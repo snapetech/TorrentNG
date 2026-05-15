@@ -1,0 +1,312 @@
+# Roadmap
+
+This project has two sequential tracks. Track 1 delivers immediate value on top of rTorrent. Track 2 is the full native Rust engine that replaces rTorrent entirely. Track 2 begins after Track 1 ships.
+
+---
+
+# Track 1 — rTorrent Sidecar
+
+Fix the rTorrent/ruTorrent pain surface without replacing the engine. Ship something useful now.
+
+## Phase 0 — Audit
+
+Enumerate every known rTorrent 0.16.x + ruTorrent 5.3.x integration breakage.
+
+**Checklist:**
+- [ ] `load.start` blocked for untrusted connections via httprpc (ruTorrent#3046)
+- [ ] `load.raw.start` untrusted status
+- [ ] `d.tracker_announce` untrusted status
+- [ ] xmlrpc-c vs tinyxml2 RPC erratic behavior (rtorrent#1636)
+- [ ] XMLRPC parsererror on torrent list (ruTorrent#2977)
+- [ ] httprpc raw passthrough trust bypass
+- [ ] *arr add torrent broken flows
+- [ ] autobrr add torrent broken flows
+- [ ] ruTorrent 10k+ torrent UI performance (dxSTable regression)
+- [ ] PHP 8.5 deprecations in ruTorrent 5.3.x
+- [ ] Plugin permission check breakage in ruTorrent 5.3.1
+- [ ] Socket permission gotchas (SCGI socket world-readable vs group)
+- [ ] Large-batch `.torrent` file add limits
+
+Produce: `docs/AUDIT.md` with status per item and workaround/fix notes.
+
+## Phase 1 — Known-good distribution bundle
+
+Ship a pinned, tested, known-good rTorrent + ruTorrent bundle.
+
+**Deliverables:**
+- `engine-profile/rtorrent.rc` — known-good config
+- `engine-profile/build/` — build scripts (tinyxml2, recommended flags)
+- Patched httprpc trust behavior
+- `deploy/docker/Dockerfile.phase1` — single-container
+- `deploy/docker/compose.phase1.yml` — rTorrent + ruTorrent + nginx
+- `scripts/healthcheck.sh` — SCGI/socket/RPC/auth diagnostic
+- Integration test suite for *arr and autobrr add-torrent flows
+- `docs/MIGRATION.md` — import existing `.rtorrent.rc`, ruTorrent settings
+
+## Phase 2 — Sidecar daemon MVP
+
+The Rust sidecar becomes the control plane. ruTorrent can still coexist.
+
+**Minimum viable API:**
+- `GET    /api/v1/torrents` — list with pagination, filter, sort
+- `POST   /api/v1/torrents` — add torrent (file or magnet)
+- `DELETE /api/v1/torrents/:hash` — remove
+- `POST   /api/v1/torrents/:hash/start`
+- `POST   /api/v1/torrents/:hash/stop`
+- `POST   /api/v1/torrents/:hash/recheck`
+- `POST   /api/v1/torrents/:hash/reannounce`
+- `GET    /api/v1/torrents/:hash/files`
+- `PATCH  /api/v1/torrents/:hash/files`
+- `GET    /api/v1/torrents/:hash/trackers`
+- `PATCH  /api/v1/torrents/:hash/trackers`
+- `GET    /api/v1/settings/user-agent` / `PUT`
+- `GET    /ws` — WebSocket delta events
+- `GET    /health`
+- `GET    /metrics`
+
+**Also:** SQLite state cache, TOML config + env overrides, API token auth, structured JSON logs, Prometheus metrics.
+
+## Phase 3 — qBittorrent API compatibility shim
+
+Make existing *arr/autobrr/tool integrations work by selecting "qBittorrent" as the client type.
+
+**Target endpoints:** auth, app info, torrent CRUD, tracker ops, file priorities, categories, tags, sync/maindata, transfer info. See `docs/API.md`.
+
+**Test suite:**
+- Prowlarr/Sonarr/Radarr add-torrent flows
+- autobrr add-torrent flow
+- cross-seed announce flow
+- NZB360 / Transdrone read-only flow
+
+## Phase 4 — Modern WebUI
+
+Replace ruTorrent as the primary UI.
+
+**Priority features:**
+1. Virtualized torrent table (100k-row target)
+2. Server-side filter + sort
+3. WebSocket delta sync
+4. Bulk ops with dry-run preview
+5. Tracker health view
+6. Ratio group management
+7. Storage/mount dashboard
+8. Saved views
+9. Mobile-safe interactions (no right-click required)
+
+## Phase 5 — Workflow platform
+
+Sidecar-managed replacement for high-value ruTorrent plugins.
+
+**Priority workflows:**
+- RSS rules + autobrr integration
+- Post-complete hooks (unpack, hardlink, script)
+- Cross-seed helper
+- Tracker repair / bulk tracker replace
+- Per-tracker ratio policies
+- Category/path automation rules
+- Webhook actions
+- *arr status feedback
+
+## Track 1 benchmark targets
+
+| Scenario | Target |
+|---|---|
+| 1k torrents — UI first paint | < 1s |
+| 10k torrents — UI first paint | < 2s |
+| 15k torrents — UI first paint | < 3s |
+| 50k synthetic — `/torrents/info` API | < 500ms |
+| `/sync/maindata` delta under normal churn | < 50ms |
+| Sidecar memory at 15k torrents after 24h | < 500MB |
+| Cold start + first torrent list ready | < 5s |
+
+---
+
+# Track 2 — Native Rust Engine
+
+A ground-up Rust BitTorrent daemon optimized for 10k–100k torrents, 200+ TB libraries, private-tracker seeding, and operational observability. Starts after Track 1 ships.
+
+See `docs/ENGINE.md` for the full design.
+
+## North star
+
+> A Rust-native, headless-first BitTorrent daemon optimized for massive long-lived seeding libraries, with qBittorrent-compatible API, deterministic storage behavior, and operational observability.
+
+The engine is **not** a general-purpose torrent client first. It is a **massive-library seeding engine** first. Downloading, DHT, uTP, and streaming come later.
+
+## Track 2 — Phase 0: Research and design lock
+
+Deliverables:
+- BEP compliance matrix
+- API compatibility matrix (qBit, Transmission)
+- Storage design doc and invariants
+- Session DB schema
+- Threat model
+- Benchmark plan with synthetic 1k/5k/10k/15k/50k datasets
+- Migration plan (from rTorrent/qBit/Transmission)
+- Crate workspace layout
+- Coding standards and unsafe policy
+
+## Track 2 — Phase 1: Foundation crates
+
+Build and fuzz-test:
+- `rt-bencode` — parser + canonical encoder, property-tested
+- `rt-metainfo` — .torrent and magnet parsing, path sanitization, infohash v1/v2/hybrid
+- `rt-hash` — SHA-1 / SHA-256 piece verification, bounded hashing pool
+- `rt-piece-map` — piece-to-file mapping, request boundary math
+- `rt-config` — TOML config, env override, validation
+- `rt-testkit` — test fixtures, synthetic torrent generators
+
+Exit criteria: parse valid torrents, reject malformed/malicious torrents, compute v1 infohash correctly, map pieces to files, fuzz parser, property-test bencode invariants.
+
+## Track 2 — Phase 2: Storage and recheck engine
+
+Build:
+- File planner and path sanitizer
+- Storage root abstraction (mount-aware)
+- Piece verifier with bounded hashing pool
+- Resumable, cancellable, restart-safe recheck jobs
+- Per-mount disk scheduler (queue depth, HDD vs SSD profile, priority)
+- Dry-run import mode
+
+Exit criteria: verify existing complete torrent without downloading, detect missing/corrupt files, survive crash mid-check, resume recheck, dry-run import a 15k-torrent library.
+
+## Track 2 — Phase 3: Tracker engine
+
+Build:
+- HTTP and UDP announce
+- Compact peer parsing
+- Tracker tiers, retry, and backoff
+- Scrape
+- Announce accounting (uploaded/downloaded/left, events)
+- Private tracker mode (disable DHT/PEX/LSD)
+- Restart jitter — no announce storms
+
+Exit criteria: started/completed/stopped events correct, interval respected, tracker failures classified, restart does not announce-storm, private torrent disables DHT unless overridden.
+
+## Track 2 — Phase 4: TCP seeding MVP
+
+Build:
+- TCP listener and handshake
+- Bitfield/have-all
+- Interested/choke/unchoke
+- Request validation and piece serving
+- Upload accounting per torrent/tracker/session
+- Per-torrent and global peer caps
+
+Exit criteria: seed a complete torrent to another client, seed multi-file torrent, reject invalid requests, maintain correct upload stats, run 1k passive seeding torrents.
+
+## Track 2 — Phase 5: Session daemon
+
+Build:
+- `rusttorrentd` binary
+- SQLite session DB with migrations
+- Torrent lifecycle supervisor
+- Append-only event log
+- Job queue
+- Health and metrics endpoints
+- Clean shutdown with stopped announces
+
+Exit criteria: add torrent, import complete torrent, start/stop/pause, restart cleanly, crash-recover, expose Prometheus metrics.
+
+## Track 2 — Phase 6: qBittorrent API compatibility v1
+
+Priority 1 endpoints:
+- auth, app/version, app/webapiVersion
+- torrents/info, add, pause, resume, delete, recheck, reannounce
+- torrents/files, trackers, setCategory, addTags
+- sync/maindata (delta semantics)
+- transfer/info
+
+Exit criteria: Prowlarr/Sonarr/Radarr/autobrr can add torrents; qBit-compatible clients can list/pause/resume/delete/recheck/reannounce; sync/maindata works.
+
+## Track 2 — Phase 7: Downloading
+
+Build:
+- Rarest-first piece picker
+- Request scheduler and endgame mode
+- Piece verification on receive
+- File priority
+- Partial download resume
+- Magnet metadata exchange
+
+Exit criteria: download Linux ISO from public swarm, resume partial download, handle corrupt piece, complete and transition to seeding.
+
+## Track 2 — Phase 8: Scale hardening
+
+Target: 10k → 15k torrents, 200+ TB simulation, tracker jitter, low idle CPU, bounded memory.
+
+Exit criteria: 15k torrents cold start under target, API responsive, recheck does not starve seeding, tracker manager avoids burst failures, UI cache consistent.
+
+## Track 2 — Phase 9: Web UI
+
+Full UI replacing the Track 1 WebUI, backed by the native engine API. Same design principles: virtualized table, server-side filter/sort, delta sync, bulk dry-run previews, "why is this not seeding?" diagnostic path.
+
+## Track 2 — Phase 10: DHT / PEX / LSD / uTP
+
+Optional for private-tracker profile. Exit criteria: public swarm performance comparable to baseline clients; private profile keeps these disabled.
+
+## Track 2 — Phase 11: BEP 52 / v2 / hybrid torrents
+
+v2 metainfo, file trees, piece layers, SHA-256 verification, hybrid torrent identity.
+
+## Track 2 — Phase 12: Production 1.0
+
+Required before 1.0:
+- Migration tools from rTorrent, qBittorrent, Transmission
+- qBit API compatibility report
+- Public benchmark report (see targets below)
+- Threat model review
+- Backup/restore docs
+- systemd unit, Docker image, Compose, Kubernetes example
+- Prometheus/Grafana example dashboard
+- Arch/AUR package
+- Disaster recovery guide
+
+## Track 2 benchmark targets
+
+### Engine
+
+| Scenario | Target |
+|---|---|
+| Cold start — 15k torrents | < 120s |
+| Steady idle RAM — 15k torrents | < 2.5 GB |
+| Crash recovery — 15k torrents | < 30s |
+| Session restore — no global recheck required | ✓ |
+| Tracker announce storm after restart | 0 |
+| Recheck throughput — NVMe | measure and publish |
+| Recheck throughput — HDD | measure and publish |
+
+### API
+
+| Scenario | Target |
+|---|---|
+| `/api/v2/torrents/info` — 15k torrents | < 250ms |
+| `/api/v2/sync/maindata` delta | < 50ms |
+| Native filter/sort — 15k | < 250ms |
+| Bulk tag — 10k torrents | < 2s |
+
+### UI
+
+| Scenario | Target |
+|---|---|
+| Initial load — 15k torrents | < 3s |
+| Filter response | < 200ms |
+| Torrent detail open | < 100ms |
+| Bulk preview — 10k | < 1s |
+
+## Track 2 — "best in class" acceptance criteria
+
+Do not call it best-in-class until all of these are true:
+
+- [ ] 15k torrents loaded and manageable
+- [ ] 200+ TB library imported without forced global recheck
+- [ ] qBit-compatible API works with Sonarr/Radarr/Prowlarr/autobrr
+- [ ] Cold restart does not announce-storm trackers
+- [ ] Rechecks are queued, resumable, cancellable, and visible
+- [ ] Bulk path/category/tracker edits have dry-run previews
+- [ ] Storage engine has per-mount queueing and backpressure
+- [ ] UI can filter/sort 15k torrents without browser death
+- [ ] Crash during move/check/import is recoverable
+- [ ] Private tracker mode disables DHT/PEX/LSD unless explicitly enabled
+- [ ] Metrics and event logs explain failures without log spelunking
+- [ ] Public benchmark report published

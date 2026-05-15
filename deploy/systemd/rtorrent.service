@@ -1,0 +1,20 @@
+[Unit]
+Description=rTorrent BitTorrent Engine
+After=network.target
+Wants=rtorrentng-sidecar.service
+
+[Service]
+Type=simple
+User=rtorrent
+Group=rtorrent
+UMask=0002
+ExecStart=/usr/bin/rtorrent -n -o "import=/etc/rtorrent/rtorrent.rc"
+Restart=on-failure
+RestartSec=5
+
+# Socket directory
+RuntimeDirectory=rtorrent
+RuntimeDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,480 @@
+# Native Rust Engine Design
+
+This document covers the full Rust BitTorrent engine planned for Track 2. Track 2 begins after the rTorrent sidecar (Track 1) ships.
+
+---
+
+## Product shape
+
+**Target persona:** private tracker users, seedbox operators, homelab media automation, large archive seeders, 10k–100k torrent operators, multi-hundred-TB libraries, *arr/autobrr/cross-seed power users.
+
+**Not the primary target:** casual desktop torrenting, search-engine plugin users, "download one magnet and watch immediately" users.
+
+The engine is seeding-first. Downloading, DHT, uTP, and streaming come later.
+
+---
+
+## Why a full rewrite after Track 1
+
+Track 1 solves the immediate pain: broken RPC trust, PHP control plane, polling-based sync, integration fragility. It does not solve the deep problems:
+
+- rTorrent's storage engine has no userspace disk scheduler
+- No per-mount queue depth, HDD/SSD profiles, or storage pressure awareness
+- No structured event log ("why did this torrent stop seeding?")
+- No resumable rechecks with observable progress
+- No safe move-and-verify for cross-device operations
+- XMLRPC as the internal protocol
+
+Track 2 eliminates all of these at the foundation level.
+
+---
+
+## Crate workspace layout
+
+```
+crates/
+  rt-bencode/         — bencode parser + canonical encoder, fuzzed, property-tested
+  rt-metainfo/        — .torrent and magnet parsing, path sanitization, v1/v2/hybrid infohash
+  rt-hash/            — SHA-1 / SHA-256 piece verification, bounded hashing worker pool
+  rt-piece-map/       — piece-to-file mapping, request boundary math, invariant tests
+  rt-fastresume/      — resume state import (rTorrent .rtorrent, qBit .fastresume)
+  rt-storage/         — storage root abstraction, mount awareness, disk scheduler
+  rt-tracker/         — HTTP + UDP announce, tiers, backoff, announce accounting, scrape
+  rt-peer-protocol/   — peer wire codec, extension protocol, fuzzed
+  rt-peer-manager/    — connection pool, choking, unchoking, peer scoring, ban rules
+  rt-piece-picker/    — rarest-first, endgame, file priority
+  rt-dht/             — DHT (Phase 10, private-tracker-off by default)
+  rt-utp/             — uTP transport (Phase 10)
+  rt-session/         — torrent lifecycle supervisor, SQLite DB, event log, job queue
+  rt-api-model/       — shared API types (serde)
+  rt-api-native/      — native REST + WebSocket API (axum)
+  rt-api-qbit/        — qBittorrent v2 compatibility shim
+  rt-api-transmission/ — Transmission RPC (Phase 12)
+  rt-jobs/            — bulk op job queue, dry-run engine
+  rt-metrics/         — Prometheus metrics definitions
+  rt-config/          — TOML config, env override, validation
+  rt-migrate/         — import from rTorrent / qBit / Transmission
+  rt-testkit/         — test fixtures, synthetic torrent generators, interop helpers
+  rusttorrentd/       — binary: wires all modules, signal handling, startup
+```
+
+---
+
+## Torrent identity
+
+```rust
+enum TorrentId {
+    V1 { info_hash: [u8; 20] },
+    V2 { info_hash: [u8; 32] },
+    Hybrid { v1: [u8; 20], v2: [u8; 32] },
+}
+```
+
+Never assume SHA-1 forever. v2 and hybrid identity are first-class even if v2 full support lands in Phase 11.
+
+---
+
+## Torrent lifecycle states
+
+```
+Imported → MetadataPending → CheckingQueued → Checking → CheckedComplete
+                                                       → CheckedPartial → Downloading → Seeding
+Seeding → Paused
+Seeding → Errored
+Seeding → MissingFiles
+Seeding → Moving → Seeding
+* → Deleting → Retired
+```
+
+Every transition is persisted and emits a structured event. No boolean soup.
+
+---
+
+## Storage model
+
+### Design principle
+
+Do not use mmap for torrent data as the primary design. Use an explicit userspace disk scheduler with bounded buffers.
+
+Rationale: libtorrent-rasterbar's own maintainer documented why 2.x mmap was a mistake for I/O control. A 200+ TB seedbox needs deliberate storage scheduling, not OS mmap behavior.
+
+### Storage modes
+
+```
+seeding_existing        — verify and seed pre-existing files
+download_to_final       — download directly to final path
+download_to_temp        — download to temp, move on complete
+download_to_category    — use category save root
+hardlink_import         — hardlink from source to storage root
+copy_import             — copy from source, verify on complete
+verify_only             — check without changing state
+metadata_only           — no file I/O (metadata/announce only)
+```
+
+### Disk scheduler responsibilities
+
+- Mount identity and free space awareness
+- Filesystem type detection
+- Per-mount queue depth and read/write concurrency limits
+- HDD vs SSD/NVMe I/O profile
+- Sequential vs random pressure awareness
+- Priority: recheck < background seeding < active downloads < active streams (future)
+- External filesystem pressure hints where available
+
+### Recheck engine
+
+Recheck is not a fire-and-forget operation. It is a first-class job:
+
+```
+job_id
+torrent_id
+file_index (resumable)
+piece_index (resumable)
+byte_offset (resumable)
+verified_bytes
+invalid_pieces
+started_at / updated_at
+state: queued | running | paused | cancelled | complete
+```
+
+Requirements:
+- Incremental and resumable — survives crash mid-check
+- Rate-limited and per-mount throttled
+- Cancellable without data loss
+- Visible through API and event log
+- Verifies files without changing torrent state until commit
+
+### File movement
+
+Moving 200+ TB is a database migration, not a file copy:
+
+1. Dry-run: conflict detection, capacity check, path mapping preview
+2. Fast path: same-filesystem rename
+3. Safe path: copy + verify SHA + atomic rename + cleanup
+4. Failure: partial failure report, rollback plan
+5. Post-move: tracker path update, no silent deletes
+
+---
+
+## Networking
+
+### Peer connection manager
+
+- TCP listener (Phase 4)
+- uTP listener (Phase 10, optional)
+- Outgoing connection queue with backpressure
+- Per-torrent and global peer caps
+- Peer scoring and ban/eject rules
+- Choking/unchoking scheduler (no fibrillation)
+- Request pipeline and stale peer cleanup
+- Extension protocol negotiation
+
+### Protocol targets
+
+| BEP | Description | Phase |
+|---|---|---|
+| BEP 3 | BitTorrent v1 baseline | 4 |
+| BEP 9 | Metadata exchange / magnet | 7 |
+| BEP 10 | Extension protocol | 4 |
+| BEP 11 | PEX | 10 |
+| BEP 12 | Multitracker | 3 |
+| BEP 14 | LSD | 10 |
+| BEP 15 | UDP trackers | 3 |
+| BEP 23 | Compact peer list | 3 |
+| BEP 27 | Private torrents | 3 |
+| BEP 29 | uTP | 10 |
+| BEP 32 | IPv6 | later |
+| BEP 52 | BitTorrent v2 / hybrid | 11 |
+
+DHT is implemented in Phase 10. Private-tracker profiles disable DHT/PEX/LSD by default.
+
+---
+
+## Tracker subsystem
+
+Track per-torrent per-tracker:
+```
+uploaded / downloaded / left
+event (started/stopped/completed)
+last_announce / next_announce / last_success
+failure_reason / warning_message
+seeders / leechers / completed
+```
+
+For private trackers, accounting correctness is not optional. Ratio bugs kill trust.
+
+Restart behavior:
+- Jitter announces across the restart window
+- Never announce-storm (no simultaneous burst of 15k started events)
+- Send stopped announces on clean shutdown within configured time budget
+- Crash recovery resumes state from DB, no phantom completed events
+
+---
+
+## Session database
+
+SQLite initially. Clean abstraction so Postgres is an option later.
+
+Minimum tables:
+```sql
+torrents
+torrent_files
+torrent_trackers
+torrent_tags
+torrent_categories
+torrent_limits
+jobs
+job_events
+session_events        -- append-only event log
+mounts
+storage_roots
+api_tokens
+settings
+```
+
+### Event log
+
+Append-only, never delete. Answers "why did this torrent stop seeding?":
+
+```
+torrent_added / metadata_resolved
+check_started / check_progress / check_completed
+tracker_announce_started / failed / succeeded
+peer_connected / disconnected
+piece_verified
+file_missing / path_conflict / permission_error
+move_started / move_completed / move_failed
+error_raised
+```
+
+---
+
+## API design
+
+### Native API
+
+```
+/api/v1/torrents
+/api/v1/torrents/{id}
+/api/v1/torrents/{id}/files
+/api/v1/torrents/{id}/trackers
+/api/v1/torrents/{id}/peers
+/api/v1/torrents/{id}/pieces
+/api/v1/jobs
+/api/v1/events          (SSE or WebSocket)
+/api/v1/mounts
+/api/v1/settings
+/api/v1/settings/user-agent
+/api/v1/health
+/api/v1/metrics
+```
+
+Principles:
+- REST for CRUD and bulk ops
+- SSE/WebSocket for event stream (no polling)
+- OpenAPI spec generated in CI
+- Typed error codes, not freeform strings
+- Idempotency keys for destructive operations
+- All destructive bulk ops support `dry_run=true`
+
+### qBittorrent compatibility API
+
+Compatibility shim is a translation layer over the native model. qBit API quirks do not leak into the engine.
+
+Priority 1 (Phase 6):
+```
+/api/v2/auth/login|logout
+/api/v2/app/version|webapiVersion|preferences
+/api/v2/sync/maindata
+/api/v2/transfer/info
+/api/v2/torrents/info|add|pause|resume|delete|recheck|reannounce
+/api/v2/torrents/files|trackers|filePrio|setCategory|addTags|removeTags
+```
+
+Priority 2 (Phase 9):
+```
+/api/v2/torrents/setLocation|renameFile|renameFolder
+/api/v2/torrents/categories|tags
+share limits, speed limits
+```
+
+Priority 3 (Phase 12):
+```
+RSS, search, cookies, advanced preferences
+```
+
+### Transmission compatibility API (Phase 12)
+
+```
+/transmission/rpc
+session_get / session_set
+torrent_get / torrent_add / torrent_set
+torrent_start / torrent_stop / torrent_remove
+free_space
+```
+
+---
+
+## Security model
+
+### API
+
+- No unauthenticated mutating endpoints
+- API tokens with scopes
+- Bearer token mode for automation
+- Browser cookie mode with CSRF protection
+- Reverse-proxy safe (trust X-Remote-User if configured)
+- Local socket option
+- Audit log for destructive operations
+
+### Filesystem
+
+- Reject absolute paths from torrent metadata
+- Reject `..` path components
+- Sanitize platform-reserved names
+- Detect symlink traversal
+- Never write outside assigned storage roots
+- Dry-run all moves and imports
+- No arbitrary script execution by default
+- Explicit allowlist for URL schemes when fetching .torrent URLs
+
+### Network
+
+- All parsers fuzzed (bencode, metainfo, tracker responses, peer wire, magnet)
+- Bounded message sizes
+- Per-peer request rate limits
+- Ban flood/invalid request patterns
+- No DHT on private torrents by default
+- SSRF protection for .torrent URL fetching
+
+---
+
+## Observability
+
+### Structured logs (tracing)
+
+Every significant event is a structured JSON log line with consistent fields:
+```json
+{ "event": "tracker_announce_failed", "torrent_id": "...", "tracker": "...", "reason": "...", "next_retry_secs": 300 }
+```
+
+### Prometheus metrics
+
+```
+rusttorrent_torrents_total{state}
+rusttorrent_peers_connected
+rusttorrent_tracker_announces_total{result}
+rusttorrent_disk_queue_depth{mount}
+rusttorrent_disk_bytes_total{direction, mount}
+rusttorrent_recheck_bytes_total
+rusttorrent_api_request_duration_seconds{endpoint, method}
+rusttorrent_event_lag_seconds
+rusttorrent_job_queue_depth{type}
+```
+
+### Diagnostics API
+
+Every torrent answers these questions through the API:
+- Why is this not seeding?
+- Why is this tracker failing?
+- Why did this recheck start?
+- Why is this file missing?
+- Why is this torrent paused?
+- Why is this torrent not announcing?
+- Why did this move fail?
+
+---
+
+## Testing strategy
+
+### Fuzz targets (from day one)
+
+- `.torrent` parser
+- Magnet URI parser
+- Bencode parser
+- Tracker HTTP response parser
+- Tracker UDP packet codec
+- Peer wire message parser
+- Resume DB import
+- qBit API input shapes
+
+### Property tests
+
+- Bencode round-trip
+- Invalid bencode rejection
+- Path traversal rejection (all variants)
+- Piece-to-file map invariants
+- Chunk request boundary math
+- Tracker response parser robustness
+
+### Failure injection tests
+
+- SIGKILL during recheck
+- SIGKILL during file move
+- SIGKILL during DB transaction
+- Disk full
+- Permission denied
+- Tracker timeout / invalid response
+- Corrupted piece
+- Missing / renamed file
+- Mount disappears
+- Network outage / DNS failure
+
+### Scale tests (synthetic)
+
+```
+1k / 5k / 10k / 15k / 50k / 100k torrents
+Large single-file torrents
+Large multi-file deep directory trees
+Many small files
+Multiple storage roots
+Multiple tracker tiers
+```
+
+---
+
+## Migration
+
+### From rTorrent
+
+- Import session directory and `.torrent` files
+- Import resume state (no forced global recheck for complete torrents)
+- Import labels, views, save paths, tracker lists
+- Ratio/upload stats where available
+- Always dry-run first, never destructive
+
+### From qBittorrent
+
+- Import `BT_backup/` directory
+- Import `.fastresume` files
+- Categories, tags, save paths, torrent states, trackers
+
+### From Transmission
+
+- Import resume files and torrents directory
+- Labels/groups and download directories
+
+### Migration acceptance criteria
+
+A migration is not done until:
+- Pre-existing complete files seed without overwrite confusion
+- Imported complete torrents do not recheck unless requested
+- Missing paths are reported clearly with path-remap preview
+- Failed import is resumable
+- Dry-run output is human-readable
+
+---
+
+## Runtime
+
+- Tokio async runtime (peer sockets, trackers, API, events)
+- Rayon or bounded threadpool for CPU-bound hashing — never unbounded `spawn_blocking`
+- `bytes` for network buffers
+- `rusqlite` (bundled) for session DB
+- `axum` + `tower` for HTTP API
+- `tracing` + `tracing-subscriber` JSON layer for logs
+- `criterion` for benchmarks
+- `proptest` / `cargo-fuzz` for parsers and state machines
+- `loom` for critical concurrency primitives
+
+No global shared mutable state. Strict actor/task boundaries. Bounded channels with backpressure everywhere.

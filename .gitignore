@@ -1,0 +1,10 @@
+sidecar/rtorrentng
+sidecar/target/
+sidecar/static/
+webui/node_modules/
+webui/dist/
+*.db
+*.db-wal
+*.db-shm
+/config/
+.env

@@ -1,0 +1,19 @@
+[Unit]
+Description=rtorrentNG Sidecar API Daemon
+After=rtorrent.service
+Requires=rtorrent.service
+
+[Service]
+Type=simple
+User=rtorrent
+Group=rtorrent
+ExecStart=/usr/local/bin/rtorrentng --config /etc/rtorrentng/config.toml
+Restart=on-failure
+RestartSec=5
+
+# State directory for SQLite cache
+StateDirectory=rtorrentng
+StateDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,59 @@
+# Phase 1: Known-good rTorrent + ruTorrent bundle
+# No Rust sidecar yet — this is the "make existing users less miserable" release.
+# rTorrent 0.16.11, ruTorrent 5.3.1, tinyxml2 XMLRPC backend, nginx proxy.
+
+FROM alpine:3.20 AS base
+
+# Build rTorrent with tinyxml2 (avoids xmlrpc-c erratic behavior, rtorrent#1636)
+FROM base AS rtorrent-build
+RUN apk add --no-cache \
+    build-base git cmake ninja pkgconf \
+    libtool autoconf automake \
+    openssl-dev zlib-dev curl-dev \
+    ncurses-dev tinyxml2-dev \
+    linux-headers
+
+WORKDIR /src
+RUN git clone --depth=1 --branch v0.16.11 https://github.com/rakshasa/rtorrent.git && \
+    git clone --depth=1 --branch v0.13.8  https://github.com/rakshasa/libtorrent.git
+
+# Build libtorrent
+RUN cd libtorrent && ./autogen.sh && \
+    ./configure --prefix=/usr/local --with-openssl && \
+    make -j$(nproc) && make install
+
+# Build rTorrent with tinyxml2
+RUN cd rtorrent && ./autogen.sh && \
+    ./configure --prefix=/usr/local \
+                --with-xmlrpc-tinyxml2 \
+                --enable-ipv6 && \
+    make -j$(nproc) && make install
+
+# Runtime image
+FROM base AS runtime
+
+RUN apk add --no-cache \
+    rtorrent \
+    php83 php83-fpm php83-json php83-session php83-curl php83-posix \
+    nginx curl ca-certificates tzdata \
+    tinyxml2 openssl zlib
+
+# Copy built rTorrent (overrides distro package)
+COPY --from=rtorrent-build /usr/local/bin/rtorrent  /usr/local/bin/rtorrent
+COPY --from=rtorrent-build /usr/local/lib/libtorrent* /usr/local/lib/
+
+# ruTorrent 5.3.1
+RUN mkdir -p /var/www/rutorrent && \
+    wget -qO- https://github.com/Novik/ruTorrent/archive/refs/tags/v5.3.1.tar.gz | \
+    tar -xz -C /var/www/rutorrent --strip-components=1
+
+COPY deploy/docker/rtorrent.rc      /etc/rtorrent/rtorrent.rc
+COPY engine-profile/rtorrent.rc     /etc/rtorrent/profile.rc
+COPY deploy/nginx/nginx.phase1.conf /etc/nginx/http.d/default.conf
+COPY deploy/docker/entrypoint.phase1.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+VOLUME ["/data", "/session", "/config"]
+EXPOSE 80 50000 50000/udp
+
+ENTRYPOINT ["/entrypoint.sh"]

@@ -1,0 +1,28 @@
+services:
+  rtorrentng-phase1:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.phase1
+    image: rtorrentng-phase1:latest
+    container_name: rtorrentng-phase1
+    restart: unless-stopped
+    ports:
+      - "8080:80"             # ruTorrent web UI
+      - "50000:50000"         # rTorrent incoming
+      - "50000:50000/udp"
+    volumes:
+      - ./config:/config          # optional user config overlay
+      - downloads:/data           # download directory
+      - session:/session          # rTorrent session
+    environment:
+      TZ: UTC
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost/rutorrent/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  downloads:
+  session:

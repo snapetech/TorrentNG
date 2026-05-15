@@ -1,0 +1,46 @@
+# rtorrentNG engine profile
+# Pinned for rTorrent 0.16.11, tinyxml2 XMLRPC backend
+
+# Network
+network.port_range.set = 50000-50000
+network.port_random.set = no
+
+protocol.encryption.set = allow_incoming,try_outgoing,enable_retry
+
+# DHT / PEX / LSD
+dht.mode.set = auto
+dht.port.set = 6881
+protocol.pex.set = yes
+trackers.use_udp.set = yes
+
+# Performance tuning for large seed libraries
+# Limit global slots to avoid connection storms
+throttle.max_uploads.global.set = 500
+throttle.max_downloads.global.set = 50
+
+# Per-torrent slot limits
+throttle.max_uploads.set = 10
+throttle.max_downloads.set = 4
+
+# Piece/chunk settings
+pieces.hash.on_completion.set = yes
+pieces.memory.max.set = 2048M
+
+# Session
+session.use_lock.set = yes
+session.on_completion.set = yes
+
+# SCGI socket — sidecar connects via trusted local socket
+# scgi_local path is set by the entrypoint/systemd to /run/rtorrent/rpc.sock
+# Do NOT expose SCGI over TCP to untrusted networks.
+
+# Announce throttling — avoid hammering trackers on restart
+trackers.numwant.set = 80
+
+# Logging
+log.open_file = "rtorrent", /var/log/rtorrent/rtorrent.log
+log.add_output = "info", "rtorrent"
+
+# File completion handling
+# Set directory via d.directory.set in load commands; no default download dir
+# (each torrent must have save_path set explicitly by the sidecar)
