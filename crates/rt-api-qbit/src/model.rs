@@ -119,6 +119,9 @@ pub struct QbServerState {
     pub up_info_data: i64,
     pub connection_status: String,
     pub free_space_on_disk: i64,
+    pub dl_rate_limit: i64,
+    pub up_rate_limit: i64,
+    pub use_alt_speed_limits: bool,
 }
 
 /// `POST /api/qb/v2/torrents/add` form fields.

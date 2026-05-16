@@ -22,8 +22,8 @@ use rt_peer_wire::handshake::{Handshake, HANDSHAKE_LEN};
 use rt_session::{SessionRegistry, TorrentEntry, TorrentState, TransferStats};
 
 use crate::command::{
-    CmdResult, EngineCmd, EnginePieceState, EngineStats, EngineTorrentFile, EngineTorrentLimits,
-    EngineTorrentMetadata, TorrentDiagnostic,
+    CmdResult, EngineCmd, EngineGlobalLimits, EnginePieceState, EngineStats, EngineTorrentFile,
+    EngineTorrentLimits, EngineTorrentMetadata, TorrentDiagnostic,
 };
 use crate::dht_task::{run_dht, DhtCommand, DhtTorrent};
 use crate::metadata_task::run_metadata_task;
@@ -51,6 +51,9 @@ const JOB_STATE_RUNNING: &str = "running";
 const JOB_STATE_PAUSED: &str = "paused";
 const JOB_STATE_CANCELLED: &str = "cancelled";
 const JOB_STATE_FAILED: &str = "failed";
+const SETTING_GLOBAL_DOWNLOAD_LIMIT: &str = "transfer.download_limit";
+const SETTING_GLOBAL_UPLOAD_LIMIT: &str = "transfer.upload_limit";
+const SETTING_GLOBAL_SPEED_LIMITS_MODE: &str = "transfer.speed_limits_mode";
 
 /// Handle given to the API layer. Clone freely; all sends are channel-based.
 #[derive(Clone)]
@@ -329,6 +332,24 @@ impl EngineHandle {
                 peers,
                 reply,
             })
+            .await
+            .map_err(|_| "engine shut down".to_owned())?;
+        rx.await.map_err(|_| "engine dropped reply".to_owned())?
+    }
+
+    pub async fn global_limits(&self) -> CmdResult<EngineGlobalLimits> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(EngineCmd::GetGlobalLimits { reply })
+            .await
+            .map_err(|_| "engine shut down".to_owned())?;
+        rx.await.map_err(|_| "engine dropped reply".to_owned())?
+    }
+
+    pub async fn update_global_limits(&self, limits: EngineGlobalLimits) -> CmdResult<()> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(EngineCmd::UpdateGlobalLimits { limits, reply })
             .await
             .map_err(|_| "engine shut down".to_owned())?;
         rx.await.map_err(|_| "engine dropped reply".to_owned())?
@@ -705,6 +726,14 @@ impl Engine {
                 reply,
             } => {
                 let result = self.add_peers_inner(&info_hash, peers).await;
+                let _ = reply.send(result);
+            }
+            EngineCmd::GetGlobalLimits { reply } => {
+                let result = self.global_limits_inner();
+                let _ = reply.send(result);
+            }
+            EngineCmd::UpdateGlobalLimits { limits, reply } => {
+                let result = self.update_global_limits_inner(limits);
                 let _ = reply.send(result);
             }
 
@@ -1618,6 +1647,42 @@ impl Engine {
             .await
     }
 
+    fn global_limits_inner(&self) -> CmdResult<EngineGlobalLimits> {
+        let db = self.db.lock().expect("database mutex poisoned");
+        Ok(EngineGlobalLimits {
+            download_limit: setting_i64(&db, SETTING_GLOBAL_DOWNLOAD_LIMIT),
+            upload_limit: setting_i64(&db, SETTING_GLOBAL_UPLOAD_LIMIT),
+            speed_limits_mode: setting_bool(&db, SETTING_GLOBAL_SPEED_LIMITS_MODE),
+        })
+    }
+
+    fn update_global_limits_inner(&self, limits: EngineGlobalLimits) -> CmdResult<()> {
+        let db = self.db.lock().expect("database mutex poisoned");
+        let now = unix_now_i64();
+        rt_db::set_setting(
+            &db,
+            SETTING_GLOBAL_DOWNLOAD_LIMIT,
+            &limits.download_limit.max(0).to_string(),
+            now,
+        )
+        .map_err(|e| e.to_string())?;
+        rt_db::set_setting(
+            &db,
+            SETTING_GLOBAL_UPLOAD_LIMIT,
+            &limits.upload_limit.max(0).to_string(),
+            now,
+        )
+        .map_err(|e| e.to_string())?;
+        rt_db::set_setting(
+            &db,
+            SETTING_GLOBAL_SPEED_LIMITS_MODE,
+            if limits.speed_limits_mode { "1" } else { "0" },
+            now,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     async fn send_to_torrent(&self, info_hash: &str, cmd: TorrentCmd) -> CmdResult<()> {
         match self.torrent_chans.get(info_hash) {
             Some(tx) => tx
@@ -2239,6 +2304,18 @@ fn unix_now_i64() -> i64 {
         .as_secs() as i64
 }
 
+fn setting_i64(conn: &Connection, key: &str) -> i64 {
+    rt_db::get_setting(conn, key)
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0)
+        .max(0)
+}
+
+fn setting_bool(conn: &Connection, key: &str) -> bool {
+    matches!(rt_db::get_setting(conn, key).as_deref(), Ok("1" | "true"))
+}
+
 fn normalize_category(category: Option<String>) -> Option<String> {
     category
         .map(|value| value.trim().to_owned())
@@ -2677,6 +2754,43 @@ mod tests {
             torrent_rx.recv().await,
             Some(TorrentCmd::NewPeers(peers)) if peers == vec![peer]
         ));
+    }
+
+    #[test]
+    fn global_limits_persist_to_settings_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let (_tx, rx) = mpsc::channel(1);
+        let engine = Engine {
+            config: Arc::new(Config::default()),
+            registry: Arc::new(RwLock::new(SessionRegistry::new())),
+            db: Arc::new(Mutex::new(conn)),
+            cmd_rx: rx,
+            cmd_tx: mpsc::channel(1).0,
+            torrent_chans: HashMap::new(),
+            torrent_tasks: HashMap::new(),
+            dht_tx: None,
+        };
+
+        assert_eq!(
+            engine.global_limits_inner().unwrap(),
+            EngineGlobalLimits::default()
+        );
+        engine
+            .update_global_limits_inner(EngineGlobalLimits {
+                download_limit: 123,
+                upload_limit: 456,
+                speed_limits_mode: true,
+            })
+            .unwrap();
+        assert_eq!(
+            engine.global_limits_inner().unwrap(),
+            EngineGlobalLimits {
+                download_limit: 123,
+                upload_limit: 456,
+                speed_limits_mode: true,
+            }
+        );
     }
 
     #[tokio::test]

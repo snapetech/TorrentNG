@@ -14,7 +14,7 @@ use std::{
 };
 use url::Url;
 
-use rt_engine::{EnginePieceState, EngineTorrentLimits};
+use rt_engine::{EngineGlobalLimits, EnginePieceState, EngineTorrentLimits};
 
 use crate::{
     model::{
@@ -1314,31 +1314,52 @@ pub async fn torrents_toggle_first_last_piece_prio(
 }
 
 /// `POST /api/qb/v2/transfer/setDownloadLimit`.
-pub async fn transfer_set_download_limit() -> impl IntoResponse {
-    StatusCode::OK
+pub async fn transfer_set_download_limit(
+    State(state): State<AppState>,
+    body: String,
+) -> impl IntoResponse {
+    update_global_limit(&state, &body, LimitField::Download).await
 }
 
 /// `POST /api/qb/v2/transfer/setUploadLimit`.
-pub async fn transfer_set_upload_limit() -> impl IntoResponse {
-    StatusCode::OK
+pub async fn transfer_set_upload_limit(
+    State(state): State<AppState>,
+    body: String,
+) -> impl IntoResponse {
+    update_global_limit(&state, &body, LimitField::Upload).await
 }
 
-pub async fn transfer_speed_limits_mode() -> impl IntoResponse {
-    (StatusCode::OK, "0")
+pub async fn transfer_speed_limits_mode(State(state): State<AppState>) -> impl IntoResponse {
+    let mode = global_limits(&state).await.speed_limits_mode;
+    (StatusCode::OK, if mode { "1" } else { "0" })
 }
 
-pub async fn transfer_toggle_speed_limits_mode() -> impl IntoResponse {
-    StatusCode::OK
+pub async fn transfer_toggle_speed_limits_mode(State(state): State<AppState>) -> impl IntoResponse {
+    let Some(engine) = &state.engine else {
+        return StatusCode::OK;
+    };
+    let mut limits = global_limits(&state).await;
+    limits.speed_limits_mode = !limits.speed_limits_mode;
+    match engine.update_global_limits(limits).await {
+        Ok(()) => StatusCode::OK,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
 }
 
 /// `GET /api/qb/v2/transfer/downloadLimit`.
-pub async fn transfer_download_limit() -> impl IntoResponse {
-    (StatusCode::OK, "0")
+pub async fn transfer_download_limit(State(state): State<AppState>) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        global_limits(&state).await.download_limit.to_string(),
+    )
 }
 
 /// `GET /api/qb/v2/transfer/uploadLimit`.
-pub async fn transfer_upload_limit() -> impl IntoResponse {
-    (StatusCode::OK, "0")
+pub async fn transfer_upload_limit(State(state): State<AppState>) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        global_limits(&state).await.upload_limit.to_string(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1370,6 +1391,7 @@ pub async fn sync_maindata(
             torrents.insert(info.hash.clone(), serde_json::to_value(info).unwrap());
         }
     }
+    let limits = global_limits(&state).await;
     let resp = serde_json::json!({
         "rid": rid,
         "full_update": full_update,
@@ -1382,6 +1404,9 @@ pub async fn sync_maindata(
             up_info_data: 0,
             connection_status: "connected".into(),
             free_space_on_disk: 0,
+            dl_rate_limit: limits.download_limit,
+            up_rate_limit: limits.upload_limit,
+            use_alt_speed_limits: limits.speed_limits_mode,
         }
     });
     (StatusCode::OK, Json(resp))
@@ -1400,17 +1425,21 @@ pub async fn sync_torrent_peers() -> impl IntoResponse {
     )
 }
 
-pub async fn transfer_info() -> impl IntoResponse {
+pub async fn transfer_info(State(state): State<AppState>) -> impl IntoResponse {
+    let limits = global_limits(&state).await;
     (
         StatusCode::OK,
-        Json(QbServerState {
-            dl_info_speed: 0,
-            dl_info_data: 0,
-            up_info_speed: 0,
-            up_info_data: 0,
-            connection_status: "connected".into(),
-            free_space_on_disk: 0,
-        }),
+        Json(serde_json::json!({
+            "dl_info_speed": 0,
+            "dl_info_data": 0,
+            "up_info_speed": 0,
+            "up_info_data": 0,
+            "connection_status": "connected",
+            "free_space_on_disk": 0,
+            "dl_rate_limit": limits.download_limit,
+            "up_rate_limit": limits.upload_limit,
+            "use_alt_speed_limits": limits.speed_limits_mode,
+        })),
     )
 }
 
@@ -1669,6 +1698,27 @@ async fn update_limit_field(
     StatusCode::OK
 }
 
+async fn update_global_limit(state: &AppState, body: &str, field: LimitField) -> StatusCode {
+    let Some(engine) = &state.engine else {
+        return StatusCode::OK;
+    };
+    let params = parse_form_body(body);
+    let limit = params
+        .get("limit")
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0)
+        .max(0);
+    let mut limits = global_limits(state).await;
+    match field {
+        LimitField::Download => limits.download_limit = limit,
+        LimitField::Upload => limits.upload_limit = limit,
+    }
+    match engine.update_global_limits(limits).await {
+        Ok(()) => StatusCode::OK,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 async fn update_bool_limit_field(
     State(state): State<AppState>,
     body: String,
@@ -1704,6 +1754,13 @@ async fn update_bool_limit_field(
         }
     }
     StatusCode::OK
+}
+
+async fn global_limits(state: &AppState) -> EngineGlobalLimits {
+    let Some(engine) = &state.engine else {
+        return EngineGlobalLimits::default();
+    };
+    engine.global_limits().await.unwrap_or_default()
 }
 
 async fn get_torrent_limits(state: &AppState, hash: &str) -> EngineTorrentLimits {

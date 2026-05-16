@@ -67,6 +67,13 @@ pub struct EngineTorrentLimits {
     pub super_seeding: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EngineGlobalLimits {
+    pub download_limit: i64,
+    pub upload_limit: i64,
+    pub speed_limits_mode: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct TorrentDiagnostic {
     pub info_hash: String,
@@ -188,6 +195,13 @@ pub enum EngineCmd {
     AddPeers {
         info_hash: String,
         peers: Vec<SocketAddr>,
+        reply: oneshot::Sender<CmdResult<()>>,
+    },
+    GetGlobalLimits {
+        reply: oneshot::Sender<CmdResult<EngineGlobalLimits>>,
+    },
+    UpdateGlobalLimits {
+        limits: EngineGlobalLimits,
         reply: oneshot::Sender<CmdResult<()>>,
     },
     /// Snapshot runtime and durable metrics.

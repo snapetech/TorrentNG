@@ -348,7 +348,14 @@ export function TorrentTable({
               ),
               name: (
                 <span
-                  style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', cursor: 'pointer', color: 'var(--text)' }}
+                  style={{
+                    display: 'block',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                    cursor: 'pointer',
+                    color: 'var(--text)',
+                  }}
                   title={t.name}
                   onClick={() => onDetail(isDetail ? null : t.hash)}
                 >
@@ -385,7 +392,9 @@ export function TorrentTable({
                   borderLeft: isDetail ? '2px solid var(--accent)' : '2px solid transparent',
                 }}
               >
-                {visibleCols.map(col => <span key={col.key} style={{ minWidth: 0 }}>{cells[col.key]}</span>)}
+                {visibleCols.map(col => (
+                  <span key={col.key} style={{ minWidth: 0, overflow: 'hidden' }}>{cells[col.key]}</span>
+                ))}
               </div>
             )
           })}
