@@ -79,7 +79,7 @@ export function WorkflowsPanel() {
 
   return (
     <section style={{ padding: '18px 24px' }}>
-      <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 12, color: '#e2e8f0' }}>
+      <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 12, color: 'var(--text)' }}>
         Workflow Rules
       </div>
       <div style={{ display: 'grid', gridTemplateColumns: '150px 120px 120px 150px 1fr auto', gap: 8, maxWidth: 1080, marginBottom: 12 }}>
@@ -95,14 +95,14 @@ export function WorkflowsPanel() {
           category: draft.action === 'set_category' ? value : draft.category,
         })} />
         <button onClick={save} disabled={!draft.name.trim()} style={{
-          background: '#1e3a5f', border: '1px solid #3b82f6', borderRadius: 5,
-          color: '#93c5fd', padding: '4px 10px', fontSize: 12,
+          background: 'var(--accent-soft)', border: '1px solid var(--accent)', borderRadius: 5,
+          color: 'var(--accent-text)', padding: '4px 10px', fontSize: 12,
           cursor: draft.name.trim() ? 'pointer' : 'not-allowed', opacity: draft.name.trim() ? 1 : 0.5,
         }}>Save</button>
       </div>
       {error && <div style={{ color: '#ef4444', fontSize: 12, marginBottom: 10 }}>{error}</div>}
       {preview && (
-        <div style={{ color: '#94a3b8', fontSize: 12, marginBottom: 10 }}>
+        <div style={{ color: 'var(--muted)', fontSize: 12, marginBottom: 10 }}>
           {preview.name}: {preview.count.toLocaleString()} matching torrent{preview.count === 1 ? '' : 's'}
         </div>
       )}
@@ -110,41 +110,41 @@ export function WorkflowsPanel() {
         {rules.map(rule => (
           <div key={rule.id} style={{
             display: 'grid', gridTemplateColumns: '150px 120px 120px 150px 1fr auto auto auto',
-            gap: 8, alignItems: 'center', border: '1px solid #1e2433',
-            borderRadius: 6, padding: '9px 12px', background: '#111827', fontSize: 12,
+            gap: 8, alignItems: 'center', border: '1px solid var(--border)',
+            borderRadius: 6, padding: '9px 12px', background: 'var(--surface)', fontSize: 12,
           }}>
-            <strong style={{ color: '#cbd5e1' }}>{rule.name}</strong>
-            <span style={{ color: '#94a3b8' }}>{rule.event}</span>
-            <span style={{ color: '#94a3b8' }}>{rule.action}</span>
-            <span style={{ color: '#64748b' }}>{rule.category || 'any category'}</span>
-            <span style={{ color: '#64748b', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            <strong style={{ color: 'var(--text)' }}>{rule.name}</strong>
+            <span style={{ color: 'var(--muted)' }}>{rule.event}</span>
+            <span style={{ color: 'var(--muted)' }}>{rule.action}</span>
+            <span style={{ color: 'var(--faint)' }}>{rule.category || 'any category'}</span>
+            <span style={{ color: 'var(--faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
               {rule.url || rule.command || rule.target_path || rule.tracker || 'configured'}
             </span>
             <button onClick={() => run(rule, true)} disabled={pending === rule.id} style={{
-              background: 'none', border: '1px solid #334155', borderRadius: 4,
-              color: '#94a3b8', padding: '3px 8px', fontSize: 11,
+              background: 'none', border: '1px solid var(--border-strong)', borderRadius: 4,
+              color: 'var(--muted)', padding: '3px 8px', fontSize: 11,
               cursor: pending === rule.id ? 'not-allowed' : 'pointer',
             }}>Preview</button>
             <button onClick={() => run(rule, false)} disabled={pending === rule.id} style={{
-              background: '#1e2433', border: '1px solid #3b82f640', borderRadius: 4,
-              color: '#3b82f6', padding: '3px 8px', fontSize: 11,
+              background: 'var(--surface-2)', border: '1px solid var(--accent)', borderRadius: 4,
+              color: 'var(--accent)', padding: '3px 8px', fontSize: 11,
               cursor: pending === rule.id ? 'not-allowed' : 'pointer',
             }}>Run</button>
             <button onClick={() => remove(rule.id)} disabled={pending === rule.id} style={{
-              background: 'none', border: '1px solid #334155', borderRadius: 4,
-              color: '#64748b', padding: '3px 8px', fontSize: 11,
+              background: 'none', border: '1px solid var(--border-strong)', borderRadius: 4,
+              color: 'var(--faint)', padding: '3px 8px', fontSize: 11,
               cursor: pending === rule.id ? 'not-allowed' : 'pointer',
             }}>Delete</button>
           </div>
         ))}
       </div>
-      <div style={{ fontSize: 13, fontWeight: 600, marginTop: 20, marginBottom: 10, color: '#e2e8f0' }}>
+      <div style={{ fontSize: 13, fontWeight: 600, marginTop: 20, marginBottom: 10, color: 'var(--text)' }}>
         Recent Runs
       </div>
       <div style={{ display: 'grid', gap: 6, maxWidth: 1080 }}>
         {runs.slice(0, 8).map(run => <WorkflowRunRow key={run.id} run={run} />)}
         {runs.length === 0 && (
-          <div style={{ color: '#64748b', fontSize: 12, padding: '8px 0' }}>
+          <div style={{ color: 'var(--faint)', fontSize: 12, padding: '8px 0' }}>
             No workflow runs recorded.
           </div>
         )}
@@ -158,17 +158,17 @@ function WorkflowRunRow({ run }: { run: WorkflowRun }) {
   return (
     <div style={{
       display: 'grid', gridTemplateColumns: '150px 120px 90px 90px 90px 1fr',
-      gap: 8, alignItems: 'center', border: '1px solid #1e2433',
-      borderRadius: 6, padding: '8px 12px', background: '#0f1117', fontSize: 12,
+      gap: 8, alignItems: 'center', border: '1px solid var(--border)',
+      borderRadius: 6, padding: '8px 12px', background: 'var(--surface)', fontSize: 12,
     }}>
-      <strong style={{ color: '#cbd5e1', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+      <strong style={{ color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
         {run.rule_name}
       </strong>
-      <span style={{ color: '#94a3b8' }}>{run.action}</span>
-      <span style={{ color: '#64748b' }}>{run.matched.length.toLocaleString()} matched</span>
-      <span style={{ color: '#64748b' }}>{run.applied.length.toLocaleString()} applied</span>
+      <span style={{ color: 'var(--muted)' }}>{run.action}</span>
+      <span style={{ color: 'var(--faint)' }}>{run.matched.length.toLocaleString()} matched</span>
+      <span style={{ color: 'var(--faint)' }}>{run.applied.length.toLocaleString()} applied</span>
       <span style={{ color: run.errors.length > 0 ? '#ef4444' : '#22c55e' }}>{status}</span>
-      <span style={{ color: '#64748b', textAlign: 'right' }}>
+      <span style={{ color: 'var(--faint)', textAlign: 'right' }}>
         {new Date(run.started_at * 1000).toLocaleString()}
       </span>
     </div>
@@ -177,15 +177,15 @@ function WorkflowRunRow({ run }: { run: WorkflowRun }) {
 
 function Input({ value, placeholder, onChange }: { value: string; placeholder: string; onChange: (value: string) => void }) {
   return <input value={value} placeholder={placeholder} onChange={e => onChange(e.target.value)} style={{
-    minWidth: 0, background: '#0f1117', border: '1px solid #334155',
-    borderRadius: 5, color: '#cbd5e1', padding: '4px 8px', fontSize: 12,
+    minWidth: 0, background: 'var(--bg)', border: '1px solid var(--border-strong)',
+    borderRadius: 5, color: 'var(--text)', padding: '4px 8px', fontSize: 12,
   }} />
 }
 
 function Select({ value, options, onChange }: { value: string; options: string[]; onChange: (value: string) => void }) {
   return <select value={value} onChange={e => onChange(e.target.value)} style={{
-    minWidth: 0, background: '#0f1117', border: '1px solid #334155',
-    borderRadius: 5, color: '#cbd5e1', padding: '4px 8px', fontSize: 12,
+    minWidth: 0, background: 'var(--bg)', border: '1px solid var(--border-strong)',
+    borderRadius: 5, color: 'var(--text)', padding: '4px 8px', fontSize: 12,
   }}>
     {options.map(option => <option key={option} value={option}>{option}</option>)}
   </select>

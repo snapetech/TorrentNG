@@ -325,6 +325,44 @@ impl EngineHandle {
         rx.await.map_err(|_| "engine dropped reply".to_owned())?
     }
 
+    pub async fn rename_file_path(
+        &self,
+        info_hash: String,
+        file_id: u32,
+        new_path: String,
+    ) -> CmdResult<()> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(EngineCmd::RenameFilePath {
+                info_hash,
+                file_id,
+                new_path,
+                reply,
+            })
+            .await
+            .map_err(|_| "engine shut down".to_owned())?;
+        rx.await.map_err(|_| "engine dropped reply".to_owned())?
+    }
+
+    pub async fn rename_folder_path(
+        &self,
+        info_hash: String,
+        old_path: String,
+        new_path: String,
+    ) -> CmdResult<()> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(EngineCmd::RenameFolderPath {
+                info_hash,
+                old_path,
+                new_path,
+                reply,
+            })
+            .await
+            .map_err(|_| "engine shut down".to_owned())?;
+        rx.await.map_err(|_| "engine dropped reply".to_owned())?
+    }
+
     pub async fn add_peers(&self, info_hash: String, peers: Vec<SocketAddr>) -> CmdResult<()> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx
@@ -744,6 +782,28 @@ impl Engine {
             } => {
                 let result = self
                     .update_file_priorities_inner(&info_hash, file_ids, priority)
+                    .await;
+                let _ = reply.send(result);
+            }
+            EngineCmd::RenameFilePath {
+                info_hash,
+                file_id,
+                new_path,
+                reply,
+            } => {
+                let result = self
+                    .rename_file_path_inner(&info_hash, file_id, new_path)
+                    .await;
+                let _ = reply.send(result);
+            }
+            EngineCmd::RenameFolderPath {
+                info_hash,
+                old_path,
+                new_path,
+                reply,
+            } => {
+                let result = self
+                    .rename_folder_path_inner(&info_hash, old_path, new_path)
                     .await;
                 let _ = reply.send(result);
             }
@@ -1368,10 +1428,16 @@ impl Engine {
                 if !files.is_empty() {
                     let policy = files
                         .into_iter()
-                        .map(|file| (file.file_index as u32, (file.priority, file.wanted)))
+                        .map(|file| {
+                            (
+                                file.file_index as u32,
+                                (file.path, file.priority, file.wanted),
+                            )
+                        })
                         .collect::<HashMap<_, _>>();
                     for file in &mut metadata.files {
-                        if let Some((priority, wanted)) = policy.get(&file.index) {
+                        if let Some((path, priority, wanted)) = policy.get(&file.index) {
+                            file.path = path.clone();
                             file.priority = *priority;
                             file.wanted = *wanted;
                         }
@@ -1684,6 +1750,87 @@ impl Engine {
         }
         self.send_to_torrent(info_hash, TorrentCmd::NewPeers(peers))
             .await
+    }
+
+    async fn rename_file_path_inner(
+        &self,
+        info_hash: &str,
+        file_id: u32,
+        new_path: String,
+    ) -> CmdResult<()> {
+        self.ensure_torrent_exists(info_hash).await?;
+        let new_path = normalize_relative_path(&new_path)?;
+        let mut db = self.db.lock().expect("database mutex poisoned");
+        let mut files = rt_db::list_torrent_files(&db, info_hash).map_err(|e| e.to_string())?;
+        if files.is_empty() {
+            return Err(format!("torrent {info_hash} has no persisted files"));
+        }
+        let Some(file) = files
+            .iter_mut()
+            .find(|file| file.file_index as u32 == file_id)
+        else {
+            return Err(format!("file {file_id} not found for torrent {info_hash}"));
+        };
+        file.path = new_path.clone();
+        rt_db::replace_torrent_files(&mut db, info_hash, &files).map_err(|e| e.to_string())?;
+        drop(db);
+        self.append_session_event(
+            Some(info_hash),
+            "file_path_renamed",
+            Some("torrent file path renamed"),
+            serde_json::json!({ "file_id": file_id, "new_path": new_path }),
+        );
+        Ok(())
+    }
+
+    async fn rename_folder_path_inner(
+        &self,
+        info_hash: &str,
+        old_path: String,
+        new_path: String,
+    ) -> CmdResult<()> {
+        self.ensure_torrent_exists(info_hash).await?;
+        let old_path = normalize_relative_path(&old_path)?;
+        let new_path = normalize_relative_path(&new_path)?;
+        let old_prefix = format!("{old_path}/");
+        let mut db = self.db.lock().expect("database mutex poisoned");
+        let mut files = rt_db::list_torrent_files(&db, info_hash).map_err(|e| e.to_string())?;
+        if files.is_empty() {
+            return Err(format!("torrent {info_hash} has no persisted files"));
+        }
+        let mut touched = 0usize;
+        for file in &mut files {
+            if file.path == old_path {
+                file.path = new_path.clone();
+                touched += 1;
+            } else if let Some(rest) = file.path.strip_prefix(&old_prefix) {
+                file.path = format!("{new_path}/{rest}");
+                touched += 1;
+            }
+        }
+        if touched == 0 {
+            return Err(format!(
+                "folder {old_path} not found for torrent {info_hash}"
+            ));
+        }
+        rt_db::replace_torrent_files(&mut db, info_hash, &files).map_err(|e| e.to_string())?;
+        drop(db);
+        self.append_session_event(
+            Some(info_hash),
+            "folder_path_renamed",
+            Some("torrent folder path renamed"),
+            serde_json::json!({ "old_path": old_path, "new_path": new_path, "files": touched }),
+        );
+        Ok(())
+    }
+
+    async fn ensure_torrent_exists(&self, info_hash: &str) -> CmdResult<()> {
+        let reg = self.registry.read().await;
+        if reg.get(info_hash).is_some() {
+            Ok(())
+        } else {
+            Err(format!("torrent {info_hash} not found"))
+        }
     }
 
     fn global_limits_inner(&self) -> CmdResult<EngineGlobalLimits> {
@@ -2448,6 +2595,19 @@ fn queue_setting_key(info_hash: &str) -> String {
     format!("{SETTING_QUEUE_PREFIX}{info_hash}")
 }
 
+fn normalize_relative_path(path: &str) -> CmdResult<String> {
+    let parts = path
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return Err("path is empty".to_owned());
+    }
+    rt_path::SafeRelPath::from_components(&parts, false)
+        .map(|path| path.as_display())
+        .map_err(|e| e.to_string())
+}
+
 fn stable_partition_selected(
     hashes: &mut Vec<String>,
     selected: &std::collections::HashSet<&str>,
@@ -2988,6 +3148,68 @@ mod tests {
             .unwrap();
         assert_eq!(engine.queue_priority_inner(&"a".repeat(40)).unwrap(), 0);
         assert_eq!(engine.queue_priority_inner(&"c".repeat(40)).unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn rename_file_and_folder_paths_update_metadata_projection() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let (_tx, rx) = mpsc::channel(1);
+        let info_hash = "9".repeat(40);
+        let mut registry = SessionRegistry::new();
+        let entry = TorrentEntry::new(info_hash.clone(), "paths".to_owned(), "/tmp".to_owned());
+        rt_db::upsert(&conn, &row_from_entry(&entry, &meta())).unwrap();
+        registry.add(entry).unwrap();
+        rt_db::replace_torrent_files(
+            &mut conn,
+            &info_hash,
+            &[
+                rt_db::TorrentFileRow {
+                    info_hash: info_hash.clone(),
+                    file_index: 0,
+                    path: "old/a.bin".to_owned(),
+                    length: 1,
+                    offset: 0,
+                    priority: 1,
+                    wanted: true,
+                    completed_bytes: 0,
+                },
+                rt_db::TorrentFileRow {
+                    info_hash: info_hash.clone(),
+                    file_index: 1,
+                    path: "old/b.bin".to_owned(),
+                    length: 1,
+                    offset: 1,
+                    priority: 1,
+                    wanted: true,
+                    completed_bytes: 0,
+                },
+            ],
+        )
+        .unwrap();
+        let engine = Engine {
+            config: Arc::new(Config::default()),
+            registry: Arc::new(RwLock::new(registry)),
+            db: Arc::new(Mutex::new(conn)),
+            cmd_rx: rx,
+            cmd_tx: mpsc::channel(1).0,
+            torrent_chans: HashMap::new(),
+            torrent_tasks: HashMap::new(),
+            dht_tx: None,
+        };
+
+        engine
+            .rename_file_path_inner(&info_hash, 1, "old/c.bin".to_owned())
+            .await
+            .unwrap();
+        engine
+            .rename_folder_path_inner(&info_hash, "old".to_owned(), "new".to_owned())
+            .await
+            .unwrap();
+        let db = engine.db.lock().unwrap();
+        let files = rt_db::list_torrent_files(&db, &info_hash).unwrap();
+        assert_eq!(files[0].path, "new/a.bin");
+        assert_eq!(files[1].path, "new/c.bin");
     }
 
     #[tokio::test]

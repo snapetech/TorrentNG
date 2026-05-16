@@ -907,13 +907,67 @@ pub async fn torrents_rename(State(state): State<AppState>, body: String) -> imp
 }
 
 /// `POST /api/qb/v2/torrents/renameFile`.
-pub async fn torrents_rename_file() -> impl IntoResponse {
-    StatusCode::OK
+pub async fn torrents_rename_file(
+    State(state): State<AppState>,
+    body: String,
+) -> impl IntoResponse {
+    let params = parse_form_body(&body);
+    let Some(hash) = params.get("hash").and_then(|hash| normalize_api_text(hash)) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let Some(file_id) = params
+        .get("id")
+        .or_else(|| params.get("file_id"))
+        .and_then(|id| id.parse::<u32>().ok())
+    else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let Some(name) = params
+        .get("name")
+        .or_else(|| params.get("newName"))
+        .and_then(|name| normalize_api_text(name))
+    else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let Some(engine) = &state.engine else {
+        return StatusCode::OK;
+    };
+    match engine.rename_file_path(hash, file_id, name).await {
+        Ok(()) => StatusCode::OK,
+        Err(_) => StatusCode::NOT_FOUND,
+    }
 }
 
 /// `POST /api/qb/v2/torrents/renameFolder`.
-pub async fn torrents_rename_folder() -> impl IntoResponse {
-    StatusCode::OK
+pub async fn torrents_rename_folder(
+    State(state): State<AppState>,
+    body: String,
+) -> impl IntoResponse {
+    let params = parse_form_body(&body);
+    let Some(hash) = params.get("hash").and_then(|hash| normalize_api_text(hash)) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let Some(old_path) = params
+        .get("oldPath")
+        .or_else(|| params.get("old_path"))
+        .and_then(|path| normalize_api_text(path))
+    else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let Some(new_path) = params
+        .get("newPath")
+        .or_else(|| params.get("new_path"))
+        .and_then(|path| normalize_api_text(path))
+    else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let Some(engine) = &state.engine else {
+        return StatusCode::OK;
+    };
+    match engine.rename_folder_path(hash, old_path, new_path).await {
+        Ok(()) => StatusCode::OK,
+        Err(_) => StatusCode::NOT_FOUND,
+    }
 }
 
 /// `POST /api/qb/v2/torrents/setLocation`.

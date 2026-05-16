@@ -66,7 +66,7 @@ export function RatioGroupsPanel() {
 
   return (
     <section style={{ padding: '18px 24px' }}>
-      <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 12, color: '#e2e8f0' }}>
+      <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 12, color: 'var(--text)' }}>
         Ratio Groups
       </div>
 
@@ -80,8 +80,8 @@ export function RatioGroupsPanel() {
           onClick={save}
           disabled={!draft.name.trim()}
           style={{
-            background: '#1e3a5f', border: '1px solid #3b82f6', borderRadius: 5,
-            color: '#93c5fd', padding: '4px 10px', fontSize: 12,
+            background: 'var(--accent-soft)', border: '1px solid var(--accent)', borderRadius: 5,
+            color: 'var(--accent-text)', padding: '4px 10px', fontSize: 12,
             cursor: draft.name.trim() ? 'pointer' : 'not-allowed',
             opacity: draft.name.trim() ? 1 : 0.5,
           }}
@@ -92,7 +92,7 @@ export function RatioGroupsPanel() {
 
       {error && <div style={{ color: '#ef4444', fontSize: 12, marginBottom: 10 }}>{error}</div>}
       {preview && (
-        <div style={{ color: '#94a3b8', fontSize: 12, marginBottom: 10 }}>
+        <div style={{ color: 'var(--muted)', fontSize: 12, marginBottom: 10 }}>
           {preview.name}: {preview.count.toLocaleString()} matching torrent{preview.count === 1 ? '' : 's'}
         </div>
       )}
@@ -101,20 +101,20 @@ export function RatioGroupsPanel() {
         {groups.map(group => (
           <div key={group.name} style={{
             display: 'grid', gridTemplateColumns: '160px 90px 110px 150px 1fr auto auto auto',
-            gap: 8, alignItems: 'center', border: '1px solid #1e2433',
-            borderRadius: 6, padding: '9px 12px', background: '#111827', fontSize: 12,
+            gap: 8, alignItems: 'center', border: '1px solid var(--border)',
+            borderRadius: 6, padding: '9px 12px', background: 'var(--surface)', fontSize: 12,
           }}>
-            <strong style={{ color: '#cbd5e1' }}>{group.name}</strong>
-            <span style={{ color: '#94a3b8' }}>ratio {group.ratio_limit}</span>
-            <span style={{ color: '#94a3b8' }}>{group.seeding_time_limit < 0 ? 'no time cap' : `${group.seeding_time_limit}m`}</span>
-            <span style={{ color: '#64748b' }}>{group.category || 'any category'}</span>
-            <span style={{ color: '#64748b', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{group.tracker || 'any tracker'}</span>
+            <strong style={{ color: 'var(--text)' }}>{group.name}</strong>
+            <span style={{ color: 'var(--muted)' }}>ratio {group.ratio_limit}</span>
+            <span style={{ color: 'var(--muted)' }}>{group.seeding_time_limit < 0 ? 'no time cap' : `${group.seeding_time_limit}m`}</span>
+            <span style={{ color: 'var(--faint)' }}>{group.category || 'any category'}</span>
+            <span style={{ color: 'var(--faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{group.tracker || 'any tracker'}</span>
             <button
               onClick={() => apply(group.name, true)}
               disabled={pending === group.name}
               style={{
-                background: 'none', border: '1px solid #334155', borderRadius: 4,
-                color: '#94a3b8', padding: '3px 8px', fontSize: 11,
+                background: 'none', border: '1px solid var(--border-strong)', borderRadius: 4,
+                color: 'var(--muted)', padding: '3px 8px', fontSize: 11,
                 cursor: pending === group.name ? 'not-allowed' : 'pointer',
               }}
             >
@@ -124,8 +124,8 @@ export function RatioGroupsPanel() {
               onClick={() => apply(group.name, false)}
               disabled={pending === group.name}
               style={{
-                background: '#1e2433', border: '1px solid #3b82f640', borderRadius: 4,
-                color: '#3b82f6', padding: '3px 8px', fontSize: 11,
+                background: 'var(--surface-2)', border: '1px solid var(--accent)', borderRadius: 4,
+                color: 'var(--accent)', padding: '3px 8px', fontSize: 11,
                 cursor: pending === group.name ? 'not-allowed' : 'pointer',
               }}
             >
@@ -135,8 +135,8 @@ export function RatioGroupsPanel() {
               onClick={() => remove(group.name)}
               disabled={pending === group.name}
               style={{
-                background: 'none', border: '1px solid #334155', borderRadius: 4,
-                color: '#64748b', padding: '3px 8px', fontSize: 11,
+                background: 'none', border: '1px solid var(--border-strong)', borderRadius: 4,
+                color: 'var(--faint)', padding: '3px 8px', fontSize: 11,
                 cursor: pending === group.name ? 'not-allowed' : 'pointer',
               }}
             >
@@ -156,8 +156,8 @@ function Input({ value, placeholder, onChange }: { value: string; placeholder: s
       placeholder={placeholder}
       onChange={e => onChange(e.target.value)}
       style={{
-        minWidth: 0, background: '#0f1117', border: '1px solid #334155',
-        borderRadius: 5, color: '#cbd5e1', padding: '4px 8px', fontSize: 12,
+        minWidth: 0, background: 'var(--bg)', border: '1px solid var(--border-strong)',
+        borderRadius: 5, color: 'var(--text)', padding: '4px 8px', fontSize: 12,
       }}
     />
   )

@@ -19,11 +19,11 @@ export function StoragePanel() {
 
   return (
     <section style={{ padding: '18px 24px' }}>
-      <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 12, color: '#e2e8f0' }}>
+      <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 12, color: 'var(--text)' }}>
         Storage
       </div>
 
-      {isLoading && <div style={{ color: '#64748b', fontSize: 12 }}>Loading storage stats…</div>}
+      {isLoading && <div style={{ color: 'var(--faint)', fontSize: 12 }}>Loading storage stats…</div>}
       {error && <div style={{ color: '#ef4444', fontSize: 12 }}>Storage stats unavailable</div>}
 
       <div style={{ display: 'grid', gap: 10, maxWidth: 840 }}>
@@ -31,15 +31,15 @@ export function StoragePanel() {
           <div
             key={root.path}
             style={{
-              border: '1px solid #1e2433',
+              border: '1px solid var(--border)',
               borderRadius: 6,
               padding: 12,
-              background: '#111827',
+              background: 'var(--surface)',
             }}
           >
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
               <div style={{
-                flex: 1, minWidth: 0, color: root.ok ? '#cbd5e1' : '#fca5a5',
+                flex: 1, minWidth: 0, color: root.ok ? 'var(--text)' : '#fca5a5',
                 fontSize: 13, fontFamily: 'monospace', overflow: 'hidden',
                 textOverflow: 'ellipsis', whiteSpace: 'nowrap',
               }} title={root.path}>
@@ -48,21 +48,21 @@ export function StoragePanel() {
               {root.readonly && (
                 <span style={{ color: '#f59e0b', fontSize: 11 }}>read-only</span>
               )}
-              <span style={{ color: root.ok ? '#94a3b8' : '#ef4444', fontSize: 12 }}>
+              <span style={{ color: root.ok ? 'var(--muted)' : '#ef4444', fontSize: 12 }}>
                 {root.ok ? `${root.used_percent.toFixed(1)}% used` : 'unavailable'}
               </span>
             </div>
 
             {root.ok ? (
               <>
-                <div style={{ height: 6, background: '#1e2433', borderRadius: 3, overflow: 'hidden', marginBottom: 8 }}>
+                <div style={{ height: 6, background: 'var(--surface-2)', borderRadius: 3, overflow: 'hidden', marginBottom: 8 }}>
                   <div style={{
                     width: `${Math.min(100, root.used_percent)}%`,
                     height: '100%',
                     background: root.used_percent >= 90 ? '#ef4444' : root.used_percent >= 75 ? '#f59e0b' : '#22c55e',
                   }} />
                 </div>
-                <div style={{ display: 'flex', gap: 18, flexWrap: 'wrap', fontSize: 12, color: '#64748b' }}>
+                <div style={{ display: 'flex', gap: 18, flexWrap: 'wrap', fontSize: 12, color: 'var(--faint)' }}>
                   <span>Used {fmtBytes(root.used_bytes)}</span>
                   <span>Free {fmtBytes(root.available_bytes)}</span>
                   <span>Total {fmtBytes(root.total_bytes)}</span>

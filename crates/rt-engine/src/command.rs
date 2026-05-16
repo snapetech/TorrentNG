@@ -200,6 +200,18 @@ pub enum EngineCmd {
         priority: i64,
         reply: oneshot::Sender<CmdResult<()>>,
     },
+    RenameFilePath {
+        info_hash: String,
+        file_id: u32,
+        new_path: String,
+        reply: oneshot::Sender<CmdResult<()>>,
+    },
+    RenameFolderPath {
+        info_hash: String,
+        old_path: String,
+        new_path: String,
+        reply: oneshot::Sender<CmdResult<()>>,
+    },
     AddPeers {
         info_hash: String,
         peers: Vec<SocketAddr>,
