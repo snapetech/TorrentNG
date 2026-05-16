@@ -114,12 +114,22 @@ impl AnnounceRequest {
 pub fn to_http_scrape_url(tracker_url: &str, info_hash: InfoHash) -> Result<String, TrackerError> {
     let mut url = Url::parse(tracker_url).map_err(|e| TrackerError::InvalidUrl(e.to_string()))?;
     let path = url.path().to_owned();
-    if !path.ends_with("/announce") {
+    let Some((base, leaf)) = path.rsplit_once('/') else {
         return Err(TrackerError::Disabled);
-    }
-    let scrape_path = format!("{}scrape", path.trim_end_matches("announce"));
+    };
+    let Some(suffix) = leaf.strip_prefix("announce") else {
+        return Err(TrackerError::Disabled);
+    };
+    let scrape_path = format!("{base}/scrape{suffix}");
+    let existing_query = url.query().map(str::to_owned);
     url.set_path(&scrape_path);
-    url.set_query(Some(&format!("info_hash={}", info_hash.url_encode())));
+    url.set_fragment(None);
+    let info_hash_query = format!("info_hash={}", info_hash.url_encode());
+    let query = match existing_query.filter(|query| !query.is_empty()) {
+        Some(query) => format!("{query}&{info_hash_query}"),
+        None => info_hash_query,
+    };
+    url.set_query(Some(&query));
     Ok(url.to_string())
 }
 
@@ -213,6 +223,29 @@ mod tests {
         .unwrap();
         assert!(url.starts_with("http://tracker.example.com/path/scrape?"));
         assert!(url.contains("info_hash="));
+    }
+
+    #[test]
+    fn scrape_url_preserves_existing_query_and_hash_encoding() {
+        let url = to_http_scrape_url(
+            "http://tracker.example.com/path/announce.php?passkey=abc",
+            InfoHash::V1([0x11; 20]),
+        )
+        .unwrap();
+        assert!(url.starts_with("http://tracker.example.com/path/scrape.php?passkey=abc&"));
+        assert!(url.contains("info_hash=%11%11"));
+        assert!(!url.contains("%2511"));
+    }
+
+    #[test]
+    fn scrape_url_rejects_non_announce_paths() {
+        assert!(matches!(
+            to_http_scrape_url(
+                "http://tracker.example.com/path/not-announce?passkey=abc",
+                InfoHash::V1([0x11; 20])
+            ),
+            Err(TrackerError::Disabled)
+        ));
     }
 
     #[test]

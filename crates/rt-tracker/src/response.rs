@@ -260,6 +260,62 @@ mod tests {
     }
 
     #[test]
+    fn parse_scrape_response() {
+        let info_hash = [0x33u8; 20];
+        let entry = vec![
+            (&b"complete"[..], BValue::Int(12)),
+            (&b"downloaded"[..], BValue::Int(34)),
+            (&b"incomplete"[..], BValue::Int(5)),
+        ];
+        let files = vec![(&info_hash[..], BValue::Dict(entry))];
+        let raw = encode(&BValue::Dict(vec![(&b"files"[..], BValue::Dict(files))]));
+
+        let stats = ScrapeStats::parse(&raw, &info_hash).unwrap();
+
+        assert_eq!(
+            stats,
+            ScrapeStats {
+                complete: 12,
+                downloaded: 34,
+                incomplete: 5
+            }
+        );
+    }
+
+    #[test]
+    fn parse_scrape_rejects_missing_info_hash() {
+        let requested = [0x33u8; 20];
+        let other = [0x44u8; 20];
+        let entry = vec![
+            (&b"complete"[..], BValue::Int(12)),
+            (&b"downloaded"[..], BValue::Int(34)),
+            (&b"incomplete"[..], BValue::Int(5)),
+        ];
+        let files = vec![(&other[..], BValue::Dict(entry))];
+        let raw = encode(&BValue::Dict(vec![(&b"files"[..], BValue::Dict(files))]));
+
+        let err = ScrapeStats::parse(&raw, &requested).unwrap_err();
+
+        assert!(matches!(err, TrackerError::ParseError(_)));
+    }
+
+    #[test]
+    fn parse_scrape_rejects_negative_counts() {
+        let info_hash = [0x33u8; 20];
+        let entry = vec![
+            (&b"complete"[..], BValue::Int(-1)),
+            (&b"downloaded"[..], BValue::Int(34)),
+            (&b"incomplete"[..], BValue::Int(5)),
+        ];
+        let files = vec![(&info_hash[..], BValue::Dict(entry))];
+        let raw = encode(&BValue::Dict(vec![(&b"files"[..], BValue::Dict(files))]));
+
+        let err = ScrapeStats::parse(&raw, &info_hash).unwrap_err();
+
+        assert!(matches!(err, TrackerError::ParseError(_)));
+    }
+
+    #[test]
     fn parse_warning_message() {
         let mut pairs: Vec<(&[u8], BValue<'_>)> = vec![
             (b"interval", BValue::Int(1800)),

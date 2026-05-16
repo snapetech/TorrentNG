@@ -2340,6 +2340,12 @@ mod tests {
         let db = engine.db.lock().unwrap();
         let recovered = rt_db::get_job(&db, "job-running").unwrap();
         assert_eq!(recovered.state, JOB_STATE_PAUSED);
+        assert_eq!(recovered.done, 4);
+        assert_eq!(recovered.checkpoint, 4);
+        assert_eq!(recovered.file_index, Some(0));
+        assert_eq!(recovered.piece_index, Some(4));
+        assert_eq!(recovered.byte_offset, Some(4096));
+        assert_eq!(recovered.verified_bytes, 4096);
         assert!(recovered.finished_at.is_none());
         let queued = rt_db::get_job(&db, "job-queued").unwrap();
         assert_eq!(queued.state, JOB_STATE_QUEUED);

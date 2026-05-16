@@ -27,7 +27,7 @@ This is the working checklist for finishing the native Rust engine rewrite. It i
 - [x] Rate-limit recheck through storage scheduler.
 - [x] Commit torrent state only after recheck completes.
 - [x] Emit `check_started`, `check_progress`, `check_completed`, and failure events.
-- [ ] Add crash-resume recheck tests.
+- [x] Add crash-resume recheck tests.
 
 ## 3. Storage, Import, And Move Safety
 
