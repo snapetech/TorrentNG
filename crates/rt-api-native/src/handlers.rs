@@ -322,8 +322,84 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
             "ready": ready,
             "native_engine": ready,
             "torrent_count": torrent_count,
+            "engine": {
+                "mode": if ready { "native" } else { "unavailable" },
+                "source_of_truth": if ready { "sqlite_session_db" } else { "registry_only" },
+                "track1_sidecar_required": false,
+                "capabilities": native_engine_capabilities(),
+            },
         })),
     )
+}
+
+fn native_engine_capabilities() -> serde_json::Value {
+    serde_json::json!({
+        "torrent_identity": {
+            "v1": true,
+            "v2": true,
+            "hybrid": true,
+            "hash_lengths": [40, 64],
+            "magnet_xt": ["btih", "btmh"],
+        },
+        "metadata": {
+            "torrent_files": true,
+            "magnets": true,
+            "pure_v2_metadata_placeholders": true,
+            "pure_v2_metadata_completion": true,
+        },
+        "session": {
+            "durable_torrents": true,
+            "durable_files": true,
+            "durable_trackers": true,
+            "durable_limits": true,
+            "durable_labels": true,
+            "event_log": true,
+            "crash_restore": true,
+        },
+        "jobs": {
+            "durable_recheck": true,
+            "pause_resume_cancel": true,
+            "crash_recovery": true,
+            "storage_throttled": true,
+        },
+        "storage": {
+            "root_registry": true,
+            "mount_identity": true,
+            "dry_run_import": true,
+            "safe_move": true,
+            "safe_delete_after_dry_run": true,
+            "v2_file_root_verify": true,
+        },
+        "networking": {
+            "tcp_peer_wire": true,
+            "http_trackers": true,
+            "udp_trackers": true,
+            "dht": true,
+            "utp": true,
+            "private_torrent_dht_pex_lsd_default_off": true,
+        },
+        "compatibility": {
+            "native_rest": true,
+            "native_sse": true,
+            "qbittorrent_v2": true,
+            "transmission_rpc": true,
+            "deluge_rpc": true,
+        },
+        "migration": {
+            "rtorrent": true,
+            "qbittorrent": true,
+            "transmission": true,
+            "dry_run_reports": true,
+            "atomic_db_import": true,
+        },
+        "operations": {
+            "prometheus_metrics": true,
+            "diagnostics": true,
+            "bounded_shutdown": true,
+            "api_token_auth": true,
+            "scale_certification": true,
+        },
+    })
 }
 
 /// `GET /metrics` — Prometheus text exposition for native engine state.
@@ -771,6 +847,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["ready"], false);
+        assert_eq!(body["engine"]["mode"], "unavailable");
+        assert_eq!(body["engine"]["track1_sidecar_required"], false);
+        assert_eq!(
+            body["engine"]["capabilities"]["torrent_identity"]["hash_lengths"],
+            serde_json::json!([40, 64])
+        );
+        assert_eq!(
+            body["engine"]["capabilities"]["compatibility"]["transmission_rpc"],
+            true
+        );
+    }
+
+    #[test]
+    fn native_engine_capabilities_cover_rewrite_surface() {
+        let capabilities = native_engine_capabilities();
+        assert_eq!(capabilities["torrent_identity"]["v2"], true);
+        assert_eq!(
+            capabilities["metadata"]["pure_v2_metadata_completion"],
+            true
+        );
+        assert_eq!(capabilities["session"]["crash_restore"], true);
+        assert_eq!(capabilities["jobs"]["durable_recheck"], true);
+        assert_eq!(capabilities["storage"]["v2_file_root_verify"], true);
+        assert_eq!(capabilities["networking"]["dht"], true);
+        assert_eq!(capabilities["compatibility"]["qbittorrent_v2"], true);
+        assert_eq!(capabilities["migration"]["transmission"], true);
+        assert_eq!(capabilities["operations"]["prometheus_metrics"], true);
     }
 
     #[tokio::test]

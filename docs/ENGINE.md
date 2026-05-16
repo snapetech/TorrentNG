@@ -13,7 +13,9 @@ compatibility API projections.
 
 **Not the primary target:** casual desktop torrenting, search-engine plugin users, "download one magnet and watch immediately" users.
 
-The engine is seeding-first. Downloading, DHT, uTP, and streaming come later.
+The engine is seeding-first, but the rewrite now includes native downloading,
+magnet metadata, DHT/uTP protocol crates, and pure v2/hybrid metadata support.
+Streaming remains outside the first production target.
 
 ---
 
@@ -75,7 +77,9 @@ enum TorrentId {
 }
 ```
 
-Never assume SHA-1 forever. v2 and hybrid identity are first-class even if v2 full support lands in Phase 11.
+Never assume SHA-1 forever. v2 and hybrid identity are first-class: APIs,
+storage verification, metadata placeholders, fast-resume identity, and
+Transmission magnet projection accept 64-character SHA-256 info hashes.
 
 ---
 
@@ -165,8 +169,8 @@ Moving 200+ TB is a database migration, not a file copy:
 
 ### Peer connection manager
 
-- TCP listener (Phase 4)
-- uTP listener (Phase 10, optional)
+- TCP listener
+- uTP transport support
 - Outgoing connection queue with backpressure
 - Per-torrent and global peer caps
 - Peer scoring and ban/eject rules
@@ -176,20 +180,20 @@ Moving 200+ TB is a database migration, not a file copy:
 
 ### Protocol targets
 
-| BEP | Description | Phase |
+| BEP | Description | Status |
 |---|---|---|
-| BEP 3 | BitTorrent v1 baseline | 4 |
-| BEP 9 | Metadata exchange / magnet | 7 |
-| BEP 10 | Extension protocol | 4 |
-| BEP 11 | PEX | 10 |
-| BEP 12 | Multitracker | 3 |
-| BEP 14 | LSD | 10 |
-| BEP 15 | UDP trackers | 3 |
-| BEP 23 | Compact peer list | 3 |
-| BEP 27 | Private torrents | 3 |
-| BEP 29 | uTP | 10 |
+| BEP 3 | BitTorrent v1 baseline | implemented |
+| BEP 9 | Metadata exchange / magnet | implemented for v1 metadata; pure v2 placeholders/completion are taskless |
+| BEP 10 | Extension protocol | implemented |
+| BEP 11 | PEX | compatibility policy present; private torrents disable peer discovery by default |
+| BEP 12 | Multitracker | implemented |
+| BEP 14 | LSD | private torrents disable local discovery by default |
+| BEP 15 | UDP trackers | implemented for v1; v2 UDP announces are rejected explicitly |
+| BEP 23 | Compact peer list | implemented |
+| BEP 27 | Private torrents | implemented |
+| BEP 29 | uTP | transport crate implemented |
 | BEP 32 | IPv6 | later |
-| BEP 52 | BitTorrent v2 / hybrid | 11 |
+| BEP 52 | BitTorrent v2 / hybrid | implemented for parsing, identity, metadata projection, storage root verification, fastresume, and compatibility projections |
 
 DHT is implemented in Phase 10. Private-tracker profiles disable DHT/PEX/LSD by default.
 
@@ -308,7 +312,7 @@ Priority 3 (Phase 12):
 RSS, search, cookies, advanced preferences
 ```
 
-### Transmission compatibility API (Phase 12)
+### Transmission compatibility API
 
 ```
 /transmission/rpc
@@ -317,6 +321,9 @@ torrent_get / torrent_add / torrent_set
 torrent_start / torrent_stop / torrent_remove
 free_space
 ```
+
+Transmission `magnetLink` projection emits `btih` for v1 hashes and BEP 52
+`btmh` multihash links for pure v2 hashes.
 
 ---
 

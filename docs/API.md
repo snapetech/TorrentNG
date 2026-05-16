@@ -22,6 +22,21 @@ Public endpoints (never require auth): `/health`, `/metrics`, `/api/qb/v2/auth/l
 
 ---
 
+## Health And Capability Manifest
+
+`GET /health` reports native-engine readiness and a machine-readable capability
+manifest. Existing readiness fields remain stable (`status`, `ready`,
+`native_engine`, `torrent_count`), and the nested `engine.capabilities` object
+advertises rewrite-level support for v1/v2/hybrid identity, `btih`/`btmh`
+magnets, durable session/job state, storage safety, DHT/uTP policy, native REST,
+qBittorrent, Transmission, Deluge, migration, metrics, and diagnostics.
+
+The `engine.track1_sidecar_required` field is always `false` for native-engine
+mode; Track 1 remains a migration/facade layer, not a runtime dependency for
+the rewritten engine.
+
+---
+
 ## Native API — `/api/v1`
 
 ### Torrents

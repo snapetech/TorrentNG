@@ -132,7 +132,10 @@ See `docs/ENGINE.md` for the full design.
 
 > A Rust-native, headless-first BitTorrent daemon optimized for massive long-lived seeding libraries, with qBittorrent-compatible API, deterministic storage behavior, and operational observability.
 
-The engine is **not** a general-purpose torrent client first. It is a **massive-library seeding engine** first. Downloading, DHT, uTP, and streaming come later.
+The engine is **not** a general-purpose torrent client first. It is a
+**massive-library seeding engine** first. Native downloading, DHT/uTP protocol
+crates, and BEP 52 metadata/storage/API support are now part of the rewrite
+surface; streaming remains outside the first production target.
 
 ## Track 2 — Phase 0: Research and design lock
 
@@ -244,11 +247,16 @@ Full UI replacing the Track 1 WebUI, backed by the native engine API. Same desig
 
 ## Track 2 — Phase 10: DHT / PEX / LSD / uTP
 
-Optional for private-tracker profile. Exit criteria: public swarm performance comparable to baseline clients; private profile keeps these disabled.
+Implemented as native protocol/policy surface. Private-tracker profiles keep
+DHT/PEX/LSD disabled by default; public-swarm certification remains the release
+quality bar.
 
 ## Track 2 — Phase 11: BEP 52 / v2 / hybrid torrents
 
-v2 metainfo, file trees, piece layers, SHA-256 verification, hybrid torrent identity.
+Implemented for v2/hybrid parsing, file trees, SHA-256 file-root verification,
+hybrid torrent identity, durable metadata projection, pure-v2 magnet
+placeholders, fast-resume identity, and qBit/Transmission/Deluge-compatible API
+surfaces.
 
 ## Track 2 — Phase 12: Production 1.0
 
