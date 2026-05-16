@@ -1587,8 +1587,39 @@ pub async fn log_main() -> impl IntoResponse {
     (StatusCode::OK, Json(Vec::<serde_json::Value>::new()))
 }
 
-pub async fn log_peers() -> impl IntoResponse {
-    (StatusCode::OK, Json(Vec::<String>::new()))
+pub async fn log_peers(State(state): State<AppState>) -> impl IntoResponse {
+    let Some(engine) = &state.engine else {
+        return (StatusCode::OK, Json(Vec::<serde_json::Value>::new()));
+    };
+    let hashes = {
+        let reg = state.registry.read().await;
+        reg.iter()
+            .map(|entry| entry.info_hash.clone())
+            .collect::<Vec<_>>()
+    };
+    let mut entries = Vec::new();
+    for hash in hashes {
+        let peers = engine.torrent_peers(hash.clone()).await.unwrap_or_default();
+        for peer in peers {
+            entries.push(qbit_peer_log_entry(&hash, &peer));
+        }
+    }
+    (StatusCode::OK, Json(entries))
+}
+
+fn qbit_peer_log_entry(info_hash: &str, peer: &EnginePeerSnapshot) -> serde_json::Value {
+    serde_json::json!({
+        "torrent": info_hash,
+        "ip": peer.addr.ip().to_string(),
+        "port": peer.addr.port(),
+        "client": peer.client,
+        "connection": "BT",
+        "progress": peer.progress,
+        "dl_speed": peer.download_rate,
+        "up_speed": peer.upload_rate,
+        "downloaded": peer.downloaded,
+        "uploaded": peer.uploaded,
+    })
 }
 
 pub async fn search_status() -> impl IntoResponse {
@@ -3124,6 +3155,29 @@ mod tests {
         assert_eq!(peers.len(), 2);
         assert_eq!(peers[0], "127.0.0.1:6881".parse::<SocketAddr>().unwrap());
         assert_eq!(peers[1], "[::1]:6882".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn qbit_peer_log_entry_projects_engine_peer_snapshot() {
+        let peer = EnginePeerSnapshot {
+            addr: "127.0.0.1:6881".parse().unwrap(),
+            client: "BitTorrent peer".to_owned(),
+            choked: false,
+            upload_choked: false,
+            interested: true,
+            pieces: 4,
+            pieces_total: 8,
+            progress: 0.5,
+            download_rate: 128,
+            upload_rate: 256,
+            downloaded: 1024,
+            uploaded: 2048,
+        };
+        let entry = qbit_peer_log_entry(&"a".repeat(40), &peer);
+        assert_eq!(entry["torrent"], "a".repeat(40));
+        assert_eq!(entry["ip"], "127.0.0.1");
+        assert_eq!(entry["port"], 6881);
+        assert_eq!(entry["progress"], 0.5);
     }
 
     #[test]
