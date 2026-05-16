@@ -67,7 +67,7 @@ This is the working checklist for finishing the native Rust engine rewrite. It i
 
 - [x] Add native health endpoint backed by engine readiness.
 - [x] Add Prometheus metrics for torrents, peers, trackers, jobs, storage, and DB.
-- [ ] Add SSE/WebSocket delta stream for native API.
+- [x] Add SSE/WebSocket delta stream for native API.
 - [x] Add clean shutdown stopped-announces with bounded deadline.
 - [x] Add API token authentication for mutating native endpoints.
 - [x] Add structured "why is this not seeding?" diagnostic API.

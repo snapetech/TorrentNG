@@ -91,24 +91,30 @@ fn read_live_speeds(path: &str) -> Option<TransferRates> {
 
     let raw = std::fs::read_to_string(path).ok()?;
     let speeds: LiveSpeeds = serde_json::from_str(&raw).ok()?;
-    let fresh = match speeds.updated_at {
-        Some(updated_at) => {
-            let age = chrono::Utc::now().timestamp().saturating_sub(updated_at);
-            age <= LIVE_SPEEDS_MAX_AGE.as_secs() as i64
-        }
-        None => std::fs::metadata(path)
+    let legacy_modified_at = speeds.updated_at.is_none().then(|| {
+        std::fs::metadata(path)
             .ok()
             .and_then(|metadata| metadata.modified().ok())
-            .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-            .is_some_and(|age| age <= LIVE_SPEEDS_MAX_AGE),
-    };
-    if !fresh {
+    });
+    if !is_live_speeds_fresh(speeds.updated_at, legacy_modified_at.flatten()) {
         return None;
     }
     Some(TransferRates {
         download: speeds.download.max(0),
         upload: speeds.upload.max(0),
     })
+}
+
+fn is_live_speeds_fresh(updated_at: Option<i64>, legacy_modified_at: Option<SystemTime>) -> bool {
+    match updated_at {
+        Some(updated_at) => {
+            let age = chrono::Utc::now().timestamp().saturating_sub(updated_at);
+            age <= LIVE_SPEEDS_MAX_AGE.as_secs() as i64
+        }
+        None => legacy_modified_at
+            .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+            .is_some_and(|age| age <= LIVE_SPEEDS_MAX_AGE),
+    }
 }
 
 #[derive(Debug, Default)]
@@ -241,4 +247,50 @@ fn config_switch(raw: &str, key: &str, off_values: &[&str], on_values: &[&str]) 
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_speeds_with_current_timestamp_are_fresh() {
+        assert!(is_live_speeds_fresh(
+            Some(chrono::Utc::now().timestamp()),
+            None
+        ));
+    }
+
+    #[test]
+    fn live_speeds_with_old_timestamp_are_stale() {
+        let old = chrono::Utc::now().timestamp() - LIVE_SPEEDS_MAX_AGE.as_secs() as i64 - 1;
+        assert!(!is_live_speeds_fresh(Some(old), None));
+    }
+
+    #[test]
+    fn legacy_live_speeds_require_fresh_mtime() {
+        assert!(is_live_speeds_fresh(None, Some(SystemTime::now())));
+        assert!(!is_live_speeds_fresh(None, None));
+    }
+
+    #[test]
+    fn reads_current_timestamped_live_speeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live-speeds.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "download": 123,
+                "upload": 45,
+                "updated_at": chrono::Utc::now().timestamp(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let rates = read_live_speeds(path.to_str().unwrap()).unwrap();
+
+        assert_eq!(rates.download, 123);
+        assert_eq!(rates.upload, 45);
+    }
 }

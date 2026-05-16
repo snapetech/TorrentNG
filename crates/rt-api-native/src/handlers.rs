@@ -1,40 +1,28 @@
+use std::{collections::BTreeMap, convert::Infallible, time::Duration};
+
 use axum::{
     extract::{Path, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
-    response::IntoResponse,
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse,
+    },
     Json,
 };
 use base64::Engine as _;
+use futures::Stream;
 use rt_api_model::{
     AddTorrentRequest, AddTorrentResponse, ApiError, FileInfo, TorrentDetail, TorrentSummary,
 };
 use rt_metainfo::{parse_magnet, parse_torrent};
-use rt_session::TorrentState;
+use rt_session::{TorrentEntry, TorrentState};
 
 use crate::state::AppState;
 
 /// `GET /api/v1/torrents` — list all torrents.
 pub async fn list_torrents(State(state): State<AppState>) -> impl IntoResponse {
     let reg = state.registry.read().await;
-    let summaries: Vec<TorrentSummary> = reg
-        .iter()
-        .map(|e| TorrentSummary {
-            info_hash: e.info_hash.clone(),
-            name: e.name.clone(),
-            state: e.state.as_str().to_owned(),
-            total_length: e.total_length as i64,
-            downloaded: e.stats.downloaded as i64,
-            uploaded: e.stats.uploaded as i64,
-            ratio: e.stats.ratio(),
-            save_path: e.save_path.clone(),
-            category: e.category.clone(),
-            tags: e.tags.clone(),
-            added_at: e.added_at as i64,
-            completed_at: e.completed_at.map(|t| t as i64),
-            num_peers: 0,
-            num_seeds: 0,
-        })
-        .collect();
+    let summaries: Vec<TorrentSummary> = reg.iter().map(torrent_summary).collect();
     (StatusCode::OK, Json(summaries))
 }
 
@@ -184,22 +172,7 @@ pub async fn get_torrent(
     let reg = state.registry.read().await;
     match reg.get(&info_hash) {
         Some(e) => {
-            let summary = TorrentSummary {
-                info_hash: e.info_hash.clone(),
-                name: e.name.clone(),
-                state: e.state.as_str().to_owned(),
-                total_length: e.total_length as i64,
-                downloaded: e.stats.downloaded as i64,
-                uploaded: e.stats.uploaded as i64,
-                ratio: e.stats.ratio(),
-                save_path: e.save_path.clone(),
-                category: e.category.clone(),
-                tags: e.tags.clone(),
-                added_at: e.added_at as i64,
-                completed_at: e.completed_at.map(|t| t as i64),
-                num_peers: 0,
-                num_seeds: 0,
-            };
+            let summary = torrent_summary(e);
             if let Some(engine) = &state.engine {
                 match engine.torrent_metadata(info_hash.clone()).await {
                     Ok(meta) => {
@@ -382,6 +355,108 @@ pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
             )],
             format!("# failed to collect native engine metrics: {e}\n"),
         ),
+    }
+}
+
+/// `GET /api/v1/events` — server-sent torrent delta stream.
+pub async fn stream_events(
+    State(state): State<AppState>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let stream = futures::stream::unfold(
+        EventStreamState::new(state),
+        |mut stream_state| async move {
+            loop {
+                stream_state.tick.tick().await;
+                let delta = torrent_delta(&stream_state.state, &stream_state.previous).await;
+                if delta.torrents.is_empty() && delta.removed.is_empty() {
+                    continue;
+                }
+
+                stream_state.seq = stream_state.seq.saturating_add(1);
+                stream_state.previous = delta.current;
+                let payload = serde_json::json!({
+                    "seq": stream_state.seq,
+                    "torrents": delta.torrents,
+                    "removed": delta.removed,
+                });
+                let event = Event::default()
+                    .event("torrent_delta")
+                    .id(stream_state.seq.to_string())
+                    .json_data(payload)
+                    .expect("torrent delta serializes");
+                return Some((Ok(event), stream_state));
+            }
+        },
+    );
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+struct EventStreamState {
+    state: AppState,
+    previous: BTreeMap<String, String>,
+    seq: u64,
+    tick: tokio::time::Interval,
+}
+
+impl EventStreamState {
+    fn new(state: AppState) -> Self {
+        EventStreamState {
+            state,
+            previous: BTreeMap::new(),
+            seq: 0,
+            tick: tokio::time::interval(Duration::from_secs(1)),
+        }
+    }
+}
+
+struct TorrentDelta {
+    current: BTreeMap<String, String>,
+    torrents: Vec<TorrentSummary>,
+    removed: Vec<String>,
+}
+
+async fn torrent_delta(state: &AppState, previous: &BTreeMap<String, String>) -> TorrentDelta {
+    let reg = state.registry.read().await;
+    let mut current = BTreeMap::new();
+    let mut torrents = Vec::new();
+    for entry in reg.iter() {
+        let summary = torrent_summary(entry);
+        let encoded = serde_json::to_string(&summary).expect("torrent summary serializes");
+        if previous.get(&summary.info_hash) != Some(&encoded) {
+            torrents.push(summary);
+        }
+        current.insert(entry.info_hash.clone(), encoded);
+    }
+    let removed = previous
+        .keys()
+        .filter(|hash| !current.contains_key(*hash))
+        .cloned()
+        .collect();
+
+    TorrentDelta {
+        current,
+        torrents,
+        removed,
+    }
+}
+
+fn torrent_summary(e: &TorrentEntry) -> TorrentSummary {
+    TorrentSummary {
+        info_hash: e.info_hash.clone(),
+        name: e.name.clone(),
+        state: e.state.as_str().to_owned(),
+        total_length: e.total_length as i64,
+        downloaded: e.stats.downloaded as i64,
+        uploaded: e.stats.uploaded as i64,
+        ratio: e.stats.ratio(),
+        save_path: e.save_path.clone(),
+        category: e.category.clone(),
+        tags: e.tags.clone(),
+        added_at: e.added_at as i64,
+        completed_at: e.completed_at.map(|t| t as i64),
+        num_peers: 0,
+        num_seeds: 0,
     }
 }
 
@@ -963,5 +1038,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn torrent_delta_reports_initial_changes_and_removals() {
+        let state = AppState::new();
+        let hash = "b".repeat(40);
+        {
+            let mut reg = state.registry.write().await;
+            reg.add(TorrentEntry::new(
+                hash.clone(),
+                "delta.torrent".into(),
+                "/data".into(),
+            ))
+            .unwrap();
+        }
+
+        let first = torrent_delta(&state, &BTreeMap::new()).await;
+        assert_eq!(first.torrents.len(), 1);
+        assert_eq!(first.torrents[0].info_hash, hash);
+        assert!(first.removed.is_empty());
+
+        {
+            let mut reg = state.registry.write().await;
+            reg.remove(&hash).unwrap();
+        }
+        let second = torrent_delta(&state, &first.current).await;
+        assert!(second.torrents.is_empty());
+        assert_eq!(second.removed, vec![hash]);
     }
 }
