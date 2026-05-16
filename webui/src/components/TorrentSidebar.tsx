@@ -92,7 +92,8 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
   const { data: trackerHealth } = useQuery({
     queryKey: ['tracker-health'],
     queryFn: api.trackerHealth,
-    staleTime: 30_000,
+    staleTime: 5_000,
+    refetchInterval: 10_000,
   })
 
   useEffect(() => {

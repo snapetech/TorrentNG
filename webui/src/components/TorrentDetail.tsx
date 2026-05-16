@@ -59,13 +59,15 @@ export function TorrentDetail({ torrent: t, onClose }: Props) {
   const { data: trackers } = useQuery({
     queryKey: ['trackers', t.hash],
     queryFn: () => api.torrents.trackers(t.hash),
-    staleTime: 10_000,
+    staleTime: 2_000,
+    refetchInterval: 5_000,
   })
 
   const { data: files } = useQuery({
     queryKey: ['files', t.hash],
     queryFn: () => api.torrents.files(t.hash),
-    staleTime: 30_000,
+    staleTime: 2_000,
+    refetchInterval: 5_000,
   })
 
   async function doAction(fn: () => Promise<void>) {

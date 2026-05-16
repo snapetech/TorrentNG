@@ -13,7 +13,8 @@ export function StoragePanel() {
   const { data, isLoading, error } = useQuery({
     queryKey: ['storage'],
     queryFn: api.storage,
-    refetchInterval: 30_000,
+    staleTime: 5_000,
+    refetchInterval: 10_000,
   })
 
   return (

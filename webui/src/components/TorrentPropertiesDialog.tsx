@@ -36,10 +36,14 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
   const { data: trackers = [] } = useQuery({
     queryKey: ['trackers', torrent.hash],
     queryFn: () => api.torrents.trackers(torrent.hash),
+    staleTime: 2_000,
+    refetchInterval: 5_000,
   })
   const { data: files = [] } = useQuery({
     queryKey: ['files', torrent.hash],
     queryFn: () => api.torrents.files(torrent.hash),
+    staleTime: 2_000,
+    refetchInterval: 5_000,
   })
 
   useEffect(() => {

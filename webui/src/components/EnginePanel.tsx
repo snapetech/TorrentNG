@@ -5,7 +5,8 @@ export function EnginePanel() {
   const { data, isLoading, error } = useQuery({
     queryKey: ['engine'],
     queryFn: api.engine,
-    refetchInterval: 15000,
+    staleTime: 2_000,
+    refetchInterval: 5_000,
   })
   const { data: commands } = useQuery({
     queryKey: ['engine-commands'],

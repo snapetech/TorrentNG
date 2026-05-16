@@ -10,12 +10,15 @@
 ///   - 50k torrents: GET /api/qb/v2/torrents/info < 500ms
 ///   - native filter/sort over 15k torrents < 250ms
 ///   - sync/maindata delta < 50ms (at normal churn)
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::{body::Body, http::Request};
 use rt_api_native::{build_router, AppState};
 use rt_api_qbit::AppState as QbState;
+use rt_path::{StorageProfile, StorageRootId};
 use rt_session::TorrentEntry;
+use rt_storage::{IoClass, MountScheduler, SchedulerConfig};
+use rt_tracker::backoff::jitter_interval;
 use tower::ServiceExt;
 
 /// Build a native API app populated with `n` synthetic torrents.
@@ -137,4 +140,79 @@ async fn sync_maindata_15k_under_50ms() {
     let ms = get_ms(app, "/api/qb/v2/sync/maindata").await;
     let limit = threshold(50);
     assert!(ms < limit, "sync/maindata 15k took {ms}ms, want <{limit}ms");
+}
+
+#[tokio::test]
+async fn idle_memory_15k_under_2_5gb() {
+    let before = current_rss_bytes();
+    let app = qbit_app_with(15_000).await;
+    let _ = get_ms(app, "/api/qb/v2/torrents/info?limit=200").await;
+    let after = current_rss_bytes();
+    let rss = after.unwrap_or(before.unwrap_or(0));
+    let limit = 2_500_u64 * 1024 * 1024;
+
+    assert!(rss < limit, "15k idle RSS is {rss} bytes, want <{limit}");
+}
+
+#[test]
+fn tracker_restart_storm_15k_is_spread_by_jitter() {
+    let interval = Duration::from_secs(30 * 60);
+    let mut buckets = std::collections::BTreeMap::<u64, usize>::new();
+    let mut min = u64::MAX;
+    let mut max = 0;
+    for _ in 0..15_000 {
+        let seconds = jitter_interval(interval, 0.2).as_secs();
+        min = min.min(seconds);
+        max = max.max(seconds);
+        *buckets.entry(seconds / 10).or_default() += 1;
+    }
+
+    let busiest_ten_second_bucket = buckets.values().copied().max().unwrap_or_default();
+    assert!(min >= 1_440, "minimum jittered interval {min}s is too low");
+    assert!(max <= 2_160, "maximum jittered interval {max}s is too high");
+    assert!(
+        max - min > 300,
+        "jitter spread {}s is too narrow",
+        max - min
+    );
+    assert!(
+        busiest_ten_second_bucket < 750,
+        "restart storm bucket too dense: {busiest_ten_second_bucket} announces in 10s"
+    );
+}
+
+#[tokio::test]
+async fn recheck_does_not_starve_seeding_peer_reads() {
+    let scheduler = MountScheduler::new(
+        StorageRootId::new(),
+        &SchedulerConfig {
+            profile: StorageProfile::Hdd,
+            max_queue: 256,
+            recheck_concurrency: 1,
+            peer_read_concurrency: 4,
+        },
+    );
+    let _recheck = scheduler.acquire(IoClass::Recheck).await.unwrap();
+
+    let mut peer_read_permits = Vec::new();
+    for _ in 0..4 {
+        peer_read_permits.push(
+            scheduler
+                .try_acquire(IoClass::PeerRead)
+                .expect("peer reads must not wait behind recheck permits"),
+        );
+    }
+
+    assert_eq!(scheduler.available_permits(IoClass::Recheck), 0);
+    assert_eq!(scheduler.available_permits(IoClass::PeerRead), 0);
+}
+
+fn current_rss_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|line| line.starts_with("VmRSS:"))?;
+    let kb = line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|value| value.parse::<u64>().ok())?;
+    Some(kb * 1024)
 }

@@ -16,6 +16,9 @@ rt-api-native = { path = "../rt-api-native" }
 rt-api-qbit = { path = "../rt-api-qbit" }
 rt-db = { path = "../rt-db" }
 rt-testkit = { path = "../rt-testkit" }
+rt-tracker = { path = "../rt-tracker" }
+rt-storage = { path = "../rt-storage" }
+rt-path = { path = "../rt-path" }
 tokio = { version = "1", features = ["full"] }
 tower.workspace = true
 axum.workspace = true

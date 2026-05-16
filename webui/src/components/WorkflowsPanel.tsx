@@ -30,7 +30,8 @@ export function WorkflowsPanel() {
   const { data: runs = [] } = useQuery({
     queryKey: ['workflow-runs'],
     queryFn: api.workflows.runs,
-    staleTime: 10_000,
+    staleTime: 5_000,
+    refetchInterval: 10_000,
   })
 
   async function save() {

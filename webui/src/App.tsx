@@ -147,7 +147,7 @@ export function App() {
     queryKey: ['storage', 'status-bar'],
     queryFn: api.storage,
     enabled: isAuthed,
-    refetchInterval: 30_000,
+    refetchInterval: 10_000,
   })
   const { data: transferInfo } = useQuery({
     queryKey: ['transfer-info', 'status-bar'],

@@ -18,7 +18,8 @@ export function TrackerHealthPanel() {
   const { data, isLoading, error } = useQuery({
     queryKey: ['tracker-health'],
     queryFn: api.trackerHealth,
-    refetchInterval: 30_000,
+    staleTime: 5_000,
+    refetchInterval: 10_000,
   })
 
   return (
