@@ -412,6 +412,11 @@ fn capability_matrix(methods: &[String]) -> Vec<EngineCapability> {
             "Bounded torrent multicall",
             "d.multicall.range",
         ),
+        (
+            "live_rate_multicall",
+            "Live-rate torrent multicall",
+            "d.multicall.nonzero_rate",
+        ),
     ];
 
     CAPS.iter()

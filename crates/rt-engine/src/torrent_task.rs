@@ -1018,6 +1018,7 @@ impl TorrentTask {
         let mut valid = 0usize;
         let mut invalid = 0usize;
         let mut invalid_pieces = Vec::new();
+        let mut verified_pieces = Vec::with_capacity(self.piece_map.piece_count as usize);
 
         for piece in 0..self.piece_map.piece_count {
             match self.pending_recheck_control().await {
@@ -1079,23 +1080,22 @@ impl TorrentTask {
             .await;
             match result {
                 VerifyResult::Valid => {
-                    self.picker.mark_have(piece as usize);
+                    verified_pieces.push((piece, true));
                     valid += 1;
                 }
                 VerifyResult::Invalid => {
-                    self.picker.reject_piece(piece as usize);
+                    verified_pieces.push((piece, false));
                     invalid_pieces.push(piece as i64);
                     invalid += 1;
                 }
                 VerifyResult::Missing { .. } => {
-                    self.picker.reject_piece(piece as usize);
+                    verified_pieces.push((piece, false));
                     invalid_pieces.push(piece as i64);
                     invalid += 1;
                 }
             }
 
             if piece > 0 && piece % 64 == 0 {
-                self.persist_progress().await;
                 self.save_fastresume(false).await;
                 if let Some(job_id) = &job_id {
                     self.persist_recheck_job_progress(
@@ -1116,6 +1116,7 @@ impl TorrentTask {
             invalid,
             "recheck complete"
         );
+        self.commit_recheck_results(&verified_pieces);
         self.save_fastresume(true).await;
         if let Some(job_id) = &job_id {
             self.persist_recheck_job_progress(
@@ -1137,6 +1138,16 @@ impl TorrentTask {
             self.set_state(TorrentState::Downloading).await;
         }
         RecheckOutcome::Complete
+    }
+
+    fn commit_recheck_results(&mut self, verified_pieces: &[(u32, bool)]) {
+        for (piece, valid) in verified_pieces.iter().copied() {
+            if valid {
+                self.picker.mark_have(piece as usize);
+            } else {
+                self.picker.reject_piece(piece as usize);
+            }
+        }
     }
 
     async fn pending_recheck_control(&mut self) -> Option<RecheckOutcome> {

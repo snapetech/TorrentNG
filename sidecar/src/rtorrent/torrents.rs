@@ -101,7 +101,10 @@ impl Client {
             .unwrap_or_default()
             .split(',')
             .map(str::trim)
-            .any(|patch| patch == "rtorrent-0.16.11-multicall-range")
+            .any(|patch| {
+                patch == "rtorrent-0.16.11-multicall-range"
+                    || patch == "rtorrent-0.16.11-multicall-nonzero-rate"
+            })
         {
             return true;
         }
@@ -130,6 +133,22 @@ impl Client {
             .call("d.multicall.range", &args)
             .await
             .with_context(|| format!("d.multicall.range {view} offset={offset} limit={limit}"))?;
+
+        parse_torrent_rows(result.into_array())
+    }
+
+    pub async fn list_torrents_nonzero_rate(
+        &self,
+        view: &str,
+        limit: i64,
+    ) -> Result<Vec<RawTorrent>> {
+        let mut args: Vec<XmlValue> = vec!["".into(), view.to_owned().into(), limit.into()];
+        args.extend(TORRENT_FIELDS.iter().map(|&f| XmlValue::from(f)));
+
+        let result = self
+            .call("d.multicall.nonzero_rate", &args)
+            .await
+            .with_context(|| format!("d.multicall.nonzero_rate {view} limit={limit}"))?;
 
         parse_torrent_rows(result.into_array())
     }

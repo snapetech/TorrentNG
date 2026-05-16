@@ -106,17 +106,17 @@ async fn tick_bounded(
     let mut touched = HashSet::new();
 
     match rt
-        .list_torrents_range("active", 0, MULTICALL_RANGE_PAGE_SIZE)
+        .list_torrents_nonzero_rate("main", MULTICALL_RANGE_PAGE_SIZE)
         .await
     {
-        Ok(active) => {
-            for t in &active {
+        Ok(moving) => {
+            for t in &moving {
                 if touched.insert(t.hash.clone()) {
                     upsert_torrent(db, tx, t, now, &mut counts);
                 }
             }
         }
-        Err(e) => warn!("active view sync failed: {e:?}"),
+        Err(e) => warn!("nonzero-rate sync failed: {e:?}"),
     }
 
     let page = rt
