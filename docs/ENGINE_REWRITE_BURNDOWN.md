@@ -39,7 +39,7 @@ This is the working checklist for finishing the native Rust engine rewrite. It i
 - [x] Implement copy + verify + atomic rename safe path.
 - [x] Add rollback/partial failure reporting.
 - [x] Add safe delete only after dry-run approval.
-- [ ] Certify 15k-torrent dry-run import.
+- [x] Certify 15k-torrent dry-run import.
 
 ## 4. Tracker Correctness
 
