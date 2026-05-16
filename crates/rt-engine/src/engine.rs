@@ -301,6 +301,7 @@ impl Engine {
                 "dht_enabled": config.dht.enabled,
             }),
         );
+        engine.recover_interrupted_jobs()?;
         engine.load_persisted_torrents().await?;
 
         // Spawn TCP listener
@@ -961,6 +962,41 @@ impl Engine {
                 }),
             );
             info!(torrent = %row.info_hash, state = %row.state, paused, "restored persisted torrent");
+        }
+        Ok(())
+    }
+
+    fn recover_interrupted_jobs(&self) -> anyhow::Result<()> {
+        let now = unix_now_i64();
+        let db = self.db.lock().expect("database mutex poisoned");
+        let jobs = rt_db::list_active_jobs(&db)?;
+        for mut job in jobs {
+            let previous_state = job.state.clone();
+            let recovered_state = match previous_state.as_str() {
+                JOB_STATE_RUNNING | "cancelling" => Some(JOB_STATE_PAUSED),
+                _ => None,
+            };
+            let Some(recovered_state) = recovered_state else {
+                continue;
+            };
+            job.state = recovered_state.to_owned();
+            job.updated_at = now;
+            rt_db::upsert_job(&db, &job)?;
+            rt_db::append_job_event(
+                &db,
+                &rt_db::JobEventRow {
+                    event_id: None,
+                    job_id: job.job_id.clone(),
+                    occurred_at: now,
+                    kind: "job_recovered".to_owned(),
+                    message: Some("job recovered after engine restart".to_owned()),
+                    payload: serde_json::json!({
+                        "state": recovered_state,
+                        "previous_state": previous_state,
+                    })
+                    .to_string(),
+                },
+            )?;
         }
         Ok(())
     }
@@ -1635,6 +1671,7 @@ fn prune_empty_dirs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rt_bencode::{encode, BValue};
     use rt_metainfo::TorrentFileV1;
     use rt_path::SafeRelPath;
 
@@ -1655,6 +1692,27 @@ mod tests {
             private: false,
             raw: b"torrent".to_vec(),
         }
+    }
+
+    fn raw_single_file_torrent() -> Vec<u8> {
+        let pieces = vec![7u8; 20];
+        let mut info_pairs: Vec<(&[u8], BValue<'_>)> = vec![
+            (b"length", BValue::Int(1024)),
+            (b"name", BValue::Bytes(b"restore.bin")),
+            (b"piece length", BValue::Int(16_384)),
+            (b"pieces", BValue::Bytes(&pieces)),
+        ];
+        info_pairs.sort_by(|a, b| a.0.cmp(b.0));
+        let info = BValue::Dict(info_pairs);
+        let mut pairs: Vec<(&[u8], BValue<'_>)> = vec![
+            (
+                b"announce",
+                BValue::Bytes(b"http://tracker.example.com/announce"),
+            ),
+            (b"info", info),
+        ];
+        pairs.sort_by(|a, b| a.0.cmp(b.0));
+        encode(&BValue::Dict(pairs))
     }
 
     #[test]
@@ -1884,6 +1942,133 @@ mod tests {
         let job = rt_db::get_job(&db, &job_id).unwrap();
         assert_eq!(job.state, JOB_STATE_CANCELLED);
         assert!(job.finished_at.is_some());
+    }
+
+    #[test]
+    fn recover_interrupted_jobs_pauses_running_work() {
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let (_tx, rx) = mpsc::channel(1);
+        let engine = Engine {
+            config: Arc::new(Config::default()),
+            registry: Arc::new(RwLock::new(SessionRegistry::new())),
+            db: Arc::new(Mutex::new(conn)),
+            cmd_rx: rx,
+            cmd_tx: mpsc::channel(1).0,
+            torrent_chans: HashMap::new(),
+            dht_tx: None,
+        };
+        let mut job = rt_db::JobRow {
+            job_id: "job-running".to_owned(),
+            kind: JOB_KIND_RECHECK.to_owned(),
+            state: JOB_STATE_RUNNING.to_owned(),
+            dry_run: false,
+            affected_torrents: vec!["d".repeat(40)],
+            total: 10,
+            done: 4,
+            checkpoint: 4,
+            file_index: Some(0),
+            piece_index: Some(4),
+            byte_offset: Some(4096),
+            verified_bytes: 4096,
+            invalid_pieces: Vec::new(),
+            error: None,
+            created_at: 1,
+            started_at: Some(2),
+            updated_at: 3,
+            finished_at: None,
+        };
+        {
+            let db = engine.db.lock().unwrap();
+            rt_db::upsert_job(&db, &job).unwrap();
+        }
+        job.job_id = "job-queued".to_owned();
+        job.state = JOB_STATE_QUEUED.to_owned();
+        {
+            let db = engine.db.lock().unwrap();
+            rt_db::upsert_job(&db, &job).unwrap();
+        }
+
+        engine.recover_interrupted_jobs().unwrap();
+
+        let db = engine.db.lock().unwrap();
+        let recovered = rt_db::get_job(&db, "job-running").unwrap();
+        assert_eq!(recovered.state, JOB_STATE_PAUSED);
+        assert!(recovered.finished_at.is_none());
+        let queued = rt_db::get_job(&db, "job-queued").unwrap();
+        assert_eq!(queued.state, JOB_STATE_QUEUED);
+        let events = rt_db::list_job_events(&db, "job-running", 10).unwrap();
+        assert_eq!(events[0].kind, "job_recovered");
+    }
+
+    #[tokio::test]
+    async fn load_persisted_torrents_restores_registry_and_task_channels() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.daemon.session_dir = temp.path().join("session");
+        config.db.path = temp.path().join("state.db");
+        std::fs::create_dir_all(torrent_blob_dir(&config)).unwrap();
+        std::fs::create_dir_all(fastresume_dir(&config)).unwrap();
+
+        let conn = Connection::open(config.db_path()).unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let raw = raw_single_file_torrent();
+        let TorrentMeta::V1(meta) = parse_torrent(&raw).unwrap() else {
+            panic!("expected v1 torrent");
+        };
+        let info_hash = meta
+            .info_hash
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        std::fs::write(torrent_blob_path(&config, &info_hash), &raw).unwrap();
+        rt_db::upsert(
+            &conn,
+            &TorrentRow {
+                info_hash: info_hash.clone(),
+                name: meta.name.clone(),
+                total_length: meta.total_length() as i64,
+                piece_length: meta.piece_length as i64,
+                piece_count: meta.pieces.len() as i64,
+                is_private: false,
+                save_path: temp.path().join("downloads").to_string_lossy().to_string(),
+                category: Some("movies".to_owned()),
+                tags: vec!["restored".to_owned()],
+                state: "paused".to_owned(),
+                added_at: 10,
+                completed_at: None,
+                uploaded: 5,
+                downloaded: 7,
+                ratio: 0.0,
+                trackers: meta.all_trackers(),
+            },
+        )
+        .unwrap();
+
+        let (_tx, rx) = mpsc::channel(1);
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        let mut engine = Engine {
+            config: Arc::new(config),
+            registry: Arc::clone(&registry),
+            db: Arc::new(Mutex::new(conn)),
+            cmd_rx: rx,
+            cmd_tx: mpsc::channel(1).0,
+            torrent_chans: HashMap::new(),
+            dht_tx: None,
+        };
+
+        engine.load_persisted_torrents().await.unwrap();
+
+        assert!(engine.torrent_chans.contains_key(&info_hash));
+        let reg = registry.read().await;
+        let restored = reg.get(&info_hash).unwrap();
+        assert_eq!(restored.state, TorrentState::Paused);
+        assert_eq!(restored.category.as_deref(), Some("movies"));
+        assert_eq!(restored.tags, vec!["restored".to_owned()]);
+        drop(reg);
+        if let Some(tx) = engine.torrent_chans.remove(&info_hash) {
+            let _ = tx.send(TorrentCmd::Shutdown).await;
+        }
     }
 }
 

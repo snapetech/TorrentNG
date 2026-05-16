@@ -15,9 +15,9 @@ This is the working checklist for finishing the native Rust engine rewrite. It i
 - [x] Add durable `jobs` table with resumable checkpoint fields.
 - [x] Add `settings`, `storage_roots`, `mounts`, and `api_tokens` tables.
 - [ ] Add typed DB helpers for events, jobs, files, trackers, settings, mounts, and limits. (events/jobs/files/trackers/settings/limits done; mounts remaining)
-- [ ] Load engine/session state from DB on startup, not only in-memory registry bootstrap.
+- [x] Load engine/session state from DB on startup, not only in-memory registry bootstrap.
 - [x] Persist every engine state transition atomically with a session event.
-- [ ] Add crash recovery tests for DB-backed state.
+- [x] Add crash recovery tests for DB-backed state.
 
 ## 2. Recheck And Verification Jobs
 

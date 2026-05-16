@@ -15,6 +15,8 @@ index 23e262c..25370c9 100644
    return resultRaw;
  }
  
++static constexpr int64_t rtng_multicall_max_limit = 1000;
++
 +torrent::Object
 +d_multicall_range(const torrent::Object::list_type& args) {
 +  if (args.size() < 3)
@@ -42,15 +44,13 @@ index 23e262c..25370c9 100644
 +  if (limit < 0)
 +    throw torrent::input_error("d.multicall.range limit must be non-negative.");
 +
-+  static constexpr int64_t max_limit = 1000;
-+
 +  torrent::Object             resultRaw = torrent::Object::create_list();
 +  torrent::Object::list_type& result = resultRaw.as_list();
 +
 +  if (limit == 0)
 +    return resultRaw;
 +
-+  const int64_t bounded_limit = std::min(limit, max_limit);
++  const int64_t bounded_limit = std::min(limit, rtng_multicall_max_limit);
 +
 +  auto view_begin = (*view_itr)->begin_visible();
 +  auto view_end   = (*view_itr)->end_visible();
@@ -78,6 +78,60 @@ index 23e262c..25370c9 100644
 +  return resultRaw;
 +}
 +
++torrent::Object
++d_multicall_nonzero_rate(const torrent::Object::list_type& args) {
++  if (args.size() < 2)
++    throw torrent::input_error("d.multicall.nonzero_rate requires view, limit and optional commands.");
++
++  torrent::Object::list_const_iterator arg = args.begin();
++
++  core::ViewManager* viewManager = control->view_manager();
++  core::ViewManager::iterator view_itr;
++
++  if (!arg->as_string().empty())
++    view_itr = viewManager->find(arg->as_string());
++  else
++    view_itr = viewManager->find("default");
++
++  if (view_itr == viewManager->end())
++    throw torrent::input_error("Could not find view.");
++
++  const int64_t limit = (++arg)->as_value();
++
++  if (limit < 0)
++    throw torrent::input_error("d.multicall.nonzero_rate limit must be non-negative.");
++
++  torrent::Object             resultRaw = torrent::Object::create_list();
++  torrent::Object::list_type& result = resultRaw.as_list();
++
++  if (limit == 0)
++    return resultRaw;
++
++  const int64_t bounded_limit = std::min(limit, rtng_multicall_max_limit);
++  ++arg; // skip to first command
++
++  for (auto itr = (*view_itr)->begin_visible(); itr != (*view_itr)->end_visible(); ++itr) {
++    auto target = rpc::make_target(*itr);
++    const int64_t down_rate = rpc::parse_command(target, "d.down.rate=", "d.down.rate=" + 12).first.as_value();
++    const int64_t up_rate   = rpc::parse_command(target, "d.up.rate=", "d.up.rate=" + 10).first.as_value();
++
++    if (down_rate <= 0 && up_rate <= 0)
++      continue;
++
++    torrent::Object::list_type& row = result.insert(result.end(), torrent::Object::create_list())->as_list();
++
++    for (auto command = arg; command != args.end(); ++command) {
++      auto& cmdstr = command->as_string();
++      row.push_back(rpc::parse_command(target, cmdstr.c_str(), cmdstr.c_str() + cmdstr.size()).first);
++    }
++
++    if (static_cast<int64_t>(result.size()) >= bounded_limit)
++      break;
++  }
++
++  return resultRaw;
++}
++
  static void
  call_watch_command(const std::string& command, const std::string& path) {
    rpc::commands.call_catch(command.c_str(), rpc::make_target(), path);
@@ -86,6 +140,7 @@ index 23e262c..25370c9 100644
    CMD2_ANY_LIST    ("d.multicall2",        std::bind(&d_multicall, std::placeholders::_2));
    CMD2_ANY_LIST    ("d.multicall.filtered", std::bind(&d_multicall_filtered, std::placeholders::_2));
 +  CMD2_ANY_LIST    ("d.multicall.range",   std::bind(&d_multicall_range, std::placeholders::_2));
++  CMD2_ANY_LIST    ("d.multicall.nonzero_rate", std::bind(&d_multicall_nonzero_rate, std::placeholders::_2));
  
    CMD2_ANY_LIST    ("directory.watch.added", std::bind(&directory_watch_added, std::placeholders::_2));
  
@@ -94,4 +149,5 @@ index 23e262c..25370c9 100644
    rpc::rpc.mark_safe("d.multicall2");
    rpc::rpc.mark_safe("d.multicall.filtered");
 +  rpc::rpc.mark_safe("d.multicall.range");
++  rpc::rpc.mark_safe("d.multicall.nonzero_rate");
  }
