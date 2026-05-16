@@ -161,8 +161,11 @@ The Phase 2 sidecar API (`PUT /api/v1/torrents/{hash}` with `save_path`) handles
 
 If migration causes problems:
 
-1. Stop the new container
-2. Restore your session backup: `cp -r ~/rtorrent-session.bak ~/.rtorrent-session`
-3. Start your old rTorrent install
+1. Stop the new container.
+2. Restore the native DB/session backup created before import.
+3. Keep the original source client session untouched and restart it if needed.
+4. Re-run the dry-run report after correcting path/category/tag remaps.
 
 No migration step modifies the session directory in-place. The import is read-only from the source.
+See [BACKUP_RESTORE.md](BACKUP_RESTORE.md) for native DB backup and restore
+commands.

@@ -1,6 +1,9 @@
 # Native Rust Engine Design
 
-This document covers the full Rust BitTorrent engine planned for Track 2. Track 2 begins after the rTorrent sidecar (Track 1) ships.
+This document covers the native Rust BitTorrent engine. Track 1 compatibility
+code remains available as a migration and facade layer, but native engine state
+is now the source of truth for torrent rows, files, trackers, jobs, metrics, and
+compatibility API projections.
 
 ---
 
@@ -40,18 +43,20 @@ crates/
   rt-fastresume/      — resume state import (rTorrent .rtorrent, qBit .fastresume)
   rt-storage/         — storage root abstraction, mount awareness, disk scheduler
   rt-tracker/         — HTTP + UDP announce, tiers, backoff, announce accounting, scrape
-  rt-peer-protocol/   — peer wire codec, extension protocol, fuzzed
+  rt-peer-wire/       — peer wire codec, extension protocol, fuzzed
   rt-peer-manager/    — connection pool, choking, unchoking, peer scoring, ban rules
   rt-piece-picker/    — rarest-first, endgame, file priority
   rt-dht/             — DHT (Phase 10, private-tracker-off by default)
   rt-utp/             — uTP transport (Phase 10)
-  rt-session/         — torrent lifecycle supervisor, SQLite DB, event log, job queue
+  rt-session/         — torrent lifecycle types and registry
+  rt-db/              — SQLite schema, durable rows, events, jobs, labels, storage roots
   rt-api-model/       — shared API types (serde)
   rt-api-native/      — native REST + WebSocket API (axum)
   rt-api-qbit/        — qBittorrent v2 compatibility shim
-  rt-api-transmission/ — Transmission RPC (Phase 12)
+  rt-api-transmission/ — Transmission RPC facade over native state
+  rt-api-deluge/      — Deluge best-effort facade over native state
   rt-jobs/            — bulk op job queue, dry-run engine
-  rt-metrics/         — Prometheus metrics definitions
+  rt-metrics/         — Prometheus metrics definitions and scale certification tests
   rt-config/          — TOML config, env override, validation
   rt-migrate/         — import from rTorrent / qBit / Transmission
   rt-testkit/         — test fixtures, synthetic torrent generators, interop helpers
@@ -435,6 +440,12 @@ Multiple tracker tiers
 
 ## Migration
 
+Implemented migration support lives in `rt-migrate`. Scanners are read-only
+against source session directories and produce an auditable dry-run plan before
+anything is written to the native DB. The apply path writes native torrent rows,
+file rows, tracker rows, labels, categories, counters, ratio, and completion
+state through `rt-db`.
+
 ### From rTorrent
 
 - Import session directory and `.torrent` files
@@ -468,13 +479,20 @@ A migration is not done until:
 ## Runtime
 
 - Tokio async runtime (peer sockets, trackers, API, events)
-- Rayon or bounded threadpool for CPU-bound hashing — never unbounded `spawn_blocking`
 - `bytes` for network buffers
 - `rusqlite` (bundled) for session DB
 - `axum` + `tower` for HTTP API
 - `tracing` + `tracing-subscriber` JSON layer for logs
-- `criterion` for benchmarks
-- `proptest` / `cargo-fuzz` for parsers and state machines
-- `loom` for critical concurrency primitives
+- Rust integration tests for migration, scale, compatibility APIs, tracker
+  behavior, storage scheduling, and crash recovery
+- Certification reports under `certification/reports/`
 
 No global shared mutable state. Strict actor/task boundaries. Bounded channels with backpressure everywhere.
+
+## Release Operations
+
+- Backup/restore: [BACKUP_RESTORE.md](BACKUP_RESTORE.md)
+- Native deployment: [NATIVE_DEPLOYMENT.md](NATIVE_DEPLOYMENT.md)
+- Threat model: [THREAT_MODEL.md](THREAT_MODEL.md)
+- Certification report: `scripts/native_engine_certification_report.sh`
+- Public Linux ISO certification: `scripts/public_linux_iso_certification.sh`

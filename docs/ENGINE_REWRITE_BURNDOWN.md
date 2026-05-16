@@ -61,7 +61,7 @@ This is the working checklist for finishing the native Rust engine rewrite. It i
 - [x] Enforce file priorities in picker and writes.
 - [x] Verify every received piece before marking complete.
 - [x] Harden upload serving for large multi-file torrents.
-- [ ] Add public Linux ISO download certification.
+- [x] Add public Linux ISO download certification.
 
 ## 6. Daemon Operations
 
@@ -80,7 +80,7 @@ This is the working checklist for finishing the native Rust engine rewrite. It i
 - [x] Map qBit files/trackers/pieces to real engine metadata and piece state.
 - [x] Keep Transmission RPC compatible with durable engine state.
 - [x] Keep Deluge compatibility as best-effort facade.
-- [ ] Add compatibility certification runs for Prowlarr/Sonarr/Radarr/autobrr/cross-seed/NZB360/Transdrone.
+- [x] Add compatibility certification runs for Prowlarr/Sonarr/Radarr/autobrr/cross-seed/NZB360/Transdrone.
 
 ## 8. Migration
 
@@ -89,7 +89,7 @@ This is the working checklist for finishing the native Rust engine rewrite. It i
 - [x] Import Transmission resume/state.
 - [x] Preserve categories/tags/labels/save paths/trackers.
 - [x] Add dry-run migration reports.
-- [ ] Add rollback/backup docs.
+- [x] Add rollback/backup docs.
 
 ## 9. Scale Certification
 
@@ -99,13 +99,13 @@ This is the working checklist for finishing the native Rust engine rewrite. It i
 - [x] API list/filter/sort latency benchmark.
 - [x] Tracker restart storm benchmark.
 - [x] Recheck-vs-seeding starvation benchmark.
-- [ ] Publish certification report.
+- [x] Publish certification report.
 
 ## 10. Release Hygiene
 
 - [x] Update crate READMEs with actual status.
-- [ ] Update `docs/ENGINE.md` when implemented behavior diverges from design.
-- [ ] Add threat model review.
-- [ ] Add backup/restore docs.
-- [ ] Add production deployment docs for native engine mode.
-- [ ] Remove or archive Track 1-only compatibility code when native engine supersedes it.
+- [x] Update `docs/ENGINE.md` when implemented behavior diverges from design.
+- [x] Add threat model review.
+- [x] Add backup/restore docs.
+- [x] Add production deployment docs for native engine mode.
+- [x] Remove or archive Track 1-only compatibility code when native engine supersedes it.
