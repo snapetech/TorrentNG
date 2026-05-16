@@ -17,7 +17,7 @@ use tracing::{info, warn};
 use rt_config::Config;
 use rt_db::TorrentRow;
 use rt_fastresume::{FastresumeStore, PieceState};
-use rt_metainfo::{parse_torrent, MagnetLink, TorrentMeta, TorrentMetaV1};
+use rt_metainfo::{parse_torrent, MagnetLink, TorrentMeta, TorrentMetaV1, TorrentMetaV2};
 use rt_peer_wire::handshake::{Handshake, HANDSHAKE_LEN};
 use rt_session::{SessionRegistry, TorrentEntry, TorrentState, TransferStats};
 
@@ -870,15 +870,7 @@ impl Engine {
         category: Option<String>,
         tags: Vec<String>,
     ) -> CmdResult<String> {
-        let v1 = match meta {
-            TorrentMeta::V1(m) => m,
-            TorrentMeta::Hybrid(m, _) => m,
-            TorrentMeta::V2(_) => {
-                return Err("pure v2 torrents not yet supported for seeding".to_owned());
-            }
-        };
-
-        let info_hash_hex: String = v1.info_hash.iter().map(|b| format!("{b:02x}")).collect();
+        let info_hash_hex = meta_info_hash_hex(&meta);
 
         if self.torrent_chans.contains_key(&info_hash_hex) {
             return Err(format!("torrent {info_hash_hex} already added"));
@@ -891,16 +883,16 @@ impl Engine {
             let mut reg = self.registry.write().await;
             let mut entry = TorrentEntry::new(
                 info_hash_hex.clone(),
-                v1.name.clone(),
+                meta.name().to_owned(),
                 save.to_string_lossy().into_owned(),
             );
-            entry.total_length = v1.total_length();
+            entry.total_length = meta_total_length(&meta);
             entry.amount_left = entry.total_length;
             entry.category = normalize_category(category);
             entry.tags = normalize_tags(tags);
             reg.add(entry).map_err(|e| e.to_string())?;
             // TorrentEntry starts in Stopped; transition to target state.
-            let target = if paused {
+            let target = if paused || matches!(meta, TorrentMeta::V2(_)) {
                 TorrentState::Paused
             } else {
                 TorrentState::Downloading
@@ -910,31 +902,35 @@ impl Engine {
             }
         }
 
-        self.save_torrent_blob(&info_hash_hex, &v1.raw)
+        self.save_torrent_blob(&info_hash_hex, meta_raw(&meta))
             .map_err(|e| e.to_string())?;
         {
             let reg = self.registry.read().await;
             let entry = reg
                 .get(&info_hash_hex)
                 .ok_or_else(|| format!("torrent {info_hash_hex} missing from registry"))?;
-            self.persist_entry(entry, &v1).map_err(|e| e.to_string())?;
+            self.persist_entry(entry, &meta)
+                .map_err(|e| e.to_string())?;
         }
 
-        let is_private = v1.private;
-        let info_hash = v1.info_hash;
-        let torrent_name = v1.name.clone();
-        let _cmd_tx = self.spawn_torrent_task(info_hash_hex.clone(), v1, save, paused);
-        if !paused && !is_private {
-            self.register_dht_torrent(info_hash, &info_hash_hex).await;
+        let is_private = meta.is_private();
+        let torrent_name = meta.name().to_owned();
+        if let Some(v1) = meta_v1(meta) {
+            let info_hash = v1.info_hash;
+            let _cmd_tx = self.spawn_torrent_task(info_hash_hex.clone(), v1, save, paused);
+            if !paused && !is_private {
+                self.register_dht_torrent(info_hash, &info_hash_hex).await;
+            }
         }
         self.append_session_event(
             Some(&info_hash_hex),
             EVENT_TORRENT_ADDED,
             Some("torrent added"),
             serde_json::json!({
-                "paused": paused,
+                "paused": paused || self.torrent_chans.get(&info_hash_hex).is_none(),
                 "private": is_private,
                 "name": torrent_name,
+                "v2_only": self.torrent_chans.get(&info_hash_hex).is_none(),
             }),
         );
         info!(torrent = %info_hash_hex, paused, "torrent added");
@@ -1071,7 +1067,7 @@ impl Engine {
             let entry = reg
                 .get(info_hash_hex)
                 .ok_or_else(|| format!("torrent {info_hash_hex} missing after metadata update"))?;
-            self.persist_entry(entry, &meta)
+            self.persist_entry(entry, &TorrentMeta::V1(meta.clone()))
                 .map_err(|e| e.to_string())?;
         }
 
@@ -1259,21 +1255,13 @@ impl Engine {
                 }
             };
             let meta = match parse_torrent(&raw) {
-                Ok(TorrentMeta::V1(m)) | Ok(TorrentMeta::Hybrid(m, _)) => m,
-                Ok(TorrentMeta::V2(_)) => {
-                    warn!(torrent = %row.info_hash, "pure v2 persisted torrent is unsupported");
-                    continue;
-                }
+                Ok(meta) => meta,
                 Err(e) => {
                     warn!(torrent = %row.info_hash, err = %e, "failed to parse persisted torrent");
                     continue;
                 }
             };
-            let info_hash_hex = meta
-                .info_hash
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>();
+            let info_hash_hex = meta_info_hash_hex(&meta);
             if info_hash_hex != row.info_hash {
                 warn!(
                     row_hash = %row.info_hash,
@@ -1294,16 +1282,19 @@ impl Engine {
 
             let state = state_from_str(&row.state);
             let paused = !matches!(state, TorrentState::Downloading);
-            let is_private = meta.private;
-            let info_hash = meta.info_hash;
-            let _tx = self.spawn_torrent_task(
-                row.info_hash.clone(),
-                meta,
-                PathBuf::from(&row.save_path),
-                paused,
-            );
-            if !paused && !is_private {
-                self.register_dht_torrent(info_hash, &row.info_hash).await;
+            let is_private = meta.is_private();
+            let v2_only = matches!(meta, TorrentMeta::V2(_));
+            if let Some(v1) = meta_v1(meta) {
+                let info_hash = v1.info_hash;
+                let _tx = self.spawn_torrent_task(
+                    row.info_hash.clone(),
+                    v1,
+                    PathBuf::from(&row.save_path),
+                    paused,
+                );
+                if !paused && !is_private {
+                    self.register_dht_torrent(info_hash, &row.info_hash).await;
+                }
             }
             self.append_session_event(
                 Some(&row.info_hash),
@@ -1312,6 +1303,7 @@ impl Engine {
                 serde_json::json!({
                     "state": row.state,
                     "private": is_private,
+                    "v2_only": v2_only,
                 }),
             );
             info!(torrent = %row.info_hash, state = %row.state, paused, "restored persisted torrent");
@@ -1354,7 +1346,7 @@ impl Engine {
         Ok(())
     }
 
-    fn persist_entry(&self, entry: &TorrentEntry, meta: &TorrentMetaV1) -> anyhow::Result<()> {
+    fn persist_entry(&self, entry: &TorrentEntry, meta: &TorrentMeta) -> anyhow::Result<()> {
         let row = row_from_entry(entry, meta);
         let mut db = self.db.lock().expect("database mutex poisoned");
         rt_db::upsert(&db, &row)?;
@@ -1390,13 +1382,10 @@ impl Engine {
         let raw = std::fs::read(&blob_path).with_context(|| {
             format!("reading persisted torrent metadata {}", blob_path.display())
         })?;
-        let meta = match parse_torrent(&raw)? {
-            TorrentMeta::V1(m) | TorrentMeta::Hybrid(m, _) => m,
-            TorrentMeta::V2(_) => anyhow::bail!("pure v2 torrents are not supported"),
-        };
+        let meta = parse_torrent(&raw)?;
         let root = PathBuf::from(save_path);
-        for file in &meta.files {
-            let path = file.path.resolve(&root);
+        for rel_path in meta_file_paths(&meta) {
+            let path = rel_path.resolve(&root);
             match std::fs::remove_file(&path) {
                 Ok(()) => {
                     prune_empty_dirs(path.parent(), &root)?;
@@ -1430,11 +1419,8 @@ impl Engine {
                 });
             }
         };
-        let meta = match parse_torrent(&raw)? {
-            TorrentMeta::V1(m) | TorrentMeta::Hybrid(m, _) => m,
-            TorrentMeta::V2(_) => anyhow::bail!("pure v2 torrents are not supported"),
-        };
-        let mut metadata = metadata_from_v1(&meta);
+        let meta = parse_torrent(&raw)?;
+        let mut metadata = metadata_from_meta(&meta);
         {
             let db = self.db.lock().expect("database mutex poisoned");
             if let Ok(files) = rt_db::list_torrent_files(&db, info_hash) {
@@ -1518,7 +1504,7 @@ impl Engine {
             entry.tags.retain(|tag| !remove_tags.contains(tag));
         }
         let row = match load_v1_from_blob(&self.config, info_hash) {
-            Ok(meta) => row_from_entry(entry, &meta),
+            Ok(meta) => row_from_entry(entry, &TorrentMeta::V1(meta)),
             Err(_) => {
                 let db = self.db.lock().expect("database mutex poisoned");
                 let mut row = rt_db::get(&db, info_hash).map_err(|e| e.to_string())?;
@@ -1563,7 +1549,7 @@ impl Engine {
         }
 
         let row = match load_v1_from_blob(&self.config, info_hash) {
-            Ok(meta) => row_from_entry(entry, &meta),
+            Ok(meta) => row_from_entry(entry, &TorrentMeta::V1(meta)),
             Err(_) => {
                 let db = self.db.lock().expect("database mutex poisoned");
                 let mut row = rt_db::get(&db, info_hash).map_err(|e| e.to_string())?;
@@ -2422,14 +2408,14 @@ impl Engine {
     }
 }
 
-pub(crate) fn row_from_entry(entry: &TorrentEntry, meta: &TorrentMetaV1) -> TorrentRow {
+pub(crate) fn row_from_entry(entry: &TorrentEntry, meta: &TorrentMeta) -> TorrentRow {
     TorrentRow {
         info_hash: entry.info_hash.clone(),
         name: entry.name.clone(),
-        total_length: meta.total_length() as i64,
-        piece_length: meta.piece_length as i64,
-        piece_count: meta.pieces.len() as i64,
-        is_private: meta.private,
+        total_length: meta_total_length(meta) as i64,
+        piece_length: meta_piece_length(meta) as i64,
+        piece_count: meta_piece_count(meta) as i64,
+        is_private: meta.is_private(),
         save_path: entry.save_path.clone(),
         category: entry.category.clone(),
         tags: entry.tags.clone(),
@@ -2439,29 +2425,16 @@ pub(crate) fn row_from_entry(entry: &TorrentEntry, meta: &TorrentMetaV1) -> Torr
         uploaded: entry.stats.uploaded as i64,
         downloaded: entry.stats.downloaded as i64,
         ratio: entry.stats.ratio(),
-        trackers: meta.all_trackers(),
+        trackers: meta_all_trackers(meta),
     }
 }
 
 fn persist_torrent_files(
     db: &mut Connection,
     info_hash: &str,
-    meta: &TorrentMetaV1,
+    meta: &TorrentMeta,
 ) -> anyhow::Result<()> {
-    let rows: Vec<_> = meta
-        .files
-        .iter()
-        .map(|file| rt_db::TorrentFileRow {
-            info_hash: info_hash.to_owned(),
-            file_index: file.index as i64,
-            path: file.path.as_display(),
-            length: file.length as i64,
-            offset: file.offset as i64,
-            priority: 1,
-            wanted: true,
-            completed_bytes: 0,
-        })
-        .collect();
+    let rows = meta_file_rows(info_hash, meta);
     rt_db::replace_torrent_files(db, info_hash, &rows)?;
     Ok(())
 }
@@ -2517,6 +2490,120 @@ fn load_v1_from_blob(config: &Config, info_hash: &str) -> anyhow::Result<Torrent
     match parse_torrent(&raw)? {
         TorrentMeta::V1(m) | TorrentMeta::Hybrid(m, _) => Ok(m),
         TorrentMeta::V2(_) => anyhow::bail!("pure v2 torrents are not supported"),
+    }
+}
+
+fn meta_v1(meta: TorrentMeta) -> Option<TorrentMetaV1> {
+    match meta {
+        TorrentMeta::V1(meta) | TorrentMeta::Hybrid(meta, _) => Some(meta),
+        TorrentMeta::V2(_) => None,
+    }
+}
+
+fn meta_raw(meta: &TorrentMeta) -> &[u8] {
+    match meta {
+        TorrentMeta::V1(meta) => &meta.raw,
+        TorrentMeta::V2(meta) => &meta.raw,
+        TorrentMeta::Hybrid(meta, _) => &meta.raw,
+    }
+}
+
+fn meta_info_hash_hex(meta: &TorrentMeta) -> String {
+    match meta {
+        TorrentMeta::V1(meta) => hex::encode(meta.info_hash),
+        TorrentMeta::V2(meta) => hex::encode(meta.info_hash_v2),
+        TorrentMeta::Hybrid(meta, _) => hex::encode(meta.info_hash),
+    }
+}
+
+fn meta_total_length(meta: &TorrentMeta) -> u64 {
+    match meta {
+        TorrentMeta::V1(meta) => meta.total_length(),
+        TorrentMeta::V2(meta) => meta.total_length(),
+        TorrentMeta::Hybrid(meta, _) => meta.total_length(),
+    }
+}
+
+fn meta_piece_length(meta: &TorrentMeta) -> u64 {
+    match meta {
+        TorrentMeta::V1(meta) => meta.piece_length,
+        TorrentMeta::V2(meta) => meta.piece_length,
+        TorrentMeta::Hybrid(meta, _) => meta.piece_length,
+    }
+}
+
+fn meta_piece_count(meta: &TorrentMeta) -> usize {
+    match meta {
+        TorrentMeta::V1(meta) => meta.pieces.len(),
+        TorrentMeta::V2(meta) => meta.total_length().div_ceil(meta.piece_length) as usize,
+        TorrentMeta::Hybrid(meta, _) => meta.pieces.len(),
+    }
+}
+
+fn meta_all_trackers(meta: &TorrentMeta) -> Vec<String> {
+    match meta {
+        TorrentMeta::V1(meta) | TorrentMeta::Hybrid(meta, _) => meta.all_trackers(),
+        TorrentMeta::V2(meta) => v2_all_trackers(meta),
+    }
+}
+
+fn v2_all_trackers(meta: &TorrentMetaV2) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    if let Some(announce) = &meta.announce {
+        if seen.insert(announce.clone()) {
+            out.push(announce.clone());
+        }
+    }
+    for tier in &meta.announce_list {
+        for url in tier {
+            if seen.insert(url.clone()) {
+                out.push(url.clone());
+            }
+        }
+    }
+    out
+}
+
+fn meta_file_paths(meta: &TorrentMeta) -> Vec<rt_path::SafeRelPath> {
+    match meta {
+        TorrentMeta::V1(meta) | TorrentMeta::Hybrid(meta, _) => {
+            meta.files.iter().map(|file| file.path.clone()).collect()
+        }
+        TorrentMeta::V2(meta) => meta.files.iter().map(|file| file.path.clone()).collect(),
+    }
+}
+
+fn meta_file_rows(info_hash: &str, meta: &TorrentMeta) -> Vec<rt_db::TorrentFileRow> {
+    match meta {
+        TorrentMeta::V1(meta) | TorrentMeta::Hybrid(meta, _) => meta
+            .files
+            .iter()
+            .map(|file| rt_db::TorrentFileRow {
+                info_hash: info_hash.to_owned(),
+                file_index: file.index as i64,
+                path: file.path.as_display(),
+                length: file.length as i64,
+                offset: file.offset as i64,
+                priority: 1,
+                wanted: true,
+                completed_bytes: 0,
+            })
+            .collect(),
+        TorrentMeta::V2(meta) => meta
+            .files
+            .iter()
+            .map(|file| rt_db::TorrentFileRow {
+                info_hash: info_hash.to_owned(),
+                file_index: file.index as i64,
+                path: file.path.as_display(),
+                length: file.length as i64,
+                offset: file.offset as i64,
+                priority: 1,
+                wanted: true,
+                completed_bytes: 0,
+            })
+            .collect(),
     }
 }
 
@@ -2709,26 +2796,51 @@ fn engine_limits_from_row(row: rt_db::TorrentLimitRow) -> EngineTorrentLimits {
     }
 }
 
-fn metadata_from_v1(meta: &TorrentMetaV1) -> EngineTorrentMetadata {
-    EngineTorrentMetadata {
-        piece_length: meta.piece_length,
-        piece_count: meta.pieces.len(),
-        piece_hashes: meta.pieces.iter().map(hex::encode).collect(),
-        piece_states: vec![EnginePieceState::Missing; meta.pieces.len()],
-        is_private: meta.private,
-        trackers: meta.all_trackers(),
-        webseeds: meta.webseeds.clone(),
-        files: meta
-            .files
-            .iter()
-            .map(|file| EngineTorrentFile {
-                index: file.index,
-                path: file.path.as_display(),
-                length: file.length,
-                priority: 1,
-                wanted: true,
-            })
-            .collect(),
+fn metadata_from_meta(meta: &TorrentMeta) -> EngineTorrentMetadata {
+    match meta {
+        TorrentMeta::V1(meta) | TorrentMeta::Hybrid(meta, _) => EngineTorrentMetadata {
+            piece_length: meta.piece_length,
+            piece_count: meta.pieces.len(),
+            piece_hashes: meta.pieces.iter().map(hex::encode).collect(),
+            piece_states: vec![EnginePieceState::Missing; meta.pieces.len()],
+            is_private: meta.private,
+            trackers: meta.all_trackers(),
+            webseeds: meta.webseeds.clone(),
+            files: meta
+                .files
+                .iter()
+                .map(|file| EngineTorrentFile {
+                    index: file.index,
+                    path: file.path.as_display(),
+                    length: file.length,
+                    priority: 1,
+                    wanted: true,
+                })
+                .collect(),
+        },
+        TorrentMeta::V2(meta) => {
+            let piece_count = meta.total_length().div_ceil(meta.piece_length) as usize;
+            EngineTorrentMetadata {
+                piece_length: meta.piece_length,
+                piece_count,
+                piece_hashes: vec![String::new(); piece_count],
+                piece_states: vec![EnginePieceState::Missing; piece_count],
+                is_private: meta.private,
+                trackers: v2_all_trackers(meta),
+                webseeds: meta.webseeds.clone(),
+                files: meta
+                    .files
+                    .iter()
+                    .map(|file| EngineTorrentFile {
+                        index: file.index,
+                        path: file.path.as_display(),
+                        length: file.length,
+                        priority: 1,
+                        wanted: true,
+                    })
+                    .collect(),
+            }
+        }
     }
 }
 
@@ -2828,6 +2940,33 @@ mod tests {
         encode(&BValue::Dict(pairs))
     }
 
+    fn raw_v2_torrent() -> Vec<u8> {
+        let pieces_root = vec![0xAB; 32];
+        let leaf = BValue::Dict({
+            let mut pairs: Vec<(&[u8], BValue<'_>)> = vec![
+                (b"length", BValue::Int(65_536)),
+                (b"pieces root", BValue::Bytes(&pieces_root)),
+            ];
+            pairs.sort_by(|a, b| a.0.cmp(b.0));
+            pairs
+        });
+        let file_node = BValue::Dict(vec![(b"".as_ref(), leaf)]);
+        let file_tree = BValue::Dict(vec![(b"data.bin".as_ref(), file_node)]);
+        let mut info_pairs: Vec<(&[u8], BValue<'_>)> = vec![
+            (b"file tree", file_tree),
+            (b"meta version", BValue::Int(2)),
+            (b"name", BValue::Bytes(b"v2dir")),
+            (b"piece length", BValue::Int(16_384)),
+        ];
+        info_pairs.sort_by(|a, b| a.0.cmp(b.0));
+        let mut pairs: Vec<(&[u8], BValue<'_>)> = vec![
+            (b"announce", BValue::Bytes(b"http://tracker.example/v2")),
+            (b"info", BValue::Dict(info_pairs)),
+        ];
+        pairs.sort_by(|a, b| a.0.cmp(b.0));
+        encode(&BValue::Dict(pairs))
+    }
+
     #[test]
     fn row_conversion_preserves_session_fields() {
         let meta = meta();
@@ -2836,7 +2975,7 @@ mod tests {
         entry.stats.add_download(10);
         entry.stats.add_upload(5);
 
-        let row = row_from_entry(&entry, &meta);
+        let row = row_from_entry(&entry, &TorrentMeta::V1(meta));
         assert_eq!(row.info_hash, entry.info_hash);
         assert_eq!(row.state, "downloading");
         assert_eq!(row.total_length, 20_000);
@@ -2891,7 +3030,7 @@ mod tests {
             offset: 0,
         }];
 
-        let projected = metadata_from_v1(&meta);
+        let projected = metadata_from_meta(&TorrentMeta::V1(meta));
 
         assert_eq!(projected.piece_length, 16_384);
         assert_eq!(projected.piece_count, 2);
@@ -2914,10 +3053,37 @@ mod tests {
     }
 
     #[test]
+    fn pure_v2_metadata_projects_to_engine_and_db_shapes() {
+        let raw = raw_v2_torrent();
+        let meta = parse_torrent(&raw).unwrap();
+        let info_hash = meta_info_hash_hex(&meta);
+        assert_eq!(info_hash.len(), 64);
+
+        let entry = TorrentEntry::new(info_hash.clone(), meta.name().to_owned(), "/tmp".into());
+        let row = row_from_entry(&entry, &meta);
+        assert_eq!(row.info_hash, info_hash);
+        assert_eq!(row.name, "v2dir");
+        assert_eq!(row.total_length, 65_536);
+        assert_eq!(row.piece_length, 16_384);
+        assert_eq!(row.piece_count, 4);
+        assert_eq!(row.trackers, vec!["http://tracker.example/v2"]);
+
+        let files = meta_file_rows(&info_hash, &meta);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "v2dir/data.bin");
+        assert_eq!(files[0].length, 65_536);
+
+        let projected = metadata_from_meta(&meta);
+        assert_eq!(projected.piece_count, 4);
+        assert_eq!(projected.piece_states.len(), 4);
+        assert_eq!(projected.files[0].path, "v2dir/data.bin");
+    }
+
+    #[test]
     fn metadata_placeholder_projection_preserves_trackers() {
         let mut row = row_from_entry(
             &TorrentEntry::new("02".repeat(20), "pending".into(), "/tmp/data".into()),
-            &meta(),
+            &TorrentMeta::V1(meta()),
         );
         row.total_length = 0;
         row.piece_length = 0;
@@ -3191,7 +3357,7 @@ mod tests {
         let info_hash = "9".repeat(40);
         let mut registry = SessionRegistry::new();
         let entry = TorrentEntry::new(info_hash.clone(), "paths".to_owned(), "/tmp".to_owned());
-        rt_db::upsert(&conn, &row_from_entry(&entry, &meta())).unwrap();
+        rt_db::upsert(&conn, &row_from_entry(&entry, &TorrentMeta::V1(meta()))).unwrap();
         registry.add(entry).unwrap();
         rt_db::replace_torrent_files(
             &mut conn,
@@ -3253,7 +3419,7 @@ mod tests {
         let mut entry = TorrentEntry::new(info_hash.clone(), "tracked".into(), "/data".into());
         entry.total_length = 1_000;
         entry.stats.downloaded = 250;
-        let row = row_from_entry(&entry, &meta());
+        let row = row_from_entry(&entry, &TorrentMeta::V1(meta()));
         rt_db::upsert(&conn, &row).unwrap();
 
         let registry = Arc::new(RwLock::new(SessionRegistry::new()));
@@ -3303,7 +3469,7 @@ mod tests {
         rt_db::migrate(&conn).unwrap();
         let info_hash = "1".repeat(40);
         let entry = TorrentEntry::new(info_hash.clone(), "limited".into(), "/data".into());
-        let row = row_from_entry(&entry, &meta());
+        let row = row_from_entry(&entry, &TorrentMeta::V1(meta()));
         rt_db::upsert(&conn, &row).unwrap();
 
         let registry = Arc::new(RwLock::new(SessionRegistry::new()));

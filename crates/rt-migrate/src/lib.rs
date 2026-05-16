@@ -357,11 +357,8 @@ fn migration_torrent_from_path(
     resume_by_stem: &BTreeMap<String, PathBuf>,
 ) -> Result<MigrationTorrent, String> {
     let raw = std::fs::read(path).map_err(|e| e.to_string())?;
-    let meta = match parse_torrent(&raw).map_err(|e| e.to_string())? {
-        TorrentMeta::V1(meta) | TorrentMeta::Hybrid(meta, _) => meta,
-        TorrentMeta::V2(_) => return Err("pure v2 torrents are not yet importable".to_owned()),
-    };
-    let info_hash = hex_lower(&meta.info_hash);
+    let meta = parse_torrent(&raw).map_err(|e| e.to_string())?;
+    let info_hash = migration_info_hash(&meta);
     let resume_path = resume_by_stem
         .get(&info_hash)
         .or_else(|| {
@@ -385,25 +382,16 @@ fn migration_torrent_from_path(
         warnings.push("missing resume sidecar; import will require verification".to_owned());
     }
 
-    let trackers = meta.all_trackers();
-    let files = meta
-        .files
-        .iter()
-        .map(|file| MigrationFile {
-            index: file.index,
-            path: file.path.as_display(),
-            length: file.length,
-            offset: file.offset,
-        })
-        .collect();
+    let trackers = migration_trackers(&meta);
+    let files = migration_files(&meta);
 
     Ok(MigrationTorrent {
         info_hash,
-        name: meta.name.clone(),
-        total_length: meta.total_length(),
-        piece_length: meta.piece_length,
-        piece_count: meta.pieces.len() as u64,
-        is_private: meta.private,
+        name: meta.name().to_owned(),
+        total_length: migration_total_length(&meta),
+        piece_length: migration_piece_length(&meta),
+        piece_count: migration_piece_count(&meta),
+        is_private: meta.is_private(),
         files,
         torrent_path: path.to_path_buf(),
         resume_path,
@@ -416,6 +404,79 @@ fn migration_torrent_from_path(
         trackers,
         warnings,
     })
+}
+
+fn migration_info_hash(meta: &TorrentMeta) -> String {
+    match meta {
+        TorrentMeta::V1(meta) | TorrentMeta::Hybrid(meta, _) => hex_lower(&meta.info_hash),
+        TorrentMeta::V2(meta) => hex_lower(&meta.info_hash_v2),
+    }
+}
+
+fn migration_total_length(meta: &TorrentMeta) -> u64 {
+    match meta {
+        TorrentMeta::V1(meta) | TorrentMeta::Hybrid(meta, _) => meta.total_length(),
+        TorrentMeta::V2(meta) => meta.total_length(),
+    }
+}
+
+fn migration_piece_length(meta: &TorrentMeta) -> u64 {
+    match meta {
+        TorrentMeta::V1(meta) | TorrentMeta::Hybrid(meta, _) => meta.piece_length,
+        TorrentMeta::V2(meta) => meta.piece_length,
+    }
+}
+
+fn migration_piece_count(meta: &TorrentMeta) -> u64 {
+    match meta {
+        TorrentMeta::V1(meta) | TorrentMeta::Hybrid(meta, _) => meta.pieces.len() as u64,
+        TorrentMeta::V2(meta) => meta.total_length().div_ceil(meta.piece_length),
+    }
+}
+
+fn migration_trackers(meta: &TorrentMeta) -> Vec<String> {
+    match meta {
+        TorrentMeta::V1(meta) | TorrentMeta::Hybrid(meta, _) => meta.all_trackers(),
+        TorrentMeta::V2(meta) => {
+            let mut out = Vec::new();
+            if let Some(announce) = &meta.announce {
+                out.push(announce.clone());
+            }
+            for tier in &meta.announce_list {
+                for url in tier {
+                    if !out.contains(url) {
+                        out.push(url.clone());
+                    }
+                }
+            }
+            out
+        }
+    }
+}
+
+fn migration_files(meta: &TorrentMeta) -> Vec<MigrationFile> {
+    match meta {
+        TorrentMeta::V1(meta) | TorrentMeta::Hybrid(meta, _) => meta
+            .files
+            .iter()
+            .map(|file| MigrationFile {
+                index: file.index,
+                path: file.path.as_display(),
+                length: file.length,
+                offset: file.offset,
+            })
+            .collect(),
+        TorrentMeta::V2(meta) => meta
+            .files
+            .iter()
+            .map(|file| MigrationFile {
+                index: file.index,
+                path: file.path.as_display(),
+                length: file.length,
+                offset: file.offset,
+            })
+            .collect(),
+    }
 }
 
 fn parse_resume_file(path: &Path) -> Result<ResumeData, String> {

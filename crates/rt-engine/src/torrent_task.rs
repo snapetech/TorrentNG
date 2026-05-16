@@ -23,7 +23,7 @@ use std::sync::Arc;
 use rt_fastresume::{
     FastresumeState, FastresumeStore, FileHint, ImportPolicy, PartialPieceState, PieceState,
 };
-use rt_metainfo::{torrent_info_bytes, TorrentMetaV1};
+use rt_metainfo::{torrent_info_bytes, TorrentMeta, TorrentMetaV1};
 use rt_path::{StorageProfile, StorageRootId};
 use rt_peer_manager::{
     ChokeDecision, ChokeState, Choker, PeerId, PeerSnapshot, DEFAULT_MAX_UNCHOKED,
@@ -1069,7 +1069,7 @@ impl TorrentTask {
         } else {
             entry.stats.add_download(bytes);
         }
-        let row = crate::engine::row_from_entry(entry, &self.meta);
+        let row = crate::engine::row_from_entry(entry, &TorrentMeta::V1(self.meta.clone()));
         let db = self.db.lock().expect("database mutex poisoned");
         if let Err(e) = rt_db::upsert(&db, &row) {
             warn!(
@@ -1528,7 +1528,7 @@ impl TorrentTask {
                         .as_secs(),
                 );
             }
-            let row = crate::engine::row_from_entry(entry, &self.meta);
+            let row = crate::engine::row_from_entry(entry, &TorrentMeta::V1(self.meta.clone()));
             let db = self.db.lock().expect("database mutex poisoned");
             if let Err(e) = rt_db::upsert(&db, &row) {
                 warn!(
@@ -1545,7 +1545,7 @@ impl TorrentTask {
         if let Some(entry) = reg.get_mut(&self.info_hash_hex) {
             entry.total_length = self.meta.total_length();
             entry.amount_left = self.picker.bytes_left();
-            let row = crate::engine::row_from_entry(entry, &self.meta);
+            let row = crate::engine::row_from_entry(entry, &TorrentMeta::V1(self.meta.clone()));
             let db = self.db.lock().expect("database mutex poisoned");
             if let Err(e) = rt_db::upsert(&db, &row) {
                 warn!(

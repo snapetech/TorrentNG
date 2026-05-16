@@ -36,7 +36,6 @@ impl Client {
                     "t.url=".into(),
                     "t.id=".into(),
                     "t.group=".into(),
-                    "t.group_index=".into(),
                     "t.is_enabled=".into(),
                     "t.is_open=".into(),
                     "t.is_extra_tracker=".into(),
@@ -49,7 +48,6 @@ impl Client {
                     "t.scrape_incomplete=".into(),
                     "t.scrape_complete=".into(),
                     "t.scrape_downloaded=".into(),
-                    "t.message=".into(),
                 ],
             )
             .await;
@@ -93,29 +91,29 @@ impl Client {
 
 fn parse_tracker_rows(rows: Vec<XmlValue>) -> Vec<RawTracker> {
         let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
+        for (idx, row) in rows.into_iter().enumerate() {
             let f = row.into_array();
-            if f.len() < 17 {
+            if f.len() < 15 {
                 continue;
             }
             out.push(RawTracker {
                 url: sf(&f, 0),
                 id: nf(&f, 1),
                 group: nf(&f, 2),
-                group_index: nf(&f, 3),
-                is_enabled: bf(&f, 4),
-                is_open: bf(&f, 5),
-                is_extra_tracker: bf(&f, 6),
-                activity_time_last: nf(&f, 7),
-                activity_time_next: nf(&f, 8),
-                min_interval: nf(&f, 9),
-                normal_interval: nf(&f, 10),
-                failed_counter: nf(&f, 11),
-                success_counter: nf(&f, 12),
-                scrape_incomplete: nf(&f, 13),
-                scrape_complete: nf(&f, 14),
-                scrape_downloaded: nf(&f, 15),
-                message: sf(&f, 16),
+                group_index: idx as i64,
+                is_enabled: bf(&f, 3),
+                is_open: bf(&f, 4),
+                is_extra_tracker: bf(&f, 5),
+                activity_time_last: nf(&f, 6),
+                activity_time_next: nf(&f, 7),
+                min_interval: nf(&f, 8),
+                normal_interval: nf(&f, 9),
+                failed_counter: nf(&f, 10),
+                success_counter: nf(&f, 11),
+                scrape_incomplete: nf(&f, 12),
+                scrape_complete: nf(&f, 13),
+                scrape_downloaded: nf(&f, 14),
+                message: String::new(),
             });
         }
         out
@@ -169,7 +167,6 @@ mod tests {
             "udp://tracker.example/announce".into(),
             7_i64.into(),
             1_i64.into(),
-            2_i64.into(),
             true.into(),
             false.into(),
             true.into(),
@@ -182,7 +179,6 @@ mod tests {
             5_i64.into(),
             6_i64.into(),
             7_i64.into(),
-            "tracker message".into(),
         ])];
 
         let parsed = parse_tracker_rows(rows);
@@ -191,13 +187,13 @@ mod tests {
         assert_eq!(parsed[0].url, "udp://tracker.example/announce");
         assert_eq!(parsed[0].id, 7);
         assert_eq!(parsed[0].group, 1);
-        assert_eq!(parsed[0].group_index, 2);
+        assert_eq!(parsed[0].group_index, 0);
         assert!(parsed[0].is_enabled);
         assert!(!parsed[0].is_open);
         assert!(parsed[0].is_extra_tracker);
         assert_eq!(parsed[0].scrape_complete, 6);
         assert_eq!(parsed[0].scrape_downloaded, 7);
-        assert_eq!(parsed[0].message, "tracker message");
+        assert_eq!(parsed[0].message, "");
     }
 
     #[test]
