@@ -22,10 +22,7 @@ pub async fn run(rt: Arc<Client>, tx: broadcast::Sender<Event>, interval: Durati
     loop {
         ticker.tick().await;
         let rates = match live_speeds_file() {
-            Some(path) => match read_live_speeds(&path) {
-                Some(rates) => rates,
-                None => probe_transfer_rates(&rt).await,
-            },
+            Some(path) => read_live_speeds(&path).unwrap_or_default(),
             None => match tokio::time::timeout(PROBE_TIMEOUT, rt.transfer_rates()).await {
                 Ok(Ok(rates)) => rates,
                 Ok(Err(e)) => {
@@ -58,6 +55,7 @@ pub fn current_rates(rt: Arc<Client>) -> impl std::future::Future<Output = Trans
             if let Some(rates) = read_live_speeds(&path) {
                 return rates;
             }
+            return TransferRates::default();
         }
         probe_transfer_rates(&rt).await
     }

@@ -34,6 +34,8 @@ pub struct DaemonConfig {
     pub api_bind: String,
     /// Log level filter (e.g. "info", "debug", "rt_engine=trace").
     pub log_level: String,
+    /// Max seconds to wait for torrent tasks to send stopped announces on shutdown.
+    pub shutdown_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +101,7 @@ impl Default for DaemonConfig {
             session_dir: default_session_dir(),
             api_bind: "127.0.0.1:8080".to_owned(),
             log_level: "info".to_owned(),
+            shutdown_timeout_secs: 10,
         }
     }
 }
@@ -235,6 +238,7 @@ mod tests {
         assert!(!c.dht.bootstrap_nodes.is_empty());
         assert_eq!(c.tracker.http_timeout_secs, 30);
         assert!(c.auth.api_tokens.is_empty());
+        assert_eq!(c.daemon.shutdown_timeout_secs, 10);
     }
 
     #[test]
@@ -270,5 +274,6 @@ api_tokens = ["one", "two"]
         assert_eq!(c.tracker.http_timeout_secs, 30);
         assert!(c.dht.enabled);
         assert_eq!(c.auth.api_tokens, vec!["one", "two"]);
+        assert_eq!(c.daemon.shutdown_timeout_secs, 10);
     }
 }

@@ -10,6 +10,8 @@ use rusqlite::Connection;
 use sha1::{Digest, Sha1};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, RwLock};
+use tokio::task::JoinHandle;
+use tokio::time::{timeout, Duration, Instant};
 use tracing::{info, warn};
 
 use rt_config::Config;
@@ -268,6 +270,7 @@ pub struct Engine {
     cmd_tx: mpsc::Sender<EngineCmd>,
     /// info_hash_hex → channel to the torrent task
     torrent_chans: HashMap<String, mpsc::Sender<TorrentCmd>>,
+    torrent_tasks: HashMap<String, JoinHandle<()>>,
     dht_tx: Option<mpsc::Sender<DhtCommand>>,
 }
 
@@ -312,6 +315,7 @@ impl Engine {
             cmd_rx,
             cmd_tx: tx,
             torrent_chans: HashMap::new(),
+            torrent_tasks: HashMap::new(),
             dht_tx: dht_shutdown,
         };
         engine.append_session_event(
@@ -357,10 +361,7 @@ impl Engine {
                 }
             }
         }
-        // Shutdown all torrent tasks
-        for (_, tx) in self.torrent_chans.drain() {
-            let _ = tx.send(TorrentCmd::Shutdown).await;
-        }
+        self.shutdown_torrent_tasks().await;
         if let Some(tx) = self.dht_tx.take() {
             let _ = tx.send(DhtCommand::Shutdown).await;
         }
@@ -419,6 +420,7 @@ impl Engine {
             } => {
                 let result = if let Some(tx) = self.torrent_chans.remove(&info_hash) {
                     let _ = tx.send(TorrentCmd::Shutdown).await;
+                    self.torrent_tasks.remove(&info_hash);
                     let mut reg = self.registry.write().await;
                     match reg.remove(&info_hash) {
                         Ok(entry) => {
@@ -661,9 +663,7 @@ impl Engine {
         let is_private = v1.private;
         let info_hash = v1.info_hash;
         let torrent_name = v1.name.clone();
-        let cmd_tx = self.spawn_torrent_task(v1, save, paused);
-
-        self.torrent_chans.insert(info_hash_hex.clone(), cmd_tx);
+        let _cmd_tx = self.spawn_torrent_task(info_hash_hex.clone(), v1, save, paused);
         if !paused && !is_private {
             self.register_dht_torrent(info_hash, &info_hash_hex).await;
         }
@@ -745,13 +745,12 @@ impl Engine {
             rt_db::upsert(&db, &row).map_err(|e| e.to_string())?;
         }
         {
-            let cmd_tx = self.spawn_metadata_task(
+            let _cmd_tx = self.spawn_metadata_task(
                 info_hash,
                 info_hash_hex.clone(),
                 magnet.trackers.clone(),
                 paused,
             );
-            self.torrent_chans.insert(info_hash_hex.clone(), cmd_tx);
         }
         if !paused {
             self.register_dht_torrent(info_hash, &info_hash_hex).await;
@@ -819,12 +818,16 @@ impl Engine {
         if let Some(old_tx) = self.torrent_chans.remove(info_hash_hex) {
             let _ = old_tx.send(TorrentCmd::Shutdown).await;
         }
+        if let Some(old_task) = self.torrent_tasks.remove(info_hash_hex) {
+            tokio::spawn(async move {
+                let _ = timeout(Duration::from_secs(10), old_task).await;
+            });
+        }
         let is_private = meta.private;
         let info_hash = meta.info_hash;
         let torrent_name = meta.name.clone();
         let total_length = meta.total_length();
-        let tx = self.spawn_torrent_task(meta, save, false);
-        self.torrent_chans.insert(info_hash_hex.to_owned(), tx);
+        let _tx = self.spawn_torrent_task(info_hash_hex.to_owned(), meta, save, false);
         if !is_private {
             self.register_dht_torrent(info_hash, info_hash_hex).await;
         }
@@ -843,7 +846,8 @@ impl Engine {
     }
 
     fn spawn_torrent_task(
-        &self,
+        &mut self,
+        info_hash_hex: String,
         meta: TorrentMetaV1,
         save: PathBuf,
         paused: bool,
@@ -863,21 +867,24 @@ impl Engine {
             self.config.tracker.udp_timeout_secs,
             self.config.tracker.min_interval_secs,
         );
-        tokio::spawn(task.run());
+        let handle = tokio::spawn(task.run());
+        self.torrent_chans
+            .insert(info_hash_hex.clone(), cmd_tx.clone());
+        self.torrent_tasks.insert(info_hash_hex, handle);
         cmd_tx
     }
 
     fn spawn_metadata_task(
-        &self,
+        &mut self,
         info_hash: [u8; 20],
         info_hash_hex: String,
         trackers: Vec<String>,
         paused: bool,
     ) -> mpsc::Sender<TorrentCmd> {
         let (cmd_tx, cmd_rx) = mpsc::channel::<TorrentCmd>(32);
-        tokio::spawn(run_metadata_task(
+        let handle = tokio::spawn(run_metadata_task(
             info_hash,
-            info_hash_hex,
+            info_hash_hex.clone(),
             trackers,
             cmd_rx,
             self.cmd_tx.clone(),
@@ -887,7 +894,58 @@ impl Engine {
             self.config.tracker.udp_timeout_secs,
             paused,
         ));
+        self.torrent_chans
+            .insert(info_hash_hex.clone(), cmd_tx.clone());
+        self.torrent_tasks.insert(info_hash_hex, handle);
         cmd_tx
+    }
+
+    async fn shutdown_torrent_tasks(&mut self) {
+        let task_count = self.torrent_chans.len();
+        for tx in self.torrent_chans.values() {
+            let _ = tx.send(TorrentCmd::Shutdown).await;
+        }
+        self.torrent_chans.clear();
+
+        let timeout_secs = self.config.daemon.shutdown_timeout_secs.max(1);
+        let timeout_budget = Duration::from_secs(timeout_secs);
+        let deadline = Instant::now() + timeout_budget;
+        let mut timed_out = false;
+
+        for (info_hash, mut task) in std::mem::take(&mut self.torrent_tasks) {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                timed_out = true;
+                task.abort();
+                warn!(
+                    torrent = %info_hash,
+                    timeout_secs,
+                    "aborted torrent task after shutdown deadline"
+                );
+                continue;
+            };
+
+            match timeout(remaining, &mut task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if !e.is_cancelled() {
+                        warn!(torrent = %info_hash, err = %e, "torrent task failed during shutdown");
+                    }
+                }
+                Err(_) => {
+                    timed_out = true;
+                    task.abort();
+                    warn!(
+                        torrent = %info_hash,
+                        timeout_secs,
+                        "aborted torrent task after shutdown deadline"
+                    );
+                }
+            }
+        }
+
+        if !timed_out {
+            info!(tasks = task_count, "torrent tasks stopped cleanly");
+        }
     }
 
     async fn load_persisted_torrents(&mut self) -> anyhow::Result<()> {
@@ -906,13 +964,12 @@ impl Engine {
                 }
                 drop(reg);
                 if let Ok(info_hash) = parse_info_hash_hex(&row.info_hash) {
-                    let tx = self.spawn_metadata_task(
+                    let _tx = self.spawn_metadata_task(
                         info_hash,
                         row.info_hash.clone(),
                         row.trackers.clone(),
                         paused,
                     );
-                    self.torrent_chans.insert(row.info_hash.clone(), tx);
                     if !paused {
                         self.register_dht_torrent(info_hash, &row.info_hash).await;
                     }
@@ -979,8 +1036,12 @@ impl Engine {
             let paused = !matches!(state, TorrentState::Downloading);
             let is_private = meta.private;
             let info_hash = meta.info_hash;
-            let tx = self.spawn_torrent_task(meta, PathBuf::from(&row.save_path), paused);
-            self.torrent_chans.insert(row.info_hash.clone(), tx);
+            let _tx = self.spawn_torrent_task(
+                row.info_hash.clone(),
+                meta,
+                PathBuf::from(&row.save_path),
+                paused,
+            );
             if !paused && !is_private {
                 self.register_dht_torrent(info_hash, &row.info_hash).await;
             }
@@ -1416,13 +1477,12 @@ impl Engine {
         }
         let info_hash =
             parse_info_hash_hex(info_hash_hex).map_err(|_| "invalid info hash".to_owned())?;
-        let tx = self.spawn_metadata_task(
+        let _tx = self.spawn_metadata_task(
             info_hash,
             info_hash_hex.to_owned(),
             row.trackers,
             state_from_str(&row.state) == TorrentState::Paused,
         );
-        self.torrent_chans.insert(info_hash_hex.to_owned(), tx);
         Ok(())
     }
 
@@ -2091,6 +2151,7 @@ mod tests {
             cmd_rx: rx,
             cmd_tx: mpsc::channel(1).0,
             torrent_chans: HashMap::new(),
+            torrent_tasks: HashMap::new(),
             dht_tx: None,
         };
 
@@ -2121,6 +2182,7 @@ mod tests {
             cmd_rx: rx,
             cmd_tx: mpsc::channel(1).0,
             torrent_chans: HashMap::new(),
+            torrent_tasks: HashMap::new(),
             dht_tx: None,
         };
 
@@ -2156,6 +2218,7 @@ mod tests {
             cmd_rx: rx,
             cmd_tx: mpsc::channel(1).0,
             torrent_chans,
+            torrent_tasks: HashMap::new(),
             dht_tx: None,
         };
 
@@ -2189,6 +2252,43 @@ mod tests {
         assert!(job.finished_at.is_some());
     }
 
+    #[tokio::test]
+    async fn shutdown_torrent_tasks_sends_shutdown_and_waits_for_task_exit() {
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let (_tx, rx) = mpsc::channel(1);
+        let (torrent_tx, mut torrent_rx) = mpsc::channel(1);
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        let info_hash = "f".repeat(40);
+        let mut torrent_chans = HashMap::new();
+        torrent_chans.insert(info_hash.clone(), torrent_tx);
+        let mut torrent_tasks = HashMap::new();
+        torrent_tasks.insert(
+            info_hash,
+            tokio::spawn(async move {
+                if matches!(torrent_rx.recv().await, Some(TorrentCmd::Shutdown)) {
+                    let _ = seen_tx.send(());
+                }
+            }),
+        );
+        let mut engine = Engine {
+            config: Arc::new(Config::default()),
+            registry: Arc::new(RwLock::new(SessionRegistry::new())),
+            db: Arc::new(Mutex::new(conn)),
+            cmd_rx: rx,
+            cmd_tx: mpsc::channel(1).0,
+            torrent_chans,
+            torrent_tasks,
+            dht_tx: None,
+        };
+
+        engine.shutdown_torrent_tasks().await;
+
+        assert!(seen_rx.await.is_ok());
+        assert!(engine.torrent_chans.is_empty());
+        assert!(engine.torrent_tasks.is_empty());
+    }
+
     #[test]
     fn recover_interrupted_jobs_pauses_running_work() {
         let conn = Connection::open_in_memory().unwrap();
@@ -2201,6 +2301,7 @@ mod tests {
             cmd_rx: rx,
             cmd_tx: mpsc::channel(1).0,
             torrent_chans: HashMap::new(),
+            torrent_tasks: HashMap::new(),
             dht_tx: None,
         };
         let mut job = rt_db::JobRow {
@@ -2299,6 +2400,7 @@ mod tests {
             cmd_rx: rx,
             cmd_tx: mpsc::channel(1).0,
             torrent_chans: HashMap::new(),
+            torrent_tasks: HashMap::new(),
             dht_tx: None,
         };
 
@@ -2359,6 +2461,7 @@ mod tests {
             cmd_rx: rx,
             cmd_tx: mpsc::channel(1).0,
             torrent_chans: HashMap::new(),
+            torrent_tasks: HashMap::new(),
             dht_tx: None,
         };
         let job_id = engine.create_recheck_job(&"e".repeat(40)).unwrap();
@@ -2444,6 +2547,7 @@ mod tests {
             cmd_rx: rx,
             cmd_tx: mpsc::channel(1).0,
             torrent_chans: HashMap::new(),
+            torrent_tasks: HashMap::new(),
             dht_tx: None,
         };
         {
