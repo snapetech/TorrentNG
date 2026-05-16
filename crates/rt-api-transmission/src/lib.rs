@@ -637,7 +637,7 @@ async fn torrent_get(state: &AppState, args: &Value) -> Value {
                     "bandwidthPriority" | "bandwidth-priority" => json!(0),
                     "honorsSessionLimits" | "honors-session-limits" => json!(true),
                     "magnetLink" | "magnet-link" => {
-                        json!(format!("magnet:?xt=urn:btih:{}", entry.info_hash))
+                        json!(transmission_magnet_link(&entry.info_hash))
                     }
                     "metadataPercentComplete" | "metadata-percent-complete" => {
                         json!(if entry.state.as_str() == "metadata_pending" {
@@ -669,6 +669,14 @@ fn transmission_field_needs_peers(field: &str) -> bool {
             | "peersSendingToUs"
             | "peers-sending-to-us"
     )
+}
+
+fn transmission_magnet_link(info_hash: &str) -> String {
+    if info_hash.len() == 64 && info_hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        format!("magnet:?xt=urn:btmh:1220{}", info_hash.to_ascii_lowercase())
+    } else {
+        format!("magnet:?xt=urn:btih:{info_hash}")
+    }
 }
 
 fn transmission_peers(peers: &[EnginePeerSnapshot]) -> Vec<Value> {
@@ -1058,6 +1066,52 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("magnet:?xt=urn:btih:"));
+    }
+
+    #[tokio::test]
+    async fn transmission_torrent_get_projects_v2_magnet_links() {
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        {
+            let mut reg = registry.write().await;
+            let mut entry = TorrentEntry::new("B".repeat(64), "v2".into(), "/data".into());
+            entry.total_length = 100;
+            entry.amount_left = 100;
+            reg.add(entry).unwrap();
+        }
+        let app = build_transmission_router(AppState::new(registry));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .header("content-type", "application/json")
+                    .header("x-transmission-session-id", SESSION_ID)
+                    .body(Body::from(
+                        r#"{"method":"torrent-get","arguments":{"fields":["hashString","magnetLink"]}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body["arguments"]["torrents"][0]["magnetLink"],
+            format!("magnet:?xt=urn:btmh:1220{}", "b".repeat(64))
+        );
+    }
+
+    #[test]
+    fn transmission_magnet_link_formats_v1_and_v2() {
+        assert_eq!(
+            transmission_magnet_link(&"a".repeat(40)),
+            format!("magnet:?xt=urn:btih:{}", "a".repeat(40))
+        );
+        assert_eq!(
+            transmission_magnet_link(&"A".repeat(64)),
+            format!("magnet:?xt=urn:btmh:1220{}", "a".repeat(64))
+        );
     }
 
     #[test]
