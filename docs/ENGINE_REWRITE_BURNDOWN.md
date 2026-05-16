@@ -65,7 +65,7 @@ This is the working checklist for finishing the native Rust engine rewrite. It i
 
 ## 6. Daemon Operations
 
-- [ ] Add native health endpoint backed by engine readiness.
+- [x] Add native health endpoint backed by engine readiness.
 - [ ] Add Prometheus metrics for torrents, peers, trackers, jobs, storage, and DB.
 - [ ] Add SSE/WebSocket delta stream for native API.
 - [ ] Add clean shutdown stopped-announces with bounded deadline.

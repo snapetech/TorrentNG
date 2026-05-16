@@ -294,9 +294,24 @@ pub async fn reannounce_torrent(
     control_torrent(state, info_hash, TorrentControl::Reannounce).await
 }
 
-/// `GET /health` — liveness probe.
-pub async fn health() -> impl IntoResponse {
-    Json(serde_json::json!({ "status": "ok" }))
+/// `GET /health` — native engine readiness probe.
+pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    let torrent_count = state.registry.read().await.iter().count();
+    let ready = state.engine.is_some();
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "status": if ready { "ok" } else { "unavailable" },
+            "ready": ready,
+            "native_engine": ready,
+            "torrent_count": torrent_count,
+        })),
+    )
 }
 
 enum TorrentControl {
@@ -392,7 +407,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_returns_ok() {
+    async fn health_reports_unavailable_without_engine() {
         let state = AppState::new();
         let app = build_router(state);
         let resp = app
@@ -404,7 +419,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
