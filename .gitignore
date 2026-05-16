@@ -8,3 +8,8 @@ webui/dist/
 *.db-shm
 /config/
 .env
+benchmarks/report-*.md
+certification/reports/
+
+__pycache__/
+*.pyc

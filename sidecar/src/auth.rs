@@ -22,6 +22,11 @@ pub async fn require_auth(
         return next.run(req).await;
     }
 
+    // Several qBittorrent-compatible clients probe API support before logging in.
+    if is_qbit_public_app_probe(&path) {
+        return next.run(req).await;
+    }
+
     // If no API tokens configured, allow everything (development / no-auth mode)
     if state.cfg.auth.api_tokens.is_empty() {
         return next.run(req).await;
@@ -38,13 +43,17 @@ pub async fn require_auth(
         }
     }
 
-    // Check session cookie (stub — full session management is Phase 4)
+    // Check the browser/qBit session cookie. qBit login issues this cookie when
+    // the submitted username or password matches a configured API token.
     if let Some(cookie) = req.headers().get("Cookie") {
         if let Ok(c) = cookie.to_str() {
             // Simple token-in-cookie check for browser sessions
             for part in c.split(';') {
                 let part = part.trim();
-                if let Some(val) = part.strip_prefix("rtng_session=") {
+                if let Some(val) = part
+                    .strip_prefix("rtng_session=")
+                    .or_else(|| part.strip_prefix("SID="))
+                {
                     if state.cfg.auth.api_tokens.iter().any(|t| t == val) {
                         return next.run(req).await;
                     }
@@ -54,9 +63,19 @@ pub async fn require_auth(
     }
 
     // qBit compat login endpoint is always open
-    if path.starts_with("/api/qb/v2/auth/") {
+    if path.starts_with("/api/qb/v2/auth/") || path.starts_with("/api/v2/auth/") {
         return next.run(req).await;
     }
 
     (StatusCode::UNAUTHORIZED, "Unauthorized").into_response()
+}
+
+fn is_qbit_public_app_probe(path: &str) -> bool {
+    matches!(
+        path,
+        "/api/qb/v2/app/version"
+            | "/api/qb/v2/app/webapiVersion"
+            | "/api/v2/app/version"
+            | "/api/v2/app/webapiVersion"
+    )
 }

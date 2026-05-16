@@ -1336,6 +1336,7 @@ dependencies = [
  "dirs-next",
  "dotenvy",
  "hyper",
+ "libc",
  "quick-xml",
  "reqwest",
  "rusqlite",

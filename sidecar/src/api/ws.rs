@@ -9,16 +9,31 @@ use super::server::AppState;
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
-    TorrentAdded   { hash: String },
-    TorrentRemoved { hash: String },
-    TorrentUpdated { hash: String },
-    Stats          { upload_speed: i64, download_speed: i64 },
+    TorrentAdded {
+        hash: String,
+    },
+    TorrentRemoved {
+        hash: String,
+    },
+    TorrentUpdated {
+        hash: String,
+    },
+    CategoriesUpdated,
+    TagsUpdated,
+    TrackerHealthUpdated,
+    StorageUpdated,
+    RatioGroupsUpdated,
+    WorkflowsUpdated,
+    WorkflowRunsUpdated,
+    RssRulesUpdated,
+    SavedViewsUpdated,
+    Stats {
+        upload_speed: i64,
+        download_speed: i64,
+    },
 }
 
-pub async fn handler(
-    ws: WebSocketUpgrade,
-    State(s): State<AppState>,
-) -> impl IntoResponse {
+pub async fn handler(ws: WebSocketUpgrade, State(s): State<AppState>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(socket, s.events.subscribe()))
 }
 
@@ -38,7 +53,7 @@ async fn handle_socket(
                 match event {
                     Ok(e) => {
                         let payload = serde_json::to_string(&e).unwrap_or_default();
-                        if socket.send(axum::extract::ws::Message::Text(payload.into())).await.is_err() {
+                        if socket.send(axum::extract::ws::Message::Text(payload)).await.is_err() {
                             break;
                         }
                     }

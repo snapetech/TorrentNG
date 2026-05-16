@@ -42,7 +42,9 @@ impl Client {
     /// Execute a single XMLRPC method and return the parsed result.
     pub async fn call(&self, method: &str, args: &[XmlValue]) -> Result<XmlValue> {
         let body = build_xmlrpc_request(method, args);
-        let response = self.scgi_roundtrip(body.as_bytes()).await
+        let response = self
+            .scgi_roundtrip(body.as_bytes())
+            .await
             .with_context(|| format!("XMLRPC call {method}"))?;
         parse_xmlrpc_response(&response)
     }
@@ -63,7 +65,8 @@ impl Client {
         let response = tokio::time::timeout(self.timeout, async {
             match &self.transport {
                 Transport::Unix(path) => {
-                    let mut stream = UnixStream::connect(path).await
+                    let mut stream = UnixStream::connect(path)
+                        .await
                         .with_context(|| format!("connect to SCGI socket {path}"))?;
                     stream.write_all(&packet).await?;
                     let mut buf = Vec::new();
@@ -71,7 +74,8 @@ impl Client {
                     Ok::<_, anyhow::Error>(buf)
                 }
                 Transport::Tcp(addr) => {
-                    let mut stream = TcpStream::connect(addr).await
+                    let mut stream = TcpStream::connect(addr)
+                        .await
                         .with_context(|| format!("connect to SCGI addr {addr}"))?;
                     stream.write_all(&packet).await?;
                     let mut buf = Vec::new();
@@ -84,7 +88,8 @@ impl Client {
         .context("SCGI call timed out")??;
 
         // Strip HTTP headers (everything up to \r\n\r\n)
-        let body_start = response.windows(4)
+        let body_start = response
+            .windows(4)
             .position(|w| w == b"\r\n\r\n")
             .map(|i| i + 4)
             .unwrap_or(0);
@@ -98,6 +103,7 @@ impl Client {
 #[derive(Debug, Clone)]
 pub enum XmlValue {
     String(String),
+    Base64(String),
     Int(i64),
     Bool(bool),
     Array(Vec<XmlValue>),
@@ -107,12 +113,17 @@ pub enum XmlValue {
 
 impl XmlValue {
     pub fn as_str(&self) -> Option<&str> {
-        if let XmlValue::String(s) = self { Some(s) } else { None }
+        if let XmlValue::String(s) = self {
+            Some(s)
+        } else {
+            None
+        }
     }
     pub fn as_i64(&self) -> Option<i64> {
         match self {
             XmlValue::Int(n) => Some(*n),
             XmlValue::String(s) => s.parse().ok(),
+            XmlValue::Base64(s) => s.parse().ok(),
             _ => None,
         }
     }
@@ -124,28 +135,43 @@ impl XmlValue {
         }
     }
     pub fn into_array(self) -> Vec<XmlValue> {
-        if let XmlValue::Array(v) = self { v } else { vec![] }
+        if let XmlValue::Array(v) = self {
+            v
+        } else {
+            vec![]
+        }
     }
 }
 
 impl From<&str> for XmlValue {
-    fn from(s: &str) -> Self { XmlValue::String(s.to_owned()) }
+    fn from(s: &str) -> Self {
+        XmlValue::String(s.to_owned())
+    }
 }
 impl From<String> for XmlValue {
-    fn from(s: String) -> Self { XmlValue::String(s) }
+    fn from(s: String) -> Self {
+        XmlValue::String(s)
+    }
 }
 impl From<i64> for XmlValue {
-    fn from(n: i64) -> Self { XmlValue::Int(n) }
+    fn from(n: i64) -> Self {
+        XmlValue::Int(n)
+    }
 }
 impl From<bool> for XmlValue {
-    fn from(b: bool) -> Self { XmlValue::Bool(b) }
+    fn from(b: bool) -> Self {
+        XmlValue::Bool(b)
+    }
 }
 
 // --- XMLRPC builder ---
 
 fn build_xmlrpc_request(method: &str, args: &[XmlValue]) -> String {
     let mut out = String::from("<?xml version=\"1.0\"?>\n<methodCall>\n");
-    out.push_str(&format!("  <methodName>{}</methodName>\n  <params>\n", xml_escape(method)));
+    out.push_str(&format!(
+        "  <methodName>{}</methodName>\n  <params>\n",
+        xml_escape(method)
+    ));
     for arg in args {
         out.push_str("    <param><value>");
         write_xml_value(&mut out, arg);
@@ -162,8 +188,17 @@ fn write_xml_value(out: &mut String, v: &XmlValue) {
             out.push_str(&xml_escape(s));
             out.push_str("</string>");
         }
-        XmlValue::Int(n) => { out.push_str(&format!("<i8>{n}</i8>")); }
-        XmlValue::Bool(b) => { out.push_str(&format!("<boolean>{}</boolean>", if *b { 1 } else { 0 })); }
+        XmlValue::Base64(s) => {
+            out.push_str("<base64>");
+            out.push_str(s);
+            out.push_str("</base64>");
+        }
+        XmlValue::Int(n) => {
+            out.push_str(&format!("<i8>{n}</i8>"));
+        }
+        XmlValue::Bool(b) => {
+            out.push_str(&format!("<boolean>{}</boolean>", if *b { 1 } else { 0 }));
+        }
         XmlValue::Array(items) => {
             out.push_str("<array><data>");
             for item in items {
@@ -182,16 +217,18 @@ fn write_xml_value(out: &mut String, v: &XmlValue) {
             }
             out.push_str("</struct>");
         }
-        XmlValue::Nil => { out.push_str("<nil/>"); }
+        XmlValue::Nil => {
+            out.push_str("<nil/>");
+        }
     }
 }
 
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
-     .replace('<', "&lt;")
-     .replace('>', "&gt;")
-     .replace('"', "&quot;")
-     .replace('\'', "&apos;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 // --- XMLRPC parser ---
@@ -257,7 +294,10 @@ fn parse_value_content(reader: &mut Reader<&[u8]>) -> Result<XmlValue> {
                     }
                     b"array" => parse_array(reader)?,
                     b"struct" => parse_struct(reader)?,
-                    b"nil" => { let _ = reader.read_text(e.name()); XmlValue::Nil }
+                    b"nil" => {
+                        let _ = reader.read_text(e.name());
+                        XmlValue::Nil
+                    }
                     _ => {
                         let text = reader.read_text(e.name())?;
                         XmlValue::String(text.trim().to_owned())
@@ -299,7 +339,9 @@ fn parse_struct(reader: &mut Reader<&[u8]>) -> Result<XmlValue> {
     loop {
         match reader.read_event()? {
             Event::Start(e) => match e.name().as_ref() {
-                b"name" => { current_name = reader.read_text(e.name())?.into_owned(); }
+                b"name" => {
+                    current_name = reader.read_text(e.name())?.into_owned();
+                }
                 b"value" => {
                     let val = parse_value_content(reader)?;
                     fields.push((std::mem::take(&mut current_name), val));

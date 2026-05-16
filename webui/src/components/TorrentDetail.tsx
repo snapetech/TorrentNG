@@ -1,28 +1,7 @@
 import { useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { api } from '../api/client'
 import type { TorrentSummary } from '../api/client'
-
-const BASE = '/api/v1'
-
-interface Tracker {
-  url: string
-  is_enabled: boolean
-  success_counter: number
-  failed_counter: number
-  scrape_complete: number
-  scrape_incomplete: number
-  message: string
-}
-
-interface TorrentFile {
-  index: number
-  path: string
-  size_bytes: number
-  completed_chunks: number
-  size_chunks: number
-  priority: number
-  is_created: boolean
-}
 
 function fmtSize(bytes: number): string {
   if (bytes >= 1e12) return (bytes / 1e12).toFixed(2) + ' TB'
@@ -34,28 +13,6 @@ function fmtSize(bytes: number): string {
 function fmtDate(ts: number): string {
   if (!ts) return '—'
   return new Date(ts * 1000).toLocaleString()
-}
-
-async function apiPost(path: string): Promise<void> {
-  await fetch(BASE + path, { method: 'POST', headers: { 'X-RTNG-CSRF': '1' } })
-}
-
-async function apiDelete(path: string): Promise<void> {
-  await fetch(BASE + path, { method: 'DELETE', headers: { 'X-RTNG-CSRF': '1' } })
-}
-
-async function fetchTrackers(hash: string): Promise<Tracker[]> {
-  const res = await fetch(`${BASE}/torrents/${hash}/trackers`)
-  if (!res.ok) throw new Error('trackers')
-  const data = await res.json()
-  return data.trackers as Tracker[]
-}
-
-async function fetchFiles(hash: string): Promise<TorrentFile[]> {
-  const res = await fetch(`${BASE}/torrents/${hash}/files`)
-  if (!res.ok) throw new Error('files')
-  const data = await res.json()
-  return data.files as TorrentFile[]
 }
 
 interface Props {
@@ -95,23 +52,26 @@ export function TorrentDetail({ torrent: t, onClose }: Props) {
   const qc = useQueryClient()
   const [busy, setBusy] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
+  const [editingPath, setEditingPath] = useState(false)
+  const [savePath, setSavePath] = useState(t.directory || '')
+  const [newTracker, setNewTracker] = useState('')
 
   const { data: trackers } = useQuery({
     queryKey: ['trackers', t.hash],
-    queryFn: () => fetchTrackers(t.hash),
+    queryFn: () => api.torrents.trackers(t.hash),
     staleTime: 10_000,
   })
 
   const { data: files } = useQuery({
     queryKey: ['files', t.hash],
-    queryFn: () => fetchFiles(t.hash),
+    queryFn: () => api.torrents.files(t.hash),
     staleTime: 30_000,
   })
 
-  async function action(path: string) {
+  async function doAction(fn: () => Promise<void>) {
     setBusy(true)
     try {
-      await apiPost(path)
+      await fn()
       qc.invalidateQueries({ queryKey: ['torrents'], exact: false })
     } finally {
       setBusy(false)
@@ -121,12 +81,38 @@ export function TorrentDetail({ torrent: t, onClose }: Props) {
   async function remove(deleteFiles: boolean) {
     setBusy(true)
     try {
-      await apiDelete(`/torrents/${t.hash}?delete_files=${deleteFiles}`)
+      await api.torrents.remove(t.hash, deleteFiles)
       qc.invalidateQueries({ queryKey: ['torrents'], exact: false })
       onClose()
     } finally {
       setBusy(false)
     }
+  }
+
+  async function saveLocation() {
+    const next = savePath.trim()
+    if (!next) return
+    await doAction(async () => {
+      await api.torrents.update(t.hash, { save_path: next })
+      setEditingPath(false)
+    })
+  }
+
+  async function addTracker() {
+    const url = newTracker.trim()
+    if (!url) return
+    await doAction(async () => {
+      await api.torrents.patchTrackers(t.hash, { add: [url] })
+      setNewTracker('')
+      qc.invalidateQueries({ queryKey: ['trackers', t.hash] })
+    })
+  }
+
+  async function removeTracker(url: string) {
+    await doAction(async () => {
+      await api.torrents.patchTrackers(t.hash, { remove: [url] })
+      qc.invalidateQueries({ queryKey: ['trackers', t.hash] })
+    })
   }
 
   const progress = t.size_bytes > 0 ? (t.bytes_done / t.size_bytes) * 100 : 0
@@ -159,11 +145,11 @@ export function TorrentDetail({ torrent: t, onClose }: Props) {
         display: 'flex', flexWrap: 'wrap', gap: 6,
       }}>
         {isRunning
-          ? <ActionBtn label="Stop"      color="#64748b" disabled={busy} onClick={() => action(`/torrents/${t.hash}/stop`)} />
-          : <ActionBtn label="Start"     color="#22c55e" disabled={busy} onClick={() => action(`/torrents/${t.hash}/start`)} />
+          ? <ActionBtn label="Stop"      color="#64748b" disabled={busy} onClick={() => doAction(() => api.torrents.stop(t.hash))} />
+          : <ActionBtn label="Start"     color="#22c55e" disabled={busy} onClick={() => doAction(() => api.torrents.start(t.hash))} />
         }
-        <ActionBtn label="Recheck"    color="#f59e0b" disabled={busy} onClick={() => action(`/torrents/${t.hash}/recheck`)} />
-        <ActionBtn label="Reannounce" color="#3b82f6" disabled={busy} onClick={() => action(`/torrents/${t.hash}/reannounce`)} />
+        <ActionBtn label="Recheck"    color="#f59e0b" disabled={busy} onClick={() => doAction(() => api.torrents.recheck(t.hash))} />
+        <ActionBtn label="Reannounce" color="#3b82f6" disabled={busy} onClick={() => doAction(() => api.torrents.reannounce(t.hash))} />
         <ActionBtn label="Delete"     color="#ef4444" disabled={busy} onClick={() => setConfirmDelete(true)} />
       </div>
 
@@ -244,8 +230,63 @@ export function TorrentDetail({ torrent: t, onClose }: Props) {
           </div>
         </>)}
 
-        <div style={LABEL}>Save path</div>
-        <div style={{ ...MONO, marginBottom: 12 }}>{t.directory || '—'}</div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <div style={{ ...LABEL, flex: 1 }}>Save path</div>
+          {!editingPath && (
+            <button
+              onClick={() => {
+                setSavePath(t.directory || '')
+                setEditingPath(true)
+              }}
+              style={{
+                background: 'none', border: '1px solid #334155', borderRadius: 4,
+                color: '#64748b', padding: '1px 6px', fontSize: 10, cursor: 'pointer',
+              }}
+            >
+              Edit
+            </button>
+          )}
+        </div>
+        {editingPath ? (
+          <div style={{ marginBottom: 12 }}>
+            <input
+              value={savePath}
+              onChange={e => setSavePath(e.target.value)}
+              disabled={busy}
+              style={{
+                width: '100%', boxSizing: 'border-box', background: '#0f172a',
+                border: '1px solid #334155', borderRadius: 4, color: '#cbd5e1',
+                padding: '5px 7px', fontSize: 11, fontFamily: 'monospace',
+              }}
+            />
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 6, marginTop: 6 }}>
+              <button
+                onClick={() => setEditingPath(false)}
+                disabled={busy}
+                style={{
+                  background: 'none', border: '1px solid #334155', borderRadius: 4,
+                  color: '#64748b', padding: '3px 8px', fontSize: 11, cursor: 'pointer',
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={saveLocation}
+                disabled={busy || !savePath.trim()}
+                style={{
+                  background: '#1e40af', border: 'none', borderRadius: 4,
+                  color: '#bfdbfe', padding: '3px 10px', fontSize: 11,
+                  cursor: busy || !savePath.trim() ? 'not-allowed' : 'pointer',
+                  opacity: busy || !savePath.trim() ? 0.5 : 1,
+                }}
+              >
+                Save
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div style={{ ...MONO, marginBottom: 12 }}>{t.directory || '—'}</div>
+        )}
 
         {t.message && (<>
           <div style={LABEL}>Message</div>
@@ -256,20 +297,61 @@ export function TorrentDetail({ torrent: t, onClose }: Props) {
         <div style={MONO}>{t.hash}</div>
 
         {/* Trackers */}
-        {trackers && trackers.length > 0 && (
+        {trackers && (
           <Section title="Trackers">
+            <div style={{ display: 'flex', gap: 6, marginBottom: 10 }}>
+              <input
+                value={newTracker}
+                onChange={e => setNewTracker(e.target.value)}
+                disabled={busy}
+                placeholder="udp://tracker.example/announce"
+                style={{
+                  flex: 1, minWidth: 0, background: '#0f172a',
+                  border: '1px solid #334155', borderRadius: 4, color: '#cbd5e1',
+                  padding: '5px 7px', fontSize: 11, fontFamily: 'monospace',
+                }}
+              />
+              <button
+                onClick={addTracker}
+                disabled={busy || !newTracker.trim()}
+                style={{
+                  background: '#1e40af', border: 'none', borderRadius: 4,
+                  color: '#bfdbfe', padding: '3px 9px', fontSize: 11,
+                  cursor: busy || !newTracker.trim() ? 'not-allowed' : 'pointer',
+                  opacity: busy || !newTracker.trim() ? 0.5 : 1,
+                }}
+              >
+                Add
+              </button>
+            </div>
             {trackers.map((tr, i) => (
               <div key={i} style={{ marginBottom: 8 }}>
-                <div style={{
-                  fontSize: 11, color: '#94a3b8', overflow: 'hidden',
-                  textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontFamily: 'monospace',
-                }} title={tr.url}>{tr.url}</div>
+                <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                  <div style={{
+                    flex: 1, minWidth: 0, fontSize: 11, color: '#94a3b8', overflow: 'hidden',
+                    textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontFamily: 'monospace',
+                  }} title={tr.url}>{tr.url}</div>
+                  <button
+                    onClick={() => removeTracker(tr.url)}
+                    disabled={busy}
+                    style={{
+                      background: 'none', border: '1px solid #334155', borderRadius: 4,
+                      color: '#64748b', padding: '1px 6px', fontSize: 10,
+                      cursor: busy ? 'not-allowed' : 'pointer', opacity: busy ? 0.5 : 1,
+                    }}
+                  >
+                    Remove
+                  </button>
+                </div>
                 <div style={{ fontSize: 10, color: '#475569', marginTop: 1 }}>
                   {tr.scrape_complete} seeds · {tr.scrape_incomplete} peers
                   {tr.message ? ` · ${tr.message}` : ''}
                 </div>
               </div>
             ))}
+            {trackers.length === 0 && (
+              <div style={{ fontSize: 11, color: '#475569', marginBottom: 8 }}>No trackers</div>
+            )}
           </Section>
         )}
 

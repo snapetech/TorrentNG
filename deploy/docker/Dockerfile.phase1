@@ -1,10 +1,12 @@
 # Phase 1: Known-good rTorrent + ruTorrent bundle
 # No Rust sidecar yet — this is the "make existing users less miserable" release.
-# rTorrent 0.16.11, ruTorrent 5.3.1, tinyxml2 XMLRPC backend, nginx proxy.
+# rTorrent 0.16.11, libtorrent 0.16.11, ruTorrent 5.3.1,
+# tinyxml2 XMLRPC backend, nginx proxy.
 
 FROM alpine:3.20 AS base
 
 # Build rTorrent with tinyxml2 (avoids xmlrpc-c erratic behavior, rtorrent#1636)
+# and expose the libtorrent HTTP user-agent getter/setter over XMLRPC.
 FROM base AS rtorrent-build
 RUN apk add --no-cache \
     build-base git cmake ninja pkgconf \
@@ -14,33 +16,39 @@ RUN apk add --no-cache \
     linux-headers
 
 WORKDIR /src
-RUN git clone --depth=1 --branch v0.16.11 https://github.com/rakshasa/rtorrent.git && \
-    git clone --depth=1 --branch v0.13.8  https://github.com/rakshasa/libtorrent.git
+ARG RTORRENT_VERSION=0.16.11
+ARG LIBTORRENT_VERSION=0.16.11
+RUN git clone --depth=1 --branch "v${RTORRENT_VERSION}" https://github.com/rakshasa/rtorrent.git && \
+    git clone --depth=1 --branch "v${LIBTORRENT_VERSION}" https://github.com/rakshasa/libtorrent.git
+COPY deploy/docker/patches/rtorrent-0.16.11-user-agent-command.patch /tmp/rtorrent-user-agent-command.patch
+RUN cd rtorrent && git apply /tmp/rtorrent-user-agent-command.patch
 
 # Build libtorrent
-RUN cd libtorrent && ./autogen.sh && \
-    ./configure --prefix=/usr/local --with-openssl && \
+RUN cd libtorrent && autoreconf -fi && \
+    ./configure --prefix=/usr/local && \
     make -j$(nproc) && make install
 
 # Build rTorrent with tinyxml2
-RUN cd rtorrent && ./autogen.sh && \
+RUN cd rtorrent && autoreconf -fi && \
     ./configure --prefix=/usr/local \
-                --with-xmlrpc-tinyxml2 \
-                --enable-ipv6 && \
+                --with-xmlrpc-tinyxml2 && \
     make -j$(nproc) && make install
 
 # Runtime image
 FROM base AS runtime
 
 RUN apk add --no-cache \
-    rtorrent \
     php83 php83-fpm php83-json php83-session php83-curl php83-posix \
     nginx curl ca-certificates tzdata \
-    tinyxml2 openssl zlib
+    libcurl ncurses tinyxml2 openssl zlib
 
 # Copy built rTorrent (overrides distro package)
 COPY --from=rtorrent-build /usr/local/bin/rtorrent  /usr/local/bin/rtorrent
 COPY --from=rtorrent-build /usr/local/lib/libtorrent* /usr/local/lib/
+ENV LD_LIBRARY_PATH=/usr/local/lib
+ENV RTNG_PACKAGED_RTORRENT_VERSION=0.16.11
+ENV RTNG_PACKAGED_LIBTORRENT_VERSION=0.16.11
+ENV RTNG_RTORRENT_PATCHES=rtorrent-0.16.11-user-agent-command
 
 # ruTorrent 5.3.1
 RUN mkdir -p /var/www/rutorrent && \

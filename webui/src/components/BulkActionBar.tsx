@@ -1,10 +1,6 @@
 import { useState } from 'react'
-
-interface BulkResult {
-  applied: string[]
-  errors: string[]
-  dry_run: boolean
-}
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { api } from '../api/client'
 
 interface Props {
   hashes: string[]
@@ -19,27 +15,38 @@ const ACTIONS = [
 ]
 
 export function BulkActionBar({ hashes, onClear }: Props) {
+  const qc = useQueryClient()
   const [pending, setPending] = useState<string | null>(null)
-  const [preview, setPreview] = useState<BulkResult | null>(null)
+  const [preview, setPreview] = useState<{ applied: string[] } | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [category, setCategory] = useState('')
+  const [savePath, setSavePath] = useState('')
 
-  async function runAction(action: string, dryRun: boolean) {
+  const { data: categories = [] } = useQuery({
+    queryKey: ['categories'],
+    queryFn: api.categories.list,
+    staleTime: 30_000,
+  })
+
+  async function runAction(
+    action: 'start' | 'stop' | 'recheck' | 'reannounce' | 'set-category' | 'set-location',
+    dryRun: boolean,
+  ) {
     setPending(action)
     setError(null)
     setPreview(null)
     try {
-      const res = await fetch(`/api/v1/bulk/${action}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-RTNG-CSRF': '1' },
-        body: JSON.stringify({ hashes, dry_run: dryRun }),
-      })
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const data: BulkResult = await res.json()
+      const options =
+        action === 'set-category' ? { category } :
+        action === 'set-location' ? { save_path: savePath.trim() } :
+        {}
+      const data = await api.bulk(action, hashes, dryRun, options)
       if (dryRun) {
         setPreview(data)
       } else {
         setPreview(null)
         if (data.errors.length > 0) setError(`${data.errors.length} error(s)`)
+        qc.invalidateQueries({ queryKey: ['torrents'], exact: false })
       }
     } catch (e) {
       setError(String(e))
@@ -50,13 +57,14 @@ export function BulkActionBar({ hashes, onClear }: Props) {
 
   return (
     <div style={{
-      height: 44,
+      minHeight: 44,
       background: '#0a1628',
       borderBottom: '1px solid #1e3a5f',
       display: 'flex',
       alignItems: 'center',
-      padding: '0 12px',
+      padding: '6px 12px',
       gap: 8,
+      flexWrap: 'wrap',
       flexShrink: 0,
       fontSize: 12,
     }}>
@@ -68,7 +76,7 @@ export function BulkActionBar({ hashes, onClear }: Props) {
         <button
           key={a.key}
           disabled={!!pending}
-          onClick={() => runAction(a.key, false)}
+          onClick={() => runAction(a.key as 'start' | 'stop' | 'recheck' | 'reannounce', false)}
           style={{
             background: '#1e2433',
             border: `1px solid ${a.color}40`,
@@ -83,6 +91,80 @@ export function BulkActionBar({ hashes, onClear }: Props) {
           {pending === a.key ? '…' : a.label}
         </button>
       ))}
+
+      <select
+        value={category}
+        onChange={e => setCategory(e.target.value)}
+        disabled={!!pending}
+        style={{
+          background: '#0f172a', border: '1px solid #334155', borderRadius: 4,
+          color: '#94a3b8', padding: '3px 8px', fontSize: 12,
+          maxWidth: 150,
+        }}
+      >
+        <option value="">Clear category</option>
+        {categories.map(cat => (
+          <option key={cat.name} value={cat.name}>{cat.name}</option>
+        ))}
+      </select>
+      <button
+        disabled={!!pending}
+        onClick={() => runAction('set-category', true)}
+        style={{
+          background: 'transparent', border: '1px solid #475569', borderRadius: 4,
+          color: '#94a3b8', padding: '3px 8px', fontSize: 12,
+          cursor: pending ? 'not-allowed' : 'pointer',
+        }}
+      >
+        Preview category
+      </button>
+      <button
+        disabled={!!pending}
+        onClick={() => runAction('set-category', false)}
+        style={{
+          background: '#1e2433', border: '1px solid #3b82f640', borderRadius: 4,
+          color: '#3b82f6', padding: '3px 8px', fontSize: 12,
+          cursor: pending ? 'not-allowed' : 'pointer',
+        }}
+      >
+        Apply category
+      </button>
+
+      <input
+        value={savePath}
+        onChange={e => setSavePath(e.target.value)}
+        disabled={!!pending}
+        placeholder="Save path…"
+        style={{
+          width: 180, background: '#0f172a', border: '1px solid #334155',
+          borderRadius: 4, color: '#cbd5e1', padding: '3px 8px',
+          fontSize: 12, fontFamily: 'monospace',
+        }}
+      />
+      <button
+        disabled={!!pending || !savePath.trim()}
+        onClick={() => runAction('set-location', true)}
+        style={{
+          background: 'transparent', border: '1px solid #475569', borderRadius: 4,
+          color: '#94a3b8', padding: '3px 8px', fontSize: 12,
+          cursor: pending || !savePath.trim() ? 'not-allowed' : 'pointer',
+          opacity: savePath.trim() ? 1 : 0.5,
+        }}
+      >
+        Preview path
+      </button>
+      <button
+        disabled={!!pending || !savePath.trim()}
+        onClick={() => runAction('set-location', false)}
+        style={{
+          background: '#1e2433', border: '1px solid #3b82f640', borderRadius: 4,
+          color: '#3b82f6', padding: '3px 8px', fontSize: 12,
+          cursor: pending || !savePath.trim() ? 'not-allowed' : 'pointer',
+          opacity: savePath.trim() ? 1 : 0.5,
+        }}
+      >
+        Apply path
+      </button>
 
       <button
         disabled={!!pending}

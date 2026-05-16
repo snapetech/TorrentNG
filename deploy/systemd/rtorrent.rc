@@ -1,0 +1,14 @@
+# Install to /etc/rtorrent/rtorrent.rc for the systemd service.
+
+import = /etc/rtorrent/profile.rc
+
+directory.default.set = /var/lib/rtorrent/downloads
+session.path.set = /var/lib/rtorrent/session
+
+network.scgi.open_local = /run/rtorrent/rpc.sock
+execute.nothrow = chmod, 0660, /run/rtorrent/rpc.sock
+
+network.http.max_open.set = 128
+network.http.dns_cache_timeout.set = 25
+
+schedule2 = low_diskspace, 5, 60, ((close_low_diskspace, 2000M))

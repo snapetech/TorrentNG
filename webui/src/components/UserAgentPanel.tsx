@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { api } from '../api/client'
 
 const PRESETS = [
   { label: 'rtorrentNG (default)', value: 'rtorrentNG/0.1.0 libtorrent/0.16.11' },
@@ -9,25 +10,9 @@ const PRESETS = [
   { label: 'Deluge 2.2.0',         value: 'Deluge/2.2.0 libtorrent/2.0.10' },
 ]
 
-async function fetchUA(): Promise<{ user_agent: string }> {
-  const r = await fetch('/api/v1/settings/user-agent')
-  if (!r.ok) throw new Error('fetch user-agent failed')
-  return r.json()
-}
-
-async function putUA(user_agent: string): Promise<{ user_agent: string }> {
-  const r = await fetch('/api/v1/settings/user-agent', {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json', 'X-RTNG-CSRF': '1' },
-    body: JSON.stringify({ user_agent }),
-  })
-  if (!r.ok) throw new Error('update user-agent failed')
-  return r.json()
-}
-
 export function UserAgentPanel() {
   const qc = useQueryClient()
-  const { data, isLoading } = useQuery({ queryKey: ['user-agent'], queryFn: fetchUA })
+  const { data, isLoading } = useQuery({ queryKey: ['user-agent'], queryFn: api.settings.getUserAgent })
   const [draft, setDraft] = useState('')
   const [saved, setSaved] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
@@ -37,9 +22,8 @@ export function UserAgentPanel() {
   }, [data])
 
   const mutation = useMutation({
-    mutationFn: putUA,
-    onSuccess: (res) => {
-      setDraft(res.user_agent)
+    mutationFn: (ua: string) => api.settings.setUserAgent(ua),
+    onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['user-agent'] })
       setSaved(true)
       setTimeout(() => setSaved(false), 2000)

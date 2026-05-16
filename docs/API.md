@@ -1,307 +1,339 @@
-# API Reference
+# rtorrentNG API Reference
 
-All responses are JSON with snake_case keys. All timestamps are Unix epoch seconds (int64).
+Two API surfaces are exposed by the sidecar:
 
-Base URL: `http://localhost:8080` (configurable)
+- **Native API** — `/api/v1/` — JSON REST, snake_case, designed for the WebUI and direct integrations
+- **qBittorrent compat API** — `/api/v2/` and `/api/qb/v2/` — drop-in replacement for the qBittorrent Web API v2; used by Prowlarr, Sonarr, Radarr, autobrr, cross-seed, etc.
 
-## Authentication
-
-Two auth modes:
-
-**Session token (browser):** `POST /api/v1/auth/login` → set-cookie `rtng_session`
-
-**API token (automation):** `Authorization: Bearer <token>` header
-
-CSRF protection: state-changing requests from browser require `X-RTNG-CSRF: 1` header (set automatically by the WebUI).
+Both surfaces are served on the same port (default `8080`).
 
 ---
 
-## Native API — /api/v1/
+## Authentication
 
-### Auth
+When `auth.api_tokens` is configured, all non-public endpoints require one of:
 
 ```
-POST /api/v1/auth/login
-  body: { "username": str, "password": str }
-  → 200 { "token": str }  (also sets session cookie)
-
-POST /api/v1/auth/logout
-  → 200
-
-GET  /api/v1/auth/me
-  → 200 { "username": str, "permissions": [...] }
+Authorization: Bearer <token>
+Cookie: rtng_session=<token>
 ```
+
+Public endpoints (never require auth): `/health`, `/metrics`, `/api/qb/v2/auth/login`
+
+---
+
+## Native API — `/api/v1`
 
 ### Torrents
 
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET`  | `/api/v1/torrents` | List torrents with filter/sort/page |
+| `POST` | `/api/v1/torrents` | Add torrent (multipart: `torrent` file or `magnet` URL, `save_path`, `category`, `start`) |
+| `GET`  | `/api/v1/torrents/:hash` | Get single torrent by hash |
+| `PUT`  | `/api/v1/torrents/:hash` | Update torrent metadata (`{ save_path }`) |
+| `DELETE` | `/api/v1/torrents/:hash` | Remove torrent (`?delete_files=true` to also delete data) |
+| `POST` | `/api/v1/torrents/:hash/start` | Start torrent |
+| `POST` | `/api/v1/torrents/:hash/stop` | Stop torrent |
+| `POST` | `/api/v1/torrents/:hash/recheck` | Force hash check |
+| `POST` | `/api/v1/torrents/:hash/reannounce` | Force tracker announce |
+| `GET`  | `/api/v1/torrents/:hash/trackers` | List trackers |
+| `PATCH` | `/api/v1/torrents/:hash/trackers` | Add/remove/edit trackers (`{ add: ["url"], remove: ["url"], edit: [{ orig_url, new_url }] }`) |
+| `GET`  | `/api/v1/torrents/:hash/files` | List files |
+| `PATCH` | `/api/v1/torrents/:hash/files` | Set file priorities (`{ files: [{index, priority}] }`) |
+| `PUT`  | `/api/v1/torrents/:hash/category` | Set category (`{ category: "name" }`) |
+| `POST` | `/api/v1/torrents/:hash/tags` | Add tags (`{ tags: ["a","b"] }`) |
+| `DELETE` | `/api/v1/torrents/:hash/tags` | Remove tags (`{ tags: ["a"] }`) |
+
+#### `GET /api/v1/torrents` query parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `filter` | string | Name substring match (case-insensitive) |
+| `status` | string | `seeding` \| `downloading` \| `stopped` \| `checking` \| `error` |
+| `category` | string | Exact category name |
+| `tag` | string | Exact tag name |
+| `sort` | string | `name` \| `size` \| `added` \| `ratio` \| `speed_down` \| `speed_up` \| `progress` |
+| `dir` | string | `asc` \| `desc` |
+| `limit` | int | Max rows (1–5000, default 200) |
+| `offset` | int | Pagination offset |
+
+Response: `{ total: int, torrents: TorrentRow[] }`
+
+#### TorrentRow fields
+
+```json
+{
+  "hash": "abc123...",
+  "name": "Example.Torrent.Name",
+  "size_bytes": 10737418240,
+  "bytes_done": 10737418240,
+  "down_rate": 0,
+  "up_rate": 1048576,
+  "up_total": 53687091200,
+  "down_total": 10737418240,
+  "ratio": 5000,
+  "is_active": true,
+  "is_open": true,
+  "complete": true,
+  "state": 1,
+  "priority": 0,
+  "category": "Movies",
+  "base_path": "/data/downloads/Example.Torrent.Name",
+  "directory": "/data/downloads",
+  "creation_date": 1700000000,
+  "timestamp_finished": 1700001000,
+  "tracker_focus": 0,
+  "peers_connected": 12,
+  "peers_complete": 400,
+  "message": "",
+  "tracker_url": "https://tracker.example.com/announce",
+  "tags": "hd,4k",
+  "updated_at": 1700100000
+}
 ```
-GET /api/v1/torrents
-  query:
-    filter=<string>         full-text search
-    status=downloading|seeding|stopped|checking|error
-    category=<name>
-    tag=<name>
-    tracker=<domain>
-    sort=name|size|added|ratio|speed_down|speed_up|progress
-    dir=asc|desc
-    limit=<int>             default 100, max 1000
-    offset=<int>
-  → 200 {
-      "total": int,
-      "torrents": [TorrentSummary]
-    }
 
-GET /api/v1/torrents/:hash
-  → 200 TorrentDetail
+Notes:
+- `ratio` is integer × 1000 (5000 = ratio 5.0)
+- `tags` is a comma-separated string of tag names
+- `state`: 0=idle, 1=active, 2=checking, 3=error
 
-POST /api/v1/torrents
-  body (multipart/form-data):
-    torrent=<file>          .torrent file (optional if magnet provided)
-    magnet=<string>         magnet URI (optional if torrent provided)
-    category=<string>
-    tags=<comma-separated>
-    save_path=<string>
-    start=<bool>            default true
-    skip_checking=<bool>    default false
-  → 202 { "hash": str }
+### Categories
 
-DELETE /api/v1/torrents/:hash
-  query:
-    delete_files=<bool>     default false
-  → 204
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET`  | `/api/v1/categories` | List all categories |
+| `POST` | `/api/v1/categories` | Create or update category (`{ name, save_path }`) |
+| `DELETE` | `/api/v1/categories/:name` | Delete category |
 
-POST /api/v1/torrents/:hash/start   → 204
-POST /api/v1/torrents/:hash/stop    → 204
-POST /api/v1/torrents/:hash/recheck → 204
-POST /api/v1/torrents/:hash/reannounce → 204
+### Tags
 
-PATCH /api/v1/torrents/:hash
-  body (any subset):
-    { "category": str, "tags": [...], "save_path": str,
-      "upload_limit": int, "download_limit": int,
-      "ratio_limit": float, "seeding_time_limit": int }
-  → 204
-```
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET`  | `/api/v1/tags` | List all tag names |
+| `POST` | `/api/v1/tags` | Create tag (`{ name }`) |
+| `DELETE` | `/api/v1/tags/:name` | Delete tag (also removes from all torrents) |
 
-### Files
+### Storage
 
-```
-GET /api/v1/torrents/:hash/files
-  → 200 { "files": [FileInfo] }
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/v1/storage` | List configured storage roots with total/used/free bytes, readonly status, and per-root errors |
+| `GET` | `/api/v1/tracker-health` | Aggregate cached torrents by tracker URL with torrent/active/complete/error/peer counts |
+| `GET` | `/api/v1/engine` | Runtime engine provenance, XMLRPC capability probes, rTorrent HTTP tracker-stack telemetry, and drift from the bundled engine profile |
+| `GET` | `/api/v1/engine/commands` | Full XMLRPC command index exposed by the running rTorrent build |
+| `POST` | `/api/v1/cross-seed` | Preview/apply cross-seed helper (`{ hashes, trackers, reannounce, dry_run }`) |
 
-PATCH /api/v1/torrents/:hash/files
-  body: { "files": [{ "index": int, "priority": 0|1|2 }] }
-  → 204
-```
+### Saved Views
 
-### Trackers
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/v1/saved-views` | List saved torrent filter/sort views |
+| `POST` | `/api/v1/saved-views` | Create/update saved view (`{ id, name, params }`) |
+| `DELETE` | `/api/v1/saved-views/:id` | Delete saved view |
 
-```
-GET /api/v1/torrents/:hash/trackers
-  → 200 { "trackers": [TrackerInfo] }
+### Ratio Groups
 
-POST /api/v1/torrents/:hash/trackers
-  body: { "urls": [str] }
-  → 204
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/v1/ratio-groups` | List configured ratio groups |
+| `POST` | `/api/v1/ratio-groups` | Create/update ratio group (`{ name, ratio_limit, seeding_time_limit, category, tracker, enabled }`) |
+| `POST` | `/api/v1/ratio-groups/:name` | Apply ratio group to matching cached torrents (`{ dry_run }`) |
+| `DELETE` | `/api/v1/ratio-groups/:name` | Delete ratio group |
 
-PUT /api/v1/torrents/:hash/trackers/:url
-  body: { "new_url": str }
-  → 204
+### Workflow Rules
 
-DELETE /api/v1/torrents/:hash/trackers/:url
-  → 204
-```
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/v1/workflows` | List workflow rules |
+| `POST` | `/api/v1/workflows` | Create/update workflow rule for `completed`, `added`, or `category_changed` events |
+| `POST` | `/api/v1/workflows/:id` | Run workflow rule (`{ dry_run }`); native actions and webhook POST actions execute, script actions require `[workflows].allow_scripts=true` and pass the configured directory allowlist |
+| `DELETE` | `/api/v1/workflows/:id` | Delete workflow rule |
+| `GET` | `/api/v1/workflow-runs` | List the most recent workflow run audit records, capped to the latest 200 |
+
+### RSS Rules
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/v1/rss-rules` | List RSS automation rules |
+| `POST` | `/api/v1/rss-rules` | Create/update RSS rule (`{ id, name, enabled, feed_url, include, exclude, category, save_path, tags, start }`) |
+| `POST` | `/api/v1/rss-rules/test` | Test a sample `{ title, link }` against configured rules |
+| `POST` | `/api/v1/rss-rules/apply` | Preview or apply a sample `{ title, link, dry_run }`; real runs submit matched links with rule category/save path/start settings |
+| `DELETE` | `/api/v1/rss-rules/:id` | Delete RSS rule |
 
 ### Bulk operations
 
 ```
-POST /api/v1/bulk/start
-POST /api/v1/bulk/stop
-POST /api/v1/bulk/recheck
-POST /api/v1/bulk/reannounce
-POST /api/v1/bulk/delete
-POST /api/v1/bulk/set-category
-POST /api/v1/bulk/add-tags
-POST /api/v1/bulk/set-save-path
-POST /api/v1/bulk/replace-tracker
-  body: { "hashes": [str], ...operation-specific fields }
-  query:
-    dry_run=true    returns preview without executing
-  → 200 { "affected": int, "preview": [...] }   (dry_run)
-  → 202 { "job_id": str }                        (real run)
-
-GET /api/v1/jobs/:id   → job status and progress
+POST /api/v1/bulk/:action
 ```
 
-### Categories & Tags
+Actions: `start`, `stop`, `recheck`, `reannounce`, `set-category`, `set-location`
 
-```
-GET    /api/v1/categories         → { "categories": [...] }
-POST   /api/v1/categories         → 201
-PUT    /api/v1/categories/:name   → 204
-DELETE /api/v1/categories/:name   → 204
+Body: `{ hashes: ["abc123", ...], dry_run: false }`
 
-GET    /api/v1/tags               → { "tags": [...] }
-POST   /api/v1/tags               → 201
-DELETE /api/v1/tags/:name         → 204
-```
+For `set-category`, include `category` (empty string clears it). For `set-location`,
+include non-empty `save_path`.
 
-### Sync (WebSocket)
+Response: `{ applied: ["abc123"], errors: [], dry_run: false }`
 
-```
-GET /ws
-  Upgrade: websocket
+Pass `dry_run: true` to preview what would be affected without making changes.
 
-Server → client messages:
-  { "type": "torrent_update",  "hash": str, "fields": {...} }
-  { "type": "torrent_added",   "hash": str, "summary": TorrentSummary }
-  { "type": "torrent_removed", "hash": str }
-  { "type": "stats",           "upload_speed": int, "download_speed": int, ... }
-  { "type": "job_progress",    "job_id": str, "done": int, "total": int }
-```
+### Settings
 
-### Transfer stats
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET`  | `/api/v1/settings/user-agent` | Get current rTorrent user-agent string |
+| `PUT`  | `/api/v1/settings/user-agent` | Set user-agent (`{ user_agent: "..." }`) — takes effect immediately |
 
-```
-GET /api/v1/transfer
-  → 200 {
-      "upload_speed": int,
-      "download_speed": int,
-      "total_uploaded": int,
-      "total_downloaded": int,
-      "free_space": { "<path>": int }
-    }
-```
+### Infrastructure
 
-### Health & Metrics
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET`  | `/health` | Health check; 200 if sidecar up, 503 if rTorrent unreachable |
+| `GET`  | `/metrics` | Prometheus text format metrics |
+| `GET`  | `/ws` | WebSocket — upgrade to receive live events |
 
-```
-GET /health
-  → 200 { "status": "ok", "rtorrent": "connected", "cache_age_ms": int }
-  → 503 if rTorrent unreachable
+#### WebSocket events
 
-GET /metrics
-  → Prometheus text format
+```json
+{ "type": "torrent_updated", "hash": "abc123" }
+{ "type": "torrent_removed", "hash": "abc123" }
+{ "type": "stats", "upload_speed": 1048576, "download_speed": 524288 }
 ```
 
 ---
 
-## qBittorrent-compatible API — /api/qb/v2/
+## qBittorrent Compat API — `/api/v2` or `/api/qb/v2`
 
-See [qBittorrent Web API v2](https://github.com/qbittorrent/qBittorrent/wiki/WebUI-API-%28qBittorrent-5.0%29) for field-level documentation. This section documents coverage status.
+Implements the qBittorrent Web API v2. By default it advertises qBittorrent `5.0.0` / Web API `2.11.0`; lab builds can override those API-facing values with the `RTNG_QBITTORRENT_*` identity environment variables. Configure external tools to point at this server as if it were qBittorrent.
 
 ### Auth
-| Endpoint | Status |
-|---|---|
-| `POST /api/qb/v2/auth/login` | ✅ Phase 3 |
-| `POST /api/qb/v2/auth/logout` | ✅ Phase 3 |
+
+| Method | Path | Notes |
+|--------|------|-------|
+| `POST` | `/api/qb/v2/auth/login` | In no-auth mode accepts any credentials; with `auth.api_tokens`, use an API token as username or password to receive an `rtng_session` cookie |
+| `POST` | `/api/qb/v2/auth/logout` | No-op |
 
 ### App
-| Endpoint | Status |
-|---|---|
-| `GET /api/qb/v2/app/version` | ✅ Phase 3 |
-| `GET /api/qb/v2/app/webapiVersion` | ✅ Phase 3 |
-| `GET /api/qb/v2/app/preferences` | ⚠️ Partial |
+
+| Method | Path |
+|--------|------|
+| `GET` | `/api/qb/v2/app/version` |
+| `GET` | `/api/qb/v2/app/webapiVersion` |
+| `GET` | `/api/qb/v2/app/buildInfo` |
+| `GET` | `/api/qb/v2/app/preferences` |
+| `GET` | `/api/qb/v2/app/defaultSavePath` |
+| `POST` | `/api/qb/v2/app/setPreferences` | Form: `json` preference object; unsupported keys are accepted and ignored |
 
 ### Torrents
-| Endpoint | Status |
-|---|---|
-| `GET  /api/qb/v2/torrents/info` | ✅ Phase 3 |
-| `POST /api/qb/v2/torrents/add` | ✅ Phase 3 |
-| `POST /api/qb/v2/torrents/pause` | ✅ Phase 3 |
-| `POST /api/qb/v2/torrents/resume` | ✅ Phase 3 |
-| `POST /api/qb/v2/torrents/delete` | ✅ Phase 3 |
-| `POST /api/qb/v2/torrents/recheck` | ✅ Phase 3 |
-| `POST /api/qb/v2/torrents/reannounce` | ✅ Phase 3 |
-| `GET  /api/qb/v2/torrents/properties` | ✅ Phase 3 |
-| `GET  /api/qb/v2/torrents/trackers` | ✅ Phase 3 |
-| `POST /api/qb/v2/torrents/editTracker` | ✅ Phase 3 |
-| `POST /api/qb/v2/torrents/addTrackers` | ✅ Phase 3 |
-| `GET  /api/qb/v2/torrents/files` | ✅ Phase 3 |
-| `POST /api/qb/v2/torrents/filePrio` | ✅ Phase 3 |
-| `POST /api/qb/v2/torrents/setCategory` | ✅ Phase 3 |
-| `POST /api/qb/v2/torrents/addTags` | ✅ Phase 3 |
-| `POST /api/qb/v2/torrents/removeTags` | ✅ Phase 3 |
-| `GET  /api/qb/v2/torrents/categories` | ✅ Phase 3 |
-| `GET  /api/qb/v2/torrents/tags` | ✅ Phase 3 |
 
-### Sync & Transfer
-| Endpoint | Status |
-|---|---|
-| `GET /api/qb/v2/sync/maindata` | ✅ Phase 3 |
-| `GET /api/qb/v2/transfer/info` | ✅ Phase 3 |
+| Method | Path | Notes |
+|--------|------|-------|
+| `GET`  | `/api/qb/v2/torrents/info` | Filter params: `filter`, `category`, `tag`, `sort`, `reverse`, `limit`, `offset` |
+| `GET`  | `/api/qb/v2/torrents/properties` | Query: `hash`; returns cached torrent properties |
+| `POST` | `/api/qb/v2/torrents/add` | Multipart: `urls`, `savepath`, `category`, `tags`, `paused`, `stopped`, `skip_checking`, `autoTMM`, `contentLayout`, `ratioLimit`, `seedingTimeLimit`, `torrents` (file) |
+| `POST` | `/api/qb/v2/torrents/pause` / `/stop` | Form: `hashes` (pipe-separated or `all`) |
+| `POST` | `/api/qb/v2/torrents/resume` / `/start` | Form: `hashes` |
+| `POST` | `/api/qb/v2/torrents/delete` | Form: `hashes`, `deleteFiles` |
+| `POST` | `/api/qb/v2/torrents/recheck` | Form: `hashes` |
+| `POST` | `/api/qb/v2/torrents/reannounce` | Form: `hashes` |
+| `GET`  | `/api/qb/v2/torrents/trackers` | Query: `hash` |
+| `GET`  | `/api/qb/v2/torrents/webseeds` | Returns `[]` |
+| `GET`  | `/api/qb/v2/torrents/files` | Query: `hash` |
+| `GET`  | `/api/qb/v2/torrents/pieceStates` | Returns `[]` |
+| `GET`  | `/api/qb/v2/torrents/pieceHashes` | Returns `[]` |
+| `POST` | `/api/qb/v2/torrents/filePrio` | Form: `hash`, `id` (pipe-separated indices), `priority` |
+| `POST` | `/api/qb/v2/torrents/setCategory` | Form: `hashes`, `category` |
+| `POST` | `/api/qb/v2/torrents/addTags` | Form: `hashes`, `tags` (comma-separated) |
+| `POST` | `/api/qb/v2/torrents/removeTags` | Form: `hashes`, `tags` |
+| `POST` | `/api/qb/v2/torrents/setTags` | Form: `hashes`, `tags` (comma-separated replacement) |
+| `GET`  | `/api/qb/v2/torrents/categories` | Returns `{ "Name": { "name": "Name", "savePath": "/path" } }` |
+| `POST` | `/api/qb/v2/torrents/createCategory` | Form: `category`, `savePath` |
+| `POST` | `/api/qb/v2/torrents/editCategory` | Form: `category`, `savePath` |
+| `POST` | `/api/qb/v2/torrents/removeCategories` | Form: `categories` (newline-separated) |
+| `GET`  | `/api/qb/v2/torrents/tags` | Returns `["tag1", "tag2"]` |
+| `POST` | `/api/qb/v2/torrents/createTags` | Form: `tags` (comma-separated) |
+| `POST` | `/api/qb/v2/torrents/deleteTags` | Form: `tags` |
+| `POST` | `/api/qb/v2/torrents/rename` | Form: `hash`, `name` |
+| `POST` | `/api/qb/v2/torrents/renameFile` | Form: `hash`, `id`, `name` |
+| `POST` | `/api/qb/v2/torrents/renameFolder` | Form: `hash`, `id`, `name` |
+| `GET`  | `/api/qb/v2/torrents/downloadLimit` | Returns `{}` |
+| `POST` | `/api/qb/v2/torrents/setDownloadLimit` | Accepted |
+| `GET`  | `/api/qb/v2/torrents/uploadLimit` | Returns `{}` |
+| `POST` | `/api/qb/v2/torrents/setUploadLimit` | Accepted |
+| `POST` | `/api/qb/v2/torrents/setShareLimits` | Form: `hashes`, `ratioLimit`, `seedingTimeLimit` |
+| `POST` | `/api/qb/v2/torrents/setLocation` | Form: `hashes`, `location` |
+| `POST` | `/api/qb/v2/torrents/setSavePath` | Form: `hashes`, `location` |
+| `POST` | `/api/qb/v2/torrents/addTrackers` | Form: `hashes`, `urls` (newline-separated) |
+| `POST` | `/api/qb/v2/torrents/setAutoTMM` | Accepted as a compatibility no-op |
+| `POST` | `/api/qb/v2/torrents/editTracker` | Form: `hash`, `origUrl`, `newUrl` |
+| `POST` | `/api/qb/v2/torrents/removeTrackers` | Form: `hash`, `urls` (pipe-separated) |
+| `POST` | `/api/qb/v2/torrents/toggleSequentialDownload` | Form: `hashes` |
+| `POST` | `/api/qb/v2/torrents/addPeers` | Accepted |
+| `POST` | `/api/qb/v2/torrents/increasePrio` | Accepted |
+| `POST` | `/api/qb/v2/torrents/decreasePrio` | Accepted |
+| `POST` | `/api/qb/v2/torrents/topPrio` | Accepted |
+| `POST` | `/api/qb/v2/torrents/bottomPrio` | Accepted |
+| `POST` | `/api/qb/v2/torrents/setAutoManagement` | Accepted |
+| `POST` | `/api/qb/v2/torrents/setForceStart` | Accepted |
+| `POST` | `/api/qb/v2/torrents/setSuperSeeding` | Accepted |
+| `POST` | `/api/qb/v2/torrents/toggleFirstLastPiecePrio` | Accepted |
+
+### Sync / Transfer
+
+| Method | Path |
+|--------|------|
+| `GET` | `/api/qb/v2/sync/maindata` | Full (`rid=0`) and incremental (`rid>0`) torrent updates; includes current `categories` map and `tags` list |
+| `GET` | `/api/qb/v2/transfer/info` |
+| `GET` | `/api/qb/v2/transfer/speedLimitsMode` |
+| `POST` | `/api/qb/v2/transfer/toggleSpeedLimitsMode` |
+| `GET` | `/api/qb/v2/transfer/downloadLimit` |
+| `POST` | `/api/qb/v2/transfer/setDownloadLimit` |
+| `GET` | `/api/qb/v2/transfer/uploadLimit` |
+| `POST` | `/api/qb/v2/transfer/setUploadLimit` |
+| `POST` | `/api/qb/v2/transfer/banPeers` |
+
+### Log / Search / RSS
+
+These compatibility endpoints are present so qBittorrent clients can probe them safely. Search and RSS are intentionally inert in Track 1.
+
+| Method | Path | Notes |
+|--------|------|-------|
+| `GET` | `/api/qb/v2/log/main` | Returns `[]` |
+| `GET` | `/api/qb/v2/log/peers` | Returns `[]` |
+| `GET` | `/api/qb/v2/search/status` | Returns stopped status |
+| `GET` | `/api/qb/v2/search/categories` | Returns `[]` |
+| `GET` | `/api/qb/v2/search/plugins` | Returns `[]` |
+| `POST` | `/api/qb/v2/search/installPlugin` | Accepted |
+| `POST` | `/api/qb/v2/search/uninstallPlugin` | Accepted |
+| `POST` | `/api/qb/v2/search/enablePlugin` | Accepted |
+| `POST` | `/api/qb/v2/search/updatePlugins` | Accepted |
+| `POST` | `/api/qb/v2/search/start` | Returns `{ "id": 0 }` |
+| `POST` | `/api/qb/v2/search/stop` | Accepted |
+| `GET` | `/api/qb/v2/search/results` | Returns empty stopped result set |
+| `POST` | `/api/qb/v2/search/delete` | Accepted |
+| `GET` | `/api/qb/v2/rss/items` | Returns `{}` |
+| `GET` | `/api/qb/v2/rss/rules` | Returns native RSS rules in qBit-shaped rule map |
+| `GET` | `/api/qb/v2/rss/matchingArticles` | Returns names of native RSS rules matching `article` |
+| `POST` | `/api/qb/v2/rss/setRule` | Creates/updates native RSS rule from qBit rule JSON |
+| `POST` | `/api/qb/v2/rss/renameRule` | Renames native RSS rule |
+| `POST` | `/api/qb/v2/rss/removeRule` | Deletes native RSS rule |
+| `POST` | `/api/qb/v2/rss/addFolder`, `/addFeed`, `/removeItem`, `/moveItem`, `/markAsRead`, `/refreshItem` | Accepted as compatibility no-ops |
 
 ---
 
-## Data Types
+## Prometheus Metrics
 
-### TorrentSummary
-```json
-{
-  "hash": "string",
-  "name": "string",
-  "status": "downloading|seeding|stopped|checking|error|queued",
-  "size": 0,
-  "progress": 0.0,
-  "download_speed": 0,
-  "upload_speed": 0,
-  "eta": 0,
-  "ratio": 0.0,
-  "category": "string",
-  "tags": ["string"],
-  "added_on": 0,
-  "save_path": "string",
-  "tracker": "string",
-  "num_seeds": 0,
-  "num_leechs": 0,
-  "uploaded": 0,
-  "downloaded": 0
-}
-```
+Exposed at `GET /metrics` in Prometheus text format:
 
-### TorrentDetail
-Extends TorrentSummary with:
-```json
-{
-  "comment": "string",
-  "created_by": "string",
-  "creation_date": 0,
-  "total_size": 0,
-  "pieces_num": 0,
-  "piece_size": 0,
-  "download_limit": 0,
-  "upload_limit": 0,
-  "ratio_limit": 0.0,
-  "seeding_time_limit": 0,
-  "completed_on": 0,
-  "trackers": [TrackerInfo]
-}
-```
-
-### TrackerInfo
-```json
-{
-  "url": "string",
-  "status": "working|not_working|not_contacted|disabled",
-  "tier": 0,
-  "num_peers": 0,
-  "num_seeds": 0,
-  "num_leechs": 0,
-  "msg": "string",
-  "last_announce": 0,
-  "next_announce": 0
-}
-```
-
-### FileInfo
-```json
-{
-  "index": 0,
-  "name": "string",
-  "size": 0,
-  "progress": 0.0,
-  "priority": 0,
-  "is_seed": false,
-  "piece_range": [0, 0]
-}
-```
+| Metric | Type | Description |
+|--------|------|-------------|
+| `rtorrentng_torrents_total` | gauge | Total torrents in session |
+| `rtorrentng_torrents_seeding` | gauge | Currently seeding |
+| `rtorrentng_torrents_downloading` | gauge | Currently downloading |
+| `rtorrentng_torrents_stopped` | gauge | Stopped |
+| `rtorrentng_torrents_errored` | gauge | In error state |
+| `rtorrentng_peers_connected` | gauge | Connected peers across all torrents |
+| `rtorrentng_api_requests_total` | counter | API requests served |
+| `rtorrentng_sync_cycles_total` | counter | rTorrent sync cycles completed |
+| `rtorrentng_sync_errors_total` | counter | rTorrent sync cycle errors |

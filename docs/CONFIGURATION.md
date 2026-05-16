@@ -16,6 +16,8 @@ Override path by passing it as the first argument: `rtorrentng /path/to/config.t
 | `debug` | `false` | `RTNG_DEBUG=1` | Enable debug logging |
 | `sync_interval_secs` | `2` | — | Seconds between rTorrent state polls |
 | `data_dir` | `~/.local/share/rtorrentng` | — | Directory for SQLite cache |
+| `storage_roots` | `[]` | — | Paths shown in the storage dashboard; defaults to `/` when empty |
+| WebUI static dir | `static` | `RTNG_STATIC_DIR` | Directory served for WebUI assets and SPA fallback |
 
 ---
 
@@ -30,7 +32,7 @@ Override path by passing it as the first argument: `rtorrentng /path/to/config.t
 
 ### `user_agent`
 
-The `user_agent` value is pushed to rTorrent via `network.http.user_agent.set` on startup. It can also be changed at runtime via `PUT /api/v1/settings/user-agent` or the Settings panel in the WebUI.
+The `user_agent` value is pushed to rTorrent via `network.http.user_agent.set` on startup when the running rTorrent build exposes that XMLRPC method. rtorrentNG's packaged rTorrent 0.16.11 image carries a small build patch that publishes the existing libtorrent HTTP user-agent getter/setter through XMLRPC, so this works in the Docker and certification builds. It can also be changed at runtime via `PUT /api/v1/settings/user-agent` or the Settings panel in the WebUI. Some older distro rTorrent packages do not expose tracker user-agent control; the certification harness reports that as blocked instead of assuming spoofing works.
 
 **Config file:**
 ```toml
@@ -57,13 +59,40 @@ The default `rtorrentNG/0.1.0 libtorrent/0.16.11` is used in packaged releases.
 
 ---
 
+## `[identity]` section
+
+These values control the qBittorrent-compatible API identity presented to automation clients. They do not change the tracker-facing BitTorrent engine identity.
+
+| Key | Default | Env override | Description |
+|---|---|---|---|
+| `qbittorrent_version` | `5.0.0` | `RTNG_QBITTORRENT_VERSION` | Response for `/api/v2/app/version` |
+| `qbittorrent_webapi_version` | `2.11.0` | `RTNG_QBITTORRENT_WEBAPI_VERSION` | Response for `/api/v2/app/webapiVersion` |
+| `qbittorrent_build_libtorrent` | `0.16.11` | `RTNG_QBITTORRENT_BUILD_LIBTORRENT` | `libtorrent` value in `/api/v2/app/buildInfo` |
+| `qbittorrent_build_qt` | `6.7.0` | `RTNG_QBITTORRENT_BUILD_QT` | `qt` value in `/api/v2/app/buildInfo` |
+
+Use these only for lab compatibility testing. Tracker-facing identity is still controlled by the underlying rTorrent build and `RTNG_USER_AGENT` support.
+
+---
+
 ## `[auth]` section
 
-| Key | Default | Description |
-|---|---|---|
-| `secret_key` | — | Secret for signing session tokens. Set in production. |
-| `api_tokens` | `[]` | Pre-shared bearer tokens for automation tools |
-| `trust_proxy_header` | `false` | Trust `X-Remote-User` from reverse proxy |
+| Key | Default | Env override | Description |
+|---|---|---|---|
+| `secret_key` | — | `RTNG_SECRET_KEY` | Secret for signing session tokens. Set in production. |
+| `api_tokens` | `[]` | `RTNG_API_TOKENS` | Comma-separated pre-shared bearer tokens for automation tools |
+| `trust_proxy_header` | `false` | — | Trust `X-Remote-User` from reverse proxy |
+
+---
+
+## `[workflows]` section
+
+| Key | Default | Env override | Description |
+|---|---|---|---|
+| `allow_scripts` | `false` | `RTNG_ALLOW_SCRIPTS=1` | Enables workflow `script` actions |
+| `script_timeout_secs` | `30` | — | Maximum runtime for each script action |
+| `allowed_script_dirs` | `[]` | — | Optional canonical directory allowlist for script paths |
+
+Script actions are refused unless `allow_scripts` is true. Production configs that enable scripts should set `allowed_script_dirs` to root-owned or service-owned directories and keep those directories non-world-writable. See [docs/SECURITY_REVIEW.md](/home/keith/Documents/code/rtorrentNG/docs/SECURITY_REVIEW.md).
 
 ---
 
@@ -74,6 +103,10 @@ The default `rtorrentNG/0.1.0 libtorrent/0.16.11` is used in packaged releases.
 scgi_socket = "/run/rtorrent/rpc.sock"
 ```
 
+## Container example
+
+See [deploy/docker/sidecar.config.toml](/home/keith/Documents/code/rtorrentNG/deploy/docker/sidecar.config.toml) for the Phase 1 container-oriented sidecar config.
+
 ## Full example
 
 ```toml
@@ -81,6 +114,7 @@ listen_addr      = "127.0.0.1:8080"
 debug            = false
 sync_interval_secs = 2
 data_dir         = "/var/lib/rtorrentng"
+storage_roots   = ["/data", "/mnt/archive"]
 
 [rtorrent]
 scgi_socket  = "/run/rtorrent/rpc.sock"
@@ -91,4 +125,15 @@ user_agent   = "rtorrentNG/0.1.0 libtorrent/0.16.11"
 secret_key        = "change-me-in-production"
 api_tokens        = ["your-autobrr-token", "your-prowlarr-token"]
 trust_proxy_header = false
+
+[identity]
+qbittorrent_version = "5.0.0"
+qbittorrent_webapi_version = "2.11.0"
+qbittorrent_build_libtorrent = "0.16.11"
+qbittorrent_build_qt = "6.7.0"
+
+[workflows]
+allow_scripts = false
+script_timeout_secs = 30
+allowed_script_dirs = []
 ```

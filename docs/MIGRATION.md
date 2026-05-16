@@ -52,6 +52,10 @@ Key values to record:
 
 **Step 4: Deploy the Phase 1 bundle**
 
+```sh
+docker compose -f deploy/docker/compose.phase1.yml up --build
+```
+
 Map your existing session and data directories to the container volumes:
 
 ```yaml
@@ -63,6 +67,8 @@ volumes:
 ```
 
 Place any `.rtorrent.rc` overrides in `/config/rtorrent.rc`.
+
+More deployment details are in [DEPLOYMENT.md](/home/keith/Documents/code/rtorrentNG/docs/DEPLOYMENT.md).
 
 **Step 5: Verify**
 

@@ -1,5 +1,5 @@
-use std::{collections::HashSet, sync::Arc, time::Duration};
 use std::sync::atomic::Ordering;
+use std::{collections::HashSet, sync::Arc, time::Duration};
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
@@ -27,14 +27,16 @@ pub async fn run(
             Ok((seeding, downloading, stopped, errored, peers)) => {
                 metrics.sync_cycles_total.fetch_add(1, Ordering::Relaxed);
                 metrics.torrents_seeding.store(seeding, Ordering::Relaxed);
-                metrics.torrents_downloading.store(downloading, Ordering::Relaxed);
+                metrics
+                    .torrents_downloading
+                    .store(downloading, Ordering::Relaxed);
                 metrics.torrents_stopped.store(stopped, Ordering::Relaxed);
                 metrics.torrents_errored.store(errored, Ordering::Relaxed);
                 metrics.peers_connected.store(peers, Ordering::Relaxed);
             }
             Err(e) => {
                 metrics.sync_errors_total.fetch_add(1, Ordering::Relaxed);
-                warn!("sync error: {e}");
+                warn!("sync error: {e:?}");
             }
         }
     }
@@ -70,37 +72,39 @@ async fn tick(
         peers += t.peers_connected;
 
         let row = TorrentRow {
-            hash:               t.hash.clone(),
-            name:               t.name.clone(),
-            size_bytes:         t.size_bytes,
-            bytes_done:         t.bytes_done,
-            down_rate:          t.down_rate,
-            up_rate:            t.up_rate,
-            up_total:           t.up_total,
-            down_total:         t.down_total,
-            ratio:              t.ratio,
-            is_active:          t.is_active,
-            is_open:            t.is_open,
-            complete:           t.complete,
-            state:              t.state,
-            priority:           t.priority,
-            category:           t.category.clone(),
-            base_path:          t.base_path.clone(),
-            directory:          t.directory.clone(),
-            creation_date:      t.creation_date,
+            hash: t.hash.clone(),
+            name: t.name.clone(),
+            size_bytes: t.size_bytes,
+            bytes_done: t.bytes_done,
+            down_rate: t.down_rate,
+            up_rate: t.up_rate,
+            up_total: t.up_total,
+            down_total: t.down_total,
+            ratio: t.ratio,
+            is_active: t.is_active,
+            is_open: t.is_open,
+            complete: t.complete,
+            state: t.state,
+            priority: t.priority,
+            category: t.category.clone(),
+            base_path: t.base_path.clone(),
+            directory: t.directory.clone(),
+            creation_date: t.creation_date,
             timestamp_finished: t.timestamp_finished,
-            tracker_focus:      t.tracker_focus,
-            peers_connected:    t.peers_connected,
-            peers_complete:     t.peers_complete,
-            message:            t.message.clone(),
-            tracker_url:        t.tracker_url.clone(),
-            tags:               String::new(), // unused: read from torrent_tags at query time
-            updated_at:         now,
+            tracker_focus: t.tracker_focus,
+            peers_connected: t.peers_connected,
+            peers_complete: t.peers_complete,
+            message: t.message.clone(),
+            tracker_url: t.tracker_url.clone(),
+            tags: String::new(), // unused: read from torrent_tags at query time
+            updated_at: now,
         };
         if let Err(e) = db.upsert(&row) {
             warn!("upsert {}: {e}", t.hash);
         }
-        let _ = tx.send(Event::TorrentUpdated { hash: t.hash.clone() });
+        let _ = tx.send(Event::TorrentUpdated {
+            hash: t.hash.clone(),
+        });
     }
 
     // Remove torrents that disappeared from rTorrent
@@ -113,7 +117,10 @@ async fn tick(
     // Aggregate speed stats
     let up_speed: i64 = torrents.iter().map(|t| t.up_rate).sum();
     let dn_speed: i64 = torrents.iter().map(|t| t.down_rate).sum();
-    let _ = tx.send(Event::Stats { upload_speed: up_speed, download_speed: dn_speed });
+    let _ = tx.send(Event::Stats {
+        upload_speed: up_speed,
+        download_speed: dn_speed,
+    });
 
     Ok((seeding, downloading, stopped, errored, peers))
 }

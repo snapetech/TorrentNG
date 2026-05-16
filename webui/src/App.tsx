@@ -1,5 +1,5 @@
-import { useState, useCallback } from 'react'
-import { useTorrents, useHealth } from './hooks/useTorrents'
+import { useState, useCallback, useEffect } from 'react'
+import { useTorrentsInfinite, flattenPages, useHealth } from './hooks/useTorrents'
 import { useWebSocket } from './hooks/useWebSocket'
 import { TorrentTable } from './components/TorrentTable'
 import { FilterBar } from './components/FilterBar'
@@ -8,6 +8,13 @@ import { BulkActionBar } from './components/BulkActionBar'
 import { AddTorrentDialog } from './components/AddTorrentDialog'
 import { UserAgentPanel } from './components/UserAgentPanel'
 import { CategoriesPanel } from './components/CategoriesPanel'
+import { SavedViewsBar } from './components/SavedViewsBar'
+import { StoragePanel } from './components/StoragePanel'
+import { TrackerHealthPanel } from './components/TrackerHealthPanel'
+import { RatioGroupsPanel } from './components/RatioGroupsPanel'
+import { WorkflowsPanel } from './components/WorkflowsPanel'
+import { RssRulesPanel } from './components/RssRulesPanel'
+import { EnginePanel } from './components/EnginePanel'
 import type { ListParams, TorrentSummary } from './api/client'
 
 type View = 'torrents' | 'settings'
@@ -22,25 +29,50 @@ function fmtSpeed(bps: number): string {
 
 export function App() {
   const [view, setView] = useState<View>('torrents')
-  const [params, setParams] = useState<ListParams>({
+  const [params, setParams] = useState<Omit<ListParams, 'limit' | 'offset'>>({
     sort: 'name',
     dir: 'asc',
-    limit: 500,
-    offset: 0,
   })
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [detailHash, setDetailHash] = useState<string | null>(null)
   const [speeds, setSpeeds] = useState({ up: 0, dn: 0 })
   const [addOpen, setAddOpen] = useState(false)
 
-  const { data, isLoading, isError } = useTorrents(params)
+  const query = useTorrentsInfinite(params)
+  const { torrents, total } = flattenPages(query.data)
   const { data: health } = useHealth()
 
   const handleStats = useCallback((up: number, dn: number) => setSpeeds({ up, dn }), [])
   useWebSocket(handleStats)
 
-  function updateParams(p: Partial<ListParams>) {
+  // Keyboard shortcuts
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === 'Escape') {
+        if (addOpen) { setAddOpen(false); return }
+        if (detailHash) { setDetailHash(null); return }
+        if (selected.size > 0) { setSelected(new Set()); return }
+      }
+      // 'a' key to open add dialog when not in an input
+      if (e.key === 'a' && !(e.target instanceof HTMLInputElement) && !(e.target instanceof HTMLTextAreaElement)) {
+        setAddOpen(true)
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [addOpen, detailHash, selected.size])
+
+  function updateParams(p: Partial<typeof params>) {
     setParams(prev => ({ ...prev, ...p }))
+  }
+
+  function applySavedView(next: typeof params) {
+    setParams({
+      sort: 'name',
+      dir: 'asc',
+      ...next,
+    })
+    setSelected(new Set())
   }
 
   function handleSelect(hash: string) {
@@ -52,21 +84,20 @@ export function App() {
     })
   }
 
+  function handleSelectAll(hashes: string[]) {
+    setSelected(new Set(hashes))
+  }
+
   function handleSort(sortKey: string) {
     setParams(prev => ({
       ...prev,
       sort: sortKey,
       dir: prev.sort === sortKey ? (prev.dir === 'asc' ? 'desc' : 'asc') : 'asc',
-      offset: 0,
     }))
   }
 
-  function handleDetail(hash: string | null) {
-    setDetailHash(hash)
-  }
-
   const detailTorrent: TorrentSummary | undefined =
-    detailHash ? data?.torrents.find(t => t.hash === detailHash) : undefined
+    detailHash ? torrents.find(t => t.hash === detailHash) : undefined
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', background: '#0d1117', color: '#e2e8f0' }}>
@@ -91,13 +122,12 @@ export function App() {
         </nav>
 
         {view === 'torrents' && (
-          <button onClick={() => setAddOpen(true)} style={{
+          <button onClick={() => setAddOpen(true)} title="Add torrent (A)" style={{
             background: '#1e3a5f', border: '1px solid #3b82f6', borderRadius: 5,
             color: '#93c5fd', padding: '3px 12px', fontSize: 12, cursor: 'pointer',
           }}>+ Add</button>
         )}
 
-        {/* Health indicator */}
         <span style={{
           fontSize: 11, color: health?.rtorrent === 'connected' ? '#22c55e' : '#ef4444',
           display: 'flex', alignItems: 'center', gap: 4,
@@ -116,7 +146,6 @@ export function App() {
           </span>
         )}
 
-        {/* Live speeds */}
         <span style={{ fontSize: 11, color: '#3b82f6', marginLeft: 'auto' }}>
           ↓ {fmtSpeed(speeds.dn)}
         </span>
@@ -127,6 +156,9 @@ export function App() {
 
       {view === 'torrents' && (
         <FilterBar params={params} onChange={updateParams} />
+      )}
+      {view === 'torrents' && (
+        <SavedViewsBar params={params} onApply={applySavedView} />
       )}
       {view === 'torrents' && selected.size > 0 && (
         <BulkActionBar hashes={[...selected]} onClear={() => setSelected(new Set())} />
@@ -143,6 +175,24 @@ export function App() {
               <CategoriesPanel />
             </div>
             <div style={{ borderBottom: '1px solid #1e2433' }}>
+              <StoragePanel />
+            </div>
+            <div style={{ borderBottom: '1px solid #1e2433' }}>
+              <EnginePanel />
+            </div>
+            <div style={{ borderBottom: '1px solid #1e2433' }}>
+              <TrackerHealthPanel />
+            </div>
+            <div style={{ borderBottom: '1px solid #1e2433' }}>
+              <RatioGroupsPanel />
+            </div>
+            <div style={{ borderBottom: '1px solid #1e2433' }}>
+              <WorkflowsPanel />
+            </div>
+            <div style={{ borderBottom: '1px solid #1e2433' }}>
+              <RssRulesPanel />
+            </div>
+            <div style={{ borderBottom: '1px solid #1e2433' }}>
               <UserAgentPanel />
             </div>
           </div>
@@ -151,23 +201,27 @@ export function App() {
         {view === 'torrents' && (
           <>
             <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-              {isError && (
+              {query.isError && (
                 <div style={{ padding: 24, color: '#ef4444', textAlign: 'center' }}>
                   Failed to connect to sidecar API.
                 </div>
               )}
-              {isLoading && !data && (
+              {query.isLoading && !query.data && (
                 <div style={{ padding: 24, color: '#64748b', textAlign: 'center' }}>Loading…</div>
               )}
-              {data && (
+              {query.data && (
                 <TorrentTable
-                  torrents={data.torrents}
-                  total={data.total}
+                  torrents={torrents}
+                  total={total}
                   selected={selected}
                   params={params}
                   onSelect={handleSelect}
-                  onDetail={handleDetail}
+                  onSelectAll={handleSelectAll}
+                  onDetail={hash => setDetailHash(hash)}
                   onSort={handleSort}
+                  onLoadMore={() => query.fetchNextPage()}
+                  hasMore={query.hasNextPage ?? false}
+                  isFetchingMore={query.isFetchingNextPage}
                   detailHash={detailHash}
                 />
               )}

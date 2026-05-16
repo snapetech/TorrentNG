@@ -18,7 +18,7 @@ const TORRENT_FIELDS: &[&str] = &[
     "d.complete=",
     "d.state=",
     "d.priority=",
-    "d.custom1=",   // category
+    "d.custom1=", // category
     "d.base_path=",
     "d.directory=",
     "d.creation_date=",
@@ -27,7 +27,6 @@ const TORRENT_FIELDS: &[&str] = &[
     "d.peers_connected=",
     "d.peers_complete=",
     "d.message=",
-    "d.tracker_url=",
 ];
 
 #[derive(Debug, Clone)]
@@ -63,7 +62,9 @@ impl Client {
         let mut args: Vec<XmlValue> = vec!["".into(), "main".into()];
         args.extend(TORRENT_FIELDS.iter().map(|&f| XmlValue::from(f)));
 
-        let result = self.call("d.multicall2", &args).await
+        let result = self
+            .call("d.multicall2", &args)
+            .await
             .context("d.multicall2")?;
 
         let rows = result.into_array();
@@ -74,49 +75,102 @@ impl Client {
                 continue;
             }
             let t = RawTorrent {
-                hash:               str_field(&fields, 0),
-                name:               str_field(&fields, 1),
-                size_bytes:         int_field(&fields, 2),
-                bytes_done:         int_field(&fields, 3),
-                down_rate:          int_field(&fields, 4),
-                up_rate:            int_field(&fields, 5),
-                up_total:           int_field(&fields, 6),
-                down_total:         int_field(&fields, 7),
-                ratio:              int_field(&fields, 8),
-                is_active:          bool_field(&fields, 9),
-                is_open:            bool_field(&fields, 10),
-                complete:           bool_field(&fields, 11),
-                state:              int_field(&fields, 12),
-                priority:           int_field(&fields, 13),
-                category:           str_field(&fields, 14),
-                base_path:          str_field(&fields, 15),
-                directory:          str_field(&fields, 16),
-                creation_date:      int_field(&fields, 17),
+                hash: str_field(&fields, 0),
+                name: str_field(&fields, 1),
+                size_bytes: int_field(&fields, 2),
+                bytes_done: int_field(&fields, 3),
+                down_rate: int_field(&fields, 4),
+                up_rate: int_field(&fields, 5),
+                up_total: int_field(&fields, 6),
+                down_total: int_field(&fields, 7),
+                ratio: int_field(&fields, 8),
+                is_active: bool_field(&fields, 9),
+                is_open: bool_field(&fields, 10),
+                complete: bool_field(&fields, 11),
+                state: int_field(&fields, 12),
+                priority: int_field(&fields, 13),
+                category: str_field(&fields, 14),
+                base_path: str_field(&fields, 15),
+                directory: str_field(&fields, 16),
+                creation_date: int_field(&fields, 17),
                 timestamp_finished: int_field(&fields, 18),
-                tracker_focus:      int_field(&fields, 19),
-                peers_connected:    int_field(&fields, 20),
-                peers_complete:     int_field(&fields, 21),
-                message:            str_field(&fields, 22),
-                tracker_url:        str_field(&fields, 23),
+                tracker_focus: int_field(&fields, 19),
+                peers_connected: int_field(&fields, 20),
+                peers_complete: int_field(&fields, 21),
+                message: str_field(&fields, 22),
+                tracker_url: String::new(),
             };
             torrents.push(t);
         }
         Ok(torrents)
     }
 
-    pub async fn load_magnet(&self, magnet: &str, save_path: &str, start: bool) -> Result<()> {
+    pub async fn load_magnet(
+        &self,
+        magnet: &str,
+        save_path: &str,
+        category: &str,
+        start: bool,
+    ) -> Result<()> {
         let method = if start { "load.start" } else { "load.normal" };
         let dir_cmd = format!("d.directory.set={save_path}");
-        self.call(method, &["".into(), magnet.into(), dir_cmd.as_str().into()]).await?;
+        let category_cmd = format!("d.custom1.set={category}");
+        self.call(
+            method,
+            &[
+                "".into(),
+                magnet.into(),
+                dir_cmd.as_str().into(),
+                category_cmd.as_str().into(),
+            ],
+        )
+        .await?;
         Ok(())
     }
 
-    pub async fn load_torrent(&self, data: &[u8], save_path: &str, start: bool) -> Result<()> {
-        let method = if start { "load.raw.start" } else { "load.raw" };
+    pub async fn load_url(
+        &self,
+        url: &str,
+        save_path: &str,
+        category: &str,
+        start: bool,
+    ) -> Result<()> {
+        if url.starts_with("magnet:") {
+            return self.load_magnet(url, save_path, category, start).await;
+        }
+        let data = reqwest::get(url)
+            .await
+            .with_context(|| format!("fetch torrent URL {url}"))?
+            .error_for_status()
+            .with_context(|| format!("fetch torrent URL {url}"))?
+            .bytes()
+            .await
+            .with_context(|| format!("read torrent URL {url}"))?;
+        self.load_torrent(&data, save_path, category, start).await
+    }
+
+    pub async fn load_torrent(
+        &self,
+        data: &[u8],
+        save_path: &str,
+        category: &str,
+        start: bool,
+    ) -> Result<()> {
+        let method = if start { "load.raw_start" } else { "load.raw" };
         let dir_cmd = format!("d.directory.set={save_path}");
-        // Pass binary data as base64-encoded string value
-                let b64 = base64_encode(data);
-        self.call(method, &["".into(), b64.as_str().into(), dir_cmd.as_str().into()]).await?;
+        let category_cmd = format!("d.custom1.set={category}");
+        // rTorrent's raw loader expects XMLRPC base64, not a plain string.
+        let b64 = base64_encode(data);
+        self.call(
+            method,
+            &[
+                "".into(),
+                XmlValue::Base64(b64),
+                dir_cmd.as_str().into(),
+                category_cmd.as_str().into(),
+            ],
+        )
+        .await?;
         Ok(())
     }
 
@@ -132,7 +186,8 @@ impl Client {
 
     pub async fn remove(&self, hash: &str, delete_data: bool) -> Result<()> {
         if delete_data {
-            self.call("d.custom5.set", &[hash.into(), "1".into()]).await?;
+            self.call("d.custom5.set", &[hash.into(), "1".into()])
+                .await?;
         }
         self.call("d.erase", &[hash.into()]).await?;
         Ok(())
@@ -149,28 +204,72 @@ impl Client {
     }
 
     pub async fn set_category(&self, hash: &str, category: &str) -> Result<()> {
-        self.call("d.custom1.set", &[hash.into(), category.into()]).await?;
+        self.call("d.custom1.set", &[hash.into(), category.into()])
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_location(&self, hash: &str, location: &str) -> Result<()> {
+        self.call("d.directory.set", &[hash.into(), location.into()])
+            .await?;
+        Ok(())
+    }
+
+    pub async fn rename_torrent(&self, hash: &str, name: &str) -> Result<()> {
+        self.call("d.name.set", &[hash.into(), name.into()]).await?;
+        Ok(())
+    }
+
+    pub async fn set_share_limits(
+        &self,
+        hash: &str,
+        ratio_limit_milli: i64,
+        seeding_time_limit: i64,
+    ) -> Result<()> {
+        self.call("d.ratio.set", &[hash.into(), ratio_limit_milli.into()])
+            .await?;
+        self.call(
+            "d.custom2.set",
+            &[hash.into(), seeding_time_limit.to_string().into()],
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn toggle_sequential_download(&self, hash: &str) -> Result<()> {
+        self.call("d.down.sequential.toggle", &[hash.into()])
+            .await?;
         Ok(())
     }
 
     /// Push user_agent to rTorrent's HTTP user agent setting.
     /// Called on startup and on config change via API.
     pub async fn set_user_agent(&self, user_agent: &str) -> Result<()> {
-        self.call("network.http.user_agent.set", &[user_agent.into()]).await
-            .context("set network.http.user_agent")?;
+        self.call(
+            "network.http.user_agent.set",
+            &["".into(), user_agent.into()],
+        )
+        .await
+        .context("set network.http.user_agent")?;
         Ok(())
     }
 
     /// Return the current user agent rTorrent is using.
     pub async fn get_user_agent(&self) -> Result<String> {
-        let v = self.call("network.http.user_agent", &[]).await
+        let v = self
+            .call("network.http.user_agent", &[])
+            .await
             .context("get network.http.user_agent")?;
         Ok(v.as_str().unwrap_or("").to_owned())
     }
 }
 
 fn str_field(fields: &[XmlValue], i: usize) -> String {
-    fields.get(i).and_then(|v| v.as_str()).unwrap_or("").to_owned()
+    fields
+        .get(i)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned()
 }
 fn int_field(fields: &[XmlValue], i: usize) -> i64 {
     fields.get(i).and_then(|v| v.as_i64()).unwrap_or(0)
@@ -181,15 +280,31 @@ fn bool_field(fields: &[XmlValue], i: usize) -> bool {
 
 fn base64_encode(data: &[u8]) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as usize;
-        let b1 = if chunk.len() > 1 { chunk[1] as usize } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as usize } else { 0 };
-        out.push(CHARS[b0 >> 2 ] as char);
+        let b1 = if chunk.len() > 1 {
+            chunk[1] as usize
+        } else {
+            0
+        };
+        let b2 = if chunk.len() > 2 {
+            chunk[2] as usize
+        } else {
+            0
+        };
+        out.push(CHARS[b0 >> 2] as char);
         out.push(CHARS[((b0 & 3) << 4) | (b1 >> 4)] as char);
-        out.push(if chunk.len() > 1 { CHARS[((b1 & 0xf) << 2) | (b2 >> 6)] as char } else { '=' });
-        out.push(if chunk.len() > 2 { CHARS[b2 & 0x3f] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            CHARS[((b1 & 0xf) << 2) | (b2 >> 6)] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            CHARS[b2 & 0x3f] as char
+        } else {
+            '='
+        });
     }
     out
 }

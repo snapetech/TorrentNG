@@ -1,14 +1,6 @@
 import { useState, useRef, useCallback } from 'react'
-import { useQueryClient } from '@tanstack/react-query'
-import { useQuery } from '@tanstack/react-query'
-
-interface Category { name: string; save_path: string }
-
-async function fetchCategories(): Promise<Category[]> {
-  const res = await fetch('/api/v1/categories')
-  if (!res.ok) return []
-  return res.json()
-}
+import { useQueryClient, useQuery } from '@tanstack/react-query'
+import { api } from '../api/client'
 
 interface Props {
   onClose: () => void
@@ -32,7 +24,7 @@ export function AddTorrentDialog({ onClose }: Props) {
   const [error, setError] = useState<string | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
 
-  const { data: categories = [] } = useQuery({ queryKey: ['categories'], queryFn: fetchCategories })
+  const { data: categories = [] } = useQuery({ queryKey: ['categories'], queryFn: api.categories.list })
 
   const addFiles = useCallback((incoming: FileList | File[]) => {
     const valid = Array.from(incoming).filter(f => f.name.endsWith('.torrent'))
@@ -60,25 +52,14 @@ export function AddTorrentDialog({ onClose }: Props) {
 
       // Upload .torrent files
       for (const file of files) {
-        const fd = new FormData()
-        fd.append('torrent', file)
-        fd.append('save_path', effectiveSavePath)
-        fd.append('start', String(start))
-        if (category) fd.append('category', category)
-        const res = await fetch('/api/v1/torrents', { method: 'POST', body: fd })
-        if (!res.ok) throw new Error(`Failed to add ${file.name}`)
+        await api.torrents.addFile(file, effectiveSavePath, category, start)
       }
 
       // Load magnet/HTTP URLs
       for (const line of url.split('\n')) {
         const u = line.trim()
         if (!u) continue
-        const fd = new FormData()
-        fd.append('magnet', u)
-        fd.append('save_path', effectiveSavePath)
-        fd.append('start', String(start))
-        const res = await fetch('/api/v1/torrents', { method: 'POST', body: fd })
-        if (!res.ok) throw new Error(`Failed to add ${u}`)
+        await api.torrents.addMagnet(u, effectiveSavePath, category, start)
       }
 
       qc.invalidateQueries({ queryKey: ['torrents'], exact: false })

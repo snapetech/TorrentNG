@@ -1,6 +1,10 @@
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
-use std::{collections::HashSet, path::Path, sync::{Arc, Mutex}};
+use std::{
+    collections::HashSet,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TorrentRow {
@@ -42,10 +46,12 @@ impl Db {
                 .with_context(|| format!("create cache dir {}", parent.display()))?;
         }
 
-        let conn = Connection::open(path)
-            .with_context(|| format!("open sqlite {}", path.display()))?;
+        let conn =
+            Connection::open(path).with_context(|| format!("open sqlite {}", path.display()))?;
 
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;")?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
+        )?;
 
         migrate(&conn)?;
 
@@ -57,9 +63,10 @@ impl Db {
     }
 
     pub fn upsert(&self, t: &TorrentRow) -> Result<()> {
-        self.conn().execute(
-            // tags is excluded from DO UPDATE — managed via torrent_tags table
-            "INSERT INTO torrents (
+        self.conn()
+            .execute(
+                // tags is excluded from DO UPDATE — managed via torrent_tags table
+                "INSERT INTO torrents (
                 hash, name, size_bytes, bytes_done, down_rate, up_rate,
                 up_total, down_total, ratio, is_active, is_open, complete,
                 state, priority, category, base_path, directory, creation_date,
@@ -84,26 +91,56 @@ impl Db {
                 message=excluded.message,
                 tracker_url=excluded.tracker_url,
                 updated_at=excluded.updated_at",
-            params![
-                t.hash, t.name, t.size_bytes, t.bytes_done, t.down_rate, t.up_rate,
-                t.up_total, t.down_total, t.ratio,
-                t.is_active as i64, t.is_open as i64, t.complete as i64,
-                t.state, t.priority, t.category, t.base_path, t.directory,
-                t.creation_date, t.timestamp_finished, t.tracker_focus,
-                t.peers_connected, t.peers_complete, t.message,
-                t.tracker_url, t.updated_at,
-            ],
-        ).context("upsert torrent")?;
+                params![
+                    t.hash,
+                    t.name,
+                    t.size_bytes,
+                    t.bytes_done,
+                    t.down_rate,
+                    t.up_rate,
+                    t.up_total,
+                    t.down_total,
+                    t.ratio,
+                    t.is_active as i64,
+                    t.is_open as i64,
+                    t.complete as i64,
+                    t.state,
+                    t.priority,
+                    t.category,
+                    t.base_path,
+                    t.directory,
+                    t.creation_date,
+                    t.timestamp_finished,
+                    t.tracker_focus,
+                    t.peers_connected,
+                    t.peers_complete,
+                    t.message,
+                    t.tracker_url,
+                    t.updated_at,
+                ],
+            )
+            .context("upsert torrent")?;
         Ok(())
     }
 
     pub fn delete(&self, hash: &str) -> Result<()> {
-        self.conn().execute("DELETE FROM torrents WHERE hash=?1", params![hash])?;
+        self.conn()
+            .execute("DELETE FROM torrents WHERE hash=?1", params![hash])?;
         Ok(())
     }
 
+    pub fn exists(&self, hash: &str) -> Result<bool> {
+        let exists: i64 = self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM torrents WHERE hash=?1)",
+            params![hash],
+            |r| r.get(0),
+        )?;
+        Ok(exists != 0)
+    }
+
     pub fn count(&self) -> Result<i64> {
-        let n: i64 = self.conn()
+        let n: i64 = self
+            .conn()
             .query_row("SELECT COUNT(*) FROM torrents", [], |r| r.get(0))?;
         Ok(n)
     }
@@ -111,14 +148,16 @@ impl Db {
     pub fn all_hashes(&self) -> Result<HashSet<String>> {
         let conn = self.conn();
         let mut stmt = conn.prepare("SELECT hash FROM torrents")?;
-        let hashes = stmt.query_map([], |r| r.get(0))?
+        let hashes = stmt
+            .query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<HashSet<String>>>()?;
         Ok(hashes)
     }
 }
 
 fn migrate(conn: &Connection) -> Result<()> {
-    conn.execute_batch("
+    conn.execute_batch(
+        "
         CREATE TABLE IF NOT EXISTS torrents (
             hash                TEXT PRIMARY KEY,
             name                TEXT NOT NULL,
@@ -171,6 +210,7 @@ fn migrate(conn: &Connection) -> Result<()> {
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
-    ")?;
+    ",
+    )?;
     Ok(())
 }

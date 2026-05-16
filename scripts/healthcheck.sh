@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Diagnostic script: check rTorrent socket, SCGI connectivity, and sidecar health.
+# Diagnostic script: check rTorrent socket, ruTorrent/nginx, and sidecar health.
 
 set -euo pipefail
 
 SOCKET="${1:-/run/rtorrent/rpc.sock}"
 SIDECAR="${2:-http://localhost:8080}"
+RUTORRENT="${3:-http://localhost:8080/rutorrent/}"
 PASS=0
 FAIL=0
 
@@ -31,17 +32,26 @@ fi
 echo
 echo "--- SCGI / XMLRPC ---"
 if command -v curl &>/dev/null; then
-  XMLRPC_BODY='<?xml version="1.0"?><methodCall><methodName>system.listMethods</methodName><params/></methodCall>'
-  HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --unix-socket "$SOCKET" \
-    -X POST -H "Content-Type: text/xml" \
-    --data "$XMLRPC_BODY" "http://localhost/RPC2" 2>/dev/null || echo "000")
-  if [ "$HTTP_STATUS" = "200" ]; then
-    ok "XMLRPC call succeeded (HTTP 200)"
+  if [ -S "$SOCKET" ]; then
+    info "SCGI socket is present. Raw XMLRPC probe requires a SCGI-capable client."
   else
-    fail "XMLRPC call failed (HTTP $HTTP_STATUS)"
+    fail "Cannot probe XMLRPC because socket is missing"
   fi
 else
-  info "curl not available — skipping XMLRPC test"
+  info "curl not available — skipping XMLRPC note"
+fi
+
+echo
+echo "--- ruTorrent / nginx ---"
+if command -v curl &>/dev/null; then
+  HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$RUTORRENT" 2>/dev/null || echo "000")
+  if [ "$HTTP_STATUS" = "200" ]; then
+    ok "ruTorrent reachable: $RUTORRENT"
+  else
+    fail "ruTorrent not reachable at $RUTORRENT (HTTP $HTTP_STATUS)"
+  fi
+else
+  info "curl not available — skipping ruTorrent test"
 fi
 
 echo

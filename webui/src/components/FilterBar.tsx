@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
+import { api } from '../api/client'
 import type { ListParams } from '../api/client'
 
 const STATUS_OPTIONS = [
@@ -9,20 +10,6 @@ const STATUS_OPTIONS = [
   { value: 'stopped', label: 'Stopped' },
   { value: 'checking', label: 'Checking' },
 ]
-
-interface Category { name: string; save_path: string }
-
-async function fetchCategories(): Promise<Category[]> {
-  const res = await fetch('/api/v1/categories')
-  if (!res.ok) return []
-  return res.json()
-}
-
-async function fetchTags(): Promise<string[]> {
-  const res = await fetch('/api/v1/tags')
-  if (!res.ok) return []
-  return res.json()
-}
 
 interface Props {
   params: ListParams
@@ -45,13 +32,13 @@ export function FilterBar({ params, onChange }: Props) {
 
   const { data: categories } = useQuery({
     queryKey: ['categories'],
-    queryFn: fetchCategories,
+    queryFn: api.categories.list,
     staleTime: 30_000,
   })
 
   const { data: tags } = useQuery({
     queryKey: ['tags'],
-    queryFn: fetchTags,
+    queryFn: api.tags.list,
     staleTime: 30_000,
   })
 

@@ -1,15 +1,32 @@
 #!/bin/sh
 set -e
 
-RTORRENT_SOCKET=/run/rtorrent/rpc.sock
+RTORRENT_SOCKET=${RTORRENT_SCGI_SOCKET:-/run/rtorrent/rpc.sock}
 CONFIG_FILE=${RTORRENTNG_CONFIG:-/config/config.toml}
+INCOMING_PORT=${RTORRENT_INCOMING_PORT:-50000}
+export TERM=${TERM:-xterm}
 
-mkdir -p /run/rtorrent /session /data
+mkdir -p /run/rtorrent /session /data /var/lib/rtorrentng /var/log/rtorrent /config
+rm -f "$RTORRENT_SOCKET" /session/rtorrent.lock
+
+if [ -f /config/rtorrent.rc ]; then
+  cp /config/rtorrent.rc /etc/rtorrent/user.rc
+else
+  : > /etc/rtorrent/user.rc
+fi
+
+if [ ! -f "$CONFIG_FILE" ]; then
+  cp /etc/rtorrentng/config.toml "$CONFIG_FILE"
+fi
 
 # Start rTorrent in background
 rtorrent -n -o "import=/etc/rtorrent/rtorrent.rc" \
+         -o "system.daemon.set=true" \
          -o "session.path=/session" \
-         -o "scgi_local=$RTORRENT_SOCKET" &
+         -o "network.scgi.open_local=$RTORRENT_SOCKET" \
+         -o "network.port_range.set=$INCOMING_PORT-$INCOMING_PORT" \
+         -o "dht.port.set=$INCOMING_PORT" \
+         -o "dht.override_port.set=$INCOMING_PORT" &
 
 # Wait for socket
 for i in $(seq 1 30); do
@@ -22,4 +39,6 @@ if [ ! -S "$RTORRENT_SOCKET" ]; then
   exit 1
 fi
 
-exec rtorrentng --config "$CONFIG_FILE"
+chmod 660 "$RTORRENT_SOCKET"
+
+exec rtorrentng "$CONFIG_FILE"

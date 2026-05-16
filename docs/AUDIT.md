@@ -48,6 +48,14 @@ rTorrent 0.16.9 introduced a trusted/untrusted XMLRPC connection model. Connecti
 
 **Action:** All rtorrentNG Docker images build rTorrent `--with-xmlrpc-tinyxml2`. Document in build scripts.
 
+### Tracker HTTP user-agent control
+
+| Field | Status | Notes |
+|---|---|---|
+| Runtime support | ✅ | Packaged images expose `network.http.user_agent` and `network.http.user_agent.set` |
+| Upstream impact | ⚠️ | rTorrent 0.16.11 initializes libtorrent's HTTP user-agent internally, but does not publish XMLRPC commands for reading or changing it |
+| rtorrentNG fix | ✅ | Docker builds apply `deploy/docker/patches/rtorrent-0.16.11-user-agent-command.patch`, which wires the existing libtorrent getter/setter into rTorrent's XMLRPC command map |
+
 ### XMLRPC parsererror on torrent list
 
 **Symptom:** ruTorrent shows "Bad response from server: (200 [parsererror,list])" (ruTorrent#2977).
@@ -123,7 +131,7 @@ Run these against Phase 1 build before release:
 | Component | Version |
 |---|---|
 | rTorrent | 0.16.11 |
-| libtorrent (rakshasa) | 0.13.8 |
+| libtorrent (rakshasa) | 0.16.11 |
 | ruTorrent | 5.3.1 |
 | XMLRPC backend | tinyxml2 |
 | PHP | 8.3 |

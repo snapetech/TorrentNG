@@ -1,5 +1,7 @@
 # rtorrentNG
 
+[![Discord](https://img.shields.io/discord/4ub88HeHFm?label=Discord&logo=discord&logoColor=white)](https://discord.gg/4ub88HeHFm)
+
 rtorrentNG is a modern control plane and web interface for rTorrent. It pairs
 a Rust sidecar service with a React/Vite WebUI, exposes a native API, and
 includes a qBittorrent-compatible API shim for automation tools.
@@ -8,6 +10,11 @@ includes a qBittorrent-compatible API shim for automation tools.
 
 This repository is early-stage software. Interfaces, deployment details, and
 runtime behavior may change while the project is being developed.
+
+## Support
+
+Project support, setup help, integration discussion, and development updates
+are available on Discord: [https://discord.gg/4ub88HeHFm](https://discord.gg/4ub88HeHFm).
 
 ## Components
 
@@ -70,4 +77,3 @@ Run sidecar tests:
 cd sidecar
 cargo test
 ```
-

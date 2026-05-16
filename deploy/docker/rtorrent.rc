@@ -1,0 +1,17 @@
+# Container entrypoint imports this file first, then applies runtime overrides.
+# Keep container-specific paths here; engine-profile/rtorrent.rc carries tuning.
+
+import = /etc/rtorrent/profile.rc
+
+directory.default.set = /data
+session.path.set = /session
+
+method.insert = cfg.basedir, private|const|string, /data
+method.insert = cfg.session, private|const|string, /session
+
+network.http.max_open.set = 128
+network.http.dns_cache_timeout.set = 25
+
+schedule2 = low_diskspace, 5, 60, ((close_low_diskspace, 2000M))
+
+import = /etc/rtorrent/user.rc

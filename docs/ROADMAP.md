@@ -13,19 +13,19 @@ Fix the rTorrent/ruTorrent pain surface without replacing the engine. Ship somet
 Enumerate every known rTorrent 0.16.x + ruTorrent 5.3.x integration breakage.
 
 **Checklist:**
-- [ ] `load.start` blocked for untrusted connections via httprpc (ruTorrent#3046)
-- [ ] `load.raw.start` untrusted status
-- [ ] `d.tracker_announce` untrusted status
-- [ ] xmlrpc-c vs tinyxml2 RPC erratic behavior (rtorrent#1636)
-- [ ] XMLRPC parsererror on torrent list (ruTorrent#2977)
-- [ ] httprpc raw passthrough trust bypass
-- [ ] *arr add torrent broken flows
-- [ ] autobrr add torrent broken flows
-- [ ] ruTorrent 10k+ torrent UI performance (dxSTable regression)
-- [ ] PHP 8.5 deprecations in ruTorrent 5.3.x
-- [ ] Plugin permission check breakage in ruTorrent 5.3.1
-- [ ] Socket permission gotchas (SCGI socket world-readable vs group)
-- [ ] Large-batch `.torrent` file add limits
+- [x] `load.start` blocked for untrusted connections via httprpc (ruTorrent#3046)
+- [x] `load.raw.start` untrusted status
+- [x] `d.tracker_announce` untrusted status
+- [x] xmlrpc-c vs tinyxml2 RPC erratic behavior (rtorrent#1636)
+- [x] XMLRPC parsererror on torrent list (ruTorrent#2977)
+- [x] httprpc raw passthrough trust bypass
+- [x] *arr add torrent broken flows
+- [x] autobrr add torrent broken flows
+- [x] ruTorrent 10k+ torrent UI performance (dxSTable regression)
+- [x] PHP 8.5 deprecations in ruTorrent 5.3.x
+- [x] Plugin permission check breakage in ruTorrent 5.3.1
+- [x] Socket permission gotchas (SCGI socket world-readable vs group)
+- [x] Large-batch `.torrent` file add limits
 
 Produce: `docs/AUDIT.md` with status per item and workaround/fix notes.
 
@@ -34,14 +34,14 @@ Produce: `docs/AUDIT.md` with status per item and workaround/fix notes.
 Ship a pinned, tested, known-good rTorrent + ruTorrent bundle.
 
 **Deliverables:**
-- `engine-profile/rtorrent.rc` — known-good config
-- `engine-profile/build/` — build scripts (tinyxml2, recommended flags)
-- Patched httprpc trust behavior
-- `deploy/docker/Dockerfile.phase1` — single-container
-- `deploy/docker/compose.phase1.yml` — rTorrent + ruTorrent + nginx
-- `scripts/healthcheck.sh` — SCGI/socket/RPC/auth diagnostic
-- Integration test suite for *arr and autobrr add-torrent flows
-- `docs/MIGRATION.md` — import existing `.rtorrent.rc`, ruTorrent settings
+- [x] `engine-profile/rtorrent.rc` — known-good config
+- [x] `engine-profile/build/` — build scripts (tinyxml2, recommended flags)
+- [x] Patched httprpc trust behavior
+- [x] `deploy/docker/Dockerfile.phase1` — single-container
+- [x] `deploy/docker/compose.phase1.yml` — rTorrent + ruTorrent + nginx
+- [x] `scripts/healthcheck.sh` — SCGI/socket/RPC/auth diagnostic
+- [x] Integration test suite for *arr and autobrr add-torrent flows
+- [x] `docs/MIGRATION.md` — import existing `.rtorrent.rc`, ruTorrent settings
 
 ## Phase 2 — Sidecar daemon MVP
 
@@ -83,29 +83,30 @@ Make existing *arr/autobrr/tool integrations work by selecting "qBittorrent" as 
 Replace ruTorrent as the primary UI.
 
 **Priority features:**
-1. Virtualized torrent table (100k-row target)
-2. Server-side filter + sort
-3. WebSocket delta sync
-4. Bulk ops with dry-run preview
-5. Tracker health view
-6. Ratio group management
-7. Storage/mount dashboard
-8. Saved views
-9. Mobile-safe interactions (no right-click required)
+1. [x] Virtualized torrent table (100k-row target)
+2. [x] Server-side filter + sort
+3. [x] WebSocket delta sync
+4. [x] Bulk ops with dry-run preview
+5. [x] Tracker health view
+6. [x] Ratio group management
+7. [x] Storage/mount dashboard
+8. [x] Saved views
+9. [x] Mobile-safe interactions (no right-click required)
 
 ## Phase 5 — Workflow platform
 
 Sidecar-managed replacement for high-value ruTorrent plugins.
 
 **Priority workflows:**
-- RSS rules + autobrr integration
-- Post-complete hooks (unpack, hardlink, script)
-- Cross-seed helper
-- Tracker repair / bulk tracker replace
-- Per-tracker ratio policies
-- Category/path automation rules
-- Webhook actions
-- *arr status feedback
+- [x] RSS rules + autobrr integration
+- [x] Post-complete hooks (webhook, category/path actions, and config-gated script execution)
+- [x] Post-complete unpack/hardlink script execution foundation
+- [x] Cross-seed helper
+- [x] Tracker repair / bulk tracker replace
+- [x] Per-tracker ratio policies
+- [x] Category/path automation rules
+- [x] Webhook actions
+- [x] *arr status feedback compatibility surface
 
 ## Track 1 benchmark targets
 

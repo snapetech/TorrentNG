@@ -1,0 +1,125 @@
+services:
+  rtorrentng:
+    image: rtorrentng:certification
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    restart: unless-stopped
+    security_opt:
+      - seccomp:unconfined
+    ports:
+      - "${RTNG_HOST_PORT:-18080}:8080"
+      - "${RTNG_INCOMING_PORT:-50000}:50000"
+      - "${RTNG_INCOMING_PORT:-50000}:50000/udp"
+    volumes:
+      - ./sidecar.config.toml:/config/config.toml:ro
+      - rtng-data:/var/lib/rtorrentng
+      - downloads:/data
+      - session:/session
+    environment:
+      RTORRENTNG_CONFIG: /config/config.toml
+      RTORRENT_INCOMING_PORT: "${RTNG_INCOMING_PORT:-50000}"
+      RTORRENT_SCGI_SOCKET: /run/rtorrent/rpc.sock
+      RTNG_STATIC_DIR: /usr/share/rtorrentng/webui
+      RTNG_SYNC_INTERVAL_SECS: "${RTNG_SYNC_INTERVAL_SECS:-2}"
+      RTNG_DATA_DIR: "${RTNG_DATA_DIR:-/var/lib/rtorrentng}"
+      RTNG_SECRET_KEY: "${RTNG_SECRET_KEY:-certification-only-change-me}"
+      RTNG_API_TOKENS: "${RTNG_API_TOKEN:-cert-token}"
+      RTNG_USER_AGENT: "${RTNG_USER_AGENT:-rtorrentNG/0.1.0 libtorrent/0.16.11}"
+      RTNG_QBITTORRENT_VERSION: "${RTNG_QBITTORRENT_VERSION:-5.0.0}"
+      RTNG_QBITTORRENT_WEBAPI_VERSION: "${RTNG_QBITTORRENT_WEBAPI_VERSION:-2.11.0}"
+      RTNG_QBITTORRENT_BUILD_LIBTORRENT: "${RTNG_QBITTORRENT_BUILD_LIBTORRENT:-0.16.11}"
+      RTNG_QBITTORRENT_BUILD_QT: "${RTNG_QBITTORRENT_BUILD_QT:-6.7.0}"
+    healthcheck:
+      test: ["CMD", "/bin/sh", "-c", "test -S /run/rtorrent/rpc.sock && wget -qO- http://127.0.0.1:8080/health >/dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    restart: unless-stopped
+    ports:
+      - "${SONARR_HOST_PORT:-18989}:8989"
+    volumes:
+      - sonarr-config:/config
+      - downloads:/downloads
+      - media-tv:/tv
+    environment:
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
+      TZ: "${TZ:-Etc/UTC}"
+    depends_on:
+      - rtorrentng
+
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    restart: unless-stopped
+    ports:
+      - "${RADARR_HOST_PORT:-17878}:7878"
+    volumes:
+      - radarr-config:/config
+      - downloads:/downloads
+      - media-movies:/movies
+    environment:
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
+      TZ: "${TZ:-Etc/UTC}"
+    depends_on:
+      - rtorrentng
+
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    restart: unless-stopped
+    ports:
+      - "${PROWLARR_HOST_PORT:-19696}:9696"
+    volumes:
+      - prowlarr-config:/config
+    environment:
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
+      TZ: "${TZ:-Etc/UTC}"
+    depends_on:
+      - rtorrentng
+
+  autobrr:
+    image: ghcr.io/autobrr/autobrr:latest
+    restart: unless-stopped
+    ports:
+      - "${AUTOBRR_HOST_PORT:-17474}:7474"
+    volumes:
+      - autobrr-config:/config
+    environment:
+      AUTOBRR__HOST: 0.0.0.0
+      AUTOBRR__PORT: "7474"
+      AUTOBRR__LOG_LEVEL: debug
+      AUTOBRR__SESSION_SECRET: certification-only-change-me
+    depends_on:
+      - rtorrentng
+
+  cross-seed:
+    image: ghcr.io/cross-seed/cross-seed:latest
+    restart: unless-stopped
+    command: daemon
+    ports:
+      - "${CROSS_SEED_HOST_PORT:-12468}:2468"
+    volumes:
+      - ./cross-seed.config.js:/config/config.js:ro
+      - cross-seed-output:/config/output
+      - downloads:/downloads
+    environment:
+      TZ: "${TZ:-Etc/UTC}"
+    depends_on:
+      - rtorrentng
+
+volumes:
+  rtng-data:
+  downloads:
+  session:
+  sonarr-config:
+  radarr-config:
+  prowlarr-config:
+  autobrr-config:
+  cross-seed-output:
+  media-tv:
+  media-movies:

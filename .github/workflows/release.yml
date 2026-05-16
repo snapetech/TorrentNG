@@ -1,0 +1,149 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to build"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            tag="${{ github.event.inputs.tag }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          if [[ "$tag" != v* ]]; then
+            echo "Release tags must start with v; got $tag." >&2
+            exit 1
+          fi
+          git fetch --force origin main --tags
+          tag_commit="$(git rev-list -n 1 "$tag")"
+          main_commit="$(git rev-parse origin/main)"
+          if ! git merge-base --is-ancestor "$tag_commit" origin/main; then
+            echo "Tag $tag points at $tag_commit, which is not on origin/main ($main_commit)." >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "tag_commit=$tag_commit" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build sidecar
+        working-directory: sidecar
+        run: cargo build --release --locked
+
+      - name: Run sidecar tests
+        working-directory: sidecar
+        run: cargo test --locked
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: webui/package-lock.json
+
+      - name: Build webui
+        working-directory: webui
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build Docker images
+        run: |
+          docker build -f deploy/docker/Dockerfile -t rtorrentng:${{ steps.tag.outputs.tag }} .
+          docker build -f deploy/docker/Dockerfile.phase1 -t rtorrentng-phase1:${{ steps.tag.outputs.tag }} .
+
+      - name: Package release artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp sidecar/target/release/rtorrentng "dist/rtorrentng-linux-x86_64"
+          tar -czf "dist/rtorrentng-webui-${{ steps.tag.outputs.tag }}.tar.gz" -C sidecar/static .
+          tar -czf "dist/rtorrentng-deploy-${{ steps.tag.outputs.tag }}.tar.gz" deploy docs README.md LICENSE
+          sha256sum dist/* > "dist/SHA256SUMS-${{ steps.tag.outputs.tag }}.txt"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.tag }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* \
+              --title "rtorrentNG $tag" \
+              --generate-notes \
+              --verify-tag
+          fi
+
+      - name: Check Discord webhook configuration
+        id: discord
+        env:
+          DISCORD_RELEASE_WEBHOOK: ${{ secrets.DISCORD_RELEASE_WEBHOOK }}
+        shell: bash
+        run: |
+          if [[ -n "${DISCORD_RELEASE_WEBHOOK:-}" ]]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Announce release on Discord
+        if: success() && steps.discord.outputs.configured == 'true'
+        env:
+          DISCORD_RELEASE_WEBHOOK: ${{ secrets.DISCORD_RELEASE_WEBHOOK }}
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+          RELEASE_URL: https://github.com/${{ github.repository }}/releases/tag/${{ steps.tag.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq -n \
+            --arg tag "$RELEASE_TAG" \
+            --arg url "$RELEASE_URL" \
+            --arg repo "$GITHUB_REPOSITORY" \
+            '{
+              username: "rtorrentNG releases",
+              embeds: [{
+                title: ("rtorrentNG " + $tag + " released"),
+                url: $url,
+                description: ("A new tagged release is available for `" + $repo + "`."),
+                color: 3447003,
+                fields: [
+                  {name: "Tag", value: $tag, inline: true},
+                  {name: "Release", value: $url, inline: false}
+                ]
+              }]
+            }' > discord-payload.json
+          curl -fsS \
+            -H "Content-Type: application/json" \
+            -d @discord-payload.json \
+            "$DISCORD_RELEASE_WEBHOOK"

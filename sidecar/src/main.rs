@@ -1,10 +1,13 @@
-use rtorrentng::{api, cache, config, metrics, qbcompat as _, rtorrent, sync};
-use std::sync::Arc;
 use anyhow::{Context, Result};
+use rtorrentng::{api, cache, config, metrics, rtorrent, sync};
+use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::info;
 
-use api::{server::{AppState, build_router}, ws::Event};
+use api::{
+    server::{build_router, AppState},
+    ws::Event,
+};
 use cache::Db;
 use config::Config;
 use metrics::Metrics;
@@ -19,8 +22,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .json()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| filter.into())
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| filter.into()),
         )
         .init();
 
@@ -57,11 +59,14 @@ async fn main() -> Result<()> {
     };
     let app = build_router(state);
 
-    let addr: std::net::SocketAddr = cfg.listen_addr.parse()
+    let addr: std::net::SocketAddr = cfg
+        .listen_addr
+        .parse()
         .with_context(|| format!("parse listen_addr {}", cfg.listen_addr))?;
 
     info!(%addr, "listening");
-    let listener = tokio::net::TcpListener::bind(addr).await
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
         .with_context(|| format!("bind {addr}"))?;
 
     axum::serve(listener, app)
@@ -74,7 +79,9 @@ async fn main() -> Result<()> {
 }
 
 async fn shutdown_signal() {
-    let ctrl_c = async { tokio::signal::ctrl_c().await.expect("ctrl-c listener"); };
+    let ctrl_c = async {
+        tokio::signal::ctrl_c().await.expect("ctrl-c listener");
+    };
 
     #[cfg(unix)]
     let terminate = async {

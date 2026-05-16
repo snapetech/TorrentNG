@@ -5,6 +5,8 @@ services:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
     restart: unless-stopped
+    security_opt:
+      - seccomp:unconfined
     ports:
       - "8080:8080"       # sidecar API + WebUI (put nginx in front for production)
       - "50000:50000"     # rTorrent incoming port (adjust to match rtorrent.rc)
@@ -15,8 +17,17 @@ services:
       - session:/session
     environment:
       RTORRENTNG_CONFIG: /config/config.toml
+      RTORRENT_INCOMING_PORT: "50000"
+      RTORRENT_SCGI_SOCKET: /run/rtorrent/rpc.sock
+      RTNG_SECRET_KEY: "${RTNG_SECRET_KEY:-change-me}"
+      RTNG_API_TOKENS: "${RTNG_API_TOKENS:-}"
+      RTNG_USER_AGENT: "${RTNG_USER_AGENT:-rtorrentNG/0.1.0 libtorrent/0.16.11}"
+      RTNG_QBITTORRENT_VERSION: "${RTNG_QBITTORRENT_VERSION:-5.0.0}"
+      RTNG_QBITTORRENT_WEBAPI_VERSION: "${RTNG_QBITTORRENT_WEBAPI_VERSION:-2.11.0}"
+      RTNG_QBITTORRENT_BUILD_LIBTORRENT: "${RTNG_QBITTORRENT_BUILD_LIBTORRENT:-0.16.11}"
+      RTNG_QBITTORRENT_BUILD_QT: "${RTNG_QBITTORRENT_BUILD_QT:-6.7.0}"
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      test: ["CMD", "/bin/sh", "-c", "test -S /run/rtorrent/rpc.sock && wget -qO- http://localhost:8080/health >/dev/null"]
       interval: 15s
       timeout: 5s
       retries: 3

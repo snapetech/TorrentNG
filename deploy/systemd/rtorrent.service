@@ -1,13 +1,12 @@
 [Unit]
 Description=rTorrent BitTorrent Engine
 After=network.target
-Wants=rtorrentng-sidecar.service
 
 [Service]
 Type=simple
 User=rtorrent
 Group=rtorrent
-UMask=0002
+UMask=0007
 ExecStart=/usr/bin/rtorrent -n -o "import=/etc/rtorrent/rtorrent.rc"
 Restart=on-failure
 RestartSec=5

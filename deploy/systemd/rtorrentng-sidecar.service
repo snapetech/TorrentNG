@@ -7,7 +7,8 @@ Requires=rtorrent.service
 Type=simple
 User=rtorrent
 Group=rtorrent
-ExecStart=/usr/local/bin/rtorrentng --config /etc/rtorrentng/config.toml
+Environment=RTNG_STATIC_DIR=/usr/share/rtorrentng/webui
+ExecStart=/usr/local/bin/rtorrentng /etc/rtorrentng/config.toml
 Restart=on-failure
 RestartSec=5
 

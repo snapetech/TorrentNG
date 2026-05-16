@@ -1,30 +1,7 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-
-interface Category { name: string; save_path: string }
-
-async function fetchCategories(): Promise<Category[]> {
-  const res = await fetch('/api/v1/categories')
-  if (!res.ok) throw new Error('fetch categories')
-  return res.json()
-}
-
-async function upsertCategory(cat: Category): Promise<void> {
-  const res = await fetch('/api/v1/categories', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-RTNG-CSRF': '1' },
-    body: JSON.stringify(cat),
-  })
-  if (!res.ok) throw new Error('save category')
-}
-
-async function deleteCategory(name: string): Promise<void> {
-  const res = await fetch(`/api/v1/categories/${encodeURIComponent(name)}`, {
-    method: 'DELETE',
-    headers: { 'X-RTNG-CSRF': '1' },
-  })
-  if (!res.ok) throw new Error('delete category')
-}
+import { api } from '../api/client'
+import type { Category } from '../api/client'
 
 const INPUT: React.CSSProperties = {
   background: '#0f1117',
@@ -42,7 +19,7 @@ export function CategoriesPanel() {
   const qc = useQueryClient()
   const { data: categories = [], isLoading } = useQuery({
     queryKey: ['categories'],
-    queryFn: fetchCategories,
+    queryFn: api.categories.list,
   })
 
   const [name, setName] = useState('')
@@ -50,7 +27,7 @@ export function CategoriesPanel() {
   const [editingName, setEditingName] = useState<string | null>(null)
 
   const save = useMutation({
-    mutationFn: upsertCategory,
+    mutationFn: (cat: Category) => api.categories.create(cat.name, cat.save_path),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['categories'] })
       setName('')
@@ -60,7 +37,7 @@ export function CategoriesPanel() {
   })
 
   const del = useMutation({
-    mutationFn: deleteCategory,
+    mutationFn: (name: string) => api.categories.delete(name),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['categories'] }),
   })
 
