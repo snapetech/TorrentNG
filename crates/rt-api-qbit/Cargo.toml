@@ -1,6 +1,6 @@
 [package]
 name = "rt-api-qbit"
-description = "rtorrentNG: rt-api-qbit"
+description = "rtorrentNG: qBittorrent v2 API compatibility shim"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,3 +9,14 @@ license.workspace = true
 [dependencies]
 thiserror.workspace = true
 tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+axum.workspace = true
+tokio.workspace = true
+tower.workspace = true
+rt-api-model = { path = "../rt-api-model" }
+rt-session = { path = "../rt-session" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tower.workspace = true
