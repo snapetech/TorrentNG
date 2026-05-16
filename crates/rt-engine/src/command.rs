@@ -149,6 +149,12 @@ pub enum EngineCmd {
         save_path: Option<PathBuf>,
         reply: oneshot::Sender<CmdResult<()>>,
     },
+    /// Replace persisted tracker URLs for a torrent.
+    UpdateTorrentTrackers {
+        info_hash: String,
+        trackers: Vec<String>,
+        reply: oneshot::Sender<CmdResult<()>>,
+    },
     /// Snapshot runtime and durable metrics.
     GetStats {
         reply: oneshot::Sender<CmdResult<EngineStats>>,

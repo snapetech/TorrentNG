@@ -520,18 +520,79 @@ pub async fn torrents_trackers(
 }
 
 /// `POST /api/qb/v2/torrents/addTrackers`.
-pub async fn torrents_add_trackers() -> impl IntoResponse {
-    StatusCode::OK
+pub async fn torrents_add_trackers(
+    State(state): State<AppState>,
+    body: String,
+) -> impl IntoResponse {
+    let params = parse_form_body(&body);
+    let Some(hash) = params.get("hash").cloned() else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let urls = params
+        .get("urls")
+        .map(|urls| split_tracker_values(urls))
+        .unwrap_or_default();
+    if urls.is_empty() {
+        return StatusCode::BAD_REQUEST;
+    }
+    let mut trackers = current_tracker_urls(&state, &hash).await;
+    for url in urls {
+        if !trackers.contains(&url) {
+            trackers.push(url);
+        }
+    }
+    update_torrent_trackers(&state, &hash, trackers).await
 }
 
 /// `POST /api/qb/v2/torrents/editTracker`.
-pub async fn torrents_edit_tracker() -> impl IntoResponse {
-    StatusCode::OK
+pub async fn torrents_edit_tracker(
+    State(state): State<AppState>,
+    body: String,
+) -> impl IntoResponse {
+    let params = parse_form_body(&body);
+    let Some(hash) = params.get("hash").cloned() else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let Some(original_url) = params
+        .get("origUrl")
+        .and_then(|url| normalize_api_text(url))
+    else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let Some(new_url) = params.get("newUrl").and_then(|url| normalize_api_text(url)) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let mut trackers = current_tracker_urls(&state, &hash).await;
+    let Some(slot) = trackers.iter_mut().find(|url| **url == original_url) else {
+        return StatusCode::NOT_FOUND;
+    };
+    *slot = new_url;
+    trackers = normalize_tracker_values(trackers);
+    update_torrent_trackers(&state, &hash, trackers).await
 }
 
 /// `POST /api/qb/v2/torrents/removeTrackers`.
-pub async fn torrents_remove_trackers() -> impl IntoResponse {
-    StatusCode::OK
+pub async fn torrents_remove_trackers(
+    State(state): State<AppState>,
+    body: String,
+) -> impl IntoResponse {
+    let params = parse_form_body(&body);
+    let Some(hash) = params.get("hash").cloned() else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let remove = params
+        .get("urls")
+        .map(|urls| split_tracker_values(urls))
+        .unwrap_or_default();
+    if remove.is_empty() {
+        return StatusCode::BAD_REQUEST;
+    }
+    let trackers = current_tracker_urls(&state, &hash)
+        .await
+        .into_iter()
+        .filter(|url| !remove.contains(url))
+        .collect::<Vec<_>>();
+    update_torrent_trackers(&state, &hash, trackers).await
 }
 
 /// `POST /api/qb/v2/torrents/addPeers`.
@@ -1566,6 +1627,26 @@ fn split_tags(tags: &str) -> Vec<String> {
         .collect()
 }
 
+fn split_tracker_values(values: &str) -> Vec<String> {
+    normalize_tracker_values(
+        values
+            .split(['|', '\n', '\r'])
+            .map(str::to_owned)
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn normalize_tracker_values(values: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for value in values {
+        let value = value.trim().to_owned();
+        if !value.is_empty() && !out.contains(&value) {
+            out.push(value);
+        }
+    }
+    out
+}
+
 fn split_pipe_values(values: &str) -> Vec<String> {
     values.split('|').filter_map(normalize_api_text).collect()
 }
@@ -1658,6 +1739,37 @@ async fn update_torrent_fields(
         entry.save_path = save_path.to_string_lossy().to_string();
     }
     StatusCode::OK
+}
+
+async fn current_tracker_urls(state: &AppState, hash: &str) -> Vec<String> {
+    let Some(engine) = &state.engine else {
+        return Vec::new();
+    };
+    engine
+        .torrent_metadata(hash.to_owned())
+        .await
+        .map(|meta| meta.trackers)
+        .unwrap_or_default()
+}
+
+async fn update_torrent_trackers(
+    state: &AppState,
+    hash: &str,
+    trackers: Vec<String>,
+) -> StatusCode {
+    let Some(engine) = &state.engine else {
+        return StatusCode::OK;
+    };
+    match engine
+        .update_torrent_trackers(hash.to_owned(), trackers)
+        .await
+    {
+        Ok(()) => {
+            state.tracker_projection_cache.write().await.remove(hash);
+            StatusCode::OK
+        }
+        Err(_) => StatusCode::NOT_FOUND,
+    }
 }
 
 async fn fetch_torrent_url(raw_url: &str) -> Result<Vec<u8>, String> {
@@ -2538,5 +2650,16 @@ mod tests {
         let params = parse_form_body("hashes=a%7Cb&tags=high+quality%2Carchive");
         assert_eq!(params.get("hashes").unwrap(), "a|b");
         assert_eq!(params.get("tags").unwrap(), "high quality,archive");
+    }
+
+    #[test]
+    fn split_tracker_values_accepts_qbit_separators_and_dedupes() {
+        assert_eq!(
+            split_tracker_values("udp://one/announce|udp://two/announce\nudp://one/announce"),
+            vec![
+                "udp://one/announce".to_owned(),
+                "udp://two/announce".to_owned()
+            ]
+        );
     }
 }

@@ -41,6 +41,7 @@ const EVENT_RECHECK_REQUESTED: &str = "check_requested";
 const EVENT_REANNOUNCE_REQUESTED: &str = "tracker_reannounce_requested";
 const EVENT_LABELS_UPDATED: &str = "labels_updated";
 const EVENT_FIELDS_UPDATED: &str = "torrent_fields_updated";
+const EVENT_TRACKERS_UPDATED: &str = "trackers_updated";
 const EVENT_ENGINE_STOPPED: &str = "engine_stopped";
 
 const JOB_KIND_RECHECK: &str = "recheck_torrent";
@@ -250,6 +251,23 @@ impl EngineHandle {
                 info_hash,
                 name,
                 save_path,
+                reply,
+            })
+            .await
+            .map_err(|_| "engine shut down".to_owned())?;
+        rx.await.map_err(|_| "engine dropped reply".to_owned())?
+    }
+
+    pub async fn update_torrent_trackers(
+        &self,
+        info_hash: String,
+        trackers: Vec<String>,
+    ) -> CmdResult<()> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(EngineCmd::UpdateTorrentTrackers {
+                info_hash,
+                trackers,
                 reply,
             })
             .await
@@ -586,6 +604,16 @@ impl Engine {
             } => {
                 let result = self
                     .update_torrent_fields_inner(&info_hash, name, save_path)
+                    .await;
+                let _ = reply.send(result);
+            }
+            EngineCmd::UpdateTorrentTrackers {
+                info_hash,
+                trackers,
+                reply,
+            } => {
+                let result = self
+                    .update_torrent_trackers_inner(&info_hash, trackers)
                     .await;
                 let _ = reply.send(result);
             }
@@ -1176,6 +1204,14 @@ impl Engine {
             TorrentMeta::V2(_) => anyhow::bail!("pure v2 torrents are not supported"),
         };
         let mut metadata = metadata_from_v1(&meta);
+        if let Ok(row) = {
+            let db = self.db.lock().expect("database mutex poisoned");
+            rt_db::get(&db, info_hash)
+        } {
+            if !row.trackers.is_empty() {
+                metadata.trackers = row.trackers;
+            }
+        }
         if let Ok(hash) = decode_info_hash(info_hash) {
             if let Ok(state) = FastresumeStore::new(fastresume_dir(&self.config)).load(info_hash) {
                 if state.validate(&hash, metadata.piece_count as u32).is_ok() {
@@ -1295,6 +1331,55 @@ impl Engine {
                 "name": row.name,
                 "save_path": row.save_path,
             }),
+        );
+        Ok(())
+    }
+
+    async fn update_torrent_trackers_inner(
+        &self,
+        info_hash: &str,
+        trackers: Vec<String>,
+    ) -> CmdResult<()> {
+        let trackers = normalize_tracker_urls(trackers);
+        let mut row = {
+            let db = self.db.lock().expect("database mutex poisoned");
+            rt_db::get(&db, info_hash).map_err(|e| e.to_string())?
+        };
+        row.trackers = trackers.clone();
+        let tracker_rows = trackers
+            .iter()
+            .enumerate()
+            .map(|(idx, url)| rt_db::TorrentTrackerRow {
+                info_hash: info_hash.to_owned(),
+                tracker_index: idx as i64,
+                tier: idx as i64,
+                url: url.clone(),
+                status: "pending".to_owned(),
+                last_announce_at: None,
+                next_announce_at: None,
+                last_success_at: None,
+                failure_reason: None,
+                warning_message: None,
+                seeders: None,
+                leechers: None,
+                completed: None,
+                uploaded: row.uploaded,
+                downloaded: row.downloaded,
+                left_bytes: row.total_length.saturating_sub(row.downloaded).max(0),
+            })
+            .collect::<Vec<_>>();
+
+        {
+            let mut db = self.db.lock().expect("database mutex poisoned");
+            rt_db::upsert(&db, &row).map_err(|e| e.to_string())?;
+            rt_db::replace_torrent_trackers(&mut db, info_hash, &tracker_rows)
+                .map_err(|e| e.to_string())?;
+        }
+        self.append_session_event(
+            Some(info_hash),
+            EVENT_TRACKERS_UPDATED,
+            Some("torrent trackers updated"),
+            serde_json::json!({ "trackers": trackers }),
         );
         Ok(())
     }
@@ -1943,6 +2028,17 @@ fn normalize_tags(tags: Vec<String>) -> Vec<String> {
     out
 }
 
+fn normalize_tracker_urls(trackers: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for tracker in trackers {
+        let tracker = tracker.trim().to_owned();
+        if !tracker.is_empty() && !out.contains(&tracker) {
+            out.push(tracker);
+        }
+    }
+    out
+}
+
 fn metadata_from_v1(meta: &TorrentMetaV1) -> EngineTorrentMetadata {
     EngineTorrentMetadata {
         piece_length: meta.piece_length,
@@ -2292,6 +2388,58 @@ mod tests {
         let job = rt_db::get_job(&db, &job_id).unwrap();
         assert_eq!(job.state, JOB_STATE_CANCELLED);
         assert!(job.finished_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn update_torrent_trackers_persists_summary_and_detail_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let info_hash = "f".repeat(40);
+        let mut entry = TorrentEntry::new(info_hash.clone(), "tracked".into(), "/data".into());
+        entry.total_length = 1_000;
+        entry.stats.downloaded = 250;
+        let row = row_from_entry(&entry, &meta());
+        rt_db::upsert(&conn, &row).unwrap();
+
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        registry.write().await.add(entry).unwrap();
+        let (_tx, rx) = mpsc::channel(1);
+        let engine = Engine {
+            config: Arc::new(Config::default()),
+            registry,
+            db: Arc::new(Mutex::new(conn)),
+            cmd_rx: rx,
+            cmd_tx: mpsc::channel(1).0,
+            torrent_chans: HashMap::new(),
+            torrent_tasks: HashMap::new(),
+            dht_tx: None,
+        };
+
+        engine
+            .update_torrent_trackers_inner(
+                &info_hash,
+                vec![
+                    " udp://tracker.one/announce ".into(),
+                    "udp://tracker.one/announce".into(),
+                    "https://tracker.two/announce".into(),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let db = engine.db.lock().unwrap();
+        let row = rt_db::get(&db, &info_hash).unwrap();
+        assert_eq!(
+            row.trackers,
+            vec![
+                "udp://tracker.one/announce".to_owned(),
+                "https://tracker.two/announce".to_owned()
+            ]
+        );
+        let trackers = rt_db::list_torrent_trackers(&db, &info_hash).unwrap();
+        assert_eq!(trackers.len(), 2);
+        assert_eq!(trackers[0].status, "pending");
+        assert_eq!(trackers[0].left_bytes, 19_750);
     }
 
     #[tokio::test]
