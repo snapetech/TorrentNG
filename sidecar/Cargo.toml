@@ -19,7 +19,7 @@ tokio = { version = "1", features = ["full"] }
 
 # HTTP server
 axum = { version = "0.8", features = ["multipart", "ws"] }
-tower = "0.4"
+tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "fs", "limit", "trace"] }
 hyper = { version = "1", features = ["full"] }
 
@@ -29,7 +29,7 @@ serde_json = "1"
 toml = "1.1"
 
 # SQLite
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 
 # Logging / tracing
 tracing = "0.1"
@@ -37,7 +37,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Error handling
 anyhow = "1"
-thiserror = "1"
+thiserror = "2"
 
 # Config / env
 dotenvy = "0.15"
@@ -46,11 +46,11 @@ dotenvy = "0.15"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
-quick-xml = "0.36"
+quick-xml = "0.40"
 urlencoding = "2"
 dirs-next = "2"
 libc = "0.2"
-reqwest = { version = "0.12", features = ["json", "multipart", "cookies"] }
+reqwest = { version = "0.13", features = ["json", "multipart", "cookies"] }
 
 [dev-dependencies]
 tokio-test = "0.4"

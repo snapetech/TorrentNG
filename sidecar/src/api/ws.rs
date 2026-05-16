@@ -53,7 +53,7 @@ async fn handle_socket(
                 match event {
                     Ok(e) => {
                         let payload = serde_json::to_string(&e).unwrap_or_default();
-                        if socket.send(axum::extract::ws::Message::Text(payload)).await.is_err() {
+                        if socket.send(axum::extract::ws::Message::Text(payload.into())).await.is_err() {
                             break;
                         }
                     }
