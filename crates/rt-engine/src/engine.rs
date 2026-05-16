@@ -7,6 +7,7 @@ use std::sync::Mutex;
 
 use anyhow::Context;
 use rusqlite::Connection;
+use sha1::{Digest, Sha1};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
@@ -267,6 +268,7 @@ impl Engine {
         let conn = Connection::open(config.db_path())
             .with_context(|| format!("opening database {:?}", config.db_path()))?;
         rt_db::migrate(&conn).context("migrating database")?;
+        register_configured_storage(&conn, &config).context("registering configured storage")?;
 
         let dht_shutdown = if config.dht.enabled {
             let (dht_tx, dht_rx) = mpsc::channel(64);
@@ -1570,6 +1572,70 @@ fn fastresume_dir(config: &Config) -> PathBuf {
     config.daemon.session_dir.join("fastresume")
 }
 
+fn register_configured_storage(conn: &Connection, config: &Config) -> anyhow::Result<()> {
+    std::fs::create_dir_all(&config.storage.download_dir)?;
+    let path = normalized_path_string(&config.storage.download_dir);
+    let now = unix_now_i64();
+    let root_id = stable_id("root", &path);
+    let mount_id = stable_mount_id(&config.storage.download_dir);
+    rt_db::upsert_storage_root(
+        conn,
+        &rt_db::StorageRootRow {
+            root_id,
+            path: path.clone(),
+            profile: "auto".to_owned(),
+            created_at: now,
+        },
+    )?;
+    rt_db::upsert_mount(
+        conn,
+        &rt_db::MountRow {
+            mount_id,
+            path,
+            fs_type: Some("unknown".to_owned()),
+            device: storage_device_id(&config.storage.download_dir),
+            queue_depth: 1,
+            read_concurrency: 1,
+            write_concurrency: 1,
+            updated_at: now,
+        },
+    )?;
+    Ok(())
+}
+
+fn normalized_path_string(path: &std::path::Path) -> String {
+    path.canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .to_string()
+}
+
+fn stable_mount_id(path: &std::path::Path) -> String {
+    let key = storage_device_id(path).unwrap_or_else(|| normalized_path_string(path));
+    stable_id("mount", &key)
+}
+
+fn stable_id(prefix: &str, value: &str) -> String {
+    let mut hasher = Sha1::new();
+    hasher.update(value.as_bytes());
+    let digest = hasher.finalize();
+    format!("{prefix}-{}", hex::encode(&digest[..10]))
+}
+
+#[cfg(unix)]
+fn storage_device_id(path: &std::path::Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+
+    std::fs::metadata(path)
+        .ok()
+        .map(|metadata| format!("dev:{}", metadata.dev()))
+}
+
+#[cfg(not(unix))]
+fn storage_device_id(_path: &std::path::Path) -> Option<String> {
+    None
+}
+
 fn parse_info_hash_hex(info_hash: &str) -> Result<[u8; 20], ()> {
     if info_hash.len() != 40 {
         return Err(());
@@ -2069,6 +2135,27 @@ mod tests {
         if let Some(tx) = engine.torrent_chans.remove(&info_hash) {
             let _ = tx.send(TorrentCmd::Shutdown).await;
         }
+    }
+
+    #[test]
+    fn register_configured_storage_persists_root_and_mount() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.download_dir = temp.path().join("downloads");
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+
+        register_configured_storage(&conn, &config).unwrap();
+
+        let roots = rt_db::list_storage_roots(&conn).unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].profile, "auto");
+        assert!(roots[0].path.ends_with("downloads"));
+        let mounts = rt_db::list_mounts(&conn).unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].queue_depth, 1);
+        assert_eq!(mounts[0].read_concurrency, 1);
+        assert_eq!(mounts[0].write_concurrency, 1);
     }
 }
 

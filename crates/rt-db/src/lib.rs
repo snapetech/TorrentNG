@@ -4,6 +4,7 @@ pub mod event_row;
 pub mod job_row;
 pub mod schema;
 pub mod settings_row;
+pub mod storage_row;
 pub mod torrent_row;
 
 pub use detail_row::{
@@ -19,4 +20,8 @@ pub use event_row::{
 pub use job_row::{get_job, list_active_jobs, upsert_job, JobRow};
 pub use schema::migrate;
 pub use settings_row::{get_setting, set_setting};
+pub use storage_row::{
+    get_mount, get_storage_root, list_mounts, list_storage_roots, upsert_mount,
+    upsert_storage_root, MountRow, StorageRootRow,
+};
 pub use torrent_row::{delete, get, list_all, list_by_state, upsert, TorrentRow};
