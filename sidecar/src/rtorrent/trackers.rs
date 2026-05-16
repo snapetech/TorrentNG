@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use super::client::{Client, XmlValue};
+use crate::torrent_meta::session_tracker_urls;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RawTracker {
@@ -81,6 +82,32 @@ impl Client {
                 message: sf(&f, 17),
             });
         }
+
+        if out.is_empty() {
+            out = session_tracker_urls(hash)
+                .into_iter()
+                .enumerate()
+                .map(|(idx, url)| RawTracker {
+                    url,
+                    id: idx as i64,
+                    group: 0,
+                    group_index: idx as i64,
+                    is_enabled: true,
+                    is_open: false,
+                    is_extra_tracker: false,
+                    activity_time_last: 0,
+                    activity_time_next: 0,
+                    min_interval: 0,
+                    normal_interval: 0,
+                    failed_counter: 0,
+                    success_counter: 0,
+                    scrape_incomplete: 0,
+                    scrape_complete: 0,
+                    scrape_downloaded: 0,
+                    message: String::new(),
+                })
+                .collect();
+        }
         Ok(out)
     }
 
@@ -109,9 +136,11 @@ impl Client {
 fn sf(f: &[XmlValue], i: usize) -> String {
     f.get(i).and_then(|v| v.as_str()).unwrap_or("").to_owned()
 }
+
 fn nf(f: &[XmlValue], i: usize) -> i64 {
     f.get(i).and_then(|v| v.as_i64()).unwrap_or(0)
 }
+
 fn bf(f: &[XmlValue], i: usize) -> bool {
     f.get(i).and_then(|v| v.as_bool()).unwrap_or(false)
 }

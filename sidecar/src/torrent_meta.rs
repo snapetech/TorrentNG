@@ -20,6 +20,18 @@ pub fn session_tracker_url(hash: &str, cache: &mut HashMap<String, Option<String
     tracker.unwrap_or_default()
 }
 
+pub fn session_tracker_urls(hash: &str) -> Vec<String> {
+    let normalized = hash.trim().to_ascii_uppercase();
+    if normalized.is_empty() {
+        return Vec::new();
+    }
+    let path = session_dir().join(format!("{normalized}.torrent"));
+    std::fs::read(path)
+        .ok()
+        .map(|raw| tracker_urls_from_torrent(&raw))
+        .unwrap_or_default()
+}
+
 fn session_dir() -> PathBuf {
     std::env::var("RTNG_SESSION_DIR")
         .ok()
@@ -29,28 +41,46 @@ fn session_dir() -> PathBuf {
 }
 
 fn first_tracker_url(raw: &[u8]) -> Option<String> {
+    tracker_urls_from_torrent(raw).into_iter().next()
+}
+
+fn tracker_urls_from_torrent(raw: &[u8]) -> Vec<String> {
     let mut pos = 0;
     if raw.get(pos) != Some(&b'd') {
-        return None;
+        return Vec::new();
     }
     pos += 1;
-    let mut announce_list: Option<String> = None;
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
 
     while pos < raw.len() && raw[pos] != b'e' {
-        let key = parse_bytes(raw, &mut pos)?;
+        let Some(key) = parse_bytes(raw, &mut pos) else {
+            break;
+        };
         if key == b"announce" {
-            let value = parse_bytes(raw, &mut pos)?;
-            if let Some(url) = clean_tracker_url(value) {
-                return Some(url);
+            if let Some(value) = parse_bytes(raw, &mut pos).and_then(clean_tracker_url) {
+                push_tracker(value, &mut seen, &mut out);
             }
         } else if key == b"announce-list" {
-            announce_list = first_string_in_value(raw, &mut pos, 0).and_then(clean_tracker_url);
+            collect_trackers_in_value(raw, &mut pos, 0, &mut seen, &mut out);
         } else {
-            skip_value(raw, &mut pos, 0)?;
+            if skip_value(raw, &mut pos, 0).is_none() {
+                break;
+            }
         }
     }
 
-    announce_list
+    out
+}
+
+fn push_tracker(
+    value: String,
+    seen: &mut std::collections::HashSet<String>,
+    out: &mut Vec<String>,
+) {
+    if seen.insert(value.clone()) {
+        out.push(value);
+    }
 }
 
 fn clean_tracker_url(raw: &[u8]) -> Option<String> {
@@ -62,66 +92,48 @@ fn clean_tracker_url(raw: &[u8]) -> Option<String> {
     }
 }
 
-fn first_string_in_value<'a>(raw: &'a [u8], pos: &mut usize, depth: usize) -> Option<&'a [u8]> {
+fn collect_trackers_in_value(
+    raw: &[u8],
+    pos: &mut usize,
+    depth: usize,
+    seen: &mut std::collections::HashSet<String>,
+    out: &mut Vec<String>,
+) -> Option<()> {
     if depth > MAX_BENCODE_DEPTH || *pos >= raw.len() {
         return None;
     }
     match raw[*pos] {
-        b'0'..=b'9' => parse_bytes(raw, pos),
+        b'0'..=b'9' => {
+            if let Some(url) = parse_bytes(raw, pos).and_then(clean_tracker_url) {
+                push_tracker(url, seen, out);
+            }
+            Some(())
+        }
         b'l' => {
             *pos += 1;
             while *pos < raw.len() && raw[*pos] != b'e' {
-                if let Some(value) = first_string_in_value(raw, pos, depth + 1) {
-                    skip_remaining_list(raw, pos, depth + 1);
-                    return Some(value);
-                }
+                collect_trackers_in_value(raw, pos, depth + 1, seen, out)?;
             }
-            if *pos < raw.len() {
-                *pos += 1;
+            if *pos >= raw.len() {
+                return None;
             }
-            None
+            *pos += 1;
+            Some(())
         }
         b'd' => {
             *pos += 1;
             while *pos < raw.len() && raw[*pos] != b'e' {
                 parse_bytes(raw, pos)?;
-                if let Some(value) = first_string_in_value(raw, pos, depth + 1) {
-                    skip_remaining_dict(raw, pos, depth + 1);
-                    return Some(value);
-                }
+                collect_trackers_in_value(raw, pos, depth + 1, seen, out)?;
             }
-            if *pos < raw.len() {
-                *pos += 1;
+            if *pos >= raw.len() {
+                return None;
             }
-            None
+            *pos += 1;
+            Some(())
         }
-        b'i' => {
-            skip_value(raw, pos, depth)?;
-            None
-        }
+        b'i' => skip_value(raw, pos, depth),
         _ => None,
-    }
-}
-
-fn skip_remaining_list(raw: &[u8], pos: &mut usize, depth: usize) {
-    while *pos < raw.len() && raw[*pos] != b'e' {
-        if skip_value(raw, pos, depth).is_none() {
-            return;
-        }
-    }
-    if *pos < raw.len() {
-        *pos += 1;
-    }
-}
-
-fn skip_remaining_dict(raw: &[u8], pos: &mut usize, depth: usize) {
-    while *pos < raw.len() && raw[*pos] != b'e' {
-        if parse_bytes(raw, pos).is_none() || skip_value(raw, pos, depth).is_none() {
-            return;
-        }
-    }
-    if *pos < raw.len() {
-        *pos += 1;
     }
 }
 
@@ -197,6 +209,7 @@ fn skip_value(raw: &[u8], pos: &mut usize, depth: usize) -> Option<()> {
 #[cfg(test)]
 mod tests {
     use super::first_tracker_url;
+    use super::tracker_urls_from_torrent;
 
     #[test]
     fn reads_announce_first() {
@@ -213,6 +226,18 @@ mod tests {
         assert_eq!(
             first_tracker_url(raw).as_deref(),
             Some("udp://tracker:6969/announce")
+        );
+    }
+
+    #[test]
+    fn deduplicates_tracker_urls() {
+        let raw = b"d8:announce24:https://tracker/announce13:announce-listll24:https://tracker/announceel27:udp://tracker:6969/announceeee";
+        assert_eq!(
+            tracker_urls_from_torrent(raw),
+            vec![
+                "https://tracker/announce".to_owned(),
+                "udp://tracker:6969/announce".to_owned()
+            ]
         );
     }
 }
