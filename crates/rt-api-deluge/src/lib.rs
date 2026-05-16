@@ -79,7 +79,14 @@ async fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Va
         "web.connect" | "web.disconnect" | "web.start_daemon" | "web.stop_daemon" => {
             Ok(json!(true))
         }
+        "web.get_events" => Ok(json!([])),
         "web.update_ui" => update_ui(state).await,
+        "core.get_session_status" => session_status(state).await,
+        "core.get_stats" => session_status(state).await,
+        "core.get_num_connections" => Ok(json!(0)),
+        "core.get_download_rate" => Ok(json!(0.0)),
+        "core.get_upload_rate" => Ok(json!(0.0)),
+        "core.get_filter_tree" => filter_tree(state).await,
         "core.get_torrents_status" => torrents_status(state).await,
         "core.get_torrent_status" => {
             let hash = params
@@ -138,6 +145,19 @@ async fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Va
             add_torrent_file(state, data, params.get(2)).await
         }
         "core.set_torrent_options" => Ok(json!(true)),
+        "label.get_labels" => labels(state).await,
+        "label.add" => Ok(json!(true)),
+        "label.remove" => Ok(json!(true)),
+        "label.set_options" => Ok(json!(true)),
+        "label.set_torrent" => {
+            let hash = params
+                .first()
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing torrent id".to_owned())?;
+            let label = params.get(1).and_then(Value::as_str).unwrap_or_default();
+            set_label(state, hash, label).await?;
+            Ok(json!(true))
+        }
         "core.get_free_space" => Ok(json!(0)),
         "core.get_config" => Ok(json!({
             "download_location": "/downloads",
@@ -148,6 +168,45 @@ async fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Va
         "core.get_enabled_plugins" => Ok(json!([])),
         _ => Err(format!("unsupported method {method}")),
     }
+}
+
+async fn session_status(state: &AppState) -> Result<Value, String> {
+    let reg = state.registry.read().await;
+    let torrent_count = reg.iter().count();
+    let total_payload_download = reg.iter().fold(0_u64, |acc, entry| {
+        acc.saturating_add(entry.stats.downloaded)
+    });
+    let total_payload_upload = reg
+        .iter()
+        .fold(0_u64, |acc, entry| acc.saturating_add(entry.stats.uploaded));
+    Ok(json!({
+        "payload_download_rate": 0.0,
+        "payload_upload_rate": 0.0,
+        "download_rate": 0.0,
+        "upload_rate": 0.0,
+        "num_connections": 0,
+        "total_payload_download": total_payload_download,
+        "total_payload_upload": total_payload_upload,
+        "num_torrents": torrent_count,
+    }))
+}
+
+async fn filter_tree(state: &AppState) -> Result<Value, String> {
+    let reg = state.registry.read().await;
+    let mut labels = std::collections::BTreeMap::<String, usize>::new();
+    let mut states = std::collections::BTreeMap::<String, usize>::new();
+    for entry in reg.iter() {
+        *labels
+            .entry(entry.category.clone().unwrap_or_default())
+            .or_default() += 1;
+        *states
+            .entry(deluge_state(entry.state.as_str()).to_owned())
+            .or_default() += 1;
+    }
+    Ok(json!({
+        "label": labels.into_iter().map(|(label, count)| json!([label, count])).collect::<Vec<_>>(),
+        "state": states.into_iter().map(|(state, count)| json!([state, count])).collect::<Vec<_>>(),
+    }))
 }
 
 async fn update_ui(state: &AppState) -> Result<Value, String> {
@@ -161,6 +220,7 @@ async fn update_ui(state: &AppState) -> Result<Value, String> {
         "torrents": torrents,
         "filters": {
             "state": [["All", reg.iter().count()]],
+            "label": labels_from_registry(&reg),
         },
         "stats": {
             "download_rate": 0.0,
@@ -168,6 +228,37 @@ async fn update_ui(state: &AppState) -> Result<Value, String> {
             "num_connections": 0,
         }
     }))
+}
+
+async fn labels(state: &AppState) -> Result<Value, String> {
+    let reg = state.registry.read().await;
+    Ok(json!(reg
+        .iter()
+        .filter_map(|entry| entry.category.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()))
+}
+
+async fn set_label(state: &AppState, hash: &str, label: &str) -> Result<(), String> {
+    let label = label.trim();
+    let category = if label.is_empty() {
+        None
+    } else {
+        Some(label.to_owned())
+    };
+    if let Some(engine) = &state.engine {
+        engine
+            .update_torrent_labels(hash.to_owned(), Some(category), Vec::new(), Vec::new())
+            .await?;
+        return Ok(());
+    }
+    let mut reg = state.registry.write().await;
+    let entry = reg
+        .get_mut(hash)
+        .ok_or_else(|| format!("torrent {hash} not found"))?;
+    entry.category = category;
+    Ok(())
 }
 
 async fn torrents_status(state: &AppState) -> Result<Value, String> {
@@ -209,6 +300,19 @@ fn deluge_torrent(entry: &rt_session::TorrentEntry) -> Value {
         "tags": entry.tags,
         "is_finished": entry.completed_at.is_some(),
     })
+}
+
+fn labels_from_registry(reg: &SessionRegistry) -> Vec<Value> {
+    let mut labels = std::collections::BTreeMap::<String, usize>::new();
+    for entry in reg.iter() {
+        if let Some(label) = &entry.category {
+            *labels.entry(label.clone()).or_default() += 1;
+        }
+    }
+    labels
+        .into_iter()
+        .map(|(label, count)| json!([label, count]))
+        .collect()
 }
 
 async fn add_magnet(state: &AppState, uri: &str, options: Option<&Value>) -> Result<Value, String> {
@@ -337,5 +441,63 @@ mod tests {
                 .unwrap();
             assert!(resp.status().is_success());
         }
+    }
+
+    #[tokio::test]
+    async fn deluge_label_methods_update_registry() {
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        {
+            let mut reg = registry.write().await;
+            reg.add(TorrentEntry::new(
+                "b".repeat(40),
+                "beta".into(),
+                "/data".into(),
+            ))
+            .unwrap();
+        }
+        let app = build_deluge_router(AppState::new(Arc::clone(&registry)));
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/json")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"id":1,"method":"label.set_torrent","params":["{}","movies"]}}"#,
+                        "b".repeat(40)
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        assert_eq!(
+            registry
+                .read()
+                .await
+                .get(&"b".repeat(40))
+                .unwrap()
+                .category
+                .as_deref(),
+            Some("movies")
+        );
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/json")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"id":2,"method":"label.get_labels","params":[]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["result"], json!(["movies"]));
     }
 }

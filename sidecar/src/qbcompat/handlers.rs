@@ -1440,6 +1440,7 @@ async fn transfer_info(State(s): State<AppState>) -> Json<serde_json::Value> {
 // --- mapping helpers ---
 
 pub fn to_qb_torrent(t: &TorrentRow) -> serde_json::Value {
+    let (down_rate, up_rate) = current_row_rates(t);
     let progress = if t.size_bytes > 0 {
         t.bytes_done as f64 / t.size_bytes as f64
     } else {
@@ -1456,8 +1457,8 @@ pub fn to_qb_torrent(t: &TorrentRow) -> serde_json::Value {
     } else {
         "pausedUP"
     };
-    let eta = if t.down_rate > 0 && t.size_bytes > t.bytes_done {
-        (t.size_bytes - t.bytes_done) / t.down_rate
+    let eta = if down_rate > 0 && t.size_bytes > t.bytes_done {
+        (t.size_bytes - t.bytes_done) / down_rate
     } else {
         8_640_000
     };
@@ -1467,8 +1468,8 @@ pub fn to_qb_torrent(t: &TorrentRow) -> serde_json::Value {
         "name":          t.name,
         "size":          t.size_bytes,
         "progress":      progress,
-        "dlspeed":       t.down_rate,
-        "upspeed":       t.up_rate,
+        "dlspeed":       down_rate,
+        "upspeed":       up_rate,
         "priority":      t.priority,
         "num_seeds":     t.peers_complete,
         "num_leechs":    t.peers_connected,
@@ -1487,6 +1488,15 @@ pub fn to_qb_torrent(t: &TorrentRow) -> serde_json::Value {
         "tracker":       t.tracker_url,
         "magnet_uri":    "",
     })
+}
+
+fn current_row_rates(t: &TorrentRow) -> (i64, i64) {
+    const STALE_AFTER_SECS: i64 = 15;
+    let now = chrono::Utc::now().timestamp();
+    if t.updated_at <= 0 || now.saturating_sub(t.updated_at) > STALE_AFTER_SECS {
+        return (0, 0);
+    }
+    (t.down_rate.max(0), t.up_rate.max(0))
 }
 
 fn split_hashes(db: &crate::cache::Db, s: Option<&str>) -> Vec<String> {

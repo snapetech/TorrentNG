@@ -73,8 +73,13 @@ async fn rpc(
     let result = match method {
         "session-get" => Ok(session_get(&state).await),
         "session-stats" => Ok(session_stats(&state).await),
-        "session-set" | "torrent-set" | "queue-move-top" | "queue-move-up" | "queue-move-down"
-        | "queue-move-bottom" => Ok(json!({})),
+        "session-close" | "session-set" => Ok(json!({})),
+        "group-get" => Ok(json!({ "groups": [] })),
+        "group-set" => Ok(json!({})),
+        "torrent-set" => torrent_set(&state, &args).await,
+        "queue-move-top" | "queue-move-up" | "queue-move-down" | "queue-move-bottom" => {
+            Ok(json!({}))
+        }
         "port-test" => Ok(json!({"port-is-open": true})),
         "blocklist-update" => Ok(json!({"blocklist-size": 0})),
         "free-space" => Ok(
@@ -158,6 +163,60 @@ async fn rpc(
         response["tag"] = tag;
     }
     Json(response).into_response()
+}
+
+async fn torrent_set(state: &AppState, args: &Value) -> Result<Value, String> {
+    let labels = args.get("labels").and_then(Value::as_array).map(|labels| {
+        labels
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    });
+    let location = args
+        .get("download-dir")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if labels.is_none() && location.is_none() {
+        return Ok(json!({}));
+    }
+    for hash in ids(state, args).await {
+        if let Some(labels) = labels.clone() {
+            if let Some(engine) = &state.engine {
+                let old_labels = {
+                    let reg = state.registry.read().await;
+                    reg.get(&hash)
+                        .map(|entry| entry.tags.clone())
+                        .unwrap_or_default()
+                };
+                let _ = engine
+                    .update_torrent_labels(hash.clone(), None, labels.clone(), old_labels)
+                    .await;
+            } else {
+                let mut reg = state.registry.write().await;
+                if let Some(entry) = reg.get_mut(&hash) {
+                    entry.tags = labels;
+                }
+            }
+        }
+        if let Some(location) = &location {
+            if let Some(engine) = &state.engine {
+                let _ = engine
+                    .update_torrent_fields(
+                        hash.clone(),
+                        None,
+                        Some(std::path::PathBuf::from(location)),
+                    )
+                    .await;
+            } else {
+                let mut reg = state.registry.write().await;
+                if let Some(entry) = reg.get_mut(&hash) {
+                    entry.save_path = location.clone();
+                }
+            }
+        }
+    }
+    Ok(json!({}))
 }
 
 fn response(tag: Option<Value>, result: &str, arguments: Value) -> Value {
@@ -471,5 +530,36 @@ mod tests {
                 .save_path,
             "/new"
         );
+    }
+
+    #[tokio::test]
+    async fn transmission_torrent_set_updates_labels_and_download_dir() {
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        {
+            let mut reg = registry.write().await;
+            let entry = TorrentEntry::new("c".repeat(40), "gamma".into(), "/old".into());
+            reg.add(entry).unwrap();
+        }
+        let app = build_transmission_router(AppState::new(Arc::clone(&registry)));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .header("content-type", "application/json")
+                    .header("x-transmission-session-id", SESSION_ID)
+                    .body(Body::from(format!(
+                        r#"{{"method":"torrent-set","arguments":{{"ids":["{}"],"labels":["tv","hd"],"download-dir":"/new"}}}}"#,
+                        "c".repeat(40)
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let reg = registry.read().await;
+        let entry = reg.get(&"c".repeat(40)).unwrap();
+        assert_eq!(entry.tags, vec!["tv".to_owned(), "hd".to_owned()]);
+        assert_eq!(entry.save_path, "/new");
     }
 }
