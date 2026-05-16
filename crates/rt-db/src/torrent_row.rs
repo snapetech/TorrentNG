@@ -88,7 +88,46 @@ pub fn upsert(conn: &Connection, row: &TorrentRow) -> Result<(), DbError> {
             trackers_json,
         ],
     )?;
+    persist_normalized_labels(conn, row)?;
     Ok(())
+}
+
+fn persist_normalized_labels(conn: &Connection, row: &TorrentRow) -> Result<(), DbError> {
+    conn.execute(
+        "DELETE FROM torrent_tags WHERE info_hash = ?1",
+        params![row.info_hash],
+    )?;
+    for tag in &row.tags {
+        conn.execute(
+            "INSERT OR IGNORE INTO torrent_tags (info_hash, tag) VALUES (?1, ?2)",
+            params![row.info_hash, tag],
+        )?;
+    }
+    if let Some(category) = &row.category {
+        conn.execute(
+            "INSERT OR IGNORE INTO torrent_categories (name, save_path, created_at)
+             VALUES (?1, NULL, ?2)",
+            params![category, row.added_at],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn list_torrent_tags(conn: &Connection, info_hash: &str) -> Result<Vec<String>, DbError> {
+    let mut stmt =
+        conn.prepare("SELECT tag FROM torrent_tags WHERE info_hash = ?1 ORDER BY tag ASC")?;
+    let tags = stmt
+        .query_map(params![info_hash], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(tags)
+}
+
+pub fn list_categories(conn: &Connection) -> Result<Vec<String>, DbError> {
+    let mut stmt = conn.prepare("SELECT name FROM torrent_categories ORDER BY name ASC")?;
+    let categories = stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(categories)
 }
 
 pub fn get(conn: &Connection, info_hash: &str) -> Result<TorrentRow, DbError> {
@@ -183,6 +222,33 @@ mod tests {
         assert_eq!(fetched.tags, row.tags);
         assert_eq!(fetched.trackers, row.trackers);
         assert!(fetched.is_private);
+    }
+
+    #[test]
+    fn upsert_persists_normalized_labels() {
+        let conn = setup();
+        let row = sample();
+        upsert(&conn, &row).unwrap();
+
+        assert_eq!(
+            list_torrent_tags(&conn, &row.info_hash).unwrap(),
+            vec!["bluray".to_owned(), "hd".to_owned()]
+        );
+        assert_eq!(list_categories(&conn).unwrap(), vec!["movies".to_owned()]);
+    }
+
+    #[test]
+    fn upsert_replaces_normalized_tags() {
+        let conn = setup();
+        let mut row = sample();
+        upsert(&conn, &row).unwrap();
+        row.tags = vec!["archive".into()];
+        upsert(&conn, &row).unwrap();
+
+        assert_eq!(
+            list_torrent_tags(&conn, &row.info_hash).unwrap(),
+            vec!["archive".to_owned()]
+        );
     }
 
     #[test]

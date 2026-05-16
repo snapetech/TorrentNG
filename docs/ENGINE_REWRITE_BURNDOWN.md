@@ -8,7 +8,7 @@ This is the working checklist for finishing the native Rust engine rewrite. It i
 - [x] Expand `rt-db` schema beyond `torrents` and `files`.
 - [x] Persist `torrent_files` metadata with offsets, priorities, and completion state.
 - [x] Persist `torrent_trackers` with tier/order, status, announce timing, and scrape stats.
-- [ ] Persist `torrent_tags` and `torrent_categories` as normalized tables.
+- [x] Persist `torrent_tags` and `torrent_categories` as normalized tables.
 - [x] Persist per-torrent limits and policy flags.
 - [x] Add append-only `session_events`.
 - [x] Add append-only `job_events`.

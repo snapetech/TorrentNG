@@ -24,4 +24,6 @@ pub use storage_row::{
     get_mount, get_storage_root, list_mounts, list_storage_roots, upsert_mount,
     upsert_storage_root, MountRow, StorageRootRow,
 };
-pub use torrent_row::{delete, get, list_all, list_by_state, upsert, TorrentRow};
+pub use torrent_row::{
+    delete, get, list_all, list_by_state, list_categories, list_torrent_tags, upsert, TorrentRow,
+};
