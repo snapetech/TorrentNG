@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::Serialize;
 
 use super::client::{Client, XmlValue};
@@ -52,61 +52,19 @@ impl Client {
                     "t.message=".into(),
                 ],
             )
-            .await
-            .with_context(|| format!("t.multicall {hash}"))?;
+            .await;
 
-        let rows = result.into_array();
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            let f = row.into_array();
-            if f.len() < 18 {
-                continue;
-            }
-            out.push(RawTracker {
-                url: sf(&f, 0),
-                id: nf(&f, 1),
-                group: nf(&f, 2),
-                group_index: nf(&f, 3),
-                is_enabled: bf(&f, 4),
-                is_open: bf(&f, 5),
-                is_extra_tracker: bf(&f, 6),
-                activity_time_last: nf(&f, 7),
-                activity_time_next: nf(&f, 8),
-                min_interval: nf(&f, 9),
-                normal_interval: nf(&f, 10),
-                failed_counter: nf(&f, 11),
-                success_counter: nf(&f, 12),
-                scrape_incomplete: nf(&f, 13),
-                scrape_complete: nf(&f, 14),
-                scrape_downloaded: nf(&f, 15),
-                message: sf(&f, 17),
-            });
-        }
+        let Ok(result) = result else {
+            tracing::warn!(
+                result = ?result,
+                "t.multicall {hash} failed, falling back to session metadata"
+            );
+            return Ok(session_trackers(hash));
+        };
 
+        let mut out = parse_tracker_rows(result.into_array());
         if out.is_empty() {
-            out = session_tracker_urls(hash)
-                .into_iter()
-                .enumerate()
-                .map(|(idx, url)| RawTracker {
-                    url,
-                    id: idx as i64,
-                    group: 0,
-                    group_index: idx as i64,
-                    is_enabled: true,
-                    is_open: false,
-                    is_extra_tracker: false,
-                    activity_time_last: 0,
-                    activity_time_next: 0,
-                    min_interval: 0,
-                    normal_interval: 0,
-                    failed_counter: 0,
-                    success_counter: 0,
-                    scrape_incomplete: 0,
-                    scrape_complete: 0,
-                    scrape_downloaded: 0,
-                    message: String::new(),
-                })
-                .collect();
+            out = session_trackers(hash);
         }
         Ok(out)
     }
@@ -133,6 +91,62 @@ impl Client {
     }
 }
 
+fn parse_tracker_rows(rows: Vec<XmlValue>) -> Vec<RawTracker> {
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let f = row.into_array();
+            if f.len() < 17 {
+                continue;
+            }
+            out.push(RawTracker {
+                url: sf(&f, 0),
+                id: nf(&f, 1),
+                group: nf(&f, 2),
+                group_index: nf(&f, 3),
+                is_enabled: bf(&f, 4),
+                is_open: bf(&f, 5),
+                is_extra_tracker: bf(&f, 6),
+                activity_time_last: nf(&f, 7),
+                activity_time_next: nf(&f, 8),
+                min_interval: nf(&f, 9),
+                normal_interval: nf(&f, 10),
+                failed_counter: nf(&f, 11),
+                success_counter: nf(&f, 12),
+                scrape_incomplete: nf(&f, 13),
+                scrape_complete: nf(&f, 14),
+                scrape_downloaded: nf(&f, 15),
+                message: sf(&f, 16),
+            });
+        }
+        out
+}
+
+fn session_trackers(hash: &str) -> Vec<RawTracker> {
+    session_tracker_urls(hash)
+        .into_iter()
+        .enumerate()
+        .map(|(idx, url)| RawTracker {
+            url,
+            id: idx as i64,
+            group: 0,
+            group_index: idx as i64,
+            is_enabled: true,
+            is_open: false,
+            is_extra_tracker: false,
+            activity_time_last: 0,
+            activity_time_next: 0,
+            min_interval: 0,
+            normal_interval: 0,
+            failed_counter: 0,
+            success_counter: 0,
+            scrape_incomplete: 0,
+            scrape_complete: 0,
+            scrape_downloaded: 0,
+            message: String::new(),
+        })
+        .collect()
+}
+
 fn sf(f: &[XmlValue], i: usize) -> String {
     f.get(i).and_then(|v| v.as_str()).unwrap_or("").to_owned()
 }
@@ -143,4 +157,55 @@ fn nf(f: &[XmlValue], i: usize) -> i64 {
 
 fn bf(f: &[XmlValue], i: usize) -> bool {
     f.get(i).and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_tracker_rows_accepts_requested_field_count() {
+        let rows = vec![XmlValue::Array(vec![
+            "udp://tracker.example/announce".into(),
+            7_i64.into(),
+            1_i64.into(),
+            2_i64.into(),
+            true.into(),
+            false.into(),
+            true.into(),
+            10_i64.into(),
+            20_i64.into(),
+            30_i64.into(),
+            40_i64.into(),
+            3_i64.into(),
+            4_i64.into(),
+            5_i64.into(),
+            6_i64.into(),
+            7_i64.into(),
+            "tracker message".into(),
+        ])];
+
+        let parsed = parse_tracker_rows(rows);
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].url, "udp://tracker.example/announce");
+        assert_eq!(parsed[0].id, 7);
+        assert_eq!(parsed[0].group, 1);
+        assert_eq!(parsed[0].group_index, 2);
+        assert!(parsed[0].is_enabled);
+        assert!(!parsed[0].is_open);
+        assert!(parsed[0].is_extra_tracker);
+        assert_eq!(parsed[0].scrape_complete, 6);
+        assert_eq!(parsed[0].scrape_downloaded, 7);
+        assert_eq!(parsed[0].message, "tracker message");
+    }
+
+    #[test]
+    fn parse_tracker_rows_ignores_short_rows() {
+        let parsed = parse_tracker_rows(vec![XmlValue::Array(vec![
+            "udp://tracker.example/announce".into(),
+        ])]);
+
+        assert!(parsed.is_empty());
+    }
 }

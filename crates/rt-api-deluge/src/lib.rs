@@ -88,9 +88,9 @@ async fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Va
         "web.connect" | "web.disconnect" | "web.start_daemon" | "web.stop_daemon" => {
             Ok(json!(true))
         }
-        "web.get_events" => Ok(json!([])),
-        "web.get_plugins" => Ok(json!([])),
-        "web.get_plugin_info" => Ok(json!({})),
+        "web.get_events" => web_events(state).await,
+        "web.get_plugins" => Ok(json!(deluge_plugins())),
+        "web.get_plugin_info" => Ok(plugin_info(params.first().and_then(Value::as_str))),
         "web.upload_plugin" | "web.update_config" | "web.save_config" => Ok(json!(true)),
         "web.get_torrent_files" => {
             let hash = params
@@ -204,19 +204,19 @@ async fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Va
         "core.get_listen_port" => Ok(json!(0)),
         "core.get_external_ip" => Ok(json!("")),
         "core.get_path_size" => Ok(json!(0)),
-        "core.get_cache_status" => Ok(json!({})),
+        "core.get_cache_status" => cache_status(state).await,
         "core.get_config" => Ok(json!({
             "download_location": "/downloads",
             "move_completed": false,
             "max_download_speed": -1.0,
             "max_upload_speed": -1.0,
         })),
-        "core.get_enabled_plugins" => Ok(json!([])),
+        "core.get_enabled_plugins" => Ok(json!(deluge_plugins())),
         "core.enable_plugin" | "core.disable_plugin" => Ok(json!(true)),
-        "core.get_available_plugins" => Ok(json!([])),
+        "core.get_available_plugins" => Ok(json!(deluge_plugins())),
         "core.get_libtorrent_version" => Ok(json!("native")),
-        "notifications.get_handled_events" => Ok(json!([])),
-        "notifications.get_subscriptions" => Ok(json!({})),
+        "notifications.get_handled_events" => Ok(json!(notification_events())),
+        "notifications.get_subscriptions" => Ok(notification_subscriptions()),
         "notifications.set_config" | "notifications.add_subscription" => Ok(json!(true)),
         _ => Err(format!("unsupported method {method}")),
     }
@@ -324,6 +324,94 @@ async fn session_status(state: &AppState) -> Result<Value, String> {
         "total_payload_upload": total_payload_upload,
         "num_torrents": torrent_count,
     }))
+}
+
+async fn cache_status(state: &AppState) -> Result<Value, String> {
+    let (num_torrents, total_done, total_left) = {
+        let reg = state.registry.read().await;
+        reg.iter()
+            .fold((0_u64, 0_u64, 0_u64), |(count, done, left), entry| {
+                (
+                    count + 1,
+                    done.saturating_add(entry.total_length.saturating_sub(entry.amount_left)),
+                    left.saturating_add(entry.amount_left),
+                )
+            })
+    };
+    let jobs_active = if let Some(engine) = &state.engine {
+        engine
+            .stats()
+            .await
+            .map(|stats| stats.jobs_active)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    Ok(json!({
+        "blocks_read": 0,
+        "blocks_written": 0,
+        "cache_size": total_done.saturating_add(total_left),
+        "read_cache_hits": 0,
+        "read_cache_size": total_done,
+        "total_used_buffers": num_torrents,
+        "write_cache_size": total_left,
+        "queued_jobs": jobs_active,
+    }))
+}
+
+async fn web_events(state: &AppState) -> Result<Value, String> {
+    let reg = state.registry.read().await;
+    Ok(json!(reg
+        .iter()
+        .map(|entry| {
+            json!({
+                "event": "TorrentStateChangedEvent",
+                "value": [entry.info_hash, deluge_state(entry.state.as_str())],
+            })
+        })
+        .collect::<Vec<_>>()))
+}
+
+fn deluge_plugins() -> Vec<&'static str> {
+    vec!["Label", "Notifications"]
+}
+
+fn plugin_info(name: Option<&str>) -> Value {
+    let name = name.unwrap_or_default();
+    match name {
+        "Label" | "label" => json!({
+            "name": "Label",
+            "version": "rtorrentNG",
+            "author": "rtorrentNG",
+            "description": "Category and label compatibility backed by native torrent labels.",
+            "enabled": true,
+        }),
+        "Notifications" | "notifications" => json!({
+            "name": "Notifications",
+            "version": "rtorrentNG",
+            "author": "rtorrentNG",
+            "description": "Native session event notification compatibility.",
+            "enabled": true,
+        }),
+        _ => json!({}),
+    }
+}
+
+fn notification_events() -> Vec<&'static str> {
+    vec![
+        "TorrentAddedEvent",
+        "TorrentRemovedEvent",
+        "TorrentStateChangedEvent",
+        "TorrentFinishedEvent",
+    ]
+}
+
+fn notification_subscriptions() -> Value {
+    notification_events()
+        .into_iter()
+        .map(|event| (event.to_owned(), json!([])))
+        .collect::<serde_json::Map<_, _>>()
+        .into()
 }
 
 async fn filter_tree(state: &AppState) -> Result<Value, String> {
@@ -721,6 +809,48 @@ mod tests {
                 "{method} returned {:?}",
                 body["error"]
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn deluge_plugin_cache_and_notification_shapes_are_structured() {
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        {
+            let mut reg = registry.write().await;
+            let mut entry = TorrentEntry::new("c".repeat(40), "cache".into(), "/data".into());
+            entry.total_length = 100;
+            entry.amount_left = 40;
+            reg.add(entry).unwrap();
+        }
+        let app = build_deluge_router(AppState::new(registry));
+        for (method, assertion_key) in [
+            ("core.get_cache_status", "cache_size"),
+            ("web.get_plugin_info", "name"),
+            ("notifications.get_subscriptions", "TorrentAddedEvent"),
+        ] {
+            let params = if method == "web.get_plugin_info" {
+                r#"["Label"]"#
+            } else {
+                "[]"
+            };
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/json")
+                        .header("content-type", "application/json")
+                        .body(Body::from(format!(
+                            r#"{{"id":1,"method":"{method}","params":{params}}}"#
+                        )))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert!(body["error"].is_null());
+            assert!(!body["result"][assertion_key].is_null(), "{method}");
         }
     }
 
