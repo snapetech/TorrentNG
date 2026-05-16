@@ -345,17 +345,33 @@ async fn filter_tree(state: &AppState) -> Result<Value, String> {
 }
 
 async fn update_ui(state: &AppState) -> Result<Value, String> {
-    let reg = state.registry.read().await;
-    let torrents = reg
+    let entries = {
+        let reg = state.registry.read().await;
+        reg.iter().cloned().collect::<Vec<_>>()
+    };
+    let mut metadata = std::collections::HashMap::new();
+    if let Some(engine) = &state.engine {
+        for entry in &entries {
+            if let Ok(meta) = engine.torrent_metadata(entry.info_hash.clone()).await {
+                metadata.insert(entry.info_hash.clone(), meta);
+            }
+        }
+    }
+    let torrents = entries
         .iter()
-        .map(|entry| (entry.info_hash.clone(), deluge_torrent(entry, None)))
+        .map(|entry| {
+            (
+                entry.info_hash.clone(),
+                deluge_torrent(entry, metadata.get(&entry.info_hash)),
+            )
+        })
         .collect::<serde_json::Map<_, _>>();
     Ok(json!({
         "connected": true,
         "torrents": torrents,
         "filters": {
-            "state": [["All", reg.iter().count()]],
-            "label": labels_from_registry(&reg),
+            "state": [["All", entries.len()]],
+            "label": labels_from_entries(&entries),
         },
         "stats": {
             "download_rate": 0.0,
@@ -534,9 +550,11 @@ fn tracker_host(announce: &str) -> String {
         .to_owned()
 }
 
-fn labels_from_registry(reg: &SessionRegistry) -> Vec<Value> {
+fn labels_from_entries<'a>(
+    entries: impl IntoIterator<Item = &'a rt_session::TorrentEntry>,
+) -> Vec<Value> {
     let mut labels = std::collections::BTreeMap::<String, usize>::new();
-    for entry in reg.iter() {
+    for entry in entries {
         if let Some(label) = &entry.category {
             *labels.entry(label.clone()).or_default() += 1;
         }

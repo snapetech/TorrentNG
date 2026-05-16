@@ -393,8 +393,8 @@ async fn torrent_get(state: &AppState, args: &Value) -> Value {
                     "peersSendingToUs" | "peers-sending-to-us" => json!(0),
                     "trackers" => json!(transmission_trackers(meta)),
                     "trackerStats" | "tracker-stats" => json!(transmission_tracker_stats(meta)),
-                    "files" => json!(transmission_files(meta)),
-                    "fileStats" | "file-stats" => json!(transmission_file_stats(meta)),
+                    "files" => json!(transmission_files(entry, meta)),
+                    "fileStats" | "file-stats" => json!(transmission_file_stats(entry, meta)),
                     "priorities" => json!(transmission_file_priorities(meta)),
                     "wanted" => json!(transmission_file_wanted(meta)),
                     "comment" => json!(""),
@@ -436,15 +436,20 @@ async fn torrent_get(state: &AppState, args: &Value) -> Value {
     json!({ "torrents": torrents })
 }
 
-fn transmission_files(meta: Option<&EngineTorrentMetadata>) -> Vec<Value> {
+fn transmission_files(
+    entry: &rt_session::TorrentEntry,
+    meta: Option<&EngineTorrentMetadata>,
+) -> Vec<Value> {
     meta.map(|meta| {
+        let completed = file_completed_bytes(entry, meta);
         meta.files
             .iter()
-            .map(|file| {
+            .enumerate()
+            .map(|(idx, file)| {
                 json!({
                     "name": file.path,
                     "length": file.length,
-                    "bytesCompleted": 0,
+                    "bytesCompleted": completed[idx],
                 })
             })
             .collect()
@@ -452,13 +457,18 @@ fn transmission_files(meta: Option<&EngineTorrentMetadata>) -> Vec<Value> {
     .unwrap_or_default()
 }
 
-fn transmission_file_stats(meta: Option<&EngineTorrentMetadata>) -> Vec<Value> {
+fn transmission_file_stats(
+    entry: &rt_session::TorrentEntry,
+    meta: Option<&EngineTorrentMetadata>,
+) -> Vec<Value> {
     meta.map(|meta| {
+        let completed = file_completed_bytes(entry, meta);
         meta.files
             .iter()
-            .map(|_| {
+            .enumerate()
+            .map(|(idx, _)| {
                 json!({
-                    "bytesCompleted": 0,
+                    "bytesCompleted": completed[idx],
                     "wanted": true,
                     "priority": 0,
                 })
@@ -466,6 +476,22 @@ fn transmission_file_stats(meta: Option<&EngineTorrentMetadata>) -> Vec<Value> {
             .collect()
     })
     .unwrap_or_default()
+}
+
+fn file_completed_bytes(
+    entry: &rt_session::TorrentEntry,
+    meta: &EngineTorrentMetadata,
+) -> Vec<u64> {
+    let done = entry.total_length.saturating_sub(entry.amount_left);
+    let mut offset = 0u64;
+    meta.files
+        .iter()
+        .map(|file| {
+            let file_start = offset;
+            offset = offset.saturating_add(file.length);
+            done.saturating_sub(file_start).min(file.length)
+        })
+        .collect()
 }
 
 fn transmission_file_priorities(meta: Option<&EngineTorrentMetadata>) -> Vec<i64> {
@@ -630,6 +656,7 @@ fn transmission_status(state: &str) -> i64 {
 mod tests {
     use super::*;
     use axum::{body::Body, http::Request};
+    use rt_engine::{EnginePieceState, EngineTorrentFile};
     use rt_session::TorrentEntry;
     use tower::ServiceExt;
 
@@ -692,6 +719,43 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("magnet:?xt=urn:btih:"));
+    }
+
+    #[test]
+    fn transmission_file_completion_is_projected_per_file() {
+        let mut entry = TorrentEntry::new("a".repeat(40), "alpha".into(), "/data".into());
+        entry.total_length = 300;
+        entry.amount_left = 125;
+        let meta = EngineTorrentMetadata {
+            piece_length: 100,
+            piece_count: 3,
+            piece_hashes: Vec::new(),
+            piece_states: vec![
+                EnginePieceState::Complete,
+                EnginePieceState::Partial,
+                EnginePieceState::Missing,
+            ],
+            is_private: false,
+            trackers: Vec::new(),
+            files: vec![
+                EngineTorrentFile {
+                    index: 0,
+                    path: "one.bin".into(),
+                    length: 100,
+                },
+                EngineTorrentFile {
+                    index: 1,
+                    path: "two.bin".into(),
+                    length: 200,
+                },
+            ],
+        };
+
+        let files = transmission_files(&entry, Some(&meta));
+        assert_eq!(files[0]["bytesCompleted"], 100);
+        assert_eq!(files[1]["bytesCompleted"], 75);
+        let stats = transmission_file_stats(&entry, Some(&meta));
+        assert_eq!(stats[1]["bytesCompleted"], 75);
     }
 
     #[tokio::test]

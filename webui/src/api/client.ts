@@ -181,6 +181,7 @@ async function qbPost(path: string, fields: Record<string, string | number | boo
 export interface Category {
   name: string
   save_path: string
+  torrent_count?: number
 }
 
 export interface BulkResult {

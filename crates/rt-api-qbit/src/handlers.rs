@@ -14,6 +14,8 @@ use std::{
 };
 use url::Url;
 
+use rt_engine::EnginePieceState;
+
 use crate::{
     model::{
         to_qbit_state, QbCategoryInfo, QbFileInfo, QbServerState, QbTorrentInfo,
@@ -206,24 +208,24 @@ pub async fn torrents_info(
             .cloned()
             .collect::<Vec<_>>()
     };
+    let mut entries = entries;
+    sort_torrent_entries(&mut entries, q.sort.as_deref(), q.reverse.unwrap_or(false));
+
+    let offset = q.offset.unwrap_or(0);
+    let entries = if offset < entries.len() {
+        &entries[offset..]
+    } else {
+        &[]
+    };
+    let entries: Vec<_> = if let Some(limit) = q.limit {
+        entries.iter().take(limit).cloned().collect()
+    } else {
+        entries.to_vec()
+    };
     let mut infos = Vec::with_capacity(entries.len());
     for entry in &entries {
         infos.push(qbit_torrent_info(&state, entry).await);
     }
-
-    sort_torrent_infos(&mut infos, q.sort.as_deref(), q.reverse.unwrap_or(false));
-
-    let offset = q.offset.unwrap_or(0);
-    let infos = if offset < infos.len() {
-        &infos[offset..]
-    } else {
-        &[]
-    };
-    let infos: Vec<_> = if let Some(limit) = q.limit {
-        infos.iter().take(limit).cloned().collect()
-    } else {
-        infos.to_vec()
-    };
 
     (StatusCode::OK, Json(infos))
 }
@@ -595,7 +597,7 @@ pub async fn torrents_piece_states(
         let reg = state.registry.read().await;
         reg.get(&hash).cloned()
     };
-    let Some(entry) = entry else {
+    let Some(_) = entry else {
         return (StatusCode::NOT_FOUND, Json(Vec::<i32>::new()));
     };
     let Some(engine) = &state.engine else {
@@ -603,15 +605,14 @@ pub async fn torrents_piece_states(
     };
     match engine.torrent_metadata(hash).await {
         Ok(meta) => {
-            let have = pieces_have(
-                entry.total_length,
-                entry.amount_left,
-                entry.completed_at.is_some(),
-                meta.piece_length as i64,
-                meta.piece_count as i64,
-            ) as usize;
-            let states = (0..meta.piece_count)
-                .map(|index| if index < have { 2 } else { 0 })
+            let states = meta
+                .piece_states
+                .into_iter()
+                .map(|state| match state {
+                    EnginePieceState::Missing => 0,
+                    EnginePieceState::Partial => 1,
+                    EnginePieceState::Complete => 2,
+                })
                 .collect();
             (StatusCode::OK, Json(states))
         }
@@ -1199,15 +1200,16 @@ pub async fn sync_maindata(
         let reg = state.registry.read().await;
         reg.iter().cloned().collect::<Vec<_>>()
     };
-    let rid = sync_rid_for_entries(&entries);
+    let mut infos = Vec::with_capacity(entries.len());
+    for entry in &entries {
+        infos.push(qbit_torrent_info(&state, entry).await);
+    }
+    let rid = sync_rid_for_infos(&infos);
     let full_update = q.rid.unwrap_or(0) != rid;
     let mut torrents = serde_json::Map::new();
     if full_update {
-        for entry in &entries {
-            torrents.insert(
-                entry.info_hash.clone(),
-                serde_json::to_value(qbit_torrent_info(&state, entry).await).unwrap(),
-            );
+        for info in infos {
+            torrents.insert(info.hash.clone(), serde_json::to_value(info).unwrap());
         }
     }
     let resp = serde_json::json!({
@@ -1350,22 +1352,30 @@ fn torrent_progress(total_length: u64, amount_left: u64, complete: bool) -> f64 
     (done as f64 / total_length as f64).clamp(0.0, 1.0)
 }
 
-fn sort_torrent_infos(infos: &mut [QbTorrentInfo], sort: Option<&str>, reverse: bool) {
+fn sort_torrent_entries(
+    entries: &mut [rt_session::TorrentEntry],
+    sort: Option<&str>,
+    reverse: bool,
+) {
     match sort.unwrap_or_default() {
-        "name" => infos.sort_by(|a, b| a.name.cmp(&b.name)),
-        "size" => infos.sort_by_key(|info| info.size),
-        "progress" => infos.sort_by(|a, b| a.progress.total_cmp(&b.progress)),
-        "dlspeed" => infos.sort_by_key(|info| info.dlspeed),
-        "upspeed" => infos.sort_by_key(|info| info.upspeed),
-        "ratio" => infos.sort_by(|a, b| a.ratio.total_cmp(&b.ratio)),
-        "added_on" => infos.sort_by_key(|info| info.added_on),
-        "completion_on" => infos.sort_by_key(|info| info.completion_on),
-        "category" => infos.sort_by(|a, b| a.category.cmp(&b.category)),
-        "state" => infos.sort_by(|a, b| a.state.cmp(&b.state)),
-        _ => infos.sort_by(|a, b| a.name.cmp(&b.name)),
+        "name" => entries.sort_by(|a, b| a.name.cmp(&b.name)),
+        "size" => entries.sort_by_key(|entry| entry.total_length),
+        "progress" => entries.sort_by(|a, b| {
+            torrent_progress(a.total_length, a.amount_left, a.completed_at.is_some()).total_cmp(
+                &torrent_progress(b.total_length, b.amount_left, b.completed_at.is_some()),
+            )
+        }),
+        "ratio" => entries.sort_by(|a, b| a.stats.ratio().total_cmp(&b.stats.ratio())),
+        "added_on" => entries.sort_by_key(|entry| entry.added_at),
+        "completion_on" => entries.sort_by_key(|entry| entry.completed_at.unwrap_or(0)),
+        "category" => entries.sort_by(|a, b| a.category.cmp(&b.category)),
+        "state" => entries
+            .sort_by(|a, b| to_qbit_state(a.state.as_str()).cmp(to_qbit_state(b.state.as_str()))),
+        "dlspeed" | "upspeed" => entries.sort_by(|a, b| a.info_hash.cmp(&b.info_hash)),
+        _ => entries.sort_by(|a, b| a.name.cmp(&b.name)),
     }
     if reverse {
-        infos.reverse();
+        entries.reverse();
     }
 }
 
@@ -1483,21 +1493,27 @@ async fn qbit_torrent_info(state: &AppState, e: &rt_session::TorrentEntry) -> Qb
     }
 }
 
-fn sync_rid_for_entries(entries: &[rt_session::TorrentEntry]) -> i64 {
+fn sync_rid_for_infos(infos: &[QbTorrentInfo]) -> i64 {
     let mut hasher = DefaultHasher::new();
-    for entry in entries {
-        entry.info_hash.hash(&mut hasher);
-        entry.name.hash(&mut hasher);
-        entry.state.hash(&mut hasher);
-        entry.total_length.hash(&mut hasher);
-        entry.amount_left.hash(&mut hasher);
-        entry.save_path.hash(&mut hasher);
-        entry.category.hash(&mut hasher);
-        entry.tags.hash(&mut hasher);
-        entry.stats.downloaded.hash(&mut hasher);
-        entry.stats.uploaded.hash(&mut hasher);
-        entry.added_at.hash(&mut hasher);
-        entry.completed_at.hash(&mut hasher);
+    let mut infos = infos.iter().collect::<Vec<_>>();
+    infos.sort_by(|a, b| a.hash.cmp(&b.hash));
+    for info in infos {
+        info.hash.hash(&mut hasher);
+        info.name.hash(&mut hasher);
+        info.state.hash(&mut hasher);
+        info.size.hash(&mut hasher);
+        info.downloaded.hash(&mut hasher);
+        info.uploaded.hash(&mut hasher);
+        info.amount_left.hash(&mut hasher);
+        info.save_path.hash(&mut hasher);
+        info.category.hash(&mut hasher);
+        info.tags.hash(&mut hasher);
+        info.added_on.hash(&mut hasher);
+        info.completion_on.hash(&mut hasher);
+        info.tracker.hash(&mut hasher);
+        info.trackers_count.hash(&mut hasher);
+        info.progress.to_bits().hash(&mut hasher);
+        info.ratio.to_bits().hash(&mut hasher);
     }
     let rid = (hasher.finish() & 0x7fff_ffff_ffff_ffff) as i64;
     rid.max(1)
@@ -1737,6 +1753,34 @@ mod tests {
             .unwrap();
         }
         state
+    }
+
+    fn qbit_info(hash: &str, tracker: &str, trackers_count: u32) -> QbTorrentInfo {
+        QbTorrentInfo {
+            hash: hash.to_owned(),
+            name: hash.to_owned(),
+            state: "downloading".into(),
+            size: 100,
+            downloaded: 25,
+            uploaded: 5,
+            ratio: 0.2,
+            save_path: "/data/".into(),
+            category: String::new(),
+            tags: String::new(),
+            added_on: 1,
+            completion_on: -1,
+            num_leechs: 0,
+            num_seeds: 0,
+            dlspeed: 0,
+            upspeed: 0,
+            eta: -1,
+            progress: 0.25,
+            priority: 0,
+            amount_left: 75,
+            auto_tmm: false,
+            tracker: tracker.to_owned(),
+            trackers_count,
+        }
     }
 
     #[tokio::test]
@@ -2043,6 +2087,19 @@ mod tests {
         assert_eq!(second["rid"].as_i64().unwrap(), rid);
         assert_eq!(second["full_update"], false);
         assert!(second["torrents"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn sync_rid_is_order_independent_and_covers_metadata_projection() {
+        let first = qbit_info("a", "udp://tracker-a", 1);
+        let second = qbit_info("b", "udp://tracker-b", 1);
+        assert_eq!(
+            sync_rid_for_infos(&[first.clone(), second.clone()]),
+            sync_rid_for_infos(&[second, first.clone()])
+        );
+
+        let changed = qbit_info("a", "udp://tracker-c", 2);
+        assert_ne!(sync_rid_for_infos(&[first]), sync_rid_for_infos(&[changed]));
     }
 
     #[tokio::test]

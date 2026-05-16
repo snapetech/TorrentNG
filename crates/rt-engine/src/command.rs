@@ -14,11 +14,19 @@ pub struct EngineTorrentFile {
     pub length: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnginePieceState {
+    Missing,
+    Partial,
+    Complete,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineTorrentMetadata {
     pub piece_length: u64,
     pub piece_count: usize,
     pub piece_hashes: Vec<String>,
+    pub piece_states: Vec<EnginePieceState>,
     pub is_private: bool,
     pub trackers: Vec<String>,
     pub files: Vec<EngineTorrentFile>,

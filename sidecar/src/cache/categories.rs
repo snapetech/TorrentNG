@@ -7,6 +7,7 @@ use super::db::Db;
 pub struct Category {
     pub name: String,
     pub save_path: String,
+    pub torrent_count: i64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -19,12 +20,32 @@ impl Db {
 
     pub fn list_categories(&self) -> Result<Vec<Category>> {
         let conn = self.0.lock().expect("db");
-        let mut stmt = conn.prepare("SELECT name, save_path FROM categories ORDER BY name")?;
+        let mut stmt = conn.prepare(
+            "WITH names AS (
+                SELECT name FROM categories WHERE name != ''
+                UNION
+                SELECT DISTINCT category AS name FROM torrents WHERE category != ''
+             ),
+             counts AS (
+                SELECT category AS name, COUNT(*) AS torrent_count
+                FROM torrents
+                WHERE category != ''
+                GROUP BY category
+             )
+             SELECT names.name,
+                    COALESCE(categories.save_path, '') AS save_path,
+                    COALESCE(counts.torrent_count, 0) AS torrent_count
+             FROM names
+             LEFT JOIN categories ON categories.name = names.name
+             LEFT JOIN counts ON counts.name = names.name
+             ORDER BY names.name COLLATE NOCASE",
+        )?;
         let rows = stmt
             .query_map([], |r| {
                 Ok(Category {
                     name: r.get(0)?,
                     save_path: r.get(1)?,
+                    torrent_count: r.get(2)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

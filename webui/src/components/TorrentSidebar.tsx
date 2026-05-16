@@ -171,7 +171,7 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
           icon="⌁"
           label="All categories"
           active={!params.category}
-          count={total}
+          count={categories.length}
           onClick={() => onChange({ category: undefined, offset: 0 })}
         />
         {categories.slice(0, MAX_SECTION_ROWS).map(category => (
@@ -180,6 +180,7 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
             icon="⌁"
             label={category.name}
             active={(params.category ?? '') === category.name}
+            count={category.torrent_count}
             onClick={() => onChange({ category: category.name, offset: 0 })}
           />
         ))}
@@ -194,7 +195,7 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
             icon="#"
             label="All tags"
             active={!params.tag}
-            count={total}
+            count={tags.length}
             onClick={() => onChange({ tag: undefined, offset: 0 })}
           />
           {tags.slice(0, MAX_SECTION_ROWS).map(tag => (
@@ -217,7 +218,7 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
           icon="☊"
           label="All trackers"
           active={!params.tracker}
-          count={total}
+          count={trackerHealth?.trackers.length ?? 0}
           onClick={() => onChange({ tracker: undefined, offset: 0 })}
         />
         <form

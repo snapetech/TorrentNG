@@ -109,3 +109,14 @@ This is the working checklist for finishing the native Rust engine rewrite. It i
 - [x] Add backup/restore docs.
 - [x] Add production deployment docs for native engine mode.
 - [x] Remove or archive Track 1-only compatibility code when native engine supersedes it.
+
+## 11. Red-Team Rectifications
+
+- [x] Make migration DB import atomic across torrent row, files, trackers, tags, and category tables.
+- [x] Apply qBit `/torrents/info` offset/limit before engine metadata projection.
+- [x] Base qBit `rid` on stable, order-independent projected torrent data including metadata-backed tracker fields.
+- [x] Return qBit piece states from fastresume piece state instead of aggregate progress guesses.
+- [x] Back Deluge `web.update_ui` with engine metadata.
+- [x] Project Transmission per-file completion from torrent bytes done.
+- [x] Make public Linux ISO certification fail when `PUBLIC_TRANSFER=1` does not complete in the configured timeout.
+- [x] Add focused regression tests for qBit `rid` and Transmission file completion.

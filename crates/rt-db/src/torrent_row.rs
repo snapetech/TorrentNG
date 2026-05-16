@@ -92,6 +92,44 @@ pub fn upsert(conn: &Connection, row: &TorrentRow) -> Result<(), DbError> {
     Ok(())
 }
 
+pub fn upsert_in_tx(tx: &rusqlite::Transaction<'_>, row: &TorrentRow) -> Result<(), DbError> {
+    let tags_json = serde_json::to_string(&row.tags)?;
+    let trackers_json = serde_json::to_string(&row.trackers)?;
+    tx.execute(
+        "INSERT INTO torrents
+            (info_hash, name, total_length, piece_length, piece_count, is_private,
+             save_path, category, tags, state, added_at, completed_at,
+             uploaded, downloaded, ratio, trackers)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+         ON CONFLICT(info_hash) DO UPDATE SET
+             name=excluded.name, state=excluded.state,
+             uploaded=excluded.uploaded, downloaded=excluded.downloaded,
+             ratio=excluded.ratio, completed_at=excluded.completed_at,
+             category=excluded.category, tags=excluded.tags,
+             trackers=excluded.trackers",
+        params![
+            row.info_hash,
+            row.name,
+            row.total_length,
+            row.piece_length,
+            row.piece_count,
+            row.is_private as i64,
+            row.save_path,
+            row.category,
+            tags_json,
+            row.state,
+            row.added_at,
+            row.completed_at,
+            row.uploaded,
+            row.downloaded,
+            row.ratio,
+            trackers_json,
+        ],
+    )?;
+    persist_normalized_labels_in_tx(tx, row)?;
+    Ok(())
+}
+
 fn persist_normalized_labels(conn: &Connection, row: &TorrentRow) -> Result<(), DbError> {
     conn.execute(
         "DELETE FROM torrent_tags WHERE info_hash = ?1",
@@ -105,6 +143,30 @@ fn persist_normalized_labels(conn: &Connection, row: &TorrentRow) -> Result<(), 
     }
     if let Some(category) = &row.category {
         conn.execute(
+            "INSERT OR IGNORE INTO torrent_categories (name, save_path, created_at)
+             VALUES (?1, NULL, ?2)",
+            params![category, row.added_at],
+        )?;
+    }
+    Ok(())
+}
+
+fn persist_normalized_labels_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    row: &TorrentRow,
+) -> Result<(), DbError> {
+    tx.execute(
+        "DELETE FROM torrent_tags WHERE info_hash = ?1",
+        params![row.info_hash],
+    )?;
+    for tag in &row.tags {
+        tx.execute(
+            "INSERT OR IGNORE INTO torrent_tags (info_hash, tag) VALUES (?1, ?2)",
+            params![row.info_hash, tag],
+        )?;
+    }
+    if let Some(category) = &row.category {
+        tx.execute(
             "INSERT OR IGNORE INTO torrent_categories (name, save_path, created_at)
              VALUES (?1, NULL, ?2)",
             params![category, row.added_at],

@@ -57,7 +57,8 @@ http_code() {
 wait_for_torrent() {
   local name="$1"
   local want_complete="$2"
-  local deadline=$((SECONDS + ${CERT_TRANSFER_TIMEOUT_SECS:-120}))
+  local timeout="${3:-${CERT_TRANSFER_TIMEOUT_SECS:-120}}"
+  local deadline=$((SECONDS + timeout))
   while (( SECONDS < deadline )); do
     local row
     row="$(curl -ksS -b "$COOKIE_JAR" "$RTNG_HOST_URL/api/qb/v2/torrents/info" \
@@ -69,6 +70,26 @@ wait_for_torrent() {
       fi
     fi
     sleep 2
+  done
+  return 1
+}
+
+wait_for_category_torrent() {
+  local category="$1"
+  local want_complete="$2"
+  local timeout="${3:-${CERT_TRANSFER_TIMEOUT_SECS:-120}}"
+  local deadline=$((SECONDS + timeout))
+  while (( SECONDS < deadline )); do
+    local row
+    row="$(curl -ksS -b "$COOKIE_JAR" "$RTNG_HOST_URL/api/qb/v2/torrents/info?category=$category" \
+      | jq -c 'sort_by(.progress) | reverse | .[0] // empty' || true)"
+    if [[ -n "$row" ]]; then
+      if [[ "$want_complete" != "1" || "$(jq -r '.progress >= 1' <<<"$row")" == "true" ]]; then
+        printf '%s' "$row"
+        return 0
+      fi
+    fi
+    sleep 5
   done
   return 1
 }
@@ -181,7 +202,13 @@ else
 fi
 
 if [[ "$PUBLIC_TRANSFER" == "1" ]]; then
-  mark "public Linux transfer" "INFO" "enabled; inspect torrent progress in WebUI"
+  if row="$(wait_for_category_torrent "cert-public" 1 "${CERT_PUBLIC_TRANSFER_TIMEOUT_SECS:-1800}")"; then
+    mark "public Linux transfer" "PASS" "$(jq -r '"progress=\(.progress) size=\(.size) downloaded=\(.downloaded)"' <<<"$row")"
+  else
+    row="$(curl -ksS -b "$COOKIE_JAR" "$RTNG_HOST_URL/api/qb/v2/torrents/info?category=cert-public" \
+      | jq -c 'sort_by(.progress) | reverse | .[0] // empty' || true)"
+    mark "public Linux transfer" "FAIL" "did not complete within ${CERT_PUBLIC_TRANSFER_TIMEOUT_SECS:-1800}s latest=${row:-none}"
+  fi
 else
   mark "public Linux transfer" "INFO" "skipped by default; set PUBLIC_TRANSFER=1 to download"
 fi

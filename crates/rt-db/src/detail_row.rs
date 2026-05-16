@@ -135,6 +135,35 @@ pub fn replace_torrent_files(
     Ok(())
 }
 
+pub fn replace_torrent_files_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    info_hash: &str,
+    files: &[TorrentFileRow],
+) -> Result<(), DbError> {
+    tx.execute(
+        "DELETE FROM torrent_files WHERE info_hash = ?1",
+        params![info_hash],
+    )?;
+    for file in files {
+        tx.execute(
+            "INSERT INTO torrent_files
+                (info_hash, file_index, path, length, offset, priority, wanted, completed_bytes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                info_hash,
+                file.file_index,
+                file.path,
+                file.length,
+                file.offset,
+                file.priority,
+                file.wanted as i64,
+                file.completed_bytes,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 pub fn list_torrent_files(
     conn: &Connection,
     info_hash: &str,
@@ -189,6 +218,45 @@ pub fn replace_torrent_trackers(
         )?;
     }
     tx.commit()?;
+    Ok(())
+}
+
+pub fn replace_torrent_trackers_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    info_hash: &str,
+    trackers: &[TorrentTrackerRow],
+) -> Result<(), DbError> {
+    tx.execute(
+        "DELETE FROM torrent_trackers WHERE info_hash = ?1",
+        params![info_hash],
+    )?;
+    for tracker in trackers {
+        tx.execute(
+            "INSERT INTO torrent_trackers
+                (info_hash, tracker_index, tier, url, status, last_announce_at,
+                 next_announce_at, last_success_at, failure_reason, warning_message,
+                 seeders, leechers, completed, uploaded, downloaded, left_bytes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            params![
+                info_hash,
+                tracker.tracker_index,
+                tracker.tier,
+                tracker.url,
+                tracker.status,
+                tracker.last_announce_at,
+                tracker.next_announce_at,
+                tracker.last_success_at,
+                tracker.failure_reason,
+                tracker.warning_message,
+                tracker.seeders,
+                tracker.leechers,
+                tracker.completed,
+                tracker.uploaded,
+                tracker.downloaded,
+                tracker.left_bytes,
+            ],
+        )?;
+    }
     Ok(())
 }
 

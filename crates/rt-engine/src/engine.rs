@@ -16,13 +16,14 @@ use tracing::{info, warn};
 
 use rt_config::Config;
 use rt_db::TorrentRow;
-use rt_fastresume::FastresumeStore;
+use rt_fastresume::{FastresumeStore, PieceState};
 use rt_metainfo::{parse_torrent, MagnetLink, TorrentMeta, TorrentMetaV1};
 use rt_peer_wire::handshake::{Handshake, HANDSHAKE_LEN};
 use rt_session::{SessionRegistry, TorrentEntry, TorrentState, TransferStats};
 
 use crate::command::{
-    CmdResult, EngineCmd, EngineStats, EngineTorrentFile, EngineTorrentMetadata, TorrentDiagnostic,
+    CmdResult, EngineCmd, EnginePieceState, EngineStats, EngineTorrentFile, EngineTorrentMetadata,
+    TorrentDiagnostic,
 };
 use crate::dht_task::{run_dht, DhtCommand, DhtTorrent};
 use crate::metadata_task::run_metadata_task;
@@ -1174,7 +1175,32 @@ impl Engine {
             TorrentMeta::V1(m) | TorrentMeta::Hybrid(m, _) => m,
             TorrentMeta::V2(_) => anyhow::bail!("pure v2 torrents are not supported"),
         };
-        Ok(metadata_from_v1(&meta))
+        let mut metadata = metadata_from_v1(&meta);
+        if let Ok(hash) = decode_info_hash(info_hash) {
+            if let Ok(state) = FastresumeStore::new(fastresume_dir(&self.config)).load(info_hash) {
+                if state.validate(&hash, metadata.piece_count as u32).is_ok() {
+                    let mut pieces = state
+                        .pieces
+                        .iter()
+                        .map(|piece| match piece {
+                            PieceState::Valid => EnginePieceState::Complete,
+                            PieceState::Invalid | PieceState::Unknown | PieceState::Missing => {
+                                EnginePieceState::Missing
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    for partial in state.partial_pieces {
+                        if let Some(piece) = pieces.get_mut(partial.piece as usize) {
+                            if !partial.received_blocks.is_empty() {
+                                *piece = EnginePieceState::Partial;
+                            }
+                        }
+                    }
+                    metadata.piece_states = pieces;
+                }
+            }
+        }
+        Ok(metadata)
     }
 
     async fn update_torrent_labels_inner(
@@ -1922,6 +1948,7 @@ fn metadata_from_v1(meta: &TorrentMetaV1) -> EngineTorrentMetadata {
         piece_length: meta.piece_length,
         piece_count: meta.pieces.len(),
         piece_hashes: meta.pieces.iter().map(hex::encode).collect(),
+        piece_states: vec![EnginePieceState::Missing; meta.pieces.len()],
         is_private: meta.private,
         trackers: meta.all_trackers(),
         files: meta
@@ -1941,10 +1968,18 @@ fn metadata_from_placeholder_row(row: &TorrentRow) -> EngineTorrentMetadata {
         piece_length: 0,
         piece_count: 0,
         piece_hashes: Vec::new(),
+        piece_states: Vec::new(),
         is_private: row.is_private,
         trackers: row.trackers.clone(),
         files: Vec::new(),
     }
+}
+
+fn decode_info_hash(info_hash: &str) -> anyhow::Result<[u8; 20]> {
+    let bytes = hex::decode(info_hash)?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("expected 20-byte info hash"))
 }
 
 fn prune_empty_dirs(

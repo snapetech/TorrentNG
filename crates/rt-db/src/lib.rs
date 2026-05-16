@@ -9,8 +9,9 @@ pub mod torrent_row;
 
 pub use detail_row::{
     get_torrent_limits, list_all_torrent_trackers, list_torrent_files, list_torrent_trackers,
-    replace_torrent_files, replace_torrent_trackers, upsert_torrent_limits, TorrentFileRow,
-    TorrentLimitRow, TorrentTrackerRow,
+    replace_torrent_files, replace_torrent_files_in_tx, replace_torrent_trackers,
+    replace_torrent_trackers_in_tx, upsert_torrent_limits, TorrentFileRow, TorrentLimitRow,
+    TorrentTrackerRow,
 };
 pub use error::DbError;
 pub use event_row::{
@@ -25,5 +26,6 @@ pub use storage_row::{
     upsert_storage_root, MountRow, StorageRootRow,
 };
 pub use torrent_row::{
-    delete, get, list_all, list_by_state, list_categories, list_torrent_tags, upsert, TorrentRow,
+    delete, get, list_all, list_by_state, list_categories, list_torrent_tags, upsert, upsert_in_tx,
+    TorrentRow,
 };

@@ -13,6 +13,8 @@ pub enum MigrationError {
     Io(#[from] std::io::Error),
     #[error("database error: {0}")]
     Db(#[from] rt_db::DbError),
+    #[error("sqlite error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -252,11 +254,17 @@ impl DbImportPlan {
         &self,
         conn: &mut rusqlite::Connection,
     ) -> Result<DbImportSummary, MigrationError> {
+        let tx = conn.transaction()?;
         for import in &self.torrents {
-            rt_db::upsert(conn, &import.torrent)?;
-            rt_db::replace_torrent_files(conn, &import.torrent.info_hash, &import.files)?;
-            rt_db::replace_torrent_trackers(conn, &import.torrent.info_hash, &import.trackers)?;
+            rt_db::upsert_in_tx(&tx, &import.torrent)?;
+            rt_db::replace_torrent_files_in_tx(&tx, &import.torrent.info_hash, &import.files)?;
+            rt_db::replace_torrent_trackers_in_tx(
+                &tx,
+                &import.torrent.info_hash,
+                &import.trackers,
+            )?;
         }
+        tx.commit()?;
         Ok(DbImportSummary {
             torrents: self.torrents.len(),
             files: self.torrents.iter().map(|import| import.files.len()).sum(),

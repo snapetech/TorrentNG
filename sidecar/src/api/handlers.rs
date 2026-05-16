@@ -1296,6 +1296,7 @@ pub async fn upsert_category(
             Json(Category {
                 name: name.to_owned(),
                 save_path: save_path.to_owned(),
+                torrent_count: 0,
             })
             .into_response()
         }
