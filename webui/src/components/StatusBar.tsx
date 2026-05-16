@@ -57,6 +57,7 @@ function Badge({ label, value, title, state }: { label: string; value: string; t
 
 export function StatusBar({ loaded, total, selected, stats, rtorrent, cached, storage }: Props) {
   const connected = rtorrent === 'connected'
+  const rendered = Math.min(loaded, total)
   const storageLabel = storage?.ok
     ? `${fmtBytes(storage.used_bytes)} / ${fmtBytes(storage.total_bytes)}`
     : 'unknown'
@@ -66,32 +67,37 @@ export function StatusBar({ loaded, total, selected, stats, rtorrent, cached, st
 
   return (
     <footer style={{
-      minHeight: 34, flexShrink: 0, display: 'flex', alignItems: 'center', gap: 8,
-      padding: '0 12px', background: '#0d1117', borderTop: '1px solid #1e2433',
+      minHeight: 36, flexShrink: 0, display: 'flex', alignItems: 'center', gap: 12,
+      padding: '0 12px', background: '#0d1117', borderTop: '1px solid #273244',
       color: '#64748b', fontSize: 11, overflowX: 'auto',
     }}>
-      <Badge label="Core" value={connected ? 'connected' : 'disconnected'} state={connected ? 'on' : 'closed'} />
-      <span>{loaded.toLocaleString()} loaded / {total.toLocaleString()} shown</span>
-      {cached !== undefined && <span>{cached.toLocaleString()} cached</span>}
-      {selected > 0 && <span style={{ color: '#93c5fd' }}>{selected.toLocaleString()} selected</span>}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 'max-content' }}>
+        <Badge label="Core" value={connected ? 'connected' : 'disconnected'} state={connected ? 'on' : 'closed'} />
+        <span>{total.toLocaleString()} torrents</span>
+        {rendered !== total && <span>{rendered.toLocaleString()} rendered</span>}
+        {cached !== undefined && <span>{cached.toLocaleString()} cached</span>}
+        {selected > 0 && <span style={{ color: '#93c5fd' }}>{selected.toLocaleString()} selected</span>}
+      </div>
       <span style={{ flex: 1 }} />
-      <Badge label="DL" value={fmtSpeed(stats.download_speed)} state="on" />
-      <Badge label="UL" value={fmtSpeed(stats.upload_speed)} state="on" />
-      <Badge label="Disk" value={storageLabel} title={storageTitle} state={storage?.ok ? 'on' : 'unknown'} />
-      <Badge
-        label="Conn"
-        value={`${(stats.connections ?? 0).toLocaleString()}${stats.pending_connections ? ` +${stats.pending_connections}` : ''}`}
-        title="Established and pending peer sockets on the incoming port"
-        state={(stats.connections ?? 0) > 0 ? 'on' : 'unknown'}
-      />
-      <Badge
-        label="FW"
-        value={`${stats.firewall ?? 'unknown'}${stats.listen_port ? ` :${stats.listen_port}` : ''}`}
-        title="Incoming port listener state inferred from live TCP sockets"
-        state={stats.firewall}
-      />
-      <Badge label="DHT" value={stats.dht ?? 'unknown'} title="Runtime rTorrent DHT config" state={stats.dht} />
-      <Badge label="PEX" value={stats.pex ?? 'unknown'} title="Runtime rTorrent peer exchange config" state={stats.pex} />
+      <div style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 'max-content' }}>
+        <Badge label="DL" value={fmtSpeed(stats.download_speed)} state={(stats.download_speed ?? 0) > 0 ? 'on' : 'unknown'} />
+        <Badge label="UL" value={fmtSpeed(stats.upload_speed)} state={(stats.upload_speed ?? 0) > 0 ? 'on' : 'unknown'} />
+        <Badge label="Disk" value={storageLabel} title={storageTitle} state={storage?.ok ? 'on' : 'unknown'} />
+        <Badge
+          label="Conn"
+          value={`${(stats.connections ?? 0).toLocaleString()}${stats.pending_connections ? ` +${stats.pending_connections}` : ''}`}
+          title="Established and pending peer sockets on the incoming port"
+          state={(stats.connections ?? 0) > 0 ? 'on' : 'unknown'}
+        />
+        <Badge
+          label="FW"
+          value={`${stats.firewall ?? 'unknown'}${stats.listen_port ? ` :${stats.listen_port}` : ''}`}
+          title="Incoming port listener state inferred from live TCP sockets"
+          state={stats.firewall}
+        />
+        <Badge label="DHT" value={stats.dht ?? 'unknown'} title="Runtime rTorrent DHT config" state={stats.dht} />
+        <Badge label="PEX" value={stats.pex ?? 'unknown'} title="Runtime rTorrent peer exchange config" state={stats.pex} />
+      </div>
     </footer>
   )
 }

@@ -88,7 +88,7 @@ This is the working checklist for finishing the native Rust engine rewrite. It i
 - [ ] Import qBittorrent fastresume/state.
 - [ ] Import Transmission resume/state.
 - [ ] Preserve categories/tags/labels/save paths/trackers.
-- [ ] Add dry-run migration reports.
+- [x] Add dry-run migration reports.
 - [ ] Add rollback/backup docs.
 
 ## 9. Scale Certification

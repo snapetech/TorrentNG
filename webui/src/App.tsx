@@ -42,14 +42,6 @@ function loadMediaInference(): MediaInferenceMode {
   return value === 'full' || value === 'suffix' || value === 'hints' || value === 'off' ? value : 'full'
 }
 
-function fmtSpeed(bps: number): string {
-  if (!bps) return '0 B/s'
-  if (bps >= 1e9) return (bps / 1e9).toFixed(1) + ' GB/s'
-  if (bps >= 1e6) return (bps / 1e6).toFixed(1) + ' MB/s'
-  if (bps >= 1e3) return (bps / 1e3).toFixed(0) + ' KB/s'
-  return bps + ' B/s'
-}
-
 function makeTabId() {
   try {
     return crypto.randomUUID()
@@ -404,18 +396,7 @@ export function App() {
           {health?.rtorrent ?? 'connecting…'}
         </span>
 
-        {health && (
-          <span style={{ fontSize: 11, color: '#475569' }}>
-            {health.cached_torrents.toLocaleString()} cached
-          </span>
-        )}
-
-        <span style={{ fontSize: 11, color: '#3b82f6', marginLeft: 'auto' }}>
-          ↓ {fmtSpeed(liveStats.download_speed)}
-        </span>
-        <span style={{ fontSize: 11, color: '#22c55e' }}>
-          ↑ {fmtSpeed(liveStats.upload_speed)}
-        </span>
+        <span style={{ flex: 1 }} />
         <button onClick={handleLogout} title="Log out" style={{
           background: 'transparent', border: '1px solid #334155', borderRadius: 5,
           color: '#94a3b8', padding: '3px 10px', fontSize: 12, cursor: 'pointer',

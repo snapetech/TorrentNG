@@ -1452,6 +1452,12 @@ dependencies = [
 name = "rt-migrate"
 version = "0.1.0"
 dependencies = [
+ "rt-bencode",
+ "rt-db",
+ "rt-metainfo",
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "tracing",
 ]
