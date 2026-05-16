@@ -1675,6 +1675,8 @@ impl Engine {
             first_last_piece_prio: limits.first_last_piece_prio,
             force_start: limits.force_start,
             super_seeding: limits.super_seeding,
+            auto_tmm: limits.auto_tmm,
+            auto_management: limits.auto_management,
         };
         let db = self.db.lock().expect("database mutex poisoned");
         rt_db::upsert_torrent_limits(&db, &row).map_err(|e| e.to_string())?;
@@ -2702,6 +2704,8 @@ fn engine_limits_from_row(row: rt_db::TorrentLimitRow) -> EngineTorrentLimits {
         first_last_piece_prio: row.first_last_piece_prio,
         force_start: row.force_start,
         super_seeding: row.super_seeding,
+        auto_tmm: row.auto_tmm,
+        auto_management: row.auto_management,
     }
 }
 
@@ -3325,6 +3329,8 @@ mod tests {
                     seed_ratio_limit: Some(1.5),
                     sequential_download: true,
                     force_start: true,
+                    auto_tmm: true,
+                    auto_management: true,
                     ..EngineTorrentLimits::default()
                 },
             )
@@ -3337,6 +3343,8 @@ mod tests {
         assert_eq!(limits.seed_ratio_limit, Some(1.5));
         assert!(limits.sequential_download);
         assert!(limits.force_start);
+        assert!(limits.auto_tmm);
+        assert!(limits.auto_management);
     }
 
     #[tokio::test]

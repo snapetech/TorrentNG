@@ -1370,13 +1370,19 @@ pub async fn torrents_set_super_seeding(
 }
 
 /// `POST /api/qb/v2/torrents/setAutoTMM`.
-pub async fn torrents_set_auto_tmm() -> impl IntoResponse {
-    StatusCode::OK
+pub async fn torrents_set_auto_tmm(
+    State(state): State<AppState>,
+    body: String,
+) -> impl IntoResponse {
+    update_bool_limit_field(State(state), body, BoolLimitField::AutoTmm).await
 }
 
 /// `POST /api/qb/v2/torrents/setAutoManagement`.
-pub async fn torrents_set_auto_management() -> impl IntoResponse {
-    StatusCode::OK
+pub async fn torrents_set_auto_management(
+    State(state): State<AppState>,
+    body: String,
+) -> impl IntoResponse {
+    update_bool_limit_field(State(state), body, BoolLimitField::AutoManagement).await
 }
 
 /// `POST /api/qb/v2/torrents/toggleSequentialDownload`.
@@ -1798,6 +1804,8 @@ enum BoolLimitField {
     FirstLast,
     ForceStart,
     SuperSeeding,
+    AutoTmm,
+    AutoManagement,
 }
 
 async fn update_limit_field(
@@ -1871,6 +1879,8 @@ async fn update_bool_limit_field(
             BoolLimitField::FirstLast => limits.first_last_piece_prio,
             BoolLimitField::ForceStart => limits.force_start,
             BoolLimitField::SuperSeeding => limits.super_seeding,
+            BoolLimitField::AutoTmm => limits.auto_tmm,
+            BoolLimitField::AutoManagement => limits.auto_management,
         };
         let value = requested.unwrap_or(!current);
         match field {
@@ -1878,6 +1888,8 @@ async fn update_bool_limit_field(
             BoolLimitField::FirstLast => limits.first_last_piece_prio = value,
             BoolLimitField::ForceStart => limits.force_start = value,
             BoolLimitField::SuperSeeding => limits.super_seeding = value,
+            BoolLimitField::AutoTmm => limits.auto_tmm = value,
+            BoolLimitField::AutoManagement => limits.auto_management = value,
         }
         if update_torrent_limits(&state, &hash, limits).await != StatusCode::OK {
             return StatusCode::NOT_FOUND;
@@ -1956,6 +1968,7 @@ async fn qbit_torrent_info(state: &AppState, e: &rt_session::TorrentEntry) -> Qb
         (String::new(), 0)
     };
     let priority = queue_priority(state, &e.info_hash).await;
+    let limits = get_torrent_limits(state, &e.info_hash).await;
     QbTorrentInfo {
         hash: e.info_hash.clone(),
         name: e.name.clone(),
@@ -1977,7 +1990,7 @@ async fn qbit_torrent_info(state: &AppState, e: &rt_session::TorrentEntry) -> Qb
         progress,
         priority,
         amount_left: e.amount_left as i64,
-        auto_tmm: false,
+        auto_tmm: limits.auto_tmm || limits.auto_management,
         tracker,
         trackers_count,
     }

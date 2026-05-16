@@ -10,8 +10,8 @@ interface Props {
 }
 
 const INPUT: React.CSSProperties = {
-  width: '100%', background: '#0d1117', border: '1px solid #334155', borderRadius: 5,
-  color: '#e2e8f0', padding: '6px 8px', fontSize: 12, outline: 'none', boxSizing: 'border-box',
+  width: '100%', background: 'var(--bg)', border: '1px solid var(--border-strong)', borderRadius: 5,
+  color: 'var(--text)', padding: '6px 8px', fontSize: 12, outline: 'none', boxSizing: 'border-box',
 }
 
 export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
@@ -76,26 +76,26 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
       display: 'grid', placeItems: 'center', padding: 22,
     }}>
       <div style={{
-        width: 'min(820px, 100%)', height: 'min(680px, 90vh)', background: '#0f141d',
-        border: '1px solid #334155', borderRadius: 8, display: 'flex', flexDirection: 'column',
-        boxShadow: '0 24px 60px rgba(0,0,0,0.5)',
+        width: 'min(820px, 100%)', height: 'min(680px, 90vh)', background: 'var(--panel)',
+        border: '1px solid var(--border-strong)', borderRadius: 8, display: 'flex', flexDirection: 'column',
+        boxShadow: '0 24px 60px var(--shadow)',
       }}>
-        <header style={{ padding: '12px 14px', borderBottom: '1px solid #1e2433', display: 'flex', gap: 12 }}>
+        <header style={{ padding: '12px 14px', borderBottom: '1px solid var(--border)', display: 'flex', gap: 12 }}>
           <div style={{ flex: 1, minWidth: 0 }}>
-            <div style={{ color: '#e2e8f0', fontWeight: 700, fontSize: 15 }}>Properties</div>
-            <div style={{ color: '#64748b', fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{torrent.name}</div>
+            <div style={{ color: 'var(--text)', fontWeight: 700, fontSize: 15 }}>Properties</div>
+            <div style={{ color: 'var(--faint)', fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{torrent.name}</div>
           </div>
           <button onClick={onClose} style={smallButton('#94a3b8')}>Close</button>
         </header>
 
         <div style={{ display: 'flex', minHeight: 0, flex: 1 }}>
-          <nav style={{ width: 150, borderRight: '1px solid #1e2433', padding: 10 }}>
+          <nav style={{ width: 150, borderRight: '1px solid var(--border)', padding: 10 }}>
             {(['general', 'trackers', 'files', 'limits'] as Tab[]).map(item => (
               <button key={item} onClick={() => setTab(item)} style={{
                 width: '100%', textAlign: 'left', marginBottom: 5, borderRadius: 5,
-                background: tab === item ? '#1e3a5f' : 'transparent',
-                border: '1px solid ' + (tab === item ? '#3b82f6' : 'transparent'),
-                color: tab === item ? '#bfdbfe' : '#94a3b8',
+                background: tab === item ? 'var(--accent-soft)' : 'transparent',
+                border: '1px solid ' + (tab === item ? 'var(--accent)' : 'transparent'),
+                color: tab === item ? 'var(--accent-text)' : 'var(--muted)',
                 padding: '7px 9px', fontSize: 12, cursor: 'pointer', textTransform: 'capitalize',
               }}>{item}</button>
             ))}
@@ -138,7 +138,7 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
                     </div>
                   )}
                 </Field>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, color: '#94a3b8', fontSize: 12 }}>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, color: 'var(--muted)', fontSize: 12 }}>
                   <Info label="Hash" value={torrent.hash} mono />
                   <Info label="Tracker" value={torrent.tracker_url || '-'} mono />
                   <Info label="Save path" value={torrent.directory || '-'} mono />
@@ -157,7 +157,7 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
                   })} style={smallButton('#93c5fd')}>Add</button>
                 </div>
                 {trackers.map(tracker => (
-                  <div key={tracker.url} style={{ borderBottom: '1px solid #1e2433', padding: '8px 0' }}>
+                  <div key={tracker.url} style={{ borderBottom: '1px solid var(--border)', padding: '8px 0' }}>
                     {editingTracker?.url === tracker.url ? (
                       <div style={{ display: 'grid', gridTemplateColumns: '1fr auto auto', gap: 7 }}>
                         <input value={trackerUrl} onChange={e => setTrackerUrl(e.target.value)} style={{ ...INPUT, fontFamily: 'monospace' }} />
@@ -170,8 +170,8 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
                     ) : (
                       <div style={{ display: 'grid', gridTemplateColumns: '1fr auto auto', gap: 7, alignItems: 'center' }}>
                         <div>
-                          <div style={{ color: '#cbd5e1', fontFamily: 'monospace', fontSize: 11, overflowWrap: 'anywhere' }}>{tracker.url}</div>
-                          <div style={{ color: '#64748b', fontSize: 11 }}>{tracker.scrape_complete} seeds, {tracker.scrape_incomplete} peers {tracker.message ? `- ${tracker.message}` : ''}</div>
+                          <div style={{ color: 'var(--text)', fontFamily: 'monospace', fontSize: 11, overflowWrap: 'anywhere' }}>{tracker.url}</div>
+                          <div style={{ color: 'var(--faint)', fontSize: 11 }}>{tracker.scrape_complete} seeds, {tracker.scrape_incomplete} peers {tracker.message ? `- ${tracker.message}` : ''}</div>
                         </div>
                         <button onClick={() => setEditingTracker(tracker)} style={smallButton('#94a3b8')}>Edit</button>
                         <button onClick={() => apply('Tracker removed', () => api.torrents.patchTrackers(torrent.hash, { remove: [tracker.url] }))} style={smallButton('#f87171')}>Remove</button>
@@ -223,7 +223,7 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
             )}
           </main>
         </div>
-        {message && <div style={{ borderTop: '1px solid #1e2433', padding: '8px 14px', color: message.startsWith('Error') ? '#f87171' : '#94a3b8', fontSize: 12 }}>{message}</div>}
+        {message && <div style={{ borderTop: '1px solid var(--border)', padding: '8px 14px', color: message.startsWith('Error') ? '#f87171' : 'var(--muted)', fontSize: 12 }}>{message}</div>}
       </div>
     </div>
   )
@@ -242,7 +242,7 @@ function FileRow({ file, busy, renaming, name, onName, onRenameStart, onRenameCa
 }) {
   const pct = file.size_chunks ? Math.round((file.completed_chunks / file.size_chunks) * 100) : 100
   return (
-    <div style={{ border: '1px solid #1e2433', borderRadius: 5, padding: 8 }}>
+    <div style={{ border: '1px solid var(--border)', borderRadius: 5, padding: 8, background: 'var(--surface)' }}>
       {renaming ? (
         <div style={{ display: 'grid', gridTemplateColumns: '1fr auto auto', gap: 7 }}>
           <input value={name} onChange={e => onName(e.target.value)} style={INPUT} />
@@ -252,8 +252,8 @@ function FileRow({ file, busy, renaming, name, onName, onRenameStart, onRenameCa
       ) : (
         <div style={{ display: 'grid', gridTemplateColumns: '1fr auto auto', gap: 7, alignItems: 'center' }}>
           <div style={{ minWidth: 0 }}>
-            <div style={{ color: '#cbd5e1', fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={file.path}>{file.path}</div>
-            <div style={{ color: '#64748b', fontSize: 11 }}>{pct}% complete, priority {file.priority}</div>
+            <div style={{ color: 'var(--text)', fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={file.path}>{file.path}</div>
+            <div style={{ color: 'var(--faint)', fontSize: 11 }}>{pct}% complete, priority {file.priority}</div>
           </div>
           <select value={file.priority} disabled={busy} onChange={e => onPriority(Number(e.target.value))} style={{ ...INPUT, width: 112 }}>
             <option value={0}>Do not download</option>
@@ -268,25 +268,25 @@ function FileRow({ file, busy, renaming, name, onName, onRenameStart, onRenameCa
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
-  return <label style={{ display: 'grid', gap: 5, color: '#64748b', fontSize: 11, fontWeight: 700, textTransform: 'uppercase' }}>{label}{children}</label>
+  return <label style={{ display: 'grid', gap: 5, color: 'var(--faint)', fontSize: 11, fontWeight: 700, textTransform: 'uppercase' }}>{label}{children}</label>
 }
 
 function Info({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
-  return <div><div style={{ color: '#475569', fontSize: 10, textTransform: 'uppercase', marginBottom: 3 }}>{label}</div><div style={{ fontFamily: mono ? 'monospace' : undefined, overflowWrap: 'anywhere' }}>{value}</div></div>
+  return <div><div style={{ color: 'var(--faint)', fontSize: 10, textTransform: 'uppercase', marginBottom: 3 }}>{label}</div><div style={{ fontFamily: mono ? 'monospace' : undefined, overflowWrap: 'anywhere' }}>{value}</div></div>
 }
 
 function smallButton(color: string): React.CSSProperties {
   return {
-    background: '#1e2433', border: `1px solid ${color}66`, borderRadius: 5,
+    background: 'var(--surface-2)', border: `1px solid ${color}66`, borderRadius: 5,
     color, padding: '5px 9px', fontSize: 12, cursor: 'pointer',
   }
 }
 
 const chipButton: React.CSSProperties = {
-  background: '#111827',
-  border: '1px solid #334155',
+  background: 'var(--surface)',
+  border: '1px solid var(--border-strong)',
   borderRadius: 12,
-  color: '#94a3b8',
+  color: 'var(--muted)',
   padding: '2px 7px',
   fontSize: 11,
   cursor: 'pointer',

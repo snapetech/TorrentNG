@@ -66,6 +66,8 @@ pub struct EngineTorrentLimits {
     pub first_last_piece_prio: bool,
     pub force_start: bool,
     pub super_seeding: bool,
+    pub auto_tmm: bool,
+    pub auto_management: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

@@ -217,6 +217,15 @@ const MIGRATIONS: &[(u32, &str)] = &[
         CREATE INDEX IF NOT EXISTS idx_job_events_job ON job_events(job_id);
         ",
     ),
+    (
+        3,
+        "
+        PRAGMA foreign_keys = ON;
+
+        ALTER TABLE torrent_limits ADD COLUMN auto_tmm INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE torrent_limits ADD COLUMN auto_management INTEGER NOT NULL DEFAULT 0;
+        ",
+    ),
 ];
 
 #[cfg(test)]
@@ -250,7 +259,7 @@ mod tests {
         let v: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 2);
+        assert_eq!(v, 3);
     }
 
     #[test]

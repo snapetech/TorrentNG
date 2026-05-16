@@ -47,6 +47,8 @@ pub struct TorrentLimitRow {
     pub first_last_piece_prio: bool,
     pub force_start: bool,
     pub super_seeding: bool,
+    pub auto_tmm: bool,
+    pub auto_management: bool,
 }
 
 impl TorrentFileRow {
@@ -100,6 +102,8 @@ impl TorrentLimitRow {
             first_last_piece_prio: row.get::<_, i64>(7)? != 0,
             force_start: row.get::<_, i64>(8)? != 0,
             super_seeding: row.get::<_, i64>(9)? != 0,
+            auto_tmm: row.get::<_, i64>(10)? != 0,
+            auto_management: row.get::<_, i64>(11)? != 0,
         })
     }
 }
@@ -296,8 +300,9 @@ pub fn upsert_torrent_limits(conn: &Connection, limits: &TorrentLimitRow) -> Res
     conn.execute(
         "INSERT INTO torrent_limits
             (info_hash, download_limit, upload_limit, max_connections, seed_ratio_limit,
-             seed_idle_limit, sequential_download, first_last_piece_prio, force_start, super_seeding)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             seed_idle_limit, sequential_download, first_last_piece_prio, force_start, super_seeding,
+             auto_tmm, auto_management)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
          ON CONFLICT(info_hash) DO UPDATE SET
             download_limit=excluded.download_limit,
             upload_limit=excluded.upload_limit,
@@ -307,7 +312,9 @@ pub fn upsert_torrent_limits(conn: &Connection, limits: &TorrentLimitRow) -> Res
             sequential_download=excluded.sequential_download,
             first_last_piece_prio=excluded.first_last_piece_prio,
             force_start=excluded.force_start,
-            super_seeding=excluded.super_seeding",
+            super_seeding=excluded.super_seeding,
+            auto_tmm=excluded.auto_tmm,
+            auto_management=excluded.auto_management",
         params![
             limits.info_hash,
             limits.download_limit,
@@ -319,6 +326,8 @@ pub fn upsert_torrent_limits(conn: &Connection, limits: &TorrentLimitRow) -> Res
             limits.first_last_piece_prio as i64,
             limits.force_start as i64,
             limits.super_seeding as i64,
+            limits.auto_tmm as i64,
+            limits.auto_management as i64,
         ],
     )?;
     Ok(())
@@ -327,7 +336,8 @@ pub fn upsert_torrent_limits(conn: &Connection, limits: &TorrentLimitRow) -> Res
 pub fn get_torrent_limits(conn: &Connection, info_hash: &str) -> Result<TorrentLimitRow, DbError> {
     conn.query_row(
         "SELECT info_hash, download_limit, upload_limit, max_connections, seed_ratio_limit,
-                seed_idle_limit, sequential_download, first_last_piece_prio, force_start, super_seeding
+                seed_idle_limit, sequential_download, first_last_piece_prio, force_start, super_seeding,
+                auto_tmm, auto_management
          FROM torrent_limits WHERE info_hash = ?1",
         params![info_hash],
         TorrentLimitRow::from_row,
@@ -447,11 +457,15 @@ mod tests {
                 first_last_piece_prio: true,
                 force_start: false,
                 super_seeding: false,
+                auto_tmm: true,
+                auto_management: true,
             },
         )
         .unwrap();
         let limits = get_torrent_limits(&conn, &"a".repeat(40)).unwrap();
         assert_eq!(limits.upload_limit, Some(20));
         assert!(limits.sequential_download);
+        assert!(limits.auto_tmm);
+        assert!(limits.auto_management);
     }
 }
