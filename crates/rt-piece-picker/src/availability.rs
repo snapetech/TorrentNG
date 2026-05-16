@@ -40,6 +40,13 @@ impl Availability {
         }
     }
 
+    /// Remove one peer's ownership of a single piece.
+    pub fn remove_have(&mut self, piece: usize) {
+        if let Some(c) = self.counts.get_mut(piece) {
+            *c = c.saturating_sub(1);
+        }
+    }
+
     /// A peer disconnected; remove its bitfield from availability.
     pub fn remove_bitfield(&mut self, bitfield: &[u8]) {
         for (byte_idx, &byte) in bitfield.iter().enumerate() {
@@ -110,6 +117,18 @@ mod tests {
     fn remove_does_not_underflow() {
         let mut av = Availability::new(4);
         av.remove_bitfield(&[0xFF]); // should not panic or underflow
+        assert_eq!(av.count(0), 0);
+    }
+
+    #[test]
+    fn remove_have_decrements_single_piece() {
+        let mut av = Availability::new(4);
+        av.add_have(2);
+        av.add_have(2);
+
+        av.remove_have(2);
+
+        assert_eq!(av.count(2), 1);
         assert_eq!(av.count(0), 0);
     }
 

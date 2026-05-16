@@ -35,7 +35,7 @@ use rt_peer_wire::{
     message::Message,
 };
 use rt_piece_map::{FileSpan, PieceMap};
-use rt_piece_picker::{BlockRequest, PiecePicker};
+use rt_piece_picker::{Availability, BlockRequest, PiecePicker};
 use rt_session::{SessionRegistry, TorrentState};
 use rt_storage::{
     scheduler::{scheduled_read, scheduled_write},
@@ -736,11 +736,11 @@ impl TorrentTask {
         match event {
             PeerEvent::Bitfield { peer, pieces } => {
                 if let Some(handle) = self.active_peers.get_mut(&peer) {
-                    for (idx, has_piece) in pieces.iter().copied().enumerate() {
-                        if has_piece {
-                            self.picker.availability.add_have(idx);
-                        }
-                    }
+                    reconcile_peer_availability(
+                        &mut self.picker.availability,
+                        &handle.peer_has,
+                        &pieces,
+                    );
                     handle.peer_has = pieces;
                 }
                 self.refill_peer_requests(peer).await;
@@ -748,8 +748,10 @@ impl TorrentTask {
             PeerEvent::Have { peer, piece } => {
                 if let Some(handle) = self.active_peers.get_mut(&peer) {
                     if let Some(has_piece) = handle.peer_has.get_mut(piece as usize) {
-                        *has_piece = true;
-                        self.picker.availability.add_have(piece as usize);
+                        if !*has_piece {
+                            *has_piece = true;
+                            self.picker.availability.add_have(piece as usize);
+                        }
                     }
                 }
                 self.refill_peer_requests(peer).await;
@@ -1675,6 +1677,20 @@ fn private_peer_source_allowed(
     !is_private || allowed_private_peers.contains(&peer)
 }
 
+fn reconcile_peer_availability(availability: &mut Availability, old: &[bool], new: &[bool]) {
+    let piece_count = availability.piece_count();
+    for piece in 0..piece_count {
+        match (
+            old.get(piece).copied().unwrap_or(false),
+            new.get(piece).copied().unwrap_or(false),
+        ) {
+            (false, true) => availability.add_have(piece),
+            (true, false) => availability.remove_have(piece),
+            _ => {}
+        }
+    }
+}
+
 fn tracker_event_after_success(current: TrackerEvent, sent: TrackerEvent) -> TrackerEvent {
     if matches!(sent, TrackerEvent::Started | TrackerEvent::Completed) {
         TrackerEvent::Empty
@@ -2417,5 +2433,26 @@ mod tests {
         assert!(private_peer_source_allowed(true, &allowed, peer));
         assert!(!private_peer_source_allowed(true, &allowed, other));
         assert!(private_peer_source_allowed(false, &allowed, other));
+    }
+
+    #[test]
+    fn peer_availability_reconcile_counts_only_transitions() {
+        let mut availability = Availability::new(4);
+
+        reconcile_peer_availability(
+            &mut availability,
+            &[false, false, false, false],
+            &[true, false, true, false],
+        );
+        reconcile_peer_availability(
+            &mut availability,
+            &[true, false, true, false],
+            &[true, true, false, false],
+        );
+
+        assert_eq!(availability.count(0), 1);
+        assert_eq!(availability.count(1), 1);
+        assert_eq!(availability.count(2), 0);
+        assert_eq!(availability.count(3), 0);
     }
 }
