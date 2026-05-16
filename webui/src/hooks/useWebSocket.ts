@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
+import type { LiveStats } from '../api/client'
 
 interface WsEvent {
   type:
@@ -19,9 +20,15 @@ interface WsEvent {
   hash?: string
   upload_speed?: number
   download_speed?: number
+  connections?: number
+  pending_connections?: number
+  listen_port?: number
+  firewall?: string
+  dht?: string
+  pex?: string
 }
 
-export function useWebSocket(onStats?: (up: number, dn: number) => void, enabled = true) {
+export function useWebSocket(onStats?: (stats: LiveStats) => void, enabled = true) {
   const qc = useQueryClient()
   const ws = useRef<WebSocket | null>(null)
   const statsRef = useRef(onStats)
@@ -70,7 +77,16 @@ export function useWebSocket(onStats?: (up: number, dn: number) => void, enabled
         try {
           const msg: WsEvent = JSON.parse(e.data)
           if (msg.type === 'stats') {
-            statsRef.current?.(msg.upload_speed ?? 0, msg.download_speed ?? 0)
+            statsRef.current?.({
+              upload_speed: msg.upload_speed ?? 0,
+              download_speed: msg.download_speed ?? 0,
+              connections: msg.connections,
+              pending_connections: msg.pending_connections,
+              listen_port: msg.listen_port,
+              firewall: msg.firewall,
+              dht: msg.dht,
+              pex: msg.pex,
+            })
             return
           }
           switch (msg.type) {

@@ -219,6 +219,17 @@ export interface StorageResponse {
   roots: StorageRoot[]
 }
 
+export interface LiveStats {
+  upload_speed: number
+  download_speed: number
+  connections?: number
+  pending_connections?: number
+  listen_port?: number
+  firewall?: 'open' | 'listening' | 'closed' | 'unknown' | string
+  dht?: 'on' | 'off' | 'unknown' | string
+  pex?: 'on' | 'off' | 'unknown' | string
+}
+
 export interface TrackerHealth {
   tracker: string
   torrent_count: number

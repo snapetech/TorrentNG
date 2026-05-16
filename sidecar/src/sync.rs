@@ -20,6 +20,7 @@ pub async fn run(
     info!("sync loop started, interval={interval:?}");
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker.tick().await;
 
     loop {
         ticker.tick().await;
@@ -113,14 +114,6 @@ async fn tick(
         let _ = db.delete(hash);
         let _ = tx.send(Event::TorrentRemoved { hash: hash.clone() });
     }
-
-    // Aggregate speed stats
-    let up_speed: i64 = torrents.iter().map(|t| t.up_rate).sum();
-    let dn_speed: i64 = torrents.iter().map(|t| t.down_rate).sum();
-    let _ = tx.send(Event::Stats {
-        upload_speed: up_speed,
-        download_speed: dn_speed,
-    });
 
     Ok((seeding, downloading, stopped, errored, peers))
 }

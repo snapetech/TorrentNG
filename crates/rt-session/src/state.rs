@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 pub enum TorrentState {
     /// Added but not yet started.
     Stopped,
+    /// Magnet or metadata-only entry waiting for torrent metadata.
+    MetadataPending,
     /// Checking piece hashes.
     Checking,
     /// Seeding (all pieces verified).
@@ -28,7 +30,10 @@ impl TorrentState {
     pub fn can_start(self) -> bool {
         matches!(
             self,
-            TorrentState::Stopped | TorrentState::Paused | TorrentState::Error
+            TorrentState::Stopped
+                | TorrentState::MetadataPending
+                | TorrentState::Paused
+                | TorrentState::Error
         )
     }
 
@@ -52,6 +57,7 @@ impl TorrentState {
     pub fn as_str(self) -> &'static str {
         match self {
             TorrentState::Stopped => "stopped",
+            TorrentState::MetadataPending => "metadata_pending",
             TorrentState::Checking => "checking",
             TorrentState::Seeding => "seeding",
             TorrentState::Downloading => "downloading",
@@ -75,6 +81,7 @@ mod tests {
     #[test]
     fn can_start_stopped() {
         assert!(TorrentState::Stopped.can_start());
+        assert!(TorrentState::MetadataPending.can_start());
         assert!(TorrentState::Paused.can_start());
         assert!(!TorrentState::Seeding.can_start());
         assert!(!TorrentState::Checking.can_start());
@@ -97,6 +104,7 @@ mod tests {
     #[test]
     fn display_matches_serde() {
         assert_eq!(TorrentState::Seeding.as_str(), "seeding");
+        assert_eq!(TorrentState::MetadataPending.as_str(), "metadata_pending");
         assert_eq!(TorrentState::Downloading.as_str(), "downloading");
     }
 }

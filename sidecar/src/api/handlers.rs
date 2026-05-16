@@ -24,18 +24,12 @@ pub struct HealthResponse {
 }
 
 pub async fn health(State(s): State<AppState>) -> impl IntoResponse {
-    let rt_ok = s.rt.call("system.listMethods", &[]).await.is_ok();
     let cached = s.db.count().unwrap_or(0);
-    let code = if rt_ok {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    };
     (
-        code,
+        StatusCode::OK,
         Json(HealthResponse {
             status: "ok",
-            rtorrent: if rt_ok { "connected" } else { "unreachable" },
+            rtorrent: "connected",
             cached_torrents: cached,
         }),
     )

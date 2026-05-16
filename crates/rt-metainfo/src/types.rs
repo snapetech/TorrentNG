@@ -122,6 +122,15 @@ pub struct TorrentMetaV2 {
     pub raw: Vec<u8>,
 }
 
+/// Parsed magnet link metadata before BEP 9 metadata exchange completes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MagnetLink {
+    pub info_hash_v1: Option<[u8; 20]>,
+    pub info_hash_v2: Option<[u8; 32]>,
+    pub display_name: Option<String>,
+    pub trackers: Vec<String>,
+}
+
 impl TorrentMetaV2 {
     pub fn total_length(&self) -> u64 {
         self.files.iter().map(|f| f.length).sum()

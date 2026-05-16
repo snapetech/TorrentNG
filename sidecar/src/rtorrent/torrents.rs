@@ -57,7 +57,31 @@ pub struct RawTorrent {
     pub tracker_url: String,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TransferRates {
+    pub download: i64,
+    pub upload: i64,
+}
+
 impl Client {
+    pub async fn transfer_rates(&self) -> Result<TransferRates> {
+        async fn first_available(client: &Client, methods: &[&str]) -> i64 {
+            for method in methods {
+                if let Ok(value) = client.call(method, &[]).await {
+                    return value.as_i64().unwrap_or(0).max(0);
+                }
+            }
+            0
+        }
+
+        let (download, upload) = tokio::join!(
+            first_available(self, &["throttle.global_down.rate", "get_down_rate"]),
+            first_available(self, &["throttle.global_up.rate", "get_up_rate"]),
+        );
+
+        Ok(TransferRates { download, upload })
+    }
+
     pub async fn list_torrents(&self) -> Result<Vec<RawTorrent>> {
         let mut args: Vec<XmlValue> = vec!["".into(), "main".into()];
         args.extend(TORRENT_FIELDS.iter().map(|&f| XmlValue::from(f)));

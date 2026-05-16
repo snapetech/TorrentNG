@@ -153,6 +153,14 @@ pub fn parse_torrent(raw: &[u8]) -> Result<TorrentMeta, MetainfoError> {
     }))
 }
 
+/// Return the exact bencoded `info` dictionary bytes used for v1 infohashes
+/// and BEP 9 metadata exchange.
+pub fn torrent_info_bytes(raw: &[u8]) -> Result<Vec<u8>, MetainfoError> {
+    let (_, info_span) = decode_torrent_info_span(raw)?;
+    let info_span = info_span.ok_or(MetainfoError::MissingField("info span"))?;
+    Ok(raw[info_span].to_vec())
+}
+
 /// Parse a v2 `file tree` dict into a flat list of files.
 /// BEP 52 file tree: nested dicts where leaves have `{"": {"length": N, "pieces root": <bytes>}}`.
 fn parse_file_tree(

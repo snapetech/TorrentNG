@@ -5,4 +5,5 @@ pub mod config;
 pub mod metrics;
 pub mod qbcompat;
 pub mod rtorrent;
+pub mod stats;
 pub mod sync;

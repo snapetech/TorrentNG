@@ -6,7 +6,7 @@ use crate::node_id::NodeId;
 pub const K: usize = 8;
 pub const BUCKET_COUNT: usize = 160;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KNode {
     pub id: NodeId,
     pub addr: SocketAddrV4,

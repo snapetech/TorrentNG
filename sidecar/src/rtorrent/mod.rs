@@ -5,3 +5,4 @@ pub mod torrents;
 pub mod trackers;
 
 pub use client::Client;
+pub use torrents::TransferRates;

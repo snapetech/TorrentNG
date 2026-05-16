@@ -22,4 +22,8 @@ pub enum MetainfoError {
     ZeroLengthName,
     #[error("announce URL invalid: {0}")]
     InvalidAnnounce(String),
+    #[error("invalid magnet link: {0}")]
+    InvalidMagnet(String),
+    #[error("unsupported magnet info hash: {0}")]
+    UnsupportedMagnetHash(String),
 }

@@ -32,6 +32,7 @@ pub struct FileSpan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PieceRegion {
     pub file_index: u32,
+    pub path: SafeRelPath,
     /// Offset within the file.
     pub file_offset: u64,
     /// How many bytes to read.
@@ -143,6 +144,7 @@ impl PieceMap {
             }
             regions.push(PieceRegion {
                 file_index: file.file_index,
+                path: file.path.clone(),
                 file_offset: overlap_start - file.content_offset,
                 length: (overlap_end - overlap_start) as u32,
             });

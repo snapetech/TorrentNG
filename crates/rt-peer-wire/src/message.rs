@@ -33,6 +33,8 @@ pub enum Message {
     },
     /// id=8: cancel a pending request.
     Cancel { piece: u32, begin: u32, length: u32 },
+    /// id=20: BEP 10 extended message.
+    Extended { ext_id: u8, payload: Vec<u8> },
 }
 
 impl Message {
@@ -73,6 +75,15 @@ impl Message {
                 begin,
                 length,
             } => encode_fixed(8, &encode_3u32(*piece, *begin, *length)),
+            Message::Extended { ext_id, payload } => {
+                let len = (1 + 1 + payload.len()) as u32;
+                let mut v = Vec::with_capacity(4 + 1 + 1 + payload.len());
+                v.extend_from_slice(&len.to_be_bytes());
+                v.push(20);
+                v.push(*ext_id);
+                v.extend_from_slice(payload);
+                v
+            }
         }
     }
 
@@ -141,6 +152,17 @@ impl Message {
                     piece,
                     begin,
                     length,
+                })
+            }
+            20 => {
+                if body.is_empty() {
+                    return Err(WireError::InvalidMessage(
+                        "Extended body missing extension id".into(),
+                    ));
+                }
+                Ok(Message::Extended {
+                    ext_id: body[0],
+                    payload: body[1..].to_vec(),
                 })
             }
             _ => Err(WireError::UnknownMessageId(id)),
@@ -312,6 +334,25 @@ mod tests {
             length: 16384,
         };
         assert_eq!(roundtrip(msg.clone()), msg);
+    }
+
+    #[test]
+    fn extended_roundtrip() {
+        let msg = Message::Extended {
+            ext_id: 3,
+            payload: b"d1:md11:ut_metadatai1eee".to_vec(),
+        };
+        assert_eq!(roundtrip(msg.clone()), msg);
+        let encoded = msg.encode();
+        let len = u32::from_be_bytes(encoded[..4].try_into().unwrap());
+        assert_eq!(len as usize, encoded.len() - 4);
+        assert_eq!(encoded[4], 20);
+        assert_eq!(encoded[5], 3);
+    }
+
+    #[test]
+    fn extended_rejects_missing_extension_id() {
+        assert!(Message::parse(&[20u8]).is_err());
     }
 
     #[test]

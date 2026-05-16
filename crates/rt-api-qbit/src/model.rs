@@ -54,6 +54,52 @@ pub struct QbTrackerInfo {
     pub msg: String,
 }
 
+/// `GET /api/qb/v2/torrents/properties` response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QbTorrentProperties {
+    pub save_path: String,
+    pub creation_date: i64,
+    pub piece_size: i64,
+    pub comment: String,
+    pub total_wasted: i64,
+    pub total_uploaded: i64,
+    pub total_uploaded_session: i64,
+    pub total_downloaded: i64,
+    pub total_downloaded_session: i64,
+    pub up_limit: i64,
+    pub dl_limit: i64,
+    pub time_elapsed: i64,
+    pub seeding_time: i64,
+    pub nb_connections: i64,
+    pub nb_connections_limit: i64,
+    pub share_ratio: f64,
+    pub addition_date: i64,
+    pub completion_date: i64,
+    pub created_by: String,
+    pub dl_speed_avg: i64,
+    pub dl_speed: i64,
+    pub eta: i64,
+    pub last_seen: i64,
+    pub peers: i64,
+    pub peers_total: i64,
+    pub pieces_have: i64,
+    pub pieces_num: i64,
+    pub reannounce: i64,
+    pub seeds: i64,
+    pub seeds_total: i64,
+    pub total_size: i64,
+    pub up_speed_avg: i64,
+    pub up_speed: i64,
+}
+
+/// `GET /api/qb/v2/torrents/categories` map value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QbCategoryInfo {
+    pub name: String,
+    #[serde(rename = "savePath")]
+    pub save_path: String,
+}
+
 /// `GET /api/qb/v2/sync/maindata` response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QbMaindata {
@@ -91,6 +137,7 @@ pub struct QbAddTorrentForm {
 pub fn to_qbit_state(state: &str) -> &'static str {
     match state {
         "seeding" => "uploading",
+        "metadata_pending" => "metaDL",
         "downloading" => "downloading",
         "checking" => "checkingUP",
         "paused" => "pausedUP",
@@ -157,5 +204,48 @@ mod tests {
     #[test]
     fn unknown_state_maps_to_unknown() {
         assert_eq!(to_qbit_state("garbage"), "unknown");
+    }
+
+    #[test]
+    fn torrent_properties_serializes_qbit_fields() {
+        let props = QbTorrentProperties {
+            save_path: "/data/".into(),
+            creation_date: 1,
+            piece_size: 16_384,
+            comment: String::new(),
+            total_wasted: 0,
+            total_uploaded: 20,
+            total_uploaded_session: 20,
+            total_downloaded: 10,
+            total_downloaded_session: 10,
+            up_limit: -1,
+            dl_limit: -1,
+            time_elapsed: 0,
+            seeding_time: 0,
+            nb_connections: 0,
+            nb_connections_limit: -1,
+            share_ratio: 2.0,
+            addition_date: 1,
+            completion_date: -1,
+            created_by: String::new(),
+            dl_speed_avg: 0,
+            dl_speed: 0,
+            eta: -1,
+            last_seen: -1,
+            peers: 0,
+            peers_total: 0,
+            pieces_have: 0,
+            pieces_num: 3,
+            reannounce: -1,
+            seeds: 0,
+            seeds_total: 0,
+            total_size: 30,
+            up_speed_avg: 0,
+            up_speed: 0,
+        };
+        let json = serde_json::to_string(&props).unwrap();
+        assert!(json.contains("save_path"));
+        assert!(json.contains("piece_size"));
+        assert!(json.contains("share_ratio"));
     }
 }

@@ -76,35 +76,37 @@ impl AnnounceRequest {
     pub fn to_http_query(&self, tracker_url: &str) -> Result<String, TrackerError> {
         let mut url =
             Url::parse(tracker_url).map_err(|e| TrackerError::InvalidUrl(e.to_string()))?;
+        let existing_query = url.query().map(str::to_owned);
+        let fragment = url.fragment().map(str::to_owned);
+        url.set_query(None);
+        url.set_fragment(None);
 
-        {
-            let mut q = url.query_pairs_mut();
-            // info_hash is percent-encoded separately (raw bytes)
-            q.append_pair("peer_id", &url_encode_bytes(&self.peer_id));
-            q.append_pair("port", &self.port.to_string());
-            q.append_pair("uploaded", &self.uploaded.to_string());
-            q.append_pair("downloaded", &self.downloaded.to_string());
-            q.append_pair("left", &self.left.to_string());
-            q.append_pair("compact", if self.compact { "1" } else { "0" });
-            if let Some(n) = self.numwant {
-                q.append_pair("numwant", &n.to_string());
-            }
-            if let Some(ev) = self.event.as_str() {
-                q.append_pair("event", ev);
-            }
+        let mut query_parts = Vec::new();
+        if let Some(query) = existing_query.filter(|query| !query.is_empty()) {
+            query_parts.push(query);
         }
+        query_parts.push(format!("peer_id={}", url_encode_bytes(&self.peer_id)));
+        query_parts.push(format!("port={}", self.port));
+        query_parts.push(format!("uploaded={}", self.uploaded));
+        query_parts.push(format!("downloaded={}", self.downloaded));
+        query_parts.push(format!("left={}", self.left));
+        query_parts.push(format!("compact={}", if self.compact { 1 } else { 0 }));
+        if let Some(n) = self.numwant {
+            query_parts.push(format!("numwant={n}"));
+        }
+        if let Some(ev) = self.event.as_str() {
+            query_parts.push(format!("event={ev}"));
+        }
+        query_parts.push(format!("info_hash={}", self.info_hash.url_encode()));
 
-        // Append info_hash as raw percent-encoded bytes (url crate will re-encode otherwise)
-        let query = url.query().unwrap_or("").to_owned();
-        let info_hash_param = format!("info_hash={}", self.info_hash.url_encode());
-        let full_query = if query.is_empty() {
-            info_hash_param
-        } else {
-            format!("{query}&{info_hash_param}")
-        };
-        url.set_query(Some(&full_query));
-
-        Ok(url.to_string())
+        let mut out = url.to_string();
+        out.push('?');
+        out.push_str(&query_parts.join("&"));
+        if let Some(fragment) = fragment {
+            out.push('#');
+            out.push_str(&fragment);
+        }
+        Ok(out)
     }
 }
 
@@ -168,6 +170,25 @@ mod tests {
             .unwrap();
         // 0xAB percent-encoded is %AB
         assert!(url.contains("%AB"));
+    }
+
+    #[test]
+    fn peer_id_is_not_double_encoded() {
+        let req = test_request(TrackerEvent::Empty);
+        let url = req
+            .to_http_query("http://tracker.example.com/announce")
+            .unwrap();
+        assert!(url.contains("peer_id=%2D%2D"));
+        assert!(!url.contains("peer_id=%252D"));
+    }
+
+    #[test]
+    fn preserves_existing_query() {
+        let req = test_request(TrackerEvent::Empty);
+        let url = req
+            .to_http_query("http://tracker.example.com/announce?passkey=abc")
+            .unwrap();
+        assert!(url.contains("?passkey=abc&peer_id="));
     }
 
     #[test]

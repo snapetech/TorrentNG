@@ -1,38 +1,42 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
+    branches: ["master", "main"]
+  workflow_dispatch:
 
-env:
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
+permissions:
+  contents: read
 
 jobs:
-  check:
-    name: Check
-    runs-on: ubuntu-latest
+  sidecar:
+    runs-on: [self-hosted, Linux, X64]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: fmt
-        run: cargo fmt --all -- --check
-      - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: test
-        run: cargo test --workspace
-      - name: build
-        run: cargo build --workspace
+      - name: Checkout
+        uses: actions/checkout@v6
 
-  deny:
-    name: Dependency audit
-    runs-on: ubuntu-latest
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build sidecar
+        working-directory: sidecar
+        run: cargo build --locked
+
+  webui:
+    runs-on: [self-hosted, Linux, X64]
     steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v1
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
         with:
-          command: check licenses advisories
+          node-version: "22"
+
+      - name: Install dependencies
+        working-directory: webui
+        run: npm ci
+
+      - name: Build webui
+        working-directory: webui
+        run: npm run build

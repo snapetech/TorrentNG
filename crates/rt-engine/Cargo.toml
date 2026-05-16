@@ -11,17 +11,26 @@ tokio.workspace = true
 tokio-util.workspace = true
 bytes.workspace = true
 futures.workspace = true
+reqwest.workspace = true
+rusqlite.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 serde.workspace = true
+url.workspace = true
+hex.workspace = true
+sha1.workspace = true
 
 rt-config      = { path = "../rt-config" }
+rt-bencode     = { path = "../rt-bencode" }
+rt-dht         = { path = "../rt-dht" }
 rt-metainfo    = { path = "../rt-metainfo" }
 rt-session     = { path = "../rt-session" }
 rt-db          = { path = "../rt-db" }
+rt-fastresume  = { path = "../rt-fastresume" }
 rt-peer-wire   = { path = "../rt-peer-wire" }
 rt-peer-manager = { path = "../rt-peer-manager" }
+rt-path        = { path = "../rt-path" }
 rt-piece-picker = { path = "../rt-piece-picker" }
 rt-piece-map   = { path = "../rt-piece-map" }
 rt-storage     = { path = "../rt-storage" }
@@ -30,3 +39,4 @@ rt-metrics     = { path = "../rt-metrics" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+tempfile.workspace = true

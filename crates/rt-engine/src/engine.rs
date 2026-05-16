@@ -1,18 +1,26 @@
 /// Top-level engine: manages torrent task lifecycle and incoming TCP listener.
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use anyhow::Context;
+use rusqlite::Connection;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
 
 use rt_config::Config;
-use rt_metainfo::TorrentMeta;
-use rt_session::{SessionRegistry, TorrentEntry, TorrentState};
+use rt_db::TorrentRow;
+use rt_fastresume::FastresumeStore;
+use rt_metainfo::{parse_torrent, MagnetLink, TorrentMeta, TorrentMetaV1};
+use rt_peer_wire::handshake::{Handshake, HANDSHAKE_LEN};
+use rt_session::{SessionRegistry, TorrentEntry, TorrentState, TransferStats};
 
-use crate::command::{CmdResult, EngineCmd};
+use crate::command::{CmdResult, EngineCmd, EngineTorrentFile, EngineTorrentMetadata};
+use crate::dht_task::{run_dht, DhtCommand, DhtTorrent};
+use crate::metadata_task::run_metadata_task;
 use crate::torrent_task::{TorrentCmd, TorrentTask};
 
 /// Handle given to the API layer. Clone freely; all sends are channel-based.
@@ -29,12 +37,49 @@ impl EngineHandle {
         save_path: Option<std::path::PathBuf>,
         paused: bool,
     ) -> CmdResult<String> {
+        self.add_torrent_with_labels(meta, save_path, paused, None, Vec::new())
+            .await
+    }
+
+    pub async fn add_torrent_with_labels(
+        &self,
+        meta: TorrentMeta,
+        save_path: Option<std::path::PathBuf>,
+        paused: bool,
+        category: Option<String>,
+        tags: Vec<String>,
+    ) -> CmdResult<String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx
             .send(EngineCmd::AddTorrent {
                 meta: Box::new(meta),
                 save_path,
                 paused,
+                category,
+                tags,
+                reply,
+            })
+            .await
+            .map_err(|_| "engine shut down".to_owned())?;
+        rx.await.map_err(|_| "engine dropped reply".to_owned())?
+    }
+
+    pub async fn add_magnet_with_labels(
+        &self,
+        magnet: MagnetLink,
+        save_path: Option<std::path::PathBuf>,
+        paused: bool,
+        category: Option<String>,
+        tags: Vec<String>,
+    ) -> CmdResult<String> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(EngineCmd::AddMagnet {
+                magnet,
+                save_path,
+                paused,
+                category,
+                tags,
                 reply,
             })
             .await
@@ -73,6 +118,54 @@ impl EngineHandle {
         rx.await.map_err(|_| "engine dropped reply".to_owned())?
     }
 
+    pub async fn recheck_torrent(&self, info_hash: String) -> CmdResult<()> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(EngineCmd::RecheckTorrent { info_hash, reply })
+            .await
+            .map_err(|_| "engine shut down".to_owned())?;
+        rx.await.map_err(|_| "engine dropped reply".to_owned())?
+    }
+
+    pub async fn reannounce_torrent(&self, info_hash: String) -> CmdResult<()> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(EngineCmd::ReannounceTorrent { info_hash, reply })
+            .await
+            .map_err(|_| "engine shut down".to_owned())?;
+        rx.await.map_err(|_| "engine dropped reply".to_owned())?
+    }
+
+    pub async fn torrent_metadata(&self, info_hash: String) -> CmdResult<EngineTorrentMetadata> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(EngineCmd::GetTorrentMetadata { info_hash, reply })
+            .await
+            .map_err(|_| "engine shut down".to_owned())?;
+        rx.await.map_err(|_| "engine dropped reply".to_owned())?
+    }
+
+    pub async fn update_torrent_labels(
+        &self,
+        info_hash: String,
+        category: Option<Option<String>>,
+        add_tags: Vec<String>,
+        remove_tags: Vec<String>,
+    ) -> CmdResult<()> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(EngineCmd::UpdateTorrentLabels {
+                info_hash,
+                category,
+                add_tags,
+                remove_tags,
+                reply,
+            })
+            .await
+            .map_err(|_| "engine shut down".to_owned())?;
+        rx.await.map_err(|_| "engine dropped reply".to_owned())?
+    }
+
     pub async fn shutdown(&self) {
         let _ = self.tx.send(EngineCmd::Shutdown).await;
     }
@@ -82,9 +175,12 @@ impl EngineHandle {
 pub struct Engine {
     config: Arc<Config>,
     registry: Arc<RwLock<SessionRegistry>>,
+    db: Arc<Mutex<Connection>>,
     cmd_rx: mpsc::Receiver<EngineCmd>,
+    cmd_tx: mpsc::Sender<EngineCmd>,
     /// info_hash_hex → channel to the torrent task
     torrent_chans: HashMap<String, mpsc::Sender<TorrentCmd>>,
+    dht_tx: Option<mpsc::Sender<DhtCommand>>,
 }
 
 impl Engine {
@@ -94,14 +190,42 @@ impl Engine {
         registry: Arc<RwLock<SessionRegistry>>,
     ) -> anyhow::Result<EngineHandle> {
         let (tx, cmd_rx) = mpsc::channel(64);
-        let handle = EngineHandle { tx };
+        let handle = EngineHandle { tx: tx.clone() };
+        std::fs::create_dir_all(&config.daemon.session_dir)
+            .with_context(|| format!("creating session_dir {:?}", config.daemon.session_dir))?;
+        std::fs::create_dir_all(torrent_blob_dir(&config))
+            .with_context(|| "creating torrent metadata directory")?;
+        std::fs::create_dir_all(fastresume_dir(&config))
+            .with_context(|| "creating fastresume directory")?;
+        let conn = Connection::open(config.db_path())
+            .with_context(|| format!("opening database {:?}", config.db_path()))?;
+        rt_db::migrate(&conn).context("migrating database")?;
 
-        let engine = Engine {
+        let dht_shutdown = if config.dht.enabled {
+            let (dht_tx, dht_rx) = mpsc::channel(64);
+            let dht_port = config.dht_port();
+            let listen_port = config.network.listen_port;
+            let bootstrap_nodes = config.dht.bootstrap_nodes.clone();
+            tokio::spawn(async move {
+                if let Err(e) = run_dht(dht_port, listen_port, bootstrap_nodes, dht_rx).await {
+                    warn!(err = %e, "DHT task exited with error");
+                }
+            });
+            Some(dht_tx)
+        } else {
+            None
+        };
+
+        let mut engine = Engine {
             config: config.clone(),
             registry,
+            db: Arc::new(Mutex::new(conn)),
             cmd_rx,
+            cmd_tx: tx,
             torrent_chans: HashMap::new(),
+            dht_tx: dht_shutdown,
         };
+        engine.load_persisted_torrents().await?;
 
         // Spawn TCP listener
         let listen_addr: SocketAddr = format!("0.0.0.0:{}", config.network.listen_port)
@@ -138,6 +262,9 @@ impl Engine {
         for (_, tx) in self.torrent_chans.drain() {
             let _ = tx.send(TorrentCmd::Shutdown).await;
         }
+        if let Some(tx) = self.dht_tx.take() {
+            let _ = tx.send(DhtCommand::Shutdown).await;
+        }
         info!("engine shut down");
     }
 
@@ -150,23 +277,61 @@ impl Engine {
                 meta,
                 save_path,
                 paused,
+                category,
+                tags,
                 reply,
             } => {
-                let result = self.add_torrent(*meta, save_path, paused).await;
+                let result = self
+                    .add_torrent(*meta, save_path, paused, category, tags)
+                    .await;
                 let _ = reply.send(result);
+            }
+
+            EngineCmd::AddMagnet {
+                magnet,
+                save_path,
+                paused,
+                category,
+                tags,
+                reply,
+            } => {
+                let result = self
+                    .add_magnet(magnet, save_path, paused, category, tags)
+                    .await;
+                let _ = reply.send(result);
+            }
+
+            EngineCmd::CompleteMagnet { info_hash, raw } => {
+                if let Err(e) = self.complete_magnet(&info_hash, raw).await {
+                    warn!(torrent = %info_hash, err = %e, "failed to complete magnet metadata");
+                }
             }
 
             EngineCmd::RemoveTorrent {
                 info_hash,
-                delete_files: _,
+                delete_files,
                 reply,
             } => {
                 let result = if let Some(tx) = self.torrent_chans.remove(&info_hash) {
                     let _ = tx.send(TorrentCmd::Shutdown).await;
                     let mut reg = self.registry.write().await;
-                    reg.remove(&info_hash)
-                        .map(|_| ())
-                        .map_err(|e| e.to_string())
+                    match reg.remove(&info_hash) {
+                        Ok(entry) => {
+                            if delete_files {
+                                if let Err(e) =
+                                    self.delete_payload_files(&info_hash, &entry.save_path)
+                                {
+                                    warn!(torrent = %info_hash, err = %e, "failed to delete torrent payload files");
+                                }
+                            }
+                            if let Err(e) = self.delete_persisted_torrent(&info_hash) {
+                                warn!(torrent = %info_hash, err = %e, "failed to delete persisted torrent");
+                            }
+                            self.unregister_dht_torrent(&info_hash).await;
+                            Ok(())
+                        }
+                        Err(e) => Err(e.to_string()),
+                    }
                 } else {
                     Err(format!("torrent {info_hash} not found"))
                 };
@@ -174,17 +339,63 @@ impl Engine {
             }
 
             EngineCmd::PauseTorrent { info_hash, reply } => {
+                self.unregister_dht_torrent(&info_hash).await;
                 let result = self.send_to_torrent(&info_hash, TorrentCmd::Pause).await;
+                if result.is_ok() {
+                    self.set_metadata_placeholder_state(&info_hash, TorrentState::Paused);
+                }
                 let _ = reply.send(result);
             }
 
             EngineCmd::ResumeTorrent { info_hash, reply } => {
-                let result = self.send_to_torrent(&info_hash, TorrentCmd::Resume).await;
+                let result = self.ensure_metadata_task(&info_hash).await.and_then(|_| {
+                    self.torrent_chans
+                        .get(&info_hash)
+                        .ok_or_else(|| format!("torrent {info_hash} not found"))
+                        .map(|_| ())
+                });
+                let result = if result.is_ok() {
+                    self.send_to_torrent(&info_hash, TorrentCmd::Resume).await
+                } else {
+                    result
+                };
+                if result.is_ok() {
+                    self.set_metadata_placeholder_state(&info_hash, TorrentState::MetadataPending);
+                    self.register_dht_torrent_from_storage_or_hash(&info_hash)
+                        .await;
+                }
                 let _ = reply.send(result);
             }
 
             EngineCmd::RecheckTorrent { info_hash, reply } => {
                 let result = self.send_to_torrent(&info_hash, TorrentCmd::Recheck).await;
+                let _ = reply.send(result);
+            }
+
+            EngineCmd::ReannounceTorrent { info_hash, reply } => {
+                let result = self
+                    .send_to_torrent(&info_hash, TorrentCmd::Reannounce)
+                    .await;
+                let _ = reply.send(result);
+            }
+
+            EngineCmd::GetTorrentMetadata { info_hash, reply } => {
+                let result = self
+                    .load_torrent_metadata(&info_hash)
+                    .map_err(|e| e.to_string());
+                let _ = reply.send(result);
+            }
+
+            EngineCmd::UpdateTorrentLabels {
+                info_hash,
+                category,
+                add_tags,
+                remove_tags,
+                reply,
+            } => {
+                let result = self
+                    .update_torrent_labels_inner(&info_hash, category, add_tags, remove_tags)
+                    .await;
                 let _ = reply.send(result);
             }
         }
@@ -196,6 +407,8 @@ impl Engine {
         meta: TorrentMeta,
         save_path: Option<std::path::PathBuf>,
         paused: bool,
+        category: Option<String>,
+        tags: Vec<String>,
     ) -> CmdResult<String> {
         let v1 = match meta {
             TorrentMeta::V1(m) => m,
@@ -216,11 +429,15 @@ impl Engine {
         // Register in session
         {
             let mut reg = self.registry.write().await;
-            let entry = TorrentEntry::new(
+            let mut entry = TorrentEntry::new(
                 info_hash_hex.clone(),
                 v1.name.clone(),
                 save.to_string_lossy().into_owned(),
             );
+            entry.total_length = v1.total_length();
+            entry.amount_left = entry.total_length;
+            entry.category = normalize_category(category);
+            entry.tags = normalize_tags(tags);
             reg.add(entry).map_err(|e| e.to_string())?;
             // TorrentEntry starts in Stopped; transition to target state.
             let target = if paused {
@@ -233,20 +450,427 @@ impl Engine {
             }
         }
 
-        let (cmd_tx, cmd_rx) = mpsc::channel::<TorrentCmd>(32);
+        self.save_torrent_blob(&info_hash_hex, &v1.raw)
+            .map_err(|e| e.to_string())?;
+        {
+            let reg = self.registry.read().await;
+            let entry = reg
+                .get(&info_hash_hex)
+                .ok_or_else(|| format!("torrent {info_hash_hex} missing from registry"))?;
+            self.persist_entry(entry, &v1).map_err(|e| e.to_string())?;
+        }
 
-        let task = TorrentTask::new(
-            v1,
-            Arc::clone(&self.registry),
-            cmd_rx,
-            self.config.network.max_peers,
-        );
-
-        tokio::spawn(task.run());
+        let is_private = v1.private;
+        let info_hash = v1.info_hash;
+        let cmd_tx = self.spawn_torrent_task(v1, save, paused);
 
         self.torrent_chans.insert(info_hash_hex.clone(), cmd_tx);
+        if !paused && !is_private {
+            self.register_dht_torrent(info_hash, &info_hash_hex).await;
+        }
         info!(torrent = %info_hash_hex, paused, "torrent added");
         Ok(info_hash_hex)
+    }
+
+    async fn add_magnet(
+        &mut self,
+        magnet: MagnetLink,
+        save_path: Option<std::path::PathBuf>,
+        paused: bool,
+        category: Option<String>,
+        tags: Vec<String>,
+    ) -> CmdResult<String> {
+        let info_hash = magnet
+            .info_hash_v1
+            .ok_or_else(|| "only v1 btih magnets are currently supported".to_owned())?;
+        let info_hash_hex = hex::encode(info_hash);
+        if self.torrent_chans.contains_key(&info_hash_hex)
+            || self.registry.read().await.get(&info_hash_hex).is_some()
+        {
+            return Err(format!("torrent {info_hash_hex} already added"));
+        }
+
+        let save = save_path.unwrap_or_else(|| self.config.storage.download_dir.clone());
+        let name = magnet
+            .display_name
+            .clone()
+            .unwrap_or_else(|| info_hash_hex.clone());
+        let mut entry = TorrentEntry::new(
+            info_hash_hex.clone(),
+            name,
+            save.to_string_lossy().into_owned(),
+        );
+        entry.category = normalize_category(category);
+        entry.tags = normalize_tags(tags);
+        entry.state = if paused {
+            TorrentState::Paused
+        } else {
+            TorrentState::MetadataPending
+        };
+
+        {
+            let mut reg = self.registry.write().await;
+            reg.add(entry.clone()).map_err(|e| e.to_string())?;
+        }
+
+        let row = TorrentRow {
+            info_hash: entry.info_hash.clone(),
+            name: entry.name.clone(),
+            total_length: 0,
+            piece_length: 0,
+            piece_count: 0,
+            is_private: false,
+            save_path: entry.save_path.clone(),
+            category: entry.category.clone(),
+            tags: entry.tags.clone(),
+            state: entry.state.as_str().to_owned(),
+            added_at: entry.added_at as i64,
+            completed_at: None,
+            uploaded: 0,
+            downloaded: 0,
+            ratio: 0.0,
+            trackers: magnet.trackers.clone(),
+        };
+        {
+            let db = self.db.lock().expect("database mutex poisoned");
+            rt_db::upsert(&db, &row).map_err(|e| e.to_string())?;
+        }
+        {
+            let cmd_tx = self.spawn_metadata_task(
+                info_hash,
+                info_hash_hex.clone(),
+                magnet.trackers.clone(),
+                paused,
+            );
+            self.torrent_chans.insert(info_hash_hex.clone(), cmd_tx);
+        }
+        if !paused {
+            self.register_dht_torrent(info_hash, &info_hash_hex).await;
+        }
+        info!(torrent = %info_hash_hex, paused, "magnet added as metadata pending");
+        Ok(info_hash_hex)
+    }
+
+    async fn complete_magnet(&mut self, info_hash_hex: &str, raw: Vec<u8>) -> CmdResult<()> {
+        let meta = match parse_torrent(&raw).map_err(|e| e.to_string())? {
+            TorrentMeta::V1(m) | TorrentMeta::Hybrid(m, _) => m,
+            TorrentMeta::V2(_) => return Err("pure v2 metadata is not yet supported".to_owned()),
+        };
+        let fetched_hash = hex::encode(meta.info_hash);
+        if fetched_hash != info_hash_hex {
+            return Err(format!(
+                "fetched metadata hash {fetched_hash} does not match magnet {info_hash_hex}"
+            ));
+        }
+
+        let (save, category, tags) = {
+            let reg = self.registry.read().await;
+            let entry = reg
+                .get(info_hash_hex)
+                .ok_or_else(|| format!("metadata-pending torrent {info_hash_hex} not found"))?;
+            (
+                PathBuf::from(&entry.save_path),
+                entry.category.clone(),
+                entry.tags.clone(),
+            )
+        };
+
+        self.save_torrent_blob(info_hash_hex, &raw)
+            .map_err(|e| e.to_string())?;
+        {
+            let mut reg = self.registry.write().await;
+            let entry = reg
+                .get_mut(info_hash_hex)
+                .ok_or_else(|| format!("metadata-pending torrent {info_hash_hex} not found"))?;
+            entry.name = meta.name.clone();
+            entry.total_length = meta.total_length();
+            entry.amount_left = meta.total_length();
+            entry.category = category;
+            entry.tags = tags;
+            let _ = entry.transition(TorrentState::Downloading);
+        }
+        {
+            let reg = self.registry.read().await;
+            let entry = reg
+                .get(info_hash_hex)
+                .ok_or_else(|| format!("torrent {info_hash_hex} missing after metadata update"))?;
+            self.persist_entry(entry, &meta)
+                .map_err(|e| e.to_string())?;
+        }
+
+        if let Some(old_tx) = self.torrent_chans.remove(info_hash_hex) {
+            let _ = old_tx.send(TorrentCmd::Shutdown).await;
+        }
+        let is_private = meta.private;
+        let info_hash = meta.info_hash;
+        let tx = self.spawn_torrent_task(meta, save, false);
+        self.torrent_chans.insert(info_hash_hex.to_owned(), tx);
+        if !is_private {
+            self.register_dht_torrent(info_hash, info_hash_hex).await;
+        }
+        info!(torrent = %info_hash_hex, "magnet metadata completed");
+        Ok(())
+    }
+
+    fn spawn_torrent_task(
+        &self,
+        meta: TorrentMetaV1,
+        save: PathBuf,
+        paused: bool,
+    ) -> mpsc::Sender<TorrentCmd> {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<TorrentCmd>(32);
+        let task = TorrentTask::new(
+            meta,
+            save,
+            paused,
+            Arc::clone(&self.registry),
+            Arc::clone(&self.db),
+            cmd_rx,
+            fastresume_dir(&self.config),
+            self.config.network.max_peers,
+            self.config.network.listen_port,
+            self.config.tracker.http_timeout_secs,
+            self.config.tracker.udp_timeout_secs,
+            self.config.tracker.min_interval_secs,
+        );
+        tokio::spawn(task.run());
+        cmd_tx
+    }
+
+    fn spawn_metadata_task(
+        &self,
+        info_hash: [u8; 20],
+        info_hash_hex: String,
+        trackers: Vec<String>,
+        paused: bool,
+    ) -> mpsc::Sender<TorrentCmd> {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<TorrentCmd>(32);
+        tokio::spawn(run_metadata_task(
+            info_hash,
+            info_hash_hex,
+            trackers,
+            cmd_rx,
+            self.cmd_tx.clone(),
+            self.config.network.listen_port,
+            self.config.network.max_peers,
+            self.config.tracker.http_timeout_secs,
+            self.config.tracker.udp_timeout_secs,
+            paused,
+        ));
+        cmd_tx
+    }
+
+    async fn load_persisted_torrents(&mut self) -> anyhow::Result<()> {
+        let rows = {
+            let db = self.db.lock().expect("database mutex poisoned");
+            rt_db::list_all(&db)?
+        };
+
+        for row in rows {
+            if self.is_metadata_placeholder_row(&row) {
+                let paused = state_from_str(&row.state) == TorrentState::Paused;
+                let entry = entry_from_row(&row);
+                let mut reg = self.registry.write().await;
+                if let Err(e) = reg.add(entry) {
+                    warn!(torrent = %row.info_hash, err = %e, "failed to restore metadata-pending registry entry");
+                }
+                drop(reg);
+                if let Ok(info_hash) = parse_info_hash_hex(&row.info_hash) {
+                    let tx = self.spawn_metadata_task(
+                        info_hash,
+                        row.info_hash.clone(),
+                        row.trackers.clone(),
+                        paused,
+                    );
+                    self.torrent_chans.insert(row.info_hash.clone(), tx);
+                    if !paused {
+                        self.register_dht_torrent(info_hash, &row.info_hash).await;
+                    }
+                }
+                continue;
+            }
+            let blob_path = torrent_blob_path(&self.config, &row.info_hash);
+            let raw = match std::fs::read(&blob_path) {
+                Ok(raw) => raw,
+                Err(e) => {
+                    warn!(
+                        torrent = %row.info_hash,
+                        path = %blob_path.display(),
+                        err = %e,
+                        "persisted torrent metadata missing"
+                    );
+                    continue;
+                }
+            };
+            let meta = match parse_torrent(&raw) {
+                Ok(TorrentMeta::V1(m)) | Ok(TorrentMeta::Hybrid(m, _)) => m,
+                Ok(TorrentMeta::V2(_)) => {
+                    warn!(torrent = %row.info_hash, "pure v2 persisted torrent is unsupported");
+                    continue;
+                }
+                Err(e) => {
+                    warn!(torrent = %row.info_hash, err = %e, "failed to parse persisted torrent");
+                    continue;
+                }
+            };
+            let info_hash_hex = meta
+                .info_hash
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+            if info_hash_hex != row.info_hash {
+                warn!(
+                    row_hash = %row.info_hash,
+                    meta_hash = %info_hash_hex,
+                    "persisted torrent hash mismatch"
+                );
+                continue;
+            }
+
+            let entry = entry_from_row(&row);
+            {
+                let mut reg = self.registry.write().await;
+                if let Err(e) = reg.add(entry) {
+                    warn!(torrent = %row.info_hash, err = %e, "failed to restore registry entry");
+                    continue;
+                }
+            }
+
+            let state = state_from_str(&row.state);
+            let paused = !matches!(state, TorrentState::Downloading);
+            let is_private = meta.private;
+            let info_hash = meta.info_hash;
+            let tx = self.spawn_torrent_task(meta, PathBuf::from(&row.save_path), paused);
+            self.torrent_chans.insert(row.info_hash.clone(), tx);
+            if !paused && !is_private {
+                self.register_dht_torrent(info_hash, &row.info_hash).await;
+            }
+            info!(torrent = %row.info_hash, state = %row.state, paused, "restored persisted torrent");
+        }
+        Ok(())
+    }
+
+    fn persist_entry(&self, entry: &TorrentEntry, meta: &TorrentMetaV1) -> anyhow::Result<()> {
+        let row = row_from_entry(entry, meta);
+        let db = self.db.lock().expect("database mutex poisoned");
+        rt_db::upsert(&db, &row)?;
+        Ok(())
+    }
+
+    fn save_torrent_blob(&self, info_hash: &str, raw: &[u8]) -> anyhow::Result<()> {
+        let path = torrent_blob_path(&self.config, info_hash);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, raw)?;
+        Ok(())
+    }
+
+    fn delete_persisted_torrent(&self, info_hash: &str) -> anyhow::Result<()> {
+        {
+            let db = self.db.lock().expect("database mutex poisoned");
+            let _ = rt_db::delete(&db, info_hash)?;
+        }
+        match std::fs::remove_file(torrent_blob_path(&self.config, info_hash)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        FastresumeStore::new(fastresume_dir(&self.config)).delete(info_hash)?;
+        Ok(())
+    }
+
+    fn delete_payload_files(&self, info_hash: &str, save_path: &str) -> anyhow::Result<()> {
+        let blob_path = torrent_blob_path(&self.config, info_hash);
+        let raw = std::fs::read(&blob_path).with_context(|| {
+            format!("reading persisted torrent metadata {}", blob_path.display())
+        })?;
+        let meta = match parse_torrent(&raw)? {
+            TorrentMeta::V1(m) | TorrentMeta::Hybrid(m, _) => m,
+            TorrentMeta::V2(_) => anyhow::bail!("pure v2 torrents are not supported"),
+        };
+        let root = PathBuf::from(save_path);
+        for file in &meta.files {
+            let path = file.path.resolve(&root);
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    prune_empty_dirs(path.parent(), &root)?;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+
+    fn load_torrent_metadata(&self, info_hash: &str) -> anyhow::Result<EngineTorrentMetadata> {
+        let blob_path = torrent_blob_path(&self.config, info_hash);
+        let raw = match std::fs::read(&blob_path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let row = {
+                    let db = self.db.lock().expect("database mutex poisoned");
+                    rt_db::get(&db, info_hash)?
+                };
+                if self.is_metadata_placeholder_row(&row) {
+                    return Ok(metadata_from_placeholder_row(&row));
+                }
+                return Err(e).with_context(|| {
+                    format!("reading persisted torrent metadata {}", blob_path.display())
+                });
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("reading persisted torrent metadata {}", blob_path.display())
+                });
+            }
+        };
+        let meta = match parse_torrent(&raw)? {
+            TorrentMeta::V1(m) | TorrentMeta::Hybrid(m, _) => m,
+            TorrentMeta::V2(_) => anyhow::bail!("pure v2 torrents are not supported"),
+        };
+        Ok(metadata_from_v1(&meta))
+    }
+
+    async fn update_torrent_labels_inner(
+        &self,
+        info_hash: &str,
+        category: Option<Option<String>>,
+        add_tags: Vec<String>,
+        remove_tags: Vec<String>,
+    ) -> CmdResult<()> {
+        let mut reg = self.registry.write().await;
+        let entry = reg
+            .get_mut(info_hash)
+            .ok_or_else(|| format!("torrent {info_hash} not found"))?;
+
+        if let Some(category) = category {
+            entry.category = category.and_then(|value| normalize_category(Some(value)));
+        }
+        for tag in normalize_tags(add_tags) {
+            if !entry.tags.contains(&tag) {
+                entry.tags.push(tag);
+            }
+        }
+        let remove_tags = normalize_tags(remove_tags);
+        if !remove_tags.is_empty() {
+            entry.tags.retain(|tag| !remove_tags.contains(tag));
+        }
+        let row = match load_v1_from_blob(&self.config, info_hash) {
+            Ok(meta) => row_from_entry(entry, &meta),
+            Err(_) => {
+                let db = self.db.lock().expect("database mutex poisoned");
+                let mut row = rt_db::get(&db, info_hash).map_err(|e| e.to_string())?;
+                row.category = entry.category.clone();
+                row.tags = entry.tags.clone();
+                row
+            }
+        };
+        drop(reg);
+
+        let db = self.db.lock().expect("database mutex poisoned");
+        rt_db::upsert(&db, &row).map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     async fn send_to_torrent(&self, info_hash: &str, cmd: TorrentCmd) -> CmdResult<()> {
@@ -258,6 +882,435 @@ impl Engine {
             None => Err(format!("torrent {info_hash} not found")),
         }
     }
+
+    async fn ensure_metadata_task(&mut self, info_hash_hex: &str) -> CmdResult<()> {
+        if self.torrent_chans.contains_key(info_hash_hex) {
+            return Ok(());
+        }
+        let row = {
+            let db = self.db.lock().expect("database mutex poisoned");
+            rt_db::get(&db, info_hash_hex).map_err(|e| e.to_string())?
+        };
+        if !self.is_metadata_placeholder_row(&row) {
+            return Err(format!("torrent {info_hash_hex} not running"));
+        }
+        let info_hash =
+            parse_info_hash_hex(info_hash_hex).map_err(|_| "invalid info hash".to_owned())?;
+        let tx = self.spawn_metadata_task(
+            info_hash,
+            info_hash_hex.to_owned(),
+            row.trackers,
+            state_from_str(&row.state) == TorrentState::Paused,
+        );
+        self.torrent_chans.insert(info_hash_hex.to_owned(), tx);
+        Ok(())
+    }
+
+    async fn register_dht_torrent(&self, info_hash: [u8; 20], info_hash_hex: &str) {
+        let Some(dht_tx) = &self.dht_tx else {
+            return;
+        };
+        let Some(cmd_tx) = self.torrent_chans.get(info_hash_hex).cloned() else {
+            return;
+        };
+        let _ = dht_tx
+            .send(DhtCommand::AddTorrent(DhtTorrent { info_hash, cmd_tx }))
+            .await;
+    }
+
+    async fn register_dht_torrent_from_blob(&self, info_hash_hex: &str) {
+        let Some(dht_tx) = &self.dht_tx else {
+            return;
+        };
+        let Some(cmd_tx) = self.torrent_chans.get(info_hash_hex).cloned() else {
+            return;
+        };
+        let raw = match std::fs::read(torrent_blob_path(&self.config, info_hash_hex)) {
+            Ok(raw) => raw,
+            Err(e) => {
+                warn!(torrent = %info_hash_hex, err = %e, "failed to load torrent metadata for DHT registration");
+                return;
+            }
+        };
+        let meta = match parse_torrent(&raw) {
+            Ok(TorrentMeta::V1(m)) | Ok(TorrentMeta::Hybrid(m, _)) => m,
+            _ => return,
+        };
+        if meta.private {
+            return;
+        }
+        let _ = dht_tx
+            .send(DhtCommand::AddTorrent(DhtTorrent {
+                info_hash: meta.info_hash,
+                cmd_tx,
+            }))
+            .await;
+    }
+
+    async fn register_dht_torrent_from_storage_or_hash(&self, info_hash_hex: &str) {
+        if std::fs::metadata(torrent_blob_path(&self.config, info_hash_hex)).is_ok() {
+            self.register_dht_torrent_from_blob(info_hash_hex).await;
+            return;
+        }
+        match parse_info_hash_hex(info_hash_hex) {
+            Ok(info_hash) => self.register_dht_torrent(info_hash, info_hash_hex).await,
+            Err(()) => {
+                warn!(torrent = %info_hash_hex, "failed to parse info hash for DHT registration")
+            }
+        }
+    }
+
+    fn is_metadata_placeholder_row(&self, row: &TorrentRow) -> bool {
+        if state_from_str(&row.state) == TorrentState::MetadataPending {
+            return true;
+        }
+        state_from_str(&row.state) == TorrentState::Paused
+            && row.total_length == 0
+            && row.piece_count == 0
+            && std::fs::metadata(torrent_blob_path(&self.config, &row.info_hash)).is_err()
+    }
+
+    fn set_metadata_placeholder_state(&self, info_hash: &str, state: TorrentState) {
+        let mut row = {
+            let db = self.db.lock().expect("database mutex poisoned");
+            match rt_db::get(&db, info_hash) {
+                Ok(row) => row,
+                Err(_) => return,
+            }
+        };
+        if !self.is_metadata_placeholder_row(&row) {
+            return;
+        }
+        row.state = state.as_str().to_owned();
+        {
+            let db = self.db.lock().expect("database mutex poisoned");
+            let _ = rt_db::upsert(&db, &row);
+        }
+        if let Ok(mut registry) = self.registry.try_write() {
+            if let Some(entry) = registry.get_mut(info_hash) {
+                entry.state = state;
+            }
+        }
+    }
+
+    async fn unregister_dht_torrent(&self, info_hash_hex: &str) {
+        let Some(dht_tx) = &self.dht_tx else {
+            return;
+        };
+        let Ok(info_hash) = parse_info_hash_hex(info_hash_hex) else {
+            return;
+        };
+        let _ = dht_tx.send(DhtCommand::RemoveTorrent(info_hash)).await;
+    }
+}
+
+pub(crate) fn row_from_entry(entry: &TorrentEntry, meta: &TorrentMetaV1) -> TorrentRow {
+    TorrentRow {
+        info_hash: entry.info_hash.clone(),
+        name: entry.name.clone(),
+        total_length: meta.total_length() as i64,
+        piece_length: meta.piece_length as i64,
+        piece_count: meta.pieces.len() as i64,
+        is_private: meta.private,
+        save_path: entry.save_path.clone(),
+        category: entry.category.clone(),
+        tags: entry.tags.clone(),
+        state: entry.state.as_str().to_owned(),
+        added_at: entry.added_at as i64,
+        completed_at: entry.completed_at.map(|t| t as i64),
+        uploaded: entry.stats.uploaded as i64,
+        downloaded: entry.stats.downloaded as i64,
+        ratio: entry.stats.ratio(),
+        trackers: meta.all_trackers(),
+    }
+}
+
+fn entry_from_row(row: &TorrentRow) -> TorrentEntry {
+    TorrentEntry {
+        handle: Default::default(),
+        info_hash: row.info_hash.clone(),
+        name: row.name.clone(),
+        save_path: row.save_path.clone(),
+        total_length: row.total_length.max(0) as u64,
+        amount_left: if state_from_str(&row.state) == TorrentState::Seeding {
+            0
+        } else {
+            (row.total_length.max(0) as u64).saturating_sub(row.downloaded.max(0) as u64)
+        },
+        state: state_from_str(&row.state),
+        stats: TransferStats {
+            uploaded: row.uploaded.max(0) as u64,
+            downloaded: row.downloaded.max(0) as u64,
+        },
+        added_at: row.added_at.max(0) as u64,
+        completed_at: row.completed_at.map(|t| t.max(0) as u64),
+        category: row.category.clone(),
+        tags: row.tags.clone(),
+        error_message: None,
+    }
+}
+
+fn state_from_str(state: &str) -> TorrentState {
+    match state {
+        "checking" => TorrentState::Checking,
+        "metadata_pending" => TorrentState::MetadataPending,
+        "seeding" => TorrentState::Seeding,
+        "downloading" => TorrentState::Downloading,
+        "paused" => TorrentState::Paused,
+        "queued" => TorrentState::Queued,
+        "error" => TorrentState::Error,
+        _ => TorrentState::Stopped,
+    }
+}
+
+fn torrent_blob_dir(config: &Config) -> PathBuf {
+    config.daemon.session_dir.join("torrents")
+}
+
+fn torrent_blob_path(config: &Config, info_hash: &str) -> PathBuf {
+    torrent_blob_dir(config).join(format!("{info_hash}.torrent"))
+}
+
+fn load_v1_from_blob(config: &Config, info_hash: &str) -> anyhow::Result<TorrentMetaV1> {
+    let raw = std::fs::read(torrent_blob_path(config, info_hash))?;
+    match parse_torrent(&raw)? {
+        TorrentMeta::V1(m) | TorrentMeta::Hybrid(m, _) => Ok(m),
+        TorrentMeta::V2(_) => anyhow::bail!("pure v2 torrents are not supported"),
+    }
+}
+
+fn fastresume_dir(config: &Config) -> PathBuf {
+    config.daemon.session_dir.join("fastresume")
+}
+
+fn parse_info_hash_hex(info_hash: &str) -> Result<[u8; 20], ()> {
+    if info_hash.len() != 40 {
+        return Err(());
+    }
+    let mut out = [0u8; 20];
+    for (idx, chunk) in info_hash.as_bytes().chunks_exact(2).enumerate() {
+        let hex = std::str::from_utf8(chunk).map_err(|_| ())?;
+        out[idx] = u8::from_str_radix(hex, 16).map_err(|_| ())?;
+    }
+    Ok(out)
+}
+
+fn normalize_category(category: Option<String>) -> Option<String> {
+    category
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn normalize_tags(tags: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for tag in tags {
+        let tag = tag.trim().to_owned();
+        if !tag.is_empty() && !out.contains(&tag) {
+            out.push(tag);
+        }
+    }
+    out
+}
+
+fn metadata_from_v1(meta: &TorrentMetaV1) -> EngineTorrentMetadata {
+    EngineTorrentMetadata {
+        piece_length: meta.piece_length,
+        piece_count: meta.pieces.len(),
+        is_private: meta.private,
+        trackers: meta.all_trackers(),
+        files: meta
+            .files
+            .iter()
+            .map(|file| EngineTorrentFile {
+                index: file.index,
+                path: file.path.as_display(),
+                length: file.length,
+            })
+            .collect(),
+    }
+}
+
+fn metadata_from_placeholder_row(row: &TorrentRow) -> EngineTorrentMetadata {
+    EngineTorrentMetadata {
+        piece_length: 0,
+        piece_count: 0,
+        is_private: row.is_private,
+        trackers: row.trackers.clone(),
+        files: Vec::new(),
+    }
+}
+
+fn prune_empty_dirs(
+    mut dir: Option<&std::path::Path>,
+    root: &std::path::Path,
+) -> anyhow::Result<()> {
+    while let Some(current) = dir {
+        if current == root {
+            break;
+        }
+        match std::fs::remove_dir(current) {
+            Ok(()) => {
+                dir = current.parent();
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::DirectoryNotEmpty
+                        | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                break;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rt_metainfo::TorrentFileV1;
+    use rt_path::SafeRelPath;
+
+    fn meta() -> TorrentMetaV1 {
+        TorrentMetaV1 {
+            info_hash: [1u8; 20],
+            announce: Some("http://tracker.example.com/announce".into()),
+            announce_list: Vec::new(),
+            name: "sample.bin".into(),
+            piece_length: 16_384,
+            pieces: vec![[2u8; 20], [3u8; 20]],
+            files: vec![TorrentFileV1 {
+                index: 0,
+                length: 20_000,
+                path: SafeRelPath::from_name("sample.bin", false).unwrap(),
+                offset: 0,
+            }],
+            private: false,
+            raw: b"torrent".to_vec(),
+        }
+    }
+
+    #[test]
+    fn row_conversion_preserves_session_fields() {
+        let meta = meta();
+        let mut entry = TorrentEntry::new("01".repeat(20), meta.name.clone(), "/tmp/data".into());
+        entry.transition(TorrentState::Downloading).unwrap();
+        entry.stats.add_download(10);
+        entry.stats.add_upload(5);
+
+        let row = row_from_entry(&entry, &meta);
+        assert_eq!(row.info_hash, entry.info_hash);
+        assert_eq!(row.state, "downloading");
+        assert_eq!(row.total_length, 20_000);
+        assert_eq!(row.piece_count, 2);
+        assert_eq!(row.trackers, vec!["http://tracker.example.com/announce"]);
+
+        let restored = entry_from_row(&row);
+        assert_eq!(restored.info_hash, entry.info_hash);
+        assert_eq!(restored.state, TorrentState::Downloading);
+        assert_eq!(restored.stats.downloaded, 10);
+        assert_eq!(restored.stats.uploaded, 5);
+    }
+
+    #[test]
+    fn prune_empty_dirs_stops_at_root_and_keeps_nonempty_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("downloads");
+        let empty_leaf = root.join("torrent").join("subdir");
+        std::fs::create_dir_all(&empty_leaf).unwrap();
+        prune_empty_dirs(Some(&empty_leaf), &root).unwrap();
+        assert!(root.exists());
+        assert!(!root.join("torrent").exists());
+
+        let nonempty = root.join("other").join("nested");
+        std::fs::create_dir_all(&nonempty).unwrap();
+        std::fs::write(root.join("other").join("keep.bin"), b"data").unwrap();
+        prune_empty_dirs(Some(&nonempty), &root).unwrap();
+        assert!(!nonempty.exists());
+        assert!(root.join("other").exists());
+        assert!(root.join("other").join("keep.bin").exists());
+    }
+
+    #[test]
+    fn parse_info_hash_hex_rejects_invalid_input() {
+        assert_eq!(parse_info_hash_hex(&"0a".repeat(20)).unwrap(), [10u8; 20]);
+        assert!(parse_info_hash_hex("abc").is_err());
+        assert!(parse_info_hash_hex(&"zz".repeat(20)).is_err());
+    }
+
+    #[test]
+    fn metadata_projection_preserves_files_trackers_and_privacy() {
+        let mut meta = meta();
+        meta.private = true;
+        meta.announce_list = vec![vec![
+            "http://tracker.example.com/announce".into(),
+            "udp://tracker.two:6969/announce".into(),
+        ]];
+        meta.files = vec![TorrentFileV1 {
+            index: 7,
+            length: 42,
+            path: SafeRelPath::from_components(&["dir", "file.bin"], false).unwrap(),
+            offset: 0,
+        }];
+
+        let projected = metadata_from_v1(&meta);
+
+        assert_eq!(projected.piece_length, 16_384);
+        assert_eq!(projected.piece_count, 2);
+        assert!(projected.is_private);
+        assert_eq!(
+            projected.trackers,
+            vec![
+                "http://tracker.example.com/announce".to_owned(),
+                "udp://tracker.two:6969/announce".to_owned()
+            ]
+        );
+        assert_eq!(projected.files.len(), 1);
+        assert_eq!(projected.files[0].index, 7);
+        assert_eq!(projected.files[0].path, "dir/file.bin");
+        assert_eq!(projected.files[0].length, 42);
+    }
+
+    #[test]
+    fn metadata_placeholder_projection_preserves_trackers() {
+        let mut row = row_from_entry(
+            &TorrentEntry::new("02".repeat(20), "pending".into(), "/tmp/data".into()),
+            &meta(),
+        );
+        row.total_length = 0;
+        row.piece_length = 0;
+        row.piece_count = 0;
+        row.trackers = vec!["udp://tracker.example:6969/announce".into()];
+        row.state = "metadata_pending".into();
+
+        let projected = metadata_from_placeholder_row(&row);
+
+        assert_eq!(projected.piece_length, 0);
+        assert_eq!(projected.piece_count, 0);
+        assert_eq!(projected.trackers, row.trackers);
+        assert!(projected.files.is_empty());
+    }
+
+    #[test]
+    fn label_normalization_trims_dedupes_and_drops_empty_values() {
+        assert_eq!(
+            normalize_category(Some(" movies ".into())).as_deref(),
+            Some("movies")
+        );
+        assert_eq!(normalize_category(Some("   ".into())), None);
+        assert_eq!(
+            normalize_tags(vec![
+                " hd ".into(),
+                String::new(),
+                "hd".into(),
+                "archive".into()
+            ]),
+            vec!["hd".to_owned(), "archive".to_owned()]
+        );
+    }
 }
 
 /// Handle an incoming TCP peer connection: read the handshake's info_hash and
@@ -265,17 +1318,26 @@ impl Engine {
 async fn handle_incoming(
     mut stream: tokio::net::TcpStream,
     peer_addr: SocketAddr,
-    _torrent_chans: HashMap<String, mpsc::Sender<TorrentCmd>>,
+    torrent_chans: HashMap<String, mpsc::Sender<TorrentCmd>>,
 ) -> anyhow::Result<()> {
     use tokio::io::AsyncReadExt;
-    let mut hs = [0u8; 68];
+    let mut hs = [0u8; HANDSHAKE_LEN];
     stream.read_exact(&mut hs).await?;
-    // protocol string check
-    if hs[0] != 19 || &hs[1..20] != b"BitTorrent protocol" {
-        anyhow::bail!("not a BitTorrent handshake from {peer_addr}");
-    }
-    let _info_hash = &hs[28..48];
-    // Route to torrent task by info_hash — full routing deferred until
-    // torrent tasks expose a stream-accept channel.
+    let handshake = Handshake::parse(&hs)?;
+    let info_hash_hex: String = handshake
+        .info_hash
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let tx = torrent_chans
+        .get(&info_hash_hex)
+        .ok_or_else(|| anyhow::anyhow!("no torrent for incoming info_hash {info_hash_hex}"))?;
+    tx.send(TorrentCmd::AcceptPeer {
+        stream,
+        peer_addr,
+        handshake,
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("torrent task gone for incoming info_hash {info_hash_hex}"))?;
     Ok(())
 }

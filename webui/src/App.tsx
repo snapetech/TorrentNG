@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect } from 'react'
-import { useQueryClient } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useTorrentsInfinite, flattenPages, useHealth } from './hooks/useTorrents'
 import { useWebSocket } from './hooks/useWebSocket'
 import { TorrentTable } from './components/TorrentTable'
@@ -23,7 +23,7 @@ import { StatusBar } from './components/StatusBar'
 import { TorrentPropertiesDialog } from './components/TorrentPropertiesDialog'
 import { AppearancePanel, type MediaInferenceMode } from './components/AppearancePanel'
 import { BulkEditDialog } from './components/BulkEditDialog'
-import { api, AuthError, type ListParams, type TorrentSummary } from './api/client'
+import { api, AuthError, type ListParams, type LiveStats, type TorrentSummary } from './api/client'
 
 type View = 'torrents' | 'settings'
 type AuthState = 'checking' | 'authenticated' | 'unauthenticated'
@@ -136,7 +136,7 @@ export function App() {
   })
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [detailHash, setDetailHash] = useState<string | null>(null)
-  const [speeds, setSpeeds] = useState({ up: 0, dn: 0 })
+  const [liveStats, setLiveStats] = useState<LiveStats>({ upload_speed: 0, download_speed: 0 })
   const [addOpen, setAddOpen] = useState(false)
   const [helpOpen, setHelpOpen] = useState(false)
   const [toolbarBusy, setToolbarBusy] = useState(false)
@@ -151,8 +151,14 @@ export function App() {
   const query = useTorrentsInfinite(params, isAuthed)
   const { torrents, total } = flattenPages(query.data)
   const { data: health } = useHealth(activeTab.isActive && authState === 'authenticated')
+  const { data: storage } = useQuery({
+    queryKey: ['storage', 'status-bar'],
+    queryFn: api.storage,
+    enabled: isAuthed,
+    refetchInterval: 30_000,
+  })
 
-  const handleStats = useCallback((up: number, dn: number) => setSpeeds({ up, dn }), [])
+  const handleStats = useCallback((stats: LiveStats) => setLiveStats(stats), [])
   useWebSocket(handleStats, isAuthed)
 
   useEffect(() => {
@@ -175,7 +181,7 @@ export function App() {
   useEffect(() => {
     if (activeTab.isActive) return
     qc.clear()
-    setSpeeds({ up: 0, dn: 0 })
+    setLiveStats({ upload_speed: 0, download_speed: 0 })
   }, [activeTab.isActive, qc])
 
   useEffect(() => {
@@ -306,7 +312,7 @@ export function App() {
     setAuthState('unauthenticated')
     setSelected(new Set())
     setDetailHash(null)
-    setSpeeds({ up: 0, dn: 0 })
+    setLiveStats({ upload_speed: 0, download_speed: 0 })
     qc.clear()
   }
 
@@ -390,10 +396,10 @@ export function App() {
         )}
 
         <span style={{ fontSize: 11, color: '#3b82f6', marginLeft: 'auto' }}>
-          ↓ {fmtSpeed(speeds.dn)}
+          ↓ {fmtSpeed(liveStats.download_speed)}
         </span>
         <span style={{ fontSize: 11, color: '#22c55e' }}>
-          ↑ {fmtSpeed(speeds.up)}
+          ↑ {fmtSpeed(liveStats.upload_speed)}
         </span>
         <button onClick={handleLogout} title="Log out" style={{
           background: 'transparent', border: '1px solid #334155', borderRadius: 5,
@@ -489,10 +495,10 @@ export function App() {
         loaded={torrents.length}
         total={total}
         selected={selected.size}
-        up={speeds.up}
-        down={speeds.dn}
+        stats={liveStats}
         rtorrent={health?.rtorrent ?? 'connecting'}
         cached={health?.cached_torrents}
+        storage={storage?.roots?.[0]}
       />
 
       {addOpen && <AddTorrentDialog onClose={() => setAddOpen(false)} />}

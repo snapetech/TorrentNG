@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rtorrentng::{api, cache, config, metrics, rtorrent, sync};
+use rtorrentng::{api, cache, config, metrics, rtorrent, stats, sync};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::info;
@@ -31,13 +31,19 @@ async fn main() -> Result<()> {
 
     let rt = Arc::new(Client::new(&cfg.rtorrent).context("create rtorrent client")?);
 
-    if let Err(e) = rt.set_user_agent(&cfg.rtorrent.user_agent).await {
-        tracing::warn!("could not set user agent on startup (rTorrent may not be ready yet): {e}");
-    }
-
     let db = Arc::new(Db::open(&cfg.cache_path()).context("open cache db")?);
     let metrics = Metrics::new();
     let (tx, _) = broadcast::channel::<Event>(1024);
+
+    {
+        let rt_ua = rt.clone();
+        let ua = cfg.rtorrent.user_agent.clone();
+        tokio::spawn(async move {
+            if let Err(e) = rt_ua.set_user_agent(&ua).await {
+                tracing::warn!("could not set user agent after startup: {e}");
+            }
+        });
+    }
 
     {
         let rt2 = rt.clone();
@@ -47,6 +53,14 @@ async fn main() -> Result<()> {
         let interval = cfg.sync_interval();
         tokio::spawn(async move {
             sync::run(rt2, db2, tx2, mx2, interval).await;
+        });
+    }
+
+    {
+        let rt2 = rt.clone();
+        let tx2 = tx.clone();
+        tokio::spawn(async move {
+            stats::run(rt2, tx2, std::time::Duration::from_secs(2)).await;
         });
     }
 

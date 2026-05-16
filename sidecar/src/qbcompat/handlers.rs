@@ -1423,12 +1423,14 @@ fn sync_metadata(
     Ok((categories, tags))
 }
 
-async fn transfer_info() -> Json<serde_json::Value> {
+async fn transfer_info(State(s): State<AppState>) -> Json<serde_json::Value> {
+    let rates = crate::stats::current_rates(s.rt.clone()).await;
+
     Json(json!({
         "connection_status": "connected",
-        "dl_info_speed": 0,
+        "dl_info_speed": rates.download,
         "dl_info_data": 0,
-        "up_info_speed": 0,
+        "up_info_speed": rates.upload,
         "up_info_data": 0,
         "dl_rate_limit": 0,
         "up_rate_limit": 0,

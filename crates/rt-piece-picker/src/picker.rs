@@ -113,6 +113,14 @@ impl PiecePicker {
         }
     }
 
+    /// Mark a piece as needed again after verification failed.
+    pub fn reject_piece(&mut self, piece: usize) {
+        if piece < self.piece_count {
+            self.wanted[piece] = true;
+            self.in_progress.remove(&piece);
+        }
+    }
+
     /// Set priority pieces (head/tail of each file for fast preview).
     pub fn set_priority(&mut self, pieces: Vec<usize>) {
         self.priority = pieces;
@@ -195,6 +203,19 @@ impl PiecePicker {
     pub fn remaining_pieces(&self) -> usize {
         self.wanted.iter().filter(|&&w| w).count()
     }
+
+    pub fn bytes_left(&self) -> u64 {
+        self.wanted
+            .iter()
+            .enumerate()
+            .filter(|&(_, wanted)| *wanted)
+            .map(|(piece, _)| self.piece_length_for(piece) as u64)
+            .sum()
+    }
+
+    pub fn have_pieces(&self) -> Vec<bool> {
+        self.wanted.iter().map(|wanted| !*wanted).collect()
+    }
 }
 
 #[cfg(test)]
@@ -253,6 +274,44 @@ mod tests {
         p.mark_have(0);
         p.mark_have(1);
         assert_eq!(p.remaining_pieces(), 2);
+    }
+
+    #[test]
+    fn reject_piece_makes_completed_piece_wanted_again() {
+        let mut p = picker_1piece(MAX_BLOCK_SIZE);
+        p.mark_have(0);
+        assert!(p.is_complete());
+        p.reject_piece(0);
+        assert!(!p.is_complete());
+        assert_eq!(p.remaining_pieces(), 1);
+    }
+
+    #[test]
+    fn bytes_left_sums_wanted_piece_lengths() {
+        let mut p = picker_4pieces(10, 4);
+        assert_eq!(p.bytes_left(), 34);
+        p.mark_have(0);
+        p.mark_have(3);
+        assert_eq!(p.bytes_left(), 20);
+    }
+
+    #[test]
+    fn have_pieces_is_inverse_of_wanted() {
+        let mut p = picker_4pieces(10, 4);
+        p.mark_have(1);
+        p.mark_have(3);
+        assert_eq!(p.have_pieces(), vec![false, true, false, true]);
+    }
+
+    #[test]
+    fn mark_and_reject_update_recheck_accounting() {
+        let mut p = picker_4pieces(10, 4);
+        p.mark_have(0);
+        p.mark_have(1);
+        assert_eq!(p.bytes_left(), 14);
+        p.reject_piece(1);
+        assert_eq!(p.have_pieces(), vec![true, false, false, false]);
+        assert_eq!(p.bytes_left(), 24);
     }
 
     #[test]
