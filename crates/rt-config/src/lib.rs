@@ -22,6 +22,7 @@ pub struct Config {
     pub tracker: TrackerConfig,
     pub dht: DhtConfig,
     pub db: DbConfig,
+    pub auth: AuthConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +84,13 @@ pub struct DbConfig {
     pub path: PathBuf,
     /// SQLite WAL checkpoint threshold (pages).
     pub wal_checkpoint_pages: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct AuthConfig {
+    /// Pre-shared bearer/session tokens accepted by the native API.
+    pub api_tokens: Vec<String>,
 }
 
 impl Default for DaemonConfig {
@@ -226,6 +234,7 @@ mod tests {
         assert!(c.dht.enabled);
         assert!(!c.dht.bootstrap_nodes.is_empty());
         assert_eq!(c.tracker.http_timeout_secs, 30);
+        assert!(c.auth.api_tokens.is_empty());
     }
 
     #[test]
@@ -250,6 +259,9 @@ mod tests {
 [network]
 listen_port = 51413
 max_peers = 500
+
+[auth]
+api_tokens = ["one", "two"]
 "#;
         let c: Config = toml::from_str(toml).unwrap();
         assert_eq!(c.network.listen_port, 51413);
@@ -257,5 +269,6 @@ max_peers = 500
         // defaults preserved for unset fields
         assert_eq!(c.tracker.http_timeout_secs, 30);
         assert!(c.dht.enabled);
+        assert_eq!(c.auth.api_tokens, vec!["one", "two"]);
     }
 }

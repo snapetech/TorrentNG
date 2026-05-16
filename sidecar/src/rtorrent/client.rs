@@ -102,6 +102,9 @@ impl Client {
     }
 
     async fn call_json(&self, method: &str, args: &[XmlValue]) -> Result<XmlValue> {
+        if args.iter().any(contains_base64) {
+            bail!("JSON-RPC unavailable for XML-RPC base64 payload");
+        }
         let body = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -294,8 +297,18 @@ fn parse_jsonrpc_response(body: &[u8]) -> Result<XmlValue> {
 fn is_jsonrpc_unavailable(error: &anyhow::Error) -> bool {
     let text = format!("{error:#}");
     text.contains("JSON-RPC not supported")
+        || text.contains("JSON-RPC unavailable for XML-RPC base64 payload")
         || text.contains("method not found: system.listMethods")
         || text.contains("method not found: method.list_keys")
+}
+
+fn contains_base64(value: &XmlValue) -> bool {
+    match value {
+        XmlValue::Base64(_) => true,
+        XmlValue::Array(items) => items.iter().any(contains_base64),
+        XmlValue::Struct(fields) => fields.iter().any(|(_, value)| contains_base64(value)),
+        _ => false,
+    }
 }
 
 fn is_timeout_error(error: &anyhow::Error) -> bool {

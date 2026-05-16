@@ -1,5 +1,5 @@
-use std::sync::atomic::Ordering;
 use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::sync::atomic::Ordering;
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
@@ -105,18 +105,16 @@ async fn tick_bounded(
     let mut counts = SyncCounts::default();
     let mut touched = HashSet::new();
 
-    match rt
-        .list_torrents_nonzero_rate("main", MULTICALL_RANGE_PAGE_SIZE)
-        .await
-    {
-        Ok(moving) => {
-            for t in &moving {
+    match rt.live_summary("main", MULTICALL_RANGE_PAGE_SIZE).await {
+        Ok(summary) => {
+            write_live_speeds(summary.rates.download, summary.rates.upload);
+            for t in &summary.moving {
                 if touched.insert(t.hash.clone()) {
                     upsert_torrent(db, tx, t, now, &mut counts);
                 }
             }
         }
-        Err(e) => warn!("nonzero-rate sync failed: {e:?}"),
+        Err(e) => warn!("live summary sync failed: {e:?}"),
     }
 
     let page = rt
@@ -198,4 +196,21 @@ fn upsert_torrent(
     let _ = tx.send(Event::TorrentUpdated {
         hash: t.hash.clone(),
     });
+}
+
+fn write_live_speeds(download: i64, upload: i64) {
+    let Some(path) = std::env::var("RTNG_LIVE_SPEEDS_FILE")
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+    else {
+        return;
+    };
+    let body = serde_json::json!({
+        "download": download.max(0),
+        "upload": upload.max(0),
+    })
+    .to_string();
+    if let Err(e) = std::fs::write(&path, body) {
+        warn!("write live speeds {path}: {e}");
+    }
 }

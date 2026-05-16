@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::IntoResponse,
     Json,
 };
@@ -41,8 +41,12 @@ pub async fn list_torrents(State(state): State<AppState>) -> impl IntoResponse {
 /// `POST /api/v1/torrents` — add a v1/hybrid `.torrent` from base64 JSON.
 pub async fn add_torrent(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<AddTorrentRequest>,
 ) -> impl IntoResponse {
+    if let Some(response) = require_mutation_auth(&state, &headers) {
+        return response;
+    }
     let Some(engine) = &state.engine else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -245,8 +249,12 @@ pub async fn get_torrent(
 /// `DELETE /api/v1/torrents/{hash}` — remove a torrent.
 pub async fn delete_torrent(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(info_hash): Path<String>,
 ) -> impl IntoResponse {
+    if let Some(response) = require_mutation_auth(&state, &headers) {
+        return response;
+    }
     if !torrent_exists(&state, &info_hash).await {
         return not_found(info_hash);
     }
@@ -265,33 +273,37 @@ pub async fn delete_torrent(
 /// `POST /api/v1/torrents/{hash}/pause` — pause a torrent.
 pub async fn pause_torrent(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(info_hash): Path<String>,
 ) -> impl IntoResponse {
-    control_torrent(state, info_hash, TorrentControl::Pause).await
+    control_torrent(state, headers, info_hash, TorrentControl::Pause).await
 }
 
 /// `POST /api/v1/torrents/{hash}/resume` — resume a torrent.
 pub async fn resume_torrent(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(info_hash): Path<String>,
 ) -> impl IntoResponse {
-    control_torrent(state, info_hash, TorrentControl::Resume).await
+    control_torrent(state, headers, info_hash, TorrentControl::Resume).await
 }
 
 /// `POST /api/v1/torrents/{hash}/recheck` — force a piece hash recheck.
 pub async fn recheck_torrent(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(info_hash): Path<String>,
 ) -> impl IntoResponse {
-    control_torrent(state, info_hash, TorrentControl::Recheck).await
+    control_torrent(state, headers, info_hash, TorrentControl::Recheck).await
 }
 
 /// `POST /api/v1/torrents/{hash}/reannounce` — force tracker announce.
 pub async fn reannounce_torrent(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(info_hash): Path<String>,
 ) -> impl IntoResponse {
-    control_torrent(state, info_hash, TorrentControl::Reannounce).await
+    control_torrent(state, headers, info_hash, TorrentControl::Reannounce).await
 }
 
 /// `GET /health` — native engine readiness probe.
@@ -489,9 +501,13 @@ enum TorrentControl {
 
 async fn control_torrent(
     state: AppState,
+    headers: HeaderMap,
     info_hash: String,
     control: TorrentControl,
 ) -> axum::response::Response {
+    if let Some(response) = require_mutation_auth(&state, &headers) {
+        return response;
+    }
     if !torrent_exists(&state, &info_hash).await {
         return not_found(info_hash);
     }
@@ -528,6 +544,54 @@ async fn control_torrent(
     }
 }
 
+fn require_mutation_auth(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Option<axum::response::Response> {
+    if state.api_tokens.is_empty()
+        || presented_token(headers).is_some_and(|token| token_allowed(state, token))
+    {
+        return None;
+    }
+    Some(
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(
+                serde_json::to_value(ApiError::new(
+                    "UNAUTHORIZED",
+                    "missing or invalid API token",
+                ))
+                .unwrap(),
+            ),
+        )
+            .into_response(),
+    )
+}
+
+fn token_allowed(state: &AppState, token: &str) -> bool {
+    state.api_tokens.iter().any(|allowed| allowed == token)
+}
+
+fn presented_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .or_else(|| {
+            headers
+                .get(header::COOKIE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(extract_session_cookie)
+        })
+}
+
+fn extract_session_cookie(cookie: &str) -> Option<&str> {
+    cookie.split(';').find_map(|part| {
+        let part = part.trim();
+        part.strip_prefix("rtng_session=")
+    })
+}
+
 async fn torrent_exists(state: &AppState, info_hash: &str) -> bool {
     state.registry.read().await.get(info_hash).is_some()
 }
@@ -552,7 +616,7 @@ mod tests {
         body::Body,
         http::{Request, StatusCode},
     };
-    use rt_session::TorrentEntry;
+    use rt_session::{SessionRegistry, TorrentEntry};
     use tower::ServiceExt;
 
     use crate::router::build_router;
@@ -565,6 +629,25 @@ mod tests {
             reg.add(TorrentEntry::new(
                 hash.clone(),
                 "my.torrent".into(),
+                "/data".into(),
+            ))
+            .unwrap();
+        }
+        (build_router(state), hash)
+    }
+
+    async fn setup_authed_app_with_torrent() -> (axum::Router, String) {
+        let state = AppState {
+            registry: std::sync::Arc::new(tokio::sync::RwLock::new(SessionRegistry::new())),
+            engine: None,
+            api_tokens: std::sync::Arc::new(vec!["secret-token".to_owned()]),
+        };
+        let hash = "b".repeat(40);
+        {
+            let mut reg = state.registry.write().await;
+            reg.add(TorrentEntry::new(
+                hash.clone(),
+                "secure.torrent".into(),
                 "/data".into(),
             ))
             .unwrap();
@@ -718,6 +801,39 @@ mod tests {
                 Request::builder()
                     .method("DELETE")
                     .uri(format!("/api/v1/torrents/{hash}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn mutating_endpoint_requires_configured_token() {
+        let (app, hash) = setup_authed_app_with_torrent().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/v1/torrents/{hash}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn mutating_endpoint_accepts_bearer_token() {
+        let (app, hash) = setup_authed_app_with_torrent().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/v1/torrents/{hash}"))
+                    .header(header::AUTHORIZATION, "Bearer secret-token")
                     .body(Body::empty())
                     .unwrap(),
             )

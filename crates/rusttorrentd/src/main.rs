@@ -44,7 +44,11 @@ async fn main() -> anyhow::Result<()> {
         .context("starting engine")?;
 
     // Build the API routers
-    let native_state = NativeState::with_engine(Arc::clone(&registry), engine_handle.clone());
+    let native_state = NativeState::with_engine_and_tokens(
+        Arc::clone(&registry),
+        engine_handle.clone(),
+        config.auth.api_tokens.clone(),
+    );
     let native_router = rt_api_native::router::build_router(native_state);
 
     let qbit_state = QbitState::with_engine(Arc::clone(&registry), engine_handle.clone());

@@ -9,6 +9,7 @@ use rt_session::SessionRegistry;
 pub struct AppState {
     pub registry: Arc<RwLock<SessionRegistry>>,
     pub engine: Option<EngineHandle>,
+    pub api_tokens: Arc<Vec<String>>,
 }
 
 impl AppState {
@@ -16,6 +17,7 @@ impl AppState {
         AppState {
             registry: Arc::new(RwLock::new(SessionRegistry::new())),
             engine: None,
+            api_tokens: Arc::new(Vec::new()),
         }
     }
 
@@ -23,6 +25,7 @@ impl AppState {
         AppState {
             registry,
             engine: None,
+            api_tokens: Arc::new(Vec::new()),
         }
     }
 
@@ -30,6 +33,19 @@ impl AppState {
         AppState {
             registry,
             engine: Some(engine),
+            api_tokens: Arc::new(Vec::new()),
+        }
+    }
+
+    pub fn with_engine_and_tokens(
+        registry: Arc<RwLock<SessionRegistry>>,
+        engine: EngineHandle,
+        api_tokens: Vec<String>,
+    ) -> Self {
+        AppState {
+            registry,
+            engine: Some(engine),
+            api_tokens: Arc::new(api_tokens),
         }
     }
 }

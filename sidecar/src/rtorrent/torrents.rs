@@ -65,6 +65,12 @@ pub struct TransferRates {
     pub upload: i64,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct LiveSummary {
+    pub rates: TransferRates,
+    pub moving: Vec<RawTorrent>,
+}
+
 impl Client {
     pub async fn transfer_rates(&self) -> Result<TransferRates> {
         async fn first_available(client: &Client, methods: &[&str]) -> i64 {
@@ -104,6 +110,7 @@ impl Client {
             .any(|patch| {
                 patch == "rtorrent-0.16.11-multicall-range"
                     || patch == "rtorrent-0.16.11-multicall-nonzero-rate"
+                    || patch == "rtorrent-0.16.11-rtng-live-summary"
             })
         {
             return true;
@@ -151,6 +158,28 @@ impl Client {
             .with_context(|| format!("d.multicall.nonzero_rate {view} limit={limit}"))?;
 
         parse_torrent_rows(result.into_array())
+    }
+
+    pub async fn live_summary(&self, view: &str, limit: i64) -> Result<LiveSummary> {
+        let mut args: Vec<XmlValue> = vec!["".into(), view.to_owned().into(), limit.into()];
+        args.extend(TORRENT_FIELDS.iter().map(|&f| XmlValue::from(f)));
+
+        let result = self
+            .call_sync("rtng.live_summary", &args)
+            .await
+            .with_context(|| format!("rtng.live_summary {view} limit={limit}"))?;
+        let mut fields = result.into_array();
+        if fields.len() < 3 {
+            return Ok(LiveSummary::default());
+        }
+        let rows = fields.pop().unwrap_or(XmlValue::Array(Vec::new())).into_array();
+        let upload = fields.get(1).and_then(XmlValue::as_i64).unwrap_or(0).max(0);
+        let download = fields.first().and_then(XmlValue::as_i64).unwrap_or(0).max(0);
+
+        Ok(LiveSummary {
+            rates: TransferRates { download, upload },
+            moving: parse_torrent_rows(rows)?,
+        })
     }
 
     pub async fn list_torrents_paged(&self, view: &str) -> Result<Vec<RawTorrent>> {
