@@ -18,6 +18,8 @@ function fmtDate(ts: number): string {
 interface Props {
   torrent: TorrentSummary
   onClose: () => void
+  autoDisplay: boolean
+  onAutoDisplayChange: (enabled: boolean) => void
 }
 
 const LABEL: React.CSSProperties = {
@@ -48,7 +50,7 @@ function ActionBtn({
   )
 }
 
-export function TorrentDetail({ torrent: t, onClose }: Props) {
+export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayChange }: Props) {
   const qc = useQueryClient()
   const [busy, setBusy] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
@@ -135,10 +137,35 @@ export function TorrentDetail({ torrent: t, onClose }: Props) {
         <span style={{ flex: 1, fontWeight: 600, fontSize: 13, color: 'var(--text)', lineHeight: 1.3 }}>
           {t.name}
         </span>
+        <button onClick={onClose} title="Hide details" aria-label="Hide details" style={{
+          background: 'var(--surface-2)', border: '1px solid var(--border-strong)', borderRadius: 5,
+          cursor: 'pointer', color: 'var(--muted)', fontSize: 16, lineHeight: 1,
+          width: 28, height: 28, padding: 0, flexShrink: 0,
+        }}>×</button>
+      </div>
+
+      <label style={{
+        padding: '8px 14px', borderBottom: '1px solid var(--border)',
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12,
+        color: 'var(--muted)', fontSize: 11,
+      }}>
+        <span>Auto-display details on selection</span>
+        <input
+          type="checkbox"
+          checked={autoDisplay}
+          onChange={e => onAutoDisplayChange(e.target.checked)}
+          style={{ accentColor: 'var(--accent)', cursor: 'pointer', flexShrink: 0 }}
+        />
+      </label>
+
+      <div style={{
+        padding: '6px 14px', borderBottom: '1px solid var(--border)',
+        display: 'flex', justifyContent: 'flex-end',
+      }}>
         <button onClick={onClose} style={{
-          background: 'none', border: 'none', cursor: 'pointer',
-          color: 'var(--faint)', fontSize: 16, padding: '0 4px', flexShrink: 0,
-        }}>✕</button>
+          background: 'transparent', border: '1px solid var(--border-strong)', borderRadius: 5,
+          color: 'var(--muted)', padding: '3px 9px', fontSize: 11, cursor: 'pointer',
+        }}>Hide panel</button>
       </div>
 
       {/* Action buttons */}

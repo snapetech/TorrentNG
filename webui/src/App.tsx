@@ -30,6 +30,7 @@ type View = 'torrents' | 'settings'
 type AuthState = 'checking' | 'authenticated' | 'unauthenticated'
 type SettingsSection = 'library' | 'engine' | 'automation' | 'support'
 const MEDIA_INFERENCE_KEY = 'rtng.mediaInference'
+const DETAIL_AUTO_DISPLAY_KEY = 'rtng.detailAutoDisplay'
 const ACTIVE_TAB_KEY = 'rtng.activeTab'
 const ACTIVE_TAB_TTL_MS = 8000
 
@@ -58,6 +59,14 @@ function loadMediaInference(): MediaInferenceMode {
     value = null
   }
   return value === 'full' || value === 'suffix' || value === 'hints' || value === 'off' ? value : 'full'
+}
+
+function loadDetailAutoDisplay(): boolean {
+  try {
+    return localStorage.getItem(DETAIL_AUTO_DISPLAY_KEY) !== 'off'
+  } catch {
+    return true
+  }
 }
 
 function makeTabId() {
@@ -158,6 +167,7 @@ export function App() {
   const [mediaInference, setMediaInference] = useState<MediaInferenceMode>(loadMediaInference)
   const [themeId, setThemeId] = useState(loadThemeId)
   const [themeMode, setThemeMode] = useState<ThemeMode>(loadThemeMode)
+  const [detailAutoDisplay, setDetailAutoDisplay] = useState(loadDetailAutoDisplay)
 
   const isAuthed = activeTab.isActive && authState === 'authenticated'
   const query = useTorrentsInfinite(params, isAuthed)
@@ -271,14 +281,34 @@ export function App() {
   function handleSelect(hash: string) {
     setSelected(prev => {
       const next = new Set(prev)
-      if (next.has(hash)) next.delete(hash)
-      else next.add(hash)
+      if (next.has(hash)) {
+        next.delete(hash)
+        if (detailHash === hash) setDetailHash(null)
+      } else {
+        next.add(hash)
+        if (detailAutoDisplay) setDetailHash(hash)
+      }
       return next
     })
   }
 
   function handleSelectAll(hashes: string[]) {
     setSelected(new Set(hashes))
+    if (detailAutoDisplay && hashes.length === 1) setDetailHash(hashes[0])
+    if (hashes.length === 0) setDetailHash(null)
+  }
+
+  function updateDetailAutoDisplay(enabled: boolean) {
+    try {
+      localStorage.setItem(DETAIL_AUTO_DISPLAY_KEY, enabled ? 'on' : 'off')
+    } catch {
+      // The current tab still honors the setting.
+    }
+    setDetailAutoDisplay(enabled)
+  }
+
+  function openAutoDetail(hash: string | null) {
+    if (detailAutoDisplay) setDetailHash(hash)
   }
 
   function handleSort(sortKey: string) {
@@ -511,7 +541,7 @@ export function App() {
                   params={params}
                   onSelect={handleSelect}
                   onSelectAll={handleSelectAll}
-                  onDetail={hash => setDetailHash(hash)}
+                  onDetail={openAutoDetail}
                   onContextMenu={(torrent, x, y) => {
                     setContextMenu({ torrent, x, y })
                     setSelected(prev => prev.has(torrent.hash) ? prev : new Set([torrent.hash]))
@@ -530,6 +560,8 @@ export function App() {
               <TorrentDetail
                 torrent={detailTorrent}
                 onClose={() => setDetailHash(null)}
+                autoDisplay={detailAutoDisplay}
+                onAutoDisplayChange={updateDetailAutoDisplay}
               />
             )}
           </>

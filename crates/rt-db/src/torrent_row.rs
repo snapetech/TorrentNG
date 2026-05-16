@@ -64,7 +64,13 @@ pub fn upsert(conn: &Connection, row: &TorrentRow) -> Result<(), DbError> {
              uploaded, downloaded, ratio, trackers)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
          ON CONFLICT(info_hash) DO UPDATE SET
-             name=excluded.name, state=excluded.state,
+             name=excluded.name,
+             total_length=excluded.total_length,
+             piece_length=excluded.piece_length,
+             piece_count=excluded.piece_count,
+             is_private=excluded.is_private,
+             save_path=excluded.save_path,
+             state=excluded.state,
              uploaded=excluded.uploaded, downloaded=excluded.downloaded,
              ratio=excluded.ratio, completed_at=excluded.completed_at,
              category=excluded.category, tags=excluded.tags,
@@ -102,7 +108,13 @@ pub fn upsert_in_tx(tx: &rusqlite::Transaction<'_>, row: &TorrentRow) -> Result<
              uploaded, downloaded, ratio, trackers)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
          ON CONFLICT(info_hash) DO UPDATE SET
-             name=excluded.name, state=excluded.state,
+             name=excluded.name,
+             total_length=excluded.total_length,
+             piece_length=excluded.piece_length,
+             piece_count=excluded.piece_count,
+             is_private=excluded.is_private,
+             save_path=excluded.save_path,
+             state=excluded.state,
              uploaded=excluded.uploaded, downloaded=excluded.downloaded,
              ratio=excluded.ratio, completed_at=excluded.completed_at,
              category=excluded.category, tags=excluded.tags,

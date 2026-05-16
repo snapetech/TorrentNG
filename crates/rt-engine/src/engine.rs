@@ -1064,16 +1064,17 @@ impl Engine {
     }
 
     async fn complete_magnet(&mut self, info_hash_hex: &str, raw: Vec<u8>) -> CmdResult<()> {
-        let meta = match parse_torrent(&raw).map_err(|e| e.to_string())? {
-            TorrentMeta::V1(m) | TorrentMeta::Hybrid(m, _) => m,
-            TorrentMeta::V2(_) => return Err("pure v2 metadata is not yet supported".to_owned()),
-        };
-        let fetched_hash = hex::encode(meta.info_hash);
+        let meta = parse_torrent(&raw).map_err(|e| e.to_string())?;
+        let fetched_hash = meta_info_hash_hex(&meta);
         if fetched_hash != info_hash_hex {
             return Err(format!(
                 "fetched metadata hash {fetched_hash} does not match magnet {info_hash_hex}"
             ));
         }
+        let is_private = meta.is_private();
+        let torrent_name = meta.name().to_owned();
+        let total_length = meta_total_length(&meta);
+        let v2_only = matches!(meta, TorrentMeta::V2(_));
 
         let (save, category, tags) = {
             let reg = self.registry.read().await;
@@ -1094,19 +1095,23 @@ impl Engine {
             let entry = reg
                 .get_mut(info_hash_hex)
                 .ok_or_else(|| format!("metadata-pending torrent {info_hash_hex} not found"))?;
-            entry.name = meta.name.clone();
-            entry.total_length = meta.total_length();
-            entry.amount_left = meta.total_length();
+            entry.name = torrent_name.clone();
+            entry.total_length = total_length;
+            entry.amount_left = total_length;
             entry.category = category;
             entry.tags = tags;
-            let _ = entry.transition(TorrentState::Downloading);
+            if v2_only {
+                let _ = entry.transition(TorrentState::Paused);
+            } else {
+                let _ = entry.transition(TorrentState::Downloading);
+            }
         }
         {
             let reg = self.registry.read().await;
             let entry = reg
                 .get(info_hash_hex)
                 .ok_or_else(|| format!("torrent {info_hash_hex} missing after metadata update"))?;
-            self.persist_entry(entry, &TorrentMeta::V1(meta.clone()))
+            self.persist_entry(entry, &meta)
                 .map_err(|e| e.to_string())?;
         }
 
@@ -1118,13 +1123,12 @@ impl Engine {
                 let _ = timeout(Duration::from_secs(10), old_task).await;
             });
         }
-        let is_private = meta.private;
-        let info_hash = meta.info_hash;
-        let torrent_name = meta.name.clone();
-        let total_length = meta.total_length();
-        let _tx = self.spawn_torrent_task(info_hash_hex.to_owned(), meta, save, false);
-        if !is_private {
-            self.register_dht_torrent(info_hash, info_hash_hex).await;
+        if let Some(v1) = meta_v1(meta) {
+            let info_hash = v1.info_hash;
+            let _tx = self.spawn_torrent_task(info_hash_hex.to_owned(), v1, save, false);
+            if !is_private {
+                self.register_dht_torrent(info_hash, info_hash_hex).await;
+            }
         }
         self.append_session_event(
             Some(info_hash_hex),
@@ -1134,6 +1138,7 @@ impl Engine {
                 "name": torrent_name,
                 "total_length": total_length,
                 "private": is_private,
+                "v2_only": v2_only,
             }),
         );
         info!(torrent = %info_hash_hex, "magnet metadata completed");
@@ -3472,6 +3477,83 @@ mod tests {
         );
         rx.await.unwrap().unwrap();
         assert!(engine.torrent_chans.is_empty());
+    }
+
+    #[tokio::test]
+    async fn complete_v2_only_magnet_persists_metadata_without_task() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.download_dir = temp.path().join("downloads");
+        config.daemon.session_dir = temp.path().join("session");
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        let (_tx, rx) = mpsc::channel(1);
+        let mut engine = Engine {
+            config: Arc::new(config),
+            registry: Arc::clone(&registry),
+            db: Arc::new(Mutex::new(conn)),
+            cmd_rx: rx,
+            cmd_tx: mpsc::channel(1).0,
+            torrent_chans: HashMap::new(),
+            torrent_tasks: HashMap::new(),
+            dht_tx: None,
+        };
+        std::fs::create_dir_all(torrent_blob_dir(&engine.config)).unwrap();
+        let raw = raw_v2_torrent();
+        let meta = parse_torrent(&raw).unwrap();
+        let hash = meta_info_hash_hex(&meta);
+        let magnet = MagnetLink {
+            info_hash_v1: None,
+            info_hash_v2: Some(match meta {
+                TorrentMeta::V2(ref meta) => meta.info_hash_v2,
+                _ => unreachable!(),
+            }),
+            display_name: Some("placeholder".to_owned()),
+            trackers: vec!["https://tracker.example/announce".to_owned()],
+        };
+
+        let added = engine
+            .add_magnet(
+                magnet,
+                Some(temp.path().join("payload")),
+                false,
+                Some("movies".to_owned()),
+                vec!["v2".to_owned()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(added, hash);
+
+        engine.complete_magnet(&hash, raw.clone()).await.unwrap();
+
+        assert!(engine.torrent_chans.is_empty());
+        let reg = registry.read().await;
+        let entry = reg.get(&hash).unwrap();
+        assert_eq!(entry.name, "v2dir");
+        assert_eq!(entry.total_length, 65_536);
+        assert_eq!(entry.amount_left, 65_536);
+        assert_eq!(entry.state, TorrentState::Paused);
+        assert_eq!(entry.category.as_deref(), Some("movies"));
+        assert_eq!(entry.tags, vec!["v2".to_owned()]);
+        drop(reg);
+
+        assert_eq!(
+            std::fs::read(torrent_blob_path(&engine.config, &hash)).unwrap(),
+            raw
+        );
+        let db = engine.db.lock().unwrap();
+        let row = rt_db::get(&db, &hash).unwrap();
+        assert_eq!(row.name, "v2dir");
+        assert_eq!(row.state, "paused");
+        assert_eq!(row.total_length, 65_536);
+        assert_eq!(row.piece_length, 16_384);
+        assert_eq!(row.piece_count, 4);
+        assert_eq!(row.trackers, vec!["http://tracker.example/v2"]);
+        let files = rt_db::list_torrent_files(&db, &hash).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "v2dir/data.bin");
+        assert_eq!(files[0].length, 65_536);
     }
 
     #[test]
