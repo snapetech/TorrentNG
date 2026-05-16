@@ -1,5 +1,6 @@
 sidecar/rtorrentng
 sidecar/target/
+/target/
 sidecar/static/
 webui/node_modules/
 webui/dist/
