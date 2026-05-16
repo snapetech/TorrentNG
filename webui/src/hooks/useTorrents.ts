@@ -15,7 +15,8 @@ export function useTorrentsInfinite(params: Omit<ListParams, 'limit' | 'offset'>
       return loaded < lastPage.total ? loaded : undefined
     },
     placeholderData: (prev) => prev,
-    staleTime: 3000,
+    staleTime: 1000,
+    refetchInterval: enabled ? 2_000 : false,
   })
 }
 

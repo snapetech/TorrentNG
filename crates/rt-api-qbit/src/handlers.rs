@@ -6,7 +6,12 @@ use axum::{
 };
 use rt_metainfo::{parse_magnet, parse_torrent};
 use serde::Deserialize;
-use std::{collections::HashMap, net::IpAddr, time::Duration};
+use std::{
+    collections::{hash_map::DefaultHasher, HashMap},
+    hash::{Hash, Hasher},
+    net::IpAddr,
+    time::Duration,
+};
 use url::Url;
 
 use crate::{
@@ -146,88 +151,65 @@ pub async fn torrents_info(
     State(state): State<AppState>,
     Query(q): Query<TorrentsInfoQuery>,
 ) -> impl IntoResponse {
-    let reg = state.registry.read().await;
-    let mut infos: Vec<QbTorrentInfo> = reg
-        .iter()
-        .filter(|e| {
-            // Filter by hashes if provided
-            if let Some(ref hashes_str) = q.hashes {
-                let hashes: Vec<&str> = hashes_str.split('|').collect();
-                if !hashes.contains(&e.info_hash.as_str()) {
-                    return false;
-                }
-            }
-            // Filter by category
-            if let Some(ref cat) = q.category {
-                if e.category.as_deref() != Some(cat.as_str()) {
-                    return false;
-                }
-            }
-            if let Some(ref tag) = q.tag {
-                if !tag.is_empty() && !e.tags.iter().any(|entry_tag| entry_tag == tag) {
-                    return false;
-                }
-            }
-            // Filter by state
-            if let Some(ref filter) = q.filter {
-                let qb_state = to_qbit_state(e.state.as_str());
-                match filter.as_str() {
-                    "all" => {}
-                    "downloading" => {
-                        if qb_state != "downloading" {
-                            return false;
-                        }
+    let entries = {
+        let reg = state.registry.read().await;
+        reg.iter()
+            .filter(|e| {
+                // Filter by hashes if provided
+                if let Some(ref hashes_str) = q.hashes {
+                    let hashes: Vec<&str> = hashes_str.split('|').collect();
+                    if !hashes.contains(&e.info_hash.as_str()) {
+                        return false;
                     }
-                    "seeding" | "uploading" => {
-                        if qb_state != "uploading" {
-                            return false;
-                        }
-                    }
-                    "completed" => {
-                        if e.completed_at.is_none() {
-                            return false;
-                        }
-                    }
-                    "paused" => {
-                        if !matches!(qb_state, "pausedUP" | "pausedDL") {
-                            return false;
-                        }
-                    }
-                    _ => {}
                 }
-            }
-            true
-        })
-        .map(|e| {
-            let progress =
-                torrent_progress(e.total_length, e.amount_left, e.completed_at.is_some());
-            QbTorrentInfo {
-                hash: e.info_hash.clone(),
-                name: e.name.clone(),
-                state: to_qbit_state(e.state.as_str()).to_owned(),
-                size: e.total_length as i64,
-                downloaded: e.stats.downloaded as i64,
-                uploaded: e.stats.uploaded as i64,
-                ratio: e.stats.ratio(),
-                save_path: format!("{}/", e.save_path.trim_end_matches('/')),
-                category: e.category.clone().unwrap_or_default(),
-                tags: e.tags.join(","),
-                added_on: e.added_at as i64,
-                completion_on: e.completed_at.map(|t| t as i64).unwrap_or(-1),
-                num_leechs: 0,
-                num_seeds: 0,
-                dlspeed: 0,
-                upspeed: 0,
-                eta: -1,
-                progress,
-                priority: 0,
-                amount_left: e.amount_left as i64,
-                auto_tmm: false,
-                tracker: String::new(),
-                trackers_count: 0,
-            }
-        })
-        .collect();
+                // Filter by category
+                if let Some(ref cat) = q.category {
+                    if e.category.as_deref() != Some(cat.as_str()) {
+                        return false;
+                    }
+                }
+                if let Some(ref tag) = q.tag {
+                    if !tag.is_empty() && !e.tags.iter().any(|entry_tag| entry_tag == tag) {
+                        return false;
+                    }
+                }
+                // Filter by state
+                if let Some(ref filter) = q.filter {
+                    let qb_state = to_qbit_state(e.state.as_str());
+                    match filter.as_str() {
+                        "all" => {}
+                        "downloading" => {
+                            if qb_state != "downloading" {
+                                return false;
+                            }
+                        }
+                        "seeding" | "uploading" => {
+                            if qb_state != "uploading" {
+                                return false;
+                            }
+                        }
+                        "completed" => {
+                            if e.completed_at.is_none() {
+                                return false;
+                            }
+                        }
+                        "paused" => {
+                            if !matches!(qb_state, "pausedUP" | "pausedDL") {
+                                return false;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                true
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let mut infos = Vec::with_capacity(entries.len());
+    for entry in &entries {
+        infos.push(qbit_torrent_info(&state, entry).await);
+    }
 
     sort_torrent_infos(&mut infos, q.sort.as_deref(), q.reverse.unwrap_or(false));
 
@@ -570,6 +552,12 @@ pub async fn torrents_files(
     let Some(engine) = &state.engine else {
         return (StatusCode::OK, Json(Vec::<QbFileInfo>::new()));
     };
+    let complete = {
+        let reg = state.registry.read().await;
+        reg.get(&hash)
+            .map(|entry| entry.completed_at.is_some() || entry.amount_left == 0)
+            .unwrap_or(false)
+    };
     match engine.torrent_metadata(hash).await {
         Ok(meta) => {
             let files = meta
@@ -580,7 +568,7 @@ pub async fn torrents_files(
                     name: file.path,
                     size: file.length as i64,
                     priority: 1,
-                    progress: 0.0,
+                    progress: if complete { 1.0 } else { 0.0 },
                 })
                 .collect();
             (StatusCode::OK, Json(files))
@@ -596,8 +584,39 @@ pub async fn torrents_webseeds() -> impl IntoResponse {
 }
 
 /// `GET /api/qb/v2/torrents/pieceStates`.
-pub async fn torrents_piece_states() -> impl IntoResponse {
-    (StatusCode::OK, Json(Vec::<i32>::new()))
+pub async fn torrents_piece_states(
+    State(state): State<AppState>,
+    Query(q): Query<HashQuery>,
+) -> impl IntoResponse {
+    let Some(hash) = q.hash else {
+        return (StatusCode::OK, Json(Vec::<i32>::new()));
+    };
+    let entry = {
+        let reg = state.registry.read().await;
+        reg.get(&hash).cloned()
+    };
+    let Some(entry) = entry else {
+        return (StatusCode::NOT_FOUND, Json(Vec::<i32>::new()));
+    };
+    let Some(engine) = &state.engine else {
+        return (StatusCode::OK, Json(Vec::<i32>::new()));
+    };
+    match engine.torrent_metadata(hash).await {
+        Ok(meta) => {
+            let have = pieces_have(
+                entry.total_length,
+                entry.amount_left,
+                entry.completed_at.is_some(),
+                meta.piece_length as i64,
+                meta.piece_count as i64,
+            ) as usize;
+            let states = (0..meta.piece_count)
+                .map(|index| if index < have { 2 } else { 0 })
+                .collect();
+            (StatusCode::OK, Json(states))
+        }
+        Err(_) => (StatusCode::OK, Json(Vec::<i32>::new())),
+    }
 }
 
 /// `GET /api/qb/v2/torrents/pieceHashes`.
@@ -1150,44 +1169,33 @@ pub async fn transfer_upload_limit() -> impl IntoResponse {
 // Sync & Transfer
 // ---------------------------------------------------------------------------
 
-pub async fn sync_maindata(State(state): State<AppState>) -> impl IntoResponse {
-    let reg = state.registry.read().await;
-    let torrents: serde_json::Map<String, serde_json::Value> = reg
-        .iter()
-        .map(|e| {
-            let progress =
-                torrent_progress(e.total_length, e.amount_left, e.completed_at.is_some());
-            let info = QbTorrentInfo {
-                hash: e.info_hash.clone(),
-                name: e.name.clone(),
-                state: to_qbit_state(e.state.as_str()).to_owned(),
-                size: e.total_length as i64,
-                downloaded: e.stats.downloaded as i64,
-                uploaded: e.stats.uploaded as i64,
-                ratio: e.stats.ratio(),
-                save_path: format!("{}/", e.save_path.trim_end_matches('/')),
-                category: e.category.clone().unwrap_or_default(),
-                tags: e.tags.join(","),
-                added_on: e.added_at as i64,
-                completion_on: e.completed_at.map(|t| t as i64).unwrap_or(-1),
-                num_leechs: 0,
-                num_seeds: 0,
-                dlspeed: 0,
-                upspeed: 0,
-                eta: -1,
-                progress,
-                priority: 0,
-                amount_left: e.amount_left as i64,
-                auto_tmm: false,
-                tracker: String::new(),
-                trackers_count: 0,
-            };
-            (e.info_hash.clone(), serde_json::to_value(info).unwrap())
-        })
-        .collect();
+#[derive(Debug, Deserialize)]
+pub struct SyncMaindataQuery {
+    pub rid: Option<i64>,
+}
+
+pub async fn sync_maindata(
+    State(state): State<AppState>,
+    Query(q): Query<SyncMaindataQuery>,
+) -> impl IntoResponse {
+    let entries = {
+        let reg = state.registry.read().await;
+        reg.iter().cloned().collect::<Vec<_>>()
+    };
+    let rid = sync_rid_for_entries(&entries);
+    let full_update = q.rid.unwrap_or(0) != rid;
+    let mut torrents = serde_json::Map::new();
+    if full_update {
+        for entry in &entries {
+            torrents.insert(
+                entry.info_hash.clone(),
+                serde_json::to_value(qbit_torrent_info(&state, entry).await).unwrap(),
+            );
+        }
+    }
     let resp = serde_json::json!({
-        "rid": 1,
-        "full_update": true,
+        "rid": rid,
+        "full_update": full_update,
         "torrents": torrents,
         "torrents_removed": [],
         "server_state": QbServerState {
@@ -1416,6 +1424,66 @@ async fn torrent_limit_map(
         .map(|entry| (entry.info_hash.clone(), serde_json::json!(0)))
         .collect::<serde_json::Map<_, _>>();
     (StatusCode::OK, Json(serde_json::Value::Object(limits)))
+}
+
+async fn qbit_torrent_info(state: &AppState, e: &rt_session::TorrentEntry) -> QbTorrentInfo {
+    let progress = torrent_progress(e.total_length, e.amount_left, e.completed_at.is_some());
+    let (tracker, trackers_count) = if let Some(engine) = &state.engine {
+        match engine.torrent_metadata(e.info_hash.clone()).await {
+            Ok(meta) => (
+                meta.trackers.first().cloned().unwrap_or_default(),
+                meta.trackers.len() as u32,
+            ),
+            Err(_) => (String::new(), 0),
+        }
+    } else {
+        (String::new(), 0)
+    };
+    QbTorrentInfo {
+        hash: e.info_hash.clone(),
+        name: e.name.clone(),
+        state: to_qbit_state(e.state.as_str()).to_owned(),
+        size: e.total_length as i64,
+        downloaded: e.stats.downloaded as i64,
+        uploaded: e.stats.uploaded as i64,
+        ratio: e.stats.ratio(),
+        save_path: format!("{}/", e.save_path.trim_end_matches('/')),
+        category: e.category.clone().unwrap_or_default(),
+        tags: e.tags.join(","),
+        added_on: e.added_at as i64,
+        completion_on: e.completed_at.map(|t| t as i64).unwrap_or(-1),
+        num_leechs: 0,
+        num_seeds: 0,
+        dlspeed: 0,
+        upspeed: 0,
+        eta: -1,
+        progress,
+        priority: 0,
+        amount_left: e.amount_left as i64,
+        auto_tmm: false,
+        tracker,
+        trackers_count,
+    }
+}
+
+fn sync_rid_for_entries(entries: &[rt_session::TorrentEntry]) -> i64 {
+    let mut hasher = DefaultHasher::new();
+    for entry in entries {
+        entry.info_hash.hash(&mut hasher);
+        entry.name.hash(&mut hasher);
+        entry.state.hash(&mut hasher);
+        entry.total_length.hash(&mut hasher);
+        entry.amount_left.hash(&mut hasher);
+        entry.save_path.hash(&mut hasher);
+        entry.category.hash(&mut hasher);
+        entry.tags.hash(&mut hasher);
+        entry.stats.downloaded.hash(&mut hasher);
+        entry.stats.uploaded.hash(&mut hasher);
+        entry.added_at.hash(&mut hasher);
+        entry.completed_at.hash(&mut hasher);
+    }
+    let rid = (hasher.finish() & 0x7fff_ffff_ffff_ffff) as i64;
+    rid.max(1)
 }
 
 fn extract_hashes_from_str(s: &str) -> Vec<String> {
@@ -1919,6 +1987,45 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["full_update"], true);
+        assert!(v["rid"].as_i64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn sync_maindata_uses_stable_rid_for_unchanged_registry() {
+        let hash = "9".repeat(40);
+        let app = build_qbit_router(make_state_with(&hash).await);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/qb/v2/sync/maindata")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let first: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let rid = first["rid"].as_i64().unwrap();
+        assert_eq!(first["full_update"], true);
+        assert_eq!(first["torrents"].as_object().unwrap().len(), 1);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/qb/v2/sync/maindata?rid={rid}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let second: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(second["rid"].as_i64().unwrap(), rid);
+        assert_eq!(second["full_update"], false);
+        assert!(second["torrents"].as_object().unwrap().is_empty());
     }
 
     #[tokio::test]

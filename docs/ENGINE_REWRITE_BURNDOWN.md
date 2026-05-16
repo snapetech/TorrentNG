@@ -76,7 +76,7 @@ This is the working checklist for finishing the native Rust engine rewrite. It i
 ## 7. Compatibility APIs
 
 - [ ] Keep qBit compatibility, but back it with durable engine state instead of ad hoc fallback state.
-- [ ] Implement qBit sync delta semantics with stable `rid`.
+- [x] Implement qBit sync delta semantics with stable `rid`.
 - [ ] Map qBit files/trackers/pieces to real engine metadata and piece state.
 - [ ] Keep Transmission RPC compatible with durable engine state.
 - [ ] Keep Deluge compatibility as best-effort facade.
