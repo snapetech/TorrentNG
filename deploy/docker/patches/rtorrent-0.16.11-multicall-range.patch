@@ -1,5 +1,5 @@
 diff --git a/src/command_events.cc b/src/command_events.cc
-index 23e262c..0742c30 100644
+index 23e262c..917246b 100644
 --- a/src/command_events.cc
 +++ b/src/command_events.cc
 @@ -1,6 +1,8 @@
@@ -11,7 +11,7 @@ index 23e262c..0742c30 100644
  #include <cstdio>
  #include <torrent/rate.h>
  #include <torrent/hash_string.h>
-@@ -285,6 +287,125 @@ d_multicall_filtered(const torrent::Object::list_type& args) {
+@@ -285,6 +287,123 @@ d_multicall_filtered(const torrent::Object::list_type& args) {
    return resultRaw;
  }
  
@@ -111,15 +111,13 @@ index 23e262c..0742c30 100644
 +  ++arg; // skip to first command
 +
 +  for (auto itr = (*view_itr)->begin_visible(); itr != (*view_itr)->end_visible(); ++itr) {
-+    auto target = rpc::make_target(*itr);
-+    const char down_rate_command[] = "d.down.rate=";
-+    const char up_rate_command[] = "d.up.rate=";
-+    const int64_t down_rate = rpc::parse_command(target, down_rate_command, down_rate_command + sizeof(down_rate_command) - 1).first.as_value();
-+    const int64_t up_rate   = rpc::parse_command(target, up_rate_command, up_rate_command + sizeof(up_rate_command) - 1).first.as_value();
++    const int64_t down_rate = (*itr)->info()->down_rate()->rate();
++    const int64_t up_rate   = (*itr)->info()->up_rate()->rate();
 +
 +    if (down_rate <= 0 && up_rate <= 0)
 +      continue;
 +
++    auto target = rpc::make_target(*itr);
 +    torrent::Object::list_type& row = result.insert(result.end(), torrent::Object::create_list())->as_list();
 +
 +    for (auto command = arg; command != args.end(); ++command) {
@@ -137,7 +135,7 @@ index 23e262c..0742c30 100644
  static void
  call_watch_command(const std::string& command, const std::string& path) {
    rpc::commands.call_catch(command.c_str(), rpc::make_target(), path);
-@@ -342,6 +463,8 @@ initialize_command_events() {
+@@ -342,6 +461,8 @@ initialize_command_events() {
    CMD2_ANY_LIST    ("download_list",       std::bind(&apply_download_list, std::placeholders::_2));
    CMD2_ANY_LIST    ("d.multicall2",        std::bind(&d_multicall, std::placeholders::_2));
    CMD2_ANY_LIST    ("d.multicall.filtered", std::bind(&d_multicall_filtered, std::placeholders::_2));
@@ -146,7 +144,7 @@ index 23e262c..0742c30 100644
  
    CMD2_ANY_LIST    ("directory.watch.added", std::bind(&directory_watch_added, std::placeholders::_2));
  
-@@ -355,4 +478,6 @@ initialize_command_events() {
+@@ -355,4 +476,6 @@ initialize_command_events() {
    rpc::rpc.mark_safe("download_list");
    rpc::rpc.mark_safe("d.multicall2");
    rpc::rpc.mark_safe("d.multicall.filtered");

@@ -43,12 +43,12 @@ This is the working checklist for finishing the native Rust engine rewrite. It i
 
 ## 4. Tracker Correctness
 
-- [ ] Persist tracker state across restart.
-- [ ] Persist uploaded/downloaded/left accounting per torrent.
+- [x] Persist tracker state across restart.
+- [x] Persist uploaded/downloaded/left accounting per torrent.
 - [ ] Send `started`, `completed`, and `stopped` events exactly once where required.
-- [ ] Add restart jitter to prevent announce storms.
+- [x] Add restart jitter to prevent announce storms.
 - [ ] Add scrape support/state where tracker supports it.
-- [ ] Classify tracker failures and warnings into durable state.
+- [x] Classify tracker failures and warnings into durable state.
 - [ ] Disable DHT/PEX/LSD by default for private torrents.
 - [ ] Add private-tracker accounting tests.
 

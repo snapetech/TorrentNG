@@ -42,6 +42,7 @@ use rt_storage::{
 use rt_tracker::{
     udp::{UdpAnnounceRequest, UdpAnnounceResponse, UdpConnectRequest, UdpConnectResponse},
     AnnounceRequest, AnnounceResponse, InfoHash, TrackerError, TrackerEvent, TrackerState,
+    TrackerStatus,
 };
 
 use crate::peer_id::OUR_PEER_ID;
@@ -276,6 +277,7 @@ impl TorrentTask {
 
     pub async fn run(mut self) {
         let restored = self.restore_fastresume().await;
+        self.persist_tracker_state().await;
         if self.paused {
             self.persist_progress().await;
             self.set_state(TorrentState::Paused).await;
@@ -426,6 +428,7 @@ impl TorrentTask {
                         }
                     }
                     any_success = true;
+                    self.persist_tracker_state().await;
                     if matches!(event, TrackerEvent::Started | TrackerEvent::Completed) {
                         self.tracker_event = TrackerEvent::Empty;
                     }
@@ -448,6 +451,7 @@ impl TorrentTask {
                         "tracker announce failed"
                     );
                     self.tracker_tiers[tier_idx][idx].on_failure(err);
+                    self.persist_tracker_state().await;
                 }
             }
         }
@@ -464,6 +468,7 @@ impl TorrentTask {
                 match self.announce_tracker(&url, TrackerEvent::Stopped).await {
                     Ok(resp) => {
                         self.tracker_tiers[tier_idx][idx].on_success(&resp);
+                        self.persist_tracker_state().await;
                     }
                     Err(err) => {
                         warn!(
@@ -473,6 +478,7 @@ impl TorrentTask {
                             "tracker stopped announce failed"
                         );
                         self.tracker_tiers[tier_idx][idx].on_failure(err);
+                        self.persist_tracker_state().await;
                     }
                 }
             }
@@ -974,6 +980,43 @@ impl TorrentTask {
         reg.get(&self.info_hash_hex)
             .map(|entry| (entry.stats.uploaded, entry.stats.downloaded))
             .unwrap_or((0, 0))
+    }
+
+    async fn persist_tracker_state(&self) {
+        let (uploaded, downloaded) = self.transfer_snapshot().await;
+        let left = self.picker.bytes_left() as i64;
+        let now = Instant::now();
+        let mut rows = Vec::new();
+        for (tier_idx, tier) in self.tracker_tiers.iter().enumerate() {
+            for (tracker_idx, tracker) in tier.iter().enumerate() {
+                rows.push(rt_db::TorrentTrackerRow {
+                    info_hash: self.info_hash_hex.clone(),
+                    tracker_index: tracker_idx as i64,
+                    tier: tier_idx as i64,
+                    url: tracker.url.clone(),
+                    status: tracker_status_label(&tracker.status).to_owned(),
+                    last_announce_at: instant_to_unix(tracker.last_announce, now),
+                    next_announce_at: instant_to_unix(tracker.next_announce, now),
+                    last_success_at: instant_to_unix(tracker.last_success, now),
+                    failure_reason: tracker_failure_reason(&tracker.status),
+                    warning_message: tracker_warning_message(&tracker.status),
+                    seeders: tracker.scrape_complete.map(|value| value as i64),
+                    leechers: tracker.scrape_incomplete.map(|value| value as i64),
+                    completed: None,
+                    uploaded: uploaded as i64,
+                    downloaded: downloaded as i64,
+                    left_bytes: left,
+                });
+            }
+        }
+        let mut db = self.db.lock().expect("database mutex poisoned");
+        if let Err(e) = rt_db::replace_torrent_trackers(&mut db, &self.info_hash_hex, &rows) {
+            warn!(
+                torrent = %self.info_hash_hex,
+                err = %e,
+                "failed to persist tracker state"
+            );
+        }
     }
 
     fn schedule_trackers_now(&mut self) {
@@ -1560,6 +1603,42 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn instant_to_unix(instant: Option<Instant>, now: Instant) -> Option<i64> {
+    let current = unix_now() as i64;
+    instant.map(|instant| {
+        if instant >= now {
+            current.saturating_add(instant.duration_since(now).as_secs() as i64)
+        } else {
+            current.saturating_sub(now.duration_since(instant).as_secs() as i64)
+        }
+    })
+}
+
+fn tracker_status_label(status: &TrackerStatus) -> &'static str {
+    match status {
+        TrackerStatus::NeverAnnounced => "never_announced",
+        TrackerStatus::Announcing => "announcing",
+        TrackerStatus::Working => "working",
+        TrackerStatus::Warning(_) => "warning",
+        TrackerStatus::Error(_) => "error",
+        TrackerStatus::Disabled => "disabled",
+    }
+}
+
+fn tracker_failure_reason(status: &TrackerStatus) -> Option<String> {
+    match status {
+        TrackerStatus::Error(err) => Some(err.to_string()),
+        _ => None,
+    }
+}
+
+fn tracker_warning_message(status: &TrackerStatus) -> Option<String> {
+    match status {
+        TrackerStatus::Warning(message) => Some(message.clone()),
+        _ => None,
+    }
 }
 
 /// Open a TCP connection, complete BEP 3 handshake, receive Piece messages.
@@ -2172,6 +2251,29 @@ mod tests {
         assert_eq!(tiers[0][0].url, "http://tracker-a/announce");
         assert_eq!(tiers[0][1].url, "http://tracker-b/announce");
         assert_eq!(tiers[1][0].url, "udp://tracker-c:6969/announce");
+    }
+
+    #[test]
+    fn tracker_status_persistence_fields_are_stable() {
+        assert_eq!(
+            tracker_status_label(&TrackerStatus::NeverAnnounced),
+            "never_announced"
+        );
+        assert_eq!(tracker_status_label(&TrackerStatus::Working), "working");
+
+        let warning = TrackerStatus::Warning("tracker says slow down".to_owned());
+        assert_eq!(tracker_status_label(&warning), "warning");
+        assert_eq!(
+            tracker_warning_message(&warning).as_deref(),
+            Some("tracker says slow down")
+        );
+
+        let failure = TrackerStatus::Error(TrackerError::Timeout);
+        assert_eq!(tracker_status_label(&failure), "error");
+        assert_eq!(
+            tracker_failure_reason(&failure).as_deref(),
+            Some("announce timed out")
+        );
     }
 
     #[test]
