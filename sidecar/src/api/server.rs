@@ -35,38 +35,38 @@ pub fn build_router(state: AppState) -> Router {
             get(handlers::list_torrents).post(handlers::add_torrent),
         )
         .route(
-            "/api/v1/torrents/:hash",
+            "/api/v1/torrents/{hash}",
             get(handlers::get_torrent)
                 .put(handlers::update_torrent)
                 .delete(handlers::delete_torrent),
         )
         .route(
-            "/api/v1/torrents/:hash/start",
+            "/api/v1/torrents/{hash}/start",
             post(handlers::torrent_start),
         )
-        .route("/api/v1/torrents/:hash/stop", post(handlers::torrent_stop))
+        .route("/api/v1/torrents/{hash}/stop", post(handlers::torrent_stop))
         .route(
-            "/api/v1/torrents/:hash/recheck",
+            "/api/v1/torrents/{hash}/recheck",
             post(handlers::torrent_recheck),
         )
         .route(
-            "/api/v1/torrents/:hash/reannounce",
+            "/api/v1/torrents/{hash}/reannounce",
             post(handlers::torrent_reannounce),
         )
         .route(
-            "/api/v1/torrents/:hash/trackers",
+            "/api/v1/torrents/{hash}/trackers",
             get(handlers::torrent_trackers).patch(handlers::patch_torrent_trackers),
         )
         .route(
-            "/api/v1/torrents/:hash/files",
+            "/api/v1/torrents/{hash}/files",
             get(handlers::torrent_files).patch(handlers::set_file_priorities),
         )
         .route(
-            "/api/v1/torrents/:hash/category",
+            "/api/v1/torrents/{hash}/category",
             put(handlers::set_torrent_category),
         )
         .route(
-            "/api/v1/torrents/:hash/tags",
+            "/api/v1/torrents/{hash}/tags",
             post(handlers::add_torrent_tags).delete(handlers::remove_torrent_tags),
         )
         .route(
@@ -74,15 +74,15 @@ pub fn build_router(state: AppState) -> Router {
             get(handlers::list_categories).post(handlers::upsert_category),
         )
         .route(
-            "/api/v1/categories/:name",
+            "/api/v1/categories/{name}",
             delete(handlers::delete_category),
         )
         .route(
             "/api/v1/tags",
             get(handlers::list_tags).post(handlers::create_tag),
         )
-        .route("/api/v1/tags/:name", delete(handlers::delete_tag))
-        .route("/api/v1/bulk/:action", post(handlers::bulk_action))
+        .route("/api/v1/tags/{name}", delete(handlers::delete_tag))
+        .route("/api/v1/bulk/{action}", post(handlers::bulk_action))
         .route("/api/v1/storage", get(handlers::storage_roots))
         .route("/api/v1/tracker-health", get(handlers::tracker_health))
         .route("/api/v1/engine", get(handlers::engine_diagnostics))
@@ -93,7 +93,7 @@ pub fn build_router(state: AppState) -> Router {
             get(handlers::list_saved_views).post(handlers::upsert_saved_view),
         )
         .route(
-            "/api/v1/saved-views/:id",
+            "/api/v1/saved-views/{id}",
             delete(handlers::delete_saved_view),
         )
         .route(
@@ -101,7 +101,7 @@ pub fn build_router(state: AppState) -> Router {
             get(handlers::list_ratio_groups).post(handlers::upsert_ratio_group),
         )
         .route(
-            "/api/v1/ratio-groups/:name",
+            "/api/v1/ratio-groups/{name}",
             post(handlers::apply_ratio_group).delete(handlers::delete_ratio_group),
         )
         .route(
@@ -114,10 +114,10 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/v1/rss-rules/test", post(handlers::test_rss_rules))
         .route("/api/v1/rss-rules/apply", post(handlers::apply_rss_rules))
-        .route("/api/v1/rss-rules/:id", delete(handlers::delete_rss_rule))
+        .route("/api/v1/rss-rules/{id}", delete(handlers::delete_rss_rule))
         .route("/api/v1/workflow-runs", get(handlers::list_workflow_runs))
         .route(
-            "/api/v1/workflows/:id",
+            "/api/v1/workflows/{id}",
             post(handlers::run_workflow).delete(handlers::delete_workflow),
         )
         .route(

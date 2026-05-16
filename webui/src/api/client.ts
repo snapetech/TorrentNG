@@ -230,6 +230,11 @@ export interface LiveStats {
   pex?: 'on' | 'off' | 'unknown' | string
 }
 
+export interface TransferInfo {
+  dl_info_speed: number
+  up_info_speed: number
+}
+
 export interface TrackerHealth {
   tracker: string
   torrent_count: number
@@ -526,6 +531,8 @@ export const api = {
   },
 
   storage: (): Promise<StorageResponse> => get('/storage'),
+
+  transferInfo: (): Promise<TransferInfo> => getRoot('/api/qb/v2/transfer/info'),
 
   trackerHealth: (): Promise<TrackerHealthResponse> => get('/tracker-health'),
 

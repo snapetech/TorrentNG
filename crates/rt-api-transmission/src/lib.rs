@@ -1,10 +1,20 @@
 use std::sync::Arc;
 
-use axum::{extract::State, http::HeaderMap, routing::post, Json, Router};
+use axum::{
+    extract::State,
+    http::{HeaderMap, HeaderValue, StatusCode},
+    response::IntoResponse,
+    routing::post,
+    Json, Router,
+};
+use base64::{engine::general_purpose, Engine as _};
 use rt_engine::EngineHandle;
+use rt_metainfo::{parse_magnet, parse_torrent};
 use rt_session::SessionRegistry;
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
+
+const SESSION_ID: &str = "rtorrentNG";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -39,91 +49,427 @@ async fn rpc(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<Value>,
-) -> Json<Value> {
+) -> impl IntoResponse {
+    if headers.get("x-transmission-session-id").is_none() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-transmission-session-id",
+            HeaderValue::from_static(SESSION_ID),
+        );
+        return (
+            StatusCode::CONFLICT,
+            headers,
+            Json(json!({"result":"missing session-id"})),
+        )
+            .into_response();
+    }
+
     let method = body
         .get("method")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    let args = body.get("arguments").cloned().unwrap_or_else(|| json!({}));
     let tag = body.get("tag").cloned();
-    let arguments = match method {
-        "session-get" => session_get(),
-        "torrent-get" => torrent_get(&state).await,
-        "torrent-start" | "torrent-stop" | "torrent-verify" | "torrent-reannounce" => json!({}),
-        _ => return response(tag, "method name not recognized", json!({})),
-    };
-
-    let mut payload = response(tag, "success", arguments).0;
-    if let Some(obj) = payload.as_object_mut() {
-        if let Some(session) = headers
-            .get("x-transmission-session-id")
-            .and_then(|h| h.to_str().ok())
-        {
-            obj.insert("session-id".to_owned(), Value::String(session.to_owned()));
+    let result = match method {
+        "session-get" => Ok(session_get(&state).await),
+        "session-stats" => Ok(session_stats(&state).await),
+        "session-set" | "torrent-set" | "queue-move-top" | "queue-move-up" | "queue-move-down"
+        | "queue-move-bottom" => Ok(json!({})),
+        "port-test" => Ok(json!({"port-is-open": true})),
+        "blocklist-update" => Ok(json!({"blocklist-size": 0})),
+        "free-space" => Ok(
+            json!({"path": args.get("path").and_then(Value::as_str).unwrap_or(""), "size-bytes": 0}),
+        ),
+        "torrent-get" => Ok(torrent_get(&state, &args).await),
+        "torrent-add" => torrent_add(&state, &args).await,
+        "torrent-set-location" => {
+            let Some(location) = args.get("location").and_then(Value::as_str) else {
+                return Json(response(tag.clone(), "missing location", json!({}))).into_response();
+            };
+            for hash in ids(&state, &args).await {
+                if let Some(engine) = &state.engine {
+                    let _ = engine
+                        .update_torrent_fields(hash, None, Some(std::path::PathBuf::from(location)))
+                        .await;
+                } else {
+                    let mut reg = state.registry.write().await;
+                    if let Some(entry) = reg.get_mut(&hash) {
+                        entry.save_path = location.to_owned();
+                    }
+                }
+            }
+            Ok(json!({}))
         }
+        "torrent-rename-path" => Ok(
+            json!({ "path": args.get("path").cloned().unwrap_or(Value::Null), "name": args.get("name").cloned().unwrap_or(Value::Null) }),
+        ),
+        "torrent-start" | "torrent-start-now" => {
+            for hash in ids(&state, &args).await {
+                if let Some(engine) = &state.engine {
+                    let _ = engine.resume_torrent(hash).await;
+                }
+            }
+            Ok(json!({}))
+        }
+        "torrent-stop" => {
+            for hash in ids(&state, &args).await {
+                if let Some(engine) = &state.engine {
+                    let _ = engine.pause_torrent(hash).await;
+                }
+            }
+            Ok(json!({}))
+        }
+        "torrent-verify" => {
+            for hash in ids(&state, &args).await {
+                if let Some(engine) = &state.engine {
+                    let _ = engine.recheck_torrent(hash).await;
+                }
+            }
+            Ok(json!({}))
+        }
+        "torrent-reannounce" => {
+            for hash in ids(&state, &args).await {
+                if let Some(engine) = &state.engine {
+                    let _ = engine.reannounce_torrent(hash).await;
+                }
+            }
+            Ok(json!({}))
+        }
+        "torrent-remove" => {
+            let delete_files = args
+                .get("delete-local-data")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            for hash in ids(&state, &args).await {
+                if let Some(engine) = &state.engine {
+                    let _ = engine.remove_torrent(hash, delete_files).await;
+                }
+            }
+            Ok(json!({}))
+        }
+        _ => Err("method name not recognized".to_owned()),
+    };
+    let (result, arguments) = match result {
+        Ok(arguments) => ("success".to_owned(), arguments),
+        Err(result) => (result, json!({})),
+    };
+    let mut response = json!({"result": result, "arguments": arguments});
+    if let Some(tag) = tag {
+        response["tag"] = tag;
     }
-    Json(payload)
+    Json(response).into_response()
 }
 
-fn session_get() -> Value {
+fn response(tag: Option<Value>, result: &str, arguments: Value) -> Value {
+    let mut response = json!({"result": result, "arguments": arguments});
+    if let Some(tag) = tag {
+        response["tag"] = tag;
+    }
+    response
+}
+
+async fn session_get(state: &AppState) -> Value {
     json!({
         "version": "rtorrentNG",
         "rpc-version": 17,
         "rpc-version-minimum": 1,
-        "download-dir": "/downloads",
+        "download-dir": default_download_dir(state).await,
         "config-dir": "/config",
         "start-added-torrents": true,
         "trash-original-torrent-files": false,
         "speed-limit-down-enabled": false,
         "speed-limit-up-enabled": false,
+        "dht-enabled": true,
+        "pex-enabled": true,
     })
 }
 
-async fn torrent_get(state: &AppState) -> Value {
+async fn session_stats(state: &AppState) -> Value {
+    let reg = state.registry.read().await;
+    let torrent_count = reg.iter().count();
+    let (downloaded, uploaded) = reg.iter().fold((0_u64, 0_u64), |(down, up), entry| {
+        (
+            down.saturating_add(entry.stats.downloaded),
+            up.saturating_add(entry.stats.uploaded),
+        )
+    });
+    json!({
+        "activeTorrentCount": torrent_count,
+        "downloadSpeed": 0,
+        "pausedTorrentCount": reg.iter().filter(|entry| matches!(entry.state.as_str(), "paused" | "stopped")).count(),
+        "torrentCount": torrent_count,
+        "uploadSpeed": 0,
+        "cumulative-stats": {
+            "downloadedBytes": downloaded,
+            "uploadedBytes": uploaded,
+            "filesAdded": torrent_count,
+            "sessionCount": 1,
+            "secondsActive": 0,
+        },
+        "current-stats": {
+            "downloadedBytes": downloaded,
+            "uploadedBytes": uploaded,
+            "filesAdded": torrent_count,
+            "sessionCount": 1,
+            "secondsActive": 0,
+        }
+    })
+}
+
+async fn torrent_get(state: &AppState, args: &Value) -> Value {
+    let fields = args
+        .get("fields")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| {
+            ["hashString", "name", "totalSize", "percentDone", "status"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        });
+    let requested = ids(state, args).await;
     let reg = state.registry.read().await;
     let torrents = reg
         .iter()
-        .map(|entry| {
-            let completed = entry.total_length.saturating_sub(entry.amount_left);
-            json!({
-                "hashString": entry.info_hash,
-                "name": entry.name,
-                "totalSize": entry.total_length,
-                "downloadedEver": entry.stats.downloaded,
-                "uploadedEver": entry.stats.uploaded,
-                "percentDone": if entry.total_length == 0 {
-                    0.0
-                } else {
-                    completed as f64 / entry.total_length as f64
-                },
-                "rateDownload": 0,
-                "rateUpload": 0,
-                "status": transmission_status(entry.state),
-                "downloadDir": entry.save_path,
-                "isFinished": entry.total_length > 0 && entry.amount_left == 0,
-            })
+        .filter(|entry| requested.is_empty() || requested.contains(&entry.info_hash))
+        .enumerate()
+        .map(|(idx, entry)| {
+            let mut obj = serde_json::Map::new();
+            for field in &fields {
+                let value = match field.as_str() {
+                    "id" => json!(idx + 1),
+                    "hashString" | "hash-string" => json!(entry.info_hash),
+                    "name" => json!(entry.name),
+                    "totalSize" | "total-size" => json!(entry.total_length),
+                    "leftUntilDone" | "left-until-done" => json!(entry.amount_left),
+                    "percentDone" | "percent-done" => {
+                        json!(percent_done(entry.total_length, entry.amount_left))
+                    }
+                    "downloadedEver" | "downloaded-ever" => json!(entry.stats.downloaded),
+                    "uploadedEver" | "uploaded-ever" => json!(entry.stats.uploaded),
+                    "uploadRatio" | "upload-ratio" => json!(entry.stats.ratio()),
+                    "rateDownload" | "rate-download" => json!(0),
+                    "rateUpload" | "rate-upload" => json!(0),
+                    "status" => json!(transmission_status(entry.state.as_str())),
+                    "downloadDir" | "download-dir" => json!(entry.save_path),
+                    "labels" => json!(entry.tags),
+                    "isFinished" | "is-finished" => json!(entry.completed_at.is_some()),
+                    "addedDate" | "added-date" => json!(entry.added_at),
+                    "doneDate" | "done-date" => json!(entry.completed_at.unwrap_or(0)),
+                    _ => Value::Null,
+                };
+                obj.insert(field.clone(), value);
+            }
+            Value::Object(obj)
         })
         .collect::<Vec<_>>();
     json!({ "torrents": torrents })
 }
 
-fn transmission_status(state: rt_session::TorrentState) -> i64 {
-    match state {
-        rt_session::TorrentState::Stopped | rt_session::TorrentState::Paused => 0,
-        rt_session::TorrentState::MetadataPending | rt_session::TorrentState::Queued => 1,
-        rt_session::TorrentState::Checking => 2,
-        rt_session::TorrentState::Downloading => 4,
-        rt_session::TorrentState::Seeding => 6,
-        rt_session::TorrentState::Error => 0,
+async fn torrent_add(state: &AppState, args: &Value) -> Result<Value, String> {
+    let Some(engine) = &state.engine else {
+        return Err("engine unavailable".to_owned());
+    };
+    let paused = args.get("paused").and_then(Value::as_bool).unwrap_or(false);
+    let download_dir = args
+        .get("download-dir")
+        .and_then(Value::as_str)
+        .map(std::path::PathBuf::from);
+    let labels = args
+        .get("labels")
+        .and_then(Value::as_array)
+        .map(|labels| {
+            labels
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let hash = if let Some(filename) = args.get("filename").and_then(Value::as_str) {
+        let magnet = parse_magnet(filename).map_err(|e| e.to_string())?;
+        engine
+            .add_magnet_with_labels(magnet, download_dir, paused, None, labels)
+            .await?
+    } else if let Some(metainfo) = args.get("metainfo").and_then(Value::as_str) {
+        let raw = general_purpose::STANDARD
+            .decode(metainfo)
+            .map_err(|e| e.to_string())?;
+        let meta = parse_torrent(&raw).map_err(|e| e.to_string())?;
+        engine
+            .add_torrent_with_labels(meta, download_dir, paused, None, labels)
+            .await?
+    } else {
+        return Err("missing filename or metainfo".to_owned());
+    };
+    Ok(json!({ "torrent-added": { "hashString": hash } }))
+}
+
+async fn ids(state: &AppState, args: &Value) -> Vec<String> {
+    let Some(values) = args.get("ids").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let reg = state.registry.read().await;
+    values
+        .iter()
+        .filter_map(|value| {
+            if let Some(hash) = value.as_str() {
+                Some(hash.to_owned())
+            } else {
+                value.as_u64().and_then(|id| {
+                    reg.iter()
+                        .nth(id.saturating_sub(1) as usize)
+                        .map(|entry| entry.info_hash.clone())
+                })
+            }
+        })
+        .collect()
+}
+
+async fn default_download_dir(state: &AppState) -> String {
+    let reg = state.registry.read().await;
+    let dir = reg
+        .iter()
+        .next()
+        .map(|entry| entry.save_path.clone())
+        .unwrap_or_else(|| "/downloads".to_owned());
+    dir
+}
+
+fn percent_done(total: u64, left: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        total.saturating_sub(left) as f64 / total as f64
     }
 }
 
-fn response(tag: Option<Value>, result: &str, arguments: Value) -> Json<Value> {
-    let mut payload = json!({
-        "result": result,
-        "arguments": arguments,
-    });
-    if let Some(tag) = tag {
-        payload["tag"] = tag;
+fn transmission_status(state: &str) -> i64 {
+    match state {
+        "paused" | "stopped" => 0,
+        "checking" => 2,
+        "downloading" | "metadata_pending" => 4,
+        "seeding" => 6,
+        _ => 0,
     }
-    Json(payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{body::Body, http::Request};
+    use rt_session::TorrentEntry;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn transmission_session_id_handshake() {
+        let state = AppState::new(Arc::new(RwLock::new(SessionRegistry::new())));
+        let app = build_transmission_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"method":"session-get"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert!(resp.headers().contains_key("x-transmission-session-id"));
+    }
+
+    #[tokio::test]
+    async fn transmission_torrent_get_projects_registry() {
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        {
+            let mut reg = registry.write().await;
+            let mut entry = TorrentEntry::new("a".repeat(40), "alpha".into(), "/data".into());
+            entry.total_length = 100;
+            entry.amount_left = 25;
+            reg.add(entry).unwrap();
+        }
+        let app = build_transmission_router(AppState::new(registry));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .header("content-type", "application/json")
+                    .header("x-transmission-session-id", SESSION_ID)
+                    .body(Body::from(
+                        r#"{"method":"torrent-get","arguments":{"fields":["hashString","name","percentDone"]}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["result"], "success");
+        assert_eq!(body["arguments"]["torrents"][0]["name"], "alpha");
+        assert_eq!(body["arguments"]["torrents"][0]["percentDone"], 0.75);
+    }
+
+    #[tokio::test]
+    async fn transmission_stats_and_location_are_supported() {
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        {
+            let mut reg = registry.write().await;
+            let entry = TorrentEntry::new("b".repeat(40), "beta".into(), "/old".into());
+            reg.add(entry).unwrap();
+        }
+        let app = build_transmission_router(AppState::new(Arc::clone(&registry)));
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .header("content-type", "application/json")
+                    .header("x-transmission-session-id", SESSION_ID)
+                    .body(Body::from(r#"{"method":"session-stats"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["arguments"]["torrentCount"], 1);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .header("content-type", "application/json")
+                    .header("x-transmission-session-id", SESSION_ID)
+                    .body(Body::from(format!(
+                        r#"{{"method":"torrent-set-location","arguments":{{"ids":["{}"],"location":"/new"}}}}"#,
+                        "b".repeat(40)
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            registry
+                .read()
+                .await
+                .get(&"b".repeat(40))
+                .unwrap()
+                .save_path,
+            "/new"
+        );
+    }
 }

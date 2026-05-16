@@ -94,6 +94,30 @@ pub async fn app_set_preferences() -> impl IntoResponse {
     StatusCode::OK
 }
 
+pub async fn app_shutdown() -> impl IntoResponse {
+    StatusCode::OK
+}
+
+pub async fn app_network_interface_list() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(vec![serde_json::json!({
+            "name": "Any interface",
+            "value": "",
+        })]),
+    )
+}
+
+pub async fn app_network_interface_address_list() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(vec![serde_json::json!({
+            "name": "All addresses",
+            "value": "",
+        })]),
+    )
+}
+
 pub async fn app_default_save_path(State(state): State<AppState>) -> impl IntoResponse {
     (StatusCode::OK, default_save_path(&state).await)
 }
@@ -512,6 +536,11 @@ pub async fn torrents_remove_trackers() -> impl IntoResponse {
     StatusCode::OK
 }
 
+/// `POST /api/qb/v2/torrents/addPeers`.
+pub async fn torrents_add_peers() -> impl IntoResponse {
+    StatusCode::OK
+}
+
 /// `GET /api/qb/v2/torrents/files`.
 pub async fn torrents_files(
     State(state): State<AppState>,
@@ -540,6 +569,11 @@ pub async fn torrents_files(
         }
         Err(_) => (StatusCode::NOT_FOUND, Json(Vec::<QbFileInfo>::new())),
     }
+}
+
+/// `GET /api/qb/v2/torrents/export`.
+pub async fn torrents_export() -> impl IntoResponse {
+    StatusCode::NOT_FOUND
 }
 
 /// `GET /api/qb/v2/torrents/properties`.
@@ -671,6 +705,16 @@ pub async fn torrents_rename(State(state): State<AppState>, body: String) -> imp
         return StatusCode::BAD_REQUEST;
     };
     update_torrent_fields(&state, &hash, Some(name), None).await
+}
+
+/// `POST /api/qb/v2/torrents/renameFile`.
+pub async fn torrents_rename_file() -> impl IntoResponse {
+    StatusCode::OK
+}
+
+/// `POST /api/qb/v2/torrents/renameFolder`.
+pub async fn torrents_rename_folder() -> impl IntoResponse {
+    StatusCode::OK
 }
 
 /// `POST /api/qb/v2/torrents/setLocation`.
@@ -1014,6 +1058,14 @@ pub async fn transfer_set_download_limit() -> impl IntoResponse {
 
 /// `POST /api/qb/v2/transfer/setUploadLimit`.
 pub async fn transfer_set_upload_limit() -> impl IntoResponse {
+    StatusCode::OK
+}
+
+pub async fn transfer_speed_limits_mode() -> impl IntoResponse {
+    (StatusCode::OK, "0")
+}
+
+pub async fn transfer_toggle_speed_limits_mode() -> impl IntoResponse {
     StatusCode::OK
 }
 
@@ -1930,6 +1982,94 @@ mod tests {
         let entry = reg.get(&hash).unwrap();
         assert_eq!(entry.category, None);
         assert_eq!(entry.tags, vec!["keep".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn qbit_alias_and_broad_compat_routes_are_registered() {
+        let app = build_qbit_router(AppState::new());
+        for path in [
+            "/api/v2/app/version",
+            "/api/qb/v2/auth/logout",
+            "/api/qb/v2/torrents/start",
+            "/api/qb/v2/torrents/stop",
+            "/api/qb/v2/torrents/filePrio",
+            "/api/qb/v2/torrents/addTrackers",
+            "/api/qb/v2/torrents/addPeers",
+            "/api/qb/v2/torrents/removeTrackers",
+            "/api/qb/v2/torrents/renameFile",
+            "/api/qb/v2/torrents/renameFolder",
+            "/api/qb/v2/torrents/setAutoTMM",
+            "/api/qb/v2/torrents/toggleSequentialDownload",
+            "/api/qb/v2/transfer/toggleSpeedLimitsMode",
+            "/api/qb/v2/transfer/banPeers",
+            "/api/qb/v2/search/start",
+            "/api/qb/v2/rss/addFeed",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("content-type", "application/x-www-form-urlencoded")
+                        .body(Body::from("hashes=all"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(resp.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+
+        for path in [
+            "/api/v2/app/webapiVersion",
+            "/api/qb/v2/app/networkInterfaceList",
+            "/api/qb/v2/app/networkInterfaceAddressList",
+            "/api/qb/v2/sync/torrentPeers",
+            "/api/qb/v2/log/main",
+            "/api/qb/v2/log/peers",
+            "/api/qb/v2/search/status",
+            "/api/qb/v2/transfer/speedLimitsMode",
+            "/api/qb/v2/rss/items",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn create_tags_persists_empty_global_tags() {
+        let state = AppState::new();
+        let app = build_qbit_router(state);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/torrents/createTags")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("tags=hd,remux"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/qb/v2/torrents/tags")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let tags: Vec<String> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(tags, vec!["hd".to_owned(), "remux".to_owned()]);
     }
 
     #[tokio::test]

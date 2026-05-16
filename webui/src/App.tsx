@@ -157,9 +157,24 @@ export function App() {
     enabled: isAuthed,
     refetchInterval: 30_000,
   })
+  const { data: transferInfo } = useQuery({
+    queryKey: ['transfer-info', 'status-bar'],
+    queryFn: api.transferInfo,
+    enabled: isAuthed,
+    refetchInterval: 2_000,
+  })
 
   const handleStats = useCallback((stats: LiveStats) => setLiveStats(stats), [])
   useWebSocket(handleStats, isAuthed)
+
+  useEffect(() => {
+    if (!transferInfo) return
+    setLiveStats(prev => ({
+      ...prev,
+      download_speed: transferInfo.dl_info_speed ?? 0,
+      upload_speed: transferInfo.up_info_speed ?? 0,
+    }))
+  }, [transferInfo])
 
   useEffect(() => {
     if (!activeTab.isActive) return
