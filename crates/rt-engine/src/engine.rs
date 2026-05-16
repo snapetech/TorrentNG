@@ -954,10 +954,11 @@ impl Engine {
         category: Option<String>,
         tags: Vec<String>,
     ) -> CmdResult<String> {
-        let info_hash = magnet
+        let info_hash_hex = magnet
             .info_hash_v1
-            .ok_or_else(|| "only v1 btih magnets are currently supported".to_owned())?;
-        let info_hash_hex = hex::encode(info_hash);
+            .map(hex::encode)
+            .or_else(|| magnet.info_hash_v2.map(hex::encode))
+            .ok_or_else(|| "magnet is missing an info hash".to_owned())?;
         if self.torrent_chans.contains_key(&info_hash_hex)
             || self.registry.read().await.get(&info_hash_hex).is_some()
         {
@@ -1009,16 +1010,17 @@ impl Engine {
             let db = self.db.lock().expect("database mutex poisoned");
             rt_db::upsert(&db, &row).map_err(|e| e.to_string())?;
         }
-        {
+
+        if let Some(info_hash) = magnet.info_hash_v1 {
             let _cmd_tx = self.spawn_metadata_task(
                 info_hash,
                 info_hash_hex.clone(),
                 magnet.trackers.clone(),
                 paused,
             );
-        }
-        if !paused {
-            self.register_dht_torrent(info_hash, &info_hash_hex).await;
+            if !paused {
+                self.register_dht_torrent(info_hash, &info_hash_hex).await;
+            }
         }
         self.append_session_event(
             Some(&info_hash_hex),
@@ -1027,6 +1029,7 @@ impl Engine {
             serde_json::json!({
                 "paused": paused,
                 "trackers": magnet.trackers,
+                "v2_only": magnet.info_hash_v1.is_none(),
             }),
         );
         info!(torrent = %info_hash_hex, paused, "magnet added as metadata pending");
@@ -3337,6 +3340,58 @@ mod tests {
         assert_eq!(job.state, JOB_STATE_COMPLETED);
         assert_eq!(job.done, 1);
         assert!(job.invalid_pieces.is_empty());
+    }
+
+    #[tokio::test]
+    async fn add_v2_only_magnet_persists_metadata_placeholder() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.download_dir = temp.path().join("downloads");
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        let (_tx, rx) = mpsc::channel(1);
+        let mut engine = Engine {
+            config: Arc::new(config),
+            registry: Arc::clone(&registry),
+            db: Arc::new(Mutex::new(conn)),
+            cmd_rx: rx,
+            cmd_tx: mpsc::channel(1).0,
+            torrent_chans: HashMap::new(),
+            torrent_tasks: HashMap::new(),
+            dht_tx: None,
+        };
+        let magnet = MagnetLink {
+            info_hash_v1: None,
+            info_hash_v2: Some([0x22; 32]),
+            display_name: Some("v2-only".to_owned()),
+            trackers: vec!["https://tracker.example/announce".to_owned()],
+        };
+
+        let hash = engine
+            .add_magnet(
+                magnet,
+                Some(temp.path().join("payload")),
+                false,
+                Some("movies".to_owned()),
+                vec!["v2".to_owned()],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(hash, hex::encode([0x22; 32]));
+        assert!(engine.torrent_chans.is_empty());
+        let reg = registry.read().await;
+        let entry = reg.get(&hash).unwrap();
+        assert_eq!(entry.name, "v2-only");
+        assert_eq!(entry.state, TorrentState::MetadataPending);
+        assert_eq!(entry.category.as_deref(), Some("movies"));
+        assert_eq!(entry.tags, vec!["v2".to_owned()]);
+        drop(reg);
+        let db = engine.db.lock().unwrap();
+        let row = rt_db::get(&db, &hash).unwrap();
+        assert_eq!(row.state, "metadata_pending");
+        assert_eq!(row.trackers, vec!["https://tracker.example/announce"]);
     }
 
     #[test]
