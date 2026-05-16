@@ -12,4 +12,4 @@ pub use plan::{
     StoragePlanStep,
 };
 pub use scheduler::{IoRequest, MountScheduler, SchedulerConfig};
-pub use verify::{PieceVerifier, VerifyResult};
+pub use verify::{PieceVerifier, V2FileHash, V2FileVerifier, VerifyResult};

@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use rt_hash::{merkle_root, BlockHash};
+use rt_path::SafeRelPath;
 use sha1::{Digest, Sha1};
 use tracing::instrument;
 
@@ -20,6 +22,14 @@ pub enum VerifyResult {
     Invalid,
     /// One or more files could not be read (missing, permission denied, etc.)
     Missing { file_index: u32, reason: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct V2FileHash {
+    pub file_index: u32,
+    pub path: SafeRelPath,
+    pub length: u64,
+    pub pieces_root: [u8; 32],
 }
 
 /// Verifies piece data against expected SHA-1 hashes by reading directly
@@ -131,6 +141,78 @@ impl<'a> PieceVerifier<'a> {
     }
 }
 
+/// Verifies BEP 52 file roots by reading each file in 16 KiB leaves and
+/// comparing the computed merkle root with the metainfo `pieces root`.
+pub struct V2FileVerifier<'a> {
+    storage_root: &'a Path,
+    scheduler: &'a MountScheduler,
+    files: &'a [V2FileHash],
+}
+
+impl<'a> V2FileVerifier<'a> {
+    pub const LEAF_SIZE: usize = 16 * 1024;
+
+    pub fn new(
+        storage_root: &'a Path,
+        scheduler: &'a MountScheduler,
+        files: &'a [V2FileHash],
+    ) -> Self {
+        Self {
+            storage_root,
+            scheduler,
+            files,
+        }
+    }
+
+    pub async fn verify_all(&self) -> Vec<(u32, VerifyResult)> {
+        let mut out = Vec::with_capacity(self.files.len());
+        for file in self.files {
+            out.push((file.file_index, self.verify_file(file).await));
+        }
+        out
+    }
+
+    #[instrument(skip(self, file), fields(file_index = file.file_index))]
+    pub async fn verify_file(&self, file: &V2FileHash) -> VerifyResult {
+        let actual = match self.file_root(file).await {
+            Ok(root) => root,
+            Err(e) => {
+                tracing::warn!(
+                    file_index = file.file_index,
+                    error = %e,
+                    "file read failed during v2 verify"
+                );
+                return VerifyResult::Missing {
+                    file_index: file.file_index,
+                    reason: e.to_string(),
+                };
+            }
+        };
+        if actual == file.pieces_root {
+            VerifyResult::Valid
+        } else {
+            tracing::warn!(file_index = file.file_index, "v2 file root mismatch");
+            VerifyResult::Invalid
+        }
+    }
+
+    async fn file_root(&self, file: &V2FileHash) -> Result<[u8; 32], StorageError> {
+        let path = file.path.resolve(self.storage_root);
+        let mut leaves = Vec::with_capacity((file.length as usize).div_ceil(Self::LEAF_SIZE));
+        let mut offset = 0u64;
+        while offset < file.length {
+            let len = (file.length - offset).min(Self::LEAF_SIZE as u64) as usize;
+            let data = scheduled_read(self.scheduler, IoClass::Recheck, &path, offset, len).await?;
+            leaves.push(BlockHash::of(&data).0);
+            offset += len as u64;
+        }
+        if leaves.is_empty() {
+            leaves.push(BlockHash::of(&[]).0);
+        }
+        Ok(merkle_root(&leaves))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,6 +235,17 @@ mod tests {
 
     fn piece_hash(data: &[u8]) -> [u8; 20] {
         Sha1::digest(data).into()
+    }
+
+    fn v2_file_root(content: &[u8]) -> [u8; 32] {
+        let mut leaves = Vec::new();
+        for chunk in content.chunks(V2FileVerifier::LEAF_SIZE) {
+            leaves.push(BlockHash::of(chunk).0);
+        }
+        if leaves.is_empty() {
+            leaves.push(BlockHash::of(&[]).0);
+        }
+        merkle_root(&leaves)
     }
 
     #[tokio::test]
@@ -282,5 +375,45 @@ mod tests {
         assert_eq!(results[0].1, VerifyResult::Valid);
         assert_eq!(results[1].0, 2);
         assert_eq!(results[1].1, VerifyResult::Valid);
+    }
+
+    #[tokio::test]
+    async fn v2_file_verify_accepts_matching_file_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let content: Vec<u8> = (0..(V2FileVerifier::LEAF_SIZE + 17))
+            .map(|idx| idx as u8)
+            .collect();
+        std::fs::write(dir.path().join("data.bin"), &content).unwrap();
+
+        let file = V2FileHash {
+            file_index: 3,
+            path: SafeRelPath::from_name("data.bin", false).unwrap(),
+            length: content.len() as u64,
+            pieces_root: v2_file_root(&content),
+        };
+        let sched = ssd_scheduler();
+        let verifier = V2FileVerifier::new(dir.path(), &sched, std::slice::from_ref(&file));
+
+        assert_eq!(verifier.verify_file(&file).await, VerifyResult::Valid);
+        assert_eq!(
+            verifier.verify_all().await,
+            vec![(file.file_index, VerifyResult::Valid)]
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_file_verify_rejects_wrong_file_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("data.bin"), b"content").unwrap();
+        let file = V2FileHash {
+            file_index: 0,
+            path: SafeRelPath::from_name("data.bin", false).unwrap(),
+            length: 7,
+            pieces_root: [0u8; 32],
+        };
+        let sched = ssd_scheduler();
+        let verifier = V2FileVerifier::new(dir.path(), &sched, std::slice::from_ref(&file));
+
+        assert_eq!(verifier.verify_file(&file).await, VerifyResult::Invalid);
     }
 }

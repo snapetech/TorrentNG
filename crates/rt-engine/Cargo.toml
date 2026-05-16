@@ -41,3 +41,4 @@ rt-metrics     = { path = "../rt-metrics" }
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile.workspace = true
+rt-hash = { path = "../rt-hash" }

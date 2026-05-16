@@ -1367,6 +1367,7 @@ dependencies = [
  "rt-db",
  "rt-dht",
  "rt-fastresume",
+ "rt-hash",
  "rt-metainfo",
  "rt-metrics",
  "rt-path",
@@ -1533,6 +1534,7 @@ name = "rt-storage"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "rt-hash",
  "rt-path",
  "rt-piece-map",
  "sha1",

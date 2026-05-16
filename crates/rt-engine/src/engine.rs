@@ -18,8 +18,10 @@ use rt_config::Config;
 use rt_db::TorrentRow;
 use rt_fastresume::{FastresumeStore, PieceState};
 use rt_metainfo::{parse_torrent, MagnetLink, TorrentMeta, TorrentMetaV1, TorrentMetaV2};
+use rt_path::{StorageProfile, StorageRootId};
 use rt_peer_wire::handshake::{Handshake, HANDSHAKE_LEN};
 use rt_session::{SessionRegistry, TorrentEntry, TorrentState, TransferStats};
+use rt_storage::{MountScheduler, SchedulerConfig, V2FileHash, V2FileVerifier, VerifyResult};
 
 use crate::command::{
     CmdResult, EngineCmd, EngineGlobalLimits, EnginePeerSnapshot, EnginePieceState, EngineStats,
@@ -51,6 +53,7 @@ const JOB_STATE_RUNNING: &str = "running";
 const JOB_STATE_PAUSED: &str = "paused";
 const JOB_STATE_CANCELLED: &str = "cancelled";
 const JOB_STATE_FAILED: &str = "failed";
+const JOB_STATE_COMPLETED: &str = "completed";
 const SETTING_GLOBAL_DOWNLOAD_LIMIT: &str = "transfer.download_limit";
 const SETTING_GLOBAL_UPLOAD_LIMIT: &str = "transfer.upload_limit";
 const SETTING_GLOBAL_SPEED_LIMITS_MODE: &str = "transfer.speed_limits_mode";
@@ -675,6 +678,12 @@ impl Engine {
                         },
                     )
                     .await;
+                let result = if result.is_err() && self.is_pure_v2_torrent(&info_hash) {
+                    self.recheck_pure_v2_torrent(&info_hash, job_id.clone())
+                        .await
+                } else {
+                    result
+                };
                 if result.is_ok() {
                     if let Some(job_id) = &job_id {
                         self.update_job_state(
@@ -1477,6 +1486,121 @@ impl Engine {
             }
         }
         Ok(metadata)
+    }
+
+    fn is_pure_v2_torrent(&self, info_hash: &str) -> bool {
+        let blob_path = torrent_blob_path(&self.config, info_hash);
+        let Ok(raw) = std::fs::read(blob_path) else {
+            return false;
+        };
+        matches!(parse_torrent(&raw), Ok(TorrentMeta::V2(_)))
+    }
+
+    async fn recheck_pure_v2_torrent(
+        &self,
+        info_hash: &str,
+        job_id: Option<String>,
+    ) -> CmdResult<()> {
+        let blob_path = torrent_blob_path(&self.config, info_hash);
+        let raw = std::fs::read(&blob_path).map_err(|e| e.to_string())?;
+        let meta = match parse_torrent(&raw).map_err(|e| e.to_string())? {
+            TorrentMeta::V2(meta) => meta,
+            _ => return Err(format!("torrent {info_hash} has no active torrent task")),
+        };
+        let save_root = {
+            let reg = self.registry.read().await;
+            let entry = reg
+                .get(info_hash)
+                .ok_or_else(|| format!("torrent {info_hash} not found"))?;
+            PathBuf::from(&entry.save_path)
+        };
+        self.set_registry_state(info_hash, TorrentState::Checking, None)
+            .await?;
+        if let Some(job_id) = &job_id {
+            self.update_job_state(
+                job_id,
+                JOB_STATE_RUNNING,
+                None,
+                Some("pure v2 recheck started"),
+            );
+        }
+
+        let files = meta
+            .files
+            .iter()
+            .map(|file| V2FileHash {
+                file_index: file.index,
+                path: file.path.clone(),
+                length: file.length,
+                pieces_root: file.pieces_root,
+            })
+            .collect::<Vec<_>>();
+        let scheduler = MountScheduler::new(
+            StorageRootId::new(),
+            &SchedulerConfig {
+                profile: StorageProfile::Unknown,
+                ..Default::default()
+            },
+        );
+        let results = V2FileVerifier::new(&save_root, &scheduler, &files)
+            .verify_all()
+            .await;
+        let invalid_files = results
+            .iter()
+            .filter_map(|(file_index, result)| {
+                (!matches!(result, VerifyResult::Valid)).then_some(*file_index as i64)
+            })
+            .collect::<Vec<_>>();
+        if let Some(job_id) = &job_id {
+            self.persist_pure_v2_recheck_job(
+                job_id,
+                results.len() as i64,
+                files.len() as i64,
+                &invalid_files,
+            );
+        }
+        if invalid_files.is_empty() {
+            self.set_registry_state(info_hash, TorrentState::Seeding, Some(meta.total_length()))
+                .await?;
+        } else {
+            self.set_registry_state(info_hash, TorrentState::Paused, None)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn set_registry_state(
+        &self,
+        info_hash: &str,
+        state: TorrentState,
+        completed_length: Option<u64>,
+    ) -> CmdResult<()> {
+        let mut reg = self.registry.write().await;
+        let entry = reg
+            .get_mut(info_hash)
+            .ok_or_else(|| format!("torrent {info_hash} not found"))?;
+        if let Some(total) = completed_length {
+            entry.total_length = total;
+            entry.amount_left = 0;
+            if entry.completed_at.is_none() {
+                entry.completed_at = Some(unix_now_i64() as u64);
+            }
+        }
+        let _ = entry.transition(state);
+        let mut row = {
+            let db = self.db.lock().expect("database mutex poisoned");
+            rt_db::get(&db, info_hash).map_err(|e| e.to_string())?
+        };
+        row.state = entry.state.as_str().to_owned();
+        row.completed_at = entry.completed_at.map(|value| value as i64);
+        row.downloaded = entry
+            .total_length
+            .saturating_sub(entry.amount_left)
+            .min(i64::MAX as u64) as i64;
+        drop(reg);
+        let db = self.db.lock().expect("database mutex poisoned");
+        rt_db::upsert(&db, &row).map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     async fn update_torrent_labels_inner(
@@ -2406,6 +2530,58 @@ impl Engine {
             }
         }
     }
+
+    fn persist_pure_v2_recheck_job(
+        &self,
+        job_id: &str,
+        done: i64,
+        total: i64,
+        invalid_files: &[i64],
+    ) {
+        let now = unix_now_i64();
+        let mut job = {
+            let db = self.db.lock().expect("database mutex poisoned");
+            match rt_db::get_job(&db, job_id) {
+                Ok(job) => job,
+                Err(e) => {
+                    warn!(job_id, err = %e, "failed to load pure v2 recheck job");
+                    return;
+                }
+            }
+        };
+        job.total = total;
+        job.done = done;
+        job.checkpoint = done;
+        job.file_index = Some(done);
+        job.piece_index = None;
+        job.byte_offset = None;
+        job.invalid_pieces = invalid_files.to_vec();
+        job.state = JOB_STATE_COMPLETED.to_owned();
+        job.updated_at = now;
+        job.finished_at = Some(now);
+        let event = rt_db::JobEventRow {
+            event_id: None,
+            job_id: job_id.to_owned(),
+            occurred_at: now,
+            kind: "check_completed".to_owned(),
+            message: Some("pure v2 file-root recheck completed".to_owned()),
+            payload: serde_json::json!({
+                "done": done,
+                "total": total,
+                "invalid_files": invalid_files,
+                "state": JOB_STATE_COMPLETED,
+            })
+            .to_string(),
+        };
+        let db = self.db.lock().expect("database mutex poisoned");
+        if let Err(e) = rt_db::upsert_job(&db, &job) {
+            warn!(job_id, err = %e, "failed to persist pure v2 recheck job");
+            return;
+        }
+        if let Err(e) = rt_db::append_job_event(&db, &event) {
+            warn!(job_id, err = %e, "failed to append pure v2 recheck event");
+        }
+    }
 }
 
 pub(crate) fn row_from_entry(entry: &TorrentEntry, meta: &TorrentMeta) -> TorrentRow {
@@ -2897,6 +3073,7 @@ fn prune_empty_dirs(
 mod tests {
     use super::*;
     use rt_bencode::{encode, BValue};
+    use rt_hash::{merkle_root, BlockHash};
     use rt_metainfo::TorrentFileV1;
     use rt_path::SafeRelPath;
 
@@ -2942,10 +3119,13 @@ mod tests {
     }
 
     fn raw_v2_torrent() -> Vec<u8> {
-        let pieces_root = vec![0xAB; 32];
+        raw_v2_torrent_with_root([0xAB; 32], 65_536)
+    }
+
+    fn raw_v2_torrent_with_root(pieces_root: [u8; 32], length: i64) -> Vec<u8> {
         let leaf = BValue::Dict({
             let mut pairs: Vec<(&[u8], BValue<'_>)> = vec![
-                (b"length", BValue::Int(65_536)),
+                (b"length", BValue::Int(length)),
                 (b"pieces root", BValue::Bytes(&pieces_root)),
             ];
             pairs.sort_by(|a, b| a.0.cmp(b.0));
@@ -2966,6 +3146,17 @@ mod tests {
         ];
         pairs.sort_by(|a, b| a.0.cmp(b.0));
         encode(&BValue::Dict(pairs))
+    }
+
+    fn v2_file_root(content: &[u8]) -> [u8; 32] {
+        let mut leaves = content
+            .chunks(V2FileVerifier::LEAF_SIZE)
+            .map(|chunk| BlockHash::of(chunk).0)
+            .collect::<Vec<_>>();
+        if leaves.is_empty() {
+            leaves.push(BlockHash::of(&[]).0);
+        }
+        merkle_root(&leaves)
     }
 
     #[test]
@@ -3085,6 +3276,67 @@ mod tests {
         assert_eq!(projected.piece_count, 4);
         assert_eq!(projected.piece_states.len(), 4);
         assert_eq!(projected.files[0].path, "v2dir/data.bin");
+    }
+
+    #[tokio::test]
+    async fn pure_v2_recheck_verifies_file_roots_without_torrent_task() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.daemon.session_dir = temp.path().join("session");
+        std::fs::create_dir_all(torrent_blob_dir(&config)).unwrap();
+
+        let content: Vec<u8> = (0..(V2FileVerifier::LEAF_SIZE + 11))
+            .map(|idx| idx as u8)
+            .collect();
+        let raw = raw_v2_torrent_with_root(v2_file_root(&content), content.len() as i64);
+        let meta = parse_torrent(&raw).unwrap();
+        let info_hash = meta_info_hash_hex(&meta);
+        let save_root = temp.path().join("downloads");
+        std::fs::create_dir_all(save_root.join("v2dir")).unwrap();
+        std::fs::write(save_root.join("v2dir").join("data.bin"), &content).unwrap();
+        std::fs::write(torrent_blob_path(&config, &info_hash), &raw).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let mut entry = TorrentEntry::new(
+            info_hash.clone(),
+            "v2dir".into(),
+            save_root.to_string_lossy().into(),
+        );
+        entry.total_length = content.len() as u64;
+        entry.amount_left = content.len() as u64;
+        entry.state = TorrentState::Paused;
+        rt_db::upsert(&conn, &row_from_entry(&entry, &meta)).unwrap();
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        registry.write().await.add(entry).unwrap();
+        let (_tx, rx) = mpsc::channel(1);
+        let engine = Engine {
+            config: Arc::new(config),
+            registry: Arc::clone(&registry),
+            db: Arc::new(Mutex::new(conn)),
+            cmd_rx: rx,
+            cmd_tx: mpsc::channel(1).0,
+            torrent_chans: HashMap::new(),
+            torrent_tasks: HashMap::new(),
+            dht_tx: None,
+        };
+        let job_id = engine.create_recheck_job(&info_hash).unwrap();
+
+        engine
+            .recheck_pure_v2_torrent(&info_hash, Some(job_id.clone()))
+            .await
+            .unwrap();
+
+        let reg = registry.read().await;
+        let entry = reg.get(&info_hash).unwrap();
+        assert_eq!(entry.state, TorrentState::Seeding);
+        assert_eq!(entry.amount_left, 0);
+        drop(reg);
+        let db = engine.db.lock().unwrap();
+        let job = rt_db::get_job(&db, &job_id).unwrap();
+        assert_eq!(job.state, JOB_STATE_COMPLETED);
+        assert_eq!(job.done, 1);
+        assert!(job.invalid_pieces.is_empty());
     }
 
     #[test]
