@@ -22,6 +22,22 @@ const SESSION_ID: &str = "rtorrentNG";
 pub struct AppState {
     pub registry: Arc<RwLock<SessionRegistry>>,
     pub engine: Option<EngineHandle>,
+    pub session: Arc<RwLock<TransmissionSessionSettings>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransmissionSessionSettings {
+    pub queue_stalled_enabled: bool,
+    pub queue_stalled_minutes: i64,
+}
+
+impl Default for TransmissionSessionSettings {
+    fn default() -> Self {
+        Self {
+            queue_stalled_enabled: false,
+            queue_stalled_minutes: 30,
+        }
+    }
 }
 
 impl AppState {
@@ -29,6 +45,7 @@ impl AppState {
         Self {
             registry,
             engine: None,
+            session: Arc::new(RwLock::new(TransmissionSessionSettings::default())),
         }
     }
 
@@ -36,6 +53,7 @@ impl AppState {
         Self {
             registry,
             engine: Some(engine),
+            session: Arc::new(RwLock::new(TransmissionSessionSettings::default())),
         }
     }
 }
@@ -93,7 +111,8 @@ async fn rpc(
         "queue-move-up" => transmission_queue_move(&state, &args, QueueMove::Up).await,
         "queue-move-down" => transmission_queue_move(&state, &args, QueueMove::Down).await,
         "queue-move-bottom" => transmission_queue_move(&state, &args, QueueMove::Bottom).await,
-        "queue-stalled-enable" | "queue-stalled-disable" => Ok(json!({})),
+        "queue-stalled-enable" => queue_stalled_set(&state, true).await,
+        "queue-stalled-disable" => queue_stalled_set(&state, false).await,
         "port-test" => Ok(json!({"port-is-open": true})),
         "blocklist-update" => Ok(json!({"blocklist-size": 0})),
         "free-space" => Ok(
@@ -405,6 +424,7 @@ fn response(tag: Option<Value>, result: &str, arguments: Value) -> Value {
 
 async fn session_get(state: &AppState) -> Value {
     let limits = transmission_global_limits(state).await;
+    let session = state.session.read().await.clone();
     json!({
         "version": "rtorrentNG",
         "rpc-version": 17,
@@ -424,8 +444,8 @@ async fn session_get(state: &AppState) -> Value {
         "download-queue-size": 0,
         "seed-queue-enabled": false,
         "seed-queue-size": 0,
-        "queue-stalled-enabled": false,
-        "queue-stalled-minutes": 30,
+        "queue-stalled-enabled": session.queue_stalled_enabled,
+        "queue-stalled-minutes": session.queue_stalled_minutes,
         "peer-limit-global": 0,
         "peer-limit-per-torrent": 0,
         "script-torrent-added-enabled": false,
@@ -885,36 +905,46 @@ fn percent_done(total: u64, left: u64) -> f64 {
 }
 
 async fn session_set(state: &AppState, args: &Value) -> Result<Value, String> {
-    let Some(engine) = &state.engine else {
-        return Ok(json!({}));
-    };
-    let mut limits = engine.global_limits().await.unwrap_or_default();
-    if let Some(value) = transmission_i64_arg(args, "speed-limit-down")
-        .or_else(|| transmission_i64_arg(args, "alt-speed-down"))
-    {
-        limits.download_limit = transmission_kib_to_bytes(value);
+    if let Some(engine) = &state.engine {
+        let mut limits = engine.global_limits().await.unwrap_or_default();
+        if let Some(value) = transmission_i64_arg(args, "speed-limit-down")
+            .or_else(|| transmission_i64_arg(args, "alt-speed-down"))
+        {
+            limits.download_limit = transmission_kib_to_bytes(value);
+        }
+        if let Some(value) = transmission_i64_arg(args, "speed-limit-up")
+            .or_else(|| transmission_i64_arg(args, "alt-speed-up"))
+        {
+            limits.upload_limit = transmission_kib_to_bytes(value);
+        }
+        if matches!(
+            transmission_bool_arg(args, "speed-limit-down-enabled"),
+            Some(false)
+        ) {
+            limits.download_limit = 0;
+        }
+        if matches!(
+            transmission_bool_arg(args, "speed-limit-up-enabled"),
+            Some(false)
+        ) {
+            limits.upload_limit = 0;
+        }
+        if let Some(enabled) = transmission_bool_arg(args, "alt-speed-enabled") {
+            limits.speed_limits_mode = enabled;
+        }
+        engine.update_global_limits(limits).await?;
     }
-    if let Some(value) = transmission_i64_arg(args, "speed-limit-up")
-        .or_else(|| transmission_i64_arg(args, "alt-speed-up"))
-    {
-        limits.upload_limit = transmission_kib_to_bytes(value);
+    if let Some(enabled) = transmission_bool_arg(args, "queue-stalled-enabled") {
+        state.session.write().await.queue_stalled_enabled = enabled;
     }
-    if matches!(
-        transmission_bool_arg(args, "speed-limit-down-enabled"),
-        Some(false)
-    ) {
-        limits.download_limit = 0;
+    if let Some(minutes) = transmission_i64_arg(args, "queue-stalled-minutes") {
+        state.session.write().await.queue_stalled_minutes = minutes.max(0);
     }
-    if matches!(
-        transmission_bool_arg(args, "speed-limit-up-enabled"),
-        Some(false)
-    ) {
-        limits.upload_limit = 0;
-    }
-    if let Some(enabled) = transmission_bool_arg(args, "alt-speed-enabled") {
-        limits.speed_limits_mode = enabled;
-    }
-    engine.update_global_limits(limits).await?;
+    Ok(json!({}))
+}
+
+async fn queue_stalled_set(state: &AppState, enabled: bool) -> Result<Value, String> {
+    state.session.write().await.queue_stalled_enabled = enabled;
     Ok(json!({}))
 }
 
@@ -1124,6 +1154,45 @@ mod tests {
                 .save_path,
             "/new"
         );
+    }
+
+    #[tokio::test]
+    async fn transmission_queue_stalled_settings_roundtrip_without_engine() {
+        let app =
+            build_transmission_router(AppState::new(Arc::new(RwLock::new(SessionRegistry::new()))));
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .header("content-type", "application/json")
+                    .header("x-transmission-session-id", SESSION_ID)
+                    .body(Body::from(
+                        r#"{"method":"session-set","arguments":{"queue-stalled-enabled":true,"queue-stalled-minutes":7}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .header("content-type", "application/json")
+                    .header("x-transmission-session-id", SESSION_ID)
+                    .body(Body::from(r#"{"method":"session-get"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["arguments"]["queue-stalled-enabled"], true);
+        assert_eq!(body["arguments"]["queue-stalled-minutes"], 7);
     }
 
     #[tokio::test]
