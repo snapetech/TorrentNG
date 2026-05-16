@@ -8,7 +8,7 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose, Engine as _};
-use rt_engine::{EngineHandle, EngineTorrentMetadata};
+use rt_engine::{EngineHandle, EngineTorrentMetadata, QueueMove};
 use rt_metainfo::{parse_magnet, parse_torrent};
 use rt_session::SessionRegistry;
 use serde_json::{json, Value};
@@ -86,9 +86,10 @@ async fn rpc(
         "torrent-set-file-priorities" => torrent_set_file_priorities(&state, &args).await,
         "torrent-set-file-wanted" => torrent_set_file_wanted(&state, &args, true).await,
         "torrent-set-file-unwanted" => torrent_set_file_wanted(&state, &args, false).await,
-        "queue-move-top" | "queue-move-up" | "queue-move-down" | "queue-move-bottom" => {
-            Ok(json!({}))
-        }
+        "queue-move-top" => transmission_queue_move(&state, &args, QueueMove::Top).await,
+        "queue-move-up" => transmission_queue_move(&state, &args, QueueMove::Up).await,
+        "queue-move-down" => transmission_queue_move(&state, &args, QueueMove::Down).await,
+        "queue-move-bottom" => transmission_queue_move(&state, &args, QueueMove::Bottom).await,
         "queue-stalled-enable" | "queue-stalled-disable" => Ok(json!({})),
         "port-test" => Ok(json!({"port-is-open": true})),
         "blocklist-update" => Ok(json!({"blocklist-size": 0})),
@@ -282,6 +283,19 @@ async fn torrent_set_file_priorities(state: &AppState, args: &Value) -> Result<V
     Ok(json!({}))
 }
 
+async fn transmission_queue_move(
+    state: &AppState,
+    args: &Value,
+    queue_move: QueueMove,
+) -> Result<Value, String> {
+    let hashes = ids(state, args).await;
+    let Some(engine) = &state.engine else {
+        return Ok(json!({}));
+    };
+    engine.update_queue_order(hashes, queue_move).await?;
+    Ok(json!({}))
+}
+
 fn file_ids_arg(args: &Value, key: &str) -> Vec<u32> {
     args.get(key)
         .and_then(Value::as_array)
@@ -396,10 +410,14 @@ async fn torrent_get(state: &AppState, args: &Value) -> Value {
             .collect::<Vec<_>>()
     };
     let mut metadata = std::collections::HashMap::new();
+    let mut queue_positions = std::collections::HashMap::new();
     if let Some(engine) = &state.engine {
         for entry in &entries {
             if let Ok(meta) = engine.torrent_metadata(entry.info_hash.clone()).await {
                 metadata.insert(entry.info_hash.clone(), meta);
+            }
+            if let Ok(position) = engine.queue_priority(entry.info_hash.clone()).await {
+                queue_positions.insert(entry.info_hash.clone(), position);
             }
         }
     }
@@ -441,7 +459,12 @@ async fn torrent_get(state: &AppState, args: &Value) -> Value {
                     }
                     "isFinished" | "is-finished" => json!(entry.completed_at.is_some()),
                     "isStalled" | "is-stalled" => json!(false),
-                    "queuePosition" | "queue-position" => json!(idx),
+                    "queuePosition" | "queue-position" => {
+                        json!(queue_positions
+                            .get(&entry.info_hash)
+                            .copied()
+                            .unwrap_or(idx as i32))
+                    }
                     "recheckProgress" | "recheck-progress" => json!(0.0),
                     "seedRatioLimit" | "seed-ratio-limit" => json!(-1.0),
                     "seedRatioMode" | "seed-ratio-mode" => json!(0),
