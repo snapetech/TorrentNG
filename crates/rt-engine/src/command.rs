@@ -1,5 +1,5 @@
 /// Commands sent from the API layer down to the engine or individual torrent tasks.
-use std::path::PathBuf;
+use std::{net::SocketAddr, path::PathBuf};
 
 use tokio::sync::oneshot;
 
@@ -183,6 +183,11 @@ pub enum EngineCmd {
         info_hash: String,
         file_ids: Vec<u32>,
         priority: i64,
+        reply: oneshot::Sender<CmdResult<()>>,
+    },
+    AddPeers {
+        info_hash: String,
+        peers: Vec<SocketAddr>,
         reply: oneshot::Sender<CmdResult<()>>,
     },
     /// Snapshot runtime and durable metrics.

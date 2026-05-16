@@ -321,6 +321,19 @@ impl EngineHandle {
         rx.await.map_err(|_| "engine dropped reply".to_owned())?
     }
 
+    pub async fn add_peers(&self, info_hash: String, peers: Vec<SocketAddr>) -> CmdResult<()> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(EngineCmd::AddPeers {
+                info_hash,
+                peers,
+                reply,
+            })
+            .await
+            .map_err(|_| "engine shut down".to_owned())?;
+        rx.await.map_err(|_| "engine dropped reply".to_owned())?
+    }
+
     pub async fn shutdown(&self) {
         let _ = self.tx.send(EngineCmd::Shutdown).await;
     }
@@ -684,6 +697,14 @@ impl Engine {
                 let result = self
                     .update_file_priorities_inner(&info_hash, file_ids, priority)
                     .await;
+                let _ = reply.send(result);
+            }
+            EngineCmd::AddPeers {
+                info_hash,
+                peers,
+                reply,
+            } => {
+                let result = self.add_peers_inner(&info_hash, peers).await;
                 let _ = reply.send(result);
             }
 
@@ -1581,6 +1602,20 @@ impl Engine {
             .send_to_torrent(info_hash, TorrentCmd::ReloadFilePolicy)
             .await;
         Ok(())
+    }
+
+    async fn add_peers_inner(&self, info_hash: &str, peers: Vec<SocketAddr>) -> CmdResult<()> {
+        if peers.is_empty() {
+            return Ok(());
+        }
+        {
+            let reg = self.registry.read().await;
+            if reg.get(info_hash).is_none() {
+                return Err(format!("torrent {info_hash} not found"));
+            }
+        }
+        self.send_to_torrent(info_hash, TorrentCmd::NewPeers(peers))
+            .await
     }
 
     async fn send_to_torrent(&self, info_hash: &str, cmd: TorrentCmd) -> CmdResult<()> {
@@ -2603,6 +2638,45 @@ mod tests {
         let job = rt_db::get_job(&db, &job_id).unwrap();
         assert_eq!(job.state, JOB_STATE_CANCELLED);
         assert!(job.finished_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn add_peers_forwards_external_peers_to_torrent_task() {
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let (_tx, rx) = mpsc::channel(1);
+        let (torrent_tx, mut torrent_rx) = mpsc::channel(4);
+        let info_hash = "d".repeat(40);
+        let peer = "127.0.0.1:6881".parse::<SocketAddr>().unwrap();
+        let mut registry = SessionRegistry::new();
+        registry
+            .add(TorrentEntry::new(
+                info_hash.clone(),
+                "delta".to_owned(),
+                "/tmp".to_owned(),
+            ))
+            .unwrap();
+        let mut torrent_chans = HashMap::new();
+        torrent_chans.insert(info_hash.clone(), torrent_tx);
+        let engine = Engine {
+            config: Arc::new(Config::default()),
+            registry: Arc::new(RwLock::new(registry)),
+            db: Arc::new(Mutex::new(conn)),
+            cmd_rx: rx,
+            cmd_tx: mpsc::channel(1).0,
+            torrent_chans,
+            torrent_tasks: HashMap::new(),
+            dht_tx: None,
+        };
+
+        engine
+            .add_peers_inner(&info_hash, vec![peer])
+            .await
+            .unwrap();
+        assert!(matches!(
+            torrent_rx.recv().await,
+            Some(TorrentCmd::NewPeers(peers)) if peers == vec![peer]
+        ));
     }
 
     #[tokio::test]

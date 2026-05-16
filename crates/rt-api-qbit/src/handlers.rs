@@ -9,7 +9,7 @@ use serde::Deserialize;
 use std::{
     collections::{hash_map::DefaultHasher, HashMap},
     hash::{Hash, Hasher},
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     time::Duration,
 };
 use url::Url;
@@ -624,7 +624,33 @@ pub async fn torrents_remove_trackers(
 }
 
 /// `POST /api/qb/v2/torrents/addPeers`.
-pub async fn torrents_add_peers() -> impl IntoResponse {
+pub async fn torrents_add_peers(State(state): State<AppState>, body: String) -> impl IntoResponse {
+    let params = parse_form_body(&body);
+    let hashes = params
+        .get("hashes")
+        .or_else(|| params.get("hash"))
+        .map(|hashes| {
+            hashes
+                .split('|')
+                .filter_map(normalize_api_text)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let peers = params
+        .get("peers")
+        .map(|peers| parse_peer_addrs(peers))
+        .unwrap_or_default();
+    if hashes.is_empty() || peers.is_empty() {
+        return StatusCode::BAD_REQUEST;
+    }
+    let Some(engine) = &state.engine else {
+        return StatusCode::OK;
+    };
+    for hash in hashes {
+        if engine.add_peers(hash, peers.clone()).await.is_err() {
+            return StatusCode::NOT_FOUND;
+        }
+    }
     StatusCode::OK
 }
 
@@ -1849,6 +1875,13 @@ fn split_pipe_values(values: &str) -> Vec<String> {
     values.split('|').filter_map(normalize_api_text).collect()
 }
 
+fn parse_peer_addrs(values: &str) -> Vec<SocketAddr> {
+    values
+        .split('|')
+        .filter_map(|peer| peer.trim().parse::<SocketAddr>().ok())
+        .collect()
+}
+
 fn normalize_api_text(value: &str) -> Option<String> {
     let value = value.trim();
     if value.is_empty() {
@@ -2859,6 +2892,14 @@ mod tests {
                 "udp://two/announce".to_owned()
             ]
         );
+    }
+
+    #[test]
+    fn parse_peer_addrs_accepts_pipe_separated_socket_addresses() {
+        let peers = parse_peer_addrs("127.0.0.1:6881|[::1]:6882|bad");
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0], "127.0.0.1:6881".parse::<SocketAddr>().unwrap());
+        assert_eq!(peers[1], "[::1]:6882".parse::<SocketAddr>().unwrap());
     }
 
     #[test]
