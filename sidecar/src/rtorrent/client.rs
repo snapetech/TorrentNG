@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::{BufMut, BytesMut};
-use quick_xml::{events::Event, Reader};
+use quick_xml::{events::Event, name::QName, Reader};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixStream};
 
@@ -281,15 +281,15 @@ fn parse_value_content(reader: &mut Reader<&[u8]>) -> Result<XmlValue> {
             Event::Start(e) => {
                 let val = match e.name().as_ref() {
                     b"string" => {
-                        let text = reader.read_text(e.name())?;
-                        XmlValue::String(text.into_owned())
+                        let text = read_text_string(reader, e.name())?;
+                        XmlValue::String(text)
                     }
                     b"int" | b"i4" | b"i8" => {
-                        let text = reader.read_text(e.name())?;
+                        let text = read_text_string(reader, e.name())?;
                         XmlValue::Int(text.trim().parse().unwrap_or(0))
                     }
                     b"boolean" => {
-                        let text = reader.read_text(e.name())?;
+                        let text = read_text_string(reader, e.name())?;
                         XmlValue::Bool(text.trim() == "1")
                     }
                     b"array" => parse_array(reader)?,
@@ -299,14 +299,14 @@ fn parse_value_content(reader: &mut Reader<&[u8]>) -> Result<XmlValue> {
                         XmlValue::Nil
                     }
                     _ => {
-                        let text = reader.read_text(e.name())?;
+                        let text = read_text_string(reader, e.name())?;
                         XmlValue::String(text.trim().to_owned())
                     }
                 };
                 return Ok(val);
             }
             Event::Text(t) => {
-                let s = t.unescape()?.trim().to_owned();
+                let s = t.decode()?.trim().to_owned();
                 if !s.is_empty() {
                     return Ok(XmlValue::String(s));
                 }
@@ -340,7 +340,7 @@ fn parse_struct(reader: &mut Reader<&[u8]>) -> Result<XmlValue> {
         match reader.read_event()? {
             Event::Start(e) => match e.name().as_ref() {
                 b"name" => {
-                    current_name = reader.read_text(e.name())?.into_owned();
+                    current_name = read_text_string(reader, e.name())?;
                 }
                 b"value" => {
                     let val = parse_value_content(reader)?;
@@ -354,4 +354,8 @@ fn parse_struct(reader: &mut Reader<&[u8]>) -> Result<XmlValue> {
         }
     }
     Ok(XmlValue::Struct(fields))
+}
+
+fn read_text_string(reader: &mut Reader<&[u8]>, end: QName<'_>) -> Result<String> {
+    Ok(reader.read_text(end)?.decode()?.into_owned())
 }
