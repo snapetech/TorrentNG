@@ -1,6 +1,7 @@
-import { useRef, useEffect } from 'react'
+import { useRef, useEffect, useMemo, useState } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import type { TorrentSummary, ListParams } from '../api/client'
+import type { MediaInferenceMode } from './AppearancePanel'
 
 interface Props {
   torrents: TorrentSummary[]
@@ -10,11 +11,13 @@ interface Props {
   onSelect: (hash: string) => void
   onSelectAll: (hashes: string[]) => void
   onDetail: (hash: string | null) => void
+  onContextMenu: (torrent: TorrentSummary, x: number, y: number) => void
   onSort: (sort: string) => void
   onLoadMore: () => void
   hasMore: boolean
   isFetchingMore: boolean
   detailHash: string | null
+  mediaInference: MediaInferenceMode
 }
 
 const ROW_HEIGHT = 36
@@ -45,10 +48,26 @@ function statusLabel(t: TorrentSummary): { label: string; color: string } {
   return { label: 'Queued', color: '#94a3b8' }
 }
 
-interface Col { key: string; label: string; width: string; sortKey?: string }
+type ColKey =
+  | 'check'
+  | 'kind'
+  | 'name'
+  | 'status'
+  | 'size'
+  | 'progress'
+  | 'down_rate'
+  | 'up_rate'
+  | 'ratio'
+  | 'added'
+  | 'category'
+  | 'tags'
+  | 'tracker'
+
+interface Col { key: ColKey; label: string; width: string; sortKey?: string; required?: boolean }
 
 const COLS: Col[] = [
-  { key: 'check',     label: '',         width: '32px' },
+  { key: 'check',     label: '',         width: '32px', required: true },
+  { key: 'kind',      label: 'Type',     width: '52px' },
   { key: 'name',      label: 'Name',     width: 'minmax(200px, 1fr)', sortKey: 'name' },
   { key: 'status',    label: 'Status',   width: '72px' },
   { key: 'size',      label: 'Size',     width: '74px', sortKey: 'size' },
@@ -58,21 +77,139 @@ const COLS: Col[] = [
   { key: 'ratio',     label: 'Ratio',    width: '54px', sortKey: 'ratio' },
   { key: 'added',     label: 'Added',    width: '80px', sortKey: 'added' },
   { key: 'category',  label: 'Category', width: '90px' },
+  { key: 'tags',      label: 'Tags',     width: '96px' },
+  { key: 'tracker',   label: 'Tracker',  width: '120px' },
 ]
 
-const gridTemplate = COLS.map(c => c.width).join(' ')
+const DEFAULT_VISIBLE: ColKey[] = [
+  'check',
+  'kind',
+  'name',
+  'status',
+  'size',
+  'progress',
+  'down_rate',
+  'up_rate',
+  'ratio',
+  'added',
+  'category',
+  'tags',
+  'tracker',
+]
+
+const COLUMN_STORAGE_KEY = 'rtng.visibleColumns'
 
 function fmtDate(ts: number): string {
   if (!ts) return '—'
   return new Date(ts * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: '2-digit' })
 }
 
+function trackerHost(url: string): string {
+  if (!url) return '—'
+  try {
+    return new URL(url).hostname
+  } catch {
+    return url
+  }
+}
+
+interface MediaKind {
+  icon: string
+  label: string
+  color: string
+}
+
+function mediaKind(t: TorrentSummary, mode: MediaInferenceMode): MediaKind {
+  if (mode === 'off') return { icon: '📦', label: 'Type inference disabled', color: '#64748b' }
+
+  const haystack = mode === 'suffix' ? '' : `${t.name} ${t.category} ${t.tags} ${t.directory}`.toLowerCase()
+  const suffixes = mode === 'hints' ? [] : fileSuffixes(`${t.name} ${t.directory}`)
+  const has = (patterns: RegExp[]) => patterns.some(pattern =>
+    pattern.test(haystack) || suffixes.some(suffix => pattern.test(suffix)),
+  )
+
+  if (has([/\b(ebook|ebooks|book|books|audiobook|epub|mobi|azw3|pdf|cbz|cbr)\b/, /^(epub|mobi|azw3|pdf|cbz|cbr)$/])) {
+    return { icon: '📚', label: 'Ebook', color: '#a78bfa' }
+  }
+  if (has([/\b(s\d{1,2}e\d{1,2}|season|episode|hdtv|web-dl|webrip|tv)\b/])) {
+    return { icon: '📺', label: 'TV', color: '#38bdf8' }
+  }
+  if (has([/\b(movie|movies|film|bluray|bdrip|dvdrip|x264|x265|h\.264|h\.265|2160p|1080p|720p)\b/, /^(mkv|mp4|avi|mov|wmv|m4v)$/])) {
+    return { icon: '🎬', label: 'Video', color: '#60a5fa' }
+  }
+  if (has([/\b(music|album|discography|flac|mp3|aac|ogg|opus)\b/, /^(flac|mp3|aac|ogg|opus|wav|m4a)$/])) {
+    return { icon: '🎵', label: 'Audio', color: '#34d399' }
+  }
+  if (has([/\b(iso|installer|image|linux|ubuntu|debian|archlinux|fedora)\b/, /^(iso|img|dmg)$/])) {
+    return { icon: '💿', label: 'ISO/Image', color: '#f59e0b' }
+  }
+  if (has([/\b(game|games|gog|steam|switch|ps4|ps5|xbox)\b/])) {
+    return { icon: '🎮', label: 'Game', color: '#f472b6' }
+  }
+  if (has([/\b(app|software|source|code|github|windows|macos|linux)\b/, /^(exe|msi|pkg|deb|rpm|zip|tar|gz|xz|7z|rar)$/])) {
+    return { icon: '🧩', label: 'Software/Archive', color: '#94a3b8' }
+  }
+  return { icon: '📦', label: 'Other', color: '#64748b' }
+}
+
+function fileSuffixes(text: string): string[] {
+  const suffixes = new Set<string>()
+  const matches = text.matchAll(/(?:^|[/\s._()[\]-])([a-z0-9][a-z0-9._ -]{0,180}\.([a-z0-9]{2,8}))(?:$|[/\s()[\]-])/gi)
+  for (const match of matches) {
+    const ext = match[2]?.toLowerCase()
+    if (ext) suffixes.add(ext)
+    const name = match[1]?.toLowerCase() ?? ''
+    for (const nested of name.matchAll(/\.([a-z0-9]{2,8})(?=\.|$)/g)) {
+      suffixes.add(nested[1])
+    }
+  }
+  return [...suffixes]
+}
+
+function loadColumns(): ColKey[] {
+  try {
+    const raw = localStorage.getItem(COLUMN_STORAGE_KEY)
+    if (!raw) return DEFAULT_VISIBLE
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return DEFAULT_VISIBLE
+    const valid = new Set(COLS.map(c => c.key))
+    const loaded = parsed.filter((key): key is ColKey => valid.has(key))
+    return ['check', ...loaded.filter(key => key !== 'check')]
+  } catch {
+    return DEFAULT_VISIBLE
+  }
+}
+
 export function TorrentTable({
-  torrents, total, selected, params, onSelect, onSelectAll, onDetail, onSort,
-  onLoadMore, hasMore, isFetchingMore, detailHash,
+  torrents, selected, params, onSelect, onSelectAll, onDetail, onContextMenu, onSort,
+  onLoadMore, hasMore, isFetchingMore, detailHash, mediaInference,
 }: Props) {
   const parentRef = useRef<HTMLDivElement>(null)
   const loadMoreRef = useRef(false)
+  const [visibleKeys, setVisibleKeys] = useState<ColKey[]>(loadColumns)
+  const [columnsOpen, setColumnsOpen] = useState(false)
+
+  const visibleCols = useMemo(() => {
+    const visible = new Set(visibleKeys)
+    return COLS.filter(col => col.required || visible.has(col.key))
+  }, [visibleKeys])
+  const gridTemplate = visibleCols.map(c => c.width).join(' ')
+
+  function setColumnVisible(key: ColKey, visible: boolean) {
+    setVisibleKeys(prev => {
+      const next = visible
+        ? [...prev, key]
+        : prev.filter(k => k !== key)
+      const deduped = COLS.map(c => c.key).filter(k => k === 'check' || next.includes(k))
+      localStorage.setItem(COLUMN_STORAGE_KEY, JSON.stringify(deduped))
+      return deduped
+    })
+  }
+
+  function resetColumns() {
+    localStorage.setItem(COLUMN_STORAGE_KEY, JSON.stringify(DEFAULT_VISIBLE))
+    setVisibleKeys(DEFAULT_VISIBLE)
+  }
 
   const virtualizer = useVirtualizer({
     count: torrents.length,
@@ -127,7 +264,7 @@ export function TorrentTable({
           }
           style={{ accentColor: '#3b82f6', cursor: 'pointer' }}
         />
-        {COLS.slice(1).map(col => (
+        {visibleCols.slice(1).map(col => (
           <span
             key={col.key}
             onClick={() => col.sortKey && onSort(col.sortKey)}
@@ -143,6 +280,46 @@ export function TorrentTable({
             )}
           </span>
         ))}
+        <button
+          onClick={() => setColumnsOpen(open => !open)}
+          title="Choose table columns"
+          style={{
+            position: 'absolute', right: 8, top: 5, background: '#111827',
+            border: '1px solid #334155', borderRadius: 4, color: '#94a3b8',
+            fontSize: 11, padding: '2px 7px', cursor: 'pointer',
+          }}
+        >
+          Columns
+        </button>
+        {columnsOpen && (
+          <div style={{
+            position: 'absolute', right: 8, top: 30, zIndex: 20, width: 210,
+            background: '#0f141d', border: '1px solid #334155', borderRadius: 6,
+            boxShadow: '0 18px 40px rgba(0,0,0,0.45)', padding: 8,
+            textTransform: 'none', letterSpacing: 0, fontWeight: 400,
+          }}>
+            <div style={{ color: '#64748b', fontSize: 11, margin: '2px 4px 7px' }}>Visible columns</div>
+            {COLS.filter(col => !col.required).map(col => (
+              <label key={col.key} style={{
+                display: 'flex', alignItems: 'center', gap: 8, color: '#cbd5e1',
+                fontSize: 12, padding: '4px 3px', cursor: 'pointer',
+              }}>
+                <input
+                  type="checkbox"
+                  checked={visibleKeys.includes(col.key)}
+                  onChange={e => setColumnVisible(col.key, e.target.checked)}
+                  style={{ accentColor: '#3b82f6' }}
+                />
+                {col.label || col.key}
+              </label>
+            ))}
+            <button onClick={resetColumns} style={{
+              marginTop: 6, width: '100%', background: 'transparent',
+              border: '1px solid #334155', borderRadius: 5, color: '#94a3b8',
+              padding: '5px 8px', fontSize: 12, cursor: 'pointer',
+            }}>Reset columns</button>
+          </div>
+        )}
       </div>
 
       {/* Scrollable body */}
@@ -151,11 +328,52 @@ export function TorrentTable({
           {items.map(item => {
             const t = torrents[item.index]
             const { label, color } = statusLabel(t)
+            const kind = mediaKind(t, mediaInference)
             const isSelected = selected.has(t.hash)
             const isDetail = detailHash === t.hash
+            const cells: Record<ColKey, React.ReactNode> = {
+              check: (
+                <input
+                  type="checkbox"
+                  checked={isSelected}
+                  onChange={() => onSelect(t.hash)}
+                  style={{ accentColor: '#3b82f6', cursor: 'pointer' }}
+                />
+              ),
+              kind: (
+                <span title={kind.label} style={{
+                  display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                  width: 26, height: 22, color: kind.color, fontSize: 16,
+                }}>{kind.icon}</span>
+              ),
+              name: (
+                <span
+                  style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', cursor: 'pointer', color: '#e2e8f0' }}
+                  title={t.name}
+                  onClick={() => onDetail(isDetail ? null : t.hash)}
+                >
+                  {t.name}
+                </span>
+              ),
+              status: <span style={{ color, fontSize: 11, fontWeight: 600 }}>{label}</span>,
+              size: <span style={{ color: '#94a3b8' }}>{fmtSize(t.size_bytes)}</span>,
+              progress: <span style={{ color: '#94a3b8' }}>{fmtProgress(t)}</span>,
+              down_rate: <span style={{ color: t.down_rate ? '#3b82f6' : '#475569' }}>{fmtSpeed(t.down_rate)}</span>,
+              up_rate: <span style={{ color: t.up_rate ? '#22c55e' : '#475569' }}>{fmtSpeed(t.up_rate)}</span>,
+              ratio: <span style={{ color: '#94a3b8' }}>{(t.ratio / 1000).toFixed(2)}</span>,
+              added: <span style={{ color: '#64748b' }}>{fmtDate(t.creation_date)}</span>,
+              category: <span style={{ color: '#64748b', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.category || '—'}</span>,
+              tags: <span style={{ color: '#64748b', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={t.tags}>{t.tags || '—'}</span>,
+              tracker: <span style={{ color: '#64748b', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={t.tracker_url}>{trackerHost(t.tracker_url)}</span>,
+            }
             return (
               <div
                 key={t.hash}
+                onContextMenu={e => {
+                  e.preventDefault()
+                  onContextMenu(t, e.clientX, e.clientY)
+                }}
+                onDoubleClick={() => onDetail(t.hash)}
                 style={{
                   position: 'absolute', top: item.start, left: 0, right: 0,
                   height: ROW_HEIGHT, display: 'grid', gridTemplateColumns: gridTemplate,
@@ -167,29 +385,7 @@ export function TorrentTable({
                   borderLeft: isDetail ? '2px solid #3b82f6' : '2px solid transparent',
                 }}
               >
-                <input
-                  type="checkbox"
-                  checked={isSelected}
-                  onChange={() => onSelect(t.hash)}
-                  style={{ accentColor: '#3b82f6', cursor: 'pointer' }}
-                />
-                <span
-                  style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', cursor: 'pointer', color: '#e2e8f0' }}
-                  title={t.name}
-                  onClick={() => onDetail(isDetail ? null : t.hash)}
-                >
-                  {t.name}
-                </span>
-                <span style={{ color, fontSize: 11, fontWeight: 600 }}>{label}</span>
-                <span style={{ color: '#94a3b8' }}>{fmtSize(t.size_bytes)}</span>
-                <span style={{ color: '#94a3b8' }}>{fmtProgress(t)}</span>
-                <span style={{ color: t.down_rate ? '#3b82f6' : '#475569' }}>{fmtSpeed(t.down_rate)}</span>
-                <span style={{ color: t.up_rate   ? '#22c55e' : '#475569' }}>{fmtSpeed(t.up_rate)}</span>
-                <span style={{ color: '#94a3b8' }}>{(t.ratio / 1000).toFixed(2)}</span>
-                <span style={{ color: '#64748b' }}>{fmtDate(t.creation_date)}</span>
-                <span style={{ color: '#64748b', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {t.category || '—'}
-                </span>
+                {visibleCols.map(col => <span key={col.key} style={{ minWidth: 0 }}>{cells[col.key]}</span>)}
               </div>
             )
           })}
@@ -203,18 +399,15 @@ export function TorrentTable({
         )}
       </div>
 
-      {/* Footer */}
-      <div style={{
-        height: 28, background: '#1e2433', borderTop: '1px solid #2d3748',
-        display: 'flex', alignItems: 'center', padding: '0 12px',
-        fontSize: 11, color: '#64748b', flexShrink: 0, gap: 16,
-      }}>
-        <span>{torrents.length.toLocaleString()} / {total.toLocaleString()} torrent{total !== 1 ? 's' : ''}</span>
-        {selected.size > 0 && <span style={{ color: '#3b82f6' }}>{selected.size} selected</span>}
-        {hasMore && !isFetchingMore && (
-          <span style={{ color: '#334155' }}>↓ scroll for more</span>
-        )}
-      </div>
+      {hasMore && !isFetchingMore && (
+        <div style={{
+          height: 24, background: '#1e2433', borderTop: '1px solid #2d3748',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          fontSize: 11, color: '#475569', flexShrink: 0,
+        }}>
+          Scroll for more
+        </div>
+      )}
     </div>
   )
 }

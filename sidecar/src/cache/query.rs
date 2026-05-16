@@ -22,6 +22,7 @@ pub struct ListParams {
     pub status: Option<String>,
     pub category: Option<String>,
     pub tag: Option<String>,
+    pub tracker: Option<String>,
     pub sort: Option<String>,
     pub dir: Option<String>,
     pub limit: Option<i64>,
@@ -272,6 +273,12 @@ fn build_where(p: &ListParams) -> (String, Vec<String>) {
             args.len() + 1
         ));
         args.push(tag.clone());
+    }
+    if let Some(tracker) = &p.tracker {
+        if !tracker.is_empty() {
+            clauses.push(format!("t.tracker_url LIKE ?{} COLLATE NOCASE", args.len() + 1));
+            args.push(format!("%{tracker}%"));
+        }
     }
     if let Some(status) = &p.status {
         match status.as_str() {

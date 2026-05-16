@@ -1033,7 +1033,14 @@ dependencies = [
 name = "rt-api-qbit"
 version = "0.1.0"
 dependencies = [
+ "axum",
+ "rt-api-model",
+ "rt-session",
+ "serde",
+ "serde_json",
  "thiserror",
+ "tokio",
+ "tower 0.4.13",
  "tracing",
 ]
 
@@ -1077,6 +1084,7 @@ dependencies = [
 name = "rt-dht"
 version = "0.1.0"
 dependencies = [
+ "rand 0.8.6",
  "thiserror",
  "tracing",
 ]
@@ -1128,7 +1136,13 @@ dependencies = [
 name = "rt-metrics"
 version = "0.1.0"
 dependencies = [
+ "axum",
+ "rt-api-native",
+ "rt-api-qbit",
+ "rt-session",
  "thiserror",
+ "tokio",
+ "tower 0.4.13",
  "tracing",
 ]
 

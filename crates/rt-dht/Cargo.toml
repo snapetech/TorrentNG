@@ -1,6 +1,6 @@
 [package]
 name = "rt-dht"
-description = "rtorrentNG: rt-dht"
+description = "rtorrentNG: BEP 5 Kademlia DHT (node ID, routing table, message codec)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,3 +9,6 @@ license.workspace = true
 [dependencies]
 thiserror.workspace = true
 tracing.workspace = true
+rand.workspace = true
+
+[dev-dependencies]

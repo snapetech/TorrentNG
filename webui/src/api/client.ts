@@ -46,6 +46,7 @@ export interface ListParams {
   status?: string
   category?: string
   tag?: string
+  tracker?: string
   sort?: string
   dir?: 'asc' | 'desc'
   limit?: number
@@ -159,6 +160,21 @@ async function logout(): Promise<void> {
     method: 'POST',
     credentials: 'same-origin',
   })
+}
+
+async function qbPost(path: string, fields: Record<string, string | number | boolean | undefined | null>): Promise<void> {
+  const form = new URLSearchParams()
+  for (const [key, value] of Object.entries(fields)) {
+    if (value !== undefined && value !== null) form.set(key, String(value))
+  }
+  const res = await fetch('/api/qb/v2' + path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-RTNG-CSRF': '1' },
+    body: form,
+    credentials: 'same-origin',
+  })
+  if (res.status === 401) throw new AuthError()
+  if (!res.ok) throw new Error(`API ${res.status}: ${path}`)
 }
 
 export interface Category {
@@ -402,6 +418,22 @@ export const api = {
     update: (hash: string, body: { save_path?: string }) =>
       put(`/torrents/${hash}`, body),
 
+    rename: (hash: string, name: string) =>
+      qbPost('/torrents/rename', { hash, name }),
+
+    setLocation: (hashes: string[], location: string) =>
+      qbPost('/torrents/setLocation', { hashes: hashes.join('|'), location }),
+
+    setShareLimits: (hashes: string[], ratioLimit: number, seedingTimeLimit: number) =>
+      qbPost('/torrents/setShareLimits', {
+        hashes: hashes.join('|'),
+        ratioLimit,
+        seedingTimeLimit,
+      }),
+
+    toggleSequential: (hashes: string[]) =>
+      qbPost('/torrents/toggleSequentialDownload', { hashes: hashes.join('|') }),
+
     trackers: async (hash: string): Promise<Tracker[]> =>
       (await get<TrackersResponse>(`/torrents/${hash}/trackers`)).trackers,
 
@@ -419,6 +451,15 @@ export const api = {
 
     removeTags: (hash: string, tags: string[]) =>
       del(`/torrents/${hash}/tags`, { tags }),
+
+    setTags: (hashes: string[], tags: string[]) =>
+      qbPost('/torrents/setTags', { hashes: hashes.join('|'), tags: tags.join(',') }),
+
+    setFilePriority: (hash: string, fileIds: number[], priority: number) =>
+      qbPost('/torrents/filePrio', { hash, id: fileIds.join('|'), priority }),
+
+    renameFile: (hash: string, id: number, name: string) =>
+      qbPost('/torrents/renameFile', { hash, id, name }),
 
     addFile: (file: File, savePath = '', category = '', start = true) => {
       const fd = new FormData()

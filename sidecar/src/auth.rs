@@ -17,8 +17,15 @@ pub async fn require_auth(
 ) -> Response {
     let path = req.uri().path().to_owned();
 
-    // Public endpoints — never require auth
-    if path == "/health" || path == "/metrics" {
+    // Public endpoints — never require auth. The WebUI app shell and assets
+    // must be public so the browser can render the login screen.
+    if path == "/"
+        || path == "/index.html"
+        || path == "/favicon.ico"
+        || path == "/health"
+        || path == "/metrics"
+        || path.starts_with("/assets/")
+    {
         return next.run(req).await;
     }
 

@@ -1,1 +1,5 @@
-// rt-dht — stub, implementation pending
+pub mod node_id;
+pub mod routing;
+
+pub use node_id::{Distance, NodeId};
+pub use routing::{KBucket, KNode, RoutingTable, K};

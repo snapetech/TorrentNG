@@ -9,17 +9,31 @@ import { BulkActionBar } from './components/BulkActionBar'
 import { AddTorrentDialog } from './components/AddTorrentDialog'
 import { UserAgentPanel } from './components/UserAgentPanel'
 import { CategoriesPanel } from './components/CategoriesPanel'
-import { SavedViewsBar } from './components/SavedViewsBar'
+import { TorrentSidebar } from './components/TorrentSidebar'
 import { StoragePanel } from './components/StoragePanel'
 import { TrackerHealthPanel } from './components/TrackerHealthPanel'
 import { RatioGroupsPanel } from './components/RatioGroupsPanel'
 import { WorkflowsPanel } from './components/WorkflowsPanel'
 import { RssRulesPanel } from './components/RssRulesPanel'
 import { EnginePanel } from './components/EnginePanel'
+import { TorrentToolbar } from './components/TorrentToolbar'
+import { TorrentContextMenu, type ContextMenuState } from './components/TorrentContextMenu'
+import { HelpDialog } from './components/HelpDialog'
+import { StatusBar } from './components/StatusBar'
+import { TorrentPropertiesDialog } from './components/TorrentPropertiesDialog'
+import { AppearancePanel, type MediaInferenceMode } from './components/AppearancePanel'
+import { BulkEditDialog } from './components/BulkEditDialog'
 import { api, AuthError, type ListParams, type TorrentSummary } from './api/client'
 
 type View = 'torrents' | 'settings'
 type AuthState = 'checking' | 'authenticated' | 'unauthenticated'
+type SettingsSection = 'library' | 'engine' | 'automation' | 'support'
+const MEDIA_INFERENCE_KEY = 'rtng.mediaInference'
+
+function loadMediaInference(): MediaInferenceMode {
+  const value = localStorage.getItem(MEDIA_INFERENCE_KEY)
+  return value === 'full' || value === 'suffix' || value === 'hints' || value === 'off' ? value : 'full'
+}
 
 function fmtSpeed(bps: number): string {
   if (!bps) return '0 B/s'
@@ -42,6 +56,14 @@ export function App() {
   const [detailHash, setDetailHash] = useState<string | null>(null)
   const [speeds, setSpeeds] = useState({ up: 0, dn: 0 })
   const [addOpen, setAddOpen] = useState(false)
+  const [helpOpen, setHelpOpen] = useState(false)
+  const [toolbarBusy, setToolbarBusy] = useState(false)
+  const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null)
+  const [pendingDelete, setPendingDelete] = useState<TorrentSummary | null>(null)
+  const [propertiesHash, setPropertiesHash] = useState<string | null>(null)
+  const [bulkEditOpen, setBulkEditOpen] = useState(false)
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>('library')
+  const [mediaInference, setMediaInference] = useState<MediaInferenceMode>(loadMediaInference)
 
   const isAuthed = authState === 'authenticated'
   const query = useTorrentsInfinite(params, isAuthed)
@@ -79,9 +101,18 @@ export function App() {
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if (e.key === 'Escape') {
+        if (contextMenu) { setContextMenu(null); return }
+        if (helpOpen) { setHelpOpen(false); return }
+        if (pendingDelete) { setPendingDelete(null); return }
+        if (bulkEditOpen) { setBulkEditOpen(false); return }
+        if (propertiesHash) { setPropertiesHash(null); return }
         if (addOpen) { setAddOpen(false); return }
         if (detailHash) { setDetailHash(null); return }
         if (selected.size > 0) { setSelected(new Set()); return }
+      }
+      if (e.key === '?' && !(e.target instanceof HTMLInputElement) && !(e.target instanceof HTMLTextAreaElement)) {
+        setHelpOpen(true)
+        return
       }
       // 'a' key to open add dialog when not in an input
       if (e.key === 'a' && !(e.target instanceof HTMLInputElement) && !(e.target instanceof HTMLTextAreaElement)) {
@@ -90,7 +121,7 @@ export function App() {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [addOpen, detailHash, selected.size])
+  }, [addOpen, bulkEditOpen, contextMenu, detailHash, helpOpen, pendingDelete, propertiesHash, selected.size])
 
   function updateParams(p: Partial<typeof params>) {
     setParams(prev => ({ ...prev, ...p }))
@@ -128,6 +159,49 @@ export function App() {
 
   const detailTorrent: TorrentSummary | undefined =
     detailHash ? torrents.find(t => t.hash === detailHash) : undefined
+  const propertiesTorrent: TorrentSummary | undefined =
+    propertiesHash ? torrents.find(t => t.hash === propertiesHash) : undefined
+
+  async function runBulk(action: 'start' | 'stop' | 'recheck' | 'reannounce') {
+    const hashes = [...selected]
+    if (hashes.length === 0) return
+    setToolbarBusy(true)
+    try {
+      await api.bulk(action, hashes, false)
+      qc.invalidateQueries({ queryKey: ['torrents'], exact: false })
+    } finally {
+      setToolbarBusy(false)
+    }
+  }
+
+  async function toggleSequential(hashes: string[]) {
+    if (hashes.length === 0) return
+    await api.torrents.toggleSequential(hashes)
+    qc.invalidateQueries({ queryKey: ['torrents'], exact: false })
+  }
+
+  async function runTorrent(torrent: TorrentSummary, action: 'start' | 'stop' | 'recheck' | 'reannounce') {
+    const actions = {
+      start: api.torrents.start,
+      stop: api.torrents.stop,
+      recheck: api.torrents.recheck,
+      reannounce: api.torrents.reannounce,
+    }
+    await actions[action](torrent.hash)
+    qc.invalidateQueries({ queryKey: ['torrents'], exact: false })
+  }
+
+  async function deleteTorrent(torrent: TorrentSummary, deleteFiles: boolean) {
+    await api.torrents.remove(torrent.hash, deleteFiles)
+    setPendingDelete(null)
+    setSelected(prev => {
+      const next = new Set(prev)
+      next.delete(torrent.hash)
+      return next
+    })
+    if (detailHash === torrent.hash) setDetailHash(null)
+    qc.invalidateQueries({ queryKey: ['torrents'], exact: false })
+  }
 
   async function handleLogin(username: string, password: string) {
     setAuthMessage('')
@@ -145,6 +219,11 @@ export function App() {
     setDetailHash(null)
     setSpeeds({ up: 0, dn: 0 })
     qc.clear()
+  }
+
+  function updateMediaInference(mode: MediaInferenceMode) {
+    localStorage.setItem(MEDIA_INFERENCE_KEY, mode)
+    setMediaInference(mode)
   }
 
   if (authState === 'checking') {
@@ -190,6 +269,10 @@ export function App() {
             color: '#93c5fd', padding: '3px 12px', fontSize: 12, cursor: 'pointer',
           }}>+ Add</button>
         )}
+        <button onClick={() => setHelpOpen(true)} title="Help and links" style={{
+          background: 'transparent', border: '1px solid #334155', borderRadius: 5,
+          color: '#94a3b8', padding: '3px 10px', fontSize: 12, cursor: 'pointer',
+        }}>Help</button>
 
         <span style={{
           fontSize: 11, color: health?.rtorrent === 'connected' ? '#22c55e' : '#ef4444',
@@ -225,7 +308,19 @@ export function App() {
         <FilterBar params={params} onChange={updateParams} />
       )}
       {view === 'torrents' && (
-        <SavedViewsBar params={params} onApply={applySavedView} />
+        <TorrentToolbar
+          selectedCount={selected.size}
+          onAdd={() => setAddOpen(true)}
+          onStart={() => runBulk('start')}
+          onStop={() => runBulk('stop')}
+          onRecheck={() => runBulk('recheck')}
+          onReannounce={() => runBulk('reannounce')}
+          onProperties={() => setPropertiesHash([...selected][0] ?? null)}
+          onEditSelected={() => setBulkEditOpen(true)}
+          onSequential={() => toggleSequential([...selected])}
+          onHelp={() => setHelpOpen(true)}
+          busy={toolbarBusy}
+        />
       )}
       {view === 'torrents' && selected.size > 0 && (
         <BulkActionBar hashes={[...selected]} onClear={() => setSelected(new Set())} />
@@ -234,39 +329,22 @@ export function App() {
       {/* Main content */}
       <main style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
         {view === 'settings' && (
-          <div style={{ flex: 1, overflowY: 'auto', background: '#0f1117' }}>
-            <div style={{ padding: '20px 24px', borderBottom: '1px solid #1e2433', fontSize: 16, fontWeight: 600 }}>
-              Settings
-            </div>
-            <div style={{ borderBottom: '1px solid #1e2433' }}>
-              <CategoriesPanel />
-            </div>
-            <div style={{ borderBottom: '1px solid #1e2433' }}>
-              <StoragePanel />
-            </div>
-            <div style={{ borderBottom: '1px solid #1e2433' }}>
-              <EnginePanel />
-            </div>
-            <div style={{ borderBottom: '1px solid #1e2433' }}>
-              <TrackerHealthPanel />
-            </div>
-            <div style={{ borderBottom: '1px solid #1e2433' }}>
-              <RatioGroupsPanel />
-            </div>
-            <div style={{ borderBottom: '1px solid #1e2433' }}>
-              <WorkflowsPanel />
-            </div>
-            <div style={{ borderBottom: '1px solid #1e2433' }}>
-              <RssRulesPanel />
-            </div>
-            <div style={{ borderBottom: '1px solid #1e2433' }}>
-              <UserAgentPanel />
-            </div>
-          </div>
+          <SettingsView
+            section={settingsSection}
+            onSection={setSettingsSection}
+            mediaInference={mediaInference}
+            onMediaInference={updateMediaInference}
+          />
         )}
 
         {view === 'torrents' && (
           <>
+            <TorrentSidebar
+              params={params}
+              total={total}
+              onChange={updateParams}
+              onApply={applySavedView}
+            />
             <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
               {query.isError && (
                 <div style={{ padding: 24, color: '#ef4444', textAlign: 'center' }}>
@@ -285,11 +363,16 @@ export function App() {
                   onSelect={handleSelect}
                   onSelectAll={handleSelectAll}
                   onDetail={hash => setDetailHash(hash)}
+                  onContextMenu={(torrent, x, y) => {
+                    setContextMenu({ torrent, x, y })
+                    setSelected(prev => prev.has(torrent.hash) ? prev : new Set([torrent.hash]))
+                  }}
                   onSort={handleSort}
                   onLoadMore={() => query.fetchNextPage()}
                   hasMore={query.hasNextPage ?? false}
                   isFetchingMore={query.isFetchingNextPage}
                   detailHash={detailHash}
+                  mediaInference={mediaInference}
                 />
               )}
             </div>
@@ -304,9 +387,185 @@ export function App() {
         )}
       </main>
 
+      <StatusBar
+        loaded={torrents.length}
+        total={total}
+        selected={selected.size}
+        up={speeds.up}
+        down={speeds.dn}
+        rtorrent={health?.rtorrent ?? 'connecting'}
+        cached={health?.cached_torrents}
+      />
+
       {addOpen && <AddTorrentDialog onClose={() => setAddOpen(false)} />}
+      {helpOpen && <HelpDialog onClose={() => setHelpOpen(false)} />}
+      {contextMenu && (
+        <TorrentContextMenu
+          menu={contextMenu}
+          onClose={() => setContextMenu(null)}
+          onProperties={() => setPropertiesHash(contextMenu.torrent.hash)}
+          onEditSelected={() => setBulkEditOpen(true)}
+          onDetail={() => setDetailHash(contextMenu.torrent.hash)}
+          onStart={() => runTorrent(contextMenu.torrent, 'start')}
+          onStop={() => runTorrent(contextMenu.torrent, 'stop')}
+          onRecheck={() => runTorrent(contextMenu.torrent, 'recheck')}
+          onReannounce={() => runTorrent(contextMenu.torrent, 'reannounce')}
+          onDelete={() => setPendingDelete(contextMenu.torrent)}
+          onCopyHash={() => navigator.clipboard?.writeText(contextMenu.torrent.hash)}
+          onCopyName={() => navigator.clipboard?.writeText(contextMenu.torrent.name)}
+          onToggleSequential={() => toggleSequential([contextMenu.torrent.hash])}
+        />
+      )}
+      {propertiesTorrent && (
+        <TorrentPropertiesDialog torrent={propertiesTorrent} onClose={() => setPropertiesHash(null)} />
+      )}
+      {bulkEditOpen && selected.size > 0 && (
+        <BulkEditDialog hashes={[...selected]} onClose={() => setBulkEditOpen(false)} />
+      )}
+      {pendingDelete && (
+        <DeleteDialog
+          torrent={pendingDelete}
+          onCancel={() => setPendingDelete(null)}
+          onRemove={() => deleteTorrent(pendingDelete, false)}
+          onRemoveFiles={() => deleteTorrent(pendingDelete, true)}
+        />
+      )}
     </div>
   )
+}
+
+function SettingsView({ section, onSection, mediaInference, onMediaInference }: {
+  section: SettingsSection
+  onSection: (section: SettingsSection) => void
+  mediaInference: MediaInferenceMode
+  onMediaInference: (mode: MediaInferenceMode) => void
+}) {
+  const sections: Array<[SettingsSection, string]> = [
+    ['library', 'Library'],
+    ['engine', 'Engine'],
+    ['automation', 'Automation'],
+    ['support', 'Support'],
+  ]
+  return (
+    <>
+      <aside style={{
+        width: 220, flexShrink: 0, background: '#0f141d', borderRight: '1px solid #1e2433',
+        padding: 12,
+      }}>
+        <div style={{ fontSize: 16, fontWeight: 700, color: '#e2e8f0', margin: '4px 4px 12px' }}>Settings</div>
+        {sections.map(([key, label]) => (
+          <button key={key} onClick={() => onSection(key)} style={{
+            width: '100%', display: 'block', textAlign: 'left', marginBottom: 4,
+            background: section === key ? '#1e3a5f' : 'transparent',
+            border: '1px solid ' + (section === key ? '#3b82f6' : 'transparent'),
+            borderRadius: 5, color: section === key ? '#bfdbfe' : '#94a3b8',
+            padding: '7px 9px', fontSize: 13, cursor: 'pointer',
+          }}>{label}</button>
+        ))}
+      </aside>
+      <div style={{ flex: 1, overflowY: 'auto', background: '#0f1117' }}>
+        {section === 'library' && (<>
+          <PanelTitle title="Library" subtitle="Categories, storage roots, and tracker summaries" />
+          <PanelFrame><CategoriesPanel /></PanelFrame>
+          <PanelFrame><StoragePanel /></PanelFrame>
+          <PanelFrame><TrackerHealthPanel /></PanelFrame>
+        </>)}
+        {section === 'engine' && (<>
+          <PanelTitle title="Engine" subtitle="Runtime diagnostics, user agent, and capability checks" />
+          <PanelFrame><EnginePanel /></PanelFrame>
+          <PanelFrame><UserAgentPanel /></PanelFrame>
+        </>)}
+        {section === 'automation' && (<>
+          <PanelTitle title="Automation" subtitle="Ratio groups, workflows, and RSS rules" />
+          <PanelFrame><RatioGroupsPanel /></PanelFrame>
+          <PanelFrame><WorkflowsPanel /></PanelFrame>
+          <PanelFrame><RssRulesPanel /></PanelFrame>
+        </>)}
+        {section === 'support' && (<>
+          <PanelTitle title="Support" subtitle="Project resources and community support" />
+          <PanelFrame>
+            <AppearancePanel mediaInference={mediaInference} onMediaInference={onMediaInference} />
+          </PanelFrame>
+          <div style={{ padding: 18, display: 'grid', gap: 10, maxWidth: 720 }}>
+            <a style={supportLink} href="https://discord.gg/4ub88HeHFm" target="_blank" rel="noreferrer">Discord support</a>
+            <a style={supportLink} href="https://github.com/rtorrentng/rtorrentng" target="_blank" rel="noreferrer">GitHub project</a>
+            <button onClick={() => window.dispatchEvent(new KeyboardEvent('keydown', { key: '?' }))} style={supportButton}>Open help</button>
+          </div>
+        </>)}
+      </div>
+    </>
+  )
+}
+
+function PanelTitle({ title, subtitle }: { title: string; subtitle: string }) {
+  return (
+    <div style={{ padding: '18px 22px', borderBottom: '1px solid #1e2433' }}>
+      <div style={{ fontSize: 17, fontWeight: 700, color: '#e2e8f0' }}>{title}</div>
+      <div style={{ marginTop: 3, fontSize: 12, color: '#64748b' }}>{subtitle}</div>
+    </div>
+  )
+}
+
+function PanelFrame({ children }: { children: React.ReactNode }) {
+  return <div style={{ borderBottom: '1px solid #1e2433' }}>{children}</div>
+}
+
+function DeleteDialog({ torrent, onCancel, onRemove, onRemoveFiles }: {
+  torrent: TorrentSummary
+  onCancel: () => void
+  onRemove: () => void
+  onRemoveFiles: () => void
+}) {
+  return (
+    <div style={{
+      position: 'fixed', inset: 0, background: 'rgba(2,6,23,0.72)', zIndex: 1150,
+      display: 'grid', placeItems: 'center', padding: 24,
+    }}>
+      <div style={{
+        width: 'min(480px, 100%)', background: '#0f141d', border: '1px solid #7f1d1d',
+        borderRadius: 8, boxShadow: '0 24px 60px rgba(0,0,0,0.5)',
+      }}>
+        <div style={{ padding: 16, borderBottom: '1px solid #1e2433' }}>
+          <div style={{ fontSize: 16, fontWeight: 700, color: '#fecaca' }}>Delete torrent</div>
+          <div style={{ marginTop: 8, color: '#cbd5e1', fontSize: 13, lineHeight: 1.4, wordBreak: 'break-word' }}>{torrent.name}</div>
+        </div>
+        <div style={{ padding: 14, display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+          <button onClick={onCancel} style={dialogButton('#64748b')}>Cancel</button>
+          <button onClick={onRemove} style={dialogButton('#f87171')}>Remove torrent</button>
+          <button onClick={onRemoveFiles} style={dialogButton('#ef4444')}>Delete files</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+const supportLink: React.CSSProperties = {
+  color: '#93c5fd',
+  textDecoration: 'none',
+  fontSize: 14,
+}
+
+const supportButton: React.CSSProperties = {
+  width: 'fit-content',
+  background: '#1e3a5f',
+  border: '1px solid #3b82f6',
+  borderRadius: 5,
+  color: '#bfdbfe',
+  padding: '6px 10px',
+  fontSize: 13,
+  cursor: 'pointer',
+}
+
+function dialogButton(color: string): React.CSSProperties {
+  return {
+    background: '#1e2433',
+    border: `1px solid ${color}66`,
+    borderRadius: 5,
+    color,
+    padding: '6px 10px',
+    fontSize: 12,
+    cursor: 'pointer',
+  }
 }
 
 function LoginScreen({ message, onLogin }: {

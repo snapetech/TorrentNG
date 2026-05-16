@@ -20,6 +20,7 @@ pub struct SavedViewParams {
     pub status: Option<String>,
     pub category: Option<String>,
     pub tag: Option<String>,
+    pub tracker: Option<String>,
     pub sort: Option<String>,
     pub dir: Option<String>,
 }
@@ -31,6 +32,7 @@ impl From<SavedViewParams> for ListParams {
             status: params.status,
             category: params.category,
             tag: params.tag,
+            tracker: params.tracker,
             sort: params.sort,
             dir: params.dir,
             limit: None,

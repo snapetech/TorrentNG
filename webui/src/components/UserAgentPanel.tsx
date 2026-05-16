@@ -19,7 +19,7 @@ export function UserAgentPanel() {
 
   useEffect(() => {
     if (data && draft === '') setDraft(data.user_agent)
-  }, [data])
+  }, [data, draft])
 
   const mutation = useMutation({
     mutationFn: (ua: string) => api.settings.setUserAgent(ua),

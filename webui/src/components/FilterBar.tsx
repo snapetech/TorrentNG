@@ -1,51 +1,18 @@
 import { useEffect, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
-import { api } from '../api/client'
 import type { ListParams } from '../api/client'
-
-const STATUS_OPTIONS = [
-  { value: '', label: 'All' },
-  { value: 'seeding', label: 'Seeding' },
-  { value: 'downloading', label: 'Downloading' },
-  { value: 'stopped', label: 'Stopped' },
-  { value: 'checking', label: 'Checking' },
-]
 
 interface Props {
   params: ListParams
   onChange: (p: Partial<ListParams>) => void
 }
 
-const SELECT_STYLE: React.CSSProperties = {
-  background: '#0f1117',
-  border: '1px solid #334155',
-  borderRadius: 6,
-  color: '#94a3b8',
-  padding: '4px 8px',
-  fontSize: 12,
-  outline: 'none',
-  cursor: 'pointer',
-}
-
 export function FilterBar({ params, onChange }: Props) {
   const [search, setSearch] = useState(params.filter ?? '')
-
-  const { data: categories } = useQuery({
-    queryKey: ['categories'],
-    queryFn: api.categories.list,
-    staleTime: 30_000,
-  })
-
-  const { data: tags } = useQuery({
-    queryKey: ['tags'],
-    queryFn: api.tags.list,
-    staleTime: 30_000,
-  })
 
   useEffect(() => {
     const t = setTimeout(() => onChange({ filter: search, offset: 0 }), 200)
     return () => clearTimeout(t)
-  }, [search])
+  }, [search, onChange])
 
   return (
     <div style={{
@@ -59,7 +26,7 @@ export function FilterBar({ params, onChange }: Props) {
     }}>
       <input
         type="search"
-        placeholder="Filter torrents…"
+        placeholder="Search torrents"
         value={search}
         onChange={e => setSearch(e.target.value)}
         style={{
@@ -74,59 +41,12 @@ export function FilterBar({ params, onChange }: Props) {
         }}
       />
 
-      {/* Status filters */}
-      <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
-        {STATUS_OPTIONS.map(o => (
-          <button
-            key={o.value}
-            onClick={() => onChange({ status: o.value || undefined, offset: 0 })}
-            style={{
-              background: (params.status ?? '') === o.value ? '#2563eb' : '#1e2433',
-              border: '1px solid ' + ((params.status ?? '') === o.value ? '#3b82f6' : '#334155'),
-              borderRadius: 5,
-              color: (params.status ?? '') === o.value ? '#fff' : '#94a3b8',
-              padding: '3px 10px',
-              fontSize: 12,
-              cursor: 'pointer',
-            }}
-          >
-            {o.label}
-          </button>
-        ))}
-      </div>
-
-      {/* Category filter */}
-      {categories && categories.length > 0 && (
-        <select
-          value={params.category ?? ''}
-          onChange={e => onChange({ category: e.target.value || undefined, offset: 0 })}
-          style={SELECT_STYLE}
-        >
-          <option value="">All categories</option>
-          {categories.map(c => (
-            <option key={c.name} value={c.name}>{c.name}</option>
-          ))}
-        </select>
-      )}
-
-      {/* Tag filter */}
-      {tags && tags.length > 0 && (
-        <select
-          value={params.tag ?? ''}
-          onChange={e => onChange({ tag: e.target.value || undefined, offset: 0 })}
-          style={SELECT_STYLE}
-        >
-          <option value="">All tags</option>
-          {tags.map(t => (
-            <option key={t} value={t}>{t}</option>
-          ))}
-        </select>
-      )}
-
-      {/* Clear active filters */}
-      {(params.category || params.tag || params.status) && (
+      {(params.filter || search) && (
         <button
-          onClick={() => onChange({ category: undefined, tag: undefined, status: undefined, filter: undefined, offset: 0 })}
+          onClick={() => {
+            setSearch('')
+            onChange({ filter: undefined, offset: 0 })
+          }}
           style={{
             background: 'none',
             border: '1px solid #475569',
@@ -137,7 +57,7 @@ export function FilterBar({ params, onChange }: Props) {
             cursor: 'pointer',
           }}
         >
-          ✕ Clear
+          Clear search
         </button>
       )}
     </div>
