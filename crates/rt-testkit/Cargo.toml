@@ -9,3 +9,5 @@ license.workspace = true
 [dependencies]
 thiserror.workspace = true
 tracing.workspace = true
+rt-db = { path = "../rt-db" }
+rusqlite.workspace = true

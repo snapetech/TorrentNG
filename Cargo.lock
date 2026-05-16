@@ -1534,6 +1534,8 @@ dependencies = [
 name = "rt-testkit"
 version = "0.1.0"
 dependencies = [
+ "rt-db",
+ "rusqlite",
  "thiserror 1.0.69",
  "tracing",
 ]

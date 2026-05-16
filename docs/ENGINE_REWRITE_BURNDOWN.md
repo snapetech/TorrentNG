@@ -93,7 +93,7 @@ This is the working checklist for finishing the native Rust engine rewrite. It i
 
 ## 9. Scale Certification
 
-- [ ] Generate synthetic 1k, 5k, 10k, 15k, 50k datasets.
+- [x] Generate synthetic 1k, 5k, 10k, 15k, 50k datasets.
 - [ ] Cold-start benchmark with DB load and API readiness.
 - [ ] Idle memory benchmark at 15k torrents.
 - [ ] API list/filter/sort latency benchmark.
@@ -103,7 +103,7 @@ This is the working checklist for finishing the native Rust engine rewrite. It i
 
 ## 10. Release Hygiene
 
-- [ ] Update crate READMEs with actual status.
+- [x] Update crate READMEs with actual status.
 - [ ] Update `docs/ENGINE.md` when implemented behavior diverges from design.
 - [ ] Add threat model review.
 - [ ] Add backup/restore docs.
