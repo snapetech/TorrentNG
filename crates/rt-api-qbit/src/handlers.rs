@@ -591,6 +591,162 @@ pub async fn torrents_tags(State(state): State<AppState>) -> impl IntoResponse {
     (StatusCode::OK, Json(tags.into_iter().collect::<Vec<_>>()))
 }
 
+/// `POST /api/qb/v2/torrents/rename`.
+pub async fn torrents_rename(State(state): State<AppState>, body: String) -> impl IntoResponse {
+    let params = parse_form_body(&body);
+    let Some(hash) = params.get("hash").cloned() else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let Some(name) = params.get("name").cloned() else {
+        return StatusCode::BAD_REQUEST;
+    };
+    update_torrent_fields(&state, &hash, Some(name), None).await
+}
+
+/// `POST /api/qb/v2/torrents/setLocation`.
+pub async fn torrents_set_location(
+    State(state): State<AppState>,
+    body: String,
+) -> impl IntoResponse {
+    let params = parse_form_body(&body);
+    let hashes = params
+        .get("hashes")
+        .map(|h| extract_hashes_from_str(h))
+        .unwrap_or_default();
+    let hashes = resolve_hashes(&state, hashes).await;
+    let Some(location) = params.get("location").cloned() else {
+        return StatusCode::BAD_REQUEST;
+    };
+    for hash in hashes {
+        let status = update_torrent_fields(
+            &state,
+            &hash,
+            None,
+            Some(std::path::PathBuf::from(location.clone())),
+        )
+        .await;
+        if status != StatusCode::OK {
+            return status;
+        }
+    }
+    StatusCode::OK
+}
+
+/// `POST /api/qb/v2/torrents/createCategory`.
+pub async fn torrents_create_category(
+    State(_state): State<AppState>,
+    body: String,
+) -> impl IntoResponse {
+    let params = parse_form_body(&body);
+    if params
+        .get("category")
+        .and_then(|category| normalize_api_text(category))
+        .is_none()
+    {
+        return StatusCode::BAD_REQUEST;
+    }
+    StatusCode::OK
+}
+
+/// `POST /api/qb/v2/torrents/editCategory`.
+pub async fn torrents_edit_category(
+    State(state): State<AppState>,
+    body: String,
+) -> impl IntoResponse {
+    let params = parse_form_body(&body);
+    let Some(category) = params
+        .get("category")
+        .and_then(|category| normalize_api_text(category))
+    else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let Some(new_category) = params
+        .get("newCategory")
+        .and_then(|category| normalize_api_text(category))
+    else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let hashes = {
+        let reg = state.registry.read().await;
+        reg.iter()
+            .filter(|entry| entry.category.as_deref() == Some(category.as_str()))
+            .map(|entry| entry.info_hash.clone())
+            .collect::<Vec<_>>()
+    };
+    for hash in hashes {
+        update_torrent_category(&state, &hash, Some(new_category.clone())).await;
+    }
+    StatusCode::OK
+}
+
+/// `POST /api/qb/v2/torrents/removeCategories`.
+pub async fn torrents_remove_categories(
+    State(state): State<AppState>,
+    body: String,
+) -> impl IntoResponse {
+    let params = parse_form_body(&body);
+    let categories = params
+        .get("categories")
+        .map(|value| split_pipe_values(value))
+        .unwrap_or_default();
+    let hashes = {
+        let reg = state.registry.read().await;
+        reg.iter()
+            .filter(|entry| {
+                entry
+                    .category
+                    .as_ref()
+                    .is_some_and(|category| categories.contains(category))
+            })
+            .map(|entry| entry.info_hash.clone())
+            .collect::<Vec<_>>()
+    };
+    for hash in hashes {
+        update_torrent_category(&state, &hash, None).await;
+    }
+    StatusCode::OK
+}
+
+/// `POST /api/qb/v2/torrents/createTags`.
+pub async fn torrents_create_tags(body: String) -> impl IntoResponse {
+    let params = parse_form_body(&body);
+    if params
+        .get("tags")
+        .map(|tags| split_tags(tags))
+        .unwrap_or_default()
+        .is_empty()
+    {
+        return StatusCode::BAD_REQUEST;
+    }
+    StatusCode::OK
+}
+
+/// `POST /api/qb/v2/torrents/deleteTags`.
+pub async fn torrents_delete_tags(
+    State(state): State<AppState>,
+    body: String,
+) -> impl IntoResponse {
+    let params = parse_form_body(&body);
+    let remove_tags = params
+        .get("tags")
+        .map(|tags| split_tags(tags))
+        .unwrap_or_default();
+    if remove_tags.is_empty() {
+        return StatusCode::BAD_REQUEST;
+    }
+    let hashes = {
+        let reg = state.registry.read().await;
+        reg.iter()
+            .filter(|entry| entry.tags.iter().any(|tag| remove_tags.contains(tag)))
+            .map(|entry| entry.info_hash.clone())
+            .collect::<Vec<_>>()
+    };
+    for hash in hashes {
+        update_torrent_tags(&state, &hash, Vec::new(), remove_tags.clone()).await;
+    }
+    StatusCode::OK
+}
+
 /// `POST /api/qb/v2/torrents/setCategory`.
 pub async fn torrents_set_category(
     State(state): State<AppState>,
@@ -692,6 +848,36 @@ pub async fn torrents_remove_tags(
         }
     }
     StatusCode::OK
+}
+
+/// `POST /api/qb/v2/torrents/setDownloadLimit`.
+pub async fn torrents_set_download_limit() -> impl IntoResponse {
+    StatusCode::OK
+}
+
+/// `POST /api/qb/v2/torrents/setUploadLimit`.
+pub async fn torrents_set_upload_limit() -> impl IntoResponse {
+    StatusCode::OK
+}
+
+/// `POST /api/qb/v2/transfer/setDownloadLimit`.
+pub async fn transfer_set_download_limit() -> impl IntoResponse {
+    StatusCode::OK
+}
+
+/// `POST /api/qb/v2/transfer/setUploadLimit`.
+pub async fn transfer_set_upload_limit() -> impl IntoResponse {
+    StatusCode::OK
+}
+
+/// `GET /api/qb/v2/transfer/downloadLimit`.
+pub async fn transfer_download_limit() -> impl IntoResponse {
+    (StatusCode::OK, "0")
+}
+
+/// `GET /api/qb/v2/transfer/uploadLimit`.
+pub async fn transfer_upload_limit() -> impl IntoResponse {
+    (StatusCode::OK, "0")
 }
 
 // ---------------------------------------------------------------------------
@@ -885,6 +1071,100 @@ fn split_tags(tags: &str) -> Vec<String> {
         .collect()
 }
 
+fn split_pipe_values(values: &str) -> Vec<String> {
+    values.split('|').filter_map(normalize_api_text).collect()
+}
+
+fn normalize_api_text(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_owned())
+    }
+}
+
+async fn update_torrent_category(
+    state: &AppState,
+    hash: &str,
+    category: Option<String>,
+) -> StatusCode {
+    if let Some(engine) = &state.engine {
+        let category = Some(category);
+        return match engine
+            .update_torrent_labels(hash.to_owned(), category, Vec::new(), Vec::new())
+            .await
+        {
+            Ok(()) => StatusCode::OK,
+            Err(_) => StatusCode::NOT_FOUND,
+        };
+    }
+    let mut reg = state.registry.write().await;
+    let Some(entry) = reg.get_mut(hash) else {
+        return StatusCode::NOT_FOUND;
+    };
+    entry.category = category;
+    StatusCode::OK
+}
+
+async fn update_torrent_tags(
+    state: &AppState,
+    hash: &str,
+    add_tags: Vec<String>,
+    remove_tags: Vec<String>,
+) -> StatusCode {
+    if let Some(engine) = &state.engine {
+        return match engine
+            .update_torrent_labels(hash.to_owned(), None, add_tags, remove_tags)
+            .await
+        {
+            Ok(()) => StatusCode::OK,
+            Err(_) => StatusCode::NOT_FOUND,
+        };
+    }
+    let mut reg = state.registry.write().await;
+    let Some(entry) = reg.get_mut(hash) else {
+        return StatusCode::NOT_FOUND;
+    };
+    for tag in add_tags {
+        if !entry.tags.contains(&tag) {
+            entry.tags.push(tag);
+        }
+    }
+    if !remove_tags.is_empty() {
+        entry.tags.retain(|tag| !remove_tags.contains(tag));
+    }
+    StatusCode::OK
+}
+
+async fn update_torrent_fields(
+    state: &AppState,
+    hash: &str,
+    name: Option<String>,
+    save_path: Option<std::path::PathBuf>,
+) -> StatusCode {
+    if let Some(engine) = &state.engine {
+        return match engine
+            .update_torrent_fields(hash.to_owned(), name, save_path)
+            .await
+        {
+            Ok(()) => StatusCode::OK,
+            Err(_) => StatusCode::NOT_FOUND,
+        };
+    }
+    let mut reg = state.registry.write().await;
+    let Some(entry) = reg.get_mut(hash) else {
+        return StatusCode::NOT_FOUND;
+    };
+    if let Some(name) = name.and_then(|name| normalize_api_text(&name)) {
+        entry.name = name;
+    }
+    if let Some(save_path) = save_path {
+        entry.save_path = save_path.to_string_lossy().to_string();
+    }
+    StatusCode::OK
+}
+
 async fn fetch_torrent_url(raw_url: &str) -> Result<Vec<u8>, String> {
     const MAX_TORRENT_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -969,10 +1249,12 @@ async fn resolve_hashes(state: &AppState, hashes: Vec<String>) -> Vec<String> {
 
 async fn default_save_path(state: &AppState) -> String {
     let reg = state.registry.read().await;
-    reg.iter()
+    let save_path = reg
+        .iter()
         .next()
         .map(|entry| format!("{}/", entry.save_path.trim_end_matches('/')))
-        .unwrap_or_else(|| "/downloads/".to_owned())
+        .unwrap_or_else(|| "/downloads/".to_owned());
+    save_path
 }
 
 // ---------------------------------------------------------------------------
@@ -1034,6 +1316,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn app_preferences_and_default_save_path_ok() {
+        let hash = "f".repeat(40);
+        let state = make_state_with(&hash).await;
+        let app = build_qbit_router(state);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/qb/v2/app/preferences")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["save_path"].as_str().unwrap(), "/data/");
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/qb/v2/app/defaultSavePath")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(std::str::from_utf8(&body).unwrap(), "/data/");
+    }
+
+    #[tokio::test]
     async fn torrents_info_empty() {
         let app = build_qbit_router(AppState::new());
         let resp = app
@@ -1088,6 +1404,42 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v.as_array().unwrap().len(), 1);
         assert_eq!(v[0]["hash"].as_str().unwrap(), hash);
+    }
+
+    #[tokio::test]
+    async fn torrents_info_filters_by_tag_and_sorts() {
+        let state = AppState::new();
+        {
+            let mut reg = state.registry.write().await;
+            let mut first = TorrentEntry::new("a".repeat(40), "zeta".into(), "/data".into());
+            first.total_length = 10;
+            first.tags = vec!["keep".into()];
+            reg.add(first).unwrap();
+            let mut second = TorrentEntry::new("b".repeat(40), "alpha".into(), "/data".into());
+            second.total_length = 30;
+            second.tags = vec!["keep".into()];
+            reg.add(second).unwrap();
+            let mut skipped = TorrentEntry::new("c".repeat(40), "middle".into(), "/data".into());
+            skipped.total_length = 20;
+            skipped.tags = vec!["skip".into()];
+            reg.add(skipped).unwrap();
+        }
+        let app = build_qbit_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/qb/v2/torrents/info?tag=keep&sort=size&reverse=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 2);
+        assert_eq!(v[0]["name"].as_str().unwrap(), "alpha");
+        assert_eq!(v[1]["name"].as_str().unwrap(), "zeta");
     }
 
     #[tokio::test]
@@ -1239,6 +1591,158 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_category_decodes_url_encoded_form_values() {
+        let hash = "1".repeat(40);
+        let state = make_state_with(&hash).await;
+        let app = build_qbit_router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/torrents/setCategory")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("hashes=all&category=tv%20shows"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let reg = state.registry.read().await;
+        assert_eq!(
+            reg.get(&hash).unwrap().category.as_deref(),
+            Some("tv shows")
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_and_set_location_update_registry_without_engine() {
+        let hash = "2".repeat(40);
+        let state = make_state_with(&hash).await;
+        let app = build_qbit_router(state.clone());
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/torrents/rename")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(format!("hash={hash}&name=better%20name")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/torrents/setLocation")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("hashes=all&location=%2Fnew%20data"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let reg = state.registry.read().await;
+        let entry = reg.get(&hash).unwrap();
+        assert_eq!(entry.name, "better name");
+        assert_eq!(entry.save_path, "/new data");
+    }
+
+    #[tokio::test]
+    async fn category_and_global_tag_endpoints_update_registry() {
+        let hash = "3".repeat(40);
+        let state = make_state_with(&hash).await;
+        {
+            let mut reg = state.registry.write().await;
+            let entry = reg.get_mut(&hash).unwrap();
+            entry.category = Some("old".into());
+            entry.tags = vec!["remove".into(), "keep".into()];
+        }
+        let app = build_qbit_router(state.clone());
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/torrents/editCategory")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("category=old&newCategory=new"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/torrents/deleteTags")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("tags=remove"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/torrents/removeCategories")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("categories=new"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let reg = state.registry.read().await;
+        let entry = reg.get(&hash).unwrap();
+        assert_eq!(entry.category, None);
+        assert_eq!(entry.tags, vec!["keep".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn transfer_limit_endpoints_are_qbit_compatible_noops() {
+        let app = build_qbit_router(AppState::new());
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/qb/v2/transfer/downloadLimit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(std::str::from_utf8(&body).unwrap(), "0");
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/torrents/setUploadLimit")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("hashes=all&limit=0"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn add_and_remove_tags_resolve_all_hashes() {
         let hash = "b".repeat(40);
         let state = make_state_with(&hash).await;
@@ -1313,5 +1817,12 @@ mod tests {
         assert_eq!(pieces_have(1_000, 0, false, 100, 10), 10);
         assert_eq!(pieces_have(1_000, 250, false, 0, 10), 0);
         assert_eq!(pieces_have(1_000, 250, false, 100, 0), 0);
+    }
+
+    #[test]
+    fn parse_form_body_decodes_qbit_forms() {
+        let params = parse_form_body("hashes=a%7Cb&tags=high+quality%2Carchive");
+        assert_eq!(params.get("hashes").unwrap(), "a|b");
+        assert_eq!(params.get("tags").unwrap(), "high quality,archive");
     }
 }

@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["sidecar"]
 members = [
     "crates/rt-bencode",
     "crates/rt-metainfo",

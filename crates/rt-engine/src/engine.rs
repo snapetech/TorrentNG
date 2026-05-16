@@ -166,6 +166,25 @@ impl EngineHandle {
         rx.await.map_err(|_| "engine dropped reply".to_owned())?
     }
 
+    pub async fn update_torrent_fields(
+        &self,
+        info_hash: String,
+        name: Option<String>,
+        save_path: Option<std::path::PathBuf>,
+    ) -> CmdResult<()> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(EngineCmd::UpdateTorrentFields {
+                info_hash,
+                name,
+                save_path,
+                reply,
+            })
+            .await
+            .map_err(|_| "engine shut down".to_owned())?;
+        rx.await.map_err(|_| "engine dropped reply".to_owned())?
+    }
+
     pub async fn shutdown(&self) {
         let _ = self.tx.send(EngineCmd::Shutdown).await;
     }
@@ -395,6 +414,17 @@ impl Engine {
             } => {
                 let result = self
                     .update_torrent_labels_inner(&info_hash, category, add_tags, remove_tags)
+                    .await;
+                let _ = reply.send(result);
+            }
+            EngineCmd::UpdateTorrentFields {
+                info_hash,
+                name,
+                save_path,
+                reply,
+            } => {
+                let result = self
+                    .update_torrent_fields_inner(&info_hash, name, save_path)
                     .await;
                 let _ = reply.send(result);
             }
@@ -873,6 +903,41 @@ impl Engine {
         Ok(())
     }
 
+    async fn update_torrent_fields_inner(
+        &self,
+        info_hash: &str,
+        name: Option<String>,
+        save_path: Option<std::path::PathBuf>,
+    ) -> CmdResult<()> {
+        let mut reg = self.registry.write().await;
+        let entry = reg
+            .get_mut(info_hash)
+            .ok_or_else(|| format!("torrent {info_hash} not found"))?;
+
+        if let Some(name) = normalize_optional_text(name) {
+            entry.name = name;
+        }
+        if let Some(save_path) = save_path {
+            entry.save_path = save_path.to_string_lossy().to_string();
+        }
+
+        let row = match load_v1_from_blob(&self.config, info_hash) {
+            Ok(meta) => row_from_entry(entry, &meta),
+            Err(_) => {
+                let db = self.db.lock().expect("database mutex poisoned");
+                let mut row = rt_db::get(&db, info_hash).map_err(|e| e.to_string())?;
+                row.name = entry.name.clone();
+                row.save_path = entry.save_path.clone();
+                row
+            }
+        };
+        drop(reg);
+
+        let db = self.db.lock().expect("database mutex poisoned");
+        rt_db::upsert(&db, &row).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     async fn send_to_torrent(&self, info_hash: &str, cmd: TorrentCmd) -> CmdResult<()> {
         match self.torrent_chans.get(info_hash) {
             Some(tx) => tx
@@ -1097,6 +1162,12 @@ fn parse_info_hash_hex(info_hash: &str) -> Result<[u8; 20], ()> {
 
 fn normalize_category(category: Option<String>) -> Option<String> {
     category
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn normalize_optional_text(value: Option<String>) -> Option<String> {
+    value
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
 }

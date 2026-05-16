@@ -85,6 +85,13 @@ pub enum EngineCmd {
         remove_tags: Vec<String>,
         reply: oneshot::Sender<CmdResult<()>>,
     },
+    /// Update user-visible torrent fields stored in the session row.
+    UpdateTorrentFields {
+        info_hash: String,
+        name: Option<String>,
+        save_path: Option<PathBuf>,
+        reply: oneshot::Sender<CmdResult<()>>,
+    },
     /// Graceful shutdown.
     Shutdown,
 }

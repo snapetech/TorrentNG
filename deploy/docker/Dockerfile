@@ -11,7 +11,7 @@ COPY sidecar/src ./src
 RUN touch src/lib.rs src/main.rs && cargo build --release
 
 # Stage 2: Build WebUI
-FROM node:22-alpine AS webui-build
+FROM node:22-bookworm-slim AS webui-build
 WORKDIR /src
 COPY webui/package.json webui/package-lock.json ./
 RUN npm ci --ignore-scripts
