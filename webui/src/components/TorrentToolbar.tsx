@@ -33,10 +33,10 @@ export function TorrentToolbar({
   return (
     <div style={{
       height: 38, flexShrink: 0, display: 'flex', alignItems: 'center', gap: 6,
-      padding: '0 10px', background: '#111827', borderBottom: '1px solid #1e2433',
+      padding: '0 10px', background: 'var(--surface)', borderBottom: '1px solid var(--border)',
     }}>
       <button onClick={onAdd} title="Add torrent" style={primaryButton}>+ Add</button>
-      <div style={{ width: 1, height: 20, background: '#1e2433', margin: '0 2px' }} />
+      <div style={{ width: 1, height: 20, background: 'var(--border)', margin: '0 2px' }} />
       {ACTIONS.map(action => (
         <button
           key={action.key}
@@ -72,12 +72,12 @@ export function TorrentToolbar({
       >
         Sequential
       </button>
-      <span style={{ color: '#475569', fontSize: 11, marginLeft: 6 }}>
+      <span style={{ color: 'var(--faint)', fontSize: 11, marginLeft: 6 }}>
         {selectedCount > 0 ? `${selectedCount.toLocaleString()} selected` : 'No selection'}
       </span>
       <button onClick={onHelp} title="Keyboard shortcuts and docs" style={{
-        marginLeft: 'auto', background: 'transparent', border: '1px solid #334155',
-        borderRadius: 5, color: '#94a3b8', padding: '4px 8px', fontSize: 12, cursor: 'pointer',
+        marginLeft: 'auto', background: 'transparent', border: '1px solid var(--border-strong)',
+        borderRadius: 5, color: 'var(--muted)', padding: '4px 8px', fontSize: 12, cursor: 'pointer',
       }}>
         Help
       </button>
@@ -86,10 +86,10 @@ export function TorrentToolbar({
 }
 
 const primaryButton: React.CSSProperties = {
-  background: '#1e3a5f',
-  border: '1px solid #3b82f6',
+  background: 'var(--accent-soft)',
+  border: '1px solid var(--accent)',
   borderRadius: 5,
-  color: '#bfdbfe',
+  color: 'var(--accent-text)',
   padding: '4px 10px',
   fontSize: 12,
   cursor: 'pointer',
@@ -97,7 +97,7 @@ const primaryButton: React.CSSProperties = {
 
 function actionButton(color: string, disabled: boolean): React.CSSProperties {
   return {
-    background: '#1e2433',
+    background: 'var(--surface-2)',
     border: `1px solid ${color}55`,
     borderRadius: 5,
     color,

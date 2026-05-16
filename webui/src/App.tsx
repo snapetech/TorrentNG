@@ -586,20 +586,20 @@ export function App() {
 function StandbyScreen({ onTakeOver }: { onTakeOver: () => void }) {
   return (
     <div style={{
-      minHeight: '100vh', background: '#0d1117', color: '#e2e8f0',
+      minHeight: '100vh', background: 'var(--bg)', color: 'var(--text)',
       display: 'grid', placeItems: 'center', padding: 24,
     }}>
       <div style={{
-        width: 'min(460px, 100%)', border: '1px solid #1e2433', borderRadius: 8,
-        background: '#0f141d', padding: 20, display: 'flex', flexDirection: 'column', gap: 12,
+        width: 'min(460px, 100%)', border: '1px solid var(--border)', borderRadius: 8,
+        background: 'var(--panel)', padding: 20, display: 'flex', flexDirection: 'column', gap: 12,
       }}>
         <div style={{ fontWeight: 700, fontSize: 18 }}>rtorrentNG is open in another tab</div>
-        <div style={{ color: '#94a3b8', fontSize: 13, lineHeight: 1.45 }}>
+        <div style={{ color: 'var(--muted)', fontSize: 13, lineHeight: 1.45 }}>
           This standby tab is not connected to the API or websocket. Use one active tab for large libraries.
         </div>
         <button onClick={onTakeOver} style={{
-          width: 'fit-content', background: '#1e3a5f', border: '1px solid #3b82f6',
-          borderRadius: 5, color: '#bfdbfe', padding: '7px 11px', fontSize: 13, cursor: 'pointer',
+          width: 'fit-content', background: 'var(--accent-soft)', border: '1px solid var(--accent)',
+          borderRadius: 5, color: 'var(--accent-text)', padding: '7px 11px', fontSize: 13, cursor: 'pointer',
         }}>Take over this tab</button>
       </div>
     </div>
@@ -621,21 +621,21 @@ function SettingsView({ section, onSection, mediaInference, onMediaInference }: 
   return (
     <>
       <aside style={{
-        width: 220, flexShrink: 0, background: '#0f141d', borderRight: '1px solid #1e2433',
+        width: 220, flexShrink: 0, background: 'var(--panel)', borderRight: '1px solid var(--border)',
         padding: 12,
       }}>
-        <div style={{ fontSize: 16, fontWeight: 700, color: '#e2e8f0', margin: '4px 4px 12px' }}>Settings</div>
+        <div style={{ fontSize: 16, fontWeight: 700, color: 'var(--text)', margin: '4px 4px 12px' }}>Settings</div>
         {sections.map(([key, label]) => (
           <button key={key} onClick={() => onSection(key)} style={{
             width: '100%', display: 'block', textAlign: 'left', marginBottom: 4,
-            background: section === key ? '#1e3a5f' : 'transparent',
-            border: '1px solid ' + (section === key ? '#3b82f6' : 'transparent'),
-            borderRadius: 5, color: section === key ? '#bfdbfe' : '#94a3b8',
+            background: section === key ? 'var(--accent-soft)' : 'transparent',
+            border: '1px solid ' + (section === key ? 'var(--accent)' : 'transparent'),
+            borderRadius: 5, color: section === key ? 'var(--accent-text)' : 'var(--muted)',
             padding: '7px 9px', fontSize: 13, cursor: 'pointer',
           }}>{label}</button>
         ))}
       </aside>
-      <div style={{ flex: 1, overflowY: 'auto', background: '#0f1117' }}>
+      <div style={{ flex: 1, overflowY: 'auto', background: 'var(--bg)' }}>
         {section === 'library' && (<>
           <PanelTitle title="Library" subtitle="Categories, storage roots, and tracker summaries" />
           <PanelFrame><CategoriesPanel /></PanelFrame>
@@ -671,15 +671,15 @@ function SettingsView({ section, onSection, mediaInference, onMediaInference }: 
 
 function PanelTitle({ title, subtitle }: { title: string; subtitle: string }) {
   return (
-    <div style={{ padding: '18px 22px', borderBottom: '1px solid #1e2433' }}>
-      <div style={{ fontSize: 17, fontWeight: 700, color: '#e2e8f0' }}>{title}</div>
-      <div style={{ marginTop: 3, fontSize: 12, color: '#64748b' }}>{subtitle}</div>
+    <div style={{ padding: '18px 22px', borderBottom: '1px solid var(--border)' }}>
+      <div style={{ fontSize: 17, fontWeight: 700, color: 'var(--text)' }}>{title}</div>
+      <div style={{ marginTop: 3, fontSize: 12, color: 'var(--faint)' }}>{subtitle}</div>
     </div>
   )
 }
 
 function PanelFrame({ children }: { children: React.ReactNode }) {
-  return <div style={{ borderBottom: '1px solid #1e2433' }}>{children}</div>
+  return <div style={{ borderBottom: '1px solid var(--border)' }}>{children}</div>
 }
 
 function DeleteDialog({ torrent, onCancel, onRemove, onRemoveFiles }: {
@@ -712,17 +712,17 @@ function DeleteDialog({ torrent, onCancel, onRemove, onRemoveFiles }: {
 }
 
 const supportLink: React.CSSProperties = {
-  color: '#93c5fd',
+  color: 'var(--accent)',
   textDecoration: 'none',
   fontSize: 14,
 }
 
 const supportButton: React.CSSProperties = {
   width: 'fit-content',
-  background: '#1e3a5f',
-  border: '1px solid #3b82f6',
+  background: 'var(--accent-soft)',
+  border: '1px solid var(--accent)',
   borderRadius: 5,
-  color: '#bfdbfe',
+  color: 'var(--accent-text)',
   padding: '6px 10px',
   fontSize: 13,
   cursor: 'pointer',

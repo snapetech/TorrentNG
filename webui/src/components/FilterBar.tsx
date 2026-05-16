@@ -19,8 +19,8 @@ export function FilterBar({ params, onChange }: Props) {
       display: 'flex',
       gap: 8,
       padding: '7px 12px',
-      background: '#1a2030',
-      borderBottom: '1px solid #2d3748',
+      background: 'var(--surface-2)',
+      borderBottom: '1px solid var(--border-strong)',
       alignItems: 'center',
       flexWrap: 'wrap',
     }}>
@@ -31,10 +31,10 @@ export function FilterBar({ params, onChange }: Props) {
         onChange={e => setSearch(e.target.value)}
         style={{
           flex: '1 1 160px',
-          background: '#0f1117',
-          border: '1px solid #334155',
+          background: 'var(--bg)',
+          border: '1px solid var(--border-strong)',
           borderRadius: 6,
-          color: '#e2e8f0',
+          color: 'var(--text)',
           padding: '4px 10px',
           fontSize: 13,
           outline: 'none',
@@ -49,9 +49,9 @@ export function FilterBar({ params, onChange }: Props) {
           }}
           style={{
             background: 'none',
-            border: '1px solid #475569',
+            border: '1px solid var(--border-strong)',
             borderRadius: 5,
-            color: '#64748b',
+            color: 'var(--faint)',
             padding: '3px 8px',
             fontSize: 11,
             cursor: 'pointer',

@@ -74,6 +74,14 @@ pub struct EngineGlobalLimits {
     pub speed_limits_mode: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueMove {
+    Up,
+    Down,
+    Top,
+    Bottom,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct TorrentDiagnostic {
     pub info_hash: String,
@@ -202,6 +210,15 @@ pub enum EngineCmd {
     },
     UpdateGlobalLimits {
         limits: EngineGlobalLimits,
+        reply: oneshot::Sender<CmdResult<()>>,
+    },
+    GetQueuePriority {
+        info_hash: String,
+        reply: oneshot::Sender<CmdResult<i32>>,
+    },
+    UpdateQueueOrder {
+        info_hashes: Vec<String>,
+        queue_move: QueueMove,
         reply: oneshot::Sender<CmdResult<()>>,
     },
     /// Snapshot runtime and durable metrics.

@@ -14,7 +14,7 @@ use std::{
 };
 use url::Url;
 
-use rt_engine::{EngineGlobalLimits, EnginePieceState, EngineTorrentLimits};
+use rt_engine::{EngineGlobalLimits, EnginePieceState, EngineTorrentLimits, QueueMove};
 
 use crate::{
     model::{
@@ -479,23 +479,32 @@ pub async fn torrents_file_prio(State(state): State<AppState>, body: String) -> 
 }
 
 /// `POST /api/qb/v2/torrents/increasePrio`.
-pub async fn torrents_increase_prio() -> impl IntoResponse {
-    StatusCode::OK
+pub async fn torrents_increase_prio(
+    State(state): State<AppState>,
+    body: String,
+) -> impl IntoResponse {
+    update_queue_order(&state, &body, QueueMove::Up).await
 }
 
 /// `POST /api/qb/v2/torrents/decreasePrio`.
-pub async fn torrents_decrease_prio() -> impl IntoResponse {
-    StatusCode::OK
+pub async fn torrents_decrease_prio(
+    State(state): State<AppState>,
+    body: String,
+) -> impl IntoResponse {
+    update_queue_order(&state, &body, QueueMove::Down).await
 }
 
 /// `POST /api/qb/v2/torrents/topPrio`.
-pub async fn torrents_top_prio() -> impl IntoResponse {
-    StatusCode::OK
+pub async fn torrents_top_prio(State(state): State<AppState>, body: String) -> impl IntoResponse {
+    update_queue_order(&state, &body, QueueMove::Top).await
 }
 
 /// `POST /api/qb/v2/torrents/bottomPrio`.
-pub async fn torrents_bottom_prio() -> impl IntoResponse {
-    StatusCode::OK
+pub async fn torrents_bottom_prio(
+    State(state): State<AppState>,
+    body: String,
+) -> impl IntoResponse {
+    update_queue_order(&state, &body, QueueMove::Bottom).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -1763,6 +1772,29 @@ async fn global_limits(state: &AppState) -> EngineGlobalLimits {
     engine.global_limits().await.unwrap_or_default()
 }
 
+async fn queue_priority(state: &AppState, hash: &str) -> i32 {
+    let Some(engine) = &state.engine else {
+        return 0;
+    };
+    engine.queue_priority(hash.to_owned()).await.unwrap_or(0)
+}
+
+async fn update_queue_order(state: &AppState, body: &str, queue_move: QueueMove) -> StatusCode {
+    let params = parse_form_body(body);
+    let hashes = params
+        .get("hashes")
+        .map(|h| extract_hashes_from_str(h))
+        .unwrap_or_default();
+    let hashes = resolve_hashes(state, hashes).await;
+    let Some(engine) = &state.engine else {
+        return StatusCode::OK;
+    };
+    match engine.update_queue_order(hashes, queue_move).await {
+        Ok(()) => StatusCode::OK,
+        Err(_) => StatusCode::NOT_FOUND,
+    }
+}
+
 async fn get_torrent_limits(state: &AppState, hash: &str) -> EngineTorrentLimits {
     let Some(engine) = &state.engine else {
         return EngineTorrentLimits::default();
@@ -1802,6 +1834,7 @@ async fn qbit_torrent_info(state: &AppState, e: &rt_session::TorrentEntry) -> Qb
     } else {
         (String::new(), 0)
     };
+    let priority = queue_priority(state, &e.info_hash).await;
     QbTorrentInfo {
         hash: e.info_hash.clone(),
         name: e.name.clone(),
@@ -1821,7 +1854,7 @@ async fn qbit_torrent_info(state: &AppState, e: &rt_session::TorrentEntry) -> Qb
         upspeed: 0,
         eta: -1,
         progress,
-        priority: 0,
+        priority,
         amount_left: e.amount_left as i64,
         auto_tmm: false,
         tracker,

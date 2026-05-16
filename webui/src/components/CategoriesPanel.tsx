@@ -4,10 +4,10 @@ import { api } from '../api/client'
 import type { Category } from '../api/client'
 
 const INPUT: React.CSSProperties = {
-  background: '#0f1117',
-  border: '1px solid #334155',
+  background: 'var(--bg)',
+  border: '1px solid var(--border-strong)',
   borderRadius: 5,
-  color: '#e2e8f0',
+  color: 'var(--text)',
   padding: '5px 10px',
   fontSize: 13,
   outline: 'none',
@@ -61,15 +61,15 @@ export function CategoriesPanel() {
 
   return (
     <div style={{ padding: '20px 24px' }}>
-      <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 16, color: '#e2e8f0' }}>
+      <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 16, color: 'var(--text)' }}>
         Categories
       </div>
 
       {/* Category list */}
       {isLoading ? (
-        <div style={{ fontSize: 12, color: '#64748b', marginBottom: 16 }}>Loading…</div>
+        <div style={{ fontSize: 12, color: 'var(--faint)', marginBottom: 16 }}>Loading…</div>
       ) : categories.length === 0 ? (
-        <div style={{ fontSize: 12, color: '#475569', marginBottom: 16 }}>No categories yet.</div>
+        <div style={{ fontSize: 12, color: 'var(--faint)', marginBottom: 16 }}>No categories yet.</div>
       ) : (
         <div style={{ marginBottom: 20 }}>
           {categories.map(cat => (
@@ -78,19 +78,19 @@ export function CategoriesPanel() {
               alignItems: 'center',
               gap: 12,
               padding: '8px 12px',
-              background: '#1e2433',
+              background: 'var(--surface-2)',
               borderRadius: 6,
               marginBottom: 6,
             }}>
               <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 13, color: '#e2e8f0', fontWeight: 500 }}>{cat.name}</div>
-                <div style={{ fontSize: 11, color: '#475569', fontFamily: 'monospace', marginTop: 2 }}>
+                <div style={{ fontSize: 13, color: 'var(--text)', fontWeight: 500 }}>{cat.name}</div>
+                <div style={{ fontSize: 11, color: 'var(--faint)', fontFamily: 'monospace', marginTop: 2 }}>
                   {cat.save_path || '(no save path)'}
                 </div>
               </div>
               <button
                 onClick={() => startEdit(cat)}
-                style={{ background: 'none', border: '1px solid #334155', borderRadius: 4, color: '#94a3b8', padding: '2px 8px', fontSize: 11, cursor: 'pointer' }}
+                style={{ background: 'none', border: '1px solid var(--border-strong)', borderRadius: 4, color: 'var(--muted)', padding: '2px 8px', fontSize: 11, cursor: 'pointer' }}
               >Edit</button>
               <button
                 onClick={() => del.mutate(cat.name)}
@@ -103,11 +103,11 @@ export function CategoriesPanel() {
 
       {/* Add / edit form */}
       <form onSubmit={submit} style={{ display: 'flex', flexDirection: 'column', gap: 10, maxWidth: 420 }}>
-        <div style={{ fontSize: 12, fontWeight: 600, color: '#64748b', letterSpacing: '0.05em', textTransform: 'uppercase' }}>
+        <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--faint)', letterSpacing: '0.05em', textTransform: 'uppercase' }}>
           {editingName ? `Edit "${editingName}"` : 'Add category'}
         </div>
         <div>
-          <label style={{ fontSize: 11, color: '#64748b', display: 'block', marginBottom: 4 }}>Name</label>
+          <label style={{ fontSize: 11, color: 'var(--faint)', display: 'block', marginBottom: 4 }}>Name</label>
           <input
             value={name}
             onChange={e => setName(e.target.value)}
@@ -117,7 +117,7 @@ export function CategoriesPanel() {
           />
         </div>
         <div>
-          <label style={{ fontSize: 11, color: '#64748b', display: 'block', marginBottom: 4 }}>Save path</label>
+          <label style={{ fontSize: 11, color: 'var(--faint)', display: 'block', marginBottom: 4 }}>Save path</label>
           <input
             value={savePath}
             onChange={e => setSavePath(e.target.value)}
@@ -127,15 +127,15 @@ export function CategoriesPanel() {
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
           <button type="submit" disabled={save.isPending} style={{
-            background: '#1e3a5f', border: '1px solid #3b82f6', borderRadius: 5,
-            color: '#93c5fd', padding: '5px 16px', fontSize: 13, cursor: 'pointer',
+            background: 'var(--accent-soft)', border: '1px solid var(--accent)', borderRadius: 5,
+            color: 'var(--accent-text)', padding: '5px 16px', fontSize: 13, cursor: 'pointer',
           }}>
             {save.isPending ? 'Saving…' : editingName ? 'Save changes' : 'Add'}
           </button>
           {editingName && (
             <button type="button" onClick={cancelEdit} style={{
-              background: 'none', border: '1px solid #334155', borderRadius: 5,
-              color: '#64748b', padding: '5px 12px', fontSize: 13, cursor: 'pointer',
+              background: 'none', border: '1px solid var(--border-strong)', borderRadius: 5,
+              color: 'var(--faint)', padding: '5px 12px', fontSize: 13, cursor: 'pointer',
             }}>Cancel</button>
           )}
         </div>

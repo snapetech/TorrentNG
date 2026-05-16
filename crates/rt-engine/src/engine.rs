@@ -23,7 +23,7 @@ use rt_session::{SessionRegistry, TorrentEntry, TorrentState, TransferStats};
 
 use crate::command::{
     CmdResult, EngineCmd, EngineGlobalLimits, EnginePieceState, EngineStats, EngineTorrentFile,
-    EngineTorrentLimits, EngineTorrentMetadata, TorrentDiagnostic,
+    EngineTorrentLimits, EngineTorrentMetadata, QueueMove, TorrentDiagnostic,
 };
 use crate::dht_task::{run_dht, DhtCommand, DhtTorrent};
 use crate::metadata_task::run_metadata_task;
@@ -54,6 +54,7 @@ const JOB_STATE_FAILED: &str = "failed";
 const SETTING_GLOBAL_DOWNLOAD_LIMIT: &str = "transfer.download_limit";
 const SETTING_GLOBAL_UPLOAD_LIMIT: &str = "transfer.upload_limit";
 const SETTING_GLOBAL_SPEED_LIMITS_MODE: &str = "transfer.speed_limits_mode";
+const SETTING_QUEUE_PREFIX: &str = "torrent.queue.";
 
 /// Handle given to the API layer. Clone freely; all sends are channel-based.
 #[derive(Clone)]
@@ -350,6 +351,32 @@ impl EngineHandle {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx
             .send(EngineCmd::UpdateGlobalLimits { limits, reply })
+            .await
+            .map_err(|_| "engine shut down".to_owned())?;
+        rx.await.map_err(|_| "engine dropped reply".to_owned())?
+    }
+
+    pub async fn queue_priority(&self, info_hash: String) -> CmdResult<i32> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(EngineCmd::GetQueuePriority { info_hash, reply })
+            .await
+            .map_err(|_| "engine shut down".to_owned())?;
+        rx.await.map_err(|_| "engine dropped reply".to_owned())?
+    }
+
+    pub async fn update_queue_order(
+        &self,
+        info_hashes: Vec<String>,
+        queue_move: QueueMove,
+    ) -> CmdResult<()> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(EngineCmd::UpdateQueueOrder {
+                info_hashes,
+                queue_move,
+                reply,
+            })
             .await
             .map_err(|_| "engine shut down".to_owned())?;
         rx.await.map_err(|_| "engine dropped reply".to_owned())?
@@ -734,6 +761,18 @@ impl Engine {
             }
             EngineCmd::UpdateGlobalLimits { limits, reply } => {
                 let result = self.update_global_limits_inner(limits);
+                let _ = reply.send(result);
+            }
+            EngineCmd::GetQueuePriority { info_hash, reply } => {
+                let result = self.queue_priority_inner(&info_hash);
+                let _ = reply.send(result);
+            }
+            EngineCmd::UpdateQueueOrder {
+                info_hashes,
+                queue_move,
+                reply,
+            } => {
+                let result = self.update_queue_order_inner(info_hashes, queue_move).await;
                 let _ = reply.send(result);
             }
 
@@ -1683,6 +1722,95 @@ impl Engine {
         Ok(())
     }
 
+    fn queue_priority_inner(&self, info_hash: &str) -> CmdResult<i32> {
+        let db = self.db.lock().expect("database mutex poisoned");
+        let key = queue_setting_key(info_hash);
+        Ok(setting_i64(&db, &key) as i32)
+    }
+
+    async fn update_queue_order_inner(
+        &self,
+        info_hashes: Vec<String>,
+        queue_move: QueueMove,
+    ) -> CmdResult<()> {
+        if info_hashes.is_empty() {
+            return Ok(());
+        }
+        let mut rows = {
+            let reg = self.registry.read().await;
+            reg.iter().cloned().collect::<Vec<_>>()
+        };
+        rows.sort_by(|a, b| {
+            a.added_at
+                .cmp(&b.added_at)
+                .then_with(|| a.info_hash.cmp(&b.info_hash))
+        });
+        let db = self.db.lock().expect("database mutex poisoned");
+        let mut ordered = rows
+            .into_iter()
+            .map(|entry| {
+                let pos = setting_i64(&db, &queue_setting_key(&entry.info_hash));
+                (entry.info_hash, pos)
+            })
+            .collect::<Vec<_>>();
+        ordered.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        let known = ordered
+            .iter()
+            .map(|(hash, _)| hash.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        if info_hashes
+            .iter()
+            .any(|hash| !known.contains(hash.as_str()))
+        {
+            return Err("one or more torrents not found".to_owned());
+        }
+        let selected = info_hashes
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::HashSet<_>>();
+        let mut hashes = ordered
+            .into_iter()
+            .map(|(hash, _)| hash)
+            .collect::<Vec<_>>();
+        match queue_move {
+            QueueMove::Top => {
+                stable_partition_selected(&mut hashes, &selected, true);
+            }
+            QueueMove::Bottom => {
+                stable_partition_selected(&mut hashes, &selected, false);
+            }
+            QueueMove::Up => {
+                for idx in 1..hashes.len() {
+                    if selected.contains(hashes[idx].as_str())
+                        && !selected.contains(hashes[idx - 1].as_str())
+                    {
+                        hashes.swap(idx - 1, idx);
+                    }
+                }
+            }
+            QueueMove::Down => {
+                for idx in (0..hashes.len().saturating_sub(1)).rev() {
+                    if selected.contains(hashes[idx].as_str())
+                        && !selected.contains(hashes[idx + 1].as_str())
+                    {
+                        hashes.swap(idx, idx + 1);
+                    }
+                }
+            }
+        }
+        let now = unix_now_i64();
+        for (idx, hash) in hashes.iter().enumerate() {
+            rt_db::set_setting(
+                &db,
+                &queue_setting_key(hash),
+                &(idx as i64).to_string(),
+                now,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
     async fn send_to_torrent(&self, info_hash: &str, cmd: TorrentCmd) -> CmdResult<()> {
         match self.torrent_chans.get(info_hash) {
             Some(tx) => tx
@@ -2316,6 +2444,33 @@ fn setting_bool(conn: &Connection, key: &str) -> bool {
     matches!(rt_db::get_setting(conn, key).as_deref(), Ok("1" | "true"))
 }
 
+fn queue_setting_key(info_hash: &str) -> String {
+    format!("{SETTING_QUEUE_PREFIX}{info_hash}")
+}
+
+fn stable_partition_selected(
+    hashes: &mut Vec<String>,
+    selected: &std::collections::HashSet<&str>,
+    selected_first: bool,
+) {
+    let mut picked = Vec::new();
+    let mut rest = Vec::new();
+    for hash in hashes.drain(..) {
+        if selected.contains(hash.as_str()) {
+            picked.push(hash);
+        } else {
+            rest.push(hash);
+        }
+    }
+    if selected_first {
+        picked.extend(rest);
+        *hashes = picked;
+    } else {
+        rest.extend(picked);
+        *hashes = rest;
+    }
+}
+
 fn normalize_category(category: Option<String>) -> Option<String> {
     category
         .map(|value| value.trim().to_owned())
@@ -2791,6 +2946,48 @@ mod tests {
                 speed_limits_mode: true,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn queue_order_moves_are_persisted() {
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let (_tx, rx) = mpsc::channel(1);
+        let mut registry = SessionRegistry::new();
+        for suffix in ["a", "b", "c"] {
+            registry
+                .add(TorrentEntry::new(
+                    suffix.repeat(40),
+                    suffix.to_owned(),
+                    "/tmp".to_owned(),
+                ))
+                .unwrap();
+        }
+        let engine = Engine {
+            config: Arc::new(Config::default()),
+            registry: Arc::new(RwLock::new(registry)),
+            db: Arc::new(Mutex::new(conn)),
+            cmd_rx: rx,
+            cmd_tx: mpsc::channel(1).0,
+            torrent_chans: HashMap::new(),
+            torrent_tasks: HashMap::new(),
+            dht_tx: None,
+        };
+
+        engine
+            .update_queue_order_inner(vec!["c".repeat(40)], QueueMove::Top)
+            .await
+            .unwrap();
+        assert_eq!(engine.queue_priority_inner(&"c".repeat(40)).unwrap(), 0);
+        assert_eq!(engine.queue_priority_inner(&"a".repeat(40)).unwrap(), 1);
+        assert_eq!(engine.queue_priority_inner(&"b".repeat(40)).unwrap(), 2);
+
+        engine
+            .update_queue_order_inner(vec!["c".repeat(40)], QueueMove::Down)
+            .await
+            .unwrap();
+        assert_eq!(engine.queue_priority_inner(&"a".repeat(40)).unwrap(), 0);
+        assert_eq!(engine.queue_priority_inner(&"c".repeat(40)).unwrap(), 1);
     }
 
     #[tokio::test]

@@ -49,7 +49,7 @@ function Badge({ label, value, title, state }: { label: string; value: string; t
       whiteSpace: 'nowrap',
       fontVariantNumeric: 'tabular-nums',
     }}>
-      <span style={{ color: '#64748b' }}>{label}</span>
+      <span style={{ color: 'var(--faint)' }}>{label}</span>
       <span>{value}</span>
     </span>
   )
@@ -68,15 +68,15 @@ export function StatusBar({ loaded, total, selected, stats, rtorrent, cached, st
   return (
     <footer style={{
       minHeight: 36, flexShrink: 0, display: 'flex', alignItems: 'center', gap: 12,
-      padding: '0 12px', background: '#0d1117', borderTop: '1px solid #273244',
-      color: '#64748b', fontSize: 11, overflowX: 'auto',
+      padding: '0 12px', background: 'var(--bg)', borderTop: '1px solid var(--border-strong)',
+      color: 'var(--faint)', fontSize: 11, overflowX: 'auto',
     }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 'max-content' }}>
         <Badge label="Core" value={connected ? 'connected' : 'disconnected'} state={connected ? 'on' : 'closed'} />
         <span>{total.toLocaleString()} torrents</span>
         {rendered !== total && <span>{rendered.toLocaleString()} rendered</span>}
         {cached !== undefined && <span>{cached.toLocaleString()} cached</span>}
-        {selected > 0 && <span style={{ color: '#93c5fd' }}>{selected.toLocaleString()} selected</span>}
+        {selected > 0 && <span style={{ color: 'var(--accent)' }}>{selected.toLocaleString()} selected</span>}
       </div>
       <span style={{ flex: 1 }} />
       <div style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 'max-content' }}>

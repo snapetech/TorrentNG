@@ -116,5 +116,8 @@ export function applyTheme(id: string, mode: ThemeMode) {
 }
 
 function kebab(value: string): string {
-  return value.replace(/[A-Z]/g, char => `-${char.toLowerCase()}`)
+  return value
+    .replace(/([a-z])([A-Z0-9])/g, '$1-$2')
+    .replace(/[A-Z]/g, char => char.toLowerCase())
+    .toLowerCase()
 }
