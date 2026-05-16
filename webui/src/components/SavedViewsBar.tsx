@@ -43,22 +43,22 @@ export function SavedViewsBar({ params, onApply }: Props) {
   return (
     <div style={{
       display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap',
-      padding: '6px 12px', background: '#111827', borderBottom: '1px solid #1e2433',
+      padding: '6px 12px', background: 'var(--surface)', borderBottom: '1px solid var(--border)',
       fontSize: 12,
     }}>
-      <span style={{ color: '#64748b', fontWeight: 600 }}>Views</span>
+      <span style={{ color: 'var(--faint)', fontWeight: 600 }}>Views</span>
 
       {views.map(view => (
         <span key={view.id} style={{
           display: 'inline-flex', alignItems: 'center', gap: 4,
-          background: '#1e2433', border: '1px solid #334155', borderRadius: 5,
+          background: 'var(--surface-2)', border: '1px solid var(--border-strong)', borderRadius: 5,
           overflow: 'hidden',
         }}>
           <button
             onClick={() => onApply(view.params)}
             title={JSON.stringify(view.params)}
             style={{
-              background: 'transparent', border: 'none', color: '#94a3b8',
+              background: 'transparent', border: 'none', color: 'var(--muted)',
               padding: '3px 8px', fontSize: 12, cursor: 'pointer',
             }}
           >
@@ -67,8 +67,8 @@ export function SavedViewsBar({ params, onApply }: Props) {
           <button
             onClick={() => removeView(view.id)}
             style={{
-              background: 'transparent', border: 'none', borderLeft: '1px solid #334155',
-              color: '#475569', padding: '3px 6px', fontSize: 11, cursor: 'pointer',
+              background: 'transparent', border: 'none', borderLeft: '1px solid var(--border-strong)',
+              color: 'var(--faint)', padding: '3px 6px', fontSize: 11, cursor: 'pointer',
             }}
           >
             x
@@ -83,8 +83,8 @@ export function SavedViewsBar({ params, onApply }: Props) {
           onKeyDown={e => { if (e.key === 'Enter') saveView() }}
           placeholder="Save current view"
           style={{
-            width: 150, background: '#0f1117', border: '1px solid #334155',
-            borderRadius: 5, color: '#cbd5e1', padding: '3px 8px', fontSize: 12,
+            width: 150, background: 'var(--surface)', border: '1px solid var(--border-strong)',
+            borderRadius: 5, color: 'var(--text)', padding: '3px 8px', fontSize: 12,
             outline: 'none',
           }}
         />
@@ -92,8 +92,8 @@ export function SavedViewsBar({ params, onApply }: Props) {
           onClick={saveView}
           disabled={!name.trim()}
           style={{
-            background: '#1e3a5f', border: '1px solid #3b82f6', borderRadius: 5,
-            color: '#93c5fd', padding: '3px 8px', fontSize: 12,
+            background: 'var(--accent-soft)', border: '1px solid var(--accent)', borderRadius: 5,
+            color: 'var(--accent-text)', padding: '3px 8px', fontSize: 12,
             cursor: name.trim() ? 'pointer' : 'not-allowed',
             opacity: name.trim() ? 1 : 0.5,
           }}

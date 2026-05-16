@@ -8,7 +8,9 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose, Engine as _};
-use rt_engine::{EngineHandle, EnginePeerSnapshot, EngineTorrentMetadata, QueueMove};
+use rt_engine::{
+    EngineGlobalLimits, EngineHandle, EnginePeerSnapshot, EngineTorrentMetadata, QueueMove,
+};
 use rt_metainfo::{parse_magnet, parse_torrent};
 use rt_session::SessionRegistry;
 use serde_json::{json, Value};
@@ -73,7 +75,8 @@ async fn rpc(
     let result = match method {
         "session-get" => Ok(session_get(&state).await),
         "session-stats" => Ok(session_stats(&state).await),
-        "session-close" | "session-set" => Ok(json!({})),
+        "session-close" => Ok(json!({})),
+        "session-set" => session_set(&state, &args).await,
         "session-access-control" => Ok(json!({
             "blocklist-enabled": false,
             "rpc-authentication-required": false,
@@ -401,6 +404,7 @@ fn response(tag: Option<Value>, result: &str, arguments: Value) -> Value {
 }
 
 async fn session_get(state: &AppState) -> Value {
+    let limits = transmission_global_limits(state).await;
     json!({
         "version": "rtorrentNG",
         "rpc-version": 17,
@@ -409,13 +413,13 @@ async fn session_get(state: &AppState) -> Value {
         "config-dir": "/config",
         "start-added-torrents": true,
         "trash-original-torrent-files": false,
-        "speed-limit-down-enabled": false,
-        "speed-limit-up-enabled": false,
-        "speed-limit-down": 0,
-        "speed-limit-up": 0,
-        "alt-speed-enabled": false,
-        "alt-speed-down": 0,
-        "alt-speed-up": 0,
+        "speed-limit-down-enabled": limits.download_limit > 0,
+        "speed-limit-up-enabled": limits.upload_limit > 0,
+        "speed-limit-down": bytes_to_transmission_kib(limits.download_limit),
+        "speed-limit-up": bytes_to_transmission_kib(limits.upload_limit),
+        "alt-speed-enabled": limits.speed_limits_mode,
+        "alt-speed-down": bytes_to_transmission_kib(limits.download_limit),
+        "alt-speed-up": bytes_to_transmission_kib(limits.upload_limit),
         "download-queue-enabled": false,
         "download-queue-size": 0,
         "seed-queue-enabled": false,
@@ -880,6 +884,73 @@ fn percent_done(total: u64, left: u64) -> f64 {
     }
 }
 
+async fn session_set(state: &AppState, args: &Value) -> Result<Value, String> {
+    let Some(engine) = &state.engine else {
+        return Ok(json!({}));
+    };
+    let mut limits = engine.global_limits().await.unwrap_or_default();
+    if let Some(value) = transmission_i64_arg(args, "speed-limit-down")
+        .or_else(|| transmission_i64_arg(args, "alt-speed-down"))
+    {
+        limits.download_limit = transmission_kib_to_bytes(value);
+    }
+    if let Some(value) = transmission_i64_arg(args, "speed-limit-up")
+        .or_else(|| transmission_i64_arg(args, "alt-speed-up"))
+    {
+        limits.upload_limit = transmission_kib_to_bytes(value);
+    }
+    if matches!(
+        transmission_bool_arg(args, "speed-limit-down-enabled"),
+        Some(false)
+    ) {
+        limits.download_limit = 0;
+    }
+    if matches!(
+        transmission_bool_arg(args, "speed-limit-up-enabled"),
+        Some(false)
+    ) {
+        limits.upload_limit = 0;
+    }
+    if let Some(enabled) = transmission_bool_arg(args, "alt-speed-enabled") {
+        limits.speed_limits_mode = enabled;
+    }
+    engine.update_global_limits(limits).await?;
+    Ok(json!({}))
+}
+
+async fn transmission_global_limits(state: &AppState) -> EngineGlobalLimits {
+    let Some(engine) = &state.engine else {
+        return EngineGlobalLimits::default();
+    };
+    engine.global_limits().await.unwrap_or_default()
+}
+
+fn transmission_i64_arg(args: &Value, key: &str) -> Option<i64> {
+    args.get(key)
+        .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))
+}
+
+fn transmission_bool_arg(args: &Value, key: &str) -> Option<bool> {
+    match args.get(key)? {
+        Value::Bool(value) => Some(*value),
+        Value::Number(value) => Some(value.as_i64()? != 0),
+        Value::String(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Some(true),
+            "false" | "0" | "no" | "off" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn transmission_kib_to_bytes(value: i64) -> i64 {
+    value.max(0).saturating_mul(1024)
+}
+
+fn bytes_to_transmission_kib(value: i64) -> i64 {
+    value.max(0) / 1024
+}
+
 fn transmission_status(state: &str) -> i64 {
     match state {
         "paused" | "stopped" => 0,
@@ -1143,6 +1214,29 @@ mod tests {
                 "https://two/announce".to_owned(),
                 "http://three/announce".to_owned(),
             ]
+        );
+    }
+
+    #[test]
+    fn transmission_session_limit_args_use_kib_wire_units() {
+        let args = json!({
+            "speed-limit-down": "128",
+            "speed-limit-up-enabled": 0,
+            "alt-speed-enabled": "on"
+        });
+        assert_eq!(transmission_i64_arg(&args, "speed-limit-down"), Some(128));
+        assert_eq!(
+            transmission_kib_to_bytes(transmission_i64_arg(&args, "speed-limit-down").unwrap()),
+            131_072
+        );
+        assert_eq!(bytes_to_transmission_kib(131_072), 128);
+        assert_eq!(
+            transmission_bool_arg(&args, "speed-limit-up-enabled"),
+            Some(false)
+        );
+        assert_eq!(
+            transmission_bool_arg(&args, "alt-speed-enabled"),
+            Some(true)
         );
     }
 }

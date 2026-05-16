@@ -58,8 +58,8 @@ export function BulkActionBar({ hashes, onClear }: Props) {
   return (
     <div style={{
       minHeight: 44,
-      background: '#0a1628',
-      borderBottom: '1px solid #1e3a5f',
+      background: 'var(--panel)',
+      borderBottom: '1px solid var(--border)',
       display: 'flex',
       alignItems: 'center',
       padding: '6px 12px',
@@ -68,7 +68,7 @@ export function BulkActionBar({ hashes, onClear }: Props) {
       flexShrink: 0,
       fontSize: 12,
     }}>
-      <span style={{ color: '#3b82f6', fontWeight: 600, marginRight: 4 }}>
+      <span style={{ color: 'var(--accent)', fontWeight: 600, marginRight: 4 }}>
         {hashes.length} selected
       </span>
 
@@ -78,7 +78,7 @@ export function BulkActionBar({ hashes, onClear }: Props) {
           disabled={!!pending}
           onClick={() => runAction(a.key as 'start' | 'stop' | 'recheck' | 'reannounce', false)}
           style={{
-            background: '#1e2433',
+            background: 'var(--surface-2)',
             border: `1px solid ${a.color}40`,
             borderRadius: 4,
             color: a.color,
@@ -97,8 +97,8 @@ export function BulkActionBar({ hashes, onClear }: Props) {
         onChange={e => setCategory(e.target.value)}
         disabled={!!pending}
         style={{
-          background: '#0f172a', border: '1px solid #334155', borderRadius: 4,
-          color: '#94a3b8', padding: '3px 8px', fontSize: 12,
+          background: 'var(--surface)', border: '1px solid var(--border-strong)', borderRadius: 4,
+          color: 'var(--muted)', padding: '3px 8px', fontSize: 12,
           maxWidth: 150,
         }}
       >
@@ -111,8 +111,8 @@ export function BulkActionBar({ hashes, onClear }: Props) {
         disabled={!!pending}
         onClick={() => runAction('set-category', true)}
         style={{
-          background: 'transparent', border: '1px solid #475569', borderRadius: 4,
-          color: '#94a3b8', padding: '3px 8px', fontSize: 12,
+          background: 'transparent', border: '1px solid var(--border-strong)', borderRadius: 4,
+          color: 'var(--muted)', padding: '3px 8px', fontSize: 12,
           cursor: pending ? 'not-allowed' : 'pointer',
         }}
       >
@@ -122,8 +122,8 @@ export function BulkActionBar({ hashes, onClear }: Props) {
         disabled={!!pending}
         onClick={() => runAction('set-category', false)}
         style={{
-          background: '#1e2433', border: '1px solid #3b82f640', borderRadius: 4,
-          color: '#3b82f6', padding: '3px 8px', fontSize: 12,
+          background: 'var(--accent-soft)', border: '1px solid var(--accent)', borderRadius: 4,
+          color: 'var(--accent-text)', padding: '3px 8px', fontSize: 12,
           cursor: pending ? 'not-allowed' : 'pointer',
         }}
       >
@@ -136,8 +136,8 @@ export function BulkActionBar({ hashes, onClear }: Props) {
         disabled={!!pending}
         placeholder="Save path…"
         style={{
-          width: 180, background: '#0f172a', border: '1px solid #334155',
-          borderRadius: 4, color: '#cbd5e1', padding: '3px 8px',
+          width: 180, background: 'var(--surface)', border: '1px solid var(--border-strong)',
+          borderRadius: 4, color: 'var(--text)', padding: '3px 8px',
           fontSize: 12, fontFamily: 'monospace',
         }}
       />
@@ -145,8 +145,8 @@ export function BulkActionBar({ hashes, onClear }: Props) {
         disabled={!!pending || !savePath.trim()}
         onClick={() => runAction('set-location', true)}
         style={{
-          background: 'transparent', border: '1px solid #475569', borderRadius: 4,
-          color: '#94a3b8', padding: '3px 8px', fontSize: 12,
+          background: 'transparent', border: '1px solid var(--border-strong)', borderRadius: 4,
+          color: 'var(--muted)', padding: '3px 8px', fontSize: 12,
           cursor: pending || !savePath.trim() ? 'not-allowed' : 'pointer',
           opacity: savePath.trim() ? 1 : 0.5,
         }}
@@ -157,8 +157,8 @@ export function BulkActionBar({ hashes, onClear }: Props) {
         disabled={!!pending || !savePath.trim()}
         onClick={() => runAction('set-location', false)}
         style={{
-          background: '#1e2433', border: '1px solid #3b82f640', borderRadius: 4,
-          color: '#3b82f6', padding: '3px 8px', fontSize: 12,
+          background: 'var(--accent-soft)', border: '1px solid var(--accent)', borderRadius: 4,
+          color: 'var(--accent-text)', padding: '3px 8px', fontSize: 12,
           cursor: pending || !savePath.trim() ? 'not-allowed' : 'pointer',
           opacity: savePath.trim() ? 1 : 0.5,
         }}
@@ -171,9 +171,9 @@ export function BulkActionBar({ hashes, onClear }: Props) {
         onClick={() => runAction('stop', true)}
         style={{
           background: 'transparent',
-          border: '1px solid #475569',
+          border: '1px solid var(--border-strong)',
           borderRadius: 4,
-          color: '#94a3b8',
+          color: 'var(--muted)',
           padding: '3px 10px',
           fontSize: 12,
           cursor: pending ? 'not-allowed' : 'pointer',
@@ -184,7 +184,7 @@ export function BulkActionBar({ hashes, onClear }: Props) {
       </button>
 
       {preview && (
-        <span style={{ color: '#94a3b8', fontSize: 11 }}>
+        <span style={{ color: 'var(--muted)', fontSize: 11 }}>
           Preview: {preview.applied.length} would be affected
         </span>
       )}
@@ -198,7 +198,7 @@ export function BulkActionBar({ hashes, onClear }: Props) {
           marginLeft: 'auto',
           background: 'none',
           border: 'none',
-          color: '#475569',
+          color: 'var(--faint)',
           cursor: 'pointer',
           fontSize: 13,
           padding: '2px 6px',

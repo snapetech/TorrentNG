@@ -22,13 +22,13 @@ interface Props {
 
 const LABEL: React.CSSProperties = {
   fontSize: 10, fontWeight: 600, letterSpacing: '0.06em',
-  textTransform: 'uppercase' as const, color: '#475569', marginBottom: 2,
+  textTransform: 'uppercase' as const, color: 'var(--faint)', marginBottom: 2,
 }
 const VALUE: React.CSSProperties = {
-  fontSize: 12, color: '#cbd5e1', wordBreak: 'break-all' as const, marginBottom: 12,
+  fontSize: 12, color: 'var(--text)', wordBreak: 'break-all' as const, marginBottom: 12,
 }
 const MONO: React.CSSProperties = {
-  ...VALUE, fontFamily: 'monospace', fontSize: 11, color: '#94a3b8',
+  ...VALUE, fontFamily: 'monospace', fontSize: 11, color: 'var(--muted)',
 }
 
 function ActionBtn({
@@ -36,7 +36,7 @@ function ActionBtn({
 }: { label: string; color: string; onClick: () => void; disabled?: boolean }) {
   return (
     <button onClick={onClick} disabled={disabled} style={{
-      background: '#1e2433',
+      background: 'var(--surface-2)',
       border: `1px solid ${color}55`,
       borderRadius: 4,
       color,
@@ -124,26 +124,26 @@ export function TorrentDetail({ torrent: t, onClose }: Props) {
 
   return (
     <aside style={{
-      width: 340, background: '#0d1117', borderLeft: '1px solid #1e2433',
+      width: 340, background: 'var(--bg)', borderLeft: '1px solid var(--border)',
       display: 'flex', flexDirection: 'column', flexShrink: 0, fontSize: 12,
     }}>
       {/* Header */}
       <div style={{
-        padding: '10px 14px', borderBottom: '1px solid #1e2433',
+        padding: '10px 14px', borderBottom: '1px solid var(--border)',
         display: 'flex', alignItems: 'flex-start', gap: 8,
       }}>
-        <span style={{ flex: 1, fontWeight: 600, fontSize: 13, color: '#e2e8f0', lineHeight: 1.3 }}>
+        <span style={{ flex: 1, fontWeight: 600, fontSize: 13, color: 'var(--text)', lineHeight: 1.3 }}>
           {t.name}
         </span>
         <button onClick={onClose} style={{
           background: 'none', border: 'none', cursor: 'pointer',
-          color: '#475569', fontSize: 16, padding: '0 4px', flexShrink: 0,
+          color: 'var(--faint)', fontSize: 16, padding: '0 4px', flexShrink: 0,
         }}>✕</button>
       </div>
 
       {/* Action buttons */}
       <div style={{
-        padding: '8px 14px', borderBottom: '1px solid #1e2433',
+        padding: '8px 14px', borderBottom: '1px solid var(--border)',
         display: 'flex', flexWrap: 'wrap', gap: 6,
       }}>
         {isRunning
@@ -158,22 +158,22 @@ export function TorrentDetail({ torrent: t, onClose }: Props) {
       {/* Delete confirmation */}
       {confirmDelete && (
         <div style={{
-          padding: '10px 14px', background: '#1a0a0a', borderBottom: '1px solid #7f1d1d',
+          padding: '10px 14px', background: 'color-mix(in srgb, var(--danger) 12%, var(--panel))', borderBottom: '1px solid var(--danger)',
           fontSize: 12,
         }}>
-          <div style={{ color: '#fca5a5', marginBottom: 8 }}>Delete "{t.name}"?</div>
+          <div style={{ color: 'var(--danger)', marginBottom: 8 }}>Delete "{t.name}"?</div>
           <div style={{ display: 'flex', gap: 6 }}>
             <button onClick={() => remove(false)} style={{
-              background: '#7f1d1d', border: 'none', borderRadius: 4,
-              color: '#fca5a5', padding: '3px 10px', fontSize: 11, cursor: 'pointer',
+              background: 'color-mix(in srgb, var(--danger) 18%, var(--surface-2))', border: 'none', borderRadius: 4,
+              color: 'var(--danger)', padding: '3px 10px', fontSize: 11, cursor: 'pointer',
             }}>Remove torrent</button>
             <button onClick={() => remove(true)} style={{
-              background: '#991b1b', border: 'none', borderRadius: 4,
-              color: '#fca5a5', padding: '3px 10px', fontSize: 11, cursor: 'pointer',
+              background: 'color-mix(in srgb, var(--danger) 28%, var(--surface-2))', border: 'none', borderRadius: 4,
+              color: 'var(--danger)', padding: '3px 10px', fontSize: 11, cursor: 'pointer',
             }}>+ Delete files</button>
             <button onClick={() => setConfirmDelete(false)} style={{
-              background: 'none', border: '1px solid #334155', borderRadius: 4,
-              color: '#64748b', padding: '3px 8px', fontSize: 11, cursor: 'pointer',
+              background: 'none', border: '1px solid var(--border-strong)', borderRadius: 4,
+              color: 'var(--faint)', padding: '3px 8px', fontSize: 11, cursor: 'pointer',
             }}>Cancel</button>
           </div>
         </div>
@@ -185,13 +185,13 @@ export function TorrentDetail({ torrent: t, onClose }: Props) {
         {/* Progress bar */}
         <div style={{ marginBottom: 14 }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
-            <span style={{ fontSize: 11, color: '#64748b' }}>Progress</span>
-            <span style={{ fontSize: 11, color: '#94a3b8' }}>{progress.toFixed(1)}%</span>
+            <span style={{ fontSize: 11, color: 'var(--faint)' }}>Progress</span>
+            <span style={{ fontSize: 11, color: 'var(--muted)' }}>{progress.toFixed(1)}%</span>
           </div>
-          <div style={{ height: 4, background: '#1e2433', borderRadius: 2, overflow: 'hidden' }}>
+          <div style={{ height: 4, background: 'var(--surface-2)', borderRadius: 2, overflow: 'hidden' }}>
             <div style={{
               width: `${progress}%`, height: '100%',
-              background: progress >= 100 ? '#22c55e' : '#3b82f6', borderRadius: 2,
+              background: progress >= 100 ? 'var(--success)' : 'var(--accent)', borderRadius: 2,
             }} />
           </div>
         </div>
@@ -225,7 +225,7 @@ export function TorrentDetail({ torrent: t, onClose }: Props) {
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 12 }}>
             {tags.map(tag => (
               <span key={tag} style={{
-                background: '#1e2433', color: '#94a3b8',
+                background: 'var(--surface-2)', color: 'var(--muted)',
                 padding: '1px 7px', borderRadius: 10, fontSize: 11,
               }}>{tag}</span>
             ))}
@@ -241,8 +241,8 @@ export function TorrentDetail({ torrent: t, onClose }: Props) {
                 setEditingPath(true)
               }}
               style={{
-                background: 'none', border: '1px solid #334155', borderRadius: 4,
-                color: '#64748b', padding: '1px 6px', fontSize: 10, cursor: 'pointer',
+                background: 'none', border: '1px solid var(--border-strong)', borderRadius: 4,
+                color: 'var(--faint)', padding: '1px 6px', fontSize: 10, cursor: 'pointer',
               }}
             >
               Edit
@@ -256,8 +256,8 @@ export function TorrentDetail({ torrent: t, onClose }: Props) {
               onChange={e => setSavePath(e.target.value)}
               disabled={busy}
               style={{
-                width: '100%', boxSizing: 'border-box', background: '#0f172a',
-                border: '1px solid #334155', borderRadius: 4, color: '#cbd5e1',
+                width: '100%', boxSizing: 'border-box', background: 'var(--surface)',
+                border: '1px solid var(--border-strong)', borderRadius: 4, color: 'var(--text)',
                 padding: '5px 7px', fontSize: 11, fontFamily: 'monospace',
               }}
             />
@@ -266,8 +266,8 @@ export function TorrentDetail({ torrent: t, onClose }: Props) {
                 onClick={() => setEditingPath(false)}
                 disabled={busy}
                 style={{
-                  background: 'none', border: '1px solid #334155', borderRadius: 4,
-                  color: '#64748b', padding: '3px 8px', fontSize: 11, cursor: 'pointer',
+                  background: 'none', border: '1px solid var(--border-strong)', borderRadius: 4,
+                  color: 'var(--faint)', padding: '3px 8px', fontSize: 11, cursor: 'pointer',
                 }}
               >
                 Cancel
@@ -276,8 +276,8 @@ export function TorrentDetail({ torrent: t, onClose }: Props) {
                 onClick={saveLocation}
                 disabled={busy || !savePath.trim()}
                 style={{
-                  background: '#1e40af', border: 'none', borderRadius: 4,
-                  color: '#bfdbfe', padding: '3px 10px', fontSize: 11,
+                  background: 'var(--accent-soft)', border: '1px solid var(--accent)', borderRadius: 4,
+                  color: 'var(--accent-text)', padding: '3px 10px', fontSize: 11,
                   cursor: busy || !savePath.trim() ? 'not-allowed' : 'pointer',
                   opacity: busy || !savePath.trim() ? 0.5 : 1,
                 }}
@@ -292,7 +292,7 @@ export function TorrentDetail({ torrent: t, onClose }: Props) {
 
         {t.message && (<>
           <div style={LABEL}>Message</div>
-          <div style={{ ...VALUE, color: '#f59e0b' }}>{t.message}</div>
+          <div style={{ ...VALUE, color: 'var(--warning)' }}>{t.message}</div>
         </>)}
 
         <div style={LABEL}>Hash</div>
@@ -308,8 +308,8 @@ export function TorrentDetail({ torrent: t, onClose }: Props) {
                 disabled={busy}
                 placeholder="udp://tracker.example/announce"
                 style={{
-                  flex: 1, minWidth: 0, background: '#0f172a',
-                  border: '1px solid #334155', borderRadius: 4, color: '#cbd5e1',
+                  flex: 1, minWidth: 0, background: 'var(--surface)',
+                  border: '1px solid var(--border-strong)', borderRadius: 4, color: 'var(--text)',
                   padding: '5px 7px', fontSize: 11, fontFamily: 'monospace',
                 }}
               />
@@ -317,8 +317,8 @@ export function TorrentDetail({ torrent: t, onClose }: Props) {
                 onClick={addTracker}
                 disabled={busy || !newTracker.trim()}
                 style={{
-                  background: '#1e40af', border: 'none', borderRadius: 4,
-                  color: '#bfdbfe', padding: '3px 9px', fontSize: 11,
+                  background: 'var(--accent-soft)', border: '1px solid var(--accent)', borderRadius: 4,
+                  color: 'var(--accent-text)', padding: '3px 9px', fontSize: 11,
                   cursor: busy || !newTracker.trim() ? 'not-allowed' : 'pointer',
                   opacity: busy || !newTracker.trim() ? 0.5 : 1,
                 }}
@@ -330,29 +330,29 @@ export function TorrentDetail({ torrent: t, onClose }: Props) {
               <div key={i} style={{ marginBottom: 8 }}>
                 <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
                   <div style={{
-                    flex: 1, minWidth: 0, fontSize: 11, color: '#94a3b8', overflow: 'hidden',
+                    flex: 1, minWidth: 0, fontSize: 11, color: 'var(--muted)', overflow: 'hidden',
                     textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontFamily: 'monospace',
                   }} title={tr.url}>{tr.url}</div>
                   <button
                     onClick={() => removeTracker(tr.url)}
                     disabled={busy}
                     style={{
-                      background: 'none', border: '1px solid #334155', borderRadius: 4,
-                      color: '#64748b', padding: '1px 6px', fontSize: 10,
+                      background: 'none', border: '1px solid var(--border-strong)', borderRadius: 4,
+                      color: 'var(--faint)', padding: '1px 6px', fontSize: 10,
                       cursor: busy ? 'not-allowed' : 'pointer', opacity: busy ? 0.5 : 1,
                     }}
                   >
                     Remove
                   </button>
                 </div>
-                <div style={{ fontSize: 10, color: '#475569', marginTop: 1 }}>
+                <div style={{ fontSize: 10, color: 'var(--faint)', marginTop: 1 }}>
                   {tr.scrape_complete} seeds · {tr.scrape_incomplete} peers
                   {tr.message ? ` · ${tr.message}` : ''}
                 </div>
               </div>
             ))}
             {trackers.length === 0 && (
-              <div style={{ fontSize: 11, color: '#475569', marginBottom: 8 }}>No trackers</div>
+              <div style={{ fontSize: 11, color: 'var(--faint)', marginBottom: 8 }}>No trackers</div>
             )}
           </Section>
         )}
@@ -365,14 +365,14 @@ export function TorrentDetail({ torrent: t, onClose }: Props) {
               return (
                 <div key={f.index} style={{ marginBottom: 8 }}>
                   <div style={{
-                    fontSize: 11, color: '#94a3b8', overflow: 'hidden',
+                    fontSize: 11, color: 'var(--muted)', overflow: 'hidden',
                     textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                   }} title={f.path}>{f.path.split('/').pop()}</div>
                   <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 2 }}>
-                    <div style={{ flex: 1, height: 2, background: '#1e2433', borderRadius: 1, overflow: 'hidden' }}>
-                      <div style={{ width: `${fp}%`, height: '100%', background: fp >= 100 ? '#22c55e' : '#3b82f6' }} />
+                    <div style={{ flex: 1, height: 2, background: 'var(--surface-2)', borderRadius: 1, overflow: 'hidden' }}>
+                      <div style={{ width: `${fp}%`, height: '100%', background: fp >= 100 ? 'var(--success)' : 'var(--accent)' }} />
                     </div>
-                    <span style={{ fontSize: 10, color: '#475569', flexShrink: 0 }}>{fmtSize(f.size_bytes)}</span>
+                    <span style={{ fontSize: 10, color: 'var(--faint)', flexShrink: 0 }}>{fmtSize(f.size_bytes)}</span>
                   </div>
                 </div>
               )
@@ -391,7 +391,7 @@ function Section({ title, children }: { title: string; children: React.ReactNode
     <div style={{ marginTop: 16 }}>
       <div style={{
         fontSize: 10, fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase',
-        color: '#3b82f6', borderBottom: '1px solid #1e2433', paddingBottom: 4, marginBottom: 8,
+        color: 'var(--accent)', borderBottom: '1px solid var(--border)', paddingBottom: 4, marginBottom: 8,
       }}>{title}</div>
       {children}
     </div>

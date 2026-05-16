@@ -694,12 +694,12 @@ function DeleteDialog({ torrent, onCancel, onRemove, onRemoveFiles }: {
       display: 'grid', placeItems: 'center', padding: 24,
     }}>
       <div style={{
-        width: 'min(480px, 100%)', background: '#0f141d', border: '1px solid #7f1d1d',
-        borderRadius: 8, boxShadow: '0 24px 60px rgba(0,0,0,0.5)',
+        width: 'min(480px, 100%)', background: 'var(--panel)', border: '1px solid var(--danger)',
+        borderRadius: 8, boxShadow: '0 24px 60px var(--shadow)',
       }}>
-        <div style={{ padding: 16, borderBottom: '1px solid #1e2433' }}>
-          <div style={{ fontSize: 16, fontWeight: 700, color: '#fecaca' }}>Delete torrent</div>
-          <div style={{ marginTop: 8, color: '#cbd5e1', fontSize: 13, lineHeight: 1.4, wordBreak: 'break-word' }}>{torrent.name}</div>
+        <div style={{ padding: 16, borderBottom: '1px solid var(--border)' }}>
+          <div style={{ fontSize: 16, fontWeight: 700, color: 'var(--danger)' }}>Delete torrent</div>
+          <div style={{ marginTop: 8, color: 'var(--text)', fontSize: 13, lineHeight: 1.4, wordBreak: 'break-word' }}>{torrent.name}</div>
         </div>
         <div style={{ padding: 14, display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
           <button onClick={onCancel} style={dialogButton('#64748b')}>Cancel</button>
@@ -730,7 +730,7 @@ const supportButton: React.CSSProperties = {
 
 function dialogButton(color: string): React.CSSProperties {
   return {
-    background: '#1e2433',
+    background: 'var(--surface-2)',
     border: `1px solid ${color}66`,
     borderRadius: 5,
     color,
@@ -766,18 +766,18 @@ function LoginScreen({ message, onLogin }: {
 
   return (
     <div style={{
-      minHeight: '100vh', background: '#0d1117', color: '#e2e8f0',
+      minHeight: '100vh', background: 'var(--bg)', color: 'var(--text)',
       display: 'grid', placeItems: 'center', padding: 24,
     }}>
       <form onSubmit={submit} style={{
-        width: 'min(360px, 100%)', border: '1px solid #1e2433', borderRadius: 8,
-        background: '#0f141d', padding: 20, display: 'flex', flexDirection: 'column', gap: 12,
+        width: 'min(360px, 100%)', border: '1px solid var(--border)', borderRadius: 8,
+        background: 'var(--panel)', padding: 20, display: 'flex', flexDirection: 'column', gap: 12,
       }}>
         <div>
           <div style={{ fontWeight: 700, fontSize: 18 }}>rtorrentNG</div>
-          <div style={{ color: '#64748b', fontSize: 12, marginTop: 4 }}>Sign in to manage torrents</div>
+          <div style={{ color: 'var(--faint)', fontSize: 12, marginTop: 4 }}>Sign in to manage torrents</div>
         </div>
-        <label style={{ display: 'flex', flexDirection: 'column', gap: 5, fontSize: 12, color: '#94a3b8' }}>
+        <label style={{ display: 'flex', flexDirection: 'column', gap: 5, fontSize: 12, color: 'var(--muted)' }}>
           Username
           <input
             autoFocus
@@ -785,12 +785,12 @@ function LoginScreen({ message, onLogin }: {
             onChange={e => setUsername(e.target.value)}
             autoComplete="username"
             style={{
-              background: '#0d1117', border: '1px solid #334155', borderRadius: 5,
-              color: '#e2e8f0', padding: '8px 10px', fontSize: 14,
+              background: 'var(--surface)', border: '1px solid var(--border-strong)', borderRadius: 5,
+              color: 'var(--text)', padding: '8px 10px', fontSize: 14,
             }}
           />
         </label>
-        <label style={{ display: 'flex', flexDirection: 'column', gap: 5, fontSize: 12, color: '#94a3b8' }}>
+        <label style={{ display: 'flex', flexDirection: 'column', gap: 5, fontSize: 12, color: 'var(--muted)' }}>
           Password
           <input
             type="password"
@@ -798,15 +798,15 @@ function LoginScreen({ message, onLogin }: {
             onChange={e => setPassword(e.target.value)}
             autoComplete="current-password"
             style={{
-              background: '#0d1117', border: '1px solid #334155', borderRadius: 5,
-              color: '#e2e8f0', padding: '8px 10px', fontSize: 14,
+              background: 'var(--surface)', border: '1px solid var(--border-strong)', borderRadius: 5,
+              color: 'var(--text)', padding: '8px 10px', fontSize: 14,
             }}
           />
         </label>
-        {error && <div style={{ color: '#f87171', fontSize: 12 }}>{error}</div>}
+        {error && <div style={{ color: 'var(--danger)', fontSize: 12 }}>{error}</div>}
         <button disabled={busy} style={{
-          marginTop: 4, background: busy ? '#1e293b' : '#1e3a5f',
-          border: '1px solid #3b82f6', borderRadius: 5, color: '#bfdbfe',
+          marginTop: 4, background: busy ? 'var(--surface-2)' : 'var(--accent-soft)',
+          border: '1px solid var(--accent)', borderRadius: 5, color: 'var(--accent-text)',
           padding: '8px 12px', fontSize: 13, cursor: busy ? 'default' : 'pointer',
         }}>
           {busy ? 'Signing in...' : 'Sign in'}
