@@ -21,13 +21,15 @@ interface WsEvent {
   download_speed?: number
 }
 
-export function useWebSocket(onStats?: (up: number, dn: number) => void) {
+export function useWebSocket(onStats?: (up: number, dn: number) => void, enabled = true) {
   const qc = useQueryClient()
   const ws = useRef<WebSocket | null>(null)
   const statsRef = useRef(onStats)
   statsRef.current = onStats
 
   useEffect(() => {
+    if (!enabled) return
+
     let reconnectTimer: ReturnType<typeof setTimeout>
     let closed = false
 
@@ -99,5 +101,5 @@ export function useWebSocket(onStats?: (up: number, dn: number) => void) {
       clearTimeout(reconnectTimer)
       ws.current?.close()
     }
-  }, [qc])
+  }, [qc, enabled])
 }

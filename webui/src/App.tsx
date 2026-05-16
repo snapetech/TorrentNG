@@ -1,4 +1,5 @@
 import { useState, useCallback, useEffect } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
 import { useTorrentsInfinite, flattenPages, useHealth } from './hooks/useTorrents'
 import { useWebSocket } from './hooks/useWebSocket'
 import { TorrentTable } from './components/TorrentTable'
@@ -15,9 +16,10 @@ import { RatioGroupsPanel } from './components/RatioGroupsPanel'
 import { WorkflowsPanel } from './components/WorkflowsPanel'
 import { RssRulesPanel } from './components/RssRulesPanel'
 import { EnginePanel } from './components/EnginePanel'
-import type { ListParams, TorrentSummary } from './api/client'
+import { api, AuthError, type ListParams, type TorrentSummary } from './api/client'
 
 type View = 'torrents' | 'settings'
+type AuthState = 'checking' | 'authenticated' | 'unauthenticated'
 
 function fmtSpeed(bps: number): string {
   if (!bps) return '0 B/s'
@@ -28,6 +30,9 @@ function fmtSpeed(bps: number): string {
 }
 
 export function App() {
+  const qc = useQueryClient()
+  const [authState, setAuthState] = useState<AuthState>('checking')
+  const [authMessage, setAuthMessage] = useState('')
   const [view, setView] = useState<View>('torrents')
   const [params, setParams] = useState<Omit<ListParams, 'limit' | 'offset'>>({
     sort: 'name',
@@ -38,12 +43,37 @@ export function App() {
   const [speeds, setSpeeds] = useState({ up: 0, dn: 0 })
   const [addOpen, setAddOpen] = useState(false)
 
-  const query = useTorrentsInfinite(params)
+  const isAuthed = authState === 'authenticated'
+  const query = useTorrentsInfinite(params, isAuthed)
   const { torrents, total } = flattenPages(query.data)
   const { data: health } = useHealth()
 
   const handleStats = useCallback((up: number, dn: number) => setSpeeds({ up, dn }), [])
-  useWebSocket(handleStats)
+  useWebSocket(handleStats, isAuthed)
+
+  useEffect(() => {
+    let cancelled = false
+    api.auth.check()
+      .then(() => {
+        if (!cancelled) setAuthState('authenticated')
+      })
+      .catch((err) => {
+        if (cancelled) return
+        setAuthState('unauthenticated')
+        if (!(err instanceof AuthError)) {
+          setAuthMessage('Could not reach the API.')
+        }
+      })
+    return () => { cancelled = true }
+  }, [])
+
+  useEffect(() => {
+    if (query.error instanceof AuthError) {
+      setAuthState('unauthenticated')
+      setSelected(new Set())
+      setDetailHash(null)
+    }
+  }, [query.error])
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -99,6 +129,39 @@ export function App() {
   const detailTorrent: TorrentSummary | undefined =
     detailHash ? torrents.find(t => t.hash === detailHash) : undefined
 
+  async function handleLogin(username: string, password: string) {
+    setAuthMessage('')
+    await api.auth.login(username, password)
+    setAuthState('authenticated')
+    setSelected(new Set())
+    setDetailHash(null)
+    await qc.invalidateQueries()
+  }
+
+  async function handleLogout() {
+    await api.auth.logout()
+    setAuthState('unauthenticated')
+    setSelected(new Set())
+    setDetailHash(null)
+    setSpeeds({ up: 0, dn: 0 })
+    qc.clear()
+  }
+
+  if (authState === 'checking') {
+    return (
+      <div style={{
+        minHeight: '100vh', background: '#0d1117', color: '#64748b',
+        display: 'grid', placeItems: 'center', fontSize: 13,
+      }}>
+        Checking session...
+      </div>
+    )
+  }
+
+  if (authState === 'unauthenticated') {
+    return <LoginScreen message={authMessage} onLogin={handleLogin} />
+  }
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', background: '#0d1117', color: '#e2e8f0' }}>
       {/* Topbar */}
@@ -152,6 +215,10 @@ export function App() {
         <span style={{ fontSize: 11, color: '#22c55e' }}>
           ↑ {fmtSpeed(speeds.up)}
         </span>
+        <button onClick={handleLogout} title="Log out" style={{
+          background: 'transparent', border: '1px solid #334155', borderRadius: 5,
+          color: '#94a3b8', padding: '3px 10px', fontSize: 12, cursor: 'pointer',
+        }}>Log out</button>
       </header>
 
       {view === 'torrents' && (
@@ -238,6 +305,82 @@ export function App() {
       </main>
 
       {addOpen && <AddTorrentDialog onClose={() => setAddOpen(false)} />}
+    </div>
+  )
+}
+
+function LoginScreen({ message, onLogin }: {
+  message: string
+  onLogin: (username: string, password: string) => Promise<void>
+}) {
+  const [username, setUsername] = useState('keith')
+  const [password, setPassword] = useState('')
+  const [error, setError] = useState(message)
+  const [busy, setBusy] = useState(false)
+
+  useEffect(() => setError(message), [message])
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault()
+    setBusy(true)
+    setError('')
+    try {
+      await onLogin(username.trim(), password)
+    } catch (err) {
+      setError(err instanceof AuthError ? err.message : 'Login failed.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div style={{
+      minHeight: '100vh', background: '#0d1117', color: '#e2e8f0',
+      display: 'grid', placeItems: 'center', padding: 24,
+    }}>
+      <form onSubmit={submit} style={{
+        width: 'min(360px, 100%)', border: '1px solid #1e2433', borderRadius: 8,
+        background: '#0f141d', padding: 20, display: 'flex', flexDirection: 'column', gap: 12,
+      }}>
+        <div>
+          <div style={{ fontWeight: 700, fontSize: 18 }}>rtorrentNG</div>
+          <div style={{ color: '#64748b', fontSize: 12, marginTop: 4 }}>Sign in to manage torrents</div>
+        </div>
+        <label style={{ display: 'flex', flexDirection: 'column', gap: 5, fontSize: 12, color: '#94a3b8' }}>
+          Username
+          <input
+            autoFocus
+            value={username}
+            onChange={e => setUsername(e.target.value)}
+            autoComplete="username"
+            style={{
+              background: '#0d1117', border: '1px solid #334155', borderRadius: 5,
+              color: '#e2e8f0', padding: '8px 10px', fontSize: 14,
+            }}
+          />
+        </label>
+        <label style={{ display: 'flex', flexDirection: 'column', gap: 5, fontSize: 12, color: '#94a3b8' }}>
+          Password
+          <input
+            type="password"
+            value={password}
+            onChange={e => setPassword(e.target.value)}
+            autoComplete="current-password"
+            style={{
+              background: '#0d1117', border: '1px solid #334155', borderRadius: 5,
+              color: '#e2e8f0', padding: '8px 10px', fontSize: 14,
+            }}
+          />
+        </label>
+        {error && <div style={{ color: '#f87171', fontSize: 12 }}>{error}</div>}
+        <button disabled={busy} style={{
+          marginTop: 4, background: busy ? '#1e293b' : '#1e3a5f',
+          border: '1px solid #3b82f6', borderRadius: 5, color: '#bfdbfe',
+          padding: '8px 12px', fontSize: 13, cursor: busy ? 'default' : 'pointer',
+        }}>
+          {busy ? 'Signing in...' : 'Sign in'}
+        </button>
+      </form>
     </div>
   )
 }

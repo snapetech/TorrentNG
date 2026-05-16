@@ -1,5 +1,12 @@
 const BASE = '/api/v1'
 
+export class AuthError extends Error {
+  constructor(message = 'Unauthorized') {
+    super(message)
+    this.name = 'AuthError'
+  }
+}
+
 export interface TorrentSummary {
   hash: string
   name: string
@@ -52,13 +59,15 @@ async function get<T>(path: string, params?: Record<string, string | number>): P
       if (v !== undefined && v !== '') url.searchParams.set(k, String(v))
     }
   }
-  const res = await fetch(url)
+  const res = await fetch(url, { credentials: 'same-origin' })
+  if (res.status === 401) throw new AuthError()
   if (!res.ok) throw new Error(`API ${res.status}: ${url.pathname}`)
   return res.json()
 }
 
 async function getRoot<T>(path: string): Promise<T> {
-  const res = await fetch(path)
+  const res = await fetch(path, { credentials: 'same-origin' })
+  if (res.status === 401) throw new AuthError()
   if (!res.ok) throw new Error(`API ${res.status}: ${path}`)
   return res.json()
 }
@@ -69,7 +78,9 @@ async function post<T = void>(path: string, body?: FormData | object): Promise<T
     method: 'POST',
     headers: isForm ? undefined : { 'Content-Type': 'application/json', 'X-RTNG-CSRF': '1' },
     body: isForm ? body : body !== undefined ? JSON.stringify(body) : undefined,
+    credentials: 'same-origin',
   })
+  if (res.status === 401) throw new AuthError()
   if (!res.ok) throw new Error(`API ${res.status}: ${path}`)
   const ct = res.headers.get('content-type') ?? ''
   if (ct.includes('application/json')) return res.json() as Promise<T>
@@ -81,7 +92,9 @@ async function put<T = void>(path: string, body: object): Promise<T> {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json', 'X-RTNG-CSRF': '1' },
     body: JSON.stringify(body),
+    credentials: 'same-origin',
   })
+  if (res.status === 401) throw new AuthError()
   if (!res.ok) throw new Error(`API ${res.status}: ${path}`)
   const ct = res.headers.get('content-type') ?? ''
   if (ct.includes('application/json')) return res.json() as Promise<T>
@@ -93,7 +106,9 @@ async function patch<T = void>(path: string, body: object): Promise<T> {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json', 'X-RTNG-CSRF': '1' },
     body: JSON.stringify(body),
+    credentials: 'same-origin',
   })
+  if (res.status === 401) throw new AuthError()
   if (!res.ok) throw new Error(`API ${res.status}: ${path}`)
   const ct = res.headers.get('content-type') ?? ''
   if (ct.includes('application/json')) return res.json() as Promise<T>
@@ -105,7 +120,9 @@ async function del(path: string, body?: object): Promise<void> {
     method: 'DELETE',
     headers: body ? { 'Content-Type': 'application/json', 'X-RTNG-CSRF': '1' } : { 'X-RTNG-CSRF': '1' },
     body: body ? JSON.stringify(body) : undefined,
+    credentials: 'same-origin',
   })
+  if (res.status === 401) throw new AuthError()
   if (!res.ok) throw new Error(`API ${res.status}: ${path}`)
 }
 
@@ -114,9 +131,34 @@ async function delJson<T>(path: string, body?: object): Promise<T> {
     method: 'DELETE',
     headers: body ? { 'Content-Type': 'application/json', 'X-RTNG-CSRF': '1' } : { 'X-RTNG-CSRF': '1' },
     body: body ? JSON.stringify(body) : undefined,
+    credentials: 'same-origin',
   })
+  if (res.status === 401) throw new AuthError()
   if (!res.ok) throw new Error(`API ${res.status}: ${path}`)
   return res.json() as Promise<T>
+}
+
+async function login(username: string, password: string): Promise<void> {
+  const form = new URLSearchParams()
+  form.set('username', username)
+  form.set('password', password)
+  const res = await fetch('/api/qb/v2/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: form,
+    credentials: 'same-origin',
+  })
+  const text = await res.text()
+  if (!res.ok || text.trim() !== 'Ok.') {
+    throw new AuthError('Invalid username or password')
+  }
+}
+
+async function logout(): Promise<void> {
+  await fetch('/api/qb/v2/auth/logout', {
+    method: 'POST',
+    credentials: 'same-origin',
+  })
 }
 
 export interface Category {
@@ -337,6 +379,12 @@ interface FilesResponse {
 }
 
 export const api = {
+  auth: {
+    login,
+    logout,
+    check: (): Promise<TorrentListResponse> => get('/torrents', { limit: 1 }),
+  },
+
   torrents: {
     list: (p: ListParams = {}): Promise<TorrentListResponse> =>
       get('/torrents', p as Record<string, string | number>),

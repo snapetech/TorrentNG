@@ -1,7 +1,7 @@
 use axum::{
     extract::{Form, Multipart, Query, State},
     http::{header, StatusCode},
-    response::IntoResponse,
+    response::{AppendHeaders, IntoResponse},
     routing::{get, post},
     Json, Router,
 };
@@ -148,10 +148,10 @@ async fn auth_login(
         let rtng_cookie = format!("rtng_session={candidate}; Path=/; HttpOnly; SameSite=Lax");
         let sid_cookie = format!("SID={candidate}; Path=/; HttpOnly; SameSite=Lax");
         (
-            [
+            AppendHeaders([
                 (header::SET_COOKIE, rtng_cookie),
                 (header::SET_COOKIE, sid_cookie),
-            ],
+            ]),
             "Ok.",
         )
             .into_response()
@@ -159,8 +159,20 @@ async fn auth_login(
         "Fails.".into_response()
     }
 }
-async fn auth_logout() -> StatusCode {
-    StatusCode::OK
+async fn auth_logout() -> impl IntoResponse {
+    (
+        AppendHeaders([
+            (
+                header::SET_COOKIE,
+                "rtng_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0",
+            ),
+            (
+                header::SET_COOKIE,
+                "SID=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0",
+            ),
+        ]),
+        StatusCode::OK,
+    )
 }
 
 async fn ok_form(Form(_f): Form<HashMap<String, String>>) -> StatusCode {

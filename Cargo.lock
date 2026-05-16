@@ -215,6 +215,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "hex"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
 name = "id-arena"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -574,6 +580,12 @@ dependencies = [
 name = "rt-fastresume"
 version = "0.1.0"
 dependencies = [
+ "hex",
+ "rt-path",
+ "rt-piece-map",
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror",
  "tracing",
 ]
@@ -590,8 +602,10 @@ dependencies = [
 name = "rt-jobs"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "thiserror",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -677,7 +691,13 @@ dependencies = [
 name = "rt-storage"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "rt-path",
+ "rt-piece-map",
+ "sha1",
+ "tempfile",
  "thiserror",
+ "tokio",
  "tracing",
 ]
 

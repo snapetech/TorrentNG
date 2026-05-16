@@ -1,0 +1,286 @@
+use std::path::Path;
+
+use sha1::{Digest, Sha1};
+use tracing::instrument;
+
+use rt_piece_map::{FileRegion, PieceMap};
+
+use crate::{
+    error::StorageError,
+    io_class::IoClass,
+    scheduler::{scheduled_read, MountScheduler},
+};
+
+/// Result of verifying a single piece.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifyResult {
+    /// SHA-1 matches the expected hash.
+    Valid,
+    /// SHA-1 does not match.
+    Invalid,
+    /// One or more files could not be read (missing, permission denied, etc.)
+    Missing { file_index: u32, reason: String },
+}
+
+/// Verifies piece data against expected SHA-1 hashes by reading directly
+/// from disk. Never uses mmap.
+pub struct PieceVerifier<'a> {
+    storage_root: &'a Path,
+    scheduler: &'a MountScheduler,
+    piece_map: &'a PieceMap,
+    expected_hashes: &'a [[u8; 20]],
+}
+
+impl<'a> PieceVerifier<'a> {
+    pub fn new(
+        storage_root: &'a Path,
+        scheduler: &'a MountScheduler,
+        piece_map: &'a PieceMap,
+        expected_hashes: &'a [[u8; 20]],
+    ) -> Self {
+        PieceVerifier {
+            storage_root,
+            scheduler,
+            piece_map,
+            expected_hashes,
+        }
+    }
+
+    /// Verify a single piece. Reads all file regions that compose the piece.
+    #[instrument(skip(self), fields(piece))]
+    pub async fn verify_piece(&self, piece: u32) -> VerifyResult {
+        let regions = match self.piece_map.piece_to_file_regions(piece) {
+            Ok(r) => r,
+            Err(e) => {
+                return VerifyResult::Missing {
+                    file_index: 0,
+                    reason: e.to_string(),
+                }
+            }
+        };
+
+        let expected = match self.expected_hashes.get(piece as usize) {
+            Some(h) => h,
+            None => {
+                return VerifyResult::Missing {
+                    file_index: 0,
+                    reason: format!("no hash for piece {piece}"),
+                }
+            }
+        };
+
+        let mut hasher = Sha1::new();
+
+        for region in &regions {
+            match self.read_region(region).await {
+                Ok(data) => hasher.update(&data),
+                Err(e) => {
+                    tracing::warn!(piece, file_index = region.file_index, error = %e, "file read failed during verify");
+                    return VerifyResult::Missing {
+                        file_index: region.file_index,
+                        reason: e.to_string(),
+                    };
+                }
+            }
+        }
+
+        let actual: [u8; 20] = hasher.finalize().into();
+        if &actual == expected {
+            tracing::debug!(piece, "piece valid");
+            VerifyResult::Valid
+        } else {
+            tracing::warn!(piece, "piece hash mismatch");
+            VerifyResult::Invalid
+        }
+    }
+
+    /// Verify all pieces, returning a bitset of valid pieces.
+    pub async fn verify_all(&self) -> Vec<VerifyResult> {
+        let mut results = Vec::with_capacity(self.piece_map.piece_count as usize);
+        for piece in 0..self.piece_map.piece_count {
+            results.push(self.verify_piece(piece).await);
+        }
+        results
+    }
+
+    /// Verify a range of pieces (for resumable recheck).
+    pub async fn verify_range(
+        &self,
+        start: u32,
+        end: u32,
+    ) -> Result<Vec<(u32, VerifyResult)>, StorageError> {
+        let end = end.min(self.piece_map.piece_count);
+        let mut results = Vec::with_capacity((end - start) as usize);
+        for piece in start..end {
+            let result = self.verify_piece(piece).await;
+            results.push((piece, result));
+        }
+        Ok(results)
+    }
+
+    async fn read_region(&self, region: &FileRegion) -> Result<bytes::Bytes, StorageError> {
+        let file_path = region.path.resolve(self.storage_root);
+        scheduled_read(
+            self.scheduler,
+            IoClass::Recheck,
+            &file_path,
+            region.file_offset,
+            region.length as usize,
+        )
+        .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rt_path::SafeRelPath;
+    use rt_piece_map::{FileSpan, PieceMap};
+    use sha1::{Digest, Sha1};
+
+    use crate::scheduler::{MountScheduler, SchedulerConfig};
+    use rt_path::{StorageProfile, StorageRootId};
+
+    fn ssd_scheduler() -> MountScheduler {
+        MountScheduler::new(
+            StorageRootId::new(),
+            &SchedulerConfig {
+                profile: StorageProfile::Ssd,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn piece_hash(data: &[u8]) -> [u8; 20] {
+        Sha1::digest(data).into()
+    }
+
+    #[tokio::test]
+    async fn verify_valid_piece() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = b"hello world - this is exactly one piece of data!";
+        let fname = "data.bin";
+        std::fs::write(dir.path().join(fname), content).unwrap();
+
+        let piece_length = content.len() as u64;
+        let hash = piece_hash(content);
+
+        let files = vec![FileSpan {
+            file_index: 0,
+            path: SafeRelPath::from_name(fname, false).unwrap(),
+            content_offset: 0,
+            length: piece_length,
+        }];
+        let pm = PieceMap::new(piece_length, files).unwrap();
+        let sched = ssd_scheduler();
+        let hashes = [hash];
+        let verifier = PieceVerifier::new(dir.path(), &sched, &pm, &hashes);
+
+        assert_eq!(verifier.verify_piece(0).await, VerifyResult::Valid);
+    }
+
+    #[tokio::test]
+    async fn verify_invalid_piece() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = b"corrupted data!!!";
+        let fname = "data.bin";
+        std::fs::write(dir.path().join(fname), content).unwrap();
+
+        let wrong_hash = [0u8; 20]; // definitely wrong
+        let piece_length = content.len() as u64;
+
+        let files = vec![FileSpan {
+            file_index: 0,
+            path: SafeRelPath::from_name(fname, false).unwrap(),
+            content_offset: 0,
+            length: piece_length,
+        }];
+        let pm = PieceMap::new(piece_length, files).unwrap();
+        let sched = ssd_scheduler();
+        let hashes = [wrong_hash];
+        let verifier = PieceVerifier::new(dir.path(), &sched, &pm, &hashes);
+
+        assert_eq!(verifier.verify_piece(0).await, VerifyResult::Invalid);
+    }
+
+    #[tokio::test]
+    async fn verify_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // don't create the file
+
+        let files = vec![FileSpan {
+            file_index: 0,
+            path: SafeRelPath::from_name("missing.bin", false).unwrap(),
+            content_offset: 0,
+            length: 256,
+        }];
+        let pm = PieceMap::new(256, files).unwrap();
+        let sched = ssd_scheduler();
+        let hashes = [[0u8; 20]];
+        let verifier = PieceVerifier::new(dir.path(), &sched, &pm, &hashes);
+
+        assert!(matches!(
+            verifier.verify_piece(0).await,
+            VerifyResult::Missing { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn verify_all_reports_per_piece() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two-piece file: piece 0 valid, piece 1 has wrong hash
+        let piece_len = 64usize;
+        let content: Vec<u8> = (0..piece_len * 2).map(|i| i as u8).collect();
+        std::fs::write(dir.path().join("data.bin"), &content).unwrap();
+
+        let hash0 = piece_hash(&content[..piece_len]);
+        let hash1_wrong = [0u8; 20];
+
+        let files = vec![FileSpan {
+            file_index: 0,
+            path: SafeRelPath::from_name("data.bin", false).unwrap(),
+            content_offset: 0,
+            length: content.len() as u64,
+        }];
+        let pm = PieceMap::new(piece_len as u64, files).unwrap();
+        let sched = ssd_scheduler();
+        let hashes = [hash0, hash1_wrong];
+        let verifier = PieceVerifier::new(dir.path(), &sched, &pm, &hashes);
+
+        let results = verifier.verify_all().await;
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0], VerifyResult::Valid);
+        assert_eq!(results[1], VerifyResult::Invalid);
+    }
+
+    #[tokio::test]
+    async fn verify_range_resumable() {
+        let dir = tempfile::tempdir().unwrap();
+        let piece_len = 32usize;
+        let n_pieces = 4usize;
+        let content: Vec<u8> = (0..(piece_len * n_pieces)).map(|i| i as u8).collect();
+        std::fs::write(dir.path().join("data.bin"), &content).unwrap();
+
+        let hashes: Vec<[u8; 20]> = (0..n_pieces)
+            .map(|i| piece_hash(&content[i * piece_len..(i + 1) * piece_len]))
+            .collect();
+
+        let files = vec![FileSpan {
+            file_index: 0,
+            path: SafeRelPath::from_name("data.bin", false).unwrap(),
+            content_offset: 0,
+            length: content.len() as u64,
+        }];
+        let pm = PieceMap::new(piece_len as u64, files).unwrap();
+        let sched = ssd_scheduler();
+        let verifier = PieceVerifier::new(dir.path(), &sched, &pm, &hashes);
+
+        // Verify only pieces 1..3 (simulating resume from piece 1)
+        let results = verifier.verify_range(1, 3).await.unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, 1);
+        assert_eq!(results[0].1, VerifyResult::Valid);
+        assert_eq!(results[1].0, 2);
+        assert_eq!(results[1].1, VerifyResult::Valid);
+    }
+}

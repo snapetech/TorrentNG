@@ -3,11 +3,12 @@ import { api, type ListParams, type TorrentSummary } from '../api/client'
 
 const PAGE_SIZE = 200
 
-export function useTorrentsInfinite(params: Omit<ListParams, 'limit' | 'offset'>) {
+export function useTorrentsInfinite(params: Omit<ListParams, 'limit' | 'offset'>, enabled = true) {
   return useInfiniteQuery({
     queryKey: ['torrents', params],
     queryFn: ({ pageParam = 0 }) =>
       api.torrents.list({ ...params, limit: PAGE_SIZE, offset: pageParam }),
+    enabled,
     initialPageParam: 0,
     getNextPageParam: (lastPage, allPages) => {
       const loaded = allPages.reduce((n, p) => n + p.torrents.length, 0)
