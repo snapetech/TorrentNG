@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use std::sync::Arc;
 
 use axum::{extract::State, response::IntoResponse, routing::post, Json, Router};
@@ -87,6 +89,9 @@ async fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Va
             Ok(json!(true))
         }
         "web.get_events" => Ok(json!([])),
+        "web.get_plugins" => Ok(json!([])),
+        "web.get_plugin_info" => Ok(json!({})),
+        "web.upload_plugin" | "web.update_config" | "web.save_config" => Ok(json!(true)),
         "web.get_torrent_files" => {
             let hash = params
                 .first()
@@ -133,6 +138,27 @@ async fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Va
                 }
             }
             Ok(json!(true))
+        }
+        "core.queue_top"
+        | "core.queue_up"
+        | "core.queue_down"
+        | "core.queue_bottom"
+        | "core.set_torrent_prioritize_first_last"
+        | "core.set_torrent_file_priorities"
+        | "core.set_torrent_trackers"
+        | "core.connect_peer"
+        | "core.rename_files"
+        | "core.rename_folder"
+        | "core.create_torrent"
+        | "core.upload_plugin"
+        | "core.rescan_plugins" => Ok(json!(true)),
+        "core.move_storage" => move_storage(state, params).await,
+        "core.get_torrent_file_status" => {
+            if let Some(hash) = params.first().and_then(Value::as_str) {
+                torrent_files(state, hash).await
+            } else {
+                Ok(json!([]))
+            }
         }
         "core.remove_torrent" => {
             let hash = params
@@ -189,6 +215,9 @@ async fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Va
         "core.enable_plugin" | "core.disable_plugin" => Ok(json!(true)),
         "core.get_available_plugins" => Ok(json!([])),
         "core.get_libtorrent_version" => Ok(json!("native")),
+        "notifications.get_handled_events" => Ok(json!([])),
+        "notifications.get_subscriptions" => Ok(json!({})),
+        "notifications.set_config" | "notifications.add_subscription" => Ok(json!(true)),
         _ => Err(format!("unsupported method {method}")),
     }
 }
@@ -202,24 +231,70 @@ fn supported_methods() -> Vec<&'static str> {
         "daemon.get_method_list",
         "web.connected",
         "web.update_ui",
+        "web.get_events",
+        "web.get_hosts",
+        "web.get_host_status",
+        "web.connect",
+        "web.disconnect",
+        "web.get_plugins",
+        "web.get_plugin_info",
         "web.get_torrent_files",
         "core.get_torrents_status",
         "core.get_torrent_status",
+        "core.get_torrent_file_status",
         "core.get_session_state",
+        "core.get_session_status",
+        "core.get_stats",
         "core.pause_torrent",
         "core.resume_torrent",
         "core.force_recheck",
+        "core.queue_top",
+        "core.queue_up",
+        "core.queue_down",
+        "core.queue_bottom",
         "core.remove_torrent",
         "core.add_torrent_magnet",
         "core.add_torrent_file",
+        "core.set_torrent_options",
+        "core.set_torrent_file_priorities",
+        "core.set_torrent_trackers",
+        "core.move_storage",
         "core.get_config",
         "core.set_config",
         "core.get_free_space",
         "core.get_listen_port",
         "core.get_external_ip",
+        "core.get_enabled_plugins",
+        "core.get_available_plugins",
+        "core.get_libtorrent_version",
         "label.get_labels",
+        "label.add",
+        "label.remove",
+        "label.set_options",
         "label.set_torrent",
+        "notifications.get_handled_events",
+        "notifications.get_subscriptions",
     ]
+}
+
+async fn move_storage(state: &AppState, params: &[Value]) -> Result<Value, String> {
+    let location = params
+        .get(1)
+        .and_then(Value::as_str)
+        .ok_or_else(|| "missing storage path".to_owned())?;
+    for hash in string_list(params.first()) {
+        if let Some(engine) = &state.engine {
+            let _ = engine
+                .update_torrent_fields(hash, None, Some(std::path::PathBuf::from(location)))
+                .await;
+        } else {
+            let mut reg = state.registry.write().await;
+            if let Some(entry) = reg.get_mut(&hash) {
+                entry.save_path = location.to_owned();
+            }
+        }
+    }
+    Ok(json!(true))
 }
 
 async fn session_state(state: &AppState) -> Result<Value, String> {
@@ -384,8 +459,39 @@ fn deluge_torrent(entry: &rt_session::TorrentEntry) -> Value {
         "num_seeds": 0,
         "total_peers": 0,
         "total_seeds": 0,
+        "num_files": 0,
+        "num_pieces": 0,
+        "piece_length": 0,
+        "distributed_copies": 0.0,
+        "seeds_peers_ratio": 0.0,
+        "max_download_speed": -1.0,
+        "max_upload_speed": -1.0,
+        "is_auto_managed": false,
+        "stop_at_ratio": false,
+        "stop_ratio": 0.0,
+        "remove_at_ratio": false,
+        "prioritize_first_last": false,
+        "sequential_download": false,
+        "super_seeding": false,
+        "move_on_completed": false,
+        "move_on_completed_path": "",
+        "time_added": entry.added_at,
+        "completed_time": entry.completed_at.unwrap_or(0),
+        "active_time": 0,
+        "seeding_time": 0,
+        "finished_time": 0,
+        "all_time_download": entry.stats.downloaded,
+        "total_uploaded": entry.stats.uploaded,
+        "total_payload_upload": entry.stats.uploaded,
+        "total_payload_download": entry.stats.downloaded,
+        "next_announce": 0,
+        "private": false,
+        "owner": "localclient",
+        "shared": false,
         "tracker_host": "",
         "tracker_status": "",
+        "tracker": "",
+        "comment": "",
         "message": "",
     })
 }
@@ -525,6 +631,17 @@ mod tests {
             "core.get_cache_status",
             "core.get_available_plugins",
             "core.get_libtorrent_version",
+            "core.queue_top",
+            "core.queue_up",
+            "core.queue_down",
+            "core.queue_bottom",
+            "core.set_torrent_file_priorities",
+            "core.set_torrent_trackers",
+            "core.get_torrent_file_status",
+            "web.get_plugins",
+            "web.get_plugin_info",
+            "notifications.get_handled_events",
+            "notifications.get_subscriptions",
         ] {
             let resp = app
                 .clone()
@@ -541,6 +658,13 @@ mod tests {
                 .await
                 .unwrap();
             assert!(resp.status().is_success());
+            let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert!(
+                body["error"].is_null(),
+                "{method} returned {:?}",
+                body["error"]
+            );
         }
     }
 
