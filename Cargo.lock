@@ -1284,7 +1284,16 @@ dependencies = [
 name = "rt-api-transmission"
 version = "0.1.0"
 dependencies = [
+ "axum",
+ "base64",
+ "rt-engine",
+ "rt-metainfo",
+ "rt-session",
+ "serde",
+ "serde_json",
  "thiserror 1.0.69",
+ "tokio",
+ "tower 0.4.13",
  "tracing",
 ]
 
@@ -1609,6 +1618,7 @@ dependencies = [
  "axum",
  "rt-api-native",
  "rt-api-qbit",
+ "rt-api-transmission",
  "rt-config",
  "rt-db",
  "rt-engine",

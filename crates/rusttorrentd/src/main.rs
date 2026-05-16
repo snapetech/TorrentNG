@@ -6,6 +6,7 @@ use tracing::info;
 
 use rt_api_native::state::AppState as NativeState;
 use rt_api_qbit::state::AppState as QbitState;
+use rt_api_transmission::AppState as TransmissionState;
 use rt_config::Config;
 use rt_engine::Engine;
 use rt_session::SessionRegistry;
@@ -48,8 +49,12 @@ async fn main() -> anyhow::Result<()> {
     let qbit_state = QbitState::with_engine(Arc::clone(&registry), engine_handle.clone());
     let qbit_router = rt_api_qbit::router::build_qbit_router(qbit_state);
 
+    let transmission_state =
+        TransmissionState::with_engine(Arc::clone(&registry), engine_handle.clone());
+    let transmission_router = rt_api_transmission::build_transmission_router(transmission_state);
+
     // Merge into a single axum app
-    let app = native_router.merge(qbit_router);
+    let app = native_router.merge(qbit_router).merge(transmission_router);
 
     let api_addr: std::net::SocketAddr = config
         .daemon
