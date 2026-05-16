@@ -82,9 +82,14 @@ async fn rpc(
         "group-get" => Ok(json!({ "groups": [] })),
         "group-set" => Ok(json!({})),
         "torrent-set" => torrent_set(&state, &args).await,
+        "torrent-set-tracker-list"
+        | "torrent-set-file-priorities"
+        | "torrent-set-file-wanted"
+        | "torrent-set-file-unwanted" => Ok(json!({})),
         "queue-move-top" | "queue-move-up" | "queue-move-down" | "queue-move-bottom" => {
             Ok(json!({}))
         }
+        "queue-stalled-enable" | "queue-stalled-disable" => Ok(json!({})),
         "port-test" => Ok(json!({"port-is-open": true})),
         "blocklist-update" => Ok(json!({"blocklist-size": 0})),
         "free-space" => Ok(
@@ -243,6 +248,26 @@ async fn session_get(state: &AppState) -> Value {
         "trash-original-torrent-files": false,
         "speed-limit-down-enabled": false,
         "speed-limit-up-enabled": false,
+        "speed-limit-down": 0,
+        "speed-limit-up": 0,
+        "alt-speed-enabled": false,
+        "alt-speed-down": 0,
+        "alt-speed-up": 0,
+        "download-queue-enabled": false,
+        "download-queue-size": 0,
+        "seed-queue-enabled": false,
+        "seed-queue-size": 0,
+        "queue-stalled-enabled": false,
+        "queue-stalled-minutes": 30,
+        "peer-limit-global": 0,
+        "peer-limit-per-torrent": 0,
+        "script-torrent-added-enabled": false,
+        "script-torrent-done-enabled": false,
+        "script-torrent-done-seeding-enabled": false,
+        "blocklist-enabled": false,
+        "blocklist-size": 0,
+        "utp-enabled": true,
+        "lpd-enabled": false,
         "dht-enabled": true,
         "pex-enabled": true,
     })
@@ -750,5 +775,40 @@ mod tests {
         let entry = reg.get(&"c".repeat(40)).unwrap();
         assert_eq!(entry.tags, vec!["tv".to_owned(), "hd".to_owned()]);
         assert_eq!(entry.save_path, "/new");
+    }
+
+    #[tokio::test]
+    async fn transmission_common_mutators_are_accepted() {
+        let app =
+            build_transmission_router(AppState::new(Arc::new(RwLock::new(SessionRegistry::new()))));
+        for method in [
+            "torrent-set-tracker-list",
+            "torrent-set-file-priorities",
+            "torrent-set-file-wanted",
+            "torrent-set-file-unwanted",
+            "queue-stalled-enable",
+            "queue-stalled-disable",
+            "session-set",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/transmission/rpc")
+                        .header("content-type", "application/json")
+                        .header("x-transmission-session-id", SESSION_ID)
+                        .body(Body::from(format!(
+                            r#"{{"method":"{method}","arguments":{{}}}}"#
+                        )))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["result"], "success", "{method}");
+        }
     }
 }
