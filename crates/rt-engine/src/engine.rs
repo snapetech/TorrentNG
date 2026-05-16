@@ -37,6 +37,11 @@ const EVENT_LABELS_UPDATED: &str = "labels_updated";
 const EVENT_FIELDS_UPDATED: &str = "torrent_fields_updated";
 const EVENT_ENGINE_STOPPED: &str = "engine_stopped";
 
+const JOB_KIND_RECHECK: &str = "recheck_torrent";
+const JOB_STATE_QUEUED: &str = "queued";
+const JOB_STATE_RUNNING: &str = "running";
+const JOB_STATE_FAILED: &str = "failed";
+
 /// Handle given to the API layer. Clone freely; all sends are channel-based.
 #[derive(Clone)]
 pub struct EngineHandle {
@@ -434,13 +439,29 @@ impl Engine {
             }
 
             EngineCmd::RecheckTorrent { info_hash, reply } => {
+                let job_id = self.create_recheck_job(&info_hash);
                 let result = self.send_to_torrent(&info_hash, TorrentCmd::Recheck).await;
                 if result.is_ok() {
+                    if let Some(job_id) = &job_id {
+                        self.update_job_state(
+                            job_id,
+                            JOB_STATE_RUNNING,
+                            None,
+                            Some("recheck dispatched to torrent task"),
+                        );
+                    }
                     self.append_session_event(
                         Some(&info_hash),
                         EVENT_RECHECK_REQUESTED,
                         Some("torrent recheck requested"),
-                        serde_json::json!({}),
+                        serde_json::json!({ "job_id": job_id }),
+                    );
+                } else if let Some(job_id) = &job_id {
+                    self.update_job_state(
+                        job_id,
+                        JOB_STATE_FAILED,
+                        result.as_ref().err().cloned(),
+                        Some("recheck dispatch failed"),
                     );
                 }
                 let _ = reply.send(result);
@@ -1221,6 +1242,97 @@ impl Engine {
             warn!(kind, err = %e, "failed to append session event");
         }
     }
+
+    fn create_recheck_job(&self, info_hash: &str) -> Option<String> {
+        let now = unix_now_i64();
+        let total = self
+            .load_torrent_metadata(info_hash)
+            .map(|meta| meta.piece_count as i64)
+            .unwrap_or(0);
+        let job_id = format!("recheck-{info_hash}-{now}");
+        let job = rt_db::JobRow {
+            job_id: job_id.clone(),
+            kind: JOB_KIND_RECHECK.to_owned(),
+            state: JOB_STATE_QUEUED.to_owned(),
+            dry_run: false,
+            affected_torrents: vec![info_hash.to_owned()],
+            total,
+            done: 0,
+            checkpoint: 0,
+            file_index: Some(0),
+            piece_index: Some(0),
+            byte_offset: Some(0),
+            verified_bytes: 0,
+            invalid_pieces: Vec::new(),
+            error: None,
+            created_at: now,
+            started_at: None,
+            updated_at: now,
+            finished_at: None,
+        };
+        let event = rt_db::JobEventRow {
+            event_id: None,
+            job_id: job_id.clone(),
+            occurred_at: now,
+            kind: "job_queued".to_owned(),
+            message: Some("recheck queued".to_owned()),
+            payload: serde_json::json!({ "info_hash": info_hash }).to_string(),
+        };
+        let db = self.db.lock().expect("database mutex poisoned");
+        if let Err(e) = rt_db::upsert_job(&db, &job) {
+            warn!(torrent = %info_hash, err = %e, "failed to persist recheck job");
+            return None;
+        }
+        if let Err(e) = rt_db::append_job_event(&db, &event) {
+            warn!(job_id = %job_id, err = %e, "failed to append recheck job event");
+        }
+        Some(job_id)
+    }
+
+    fn update_job_state(
+        &self,
+        job_id: &str,
+        state: &str,
+        error: Option<String>,
+        message: Option<&str>,
+    ) {
+        let now = unix_now_i64();
+        let mut job = {
+            let db = self.db.lock().expect("database mutex poisoned");
+            match rt_db::get_job(&db, job_id) {
+                Ok(job) => job,
+                Err(e) => {
+                    warn!(job_id, err = %e, "failed to load job for state update");
+                    return;
+                }
+            }
+        };
+        job.state = state.to_owned();
+        job.error = error;
+        job.updated_at = now;
+        if state == JOB_STATE_RUNNING && job.started_at.is_none() {
+            job.started_at = Some(now);
+        }
+        if state == JOB_STATE_FAILED {
+            job.finished_at = Some(now);
+        }
+        let event = rt_db::JobEventRow {
+            event_id: None,
+            job_id: job_id.to_owned(),
+            occurred_at: now,
+            kind: format!("job_{state}"),
+            message: message.map(str::to_owned),
+            payload: serde_json::json!({ "state": state }).to_string(),
+        };
+        let db = self.db.lock().expect("database mutex poisoned");
+        if let Err(e) = rt_db::upsert_job(&db, &job) {
+            warn!(job_id, err = %e, "failed to persist job state");
+            return;
+        }
+        if let Err(e) = rt_db::append_job_event(&db, &event) {
+            warn!(job_id, err = %e, "failed to append job state event");
+        }
+    }
 }
 
 pub(crate) fn row_from_entry(entry: &TorrentEntry, meta: &TorrentMetaV1) -> TorrentRow {
@@ -1572,6 +1684,36 @@ mod tests {
         assert_eq!(events[0].kind, EVENT_TORRENT_ADDED);
         assert_eq!(events[0].message.as_deref(), Some("torrent added"));
         assert!(events[0].payload.contains("\"paused\":false"));
+    }
+
+    #[test]
+    fn recheck_job_helpers_persist_state_and_events() {
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let (_tx, rx) = mpsc::channel(1);
+        let engine = Engine {
+            config: Arc::new(Config::default()),
+            registry: Arc::new(RwLock::new(SessionRegistry::new())),
+            db: Arc::new(Mutex::new(conn)),
+            cmd_rx: rx,
+            cmd_tx: mpsc::channel(1).0,
+            torrent_chans: HashMap::new(),
+            dht_tx: None,
+        };
+
+        let job_id = engine.create_recheck_job(&"b".repeat(40)).unwrap();
+        engine.update_job_state(&job_id, JOB_STATE_RUNNING, None, Some("recheck dispatched"));
+
+        let db = engine.db.lock().unwrap();
+        let job = rt_db::get_job(&db, &job_id).unwrap();
+        assert_eq!(job.kind, JOB_KIND_RECHECK);
+        assert_eq!(job.state, JOB_STATE_RUNNING);
+        assert_eq!(job.affected_torrents, vec!["b".repeat(40)]);
+        assert!(job.started_at.is_some());
+        let events = rt_db::list_job_events(&db, &job_id, 10).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, "job_running");
+        assert_eq!(events[1].kind, "job_queued");
     }
 }
 

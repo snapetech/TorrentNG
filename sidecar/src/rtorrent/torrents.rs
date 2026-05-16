@@ -29,7 +29,7 @@ const TORRENT_FIELDS: &[&str] = &[
     "d.message=",
 ];
 
-pub const MULTICALL_RANGE_PAGE_SIZE: i64 = 500;
+pub const MULTICALL_RANGE_PAGE_SIZE: i64 = 100;
 
 #[derive(Debug, Clone)]
 pub struct RawTorrent {
