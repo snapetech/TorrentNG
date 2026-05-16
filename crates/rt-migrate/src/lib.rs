@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use rt_bencode::{decode, BValue};
+use rt_db::{TorrentFileRow, TorrentRow, TorrentTrackerRow};
 use rt_metainfo::{parse_torrent, TorrentMeta};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -10,6 +11,8 @@ use thiserror::Error;
 pub enum MigrationError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("database error: {0}")]
+    Db(#[from] rt_db::DbError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,12 +86,36 @@ impl MigrationPlan {
         }
         out
     }
+
+    pub fn to_db_import(&self, options: &ImportOptions) -> DbImportPlan {
+        DbImportPlan {
+            torrents: self
+                .torrents
+                .iter()
+                .map(|torrent| torrent.to_db_rows(options))
+                .collect(),
+        }
+    }
+
+    pub fn apply_to_db(
+        &self,
+        conn: &mut rusqlite::Connection,
+        options: &ImportOptions,
+    ) -> Result<DbImportSummary, MigrationError> {
+        let import = self.to_db_import(options);
+        import.apply(conn)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MigrationTorrent {
     pub info_hash: String,
     pub name: String,
+    pub total_length: u64,
+    pub piece_length: u64,
+    pub piece_count: u64,
+    pub is_private: bool,
+    pub files: Vec<MigrationFile>,
     pub torrent_path: PathBuf,
     pub resume_path: Option<PathBuf>,
     pub save_path: Option<PathBuf>,
@@ -101,10 +128,159 @@ pub struct MigrationTorrent {
     pub warnings: Vec<String>,
 }
 
+impl MigrationTorrent {
+    pub fn to_db_rows(&self, options: &ImportOptions) -> DbTorrentImport {
+        let save_path = self
+            .save_path
+            .clone()
+            .or_else(|| options.default_save_path.clone())
+            .unwrap_or_else(|| PathBuf::from("."))
+            .to_string_lossy()
+            .to_string();
+        let uploaded = self.uploaded.unwrap_or_default();
+        let downloaded = self.downloaded.unwrap_or_default();
+        let ratio = if downloaded == 0 {
+            0.0
+        } else {
+            uploaded as f64 / downloaded as f64
+        };
+        let completed = self.completed.unwrap_or(false);
+        DbTorrentImport {
+            torrent: TorrentRow {
+                info_hash: self.info_hash.clone(),
+                name: self.name.clone(),
+                total_length: i64_saturating(self.total_length),
+                piece_length: i64_saturating(self.piece_length),
+                piece_count: i64_saturating(self.piece_count),
+                is_private: self.is_private,
+                save_path,
+                category: normalize_optional_label(self.category.clone()),
+                tags: normalize_tags(self.tags.clone()),
+                state: if completed { "completed" } else { "stopped" }.to_owned(),
+                added_at: options.added_at,
+                completed_at: completed.then_some(options.added_at),
+                uploaded: i64_saturating(uploaded),
+                downloaded: i64_saturating(downloaded),
+                ratio,
+                trackers: self.trackers.clone(),
+            },
+            files: self
+                .files
+                .iter()
+                .map(|file| TorrentFileRow {
+                    info_hash: self.info_hash.clone(),
+                    file_index: i64::from(file.index),
+                    path: file.path.clone(),
+                    length: i64_saturating(file.length),
+                    offset: i64_saturating(file.offset),
+                    priority: 1,
+                    wanted: true,
+                    completed_bytes: if completed {
+                        i64_saturating(file.length)
+                    } else {
+                        0
+                    },
+                })
+                .collect(),
+            trackers: self
+                .trackers
+                .iter()
+                .enumerate()
+                .map(|(index, url)| TorrentTrackerRow {
+                    info_hash: self.info_hash.clone(),
+                    tracker_index: i64_saturating(index as u64),
+                    tier: i64_saturating(index as u64),
+                    url: url.clone(),
+                    status: "never_announced".to_owned(),
+                    last_announce_at: None,
+                    next_announce_at: None,
+                    last_success_at: None,
+                    failure_reason: None,
+                    warning_message: None,
+                    seeders: None,
+                    leechers: None,
+                    completed: None,
+                    uploaded: i64_saturating(uploaded),
+                    downloaded: i64_saturating(downloaded),
+                    left_bytes: if completed {
+                        0
+                    } else {
+                        i64_saturating(self.total_length)
+                    },
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MigrationFile {
+    pub index: u32,
+    pub path: String,
+    pub length: u64,
+    pub offset: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkippedEntry {
     pub path: PathBuf,
     pub reason: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImportOptions {
+    pub default_save_path: Option<PathBuf>,
+    pub added_at: i64,
+}
+
+impl Default for ImportOptions {
+    fn default() -> Self {
+        Self {
+            default_save_path: None,
+            added_at: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DbImportPlan {
+    pub torrents: Vec<DbTorrentImport>,
+}
+
+impl DbImportPlan {
+    pub fn apply(
+        &self,
+        conn: &mut rusqlite::Connection,
+    ) -> Result<DbImportSummary, MigrationError> {
+        for import in &self.torrents {
+            rt_db::upsert(conn, &import.torrent)?;
+            rt_db::replace_torrent_files(conn, &import.torrent.info_hash, &import.files)?;
+            rt_db::replace_torrent_trackers(conn, &import.torrent.info_hash, &import.trackers)?;
+        }
+        Ok(DbImportSummary {
+            torrents: self.torrents.len(),
+            files: self.torrents.iter().map(|import| import.files.len()).sum(),
+            trackers: self
+                .torrents
+                .iter()
+                .map(|import| import.trackers.len())
+                .sum(),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DbTorrentImport {
+    pub torrent: TorrentRow,
+    pub files: Vec<TorrentFileRow>,
+    pub trackers: Vec<TorrentTrackerRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbImportSummary {
+    pub torrents: usize,
+    pub files: usize,
+    pub trackers: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -202,10 +378,25 @@ fn migration_torrent_from_path(
     }
 
     let trackers = meta.all_trackers();
+    let files = meta
+        .files
+        .iter()
+        .map(|file| MigrationFile {
+            index: file.index,
+            path: file.path.as_display(),
+            length: file.length,
+            offset: file.offset,
+        })
+        .collect();
 
     Ok(MigrationTorrent {
         info_hash,
         name: meta.name.clone(),
+        total_length: meta.total_length(),
+        piece_length: meta.piece_length,
+        piece_count: meta.pieces.len() as u64,
+        is_private: meta.private,
+        files,
         torrent_path: path.to_path_buf(),
         resume_path,
         save_path: resume.save_path,
@@ -406,6 +597,27 @@ fn escape_table(value: &str) -> String {
     value.replace('|', "\\|")
 }
 
+fn normalize_optional_label(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn normalize_tags(tags: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for tag in tags {
+        let tag = tag.trim().to_owned();
+        if !tag.is_empty() && !out.contains(&tag) {
+            out.push(tag);
+        }
+    }
+    out
+}
+
+fn i64_saturating(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,6 +687,85 @@ mod tests {
         assert_eq!(torrent.downloaded, Some(12));
         assert_eq!(torrent.completed, Some(true));
         assert!(torrent.warnings.is_empty());
+    }
+
+    #[test]
+    fn import_plan_applies_native_db_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let torrent_path = dir.path().join("sample.torrent");
+        let info_hash = write_fixture_torrent(&torrent_path);
+        let info_hash_hex = hex_lower(&info_hash);
+        std::fs::rename(
+            &torrent_path,
+            dir.path().join(format!("{info_hash_hex}.torrent")),
+        )
+        .unwrap();
+        let resume = serde_json::json!({
+            "save_path": "/downloads/imported",
+            "category": " linux ",
+            "tags": [" iso ", "archive", "iso"],
+            "uploaded": 200,
+            "downloaded": 100,
+            "completed": true
+        });
+        std::fs::write(
+            dir.path().join(format!("{info_hash_hex}.fastresume")),
+            serde_json::to_vec(&resume).unwrap(),
+        )
+        .unwrap();
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let plan = dry_run_qbittorrent_backup(dir.path()).unwrap();
+
+        let summary = plan
+            .apply_to_db(
+                &mut conn,
+                &ImportOptions {
+                    default_save_path: Some(PathBuf::from("/fallback")),
+                    added_at: 1234,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            summary,
+            DbImportSummary {
+                torrents: 1,
+                files: 1,
+                trackers: 1,
+            }
+        );
+        let row = rt_db::get(&conn, &info_hash_hex).unwrap();
+        assert_eq!(row.name, "sample.bin");
+        assert_eq!(row.total_length, 12);
+        assert_eq!(row.piece_length, 16_384);
+        assert_eq!(row.piece_count, 1);
+        assert_eq!(row.save_path, "/downloads/imported");
+        assert_eq!(row.category.as_deref(), Some("linux"));
+        assert_eq!(row.tags, vec!["iso".to_owned(), "archive".to_owned()]);
+        assert_eq!(row.state, "completed");
+        assert_eq!(row.completed_at, Some(1234));
+        assert_eq!(row.uploaded, 200);
+        assert_eq!(row.downloaded, 100);
+        assert_eq!(row.ratio, 2.0);
+        assert_eq!(row.trackers, vec!["https://tracker/announce".to_owned()]);
+        assert_eq!(
+            rt_db::list_torrent_tags(&conn, &info_hash_hex).unwrap(),
+            vec!["archive", "iso"]
+        );
+        assert_eq!(rt_db::list_categories(&conn).unwrap(), vec!["linux"]);
+
+        let files = rt_db::list_torrent_files(&conn, &info_hash_hex).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "sample.bin");
+        assert_eq!(files[0].completed_bytes, 12);
+
+        let trackers = rt_db::list_torrent_trackers(&conn, &info_hash_hex).unwrap();
+        assert_eq!(trackers.len(), 1);
+        assert_eq!(trackers[0].url, "https://tracker/announce");
+        assert_eq!(trackers[0].uploaded, 200);
+        assert_eq!(trackers[0].downloaded, 100);
+        assert_eq!(trackers[0].left_bytes, 0);
     }
 
     #[test]

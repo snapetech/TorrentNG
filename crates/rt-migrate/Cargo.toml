@@ -14,6 +14,7 @@ serde_json.workspace = true
 rt-bencode = { path = "../rt-bencode" }
 rt-db = { path = "../rt-db" }
 rt-metainfo = { path = "../rt-metainfo" }
+rusqlite.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

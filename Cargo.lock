@@ -1455,6 +1455,7 @@ dependencies = [
  "rt-bencode",
  "rt-db",
  "rt-metainfo",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

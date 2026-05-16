@@ -111,16 +111,17 @@ Common locations:
 cp -r ~/.local/share/data/qBittorrent/BT_backup /tmp/qbt-migration
 ```
 
-**Step 3: Run dry-run scan**
+**Step 3: Run dry-run scan and native import**
 
-The `rt-migrate` crate now provides a read-only qBittorrent `BT_backup` dry-run
-scanner. It pairs `.torrent` files with `.fastresume` sidecars and reports the
-metadata that would be imported, including save path, category, tags, trackers,
-completion state, and transfer counters.
+The `rt-migrate` crate now provides qBittorrent `BT_backup` dry-run scanning and
+native database apply plumbing. It pairs `.torrent` files with `.fastresume`
+sidecars and imports save path, category, tags, trackers, completion state, file
+rows, transfer counters, and ratio.
 
-Apply/import into the native database is still pending. Until then, load each
-`.torrent` file manually via the rtorrentNG API or ruTorrent UI, pointing to the
-existing file path. rtorrentNG will verify and resume without downloading.
+Operator-facing CLI wiring is still pending. Until then, use the crate API from
+integration tooling or load each `.torrent` file manually via the rtorrentNG API
+or ruTorrent UI, pointing to the existing file path. rtorrentNG will verify and
+resume without downloading.
 
 ---
 

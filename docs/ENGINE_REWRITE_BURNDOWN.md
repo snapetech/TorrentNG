@@ -84,10 +84,10 @@ This is the working checklist for finishing the native Rust engine rewrite. It i
 
 ## 8. Migration
 
-- [ ] Import rTorrent session state and `.rtorrent` fast-resume data.
-- [ ] Import qBittorrent fastresume/state.
-- [ ] Import Transmission resume/state.
-- [ ] Preserve categories/tags/labels/save paths/trackers.
+- [x] Import rTorrent session state and `.rtorrent` fast-resume data.
+- [x] Import qBittorrent fastresume/state.
+- [x] Import Transmission resume/state.
+- [x] Preserve categories/tags/labels/save paths/trackers.
 - [x] Add dry-run migration reports.
 - [ ] Add rollback/backup docs.
 
