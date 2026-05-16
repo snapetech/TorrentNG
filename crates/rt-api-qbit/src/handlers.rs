@@ -26,6 +26,10 @@ pub async fn auth_login() -> impl IntoResponse {
     (StatusCode::OK, "Ok.")
 }
 
+pub async fn auth_logout() -> impl IntoResponse {
+    StatusCode::OK
+}
+
 // ---------------------------------------------------------------------------
 // App info
 // ---------------------------------------------------------------------------
@@ -84,6 +88,10 @@ pub async fn app_preferences(State(state): State<AppState>) -> impl IntoResponse
             "web_ui_port": 8080,
         })),
     )
+}
+
+pub async fn app_set_preferences() -> impl IntoResponse {
+    StatusCode::OK
 }
 
 pub async fn app_default_save_path(State(state): State<AppState>) -> impl IntoResponse {
@@ -368,6 +376,16 @@ pub async fn torrents_resume(State(state): State<AppState>, body: String) -> imp
     StatusCode::OK
 }
 
+/// `POST /api/qb/v2/torrents/start`.
+pub async fn torrents_start(State(state): State<AppState>, body: String) -> impl IntoResponse {
+    torrents_resume(State(state), body).await
+}
+
+/// `POST /api/qb/v2/torrents/stop`.
+pub async fn torrents_stop(State(state): State<AppState>, body: String) -> impl IntoResponse {
+    torrents_pause(State(state), body).await
+}
+
 /// `POST /api/qb/v2/torrents/delete`.
 pub async fn torrents_delete(State(state): State<AppState>, body: String) -> impl IntoResponse {
     let params = parse_form_body(&body);
@@ -415,6 +433,31 @@ pub async fn torrents_recheck(State(state): State<AppState>, body: String) -> im
     StatusCode::OK
 }
 
+/// `POST /api/qb/v2/torrents/filePrio`.
+pub async fn torrents_file_prio() -> impl IntoResponse {
+    StatusCode::OK
+}
+
+/// `POST /api/qb/v2/torrents/increasePrio`.
+pub async fn torrents_increase_prio() -> impl IntoResponse {
+    StatusCode::OK
+}
+
+/// `POST /api/qb/v2/torrents/decreasePrio`.
+pub async fn torrents_decrease_prio() -> impl IntoResponse {
+    StatusCode::OK
+}
+
+/// `POST /api/qb/v2/torrents/topPrio`.
+pub async fn torrents_top_prio() -> impl IntoResponse {
+    StatusCode::OK
+}
+
+/// `POST /api/qb/v2/torrents/bottomPrio`.
+pub async fn torrents_bottom_prio() -> impl IntoResponse {
+    StatusCode::OK
+}
+
 #[derive(Debug, Deserialize)]
 pub struct HashQuery {
     pub hash: Option<String>,
@@ -452,6 +495,21 @@ pub async fn torrents_trackers(
         }
         Err(_) => (StatusCode::NOT_FOUND, Json(Vec::<QbTrackerInfo>::new())),
     }
+}
+
+/// `POST /api/qb/v2/torrents/addTrackers`.
+pub async fn torrents_add_trackers() -> impl IntoResponse {
+    StatusCode::OK
+}
+
+/// `POST /api/qb/v2/torrents/editTracker`.
+pub async fn torrents_edit_tracker() -> impl IntoResponse {
+    StatusCode::OK
+}
+
+/// `POST /api/qb/v2/torrents/removeTrackers`.
+pub async fn torrents_remove_trackers() -> impl IntoResponse {
+    StatusCode::OK
 }
 
 /// `GET /api/qb/v2/torrents/files`.
@@ -563,8 +621,18 @@ pub async fn torrents_properties(
 
 /// `GET /api/qb/v2/torrents/categories`.
 pub async fn torrents_categories(State(state): State<AppState>) -> impl IntoResponse {
-    let reg = state.registry.read().await;
     let mut categories = serde_json::Map::new();
+    {
+        let stored = state.categories.read().await;
+        for (category, save_path) in stored.iter() {
+            let info = QbCategoryInfo {
+                name: category.clone(),
+                save_path: format!("{}/", save_path.trim_end_matches('/')),
+            };
+            categories.insert(category.clone(), serde_json::to_value(info).unwrap());
+        }
+    }
+    let reg = state.registry.read().await;
     for entry in reg.iter() {
         let Some(category) = entry.category.as_deref() else {
             continue;
@@ -583,10 +651,12 @@ pub async fn torrents_categories(State(state): State<AppState>) -> impl IntoResp
 
 /// `GET /api/qb/v2/torrents/tags`.
 pub async fn torrents_tags(State(state): State<AppState>) -> impl IntoResponse {
-    let reg = state.registry.read().await;
-    let mut tags = std::collections::BTreeSet::new();
-    for entry in reg.iter() {
-        tags.extend(entry.tags.iter().filter(|tag| !tag.is_empty()).cloned());
+    let mut tags = state.tags.read().await.clone();
+    {
+        let reg = state.registry.read().await;
+        for entry in reg.iter() {
+            tags.extend(entry.tags.iter().filter(|tag| !tag.is_empty()).cloned());
+        }
     }
     (StatusCode::OK, Json(tags.into_iter().collect::<Vec<_>>()))
 }
@@ -634,17 +704,21 @@ pub async fn torrents_set_location(
 
 /// `POST /api/qb/v2/torrents/createCategory`.
 pub async fn torrents_create_category(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     body: String,
 ) -> impl IntoResponse {
     let params = parse_form_body(&body);
-    if params
+    let Some(category) = params
         .get("category")
         .and_then(|category| normalize_api_text(category))
-        .is_none()
-    {
+    else {
         return StatusCode::BAD_REQUEST;
-    }
+    };
+    let save_path = params
+        .get("savePath")
+        .and_then(|save_path| normalize_api_text(save_path))
+        .unwrap_or_default();
+    state.categories.write().await.insert(category, save_path);
     StatusCode::OK
 }
 
@@ -676,6 +750,10 @@ pub async fn torrents_edit_category(
     for hash in hashes {
         update_torrent_category(&state, &hash, Some(new_category.clone())).await;
     }
+    let mut categories = state.categories.write().await;
+    if let Some(save_path) = categories.remove(&category) {
+        categories.insert(new_category, save_path);
+    }
     StatusCode::OK
 }
 
@@ -704,19 +782,36 @@ pub async fn torrents_remove_categories(
     for hash in hashes {
         update_torrent_category(&state, &hash, None).await;
     }
+    let mut stored = state.categories.write().await;
+    for category in categories {
+        stored.remove(&category);
+    }
     StatusCode::OK
 }
 
 /// `POST /api/qb/v2/torrents/createTags`.
 pub async fn torrents_create_tags(body: String) -> impl IntoResponse {
+    torrents_create_tags_inner(None, body).await
+}
+
+pub async fn torrents_create_tags_state(
+    State(state): State<AppState>,
+    body: String,
+) -> impl IntoResponse {
+    torrents_create_tags_inner(Some(state), body).await
+}
+
+async fn torrents_create_tags_inner(state: Option<AppState>, body: String) -> StatusCode {
     let params = parse_form_body(&body);
-    if params
+    let tags = params
         .get("tags")
         .map(|tags| split_tags(tags))
-        .unwrap_or_default()
-        .is_empty()
-    {
+        .unwrap_or_default();
+    if tags.is_empty() {
         return StatusCode::BAD_REQUEST;
+    }
+    if let Some(state) = state {
+        state.tags.write().await.extend(tags);
     }
     StatusCode::OK
 }
@@ -743,6 +838,10 @@ pub async fn torrents_delete_tags(
     };
     for hash in hashes {
         update_torrent_tags(&state, &hash, Vec::new(), remove_tags.clone()).await;
+    }
+    let mut stored = state.tags.write().await;
+    for tag in remove_tags {
+        stored.remove(&tag);
     }
     StatusCode::OK
 }
