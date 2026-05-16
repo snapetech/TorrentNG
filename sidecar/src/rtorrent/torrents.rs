@@ -97,6 +97,15 @@ impl Client {
     }
 
     pub async fn has_multicall_range(&self) -> bool {
+        if std::env::var("RTNG_RTORRENT_PATCHES")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .any(|patch| patch == "rtorrent-0.16.11-multicall-range")
+        {
+            return true;
+        }
+
         self.list_methods()
             .await
             .map(|methods| methods.iter().any(|method| method == "d.multicall.range"))

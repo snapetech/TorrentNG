@@ -6,15 +6,15 @@ This is the working checklist for finishing the native Rust engine rewrite. It i
 
 - [ ] Replace README "Phase 0 stub" labels for implemented crates with accurate status.
 - [x] Expand `rt-db` schema beyond `torrents` and `files`.
-- [ ] Persist `torrent_files` metadata with offsets, priorities, and completion state.
-- [ ] Persist `torrent_trackers` with tier/order, status, announce timing, and scrape stats.
+- [x] Persist `torrent_files` metadata with offsets, priorities, and completion state.
+- [x] Persist `torrent_trackers` with tier/order, status, announce timing, and scrape stats.
 - [ ] Persist `torrent_tags` and `torrent_categories` as normalized tables.
-- [ ] Persist per-torrent limits and policy flags.
+- [x] Persist per-torrent limits and policy flags.
 - [x] Add append-only `session_events`.
 - [x] Add append-only `job_events`.
 - [x] Add durable `jobs` table with resumable checkpoint fields.
 - [x] Add `settings`, `storage_roots`, `mounts`, and `api_tokens` tables.
-- [ ] Add typed DB helpers for events, jobs, files, trackers, settings, mounts, and limits.
+- [ ] Add typed DB helpers for events, jobs, files, trackers, settings, mounts, and limits. (events/jobs/files/trackers/settings/limits done; mounts remaining)
 - [ ] Load engine/session state from DB on startup, not only in-memory registry bootstrap.
 - [ ] Persist every engine state transition atomically with a session event.
 - [ ] Add crash recovery tests for DB-backed state.
