@@ -1,6 +1,6 @@
 [package]
 name = "rt-peer-wire"
-description = "rtorrentNG: rt-peer-wire"
+description = "rtorrentNG: BEP 3 peer wire protocol codec"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,3 +9,9 @@ license.workspace = true
 [dependencies]
 thiserror.workspace = true
 tracing.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+bytes.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
