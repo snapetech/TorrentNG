@@ -302,6 +302,25 @@ impl EngineHandle {
         rx.await.map_err(|_| "engine dropped reply".to_owned())?
     }
 
+    pub async fn update_file_priorities(
+        &self,
+        info_hash: String,
+        file_ids: Vec<u32>,
+        priority: i64,
+    ) -> CmdResult<()> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(EngineCmd::UpdateFilePriorities {
+                info_hash,
+                file_ids,
+                priority,
+                reply,
+            })
+            .await
+            .map_err(|_| "engine shut down".to_owned())?;
+        rx.await.map_err(|_| "engine dropped reply".to_owned())?
+    }
+
     pub async fn shutdown(&self) {
         let _ = self.tx.send(EngineCmd::Shutdown).await;
     }
@@ -654,6 +673,17 @@ impl Engine {
                 reply,
             } => {
                 let result = self.update_torrent_limits_inner(&info_hash, limits).await;
+                let _ = reply.send(result);
+            }
+            EngineCmd::UpdateFilePriorities {
+                info_hash,
+                file_ids,
+                priority,
+                reply,
+            } => {
+                let result = self
+                    .update_file_priorities_inner(&info_hash, file_ids, priority)
+                    .await;
                 let _ = reply.send(result);
             }
 
@@ -1243,6 +1273,23 @@ impl Engine {
             TorrentMeta::V2(_) => anyhow::bail!("pure v2 torrents are not supported"),
         };
         let mut metadata = metadata_from_v1(&meta);
+        {
+            let db = self.db.lock().expect("database mutex poisoned");
+            if let Ok(files) = rt_db::list_torrent_files(&db, info_hash) {
+                if !files.is_empty() {
+                    let policy = files
+                        .into_iter()
+                        .map(|file| (file.file_index as u32, (file.priority, file.wanted)))
+                        .collect::<HashMap<_, _>>();
+                    for file in &mut metadata.files {
+                        if let Some((priority, wanted)) = policy.get(&file.index) {
+                            file.priority = *priority;
+                            file.wanted = *wanted;
+                        }
+                    }
+                }
+            }
+        }
         if let Ok(row) = {
             let db = self.db.lock().expect("database mutex poisoned");
             rt_db::get(&db, info_hash)
@@ -1478,6 +1525,55 @@ impl Engine {
                 "first_last_piece_prio": row.first_last_piece_prio,
                 "force_start": row.force_start,
                 "super_seeding": row.super_seeding,
+            }),
+        );
+        Ok(())
+    }
+
+    async fn update_file_priorities_inner(
+        &self,
+        info_hash: &str,
+        file_ids: Vec<u32>,
+        priority: i64,
+    ) -> CmdResult<()> {
+        {
+            let reg = self.registry.read().await;
+            if reg.get(info_hash).is_none() {
+                return Err(format!("torrent {info_hash} not found"));
+            }
+        }
+        let priority = priority.clamp(0, 2);
+        let wanted = priority > 0;
+        let mut db = self.db.lock().expect("database mutex poisoned");
+        let mut files = rt_db::list_torrent_files(&db, info_hash).map_err(|e| e.to_string())?;
+        if files.is_empty() {
+            return Err(format!("torrent {info_hash} has no persisted files"));
+        }
+        let ids = file_ids
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        let apply_all = ids.is_empty();
+        let mut touched = 0usize;
+        for file in &mut files {
+            if apply_all || ids.contains(&(file.file_index as u32)) {
+                file.priority = priority;
+                file.wanted = wanted;
+                touched += 1;
+            }
+        }
+        if touched == 0 {
+            return Err(format!("no matching files for torrent {info_hash}"));
+        }
+        rt_db::replace_torrent_files(&mut db, info_hash, &files).map_err(|e| e.to_string())?;
+        drop(db);
+        self.append_session_event(
+            Some(info_hash),
+            "file_priorities_updated",
+            Some("torrent file priorities updated"),
+            serde_json::json!({
+                "file_ids": ids.into_iter().collect::<Vec<_>>(),
+                "priority": priority,
+                "wanted": wanted,
             }),
         );
         Ok(())
@@ -2167,6 +2263,8 @@ fn metadata_from_v1(meta: &TorrentMetaV1) -> EngineTorrentMetadata {
                 index: file.index,
                 path: file.path.as_display(),
                 length: file.length,
+                priority: 1,
+                wanted: true,
             })
             .collect(),
     }

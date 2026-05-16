@@ -446,8 +446,36 @@ pub async fn torrents_recheck(State(state): State<AppState>, body: String) -> im
 }
 
 /// `POST /api/qb/v2/torrents/filePrio`.
-pub async fn torrents_file_prio() -> impl IntoResponse {
-    StatusCode::OK
+pub async fn torrents_file_prio(State(state): State<AppState>, body: String) -> impl IntoResponse {
+    let params = parse_form_body(&body);
+    let Some(hash) = params.get("hash").cloned() else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let file_ids = params
+        .get("id")
+        .or_else(|| params.get("ids"))
+        .map(|ids| {
+            ids.split('|')
+                .filter_map(|id| id.trim().parse::<u32>().ok())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let Some(priority) = params
+        .get("priority")
+        .and_then(|value| value.parse::<i64>().ok())
+    else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let Some(engine) = &state.engine else {
+        return StatusCode::OK;
+    };
+    match engine
+        .update_file_priorities(hash, file_ids, priority)
+        .await
+    {
+        Ok(()) => StatusCode::OK,
+        Err(_) => StatusCode::NOT_FOUND,
+    }
 }
 
 /// `POST /api/qb/v2/torrents/increasePrio`.
@@ -630,8 +658,8 @@ pub async fn torrents_files(
                     index: file.index,
                     name: file.path,
                     size: file.length as i64,
-                    priority: 1,
-                    progress: if complete { 1.0 } else { 0.0 },
+                    priority: file.priority.clamp(0, 2) as u8,
+                    progress: if complete || !file.wanted { 1.0 } else { 0.0 },
                 })
                 .collect();
             (StatusCode::OK, Json(files))

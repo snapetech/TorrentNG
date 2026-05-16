@@ -466,11 +466,11 @@ fn transmission_file_stats(
         meta.files
             .iter()
             .enumerate()
-            .map(|(idx, _)| {
+            .map(|(idx, file)| {
                 json!({
                     "bytesCompleted": completed[idx],
-                    "wanted": true,
-                    "priority": 0,
+                    "wanted": file.wanted,
+                    "priority": file.priority,
                 })
             })
             .collect()
@@ -495,12 +495,12 @@ fn file_completed_bytes(
 }
 
 fn transmission_file_priorities(meta: Option<&EngineTorrentMetadata>) -> Vec<i64> {
-    meta.map(|meta| vec![0; meta.files.len()])
+    meta.map(|meta| meta.files.iter().map(|file| file.priority).collect())
         .unwrap_or_default()
 }
 
 fn transmission_file_wanted(meta: Option<&EngineTorrentMetadata>) -> Vec<bool> {
-    meta.map(|meta| vec![true; meta.files.len()])
+    meta.map(|meta| meta.files.iter().map(|file| file.wanted).collect())
         .unwrap_or_default()
 }
 
@@ -742,11 +742,15 @@ mod tests {
                     index: 0,
                     path: "one.bin".into(),
                     length: 100,
+                    priority: 1,
+                    wanted: true,
                 },
                 EngineTorrentFile {
                     index: 1,
                     path: "two.bin".into(),
                     length: 200,
+                    priority: 0,
+                    wanted: false,
                 },
             ],
         };

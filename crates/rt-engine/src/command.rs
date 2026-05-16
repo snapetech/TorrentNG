@@ -12,6 +12,8 @@ pub struct EngineTorrentFile {
     pub index: u32,
     pub path: String,
     pub length: u64,
+    pub priority: i64,
+    pub wanted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,6 +177,12 @@ pub enum EngineCmd {
     UpdateTorrentLimits {
         info_hash: String,
         limits: EngineTorrentLimits,
+        reply: oneshot::Sender<CmdResult<()>>,
+    },
+    UpdateFilePriorities {
+        info_hash: String,
+        file_ids: Vec<u32>,
+        priority: i64,
         reply: oneshot::Sender<CmdResult<()>>,
     },
     /// Snapshot runtime and durable metrics.
