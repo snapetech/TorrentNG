@@ -440,7 +440,14 @@ impl Engine {
 
             EngineCmd::RecheckTorrent { info_hash, reply } => {
                 let job_id = self.create_recheck_job(&info_hash);
-                let result = self.send_to_torrent(&info_hash, TorrentCmd::Recheck).await;
+                let result = self
+                    .send_to_torrent(
+                        &info_hash,
+                        TorrentCmd::Recheck {
+                            job_id: job_id.clone(),
+                        },
+                    )
+                    .await;
                 if result.is_ok() {
                     if let Some(job_id) = &job_id {
                         self.update_job_state(
@@ -1332,6 +1339,19 @@ impl Engine {
         if let Err(e) = rt_db::append_job_event(&db, &event) {
             warn!(job_id, err = %e, "failed to append job state event");
         }
+        if state == JOB_STATE_RUNNING {
+            let started = rt_db::JobEventRow {
+                event_id: None,
+                job_id: job_id.to_owned(),
+                occurred_at: now,
+                kind: "check_started".to_owned(),
+                message: Some("recheck started".to_owned()),
+                payload: serde_json::json!({ "state": state }).to_string(),
+            };
+            if let Err(e) = rt_db::append_job_event(&db, &started) {
+                warn!(job_id, err = %e, "failed to append recheck start event");
+            }
+        }
     }
 }
 
@@ -1711,9 +1731,10 @@ mod tests {
         assert_eq!(job.affected_torrents, vec!["b".repeat(40)]);
         assert!(job.started_at.is_some());
         let events = rt_db::list_job_events(&db, &job_id, 10).unwrap();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].kind, "job_running");
-        assert_eq!(events[1].kind, "job_queued");
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].kind, "check_started");
+        assert_eq!(events[1].kind, "job_running");
+        assert_eq!(events[2].kind, "job_queued");
     }
 }
 

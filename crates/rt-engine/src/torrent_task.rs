@@ -54,7 +54,9 @@ const METADATA_PIECE_SIZE: usize = 16 * 1024;
 pub enum TorrentCmd {
     Pause,
     Resume,
-    Recheck,
+    Recheck {
+        job_id: Option<String>,
+    },
     Reannounce,
     Shutdown,
     /// Peers discovered by DHT or tracker.
@@ -73,6 +75,10 @@ enum RecheckOutcome {
     Paused,
     Shutdown,
 }
+
+const JOB_STATE_RUNNING: &str = "running";
+const JOB_STATE_PAUSED: &str = "paused";
+const JOB_STATE_COMPLETED: &str = "completed";
 
 /// A block received from a peer.
 #[derive(Debug)]
@@ -269,7 +275,7 @@ impl TorrentTask {
             self.persist_progress().await;
             self.set_state(TorrentState::Paused).await;
         } else if !restored {
-            if matches!(self.run_recheck().await, RecheckOutcome::Shutdown) {
+            if matches!(self.run_recheck(None).await, RecheckOutcome::Shutdown) {
                 return;
             }
         } else if self.picker.is_complete() {
@@ -302,7 +308,7 @@ impl TorrentTask {
                         TorrentCmd::Resume => {
                             self.paused = false;
                             self.tracker_event = TrackerEvent::Started;
-                            if matches!(self.run_recheck().await, RecheckOutcome::Shutdown) {
+                            if matches!(self.run_recheck(None).await, RecheckOutcome::Shutdown) {
                                 break;
                             }
                         }
@@ -320,8 +326,8 @@ impl TorrentTask {
                                 self.accept_peer(stream, peer_addr, handshake).await;
                             }
                         }
-                        TorrentCmd::Recheck => {
-                            if matches!(self.run_recheck().await, RecheckOutcome::Shutdown) {
+                        TorrentCmd::Recheck { job_id } => {
+                            if matches!(self.run_recheck(job_id).await, RecheckOutcome::Shutdown) {
                                 break;
                             }
                         }
@@ -999,23 +1005,44 @@ impl TorrentTask {
         );
     }
 
-    async fn run_recheck(&mut self) -> RecheckOutcome {
+    async fn run_recheck(&mut self, job_id: Option<String>) -> RecheckOutcome {
         self.shutdown_peers().await;
         self.set_state(TorrentState::Checking).await;
 
         let mut valid = 0usize;
         let mut invalid = 0usize;
+        let mut invalid_pieces = Vec::new();
 
         for piece in 0..self.piece_map.piece_count {
             match self.pending_recheck_control().await {
                 Some(RecheckOutcome::Paused) => {
                     self.save_fastresume(false).await;
                     self.set_state(TorrentState::Paused).await;
+                    if let Some(job_id) = &job_id {
+                        self.persist_recheck_job_progress(
+                            job_id,
+                            piece,
+                            valid,
+                            &invalid_pieces,
+                            JOB_STATE_PAUSED,
+                            Some("recheck paused"),
+                        );
+                    }
                     return RecheckOutcome::Paused;
                 }
                 Some(RecheckOutcome::Shutdown) => {
                     self.save_fastresume(false).await;
                     self.set_state(TorrentState::Stopped).await;
+                    if let Some(job_id) = &job_id {
+                        self.persist_recheck_job_progress(
+                            job_id,
+                            piece,
+                            valid,
+                            &invalid_pieces,
+                            JOB_STATE_PAUSED,
+                            Some("recheck interrupted by shutdown"),
+                        );
+                    }
                     return RecheckOutcome::Shutdown;
                 }
                 Some(RecheckOutcome::Complete) | None => {}
@@ -1036,10 +1063,12 @@ impl TorrentTask {
                 }
                 VerifyResult::Invalid => {
                     self.picker.reject_piece(piece as usize);
+                    invalid_pieces.push(piece as i64);
                     invalid += 1;
                 }
                 VerifyResult::Missing { .. } => {
                     self.picker.reject_piece(piece as usize);
+                    invalid_pieces.push(piece as i64);
                     invalid += 1;
                 }
             }
@@ -1047,6 +1076,16 @@ impl TorrentTask {
             if piece > 0 && piece % 64 == 0 {
                 self.persist_progress().await;
                 self.save_fastresume(false).await;
+                if let Some(job_id) = &job_id {
+                    self.persist_recheck_job_progress(
+                        job_id,
+                        piece + 1,
+                        valid,
+                        &invalid_pieces,
+                        JOB_STATE_RUNNING,
+                        Some("recheck progress"),
+                    );
+                }
             }
         }
 
@@ -1057,6 +1096,16 @@ impl TorrentTask {
             "recheck complete"
         );
         self.save_fastresume(true).await;
+        if let Some(job_id) = &job_id {
+            self.persist_recheck_job_progress(
+                job_id,
+                self.piece_map.piece_count,
+                valid,
+                &invalid_pieces,
+                JOB_STATE_COMPLETED,
+                Some("recheck completed"),
+            );
+        }
 
         if self.picker.is_complete() {
             self.tracker_event = TrackerEvent::Completed;
@@ -1090,7 +1139,7 @@ impl TorrentTask {
                 Ok(TorrentCmd::Reannounce) => {
                     self.schedule_active_tracker_tier_now();
                 }
-                Ok(TorrentCmd::Recheck) => {}
+                Ok(TorrentCmd::Recheck { .. }) => {}
                 Ok(TorrentCmd::NewPeers(_)) => {}
                 Ok(TorrentCmd::AcceptPeer { .. }) => {}
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return None,
@@ -1277,6 +1326,71 @@ impl TorrentTask {
         }
     }
 
+    fn persist_recheck_job_progress(
+        &self,
+        job_id: &str,
+        next_piece: u32,
+        valid_pieces: usize,
+        invalid_pieces: &[i64],
+        state: &str,
+        message: Option<&str>,
+    ) {
+        let now = unix_now();
+        let mut job = {
+            let db = self.db.lock().expect("database mutex poisoned");
+            match rt_db::get_job(&db, job_id) {
+                Ok(job) => job,
+                Err(e) => {
+                    warn!(job_id, err = %e, "failed to load recheck job");
+                    return;
+                }
+            }
+        };
+        let done = next_piece.min(self.piece_map.piece_count) as i64;
+        job.state = state.to_owned();
+        job.done = done;
+        job.checkpoint = done;
+        job.piece_index = Some(done);
+        job.byte_offset = Some(self.verified_byte_offset(next_piece));
+        job.verified_bytes = (valid_pieces as u64).saturating_mul(self.meta.piece_length) as i64;
+        job.invalid_pieces = invalid_pieces.to_vec();
+        job.updated_at = now as i64;
+        if state == JOB_STATE_COMPLETED {
+            job.finished_at = Some(now as i64);
+        }
+        let event = rt_db::JobEventRow {
+            event_id: None,
+            job_id: job_id.to_owned(),
+            occurred_at: now as i64,
+            kind: if state == JOB_STATE_COMPLETED {
+                "check_completed".to_owned()
+            } else {
+                "check_progress".to_owned()
+            },
+            message: message.map(str::to_owned),
+            payload: serde_json::json!({
+                "piece_index": job.piece_index,
+                "verified_bytes": job.verified_bytes,
+                "invalid_pieces": job.invalid_pieces,
+                "state": state,
+            })
+            .to_string(),
+        };
+        let db = self.db.lock().expect("database mutex poisoned");
+        if let Err(e) = rt_db::upsert_job(&db, &job) {
+            warn!(job_id, err = %e, "failed to persist recheck progress");
+            return;
+        }
+        if let Err(e) = rt_db::append_job_event(&db, &event) {
+            warn!(job_id, err = %e, "failed to append recheck progress event");
+        }
+    }
+
+    fn verified_byte_offset(&self, next_piece: u32) -> i64 {
+        let bytes = (next_piece as u64).saturating_mul(self.meta.piece_length);
+        bytes.min(self.meta.total_length()) as i64
+    }
+
     async fn save_fastresume(&self, full_verify: bool) {
         let (uploaded, downloaded) = self.transfer_snapshot().await;
         let mut state = FastresumeState::new_empty(
@@ -1398,6 +1512,13 @@ fn private_peer_source_allowed(
     peer: SocketAddr,
 ) -> bool {
     !is_private || allowed_private_peers.contains(&peer)
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 /// Open a TCP connection, complete BEP 3 handshake, receive Piece messages.

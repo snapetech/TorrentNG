@@ -22,11 +22,11 @@ This is the working checklist for finishing the native Rust engine rewrite. It i
 ## 2. Recheck And Verification Jobs
 
 - [x] Convert `EngineHandle::recheck_torrent` from direct command into a durable job.
-- [ ] Store resumable recheck checkpoint: file index, piece index, byte offset, verified bytes, invalid pieces. (job fields and initial checkpoint exist; live progress updates remaining)
+- [x] Store resumable recheck checkpoint: file index, piece index, byte offset, verified bytes, invalid pieces.
 - [ ] Add cancellation and pause/resume controls.
 - [ ] Rate-limit recheck through storage scheduler.
 - [ ] Commit torrent state only after recheck completes.
-- [ ] Emit `check_started`, `check_progress`, `check_completed`, and failure events.
+- [x] Emit `check_started`, `check_progress`, `check_completed`, and failure events.
 - [ ] Add crash-resume recheck tests.
 
 ## 3. Storage, Import, And Move Safety
