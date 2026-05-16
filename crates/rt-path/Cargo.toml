@@ -9,3 +9,5 @@ license.workspace = true
 [dependencies]
 thiserror.workspace = true
 tracing.workspace = true
+uuid.workspace = true
+serde.workspace = true

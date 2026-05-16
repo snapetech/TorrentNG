@@ -9,3 +9,6 @@ license.workspace = true
 [dependencies]
 thiserror.workspace = true
 tracing.workspace = true
+sha1.workspace = true
+rt-bencode = { path = "../rt-bencode" }
+rt-path = { path = "../rt-path" }

@@ -9,3 +9,7 @@ license.workspace = true
 [dependencies]
 thiserror.workspace = true
 tracing.workspace = true
+rt-path = { path = "../rt-path" }
+
+[dev-dependencies]
+proptest.workspace = true

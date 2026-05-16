@@ -75,7 +75,7 @@ prometheus = "0.13"
 
 # utilities
 bytes = "1"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 rand = "0.8"
 url = "2"
 hex = "0.4"
