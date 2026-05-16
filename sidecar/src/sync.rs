@@ -1,5 +1,9 @@
 use std::sync::atomic::Ordering;
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
@@ -8,6 +12,7 @@ use crate::{
     cache::{Db, TorrentRow},
     metrics::SharedMetrics,
     rtorrent::{torrents::MULTICALL_RANGE_PAGE_SIZE, Client},
+    torrent_meta::session_tracker_url,
 };
 
 #[derive(Debug, Default)]
@@ -34,13 +39,22 @@ pub async fn run(
     info!("rTorrent d.multicall.range supported={range_supported}");
     let mut page_offset = 0i64;
     let mut full_cycle_seen = HashSet::new();
+    let mut tracker_cache = HashMap::new();
 
     loop {
         ticker.tick().await;
         let result = if range_supported {
-            tick_bounded(&rt, &db, &tx, &mut page_offset, &mut full_cycle_seen).await
+            tick_bounded(
+                &rt,
+                &db,
+                &tx,
+                &mut page_offset,
+                &mut full_cycle_seen,
+                &mut tracker_cache,
+            )
+            .await
         } else {
-            tick_full(&rt, &db, &tx).await
+            tick_full(&rt, &db, &tx, &mut tracker_cache).await
         };
         match result {
             Ok(counts) => {
@@ -73,6 +87,7 @@ async fn tick_full(
     rt: &Client,
     db: &Db,
     tx: &broadcast::Sender<Event>,
+    tracker_cache: &mut HashMap<String, Option<String>>,
 ) -> anyhow::Result<SyncCounts> {
     let torrents = rt.list_torrents().await?;
     let now = chrono::Utc::now().timestamp();
@@ -82,7 +97,7 @@ async fn tick_full(
     let mut counts = SyncCounts::default();
 
     for t in &torrents {
-        upsert_torrent(db, tx, t, now, &mut counts);
+        upsert_torrent(db, tx, t, now, &mut counts, tracker_cache);
     }
 
     let known = db.all_hashes()?;
@@ -100,6 +115,7 @@ async fn tick_bounded(
     tx: &broadcast::Sender<Event>,
     page_offset: &mut i64,
     full_cycle_seen: &mut HashSet<String>,
+    tracker_cache: &mut HashMap<String, Option<String>>,
 ) -> anyhow::Result<SyncCounts> {
     let now = chrono::Utc::now().timestamp();
     let mut counts = SyncCounts::default();
@@ -110,7 +126,7 @@ async fn tick_bounded(
             write_live_speeds(summary.rates.download, summary.rates.upload);
             for t in &summary.moving {
                 if touched.insert(t.hash.clone()) {
-                    upsert_torrent(db, tx, t, now, &mut counts);
+                    upsert_torrent(db, tx, t, now, &mut counts, tracker_cache);
                 }
             }
         }
@@ -125,7 +141,7 @@ async fn tick_bounded(
     for t in &page {
         full_cycle_seen.insert(t.hash.clone());
         if touched.insert(t.hash.clone()) {
-            upsert_torrent(db, tx, t, now, &mut counts);
+            upsert_torrent(db, tx, t, now, &mut counts, tracker_cache);
         }
     }
 
@@ -150,6 +166,7 @@ fn upsert_torrent(
     t: &crate::rtorrent::torrents::RawTorrent,
     now: i64,
     counts: &mut SyncCounts,
+    tracker_cache: &mut HashMap<String, Option<String>>,
 ) {
     if !t.message.is_empty() && t.state == 3 {
         counts.errored += 1;
@@ -186,7 +203,11 @@ fn upsert_torrent(
         peers_connected: t.peers_connected,
         peers_complete: t.peers_complete,
         message: t.message.clone(),
-        tracker_url: t.tracker_url.clone(),
+        tracker_url: if t.tracker_url.is_empty() {
+            session_tracker_url(&t.hash, tracker_cache)
+        } else {
+            t.tracker_url.clone()
+        },
         tags: String::new(),
         updated_at: now,
     };

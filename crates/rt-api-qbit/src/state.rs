@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, collections::BTreeSet, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    sync::Arc,
+};
 use tokio::sync::RwLock;
 
 use rt_engine::EngineHandle;
@@ -10,6 +13,7 @@ pub struct AppState {
     pub engine: Option<EngineHandle>,
     pub categories: Arc<RwLock<BTreeMap<String, String>>>,
     pub tags: Arc<RwLock<BTreeSet<String>>>,
+    pub tracker_projection_cache: Arc<RwLock<HashMap<String, (String, u32)>>>,
 }
 
 impl AppState {
@@ -19,6 +23,7 @@ impl AppState {
             engine: None,
             categories: Arc::new(RwLock::new(BTreeMap::new())),
             tags: Arc::new(RwLock::new(BTreeSet::new())),
+            tracker_projection_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -28,6 +33,7 @@ impl AppState {
             engine: None,
             categories: Arc::new(RwLock::new(BTreeMap::new())),
             tags: Arc::new(RwLock::new(BTreeSet::new())),
+            tracker_projection_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -37,6 +43,7 @@ impl AppState {
             engine: Some(engine),
             categories: Arc::new(RwLock::new(BTreeMap::new())),
             tags: Arc::new(RwLock::new(BTreeSet::new())),
+            tracker_projection_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }

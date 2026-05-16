@@ -1455,14 +1455,8 @@ async fn torrent_limit_map(
 
 async fn qbit_torrent_info(state: &AppState, e: &rt_session::TorrentEntry) -> QbTorrentInfo {
     let progress = torrent_progress(e.total_length, e.amount_left, e.completed_at.is_some());
-    let (tracker, trackers_count) = if let Some(engine) = &state.engine {
-        match engine.torrent_metadata(e.info_hash.clone()).await {
-            Ok(meta) => (
-                meta.trackers.first().cloned().unwrap_or_default(),
-                meta.trackers.len() as u32,
-            ),
-            Err(_) => (String::new(), 0),
-        }
+    let (tracker, trackers_count) = if state.engine.is_some() {
+        qbit_tracker_projection(state, &e.info_hash).await
     } else {
         (String::new(), 0)
     };
@@ -1491,6 +1485,36 @@ async fn qbit_torrent_info(state: &AppState, e: &rt_session::TorrentEntry) -> Qb
         tracker,
         trackers_count,
     }
+}
+
+async fn qbit_tracker_projection(state: &AppState, info_hash: &str) -> (String, u32) {
+    if let Some(cached) = state
+        .tracker_projection_cache
+        .read()
+        .await
+        .get(info_hash)
+        .cloned()
+    {
+        return cached;
+    }
+    let Some(engine) = &state.engine else {
+        return (String::new(), 0);
+    };
+    let projection = match engine.torrent_metadata(info_hash.to_owned()).await {
+        Ok(meta) => (
+            meta.trackers.first().cloned().unwrap_or_default(),
+            meta.trackers.len() as u32,
+        ),
+        Err(_) => (String::new(), 0),
+    };
+    if projection.1 > 0 {
+        state
+            .tracker_projection_cache
+            .write()
+            .await
+            .insert(info_hash.to_owned(), projection.clone());
+    }
+    projection
 }
 
 fn sync_rid_for_infos(infos: &[QbTorrentInfo]) -> i64 {
