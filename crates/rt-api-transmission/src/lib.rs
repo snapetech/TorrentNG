@@ -82,7 +82,7 @@ async fn rpc(
         "group-get" => Ok(json!({ "groups": [] })),
         "group-set" => Ok(json!({})),
         "torrent-set" => torrent_set(&state, &args).await,
-        "torrent-set-tracker-list" => Ok(json!({})),
+        "torrent-set-tracker-list" => torrent_set_tracker_list(&state, &args).await,
         "torrent-set-file-priorities" => torrent_set_file_priorities(&state, &args).await,
         "torrent-set-file-wanted" => torrent_set_file_wanted(&state, &args, true).await,
         "torrent-set-file-unwanted" => torrent_set_file_wanted(&state, &args, false).await,
@@ -228,6 +228,19 @@ async fn torrent_set(state: &AppState, args: &Value) -> Result<Value, String> {
     Ok(json!({}))
 }
 
+async fn torrent_set_tracker_list(state: &AppState, args: &Value) -> Result<Value, String> {
+    let trackers = transmission_tracker_list_arg(args);
+    let Some(engine) = &state.engine else {
+        return Ok(json!({}));
+    };
+    for hash in ids(state, args).await {
+        engine
+            .update_torrent_trackers(hash, trackers.clone())
+            .await?;
+    }
+    Ok(json!({}))
+}
+
 async fn torrent_set_file_wanted(
     state: &AppState,
     args: &Value,
@@ -248,6 +261,47 @@ async fn torrent_set_file_wanted(
             .await?;
     }
     Ok(json!({}))
+}
+
+fn transmission_tracker_list_arg(args: &Value) -> Vec<String> {
+    let value = args
+        .get("trackerList")
+        .or_else(|| args.get("tracker-list"))
+        .or_else(|| args.get("trackers"));
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    let mut trackers = Vec::new();
+    collect_tracker_values(value, &mut trackers);
+    normalize_tracker_values(trackers)
+}
+
+fn collect_tracker_values(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(s) => out.push(s.to_owned()),
+        Value::Array(values) => {
+            for value in values {
+                collect_tracker_values(value, out);
+            }
+        }
+        Value::Object(obj) => {
+            if let Some(announce) = obj.get("announce").and_then(Value::as_str) {
+                out.push(announce.to_owned());
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_tracker_values(values: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for value in values {
+        let value = value.trim();
+        if !value.is_empty() && !out.iter().any(|existing| existing == value) {
+            out.push(value.to_owned());
+        }
+    }
+    out
 }
 
 async fn torrent_set_file_priorities(state: &AppState, args: &Value) -> Result<Value, String> {
@@ -1004,5 +1058,24 @@ mod tests {
     fn renamed_file_path_preserves_parent_directory() {
         assert_eq!(renamed_file_path("dir/old.bin", "new.bin"), "dir/new.bin");
         assert_eq!(renamed_file_path("old.bin", "new.bin"), "new.bin");
+    }
+
+    #[test]
+    fn transmission_tracker_list_arg_accepts_common_shapes() {
+        let args = json!({
+            "trackerList": [
+                [" udp://one/announce ", "udp://one/announce"],
+                "https://two/announce",
+                { "announce": "http://three/announce" }
+            ]
+        });
+        assert_eq!(
+            transmission_tracker_list_arg(&args),
+            vec![
+                "udp://one/announce".to_owned(),
+                "https://two/announce".to_owned(),
+                "http://three/announce".to_owned(),
+            ]
+        );
     }
 }

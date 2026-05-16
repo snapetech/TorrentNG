@@ -19,7 +19,7 @@ export function EnginePanel() {
   return (
     <section style={{ padding: '16px 24px' }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 12 }}>
-        <h2 style={{ fontSize: 13, margin: 0, color: '#cbd5e1' }}>Engine</h2>
+        <h2 style={{ fontSize: 13, margin: 0, color: 'var(--text)' }}>Engine</h2>
         {data && (
           <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
             <Badge ok={driftProblems === 0} text={driftProblems === 0 ? 'profile clean' : `${driftProblems} drift`} />
@@ -28,7 +28,7 @@ export function EnginePanel() {
         )}
       </div>
 
-      {isLoading && <div style={{ color: '#64748b', fontSize: 12 }}>Loading engine diagnostics...</div>}
+      {isLoading && <div style={{ color: 'var(--faint)', fontSize: 12 }}>Loading engine diagnostics...</div>}
       {error && <div style={{ color: '#ef4444', fontSize: 12 }}>Engine diagnostics unavailable</div>}
       {data && (
         <div style={{ display: 'grid', gridTemplateColumns: 'minmax(240px, 1fr) minmax(320px, 2fr)', gap: 16 }}>
@@ -69,17 +69,17 @@ function Capabilities({ data }: { data: EngineDiagnostics }) {
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))', gap: 8 }}>
         {data.capabilities.map(cap => (
           <div key={cap.key} style={{
-            border: '1px solid #1e293b',
+            border: '1px solid var(--border)',
             borderRadius: 6,
             padding: '8px 10px',
-            background: cap.available ? '#0f1a24' : '#1a1114',
+            background: cap.available ? 'var(--surface)' : 'rgba(239,68,68,.10)',
             minWidth: 0,
           }}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
-              <span style={{ fontSize: 12, color: '#e2e8f0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{cap.label}</span>
+              <span style={{ fontSize: 12, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{cap.label}</span>
               <Badge ok={cap.available} text={cap.available ? 'yes' : 'no'} />
             </div>
-            <div title={cap.command} style={{ fontSize: 11, color: '#64748b', marginTop: 4, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            <div title={cap.command} style={{ fontSize: 11, color: 'var(--faint)', marginTop: 4, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
               {cap.command}
             </div>
           </div>
@@ -136,7 +136,7 @@ function ProfileDrift({ data }: { data: EngineDiagnostics }) {
   return (
     <div style={{ gridColumn: '1 / -1' }}>
       <Subhead>Engine Profile Drift</Subhead>
-      {problems.length === 0 && <div style={{ color: '#86efac', fontSize: 12 }}>Running profile matches rtorrentNG defaults</div>}
+      {problems.length === 0 && <div style={{ color: '#22c55e', fontSize: 12 }}>Running profile matches rtorrentNG defaults</div>}
       {problems.length > 0 && (
         <div style={{ display: 'grid', gap: 6 }}>
           {problems.map(row => (
@@ -145,14 +145,14 @@ function ProfileDrift({ data }: { data: EngineDiagnostics }) {
               gridTemplateColumns: '180px minmax(0, 1fr) minmax(0, 1fr)',
               gap: 10,
               alignItems: 'center',
-              border: '1px solid #3f1d1d',
+              border: '1px solid #7f1d1d',
               borderRadius: 6,
               padding: '7px 9px',
-              background: '#1a1114',
+              background: 'rgba(239,68,68,.10)',
               fontSize: 12,
             }}>
-              <div title={row.command} style={{ color: '#e2e8f0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{row.label}</div>
-              <div title={row.expected} style={{ color: '#64748b', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>Expected {row.expected}</div>
+              <div title={row.command} style={{ color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{row.label}</div>
+              <div title={row.expected} style={{ color: 'var(--faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>Expected {row.expected}</div>
               <div title={row.actual ?? row.detail ?? ''} style={{ color: '#fca5a5', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                 {row.status === 'unavailable' ? 'Unavailable' : `Actual ${row.actual ?? ''}`}
               </div>
@@ -168,11 +168,11 @@ function CommandIndex({ commands }: { commands?: { ok: boolean; count: number; c
   return (
     <div style={{ gridColumn: '1 / -1' }}>
       <Subhead>XMLRPC Command Surface</Subhead>
-      {!commands && <div style={{ color: '#64748b', fontSize: 12 }}>Loading command index...</div>}
+      {!commands && <div style={{ color: 'var(--faint)', fontSize: 12 }}>Loading command index...</div>}
       {commands && !commands.ok && <div style={{ color: '#fca5a5', fontSize: 12 }}>Command index unavailable</div>}
       {commands?.ok && (
         <details>
-          <summary style={{ color: '#cbd5e1', fontSize: 12, cursor: 'pointer' }}>{commands.count} commands exposed by rTorrent</summary>
+          <summary style={{ color: 'var(--text)', fontSize: 12, cursor: 'pointer' }}>{commands.count} commands exposed by rTorrent</summary>
           <div style={{
             marginTop: 8,
             maxHeight: 180,
@@ -182,7 +182,7 @@ function CommandIndex({ commands }: { commands?: { ok: boolean; count: number; c
             gap: 4,
             fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
             fontSize: 11,
-            color: '#94a3b8',
+            color: 'var(--muted)',
           }}>
             {commands.commands.map(command => <div key={command} title={command} style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{command}</div>)}
           </div>
@@ -197,8 +197,8 @@ function Rows({ rows }: { rows: [string, string][] }) {
     <div style={{ display: 'grid', gridTemplateColumns: '160px minmax(0, 1fr)', gap: '6px 12px', fontSize: 12 }}>
       {rows.map(([k, v]) => (
         <div key={k} style={{ display: 'contents' }}>
-          <div style={{ color: '#64748b' }}>{k}</div>
-          <div title={v} style={{ color: '#cbd5e1', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{v}</div>
+          <div style={{ color: 'var(--faint)' }}>{k}</div>
+          <div title={v} style={{ color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{v}</div>
         </div>
       ))}
     </div>
@@ -206,7 +206,7 @@ function Rows({ rows }: { rows: [string, string][] }) {
 }
 
 function Subhead({ children }: { children: string }) {
-  return <div style={{ fontSize: 11, textTransform: 'uppercase', color: '#64748b', marginBottom: 8 }}>{children}</div>
+  return <div style={{ fontSize: 11, textTransform: 'uppercase', color: 'var(--faint)', marginBottom: 8 }}>{children}</div>
 }
 
 function Badge({ ok, text }: { ok: boolean; text: string }) {

@@ -35,7 +35,7 @@ export function UserAgentPanel() {
 
   return (
     <div style={{ padding: '16px 20px', maxWidth: 560 }}>
-      <div style={{ fontSize: 12, fontWeight: 600, color: '#64748b', letterSpacing: '0.06em', textTransform: 'uppercase', marginBottom: 12 }}>
+      <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--faint)', letterSpacing: '0.06em', textTransform: 'uppercase', marginBottom: 12 }}>
         Client Identifier
       </div>
 
@@ -46,10 +46,10 @@ export function UserAgentPanel() {
             key={p.value}
             onClick={() => setDraft(p.value)}
             style={{
-              background: draft === p.value ? '#1e3a5f' : '#1e2433',
-              border: '1px solid ' + (draft === p.value ? '#3b82f6' : '#334155'),
+              background: draft === p.value ? 'var(--accent-soft)' : 'var(--surface-2)',
+              border: '1px solid ' + (draft === p.value ? 'var(--accent)' : 'var(--border-strong)'),
               borderRadius: 5,
-              color: draft === p.value ? '#93c5fd' : '#94a3b8',
+              color: draft === p.value ? 'var(--accent-text)' : 'var(--muted)',
               padding: '3px 10px',
               fontSize: 11,
               cursor: 'pointer',
@@ -70,10 +70,10 @@ export function UserAgentPanel() {
         placeholder={isLoading ? 'Loading…' : 'user-agent string'}
         style={{
           width: '100%',
-          background: '#0f1117',
-          border: '1px solid ' + (isCustom && draft ? '#7c3aed' : '#334155'),
+          background: 'var(--bg)',
+          border: '1px solid ' + (isCustom && draft ? 'var(--accent)' : 'var(--border-strong)'),
           borderRadius: 6,
-          color: '#e2e8f0',
+          color: 'var(--text)',
           padding: '6px 10px',
           fontSize: 13,
           fontFamily: 'monospace',
@@ -83,7 +83,7 @@ export function UserAgentPanel() {
       />
 
       {isCustom && draft && (
-        <div style={{ fontSize: 11, color: '#7c3aed', marginTop: 4 }}>Custom value</div>
+        <div style={{ fontSize: 11, color: 'var(--accent)', marginTop: 4 }}>Custom value</div>
       )}
 
       {/* Save button */}
@@ -92,10 +92,10 @@ export function UserAgentPanel() {
           onClick={() => mutation.mutate(draft)}
           disabled={!isDirty || mutation.isPending || !draft.trim()}
           style={{
-            background: isDirty ? '#2563eb' : '#1e2433',
-            border: '1px solid ' + (isDirty ? '#3b82f6' : '#334155'),
+            background: isDirty ? 'var(--accent)' : 'var(--surface-2)',
+            border: '1px solid ' + (isDirty ? 'var(--accent)' : 'var(--border-strong)'),
             borderRadius: 6,
-            color: isDirty ? '#fff' : '#475569',
+            color: isDirty ? 'var(--accent-text)' : 'var(--faint)',
             padding: '5px 16px',
             fontSize: 12,
             cursor: isDirty ? 'pointer' : 'default',
@@ -108,8 +108,8 @@ export function UserAgentPanel() {
         {mutation.isError && <span style={{ fontSize: 12, color: '#ef4444' }}>Failed</span>}
       </div>
 
-      <div style={{ fontSize: 11, color: '#334155', marginTop: 12, lineHeight: 1.5 }}>
-        Current: <span style={{ fontFamily: 'monospace', color: '#475569' }}>{data?.user_agent ?? '…'}</span>
+      <div style={{ fontSize: 11, color: 'var(--faint)', marginTop: 12, lineHeight: 1.5 }}>
+        Current: <span style={{ fontFamily: 'monospace', color: 'var(--muted)' }}>{data?.user_agent ?? '…'}</span>
       </div>
     </div>
   )
