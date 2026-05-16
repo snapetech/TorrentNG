@@ -1,0 +1,32 @@
+[package]
+name = "rt-engine"
+description = "rtorrentNG: torrent engine — wires tracker, peers, storage, and session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+tokio-util.workspace = true
+bytes.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+serde.workspace = true
+
+rt-config      = { path = "../rt-config" }
+rt-metainfo    = { path = "../rt-metainfo" }
+rt-session     = { path = "../rt-session" }
+rt-db          = { path = "../rt-db" }
+rt-peer-wire   = { path = "../rt-peer-wire" }
+rt-peer-manager = { path = "../rt-peer-manager" }
+rt-piece-picker = { path = "../rt-piece-picker" }
+rt-piece-map   = { path = "../rt-piece-map" }
+rt-storage     = { path = "../rt-storage" }
+rt-tracker     = { path = "../rt-tracker" }
+rt-metrics     = { path = "../rt-metrics" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

@@ -21,6 +21,7 @@ pub struct SavedViewParams {
     pub category: Option<String>,
     pub tag: Option<String>,
     pub tracker: Option<String>,
+    pub media_type: Option<String>,
     pub sort: Option<String>,
     pub dir: Option<String>,
 }
@@ -33,6 +34,7 @@ impl From<SavedViewParams> for ListParams {
             category: params.category,
             tag: params.tag,
             tracker: params.tracker,
+            media_type: params.media_type,
             sort: params.sort,
             dir: params.dir,
             limit: None,

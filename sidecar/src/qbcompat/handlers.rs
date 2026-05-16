@@ -514,6 +514,7 @@ async fn torrents_info(State(s): State<AppState>, Query(q): Query<InfoQuery>) ->
         category: q.category,
         tag: q.tag,
         tracker: None,
+        media_type: None,
         sort: q.sort.as_deref().map(map_sort).map(String::from),
         dir: if q.reverse.as_deref() == Some("true") {
             Some("desc".into())

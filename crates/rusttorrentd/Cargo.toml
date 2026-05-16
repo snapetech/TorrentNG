@@ -15,3 +15,11 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
+
+axum.workspace = true
+rt-config     = { path = "../rt-config" }
+rt-engine     = { path = "../rt-engine" }
+rt-session    = { path = "../rt-session" }
+rt-db         = { path = "../rt-db" }
+rt-api-native = { path = "../rt-api-native" }
+rt-api-qbit   = { path = "../rt-api-qbit" }

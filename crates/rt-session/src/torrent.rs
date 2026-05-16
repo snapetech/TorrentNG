@@ -87,6 +87,7 @@ impl TorrentEntry {
         let valid = match (self.state, target) {
             (TorrentState::Stopped, TorrentState::Checking) => true,
             (TorrentState::Stopped, TorrentState::Downloading) => true,
+            (TorrentState::Stopped, TorrentState::Paused) => true,
             (TorrentState::Paused, TorrentState::Checking) => true,
             (TorrentState::Paused, TorrentState::Downloading) => true,
             (TorrentState::Paused, TorrentState::Seeding) => true,

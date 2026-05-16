@@ -15,6 +15,10 @@ impl AppState {
             registry: Arc::new(RwLock::new(SessionRegistry::new())),
         }
     }
+
+    pub fn with_registry(registry: Arc<RwLock<SessionRegistry>>) -> Self {
+        AppState { registry }
+    }
 }
 
 impl Default for AppState {

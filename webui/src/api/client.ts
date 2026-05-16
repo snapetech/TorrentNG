@@ -47,6 +47,7 @@ export interface ListParams {
   category?: string
   tag?: string
   tracker?: string
+  media_type?: string
   sort?: string
   dir?: 'asc' | 'desc'
   limit?: number

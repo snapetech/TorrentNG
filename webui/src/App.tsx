@@ -29,9 +29,16 @@ type View = 'torrents' | 'settings'
 type AuthState = 'checking' | 'authenticated' | 'unauthenticated'
 type SettingsSection = 'library' | 'engine' | 'automation' | 'support'
 const MEDIA_INFERENCE_KEY = 'rtng.mediaInference'
+const ACTIVE_TAB_KEY = 'rtng.activeTab'
+const ACTIVE_TAB_TTL_MS = 8000
 
 function loadMediaInference(): MediaInferenceMode {
-  const value = localStorage.getItem(MEDIA_INFERENCE_KEY)
+  let value: string | null = null
+  try {
+    value = localStorage.getItem(MEDIA_INFERENCE_KEY)
+  } catch {
+    value = null
+  }
   return value === 'full' || value === 'suffix' || value === 'hints' || value === 'off' ? value : 'full'
 }
 
@@ -43,8 +50,83 @@ function fmtSpeed(bps: number): string {
   return bps + ' B/s'
 }
 
+function makeTabId() {
+  try {
+    return crypto.randomUUID()
+  } catch {
+    return `${Date.now()}-${Math.random()}`
+  }
+}
+
+function readActiveOwner(): { id: string; ts: number } | null {
+  try {
+    const raw = localStorage.getItem(ACTIVE_TAB_KEY)
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as { id?: unknown; ts?: unknown }
+    return typeof parsed.id === 'string' && typeof parsed.ts === 'number'
+      ? { id: parsed.id, ts: parsed.ts }
+      : null
+  } catch {
+    return null
+  }
+}
+
+function writeActiveOwner(id: string) {
+  localStorage.setItem(ACTIVE_TAB_KEY, JSON.stringify({ id, ts: Date.now() }))
+}
+
+function useSingleActiveTab() {
+  const [tabId] = useState(makeTabId)
+  const [isActive, setIsActive] = useState(true)
+
+  const claim = useCallback((force = false) => {
+    try {
+      const now = Date.now()
+      const owner = readActiveOwner()
+      const ownerExpired = !owner || now - owner.ts > ACTIVE_TAB_TTL_MS
+      if (force || ownerExpired || owner.id === tabId) {
+        writeActiveOwner(tabId)
+        setIsActive(true)
+      } else {
+        setIsActive(false)
+      }
+    } catch {
+      setIsActive(true)
+    }
+  }, [tabId])
+
+  useEffect(() => {
+    claim(false)
+    const interval = window.setInterval(() => claim(false), 3000)
+    function onStorage(e: StorageEvent) {
+      if (e.key === ACTIVE_TAB_KEY) claim(false)
+    }
+    function onVisibility() {
+      if (!document.hidden) claim(false)
+    }
+    window.addEventListener('storage', onStorage)
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => {
+      window.clearInterval(interval)
+      window.removeEventListener('storage', onStorage)
+      document.removeEventListener('visibilitychange', onVisibility)
+      try {
+        if (readActiveOwner()?.id === tabId) localStorage.removeItem(ACTIVE_TAB_KEY)
+      } catch {
+        // localStorage can be disabled by browser policy.
+      }
+    }
+  }, [claim, tabId])
+
+  return {
+    isActive,
+    takeOver: () => claim(true),
+  }
+}
+
 export function App() {
   const qc = useQueryClient()
+  const activeTab = useSingleActiveTab()
   const [authState, setAuthState] = useState<AuthState>('checking')
   const [authMessage, setAuthMessage] = useState('')
   const [view, setView] = useState<View>('torrents')
@@ -65,15 +147,16 @@ export function App() {
   const [settingsSection, setSettingsSection] = useState<SettingsSection>('library')
   const [mediaInference, setMediaInference] = useState<MediaInferenceMode>(loadMediaInference)
 
-  const isAuthed = authState === 'authenticated'
+  const isAuthed = activeTab.isActive && authState === 'authenticated'
   const query = useTorrentsInfinite(params, isAuthed)
   const { torrents, total } = flattenPages(query.data)
-  const { data: health } = useHealth()
+  const { data: health } = useHealth(activeTab.isActive && authState === 'authenticated')
 
   const handleStats = useCallback((up: number, dn: number) => setSpeeds({ up, dn }), [])
   useWebSocket(handleStats, isAuthed)
 
   useEffect(() => {
+    if (!activeTab.isActive) return
     let cancelled = false
     api.auth.check()
       .then(() => {
@@ -87,7 +170,13 @@ export function App() {
         }
       })
     return () => { cancelled = true }
-  }, [])
+  }, [activeTab.isActive])
+
+  useEffect(() => {
+    if (activeTab.isActive) return
+    qc.clear()
+    setSpeeds({ up: 0, dn: 0 })
+  }, [activeTab.isActive, qc])
 
   useEffect(() => {
     if (query.error instanceof AuthError) {
@@ -222,8 +311,16 @@ export function App() {
   }
 
   function updateMediaInference(mode: MediaInferenceMode) {
-    localStorage.setItem(MEDIA_INFERENCE_KEY, mode)
+    try {
+      localStorage.setItem(MEDIA_INFERENCE_KEY, mode)
+    } catch {
+      // Ignore storage failures; the setting still applies for this tab.
+    }
     setMediaInference(mode)
+  }
+
+  if (!activeTab.isActive) {
+    return <StandbyScreen onTakeOver={activeTab.takeOver} />
   }
 
   if (authState === 'checking') {
@@ -342,6 +439,7 @@ export function App() {
             <TorrentSidebar
               params={params}
               total={total}
+              mediaInference={mediaInference}
               onChange={updateParams}
               onApply={applySavedView}
             />
@@ -430,6 +528,29 @@ export function App() {
           onRemoveFiles={() => deleteTorrent(pendingDelete, true)}
         />
       )}
+    </div>
+  )
+}
+
+function StandbyScreen({ onTakeOver }: { onTakeOver: () => void }) {
+  return (
+    <div style={{
+      minHeight: '100vh', background: '#0d1117', color: '#e2e8f0',
+      display: 'grid', placeItems: 'center', padding: 24,
+    }}>
+      <div style={{
+        width: 'min(460px, 100%)', border: '1px solid #1e2433', borderRadius: 8,
+        background: '#0f141d', padding: 20, display: 'flex', flexDirection: 'column', gap: 12,
+      }}>
+        <div style={{ fontWeight: 700, fontSize: 18 }}>rtorrentNG is open in another tab</div>
+        <div style={{ color: '#94a3b8', fontSize: 13, lineHeight: 1.45 }}>
+          This standby tab is not connected to the API or websocket. Use one active tab for large libraries.
+        </div>
+        <button onClick={onTakeOver} style={{
+          width: 'fit-content', background: '#1e3a5f', border: '1px solid #3b82f6',
+          borderRadius: 5, color: '#bfdbfe', padding: '7px 11px', fontSize: 13, cursor: 'pointer',
+        }}>Take over this tab</button>
+      </div>
     </div>
   )
 }

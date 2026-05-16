@@ -1,25 +1,43 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, type ListParams, type SavedView } from '../api/client'
+import type { MediaInferenceMode } from './AppearancePanel'
 
 type Params = Omit<ListParams, 'limit' | 'offset'>
 
 interface Props {
   params: Params
   total: number
+  mediaInference: MediaInferenceMode
   onChange: (p: Partial<ListParams>) => void
   onApply: (params: Params) => void
 }
 
 const STATUS_OPTIONS = [
-  { value: '', label: 'All' },
-  { value: 'downloading', label: 'Downloading' },
-  { value: 'seeding', label: 'Seeding' },
-  { value: 'completed', label: 'Completed' },
-  { value: 'active', label: 'Active' },
-  { value: 'stopped', label: 'Stopped' },
-  { value: 'checking', label: 'Checking' },
-  { value: 'error', label: 'Error' },
+  { value: '', label: 'All', icon: '↔' },
+  { value: 'downloading', label: 'Downloading', icon: '⇣' },
+  { value: 'seeding', label: 'Seeding', icon: '⇡' },
+  { value: 'completed', label: 'Completed', icon: '✓' },
+  { value: 'running', label: 'Running', icon: '▶' },
+  { value: 'stopped', label: 'Stopped', icon: '■' },
+  { value: 'active', label: 'Active', icon: '⇅' },
+  { value: 'inactive', label: 'Inactive', icon: '⇵' },
+  { value: 'stalled', label: 'Stalled', icon: '↕' },
+  { value: 'stalled_uploading', label: 'Stalled Uploading', icon: '⇡' },
+  { value: 'stalled_downloading', label: 'Stalled Downloading', icon: '⇣' },
+  { value: 'checking', label: 'Checking', icon: '↻' },
+  { value: 'moving', label: 'Moving', icon: '⌖' },
+  { value: 'error', label: 'Errored', icon: '!' },
+]
+
+const TYPE_OPTIONS = [
+  { value: 'ebook', label: 'Ebooks', icon: '📚' },
+  { value: 'tv', label: 'TV', icon: '📺' },
+  { value: 'video', label: 'Video', icon: '🎬' },
+  { value: 'audio', label: 'Audio', icon: '🎵' },
+  { value: 'image', label: 'ISO / Images', icon: '💿' },
+  { value: 'game', label: 'Games', icon: '🎮' },
+  { value: 'software', label: 'Software / Archives', icon: '🧩' },
 ]
 
 const SORT_OPTIONS = [
@@ -40,13 +58,6 @@ function cleanParams(params: Params): Params {
   ) as Params
 }
 
-function isActive(params: Params, patch: Partial<ListParams>): boolean {
-  return (params.status ?? '') === (patch.status ?? '')
-    && (params.category ?? '') === (patch.category ?? '')
-    && (params.tag ?? '') === (patch.tag ?? '')
-    && (params.tracker ?? '') === (patch.tracker ?? '')
-}
-
 function trackerHost(url: string): string {
   try {
     return new URL(url).hostname
@@ -55,9 +66,10 @@ function trackerHost(url: string): string {
   }
 }
 
-export function TorrentSidebar({ params, total, onChange, onApply }: Props) {
+export function TorrentSidebar({ params, total, mediaInference, onChange, onApply }: Props) {
   const qc = useQueryClient()
   const [viewName, setViewName] = useState('')
+  const [trackerFilter, setTrackerFilter] = useState(params.tracker ?? '')
 
   const { data: categories = [] } = useQuery({
     queryKey: ['categories'],
@@ -83,6 +95,10 @@ export function TorrentSidebar({ params, total, onChange, onApply }: Props) {
     staleTime: 30_000,
   })
 
+  useEffect(() => {
+    setTrackerFilter(params.tracker ?? '')
+  }, [params.tracker])
+
   async function saveView() {
     const name = viewName.trim()
     if (!name) return
@@ -98,7 +114,15 @@ export function TorrentSidebar({ params, total, onChange, onApply }: Props) {
   }
 
   function clearFilters() {
-    onChange({ status: undefined, category: undefined, tag: undefined, tracker: undefined, filter: undefined, offset: 0 })
+    onChange({
+      status: undefined,
+      category: undefined,
+      tag: undefined,
+      tracker: undefined,
+      media_type: undefined,
+      filter: undefined,
+      offset: 0,
+    })
   }
 
   return (
@@ -110,16 +134,40 @@ export function TorrentSidebar({ params, total, onChange, onApply }: Props) {
         {STATUS_OPTIONS.map(option => (
           <CountRow
             key={option.value}
+            icon={option.icon}
             label={option.label}
-            active={isActive(params, { status: option.value || undefined, category: undefined, tag: undefined, tracker: undefined })}
+            active={(params.status ?? '') === option.value}
             count={option.value ? undefined : total}
-            onClick={() => onChange({ status: option.value || undefined, category: undefined, tag: undefined, tracker: undefined, offset: 0 })}
+            onClick={() => onChange({ status: option.value || undefined, offset: 0 })}
           />
         ))}
       </Section>
 
-      <Section title="Categories">
+      <Section title="Type">
         <CountRow
+          icon="◇"
+          label="All types"
+          active={!params.media_type}
+          count={total}
+          onClick={() => onChange({ media_type: undefined, offset: 0 })}
+        />
+        {TYPE_OPTIONS.map(option => (
+          <CountRow
+            key={option.value}
+            icon={option.icon}
+            label={option.label}
+            active={(params.media_type ?? '') === option.value}
+            onClick={() => onChange({ media_type: option.value, offset: 0 })}
+          />
+        ))}
+        {mediaInference === 'off' && (
+          <div style={overflowNote}>Type filter still uses names, paths, and suffixes.</div>
+        )}
+      </Section>
+
+      <Section title="Categories / Labels">
+        <CountRow
+          icon="⌁"
           label="All categories"
           active={!params.category}
           count={total}
@@ -128,9 +176,10 @@ export function TorrentSidebar({ params, total, onChange, onApply }: Props) {
         {categories.slice(0, MAX_SECTION_ROWS).map(category => (
           <CountRow
             key={category.name}
+            icon="⌁"
             label={category.name}
             active={(params.category ?? '') === category.name}
-            onClick={() => onChange({ category: category.name, tag: undefined, tracker: undefined, offset: 0 })}
+            onClick={() => onChange({ category: category.name, offset: 0 })}
           />
         ))}
         {categories.length > MAX_SECTION_ROWS && (
@@ -141,6 +190,7 @@ export function TorrentSidebar({ params, total, onChange, onApply }: Props) {
       {tags.length > 0 && (
         <Section title="Tags">
           <CountRow
+            icon="#"
             label="All tags"
             active={!params.tag}
             count={total}
@@ -149,9 +199,10 @@ export function TorrentSidebar({ params, total, onChange, onApply }: Props) {
           {tags.slice(0, MAX_SECTION_ROWS).map(tag => (
             <CountRow
               key={tag}
+              icon="#"
               label={tag}
               active={(params.tag ?? '') === tag}
-              onClick={() => onChange({ tag, category: undefined, tracker: undefined, offset: 0 })}
+              onClick={() => onChange({ tag, offset: 0 })}
             />
           ))}
           {tags.length > MAX_SECTION_ROWS && (
@@ -160,28 +211,46 @@ export function TorrentSidebar({ params, total, onChange, onApply }: Props) {
         </Section>
       )}
 
-      {trackerHealth && trackerHealth.trackers.length > 0 && (
-        <Section title="Trackers">
-          <CountRow
-            label="All trackers"
-            active={!params.tracker}
-            count={total}
-            onClick={() => onChange({ tracker: undefined, offset: 0 })}
+      <Section title="Trackers">
+        <CountRow
+          icon="☊"
+          label="All trackers"
+          active={!params.tracker}
+          count={total}
+          onClick={() => onChange({ tracker: undefined, offset: 0 })}
+        />
+        <form
+          onSubmit={e => {
+            e.preventDefault()
+            onChange({ tracker: trackerFilter.trim() || undefined, offset: 0 })
+          }}
+          style={{ display: 'grid', gridTemplateColumns: '1fr 42px', gap: 5, margin: '5px 0 7px' }}
+        >
+          <input
+            value={trackerFilter}
+            onChange={e => setTrackerFilter(e.target.value)}
+            placeholder="Tracker contains"
+            style={inputStyle}
           />
-          {trackerHealth.trackers.slice(0, MAX_SECTION_ROWS).map(row => (
-            <CountRow
-              key={row.tracker}
-              label={trackerHost(row.tracker)}
-              active={(params.tracker ?? '') === row.tracker}
-              count={row.torrent_count}
-              onClick={() => onChange({ tracker: row.tracker, category: undefined, tag: undefined, offset: 0 })}
-            />
-          ))}
-          {trackerHealth.trackers.length > MAX_SECTION_ROWS && (
-            <div style={overflowNote}>Showing first {MAX_SECTION_ROWS.toLocaleString()} trackers</div>
-          )}
-        </Section>
-      )}
+          <button style={saveStyle(true)}>Go</button>
+        </form>
+        {trackerHealth?.trackers.slice(0, MAX_SECTION_ROWS).map(row => (
+          <CountRow
+            key={row.tracker}
+            icon={row.error_count > 0 ? '!' : '☊'}
+            label={trackerHost(row.tracker)}
+            active={(params.tracker ?? '') === row.tracker}
+            count={row.torrent_count}
+            onClick={() => onChange({ tracker: row.tracker, offset: 0 })}
+          />
+        ))}
+        {trackerHealth && trackerHealth.trackers.length === 0 && (
+          <div style={overflowNote}>No cached tracker URLs yet.</div>
+        )}
+        {trackerHealth && trackerHealth.trackers.length > MAX_SECTION_ROWS && (
+          <div style={overflowNote}>Showing first {MAX_SECTION_ROWS.toLocaleString()} trackers</div>
+        )}
+      </Section>
 
       <Section title="Sort">
         <select
@@ -206,7 +275,7 @@ export function TorrentSidebar({ params, total, onChange, onApply }: Props) {
             <button
               onClick={() => onApply(view.params)}
               title={JSON.stringify(view.params)}
-              style={rowButtonStyle(false)}
+              style={savedViewButtonStyle}
             >
               <span style={labelStyle}>{view.name}</span>
             </button>
@@ -225,7 +294,7 @@ export function TorrentSidebar({ params, total, onChange, onApply }: Props) {
         </div>
       </Section>
 
-      {(params.status || params.category || params.tag || params.tracker || params.filter) && (
+      {(params.status || params.category || params.tag || params.tracker || params.media_type || params.filter) && (
         <div style={{ padding: '10px 12px 14px', borderTop: '1px solid #1e2433' }}>
           <button onClick={clearFilters} style={{
             width: '100%', background: 'transparent', border: '1px solid #334155', borderRadius: 5,
@@ -239,7 +308,8 @@ export function TorrentSidebar({ params, total, onChange, onApply }: Props) {
   )
 }
 
-function CountRow({ label, active, count, onClick }: {
+function CountRow({ icon, label, active, count, onClick }: {
+  icon?: string
   label: string
   active: boolean
   count?: number
@@ -247,6 +317,7 @@ function CountRow({ label, active, count, onClick }: {
 }) {
   return (
     <button onClick={onClick} style={rowButtonStyle(active)}>
+      {icon && <span style={iconStyle(active)}>{icon}</span>}
       <span style={labelStyle}>{label}</span>
       <span style={{ color: active ? '#bfdbfe' : '#64748b', fontVariantNumeric: 'tabular-nums' }}>
         {count === undefined ? '' : count.toLocaleString()}
@@ -281,6 +352,17 @@ const labelStyle: React.CSSProperties = {
   whiteSpace: 'nowrap',
 }
 
+function iconStyle(active: boolean): React.CSSProperties {
+  return {
+    width: 18,
+    color: active ? '#bfdbfe' : '#60a5fa',
+    fontSize: 15,
+    lineHeight: '14px',
+    textAlign: 'center',
+    fontWeight: 700,
+  }
+}
+
 const selectStyle: React.CSSProperties = {
   width: '100%',
   background: '#0d1117',
@@ -312,6 +394,20 @@ const deleteStyle: React.CSSProperties = {
   fontSize: 12,
 }
 
+const savedViewButtonStyle: React.CSSProperties = {
+  width: '100%',
+  minWidth: 0,
+  background: 'transparent',
+  border: '1px solid transparent',
+  borderRadius: 5,
+  color: '#94a3b8',
+  padding: '5px 7px',
+  fontSize: 12,
+  cursor: 'pointer',
+  display: 'block',
+  textAlign: 'left',
+}
+
 const overflowNote: React.CSSProperties = {
   color: '#475569',
   fontSize: 11,
@@ -330,7 +426,7 @@ function rowButtonStyle(active: boolean): React.CSSProperties {
     fontSize: 12,
     cursor: 'pointer',
     display: 'grid',
-    gridTemplateColumns: 'minmax(0, 1fr) auto',
+    gridTemplateColumns: 'auto minmax(0, 1fr) auto',
     gap: 8,
     alignItems: 'center',
     textAlign: 'left',
