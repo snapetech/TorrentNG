@@ -1,10 +1,10 @@
 #![recursion_limit = "256"]
 
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use axum::{extract::State, response::IntoResponse, routing::post, Json, Router};
 use base64::{engine::general_purpose, Engine as _};
-use rt_engine::{EngineHandle, EngineTorrentMetadata};
+use rt_engine::{EngineHandle, EngineTorrentLimits, EngineTorrentMetadata};
 use rt_metainfo::{parse_magnet, parse_torrent};
 use rt_session::SessionRegistry;
 use serde::Deserialize;
@@ -143,15 +143,15 @@ async fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Va
         | "core.queue_up"
         | "core.queue_down"
         | "core.queue_bottom"
-        | "core.set_torrent_prioritize_first_last"
-        | "core.set_torrent_file_priorities"
-        | "core.set_torrent_trackers"
-        | "core.connect_peer"
-        | "core.rename_files"
-        | "core.rename_folder"
         | "core.create_torrent"
         | "core.upload_plugin"
         | "core.rescan_plugins" => Ok(json!(true)),
+        "core.set_torrent_prioritize_first_last" => set_prioritize_first_last(state, params).await,
+        "core.set_torrent_file_priorities" => set_file_priorities(state, params).await,
+        "core.set_torrent_trackers" => set_trackers(state, params).await,
+        "core.connect_peer" => connect_peer(state, params).await,
+        "core.rename_files" => rename_files(state, params).await,
+        "core.rename_folder" => rename_folder(state, params).await,
         "core.move_storage" => move_storage(state, params).await,
         "core.get_torrent_file_status" => {
             if let Some(hash) = params.first().and_then(Value::as_str) {
@@ -185,7 +185,7 @@ async fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Va
                 .ok_or_else(|| "missing torrent data".to_owned())?;
             add_torrent_file(state, data, params.get(2)).await
         }
-        "core.set_torrent_options" => Ok(json!(true)),
+        "core.set_torrent_options" => set_torrent_options(state, params).await,
         "label.get_labels" => labels(state).await,
         "label.add" => Ok(json!(true)),
         "label.remove" => Ok(json!(true)),
@@ -690,6 +690,131 @@ async fn add_torrent_file(
     Ok(json!(hash))
 }
 
+async fn set_torrent_options(state: &AppState, params: &[Value]) -> Result<Value, String> {
+    let hashes = hashes_from_param(params.first());
+    let Some(options) = params.get(1).and_then(Value::as_object) else {
+        return Ok(json!(true));
+    };
+    let Some(engine) = &state.engine else {
+        return Ok(json!(true));
+    };
+    for hash in hashes {
+        let mut limits = engine
+            .torrent_limits(hash.clone())
+            .await
+            .unwrap_or_else(|_| EngineTorrentLimits::default());
+        apply_deluge_options(&mut limits, options);
+        engine.update_torrent_limits(hash, limits).await?;
+    }
+    Ok(json!(true))
+}
+
+async fn set_prioritize_first_last(state: &AppState, params: &[Value]) -> Result<Value, String> {
+    let hashes = hashes_from_param(params.first());
+    let Some(enabled) = deluge_bool(params.get(1)) else {
+        return Ok(json!(true));
+    };
+    let Some(engine) = &state.engine else {
+        return Ok(json!(true));
+    };
+    for hash in hashes {
+        let mut limits = engine
+            .torrent_limits(hash.clone())
+            .await
+            .unwrap_or_else(|_| EngineTorrentLimits::default());
+        limits.first_last_piece_prio = enabled;
+        engine.update_torrent_limits(hash, limits).await?;
+    }
+    Ok(json!(true))
+}
+
+async fn set_file_priorities(state: &AppState, params: &[Value]) -> Result<Value, String> {
+    let Some(hash) = params.first().and_then(Value::as_str) else {
+        return Ok(json!(true));
+    };
+    let updates = deluge_file_priority_updates(params.get(1), params.get(2));
+    if updates.is_empty() {
+        return Ok(json!(true));
+    }
+    let Some(engine) = &state.engine else {
+        return Ok(json!(true));
+    };
+    for (file_ids, priority) in updates {
+        engine
+            .update_file_priorities(hash.to_owned(), file_ids, priority)
+            .await?;
+    }
+    Ok(json!(true))
+}
+
+async fn set_trackers(state: &AppState, params: &[Value]) -> Result<Value, String> {
+    let Some(hash) = params.first().and_then(Value::as_str) else {
+        return Ok(json!(true));
+    };
+    let trackers = deluge_trackers_arg(params.get(1));
+    let Some(engine) = &state.engine else {
+        return Ok(json!(true));
+    };
+    engine
+        .update_torrent_trackers(hash.to_owned(), trackers)
+        .await?;
+    Ok(json!(true))
+}
+
+async fn connect_peer(state: &AppState, params: &[Value]) -> Result<Value, String> {
+    let Some(hash) = params.first().and_then(Value::as_str) else {
+        return Ok(json!(true));
+    };
+    let peer = if let Some(addr) = params.get(1).and_then(deluge_peer_addr_arg) {
+        Some(addr)
+    } else {
+        deluge_peer_host_port(params.get(1), params.get(2))
+    };
+    let Some(peer) = peer else {
+        return Ok(json!(true));
+    };
+    let Some(engine) = &state.engine else {
+        return Ok(json!(true));
+    };
+    engine.add_peers(hash.to_owned(), vec![peer]).await?;
+    Ok(json!(true))
+}
+
+async fn rename_files(state: &AppState, params: &[Value]) -> Result<Value, String> {
+    let Some(hash) = params.first().and_then(Value::as_str) else {
+        return Ok(json!(true));
+    };
+    let renames = deluge_rename_file_args(params.get(1));
+    let Some(engine) = &state.engine else {
+        return Ok(json!(true));
+    };
+    for (file_id, new_path) in renames {
+        engine
+            .rename_file_path(hash.to_owned(), file_id, new_path)
+            .await?;
+    }
+    Ok(json!(true))
+}
+
+async fn rename_folder(state: &AppState, params: &[Value]) -> Result<Value, String> {
+    let Some(hash) = params.first().and_then(Value::as_str) else {
+        return Ok(json!(true));
+    };
+    let Some(old_path) = params.get(1).and_then(Value::as_str) else {
+        return Ok(json!(true));
+    };
+    let Some(new_path) = params.get(2).and_then(Value::as_str) else {
+        return Ok(json!(true));
+    };
+    let Some(engine) = &state.engine else {
+        return Ok(json!(true));
+    };
+    engine
+        .rename_folder_path(hash.to_owned(), old_path.to_owned(), new_path.to_owned())
+        .await?;
+    Ok(json!(true))
+}
+
 fn string_list(value: Option<&Value>) -> Vec<String> {
     value
         .and_then(Value::as_array)
@@ -701,6 +826,254 @@ fn string_list(value: Option<&Value>) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn hashes_from_param(value: Option<&Value>) -> Vec<String> {
+    match value {
+        Some(Value::String(hash)) if !hash.trim().is_empty() => vec![hash.trim().to_owned()],
+        Some(Value::Array(values)) => values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|hash| !hash.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn apply_deluge_options(
+    limits: &mut EngineTorrentLimits,
+    options: &serde_json::Map<String, Value>,
+) {
+    if let Some(value) = options
+        .get("prioritize_first_last")
+        .and_then(|value| deluge_bool(Some(value)))
+    {
+        limits.first_last_piece_prio = value;
+    }
+    if let Some(value) = options
+        .get("sequential_download")
+        .and_then(|value| deluge_bool(Some(value)))
+    {
+        limits.sequential_download = value;
+    }
+    if let Some(value) = options
+        .get("super_seeding")
+        .and_then(|value| deluge_bool(Some(value)))
+    {
+        limits.super_seeding = value;
+    }
+    if let Some(value) = options
+        .get("auto_managed")
+        .and_then(|value| deluge_bool(Some(value)))
+    {
+        limits.auto_management = value;
+    }
+    if let Some(value) = options
+        .get("max_download_speed")
+        .and_then(|value| deluge_speed_limit(Some(value)))
+    {
+        limits.download_limit = value;
+    }
+    if let Some(value) = options
+        .get("max_upload_speed")
+        .and_then(|value| deluge_speed_limit(Some(value)))
+    {
+        limits.upload_limit = value;
+    }
+    if matches!(
+        options
+            .get("stop_at_ratio")
+            .and_then(|value| deluge_bool(Some(value))),
+        Some(false)
+    ) {
+        limits.seed_ratio_limit = None;
+    } else if let Some(value) = options.get("stop_ratio").and_then(Value::as_f64) {
+        limits.seed_ratio_limit = Some(value);
+    }
+}
+
+fn deluge_bool(value: Option<&Value>) -> Option<bool> {
+    match value {
+        Some(Value::Bool(value)) => Some(*value),
+        Some(Value::Number(value)) => Some(value.as_i64().unwrap_or_default() != 0),
+        Some(Value::String(value)) => match value.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Some(true),
+            "false" | "0" | "no" | "off" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn deluge_speed_limit(value: Option<&Value>) -> Option<Option<i64>> {
+    let kib = match value {
+        Some(Value::Number(value)) => value.as_f64()?,
+        Some(Value::String(value)) => value.trim().parse::<f64>().ok()?,
+        _ => return None,
+    };
+    if kib <= 0.0 {
+        Some(None)
+    } else {
+        Some(Some((kib * 1024.0) as i64))
+    }
+}
+
+fn deluge_file_priority_updates(
+    ids_or_priorities: Option<&Value>,
+    priority: Option<&Value>,
+) -> Vec<(Vec<u32>, i64)> {
+    if let Some(priority) = priority.and_then(Value::as_i64) {
+        let ids = deluge_file_ids(ids_or_priorities);
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        return vec![(ids, deluge_file_priority(priority))];
+    }
+    let Some(priorities) = ids_or_priorities.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut skipped = Vec::new();
+    let mut normal = Vec::new();
+    let mut high = Vec::new();
+    for (idx, value) in priorities.iter().enumerate() {
+        let Some(priority) = value.as_i64() else {
+            continue;
+        };
+        match deluge_file_priority(priority) {
+            0 => skipped.push(idx as u32),
+            2 => high.push(idx as u32),
+            _ => normal.push(idx as u32),
+        }
+    }
+    let mut updates = Vec::new();
+    if !skipped.is_empty() {
+        updates.push((skipped, 0));
+    }
+    if !normal.is_empty() {
+        updates.push((normal, 1));
+    }
+    if !high.is_empty() {
+        updates.push((high, 2));
+    }
+    updates
+}
+
+fn deluge_file_ids(value: Option<&Value>) -> Vec<u32> {
+    value
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_u64().map(|value| value as u32))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn deluge_file_priority(priority: i64) -> i64 {
+    if priority <= 0 {
+        0
+    } else if priority >= 5 {
+        2
+    } else {
+        1
+    }
+}
+
+fn deluge_trackers_arg(value: Option<&Value>) -> Vec<String> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    let mut trackers = Vec::new();
+    collect_deluge_trackers(value, &mut trackers);
+    normalize_deluge_trackers(trackers)
+}
+
+fn collect_deluge_trackers(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(value) => out.push(value.to_owned()),
+        Value::Array(values) => {
+            for value in values {
+                collect_deluge_trackers(value, out);
+            }
+        }
+        Value::Object(obj) => {
+            if let Some(url) = obj
+                .get("url")
+                .or_else(|| obj.get("announce"))
+                .and_then(Value::as_str)
+            {
+                out.push(url.to_owned());
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_deluge_trackers(values: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for value in values {
+        let value = value.trim();
+        if !value.is_empty() && !out.iter().any(|existing| existing == value) {
+            out.push(value.to_owned());
+        }
+    }
+    out
+}
+
+fn deluge_peer_addr_arg(value: &Value) -> Option<SocketAddr> {
+    match value {
+        Value::String(value) => value.trim().parse().ok(),
+        Value::Array(values) => deluge_peer_host_port(values.first(), values.get(1)),
+        Value::Object(obj) => {
+            deluge_peer_host_port(obj.get("ip").or_else(|| obj.get("host")), obj.get("port"))
+        }
+        _ => None,
+    }
+}
+
+fn deluge_peer_host_port(host: Option<&Value>, port: Option<&Value>) -> Option<SocketAddr> {
+    let host = host.and_then(Value::as_str)?.trim();
+    let port = match port {
+        Some(Value::Number(value)) => value.as_u64()? as u16,
+        Some(Value::String(value)) => value.trim().parse().ok()?,
+        _ => return None,
+    };
+    format!("{host}:{port}").parse().ok()
+}
+
+fn deluge_rename_file_args(value: Option<&Value>) -> Vec<(u32, String)> {
+    value
+        .and_then(Value::as_array)
+        .map(|values| values.iter().filter_map(deluge_rename_file_arg).collect())
+        .unwrap_or_default()
+}
+
+fn deluge_rename_file_arg(value: &Value) -> Option<(u32, String)> {
+    match value {
+        Value::Array(values) => {
+            let id = values.first()?.as_u64()? as u32;
+            let path = values.get(1)?.as_str()?.to_owned();
+            Some((id, path))
+        }
+        Value::Object(obj) => {
+            let id = obj
+                .get("index")
+                .or_else(|| obj.get("id"))
+                .or_else(|| obj.get("file_id"))?
+                .as_u64()? as u32;
+            let path = obj
+                .get("path")
+                .or_else(|| obj.get("name"))
+                .or_else(|| obj.get("new_path"))?
+                .as_str()?
+                .to_owned();
+            Some((id, path))
+        }
+        _ => None,
+    }
 }
 
 fn deluge_state(state: &str) -> &'static str {
@@ -943,5 +1316,75 @@ mod tests {
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert!(body["error"].is_null());
         assert!(body["result"].as_array().is_some());
+    }
+
+    #[test]
+    fn deluge_mutator_parsers_accept_client_shapes() {
+        assert_eq!(
+            hashes_from_param(Some(&json!([" a ", "", "b"]))),
+            vec!["a".to_owned(), "b".to_owned()]
+        );
+        assert_eq!(deluge_file_priority(0), 0);
+        assert_eq!(deluge_file_priority(1), 1);
+        assert_eq!(deluge_file_priority(7), 2);
+        assert_eq!(
+            deluge_file_priority_updates(Some(&json!([0, 1, 5, 7])), None),
+            vec![(vec![0], 0), (vec![1], 1), (vec![2, 3], 2)]
+        );
+        assert_eq!(
+            deluge_file_priority_updates(Some(&json!([2, 4])), Some(&json!(0))),
+            vec![(vec![2, 4], 0)]
+        );
+        assert_eq!(
+            deluge_trackers_arg(Some(&json!([
+                {"url":" udp://tracker.example/announce "},
+                {"announce":"http://tracker.example/announce"},
+                "udp://tracker.example/announce"
+            ]))),
+            vec![
+                "udp://tracker.example/announce".to_owned(),
+                "http://tracker.example/announce".to_owned()
+            ]
+        );
+        assert_eq!(
+            deluge_peer_addr_arg(&json!(["127.0.0.1", 6881])).unwrap(),
+            "127.0.0.1:6881".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            deluge_rename_file_args(Some(&json!([
+                [1, "new/a.bin"],
+                {"index": 2, "path": "new/b.bin"}
+            ]))),
+            vec![(1, "new/a.bin".to_owned()), (2, "new/b.bin".to_owned())]
+        );
+    }
+
+    #[test]
+    fn deluge_options_project_to_engine_limits() {
+        let mut limits = EngineTorrentLimits::default();
+        let options = json!({
+            "prioritize_first_last": true,
+            "sequential_download": "1",
+            "super_seeding": 1,
+            "auto_managed": false,
+            "max_download_speed": 10.5,
+            "max_upload_speed": "-1",
+            "stop_at_ratio": true,
+            "stop_ratio": 1.25
+        });
+        apply_deluge_options(&mut limits, options.as_object().unwrap());
+        assert!(limits.first_last_piece_prio);
+        assert!(limits.sequential_download);
+        assert!(limits.super_seeding);
+        assert!(!limits.auto_management);
+        assert_eq!(limits.download_limit, Some(10_752));
+        assert_eq!(limits.upload_limit, None);
+        assert_eq!(limits.seed_ratio_limit, Some(1.25));
+
+        apply_deluge_options(
+            &mut limits,
+            json!({"stop_at_ratio": false}).as_object().unwrap(),
+        );
+        assert_eq!(limits.seed_ratio_limit, None);
     }
 }
