@@ -2,6 +2,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -54,6 +55,7 @@ const JOB_STATE_PAUSED: &str = "paused";
 const JOB_STATE_CANCELLED: &str = "cancelled";
 const JOB_STATE_FAILED: &str = "failed";
 const JOB_STATE_COMPLETED: &str = "completed";
+static RECHECK_JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const SETTING_GLOBAL_DOWNLOAD_LIMIT: &str = "transfer.download_limit";
 const SETTING_GLOBAL_UPLOAD_LIMIT: &str = "transfer.upload_limit";
 const SETTING_GLOBAL_SPEED_LIMITS_MODE: &str = "transfer.speed_limits_mode";
@@ -594,12 +596,18 @@ impl Engine {
                 delete_files,
                 reply,
             } => {
-                let result = if let Some(tx) = self.torrent_chans.remove(&info_hash) {
+                if let Some(tx) = self.torrent_chans.remove(&info_hash) {
                     let _ = tx.send(TorrentCmd::Shutdown).await;
                     self.torrent_tasks.remove(&info_hash);
-                    let mut reg = self.registry.write().await;
-                    match reg.remove(&info_hash) {
+                }
+                let result = {
+                    let entry = {
+                        let mut reg = self.registry.write().await;
+                        reg.remove(&info_hash).map_err(|e| e.to_string())
+                    };
+                    match entry {
                         Ok(entry) => {
+                            let v2_only = self.is_pure_v2_torrent(&info_hash);
                             if delete_files {
                                 if let Err(e) =
                                     self.delete_payload_files(&info_hash, &entry.save_path)
@@ -610,19 +618,22 @@ impl Engine {
                             if let Err(e) = self.delete_persisted_torrent(&info_hash) {
                                 warn!(torrent = %info_hash, err = %e, "failed to delete persisted torrent");
                             }
-                            self.unregister_dht_torrent(&info_hash).await;
+                            if !v2_only {
+                                self.unregister_dht_torrent(&info_hash).await;
+                            }
                             self.append_session_event(
                                 Some(&info_hash),
                                 EVENT_TORRENT_REMOVED,
                                 Some("torrent removed"),
-                                serde_json::json!({ "delete_files": delete_files }),
+                                serde_json::json!({
+                                    "delete_files": delete_files,
+                                    "v2_only": v2_only,
+                                }),
                             );
                             Ok(())
                         }
-                        Err(e) => Err(e.to_string()),
+                        Err(err) => Err(err),
                     }
-                } else {
-                    Err(format!("torrent {info_hash} not found"))
                 };
                 let _ = reply.send(result);
             }
@@ -633,6 +644,10 @@ impl Engine {
                     Ok(()) => Ok(()),
                     Err(_) if self.metadata_placeholder_row(&info_hash).is_some() => {
                         self.update_metadata_placeholder_state(&info_hash, TorrentState::Paused)
+                    }
+                    Err(_) if self.is_taskless_pure_v2_torrent(&info_hash) => {
+                        self.set_registry_state(&info_hash, TorrentState::Paused, None)
+                            .await
                     }
                     Err(err) => Err(err),
                 };
@@ -652,7 +667,10 @@ impl Engine {
                     .metadata_placeholder_row(&info_hash)
                     .as_ref()
                     .is_some_and(is_v2_only_placeholder_row);
-                let result = if v2_only_placeholder {
+                let taskless_v2 = self.is_taskless_pure_v2_torrent(&info_hash);
+                let result = if taskless_v2 {
+                    Ok(())
+                } else if v2_only_placeholder {
                     self.update_metadata_placeholder_state(
                         &info_hash,
                         TorrentState::MetadataPending,
@@ -671,7 +689,7 @@ impl Engine {
                     }
                 };
                 if result.is_ok() {
-                    if !v2_only_placeholder {
+                    if !v2_only_placeholder && !taskless_v2 {
                         self.register_dht_torrent_from_storage_or_hash(&info_hash)
                             .await;
                     }
@@ -679,7 +697,10 @@ impl Engine {
                         Some(&info_hash),
                         EVENT_TORRENT_RESUMED,
                         Some("torrent resumed"),
-                        serde_json::json!({ "v2_only": v2_only_placeholder }),
+                        serde_json::json!({
+                            "v2_only": v2_only_placeholder || taskless_v2,
+                            "skipped": taskless_v2,
+                        }),
                     );
                 }
                 let _ = reply.send(result);
@@ -747,7 +768,8 @@ impl Engine {
                     .metadata_placeholder_row(&info_hash)
                     .as_ref()
                     .is_some_and(is_v2_only_placeholder_row);
-                let result = if v2_only_placeholder {
+                let taskless_v2 = self.is_taskless_pure_v2_torrent(&info_hash);
+                let result = if v2_only_placeholder || taskless_v2 {
                     Ok(())
                 } else {
                     self.send_to_torrent(&info_hash, TorrentCmd::Reannounce)
@@ -759,8 +781,8 @@ impl Engine {
                         EVENT_REANNOUNCE_REQUESTED,
                         Some("tracker reannounce requested"),
                         serde_json::json!({
-                            "v2_only": v2_only_placeholder,
-                            "skipped": v2_only_placeholder,
+                            "v2_only": v2_only_placeholder || taskless_v2,
+                            "skipped": v2_only_placeholder || taskless_v2,
                         }),
                     );
                 }
@@ -1531,6 +1553,10 @@ impl Engine {
         matches!(parse_torrent(&raw), Ok(TorrentMeta::V2(_)))
     }
 
+    fn is_taskless_pure_v2_torrent(&self, info_hash: &str) -> bool {
+        !self.torrent_chans.contains_key(info_hash) && self.is_pure_v2_torrent(info_hash)
+    }
+
     async fn recheck_pure_v2_torrent(
         &self,
         info_hash: &str,
@@ -2287,29 +2313,47 @@ impl Engine {
             .first()
             .ok_or_else(|| format!("job {job_id} has no target torrent"))?
             .clone();
+        let taskless_v2 = self.is_taskless_pure_v2_torrent(&info_hash);
         match target_state {
             JOB_STATE_PAUSED => {
-                self.send_to_torrent(&info_hash, TorrentCmd::Pause).await?;
+                if taskless_v2 {
+                    self.set_registry_state(&info_hash, TorrentState::Paused, None)
+                        .await?;
+                } else {
+                    self.send_to_torrent(&info_hash, TorrentCmd::Pause).await?;
+                }
                 self.update_job_state(job_id, JOB_STATE_PAUSED, None, Some("recheck job paused"));
             }
             JOB_STATE_RUNNING => {
-                self.send_to_torrent(
-                    &info_hash,
-                    TorrentCmd::Recheck {
-                        job_id: Some(job_id.to_owned()),
-                    },
-                )
-                .await?;
-                self.update_job_state(job_id, JOB_STATE_RUNNING, None, Some("recheck job resumed"));
+                if taskless_v2 {
+                    self.recheck_pure_v2_torrent(&info_hash, Some(job_id.to_owned()))
+                        .await?;
+                } else {
+                    self.send_to_torrent(
+                        &info_hash,
+                        TorrentCmd::Recheck {
+                            job_id: Some(job_id.to_owned()),
+                        },
+                    )
+                    .await?;
+                    self.update_job_state(
+                        job_id,
+                        JOB_STATE_RUNNING,
+                        None,
+                        Some("recheck job resumed"),
+                    );
+                }
             }
             JOB_STATE_CANCELLED => {
-                self.send_to_torrent(
-                    &info_hash,
-                    TorrentCmd::CancelJob {
-                        job_id: job_id.to_owned(),
-                    },
-                )
-                .await?;
+                if !taskless_v2 {
+                    self.send_to_torrent(
+                        &info_hash,
+                        TorrentCmd::CancelJob {
+                            job_id: job_id.to_owned(),
+                        },
+                    )
+                    .await?;
+                }
                 self.update_job_state(
                     job_id,
                     JOB_STATE_CANCELLED,
@@ -2474,7 +2518,8 @@ impl Engine {
             .load_torrent_metadata(info_hash)
             .map(|meta| meta.piece_count as i64)
             .unwrap_or(0);
-        let job_id = format!("recheck-{info_hash}-{now}");
+        let seq = RECHECK_JOB_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let job_id = format!("recheck-{info_hash}-{now}-{seq}");
         let job = rt_db::JobRow {
             job_id: job_id.clone(),
             kind: JOB_KIND_RECHECK.to_owned(),
@@ -3379,6 +3424,26 @@ mod tests {
         assert_eq!(job.state, JOB_STATE_COMPLETED);
         assert_eq!(job.done, 1);
         assert!(job.invalid_pieces.is_empty());
+        drop(db);
+
+        let paused_job_id = engine.create_recheck_job(&info_hash).unwrap();
+        engine
+            .control_recheck_job(&paused_job_id, JOB_STATE_PAUSED)
+            .await
+            .unwrap();
+        let db = engine.db.lock().unwrap();
+        let paused_job = rt_db::get_job(&db, &paused_job_id).unwrap();
+        assert_eq!(paused_job.state, JOB_STATE_PAUSED);
+        drop(db);
+
+        let cancelled_job_id = engine.create_recheck_job(&info_hash).unwrap();
+        engine
+            .control_recheck_job(&cancelled_job_id, JOB_STATE_CANCELLED)
+            .await
+            .unwrap();
+        let db = engine.db.lock().unwrap();
+        let cancelled_job = rt_db::get_job(&db, &cancelled_job_id).unwrap();
+        assert_eq!(cancelled_job.state, JOB_STATE_CANCELLED);
     }
 
     #[tokio::test]
@@ -3569,6 +3634,48 @@ mod tests {
         assert_eq!(projected.files[0].priority, 0);
         assert!(!projected.files[0].wanted);
 
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        assert!(
+            engine
+                .handle_cmd(EngineCmd::PauseTorrent {
+                    info_hash: hash.clone(),
+                    reply,
+                })
+                .await
+        );
+        rx.await.unwrap().unwrap();
+        assert_eq!(
+            registry.read().await.get(&hash).unwrap().state,
+            TorrentState::Paused
+        );
+
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        assert!(
+            engine
+                .handle_cmd(EngineCmd::ResumeTorrent {
+                    info_hash: hash.clone(),
+                    reply,
+                })
+                .await
+        );
+        rx.await.unwrap().unwrap();
+        assert_eq!(
+            registry.read().await.get(&hash).unwrap().state,
+            TorrentState::Paused
+        );
+
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        assert!(
+            engine
+                .handle_cmd(EngineCmd::ReannounceTorrent {
+                    info_hash: hash.clone(),
+                    reply,
+                })
+                .await
+        );
+        rx.await.unwrap().unwrap();
+        assert!(engine.torrent_chans.is_empty());
+
         assert_eq!(
             std::fs::read(torrent_blob_path(&engine.config, &hash)).unwrap(),
             raw
@@ -3590,6 +3697,23 @@ mod tests {
         assert_eq!(files[0].length, 65_536);
         assert_eq!(files[0].priority, 0);
         assert!(!files[0].wanted);
+        drop(db);
+
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        assert!(
+            engine
+                .handle_cmd(EngineCmd::RemoveTorrent {
+                    info_hash: hash.clone(),
+                    delete_files: false,
+                    reply,
+                })
+                .await
+        );
+        rx.await.unwrap().unwrap();
+        assert!(registry.read().await.get(&hash).is_none());
+        assert!(std::fs::read(torrent_blob_path(&engine.config, &hash)).is_err());
+        let db = engine.db.lock().unwrap();
+        assert!(rt_db::get(&db, &hash).is_err());
     }
 
     #[test]

@@ -19,6 +19,8 @@
   --accent: #3b82f6;
   --accent-soft: #1e3a5f;
   --accent-text: #bfdbfe;
+  --hover: color-mix(in srgb, var(--accent) 12%, transparent);
+  --press: color-mix(in srgb, var(--accent) 20%, transparent);
   --success: #22c55e;
   --warning: #f59e0b;
   --danger: #ef4444;
@@ -52,4 +54,79 @@ textarea:focus-visible,
 a:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
+}
+
+button,
+select,
+input,
+textarea,
+[role="button"] {
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease,
+    color 120ms ease,
+    box-shadow 120ms ease,
+    filter 120ms ease,
+    transform 90ms ease;
+}
+
+button:not(:disabled),
+select:not(:disabled),
+input[type="checkbox"]:not(:disabled),
+input[type="radio"]:not(:disabled),
+[role="button"] {
+  cursor: pointer;
+}
+
+button:not(:disabled):hover,
+select:not(:disabled):hover {
+  border-color: var(--accent) !important;
+  box-shadow: 0 0 0 1px var(--hover);
+  filter: brightness(1.08);
+}
+
+button:not(:disabled):active,
+[role="button"]:active {
+  transform: translateY(1px);
+  filter: brightness(0.96);
+}
+
+input:not([type="checkbox"]):not([type="radio"]):not(:disabled):hover,
+textarea:not(:disabled):hover {
+  border-color: color-mix(in srgb, var(--accent) 70%, var(--border-strong)) !important;
+}
+
+input:not([type="checkbox"]):not([type="radio"]):not(:disabled):focus,
+textarea:not(:disabled):focus,
+select:not(:disabled):focus {
+  border-color: var(--accent) !important;
+  box-shadow: 0 0 0 2px var(--hover);
+}
+
+input[type="checkbox"]:not(:disabled):hover,
+input[type="radio"]:not(:disabled):hover {
+  filter: brightness(1.18);
+}
+
+.torrent-row {
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease,
+    box-shadow 120ms ease,
+    filter 120ms ease,
+    transform 90ms ease;
+}
+
+.torrent-row:hover {
+  background: color-mix(in srgb, var(--selected) 58%, var(--row)) !important;
+  box-shadow: inset 0 0 0 1px var(--hover);
+}
+
+.torrent-row:active {
+  transform: translateY(1px);
+  background: color-mix(in srgb, var(--selected) 72%, var(--row)) !important;
+}
+
+.torrent-row[aria-selected="true"] {
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 38%, transparent);
 }

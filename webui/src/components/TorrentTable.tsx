@@ -336,6 +336,7 @@ export function TorrentTable({
                 <input
                   type="checkbox"
                   checked={isSelected}
+                  onClick={e => e.stopPropagation()}
                   onChange={() => onSelect(t.hash)}
                   style={{ accentColor: 'var(--accent)', cursor: 'pointer' }}
                 />
@@ -357,7 +358,6 @@ export function TorrentTable({
                     color: 'var(--text)',
                   }}
                   title={t.name}
-                  onClick={() => onDetail(isDetail ? null : t.hash)}
                 >
                   {t.name}
                 </span>
@@ -376,6 +376,18 @@ export function TorrentTable({
             return (
               <div
                 key={t.hash}
+                className="torrent-row"
+                role="button"
+                tabIndex={0}
+                aria-selected={isSelected}
+                title={`${isSelected ? 'Deselect' : 'Select'} ${t.name}`}
+                onClick={() => onSelect(t.hash)}
+                onKeyDown={e => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault()
+                    onSelect(t.hash)
+                  }
+                }}
                 onContextMenu={e => {
                   e.preventDefault()
                   onContextMenu(t, e.clientX, e.clientY)
@@ -385,7 +397,7 @@ export function TorrentTable({
                   position: 'absolute', top: item.start, left: 0, right: 0,
                   height: ROW_HEIGHT, display: 'grid', gridTemplateColumns: gridTemplate,
                   gap: '0 8px', padding: '0 12px', alignItems: 'center',
-                  cursor: 'default', fontSize: 13,
+                  cursor: 'pointer', fontSize: 13,
                   background: isDetail || isSelected ? 'var(--selected)'
                     : item.index % 2 === 0 ? 'var(--row)' : 'var(--row-alt)',
                   borderBottom: '1px solid var(--border)',
