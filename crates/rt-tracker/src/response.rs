@@ -45,6 +45,56 @@ pub struct AnnounceResponse {
     pub incomplete: Option<u32>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScrapeStats {
+    pub complete: u32,
+    pub downloaded: u32,
+    pub incomplete: u32,
+}
+
+impl ScrapeStats {
+    pub fn parse(bytes: &[u8], info_hash: &[u8]) -> Result<Self, TrackerError> {
+        let val = decode(bytes).map_err(|e| TrackerError::ParseError(e.to_string()))?;
+        if let Some(reason) = val.get(b"failure reason") {
+            let msg = reason
+                .as_bytes()
+                .and_then(|b| std::str::from_utf8(b).ok())
+                .unwrap_or("unknown failure")
+                .to_owned();
+            return Err(TrackerError::FailureReason(msg));
+        }
+        let files = val
+            .get(b"files")
+            .ok_or_else(|| TrackerError::ParseError("missing files".into()))?;
+        let entry = match files {
+            BValue::Dict(entries) => entries
+                .iter()
+                .find(|(key, _)| *key == info_hash)
+                .map(|(_, value)| value)
+                .ok_or_else(|| TrackerError::ParseError("scrape missing info_hash".into()))?,
+            _ => return Err(TrackerError::ParseError("files is not a dict".into())),
+        };
+        Ok(ScrapeStats {
+            complete: scrape_int(entry, b"complete")?,
+            downloaded: scrape_int(entry, b"downloaded")?,
+            incomplete: scrape_int(entry, b"incomplete")?,
+        })
+    }
+}
+
+fn scrape_int(entry: &BValue<'_>, key: &[u8]) -> Result<u32, TrackerError> {
+    entry
+        .get(key)
+        .and_then(|value| value.as_int())
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| {
+            TrackerError::ParseError(format!(
+                "missing or invalid scrape field {}",
+                String::from_utf8_lossy(key)
+            ))
+        })
+}
+
 impl AnnounceResponse {
     /// Parse a bencoded HTTP announce response.
     pub fn parse(bytes: &[u8]) -> Result<Self, TrackerError> {
@@ -220,5 +270,29 @@ mod tests {
         let raw = encode(&BValue::Dict(pairs));
         let resp = AnnounceResponse::parse(&raw).unwrap();
         assert_eq!(resp.warning_message.as_deref(), Some("low peers"));
+    }
+
+    #[test]
+    fn parse_scrape_stats_for_info_hash() {
+        let info_hash = [0x22u8; 20];
+        let mut stats: Vec<(&[u8], BValue<'_>)> = vec![
+            (b"complete", BValue::Int(12)),
+            (b"downloaded", BValue::Int(34)),
+            (b"incomplete", BValue::Int(5)),
+        ];
+        stats.sort_by(|a, b| a.0.cmp(b.0));
+        let files: Vec<(&[u8], BValue<'_>)> = vec![(&info_hash, BValue::Dict(stats))];
+        let raw = encode(&BValue::Dict(vec![(b"files", BValue::Dict(files))]));
+
+        let scrape = ScrapeStats::parse(&raw, &info_hash).unwrap();
+
+        assert_eq!(
+            scrape,
+            ScrapeStats {
+                complete: 12,
+                downloaded: 34,
+                incomplete: 5
+            }
+        );
     }
 }

@@ -22,6 +22,7 @@ pub struct TrackerState {
     pub tracker_id: Option<String>,
     pub scrape_complete: Option<u32>,
     pub scrape_incomplete: Option<u32>,
+    pub scrape_downloaded: Option<u32>,
     backoff: Backoff,
     consecutive_failures: u32,
 }
@@ -39,6 +40,7 @@ impl TrackerState {
             tracker_id: None,
             scrape_complete: None,
             scrape_incomplete: None,
+            scrape_downloaded: None,
             backoff: Backoff::tracker_retry(),
             consecutive_failures: 0,
         }

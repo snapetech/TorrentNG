@@ -110,6 +110,19 @@ impl AnnounceRequest {
     }
 }
 
+/// Build a BEP 48 HTTP scrape URL for trackers exposing `/scrape`.
+pub fn to_http_scrape_url(tracker_url: &str, info_hash: InfoHash) -> Result<String, TrackerError> {
+    let mut url = Url::parse(tracker_url).map_err(|e| TrackerError::InvalidUrl(e.to_string()))?;
+    let path = url.path().to_owned();
+    if !path.ends_with("/announce") {
+        return Err(TrackerError::Disabled);
+    }
+    let scrape_path = format!("{}scrape", path.trim_end_matches("announce"));
+    url.set_path(&scrape_path);
+    url.set_query(Some(&format!("info_hash={}", info_hash.url_encode())));
+    Ok(url.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,6 +202,17 @@ mod tests {
             .to_http_query("http://tracker.example.com/announce?passkey=abc")
             .unwrap();
         assert!(url.contains("?passkey=abc&peer_id="));
+    }
+
+    #[test]
+    fn scrape_url_rewrites_announce_path() {
+        let url = to_http_scrape_url(
+            "http://tracker.example.com/path/announce?passkey=abc",
+            InfoHash::V1([0x11; 20]),
+        )
+        .unwrap();
+        assert!(url.starts_with("http://tracker.example.com/path/scrape?"));
+        assert!(url.contains("info_hash="));
     }
 
     #[test]

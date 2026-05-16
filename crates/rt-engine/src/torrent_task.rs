@@ -42,9 +42,10 @@ use rt_storage::{
     IoClass, MountScheduler, PieceVerifier, SchedulerConfig, VerifyResult,
 };
 use rt_tracker::{
+    to_http_scrape_url,
     udp::{UdpAnnounceRequest, UdpAnnounceResponse, UdpConnectRequest, UdpConnectResponse},
-    AnnounceRequest, AnnounceResponse, InfoHash, TrackerError, TrackerEvent, TrackerState,
-    TrackerStatus,
+    AnnounceRequest, AnnounceResponse, InfoHash, ScrapeStats, TrackerError, TrackerEvent,
+    TrackerState, TrackerStatus,
 };
 
 use crate::peer_id::OUR_PEER_ID;
@@ -429,6 +430,13 @@ impl TorrentTask {
                 Ok(resp) => {
                     let peers: Vec<SocketAddr> = resp.peers.iter().map(|peer| peer.addr).collect();
                     self.tracker_tiers[tier_idx][idx].on_success(&resp);
+                    if let Ok(scrape) = self.scrape_tracker(&url).await {
+                        self.tracker_tiers[tier_idx][idx].scrape_complete = Some(scrape.complete);
+                        self.tracker_tiers[tier_idx][idx].scrape_incomplete =
+                            Some(scrape.incomplete);
+                        self.tracker_tiers[tier_idx][idx].scrape_downloaded =
+                            Some(scrape.downloaded);
+                    }
                     if let Some(min_interval) = self.min_announce_interval {
                         if self.tracker_tiers[tier_idx][idx].interval < min_interval {
                             self.tracker_tiers[tier_idx][idx].interval = min_interval;
@@ -644,6 +652,30 @@ impl TorrentTask {
             complete: Some(announce_resp.seeders),
             incomplete: Some(announce_resp.leechers),
         })
+    }
+
+    async fn scrape_tracker(&self, tracker_url: &str) -> Result<ScrapeStats, TrackerError> {
+        if !tracker_url.starts_with("http://") && !tracker_url.starts_with("https://") {
+            return Err(TrackerError::Disabled);
+        }
+        let url = to_http_scrape_url(tracker_url, InfoHash::V1(self.meta.info_hash))?;
+        let resp = reqwest::Client::new()
+            .get(url)
+            .timeout(self.http_timeout)
+            .send()
+            .await
+            .map_err(|e| TrackerError::Network(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(TrackerError::Http {
+                status: status.as_u16(),
+            });
+        }
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| TrackerError::Network(e.to_string()))?;
+        ScrapeStats::parse(&body, &self.meta.info_hash)
     }
 
     async fn accept_peer(
@@ -1035,7 +1067,7 @@ impl TorrentTask {
                     warning_message: tracker_warning_message(&tracker.status),
                     seeders: tracker.scrape_complete.map(|value| value as i64),
                     leechers: tracker.scrape_incomplete.map(|value| value as i64),
-                    completed: None,
+                    completed: tracker.scrape_downloaded.map(|value| value as i64),
                     uploaded: uploaded as i64,
                     downloaded: downloaded as i64,
                     left_bytes: left,
