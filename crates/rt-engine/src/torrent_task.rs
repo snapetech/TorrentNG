@@ -184,6 +184,7 @@ pub struct TorrentTask {
     tracker_tiers: Vec<Vec<TrackerState>>,
     active_tracker_tier: usize,
     tracker_event: TrackerEvent,
+    stopped_announced: bool,
     listen_port: u16,
     http_timeout: Duration,
     udp_timeout: Duration,
@@ -258,6 +259,7 @@ impl TorrentTask {
             tracker_tiers,
             active_tracker_tier: 0,
             tracker_event: TrackerEvent::Started,
+            stopped_announced: paused,
             listen_port,
             http_timeout: Duration::from_secs(http_timeout_secs.max(1)),
             udp_timeout: Duration::from_secs(udp_timeout_secs.max(1)),
@@ -318,7 +320,7 @@ impl TorrentTask {
                         }
                         TorrentCmd::Resume => {
                             self.paused = false;
-                            self.tracker_event = TrackerEvent::Started;
+                            self.restart_tracker_session();
                             if matches!(self.run_recheck(None).await, RecheckOutcome::Shutdown) {
                                 break;
                             }
@@ -433,9 +435,7 @@ impl TorrentTask {
                     }
                     any_success = true;
                     self.persist_tracker_state().await;
-                    if matches!(event, TrackerEvent::Started | TrackerEvent::Completed) {
-                        self.tracker_event = TrackerEvent::Empty;
-                    }
+                    self.tracker_event = tracker_event_after_success(self.tracker_event, event);
                     if !peers.is_empty() {
                         self.remember_tracker_peers(&peers);
                         info!(
@@ -466,6 +466,10 @@ impl TorrentTask {
     }
 
     async fn announce_stopped(&mut self) {
+        if !consume_stopped_announce(&mut self.stopped_announced) {
+            return;
+        }
+
         for tier_idx in 0..self.tracker_tiers.len() {
             for idx in 0..self.tracker_tiers[tier_idx].len() {
                 let url = self.tracker_tiers[tier_idx][idx].url.clone();
@@ -487,6 +491,11 @@ impl TorrentTask {
                 }
             }
         }
+    }
+
+    fn restart_tracker_session(&mut self) {
+        self.tracker_event = TrackerEvent::Started;
+        self.stopped_announced = false;
     }
 
     async fn announce_http(
@@ -1649,6 +1658,23 @@ fn private_peer_source_allowed(
     !is_private || allowed_private_peers.contains(&peer)
 }
 
+fn tracker_event_after_success(current: TrackerEvent, sent: TrackerEvent) -> TrackerEvent {
+    if matches!(sent, TrackerEvent::Started | TrackerEvent::Completed) {
+        TrackerEvent::Empty
+    } else {
+        current
+    }
+}
+
+fn consume_stopped_announce(stopped_announced: &mut bool) -> bool {
+    if *stopped_announced {
+        false
+    } else {
+        *stopped_announced = true;
+        true
+    }
+}
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2325,6 +2351,33 @@ mod tests {
             tracker_failure_reason(&failure).as_deref(),
             Some("announce timed out")
         );
+    }
+
+    #[test]
+    fn tracker_lifecycle_events_clear_after_one_success() {
+        assert_eq!(
+            tracker_event_after_success(TrackerEvent::Started, TrackerEvent::Started),
+            TrackerEvent::Empty
+        );
+        assert_eq!(
+            tracker_event_after_success(TrackerEvent::Completed, TrackerEvent::Completed),
+            TrackerEvent::Empty
+        );
+        assert_eq!(
+            tracker_event_after_success(TrackerEvent::Empty, TrackerEvent::Empty),
+            TrackerEvent::Empty
+        );
+    }
+
+    #[test]
+    fn stopped_announce_is_consumed_once_per_session() {
+        let mut stopped_announced = false;
+
+        assert!(consume_stopped_announce(&mut stopped_announced));
+        assert!(!consume_stopped_announce(&mut stopped_announced));
+
+        stopped_announced = false;
+        assert!(consume_stopped_announce(&mut stopped_announced));
     }
 
     #[test]

@@ -45,7 +45,7 @@ This is the working checklist for finishing the native Rust engine rewrite. It i
 
 - [x] Persist tracker state across restart.
 - [x] Persist uploaded/downloaded/left accounting per torrent.
-- [ ] Send `started`, `completed`, and `stopped` events exactly once where required.
+- [x] Send `started`, `completed`, and `stopped` events exactly once where required.
 - [x] Add restart jitter to prevent announce storms.
 - [ ] Add scrape support/state where tracker supports it.
 - [x] Classify tracker failures and warnings into durable state.
