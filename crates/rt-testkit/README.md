@@ -2,7 +2,8 @@
 
 test fixtures, synthetic torrent generators, interop helpers.
 
-## Status: Implemented — synthetic scale datasets
+## Status: Implemented — database fixture helpers
 
-Provides deterministic torrent row generators for certification and benchmark
-fixtures, including the 1k, 5k, 10k, 15k, and 50k scale matrix.
+Provides migrated in-memory database setup, deterministic torrent row
+generators, and the native scale certification matrix:
+1k, 5k, 10k, 15k, and 50k torrents.
