@@ -69,7 +69,7 @@ impl Client {
     pub async fn transfer_rates(&self) -> Result<TransferRates> {
         async fn first_available(client: &Client, methods: &[&str]) -> i64 {
             for method in methods {
-                if let Ok(value) = client.call(method, &[]).await {
+                if let Ok(value) = client.call_sync(method, &[]).await {
                     return value.as_i64().unwrap_or(0).max(0);
                 }
             }
@@ -89,7 +89,7 @@ impl Client {
         args.extend(TORRENT_FIELDS.iter().map(|&f| XmlValue::from(f)));
 
         let result = self
-            .call("d.multicall2", &args)
+            .call_sync("d.multicall2", &args)
             .await
             .context("d.multicall2")?;
 
@@ -130,7 +130,7 @@ impl Client {
         args.extend(TORRENT_FIELDS.iter().map(|&f| XmlValue::from(f)));
 
         let result = self
-            .call("d.multicall.range", &args)
+            .call_sync("d.multicall.range", &args)
             .await
             .with_context(|| format!("d.multicall.range {view} offset={offset} limit={limit}"))?;
 
@@ -146,7 +146,7 @@ impl Client {
         args.extend(TORRENT_FIELDS.iter().map(|&f| XmlValue::from(f)));
 
         let result = self
-            .call("d.multicall.nonzero_rate", &args)
+            .call_sync("d.multicall.nonzero_rate", &args)
             .await
             .with_context(|| format!("d.multicall.nonzero_rate {view} limit={limit}"))?;
 

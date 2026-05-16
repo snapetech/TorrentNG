@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{header, HeaderValue, StatusCode},
     response::IntoResponse,
     Json,
 };
@@ -314,6 +314,172 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
     )
 }
 
+/// `GET /metrics` — Prometheus text exposition for native engine state.
+pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+    let Some(engine) = &state.engine else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; version=0.0.4"),
+            )],
+            "# native engine unavailable\n".to_owned(),
+        );
+    };
+    match engine.stats().await {
+        Ok(stats) => (
+            StatusCode::OK,
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; version=0.0.4"),
+            )],
+            render_metrics(&stats),
+        ),
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; version=0.0.4"),
+            )],
+            format!("# failed to collect native engine metrics: {e}\n"),
+        ),
+    }
+}
+
+fn render_metrics(stats: &rt_engine::EngineStats) -> String {
+    let mut out = String::new();
+    metric(
+        &mut out,
+        "rtorrentng_torrents_total",
+        "gauge",
+        "Total torrents in session",
+        stats.torrents_total,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_torrents_seeding",
+        "gauge",
+        "Currently seeding torrents",
+        stats.torrents_seeding,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_torrents_downloading",
+        "gauge",
+        "Currently downloading torrents",
+        stats.torrents_downloading,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_torrents_paused",
+        "gauge",
+        "Paused or stopped torrents",
+        stats.torrents_paused,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_torrents_checking",
+        "gauge",
+        "Torrents checking pieces",
+        stats.torrents_checking,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_torrents_metadata_pending",
+        "gauge",
+        "Metadata-pending torrents",
+        stats.torrents_metadata_pending,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_torrents_queued",
+        "gauge",
+        "Queued torrents",
+        stats.torrents_queued,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_torrents_errored",
+        "gauge",
+        "Errored torrents",
+        stats.torrents_error,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_bytes_uploaded_total",
+        "counter",
+        "Uploaded bytes from session accounting",
+        stats.bytes_uploaded,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_bytes_downloaded_total",
+        "counter",
+        "Downloaded bytes from session accounting",
+        stats.bytes_downloaded,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_bytes_left",
+        "gauge",
+        "Bytes left across enabled torrent pieces",
+        stats.bytes_left,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_jobs_active",
+        "gauge",
+        "Active durable jobs",
+        stats.jobs_active,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_trackers_total",
+        "gauge",
+        "Persisted tracker rows",
+        stats.trackers_total,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_trackers_working",
+        "gauge",
+        "Trackers in working state",
+        stats.trackers_working,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_trackers_warning",
+        "gauge",
+        "Trackers with warning state",
+        stats.trackers_warning,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_trackers_error",
+        "gauge",
+        "Trackers with error state",
+        stats.trackers_error,
+    );
+    out
+}
+
+fn metric(out: &mut String, name: &str, kind: &str, help: &str, value: u64) {
+    out.push_str("# HELP ");
+    out.push_str(name);
+    out.push(' ');
+    out.push_str(help);
+    out.push('\n');
+    out.push_str("# TYPE ");
+    out.push_str(name);
+    out.push(' ');
+    out.push_str(kind);
+    out.push('\n');
+    out.push_str(name);
+    out.push(' ');
+    out.push_str(&value.to_string());
+    out.push('\n');
+}
+
 enum TorrentControl {
     Pause,
     Resume,
@@ -420,6 +586,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn metrics_reports_unavailable_without_engine() {
+        let state = AppState::new();
+        let app = build_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn render_metrics_includes_engine_stats() {
+        let stats = rt_engine::EngineStats {
+            torrents_total: 2,
+            torrents_seeding: 1,
+            jobs_active: 3,
+            trackers_error: 4,
+            ..Default::default()
+        };
+        let rendered = render_metrics(&stats);
+        assert!(rendered.contains("rtorrentng_torrents_total 2"));
+        assert!(rendered.contains("rtorrentng_torrents_seeding 1"));
+        assert!(rendered.contains("rtorrentng_jobs_active 3"));
+        assert!(rendered.contains("rtorrentng_trackers_error 4"));
     }
 
     #[tokio::test]

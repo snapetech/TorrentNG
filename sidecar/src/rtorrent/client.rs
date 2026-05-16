@@ -1,8 +1,12 @@
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::{BufMut, BytesMut};
 use quick_xml::{events::Event, name::QName, Reader};
+use serde_json::{json, Value};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixStream};
+use tokio::sync::{Mutex, Semaphore};
+use tokio::time::Instant;
 
 use crate::config::RtorrentConfig;
 
@@ -16,6 +20,8 @@ pub enum Transport {
 pub struct Client {
     transport: Transport,
     timeout: std::time::Duration,
+    rpc_gate: Arc<Semaphore>,
+    low_priority_pause_until: Arc<Mutex<Option<Instant>>>,
 }
 
 impl Client {
@@ -28,6 +34,8 @@ impl Client {
         Ok(Self {
             transport,
             timeout: std::time::Duration::from_secs(cfg.timeout_secs),
+            rpc_gate: Arc::new(Semaphore::new(1)),
+            low_priority_pause_until: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -36,31 +44,99 @@ impl Client {
         Self {
             transport: Transport::Unix(socket_path.to_owned()),
             timeout: std::time::Duration::from_secs(timeout_secs),
+            rpc_gate: Arc::new(Semaphore::new(1)),
+            low_priority_pause_until: Arc::new(Mutex::new(None)),
         }
     }
 
     /// Execute a single XMLRPC method and return the parsed result.
     pub async fn call(&self, method: &str, args: &[XmlValue]) -> Result<XmlValue> {
+        self.call_with_priority(method, args, RpcPriority::User).await
+    }
+
+    pub async fn call_sync(&self, method: &str, args: &[XmlValue]) -> Result<XmlValue> {
+        self.call_with_priority(method, args, RpcPriority::Background)
+            .await
+    }
+
+    async fn call_with_priority(
+        &self,
+        method: &str,
+        args: &[XmlValue],
+        priority: RpcPriority,
+    ) -> Result<XmlValue> {
+        if priority == RpcPriority::Background {
+            let mut pause = self.low_priority_pause_until.lock().await;
+            if let Some(until) = *pause {
+                if until > Instant::now() {
+                    bail!("rTorrent RPC circuit breaker is open");
+                }
+                *pause = None;
+            }
+        }
+
+        let _permit = self
+            .rpc_gate
+            .acquire()
+            .await
+            .context("rTorrent RPC gate closed")?;
+
+        match self.call_json(method, args).await {
+            Ok(value) => Ok(value),
+            Err(json_err) => {
+                if is_jsonrpc_unavailable(&json_err) {
+                    self.call_xml(method, args).await
+                } else {
+                    Err(json_err)
+                }
+            }
+        }
+        .inspect_err(|e| {
+            if priority == RpcPriority::Background && is_timeout_error(e) {
+                let pause = self.low_priority_pause_until.clone();
+                tokio::spawn(async move {
+                    *pause.lock().await = Some(Instant::now() + std::time::Duration::from_secs(15));
+                });
+            }
+        })
+    }
+
+    async fn call_json(&self, method: &str, args: &[XmlValue]) -> Result<XmlValue> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": args.iter().map(xml_to_json).collect::<Vec<_>>(),
+        })
+        .to_string();
+        let response = self
+            .scgi_roundtrip("application/json", body.as_bytes())
+            .await
+            .with_context(|| format!("JSON-RPC call {method}"))?;
+        parse_jsonrpc_response(&response)
+    }
+
+    async fn call_xml(&self, method: &str, args: &[XmlValue]) -> Result<XmlValue> {
         let body = build_xmlrpc_request(method, args);
         let response = self
-            .scgi_roundtrip(body.as_bytes())
+            .scgi_roundtrip("text/xml", body.as_bytes())
             .await
             .with_context(|| format!("XMLRPC call {method}"))?;
         parse_xmlrpc_response(&response)
     }
 
     /// Send raw SCGI request and return the HTTP body.
-    async fn scgi_roundtrip(&self, xmlrpc_body: &[u8]) -> Result<Vec<u8>> {
-        let content_length = xmlrpc_body.len();
+    async fn scgi_roundtrip(&self, content_type: &str, body: &[u8]) -> Result<Vec<u8>> {
+        let content_length = body.len();
         let headers = format!(
             "CONTENT_LENGTH\0{content_length}\0SCGI\01\0REQUEST_METHOD\0POST\0\
-             REQUEST_URI\0/RPC2\0CONTENT_TYPE\0text/xml\0"
+             REQUEST_URI\0/RPC2\0CONTENT_TYPE\0{content_type}\0"
         );
         let netstring = format!("{}:{},", headers.len(), headers);
 
-        let mut packet = BytesMut::with_capacity(netstring.len() + xmlrpc_body.len());
+        let mut packet = BytesMut::with_capacity(netstring.len() + body.len());
         packet.put(netstring.as_bytes());
-        packet.put(xmlrpc_body);
+        packet.put(body);
 
         let response = tokio::time::timeout(self.timeout, async {
             match &self.transport {
@@ -96,6 +172,12 @@ impl Client {
 
         Ok(response[body_start..].to_vec())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RpcPriority {
+    User,
+    Background,
 }
 
 // --- XMLRPC types ---
@@ -162,6 +244,63 @@ impl From<bool> for XmlValue {
     fn from(b: bool) -> Self {
         XmlValue::Bool(b)
     }
+}
+
+fn xml_to_json(value: &XmlValue) -> Value {
+    match value {
+        XmlValue::String(s) | XmlValue::Base64(s) => Value::String(s.clone()),
+        XmlValue::Int(n) => json!(n),
+        XmlValue::Bool(b) => json!(b),
+        XmlValue::Array(items) => Value::Array(items.iter().map(xml_to_json).collect()),
+        XmlValue::Struct(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(k, v)| (k.clone(), xml_to_json(v)))
+                .collect(),
+        ),
+        XmlValue::Nil => Value::Null,
+    }
+}
+
+fn json_to_xml(value: Value) -> XmlValue {
+    match value {
+        Value::Null => XmlValue::Nil,
+        Value::Bool(b) => XmlValue::Bool(b),
+        Value::Number(n) => XmlValue::Int(n.as_i64().or_else(|| n.as_u64().map(|n| n as i64)).unwrap_or(0)),
+        Value::String(s) => XmlValue::String(s),
+        Value::Array(items) => XmlValue::Array(items.into_iter().map(json_to_xml).collect()),
+        Value::Object(map) => XmlValue::Struct(
+            map.into_iter()
+                .map(|(key, value)| (key, json_to_xml(value)))
+                .collect(),
+        ),
+    }
+}
+
+fn parse_jsonrpc_response(body: &[u8]) -> Result<XmlValue> {
+    let value: Value = serde_json::from_slice(body).context("JSON-RPC response is not valid JSON")?;
+    if let Some(error) = value.get("error") {
+        bail!(
+            "JSON-RPC error: {}",
+            error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error")
+        );
+    }
+    Ok(json_to_xml(value.get("result").cloned().unwrap_or(Value::Null)))
+}
+
+fn is_jsonrpc_unavailable(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}");
+    text.contains("JSON-RPC not supported")
+        || text.contains("method not found: system.listMethods")
+        || text.contains("method not found: method.list_keys")
+}
+
+fn is_timeout_error(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}");
+    text.contains("timed out") || text.contains("deadline has elapsed")
 }
 
 // --- XMLRPC builder ---

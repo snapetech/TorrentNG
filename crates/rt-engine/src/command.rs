@@ -23,6 +23,26 @@ pub struct EngineTorrentMetadata {
     pub files: Vec<EngineTorrentFile>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EngineStats {
+    pub torrents_total: u64,
+    pub torrents_seeding: u64,
+    pub torrents_downloading: u64,
+    pub torrents_paused: u64,
+    pub torrents_checking: u64,
+    pub torrents_queued: u64,
+    pub torrents_error: u64,
+    pub torrents_metadata_pending: u64,
+    pub bytes_uploaded: u64,
+    pub bytes_downloaded: u64,
+    pub bytes_left: u64,
+    pub jobs_active: u64,
+    pub trackers_total: u64,
+    pub trackers_working: u64,
+    pub trackers_warning: u64,
+    pub trackers_error: u64,
+}
+
 /// Engine-level commands (handled by the top-level EngineHandle).
 #[derive(Debug)]
 pub enum EngineCmd {
@@ -106,6 +126,10 @@ pub enum EngineCmd {
         name: Option<String>,
         save_path: Option<PathBuf>,
         reply: oneshot::Sender<CmdResult<()>>,
+    },
+    /// Snapshot runtime and durable metrics.
+    GetStats {
+        reply: oneshot::Sender<CmdResult<EngineStats>>,
     },
     /// Graceful shutdown.
     Shutdown,

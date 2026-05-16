@@ -19,7 +19,7 @@ use rt_metainfo::{parse_torrent, MagnetLink, TorrentMeta, TorrentMetaV1};
 use rt_peer_wire::handshake::{Handshake, HANDSHAKE_LEN};
 use rt_session::{SessionRegistry, TorrentEntry, TorrentState, TransferStats};
 
-use crate::command::{CmdResult, EngineCmd, EngineTorrentFile, EngineTorrentMetadata};
+use crate::command::{CmdResult, EngineCmd, EngineStats, EngineTorrentFile, EngineTorrentMetadata};
 use crate::dht_task::{run_dht, DhtCommand, DhtTorrent};
 use crate::metadata_task::run_metadata_task;
 use crate::torrent_task::{TorrentCmd, TorrentTask};
@@ -189,6 +189,15 @@ impl EngineHandle {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx
             .send(EngineCmd::GetTorrentMetadata { info_hash, reply })
+            .await
+            .map_err(|_| "engine shut down".to_owned())?;
+        rx.await.map_err(|_| "engine dropped reply".to_owned())?
+    }
+
+    pub async fn stats(&self) -> CmdResult<EngineStats> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(EngineCmd::GetStats { reply })
             .await
             .map_err(|_| "engine shut down".to_owned())?;
         rx.await.map_err(|_| "engine dropped reply".to_owned())?
@@ -564,6 +573,11 @@ impl Engine {
                 let result = self
                     .update_torrent_fields_inner(&info_hash, name, save_path)
                     .await;
+                let _ = reply.send(result);
+            }
+
+            EngineCmd::GetStats { reply } => {
+                let result = self.engine_stats().await;
                 let _ = reply.send(result);
             }
         }
@@ -1190,6 +1204,45 @@ impl Engine {
                 .map_err(|_| "torrent task gone".to_owned()),
             None => Err(format!("torrent {info_hash} not found")),
         }
+    }
+
+    async fn engine_stats(&self) -> CmdResult<EngineStats> {
+        let mut stats = EngineStats::default();
+        {
+            let reg = self.registry.read().await;
+            for entry in reg.iter() {
+                stats.torrents_total += 1;
+                stats.bytes_uploaded = stats.bytes_uploaded.saturating_add(entry.stats.uploaded);
+                stats.bytes_downloaded = stats
+                    .bytes_downloaded
+                    .saturating_add(entry.stats.downloaded);
+                stats.bytes_left = stats.bytes_left.saturating_add(entry.amount_left);
+                match entry.state {
+                    TorrentState::Seeding => stats.torrents_seeding += 1,
+                    TorrentState::Downloading => stats.torrents_downloading += 1,
+                    TorrentState::Paused | TorrentState::Stopped => stats.torrents_paused += 1,
+                    TorrentState::Checking => stats.torrents_checking += 1,
+                    TorrentState::MetadataPending => stats.torrents_metadata_pending += 1,
+                    TorrentState::Queued => stats.torrents_queued += 1,
+                    TorrentState::Error => stats.torrents_error += 1,
+                }
+            }
+        }
+        let db = self.db.lock().expect("database mutex poisoned");
+        stats.jobs_active = rt_db::list_active_jobs(&db)
+            .map_err(|e| e.to_string())?
+            .len() as u64;
+        let trackers = rt_db::list_all_torrent_trackers(&db).map_err(|e| e.to_string())?;
+        stats.trackers_total = trackers.len() as u64;
+        for tracker in trackers {
+            match tracker.status.as_str() {
+                "working" => stats.trackers_working += 1,
+                "warning" => stats.trackers_warning += 1,
+                "error" => stats.trackers_error += 1,
+                _ => {}
+            }
+        }
+        Ok(stats)
     }
 
     async fn control_recheck_job(&self, job_id: &str, target_state: &str) -> CmdResult<()> {
@@ -2180,6 +2233,92 @@ mod tests {
         assert_eq!(mounts[0].queue_depth, 1);
         assert_eq!(mounts[0].read_concurrency, 1);
         assert_eq!(mounts[0].write_concurrency, 1);
+    }
+
+    #[tokio::test]
+    async fn engine_stats_include_registry_jobs_and_trackers() {
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let (_tx, rx) = mpsc::channel(1);
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        {
+            let mut reg = registry.write().await;
+            let mut entry = TorrentEntry::new("e".repeat(40), "stats.bin".into(), "/tmp".into());
+            entry.stats.add_upload(10);
+            entry.stats.add_download(20);
+            entry.amount_left = 30;
+            let _ = entry.transition(TorrentState::Downloading);
+            reg.add(entry).unwrap();
+        }
+        let engine = Engine {
+            config: Arc::new(Config::default()),
+            registry,
+            db: Arc::new(Mutex::new(conn)),
+            cmd_rx: rx,
+            cmd_tx: mpsc::channel(1).0,
+            torrent_chans: HashMap::new(),
+            dht_tx: None,
+        };
+        let job_id = engine.create_recheck_job(&"e".repeat(40)).unwrap();
+        engine.update_job_state(&job_id, JOB_STATE_RUNNING, None, Some("running"));
+        {
+            let mut db = engine.db.lock().unwrap();
+            rt_db::upsert(
+                &db,
+                &TorrentRow {
+                    info_hash: "e".repeat(40),
+                    name: "stats.bin".to_owned(),
+                    total_length: 100,
+                    piece_length: 10,
+                    piece_count: 10,
+                    is_private: false,
+                    save_path: "/tmp".to_owned(),
+                    category: None,
+                    tags: Vec::new(),
+                    state: "downloading".to_owned(),
+                    added_at: 1,
+                    completed_at: None,
+                    uploaded: 10,
+                    downloaded: 20,
+                    ratio: 0.5,
+                    trackers: Vec::new(),
+                },
+            )
+            .unwrap();
+            rt_db::replace_torrent_trackers(
+                &mut db,
+                &"e".repeat(40),
+                &[rt_db::TorrentTrackerRow {
+                    info_hash: "e".repeat(40),
+                    tracker_index: 0,
+                    tier: 0,
+                    url: "http://tracker/announce".to_owned(),
+                    status: "error".to_owned(),
+                    last_announce_at: None,
+                    next_announce_at: None,
+                    last_success_at: None,
+                    failure_reason: Some("timeout".to_owned()),
+                    warning_message: None,
+                    seeders: None,
+                    leechers: None,
+                    completed: None,
+                    uploaded: 10,
+                    downloaded: 20,
+                    left_bytes: 30,
+                }],
+            )
+            .unwrap();
+        }
+
+        let stats = engine.engine_stats().await.unwrap();
+        assert_eq!(stats.torrents_total, 1);
+        assert_eq!(stats.torrents_downloading, 1);
+        assert_eq!(stats.bytes_uploaded, 10);
+        assert_eq!(stats.bytes_downloaded, 20);
+        assert_eq!(stats.bytes_left, 30);
+        assert_eq!(stats.jobs_active, 1);
+        assert_eq!(stats.trackers_total, 1);
+        assert_eq!(stats.trackers_error, 1);
     }
 }
 

@@ -1,5 +1,5 @@
 diff --git a/src/command_events.cc b/src/command_events.cc
-index 23e262c..917246b 100644
+index 23e262c..ebb3674 100644
 --- a/src/command_events.cc
 +++ b/src/command_events.cc
 @@ -1,6 +1,8 @@
@@ -11,7 +11,7 @@ index 23e262c..917246b 100644
  #include <cstdio>
  #include <torrent/rate.h>
  #include <torrent/hash_string.h>
-@@ -285,6 +287,123 @@ d_multicall_filtered(const torrent::Object::list_type& args) {
+@@ -285,6 +287,181 @@ d_multicall_filtered(const torrent::Object::list_type& args) {
    return resultRaw;
  }
  
@@ -132,22 +132,82 @@ index 23e262c..917246b 100644
 +  return resultRaw;
 +}
 +
++torrent::Object
++rtng_live_summary(const torrent::Object::list_type& args) {
++  if (args.size() < 2)
++    throw torrent::input_error("rtng.live_summary requires view, limit and optional commands.");
++
++  torrent::Object::list_const_iterator arg = args.begin();
++
++  core::ViewManager* viewManager = control->view_manager();
++  core::ViewManager::iterator view_itr;
++
++  if (!arg->as_string().empty())
++    view_itr = viewManager->find(arg->as_string());
++  else
++    view_itr = viewManager->find("default");
++
++  if (view_itr == viewManager->end())
++    throw torrent::input_error("Could not find view.");
++
++  const int64_t limit = (++arg)->as_value();
++
++  if (limit < 0)
++    throw torrent::input_error("rtng.live_summary limit must be non-negative.");
++
++  torrent::Object             resultRaw = torrent::Object::create_list();
++  torrent::Object::list_type& result = resultRaw.as_list();
++
++  result.push_back(torrent::Object(static_cast<int64_t>(torrent::down_rate()->rate())));
++  result.push_back(torrent::Object(static_cast<int64_t>(torrent::up_rate()->rate())));
++
++  torrent::Object             rowsRaw = torrent::Object::create_list();
++  torrent::Object::list_type& rows = rowsRaw.as_list();
++
++  const int64_t bounded_limit = std::min(limit, rtng_multicall_max_limit);
++  ++arg; // skip to first command
++
++  for (auto itr = (*view_itr)->begin_visible(); itr != (*view_itr)->end_visible(); ++itr) {
++    const int64_t down_rate = (*itr)->info()->down_rate()->rate();
++    const int64_t up_rate   = (*itr)->info()->up_rate()->rate();
++
++    if (down_rate <= 0 && up_rate <= 0)
++      continue;
++
++    auto target = rpc::make_target(*itr);
++    torrent::Object::list_type& row = rows.insert(rows.end(), torrent::Object::create_list())->as_list();
++
++    for (auto command = arg; command != args.end(); ++command) {
++      auto& cmdstr = command->as_string();
++      row.push_back(rpc::parse_command(target, cmdstr.c_str(), cmdstr.c_str() + cmdstr.size()).first);
++    }
++
++    if (static_cast<int64_t>(rows.size()) >= bounded_limit)
++      break;
++  }
++
++  result.push_back(rowsRaw);
++  return resultRaw;
++}
++
  static void
  call_watch_command(const std::string& command, const std::string& path) {
    rpc::commands.call_catch(command.c_str(), rpc::make_target(), path);
-@@ -342,6 +461,8 @@ initialize_command_events() {
+@@ -342,6 +519,9 @@ initialize_command_events() {
    CMD2_ANY_LIST    ("download_list",       std::bind(&apply_download_list, std::placeholders::_2));
    CMD2_ANY_LIST    ("d.multicall2",        std::bind(&d_multicall, std::placeholders::_2));
    CMD2_ANY_LIST    ("d.multicall.filtered", std::bind(&d_multicall_filtered, std::placeholders::_2));
 +  CMD2_ANY_LIST    ("d.multicall.range",   std::bind(&d_multicall_range, std::placeholders::_2));
 +  CMD2_ANY_LIST    ("d.multicall.nonzero_rate", std::bind(&d_multicall_nonzero_rate, std::placeholders::_2));
++  CMD2_ANY_LIST    ("rtng.live_summary", std::bind(&rtng_live_summary, std::placeholders::_2));
  
    CMD2_ANY_LIST    ("directory.watch.added", std::bind(&directory_watch_added, std::placeholders::_2));
  
-@@ -355,4 +476,6 @@ initialize_command_events() {
+@@ -355,4 +535,7 @@ initialize_command_events() {
    rpc::rpc.mark_safe("download_list");
    rpc::rpc.mark_safe("d.multicall2");
    rpc::rpc.mark_safe("d.multicall.filtered");
 +  rpc::rpc.mark_safe("d.multicall.range");
 +  rpc::rpc.mark_safe("d.multicall.nonzero_rate");
++  rpc::rpc.mark_safe("rtng.live_summary");
  }

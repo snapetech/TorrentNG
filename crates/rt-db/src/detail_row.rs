@@ -210,6 +210,20 @@ pub fn list_torrent_trackers(
     Ok(rows)
 }
 
+pub fn list_all_torrent_trackers(conn: &Connection) -> Result<Vec<TorrentTrackerRow>, DbError> {
+    let mut stmt = conn.prepare(
+        "SELECT info_hash, tracker_index, tier, url, status, last_announce_at,
+                next_announce_at, last_success_at, failure_reason, warning_message,
+                seeders, leechers, completed, uploaded, downloaded, left_bytes
+         FROM torrent_trackers
+         ORDER BY info_hash ASC, tier ASC, tracker_index ASC",
+    )?;
+    let rows = stmt
+        .query_map([], TorrentTrackerRow::from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 pub fn upsert_torrent_limits(conn: &Connection, limits: &TorrentLimitRow) -> Result<(), DbError> {
     conn.execute(
         "INSERT INTO torrent_limits
@@ -339,6 +353,9 @@ mod tests {
         let trackers = list_torrent_trackers(&conn, &"a".repeat(40)).unwrap();
         assert_eq!(trackers.len(), 1);
         assert_eq!(trackers[0].left_bytes, 6);
+        let all = list_all_torrent_trackers(&conn).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].status, "working");
     }
 
     #[test]
