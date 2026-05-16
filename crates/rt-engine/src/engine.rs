@@ -629,9 +629,14 @@ impl Engine {
 
             EngineCmd::PauseTorrent { info_hash, reply } => {
                 self.unregister_dht_torrent(&info_hash).await;
-                let result = self.send_to_torrent(&info_hash, TorrentCmd::Pause).await;
+                let result = match self.send_to_torrent(&info_hash, TorrentCmd::Pause).await {
+                    Ok(()) => Ok(()),
+                    Err(_) if self.metadata_placeholder_row(&info_hash).is_some() => {
+                        self.update_metadata_placeholder_state(&info_hash, TorrentState::Paused)
+                    }
+                    Err(err) => Err(err),
+                };
                 if result.is_ok() {
-                    self.set_metadata_placeholder_state(&info_hash, TorrentState::Paused);
                     self.append_session_event(
                         Some(&info_hash),
                         EVENT_TORRENT_PAUSED,
@@ -643,26 +648,38 @@ impl Engine {
             }
 
             EngineCmd::ResumeTorrent { info_hash, reply } => {
-                let result = self.ensure_metadata_task(&info_hash).await.and_then(|_| {
-                    self.torrent_chans
-                        .get(&info_hash)
-                        .ok_or_else(|| format!("torrent {info_hash} not found"))
-                        .map(|_| ())
-                });
-                let result = if result.is_ok() {
-                    self.send_to_torrent(&info_hash, TorrentCmd::Resume).await
+                let v2_only_placeholder = self
+                    .metadata_placeholder_row(&info_hash)
+                    .as_ref()
+                    .is_some_and(is_v2_only_placeholder_row);
+                let result = if v2_only_placeholder {
+                    self.update_metadata_placeholder_state(
+                        &info_hash,
+                        TorrentState::MetadataPending,
+                    )
                 } else {
-                    result
+                    let result = self.ensure_metadata_task(&info_hash).await.and_then(|_| {
+                        self.torrent_chans
+                            .get(&info_hash)
+                            .ok_or_else(|| format!("torrent {info_hash} not found"))
+                            .map(|_| ())
+                    });
+                    if result.is_ok() {
+                        self.send_to_torrent(&info_hash, TorrentCmd::Resume).await
+                    } else {
+                        result
+                    }
                 };
                 if result.is_ok() {
-                    self.set_metadata_placeholder_state(&info_hash, TorrentState::MetadataPending);
-                    self.register_dht_torrent_from_storage_or_hash(&info_hash)
-                        .await;
+                    if !v2_only_placeholder {
+                        self.register_dht_torrent_from_storage_or_hash(&info_hash)
+                            .await;
+                    }
                     self.append_session_event(
                         Some(&info_hash),
                         EVENT_TORRENT_RESUMED,
                         Some("torrent resumed"),
-                        serde_json::json!({}),
+                        serde_json::json!({ "v2_only": v2_only_placeholder }),
                     );
                 }
                 let _ = reply.send(result);
@@ -726,15 +743,25 @@ impl Engine {
             }
 
             EngineCmd::ReannounceTorrent { info_hash, reply } => {
-                let result = self
-                    .send_to_torrent(&info_hash, TorrentCmd::Reannounce)
-                    .await;
+                let v2_only_placeholder = self
+                    .metadata_placeholder_row(&info_hash)
+                    .as_ref()
+                    .is_some_and(is_v2_only_placeholder_row);
+                let result = if v2_only_placeholder {
+                    Ok(())
+                } else {
+                    self.send_to_torrent(&info_hash, TorrentCmd::Reannounce)
+                        .await
+                };
                 if result.is_ok() {
                     self.append_session_event(
                         Some(&info_hash),
                         EVENT_REANNOUNCE_REQUESTED,
                         Some("tracker reannounce requested"),
-                        serde_json::json!({}),
+                        serde_json::json!({
+                            "v2_only": v2_only_placeholder,
+                            "skipped": v2_only_placeholder,
+                        }),
                     );
                 }
                 let _ = reply.send(result);
@@ -2376,27 +2403,33 @@ impl Engine {
             && std::fs::metadata(torrent_blob_path(&self.config, &row.info_hash)).is_err()
     }
 
-    fn set_metadata_placeholder_state(&self, info_hash: &str, state: TorrentState) {
-        let mut row = {
+    fn metadata_placeholder_row(&self, info_hash: &str) -> Option<TorrentRow> {
+        let row = {
             let db = self.db.lock().expect("database mutex poisoned");
-            match rt_db::get(&db, info_hash) {
-                Ok(row) => row,
-                Err(_) => return,
-            }
+            rt_db::get(&db, info_hash).ok()?
         };
-        if !self.is_metadata_placeholder_row(&row) {
-            return;
-        }
+        self.is_metadata_placeholder_row(&row).then_some(row)
+    }
+
+    fn update_metadata_placeholder_state(
+        &self,
+        info_hash: &str,
+        state: TorrentState,
+    ) -> CmdResult<()> {
+        let Some(mut row) = self.metadata_placeholder_row(info_hash) else {
+            return Err(format!("torrent {info_hash} is not metadata pending"));
+        };
         row.state = state.as_str().to_owned();
         {
             let db = self.db.lock().expect("database mutex poisoned");
-            let _ = rt_db::upsert(&db, &row);
+            rt_db::upsert(&db, &row).map_err(|e| e.to_string())?;
         }
         if let Ok(mut registry) = self.registry.try_write() {
             if let Some(entry) = registry.get_mut(info_hash) {
                 entry.state = state;
             }
         }
+        Ok(())
     }
 
     async fn unregister_dht_torrent(&self, info_hash_hex: &str) {
@@ -2654,6 +2687,10 @@ fn state_from_str(state: &str) -> TorrentState {
         "error" => TorrentState::Error,
         _ => TorrentState::Stopped,
     }
+}
+
+fn is_v2_only_placeholder_row(row: &TorrentRow) -> bool {
+    row.info_hash.len() == 64 && row.total_length == 0 && row.piece_count == 0
 }
 
 fn torrent_blob_dir(config: &Config) -> PathBuf {
@@ -3392,6 +3429,49 @@ mod tests {
         let row = rt_db::get(&db, &hash).unwrap();
         assert_eq!(row.state, "metadata_pending");
         assert_eq!(row.trackers, vec!["https://tracker.example/announce"]);
+        drop(db);
+
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        assert!(
+            engine
+                .handle_cmd(EngineCmd::PauseTorrent {
+                    info_hash: hash.clone(),
+                    reply,
+                })
+                .await
+        );
+        rx.await.unwrap().unwrap();
+        assert_eq!(
+            registry.read().await.get(&hash).unwrap().state,
+            TorrentState::Paused
+        );
+
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        assert!(
+            engine
+                .handle_cmd(EngineCmd::ResumeTorrent {
+                    info_hash: hash.clone(),
+                    reply,
+                })
+                .await
+        );
+        rx.await.unwrap().unwrap();
+        assert_eq!(
+            registry.read().await.get(&hash).unwrap().state,
+            TorrentState::MetadataPending
+        );
+
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        assert!(
+            engine
+                .handle_cmd(EngineCmd::ReannounceTorrent {
+                    info_hash: hash.clone(),
+                    reply,
+                })
+                .await
+        );
+        rx.await.unwrap().unwrap();
+        assert!(engine.torrent_chans.is_empty());
     }
 
     #[test]
