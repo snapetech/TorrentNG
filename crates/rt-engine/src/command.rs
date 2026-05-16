@@ -18,6 +18,7 @@ pub struct EngineTorrentFile {
 pub struct EngineTorrentMetadata {
     pub piece_length: u64,
     pub piece_count: usize,
+    pub piece_hashes: Vec<String>,
     pub is_private: bool,
     pub trackers: Vec<String>,
     pub files: Vec<EngineTorrentFile>,

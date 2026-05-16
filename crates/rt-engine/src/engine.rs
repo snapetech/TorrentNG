@@ -1921,6 +1921,7 @@ fn metadata_from_v1(meta: &TorrentMetaV1) -> EngineTorrentMetadata {
     EngineTorrentMetadata {
         piece_length: meta.piece_length,
         piece_count: meta.pieces.len(),
+        piece_hashes: meta.pieces.iter().map(hex::encode).collect(),
         is_private: meta.private,
         trackers: meta.all_trackers(),
         files: meta
@@ -1939,6 +1940,7 @@ fn metadata_from_placeholder_row(row: &TorrentRow) -> EngineTorrentMetadata {
     EngineTorrentMetadata {
         piece_length: 0,
         piece_count: 0,
+        piece_hashes: Vec::new(),
         is_private: row.is_private,
         trackers: row.trackers.clone(),
         files: Vec::new(),
@@ -2087,6 +2089,10 @@ mod tests {
 
         assert_eq!(projected.piece_length, 16_384);
         assert_eq!(projected.piece_count, 2);
+        assert_eq!(
+            projected.piece_hashes,
+            vec![hex::encode([2u8; 20]), hex::encode([3u8; 20])]
+        );
         assert!(projected.is_private);
         assert_eq!(
             projected.trackers,
@@ -2117,6 +2123,7 @@ mod tests {
 
         assert_eq!(projected.piece_length, 0);
         assert_eq!(projected.piece_count, 0);
+        assert!(projected.piece_hashes.is_empty());
         assert_eq!(projected.trackers, row.trackers);
         assert!(projected.files.is_empty());
     }
