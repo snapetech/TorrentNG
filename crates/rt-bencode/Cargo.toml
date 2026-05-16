@@ -1,0 +1,13 @@
+[package]
+name = "rt-bencode"
+description = "Bencode parser and encoder for rtorrentNG"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

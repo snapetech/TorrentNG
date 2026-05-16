@@ -1,0 +1,17 @@
+[package]
+name = "rusttorrentd"
+description = "rtorrentNG: native Rust BitTorrent daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rusttorrentd"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true

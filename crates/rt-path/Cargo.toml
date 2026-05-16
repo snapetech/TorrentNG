@@ -1,0 +1,11 @@
+[package]
+name = "rt-path"
+description = "rtorrentNG: rt-path"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
