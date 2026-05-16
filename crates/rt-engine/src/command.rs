@@ -67,6 +67,21 @@ pub enum EngineCmd {
         info_hash: String,
         reply: oneshot::Sender<CmdResult<()>>,
     },
+    /// Pause a durable job by ID.
+    PauseJob {
+        job_id: String,
+        reply: oneshot::Sender<CmdResult<()>>,
+    },
+    /// Resume a durable job by ID.
+    ResumeJob {
+        job_id: String,
+        reply: oneshot::Sender<CmdResult<()>>,
+    },
+    /// Cancel a durable job by ID.
+    CancelJob {
+        job_id: String,
+        reply: oneshot::Sender<CmdResult<()>>,
+    },
     /// Force a tracker announce now.
     ReannounceTorrent {
         info_hash: String,

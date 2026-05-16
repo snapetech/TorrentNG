@@ -57,6 +57,9 @@ pub enum TorrentCmd {
     Recheck {
         job_id: Option<String>,
     },
+    CancelJob {
+        job_id: String,
+    },
     Reannounce,
     Shutdown,
     /// Peers discovered by DHT or tracker.
@@ -73,11 +76,13 @@ pub enum TorrentCmd {
 enum RecheckOutcome {
     Complete,
     Paused,
+    Cancelled,
     Shutdown,
 }
 
 const JOB_STATE_RUNNING: &str = "running";
 const JOB_STATE_PAUSED: &str = "paused";
+const JOB_STATE_CANCELLED: &str = "cancelled";
 const JOB_STATE_COMPLETED: &str = "completed";
 
 /// A block received from a peer.
@@ -331,6 +336,7 @@ impl TorrentTask {
                                 break;
                             }
                         }
+                        TorrentCmd::CancelJob { .. } => {}
                         TorrentCmd::Reannounce => {
                             self.tracker_event = TrackerEvent::Empty;
                             self.schedule_active_tracker_tier_now();
@@ -1030,6 +1036,21 @@ impl TorrentTask {
                     }
                     return RecheckOutcome::Paused;
                 }
+                Some(RecheckOutcome::Cancelled) => {
+                    self.save_fastresume(false).await;
+                    self.set_state(TorrentState::Paused).await;
+                    if let Some(job_id) = &job_id {
+                        self.persist_recheck_job_progress(
+                            job_id,
+                            piece,
+                            valid,
+                            &invalid_pieces,
+                            JOB_STATE_CANCELLED,
+                            Some("recheck cancelled"),
+                        );
+                    }
+                    return RecheckOutcome::Cancelled;
+                }
                 Some(RecheckOutcome::Shutdown) => {
                     self.save_fastresume(false).await;
                     self.set_state(TorrentState::Stopped).await;
@@ -1140,6 +1161,14 @@ impl TorrentTask {
                     self.schedule_active_tracker_tier_now();
                 }
                 Ok(TorrentCmd::Recheck { .. }) => {}
+                Ok(TorrentCmd::CancelJob { job_id }) => {
+                    debug!(
+                        torrent = %self.info_hash_hex,
+                        job_id,
+                        "cancelling recheck job"
+                    );
+                    return Some(RecheckOutcome::Cancelled);
+                }
                 Ok(TorrentCmd::NewPeers(_)) => {}
                 Ok(TorrentCmd::AcceptPeer { .. }) => {}
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return None,
@@ -1355,18 +1384,19 @@ impl TorrentTask {
         job.verified_bytes = (valid_pieces as u64).saturating_mul(self.meta.piece_length) as i64;
         job.invalid_pieces = invalid_pieces.to_vec();
         job.updated_at = now as i64;
-        if state == JOB_STATE_COMPLETED {
+        if matches!(state, JOB_STATE_CANCELLED | JOB_STATE_COMPLETED) {
             job.finished_at = Some(now as i64);
         }
         let event = rt_db::JobEventRow {
             event_id: None,
             job_id: job_id.to_owned(),
             occurred_at: now as i64,
-            kind: if state == JOB_STATE_COMPLETED {
-                "check_completed".to_owned()
-            } else {
-                "check_progress".to_owned()
-            },
+            kind: match state {
+                JOB_STATE_CANCELLED => "check_cancelled",
+                JOB_STATE_COMPLETED => "check_completed",
+                _ => "check_progress",
+            }
+            .to_owned(),
             message: message.map(str::to_owned),
             payload: serde_json::json!({
                 "piece_index": job.piece_index,

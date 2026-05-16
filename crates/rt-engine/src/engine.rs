@@ -40,6 +40,8 @@ const EVENT_ENGINE_STOPPED: &str = "engine_stopped";
 const JOB_KIND_RECHECK: &str = "recheck_torrent";
 const JOB_STATE_QUEUED: &str = "queued";
 const JOB_STATE_RUNNING: &str = "running";
+const JOB_STATE_PAUSED: &str = "paused";
+const JOB_STATE_CANCELLED: &str = "cancelled";
 const JOB_STATE_FAILED: &str = "failed";
 
 /// Handle given to the API layer. Clone freely; all sends are channel-based.
@@ -141,6 +143,33 @@ impl EngineHandle {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx
             .send(EngineCmd::RecheckTorrent { info_hash, reply })
+            .await
+            .map_err(|_| "engine shut down".to_owned())?;
+        rx.await.map_err(|_| "engine dropped reply".to_owned())?
+    }
+
+    pub async fn pause_job(&self, job_id: String) -> CmdResult<()> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(EngineCmd::PauseJob { job_id, reply })
+            .await
+            .map_err(|_| "engine shut down".to_owned())?;
+        rx.await.map_err(|_| "engine dropped reply".to_owned())?
+    }
+
+    pub async fn resume_job(&self, job_id: String) -> CmdResult<()> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(EngineCmd::ResumeJob { job_id, reply })
+            .await
+            .map_err(|_| "engine shut down".to_owned())?;
+        rx.await.map_err(|_| "engine dropped reply".to_owned())?
+    }
+
+    pub async fn cancel_job(&self, job_id: String) -> CmdResult<()> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(EngineCmd::CancelJob { job_id, reply })
             .await
             .map_err(|_| "engine shut down".to_owned())?;
         rx.await.map_err(|_| "engine dropped reply".to_owned())?
@@ -471,6 +500,21 @@ impl Engine {
                         Some("recheck dispatch failed"),
                     );
                 }
+                let _ = reply.send(result);
+            }
+
+            EngineCmd::PauseJob { job_id, reply } => {
+                let result = self.control_recheck_job(&job_id, JOB_STATE_PAUSED).await;
+                let _ = reply.send(result);
+            }
+
+            EngineCmd::ResumeJob { job_id, reply } => {
+                let result = self.control_recheck_job(&job_id, JOB_STATE_RUNNING).await;
+                let _ = reply.send(result);
+            }
+
+            EngineCmd::CancelJob { job_id, reply } => {
+                let result = self.control_recheck_job(&job_id, JOB_STATE_CANCELLED).await;
                 let _ = reply.send(result);
             }
 
@@ -1109,6 +1153,62 @@ impl Engine {
         }
     }
 
+    async fn control_recheck_job(&self, job_id: &str, target_state: &str) -> CmdResult<()> {
+        let job = {
+            let db = self.db.lock().expect("database mutex poisoned");
+            rt_db::get_job(&db, job_id).map_err(|e| e.to_string())?
+        };
+        if job.kind != JOB_KIND_RECHECK {
+            return Err(format!("job {job_id} is not a recheck job"));
+        }
+        if job.finished_at.is_some()
+            || matches!(
+                job.state.as_str(),
+                JOB_STATE_CANCELLED | "completed" | JOB_STATE_FAILED
+            )
+        {
+            return Err(format!("job {job_id} is already terminal"));
+        }
+        let info_hash = job
+            .affected_torrents
+            .first()
+            .ok_or_else(|| format!("job {job_id} has no target torrent"))?
+            .clone();
+        match target_state {
+            JOB_STATE_PAUSED => {
+                self.send_to_torrent(&info_hash, TorrentCmd::Pause).await?;
+                self.update_job_state(job_id, JOB_STATE_PAUSED, None, Some("recheck job paused"));
+            }
+            JOB_STATE_RUNNING => {
+                self.send_to_torrent(
+                    &info_hash,
+                    TorrentCmd::Recheck {
+                        job_id: Some(job_id.to_owned()),
+                    },
+                )
+                .await?;
+                self.update_job_state(job_id, JOB_STATE_RUNNING, None, Some("recheck job resumed"));
+            }
+            JOB_STATE_CANCELLED => {
+                self.send_to_torrent(
+                    &info_hash,
+                    TorrentCmd::CancelJob {
+                        job_id: job_id.to_owned(),
+                    },
+                )
+                .await?;
+                self.update_job_state(
+                    job_id,
+                    JOB_STATE_CANCELLED,
+                    None,
+                    Some("recheck job cancelled"),
+                );
+            }
+            _ => return Err(format!("unsupported job state {target_state}")),
+        }
+        Ok(())
+    }
+
     async fn ensure_metadata_task(&mut self, info_hash_hex: &str) -> CmdResult<()> {
         if self.torrent_chans.contains_key(info_hash_hex) {
             return Ok(());
@@ -1320,7 +1420,7 @@ impl Engine {
         if state == JOB_STATE_RUNNING && job.started_at.is_none() {
             job.started_at = Some(now);
         }
-        if state == JOB_STATE_FAILED {
+        if matches!(state, JOB_STATE_CANCELLED | JOB_STATE_FAILED) {
             job.finished_at = Some(now);
         }
         let event = rt_db::JobEventRow {
@@ -1735,6 +1835,55 @@ mod tests {
         assert_eq!(events[0].kind, "check_started");
         assert_eq!(events[1].kind, "job_running");
         assert_eq!(events[2].kind, "job_queued");
+    }
+
+    #[tokio::test]
+    async fn recheck_job_control_sends_torrent_commands_and_updates_state() {
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let (_tx, rx) = mpsc::channel(1);
+        let (torrent_tx, mut torrent_rx) = mpsc::channel(4);
+        let info_hash = "c".repeat(40);
+        let mut torrent_chans = HashMap::new();
+        torrent_chans.insert(info_hash.clone(), torrent_tx);
+        let engine = Engine {
+            config: Arc::new(Config::default()),
+            registry: Arc::new(RwLock::new(SessionRegistry::new())),
+            db: Arc::new(Mutex::new(conn)),
+            cmd_rx: rx,
+            cmd_tx: mpsc::channel(1).0,
+            torrent_chans,
+            dht_tx: None,
+        };
+
+        let job_id = engine.create_recheck_job(&info_hash).unwrap();
+        engine
+            .control_recheck_job(&job_id, JOB_STATE_PAUSED)
+            .await
+            .unwrap();
+        assert!(matches!(torrent_rx.recv().await, Some(TorrentCmd::Pause)));
+
+        engine
+            .control_recheck_job(&job_id, JOB_STATE_RUNNING)
+            .await
+            .unwrap();
+        assert!(matches!(
+            torrent_rx.recv().await,
+            Some(TorrentCmd::Recheck { job_id: Some(id) }) if id == job_id
+        ));
+
+        engine
+            .control_recheck_job(&job_id, JOB_STATE_CANCELLED)
+            .await
+            .unwrap();
+        assert!(matches!(
+            torrent_rx.recv().await,
+            Some(TorrentCmd::CancelJob { job_id: id }) if id == job_id
+        ));
+        let db = engine.db.lock().unwrap();
+        let job = rt_db::get_job(&db, &job_id).unwrap();
+        assert_eq!(job.state, JOB_STATE_CANCELLED);
+        assert!(job.finished_at.is_some());
     }
 }
 
