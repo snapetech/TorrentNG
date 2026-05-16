@@ -8,7 +8,7 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose, Engine as _};
-use rt_engine::EngineHandle;
+use rt_engine::{EngineHandle, EngineTorrentMetadata};
 use rt_metainfo::{parse_magnet, parse_torrent};
 use rt_session::SessionRegistry;
 use serde_json::{json, Value};
@@ -298,12 +298,26 @@ async fn torrent_get(state: &AppState, args: &Value) -> Value {
                 .collect()
         });
     let requested = ids(state, args).await;
-    let reg = state.registry.read().await;
-    let torrents = reg
+    let entries = {
+        let reg = state.registry.read().await;
+        reg.iter()
+            .filter(|entry| requested.is_empty() || requested.contains(&entry.info_hash))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let mut metadata = std::collections::HashMap::new();
+    if let Some(engine) = &state.engine {
+        for entry in &entries {
+            if let Ok(meta) = engine.torrent_metadata(entry.info_hash.clone()).await {
+                metadata.insert(entry.info_hash.clone(), meta);
+            }
+        }
+    }
+    let torrents = entries
         .iter()
-        .filter(|entry| requested.is_empty() || requested.contains(&entry.info_hash))
         .enumerate()
         .map(|(idx, entry)| {
+            let meta = metadata.get(&entry.info_hash);
             let mut obj = serde_json::Map::new();
             for field in &fields {
                 let value = match field.as_str() {
@@ -320,6 +334,10 @@ async fn torrent_get(state: &AppState, args: &Value) -> Value {
                     "uploadRatio" | "upload-ratio" => json!(entry.stats.ratio()),
                     "rateDownload" | "rate-download" => json!(0),
                     "rateUpload" | "rate-upload" => json!(0),
+                    "downloadLimit" | "download-limit" => json!(0),
+                    "downloadLimited" | "download-limited" => json!(false),
+                    "uploadLimit" | "upload-limit" => json!(0),
+                    "uploadLimited" | "upload-limited" => json!(false),
                     "status" => json!(transmission_status(entry.state.as_str())),
                     "downloadDir" | "download-dir" => json!(entry.save_path),
                     "labels" => json!(entry.tags),
@@ -330,21 +348,45 @@ async fn torrent_get(state: &AppState, args: &Value) -> Value {
                     "eta" => json!(-1),
                     "isPrivate" | "is-private" => json!(false),
                     "isFinished" | "is-finished" => json!(entry.completed_at.is_some()),
+                    "isStalled" | "is-stalled" => json!(false),
+                    "queuePosition" | "queue-position" => json!(idx),
+                    "recheckProgress" | "recheck-progress" => json!(0.0),
+                    "seedRatioLimit" | "seed-ratio-limit" => json!(-1.0),
+                    "seedRatioMode" | "seed-ratio-mode" => json!(0),
+                    "seedIdleLimit" | "seed-idle-limit" => json!(0),
+                    "seedIdleMode" | "seed-idle-mode" => json!(0),
                     "addedDate" | "added-date" => json!(entry.added_at),
                     "activityDate" | "activity-date" => json!(entry.added_at),
                     "doneDate" | "done-date" => json!(entry.completed_at.unwrap_or(0)),
+                    "startDate" | "start-date" => json!(entry.added_at),
+                    "dateCreated" | "date-created" => json!(entry.added_at),
                     "peers" => json!([]),
                     "peersConnected" | "peers-connected" => json!(0),
                     "peersGettingFromUs" | "peers-getting-from-us" => json!(0),
                     "peersSendingToUs" | "peers-sending-to-us" => json!(0),
-                    "trackers" => json!([]),
-                    "trackerStats" | "tracker-stats" => json!([]),
-                    "files" => json!([]),
-                    "fileStats" | "file-stats" => json!([]),
-                    "priorities" => json!([]),
-                    "wanted" => json!([]),
+                    "trackers" => json!(transmission_trackers(meta)),
+                    "trackerStats" | "tracker-stats" => json!(transmission_tracker_stats(meta)),
+                    "files" => json!(transmission_files(meta)),
+                    "fileStats" | "file-stats" => json!(transmission_file_stats(meta)),
+                    "priorities" => json!(transmission_file_priorities(meta)),
+                    "wanted" => json!(transmission_file_wanted(meta)),
                     "comment" => json!(""),
                     "creator" => json!(""),
+                    "pieceCount" | "piece-count" => json!(meta.map(|m| m.piece_count).unwrap_or(0)),
+                    "pieceSize" | "piece-size" => json!(meta.map(|m| m.piece_length).unwrap_or(0)),
+                    "pieces" => json!(""),
+                    "haveUnchecked" | "have-unchecked" => json!(0),
+                    "haveValid" | "have-valid" => {
+                        json!(entry.total_length.saturating_sub(entry.amount_left))
+                    }
+                    "desiredAvailable" | "desired-available" => json!(0),
+                    "corruptEver" | "corrupt-ever" => json!(0),
+                    "manualAnnounceTime" | "manual-announce-time" => json!(0),
+                    "maxConnectedPeers" | "max-connected-peers" => json!(0),
+                    "webseeds" => json!([]),
+                    "webseedsSendingToUs" | "webseeds-sending-to-us" => json!(0),
+                    "bandwidthPriority" | "bandwidth-priority" => json!(0),
+                    "honorsSessionLimits" | "honors-session-limits" => json!(true),
                     "magnetLink" | "magnet-link" => {
                         json!(format!("magnet:?xt=urn:btih:{}", entry.info_hash))
                     }
@@ -365,6 +407,108 @@ async fn torrent_get(state: &AppState, args: &Value) -> Value {
         })
         .collect::<Vec<_>>();
     json!({ "torrents": torrents })
+}
+
+fn transmission_files(meta: Option<&EngineTorrentMetadata>) -> Vec<Value> {
+    meta.map(|meta| {
+        meta.files
+            .iter()
+            .map(|file| {
+                json!({
+                    "name": file.path,
+                    "length": file.length,
+                    "bytesCompleted": 0,
+                })
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn transmission_file_stats(meta: Option<&EngineTorrentMetadata>) -> Vec<Value> {
+    meta.map(|meta| {
+        meta.files
+            .iter()
+            .map(|_| {
+                json!({
+                    "bytesCompleted": 0,
+                    "wanted": true,
+                    "priority": 0,
+                })
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn transmission_file_priorities(meta: Option<&EngineTorrentMetadata>) -> Vec<i64> {
+    meta.map(|meta| vec![0; meta.files.len()])
+        .unwrap_or_default()
+}
+
+fn transmission_file_wanted(meta: Option<&EngineTorrentMetadata>) -> Vec<bool> {
+    meta.map(|meta| vec![true; meta.files.len()])
+        .unwrap_or_default()
+}
+
+fn transmission_trackers(meta: Option<&EngineTorrentMetadata>) -> Vec<Value> {
+    meta.map(|meta| {
+        meta.trackers
+            .iter()
+            .enumerate()
+            .map(|(id, announce)| {
+                json!({
+                    "id": id,
+                    "announce": announce,
+                    "scrape": "",
+                    "tier": id,
+                })
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn transmission_tracker_stats(meta: Option<&EngineTorrentMetadata>) -> Vec<Value> {
+    meta.map(|meta| {
+        meta.trackers
+            .iter()
+            .enumerate()
+            .map(|(id, announce)| {
+                json!({
+                    "id": id,
+                    "announce": announce,
+                    "host": tracker_host(announce),
+                    "tier": id,
+                    "lastAnnounceSucceeded": false,
+                    "lastAnnounceTime": 0,
+                    "lastAnnounceResult": "",
+                    "nextAnnounceTime": 0,
+                    "lastScrapeSucceeded": false,
+                    "lastScrapeTime": 0,
+                    "lastScrapeResult": "",
+                    "nextScrapeTime": 0,
+                    "seederCount": -1,
+                    "leecherCount": -1,
+                    "downloadCount": -1,
+                    "hasAnnounced": false,
+                    "hasScraped": false,
+                })
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn tracker_host(announce: &str) -> String {
+    announce
+        .split("://")
+        .nth(1)
+        .unwrap_or(announce)
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .to_owned()
 }
 
 async fn torrent_add(state: &AppState, args: &Value) -> Result<Value, String> {
