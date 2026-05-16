@@ -24,3 +24,4 @@ rt-db         = { path = "../rt-db" }
 rt-api-native = { path = "../rt-api-native" }
 rt-api-qbit   = { path = "../rt-api-qbit" }
 rt-api-transmission = { path = "../rt-api-transmission" }
+rt-api-deluge = { path = "../rt-api-deluge" }

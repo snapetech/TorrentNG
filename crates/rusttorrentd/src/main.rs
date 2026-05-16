@@ -4,6 +4,7 @@ use anyhow::Context;
 use tokio::sync::RwLock;
 use tracing::info;
 
+use rt_api_deluge::AppState as DelugeState;
 use rt_api_native::state::AppState as NativeState;
 use rt_api_qbit::state::AppState as QbitState;
 use rt_api_transmission::AppState as TransmissionState;
@@ -53,8 +54,14 @@ async fn main() -> anyhow::Result<()> {
         TransmissionState::with_engine(Arc::clone(&registry), engine_handle.clone());
     let transmission_router = rt_api_transmission::build_transmission_router(transmission_state);
 
+    let deluge_state = DelugeState::with_engine(Arc::clone(&registry), engine_handle.clone());
+    let deluge_router = rt_api_deluge::build_deluge_router(deluge_state);
+
     // Merge into a single axum app
-    let app = native_router.merge(qbit_router).merge(transmission_router);
+    let app = native_router
+        .merge(qbit_router)
+        .merge(transmission_router)
+        .merge(deluge_router);
 
     let api_addr: std::net::SocketAddr = config
         .daemon

@@ -1235,6 +1235,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "rt-api-deluge"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64",
+ "rt-engine",
+ "rt-metainfo",
+ "rt-session",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower 0.4.13",
+ "tracing",
+]
+
+[[package]]
 name = "rt-api-model"
 version = "0.1.0"
 dependencies = [
@@ -1616,6 +1632,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "rt-api-deluge",
  "rt-api-native",
  "rt-api-qbit",
  "rt-api-transmission",
