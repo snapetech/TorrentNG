@@ -23,6 +23,20 @@ use crate::dht_task::{run_dht, DhtCommand, DhtTorrent};
 use crate::metadata_task::run_metadata_task;
 use crate::torrent_task::{TorrentCmd, TorrentTask};
 
+const EVENT_ENGINE_STARTED: &str = "engine_started";
+const EVENT_TORRENT_ADDED: &str = "torrent_added";
+const EVENT_MAGNET_ADDED: &str = "magnet_added";
+const EVENT_METADATA_RESOLVED: &str = "metadata_resolved";
+const EVENT_TORRENT_RESTORED: &str = "torrent_restored";
+const EVENT_TORRENT_REMOVED: &str = "torrent_removed";
+const EVENT_TORRENT_PAUSED: &str = "torrent_paused";
+const EVENT_TORRENT_RESUMED: &str = "torrent_resumed";
+const EVENT_RECHECK_REQUESTED: &str = "check_requested";
+const EVENT_REANNOUNCE_REQUESTED: &str = "tracker_reannounce_requested";
+const EVENT_LABELS_UPDATED: &str = "labels_updated";
+const EVENT_FIELDS_UPDATED: &str = "torrent_fields_updated";
+const EVENT_ENGINE_STOPPED: &str = "engine_stopped";
+
 /// Handle given to the API layer. Clone freely; all sends are channel-based.
 #[derive(Clone)]
 pub struct EngineHandle {
@@ -244,6 +258,15 @@ impl Engine {
             torrent_chans: HashMap::new(),
             dht_tx: dht_shutdown,
         };
+        engine.append_session_event(
+            None,
+            EVENT_ENGINE_STARTED,
+            Some("native engine started"),
+            serde_json::json!({
+                "listen_port": config.network.listen_port,
+                "dht_enabled": config.dht.enabled,
+            }),
+        );
         engine.load_persisted_torrents().await?;
 
         // Spawn TCP listener
@@ -284,6 +307,12 @@ impl Engine {
         if let Some(tx) = self.dht_tx.take() {
             let _ = tx.send(DhtCommand::Shutdown).await;
         }
+        self.append_session_event(
+            None,
+            EVENT_ENGINE_STOPPED,
+            Some("native engine stopped"),
+            serde_json::json!({}),
+        );
         info!("engine shut down");
     }
 
@@ -347,6 +376,12 @@ impl Engine {
                                 warn!(torrent = %info_hash, err = %e, "failed to delete persisted torrent");
                             }
                             self.unregister_dht_torrent(&info_hash).await;
+                            self.append_session_event(
+                                Some(&info_hash),
+                                EVENT_TORRENT_REMOVED,
+                                Some("torrent removed"),
+                                serde_json::json!({ "delete_files": delete_files }),
+                            );
                             Ok(())
                         }
                         Err(e) => Err(e.to_string()),
@@ -362,6 +397,12 @@ impl Engine {
                 let result = self.send_to_torrent(&info_hash, TorrentCmd::Pause).await;
                 if result.is_ok() {
                     self.set_metadata_placeholder_state(&info_hash, TorrentState::Paused);
+                    self.append_session_event(
+                        Some(&info_hash),
+                        EVENT_TORRENT_PAUSED,
+                        Some("torrent paused"),
+                        serde_json::json!({}),
+                    );
                 }
                 let _ = reply.send(result);
             }
@@ -382,12 +423,26 @@ impl Engine {
                     self.set_metadata_placeholder_state(&info_hash, TorrentState::MetadataPending);
                     self.register_dht_torrent_from_storage_or_hash(&info_hash)
                         .await;
+                    self.append_session_event(
+                        Some(&info_hash),
+                        EVENT_TORRENT_RESUMED,
+                        Some("torrent resumed"),
+                        serde_json::json!({}),
+                    );
                 }
                 let _ = reply.send(result);
             }
 
             EngineCmd::RecheckTorrent { info_hash, reply } => {
                 let result = self.send_to_torrent(&info_hash, TorrentCmd::Recheck).await;
+                if result.is_ok() {
+                    self.append_session_event(
+                        Some(&info_hash),
+                        EVENT_RECHECK_REQUESTED,
+                        Some("torrent recheck requested"),
+                        serde_json::json!({}),
+                    );
+                }
                 let _ = reply.send(result);
             }
 
@@ -395,6 +450,14 @@ impl Engine {
                 let result = self
                     .send_to_torrent(&info_hash, TorrentCmd::Reannounce)
                     .await;
+                if result.is_ok() {
+                    self.append_session_event(
+                        Some(&info_hash),
+                        EVENT_REANNOUNCE_REQUESTED,
+                        Some("tracker reannounce requested"),
+                        serde_json::json!({}),
+                    );
+                }
                 let _ = reply.send(result);
             }
 
@@ -492,12 +555,23 @@ impl Engine {
 
         let is_private = v1.private;
         let info_hash = v1.info_hash;
+        let torrent_name = v1.name.clone();
         let cmd_tx = self.spawn_torrent_task(v1, save, paused);
 
         self.torrent_chans.insert(info_hash_hex.clone(), cmd_tx);
         if !paused && !is_private {
             self.register_dht_torrent(info_hash, &info_hash_hex).await;
         }
+        self.append_session_event(
+            Some(&info_hash_hex),
+            EVENT_TORRENT_ADDED,
+            Some("torrent added"),
+            serde_json::json!({
+                "paused": paused,
+                "private": is_private,
+                "name": torrent_name,
+            }),
+        );
         info!(torrent = %info_hash_hex, paused, "torrent added");
         Ok(info_hash_hex)
     }
@@ -577,6 +651,15 @@ impl Engine {
         if !paused {
             self.register_dht_torrent(info_hash, &info_hash_hex).await;
         }
+        self.append_session_event(
+            Some(&info_hash_hex),
+            EVENT_MAGNET_ADDED,
+            Some("magnet added as metadata pending"),
+            serde_json::json!({
+                "paused": paused,
+                "trackers": magnet.trackers,
+            }),
+        );
         info!(torrent = %info_hash_hex, paused, "magnet added as metadata pending");
         Ok(info_hash_hex)
     }
@@ -633,11 +716,23 @@ impl Engine {
         }
         let is_private = meta.private;
         let info_hash = meta.info_hash;
+        let torrent_name = meta.name.clone();
+        let total_length = meta.total_length();
         let tx = self.spawn_torrent_task(meta, save, false);
         self.torrent_chans.insert(info_hash_hex.to_owned(), tx);
         if !is_private {
             self.register_dht_torrent(info_hash, info_hash_hex).await;
         }
+        self.append_session_event(
+            Some(info_hash_hex),
+            EVENT_METADATA_RESOLVED,
+            Some("magnet metadata resolved"),
+            serde_json::json!({
+                "name": torrent_name,
+                "total_length": total_length,
+                "private": is_private,
+            }),
+        );
         info!(torrent = %info_hash_hex, "magnet metadata completed");
         Ok(())
     }
@@ -716,6 +811,15 @@ impl Engine {
                     if !paused {
                         self.register_dht_torrent(info_hash, &row.info_hash).await;
                     }
+                    self.append_session_event(
+                        Some(&row.info_hash),
+                        EVENT_TORRENT_RESTORED,
+                        Some("metadata-pending torrent restored"),
+                        serde_json::json!({
+                            "state": row.state,
+                            "metadata_pending": true,
+                        }),
+                    );
                 }
                 continue;
             }
@@ -775,6 +879,15 @@ impl Engine {
             if !paused && !is_private {
                 self.register_dht_torrent(info_hash, &row.info_hash).await;
             }
+            self.append_session_event(
+                Some(&row.info_hash),
+                EVENT_TORRENT_RESTORED,
+                Some("torrent restored from database"),
+                serde_json::json!({
+                    "state": row.state,
+                    "private": is_private,
+                }),
+            );
             info!(torrent = %row.info_hash, state = %row.state, paused, "restored persisted torrent");
         }
         Ok(())
@@ -900,6 +1013,16 @@ impl Engine {
 
         let db = self.db.lock().expect("database mutex poisoned");
         rt_db::upsert(&db, &row).map_err(|e| e.to_string())?;
+        drop(db);
+        self.append_session_event(
+            Some(info_hash),
+            EVENT_LABELS_UPDATED,
+            Some("torrent labels updated"),
+            serde_json::json!({
+                "category": row.category,
+                "tags": row.tags,
+            }),
+        );
         Ok(())
     }
 
@@ -935,6 +1058,16 @@ impl Engine {
 
         let db = self.db.lock().expect("database mutex poisoned");
         rt_db::upsert(&db, &row).map_err(|e| e.to_string())?;
+        drop(db);
+        self.append_session_event(
+            Some(info_hash),
+            EVENT_FIELDS_UPDATED,
+            Some("torrent fields updated"),
+            serde_json::json!({
+                "name": row.name,
+                "save_path": row.save_path,
+            }),
+        );
         Ok(())
     }
 
@@ -1067,6 +1200,27 @@ impl Engine {
         };
         let _ = dht_tx.send(DhtCommand::RemoveTorrent(info_hash)).await;
     }
+
+    fn append_session_event(
+        &self,
+        info_hash: Option<&str>,
+        kind: &str,
+        message: Option<&str>,
+        payload: serde_json::Value,
+    ) {
+        let event = rt_db::SessionEventRow {
+            event_id: None,
+            occurred_at: unix_now_i64(),
+            info_hash: info_hash.map(str::to_owned),
+            kind: kind.to_owned(),
+            message: message.map(str::to_owned),
+            payload: payload.to_string(),
+        };
+        let db = self.db.lock().expect("database mutex poisoned");
+        if let Err(e) = rt_db::append_session_event(&db, &event) {
+            warn!(kind, err = %e, "failed to append session event");
+        }
+    }
 }
 
 pub(crate) fn row_from_entry(entry: &TorrentEntry, meta: &TorrentMetaV1) -> TorrentRow {
@@ -1158,6 +1312,13 @@ fn parse_info_hash_hex(info_hash: &str) -> Result<[u8; 20], ()> {
         out[idx] = u8::from_str_radix(hex, 16).map_err(|_| ())?;
     }
     Ok(out)
+}
+
+fn unix_now_i64() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 fn normalize_category(category: Option<String>) -> Option<String> {
@@ -1381,6 +1542,36 @@ mod tests {
             ]),
             vec!["hd".to_owned(), "archive".to_owned()]
         );
+    }
+
+    #[test]
+    fn append_session_event_persists_payload() {
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let (_tx, rx) = mpsc::channel(1);
+        let engine = Engine {
+            config: Arc::new(Config::default()),
+            registry: Arc::new(RwLock::new(SessionRegistry::new())),
+            db: Arc::new(Mutex::new(conn)),
+            cmd_rx: rx,
+            cmd_tx: mpsc::channel(1).0,
+            torrent_chans: HashMap::new(),
+            dht_tx: None,
+        };
+
+        engine.append_session_event(
+            Some(&"a".repeat(40)),
+            EVENT_TORRENT_ADDED,
+            Some("torrent added"),
+            serde_json::json!({"paused": false}),
+        );
+
+        let db = engine.db.lock().unwrap();
+        let events = rt_db::list_session_events(&db, Some(&"a".repeat(40)), 10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, EVENT_TORRENT_ADDED);
+        assert_eq!(events[0].message.as_deref(), Some("torrent added"));
+        assert!(events[0].payload.contains("\"paused\":false"));
     }
 }
 
