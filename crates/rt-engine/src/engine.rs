@@ -1934,15 +1934,33 @@ impl Engine {
                 return Err(format!("torrent {info_hash} not found"));
             }
         }
+        if self.is_taskless_pure_v2_torrent(info_hash) {
+            self.append_session_event(
+                Some(info_hash),
+                "peers_add_skipped",
+                Some("peer add skipped for taskless pure v2 torrent"),
+                serde_json::json!({
+                    "peer_count": peers.len(),
+                    "v2_only": true,
+                    "skipped": true,
+                }),
+            );
+            return Ok(());
+        }
         self.send_to_torrent(info_hash, TorrentCmd::NewPeers(peers))
             .await
     }
 
     async fn torrent_peers_inner(&self, info_hash: &str) -> CmdResult<Vec<EnginePeerSnapshot>> {
-        let tx = self
-            .torrent_chans
-            .get(info_hash)
-            .ok_or_else(|| format!("torrent {info_hash} not found"))?;
+        let tx = self.torrent_chans.get(info_hash).cloned();
+        let Some(tx) = tx else {
+            let reg = self.registry.read().await;
+            return if reg.get(info_hash).is_some() {
+                Ok(Vec::new())
+            } else {
+                Err(format!("torrent {info_hash} not found"))
+            };
+        };
         let (reply, rx) = tokio::sync::oneshot::channel();
         tx.send(TorrentCmd::GetPeers { reply })
             .await
@@ -2214,6 +2232,7 @@ impl Engine {
                 .ok_or_else(|| format!("torrent {info_hash} not found"))?;
             (entry.state, entry.amount_left)
         };
+        let taskless_v2 = self.is_taskless_pure_v2_torrent(info_hash);
         let (is_private, trackers, active_jobs) = {
             let db = self.db.lock().expect("database mutex poisoned");
             let row = rt_db::get(&db, info_hash).map_err(|e| e.to_string())?;
@@ -2238,10 +2257,18 @@ impl Engine {
         if state == TorrentState::Seeding && bytes_left == 0 {
             reasons.push("torrent is already seeding".to_owned());
         } else {
+            if taskless_v2 {
+                reasons.push(
+                    "pure v2 torrent has metadata but no active v2 peer transfer task".to_owned(),
+                );
+                next_actions.push("recheck local files or wait for v2 transfer support".to_owned());
+            }
             match state {
                 TorrentState::Paused | TorrentState::Stopped => {
                     reasons.push("torrent is paused or stopped".to_owned());
-                    next_actions.push("resume the torrent".to_owned());
+                    if !taskless_v2 {
+                        next_actions.push("resume the torrent".to_owned());
+                    }
                 }
                 TorrentState::Checking => {
                     reasons.push("torrent is currently checking pieces".to_owned());
@@ -3633,6 +3660,21 @@ mod tests {
         assert_eq!(projected.files[0].path, "renamed/data.bin");
         assert_eq!(projected.files[0].priority, 0);
         assert!(!projected.files[0].wanted);
+
+        engine
+            .add_peers_inner(&hash, vec!["127.0.0.1:6881".parse::<SocketAddr>().unwrap()])
+            .await
+            .unwrap();
+        assert!(engine.torrent_peers_inner(&hash).await.unwrap().is_empty());
+        let diagnostic = engine.diagnose_torrent_inner(&hash).await.unwrap();
+        assert!(diagnostic
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("pure v2 torrent has metadata")));
+        assert!(diagnostic
+            .next_actions
+            .iter()
+            .any(|action| action.contains("v2 transfer support")));
 
         let (reply, rx) = tokio::sync::oneshot::channel();
         assert!(
