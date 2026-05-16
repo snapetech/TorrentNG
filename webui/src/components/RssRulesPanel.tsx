@@ -79,7 +79,7 @@ export function RssRulesPanel() {
 
   return (
     <section style={{ padding: '18px 24px' }}>
-      <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 12, color: '#e2e8f0' }}>
+      <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 12, color: 'var(--text)' }}>
         RSS Rules
       </div>
       <div style={{ display: 'grid', gridTemplateColumns: '130px 1fr 130px 120px 120px auto', gap: 8, maxWidth: 1080, marginBottom: 8 }}>
@@ -95,7 +95,7 @@ export function RssRulesPanel() {
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 180px 180px auto', gap: 8, maxWidth: 1080, marginBottom: 12 }}>
         <Input value={draft.save_path ?? ''} placeholder="Save path" onChange={save_path => setDraft({ ...draft, save_path })} />
         <Input value={draft.tags.join(',')} placeholder="Tags" onChange={tags => setDraft({ ...draft, tags: tags.split(',') })} />
-        <label style={{ display: 'flex', alignItems: 'center', gap: 6, color: '#94a3b8', fontSize: 12 }}>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--muted)', fontSize: 12 }}>
           <input type="checkbox" checked={draft.start} onChange={e => setDraft({ ...draft, start: e.target.checked })} />
           Start
         </label>
@@ -106,20 +106,20 @@ export function RssRulesPanel() {
         {rules.map(rule => (
           <div key={rule.id} style={{
             display: 'grid', gridTemplateColumns: '140px 1fr 120px 120px 120px auto',
-            gap: 8, alignItems: 'center', border: '1px solid #1e2433',
-            borderRadius: 6, padding: '9px 12px', background: '#111827', fontSize: 12,
+            gap: 8, alignItems: 'center', border: '1px solid var(--border)',
+            borderRadius: 6, padding: '9px 12px', background: 'var(--surface)', fontSize: 12,
           }}>
-            <strong style={{ color: '#cbd5e1' }}>{rule.name}</strong>
-            <span style={{ color: '#64748b', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{rule.feed_url}</span>
-            <span style={{ color: '#94a3b8' }}>{rule.include}</span>
-            <span style={{ color: '#64748b' }}>{rule.category || 'no category'}</span>
-            <span style={{ color: rule.enabled ? '#22c55e' : '#64748b' }}>{rule.enabled ? 'enabled' : 'disabled'}</span>
+            <strong style={{ color: 'var(--text)' }}>{rule.name}</strong>
+            <span style={{ color: 'var(--faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{rule.feed_url}</span>
+            <span style={{ color: 'var(--muted)' }}>{rule.include}</span>
+            <span style={{ color: 'var(--faint)' }}>{rule.category || 'no category'}</span>
+            <span style={{ color: rule.enabled ? '#22c55e' : 'var(--faint)' }}>{rule.enabled ? 'enabled' : 'disabled'}</span>
             <button onClick={() => remove(rule.id)} style={ghostButtonStyle}>Delete</button>
           </div>
         ))}
       </div>
 
-      <div style={{ fontSize: 13, fontWeight: 600, marginTop: 20, marginBottom: 10, color: '#e2e8f0' }}>
+      <div style={{ fontSize: 13, fontWeight: 600, marginTop: 20, marginBottom: 10, color: 'var(--text)' }}>
         Match Test
       </div>
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr auto auto auto', gap: 8, maxWidth: 1080, marginBottom: 8 }}>
@@ -129,10 +129,10 @@ export function RssRulesPanel() {
         <button onClick={() => apply(true)} disabled={!sampleTitle.trim() || !sampleLink.trim()} style={buttonStyle}>Preview</button>
         <button onClick={() => apply(false)} disabled={!sampleTitle.trim() || !sampleLink.trim()} style={buttonStyle}>Apply</button>
       </div>
-      {applyResult && <div style={{ color: '#94a3b8', fontSize: 12, marginBottom: 8 }}>{applyResult}</div>}
+      {applyResult && <div style={{ color: 'var(--muted)', fontSize: 12, marginBottom: 8 }}>{applyResult}</div>}
       <div style={{ display: 'grid', gap: 6, maxWidth: 1080 }}>
         {matches.map(match => (
-          <div key={match.rule_id} style={{ color: match.matched ? '#22c55e' : '#64748b', fontSize: 12 }}>
+          <div key={match.rule_id} style={{ color: match.matched ? '#22c55e' : 'var(--faint)', fontSize: 12 }}>
             {match.rule_name}: {match.reason}
           </div>
         ))}
@@ -142,18 +142,18 @@ export function RssRulesPanel() {
 }
 
 const buttonStyle = {
-  background: '#1e3a5f', border: '1px solid #3b82f6', borderRadius: 5,
-  color: '#93c5fd', padding: '4px 10px', fontSize: 12, cursor: 'pointer',
+  background: 'var(--accent-soft)', border: '1px solid var(--accent)', borderRadius: 5,
+  color: 'var(--accent-text)', padding: '4px 10px', fontSize: 12, cursor: 'pointer',
 }
 
 const ghostButtonStyle = {
-  background: 'none', border: '1px solid #334155', borderRadius: 4,
-  color: '#64748b', padding: '3px 8px', fontSize: 11, cursor: 'pointer',
+  background: 'none', border: '1px solid var(--border-strong)', borderRadius: 4,
+  color: 'var(--faint)', padding: '3px 8px', fontSize: 11, cursor: 'pointer',
 }
 
 function Input({ value, placeholder, onChange }: { value: string; placeholder: string; onChange: (value: string) => void }) {
   return <input value={value} placeholder={placeholder} onChange={e => onChange(e.target.value)} style={{
-    minWidth: 0, background: '#0f1117', border: '1px solid #334155',
-    borderRadius: 5, color: '#cbd5e1', padding: '4px 8px', fontSize: 12,
+    minWidth: 0, background: 'var(--bg)', border: '1px solid var(--border-strong)',
+    borderRadius: 5, color: 'var(--text)', padding: '4px 8px', fontSize: 12,
   }} />
 }

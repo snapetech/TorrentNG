@@ -116,9 +116,7 @@ async fn rpc(
             }
             Ok(json!({}))
         }
-        "torrent-rename-path" => Ok(
-            json!({ "path": args.get("path").cloned().unwrap_or(Value::Null), "name": args.get("name").cloned().unwrap_or(Value::Null) }),
-        ),
+        "torrent-rename-path" => torrent_rename_path(&state, &args).await,
         "torrent-start" | "torrent-start-now" => {
             for hash in ids(&state, &args).await {
                 if let Some(engine) = &state.engine {
@@ -294,6 +292,38 @@ async fn transmission_queue_move(
     };
     engine.update_queue_order(hashes, queue_move).await?;
     Ok(json!({}))
+}
+
+async fn torrent_rename_path(state: &AppState, args: &Value) -> Result<Value, String> {
+    let Some(path) = args.get("path").and_then(Value::as_str) else {
+        return Err("missing path".to_owned());
+    };
+    let Some(name) = args.get("name").and_then(Value::as_str) else {
+        return Err("missing name".to_owned());
+    };
+    let hashes = ids(state, args).await;
+    let Some(engine) = &state.engine else {
+        return Ok(json!({ "path": path, "name": name }));
+    };
+    for hash in hashes {
+        let meta = engine.torrent_metadata(hash.clone()).await?;
+        if let Some(file) = meta.files.iter().find(|file| file.path == path) {
+            let new_path = renamed_file_path(path, name);
+            engine.rename_file_path(hash, file.index, new_path).await?;
+        } else {
+            engine
+                .rename_folder_path(hash, path.to_owned(), name.to_owned())
+                .await?;
+        }
+    }
+    Ok(json!({ "path": path, "name": name }))
+}
+
+fn renamed_file_path(path: &str, name: &str) -> String {
+    match path.rsplit_once('/') {
+        Some((parent, _)) if !parent.is_empty() => format!("{parent}/{name}"),
+        _ => name.to_owned(),
+    }
 }
 
 fn file_ids_arg(args: &Value, key: &str) -> Vec<u32> {
@@ -968,5 +998,11 @@ mod tests {
             let body: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(body["result"], "success", "{method}");
         }
+    }
+
+    #[test]
+    fn renamed_file_path_preserves_parent_directory() {
+        assert_eq!(renamed_file_path("dir/old.bin", "new.bin"), "dir/new.bin");
+        assert_eq!(renamed_file_path("old.bin", "new.bin"), "new.bin");
     }
 }
