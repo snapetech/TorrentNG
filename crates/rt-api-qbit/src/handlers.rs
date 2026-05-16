@@ -1,6 +1,6 @@
 use axum::{
     extract::{Multipart, Query, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     response::IntoResponse,
     Json,
 };
@@ -95,6 +95,10 @@ pub async fn app_set_preferences() -> impl IntoResponse {
 }
 
 pub async fn app_shutdown() -> impl IntoResponse {
+    StatusCode::OK
+}
+
+pub async fn app_send_test_email() -> impl IntoResponse {
     StatusCode::OK
 }
 
@@ -487,6 +491,11 @@ pub struct HashQuery {
     pub hash: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct HashesQuery {
+    pub hashes: Option<String>,
+}
+
 /// `GET /api/qb/v2/torrents/trackers`.
 pub async fn torrents_trackers(
     State(state): State<AppState>,
@@ -494,6 +503,10 @@ pub async fn torrents_trackers(
 ) -> impl IntoResponse {
     let Some(hash) = q.hash else {
         return (StatusCode::BAD_REQUEST, Json(Vec::<QbTrackerInfo>::new()));
+    };
+    let exists = {
+        let reg = state.registry.read().await;
+        reg.get(&hash).is_some()
     };
     let Some(engine) = &state.engine else {
         return (StatusCode::OK, Json(Vec::<QbTrackerInfo>::new()));
@@ -517,6 +530,7 @@ pub async fn torrents_trackers(
                 .collect();
             (StatusCode::OK, Json(trackers))
         }
+        Err(_) if exists => (StatusCode::OK, Json(Vec::<QbTrackerInfo>::new())),
         Err(_) => (StatusCode::NOT_FOUND, Json(Vec::<QbTrackerInfo>::new())),
     }
 }
@@ -549,6 +563,10 @@ pub async fn torrents_files(
     let Some(hash) = q.hash else {
         return (StatusCode::BAD_REQUEST, Json(Vec::<QbFileInfo>::new()));
     };
+    let exists = {
+        let reg = state.registry.read().await;
+        reg.get(&hash).is_some()
+    };
     let Some(engine) = &state.engine else {
         return (StatusCode::OK, Json(Vec::<QbFileInfo>::new()));
     };
@@ -567,6 +585,7 @@ pub async fn torrents_files(
                 .collect();
             (StatusCode::OK, Json(files))
         }
+        Err(_) if exists => (StatusCode::OK, Json(Vec::<QbFileInfo>::new())),
         Err(_) => (StatusCode::NOT_FOUND, Json(Vec::<QbFileInfo>::new())),
     }
 }
@@ -588,7 +607,11 @@ pub async fn torrents_piece_hashes() -> impl IntoResponse {
 
 /// `GET /api/qb/v2/torrents/export`.
 pub async fn torrents_export() -> impl IntoResponse {
-    StatusCode::NOT_FOUND
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/x-bittorrent")],
+        Vec::<u8>::new(),
+    )
 }
 
 /// `GET /api/qb/v2/torrents/properties`.
@@ -1045,13 +1068,19 @@ pub async fn torrents_set_upload_limit() -> impl IntoResponse {
 }
 
 /// `GET /api/qb/v2/torrents/downloadLimit`.
-pub async fn torrents_download_limit() -> impl IntoResponse {
-    (StatusCode::OK, Json(serde_json::json!({})))
+pub async fn torrents_download_limit(
+    State(state): State<AppState>,
+    Query(q): Query<HashesQuery>,
+) -> impl IntoResponse {
+    torrent_limit_map(&state, q.hashes).await
 }
 
 /// `GET /api/qb/v2/torrents/uploadLimit`.
-pub async fn torrents_upload_limit() -> impl IntoResponse {
-    (StatusCode::OK, Json(serde_json::json!({})))
+pub async fn torrents_upload_limit(
+    State(state): State<AppState>,
+    Query(q): Query<HashesQuery>,
+) -> impl IntoResponse {
+    torrent_limit_map(&state, q.hashes).await
 }
 
 /// `POST /api/qb/v2/torrents/setShareLimits`.
@@ -1369,6 +1398,24 @@ fn default_torrent_properties(save_path: String) -> QbTorrentProperties {
         up_speed_avg: 0,
         up_speed: 0,
     }
+}
+
+async fn torrent_limit_map(
+    state: &AppState,
+    hashes: Option<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let requested = hashes
+        .as_deref()
+        .map(extract_hashes_from_str)
+        .unwrap_or_default();
+    let hashes = resolve_hashes(state, requested).await;
+    let reg = state.registry.read().await;
+    let limits = reg
+        .iter()
+        .filter(|entry| hashes.is_empty() || hashes.contains(&entry.info_hash))
+        .map(|entry| (entry.info_hash.clone(), serde_json::json!(0)))
+        .collect::<serde_json::Map<_, _>>();
+    (StatusCode::OK, Json(serde_json::Value::Object(limits)))
 }
 
 fn extract_hashes_from_str(s: &str) -> Vec<String> {
@@ -2040,6 +2087,7 @@ mod tests {
         for path in [
             "/api/v2/app/version",
             "/api/qb/v2/auth/logout",
+            "/api/qb/v2/app/sendTestEmail",
             "/api/qb/v2/torrents/start",
             "/api/qb/v2/torrents/stop",
             "/api/qb/v2/torrents/filePrio",
@@ -2084,6 +2132,7 @@ mod tests {
             "/api/qb/v2/torrents/webseeds",
             "/api/qb/v2/torrents/pieceStates",
             "/api/qb/v2/torrents/pieceHashes",
+            "/api/qb/v2/torrents/export",
             "/api/qb/v2/torrents/downloadLimit",
             "/api/qb/v2/torrents/uploadLimit",
             "/api/qb/v2/sync/torrentPeers",
@@ -2100,6 +2149,26 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn qbit_detail_endpoints_are_compatible_without_engine_metadata() {
+        let hash = "d".repeat(40);
+        let app = build_qbit_router(make_state_with(&hash).await);
+        for path in [
+            format!("/api/qb/v2/torrents/files?hash={hash}"),
+            format!("/api/qb/v2/torrents/trackers?hash={hash}"),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body, serde_json::json!([]));
         }
     }
 
@@ -2137,7 +2206,8 @@ mod tests {
 
     #[tokio::test]
     async fn transfer_limit_endpoints_are_qbit_compatible_noops() {
-        let app = build_qbit_router(AppState::new());
+        let hash = "e".repeat(40);
+        let app = build_qbit_router(make_state_with(&hash).await);
         let resp = app
             .clone()
             .oneshot(
@@ -2151,6 +2221,21 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
         assert_eq!(std::str::from_utf8(&body).unwrap(), "0");
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/qb/v2/torrents/downloadLimit?hashes={hash}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let limits: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(limits[hash], 0);
 
         let resp = app
             .oneshot(

@@ -22,6 +22,10 @@ fn qbit_routes() -> Router<AppState> {
         .route("/app/preferences", get(app_preferences))
         .route("/app/setPreferences", post(app_set_preferences))
         .route("/app/shutdown", post(app_shutdown))
+        .route(
+            "/app/sendTestEmail",
+            get(app_send_test_email).post(app_send_test_email),
+        )
         .route("/app/networkInterfaceList", get(app_network_interface_list))
         .route(
             "/app/networkInterfaceAddressList",
