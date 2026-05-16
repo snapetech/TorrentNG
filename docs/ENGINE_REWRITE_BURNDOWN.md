@@ -94,9 +94,9 @@ This is the working checklist for finishing the native Rust engine rewrite. It i
 ## 9. Scale Certification
 
 - [x] Generate synthetic 1k, 5k, 10k, 15k, 50k datasets.
-- [ ] Cold-start benchmark with DB load and API readiness.
+- [x] Cold-start benchmark with DB load and API readiness.
 - [ ] Idle memory benchmark at 15k torrents.
-- [ ] API list/filter/sort latency benchmark.
+- [x] API list/filter/sort latency benchmark.
 - [ ] Tracker restart storm benchmark.
 - [ ] Recheck-vs-seeding starvation benchmark.
 - [ ] Publish certification report.

@@ -8,6 +8,7 @@
 ///   - 10k torrents: GET /api/v1/torrents < 200ms
 ///   - 15k torrents: GET /api/v1/torrents < 500ms
 ///   - 50k torrents: GET /api/qb/v2/torrents/info < 500ms
+///   - native filter/sort over 15k torrents < 250ms
 ///   - sync/maindata delta < 50ms (at normal churn)
 use std::time::Instant;
 
@@ -90,6 +91,36 @@ async fn list_15k_torrents_under_500ms() {
     let ms = get_ms(app, "/api/v1/torrents").await;
     let limit = threshold(500);
     assert!(ms < limit, "15k list took {ms}ms, want <{limit}ms");
+}
+
+#[tokio::test]
+async fn cold_db_load_15k_under_120s() {
+    let dataset = rt_testkit::SyntheticTorrentDataset::new(15_000);
+    let conn = rt_testkit::memory_db().unwrap();
+
+    let t0 = Instant::now();
+    dataset.write_to_db(&conn).unwrap();
+    let rows = rt_db::list_all(&conn).unwrap();
+    let ms = t0.elapsed().as_millis();
+
+    assert_eq!(rows.len(), 15_000);
+    let limit = threshold(120_000);
+    assert!(ms < limit, "15k cold DB load took {ms}ms, want <{limit}ms");
+}
+
+#[tokio::test]
+async fn native_filter_sort_15k_under_250ms() {
+    let app = native_app_with(15_000).await;
+    let ms = get_ms(
+        app,
+        "/api/v1/torrents?filter=all&sort=name&reverse=true&limit=200&offset=2000",
+    )
+    .await;
+    let limit = threshold(250);
+    assert!(
+        ms < limit,
+        "15k native filter/sort took {ms}ms, want <{limit}ms"
+    );
 }
 
 #[tokio::test]
