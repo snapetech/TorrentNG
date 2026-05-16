@@ -247,11 +247,11 @@ export function TorrentTable({
       {/* Header */}
       <div style={{
         display: 'grid', gridTemplateColumns: gridTemplate, gap: '0 8px',
-        padding: '0 12px', height: 32, alignItems: 'center',
-        background: '#1e2433', borderBottom: '1px solid #2d3748',
-        fontSize: 11, fontWeight: 600, color: '#94a3b8',
+        padding: '0 96px 0 12px', height: 32, alignItems: 'center',
+        background: 'var(--table-head)', borderBottom: '1px solid var(--border-strong)',
+        fontSize: 11, fontWeight: 600, color: 'var(--muted)',
         letterSpacing: '0.05em', textTransform: 'uppercase',
-        flexShrink: 0, userSelect: 'none',
+        flexShrink: 0, userSelect: 'none', position: 'relative',
       }}>
         {/* Select-all checkbox */}
         <input
@@ -262,7 +262,7 @@ export function TorrentTable({
             ? onSelectAll([])
             : onSelectAll(torrents.map(t => t.hash))
           }
-          style={{ accentColor: '#3b82f6', cursor: 'pointer' }}
+          style={{ accentColor: 'var(--accent)', cursor: 'pointer' }}
         />
         {visibleCols.slice(1).map(col => (
           <span
@@ -270,7 +270,7 @@ export function TorrentTable({
             onClick={() => col.sortKey && onSort(col.sortKey)}
             style={{
               cursor: col.sortKey ? 'pointer' : 'default',
-              color: col.sortKey === activeSort ? '#93c5fd' : '#94a3b8',
+              color: col.sortKey === activeSort ? 'var(--accent-text)' : 'var(--muted)',
               display: 'flex', alignItems: 'center', gap: 3,
             }}
           >
@@ -284,8 +284,8 @@ export function TorrentTable({
           onClick={() => setColumnsOpen(open => !open)}
           title="Choose table columns"
           style={{
-            position: 'absolute', right: 8, top: 5, background: '#111827',
-            border: '1px solid #334155', borderRadius: 4, color: '#94a3b8',
+            position: 'absolute', right: 8, top: 5, background: 'var(--surface)',
+            border: '1px solid var(--border-strong)', borderRadius: 4, color: 'var(--muted)',
             fontSize: 11, padding: '2px 7px', cursor: 'pointer',
           }}
         >
@@ -294,28 +294,28 @@ export function TorrentTable({
         {columnsOpen && (
           <div style={{
             position: 'absolute', right: 8, top: 30, zIndex: 20, width: 210,
-            background: '#0f141d', border: '1px solid #334155', borderRadius: 6,
-            boxShadow: '0 18px 40px rgba(0,0,0,0.45)', padding: 8,
+            background: 'var(--panel)', border: '1px solid var(--border-strong)', borderRadius: 6,
+            boxShadow: '0 18px 40px var(--shadow)', padding: 8,
             textTransform: 'none', letterSpacing: 0, fontWeight: 400,
           }}>
-            <div style={{ color: '#64748b', fontSize: 11, margin: '2px 4px 7px' }}>Visible columns</div>
+            <div style={{ color: 'var(--faint)', fontSize: 11, margin: '2px 4px 7px' }}>Visible columns</div>
             {COLS.filter(col => !col.required).map(col => (
               <label key={col.key} style={{
-                display: 'flex', alignItems: 'center', gap: 8, color: '#cbd5e1',
+                display: 'flex', alignItems: 'center', gap: 8, color: 'var(--text)',
                 fontSize: 12, padding: '4px 3px', cursor: 'pointer',
               }}>
                 <input
                   type="checkbox"
                   checked={visibleKeys.includes(col.key)}
                   onChange={e => setColumnVisible(col.key, e.target.checked)}
-                  style={{ accentColor: '#3b82f6' }}
+                  style={{ accentColor: 'var(--accent)' }}
                 />
                 {col.label || col.key}
               </label>
             ))}
             <button onClick={resetColumns} style={{
               marginTop: 6, width: '100%', background: 'transparent',
-              border: '1px solid #334155', borderRadius: 5, color: '#94a3b8',
+              border: '1px solid var(--border-strong)', borderRadius: 5, color: 'var(--muted)',
               padding: '5px 8px', fontSize: 12, cursor: 'pointer',
             }}>Reset columns</button>
           </div>
@@ -337,7 +337,7 @@ export function TorrentTable({
                   type="checkbox"
                   checked={isSelected}
                   onChange={() => onSelect(t.hash)}
-                  style={{ accentColor: '#3b82f6', cursor: 'pointer' }}
+                  style={{ accentColor: 'var(--accent)', cursor: 'pointer' }}
                 />
               ),
               kind: (
@@ -348,7 +348,7 @@ export function TorrentTable({
               ),
               name: (
                 <span
-                  style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', cursor: 'pointer', color: '#e2e8f0' }}
+                  style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', cursor: 'pointer', color: 'var(--text)' }}
                   title={t.name}
                   onClick={() => onDetail(isDetail ? null : t.hash)}
                 >
@@ -356,15 +356,15 @@ export function TorrentTable({
                 </span>
               ),
               status: <span style={{ color, fontSize: 11, fontWeight: 600 }}>{label}</span>,
-              size: <span style={{ color: '#94a3b8' }}>{fmtSize(t.size_bytes)}</span>,
-              progress: <span style={{ color: '#94a3b8' }}>{fmtProgress(t)}</span>,
-              down_rate: <span style={{ color: t.down_rate ? '#3b82f6' : '#475569' }}>{fmtSpeed(t.down_rate)}</span>,
+              size: <span style={{ color: 'var(--muted)' }}>{fmtSize(t.size_bytes)}</span>,
+              progress: <span style={{ color: 'var(--muted)' }}>{fmtProgress(t)}</span>,
+              down_rate: <span style={{ color: t.down_rate ? 'var(--accent)' : 'var(--faint)' }}>{fmtSpeed(t.down_rate)}</span>,
               up_rate: <span style={{ color: t.up_rate ? '#22c55e' : '#475569' }}>{fmtSpeed(t.up_rate)}</span>,
-              ratio: <span style={{ color: '#94a3b8' }}>{(t.ratio / 1000).toFixed(2)}</span>,
-              added: <span style={{ color: '#64748b' }}>{fmtDate(t.creation_date)}</span>,
-              category: <span style={{ color: '#64748b', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.category || '—'}</span>,
-              tags: <span style={{ color: '#64748b', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={t.tags}>{t.tags || '—'}</span>,
-              tracker: <span style={{ color: '#64748b', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={t.tracker_url}>{trackerHost(t.tracker_url)}</span>,
+              ratio: <span style={{ color: 'var(--muted)' }}>{(t.ratio / 1000).toFixed(2)}</span>,
+              added: <span style={{ color: 'var(--faint)' }}>{fmtDate(t.creation_date)}</span>,
+              category: <span style={{ color: 'var(--faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.category || '—'}</span>,
+              tags: <span style={{ color: 'var(--faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={t.tags}>{t.tags || '—'}</span>,
+              tracker: <span style={{ color: 'var(--faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={t.tracker_url}>{trackerHost(t.tracker_url)}</span>,
             }
             return (
               <div
@@ -379,10 +379,10 @@ export function TorrentTable({
                   height: ROW_HEIGHT, display: 'grid', gridTemplateColumns: gridTemplate,
                   gap: '0 8px', padding: '0 12px', alignItems: 'center',
                   cursor: 'default', fontSize: 13,
-                  background: isDetail ? '#152040' : isSelected ? '#14203a'
-                    : item.index % 2 === 0 ? '#131820' : '#151c27',
-                  borderBottom: '1px solid #1e2433',
-                  borderLeft: isDetail ? '2px solid #3b82f6' : '2px solid transparent',
+                  background: isDetail || isSelected ? 'var(--selected)'
+                    : item.index % 2 === 0 ? 'var(--row)' : 'var(--row-alt)',
+                  borderBottom: '1px solid var(--border)',
+                  borderLeft: isDetail ? '2px solid var(--accent)' : '2px solid transparent',
                 }}
               >
                 {visibleCols.map(col => <span key={col.key} style={{ minWidth: 0 }}>{cells[col.key]}</span>)}
@@ -393,7 +393,7 @@ export function TorrentTable({
 
         {/* Load-more sentinel */}
         {isFetchingMore && (
-          <div style={{ padding: '12px 0', textAlign: 'center', fontSize: 11, color: '#475569' }}>
+          <div style={{ padding: '12px 0', textAlign: 'center', fontSize: 11, color: 'var(--faint)' }}>
             Loading more…
           </div>
         )}
@@ -401,9 +401,9 @@ export function TorrentTable({
 
       {hasMore && !isFetchingMore && (
         <div style={{
-          height: 24, background: '#1e2433', borderTop: '1px solid #2d3748',
+          height: 24, background: 'var(--table-head)', borderTop: '1px solid var(--border-strong)',
           display: 'flex', alignItems: 'center', justifyContent: 'center',
-          fontSize: 11, color: '#475569', flexShrink: 0,
+          fontSize: 11, color: 'var(--faint)', flexShrink: 0,
         }}>
           Scroll for more
         </div>

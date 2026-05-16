@@ -65,6 +65,7 @@ pub enum TorrentCmd {
         job_id: String,
     },
     Reannounce,
+    ReloadFilePolicy,
     Shutdown,
     /// Peers discovered by DHT or tracker.
     NewPeers(Vec<SocketAddr>),
@@ -350,6 +351,9 @@ impl TorrentTask {
                         TorrentCmd::Reannounce => {
                             self.tracker_event = TrackerEvent::Empty;
                             self.schedule_active_tracker_tier_now();
+                        }
+                        TorrentCmd::ReloadFilePolicy => {
+                            self.apply_file_policy_from_db();
                         }
                     }
                 }
@@ -1311,6 +1315,9 @@ impl TorrentTask {
                 }
                 Ok(TorrentCmd::Reannounce) => {
                     self.schedule_active_tracker_tier_now();
+                }
+                Ok(TorrentCmd::ReloadFilePolicy) => {
+                    self.apply_file_policy_from_db();
                 }
                 Ok(TorrentCmd::Recheck { .. }) => {}
                 Ok(TorrentCmd::CancelJob { job_id }) => {

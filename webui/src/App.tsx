@@ -24,6 +24,7 @@ import { TorrentPropertiesDialog } from './components/TorrentPropertiesDialog'
 import { AppearancePanel, type MediaInferenceMode } from './components/AppearancePanel'
 import { BulkEditDialog } from './components/BulkEditDialog'
 import { api, AuthError, type ListParams, type LiveStats, type TorrentSummary } from './api/client'
+import { PALETTES, applyTheme, findPalette, THEME_MODE_STORAGE_KEY, THEME_STORAGE_KEY, type ThemeMode } from './themes'
 
 type View = 'torrents' | 'settings'
 type AuthState = 'checking' | 'authenticated' | 'unauthenticated'
@@ -31,6 +32,23 @@ type SettingsSection = 'library' | 'engine' | 'automation' | 'support'
 const MEDIA_INFERENCE_KEY = 'rtng.mediaInference'
 const ACTIVE_TAB_KEY = 'rtng.activeTab'
 const ACTIVE_TAB_TTL_MS = 8000
+
+function loadThemeId(): string {
+  try {
+    const value = localStorage.getItem(THEME_STORAGE_KEY)
+    return value && findPalette(value).id === value ? value : PALETTES[0].id
+  } catch {
+    return PALETTES[0].id
+  }
+}
+
+function loadThemeMode(): ThemeMode {
+  try {
+    return localStorage.getItem(THEME_MODE_STORAGE_KEY) === 'light' ? 'light' : 'dark'
+  } catch {
+    return 'dark'
+  }
+}
 
 function loadMediaInference(): MediaInferenceMode {
   let value: string | null = null
@@ -138,6 +156,8 @@ export function App() {
   const [bulkEditOpen, setBulkEditOpen] = useState(false)
   const [settingsSection, setSettingsSection] = useState<SettingsSection>('library')
   const [mediaInference, setMediaInference] = useState<MediaInferenceMode>(loadMediaInference)
+  const [themeId, setThemeId] = useState(loadThemeId)
+  const [themeMode, setThemeMode] = useState<ThemeMode>(loadThemeMode)
 
   const isAuthed = activeTab.isActive && authState === 'authenticated'
   const query = useTorrentsInfinite(params, isAuthed)
@@ -158,6 +178,16 @@ export function App() {
 
   const handleStats = useCallback((stats: LiveStats) => setLiveStats(stats), [])
   useWebSocket(handleStats, isAuthed)
+
+  useEffect(() => {
+    applyTheme(themeId, themeMode)
+    try {
+      localStorage.setItem(THEME_STORAGE_KEY, themeId)
+      localStorage.setItem(THEME_MODE_STORAGE_KEY, themeMode)
+    } catch {
+      // Theme selection still applies for this tab.
+    }
+  }, [themeId, themeMode])
 
   useEffect(() => {
     if (!transferInfo) return
@@ -339,7 +369,7 @@ export function App() {
   if (authState === 'checking') {
     return (
       <div style={{
-        minHeight: '100vh', background: '#0d1117', color: '#64748b',
+        minHeight: '100vh', background: 'var(--bg)', color: 'var(--faint)',
         display: 'grid', placeItems: 'center', fontSize: 13,
       }}>
         Checking session...
@@ -352,22 +382,22 @@ export function App() {
   }
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', background: '#0d1117', color: '#e2e8f0' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', background: 'var(--bg)', color: 'var(--text)' }}>
       {/* Topbar */}
       <header style={{
-        height: 44, background: '#0d1117', borderBottom: '1px solid #1e2433',
+        height: 44, background: 'var(--bg)', borderBottom: '1px solid var(--border)',
         display: 'flex', alignItems: 'center', padding: '0 16px', gap: 12, flexShrink: 0,
       }}>
-        <span style={{ fontWeight: 700, fontSize: 15, letterSpacing: '-0.02em', color: '#e2e8f0' }}>
+        <span style={{ fontWeight: 700, fontSize: 15, color: 'var(--text)' }}>
           rtorrentNG
         </span>
 
         <nav style={{ display: 'flex', gap: 4, marginLeft: 4 }}>
           {(['torrents', 'settings'] as View[]).map(v => (
             <button key={v} onClick={() => setView(v)} style={{
-              background: view === v ? '#1e3a5f' : 'transparent',
-              border: '1px solid ' + (view === v ? '#3b82f6' : 'transparent'),
-              borderRadius: 5, color: view === v ? '#93c5fd' : '#64748b',
+              background: view === v ? 'var(--accent-soft)' : 'transparent',
+              border: '1px solid ' + (view === v ? 'var(--accent)' : 'transparent'),
+              borderRadius: 5, color: view === v ? 'var(--accent-text)' : 'var(--faint)',
               padding: '2px 10px', fontSize: 12, cursor: 'pointer', textTransform: 'capitalize',
             }}>{v}</button>
           ))}
@@ -375,13 +405,13 @@ export function App() {
 
         {view === 'torrents' && (
           <button onClick={() => setAddOpen(true)} title="Add torrent (A)" style={{
-            background: '#1e3a5f', border: '1px solid #3b82f6', borderRadius: 5,
-            color: '#93c5fd', padding: '3px 12px', fontSize: 12, cursor: 'pointer',
+            background: 'var(--accent-soft)', border: '1px solid var(--accent)', borderRadius: 5,
+            color: 'var(--accent-text)', padding: '3px 12px', fontSize: 12, cursor: 'pointer',
           }}>+ Add</button>
         )}
         <button onClick={() => setHelpOpen(true)} title="Help and links" style={{
-          background: 'transparent', border: '1px solid #334155', borderRadius: 5,
-          color: '#94a3b8', padding: '3px 10px', fontSize: 12, cursor: 'pointer',
+          background: 'transparent', border: '1px solid var(--border-strong)', borderRadius: 5,
+          color: 'var(--muted)', padding: '3px 10px', fontSize: 12, cursor: 'pointer',
         }}>Help</button>
 
         <span style={{
@@ -397,9 +427,28 @@ export function App() {
         </span>
 
         <span style={{ flex: 1 }} />
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <select
+            aria-label="Theme palette"
+            value={themeId}
+            onChange={e => setThemeId(e.target.value)}
+            style={themeSelectStyle}
+          >
+            {PALETTES.map(palette => (
+              <option key={palette.id} value={palette.id}>{palette.label}</option>
+            ))}
+          </select>
+          <button
+            onClick={() => setThemeMode(mode => mode === 'dark' ? 'light' : 'dark')}
+            title="Toggle light/dark theme"
+            style={themeButtonStyle}
+          >
+            {themeMode === 'dark' ? 'Dark' : 'Light'}
+          </button>
+        </div>
         <button onClick={handleLogout} title="Log out" style={{
-          background: 'transparent', border: '1px solid #334155', borderRadius: 5,
-          color: '#94a3b8', padding: '3px 10px', fontSize: 12, cursor: 'pointer',
+          background: 'transparent', border: '1px solid var(--border-strong)', borderRadius: 5,
+          color: 'var(--muted)', padding: '3px 10px', fontSize: 12, cursor: 'pointer',
         }}>Log out</button>
       </header>
 
@@ -447,12 +496,12 @@ export function App() {
             />
             <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
               {query.isError && (
-                <div style={{ padding: 24, color: '#ef4444', textAlign: 'center' }}>
+                <div style={{ padding: 24, color: 'var(--danger)', textAlign: 'center' }}>
                   Failed to connect to sidecar API.
                 </div>
               )}
               {query.isLoading && !query.data && (
-                <div style={{ padding: 24, color: '#64748b', textAlign: 'center' }}>Loading…</div>
+                <div style={{ padding: 24, color: 'var(--faint)', textAlign: 'center' }}>Loading…</div>
               )}
               {query.data && (
                 <TorrentTable
@@ -765,4 +814,25 @@ function LoginScreen({ message, onLogin }: {
       </form>
     </div>
   )
+}
+
+const themeSelectStyle: React.CSSProperties = {
+  width: 132,
+  background: 'var(--surface)',
+  border: '1px solid var(--border-strong)',
+  borderRadius: 5,
+  color: 'var(--text)',
+  padding: '3px 7px',
+  fontSize: 12,
+  outline: 'none',
+}
+
+const themeButtonStyle: React.CSSProperties = {
+  background: 'var(--surface)',
+  border: '1px solid var(--border-strong)',
+  borderRadius: 5,
+  color: 'var(--muted)',
+  padding: '3px 10px',
+  fontSize: 12,
+  cursor: 'pointer',
 }

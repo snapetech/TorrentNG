@@ -1544,28 +1544,29 @@ impl Engine {
         }
         let priority = priority.clamp(0, 2);
         let wanted = priority > 0;
-        let mut db = self.db.lock().expect("database mutex poisoned");
-        let mut files = rt_db::list_torrent_files(&db, info_hash).map_err(|e| e.to_string())?;
-        if files.is_empty() {
-            return Err(format!("torrent {info_hash} has no persisted files"));
-        }
         let ids = file_ids
             .into_iter()
             .collect::<std::collections::HashSet<_>>();
-        let apply_all = ids.is_empty();
-        let mut touched = 0usize;
-        for file in &mut files {
-            if apply_all || ids.contains(&(file.file_index as u32)) {
-                file.priority = priority;
-                file.wanted = wanted;
-                touched += 1;
+        {
+            let mut db = self.db.lock().expect("database mutex poisoned");
+            let mut files = rt_db::list_torrent_files(&db, info_hash).map_err(|e| e.to_string())?;
+            if files.is_empty() {
+                return Err(format!("torrent {info_hash} has no persisted files"));
             }
+            let apply_all = ids.is_empty();
+            let mut touched = 0usize;
+            for file in &mut files {
+                if apply_all || ids.contains(&(file.file_index as u32)) {
+                    file.priority = priority;
+                    file.wanted = wanted;
+                    touched += 1;
+                }
+            }
+            if touched == 0 {
+                return Err(format!("no matching files for torrent {info_hash}"));
+            }
+            rt_db::replace_torrent_files(&mut db, info_hash, &files).map_err(|e| e.to_string())?;
         }
-        if touched == 0 {
-            return Err(format!("no matching files for torrent {info_hash}"));
-        }
-        rt_db::replace_torrent_files(&mut db, info_hash, &files).map_err(|e| e.to_string())?;
-        drop(db);
         self.append_session_event(
             Some(info_hash),
             "file_priorities_updated",
@@ -1576,6 +1577,9 @@ impl Engine {
                 "wanted": wanted,
             }),
         );
+        let _ = self
+            .send_to_torrent(info_hash, TorrentCmd::ReloadFilePolicy)
+            .await;
         Ok(())
     }
 

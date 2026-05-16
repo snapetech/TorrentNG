@@ -129,7 +129,9 @@ pub async fn run_metadata_task(
                         paused = false;
                         tracker_tick.reset_immediately();
                     }
-                    TorrentCmd::Recheck { .. } | TorrentCmd::CancelJob { .. } => {}
+                    TorrentCmd::Recheck { .. }
+                    | TorrentCmd::CancelJob { .. }
+                    | TorrentCmd::ReloadFilePolicy => {}
                 }
             }
             _ = tracker_tick.tick(), if !paused && !trackers.is_empty() => {
