@@ -54,7 +54,7 @@ pub enum ImportPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FastresumeState {
     pub version: u32,
-    /// Hex-encoded SHA-1 infohash.
+    /// Hex-encoded torrent infohash. V1 uses 20 bytes; BEP 52 v2 uses 32 bytes.
     pub info_hash: String,
     /// Generation counter — incremented on each clean save.
     pub session_generation: u64,
@@ -77,7 +77,7 @@ pub struct FastresumeState {
 }
 
 impl FastresumeState {
-    pub fn new_empty(info_hash: &[u8; 20], piece_count: u32, policy: ImportPolicy) -> Self {
+    pub fn new_empty(info_hash: &[u8], piece_count: u32, policy: ImportPolicy) -> Self {
         FastresumeState {
             version: FASTRESUME_VERSION,
             info_hash: hex::encode(info_hash),
@@ -96,7 +96,7 @@ impl FastresumeState {
     /// Validate that stored state is compatible with the current torrent.
     pub fn validate(
         &self,
-        info_hash: &[u8; 20],
+        info_hash: &[u8],
         piece_count: u32,
     ) -> Result<(), crate::error::FastresumeError> {
         use crate::error::FastresumeError;
@@ -209,6 +209,10 @@ mod tests {
         [1u8; 20]
     }
 
+    fn test_hash_v2() -> [u8; 32] {
+        [2u8; 32]
+    }
+
     #[test]
     fn new_state_all_unknown() {
         let state = FastresumeState::new_empty(&test_hash(), 4, ImportPolicy::RequireVerification);
@@ -223,6 +227,18 @@ mod tests {
     fn validate_succeeds_for_matching_state() {
         let state = FastresumeState::new_empty(&test_hash(), 4, ImportPolicy::RequireVerification);
         assert!(state.validate(&test_hash(), 4).is_ok());
+    }
+
+    #[test]
+    fn validate_succeeds_for_v2_infohash() {
+        let state =
+            FastresumeState::new_empty(&test_hash_v2(), 8, ImportPolicy::RequireVerification);
+        assert_eq!(state.info_hash, hex::encode(test_hash_v2()));
+        assert!(state.validate(&test_hash_v2(), 8).is_ok());
+        assert!(matches!(
+            state.validate(&test_hash(), 8),
+            Err(crate::error::FastresumeError::InfohashMismatch { .. })
+        ));
     }
 
     #[test]

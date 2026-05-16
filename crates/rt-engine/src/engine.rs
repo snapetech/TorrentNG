@@ -1452,7 +1452,7 @@ impl Engine {
                 metadata.trackers = row.trackers;
             }
         }
-        if let Ok(hash) = decode_info_hash(info_hash) {
+        if let Ok(hash) = decode_info_hash_bytes(info_hash) {
             if let Ok(state) = FastresumeStore::new(fastresume_dir(&self.config)).load(info_hash) {
                 if state.validate(&hash, metadata.piece_count as u32).is_ok() {
                     let mut pieces = state
@@ -2857,11 +2857,12 @@ fn metadata_from_placeholder_row(row: &TorrentRow) -> EngineTorrentMetadata {
     }
 }
 
-fn decode_info_hash(info_hash: &str) -> anyhow::Result<[u8; 20]> {
+fn decode_info_hash_bytes(info_hash: &str) -> anyhow::Result<Vec<u8>> {
     let bytes = hex::decode(info_hash)?;
-    bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("expected 20-byte info hash"))
+    match bytes.len() {
+        20 | 32 => Ok(bytes),
+        len => anyhow::bail!("expected 20-byte or 32-byte info hash, got {len} bytes"),
+    }
 }
 
 fn prune_empty_dirs(
@@ -3013,6 +3014,13 @@ mod tests {
         assert_eq!(parse_info_hash_hex(&"0a".repeat(20)).unwrap(), [10u8; 20]);
         assert!(parse_info_hash_hex("abc").is_err());
         assert!(parse_info_hash_hex(&"zz".repeat(20)).is_err());
+    }
+
+    #[test]
+    fn decode_info_hash_bytes_accepts_v1_and_v2_lengths() {
+        assert_eq!(decode_info_hash_bytes(&"0a".repeat(20)).unwrap().len(), 20);
+        assert_eq!(decode_info_hash_bytes(&"0b".repeat(32)).unwrap().len(), 32);
+        assert!(decode_info_hash_bytes(&"0c".repeat(21)).is_err());
     }
 
     #[test]
