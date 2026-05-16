@@ -1005,8 +1005,9 @@ impl Engine {
 
     fn persist_entry(&self, entry: &TorrentEntry, meta: &TorrentMetaV1) -> anyhow::Result<()> {
         let row = row_from_entry(entry, meta);
-        let db = self.db.lock().expect("database mutex poisoned");
+        let mut db = self.db.lock().expect("database mutex poisoned");
         rt_db::upsert(&db, &row)?;
+        persist_torrent_files(&mut db, &entry.info_hash, meta)?;
         Ok(())
     }
 
@@ -1512,6 +1513,29 @@ pub(crate) fn row_from_entry(entry: &TorrentEntry, meta: &TorrentMetaV1) -> Torr
         ratio: entry.stats.ratio(),
         trackers: meta.all_trackers(),
     }
+}
+
+fn persist_torrent_files(
+    db: &mut Connection,
+    info_hash: &str,
+    meta: &TorrentMetaV1,
+) -> anyhow::Result<()> {
+    let rows: Vec<_> = meta
+        .files
+        .iter()
+        .map(|file| rt_db::TorrentFileRow {
+            info_hash: info_hash.to_owned(),
+            file_index: file.index as i64,
+            path: file.path.as_display(),
+            length: file.length as i64,
+            offset: file.offset as i64,
+            priority: 1,
+            wanted: true,
+            completed_bytes: 0,
+        })
+        .collect();
+    rt_db::replace_torrent_files(db, info_hash, &rows)?;
+    Ok(())
 }
 
 fn entry_from_row(row: &TorrentRow) -> TorrentEntry {

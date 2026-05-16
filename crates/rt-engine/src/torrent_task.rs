@@ -248,7 +248,7 @@ impl TorrentTask {
             },
         );
         let tracker_tiers = tracker_tiers_from_meta(&meta);
-        TorrentTask {
+        let mut task = TorrentTask {
             info_hash_hex,
             meta,
             save_root,
@@ -274,7 +274,9 @@ impl TorrentTask {
             allowed_private_peers: HashSet::new(),
             paused,
             max_peers,
-        }
+        };
+        task.apply_file_policy_from_db();
+        task
     }
 
     pub async fn run(mut self) {
@@ -1038,6 +1040,39 @@ impl TorrentTask {
         for tracker in &mut self.tracker_tiers[tier_idx] {
             tracker.schedule_immediate();
         }
+    }
+
+    fn apply_file_policy_from_db(&mut self) {
+        let rows = {
+            let db = self.db.lock().expect("database mutex poisoned");
+            rt_db::list_torrent_files(&db, &self.info_hash_hex).unwrap_or_default()
+        };
+        if rows.is_empty() {
+            return;
+        }
+        let policy: HashMap<u32, (bool, i64)> = rows
+            .into_iter()
+            .map(|row| (row.file_index as u32, (row.wanted, row.priority)))
+            .collect();
+        let mut priority_pieces = Vec::new();
+        for piece in 0..self.piece_map.piece_count {
+            let Ok(regions) = self.piece_map.piece_to_file_regions(piece) else {
+                continue;
+            };
+            let mut any_wanted = false;
+            let mut any_high = false;
+            for region in regions {
+                let (wanted, priority) =
+                    policy.get(&region.file_index).copied().unwrap_or((true, 1));
+                any_wanted |= wanted && priority > 0;
+                any_high |= wanted && priority > 1;
+            }
+            self.picker.set_piece_enabled(piece as usize, any_wanted);
+            if any_high {
+                priority_pieces.push(piece as usize);
+            }
+        }
+        self.picker.set_priority(priority_pieces);
     }
 
     fn advance_tracker_tier(&mut self) {

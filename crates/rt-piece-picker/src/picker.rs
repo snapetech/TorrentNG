@@ -93,6 +93,8 @@ pub struct PiecePicker {
     last_piece_length: u32,
     /// Pieces we still need.
     wanted: Vec<bool>,
+    /// Pieces eligible to request. Disabled pieces are skipped without being advertised as complete.
+    enabled: Vec<bool>,
     /// In-progress pieces (piece index → state).
     in_progress: std::collections::HashMap<usize, PieceState>,
     /// Priority pieces (selected before rarest-first).
@@ -107,6 +109,7 @@ impl PiecePicker {
             default_piece_length,
             last_piece_length,
             wanted: vec![true; piece_count],
+            enabled: vec![true; piece_count],
             in_progress: std::collections::HashMap::new(),
             priority: Vec::new(),
             availability: Availability::new(piece_count),
@@ -117,6 +120,7 @@ impl PiecePicker {
     pub fn mark_have(&mut self, piece: usize) {
         if piece < self.piece_count {
             self.wanted[piece] = false;
+            self.enabled[piece] = true;
             self.in_progress.remove(&piece);
         }
     }
@@ -129,8 +133,21 @@ impl PiecePicker {
         }
     }
 
+    pub fn set_piece_enabled(&mut self, piece: usize, enabled: bool) {
+        if piece < self.piece_count {
+            self.enabled[piece] = enabled;
+            if !enabled {
+                self.in_progress.remove(&piece);
+            }
+        }
+    }
+
     pub fn restore_partial_piece(&mut self, piece: usize, received_blocks: &[u32]) {
-        if piece >= self.piece_count || received_blocks.is_empty() || !self.wanted[piece] {
+        if piece >= self.piece_count
+            || received_blocks.is_empty()
+            || !self.wanted[piece]
+            || !self.enabled[piece]
+        {
             return;
         }
         let piece_length = self.piece_length_for(piece);
@@ -159,7 +176,7 @@ impl PiecePicker {
     pub fn pick(&mut self, peer_has: &[bool]) -> Option<BlockRequest> {
         // Priority pieces first.
         for &p in &self.priority.clone() {
-            if self.wanted[p] && peer_has.get(p).copied().unwrap_or(false) {
+            if self.wanted[p] && self.enabled[p] && peer_has.get(p).copied().unwrap_or(false) {
                 if let Some(req) = self.pick_block_from(p) {
                     return Some(req);
                 }
@@ -167,7 +184,13 @@ impl PiecePicker {
         }
 
         // Rarest-first among wanted pieces the peer has.
-        let ordered = self.availability.rarest_first(&self.wanted);
+        let wanted_enabled: Vec<bool> = self
+            .wanted
+            .iter()
+            .zip(self.enabled.iter())
+            .map(|(wanted, enabled)| *wanted && *enabled)
+            .collect();
+        let ordered = self.availability.rarest_first(&wanted_enabled);
         for p in ordered {
             if peer_has.get(p).copied().unwrap_or(false) {
                 if let Some(req) = self.pick_block_from(p) {
@@ -224,18 +247,25 @@ impl PiecePicker {
     }
 
     pub fn is_complete(&self) -> bool {
-        self.wanted.iter().all(|&w| !w)
+        self.wanted
+            .iter()
+            .zip(self.enabled.iter())
+            .all(|(wanted, enabled)| !*enabled || !*wanted)
     }
 
     pub fn remaining_pieces(&self) -> usize {
-        self.wanted.iter().filter(|&&w| w).count()
+        self.wanted
+            .iter()
+            .zip(self.enabled.iter())
+            .filter(|(wanted, enabled)| **wanted && **enabled)
+            .count()
     }
 
     pub fn bytes_left(&self) -> u64 {
         self.wanted
             .iter()
             .enumerate()
-            .filter(|&(_, wanted)| *wanted)
+            .filter(|&(piece, wanted)| *wanted && self.enabled[piece])
             .map(|(piece, _)| self.piece_length_for(piece) as u64)
             .sum()
     }
@@ -390,6 +420,17 @@ mod tests {
         p.availability.add_have(0);
         let no_has = vec![false];
         assert!(p.pick(&no_has).is_none());
+    }
+
+    #[test]
+    fn disabled_piece_is_not_requested_or_advertised_complete() {
+        let mut p = picker_1piece(MAX_BLOCK_SIZE);
+        p.availability.add_have(0);
+        p.set_piece_enabled(0, false);
+        assert!(p.pick(&peer_has_all(1)).is_none());
+        assert!(p.is_complete());
+        assert_eq!(p.have_pieces(), vec![false]);
+        assert_eq!(p.bytes_left(), 0);
     }
 
     #[test]
