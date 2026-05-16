@@ -1,6 +1,6 @@
 [package]
 name = "rt-tracker"
-description = "rtorrentNG: rt-tracker"
+description = "rtorrentNG: HTTP/UDP tracker announce, BEP 3/12/15/23/27"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,3 +9,12 @@ license.workspace = true
 [dependencies]
 thiserror.workspace = true
 tracing.workspace = true
+tokio = { workspace = true, features = ["net", "time", "sync", "rt"] }
+bytes.workspace = true
+rand.workspace = true
+url.workspace = true
+serde.workspace = true
+rt-bencode = { path = "../rt-bencode" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }

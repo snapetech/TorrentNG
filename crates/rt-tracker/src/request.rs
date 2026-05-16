@@ -1,0 +1,178 @@
+use url::Url;
+
+use crate::error::TrackerError;
+
+/// SHA-1 or SHA-256 infohash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InfoHash {
+    V1([u8; 20]),
+    V2([u8; 32]),
+}
+
+impl InfoHash {
+    pub fn as_v1(&self) -> Option<&[u8; 20]> {
+        match self {
+            InfoHash::V1(h) => Some(h),
+            InfoHash::V2(_) => None,
+        }
+    }
+
+    /// URL-encoded form for HTTP announces.
+    pub fn url_encode(&self) -> String {
+        match self {
+            InfoHash::V1(h) => url_encode_bytes(h),
+            InfoHash::V2(h) => url_encode_bytes(h),
+        }
+    }
+}
+
+fn url_encode_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|&b| format!("%{b:02X}")).collect()
+}
+
+/// BEP 3 tracker event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackerEvent {
+    /// First announce for this torrent session.
+    Started,
+    /// Sent before client shuts down or removes torrent.
+    Stopped,
+    /// Sent when download completes.
+    Completed,
+    /// Regular re-announce (no event field sent).
+    Empty,
+}
+
+impl TrackerEvent {
+    pub fn as_str(self) -> Option<&'static str> {
+        match self {
+            TrackerEvent::Started => Some("started"),
+            TrackerEvent::Stopped => Some("stopped"),
+            TrackerEvent::Completed => Some("completed"),
+            TrackerEvent::Empty => None,
+        }
+    }
+}
+
+/// Parameters for a tracker announce.
+#[derive(Debug, Clone)]
+pub struct AnnounceRequest {
+    pub info_hash: InfoHash,
+    pub peer_id: [u8; 20],
+    pub port: u16,
+    pub uploaded: u64,
+    pub downloaded: u64,
+    /// Bytes remaining; 0 if complete.
+    pub left: u64,
+    pub event: TrackerEvent,
+    /// Request compact peer response (BEP 23).
+    pub compact: bool,
+    /// Optional: explicit number of peers to request.
+    pub numwant: Option<u32>,
+}
+
+impl AnnounceRequest {
+    /// Build the HTTP query string for an HTTP tracker announce.
+    pub fn to_http_query(&self, tracker_url: &str) -> Result<String, TrackerError> {
+        let mut url =
+            Url::parse(tracker_url).map_err(|e| TrackerError::InvalidUrl(e.to_string()))?;
+
+        {
+            let mut q = url.query_pairs_mut();
+            // info_hash is percent-encoded separately (raw bytes)
+            q.append_pair("peer_id", &url_encode_bytes(&self.peer_id));
+            q.append_pair("port", &self.port.to_string());
+            q.append_pair("uploaded", &self.uploaded.to_string());
+            q.append_pair("downloaded", &self.downloaded.to_string());
+            q.append_pair("left", &self.left.to_string());
+            q.append_pair("compact", if self.compact { "1" } else { "0" });
+            if let Some(n) = self.numwant {
+                q.append_pair("numwant", &n.to_string());
+            }
+            if let Some(ev) = self.event.as_str() {
+                q.append_pair("event", ev);
+            }
+        }
+
+        // Append info_hash as raw percent-encoded bytes (url crate will re-encode otherwise)
+        let query = url.query().unwrap_or("").to_owned();
+        let info_hash_param = format!("info_hash={}", self.info_hash.url_encode());
+        let full_query = if query.is_empty() {
+            info_hash_param
+        } else {
+            format!("{query}&{info_hash_param}")
+        };
+        url.set_query(Some(&full_query));
+
+        Ok(url.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_request(event: TrackerEvent) -> AnnounceRequest {
+        AnnounceRequest {
+            info_hash: InfoHash::V1([0xABu8; 20]),
+            peer_id: [0x2Du8; 20],
+            port: 6881,
+            uploaded: 1024,
+            downloaded: 2048,
+            left: 0,
+            event,
+            compact: true,
+            numwant: Some(50),
+        }
+    }
+
+    #[test]
+    fn url_contains_required_fields() {
+        let req = test_request(TrackerEvent::Started);
+        let url = req
+            .to_http_query("http://tracker.example.com/announce")
+            .unwrap();
+        assert!(url.contains("port=6881"));
+        assert!(url.contains("uploaded=1024"));
+        assert!(url.contains("downloaded=2048"));
+        assert!(url.contains("left=0"));
+        assert!(url.contains("compact=1"));
+        assert!(url.contains("event=started"));
+        assert!(url.contains("numwant=50"));
+        assert!(url.contains("info_hash="));
+    }
+
+    #[test]
+    fn empty_event_not_in_query() {
+        let req = test_request(TrackerEvent::Empty);
+        let url = req
+            .to_http_query("http://tracker.example.com/announce")
+            .unwrap();
+        assert!(!url.contains("event="));
+    }
+
+    #[test]
+    fn stopped_event_in_query() {
+        let req = test_request(TrackerEvent::Stopped);
+        let url = req
+            .to_http_query("http://tracker.example.com/announce")
+            .unwrap();
+        assert!(url.contains("event=stopped"));
+    }
+
+    #[test]
+    fn info_hash_url_encoded() {
+        let req = test_request(TrackerEvent::Empty);
+        let url = req
+            .to_http_query("http://tracker.example.com/announce")
+            .unwrap();
+        // 0xAB percent-encoded is %AB
+        assert!(url.contains("%AB"));
+    }
+
+    #[test]
+    fn invalid_tracker_url() {
+        let req = test_request(TrackerEvent::Empty);
+        assert!(req.to_http_query("not a url !!").is_err());
+    }
+}
