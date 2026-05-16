@@ -2,4 +2,4 @@
 
 SHA-1/SHA-256 piece verification, bounded hashing worker pool.
 
-## Status: Phase 0 stub — implementation pending
+## Status: Implemented — native engine support

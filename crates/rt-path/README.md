@@ -2,4 +2,4 @@
 
 safe relative path handling for torrent file lists.
 
-## Status: Phase 0 stub — implementation pending
+## Status: Implemented — native engine support

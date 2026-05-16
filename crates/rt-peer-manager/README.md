@@ -2,4 +2,4 @@
 
 peer connection pool, choking, scoring, ban rules.
 
-## Status: Phase 0 stub — implementation pending
+## Status: Implemented — native engine support

@@ -2,4 +2,4 @@
 
 SQLite migration management, schema, WAL mode.
 
-## Status: Phase 0 stub — implementation pending
+## Status: Implemented — native engine support

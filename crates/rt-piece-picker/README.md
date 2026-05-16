@@ -2,4 +2,4 @@
 
 piece selection: rarest-first, endgame, file priority.
 
-## Status: Phase 0 stub — implementation pending
+## Status: Implemented — native engine support

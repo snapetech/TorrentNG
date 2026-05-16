@@ -2,9 +2,15 @@
 
 [![Discord](https://img.shields.io/discord/4ub88HeHFm?label=Discord&logo=discord&logoColor=white)](https://discord.gg/4ub88HeHFm)
 
-rtorrentNG is a modern control plane and web interface for rTorrent. It pairs
-a Rust sidecar service with a React/Vite WebUI, exposes a native API, and
-includes a qBittorrent-compatible API shim for automation tools.
+rtorrentNG is a torrent management stack with two runtime modes:
+
+- A Phase 1 rTorrent sidecar for existing rTorrent deployments.
+- A native Rust BitTorrent daemon (`rusttorrentd`) that owns torrent state,
+  tracker announces, peer wire traffic, storage, rechecks, metrics, and native
+  REST/SSE APIs.
+
+Both modes include a React/Vite WebUI and compatibility shims for common
+automation tools.
 
 ## Status
 
@@ -18,9 +24,11 @@ are available on Discord: [https://discord.gg/4ub88HeHFm](https://discord.gg/4ub
 
 ## Components
 
-- `sidecar/` - Rust service that talks to rTorrent over a trusted local SCGI
-  socket, maintains a SQLite cache, serves REST/WebSocket APIs, and exposes a
-  qBittorrent-compatible API.
+- `sidecar/` - Rust service for rTorrent deployments. It talks to rTorrent over
+  a trusted local SCGI socket, maintains a SQLite cache, serves APIs, and
+  exposes qBittorrent-compatible endpoints.
+- `crates/` - Native Rust engine crates plus `rusttorrentd`, the standalone
+  native daemon.
 - `webui/` - React, TypeScript, and Vite frontend for torrent management.
 - `engine-profile/` - rTorrent configuration profile and operational defaults.
 - `deploy/` - Docker, Compose, systemd, and nginx deployment examples.
@@ -64,16 +72,14 @@ npm install
 npm run build
 ```
 
-Build the sidecar:
+Build the native daemon and sidecar crates:
 
 ```sh
-cd sidecar
 cargo build
 ```
 
-Run sidecar tests:
+Run Rust tests:
 
 ```sh
-cd sidecar
 cargo test
 ```

@@ -4,7 +4,7 @@ This is the working checklist for finishing the native Rust engine rewrite. It i
 
 ## 1. Durable Session Backbone
 
-- [ ] Replace README "Phase 0 stub" labels for implemented crates with accurate status.
+- [x] Replace README "Phase 0 stub" labels for implemented crates with accurate status.
 - [x] Expand `rt-db` schema beyond `torrents` and `files`.
 - [x] Persist `torrent_files` metadata with offsets, priorities, and completion state.
 - [x] Persist `torrent_trackers` with tier/order, status, announce timing, and scrape stats.
@@ -71,7 +71,7 @@ This is the working checklist for finishing the native Rust engine rewrite. It i
 - [x] Add clean shutdown stopped-announces with bounded deadline.
 - [x] Add API token authentication for mutating native endpoints.
 - [x] Add structured "why is this not seeding?" diagnostic API.
-- [ ] Remove stale sidecar assumptions from `rusttorrentd` docs.
+- [x] Remove stale sidecar assumptions from `rusttorrentd` docs.
 
 ## 7. Compatibility APIs
 
