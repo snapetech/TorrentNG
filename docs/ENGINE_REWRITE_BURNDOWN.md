@@ -60,7 +60,7 @@ This is the working checklist for finishing the native Rust engine rewrite. It i
 - [x] Resume partial downloads after restart.
 - [x] Enforce file priorities in picker and writes.
 - [x] Verify every received piece before marking complete.
-- [ ] Harden upload serving for large multi-file torrents.
+- [x] Harden upload serving for large multi-file torrents.
 - [ ] Add public Linux ISO download certification.
 
 ## 6. Daemon Operations

@@ -118,6 +118,9 @@ impl PieceMap {
         begin: u32,
         length: u32,
     ) -> Result<Vec<PieceRegion>, PieceMapError> {
+        if length == 0 {
+            return Err(PieceMapError::ZeroRequestLength);
+        }
         if length > MAX_BLOCK_SIZE {
             return Err(PieceMapError::BlockTooLarge(length, MAX_BLOCK_SIZE));
         }
@@ -248,6 +251,16 @@ mod tests {
     }
 
     #[test]
+    fn zero_length_request_rejected() {
+        let files = make_files(&[(&["a.bin"], 1024)]);
+        let pm = PieceMap::new(512, files).unwrap();
+        assert!(matches!(
+            pm.validate_request(0, 0, 0),
+            Err(PieceMapError::ZeroRequestLength)
+        ));
+    }
+
+    #[test]
     fn request_out_of_bounds() {
         let files = make_files(&[(&["a.bin"], 100)]);
         let pm = PieceMap::new(256 * 1024, files).unwrap();
@@ -266,6 +279,35 @@ mod tests {
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0].file_offset, 256 * 1024); // piece 1 starts at byte 256K
         assert_eq!(regions[0].length, 16 * 1024);
+    }
+
+    #[test]
+    fn valid_request_can_span_many_files() {
+        let specs: Vec<_> = (0..64)
+            .map(|idx| (vec![format!("{idx}.bin")], 256u64))
+            .collect();
+        let files = specs
+            .iter()
+            .map(|(components, len)| {
+                (
+                    components.iter().map(String::as_str).collect::<Vec<_>>(),
+                    *len,
+                )
+            })
+            .collect::<Vec<_>>();
+        let file_refs = files
+            .iter()
+            .map(|(components, len)| (components.as_slice(), *len))
+            .collect::<Vec<_>>();
+        let pm = PieceMap::new(16 * 1024, make_files(&file_refs)).unwrap();
+
+        let regions = pm.validate_request(0, 0, 16 * 1024).unwrap();
+
+        assert_eq!(regions.len(), 64);
+        assert_eq!(
+            regions.iter().map(|region| region.length).sum::<u32>(),
+            16 * 1024
+        );
     }
 
     #[test]

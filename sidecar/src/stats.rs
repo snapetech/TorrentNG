@@ -1,4 +1,7 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use tokio::sync::broadcast;
 use tracing::warn;
@@ -90,11 +93,19 @@ fn read_live_speeds(path: &str) -> Option<TransferRates> {
 
     let raw = std::fs::read_to_string(path).ok()?;
     let speeds: LiveSpeeds = serde_json::from_str(&raw).ok()?;
-    if let Some(updated_at) = speeds.updated_at {
-        let age = chrono::Utc::now().timestamp().saturating_sub(updated_at);
-        if age > LIVE_SPEEDS_MAX_AGE.as_secs() as i64 {
-            return None;
+    let fresh = match speeds.updated_at {
+        Some(updated_at) => {
+            let age = chrono::Utc::now().timestamp().saturating_sub(updated_at);
+            age <= LIVE_SPEEDS_MAX_AGE.as_secs() as i64
         }
+        None => std::fs::metadata(path)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+            .is_some_and(|age| age <= LIVE_SPEEDS_MAX_AGE),
+    };
+    if !fresh {
+        return None;
     }
     Some(TransferRates {
         download: speeds.download.max(0),

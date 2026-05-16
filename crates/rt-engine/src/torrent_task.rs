@@ -2140,6 +2140,13 @@ async fn read_upload_block(
         .await?;
         data.extend_from_slice(&bytes);
     }
+    if data.len() != length as usize {
+        anyhow::bail!(
+            "upload block read assembled {} bytes, expected {}",
+            data.len(),
+            length
+        );
+    }
     Ok(bytes::Bytes::from(data))
 }
 
@@ -2454,5 +2461,44 @@ mod tests {
         assert_eq!(availability.count(1), 1);
         assert_eq!(availability.count(2), 0);
         assert_eq!(availability.count(3), 0);
+    }
+
+    #[tokio::test]
+    async fn upload_block_reads_across_many_file_regions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = Vec::new();
+        let mut expected = Vec::new();
+        let mut offset = 0u64;
+        for idx in 0..64u32 {
+            let path = rt_path::SafeRelPath::from_name(format!("{idx}.bin"), false).unwrap();
+            let bytes = vec![idx as u8; 256];
+            std::fs::write(path.resolve(dir.path()), &bytes).unwrap();
+            expected.extend_from_slice(&bytes);
+            files.push(FileSpan {
+                file_index: idx,
+                path,
+                content_offset: offset,
+                length: 256,
+            });
+            offset += 256;
+        }
+        let piece_map = PieceMap::new(16 * 1024, files).unwrap();
+        let upload = UploadContext {
+            save_root: dir.path().to_path_buf(),
+            piece_map,
+            storage: MountScheduler::new(
+                StorageRootId::new(),
+                &SchedulerConfig {
+                    profile: StorageProfile::Unknown,
+                    ..Default::default()
+                },
+            ),
+            have_pieces: vec![true],
+            metadata: None,
+        };
+
+        let block = read_upload_block(&upload, 0, 0, 16 * 1024).await.unwrap();
+
+        assert_eq!(block.as_ref(), expected.as_slice());
     }
 }

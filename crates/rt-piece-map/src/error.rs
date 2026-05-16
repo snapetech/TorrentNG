@@ -6,6 +6,8 @@ pub enum PieceMapError {
     PieceOutOfRange(u32, u32),
     #[error("request exceeds max block size: {0} > {1}")]
     BlockTooLarge(u32, u32),
+    #[error("request length must be greater than zero")]
+    ZeroRequestLength,
     #[error(
         "request offset + length overflows piece: offset={offset} len={len} piece_len={piece_len}"
     )]
