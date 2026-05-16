@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 
 use super::client::{Client, XmlValue};
 
-/// Fields queried per torrent via d.multicall2.
+/// Fields queried per torrent via d.multicall2 / d.multicall.range.
 const TORRENT_FIELDS: &[&str] = &[
     "d.hash=",
     "d.name=",
@@ -28,6 +28,8 @@ const TORRENT_FIELDS: &[&str] = &[
     "d.peers_complete=",
     "d.message=",
 ];
+
+pub const MULTICALL_RANGE_PAGE_SIZE: i64 = 500;
 
 #[derive(Debug, Clone)]
 pub struct RawTorrent {
@@ -91,42 +93,79 @@ impl Client {
             .await
             .context("d.multicall2")?;
 
-        let rows = result.into_array();
-        let mut torrents = Vec::with_capacity(rows.len());
-        for row in rows {
-            let fields = row.into_array();
-            if fields.len() < TORRENT_FIELDS.len() {
-                continue;
+        parse_torrent_rows(result.into_array())
+    }
+
+    pub async fn has_multicall_range(&self) -> bool {
+        self.list_methods()
+            .await
+            .map(|methods| methods.iter().any(|method| method == "d.multicall.range"))
+            .unwrap_or(false)
+    }
+
+    pub async fn list_torrents_range(
+        &self,
+        view: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<RawTorrent>> {
+        let mut args: Vec<XmlValue> = vec![
+            "".into(),
+            view.to_owned().into(),
+            offset.into(),
+            limit.into(),
+        ];
+        args.extend(TORRENT_FIELDS.iter().map(|&f| XmlValue::from(f)));
+
+        let result = self
+            .call("d.multicall.range", &args)
+            .await
+            .with_context(|| format!("d.multicall.range {view} offset={offset} limit={limit}"))?;
+
+        parse_torrent_rows(result.into_array())
+    }
+
+    pub async fn list_torrents_paged(&self, view: &str) -> Result<Vec<RawTorrent>> {
+        if !self.has_multicall_range().await {
+            return self.list_torrents().await;
+        }
+
+        let mut offset = 0i64;
+        let mut torrents = Vec::new();
+        loop {
+            let mut page = self
+                .list_torrents_range(view, offset, MULTICALL_RANGE_PAGE_SIZE)
+                .await?;
+            let page_len = page.len() as i64;
+            torrents.append(&mut page);
+            if page_len < MULTICALL_RANGE_PAGE_SIZE {
+                break;
             }
-            let t = RawTorrent {
-                hash: str_field(&fields, 0),
-                name: str_field(&fields, 1),
-                size_bytes: int_field(&fields, 2),
-                bytes_done: int_field(&fields, 3),
-                down_rate: int_field(&fields, 4),
-                up_rate: int_field(&fields, 5),
-                up_total: int_field(&fields, 6),
-                down_total: int_field(&fields, 7),
-                ratio: int_field(&fields, 8),
-                is_active: bool_field(&fields, 9),
-                is_open: bool_field(&fields, 10),
-                complete: bool_field(&fields, 11),
-                state: int_field(&fields, 12),
-                priority: int_field(&fields, 13),
-                category: str_field(&fields, 14),
-                base_path: str_field(&fields, 15),
-                directory: str_field(&fields, 16),
-                creation_date: int_field(&fields, 17),
-                timestamp_finished: int_field(&fields, 18),
-                tracker_focus: int_field(&fields, 19),
-                peers_connected: int_field(&fields, 20),
-                peers_complete: int_field(&fields, 21),
-                message: str_field(&fields, 22),
-                tracker_url: String::new(),
-            };
-            torrents.push(t);
+            offset += page_len;
         }
         Ok(torrents)
+    }
+
+    pub async fn list_torrents_fast(&self) -> Result<Vec<RawTorrent>> {
+        if self.has_multicall_range().await {
+            return self
+                .list_torrents_range("active", 0, MULTICALL_RANGE_PAGE_SIZE)
+                .await;
+        }
+        self.list_torrents().await
+    }
+
+    pub async fn list_methods(&self) -> Result<Vec<String>> {
+        let value = match self.call("method.list_keys", &["".into()]).await {
+            Ok(v) => Ok(v),
+            Err(_) => self.call("system.listMethods", &[]).await,
+        }
+        .context("list rTorrent XMLRPC methods")?;
+        Ok(value
+            .into_array()
+            .into_iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect())
     }
 
     pub async fn load_magnet(
@@ -286,6 +325,43 @@ impl Client {
             .context("get network.http.user_agent")?;
         Ok(v.as_str().unwrap_or("").to_owned())
     }
+}
+
+fn parse_torrent_rows(rows: Vec<XmlValue>) -> Result<Vec<RawTorrent>> {
+    let mut torrents = Vec::with_capacity(rows.len());
+    for row in rows {
+        let fields = row.into_array();
+        if fields.len() < TORRENT_FIELDS.len() {
+            continue;
+        }
+        torrents.push(RawTorrent {
+            hash: str_field(&fields, 0),
+            name: str_field(&fields, 1),
+            size_bytes: int_field(&fields, 2),
+            bytes_done: int_field(&fields, 3),
+            down_rate: int_field(&fields, 4),
+            up_rate: int_field(&fields, 5),
+            up_total: int_field(&fields, 6),
+            down_total: int_field(&fields, 7),
+            ratio: int_field(&fields, 8),
+            is_active: bool_field(&fields, 9),
+            is_open: bool_field(&fields, 10),
+            complete: bool_field(&fields, 11),
+            state: int_field(&fields, 12),
+            priority: int_field(&fields, 13),
+            category: str_field(&fields, 14),
+            base_path: str_field(&fields, 15),
+            directory: str_field(&fields, 16),
+            creation_date: int_field(&fields, 17),
+            timestamp_finished: int_field(&fields, 18),
+            tracker_focus: int_field(&fields, 19),
+            peers_connected: int_field(&fields, 20),
+            peers_complete: int_field(&fields, 21),
+            message: str_field(&fields, 22),
+            tracker_url: String::new(),
+        });
+    }
+    Ok(torrents)
 }
 
 fn str_field(fields: &[XmlValue], i: usize) -> String {

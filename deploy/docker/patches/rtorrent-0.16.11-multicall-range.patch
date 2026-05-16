@@ -1,0 +1,97 @@
+diff --git a/src/command_events.cc b/src/command_events.cc
+index 23e262c..25370c9 100644
+--- a/src/command_events.cc
++++ b/src/command_events.cc
+@@ -1,6 +1,8 @@
+ #include "config.h"
+ 
++#include <algorithm>
+ #include <functional>
++#include <iterator>
+ #include <cstdio>
+ #include <torrent/rate.h>
+ #include <torrent/hash_string.h>
+@@ -285,6 +287,69 @@ d_multicall_filtered(const torrent::Object::list_type& args) {
+   return resultRaw;
+ }
+ 
++torrent::Object
++d_multicall_range(const torrent::Object::list_type& args) {
++  if (args.size() < 3)
++    throw torrent::input_error("d.multicall.range requires view, offset, limit and optional commands.");
++
++  torrent::Object::list_const_iterator arg = args.begin();
++
++  core::ViewManager* viewManager = control->view_manager();
++  core::ViewManager::iterator view_itr;
++
++  if (!arg->as_string().empty())
++    view_itr = viewManager->find(arg->as_string());
++  else
++    view_itr = viewManager->find("default");
++
++  if (view_itr == viewManager->end())
++    throw torrent::input_error("Could not find view.");
++
++  const int64_t offset = (++arg)->as_value();
++  const int64_t limit  = (++arg)->as_value();
++
++  if (offset < 0)
++    throw torrent::input_error("d.multicall.range offset must be non-negative.");
++
++  if (limit < 0)
++    throw torrent::input_error("d.multicall.range limit must be non-negative.");
++
++  static constexpr int64_t max_limit = 1000;
++
++  torrent::Object             resultRaw = torrent::Object::create_list();
++  torrent::Object::list_type& result = resultRaw.as_list();
++
++  if (limit == 0)
++    return resultRaw;
++
++  const int64_t bounded_limit = std::min(limit, max_limit);
++
++  auto view_begin = (*view_itr)->begin_visible();
++  auto view_end   = (*view_itr)->end_visible();
++  auto view_size  = std::distance(view_begin, view_end);
++
++  if (offset >= view_size)
++    return resultRaw;
++
++  std::advance(view_begin, offset);
++
++  auto row_end = view_begin;
++  std::advance(row_end, std::min<int64_t>(bounded_limit, std::distance(view_begin, view_end)));
++
++  ++arg; // skip to first command
++
++  for (auto itr = view_begin; itr != row_end; ++itr) {
++    torrent::Object::list_type& row = result.insert(result.end(), torrent::Object::create_list())->as_list();
++
++    for (auto command = arg; command != args.end(); ++command) {
++      auto& cmdstr = command->as_string();
++      row.push_back(rpc::parse_command(rpc::make_target(*itr), cmdstr.c_str(), cmdstr.c_str() + cmdstr.size()).first);
++    }
++  }
++
++  return resultRaw;
++}
++
+ static void
+ call_watch_command(const std::string& command, const std::string& path) {
+   rpc::commands.call_catch(command.c_str(), rpc::make_target(), path);
+@@ -342,6 +407,7 @@ initialize_command_events() {
+   CMD2_ANY_LIST    ("download_list",       std::bind(&apply_download_list, std::placeholders::_2));
+   CMD2_ANY_LIST    ("d.multicall2",        std::bind(&d_multicall, std::placeholders::_2));
+   CMD2_ANY_LIST    ("d.multicall.filtered", std::bind(&d_multicall_filtered, std::placeholders::_2));
++  CMD2_ANY_LIST    ("d.multicall.range",   std::bind(&d_multicall_range, std::placeholders::_2));
+ 
+   CMD2_ANY_LIST    ("directory.watch.added", std::bind(&directory_watch_added, std::placeholders::_2));
+ 
+@@ -355,4 +421,5 @@ initialize_command_events() {
+   rpc::rpc.mark_safe("download_list");
+   rpc::rpc.mark_safe("d.multicall2");
+   rpc::rpc.mark_safe("d.multicall.filtered");
++  rpc::rpc.mark_safe("d.multicall.range");
+ }

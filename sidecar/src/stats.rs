@@ -3,7 +3,10 @@ use std::{sync::Arc, time::Duration};
 use tokio::sync::broadcast;
 use tracing::warn;
 
-use crate::{api::ws::Event, rtorrent::{Client, TransferRates}};
+use crate::{
+    api::ws::Event,
+    rtorrent::{Client, TransferRates},
+};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_INCOMING_PORT: u16 = 50000;

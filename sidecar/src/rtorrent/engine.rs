@@ -1,4 +1,3 @@
-use anyhow::{Context, Result};
 use serde::Serialize;
 
 use super::client::{Client, XmlValue};
@@ -155,19 +154,6 @@ impl Client {
                 error: Some(e.to_string()),
             },
         }
-    }
-
-    pub async fn list_methods(&self) -> Result<Vec<String>> {
-        let value = match self.call("method.list_keys", &["".into()]).await {
-            Ok(v) => Ok(v),
-            Err(_) => self.call("system.listMethods", &[]).await,
-        }
-        .context("list rTorrent XMLRPC methods")?;
-        Ok(value
-            .into_array()
-            .into_iter()
-            .filter_map(|v| v.as_str().map(str::to_owned))
-            .collect())
     }
 
     async fn http_stack_diagnostics(&self) -> HttpStackDiagnostics {
@@ -420,6 +406,11 @@ fn capability_matrix(methods: &[String]) -> Vec<EngineCapability> {
             "scgi_gzip",
             "SCGI gzip controls",
             "network.scgi.use_gzip.set",
+        ),
+        (
+            "bounded_multicall",
+            "Bounded torrent multicall",
+            "d.multicall.range",
         ),
     ];
 

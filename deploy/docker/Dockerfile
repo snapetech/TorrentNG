@@ -30,7 +30,8 @@ WORKDIR /src
 RUN git clone --depth=1 --branch "v${LIBTORRENT_VERSION}" https://github.com/rakshasa/libtorrent.git && \
     git clone --depth=1 --branch "v${RTORRENT_VERSION}" https://github.com/rakshasa/rtorrent.git
 COPY deploy/docker/patches/rtorrent-0.16.11-user-agent-command.patch /tmp/rtorrent-user-agent-command.patch
-RUN cd rtorrent && git apply /tmp/rtorrent-user-agent-command.patch
+COPY deploy/docker/patches/rtorrent-0.16.11-multicall-range.patch /tmp/rtorrent-multicall-range.patch
+RUN cd rtorrent && git apply /tmp/rtorrent-user-agent-command.patch && git apply /tmp/rtorrent-multicall-range.patch
 RUN cd libtorrent && autoreconf -fi && \
     ./configure --prefix=/usr/local && \
     make -j"$(nproc)" && make install
@@ -57,7 +58,7 @@ ENV RTNG_STATIC_DIR=/usr/share/rtorrentng/webui
 ENV LD_LIBRARY_PATH=/usr/local/lib
 ENV RTNG_PACKAGED_RTORRENT_VERSION=0.16.11
 ENV RTNG_PACKAGED_LIBTORRENT_VERSION=0.16.11
-ENV RTNG_RTORRENT_PATCHES=rtorrent-0.16.11-user-agent-command
+ENV RTNG_RTORRENT_PATCHES=rtorrent-0.16.11-user-agent-command,rtorrent-0.16.11-multicall-range
 
 VOLUME ["/data", "/session", "/config"]
 EXPOSE 8080 50000 50000/udp

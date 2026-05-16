@@ -277,7 +277,10 @@ fn build_where(p: &ListParams) -> (String, Vec<String>) {
     }
     if let Some(tracker) = &p.tracker {
         if !tracker.is_empty() {
-            clauses.push(format!("t.tracker_url LIKE ?{} COLLATE NOCASE", args.len() + 1));
+            clauses.push(format!(
+                "t.tracker_url LIKE ?{} COLLATE NOCASE",
+                args.len() + 1
+            ));
             args.push(format!("%{tracker}%"));
         }
     }
@@ -294,8 +297,12 @@ fn build_where(p: &ListParams) -> (String, Vec<String>) {
             "inactive" => clauses.push("t.is_active=0".into()),
             "paused" | "stopped" => clauses.push("t.is_active=0".into()),
             "stalled" => clauses.push("t.is_open=1 AND t.is_active=0".into()),
-            "stalled_uploading" => clauses.push("t.complete=1 AND t.is_open=1 AND t.is_active=0".into()),
-            "stalled_downloading" => clauses.push("t.complete=0 AND t.is_open=1 AND t.is_active=0".into()),
+            "stalled_uploading" => {
+                clauses.push("t.complete=1 AND t.is_open=1 AND t.is_active=0".into())
+            }
+            "stalled_downloading" => {
+                clauses.push("t.complete=0 AND t.is_open=1 AND t.is_active=0".into())
+            }
             "checking" => clauses.push("t.state=2".into()),
             "moving" => clauses.push("0=1".into()),
             "error" | "errored" => clauses.push("t.message != '' AND t.is_active=0".into()),
@@ -315,17 +322,51 @@ fn build_where(p: &ListParams) -> (String, Vec<String>) {
 fn append_media_type_clause(media_type: &str, clauses: &mut Vec<String>, args: &mut Vec<String>) {
     let patterns: &[&str] = match media_type {
         "ebook" => &[
-            "ebook", "ebooks", "book", "books", "audiobook", ".epub", ".mobi", ".azw3", ".pdf",
-            ".cbz", ".cbr",
+            "ebook",
+            "ebooks",
+            "book",
+            "books",
+            "audiobook",
+            ".epub",
+            ".mobi",
+            ".azw3",
+            ".pdf",
+            ".cbz",
+            ".cbr",
         ],
-        "tv" => &["s%e%", "season", "episode", "hdtv", "web-dl", "webrip", "tv"],
+        "tv" => &[
+            "s%e%", "season", "episode", "hdtv", "web-dl", "webrip", "tv",
+        ],
         "video" => &[
             "movie", "movies", "film", "bluray", "bdrip", "dvdrip", "x264", "x265", "2160p",
             "1080p", "720p", ".mkv", ".mp4", ".avi", ".mov", ".wmv", ".m4v",
         ],
-        "audio" => &["music", "album", "discography", ".flac", ".mp3", ".aac", ".ogg", ".opus", ".wav", ".m4a"],
-        "image" => &[".iso", ".img", ".dmg", "installer", "image", "linux", "ubuntu", "debian", "fedora"],
-        "game" => &["game", "games", "gog", "steam", "switch", "ps4", "ps5", "xbox"],
+        "audio" => &[
+            "music",
+            "album",
+            "discography",
+            ".flac",
+            ".mp3",
+            ".aac",
+            ".ogg",
+            ".opus",
+            ".wav",
+            ".m4a",
+        ],
+        "image" => &[
+            ".iso",
+            ".img",
+            ".dmg",
+            "installer",
+            "image",
+            "linux",
+            "ubuntu",
+            "debian",
+            "fedora",
+        ],
+        "game" => &[
+            "game", "games", "gog", "steam", "switch", "ps4", "ps5", "xbox",
+        ],
         "software" => &[
             "app", "software", "source", "code", "github", "windows", "macos", ".exe", ".msi",
             ".pkg", ".deb", ".rpm", ".zip", ".tar", ".gz", ".xz", ".7z", ".rar",
