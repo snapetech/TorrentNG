@@ -9,6 +9,7 @@ use crate::{
 };
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const LIVE_SPEEDS_MAX_AGE: Duration = Duration::from_secs(8);
 const DEFAULT_INCOMING_PORT: u16 = 50000;
 
 pub async fn run(rt: Arc<Client>, tx: broadcast::Sender<Event>, interval: Duration) {
@@ -18,7 +19,10 @@ pub async fn run(rt: Arc<Client>, tx: broadcast::Sender<Event>, interval: Durati
     loop {
         ticker.tick().await;
         let rates = match live_speeds_file() {
-            Some(path) => read_live_speeds(&path).unwrap_or_default(),
+            Some(path) => match read_live_speeds(&path) {
+                Some(rates) => rates,
+                None => probe_transfer_rates(&rt).await,
+            },
             None => match tokio::time::timeout(PROBE_TIMEOUT, rt.transfer_rates()).await {
                 Ok(Ok(rates)) => rates,
                 Ok(Err(e)) => {
@@ -48,13 +52,25 @@ pub async fn run(rt: Arc<Client>, tx: broadcast::Sender<Event>, interval: Durati
 pub fn current_rates(rt: Arc<Client>) -> impl std::future::Future<Output = TransferRates> {
     async move {
         if let Some(path) = live_speeds_file() {
-            return read_live_speeds(&path).unwrap_or_default();
+            if let Some(rates) = read_live_speeds(&path) {
+                return rates;
+            }
         }
-        tokio::time::timeout(PROBE_TIMEOUT, rt.transfer_rates())
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or_default()
+        probe_transfer_rates(&rt).await
+    }
+}
+
+async fn probe_transfer_rates(rt: &Client) -> TransferRates {
+    match tokio::time::timeout(PROBE_TIMEOUT, rt.transfer_rates()).await {
+        Ok(Ok(rates)) => rates,
+        Ok(Err(e)) => {
+            warn!("transfer stats error: {e:?}");
+            TransferRates::default()
+        }
+        Err(_) => {
+            warn!("transfer stats probe timed out");
+            TransferRates::default()
+        }
     }
 }
 
@@ -69,10 +85,17 @@ fn read_live_speeds(path: &str) -> Option<TransferRates> {
     struct LiveSpeeds {
         download: i64,
         upload: i64,
+        updated_at: Option<i64>,
     }
 
     let raw = std::fs::read_to_string(path).ok()?;
     let speeds: LiveSpeeds = serde_json::from_str(&raw).ok()?;
+    if let Some(updated_at) = speeds.updated_at {
+        let age = chrono::Utc::now().timestamp().saturating_sub(updated_at);
+        if age > LIVE_SPEEDS_MAX_AGE.as_secs() as i64 {
+            return None;
+        }
+    }
     Some(TransferRates {
         download: speeds.download.max(0),
         upload: speeds.upload.max(0),

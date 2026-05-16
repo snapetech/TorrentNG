@@ -172,9 +172,16 @@ impl Client {
         if fields.len() < 3 {
             return Ok(LiveSummary::default());
         }
-        let rows = fields.pop().unwrap_or(XmlValue::Array(Vec::new())).into_array();
+        let rows = fields
+            .pop()
+            .unwrap_or(XmlValue::Array(Vec::new()))
+            .into_array();
         let upload = fields.get(1).and_then(XmlValue::as_i64).unwrap_or(0).max(0);
-        let download = fields.first().and_then(XmlValue::as_i64).unwrap_or(0).max(0);
+        let download = fields
+            .first()
+            .and_then(XmlValue::as_i64)
+            .unwrap_or(0)
+            .max(0);
 
         Ok(LiveSummary {
             rates: TransferRates { download, upload },

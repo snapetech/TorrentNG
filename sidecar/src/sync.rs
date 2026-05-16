@@ -1,5 +1,5 @@
-use std::{collections::HashSet, sync::Arc, time::Duration};
 use std::sync::atomic::Ordering;
+use std::{collections::HashSet, sync::Arc, time::Duration};
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
@@ -208,9 +208,13 @@ fn write_live_speeds(download: i64, upload: i64) {
     let body = serde_json::json!({
         "download": download.max(0),
         "upload": upload.max(0),
+        "updated_at": chrono::Utc::now().timestamp(),
     })
     .to_string();
-    if let Err(e) = std::fs::write(&path, body) {
+    let tmp_path = format!("{path}.tmp");
+    if let Err(e) = std::fs::write(&tmp_path, body).and_then(|_| std::fs::rename(&tmp_path, &path))
+    {
         warn!("write live speeds {path}: {e}");
+        let _ = std::fs::remove_file(tmp_path);
     }
 }

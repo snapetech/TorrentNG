@@ -21,7 +21,7 @@ pub struct BlockRequest {
 struct PieceState {
     piece_length: u32,
     /// Blocks that have been requested but not yet received.
-    requested: Vec<bool>,
+    requested: Vec<u16>,
     /// Blocks that have been received.
     received: Vec<bool>,
 }
@@ -31,7 +31,7 @@ impl PieceState {
         let n_blocks = n_blocks(piece_length);
         PieceState {
             piece_length,
-            requested: vec![false; n_blocks],
+            requested: vec![0; n_blocks],
             received: vec![false; n_blocks],
         }
     }
@@ -40,12 +40,26 @@ impl PieceState {
         self.requested
             .iter()
             .zip(self.received.iter())
-            .position(|(&req, &recv)| !req && !recv)
+            .position(|(&req, &recv)| req == 0 && !recv)
+    }
+
+    fn next_requested_not_received(&self, exclude: &[BlockRequest], piece: usize) -> Option<usize> {
+        self.requested
+            .iter()
+            .zip(self.received.iter())
+            .enumerate()
+            .find_map(|(block_idx, (&req, &recv))| {
+                if req == 0 || recv {
+                    return None;
+                }
+                let candidate = self.block_request_for(piece, block_idx);
+                (!exclude.contains(&candidate)).then_some(block_idx)
+            })
     }
 
     fn mark_requested(&mut self, block_idx: usize) {
         if let Some(r) = self.requested.get_mut(block_idx) {
-            *r = true;
+            *r = r.saturating_add(1);
         }
     }
 
@@ -54,7 +68,7 @@ impl PieceState {
             *r = true;
         }
         if let Some(r) = self.requested.get_mut(block_idx) {
-            *r = false; // clear request — no longer outstanding
+            *r = 0; // clear requests — no longer outstanding
         }
     }
 
@@ -70,15 +84,15 @@ impl PieceState {
             .collect()
     }
 
-    fn block_request(&self, block_idx: usize) -> BlockRequest {
+    fn block_request_for(&self, piece: usize, block_idx: usize) -> BlockRequest {
         let begin = block_idx as u32 * MAX_BLOCK_SIZE;
         let remaining = self.piece_length.saturating_sub(begin);
         let length = remaining.min(MAX_BLOCK_SIZE);
         BlockRequest {
-            piece: 0,
+            piece: piece as u32,
             begin,
             length,
-        } // caller sets .piece
+        }
     }
 }
 
@@ -201,6 +215,85 @@ impl PiecePicker {
         None
     }
 
+    /// Pick a duplicate outstanding block for endgame mode.
+    ///
+    /// This returns `Some` only after all enabled wanted pieces have no fresh
+    /// unrequested blocks left. The caller supplies blocks already outstanding
+    /// with the peer so we do not duplicate the same block to one peer.
+    pub fn pick_endgame(
+        &mut self,
+        peer_has: &[bool],
+        already_requested_by_peer: &[BlockRequest],
+    ) -> Option<BlockRequest> {
+        if !self.endgame_active() {
+            return None;
+        }
+
+        for piece in self.pieces_in_pick_order() {
+            if !self.wanted[piece]
+                || !self.enabled[piece]
+                || !peer_has.get(piece).copied().unwrap_or(false)
+            {
+                continue;
+            }
+
+            let Some(state) = self.in_progress.get_mut(&piece) else {
+                continue;
+            };
+            let Some(block_idx) =
+                state.next_requested_not_received(already_requested_by_peer, piece)
+            else {
+                continue;
+            };
+            state.mark_requested(block_idx);
+            return Some(state.block_request_for(piece, block_idx));
+        }
+        None
+    }
+
+    fn endgame_active(&self) -> bool {
+        let has_wanted = self
+            .wanted
+            .iter()
+            .zip(self.enabled.iter())
+            .any(|(wanted, enabled)| *wanted && *enabled);
+        has_wanted
+            && self
+                .wanted
+                .iter()
+                .zip(self.enabled.iter())
+                .enumerate()
+                .filter(|(_, (wanted, enabled))| **wanted && **enabled)
+                .all(|(piece, _)| {
+                    self.in_progress
+                        .get(&piece)
+                        .and_then(PieceState::next_unrequested)
+                        .is_none()
+                })
+    }
+
+    fn pieces_in_pick_order(&self) -> Vec<usize> {
+        let mut ordered = Vec::new();
+        for piece in self.priority.iter().copied() {
+            if !ordered.contains(&piece) {
+                ordered.push(piece);
+            }
+        }
+
+        let wanted_enabled: Vec<bool> = self
+            .wanted
+            .iter()
+            .zip(self.enabled.iter())
+            .map(|(wanted, enabled)| *wanted && *enabled)
+            .collect();
+        for piece in self.availability.rarest_first(&wanted_enabled) {
+            if !ordered.contains(&piece) {
+                ordered.push(piece);
+            }
+        }
+        ordered
+    }
+
     fn piece_length_for(&self, piece: usize) -> u32 {
         if piece + 1 == self.piece_count {
             self.last_piece_length
@@ -217,9 +310,7 @@ impl PiecePicker {
             .or_insert_with(|| PieceState::new(pl));
         let block_idx = state.next_unrequested()?;
         state.mark_requested(block_idx);
-        let mut req = state.block_request(block_idx);
-        req.piece = piece as u32;
-        Some(req)
+        Some(state.block_request_for(piece, block_idx))
     }
 
     /// Record a received block. Returns true if the piece is now complete.
@@ -241,7 +332,7 @@ impl PiecePicker {
         let block_idx = (begin / MAX_BLOCK_SIZE) as usize;
         if let Some(state) = self.in_progress.get_mut(&piece) {
             if let Some(r) = state.requested.get_mut(block_idx) {
-                *r = false;
+                *r = r.saturating_sub(1);
             }
         }
     }
@@ -412,6 +503,32 @@ mod tests {
         p.cancel_request(0, r1.begin);
         let r3 = p.pick(&all).unwrap();
         assert_eq!(r3.begin, r1.begin);
+    }
+
+    #[test]
+    fn endgame_duplicates_outstanding_blocks_after_fresh_work_is_exhausted() {
+        let mut p = picker_1piece(MAX_BLOCK_SIZE * 2);
+        p.availability.add_have(0);
+        let all = peer_has_all(1);
+        let r1 = p.pick(&all).unwrap();
+        let r2 = p.pick(&all).unwrap();
+
+        assert!(p.pick(&all).is_none());
+        let duplicate = p.pick_endgame(&all, &[]).unwrap();
+        assert!(duplicate == r1 || duplicate == r2);
+    }
+
+    #[test]
+    fn endgame_does_not_duplicate_same_block_to_same_peer() {
+        let mut p = picker_1piece(MAX_BLOCK_SIZE * 2);
+        p.availability.add_have(0);
+        let all = peer_has_all(1);
+        let r1 = p.pick(&all).unwrap();
+        let r2 = p.pick(&all).unwrap();
+
+        let duplicate = p.pick_endgame(&all, &[r1]).unwrap();
+        assert_eq!(duplicate, r2);
+        assert!(p.pick_endgame(&all, &[r1, r2]).is_none());
     }
 
     #[test]

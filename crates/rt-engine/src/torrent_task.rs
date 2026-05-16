@@ -152,6 +152,7 @@ struct PeerHandle {
     interested: bool,
     upload_rate: f64,
     outstanding: usize,
+    requested: Vec<BlockRequest>,
     ut_metadata_id: Option<u8>,
     metadata_size: Option<u32>,
 }
@@ -713,6 +714,7 @@ impl TorrentTask {
                 interested: false,
                 upload_rate: 0.0,
                 outstanding: 0,
+                requested: Vec::new(),
                 ut_metadata_id: None,
                 metadata_size: None,
             },
@@ -762,6 +764,7 @@ impl TorrentTask {
                 if let Some(handle) = self.active_peers.get_mut(&peer) {
                     handle.choked = true;
                     handle.outstanding = 0;
+                    handle.requested.clear();
                 }
                 for req in outstanding {
                     self.picker.cancel_request(req.piece as usize, req.begin);
@@ -780,6 +783,7 @@ impl TorrentTask {
             PeerEvent::Piece { peer, block } => {
                 if let Some(handle) = self.active_peers.get_mut(&peer) {
                     handle.outstanding = handle.outstanding.saturating_sub(1);
+                    remove_requested_block(&mut handle.requested, block.piece, block.offset);
                 }
                 self.handle_block(block).await;
                 self.refill_peer_requests(peer).await;
@@ -803,6 +807,9 @@ impl TorrentTask {
             PeerEvent::RequestTimedOut { peer, timed_out } => {
                 if let Some(handle) = self.active_peers.get_mut(&peer) {
                     handle.outstanding = handle.outstanding.saturating_sub(timed_out.len());
+                    for req in &timed_out {
+                        remove_requested_block(&mut handle.requested, req.piece, req.begin);
+                    }
                 }
                 for req in timed_out {
                     self.picker.cancel_request(req.piece as usize, req.begin);
@@ -869,14 +876,24 @@ impl TorrentTask {
         }
 
         while handle.outstanding < REQUEST_PIPELINE {
-            let Some(req) = self.picker.pick(&handle.peer_has) else {
-                break;
+            let req = match self.picker.pick(&handle.peer_has) {
+                Some(req) => req,
+                None => {
+                    let Some(req) = self
+                        .picker
+                        .pick_endgame(&handle.peer_has, &handle.requested)
+                    else {
+                        break;
+                    };
+                    req
+                }
             };
             if handle.cmd_tx.send(PeerCommand::Request(req)).await.is_err() {
                 self.picker.cancel_request(req.piece as usize, req.begin);
                 break;
             }
             handle.outstanding += 1;
+            handle.requested.push(req);
         }
     }
 
@@ -2162,6 +2179,15 @@ fn take_matching_outstanding(
     };
     outstanding.swap_remove(pos);
     true
+}
+
+fn remove_requested_block(requested: &mut Vec<BlockRequest>, piece: u32, begin: u32) {
+    if let Some(pos) = requested
+        .iter()
+        .position(|req| req.piece == piece && req.begin == begin)
+    {
+        requested.swap_remove(pos);
+    }
 }
 
 fn take_timed_out_requests(

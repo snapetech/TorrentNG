@@ -417,7 +417,11 @@ fn capability_matrix(methods: &[String]) -> Vec<EngineCapability> {
             "Live-rate torrent multicall",
             "d.multicall.nonzero_rate",
         ),
-        ("live_summary", "rtorrentNG live summary", "rtng.live_summary"),
+        (
+            "live_summary",
+            "rtorrentNG live summary",
+            "rtng.live_summary",
+        ),
     ];
 
     CAPS.iter()

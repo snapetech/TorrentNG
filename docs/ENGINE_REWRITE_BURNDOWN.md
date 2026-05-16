@@ -55,7 +55,7 @@ This is the working checklist for finishing the native Rust engine rewrite. It i
 ## 5. Peer And Download Completion
 
 - [ ] Finish production rarest-first piece picker integration.
-- [ ] Add endgame request scheduling.
+- [x] Add endgame request scheduling.
 - [x] Persist partial download piece state.
 - [x] Resume partial downloads after restart.
 - [x] Enforce file priorities in picker and writes.

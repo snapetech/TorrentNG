@@ -51,7 +51,8 @@ impl Client {
 
     /// Execute a single XMLRPC method and return the parsed result.
     pub async fn call(&self, method: &str, args: &[XmlValue]) -> Result<XmlValue> {
-        self.call_with_priority(method, args, RpcPriority::User).await
+        self.call_with_priority(method, args, RpcPriority::User)
+            .await
     }
 
     pub async fn call_sync(&self, method: &str, args: &[XmlValue]) -> Result<XmlValue> {
@@ -269,7 +270,11 @@ fn json_to_xml(value: Value) -> XmlValue {
     match value {
         Value::Null => XmlValue::Nil,
         Value::Bool(b) => XmlValue::Bool(b),
-        Value::Number(n) => XmlValue::Int(n.as_i64().or_else(|| n.as_u64().map(|n| n as i64)).unwrap_or(0)),
+        Value::Number(n) => XmlValue::Int(
+            n.as_i64()
+                .or_else(|| n.as_u64().map(|n| n as i64))
+                .unwrap_or(0),
+        ),
         Value::String(s) => XmlValue::String(s),
         Value::Array(items) => XmlValue::Array(items.into_iter().map(json_to_xml).collect()),
         Value::Object(map) => XmlValue::Struct(
@@ -281,7 +286,8 @@ fn json_to_xml(value: Value) -> XmlValue {
 }
 
 fn parse_jsonrpc_response(body: &[u8]) -> Result<XmlValue> {
-    let value: Value = serde_json::from_slice(body).context("JSON-RPC response is not valid JSON")?;
+    let value: Value =
+        serde_json::from_slice(body).context("JSON-RPC response is not valid JSON")?;
     if let Some(error) = value.get("error") {
         bail!(
             "JSON-RPC error: {}",
@@ -291,7 +297,9 @@ fn parse_jsonrpc_response(body: &[u8]) -> Result<XmlValue> {
                 .unwrap_or("unknown error")
         );
     }
-    Ok(json_to_xml(value.get("result").cloned().unwrap_or(Value::Null)))
+    Ok(json_to_xml(
+        value.get("result").cloned().unwrap_or(Value::Null),
+    ))
 }
 
 fn is_jsonrpc_unavailable(error: &anyhow::Error) -> bool {
