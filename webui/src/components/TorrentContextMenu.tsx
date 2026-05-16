@@ -50,12 +50,12 @@ export function TorrentContextMenu({
       onMouseLeave={onClose}
       style={{
         position: 'fixed', left: menu.x, top: menu.y, zIndex: 1000,
-        minWidth: 176, background: '#0f141d', border: '1px solid #334155',
-        borderRadius: 6, boxShadow: '0 18px 40px rgba(0,0,0,0.45)', padding: 4,
+        minWidth: 176, background: 'var(--panel)', border: '1px solid var(--border-strong)',
+        borderRadius: 6, boxShadow: '0 18px 40px var(--shadow)', padding: 4,
       }}
     >
       <div style={{
-        padding: '6px 8px', borderBottom: '1px solid #1e2433', color: '#64748b',
+        padding: '6px 8px', borderBottom: '1px solid var(--border)', color: 'var(--faint)',
         fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
       }}>
         {menu.torrent.name}
@@ -66,7 +66,7 @@ export function TorrentContextMenu({
           onClick={() => run(item.action)}
           style={{
             width: '100%', display: 'block', textAlign: 'left', background: 'transparent',
-            border: 'none', borderRadius: 4, color: item.danger ? '#f87171' : '#cbd5e1',
+            border: 'none', borderRadius: 4, color: item.danger ? '#f87171' : 'var(--text)',
             padding: '6px 8px', fontSize: 12, cursor: 'pointer',
           }}
         >

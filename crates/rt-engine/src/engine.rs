@@ -22,8 +22,8 @@ use rt_peer_wire::handshake::{Handshake, HANDSHAKE_LEN};
 use rt_session::{SessionRegistry, TorrentEntry, TorrentState, TransferStats};
 
 use crate::command::{
-    CmdResult, EngineCmd, EngineGlobalLimits, EnginePieceState, EngineStats, EngineTorrentFile,
-    EngineTorrentLimits, EngineTorrentMetadata, QueueMove, TorrentDiagnostic,
+    CmdResult, EngineCmd, EngineGlobalLimits, EnginePeerSnapshot, EnginePieceState, EngineStats,
+    EngineTorrentFile, EngineTorrentLimits, EngineTorrentMetadata, QueueMove, TorrentDiagnostic,
 };
 use crate::dht_task::{run_dht, DhtCommand, DhtTorrent};
 use crate::metadata_task::run_metadata_task;
@@ -371,6 +371,15 @@ impl EngineHandle {
                 peers,
                 reply,
             })
+            .await
+            .map_err(|_| "engine shut down".to_owned())?;
+        rx.await.map_err(|_| "engine dropped reply".to_owned())?
+    }
+
+    pub async fn torrent_peers(&self, info_hash: String) -> CmdResult<Vec<EnginePeerSnapshot>> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(EngineCmd::GetTorrentPeers { info_hash, reply })
             .await
             .map_err(|_| "engine shut down".to_owned())?;
         rx.await.map_err(|_| "engine dropped reply".to_owned())?
@@ -813,6 +822,10 @@ impl Engine {
                 reply,
             } => {
                 let result = self.add_peers_inner(&info_hash, peers).await;
+                let _ = reply.send(result);
+            }
+            EngineCmd::GetTorrentPeers { info_hash, reply } => {
+                let result = self.torrent_peers_inner(&info_hash).await;
                 let _ = reply.send(result);
             }
             EngineCmd::GetGlobalLimits { reply } => {
@@ -1750,6 +1763,19 @@ impl Engine {
         }
         self.send_to_torrent(info_hash, TorrentCmd::NewPeers(peers))
             .await
+    }
+
+    async fn torrent_peers_inner(&self, info_hash: &str) -> CmdResult<Vec<EnginePeerSnapshot>> {
+        let tx = self
+            .torrent_chans
+            .get(info_hash)
+            .ok_or_else(|| format!("torrent {info_hash} not found"))?;
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        tx.send(TorrentCmd::GetPeers { reply })
+            .await
+            .map_err(|_| "torrent task gone".to_owned())?;
+        rx.await
+            .map_err(|_| "torrent task dropped reply".to_owned())
     }
 
     async fn rename_file_path_inner(

@@ -8,8 +8,8 @@ interface Props {
 }
 
 const INPUT: React.CSSProperties = {
-  width: '100%', background: '#0d1117', border: '1px solid #334155', borderRadius: 5,
-  color: '#e2e8f0', padding: '6px 8px', fontSize: 12, outline: 'none', boxSizing: 'border-box',
+  width: '100%', background: 'var(--bg)', border: '1px solid var(--border-strong)', borderRadius: 5,
+  color: 'var(--text)', padding: '6px 8px', fontSize: 12, outline: 'none', boxSizing: 'border-box',
 }
 
 export function BulkEditDialog({ hashes, onClose }: Props) {
@@ -51,13 +51,13 @@ export function BulkEditDialog({ hashes, onClose }: Props) {
     }}>
       <div style={{
         width: 'min(620px, 100%)', maxHeight: '88vh', overflowY: 'auto',
-        background: '#0f141d', border: '1px solid #334155', borderRadius: 8,
-        boxShadow: '0 24px 60px rgba(0,0,0,0.5)',
+        background: 'var(--panel)', border: '1px solid var(--border-strong)', borderRadius: 8,
+        boxShadow: '0 24px 60px var(--shadow)',
       }}>
-        <header style={{ padding: '13px 15px', borderBottom: '1px solid #1e2433', display: 'flex', gap: 12, alignItems: 'center' }}>
+        <header style={{ padding: '13px 15px', borderBottom: '1px solid var(--border)', display: 'flex', gap: 12, alignItems: 'center' }}>
           <div style={{ flex: 1 }}>
-            <div style={{ color: '#e2e8f0', fontWeight: 700, fontSize: 15 }}>Edit selected torrents</div>
-            <div style={{ color: '#64748b', fontSize: 12 }}>{hashes.length.toLocaleString()} torrent{hashes.length === 1 ? '' : 's'} selected</div>
+            <div style={{ color: 'var(--text)', fontWeight: 700, fontSize: 15 }}>Edit selected torrents</div>
+            <div style={{ color: 'var(--faint)', fontSize: 12 }}>{hashes.length.toLocaleString()} torrent{hashes.length === 1 ? '' : 's'} selected</div>
           </div>
           <button onClick={onClose} style={smallButton('#94a3b8')}>Close</button>
         </header>
@@ -111,7 +111,7 @@ export function BulkEditDialog({ hashes, onClose }: Props) {
             <button disabled={busy} onClick={() => apply('Sequential toggled', () => api.torrents.toggleSequential(hashes))} style={smallButton('#f59e0b')}>Toggle sequential download</button>
           </div>
 
-          {message && <div style={{ color: message.startsWith('Error') ? '#f87171' : '#94a3b8', fontSize: 12 }}>{message}</div>}
+          {message && <div style={{ color: message.startsWith('Error') ? '#f87171' : 'var(--muted)', fontSize: 12 }}>{message}</div>}
         </div>
       </div>
     </div>
@@ -119,21 +119,21 @@ export function BulkEditDialog({ hashes, onClose }: Props) {
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
-  return <label style={{ display: 'grid', gap: 5, color: '#64748b', fontSize: 11, fontWeight: 700, textTransform: 'uppercase' }}>{label}{children}</label>
+  return <label style={{ display: 'grid', gap: 5, color: 'var(--faint)', fontSize: 11, fontWeight: 700, textTransform: 'uppercase' }}>{label}{children}</label>
 }
 
 function smallButton(color: string): React.CSSProperties {
   return {
-    background: '#1e2433', border: `1px solid ${color}66`, borderRadius: 5,
+    background: 'var(--surface-2)', border: `1px solid ${color}66`, borderRadius: 5,
     color, padding: '6px 9px', fontSize: 12, cursor: 'pointer',
   }
 }
 
 const chipButton: React.CSSProperties = {
-  background: '#111827',
-  border: '1px solid #334155',
+  background: 'var(--surface)',
+  border: '1px solid var(--border-strong)',
   borderRadius: 12,
-  color: '#94a3b8',
+  color: 'var(--muted)',
   padding: '2px 7px',
   fontSize: 11,
   cursor: 'pointer',

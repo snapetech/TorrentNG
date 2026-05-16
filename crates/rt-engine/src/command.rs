@@ -74,6 +74,22 @@ pub struct EngineGlobalLimits {
     pub speed_limits_mode: bool,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnginePeerSnapshot {
+    pub addr: SocketAddr,
+    pub client: String,
+    pub choked: bool,
+    pub upload_choked: bool,
+    pub interested: bool,
+    pub pieces: usize,
+    pub pieces_total: usize,
+    pub progress: f64,
+    pub download_rate: i64,
+    pub upload_rate: i64,
+    pub downloaded: u64,
+    pub uploaded: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueMove {
     Up,
@@ -216,6 +232,10 @@ pub enum EngineCmd {
         info_hash: String,
         peers: Vec<SocketAddr>,
         reply: oneshot::Sender<CmdResult<()>>,
+    },
+    GetTorrentPeers {
+        info_hash: String,
+        reply: oneshot::Sender<CmdResult<Vec<EnginePeerSnapshot>>>,
     },
     GetGlobalLimits {
         reply: oneshot::Sender<CmdResult<EngineGlobalLimits>>,

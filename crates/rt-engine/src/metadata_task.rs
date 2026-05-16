@@ -129,6 +129,9 @@ pub async fn run_metadata_task(
                         paused = false;
                         tracker_tick.reset_immediately();
                     }
+                    TorrentCmd::GetPeers { reply } => {
+                        let _ = reply.send(Vec::new());
+                    }
                     TorrentCmd::Recheck { .. }
                     | TorrentCmd::CancelJob { .. }
                     | TorrentCmd::ReloadFilePolicy => {}

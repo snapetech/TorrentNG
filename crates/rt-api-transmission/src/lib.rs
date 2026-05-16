@@ -8,7 +8,7 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose, Engine as _};
-use rt_engine::{EngineHandle, EngineTorrentMetadata, QueueMove};
+use rt_engine::{EngineHandle, EnginePeerSnapshot, EngineTorrentMetadata, QueueMove};
 use rt_metainfo::{parse_magnet, parse_torrent};
 use rt_session::SessionRegistry;
 use serde_json::{json, Value};
@@ -505,6 +505,19 @@ async fn torrent_get(state: &AppState, args: &Value) -> Value {
             }
         }
     }
+    let mut peers = std::collections::HashMap::new();
+    if let Some(engine) = &state.engine {
+        for entry in &entries {
+            if fields
+                .iter()
+                .any(|field| transmission_field_needs_peers(field))
+            {
+                if let Ok(snapshot) = engine.torrent_peers(entry.info_hash.clone()).await {
+                    peers.insert(entry.info_hash.clone(), snapshot);
+                }
+            }
+        }
+    }
     let torrents = entries
         .iter()
         .enumerate()
@@ -559,10 +572,23 @@ async fn torrent_get(state: &AppState, args: &Value) -> Value {
                     "doneDate" | "done-date" => json!(entry.completed_at.unwrap_or(0)),
                     "startDate" | "start-date" => json!(entry.added_at),
                     "dateCreated" | "date-created" => json!(entry.added_at),
-                    "peers" => json!([]),
-                    "peersConnected" | "peers-connected" => json!(0),
-                    "peersGettingFromUs" | "peers-getting-from-us" => json!(0),
-                    "peersSendingToUs" | "peers-sending-to-us" => json!(0),
+                    "peers" => json!(transmission_peers(
+                        peers
+                            .get(&entry.info_hash)
+                            .map(Vec::as_slice)
+                            .unwrap_or(&[])
+                    )),
+                    "peersConnected" | "peers-connected" => {
+                        json!(peers.get(&entry.info_hash).map(Vec::len).unwrap_or(0))
+                    }
+                    "peersGettingFromUs" | "peers-getting-from-us" => json!(peers
+                        .get(&entry.info_hash)
+                        .map(|peers| peers.iter().filter(|peer| peer.upload_rate > 0).count())
+                        .unwrap_or(0)),
+                    "peersSendingToUs" | "peers-sending-to-us" => json!(peers
+                        .get(&entry.info_hash)
+                        .map(|peers| peers.iter().filter(|peer| peer.download_rate > 0).count())
+                        .unwrap_or(0)),
                     "trackers" => json!(transmission_trackers(meta)),
                     "trackerStats" | "tracker-stats" => json!(transmission_tracker_stats(meta)),
                     "files" => json!(transmission_files(entry, meta)),
@@ -606,6 +632,46 @@ async fn torrent_get(state: &AppState, args: &Value) -> Value {
         })
         .collect::<Vec<_>>();
     json!({ "torrents": torrents })
+}
+
+fn transmission_field_needs_peers(field: &str) -> bool {
+    matches!(
+        field,
+        "peers"
+            | "peersConnected"
+            | "peers-connected"
+            | "peersGettingFromUs"
+            | "peers-getting-from-us"
+            | "peersSendingToUs"
+            | "peers-sending-to-us"
+    )
+}
+
+fn transmission_peers(peers: &[EnginePeerSnapshot]) -> Vec<Value> {
+    peers
+        .iter()
+        .map(|peer| {
+            json!({
+                "address": peer.addr.ip().to_string(),
+                "clientName": peer.client,
+                "clientIsChoked": peer.upload_choked,
+                "clientIsInterested": peer.interested,
+                "flagStr": "",
+                "isDownloadingFrom": peer.download_rate > 0,
+                "isEncrypted": false,
+                "isIncoming": false,
+                "isUTP": false,
+                "isUploadingTo": peer.upload_rate > 0,
+                "isSeed": peer.progress >= 1.0,
+                "peerIsChoked": peer.choked,
+                "peerIsInterested": peer.interested,
+                "port": peer.addr.port(),
+                "progress": peer.progress,
+                "rateToClient": peer.upload_rate,
+                "rateToPeer": peer.download_rate,
+            })
+        })
+        .collect()
 }
 
 fn transmission_files(

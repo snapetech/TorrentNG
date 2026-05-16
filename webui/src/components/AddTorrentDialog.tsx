@@ -7,8 +7,8 @@ interface Props {
 }
 
 const INPUT: React.CSSProperties = {
-  background: '#0f1117', border: '1px solid #334155', borderRadius: 5,
-  color: '#e2e8f0', padding: '6px 10px', fontSize: 13, outline: 'none',
+  background: 'var(--bg)', border: '1px solid var(--border-strong)', borderRadius: 5,
+  color: 'var(--text)', padding: '6px 10px', fontSize: 13, outline: 'none',
   width: '100%', boxSizing: 'border-box',
 }
 
@@ -73,16 +73,16 @@ export function AddTorrentDialog({ onClose }: Props) {
 
   return (
     <div style={{
-      position: 'fixed', inset: 0, background: '#000a', display: 'flex',
+      position: 'fixed', inset: 0, background: 'rgba(2,6,23,0.72)', display: 'flex',
       alignItems: 'center', justifyContent: 'center', zIndex: 100,
     }} onClick={e => { if (e.target === e.currentTarget) onClose() }}>
       <div style={{
-        background: '#111827', border: '1px solid #1e2433', borderRadius: 10,
+        background: 'var(--panel)', border: '1px solid var(--border)', borderRadius: 10,
         width: 480, maxWidth: '95vw', padding: 24, display: 'flex', flexDirection: 'column', gap: 16,
       }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-          <span style={{ fontWeight: 600, fontSize: 15, color: '#e2e8f0' }}>Add torrent</span>
-          <button onClick={onClose} style={{ background: 'none', border: 'none', color: '#475569', fontSize: 18, cursor: 'pointer' }}>✕</button>
+          <span style={{ fontWeight: 600, fontSize: 15, color: 'var(--text)' }}>Add torrent</span>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', color: 'var(--faint)', fontSize: 18, cursor: 'pointer' }}>✕</button>
         </div>
 
         {/* Drag-drop zone */}
@@ -92,10 +92,10 @@ export function AddTorrentDialog({ onClose }: Props) {
           onDrop={handleDrop}
           onClick={() => fileRef.current?.click()}
           style={{
-            border: `2px dashed ${dragOver ? '#3b82f6' : '#334155'}`,
+            border: `2px dashed ${dragOver ? 'var(--accent)' : 'var(--border-strong)'}`,
             borderRadius: 8, padding: '20px 16px', textAlign: 'center',
             cursor: 'pointer', transition: 'border-color 0.15s',
-            background: dragOver ? '#0f1e3a' : 'transparent',
+            background: dragOver ? 'var(--accent-soft)' : 'transparent',
           }}
         >
           <input
@@ -107,26 +107,26 @@ export function AddTorrentDialog({ onClose }: Props) {
             onChange={e => e.target.files && addFiles(e.target.files)}
           />
           {files.length === 0 ? (
-            <span style={{ fontSize: 13, color: '#64748b' }}>
-              Drop .torrent files here or <span style={{ color: '#3b82f6' }}>browse</span>
+            <span style={{ fontSize: 13, color: 'var(--faint)' }}>
+              Drop .torrent files here or <span style={{ color: 'var(--accent)' }}>browse</span>
             </span>
           ) : (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
               {files.map(f => (
                 <div key={f.name} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                  <span style={{ fontSize: 12, color: '#94a3b8', flex: 1, textAlign: 'left' }}>📄 {f.name}</span>
+                  <span style={{ fontSize: 12, color: 'var(--muted)', flex: 1, textAlign: 'left' }}>📄 {f.name}</span>
                   <button onClick={e => { e.stopPropagation(); setFiles(p => p.filter(x => x !== f)) }}
                     style={{ background: 'none', border: 'none', color: '#ef4444', cursor: 'pointer', fontSize: 14, padding: '0 2px' }}>✕</button>
                 </div>
               ))}
-              <span style={{ fontSize: 11, color: '#475569', marginTop: 4 }}>Click to add more</span>
+              <span style={{ fontSize: 11, color: 'var(--faint)', marginTop: 4 }}>Click to add more</span>
             </div>
           )}
         </div>
 
         {/* URL input */}
         <div>
-          <label style={{ fontSize: 11, color: '#64748b', display: 'block', marginBottom: 4 }}>
+          <label style={{ fontSize: 11, color: 'var(--faint)', display: 'block', marginBottom: 4 }}>
             Magnet links or URLs (one per line)
           </label>
           <textarea
@@ -140,7 +140,7 @@ export function AddTorrentDialog({ onClose }: Props) {
 
         {/* Save path */}
         <div>
-          <label style={{ fontSize: 11, color: '#64748b', display: 'block', marginBottom: 4 }}>Save path</label>
+          <label style={{ fontSize: 11, color: 'var(--faint)', display: 'block', marginBottom: 4 }}>Save path</label>
           <input
             value={savePath}
             onChange={e => setSavePath(e.target.value)}
@@ -152,7 +152,7 @@ export function AddTorrentDialog({ onClose }: Props) {
         {/* Category */}
         {categories.length > 0 && (
           <div>
-            <label style={{ fontSize: 11, color: '#64748b', display: 'block', marginBottom: 4 }}>Category</label>
+            <label style={{ fontSize: 11, color: 'var(--faint)', display: 'block', marginBottom: 4 }}>Category</label>
             <select
               value={category}
               onChange={e => {
@@ -169,8 +169,8 @@ export function AddTorrentDialog({ onClose }: Props) {
         )}
 
         {/* Start toggle */}
-        <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 13, color: '#94a3b8' }}>
-          <input type="checkbox" checked={start} onChange={e => setStart(e.target.checked)} style={{ accentColor: '#3b82f6' }} />
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 13, color: 'var(--muted)' }}>
+          <input type="checkbox" checked={start} onChange={e => setStart(e.target.checked)} style={{ accentColor: 'var(--accent)' }} />
           Start immediately
         </label>
 
@@ -178,12 +178,12 @@ export function AddTorrentDialog({ onClose }: Props) {
 
         <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
           <button onClick={onClose} style={{
-            background: 'none', border: '1px solid #334155', borderRadius: 5,
-            color: '#64748b', padding: '6px 16px', fontSize: 13, cursor: 'pointer',
+            background: 'none', border: '1px solid var(--border-strong)', borderRadius: 5,
+            color: 'var(--faint)', padding: '6px 16px', fontSize: 13, cursor: 'pointer',
           }}>Cancel</button>
           <button onClick={submit} disabled={busy} style={{
-            background: '#1e3a5f', border: '1px solid #3b82f6', borderRadius: 5,
-            color: '#93c5fd', padding: '6px 20px', fontSize: 13,
+            background: 'var(--accent-soft)', border: '1px solid var(--accent)', borderRadius: 5,
+            color: 'var(--accent-text)', padding: '6px 20px', fontSize: 13,
             cursor: busy ? 'not-allowed' : 'pointer', opacity: busy ? 0.6 : 1,
           }}>
             {busy ? 'Adding…' : 'Add'}

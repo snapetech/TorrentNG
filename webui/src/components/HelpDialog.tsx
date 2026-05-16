@@ -24,16 +24,16 @@ export function HelpDialog({ onClose }: Props) {
     }}>
       <div style={{
         width: 'min(620px, 100%)', maxHeight: '80vh', overflowY: 'auto',
-        background: '#0f141d', border: '1px solid #334155', borderRadius: 8,
-        boxShadow: '0 24px 60px rgba(0,0,0,0.5)',
+        background: 'var(--panel)', border: '1px solid var(--border-strong)', borderRadius: 8,
+        boxShadow: '0 24px 60px var(--shadow)',
       }}>
         <div style={{
           display: 'flex', alignItems: 'center', gap: 12, padding: '14px 16px',
-          borderBottom: '1px solid #1e2433',
+          borderBottom: '1px solid var(--border)',
         }}>
           <div style={{ flex: 1 }}>
-            <div style={{ fontSize: 16, fontWeight: 700, color: '#e2e8f0' }}>Help</div>
-            <div style={{ fontSize: 12, color: '#64748b', marginTop: 2 }}>rtorrentNG WebUI controls and support links</div>
+            <div style={{ fontSize: 16, fontWeight: 700, color: 'var(--text)' }}>Help</div>
+            <div style={{ fontSize: 12, color: 'var(--faint)', marginTop: 2 }}>rtorrentNG WebUI controls and support links</div>
           </div>
           <button onClick={onClose} style={closeButton}>Close</button>
         </div>
@@ -75,7 +75,7 @@ export function HelpDialog({ onClose }: Props) {
 
 const headingStyle: React.CSSProperties = {
   margin: '0 0 8px',
-  color: '#93c5fd',
+  color: 'var(--accent)',
   fontSize: 12,
   textTransform: 'uppercase',
   letterSpacing: '0.06em',
@@ -86,7 +86,7 @@ const rowStyle: React.CSSProperties = {
   gridTemplateColumns: '90px 1fr',
   gap: 10,
   alignItems: 'center',
-  color: '#cbd5e1',
+  color: 'var(--text)',
   fontSize: 13,
 }
 
@@ -95,32 +95,32 @@ const kbdStyle: React.CSSProperties = {
   width: 'fit-content',
   minWidth: 34,
   padding: '2px 7px',
-  border: '1px solid #334155',
+  border: '1px solid var(--border-strong)',
   borderRadius: 4,
-  background: '#0d1117',
-  color: '#e2e8f0',
+  background: 'var(--bg)',
+  color: 'var(--text)',
   fontFamily: 'monospace',
   fontSize: 12,
 }
 
 const textStyle: React.CSSProperties = {
   margin: 0,
-  color: '#cbd5e1',
+  color: 'var(--text)',
   fontSize: 13,
   lineHeight: 1.5,
 }
 
 const linkStyle: React.CSSProperties = {
-  color: '#93c5fd',
+  color: 'var(--accent)',
   fontSize: 13,
   textDecoration: 'none',
 }
 
 const closeButton: React.CSSProperties = {
   background: 'transparent',
-  border: '1px solid #334155',
+  border: '1px solid var(--border-strong)',
   borderRadius: 5,
-  color: '#94a3b8',
+  color: 'var(--muted)',
   padding: '5px 10px',
   fontSize: 12,
   cursor: 'pointer',

@@ -14,7 +14,9 @@ use std::{
 };
 use url::Url;
 
-use rt_engine::{EngineGlobalLimits, EnginePieceState, EngineTorrentLimits, QueueMove};
+use rt_engine::{
+    EngineGlobalLimits, EnginePeerSnapshot, EnginePieceState, EngineTorrentLimits, QueueMove,
+};
 
 use crate::{
     model::{
@@ -1475,17 +1477,65 @@ pub async fn sync_maindata(
     (StatusCode::OK, Json(resp))
 }
 
-pub async fn sync_torrent_peers() -> impl IntoResponse {
+pub async fn sync_torrent_peers(
+    State(state): State<AppState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let Some(hash) = q.get("hash").cloned() else {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "rid": 1,
+                "full_update": true,
+                "peers": {},
+                "peers_removed": [],
+                "show_flags": true,
+            })),
+        );
+    };
+    let peers = if let Some(engine) = &state.engine {
+        engine.torrent_peers(hash).await.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "rid": 1,
             "full_update": true,
-            "peers": {},
+            "peers": qbit_peer_map(&peers),
             "peers_removed": [],
             "show_flags": true,
         })),
     )
+}
+
+fn qbit_peer_map(peers: &[EnginePeerSnapshot]) -> serde_json::Map<String, serde_json::Value> {
+    peers
+        .iter()
+        .map(|peer| {
+            let key = peer.addr.to_string();
+            let value = serde_json::json!({
+                "client": peer.client,
+                "connection": "BT",
+                "country": "",
+                "country_code": "",
+                "dl_speed": peer.download_rate,
+                "downloaded": peer.downloaded,
+                "files": "",
+                "flags": "",
+                "flags_desc": "",
+                "ip": peer.addr.ip().to_string(),
+                "peer_id_client": peer.client,
+                "port": peer.addr.port(),
+                "progress": peer.progress,
+                "relevance": peer.progress,
+                "up_speed": peer.upload_rate,
+                "uploaded": peer.uploaded,
+            });
+            (key, value)
+        })
+        .collect()
 }
 
 pub async fn transfer_info(State(state): State<AppState>) -> impl IntoResponse {

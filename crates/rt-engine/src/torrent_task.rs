@@ -12,7 +12,7 @@ use futures::{SinkExt, StreamExt};
 use rusqlite::Connection;
 use tokio::net::TcpStream;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::time::interval;
 use tokio_util::codec::Framed;
 use tracing::{debug, info, warn};
@@ -49,6 +49,7 @@ use rt_tracker::{
 };
 
 use crate::peer_id::OUR_PEER_ID;
+use crate::EnginePeerSnapshot;
 
 const LOCAL_UT_METADATA_ID: u8 = 1;
 const METADATA_PIECE_SIZE: usize = 16 * 1024;
@@ -69,6 +70,9 @@ pub enum TorrentCmd {
     Shutdown,
     /// Peers discovered by DHT or tracker.
     NewPeers(Vec<SocketAddr>),
+    GetPeers {
+        reply: oneshot::Sender<Vec<EnginePeerSnapshot>>,
+    },
     /// An inbound TCP peer whose handshake already matched this torrent.
     AcceptPeer {
         stream: TcpStream,
@@ -332,6 +336,9 @@ impl TorrentTask {
                             if !self.paused {
                                 self.connect_peers(addrs).await;
                             }
+                        }
+                        TorrentCmd::GetPeers { reply } => {
+                            let _ = reply.send(self.peer_snapshots());
                         }
                         TorrentCmd::AcceptPeer {
                             stream,
@@ -756,6 +763,35 @@ impl TorrentTask {
             },
         );
         cmd_rx
+    }
+
+    fn peer_snapshots(&self) -> Vec<EnginePeerSnapshot> {
+        self.active_peers
+            .iter()
+            .map(|(addr, peer)| {
+                let pieces = peer.peer_has.iter().filter(|has| **has).count();
+                let pieces_total = peer.peer_has.len();
+                let progress = if pieces_total == 0 {
+                    0.0
+                } else {
+                    pieces as f64 / pieces_total as f64
+                };
+                EnginePeerSnapshot {
+                    addr: *addr,
+                    client: peer_client_label(peer),
+                    choked: peer.choked,
+                    upload_choked: peer.upload_choked,
+                    interested: peer.interested,
+                    pieces,
+                    pieces_total,
+                    progress,
+                    download_rate: 0,
+                    upload_rate: peer.upload_rate.max(0.0).round() as i64,
+                    downloaded: 0,
+                    uploaded: 0,
+                }
+            })
+            .collect()
     }
 
     fn remember_tracker_peers(&mut self, peers: &[SocketAddr]) {
@@ -1329,6 +1365,9 @@ impl TorrentTask {
                     return Some(RecheckOutcome::Cancelled);
                 }
                 Ok(TorrentCmd::NewPeers(_)) => {}
+                Ok(TorrentCmd::GetPeers { reply }) => {
+                    let _ = reply.send(Vec::new());
+                }
                 Ok(TorrentCmd::AcceptPeer { .. }) => {}
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return None,
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
@@ -1714,6 +1753,14 @@ fn private_peer_source_allowed(
     peer: SocketAddr,
 ) -> bool {
     !is_private || allowed_private_peers.contains(&peer)
+}
+
+fn peer_client_label(peer: &PeerHandle) -> String {
+    if peer.ut_metadata_id.is_some() {
+        "BEP10 peer".to_owned()
+    } else {
+        "BitTorrent peer".to_owned()
+    }
 }
 
 fn reconcile_peer_availability(availability: &mut Availability, old: &[bool], new: &[bool]) {
