@@ -1662,8 +1662,8 @@ impl Engine {
         if !remove_tags.is_empty() {
             entry.tags.retain(|tag| !remove_tags.contains(tag));
         }
-        let row = match load_v1_from_blob(&self.config, info_hash) {
-            Ok(meta) => row_from_entry(entry, &TorrentMeta::V1(meta)),
+        let row = match load_meta_from_blob(&self.config, info_hash) {
+            Ok(meta) => row_from_entry(entry, &meta),
             Err(_) => {
                 let db = self.db.lock().expect("database mutex poisoned");
                 let mut row = rt_db::get(&db, info_hash).map_err(|e| e.to_string())?;
@@ -1707,8 +1707,8 @@ impl Engine {
             entry.save_path = save_path.to_string_lossy().to_string();
         }
 
-        let row = match load_v1_from_blob(&self.config, info_hash) {
-            Ok(meta) => row_from_entry(entry, &TorrentMeta::V1(meta)),
+        let row = match load_meta_from_blob(&self.config, info_hash) {
+            Ok(meta) => row_from_entry(entry, &meta),
             Err(_) => {
                 let db = self.db.lock().expect("database mutex poisoned");
                 let mut row = rt_db::get(&db, info_hash).map_err(|e| e.to_string())?;
@@ -2706,12 +2706,9 @@ fn torrent_blob_path(config: &Config, info_hash: &str) -> PathBuf {
     torrent_blob_dir(config).join(format!("{info_hash}.torrent"))
 }
 
-fn load_v1_from_blob(config: &Config, info_hash: &str) -> anyhow::Result<TorrentMetaV1> {
+fn load_meta_from_blob(config: &Config, info_hash: &str) -> anyhow::Result<TorrentMeta> {
     let raw = std::fs::read(torrent_blob_path(config, info_hash))?;
-    match parse_torrent(&raw)? {
-        TorrentMeta::V1(m) | TorrentMeta::Hybrid(m, _) => Ok(m),
-        TorrentMeta::V2(_) => anyhow::bail!("pure v2 torrents are not supported"),
-    }
+    Ok(parse_torrent(&raw)?)
 }
 
 fn meta_v1(meta: TorrentMeta) -> Option<TorrentMetaV1> {
@@ -3538,22 +3535,61 @@ mod tests {
         assert_eq!(entry.tags, vec!["v2".to_owned()]);
         drop(reg);
 
+        engine
+            .update_torrent_labels_inner(
+                &hash,
+                Some(Some("archive".to_owned())),
+                vec!["complete".to_owned()],
+                vec!["v2".to_owned()],
+            )
+            .await
+            .unwrap();
+        engine
+            .update_torrent_fields_inner(
+                &hash,
+                Some("v2-renamed".to_owned()),
+                Some(temp.path().join("moved")),
+            )
+            .await
+            .unwrap();
+        engine
+            .update_file_priorities_inner(&hash, vec![0], 0)
+            .await
+            .unwrap();
+        engine
+            .rename_file_path_inner(&hash, 0, "renamed/data.bin".to_owned())
+            .await
+            .unwrap();
+
+        let projected = engine.load_torrent_metadata(&hash).unwrap();
+        assert_eq!(projected.piece_count, 4);
+        assert_eq!(projected.trackers, vec!["http://tracker.example/v2"]);
+        assert_eq!(projected.files.len(), 1);
+        assert_eq!(projected.files[0].path, "renamed/data.bin");
+        assert_eq!(projected.files[0].priority, 0);
+        assert!(!projected.files[0].wanted);
+
         assert_eq!(
             std::fs::read(torrent_blob_path(&engine.config, &hash)).unwrap(),
             raw
         );
         let db = engine.db.lock().unwrap();
         let row = rt_db::get(&db, &hash).unwrap();
-        assert_eq!(row.name, "v2dir");
+        assert_eq!(row.name, "v2-renamed");
         assert_eq!(row.state, "paused");
         assert_eq!(row.total_length, 65_536);
         assert_eq!(row.piece_length, 16_384);
         assert_eq!(row.piece_count, 4);
+        assert_eq!(row.save_path, temp.path().join("moved").to_string_lossy());
+        assert_eq!(row.category.as_deref(), Some("archive"));
+        assert_eq!(row.tags, vec!["complete".to_owned()]);
         assert_eq!(row.trackers, vec!["http://tracker.example/v2"]);
         let files = rt_db::list_torrent_files(&db, &hash).unwrap();
         assert_eq!(files.len(), 1);
-        assert_eq!(files[0].path, "v2dir/data.bin");
+        assert_eq!(files[0].path, "renamed/data.bin");
         assert_eq!(files[0].length, 65_536);
+        assert_eq!(files[0].priority, 0);
+        assert!(!files[0].wanted);
     }
 
     #[test]

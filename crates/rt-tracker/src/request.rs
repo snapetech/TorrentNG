@@ -221,6 +221,21 @@ mod tests {
     }
 
     #[test]
+    fn v2_info_hash_url_encoded_for_http_announce() {
+        let mut req = test_request(TrackerEvent::Started);
+        req.info_hash = InfoHash::V2([0x22; 32]);
+
+        let url = req
+            .to_http_query("https://tracker.example.com/announce?passkey=abc")
+            .unwrap();
+
+        assert!(url.contains("?passkey=abc&peer_id="));
+        assert!(url.contains("event=started"));
+        assert!(url.contains(&format!("info_hash={}", "%22".repeat(32))));
+        assert!(!url.contains("%2522"));
+    }
+
+    #[test]
     fn peer_id_is_not_double_encoded() {
         let req = test_request(TrackerEvent::Empty);
         let url = req
@@ -260,6 +275,19 @@ mod tests {
         assert!(url.starts_with("http://tracker.example.com/path/scrape.php?passkey=abc&"));
         assert!(url.contains("info_hash=%11%11"));
         assert!(!url.contains("%2511"));
+    }
+
+    #[test]
+    fn scrape_url_accepts_v2_info_hash() {
+        let url = to_http_scrape_url(
+            "http://tracker.example.com/path/announce?passkey=abc",
+            InfoHash::V2([0x33; 32]),
+        )
+        .unwrap();
+
+        assert!(url.starts_with("http://tracker.example.com/path/scrape?passkey=abc&"));
+        assert!(url.contains(&format!("info_hash={}", "%33".repeat(32))));
+        assert!(!url.contains("%2533"));
     }
 
     #[test]
