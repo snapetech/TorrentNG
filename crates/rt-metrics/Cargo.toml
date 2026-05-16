@@ -1,6 +1,6 @@
 [package]
 name = "rt-metrics"
-description = "rtorrentNG: rt-metrics"
+description = "rtorrentNG: runtime performance counters and scale certification"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,3 +9,11 @@ license.workspace = true
 [dependencies]
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+rt-session = { path = "../rt-session" }
+rt-api-native = { path = "../rt-api-native" }
+rt-api-qbit = { path = "../rt-api-qbit" }
+tokio = { version = "1", features = ["full"] }
+tower.workspace = true
+axum.workspace = true

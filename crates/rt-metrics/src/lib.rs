@@ -1,1 +1,3 @@
-// rt-metrics — stub, implementation pending
+pub mod counter;
+
+pub use counter::{Counter, Metrics, MetricsSnapshot};
