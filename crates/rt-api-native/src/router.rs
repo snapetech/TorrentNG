@@ -2,8 +2,8 @@ use axum::{routing::get, Router};
 
 use crate::{
     handlers::{
-        add_torrent, delete_torrent, get_torrent, health, list_torrents, metrics, pause_torrent,
-        reannounce_torrent, recheck_torrent, resume_torrent,
+        add_torrent, delete_torrent, diagnose_torrent, get_torrent, health, list_torrents, metrics,
+        pause_torrent, reannounce_torrent, recheck_torrent, resume_torrent,
     },
     state::AppState,
 };
@@ -33,5 +33,6 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/torrents/:hash/reannounce",
             axum::routing::post(reannounce_torrent),
         )
+        .route("/api/v1/torrents/:hash/diagnostics", get(diagnose_torrent))
         .with_state(state)
 }

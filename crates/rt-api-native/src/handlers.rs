@@ -306,6 +306,33 @@ pub async fn reannounce_torrent(
     control_torrent(state, headers, info_hash, TorrentControl::Reannounce).await
 }
 
+/// `GET /api/v1/torrents/{hash}/diagnostics` — explain why a torrent is not seeding.
+pub async fn diagnose_torrent(
+    State(state): State<AppState>,
+    Path(info_hash): Path<String>,
+) -> impl IntoResponse {
+    let Some(engine) = &state.engine else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                serde_json::to_value(ApiError::internal(
+                    "native engine is not available".to_owned(),
+                ))
+                .unwrap(),
+            ),
+        )
+            .into_response();
+    };
+    match engine.diagnose_torrent(info_hash.clone()).await {
+        Ok(diagnostic) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(diagnostic).unwrap()),
+        )
+            .into_response(),
+        Err(_) => not_found(info_hash),
+    }
+}
+
 /// `GET /health` — native engine readiness probe.
 pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let torrent_count = state.registry.read().await.iter().count();
@@ -679,6 +706,21 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_without_engine_returns_unavailable() {
+        let (app, hash) = setup_app_with_torrent().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/torrents/{hash}/diagnostics"))
                     .body(Body::empty())
                     .unwrap(),
             )

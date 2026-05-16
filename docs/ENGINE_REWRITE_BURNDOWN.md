@@ -70,7 +70,7 @@ This is the working checklist for finishing the native Rust engine rewrite. It i
 - [ ] Add SSE/WebSocket delta stream for native API.
 - [ ] Add clean shutdown stopped-announces with bounded deadline.
 - [x] Add API token authentication for mutating native endpoints.
-- [ ] Add structured "why is this not seeding?" diagnostic API.
+- [x] Add structured "why is this not seeding?" diagnostic API.
 - [ ] Remove stale sidecar assumptions from `rusttorrentd` docs.
 
 ## 7. Compatibility APIs

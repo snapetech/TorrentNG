@@ -43,6 +43,19 @@ pub struct EngineStats {
     pub trackers_error: u64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct TorrentDiagnostic {
+    pub info_hash: String,
+    pub state: String,
+    pub is_private: bool,
+    pub bytes_left: u64,
+    pub active_jobs: usize,
+    pub tracker_errors: usize,
+    pub tracker_warnings: usize,
+    pub reasons: Vec<String>,
+    pub next_actions: Vec<String>,
+}
+
 /// Engine-level commands (handled by the top-level EngineHandle).
 #[derive(Debug)]
 pub enum EngineCmd {
@@ -130,6 +143,11 @@ pub enum EngineCmd {
     /// Snapshot runtime and durable metrics.
     GetStats {
         reply: oneshot::Sender<CmdResult<EngineStats>>,
+    },
+    /// Structured diagnostic for why a torrent is not seeding.
+    DiagnoseTorrent {
+        info_hash: String,
+        reply: oneshot::Sender<CmdResult<TorrentDiagnostic>>,
     },
     /// Graceful shutdown.
     Shutdown,

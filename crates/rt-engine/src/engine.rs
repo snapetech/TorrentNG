@@ -19,7 +19,9 @@ use rt_metainfo::{parse_torrent, MagnetLink, TorrentMeta, TorrentMetaV1};
 use rt_peer_wire::handshake::{Handshake, HANDSHAKE_LEN};
 use rt_session::{SessionRegistry, TorrentEntry, TorrentState, TransferStats};
 
-use crate::command::{CmdResult, EngineCmd, EngineStats, EngineTorrentFile, EngineTorrentMetadata};
+use crate::command::{
+    CmdResult, EngineCmd, EngineStats, EngineTorrentFile, EngineTorrentMetadata, TorrentDiagnostic,
+};
 use crate::dht_task::{run_dht, DhtCommand, DhtTorrent};
 use crate::metadata_task::run_metadata_task;
 use crate::torrent_task::{TorrentCmd, TorrentTask};
@@ -198,6 +200,15 @@ impl EngineHandle {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx
             .send(EngineCmd::GetStats { reply })
+            .await
+            .map_err(|_| "engine shut down".to_owned())?;
+        rx.await.map_err(|_| "engine dropped reply".to_owned())?
+    }
+
+    pub async fn diagnose_torrent(&self, info_hash: String) -> CmdResult<TorrentDiagnostic> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(EngineCmd::DiagnoseTorrent { info_hash, reply })
             .await
             .map_err(|_| "engine shut down".to_owned())?;
         rx.await.map_err(|_| "engine dropped reply".to_owned())?
@@ -578,6 +589,11 @@ impl Engine {
 
             EngineCmd::GetStats { reply } => {
                 let result = self.engine_stats().await;
+                let _ = reply.send(result);
+            }
+
+            EngineCmd::DiagnoseTorrent { info_hash, reply } => {
+                let result = self.diagnose_torrent_inner(&info_hash).await;
                 let _ = reply.send(result);
             }
         }
@@ -1243,6 +1259,92 @@ impl Engine {
             }
         }
         Ok(stats)
+    }
+
+    async fn diagnose_torrent_inner(&self, info_hash: &str) -> CmdResult<TorrentDiagnostic> {
+        let (state, bytes_left) = {
+            let reg = self.registry.read().await;
+            let entry = reg
+                .get(info_hash)
+                .ok_or_else(|| format!("torrent {info_hash} not found"))?;
+            (entry.state, entry.amount_left)
+        };
+        let (is_private, trackers, active_jobs) = {
+            let db = self.db.lock().expect("database mutex poisoned");
+            let row = rt_db::get(&db, info_hash).map_err(|e| e.to_string())?;
+            let trackers = rt_db::list_torrent_trackers(&db, info_hash).unwrap_or_default();
+            let active_jobs = rt_db::list_active_jobs(&db)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .filter(|job| job.affected_torrents.iter().any(|hash| hash == info_hash))
+                .count();
+            (row.is_private, trackers, active_jobs)
+        };
+        let tracker_errors = trackers
+            .iter()
+            .filter(|tracker| tracker.status == "error")
+            .count();
+        let tracker_warnings = trackers
+            .iter()
+            .filter(|tracker| tracker.status == "warning")
+            .count();
+        let mut reasons = Vec::new();
+        let mut next_actions = Vec::new();
+        if state == TorrentState::Seeding && bytes_left == 0 {
+            reasons.push("torrent is already seeding".to_owned());
+        } else {
+            match state {
+                TorrentState::Paused | TorrentState::Stopped => {
+                    reasons.push("torrent is paused or stopped".to_owned());
+                    next_actions.push("resume the torrent".to_owned());
+                }
+                TorrentState::Checking => {
+                    reasons.push("torrent is currently checking pieces".to_owned());
+                    next_actions.push("wait for the active recheck job to finish".to_owned());
+                }
+                TorrentState::MetadataPending => {
+                    reasons.push("torrent is waiting for metadata".to_owned());
+                    next_actions
+                        .push("wait for metadata peers or add the .torrent file".to_owned());
+                }
+                TorrentState::Downloading | TorrentState::Queued => {
+                    reasons.push(format!("{bytes_left} bytes are still missing"));
+                }
+                TorrentState::Error => {
+                    reasons.push("torrent is in an error state".to_owned());
+                    next_actions.push("inspect tracker and storage errors".to_owned());
+                }
+                TorrentState::Seeding => {}
+            }
+            if active_jobs > 0 {
+                reasons.push(format!("{active_jobs} active job(s) affect this torrent"));
+            }
+            if tracker_errors > 0 {
+                reasons.push(format!("{tracker_errors} tracker(s) are in error state"));
+                next_actions.push("check tracker failure_reason values".to_owned());
+            }
+            if tracker_warnings > 0 {
+                reasons.push(format!("{tracker_warnings} tracker(s) reported warnings"));
+            }
+            if is_private && trackers.is_empty() {
+                reasons.push("private torrent has no persisted trackers".to_owned());
+                next_actions.push("add a private tracker before expecting peers".to_owned());
+            }
+        }
+        if next_actions.is_empty() && state != TorrentState::Seeding {
+            next_actions.push("inspect torrent files, trackers, and active jobs".to_owned());
+        }
+        Ok(TorrentDiagnostic {
+            info_hash: info_hash.to_owned(),
+            state: state.as_str().to_owned(),
+            is_private,
+            bytes_left,
+            active_jobs,
+            tracker_errors,
+            tracker_warnings,
+            reasons,
+            next_actions,
+        })
     }
 
     async fn control_recheck_job(&self, job_id: &str, target_state: &str) -> CmdResult<()> {
@@ -2319,6 +2421,67 @@ mod tests {
         assert_eq!(stats.jobs_active, 1);
         assert_eq!(stats.trackers_total, 1);
         assert_eq!(stats.trackers_error, 1);
+    }
+
+    #[tokio::test]
+    async fn torrent_diagnostic_explains_paused_private_tracker_gap() {
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let (_tx, rx) = mpsc::channel(1);
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        let info_hash = "f".repeat(40);
+        {
+            let mut reg = registry.write().await;
+            let mut entry = TorrentEntry::new(info_hash.clone(), "why.bin".into(), "/tmp".into());
+            entry.amount_left = 100;
+            let _ = entry.transition(TorrentState::Paused);
+            reg.add(entry).unwrap();
+        }
+        let engine = Engine {
+            config: Arc::new(Config::default()),
+            registry,
+            db: Arc::new(Mutex::new(conn)),
+            cmd_rx: rx,
+            cmd_tx: mpsc::channel(1).0,
+            torrent_chans: HashMap::new(),
+            dht_tx: None,
+        };
+        {
+            let db = engine.db.lock().unwrap();
+            rt_db::upsert(
+                &db,
+                &TorrentRow {
+                    info_hash: info_hash.clone(),
+                    name: "why.bin".to_owned(),
+                    total_length: 100,
+                    piece_length: 10,
+                    piece_count: 10,
+                    is_private: true,
+                    save_path: "/tmp".to_owned(),
+                    category: None,
+                    tags: Vec::new(),
+                    state: "paused".to_owned(),
+                    added_at: 1,
+                    completed_at: None,
+                    uploaded: 0,
+                    downloaded: 0,
+                    ratio: 0.0,
+                    trackers: Vec::new(),
+                },
+            )
+            .unwrap();
+        }
+
+        let diagnostic = engine.diagnose_torrent_inner(&info_hash).await.unwrap();
+        assert_eq!(diagnostic.state, "paused");
+        assert!(diagnostic
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("paused")));
+        assert!(diagnostic
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("no persisted trackers")));
     }
 }
 
