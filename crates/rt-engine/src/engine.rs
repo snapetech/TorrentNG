@@ -1056,8 +1056,17 @@ impl Engine {
             trackers: magnet.trackers.clone(),
         };
         {
-            let db = self.db.lock().expect("database mutex poisoned");
+            let mut db = self.db.lock().expect("database mutex poisoned");
             rt_db::upsert(&db, &row).map_err(|e| e.to_string())?;
+            let tracker_rows = tracker_rows_from_urls(
+                &entry.info_hash,
+                &row.trackers,
+                entry.stats.uploaded as i64,
+                entry.stats.downloaded as i64,
+                entry.total_length.saturating_sub(entry.stats.downloaded) as i64,
+            );
+            rt_db::replace_torrent_trackers(&mut db, &entry.info_hash, &tracker_rows)
+                .map_err(|e| e.to_string())?;
         }
 
         if let Some(info_hash) = magnet.info_hash_v1 {
@@ -1417,6 +1426,7 @@ impl Engine {
         let mut db = self.db.lock().expect("database mutex poisoned");
         rt_db::upsert(&db, &row)?;
         persist_torrent_files(&mut db, &entry.info_hash, meta)?;
+        sync_torrent_trackers_if_urls_changed(&mut db, &row)?;
         Ok(())
     }
 
@@ -1771,28 +1781,13 @@ impl Engine {
             rt_db::get(&db, info_hash).map_err(|e| e.to_string())?
         };
         row.trackers = trackers.clone();
-        let tracker_rows = trackers
-            .iter()
-            .enumerate()
-            .map(|(idx, url)| rt_db::TorrentTrackerRow {
-                info_hash: info_hash.to_owned(),
-                tracker_index: idx as i64,
-                tier: idx as i64,
-                url: url.clone(),
-                status: "pending".to_owned(),
-                last_announce_at: None,
-                next_announce_at: None,
-                last_success_at: None,
-                failure_reason: None,
-                warning_message: None,
-                seeders: None,
-                leechers: None,
-                completed: None,
-                uploaded: row.uploaded,
-                downloaded: row.downloaded,
-                left_bytes: row.total_length.saturating_sub(row.downloaded).max(0),
-            })
-            .collect::<Vec<_>>();
+        let tracker_rows = tracker_rows_from_urls(
+            info_hash,
+            &trackers,
+            row.uploaded,
+            row.downloaded,
+            row.total_length.saturating_sub(row.downloaded).max(0),
+        );
 
         {
             let mut db = self.db.lock().expect("database mutex poisoned");
@@ -2728,6 +2723,61 @@ fn persist_torrent_files(
     Ok(())
 }
 
+fn sync_torrent_trackers_if_urls_changed(
+    db: &mut Connection,
+    row: &TorrentRow,
+) -> anyhow::Result<()> {
+    let existing = rt_db::list_torrent_trackers(db, &row.info_hash)?;
+    let existing_urls = existing
+        .iter()
+        .map(|tracker| tracker.url.as_str())
+        .collect::<Vec<_>>();
+    let row_urls = row.trackers.iter().map(String::as_str).collect::<Vec<_>>();
+    if existing_urls == row_urls {
+        return Ok(());
+    }
+    let trackers = tracker_rows_from_urls(
+        &row.info_hash,
+        &row.trackers,
+        row.uploaded,
+        row.downloaded,
+        row.total_length.saturating_sub(row.downloaded).max(0),
+    );
+    rt_db::replace_torrent_trackers(db, &row.info_hash, &trackers)?;
+    Ok(())
+}
+
+fn tracker_rows_from_urls(
+    info_hash: &str,
+    trackers: &[String],
+    uploaded: i64,
+    downloaded: i64,
+    left_bytes: i64,
+) -> Vec<rt_db::TorrentTrackerRow> {
+    trackers
+        .iter()
+        .enumerate()
+        .map(|(idx, url)| rt_db::TorrentTrackerRow {
+            info_hash: info_hash.to_owned(),
+            tracker_index: idx as i64,
+            tier: idx as i64,
+            url: url.clone(),
+            status: "pending".to_owned(),
+            last_announce_at: None,
+            next_announce_at: None,
+            last_success_at: None,
+            failure_reason: None,
+            warning_message: None,
+            seeders: None,
+            leechers: None,
+            completed: None,
+            uploaded,
+            downloaded,
+            left_bytes,
+        })
+        .collect()
+}
+
 fn entry_from_row(row: &TorrentRow) -> TorrentEntry {
     TorrentEntry {
         handle: Default::default(),
@@ -3523,6 +3573,10 @@ mod tests {
         let row = rt_db::get(&db, &hash).unwrap();
         assert_eq!(row.state, "metadata_pending");
         assert_eq!(row.trackers, vec!["https://tracker.example/announce"]);
+        let trackers = rt_db::list_torrent_trackers(&db, &hash).unwrap();
+        assert_eq!(trackers.len(), 1);
+        assert_eq!(trackers[0].url, "https://tracker.example/announce");
+        assert_eq!(trackers[0].status, "pending");
         drop(db);
 
         let (reply, rx) = tokio::sync::oneshot::channel();
@@ -3739,6 +3793,10 @@ mod tests {
         assert_eq!(files[0].length, 65_536);
         assert_eq!(files[0].priority, 0);
         assert!(!files[0].wanted);
+        let trackers = rt_db::list_torrent_trackers(&db, &hash).unwrap();
+        assert_eq!(trackers.len(), 1);
+        assert_eq!(trackers[0].url, "http://tracker.example/v2");
+        assert_eq!(trackers[0].left_bytes, 65_536);
         drop(db);
 
         let (reply, rx) = tokio::sync::oneshot::channel();
