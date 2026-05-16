@@ -74,6 +74,11 @@ async fn rpc(
         "session-get" => Ok(session_get(&state).await),
         "session-stats" => Ok(session_stats(&state).await),
         "session-close" | "session-set" => Ok(json!({})),
+        "session-access-control" => Ok(json!({
+            "blocklist-enabled": false,
+            "rpc-authentication-required": false,
+            "rpc-whitelist-enabled": false,
+        })),
         "group-get" => Ok(json!({ "groups": [] })),
         "group-set" => Ok(json!({})),
         "torrent-set" => torrent_set(&state, &args).await,
@@ -318,9 +323,40 @@ async fn torrent_get(state: &AppState, args: &Value) -> Value {
                     "status" => json!(transmission_status(entry.state.as_str())),
                     "downloadDir" | "download-dir" => json!(entry.save_path),
                     "labels" => json!(entry.tags),
+                    "error" => json!(0),
+                    "errorString" | "error-string" => {
+                        json!(entry.error_message.clone().unwrap_or_default())
+                    }
+                    "eta" => json!(-1),
+                    "isPrivate" | "is-private" => json!(false),
                     "isFinished" | "is-finished" => json!(entry.completed_at.is_some()),
                     "addedDate" | "added-date" => json!(entry.added_at),
+                    "activityDate" | "activity-date" => json!(entry.added_at),
                     "doneDate" | "done-date" => json!(entry.completed_at.unwrap_or(0)),
+                    "peers" => json!([]),
+                    "peersConnected" | "peers-connected" => json!(0),
+                    "peersGettingFromUs" | "peers-getting-from-us" => json!(0),
+                    "peersSendingToUs" | "peers-sending-to-us" => json!(0),
+                    "trackers" => json!([]),
+                    "trackerStats" | "tracker-stats" => json!([]),
+                    "files" => json!([]),
+                    "fileStats" | "file-stats" => json!([]),
+                    "priorities" => json!([]),
+                    "wanted" => json!([]),
+                    "comment" => json!(""),
+                    "creator" => json!(""),
+                    "magnetLink" | "magnet-link" => {
+                        json!(format!("magnet:?xt=urn:btih:{}", entry.info_hash))
+                    }
+                    "metadataPercentComplete" | "metadata-percent-complete" => {
+                        json!(if entry.state.as_str() == "metadata_pending" {
+                            0.0
+                        } else {
+                            1.0
+                        })
+                    }
+                    "secondsDownloading" | "seconds-downloading" => json!(0),
+                    "secondsSeeding" | "seconds-seeding" => json!(0),
                     _ => Value::Null,
                 };
                 obj.insert(field.clone(), value);
@@ -464,7 +500,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("x-transmission-session-id", SESSION_ID)
                     .body(Body::from(
-                        r#"{"method":"torrent-get","arguments":{"fields":["hashString","name","percentDone"]}}"#,
+                        r#"{"method":"torrent-get","arguments":{"fields":["hashString","name","percentDone","eta","files","trackers","magnetLink"]}}"#,
                     ))
                     .unwrap(),
             )
@@ -476,6 +512,15 @@ mod tests {
         assert_eq!(body["result"], "success");
         assert_eq!(body["arguments"]["torrents"][0]["name"], "alpha");
         assert_eq!(body["arguments"]["torrents"][0]["percentDone"], 0.75);
+        assert_eq!(body["arguments"]["torrents"][0]["eta"], -1);
+        assert!(body["arguments"]["torrents"][0]["files"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(body["arguments"]["torrents"][0]["magnetLink"]
+            .as_str()
+            .unwrap()
+            .starts_with("magnet:?xt=urn:btih:"));
     }
 
     #[tokio::test]

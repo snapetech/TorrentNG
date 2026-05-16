@@ -87,6 +87,13 @@ async fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Va
             Ok(json!(true))
         }
         "web.get_events" => Ok(json!([])),
+        "web.get_torrent_files" => {
+            let hash = params
+                .first()
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing torrent id".to_owned())?;
+            torrent_files(state, hash).await
+        }
         "web.update_ui" => update_ui(state).await,
         "core.get_session_status" => session_status(state).await,
         "core.get_stats" => session_status(state).await,
@@ -94,6 +101,7 @@ async fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Va
         "core.get_download_rate" => Ok(json!(0.0)),
         "core.get_upload_rate" => Ok(json!(0.0)),
         "core.get_filter_tree" => filter_tree(state).await,
+        "core.get_session_state" => session_state(state).await,
         "core.get_torrents_status" => torrents_status(state).await,
         "core.get_torrent_status" => {
             let hash = params
@@ -166,6 +174,11 @@ async fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Va
             Ok(json!(true))
         }
         "core.get_free_space" => Ok(json!(0)),
+        "core.set_config" => Ok(json!(true)),
+        "core.get_listen_port" => Ok(json!(0)),
+        "core.get_external_ip" => Ok(json!("")),
+        "core.get_path_size" => Ok(json!(0)),
+        "core.get_cache_status" => Ok(json!({})),
         "core.get_config" => Ok(json!({
             "download_location": "/downloads",
             "move_completed": false,
@@ -189,8 +202,10 @@ fn supported_methods() -> Vec<&'static str> {
         "daemon.get_method_list",
         "web.connected",
         "web.update_ui",
+        "web.get_torrent_files",
         "core.get_torrents_status",
         "core.get_torrent_status",
+        "core.get_session_state",
         "core.pause_torrent",
         "core.resume_torrent",
         "core.force_recheck",
@@ -198,10 +213,21 @@ fn supported_methods() -> Vec<&'static str> {
         "core.add_torrent_magnet",
         "core.add_torrent_file",
         "core.get_config",
+        "core.set_config",
         "core.get_free_space",
+        "core.get_listen_port",
+        "core.get_external_ip",
         "label.get_labels",
         "label.set_torrent",
     ]
+}
+
+async fn session_state(state: &AppState) -> Result<Value, String> {
+    let reg = state.registry.read().await;
+    Ok(json!(reg
+        .iter()
+        .map(|entry| entry.info_hash.clone())
+        .collect::<Vec<_>>()))
 }
 
 async fn session_status(state: &AppState) -> Result<Value, String> {
@@ -312,6 +338,26 @@ async fn torrent_status(state: &AppState, hash: &str) -> Result<Value, String> {
     Ok(deluge_torrent(entry))
 }
 
+async fn torrent_files(state: &AppState, hash: &str) -> Result<Value, String> {
+    if let Some(engine) = &state.engine {
+        if let Ok(meta) = engine.torrent_metadata(hash.to_owned()).await {
+            return Ok(json!(meta
+                .files
+                .into_iter()
+                .map(|file| json!({
+                    "index": file.index,
+                    "path": file.path,
+                    "size": file.length,
+                    "offset": 0,
+                    "progress": 0.0,
+                    "priority": 1,
+                }))
+                .collect::<Vec<_>>()));
+        }
+    }
+    Ok(json!([]))
+}
+
 fn deluge_torrent(entry: &rt_session::TorrentEntry) -> Value {
     let progress = if entry.total_length == 0 {
         0.0
@@ -333,6 +379,14 @@ fn deluge_torrent(entry: &rt_session::TorrentEntry) -> Value {
         "label": entry.category.clone().unwrap_or_default(),
         "tags": entry.tags,
         "is_finished": entry.completed_at.is_some(),
+        "eta": 0,
+        "num_peers": 0,
+        "num_seeds": 0,
+        "total_peers": 0,
+        "total_seeds": 0,
+        "tracker_host": "",
+        "tracker_status": "",
+        "message": "",
     })
 }
 
@@ -464,6 +518,11 @@ mod tests {
             "daemon.get_method_list",
             "web.connected",
             "core.get_config",
+            "core.get_session_state",
+            "core.get_session_status",
+            "core.get_listen_port",
+            "core.get_external_ip",
+            "core.get_cache_status",
             "core.get_available_plugins",
             "core.get_libtorrent_version",
         ] {
@@ -541,5 +600,38 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["result"], json!(["movies"]));
+    }
+
+    #[tokio::test]
+    async fn deluge_file_probe_returns_array_shape() {
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        {
+            let mut reg = registry.write().await;
+            reg.add(TorrentEntry::new(
+                "c".repeat(40),
+                "gamma".into(),
+                "/data".into(),
+            ))
+            .unwrap();
+        }
+        let app = build_deluge_router(AppState::new(registry));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/json")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"id":1,"method":"web.get_torrent_files","params":["{}"]}}"#,
+                        "c".repeat(40)
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert!(body["error"].is_null());
+        assert!(body["result"].as_array().is_some());
     }
 }

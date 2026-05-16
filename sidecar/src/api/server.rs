@@ -29,7 +29,7 @@ pub fn build_router(state: AppState) -> Router {
     let static_dir = std::env::var("RTNG_STATIC_DIR").unwrap_or_else(|_| "static".to_owned());
 
     Router::new()
-        // Native API — axum 0.7 uses :param syntax
+        // Native API.
         .route(
             "/api/v1/torrents",
             get(handlers::list_torrents).post(handlers::add_torrent),
