@@ -352,6 +352,11 @@ mod tests {
         .unwrap();
         let trackers = list_torrent_trackers(&conn, &"a".repeat(40)).unwrap();
         assert_eq!(trackers.len(), 1);
+        assert_eq!(trackers[0].seeders, Some(1));
+        assert_eq!(trackers[0].leechers, Some(2));
+        assert_eq!(trackers[0].completed, Some(3));
+        assert_eq!(trackers[0].uploaded, 4);
+        assert_eq!(trackers[0].downloaded, 5);
         assert_eq!(trackers[0].left_bytes, 6);
         let all = list_all_torrent_trackers(&conn).unwrap();
         assert_eq!(all.len(), 1);

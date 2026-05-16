@@ -168,6 +168,31 @@ mod tests {
     }
 
     #[test]
+    fn private_tracker_accounting_values_are_exact_in_query() {
+        let req = AnnounceRequest {
+            info_hash: InfoHash::V1([0xCDu8; 20]),
+            peer_id: [0x2Du8; 20],
+            port: 6881,
+            uploaded: 9_876_543_210,
+            downloaded: 1_234_567_890,
+            left: 42,
+            event: TrackerEvent::Completed,
+            compact: true,
+            numwant: Some(0),
+        };
+
+        let url = req
+            .to_http_query("https://private.example/announce?passkey=secret")
+            .unwrap();
+
+        assert!(url.contains("uploaded=9876543210"));
+        assert!(url.contains("downloaded=1234567890"));
+        assert!(url.contains("left=42"));
+        assert!(url.contains("event=completed"));
+        assert!(url.contains("passkey=secret"));
+    }
+
+    #[test]
     fn empty_event_not_in_query() {
         let req = test_request(TrackerEvent::Empty);
         let url = req

@@ -50,7 +50,7 @@ This is the working checklist for finishing the native Rust engine rewrite. It i
 - [x] Add scrape support/state where tracker supports it.
 - [x] Classify tracker failures and warnings into durable state.
 - [x] Disable DHT/PEX/LSD by default for private torrents.
-- [ ] Add private-tracker accounting tests.
+- [x] Add private-tracker accounting tests.
 
 ## 5. Peer And Download Completion
 
