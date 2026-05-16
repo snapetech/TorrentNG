@@ -33,12 +33,12 @@ This is the working checklist for finishing the native Rust engine rewrite. It i
 
 - [x] Wire `rt-storage` scheduler into engine reads/writes/rechecks.
 - [x] Implement storage root registry and mount identity persistence.
-- [ ] Add dry-run import mode for existing libraries.
-- [ ] Add dry-run move/copy planning with conflict and capacity checks.
-- [ ] Implement same-filesystem rename fast path.
-- [ ] Implement copy + verify + atomic rename safe path.
-- [ ] Add rollback/partial failure reporting.
-- [ ] Add safe delete only after dry-run approval.
+- [x] Add dry-run import mode for existing libraries.
+- [x] Add dry-run move/copy planning with conflict and capacity checks.
+- [x] Implement same-filesystem rename fast path.
+- [x] Implement copy + verify + atomic rename safe path.
+- [x] Add rollback/partial failure reporting.
+- [x] Add safe delete only after dry-run approval.
 - [ ] Certify 15k-torrent dry-run import.
 
 ## 4. Tracker Correctness
