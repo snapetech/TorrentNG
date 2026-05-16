@@ -1289,11 +1289,18 @@ impl Engine {
             if self.is_metadata_placeholder_row(&row) {
                 let paused = state_from_str(&row.state) == TorrentState::Paused;
                 let entry = entry_from_row(&row);
+                {
+                    let mut db = self.db.lock().expect("database mutex poisoned");
+                    if let Err(e) = sync_torrent_trackers_if_urls_changed(&mut db, &row) {
+                        warn!(torrent = %row.info_hash, err = %e, "failed to restore metadata-pending tracker details");
+                    }
+                }
                 let mut reg = self.registry.write().await;
                 if let Err(e) = reg.add(entry) {
                     warn!(torrent = %row.info_hash, err = %e, "failed to restore metadata-pending registry entry");
                 }
                 drop(reg);
+                let mut restored = false;
                 if let Ok(info_hash) = parse_info_hash_hex(&row.info_hash) {
                     let _tx = self.spawn_metadata_task(
                         info_hash,
@@ -1311,6 +1318,20 @@ impl Engine {
                         serde_json::json!({
                             "state": row.state,
                             "metadata_pending": true,
+                            "v2_only": false,
+                        }),
+                    );
+                    restored = true;
+                }
+                if !restored {
+                    self.append_session_event(
+                        Some(&row.info_hash),
+                        EVENT_TORRENT_RESTORED,
+                        Some("metadata-pending torrent restored"),
+                        serde_json::json!({
+                            "state": row.state,
+                            "metadata_pending": true,
+                            "v2_only": row.info_hash.len() == 64,
                         }),
                     );
                 }
@@ -1344,6 +1365,12 @@ impl Engine {
                     "persisted torrent hash mismatch"
                 );
                 continue;
+            }
+            {
+                let mut db = self.db.lock().expect("database mutex poisoned");
+                if let Err(e) = sync_torrent_trackers_if_urls_changed(&mut db, &row) {
+                    warn!(torrent = %row.info_hash, err = %e, "failed to restore tracker details");
+                }
             }
 
             let entry = entry_from_row(&row);
@@ -4417,9 +4444,111 @@ mod tests {
         assert_eq!(restored.category.as_deref(), Some("movies"));
         assert_eq!(restored.tags, vec!["restored".to_owned()]);
         drop(reg);
+        let db = engine.db.lock().unwrap();
+        let trackers = rt_db::list_torrent_trackers(&db, &info_hash).unwrap();
+        assert_eq!(trackers.len(), 1);
+        assert_eq!(trackers[0].url, "http://tracker.example.com/announce");
+        drop(db);
         if let Some(tx) = engine.torrent_chans.remove(&info_hash) {
             let _ = tx.send(TorrentCmd::Shutdown).await;
         }
+    }
+
+    #[tokio::test]
+    async fn load_persisted_v2_rows_restore_taskless_registry_and_trackers() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.daemon.session_dir = temp.path().join("session");
+        config.db.path = temp.path().join("state.db");
+        std::fs::create_dir_all(torrent_blob_dir(&config)).unwrap();
+
+        let conn = Connection::open(config.db_path()).unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let raw = raw_v2_torrent();
+        let meta = parse_torrent(&raw).unwrap();
+        let info_hash = meta_info_hash_hex(&meta);
+        std::fs::write(torrent_blob_path(&config, &info_hash), &raw).unwrap();
+        rt_db::upsert(
+            &conn,
+            &TorrentRow {
+                info_hash: info_hash.clone(),
+                name: meta.name().to_owned(),
+                total_length: meta_total_length(&meta) as i64,
+                piece_length: meta_piece_length(&meta) as i64,
+                piece_count: meta_piece_count(&meta) as i64,
+                is_private: false,
+                save_path: temp.path().join("downloads").to_string_lossy().to_string(),
+                category: None,
+                tags: vec!["v2".to_owned()],
+                state: "paused".to_owned(),
+                added_at: 10,
+                completed_at: None,
+                uploaded: 0,
+                downloaded: 0,
+                ratio: 0.0,
+                trackers: meta_all_trackers(&meta),
+            },
+        )
+        .unwrap();
+        let placeholder_hash = "44".repeat(32);
+        rt_db::upsert(
+            &conn,
+            &TorrentRow {
+                info_hash: placeholder_hash.clone(),
+                name: "pending-v2".to_owned(),
+                total_length: 0,
+                piece_length: 0,
+                piece_count: 0,
+                is_private: false,
+                save_path: temp.path().join("pending").to_string_lossy().to_string(),
+                category: None,
+                tags: Vec::new(),
+                state: "metadata_pending".to_owned(),
+                added_at: 11,
+                completed_at: None,
+                uploaded: 0,
+                downloaded: 0,
+                ratio: 0.0,
+                trackers: vec!["https://tracker.example/v2-placeholder".to_owned()],
+            },
+        )
+        .unwrap();
+
+        let (_tx, rx) = mpsc::channel(1);
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        let mut engine = Engine {
+            config: Arc::new(config),
+            registry: Arc::clone(&registry),
+            db: Arc::new(Mutex::new(conn)),
+            cmd_rx: rx,
+            cmd_tx: mpsc::channel(1).0,
+            torrent_chans: HashMap::new(),
+            torrent_tasks: HashMap::new(),
+            dht_tx: None,
+        };
+
+        engine.load_persisted_torrents().await.unwrap();
+
+        assert!(engine.torrent_chans.is_empty());
+        let reg = registry.read().await;
+        assert_eq!(reg.get(&info_hash).unwrap().state, TorrentState::Paused);
+        assert_eq!(
+            reg.get(&placeholder_hash).unwrap().state,
+            TorrentState::MetadataPending
+        );
+        drop(reg);
+        let db = engine.db.lock().unwrap();
+        let trackers = rt_db::list_torrent_trackers(&db, &info_hash).unwrap();
+        assert_eq!(trackers[0].url, "http://tracker.example/v2");
+        let placeholder_trackers = rt_db::list_torrent_trackers(&db, &placeholder_hash).unwrap();
+        assert_eq!(
+            placeholder_trackers[0].url,
+            "https://tracker.example/v2-placeholder"
+        );
+        let events = rt_db::list_session_events(&db, Some(&placeholder_hash), 10).unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event.payload.contains("\"v2_only\":true")));
     }
 
     #[test]
