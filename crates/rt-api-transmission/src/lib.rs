@@ -371,7 +371,9 @@ async fn torrent_get(state: &AppState, args: &Value) -> Value {
                         json!(entry.error_message.clone().unwrap_or_default())
                     }
                     "eta" => json!(-1),
-                    "isPrivate" | "is-private" => json!(false),
+                    "isPrivate" | "is-private" => {
+                        json!(meta.map(|m| m.is_private).unwrap_or(false))
+                    }
                     "isFinished" | "is-finished" => json!(entry.completed_at.is_some()),
                     "isStalled" | "is-stalled" => json!(false),
                     "queuePosition" | "queue-position" => json!(idx),

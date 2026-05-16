@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::{extract::State, response::IntoResponse, routing::post, Json, Router};
 use base64::{engine::general_purpose, Engine as _};
-use rt_engine::EngineHandle;
+use rt_engine::{EngineHandle, EngineTorrentMetadata};
 use rt_metainfo::{parse_magnet, parse_torrent};
 use rt_session::SessionRegistry;
 use serde::Deserialize;
@@ -348,7 +348,7 @@ async fn update_ui(state: &AppState) -> Result<Value, String> {
     let reg = state.registry.read().await;
     let torrents = reg
         .iter()
-        .map(|entry| (entry.info_hash.clone(), deluge_torrent(entry)))
+        .map(|entry| (entry.info_hash.clone(), deluge_torrent(entry, None)))
         .collect::<serde_json::Map<_, _>>();
     Ok(json!({
         "connected": true,
@@ -397,20 +397,43 @@ async fn set_label(state: &AppState, hash: &str, label: &str) -> Result<(), Stri
 }
 
 async fn torrents_status(state: &AppState) -> Result<Value, String> {
-    let reg = state.registry.read().await;
-    let torrents = reg
+    let entries = {
+        let reg = state.registry.read().await;
+        reg.iter().cloned().collect::<Vec<_>>()
+    };
+    let mut metadata = std::collections::HashMap::new();
+    if let Some(engine) = &state.engine {
+        for entry in &entries {
+            if let Ok(meta) = engine.torrent_metadata(entry.info_hash.clone()).await {
+                metadata.insert(entry.info_hash.clone(), meta);
+            }
+        }
+    }
+    let torrents = entries
         .iter()
-        .map(|entry| (entry.info_hash.clone(), deluge_torrent(entry)))
+        .map(|entry| {
+            (
+                entry.info_hash.clone(),
+                deluge_torrent(entry, metadata.get(&entry.info_hash)),
+            )
+        })
         .collect::<serde_json::Map<_, _>>();
     Ok(Value::Object(torrents))
 }
 
 async fn torrent_status(state: &AppState, hash: &str) -> Result<Value, String> {
-    let reg = state.registry.read().await;
-    let entry = reg
-        .get(hash)
-        .ok_or_else(|| format!("torrent {hash} not found"))?;
-    Ok(deluge_torrent(entry))
+    let entry = {
+        let reg = state.registry.read().await;
+        reg.get(hash)
+            .cloned()
+            .ok_or_else(|| format!("torrent {hash} not found"))?
+    };
+    let meta = if let Some(engine) = &state.engine {
+        engine.torrent_metadata(hash.to_owned()).await.ok()
+    } else {
+        None
+    };
+    Ok(deluge_torrent(&entry, meta.as_ref()))
 }
 
 async fn torrent_files(state: &AppState, hash: &str) -> Result<Value, String> {
@@ -433,13 +456,17 @@ async fn torrent_files(state: &AppState, hash: &str) -> Result<Value, String> {
     Ok(json!([]))
 }
 
-fn deluge_torrent(entry: &rt_session::TorrentEntry) -> Value {
+fn deluge_torrent(entry: &rt_session::TorrentEntry, meta: Option<&EngineTorrentMetadata>) -> Value {
     let progress = if entry.total_length == 0 {
         0.0
     } else {
         entry.total_length.saturating_sub(entry.amount_left) as f64 * 100.0
             / entry.total_length as f64
     };
+    let tracker = meta
+        .and_then(|meta| meta.trackers.first())
+        .cloned()
+        .unwrap_or_default();
     json!({
         "hash": entry.info_hash,
         "name": entry.name,
@@ -459,9 +486,9 @@ fn deluge_torrent(entry: &rt_session::TorrentEntry) -> Value {
         "num_seeds": 0,
         "total_peers": 0,
         "total_seeds": 0,
-        "num_files": 0,
-        "num_pieces": 0,
-        "piece_length": 0,
+        "num_files": meta.map(|meta| meta.files.len()).unwrap_or(0),
+        "num_pieces": meta.map(|meta| meta.piece_count).unwrap_or(0),
+        "piece_length": meta.map(|meta| meta.piece_length).unwrap_or(0),
         "distributed_copies": 0.0,
         "seeds_peers_ratio": 0.0,
         "max_download_speed": -1.0,
@@ -485,15 +512,26 @@ fn deluge_torrent(entry: &rt_session::TorrentEntry) -> Value {
         "total_payload_upload": entry.stats.uploaded,
         "total_payload_download": entry.stats.downloaded,
         "next_announce": 0,
-        "private": false,
+        "private": meta.map(|meta| meta.is_private).unwrap_or(false),
         "owner": "localclient",
         "shared": false,
-        "tracker_host": "",
+        "tracker_host": tracker_host(&tracker),
         "tracker_status": "",
-        "tracker": "",
+        "tracker": tracker,
         "comment": "",
         "message": "",
     })
+}
+
+fn tracker_host(announce: &str) -> String {
+    announce
+        .split("://")
+        .nth(1)
+        .unwrap_or(announce)
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .to_owned()
 }
 
 fn labels_from_registry(reg: &SessionRegistry) -> Vec<Value> {
