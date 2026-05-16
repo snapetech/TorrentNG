@@ -36,6 +36,7 @@ pub fn parse_torrent(raw: &[u8]) -> Result<TorrentMeta, MetainfoError> {
 
     let announce = parse_announce(root);
     let announce_list = parse_announce_list(root);
+    let webseeds = parse_webseeds(root);
 
     let name = get_string(info, b"name", "name")?;
     if name.is_empty() {
@@ -83,6 +84,7 @@ pub fn parse_torrent(raw: &[u8]) -> Result<TorrentMeta, MetainfoError> {
                 info_hash: info_hash_v1,
                 announce: announce.clone(),
                 announce_list: announce_list.clone(),
+                webseeds: webseeds.clone(),
                 name: name.clone(),
                 piece_length,
                 pieces,
@@ -94,6 +96,7 @@ pub fn parse_torrent(raw: &[u8]) -> Result<TorrentMeta, MetainfoError> {
                 info_hash_v2,
                 announce,
                 announce_list,
+                webseeds,
                 name,
                 piece_length,
                 files: files_v2,
@@ -115,6 +118,7 @@ pub fn parse_torrent(raw: &[u8]) -> Result<TorrentMeta, MetainfoError> {
             info_hash_v2,
             announce,
             announce_list,
+            webseeds,
             name,
             piece_length,
             files: files_v2,
@@ -144,6 +148,7 @@ pub fn parse_torrent(raw: &[u8]) -> Result<TorrentMeta, MetainfoError> {
         info_hash,
         announce,
         announce_list,
+        webseeds,
         name,
         piece_length,
         pieces,
@@ -308,6 +313,35 @@ fn parse_announce_list(root: &BValue<'_>) -> Vec<Vec<String>> {
         .collect()
 }
 
+fn parse_webseeds(root: &BValue<'_>) -> Vec<String> {
+    let Some(value) = root.get(b"url-list") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    match value {
+        BValue::Bytes(bytes) => push_webseed_bytes(bytes, &mut out),
+        BValue::List(values) => {
+            for value in values {
+                if let Some(bytes) = value.as_bytes() {
+                    push_webseed_bytes(bytes, &mut out);
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+fn push_webseed_bytes(bytes: &[u8], out: &mut Vec<String>) {
+    let Ok(value) = std::str::from_utf8(bytes) else {
+        return;
+    };
+    let value = value.trim();
+    if !value.is_empty() && !out.iter().any(|existing| existing == value) {
+        out.push(value.to_owned());
+    }
+}
+
 fn get_bytes<'a>(
     dict: &'a BValue<'_>,
     key: &[u8],
@@ -447,6 +481,42 @@ mod tests {
             panic!("expected V1")
         };
         assert!(m.private);
+    }
+
+    #[test]
+    fn parse_webseeds_accepts_string_and_list_forms() {
+        let pieces_data = make_pieces(1);
+        let mut info_pairs: Vec<(&[u8], BValue<'_>)> = vec![
+            (b"length", BValue::Int(1024)),
+            (b"name", BValue::Bytes(b"seeded.bin")),
+            (b"piece length", BValue::Int(512 * 1024)),
+            (b"pieces", BValue::Bytes(&pieces_data)),
+        ];
+        info_pairs.sort_by(|a, b| a.0.cmp(b.0));
+        let mut root: Vec<(&[u8], BValue<'_>)> = vec![
+            (b"announce", BValue::Bytes(b"http://t.example/a")),
+            (b"info", BValue::Dict(info_pairs)),
+            (
+                b"url-list",
+                BValue::List(vec![
+                    BValue::Bytes(b" https://seed.example/file "),
+                    BValue::Bytes(b"https://seed.example/file"),
+                    BValue::Bytes(b"https://mirror.example/file"),
+                ]),
+            ),
+        ];
+        root.sort_by(|a, b| a.0.cmp(b.0));
+        let raw = encode(&BValue::Dict(root));
+        let TorrentMeta::V1(m) = parse_torrent(&raw).unwrap() else {
+            panic!("expected V1")
+        };
+        assert_eq!(
+            m.webseeds,
+            vec![
+                "https://seed.example/file".to_owned(),
+                "https://mirror.example/file".to_owned()
+            ]
+        );
     }
 
     #[test]

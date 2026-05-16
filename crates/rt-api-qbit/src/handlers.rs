@@ -707,8 +707,25 @@ pub async fn torrents_files(
 }
 
 /// `GET /api/qb/v2/torrents/webseeds`.
-pub async fn torrents_webseeds() -> impl IntoResponse {
-    (StatusCode::OK, Json(Vec::<serde_json::Value>::new()))
+pub async fn torrents_webseeds(
+    State(state): State<AppState>,
+    Query(q): Query<HashQuery>,
+) -> impl IntoResponse {
+    let Some(hash) = q.hash else {
+        return (StatusCode::OK, Json(Vec::<String>::new()));
+    };
+    let exists = {
+        let reg = state.registry.read().await;
+        reg.get(&hash).is_some()
+    };
+    let Some(engine) = &state.engine else {
+        return (StatusCode::OK, Json(Vec::<String>::new()));
+    };
+    match engine.torrent_metadata(hash).await {
+        Ok(meta) => (StatusCode::OK, Json(meta.webseeds)),
+        Err(_) if exists => (StatusCode::OK, Json(Vec::<String>::new())),
+        Err(_) => (StatusCode::NOT_FOUND, Json(Vec::<String>::new())),
+    }
 }
 
 /// `GET /api/qb/v2/torrents/pieceStates`.

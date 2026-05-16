@@ -2713,6 +2713,7 @@ fn metadata_from_v1(meta: &TorrentMetaV1) -> EngineTorrentMetadata {
         piece_states: vec![EnginePieceState::Missing; meta.pieces.len()],
         is_private: meta.private,
         trackers: meta.all_trackers(),
+        webseeds: meta.webseeds.clone(),
         files: meta
             .files
             .iter()
@@ -2735,6 +2736,7 @@ fn metadata_from_placeholder_row(row: &TorrentRow) -> EngineTorrentMetadata {
         piece_states: Vec::new(),
         is_private: row.is_private,
         trackers: row.trackers.clone(),
+        webseeds: Vec::new(),
         files: Vec::new(),
     }
 }
@@ -2786,6 +2788,7 @@ mod tests {
             info_hash: [1u8; 20],
             announce: Some("http://tracker.example.com/announce".into()),
             announce_list: Vec::new(),
+            webseeds: Vec::new(),
             name: "sample.bin".into(),
             piece_length: 16_384,
             pieces: vec![[2u8; 20], [3u8; 20]],

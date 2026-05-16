@@ -608,7 +608,7 @@ async fn torrent_get(state: &AppState, args: &Value) -> Value {
                     "corruptEver" | "corrupt-ever" => json!(0),
                     "manualAnnounceTime" | "manual-announce-time" => json!(0),
                     "maxConnectedPeers" | "max-connected-peers" => json!(0),
-                    "webseeds" => json!([]),
+                    "webseeds" => json!(meta.map(|m| m.webseeds.clone()).unwrap_or_default()),
                     "webseedsSendingToUs" | "webseeds-sending-to-us" => json!(0),
                     "bandwidthPriority" | "bandwidth-priority" => json!(0),
                     "honorsSessionLimits" | "honors-session-limits" => json!(true),
@@ -975,6 +975,7 @@ mod tests {
             ],
             is_private: false,
             trackers: Vec::new(),
+            webseeds: vec!["https://seed.example/one.bin".to_owned()],
             files: vec![
                 EngineTorrentFile {
                     index: 0,

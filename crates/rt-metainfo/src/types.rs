@@ -55,6 +55,8 @@ pub struct TorrentMetaV1 {
     pub announce: Option<String>,
     /// BEP 12 multi-tracker tiers.
     pub announce_list: Vec<Vec<String>>,
+    /// BEP 19 HTTP/FTP web seeds.
+    pub webseeds: Vec<String>,
     pub name: String,
     pub piece_length: u64,
     /// One SHA-1 hash per piece.
@@ -114,6 +116,7 @@ pub struct TorrentMetaV2 {
     pub info_hash_v2: [u8; 32],
     pub announce: Option<String>,
     pub announce_list: Vec<Vec<String>>,
+    pub webseeds: Vec<String>,
     pub name: String,
     /// Piece length must be a power of two, minimum 16 KiB.
     pub piece_length: u64,
