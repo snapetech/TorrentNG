@@ -25,6 +25,9 @@ export function useWebSocket(onStats?: (up: number, dn: number) => void, enabled
   const qc = useQueryClient()
   const ws = useRef<WebSocket | null>(null)
   const statsRef = useRef(onStats)
+  const torrentsInvalidationTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const detailInvalidationTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const detailHashes = useRef<Set<string>>(new Set())
   statsRef.current = onStats
 
   useEffect(() => {
@@ -32,11 +35,36 @@ export function useWebSocket(onStats?: (up: number, dn: number) => void, enabled
 
     let reconnectTimer: ReturnType<typeof setTimeout>
     let closed = false
+    let reconnectDelayMs = 3000
+
+    function scheduleTorrentInvalidation(hash?: string) {
+      if (hash) detailHashes.current.add(hash)
+      if (!torrentsInvalidationTimer.current) {
+        torrentsInvalidationTimer.current = setTimeout(() => {
+          torrentsInvalidationTimer.current = null
+          qc.invalidateQueries({ queryKey: ['torrents'], exact: false })
+        }, 1000)
+      }
+      if (hash && !detailInvalidationTimer.current) {
+        detailInvalidationTimer.current = setTimeout(() => {
+          const hashes = [...detailHashes.current]
+          detailHashes.current.clear()
+          detailInvalidationTimer.current = null
+          for (const h of hashes) {
+            qc.invalidateQueries({ queryKey: ['trackers', h] })
+            qc.invalidateQueries({ queryKey: ['files', h] })
+          }
+        }, 1500)
+      }
+    }
 
     function connect() {
       const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`
       const socket = new WebSocket(url)
       ws.current = socket
+      socket.onopen = () => {
+        reconnectDelayMs = 3000
+      }
 
       socket.onmessage = (e) => {
         try {
@@ -49,19 +77,15 @@ export function useWebSocket(onStats?: (up: number, dn: number) => void, enabled
             case 'torrent_added':
             case 'torrent_removed':
             case 'torrent_updated':
-              qc.invalidateQueries({ queryKey: ['torrents'], exact: false })
-              if (msg.hash) {
-                qc.invalidateQueries({ queryKey: ['trackers', msg.hash] })
-                qc.invalidateQueries({ queryKey: ['files', msg.hash] })
-              }
+              scheduleTorrentInvalidation(msg.hash)
               break
             case 'categories_updated':
               qc.invalidateQueries({ queryKey: ['categories'] })
-              qc.invalidateQueries({ queryKey: ['torrents'], exact: false })
+              scheduleTorrentInvalidation()
               break
             case 'tags_updated':
               qc.invalidateQueries({ queryKey: ['tags'] })
-              qc.invalidateQueries({ queryKey: ['torrents'], exact: false })
+              scheduleTorrentInvalidation()
               break
             case 'tracker_health_updated':
               qc.invalidateQueries({ queryKey: ['tracker-health'] })
@@ -91,7 +115,10 @@ export function useWebSocket(onStats?: (up: number, dn: number) => void, enabled
       }
 
       socket.onclose = () => {
-        if (!closed) reconnectTimer = setTimeout(connect, 3000)
+        if (!closed) {
+          reconnectTimer = setTimeout(connect, reconnectDelayMs)
+          reconnectDelayMs = Math.min(reconnectDelayMs * 2, 30_000)
+        }
       }
     }
 
@@ -99,6 +126,11 @@ export function useWebSocket(onStats?: (up: number, dn: number) => void, enabled
     return () => {
       closed = true
       clearTimeout(reconnectTimer)
+      if (torrentsInvalidationTimer.current) clearTimeout(torrentsInvalidationTimer.current)
+      if (detailInvalidationTimer.current) clearTimeout(detailInvalidationTimer.current)
+      torrentsInvalidationTimer.current = null
+      detailInvalidationTimer.current = null
+      detailHashes.current.clear()
       ws.current?.close()
     }
   }, [qc, enabled])

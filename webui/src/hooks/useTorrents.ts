@@ -27,10 +27,11 @@ export function flattenPages(data: ReturnType<typeof useTorrentsInfinite>['data'
   return { torrents, total }
 }
 
-export function useHealth() {
+export function useHealth(enabled = true) {
   return useQuery({
     queryKey: ['health'],
     queryFn: api.health,
+    enabled,
     refetchInterval: 10_000,
   })
 }

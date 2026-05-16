@@ -1,9 +1,50 @@
 use rt_path::SafeRelPath;
 
-/// Top-level torrent identity enum — v2 and hybrid are scaffolded, implemented in Phase 11.
+/// Top-level torrent identity. V2 and Hybrid added in Phase 12 (BEP 52).
 #[derive(Debug, Clone)]
 pub enum TorrentMeta {
     V1(TorrentMetaV1),
+    V2(TorrentMetaV2),
+    /// Both v1 SHA-1 and v2 SHA-256 infohashes are valid; clients can use either.
+    Hybrid(TorrentMetaV1, TorrentMetaV2),
+}
+
+impl TorrentMeta {
+    /// v1 SHA-1 infohash (20 bytes), if present.
+    pub fn v1_info_hash(&self) -> Option<[u8; 20]> {
+        match self {
+            TorrentMeta::V1(m) => Some(m.info_hash),
+            TorrentMeta::Hybrid(m, _) => Some(m.info_hash),
+            TorrentMeta::V2(_) => None,
+        }
+    }
+
+    /// v2 SHA-256 infohash (32 bytes), if present.
+    pub fn v2_info_hash(&self) -> Option<[u8; 32]> {
+        match self {
+            TorrentMeta::V2(m) => Some(m.info_hash_v2),
+            TorrentMeta::Hybrid(_, m) => Some(m.info_hash_v2),
+            TorrentMeta::V1(_) => None,
+        }
+    }
+
+    /// The primary display name.
+    pub fn name(&self) -> &str {
+        match self {
+            TorrentMeta::V1(m) => &m.name,
+            TorrentMeta::V2(m) => &m.name,
+            TorrentMeta::Hybrid(m, _) => &m.name,
+        }
+    }
+
+    /// BEP 27 private flag.
+    pub fn is_private(&self) -> bool {
+        match self {
+            TorrentMeta::V1(m) => m.private,
+            TorrentMeta::V2(m) => m.private,
+            TorrentMeta::Hybrid(m, _) => m.private,
+        }
+    }
 }
 
 /// Parsed v1 torrent metainfo.
@@ -64,4 +105,54 @@ pub struct TorrentFileV1 {
     pub path: SafeRelPath,
     /// Byte offset of this file within the concatenated content stream.
     pub offset: u64,
+}
+
+/// Parsed v2 torrent metainfo (BEP 52).
+#[derive(Debug, Clone)]
+pub struct TorrentMetaV2 {
+    /// SHA-256 of the exact bencoded `info` dictionary bytes.
+    pub info_hash_v2: [u8; 32],
+    pub announce: Option<String>,
+    pub announce_list: Vec<Vec<String>>,
+    pub name: String,
+    /// Piece length must be a power of two, minimum 16 KiB.
+    pub piece_length: u64,
+    pub files: Vec<TorrentFileV2>,
+    pub private: bool,
+    pub raw: Vec<u8>,
+}
+
+impl TorrentMetaV2 {
+    pub fn total_length(&self) -> u64 {
+        self.files.iter().map(|f| f.length).sum()
+    }
+
+    pub fn all_trackers(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        if let Some(a) = &self.announce {
+            if seen.insert(a.clone()) {
+                out.push(a.clone());
+            }
+        }
+        for tier in &self.announce_list {
+            for url in tier {
+                if seen.insert(url.clone()) {
+                    out.push(url.clone());
+                }
+            }
+        }
+        out
+    }
+}
+
+/// One file within a v2 torrent, with its merkle root hash.
+#[derive(Debug, Clone)]
+pub struct TorrentFileV2 {
+    pub index: u32,
+    pub length: u64,
+    pub path: SafeRelPath,
+    pub offset: u64,
+    /// SHA-256 merkle root of this file's 16 KiB leaf hashes.
+    pub pieces_root: [u8; 32],
 }
