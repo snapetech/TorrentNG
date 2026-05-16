@@ -790,18 +790,10 @@ pub async fn torrents_remove_categories(
 }
 
 /// `POST /api/qb/v2/torrents/createTags`.
-pub async fn torrents_create_tags(body: String) -> impl IntoResponse {
-    torrents_create_tags_inner(None, body).await
-}
-
-pub async fn torrents_create_tags_state(
+pub async fn torrents_create_tags(
     State(state): State<AppState>,
     body: String,
 ) -> impl IntoResponse {
-    torrents_create_tags_inner(Some(state), body).await
-}
-
-async fn torrents_create_tags_inner(state: Option<AppState>, body: String) -> StatusCode {
     let params = parse_form_body(&body);
     let tags = params
         .get("tags")
@@ -810,9 +802,7 @@ async fn torrents_create_tags_inner(state: Option<AppState>, body: String) -> St
     if tags.is_empty() {
         return StatusCode::BAD_REQUEST;
     }
-    if let Some(state) = state {
-        state.tags.write().await.extend(tags);
-    }
+    state.tags.write().await.extend(tags);
     StatusCode::OK
 }
 
@@ -917,6 +907,34 @@ pub async fn torrents_add_tags(State(state): State<AppState>, body: String) -> i
     StatusCode::OK
 }
 
+/// `POST /api/qb/v2/torrents/setTags`.
+pub async fn torrents_set_tags(State(state): State<AppState>, body: String) -> impl IntoResponse {
+    let params = parse_form_body(&body);
+    let hashes = params
+        .get("hashes")
+        .map(|h| extract_hashes_from_str(h))
+        .unwrap_or_default();
+    let hashes = resolve_hashes(&state, hashes).await;
+    let new_tags = params
+        .get("tags")
+        .map(|tags| split_tags(tags))
+        .unwrap_or_default();
+    for hash in hashes {
+        let old_tags = {
+            let reg = state.registry.read().await;
+            reg.get(&hash)
+                .map(|entry| entry.tags.clone())
+                .unwrap_or_default()
+        };
+        let status = update_torrent_tags(&state, &hash, new_tags.clone(), old_tags).await;
+        if status != StatusCode::OK {
+            return status;
+        }
+    }
+    state.tags.write().await.extend(new_tags);
+    StatusCode::OK
+}
+
 /// `POST /api/qb/v2/torrents/removeTags`.
 pub async fn torrents_remove_tags(
     State(state): State<AppState>,
@@ -956,6 +974,36 @@ pub async fn torrents_set_download_limit() -> impl IntoResponse {
 
 /// `POST /api/qb/v2/torrents/setUploadLimit`.
 pub async fn torrents_set_upload_limit() -> impl IntoResponse {
+    StatusCode::OK
+}
+
+/// `POST /api/qb/v2/torrents/setShareLimits`.
+pub async fn torrents_set_share_limits() -> impl IntoResponse {
+    StatusCode::OK
+}
+
+/// `POST /api/qb/v2/torrents/setForceStart`.
+pub async fn torrents_set_force_start() -> impl IntoResponse {
+    StatusCode::OK
+}
+
+/// `POST /api/qb/v2/torrents/setSuperSeeding`.
+pub async fn torrents_set_super_seeding() -> impl IntoResponse {
+    StatusCode::OK
+}
+
+/// `POST /api/qb/v2/torrents/setAutoTMM`.
+pub async fn torrents_set_auto_tmm() -> impl IntoResponse {
+    StatusCode::OK
+}
+
+/// `POST /api/qb/v2/torrents/toggleSequentialDownload`.
+pub async fn torrents_toggle_sequential_download() -> impl IntoResponse {
+    StatusCode::OK
+}
+
+/// `POST /api/qb/v2/torrents/toggleFirstLastPiecePrio`.
+pub async fn torrents_toggle_first_last_piece_prio() -> impl IntoResponse {
     StatusCode::OK
 }
 
@@ -1035,6 +1083,19 @@ pub async fn sync_maindata(State(state): State<AppState>) -> impl IntoResponse {
     (StatusCode::OK, Json(resp))
 }
 
+pub async fn sync_torrent_peers() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "rid": 1,
+            "full_update": true,
+            "peers": {},
+            "peers_removed": [],
+            "show_flags": true,
+        })),
+    )
+}
+
 pub async fn transfer_info() -> impl IntoResponse {
     (
         StatusCode::OK,
@@ -1047,6 +1108,67 @@ pub async fn transfer_info() -> impl IntoResponse {
             free_space_on_disk: 0,
         }),
     )
+}
+
+pub async fn transfer_ban_peers() -> impl IntoResponse {
+    StatusCode::OK
+}
+
+pub async fn log_main() -> impl IntoResponse {
+    (StatusCode::OK, Json(Vec::<serde_json::Value>::new()))
+}
+
+pub async fn log_peers() -> impl IntoResponse {
+    (StatusCode::OK, Json(Vec::<String>::new()))
+}
+
+pub async fn search_status() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "Stopped",
+            "plugins": [],
+        })),
+    )
+}
+
+pub async fn search_plugins() -> impl IntoResponse {
+    (StatusCode::OK, Json(Vec::<String>::new()))
+}
+
+pub async fn search_start() -> impl IntoResponse {
+    (StatusCode::OK, Json(serde_json::json!({ "id": 0 })))
+}
+
+pub async fn search_stop() -> impl IntoResponse {
+    StatusCode::OK
+}
+
+pub async fn search_results() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "Stopped",
+            "total": 0,
+            "results": [],
+        })),
+    )
+}
+
+pub async fn rss_items() -> impl IntoResponse {
+    (StatusCode::OK, Json(serde_json::json!({})))
+}
+
+pub async fn rss_rules() -> impl IntoResponse {
+    (StatusCode::OK, Json(serde_json::json!({})))
+}
+
+pub async fn rss_matching_articles() -> impl IntoResponse {
+    (StatusCode::OK, Json(Vec::<serde_json::Value>::new()))
+}
+
+pub async fn rss_noop() -> impl IntoResponse {
+    StatusCode::OK
 }
 
 // ---------------------------------------------------------------------------
