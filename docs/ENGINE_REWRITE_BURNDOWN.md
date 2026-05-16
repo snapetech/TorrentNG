@@ -49,17 +49,17 @@ This is the working checklist for finishing the native Rust engine rewrite. It i
 - [x] Add restart jitter to prevent announce storms.
 - [ ] Add scrape support/state where tracker supports it.
 - [x] Classify tracker failures and warnings into durable state.
-- [ ] Disable DHT/PEX/LSD by default for private torrents.
+- [x] Disable DHT/PEX/LSD by default for private torrents.
 - [ ] Add private-tracker accounting tests.
 
 ## 5. Peer And Download Completion
 
 - [ ] Finish production rarest-first piece picker integration.
 - [ ] Add endgame request scheduling.
-- [ ] Persist partial download piece state.
-- [ ] Resume partial downloads after restart.
+- [x] Persist partial download piece state.
+- [x] Resume partial downloads after restart.
 - [ ] Enforce file priorities in picker and writes.
-- [ ] Verify every received piece before marking complete.
+- [x] Verify every received piece before marking complete.
 - [ ] Harden upload serving for large multi-file torrents.
 - [ ] Add public Linux ISO download certification.
 

@@ -62,6 +62,14 @@ impl PieceState {
         self.received.iter().all(|&r| r)
     }
 
+    fn received_blocks(&self) -> Vec<u32> {
+        self.received
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, received)| received.then_some(idx as u32))
+            .collect()
+    }
+
     fn block_request(&self, block_idx: usize) -> BlockRequest {
         let begin = block_idx as u32 * MAX_BLOCK_SIZE;
         let remaining = self.piece_length.saturating_sub(begin);
@@ -118,6 +126,25 @@ impl PiecePicker {
         if piece < self.piece_count {
             self.wanted[piece] = true;
             self.in_progress.remove(&piece);
+        }
+    }
+
+    pub fn restore_partial_piece(&mut self, piece: usize, received_blocks: &[u32]) {
+        if piece >= self.piece_count || received_blocks.is_empty() || !self.wanted[piece] {
+            return;
+        }
+        let piece_length = self.piece_length_for(piece);
+        let mut state = PieceState::new(piece_length);
+        for block_idx in received_blocks {
+            if let Some(received) = state.received.get_mut(*block_idx as usize) {
+                *received = true;
+            }
+        }
+        if state.is_complete() {
+            self.wanted[piece] = false;
+            self.in_progress.remove(&piece);
+        } else {
+            self.in_progress.insert(piece, state);
         }
     }
 
@@ -216,6 +243,19 @@ impl PiecePicker {
     pub fn have_pieces(&self) -> Vec<bool> {
         self.wanted.iter().map(|wanted| !*wanted).collect()
     }
+
+    pub fn partial_pieces(&self) -> Vec<(u32, Vec<u32>)> {
+        let mut partials: Vec<_> = self
+            .in_progress
+            .iter()
+            .filter_map(|(piece, state)| {
+                let blocks = state.received_blocks();
+                (!blocks.is_empty()).then_some((*piece as u32, blocks))
+            })
+            .collect();
+        partials.sort_by_key(|(piece, _)| *piece);
+        partials
+    }
 }
 
 #[cfg(test)]
@@ -301,6 +341,23 @@ mod tests {
         p.mark_have(1);
         p.mark_have(3);
         assert_eq!(p.have_pieces(), vec![false, true, false, true]);
+    }
+
+    #[test]
+    fn partial_piece_snapshot_restores_received_blocks() {
+        let mut p = picker_1piece(MAX_BLOCK_SIZE * 2);
+        p.availability.add_have(0);
+        let all = peer_has_all(1);
+        let first = p.pick(&all).unwrap();
+        let second = p.pick(&all).unwrap();
+        assert!(!p.block_received(0, first.begin));
+        assert_eq!(p.partial_pieces(), vec![(0, vec![0])]);
+
+        let mut restored = picker_1piece(MAX_BLOCK_SIZE * 2);
+        restored.availability.add_have(0);
+        restored.restore_partial_piece(0, &[0]);
+        let next = restored.pick(&all).unwrap();
+        assert_eq!(next.begin, second.begin);
     }
 
     #[test]

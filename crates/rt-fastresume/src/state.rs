@@ -29,6 +29,12 @@ pub struct FileHint {
     pub inode: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PartialPieceState {
+    pub piece: u32,
+    pub received_blocks: Vec<u32>,
+}
+
 /// Policy controlling when pieces can be marked Valid without explicit hash check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ImportPolicy {
@@ -54,6 +60,9 @@ pub struct FastresumeState {
     pub session_generation: u64,
     /// Per-piece verification state. Index = piece index.
     pub pieces: Vec<PieceState>,
+    /// Received-but-not-yet-verified block indexes for partial pieces.
+    #[serde(default)]
+    pub partial_pieces: Vec<PartialPieceState>,
     /// Per-file hints for fast re-validation.
     pub file_hints: Vec<FileHint>,
     /// Unix timestamp of last full verification (0 = never).
@@ -74,6 +83,7 @@ impl FastresumeState {
             info_hash: hex::encode(info_hash),
             session_generation: 1,
             pieces: vec![PieceState::Unknown; piece_count as usize],
+            partial_pieces: Vec::new(),
             file_hints: Vec::new(),
             last_full_verify: 0,
             clean_shutdown: false,
@@ -205,6 +215,7 @@ mod tests {
         assert_eq!(state.piece_count(), 4);
         assert_eq!(state.valid_piece_count(), 0);
         assert_eq!(state.unknown_piece_count(), 4);
+        assert!(state.partial_pieces.is_empty());
         assert!(!state.is_complete());
     }
 

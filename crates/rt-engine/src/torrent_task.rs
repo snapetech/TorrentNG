@@ -20,7 +20,9 @@ use url::Url;
 
 use std::sync::Arc;
 
-use rt_fastresume::{FastresumeState, FastresumeStore, FileHint, ImportPolicy, PieceState};
+use rt_fastresume::{
+    FastresumeState, FastresumeStore, FileHint, ImportPolicy, PartialPieceState, PieceState,
+};
 use rt_metainfo::{torrent_info_bytes, TorrentMetaV1};
 use rt_path::{StorageProfile, StorageRootId};
 use rt_peer_manager::{
@@ -880,6 +882,7 @@ impl TorrentTask {
             return;
         }
         self.record_download(block.data.len() as u64).await;
+        self.save_fastresume(false).await;
 
         let complete = self
             .picker
@@ -1296,6 +1299,10 @@ impl TorrentTask {
                 }
             }
         }
+        for partial in &state.partial_pieces {
+            self.picker
+                .restore_partial_piece(partial.piece as usize, &partial.received_blocks);
+        }
 
         {
             let mut reg = self.registry.write().await;
@@ -1492,6 +1499,15 @@ impl TorrentTask {
                 } else {
                     PieceState::Unknown
                 }
+            })
+            .collect();
+        state.partial_pieces = self
+            .picker
+            .partial_pieces()
+            .into_iter()
+            .map(|(piece, received_blocks)| PartialPieceState {
+                piece,
+                received_blocks,
             })
             .collect();
         state.uploaded_bytes = uploaded;
