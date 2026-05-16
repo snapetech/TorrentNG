@@ -19,7 +19,7 @@ pub struct SyntheticTorrentDataset {
 
 impl SyntheticTorrentDataset {
     pub fn new(count: usize) -> Self {
-        let torrents = (0..count).map(torrent_row).collect();
+        let torrents = (0..count).map(synthetic_torrent_row).collect();
         Self { torrents }
     }
 
@@ -56,6 +56,48 @@ pub fn memory_db() -> Result<Connection, rt_db::DbError> {
     let conn = Connection::open_in_memory()?;
     rt_db::migrate(&conn)?;
     Ok(conn)
+}
+
+/// Build a deterministic torrent row for scale and certification datasets.
+pub fn synthetic_torrent_row(index: usize) -> rt_db::TorrentRow {
+    let total_length = 64 * 1024 * 1024 + ((index % 8192) as i64 * 4096);
+    let downloaded = if index % 5 == 0 {
+        total_length / 2
+    } else {
+        total_length
+    };
+    let state = if downloaded == total_length {
+        "seeding"
+    } else {
+        "downloading"
+    };
+    rt_db::TorrentRow {
+        info_hash: fixture_info_hash(index),
+        name: format!("Synthetic Scale Torrent {index:08}"),
+        total_length,
+        piece_length: 256 * 1024,
+        piece_count: (total_length + (256 * 1024 - 1)) / (256 * 1024),
+        is_private: index % 3 != 0,
+        save_path: format!("/certification/library/{:02}", index % 64),
+        category: Some(format!("category-{:02}", index % 32)),
+        tags: vec![format!("tag-{:02}", index % 128)],
+        state: state.to_owned(),
+        added_at: FIXTURE_ADDED_AT + index as i64,
+        completed_at: (downloaded == total_length)
+            .then_some(FIXTURE_ADDED_AT + 100_000 + index as i64),
+        uploaded: downloaded.saturating_mul((index % 4) as i64),
+        downloaded,
+        ratio: if downloaded == 0 {
+            0.0
+        } else {
+            downloaded.saturating_mul((index % 4) as i64) as f64 / downloaded as f64
+        },
+        trackers: vec![format!(
+            "https://tracker-{:02}.example/announce/{}",
+            index % 16,
+            index
+        )],
+    }
 }
 
 /// Build a deterministic 40-character hex SHA-1-like info hash.
@@ -150,5 +192,16 @@ mod tests {
 
         assert_eq!(rt_db::list_all(&conn).unwrap().len(), 100);
         assert!(dataset.total_bytes() > 0);
+    }
+
+    #[test]
+    fn synthetic_rows_are_stable_and_scale_shaped() {
+        let row = synthetic_torrent_row(42);
+
+        assert_eq!(row.info_hash.len(), 40);
+        assert!(row.total_length >= 64 * 1024 * 1024);
+        assert!(row.piece_count > 0);
+        assert!(row.trackers[0].contains("announce"));
+        assert!(matches!(row.state.as_str(), "seeding" | "downloading"));
     }
 }
