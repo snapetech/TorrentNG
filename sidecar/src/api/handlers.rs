@@ -95,6 +95,16 @@ pub async fn tracker_health(State(s): State<AppState>) -> impl IntoResponse {
     }
 }
 
+pub async fn sidebar_facets(State(s): State<AppState>) -> impl IntoResponse {
+    match s.db.sidebar_facets() {
+        Ok(facets) => Json(facets).into_response(),
+        Err(e) => {
+            tracing::error!("sidebar facets: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
 pub async fn engine_diagnostics(State(s): State<AppState>) -> impl IntoResponse {
     Json(s.rt.engine_diagnostics().await)
 }

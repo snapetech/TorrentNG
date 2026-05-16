@@ -22,8 +22,8 @@ use rt_peer_wire::handshake::{Handshake, HANDSHAKE_LEN};
 use rt_session::{SessionRegistry, TorrentEntry, TorrentState, TransferStats};
 
 use crate::command::{
-    CmdResult, EngineCmd, EnginePieceState, EngineStats, EngineTorrentFile, EngineTorrentMetadata,
-    TorrentDiagnostic,
+    CmdResult, EngineCmd, EnginePieceState, EngineStats, EngineTorrentFile, EngineTorrentLimits,
+    EngineTorrentMetadata, TorrentDiagnostic,
 };
 use crate::dht_task::{run_dht, DhtCommand, DhtTorrent};
 use crate::metadata_task::run_metadata_task;
@@ -42,6 +42,7 @@ const EVENT_REANNOUNCE_REQUESTED: &str = "tracker_reannounce_requested";
 const EVENT_LABELS_UPDATED: &str = "labels_updated";
 const EVENT_FIELDS_UPDATED: &str = "torrent_fields_updated";
 const EVENT_TRACKERS_UPDATED: &str = "trackers_updated";
+const EVENT_LIMITS_UPDATED: &str = "limits_updated";
 const EVENT_ENGINE_STOPPED: &str = "engine_stopped";
 
 const JOB_KIND_RECHECK: &str = "recheck_torrent";
@@ -268,6 +269,32 @@ impl EngineHandle {
             .send(EngineCmd::UpdateTorrentTrackers {
                 info_hash,
                 trackers,
+                reply,
+            })
+            .await
+            .map_err(|_| "engine shut down".to_owned())?;
+        rx.await.map_err(|_| "engine dropped reply".to_owned())?
+    }
+
+    pub async fn torrent_limits(&self, info_hash: String) -> CmdResult<EngineTorrentLimits> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(EngineCmd::GetTorrentLimits { info_hash, reply })
+            .await
+            .map_err(|_| "engine shut down".to_owned())?;
+        rx.await.map_err(|_| "engine dropped reply".to_owned())?
+    }
+
+    pub async fn update_torrent_limits(
+        &self,
+        info_hash: String,
+        limits: EngineTorrentLimits,
+    ) -> CmdResult<()> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(EngineCmd::UpdateTorrentLimits {
+                info_hash,
+                limits,
                 reply,
             })
             .await
@@ -615,6 +642,18 @@ impl Engine {
                 let result = self
                     .update_torrent_trackers_inner(&info_hash, trackers)
                     .await;
+                let _ = reply.send(result);
+            }
+            EngineCmd::GetTorrentLimits { info_hash, reply } => {
+                let result = self.torrent_limits_inner(&info_hash).await;
+                let _ = reply.send(result);
+            }
+            EngineCmd::UpdateTorrentLimits {
+                info_hash,
+                limits,
+                reply,
+            } => {
+                let result = self.update_torrent_limits_inner(&info_hash, limits).await;
                 let _ = reply.send(result);
             }
 
@@ -1384,6 +1423,66 @@ impl Engine {
         Ok(())
     }
 
+    async fn torrent_limits_inner(&self, info_hash: &str) -> CmdResult<EngineTorrentLimits> {
+        {
+            let reg = self.registry.read().await;
+            if reg.get(info_hash).is_none() {
+                return Err(format!("torrent {info_hash} not found"));
+            }
+        }
+        let db = self.db.lock().expect("database mutex poisoned");
+        match rt_db::get_torrent_limits(&db, info_hash) {
+            Ok(row) => Ok(engine_limits_from_row(row)),
+            Err(rt_db::DbError::NotFound(_)) => Ok(EngineTorrentLimits::default()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    async fn update_torrent_limits_inner(
+        &self,
+        info_hash: &str,
+        limits: EngineTorrentLimits,
+    ) -> CmdResult<()> {
+        {
+            let reg = self.registry.read().await;
+            if reg.get(info_hash).is_none() {
+                return Err(format!("torrent {info_hash} not found"));
+            }
+        }
+        let row = rt_db::TorrentLimitRow {
+            info_hash: info_hash.to_owned(),
+            download_limit: limits.download_limit.filter(|value| *value > 0),
+            upload_limit: limits.upload_limit.filter(|value| *value > 0),
+            max_connections: limits.max_connections.filter(|value| *value > 0),
+            seed_ratio_limit: limits.seed_ratio_limit.filter(|value| *value >= 0.0),
+            seed_idle_limit: limits.seed_idle_limit.filter(|value| *value >= 0),
+            sequential_download: limits.sequential_download,
+            first_last_piece_prio: limits.first_last_piece_prio,
+            force_start: limits.force_start,
+            super_seeding: limits.super_seeding,
+        };
+        let db = self.db.lock().expect("database mutex poisoned");
+        rt_db::upsert_torrent_limits(&db, &row).map_err(|e| e.to_string())?;
+        drop(db);
+        self.append_session_event(
+            Some(info_hash),
+            EVENT_LIMITS_UPDATED,
+            Some("torrent limits updated"),
+            serde_json::json!({
+                "download_limit": row.download_limit,
+                "upload_limit": row.upload_limit,
+                "max_connections": row.max_connections,
+                "seed_ratio_limit": row.seed_ratio_limit,
+                "seed_idle_limit": row.seed_idle_limit,
+                "sequential_download": row.sequential_download,
+                "first_last_piece_prio": row.first_last_piece_prio,
+                "force_start": row.force_start,
+                "super_seeding": row.super_seeding,
+            }),
+        );
+        Ok(())
+    }
+
     async fn send_to_torrent(&self, info_hash: &str, cmd: TorrentCmd) -> CmdResult<()> {
         match self.torrent_chans.get(info_hash) {
             Some(tx) => tx
@@ -2039,6 +2138,20 @@ fn normalize_tracker_urls(trackers: Vec<String>) -> Vec<String> {
     out
 }
 
+fn engine_limits_from_row(row: rt_db::TorrentLimitRow) -> EngineTorrentLimits {
+    EngineTorrentLimits {
+        download_limit: row.download_limit,
+        upload_limit: row.upload_limit,
+        max_connections: row.max_connections,
+        seed_ratio_limit: row.seed_ratio_limit,
+        seed_idle_limit: row.seed_idle_limit,
+        sequential_download: row.sequential_download,
+        first_last_piece_prio: row.first_last_piece_prio,
+        force_start: row.force_start,
+        super_seeding: row.super_seeding,
+    }
+}
+
 fn metadata_from_v1(meta: &TorrentMetaV1) -> EngineTorrentMetadata {
     EngineTorrentMetadata {
         piece_length: meta.piece_length,
@@ -2440,6 +2553,52 @@ mod tests {
         assert_eq!(trackers.len(), 2);
         assert_eq!(trackers[0].status, "pending");
         assert_eq!(trackers[0].left_bytes, 19_750);
+    }
+
+    #[tokio::test]
+    async fn update_torrent_limits_persists_and_reads_back() {
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let info_hash = "1".repeat(40);
+        let entry = TorrentEntry::new(info_hash.clone(), "limited".into(), "/data".into());
+        let row = row_from_entry(&entry, &meta());
+        rt_db::upsert(&conn, &row).unwrap();
+
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        registry.write().await.add(entry).unwrap();
+        let (_tx, rx) = mpsc::channel(1);
+        let engine = Engine {
+            config: Arc::new(Config::default()),
+            registry,
+            db: Arc::new(Mutex::new(conn)),
+            cmd_rx: rx,
+            cmd_tx: mpsc::channel(1).0,
+            torrent_chans: HashMap::new(),
+            torrent_tasks: HashMap::new(),
+            dht_tx: None,
+        };
+
+        engine
+            .update_torrent_limits_inner(
+                &info_hash,
+                EngineTorrentLimits {
+                    download_limit: Some(1000),
+                    upload_limit: Some(2000),
+                    seed_ratio_limit: Some(1.5),
+                    sequential_download: true,
+                    force_start: true,
+                    ..EngineTorrentLimits::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let limits = engine.torrent_limits_inner(&info_hash).await.unwrap();
+        assert_eq!(limits.download_limit, Some(1000));
+        assert_eq!(limits.upload_limit, Some(2000));
+        assert_eq!(limits.seed_ratio_limit, Some(1.5));
+        assert!(limits.sequential_download);
+        assert!(limits.force_start);
     }
 
     #[tokio::test]

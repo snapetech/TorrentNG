@@ -85,6 +85,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/bulk/{action}", post(handlers::bulk_action))
         .route("/api/v1/storage", get(handlers::storage_roots))
         .route("/api/v1/tracker-health", get(handlers::tracker_health))
+        .route("/api/v1/sidebar-facets", get(handlers::sidebar_facets))
         .route("/api/v1/engine", get(handlers::engine_diagnostics))
         .route("/api/v1/engine/commands", get(handlers::engine_commands))
         .route("/api/v1/cross-seed", post(handlers::cross_seed_helper))

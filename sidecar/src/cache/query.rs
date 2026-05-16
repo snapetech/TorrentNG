@@ -16,6 +16,12 @@ pub struct TrackerHealthRow {
     pub last_updated: i64,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SidebarFacets {
+    pub status: std::collections::BTreeMap<String, i64>,
+    pub media_type: std::collections::BTreeMap<String, i64>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 pub struct ListParams {
     pub filter: Option<String>,
@@ -251,6 +257,57 @@ impl Db {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    pub fn sidebar_facets(&self) -> Result<SidebarFacets> {
+        let conn = self.0.lock().expect("db mutex");
+        let mut status = std::collections::BTreeMap::new();
+
+        let status_queries = [
+            ("all", "1=1"),
+            ("downloading", "complete=0 AND is_active=1"),
+            ("seeding", "complete=1 AND is_active=1"),
+            ("completed", "complete=1"),
+            ("running", "is_open=1"),
+            ("stopped", "is_active=0"),
+            ("active", "is_active=1"),
+            ("inactive", "is_active=0"),
+            ("stalled", "is_open=1 AND is_active=0"),
+            ("stalled_uploading", "complete=1 AND is_open=1 AND is_active=0"),
+            ("stalled_downloading", "complete=0 AND is_open=1 AND is_active=0"),
+            ("checking", "state=2"),
+            ("moving", "0=1"),
+            ("error", "message != '' AND is_active=0"),
+        ];
+        for (key, where_sql) in status_queries {
+            let count: i64 = conn.query_row(
+                &format!("SELECT COUNT(*) FROM torrents WHERE {where_sql}"),
+                [],
+                |r| r.get(0),
+            )?;
+            status.insert(key.to_owned(), count);
+        }
+
+        let mut media_type = std::collections::BTreeMap::new();
+        let media_types = ["ebook", "tv", "video", "audio", "image", "game", "software"];
+        for key in media_types {
+            let mut clauses = Vec::new();
+            let mut args = Vec::new();
+            append_media_type_clause(key, &mut clauses, &mut args);
+            let where_sql = if clauses.is_empty() {
+                "1=0".to_owned()
+            } else {
+                clauses.join(" AND ")
+            };
+            let count: i64 = conn.query_row(
+                &format!("SELECT COUNT(*) FROM torrents t WHERE {where_sql}"),
+                params_from_iter(args.iter()),
+                |r| r.get(0),
+            )?;
+            media_type.insert(key.to_owned(), count);
+        }
+
+        Ok(SidebarFacets { status, media_type })
     }
 }
 

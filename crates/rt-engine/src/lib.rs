@@ -6,6 +6,7 @@ pub mod peer_id;
 pub mod torrent_task;
 
 pub use command::{
-    EnginePieceState, EngineStats, EngineTorrentFile, EngineTorrentMetadata, TorrentDiagnostic,
+    EnginePieceState, EngineStats, EngineTorrentFile, EngineTorrentLimits, EngineTorrentMetadata,
+    TorrentDiagnostic,
 };
 pub use engine::{Engine, EngineHandle};

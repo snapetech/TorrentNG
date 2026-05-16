@@ -251,6 +251,11 @@ export interface TrackerHealthResponse {
   trackers: TrackerHealth[]
 }
 
+export interface SidebarFacets {
+  status: Record<string, number>
+  media_type: Record<string, number>
+}
+
 export interface ProbeValue<T> {
   ok: boolean
   value: T | null
@@ -536,6 +541,7 @@ export const api = {
   transferInfo: (): Promise<TransferInfo> => getRoot('/api/qb/v2/transfer/info'),
 
   trackerHealth: (): Promise<TrackerHealthResponse> => get('/tracker-health'),
+  sidebarFacets: (): Promise<SidebarFacets> => get('/sidebar-facets'),
 
   engine: (): Promise<EngineDiagnostics> => get('/engine'),
   engineCommands: (): Promise<EngineCommandIndex> => get('/engine/commands'),

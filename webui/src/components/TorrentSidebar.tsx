@@ -95,6 +95,12 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
     staleTime: 5_000,
     refetchInterval: 10_000,
   })
+  const { data: facets } = useQuery({
+    queryKey: ['sidebar-facets'],
+    queryFn: api.sidebarFacets,
+    staleTime: 5_000,
+    refetchInterval: 10_000,
+  })
 
   useEffect(() => {
     setTrackerFilter(params.tracker ?? '')
@@ -138,7 +144,7 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
             icon={option.icon}
             label={option.label}
             active={(params.status ?? '') === option.value}
-            count={option.value ? undefined : total}
+            count={facets?.status[option.value || 'all'] ?? (option.value ? undefined : total)}
             onClick={() => onChange({ status: option.value || undefined, offset: 0 })}
           />
         ))}
@@ -158,6 +164,7 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
             icon={option.icon}
             label={option.label}
             active={(params.media_type ?? '') === option.value}
+            count={facets?.media_type[option.value]}
             onClick={() => onChange({ media_type: option.value, offset: 0 })}
           />
         ))}

@@ -52,6 +52,19 @@ pub struct EngineStats {
     pub trackers_error: u64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EngineTorrentLimits {
+    pub download_limit: Option<i64>,
+    pub upload_limit: Option<i64>,
+    pub max_connections: Option<i64>,
+    pub seed_ratio_limit: Option<f64>,
+    pub seed_idle_limit: Option<i64>,
+    pub sequential_download: bool,
+    pub first_last_piece_prio: bool,
+    pub force_start: bool,
+    pub super_seeding: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct TorrentDiagnostic {
     pub info_hash: String,
@@ -153,6 +166,15 @@ pub enum EngineCmd {
     UpdateTorrentTrackers {
         info_hash: String,
         trackers: Vec<String>,
+        reply: oneshot::Sender<CmdResult<()>>,
+    },
+    GetTorrentLimits {
+        info_hash: String,
+        reply: oneshot::Sender<CmdResult<EngineTorrentLimits>>,
+    },
+    UpdateTorrentLimits {
+        info_hash: String,
+        limits: EngineTorrentLimits,
         reply: oneshot::Sender<CmdResult<()>>,
     },
     /// Snapshot runtime and durable metrics.

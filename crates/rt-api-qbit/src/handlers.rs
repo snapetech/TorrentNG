@@ -14,7 +14,7 @@ use std::{
 };
 use url::Url;
 
-use rt_engine::EnginePieceState;
+use rt_engine::{EnginePieceState, EngineTorrentLimits};
 
 use crate::{
     model::{
@@ -1156,13 +1156,19 @@ pub async fn torrents_remove_tags(
 }
 
 /// `POST /api/qb/v2/torrents/setDownloadLimit`.
-pub async fn torrents_set_download_limit() -> impl IntoResponse {
-    StatusCode::OK
+pub async fn torrents_set_download_limit(
+    State(state): State<AppState>,
+    body: String,
+) -> impl IntoResponse {
+    update_limit_field(State(state), body, LimitField::Download).await
 }
 
 /// `POST /api/qb/v2/torrents/setUploadLimit`.
-pub async fn torrents_set_upload_limit() -> impl IntoResponse {
-    StatusCode::OK
+pub async fn torrents_set_upload_limit(
+    State(state): State<AppState>,
+    body: String,
+) -> impl IntoResponse {
+    update_limit_field(State(state), body, LimitField::Upload).await
 }
 
 /// `GET /api/qb/v2/torrents/downloadLimit`.
@@ -1170,7 +1176,7 @@ pub async fn torrents_download_limit(
     State(state): State<AppState>,
     Query(q): Query<HashesQuery>,
 ) -> impl IntoResponse {
-    torrent_limit_map(&state, q.hashes).await
+    torrent_limit_map(&state, q.hashes, LimitField::Download).await
 }
 
 /// `GET /api/qb/v2/torrents/uploadLimit`.
@@ -1178,22 +1184,53 @@ pub async fn torrents_upload_limit(
     State(state): State<AppState>,
     Query(q): Query<HashesQuery>,
 ) -> impl IntoResponse {
-    torrent_limit_map(&state, q.hashes).await
+    torrent_limit_map(&state, q.hashes, LimitField::Upload).await
 }
 
 /// `POST /api/qb/v2/torrents/setShareLimits`.
-pub async fn torrents_set_share_limits() -> impl IntoResponse {
+pub async fn torrents_set_share_limits(
+    State(state): State<AppState>,
+    body: String,
+) -> impl IntoResponse {
+    let params = parse_form_body(&body);
+    let hashes = params
+        .get("hashes")
+        .map(|h| extract_hashes_from_str(h))
+        .unwrap_or_default();
+    let hashes = resolve_hashes(&state, hashes).await;
+    let ratio = params
+        .get("ratioLimit")
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| *value >= 0.0);
+    let seeding_time = params
+        .get("seedingTimeLimit")
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value >= 0);
+    for hash in hashes {
+        let mut limits = get_torrent_limits(&state, &hash).await;
+        limits.seed_ratio_limit = ratio;
+        limits.seed_idle_limit = seeding_time;
+        if update_torrent_limits(&state, &hash, limits).await != StatusCode::OK {
+            return StatusCode::NOT_FOUND;
+        }
+    }
     StatusCode::OK
 }
 
 /// `POST /api/qb/v2/torrents/setForceStart`.
-pub async fn torrents_set_force_start() -> impl IntoResponse {
-    StatusCode::OK
+pub async fn torrents_set_force_start(
+    State(state): State<AppState>,
+    body: String,
+) -> impl IntoResponse {
+    update_bool_limit_field(State(state), body, BoolLimitField::ForceStart).await
 }
 
 /// `POST /api/qb/v2/torrents/setSuperSeeding`.
-pub async fn torrents_set_super_seeding() -> impl IntoResponse {
-    StatusCode::OK
+pub async fn torrents_set_super_seeding(
+    State(state): State<AppState>,
+    body: String,
+) -> impl IntoResponse {
+    update_bool_limit_field(State(state), body, BoolLimitField::SuperSeeding).await
 }
 
 /// `POST /api/qb/v2/torrents/setAutoTMM`.
@@ -1207,13 +1244,19 @@ pub async fn torrents_set_auto_management() -> impl IntoResponse {
 }
 
 /// `POST /api/qb/v2/torrents/toggleSequentialDownload`.
-pub async fn torrents_toggle_sequential_download() -> impl IntoResponse {
-    StatusCode::OK
+pub async fn torrents_toggle_sequential_download(
+    State(state): State<AppState>,
+    body: String,
+) -> impl IntoResponse {
+    update_bool_limit_field(State(state), body, BoolLimitField::Sequential).await
 }
 
 /// `POST /api/qb/v2/torrents/toggleFirstLastPiecePrio`.
-pub async fn torrents_toggle_first_last_piece_prio() -> impl IntoResponse {
-    StatusCode::OK
+pub async fn torrents_toggle_first_last_piece_prio(
+    State(state): State<AppState>,
+    body: String,
+) -> impl IntoResponse {
+    update_bool_limit_field(State(state), body, BoolLimitField::FirstLast).await
 }
 
 /// `POST /api/qb/v2/transfer/setDownloadLimit`.
@@ -1499,6 +1542,7 @@ fn default_torrent_properties(save_path: String) -> QbTorrentProperties {
 async fn torrent_limit_map(
     state: &AppState,
     hashes: Option<String>,
+    field: LimitField,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let requested = hashes
         .as_deref()
@@ -1506,12 +1550,138 @@ async fn torrent_limit_map(
         .unwrap_or_default();
     let hashes = resolve_hashes(state, requested).await;
     let reg = state.registry.read().await;
-    let limits = reg
+    let entries = reg
         .iter()
         .filter(|entry| hashes.is_empty() || hashes.contains(&entry.info_hash))
-        .map(|entry| (entry.info_hash.clone(), serde_json::json!(0)))
-        .collect::<serde_json::Map<_, _>>();
+        .map(|entry| entry.info_hash.clone())
+        .collect::<Vec<_>>();
+    drop(reg);
+    let mut limits = serde_json::Map::new();
+    for hash in entries {
+        let value = match field {
+            LimitField::Download => get_torrent_limits(state, &hash)
+                .await
+                .download_limit
+                .unwrap_or(0),
+            LimitField::Upload => get_torrent_limits(state, &hash)
+                .await
+                .upload_limit
+                .unwrap_or(0),
+        };
+        limits.insert(hash, serde_json::json!(value));
+    }
     (StatusCode::OK, Json(serde_json::Value::Object(limits)))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LimitField {
+    Download,
+    Upload,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BoolLimitField {
+    Sequential,
+    FirstLast,
+    ForceStart,
+    SuperSeeding,
+}
+
+async fn update_limit_field(
+    State(state): State<AppState>,
+    body: String,
+    field: LimitField,
+) -> StatusCode {
+    let params = parse_form_body(&body);
+    let hashes = params
+        .get("hashes")
+        .map(|h| extract_hashes_from_str(h))
+        .unwrap_or_default();
+    let hashes = resolve_hashes(&state, hashes).await;
+    let limit = params
+        .get("limit")
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0);
+    for hash in hashes {
+        let mut limits = get_torrent_limits(&state, &hash).await;
+        match field {
+            LimitField::Download => limits.download_limit = limit,
+            LimitField::Upload => limits.upload_limit = limit,
+        }
+        if update_torrent_limits(&state, &hash, limits).await != StatusCode::OK {
+            return StatusCode::NOT_FOUND;
+        }
+    }
+    StatusCode::OK
+}
+
+async fn update_bool_limit_field(
+    State(state): State<AppState>,
+    body: String,
+    field: BoolLimitField,
+) -> StatusCode {
+    let params = parse_form_body(&body);
+    let hashes = params
+        .get("hashes")
+        .map(|h| extract_hashes_from_str(h))
+        .unwrap_or_default();
+    let hashes = resolve_hashes(&state, hashes).await;
+    let requested = params
+        .get("value")
+        .or_else(|| params.get("enable"))
+        .and_then(|value| parse_qbit_bool(value));
+    for hash in hashes {
+        let mut limits = get_torrent_limits(&state, &hash).await;
+        let current = match field {
+            BoolLimitField::Sequential => limits.sequential_download,
+            BoolLimitField::FirstLast => limits.first_last_piece_prio,
+            BoolLimitField::ForceStart => limits.force_start,
+            BoolLimitField::SuperSeeding => limits.super_seeding,
+        };
+        let value = requested.unwrap_or(!current);
+        match field {
+            BoolLimitField::Sequential => limits.sequential_download = value,
+            BoolLimitField::FirstLast => limits.first_last_piece_prio = value,
+            BoolLimitField::ForceStart => limits.force_start = value,
+            BoolLimitField::SuperSeeding => limits.super_seeding = value,
+        }
+        if update_torrent_limits(&state, &hash, limits).await != StatusCode::OK {
+            return StatusCode::NOT_FOUND;
+        }
+    }
+    StatusCode::OK
+}
+
+async fn get_torrent_limits(state: &AppState, hash: &str) -> EngineTorrentLimits {
+    let Some(engine) = &state.engine else {
+        return EngineTorrentLimits::default();
+    };
+    engine
+        .torrent_limits(hash.to_owned())
+        .await
+        .unwrap_or_default()
+}
+
+async fn update_torrent_limits(
+    state: &AppState,
+    hash: &str,
+    limits: EngineTorrentLimits,
+) -> StatusCode {
+    let Some(engine) = &state.engine else {
+        return StatusCode::OK;
+    };
+    match engine.update_torrent_limits(hash.to_owned(), limits).await {
+        Ok(()) => StatusCode::OK,
+        Err(_) => StatusCode::NOT_FOUND,
+    }
+}
+
+fn parse_qbit_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 async fn qbit_torrent_info(state: &AppState, e: &rt_session::TorrentEntry) -> QbTorrentInfo {
@@ -2661,5 +2831,14 @@ mod tests {
                 "udp://two/announce".to_owned()
             ]
         );
+    }
+
+    #[test]
+    fn parse_qbit_bool_accepts_common_wire_values() {
+        assert_eq!(parse_qbit_bool("true"), Some(true));
+        assert_eq!(parse_qbit_bool("1"), Some(true));
+        assert_eq!(parse_qbit_bool("false"), Some(false));
+        assert_eq!(parse_qbit_bool("0"), Some(false));
+        assert_eq!(parse_qbit_bool("wat"), None);
     }
 }
