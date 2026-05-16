@@ -134,7 +134,7 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
 
   return (
     <aside style={{
-      width: 236, flexShrink: 0, background: '#0f141d', borderRight: '1px solid #1e2433',
+      width: 236, flexShrink: 0, background: 'var(--panel)', borderRight: '1px solid var(--border)',
       display: 'flex', flexDirection: 'column', overflowY: 'auto',
     }}>
       <Section title="State">
@@ -304,10 +304,10 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
       </Section>
 
       {(params.status || params.category || params.tag || params.tracker || params.media_type || params.filter) && (
-        <div style={{ padding: '10px 12px 14px', borderTop: '1px solid #1e2433' }}>
+        <div style={{ padding: '10px 12px 14px', borderTop: '1px solid var(--border)' }}>
           <button onClick={clearFilters} style={{
-            width: '100%', background: 'transparent', border: '1px solid #334155', borderRadius: 5,
-            color: '#94a3b8', padding: '6px 8px', fontSize: 12, cursor: 'pointer',
+            width: '100%', background: 'transparent', border: '1px solid var(--border-strong)', borderRadius: 5,
+            color: 'var(--muted)', padding: '6px 8px', fontSize: 12, cursor: 'pointer',
           }}>
             Clear filters
           </button>
@@ -328,7 +328,7 @@ function CountRow({ icon, label, active, count, onClick }: {
     <button onClick={onClick} style={rowButtonStyle(active)}>
       {icon && <span style={iconStyle(active)}>{icon}</span>}
       <span style={labelStyle}>{label}</span>
-      <span style={{ color: active ? '#bfdbfe' : '#64748b', fontVariantNumeric: 'tabular-nums' }}>
+      <span style={{ color: active ? 'var(--accent-text)' : 'var(--faint)', fontVariantNumeric: 'tabular-nums' }}>
         {count === undefined ? '' : count.toLocaleString()}
       </span>
     </button>
@@ -337,9 +337,9 @@ function CountRow({ icon, label, active, count, onClick }: {
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
-    <section style={{ padding: '10px 10px 8px', borderBottom: '1px solid #1e2433' }}>
+    <section style={{ padding: '10px 10px 8px', borderBottom: '1px solid var(--border)' }}>
       <div style={{
-        color: '#64748b', fontSize: 11, fontWeight: 700, textTransform: 'uppercase',
+        color: 'var(--faint)', fontSize: 11, fontWeight: 700, textTransform: 'uppercase',
         margin: '0 4px 7px',
       }}>{title}</div>
       {children}
@@ -364,7 +364,7 @@ const labelStyle: React.CSSProperties = {
 function iconStyle(active: boolean): React.CSSProperties {
   return {
     width: 18,
-    color: active ? '#bfdbfe' : '#60a5fa',
+    color: active ? 'var(--accent-text)' : 'var(--accent)',
     fontSize: 15,
     lineHeight: '14px',
     textAlign: 'center',
@@ -374,10 +374,10 @@ function iconStyle(active: boolean): React.CSSProperties {
 
 const selectStyle: React.CSSProperties = {
   width: '100%',
-  background: '#0d1117',
-  border: '1px solid #334155',
+  background: 'var(--bg)',
+  border: '1px solid var(--border-strong)',
   borderRadius: 5,
-  color: '#cbd5e1',
+  color: 'var(--text)',
   padding: '6px 8px',
   fontSize: 12,
   outline: 'none',
@@ -385,10 +385,10 @@ const selectStyle: React.CSSProperties = {
 
 const inputStyle: React.CSSProperties = {
   minWidth: 0,
-  background: '#0d1117',
-  border: '1px solid #334155',
+  background: 'var(--bg)',
+  border: '1px solid var(--border-strong)',
   borderRadius: 5,
-  color: '#cbd5e1',
+  color: 'var(--text)',
   padding: '5px 7px',
   fontSize: 12,
   outline: 'none',
@@ -396,9 +396,9 @@ const inputStyle: React.CSSProperties = {
 
 const deleteStyle: React.CSSProperties = {
   background: 'transparent',
-  border: '1px solid #334155',
+  border: '1px solid var(--border-strong)',
   borderRadius: 5,
-  color: '#64748b',
+  color: 'var(--faint)',
   cursor: 'pointer',
   fontSize: 12,
 }
@@ -409,7 +409,7 @@ const savedViewButtonStyle: React.CSSProperties = {
   background: 'transparent',
   border: '1px solid transparent',
   borderRadius: 5,
-  color: '#94a3b8',
+  color: 'var(--muted)',
   padding: '5px 7px',
   fontSize: 12,
   cursor: 'pointer',
@@ -418,7 +418,7 @@ const savedViewButtonStyle: React.CSSProperties = {
 }
 
 const overflowNote: React.CSSProperties = {
-  color: '#475569',
+  color: 'var(--faint)',
   fontSize: 11,
   padding: '5px 4px 2px',
 }
@@ -427,10 +427,10 @@ function rowButtonStyle(active: boolean): React.CSSProperties {
   return {
     width: '100%',
     minWidth: 0,
-    background: active ? '#1e3a5f' : 'transparent',
-    border: '1px solid ' + (active ? '#3b82f6' : 'transparent'),
+    background: active ? 'var(--accent-soft)' : 'transparent',
+    border: '1px solid ' + (active ? 'var(--accent)' : 'transparent'),
     borderRadius: 5,
-    color: active ? '#dbeafe' : '#94a3b8',
+    color: active ? 'var(--accent-text)' : 'var(--muted)',
     padding: '5px 7px',
     fontSize: 12,
     cursor: 'pointer',
@@ -444,10 +444,10 @@ function rowButtonStyle(active: boolean): React.CSSProperties {
 
 function toggleStyle(active: boolean): React.CSSProperties {
   return {
-    background: active ? '#1e3a5f' : '#111827',
-    border: '1px solid ' + (active ? '#3b82f6' : '#334155'),
+    background: active ? 'var(--accent-soft)' : 'var(--surface)',
+    border: '1px solid ' + (active ? 'var(--accent)' : 'var(--border-strong)'),
     borderRadius: 5,
-    color: active ? '#bfdbfe' : '#94a3b8',
+    color: active ? 'var(--accent-text)' : 'var(--muted)',
     padding: '5px 6px',
     fontSize: 11,
     cursor: 'pointer',
@@ -456,10 +456,10 @@ function toggleStyle(active: boolean): React.CSSProperties {
 
 function saveStyle(enabled: boolean): React.CSSProperties {
   return {
-    background: enabled ? '#1e3a5f' : '#111827',
-    border: '1px solid ' + (enabled ? '#3b82f6' : '#334155'),
+    background: enabled ? 'var(--accent-soft)' : 'var(--surface)',
+    border: '1px solid ' + (enabled ? 'var(--accent)' : 'var(--border-strong)'),
     borderRadius: 5,
-    color: enabled ? '#bfdbfe' : '#475569',
+    color: enabled ? 'var(--accent-text)' : 'var(--faint)',
     padding: '5px 6px',
     fontSize: 11,
     cursor: enabled ? 'pointer' : 'not-allowed',

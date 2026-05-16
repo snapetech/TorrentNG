@@ -82,10 +82,10 @@ async fn rpc(
         "group-get" => Ok(json!({ "groups": [] })),
         "group-set" => Ok(json!({})),
         "torrent-set" => torrent_set(&state, &args).await,
-        "torrent-set-tracker-list"
-        | "torrent-set-file-priorities"
-        | "torrent-set-file-wanted"
-        | "torrent-set-file-unwanted" => Ok(json!({})),
+        "torrent-set-tracker-list" => Ok(json!({})),
+        "torrent-set-file-priorities" => torrent_set_file_priorities(&state, &args).await,
+        "torrent-set-file-wanted" => torrent_set_file_wanted(&state, &args, true).await,
+        "torrent-set-file-unwanted" => torrent_set_file_wanted(&state, &args, false).await,
         "queue-move-top" | "queue-move-up" | "queue-move-down" | "queue-move-bottom" => {
             Ok(json!({}))
         }
@@ -227,6 +227,71 @@ async fn torrent_set(state: &AppState, args: &Value) -> Result<Value, String> {
         }
     }
     Ok(json!({}))
+}
+
+async fn torrent_set_file_wanted(
+    state: &AppState,
+    args: &Value,
+    wanted: bool,
+) -> Result<Value, String> {
+    let Some(engine) = &state.engine else {
+        return Ok(json!({}));
+    };
+    let key = if wanted {
+        "files-wanted"
+    } else {
+        "files-unwanted"
+    };
+    let file_ids = file_ids_arg(args, key);
+    for hash in ids(state, args).await {
+        engine
+            .update_file_priorities(hash, file_ids.clone(), if wanted { 1 } else { 0 })
+            .await?;
+    }
+    Ok(json!({}))
+}
+
+async fn torrent_set_file_priorities(state: &AppState, args: &Value) -> Result<Value, String> {
+    let Some(engine) = &state.engine else {
+        return Ok(json!({}));
+    };
+    let mut updates = Vec::new();
+    let high = file_ids_arg(args, "priority-high");
+    if !high.is_empty() {
+        updates.push((high, 2));
+    }
+    let normal = file_ids_arg(args, "priority-normal");
+    if !normal.is_empty() {
+        updates.push((normal, 1));
+    }
+    let low = file_ids_arg(args, "priority-low");
+    if !low.is_empty() {
+        updates.push((low, 1));
+    }
+    if updates.is_empty() {
+        return Ok(json!({}));
+    }
+    let hashes = ids(state, args).await;
+    for hash in hashes {
+        for (file_ids, priority) in &updates {
+            engine
+                .update_file_priorities(hash.clone(), file_ids.clone(), *priority)
+                .await?;
+        }
+    }
+    Ok(json!({}))
+}
+
+fn file_ids_arg(args: &Value, key: &str) -> Vec<u32> {
+    args.get(key)
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_u64().and_then(|id| u32::try_from(id).ok()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
 }
 
 fn response(tag: Option<Value>, result: &str, arguments: Value) -> Value {
