@@ -571,6 +571,21 @@ pub async fn torrents_files(
     }
 }
 
+/// `GET /api/qb/v2/torrents/webseeds`.
+pub async fn torrents_webseeds() -> impl IntoResponse {
+    (StatusCode::OK, Json(Vec::<serde_json::Value>::new()))
+}
+
+/// `GET /api/qb/v2/torrents/pieceStates`.
+pub async fn torrents_piece_states() -> impl IntoResponse {
+    (StatusCode::OK, Json(Vec::<i32>::new()))
+}
+
+/// `GET /api/qb/v2/torrents/pieceHashes`.
+pub async fn torrents_piece_hashes() -> impl IntoResponse {
+    (StatusCode::OK, Json(Vec::<String>::new()))
+}
+
 /// `GET /api/qb/v2/torrents/export`.
 pub async fn torrents_export() -> impl IntoResponse {
     StatusCode::NOT_FOUND
@@ -744,6 +759,14 @@ pub async fn torrents_set_location(
         }
     }
     StatusCode::OK
+}
+
+/// `POST /api/qb/v2/torrents/setSavePath`.
+pub async fn torrents_set_save_path(
+    State(state): State<AppState>,
+    body: String,
+) -> impl IntoResponse {
+    torrents_set_location(State(state), body).await
 }
 
 /// `POST /api/qb/v2/torrents/createCategory`.
@@ -1021,6 +1044,16 @@ pub async fn torrents_set_upload_limit() -> impl IntoResponse {
     StatusCode::OK
 }
 
+/// `GET /api/qb/v2/torrents/downloadLimit`.
+pub async fn torrents_download_limit() -> impl IntoResponse {
+    (StatusCode::OK, Json(serde_json::json!({})))
+}
+
+/// `GET /api/qb/v2/torrents/uploadLimit`.
+pub async fn torrents_upload_limit() -> impl IntoResponse {
+    (StatusCode::OK, Json(serde_json::json!({})))
+}
+
 /// `POST /api/qb/v2/torrents/setShareLimits`.
 pub async fn torrents_set_share_limits() -> impl IntoResponse {
     StatusCode::OK
@@ -1038,6 +1071,11 @@ pub async fn torrents_set_super_seeding() -> impl IntoResponse {
 
 /// `POST /api/qb/v2/torrents/setAutoTMM`.
 pub async fn torrents_set_auto_tmm() -> impl IntoResponse {
+    StatusCode::OK
+}
+
+/// `POST /api/qb/v2/torrents/setAutoManagement`.
+pub async fn torrents_set_auto_management() -> impl IntoResponse {
     StatusCode::OK
 }
 
@@ -1188,6 +1226,14 @@ pub async fn search_plugins() -> impl IntoResponse {
     (StatusCode::OK, Json(Vec::<String>::new()))
 }
 
+pub async fn search_categories() -> impl IntoResponse {
+    (StatusCode::OK, Json(Vec::<String>::new()))
+}
+
+pub async fn search_plugin_noop() -> impl IntoResponse {
+    StatusCode::OK
+}
+
 pub async fn search_start() -> impl IntoResponse {
     (StatusCode::OK, Json(serde_json::json!({ "id": 0 })))
 }
@@ -1205,6 +1251,10 @@ pub async fn search_results() -> impl IntoResponse {
             "results": [],
         })),
     )
+}
+
+pub async fn search_delete() -> impl IntoResponse {
+    StatusCode::OK
 }
 
 pub async fn rss_items() -> impl IntoResponse {
@@ -1998,11 +2048,18 @@ mod tests {
             "/api/qb/v2/torrents/removeTrackers",
             "/api/qb/v2/torrents/renameFile",
             "/api/qb/v2/torrents/renameFolder",
+            "/api/qb/v2/torrents/setSavePath",
+            "/api/qb/v2/torrents/setAutoManagement",
             "/api/qb/v2/torrents/setAutoTMM",
             "/api/qb/v2/torrents/toggleSequentialDownload",
             "/api/qb/v2/transfer/toggleSpeedLimitsMode",
             "/api/qb/v2/transfer/banPeers",
+            "/api/qb/v2/search/installPlugin",
+            "/api/qb/v2/search/uninstallPlugin",
+            "/api/qb/v2/search/enablePlugin",
+            "/api/qb/v2/search/updatePlugins",
             "/api/qb/v2/search/start",
+            "/api/qb/v2/search/delete",
             "/api/qb/v2/rss/addFeed",
         ] {
             let resp = app
@@ -2024,10 +2081,16 @@ mod tests {
             "/api/v2/app/webapiVersion",
             "/api/qb/v2/app/networkInterfaceList",
             "/api/qb/v2/app/networkInterfaceAddressList",
+            "/api/qb/v2/torrents/webseeds",
+            "/api/qb/v2/torrents/pieceStates",
+            "/api/qb/v2/torrents/pieceHashes",
+            "/api/qb/v2/torrents/downloadLimit",
+            "/api/qb/v2/torrents/uploadLimit",
             "/api/qb/v2/sync/torrentPeers",
             "/api/qb/v2/log/main",
             "/api/qb/v2/log/peers",
             "/api/qb/v2/search/status",
+            "/api/qb/v2/search/categories",
             "/api/qb/v2/transfer/speedLimitsMode",
             "/api/qb/v2/rss/items",
         ] {

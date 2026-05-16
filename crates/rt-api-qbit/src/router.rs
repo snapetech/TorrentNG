@@ -43,6 +43,9 @@ fn qbit_routes() -> Router<AppState> {
         .route("/torrents/removeTrackers", post(torrents_remove_trackers))
         .route("/torrents/addPeers", post(torrents_add_peers))
         .route("/torrents/files", get(torrents_files))
+        .route("/torrents/webseeds", get(torrents_webseeds))
+        .route("/torrents/pieceStates", get(torrents_piece_states))
+        .route("/torrents/pieceHashes", get(torrents_piece_hashes))
         .route("/torrents/export", get(torrents_export))
         .route("/torrents/filePrio", post(torrents_file_prio))
         .route("/torrents/increasePrio", post(torrents_increase_prio))
@@ -56,6 +59,7 @@ fn qbit_routes() -> Router<AppState> {
         .route("/torrents/renameFile", post(torrents_rename_file))
         .route("/torrents/renameFolder", post(torrents_rename_folder))
         .route("/torrents/setLocation", post(torrents_set_location))
+        .route("/torrents/setSavePath", post(torrents_set_save_path))
         .route("/torrents/setCategory", post(torrents_set_category))
         .route("/torrents/createCategory", post(torrents_create_category))
         .route("/torrents/editCategory", post(torrents_edit_category))
@@ -68,10 +72,12 @@ fn qbit_routes() -> Router<AppState> {
         .route("/torrents/removeTags", post(torrents_remove_tags))
         .route("/torrents/createTags", post(torrents_create_tags))
         .route("/torrents/deleteTags", post(torrents_delete_tags))
+        .route("/torrents/downloadLimit", get(torrents_download_limit))
         .route(
             "/torrents/setDownloadLimit",
             post(torrents_set_download_limit),
         )
+        .route("/torrents/uploadLimit", get(torrents_upload_limit))
         .route("/torrents/setUploadLimit", post(torrents_set_upload_limit))
         .route("/torrents/setShareLimits", post(torrents_set_share_limits))
         .route("/torrents/setForceStart", post(torrents_set_force_start))
@@ -80,6 +86,10 @@ fn qbit_routes() -> Router<AppState> {
             post(torrents_set_super_seeding),
         )
         .route("/torrents/setAutoTMM", post(torrents_set_auto_tmm))
+        .route(
+            "/torrents/setAutoManagement",
+            post(torrents_set_auto_management),
+        )
         .route(
             "/torrents/toggleSequentialDownload",
             post(torrents_toggle_sequential_download),
@@ -107,10 +117,16 @@ fn qbit_routes() -> Router<AppState> {
         .route("/log/main", get(log_main))
         .route("/log/peers", get(log_peers))
         .route("/search/status", get(search_status))
+        .route("/search/categories", get(search_categories))
         .route("/search/plugins", get(search_plugins))
+        .route("/search/installPlugin", post(search_plugin_noop))
+        .route("/search/uninstallPlugin", post(search_plugin_noop))
+        .route("/search/enablePlugin", post(search_plugin_noop))
+        .route("/search/updatePlugins", post(search_plugin_noop))
         .route("/search/start", post(search_start))
         .route("/search/stop", post(search_stop))
         .route("/search/results", get(search_results))
+        .route("/search/delete", post(search_delete))
         .route("/rss/items", get(rss_items))
         .route("/rss/rules", get(rss_rules))
         .route("/rss/matchingArticles", get(rss_matching_articles))

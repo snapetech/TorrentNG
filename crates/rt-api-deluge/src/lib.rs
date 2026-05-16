@@ -73,6 +73,13 @@ async fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Va
     match method {
         "auth.login" => Ok(json!(true)),
         "auth.check_session" => Ok(json!(true)),
+        "daemon.login" => Ok(json!(true)),
+        "daemon.info" => Ok(json!({
+            "version": "rtorrentNG",
+            "libtorrent": "native",
+        })),
+        "daemon.get_method_list" => Ok(json!(supported_methods())),
+        "daemon.shutdown" => Ok(json!(true)),
         "web.connected" => Ok(json!(true)),
         "web.get_host_status" => Ok(json!(["rtorrentNG", "127.0.0.1", 0, "Online"])),
         "web.get_hosts" => Ok(json!([["rtorrentNG", "127.0.0.1", 0, "rtorrentNG"]])),
@@ -166,8 +173,35 @@ async fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Va
             "max_upload_speed": -1.0,
         })),
         "core.get_enabled_plugins" => Ok(json!([])),
+        "core.enable_plugin" | "core.disable_plugin" => Ok(json!(true)),
+        "core.get_available_plugins" => Ok(json!([])),
+        "core.get_libtorrent_version" => Ok(json!("native")),
         _ => Err(format!("unsupported method {method}")),
     }
+}
+
+fn supported_methods() -> Vec<&'static str> {
+    vec![
+        "auth.login",
+        "auth.check_session",
+        "daemon.login",
+        "daemon.info",
+        "daemon.get_method_list",
+        "web.connected",
+        "web.update_ui",
+        "core.get_torrents_status",
+        "core.get_torrent_status",
+        "core.pause_torrent",
+        "core.resume_torrent",
+        "core.force_recheck",
+        "core.remove_torrent",
+        "core.add_torrent_magnet",
+        "core.add_torrent_file",
+        "core.get_config",
+        "core.get_free_space",
+        "label.get_labels",
+        "label.set_torrent",
+    ]
 }
 
 async fn session_status(state: &AppState) -> Result<Value, String> {
@@ -424,7 +458,15 @@ mod tests {
     async fn deluge_auth_and_config_are_supported() {
         let registry = Arc::new(RwLock::new(SessionRegistry::new()));
         let app = build_deluge_router(AppState::new(registry));
-        for method in ["auth.login", "web.connected", "core.get_config"] {
+        for method in [
+            "auth.login",
+            "daemon.info",
+            "daemon.get_method_list",
+            "web.connected",
+            "core.get_config",
+            "core.get_available_plugins",
+            "core.get_libtorrent_version",
+        ] {
             let resp = app
                 .clone()
                 .oneshot(
