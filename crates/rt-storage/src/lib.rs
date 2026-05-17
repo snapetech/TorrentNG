@@ -23,9 +23,10 @@ pub use error::StorageError;
 pub use frame::{global_frame_pool, FramePool, DEFAULT_FRAME_CAP_MB};
 pub use io_class::IoClass;
 pub use plan::{
-    ensure_plan_can_apply, execute_storage_plan, execute_storage_plan_under_roots, plan_delete,
-    plan_import, plan_move, DeletePlanRequest, ImportPlanRequest, MovePlanRequest, PlanIssue,
-    PlannedStorageAction, StoragePlan, StoragePlanExecution, StoragePlanStep,
+    ensure_plan_can_apply, execute_storage_plan, execute_storage_plan_under_roots,
+    execute_storage_plan_under_roots_with_checkpoints, execute_storage_plan_with_checkpoints,
+    plan_delete, plan_import, plan_move, DeletePlanRequest, ImportPlanRequest, MovePlanRequest,
+    PlanIssue, PlannedStorageAction, StoragePlan, StoragePlanExecution, StoragePlanStep,
 };
 pub use scheduler::{
     preallocation_mode_for_topology, DurabilityMode, FilePoolStats, IoRequest, MountScheduler,

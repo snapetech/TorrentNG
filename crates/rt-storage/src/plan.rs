@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
 use crate::StorageError;
@@ -190,13 +191,29 @@ pub struct StoragePlanExecution {
 }
 
 pub fn execute_storage_plan(plan: &StoragePlan) -> Result<StoragePlanExecution, StorageError> {
+    execute_storage_plan_with_checkpoints(plan, &[], |_, _| Ok(()))
+}
+
+pub fn execute_storage_plan_with_checkpoints<F>(
+    plan: &StoragePlan,
+    completed_steps: &[usize],
+    mut checkpoint_step: F,
+) -> Result<StoragePlanExecution, StorageError>
+where
+    F: FnMut(usize, &StoragePlanStep) -> Result<(), StorageError>,
+{
     ensure_plan_can_apply(plan)?;
     if plan.dry_run {
         return Ok(StoragePlanExecution::default());
     }
 
+    let completed = completed_steps.iter().copied().collect::<HashSet<_>>();
     let mut execution = StoragePlanExecution::default();
-    for step in &plan.steps {
+    for (index, step) in plan.steps.iter().enumerate() {
+        if completed.contains(&index) {
+            execution.applied_steps.push(step.clone());
+            continue;
+        }
         if let Err(error) = execute_step(step) {
             execution.rolled_back_steps = rollback_plan(plan);
             return Err(StorageError::StagedMoveFailed {
@@ -204,6 +221,7 @@ pub fn execute_storage_plan(plan: &StoragePlan) -> Result<StoragePlanExecution, 
                 reason: error.to_string(),
             });
         }
+        checkpoint_step(index, step)?;
         execution.applied_steps.push(step.clone());
     }
     Ok(execution)
@@ -213,13 +231,25 @@ pub fn execute_storage_plan_under_roots(
     plan: &StoragePlan,
     roots: &[PathBuf],
 ) -> Result<StoragePlanExecution, StorageError> {
+    execute_storage_plan_under_roots_with_checkpoints(plan, roots, &[], |_, _| Ok(()))
+}
+
+pub fn execute_storage_plan_under_roots_with_checkpoints<F>(
+    plan: &StoragePlan,
+    roots: &[PathBuf],
+    completed_steps: &[usize],
+    checkpoint_step: F,
+) -> Result<StoragePlanExecution, StorageError>
+where
+    F: FnMut(usize, &StoragePlanStep) -> Result<(), StorageError>,
+{
     ensure_plan_can_apply(plan)?;
     let roots = canonical_roots(roots)?;
     validate_plan_paths_under_roots(plan, &roots)?;
     if plan.dry_run {
         return Ok(StoragePlanExecution::default());
     }
-    execute_storage_plan(plan)
+    execute_storage_plan_with_checkpoints(plan, completed_steps, checkpoint_step)
 }
 
 fn execute_step(step: &StoragePlanStep) -> Result<(), StorageError> {
