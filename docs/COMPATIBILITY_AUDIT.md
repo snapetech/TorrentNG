@@ -36,6 +36,8 @@ Shared import features:
 - Bencode and JSON sidecars.
 - Aggregate containers named `resume.dat`, `downloads.config`, `torrents.config`.
 - Hash matching by raw SHA-1 bytes, lowercase/uppercase hex, base32, and torrent stem.
+- Aggregate resume detection is source-independent for known aggregate filenames
+  such as `resume.dat`, `downloads.config`, and `torrents.config`.
 - Path remapping through `ImportOptions::path_remaps`.
 - Size limits and symlink-safe directory walking.
 - Conversion into native fastresume state through `MigrationPlan::to_fastresume_import`,

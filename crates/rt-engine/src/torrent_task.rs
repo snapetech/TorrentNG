@@ -98,6 +98,8 @@ const JOB_STATE_RUNNING: &str = "running";
 const JOB_STATE_PAUSED: &str = "paused";
 const JOB_STATE_CANCELLED: &str = "cancelled";
 const JOB_STATE_COMPLETED: &str = "completed";
+const MAX_IN_MEMORY_PIECE_ASSEMBLIES: usize = 64;
+const MAX_IN_MEMORY_PIECE_ASSEMBLY_BYTES: usize = 64 * 1024 * 1024;
 
 /// A block received from a peer.
 #[derive(Debug)]
@@ -111,6 +113,7 @@ pub struct BlockEvent {
 struct PieceAssembly {
     data: Vec<u8>,
     received: Vec<bool>,
+    last_used: Instant,
 }
 
 impl PieceAssembly {
@@ -118,10 +121,12 @@ impl PieceAssembly {
         Self {
             data: vec![0; len],
             received: vec![false; len.div_ceil(MAX_BLOCK_SIZE as usize)],
+            last_used: Instant::now(),
         }
     }
 
     fn insert(&mut self, offset: u32, block: &[u8]) -> anyhow::Result<()> {
+        self.last_used = Instant::now();
         let start = offset as usize;
         let end = start
             .checked_add(block.len())
@@ -152,6 +157,36 @@ impl PieceAssembly {
     fn is_complete(&self) -> bool {
         self.received.iter().all(|received| *received)
     }
+
+    fn len(&self) -> usize {
+        self.data.len()
+    }
+}
+
+fn evict_piece_assemblies_to_budget(
+    assemblies: &mut HashMap<u32, PieceAssembly>,
+    assembly_bytes: &mut usize,
+    current_piece: u32,
+    max_assemblies: usize,
+    max_bytes: usize,
+) -> u64 {
+    let mut evictions = 0u64;
+    while assemblies.len() > max_assemblies || *assembly_bytes > max_bytes {
+        let Some(evict_piece) = assemblies
+            .iter()
+            .filter(|(piece, _)| **piece != current_piece)
+            .min_by_key(|(_, assembly)| assembly.last_used)
+            .map(|(piece, _)| *piece)
+        else {
+            break;
+        };
+
+        if let Some(assembly) = assemblies.remove(&evict_piece) {
+            *assembly_bytes = assembly_bytes.saturating_sub(assembly.len());
+            evictions = evictions.saturating_add(1);
+        }
+    }
+    evictions
 }
 
 #[derive(Debug)]
@@ -271,6 +306,8 @@ pub struct TorrentTask {
     webseed_failures: Vec<u8>,
     last_progress_persist: Option<Instant>,
     piece_assemblies: HashMap<u32, PieceAssembly>,
+    piece_assembly_bytes: usize,
+    piece_assembly_evictions: u64,
     prepared_files: Mutex<HashSet<u32>>,
     paused: bool,
     max_peers: usize,
@@ -358,6 +395,8 @@ impl TorrentTask {
             webseed_failures,
             last_progress_persist: None,
             piece_assemblies: HashMap::new(),
+            piece_assembly_bytes: 0,
+            piece_assembly_evictions: 0,
             prepared_files: Mutex::new(HashSet::new()),
             paused,
             max_peers,
@@ -1194,7 +1233,7 @@ impl TorrentTask {
                 }
                 self.active_peers.remove(&peer);
                 if self.active_peers.is_empty() {
-                    self.piece_assemblies.clear();
+                    self.clear_piece_assemblies();
                 }
             }
             PeerEvent::RequestTimedOut { peer, timed_out } => {
@@ -1316,7 +1355,7 @@ impl TorrentTask {
                 err = %e,
                 "failed to assemble in-memory piece for verification"
             );
-            self.piece_assemblies.remove(&piece);
+            self.remove_piece_assembly(piece);
             self.picker.reject_piece(piece as usize);
             return;
         }
@@ -1328,7 +1367,7 @@ impl TorrentTask {
                 err = %e,
                 "block write failed"
             );
-            self.piece_assemblies.remove(&piece);
+            self.remove_piece_assembly(piece);
             return;
         }
         self.record_download(block.data.len() as u64).await;
@@ -1339,7 +1378,7 @@ impl TorrentTask {
         if complete {
             match self.verify_completed_piece(block.piece).await {
                 VerifyResult::Valid => {
-                    self.piece_assemblies.remove(&block.piece);
+                    self.remove_piece_assembly(block.piece);
                     info!(piece = block.piece, torrent = %self.info_hash_hex, "piece complete");
                     self.send_have_to_peers(block.piece).await;
                     if self.picker.is_complete() {
@@ -1358,7 +1397,7 @@ impl TorrentTask {
                         "piece verification failed"
                     );
                     self.picker.reject_piece(block.piece as usize);
-                    self.piece_assemblies.remove(&block.piece);
+                    self.remove_piece_assembly(block.piece);
                 }
                 VerifyResult::Missing { file_index, reason } => {
                     warn!(
@@ -1369,7 +1408,7 @@ impl TorrentTask {
                         "piece verification could not read data"
                     );
                     self.picker.reject_piece(block.piece as usize);
-                    self.piece_assemblies.remove(&block.piece);
+                    self.remove_piece_assembly(block.piece);
                 }
             }
         }
@@ -1377,10 +1416,52 @@ impl TorrentTask {
 
     fn record_piece_block(&mut self, block: &BlockEvent) -> anyhow::Result<()> {
         let len = self.piece_length(block.piece)? as usize;
-        self.piece_assemblies
-            .entry(block.piece)
-            .or_insert_with(|| PieceAssembly::new(len))
-            .insert(block.offset, &block.data)
+        if len > MAX_IN_MEMORY_PIECE_ASSEMBLY_BYTES {
+            return Ok(());
+        }
+
+        let inserted = if self.piece_assemblies.contains_key(&block.piece) {
+            false
+        } else {
+            self.piece_assembly_bytes = self.piece_assembly_bytes.saturating_add(len);
+            self.piece_assemblies
+                .insert(block.piece, PieceAssembly::new(len));
+            true
+        };
+
+        let result = self
+            .piece_assemblies
+            .get_mut(&block.piece)
+            .expect("piece assembly inserted or already present")
+            .insert(block.offset, &block.data);
+        if result.is_err() && inserted {
+            self.remove_piece_assembly(block.piece);
+        }
+        result?;
+        self.enforce_piece_assembly_budget(block.piece);
+        Ok(())
+    }
+
+    fn remove_piece_assembly(&mut self, piece: u32) {
+        if let Some(assembly) = self.piece_assemblies.remove(&piece) {
+            self.piece_assembly_bytes = self.piece_assembly_bytes.saturating_sub(assembly.len());
+        }
+    }
+
+    fn clear_piece_assemblies(&mut self) {
+        self.piece_assemblies.clear();
+        self.piece_assembly_bytes = 0;
+    }
+
+    fn enforce_piece_assembly_budget(&mut self, current_piece: u32) {
+        let evictions = evict_piece_assemblies_to_budget(
+            &mut self.piece_assemblies,
+            &mut self.piece_assembly_bytes,
+            current_piece,
+            MAX_IN_MEMORY_PIECE_ASSEMBLIES,
+            MAX_IN_MEMORY_PIECE_ASSEMBLY_BYTES,
+        );
+        self.piece_assembly_evictions = self.piece_assembly_evictions.saturating_add(evictions);
     }
 
     async fn send_have_to_peers(&mut self, piece: u32) {
@@ -1403,7 +1484,7 @@ impl TorrentTask {
             let _ = tx.send(PeerCommand::Shutdown).await;
         }
         self.active_peers.clear();
-        self.piece_assemblies.clear();
+        self.clear_piece_assemblies();
     }
 
     async fn record_download(&self, bytes: u64) {
@@ -3103,6 +3184,91 @@ mod tests {
             .insert(0, &[2; MAX_BLOCK_SIZE as usize])
             .unwrap_err();
         assert!(err.to_string().contains("conflicting duplicate block"));
+    }
+
+    #[test]
+    fn piece_assembly_budget_evicts_oldest_incomplete_piece() {
+        let now = Instant::now();
+        let mut assemblies = HashMap::new();
+        assemblies.insert(
+            1,
+            PieceAssembly {
+                last_used: now - Duration::from_secs(30),
+                ..PieceAssembly::new(4)
+            },
+        );
+        assemblies.insert(
+            2,
+            PieceAssembly {
+                last_used: now - Duration::from_secs(20),
+                ..PieceAssembly::new(4)
+            },
+        );
+        assemblies.insert(
+            3,
+            PieceAssembly {
+                last_used: now,
+                ..PieceAssembly::new(4)
+            },
+        );
+        let mut bytes = 12;
+
+        let evictions = evict_piece_assemblies_to_budget(&mut assemblies, &mut bytes, 3, 2, 12);
+
+        assert_eq!(evictions, 1);
+        assert_eq!(bytes, 8);
+        assert!(!assemblies.contains_key(&1));
+        assert!(assemblies.contains_key(&2));
+        assert!(assemblies.contains_key(&3));
+    }
+
+    #[test]
+    fn piece_assembly_budget_preserves_current_piece_when_possible() {
+        let now = Instant::now();
+        let mut assemblies = HashMap::new();
+        assemblies.insert(
+            1,
+            PieceAssembly {
+                last_used: now - Duration::from_secs(60),
+                ..PieceAssembly::new(4)
+            },
+        );
+        assemblies.insert(
+            2,
+            PieceAssembly {
+                last_used: now - Duration::from_secs(30),
+                ..PieceAssembly::new(4)
+            },
+        );
+        assemblies.insert(
+            3,
+            PieceAssembly {
+                last_used: now - Duration::from_secs(90),
+                ..PieceAssembly::new(4)
+            },
+        );
+        let mut bytes = 12;
+
+        let evictions = evict_piece_assemblies_to_budget(&mut assemblies, &mut bytes, 3, 3, 8);
+
+        assert_eq!(evictions, 1);
+        assert_eq!(bytes, 8);
+        assert!(!assemblies.contains_key(&1));
+        assert!(assemblies.contains_key(&2));
+        assert!(assemblies.contains_key(&3));
+    }
+
+    #[test]
+    fn piece_assembly_budget_stops_at_current_piece_only() {
+        let mut assemblies = HashMap::new();
+        assemblies.insert(7, PieceAssembly::new(16));
+        let mut bytes = 16;
+
+        let evictions = evict_piece_assemblies_to_budget(&mut assemblies, &mut bytes, 7, 0, 0);
+
+        assert_eq!(evictions, 0);
+        assert_eq!(bytes, 16);
+        assert!(assemblies.contains_key(&7));
     }
 
     #[test]

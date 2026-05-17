@@ -733,12 +733,12 @@ fn dry_run_session(
     let files = collect_files(root)?;
 
     for path in &files {
+        if looks_like_aggregate_resume(path) {
+            aggregate_resume_paths.push(path.clone());
+        }
         if extension_is(&path, resume_extensions) {
             if let Some(stem) = path.file_stem().and_then(|value| value.to_str()) {
                 resume_by_stem.insert(stem.to_owned(), path.clone());
-            }
-            if looks_like_aggregate_resume(path) {
-                aggregate_resume_paths.push(path.clone());
             }
         }
     }
@@ -1123,10 +1123,13 @@ fn resume_from_json(value: &serde_json::Value) -> ResumeData {
             "directory",
             "directory_base",
             "save_dir",
+            "qBt-savePath",
+            "qBt-downloadPath",
         ],
     )
     .map(PathBuf::from);
-    resume.category = first_json_string(value, &["category", "label"]).map(str::to_owned);
+    resume.category = first_json_string(value, &["category", "label", "qBt-category", "custom1"])
+        .map(str::to_owned);
     resume.tags = first_json_list(value, &["tags", "labels"]);
     resume.uploaded = first_json_u64(
         value,
@@ -1184,9 +1187,13 @@ fn resume_from_json(value: &serde_json::Value) -> ResumeData {
             "priorities",
             "priority",
             "qBt-filePriority",
+            "file_priority",
         ],
     );
-    resume.file_wanted = first_json_bool_list(value, &["wanted", "file_wanted", "fileWanted"]);
+    resume.file_wanted = first_json_bool_list(
+        value,
+        &["wanted", "file_wanted", "fileWanted", "qBt-fileWanted"],
+    );
     resume.file_completed_bytes = first_json_u64_list(
         value,
         &[
@@ -3054,6 +3061,125 @@ mod tests {
                 .source,
             MigrationSource::Generic
         );
+    }
+
+    #[test]
+    fn import_source_matrix_preserves_common_json_resume_fields() {
+        let cases: Vec<(
+            MigrationSource,
+            &str,
+            fn(&Path) -> Result<MigrationPlan, MigrationError>,
+        )> = vec![
+            (MigrationSource::QBittorrent, "fastresume", |root| {
+                dry_run_qbittorrent_backup(root)
+            }),
+            (MigrationSource::Transmission, "resume", |root| {
+                dry_run_transmission_session(root)
+            }),
+            (MigrationSource::Deluge, "fastresume", |root| {
+                dry_run_deluge_state(root)
+            }),
+            (MigrationSource::UTorrent, "dat", |root| {
+                dry_run_utorrent_config(root)
+            }),
+            (MigrationSource::BiglyBT, "config", |root| {
+                dry_run_biglybt_config(root)
+            }),
+            (MigrationSource::Tixati, "dat", |root| {
+                dry_run_tixati_config(root)
+            }),
+            (MigrationSource::Generic, "json", |root| {
+                dry_run_generic_torrent_directory(root)
+            }),
+        ];
+
+        for (source, extension, dry_run) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let torrent_path = dir.path().join("sample.torrent");
+            let info_hash = write_fixture_torrent(&torrent_path);
+            let info_hash_hex = hex_lower(&info_hash);
+            let save_path = dir.path().join("downloads");
+            std::fs::create_dir_all(&save_path).unwrap();
+            std::fs::write(save_path.join("sample.bin"), [1u8; 12]).unwrap();
+            std::fs::rename(
+                &torrent_path,
+                dir.path().join(format!("{info_hash_hex}.torrent")),
+            )
+            .unwrap();
+            let resume = serde_json::json!({
+                "qBt-savePath": save_path,
+                "qBt-category": "linux",
+                "tags": ["iso", "archive"],
+                "uploadedEver": 900,
+                "downloadedEver": 300,
+                "completed": true,
+                "addedOn": 1_700_000_000i64,
+                "completedAt": 1_700_000_100i64,
+                "paused": true,
+                "qBt-filePriority": [2],
+                "qBt-fileWanted": [true],
+                "fileCompletedBytes": [12],
+                "pieces": [1],
+                "lastAnnounce": 1_700_000_050i64,
+                "nextAnnounce": 1_700_000_500i64,
+                "seeders": 8,
+                "leechers": 2,
+            });
+            let resume_name = if source == MigrationSource::Generic {
+                "resume.dat".to_owned()
+            } else {
+                format!("{info_hash_hex}.{extension}")
+            };
+            std::fs::write(
+                dir.path().join(resume_name),
+                serde_json::to_vec(&resume).unwrap(),
+            )
+            .unwrap();
+
+            let plan = dry_run(dir.path()).unwrap();
+            assert_eq!(plan.source, source);
+            assert_eq!(plan.torrents.len(), 1, "{source:?}");
+            let torrent = &plan.torrents[0];
+            assert_eq!(torrent.info_hash, info_hash_hex, "{source:?}");
+            assert_eq!(
+                torrent.save_path.as_deref(),
+                Some(save_path.as_path()),
+                "{source:?}"
+            );
+            assert_eq!(torrent.category.as_deref(), Some("linux"), "{source:?}");
+            assert_eq!(
+                torrent.tags,
+                vec!["iso".to_owned(), "archive".to_owned()],
+                "{source:?}"
+            );
+            assert_eq!(torrent.uploaded, Some(900), "{source:?}");
+            assert_eq!(torrent.downloaded, Some(300), "{source:?}");
+            assert_eq!(torrent.completed, Some(true), "{source:?}");
+            assert_eq!(torrent.paused, Some(true), "{source:?}");
+            assert_eq!(torrent.files[0].priority, 2, "{source:?}");
+            assert_eq!(torrent.files[0].wanted, true, "{source:?}");
+            assert_eq!(torrent.files[0].completed_bytes, Some(12), "{source:?}");
+            assert_eq!(torrent.tracker_activity.seeders, Some(8), "{source:?}");
+            assert_eq!(
+                torrent.resume_confidence,
+                ResumeConfidence::Trusted,
+                "{source:?}"
+            );
+            let state = torrent
+                .to_fastresume_state(ImportPolicy::TrustHints)
+                .expect("fastresume state");
+            assert_eq!(state.pieces, vec![PieceState::Valid], "{source:?}");
+            let import = plan.to_db_import(&ImportOptions::default());
+            assert_eq!(
+                import.torrents[0].torrent.category.as_deref(),
+                Some("linux"),
+                "{source:?}"
+            );
+            assert_eq!(
+                import.torrents[0].files[0].completed_bytes, 12,
+                "{source:?}"
+            );
+        }
     }
 
     #[test]

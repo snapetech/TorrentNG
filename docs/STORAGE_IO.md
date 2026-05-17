@@ -64,7 +64,11 @@ semaphores:
 file allocation are no longer in the per-block hot path. It also keeps
 in-memory piece assembly buffers for active downloads, so completed-piece
 validation hashes the assembled bytes directly when all blocks are present and
-only falls back to disk verification when memory state is incomplete.
+only falls back to disk verification when memory state is incomplete. These
+buffers are bounded to 64 active pieces and 64 MiB per torrent task; when that
+budget is exceeded, the least recently used incomplete piece buffer is evicted
+and later validation falls back to the scheduled disk path. Pieces larger than
+the byte budget skip in-memory assembly entirely.
 
 ## Fastresume Contract
 
