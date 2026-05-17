@@ -162,6 +162,9 @@ metadata_only           — no file I/O (metadata/announce only)
 - Page-cache stewardship: large peer reads issue `SEQUENTIAL`/`WILLNEED`
   hints, and large recheck reads issue `SEQUENTIAL` before I/O and `DONTNEED`
   after I/O so cold verification sweeps do not evict hot seeding pages.
+- Sparse-aware recheck maps data extents with `SEEK_DATA`/`SEEK_HOLE` where
+  available, hashes sparse holes as zeroes, and skips reading hole bytes from
+  disk. Unsupported filesystems fall back to contiguous reads.
 - HDD vs SSD/NVMe I/O profile
 - Sequential vs random pressure awareness
 - Priority: recheck < background seeding < active downloads < active streams (future)

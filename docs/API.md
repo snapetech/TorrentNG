@@ -380,6 +380,7 @@ rTorrent over XMLRPC.
 | `torrentng_storage_peer_read_cache_*` | gauge/counter | Peer-read readahead cache entries, hits, and misses |
 | `torrentng_storage_peer_read_elevator_*` | gauge/counter | Peer-read elevator enablement, queue state, backend batches, and coalesced requests |
 | `torrentng_storage_page_cache_advise_*` | counter | Page-cache advice calls (`SEQUENTIAL`, `WILLNEED`, `DONTNEED`) and failures from the storage scheduler |
+| `torrentng_storage_sparse_*` | counter | Sparse recheck data extents, skipped hole bytes, and seek fallback count |
 | `torrentng_piece_assembly_*` | gauge/counter | In-memory completed-piece assembly buffers, bytes, and budget evictions |
 | `torrentng_api_requests_total` | counter | API requests served |
 | `torrentng_sync_cycles_total` | counter | Track 1 sidecar rTorrent sync cycles completed |

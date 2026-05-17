@@ -108,6 +108,9 @@ pub struct EngineStats {
     pub storage_page_cache_advise_willneed: u64,
     pub storage_page_cache_advise_dontneed: u64,
     pub storage_page_cache_advise_failures: u64,
+    pub storage_sparse_data_extents: u64,
+    pub storage_sparse_hole_bytes: u64,
+    pub storage_sparse_seek_fallbacks: u64,
     pub piece_assembly_buffers: u64,
     pub piece_assembly_bytes: u64,
     pub piece_assembly_evictions: u64,
@@ -326,6 +329,15 @@ impl EngineStats {
         self.storage_page_cache_advise_failures = self
             .storage_page_cache_advise_failures
             .saturating_add(storage.page_cache_advise_failures);
+        self.storage_sparse_data_extents = self
+            .storage_sparse_data_extents
+            .saturating_add(storage.sparse_data_extents);
+        self.storage_sparse_hole_bytes = self
+            .storage_sparse_hole_bytes
+            .saturating_add(storage.sparse_hole_bytes);
+        self.storage_sparse_seek_fallbacks = self
+            .storage_sparse_seek_fallbacks
+            .saturating_add(storage.sparse_seek_fallbacks);
     }
 }
 
@@ -585,13 +597,16 @@ mod tests {
             page_cache_advise_willneed: 19,
             page_cache_advise_dontneed: 20,
             page_cache_advise_failures: 21,
+            sparse_data_extents: 22,
+            sparse_hole_bytes: 23,
+            sparse_seek_fallbacks: 24,
             ..Default::default()
         };
-        storage.read_ops_by_class[0] = 22;
-        storage.read_ops_by_class[1] = 23;
-        storage.write_ops_by_class[0] = 24;
-        storage.bytes_read_by_class[0] = 25;
-        storage.bytes_written_by_class[0] = 26;
+        storage.read_ops_by_class[0] = 25;
+        storage.read_ops_by_class[1] = 26;
+        storage.write_ops_by_class[0] = 27;
+        storage.bytes_read_by_class[0] = 28;
+        storage.bytes_written_by_class[0] = 29;
         storage.backend_read_ops_by_class[4] = 3;
         storage.backend_bytes_read_by_class[4] = 4096;
         storage.read_latency_ns_by_class[4] = 100;
@@ -617,15 +632,15 @@ mod tests {
         assert_eq!(stats.storage_file_pool_open_files, 8);
         assert_eq!(stats.storage_file_pool_hits, 10);
         assert_eq!(stats.storage_file_pool_misses, 2);
-        assert_eq!(stats.storage_read_ops, 45);
-        assert_eq!(stats.storage_write_ops, 24);
-        assert_eq!(stats.storage_bytes_read, 25);
-        assert_eq!(stats.storage_bytes_written, 26);
-        assert_eq!(stats.storage_read_ops_by_class[0], 22);
-        assert_eq!(stats.storage_read_ops_by_class[1], 23);
-        assert_eq!(stats.storage_write_ops_by_class[0], 24);
-        assert_eq!(stats.storage_bytes_read_by_class[0], 25);
-        assert_eq!(stats.storage_bytes_written_by_class[0], 26);
+        assert_eq!(stats.storage_read_ops, 51);
+        assert_eq!(stats.storage_write_ops, 27);
+        assert_eq!(stats.storage_bytes_read, 28);
+        assert_eq!(stats.storage_bytes_written, 29);
+        assert_eq!(stats.storage_read_ops_by_class[0], 25);
+        assert_eq!(stats.storage_read_ops_by_class[1], 26);
+        assert_eq!(stats.storage_write_ops_by_class[0], 27);
+        assert_eq!(stats.storage_bytes_read_by_class[0], 28);
+        assert_eq!(stats.storage_bytes_written_by_class[0], 29);
         assert_eq!(stats.storage_backend_read_ops, 3);
         assert_eq!(stats.storage_backend_bytes_read, 4096);
         assert_eq!(stats.storage_backend_read_ops_by_class[4], 3);
@@ -650,6 +665,9 @@ mod tests {
         assert_eq!(stats.storage_page_cache_advise_willneed, 19);
         assert_eq!(stats.storage_page_cache_advise_dontneed, 20);
         assert_eq!(stats.storage_page_cache_advise_failures, 21);
+        assert_eq!(stats.storage_sparse_data_extents, 22);
+        assert_eq!(stats.storage_sparse_hole_bytes, 23);
+        assert_eq!(stats.storage_sparse_seek_fallbacks, 24);
         assert_eq!(stats.torrent_tasks_active, 1);
         assert_eq!(stats.fastresume_dirty_pieces, 4);
         assert_eq!(stats.piece_assembly_buffers, 19);

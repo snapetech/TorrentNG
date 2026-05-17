@@ -144,12 +144,11 @@ impl<'a> PieceVerifier<'a> {
 
     async fn read_region(&self, region: &FileRegion) -> Result<bytes::Bytes, StorageError> {
         let file_path = region.path.resolve(self.storage_root);
-        scheduled_read(
+        read_sparse_range(
             self.scheduler,
-            IoClass::Recheck,
             &file_path,
             region.file_offset,
-            region.length as usize,
+            region.length,
         )
         .await
     }
@@ -216,7 +215,7 @@ impl<'a> V2FileVerifier<'a> {
         let mut offset = 0u64;
         while offset < file.length {
             let len = (file.length - offset).min(Self::LEAF_SIZE as u64) as usize;
-            let data = scheduled_read(self.scheduler, IoClass::Recheck, &path, offset, len).await?;
+            let data = read_sparse_range(self.scheduler, &path, offset, len as u64).await?;
             leaves.push(self.scheduler.hash_v2_leaf(data).await?);
             offset += len as u64;
         }
@@ -227,9 +226,48 @@ impl<'a> V2FileVerifier<'a> {
     }
 }
 
+async fn read_sparse_range(
+    scheduler: &MountScheduler,
+    path: &Path,
+    offset: u64,
+    len: u64,
+) -> Result<bytes::Bytes, StorageError> {
+    let extents = scheduler.data_extents(path, offset, len).await?;
+    if extents.is_empty() {
+        return Ok(bytes::Bytes::from(vec![0; len as usize]));
+    }
+
+    let mut out = Vec::with_capacity(len as usize);
+    let range_end = offset.saturating_add(len);
+    let mut cursor = offset;
+    for extent in extents {
+        if extent.offset > cursor {
+            out.resize(out.len() + (extent.offset - cursor) as usize, 0);
+        }
+        let extent_end = extent.offset.saturating_add(extent.len).min(range_end);
+        if extent_end > extent.offset {
+            let data = scheduled_read(
+                scheduler,
+                IoClass::Recheck,
+                path,
+                extent.offset,
+                (extent_end - extent.offset) as usize,
+            )
+            .await?;
+            out.extend_from_slice(&data);
+            cursor = extent_end;
+        }
+    }
+    if cursor < range_end {
+        out.resize(out.len() + (range_end - cursor) as usize, 0);
+    }
+    Ok(bytes::Bytes::from(out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scheduler::scheduled_write;
     use rt_hash::{merkle_root, BlockHash};
     use rt_path::SafeRelPath;
     use rt_piece_map::{FileSpan, PieceMap};
@@ -285,6 +323,70 @@ mod tests {
         let verifier = PieceVerifier::new(dir.path(), &sched, &pm, &hashes);
 
         assert_eq!(verifier.verify_piece(0).await, VerifyResult::Valid);
+    }
+
+    #[tokio::test]
+    async fn verify_sparse_piece_hashes_holes_as_zeroes() {
+        let dir = tempfile::tempdir().unwrap();
+        let fname = "sparse.bin";
+        let path = dir.path().join(fname);
+        let piece_len = 512 * 1024usize;
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(piece_len as u64).unwrap();
+        drop(file);
+        let data_offset = 128 * 1024usize;
+        let data = vec![0x5au8; 4096];
+        scheduled_write(
+            &ssd_scheduler(),
+            IoClass::PeerWrite,
+            &path,
+            data_offset as u64,
+            bytes::Bytes::from(data.clone()),
+            false,
+        )
+        .await
+        .unwrap();
+
+        let mut expected_piece = vec![0u8; piece_len];
+        expected_piece[data_offset..data_offset + data.len()].copy_from_slice(&data);
+        let hash = piece_hash(&expected_piece);
+        let files = vec![FileSpan {
+            file_index: 0,
+            path: SafeRelPath::from_name(fname, false).unwrap(),
+            content_offset: 0,
+            length: piece_len as u64,
+        }];
+        let pm = PieceMap::new(piece_len as u64, files).unwrap();
+        let sched = ssd_scheduler();
+        let hashes = [hash];
+        let verifier = PieceVerifier::new(dir.path(), &sched, &pm, &hashes);
+
+        assert_eq!(verifier.verify_piece(0).await, VerifyResult::Valid);
+    }
+
+    #[tokio::test]
+    async fn verify_truncated_sparse_file_is_missing_not_zero_filled() {
+        let dir = tempfile::tempdir().unwrap();
+        let fname = "truncated.bin";
+        let path = dir.path().join(fname);
+        std::fs::write(&path, [0u8; 1024]).unwrap();
+        let piece_len = 128 * 1024usize;
+        let expected = piece_hash(&vec![0u8; piece_len]);
+        let files = vec![FileSpan {
+            file_index: 0,
+            path: SafeRelPath::from_name(fname, false).unwrap(),
+            content_offset: 0,
+            length: piece_len as u64,
+        }];
+        let pm = PieceMap::new(piece_len as u64, files).unwrap();
+        let sched = ssd_scheduler();
+        let hashes = [expected];
+        let verifier = PieceVerifier::new(dir.path(), &sched, &pm, &hashes);
+
+        assert!(matches!(
+            verifier.verify_piece(0).await,
+            VerifyResult::Missing { file_index: 0, .. }
+        ));
     }
 
     #[tokio::test]
@@ -414,6 +516,42 @@ mod tests {
             verifier.verify_all().await,
             vec![(file.file_index, VerifyResult::Valid)]
         );
+    }
+
+    #[tokio::test]
+    async fn v2_file_verify_hashes_sparse_holes_as_zeroes() {
+        let dir = tempfile::tempdir().unwrap();
+        let fname = "sparse-v2.bin";
+        let path = dir.path().join(fname);
+        let file_len = (V2FileVerifier::LEAF_SIZE * 2) as u64;
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(file_len).unwrap();
+        drop(file);
+        let data_offset = V2FileVerifier::LEAF_SIZE + 2048;
+        let data = vec![0xa5u8; 4096];
+        scheduled_write(
+            &ssd_scheduler(),
+            IoClass::PeerWrite,
+            &path,
+            data_offset as u64,
+            bytes::Bytes::from(data.clone()),
+            false,
+        )
+        .await
+        .unwrap();
+
+        let mut expected = vec![0u8; file_len as usize];
+        expected[data_offset..data_offset + data.len()].copy_from_slice(&data);
+        let file = V2FileHash {
+            file_index: 7,
+            path: SafeRelPath::from_name(fname, false).unwrap(),
+            length: file_len,
+            pieces_root: v2_file_root(&expected),
+        };
+        let sched = ssd_scheduler();
+        let verifier = V2FileVerifier::new(dir.path(), &sched, std::slice::from_ref(&file));
+
+        assert_eq!(verifier.verify_file(&file).await, VerifyResult::Valid);
     }
 
     #[tokio::test]

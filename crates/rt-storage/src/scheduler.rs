@@ -182,6 +182,15 @@ pub struct StorageIoStats {
     pub page_cache_advise_willneed: u64,
     pub page_cache_advise_dontneed: u64,
     pub page_cache_advise_failures: u64,
+    pub sparse_data_extents: u64,
+    pub sparse_hole_bytes: u64,
+    pub sparse_seek_fallbacks: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DataExtent {
+    pub offset: u64,
+    pub len: u64,
 }
 
 #[derive(Debug, Default)]
@@ -470,6 +479,9 @@ struct StorageCounters {
     page_cache_advise_willneed: AtomicU64,
     page_cache_advise_dontneed: AtomicU64,
     page_cache_advise_failures: AtomicU64,
+    sparse_data_extents: AtomicU64,
+    sparse_hole_bytes: AtomicU64,
+    sparse_seek_fallbacks: AtomicU64,
 }
 
 impl Default for StorageCounters {
@@ -501,6 +513,9 @@ impl Default for StorageCounters {
             page_cache_advise_willneed: AtomicU64::new(0),
             page_cache_advise_dontneed: AtomicU64::new(0),
             page_cache_advise_failures: AtomicU64::new(0),
+            sparse_data_extents: AtomicU64::new(0),
+            sparse_hole_bytes: AtomicU64::new(0),
+            sparse_seek_fallbacks: AtomicU64::new(0),
         }
     }
 }
@@ -955,6 +970,9 @@ impl MountScheduler {
                 .counters
                 .page_cache_advise_failures
                 .load(Ordering::Relaxed),
+            sparse_data_extents: self.counters.sparse_data_extents.load(Ordering::Relaxed),
+            sparse_hole_bytes: self.counters.sparse_hole_bytes.load(Ordering::Relaxed),
+            sparse_seek_fallbacks: self.counters.sparse_seek_fallbacks.load(Ordering::Relaxed),
         }
     }
 
@@ -1287,6 +1305,54 @@ impl MountScheduler {
         .await
     }
 
+    pub async fn data_extents(
+        &self,
+        path: &Path,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<DataExtent>, StorageError> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let pool = self.file_pool.clone();
+        let counters = self.counters.clone();
+        let path = path.to_path_buf();
+        self.submit(move || {
+            let key = normalized_key(&path);
+            let path_str = key.display().to_string();
+            let file = pool.get_or_open(&key, OpenMode::Read, false)?;
+            let file_len = file
+                .metadata()
+                .map_err(|e| StorageError::io(&path_str, e))?
+                .len();
+            let requested_end = offset.saturating_add(len);
+            if offset >= file_len || requested_end > file_len {
+                return Err(StorageError::ShortIo {
+                    path: path_str,
+                    expected: len as usize,
+                    actual: file_len.saturating_sub(offset) as usize,
+                });
+            }
+            let (extents, used_fallback) = seek_data_extents(&file, offset, len)
+                .map_err(|e| StorageError::io(&path_str, e))?;
+            if used_fallback {
+                counters
+                    .sparse_seek_fallbacks
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            let data_bytes = extents.iter().map(|extent| extent.len).sum::<u64>();
+            let hole_bytes = len.saturating_sub(data_bytes);
+            counters
+                .sparse_data_extents
+                .fetch_add(extents.len() as u64, Ordering::Relaxed);
+            counters
+                .sparse_hole_bytes
+                .fetch_add(hole_bytes, Ordering::Relaxed);
+            Ok(extents)
+        })
+        .await
+    }
+
     pub async fn hash_sha1(&self, data: bytes::Bytes) -> Result<[u8; 20], StorageError> {
         let counters = self.counters.clone();
         let started = Instant::now();
@@ -1550,6 +1616,81 @@ fn advise_page_cache(file: &File, offset: u64, len: usize, advice: PageCacheAdvi
     {
         let _ = (file, offset, len, advice);
         true
+    }
+}
+
+fn seek_data_extents(
+    file: &File,
+    offset: u64,
+    len: u64,
+) -> std::io::Result<(Vec<DataExtent>, bool)> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+
+        let end = offset.saturating_add(len);
+        if len == 0 {
+            return Ok((Vec::new(), false));
+        }
+
+        let fd = file.as_raw_fd();
+        let mut cursor = offset;
+        let mut extents = Vec::new();
+        while cursor < end {
+            let data = unsafe {
+                libc::lseek(
+                    fd,
+                    cursor.min(i64::MAX as u64) as libc::off_t,
+                    libc::SEEK_DATA,
+                )
+            };
+            if data < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::ENXIO) {
+                    break;
+                }
+                if matches!(err.raw_os_error(), Some(libc::EINVAL)) {
+                    return Ok((vec![DataExtent { offset, len }], true));
+                }
+                return Err(err);
+            }
+            let data = (data as u64).max(cursor);
+            if data >= end {
+                break;
+            }
+            let hole = unsafe {
+                libc::lseek(
+                    fd,
+                    data.min(i64::MAX as u64) as libc::off_t,
+                    libc::SEEK_HOLE,
+                )
+            };
+            if hole < 0 {
+                let err = std::io::Error::last_os_error();
+                if matches!(err.raw_os_error(), Some(libc::EINVAL)) {
+                    return Ok((vec![DataExtent { offset, len }], true));
+                }
+                return Err(err);
+            }
+            let extent_end = (hole as u64).min(end);
+            if extent_end > data {
+                extents.push(DataExtent {
+                    offset: data,
+                    len: extent_end - data,
+                });
+            }
+            cursor = extent_end.max(data.saturating_add(1));
+        }
+        Ok((extents, false))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        if len == 0 {
+            Ok((Vec::new(), true))
+        } else {
+            Ok((vec![DataExtent { offset, len }], true))
+        }
     }
 }
 

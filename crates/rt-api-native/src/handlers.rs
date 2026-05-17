@@ -1021,6 +1021,27 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
     );
     metric(
         &mut out,
+        "torrentng_storage_sparse_data_extents_total",
+        "counter",
+        "Sparse-file data extents discovered during storage recheck",
+        stats.storage_sparse_data_extents,
+    );
+    metric(
+        &mut out,
+        "torrentng_storage_sparse_hole_bytes_total",
+        "counter",
+        "Sparse-file hole bytes skipped during storage recheck",
+        stats.storage_sparse_hole_bytes,
+    );
+    metric(
+        &mut out,
+        "torrentng_storage_sparse_seek_fallbacks_total",
+        "counter",
+        "Sparse-file extent probes that fell back to contiguous reads",
+        stats.storage_sparse_seek_fallbacks,
+    );
+    metric(
+        &mut out,
         "torrentng_piece_assembly_buffers",
         "gauge",
         "In-memory piece assembly buffers across running torrents",
@@ -1422,6 +1443,9 @@ mod tests {
             storage_page_cache_advise_willneed: 30,
             storage_page_cache_advise_dontneed: 31,
             storage_page_cache_advise_failures: 32,
+            storage_sparse_data_extents: 33,
+            storage_sparse_hole_bytes: 34,
+            storage_sparse_seek_fallbacks: 35,
             ..Default::default()
         };
         stats.storage_read_ops_by_class[4] = 10;
@@ -1482,6 +1506,9 @@ mod tests {
         assert!(rendered.contains("torrentng_storage_page_cache_advise_willneed_total 30"));
         assert!(rendered.contains("torrentng_storage_page_cache_advise_dontneed_total 31"));
         assert!(rendered.contains("torrentng_storage_page_cache_advise_failures_total 32"));
+        assert!(rendered.contains("torrentng_storage_sparse_data_extents_total 33"));
+        assert!(rendered.contains("torrentng_storage_sparse_hole_bytes_total 34"));
+        assert!(rendered.contains("torrentng_storage_sparse_seek_fallbacks_total 35"));
         assert!(rendered.contains(
             "torrentng_storage_read_latency_nanoseconds_by_class_total{class=\"peer_read\"} 22"
         ));

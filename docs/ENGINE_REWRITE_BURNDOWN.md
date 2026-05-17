@@ -163,5 +163,5 @@ shippable and benchmarkable.
 - [x] Bounded post-crash recheck (only pieces written since last barrier).
 - [ ] Piece-aggregated writes; hash from RAM on dedicated hashing pool; delete read-after-write verify.
 - [x] Adaptive per-connection readahead + `posix_fadvise` page-cache stewardship (`DONTNEED`/`SEQUENTIAL`).
-- [ ] `SEEK_HOLE`/`SEEK_DATA`-aware recheck sweep.
+- [x] `SEEK_HOLE`/`SEEK_DATA`-aware recheck sweep.
 - [ ] Bench: kill -9 under write load → bounded recheck, zero silent corruption.
