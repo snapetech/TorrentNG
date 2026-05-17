@@ -346,6 +346,7 @@ async fn announce_http(
     let url = req.to_http_query(tracker_url)?;
     let response = reqwest::Client::builder()
         .timeout(http_timeout)
+        .user_agent(crate::peer_id::USER_AGENT)
         .build()
         .map_err(|e| TrackerError::Network(e.to_string()))?
         .get(url)

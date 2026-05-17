@@ -643,6 +643,7 @@ impl TorrentTask {
         let url = req.to_http_query(tracker_url)?;
         let response = reqwest::Client::builder()
             .timeout(self.http_timeout)
+            .user_agent(crate::peer_id::USER_AGENT)
             .build()
             .map_err(|e| TrackerError::Network(e.to_string()))?
             .get(url)
@@ -773,6 +774,7 @@ impl TorrentTask {
         let url = to_http_scrape_url(tracker_url, InfoHash::V1(self.meta.info_hash))?;
         let resp = reqwest::Client::new()
             .get(url)
+            .header(reqwest::header::USER_AGENT, crate::peer_id::USER_AGENT)
             .timeout(self.http_timeout)
             .send()
             .await
