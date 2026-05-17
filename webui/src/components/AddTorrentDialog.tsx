@@ -82,11 +82,11 @@ export function AddTorrentDialog({ onClose }: Props) {
   }
 
   return (
-    <div className="rtng-modal-backdrop" style={{
+    <div className="tng-modal-backdrop" style={{
       position: 'fixed', inset: 0, background: 'rgba(2,6,23,0.72)', display: 'flex',
       alignItems: 'center', justifyContent: 'center', zIndex: 100,
     }} onClick={e => { if (!busy && e.target === e.currentTarget) onClose() }}>
-      <div role="dialog" aria-modal="true" aria-label="Add torrent" className="rtng-modal rtng-add-dialog" style={{
+      <div role="dialog" aria-modal="true" aria-label="Add torrent" className="tng-modal tng-add-dialog" style={{
         background: 'var(--panel)', border: '1px solid var(--border)', borderRadius: 10,
         width: 480, maxWidth: '95vw', padding: 24, display: 'flex', flexDirection: 'column', gap: 16,
       }}>
@@ -107,7 +107,7 @@ export function AddTorrentDialog({ onClose }: Props) {
 
         {/* Drag-drop zone */}
         <div
-          className="rtng-dropzone"
+          className="tng-dropzone"
           data-active={dragOver ? 'true' : 'false'}
           data-filled={files.length > 0 ? 'true' : 'false'}
           role="button"
@@ -151,7 +151,7 @@ export function AddTorrentDialog({ onClose }: Props) {
           ) : (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
               {files.map(f => (
-                <div key={f.name} className="rtng-staged-file" style={{
+                <div key={f.name} className="tng-staged-file" style={{
                   display: 'flex', alignItems: 'center', gap: 8,
                   border: '1px solid var(--border)', borderRadius: 6, padding: '5px 7px',
                   background: 'var(--surface)',
@@ -170,7 +170,7 @@ export function AddTorrentDialog({ onClose }: Props) {
         </div>
 
         {/* URL input */}
-        <div className="rtng-form-card" style={{
+        <div className="tng-form-card" style={{
           border: '1px solid var(--border)', borderRadius: 7, background: 'var(--surface)',
           padding: '9px 10px',
         }}>
@@ -192,7 +192,7 @@ export function AddTorrentDialog({ onClose }: Props) {
         </div>
 
         {/* Save path */}
-        <div className="rtng-form-card" style={{
+        <div className="tng-form-card" style={{
           border: '1px solid var(--border)', borderRadius: 7, background: 'var(--surface)',
           padding: '9px 10px',
         }}>
@@ -207,7 +207,7 @@ export function AddTorrentDialog({ onClose }: Props) {
 
         {/* Category */}
         {categories.length > 0 && (
-          <div className="rtng-form-card" style={{
+          <div className="tng-form-card" style={{
             border: '1px solid var(--border)', borderRadius: 7, background: 'var(--surface)',
             padding: '9px 10px',
           }}>
@@ -233,7 +233,7 @@ export function AddTorrentDialog({ onClose }: Props) {
         )}
 
         {/* Start toggle */}
-        <label className="rtng-form-card" data-start={start ? 'true' : 'false'} style={{
+        <label className="tng-form-card" data-start={start ? 'true' : 'false'} style={{
           display: 'flex', alignItems: 'center', gap: 8, cursor: busy ? 'not-allowed' : 'pointer',
           fontSize: 13, color: 'var(--muted)', border: '1px solid var(--border)', borderRadius: 7,
           background: 'var(--surface)', padding: '8px 10px',
@@ -242,7 +242,7 @@ export function AddTorrentDialog({ onClose }: Props) {
           Start immediately
         </label>
 
-        <div className="rtng-add-summary" data-ready={canSubmit ? 'true' : 'false'} data-start={start ? 'true' : 'false'} style={{
+        <div className="tng-add-summary" data-ready={canSubmit ? 'true' : 'false'} data-start={start ? 'true' : 'false'} style={{
           display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10,
           padding: '7px 9px', border: '1px solid var(--border)', borderRadius: 6,
           background: 'var(--surface)', color: 'var(--faint)', fontSize: 12,

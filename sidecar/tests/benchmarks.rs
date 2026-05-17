@@ -8,7 +8,7 @@ use reqwest::Client;
 use std::{net::SocketAddr, sync::Arc, time::Instant};
 use tokio::{net::TcpListener, sync::broadcast};
 
-use rtorrentng::{
+use torrentng::{
     api::{server::AppState, ws::Event},
     cache::{Db, TorrentRow},
     config::Config,
@@ -23,7 +23,7 @@ async fn spawn_server_with_db() -> (SocketAddr, Client, Arc<Db>) {
     let db = Arc::new(Db::open(db_path.as_ref()).unwrap());
     let (tx, _) = broadcast::channel::<Event>(16);
     let metrics = Metrics::new();
-    let rt = Arc::new(rtorrentng::rtorrent::Client::new_unix("/nonexistent", 1));
+    let rt = Arc::new(torrentng::rtorrent::Client::new_unix("/nonexistent", 1));
     let state = AppState {
         cfg,
         rt,
@@ -31,7 +31,7 @@ async fn spawn_server_with_db() -> (SocketAddr, Client, Arc<Db>) {
         events: tx,
         metrics,
     };
-    let app: Router = rtorrentng::api::server::build_router(state);
+    let app: Router = torrentng::api::server::build_router(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -46,7 +46,7 @@ fn url(addr: SocketAddr, path: &str) -> String {
 }
 
 fn torrent_count() -> usize {
-    std::env::var("RTNG_BENCH_TORRENTS")
+    std::env::var("TNG_BENCH_TORRENTS")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(DEFAULT_TORRENTS)

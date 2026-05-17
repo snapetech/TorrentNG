@@ -2,11 +2,11 @@
 set -e
 
 RTORRENT_SOCKET=${RTORRENT_SCGI_SOCKET:-/run/rtorrent/rpc.sock}
-CONFIG_FILE=${RTORRENTNG_CONFIG:-/config/config.toml}
+CONFIG_FILE=${TORRENTNG_CONFIG:-/config/config.toml}
 INCOMING_PORT=${RTORRENT_INCOMING_PORT:-50000}
 export TERM=${TERM:-xterm}
 
-mkdir -p /run/rtorrent /session /data /var/lib/rtorrentng /var/log/rtorrent /config
+mkdir -p /run/rtorrent /session /data /var/lib/torrentng /var/log/rtorrent /config
 rm -f "$RTORRENT_SOCKET" /session/rtorrent.lock
 
 if [ -f /config/rtorrent.rc ]; then
@@ -16,7 +16,7 @@ else
 fi
 
 if [ ! -f "$CONFIG_FILE" ]; then
-  cp /etc/rtorrentng/config.toml "$CONFIG_FILE"
+  cp /etc/torrentng/config.toml "$CONFIG_FILE"
 fi
 
 # Start rTorrent in background
@@ -41,4 +41,4 @@ fi
 
 chmod 660 "$RTORRENT_SOCKET"
 
-exec rtorrentng "$CONFIG_FILE"
+exec torrentng "$CONFIG_FILE"

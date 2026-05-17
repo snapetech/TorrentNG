@@ -43,22 +43,22 @@ RUN cd rtorrent && autoreconf -fi && \
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates curl libcurl ncurses openssl tinyxml2 tzdata zlib
 
-COPY --from=sidecar-build /src/target/release/rtorrentng /usr/local/bin/rtorrentng
-COPY --from=webui-build   /sidecar/static /usr/share/rtorrentng/webui
+COPY --from=sidecar-build /src/target/release/torrentng /usr/local/bin/torrentng
+COPY --from=webui-build   /sidecar/static /usr/share/torrentng/webui
 COPY --from=rtorrent-build /usr/local/bin/rtorrent /usr/local/bin/rtorrent
 COPY --from=rtorrent-build /usr/local/lib/libtorrent* /usr/local/lib/
 
 COPY deploy/docker/rtorrent.rc    /etc/rtorrent/rtorrent.rc
 COPY engine-profile/rtorrent.rc   /etc/rtorrent/profile.rc
-COPY deploy/docker/sidecar.config.toml /etc/rtorrentng/config.toml
+COPY deploy/docker/sidecar.config.toml /etc/torrentng/config.toml
 COPY deploy/docker/entrypoint.sh  /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-ENV RTNG_STATIC_DIR=/usr/share/rtorrentng/webui
+ENV TNG_STATIC_DIR=/usr/share/torrentng/webui
 ENV LD_LIBRARY_PATH=/usr/local/lib
-ENV RTNG_PACKAGED_RTORRENT_VERSION=0.16.11
-ENV RTNG_PACKAGED_LIBTORRENT_VERSION=0.16.11
-ENV RTNG_RTORRENT_PATCHES=rtorrent-0.16.11-user-agent-command,rtorrent-0.16.11-multicall-range
+ENV TNG_PACKAGED_RTORRENT_VERSION=0.16.11
+ENV TNG_PACKAGED_LIBTORRENT_VERSION=0.16.11
+ENV TNG_RTORRENT_PATCHES=rtorrent-0.16.11-user-agent-command,rtorrent-0.16.11-multicall-range
 
 VOLUME ["/data", "/session", "/config"]
 EXPOSE 8080 50000 50000/udp

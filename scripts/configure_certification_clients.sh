@@ -12,7 +12,7 @@ if [[ -f "$ENV_FILE" ]]; then
   set +a
 fi
 
-RTNG_API_TOKEN="${RTNG_API_TOKEN:-cert-token}"
+TNG_API_TOKEN="${TNG_API_TOKEN:-cert-token}"
 SONARR_HOST_URL="${SONARR_HOST_URL:-http://localhost:${SONARR_HOST_PORT:-18989}}"
 RADARR_HOST_URL="${RADARR_HOST_URL:-http://localhost:${RADARR_HOST_PORT:-17878}}"
 PROWLARR_HOST_URL="${PROWLARR_HOST_URL:-http://localhost:${PROWLARR_HOST_PORT:-19696}}"
@@ -70,13 +70,13 @@ arr_payload() {
   local category_value="$6"
 
   curl -fsS -H "X-Api-Key: $api_key" "$base_url$api_path/downloadclient/schema" \
-    | jq --arg name "$name" --arg category_field "$category_field" --arg category_value "$category_value" --arg token "$RTNG_API_TOKEN" '
+    | jq --arg name "$name" --arg category_field "$category_field" --arg category_value "$category_value" --arg token "$TNG_API_TOKEN" '
       map(select(.implementation=="QBittorrent"))[0]
       | .enable=true
       | .name=$name
       | .priority=1
       | .fields |= map(
-          if .name=="host" then .value="rtorrentng"
+          if .name=="host" then .value="torrentng"
           elif .name=="port" then .value=8080
           elif .name=="useSsl" then .value=false
           elif .name=="urlBase" then .value=""
@@ -98,7 +98,7 @@ configure_arr_client() {
   local api_path="$4"
   local category_field="$5"
   local category_value="$6"
-  local name="rtorrentNG-qBit"
+  local name="TorrentNG-qBit"
   local payload code existing_id
 
   payload="$(arr_payload "$base_url" "$api_key" "$api_path" "$name" "$category_field" "$category_value")"
@@ -107,47 +107,47 @@ configure_arr_client() {
     payload="$(printf '%s' "$payload" | jq --argjson id "$existing_id" '.id=$id')"
   fi
 
-  code="$(curl -ksS -o /tmp/rtng-arr-test-body.txt -w '%{http_code}' -H "X-Api-Key: $api_key" -H 'Content-Type: application/json' -X POST -d "$payload" "$base_url$api_path/downloadclient/test")"
+  code="$(curl -ksS -o /tmp/tng-arr-test-body.txt -w '%{http_code}' -H "X-Api-Key: $api_key" -H 'Content-Type: application/json' -X POST -d "$payload" "$base_url$api_path/downloadclient/test")"
   if [[ "$code" != "200" ]]; then
-    mark "$label qBit test" "FAIL" "HTTP $code $(tr '\n' ' ' </tmp/rtng-arr-test-body.txt)"
+    mark "$label qBit test" "FAIL" "HTTP $code $(tr '\n' ' ' </tmp/tng-arr-test-body.txt)"
     return
   fi
 
   if [[ -n "$existing_id" ]]; then
-    code="$(curl -ksS -o /tmp/rtng-arr-save-body.txt -w '%{http_code}' -H "X-Api-Key: $api_key" -H 'Content-Type: application/json' -X PUT -d "$payload" "$base_url$api_path/downloadclient/$existing_id")"
+    code="$(curl -ksS -o /tmp/tng-arr-save-body.txt -w '%{http_code}' -H "X-Api-Key: $api_key" -H 'Content-Type: application/json' -X PUT -d "$payload" "$base_url$api_path/downloadclient/$existing_id")"
   else
-    code="$(curl -ksS -o /tmp/rtng-arr-save-body.txt -w '%{http_code}' -H "X-Api-Key: $api_key" -H 'Content-Type: application/json' -X POST -d "$payload" "$base_url$api_path/downloadclient")"
+    code="$(curl -ksS -o /tmp/tng-arr-save-body.txt -w '%{http_code}' -H "X-Api-Key: $api_key" -H 'Content-Type: application/json' -X POST -d "$payload" "$base_url$api_path/downloadclient")"
   fi
 
   if [[ "$code" == "200" || "$code" == "201" || "$code" == "202" ]]; then
     mark "$label qBit client" "PASS" "tested and saved as $name"
   else
-    mark "$label qBit client" "FAIL" "HTTP $code $(tr '\n' ' ' </tmp/rtng-arr-save-body.txt)"
+    mark "$label qBit client" "FAIL" "HTTP $code $(tr '\n' ' ' </tmp/tng-arr-save-body.txt)"
   fi
 }
 
 configure_autobrr_client() {
-  local cookies="/tmp/rtng-autobrr-cookies.txt"
+  local cookies="/tmp/tng-autobrr-cookies.txt"
   local user="${AUTOBRR_CERT_USER:-cert}"
   local pass="${AUTOBRR_CERT_PASSWORD:-cert}"
   local payload code existing_id
 
-  code="$(curl -ksS -o /tmp/rtng-autobrr-onboard.txt -w '%{http_code}' "$AUTOBRR_HOST_URL/api/auth/onboard")"
+  code="$(curl -ksS -o /tmp/tng-autobrr-onboard.txt -w '%{http_code}' "$AUTOBRR_HOST_URL/api/auth/onboard")"
   if [[ "$code" == "204" ]]; then
-    curl -ksS -o /tmp/rtng-autobrr-onboard.txt -H 'Content-Type: application/json' -X POST -d "{\"username\":\"$user\",\"password\":\"$pass\"}" "$AUTOBRR_HOST_URL/api/auth/onboard" >/dev/null
+    curl -ksS -o /tmp/tng-autobrr-onboard.txt -H 'Content-Type: application/json' -X POST -d "{\"username\":\"$user\",\"password\":\"$pass\"}" "$AUTOBRR_HOST_URL/api/auth/onboard" >/dev/null
   fi
 
-  code="$(curl -ksS -c "$cookies" -o /tmp/rtng-autobrr-login.txt -w '%{http_code}' -H 'Content-Type: application/json' -X POST -d "{\"username\":\"$user\",\"password\":\"$pass\",\"remember_me\":true}" "$AUTOBRR_HOST_URL/api/auth/login")"
+  code="$(curl -ksS -c "$cookies" -o /tmp/tng-autobrr-login.txt -w '%{http_code}' -H 'Content-Type: application/json' -X POST -d "{\"username\":\"$user\",\"password\":\"$pass\",\"remember_me\":true}" "$AUTOBRR_HOST_URL/api/auth/login")"
   if [[ "$code" != "204" ]]; then
-    mark "autobrr login" "FAIL" "HTTP $code $(tr '\n' ' ' </tmp/rtng-autobrr-login.txt)"
+    mark "autobrr login" "FAIL" "HTTP $code $(tr '\n' ' ' </tmp/tng-autobrr-login.txt)"
     return
   fi
 
-  payload="$(jq -nc --arg token "$RTNG_API_TOKEN" '{
-    name: "rtorrentNG-qBit",
+  payload="$(jq -nc --arg token "$TNG_API_TOKEN" '{
+    name: "TorrentNG-qBit",
     type: "QBITTORRENT",
     enabled: true,
-    host: "rtorrentng",
+    host: "torrentng",
     port: 8080,
     tls: false,
     tls_skip_verify: false,
@@ -159,32 +159,32 @@ configure_autobrr_client() {
     }
   }')"
 
-  code="$(curl -ksS -b "$cookies" -o /tmp/rtng-autobrr-test.txt -w '%{http_code}' -H 'Content-Type: application/json' -X POST -d "$payload" "$AUTOBRR_HOST_URL/api/download_clients/test")"
+  code="$(curl -ksS -b "$cookies" -o /tmp/tng-autobrr-test.txt -w '%{http_code}' -H 'Content-Type: application/json' -X POST -d "$payload" "$AUTOBRR_HOST_URL/api/download_clients/test")"
   if [[ "$code" != "204" ]]; then
-    mark "autobrr qBit test" "FAIL" "HTTP $code $(tr '\n' ' ' </tmp/rtng-autobrr-test.txt)"
+    mark "autobrr qBit test" "FAIL" "HTTP $code $(tr '\n' ' ' </tmp/tng-autobrr-test.txt)"
     return
   fi
 
-  existing_id="$(curl -fsS -b "$cookies" "$AUTOBRR_HOST_URL/api/download_clients" | jq -r '.[] | select(.name=="rtorrentNG-qBit") | .id' | head -1)"
+  existing_id="$(curl -fsS -b "$cookies" "$AUTOBRR_HOST_URL/api/download_clients" | jq -r '.[] | select(.name=="TorrentNG-qBit") | .id' | head -1)"
   if [[ -n "$existing_id" ]]; then
     payload="$(printf '%s' "$payload" | jq --argjson id "$existing_id" '.id=$id')"
-    code="$(curl -ksS -b "$cookies" -o /tmp/rtng-autobrr-save.txt -w '%{http_code}' -H 'Content-Type: application/json' -X PUT -d "$payload" "$AUTOBRR_HOST_URL/api/download_clients")"
+    code="$(curl -ksS -b "$cookies" -o /tmp/tng-autobrr-save.txt -w '%{http_code}' -H 'Content-Type: application/json' -X PUT -d "$payload" "$AUTOBRR_HOST_URL/api/download_clients")"
   else
-    code="$(curl -ksS -b "$cookies" -o /tmp/rtng-autobrr-save.txt -w '%{http_code}' -H 'Content-Type: application/json' -X POST -d "$payload" "$AUTOBRR_HOST_URL/api/download_clients")"
+    code="$(curl -ksS -b "$cookies" -o /tmp/tng-autobrr-save.txt -w '%{http_code}' -H 'Content-Type: application/json' -X POST -d "$payload" "$AUTOBRR_HOST_URL/api/download_clients")"
   fi
 
   if [[ "$code" == "200" || "$code" == "201" ]]; then
-    mark "autobrr qBit client" "PASS" "tested and saved as rtorrentNG-qBit"
+    mark "autobrr qBit client" "PASS" "tested and saved as TorrentNG-qBit"
   else
-    mark "autobrr qBit client" "FAIL" "HTTP $code $(tr '\n' ' ' </tmp/rtng-autobrr-save.txt)"
+    mark "autobrr qBit client" "FAIL" "HTTP $code $(tr '\n' ' ' </tmp/tng-autobrr-save.txt)"
   fi
 }
 
 {
-  echo "# rtorrentNG Client Configuration Report"
+  echo "# TorrentNG Client Configuration Report"
   echo
   echo "- Date UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  echo "- rtorrentNG Docker host: rtorrentng:8080"
+  echo "- TorrentNG Docker host: torrentng:8080"
   echo
   echo "## Checks"
   echo

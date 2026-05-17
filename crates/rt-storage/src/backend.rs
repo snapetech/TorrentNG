@@ -86,7 +86,7 @@ impl PreadBackend {
         for i in 0..threads {
             let rx = Arc::clone(&rx);
             let handle = thread::Builder::new()
-                .name(format!("rtng-disk-{i}"))
+                .name(format!("tng-disk-{i}"))
                 .spawn(move || Self::worker(rx))
                 .expect("spawn disk worker");
             workers.push(handle);

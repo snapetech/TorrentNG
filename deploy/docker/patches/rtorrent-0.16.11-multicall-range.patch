@@ -15,7 +15,7 @@ index 23e262c..ebb3674 100644
    return resultRaw;
  }
  
-+static constexpr int64_t rtng_multicall_max_limit = 1000;
++static constexpr int64_t tng_multicall_max_limit = 1000;
 +
 +torrent::Object
 +d_multicall_range(const torrent::Object::list_type& args) {
@@ -50,7 +50,7 @@ index 23e262c..ebb3674 100644
 +  if (limit == 0)
 +    return resultRaw;
 +
-+  const int64_t bounded_limit = std::min(limit, rtng_multicall_max_limit);
++  const int64_t bounded_limit = std::min(limit, tng_multicall_max_limit);
 +
 +  auto view_begin = (*view_itr)->begin_visible();
 +  auto view_end   = (*view_itr)->end_visible();
@@ -107,7 +107,7 @@ index 23e262c..ebb3674 100644
 +  if (limit == 0)
 +    return resultRaw;
 +
-+  const int64_t bounded_limit = std::min(limit, rtng_multicall_max_limit);
++  const int64_t bounded_limit = std::min(limit, tng_multicall_max_limit);
 +  ++arg; // skip to first command
 +
 +  for (auto itr = (*view_itr)->begin_visible(); itr != (*view_itr)->end_visible(); ++itr) {
@@ -133,9 +133,9 @@ index 23e262c..ebb3674 100644
 +}
 +
 +torrent::Object
-+rtng_live_summary(const torrent::Object::list_type& args) {
++tng_live_summary(const torrent::Object::list_type& args) {
 +  if (args.size() < 2)
-+    throw torrent::input_error("rtng.live_summary requires view, limit and optional commands.");
++    throw torrent::input_error("tng.live_summary requires view, limit and optional commands.");
 +
 +  torrent::Object::list_const_iterator arg = args.begin();
 +
@@ -153,7 +153,7 @@ index 23e262c..ebb3674 100644
 +  const int64_t limit = (++arg)->as_value();
 +
 +  if (limit < 0)
-+    throw torrent::input_error("rtng.live_summary limit must be non-negative.");
++    throw torrent::input_error("tng.live_summary limit must be non-negative.");
 +
 +  torrent::Object             resultRaw = torrent::Object::create_list();
 +  torrent::Object::list_type& result = resultRaw.as_list();
@@ -164,7 +164,7 @@ index 23e262c..ebb3674 100644
 +  torrent::Object             rowsRaw = torrent::Object::create_list();
 +  torrent::Object::list_type& rows = rowsRaw.as_list();
 +
-+  const int64_t bounded_limit = std::min(limit, rtng_multicall_max_limit);
++  const int64_t bounded_limit = std::min(limit, tng_multicall_max_limit);
 +  ++arg; // skip to first command
 +
 +  for (auto itr = (*view_itr)->begin_visible(); itr != (*view_itr)->end_visible(); ++itr) {
@@ -199,7 +199,7 @@ index 23e262c..ebb3674 100644
    CMD2_ANY_LIST    ("d.multicall.filtered", std::bind(&d_multicall_filtered, std::placeholders::_2));
 +  CMD2_ANY_LIST    ("d.multicall.range",   std::bind(&d_multicall_range, std::placeholders::_2));
 +  CMD2_ANY_LIST    ("d.multicall.nonzero_rate", std::bind(&d_multicall_nonzero_rate, std::placeholders::_2));
-+  CMD2_ANY_LIST    ("rtng.live_summary", std::bind(&rtng_live_summary, std::placeholders::_2));
++  CMD2_ANY_LIST    ("tng.live_summary", std::bind(&tng_live_summary, std::placeholders::_2));
  
    CMD2_ANY_LIST    ("directory.watch.added", std::bind(&directory_watch_added, std::placeholders::_2));
  
@@ -209,5 +209,5 @@ index 23e262c..ebb3674 100644
    rpc::rpc.mark_safe("d.multicall.filtered");
 +  rpc::rpc.mark_safe("d.multicall.range");
 +  rpc::rpc.mark_safe("d.multicall.nonzero_rate");
-+  rpc::rpc.mark_safe("rtng.live_summary");
++  rpc::rpc.mark_safe("tng.live_summary");
  }

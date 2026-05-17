@@ -1,6 +1,6 @@
 [package]
 name = "rt-session"
-description = "rtorrentNG: torrent lifecycle state machine and session registry"
+description = "TorrentNG: torrent lifecycle state machine and session registry"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -77,17 +77,17 @@ async fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Va
         "auth.check_session" => Ok(json!(true)),
         "daemon.login" => Ok(json!(true)),
         "daemon.info" => Ok(json!({
-            "version": "rtorrentNG",
+            "version": "TorrentNG",
             "libtorrent": "native",
         })),
         "daemon.get_method_list" => Ok(json!(supported_methods())),
         "daemon.shutdown" => Ok(json!(true)),
         "web.connected" => Ok(json!(true)),
-        "web.add_host" => Ok(json!("rtorrentNG")),
+        "web.add_host" => Ok(json!("TorrentNG")),
         "web.edit_host" | "web.remove_host" => Ok(json!(true)),
         "web.get_config" => Ok(deluge_web_config()),
-        "web.get_host_status" => Ok(json!(["rtorrentNG", "127.0.0.1", 0, "Online"])),
-        "web.get_hosts" => Ok(json!([["rtorrentNG", "127.0.0.1", 0, "rtorrentNG"]])),
+        "web.get_host_status" => Ok(json!(["TorrentNG", "127.0.0.1", 0, "Online"])),
+        "web.get_hosts" => Ok(json!([["TorrentNG", "127.0.0.1", 0, "TorrentNG"]])),
         "web.connect" | "web.disconnect" | "web.start_daemon" | "web.stop_daemon" => {
             Ok(json!(true))
         }
@@ -376,7 +376,7 @@ fn deluge_web_config() -> Value {
         "pwd_sha1": "",
         "sessions": {},
         "session_timeout": 3600,
-        "default_daemon": "rtorrentNG",
+        "default_daemon": "TorrentNG",
         "sidebar_show_zero": false,
         "sidebar_multiple_filters": true,
         "show_session_speed": false,
@@ -526,15 +526,15 @@ fn plugin_info(name: Option<&str>) -> Value {
     match name {
         "Label" | "label" => json!({
             "name": "Label",
-            "version": "rtorrentNG",
-            "author": "rtorrentNG",
+            "version": "TorrentNG",
+            "author": "TorrentNG",
             "description": "Category and label compatibility backed by native torrent labels.",
             "enabled": true,
         }),
         "Notifications" | "notifications" => json!({
             "name": "Notifications",
-            "version": "rtorrentNG",
-            "author": "rtorrentNG",
+            "version": "TorrentNG",
+            "author": "TorrentNG",
             "description": "Native session event notification compatibility.",
             "enabled": true,
         }),
@@ -1713,9 +1713,9 @@ mod tests {
             ("web.add_host", r#"["127.0.0.1",58846,"localclient",""]"#),
             (
                 "web.edit_host",
-                r#"["rtorrentNG","127.0.0.1",58846,"localclient",""]"#,
+                r#"["TorrentNG","127.0.0.1",58846,"localclient",""]"#,
             ),
-            ("web.remove_host", r#"["rtorrentNG"]"#),
+            ("web.remove_host", r#"["TorrentNG"]"#),
             ("web.get_config", r#"[]"#),
             ("web.update_ui", r#"[[],{}]"#),
             ("web.get_events", r#"[]"#),

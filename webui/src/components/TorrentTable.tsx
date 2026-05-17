@@ -104,7 +104,7 @@ const DEFAULT_VISIBLE: ColKey[] = [
 
 const COMPACT_VISIBLE: ColKey[] = ['check', 'kind', 'name', 'status', 'progress', 'down_rate', 'up_rate', 'ratio']
 
-const COLUMN_STORAGE_KEY = 'rtng.visibleColumns'
+const COLUMN_STORAGE_KEY = 'tng.visibleColumns'
 
 function fmtDate(ts: number): string {
   if (!ts) return '—'
@@ -385,7 +385,7 @@ export function TorrentTable({
                   <span>{visibleCols.length - 1}/{COLS.length - 1}</span>
                 </div>
                 {COLS.filter(col => !col.required).map(col => (
-                  <label key={col.key} className="rtng-column-menu-item" data-active={visibleKeys.includes(col.key) ? 'true' : 'false'} style={{
+                  <label key={col.key} className="tng-column-menu-item" data-active={visibleKeys.includes(col.key) ? 'true' : 'false'} style={{
                     display: 'flex', alignItems: 'center', gap: 8, color: 'var(--text)',
                     fontSize: 12, padding: '4px 3px', cursor: 'pointer',
                   }}>
@@ -427,7 +427,7 @@ export function TorrentTable({
                 position: 'absolute', inset: 0, display: 'grid', placeItems: 'center',
                 color: 'var(--faint)', fontSize: 13, textAlign: 'center', padding: 24,
               }}>
-                <div className="rtng-empty-state" data-filtered={hasFilters ? 'true' : 'false'} style={{
+                <div className="tng-empty-state" data-filtered={hasFilters ? 'true' : 'false'} style={{
                   border: '1px solid var(--border)', borderRadius: 8,
                   background: 'var(--surface)', padding: '18px 22px', display: 'grid', gap: 6,
                   maxWidth: 360,
@@ -556,7 +556,7 @@ export function TorrentTable({
                 padding: '12px 0', display: 'grid', placeItems: 'center', gap: 6,
                 fontSize: 11, color: 'var(--faint)',
               }}>
-                <span className="rtng-skeleton" style={{ width: 160, height: 8 }} />
+                <span className="tng-skeleton" style={{ width: 160, height: 8 }} />
                 <span>Loading more torrents…</span>
               </div>
             )}

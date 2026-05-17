@@ -51,8 +51,9 @@ Known import limits:
 - Tixati and some BiglyBT/Vuze private fields are intentionally verification-first
   because public, stable state schemas are limited.
 - Piece state is downgraded when resume data conflicts with torrent metadata.
-- Client-specific scheduler/RSS/search histories are not native torrent progress
-  and are not imported yet.
+- Client-specific scheduler/RSS/search/plugin histories are not native torrent
+  progress; migration dry runs preserve them as auxiliary artifacts so users can
+  carry the files forward without mixing them into piece/progress state.
 
 ## qBittorrent API Facade
 
@@ -105,7 +106,7 @@ Local surface: `crates/rt-api-deluge`.
 | Core torrent lifecycle | add magnet, add torrent file, pause, resume, force recheck, remove | Implemented |
 | Core torrent mutation | queue movement, set options, file priorities, trackers, prioritize first/last, connect peer, rename files/folder, move storage | Implemented where native engine supports it; accepted as no-op otherwise |
 | Plugin APIs | label, notifications | Implemented for common label and notification calls |
-| Remaining Deluge plugins | extractor, scheduler, execute, blocklist, autoadd plugin-specific APIs | Gap unless required by a target migration/client |
+| Remaining Deluge plugins | extractor, scheduler, execute, blocklist, autoadd plugin-specific APIs | API gap unless required by a target migration/client; migration dry runs preserve matching plugin/config files as auxiliary artifacts |
 
 ## Cross-Client API Backlog
 
@@ -116,5 +117,5 @@ Local surface: `crates/rt-api-deluge`.
 | Done | Expand qBittorrent preference response breadth and API-key compatibility routes | Settings panes and modern API clients probe these before mutation |
 | Medium | Persist qBittorrent mutable preferences and deepen torrent property field values | Avoids settings panes seeing accepted writes disappear |
 | Medium | Replace synthetic import aliases with real exported golden corpora for every supported legacy client version family | Catches undocumented key variants and nested plugin state |
-| Medium | Import scheduler/RSS/search metadata as auxiliary migration artifacts | Useful for full client migration, not required for torrent progress |
+| Done | Preserve scheduler/RSS/search/autoadd/blocklist/execute/plugin metadata as auxiliary migration artifacts | Useful for full client migration; intentionally separate from torrent progress |
 | Low | Proprietary client deep parsers for Tixati/BiglyBT plugin-only fields | Needs fixture corpus; progress import already uses generic verified paths |

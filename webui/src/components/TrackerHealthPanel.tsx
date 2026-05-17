@@ -73,7 +73,7 @@ export function TrackerHealthPanel() {
           return (
             <div
               key={tracker.tracker}
-              className="rtng-card rtng-tracker-row"
+              className="tng-card tng-tracker-row"
               data-tone={errorRatio >= 0.5 ? 'error' : errorRatio > 0 ? 'warn' : 'ok'}
               style={{
                 display: 'grid',
@@ -144,9 +144,9 @@ function TrackerSkeleton() {
           border: '1px solid var(--border)', borderRadius: 7, background: 'var(--surface)',
           padding: '10px 12px', display: 'grid', gap: 7,
         }}>
-          <span className="rtng-skeleton" style={{ width: '45%', height: 12 }} />
-          <span className="rtng-skeleton" style={{ width: '85%', height: 10 }} />
-          <span className="rtng-skeleton" style={{ width: '62%', height: 18 }} />
+          <span className="tng-skeleton" style={{ width: '45%', height: 12 }} />
+          <span className="tng-skeleton" style={{ width: '85%', height: 10 }} />
+          <span className="tng-skeleton" style={{ width: '62%', height: 18 }} />
         </div>
       ))}
     </div>
@@ -166,7 +166,7 @@ function Notice({ children }: { children: React.ReactNode }) {
 function Summary({ label, value, tone }: { label: string; value: number; tone: 'ok' | 'warn' | 'neutral' }) {
   const color = tone === 'ok' ? 'var(--success)' : tone === 'warn' ? 'var(--warning)' : 'var(--muted)'
   return (
-    <span className="rtng-metric-tile" style={{
+    <span className="tng-metric-tile" style={{
       display: 'inline-flex', alignItems: 'center', gap: 6,
       border: '1px solid var(--border)', borderRadius: 6,
       background: 'var(--surface)', padding: '5px 8px', fontSize: 12,

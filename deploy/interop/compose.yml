@@ -1,8 +1,8 @@
-name: rtorrentng-interop
+name: torrentng-interop
 
 services:
   rusttorrentd:
-    image: rtorrentng/rusttorrentd:interop
+    image: torrentng/rusttorrentd:interop
     build:
       context: ../..
       dockerfile: deploy/native/Dockerfile

@@ -47,7 +47,7 @@ mapped_port() {
 }
 
 derive_primary_stack_env() {
-  local rtng="${RTNG_CONTAINER:-certification-rtorrentng-1}"
+  local tng="${TNG_CONTAINER:-certification-torrentng-1}"
   local sonarr="${SONARR_CONTAINER:-certification-sonarr-1}"
   local radarr="${RADARR_CONTAINER:-certification-radarr-1}"
   local prowlarr="${PROWLARR_CONTAINER:-certification-prowlarr-1}"
@@ -55,8 +55,8 @@ derive_primary_stack_env() {
   local cross_seed="${CROSS_SEED_CONTAINER:-certification-cross-seed-1}"
   local port
 
-  port="$(mapped_port "$rtng" 8080)"; [[ -n "$port" ]] && export RTNG_HOST_URL="http://localhost:$port" RTNG_HOST_PORT="$port"
-  port="$(mapped_port "$rtng" 50000)"; [[ -n "$port" ]] && export RTNG_INCOMING_PORT="$port"
+  port="$(mapped_port "$tng" 8080)"; [[ -n "$port" ]] && export TNG_HOST_URL="http://localhost:$port" TNG_HOST_PORT="$port"
+  port="$(mapped_port "$tng" 50000)"; [[ -n "$port" ]] && export TNG_INCOMING_PORT="$port"
   port="$(mapped_port "$sonarr" 8989)"; [[ -n "$port" ]] && export SONARR_HOST_URL="http://localhost:$port" SONARR_HOST_PORT="$port"
   port="$(mapped_port "$radarr" 7878)"; [[ -n "$port" ]] && export RADARR_HOST_URL="http://localhost:$port" RADARR_HOST_PORT="$port"
   port="$(mapped_port "$prowlarr" 9696)"; [[ -n "$port" ]] && export PROWLARR_HOST_URL="http://localhost:$port" PROWLARR_HOST_PORT="$port"
@@ -65,7 +65,7 @@ derive_primary_stack_env() {
 }
 
 {
-  echo "# rtorrentNG Pre-Engine Certification Suite"
+  echo "# TorrentNG Pre-Engine Certification Suite"
   echo
   echo "- Date UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "- Scope: refresh all short/non-24h automated release evidence"
@@ -92,7 +92,7 @@ run_gate "DHT/public-port wiring" "$REPORT_DIR/dht-cert-suite-$(date -u +%Y%m%dT
 run_gate "mobile qBit read-flow" "$REPORT_DIR/mobile-compat-suite-$(date -u +%Y%m%dT%H%M%SZ).md" "$ROOT/scripts/mobile_compat_certification.sh"
 run_gate "Phase 1 ruTorrent" "$REPORT_DIR/phase1-cert-suite-$(date -u +%Y%m%dT%H%M%SZ).md" "$ROOT/scripts/phase1_certification.sh"
 security_review_report="$REPORT_DIR/security-review-suite-$(date -u +%Y%m%dT%H%M%SZ).md"
-if RTNG_API_TOKENS="${RTNG_API_TOKENS:-suite-token}" RTNG_SECRET_KEY="${RTNG_SECRET_KEY:-suite-secret-00000000000000000000000000000000}" "$ROOT/scripts/security_review.sh" "$ROOT/deploy/docker/sidecar.config.toml" "$security_review_report"; then
+if TNG_API_TOKENS="${TNG_API_TOKENS:-suite-token}" TNG_SECRET_KEY="${TNG_SECRET_KEY:-suite-secret-00000000000000000000000000000000}" "$ROOT/scripts/security_review.sh" "$ROOT/deploy/docker/sidecar.config.toml" "$security_review_report"; then
   mark "security review automation" "PASS" "$security_review_report"
 else
   mark "security review automation" "FAIL" "$security_review_report"

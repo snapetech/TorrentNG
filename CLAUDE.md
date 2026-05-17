@@ -1,8 +1,8 @@
-# rtorrentNG — Claude Context
+# TorrentNG — Claude Context
 
 ## What this project is
 
-**rtorrentNG** is a modern torrent management stack targeting headless
+**TorrentNG** is a modern torrent management stack targeting headless
 power-user seeding at scale (10k–100k torrents, 200+ TB).
 
 It is NOT a ruTorrent cosmetic fork. It now has a native Rust BitTorrent engine
@@ -16,7 +16,7 @@ It has two runtime tracks:
    tracker state, storage, rechecks, jobs, metrics, native REST/SSE, and
    compatibility API projections.
 2. **Track 1 rTorrent core** — rTorrent/libtorrent remains the BitTorrent
-   engine; `sidecar/rtorrentng` bridges trusted local SCGI/XMLRPC into the
+   engine; `sidecar/torrentng` bridges trusted local SCGI/XMLRPC into the
    WebUI, native REST facade, qBittorrent-compatible API, cache, auth, and
    metrics.
 
@@ -30,20 +30,20 @@ Important layers:
 
 ## Core architectural decisions
 
-- External tools (Prowlarr, Sonarr, Radarr, autobrr, cross-seed) talk to rtorrentNG through compatibility APIs, primarily the qBittorrent-compatible API.
+- External tools (Prowlarr, Sonarr, Radarr, autobrr, cross-seed) talk to TorrentNG through compatibility APIs, primarily the qBittorrent-compatible API.
 - The browser talks to native REST/SSE/WebSocket-facing APIs, never directly to rTorrent SCGI.
 - In native mode, `rusttorrentd` is the source of truth and does not require rTorrent, XMLRPC, or the sidecar.
 - In Track 1 sidecar mode, **nothing** talks to rTorrent XMLRPC/SCGI directly except the sidecar.
 - The sidecar runs beside rTorrent, communicates over a trusted local SCGI socket, and remains a migration/facade layer.
-- Auth, tokens, CSRF/OIDC/reverse-proxy trust policy live in the rtorrentNG API layer.
+- Auth, tokens, CSRF/OIDC/reverse-proxy trust policy live in the TorrentNG API layer.
 
 ## Why the native rewrite exists
 
 Track 1 fixed immediate rTorrent/ruTorrent pain, but could not fix engine-level
 limits:
 
-- rTorrent owns storage behavior and has no rtorrentNG userspace disk scheduler.
-- Rechecks are not durable rtorrentNG jobs with pause/resume/cancel semantics.
+- rTorrent owns storage behavior and has no TorrentNG userspace disk scheduler.
+- Rechecks are not durable TorrentNG jobs with pause/resume/cancel semantics.
 - Torrent lifecycle history is limited compared with native structured events.
 - The sidecar must poll and translate XMLRPC state.
 - Engine behavior depends on rTorrent/libtorrent build details.
@@ -75,7 +75,7 @@ rTorrent/libTorrent remains a strong baseline for large headless seed libraries:
 **Entry:** `sidecar/src/main.rs`
 **Crates:** axum 0.7, tokio, serde/serde_json, toml, rusqlite (bundled), tracing, anyhow, quick-xml
 **Modules:**
-- `config` — TOML config loading, env override (`RTNG_*`)
+- `config` — TOML config loading, env override (`TNG_*`)
 - `rtorrent::client` — async XMLRPC/SCGI client over Unix socket or TCP
 - `rtorrent::torrents` — `d.multicall2` torrent query, CRUD ops, `set_user_agent`
 - `api::server` — axum router, AppState
@@ -160,13 +160,13 @@ Every release must pass:
 - WebUI: TypeScript strict, TanStack Query for server state, TanStack Virtual for table
 - No ORM; raw SQL via rusqlite with bundled SQLite (no system dep)
 - Native config file: `RUSTTORRENTD_CONFIG`, `~/.config/rusttorrentd/config.toml`, or `/etc/rusttorrentd/config.toml`
-- Sidecar config file: `~/.config/rtorrentng/config.toml` or `/etc/rtorrentng/config.toml`; env vars `RTNG_*` override many sidecar fields
+- Sidecar config file: `~/.config/torrentng/config.toml` or `/etc/torrentng/config.toml`; env vars `TNG_*` override many sidecar fields
 - All API responses: JSON, snake_case keys
 - Logs: structured JSON via tracing + tracing-subscriber JSON layer
 
 ## user_agent
 
-Configurable via `[rtorrent] user_agent` in config or `RTNG_USER_AGENT` env var.
+Configurable via `[rtorrent] user_agent` in config or `TNG_USER_AGENT` env var.
 Default: `rtorrent/0.16.11` (used in packaged releases).
 Pushed to rTorrent via `network.http.user_agent.set` on startup.
 Runtime update: `PUT /api/v1/settings/user-agent` or Settings panel in WebUI.

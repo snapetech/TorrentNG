@@ -29,55 +29,55 @@ impl Metrics {
 
         gauge(
             &mut out,
-            "rtorrentng_torrents_total",
+            "torrentng_torrents_total",
             "Total torrents in session",
             self.torrents_total.load(Ordering::Relaxed),
         );
         gauge(
             &mut out,
-            "rtorrentng_torrents_seeding",
+            "torrentng_torrents_seeding",
             "Torrents currently seeding",
             self.torrents_seeding.load(Ordering::Relaxed),
         );
         gauge(
             &mut out,
-            "rtorrentng_torrents_downloading",
+            "torrentng_torrents_downloading",
             "Torrents currently downloading",
             self.torrents_downloading.load(Ordering::Relaxed),
         );
         gauge(
             &mut out,
-            "rtorrentng_torrents_stopped",
+            "torrentng_torrents_stopped",
             "Torrents stopped",
             self.torrents_stopped.load(Ordering::Relaxed),
         );
         gauge(
             &mut out,
-            "rtorrentng_torrents_errored",
+            "torrentng_torrents_errored",
             "Torrents in error state",
             self.torrents_errored.load(Ordering::Relaxed),
         );
         gauge(
             &mut out,
-            "rtorrentng_peers_connected",
+            "torrentng_peers_connected",
             "Connected peers across all torrents",
             self.peers_connected.load(Ordering::Relaxed),
         );
         counter(
             &mut out,
-            "rtorrentng_api_requests_total",
+            "torrentng_api_requests_total",
             "Total API requests served",
             self.api_requests_total.load(Ordering::Relaxed),
         );
         counter(
             &mut out,
-            "rtorrentng_sync_cycles_total",
+            "torrentng_sync_cycles_total",
             "Total rTorrent sync cycles completed",
             self.sync_cycles_total.load(Ordering::Relaxed),
         );
         counter(
             &mut out,
-            "rtorrentng_sync_errors_total",
+            "torrentng_sync_errors_total",
             "Total rTorrent sync cycle errors",
             self.sync_errors_total.load(Ordering::Relaxed),
         );

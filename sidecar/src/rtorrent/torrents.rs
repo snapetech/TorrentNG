@@ -33,7 +33,7 @@ pub const MULTICALL_RANGE_PAGE_SIZE: i64 = 100;
 
 const RTORRENT_MULTICALL_RANGE_PATCH: &str = "rtorrent-0.16.11-multicall-range";
 const LEGACY_RTORRENT_NONZERO_RATE_PATCH: &str = "rtorrent-0.16.11-multicall-nonzero-rate";
-const LEGACY_RTORRENT_LIVE_SUMMARY_PATCH: &str = "rtorrent-0.16.11-rtng-live-summary";
+const LEGACY_RTORRENT_LIVE_SUMMARY_PATCH: &str = "rtorrent-0.16.11-tng-live-summary";
 
 #[derive(Debug, Clone)]
 pub struct RawTorrent {
@@ -108,7 +108,7 @@ impl Client {
 
     pub async fn has_multicall_range(&self) -> bool {
         if rtorrent_patch_manifest_enables_bounded_live(
-            &std::env::var("RTNG_RTORRENT_PATCHES").unwrap_or_default(),
+            &std::env::var("TNG_RTORRENT_PATCHES").unwrap_or_default(),
         ) {
             return true;
         }
@@ -162,9 +162,9 @@ impl Client {
         args.extend(TORRENT_FIELDS.iter().map(|&f| XmlValue::from(f)));
 
         let result = self
-            .call_sync("rtng.live_summary", &args)
+            .call_sync("tng.live_summary", &args)
             .await
-            .with_context(|| format!("rtng.live_summary {view} limit={limit}"))?;
+            .with_context(|| format!("tng.live_summary {view} limit={limit}"))?;
         let mut fields = result.into_array();
         if fields.len() < 3 {
             return Ok(LiveSummary::default());
@@ -495,7 +495,7 @@ mod tests {
             "rtorrent-0.16.11-multicall-nonzero-rate"
         ));
         assert!(rtorrent_patch_manifest_enables_bounded_live(
-            "rtorrent-0.16.11-rtng-live-summary"
+            "rtorrent-0.16.11-tng-live-summary"
         ));
     }
 

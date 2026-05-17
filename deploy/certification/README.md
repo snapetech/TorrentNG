@@ -5,7 +5,7 @@ rTorrent-sidecar integrations. Native-engine certification lives beside it in
 `scripts/native_engine_certification_report.sh`, and cross-client native
 interop is covered by `scripts/interop_matrix.sh`.
 
-The Track 1 stack starts rtorrentNG alongside Sonarr, Radarr, Prowlarr, autobrr,
+The Track 1 stack starts TorrentNG alongside Sonarr, Radarr, Prowlarr, autobrr,
 and cross-seed. The runner verifies that the rTorrent-backed sidecar
 qBittorrent-compatible API is reachable from the same Docker network and writes
 a markdown report under `certification/reports/`.
@@ -24,7 +24,7 @@ Set `CERT_START_STACK=1` to have the runner start the stack before probing it:
 CERT_START_STACK=1 ./scripts/live_certification.sh
 ```
 
-Configure the live Sonarr, Radarr, Prowlarr, and autobrr containers to use rtorrentNG as a qBittorrent-compatible download client:
+Configure the live Sonarr, Radarr, Prowlarr, and autobrr containers to use TorrentNG as a qBittorrent-compatible download client:
 
 ```sh
 ./scripts/configure_certification_clients.sh
@@ -36,7 +36,7 @@ Run a real transfer fixture through a disposable local tracker and stock Transmi
 ./scripts/live_transfer_certification.sh
 ```
 
-The transfer runner creates a small local torrent in the Docker downloads volume, starts `opentracker` and `transmission-cli` sidecars on the certification network, adds the torrent through rtorrentNG's qBittorrent-compatible API, and waits for completion. It also adds a public Debian netinst torrent in stopped mode as an external torrent-file smoke test. Set `PUBLIC_TRANSFER=1` to let the public Linux torrent download.
+The transfer runner creates a small local torrent in the Docker downloads volume, starts `opentracker` and `transmission-cli` sidecars on the certification network, adds the torrent through TorrentNG's qBittorrent-compatible API, and waits for completion. It also adds a public Debian netinst torrent in stopped mode as an external torrent-file smoke test. Set `PUBLIC_TRANSFER=1` to let the public Linux torrent download.
 
 Run a transfer churn soak when you need repeated add/download/delete pressure
 instead of only synthetic cached rows:
@@ -46,7 +46,7 @@ TRANSFER_CHURN_CYCLES=25 ./scripts/transfer_churn_soak.sh
 ```
 
 The churn runner creates a fresh legal fixture torrent per cycle, seeds it from
-a stock Transmission sidecar, adds it through rtorrentNG, waits for completion,
+a stock Transmission sidecar, adds it through TorrentNG, waits for completion,
 deletes the torrent and files, and samples RSS after each cycle. Set
 `TRANSFER_CHURN_PUBLIC_CYCLES=1` or higher to also cycle a public Debian
 netinst torrent from `PUBLIC_TORRENT_URL`.
@@ -57,7 +57,7 @@ Run the larger release-grab gate in a separate normal-sync compose project:
 ./scripts/release_grab_certification.sh
 ```
 
-That runner uses non-conflicting host ports, configures the app clients, then proves Prowlarr, Sonarr, and Radarr can search local Torznab fixtures, submit release grabs through their own APIs, and complete transfers through rtorrentNG. It tears the temporary stack down by default; set `CERT_GRAB_KEEP_STACK=1` to keep it for debugging.
+That runner uses non-conflicting host ports, configures the app clients, then proves Prowlarr, Sonarr, and Radarr can search local Torznab fixtures, submit release grabs through their own APIs, and complete transfers through TorrentNG. It tears the temporary stack down by default; set `CERT_GRAB_KEEP_STACK=1` to keep it for debugging.
 
 Run the Docker client interop matrix against rusttorrentd, qBittorrent,
 Transmission, Deluge, rTorrent, and opentracker:
@@ -108,13 +108,13 @@ Inspect and finalize the long soak:
 The readiness runner verifies container/API readiness plus the Track 1
 sidecar/qBit compatibility surface. The client-configuration script completes
 the first-run qBittorrent client setup through each app's API and records
-whether each app's own connection test accepts rtorrentNG.
+whether each app's own connection test accepts TorrentNG.
 
 ## Host ports
 
 | Host | Container | Service |
 |---|---:|---|
-| `18080` | `8080` | rtorrentNG sidecar/WebUI |
+| `18080` | `8080` | TorrentNG sidecar/WebUI |
 | `18989` | `8989` | Sonarr |
 | `17878` | `7878` | Radarr |
 | `19696` | `9696` | Prowlarr |

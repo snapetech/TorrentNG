@@ -28,7 +28,7 @@ mark() {
 }
 
 {
-  echo "# rtorrentNG Soak Finalization"
+  echo "# TorrentNG Soak Finalization"
   echo
   echo "- Date UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "- Source report: ${REPORT:-missing}"
@@ -92,10 +92,10 @@ else
 fi
 
 if [[ "$RESTORE_NORMAL" == "1" ]]; then
-  if "$ROOT/scripts/restore_certification_normal.sh" >/tmp/rtng-restore-normal.log 2>&1; then
-    mark "restore normal sync" "PASS" "RTNG_SYNC_INTERVAL_SECS=2"
+  if "$ROOT/scripts/restore_certification_normal.sh" >/tmp/tng-restore-normal.log 2>&1; then
+    mark "restore normal sync" "PASS" "TNG_SYNC_INTERVAL_SECS=2"
   else
-    mark "restore normal sync" "FAIL" "$(tr '\n' ' ' </tmp/rtng-restore-normal.log)"
+    mark "restore normal sync" "FAIL" "$(tr '\n' ' ' </tmp/tng-restore-normal.log)"
   fi
 else
   mark "restore normal sync" "INFO" "set RESTORE_NORMAL=1 to restore certification service"

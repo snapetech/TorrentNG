@@ -13,7 +13,7 @@ ok()   { echo "  [OK]  $*"; ((PASS++)); }
 fail() { echo "  [FAIL] $*"; ((FAIL++)); }
 info() { echo "  [--]  $*"; }
 
-echo "=== rtorrentNG healthcheck ==="
+echo "=== TorrentNG healthcheck ==="
 echo
 
 echo "--- rTorrent socket ---"

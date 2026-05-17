@@ -206,8 +206,8 @@ fn staging_path(destination: &Path) -> PathBuf {
     let file_name = destination
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("rtorrentng-staged");
-    staged.set_file_name(format!(".{file_name}.rtng-copying"));
+        .unwrap_or("torrentng-staged");
+    staged.set_file_name(format!(".{file_name}.tng-copying"));
     staged
 }
 

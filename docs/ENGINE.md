@@ -1,7 +1,7 @@
 # Native Rust Engine Design
 
 This document covers the native Rust BitTorrent engine. The engine is built
-around rtorrentNG's universal compatibility goal: import from existing clients,
+around TorrentNG's universal compatibility goal: import from existing clients,
 project the APIs existing tools already speak, interoperate with independent
 clients, and keep one durable native model underneath those surfaces.
 

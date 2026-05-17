@@ -1,8 +1,8 @@
-# rtorrentNG
+# TorrentNG
 
 [![Discord](https://img.shields.io/discord/4ub88HeHFm?label=Discord&logo=discord&logoColor=white)](https://discord.gg/4ub88HeHFm)
 
-rtorrentNG is a universal-compatibility torrent stack for headless servers. The
+TorrentNG is a universal-compatibility torrent stack for headless servers. The
 goal is to be the torrent client you can move into or out of without losing
 workflow, state, automation, or client choice: import existing libraries, expose
 familiar APIs, interoperate with other clients, and run a native Rust engine when
@@ -16,8 +16,8 @@ The project currently supports two engine modes:
 
 | Mode | Process | Source of truth | Use when |
 |---|---|---|---|
-| Native engine | `rusttorrentd` | rtorrentNG Rust engine and SQLite state | You want the primary rewrite path, native storage/recheck/jobs, and one model for WebUI plus APIs |
-| rTorrent sidecar | `rTorrent` + `rtorrentng` | rTorrent session state | You need an rTorrent migration bridge, compatibility comparison, or an rTorrent-backed deployment |
+| Native engine | `rusttorrentd` | TorrentNG Rust engine and SQLite state | You want the primary rewrite path, native storage/recheck/jobs, and one model for WebUI plus APIs |
+| rTorrent sidecar | `rTorrent` + `torrentng` | rTorrent session state | You need an rTorrent migration bridge, compatibility comparison, or an rTorrent-backed deployment |
 
 Both modes aim to expose the same user-facing WebUI and compatibility surfaces.
 The compatibility target is intentionally broad: qBittorrent-style endpoints for
@@ -25,7 +25,7 @@ common automation tools, Transmission and Deluge RPC facades, rTorrent migration
 and interop support, and import paths for the client state formats operators are
 likely to have accumulated over time.
 
-![rtorrentNG WebUI using the Sietch Neon theme while downloading Linux ISO test data](docs/assets/rtorrentng-sietch-neon-linux-isos.png)
+![TorrentNG WebUI using the Sietch Neon theme while downloading Linux ISO test data](docs/assets/torrentng-sietch-neon-linux-isos.png)
 
 Screenshot uses mocked Linux ISO torrent data, not a live user session.
 
@@ -35,7 +35,7 @@ The native Rust engine is the primary development and deployment path. The
 rTorrent-backed sidecar remains supported for migration, comparison, and users
 who still want the upstream rTorrent core.
 
-rtorrentNG is pre-1.0 software. APIs, configuration, and deployment details can
+TorrentNG is pre-1.0 software. APIs, configuration, and deployment details can
 still change. Universal compatibility is the product goal and release bar, not a
 blanket claim that every surface is complete today. Current support, partial
 coverage, no-op compatibility shapes, and gaps are tracked in
@@ -82,7 +82,7 @@ Start the rTorrent-backed stack when you need the historical engine path:
 docker compose -f deploy/docker/compose.yml up --build
 ```
 
-This runs rTorrent plus the `rtorrentng` sidecar. The sidecar talks to rTorrent
+This runs rTorrent plus the `torrentng` sidecar. The sidecar talks to rTorrent
 over a trusted local SCGI/XMLRPC socket, maintains a cache, serves the WebUI,
 and exposes native and qBittorrent-compatible APIs.
 
@@ -103,7 +103,7 @@ one stack before starting the other unless you intentionally change ports.
   DHT, uTP, peer wire, piece picking, session state, jobs, migration, metrics,
   and API projections.
 - `rusttorrentd`, the native daemon that owns torrent state and serves APIs.
-- `sidecar/rtorrentng`, the rTorrent compatibility harness for existing
+- `sidecar/torrentng`, the rTorrent compatibility harness for existing
   deployments.
 - React, TypeScript, and Vite WebUI in `webui/`.
 - Docker Compose, Dockerfile, systemd, Kubernetes, nginx, Prometheus, and
@@ -210,7 +210,7 @@ https://discord.gg/4ub88HeHFm
 
 ## Legal Use
 
-rtorrentNG is intended for lawful content distribution, personal data
+TorrentNG is intended for lawful content distribution, personal data
 management, and legitimate automation workflows. The project does not condone
 copyright infringement or unauthorized access to content. Users are responsible
 for understanding and following the laws and licenses that apply to the content
@@ -218,7 +218,7 @@ they download, seed, or manage.
 
 ## License
 
-rtorrentNG is dual-licensed under `AGPL-3.0-or-later OR Commercial`.
+TorrentNG is dual-licensed under `AGPL-3.0-or-later OR Commercial`.
 
 Unless you have a separate signed commercial license, your use of this software
 is governed by the GNU Affero General Public License v3.0 or later. Commercial
@@ -228,7 +228,7 @@ See [LICENSE](LICENSE) for details.
 
 ## Attribution
 
-rtorrentNG interoperates with rTorrent, qBittorrent-compatible clients, and
+TorrentNG interoperates with rTorrent, qBittorrent-compatible clients, and
 common automation tools in the BitTorrent ecosystem. Product and project names
 mentioned in this repository are trademarks or property of their respective
 owners. This project is not affiliated with, endorsed by, or sponsored by

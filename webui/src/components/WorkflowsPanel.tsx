@@ -131,7 +131,7 @@ export function WorkflowsPanel() {
           <EmptyState title="No workflow rules configured" detail="Create a workflow above, then preview it against the current torrent list before running." />
         )}
         {rules.map(rule => (
-          <div key={rule.id} className="rtng-automation-row" data-enabled={rule.enabled ? 'true' : 'false'} style={{
+          <div key={rule.id} className="tng-automation-row" data-enabled={rule.enabled ? 'true' : 'false'} style={{
             display: 'grid', gridTemplateColumns: '150px 120px 120px 150px minmax(240px, 1fr) auto auto auto',
             minWidth: 980,
             gap: 8, alignItems: 'center', border: '1px solid var(--border)',
@@ -209,7 +209,7 @@ function WorkflowRunRow({ run }: { run: WorkflowRun }) {
   const status = run.errors.length > 0 ? `${run.errors.length} error(s)` : run.dry_run ? 'previewed' : 'completed'
   const tone = run.errors.length > 0 ? 'error' : run.dry_run ? 'info' : 'ok'
   return (
-    <div className="rtng-automation-row" data-enabled={run.errors.length === 0 ? 'true' : 'false'} style={{
+    <div className="tng-automation-row" data-enabled={run.errors.length === 0 ? 'true' : 'false'} style={{
       display: 'grid', gridTemplateColumns: '150px 120px 90px 90px 90px 1fr',
       minWidth: 760,
       gap: 8, alignItems: 'center', border: '1px solid var(--border)',
@@ -276,8 +276,8 @@ function EmptyState({ title, detail }: { title: string; detail: string }) {
 function SkeletonRows({ count }: { count: number }) {
   return Array.from({ length: count }, (_, index) => (
     <div key={index} style={{ border: '1px solid var(--border)', borderRadius: 7, padding: '12px', background: 'var(--surface)' }}>
-      <span className="rtng-skeleton" style={{ width: '30%', height: 12, marginBottom: 10 }} />
-      <span className="rtng-skeleton" style={{ width: '80%', height: 10 }} />
+      <span className="tng-skeleton" style={{ width: '30%', height: 12, marginBottom: 10 }} />
+      <span className="tng-skeleton" style={{ width: '80%', height: 10 }} />
     </div>
   ))
 }

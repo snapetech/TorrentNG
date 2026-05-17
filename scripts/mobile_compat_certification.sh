@@ -3,21 +3,21 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="${1:-$ROOT/certification/reports/mobile-compat-$(date -u +%Y%m%dT%H%M%SZ).md}"
-RTNG_HOST_URL="${RTNG_HOST_URL:-http://localhost:${RTNG_HOST_PORT:-18080}}"
-RTNG_API_TOKEN="${RTNG_API_TOKEN:-cert-token}"
-RTNG_CONTAINER="${RTNG_CONTAINER:-certification-rtorrentng-1}"
+TNG_HOST_URL="${TNG_HOST_URL:-http://localhost:${TNG_HOST_PORT:-18080}}"
+TNG_API_TOKEN="${TNG_API_TOKEN:-cert-token}"
+TNG_CONTAINER="${TNG_CONTAINER:-certification-torrentng-1}"
 MOBILE_LIST_LIMIT="${MOBILE_LIST_LIMIT:-50000}"
 BODY="$(mktemp)"
 
 mkdir -p "$(dirname "$OUT")"
 
-mapped="$(docker port "$RTNG_CONTAINER" 8080/tcp 2>/dev/null | sed -n 's/.*:\([0-9][0-9]*\)$/\1/p' | head -1 || true)"
-if [[ -n "$mapped" && "$RTNG_HOST_URL" == http://localhost:* ]]; then
-  RTNG_HOST_URL="http://localhost:$mapped"
+mapped="$(docker port "$TNG_CONTAINER" 8080/tcp 2>/dev/null | sed -n 's/.*:\([0-9][0-9]*\)$/\1/p' | head -1 || true)"
+if [[ -n "$mapped" && "$TNG_HOST_URL" == http://localhost:* ]]; then
+  TNG_HOST_URL="http://localhost:$mapped"
 fi
 
 cleanup() {
-  rm -f "$BODY" /tmp/rtng-mobile-*.cookies
+  rm -f "$BODY" /tmp/tng-mobile-*.cookies
 }
 trap cleanup EXIT
 
@@ -47,10 +47,10 @@ run_profile() {
   local label="$1"
   local prefix="$2"
   local user_agent="$3"
-  local cookie="/tmp/rtng-mobile-${label//[^A-Za-z0-9]/-}.cookies"
+  local cookie="/tmp/tng-mobile-${label//[^A-Za-z0-9]/-}.cookies"
   local code len hash rid delta_len
 
-  code="$(http_code "$RTNG_HOST_URL$prefix/auth/login" -A "$user_agent" -X POST -d "username=$RTNG_API_TOKEN" -d "password=$RTNG_API_TOKEN" -c "$cookie")"
+  code="$(http_code "$TNG_HOST_URL$prefix/auth/login" -A "$user_agent" -X POST -d "username=$TNG_API_TOKEN" -d "password=$TNG_API_TOKEN" -c "$cookie")"
   if [[ "$code" == "200" && "$(cat "$BODY")" == "Ok." ]]; then
     mark "$label login" "PASS" "$prefix auth cookie accepted"
   else
@@ -67,7 +67,7 @@ run_profile() {
     "/transfer/info" \
     "/torrents/categories" \
     "/torrents/tags"; do
-    code="$(http_code "$RTNG_HOST_URL$prefix$endpoint" -A "$user_agent" -b "$cookie")"
+    code="$(http_code "$TNG_HOST_URL$prefix$endpoint" -A "$user_agent" -b "$cookie")"
     if [[ "$code" == "200" ]]; then
       mark "$label $endpoint" "PASS" "HTTP 200"
     else
@@ -75,7 +75,7 @@ run_profile() {
     fi
   done
 
-  code="$(http_code "$RTNG_HOST_URL$prefix/torrents/info?limit=$MOBILE_LIST_LIMIT&sort=name" -A "$user_agent" -b "$cookie")"
+  code="$(http_code "$TNG_HOST_URL$prefix/torrents/info?limit=$MOBILE_LIST_LIMIT&sort=name" -A "$user_agent" -b "$cookie")"
   len="$(check_json_array_len)"
   hash="$(jq -r '.[0].hash // empty' "$BODY" 2>/dev/null || true)"
   if [[ "$code" == "200" && "$len" -gt 0 && -n "$hash" ]]; then
@@ -85,7 +85,7 @@ run_profile() {
     return
   fi
 
-  code="$(http_code "$RTNG_HOST_URL$prefix/torrents/properties?hash=$hash" -A "$user_agent" -b "$cookie")"
+  code="$(http_code "$TNG_HOST_URL$prefix/torrents/properties?hash=$hash" -A "$user_agent" -b "$cookie")"
   if [[ "$code" == "200" && "$(jq -r '.total_size // empty' "$BODY" 2>/dev/null)" =~ ^[0-9]+$ ]]; then
     mark "$label properties" "PASS" "$hash total_size=$(jq -r '.total_size' "$BODY")"
   else
@@ -97,7 +97,7 @@ run_profile() {
     "filter=paused&limit=25" \
     "category=cert-scale&limit=25" \
     "sort=ratio&reverse=true&limit=25"; do
-    code="$(http_code "$RTNG_HOST_URL$prefix/torrents/info?$query" -A "$user_agent" -b "$cookie")"
+    code="$(http_code "$TNG_HOST_URL$prefix/torrents/info?$query" -A "$user_agent" -b "$cookie")"
     len="$(check_json_array_len)"
     if [[ "$code" == "200" ]]; then
       mark "$label filter $query" "PASS" "rows=$len"
@@ -106,7 +106,7 @@ run_profile() {
     fi
   done
 
-  code="$(http_code "$RTNG_HOST_URL$prefix/sync/maindata?rid=0" -A "$user_agent" -b "$cookie")"
+  code="$(http_code "$TNG_HOST_URL$prefix/sync/maindata?rid=0" -A "$user_agent" -b "$cookie")"
   rid="$(jq -r '.rid // empty' "$BODY" 2>/dev/null || true)"
   len="$(jq '.torrents | length' "$BODY" 2>/dev/null || echo 0)"
   if [[ "$code" == "200" && -n "$rid" && "$len" -gt 0 ]]; then
@@ -116,7 +116,7 @@ run_profile() {
     return
   fi
 
-  code="$(http_code "$RTNG_HOST_URL$prefix/sync/maindata?rid=$rid" -A "$user_agent" -b "$cookie")"
+  code="$(http_code "$TNG_HOST_URL$prefix/sync/maindata?rid=$rid" -A "$user_agent" -b "$cookie")"
   delta_len="$(jq '.torrents | length' "$BODY" 2>/dev/null || echo 0)"
   if [[ "$code" == "200" ]]; then
     mark "$label sync delta" "PASS" "HTTP 200 torrents=$delta_len"
@@ -126,10 +126,10 @@ run_profile() {
 }
 
 {
-  echo "# rtorrentNG Mobile Compatibility Certification"
+  echo "# TorrentNG Mobile Compatibility Certification"
   echo
   echo "- Date UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  echo "- rtorrentNG URL: $RTNG_HOST_URL"
+  echo "- TorrentNG URL: $TNG_HOST_URL"
   echo "- List limit: $MOBILE_LIST_LIMIT"
   echo
   echo "## Checks"

@@ -1,7 +1,7 @@
 # Client Compatibility Matrices
 
-This file is the source-of-truth backlog for rtorrentNG's universal
-compatibility goal: move into rtorrentNG from other clients, move out with
+This file is the source-of-truth backlog for TorrentNG's universal
+compatibility goal: move into TorrentNG from other clients, move out with
 predictable state, expose the APIs existing tools already speak, and interoperate
 with other BitTorrent clients on the wire.
 
@@ -33,7 +33,7 @@ Status legend:
 
 | Status | Meaning |
 |---|---|
-| Native | Backed by rtorrentNG engine/session behavior |
+| Native | Backed by TorrentNG engine/session behavior |
 | Compat | API shape is accepted and returns a client-compatible result; may be no-op if the feature has no native equivalent |
 | Partial | Useful behavior exists, but fields, persistence, filtering, or error shape is incomplete |
 | Gap | Not implemented |
@@ -54,7 +54,7 @@ Universal compatibility release rule:
 
 ## 1. Feature Matrix
 
-| Capability | qBittorrent | Transmission | Deluge | rTorrent | rtorrentNG status | Required certification rows |
+| Capability | qBittorrent | Transmission | Deluge | rTorrent | TorrentNG status | Required certification rows |
 |---|---|---|---|---|---|---|
 | Add `.torrent` | Web API multipart | `torrent_add` metainfo | `core.add_torrent_file`, `web.add_torrents` | `load.*` commands | Native through qBit, Transmission, Deluge facades; rTorrent import only | Add file via every facade; verify native list and payload |
 | Add magnet | `torrents/add urls=magnet` | `torrent_add filename=magnet` | `core.add_torrent_magnet` | `load.normal` magnet-capable builds/scripts | Native through qBit, Transmission, Deluge facades | Magnet with tracker, magnet metadata fetch, DHT-only magnet |
@@ -82,7 +82,7 @@ Universal compatibility release rule:
 
 ## 2. Import And Fast-Resume Matrix
 
-| Source client | Expected state sources | rtorrentNG import entry point | Fields to preserve | Current status | Tests required |
+| Source client | Expected state sources | TorrentNG import entry point | Fields to preserve | Current status | Tests required |
 |---|---|---|---|---|---|
 | qBittorrent | `.torrent`, `.fastresume`, libtorrent resume keys | `dry_run_qbittorrent_backup_with_options` | info hash, name, save path, category, tags, added/completed times, paused/completed state, uploaded/downloaded, piece states, partial pieces, file priority/wanted/completed bytes, trackers | Native import implemented; JSON and bencoded alias matrix covered | Golden qBit profile with all fields; path remap; conflicting piece count |
 | rTorrent | session `.torrent`, file layout, custom fields when available | `dry_run_rtorrent_session_with_options` | info hash, name, base path, size, completion by file verification, custom label fields | Partial | XMLRPC/session fixture with `d.custom*`, complete/missing files |
@@ -97,7 +97,7 @@ Universal compatibility release rule:
 
 Local implementation: `crates/rt-api-qbit`.
 
-| Group | Upstream API points | rtorrentNG points | Status | Test rows |
+| Group | Upstream API points | TorrentNG points | Status | Test rows |
 |---|---|---|---|---|
 | Auth | `auth/login`, `auth/logout` | Same | Compat | Login/logout status and cookie shape |
 | App info | `app/version`, `webapiVersion`, `buildInfo`, `preferences`, `setPreferences`, `shutdown`, `sendTestEmail`, `getCookies`, `setCookies`, `rotateAPIKey`, `deleteAPIKey`, `networkInterfaceList`, `networkInterfaceAddressList`, `defaultSavePath` | Same | Native/Compat mix | Probe every endpoint, assert status/content type |
@@ -127,7 +127,7 @@ qBittorrent field backlog:
 
 ## 4. Transmission RPC Matrix
 
-Local implementation: `crates/rt-api-transmission`. rtorrentNG accepts old
+Local implementation: `crates/rt-api-transmission`. TorrentNG accepts old
 kebab/camel calls and normalizes Transmission 4.1 snake_case calls.
 
 | Method group | Upstream methods | Local status | Test rows |
@@ -147,7 +147,7 @@ kebab/camel calls and normalizes Transmission 4.1 snake_case calls.
 
 Transmission `torrent_get` field matrix:
 
-| Field bucket | Upstream fields | rtorrentNG status |
+| Field bucket | Upstream fields | TorrentNG status |
 |---|---|---|
 | Identity | `id`, `hash_string`, `name`, `magnet_link`, `metadata_percent_complete`, `is_private` | Native/Compat |
 | Size/progress | `total_size`, `left_until_done`, `percent_complete`, `percent_done`, `size_when_done`, `have_valid`, `have_unchecked`, `desired_available`, `bytes_completed`, `availability`, `pieces`, `piece_count`, `piece_size` | Partial; implemented with compatibility placeholders where native availability depth is unavailable |
@@ -165,7 +165,7 @@ Transmission `torrent_get` field matrix:
 
 Transmission `session_get` field matrix:
 
-| Bucket | Upstream fields | rtorrentNG status |
+| Bucket | Upstream fields | TorrentNG status |
 |---|---|---|
 | Version/protocol | `version`, `rpc_version`, `rpc_version_minimum`, `rpc_version_semver`, `session_id`, `units` | Compat; semver is reported, session header supported |
 | Paths/start behavior | `download_dir`, `incomplete_dir`, `incomplete_dir_enabled`, `rename_partial_files`, `start_added_torrents`, `trash_original_torrent_files` | Partial |
@@ -194,11 +194,11 @@ Local implementation: `crates/rt-api-deluge`.
 | Core mutation | set options, priorities, trackers, queue, move, rename, connect_peer | Native/Partial | Mutation rows |
 | Label plugin | label list/add/remove/options/set_torrent | Native/Compat | Label plugin row |
 | Notifications plugin | handled events, subscriptions, config/add subscription | Compat | Notification shape row |
-| Other plugins | AutoAdd, Blocklist, Execute, Extractor, Scheduler | Gap | Add only if target clients require |
+| Other plugins | AutoAdd, Blocklist, Execute, Extractor, Scheduler | Migration artifact preservation implemented; facade APIs remain gap | Artifact preservation row plus optional plugin API rows |
 
 Deluge torrent status field matrix:
 
-| Field bucket | Common Deluge fields | rtorrentNG status |
+| Field bucket | Common Deluge fields | TorrentNG status |
 |---|---|---|
 | Identity/path | `hash`, `name`, `save_path`, `label`, `owner`, `shared` | Native/Compat |
 | Progress/size | `progress`, `total_size`, `total_done`, `num_files`, `num_pieces`, `piece_length` | Native/Partial |
@@ -211,10 +211,10 @@ Deluge torrent status field matrix:
 
 ## 6. rTorrent XMLRPC Matrix
 
-rtorrentNG does not currently expose a full rTorrent XMLRPC facade. rTorrent is
+TorrentNG does not currently expose a full rTorrent XMLRPC facade. rTorrent is
 covered today as an import source and as an interop peer.
 
-| Command family | Upstream examples | rtorrentNG status | Test rows |
+| Command family | Upstream examples | TorrentNG status | Test rows |
 |---|---|---|---|
 | System/session | `system.*`, `session.*`, `network.*`, throttle commands | Gap for facade | Decide whether to implement XMLRPC facade or declare non-goal |
 | Download/torrent | `d.*`, `d.multicall*`, `load.*` | Import only; no facade | Import custom fields; optional facade probe |
@@ -234,10 +234,10 @@ covered today as an import source and as an interop peer.
 | P1 | `qbit_arr_client_matrix` | Sonarr/Radarr/Prowlarr/cross-seed/autobrr/NZB360-style qBit flows |
 | P1 | `transmission_client_matrix` | transmission-web, transmission-remote, mobile app field projections |
 | P1 | `deluge_client_matrix` | Deluge WebUI update_ui, thin-client core calls, Label plugin calls |
-| P1 | `interop_transfer_matrix` | qBit/Transmission/Deluge/rTorrent seed and leech with rtorrentNG both directions |
+| P1 | `interop_transfer_matrix` | qBit/Transmission/Deluge/rTorrent seed and leech with TorrentNG both directions |
 | P1 | `tracker_peer_matrix` | HTTP tracker, UDP tracker, private torrent, explicit peer, tracker outage |
 | P1 | `storage_resume_matrix` | stop mid-transfer, restart, resume, corrupt block repair, missing file recovery |
-| P2 | `plugin_aux_matrix` | RSS/search/scheduler/autoadd/blocklist/execute compatibility shapes |
+| P2 | `plugin_aux_matrix` | Migration artifact preservation implemented for RSS/search/scheduler/autoadd/blocklist/execute/plugin/config files; facade API shapes remain targeted work |
 | P2 | `scale_matrix` | 15k imported torrents, hundreds active, many files, hostile paths |
 
 ## 8. Build Backlog From Matrices
@@ -251,4 +251,4 @@ covered today as an import source and as an interop peer.
 | P1 | Persist qBittorrent mutable preferences and broaden property projections to all documented keys | qBit field backlog |
 | P1 | Build real exported golden fixture corpus for qBit, Transmission, Deluge, uTorrent, BiglyBT/Vuze, Tixati, rTorrent, and compare it against the synthetic JSON/bencoded alias matrices | Import matrix |
 | P2 | Decide rTorrent XMLRPC facade scope | rTorrent matrix |
-| P2 | Import auxiliary RSS/search/scheduler/autoadd/plugin metadata as migration artifacts | Feature/import matrices |
+| Done | Preserve auxiliary RSS/search/scheduler/autoadd/blocklist/execute/plugin/config metadata as migration artifacts | Feature/import matrices |

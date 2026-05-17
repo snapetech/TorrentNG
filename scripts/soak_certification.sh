@@ -3,9 +3,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="${1:-$ROOT/certification/reports/soak-$(date -u +%Y%m%dT%H%M%SZ).md}"
-RTNG_HOST_URL="${RTNG_HOST_URL:-http://localhost:${RTNG_HOST_PORT:-18080}}"
-RTNG_API_TOKEN="${RTNG_API_TOKEN:-cert-token}"
-RTNG_CONTAINER="${RTNG_CONTAINER:-certification-rtorrentng-1}"
+TNG_HOST_URL="${TNG_HOST_URL:-http://localhost:${TNG_HOST_PORT:-18080}}"
+TNG_API_TOKEN="${TNG_API_TOKEN:-cert-token}"
+TNG_CONTAINER="${TNG_CONTAINER:-certification-torrentng-1}"
 SOAK_DURATION_SECONDS="${SOAK_DURATION_SECONDS:-86400}"
 SOAK_INTERVAL_SECONDS="${SOAK_INTERVAL_SECONDS:-60}"
 SOAK_MAX_RSS_MB="${SOAK_MAX_RSS_MB:-500}"
@@ -15,9 +15,9 @@ BODY="$(mktemp)"
 
 mkdir -p "$(dirname "$OUT")"
 
-mapped="$(docker port "$RTNG_CONTAINER" 8080/tcp 2>/dev/null | sed -n 's/.*:\([0-9][0-9]*\)$/\1/p' | head -1 || true)"
-if [[ -n "$mapped" && "$RTNG_HOST_URL" == http://localhost:* ]]; then
-  RTNG_HOST_URL="http://localhost:$mapped"
+mapped="$(docker port "$TNG_CONTAINER" 8080/tcp 2>/dev/null | sed -n 's/.*:\([0-9][0-9]*\)$/\1/p' | head -1 || true)"
+if [[ -n "$mapped" && "$TNG_HOST_URL" == http://localhost:* ]]; then
+  TNG_HOST_URL="http://localhost:$mapped"
 fi
 
 cleanup() {
@@ -38,14 +38,14 @@ mark() {
 }
 
 rss_mb() {
-  docker exec "$RTNG_CONTAINER" sh -lc "awk '/VmRSS:/ {printf \"%.1f\", \$2 / 1024}' /proc/1/status"
+  docker exec "$TNG_CONTAINER" sh -lc "awk '/VmRSS:/ {printf \"%.1f\", \$2 / 1024}' /proc/1/status"
 }
 
 {
-  echo "# rtorrentNG Soak Certification"
+  echo "# TorrentNG Soak Certification"
   echo
   echo "- Date UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  echo "- rtorrentNG URL: $RTNG_HOST_URL"
+  echo "- TorrentNG URL: $TNG_HOST_URL"
   echo "- Duration seconds: $SOAK_DURATION_SECONDS"
   echo "- Interval seconds: $SOAK_INTERVAL_SECONDS"
   echo "- Max RSS MB: $SOAK_MAX_RSS_MB"
@@ -57,7 +57,7 @@ rss_mb() {
   echo "|---|---|---|"
 } > "$OUT"
 
-code="$(curl -ksS -o "$BODY" -w '%{http_code}' "$RTNG_HOST_URL/api/qb/v2/auth/login" -X POST -d "username=$RTNG_API_TOKEN" -d "password=$RTNG_API_TOKEN" -c "$COOKIE_JAR")"
+code="$(curl -ksS -o "$BODY" -w '%{http_code}' "$TNG_HOST_URL/api/qb/v2/auth/login" -X POST -d "username=$TNG_API_TOKEN" -d "password=$TNG_API_TOKEN" -c "$COOKIE_JAR")"
 if [[ "$code" == "200" ]]; then
   mark "qBit auth" "PASS" "session cookie accepted"
 else
@@ -78,9 +78,9 @@ samples=0
 max_rss="0"
 while (( SECONDS < deadline || samples == 0 )); do
   now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  health="$(curl -ksS -o "$BODY" -w '%{http_code}' "$RTNG_HOST_URL/health" || true)"
-  torrents="$(curl -ksS -b "$COOKIE_JAR" "$RTNG_HOST_URL/api/qb/v2/torrents/info?limit=$SOAK_LIST_LIMIT" | jq 'length' 2>/dev/null || echo 0)"
-  sync_code="$(curl -ksS -o "$BODY" -w '%{http_code}' -b "$COOKIE_JAR" "$RTNG_HOST_URL/api/qb/v2/sync/maindata?rid=0" || true)"
+  health="$(curl -ksS -o "$BODY" -w '%{http_code}' "$TNG_HOST_URL/health" || true)"
+  torrents="$(curl -ksS -b "$COOKIE_JAR" "$TNG_HOST_URL/api/qb/v2/torrents/info?limit=$SOAK_LIST_LIMIT" | jq 'length' 2>/dev/null || echo 0)"
+  sync_code="$(curl -ksS -o "$BODY" -w '%{http_code}' -b "$COOKIE_JAR" "$TNG_HOST_URL/api/qb/v2/sync/maindata?rid=0" || true)"
   rss="$(rss_mb)"
   awk -v a="$rss" -v b="$max_rss" 'BEGIN {exit !(a > b)}' && max_rss="$rss"
   printf '| %s | %s | %s | %s | %s |\n' "$now" "$health" "$torrents" "$rss" "$sync_code" >> "$OUT"

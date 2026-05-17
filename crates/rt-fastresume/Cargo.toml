@@ -1,6 +1,6 @@
 [package]
 name = "rt-fastresume"
-description = "rtorrentNG: durable per-torrent verification state"
+description = "TorrentNG: durable per-torrent verification state"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

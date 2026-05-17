@@ -1,6 +1,6 @@
 [package]
 name = "rt-api-native"
-description = "rtorrentNG: axum REST API server (native JSON endpoints)"
+description = "TorrentNG: axum REST API server (native JSON endpoints)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

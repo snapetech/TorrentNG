@@ -1,8 +1,8 @@
-# rtorrentNG Docs
+# TorrentNG Docs
 
-Start here when choosing, testing, or operating an rtorrentNG engine mode.
+Start here when choosing, testing, or operating an TorrentNG engine mode.
 
-rtorrentNG's product goal is universal torrent-client compatibility: import
+TorrentNG's product goal is universal torrent-client compatibility: import
 from existing clients, expose the APIs automation tools already speak,
 interoperate with independent BitTorrent clients, and provide a native Rust
 engine that can replace older cores without forcing a workflow reset. The docs

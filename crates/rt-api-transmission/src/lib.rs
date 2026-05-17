@@ -19,7 +19,7 @@ use rt_session::SessionRegistry;
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
-const SESSION_ID: &str = "rtorrentNG";
+const SESSION_ID: &str = "TorrentNG";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -560,7 +560,7 @@ async fn session_get(state: &AppState, args: &Value) -> Value {
     let limits = transmission_global_limits(state).await;
     let session = state.session.read().await.clone();
     let value = json!({
-        "version": "rtorrentNG",
+        "version": "TorrentNG",
         "rpc-version": 17,
         "rpc-version-minimum": 1,
         "rpc-version-semver": "6.0.0",
@@ -1852,7 +1852,7 @@ mod tests {
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body[0]["jsonrpc"], "2.0");
         assert_eq!(body[0]["id"], 1);
-        assert_eq!(body[0]["result"]["version"], "rtorrentNG");
+        assert_eq!(body[0]["result"]["version"], "TorrentNG");
         assert_eq!(body[1]["jsonrpc"], "2.0");
         assert_eq!(body[1]["id"], 2);
         assert_eq!(body[1]["result"]["torrents"][0]["name"], "one");

@@ -1,6 +1,6 @@
 listen_addr = "0.0.0.0:8080"
 sync_interval_secs = 2
-data_dir = "/var/lib/rtorrentng"
+data_dir = "/var/lib/torrentng"
 storage_roots = ["/data"]
 
 [rtorrent]

@@ -33,18 +33,18 @@ export function TorrentToolbar({
   }
 
   return (
-    <div className="rtng-toolbar" data-has-selection={selectedCount > 0 ? 'true' : 'false'} data-busy={busy ? 'true' : 'false'} style={{
+    <div className="tng-toolbar" data-has-selection={selectedCount > 0 ? 'true' : 'false'} data-busy={busy ? 'true' : 'false'} style={{
       minHeight: 40, flexShrink: 0, display: 'flex', alignItems: 'center', gap: 8,
       padding: '0 10px', background: 'var(--surface)', borderBottom: '1px solid var(--border)',
       minWidth: 0, overflowX: 'auto', overflowY: 'hidden', scrollbarWidth: 'thin',
     }}>
-      <button className="rtng-toolbar-button" onClick={onAdd} title="Add torrent" aria-label="Add torrent" style={primaryButton}><span>+</span><span>Add</span></button>
-      <div className="rtng-toolbar-divider" style={{ width: 1, height: 20, background: 'var(--border)', margin: '0 2px' }} />
-      <span className="rtng-toolbar-label" style={groupLabel}>Transfer</span>
-      <div className="rtng-toolbar-group" style={buttonGroup}>
+      <button className="tng-toolbar-button" onClick={onAdd} title="Add torrent" aria-label="Add torrent" style={primaryButton}><span>+</span><span>Add</span></button>
+      <div className="tng-toolbar-divider" style={{ width: 1, height: 20, background: 'var(--border)', margin: '0 2px' }} />
+      <span className="tng-toolbar-label" style={groupLabel}>Transfer</span>
+      <div className="tng-toolbar-group" style={buttonGroup}>
         {ACTIONS.map(action => (
           <button
-            className="rtng-toolbar-button"
+            className="tng-toolbar-button"
             key={action.key}
             onClick={handlers[action.key]}
             disabled={disabled}
@@ -56,10 +56,10 @@ export function TorrentToolbar({
           </button>
         ))}
       </div>
-      <span className="rtng-toolbar-label" style={groupLabel}>Edit</span>
-      <div className="rtng-toolbar-group" style={buttonGroup}>
+      <span className="tng-toolbar-label" style={groupLabel}>Edit</span>
+      <div className="tng-toolbar-group" style={buttonGroup}>
         <button
-          className="rtng-toolbar-button"
+          className="tng-toolbar-button"
           onClick={onProperties}
           disabled={selectedCount !== 1 || busy}
           title="Open selected torrent properties"
@@ -69,7 +69,7 @@ export function TorrentToolbar({
           <span>⌘</span><span>Properties</span>
         </button>
         <button
-          className="rtng-toolbar-button"
+          className="tng-toolbar-button"
           onClick={onEditSelected}
           disabled={disabled}
           title="Bulk edit selected torrents"
@@ -79,7 +79,7 @@ export function TorrentToolbar({
           <span>✎</span><span>Edit selected</span>
         </button>
         <button
-          className="rtng-toolbar-button"
+          className="tng-toolbar-button"
           onClick={onSequential}
           disabled={disabled}
           title="Toggle sequential download for selected torrents"
@@ -89,7 +89,7 @@ export function TorrentToolbar({
           <span>≡</span><span>Sequential</span>
         </button>
       </div>
-      <span className="rtng-toolbar-selection" style={{
+      <span className="tng-toolbar-selection" style={{
         color: selectedCount > 0 ? 'var(--accent-text)' : 'var(--faint)',
         fontSize: 11, marginLeft: 2, whiteSpace: 'nowrap', flex: '0 0 auto',
         padding: '3px 7px', border: '1px solid var(--border)', borderRadius: 5,
@@ -100,7 +100,7 @@ export function TorrentToolbar({
       </span>
       {selectedCount > 0 && (
         <button
-          className="rtng-toolbar-button"
+          className="tng-toolbar-button"
           onClick={onClearSelection}
           disabled={busy}
           title="Clear selected torrents"
@@ -110,7 +110,7 @@ export function TorrentToolbar({
           <span>×</span><span>Clear</span>
         </button>
       )}
-      <button className="rtng-toolbar-help rtng-toolbar-button" onClick={onHelp} title="Keyboard shortcuts and docs" aria-label="Keyboard shortcuts and docs" style={{
+      <button className="tng-toolbar-help tng-toolbar-button" onClick={onHelp} title="Keyboard shortcuts and docs" aria-label="Keyboard shortcuts and docs" style={{
         marginLeft: 'auto', flex: '0 0 auto', background: 'transparent', border: '1px solid var(--border-strong)',
         borderRadius: 5, color: 'var(--muted)', padding: '4px 8px', fontSize: 12, cursor: 'pointer',
       }}>

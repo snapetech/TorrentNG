@@ -62,7 +62,7 @@ scripts/interop_matrix.sh --local --report certification/reports/interop-local.m
 ```
 
 The script builds and starts the interop Compose stack by default. Use
-`INTEROP_SKIP_BUILD=1` when the `rtorrentng/rusttorrentd:interop` image is
+`INTEROP_SKIP_BUILD=1` when the `torrentng/rusttorrentd:interop` image is
 already current.
 
 ```sh

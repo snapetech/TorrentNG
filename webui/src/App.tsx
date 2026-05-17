@@ -29,9 +29,9 @@ import { PALETTES, applyTheme, findPalette, THEME_MODE_STORAGE_KEY, THEME_STORAG
 type View = 'torrents' | 'settings'
 type AuthState = 'checking' | 'authenticated' | 'unauthenticated'
 type SettingsSection = 'library' | 'engine' | 'automation' | 'support'
-const MEDIA_INFERENCE_KEY = 'rtng.mediaInference'
-const DETAIL_AUTO_DISPLAY_KEY = 'rtng.detailAutoDisplay'
-const ACTIVE_TAB_KEY = 'rtng.activeTab'
+const MEDIA_INFERENCE_KEY = 'tng.mediaInference'
+const DETAIL_AUTO_DISPLAY_KEY = 'tng.detailAutoDisplay'
+const ACTIVE_TAB_KEY = 'tng.activeTab'
 const ACTIVE_TAB_TTL_MS = 8000
 
 function loadThemeId(): string {
@@ -456,7 +456,7 @@ export function App() {
 
   if (authState === 'checking') {
     return (
-      <div className="rtng-card rtng-standby-card" style={{
+      <div className="tng-card tng-standby-card" style={{
         minHeight: '100vh', background: 'var(--bg)', color: 'var(--faint)',
         display: 'grid', placeItems: 'center', fontSize: 13, padding: 24,
       }}>
@@ -468,7 +468,7 @@ export function App() {
           <span style={{
             width: 22, height: 22, borderRadius: '50%',
             border: '2px solid var(--border-strong)', borderTopColor: 'var(--accent)',
-            animation: 'rtng-spin 800ms linear infinite',
+            animation: 'tng-spin 800ms linear infinite',
           }} />
           <span>Checking session...</span>
         </div>
@@ -486,7 +486,7 @@ export function App() {
       overflow: 'hidden', background: 'var(--bg)', color: 'var(--text)',
     }}>
       {/* Topbar */}
-      <header className="rtng-topbar" style={{
+      <header className="tng-topbar" style={{
         height: 44, background: 'var(--bg)', borderBottom: '1px solid var(--border)',
         display: 'flex', alignItems: 'center', padding: '0 16px', gap: 12, flexShrink: 0,
         minWidth: 0, overflowX: 'auto', overflowY: 'hidden', scrollbarWidth: 'thin',
@@ -500,7 +500,7 @@ export function App() {
             background: 'linear-gradient(135deg, var(--accent), var(--success))',
             boxShadow: '0 0 14px color-mix(in srgb, var(--accent) 48%, transparent)',
           }} />
-          rtorrentNG
+          TorrentNG
         </span>
 
         <nav aria-label="Primary" style={{ display: 'flex', gap: 4, marginLeft: 4, flex: '0 0 auto' }}>
@@ -520,7 +520,7 @@ export function App() {
         </nav>
 
         {view === 'torrents' && (
-          <span className="rtng-topbar-pill" data-tone="neutral" style={{
+          <span className="tng-topbar-pill" data-tone="neutral" style={{
             color: 'var(--muted)', background: 'var(--surface)', border: '1px solid var(--border)',
             borderRadius: 999, padding: '2px 8px', fontSize: 11, fontWeight: 700,
             whiteSpace: 'nowrap', flex: '0 0 auto',
@@ -529,7 +529,7 @@ export function App() {
           </span>
         )}
         {selected.size > 0 && view === 'torrents' && (
-          <span className="rtng-topbar-pill" data-tone="accent" style={{
+          <span className="tng-topbar-pill" data-tone="accent" style={{
             color: 'var(--accent-text)', background: 'var(--accent-soft)', border: '1px solid var(--accent)',
             borderRadius: 999, padding: '2px 8px', fontSize: 11, fontWeight: 800,
             whiteSpace: 'nowrap', flex: '0 0 auto',
@@ -543,7 +543,7 @@ export function App() {
           whiteSpace: 'nowrap', flex: '0 0 auto',
         }}>Help</button>
 
-        <span className="rtng-topbar-pill" data-tone={health?.rtorrent === 'connected' ? 'ok' : 'error'} title="rTorrent connection state" style={{
+        <span className="tng-topbar-pill" data-tone={health?.rtorrent === 'connected' ? 'ok' : 'error'} title="rTorrent connection state" style={{
           fontSize: 11, color: health?.rtorrent === 'connected' ? 'var(--success)' : 'var(--danger)',
           display: 'flex', alignItems: 'center', gap: 5, padding: '2px 7px',
           border: '1px solid ' + (health?.rtorrent === 'connected' ? 'color-mix(in srgb, var(--success) 42%, var(--border))' : 'color-mix(in srgb, var(--danger) 42%, var(--border))'),
@@ -558,10 +558,10 @@ export function App() {
           {health?.rtorrent ?? 'connecting…'}
         </span>
 
-        <span className="rtng-topbar-spacer" style={{ flex: '1 0 12px' }} />
-        <div className="rtng-theme-controls" style={{ display: 'flex', alignItems: 'center', gap: 6, flex: '0 0 auto' }}>
+        <span className="tng-topbar-spacer" style={{ flex: '1 0 12px' }} />
+        <div className="tng-theme-controls" style={{ display: 'flex', alignItems: 'center', gap: 6, flex: '0 0 auto' }}>
           <span
-            className="rtng-theme-swatch"
+            className="tng-theme-swatch"
             title={`${findPalette(themeId).label} ${themeMode}`}
             aria-hidden="true"
             style={{
@@ -623,7 +623,7 @@ export function App() {
         />
       )}
       {/* Main content */}
-      <main className="rtng-main" style={{ flex: 1, minWidth: 0, display: 'flex', overflow: 'hidden' }}>
+      <main className="tng-main" style={{ flex: 1, minWidth: 0, display: 'flex', overflow: 'hidden' }}>
         {view === 'settings' && (
           <SettingsView
             section={settingsSection}
@@ -677,8 +677,8 @@ export function App() {
                       border: '1px solid var(--border)', borderRadius: 7, background: 'var(--surface)',
                       padding: '10px 12px', display: 'grid', gap: 8,
                     }}>
-                      <span className="rtng-skeleton" style={{ width: index % 2 ? '44%' : '62%', height: 12 }} />
-                      <span className="rtng-skeleton" style={{ width: index % 3 ? '72%' : '38%', height: 8 }} />
+                      <span className="tng-skeleton" style={{ width: index % 2 ? '44%' : '62%', height: 12 }} />
+                      <span className="tng-skeleton" style={{ width: index % 3 ? '72%' : '38%', height: 8 }} />
                     </div>
                   ))}
                 </div>
@@ -794,7 +794,7 @@ function StandbyScreen({ onTakeOver }: { onTakeOver: () => void }) {
             color: 'var(--accent-text)', background: 'var(--accent-soft)', border: '1px solid var(--accent)',
             fontWeight: 900,
           }}>▣</span>
-          <div style={{ fontWeight: 800, fontSize: 18 }}>rtorrentNG is open in another tab</div>
+          <div style={{ fontWeight: 800, fontSize: 18 }}>TorrentNG is open in another tab</div>
         </div>
         <div style={{ color: 'var(--muted)', fontSize: 13, lineHeight: 1.45 }}>
           This standby tab is not connected to the API or websocket. Use one active tab for large libraries.
@@ -826,7 +826,7 @@ function SettingsView({ section, onSection, mediaInference, onMediaInference, th
   ]
   return (
     <>
-      <aside className="rtng-settings-sidebar" style={{
+      <aside className="tng-settings-sidebar" style={{
         width: 220, flexShrink: 0, background: 'var(--panel)', borderRight: '1px solid var(--border)',
         padding: 12,
       }}>
@@ -835,7 +835,7 @@ function SettingsView({ section, onSection, mediaInference, onMediaInference, th
           <div style={{ fontSize: 11, color: 'var(--faint)', marginTop: 3 }}>Daemon, library, and browser controls</div>
         </div>
         {sections.map(([key, label, icon]) => (
-          <button key={key} className="rtng-settings-nav-button" data-active={section === key ? 'true' : 'false'} onClick={() => onSection(key)} aria-current={section === key ? 'page' : undefined} style={{
+          <button key={key} className="tng-settings-nav-button" data-active={section === key ? 'true' : 'false'} onClick={() => onSection(key)} aria-current={section === key ? 'page' : undefined} style={{
             width: '100%', display: 'grid', gridTemplateColumns: '22px 1fr auto', alignItems: 'center',
             textAlign: 'left', marginBottom: 4, gap: 7,
             background: section === key ? 'var(--accent-soft)' : 'transparent',
@@ -885,7 +885,7 @@ function SettingsView({ section, onSection, mediaInference, onMediaInference, th
             gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
           }}>
             <SupportCard icon="☊" title="Discord support" href="https://discord.gg/4ub88HeHFm" detail="Community support and release discussion" />
-            <SupportCard icon="⌘" title="GitHub project" href="https://github.com/snapetech/rtorrentNG" detail="Source, issues, and deployment files" />
+            <SupportCard icon="⌘" title="GitHub project" href="https://github.com/snapetech/TorrentNG" detail="Source, issues, and deployment files" />
             <button onClick={() => window.dispatchEvent(new KeyboardEvent('keydown', { key: '?' }))} style={{
               ...supportButton, width: '100%', minHeight: 72, textAlign: 'left',
               display: 'grid', gridTemplateColumns: '32px 1fr', alignItems: 'center',
@@ -934,13 +934,13 @@ function DeleteDialog({ torrent, onCancel, onRemove, onRemoveFiles }: {
   onRemoveFiles: () => void
 }) {
   return (
-    <div className="rtng-modal-backdrop" role="presentation" onMouseDown={e => {
+    <div className="tng-modal-backdrop" role="presentation" onMouseDown={e => {
       if (e.target === e.currentTarget) onCancel()
     }} style={{
       position: 'fixed', inset: 0, background: 'rgba(2,6,23,0.72)', zIndex: 1150,
       display: 'grid', placeItems: 'center', padding: 24,
     }}>
-      <div className="rtng-modal rtng-delete-dialog" role="dialog" aria-modal="true" aria-label={`Delete ${torrent.name}`} style={{
+      <div className="tng-modal tng-delete-dialog" role="dialog" aria-modal="true" aria-label={`Delete ${torrent.name}`} style={{
         width: 'min(480px, 100%)', background: 'var(--panel)', border: '1px solid var(--danger)',
         borderRadius: 8, boxShadow: '0 24px 60px var(--shadow)',
       }}>
@@ -980,7 +980,7 @@ const supportLink: React.CSSProperties = {
 
 function SupportCard({ icon, title, href, detail }: { icon: string; title: string; href: string; detail: string }) {
   return (
-    <a className="rtng-card-link" style={{
+    <a className="tng-card-link" style={{
       ...supportLink,
       display: 'grid',
       gridTemplateColumns: '32px 1fr',
@@ -1054,7 +1054,7 @@ function LoginScreen({ message, onLogin }: {
       minHeight: '100vh', background: 'var(--bg)', color: 'var(--text)',
       display: 'grid', placeItems: 'center', padding: 24,
     }}>
-      <form className="rtng-card rtng-login-card" onSubmit={submit} style={{
+      <form className="tng-card tng-login-card" onSubmit={submit} style={{
         width: 'min(360px, 100%)', border: '1px solid var(--border)', borderRadius: 8,
         background: 'var(--panel)', padding: 20, display: 'flex', flexDirection: 'column', gap: 12,
         boxShadow: '0 24px 60px var(--shadow)',
@@ -1065,11 +1065,11 @@ function LoginScreen({ message, onLogin }: {
               width: 10, height: 10, borderRadius: 3,
               background: 'linear-gradient(135deg, var(--accent), var(--success))',
             }} />
-            <div style={{ fontWeight: 800, fontSize: 18 }}>rtorrentNG</div>
+            <div style={{ fontWeight: 800, fontSize: 18 }}>TorrentNG</div>
           </div>
           <div style={{ color: 'var(--faint)', fontSize: 12, marginTop: 4 }}>Sign in to manage torrents</div>
         </div>
-        <label className="rtng-form-card" style={{ display: 'flex', flexDirection: 'column', gap: 5, fontSize: 12, color: 'var(--muted)' }}>
+        <label className="tng-form-card" style={{ display: 'flex', flexDirection: 'column', gap: 5, fontSize: 12, color: 'var(--muted)' }}>
           Username
           <input
             autoFocus
@@ -1082,7 +1082,7 @@ function LoginScreen({ message, onLogin }: {
             }}
           />
         </label>
-        <label className="rtng-form-card" style={{ display: 'flex', flexDirection: 'column', gap: 5, fontSize: 12, color: 'var(--muted)' }}>
+        <label className="tng-form-card" style={{ display: 'flex', flexDirection: 'column', gap: 5, fontSize: 12, color: 'var(--muted)' }}>
           Password
           <input
             type="password"

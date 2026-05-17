@@ -36,8 +36,8 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
 license = "GPL-3.0-or-later"
-authors = ["rtorrentNG contributors"]
-repository = "https://github.com/rtorrentng/rtorrentng"
+authors = ["TorrentNG contributors"]
+repository = "https://github.com/torrentng/torrentng"
 
 [workspace.dependencies]
 # async runtime

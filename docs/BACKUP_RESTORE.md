@@ -7,7 +7,7 @@ metainfo, fastresume state, config, and operator-owned certification artifacts.
 
 - Native `config.toml` and any environment file that provides
   `RUSTTORRENTD_CONFIG`, API tokens, storage roots, and listen ports.
-- The native session directory containing `rtorrentng.db`, stored `.torrent`
+- The native session directory containing `torrentng.db`, stored `.torrent`
   blobs, fastresume state, and job/event state.
 - Storage-root metadata if deployed separately from payload files.
 - Certification reports under `certification/reports/` for release evidence.
@@ -22,7 +22,7 @@ Use SQLite's online backup support or stop writes briefly before copying. Do not
 copy a hot WAL database by copying only the main `.db` file.
 
 ```sh
-sqlite3 /config/session/rtorrentng.db ".backup '/backup/rtorrentng.db'"
+sqlite3 /config/session/torrentng.db ".backup '/backup/torrentng.db'"
 rsync -a /config/session/torrents/ /backup/torrents/
 rsync -a /config/session/fastresume/ /backup/fastresume/
 cp /config/config.toml /backup/config.toml
@@ -32,7 +32,7 @@ cp /config/config.toml /backup/config.toml
 
 1. Stop `rusttorrentd`.
 2. Move the current session directory aside.
-3. Restore `rtorrentng.db`, torrent blobs, fastresume state, and config.
+3. Restore `torrentng.db`, torrent blobs, fastresume state, and config.
 4. Start `rusttorrentd`.
 5. Check `/health`, `/api/v1/torrents`, and the qBit compatibility list.
 6. Run targeted rechecks only for torrents whose payload paths changed.

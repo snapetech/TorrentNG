@@ -1,6 +1,6 @@
 services:
-  rtorrentng:
-    image: rtorrentng:certification
+  torrentng:
+    image: torrentng:certification
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
@@ -8,28 +8,28 @@ services:
     security_opt:
       - seccomp:unconfined
     ports:
-      - "${RTNG_HOST_PORT:-18080}:8080"
-      - "${RTNG_INCOMING_PORT:-50000}:50000"
-      - "${RTNG_INCOMING_PORT:-50000}:50000/udp"
+      - "${TNG_HOST_PORT:-18080}:8080"
+      - "${TNG_INCOMING_PORT:-50000}:50000"
+      - "${TNG_INCOMING_PORT:-50000}:50000/udp"
     volumes:
       - ./sidecar.config.toml:/config/config.toml:ro
-      - rtng-data:/var/lib/rtorrentng
+      - tng-data:/var/lib/torrentng
       - downloads:/data
       - session:/session
     environment:
-      RTORRENTNG_CONFIG: /config/config.toml
-      RTORRENT_INCOMING_PORT: "${RTNG_INCOMING_PORT:-50000}"
+      TORRENTNG_CONFIG: /config/config.toml
+      RTORRENT_INCOMING_PORT: "${TNG_INCOMING_PORT:-50000}"
       RTORRENT_SCGI_SOCKET: /run/rtorrent/rpc.sock
-      RTNG_STATIC_DIR: /usr/share/rtorrentng/webui
-      RTNG_SYNC_INTERVAL_SECS: "${RTNG_SYNC_INTERVAL_SECS:-2}"
-      RTNG_DATA_DIR: "${RTNG_DATA_DIR:-/var/lib/rtorrentng}"
-      RTNG_SECRET_KEY: "${RTNG_SECRET_KEY:-certification-only-change-me}"
-      RTNG_API_TOKENS: "${RTNG_API_TOKEN:-cert-token}"
-      RTNG_USER_AGENT: "${RTNG_USER_AGENT:-rtorrentNG/0.1.0 libtorrent/0.16.11}"
-      RTNG_QBITTORRENT_VERSION: "${RTNG_QBITTORRENT_VERSION:-5.0.0}"
-      RTNG_QBITTORRENT_WEBAPI_VERSION: "${RTNG_QBITTORRENT_WEBAPI_VERSION:-2.11.0}"
-      RTNG_QBITTORRENT_BUILD_LIBTORRENT: "${RTNG_QBITTORRENT_BUILD_LIBTORRENT:-0.16.11}"
-      RTNG_QBITTORRENT_BUILD_QT: "${RTNG_QBITTORRENT_BUILD_QT:-6.7.0}"
+      TNG_STATIC_DIR: /usr/share/torrentng/webui
+      TNG_SYNC_INTERVAL_SECS: "${TNG_SYNC_INTERVAL_SECS:-2}"
+      TNG_DATA_DIR: "${TNG_DATA_DIR:-/var/lib/torrentng}"
+      TNG_SECRET_KEY: "${TNG_SECRET_KEY:-certification-only-change-me}"
+      TNG_API_TOKENS: "${TNG_API_TOKEN:-cert-token}"
+      TNG_USER_AGENT: "${TNG_USER_AGENT:-TorrentNG/0.1.0 libtorrent/0.16.11}"
+      TNG_QBITTORRENT_VERSION: "${TNG_QBITTORRENT_VERSION:-5.0.0}"
+      TNG_QBITTORRENT_WEBAPI_VERSION: "${TNG_QBITTORRENT_WEBAPI_VERSION:-2.11.0}"
+      TNG_QBITTORRENT_BUILD_LIBTORRENT: "${TNG_QBITTORRENT_BUILD_LIBTORRENT:-0.16.11}"
+      TNG_QBITTORRENT_BUILD_QT: "${TNG_QBITTORRENT_BUILD_QT:-6.7.0}"
     healthcheck:
       test: ["CMD", "/bin/sh", "-c", "test -S /run/rtorrent/rpc.sock && wget -qO- http://127.0.0.1:8080/health >/dev/null"]
       interval: 15s
@@ -50,7 +50,7 @@ services:
       PGID: "${PGID:-1000}"
       TZ: "${TZ:-Etc/UTC}"
     depends_on:
-      - rtorrentng
+      - torrentng
 
   radarr:
     image: lscr.io/linuxserver/radarr:latest
@@ -66,7 +66,7 @@ services:
       PGID: "${PGID:-1000}"
       TZ: "${TZ:-Etc/UTC}"
     depends_on:
-      - rtorrentng
+      - torrentng
 
   prowlarr:
     image: lscr.io/linuxserver/prowlarr:latest
@@ -80,7 +80,7 @@ services:
       PGID: "${PGID:-1000}"
       TZ: "${TZ:-Etc/UTC}"
     depends_on:
-      - rtorrentng
+      - torrentng
 
   autobrr:
     image: ghcr.io/autobrr/autobrr:latest
@@ -95,7 +95,7 @@ services:
       AUTOBRR__LOG_LEVEL: debug
       AUTOBRR__SESSION_SECRET: certification-only-change-me
     depends_on:
-      - rtorrentng
+      - torrentng
 
   cross-seed:
     image: ghcr.io/cross-seed/cross-seed:latest
@@ -110,10 +110,10 @@ services:
     environment:
       TZ: "${TZ:-Etc/UTC}"
     depends_on:
-      - rtorrentng
+      - torrentng
 
 volumes:
-  rtng-data:
+  tng-data:
   downloads:
   session:
   sonarr-config:

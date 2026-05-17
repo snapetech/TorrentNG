@@ -59,7 +59,7 @@
       "pluginVersion": "11.0.0",
       "targets": [
         {
-          "expr": "rtorrentng_torrents_total",
+          "expr": "torrentng_torrents_total",
           "legendFormat": "torrents",
           "refId": "A"
         }
@@ -101,17 +101,17 @@
       },
       "targets": [
         {
-          "expr": "rtorrentng_bytes_downloaded_total",
+          "expr": "torrentng_bytes_downloaded_total",
           "legendFormat": "downloaded",
           "refId": "A"
         },
         {
-          "expr": "rtorrentng_bytes_uploaded_total",
+          "expr": "torrentng_bytes_uploaded_total",
           "legendFormat": "uploaded",
           "refId": "B"
         },
         {
-          "expr": "rtorrentng_bytes_left",
+          "expr": "torrentng_bytes_left",
           "legendFormat": "left",
           "refId": "C"
         }
@@ -153,27 +153,27 @@
       },
       "targets": [
         {
-          "expr": "rtorrentng_torrents_seeding",
+          "expr": "torrentng_torrents_seeding",
           "legendFormat": "seeding",
           "refId": "A"
         },
         {
-          "expr": "rtorrentng_torrents_downloading",
+          "expr": "torrentng_torrents_downloading",
           "legendFormat": "downloading",
           "refId": "B"
         },
         {
-          "expr": "rtorrentng_torrents_paused",
+          "expr": "torrentng_torrents_paused",
           "legendFormat": "paused",
           "refId": "C"
         },
         {
-          "expr": "rtorrentng_jobs_active",
+          "expr": "torrentng_jobs_active",
           "legendFormat": "active jobs",
           "refId": "D"
         },
         {
-          "expr": "rtorrentng_trackers_error",
+          "expr": "torrentng_trackers_error",
           "legendFormat": "tracker errors",
           "refId": "E"
         }
@@ -185,7 +185,7 @@
   "refresh": "15s",
   "schemaVersion": 39,
   "tags": [
-    "rtorrentng",
+    "torrentng",
     "rusttorrentd"
   ],
   "templating": {

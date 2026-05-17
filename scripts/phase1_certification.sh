@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="${1:-$ROOT/certification/reports/phase1-cert-$(date -u +%Y%m%dT%H%M%SZ).md}"
-CONTAINER="${PHASE1_CONTAINER:-rtorrentng-phase1}"
+CONTAINER="${PHASE1_CONTAINER:-torrentng-phase1}"
 HTTP_URL="${PHASE1_HTTP_URL:-http://localhost:${PHASE1_HTTP_PORT:-8080}}"
 EXPECTED_RTORRENT="${PHASE1_EXPECTED_RTORRENT:-0.16.11}"
 EXPECTED_RUTORRENT="${PHASE1_EXPECTED_RUTORRENT:-5.3.1}"
@@ -55,7 +55,7 @@ http_code() {
 }
 
 {
-  echo "# rtorrentNG Phase 1 Certification"
+  echo "# TorrentNG Phase 1 Certification"
   echo
   echo "- Date UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "- Container: $CONTAINER"

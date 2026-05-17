@@ -1,6 +1,6 @@
 [package]
 name = "rt-hash"
-description = "rtorrentNG: rt-hash"
+description = "TorrentNG: rt-hash"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

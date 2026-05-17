@@ -13,7 +13,7 @@ use tokio::{
 };
 
 // Re-use internal modules via the binary crate root.
-use rtorrentng::{
+use torrentng::{
     api::{server::AppState, ws::Event},
     cache::{Db, TorrentRow},
     config::Config,
@@ -45,7 +45,7 @@ async fn spawn_server_with_config_and_events(
 
     // Stub rTorrent client pointing at a non-existent socket.
     // Tests that call rTorrent fail gracefully — we only exercise DB-backed endpoints here.
-    let rt = Arc::new(rtorrentng::rtorrent::Client::new_unix("/nonexistent", 1));
+    let rt = Arc::new(torrentng::rtorrent::Client::new_unix("/nonexistent", 1));
 
     let state = AppState {
         cfg,
@@ -54,7 +54,7 @@ async fn spawn_server_with_config_and_events(
         events: tx.clone(),
         metrics,
     };
-    let app: Router = rtorrentng::api::server::build_router(state);
+    let app: Router = torrentng::api::server::build_router(state);
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

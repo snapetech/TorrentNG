@@ -33,7 +33,7 @@ pub fn session_tracker_urls(hash: &str) -> Vec<String> {
 }
 
 fn session_dir() -> PathBuf {
-    std::env::var("RTNG_SESSION_DIR")
+    std::env::var("TNG_SESSION_DIR")
         .ok()
         .filter(|v| !v.trim().is_empty())
         .map(PathBuf::from)

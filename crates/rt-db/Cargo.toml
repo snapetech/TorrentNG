@@ -1,6 +1,6 @@
 [package]
 name = "rt-db"
-description = "rtorrentNG: SQLite persistence layer (WAL, migrations, torrent state)"
+description = "TorrentNG: SQLite persistence layer (WAL, migrations, torrent state)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

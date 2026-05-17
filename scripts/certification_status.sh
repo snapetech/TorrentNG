@@ -43,7 +43,7 @@ row() {
   printf '| %s | %s | %s |\n' "$name" "$status" "$sample"
 }
 
-echo "# rtorrentNG Certification Status"
+echo "# TorrentNG Certification Status"
 echo
 echo "- Date UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "- Report directory: $REPORT_DIR"
@@ -61,7 +61,7 @@ row "autobrr filter/action" 'autobrr-*.md'
 row "DHT" 'dht-cert-*.md'
 row "NAT-PMP DHT" 'natpmp-dht-*.md'
 row "Proton NAT-PMP" 'proton-natpmp-*.md'
-row "Proton-routed rtorrentNG DHT" 'proton-rtng-dht-*.md'
+row "Proton-routed TorrentNG DHT" 'proton-tng-dht-*.md'
 row "Mobile read-flow" 'mobile-compat-*.md'
 row "Phase 1 ruTorrent" 'phase1-cert-*.md'
 row "Synthetic benchmark" 'report-*.md' "$BENCHMARK_DIR"

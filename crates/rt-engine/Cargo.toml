@@ -1,6 +1,6 @@
 [package]
 name = "rt-engine"
-description = "rtorrentNG: torrent engine — wires tracker, peers, storage, and session"
+description = "TorrentNG: torrent engine — wires tracker, peers, storage, and session"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

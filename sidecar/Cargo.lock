@@ -1429,7 +1429,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rtorrentng"
+name = "torrentng"
 version = "0.1.0"
 dependencies = [
  "anyhow",

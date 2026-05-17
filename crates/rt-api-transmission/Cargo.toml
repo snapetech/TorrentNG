@@ -1,6 +1,6 @@
 [package]
 name = "rt-api-transmission"
-description = "rtorrentNG: Transmission RPC compatibility facade"
+description = "TorrentNG: Transmission RPC compatibility facade"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

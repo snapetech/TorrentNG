@@ -26,7 +26,7 @@ export function FilterBar({ params, onChange }: Props) {
   }, [search, onChange])
 
   return (
-    <div className="rtng-filterbar" style={{
+    <div className="tng-filterbar" style={{
       display: 'flex',
       gap: 8,
       padding: '7px 12px',
@@ -35,7 +35,7 @@ export function FilterBar({ params, onChange }: Props) {
       alignItems: 'center',
       flexWrap: 'wrap',
     }}>
-      <label className="rtng-filterbar-search" style={{
+      <label className="tng-filterbar-search" style={{
         flex: '1 1 220px', minWidth: 0, display: 'flex', alignItems: 'center', gap: 7,
         background: 'var(--bg)', border: '1px solid ' + (search ? 'var(--accent)' : 'var(--border-strong)'), borderRadius: 6,
         padding: '0 9px',
@@ -73,7 +73,7 @@ export function FilterBar({ params, onChange }: Props) {
 
       {(params.filter || search) && (
         <button
-          className="rtng-filterbar-button"
+          className="tng-filterbar-button"
           type="button"
           aria-label="Clear torrent search"
           onClick={() => {
@@ -95,7 +95,7 @@ export function FilterBar({ params, onChange }: Props) {
       )}
       {hasSidebarFilters && (
         <button
-          className="rtng-filterbar-button"
+          className="tng-filterbar-button"
           type="button"
           aria-label="Clear sidebar filters"
           onClick={() => onChange({
@@ -121,7 +121,7 @@ export function FilterBar({ params, onChange }: Props) {
         </button>
       )}
       {hasSidebarFilters && (
-        <span className="rtng-filterbar-count" style={{
+        <span className="tng-filterbar-count" style={{
           color: 'var(--accent-text)', background: 'var(--accent-soft)', border: '1px solid var(--accent)',
           borderRadius: 999, padding: '2px 8px', fontSize: 11, fontWeight: 800, whiteSpace: 'nowrap',
         }}>
@@ -129,8 +129,8 @@ export function FilterBar({ params, onChange }: Props) {
         </span>
       )}
       {(chips.length > 0 || params.sort) && (
-        <div className="rtng-filterbar-chips" style={{ display: 'flex', gap: 5, flexWrap: 'wrap', minWidth: 0 }}>
-          <span className="rtng-filter-chip rtng-filter-chip-muted" title={`Sorted by ${sortLabel}`} style={{
+        <div className="tng-filterbar-chips" style={{ display: 'flex', gap: 5, flexWrap: 'wrap', minWidth: 0 }}>
+          <span className="tng-filter-chip tng-filter-chip-muted" title={`Sorted by ${sortLabel}`} style={{
             display: 'inline-flex', alignItems: 'center', gap: 4,
             maxWidth: 190, border: '1px solid var(--border)', borderRadius: 999,
             background: 'var(--surface)', color: 'var(--muted)', padding: '2px 7px',
@@ -140,7 +140,7 @@ export function FilterBar({ params, onChange }: Props) {
             <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{sortLabel}</span>
           </span>
           {chips.map(([label, value, key]) => (
-            <span key={`${label}:${value}`} className="rtng-filter-chip" title={value} style={{
+            <span key={`${label}:${value}`} className="tng-filter-chip" title={value} style={{
               display: 'inline-flex', alignItems: 'center', gap: 4,
               maxWidth: 190, border: '1px solid var(--border)', borderRadius: 999,
               background: 'var(--surface)', color: 'var(--muted)', padding: '2px 7px',

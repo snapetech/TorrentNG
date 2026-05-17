@@ -148,7 +148,7 @@ export function RssRulesPanel() {
           <EmptyState title="No RSS rules configured" detail="Create a rule above, then use match test to check titles before applying." />
         )}
         {rules.map(rule => (
-          <div key={rule.id} className="rtng-automation-row" data-enabled={rule.enabled ? 'true' : 'false'} style={{
+          <div key={rule.id} className="tng-automation-row" data-enabled={rule.enabled ? 'true' : 'false'} style={{
             display: 'grid', gridTemplateColumns: '140px minmax(260px, 1fr) 120px 120px 120px auto',
             minWidth: 860,
             gap: 8, alignItems: 'center', border: '1px solid var(--border)',
@@ -196,7 +196,7 @@ export function RssRulesPanel() {
       {applyResult && <Notice tone="ok">{applyResult}</Notice>}
       <div style={{ display: 'grid', gap: 6, maxWidth: 1080 }}>
         {matches.map(match => (
-          <div key={match.rule_id} className="rtng-rss-match" data-matched={match.matched ? 'true' : 'false'} style={{
+          <div key={match.rule_id} className="tng-rss-match" data-matched={match.matched ? 'true' : 'false'} style={{
             display: 'flex', alignItems: 'center', gap: 8, border: '1px solid var(--border)',
             borderRadius: 6, padding: '8px 10px', background: 'var(--surface)', fontSize: 12,
           }}>
@@ -279,8 +279,8 @@ function EmptyState({ title, detail }: { title: string; detail: string }) {
 function SkeletonRows({ count }: { count: number }) {
   return Array.from({ length: count }, (_, index) => (
     <div key={index} style={{ border: '1px solid var(--border)', borderRadius: 7, padding: '12px', background: 'var(--surface)' }}>
-      <span className="rtng-skeleton" style={{ width: '28%', height: 12, marginBottom: 10 }} />
-      <span className="rtng-skeleton" style={{ width: '82%', height: 10 }} />
+      <span className="tng-skeleton" style={{ width: '28%', height: 12, marginBottom: 10 }} />
+      <span className="tng-skeleton" style={{ width: '82%', height: 10 }} />
     </div>
   ))
 }

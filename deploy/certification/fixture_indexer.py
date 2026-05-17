@@ -7,10 +7,10 @@ from urllib.parse import parse_qs, urlparse
 
 
 PORT = int(os.environ.get("FIXTURE_INDEXER_PORT", "8082"))
-TORRENT_PATH = os.environ.get("FIXTURE_TORRENT_PATH", "/downloads/cert-fixture/rtng-fixture.torrent")
+TORRENT_PATH = os.environ.get("FIXTURE_TORRENT_PATH", "/downloads/cert-fixture/tng-fixture.torrent")
 PUBLIC_BASE = os.environ.get("FIXTURE_PUBLIC_BASE", f"http://localhost:{PORT}")
-TITLE = os.environ.get("FIXTURE_TITLE", "rtng-fixture.bin")
-GUID = os.environ.get("FIXTURE_GUID", "rtng-fixture-guid")
+TITLE = os.environ.get("FIXTURE_TITLE", "tng-fixture.bin")
+GUID = os.environ.get("FIXTURE_GUID", "tng-fixture-guid")
 SIZE = os.environ.get("FIXTURE_SIZE", "1048576")
 
 
@@ -19,7 +19,7 @@ def xml_response(body: str) -> bytes:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "rtng-fixture-indexer/1.0"
+    server_version = "tng-fixture-indexer/1.0"
 
     def log_message(self, fmt, *args):
         if os.environ.get("FIXTURE_LOG_REQUESTS") == "1":
@@ -34,7 +34,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
-        if parsed.path == "/download/rtng-fixture.torrent":
+        if parsed.path == "/download/tng-fixture.torrent":
             try:
                 with open(TORRENT_PATH, "rb") as torrent:
                     body = torrent.read()
@@ -63,7 +63,7 @@ class Handler(BaseHTTPRequestHandler):
         if mode == "caps":
             body = """
 <caps>
-  <server title="rtorrentNG Fixture Torznab" version="1.0"/>
+  <server title="TorrentNG Fixture Torznab" version="1.0"/>
   <limits max="100" default="100"/>
   <searching>
     <rss available="yes" supportedParams=""/>
@@ -88,11 +88,11 @@ class Handler(BaseHTTPRequestHandler):
         escaped_guid = html.escape(GUID)
         raw_torrent_url = f"{PUBLIC_BASE}/api?t=get&id={GUID}&apikey=fixture"
         torrent_url = html.escape(raw_torrent_url, quote=True)
-        comments_url = html.escape(f"{PUBLIC_BASE}/download/rtng-fixture.torrent", quote=True)
+        comments_url = html.escape(f"{PUBLIC_BASE}/download/tng-fixture.torrent", quote=True)
         body = f"""
 <rss version="2.0" xmlns:torznab="http://torznab.com/schemas/2015/feed">
   <channel>
-    <title>rtorrentNG Fixture Torznab</title>
+    <title>TorrentNG Fixture Torznab</title>
     <item>
       <title>{escaped_title}</title>
       <guid isPermaLink="false">{escaped_guid}</guid>

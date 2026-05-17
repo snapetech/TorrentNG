@@ -1,6 +1,6 @@
 [package]
 name = "rt-config"
-description = "rtorrentNG: rt-config"
+description = "TorrentNG: rt-config"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

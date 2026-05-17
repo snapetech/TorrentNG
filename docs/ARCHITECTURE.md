@@ -2,7 +2,7 @@
 
 ## Overview
 
-rtorrentNG now has two runtime modes serving one product goal: universal
+TorrentNG now has two runtime modes serving one product goal: universal
 compatibility for torrent operators who need to import, export, automate,
 interoperate, and eventually replace existing clients without rebuilding their
 workflow around one historical API.
@@ -10,7 +10,7 @@ workflow around one historical API.
 - **Native engine mode:** `rusttorrentd` is the source of truth. It owns torrent
   state, SQLite session persistence, tracker state, peer wire tasks, storage,
   rechecks, jobs, metrics, native REST/SSE, and compatibility API projections.
-- **Track 1 sidecar mode:** `sidecar/rtorrentng` remains available for existing
+- **Track 1 sidecar mode:** `sidecar/torrentng` remains available for existing
   rTorrent deployments. It talks to rTorrent over a trusted local SCGI socket,
   keeps a SQLite cache, and exposes the same WebUI and qBittorrent-compatible
   client surface while users migrate.
@@ -62,7 +62,7 @@ Track 1 sidecar mode keeps this separate compatibility shape:
 WebUI / automation clients
           │
           ▼
-sidecar/rtorrentng ── trusted XMLRPC over local SCGI ── rTorrent
+sidecar/torrentng ── trusted XMLRPC over local SCGI ── rTorrent
           │
           └── SQLite cache, auth, qBit/native facade, metrics
 ```
@@ -139,7 +139,7 @@ diagnostics.
 ## Track 1 Sidecar
 
 **Location:** `sidecar/`
-**Binary:** `rtorrentng`
+**Binary:** `torrentng`
 
 The sidecar remains a supported facade for rTorrent deployments and release
 compatibility certification. It is not required by native engine mode.
@@ -181,7 +181,7 @@ dry-run previews, storage/tracker views, saved views, and diagnostic actions.
 
 Native deployments run `rusttorrentd` with durable DB/metadata paths and storage
 roots. Sidecar deployments run the Phase 1 rTorrent bundle or host rTorrent plus
-`sidecar/rtorrentng`.
+`sidecar/torrentng`.
 
 The release evidence is split the same way:
 

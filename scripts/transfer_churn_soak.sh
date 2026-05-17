@@ -8,7 +8,7 @@ COMPOSE_NETWORK="${CERT_COMPOSE_NETWORK:-${COMPOSE_PROJECT}_default}"
 DOWNLOADS_VOLUME="${CERT_DOWNLOADS_VOLUME:-${COMPOSE_PROJECT}_downloads}"
 OUT="${1:-$ROOT/certification/reports/transfer-churn-$(date -u +%Y%m%dT%H%M%SZ).md}"
 
-ENV_RTNG_HOST_URL="${RTNG_HOST_URL:-}"
+ENV_TNG_HOST_URL="${TNG_HOST_URL:-}"
 if [[ -f "$ENV_FILE" ]]; then
   set -a
   # shellcheck disable=SC1090
@@ -16,9 +16,9 @@ if [[ -f "$ENV_FILE" ]]; then
   set +a
 fi
 
-RTNG_HOST_URL="${ENV_RTNG_HOST_URL:-${RTNG_HOST_URL:-http://localhost:${RTNG_HOST_PORT:-18080}}}"
-RTNG_API_TOKEN="${RTNG_API_TOKEN:-cert-token}"
-RTNG_CONTAINER="${RTNG_CONTAINER:-certification-rtorrentng-1}"
+TNG_HOST_URL="${ENV_TNG_HOST_URL:-${TNG_HOST_URL:-http://localhost:${TNG_HOST_PORT:-18080}}}"
+TNG_API_TOKEN="${TNG_API_TOKEN:-cert-token}"
+TNG_CONTAINER="${TNG_CONTAINER:-certification-torrentng-1}"
 CHURN_CYCLES="${TRANSFER_CHURN_CYCLES:-5}"
 FIXTURE_BYTES="${TRANSFER_CHURN_FIXTURE_BYTES:-16777216}"
 TRANSFER_TIMEOUT_SECS="${TRANSFER_CHURN_TIMEOUT_SECS:-180}"
@@ -27,17 +27,17 @@ PUBLIC_TORRENT_URL="${PUBLIC_TORRENT_URL:-https://mirror.arizona.edu/debian-cd/c
 PUBLIC_CYCLES="${TRANSFER_CHURN_PUBLIC_CYCLES:-0}"
 FIXTURE_ID="${TRANSFER_CHURN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 CATEGORY="cert-transfer-churn"
-TRACKER_NAME="rtng-churn-tracker-$FIXTURE_ID"
-FILESERVER_NAME="rtng-churn-files-$FIXTURE_ID"
-COOKIE_JAR="/tmp/rtng-churn-cookies-$FIXTURE_ID.txt"
-BODY="/tmp/rtng-churn-body-$FIXTURE_ID.txt"
+TRACKER_NAME="tng-churn-tracker-$FIXTURE_ID"
+FILESERVER_NAME="tng-churn-files-$FIXTURE_ID"
+COOKIE_JAR="/tmp/tng-churn-cookies-$FIXTURE_ID.txt"
+BODY="/tmp/tng-churn-body-$FIXTURE_ID.txt"
 
 mkdir -p "$(dirname "$OUT")"
 : > "$BODY"
 
-mapped="$(docker port "$RTNG_CONTAINER" 8080/tcp 2>/dev/null | sed -n 's/.*:\([0-9][0-9]*\)$/\1/p' | head -1 || true)"
-if [[ -n "$mapped" && "$RTNG_HOST_URL" == http://localhost:* ]]; then
-  RTNG_HOST_URL="http://localhost:$mapped"
+mapped="$(docker port "$TNG_CONTAINER" 8080/tcp 2>/dev/null | sed -n 's/.*:\([0-9][0-9]*\)$/\1/p' | head -1 || true)"
+if [[ -n "$mapped" && "$TNG_HOST_URL" == http://localhost:* ]]; then
+  TNG_HOST_URL="http://localhost:$mapped"
 fi
 
 status="PASS"
@@ -72,18 +72,18 @@ http_code() {
 }
 
 rss_mb() {
-  docker exec "$RTNG_CONTAINER" sh -lc "awk '/VmRSS:/ {printf \"%.1f\", \$2 / 1024}' /proc/1/status" 2>/dev/null || echo 0
+  docker exec "$TNG_CONTAINER" sh -lc "awk '/VmRSS:/ {printf \"%.1f\", \$2 / 1024}' /proc/1/status" 2>/dev/null || echo 0
 }
 
 delete_category_torrents() {
   local hashes
-  hashes="$(curl -ksS -b "$COOKIE_JAR" "$RTNG_HOST_URL/api/qb/v2/torrents/info?category=$CATEGORY" \
+  hashes="$(curl -ksS -b "$COOKIE_JAR" "$TNG_HOST_URL/api/qb/v2/torrents/info?category=$CATEGORY" \
     | jq -r '.[].hash' | paste -sd '|' -)"
   if [[ -n "$hashes" ]]; then
     curl -ksS -b "$COOKIE_JAR" -X POST \
       -d "hashes=$hashes" \
       -d "deleteFiles=true" \
-      "$RTNG_HOST_URL/api/qb/v2/torrents/delete" >/dev/null || true
+      "$TNG_HOST_URL/api/qb/v2/torrents/delete" >/dev/null || true
   fi
   return 0
 }
@@ -101,7 +101,7 @@ wait_for_completion() {
   local deadline=$((SECONDS + TRANSFER_TIMEOUT_SECS))
   while (( SECONDS < deadline )); do
     local row
-    row="$(curl -ksS -b "$COOKIE_JAR" "$RTNG_HOST_URL/api/qb/v2/torrents/info?category=$CATEGORY" \
+    row="$(curl -ksS -b "$COOKIE_JAR" "$TNG_HOST_URL/api/qb/v2/torrents/info?category=$CATEGORY" \
       | jq -c --arg name "$name" '.[] | select(.name==$name)' | head -1 || true)"
     if [[ -n "$row" && "$(jq -r '.progress >= 1' <<<"$row")" == "true" ]]; then
       printf '%s' "$row"
@@ -119,10 +119,10 @@ wait_for_completion() {
 }
 
 {
-  echo "# rtorrentNG Transfer Churn Soak"
+  echo "# TorrentNG Transfer Churn Soak"
   echo
   echo "- Date UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  echo "- rtorrentNG URL: $RTNG_HOST_URL"
+  echo "- TorrentNG URL: $TNG_HOST_URL"
   echo "- Docker network: $COMPOSE_NETWORK"
   echo "- Downloads volume: $DOWNLOADS_VOLUME"
   echo "- Local cycles: $CHURN_CYCLES"
@@ -138,7 +138,7 @@ wait_for_completion() {
   echo "|---|---|---|"
 } > "$OUT"
 
-code="$(http_code "$RTNG_HOST_URL/api/qb/v2/auth/login" -X POST -d "username=$RTNG_API_TOKEN" -d "password=$RTNG_API_TOKEN" -c "$COOKIE_JAR")"
+code="$(http_code "$TNG_HOST_URL/api/qb/v2/auth/login" -X POST -d "username=$TNG_API_TOKEN" -d "password=$TNG_API_TOKEN" -c "$COOKIE_JAR")"
 if [[ "$code" == "200" && "$(cat "$BODY")" == "Ok." ]]; then
   mark "qBit auth" "PASS" "session cookie accepted"
 else
@@ -168,9 +168,9 @@ mark "fixture file server" "PASS" "http://$FILESERVER_NAME:8081/"
 
 max_rss="0"
 for cycle in $(seq 1 "$CHURN_CYCLES"); do
-  name="rtng-churn-$FIXTURE_ID-$cycle.bin"
-  torrent="rtng-churn-$FIXTURE_ID-$cycle.torrent"
-  seeder="rtng-churn-seeder-$FIXTURE_ID-$cycle"
+  name="tng-churn-$FIXTURE_ID-$cycle.bin"
+  torrent="tng-churn-$FIXTURE_ID-$cycle.torrent"
+  seeder="tng-churn-seeder-$FIXTURE_ID-$cycle"
   seeders+=("$seeder")
 
   docker run --rm --network "$COMPOSE_NETWORK" -v "$DOWNLOADS_VOLUME:/downloads" alpine:3.20 sh -lc "
@@ -191,7 +191,7 @@ for cycle in $(seq 1 "$CHURN_CYCLES"); do
     -F "savepath=/data/transfer-churn/$cycle/leech" \
     -F "category=$CATEGORY" \
     -F "stopped=false" \
-    "$RTNG_HOST_URL/api/qb/v2/torrents/add" || true)"
+    "$TNG_HOST_URL/api/qb/v2/torrents/add" || true)"
 
   progress="0"
   downloaded="0"
@@ -217,9 +217,9 @@ for cycle in $(seq 1 "$PUBLIC_CYCLES"); do
     -F "savepath=/data/transfer-churn-public/$cycle" \
     -F "category=$CATEGORY" \
     -F "stopped=false" \
-    "$RTNG_HOST_URL/api/qb/v2/torrents/add" || true)"
+    "$TNG_HOST_URL/api/qb/v2/torrents/add" || true)"
   sleep 10
-  row="$(curl -ksS -b "$COOKIE_JAR" "$RTNG_HOST_URL/api/qb/v2/torrents/info?category=$CATEGORY" | jq -c '.[0] // empty' || true)"
+  row="$(curl -ksS -b "$COOKIE_JAR" "$TNG_HOST_URL/api/qb/v2/torrents/info?category=$CATEGORY" | jq -c '.[0] // empty' || true)"
   progress="$(jq -r '.progress // 0' <<<"${row:-{}}")"
   downloaded="$(jq -r '.downloaded // 0' <<<"${row:-{}}")"
   rss="$(rss_mb)"

@@ -1,6 +1,6 @@
 [package]
 name = "rt-metainfo"
-description = "rtorrentNG: rt-metainfo"
+description = "TorrentNG: rt-metainfo"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

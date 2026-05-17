@@ -1,6 +1,6 @@
 services:
-  rtorrentng:
-    image: rtorrentng:latest
+  torrentng:
+    image: torrentng:latest
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
@@ -16,16 +16,16 @@ services:
       - downloads:/data
       - session:/session
     environment:
-      RTORRENTNG_CONFIG: /config/config.toml
+      TORRENTNG_CONFIG: /config/config.toml
       RTORRENT_INCOMING_PORT: "50000"
       RTORRENT_SCGI_SOCKET: /run/rtorrent/rpc.sock
-      RTNG_SECRET_KEY: "${RTNG_SECRET_KEY:-change-me}"
-      RTNG_API_TOKENS: "${RTNG_API_TOKENS:-}"
-      RTNG_USER_AGENT: "${RTNG_USER_AGENT:-rtorrentNG/0.1.0 libtorrent/0.16.11}"
-      RTNG_QBITTORRENT_VERSION: "${RTNG_QBITTORRENT_VERSION:-5.0.0}"
-      RTNG_QBITTORRENT_WEBAPI_VERSION: "${RTNG_QBITTORRENT_WEBAPI_VERSION:-2.11.0}"
-      RTNG_QBITTORRENT_BUILD_LIBTORRENT: "${RTNG_QBITTORRENT_BUILD_LIBTORRENT:-0.16.11}"
-      RTNG_QBITTORRENT_BUILD_QT: "${RTNG_QBITTORRENT_BUILD_QT:-6.7.0}"
+      TNG_SECRET_KEY: "${TNG_SECRET_KEY:-change-me}"
+      TNG_API_TOKENS: "${TNG_API_TOKENS:-}"
+      TNG_USER_AGENT: "${TNG_USER_AGENT:-TorrentNG/0.1.0 libtorrent/0.16.11}"
+      TNG_QBITTORRENT_VERSION: "${TNG_QBITTORRENT_VERSION:-5.0.0}"
+      TNG_QBITTORRENT_WEBAPI_VERSION: "${TNG_QBITTORRENT_WEBAPI_VERSION:-2.11.0}"
+      TNG_QBITTORRENT_BUILD_LIBTORRENT: "${TNG_QBITTORRENT_BUILD_LIBTORRENT:-0.16.11}"
+      TNG_QBITTORRENT_BUILD_QT: "${TNG_QBITTORRENT_BUILD_QT:-6.7.0}"
     healthcheck:
       test: ["CMD", "/bin/sh", "-c", "test -S /run/rtorrent/rpc.sock && wget -qO- http://localhost:8080/health >/dev/null"]
       interval: 15s
@@ -40,7 +40,7 @@ services:
     volumes:
       - ../nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:
-      - rtorrentng
+      - torrentng
 
 volumes:
   downloads:

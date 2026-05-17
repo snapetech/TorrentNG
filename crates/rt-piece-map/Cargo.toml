@@ -1,6 +1,6 @@
 [package]
 name = "rt-piece-map"
-description = "rtorrentNG: rt-piece-map"
+description = "TorrentNG: rt-piece-map"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

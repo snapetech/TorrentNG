@@ -12,17 +12,17 @@ if [[ -f "$ENV_FILE" ]]; then
   set +a
 fi
 
-RTNG_API_TOKEN="${RTNG_API_TOKEN:-cert-token}"
-RTNG_HOST_URL="${RTNG_HOST_URL:-http://localhost:${RTNG_HOST_PORT:-18080}}"
+TNG_API_TOKEN="${TNG_API_TOKEN:-cert-token}"
+TNG_HOST_URL="${TNG_HOST_URL:-http://localhost:${TNG_HOST_PORT:-18080}}"
 PROWLARR_CONTAINER="${PROWLARR_CONTAINER:-certification-prowlarr-1}"
-RTNG_CONTAINER="${RTNG_CONTAINER:-certification-rtorrentng-1}"
+TNG_CONTAINER="${TNG_CONTAINER:-certification-torrentng-1}"
 NETWORK="${CERT_DOCKER_NETWORK:-certification_default}"
 DOWNLOADS_VOLUME="${CERT_DOWNLOADS_VOLUME:-certification_downloads}"
 FIXTURE_BYTES="${FIXTURE_BYTES:-1048576}"
 FIXTURE_ID="fixture-$(date -u +%Y%m%dT%H%M%SZ)"
-TRACKER_NAME="rtng-app-tracker-$FIXTURE_ID"
-INDEXER_NAME="rtng-fixture-indexer-$FIXTURE_ID"
-SEEDER_NAME="rtng-app-seeder-$FIXTURE_ID"
+TRACKER_NAME="tng-app-tracker-$FIXTURE_ID"
+INDEXER_NAME="tng-fixture-indexer-$FIXTURE_ID"
+SEEDER_NAME="tng-app-seeder-$FIXTURE_ID"
 COOKIE_JAR="$(mktemp)"
 BODY="$(mktemp)"
 
@@ -42,7 +42,7 @@ mapped_host_url() {
   fi
 }
 
-RTNG_HOST_URL="$(mapped_host_url "$RTNG_HOST_URL" "$RTNG_CONTAINER" 8080)"
+TNG_HOST_URL="$(mapped_host_url "$TNG_HOST_URL" "$TNG_CONTAINER" 8080)"
 
 cleanup() {
   docker rm -f "$TRACKER_NAME" "$INDEXER_NAME" "$SEEDER_NAME" >/dev/null 2>&1 || true
@@ -70,7 +70,7 @@ wait_for_torrent() {
   local name="$1"
   local deadline=$((SECONDS + 120))
   while (( SECONDS < deadline )); do
-    row="$(curl -ksS -b "$COOKIE_JAR" "$RTNG_HOST_URL/api/qb/v2/torrents/info" \
+    row="$(curl -ksS -b "$COOKIE_JAR" "$TNG_HOST_URL/api/qb/v2/torrents/info" \
       | jq -c --arg name "$name" '.[] | select(.name==$name) | select((.progress // 0) >= 1)' | head -1)"
     if [[ -n "$row" ]]; then
       printf '%s\n' "$row"
@@ -82,10 +82,10 @@ wait_for_torrent() {
 }
 
 {
-  echo "# rtorrentNG App-Driven Add Job Certification"
+  echo "# TorrentNG App-Driven Add Job Certification"
   echo
   echo "- Date UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  echo "- App path: Prowlarr Torznab search -> Prowlarr grab -> qBittorrent-compatible rtorrentNG client"
+  echo "- App path: Prowlarr Torznab search -> Prowlarr grab -> qBittorrent-compatible TorrentNG client"
   echo
   echo "## Checks"
   echo
@@ -93,7 +93,7 @@ wait_for_torrent() {
   echo "|---|---|---|"
 } > "$OUT"
 
-code="$(curl -ksS -o "$BODY" -w '%{http_code}' "$RTNG_HOST_URL/api/qb/v2/auth/login" -X POST -d "username=$RTNG_API_TOKEN" -d "password=$RTNG_API_TOKEN" -c "$COOKIE_JAR")"
+code="$(curl -ksS -o "$BODY" -w '%{http_code}' "$TNG_HOST_URL/api/qb/v2/auth/login" -X POST -d "username=$TNG_API_TOKEN" -d "password=$TNG_API_TOKEN" -c "$COOKIE_JAR")"
 if [[ "$code" == "200" ]]; then
   mark "qBit auth" "PASS" "session cookie accepted"
 else
@@ -108,8 +108,8 @@ docker run --rm --network "$NETWORK" -v "$DOWNLOADS_VOLUME:/downloads" alpine:3.
   apk add --no-cache mktorrent >/dev/null
   rm -rf /downloads/cert-fixture
   mkdir -p /downloads/cert-fixture/seed /downloads/cert-fixture/leech
-  dd if=/dev/urandom of=/downloads/cert-fixture/seed/rtng-fixture.bin bs=$FIXTURE_BYTES count=1 status=none
-  mktorrent -a http://$TRACKER_NAME:6969/announce -o /downloads/cert-fixture/rtng-fixture.torrent /downloads/cert-fixture/seed/rtng-fixture.bin >/dev/null
+  dd if=/dev/urandom of=/downloads/cert-fixture/seed/tng-fixture.bin bs=$FIXTURE_BYTES count=1 status=none
+  mktorrent -a http://$TRACKER_NAME:6969/announce -o /downloads/cert-fixture/tng-fixture.torrent /downloads/cert-fixture/seed/tng-fixture.bin >/dev/null
 "
 mark "fixture torrent" "PASS" "$FIXTURE_BYTES byte torrent generated"
 
@@ -123,7 +123,7 @@ docker run -d --rm --name "$INDEXER_NAME" --network "$NETWORK" \
 
 docker run -d --rm --name "$SEEDER_NAME" --network "$NETWORK" \
   -v "$DOWNLOADS_VOLUME:/downloads" \
-  alpine:3.20 sh -lc 'apk add --no-cache transmission-cli >/dev/null && exec transmission-cli -w /downloads/cert-fixture/seed /downloads/cert-fixture/rtng-fixture.torrent' >/dev/null
+  alpine:3.20 sh -lc 'apk add --no-cache transmission-cli >/dev/null && exec transmission-cli -w /downloads/cert-fixture/seed /downloads/cert-fixture/tng-fixture.torrent' >/dev/null
 mark "stock seeder" "PASS" "$SEEDER_NAME seeding fixture"
 
 for _ in $(seq 1 30); do
@@ -141,7 +141,7 @@ PROWLARR_BASE_URL="$(mapped_host_url "$PROWLARR_BASE_URL" "$PROWLARR_CONTAINER" 
 schema="$(curl -fsS -H "X-Api-Key: $PROWLARR_API_KEY" "$PROWLARR_BASE_URL/api/v1/indexer/schema" | jq 'map(select(.implementation=="Torznab"))[0]')"
 payload="$(printf '%s' "$schema" | jq --arg base "http://$INDEXER_NAME:8082" --arg key "fixture" '
   .enable=true
-  | .name="rtorrentNG Fixture Torznab"
+  | .name="TorrentNG Fixture Torznab"
   | .appProfileId=1
   | .fields |= map(
       if .name=="baseUrl" then .value=$base
@@ -151,7 +151,7 @@ payload="$(printf '%s' "$schema" | jq --arg base "http://$INDEXER_NAME:8082" --a
       else . end
     )')"
 
-existing_id="$(curl -fsS -H "X-Api-Key: $PROWLARR_API_KEY" "$PROWLARR_BASE_URL/api/v1/indexer" | jq -r '.[] | select(.name=="rtorrentNG Fixture Torznab") | .id' | head -1)"
+existing_id="$(curl -fsS -H "X-Api-Key: $PROWLARR_API_KEY" "$PROWLARR_BASE_URL/api/v1/indexer" | jq -r '.[] | select(.name=="TorrentNG Fixture Torznab") | .id' | head -1)"
 if [[ -n "$existing_id" ]]; then
   payload="$(printf '%s' "$payload" | jq --argjson id "$existing_id" '.id=$id')"
   code="$(curl -ksS -o "$BODY" -w '%{http_code}' -H "X-Api-Key: $PROWLARR_API_KEY" -H 'Content-Type: application/json' -X PUT -d "$payload" "$PROWLARR_BASE_URL/api/v1/indexer/$existing_id")"
@@ -167,7 +167,7 @@ else
   echo >> "$OUT"; echo "Overall status: $status" >> "$OUT"; echo "$OUT"; exit 1
 fi
 
-search_body="$(curl -fsS -G -H "X-Api-Key: $PROWLARR_API_KEY" "$PROWLARR_BASE_URL/api/v1/search" --data-urlencode "query=rtng-fixture" --data-urlencode "indexerIds=$indexer_id")"
+search_body="$(curl -fsS -G -H "X-Api-Key: $PROWLARR_API_KEY" "$PROWLARR_BASE_URL/api/v1/search" --data-urlencode "query=tng-fixture" --data-urlencode "indexerIds=$indexer_id")"
 release="$(printf '%s' "$search_body" | jq -c '.[0] // empty')"
 if [[ -n "$release" ]]; then
   mark "Prowlarr fixture search" "PASS" "$(printf '%s' "$release" | jq -r '.title')"
@@ -178,12 +178,12 @@ fi
 
 code="$(curl -ksS -o "$BODY" -w '%{http_code}' -H "X-Api-Key: $PROWLARR_API_KEY" -H 'Content-Type: application/json' -X POST -d "$release" "$PROWLARR_BASE_URL/api/v1/search")"
 if [[ "$code" == "200" || "$code" == "201" || "$code" == "202" ]]; then
-  mark "Prowlarr grab" "PASS" "release submitted to rtorrentNG qBit client"
+  mark "Prowlarr grab" "PASS" "release submitted to TorrentNG qBit client"
 else
   mark "Prowlarr grab" "FAIL" "HTTP $code $(tr '\n' ' ' <"$BODY")"
 fi
 
-if row="$(wait_for_torrent "rtng-fixture.bin")"; then
+if row="$(wait_for_torrent "tng-fixture.bin")"; then
   mark "app-driven fixture transfer" "PASS" "$(jq -r '"progress=\(.progress) size=\(.size) downloaded=\(.downloaded)"' <<<"$row")"
 else
   mark "app-driven fixture transfer" "FAIL" "fixture did not complete within timeout"

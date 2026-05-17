@@ -1,6 +1,6 @@
 [package]
 name = "rt-peer-wire"
-description = "rtorrentNG: BEP 3 peer wire protocol codec"
+description = "TorrentNG: BEP 3 peer wire protocol codec"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -37,7 +37,7 @@ run_gate() {
 }
 
 {
-  echo "# rtorrentNG Post-Soak Release Gate"
+  echo "# TorrentNG Post-Soak Release Gate"
   echo
   echo "- Date UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "- Source soak report: ${REPORT:-missing}"

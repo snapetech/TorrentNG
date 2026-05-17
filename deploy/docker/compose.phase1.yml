@@ -1,10 +1,10 @@
 services:
-  rtorrentng-phase1:
+  torrentng-phase1:
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile.phase1
-    image: rtorrentng-phase1:latest
-    container_name: rtorrentng-phase1
+    image: torrentng-phase1:latest
+    container_name: torrentng-phase1
     restart: unless-stopped
     security_opt:
       - seccomp:unconfined

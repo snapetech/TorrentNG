@@ -3,7 +3,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { api } from '../api/client'
 
 const PRESETS = [
-  { label: 'rtorrentNG (default)', value: 'rtorrentNG/0.1.0 libtorrent/0.16.11' },
+  { label: 'TorrentNG (default)', value: 'TorrentNG/0.1.0 libtorrent/0.16.11' },
   { label: 'rTorrent 0.16.11',     value: 'rtorrent/0.16.11' },
   { label: 'libtorrent 0.16.11',   value: 'libtorrent/0.16.11' },
   { label: 'qBittorrent 5.0.0',    value: 'qBittorrent/5.0.0' },
@@ -51,13 +51,13 @@ export function UserAgentPanel() {
         }}>Unsaved</span>}
       </div>
 
-      <div className="rtng-card rtng-identity-panel" data-dirty={isDirty ? 'true' : 'false'} style={panelStyle}>
+      <div className="tng-card tng-identity-panel" data-dirty={isDirty ? 'true' : 'false'} style={panelStyle}>
         <div style={{ fontSize: 12, fontWeight: 800, color: 'var(--text)', marginBottom: 10 }}>Preset identity</div>
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 12 }}>
           {PRESETS.map(p => (
             <button
               key={p.value}
-              className="rtng-preset-button"
+              className="tng-preset-button"
               data-active={draft === p.value ? 'true' : 'false'}
               onClick={() => setDraft(p.value)}
               disabled={mutation.isPending}
@@ -114,7 +114,7 @@ export function UserAgentPanel() {
         )}
       </div>
 
-      <div className="rtng-metric-tile" style={currentStyle}>
+      <div className="tng-metric-tile" style={currentStyle}>
         <span style={{ color: 'var(--faint)', fontWeight: 800, textTransform: 'uppercase', fontSize: 10 }}>Current</span>
         <span style={{ fontFamily: 'monospace', color: 'var(--muted)', overflowWrap: 'anywhere' }}>{data?.user_agent ?? '…'}</span>
       </div>

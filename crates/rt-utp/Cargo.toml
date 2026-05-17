@@ -1,6 +1,6 @@
 [package]
 name = "rt-utp"
-description = "rtorrentNG: BEP 29 uTP header codec and connection state"
+description = "TorrentNG: BEP 29 uTP header codec and connection state"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

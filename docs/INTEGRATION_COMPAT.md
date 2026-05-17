@@ -1,6 +1,6 @@
 # Integration Compatibility Harness
 
-rtorrentNG has compatibility coverage for both runtime modes. The target is
+TorrentNG has compatibility coverage for both runtime modes. The target is
 universal in/out compatibility: client imports, API facades, automation flows,
 and wire-level interop all need evidence before they are considered complete.
 
@@ -57,7 +57,7 @@ NATIVE_ENGINE_URL=http://127.0.0.1:8080 scripts/native_engine_certification_repo
 Live certification:
 
 ```bash
-RTNG_HOST_URL=http://localhost:28080 ./scripts/mobile_compat_certification.sh
+TNG_HOST_URL=http://localhost:28080 ./scripts/mobile_compat_certification.sh
 ```
 
 The live script exercises NZB360/Transdrone-style read flows against both qBittorrent prefixes (`/api/qb/v2` and `/api/v2`): auth, app info, preferences, transfer info, torrent list filters, properties, and full/delta `sync/maindata`.

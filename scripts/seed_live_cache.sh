@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-RTNG_CONTAINER="${RTNG_CONTAINER:-certification-rtorrentng-1}"
-COUNT="${RTNG_SEED_TORRENTS:-15000}"
-DB_PATH="${RTNG_CACHE_DB_PATH:-/var/lib/rtorrentng/cache.db}"
-CATEGORY="${RTNG_SEED_CATEGORY:-cert-scale}"
-BASE_UPDATED_AT="${RTNG_SEED_BASE_UPDATED_AT:-$(date +%s)}"
+TNG_CONTAINER="${TNG_CONTAINER:-certification-torrentng-1}"
+COUNT="${TNG_SEED_TORRENTS:-15000}"
+DB_PATH="${TNG_CACHE_DB_PATH:-/var/lib/torrentng/cache.db}"
+CATEGORY="${TNG_SEED_CATEGORY:-cert-scale}"
+BASE_UPDATED_AT="${TNG_SEED_BASE_UPDATED_AT:-$(date +%s)}"
 
-docker exec -i "$RTNG_CONTAINER" sh -s "$COUNT" "$DB_PATH" "$CATEGORY" "$BASE_UPDATED_AT" <<'SH'
+docker exec -i "$TNG_CONTAINER" sh -s "$COUNT" "$DB_PATH" "$CATEGORY" "$BASE_UPDATED_AT" <<'SH'
 set -euo pipefail
 count="$1"
 db="$2"

@@ -1,16 +1,16 @@
 [package]
-name = "rtorrentng"
+name = "torrentng"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
 license = "AGPL-3.0-or-later OR LicenseRef-Commercial"
 
 [lib]
-name = "rtorrentng"
+name = "torrentng"
 path = "src/lib.rs"
 
 [[bin]]
-name = "rtorrentng"
+name = "torrentng"
 path = "src/main.rs"
 
 [dependencies]

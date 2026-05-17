@@ -1,0 +1,15 @@
+[Unit]
+Description=TorrentNG VPN forwarded-port watcher
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/keith/Documents/code/TorrentNG
+EnvironmentFile=-/etc/torrentng/vpn-forward-watch.env
+ExecStart=/home/keith/Documents/code/TorrentNG/scripts/vpn/tng_vpn_forward_watch.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

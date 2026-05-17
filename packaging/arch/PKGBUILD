@@ -1,16 +1,16 @@
-# Maintainer: rtorrentNG contributors
+# Maintainer: TorrentNG contributors
 pkgname=rusttorrentd-git
 pkgver=0.1.0
 pkgrel=1
-pkgdesc="rtorrentNG native Rust BitTorrent daemon"
+pkgdesc="TorrentNG native Rust BitTorrent daemon"
 arch=("x86_64")
-url="https://github.com/rtorrentng/rtorrentng"
+url="https://github.com/torrentng/torrentng"
 license=("GPL-3.0-or-later")
 depends=("gcc-libs" "sqlite")
 makedepends=("cargo" "git")
 backup=("etc/rusttorrentd/config.toml")
 source=(
-  "git+https://github.com/rtorrentng/rtorrentng.git"
+  "git+https://github.com/torrentng/torrentng.git"
   "rusttorrentd.service"
   "rusttorrentd.sysusers"
   "rusttorrentd.tmpfiles"
@@ -18,22 +18,22 @@ source=(
 sha256sums=("SKIP" "SKIP" "SKIP" "SKIP")
 
 pkgver() {
-  cd rtorrentng
+  cd torrentng
   git describe --tags --long --always | sed "s/^v//;s/-/./g"
 }
 
 build() {
-  cd rtorrentng
+  cd torrentng
   cargo build --release --locked -p rusttorrentd
 }
 
 check() {
-  cd rtorrentng
+  cd torrentng
   cargo test --locked -p rusttorrentd -p rt-config -p rt-api-native
 }
 
 package() {
-  cd rtorrentng
+  cd torrentng
   install -Dm755 target/release/rusttorrentd "$pkgdir/usr/bin/rusttorrentd"
   install -Dm644 deploy/native/config.toml "$pkgdir/etc/rusttorrentd/config.toml"
   install -Dm644 "$srcdir/rusttorrentd.service" "$pkgdir/usr/lib/systemd/system/rusttorrentd.service"

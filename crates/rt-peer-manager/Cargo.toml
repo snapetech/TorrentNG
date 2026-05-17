@@ -1,6 +1,6 @@
 [package]
 name = "rt-peer-manager"
-description = "rtorrentNG: peer connection pool, choking, and upload accounting"
+description = "TorrentNG: peer connection pool, choking, and upload accounting"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

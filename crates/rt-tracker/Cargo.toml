@@ -1,6 +1,6 @@
 [package]
 name = "rt-tracker"
-description = "rtorrentNG: HTTP/UDP tracker announce, BEP 3/12/15/23/27"
+description = "TorrentNG: HTTP/UDP tracker announce, BEP 3/12/15/23/27"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

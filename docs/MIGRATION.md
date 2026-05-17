@@ -1,6 +1,6 @@
 # Migration Guide
 
-This guide covers moving existing client state into rtorrentNG. The migration
+This guide covers moving existing client state into TorrentNG. The migration
 goal is the import side of universal compatibility: preserve the torrent
 metadata, paths, labels/categories/tags, counters, file priorities, and resume
 state that other clients have accumulated wherever the source format makes that
@@ -133,7 +133,7 @@ rows, transfer counters, and ratio.
 
 Operator-facing CLI wiring can use the native migration crate directly from
 integration tooling. Manual fallback remains available: load each `.torrent`
-through the rtorrentNG API, pointing at the existing file path, then let the
+through the TorrentNG API, pointing at the existing file path, then let the
 native recheck job verify and resume without downloading.
 
 ---
@@ -149,11 +149,11 @@ native recheck job verify and resume without downloading.
 ### Procedure
 
 The native migration crate imports Transmission torrent and resume state into
-the rtorrentNG session DB. Use a dry-run report first, back up the native DB,
+the TorrentNG session DB. Use a dry-run report first, back up the native DB,
 then apply the import from integration tooling. Manual fallback remains:
 
 1. Export torrent files from Transmission (right-click → "Export .torrent")
-2. Add each via the rtorrentNG API, pointing to the existing download path
+2. Add each via the TorrentNG API, pointing to the existing download path
 3. Run a native recheck job so verified pieces resume without re-downloading
 
 ---

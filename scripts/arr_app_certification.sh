@@ -12,7 +12,7 @@ if [[ -f "$ENV_FILE" ]]; then
   set +a
 fi
 
-RTNG_CONTAINER="${RTNG_CONTAINER:-certification-rtorrentng-1}"
+TNG_CONTAINER="${TNG_CONTAINER:-certification-torrentng-1}"
 SONARR_CONTAINER="${SONARR_CONTAINER:-certification-sonarr-1}"
 RADARR_CONTAINER="${RADARR_CONTAINER:-certification-radarr-1}"
 NETWORK="${CERT_DOCKER_NETWORK:-certification_default}"
@@ -20,13 +20,13 @@ DOWNLOADS_VOLUME="${CERT_DOWNLOADS_VOLUME:-certification_downloads}"
 FIXTURE_BYTES="${FIXTURE_BYTES:-1048576}"
 ARR_GRAB="${ARR_GRAB:-0}"
 FIXTURE_ID="arr-$(date -u +%Y%m%dT%H%M%SZ)"
-TRACKER_NAME="rtng-arr-tracker-$FIXTURE_ID"
-SONARR_SEEDER_NAME="rtng-arr-sonarr-seeder-$FIXTURE_ID"
-RADARR_SEEDER_NAME="rtng-arr-radarr-seeder-$FIXTURE_ID"
-SONARR_INDEXER_NAME="rtorrentNG Sonarr Fixture"
-RADARR_INDEXER_NAME="rtorrentNG Radarr Fixture"
-SONARR_INDEXER_CONTAINER="rtng-sonarr-indexer-$FIXTURE_ID"
-RADARR_INDEXER_CONTAINER="rtng-radarr-indexer-$FIXTURE_ID"
+TRACKER_NAME="tng-arr-tracker-$FIXTURE_ID"
+SONARR_SEEDER_NAME="tng-arr-sonarr-seeder-$FIXTURE_ID"
+RADARR_SEEDER_NAME="tng-arr-radarr-seeder-$FIXTURE_ID"
+SONARR_INDEXER_NAME="TorrentNG Sonarr Fixture"
+RADARR_INDEXER_NAME="TorrentNG Radarr Fixture"
+SONARR_INDEXER_CONTAINER="tng-sonarr-indexer-$FIXTURE_ID"
+RADARR_INDEXER_CONTAINER="tng-radarr-indexer-$FIXTURE_ID"
 COOKIE_JAR="$(mktemp)"
 BODY="$(mktemp)"
 
@@ -197,7 +197,7 @@ wait_for_torrent() {
   local name="$1"
   local deadline=$((SECONDS + 150))
   while (( SECONDS < deadline )); do
-    row="$(curl -ksS -b "$COOKIE_JAR" "$RTNG_HOST_URL/api/qb/v2/torrents/info" \
+    row="$(curl -ksS -b "$COOKIE_JAR" "$TNG_HOST_URL/api/qb/v2/torrents/info" \
       | jq -c --arg name "$name" '.[] | select(.name==$name) | select((.progress // 0) >= 1)' | head -1)"
     if [[ -n "$row" ]]; then
       printf '%s\n' "$row"
@@ -218,7 +218,7 @@ grab_release() {
 
   code="$(curl -ksS -o "$BODY" -w '%{http_code}' -H "X-Api-Key: $key" -H 'Content-Type: application/json' -X POST -d "$release" "$base/api/v3/release")"
   if [[ "$code" == "200" || "$code" == "201" || "$code" == "202" ]]; then
-    mark "$label release grab" "PASS" "submitted to qBittorrent-compatible rtorrentNG client"
+    mark "$label release grab" "PASS" "submitted to qBittorrent-compatible TorrentNG client"
   else
     mark "$label release grab" "FAIL" "HTTP $code $(tr '\n' ' ' <"$BODY")"
     return
@@ -232,7 +232,7 @@ grab_release() {
 }
 
 {
-  echo "# rtorrentNG Sonarr/Radarr App Certification"
+  echo "# TorrentNG Sonarr/Radarr App Certification"
   echo
   echo "- Date UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "- Scope: app indexer test, app search/cache, torrent URL availability, and optional app release grab/transfer"
@@ -245,9 +245,9 @@ grab_release() {
 
 SONARR_BASE="$(mapped_host_url "$SONARR_CONTAINER" 8989)"
 RADARR_BASE="$(mapped_host_url "$RADARR_CONTAINER" 7878)"
-RTNG_API_TOKEN="${RTNG_API_TOKEN:-cert-token}"
-RTNG_HOST_URL="${RTNG_HOST_URL:-http://localhost:${RTNG_HOST_PORT:-18080}}"
-RTNG_HOST_URL="$(mapped_host_url "$RTNG_CONTAINER" 8080)"
+TNG_API_TOKEN="${TNG_API_TOKEN:-cert-token}"
+TNG_HOST_URL="${TNG_HOST_URL:-http://localhost:${TNG_HOST_PORT:-18080}}"
+TNG_HOST_URL="$(mapped_host_url "$TNG_CONTAINER" 8080)"
 SONARR_KEY="${SONARR_API_KEY_OVERRIDE:-$(api_key_from_container "$SONARR_CONTAINER")}"
 RADARR_KEY="${RADARR_API_KEY_OVERRIDE:-$(api_key_from_container "$RADARR_CONTAINER")}"
 
@@ -256,31 +256,31 @@ docker run --rm --network "$NETWORK" -v "$DOWNLOADS_VOLUME:/downloads" alpine:3.
   apk add --no-cache mktorrent >/dev/null
   rm -rf /downloads/cert-arr-fixture
   mkdir -p /downloads/cert-arr-fixture/sonarr-seed /downloads/cert-arr-fixture/radarr-seed
-  dd if=/dev/urandom of=/downloads/cert-arr-fixture/sonarr-seed/rtng-sonarr-fixture.bin bs=$FIXTURE_BYTES count=1 status=none
-  dd if=/dev/urandom of=/downloads/cert-arr-fixture/radarr-seed/rtng-radarr-fixture.bin bs=$FIXTURE_BYTES count=1 status=none
-  mktorrent -a http://$TRACKER_NAME:6969/announce -o /downloads/cert-arr-fixture/rtng-sonarr-fixture.torrent /downloads/cert-arr-fixture/sonarr-seed/rtng-sonarr-fixture.bin >/dev/null
-  mktorrent -a http://$TRACKER_NAME:6969/announce -o /downloads/cert-arr-fixture/rtng-radarr-fixture.torrent /downloads/cert-arr-fixture/radarr-seed/rtng-radarr-fixture.bin >/dev/null
+  dd if=/dev/urandom of=/downloads/cert-arr-fixture/sonarr-seed/tng-sonarr-fixture.bin bs=$FIXTURE_BYTES count=1 status=none
+  dd if=/dev/urandom of=/downloads/cert-arr-fixture/radarr-seed/tng-radarr-fixture.bin bs=$FIXTURE_BYTES count=1 status=none
+  mktorrent -a http://$TRACKER_NAME:6969/announce -o /downloads/cert-arr-fixture/tng-sonarr-fixture.torrent /downloads/cert-arr-fixture/sonarr-seed/tng-sonarr-fixture.bin >/dev/null
+  mktorrent -a http://$TRACKER_NAME:6969/announce -o /downloads/cert-arr-fixture/tng-radarr-fixture.torrent /downloads/cert-arr-fixture/radarr-seed/tng-radarr-fixture.bin >/dev/null
 "
 docker run -d --rm --name "$SONARR_SEEDER_NAME" --network "$NETWORK" -v "$DOWNLOADS_VOLUME:/downloads" \
-  alpine:3.20 sh -lc 'apk add --no-cache transmission-cli >/dev/null && exec transmission-cli -w /downloads/cert-arr-fixture/sonarr-seed /downloads/cert-arr-fixture/rtng-sonarr-fixture.torrent' >/dev/null
+  alpine:3.20 sh -lc 'apk add --no-cache transmission-cli >/dev/null && exec transmission-cli -w /downloads/cert-arr-fixture/sonarr-seed /downloads/cert-arr-fixture/tng-sonarr-fixture.torrent' >/dev/null
 docker run -d --rm --name "$RADARR_SEEDER_NAME" --network "$NETWORK" -v "$DOWNLOADS_VOLUME:/downloads" \
-  alpine:3.20 sh -lc 'apk add --no-cache transmission-cli >/dev/null && exec transmission-cli -w /downloads/cert-arr-fixture/radarr-seed /downloads/cert-arr-fixture/rtng-radarr-fixture.torrent' >/dev/null
+  alpine:3.20 sh -lc 'apk add --no-cache transmission-cli >/dev/null && exec transmission-cli -w /downloads/cert-arr-fixture/radarr-seed /downloads/cert-arr-fixture/tng-radarr-fixture.torrent' >/dev/null
 mark "fixture torrents" "PASS" "separate $FIXTURE_BYTES byte Sonarr/Radarr torrents and stock seeders ready"
 
 docker run -d --rm --name "$SONARR_INDEXER_CONTAINER" --network "$NETWORK" \
   -v "$DOWNLOADS_VOLUME:/downloads" \
   -v "$ROOT/deploy/certification/fixture_indexer.py:/fixture_indexer.py:ro" \
   -e "FIXTURE_PUBLIC_BASE=http://$SONARR_INDEXER_CONTAINER:8082" \
-  -e "FIXTURE_TORRENT_PATH=/downloads/cert-arr-fixture/rtng-sonarr-fixture.torrent" \
-  -e "FIXTURE_TITLE=Breaking.Bad.S01E01.1080p.WEB-DL-RTNG" \
+  -e "FIXTURE_TORRENT_PATH=/downloads/cert-arr-fixture/tng-sonarr-fixture.torrent" \
+  -e "FIXTURE_TITLE=Breaking.Bad.S01E01.1080p.WEB-DL-TNG" \
   -e "FIXTURE_GUID=$FIXTURE_ID-sonarr" \
   python:3-alpine python /fixture_indexer.py >/dev/null
 docker run -d --rm --name "$RADARR_INDEXER_CONTAINER" --network "$NETWORK" \
   -v "$DOWNLOADS_VOLUME:/downloads" \
   -v "$ROOT/deploy/certification/fixture_indexer.py:/fixture_indexer.py:ro" \
   -e "FIXTURE_PUBLIC_BASE=http://$RADARR_INDEXER_CONTAINER:8082" \
-  -e "FIXTURE_TORRENT_PATH=/downloads/cert-arr-fixture/rtng-radarr-fixture.torrent" \
-  -e "FIXTURE_TITLE=The.Matrix.1999.1080p.WEB-DL-RTNG" \
+  -e "FIXTURE_TORRENT_PATH=/downloads/cert-arr-fixture/tng-radarr-fixture.torrent" \
+  -e "FIXTURE_TITLE=The.Matrix.1999.1080p.WEB-DL-TNG" \
   -e "FIXTURE_GUID=$FIXTURE_ID-radarr" \
   python:3-alpine python /fixture_indexer.py >/dev/null
 
@@ -298,7 +298,7 @@ radarr_indexer_id="$(create_indexer "Radarr" "$RADARR_BASE" "$RADARR_KEY" "$RADA
 [[ -n "$radarr_indexer_id" ]] || status="FAIL"
 
 if [[ "$ARR_GRAB" == "1" ]]; then
-  code="$(curl -ksS -o "$BODY" -w '%{http_code}' "$RTNG_HOST_URL/api/qb/v2/auth/login" -X POST -d "username=$RTNG_API_TOKEN" -d "password=$RTNG_API_TOKEN" -c "$COOKIE_JAR")"
+  code="$(curl -ksS -o "$BODY" -w '%{http_code}' "$TNG_HOST_URL/api/qb/v2/auth/login" -X POST -d "username=$TNG_API_TOKEN" -d "password=$TNG_API_TOKEN" -c "$COOKIE_JAR")"
   if [[ "$code" == "200" ]]; then
     mark "qBit auth" "PASS" "session cookie accepted for transfer verification"
   else
@@ -314,7 +314,7 @@ if [[ -n "$sonarr_indexer_id" ]]; then
     mark "Sonarr fixture search" "PASS" "releases=$releases"
     if [[ "$ARR_GRAB" == "1" ]]; then
       release="$(jq -c '.[0]' "$BODY")"
-      grab_release "Sonarr" "$SONARR_BASE" "$SONARR_KEY" "rtng-sonarr-fixture.bin" "$release"
+      grab_release "Sonarr" "$SONARR_BASE" "$SONARR_KEY" "tng-sonarr-fixture.bin" "$release"
     fi
   else
     mark "Sonarr fixture search" "FAIL" "HTTP $code releases=$releases"
@@ -329,7 +329,7 @@ if [[ -n "$radarr_indexer_id" ]]; then
     mark "Radarr fixture search" "PASS" "releases=$releases"
     if [[ "$ARR_GRAB" == "1" ]]; then
       release="$(jq -c '.[0]' "$BODY")"
-      grab_release "Radarr" "$RADARR_BASE" "$RADARR_KEY" "rtng-radarr-fixture.bin" "$release"
+      grab_release "Radarr" "$RADARR_BASE" "$RADARR_KEY" "tng-radarr-fixture.bin" "$release"
     fi
   else
     mark "Radarr fixture search" "FAIL" "HTTP $code releases=$releases"

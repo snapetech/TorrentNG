@@ -5,32 +5,32 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ENV_FILE="${CERT_ENV_FILE:-$ROOT/deploy/certification/.env}"
 COMPOSE_FILE="${CERT_COMPOSE_FILE:-$ROOT/deploy/certification/compose.yml}"
 
-STATE_DIR="${RTNG_VPN_STATE_DIR:-/var/lib/slskdN-vpn}"
-STATIC_FORWARD_DIR="${RTNG_VPN_STATIC_FORWARD_DIR:-/etc/slskdN-vpn/static-forwards}"
-GLUETUN_API="${RTNG_VPN_GLUETUN_API:-}"
-PRIVATE_PORT="${RTNG_VPN_PRIVATE_PORT:-50000}"
-PROTO="${RTNG_VPN_PROTO:-tcp}"
-OUT_ENV="${RTNG_VPN_OUT_ENV:-$ROOT/certification/reports/rtng-vpn-forward.env}"
+STATE_DIR="${TNG_VPN_STATE_DIR:-/var/lib/slskdN-vpn}"
+STATIC_FORWARD_DIR="${TNG_VPN_STATIC_FORWARD_DIR:-/etc/slskdN-vpn/static-forwards}"
+GLUETUN_API="${TNG_VPN_GLUETUN_API:-}"
+PRIVATE_PORT="${TNG_VPN_PRIVATE_PORT:-50000}"
+PROTO="${TNG_VPN_PROTO:-tcp}"
+OUT_ENV="${TNG_VPN_OUT_ENV:-$ROOT/certification/reports/tng-vpn-forward.env}"
 
 usage() {
   cat <<EOF
 Usage: $(basename "$0") [print|write-env|restart-cert]
 
 Reads slskdN-vpn-agent/Gluetun-style forwarded-port state and adapts it for
-rtorrentNG. Secrets stay outside git; this script only consumes runtime state.
+TorrentNG. Secrets stay outside git; this script only consumes runtime state.
 
 Inputs:
-  RTNG_VPN_STATE_DIR              default /var/lib/slskdN-vpn
-  RTNG_VPN_STATIC_FORWARD_DIR     default /etc/slskdN-vpn/static-forwards
-  RTNG_VPN_GLUETUN_API            optional, e.g. http://127.0.0.1:8000
-  RTNG_VPN_PRIVATE_PORT           private target port, default 50000
-  RTNG_VPN_PROTO                  tcp or udp, default tcp
-  RTNG_VPN_OUT_ENV                output env file
+  TNG_VPN_STATE_DIR              default /var/lib/slskdN-vpn
+  TNG_VPN_STATIC_FORWARD_DIR     default /etc/slskdN-vpn/static-forwards
+  TNG_VPN_GLUETUN_API            optional, e.g. http://127.0.0.1:8000
+  TNG_VPN_PRIVATE_PORT           private target port, default 50000
+  TNG_VPN_PROTO                  tcp or udp, default tcp
+  TNG_VPN_OUT_ENV                output env file
 
 Commands:
   print         print discovered mapping
-  write-env     write RTNG_INCOMING_PORT and RTNG_VPN_PUBLIC_* env file
-  restart-cert  write env and restart certification rtorrentng with forwarded port
+  write-env     write TNG_INCOMING_PORT and TNG_VPN_PUBLIC_* env file
+  restart-cert  write env and restart certification torrentng with forwarded port
 EOF
 }
 
@@ -82,11 +82,11 @@ write_env() {
   source="$(sed -n 's/^source=//p' <<<"$mapping")"
   mkdir -p "$(dirname "$OUT_ENV")"
   cat > "$OUT_ENV" <<EOF
-RTNG_INCOMING_PORT=$private_port
-RTNG_VPN_PUBLIC_PORT=$public_port
-RTNG_VPN_PUBLIC_IP=$public_ip
-RTNG_VPN_FORWARD_PROTO=$proto
-RTNG_VPN_FORWARD_SOURCE=$source
+TNG_INCOMING_PORT=$private_port
+TNG_VPN_PUBLIC_PORT=$public_port
+TNG_VPN_PUBLIC_IP=$public_ip
+TNG_VPN_FORWARD_PROTO=$proto
+TNG_VPN_FORWARD_SOURCE=$source
 EOF
   echo "$OUT_ENV"
 }
@@ -111,14 +111,14 @@ case "$cmd" in
     [[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
     source "$out"
     set +a
-    RTNG_HOST_PORT="${RTNG_HOST_PORT:-28080}" \
+    TNG_HOST_PORT="${TNG_HOST_PORT:-28080}" \
     SONARR_HOST_PORT="${SONARR_HOST_PORT:-28989}" \
     RADARR_HOST_PORT="${RADARR_HOST_PORT:-27878}" \
     PROWLARR_HOST_PORT="${PROWLARR_HOST_PORT:-29696}" \
     AUTOBRR_HOST_PORT="${AUTOBRR_HOST_PORT:-27474}" \
     CROSS_SEED_HOST_PORT="${CROSS_SEED_HOST_PORT:-22468}" \
-    RTNG_INCOMING_PORT="$RTNG_INCOMING_PORT" \
-      docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d rtorrentng
+    TNG_INCOMING_PORT="$TNG_INCOMING_PORT" \
+      docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d torrentng
     ;;
   *)
     usage >&2

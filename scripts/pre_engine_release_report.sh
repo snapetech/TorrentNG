@@ -73,7 +73,7 @@ if [[ -z "$SOAK_REPORT" ]]; then
 fi
 
 {
-  echo "# rtorrentNG Pre-Engine Release Gate"
+  echo "# TorrentNG Pre-Engine Release Gate"
   echo
   echo "- Date UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "- Report directory: $REPORT_DIR"

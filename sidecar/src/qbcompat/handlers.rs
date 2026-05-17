@@ -146,11 +146,11 @@ async fn auth_login(
         .unwrap_or("");
 
     if s.cfg.auth.api_tokens.iter().any(|token| token == candidate) {
-        let rtng_cookie = format!("rtng_session={candidate}; Path=/; HttpOnly; SameSite=Lax");
+        let tng_cookie = format!("tng_session={candidate}; Path=/; HttpOnly; SameSite=Lax");
         let sid_cookie = format!("SID={candidate}; Path=/; HttpOnly; SameSite=Lax");
         (
             AppendHeaders([
-                (header::SET_COOKIE, rtng_cookie),
+                (header::SET_COOKIE, tng_cookie),
                 (header::SET_COOKIE, sid_cookie),
             ]),
             "Ok.",
@@ -165,7 +165,7 @@ async fn auth_logout() -> impl IntoResponse {
         AppendHeaders([
             (
                 header::SET_COOKIE,
-                "rtng_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0",
+                "tng_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0",
             ),
             (
                 header::SET_COOKIE,

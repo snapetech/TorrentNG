@@ -14,6 +14,7 @@ pub struct AppState {
     pub categories: Arc<RwLock<BTreeMap<String, String>>>,
     pub tags: Arc<RwLock<BTreeSet<String>>>,
     pub tracker_projection_cache: Arc<RwLock<HashMap<String, (String, u32)>>>,
+    pub preference_overrides: Arc<RwLock<serde_json::Map<String, serde_json::Value>>>,
 }
 
 impl AppState {
@@ -24,6 +25,7 @@ impl AppState {
             categories: Arc::new(RwLock::new(BTreeMap::new())),
             tags: Arc::new(RwLock::new(BTreeSet::new())),
             tracker_projection_cache: Arc::new(RwLock::new(HashMap::new())),
+            preference_overrides: Arc::new(RwLock::new(serde_json::Map::new())),
         }
     }
 
@@ -34,6 +36,7 @@ impl AppState {
             categories: Arc::new(RwLock::new(BTreeMap::new())),
             tags: Arc::new(RwLock::new(BTreeSet::new())),
             tracker_projection_cache: Arc::new(RwLock::new(HashMap::new())),
+            preference_overrides: Arc::new(RwLock::new(serde_json::Map::new())),
         }
     }
 
@@ -44,6 +47,7 @@ impl AppState {
             categories: Arc::new(RwLock::new(BTreeMap::new())),
             tags: Arc::new(RwLock::new(BTreeSet::new())),
             tracker_projection_cache: Arc::new(RwLock::new(HashMap::new())),
+            preference_overrides: Arc::new(RwLock::new(serde_json::Map::new())),
         }
     }
 }

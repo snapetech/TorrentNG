@@ -1,6 +1,6 @@
 services:
   rusttorrentd:
-    image: rtorrentng/rusttorrentd:local
+    image: torrentng/rusttorrentd:local
     build:
       context: ../..
       dockerfile: deploy/native/Dockerfile

@@ -1,6 +1,6 @@
 [package]
 name = "rt-jobs"
-description = "rtorrentNG: job queue and long-running operations"
+description = "TorrentNG: job queue and long-running operations"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

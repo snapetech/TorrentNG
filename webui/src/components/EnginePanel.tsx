@@ -65,10 +65,10 @@ function EngineSkeleton() {
     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: 16 }}>
       {Array.from({ length: 4 }).map((_, index) => (
         <Panel key={index}>
-          <span className="rtng-skeleton" style={{ width: 120, height: 12, marginBottom: 12 }} />
-          <span className="rtng-skeleton" style={{ width: '92%', height: 10, marginBottom: 8 }} />
-          <span className="rtng-skeleton" style={{ width: '72%', height: 10, marginBottom: 8 }} />
-          <span className="rtng-skeleton" style={{ width: '84%', height: 10 }} />
+          <span className="tng-skeleton" style={{ width: 120, height: 12, marginBottom: 12 }} />
+          <span className="tng-skeleton" style={{ width: '92%', height: 10, marginBottom: 8 }} />
+          <span className="tng-skeleton" style={{ width: '72%', height: 10, marginBottom: 8 }} />
+          <span className="tng-skeleton" style={{ width: '84%', height: 10 }} />
         </Panel>
       ))}
     </div>
@@ -109,7 +109,7 @@ function Capabilities({ data }: { data: EngineDiagnostics }) {
       <Subhead>Capabilities</Subhead>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))', gap: 8 }}>
         {data.capabilities.map(cap => (
-          <div key={cap.key} className="rtng-engine-capability" data-available={cap.available ? 'true' : 'false'} style={{
+          <div key={cap.key} className="tng-engine-capability" data-available={cap.available ? 'true' : 'false'} style={{
             border: '1px solid var(--border)',
             borderRadius: 6,
             padding: '8px 10px',
@@ -177,11 +177,11 @@ function ProfileDrift({ data }: { data: EngineDiagnostics }) {
   return (
     <Panel wide>
       <Subhead>Engine Profile Drift</Subhead>
-      {problems.length === 0 && <div style={{ color: 'var(--success)', fontSize: 12 }}>Running profile matches rtorrentNG defaults</div>}
+      {problems.length === 0 && <div style={{ color: 'var(--success)', fontSize: 12 }}>Running profile matches TorrentNG defaults</div>}
       {problems.length > 0 && (
         <div style={{ display: 'grid', gap: 6 }}>
           {problems.map(row => (
-            <div key={row.key} className="rtng-engine-drift" data-status={row.status} style={{
+            <div key={row.key} className="tng-engine-drift" data-status={row.status} style={{
               display: 'grid',
               gridTemplateColumns: '180px minmax(0, 1fr) minmax(0, 1fr)',
               gap: 10,
@@ -249,7 +249,7 @@ function RtorrentSettingsPanel() {
   return (
     <Panel wide>
       <Subhead>rTorrent Limits</Subhead>
-      {isLoading && <span className="rtng-skeleton" style={{ width: '70%', height: 12 }} />}
+      {isLoading && <span className="tng-skeleton" style={{ width: '70%', height: 12 }} />}
       {error && <InlineNotice>rTorrent settings unavailable</InlineNotice>}
       {data && (
         <div style={{ display: 'grid', gap: 10 }}>
@@ -262,7 +262,7 @@ function RtorrentSettingsPanel() {
               const row = data.values.find(value => value.key === setting.key)
               const value = draft[setting.key] ?? inputValue(setting.value_type, row?.saved ?? row?.live.value ?? setting.default_value)
               return (
-                <label key={setting.key} className="rtng-form-card" style={{
+                <label key={setting.key} className="tng-form-card" style={{
                   border: '1px solid var(--border)', borderRadius: 7, background: 'var(--surface)', padding: 9,
                   display: 'grid', gap: 5,
                 }}>
@@ -322,7 +322,7 @@ function RtorrentSettingsPanel() {
             </button>
             <button
               onClick={() => {
-                if (window.confirm('Restart rTorrent/rtorrentNG now? Active transfers will reconnect after the service comes back.')) restart.mutate()
+                if (window.confirm('Restart rTorrent/TorrentNG now? Active transfers will reconnect after the service comes back.')) restart.mutate()
               }}
               disabled={restart.isPending}
               style={buttonStyle('var(--warning)', 'color-mix(in srgb, var(--warning) 12%, var(--surface))', 'var(--warning)')}
@@ -381,8 +381,8 @@ function CommandIndex({ commands }: { commands?: { ok: boolean; count: number; c
     <Panel wide>
       <Subhead>XMLRPC Command Surface</Subhead>
       {!commands && <div style={{ display: 'grid', gap: 7 }}>
-        <span className="rtng-skeleton" style={{ width: '42%', height: 10 }} />
-        <span className="rtng-skeleton" style={{ width: '72%', height: 8 }} />
+        <span className="tng-skeleton" style={{ width: '42%', height: 10 }} />
+        <span className="tng-skeleton" style={{ width: '72%', height: 8 }} />
       </div>}
       {commands && !commands.ok && <InlineNotice>Command index unavailable</InlineNotice>}
       {commands?.ok && (
@@ -423,7 +423,7 @@ function CommandIndex({ commands }: { commands?: { ok: boolean; count: number; c
 
 function Panel({ children, wide }: { children: React.ReactNode; wide?: boolean }) {
   return (
-    <div className="rtng-card rtng-engine-panel" style={{
+    <div className="tng-card tng-engine-panel" style={{
       gridColumn: wide ? '1 / -1' : undefined,
       border: '1px solid var(--border)',
       borderRadius: 7,
@@ -440,7 +440,7 @@ function Rows({ rows }: { rows: [string, string][] }) {
   return (
     <div style={{ display: 'grid', gridTemplateColumns: '160px minmax(0, 1fr)', gap: '6px 12px', fontSize: 12 }}>
       {rows.map(([k, v]) => (
-        <div key={k} className="rtng-engine-kv" style={{ display: 'contents' }}>
+        <div key={k} className="tng-engine-kv" style={{ display: 'contents' }}>
           <div style={{ color: 'var(--faint)' }}>{k}</div>
           <div title={v} style={{ color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{v}</div>
         </div>

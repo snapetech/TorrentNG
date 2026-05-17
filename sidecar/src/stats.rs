@@ -107,7 +107,7 @@ async fn probe_transfer_rates(rt: &Client) -> TransferRates {
 }
 
 fn live_speeds_file() -> Option<String> {
-    std::env::var("RTNG_LIVE_SPEEDS_FILE")
+    std::env::var("TNG_LIVE_SPEEDS_FILE")
         .ok()
         .filter(|path| !path.trim().is_empty())
 }

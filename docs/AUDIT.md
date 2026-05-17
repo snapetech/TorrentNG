@@ -46,7 +46,7 @@ rTorrent 0.16.9 introduced a trusted/untrusted XMLRPC connection model. Connecti
 | `--with-xmlrpc-c` | ❌ | Erratic RPC behavior reported (rtorrent#1636); Fedora package uses this |
 | `--with-xmlrpc-tinyxml2` | ✅ | Preferred; build our images with this flag |
 
-**Action:** All rtorrentNG Docker images build rTorrent `--with-xmlrpc-tinyxml2`. Document in build scripts.
+**Action:** All TorrentNG Docker images build rTorrent `--with-xmlrpc-tinyxml2`. Document in build scripts.
 
 ### Tracker HTTP user-agent control
 
@@ -54,7 +54,7 @@ rTorrent 0.16.9 introduced a trusted/untrusted XMLRPC connection model. Connecti
 |---|---|---|
 | Runtime support | ✅ | Packaged images expose `network.http.user_agent` and `network.http.user_agent.set` |
 | Upstream impact | ⚠️ | rTorrent 0.16.11 initializes libtorrent's HTTP user-agent internally, but does not publish XMLRPC commands for reading or changing it |
-| rtorrentNG fix | ✅ | Docker builds apply `deploy/docker/patches/rtorrent-0.16.11-user-agent-command.patch`, which wires the existing libtorrent getter/setter into rTorrent's XMLRPC command map |
+| TorrentNG fix | ✅ | Docker builds apply `deploy/docker/patches/rtorrent-0.16.11-user-agent-command.patch`, which wires the existing libtorrent getter/setter into rTorrent's XMLRPC command map |
 
 ### XMLRPC parsererror on torrent list
 

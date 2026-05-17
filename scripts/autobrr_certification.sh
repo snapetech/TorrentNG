@@ -12,7 +12,7 @@ if [[ -f "$ENV_FILE" ]]; then
   set +a
 fi
 
-RTNG_API_TOKEN="${RTNG_API_TOKEN:-cert-token}"
+TNG_API_TOKEN="${TNG_API_TOKEN:-cert-token}"
 AUTOBRR_CONTAINER="${AUTOBRR_CONTAINER:-certification-autobrr-1}"
 AUTOBRR_HOST_URL="${AUTOBRR_HOST_URL:-http://localhost:${AUTOBRR_HOST_PORT:-17474}}"
 AUTOBRR_CERT_USER="${AUTOBRR_CERT_USER:-cert}"
@@ -66,7 +66,7 @@ delete_named() {
 }
 
 {
-  echo "# rtorrentNG autobrr Certification"
+  echo "# TorrentNG autobrr Certification"
   echo
   echo "- Date UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "- autobrr URL: $AUTOBRR_HOST_URL"
@@ -94,16 +94,16 @@ else
   echo >> "$OUT"; echo "Overall status: $status" >> "$OUT"; echo "$OUT"; exit 1
 fi
 
-client="$(curl -fsS -b "$COOKIE_JAR" "$AUTOBRR_HOST_URL/api/download_clients" | jq -c '.[] | select(.name=="rtorrentNG-qBit")' | head -1)"
+client="$(curl -fsS -b "$COOKIE_JAR" "$AUTOBRR_HOST_URL/api/download_clients" | jq -c '.[] | select(.name=="TorrentNG-qBit")' | head -1)"
 if [[ -n "$client" ]]; then
   client_id="$(jq -r '.id' <<<"$client")"
   mark "qBit client exists" "PASS" "id=$client_id"
 else
-  payload="$(jq -nc --arg token "$RTNG_API_TOKEN" '{
-    name: "rtorrentNG-qBit",
+  payload="$(jq -nc --arg token "$TNG_API_TOKEN" '{
+    name: "TorrentNG-qBit",
     type: "QBITTORRENT",
     enabled: true,
-    host: "rtorrentng",
+    host: "torrentng",
     port: 8080,
     tls: false,
     tls_skip_verify: false,
@@ -122,12 +122,12 @@ else
 fi
 
 if [[ -n "${client_id:-}" ]]; then
-  test_payload="$(jq -nc --argjson id "$client_id" --arg token "$RTNG_API_TOKEN" '{
+  test_payload="$(jq -nc --argjson id "$client_id" --arg token "$TNG_API_TOKEN" '{
     id: $id,
-    name: "rtorrentNG-qBit",
+    name: "TorrentNG-qBit",
     type: "QBITTORRENT",
     enabled: true,
-    host: "rtorrentng",
+    host: "torrentng",
     port: 8080,
     tls: false,
     tls_skip_verify: false,
@@ -137,19 +137,19 @@ if [[ -n "${client_id:-}" ]]; then
   }')"
   code="$(api POST /api/download_clients/test "$test_payload")"
   if [[ "$code" == "204" ]]; then
-    mark "qBit client test" "PASS" "autobrr reached rtorrentNG"
+    mark "qBit client test" "PASS" "autobrr reached TorrentNG"
   else
     mark "qBit client test" "FAIL" "HTTP $code $(tr '\n' ' ' <"$BODY")"
   fi
 fi
 
-delete_named /api/actions '.[] | select(.name=="rtorrentNG qBit Action") | .id'
-delete_named /api/filters '.[] | select(.name=="rtorrentNG Fixture Filter") | .id'
+delete_named /api/actions '.[] | select(.name=="TorrentNG qBit Action") | .id'
+delete_named /api/filters '.[] | select(.name=="TorrentNG Fixture Filter") | .id'
 
 filter_payload="$(jq -nc '{
-  name: "rtorrentNG Fixture Filter",
+  name: "TorrentNG Fixture Filter",
   enabled: true,
-  match_releases: "RTNG",
+  match_releases: "TNG",
   use_regex: false,
   resolutions: [],
   codecs: [],
@@ -181,7 +181,7 @@ fi
 
 if [[ -n "${client_id:-}" && -n "${filter_id:-}" ]]; then
   action_payload="$(jq -nc --argjson client_id "$client_id" --argjson filter_id "$filter_id" '{
-    name: "rtorrentNG qBit Action",
+    name: "TorrentNG qBit Action",
     type: "QBITTORRENT",
     enabled: true,
     client_id: $client_id,
@@ -200,8 +200,8 @@ if [[ -n "${client_id:-}" && -n "${filter_id:-}" ]]; then
   fi
 fi
 
-actions="$(curl -fsS -b "$COOKIE_JAR" "$AUTOBRR_HOST_URL/api/actions" | jq '[.[] | select(.name=="rtorrentNG qBit Action" and .type=="QBITTORRENT" and .enabled==true)] | length')"
-filters="$(curl -fsS -b "$COOKIE_JAR" "$AUTOBRR_HOST_URL/api/filters" | jq '[.[] | select(.name=="rtorrentNG Fixture Filter" and .enabled==true)] | length')"
+actions="$(curl -fsS -b "$COOKIE_JAR" "$AUTOBRR_HOST_URL/api/actions" | jq '[.[] | select(.name=="TorrentNG qBit Action" and .type=="QBITTORRENT" and .enabled==true)] | length')"
+filters="$(curl -fsS -b "$COOKIE_JAR" "$AUTOBRR_HOST_URL/api/filters" | jq '[.[] | select(.name=="TorrentNG Fixture Filter" and .enabled==true)] | length')"
 if [[ "$actions" -gt 0 && "$filters" -gt 0 ]]; then
   mark "readback" "PASS" "filters=$filters actions=$actions"
 else

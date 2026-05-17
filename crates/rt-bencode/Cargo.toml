@@ -1,6 +1,6 @@
 [package]
 name = "rt-bencode"
-description = "Bencode parser and encoder for rtorrentNG"
+description = "Bencode parser and encoder for TorrentNG"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

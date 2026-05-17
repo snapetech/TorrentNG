@@ -12,18 +12,18 @@ const SHORTCUTS = [
 ]
 
 const LINKS = [
-  ['Project', 'https://github.com/snapetech/rtorrentNG'],
+  ['Project', 'https://github.com/snapetech/TorrentNG'],
   ['Discord support', 'https://discord.gg/4ub88HeHFm'],
   ['qBittorrent API compatibility', 'https://github.com/qbittorrent/qBittorrent/wiki/WebUI-API-(qBittorrent-4.1)'],
 ]
 
 export function HelpDialog({ onClose }: Props) {
   return (
-    <div className="rtng-modal-backdrop" style={{
+    <div className="tng-modal-backdrop" style={{
       position: 'fixed', inset: 0, background: 'rgba(2,6,23,0.72)', zIndex: 1100,
       display: 'grid', placeItems: 'center', padding: 24,
     }} onClick={e => { if (e.target === e.currentTarget) onClose() }}>
-      <div role="dialog" aria-modal="true" aria-label="Help" className="rtng-modal" style={{
+      <div role="dialog" aria-modal="true" aria-label="Help" className="tng-modal" style={{
         width: 'min(620px, 100%)', maxHeight: '80vh', overflowY: 'auto',
         background: 'var(--panel)', border: '1px solid var(--border-strong)', borderRadius: 8,
         boxShadow: '0 24px 60px var(--shadow)',
@@ -34,17 +34,17 @@ export function HelpDialog({ onClose }: Props) {
         }}>
           <div style={{ flex: 1 }}>
             <div style={{ fontSize: 16, fontWeight: 700, color: 'var(--text)' }}>Help</div>
-            <div style={{ fontSize: 12, color: 'var(--faint)', marginTop: 2 }}>rtorrentNG WebUI controls and support links</div>
+            <div style={{ fontSize: 12, color: 'var(--faint)', marginTop: 2 }}>TorrentNG WebUI controls and support links</div>
           </div>
           <button onClick={onClose} style={closeButton}>Close</button>
         </div>
 
         <div style={{ padding: 16, display: 'grid', gap: 18 }}>
-          <section className="rtng-card" style={sectionCard}>
+          <section className="tng-card" style={sectionCard}>
             <h2 style={headingStyle}>Shortcuts</h2>
             <div style={{ display: 'grid', gap: 6 }}>
               {SHORTCUTS.map(([key, value]) => (
-                <div key={key} className="rtng-shortcut-row" style={rowStyle}>
+                <div key={key} className="tng-shortcut-row" style={rowStyle}>
                   <kbd style={kbdStyle}>{key}</kbd>
                   <span>{value}</span>
                 </div>
@@ -52,7 +52,7 @@ export function HelpDialog({ onClose }: Props) {
             </div>
           </section>
 
-          <section className="rtng-card" style={sectionCard}>
+          <section className="tng-card" style={sectionCard}>
             <h2 style={headingStyle}>Actions</h2>
             <p style={textStyle}>
               Use the toolbar for selected torrents, the left sidebar for filtering and saved views,
@@ -60,11 +60,11 @@ export function HelpDialog({ onClose }: Props) {
             </p>
           </section>
 
-          <section className="rtng-card" style={sectionCard}>
+          <section className="tng-card" style={sectionCard}>
             <h2 style={headingStyle}>Links</h2>
             <div style={{ display: 'grid', gap: 7 }}>
               {LINKS.map(([label, href]) => (
-                <a key={href} className="rtng-card-link" href={href} target="_blank" rel="noreferrer" style={linkStyle}>
+                <a key={href} className="tng-card-link" href={href} target="_blank" rel="noreferrer" style={linkStyle}>
                   <span>{label}</span>
                   <span style={{ color: 'var(--faint)', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{href.replace(/^https?:\/\//, '')}</span>
                   <span aria-hidden="true" style={{ color: 'var(--accent-text)', justifySelf: 'end' }}>↗</span>

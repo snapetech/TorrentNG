@@ -541,273 +541,273 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
     let mut out = String::new();
     metric(
         &mut out,
-        "rtorrentng_torrents_total",
+        "torrentng_torrents_total",
         "gauge",
         "Total torrents in session",
         stats.torrents_total,
     );
     metric(
         &mut out,
-        "rtorrentng_torrents_seeding",
+        "torrentng_torrents_seeding",
         "gauge",
         "Currently seeding torrents",
         stats.torrents_seeding,
     );
     metric(
         &mut out,
-        "rtorrentng_torrents_downloading",
+        "torrentng_torrents_downloading",
         "gauge",
         "Currently downloading torrents",
         stats.torrents_downloading,
     );
     metric(
         &mut out,
-        "rtorrentng_torrents_paused",
+        "torrentng_torrents_paused",
         "gauge",
         "Paused or stopped torrents",
         stats.torrents_paused,
     );
     metric(
         &mut out,
-        "rtorrentng_torrents_checking",
+        "torrentng_torrents_checking",
         "gauge",
         "Torrents checking pieces",
         stats.torrents_checking,
     );
     metric(
         &mut out,
-        "rtorrentng_torrents_metadata_pending",
+        "torrentng_torrents_metadata_pending",
         "gauge",
         "Metadata-pending torrents",
         stats.torrents_metadata_pending,
     );
     metric(
         &mut out,
-        "rtorrentng_torrents_queued",
+        "torrentng_torrents_queued",
         "gauge",
         "Queued torrents",
         stats.torrents_queued,
     );
     metric(
         &mut out,
-        "rtorrentng_torrents_errored",
+        "torrentng_torrents_errored",
         "gauge",
         "Errored torrents",
         stats.torrents_error,
     );
     metric(
         &mut out,
-        "rtorrentng_bytes_uploaded_total",
+        "torrentng_bytes_uploaded_total",
         "counter",
         "Uploaded bytes from session accounting",
         stats.bytes_uploaded,
     );
     metric(
         &mut out,
-        "rtorrentng_bytes_downloaded_total",
+        "torrentng_bytes_downloaded_total",
         "counter",
         "Downloaded bytes from session accounting",
         stats.bytes_downloaded,
     );
     metric(
         &mut out,
-        "rtorrentng_bytes_left",
+        "torrentng_bytes_left",
         "gauge",
         "Bytes left across enabled torrent pieces",
         stats.bytes_left,
     );
     metric(
         &mut out,
-        "rtorrentng_jobs_active",
+        "torrentng_jobs_active",
         "gauge",
         "Active durable jobs",
         stats.jobs_active,
     );
     metric(
         &mut out,
-        "rtorrentng_trackers_total",
+        "torrentng_trackers_total",
         "gauge",
         "Persisted tracker rows",
         stats.trackers_total,
     );
     metric(
         &mut out,
-        "rtorrentng_trackers_working",
+        "torrentng_trackers_working",
         "gauge",
         "Trackers in working state",
         stats.trackers_working,
     );
     metric(
         &mut out,
-        "rtorrentng_trackers_warning",
+        "torrentng_trackers_warning",
         "gauge",
         "Trackers with warning state",
         stats.trackers_warning,
     );
     metric(
         &mut out,
-        "rtorrentng_trackers_error",
+        "torrentng_trackers_error",
         "gauge",
         "Trackers with error state",
         stats.trackers_error,
     );
     metric(
         &mut out,
-        "rtorrentng_storage_file_pool_capacity",
+        "torrentng_storage_file_pool_capacity",
         "gauge",
         "Configured open-file cache capacity across running torrent schedulers",
         stats.storage_file_pool_capacity,
     );
     metric(
         &mut out,
-        "rtorrentng_storage_file_pool_open_files",
+        "torrentng_storage_file_pool_open_files",
         "gauge",
         "Open files across running torrent scheduler caches",
         stats.storage_file_pool_open_files,
     );
     metric(
         &mut out,
-        "rtorrentng_storage_file_pool_hits_total",
+        "torrentng_storage_file_pool_hits_total",
         "counter",
         "Open-file cache hits across running torrent schedulers",
         stats.storage_file_pool_hits,
     );
     metric(
         &mut out,
-        "rtorrentng_storage_file_pool_misses_total",
+        "torrentng_storage_file_pool_misses_total",
         "counter",
         "Open-file cache misses across running torrent schedulers",
         stats.storage_file_pool_misses,
     );
     metric(
         &mut out,
-        "rtorrentng_storage_file_pool_evictions_total",
+        "torrentng_storage_file_pool_evictions_total",
         "counter",
         "Open-file cache evictions across running torrent schedulers",
         stats.storage_file_pool_evictions,
     );
     metric(
         &mut out,
-        "rtorrentng_storage_file_pool_idle_closes_total",
+        "torrentng_storage_file_pool_idle_closes_total",
         "counter",
         "Idle open-file cache closes across running torrent schedulers",
         stats.storage_file_pool_idle_closes,
     );
     metric(
         &mut out,
-        "rtorrentng_storage_io_queue_depth",
+        "torrentng_storage_io_queue_depth",
         "gauge",
         "Queued disk I/O jobs across running torrent schedulers",
         stats.storage_io_queue_depth,
     );
     metric(
         &mut out,
-        "rtorrentng_storage_hash_queue_depth",
+        "torrentng_storage_hash_queue_depth",
         "gauge",
         "Queued hashing jobs across running torrent schedulers",
         stats.storage_hash_queue_depth,
     );
     metric(
         &mut out,
-        "rtorrentng_storage_dirty_files",
+        "torrentng_storage_dirty_files",
         "gauge",
         "Dirty files tracked by running torrent schedulers",
         stats.storage_dirty_files,
     );
     metric(
         &mut out,
-        "rtorrentng_storage_read_ops_total",
+        "torrentng_storage_read_ops_total",
         "counter",
         "Positioned read operations across running torrent schedulers",
         stats.storage_read_ops,
     );
     metric_by_class(
         &mut out,
-        "rtorrentng_storage_read_ops_by_class_total",
+        "torrentng_storage_read_ops_by_class_total",
         "counter",
         "Positioned read operations by I/O class across running torrent schedulers",
         &stats.storage_read_ops_by_class,
     );
     metric(
         &mut out,
-        "rtorrentng_storage_write_ops_total",
+        "torrentng_storage_write_ops_total",
         "counter",
         "Positioned write operations across running torrent schedulers",
         stats.storage_write_ops,
     );
     metric_by_class(
         &mut out,
-        "rtorrentng_storage_write_ops_by_class_total",
+        "torrentng_storage_write_ops_by_class_total",
         "counter",
         "Positioned write operations by I/O class across running torrent schedulers",
         &stats.storage_write_ops_by_class,
     );
     metric(
         &mut out,
-        "rtorrentng_storage_bytes_read_total",
+        "torrentng_storage_bytes_read_total",
         "counter",
         "Bytes read through running torrent schedulers",
         stats.storage_bytes_read,
     );
     metric_by_class(
         &mut out,
-        "rtorrentng_storage_bytes_read_by_class_total",
+        "torrentng_storage_bytes_read_by_class_total",
         "counter",
         "Bytes read by I/O class through running torrent schedulers",
         &stats.storage_bytes_read_by_class,
     );
     metric(
         &mut out,
-        "rtorrentng_storage_bytes_written_total",
+        "torrentng_storage_bytes_written_total",
         "counter",
         "Bytes written through running torrent schedulers",
         stats.storage_bytes_written,
     );
     metric_by_class(
         &mut out,
-        "rtorrentng_storage_bytes_written_by_class_total",
+        "torrentng_storage_bytes_written_by_class_total",
         "counter",
         "Bytes written by I/O class through running torrent schedulers",
         &stats.storage_bytes_written_by_class,
     );
     metric(
         &mut out,
-        "rtorrentng_storage_backend_read_ops_total",
+        "torrentng_storage_backend_read_ops_total",
         "counter",
         "Backend disk read operations across running torrent schedulers",
         stats.storage_backend_read_ops,
     );
     metric_by_class(
         &mut out,
-        "rtorrentng_storage_backend_read_ops_by_class_total",
+        "torrentng_storage_backend_read_ops_by_class_total",
         "counter",
         "Backend disk read operations by I/O class across running torrent schedulers",
         &stats.storage_backend_read_ops_by_class,
     );
     metric(
         &mut out,
-        "rtorrentng_storage_backend_bytes_read_total",
+        "torrentng_storage_backend_bytes_read_total",
         "counter",
         "Bytes read from backend disk operations across running torrent schedulers",
         stats.storage_backend_bytes_read,
     );
     metric_by_class(
         &mut out,
-        "rtorrentng_storage_backend_bytes_read_by_class_total",
+        "torrentng_storage_backend_bytes_read_by_class_total",
         "counter",
         "Bytes read from backend disk operations by I/O class across running torrent schedulers",
         &stats.storage_backend_bytes_read_by_class,
     );
     metric(
         &mut out,
-        "rtorrentng_storage_read_latency_nanoseconds_total",
+        "torrentng_storage_read_latency_nanoseconds_total",
         "counter",
         "Total read queue plus execution latency across running torrent schedulers",
         stats.storage_read_latency_ns,
     );
     latency_histogram(
         &mut out,
-        "rtorrentng_storage_read_latency_nanoseconds",
+        "torrentng_storage_read_latency_nanoseconds",
         "Read queue plus execution latency across running torrent schedulers",
         &stats.storage_read_latency_buckets,
         stats.storage_read_ops,
@@ -815,21 +815,21 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
     );
     metric_by_class(
         &mut out,
-        "rtorrentng_storage_read_latency_nanoseconds_by_class_total",
+        "torrentng_storage_read_latency_nanoseconds_by_class_total",
         "counter",
         "Total read queue plus execution latency by I/O class",
         &stats.storage_read_latency_ns_by_class,
     );
     metric(
         &mut out,
-        "rtorrentng_storage_write_latency_nanoseconds_total",
+        "torrentng_storage_write_latency_nanoseconds_total",
         "counter",
         "Total write queue plus execution latency across running torrent schedulers",
         stats.storage_write_latency_ns,
     );
     latency_histogram(
         &mut out,
-        "rtorrentng_storage_write_latency_nanoseconds",
+        "torrentng_storage_write_latency_nanoseconds",
         "Write queue plus execution latency across running torrent schedulers",
         &stats.storage_write_latency_buckets,
         stats.storage_write_ops,
@@ -837,21 +837,21 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
     );
     metric_by_class(
         &mut out,
-        "rtorrentng_storage_write_latency_nanoseconds_by_class_total",
+        "torrentng_storage_write_latency_nanoseconds_by_class_total",
         "counter",
         "Total write queue plus execution latency by I/O class",
         &stats.storage_write_latency_ns_by_class,
     );
     metric(
         &mut out,
-        "rtorrentng_storage_sync_latency_nanoseconds_total",
+        "torrentng_storage_sync_latency_nanoseconds_total",
         "counter",
         "Total sync queue plus execution latency across running torrent schedulers",
         stats.storage_sync_latency_ns,
     );
     latency_histogram(
         &mut out,
-        "rtorrentng_storage_sync_latency_nanoseconds",
+        "torrentng_storage_sync_latency_nanoseconds",
         "Sync queue plus execution latency across running torrent schedulers",
         &stats.storage_sync_latency_buckets,
         stats.storage_sync_ops,
@@ -859,14 +859,14 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
     );
     metric(
         &mut out,
-        "rtorrentng_storage_hash_latency_nanoseconds_total",
+        "torrentng_storage_hash_latency_nanoseconds_total",
         "counter",
         "Total hashing queue plus execution latency across running torrent schedulers",
         stats.storage_hash_latency_ns,
     );
     latency_histogram(
         &mut out,
-        "rtorrentng_storage_hash_latency_nanoseconds",
+        "torrentng_storage_hash_latency_nanoseconds",
         "Hashing queue plus execution latency across running torrent schedulers",
         &stats.storage_hash_latency_buckets,
         stats.storage_hash_ops,
@@ -874,70 +874,70 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
     );
     metric(
         &mut out,
-        "rtorrentng_storage_sync_ops_total",
+        "torrentng_storage_sync_ops_total",
         "counter",
         "Data sync operations across running torrent schedulers",
         stats.storage_sync_ops,
     );
     metric(
         &mut out,
-        "rtorrentng_storage_hash_ops_total",
+        "torrentng_storage_hash_ops_total",
         "counter",
         "Hashing operations across running torrent schedulers",
         stats.storage_hash_ops,
     );
     metric(
         &mut out,
-        "rtorrentng_storage_preallocation_failures_total",
+        "torrentng_storage_preallocation_failures_total",
         "counter",
         "Preallocation failures across running torrent schedulers",
         stats.storage_preallocation_failures,
     );
     metric(
         &mut out,
-        "rtorrentng_storage_preallocation_fallbacks_total",
+        "torrentng_storage_preallocation_fallbacks_total",
         "counter",
         "Preallocation fallback events across running torrent schedulers",
         stats.storage_preallocation_fallbacks,
     );
     metric(
         &mut out,
-        "rtorrentng_storage_peer_read_cache_entries",
+        "torrentng_storage_peer_read_cache_entries",
         "gauge",
         "Peer-read readahead cache entries across running torrent schedulers",
         stats.storage_peer_read_cache_entries,
     );
     metric(
         &mut out,
-        "rtorrentng_storage_peer_read_cache_hits_total",
+        "torrentng_storage_peer_read_cache_hits_total",
         "counter",
         "Peer-read readahead cache hits across running torrent schedulers",
         stats.storage_peer_read_cache_hits,
     );
     metric(
         &mut out,
-        "rtorrentng_storage_peer_read_cache_misses_total",
+        "torrentng_storage_peer_read_cache_misses_total",
         "counter",
         "Peer-read readahead cache misses across running torrent schedulers",
         stats.storage_peer_read_cache_misses,
     );
     metric(
         &mut out,
-        "rtorrentng_piece_assembly_buffers",
+        "torrentng_piece_assembly_buffers",
         "gauge",
         "In-memory piece assembly buffers across running torrents",
         stats.piece_assembly_buffers,
     );
     metric(
         &mut out,
-        "rtorrentng_piece_assembly_bytes",
+        "torrentng_piece_assembly_bytes",
         "gauge",
         "In-memory piece assembly bytes across running torrents",
         stats.piece_assembly_bytes,
     );
     metric(
         &mut out,
-        "rtorrentng_piece_assembly_evictions_total",
+        "torrentng_piece_assembly_evictions_total",
         "counter",
         "In-memory piece assembly buffers evicted by torrent-task budgets",
         stats.piece_assembly_evictions,
@@ -945,21 +945,21 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
     let storage = StorageRuntime::global();
     metric(
         &mut out,
-        "rtorrentng_storage_handles_open",
+        "torrentng_storage_handles_open",
         "gauge",
         "Open file handles in the global storage runtime cache",
         storage.handles_open() as u64,
     );
     metric(
         &mut out,
-        "rtorrentng_storage_frame_bytes_in_use",
+        "torrentng_storage_frame_bytes_in_use",
         "gauge",
         "Frame-pool bytes currently checked out by storage I/O",
         storage.frame_in_use_bytes(),
     );
     metric(
         &mut out,
-        "rtorrentng_storage_frame_bytes_cap",
+        "torrentng_storage_frame_bytes_cap",
         "gauge",
         "Frame-pool byte cap for storage I/O",
         storage.frame_cap_bytes(),
@@ -1148,7 +1148,7 @@ fn presented_token(headers: &HeaderMap) -> Option<&str> {
 fn extract_session_cookie(cookie: &str) -> Option<&str> {
     cookie.split(';').find_map(|part| {
         let part = part.trim();
-        part.strip_prefix("rtng_session=")
+        part.strip_prefix("tng_session=")
     })
 }
 
@@ -1325,57 +1325,57 @@ mod tests {
         stats.storage_sync_latency_buckets[7] = 2;
         stats.storage_hash_latency_buckets[7] = 7;
         let rendered = render_metrics(&stats);
-        assert!(rendered.contains("rtorrentng_torrents_total 2"));
-        assert!(rendered.contains("rtorrentng_torrents_seeding 1"));
-        assert!(rendered.contains("rtorrentng_jobs_active 3"));
-        assert!(rendered.contains("rtorrentng_trackers_error 4"));
-        assert!(rendered.contains("rtorrentng_storage_file_pool_hits_total 5"));
-        assert!(rendered.contains("rtorrentng_storage_read_ops_total 6"));
-        assert!(rendered.contains("rtorrentng_storage_hash_ops_total 7"));
-        assert!(rendered.contains("rtorrentng_storage_peer_read_cache_hits_total 8"));
-        assert!(rendered.contains("rtorrentng_piece_assembly_evictions_total 9"));
+        assert!(rendered.contains("torrentng_torrents_total 2"));
+        assert!(rendered.contains("torrentng_torrents_seeding 1"));
+        assert!(rendered.contains("torrentng_jobs_active 3"));
+        assert!(rendered.contains("torrentng_trackers_error 4"));
+        assert!(rendered.contains("torrentng_storage_file_pool_hits_total 5"));
+        assert!(rendered.contains("torrentng_storage_read_ops_total 6"));
+        assert!(rendered.contains("torrentng_storage_hash_ops_total 7"));
+        assert!(rendered.contains("torrentng_storage_peer_read_cache_hits_total 8"));
+        assert!(rendered.contains("torrentng_piece_assembly_evictions_total 9"));
         assert!(
-            rendered.contains("rtorrentng_storage_read_ops_by_class_total{class=\"peer_read\"} 10")
+            rendered.contains("torrentng_storage_read_ops_by_class_total{class=\"peer_read\"} 10")
         );
         assert!(rendered
-            .contains("rtorrentng_storage_write_ops_by_class_total{class=\"peer_write\"} 11"));
+            .contains("torrentng_storage_write_ops_by_class_total{class=\"peer_write\"} 11"));
         assert!(rendered
-            .contains("rtorrentng_storage_bytes_read_by_class_total{class=\"peer_read\"} 12"));
+            .contains("torrentng_storage_bytes_read_by_class_total{class=\"peer_read\"} 12"));
         assert!(rendered
-            .contains("rtorrentng_storage_bytes_written_by_class_total{class=\"peer_write\"} 13"));
-        assert!(rendered.contains("rtorrentng_storage_backend_read_ops_total 14"));
-        assert!(rendered.contains("rtorrentng_storage_backend_bytes_read_total 15"));
+            .contains("torrentng_storage_bytes_written_by_class_total{class=\"peer_write\"} 13"));
+        assert!(rendered.contains("torrentng_storage_backend_read_ops_total 14"));
+        assert!(rendered.contains("torrentng_storage_backend_bytes_read_total 15"));
         assert!(rendered.contains(
-            "rtorrentng_storage_backend_read_ops_by_class_total{class=\"peer_read\"} 16"
+            "torrentng_storage_backend_read_ops_by_class_total{class=\"peer_read\"} 16"
         ));
         assert!(rendered.contains(
-            "rtorrentng_storage_backend_bytes_read_by_class_total{class=\"peer_read\"} 17"
+            "torrentng_storage_backend_bytes_read_by_class_total{class=\"peer_read\"} 17"
         ));
-        assert!(rendered.contains("rtorrentng_storage_read_latency_nanoseconds_total 18"));
-        assert!(rendered.contains("rtorrentng_storage_write_latency_nanoseconds_total 19"));
-        assert!(rendered.contains("rtorrentng_storage_sync_latency_nanoseconds_total 20"));
-        assert!(rendered.contains("rtorrentng_storage_hash_latency_nanoseconds_total 21"));
+        assert!(rendered.contains("torrentng_storage_read_latency_nanoseconds_total 18"));
+        assert!(rendered.contains("torrentng_storage_write_latency_nanoseconds_total 19"));
+        assert!(rendered.contains("torrentng_storage_sync_latency_nanoseconds_total 20"));
+        assert!(rendered.contains("torrentng_storage_hash_latency_nanoseconds_total 21"));
         assert!(rendered.contains(
-            "rtorrentng_storage_read_latency_nanoseconds_by_class_total{class=\"peer_read\"} 22"
+            "torrentng_storage_read_latency_nanoseconds_by_class_total{class=\"peer_read\"} 22"
         ));
         assert!(rendered.contains(
-            "rtorrentng_storage_write_latency_nanoseconds_by_class_total{class=\"peer_write\"} 23"
+            "torrentng_storage_write_latency_nanoseconds_by_class_total{class=\"peer_write\"} 23"
         ));
         assert!(
-            rendered.contains("rtorrentng_storage_read_latency_nanoseconds_bucket{le=\"+Inf\"} 6")
+            rendered.contains("torrentng_storage_read_latency_nanoseconds_bucket{le=\"+Inf\"} 6")
         );
-        assert!(rendered.contains("rtorrentng_storage_read_latency_nanoseconds_sum 18"));
-        assert!(rendered.contains("rtorrentng_storage_read_latency_nanoseconds_count 6"));
+        assert!(rendered.contains("torrentng_storage_read_latency_nanoseconds_sum 18"));
+        assert!(rendered.contains("torrentng_storage_read_latency_nanoseconds_count 6"));
         assert!(rendered
-            .contains("rtorrentng_storage_write_latency_nanoseconds_bucket{le=\"+Inf\"} 11"));
+            .contains("torrentng_storage_write_latency_nanoseconds_bucket{le=\"+Inf\"} 11"));
         assert!(
-            rendered.contains("rtorrentng_storage_sync_latency_nanoseconds_bucket{le=\"+Inf\"} 2")
+            rendered.contains("torrentng_storage_sync_latency_nanoseconds_bucket{le=\"+Inf\"} 2")
         );
         assert!(
-            rendered.contains("rtorrentng_storage_hash_latency_nanoseconds_bucket{le=\"+Inf\"} 7")
+            rendered.contains("torrentng_storage_hash_latency_nanoseconds_bucket{le=\"+Inf\"} 7")
         );
-        assert!(rendered.contains("rtorrentng_storage_handles_open "));
-        assert!(rendered.contains("rtorrentng_storage_frame_bytes_cap "));
+        assert!(rendered.contains("torrentng_storage_handles_open "));
+        assert!(rendered.contains("torrentng_storage_frame_bytes_cap "));
     }
 
     #[tokio::test]

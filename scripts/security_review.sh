@@ -25,7 +25,7 @@ value_for() {
 }
 
 {
-  echo "# rtorrentNG Security Review"
+  echo "# TorrentNG Security Review"
   echo
   echo "- Date UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "- Config: $CONFIG"
@@ -48,12 +48,12 @@ tokens="$(value_for api_tokens)"
 secret="$(value_for secret_key | tr -d ' "')"
 trust_proxy="$(value_for trust_proxy_header | tr -d ' "')"
 
-if [[ -n "${RTNG_API_TOKENS:-}" ]]; then
-  tokens="$RTNG_API_TOKENS"
+if [[ -n "${TNG_API_TOKENS:-}" ]]; then
+  tokens="$TNG_API_TOKENS"
 fi
 
-if [[ -n "${RTNG_SECRET_KEY:-}" ]]; then
-  secret="$RTNG_SECRET_KEY"
+if [[ -n "${TNG_SECRET_KEY:-}" ]]; then
+  secret="$TNG_SECRET_KEY"
 fi
 
 if [[ "$allow_scripts" == "false" || -z "$allow_scripts" ]]; then

@@ -64,7 +64,7 @@ export function SavedViewsBar({ params, onApply }: Props) {
   }
 
   return (
-    <div className="rtng-savedviews" style={{
+    <div className="tng-savedviews" style={{
       display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap',
       padding: '6px 12px', background: 'var(--surface)', borderBottom: '1px solid var(--border)',
       fontSize: 12,
@@ -87,7 +87,7 @@ export function SavedViewsBar({ params, onApply }: Props) {
       {views.map(view => {
         const isActive = JSON.stringify(cleanParams(view.params)) === activeKey
         return (
-          <span key={view.id} className="rtng-savedview-chip" data-active={isActive} style={{
+          <span key={view.id} className="tng-savedview-chip" data-active={isActive} style={{
             display: 'inline-flex', alignItems: 'center', gap: 4,
             background: isActive ? 'var(--accent-soft)' : 'var(--surface-2)',
             border: '1px solid ' + (isActive ? 'var(--accent)' : 'var(--border-strong)'),
@@ -127,7 +127,7 @@ export function SavedViewsBar({ params, onApply }: Props) {
         <span style={{ color: 'var(--faint)', fontSize: 11 }}>No saved views yet</span>
       )}
       {hasActiveFilters && !hasSavedCurrentView && !error && (
-        <span className="rtng-unsaved-view" style={{
+        <span className="tng-unsaved-view" style={{
           color: 'var(--warning)',
           background: 'color-mix(in srgb, var(--warning) 9%, transparent)',
           border: '1px solid color-mix(in srgb, var(--warning) 38%, var(--border))',
@@ -141,7 +141,7 @@ export function SavedViewsBar({ params, onApply }: Props) {
         </span>
       )}
 
-      <div className="rtng-savedview-save" style={{ display: 'flex', alignItems: 'center', gap: 6, marginLeft: views.length ? 4 : 0 }}>
+      <div className="tng-savedview-save" style={{ display: 'flex', alignItems: 'center', gap: 6, marginLeft: views.length ? 4 : 0 }}>
         <input
           value={name}
           onChange={e => setName(e.target.value)}

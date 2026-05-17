@@ -1,4 +1,4 @@
-//! Shared test fixtures for rtorrentNG crates.
+//! Shared test fixtures for TorrentNG crates.
 //!
 //! This crate intentionally stays small and dependency-light. It provides
 //! deterministic database and torrent-row fixtures that integration tests can
@@ -51,7 +51,7 @@ impl SyntheticTorrentDataset {
     }
 }
 
-/// Open an in-memory SQLite database and apply the rtorrentNG schema.
+/// Open an in-memory SQLite database and apply the TorrentNG schema.
 pub fn memory_db() -> Result<Connection, rt_db::DbError> {
     let conn = Connection::open_in_memory()?;
     rt_db::migrate(&conn)?;

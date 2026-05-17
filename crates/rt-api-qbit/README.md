@@ -5,7 +5,7 @@ qBittorrent Web API v2 compatibility facade over native engine state.
 ## Status: Implemented — compatibility facade
 
 This crate exposes both `/api/qb/v2` and `/api/v2` routes so automation tools
-can configure rtorrentNG as a qBittorrent-compatible download client.
+can configure TorrentNG as a qBittorrent-compatible download client.
 
 The facade projects native torrent registry and engine metadata into qBit
 response shapes. Compatibility structs are intentionally not the internal engine

@@ -78,7 +78,7 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
       position: 'fixed', inset: 0, background: 'rgba(2,6,23,0.72)', zIndex: 1200,
       display: 'grid', placeItems: 'center', padding: 22,
     }} onClick={e => { if (!busy && e.target === e.currentTarget) onClose() }}>
-      <div role="dialog" aria-modal="true" aria-label={`Properties for ${torrent.name}`} className="rtng-properties-dialog rtng-modal" style={{
+      <div role="dialog" aria-modal="true" aria-label={`Properties for ${torrent.name}`} className="tng-properties-dialog tng-modal" style={{
         width: 'min(820px, 100%)', height: 'min(680px, 90vh)', background: 'var(--panel)',
         border: '1px solid var(--border-strong)', borderRadius: 8, display: 'flex', flexDirection: 'column',
         boxShadow: '0 24px 60px var(--shadow)',
@@ -95,8 +95,8 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
           <button onClick={onClose} disabled={busy} style={smallButton('#94a3b8', busy)}>Close</button>
         </header>
 
-        <div className="rtng-properties-body" style={{ display: 'flex', minHeight: 0, flex: 1 }}>
-          <nav className="rtng-properties-tabs" style={{ width: 150, borderRight: '1px solid var(--border)', padding: 10 }}>
+        <div className="tng-properties-body" style={{ display: 'flex', minHeight: 0, flex: 1 }}>
+          <nav className="tng-properties-tabs" style={{ width: 150, borderRight: '1px solid var(--border)', padding: 10 }}>
             {(['general', 'trackers', 'files', 'limits'] as Tab[]).map(item => (
               <button key={item} onClick={() => setTab(item)} disabled={busy} style={{
                 width: '100%', textAlign: 'left', marginBottom: 5, borderRadius: 5,
@@ -114,7 +114,7 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
             ))}
           </nav>
 
-          <main className="rtng-properties-main" style={{ flex: 1, overflowY: 'auto', padding: 14 }}>
+          <main className="tng-properties-main" style={{ flex: 1, overflowY: 'auto', padding: 14 }}>
             {tab === 'general' && (
               <div style={{ display: 'grid', gap: 12 }}>
                 <Field label="Name">
@@ -148,7 +148,7 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
                       {allTags.map(tag => (
                         <button
                           key={tag}
-                          className="rtng-tag-chip"
+                          className="tng-tag-chip"
                           data-active={tags.includes(tag) ? 'true' : 'false'}
                           disabled={busy}
                           onClick={() => setTagsText(Array.from(new Set([...tags, tag])).join(','))}
@@ -158,7 +158,7 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
                     </div>
                   )}
                 </Field>
-                <div className="rtng-two-col" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, color: 'var(--muted)', fontSize: 12 }}>
+                <div className="tng-two-col" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, color: 'var(--muted)', fontSize: 12 }}>
                   <Info label="Hash" value={torrent.hash} mono />
                   <Info label="Tracker" value={torrent.tracker_url || '-'} mono />
                   <Info label="Save path" value={torrent.directory || '-'} mono />
@@ -184,7 +184,7 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
                 {trackers.map(tracker => (
                   <div
                     key={tracker.url}
-                    className="rtng-properties-row"
+                    className="tng-properties-row"
                     data-tone={tracker.message ? 'warn' : 'ok'}
                     style={{
                       border: '1px solid var(--border)', borderRadius: 7, padding: 9,
@@ -192,7 +192,7 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
                     }}
                   >
                     {editingTracker?.url === tracker.url ? (
-                      <div className="rtng-action-grid-3" style={{ display: 'grid', gridTemplateColumns: '1fr auto auto', gap: 7 }}>
+                      <div className="tng-action-grid-3" style={{ display: 'grid', gridTemplateColumns: '1fr auto auto', gap: 7 }}>
                         <input value={trackerUrl} onChange={e => setTrackerUrl(e.target.value)} disabled={busy} style={{ ...INPUT, fontFamily: 'monospace' }} />
                         <button disabled={busy || !trackerUrl.trim()} onClick={() => apply('Tracker edited', async () => {
                           await api.torrents.patchTrackers(torrent.hash, { edit: [{ orig_url: tracker.url, new_url: trackerUrl.trim() }] })
@@ -201,7 +201,7 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
                         <button disabled={busy} onClick={() => setEditingTracker(null)} style={smallButton('#64748b', busy)}>Cancel</button>
                       </div>
                     ) : (
-                      <div className="rtng-action-grid-3" style={{ display: 'grid', gridTemplateColumns: '1fr auto auto', gap: 7, alignItems: 'center' }}>
+                      <div className="tng-action-grid-3" style={{ display: 'grid', gridTemplateColumns: '1fr auto auto', gap: 7, alignItems: 'center' }}>
                         <div>
                           <div style={{ color: 'var(--text)', fontFamily: 'monospace', fontSize: 11, overflowWrap: 'anywhere' }}>{tracker.url}</div>
                           <div style={{ color: 'var(--faint)', fontSize: 11 }}>{tracker.scrape_complete} seeds, {tracker.scrape_incomplete} peers {tracker.message ? `- ${tracker.message}` : ''}</div>
@@ -291,18 +291,18 @@ function FileRow({ file, busy, renaming, name, onName, onRenameStart, onRenameCa
       : { label: 'Normal', color: 'var(--success)' }
   return (
     <div
-      className="rtng-properties-row"
+      className="tng-properties-row"
       data-tone={file.priority === 0 ? 'muted' : pct >= 100 ? 'ok' : 'active'}
       style={{ border: '1px solid var(--border)', borderRadius: 7, padding: 9, background: 'var(--surface)' }}
     >
       {renaming ? (
-        <div className="rtng-action-grid-3" style={{ display: 'grid', gridTemplateColumns: '1fr auto auto', gap: 7 }}>
+        <div className="tng-action-grid-3" style={{ display: 'grid', gridTemplateColumns: '1fr auto auto', gap: 7 }}>
           <input value={name} onChange={e => onName(e.target.value)} style={INPUT} />
           <button disabled={busy || !name.trim()} onClick={onRenameSave} style={smallButton('#93c5fd', busy || !name.trim())}>Save</button>
           <button disabled={busy} onClick={onRenameCancel} style={smallButton('#64748b', busy)}>Cancel</button>
         </div>
       ) : (
-        <div className="rtng-action-grid-3" style={{ display: 'grid', gridTemplateColumns: '1fr auto auto', gap: 7, alignItems: 'center' }}>
+        <div className="tng-action-grid-3" style={{ display: 'grid', gridTemplateColumns: '1fr auto auto', gap: 7, alignItems: 'center' }}>
           <div style={{ minWidth: 0 }}>
             <div style={{ color: 'var(--text)', fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={file.path}>{file.path}</div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 4 }}>
@@ -333,7 +333,7 @@ function FileRow({ file, busy, renaming, name, onName, onRenameStart, onRenameCa
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
-  return <label className="rtng-form-card" style={{
+  return <label className="tng-form-card" style={{
     display: 'grid', gap: 6, color: 'var(--faint)', fontSize: 11, fontWeight: 700,
     textTransform: 'uppercase', background: 'var(--surface)', border: '1px solid var(--border)',
     borderRadius: 7, padding: 10,
@@ -348,8 +348,8 @@ function LoadingRows({ count }: { count: number }) {
           border: '1px solid var(--border)', borderRadius: 7, background: 'var(--surface)',
           padding: '9px 10px', display: 'grid', gap: 7,
         }}>
-          <span className="rtng-skeleton" style={{ width: index % 2 ? '46%' : '64%', height: 10 }} />
-          <span className="rtng-skeleton" style={{ width: index % 2 ? '76%' : '52%', height: 8 }} />
+          <span className="tng-skeleton" style={{ width: index % 2 ? '46%' : '64%', height: 10 }} />
+          <span className="tng-skeleton" style={{ width: index % 2 ? '76%' : '52%', height: 8 }} />
         </div>
       ))}
     </div>
@@ -386,7 +386,7 @@ function TabCount({ children }: { children: React.ReactNode }) {
 }
 
 function Info({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
-  return <div className="rtng-metric-tile" style={{ border: '1px solid var(--border)', borderRadius: 7, background: 'var(--surface)', padding: 9 }}>
+  return <div className="tng-metric-tile" style={{ border: '1px solid var(--border)', borderRadius: 7, background: 'var(--surface)', padding: 9 }}>
     <div style={{ color: 'var(--faint)', fontSize: 10, textTransform: 'uppercase', marginBottom: 3 }}>{label}</div>
     <div style={{ fontFamily: mono ? 'monospace' : undefined, overflowWrap: 'anywhere' }}>{value}</div>
   </div>

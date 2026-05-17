@@ -2,8 +2,11 @@ use std::path::{Path, PathBuf};
 
 use rt_path::StorageProfile;
 
+use crate::elevator::DeviceId;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageTopology {
+    pub device_id: Option<DeviceId>,
     pub profile: StorageProfile,
     pub fs_type: Option<String>,
     pub cow: bool,
@@ -14,6 +17,7 @@ struct MountInfo {
     mount_point: PathBuf,
     major_minor: String,
     fs_type: String,
+    source: String,
 }
 
 /// Best-effort storage profile detection for a path.
@@ -27,6 +31,7 @@ pub fn detect_storage_profile(path: &Path) -> StorageProfile {
 
 pub fn detect_storage_topology(path: &Path) -> StorageTopology {
     detect_storage_topology_inner(path).unwrap_or_else(|| StorageTopology {
+        device_id: None,
         profile: StorageProfile::Unknown,
         fs_type: None,
         cow: false,
@@ -57,6 +62,7 @@ fn detect_storage_topology_from_roots(
     let cow = is_cow_fs(&mount.fs_type);
     if is_network_fs(&mount.fs_type) {
         return Some(StorageTopology {
+            device_id: Some(network_device_id(mount)),
             profile: StorageProfile::Network,
             fs_type,
             cow,
@@ -65,6 +71,7 @@ fn detect_storage_topology_from_roots(
 
     let device = block_device_name(sys_root, &mount.major_minor)?;
     Some(StorageTopology {
+        device_id: Some(DeviceId(device.clone())),
         profile: profile_from_block_device(sys_root, &device),
         fs_type,
         cow,
@@ -102,6 +109,7 @@ fn parse_mountinfo(input: &str) -> Option<Vec<MountInfo>> {
             mount_point: PathBuf::from(unescape_mountinfo(left_fields[4])),
             major_minor: left_fields[2].to_owned(),
             fs_type: right_fields[0].to_owned(),
+            source: right_fields.get(1).copied().unwrap_or("").to_owned(),
         });
     }
     Some(mounts)
@@ -151,6 +159,15 @@ fn is_network_fs(fs_type: &str) -> bool {
             | "sshfs"
             | "virtiofs"
     )
+}
+
+#[cfg(target_os = "linux")]
+fn network_device_id(mount: &MountInfo) -> DeviceId {
+    if mount.source.is_empty() {
+        DeviceId(format!("{}:{}", mount.fs_type, mount.mount_point.display()))
+    } else {
+        DeviceId(format!("{}:{}", mount.fs_type, mount.source))
+    }
 }
 
 pub fn is_cow_fs(fs_type: &str) -> bool {
@@ -280,9 +297,34 @@ mod tests {
             &dir.path().join("sys"),
         )
         .unwrap();
+        assert_eq!(topology.device_id, Some(DeviceId("sda".to_owned())));
         assert_eq!(topology.profile, StorageProfile::Hdd);
         assert_eq!(topology.fs_type.as_deref(), Some("btrfs"));
         assert!(topology.cow);
+    }
+
+    #[test]
+    fn network_topology_uses_mount_source_as_device_id() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("root/remote")).unwrap();
+        let mountinfo = format!(
+            "24 0 0:42 / {} rw,relatime - nfs server:/share rw\n",
+            dir.path().join("root/remote").display()
+        );
+        let mountinfo_path = dir.path().join("mountinfo");
+        std::fs::write(&mountinfo_path, mountinfo).unwrap();
+
+        let topology = detect_storage_topology_from_roots(
+            &dir.path().join("root/remote/movie.bin"),
+            &mountinfo_path,
+            &dir.path().join("sys"),
+        )
+        .unwrap();
+        assert_eq!(
+            topology.device_id,
+            Some(DeviceId("nfs:server:/share".to_owned()))
+        );
+        assert_eq!(topology.profile, StorageProfile::Network);
     }
 
     #[test]

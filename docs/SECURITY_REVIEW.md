@@ -8,7 +8,7 @@ Script workflow execution is disabled by default and must be explicitly enabled:
 [workflows]
 allow_scripts = true
 script_timeout_secs = 30
-allowed_script_dirs = ["/etc/rtorrentng/workflows"]
+allowed_script_dirs = ["/etc/torrentng/workflows"]
 ```
 
 Required production policy:
@@ -25,11 +25,11 @@ Runtime behavior:
 - The sidecar refuses script actions unless `allow_scripts` is true.
 - When `allowed_script_dirs` is non-empty, the script path is canonicalized and must live under one of those directories.
 - The sidecar passes torrent context through environment variables instead of interpolating values into the command:
-  - `RTNG_WORKFLOW_ID`
-  - `RTNG_WORKFLOW_NAME`
-  - `RTNG_TORRENT_HASH`
-  - `RTNG_CATEGORY`
-  - `RTNG_TRACKER`
+  - `TNG_WORKFLOW_ID`
+  - `TNG_WORKFLOW_NAME`
+  - `TNG_TORRENT_HASH`
+  - `TNG_CATEGORY`
+  - `TNG_TRACKER`
 - The sidecar enforces a timeout and records success/failure in workflow run history.
 
 ## Release Checklist

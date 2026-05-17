@@ -46,9 +46,9 @@ RUN apk add --no-cache \
 COPY --from=rtorrent-build /usr/local/bin/rtorrent  /usr/local/bin/rtorrent
 COPY --from=rtorrent-build /usr/local/lib/libtorrent* /usr/local/lib/
 ENV LD_LIBRARY_PATH=/usr/local/lib
-ENV RTNG_PACKAGED_RTORRENT_VERSION=0.16.11
-ENV RTNG_PACKAGED_LIBTORRENT_VERSION=0.16.11
-ENV RTNG_RTORRENT_PATCHES=rtorrent-0.16.11-user-agent-command
+ENV TNG_PACKAGED_RTORRENT_VERSION=0.16.11
+ENV TNG_PACKAGED_LIBTORRENT_VERSION=0.16.11
+ENV TNG_RTORRENT_PATCHES=rtorrent-0.16.11-user-agent-command
 
 # ruTorrent 5.3.1
 RUN mkdir -p /var/www/rutorrent && \

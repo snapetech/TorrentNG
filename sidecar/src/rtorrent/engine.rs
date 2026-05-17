@@ -119,9 +119,9 @@ impl Client {
                 rtorrent_version: self.optional_string("system.client_version").await,
                 libtorrent_version: self.optional_string("system.library_version").await,
                 xmlrpc_backend: "tinyxml2",
-                packaged_rtorrent_version: std::env::var("RTNG_PACKAGED_RTORRENT_VERSION").ok(),
-                packaged_libtorrent_version: std::env::var("RTNG_PACKAGED_LIBTORRENT_VERSION").ok(),
-                patch_set: std::env::var("RTNG_RTORRENT_PATCHES")
+                packaged_rtorrent_version: std::env::var("TNG_PACKAGED_RTORRENT_VERSION").ok(),
+                packaged_libtorrent_version: std::env::var("TNG_PACKAGED_LIBTORRENT_VERSION").ok(),
+                patch_set: std::env::var("TNG_RTORRENT_PATCHES")
                     .unwrap_or_default()
                     .split(',')
                     .map(str::trim)
@@ -419,8 +419,8 @@ fn capability_matrix(methods: &[String]) -> Vec<EngineCapability> {
         ),
         (
             "live_summary",
-            "rtorrentNG live summary",
-            "rtng.live_summary",
+            "TorrentNG live summary",
+            "tng.live_summary",
         ),
     ];
 

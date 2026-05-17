@@ -56,7 +56,7 @@ pub async fn app_build_info() -> impl IntoResponse {
         StatusCode::OK,
         Json(serde_json::json!({
             "qt": "6.7.0",
-            "libtorrent": "rtorrentNG-native",
+            "libtorrent": "TorrentNG-native",
             "boost": "",
             "openssl": "",
             "bitness": 64,
@@ -66,11 +66,24 @@ pub async fn app_build_info() -> impl IntoResponse {
 
 pub async fn app_preferences(State(state): State<AppState>) -> impl IntoResponse {
     let save_path = default_save_path(&state).await;
-    (StatusCode::OK, Json(qbit_preferences(save_path)))
+    let mut preferences = qbit_preferences(save_path);
+    if let Some(map) = preferences.as_object_mut() {
+        for (key, value) in state.preference_overrides.read().await.iter() {
+            map.insert(key.clone(), value.clone());
+        }
+    }
+    (StatusCode::OK, Json(preferences))
 }
 
-pub async fn app_set_preferences() -> impl IntoResponse {
-    StatusCode::OK
+pub async fn app_set_preferences(State(state): State<AppState>, body: String) -> impl IntoResponse {
+    match qbit_preference_payload(&body) {
+        Some(serde_json::Value::Object(updates)) => {
+            state.preference_overrides.write().await.extend(updates);
+            StatusCode::OK
+        }
+        Some(_) => StatusCode::BAD_REQUEST,
+        None => StatusCode::BAD_REQUEST,
+    }
 }
 
 pub async fn app_shutdown() -> impl IntoResponse {
@@ -278,6 +291,16 @@ fn qbit_preferences(save_path: String) -> serde_json::Value {
         "upnp_lease_duration": 0,
         "utp_tcp_mixed_mode": 0,
     })
+}
+
+fn qbit_preference_payload(body: &str) -> Option<serde_json::Value> {
+    let trimmed = body.trim();
+    if trimmed.starts_with('{') {
+        return serde_json::from_str(trimmed).ok();
+    }
+    parse_form_body(trimmed)
+        .remove("json")
+        .and_then(|json| serde_json::from_str(&json).ok())
 }
 
 // ---------------------------------------------------------------------------
@@ -2922,6 +2945,59 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
         assert_eq!(std::str::from_utf8(&body).unwrap(), "/data/");
+    }
+
+    #[tokio::test]
+    async fn app_set_preferences_persists_form_and_json_updates() {
+        let app = build_qbit_router(AppState::new());
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/app/setPreferences")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(
+                        "json=%7B%22locale%22%3A%22fr%22%2C%22scheduler_enabled%22%3Atrue%2C%22web_ui_port%22%3A9090%7D",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/app/setPreferences")
+                    .body(Body::from(
+                        r#"{"rss_processing_enabled":true,"save_path":"/incoming"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/qb/v2/app/preferences")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["locale"], "fr");
+        assert_eq!(v["scheduler_enabled"], true);
+        assert_eq!(v["web_ui_port"], 9090);
+        assert_eq!(v["rss_processing_enabled"], true);
+        assert_eq!(v["save_path"], "/incoming");
     }
 
     #[tokio::test]

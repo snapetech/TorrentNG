@@ -44,7 +44,7 @@ fi
 # Set socket group-readable for nginx/PHP-FPM
 chmod 660 "$SOCKET"
 
-echo "rtorrentNG Phase 1 ready. ruTorrent: http://localhost/"
+echo "TorrentNG Phase 1 ready. ruTorrent: http://localhost/"
 echo "Socket: $SOCKET"
 
 while pgrep rtorrent >/dev/null && pgrep nginx >/dev/null && pgrep php-fpm83 >/dev/null; do

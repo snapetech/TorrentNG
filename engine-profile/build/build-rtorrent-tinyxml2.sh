@@ -2,7 +2,7 @@
 set -eu
 
 PREFIX=${PREFIX:-/usr/local}
-WORKDIR=${WORKDIR:-/tmp/rtorrentng-build}
+WORKDIR=${WORKDIR:-/tmp/torrentng-build}
 LIBTORRENT_REF=${LIBTORRENT_REF:-v0.16.11}
 RTORRENT_REF=${RTORRENT_REF:-v0.16.11}
 JOBS=${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)}

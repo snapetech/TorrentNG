@@ -1,6 +1,6 @@
-# rtorrentNG API Reference
+# TorrentNG API Reference
 
-rtorrentNG exposes the same client-facing API families in both native-engine
+TorrentNG exposes the same client-facing API families in both native-engine
 mode and the Track 1 rTorrent sidecar:
 
 - **Native API** — `/api/v1/` — JSON REST, snake_case, designed for the WebUI and direct integrations. In native-engine mode this is backed by durable engine state; in Track 1 it is a sidecar facade over rTorrent.
@@ -11,7 +11,7 @@ mode and the Track 1 rTorrent sidecar:
 All surfaces are served on the same port (default `8080`).
 
 The API strategy is compatibility-first: existing tools should be able to keep
-speaking the client dialect they already support while rtorrentNG projects those
+speaking the client dialect they already support while TorrentNG projects those
 calls onto one native model. Endpoint availability does not by itself mean full
 semantic parity; current native, partial, compatibility-only, and gap status is
 tracked in [CLIENT_COMPATIBILITY_MATRICES.md](CLIENT_COMPATIBILITY_MATRICES.md).
@@ -27,7 +27,7 @@ When `auth.api_tokens` is configured, all non-public endpoints require one of:
 
 ```
 Authorization: Bearer <token>
-Cookie: rtng_session=<token>
+Cookie: tng_session=<token>
 ```
 
 Public endpoints (never require auth): `/health`, `/metrics`, `/api/qb/v2/auth/login`
@@ -232,13 +232,13 @@ Pass `dry_run: true` to preview what would be affected without making changes.
 
 ## qBittorrent Compat API — `/api/v2` or `/api/qb/v2`
 
-Implements the qBittorrent Web API v2. By default it advertises qBittorrent `5.0.0` / Web API `2.11.0`; lab builds can override those API-facing values with the `RTNG_QBITTORRENT_*` identity environment variables. Configure external tools to point at this server as if it were qBittorrent.
+Implements the qBittorrent Web API v2. By default it advertises qBittorrent `5.0.0` / Web API `2.11.0`; lab builds can override those API-facing values with the `TNG_QBITTORRENT_*` identity environment variables. Configure external tools to point at this server as if it were qBittorrent.
 
 ### Auth
 
 | Method | Path | Notes |
 |--------|------|-------|
-| `POST` | `/api/qb/v2/auth/login` | In no-auth mode accepts any credentials; with `auth.api_tokens`, use an API token as username or password to receive an `rtng_session` cookie |
+| `POST` | `/api/qb/v2/auth/login` | In no-auth mode accepts any credentials; with `auth.api_tokens`, use an API token as username or password to receive an `tng_session` cookie |
 | `POST` | `/api/qb/v2/auth/logout` | No-op |
 
 ### App
@@ -359,23 +359,23 @@ rTorrent over XMLRPC.
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `rtorrentng_torrents_total` | gauge | Total torrents in session |
-| `rtorrentng_torrents_seeding` | gauge | Currently seeding |
-| `rtorrentng_torrents_downloading` | gauge | Currently downloading |
-| `rtorrentng_torrents_stopped` | gauge | Stopped |
-| `rtorrentng_torrents_errored` | gauge | In error state |
-| `rtorrentng_peers_connected` | gauge | Connected peers across all torrents |
-| `rtorrentng_storage_file_pool_*` | gauge/counter | Native scheduler open-file cache capacity, open files, hits, misses, evictions, and idle closes |
-| `rtorrentng_storage_*_queue_depth` | gauge | Native disk I/O and hashing queue depths |
-| `rtorrentng_storage_{read,write}_ops_total` | counter | Positioned disk operations through native schedulers |
-| `rtorrentng_storage_bytes_{read,written}_total` | counter | Bytes moved through native schedulers |
-| `rtorrentng_storage_*_by_class_total{class=...}` | counter | Read/write operation and byte counters split by scheduler I/O class |
-| `rtorrentng_storage_backend_read_*` | counter | Actual backend disk read operations and bytes, excluding peer-read cache hits |
-| `rtorrentng_storage_*_latency_nanoseconds` | histogram/counter | Storage queue plus execution latency buckets and cumulative totals for read, write, sync, and hash work |
-| `rtorrentng_storage_{sync,hash}_ops_total` | counter | Durability syncs and hashing-pool work |
-| `rtorrentng_storage_preallocation_*_total` | counter | Preallocation failures and fallback events |
-| `rtorrentng_storage_peer_read_cache_*` | gauge/counter | Peer-read readahead cache entries, hits, and misses |
-| `rtorrentng_piece_assembly_*` | gauge/counter | In-memory completed-piece assembly buffers, bytes, and budget evictions |
-| `rtorrentng_api_requests_total` | counter | API requests served |
-| `rtorrentng_sync_cycles_total` | counter | Track 1 sidecar rTorrent sync cycles completed |
-| `rtorrentng_sync_errors_total` | counter | Track 1 sidecar rTorrent sync cycle errors |
+| `torrentng_torrents_total` | gauge | Total torrents in session |
+| `torrentng_torrents_seeding` | gauge | Currently seeding |
+| `torrentng_torrents_downloading` | gauge | Currently downloading |
+| `torrentng_torrents_stopped` | gauge | Stopped |
+| `torrentng_torrents_errored` | gauge | In error state |
+| `torrentng_peers_connected` | gauge | Connected peers across all torrents |
+| `torrentng_storage_file_pool_*` | gauge/counter | Native scheduler open-file cache capacity, open files, hits, misses, evictions, and idle closes |
+| `torrentng_storage_*_queue_depth` | gauge | Native disk I/O and hashing queue depths |
+| `torrentng_storage_{read,write}_ops_total` | counter | Positioned disk operations through native schedulers |
+| `torrentng_storage_bytes_{read,written}_total` | counter | Bytes moved through native schedulers |
+| `torrentng_storage_*_by_class_total{class=...}` | counter | Read/write operation and byte counters split by scheduler I/O class |
+| `torrentng_storage_backend_read_*` | counter | Actual backend disk read operations and bytes, excluding peer-read cache hits |
+| `torrentng_storage_*_latency_nanoseconds` | histogram/counter | Storage queue plus execution latency buckets and cumulative totals for read, write, sync, and hash work |
+| `torrentng_storage_{sync,hash}_ops_total` | counter | Durability syncs and hashing-pool work |
+| `torrentng_storage_preallocation_*_total` | counter | Preallocation failures and fallback events |
+| `torrentng_storage_peer_read_cache_*` | gauge/counter | Peer-read readahead cache entries, hits, and misses |
+| `torrentng_piece_assembly_*` | gauge/counter | In-memory completed-piece assembly buffers, bytes, and budget evictions |
+| `torrentng_api_requests_total` | counter | API requests served |
+| `torrentng_sync_cycles_total` | counter | Track 1 sidecar rTorrent sync cycles completed |
+| `torrentng_sync_errors_total` | counter | Track 1 sidecar rTorrent sync cycle errors |

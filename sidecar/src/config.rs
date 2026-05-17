@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, time::Duration};
 
 /// Default user-agent announced to trackers via rTorrent.
-/// Overridden by config or RTNG_USER_AGENT env var.
+/// Overridden by config or TNG_USER_AGENT env var.
 pub const DEFAULT_USER_AGENT: &str = "rtorrent/0.16.11";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -50,7 +50,7 @@ pub struct RtorrentConfig {
     pub timeout_secs: u64,
 
     /// User-agent string pushed to rTorrent's network.http.user_agent on startup.
-    /// Override with RTNG_USER_AGENT env var.
+    /// Override with TNG_USER_AGENT env var.
     /// See docs/CONFIGURATION.md for accepted values.
     #[serde(default = "default_user_agent")]
     pub user_agent: String,
@@ -147,7 +147,7 @@ impl Config {
             Some(p) => PathBuf::from(p),
             None => {
                 let home = dirs_next::home_dir().context("cannot determine home directory")?;
-                home.join(".config").join("rtorrentng").join("config.toml")
+                home.join(".config").join("torrentng").join("config.toml")
             }
         };
 
@@ -174,35 +174,35 @@ impl Config {
     }
 
     fn apply_env(&mut self) {
-        if let Ok(v) = std::env::var("RTNG_LISTEN_ADDR") {
+        if let Ok(v) = std::env::var("TNG_LISTEN_ADDR") {
             self.listen_addr = v;
         }
-        if let Ok(v) = std::env::var("RTNG_DEBUG") {
+        if let Ok(v) = std::env::var("TNG_DEBUG") {
             self.debug = v == "1" || v.eq_ignore_ascii_case("true");
         }
-        if let Ok(v) = std::env::var("RTNG_SYNC_INTERVAL_SECS") {
+        if let Ok(v) = std::env::var("TNG_SYNC_INTERVAL_SECS") {
             if let Ok(secs) = v.parse() {
                 self.sync_interval_secs = secs;
             }
         }
-        if let Ok(v) = std::env::var("RTNG_DATA_DIR") {
+        if let Ok(v) = std::env::var("TNG_DATA_DIR") {
             self.data_dir = Some(PathBuf::from(v));
         }
-        if let Ok(v) = std::env::var("RTNG_USER_AGENT") {
+        if let Ok(v) = std::env::var("TNG_USER_AGENT") {
             self.rtorrent.user_agent = v;
         }
-        if let Ok(v) = std::env::var("RTNG_SCGI_SOCKET") {
+        if let Ok(v) = std::env::var("TNG_SCGI_SOCKET") {
             self.rtorrent.scgi_socket = Some(v);
             self.rtorrent.scgi_addr = None;
         }
-        if let Ok(v) = std::env::var("RTNG_SCGI_ADDR") {
+        if let Ok(v) = std::env::var("TNG_SCGI_ADDR") {
             self.rtorrent.scgi_addr = Some(v);
             self.rtorrent.scgi_socket = None;
         }
-        if let Ok(v) = std::env::var("RTNG_SECRET_KEY") {
+        if let Ok(v) = std::env::var("TNG_SECRET_KEY") {
             self.auth.secret_key = Some(v);
         }
-        if let Ok(v) = std::env::var("RTNG_API_TOKENS") {
+        if let Ok(v) = std::env::var("TNG_API_TOKENS") {
             self.auth.api_tokens = v
                 .split(',')
                 .map(str::trim)
@@ -210,19 +210,19 @@ impl Config {
                 .map(ToOwned::to_owned)
                 .collect();
         }
-        if let Ok(v) = std::env::var("RTNG_ALLOW_SCRIPTS") {
+        if let Ok(v) = std::env::var("TNG_ALLOW_SCRIPTS") {
             self.workflows.allow_scripts = v == "1" || v.eq_ignore_ascii_case("true");
         }
-        if let Ok(v) = std::env::var("RTNG_QBITTORRENT_VERSION") {
+        if let Ok(v) = std::env::var("TNG_QBITTORRENT_VERSION") {
             self.identity.qbittorrent_version = v;
         }
-        if let Ok(v) = std::env::var("RTNG_QBITTORRENT_WEBAPI_VERSION") {
+        if let Ok(v) = std::env::var("TNG_QBITTORRENT_WEBAPI_VERSION") {
             self.identity.qbittorrent_webapi_version = v;
         }
-        if let Ok(v) = std::env::var("RTNG_QBITTORRENT_BUILD_LIBTORRENT") {
+        if let Ok(v) = std::env::var("TNG_QBITTORRENT_BUILD_LIBTORRENT") {
             self.identity.qbittorrent_build_libtorrent = v;
         }
-        if let Ok(v) = std::env::var("RTNG_QBITTORRENT_BUILD_QT") {
+        if let Ok(v) = std::env::var("TNG_QBITTORRENT_BUILD_QT") {
             self.identity.qbittorrent_build_qt = v;
         }
     }
@@ -242,7 +242,7 @@ impl Config {
         let dir = self.data_dir.clone().unwrap_or_else(|| {
             dirs_next::data_local_dir()
                 .unwrap_or_else(|| PathBuf::from("/var/lib"))
-                .join("rtorrentng")
+                .join("torrentng")
         });
         dir.join("cache.db")
     }
@@ -266,11 +266,11 @@ mod tests {
     #[test]
     fn auth_env_overrides_file_values() {
         let _guard = ENV_LOCK.lock().expect("env lock poisoned");
-        let old_secret = std::env::var("RTNG_SECRET_KEY").ok();
-        let old_tokens = std::env::var("RTNG_API_TOKENS").ok();
+        let old_secret = std::env::var("TNG_SECRET_KEY").ok();
+        let old_tokens = std::env::var("TNG_API_TOKENS").ok();
 
-        std::env::set_var("RTNG_SECRET_KEY", "runtime-secret");
-        std::env::set_var("RTNG_API_TOKENS", "alpha, beta ,,gamma");
+        std::env::set_var("TNG_SECRET_KEY", "runtime-secret");
+        std::env::set_var("TNG_API_TOKENS", "alpha, beta ,,gamma");
 
         let mut cfg = Config::test_default();
         cfg.auth.secret_key = Some("file-secret".to_owned());
@@ -280,22 +280,22 @@ mod tests {
         assert_eq!(cfg.auth.secret_key.as_deref(), Some("runtime-secret"));
         assert_eq!(cfg.auth.api_tokens, ["alpha", "beta", "gamma"]);
 
-        restore_env("RTNG_SECRET_KEY", old_secret);
-        restore_env("RTNG_API_TOKENS", old_tokens);
+        restore_env("TNG_SECRET_KEY", old_secret);
+        restore_env("TNG_API_TOKENS", old_tokens);
     }
 
     #[test]
     fn identity_env_overrides_defaults() {
         let _guard = ENV_LOCK.lock().expect("env lock poisoned");
-        let old_qb = std::env::var("RTNG_QBITTORRENT_VERSION").ok();
-        let old_api = std::env::var("RTNG_QBITTORRENT_WEBAPI_VERSION").ok();
-        let old_lt = std::env::var("RTNG_QBITTORRENT_BUILD_LIBTORRENT").ok();
-        let old_qt = std::env::var("RTNG_QBITTORRENT_BUILD_QT").ok();
+        let old_qb = std::env::var("TNG_QBITTORRENT_VERSION").ok();
+        let old_api = std::env::var("TNG_QBITTORRENT_WEBAPI_VERSION").ok();
+        let old_lt = std::env::var("TNG_QBITTORRENT_BUILD_LIBTORRENT").ok();
+        let old_qt = std::env::var("TNG_QBITTORRENT_BUILD_QT").ok();
 
-        std::env::set_var("RTNG_QBITTORRENT_VERSION", "4.6.7");
-        std::env::set_var("RTNG_QBITTORRENT_WEBAPI_VERSION", "2.10.4");
-        std::env::set_var("RTNG_QBITTORRENT_BUILD_LIBTORRENT", "2.0.10.0");
-        std::env::set_var("RTNG_QBITTORRENT_BUILD_QT", "6.6.3");
+        std::env::set_var("TNG_QBITTORRENT_VERSION", "4.6.7");
+        std::env::set_var("TNG_QBITTORRENT_WEBAPI_VERSION", "2.10.4");
+        std::env::set_var("TNG_QBITTORRENT_BUILD_LIBTORRENT", "2.0.10.0");
+        std::env::set_var("TNG_QBITTORRENT_BUILD_QT", "6.6.3");
 
         let mut cfg = Config::test_default();
         cfg.apply_env();
@@ -305,10 +305,10 @@ mod tests {
         assert_eq!(cfg.identity.qbittorrent_build_libtorrent, "2.0.10.0");
         assert_eq!(cfg.identity.qbittorrent_build_qt, "6.6.3");
 
-        restore_env("RTNG_QBITTORRENT_VERSION", old_qb);
-        restore_env("RTNG_QBITTORRENT_WEBAPI_VERSION", old_api);
-        restore_env("RTNG_QBITTORRENT_BUILD_LIBTORRENT", old_lt);
-        restore_env("RTNG_QBITTORRENT_BUILD_QT", old_qt);
+        restore_env("TNG_QBITTORRENT_VERSION", old_qb);
+        restore_env("TNG_QBITTORRENT_WEBAPI_VERSION", old_api);
+        restore_env("TNG_QBITTORRENT_BUILD_LIBTORRENT", old_lt);
+        restore_env("TNG_QBITTORRENT_BUILD_QT", old_qt);
     }
 
     fn restore_env(key: &str, value: Option<String>) {
@@ -322,8 +322,8 @@ mod tests {
     #[test]
     fn sync_and_data_dir_env_override_file_values() {
         let _guard = ENV_LOCK.lock().expect("env lock poisoned");
-        let old_sync = std::env::var("RTNG_SYNC_INTERVAL_SECS").ok();
-        let old_data_dir = std::env::var("RTNG_DATA_DIR").ok();
+        let old_sync = std::env::var("TNG_SYNC_INTERVAL_SECS").ok();
+        let old_data_dir = std::env::var("TNG_DATA_DIR").ok();
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
         std::fs::write(
@@ -339,14 +339,14 @@ scgi_socket = "/tmp/rtorrent.sock"
         )
         .unwrap();
 
-        std::env::set_var("RTNG_SYNC_INTERVAL_SECS", "86400");
-        std::env::set_var("RTNG_DATA_DIR", "/tmp/env-data");
+        std::env::set_var("TNG_SYNC_INTERVAL_SECS", "86400");
+        std::env::set_var("TNG_DATA_DIR", "/tmp/env-data");
 
         let cfg = Config::load(Some(config_path.to_str().unwrap())).unwrap();
         assert_eq!(cfg.sync_interval_secs, 86400);
         assert_eq!(cfg.data_dir, Some(PathBuf::from("/tmp/env-data")));
 
-        restore_env("RTNG_SYNC_INTERVAL_SECS", old_sync);
-        restore_env("RTNG_DATA_DIR", old_data_dir);
+        restore_env("TNG_SYNC_INTERVAL_SECS", old_sync);
+        restore_env("TNG_DATA_DIR", old_data_dir);
     }
 }

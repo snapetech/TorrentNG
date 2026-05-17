@@ -1,6 +1,6 @@
 [package]
 name = "rt-testkit"
-description = "rtorrentNG: rt-testkit"
+description = "TorrentNG: rt-testkit"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

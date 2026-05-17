@@ -1,6 +1,6 @@
 [package]
 name = "rt-metrics"
-description = "rtorrentNG: runtime performance counters and scale certification"
+description = "TorrentNG: runtime performance counters and scale certification"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

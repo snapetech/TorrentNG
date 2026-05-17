@@ -33,7 +33,7 @@ run_gate() {
 }
 
 {
-  echo "# rtorrentNG Native Engine Certification Report"
+  echo "# TorrentNG Native Engine Certification Report"
   echo
   echo "- Date UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "- Host: $(hostname)"

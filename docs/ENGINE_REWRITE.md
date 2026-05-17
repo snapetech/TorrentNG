@@ -1,18 +1,18 @@
 # Engine Rewrite Guide
 
-This is the practical guide to the rtorrentNG engine rewrite: what it is, how
+This is the practical guide to the TorrentNG engine rewrite: what it is, how
 it differs from the rTorrent-backed mode, and how to test either engine.
 
 ## Short Version
 
-rtorrentNG has two runtime modes under one compatibility goal: make the project
+TorrentNG has two runtime modes under one compatibility goal: make the project
 usable as a migration target, an interop peer, and eventually a practical
 drop-in replacement for the torrent clients and APIs operators already use.
 
 | Mode | Process | BitTorrent engine | Best for |
 |---|---|---|---|
-| Native rewrite | `rusttorrentd` | rtorrentNG Rust crates | Testing and developing the new engine, native deployments, storage/recheck/job work |
-| rTorrent core | `rTorrent` + `rtorrentng` sidecar | Upstream rTorrent/libtorrent | Compatibility comparison, migration bridge, existing rTorrent users |
+| Native rewrite | `rusttorrentd` | TorrentNG Rust crates | Testing and developing the new engine, native deployments, storage/recheck/job work |
+| rTorrent core | `rTorrent` + `torrentng` sidecar | Upstream rTorrent/libtorrent | Compatibility comparison, migration bridge, existing rTorrent users |
 
 The WebUI and compatibility APIs are shared goals, but the source of truth is
 different. Native mode owns the torrent lifecycle itself. rTorrent mode reflects
@@ -26,8 +26,8 @@ The Track 1 sidecar fixed the control plane around rTorrent: auth, WebUI,
 qBittorrent-compatible endpoints, safer local RPC access, integration tests,
 and operational profiles. It could not fix the engine-level constraints:
 
-- rTorrent owns storage behavior and has no rtorrentNG userspace disk scheduler.
-- Rechecks are not durable rtorrentNG jobs with pause/resume/cancel semantics.
+- rTorrent owns storage behavior and has no TorrentNG userspace disk scheduler.
+- Rechecks are not durable TorrentNG jobs with pause/resume/cancel semantics.
 - Torrent lifecycle history is limited compared with native structured events.
 - The sidecar must poll and translate XMLRPC state.
 - Engine behavior depends on rTorrent/libtorrent build details.
@@ -38,7 +38,7 @@ The rewrite moves those concerns into Rust crates with durable SQLite state,
 explicit storage scheduling, observable jobs, and API projections over one
 engine model. That single model is what makes the larger compatibility target
 credible: import from many clients, project many APIs, and certify behavior from
-one source of truth instead of binding rtorrentNG to one legacy engine.
+one source of truth instead of binding TorrentNG to one legacy engine.
 
 ## Native Engine Shape
 
@@ -76,7 +76,7 @@ The rTorrent-backed mode keeps upstream rTorrent as the engine:
 WebUI / automation clients
           |
           v
-sidecar/rtorrentng
+sidecar/torrentng
           |
           v
 trusted local SCGI/XMLRPC socket

@@ -4,23 +4,23 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SLSKR_ROOT="${SLSKR_ROOT:-/home/keith/Documents/code/slskR}"
 POOL_FILE="${SLSKR_PROTON_CREDENTIAL_POOL_FILE:-$SLSKR_ROOT/.secrets/proton-credential-pool.env}"
-LABEL="${RTNG_PROTON_LABEL:-p1}"
-OUT="${1:-$ROOT/certification/reports/proton-rtng-dht-$(date -u +%Y%m%dT%H%M%SZ).md}"
-IMAGE="${RTNG_PROTON_IMAGE:-rtorrentng:certification}"
-CONTAINER="rtng-proton-cert-${LABEL}-$(date -u +%H%M%S)"
-NS="rtngvpn-${LABEL}-$(date -u +%H%M%S)"
-PRIVATE_PORT="${RTNG_PROTON_PRIVATE_PORT:-51000}"
-NATPMP_PUBLIC_PORT="${RTNG_PROTON_PUBLIC_PORT:-0}"
-NATPMP_GATEWAY="${RTNG_PROTON_NATPMP_GATEWAY:-10.2.0.1}"
-NATPMP_LIFETIME="${RTNG_PROTON_NATPMP_LIFETIME:-600}"
-API_TOKEN="${RTNG_API_TOKEN:-cert-token}"
-SECRET_KEY="${RTNG_SECRET_KEY:-proton-cert-secret-000000000000000000000000}"
-SUBNET_BASE="${RTNG_PROTON_SUBNET_BASE:-10.244.$((100 + ($(date +%S) % 100))).0}"
-HOST_NS_IP="${RTNG_PROTON_HOST_NS_IP:-${SUBNET_BASE%.*}.1}"
-CONTAINER_IP="${RTNG_PROTON_CONTAINER_IP:-${SUBNET_BASE%.*}.2}"
-UPLINK_BASE="${RTNG_PROTON_UPLINK_BASE:-10.245.$((100 + ($(date +%S) % 100))).0}"
-UPLINK_HOST_IP="${RTNG_PROTON_UPLINK_HOST_IP:-${UPLINK_BASE%.*}.1}"
-UPLINK_NS_IP="${RTNG_PROTON_UPLINK_NS_IP:-${UPLINK_BASE%.*}.2}"
+LABEL="${TNG_PROTON_LABEL:-p1}"
+OUT="${1:-$ROOT/certification/reports/proton-tng-dht-$(date -u +%Y%m%dT%H%M%SZ).md}"
+IMAGE="${TNG_PROTON_IMAGE:-torrentng:certification}"
+CONTAINER="tng-proton-cert-${LABEL}-$(date -u +%H%M%S)"
+NS="tngvpn-${LABEL}-$(date -u +%H%M%S)"
+PRIVATE_PORT="${TNG_PROTON_PRIVATE_PORT:-51000}"
+NATPMP_PUBLIC_PORT="${TNG_PROTON_PUBLIC_PORT:-0}"
+NATPMP_GATEWAY="${TNG_PROTON_NATPMP_GATEWAY:-10.2.0.1}"
+NATPMP_LIFETIME="${TNG_PROTON_NATPMP_LIFETIME:-600}"
+API_TOKEN="${TNG_API_TOKEN:-cert-token}"
+SECRET_KEY="${TNG_SECRET_KEY:-proton-cert-secret-000000000000000000000000}"
+SUBNET_BASE="${TNG_PROTON_SUBNET_BASE:-10.244.$((100 + ($(date +%S) % 100))).0}"
+HOST_NS_IP="${TNG_PROTON_HOST_NS_IP:-${SUBNET_BASE%.*}.1}"
+CONTAINER_IP="${TNG_PROTON_CONTAINER_IP:-${SUBNET_BASE%.*}.2}"
+UPLINK_BASE="${TNG_PROTON_UPLINK_BASE:-10.245.$((100 + ($(date +%S) % 100))).0}"
+UPLINK_HOST_IP="${TNG_PROTON_UPLINK_HOST_IP:-${UPLINK_BASE%.*}.1}"
+UPLINK_NS_IP="${TNG_PROTON_UPLINK_NS_IP:-${UPLINK_BASE%.*}.2}"
 VETH_HOST="v${NS:0:10}h"
 VETH_CONT="v${NS:0:10}c"
 VETH_UP_HOST="u${NS:0:10}h"
@@ -29,7 +29,7 @@ TMP_CONFIG="$(mktemp)"
 TMP_OUTPUT="$(mktemp)"
 DATA_DIR="$(mktemp -d)"
 SESSION_DIR="$(mktemp -d)"
-RTNG_DATA_DIR="$(mktemp -d)"
+TNG_DATA_DIR="$(mktemp -d)"
 key_file=""
 
 mkdir -p "$(dirname "$OUT")"
@@ -60,7 +60,7 @@ cleanup() {
   sudo iptables -D FORWARD -i "$VETH_UP_HOST" -j ACCEPT 2>/dev/null || true
   sudo iptables -D FORWARD -o "$VETH_UP_HOST" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
   rm -f "$TMP_CONFIG" "$TMP_OUTPUT" "$key_file"
-  rm -rf "$DATA_DIR" "$SESSION_DIR" "$RTNG_DATA_DIR"
+  rm -rf "$DATA_DIR" "$SESSION_DIR" "$TNG_DATA_DIR"
 }
 trap cleanup EXIT
 
@@ -82,7 +82,7 @@ extract_first_value() {
 }
 
 {
-  echo "# rtorrentNG Proton-Routed DHT Certification"
+  echo "# TorrentNG Proton-Routed DHT Certification"
   echo
   echo "- Date UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "- Proton label: $LABEL"
@@ -169,18 +169,18 @@ docker run -d --rm --name "$CONTAINER" --network none \
   -v "$ROOT/deploy/certification/sidecar.config.toml:/config/config.toml:ro" \
   -v "$DATA_DIR:/data" \
   -v "$SESSION_DIR:/session" \
-  -v "$RTNG_DATA_DIR:/var/lib/rtorrentng" \
-  -e RTORRENTNG_CONFIG=/config/config.toml \
+  -v "$TNG_DATA_DIR:/var/lib/torrentng" \
+  -e TORRENTNG_CONFIG=/config/config.toml \
   -e RTORRENT_INCOMING_PORT="$PRIVATE_PORT" \
   -e RTORRENT_SCGI_SOCKET=/run/rtorrent/rpc.sock \
-  -e RTNG_STATIC_DIR=/usr/share/rtorrentng/webui \
-  -e RTNG_SYNC_INTERVAL_SECS=2 \
-  -e RTNG_DATA_DIR=/var/lib/rtorrentng \
-  -e RTNG_SECRET_KEY="$SECRET_KEY" \
-  -e RTNG_API_TOKENS="$API_TOKEN" \
+  -e TNG_STATIC_DIR=/usr/share/torrentng/webui \
+  -e TNG_SYNC_INTERVAL_SECS=2 \
+  -e TNG_DATA_DIR=/var/lib/torrentng \
+  -e TNG_SECRET_KEY="$SECRET_KEY" \
+  -e TNG_API_TOKENS="$API_TOKEN" \
   "$IMAGE" >/dev/null
 docker exec "$CONTAINER" sh -lc "printf 'nameserver %s\n' '$NATPMP_GATEWAY' > /etc/resolv.conf" 2>/dev/null || true
-mark "rtorrentNG container" "PASS" "$IMAGE"
+mark "TorrentNG container" "PASS" "$IMAGE"
 
 container_pid="$(docker inspect -f '{{.State.Pid}}' "$CONTAINER")"
 sudo ip link add "$VETH_HOST" type veth peer name "$VETH_CONT"
@@ -202,8 +202,8 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 [[ "$code" == "200" || "$code" == "503" ]] \
-  && mark "rtorrentNG health" "PASS" "HTTP $code" \
-  || mark "rtorrentNG health" "FAIL" "HTTP $code"
+  && mark "TorrentNG health" "PASS" "HTTP $code" \
+  || mark "TorrentNG health" "FAIL" "HTTP $code"
 
 container_egress="$(timeout 12 docker exec "$CONTAINER" sh -lc 'wget -T 5 -qO- https://api.ipify.org 2>/dev/null || wget -T 5 -qO- http://ifconfig.me/ip 2>/dev/null || true' | tr -d '\r\n' || true)"
 [[ -n "$container_egress" ]] \
@@ -222,11 +222,11 @@ public_port="$(awk '/Mapped public port/ {for (i=1; i<=NF; i++) if ($i=="port") 
   && mark "Proton NAT-PMP mapping" "PASS" "$public_ip:$public_port -> $PRIVATE_PORT tcp/udp" \
   || mark "Proton NAT-PMP mapping" "FAIL" "tcp_exit=$tcp_natpmp_status udp_exit=$udp_natpmp_status $(tr '\n' ' ' < "$TMP_OUTPUT")"
 
-DHT_REPORT="$ROOT/certification/reports/dht-cert-proton-rtng-$(date -u +%Y%m%dT%H%M%SZ).md"
-if [[ -n "$public_ip" && -n "$public_port" ]] && sudo -E ip netns exec "$NS" env PATH="$PATH" RTNG_HOST_URL="http://$CONTAINER_IP:8080" RTNG_API_TOKEN="$API_TOKEN" RTNG_CONTAINER="$CONTAINER" RTNG_INCOMING_PORT="$PRIVATE_PORT" RTNG_VPN_PUBLIC_PORT="$public_port" RTNG_VPN_PUBLIC_IP="$public_ip" "$ROOT/scripts/dht_certification.sh" "$DHT_REPORT"; then
-  mark "DHT certification over Proton-routed rtorrentNG" "PASS" "$(basename "$DHT_REPORT")"
+DHT_REPORT="$ROOT/certification/reports/dht-cert-proton-tng-$(date -u +%Y%m%dT%H%M%SZ).md"
+if [[ -n "$public_ip" && -n "$public_port" ]] && sudo -E ip netns exec "$NS" env PATH="$PATH" TNG_HOST_URL="http://$CONTAINER_IP:8080" TNG_API_TOKEN="$API_TOKEN" TNG_CONTAINER="$CONTAINER" TNG_INCOMING_PORT="$PRIVATE_PORT" TNG_VPN_PUBLIC_PORT="$public_port" TNG_VPN_PUBLIC_IP="$public_ip" "$ROOT/scripts/dht_certification.sh" "$DHT_REPORT"; then
+  mark "DHT certification over Proton-routed TorrentNG" "PASS" "$(basename "$DHT_REPORT")"
 else
-  mark "DHT certification over Proton-routed rtorrentNG" "FAIL" "$(basename "$DHT_REPORT")"
+  mark "DHT certification over Proton-routed TorrentNG" "FAIL" "$(basename "$DHT_REPORT")"
 fi
 
 {

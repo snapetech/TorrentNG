@@ -1,6 +1,6 @@
 [package]
 name = "rt-api-model"
-description = "rtorrentNG: shared API request/response types (native JSON)"
+description = "TorrentNG: shared API request/response types (native JSON)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

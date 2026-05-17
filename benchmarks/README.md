@@ -13,7 +13,7 @@ cargo test --test benchmarks -- --ignored --nocapture
 Use a smaller local dataset while iterating:
 
 ```sh
-RTNG_BENCH_TORRENTS=10000 cargo test --test benchmarks -- --ignored --nocapture
+TNG_BENCH_TORRENTS=10000 cargo test --test benchmarks -- --ignored --nocapture
 ```
 
 Generate a markdown report:

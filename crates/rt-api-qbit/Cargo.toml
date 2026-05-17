@@ -1,6 +1,6 @@
 [package]
 name = "rt-api-qbit"
-description = "rtorrentNG: qBittorrent v2 API compatibility shim"
+description = "TorrentNG: qBittorrent v2 API compatibility shim"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

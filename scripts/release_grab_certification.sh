@@ -26,14 +26,14 @@ fi
 
 cat >> "$WORK_DIR/env" <<EOF
 
-RTNG_HOST_PORT=${CERT_GRAB_RTNG_HOST_PORT:-38080}
-RTNG_INCOMING_PORT=${CERT_GRAB_RTNG_INCOMING_PORT:-52000}
+TNG_HOST_PORT=${CERT_GRAB_TNG_HOST_PORT:-38080}
+TNG_INCOMING_PORT=${CERT_GRAB_TNG_INCOMING_PORT:-52000}
 SONARR_HOST_PORT=${CERT_GRAB_SONARR_HOST_PORT:-38989}
 RADARR_HOST_PORT=${CERT_GRAB_RADARR_HOST_PORT:-37878}
 PROWLARR_HOST_PORT=${CERT_GRAB_PROWLARR_HOST_PORT:-39696}
 AUTOBRR_HOST_PORT=${CERT_GRAB_AUTOBRR_HOST_PORT:-37474}
 CROSS_SEED_HOST_PORT=${CERT_GRAB_CROSS_SEED_HOST_PORT:-32468}
-RTNG_SYNC_INTERVAL_SECS=2
+TNG_SYNC_INTERVAL_SECS=2
 EOF
 
 set -a
@@ -45,12 +45,12 @@ export CERT_ENV_FILE="$WORK_DIR/env"
 export CERT_COMPOSE_FILE="$COMPOSE_FILE"
 export CERT_DOCKER_NETWORK="${PROJECT}_default"
 export CERT_DOWNLOADS_VOLUME="${PROJECT}_downloads"
-export RTNG_CONTAINER="${PROJECT}-rtorrentng-1"
+export TNG_CONTAINER="${PROJECT}-torrentng-1"
 export SONARR_CONTAINER="${PROJECT}-sonarr-1"
 export RADARR_CONTAINER="${PROJECT}-radarr-1"
 export PROWLARR_CONTAINER="${PROJECT}-prowlarr-1"
 export AUTOBRR_CONTAINER="${PROJECT}-autobrr-1"
-export RTNG_HOST_URL="http://localhost:${RTNG_HOST_PORT:-38080}"
+export TNG_HOST_URL="http://localhost:${TNG_HOST_PORT:-38080}"
 export SONARR_HOST_URL="http://localhost:${SONARR_HOST_PORT:-38989}"
 export RADARR_HOST_URL="http://localhost:${RADARR_HOST_PORT:-37878}"
 export PROWLARR_HOST_URL="http://localhost:${PROWLARR_HOST_PORT:-39696}"
@@ -83,7 +83,7 @@ run_gate() {
 wait_for_stack() {
   local deadline=$((SECONDS + 240))
   while (( SECONDS < deadline )); do
-    code="$(curl -ksS -o /dev/null -w '%{http_code}' "$RTNG_HOST_URL/health" || true)"
+    code="$(curl -ksS -o /dev/null -w '%{http_code}' "$TNG_HOST_URL/health" || true)"
     sonarr="$(curl -ksS -o /dev/null -w '%{http_code}' "$SONARR_HOST_URL/ping" || true)"
     radarr="$(curl -ksS -o /dev/null -w '%{http_code}' "$RADARR_HOST_URL/ping" || true)"
     prowlarr="$(curl -ksS -o /dev/null -w '%{http_code}' "$PROWLARR_HOST_URL/ping" || true)"
@@ -97,12 +97,12 @@ wait_for_stack() {
 }
 
 {
-  echo "# rtorrentNG Release Grab Certification"
+  echo "# TorrentNG Release Grab Certification"
   echo
   echo "- Date UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "- Compose project: $PROJECT"
   echo "- Scope: isolated normal-sync stack for app-driven release grabs while the primary soak stack can continue running"
-  echo "- rtorrentNG URL: $RTNG_HOST_URL"
+  echo "- TorrentNG URL: $TNG_HOST_URL"
   echo
   echo "## Gates"
   echo

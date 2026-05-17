@@ -30,7 +30,7 @@ export function AppearancePanel({ mediaInference, onMediaInference, themes = [],
       </div>
 
       {themes.length > 0 && (
-        <div className="rtng-card rtng-appearance-panel" style={{ ...panelStyle, marginBottom: 12 }}>
+        <div className="tng-card tng-appearance-panel" style={{ ...panelStyle, marginBottom: 12 }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, marginBottom: 10 }}>
             <div>
               <div style={{ fontSize: 12, color: 'var(--text)', fontWeight: 800 }}>Theme palette</div>
@@ -48,7 +48,7 @@ export function AppearancePanel({ mediaInference, onMediaInference, themes = [],
             </button>
           </div>
 
-          <div className="rtng-theme-gallery">
+          <div className="tng-theme-gallery">
             {themes.map(theme => {
               const tokens = theme[themeMode]
               const active = theme.id === themeId
@@ -56,7 +56,7 @@ export function AppearancePanel({ mediaInference, onMediaInference, themes = [],
                 <button
                   key={theme.id}
                   type="button"
-                  className="rtng-theme-card"
+                  className="tng-theme-card"
                   data-active={active ? 'true' : 'false'}
                   onClick={() => onTheme?.(theme.id)}
                   style={{
@@ -72,13 +72,13 @@ export function AppearancePanel({ mediaInference, onMediaInference, themes = [],
                     ['--preview-shadow' as string]: tokens.shadow,
                   }}
                 >
-                  <span className="rtng-theme-card-preview">
-                    <span className="rtng-theme-card-bar" />
-                    <span className="rtng-theme-card-row" />
-                    <span className="rtng-theme-card-row" />
-                    <span className="rtng-theme-card-row" />
+                  <span className="tng-theme-card-preview">
+                    <span className="tng-theme-card-bar" />
+                    <span className="tng-theme-card-row" />
+                    <span className="tng-theme-card-row" />
+                    <span className="tng-theme-card-row" />
                   </span>
-                  <span className="rtng-theme-card-label">
+                  <span className="tng-theme-card-label">
                     <span>{theme.label}</span>
                     {active && <span>Active</span>}
                   </span>
@@ -89,7 +89,7 @@ export function AppearancePanel({ mediaInference, onMediaInference, themes = [],
         </div>
       )}
 
-      <div className="rtng-card rtng-appearance-panel" style={panelStyle}>
+      <div className="tng-card tng-appearance-panel" style={panelStyle}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, marginBottom: 10 }}>
           <div>
             <div style={{ fontSize: 12, color: 'var(--text)', fontWeight: 800 }}>Media type inference</div>
@@ -101,7 +101,7 @@ export function AppearancePanel({ mediaInference, onMediaInference, themes = [],
           }}>{MODES.find(mode => mode.value === mediaInference)?.label}</span>
         </div>
         {MODES.map(mode => (
-          <label key={mode.value} className="rtng-appearance-option" data-active={mediaInference === mode.value ? 'true' : 'false'} style={{
+          <label key={mode.value} className="tng-appearance-option" data-active={mediaInference === mode.value ? 'true' : 'false'} style={{
             display: 'grid', gridTemplateColumns: 'auto 1fr auto', gap: 10, alignItems: 'start',
             border: '1px solid ' + (mediaInference === mode.value ? 'var(--accent)' : 'var(--border)'),
             borderRadius: 6, padding: 10, background: mediaInference === mode.value ? 'var(--accent-soft)' : 'var(--surface)',

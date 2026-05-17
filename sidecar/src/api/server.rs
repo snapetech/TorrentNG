@@ -26,7 +26,7 @@ pub struct AppState {
 pub fn build_router(state: AppState) -> Router {
     let qb = crate::qbcompat::build_router(state.clone());
 
-    let static_dir = std::env::var("RTNG_STATIC_DIR").unwrap_or_else(|_| "static".to_owned());
+    let static_dir = std::env::var("TNG_STATIC_DIR").unwrap_or_else(|_| "static".to_owned());
 
     Router::new()
         // Native API.
@@ -135,7 +135,7 @@ pub fn build_router(state: AppState) -> Router {
             get(handlers::get_user_agent).put(handlers::set_user_agent),
         )
         // qBit compat. /api/v2 is the canonical qBittorrent path; /api/qb/v2 is kept
-        // for explicit namespacing in rtorrentNG deployments.
+        // for explicit namespacing in TorrentNG deployments.
         .nest("/api/qb/v2", qb.clone())
         .nest("/api/v2", qb)
         // Infrastructure

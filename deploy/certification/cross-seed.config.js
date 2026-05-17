@@ -5,7 +5,7 @@ module.exports = {
   action: "inject",
   matchMode: "strict",
   useClientTorrents: true,
-  torrentClients: ["qbittorrent:http://cert-token:cert-token@rtorrentng:8080"],
+  torrentClients: ["qbittorrent:http://cert-token:cert-token@torrentng:8080"],
   outputDir: null,
   torznab: [],
   linkDirs: ["/downloads"],

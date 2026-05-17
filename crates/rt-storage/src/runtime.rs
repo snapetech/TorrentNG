@@ -9,9 +9,9 @@
 //! Configuration is read from the environment at first use (defaults are
 //! sized for a large seedbox):
 //!
-//! - `RTNG_STORAGE_FRAME_CAP_MB`     frame-pool hard cap (default 256)
-//! - `RTNG_STORAGE_DISK_THREADS`     pread worker threads (default: cores/2)
-//! - `RTNG_STORAGE_HANDLE_IDLE_SECS` idle handle TTL      (default 30)
+//! - `TNG_STORAGE_FRAME_CAP_MB`     frame-pool hard cap (default 256)
+//! - `TNG_STORAGE_DISK_THREADS`     pread worker threads (default: cores/2)
+//! - `TNG_STORAGE_HANDLE_IDLE_SECS` idle handle TTL      (default 30)
 
 use std::fs::File;
 use std::path::Path;
@@ -43,12 +43,12 @@ impl StorageRuntime {
         let soft_nofile = raise_nofile_limit();
         let cap = handle_cache_capacity(soft_nofile);
 
-        let idle_secs = env_u64("RTNG_STORAGE_HANDLE_IDLE_SECS", DEFAULT_HANDLE_IDLE_SECS);
-        let frame_cap_mb = env_u64("RTNG_STORAGE_FRAME_CAP_MB", DEFAULT_FRAME_CAP_MB);
+        let idle_secs = env_u64("TNG_STORAGE_HANDLE_IDLE_SECS", DEFAULT_HANDLE_IDLE_SECS);
+        let frame_cap_mb = env_u64("TNG_STORAGE_FRAME_CAP_MB", DEFAULT_FRAME_CAP_MB);
 
         let handles = HandleCache::new(cap, Duration::from_secs(idle_secs));
         let frames = FramePool::new(frame_cap_mb.saturating_mul(1024 * 1024));
-        let backend = match std::env::var("RTNG_STORAGE_DISK_THREADS")
+        let backend = match std::env::var("TNG_STORAGE_DISK_THREADS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
         {
@@ -60,7 +60,7 @@ impl StorageRuntime {
         // regardless of whether a Tokio runtime exists at init time.
         let sweep_handles = handles.clone();
         std::thread::Builder::new()
-            .name("rtng-handle-sweep".to_string())
+            .name("tng-handle-sweep".to_string())
             .spawn(move || loop {
                 std::thread::sleep(SWEEP_INTERVAL);
                 let closed = sweep_handles.sweep_idle();

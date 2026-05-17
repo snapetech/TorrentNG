@@ -1,6 +1,6 @@
 [package]
 name = "rt-storage"
-description = "rtorrentNG: storage scheduler and file I/O layer"
+description = "TorrentNG: storage scheduler and file I/O layer"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

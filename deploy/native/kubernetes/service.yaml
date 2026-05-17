@@ -2,7 +2,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: rusttorrentd
-  namespace: rtorrentng
+  namespace: torrentng
   labels:
     app.kubernetes.io/name: rusttorrentd
 spec:

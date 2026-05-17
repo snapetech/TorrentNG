@@ -1,6 +1,6 @@
 [package]
 name = "rt-piece-picker"
-description = "rtorrentNG: piece selection strategy for downloading"
+description = "TorrentNG: piece selection strategy for downloading"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

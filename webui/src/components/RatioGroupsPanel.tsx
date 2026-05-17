@@ -115,7 +115,7 @@ export function RatioGroupsPanel() {
           <EmptyState title="No ratio groups configured" detail="Create a group above, then preview which torrents match before applying it." />
         )}
         {groups.map(group => (
-          <div key={group.name} className="rtng-automation-row" data-enabled={group.enabled ? 'true' : 'false'} style={{
+          <div key={group.name} className="tng-automation-row" data-enabled={group.enabled ? 'true' : 'false'} style={{
             display: 'grid', gridTemplateColumns: '160px 90px 110px 150px minmax(220px, 1fr) auto auto auto',
             minWidth: 900,
             gap: 8, alignItems: 'center', border: '1px solid var(--border)',
@@ -226,8 +226,8 @@ function EmptyState({ title, detail }: { title: string; detail: string }) {
 function SkeletonRows({ count }: { count: number }) {
   return Array.from({ length: count }, (_, index) => (
     <div key={index} style={{ border: '1px solid var(--border)', borderRadius: 7, padding: '12px', background: 'var(--surface)' }}>
-      <span className="rtng-skeleton" style={{ width: '32%', height: 12, marginBottom: 10 }} />
-      <span className="rtng-skeleton" style={{ width: '76%', height: 10 }} />
+      <span className="tng-skeleton" style={{ width: '32%', height: 12, marginBottom: 10 }} />
+      <span className="tng-skeleton" style={{ width: '76%', height: 10 }} />
     </div>
   ))
 }

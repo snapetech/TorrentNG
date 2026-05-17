@@ -80,7 +80,7 @@ export function TorrentContextMenu({
   return (
     <div
       ref={menuRef}
-      className="rtng-context-menu"
+      className="tng-context-menu"
       data-status={status.label.toLowerCase()}
       role="menu"
       aria-label={`Actions for ${menu.torrent.name}`}
@@ -106,11 +106,11 @@ export function TorrentContextMenu({
         </span>
       </div>
       {items.map(item => item.separator ? (
-        <div key={item.label} className="rtng-context-separator" style={{ height: 1, background: 'var(--border)', margin: '4px 5px' }} />
+        <div key={item.label} className="tng-context-separator" style={{ height: 1, background: 'var(--border)', margin: '4px 5px' }} />
       ) : (
         <button
           key={item.label}
-          className="rtng-context-item"
+          className="tng-context-item"
           data-danger={item.danger ? 'true' : 'false'}
           role="menuitem"
           tabIndex={0}

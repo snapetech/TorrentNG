@@ -4,14 +4,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SLSKR_ROOT="${SLSKR_ROOT:-/home/keith/Documents/code/slskR}"
 POOL_FILE="${SLSKR_PROTON_CREDENTIAL_POOL_FILE:-$SLSKR_ROOT/.secrets/proton-credential-pool.env}"
-LABEL="${RTNG_PROTON_LABEL:-p1}"
+LABEL="${TNG_PROTON_LABEL:-p1}"
 OUT="${1:-$ROOT/certification/reports/proton-natpmp-$(date -u +%Y%m%dT%H%M%SZ).md}"
-PRIVATE_PORT="${RTNG_PROTON_PRIVATE_PORT:-${RTNG_INCOMING_PORT:-51000}}"
-REQUESTED_PUBLIC_PORT="${RTNG_PROTON_PUBLIC_PORT:-0}"
-LIFETIME="${RTNG_PROTON_NATPMP_LIFETIME:-120}"
-GATEWAY="${RTNG_PROTON_NATPMP_GATEWAY:-10.2.0.1}"
-NAMESPACE="rtng-${LABEL}-$(date -u +%H%M%S)"
-RTNG_CONTAINER="${RTNG_CONTAINER:-certification-rtorrentng-1}"
+PRIVATE_PORT="${TNG_PROTON_PRIVATE_PORT:-${TNG_INCOMING_PORT:-51000}}"
+REQUESTED_PUBLIC_PORT="${TNG_PROTON_PUBLIC_PORT:-0}"
+LIFETIME="${TNG_PROTON_NATPMP_LIFETIME:-120}"
+GATEWAY="${TNG_PROTON_NATPMP_GATEWAY:-10.2.0.1}"
+NAMESPACE="tng-${LABEL}-$(date -u +%H%M%S)"
+TNG_CONTAINER="${TNG_CONTAINER:-certification-torrentng-1}"
 TMP_OUTPUT="$(mktemp)"
 
 mkdir -p "$(dirname "$OUT")"
@@ -36,7 +36,7 @@ mark() {
 }
 
 {
-  echo "# rtorrentNG Proton NAT-PMP Certification"
+  echo "# TorrentNG Proton NAT-PMP Certification"
   echo
   echo "- Date UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "- Proton label: $LABEL"
@@ -122,11 +122,11 @@ udp_mapping="$(awk '/Mapped public port/ && /protocol UDP/ {for (i=1; i<=NF; i++
   && mark "UDP Proton NAT-PMP mapping" "PASS" "public=$udp_mapping private=$PRIVATE_PORT" \
   || mark "UDP Proton NAT-PMP mapping" "FAIL" "missing"
 
-container_ip="$(docker exec "$RTNG_CONTAINER" sh -lc 'wget -qO- https://api.ipify.org 2>/dev/null || true' 2>/dev/null | tr -d '\r\n')"
+container_ip="$(docker exec "$TNG_CONTAINER" sh -lc 'wget -qO- https://api.ipify.org 2>/dev/null || true' 2>/dev/null | tr -d '\r\n')"
 if [[ -n "$container_ip" && -n "$proton_ip" && "$container_ip" == "$proton_ip" ]]; then
-  mark "rtorrentNG VPN alignment" "PASS" "container egress matches Proton egress $container_ip"
+  mark "TorrentNG VPN alignment" "PASS" "container egress matches Proton egress $container_ip"
 else
-  mark "rtorrentNG VPN alignment" "INFO" "container egress=${container_ip:-unknown} proton egress=${proton_ip:-unknown}; current rtorrentNG container is not in this Proton namespace"
+  mark "TorrentNG VPN alignment" "INFO" "container egress=${container_ip:-unknown} proton egress=${proton_ip:-unknown}; current TorrentNG container is not in this Proton namespace"
 fi
 
 {

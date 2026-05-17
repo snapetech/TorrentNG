@@ -997,7 +997,7 @@ run_qbit_mutation_facade_case() {
   torrent="$(make_torrent "$fixture" "$fixture" tracker-only)"
   info_hash="$(torrent_info_hash "$torrent")"
   original="http://opentracker:6969/announce"
-  replacement="http://opentracker:6969/announce?rtng=edited"
+  replacement="http://opentracker:6969/announce?tng=edited"
   add_to_client rusttorrentd "$torrent" || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
     --data-urlencode "hash=$info_hash" \

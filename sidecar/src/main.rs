@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rtorrentng::{api, cache, config, metrics, rtorrent, stats, sync};
+use torrentng::{api, cache, config, metrics, rtorrent, stats, sync};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::info;
@@ -26,7 +26,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    info!("rtorrentNG starting");
+    info!("TorrentNG starting");
     info!(user_agent = %cfg.rtorrent.user_agent, "config loaded");
 
     let rt = Arc::new(Client::new(&cfg.rtorrent).context("create rtorrent client")?);

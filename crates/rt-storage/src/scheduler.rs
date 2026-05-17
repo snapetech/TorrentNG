@@ -1149,6 +1149,7 @@ fn full_preallocate(file: &File, len: u64) -> Result<(), StorageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::elevator::DeviceId;
     use rt_path::StorageRootId;
 
     fn hdd_scheduler() -> MountScheduler {
@@ -1207,16 +1208,19 @@ mod tests {
     #[test]
     fn auto_preallocation_policy_uses_full_only_for_non_cow_hdd() {
         let hdd = StorageTopology {
+            device_id: Some(DeviceId("sda".to_owned())),
             profile: StorageProfile::Hdd,
             fs_type: Some("xfs".to_owned()),
             cow: false,
         };
         let hdd_cow = StorageTopology {
+            device_id: Some(DeviceId("sdb".to_owned())),
             profile: StorageProfile::Hdd,
             fs_type: Some("btrfs".to_owned()),
             cow: true,
         };
         let nvme = StorageTopology {
+            device_id: Some(DeviceId("nvme0n1".to_owned())),
             profile: StorageProfile::Nvme,
             fs_type: Some("ext4".to_owned()),
             cow: false,

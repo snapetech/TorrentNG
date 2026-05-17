@@ -63,7 +63,7 @@ function Badge({
   const handleClick = disabled ? undefined : onClick
   return (
     <Element
-      className="rtng-status-badge"
+      className="tng-status-badge"
       data-state={state ?? 'idle'}
       role={onClick ? 'switch' : undefined}
       aria-checked={onClick ? state === 'on' : undefined}
@@ -144,7 +144,7 @@ export function StatusBar({
 
   return (
     <footer
-      className="rtng-statusbar"
+      className="tng-statusbar"
       data-connected={connected ? 'true' : 'false'}
       data-selected={selected > 0 ? 'true' : 'false'}
       style={{
@@ -152,10 +152,10 @@ export function StatusBar({
       padding: '0 12px', background: 'var(--bg)', borderTop: '1px solid var(--border-strong)',
       color: 'var(--faint)', fontSize: 11, overflowX: 'auto',
     }}>
-      <div className="rtng-statusbar-summary" style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 'max-content' }}>
+      <div className="tng-statusbar-summary" style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 'max-content' }}>
         <Badge label="Core" value={connected ? 'connected' : 'disconnected'} state={connected ? 'on' : 'closed'} />
       </div>
-      <div className="rtng-statusbar-counts" style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 'max-content' }}>
+      <div className="tng-statusbar-counts" style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 'max-content' }}>
         <Badge label="Torrents" value={total.toLocaleString()} state="idle" />
         {rendered !== total && <Badge label="Rendered" value={rendered.toLocaleString()} state="idle" />}
         {cached !== undefined && <Badge label="Cached" value={cached.toLocaleString()} state="idle" />}
@@ -163,8 +163,8 @@ export function StatusBar({
         {featureError && <Notice tone="error">{featureError}</Notice>}
         {actionMessage && <Notice tone={actionTone}>{actionMessage}</Notice>}
       </div>
-      <span className="rtng-statusbar-spacer" style={{ flex: 1 }} />
-      <div className="rtng-statusbar-metrics" style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 'max-content' }}>
+      <span className="tng-statusbar-spacer" style={{ flex: 1 }} />
+      <div className="tng-statusbar-metrics" style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 'max-content' }}>
         <Badge label="DL" value={fmtSpeed(stats.download_speed)} state={(stats.download_speed ?? 0) > 0 ? 'on' : 'unknown'} />
         <Badge label="UL" value={fmtSpeed(stats.upload_speed)} state={(stats.upload_speed ?? 0) > 0 ? 'on' : 'unknown'} />
         <Badge label="DL total" value={fmtBytes(stats.download_total)} title="Downloaded during this daemon session" state="on" />

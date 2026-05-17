@@ -52,7 +52,7 @@ awk -v rss="$max_rss" -v limit="$MAX_RSS_MB" 'BEGIN {exit !(rss <= limit)}' || s
 (( bad_health == 0 )) || status="FAIL"
 (( bad_sync == 0 )) || status="FAIL"
 
-echo "# rtorrentNG Soak Status"
+echo "# TorrentNG Soak Status"
 echo
 echo "- Date UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "- Report: $REPORT"

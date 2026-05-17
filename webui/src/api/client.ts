@@ -78,7 +78,7 @@ async function post<T = void>(path: string, body?: FormData | object): Promise<T
   const isForm = body instanceof FormData
   const res = await fetch(BASE + path, {
     method: 'POST',
-    headers: isForm ? undefined : { 'Content-Type': 'application/json', 'X-RTNG-CSRF': '1' },
+    headers: isForm ? undefined : { 'Content-Type': 'application/json', 'X-TNG-CSRF': '1' },
     body: isForm ? body : body !== undefined ? JSON.stringify(body) : undefined,
     credentials: 'same-origin',
   })
@@ -92,7 +92,7 @@ async function post<T = void>(path: string, body?: FormData | object): Promise<T
 async function put<T = void>(path: string, body: object): Promise<T> {
   const res = await fetch(BASE + path, {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json', 'X-RTNG-CSRF': '1' },
+    headers: { 'Content-Type': 'application/json', 'X-TNG-CSRF': '1' },
     body: JSON.stringify(body),
     credentials: 'same-origin',
   })
@@ -106,7 +106,7 @@ async function put<T = void>(path: string, body: object): Promise<T> {
 async function patch<T = void>(path: string, body: object): Promise<T> {
   const res = await fetch(BASE + path, {
     method: 'PATCH',
-    headers: { 'Content-Type': 'application/json', 'X-RTNG-CSRF': '1' },
+    headers: { 'Content-Type': 'application/json', 'X-TNG-CSRF': '1' },
     body: JSON.stringify(body),
     credentials: 'same-origin',
   })
@@ -120,7 +120,7 @@ async function patch<T = void>(path: string, body: object): Promise<T> {
 async function del(path: string, body?: object): Promise<void> {
   const res = await fetch(BASE + path, {
     method: 'DELETE',
-    headers: body ? { 'Content-Type': 'application/json', 'X-RTNG-CSRF': '1' } : { 'X-RTNG-CSRF': '1' },
+    headers: body ? { 'Content-Type': 'application/json', 'X-TNG-CSRF': '1' } : { 'X-TNG-CSRF': '1' },
     body: body ? JSON.stringify(body) : undefined,
     credentials: 'same-origin',
   })
@@ -131,7 +131,7 @@ async function del(path: string, body?: object): Promise<void> {
 async function delJson<T>(path: string, body?: object): Promise<T> {
   const res = await fetch(BASE + path, {
     method: 'DELETE',
-    headers: body ? { 'Content-Type': 'application/json', 'X-RTNG-CSRF': '1' } : { 'X-RTNG-CSRF': '1' },
+    headers: body ? { 'Content-Type': 'application/json', 'X-TNG-CSRF': '1' } : { 'X-TNG-CSRF': '1' },
     body: body ? JSON.stringify(body) : undefined,
     credentials: 'same-origin',
   })
@@ -170,7 +170,7 @@ async function qbPost(path: string, fields: Record<string, string | number | boo
   }
   const res = await fetch('/api/qb/v2' + path, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-RTNG-CSRF': '1' },
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-TNG-CSRF': '1' },
     body: form,
     credentials: 'same-origin',
   })

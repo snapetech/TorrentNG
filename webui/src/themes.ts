@@ -65,7 +65,7 @@ function palette(id: string, label: string, dark: Partial<ThemeTokens>, light: P
 }
 
 export const PALETTES: ThemePalette[] = [
-  palette('rtng', 'rtorrentNG', {
+  palette('tng', 'TorrentNG', {
     bg: '#0b1220', panel: '#111827', surface: '#162033', surface2: '#202b42',
     tableHead: '#1b2740', row: '#101826', rowAlt: '#152033', selected: '#17335f',
     border: '#22324d', borderStrong: '#40516f', text: '#e6edf7', muted: '#a9b8cc', faint: '#73849c',
@@ -346,8 +346,8 @@ export const PALETTES: ThemePalette[] = [
   }),
 ]
 
-export const THEME_STORAGE_KEY = 'rtng.theme'
-export const THEME_MODE_STORAGE_KEY = 'rtng.themeMode'
+export const THEME_STORAGE_KEY = 'tng.theme'
+export const THEME_MODE_STORAGE_KEY = 'tng.themeMode'
 
 export function findPalette(id: string): ThemePalette {
   return PALETTES.find(palette => palette.id === id) ?? PALETTES[0]

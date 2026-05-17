@@ -1,6 +1,6 @@
 [package]
 name = "rt-api-deluge"
-description = "rtorrentNG: Deluge JSON-RPC compatibility facade"
+description = "TorrentNG: Deluge JSON-RPC compatibility facade"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

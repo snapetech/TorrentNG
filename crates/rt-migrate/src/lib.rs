@@ -73,7 +73,7 @@ impl MigrationPlan {
 
     pub fn to_markdown(&self) -> String {
         let mut out = String::new();
-        out.push_str("# rtorrentNG Migration Dry Run\n\n");
+        out.push_str("# TorrentNG Migration Dry Run\n\n");
         out.push_str(&format!("- Source: {:?}\n", self.source));
         out.push_str(&format!("- Root: `{}`\n", self.root.display()));
         out.push_str(&format!("- Importable torrents: {}\n", self.torrents.len()));
@@ -1837,7 +1837,13 @@ fn classify_auxiliary_artifact(root: &Path, path: &Path) -> Option<AuxiliaryArti
     }
     if any_aux_token(
         &tokens,
-        &["search", "searchengines", "search_engines", "nova", "engines"],
+        &[
+            "search",
+            "searchengines",
+            "search_engines",
+            "nova",
+            "engines",
+        ],
     ) {
         return Some(AuxiliaryArtifactKind::Search);
     }

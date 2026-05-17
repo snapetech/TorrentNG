@@ -58,7 +58,7 @@ pub async fn require_auth(
             for part in c.split(';') {
                 let part = part.trim();
                 if let Some(val) = part
-                    .strip_prefix("rtng_session=")
+                    .strip_prefix("tng_session=")
                     .or_else(|| part.strip_prefix("SID="))
                 {
                     if state.cfg.auth.api_tokens.iter().any(|t| t == val) {

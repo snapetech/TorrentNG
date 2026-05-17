@@ -48,11 +48,11 @@ export function BulkEditDialog({ hashes, onClose }: Props) {
   const tagList = tags.split(',').map(tag => tag.trim()).filter(Boolean)
 
   return (
-    <div className="rtng-modal-backdrop" style={{
+    <div className="tng-modal-backdrop" style={{
       position: 'fixed', inset: 0, background: 'rgba(2,6,23,0.72)', zIndex: 1200,
       display: 'grid', placeItems: 'center', padding: 22,
     }} onClick={e => { if (!busy && e.target === e.currentTarget) onClose() }}>
-      <div role="dialog" aria-modal="true" aria-label="Edit selected torrents" aria-busy={busy} className="rtng-modal" style={{
+      <div role="dialog" aria-modal="true" aria-label="Edit selected torrents" aria-busy={busy} className="tng-modal" style={{
         width: 'min(620px, 100%)', maxHeight: '88vh', overflowY: 'auto',
         background: 'var(--panel)', border: '1px solid var(--border-strong)', borderRadius: 8,
         boxShadow: '0 24px 60px var(--shadow)',
@@ -90,7 +90,7 @@ export function BulkEditDialog({ hashes, onClose }: Props) {
                 {allTags.map(tag => (
                   <button
                     key={tag}
-                    className="rtng-tag-chip"
+                    className="tng-tag-chip"
                     data-active={tagList.includes(tag) ? 'true' : 'false'}
                     disabled={busy}
                     onClick={() => setTags(Array.from(new Set([...tagList, tag])).join(','))}
@@ -110,7 +110,7 @@ export function BulkEditDialog({ hashes, onClose }: Props) {
           </Field>
 
           <Field label="Share limits">
-            <div className="rtng-action-grid-3" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr auto', gap: 8 }}>
+            <div className="tng-action-grid-3" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr auto', gap: 8 }}>
               <input value={ratioLimit} onChange={e => setRatioLimit(e.target.value)} disabled={busy} placeholder="Ratio -2 default, -1 unlimited" style={INPUT} />
               <input value={seedMinutes} onChange={e => setSeedMinutes(e.target.value)} disabled={busy} placeholder="Minutes -2 default, -1 unlimited" style={INPUT} />
               <button disabled={busy} onClick={() => apply('Share limits applied', () => api.torrents.setShareLimits(
@@ -121,7 +121,7 @@ export function BulkEditDialog({ hashes, onClose }: Props) {
             </div>
           </Field>
 
-          <div className="rtng-form-card" style={{
+          <div className="tng-form-card" style={{
             display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10,
             background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 7, padding: 10,
           }}>
@@ -145,7 +145,7 @@ export function BulkEditDialog({ hashes, onClose }: Props) {
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
-  return <label className="rtng-form-card" style={{
+  return <label className="tng-form-card" style={{
     display: 'grid', gap: 6, color: 'var(--faint)', fontSize: 11, fontWeight: 700,
     textTransform: 'uppercase', background: 'var(--surface)', border: '1px solid var(--border)',
     borderRadius: 7, padding: 10,

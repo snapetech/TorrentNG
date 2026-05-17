@@ -2,20 +2,20 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="${RTNG_LIVE_REPO_DIR:-$(cd -- "$SCRIPT_DIR/.." && pwd)}"
-REMOTE="${RTNG_LIVE_REMOTE:-origin}"
-BRANCH="${RTNG_LIVE_BRANCH:-main}"
-COMPOSE_FILE="${RTNG_LIVE_COMPOSE_FILE:-deploy/docker/compose.yml}"
-COMPOSE_ENV_FILE="${RTNG_LIVE_COMPOSE_ENV_FILE:-}"
-SERVICE="${RTNG_LIVE_SERVICE:-rtorrentng}"
-LOCK_FILE="${RTNG_LIVE_LOCK_FILE:-/tmp/rtorrentng-live-main-update.lock}"
-ALLOW_DIRTY="${RTNG_LIVE_ALLOW_DIRTY:-0}"
-DRY_RUN="${RTNG_LIVE_DRY_RUN:-0}"
-FORCE="${RTNG_LIVE_FORCE:-0}"
-PRUNE="${RTNG_LIVE_PRUNE:-0}"
+REPO_DIR="${TNG_LIVE_REPO_DIR:-$(cd -- "$SCRIPT_DIR/.." && pwd)}"
+REMOTE="${TNG_LIVE_REMOTE:-origin}"
+BRANCH="${TNG_LIVE_BRANCH:-main}"
+COMPOSE_FILE="${TNG_LIVE_COMPOSE_FILE:-deploy/docker/compose.yml}"
+COMPOSE_ENV_FILE="${TNG_LIVE_COMPOSE_ENV_FILE:-}"
+SERVICE="${TNG_LIVE_SERVICE:-torrentng}"
+LOCK_FILE="${TNG_LIVE_LOCK_FILE:-/tmp/torrentng-live-main-update.lock}"
+ALLOW_DIRTY="${TNG_LIVE_ALLOW_DIRTY:-0}"
+DRY_RUN="${TNG_LIVE_DRY_RUN:-0}"
+FORCE="${TNG_LIVE_FORCE:-0}"
+PRUNE="${TNG_LIVE_PRUNE:-0}"
 
 log() {
-  printf '[rtorrentNG live] %s\n' "$*"
+  printf '[TorrentNG live] %s\n' "$*"
 }
 
 run() {
@@ -55,7 +55,7 @@ compose_cmd+=(-f "$COMPOSE_FILE")
 
 if [[ "$ALLOW_DIRTY" != "1" ]] && [[ -n "$(git status --porcelain)" ]]; then
   log "worktree has local changes; refusing to auto-update"
-  log "commit/stash the changes, or set RTNG_LIVE_ALLOW_DIRTY=1 for a disposable checkout"
+  log "commit/stash the changes, or set TNG_LIVE_ALLOW_DIRTY=1 for a disposable checkout"
   exit 3
 fi
 

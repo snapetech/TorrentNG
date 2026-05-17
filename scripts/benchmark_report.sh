@@ -3,12 +3,12 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="${1:-$ROOT/benchmarks/report-$(date -u +%Y%m%dT%H%M%SZ).md}"
-BENCH_COUNTS="${RTNG_BENCH_COUNTS:-1000 10000 15000 50000}"
+BENCH_COUNTS="${TNG_BENCH_COUNTS:-1000 10000 15000 50000}"
 
 mkdir -p "$(dirname "$OUT")"
 
 {
-  echo "# rtorrentNG Benchmark Report"
+  echo "# TorrentNG Benchmark Report"
   echo
   echo "- Date UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "- Host: $(hostname)"
@@ -26,12 +26,12 @@ mkdir -p "$(dirname "$OUT")"
 for count in $BENCH_COUNTS; do
   {
     echo
-    echo "### RTNG_BENCH_TORRENTS=$count"
+    echo "### TNG_BENCH_TORRENTS=$count"
   } | tee -a "$OUT"
 
   (
     cd "$ROOT/sidecar"
-    RTNG_BENCH_TORRENTS="$count" cargo test --release --test benchmarks -- --ignored --nocapture
+    TNG_BENCH_TORRENTS="$count" cargo test --release --test benchmarks -- --ignored --nocapture
   ) 2>&1 | tee -a "$OUT"
 done
 
