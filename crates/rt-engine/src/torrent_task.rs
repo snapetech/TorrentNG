@@ -2043,6 +2043,27 @@ fn webseed_block_url(meta: &TorrentMetaV1, webseed: &str) -> Option<Url> {
     if !matches!(parsed.scheme(), "http" | "https") {
         return None;
     }
+    let first_file = meta.files.first()?;
+    let components = first_file.path.components();
+    if !webseed.ends_with('/')
+        && components.len() > 1
+        && components
+            .first()
+            .is_some_and(|component| component == &meta.name)
+        && parsed
+            .path_segments()
+            .and_then(|mut segments| segments.next_back())
+            .is_some_and(|last| last == meta.name)
+    {
+        let mut url = parsed;
+        {
+            let mut segments = url.path_segments_mut().ok()?;
+            for component in &components[1..] {
+                segments.push(component);
+            }
+        }
+        return Some(url);
+    }
     if webseed.ends_with('/') {
         parsed.join(&meta.name).ok()
     } else {
@@ -2717,6 +2738,35 @@ mod tests {
             "https://mirror.example/releases/sample.iso"
         );
         assert!(webseed_block_url(&meta, "ftp://mirror.example/sample.iso").is_none());
+    }
+
+    #[test]
+    fn webseed_block_url_expands_single_file_directory_prefix() {
+        let meta = TorrentMetaV1 {
+            info_hash: [1; 20],
+            announce: None,
+            announce_list: Vec::new(),
+            webseeds: Vec::new(),
+            name: "payload-dir".into(),
+            piece_length: 16_384,
+            pieces: vec![[2; 20]],
+            files: vec![rt_metainfo::TorrentFileV1 {
+                index: 0,
+                length: 5,
+                path: rt_path::SafeRelPath::from_components(&["payload-dir", "payload.bin"], false)
+                    .unwrap(),
+                offset: 0,
+            }],
+            private: false,
+            raw: Vec::new(),
+        };
+
+        assert_eq!(
+            webseed_block_url(&meta, "https://mirror.example/payload-dir")
+                .unwrap()
+                .as_str(),
+            "https://mirror.example/payload-dir/payload.bin"
+        );
     }
 
     #[test]
