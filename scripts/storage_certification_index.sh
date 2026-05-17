@@ -10,7 +10,7 @@ mkdir -p "$REPORT_DIR"
 kind_for_report() {
   case "$(basename "$1")" in
     storage-hardware-*) printf 'hardware matrix' ;;
-    storage-uring-graduation-*) printf 'io_uring graduation' ;;
+    storage-uring-graduation-*) printf 'io_uring capability/graduation' ;;
     storage-move-import-*) printf 'move/import' ;;
     *) printf 'storage' ;;
   esac

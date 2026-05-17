@@ -47,11 +47,17 @@ evidence rollup and non-claim boundary report.
 
 ## Optional Acceleration
 
-- [ ] `io_uring` graduation behind the backend interface.
+- [x] `io_uring` capability probe behind the backend interface.
   - Correctness fallback and forced-roundtrip tests exist.
   - Real-device hardware reports now include `pread` and forced `uring`
     backend roundtrips plus registered-file/fixed-buffer capability rows.
   - `scripts/storage_uring_graduation.sh` records real-device `pread` vs
     `uring` stream throughput, selected backend, registered-file support, and
-    fixed-buffer support, with opt-in pass/fail thresholds for graduation.
-  - `uring` remains explicit opt-in until real-device `pread` vs `uring` reports show a durable win and frame-pool registered-buffer leases remove the extra copy path.
+    fixed-buffer support, with opt-in pass/fail thresholds.
+- [ ] Final `io_uring` frame-pool-slot graduation behind the backend interface.
+  - Current fixed-buffer support reports `fixed_buffer_strategy=worker_copy`.
+  - Final graduation requires `fixed_buffer_strategy=frame_pool_slots`, which
+    can be enforced with `TNG_STORAGE_URING_REQUIRE_FRAME_POOL_SLOTS=1`.
+  - `uring` remains explicit opt-in until real-device `pread` vs `uring`
+    reports show a durable win and frame-pool registered-buffer leases remove
+    the extra copy path.
