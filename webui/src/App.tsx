@@ -455,7 +455,7 @@ export function App() {
 
   if (authState === 'checking') {
     return (
-      <div style={{
+      <div className="rtng-card rtng-standby-card" style={{
         minHeight: '100vh', background: 'var(--bg)', color: 'var(--faint)',
         display: 'grid', placeItems: 'center', fontSize: 13, padding: 24,
       }}>
@@ -811,7 +811,7 @@ function SettingsView({ section, onSection, mediaInference, onMediaInference }: 
           <div style={{ fontSize: 11, color: 'var(--faint)', marginTop: 3 }}>Daemon, library, and browser controls</div>
         </div>
         {sections.map(([key, label, icon]) => (
-          <button key={key} onClick={() => onSection(key)} aria-current={section === key ? 'page' : undefined} style={{
+          <button key={key} className="rtng-settings-nav-button" data-active={section === key ? 'true' : 'false'} onClick={() => onSection(key)} aria-current={section === key ? 'page' : undefined} style={{
             width: '100%', display: 'grid', gridTemplateColumns: '22px 1fr auto', alignItems: 'center',
             textAlign: 'left', marginBottom: 4, gap: 7,
             background: section === key ? 'var(--accent-soft)' : 'transparent',
@@ -902,13 +902,13 @@ function DeleteDialog({ torrent, onCancel, onRemove, onRemoveFiles }: {
   onRemoveFiles: () => void
 }) {
   return (
-    <div role="presentation" onMouseDown={e => {
+    <div className="rtng-modal-backdrop" role="presentation" onMouseDown={e => {
       if (e.target === e.currentTarget) onCancel()
     }} style={{
       position: 'fixed', inset: 0, background: 'rgba(2,6,23,0.72)', zIndex: 1150,
       display: 'grid', placeItems: 'center', padding: 24,
     }}>
-      <div role="dialog" aria-modal="true" aria-label={`Delete ${torrent.name}`} style={{
+      <div className="rtng-modal rtng-delete-dialog" role="dialog" aria-modal="true" aria-label={`Delete ${torrent.name}`} style={{
         width: 'min(480px, 100%)', background: 'var(--panel)', border: '1px solid var(--danger)',
         borderRadius: 8, boxShadow: '0 24px 60px var(--shadow)',
       }}>
@@ -1022,7 +1022,7 @@ function LoginScreen({ message, onLogin }: {
       minHeight: '100vh', background: 'var(--bg)', color: 'var(--text)',
       display: 'grid', placeItems: 'center', padding: 24,
     }}>
-      <form onSubmit={submit} style={{
+      <form className="rtng-card rtng-login-card" onSubmit={submit} style={{
         width: 'min(360px, 100%)', border: '1px solid var(--border)', borderRadius: 8,
         background: 'var(--panel)', padding: 20, display: 'flex', flexDirection: 'column', gap: 12,
         boxShadow: '0 24px 60px var(--shadow)',
@@ -1037,7 +1037,7 @@ function LoginScreen({ message, onLogin }: {
           </div>
           <div style={{ color: 'var(--faint)', fontSize: 12, marginTop: 4 }}>Sign in to manage torrents</div>
         </div>
-        <label style={{ display: 'flex', flexDirection: 'column', gap: 5, fontSize: 12, color: 'var(--muted)' }}>
+        <label className="rtng-form-card" style={{ display: 'flex', flexDirection: 'column', gap: 5, fontSize: 12, color: 'var(--muted)' }}>
           Username
           <input
             autoFocus
@@ -1050,7 +1050,7 @@ function LoginScreen({ message, onLogin }: {
             }}
           />
         </label>
-        <label style={{ display: 'flex', flexDirection: 'column', gap: 5, fontSize: 12, color: 'var(--muted)' }}>
+        <label className="rtng-form-card" style={{ display: 'flex', flexDirection: 'column', gap: 5, fontSize: 12, color: 'var(--muted)' }}>
           Password
           <input
             type="password"

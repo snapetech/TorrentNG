@@ -634,6 +634,41 @@ summary:hover {
   padding: 2px 0;
 }
 
+.rtng-standby-card,
+.rtng-login-card,
+.rtng-delete-dialog,
+.rtng-settings-nav-button {
+  transition:
+    border-color 120ms ease,
+    background-color 120ms ease,
+    box-shadow 120ms ease,
+    filter 120ms ease,
+    transform 90ms ease;
+}
+
+.rtng-standby-card:hover,
+.rtng-login-card:hover,
+.rtng-delete-dialog:hover {
+  border-color: color-mix(in srgb, var(--accent) 32%, var(--border-strong)) !important;
+}
+
+.rtng-settings-nav-button:hover {
+  background: color-mix(in srgb, var(--accent-soft) 45%, transparent) !important;
+  border-color: color-mix(in srgb, var(--accent) 32%, transparent) !important;
+}
+
+.rtng-settings-nav-button[data-active="true"] {
+  box-shadow:
+    inset 3px 0 0 color-mix(in srgb, var(--accent) 68%, transparent),
+    inset 0 1px 0 rgba(255,255,255,0.035);
+}
+
+.rtng-delete-dialog {
+  box-shadow:
+    0 24px 60px var(--shadow),
+    inset 3px 0 0 color-mix(in srgb, var(--danger) 72%, transparent) !important;
+}
+
 ::selection {
   background: color-mix(in srgb, var(--accent) 40%, transparent);
   color: var(--text);
