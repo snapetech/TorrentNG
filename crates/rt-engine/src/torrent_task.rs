@@ -349,6 +349,11 @@ struct UploadContext {
     metadata: Option<Arc<Vec<u8>>>,
 }
 
+struct LeasedUploadBlock {
+    data: bytes::Bytes,
+    _lease: MemoryLease,
+}
+
 pub struct TorrentTask {
     info_hash_hex: String,
     meta: TorrentMetaV1,
@@ -2914,12 +2919,12 @@ async fn run_peer_loop(
                     Message::Request { piece, begin, length } => {
                         if !upload_choked && upload.have_pieces.get(piece as usize).copied().unwrap_or(false) {
                             match read_upload_block(&upload, piece, begin, length).await {
-                                Ok(data) => {
-                                    let bytes = data.len() as u64;
+                                Ok(block) => {
+                                    let bytes = block.data.len() as u64;
                                     framed.send(Message::Piece {
                                         piece,
                                         begin,
-                                        data: data.to_vec(),
+                                        data: block.data.to_vec(),
                                     }).await?;
                                     if peer_event_tx
                                         .send(PeerEvent::Uploaded { peer: addr, bytes })
@@ -3112,8 +3117,8 @@ async fn read_upload_block(
     piece: u32,
     begin: u32,
     length: u32,
-) -> anyhow::Result<bytes::Bytes> {
-    let _lease = reserve_peer_upload_bytes(&upload.resources, length)?;
+) -> anyhow::Result<LeasedUploadBlock> {
+    let lease = reserve_peer_upload_bytes(&upload.resources, length)?;
     let regions = upload.piece_map.validate_request(piece, begin, length)?;
     let mut data = Vec::with_capacity(length as usize);
     for region in regions {
@@ -3135,7 +3140,10 @@ async fn read_upload_block(
             length
         );
     }
-    Ok(bytes::Bytes::from(data))
+    Ok(LeasedUploadBlock {
+        data: bytes::Bytes::from(data),
+        _lease: lease,
+    })
 }
 
 fn bitfield_to_pieces(bits: &[u8], piece_count: usize) -> anyhow::Result<Vec<bool>> {
@@ -3795,7 +3803,16 @@ mod tests {
 
         let block = read_upload_block(&upload, 0, 0, 16 * 1024).await.unwrap();
 
-        assert_eq!(block.as_ref(), expected.as_slice());
+        assert_eq!(block.data.as_ref(), expected.as_slice());
+        assert_eq!(
+            upload.resources.snapshot().classes[MemoryClass::PeerBuffer as usize].used_bytes,
+            16 * 1024
+        );
+        drop(block);
+        assert_eq!(
+            upload.resources.snapshot().classes[MemoryClass::PeerBuffer as usize].used_bytes,
+            0
+        );
     }
 
     #[test]

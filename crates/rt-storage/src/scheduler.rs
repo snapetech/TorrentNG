@@ -613,6 +613,7 @@ struct PeerReadCacheEntry {
     offset: u64,
     data: bytes::Bytes,
     last_used: Instant,
+    _lease: Option<MemoryLease>,
 }
 
 #[derive(Debug, Clone)]
@@ -1591,6 +1592,7 @@ impl MountScheduler {
                     peer_read_cache_store(
                         &peer_read_cache,
                         &counters,
+                        self.resources.as_ref(),
                         readahead_cache_entries,
                         key,
                         offset,
@@ -2034,6 +2036,7 @@ fn peer_read_cache_hit(
 fn peer_read_cache_store(
     cache: &Mutex<HashMap<PathBuf, PeerReadCacheEntry>>,
     counters: &StorageCounters,
+    resources: Option<&ResourceGovernor>,
     max_entries: usize,
     key: PathBuf,
     offset: u64,
@@ -2042,6 +2045,17 @@ fn peer_read_cache_store(
     if max_entries == 0 {
         return;
     }
+    let lease = if let Some(resources) = resources {
+        match resources.try_acquire(MemoryClass::PeerBuffer, data.len() as u64) {
+            Some(lease) => Some(lease),
+            None => {
+                counters.queue_full.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+    } else {
+        None
+    };
     let mut cache = cache.lock().expect("peer read cache mutex poisoned");
     if !cache.contains_key(&key) && cache.len() >= max_entries {
         if let Some(evict) = cache
@@ -2061,6 +2075,7 @@ fn peer_read_cache_store(
             offset,
             data,
             last_used: Instant::now(),
+            _lease: lease,
         },
     );
 }
