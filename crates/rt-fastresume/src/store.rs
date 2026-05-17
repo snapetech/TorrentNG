@@ -45,7 +45,13 @@ impl FastresumeStore {
         let data = serde_json::to_vec_pretty(state)?;
         std::fs::write(&tmp, &data)?;
         std::fs::rename(&tmp, &target)?;
-        tracing::debug!(info_hash = %state.info_hash, "fastresume saved");
+        tracing::debug!(
+            component = "fastresume",
+            operation = "save",
+            torrent = %state.info_hash,
+            result = "ok",
+            "fastresume saved"
+        );
         Ok(())
     }
 

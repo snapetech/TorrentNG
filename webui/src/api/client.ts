@@ -256,6 +256,29 @@ export interface StoragePlanResponse {
   plan: StoragePlanView
 }
 
+export interface Job {
+  job_id: string
+  kind: string
+  state: string
+  dry_run: boolean
+  affected_torrents: string[]
+  total: number
+  done: number
+  checkpoint: number
+  byte_offset: number | null
+  verified_bytes: number
+  error: string | null
+  created_at: number
+  started_at: number | null
+  updated_at: number
+  finished_at: number | null
+  progress: number
+}
+
+export interface JobsResponse {
+  jobs: Job[]
+}
+
 export interface LiveStats {
   upload_speed: number
   download_speed: number
@@ -631,6 +654,7 @@ export const api = {
   },
 
   storage: (): Promise<StorageResponse> => get('/storage'),
+  jobs: (): Promise<JobsResponse> => get('/jobs'),
   storagePlan: {
     preview: (body: StoragePlanRequest): Promise<StoragePlanResponse> =>
       post('/storage/plan', body),

@@ -40,6 +40,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/torrents/:hash/diagnostics", get(diagnose_torrent))
         .route("/api/v1/events", get(stream_events))
         .route("/api/v1/session-events", get(list_session_events))
+        .route("/api/v1/jobs", get(crate::handlers::list_jobs))
         .route("/api/v1/storage/plan", post(storage_preview_plan))
         .route("/api/v1/storage/execute", post(storage_execute_plan))
         .with_state(state)

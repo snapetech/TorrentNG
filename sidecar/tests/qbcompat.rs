@@ -1193,6 +1193,15 @@ async fn native_storage_reports_configured_roots() {
 }
 
 #[tokio::test]
+async fn native_jobs_returns_empty_list_for_sidecar_mode() {
+    let (addr, client) = spawn_server().await;
+    let res = client.get(url(addr, "/api/v1/jobs")).send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["jobs"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
 async fn native_session_features_validate_request_body() {
     let (addr, client) = spawn_server().await;
     let res = client

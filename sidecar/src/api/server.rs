@@ -95,6 +95,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/tags/{name}", delete(handlers::delete_tag))
         .route("/api/v1/bulk/{action}", post(handlers::bulk_action))
         .route("/api/v1/storage", get(handlers::storage_roots))
+        .route("/api/v1/jobs", get(handlers::list_jobs))
         .route("/api/v1/logs", get(handlers::list_logs))
         .route("/api/v1/tracker-health", get(handlers::tracker_health))
         .route("/api/v1/sidebar-facets", get(handlers::sidebar_facets))

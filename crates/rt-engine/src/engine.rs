@@ -33,8 +33,9 @@ use rt_storage::{
 };
 
 use crate::command::{
-    CmdResult, EngineCmd, EngineGlobalLimits, EnginePeerSnapshot, EnginePieceState, EngineStats,
-    EngineTorrentFile, EngineTorrentLimits, EngineTorrentMetadata, QueueMove, TorrentDiagnostic,
+    CmdResult, EngineCmd, EngineGlobalLimits, EngineJob, EnginePeerSnapshot, EnginePieceState,
+    EngineStats, EngineTorrentFile, EngineTorrentLimits, EngineTorrentMetadata, QueueMove,
+    TorrentDiagnostic,
 };
 use crate::dht_task::{run_dht, DhtCommand, DhtTorrent};
 use crate::metadata_task::run_metadata_task;
@@ -316,6 +317,15 @@ impl EngineHandle {
                 completed_steps,
                 reply,
             })
+            .await
+            .map_err(|_| "engine shut down".to_owned())?;
+        rx.await.map_err(|_| "engine dropped reply".to_owned())?
+    }
+
+    pub async fn list_jobs(&self) -> CmdResult<Vec<EngineJob>> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(EngineCmd::ListJobs { reply })
             .await
             .map_err(|_| "engine shut down".to_owned())?;
         rx.await.map_err(|_| "engine dropped reply".to_owned())?
@@ -1040,6 +1050,10 @@ impl Engine {
                     &roots,
                     completed_steps,
                 );
+                let _ = reply.send(result);
+            }
+            EngineCmd::ListJobs { reply } => {
+                let result = self.list_active_jobs();
                 let _ = reply.send(result);
             }
             EngineCmd::UpdateTorrentTrackers {
@@ -3193,6 +3207,13 @@ impl Engine {
             );
         }
         Some(job_id)
+    }
+
+    fn list_active_jobs(&self) -> CmdResult<Vec<EngineJob>> {
+        let db = self.db.lock().expect("database mutex poisoned");
+        rt_db::list_active_jobs(&db)
+            .map(|jobs| jobs.into_iter().map(EngineJob::from).collect())
+            .map_err(|e| e.to_string())
     }
 
     #[allow(dead_code)]

@@ -14,6 +14,7 @@ use futures::Stream;
 use rt_api_model::{
     AddTorrentRequest, AddTorrentResponse, ApiError, FileInfo, TorrentDetail, TorrentSummary,
 };
+use rt_engine::EngineJob;
 use rt_metainfo::{parse_magnet, parse_torrent};
 use rt_metrics::MemoryClass;
 use rt_session::{TorrentEntry, TorrentState};
@@ -351,6 +352,31 @@ pub struct StoragePlanStepView {
     bytes: u64,
 }
 
+#[derive(Debug, Serialize)]
+pub struct JobsResponse {
+    jobs: Vec<JobView>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct JobView {
+    job_id: String,
+    kind: String,
+    state: String,
+    dry_run: bool,
+    affected_torrents: Vec<String>,
+    total: i64,
+    done: i64,
+    checkpoint: i64,
+    byte_offset: Option<i64>,
+    verified_bytes: i64,
+    error: Option<String>,
+    created_at: i64,
+    started_at: Option<i64>,
+    updated_at: i64,
+    finished_at: Option<i64>,
+    progress: f64,
+}
+
 /// `POST /api/v1/storage/plan` — preview a move/import/delete storage plan.
 pub async fn storage_preview_plan(
     State(state): State<AppState>,
@@ -448,6 +474,39 @@ pub async fn storage_execute_plan(
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::to_value(ApiError::bad_request(e)).unwrap()),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /api/v1/jobs` — list active durable engine jobs.
+pub async fn list_jobs(State(state): State<AppState>) -> impl IntoResponse {
+    let Some(engine) = &state.engine else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                serde_json::to_value(ApiError::internal(
+                    "native engine is not available".to_owned(),
+                ))
+                .unwrap(),
+            ),
+        )
+            .into_response();
+    };
+    match engine.list_jobs().await {
+        Ok(jobs) => (
+            StatusCode::OK,
+            Json(
+                serde_json::to_value(JobsResponse {
+                    jobs: jobs.into_iter().map(JobView::from).collect(),
+                })
+                .unwrap(),
+            ),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::to_value(ApiError::internal(e)).unwrap()),
         )
             .into_response(),
     }
@@ -576,6 +635,34 @@ impl StoragePlanStepView {
                 .as_ref()
                 .map(|path| path.display().to_string()),
             bytes: step.bytes,
+        }
+    }
+}
+
+impl From<EngineJob> for JobView {
+    fn from(job: EngineJob) -> Self {
+        let progress = if job.total > 0 {
+            (job.done as f64 / job.total as f64).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        Self {
+            job_id: job.job_id,
+            kind: job.kind,
+            state: job.state,
+            dry_run: job.dry_run,
+            affected_torrents: job.affected_torrents,
+            total: job.total,
+            done: job.done,
+            checkpoint: job.checkpoint,
+            byte_offset: job.byte_offset,
+            verified_bytes: job.verified_bytes,
+            error: job.error,
+            created_at: job.created_at,
+            started_at: job.started_at,
+            updated_at: job.updated_at,
+            finished_at: job.finished_at,
+            progress,
         }
     }
 }
@@ -2471,6 +2558,34 @@ mod tests {
 
         let plan = build_storage_plan(&req, true).unwrap();
         assert!(validate_storage_plan_roots(&plan, req.roots.as_deref()).is_some());
+    }
+
+    #[test]
+    fn job_view_projects_progress_and_checkpoint_fields() {
+        let view = JobView::from(EngineJob {
+            job_id: "job-1".to_owned(),
+            kind: "storage_plan".to_owned(),
+            state: "running".to_owned(),
+            dry_run: false,
+            affected_torrents: vec!["a".repeat(40)],
+            total: 10,
+            done: 4,
+            checkpoint: 3,
+            byte_offset: Some(2048),
+            verified_bytes: 1024,
+            error: None,
+            created_at: 1,
+            started_at: Some(2),
+            updated_at: 3,
+            finished_at: None,
+        });
+
+        assert_eq!(view.job_id, "job-1");
+        assert_eq!(view.kind, "storage_plan");
+        assert_eq!(view.progress, 0.4);
+        assert_eq!(view.checkpoint, 3);
+        assert_eq!(view.byte_offset, Some(2048));
+        assert_eq!(view.affected_torrents.len(), 1);
     }
 
     async fn setup_authed_app_with_torrent() -> (axum::Router, String) {

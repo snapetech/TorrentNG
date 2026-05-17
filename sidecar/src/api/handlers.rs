@@ -93,6 +93,10 @@ pub async fn storage_roots(State(s): State<AppState>) -> impl IntoResponse {
     Json(serde_json::json!({ "roots": rows }))
 }
 
+pub async fn list_jobs() -> impl IntoResponse {
+    Json(serde_json::json!({ "jobs": [] }))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct LogsQuery {
     limit: Option<usize>,

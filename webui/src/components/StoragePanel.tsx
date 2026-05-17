@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react'
 import { useMutation, useQuery } from '@tanstack/react-query'
-import { api, type StoragePlanRequest, type StoragePlanResponse } from '../api/client'
+import { api, type Job, type StoragePlanRequest, type StoragePlanResponse } from '../api/client'
 
 function fmtBytes(bytes: number): string {
   if (bytes >= 1e12) return (bytes / 1e12).toFixed(2) + ' TB'
@@ -66,7 +66,14 @@ export function StoragePanel() {
     staleTime: 5_000,
     refetchInterval: 10_000,
   })
+  const { data: jobsData } = useQuery({
+    queryKey: ['jobs', 'storage-plan'],
+    queryFn: api.jobs,
+    staleTime: 2_000,
+    refetchInterval: 3_000,
+  })
   const roots = data?.roots.filter(root => root.ok && !root.readonly) ?? []
+  const storageJobs = jobsData?.jobs.filter(job => job.kind === 'storage_plan') ?? []
   const selectedRoot = rootPath || roots[0]?.path || ''
   const selectedRootInfo = roots.find(root => root.path === selectedRoot)
   const request = useMemo<StoragePlanRequest>(() => {
@@ -156,6 +163,10 @@ export function StoragePanel() {
       </div>
 
       <div style={{ marginTop: 14, maxWidth: 960 }}>
+        {storageJobs.length > 0 && (
+          <StorageJobs jobs={storageJobs} />
+        )}
+
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10, flexWrap: 'wrap' }}>
           <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--text)', flex: 1, minWidth: 200 }}>
             Storage Plan
@@ -264,6 +275,49 @@ export function StoragePanel() {
         {preview && <StoragePlanResult response={preview} completedIndexes={completedIndexes} />}
       </div>
     </section>
+  )
+}
+
+function StorageJobs({ jobs }: { jobs: Job[] }) {
+  return (
+    <div style={{ display: 'grid', gap: 7, marginBottom: 12 }}>
+      {jobs.map(job => (
+        <div
+          key={job.job_id}
+          style={{
+            border: '1px solid var(--border)',
+            borderRadius: 7,
+            background: 'var(--surface)',
+            padding: 10,
+            display: 'grid',
+            gap: 7,
+          }}
+        >
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', minWidth: 0 }}>
+            <strong style={{ color: 'var(--text)', fontSize: 12, textTransform: 'capitalize' }}>
+              {job.state}
+            </strong>
+            <code style={{ color: 'var(--faint)', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {job.job_id}
+            </code>
+            <span style={{ marginLeft: 'auto', color: 'var(--muted)', fontSize: 12, fontWeight: 800 }}>
+              {Math.round(job.progress * 100)}%
+            </span>
+          </div>
+          <div style={{ height: 7, borderRadius: 99, background: 'var(--surface-2)', overflow: 'hidden' }}>
+            <div style={{ width: `${Math.max(0, Math.min(100, job.progress * 100))}%`, height: '100%', background: 'var(--accent)' }} />
+          </div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 7 }}>
+            <SummaryPill label="steps" value={`${job.done}/${job.total}`} />
+            <SummaryPill label="checkpoint" value={String(job.checkpoint)} />
+            <SummaryPill label="bytes" value={fmtBytes(Math.max(0, job.byte_offset ?? job.verified_bytes))} />
+            {job.affected_torrents.length > 0 && (
+              <SummaryPill label="torrents" value={String(job.affected_torrents.length)} />
+            )}
+          </div>
+        </div>
+      ))}
+    </div>
   )
 }
 

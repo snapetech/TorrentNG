@@ -170,6 +170,47 @@ pub struct StorageDeviceLatencyStats {
     pub hash_latency_buckets: [u64; STORAGE_LATENCY_BUCKET_COUNT],
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineJob {
+    pub job_id: String,
+    pub kind: String,
+    pub state: String,
+    pub dry_run: bool,
+    pub affected_torrents: Vec<String>,
+    pub total: i64,
+    pub done: i64,
+    pub checkpoint: i64,
+    pub byte_offset: Option<i64>,
+    pub verified_bytes: i64,
+    pub error: Option<String>,
+    pub created_at: i64,
+    pub started_at: Option<i64>,
+    pub updated_at: i64,
+    pub finished_at: Option<i64>,
+}
+
+impl From<rt_db::JobRow> for EngineJob {
+    fn from(row: rt_db::JobRow) -> Self {
+        Self {
+            job_id: row.job_id,
+            kind: row.kind,
+            state: row.state,
+            dry_run: row.dry_run,
+            affected_torrents: row.affected_torrents,
+            total: row.total,
+            done: row.done,
+            checkpoint: row.checkpoint,
+            byte_offset: row.byte_offset,
+            verified_bytes: row.verified_bytes,
+            error: row.error,
+            created_at: row.created_at,
+            started_at: row.started_at,
+            updated_at: row.updated_at,
+            finished_at: row.finished_at,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TorrentRuntimeStats {
     pub connected_peers: u64,
@@ -717,6 +758,10 @@ pub enum EngineCmd {
         roots: Vec<PathBuf>,
         completed_steps: Vec<usize>,
         reply: oneshot::Sender<CmdResult<String>>,
+    },
+    /// List active durable jobs.
+    ListJobs {
+        reply: oneshot::Sender<CmdResult<Vec<EngineJob>>>,
     },
     /// Replace persisted tracker URLs for a torrent.
     UpdateTorrentTrackers {
