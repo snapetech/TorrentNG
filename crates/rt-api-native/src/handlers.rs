@@ -1345,9 +1345,8 @@ mod tests {
             .contains("torrentng_storage_bytes_written_by_class_total{class=\"peer_write\"} 13"));
         assert!(rendered.contains("torrentng_storage_backend_read_ops_total 14"));
         assert!(rendered.contains("torrentng_storage_backend_bytes_read_total 15"));
-        assert!(rendered.contains(
-            "torrentng_storage_backend_read_ops_by_class_total{class=\"peer_read\"} 16"
-        ));
+        assert!(rendered
+            .contains("torrentng_storage_backend_read_ops_by_class_total{class=\"peer_read\"} 16"));
         assert!(rendered.contains(
             "torrentng_storage_backend_bytes_read_by_class_total{class=\"peer_read\"} 17"
         ));
@@ -1366,8 +1365,9 @@ mod tests {
         );
         assert!(rendered.contains("torrentng_storage_read_latency_nanoseconds_sum 18"));
         assert!(rendered.contains("torrentng_storage_read_latency_nanoseconds_count 6"));
-        assert!(rendered
-            .contains("torrentng_storage_write_latency_nanoseconds_bucket{le=\"+Inf\"} 11"));
+        assert!(
+            rendered.contains("torrentng_storage_write_latency_nanoseconds_bucket{le=\"+Inf\"} 11")
+        );
         assert!(
             rendered.contains("torrentng_storage_sync_latency_nanoseconds_bucket{le=\"+Inf\"} 2")
         );

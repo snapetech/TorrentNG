@@ -41,6 +41,9 @@ certified status.
 - [INTEROP_MATRIX.md](INTEROP_MATRIX.md) - Docker client matrix across
   rusttorrentd, qBittorrent, Transmission, Deluge, rTorrent, local fixtures, and
   official public Linux torrents.
+- [STORAGE_PHASE_B_TEST_MATRIX.md](STORAGE_PHASE_B_TEST_MATRIX.md) - focused
+  matrix for storage topology, auto preallocation, peer-read locality, and
+  per-device elevator work.
 - [ENGINE_REWRITE_BURNDOWN.md](ENGINE_REWRITE_BURNDOWN.md) - implementation
   checklist for the native rewrite.
 

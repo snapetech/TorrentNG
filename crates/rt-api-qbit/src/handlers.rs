@@ -10,7 +10,7 @@ use std::{
     collections::{hash_map::DefaultHasher, HashMap},
     hash::{Hash, Hasher},
     net::{IpAddr, SocketAddr},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use url::Url;
 
@@ -991,7 +991,7 @@ pub async fn torrents_properties(
     };
 
     let (piece_size, pieces_num) = if let Some(engine) = &state.engine {
-        match engine.torrent_metadata(hash).await {
+        match engine.torrent_metadata(hash.clone()).await {
             Ok(meta) => (meta.piece_length as i64, meta.piece_count as i64),
             Err(_) => (0, 0),
         }
@@ -999,6 +999,22 @@ pub async fn torrents_properties(
         (0, 0)
     };
 
+    let limits = get_torrent_limits(&state, &hash).await;
+    let now = unix_now();
+    let time_elapsed = now.saturating_sub(entry.added_at as i64);
+    let seeding_time = entry
+        .completed_at
+        .map(|completed| now.saturating_sub(completed as i64))
+        .unwrap_or(0);
+    let dl_speed = 0;
+    let up_speed = 0;
+    let eta = if entry.amount_left == 0 {
+        0
+    } else if dl_speed > 0 {
+        (entry.amount_left as i64 / dl_speed).max(0)
+    } else {
+        -1
+    };
     let pieces_have = pieces_have(
         entry.total_length,
         entry.amount_left,
@@ -1016,19 +1032,19 @@ pub async fn torrents_properties(
         total_uploaded_session: entry.stats.uploaded as i64,
         total_downloaded: entry.stats.downloaded as i64,
         total_downloaded_session: entry.stats.downloaded as i64,
-        up_limit: -1,
-        dl_limit: -1,
-        time_elapsed: 0,
-        seeding_time: 0,
+        up_limit: limits.upload_limit.unwrap_or(-1),
+        dl_limit: limits.download_limit.unwrap_or(-1),
+        time_elapsed,
+        seeding_time,
         nb_connections: 0,
-        nb_connections_limit: -1,
+        nb_connections_limit: limits.max_connections.unwrap_or(-1),
         share_ratio: entry.stats.ratio(),
         addition_date: entry.added_at as i64,
         completion_date: entry.completed_at.map(|t| t as i64).unwrap_or(-1),
         created_by: String::new(),
         dl_speed_avg: 0,
-        dl_speed: 0,
-        eta: -1,
+        dl_speed,
+        eta,
         last_seen: -1,
         peers: 0,
         peers_total: 0,
@@ -1039,7 +1055,7 @@ pub async fn torrents_properties(
         seeds_total: 0,
         total_size: entry.total_length as i64,
         up_speed_avg: 0,
-        up_speed: 0,
+        up_speed,
     };
     (StatusCode::OK, Json(props))
 }
@@ -2401,6 +2417,13 @@ fn parse_form_body(body: &str) -> HashMap<String, String> {
         .collect()
 }
 
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
 fn split_tags(tags: &str) -> Vec<String> {
     tags.split(',')
         .map(|s| s.trim().to_owned())
@@ -3319,6 +3342,8 @@ mod tests {
             let entry = reg.get_mut(&hash).unwrap();
             entry.total_length = 1_000;
             entry.amount_left = 250;
+            entry.added_at = 100;
+            entry.completed_at = Some(200);
             entry.stats.add_download(750);
             entry.stats.add_upload(1_500);
         }
@@ -3340,6 +3365,9 @@ mod tests {
         assert_eq!(v["total_downloaded"].as_i64().unwrap(), 750);
         assert_eq!(v["total_uploaded"].as_i64().unwrap(), 1_500);
         assert_eq!(v["share_ratio"].as_f64().unwrap(), 2.0);
+        assert!(v["time_elapsed"].as_i64().unwrap() > 0);
+        assert!(v["seeding_time"].as_i64().unwrap() > 0);
+        assert_eq!(v["eta"].as_i64().unwrap(), -1);
         assert_eq!(v["piece_size"].as_i64().unwrap(), 0);
         assert_eq!(v["pieces_num"].as_i64().unwrap(), 0);
     }

@@ -62,12 +62,12 @@ Local surface: `crates/rt-api-qbit`.
 | API group | Upstream surface | Local status |
 |---|---|---|
 | Authentication | `auth/login`, `auth/logout` | Implemented |
-| Application | version, API version, build info, shutdown, preferences, set preferences, default save path, network interface probes, test email | Implemented as native/no-op compatibility where no native equivalent exists |
+| Application | version, API version, build info, shutdown, preferences, set preferences, default save path, network interface probes, test email | Implemented as native/no-op compatibility where no native equivalent exists; `setPreferences` persists arbitrary qBit preference keys in facade state |
 | qBittorrent 5 cookie/API key APIs | `app/getCookies`, `app/setCookies`, `app/rotateAPIKey`, `app/deleteAPIKey` | Implemented as empty/no-op compatibility |
 | Logs | main log, peer log | Implemented as empty-compatible reads |
 | Sync | `sync/maindata`, `sync/torrentPeers` | Implemented; maindata carries broad torrent/server-state keys and torrentPeers carries qBit peer shape with stable RID deltas |
 | Transfer | global info, speed limits, speed-limit mode, ban peers | Implemented |
-| Torrent reads | list with modern qBit path/counter/limit/mode/magnet/infohash fields, properties, trackers, web seeds, files, piece states, piece hashes, export | Implemented |
+| Torrent reads | list with modern qBit path/counter/limit/mode/magnet/infohash fields, properties, trackers, web seeds, files, piece states, piece hashes, export | Implemented; properties include registry/engine-backed counters, lifecycle times, piece counts, and limits where available |
 | Torrent lifecycle | add, pause/resume legacy aliases, start/stop v5 aliases, delete, recheck, reannounce | Implemented |
 | Torrent mutation | tracker add/edit/remove, peers, priority order, file priority, limits, share limits, force start, super seeding, auto management, sequential, first/last, location/save path, rename, category with configured save paths, tags with global tag cleanup | Implemented |
 | RSS | folders, feeds, items, rules, matching articles | Implemented as no-op/read-compatible |
@@ -115,7 +115,8 @@ Local surface: `crates/rt-api-deluge`.
 | Done | Add tests that enumerate advertised facade methods and assert every advertised method returns a compatibility-shaped response | Prevents method-list drift |
 | Done | Add cross-source import/apply matrices for JSON and bencoded resume aliases | Prevents fast-resume regressions when migrating from old clients |
 | Done | Expand qBittorrent preference response breadth and API-key compatibility routes | Settings panes and modern API clients probe these before mutation |
-| Medium | Persist qBittorrent mutable preferences and deepen torrent property field values | Avoids settings panes seeing accepted writes disappear |
+| Done | Persist qBittorrent mutable preferences | Avoids settings panes seeing accepted writes disappear |
+| Done | Deepen qBittorrent torrent property field values | Avoids detail panes seeing compatibility placeholders for values derivable from registry/engine state |
 | Medium | Replace synthetic import aliases with real exported golden corpora for every supported legacy client version family | Catches undocumented key variants and nested plugin state |
 | Done | Preserve scheduler/RSS/search/autoadd/blocklist/execute/plugin metadata as auxiliary migration artifacts | Useful for full client migration; intentionally separate from torrent progress |
 | Low | Proprietary client deep parsers for Tixati/BiglyBT plugin-only fields | Needs fixture corpus; progress import already uses generic verified paths |

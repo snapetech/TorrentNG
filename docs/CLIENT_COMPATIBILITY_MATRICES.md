@@ -120,9 +120,9 @@ qBittorrent field backlog:
 
 | Surface | Fields to audit exhaustively | Current risk |
 |---|---|---|
-| `app/preferences` | Broad current/legacy WebUI preference key set across paths, queueing, BitTorrent, WebUI, RSS, proxy, and advanced settings | Implemented compatibility defaults for common settings panes; remaining work is value persistence for mutable settings |
+| `app/preferences` | Broad current/legacy WebUI preference key set across paths, queueing, BitTorrent, WebUI, RSS, proxy, and advanced settings | Implemented compatibility defaults plus in-memory `setPreferences` persistence for arbitrary qBit preference keys |
 | `torrents/info` | Core list fields plus modern path, session counter, lifecycle, limit, mode, magnet, and infohash fields; detailed availability and live swarm counters remain placeholders | Implemented compatibility breadth for common remote-app columns |
-| `torrents/properties` | Full properties object | Detail panels may show missing values |
+| `torrents/properties` | Full properties object | Implemented key set with registry/engine-backed counters, lifecycle times, piece counts, and per-torrent limits where available |
 | `sync/maindata` / `sync/torrentPeers` | Server state, categories, tags, torrents, trackers, peers | Broad torrent/server-state key sets and peer shape/RID stability are matrix-tested; remaining risk is deeper live tracker delta fidelity |
 
 ## 4. Transmission RPC Matrix
@@ -248,7 +248,8 @@ covered today as an import source and as an interop peer.
 | P0 | Add all-field response tests for qBit `torrents/info`, `properties`, `sync/maindata`; Transmission `torrent_get` and `session_get`; Deluge torrent status | Implemented in facade unit tests for currently supported fields |
 | P0 | Deepen Transmission 4.1 native parity beyond compatibility envelope: exact error codes, notifications, and remaining mutable session fields | Transmission API matrix |
 | P1 | Deepen Deluge `web.add_torrents` with real file upload/temp-file flows when target clients require it | Deluge API matrix |
-| P1 | Persist qBittorrent mutable preferences and broaden property projections to all documented keys | qBit field backlog |
+| Done | Persist qBittorrent mutable preferences for arbitrary `setPreferences` keys | qBit field backlog |
+| Done | Broaden qBittorrent property projections to documented keys backed by registry/engine state | qBit field backlog |
 | P1 | Build real exported golden fixture corpus for qBit, Transmission, Deluge, uTorrent, BiglyBT/Vuze, Tixati, rTorrent, and compare it against the synthetic JSON/bencoded alias matrices | Import matrix |
 | P2 | Decide rTorrent XMLRPC facade scope | rTorrent matrix |
 | Done | Preserve auxiliary RSS/search/scheduler/autoadd/blocklist/execute/plugin/config metadata as migration artifacts | Feature/import matrices |
