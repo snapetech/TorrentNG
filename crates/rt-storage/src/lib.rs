@@ -30,7 +30,7 @@ pub use plan::{
 };
 pub use scheduler::{
     preallocation_mode_for_topology, DurabilityMode, FilePoolStats, IoRequest, MountScheduler,
-    PreallocationMode, SchedulerConfig, StorageIoConfig, StorageIoStats,
+    PreallocationMode, SchedulerConfig, StorageIoConfig, StorageIoStats, StorageRead,
     STORAGE_LATENCY_BUCKETS_NS, STORAGE_LATENCY_BUCKET_COUNT,
 };
 pub use verify::{PieceVerifier, V2FileHash, V2FileVerifier, VerifyResult};

@@ -50,7 +50,9 @@ class semaphores:
   detected topology. Native `[storage]` TOML exposes these scheduler knobs so
   operators can tune them without code changes.
 - `scheduled_read` and `scheduled_write` remain compatibility wrappers, but
-  call positioned `read_at`/`write_at`.
+  call positioned `read_at`/`write_at`. Callers that can process borrowed data
+  can use `scheduled_read_owned` / `read_owned_at` to keep exact backend reads
+  in a pooled `StorageRead::Frame`.
 - Disk syscalls are submitted through the probe-selected `DiskBackend`
   (`pread` baseline or explicit Linux `io_uring`) while `MountScheduler`
   preserves its per-class, per-mount, and per-device backpressure gates.

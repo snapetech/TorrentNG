@@ -10,7 +10,9 @@ scheduler used by the native engine.
   worker threads, queue depth, preallocation, durability, and peer-read
   readahead target.
 - `scheduled_read` and `scheduled_write` are compatibility wrappers over
-  positioned `read_at` and `write_at`.
+  positioned `read_at` and `write_at`; `scheduled_read_owned` preserves a
+  pooled `StorageRead::Frame` for exact backend reads when a caller can avoid
+  converting to `Bytes`.
 - A bounded open-file pool avoids per-block fd churn and records hits, misses,
   evictions, idle closes, and current open count.
 - Disk operations are submitted through the selected `DiskBackend`, behind

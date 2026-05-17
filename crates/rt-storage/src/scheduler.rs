@@ -22,7 +22,7 @@ use crate::{
     backend::{BackendRequest, DiskBackend, SelectedDiskBackend},
     device::{detect_storage_topology, StorageTopology},
     error::StorageError,
-    frame::global_frame_pool,
+    frame::{global_frame_pool, Frame},
     io_class::IoClass,
 };
 
@@ -201,6 +201,45 @@ pub struct StorageIoStats {
     pub sparse_data_extents: u64,
     pub sparse_hole_bytes: u64,
     pub sparse_seek_fallbacks: u64,
+}
+
+/// Read payload that can keep ownership of a pooled storage frame.
+///
+/// `read_at` and `scheduled_read` remain `Bytes` compatibility wrappers.
+/// New call sites that can process borrowed data should use
+/// `read_owned_at` / `scheduled_read_owned` so exact backend reads can avoid
+/// copying out of the process-wide frame pool.
+#[derive(Debug)]
+pub enum StorageRead {
+    Frame(Frame),
+    Bytes(bytes::Bytes),
+}
+
+impl StorageRead {
+    pub fn len(&self) -> usize {
+        match self {
+            StorageRead::Frame(frame) => frame.len(),
+            StorageRead::Bytes(bytes) => bytes.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            StorageRead::Frame(frame) => frame.as_slice(),
+            StorageRead::Bytes(bytes) => bytes.as_ref(),
+        }
+    }
+
+    pub fn into_bytes(self) -> bytes::Bytes {
+        match self {
+            StorageRead::Frame(frame) => bytes::Bytes::copy_from_slice(frame.as_slice()),
+            StorageRead::Bytes(bytes) => bytes,
+        }
+    }
 }
 
 impl Default for StorageIoStats {
@@ -1460,6 +1499,18 @@ impl MountScheduler {
         offset: u64,
         len: usize,
     ) -> Result<bytes::Bytes, StorageError> {
+        self.read_owned_at(class, path, offset, len)
+            .await
+            .map(StorageRead::into_bytes)
+    }
+
+    pub async fn read_owned_at(
+        &self,
+        class: IoClass,
+        path: &Path,
+        offset: u64,
+        len: usize,
+    ) -> Result<StorageRead, StorageError> {
         let _permit = self.acquire(class).await?;
         let pool = self.file_pool.clone();
         let disk_backend = self.disk_backend.clone();
@@ -1480,7 +1531,7 @@ impl MountScheduler {
                 counters.read_latency_ns_by_class[class_index(class)]
                     .fetch_add(latency_ns, Ordering::Relaxed);
                 record_latency_bucket(&counters.read_latency_buckets, latency_ns);
-                return Ok(bytes);
+                return Ok(StorageRead::Bytes(bytes));
             }
         }
         let submission = self.reserve_submission(len as u64)?;
@@ -1550,7 +1601,7 @@ impl MountScheduler {
         }
         let preparation = preparation?;
         match preparation {
-            ReadPreparation::CacheHit(bytes) => Ok(bytes),
+            ReadPreparation::CacheHit(bytes) => Ok(StorageRead::Bytes(bytes)),
             ReadPreparation::BackendRead {
                 key,
                 file,
@@ -1586,8 +1637,8 @@ impl MountScheduler {
                 counters.read_latency_ns_by_class[class_index(class)]
                     .fetch_add(latency_ns, Ordering::Relaxed);
                 record_latency_bucket(&counters.read_latency_buckets, latency_ns);
-                let bytes = bytes::Bytes::copy_from_slice(frame.as_slice());
                 if class == IoClass::PeerRead && read_len > len && readahead_cache_entries > 0 {
+                    let bytes = bytes::Bytes::copy_from_slice(frame.as_slice());
                     let exact = bytes.slice(..len);
                     peer_read_cache_store(
                         &peer_read_cache,
@@ -1598,9 +1649,9 @@ impl MountScheduler {
                         offset,
                         bytes,
                     );
-                    Ok(exact)
+                    Ok(StorageRead::Bytes(exact))
                 } else {
-                    Ok(bytes)
+                    Ok(StorageRead::Frame(frame))
                 }
             }
         }
@@ -1971,6 +2022,17 @@ pub async fn scheduled_read(
     len: usize,
 ) -> Result<bytes::Bytes, StorageError> {
     scheduler.read_at(class, path, offset, len).await
+}
+
+#[instrument(skip(scheduler), fields(path = %path.display(), offset, len))]
+pub async fn scheduled_read_owned(
+    scheduler: &MountScheduler,
+    class: IoClass,
+    path: &Path,
+    offset: u64,
+    len: usize,
+) -> Result<StorageRead, StorageError> {
+    scheduler.read_owned_at(class, path, offset, len).await
 }
 
 #[instrument(skip(scheduler, data), fields(path = %path.display(), offset, len = data.len()))]
@@ -2438,6 +2500,35 @@ mod tests {
             snapshot.classes[MemoryClass::QueuedDisk as usize].denied_allocations,
             1
         );
+    }
+
+    #[tokio::test]
+    async fn owned_read_returns_pooled_frame_for_exact_backend_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owned-read.bin");
+        std::fs::write(&path, b"owned-frame").unwrap();
+        let sched = MountScheduler::new(StorageRootId::new(), &SchedulerConfig::default());
+
+        let read = scheduled_read_owned(&sched, IoClass::Foreground, &path, 0, 11)
+            .await
+            .unwrap();
+
+        assert!(matches!(read, StorageRead::Frame(_)));
+        assert_eq!(read.as_slice(), b"owned-frame");
+    }
+
+    #[tokio::test]
+    async fn compatibility_read_still_returns_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("compat-read.bin");
+        std::fs::write(&path, b"compat").unwrap();
+        let sched = MountScheduler::new(StorageRootId::new(), &SchedulerConfig::default());
+
+        let read = scheduled_read(&sched, IoClass::Foreground, &path, 0, 6)
+            .await
+            .unwrap();
+
+        assert_eq!(read, bytes::Bytes::from_static(b"compat"));
     }
 
     #[tokio::test]

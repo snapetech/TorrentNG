@@ -41,7 +41,7 @@ use rt_piece_map::{FileSpan, PieceMap};
 use rt_piece_picker::{Availability, BlockRequest, PiecePicker, MAX_BLOCK_SIZE};
 use rt_session::{SessionRegistry, TorrentState};
 use rt_storage::{
-    scheduler::{scheduled_read, scheduled_write},
+    scheduler::{scheduled_read_owned, scheduled_write},
     IoClass, MountScheduler, PieceVerifier, SchedulerConfig, StorageIoConfig, VerifyResult,
 };
 use rt_tracker::{
@@ -3123,7 +3123,7 @@ async fn read_upload_block(
     let mut data = Vec::with_capacity(length as usize);
     for region in regions {
         let path = region.path.resolve(&upload.save_root);
-        let bytes = scheduled_read(
+        let read = scheduled_read_owned(
             &upload.storage,
             IoClass::PeerRead,
             &path,
@@ -3131,7 +3131,7 @@ async fn read_upload_block(
             region.length as usize,
         )
         .await?;
-        data.extend_from_slice(&bytes);
+        data.extend_from_slice(read.as_slice());
     }
     if data.len() != length as usize {
         anyhow::bail!(
