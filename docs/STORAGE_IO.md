@@ -153,9 +153,8 @@ The following items are still implementation targets:
   pinning once the global frame pool can lease stable registered buffer indexes.
   Until then, `torrentng_storage_backend_fixed_buffer_strategy` must report
   `worker_copy`, not `frame_pool_slots`.
-- Extend the release hardware report with recheck runtime progress.
-  `scripts/storage_hardware_matrix.sh` already records real-device seed-read
-  locality, bounded hot-file descriptor reuse, elevator throughput, and
+- The release hardware report records real-device seed-read locality, bounded
+  hot-file descriptor reuse, recheck runtime progress, elevator throughput, and
   optional syscall counts (`TNG_STORAGE_SYSCALLS=1`) across one or more target
   mounts.
 

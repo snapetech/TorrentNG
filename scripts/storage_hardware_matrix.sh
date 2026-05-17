@@ -14,6 +14,8 @@ markdown report under certification/reports/.
 Environment:
   TNG_STORAGE_BENCH_BLOCKS       blocks per benchmark file (default: 4096)
   TNG_STORAGE_BENCH_READS        repeated hot-file reads (default: 10000)
+  TNG_STORAGE_RECHECK_PIECES     pieces verified by recheck probe (default: 4096)
+  TNG_STORAGE_RECHECK_PIECE_LEN  bytes per recheck piece (default: 16384)
   TNG_STORAGE_REQUIRE_HDD_5X     require >=5x elevator wall-clock on HDD paths
   TNG_STORAGE_SYSCALLS           set to 1 to collect strace syscall counts
   TNG_STORAGE_LVM_EXTENTS        set to 1 to map a probe file through dm/LVM extents
@@ -195,7 +197,7 @@ append_lvm_extent_probe() {
 append_summary() {
   local log="$1"
   {
-    grep -E 'tng_storage_(backend|bench_path|file_pool|readahead|shuffled_baseline|elevator)' "$log" || true
+    grep -E 'tng_storage_(backend|bench_path|file_pool|readahead|recheck|shuffled_baseline|elevator)' "$log" || true
     grep -E 'tng_storage_syscalls' "$log" || true
     grep -E 'TorrentNG storage elevator wall-clock ratio|expected >=5x' "$log" || true
   } | sed 's/^/    /'
@@ -247,6 +249,8 @@ for target in "$@"; do
 
   if TNG_STORAGE_BENCH_BLOCKS="${TNG_STORAGE_BENCH_BLOCKS:-4096}" \
     TNG_STORAGE_BENCH_READS="${TNG_STORAGE_BENCH_READS:-10000}" \
+    TNG_STORAGE_RECHECK_PIECES="${TNG_STORAGE_RECHECK_PIECES:-4096}" \
+    TNG_STORAGE_RECHECK_PIECE_LEN="${TNG_STORAGE_RECHECK_PIECE_LEN:-16384}" \
     TNG_STORAGE_REQUIRE_5X="$require_5x" \
     TNG_STORAGE_SYSCALLS="${TNG_STORAGE_SYSCALLS:-0}" \
     "$ROOT/scripts/storage_real_device_benchmark.sh" "$target" 2>&1 | tee "$log"; then

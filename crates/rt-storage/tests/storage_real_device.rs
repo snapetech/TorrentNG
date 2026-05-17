@@ -1,12 +1,14 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use rt_path::{StorageProfile, StorageRootId};
+use rt_path::{SafeRelPath, StorageProfile, StorageRootId};
+use rt_piece_map::{FileSpan, PieceMap};
 use rt_storage::frame::FramePool;
 use rt_storage::{
-    detect_storage_topology, BackendRequest, DiskBackend, IoClass, MountScheduler, SchedulerConfig,
-    SelectedDiskBackend, StorageError, StorageIoConfig,
+    detect_storage_topology, BackendRequest, DiskBackend, IoClass, MountScheduler, PieceVerifier,
+    SchedulerConfig, SelectedDiskBackend, StorageError, StorageIoConfig, VerifyResult,
 };
+use sha1::{Digest, Sha1};
 
 fn bench_size(name: &str, default: u64) -> u64 {
     std::env::var(name)
@@ -17,6 +19,12 @@ fn bench_size(name: &str, default: u64) -> u64 {
 
 fn bench_u64(name: &str, default: u64) -> u64 {
     bench_size(name, default)
+}
+
+fn piece_hash(data: &[u8]) -> [u8; 20] {
+    let mut hasher = Sha1::new();
+    hasher.update(data);
+    hasher.finalize().into()
 }
 
 fn bench_dir() -> tempfile::TempDir {
@@ -343,6 +351,73 @@ async fn repeated_reads_reuse_one_open_file_handle() {
 
     assert_eq!(stats.misses, 1);
     assert_eq!(stats.open_files, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real-device storage benchmark; run explicitly with --ignored --nocapture"]
+async fn recheck_range_reports_runtime_progress() {
+    let pieces = bench_size("TNG_STORAGE_RECHECK_PIECES", 4096) as usize;
+    let piece_len = bench_size("TNG_STORAGE_RECHECK_PIECE_LEN", 16 * 1024) as usize;
+    let total = pieces * piece_len;
+
+    let dir = bench_dir();
+    print_topology(dir.path());
+    let path = dir.path().join("recheck.bin");
+    let data: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&path, &data).unwrap();
+    settle_file_for_read_benchmark(&path);
+
+    let hashes = (0..pieces)
+        .map(|piece| piece_hash(&data[piece * piece_len..(piece + 1) * piece_len]))
+        .collect::<Vec<_>>();
+    let files = vec![FileSpan {
+        file_index: 0,
+        path: SafeRelPath::from_name("recheck.bin", false).unwrap(),
+        content_offset: 0,
+        length: total as u64,
+    }];
+    let piece_map = PieceMap::new(piece_len as u64, files).unwrap();
+    let scheduler = MountScheduler::new_for_path(
+        StorageRootId::new(),
+        dir.path(),
+        &SchedulerConfig {
+            profile: StorageProfile::Unknown,
+            recheck_concurrency: 64,
+            storage_io: StorageIoConfig {
+                peer_read_readahead_bytes: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    let verifier = PieceVerifier::new(dir.path(), &scheduler, &piece_map, &hashes);
+
+    let started = Instant::now();
+    let results = verifier.verify_range(0, pieces as u32).await.unwrap();
+    let elapsed = started.elapsed();
+    let valid = results
+        .iter()
+        .filter(|(_, result)| matches!(result, VerifyResult::Valid))
+        .count();
+    let stats = scheduler.stats();
+    let total_mib = total as f64 / (1024.0 * 1024.0);
+    let mib_s = total_mib / elapsed.as_secs_f64();
+
+    println!(
+        "tng_storage_recheck pieces={pieces} piece_len={piece_len} total_mib={total_mib:.2} valid={valid} elapsed_ms={} mib_s={mib_s:.2} read_ops={} backend_reads={} hash_ops={} hash_latency_ms={}",
+        elapsed.as_millis(),
+        stats.read_ops_by_class[IoClass::Recheck as usize],
+        stats.backend_read_ops_by_class[IoClass::Recheck as usize],
+        stats.hash_ops,
+        stats.hash_latency_ns / 1_000_000,
+    );
+
+    assert_eq!(valid, pieces);
+    assert_eq!(
+        stats.read_ops_by_class[IoClass::Recheck as usize],
+        pieces as u64
+    );
+    assert_eq!(stats.hash_ops, pieces as u64);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -29,6 +29,8 @@ async fn main() -> anyhow::Result<()> {
     let config = Arc::new(load_config());
     rt_logging::init(&config.logging, Some(&config.daemon.log_level));
     info!(
+        component = "daemon",
+        operation = "startup",
         version = env!("CARGO_PKG_VERSION"),
         api_bind = %config.daemon.api_bind,
         listen_port = config.network.listen_port,
@@ -78,7 +80,12 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .context("invalid api_bind address")?;
 
-    info!(addr = %api_addr, "API listening");
+    info!(
+        component = "http",
+        operation = "listen",
+        addr = %api_addr,
+        "API listening"
+    );
 
     let listener = tokio::net::TcpListener::bind(api_addr)
         .await
@@ -88,7 +95,12 @@ async fn main() -> anyhow::Result<()> {
     let engine_for_shutdown = engine_handle.clone();
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
-            info!("received ctrl-c, shutting down");
+            info!(
+                component = "daemon",
+                operation = "shutdown_signal",
+                signal = "ctrl-c",
+                "received ctrl-c, shutting down"
+            );
             engine_for_shutdown.shutdown().await;
         }
     });

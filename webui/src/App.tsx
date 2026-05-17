@@ -927,10 +927,11 @@ function SettingsView({ section, onSection, mediaInference, onMediaInference, th
           <div style={{ fontSize: 16, fontWeight: 800, color: 'var(--text)' }}>Settings</div>
           <div style={{ fontSize: 11, color: 'var(--faint)', marginTop: 3 }}>Daemon, library, and browser controls</div>
         </div>
-        <div role="tablist" aria-label="Settings sections">
+        <div role="tablist" aria-label="Settings sections" aria-orientation="vertical">
         {sections.map(([key, label, icon]) => (
           <button
             key={key}
+            type="button"
             id={`settings-tab-${key}`}
             role="tab"
             className="tng-settings-nav-button"
@@ -942,6 +943,11 @@ function SettingsView({ section, onSection, mediaInference, onMediaInference, th
               onSection(key)
             }}
             onKeyDown={event => {
+              if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault()
+                preloadSettingsSection(key)
+                onSection(key)
+              }
               if (event.key === 'ArrowDown' || event.key === 'ArrowRight') {
                 event.preventDefault()
                 moveSection(key, 1)
@@ -979,24 +985,24 @@ function SettingsView({ section, onSection, mediaInference, onMediaInference, th
       </aside>
       <div style={{ flex: 1, overflowY: 'auto', background: 'var(--bg)' }}>
         <Suspense fallback={<SettingsPanelFallback />}>
-        {section === 'library' && (<section id="settings-panel-library" role="tabpanel" aria-labelledby="settings-tab-library">
+        {section === 'library' && (<section id="settings-panel-library" role="tabpanel" aria-labelledby="settings-tab-library" tabIndex={0}>
           <PanelTitle title="Library" subtitle="Categories, storage roots, and tracker summaries" />
           <PanelFrame><CategoriesPanel /></PanelFrame>
           <PanelFrame><StoragePanel /></PanelFrame>
           <PanelFrame><TrackerHealthPanel /></PanelFrame>
         </section>)}
-        {section === 'engine' && (<section id="settings-panel-engine" role="tabpanel" aria-labelledby="settings-tab-engine">
+        {section === 'engine' && (<section id="settings-panel-engine" role="tabpanel" aria-labelledby="settings-tab-engine" tabIndex={0}>
           <PanelTitle title="Engine" subtitle="Runtime diagnostics, user agent, and capability checks" />
           <PanelFrame><EnginePanel /></PanelFrame>
           <PanelFrame><UserAgentPanel /></PanelFrame>
         </section>)}
-        {section === 'automation' && (<section id="settings-panel-automation" role="tabpanel" aria-labelledby="settings-tab-automation">
+        {section === 'automation' && (<section id="settings-panel-automation" role="tabpanel" aria-labelledby="settings-tab-automation" tabIndex={0}>
           <PanelTitle title="Automation" subtitle="Ratio groups, workflows, and RSS rules" />
           <PanelFrame><RatioGroupsPanel /></PanelFrame>
           <PanelFrame><WorkflowsPanel /></PanelFrame>
           <PanelFrame><RssRulesPanel /></PanelFrame>
         </section>)}
-        {section === 'support' && (<section id="settings-panel-support" role="tabpanel" aria-labelledby="settings-tab-support">
+        {section === 'support' && (<section id="settings-panel-support" role="tabpanel" aria-labelledby="settings-tab-support" tabIndex={0}>
           <PanelTitle title="Support" subtitle="Project resources and community support" />
           <PanelFrame><LogsPanel /></PanelFrame>
           <PanelFrame>

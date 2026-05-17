@@ -374,6 +374,13 @@ function RtorrentSettingsPanel() {
     .filter(group => collapsedGroups.has(group.name))
     .reduce((sum, group) => sum + group.settings.length, 0)
   const allGroupsCollapsed = filteredGroups.length > 0 && filteredGroups.every(group => collapsedGroups.has(group.name))
+  const autosaveText = lastSaveFailed
+    ? `${dirtyCount} change${dirtyCount === 1 ? '' : 's'} could not be saved. Retry when the API is available.`
+    : save.isPending
+      ? 'Saving changes...'
+      : dirtyCount === 0
+        ? `All settings are saved${lastSavedAt ? `; last save ${formatRelativeTime(lastSavedAt)}` : ''}.`
+        : `${dirtyCount} change${dirtyCount === 1 ? '' : 's'} will autosave shortly: ${liveDirtyCount} live, ${restartDirtyCount} restart${customRcDirty ? ', custom lines edited' : ''}.`
   const toggleAllGroups = () => {
     if (allGroupsCollapsed) {
       setCollapsedGroups(new Set())
@@ -478,6 +485,9 @@ function RtorrentSettingsPanel() {
       {error && <InlineNotice>rTorrent settings unavailable</InlineNotice>}
       {data && (
         <div style={{ display: 'grid', gap: 10 }}>
+          <div id="rt-settings-autosave-status" role="status" aria-live="polite" style={visuallyHiddenStyle}>
+            {autosaveText}
+          </div>
           <div style={{
             display: 'grid',
             gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
@@ -605,13 +615,7 @@ function RtorrentSettingsPanel() {
             <div style={{ display: 'grid', gap: 4, minWidth: 0 }}>
               <div style={{ color: 'var(--text)', fontSize: 12, fontWeight: 800 }}>Autosave state</div>
               <div style={{ color: 'var(--faint)', fontSize: 11 }}>
-                {save.isPending
-                  ? 'Saving changes...'
-                  : lastSaveFailed
-                    ? `${dirtyCount} change${dirtyCount === 1 ? '' : 's'} could not be saved. Retry when the API is available.`
-                    : dirtyCount === 0
-                    ? `All settings are saved${lastSavedAt ? `; last save ${formatRelativeTime(lastSavedAt)}` : ''}.`
-                    : `${dirtyCount} change${dirtyCount === 1 ? '' : 's'} will autosave shortly: ${liveDirtyCount} live, ${restartDirtyCount} restart${customRcDirty ? ', custom lines edited' : ''}.`}
+                {autosaveText}
               </div>
             </div>
             <div role="toolbar" aria-label="Settings workspace actions" style={{ display: 'flex', gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
@@ -1422,6 +1426,18 @@ const miniPresetButtonStyle: React.CSSProperties = {
   padding: '4px 6px',
   fontSize: 10,
   fontWeight: 800,
+}
+
+const visuallyHiddenStyle: React.CSSProperties = {
+  position: 'absolute',
+  width: 1,
+  height: 1,
+  padding: 0,
+  margin: -1,
+  overflow: 'hidden',
+  clip: 'rect(0, 0, 0, 0)',
+  whiteSpace: 'nowrap',
+  border: 0,
 }
 
 function smallButtonStyle(enabled: boolean): React.CSSProperties {

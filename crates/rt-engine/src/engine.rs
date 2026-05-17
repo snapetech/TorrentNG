@@ -639,7 +639,13 @@ impl Engine {
             let bootstrap_nodes = config.dht.bootstrap_nodes.clone();
             tokio::spawn(async move {
                 if let Err(e) = run_dht(dht_port, listen_port, bootstrap_nodes, dht_rx).await {
-                    warn!(err = %e, "DHT task exited with error");
+                    warn!(
+                        component = "dht",
+                        operation = "run",
+                        result = "error",
+                        error = %e,
+                        "DHT task exited with error"
+                    );
                 }
             });
             Some(dht_tx)
@@ -675,7 +681,12 @@ impl Engine {
             .parse()
             .context("invalid listen_port")?;
         let listener = TcpListener::bind(listen_addr).await?;
-        info!(addr = %listen_addr, "TCP peer listener bound");
+        info!(
+            component = "peer_listener",
+            operation = "listen",
+            addr = %listen_addr,
+            "TCP peer listener bound"
+        );
 
         tokio::spawn(engine.run(listener));
         Ok(handle)
@@ -695,7 +706,14 @@ impl Engine {
                     let chans = self.torrent_chans.clone();
                     tokio::spawn(async move {
                         if let Err(e) = handle_incoming(stream, peer_addr, chans).await {
-                            warn!(peer = %peer_addr, err = %e, "incoming peer error");
+                            warn!(
+                                component = "peer_listener",
+                                operation = "accept_peer",
+                                peer = %peer_addr,
+                                result = "error",
+                                error = %e,
+                                "incoming peer error"
+                            );
                         }
                     });
                 }
@@ -711,7 +729,12 @@ impl Engine {
             Some("native engine stopped"),
             serde_json::json!({}),
         );
-        info!("engine shut down");
+        info!(
+            component = "engine",
+            operation = "shutdown",
+            result = "ok",
+            "engine shut down"
+        );
     }
 
     /// Returns false if the engine should stop.
@@ -1462,8 +1485,11 @@ impl Engine {
                 timed_out = true;
                 task.abort();
                 warn!(
+                    component = "engine",
+                    operation = "shutdown_torrent_task",
                     torrent = %info_hash,
                     timeout_secs,
+                    result = "timeout",
                     "aborted torrent task after shutdown deadline"
                 );
                 continue;
@@ -1473,15 +1499,25 @@ impl Engine {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     if !e.is_cancelled() {
-                        warn!(torrent = %info_hash, err = %e, "torrent task failed during shutdown");
+                        warn!(
+                            component = "engine",
+                            operation = "shutdown_torrent_task",
+                            torrent = %info_hash,
+                            result = "error",
+                            error = %e,
+                            "torrent task failed during shutdown"
+                        );
                     }
                 }
                 Err(_) => {
                     timed_out = true;
                     task.abort();
                     warn!(
+                        component = "engine",
+                        operation = "shutdown_torrent_task",
                         torrent = %info_hash,
                         timeout_secs,
+                        result = "timeout",
                         "aborted torrent task after shutdown deadline"
                     );
                 }
@@ -1489,7 +1525,13 @@ impl Engine {
         }
 
         if !timed_out {
-            info!(tasks = task_count, "torrent tasks stopped cleanly");
+            info!(
+                component = "engine",
+                operation = "shutdown_torrent_tasks",
+                tasks = task_count,
+                result = "ok",
+                "torrent tasks stopped cleanly"
+            );
         }
     }
 
@@ -2536,7 +2578,14 @@ impl Engine {
                         stats.dht_queried_nodes = dht.queried_nodes;
                     }
                     Ok(Err(_)) => {}
-                    Err(_) => warn!("timed out collecting DHT runtime stats"),
+                    Err(_) => warn!(
+                        component = "engine",
+                        operation = "collect_runtime_stats",
+                        target = "dht",
+                        duration_ms = 250_u64,
+                        result = "timeout",
+                        "timed out collecting DHT runtime stats"
+                    ),
                 }
             }
         }
@@ -2570,7 +2619,15 @@ impl Engine {
                 }
                 Ok(Err(_)) => {}
                 Err(_) => {
-                    warn!("timed out collecting torrent runtime stats");
+                    warn!(
+                        component = "engine",
+                        operation = "collect_runtime_stats",
+                        target = "torrent",
+                        torrent = %info_hash,
+                        duration_ms = 250_u64,
+                        result = "timeout",
+                        "timed out collecting torrent runtime stats"
+                    );
                 }
             }
         }
