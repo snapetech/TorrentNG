@@ -772,7 +772,14 @@ impl Engine {
 
             EngineCmd::CompleteMagnet { info_hash, raw } => {
                 if let Err(e) = self.complete_magnet(&info_hash, raw).await {
-                    warn!(torrent = %info_hash, err = %e, "failed to complete magnet metadata");
+                    warn!(
+                        component = "engine",
+                        operation = "complete_magnet",
+                        torrent = %info_hash,
+                        result = "error",
+                        error = %e,
+                        "failed to complete magnet metadata"
+                    );
                 }
             }
 
@@ -797,11 +804,25 @@ impl Engine {
                                 if let Err(e) =
                                     self.delete_payload_files(&info_hash, &entry.save_path)
                                 {
-                                    warn!(torrent = %info_hash, err = %e, "failed to delete torrent payload files");
+                                    warn!(
+                                        component = "storage",
+                                        operation = "delete_payload",
+                                        torrent = %info_hash,
+                                        result = "error",
+                                        error = %e,
+                                        "failed to delete torrent payload files"
+                                    );
                                 }
                             }
                             if let Err(e) = self.delete_persisted_torrent(&info_hash) {
-                                warn!(torrent = %info_hash, err = %e, "failed to delete persisted torrent");
+                                warn!(
+                                    component = "db",
+                                    operation = "delete_torrent",
+                                    torrent = %info_hash,
+                                    result = "error",
+                                    error = %e,
+                                    "failed to delete persisted torrent"
+                                );
                             }
                             if !v2_only {
                                 self.unregister_dht_torrent(&info_hash).await;
@@ -1548,12 +1569,26 @@ impl Engine {
                 {
                     let mut db = self.db.lock().expect("database mutex poisoned");
                     if let Err(e) = sync_torrent_trackers_if_urls_changed(&mut db, &row) {
-                        warn!(torrent = %row.info_hash, err = %e, "failed to restore metadata-pending tracker details");
+                        warn!(
+                            component = "engine",
+                            operation = "restore_metadata_pending_trackers",
+                            torrent = %row.info_hash,
+                            result = "error",
+                            error = %e,
+                            "failed to restore metadata-pending tracker details"
+                        );
                     }
                 }
                 let mut reg = self.registry.write().await;
                 if let Err(e) = reg.add(entry) {
-                    warn!(torrent = %row.info_hash, err = %e, "failed to restore metadata-pending registry entry");
+                    warn!(
+                        component = "engine",
+                        operation = "restore_metadata_pending_registry",
+                        torrent = %row.info_hash,
+                        result = "error",
+                        error = %e,
+                        "failed to restore metadata-pending registry entry"
+                    );
                 }
                 drop(reg);
                 let mut restored = false;
@@ -1598,9 +1633,11 @@ impl Engine {
                 Ok(raw) => raw,
                 Err(e) => {
                     warn!(
+                        component = "engine",
+                        operation = "load_persisted_torrent_metadata",
                         torrent = %row.info_hash,
-                        path = %blob_path.display(),
-                        err = %e,
+                        result = "error",
+                        error = %e,
                         "persisted torrent metadata missing"
                     );
                     continue;
@@ -1609,15 +1646,25 @@ impl Engine {
             let meta = match parse_torrent(&raw) {
                 Ok(meta) => meta,
                 Err(e) => {
-                    warn!(torrent = %row.info_hash, err = %e, "failed to parse persisted torrent");
+                    warn!(
+                        component = "engine",
+                        operation = "parse_persisted_torrent",
+                        torrent = %row.info_hash,
+                        result = "error",
+                        error = %e,
+                        "failed to parse persisted torrent"
+                    );
                     continue;
                 }
             };
             let info_hash_hex = meta_info_hash_hex(&meta);
             if info_hash_hex != row.info_hash {
                 warn!(
+                    component = "engine",
+                    operation = "load_persisted_torrent",
                     row_hash = %row.info_hash,
                     meta_hash = %info_hash_hex,
+                    result = "error",
                     "persisted torrent hash mismatch"
                 );
                 continue;
@@ -1625,7 +1672,14 @@ impl Engine {
             {
                 let mut db = self.db.lock().expect("database mutex poisoned");
                 if let Err(e) = sync_torrent_trackers_if_urls_changed(&mut db, &row) {
-                    warn!(torrent = %row.info_hash, err = %e, "failed to restore tracker details");
+                    warn!(
+                        component = "engine",
+                        operation = "restore_tracker_details",
+                        torrent = %row.info_hash,
+                        result = "error",
+                        error = %e,
+                        "failed to restore tracker details"
+                    );
                 }
             }
 
@@ -1633,7 +1687,14 @@ impl Engine {
             {
                 let mut reg = self.registry.write().await;
                 if let Err(e) = reg.add(entry) {
-                    warn!(torrent = %row.info_hash, err = %e, "failed to restore registry entry");
+                    warn!(
+                        component = "engine",
+                        operation = "restore_registry_entry",
+                        torrent = %row.info_hash,
+                        result = "error",
+                        error = %e,
+                        "failed to restore registry entry"
+                    );
                     continue;
                 }
             }
