@@ -127,6 +127,7 @@ pub async fn list_logs(
             tracing::error!(
                 component = "api",
                 operation = "list_logs",
+                result = "error",
                 error = %e,
                 "list logs failed"
             );
@@ -1862,6 +1863,7 @@ pub async fn delete_torrent(
                     component = "cache",
                     operation = "delete_torrent",
                     torrent = %hash,
+                    result = "error",
                     error = %e,
                     "cache delete failed after native delete"
                 );
@@ -1875,6 +1877,7 @@ pub async fn delete_torrent(
                 component = "api",
                 operation = "delete_torrent",
                 torrent = %hash,
+                result = "error",
                 error = %e,
                 "native delete failed"
             );
@@ -1995,6 +1998,7 @@ pub async fn patch_torrent_trackers(
                 operation = "add_tracker",
                 torrent = %hash,
                 tracker = %redact_log_url(url),
+                result = "error",
                 error = %e,
                 "add tracker failed"
             );
@@ -2008,6 +2012,7 @@ pub async fn patch_torrent_trackers(
                 operation = "remove_tracker",
                 torrent = %hash,
                 tracker = %redact_log_url(url),
+                result = "error",
                 error = %e,
                 "remove tracker failed"
             );
@@ -2021,6 +2026,7 @@ pub async fn patch_torrent_trackers(
                 operation = "edit_tracker",
                 torrent = %hash,
                 tracker = %redact_log_url(orig_url),
+                result = "error",
                 error = %e,
                 "edit tracker failed"
             );
@@ -2085,6 +2091,7 @@ pub async fn set_file_priorities(
                 torrent = %hash,
                 file_index = item.index,
                 priority = item.priority,
+                result = "error",
                 error = %e,
                 "native file priority update failed"
             );
