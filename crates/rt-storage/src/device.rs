@@ -3,6 +3,13 @@ use std::path::{Path, PathBuf};
 use rt_path::StorageProfile;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageTopology {
+    pub profile: StorageProfile,
+    pub fs_type: Option<String>,
+    pub cow: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct MountInfo {
     mount_point: PathBuf,
     major_minor: String,
@@ -15,40 +22,53 @@ struct MountInfo {
 /// have to manually pick HDD/SSD defaults. Unsupported platforms return
 /// `Unknown` and keep the conservative HDD-shaped scheduler defaults.
 pub fn detect_storage_profile(path: &Path) -> StorageProfile {
-    detect_storage_profile_inner(path).unwrap_or(StorageProfile::Unknown)
+    detect_storage_topology(path).profile
+}
+
+pub fn detect_storage_topology(path: &Path) -> StorageTopology {
+    detect_storage_topology_inner(path).unwrap_or_else(|| StorageTopology {
+        profile: StorageProfile::Unknown,
+        fs_type: None,
+        cow: false,
+    })
 }
 
 #[cfg(target_os = "linux")]
-fn detect_storage_profile_inner(path: &Path) -> Option<StorageProfile> {
-    let profile = detect_storage_profile_from_roots(
-        path,
-        Path::new("/proc/self/mountinfo"),
-        Path::new("/sys"),
-    )?;
-    Some(profile)
+fn detect_storage_topology_inner(path: &Path) -> Option<StorageTopology> {
+    detect_storage_topology_from_roots(path, Path::new("/proc/self/mountinfo"), Path::new("/sys"))
 }
 
 #[cfg(not(target_os = "linux"))]
-fn detect_storage_profile_inner(_path: &Path) -> Option<StorageProfile> {
+fn detect_storage_topology_inner(_path: &Path) -> Option<StorageTopology> {
     None
 }
 
 #[cfg(target_os = "linux")]
-fn detect_storage_profile_from_roots(
+fn detect_storage_topology_from_roots(
     path: &Path,
     mountinfo_path: &Path,
     sys_root: &Path,
-) -> Option<StorageProfile> {
+) -> Option<StorageTopology> {
     let target = canonical_existing_path(path)?;
     let mountinfo = std::fs::read_to_string(mountinfo_path).ok()?;
     let mounts = parse_mountinfo(&mountinfo)?;
     let mount = find_best_mount(&target, &mounts)?;
+    let fs_type = Some(mount.fs_type.clone());
+    let cow = is_cow_fs(&mount.fs_type);
     if is_network_fs(&mount.fs_type) {
-        return Some(StorageProfile::Network);
+        return Some(StorageTopology {
+            profile: StorageProfile::Network,
+            fs_type,
+            cow,
+        });
     }
 
     let device = block_device_name(sys_root, &mount.major_minor)?;
-    Some(profile_from_block_device(sys_root, &device))
+    Some(StorageTopology {
+        profile: profile_from_block_device(sys_root, &device),
+        fs_type,
+        cow,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -130,6 +150,13 @@ fn is_network_fs(fs_type: &str) -> bool {
             | "smb3"
             | "sshfs"
             | "virtiofs"
+    )
+}
+
+pub fn is_cow_fs(fs_type: &str) -> bool {
+    matches!(
+        fs_type,
+        "apfs" | "bcachefs" | "btrfs" | "fuse-overlayfs" | "overlay" | "zfs"
     )
 }
 
@@ -227,5 +254,54 @@ mod tests {
             profile_from_block_device(dir.path(), "nvme0n1"),
             StorageProfile::Nvme
         );
+    }
+
+    #[test]
+    fn topology_reports_fs_profile_and_cow() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("root/media")).unwrap();
+        std::fs::create_dir_all(dir.path().join("sys/dev/block")).unwrap();
+        std::fs::create_dir_all(dir.path().join("sys/block/sda/queue")).unwrap();
+        std::fs::write(dir.path().join("sys/block/sda/queue/rotational"), "1\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("../../block/sda", dir.path().join("sys/dev/block/8:1"))
+            .unwrap();
+
+        let mountinfo = format!(
+            "24 0 8:1 / {} rw,relatime - btrfs /dev/sda1 rw\n",
+            dir.path().join("root").display()
+        );
+        let mountinfo_path = dir.path().join("mountinfo");
+        std::fs::write(&mountinfo_path, mountinfo).unwrap();
+
+        let topology = detect_storage_topology_from_roots(
+            &dir.path().join("root/media/movie.bin"),
+            &mountinfo_path,
+            &dir.path().join("sys"),
+        )
+        .unwrap();
+        assert_eq!(topology.profile, StorageProfile::Hdd);
+        assert_eq!(topology.fs_type.as_deref(), Some("btrfs"));
+        assert!(topology.cow);
+    }
+
+    #[test]
+    fn cow_fs_detection_covers_common_filesystems() {
+        for fs_type in [
+            "btrfs",
+            "zfs",
+            "bcachefs",
+            "overlay",
+            "fuse-overlayfs",
+            "apfs",
+        ] {
+            assert!(is_cow_fs(fs_type), "{fs_type} should be treated as CoW");
+        }
+        for fs_type in ["ext4", "xfs", "nfs", "tmpfs"] {
+            assert!(
+                !is_cow_fs(fs_type),
+                "{fs_type} should not be treated as CoW"
+            );
+        }
     }
 }

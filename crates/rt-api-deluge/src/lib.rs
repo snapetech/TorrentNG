@@ -670,6 +670,7 @@ async fn set_label(state: &AppState, hash: &str, label: &str) -> Result<(), Stri
 }
 
 async fn torrents_status(state: &AppState, params: &[Value]) -> Result<Value, String> {
+    let filter = params.first();
     let wanted_fields = deluge_requested_fields(params.get(1));
     let entries = {
         let reg = state.registry.read().await;
@@ -685,6 +686,7 @@ async fn torrents_status(state: &AppState, params: &[Value]) -> Result<Value, St
     }
     let torrents = entries
         .iter()
+        .filter(|entry| deluge_torrent_matches_filter(entry, filter))
         .map(|entry| {
             (
                 entry.info_hash.clone(),
@@ -696,6 +698,44 @@ async fn torrents_status(state: &AppState, params: &[Value]) -> Result<Value, St
         })
         .collect::<serde_json::Map<_, _>>();
     Ok(Value::Object(torrents))
+}
+
+fn deluge_torrent_matches_filter(entry: &rt_session::TorrentEntry, filter: Option<&Value>) -> bool {
+    let Some(filter) = filter.and_then(Value::as_object) else {
+        return true;
+    };
+    for (key, value) in filter {
+        match key.as_str() {
+            "id" | "ids" | "hash" | "hashes" => {
+                let values = string_list(Some(value));
+                if !values.is_empty() && !values.iter().any(|hash| hash == &entry.info_hash) {
+                    return false;
+                }
+            }
+            "label" => {
+                let values = string_list(Some(value));
+                if !values.is_empty()
+                    && !values
+                        .iter()
+                        .any(|label| entry.category.as_deref().unwrap_or_default() == label)
+                {
+                    return false;
+                }
+            }
+            "state" => {
+                let values = string_list(Some(value));
+                if !values.is_empty()
+                    && !values
+                        .iter()
+                        .any(|state| deluge_state(entry.state.as_str()).eq_ignore_ascii_case(state))
+                {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    true
 }
 
 async fn torrent_status(
@@ -1345,10 +1385,7 @@ mod tests {
         );
         assert_eq!(body["result"]["filters"]["state"][0], json!(["All", 1]));
         assert_eq!(body["result"]["filters"]["state"][1], json!(["Paused", 1]));
-        assert_eq!(
-            body["result"]["filters"]["label"][0],
-            json!(["movies", 1])
-        );
+        assert_eq!(body["result"]["filters"]["label"][0], json!(["movies", 1]));
         assert_json_keys(
             &body["result"]["stats"],
             &[
@@ -1537,6 +1574,49 @@ mod tests {
         assert_eq!(torrent["name"], "alpha");
         assert_eq!(torrent["state"], "Paused");
         assert_eq!(torrent.as_object().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn deluge_torrents_status_honors_filter_dictionary() {
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        {
+            let mut reg = registry.write().await;
+            let mut alpha = TorrentEntry::new("a".repeat(40), "alpha".into(), "/data".into());
+            alpha.category = Some("movies".into());
+            reg.add(alpha).unwrap();
+            let mut bravo = TorrentEntry::new("b".repeat(40), "bravo".into(), "/data".into());
+            bravo.category = Some("tv".into());
+            reg.add(bravo).unwrap();
+        }
+        let app = build_deluge_router(AppState::new(registry));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/json")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"id":1,"method":"core.get_torrents_status","params":[{"label":["movies"],"state":["Paused"]},["name","label","state"]]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert!(body["result"]["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"].is_object());
+        assert!(body["result"]["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"].is_null());
+        assert_eq!(
+            body["result"]["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]["label"],
+            "movies"
+        );
+        assert_eq!(
+            body["result"]["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+                .as_object()
+                .unwrap()
+                .len(),
+            3
+        );
     }
 
     fn assert_json_keys(value: &Value, keys: &[&str]) {

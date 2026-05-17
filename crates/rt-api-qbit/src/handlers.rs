@@ -1322,6 +1322,11 @@ pub async fn torrents_set_category(
         .unwrap_or_default();
     let hashes = resolve_hashes(&state, hashes).await;
     let category = params.get("category").cloned().unwrap_or_default();
+    let category_save_path = if category.trim().is_empty() {
+        None
+    } else {
+        state.categories.read().await.get(&category).cloned()
+    };
     if let Some(engine) = &state.engine {
         for hash in &hashes {
             let category = if category.trim().is_empty() {
@@ -1332,6 +1337,15 @@ pub async fn torrents_set_category(
             let _ = engine
                 .update_torrent_labels(hash.clone(), Some(category), Vec::new(), Vec::new())
                 .await;
+            if let Some(save_path) = &category_save_path {
+                let _ = engine
+                    .update_torrent_fields(
+                        hash.clone(),
+                        None,
+                        Some(std::path::PathBuf::from(save_path)),
+                    )
+                    .await;
+            }
         }
     } else {
         let mut reg = state.registry.write().await;
@@ -1342,6 +1356,9 @@ pub async fn torrents_set_category(
                 } else {
                     Some(category.clone())
                 };
+                if let Some(save_path) = &category_save_path {
+                    e.save_path = save_path.clone();
+                }
             }
         }
     }
@@ -1436,6 +1453,23 @@ pub async fn torrents_remove_tags(
             if let Some(e) = reg.get_mut(hash) {
                 e.tags.retain(|tag| !remove_tags.contains(tag));
             }
+        }
+    }
+    let still_used = {
+        let reg = state.registry.read().await;
+        remove_tags
+            .iter()
+            .filter(|tag| {
+                reg.iter()
+                    .any(|entry| entry.tags.iter().any(|used| used == *tag))
+            })
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let mut global = state.tags.write().await;
+    for tag in remove_tags {
+        if !still_used.contains(&tag) {
+            global.remove(&tag);
         }
     }
     StatusCode::OK
@@ -2674,6 +2708,7 @@ mod tests {
     async fn login_returns_ok() {
         let app = build_qbit_router(AppState::new());
         let resp = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -3276,6 +3311,7 @@ mod tests {
         assert_eq!(v["movies"]["savePath"].as_str().unwrap(), "/data/");
 
         let resp = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/api/qb/v2/torrents/tags")
@@ -3518,6 +3554,43 @@ mod tests {
         let entry = reg.get(&hash).unwrap();
         assert_eq!(entry.category, None);
         assert_eq!(entry.tags, vec!["keep".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn set_category_applies_stored_category_save_path() {
+        let hash = "4".repeat(40);
+        let state = make_state_with(&hash).await;
+        let app = build_qbit_router(state.clone());
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/torrents/createCategory")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("category=linux&savePath=%2Fsrv%2Flinux"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/torrents/setCategory")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("hashes=all&category=linux"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let reg = state.registry.read().await;
+        let entry = reg.get(&hash).unwrap();
+        assert_eq!(entry.category.as_deref(), Some("linux"));
+        assert_eq!(entry.save_path, "/srv/linux");
     }
 
     #[tokio::test]
@@ -3792,7 +3865,7 @@ mod tests {
     #[tokio::test]
     async fn create_tags_persists_empty_global_tags() {
         let state = AppState::new();
-        let app = build_qbit_router(state);
+        let app = build_qbit_router(state.clone());
         let resp = app
             .clone()
             .oneshot(
@@ -3801,6 +3874,34 @@ mod tests {
                     .uri("/api/qb/v2/torrents/createTags")
                     .header("content-type", "application/x-www-form-urlencoded")
                     .body(Body::from("tags=hd,remux"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/qb/v2/torrents/tags")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let tags: Vec<String> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(tags, vec!["hd".to_owned(), "remux".to_owned()]);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/torrents/deleteTags")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("tags=hd"))
                     .unwrap(),
             )
             .await
@@ -3818,7 +3919,7 @@ mod tests {
             .unwrap();
         let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let tags: Vec<String> = serde_json::from_slice(&body).unwrap();
-        assert_eq!(tags, vec!["hd".to_owned(), "remux".to_owned()]);
+        assert_eq!(tags, vec!["remux".to_owned()]);
     }
 
     #[tokio::test]

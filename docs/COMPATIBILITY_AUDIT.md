@@ -68,7 +68,7 @@ Local surface: `crates/rt-api-qbit`.
 | Transfer | global info, speed limits, speed-limit mode, ban peers | Implemented |
 | Torrent reads | list with modern qBit path/counter/limit/mode/magnet/infohash fields, properties, trackers, web seeds, files, piece states, piece hashes, export | Implemented |
 | Torrent lifecycle | add, pause/resume legacy aliases, start/stop v5 aliases, delete, recheck, reannounce | Implemented |
-| Torrent mutation | tracker add/edit/remove, peers, priority order, file priority, limits, share limits, force start, super seeding, auto management, sequential, first/last, location/save path, rename, category, tags | Implemented |
+| Torrent mutation | tracker add/edit/remove, peers, priority order, file priority, limits, share limits, force start, super seeding, auto management, sequential, first/last, location/save path, rename, category with configured save paths, tags with global tag cleanup | Implemented |
 | RSS | folders, feeds, items, rules, matching articles | Implemented as no-op/read-compatible |
 | Search | status, categories, plugins, plugin mutation, start/stop/results/delete | Implemented as no-op/read-compatible |
 
@@ -99,9 +99,9 @@ Local surface: `crates/rt-api-deluge`.
 | JSON endpoint | `/json`, `/deluge/json` | Implemented |
 | Auth/daemon | login, check session, daemon login/info/method list/shutdown | Implemented |
 | Web host management | add/edit/remove host, connected, hosts, host status, connect/disconnect/start/stop daemon | Implemented as native/no-op compatibility |
-| Web UI | add torrents, URL download placeholder, update UI, events, torrent files, plugin list/info/upload/update/save config | Implemented; URL download does not perform server-side network fetch |
+| Web UI | add torrents, URL download placeholder, update UI, events, torrent files, plugin list/info/upload/update/save config | Implemented; update UI honors requested torrent fields and emits filter/stat shape; URL download does not perform server-side network fetch |
 | Core session reads | stats, session status/state, rates, connections, filter tree, cache status, config, config values, config value, free space, listen port, external IP, path size, libtorrent version | Implemented |
-| Core torrent reads | torrents status, torrent status, torrent file status | Implemented |
+| Core torrent reads | torrents status, torrent status, torrent file status | Implemented with requested-field projection and label/state/hash filter dictionaries |
 | Core torrent lifecycle | add magnet, add torrent file, pause, resume, force recheck, remove | Implemented |
 | Core torrent mutation | queue movement, set options, file priorities, trackers, prioritize first/last, connect peer, rename files/folder, move storage | Implemented where native engine supports it; accepted as no-op otherwise |
 | Plugin APIs | label, notifications | Implemented for common label and notification calls |

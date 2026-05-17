@@ -28,7 +28,8 @@ intentionally avoids the libtorrent 2.x mmap direction that was later rolled
 back for workloads where the client needs tighter control over disk pressure.
 The preallocation requirements mirror long-standing qBittorrent and
 Transmission behavior: sparse allocation is cheap and predictable for most
-filesystems, while full preallocation is operator-selected.
+filesystems, while full preallocation is reserved for storage where it helps
+most: rotational, non-CoW local filesystems.
 
 ## Current Implementation
 
@@ -37,6 +38,8 @@ semaphores:
 
 - `StorageIoConfig` carries file-pool size, idle TTL, I/O worker count, queue
   depth, preallocation mode, durability mode, and peer-read readahead target.
+  `PreallocationMode::Auto` resolves at scheduler construction time from the
+  detected topology.
 - `scheduled_read` and `scheduled_write` remain compatibility wrappers, but
   call positioned `read_at`/`write_at`.
 - Disk syscalls run on a bounded dedicated worker pool instead of Tokio's shared
@@ -48,10 +51,14 @@ semaphores:
   on Unix when the soft limit is available.
 - New schedulers can auto-detect HDD, SSD/NVMe, or network profiles from Linux
   mount and sysfs topology when callers do not override the storage profile.
+  The same topology read records filesystem type and whether the mount is
+  likely CoW.
 - Reads open read-only with `create(false)` and never create or truncate files.
 - Writes use positioned I/O and validate short writes.
 - `prepare_file` creates parents and applies `PreallocationMode::{Off, Sparse,
-  Full}` before first write.
+  Full}` before first write. `Auto` is resolved to `Full` only for rotational
+  non-CoW local storage; SSD/NVMe, network, unknown, and CoW filesystems stay
+  sparse.
 - `sync_data` and `sync_all_open_files` provide durability checkpoints.
 - `DurabilityMode::Strict` syncs after writes; `Checkpoint` syncs open torrent
   files before clean fastresume saves; `Fast` preserves older relaxed behavior.

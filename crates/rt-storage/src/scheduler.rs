@@ -12,7 +12,11 @@ use rt_hash::{merkle_root, BlockHash};
 use rt_path::{StorageProfile, StorageRootId};
 use sha1::{Digest, Sha1};
 
-use crate::{device::detect_storage_profile, error::StorageError, io_class::IoClass};
+use crate::{
+    device::{detect_storage_topology, StorageTopology},
+    error::StorageError,
+    io_class::IoClass,
+};
 
 pub const STORAGE_LATENCY_BUCKETS_NS: [u64; 8] = [
     100_000,
@@ -44,6 +48,7 @@ pub struct IoRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreallocationMode {
     Off,
+    Auto,
     Sparse,
     Full,
 }
@@ -77,7 +82,7 @@ impl Default for StorageIoConfig {
             io_queue_depth: 256,
             hash_worker_threads: 2,
             hash_queue_depth: 256,
-            preallocation_mode: PreallocationMode::Sparse,
+            preallocation_mode: PreallocationMode::Auto,
             durability_mode: DurabilityMode::Checkpoint,
             peer_read_readahead_bytes: 512 * 1024,
         }
@@ -104,6 +109,28 @@ impl Default for SchedulerConfig {
             peer_read_concurrency: 0,
             storage_io: StorageIoConfig::default(),
         }
+    }
+}
+
+fn effective_io_config_for_topology(
+    io_config: &StorageIoConfig,
+    topology: Option<&StorageTopology>,
+) -> StorageIoConfig {
+    let mut effective = io_config.clone();
+    if effective.preallocation_mode == PreallocationMode::Auto {
+        effective.preallocation_mode = preallocation_mode_for_topology(topology);
+    }
+    effective
+}
+
+pub fn preallocation_mode_for_topology(topology: Option<&StorageTopology>) -> PreallocationMode {
+    match topology {
+        Some(StorageTopology {
+            profile: StorageProfile::Hdd,
+            cow: false,
+            ..
+        }) => PreallocationMode::Full,
+        _ => PreallocationMode::Sparse,
     }
 }
 
@@ -461,7 +488,12 @@ struct PeerReadCacheEntry {
 
 impl MountScheduler {
     pub fn new(storage_root: StorageRootId, config: &SchedulerConfig) -> Self {
-        Self::new_with_profile(storage_root, config, config.profile.clone())
+        Self::new_with_profile_and_io_config(
+            storage_root,
+            config,
+            config.profile.clone(),
+            effective_io_config_for_topology(&config.storage_io, None),
+        )
     }
 
     pub fn new_for_path(
@@ -469,17 +501,24 @@ impl MountScheduler {
         path: &Path,
         config: &SchedulerConfig,
     ) -> Self {
+        let topology = detect_storage_topology(path);
         let profile = match &config.profile {
-            StorageProfile::Unknown => detect_storage_profile(path),
+            StorageProfile::Unknown => topology.profile.clone(),
             profile => profile.clone(),
         };
-        Self::new_with_profile(storage_root, config, profile)
+        Self::new_with_profile_and_io_config(
+            storage_root,
+            config,
+            profile,
+            effective_io_config_for_topology(&config.storage_io, Some(&topology)),
+        )
     }
 
-    fn new_with_profile(
+    fn new_with_profile_and_io_config(
         storage_root: StorageRootId,
         config: &SchedulerConfig,
         profile: StorageProfile,
+        io_config: StorageIoConfig,
     ) -> Self {
         let ssd = matches!(profile, StorageProfile::Ssd | StorageProfile::Nvme);
         let recheck_limit = if config.recheck_concurrency > 0 {
@@ -516,8 +555,6 @@ impl MountScheduler {
         } else {
             IoClass::Metadata.hdd_concurrency()
         };
-        let io_config = config.storage_io.clone();
-
         MountScheduler {
             storage_root,
             recheck_sem: Arc::new(Semaphore::new(recheck_limit)),
@@ -821,6 +858,9 @@ impl MountScheduler {
             let file = pool.get_or_open(&key, OpenMode::Write, true)?;
             match mode {
                 PreallocationMode::Off => {}
+                PreallocationMode::Auto => {
+                    file.set_len(len).map_err(|e| StorageError::io(&path_str, e))?;
+                }
                 PreallocationMode::Sparse => {
                     file.set_len(len).map_err(|e| StorageError::io(&path_str, e))?;
                 }
@@ -1161,6 +1201,62 @@ mod tests {
         let ssd = ssd_scheduler();
         assert!(
             ssd.available_permits(IoClass::PeerRead) > hdd.available_permits(IoClass::PeerRead)
+        );
+    }
+
+    #[test]
+    fn auto_preallocation_policy_uses_full_only_for_non_cow_hdd() {
+        let hdd = StorageTopology {
+            profile: StorageProfile::Hdd,
+            fs_type: Some("xfs".to_owned()),
+            cow: false,
+        };
+        let hdd_cow = StorageTopology {
+            profile: StorageProfile::Hdd,
+            fs_type: Some("btrfs".to_owned()),
+            cow: true,
+        };
+        let nvme = StorageTopology {
+            profile: StorageProfile::Nvme,
+            fs_type: Some("ext4".to_owned()),
+            cow: false,
+        };
+
+        assert_eq!(
+            preallocation_mode_for_topology(Some(&hdd)),
+            PreallocationMode::Full
+        );
+        assert_eq!(
+            preallocation_mode_for_topology(Some(&hdd_cow)),
+            PreallocationMode::Sparse
+        );
+        assert_eq!(
+            preallocation_mode_for_topology(Some(&nvme)),
+            PreallocationMode::Sparse
+        );
+        assert_eq!(
+            preallocation_mode_for_topology(None),
+            PreallocationMode::Sparse
+        );
+    }
+
+    #[test]
+    fn scheduler_new_resolves_auto_to_sparse_without_path_topology() {
+        let sched = MountScheduler::new(
+            StorageRootId::new(),
+            &SchedulerConfig {
+                profile: StorageProfile::Hdd,
+                storage_io: StorageIoConfig {
+                    preallocation_mode: PreallocationMode::Auto,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            sched.io_config().preallocation_mode,
+            PreallocationMode::Sparse
         );
     }
 

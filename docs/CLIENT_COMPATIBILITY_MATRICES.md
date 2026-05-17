@@ -107,8 +107,8 @@ Local implementation: `crates/rt-api-qbit`.
 | Torrent files/pieces | `files`, `webseeds`, `pieceStates`, `pieceHashes`, `export`, `filePrio` | Same | Native/Partial | File priority, piece state, export metadata |
 | Queue priority | `increasePrio`, `decreasePrio`, `topPrio`, `bottomPrio` | Same | Native | Queue ordering row |
 | Properties | `properties` | Same | Partial projection | Full property key presence row |
-| Categories | `categories`, `createCategory`, `editCategory`, `removeCategories`, `setCategory` | Same | Native/Compat | Category create/edit/remove/set row |
-| Tags | `tags`, `createTags`, `deleteTags`, `addTags`, `setTags`, `removeTags` | Same | Native/Compat | Tags global and per-torrent row |
+| Categories | `categories`, `createCategory`, `editCategory`, `removeCategories`, `setCategory` | Same | Native/Compat; configured category save paths apply on set | Category create/edit/remove/set row |
+| Tags | `tags`, `createTags`, `deleteTags`, `addTags`, `setTags`, `removeTags` | Same | Native/Compat; global tags persist and clean up when unused | Tags global and per-torrent row |
 | Limits/modes | `downloadLimit`, `setDownloadLimit`, `uploadLimit`, `setUploadLimit`, `setShareLimits`, `setForceStart`, `setSuperSeeding`, `setAutoTMM`, `setAutoManagement`, `toggleSequentialDownload`, `toggleFirstLastPiecePrio` | Same | Partial/Compat | Limit read/write, mode accepted, native behavior later |
 | Sync | `sync/maindata`, `sync/torrentPeers` | Same | Native/Partial peers; maindata includes broad torrent/server-state keys, torrentPeers has qBit peer shape and stable RID deltas | Full sync, delta sync, peer sync row |
 | Transfer | `transfer/info`, download/upload limits, speed limits mode, toggle, setters, `banPeers` | Same | Native/Compat | Global limit and ban accepted rows |
@@ -186,10 +186,10 @@ Local implementation: `crates/rt-api-deluge`.
 | JSON endpoint/auth | `/json`, `auth.login`, `auth.check_session` | Compat | Auth row |
 | Daemon | `daemon.login`, `daemon.info`, `daemon.get_method_list`, `daemon.shutdown` | Compat | Method-list parity row |
 | Web host management | `web.add_host`, `edit_host`, `remove_host`, `get_hosts`, `get_host_status`, `connect`, `disconnect`, `connected`, `start_daemon`, `stop_daemon` | Compat/native shape implemented | Host management shape row |
-| Web torrent helpers | `web.add_torrents`, `download_torrent_from_url`, `get_torrent_files`, `update_ui`, `get_events` | Compat/native shape implemented; URL fetch intentionally no-op to avoid server-side fetch | Web add and update row |
+| Web torrent helpers | `web.add_torrents`, `download_torrent_from_url`, `get_torrent_files`, `update_ui`, `get_events` | Compat/native shape implemented; `update_ui` honors requested fields and emits filter/stat shape; URL fetch intentionally no-op to avoid server-side fetch | Web add and update row |
 | Web config/plugins | `web.get_config`, `update_config`, `save_config`, plugins | Compat implemented | Web config row |
 | Core session | `core.get_session_status`, stats/rates/connections, filter tree, cache status, config values | Native/Compat | Session/status/config rows |
-| Core torrent reads | `get_torrents_status`, `get_torrent_status`, `get_torrent_file_status`, `get_session_state` | Native/Partial; requested-key filtering implemented | Requested-key filter row |
+| Core torrent reads | `get_torrents_status`, `get_torrent_status`, `get_torrent_file_status`, `get_session_state` | Native/Partial; requested-key filtering and label/state/hash filter dictionaries implemented | Requested-key/filter row |
 | Core lifecycle | add file/magnet, pause/resume, force_recheck, remove | Native | Lifecycle rows |
 | Core mutation | set options, priorities, trackers, queue, move, rename, connect_peer | Native/Partial | Mutation rows |
 | Label plugin | label list/add/remove/options/set_torrent | Native/Compat | Label plugin row |

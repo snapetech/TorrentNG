@@ -16,8 +16,10 @@ scheduler used by the native engine.
 - Disk operations run on dedicated blocking workers, behind a bounded queue,
   instead of Tokio's shared blocking pool.
 - Piece and BEP52 hashing runs on a separate bounded hashing pool.
-- `prepare_file` creates parent directories and applies `Off`, `Sparse`, or
-  `Full` preallocation before the first write.
+- `prepare_file` creates parent directories and applies preallocation before
+  the first write. The default `Auto` policy resolves from mount/sysfs
+  topology: full allocation for rotational non-CoW local storage, sparse
+  allocation for SSD/NVMe, network, unknown, and CoW filesystems.
 - `sync_data` and `sync_all_open_files` are used by higher layers to make
   fastresume trust conditional on configured durability.
 - `StorageIoStats` exposes file-pool, queue, dirty-file, preallocation, sync,
@@ -32,6 +34,8 @@ scheduler used by the native engine.
   known torrent file.
 - Positioned I/O validates short reads/writes and returns `StorageError`.
 - File-pool keys are normalized absolute paths.
+- Preallocation policy is resolved once when the scheduler is created; hot-path
+  writes receive a concrete mode.
 - Preallocation failures are surfaced before the engine marks blocks or pieces
   valid.
 

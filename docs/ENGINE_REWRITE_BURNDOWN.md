@@ -143,7 +143,7 @@ shippable and benchmarkable.
 - [x] Auto-detect `StorageProfile` instead of defaulting to `Unknown`.
 - [ ] Implement `DeviceElevator`: offset-sorted, coalescing, deadline + `choke_critical` promotion.
 - [ ] Wire `MountScheduler` permit to elevator submission; per-class weights from `IoClass`.
-- [ ] Topology-derived preallocation policy (`fallocate` on rotational non-CoW only).
+- [x] Topology-derived preallocation policy (`fallocate` on rotational non-CoW only).
 - [ ] Bench: HDD aggregate seed throughput ≥ 5× non-elevator baseline on same dataset.
 
 ### Phase C — tiered torrents (scale unlock)
