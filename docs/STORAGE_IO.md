@@ -46,6 +46,8 @@ semaphores:
   mode, hits, misses, evictions, idle closes, and open count.
 - File-pool capacity is clamped to a conservative fraction of `RLIMIT_NOFILE`
   on Unix when the soft limit is available.
+- New schedulers can auto-detect HDD, SSD/NVMe, or network profiles from Linux
+  mount and sysfs topology when callers do not override the storage profile.
 - Reads open read-only with `create(false)` and never create or truncate files.
 - Writes use positioned I/O and validate short writes.
 - `prepare_file` creates parents and applies `PreallocationMode::{Off, Sparse,

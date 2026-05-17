@@ -1633,8 +1633,9 @@ impl Engine {
                 pieces_root: file.pieces_root,
             })
             .collect::<Vec<_>>();
-        let scheduler = MountScheduler::new(
+        let scheduler = MountScheduler::new_for_path(
             StorageRootId::new(),
+            &save_root,
             &SchedulerConfig {
                 profile: StorageProfile::Unknown,
                 ..Default::default()

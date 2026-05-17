@@ -12,7 +12,7 @@ use rt_hash::{merkle_root, BlockHash};
 use rt_path::{StorageProfile, StorageRootId};
 use sha1::{Digest, Sha1};
 
-use crate::{error::StorageError, io_class::IoClass};
+use crate::{device::detect_storage_profile, error::StorageError, io_class::IoClass};
 
 pub const STORAGE_LATENCY_BUCKETS_NS: [u64; 8] = [
     100_000,
@@ -461,7 +461,27 @@ struct PeerReadCacheEntry {
 
 impl MountScheduler {
     pub fn new(storage_root: StorageRootId, config: &SchedulerConfig) -> Self {
-        let ssd = matches!(config.profile, StorageProfile::Ssd | StorageProfile::Nvme);
+        Self::new_with_profile(storage_root, config, config.profile.clone())
+    }
+
+    pub fn new_for_path(
+        storage_root: StorageRootId,
+        path: &Path,
+        config: &SchedulerConfig,
+    ) -> Self {
+        let profile = match &config.profile {
+            StorageProfile::Unknown => detect_storage_profile(path),
+            profile => profile.clone(),
+        };
+        Self::new_with_profile(storage_root, config, profile)
+    }
+
+    fn new_with_profile(
+        storage_root: StorageRootId,
+        config: &SchedulerConfig,
+        profile: StorageProfile,
+    ) -> Self {
+        let ssd = matches!(profile, StorageProfile::Ssd | StorageProfile::Nvme);
         let recheck_limit = if config.recheck_concurrency > 0 {
             config.recheck_concurrency
         } else if ssd {

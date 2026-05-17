@@ -355,8 +355,9 @@ impl TorrentTask {
                 .collect(),
         )
         .expect("metainfo parser rejects invalid piece maps");
-        let storage = MountScheduler::new(
+        let storage = MountScheduler::new_for_path(
             StorageRootId::new(),
+            &save_root,
             &SchedulerConfig {
                 profile: StorageProfile::Unknown,
                 ..Default::default()
@@ -3446,8 +3447,9 @@ mod tests {
         let upload = UploadContext {
             save_root: dir.path().to_path_buf(),
             piece_map,
-            storage: MountScheduler::new(
+            storage: MountScheduler::new_for_path(
                 StorageRootId::new(),
+                dir.path(),
                 &SchedulerConfig {
                     profile: StorageProfile::Unknown,
                     ..Default::default()

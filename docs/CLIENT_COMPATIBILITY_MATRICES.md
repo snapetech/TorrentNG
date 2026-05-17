@@ -110,7 +110,7 @@ Local implementation: `crates/rt-api-qbit`.
 | Categories | `categories`, `createCategory`, `editCategory`, `removeCategories`, `setCategory` | Same | Native/Compat | Category create/edit/remove/set row |
 | Tags | `tags`, `createTags`, `deleteTags`, `addTags`, `setTags`, `removeTags` | Same | Native/Compat | Tags global and per-torrent row |
 | Limits/modes | `downloadLimit`, `setDownloadLimit`, `uploadLimit`, `setUploadLimit`, `setShareLimits`, `setForceStart`, `setSuperSeeding`, `setAutoTMM`, `setAutoManagement`, `toggleSequentialDownload`, `toggleFirstLastPiecePrio` | Same | Partial/Compat | Limit read/write, mode accepted, native behavior later |
-| Sync | `sync/maindata`, `sync/torrentPeers` | Same | Native/Partial peers; maindata includes broad torrent field and server-state compatibility keys | Full sync, delta sync, peer sync row |
+| Sync | `sync/maindata`, `sync/torrentPeers` | Same | Native/Partial peers; maindata includes broad torrent/server-state keys, torrentPeers has qBit peer shape and stable RID deltas | Full sync, delta sync, peer sync row |
 | Transfer | `transfer/info`, download/upload limits, speed limits mode, toggle, setters, `banPeers` | Same | Native/Compat | Global limit and ban accepted rows |
 | Logs | `log/main`, `log/peers` | Same | Compat | Shape test |
 | Search | status/categories/plugins/install/uninstall/enable/update/start/stop/results/delete | Same | Compat | Full no-plugin search flow shape |
@@ -123,7 +123,7 @@ qBittorrent field backlog:
 | `app/preferences` | Broad current/legacy WebUI preference key set across paths, queueing, BitTorrent, WebUI, RSS, proxy, and advanced settings | Implemented compatibility defaults for common settings panes; remaining work is value persistence for mutable settings |
 | `torrents/info` | Core list fields plus modern path, session counter, lifecycle, limit, mode, magnet, and infohash fields; detailed availability and live swarm counters remain placeholders | Implemented compatibility breadth for common remote-app columns |
 | `torrents/properties` | Full properties object | Detail panels may show missing values |
-| `sync/maindata` | Server state, categories, tags, torrents, trackers, peers | Broad torrent and server-state key sets are matrix-tested; remaining risk is deeper live peer/tracker delta fidelity |
+| `sync/maindata` / `sync/torrentPeers` | Server state, categories, tags, torrents, trackers, peers | Broad torrent/server-state key sets and peer shape/RID stability are matrix-tested; remaining risk is deeper live tracker delta fidelity |
 
 ## 4. Transmission RPC Matrix
 

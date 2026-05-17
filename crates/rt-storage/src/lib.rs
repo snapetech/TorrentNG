@@ -1,4 +1,5 @@
 pub mod backend;
+pub mod device;
 pub mod error;
 pub mod fd_limit;
 pub mod frame;
@@ -9,6 +10,7 @@ pub mod runtime;
 pub mod scheduler;
 pub mod verify;
 
+pub use device::detect_storage_profile;
 pub use error::StorageError;
 pub use io_class::IoClass;
 pub use plan::{

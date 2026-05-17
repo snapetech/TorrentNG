@@ -104,7 +104,7 @@ async fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Va
                 .ok_or_else(|| "missing torrent id".to_owned())?;
             torrent_files(state, hash).await
         }
-        "web.update_ui" => update_ui(state).await,
+        "web.update_ui" => update_ui(state, params).await,
         "core.get_session_status" => session_status(state).await,
         "core.get_stats" => session_status(state).await,
         "core.get_num_connections" => Ok(json!(0)),
@@ -577,7 +577,8 @@ async fn filter_tree(state: &AppState) -> Result<Value, String> {
     }))
 }
 
-async fn update_ui(state: &AppState) -> Result<Value, String> {
+async fn update_ui(state: &AppState, params: &[Value]) -> Result<Value, String> {
+    let wanted_fields = deluge_requested_fields(params.first());
     let entries = {
         let reg = state.registry.read().await;
         reg.iter().cloned().collect::<Vec<_>>()
@@ -595,23 +596,46 @@ async fn update_ui(state: &AppState) -> Result<Value, String> {
         .map(|entry| {
             (
                 entry.info_hash.clone(),
-                deluge_torrent(entry, metadata.get(&entry.info_hash)),
+                filter_deluge_torrent_fields(
+                    deluge_torrent(entry, metadata.get(&entry.info_hash)),
+                    &wanted_fields,
+                ),
             )
         })
         .collect::<serde_json::Map<_, _>>();
     Ok(json!({
         "connected": true,
         "torrents": torrents,
-        "filters": {
-            "state": [["All", entries.len()]],
-            "label": labels_from_entries(&entries),
-        },
+        "filters": deluge_filters_from_entries(&entries),
         "stats": {
             "download_rate": 0.0,
             "upload_rate": 0.0,
             "num_connections": 0,
+            "dht_nodes": 0,
+            "has_incoming_connections": true,
+            "free_space": 0,
         }
     }))
+}
+
+fn deluge_filters_from_entries(entries: &[rt_session::TorrentEntry]) -> Value {
+    let mut states = std::collections::BTreeMap::<String, usize>::new();
+    for entry in entries {
+        *states
+            .entry(deluge_state(entry.state.as_str()).to_owned())
+            .or_default() += 1;
+    }
+    let mut state_filters = vec![json!(["All", entries.len()])];
+    state_filters.extend(
+        states
+            .into_iter()
+            .map(|(state, count)| json!([state, count]))
+            .collect::<Vec<_>>(),
+    );
+    json!({
+        "state": state_filters,
+        "label": labels_from_entries(entries),
+    })
 }
 
 async fn labels(state: &AppState) -> Result<Value, String> {
@@ -1291,6 +1315,7 @@ mod tests {
             let mut entry = TorrentEntry::new("a".repeat(40), "alpha".into(), "/data".into());
             entry.total_length = 100;
             entry.amount_left = 25;
+            entry.category = Some("movies".into());
             reg.add(entry).unwrap();
         }
         let app = build_deluge_router(AppState::new(registry));
@@ -1318,6 +1343,55 @@ mod tests {
             body["result"]["torrents"]["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]["progress"],
             75.0
         );
+        assert_eq!(body["result"]["filters"]["state"][0], json!(["All", 1]));
+        assert_eq!(body["result"]["filters"]["state"][1], json!(["Paused", 1]));
+        assert_eq!(
+            body["result"]["filters"]["label"][0],
+            json!(["movies", 1])
+        );
+        assert_json_keys(
+            &body["result"]["stats"],
+            &[
+                "download_rate",
+                "upload_rate",
+                "num_connections",
+                "dht_nodes",
+                "has_incoming_connections",
+                "free_space",
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn deluge_update_ui_honors_requested_fields() {
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        {
+            let mut reg = registry.write().await;
+            let mut entry = TorrentEntry::new("b".repeat(40), "bravo".into(), "/data".into());
+            entry.total_length = 100;
+            entry.amount_left = 10;
+            reg.add(entry).unwrap();
+        }
+        let app = build_deluge_router(AppState::new(registry));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/json")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"id":1,"method":"web.update_ui","params":[["name","progress"],{}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        let torrent = &body["result"]["torrents"]["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"];
+        assert_eq!(torrent["name"], "bravo");
+        assert_eq!(torrent["progress"], 90.0);
+        assert_eq!(torrent.as_object().unwrap().len(), 2);
     }
 
     #[tokio::test]

@@ -1696,16 +1696,42 @@ pub async fn sync_torrent_peers(
     } else {
         Vec::new()
     };
+    let rid = qbit_peer_rid(&peers);
+    let full_update = q
+        .get("rid")
+        .and_then(|rid| rid.parse::<i64>().ok())
+        .is_none_or(|requested| requested != rid);
+    let peer_map = if full_update {
+        qbit_peer_map(&peers)
+    } else {
+        serde_json::Map::new()
+    };
     (
         StatusCode::OK,
         Json(serde_json::json!({
-            "rid": 1,
-            "full_update": true,
-            "peers": qbit_peer_map(&peers),
+            "rid": rid,
+            "full_update": full_update,
+            "peers": peer_map,
             "peers_removed": [],
             "show_flags": true,
         })),
     )
+}
+
+fn qbit_peer_rid(peers: &[EnginePeerSnapshot]) -> i64 {
+    let mut hasher = DefaultHasher::new();
+    let mut peers = peers.iter().collect::<Vec<_>>();
+    peers.sort_by_key(|peer| peer.addr);
+    for peer in peers {
+        peer.addr.hash(&mut hasher);
+        peer.client.hash(&mut hasher);
+        peer.download_rate.hash(&mut hasher);
+        peer.upload_rate.hash(&mut hasher);
+        peer.downloaded.hash(&mut hasher);
+        peer.uploaded.hash(&mut hasher);
+        ((peer.progress * 1_000_000.0).round() as i64).hash(&mut hasher);
+    }
+    (hasher.finish() & 0x7fff_ffff) as i64 + 1
 }
 
 fn qbit_peer_map(peers: &[EnginePeerSnapshot]) -> serde_json::Map<String, serde_json::Value> {
@@ -3966,6 +3992,71 @@ mod tests {
         assert_eq!(entry["ip"], "127.0.0.1");
         assert_eq!(entry["port"], 6881);
         assert_eq!(entry["progress"], 0.5);
+    }
+
+    #[test]
+    fn qbit_torrent_peers_projection_and_rid_are_stable() {
+        let first = EnginePeerSnapshot {
+            addr: "10.0.0.2:51413".parse().unwrap(),
+            client: "peer-a".to_owned(),
+            choked: false,
+            upload_choked: false,
+            interested: true,
+            pieces: 5,
+            pieces_total: 10,
+            progress: 0.5,
+            download_rate: 111,
+            upload_rate: 222,
+            downloaded: 333,
+            uploaded: 444,
+        };
+        let second = EnginePeerSnapshot {
+            addr: "10.0.0.3:51413".parse().unwrap(),
+            client: "peer-b".to_owned(),
+            choked: true,
+            upload_choked: true,
+            interested: false,
+            pieces: 10,
+            pieces_total: 10,
+            progress: 1.0,
+            download_rate: 0,
+            upload_rate: 555,
+            downloaded: 666,
+            uploaded: 777,
+        };
+        assert_eq!(
+            qbit_peer_rid(&[first.clone(), second.clone()]),
+            qbit_peer_rid(&[second.clone(), first.clone()])
+        );
+        let changed = EnginePeerSnapshot {
+            download_rate: 999,
+            ..first.clone()
+        };
+        assert_ne!(qbit_peer_rid(&[first.clone()]), qbit_peer_rid(&[changed]));
+
+        let peers = qbit_peer_map(&[first]);
+        let peer = &peers["10.0.0.2:51413"];
+        assert_json_keys(
+            peer,
+            &[
+                "client",
+                "connection",
+                "country",
+                "country_code",
+                "dl_speed",
+                "downloaded",
+                "files",
+                "flags",
+                "flags_desc",
+                "ip",
+                "peer_id_client",
+                "port",
+                "progress",
+                "relevance",
+                "up_speed",
+                "uploaded",
+            ],
+        );
     }
 
     #[test]
