@@ -278,6 +278,7 @@ make_torrent() {
   case "$mode" in
     tracker-webseed) args=(-a "$tracker" -w "$webseed") ;;
     tracker-only) args=(-a "$tracker") ;;
+    multi-tracker-fallback) args=(-a "http://127.0.0.1:9/dead-announce" -a "$tracker") ;;
     udp-tracker-only) args=(-a "udp://opentracker:6969/announce") ;;
     webseed-only) args=(-w "$webseed") ;;
     private-explicit) args=(-p) ;;
@@ -290,6 +291,7 @@ make_torrent() {
     case "$mode" in
       tracker-webseed) cmd_args="-a '$tracker' -w '$webseed'" ;;
       tracker-only) cmd_args="-a '$tracker'" ;;
+      multi-tracker-fallback) cmd_args="-a 'http://127.0.0.1:9/dead-announce' -a '$tracker'" ;;
       udp-tracker-only) cmd_args="-a 'udp://opentracker:6969/announce'" ;;
       webseed-only) cmd_args="-w '$webseed'" ;;
       private-explicit) cmd_args="-p" ;;
@@ -903,6 +905,30 @@ run_udp_tracker_case() {
   [[ "$status" == "PASS" ]]
 }
 
+run_multi_tracker_fallback_case() {
+  local status="PASS" fixture torrent info_hash
+  append_report "## Protocol Local: rust-multi-tracker-fallback"
+  append_report ""
+  log "running protocol local case rust-multi-tracker-fallback"
+  fixture="$(case_fixture single-16m rust-multi-tracker-fallback)"
+  torrent="$(make_torrent "$fixture" "$fixture" multi-tracker-fallback)"
+  info_hash="$(torrent_info_hash "$torrent")"
+  seed_fixture_for_client transmission "$fixture"
+  add_to_client transmission "$torrent" seed || status="FAIL"
+  add_to_client rusttorrentd "$torrent" || status="FAIL"
+  wait_clients_complete "$TIMEOUT_LOCAL" "$fixture" transmission rusttorrentd || status="FAIL"
+  verify_fixture_hashes rusttorrentd "$fixture" || status="FAIL"
+  append_report "- Seeder: transmission"
+  append_report "- Leecher: rusttorrentd"
+  append_report "- Fixture: single-16m"
+  append_report "- First tracker: http://127.0.0.1:9/dead-announce"
+  append_report "- Fallback tracker: http://opentracker:6969/announce"
+  append_report "- Info hash: $info_hash"
+  append_report "- Status: **$status**"
+  append_report ""
+  [[ "$status" == "PASS" ]]
+}
+
 run_qbit_mutation_facade_case() {
   local status="PASS" fixture torrent info_hash original replacement trackers
   append_report "## Protocol Local: rust-qbit-mutation-facade"
@@ -958,6 +984,9 @@ run_protocol_local_matrix() {
   fi
   if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "rust-udp-tracker" ]]; then
     run_udp_tracker_case || failures=$((failures + 1))
+  fi
+  if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "rust-multi-tracker-fallback" ]]; then
+    run_multi_tracker_fallback_case || failures=$((failures + 1))
   fi
   if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "rust-qbit-mutation-facade" ]]; then
     run_qbit_mutation_facade_case || failures=$((failures + 1))
