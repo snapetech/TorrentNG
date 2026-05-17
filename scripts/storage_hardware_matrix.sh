@@ -76,7 +76,7 @@ profile_for_rota() {
 append_summary() {
   local log="$1"
   {
-    grep -E 'tng_storage_(bench_path|file_pool|readahead|shuffled_baseline|elevator)' "$log" || true
+    grep -E 'tng_storage_(backend|bench_path|file_pool|readahead|shuffled_baseline|elevator)' "$log" || true
     grep -E 'tng_storage_syscalls' "$log" || true
     grep -E 'TorrentNG storage elevator wall-clock ratio|expected >=5x' "$log" || true
   } | sed 's/^/    /'

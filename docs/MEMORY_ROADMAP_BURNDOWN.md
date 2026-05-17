@@ -23,14 +23,20 @@ Status as of 2026-05-17.
 - [x] Conservative move/import/delete executor below the storage planner.
   - Applies only plans that passed admission, never overwrites destinations, creates parents, verifies copy lengths, and rolls back staged copy files on failure.
 
-## Hardware-Gated
+- [x] Current HDD/NVMe real-device release evidence with required HDD 5x target.
+  - Local NVMe/SSD report: `certification/reports/storage-hardware-20260517T201259Z.md`.
+  - HDD-backed LVM media pool report: `certification/reports/storage-hardware-kspls0-lvm-hdd-20260517T201732Z.md`.
+  - The HDD report proves behavior on `/mnt/datapool_lvm_media` as the OS exposes it: one ext4 LV on `/dev/dm-0` over rotational LVM PVs. It does not prove per-physical-drive placement control.
 
-- [ ] Current HDD/NVMe real-device release evidence with required HDD 5x target.
-  - Run `TNG_STORAGE_REQUIRE_HDD_5X=1 scripts/storage_hardware_matrix.sh /mnt/nvme /mnt/hdd` on representative devices.
-  - Keep the generated report under `certification/reports/`.
+## Remaining Hardware Caveat
+
+- [ ] Per-physical-drive placement evidence inside the LVM media pool.
+  - TorrentNG currently schedules by resolved logical device for path-based I/O. The media pool appears as one logical device (`dm-0`), so proving work is spread across specific PVs requires LVM extent mapping or lower-level device-targeted probes outside the normal path API.
 
 ## Optional Acceleration
 
 - [ ] `io_uring` graduation behind the backend interface.
   - Correctness fallback and forced-roundtrip tests exist.
+  - Real-device hardware reports now include `pread` and forced `uring`
+    backend roundtrips plus registered-file/fixed-buffer capability rows.
   - `uring` remains explicit opt-in until real-device `pread` vs `uring` reports show a durable win and frame-pool registered-buffer leases remove the extra copy path.

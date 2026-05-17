@@ -20,6 +20,7 @@ pub use elevator::{
     elevator_class_weight, DeviceElevator, DeviceId, ElevatorDispatch, FileKey, IoKind, IoOp,
 };
 pub use error::StorageError;
+pub use frame::FramePool;
 pub use io_class::IoClass;
 pub use plan::{
     ensure_plan_can_apply, execute_storage_plan, plan_delete, plan_import, plan_move,

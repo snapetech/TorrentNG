@@ -60,6 +60,17 @@ run_case() {
   fi
 }
 
+run_backend_case() {
+  local backend="$1"
+  local name="backend_selection_roundtrip_reports_capabilities"
+  local log="$tmpdir/backend-$backend.log"
+  echo
+  echo "==> $name backend=$backend"
+  TNG_STORAGE_BACKEND="$backend" \
+    cargo test -p rt-storage --release --test storage_real_device "$name" -- --ignored --nocapture --test-threads=1 \
+    2>&1 | tee "$log"
+}
+
 summarize_syscalls() {
   local name="$1"
   local trace="$2"
@@ -95,6 +106,8 @@ elapsed_ms() {
   sed -n "s/.*${key}.*elapsed_ms=\\([0-9][0-9]*\\).*/\\1/p" "$log" | tail -1
 }
 
+run_backend_case pread
+run_backend_case uring
 run_case peer_read_readahead_reduces_backend_reads_on_adjacent_blocks
 run_case repeated_reads_reuse_one_open_file_handle
 run_case shuffled_peer_read_baseline_reports_current_scheduler_throughput

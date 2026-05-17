@@ -2,9 +2,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use rt_path::{StorageProfile, StorageRootId};
+use rt_storage::frame::FramePool;
 use rt_storage::{
-    detect_storage_topology, IoClass, MountScheduler, SchedulerConfig, StorageError,
-    StorageIoConfig,
+    detect_storage_topology, BackendRequest, DiskBackend, IoClass, MountScheduler, SchedulerConfig,
+    SelectedDiskBackend, StorageError, StorageIoConfig,
 };
 
 fn bench_size(name: &str, default: u64) -> u64 {
@@ -39,6 +40,45 @@ fn print_topology(path: &Path) {
         topology.cow,
         topology.device_id,
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "real-device storage benchmark; run explicitly with --ignored --nocapture"]
+async fn backend_selection_roundtrip_reports_capabilities() {
+    let backend_name = std::env::var("TNG_STORAGE_BACKEND").unwrap_or_else(|_| "auto".to_string());
+    let request = BackendRequest::parse(&backend_name);
+    let backend = SelectedDiskBackend::select(request, 1);
+    let dir = bench_dir();
+    print_topology(dir.path());
+    let path = dir.path().join("backend-roundtrip.bin");
+    std::fs::write(&path, vec![0u8; 4096]).unwrap();
+    let file = std::sync::Arc::new(
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap(),
+    );
+    let data = bytes::Bytes::from_static(b"TorrentNG-storage-backend");
+    backend
+        .pwrite(file.clone(), data.clone(), 128)
+        .await
+        .unwrap()
+        .unwrap();
+    let frame = FramePool::new(1024 * 1024).try_acquire(data.len()).unwrap();
+    let frame = backend.pread(file, frame, 128).await.unwrap().unwrap();
+
+    println!(
+        "tng_storage_backend requested={backend_name} selected={} reason=\"{}\" fixed_buffers={} registered_files={} max_batch_len={} fixed_buffer_len={}",
+        backend.kind().as_str(),
+        backend.selection().reason,
+        backend.supports_fixed_buffers(),
+        backend.supports_registered_files(),
+        backend.max_batch_len(),
+        backend.fixed_buffer_len(),
+    );
+
+    assert_eq!(frame.as_slice(), &data[..]);
 }
 
 fn shuffled_offsets(blocks: u64, block_len: usize) -> Vec<u64> {

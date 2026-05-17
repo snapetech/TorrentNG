@@ -22,10 +22,10 @@ scripts/storage_hardware_matrix.sh /mnt/nvme /mnt/hdd
 ```
 
 The hardware matrix writes a markdown report under `certification/reports/`,
-prints topology for each target, and enforces the HDD elevator speedup gate
-when `TNG_STORAGE_REQUIRE_HDD_5X=1` is set. Set
-`TNG_STORAGE_SYSCALLS=1` to include per-case syscall counters when `strace` is
-available.
+prints topology for each target, records `pread` and forced `uring` backend
+selection/capability roundtrips, and enforces the HDD elevator speedup gate when
+`TNG_STORAGE_REQUIRE_HDD_5X=1` is set. Set `TNG_STORAGE_SYSCALLS=1` to include
+per-case syscall counters when `strace` is available.
 
 ## Automated Matrix
 
@@ -90,6 +90,7 @@ TNG_STORAGE_REQUIRE_HDD_5X=1 scripts/storage_hardware_matrix.sh /mnt/nvme /mnt/h
 | NVMe | NVMe profile by parent block device name, sparse preallocation, backend selection remains independent of topology |
 | NFS/CIFS/virtiofs | network `DeviceId` from mount source, sparse preallocation, reads never create missing files |
 | Container overlay | CoW/unknown-safe sparse allocation and clean `io_uring` fallback diagnostics when kernel policy disables it |
+| Backend comparison | `tng_storage_backend requested=pread` and `requested=uring` rows report selected backend, fallback reason, registered-file support, fixed-buffer support, batch length, and fixed-buffer length |
 
 ## Exit Criteria
 
