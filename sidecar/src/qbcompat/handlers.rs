@@ -666,7 +666,12 @@ async fn torrents_info(State(s): State<AppState>, Query(q): Query<InfoQuery>) ->
     match s.db.list(&params) {
         Ok((rows, _)) => Json(rows.iter().map(to_qb_torrent).collect::<Vec<_>>()).into_response(),
         Err(e) => {
-            tracing::error!("qb torrents/info: {e}");
+            tracing::error!(
+                component = "qbcompat",
+                operation = "torrents_info",
+                error = %e,
+                "qBit torrent list query failed"
+            );
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -727,7 +732,13 @@ async fn torrents_properties(
         .into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
-            tracing::error!("qb properties {hash}: {e}");
+            tracing::error!(
+                component = "qbcompat",
+                operation = "torrent_properties",
+                torrent = %hash,
+                error = %e,
+                "qBit torrent properties query failed"
+            );
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -934,7 +945,13 @@ async fn torrents_trackers(
             Json(json!(out)).into_response()
         }
         Err(e) => {
-            tracing::error!("qb trackers {hash}: {e}");
+            tracing::error!(
+                component = "qbcompat",
+                operation = "list_trackers",
+                torrent = %hash,
+                error = %e,
+                "qBit tracker listing failed"
+            );
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -979,7 +996,13 @@ async fn torrents_files(
             Json(json!(out)).into_response()
         }
         Err(e) => {
-            tracing::error!("qb files {hash}: {e}");
+            tracing::error!(
+                component = "qbcompat",
+                operation = "list_files",
+                torrent = %hash,
+                error = %e,
+                "qBit file listing failed"
+            );
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -999,7 +1022,12 @@ async fn categories(State(s): State<AppState>) -> impl IntoResponse {
             Json(serde_json::Value::Object(map)).into_response()
         }
         Err(e) => {
-            tracing::error!("qb categories: {e}");
+            tracing::error!(
+                component = "qbcompat",
+                operation = "list_categories",
+                error = %e,
+                "qBit category listing failed"
+            );
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1009,7 +1037,12 @@ async fn tags(State(s): State<AppState>) -> impl IntoResponse {
     match s.db.list_tags() {
         Ok(tags) => Json(tags).into_response(),
         Err(e) => {
-            tracing::error!("qb tags: {e}");
+            tracing::error!(
+                component = "qbcompat",
+                operation = "list_tags",
+                error = %e,
+                "qBit tag listing failed"
+            );
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }

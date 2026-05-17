@@ -133,7 +133,7 @@ pub async fn tracker_health(State(s): State<AppState>) -> impl IntoResponse {
     match s.db.tracker_health() {
         Ok(trackers) => Json(serde_json::json!({ "trackers": trackers })).into_response(),
         Err(e) => {
-            tracing::error!("tracker health: {e}");
+            tracing::error!(component = "api", operation = "tracker_health", error = %e, "tracker health query failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -143,7 +143,7 @@ pub async fn sidebar_facets(State(s): State<AppState>) -> impl IntoResponse {
     match s.db.sidebar_facets() {
         Ok(facets) => Json(facets).into_response(),
         Err(e) => {
-            tracing::error!("sidebar facets: {e}");
+            tracing::error!(component = "api", operation = "sidebar_facets", error = %e, "sidebar facet query failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -539,7 +539,7 @@ pub async fn set_rtorrent_settings(
     if let Err(e) =
         write_rtorrent_overlay(&overlay_path, &descriptors, &normalized, &patch.custom_rc)
     {
-        tracing::error!("write rtorrent overlay: {e}");
+        tracing::error!(component = "api", operation = "write_rtorrent_overlay", error = %e, "rTorrent overlay write failed");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
@@ -782,7 +782,7 @@ pub async fn set_session_features(
     if let Some(enabled) = patch.dht {
         let mode = if enabled { "auto" } else { "disable" };
         if let Err(e) = s.rt.call("dht.mode.set", &[XmlValue::from(mode)]).await {
-            tracing::error!("set dht mode: {e}");
+            tracing::error!(component = "rtorrent", operation = "set_dht_mode", enabled, error = %e, "rTorrent DHT mode update failed");
             return StatusCode::BAD_GATEWAY.into_response();
         }
         dht = Some(enabled);
@@ -793,7 +793,7 @@ pub async fn set_session_features(
             s.rt.call("protocol.pex.set", &[XmlValue::from(enabled)])
                 .await
         {
-            tracing::error!("set pex: {e}");
+            tracing::error!(component = "rtorrent", operation = "set_pex", enabled, error = %e, "rTorrent PEX update failed");
             return StatusCode::BAD_GATEWAY.into_response();
         }
         pex = Some(enabled);
@@ -808,7 +808,7 @@ pub async fn list_saved_views(State(s): State<AppState>) -> impl IntoResponse {
     match s.db.list_saved_views() {
         Ok(views) => Json(views).into_response(),
         Err(e) => {
-            tracing::error!("list saved views: {e}");
+            tracing::error!(component = "api", operation = "list_saved_views", error = %e, "saved view listing failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -828,7 +828,7 @@ pub async fn upsert_saved_view(
             Json(views).into_response()
         }
         Err(e) => {
-            tracing::error!("upsert saved view: {e}");
+            tracing::error!(component = "api", operation = "upsert_saved_view", error = %e, "saved view upsert failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -844,7 +844,7 @@ pub async fn delete_saved_view(
             Json(views).into_response()
         }
         Err(e) => {
-            tracing::error!("delete saved view {id}: {e}");
+            tracing::error!(component = "api", operation = "delete_saved_view", view_id = %id, error = %e, "saved view delete failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -856,7 +856,7 @@ pub async fn list_ratio_groups(State(s): State<AppState>) -> impl IntoResponse {
     match s.db.list_ratio_groups() {
         Ok(groups) => Json(groups).into_response(),
         Err(e) => {
-            tracing::error!("list ratio groups: {e}");
+            tracing::error!(component = "api", operation = "list_ratio_groups", error = %e, "ratio group listing failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -902,7 +902,7 @@ pub async fn upsert_ratio_group(
             Json(groups).into_response()
         }
         Err(e) => {
-            tracing::error!("upsert ratio group: {e}");
+            tracing::error!(component = "api", operation = "upsert_ratio_group", error = %e, "ratio group upsert failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -918,7 +918,7 @@ pub async fn delete_ratio_group(
             Json(groups).into_response()
         }
         Err(e) => {
-            tracing::error!("delete ratio group {name}: {e}");
+            tracing::error!(component = "api", operation = "delete_ratio_group", ratio_group = %name, error = %e, "ratio group delete failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -939,7 +939,7 @@ pub async fn apply_ratio_group(
         Ok(Some(group)) => group,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
-            tracing::error!("get ratio group {name}: {e}");
+            tracing::error!(component = "api", operation = "get_ratio_group", ratio_group = %name, error = %e, "ratio group lookup failed");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -950,7 +950,7 @@ pub async fn apply_ratio_group(
     let hashes = match s.db.ratio_group_hashes(&group) {
         Ok(hashes) => hashes,
         Err(e) => {
-            tracing::error!("ratio group hashes {name}: {e}");
+            tracing::error!(component = "api", operation = "ratio_group_hashes", ratio_group = %name, error = %e, "ratio group hash query failed");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -991,7 +991,7 @@ pub async fn list_workflows(State(s): State<AppState>) -> impl IntoResponse {
     match s.db.list_workflow_rules() {
         Ok(rules) => Json(rules).into_response(),
         Err(e) => {
-            tracing::error!("list workflow rules: {e}");
+            tracing::error!(component = "api", operation = "list_workflows", error = %e, "workflow rule listing failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1001,7 +1001,7 @@ pub async fn list_workflow_runs(State(s): State<AppState>) -> impl IntoResponse 
     match s.db.list_workflow_runs() {
         Ok(runs) => Json(runs).into_response(),
         Err(e) => {
-            tracing::error!("list workflow runs: {e}");
+            tracing::error!(component = "api", operation = "list_workflow_runs", error = %e, "workflow run listing failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1011,7 +1011,7 @@ pub async fn list_rss_rules(State(s): State<AppState>) -> impl IntoResponse {
     match s.db.list_rss_rules() {
         Ok(rules) => Json(rules).into_response(),
         Err(e) => {
-            tracing::error!("list rss rules: {e}");
+            tracing::error!(component = "api", operation = "list_rss_rules", error = %e, "RSS rule listing failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1059,7 +1059,7 @@ pub async fn upsert_rss_rule(
             Json(rules).into_response()
         }
         Err(e) => {
-            tracing::error!("upsert rss rule: {e}");
+            tracing::error!(component = "api", operation = "upsert_rss_rule", error = %e, "RSS rule upsert failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1075,7 +1075,7 @@ pub async fn delete_rss_rule(
             Json(rules).into_response()
         }
         Err(e) => {
-            tracing::error!("delete rss rule {id}: {e}");
+            tracing::error!(component = "api", operation = "delete_rss_rule", rule_id = %id, error = %e, "RSS rule delete failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1098,7 +1098,7 @@ pub async fn test_rss_rules(
     match s.db.match_rss_item(title, body.link.as_deref()) {
         Ok(matches) => Json(serde_json::json!({ "matches": matches })).into_response(),
         Err(e) => {
-            tracing::error!("test rss rules: {e}");
+            tracing::error!(component = "api", operation = "test_rss_rules", error = %e, "RSS rule test failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1124,7 +1124,7 @@ pub async fn apply_rss_rules(
     let matches = match s.db.match_rss_item(title, Some(link)) {
         Ok(matches) => matches,
         Err(e) => {
-            tracing::error!("apply rss rules: {e}");
+            tracing::error!(component = "api", operation = "apply_rss_rules", error = %e, "RSS rule apply failed");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
