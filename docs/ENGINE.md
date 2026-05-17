@@ -159,6 +159,9 @@ metadata_only           — no file I/O (metadata/announce only)
   unclean saves with a watermark downgrade only those dirty pieces on restart,
   bounding post-crash recheck instead of forcing full-library verification.
 - Peer-read locality through internal readahead/coalescing while returning exact requested bytes
+- Page-cache stewardship: large peer reads issue `SEQUENTIAL`/`WILLNEED`
+  hints, and large recheck reads issue `SEQUENTIAL` before I/O and `DONTNEED`
+  after I/O so cold verification sweeps do not evict hot seeding pages.
 - HDD vs SSD/NVMe I/O profile
 - Sequential vs random pressure awareness
 - Priority: recheck < background seeding < active downloads < active streams (future)

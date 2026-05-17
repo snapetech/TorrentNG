@@ -6,8 +6,13 @@ and wire-level interop all need evidence before they are considered complete.
 
 - Track 1 sidecar qBittorrent flows in `sidecar/tests/qbcompat.rs`.
 - Native compatibility API projections through `rt-api-qbit`,
-  `rt-api-transmission`, and `rt-api-deluge`, included in
-  `scripts/native_engine_certification_report.sh`.
+  `rt-api-transmission`, `rt-api-deluge`, and `rt-api-rtorrent`, included in
+  `scripts/api_facade_certification.sh`.
+- The broad local compatibility gate in
+  `scripts/universal_compatibility_certification.sh`, which covers API facades,
+  migration/fastresume, Track 1 qBit flows, native API, engine hooks, scale,
+  and storage topology. Set `UNIVERSAL_COMPAT_LIVE=1` for Docker client interop
+  and `UNIVERSAL_COMPAT_PUBLIC=1` for official public torrent downloads.
 
 The build backlog and source-to-implementation comparison live in
 `docs/CLIENT_COMPATIBILITY_MATRICES.md`.
@@ -38,7 +43,14 @@ These tests run against an in-memory sidecar and do not require a live rTorrent 
 Run the native compatibility projection tests:
 
 ```bash
-cargo test -p rt-api-qbit -p rt-api-transmission -p rt-api-deluge
+scripts/api_facade_certification.sh
+cargo test -p rt-api-qbit -p rt-api-transmission -p rt-api-deluge -p rt-api-rtorrent
+```
+
+Run the broad local compatibility gate:
+
+```bash
+scripts/universal_compatibility_certification.sh
 ```
 
 Run the full native certification gate:

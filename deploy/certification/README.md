@@ -85,6 +85,11 @@ Run native-engine certification directly:
 NATIVE_ENGINE_URL=http://127.0.0.1:8080 ./scripts/native_engine_certification_report.sh
 ```
 
+`universal_compatibility_certification.sh` is local and deterministic by
+default. Set `UNIVERSAL_COMPAT_LIVE=1` to include Docker client interop,
+`UNIVERSAL_COMPAT_PUBLIC=1` to include public Linux torrent downloads, and
+`UNIVERSAL_COMPAT_REAL_DEVICE=1` to include ignored real-device storage tests.
+
 Refresh the short automated gate set and write a consolidated release report:
 
 ```sh

@@ -242,9 +242,9 @@ engine does not expose yet.
 | P1 | `deluge_client_matrix` | Deluge WebUI update_ui, thin-client core calls, Label plugin calls |
 | P1 | `interop_transfer_matrix` | qBit/Transmission/Deluge/rTorrent seed and leech with TorrentNG both directions |
 | P1 | `tracker_peer_matrix` | HTTP tracker, UDP tracker, private torrent, explicit peer, tracker outage |
-| P1 | `storage_resume_matrix` | stop mid-transfer, restart, resume, corrupt block repair, missing file recovery |
+| P1 | `storage_resume_matrix` | stop mid-transfer, restart, resume, corrupt block repair, missing file recovery; local storage topology coverage is included in `scripts/universal_compatibility_certification.sh` |
 | P2 | `plugin_aux_matrix` | Migration artifact preservation implemented for RSS/search/scheduler/autoadd/blocklist/execute/plugin/config files; facade API shapes remain targeted work |
-| P2 | `scale_matrix` | 15k imported torrents, hundreds active, many files, hostile paths |
+| P2 | `scale_matrix` | 15k imported torrents, hundreds active, many files, hostile paths; local scale coverage is included in `scripts/universal_compatibility_certification.sh` |
 
 ## 8. Build Backlog From Matrices
 

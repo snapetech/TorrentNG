@@ -104,6 +104,10 @@ pub struct EngineStats {
     pub storage_peer_read_elevator_queued: u64,
     pub storage_peer_read_elevator_batches: u64,
     pub storage_peer_read_elevator_coalesced_requests: u64,
+    pub storage_page_cache_advise_sequential: u64,
+    pub storage_page_cache_advise_willneed: u64,
+    pub storage_page_cache_advise_dontneed: u64,
+    pub storage_page_cache_advise_failures: u64,
     pub piece_assembly_buffers: u64,
     pub piece_assembly_bytes: u64,
     pub piece_assembly_evictions: u64,
@@ -310,6 +314,18 @@ impl EngineStats {
         self.storage_peer_read_elevator_coalesced_requests = self
             .storage_peer_read_elevator_coalesced_requests
             .saturating_add(storage.peer_read_elevator_coalesced_requests);
+        self.storage_page_cache_advise_sequential = self
+            .storage_page_cache_advise_sequential
+            .saturating_add(storage.page_cache_advise_sequential);
+        self.storage_page_cache_advise_willneed = self
+            .storage_page_cache_advise_willneed
+            .saturating_add(storage.page_cache_advise_willneed);
+        self.storage_page_cache_advise_dontneed = self
+            .storage_page_cache_advise_dontneed
+            .saturating_add(storage.page_cache_advise_dontneed);
+        self.storage_page_cache_advise_failures = self
+            .storage_page_cache_advise_failures
+            .saturating_add(storage.page_cache_advise_failures);
     }
 }
 
@@ -565,13 +581,17 @@ mod tests {
             peer_read_elevator_queued: 15,
             peer_read_elevator_batches: 16,
             peer_read_elevator_coalesced_requests: 17,
+            page_cache_advise_sequential: 18,
+            page_cache_advise_willneed: 19,
+            page_cache_advise_dontneed: 20,
+            page_cache_advise_failures: 21,
             ..Default::default()
         };
-        storage.read_ops_by_class[0] = 18;
-        storage.read_ops_by_class[1] = 19;
-        storage.write_ops_by_class[0] = 20;
-        storage.bytes_read_by_class[0] = 21;
-        storage.bytes_written_by_class[0] = 22;
+        storage.read_ops_by_class[0] = 22;
+        storage.read_ops_by_class[1] = 23;
+        storage.write_ops_by_class[0] = 24;
+        storage.bytes_read_by_class[0] = 25;
+        storage.bytes_written_by_class[0] = 26;
         storage.backend_read_ops_by_class[4] = 3;
         storage.backend_bytes_read_by_class[4] = 4096;
         storage.read_latency_ns_by_class[4] = 100;
@@ -597,15 +617,15 @@ mod tests {
         assert_eq!(stats.storage_file_pool_open_files, 8);
         assert_eq!(stats.storage_file_pool_hits, 10);
         assert_eq!(stats.storage_file_pool_misses, 2);
-        assert_eq!(stats.storage_read_ops, 37);
-        assert_eq!(stats.storage_write_ops, 20);
-        assert_eq!(stats.storage_bytes_read, 21);
-        assert_eq!(stats.storage_bytes_written, 22);
-        assert_eq!(stats.storage_read_ops_by_class[0], 18);
-        assert_eq!(stats.storage_read_ops_by_class[1], 19);
-        assert_eq!(stats.storage_write_ops_by_class[0], 20);
-        assert_eq!(stats.storage_bytes_read_by_class[0], 21);
-        assert_eq!(stats.storage_bytes_written_by_class[0], 22);
+        assert_eq!(stats.storage_read_ops, 45);
+        assert_eq!(stats.storage_write_ops, 24);
+        assert_eq!(stats.storage_bytes_read, 25);
+        assert_eq!(stats.storage_bytes_written, 26);
+        assert_eq!(stats.storage_read_ops_by_class[0], 22);
+        assert_eq!(stats.storage_read_ops_by_class[1], 23);
+        assert_eq!(stats.storage_write_ops_by_class[0], 24);
+        assert_eq!(stats.storage_bytes_read_by_class[0], 25);
+        assert_eq!(stats.storage_bytes_written_by_class[0], 26);
         assert_eq!(stats.storage_backend_read_ops, 3);
         assert_eq!(stats.storage_backend_bytes_read, 4096);
         assert_eq!(stats.storage_backend_read_ops_by_class[4], 3);
@@ -626,6 +646,10 @@ mod tests {
         assert_eq!(stats.storage_peer_read_elevator_queued, 15);
         assert_eq!(stats.storage_peer_read_elevator_batches, 16);
         assert_eq!(stats.storage_peer_read_elevator_coalesced_requests, 17);
+        assert_eq!(stats.storage_page_cache_advise_sequential, 18);
+        assert_eq!(stats.storage_page_cache_advise_willneed, 19);
+        assert_eq!(stats.storage_page_cache_advise_dontneed, 20);
+        assert_eq!(stats.storage_page_cache_advise_failures, 21);
         assert_eq!(stats.torrent_tasks_active, 1);
         assert_eq!(stats.fastresume_dirty_pieces, 4);
         assert_eq!(stats.piece_assembly_buffers, 19);

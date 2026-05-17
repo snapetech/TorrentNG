@@ -15,6 +15,8 @@ scripts/storage_real_device_benchmark.sh <path>
 | 2026-05-17 | local | `/home/keith/Documents/code` | `Nvme` | btrfs | yes | 512 | 65 | 7.88x | 8 MiB in 3 ms, 512 backend reads | 1,000 | 1 |
 | 2026-05-17 | `kspls0` | `/mnt/datapool_lvm_media` | `Hdd` | ext4 | no | 16,384 | 2,034 | 8.06x | 256 MiB in 3,069 ms, 16,384 backend reads, 83.39 MiB/s | 100,000 | 1 |
 | 2026-05-17 | `kspls0` | `/mnt/datapool_lvm_media` | `Hdd` | ext4 | no | 16,384 shuffled elevator | 1 | 16,384x | serial run: baseline 256 MiB in 11,746 ms, 21.79 MiB/s; elevator 256 MiB in 2,140 ms, 119.58 MiB/s; 5.49x wall-clock | 100,000 | 1 |
+| 2026-05-17 | `kspld0` | `/home/keith/.cache/torrentng-storage-bench` | `Nvme` | btrfs | yes | 4,096 | 510 | 8.03x | 64 MiB in 49 ms, 4,096 backend reads, 1,301.97 MiB/s; HDD elevator skipped on `Nvme` | 20,000 | 1 |
+| 2026-05-17 | `kspls0` | `/mnt/datapool_lvm_media/.torrentng-storage-bench` | `Hdd` | ext4 | no | 8,192 shuffled elevator | 1 | 8,192x | serial run: baseline 128 MiB in 5,188 ms, 24.67 MiB/s; elevator 128 MiB in 1,031 ms, 124.14 MiB/s; 5.03x wall-clock with `TNG_STORAGE_REQUIRE_5X=1` | 50,000 | 1 |
 
 Notes:
 

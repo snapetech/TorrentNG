@@ -178,6 +178,10 @@ pub struct StorageIoStats {
     pub peer_read_elevator_queued: usize,
     pub peer_read_elevator_batches: u64,
     pub peer_read_elevator_coalesced_requests: u64,
+    pub page_cache_advise_sequential: u64,
+    pub page_cache_advise_willneed: u64,
+    pub page_cache_advise_dontneed: u64,
+    pub page_cache_advise_failures: u64,
 }
 
 #[derive(Debug, Default)]
@@ -462,6 +466,10 @@ struct StorageCounters {
     peer_read_cache_misses: AtomicU64,
     peer_read_elevator_batches: AtomicU64,
     peer_read_elevator_coalesced_requests: AtomicU64,
+    page_cache_advise_sequential: AtomicU64,
+    page_cache_advise_willneed: AtomicU64,
+    page_cache_advise_dontneed: AtomicU64,
+    page_cache_advise_failures: AtomicU64,
 }
 
 impl Default for StorageCounters {
@@ -489,6 +497,10 @@ impl Default for StorageCounters {
             peer_read_cache_misses: AtomicU64::new(0),
             peer_read_elevator_batches: AtomicU64::new(0),
             peer_read_elevator_coalesced_requests: AtomicU64::new(0),
+            page_cache_advise_sequential: AtomicU64::new(0),
+            page_cache_advise_willneed: AtomicU64::new(0),
+            page_cache_advise_dontneed: AtomicU64::new(0),
+            page_cache_advise_failures: AtomicU64::new(0),
         }
     }
 }
@@ -684,8 +696,9 @@ async fn dispatch_peer_read_batch(
     let path = batch.path.clone();
     let offset = batch.offset;
     let len = batch.len;
+    let read_counters = counters.clone();
     let read = io_pool
-        .run(move || read_exact_from_pool(&file_pool, &path, offset, len))
+        .run(move || read_exact_from_pool(&file_pool, &path, offset, len, &read_counters))
         .await;
 
     match read {
@@ -926,6 +939,22 @@ impl MountScheduler {
                 .counters
                 .peer_read_elevator_coalesced_requests
                 .load(Ordering::Relaxed),
+            page_cache_advise_sequential: self
+                .counters
+                .page_cache_advise_sequential
+                .load(Ordering::Relaxed),
+            page_cache_advise_willneed: self
+                .counters
+                .page_cache_advise_willneed
+                .load(Ordering::Relaxed),
+            page_cache_advise_dontneed: self
+                .counters
+                .page_cache_advise_dontneed
+                .load(Ordering::Relaxed),
+            page_cache_advise_failures: self
+                .counters
+                .page_cache_advise_failures
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -1069,6 +1098,7 @@ impl MountScheduler {
             } else {
                 len
             };
+            advise_for_read_class(&file, class, offset, read_len, &counters);
             let mut buf = vec![0u8; read_len];
             let mut read = 0usize;
             while read < read_len {
@@ -1089,6 +1119,7 @@ impl MountScheduler {
             counters.backend_read_ops_by_class[class_index(class)].fetch_add(1, Ordering::Relaxed);
             counters.backend_bytes_read_by_class[class_index(class)]
                 .fetch_add(read as u64, Ordering::Relaxed);
+            advise_after_read_class(&file, class, offset, read, &counters);
             let latency_ns = latency_ns_since(started);
             counters.read_latency_ns_by_class[class_index(class)]
                 .fetch_add(latency_ns, Ordering::Relaxed);
@@ -1410,11 +1441,12 @@ fn read_exact_from_pool(
     path: &Path,
     offset: u64,
     len: usize,
+    counters: &StorageCounters,
 ) -> Result<bytes::Bytes, StorageError> {
     let key = normalized_key(path);
     let path_str = key.display().to_string();
     let file = pool.get_or_open(&key, OpenMode::Read, false)?;
-    advise_sequential_read(&file, offset, len);
+    advise_for_read_class(&file, IoClass::PeerRead, offset, len, counters);
     let mut buf = vec![0u8; len];
     let mut read = 0usize;
     while read < len {
@@ -1429,29 +1461,95 @@ fn read_exact_from_pool(
         }
         read += n;
     }
+    advise_after_read_class(&file, IoClass::PeerRead, offset, read, counters);
     Ok(bytes::Bytes::from(buf))
 }
 
-fn advise_sequential_read(file: &File, offset: u64, len: usize) {
+fn advise_for_read_class(
+    file: &File,
+    class: IoClass,
+    offset: u64,
+    len: usize,
+    counters: &StorageCounters,
+) {
+    if len < 256 * 1024 {
+        return;
+    }
+    match class {
+        IoClass::PeerRead | IoClass::Recheck => {
+            if advise_page_cache(file, offset, len, PageCacheAdvice::Sequential) {
+                counters
+                    .page_cache_advise_sequential
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                counters
+                    .page_cache_advise_failures
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if class == IoClass::PeerRead {
+                if advise_page_cache(file, offset, len, PageCacheAdvice::WillNeed) {
+                    counters
+                        .page_cache_advise_willneed
+                        .fetch_add(1, Ordering::Relaxed);
+                } else {
+                    counters
+                        .page_cache_advise_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn advise_after_read_class(
+    file: &File,
+    class: IoClass,
+    offset: u64,
+    len: usize,
+    counters: &StorageCounters,
+) {
+    if class != IoClass::Recheck || len < 256 * 1024 {
+        return;
+    }
+    if advise_page_cache(file, offset, len, PageCacheAdvice::DontNeed) {
+        counters
+            .page_cache_advise_dontneed
+            .fetch_add(1, Ordering::Relaxed);
+    } else {
+        counters
+            .page_cache_advise_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PageCacheAdvice {
+    Sequential,
+    WillNeed,
+    DontNeed,
+}
+
+fn advise_page_cache(file: &File, offset: u64, len: usize, advice: PageCacheAdvice) -> bool {
     #[cfg(target_os = "linux")]
     {
         use std::os::fd::AsRawFd;
 
-        if len < 256 * 1024 {
-            return;
-        }
         let fd = file.as_raw_fd();
         let offset = offset.min(i64::MAX as u64) as libc::off_t;
         let len = len.min(i64::MAX as usize) as libc::off_t;
-        unsafe {
-            let _ = libc::posix_fadvise(fd, offset, len, libc::POSIX_FADV_SEQUENTIAL);
-            let _ = libc::posix_fadvise(fd, offset, len, libc::POSIX_FADV_WILLNEED);
-        }
+        let advice = match advice {
+            PageCacheAdvice::Sequential => libc::POSIX_FADV_SEQUENTIAL,
+            PageCacheAdvice::WillNeed => libc::POSIX_FADV_WILLNEED,
+            PageCacheAdvice::DontNeed => libc::POSIX_FADV_DONTNEED,
+        };
+        unsafe { libc::posix_fadvise(fd, offset, len, advice) == 0 }
     }
 
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (file, offset, len);
+        let _ = (file, offset, len, advice);
+        true
     }
 }
 

@@ -993,6 +993,34 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
     );
     metric(
         &mut out,
+        "torrentng_storage_page_cache_advise_sequential_total",
+        "counter",
+        "Successful POSIX_FADV_SEQUENTIAL hints issued by storage schedulers",
+        stats.storage_page_cache_advise_sequential,
+    );
+    metric(
+        &mut out,
+        "torrentng_storage_page_cache_advise_willneed_total",
+        "counter",
+        "Successful POSIX_FADV_WILLNEED hints issued by storage schedulers",
+        stats.storage_page_cache_advise_willneed,
+    );
+    metric(
+        &mut out,
+        "torrentng_storage_page_cache_advise_dontneed_total",
+        "counter",
+        "Successful POSIX_FADV_DONTNEED hints issued by storage schedulers",
+        stats.storage_page_cache_advise_dontneed,
+    );
+    metric(
+        &mut out,
+        "torrentng_storage_page_cache_advise_failures_total",
+        "counter",
+        "Failed page-cache advice calls observed by storage schedulers",
+        stats.storage_page_cache_advise_failures,
+    );
+    metric(
+        &mut out,
         "torrentng_piece_assembly_buffers",
         "gauge",
         "In-memory piece assembly buffers across running torrents",
@@ -1390,6 +1418,10 @@ mod tests {
             storage_peer_read_elevator_queued: 26,
             storage_peer_read_elevator_batches: 27,
             storage_peer_read_elevator_coalesced_requests: 28,
+            storage_page_cache_advise_sequential: 29,
+            storage_page_cache_advise_willneed: 30,
+            storage_page_cache_advise_dontneed: 31,
+            storage_page_cache_advise_failures: 32,
             ..Default::default()
         };
         stats.storage_read_ops_by_class[4] = 10;
@@ -1446,6 +1478,10 @@ mod tests {
         assert!(
             rendered.contains("torrentng_storage_peer_read_elevator_coalesced_requests_total 28")
         );
+        assert!(rendered.contains("torrentng_storage_page_cache_advise_sequential_total 29"));
+        assert!(rendered.contains("torrentng_storage_page_cache_advise_willneed_total 30"));
+        assert!(rendered.contains("torrentng_storage_page_cache_advise_dontneed_total 31"));
+        assert!(rendered.contains("torrentng_storage_page_cache_advise_failures_total 32"));
         assert!(rendered.contains(
             "torrentng_storage_read_latency_nanoseconds_by_class_total{class=\"peer_read\"} 22"
         ));
