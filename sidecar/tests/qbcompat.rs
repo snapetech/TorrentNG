@@ -1173,8 +1173,19 @@ async fn native_storage_reports_configured_roots() {
     let roots = body["roots"].as_array().unwrap();
     assert_eq!(roots.len(), 2);
     assert_eq!(roots[0]["path"], root.path().display().to_string());
+    #[cfg(unix)]
+    {
     assert_eq!(roots[0]["ok"], true);
     assert!(roots[0]["total_bytes"].as_u64().unwrap() > 0);
+    }
+    #[cfg(not(unix))]
+    {
+        assert_eq!(roots[0]["ok"], false);
+        assert!(roots[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("unsupported"));
+    }
     assert_eq!(roots[1]["ok"], false);
 }
 
