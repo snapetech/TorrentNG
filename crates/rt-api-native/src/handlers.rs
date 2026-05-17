@@ -35,18 +35,7 @@ pub async fn list_torrents(State(state): State<AppState>) -> impl IntoResponse {
                 let summaries: Vec<TorrentSummary> = reg.iter().map(torrent_summary).collect();
                 return (StatusCode::OK, Json(summaries)).into_response();
             }
-            Ok(None) => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(
-                        serde_json::to_value(ApiError::internal(
-                            "api snapshot memory budget exhausted".to_owned(),
-                        ))
-                        .unwrap(),
-                    ),
-                )
-                    .into_response();
-            }
+            Ok(None) => return api_snapshot_budget_exhausted(),
             Err(e) => {
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -2349,5 +2338,22 @@ mod tests {
             estimate_torrent_detail_snapshot_bytes(&summary, &large_meta)
                 > estimate_torrent_detail_snapshot_bytes(&summary, &small_meta)
         );
+    }
+
+    #[test]
+    fn metric_with_label_escapes_label_values_once() {
+        let mut rendered = String::new();
+        metric_with_label(
+            &mut rendered,
+            "torrentng_test_metric",
+            "gauge",
+            "test metric",
+            "backend",
+            "pool\"a\\disk\n1",
+            1,
+        );
+
+        assert!(rendered.contains("torrentng_test_metric{backend=\"pool\\\"a\\\\disk\\n1\"} 1"));
+        assert!(!rendered.contains("pool\\\"a\\\\disk\\n1pool"));
     }
 }

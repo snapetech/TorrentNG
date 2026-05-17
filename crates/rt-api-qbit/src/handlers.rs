@@ -20,6 +20,7 @@ use url::Url;
 use rt_engine::{
     EngineGlobalLimits, EnginePeerSnapshot, EnginePieceState, EngineTorrentLimits, QueueMove,
 };
+use rt_metrics::{MemoryClass, MemoryLease};
 
 use crate::{
     model::{
@@ -326,6 +327,21 @@ pub async fn torrents_info(
     State(state): State<AppState>,
     Query(q): Query<TorrentsInfoQuery>,
 ) -> impl IntoResponse {
+    let torrent_count = state.registry.read().await.len();
+    let _lease = if state.engine.is_some() {
+        match reserve_qbit_api_snapshot(
+            &state,
+            estimate_qbit_torrent_info_snapshot_bytes(torrent_count),
+        )
+        .await
+        {
+            Ok(Some(lease)) => Some(lease),
+            Ok(None) => return qbit_api_snapshot_budget_exhausted(),
+            Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+        }
+    } else {
+        None
+    };
     let entries = {
         let reg = state.registry.read().await;
         reg.iter()
@@ -400,7 +416,7 @@ pub async fn torrents_info(
         infos.push(qbit_torrent_info(&state, entry).await);
     }
 
-    (StatusCode::OK, Json(infos))
+    (StatusCode::OK, Json(infos)).into_response()
 }
 
 /// `POST /api/qb/v2/torrents/add`.
@@ -1724,6 +1740,21 @@ pub async fn sync_maindata(
     State(state): State<AppState>,
     Query(q): Query<SyncMaindataQuery>,
 ) -> impl IntoResponse {
+    let torrent_count = state.registry.read().await.len();
+    let _lease = if state.engine.is_some() {
+        match reserve_qbit_api_snapshot(
+            &state,
+            estimate_qbit_maindata_snapshot_bytes(torrent_count),
+        )
+        .await
+        {
+            Ok(Some(lease)) => Some(lease),
+            Ok(None) => return qbit_api_snapshot_budget_exhausted(),
+            Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+        }
+    } else {
+        None
+    };
     let entries = {
         let reg = state.registry.read().await;
         reg.iter().cloned().collect::<Vec<_>>()
@@ -1777,7 +1808,7 @@ pub async fn sync_maindata(
             write_cache_overload: "0".into(),
         },
     };
-    (StatusCode::OK, Json(resp))
+    (StatusCode::OK, Json(resp)).into_response()
 }
 
 pub async fn sync_torrent_peers(
@@ -2240,6 +2271,33 @@ async fn global_limits(state: &AppState) -> EngineGlobalLimits {
         return EngineGlobalLimits::default();
     };
     engine.global_limits().await.unwrap_or_default()
+}
+
+async fn reserve_qbit_api_snapshot(
+    state: &AppState,
+    bytes: u64,
+) -> Result<Option<MemoryLease>, String> {
+    let Some(engine) = &state.engine else {
+        return Ok(None);
+    };
+    engine.reserve_memory(MemoryClass::ApiSnapshot, bytes).await
+}
+
+fn qbit_api_snapshot_budget_exhausted() -> axum::response::Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "api snapshot memory budget exhausted",
+    )
+        .into_response()
+}
+
+fn estimate_qbit_torrent_info_snapshot_bytes(torrent_count: usize) -> u64 {
+    (torrent_count as u64).saturating_mul(2048)
+}
+
+fn estimate_qbit_maindata_snapshot_bytes(torrent_count: usize) -> u64 {
+    // /sync/maindata wraps torrent info in a keyed map plus server state.
+    16 * 1024 + (torrent_count as u64).saturating_mul(2304)
 }
 
 async fn queue_priority(state: &AppState, hash: &str) -> i32 {
@@ -4303,5 +4361,16 @@ mod tests {
         assert_eq!(parse_qbit_bool("false"), Some(false));
         assert_eq!(parse_qbit_bool("0"), Some(false));
         assert_eq!(parse_qbit_bool("wat"), None);
+    }
+
+    #[test]
+    fn qbit_api_snapshot_estimates_scale_with_torrent_count() {
+        assert_eq!(estimate_qbit_torrent_info_snapshot_bytes(0), 0);
+        assert_eq!(estimate_qbit_torrent_info_snapshot_bytes(10), 20_480);
+        assert_eq!(estimate_qbit_maindata_snapshot_bytes(0), 16 * 1024);
+        assert_eq!(
+            estimate_qbit_maindata_snapshot_bytes(10),
+            16 * 1024 + 30_720
+        );
     }
 }

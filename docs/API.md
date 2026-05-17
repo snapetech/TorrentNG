@@ -87,6 +87,15 @@ the rewritten engine.
 
 Response: `{ total: int, torrents: TorrentRow[] }`
 
+Native API list, delta-stream, and torrent-detail snapshots are charged to the
+`api_snapshot` memory class. When that budget is exhausted the API returns
+`503` with `api snapshot memory budget exhausted` instead of cloning an
+unbounded response.
+
+The qBittorrent facade applies the same budget to `/api/qb/v2/torrents/info`
+and `/api/qb/v2/sync/maindata`, because those endpoints clone the largest
+compatibility snapshots under high torrent counts.
+
 #### TorrentRow fields
 
 ```json

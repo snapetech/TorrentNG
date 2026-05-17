@@ -1300,6 +1300,7 @@ dependencies = [
  "rt-api-model",
  "rt-engine",
  "rt-metainfo",
+ "rt-metrics",
  "rt-session",
  "serde",
  "serde_json",
