@@ -60,7 +60,9 @@ Implemented and covered by automated tests:
   storage-plan job path.
 - The WebUI Library storage panel has a guided move/import/delete planner that
   previews root-confined steps and executes accepted plans through the native
-  durable storage-plan API.
+  durable storage-plan API, including affected torrent metadata, completed-step
+  resume indexes, operation templates, byte summaries, and active storage-plan
+  job progress.
 - Move/import/delete certification can run against a real storage root with
   configurable fixture size by setting `TNG_STORAGE_MOVE_IMPORT_ROOT`,
   `TNG_STORAGE_MOVE_IMPORT_FILES`, and `TNG_STORAGE_MOVE_IMPORT_MIB_PER_FILE`.
@@ -87,6 +89,8 @@ Implemented and covered by automated tests:
   durability, peer-read readahead/cache, and elevator budget.
 - `scripts/storage_uring_graduation.sh` records real-device `pread` vs
   `uring` stream throughput and optional graduation thresholds.
+- Scheduler read returns can keep frame ownership through `scheduled_read_owned`
+  or consume frames into compatibility `Bytes` without copying payload bytes.
 - Current real-device storage evidence includes local NVMe/SSD and the kspls0
   HDD-backed LVM media pool. The LVM report passes the required 5x wall-clock
   target at 8192 blocks and collapses backend reads from 8192 to 1.
@@ -97,8 +101,6 @@ Implemented and covered by automated tests:
 
 | Area | Gap | Risk | Next Work |
 | --- | --- | --- | --- |
-| Zero-copy storage read adoption | Scheduler reads and peer-read elevator reads borrow from the process-level frame pool, upload returned blocks and scheduler-owned cache entries are memory-leased, storage exposes `scheduled_read_owned`, upload plus sparse recheck extent reads consume frame-owned exact backend reads, and compatibility `Bytes` conversion now consumes frames without copying payload bytes. | Compatibility callers that take `Bytes` trade frame reuse for ownership, but no longer pay an extra payload copy. | Profile release workloads and migrate any new measured hot call sites from `scheduled_read` to `scheduled_read_owned` where retaining reusable frame ownership matters. |
-| Move/import product workflow breadth | The engine save-path path, native storage-plan API, and WebUI planner share the durable checkpointed storage-plan job path. The planner now carries affected-torrent metadata, completed-step resume indexes, forward/rollback byte summaries, move/import/delete/resume templates, and active storage-plan job progress. | The core workflow is exposed, but large maintenance operations may still need batch affordances beyond the current planner. | Extend from real operator feedback rather than inventing batch controls ahead of usage. |
 | Deterministic LVM PV placement control | The kspls0 extent probe shows the pool can allocate independent files on multiple rotational PVs, but ordinary path writes still do not let TorrentNG choose a specific PV. | Cross-PV behavior inside the LVM pool is allocator-dependent, so path-level scheduling cannot promise physical-drive affinity. | Use LVM extent mapping for evidence, or add lower-level PV-targeted probes only if release claims require deterministic per-drive placement. |
 | `io_uring` frame-pool slot pinning | `UringBackend` uses worker-owned fixed buffers when available and now exports `fixed_buffer_strategy=worker_copy`; the global frame pool does not yet hand out stable registered buffer slots. | Extra copies remain in the uring path, but metrics distinguish kernel fixed-buffer support from true application-frame zero-copy, and roadmap certification no longer treats worker-copy reports as final graduation. | Run `scripts/storage_uring_graduation.sh /target/root` with selected-backend, fixed-buffer, registered-file, throughput thresholds, and `TNG_STORAGE_URING_REQUIRE_FRAME_POOL_SLOTS=1` for the final gate. Add frame-pool slot leases through the backend API only after those reports prove `uring` should graduate from explicit opt-in. |
 | Move/import certification | The certification runner now supports real-root fixture execution, but representative multi-TB operator evidence is still host/run dependent. | Large library move/import claims should not be made from unit tests alone. | Run `TNG_STORAGE_MOVE_IMPORT_ROOT=/target/root TNG_STORAGE_MOVE_IMPORT_FILES=... TNG_STORAGE_MOVE_IMPORT_MIB_PER_FILE=... scripts/storage_move_import_certification.sh` on the target storage roots and publish the generated report. |

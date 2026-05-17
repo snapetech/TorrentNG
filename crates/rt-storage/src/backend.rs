@@ -1436,6 +1436,26 @@ mod tests {
             "frame_pool_slots"
         );
         assert!(FixedBufferStrategy::WorkerCopy.uses_worker_copy());
+        assert!(!FixedBufferStrategy::WorkerCopy.uses_frame_pool_slots());
+        assert!(!FixedBufferStrategy::FramePoolSlots.uses_worker_copy());
         assert!(FixedBufferStrategy::FramePoolSlots.uses_frame_pool_slots());
+    }
+
+    #[test]
+    fn uring_strategy_never_overclaims_frame_pool_slots() {
+        let backend = UringBackend::try_new_with_queue_depth(1, 1);
+        let Ok(backend) = backend else {
+            return;
+        };
+        let strategy = backend.fixed_buffer_strategy();
+        assert!(
+            !strategy.uses_frame_pool_slots(),
+            "frame_pool_slots must only be reported after the frame pool leases registered slots"
+        );
+        if backend.supports_fixed_buffers() {
+            assert_eq!(strategy, FixedBufferStrategy::WorkerCopy);
+        } else {
+            assert_eq!(strategy, FixedBufferStrategy::Disabled);
+        }
     }
 }
