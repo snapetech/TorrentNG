@@ -14,7 +14,8 @@ not concentrated in storage anymore. It is concentrated in release evidence and
 compatibility depth:
 
 - live Docker client interop and public-swarm runs are still release evidence
-  gates, not covered by the default local compatibility run;
+  gates, and the universal compatibility report now surfaces this as
+  `PASS_WITH_SKIPS` unless those legs are enabled;
 - real exported migration corpora are still needed for all legacy clients;
 - facade compatibility still has placeholder-depth areas for live
   peer/tracker/webseed details and some client-specific plugin APIs;
@@ -40,6 +41,7 @@ Current `scripts/certification_status.sh` highlights:
 | Storage indexed evidence | PASS |
 | Security review and scan | PASS |
 | Pre-engine and post-soak release gates | PASS |
+| Universal compatibility | PASS_WITH_SKIPS unless live/public/device legs are enabled |
 | 24h soak | STALE/INCOMPLETE |
 
 ## Roadmaps
@@ -137,7 +139,9 @@ Local deterministic API compatibility is passing:
 - qBittorrent, Transmission, Deluge, and rTorrent facade certification passed
   via `scripts/api_facade_certification.sh`.
 - `scripts/universal_compatibility_certification.sh` passed for local
-  deterministic coverage.
+  deterministic coverage. When the Docker live, public torrent, or real-device
+  legs are not enabled, the report status is `PASS_WITH_SKIPS` instead of plain
+  PASS.
 
 Remaining compatibility gaps:
 
@@ -157,8 +161,9 @@ Remaining compatibility gaps:
 
 ## Wire Interop
 
-The deterministic local compatibility certification passes, but the full Docker
-interop matrix has explicit release evidence still to run:
+The deterministic local compatibility certification passes. Skipped live legs
+are now explicit in the universal compatibility report and certification status.
+The full Docker interop matrix still has release evidence to run:
 
 - local Docker client-to-client rows across qBittorrent, Transmission, Deluge,
   rTorrent, and TorrentNG;

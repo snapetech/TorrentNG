@@ -123,6 +123,7 @@ row "Proton NAT-PMP" 'proton-natpmp-*.md'
 row "Proton-routed TorrentNG DHT" 'proton-tng-dht-*.md'
 row "Mobile read-flow" 'mobile-compat-*.md'
 row "Phase 1 ruTorrent" 'phase1-cert-*.md'
+row "Universal compatibility" 'universal-compat-*.md'
 row "Synthetic benchmark" 'report-*.md' "$BENCHMARK_DIR"
 row "Short soak" 'soak-202*.md'
 row "Transfer churn soak" 'transfer-churn-*.md'

@@ -7,6 +7,7 @@ OUT="${1:-$ROOT/certification/reports/universal-compat-$(date -u +%Y%m%dT%H%M%SZ
 mkdir -p "$(dirname "$OUT")"
 
 status="PASS"
+skips=0
 
 mark_gate() {
   local name="$1"
@@ -38,6 +39,7 @@ run_gate() {
 skip_gate() {
   local name="$1"
   local reason="$2"
+  skips=$((skips + 1))
   {
     echo
     echo "## $name"
@@ -96,7 +98,12 @@ rm -f "$OUT.table"
 
 {
   echo
-  echo "Overall status: $status"
+  if [[ "$status" == "PASS" && "$skips" -gt 0 ]]; then
+    echo "Overall status: PASS_WITH_SKIPS"
+    echo "Skipped gates: $skips"
+  else
+    echo "Overall status: $status"
+  fi
 } >> "$OUT"
 
 echo "$OUT"
