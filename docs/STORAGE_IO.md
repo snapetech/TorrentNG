@@ -51,8 +51,9 @@ class semaphores:
   operators can tune them without code changes.
 - `scheduled_read` and `scheduled_write` remain compatibility wrappers, but
   call positioned `read_at`/`write_at`.
-- Disk syscalls run on a bounded dedicated worker pool instead of Tokio's shared
-  blocking pool.
+- Disk syscalls are submitted through the probe-selected `DiskBackend`
+  (`pread` baseline or explicit Linux `io_uring`) while `MountScheduler`
+  preserves its per-class, per-mount, and per-device backpressure gates.
 - SHA-1 and BEP52 leaf/root hashing run on a separate bounded hashing pool.
 - The open-file pool is keyed by normalized absolute path, tracks read/write
   mode, hits, misses, evictions, idle closes, and open count.
@@ -77,7 +78,8 @@ class semaphores:
   fallback/failure counters. Queued disk bytes are actual short-lived payload
   leases held by queued or active disk, hash, and peer-read elevator jobs, not
   queue-depth estimates.
-- `rt-storage::StorageRuntime` now has a probe-selected backend layer:
+- The live torrent hot path and `rt-storage::StorageRuntime` share the same
+  probe-selected backend layer:
   `TNG_STORAGE_BACKEND=auto|pread|uring` chooses between the portable
   positioned-I/O worker pool and Linux `io_uring` positioned reads, writes,
   and data sync. `auto` currently selects the conservative `pread` baseline;
@@ -86,10 +88,8 @@ class semaphores:
   and fail closed when saturated. The uring worker registers file slots and
   worker-owned fixed buffers when the kernel accepts them. Kernels or
   containers that reject `io_uring` fall back to `pread` with an explicit
-  diagnostic reason instead of silently changing behavior. This
-  runtime/backend path is currently used for capability metrics and direct
-  backend probes; `MountScheduler` still performs live torrent payload I/O
-  through its own positioned `FileExt` calls.
+  diagnostic reason instead of silently changing behavior. Direct backend
+  probes remain available for hardware certification and capability metrics.
 - `IoClass::PeerRead` uses a small internal readahead cache when configured:
   the backend may read ahead within the same file, but callers receive exactly
   the requested byte range.
@@ -131,13 +131,6 @@ startup falls back to verification instead of trusting stale piece state.
 
 The following items are still implementation targets:
 
-- Route `MountScheduler` live torrent reads/writes/syncs through the
-  `DiskBackend` layer or a unified `StorageRuntime` API so backend selection,
-  queue bounds, registered files, and future `io_uring` improvements affect
-  the actual torrent hot path.
-- Move scheduler read/readahead buffers onto frame-pool leases or an equivalent
-  bounded storage-buffer API; the current frame pool backs `StorageRuntime`
-  reads, not the primary scheduler read path.
 - Persist cross-device move/import execution state so interrupted multi-step
   plans can resume or be audited after process restart.
 - Per-device latency observability now includes bounded Prometheus histograms

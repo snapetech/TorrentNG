@@ -59,6 +59,12 @@ Implemented and covered by automated tests:
   startup cannot create the ring on the host/container.
 - `PreadBackend` and `UringBackend` have bounded internal queues and fail
   closed with `WouldBlock` when the backend queue is full.
+- The live torrent scheduler owns a `SelectedDiskBackend` and routes reads,
+  writes, syncs, and peer-read elevator dispatch through the same bounded
+  backend interface used by storage runtime probes.
+- Scheduler read and peer-read elevator buffers enter the backend through frame
+  objects before being copied into caller-owned `Bytes`; process-level
+  frame-pool accounting for the live torrent path remains tracked below.
 - Native `[storage]` TOML covers scheduler `StorageIoConfig` knobs for file
   pool size, idle TTL, I/O/hash workers, queue depths, preallocation,
   durability, peer-read readahead/cache, and elevator budget.
@@ -74,8 +80,8 @@ Implemented and covered by automated tests:
 
 | Area | Gap | Risk | Next Work |
 | --- | --- | --- | --- |
-| Hot-path backend integration | `MountScheduler` is still the live torrent payload path and still performs positioned reads/writes directly with `FileExt`; `StorageRuntime` owns `DiskBackend`, `PreadBackend`, `UringBackend`, `FramePool`, and backend capability metrics, but is not yet the backend used by torrent reads/writes. | `TNG_STORAGE_BACKEND=uring`, backend fixed-buffer support, and backend registered-file support can be visible in runtime metrics without affecting the actual torrent hot path. | Route scheduler read/write/sync through a scheduler-owned `DiskBackend` or a unified runtime API while preserving class permits, queue permits, dirty tracking, and existing stats. |
-| Storage frame accounting on torrent reads | Scheduler reads and peer-read readahead allocate ordinary `Vec<u8>`/`Bytes`; the global `FramePool` only backs `StorageRuntime::read_frame`. | Storage frame caps do not bound the primary torrent read/recheck path, so frame metrics can understate actual storage buffer pressure. | Add scheduler frame leases or make scheduler reads consume `StorageRuntime` frames before dispatching disk work. |
+| Storage frame accounting on torrent reads | Scheduler reads now dispatch through `DiskBackend`, but still copy backend frames into `Bytes`; the global `FramePool` only backs `StorageRuntime::read_frame`. | Storage frame caps do not bound the primary torrent read/recheck path, so frame metrics can understate actual storage buffer pressure. | Add scheduler frame leases or make scheduler reads consume `StorageRuntime` frames before dispatching disk work. |
+| Scheduler/backend double queue | Scheduler read/write/sync reaches `DiskBackend` through the existing bounded scheduler blocking bridge. | The selected backend now affects torrent payload I/O, but the bridge still ties up one scheduler worker while awaiting backend completion. | Split scheduler submission into explicit async permit/lease guards plus a short blocking open/metadata phase, then await backend completion directly. |
 | Restartable move/import execution | The move/import/delete executor is conservative for one process execution, but multi-step move/import progress is not durably recorded. | A process crash during a multi-TB move leaves recovery dependent on filesystem inspection instead of a known persisted plan state. | Persist plan id, steps, completed steps, and rollback intent in the engine DB before executing cross-device copy/rename/delete operations. |
 | Deterministic LVM PV placement control | The kspls0 extent probe shows the pool can allocate independent files on multiple rotational PVs, but ordinary path writes still do not let TorrentNG choose a specific PV. | Cross-PV behavior inside the LVM pool is allocator-dependent, so path-level scheduling cannot promise physical-drive affinity. | Use LVM extent mapping for evidence, or add lower-level PV-targeted probes only if release claims require deterministic per-drive placement. |
 | `io_uring` frame-pool slot pinning | `UringBackend` uses worker-owned fixed buffers when available, but the global frame pool does not yet hand out stable registered buffer slots. | Extra copies remain in the uring path, and fixed-buffer metrics can overstate how much of the full storage path is zero-copy. | Run `scripts/storage_uring_graduation.sh /target/root` with selected-backend, fixed-buffer, registered-file, and throughput thresholds. Add frame-pool slot leases through the backend API only after those reports prove `uring` should graduate from explicit opt-in. |

@@ -12,6 +12,7 @@
 //! `spawn_blocking` work.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt;
@@ -98,25 +99,46 @@ enum SelectedDiskBackendInner {
     Uring(UringBackend),
 }
 
+impl fmt::Debug for SelectedDiskBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SelectedDiskBackend")
+            .field("selection", &self.selection)
+            .finish_non_exhaustive()
+    }
+}
+
 impl SelectedDiskBackend {
     /// Select and construct a backend with an explicit worker-thread budget.
     pub fn select(requested: BackendRequest, threads: usize) -> Self {
+        Self::select_with_queue_depth(requested, threads, DEFAULT_BACKEND_QUEUE_DEPTH)
+    }
+
+    /// Select and construct a backend with explicit worker and queue budgets.
+    pub fn select_with_queue_depth(
+        requested: BackendRequest,
+        threads: usize,
+        queue_depth: usize,
+    ) -> Self {
         match requested {
             BackendRequest::Pread => Self::pread(
                 requested,
                 threads,
+                queue_depth,
                 "forced by storage backend configuration".to_string(),
             ),
             BackendRequest::Auto => Self::pread(
                 requested,
                 threads,
+                queue_depth,
                 "auto uses pread baseline; request io_uring explicitly after correctness benchmarks"
                     .to_string(),
             ),
             BackendRequest::Uring => match UringBackend::probe() {
-                Ok(probe) if probe.usable => Self::uring(requested, threads, probe.reason),
-                Ok(probe) => Self::pread(requested, threads, probe.reason),
-                Err(reason) => Self::pread(requested, threads, reason),
+                Ok(probe) if probe.usable => {
+                    Self::uring(requested, threads, queue_depth, probe.reason)
+                }
+                Ok(probe) => Self::pread(requested, threads, queue_depth, probe.reason),
+                Err(reason) => Self::pread(requested, threads, queue_depth, reason),
             },
         }
     }
@@ -135,7 +157,12 @@ impl SelectedDiskBackend {
         self.selection.selected
     }
 
-    fn pread(requested: BackendRequest, threads: usize, reason: String) -> Self {
+    fn pread(
+        requested: BackendRequest,
+        threads: usize,
+        queue_depth: usize,
+        reason: String,
+    ) -> Self {
         let selection = BackendSelection {
             requested,
             selected: BackendKind::Pread,
@@ -143,17 +170,26 @@ impl SelectedDiskBackend {
         };
         Self {
             selection,
-            inner: SelectedDiskBackendInner::Pread(PreadBackend::new(threads)),
+            inner: SelectedDiskBackendInner::Pread(PreadBackend::new_with_queue_depth(
+                threads,
+                queue_depth,
+            )),
         }
     }
 
-    fn uring(requested: BackendRequest, threads: usize, reason: String) -> Self {
-        let backend = match UringBackend::try_new(threads) {
+    fn uring(
+        requested: BackendRequest,
+        threads: usize,
+        queue_depth: usize,
+        reason: String,
+    ) -> Self {
+        let backend = match UringBackend::try_new_with_queue_depth(threads, queue_depth) {
             Ok(backend) => backend,
             Err(error) => {
                 return Self::pread(
                     requested,
                     threads,
+                    queue_depth,
                     format!("{reason}; io_uring worker startup failed: {error}"),
                 );
             }

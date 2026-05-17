@@ -13,8 +13,8 @@ scheduler used by the native engine.
   positioned `read_at` and `write_at`.
 - A bounded open-file pool avoids per-block fd churn and records hits, misses,
   evictions, idle closes, and current open count.
-- Disk operations run on dedicated blocking workers, behind a bounded queue,
-  instead of Tokio's shared blocking pool.
+- Disk operations are submitted through the selected `DiskBackend`, behind
+  scheduler-owned bounded queues, instead of Tokio's shared blocking pool.
 - Piece and BEP52 hashing runs on a separate bounded hashing pool.
 - `DeviceElevator` captures the per-device Phase B scheduling policy:
   budgeted queueing, deadline and foreground bypass, choke-critical promotion,
@@ -30,7 +30,7 @@ scheduler used by the native engine.
   hash, and bytes-by-class counters for metrics integration.
 - `IoClass::PeerRead` can read ahead into a small per-file cache while returning
   exactly the requested block bytes to the caller.
-- `StorageRuntime` uses a probe-selected disk backend. Set
+- `MountScheduler` and `StorageRuntime` use a probe-selected disk backend. Set
   `TNG_STORAGE_BACKEND=auto|pread|uring` to request a backend. `auto` currently
   selects the conservative portable worker-pool baseline, `pread` requests that
   baseline explicitly, and `uring` uses Linux `io_uring` positioned SQEs when

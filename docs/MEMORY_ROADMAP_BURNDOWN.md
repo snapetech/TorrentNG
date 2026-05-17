@@ -17,6 +17,12 @@ evidence rollup and non-claim boundary report.
 - [x] Process-level per-device scheduler registry for positioned disk submissions.
   - Schedulers resolving to the same device/profile share a global device queue semaphore.
   - The shared device queue applies to read/write/sync/recheck/preallocation submissions and peer-read elevator dispatch.
+- [x] Live torrent I/O goes through the bounded backend interface.
+  - `MountScheduler` owns a `SelectedDiskBackend` selected from `TNG_STORAGE_BACKEND` and the scheduler queue-depth config.
+  - Scheduler reads, writes, durability syncs, and HDD peer-read elevator dispatch use `DiskBackend` calls instead of direct positioned file operations.
+- [x] Scheduler read buffers use frame leases before backend dispatch.
+  - Direct scheduler reads and peer-read elevator reads acquire `FramePool` frames before issuing backend `pread`.
+  - Returned `Bytes` are still copied out of the frame today; full zero-copy frame ownership remains tied to the optional `io_uring`/registered-buffer graduation work.
 - [x] 10k/100k idle torrent RSS/task/fd evidence proxy.
   - `idle_memory_100k_keeps_fixed_rss_task_fd_budget` checks 100k idle API shape under fixed RSS, task, and fd growth targets.
 - [x] 1k hot seeding memory-cap evidence proxy.

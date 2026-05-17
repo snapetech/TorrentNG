@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, Weak};
@@ -18,8 +19,10 @@ use rt_path::{StorageProfile, StorageRootId};
 use sha1::{Digest, Sha1};
 
 use crate::{
+    backend::{BackendRequest, DiskBackend, SelectedDiskBackend},
     device::{detect_storage_topology, StorageTopology},
     error::StorageError,
+    frame::FramePool,
     io_class::IoClass,
 };
 
@@ -36,11 +39,6 @@ pub const STORAGE_LATENCY_BUCKETS_NS: [u64; 8] = [
 pub const STORAGE_LATENCY_BUCKET_COUNT: usize = STORAGE_LATENCY_BUCKETS_NS.len();
 
 const QUEUED_DISK_JOB_OVERHEAD_BYTES: u64 = 1024;
-
-#[cfg(unix)]
-use std::os::unix::fs::FileExt;
-#[cfg(windows)]
-use std::os::windows::fs::FileExt;
 
 /// A pending read or write operation against a storage root.
 #[derive(Debug)]
@@ -354,16 +352,19 @@ impl FilePool {
         Ok(file)
     }
 
-    fn sync_path(&self, path: &Path) -> Result<(), StorageError> {
+    fn open_for_sync(&self, path: &Path) -> Result<Arc<File>, StorageError> {
         let key = normalized_key(path);
         let path_str = key.display().to_string();
         let file = {
             let entries = self.entries.lock().expect("file pool mutex poisoned");
-            entries.get(&key).map(|entry| entry.file.clone())
+            entries
+                .get(&key)
+                .filter(|entry| entry.mode == OpenMode::Write)
+                .map(|entry| entry.file.clone())
         };
-        let file = match file {
-            Some(file) => file,
-            None => Arc::new(
+        match file {
+            Some(file) => Ok(file),
+            None => Ok(Arc::new(
                 OpenOptions::new()
                     .read(false)
                     .write(true)
@@ -371,24 +372,32 @@ impl FilePool {
                     .truncate(false)
                     .open(&key)
                     .map_err(|e| StorageError::io(&path_str, e))?,
-            ),
-        };
-        file.sync_data().map_err(|e| StorageError::io(path_str, e))
+            )),
+        }
     }
 
-    fn sync_all(&self) -> Result<(), StorageError> {
-        let files: Vec<(PathBuf, Arc<File>)> = {
-            let entries = self.entries.lock().expect("file pool mutex poisoned");
-            entries
-                .iter()
-                .filter(|(_, entry)| entry.mode == OpenMode::Write)
-                .map(|(path, entry)| (path.clone(), entry.file.clone()))
-                .collect()
-        };
-        for (path, file) in files {
-            let path_str = path.display().to_string();
-            file.sync_data()
-                .map_err(|e| StorageError::io(path_str, e))?;
+    fn write_handles(&self) -> Vec<(PathBuf, Arc<File>)> {
+        let entries = self.entries.lock().expect("file pool mutex poisoned");
+        entries
+            .iter()
+            .filter(|(_, entry)| entry.mode == OpenMode::Write)
+            .map(|(path, entry)| (path.clone(), entry.file.clone()))
+            .collect()
+    }
+
+    fn sync_path_with_backend(
+        &self,
+        path: &Path,
+        backend: &SelectedDiskBackend,
+    ) -> Result<(), StorageError> {
+        let key = normalized_key(path);
+        let file = self.open_for_sync(&key)?;
+        wait_backend_io(&key, backend.fdatasync(file))
+    }
+
+    fn sync_all_with_backend(&self, backend: &SelectedDiskBackend) -> Result<(), StorageError> {
+        for (path, file) in self.write_handles() {
+            wait_backend_io(&path, backend.fdatasync(file))?;
         }
         Ok(())
     }
@@ -526,6 +535,7 @@ pub struct MountScheduler {
     io_config: StorageIoConfig,
     file_pool: Arc<FilePool>,
     io_pool: Arc<BlockingPool>,
+    disk_backend: Arc<SelectedDiskBackend>,
     hash_pool: Arc<BlockingPool>,
     dirty_paths: Arc<Mutex<HashSet<PathBuf>>>,
     peer_read_cache: Arc<Mutex<HashMap<PathBuf, PeerReadCacheEntry>>>,
@@ -699,6 +709,22 @@ fn queued_disk_charge(payload_bytes: u64) -> u64 {
     payload_bytes.max(QUEUED_DISK_JOB_OVERHEAD_BYTES)
 }
 
+fn wait_backend_io<T>(
+    path: &Path,
+    rx: oneshot::Receiver<io::Result<T>>,
+) -> Result<T, StorageError> {
+    match rx.blocking_recv() {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) if error.kind() == io::ErrorKind::WouldBlock => {
+            Err(StorageError::QueueFull {
+                mount: "storage-backend".to_string(),
+            })
+        }
+        Ok(Err(error)) => Err(StorageError::io(path.display().to_string(), error)),
+        Err(_) => Err(StorageError::Cancelled),
+    }
+}
+
 static DEVICE_QUEUES: Lazy<Mutex<HashMap<String, Weak<Semaphore>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
@@ -739,6 +765,7 @@ impl PeerReadElevator {
         budget: Duration,
         file_pool: Arc<FilePool>,
         io_pool: Arc<BlockingPool>,
+        disk_backend: Arc<SelectedDiskBackend>,
         queue_sem: Arc<Semaphore>,
         device_queue_sem: Arc<Semaphore>,
         counters: Arc<StorageCounters>,
@@ -751,6 +778,7 @@ impl PeerReadElevator {
             budget,
             file_pool,
             io_pool,
+            disk_backend,
             queue_sem,
             device_queue_sem,
             counters.clone(),
@@ -821,6 +849,7 @@ async fn peer_read_elevator_worker(
     budget: Duration,
     file_pool: Arc<FilePool>,
     io_pool: Arc<BlockingPool>,
+    disk_backend: Arc<SelectedDiskBackend>,
     queue_sem: Arc<Semaphore>,
     device_queue_sem: Arc<Semaphore>,
     counters: Arc<StorageCounters>,
@@ -831,6 +860,7 @@ async fn peer_read_elevator_worker(
         for batch in batches {
             let file_pool = file_pool.clone();
             let io_pool = io_pool.clone();
+            let disk_backend = disk_backend.clone();
             let queue_sem = queue_sem.clone();
             let device_queue_sem = device_queue_sem.clone();
             let counters = counters.clone();
@@ -839,6 +869,7 @@ async fn peer_read_elevator_worker(
                     batch,
                     file_pool,
                     io_pool,
+                    disk_backend,
                     queue_sem,
                     device_queue_sem,
                     counters,
@@ -918,6 +949,7 @@ async fn dispatch_peer_read_batch(
     batch: PeerReadBatch,
     file_pool: Arc<FilePool>,
     io_pool: Arc<BlockingPool>,
+    disk_backend: Arc<SelectedDiskBackend>,
     queue_sem: Arc<Semaphore>,
     device_queue_sem: Arc<Semaphore>,
     counters: Arc<StorageCounters>,
@@ -951,7 +983,16 @@ async fn dispatch_peer_read_batch(
     let len = batch.len;
     let read_counters = counters.clone();
     let read = io_pool
-        .run(move || read_exact_from_pool(&file_pool, &path, offset, len, &read_counters))
+        .run(move || {
+            read_exact_from_pool(
+                &file_pool,
+                &disk_backend,
+                &path,
+                offset,
+                len,
+                &read_counters,
+            )
+        })
         .await;
 
     match read {
@@ -1070,6 +1111,15 @@ impl MountScheduler {
             io_config.io_worker_threads,
             io_config.io_queue_depth,
         ));
+        let backend_request = std::env::var("TNG_STORAGE_BACKEND")
+            .ok()
+            .map(|value| BackendRequest::parse(&value))
+            .unwrap_or(BackendRequest::Auto);
+        let disk_backend = Arc::new(SelectedDiskBackend::select_with_queue_depth(
+            backend_request,
+            io_config.io_worker_threads,
+            io_config.io_queue_depth,
+        ));
         let queue_sem = Arc::new(Semaphore::new(
             config.max_queue.min(io_config.io_queue_depth).max(1),
         ));
@@ -1094,6 +1144,7 @@ impl MountScheduler {
                     Duration::from_millis(io_config.peer_read_elevator_budget_ms),
                     file_pool.clone(),
                     io_pool.clone(),
+                    disk_backend.clone(),
                     queue_sem.clone(),
                     device_queue_sem.clone(),
                     counters.clone(),
@@ -1116,6 +1167,7 @@ impl MountScheduler {
             device_queue_sem,
             file_pool,
             io_pool,
+            disk_backend,
             hash_pool: Arc::new(BlockingPool::new(
                 "rt-storage-hash",
                 io_config.hash_worker_threads,
@@ -1352,6 +1404,7 @@ impl MountScheduler {
                 Duration::from_millis(self.io_config.peer_read_elevator_budget_ms),
                 self.file_pool.clone(),
                 self.io_pool.clone(),
+                self.disk_backend.clone(),
                 self.queue_sem.clone(),
                 self.device_queue_sem.clone(),
                 self.counters.clone(),
@@ -1370,6 +1423,7 @@ impl MountScheduler {
     ) -> Result<bytes::Bytes, StorageError> {
         let _permit = self.acquire(class).await?;
         let pool = self.file_pool.clone();
+        let disk_backend = self.disk_backend.clone();
         let counters = self.counters.clone();
         let peer_read_cache = self.peer_read_cache.clone();
         let peer_read_elevator = self.peer_read_elevator();
@@ -1431,32 +1485,26 @@ impl MountScheduler {
                 len
             };
             advise_for_read_class(&file, class, offset, read_len, &counters);
-            let mut buf = vec![0u8; read_len];
-            let mut read = 0usize;
-            while read < read_len {
-                let n = positioned_read(&file, &mut buf[read..], offset + read as u64)
-                    .map_err(|e| StorageError::io(&path_str, e))?;
-                if n == 0 {
-                    return Err(StorageError::ShortIo {
-                        path: path_str,
-                        expected: read_len,
-                        actual: read,
-                    });
-                }
-                read += n;
-            }
+            let frame_pool = FramePool::new(read_len as u64);
+            let frame =
+                frame_pool
+                    .try_acquire(read_len)
+                    .ok_or_else(|| StorageError::QueueFull {
+                        mount: "scheduler-read-frame".to_string(),
+                    })?;
+            let frame = wait_backend_io(&key, disk_backend.pread(file.clone(), frame, offset))?;
             counters.read_ops_by_class[class_index(class)].fetch_add(1, Ordering::Relaxed);
             counters.bytes_read_by_class[class_index(class)]
-                .fetch_add(read as u64, Ordering::Relaxed);
+                .fetch_add(read_len as u64, Ordering::Relaxed);
             counters.backend_read_ops_by_class[class_index(class)].fetch_add(1, Ordering::Relaxed);
             counters.backend_bytes_read_by_class[class_index(class)]
-                .fetch_add(read as u64, Ordering::Relaxed);
-            advise_after_read_class(&file, class, offset, read, &counters);
+                .fetch_add(read_len as u64, Ordering::Relaxed);
+            advise_after_read_class(&file, class, offset, read_len, &counters);
             let latency_ns = latency_ns_since(started);
             counters.read_latency_ns_by_class[class_index(class)]
                 .fetch_add(latency_ns, Ordering::Relaxed);
             record_latency_bucket(&counters.read_latency_buckets, latency_ns);
-            let bytes = bytes::Bytes::from(buf);
+            let bytes = bytes::Bytes::copy_from_slice(frame.as_slice());
             if class == IoClass::PeerRead && read_len > len && readahead_cache_entries > 0 {
                 let exact = bytes.slice(..len);
                 peer_read_cache_store(
@@ -1486,30 +1534,18 @@ impl MountScheduler {
         let _permit = self.acquire(class).await?;
         let strict = self.io_config.durability_mode == DurabilityMode::Strict;
         let pool = self.file_pool.clone();
+        let disk_backend = self.disk_backend.clone();
         let dirty_paths = self.dirty_paths.clone();
         let counters = self.counters.clone();
         let path = path.to_path_buf();
         let started = Instant::now();
         self.submit(data.len() as u64, move || {
             let key = normalized_key(&path);
-            let path_str = key.display().to_string();
             let file = pool.get_or_open(&key, OpenMode::Write, create)?;
-            let mut written = 0usize;
-            while written < data.len() {
-                let n = positioned_write(&file, &data[written..], offset + written as u64)
-                    .map_err(|e| StorageError::io(&path_str, e))?;
-                if n == 0 {
-                    return Err(StorageError::ShortIo {
-                        path: path_str,
-                        expected: data.len(),
-                        actual: written,
-                    });
-                }
-                written += n;
-            }
+            let written = data.len();
+            wait_backend_io(&key, disk_backend.pwrite(file.clone(), data, offset))?;
             if strict {
-                file.sync_data()
-                    .map_err(|e| StorageError::io(&path_str, e))?;
+                wait_backend_io(&key, disk_backend.fdatasync(file))?;
             } else {
                 let mut dirty = dirty_paths.lock().expect("dirty path mutex poisoned");
                 dirty.insert(key);
@@ -1577,13 +1613,14 @@ impl MountScheduler {
 
     pub async fn sync_data(&self, path: &Path) -> Result<(), StorageError> {
         let pool = self.file_pool.clone();
+        let disk_backend = self.disk_backend.clone();
         let dirty_paths = self.dirty_paths.clone();
         let counters = self.counters.clone();
         let path = path.to_path_buf();
         let started = Instant::now();
         self.submit(0, move || {
             let key = normalized_key(&path);
-            pool.sync_path(&key)?;
+            pool.sync_path_with_backend(&key, &disk_backend)?;
             counters.sync_ops.fetch_add(1, Ordering::Relaxed);
             let latency_ns = latency_ns_since(started);
             counters
@@ -1599,18 +1636,19 @@ impl MountScheduler {
 
     pub async fn sync_all_open_files(&self) -> Result<(), StorageError> {
         let pool = self.file_pool.clone();
+        let disk_backend = self.disk_backend.clone();
         let dirty_paths = self.dirty_paths.clone();
         let counters = self.counters.clone();
         let started = Instant::now();
         self.submit(0, move || {
-            pool.sync_all()?;
+            pool.sync_all_with_backend(&disk_backend)?;
             counters.sync_ops.fetch_add(1, Ordering::Relaxed);
             let paths: Vec<PathBuf> = {
                 let dirty = dirty_paths.lock().expect("dirty path mutex poisoned");
                 dirty.iter().cloned().collect()
             };
             for path in &paths {
-                pool.sync_path(path)?;
+                pool.sync_path_with_backend(path, &disk_backend)?;
             }
             let mut dirty = dirty_paths.lock().expect("dirty path mutex poisoned");
             for path in paths {
@@ -1868,31 +1906,24 @@ fn peer_read_cache_store(
 
 fn read_exact_from_pool(
     pool: &FilePool,
+    disk_backend: &SelectedDiskBackend,
     path: &Path,
     offset: u64,
     len: usize,
     counters: &StorageCounters,
 ) -> Result<bytes::Bytes, StorageError> {
     let key = normalized_key(path);
-    let path_str = key.display().to_string();
     let file = pool.get_or_open(&key, OpenMode::Read, false)?;
     advise_for_read_class(&file, IoClass::PeerRead, offset, len, counters);
-    let mut buf = vec![0u8; len];
-    let mut read = 0usize;
-    while read < len {
-        let n = positioned_read(&file, &mut buf[read..], offset + read as u64)
-            .map_err(|e| StorageError::io(&path_str, e))?;
-        if n == 0 {
-            return Err(StorageError::ShortIo {
-                path: path_str,
-                expected: len,
-                actual: read,
-            });
-        }
-        read += n;
-    }
-    advise_after_read_class(&file, IoClass::PeerRead, offset, read, counters);
-    Ok(bytes::Bytes::from(buf))
+    let frame_pool = FramePool::new(len as u64);
+    let frame = frame_pool
+        .try_acquire(len)
+        .ok_or_else(|| StorageError::QueueFull {
+            mount: "scheduler-read-frame".to_string(),
+        })?;
+    let frame = wait_backend_io(&key, disk_backend.pread(file.clone(), frame, offset))?;
+    advise_after_read_class(&file, IoClass::PeerRead, offset, len, counters);
+    Ok(bytes::Bytes::copy_from_slice(frame.as_slice()))
 }
 
 fn advise_for_read_class(
@@ -2074,26 +2105,6 @@ fn clamp_file_pool_size(configured: usize) -> usize {
         }
     }
     configured
-}
-
-#[cfg(unix)]
-fn positioned_read(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
-    file.read_at(buf, offset)
-}
-
-#[cfg(windows)]
-fn positioned_read(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
-    file.seek_read(buf, offset)
-}
-
-#[cfg(unix)]
-fn positioned_write(file: &File, buf: &[u8], offset: u64) -> std::io::Result<usize> {
-    file.write_at(buf, offset)
-}
-
-#[cfg(windows)]
-fn positioned_write(file: &File, buf: &[u8], offset: u64) -> std::io::Result<usize> {
-    file.seek_write(buf, offset)
 }
 
 fn full_preallocate(file: &File, len: u64) -> Result<(), StorageError> {
