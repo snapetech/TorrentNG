@@ -425,6 +425,7 @@ type BlockingJob = Box<dyn FnOnce() + Send + 'static>;
 
 #[derive(Debug)]
 struct BlockingPool {
+    queue_name: &'static str,
     sender: mpsc::SyncSender<BlockingJob>,
     queued: Arc<AtomicUsize>,
 }
@@ -455,7 +456,11 @@ impl BlockingPool {
                 })
                 .expect("failed to spawn storage I/O worker");
         }
-        Self { sender, queued }
+        Self {
+            queue_name: name_prefix,
+            sender,
+            queued,
+        }
     }
 
     async fn run<T, F>(&self, f: F) -> Result<T, StorageError>
@@ -467,13 +472,15 @@ impl BlockingPool {
         self.queued.fetch_add(1, Ordering::Relaxed);
         if self
             .sender
-            .send(Box::new(move || {
+            .try_send(Box::new(move || {
                 let _ = tx.send(f());
             }))
             .is_err()
         {
             self.queued.fetch_sub(1, Ordering::Relaxed);
-            return Err(StorageError::Cancelled);
+            return Err(StorageError::QueueFull {
+                mount: self.queue_name.to_string(),
+            });
         }
         rx.await.map_err(|_| StorageError::Cancelled)?
     }
@@ -1127,7 +1134,11 @@ impl MountScheduler {
                 }
                 TryAcquireError::Closed => StorageError::Cancelled,
             })?;
-        self.io_pool.run(f).await
+        let result = self.io_pool.run(f).await;
+        if matches!(result, Err(StorageError::QueueFull { .. })) {
+            self.counters.queue_full.fetch_add(1, Ordering::Relaxed);
+        }
+        result
     }
 
     fn peer_read_elevator(&self) -> Option<PeerReadElevator> {
@@ -1457,7 +1468,8 @@ impl MountScheduler {
     pub async fn hash_sha1(&self, data: bytes::Bytes) -> Result<[u8; 20], StorageError> {
         let counters = self.counters.clone();
         let started = Instant::now();
-        self.hash_pool
+        let result = self
+            .hash_pool
             .run(move || {
                 let mut hasher = Sha1::new();
                 hasher.update(&data);
@@ -1469,13 +1481,18 @@ impl MountScheduler {
                 record_latency_bucket(&counters.hash_latency_buckets, latency_ns);
                 Ok(hasher.finalize().into())
             })
-            .await
+            .await;
+        if matches!(result, Err(StorageError::QueueFull { .. })) {
+            self.counters.queue_full.fetch_add(1, Ordering::Relaxed);
+        }
+        result
     }
 
     pub async fn hash_v2_leaf(&self, data: bytes::Bytes) -> Result<[u8; 32], StorageError> {
         let counters = self.counters.clone();
         let started = Instant::now();
-        self.hash_pool
+        let result = self
+            .hash_pool
             .run(move || {
                 counters.hash_ops.fetch_add(1, Ordering::Relaxed);
                 let latency_ns = latency_ns_since(started);
@@ -1485,13 +1502,18 @@ impl MountScheduler {
                 record_latency_bucket(&counters.hash_latency_buckets, latency_ns);
                 Ok(BlockHash::of(&data).0)
             })
-            .await
+            .await;
+        if matches!(result, Err(StorageError::QueueFull { .. })) {
+            self.counters.queue_full.fetch_add(1, Ordering::Relaxed);
+        }
+        result
     }
 
     pub async fn hash_v2_root(&self, leaves: Vec<[u8; 32]>) -> Result<[u8; 32], StorageError> {
         let counters = self.counters.clone();
         let started = Instant::now();
-        self.hash_pool
+        let result = self
+            .hash_pool
             .run(move || {
                 counters.hash_ops.fetch_add(1, Ordering::Relaxed);
                 let latency_ns = latency_ns_since(started);
@@ -1501,7 +1523,11 @@ impl MountScheduler {
                 record_latency_bucket(&counters.hash_latency_buckets, latency_ns);
                 Ok(merkle_root(&leaves))
             })
-            .await
+            .await;
+        if matches!(result, Err(StorageError::QueueFull { .. })) {
+            self.counters.queue_full.fetch_add(1, Ordering::Relaxed);
+        }
+        result
     }
 }
 
@@ -1929,6 +1955,25 @@ mod tests {
             Err(StorageError::QueueFull { mount }) if mount.starts_with("storage-root-")
         ));
         assert_eq!(sched.stats().queue_full, 1);
+    }
+
+    #[tokio::test]
+    async fn blocking_pool_full_queue_fails_closed() {
+        let (sender, _receiver) = mpsc::sync_channel::<BlockingJob>(1);
+        sender.send(Box::new(|| {})).unwrap();
+        let pool = BlockingPool {
+            queue_name: "test-blocking-pool",
+            sender,
+            queued: Arc::new(AtomicUsize::new(1)),
+        };
+
+        let result = pool.run(|| Ok::<_, StorageError>(())).await;
+
+        assert!(matches!(
+            result,
+            Err(StorageError::QueueFull { mount }) if mount == "test-blocking-pool"
+        ));
+        assert_eq!(pool.queued(), 1);
     }
 
     #[test]

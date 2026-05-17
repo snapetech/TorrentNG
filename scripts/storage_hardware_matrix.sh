@@ -15,6 +15,7 @@ Environment:
   TNG_STORAGE_BENCH_BLOCKS       blocks per benchmark file (default: 4096)
   TNG_STORAGE_BENCH_READS        repeated hot-file reads (default: 10000)
   TNG_STORAGE_REQUIRE_HDD_5X     require >=5x elevator wall-clock on HDD paths
+  TNG_STORAGE_SYSCALLS           set to 1 to collect strace syscall counts
   TNG_STORAGE_MATRIX_REPORT      report path override
 USAGE
 }
@@ -76,6 +77,7 @@ append_summary() {
   local log="$1"
   {
     grep -E 'tng_storage_(bench_path|file_pool|readahead|shuffled_baseline|elevator)' "$log" || true
+    grep -E 'tng_storage_syscalls' "$log" || true
     grep -E 'TorrentNG storage elevator wall-clock ratio|expected >=5x' "$log" || true
   } | sed 's/^/    /'
 }
@@ -88,6 +90,7 @@ append_summary() {
   echo "- Commit: $(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
   echo "- Blocks: ${TNG_STORAGE_BENCH_BLOCKS:-4096}"
   echo "- Hot reads: ${TNG_STORAGE_BENCH_READS:-10000}"
+  echo "- Syscall counts: ${TNG_STORAGE_SYSCALLS:-0}"
   echo
 } >"$OUT"
 
@@ -125,6 +128,7 @@ for target in "$@"; do
   if TNG_STORAGE_BENCH_BLOCKS="${TNG_STORAGE_BENCH_BLOCKS:-4096}" \
     TNG_STORAGE_BENCH_READS="${TNG_STORAGE_BENCH_READS:-10000}" \
     TNG_STORAGE_REQUIRE_5X="$require_5x" \
+    TNG_STORAGE_SYSCALLS="${TNG_STORAGE_SYSCALLS:-0}" \
     "$ROOT/scripts/storage_real_device_benchmark.sh" "$target" 2>&1 | tee "$log"; then
     echo "- Result: PASS" >>"$OUT"
   else

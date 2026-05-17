@@ -23,7 +23,9 @@ scripts/storage_hardware_matrix.sh /mnt/nvme /mnt/hdd
 
 The hardware matrix writes a markdown report under `certification/reports/`,
 prints topology for each target, and enforces the HDD elevator speedup gate
-when `TNG_STORAGE_REQUIRE_HDD_5X=1` is set.
+when `TNG_STORAGE_REQUIRE_HDD_5X=1` is set. Set
+`TNG_STORAGE_SYSCALLS=1` to include per-case syscall counters when `strace` is
+available.
 
 ## Automated Matrix
 
@@ -46,6 +48,7 @@ when `TNG_STORAGE_REQUIRE_HDD_5X=1` is set.
 | `TNG_STORAGE_DISK_THREADS` | positive integer | Sets dedicated backend worker count for the selected/fallback backend |
 | `TNG_STORAGE_FRAME_CAP_MB` | positive integer | Caps global storage frame memory; exhausted frames return queue/backpressure errors rather than unbounded allocation |
 | `TNG_STORAGE_HANDLE_IDLE_SECS` | positive integer | Controls idle cached-handle close latency |
+| `TNG_STORAGE_SYSCALLS` | `0`, `1` | Adds `strace` syscall counts to real-device hardware matrix summaries when available |
 | `[memory].*` | TOML config | Sets resource-governor total and class caps exposed through `/metrics` |
 
 ## Prometheus Checks

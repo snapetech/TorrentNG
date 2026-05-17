@@ -20,7 +20,8 @@ use rt_path::{SafeRelPath, StorageProfile, StorageRootId};
 use rt_piece_map::{FileSpan, PieceMap};
 use rt_session::TorrentEntry;
 use rt_storage::{
-    IoClass, MountScheduler, PreallocationMode, SchedulerConfig, StorageIoConfig, VerifyResult,
+    IoClass, MountScheduler, PreallocationMode, SchedulerConfig, StorageError, StorageIoConfig,
+    VerifyResult,
 };
 use rt_tracker::backoff::jitter_interval;
 use tower::ServiceExt;
@@ -389,7 +390,7 @@ async fn storage_hash_pool_does_not_block_peer_read_path() {
         let scheduler = scheduler.clone();
         hash_tasks.push(tokio::spawn(async move {
             let data = bytes::Bytes::from(vec![i as u8; 1024 * 1024]);
-            scheduler.hash_sha1(data).await.unwrap()
+            scheduler.hash_sha1(data).await
         }));
     }
 
@@ -402,13 +403,26 @@ async fn storage_hash_pool_does_not_block_peer_read_path() {
     .unwrap();
     assert_eq!(read.len(), 16 * 1024);
 
+    let mut hash_successes = 0;
+    let mut hash_backpressure = 0;
     for task in hash_tasks {
-        let hash = task.await.unwrap();
-        assert_ne!(hash, [0; 20]);
+        match task.await.unwrap() {
+            Ok(hash) => {
+                hash_successes += 1;
+                assert_ne!(hash, [0; 20]);
+            }
+            Err(StorageError::QueueFull { .. }) => {
+                hash_backpressure += 1;
+            }
+            Err(e) => panic!("unexpected hash error: {e}"),
+        }
     }
+    assert!(hash_successes > 0);
+    assert!(hash_backpressure > 0);
 
     let stats = scheduler.stats();
-    assert_eq!(stats.hash_ops, 8);
+    assert_eq!(stats.hash_ops, hash_successes);
+    assert!(stats.queue_full >= hash_backpressure);
     assert_eq!(stats.read_ops_by_class[IoClass::PeerRead as usize], 1);
 }
 

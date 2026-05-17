@@ -126,10 +126,11 @@ The following items are still implementation targets:
   in-memory piece assembly pressure.
 - Replace the worker-owned fixed-buffer copy path with true frame-pool slot
   pinning once the global frame pool can lease stable registered buffer indexes.
-- Extend the release hardware report with syscall counters and recheck runtime
-  progress. `scripts/storage_hardware_matrix.sh` already records real-device
-  seed-read locality and bounded hot-file descriptor reuse across one or more
-  target mounts.
+- Extend the release hardware report with recheck runtime progress.
+  `scripts/storage_hardware_matrix.sh` already records real-device seed-read
+  locality, bounded hot-file descriptor reuse, elevator throughput, and
+  optional syscall counts (`TNG_STORAGE_SYSCALLS=1`) across one or more target
+  mounts.
 
 ## Correctness Rules
 

@@ -27,6 +27,7 @@ fi
 echo "TorrentNG storage benchmark dir: $BENCH_DIR"
 echo "Backing source: ${source_dev:-unknown}"
 echo "Rotational flag: ${rota:-unknown}"
+echo "Syscall summary: ${TNG_STORAGE_SYSCALLS:-0}"
 
 cd "$ROOT"
 
@@ -40,10 +41,52 @@ trap 'rm -rf "$tmpdir"' EXIT
 run_case() {
   local name="$1"
   local log="$tmpdir/$name.log"
+  local trace="$tmpdir/$name.strace"
   echo
   echo "==> $name"
-  cargo test -p rt-storage --release --test storage_real_device "$name" -- --ignored --nocapture --test-threads=1 \
-    2>&1 | tee "$log"
+  if [[ "${TNG_STORAGE_SYSCALLS:-0}" == "1" && -x "$(command -v strace 2>/dev/null || true)" ]]; then
+    strace -f -qq \
+      -e trace=open,openat,close,read,write,pread64,pwrite64,fsync,fdatasync,fallocate,statx \
+      -o "$trace" \
+      cargo test -p rt-storage --release --test storage_real_device "$name" -- --ignored --nocapture --test-threads=1 \
+      2>&1 | tee "$log"
+    summarize_syscalls "$name" "$trace"
+  else
+    if [[ "${TNG_STORAGE_SYSCALLS:-0}" == "1" ]]; then
+      echo "tng_storage_syscalls case=$name unavailable=strace-not-found"
+    fi
+    cargo test -p rt-storage --release --test storage_real_device "$name" -- --ignored --nocapture --test-threads=1 \
+      2>&1 | tee "$log"
+  fi
+}
+
+summarize_syscalls() {
+  local name="$1"
+  local trace="$2"
+  [[ -s "$trace" ]] || {
+    echo "tng_storage_syscalls case=$name unavailable=empty-trace"
+    return
+  }
+  awk -v case_name="$name" '
+    {
+      line = $0
+      sub(/^[0-9]+[[:space:]]+/, "", line)
+      if (line ~ /^[a-zA-Z0-9_]+\(/) {
+        syscall = line
+        sub(/\(.*/, "", syscall)
+        calls[syscall]++
+        if (line ~ / = -1 /) {
+          errors[syscall]++
+        }
+      }
+    }
+    END {
+      for (syscall in calls) {
+        printf "tng_storage_syscalls case=%s syscall=%s calls=%d errors=%d\n",
+          case_name, syscall, calls[syscall], errors[syscall] + 0
+      }
+    }
+  ' "$trace" | sort
 }
 
 elapsed_ms() {
