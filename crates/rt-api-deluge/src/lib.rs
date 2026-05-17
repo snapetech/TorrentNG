@@ -873,6 +873,14 @@ fn deluge_torrent(
         .and_then(|meta| meta.trackers.first())
         .cloned()
         .unwrap_or_default();
+    let message = entry.error_message.clone().unwrap_or_default();
+    let tracker_status = if entry.state.as_str() == "error" && !message.is_empty() {
+        format!("Error: {message}")
+    } else if tracker.is_empty() {
+        String::new()
+    } else {
+        "Announce OK".to_owned()
+    };
     json!({
         "hash": entry.info_hash,
         "name": entry.name,
@@ -922,10 +930,10 @@ fn deluge_torrent(
         "owner": "localclient",
         "shared": false,
         "tracker_host": tracker_host(&tracker),
-        "tracker_status": "",
+        "tracker_status": tracker_status,
         "tracker": tracker,
         "comment": "",
-        "message": "",
+        "message": message,
     })
 }
 
@@ -1571,6 +1579,7 @@ mod tests {
             entry.completed_at = Some(200);
             entry.category = Some("movies".into());
             entry.tags = vec!["hd".into()];
+            entry.set_error("disk full");
             entry.stats.add_download(75);
             entry.stats.add_upload(150);
             reg.add(entry).unwrap();
@@ -1597,6 +1606,9 @@ mod tests {
         assert!(body["result"]["active_time"].as_i64().unwrap() > 0);
         assert!(body["result"]["seeding_time"].as_i64().unwrap() > 0);
         assert_eq!(body["result"]["finished_time"], 200);
+        assert_eq!(body["result"]["state"], "Error");
+        assert_eq!(body["result"]["message"], "disk full");
+        assert_eq!(body["result"]["tracker_status"], "Error: disk full");
         assert_json_keys(
             &body["result"],
             &[

@@ -86,7 +86,7 @@ impl Default for StorageIoConfig {
             preallocation_mode: PreallocationMode::Auto,
             durability_mode: DurabilityMode::Checkpoint,
             peer_read_readahead_bytes: 512 * 1024,
-            peer_read_elevator_budget_ms: 10,
+            peer_read_elevator_budget_ms: 25,
         }
     }
 }
@@ -580,13 +580,28 @@ async fn peer_read_elevator_worker(
     counters: Arc<StorageCounters>,
 ) {
     while let Some(first) = receiver.recv().await {
-        if !budget.is_zero() {
-            tokio::time::sleep(budget).await;
-        }
-
         let mut requests = vec![first];
         while let Ok(request) = receiver.try_recv() {
             requests.push(request);
+        }
+        if !budget.is_zero() {
+            let deadline = Instant::now() + budget;
+            let quiet_slice = budget.min(Duration::from_millis(1));
+            loop {
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    break;
+                };
+                let wait = quiet_slice.min(remaining);
+                match tokio::time::timeout(wait, receiver.recv()).await {
+                    Ok(Some(request)) => {
+                        requests.push(request);
+                        while let Ok(request) = receiver.try_recv() {
+                            requests.push(request);
+                        }
+                    }
+                    Ok(None) | Err(_) => break,
+                }
+            }
         }
 
         let batches = peer_read_batches(requests);
@@ -1891,5 +1906,39 @@ mod tests {
             stats.peer_read_elevator_coalesced_requests > 0,
             "expected elevator to coalesce requests; stats={stats:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hdd_peer_read_elevator_dispatches_after_quiet_slice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quiet-elevator.bin");
+        std::fs::write(&path, vec![42_u8; 4096]).unwrap();
+        let sched = MountScheduler::new(
+            StorageRootId::new(),
+            &SchedulerConfig {
+                profile: StorageProfile::Hdd,
+                storage_io: StorageIoConfig {
+                    peer_read_readahead_bytes: 0,
+                    peer_read_elevator_budget_ms: 250,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let started = Instant::now();
+        let bytes = sched
+            .read_at(IoClass::PeerRead, &path, 0, 4096)
+            .await
+            .unwrap();
+
+        assert_eq!(bytes.len(), 4096);
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "single peer read should not wait the full elevator budget"
+        );
+        let stats = sched.stats();
+        assert_eq!(stats.peer_read_elevator_batches, 1);
+        assert_eq!(stats.peer_read_elevator_coalesced_requests, 0);
     }
 }

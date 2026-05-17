@@ -146,7 +146,7 @@ shippable and benchmarkable.
 - [x] Topology-derived preallocation policy (`fallocate` on rotational non-CoW only).
 - [x] Bench/proxy: real-device adjacent peer-read readahead reduces backend reads ≥5x on NVMe and HDD.
 - [x] Bench/proxy: HDD shuffled peer-read elevator reduces backend reads ≥5x on same dataset.
-- [ ] Bench/tune: HDD shuffled peer-read wall-clock throughput ≥5× non-elevator baseline on same dataset.
+- [x] Bench/tune: HDD shuffled peer-read wall-clock throughput ≥5× non-elevator baseline on same dataset.
 
 ### Phase C — tiered torrents (scale unlock)
 

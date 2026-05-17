@@ -207,7 +207,7 @@ Deluge torrent status field matrix:
 | Peers/seeds | `num_peers`, `num_seeds`, `total_peers`, `total_seeds`, distributed copies | Placeholder |
 | Trackers | `tracker`, `tracker_host`, `tracker_status`, `next_announce` | Partial |
 | Options | max speeds, auto managed, stop ratio, move completed, sequential, super seeding, first/last | Compat/native for speed, auto-managed, stop ratio, move-completed, sequential, super seeding, first/last |
-| Messages | `comment`, `message`, `private` | Partial |
+| Messages | `comment`, `message`, `private` | Compat/native for error message and private flag; torrent comments remain placeholder |
 
 ## 6. rTorrent XMLRPC Matrix
 
