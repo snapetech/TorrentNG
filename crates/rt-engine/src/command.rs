@@ -4,7 +4,7 @@ use std::{net::SocketAddr, path::PathBuf};
 use tokio::sync::oneshot;
 
 use rt_metainfo::{MagnetLink, TorrentMeta};
-use rt_metrics::ResourceSnapshot;
+use rt_metrics::{MemoryClass, MemoryLease, ResourceSnapshot};
 use rt_storage::{StorageIoStats, STORAGE_LATENCY_BUCKET_COUNT};
 
 use crate::TorrentActivityTier;
@@ -563,6 +563,12 @@ pub enum EngineCmd {
     /// Snapshot runtime and durable metrics.
     GetStats {
         reply: oneshot::Sender<CmdResult<EngineStats>>,
+    },
+    /// Reserve governor-managed memory for bounded API materialization.
+    ReserveMemory {
+        class: MemoryClass,
+        bytes: u64,
+        reply: oneshot::Sender<CmdResult<Option<MemoryLease>>>,
     },
     /// Structured diagnostic for why a torrent is not seeding.
     DiagnoseTorrent {

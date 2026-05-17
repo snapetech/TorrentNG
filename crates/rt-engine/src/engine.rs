@@ -273,6 +273,23 @@ impl EngineHandle {
         rx.await.map_err(|_| "engine dropped reply".to_owned())?
     }
 
+    pub async fn reserve_memory(
+        &self,
+        class: MemoryClass,
+        bytes: u64,
+    ) -> CmdResult<Option<rt_metrics::MemoryLease>> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(EngineCmd::ReserveMemory {
+                class,
+                bytes,
+                reply,
+            })
+            .await
+            .map_err(|_| "engine shut down".to_owned())?;
+        rx.await.map_err(|_| "engine dropped reply".to_owned())?
+    }
+
     pub async fn diagnose_torrent(&self, info_hash: String) -> CmdResult<TorrentDiagnostic> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx
@@ -966,6 +983,14 @@ impl Engine {
             EngineCmd::GetStats { reply } => {
                 let result = self.engine_stats().await;
                 let _ = reply.send(result);
+            }
+
+            EngineCmd::ReserveMemory {
+                class,
+                bytes,
+                reply,
+            } => {
+                let _ = reply.send(Ok(self.resources.try_acquire(class, bytes)));
             }
 
             EngineCmd::DiagnoseTorrent { info_hash, reply } => {

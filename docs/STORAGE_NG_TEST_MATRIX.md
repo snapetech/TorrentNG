@@ -42,7 +42,7 @@ the ignored real-device probes.
 | Metric | Expected proof |
 | --- | --- |
 | `torrentng_storage_backend_selected{backend=...}` | Exactly one active backend sample with value `1` |
-| `torrentng_storage_backend_fixed_buffers_supported` | `0` for current `pread` and basic `uring`; becomes `1` only when registered fixed buffers are active |
+| `torrentng_storage_backend_fixed_buffers_supported` | `0` for `pread`; `1` for `uring` when the kernel accepts registered worker buffers |
 | `torrentng_storage_file_pool_*` | fd pool remains bounded and records hit/miss/eviction/idle-close activity |
 | `torrentng_storage_peer_read_elevator_*` | HDD peer-read queueing, batching, and coalescing are visible |
 | `torrentng_storage_sparse_*` | recheck reports sparse data extents, skipped holes, and fallback count |
@@ -72,5 +72,5 @@ STORAGE_NG_REAL_DEVICE=1 TNG_STORAGE_BENCH_DIR=/mnt/target scripts/storage_ng_fe
   claiming production storage performance.
 - `clean_shutdown = true` is only trusted when the configured durability mode
   completed its storage sync requirement.
-- `UringBackend` remains listed as partially complete until registered fds,
-  fixed buffers, and batched submit/completion are implemented and benchmarked.
+- `UringBackend` remains a tuning target until worker-owned fixed buffers are
+  replaced by true frame-pool slot pinning and benchmarked on real hardware.

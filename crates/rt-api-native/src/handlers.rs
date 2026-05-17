@@ -15,6 +15,7 @@ use rt_api_model::{
     AddTorrentRequest, AddTorrentResponse, ApiError, FileInfo, TorrentDetail, TorrentSummary,
 };
 use rt_metainfo::{parse_magnet, parse_torrent};
+use rt_metrics::MemoryClass;
 use rt_session::{TorrentEntry, TorrentState};
 use rt_storage::{runtime::StorageRuntime, STORAGE_LATENCY_BUCKETS_NS};
 
@@ -22,9 +23,40 @@ use crate::state::AppState;
 
 /// `GET /api/v1/torrents` — list all torrents.
 pub async fn list_torrents(State(state): State<AppState>) -> impl IntoResponse {
+    if let Some(engine) = &state.engine {
+        let torrent_count = state.registry.read().await.iter().count();
+        let estimate = estimate_torrent_summary_snapshot_bytes(torrent_count);
+        match engine.reserve_memory(MemoryClass::ApiSnapshot, estimate).await {
+            Ok(Some(_lease)) => {
+                let reg = state.registry.read().await;
+                let summaries: Vec<TorrentSummary> = reg.iter().map(torrent_summary).collect();
+                return (StatusCode::OK, Json(summaries)).into_response();
+            }
+            Ok(None) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(
+                        serde_json::to_value(ApiError::internal(
+                            "api snapshot memory budget exhausted".to_owned(),
+                        ))
+                        .unwrap(),
+                    ),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::to_value(ApiError::internal(e)).unwrap()),
+                )
+                    .into_response();
+            }
+        }
+    }
+
     let reg = state.registry.read().await;
     let summaries: Vec<TorrentSummary> = reg.iter().map(torrent_summary).collect();
-    (StatusCode::OK, Json(summaries))
+    (StatusCode::OK, Json(summaries)).into_response()
 }
 
 /// `POST /api/v1/torrents` — add a v1/hybrid `.torrent` from base64 JSON.
@@ -516,6 +548,12 @@ async fn torrent_delta(state: &AppState, previous: &BTreeMap<String, String>) ->
         torrents,
         removed,
     }
+}
+
+fn estimate_torrent_summary_snapshot_bytes(torrent_count: usize) -> u64 {
+    // Conservative enough to cover Vec growth and cloned strings for typical
+    // summaries without letting a huge API snapshot bypass governor pressure.
+    (torrent_count as u64).saturating_mul(1024)
 }
 
 fn torrent_summary(e: &TorrentEntry) -> TorrentSummary {

@@ -72,9 +72,10 @@ semaphores:
 - `rt-storage::StorageRuntime` now has a probe-selected backend layer:
   `TNG_STORAGE_BACKEND=auto|pread|uring` chooses between the portable
   positioned-I/O worker pool and Linux `io_uring` positioned reads, writes,
-  and data sync. Kernels or containers that reject `io_uring` fall back to
-  `pread` with an explicit diagnostic reason instead of silently changing
-  behavior.
+  and data sync. The uring worker registers file slots and worker-owned fixed
+  buffers when the kernel accepts them. Kernels or containers that reject
+  `io_uring` fall back to `pread` with an explicit diagnostic reason instead
+  of silently changing behavior.
 - `IoClass::PeerRead` uses a small internal readahead cache when configured:
   the backend may read ahead within the same file, but callers receive exactly
   the requested byte range.
@@ -112,8 +113,8 @@ The following items are still implementation targets:
   read/write/sync/hash work, along with file-pool activity, queue depth, dirty
   files, sync/hash/preallocate counters, peer-read cache counters, logical and
   backend read counters, and in-memory piece assembly pressure.
-- Extend the Linux `UringBackend` with registered fixed buffers once the global
-  frame pool can lease stable buffer slot indexes.
+- Replace the worker-owned fixed-buffer copy path with true frame-pool slot
+  pinning once the global frame pool can lease stable registered buffer indexes.
 - Add benchmarks comparing syscall count, seed-read locality, recheck runtime
   progress, and bounded descriptor use under active file counts above pool
   capacity.
