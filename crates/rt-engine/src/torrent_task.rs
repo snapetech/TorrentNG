@@ -767,9 +767,12 @@ impl TorrentTask {
                 }
                 Err(err) => {
                     warn!(
+                        component = "tracker",
+                        operation = "announce",
                         torrent = %self.info_hash_hex,
                         tracker = %url,
-                        err = %err,
+                        result = "error",
+                        error = %err,
                         "tracker announce failed"
                     );
                     self.tracker_tiers[tier_idx][idx].on_failure(err);
@@ -798,9 +801,12 @@ impl TorrentTask {
                     }
                     Err(err) => {
                         warn!(
+                            component = "tracker",
+                            operation = "announce_stopped",
                             torrent = %self.info_hash_hex,
                             tracker = %url,
-                            err = %err,
+                            result = "error",
+                            error = %err,
                             "tracker stopped announce failed"
                         );
                         self.tracker_tiers[tier_idx][idx].on_failure(err);
@@ -1263,11 +1269,14 @@ impl TorrentTask {
                         }
                     }
                     warn!(
+                        component = "webseed",
+                        operation = "fetch_block",
                         torrent = %self.info_hash_hex,
                         webseed = %self.meta.webseeds[idx],
                         piece = req.piece,
                         offset = req.begin,
-                        err = %err,
+                        result = "error",
+                        error = %err,
                         "webseed block fetch failed"
                     );
                 }
@@ -1533,10 +1542,13 @@ impl TorrentTask {
         let aggregate_piece_write = self.can_aggregate_piece_write(piece);
         if let Err(e) = self.record_piece_block(&block) {
             warn!(
+                component = "torrent",
+                operation = "assemble_piece",
                 torrent = %self.info_hash_hex,
                 piece,
                 offset = block.offset,
-                err = %e,
+                result = "error",
+                error = %e,
                 "failed to assemble in-memory piece for verification"
             );
             self.remove_piece_assembly(piece);
@@ -1546,10 +1558,13 @@ impl TorrentTask {
         if !aggregate_piece_write {
             if let Err(e) = self.write_block(&block).await {
                 warn!(
+                    component = "storage",
+                    operation = "write_block",
                     torrent = %self.info_hash_hex,
                     piece,
                     offset = block.offset,
-                    err = %e,
+                    result = "error",
+                    error = %e,
                     "block write failed"
                 );
                 self.remove_piece_assembly(piece);
@@ -1567,9 +1582,12 @@ impl TorrentTask {
                     if aggregate_piece_write {
                         if let Err(e) = self.write_completed_piece(block.piece).await {
                             warn!(
+                                component = "storage",
+                                operation = "write_completed_piece",
                                 piece = block.piece,
                                 torrent = %self.info_hash_hex,
-                                err = %e,
+                                result = "error",
+                                error = %e,
                                 "completed piece write failed"
                             );
                             self.picker.reject_piece(block.piece as usize);
@@ -1719,8 +1737,11 @@ impl TorrentTask {
         let db = self.db.lock().expect("database mutex poisoned");
         if let Err(e) = rt_db::upsert(&db, &row) {
             warn!(
+                component = "db",
+                operation = "persist_transfer_stats",
                 torrent = %self.info_hash_hex,
-                err = %e,
+                result = "error",
+                error = %e,
                 "failed to persist transfer stats"
             );
         }
@@ -1765,8 +1786,11 @@ impl TorrentTask {
         let mut db = self.db.lock().expect("database mutex poisoned");
         if let Err(e) = rt_db::replace_torrent_trackers(&mut db, &self.info_hash_hex, &rows) {
             warn!(
+                component = "db",
+                operation = "persist_tracker_state",
                 torrent = %self.info_hash_hex,
-                err = %e,
+                result = "error",
+                error = %e,
                 "failed to persist tracker state"
             );
         }
@@ -2038,8 +2062,11 @@ impl TorrentTask {
             }
             Err(e) => {
                 warn!(
+                    component = "fastresume",
+                    operation = "load",
                     torrent = %self.info_hash_hex,
-                    err = %e,
+                    result = "error",
+                    error = %e,
                     "failed to load fastresume state"
                 );
                 return false;
@@ -2048,8 +2075,11 @@ impl TorrentTask {
 
         if let Err(e) = state.validate(&self.meta.info_hash, self.meta.pieces.len() as u32) {
             warn!(
+                component = "fastresume",
+                operation = "validate",
                 torrent = %self.info_hash_hex,
-                err = %e,
+                result = "error",
+                error = %e,
                 "discarding incompatible fastresume state"
             );
             return false;
@@ -2087,8 +2117,11 @@ impl TorrentTask {
             }
             Err(e) => {
                 warn!(
+                    component = "fastresume",
+                    operation = "collect_file_hints",
                     torrent = %self.info_hash_hex,
-                    err = %e,
+                    result = "error",
+                    error = %e,
                     "could not collect file hints for fastresume"
                 );
                 return false;
@@ -2477,8 +2510,11 @@ impl TorrentTask {
             Ok(hints) => hints,
             Err(e) => {
                 warn!(
+                    component = "fastresume",
+                    operation = "collect_file_hints",
                     torrent = %self.info_hash_hex,
-                    err = %e,
+                    result = "error",
+                    error = %e,
                     "failed to collect fastresume file hints"
                 );
                 Vec::new()
@@ -2493,8 +2529,11 @@ impl TorrentTask {
 
         if let Err(e) = self.fastresume.save(&state) {
             warn!(
+                component = "fastresume",
+                operation = "save",
                 torrent = %self.info_hash_hex,
-                err = %e,
+                result = "error",
+                error = %e,
                 "failed to save fastresume state"
             );
         }
@@ -2508,8 +2547,11 @@ impl TorrentTask {
                     Ok(()) => true,
                     Err(e) => {
                         warn!(
+                            component = "storage",
+                            operation = "sync_before_fastresume",
                             torrent = %self.info_hash_hex,
-                            err = %e,
+                            result = "error",
+                            error = %e,
                             "failed to sync torrent files before clean fastresume save"
                         );
                         false
@@ -2959,11 +3001,14 @@ async fn run_peer_loop(
                                 }
                                 Err(e) => {
                                     warn!(
+                                        component = "peer",
+                                        operation = "read_upload_block",
                                         peer = %addr,
                                         piece,
                                         begin,
                                         length,
-                                        err = %e,
+                                        result = "error",
+                                        error = %e,
                                         "failed to read upload block"
                                     );
                                 }
