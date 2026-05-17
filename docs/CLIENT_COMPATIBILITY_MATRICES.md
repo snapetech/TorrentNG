@@ -44,7 +44,7 @@ Status legend:
 | Categories/labels/tags | categories, tags | labels | Label plugin | custom fields | Native category/tags model | Label/category import and API mutation rows |
 | Trackers | list/add/edit/remove | tracker list mutation, tracker_stats | set_torrent_trackers | tracker commands | Native metadata mutation; stats partially projected | Tracker add/edit/remove and stats row |
 | Peers | addPeers, torrentPeers | peers fields | connect_peer | peer commands | Add/connect peer hooks; peer projection partial | Explicit peer private torrent row |
-| Web seeds | webseeds read | webseeds/webseeds_ex | file/web seed via libtorrent state | supported through metainfo | Read projection; `webseeds_ex` gap | Webseed-only transfer and webseed projection row |
+| Web seeds | webseeds read | webseeds/webseeds_ex | file/web seed via libtorrent state | supported through metainfo | Read projection implemented; live webseed activity counters are placeholders | Webseed-only transfer and webseed projection row |
 | Global speed limits | transfer limits | session limits | config/options speed limits | throttle commands | Native global limits through qBit/Transmission; Deluge compat | Set/read speed limits through each facade |
 | Per-torrent speed limits | torrent limit endpoints | torrent_set limits | set_torrent_options | throttle commands | Partial | Per-torrent limit mutation and projection row |
 | Sequential/first-last | qBit toggles | 4.1 sequential fields | options/prioritize first-last | client-specific | Accepted/no-op or partial | Assert accepted; add native support if scheduler implements |
@@ -125,18 +125,18 @@ Transmission `torrent_get` field matrix:
 | Field bucket | Upstream fields | rtorrentNG status |
 |---|---|---|
 | Identity | `id`, `hash_string`, `name`, `magnet_link`, `metadata_percent_complete`, `is_private` | Native/Compat |
-| Size/progress | `total_size`, `left_until_done`, `percent_complete`, `percent_done`, `size_when_done`, `have_valid`, `have_unchecked`, `desired_available`, `bytes_completed`, `availability`, `pieces`, `piece_count`, `piece_size` | Partial; `bytes_completed` and `availability` gap |
-| State/dates | `status`, `error`, `error_string`, `eta`, `eta_idle`, `is_finished`, `is_stalled`, `recheck_progress`, `activity_date`, `added_date`, `done_date`, `start_date`, `date_created`, `seconds_downloading`, `seconds_seeding` | Partial; `eta_idle` gap |
+| Size/progress | `total_size`, `left_until_done`, `percent_complete`, `percent_done`, `size_when_done`, `have_valid`, `have_unchecked`, `desired_available`, `bytes_completed`, `availability`, `pieces`, `piece_count`, `piece_size` | Partial; implemented with compatibility placeholders where native availability depth is unavailable |
+| State/dates | `status`, `error`, `error_string`, `eta`, `eta_idle`, `is_finished`, `is_stalled`, `recheck_progress`, `activity_date`, `added_date`, `done_date`, `start_date`, `date_created`, `seconds_downloading`, `seconds_seeding` | Partial; implemented with compatibility placeholders for ETA/recheck |
 | Counters/ratio | `downloaded_ever`, `uploaded_ever`, `upload_ratio`, `corrupt_ever` | Native/Compat |
 | Rates/limits | `rate_download`, `rate_upload`, `download_limit`, `download_limited`, `upload_limit`, `upload_limited`, `bandwidth_priority`, `honors_session_limits`, `max_connected_peers` | Partial/placeholder |
 | Seed limits | `seed_ratio_limit`, `seed_ratio_mode`, `seed_idle_limit`, `seed_idle_mode` | Compat placeholder |
 | Files | `files`, `file_stats`, `priorities`, `wanted` | Native/Partial |
-| Peers | `peers`, `peers_connected`, `peers_from`, `peers_getting_from_us`, `peers_sending_to_us` | Partial; `peers_from` gap |
+| Peers | `peers`, `peers_connected`, `peers_from`, `peers_getting_from_us`, `peers_sending_to_us` | Partial; `peers_from` shape implemented with best-effort counts |
 | Trackers | `trackers`, `tracker_stats` including announce/scrape states and counts | Partial; detailed states/counts gap |
-| Web seeds | `webseeds`, `webseeds_sending_to_us`, `webseeds_ex` | Partial; `webseeds_ex` gap |
-| Queue/group | `queue_position`, `group` | Partial; `group` gap |
-| Comments/creator | `comment`, `creator`, `primary_mime_type` | Partial; `primary_mime_type` gap |
-| Sequential | `sequential_download`, `sequential_download_from_piece` | Gap/accepted only where added later |
+| Web seeds | `webseeds`, `webseeds_sending_to_us`, `webseeds_ex` | Partial; `webseeds_ex` shape implemented with activity placeholders |
+| Queue/group | `queue_position`, `group` | Partial; default group compatibility implemented |
+| Comments/creator | `comment`, `creator`, `primary_mime_type` | Partial; primary MIME type compatibility implemented as empty string |
+| Sequential | `sequential_download`, `sequential_download_from_piece` | Compatibility placeholders implemented |
 
 Transmission `session_get` field matrix:
 
@@ -164,7 +164,7 @@ Local implementation: `crates/rt-api-deluge`.
 | Web torrent helpers | `web.add_torrents`, `download_torrent_from_url`, `get_torrent_files`, `update_ui`, `get_events` | Partial; URL download/add_torrents gap | Web add and update row |
 | Web config/plugins | `web.get_config`, `update_config`, `save_config`, plugins | Partial | Web config row |
 | Core session | `core.get_session_status`, stats/rates/connections, filter tree, cache status, config values | Native/Compat | Session/status/config rows |
-| Core torrent reads | `get_torrents_status`, `get_torrent_status`, `get_torrent_file_status`, `get_session_state` | Native/Partial; key filtering gap | Requested-key filter row |
+| Core torrent reads | `get_torrents_status`, `get_torrent_status`, `get_torrent_file_status`, `get_session_state` | Native/Partial; requested-key filtering implemented | Requested-key filter row |
 | Core lifecycle | add file/magnet, pause/resume, force_recheck, remove | Native | Lifecycle rows |
 | Core mutation | set options, priorities, trackers, queue, move, rename, connect_peer | Native/Partial | Mutation rows |
 | Label plugin | label list/add/remove/options/set_torrent | Native/Compat | Label plugin row |
@@ -222,8 +222,6 @@ covered today as an import source and as an interop peer.
 | P0 | Add automated endpoint/method enumeration tests for qBit, Transmission, and Deluge | Implemented in `rt-api-qbit`, `rt-api-transmission`, and `rt-api-deluge` unit tests |
 | P0 | Add all-field response tests for qBit `torrents/info`, `properties`, `sync/maindata`; Transmission `torrent_get` and `session_get`; Deluge torrent status | Implemented in facade unit tests for currently supported fields |
 | P0 | Expand Transmission 4.1 JSON-RPC envelope support, semver header, `format=table`, and `recently_active` handling | Transmission API matrix |
-| P0 | Fill Transmission field gaps: `availability`, `bytes_completed`, `peers_from`, `webseeds_ex`, `eta_idle`, `group`, `primary_mime_type`, sequential fields | Transmission field matrix |
-| P1 | Make Deluge `get_torrents_status` and `get_torrent_status` honor requested field lists | Deluge API matrix |
 | P1 | Add Deluge web host/config helper gaps: `add_host`, `edit_host`, `remove_host`, `get_config`, `download_torrent_from_url`, `add_torrents` | Deluge API matrix |
 | P1 | Broaden qBittorrent preference and property projections to all documented keys | qBit field backlog |
 | P1 | Build golden fixture corpus for qBit, Transmission, Deluge, uTorrent, BiglyBT/Vuze, Tixati, rTorrent | Import matrix |

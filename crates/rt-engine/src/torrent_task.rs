@@ -1193,6 +1193,9 @@ impl TorrentTask {
                     self.picker.cancel_request(req.piece as usize, req.begin);
                 }
                 self.active_peers.remove(&peer);
+                if self.active_peers.is_empty() {
+                    self.piece_assemblies.clear();
+                }
             }
             PeerEvent::RequestTimedOut { peer, timed_out } => {
                 if let Some(handle) = self.active_peers.get_mut(&peer) {
@@ -1400,6 +1403,7 @@ impl TorrentTask {
             let _ = tx.send(PeerCommand::Shutdown).await;
         }
         self.active_peers.clear();
+        self.piece_assemblies.clear();
     }
 
     async fn record_download(&self, bytes: u64) {

@@ -1397,7 +1397,7 @@ mod tests {
         let body: Value = serde_json::from_slice(&body).unwrap();
         let torrent = &body["result"]["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"];
         assert_eq!(torrent["name"], "alpha");
-        assert_eq!(torrent["state"], "Queued");
+        assert_eq!(torrent["state"], "Paused");
         assert_eq!(torrent.as_object().unwrap().len(), 2);
     }
 

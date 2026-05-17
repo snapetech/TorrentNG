@@ -83,7 +83,7 @@ Local surface: `crates/rt-api-transmission`.
 | Torrent reads | `torrent_get` common fields: identity, status, size/progress, counters, labels, paths, files, file stats, trackers, tracker stats, peers, queue, dates, private flag, magnet link | Implemented |
 | Torrent writes | `torrent_set`, tracker list, file priorities, wanted/unwanted, location, rename path | Implemented where native engine supports it; accepted as no-op otherwise |
 | Utility | `port_test`, `blocklist_update`, `free_space` | Implemented as compatibility responses |
-| Remaining field depth | availability, bytes_completed bitsets, group internals, peers_from, primary_mime_type, webseeds_ex, detailed session script/blocklist/preferred transport settings | Gap or compatibility placeholder |
+| Remaining field depth | detailed availability depth, group internals, live webseed activity, detailed session script/blocklist/preferred transport settings | Gap or compatibility placeholder |
 
 ## Deluge JSON-RPC Facade
 
@@ -106,9 +106,7 @@ Local surface: `crates/rt-api-deluge`.
 
 | Priority | Work item | Why |
 |---|---|---|
-| High | Expand Transmission `torrent_get` placeholders for `availability`, `bytes_completed`, `peers_from`, `webseeds_ex`, and `eta_idle` | Common modern RPC fields requested by remote clients |
-| High | Add tests that enumerate advertised facade methods and assert every advertised method returns a compatibility-shaped response | Prevents method-list drift |
-| Medium | Make Deluge `core.get_torrents_status` honor requested key filters | Reduces payload and matches Deluge client expectations |
+| Done | Add tests that enumerate advertised facade methods and assert every advertised method returns a compatibility-shaped response | Prevents method-list drift |
 | Medium | Add qBittorrent preference-key breadth for modern WebUI clients | Avoids settings panes seeing absent keys |
 | Medium | Import scheduler/RSS/search metadata as auxiliary migration artifacts | Useful for full client migration, not required for torrent progress |
 | Low | Proprietary client deep parsers for Tixati/BiglyBT plugin-only fields | Needs fixture corpus; progress import already uses generic verified paths |
