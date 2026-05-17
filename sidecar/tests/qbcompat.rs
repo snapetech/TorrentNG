@@ -2569,7 +2569,7 @@ async fn api_responses_echo_safe_request_id() {
 
 #[tokio::test]
 async fn qb_set_preferences_validates_json() {
-    let (addr, client) = spawn_server().await;
+    let (addr, client, db) = spawn_server_with_db().await;
 
     let res = client
         .post(url(addr, "/api/qb/v2/app/setPreferences"))
@@ -2586,4 +2586,20 @@ async fn qb_set_preferences_validates_json() {
         .await
         .unwrap();
     assert_eq!(res.status(), 400);
+
+    let res = client
+        .post(url(addr, "/api/qb/v2/app/setPreferences"))
+        .form(&[(
+            "json",
+            r#"{"network_http_user_agent":"TorrentNG-Test/1.0"}"#,
+        )])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    let events = db.list_app_events(10).unwrap();
+    assert_eq!(events[0].kind, "rtorrent_user_agent_error");
+    assert_eq!(events[0].level, "warn");
+    assert!(!events[0].payload.contains("TorrentNG-Test/1.0"));
 }

@@ -622,13 +622,41 @@ async fn app_set_preferences(
         .get("network_http_user_agent")
         .and_then(|v| v.as_str())
     {
-        if let Err(e) = s.rt.set_user_agent(ua).await {
-            tracing::warn!(
-                component = "qbcompat",
-                operation = "set_user_agent",
-                error = %e,
-                "qBit user-agent preference update failed"
-            );
+        match s.rt.set_user_agent(ua).await {
+            Ok(_) => record_operator_event(
+                &s,
+                "info",
+                "settings_changed",
+                "qBittorrent preferences updated rTorrent user agent",
+                serde_json::json!({
+                    "component": "qbcompat",
+                    "operation": "set_preferences",
+                    "setting": "network_http_user_agent",
+                    "result": "updated",
+                    "user_agent_len": ua.len(),
+                }),
+            ),
+            Err(e) => {
+                tracing::warn!(
+                    component = "qbcompat",
+                    operation = "set_user_agent",
+                    error = %e,
+                    "qBit user-agent preference update failed"
+                );
+                record_operator_event(
+                    &s,
+                    "warn",
+                    "rtorrent_user_agent_error",
+                    "qBittorrent preference update could not apply rTorrent user agent",
+                    serde_json::json!({
+                        "component": "qbcompat",
+                        "operation": "set_preferences",
+                        "setting": "network_http_user_agent",
+                        "result": "error",
+                        "error": e.to_string(),
+                    }),
+                );
+            }
         }
     }
 
@@ -1984,11 +2012,37 @@ fn record_app_event(s: &AppState, event: &Event) {
     let Some((kind, message, payload)) = app_event_projection(event) else {
         return;
     };
+    append_operator_event(s, "info", kind, message, payload);
+}
+
+fn record_operator_event(
+    s: &AppState,
+    level: &str,
+    kind: &str,
+    message: &str,
+    payload: serde_json::Value,
+) {
+    append_operator_event(
+        s,
+        level,
+        kind.to_owned(),
+        message.to_owned(),
+        payload.to_string(),
+    );
+}
+
+fn append_operator_event(
+    s: &AppState,
+    level: &str,
+    kind: String,
+    message: String,
+    payload: String,
+) {
     if let Err(e) = s.db.append_app_event(
         &AppEventRow {
             event_id: None,
             occurred_at: chrono::Utc::now().timestamp(),
-            level: "info".to_owned(),
+            level: level.to_owned(),
             kind,
             message,
             payload,
