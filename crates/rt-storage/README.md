@@ -34,8 +34,9 @@ scheduler used by the native engine.
   `TNG_STORAGE_BACKEND=auto|pread|uring` to request a backend. `auto` currently
   selects the conservative portable worker-pool baseline, `pread` requests that
   baseline explicitly, and `uring` uses Linux `io_uring` positioned SQEs when
-  the kernel allows it, registers per-ring file slots and worker-owned fixed
-  buffers when accepted, and falls back with a diagnostic when it cannot.
+  the kernel allows it, keeps stable per-worker fixed-file slots by file
+  identity, registers worker-owned fixed buffers when accepted, and falls back
+  with a diagnostic when it cannot.
 
 ## Correctness Expectations
 

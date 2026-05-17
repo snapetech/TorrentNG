@@ -85,8 +85,9 @@ class semaphores:
   and data sync. `auto` currently selects the conservative `pread` baseline;
   `uring` must be requested explicitly while correctness and hardware
   benchmarks mature. Both backend implementations use bounded internal queues
-  and fail closed when saturated. The uring worker registers file slots and
-  worker-owned fixed buffers when the kernel accepts them. Kernels or
+  and fail closed when saturated. The uring worker keeps a stable per-worker
+  fixed-file table keyed by file identity and registers worker-owned fixed
+  buffers when the kernel accepts them. Kernels or
   containers that reject `io_uring` fall back to `pread` with an explicit
   diagnostic reason instead of silently changing behavior. Direct backend
   probes remain available for hardware certification and capability metrics.
