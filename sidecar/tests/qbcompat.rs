@@ -2535,6 +2535,39 @@ async fn native_logs_returns_filtered_app_events() {
 }
 
 #[tokio::test]
+async fn api_responses_echo_safe_request_id() {
+    let (addr, client) = spawn_server().await;
+
+    let res = client
+        .get(url(addr, "/api/qb/v2/app/version"))
+        .header("x-request-id", "arr-client-42.trace/7")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(
+        res.headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("arr-client-42.trace/7")
+    );
+
+    let res = client
+        .get(url(addr, "/api/qb/v2/app/version"))
+        .header("x-request-id", "bad value")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let generated = res
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap();
+    assert!(generated.starts_with("tng-"));
+}
+
+#[tokio::test]
 async fn qb_set_preferences_validates_json() {
     let (addr, client) = spawn_server().await;
 

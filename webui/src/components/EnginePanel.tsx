@@ -218,6 +218,7 @@ function RtorrentSettingsPanel() {
   const [viewFilter, setViewFilter] = useState<SettingsViewFilter>('all')
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set())
   const [notice, setNotice] = useState<{ tone: 'ok' | 'warn' | 'error'; text: string } | null>(null)
+  const [lastSavedAt, setLastSavedAt] = useState<number | null>(null)
   const searchRef = useRef<HTMLInputElement>(null)
   const immediateSaveRef = useRef(0)
 
@@ -247,6 +248,7 @@ function RtorrentSettingsPanel() {
       const bits = [`saved ${result.applied.length} live setting${result.applied.length === 1 ? '' : 's'}`]
       if (result.restart_required) bits.push('restart required')
       if (result.errors.length) bits.push(`${result.errors.length} live apply error${result.errors.length === 1 ? '' : 's'}`)
+      setLastSavedAt(Date.now())
       setNotice({ tone: result.errors.length ? 'warn' : 'ok', text: bits.join(' · ') })
     },
     onError: e => setNotice({ tone: 'error', text: String(e) }),
@@ -296,8 +298,11 @@ function RtorrentSettingsPanel() {
     }
     setDraft(next)
     setCustomRc(data.custom_rc)
+    if (data.overlay_writable && !save.isPending) {
+      window.setTimeout(() => save.mutate({ values: next, customRc: data.custom_rc }), 0)
+    }
     setNotice(null)
-  }, [data])
+  }, [data, save])
   const defaultAll = () => {
     if (!data) return
     if (!window.confirm('Apply defaults to every managed rTorrent setting? The changes will autosave shortly.')) return
@@ -306,6 +311,9 @@ function RtorrentSettingsPanel() {
       next[setting.key] = inputValue(setting.value_type, setting.default_value)
     }
     setDraft(next)
+    if (data.overlay_writable && !save.isPending) {
+      window.setTimeout(() => save.mutate({ values: next, customRc }), 0)
+    }
     setNotice({ tone: 'warn', text: 'Managed settings moved to defaults. Autosave will apply shortly.' })
   }
   const resetGroup = (settings: RtorrentSettingDescriptor[]) => {
@@ -316,6 +324,9 @@ function RtorrentSettingsPanel() {
         const row = data.values.find(value => value.key === setting.key)
         next[setting.key] = baselineValue(setting, row?.saved ?? null, row?.live.value ?? null)
       }
+      if (data.overlay_writable && !save.isPending) {
+        window.setTimeout(() => save.mutate({ values: next, customRc }), 0)
+      }
       return next
     })
   }
@@ -325,6 +336,9 @@ function RtorrentSettingsPanel() {
       const next = { ...prev }
       for (const setting of settings) {
         next[setting.key] = inputValue(setting.value_type, setting.default_value)
+      }
+      if (data?.overlay_writable && !save.isPending) {
+        window.setTimeout(() => save.mutate({ values: next, customRc }), 0)
       }
       return next
     })
@@ -565,7 +579,7 @@ function RtorrentSettingsPanel() {
                 {save.isPending
                   ? 'Saving changes...'
                   : dirtyCount === 0
-                    ? 'All settings are saved.'
+                    ? `All settings are saved${lastSavedAt ? `; last save ${formatRelativeTime(lastSavedAt)}` : ''}.`
                     : `${dirtyCount} change${dirtyCount === 1 ? '' : 's'} will autosave shortly: ${liveDirtyCount} live, ${restartDirtyCount} restart${customRcDirty ? ', custom lines edited' : ''}.`}
               </div>
             </div>
@@ -590,6 +604,7 @@ function RtorrentSettingsPanel() {
               draft={draft}
               customRcDirty={customRcDirty}
               values={data.values}
+              saving={save.isPending}
             />
           )}
           <div style={{ display: 'grid', gap: 12 }}>
@@ -927,11 +942,12 @@ function SettingPill({ tone, children }: { tone: 'warn' | 'ok'; children: React.
   )
 }
 
-function ChangeReview({ settings, draft, customRcDirty, values }: {
+function ChangeReview({ settings, draft, customRcDirty, values, saving }: {
   settings: RtorrentSettingDescriptor[]
   draft: Record<string, string | number | boolean>
   customRcDirty: boolean
   values: Array<{ key: string; live: ProbeValue<string>; saved: string | null }>
+  saving: boolean
 }) {
   return (
     <details style={{
@@ -941,7 +957,7 @@ function ChangeReview({ settings, draft, customRcDirty, values }: {
       padding: '8px 10px',
     }}>
       <summary style={{ color: 'var(--text)', fontSize: 12, fontWeight: 800, cursor: 'pointer' }}>
-        Review autosave changes ({settings.length + (customRcDirty ? 1 : 0)})
+        Review autosave changes ({settings.length + (customRcDirty ? 1 : 0)}){saving ? ' - saving' : ''}
       </summary>
       <div style={{ display: 'grid', gap: 6, marginTop: 8 }}>
         {settings.map(setting => {
@@ -1291,6 +1307,14 @@ function sameDraft(
   const rightKeys = Object.keys(right)
   if (leftKeys.length !== rightKeys.length) return false
   return rightKeys.every(key => sameSettingValue(left[key], right[key]))
+}
+
+function formatRelativeTime(ts: number): string {
+  const seconds = Math.max(0, Math.round((Date.now() - ts) / 1000))
+  if (seconds < 5) return 'just now'
+  if (seconds < 60) return `${seconds}s ago`
+  const minutes = Math.round(seconds / 60)
+  return `${minutes}m ago`
 }
 
 function clampSettingValue(setting: RtorrentSettingDescriptor, value: number): number {
