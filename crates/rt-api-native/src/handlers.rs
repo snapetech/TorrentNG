@@ -539,6 +539,7 @@ pub struct SessionEventsQuery {
     torrent: Option<String>,
     kind: Option<String>,
     level: Option<String>,
+    last_known_id: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -566,7 +567,13 @@ pub async fn list_session_events(
     let limit = query.limit.unwrap_or(200).clamp(1, 1000);
     let levels = query.level.iter().cloned().collect::<Vec<_>>();
     match engine
-        .session_events_filtered(query.torrent.clone(), query.kind.clone(), levels, limit)
+        .session_events_filtered(
+            query.torrent.clone(),
+            query.kind.clone(),
+            levels,
+            query.last_known_id,
+            limit,
+        )
         .await
     {
         Ok(events) => {

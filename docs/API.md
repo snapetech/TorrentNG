@@ -72,7 +72,7 @@ the rewritten engine.
 | `POST` | `/api/v1/torrents/:hash/tags` | Add tags (`{ tags: ["a","b"] }`) |
 | `DELETE` | `/api/v1/torrents/:hash/tags` | Remove tags (`{ tags: ["a"] }`) |
 | `GET` | `/api/v1/events` | Server-sent torrent delta stream |
-| `GET` | `/api/v1/session-events` | Recent durable native session events; query: `limit`, `torrent`, `kind`, `level` |
+| `GET` | `/api/v1/session-events` | Recent durable native session events; query: `limit`, `torrent`, `kind`, `level`, `last_known_id` |
 | `GET` | `/api/v1/logs` | Recent durable sidecar app/rTorrent events; query: `limit`, `kind`, `level` |
 
 #### `GET /api/v1/torrents` query parameters
@@ -347,7 +347,7 @@ These compatibility endpoints are present so qBittorrent clients can probe them 
 
 | Method | Path | Notes |
 |--------|------|-------|
-| `GET` | `/api/qb/v2/log/main` | Returns retained app/session/rTorrent log events in qBittorrent log shape; supports `limit`, `normal`, `info`, `warning`, `critical` |
+| `GET` | `/api/qb/v2/log/main` | Returns retained app/session/rTorrent log events in qBittorrent log shape; supports `limit`, `last_known_id`, `normal`, `info`, `warning`, `critical` |
 | `GET` | `/api/qb/v2/log/peers` | Returns `[]` |
 | `GET` | `/api/qb/v2/search/status` | Returns stopped status |
 | `GET` | `/api/qb/v2/search/categories` | Returns `[]` |

@@ -82,7 +82,7 @@ pub fn list_session_events(
     info_hash: Option<&str>,
     limit: usize,
 ) -> Result<Vec<SessionEventRow>, DbError> {
-    list_session_events_filtered(conn, info_hash, None, &[], limit)
+    list_session_events_filtered(conn, info_hash, None, &[], None, limit)
 }
 
 pub fn list_session_events_filtered(
@@ -90,6 +90,7 @@ pub fn list_session_events_filtered(
     info_hash: Option<&str>,
     kind: Option<&str>,
     levels: &[String],
+    last_known_id: Option<i64>,
     limit: usize,
 ) -> Result<Vec<SessionEventRow>, DbError> {
     let limit = limit.max(1) as i64;
@@ -105,6 +106,10 @@ pub fn list_session_events_filtered(
     if let Some(kind) = kind {
         clauses.push("kind = ?");
         values.push(Value::Text(kind.to_owned()));
+    }
+    if let Some(last_known_id) = last_known_id {
+        clauses.push("event_id > ?");
+        values.push(Value::Integer(last_known_id));
     }
     let level_placeholders = if levels.is_empty() {
         String::new()
@@ -264,9 +269,15 @@ mod tests {
         )
         .unwrap();
 
-        let events =
-            list_session_events_filtered(&conn, Some(&"a".repeat(40)), None, &["warn".into()], 1)
-                .unwrap();
+        let events = list_session_events_filtered(
+            &conn,
+            Some(&"a".repeat(40)),
+            None,
+            &["warn".into()],
+            None,
+            1,
+        )
+        .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "tracker_warning");
         let stored_level: String = conn
@@ -277,6 +288,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored_level, "warn");
+
+        let events = list_session_events_filtered(&conn, None, None, &[], Some(1), 10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].event_id.unwrap_or_default() > 1);
     }
 
     #[test]

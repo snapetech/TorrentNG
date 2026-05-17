@@ -158,7 +158,7 @@ impl Db {
     }
 
     pub fn list_app_events(&self, limit: usize) -> Result<Vec<AppEventRow>> {
-        self.list_app_events_filtered(limit, None, &[])
+        self.list_app_events_filtered(limit, None, &[], None)
     }
 
     pub fn list_app_events_filtered(
@@ -166,6 +166,7 @@ impl Db {
         limit: usize,
         kind: Option<&str>,
         levels: &[&str],
+        last_known_id: Option<i64>,
     ) -> Result<Vec<AppEventRow>> {
         let conn = self.conn();
         let limit = limit.max(1) as i64;
@@ -175,6 +176,9 @@ impl Db {
         let mut clauses = Vec::new();
         if kind.is_some() {
             clauses.push("kind = ?");
+        }
+        if last_known_id.is_some() {
+            clauses.push("event_id > ?");
         }
         let level_placeholders = if levels.is_empty() {
             String::new()
@@ -198,6 +202,9 @@ impl Db {
         let mut values: Vec<rusqlite::types::Value> = Vec::new();
         if let Some(kind) = kind {
             values.push(rusqlite::types::Value::Text(kind.to_owned()));
+        }
+        if let Some(last_known_id) = last_known_id {
+            values.push(rusqlite::types::Value::Integer(last_known_id));
         }
         for level in levels {
             values.push(rusqlite::types::Value::Text(level.to_ascii_lowercase()));
@@ -406,9 +413,13 @@ mod tests {
         }
 
         let events = db
-            .list_app_events_filtered(1, Some("rtorrent_log"), &["warn"])
+            .list_app_events_filtered(1, Some("rtorrent_log"), &["warn"], None)
             .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].message, "old warning");
+
+        let events = db.list_app_events_filtered(10, None, &[], Some(1)).unwrap();
+        assert_eq!(events.len(), 3);
+        assert!(events.iter().all(|event| event.event_id.unwrap_or_default() > 1));
     }
 }

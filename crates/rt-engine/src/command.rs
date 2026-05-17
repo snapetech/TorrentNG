@@ -768,6 +768,7 @@ pub enum EngineCmd {
         info_hash: Option<String>,
         kind: Option<String>,
         levels: Vec<String>,
+        last_known_id: Option<i64>,
         limit: usize,
         reply: oneshot::Sender<CmdResult<Vec<rt_db::SessionEventRow>>>,
     },

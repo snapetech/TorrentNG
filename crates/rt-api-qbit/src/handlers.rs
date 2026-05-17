@@ -2083,6 +2083,8 @@ pub struct LogMainQuery {
     #[serde(default)]
     limit: Option<usize>,
     #[serde(default)]
+    last_known_id: Option<i64>,
+    #[serde(default)]
     normal: Option<bool>,
     #[serde(default)]
     info: Option<bool>,
@@ -2111,7 +2113,7 @@ pub async fn log_main(
     let limit = query.limit.unwrap_or(200).clamp(1, 1000);
     let levels = query.included_levels();
     match engine
-        .session_events_filtered(None, None, levels, limit)
+        .session_events_filtered(None, None, levels, query.last_known_id, limit)
         .await
     {
         Ok(events) => (
@@ -3263,6 +3265,7 @@ mod tests {
     fn log_main_query_filters_qbit_types() {
         let all = LogMainQuery {
             limit: None,
+            last_known_id: None,
             normal: None,
             info: None,
             warning: None,
@@ -3274,6 +3277,7 @@ mod tests {
 
         let warnings = LogMainQuery {
             limit: None,
+            last_known_id: None,
             normal: None,
             info: None,
             warning: Some(true),
@@ -3285,6 +3289,7 @@ mod tests {
 
         let critical = LogMainQuery {
             limit: None,
+            last_known_id: None,
             normal: Some(false),
             info: Some(false),
             warning: Some(false),

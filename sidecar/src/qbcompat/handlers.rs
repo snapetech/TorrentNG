@@ -194,6 +194,7 @@ async fn zero_text() -> &'static str {
 #[derive(Debug, Deserialize)]
 struct LogMainQuery {
     limit: Option<usize>,
+    last_known_id: Option<i64>,
     normal: Option<bool>,
     info: Option<bool>,
     warning: Option<bool>,
@@ -212,7 +213,10 @@ struct QbLogEntry {
 async fn log_main(State(s): State<AppState>, Query(q): Query<LogMainQuery>) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(200).clamp(1, 1000);
     let levels = q.included_levels();
-    match s.db.list_app_events_filtered(limit, None, &levels) {
+    match s
+        .db
+        .list_app_events_filtered(limit, None, &levels, q.last_known_id)
+    {
         Ok(events) => (
             StatusCode::OK,
             Json(
@@ -1845,6 +1849,7 @@ mod tests {
     fn log_main_query_filters_qbit_types() {
         let all = LogMainQuery {
             limit: None,
+            last_known_id: None,
             normal: None,
             info: None,
             warning: None,
@@ -1856,6 +1861,7 @@ mod tests {
 
         let warning = LogMainQuery {
             limit: None,
+            last_known_id: None,
             normal: None,
             info: None,
             warning: Some(true),

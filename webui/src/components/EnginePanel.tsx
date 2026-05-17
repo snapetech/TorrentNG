@@ -215,6 +215,8 @@ function RtorrentSettingsPanel() {
   const [draft, setDraft] = useState<Record<string, string | number | boolean>>({})
   const [customRc, setCustomRc] = useState('')
   const [filter, setFilter] = useState('')
+  const [viewFilter, setViewFilter] = useState<'all' | 'edited' | 'restart' | 'live'>('all')
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set())
   const [notice, setNotice] = useState<{ tone: 'ok' | 'warn' | 'error'; text: string } | null>(null)
 
   useEffect(() => {
@@ -258,6 +260,11 @@ function RtorrentSettingsPanel() {
     const needle = filter.trim().toLowerCase()
     return groupSettings(data.settings
       .filter(setting => {
+        const row = data.values.find(value => value.key === setting.key)
+        const isDirty = !sameSettingValue(draft[setting.key], baselineValue(setting, row?.saved ?? null, row?.live.value ?? null))
+        if (viewFilter === 'edited' && !isDirty) return false
+        if (viewFilter === 'restart' && !setting.restart_required) return false
+        if (viewFilter === 'live' && setting.restart_required) return false
         if (!needle) return true
         return [
           setting.key,
@@ -269,7 +276,7 @@ function RtorrentSettingsPanel() {
           settingDescription(setting),
         ].some(value => value.toLowerCase().includes(needle))
       }))
-  }, [data, filter])
+  }, [data, draft, filter, viewFilter])
   const resetAll = () => {
     if (!data) return
     const next: Record<string, string | number | boolean> = {}
@@ -280,6 +287,42 @@ function RtorrentSettingsPanel() {
     setDraft(next)
     setCustomRc(data.custom_rc)
     setNotice(null)
+  }
+  const resetGroup = (settings: RtorrentSettingDescriptor[]) => {
+    if (!data) return
+    setDraft(prev => {
+      const next = { ...prev }
+      for (const setting of settings) {
+        const row = data.values.find(value => value.key === setting.key)
+        next[setting.key] = baselineValue(setting, row?.saved ?? null, row?.live.value ?? null)
+      }
+      return next
+    })
+  }
+  const defaultGroup = (settings: RtorrentSettingDescriptor[]) => {
+    setDraft(prev => {
+      const next = { ...prev }
+      for (const setting of settings) {
+        next[setting.key] = inputValue(setting.value_type, setting.default_value)
+      }
+      return next
+    })
+  }
+  const toggleGroup = (name: string) => {
+    setCollapsedGroups(prev => {
+      const next = new Set(prev)
+      if (next.has(name)) next.delete(name)
+      else next.add(name)
+      return next
+    })
+  }
+  const copyText = async (text: string, label: string) => {
+    try {
+      await navigator.clipboard?.writeText(text)
+      setNotice({ tone: 'ok', text: `${label} copied` })
+    } catch {
+      setNotice({ tone: 'error', text: `Could not copy ${label.toLowerCase()}` })
+    }
   }
 
   return (
@@ -299,21 +342,55 @@ function RtorrentSettingsPanel() {
             <SettingStat label="Overlay" value={data.overlay_writable ? 'writable' : 'readonly'} tone={data.overlay_writable ? 'ok' : 'warn'} />
             <SettingStat label="Restart support" value={data.restart_supported ? 'available' : 'manual'} tone={data.restart_supported ? 'ok' : 'warn'} />
           </div>
-          <div style={{ color: 'var(--faint)', fontSize: 12, lineHeight: 1.45 }}>
-            Values are saved to <span style={{ color: 'var(--muted)', fontFamily: 'monospace' }}>{data.overlay_path}</span>. Live-safe controls are applied immediately; controls marked restart are saved for the next daemon start.
+          <div style={{ color: 'var(--faint)', fontSize: 12, lineHeight: 1.45, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+            <span>
+              Values are saved to <span style={{ color: 'var(--muted)', fontFamily: 'monospace' }}>{data.overlay_path}</span>. Live-safe controls are applied immediately; controls marked restart are saved for the next daemon start.
+            </span>
+            <button type="button" onClick={() => copyText(data.overlay_path, 'Overlay path')} style={smallButtonStyle(true)}>
+              Copy path
+            </button>
           </div>
-          <label style={{ display: 'grid', gap: 5, maxWidth: 640 }}>
-            <span style={{ color: 'var(--text)', fontSize: 12, fontWeight: 800 }}>Find settings</span>
-            <input
-              type="search"
-              value={filter}
-              onChange={e => setFilter(e.target.value)}
-              placeholder="Filter by label, command, category, or type"
-              style={{ ...inputStyle, padding: '7px 9px' }}
-            />
-          </label>
+          <div style={{
+            display: 'grid',
+            gridTemplateColumns: 'minmax(260px, 640px) minmax(240px, 1fr)',
+            gap: 10,
+            alignItems: 'end',
+          }}>
+            <label style={{ display: 'grid', gap: 5, minWidth: 0 }}>
+              <span style={{ color: 'var(--text)', fontSize: 12, fontWeight: 800 }}>Find settings</span>
+              <input
+                type="search"
+                value={filter}
+                onChange={e => setFilter(e.target.value)}
+                placeholder="Filter by label, command, category, or type"
+                style={{ ...inputStyle, padding: '7px 9px' }}
+              />
+            </label>
+            <ViewFilter value={viewFilter} onChange={setViewFilter} dirtyCount={dirtySettings.length} restartCount={data.settings.filter(setting => setting.restart_required).length} liveCount={data.settings.filter(setting => !setting.restart_required).length} />
+          </div>
+          {(filter || viewFilter !== 'all') && (
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+              <button type="button" onClick={() => { setFilter(''); setViewFilter('all') }} style={smallButtonStyle(true)}>
+                Clear filters
+              </button>
+              <span style={{ color: 'var(--faint)', fontSize: 11 }}>
+                Filtered by {filter ? `"${filter}"` : 'view'}{filter && viewFilter !== 'all' ? ` and ${viewFilter}` : ''}
+              </span>
+            </div>
+          )}
+          <div role="status" aria-live="polite" style={{ color: 'var(--faint)', fontSize: 11 }}>
+            Showing {filteredGroups.reduce((sum, group) => sum + group.settings.length, 0).toLocaleString()} of {data.settings.length.toLocaleString()} managed settings.
+          </div>
           <div style={{ display: 'grid', gap: 12 }}>
-            {filteredGroups.map(group => (
+            {filteredGroups.map(group => {
+              const collapsed = collapsedGroups.has(group.name)
+              const groupDirty = group.settings.filter(setting => {
+                const row = data.values.find(value => value.key === setting.key)
+                return !sameSettingValue(draft[setting.key], baselineValue(setting, row?.saved ?? null, row?.live.value ?? null))
+              }).length
+              const groupRestart = group.settings.filter(setting => setting.restart_required).length
+              const bodyId = `rt-setting-group-${group.name.replace(/\W+/g, '-').toLowerCase()}`
+              return (
               <fieldset key={group.name} style={{
                 border: '1px solid var(--border)',
                 borderRadius: 8,
@@ -330,8 +407,40 @@ function RtorrentSettingsPanel() {
                 }}>
                   {group.name}
                 </legend>
-                <div style={{ color: 'var(--faint)', fontSize: 11, marginBottom: 9 }}>{group.description}</div>
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 360px), 1fr))', gap: 10 }}>
+                <div style={{
+                  display: 'grid',
+                  gridTemplateColumns: 'minmax(0, 1fr) auto',
+                  gap: 10,
+                  alignItems: 'start',
+                  marginBottom: 9,
+                }}>
+                  <div style={{ display: 'grid', gap: 5, minWidth: 0 }}>
+                    <div style={{ color: 'var(--faint)', fontSize: 11 }}>{group.description}</div>
+                    <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
+                      <SettingPill tone={groupDirty > 0 ? 'warn' : 'ok'}>{groupDirty} edited</SettingPill>
+                      <SettingPill tone={groupRestart > 0 ? 'warn' : 'ok'}>{groupRestart} restart</SettingPill>
+                      <SettingPill tone="ok">{group.settings.length} shown</SettingPill>
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                    <button type="button" onClick={() => defaultGroup(group.settings)} style={smallButtonStyle(!save.isPending)} disabled={save.isPending}>
+                      Defaults
+                    </button>
+                    <button type="button" onClick={() => resetGroup(group.settings)} style={smallButtonStyle(groupDirty > 0 && !save.isPending)} disabled={groupDirty === 0 || save.isPending}>
+                      Reset group
+                    </button>
+                    <button
+                      type="button"
+                      aria-expanded={!collapsed}
+                      aria-controls={bodyId}
+                      onClick={() => toggleGroup(group.name)}
+                      style={smallButtonStyle(true)}
+                    >
+                      {collapsed ? 'Expand' : 'Collapse'}
+                    </button>
+                  </div>
+                </div>
+                <div id={bodyId} hidden={collapsed} style={{ display: collapsed ? 'none' : 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 380px), 1fr))', gap: 10 }}>
                   {group.settings.map(setting => {
                     const row = data.values.find(value => value.key === setting.key)
                     const base = baselineValue(setting, row?.saved ?? null, row?.live.value ?? null)
@@ -376,21 +485,19 @@ function RtorrentSettingsPanel() {
                             onChange={next => setDraft(prev => ({ ...prev, [setting.key]: next }))}
                           />
                         ) : (
-                          <NumericKnob
-                            setting={setting}
-                            value={Number(value)}
-                            describedBy={descriptionId}
-                            onChange={next => setDraft(prev => ({ ...prev, [setting.key]: next }))}
-                          />
+                        <NumericKnob
+                          setting={setting}
+                          value={Number(value)}
+                          describedBy={descriptionId}
+                          onChange={next => setDraft(prev => ({ ...prev, [setting.key]: clampSettingValue(setting, next) }))}
+                          onPreset={next => setDraft(prev => ({ ...prev, [setting.key]: clampSettingValue(setting, next) }))}
+                        />
                         )}
-                        <div style={{
-                          display: 'grid',
-                          gridTemplateColumns: 'repeat(4, minmax(0, 1fr))',
-                          gap: 6,
-                        }}>
+                        <div style={readoutGridStyle}>
                           <Readout label="Editing" value={formatSettingValue(value, setting.unit)} />
                           <Readout label="Live" value={live === null ? 'unavailable' : formatSettingValue(live, setting.unit)} />
                           <Readout label="Saved" value={saved === null ? 'default' : formatSettingValue(saved, setting.unit)} />
+                          <Readout label="Default" value={formatSettingValue(inputValue(setting.value_type, setting.default_value), setting.unit)} />
                           <Readout label="Command" value={setting.command} mono />
                         </div>
                         <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center' }}>
@@ -405,13 +512,21 @@ function RtorrentSettingsPanel() {
                           >
                             Reset
                           </button>
+                          <button
+                            type="button"
+                            onClick={() => copyText(`${setting.command} / ${setting.setter}`, setting.label)}
+                            style={smallButtonStyle(true)}
+                          >
+                            Copy command
+                          </button>
                         </div>
                       </div>
                     )
                   })}
                 </div>
               </fieldset>
-            ))}
+              )
+            })}
             {filteredGroups.length === 0 && (
               <div style={{
                 color: 'var(--faint)',
@@ -424,8 +539,18 @@ function RtorrentSettingsPanel() {
               </div>
             )}
           </div>
-          <label style={{ display: 'grid', gap: 5, border: '1px solid var(--border)', borderRadius: 8, padding: 10, background: 'var(--surface)' }}>
-            <span style={{ color: 'var(--text)', fontSize: 12, fontWeight: 800 }}>Custom rTorrent lines</span>
+          <label style={{
+            display: 'grid',
+            gap: 6,
+            border: `1px solid ${customRcDirty ? 'color-mix(in srgb, var(--warning) 58%, var(--border))' : 'var(--border)'}`,
+            borderRadius: 8,
+            padding: 10,
+            background: customRcDirty ? 'color-mix(in srgb, var(--warning) 7%, var(--surface))' : 'var(--surface)',
+          }}>
+            <span style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+              <span style={{ color: 'var(--text)', fontSize: 12, fontWeight: 800 }}>Custom rTorrent lines</span>
+              {customRcDirty && <SettingPill tone="warn">edited</SettingPill>}
+            </span>
             <span style={{ color: 'var(--faint)', fontSize: 11 }}>Advanced overrides are imported after managed settings and usually need a restart.</span>
             <textarea
               value={customRc}
@@ -435,6 +560,12 @@ function RtorrentSettingsPanel() {
               placeholder="Optional advanced rtorrent.rc overrides imported after managed settings"
               style={{ ...inputStyle, resize: 'vertical', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}
             />
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center' }}>
+              <span style={{ color: 'var(--faint)', fontSize: 10 }}>{customRc.split('\n').filter(line => line.trim()).length} custom line{customRc.split('\n').filter(line => line.trim()).length === 1 ? '' : 's'}</span>
+              <button type="button" onClick={() => setCustomRc(data.custom_rc)} disabled={!customRcDirty || save.isPending} style={smallButtonStyle(customRcDirty && !save.isPending)}>
+                Reset custom lines
+              </button>
+            </div>
           </label>
           {notice && <div style={{
             color: notice.tone === 'error' ? 'var(--danger)' : notice.tone === 'warn' ? 'var(--warning)' : 'var(--success)',
@@ -517,11 +648,60 @@ function SettingPill({ tone, children }: { tone: 'warn' | 'ok'; children: React.
   )
 }
 
-function NumericKnob({ setting, value, describedBy, onChange }: {
+function ViewFilter({ value, onChange, dirtyCount, restartCount, liveCount }: {
+  value: 'all' | 'edited' | 'restart' | 'live'
+  onChange: (value: 'all' | 'edited' | 'restart' | 'live') => void
+  dirtyCount: number
+  restartCount: number
+  liveCount: number
+}) {
+  const options: Array<['all' | 'edited' | 'restart' | 'live', string, string]> = [
+    ['all', 'All', 'Show every managed setting'],
+    ['edited', `Edited ${dirtyCount}`, 'Show unsaved managed setting edits'],
+    ['restart', `Restart ${restartCount}`, 'Show settings that need restart'],
+    ['live', `Live ${liveCount}`, 'Show settings that can apply live'],
+  ]
+  return (
+    <div style={{ display: 'grid', gap: 5, minWidth: 0 }}>
+      <span style={{ color: 'var(--text)', fontSize: 12, fontWeight: 800 }}>View</span>
+      <div role="group" aria-label="Settings view filter" style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: 5 }}>
+        {options.map(([optionValue, label, title]) => {
+          const active = value === optionValue
+          return (
+            <button
+              key={optionValue}
+              type="button"
+              title={title}
+              aria-pressed={active}
+              onClick={() => onChange(optionValue)}
+              style={{
+                border: `1px solid ${active ? 'var(--accent)' : 'var(--border-strong)'}`,
+                borderRadius: 6,
+                background: active ? 'var(--accent-soft)' : 'var(--bg)',
+                color: active ? 'var(--accent-text)' : 'var(--muted)',
+                padding: '7px 8px',
+                fontSize: 11,
+                fontWeight: 800,
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+              }}
+            >
+              {label}
+            </button>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+function NumericKnob({ setting, value, describedBy, onChange, onPreset }: {
   setting: RtorrentSettingDescriptor
   value: number
   describedBy: string
   onChange: (value: number) => void
+  onPreset: (value: number) => void
 }) {
   const min = setting.minimum ?? 0
   const max = setting.maximum ?? Math.max(value, 100)
@@ -562,6 +742,10 @@ function NumericKnob({ setting, value, describedBy, onChange }: {
         </div>
       </div>
       <div style={{ display: 'grid', gap: 6, minWidth: 0 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, color: 'var(--faint)', fontSize: 10 }}>
+          <span>{min.toLocaleString()}</span>
+          <span>{max.toLocaleString()}</span>
+        </div>
         <input
           type="range"
           min={min}
@@ -584,6 +768,11 @@ function NumericKnob({ setting, value, describedBy, onChange }: {
             aria-describedby={describedBy}
           />
           {setting.unit && <span style={{ color: 'var(--faint)', fontSize: 11, fontWeight: 800 }}>{setting.unit}</span>}
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 5 }}>
+          <button type="button" onClick={() => onPreset(min)} style={miniPresetButtonStyle}>Min</button>
+          <button type="button" onClick={() => onPreset(Number(inputValue(setting.value_type, setting.default_value)))} style={miniPresetButtonStyle}>Default</button>
+          <button type="button" onClick={() => onPreset(max)} style={miniPresetButtonStyle}>Max</button>
         </div>
       </div>
     </div>
@@ -745,6 +934,13 @@ function sameSettingValue(left: unknown, right: unknown): boolean {
   return String(left) === String(right)
 }
 
+function clampSettingValue(setting: RtorrentSettingDescriptor, value: number): number {
+  const min = setting.minimum ?? Number.NEGATIVE_INFINITY
+  const max = setting.maximum ?? Number.POSITIVE_INFINITY
+  if (!Number.isFinite(value)) return Number.isFinite(min) ? min : 0
+  return Math.max(min, Math.min(max, value))
+}
+
 function inputValue(type: string, value: unknown): string | number | boolean {
   if (type === 'bool') return value === true || value === 'true' || value === 'yes' || value === '1'
   if (typeof value === 'number' || typeof value === 'boolean') return value
@@ -764,6 +960,22 @@ const inputStyle: React.CSSProperties = {
   padding: '5px 8px',
   fontSize: 12,
   outline: 'none',
+}
+
+const readoutGridStyle: React.CSSProperties = {
+  display: 'grid',
+  gridTemplateColumns: 'repeat(auto-fit, minmax(84px, 1fr))',
+  gap: 6,
+}
+
+const miniPresetButtonStyle: React.CSSProperties = {
+  border: '1px solid var(--border-strong)',
+  borderRadius: 5,
+  background: 'var(--bg)',
+  color: 'var(--muted)',
+  padding: '4px 6px',
+  fontSize: 10,
+  fontWeight: 800,
 }
 
 function smallButtonStyle(enabled: boolean): React.CSSProperties {

@@ -28,7 +28,8 @@ use rt_peer_wire::handshake::{Handshake, HANDSHAKE_LEN};
 use rt_session::{SessionRegistry, TorrentEntry, TorrentState, TransferStats};
 use rt_storage::{
     runtime::StorageRuntime, DurabilityMode, MountScheduler, PreallocationMode, SchedulerConfig,
-    StorageIoConfig, V2FileHash, V2FileVerifier, VerifyResult,
+    StorageError, StorageIoConfig, StoragePlan, StoragePlanStep, V2FileHash, V2FileVerifier,
+    VerifyResult,
 };
 
 use crate::command::{
@@ -57,6 +58,7 @@ const EVENT_LIMITS_UPDATED: &str = "limits_updated";
 const EVENT_ENGINE_STOPPED: &str = "engine_stopped";
 
 const JOB_KIND_RECHECK: &str = "recheck_torrent";
+const JOB_KIND_STORAGE_PLAN: &str = "storage_plan";
 const JOB_STATE_QUEUED: &str = "queued";
 const JOB_STATE_RUNNING: &str = "running";
 const JOB_STATE_PAUSED: &str = "paused";
@@ -64,6 +66,7 @@ const JOB_STATE_CANCELLED: &str = "cancelled";
 const JOB_STATE_FAILED: &str = "failed";
 const JOB_STATE_COMPLETED: &str = "completed";
 static RECHECK_JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static STORAGE_PLAN_JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const SETTING_GLOBAL_DOWNLOAD_LIMIT: &str = "transfer.download_limit";
 const SETTING_GLOBAL_UPLOAD_LIMIT: &str = "transfer.upload_limit";
 const SETTING_GLOBAL_SPEED_LIMITS_MODE: &str = "transfer.speed_limits_mode";
@@ -309,7 +312,7 @@ impl EngineHandle {
         info_hash: Option<String>,
         limit: usize,
     ) -> CmdResult<Vec<rt_db::SessionEventRow>> {
-        self.session_events_filtered(info_hash, None, Vec::new(), limit)
+        self.session_events_filtered(info_hash, None, Vec::new(), None, limit)
             .await
     }
 
@@ -318,6 +321,7 @@ impl EngineHandle {
         info_hash: Option<String>,
         kind: Option<String>,
         levels: Vec<String>,
+        last_known_id: Option<i64>,
         limit: usize,
     ) -> CmdResult<Vec<rt_db::SessionEventRow>> {
         let (reply, rx) = tokio::sync::oneshot::channel();
@@ -326,6 +330,7 @@ impl EngineHandle {
                 info_hash,
                 kind,
                 levels,
+                last_known_id,
                 limit,
                 reply,
             })
@@ -1050,11 +1055,18 @@ impl Engine {
                 info_hash,
                 kind,
                 levels,
+                last_known_id,
                 limit,
                 reply,
             } => {
                 let result = self
-                    .list_session_events(info_hash.as_deref(), kind.as_deref(), &levels, limit)
+                    .list_session_events(
+                        info_hash.as_deref(),
+                        kind.as_deref(),
+                        &levels,
+                        last_known_id,
+                        limit,
+                    )
                     .map_err(|e| e.to_string());
                 let _ = reply.send(result);
             }
@@ -2844,10 +2856,11 @@ impl Engine {
         info_hash: Option<&str>,
         kind: Option<&str>,
         levels: &[String],
+        last_known_id: Option<i64>,
         limit: usize,
     ) -> Result<Vec<rt_db::SessionEventRow>, rt_db::DbError> {
         let db = self.db.lock().expect("database mutex poisoned");
-        rt_db::list_session_events_filtered(&db, info_hash, kind, levels, limit)
+        rt_db::list_session_events_filtered(&db, info_hash, kind, levels, last_known_id, limit)
     }
 
     fn create_recheck_job(&self, info_hash: &str) -> Option<String> {
@@ -2895,6 +2908,119 @@ impl Engine {
             warn!(job_id = %job_id, err = %e, "failed to append recheck job event");
         }
         Some(job_id)
+    }
+
+    #[allow(dead_code)]
+    #[allow(dead_code)]
+    fn completed_storage_plan_steps_legacy(&self, job_id: &str) -> Vec<usize> {
+        let db = self.db.lock().expect("database mutex poisoned");
+        let Ok(job) = rt_db::get_job(&db, job_id) else {
+            return Vec::new();
+        };
+        if job.kind != JOB_KIND_STORAGE_PLAN {
+            return Vec::new();
+        }
+        let checkpoint = job.checkpoint.max(0) as usize;
+        (0..checkpoint).collect()
+    }
+
+    #[allow(dead_code)]
+    #[allow(dead_code)]
+    fn persist_storage_plan_step_checkpoint_legacy(
+        &self,
+        job_id: &str,
+        step_index: usize,
+        step: &StoragePlanStep,
+    ) {
+        let now = unix_now_i64();
+        let completed = step_index.saturating_add(1) as i64;
+        let mut job = {
+            let db = self.db.lock().expect("database mutex poisoned");
+            match rt_db::get_job(&db, job_id) {
+                Ok(job) => job,
+                Err(e) => {
+                    warn!(job_id, err = %e, "failed to load storage plan job");
+                    return;
+                }
+            }
+        };
+        if job.kind != JOB_KIND_STORAGE_PLAN {
+            warn!(job_id, kind = %job.kind, "refusing storage plan checkpoint for non-storage job");
+            return;
+        }
+        job.state = JOB_STATE_RUNNING.to_owned();
+        job.done = completed;
+        job.checkpoint = completed;
+        job.file_index = Some(completed);
+        let step_bytes = i64::try_from(step.bytes).unwrap_or(i64::MAX);
+        job.byte_offset = Some(job.byte_offset.unwrap_or(0).saturating_add(step_bytes));
+        job.verified_bytes = job.verified_bytes.saturating_add(step_bytes);
+        job.updated_at = now;
+        if job.started_at.is_none() {
+            job.started_at = Some(now);
+        }
+        let event = rt_db::JobEventRow {
+            event_id: None,
+            job_id: job_id.to_owned(),
+            occurred_at: now,
+            kind: "storage_plan_checkpoint".to_owned(),
+            message: Some(format!("storage plan step {step_index} completed")),
+            payload: storage_plan_step_checkpoint_payload(step_index, step, completed),
+        };
+        let db = self.db.lock().expect("database mutex poisoned");
+        if let Err(e) = rt_db::upsert_job(&db, &job) {
+            warn!(job_id, err = %e, "failed to persist storage plan checkpoint");
+            return;
+        }
+        if let Err(e) = rt_db::append_job_event(&db, &event) {
+            warn!(job_id, err = %e, "failed to append storage plan checkpoint event");
+        }
+    }
+
+    #[allow(dead_code)]
+    fn complete_storage_plan_step_job_legacy(&self, job_id: &str) {
+        let now = unix_now_i64();
+        let mut job = {
+            let db = self.db.lock().expect("database mutex poisoned");
+            match rt_db::get_job(&db, job_id) {
+                Ok(job) => job,
+                Err(e) => {
+                    warn!(job_id, err = %e, "failed to load storage plan job");
+                    return;
+                }
+            }
+        };
+        if job.kind != JOB_KIND_STORAGE_PLAN {
+            warn!(job_id, kind = %job.kind, "refusing storage plan completion for non-storage job");
+            return;
+        }
+        job.state = JOB_STATE_COMPLETED.to_owned();
+        job.done = job.total;
+        job.checkpoint = job.total;
+        job.file_index = Some(job.total);
+        job.updated_at = now;
+        job.finished_at = Some(now);
+        let event = rt_db::JobEventRow {
+            event_id: None,
+            job_id: job_id.to_owned(),
+            occurred_at: now,
+            kind: "storage_plan_completed".to_owned(),
+            message: Some("storage plan completed".to_owned()),
+            payload: serde_json::json!({
+                "done": job.done,
+                "total": job.total,
+                "state": JOB_STATE_COMPLETED,
+            })
+            .to_string(),
+        };
+        let db = self.db.lock().expect("database mutex poisoned");
+        if let Err(e) = rt_db::upsert_job(&db, &job) {
+            warn!(job_id, err = %e, "failed to persist storage plan completion");
+            return;
+        }
+        if let Err(e) = rt_db::append_job_event(&db, &event) {
+            warn!(job_id, err = %e, "failed to append storage plan completion event");
+        }
     }
 
     fn update_job_state(
@@ -3006,6 +3132,215 @@ impl Engine {
             warn!(job_id, err = %e, "failed to append pure v2 recheck event");
         }
     }
+
+    #[allow(dead_code)]
+    fn create_storage_plan_job(
+        &self,
+        operation: &str,
+        affected_torrents: Vec<String>,
+        plan: &StoragePlan,
+    ) -> Result<String, String> {
+        let now = unix_now_i64();
+        let seq = STORAGE_PLAN_JOB_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let job_id = format!("storage-plan-{operation}-{now}-{seq}");
+        let job = rt_db::JobRow {
+            job_id: job_id.clone(),
+            kind: JOB_KIND_STORAGE_PLAN.to_owned(),
+            state: JOB_STATE_QUEUED.to_owned(),
+            dry_run: plan.dry_run,
+            affected_torrents,
+            total: plan.steps.len() as i64,
+            done: 0,
+            checkpoint: 0,
+            file_index: Some(0),
+            piece_index: None,
+            byte_offset: Some(0),
+            verified_bytes: 0,
+            invalid_pieces: Vec::new(),
+            error: None,
+            created_at: now,
+            started_at: None,
+            updated_at: now,
+            finished_at: None,
+        };
+        let event = rt_db::JobEventRow {
+            event_id: None,
+            job_id: job_id.clone(),
+            occurred_at: now,
+            kind: "storage_plan_queued".to_owned(),
+            message: Some(format!("{operation} storage plan queued")),
+            payload: storage_plan_payload(operation, plan, &[]).to_string(),
+        };
+        let db = self.db.lock().expect("database mutex poisoned");
+        rt_db::upsert_job(&db, &job).map_err(|e| e.to_string())?;
+        rt_db::append_job_event(&db, &event).map_err(|e| e.to_string())?;
+        Ok(job_id)
+    }
+
+    #[allow(dead_code)]
+    fn execute_storage_plan_job(
+        &self,
+        operation: &str,
+        affected_torrents: Vec<String>,
+        plan: &StoragePlan,
+        completed_steps: Vec<usize>,
+    ) -> Result<String, String> {
+        let job_id = self.create_storage_plan_job(operation, affected_torrents, plan)?;
+        self.update_job_state(
+            &job_id,
+            JOB_STATE_RUNNING,
+            None,
+            Some("storage plan execution started"),
+        );
+        let mut completed = completed_steps;
+        let already_completed = completed.clone();
+        let result = rt_storage::execute_storage_plan_with_checkpoints(
+            plan,
+            &already_completed,
+            |index, _step| {
+                if !completed.contains(&index) {
+                    completed.push(index);
+                    completed.sort_unstable();
+                }
+                self.persist_storage_plan_checkpoint(&job_id, operation, plan, &completed)
+                    .map_err(|error| StorageError::StagedMoveFailed {
+                        step: "checkpoint",
+                        reason: error,
+                    })
+            },
+        );
+        match result {
+            Ok(_) => {
+                self.persist_storage_plan_terminal(
+                    &job_id,
+                    operation,
+                    plan,
+                    &completed,
+                    JOB_STATE_COMPLETED,
+                    None,
+                )?;
+                Ok(job_id)
+            }
+            Err(error) => {
+                let message = error.to_string();
+                self.persist_storage_plan_terminal(
+                    &job_id,
+                    operation,
+                    plan,
+                    &completed,
+                    JOB_STATE_FAILED,
+                    Some(message.clone()),
+                )?;
+                Err(message)
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    fn persist_storage_plan_checkpoint(
+        &self,
+        job_id: &str,
+        operation: &str,
+        plan: &StoragePlan,
+        completed_steps: &[usize],
+    ) -> Result<(), String> {
+        let now = unix_now_i64();
+        let done = completed_steps.len() as i64;
+        let mut job = {
+            let db = self.db.lock().expect("database mutex poisoned");
+            rt_db::get_job(&db, job_id).map_err(|e| e.to_string())?
+        };
+        job.done = done;
+        job.checkpoint = done;
+        job.file_index = Some(done);
+        job.byte_offset = Some(
+            completed_steps
+                .iter()
+                .filter_map(|index| plan.steps.get(*index))
+                .map(|step| step.bytes as i64)
+                .sum::<i64>(),
+        );
+        job.updated_at = now;
+        let event = rt_db::JobEventRow {
+            event_id: None,
+            job_id: job_id.to_owned(),
+            occurred_at: now,
+            kind: "storage_plan_checkpoint".to_owned(),
+            message: Some("storage plan checkpoint persisted".to_owned()),
+            payload: storage_plan_payload(operation, plan, completed_steps).to_string(),
+        };
+        let db = self.db.lock().expect("database mutex poisoned");
+        rt_db::upsert_job(&db, &job).map_err(|e| e.to_string())?;
+        rt_db::append_job_event(&db, &event).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn persist_storage_plan_terminal(
+        &self,
+        job_id: &str,
+        operation: &str,
+        plan: &StoragePlan,
+        completed_steps: &[usize],
+        state: &str,
+        error: Option<String>,
+    ) -> Result<(), String> {
+        let now = unix_now_i64();
+        let mut job = {
+            let db = self.db.lock().expect("database mutex poisoned");
+            rt_db::get_job(&db, job_id).map_err(|e| e.to_string())?
+        };
+        job.state = state.to_owned();
+        job.done = completed_steps.len() as i64;
+        job.checkpoint = job.done;
+        job.error = error.clone();
+        job.updated_at = now;
+        job.finished_at = Some(now);
+        let event = rt_db::JobEventRow {
+            event_id: None,
+            job_id: job_id.to_owned(),
+            occurred_at: now,
+            kind: format!("storage_plan_{state}"),
+            message: Some(format!("storage plan {state}")),
+            payload: serde_json::json!({
+                "error": error,
+                "state": state,
+                "plan": storage_plan_payload(operation, plan, completed_steps),
+            })
+            .to_string(),
+        };
+        let db = self.db.lock().expect("database mutex poisoned");
+        rt_db::upsert_job(&db, &job).map_err(|e| e.to_string())?;
+        rt_db::append_job_event(&db, &event).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+#[allow(dead_code)]
+fn storage_plan_payload(
+    operation: &str,
+    plan: &StoragePlan,
+    completed_steps: &[usize],
+) -> serde_json::Value {
+    serde_json::json!({
+        "operation": operation,
+        "dry_run": plan.dry_run,
+        "can_apply": plan.can_apply,
+        "completed_steps": completed_steps,
+        "steps": plan.steps.iter().map(storage_plan_step_payload_json).collect::<Vec<_>>(),
+        "rollback_steps": plan.rollback_steps.iter().map(storage_plan_step_payload_json).collect::<Vec<_>>(),
+        "issues": plan.issues.iter().map(|issue| format!("{issue:?}")).collect::<Vec<_>>(),
+    })
+}
+
+#[allow(dead_code)]
+fn storage_plan_step_payload_json(step: &StoragePlanStep) -> serde_json::Value {
+    serde_json::json!({
+        "action": format!("{:?}", step.action),
+        "source": step.source.as_ref().map(|path| path.display().to_string()),
+        "destination": step.destination.as_ref().map(|path| path.display().to_string()),
+        "bytes": step.bytes,
+    })
 }
 
 pub(crate) fn row_from_entry(entry: &TorrentEntry, meta: &TorrentMeta) -> TorrentRow {
@@ -3027,6 +3362,23 @@ pub(crate) fn row_from_entry(entry: &TorrentEntry, meta: &TorrentMeta) -> Torren
         ratio: entry.stats.ratio(),
         trackers: meta_all_trackers(meta),
     }
+}
+
+#[allow(dead_code)]
+fn storage_plan_step_checkpoint_payload(
+    step_index: usize,
+    step: &StoragePlanStep,
+    completed: i64,
+) -> String {
+    serde_json::json!({
+        "step_index": step_index,
+        "completed_steps": completed,
+        "action": format!("{:?}", step.action),
+        "source": step.source.as_ref().map(|path| path.to_string_lossy().to_string()),
+        "destination": step.destination.as_ref().map(|path| path.to_string_lossy().to_string()),
+        "bytes": step.bytes,
+    })
+    .to_string()
 }
 
 fn persist_torrent_files(
@@ -4787,6 +5139,96 @@ mod tests {
         assert_eq!(queued.state, JOB_STATE_QUEUED);
         let events = rt_db::list_job_events(&db, "job-running", 10).unwrap();
         assert_eq!(events[0].kind, "job_recovered");
+    }
+
+    #[test]
+    fn storage_plan_jobs_checkpoint_completed_steps() {
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let (_tx, rx) = mpsc::channel(1);
+        let engine = Engine {
+            config: Arc::new(Config::default()),
+            registry: Arc::new(RwLock::new(SessionRegistry::new())),
+            db: Arc::new(Mutex::new(conn)),
+            cmd_rx: rx,
+            cmd_tx: mpsc::channel(1).0,
+            torrent_chans: HashMap::new(),
+            torrent_tasks: HashMap::new(),
+            dht_tx: None,
+            resources: test_resource_governor(),
+        };
+        let plan = StoragePlan {
+            dry_run: false,
+            can_apply: true,
+            issues: Vec::new(),
+            steps: vec![
+                StoragePlanStep {
+                    action: rt_storage::PlannedStorageAction::CopyVerifyRename,
+                    source: Some(PathBuf::from("/mnt/a/source")),
+                    destination: Some(PathBuf::from("/mnt/b/.target.tng-copy")),
+                    bytes: 128,
+                },
+                StoragePlanStep {
+                    action: rt_storage::PlannedStorageAction::Rename,
+                    source: Some(PathBuf::from("/mnt/b/.target.tng-copy")),
+                    destination: Some(PathBuf::from("/mnt/b/target")),
+                    bytes: 128,
+                },
+            ],
+            rollback_steps: Vec::new(),
+        };
+
+        let job_id = engine
+            .create_storage_plan_job("move", vec!["a".repeat(40)], &plan)
+            .unwrap();
+        engine.update_job_state(
+            &job_id,
+            JOB_STATE_RUNNING,
+            None,
+            Some("storage plan execution started"),
+        );
+        engine
+            .persist_storage_plan_checkpoint(&job_id, "move", &plan, &[0])
+            .unwrap();
+
+        let db = engine.db.lock().unwrap();
+        let job = rt_db::get_job(&db, &job_id).unwrap();
+        assert_eq!(job.kind, JOB_KIND_STORAGE_PLAN);
+        assert_eq!(job.state, JOB_STATE_RUNNING);
+        assert_eq!(job.done, 1);
+        assert_eq!(job.checkpoint, 1);
+        assert_eq!(job.file_index, Some(1));
+        assert_eq!(job.byte_offset, Some(128));
+        drop(db);
+
+        assert_eq!(engine.completed_storage_plan_steps_legacy(&job_id), vec![0]);
+
+        engine
+            .persist_storage_plan_checkpoint(&job_id, "move", &plan, &[0, 1])
+            .unwrap();
+        engine
+            .persist_storage_plan_terminal(
+                &job_id,
+                "move",
+                &plan,
+                &[0, 1],
+                JOB_STATE_COMPLETED,
+                None,
+            )
+            .unwrap();
+
+        let db = engine.db.lock().unwrap();
+        let job = rt_db::get_job(&db, &job_id).unwrap();
+        assert_eq!(job.state, JOB_STATE_COMPLETED);
+        assert_eq!(job.done, 2);
+        assert_eq!(job.checkpoint, 2);
+        assert_eq!(job.file_index, Some(2));
+        let events = rt_db::list_job_events(&db, &job_id, 10).unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "storage_plan_checkpoint"
+                && event.payload.contains("CopyVerifyRename")));
+        assert_eq!(events[0].kind, "storage_plan_completed");
     }
 
     #[tokio::test]

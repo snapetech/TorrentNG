@@ -112,7 +112,7 @@ pub async fn list_logs(
         .unwrap_or_default();
     match s
         .db
-        .list_app_events_filtered(limit, query.kind.as_deref(), &levels)
+        .list_app_events_filtered(limit, query.kind.as_deref(), &levels, None)
     {
         Ok(events) => {
             Json(serde_json::json!({ "logs": events })).into_response()

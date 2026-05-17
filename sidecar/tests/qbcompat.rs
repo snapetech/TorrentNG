@@ -2466,6 +2466,18 @@ async fn qb_log_main_returns_retained_app_events() {
     let entries = body.as_array().unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["message"], "operator-visible warning");
+
+    let res = client
+        .get(url(addr, "/api/qb/v2/log/main?limit=10&last_known_id=2"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let entries = body.as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["message"], "newer info");
+    assert!(entries[0]["id"].as_i64().unwrap() > 2);
 }
 
 #[tokio::test]

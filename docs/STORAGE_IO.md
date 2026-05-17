@@ -132,8 +132,11 @@ startup falls back to verification instead of trusting stale piece state.
 
 The following items are still implementation targets:
 
-- Persist cross-device move/import execution state so interrupted multi-step
-  plans can resume or be audited after process restart.
+- Wire the native move/import API command path to the storage-plan job helpers.
+  The storage executor accepts completed step indexes, and the engine now
+  persists storage-plan queue/start/checkpoint/complete state in the durable
+  jobs table so interrupted multi-step plans can resume or be audited after
+  process restart.
 - Per-device latency observability now includes bounded Prometheus histograms
   for read/write/sync/hash work labeled by resolved device/profile, plus the
   cumulative per-device totals. Aggregate fixed-bucket histograms and counters
