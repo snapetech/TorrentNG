@@ -676,6 +676,29 @@ verify_fixture_hashes() {
   diff -u "$expected" "$actual" >/dev/null
 }
 
+verify_selected_fixture_hashes() {
+  local client="$1" fixture="$2" expected actual
+  shift 2
+  [[ -d "$(host_download_dir "$client")/$fixture" ]] || return 1
+  expected="$WORKDIR/artifacts/expected-$fixture-selected.sha256"
+  actual="$WORKDIR/artifacts/actual-$client-$fixture-selected.sha256"
+  : >"$expected"
+  : >"$actual"
+  for rel in "$@"; do
+    [[ -f "$WORKDIR/fixtures/$fixture/$rel" ]] || return 1
+    [[ -f "$(host_download_dir "$client")/$fixture/$rel" ]] || return 1
+    (cd "$WORKDIR/fixtures/$fixture" && sha256sum "$rel") >>"$expected" || return 1
+    (cd "$(host_download_dir "$client")/$fixture" && sha256sum "$rel") >>"$actual" || return 1
+  done
+  diff -u "$expected" "$actual" >/dev/null
+}
+
+verify_fixture_file_absent_or_empty() {
+  local client="$1" fixture="$2" rel="$3" path
+  path="$(host_download_dir "$client")/$fixture/$rel"
+  [[ ! -e "$path" ]] || [[ -f "$path" && ! -s "$path" ]]
+}
+
 run_local_case() {
   local row="$1" name seeder leecher fixture torrent torrent_fixture clients=()
   IFS='|' read -r name seeder leecher fixture <<<"$row"
@@ -929,6 +952,42 @@ run_multi_tracker_fallback_case() {
   [[ "$status" == "PASS" ]]
 }
 
+run_partial_file_selection_case() {
+  local status="PASS" fixture torrent info_hash files
+  append_report "## Protocol Local: rust-partial-file-selection"
+  append_report ""
+  log "running protocol local case rust-partial-file-selection"
+  fixture="$(case_fixture multi-128m rust-partial-file-selection)"
+  torrent="$(make_torrent "$fixture" "$fixture" private-explicit)"
+  info_hash="$(torrent_info_hash "$torrent")"
+  seed_fixture_for_client transmission "$fixture"
+  add_to_client transmission "$torrent" seed || status="FAIL"
+  add_to_client rusttorrentd "$torrent" || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
+    --data-urlencode "hash=$info_hash" \
+    --data-urlencode "id=0" \
+    --data-urlencode "priority=0" \
+    "$(client_url rusttorrentd)/api/qb/v2/torrents/filePrio" >/dev/null || status="FAIL"
+  bridge_client_peer_to_rust transmission "$info_hash" || true
+  wait_explicit_peer_complete "$TIMEOUT_LOCAL" "$fixture" "$info_hash" transmission transmission rusttorrentd || status="FAIL"
+  verify_selected_fixture_hashes rusttorrentd "$fixture" \
+    ./part-1.bin ./part-2.bin ./part-3.bin ./part-4.bin \
+    ./part-5.bin ./part-6.bin ./part-7.bin || status="FAIL"
+  verify_fixture_file_absent_or_empty rusttorrentd "$fixture" part-0.bin || status="FAIL"
+  files="$(curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/qb/v2/torrents/files?hash=$info_hash" || true)"
+  jq -e '. | length == 8 and .[0].priority == 0 and .[0].progress == 1 and ([.[1:][] | select(.priority > 0)] | length == 7)' <<<"$files" >/dev/null || status="FAIL"
+  append_report "- Seeder: transmission"
+  append_report "- Leecher: rusttorrentd"
+  append_report "- Fixture: multi-128m"
+  append_report "- Torrent mode: private explicit peer, file 0 skipped"
+  append_report "- Wanted files: part-1.bin through part-7.bin"
+  append_report "- Skipped file: part-0.bin absent or empty"
+  append_report "- Info hash: $info_hash"
+  append_report "- Status: **$status**"
+  append_report ""
+  [[ "$status" == "PASS" ]]
+}
+
 run_qbit_mutation_facade_case() {
   local status="PASS" fixture torrent info_hash original replacement trackers
   append_report "## Protocol Local: rust-qbit-mutation-facade"
@@ -987,6 +1046,9 @@ run_protocol_local_matrix() {
   fi
   if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "rust-multi-tracker-fallback" ]]; then
     run_multi_tracker_fallback_case || failures=$((failures + 1))
+  fi
+  if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "rust-partial-file-selection" ]]; then
+    run_partial_file_selection_case || failures=$((failures + 1))
   fi
   if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "rust-qbit-mutation-facade" ]]; then
     run_qbit_mutation_facade_case || failures=$((failures + 1))

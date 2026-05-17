@@ -124,7 +124,7 @@ or compatibility behaviors.
 | `magnet-dht-only` | Magnet metadata and peer discovery without trackers. | Complete and hash match | Planned |
 | `rust-multi-tracker-fallback` | Dead tracker in the first tier, working tracker fallback. | Rust completes through fallback tracker | Implemented |
 | `private-torrent-no-dht-pex` | Private torrent policy enforcement. | DHT/PEX disabled and explicit peer transfer still works | Planned |
-| `partial-file-selection` | Multi-file priority and wanted/unwanted file behavior during transfer. | Wanted files complete; skipped files remain absent or sparse | Planned |
+| `rust-partial-file-selection` | Multi-file priority and wanted/unwanted file behavior during transfer. | Wanted files complete; skipped file remains absent or empty | Implemented |
 | `force-recheck-corruption-repair` | Corrupt an on-disk block, force recheck, and redownload. | Corruption detected and repaired | Planned |
 | `resume-after-partial-download` | Stop Rust mid-transfer and resume from persisted partial data. | Progress is retained and final hash matches | Planned |
 | `endgame-multi-peer` | Last-piece contention with multiple seeders. | Completes without duplicate-write corruption or stalls | Planned |
@@ -160,7 +160,7 @@ strong baseline interoperability.
 | DHT, PEX, LSD | `dht-only-discovery`, `pex-peer-discovery`, `lsd-docker-lan-discovery`, `dht-bootstrap-recovery-after-restart` |
 | Trackers | `http-tracker-announce-scrape`, `udp-tracker-announce-scrape`, `multi-tracker-tiers`, `private-tracker-policy` |
 | Protocol behavior | `extension-handshake`, `ut-metadata`, `fast-extension`, `choke-unchoke-contention`, `optimistic-unchoke`, `endgame-mode`, `rarest-first-partial-availability` |
-| File layouts | `single-file`, `deep-multi-file-tree`, `empty-files`, `unicode-paths`, `space-and-shell-hostile-paths`, `small-piece-size`, `large-piece-size`, `partial-file-selection` |
+| File layouts | `single-file`, `deep-multi-file-tree`, `empty-files`, `unicode-paths`, `space-and-shell-hostile-paths`, `small-piece-size`, `large-piece-size` |
 | State and recovery | `pause-resume-persistence`, `force-recheck`, `move-storage-path`, `delete-torrent-only`, `delete-with-data`, `resume-partial-files`, `corrupt-block-repair`, `missing-file-recovery` |
 | API compatibility | `qbit-arr-endpoints`, `transmission-write-rpc`, `deluge-write-json-rpc`, `error-shape-compatibility`, `tracker-mutation-compatibility`, `file-priority-compatibility` |
 | Performance and stress | `hundreds-small-torrents`, `many-peers-per-torrent`, `parallel-public-torrents`, `long-active-soak`, `memory-fd-growth`, `rate-limit-behavior` |
