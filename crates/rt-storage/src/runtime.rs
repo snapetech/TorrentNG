@@ -129,6 +129,18 @@ impl StorageRuntime {
         self.backend.supports_fixed_buffers()
     }
 
+    pub fn backend_supports_registered_files(&self) -> bool {
+        self.backend.supports_registered_files()
+    }
+
+    pub fn backend_max_batch_len(&self) -> usize {
+        self.backend.max_batch_len()
+    }
+
+    pub fn backend_fixed_buffer_len(&self) -> usize {
+        self.backend.fixed_buffer_len()
+    }
+
     fn open_read(&self, path: &Path) -> Result<Arc<File>, StorageError> {
         self.handles
             .get_or_open(path, false, false)

@@ -103,9 +103,22 @@ const JOB_STATE_CANCELLED: &str = "cancelled";
 const JOB_STATE_COMPLETED: &str = "completed";
 const MAX_IN_MEMORY_PIECE_ASSEMBLIES: usize = 64;
 const MAX_IN_MEMORY_PIECE_ASSEMBLY_BYTES_PER_TORRENT: usize = 64 * 1024 * 1024;
+const PEER_REQUEST_PIPELINE_NORMAL: usize = 32;
+const PEER_REQUEST_PIPELINE_CONSTRAINED: usize = 8;
 
 fn effective_piece_assembly_soft_cap(configured_bytes: usize) -> usize {
     configured_bytes.min(MAX_IN_MEMORY_PIECE_ASSEMBLY_BYTES_PER_TORRENT)
+}
+
+fn memory_aware_request_pipeline(piece_assembly_bytes: usize, soft_cap_bytes: usize) -> usize {
+    if soft_cap_bytes == 0 {
+        return 0;
+    }
+    if piece_assembly_bytes.saturating_mul(4) >= soft_cap_bytes.saturating_mul(3) {
+        PEER_REQUEST_PIPELINE_CONSTRAINED
+    } else {
+        PEER_REQUEST_PIPELINE_NORMAL
+    }
 }
 
 /// A block received from a peer.
@@ -316,6 +329,7 @@ pub struct TorrentTask {
     piece_assembly_bytes: usize,
     piece_assembly_soft_cap_bytes: usize,
     piece_assembly_evictions: u64,
+    peer_request_window_reductions: u64,
     dirty_pieces_since_barrier: HashSet<u32>,
     completed_piece_verify_from_memory: u64,
     completed_piece_verify_from_disk: u64,
@@ -413,6 +427,7 @@ impl TorrentTask {
                 piece_assembly_cap_bytes,
             ),
             piece_assembly_evictions: 0,
+            peer_request_window_reductions: 0,
             dirty_pieces_since_barrier: HashSet::new(),
             completed_piece_verify_from_memory: 0,
             completed_piece_verify_from_disk: 0,
@@ -1024,6 +1039,7 @@ impl TorrentTask {
             piece_assembly_buffers: self.piece_assemblies.len() as u64,
             piece_assembly_bytes: self.piece_assembly_bytes as u64,
             piece_assembly_evictions: self.piece_assembly_evictions,
+            peer_request_window_reductions: self.peer_request_window_reductions,
             storage: self.storage.stats(),
         }
     }
@@ -1354,8 +1370,6 @@ impl TorrentTask {
     }
 
     async fn refill_peer_requests(&mut self, peer: SocketAddr) {
-        const REQUEST_PIPELINE: usize = 32;
-
         let Some(handle) = self.active_peers.get_mut(&peer) else {
             return;
         };
@@ -1363,7 +1377,16 @@ impl TorrentTask {
             return;
         }
 
-        while handle.outstanding < REQUEST_PIPELINE {
+        let request_pipeline = memory_aware_request_pipeline(
+            self.piece_assembly_bytes,
+            self.piece_assembly_soft_cap_bytes,
+        );
+        if request_pipeline < PEER_REQUEST_PIPELINE_NORMAL {
+            self.peer_request_window_reductions =
+                self.peer_request_window_reductions.saturating_add(1);
+        }
+
+        while handle.outstanding < request_pipeline {
             let req = match self.picker.pick(&handle.peer_has) {
                 Some(req) => req,
                 None => {
@@ -3401,6 +3424,23 @@ mod tests {
             effective_piece_assembly_soft_cap(512 * 1024 * 1024),
             MAX_IN_MEMORY_PIECE_ASSEMBLY_BYTES_PER_TORRENT
         );
+    }
+
+    #[test]
+    fn request_pipeline_reduces_near_piece_assembly_cap() {
+        assert_eq!(
+            memory_aware_request_pipeline(0, 1024),
+            PEER_REQUEST_PIPELINE_NORMAL
+        );
+        assert_eq!(
+            memory_aware_request_pipeline(767, 1024),
+            PEER_REQUEST_PIPELINE_NORMAL
+        );
+        assert_eq!(
+            memory_aware_request_pipeline(768, 1024),
+            PEER_REQUEST_PIPELINE_CONSTRAINED
+        );
+        assert_eq!(memory_aware_request_pipeline(1, 0), 0);
     }
 
     #[test]

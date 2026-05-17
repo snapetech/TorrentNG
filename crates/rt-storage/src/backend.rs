@@ -194,12 +194,34 @@ impl DiskBackend for SelectedDiskBackend {
             SelectedDiskBackendInner::Uring(backend) => backend.supports_fixed_buffers(),
         }
     }
+
+    fn supports_registered_files(&self) -> bool {
+        match &self.inner {
+            SelectedDiskBackendInner::Pread(backend) => backend.supports_registered_files(),
+            SelectedDiskBackendInner::Uring(backend) => backend.supports_registered_files(),
+        }
+    }
+
+    fn max_batch_len(&self) -> usize {
+        match &self.inner {
+            SelectedDiskBackendInner::Pread(backend) => backend.max_batch_len(),
+            SelectedDiskBackendInner::Uring(backend) => backend.max_batch_len(),
+        }
+    }
+
+    fn fixed_buffer_len(&self) -> usize {
+        match &self.inner {
+            SelectedDiskBackendInner::Pread(backend) => backend.fixed_buffer_len(),
+            SelectedDiskBackendInner::Uring(backend) => backend.fixed_buffer_len(),
+        }
+    }
 }
 
 /// Probe information for the `io_uring` backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UringProbe {
     pub usable: bool,
+    pub registered_files: bool,
     pub fixed_buffers: bool,
     pub reason: String,
 }
@@ -208,6 +230,7 @@ pub struct UringProbe {
 pub struct UringBackend {
     tx: mpsc::Sender<Job>,
     _workers: Vec<thread::JoinHandle<()>>,
+    registered_files_supported: Arc<AtomicBool>,
     fixed_buffers_supported: Arc<AtomicBool>,
 }
 
@@ -216,20 +239,25 @@ impl UringBackend {
         let threads = threads.max(1);
         let (tx, rx) = mpsc::channel::<Job>();
         let rx = Arc::new(Mutex::new(rx));
+        let registered_files_supported = Arc::new(AtomicBool::new(false));
         let fixed_buffers_supported = Arc::new(AtomicBool::new(false));
         let mut workers = Vec::with_capacity(threads);
         for i in 0..threads {
             let rx = Arc::clone(&rx);
+            let registered_files_supported = Arc::clone(&registered_files_supported);
             let fixed_buffers_supported = Arc::clone(&fixed_buffers_supported);
             let handle = thread::Builder::new()
                 .name(format!("tng-uring-{i}"))
-                .spawn(move || UringWorker::new(rx, fixed_buffers_supported).run())
+                .spawn(move || {
+                    UringWorker::new(rx, registered_files_supported, fixed_buffers_supported).run()
+                })
                 .expect("spawn io_uring worker");
             workers.push(handle);
         }
         Self {
             tx,
             _workers: workers,
+            registered_files_supported,
             fixed_buffers_supported,
         }
     }
@@ -244,6 +272,7 @@ impl UringBackend {
             if disabled != 0 {
                 return Ok(UringProbe {
                     usable: false,
+                    registered_files: false,
                     fixed_buffers: false,
                     reason: format!("kernel reports io_uring disabled ({disabled})"),
                 });
@@ -253,19 +282,20 @@ impl UringBackend {
                 Err(e) => {
                     return Ok(UringProbe {
                         usable: false,
+                        registered_files: false,
                         fixed_buffers: false,
                         reason: format!("io_uring probe failed: {e}"),
                     });
                 }
             };
+            let registered_files = probe_registered_files(&ring).is_ok();
             let fixed_buffers = probe_fixed_buffers(&ring).is_ok();
-            let reason = if fixed_buffers {
-                "io_uring probe succeeded with fixed-buffer registration".to_string()
-            } else {
-                "io_uring probe succeeded without fixed-buffer registration".to_string()
-            };
+            let reason = format!(
+                "io_uring probe succeeded; registered_files={registered_files} fixed_buffers={fixed_buffers}"
+            );
             return Ok(UringProbe {
                 usable: true,
+                registered_files,
                 fixed_buffers,
                 reason,
             });
@@ -275,11 +305,17 @@ impl UringBackend {
         {
             Ok(UringProbe {
                 usable: false,
+                registered_files: false,
                 fixed_buffers: false,
                 reason: "io_uring is only available on Linux; using pread fallback".to_string(),
             })
         }
     }
+}
+
+fn probe_registered_files(ring: &IoUring) -> io::Result<()> {
+    ring.submitter().register_files_sparse(1)?;
+    ring.submitter().unregister_files()
 }
 
 fn probe_fixed_buffers(ring: &IoUring) -> io::Result<()> {
@@ -393,6 +429,22 @@ impl DiskBackend for UringBackend {
     fn supports_fixed_buffers(&self) -> bool {
         self.fixed_buffers_supported.load(Ordering::Relaxed)
     }
+
+    fn supports_registered_files(&self) -> bool {
+        self.registered_files_supported.load(Ordering::Relaxed)
+    }
+
+    fn max_batch_len(&self) -> usize {
+        URING_BATCH_LIMIT
+    }
+
+    fn fixed_buffer_len(&self) -> usize {
+        if self.supports_fixed_buffers() {
+            URING_FIXED_BUFFER_LEN
+        } else {
+            0
+        }
+    }
 }
 
 struct UringWorker {
@@ -430,10 +482,17 @@ enum PendingUring {
 }
 
 impl UringWorker {
-    fn new(rx: Arc<Mutex<mpsc::Receiver<Job>>>, fixed_buffers_supported: Arc<AtomicBool>) -> Self {
+    fn new(
+        rx: Arc<Mutex<mpsc::Receiver<Job>>>,
+        registered_files_supported: Arc<AtomicBool>,
+        fixed_buffers_supported: Arc<AtomicBool>,
+    ) -> Self {
         let ring = IoUring::new(URING_ENTRIES).expect("create io_uring");
         let registered_files = match ring.submitter().register_files_sparse(URING_FILE_SLOTS) {
-            Ok(()) => true,
+            Ok(()) => {
+                registered_files_supported.store(true, Ordering::Relaxed);
+                true
+            }
             Err(e) => {
                 tracing::debug!(error = %e, "io_uring fixed-file table unavailable");
                 false
@@ -836,6 +895,21 @@ pub trait DiskBackend: Send + Sync {
     fn supports_fixed_buffers(&self) -> bool {
         false
     }
+
+    /// Whether the backend can use registered file slots.
+    fn supports_registered_files(&self) -> bool {
+        false
+    }
+
+    /// Maximum number of jobs the backend submits as one batch.
+    fn max_batch_len(&self) -> usize {
+        1
+    }
+
+    /// Size of each registered fixed buffer, or 0 when unsupported.
+    fn fixed_buffer_len(&self) -> usize {
+        0
+    }
 }
 
 enum Job {
@@ -1004,6 +1078,9 @@ mod tests {
         assert_eq!(backend.kind(), BackendKind::Pread);
         assert_eq!(backend.selection().requested, BackendRequest::Pread);
         assert!(!backend.supports_fixed_buffers());
+        assert!(!backend.supports_registered_files());
+        assert_eq!(backend.max_batch_len(), 1);
+        assert_eq!(backend.fixed_buffer_len(), 0);
     }
 
     #[test]
@@ -1021,6 +1098,7 @@ mod tests {
         assert!(!probe.reason.is_empty());
         if !probe.usable {
             assert!(!probe.fixed_buffers);
+            assert!(!probe.registered_files);
         }
     }
 
@@ -1125,5 +1203,10 @@ mod tests {
         let frame = backend.pread(file, frame, 32).await.unwrap().unwrap();
         assert_eq!(frame.as_slice(), b"real-uring");
         assert_eq!(backend.supports_fixed_buffers(), probe.fixed_buffers);
+        assert_eq!(backend.supports_registered_files(), probe.registered_files);
+        assert_eq!(backend.max_batch_len(), URING_BATCH_LIMIT);
+        if backend.supports_fixed_buffers() {
+            assert_eq!(backend.fixed_buffer_len(), URING_FIXED_BUFFER_LEN);
+        }
     }
 }

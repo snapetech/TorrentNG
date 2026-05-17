@@ -4386,6 +4386,7 @@ mod tests {
                     piece_assembly_buffers: 2,
                     piece_assembly_bytes: 4096,
                     piece_assembly_evictions: 1,
+                    peer_request_window_reductions: 6,
                     ..Default::default()
                 });
             }
@@ -4454,6 +4455,7 @@ mod tests {
                     piece_assembly_buffers: 2,
                     piece_assembly_bytes: 4096,
                     piece_assembly_evictions: 1,
+                    peer_request_window_reductions: 6,
                     ..Default::default()
                 });
             }
@@ -4826,6 +4828,7 @@ mod tests {
                     piece_assembly_buffers: 2,
                     piece_assembly_bytes: 4096,
                     piece_assembly_evictions: 1,
+                    peer_request_window_reductions: 6,
                     ..Default::default()
                 });
             }
@@ -4913,6 +4916,7 @@ mod tests {
         assert_eq!(stats.piece_assembly_buffers, 2);
         assert_eq!(stats.piece_assembly_bytes, 4096);
         assert_eq!(stats.piece_assembly_evictions, 1);
+        assert_eq!(stats.peer_request_window_reductions, 6);
         let resources = stats.resources.expect("resource snapshot");
         let storage_frame = MemoryClass::StorageFrame as usize;
         assert_eq!(

@@ -376,6 +376,8 @@ rTorrent over XMLRPC.
 | `torrentng_storage_*_by_class_total{class=...}` | counter | Read/write operation and byte counters split by scheduler I/O class |
 | `torrentng_storage_backend_selected{backend=...}` | gauge | Global storage backend selected at runtime (`pread` or future `uring`) |
 | `torrentng_storage_backend_fixed_buffers_supported` | gauge | Whether the selected backend can use registered fixed buffers |
+| `torrentng_storage_backend_registered_files_supported` | gauge | Whether the selected backend can use registered file slots |
+| `torrentng_storage_backend_{max_batch_len,fixed_buffer_bytes}` | gauge | Selected backend batching and fixed-buffer sizing |
 | `torrentng_storage_backend_read_*` | counter | Actual backend disk read operations and bytes, excluding peer-read cache hits |
 | `torrentng_storage_*_latency_nanoseconds` | histogram/counter | Storage queue plus execution latency buckets and cumulative totals for read, write, sync, and hash work |
 | `torrentng_storage_*_latency_nanoseconds_by_device_total{device=...,profile=...}` | counter | Storage read/write/sync/hash latency totals split by resolved storage device/profile |
@@ -386,6 +388,7 @@ rTorrent over XMLRPC.
 | `torrentng_storage_page_cache_advise_*` | counter | Page-cache advice calls (`SEQUENTIAL`, `WILLNEED`, `DONTNEED`) and failures from the storage scheduler |
 | `torrentng_storage_sparse_*` | counter | Sparse recheck data extents, skipped hole bytes, and seek fallback count |
 | `torrentng_piece_assembly_*` | gauge/counter | In-memory completed-piece assembly buffers, bytes, and budget evictions |
+| `torrentng_peer_request_window_reductions_total` | counter | Peer request refills reduced because memory pressure limited in-flight piece data |
 | `torrentng_memory_*` | gauge/counter | Resource governor cap, current process-owned usage, pressure state, per-class caps/usage, and denied allocations |
 | `torrentng_api_requests_total` | counter | API requests served |
 | `torrentng_sync_cycles_total` | counter | Track 1 sidecar rTorrent sync cycles completed |

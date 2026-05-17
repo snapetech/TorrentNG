@@ -118,6 +118,7 @@ pub struct EngineStats {
     pub piece_assembly_buffers: u64,
     pub piece_assembly_bytes: u64,
     pub piece_assembly_evictions: u64,
+    pub peer_request_window_reductions: u64,
     pub resources: Option<ResourceSnapshot>,
 }
 
@@ -141,6 +142,7 @@ pub struct TorrentRuntimeStats {
     pub piece_assembly_buffers: u64,
     pub piece_assembly_bytes: u64,
     pub piece_assembly_evictions: u64,
+    pub peer_request_window_reductions: u64,
     pub storage: StorageIoStats,
 }
 
@@ -173,6 +175,9 @@ impl EngineStats {
         self.piece_assembly_evictions = self
             .piece_assembly_evictions
             .saturating_add(runtime.piece_assembly_evictions);
+        self.peer_request_window_reductions = self
+            .peer_request_window_reductions
+            .saturating_add(runtime.peer_request_window_reductions);
 
         let storage = runtime.storage;
         self.storage_file_pool_capacity = self
@@ -703,6 +708,7 @@ mod tests {
             piece_assembly_buffers: 19,
             piece_assembly_bytes: 20,
             piece_assembly_evictions: 21,
+            peer_request_window_reductions: 22,
             storage,
         });
 
@@ -764,5 +770,6 @@ mod tests {
         assert_eq!(stats.piece_assembly_buffers, 19);
         assert_eq!(stats.piece_assembly_bytes, 20);
         assert_eq!(stats.piece_assembly_evictions, 21);
+        assert_eq!(stats.peer_request_window_reductions, 22);
     }
 }
