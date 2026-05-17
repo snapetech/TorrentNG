@@ -1,6 +1,6 @@
 #![recursion_limit = "256"]
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use axum::{
     extract::State,
@@ -11,8 +11,8 @@ use axum::{
 };
 use base64::{engine::general_purpose, Engine as _};
 use rt_engine::{
-    EngineGlobalLimits, EngineHandle, EnginePeerSnapshot, EnginePieceState, EngineTorrentMetadata,
-    QueueMove,
+    EngineGlobalLimits, EngineHandle, EnginePeerSnapshot, EnginePieceState, EngineTorrentLimits,
+    EngineTorrentMetadata, QueueMove,
 };
 use rt_metainfo::{parse_magnet, parse_torrent};
 use rt_session::SessionRegistry;
@@ -26,6 +26,7 @@ pub struct AppState {
     pub registry: Arc<RwLock<SessionRegistry>>,
     pub engine: Option<EngineHandle>,
     pub session: Arc<RwLock<TransmissionSessionSettings>>,
+    pub torrent_limits: Arc<RwLock<HashMap<String, EngineTorrentLimits>>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -119,6 +120,7 @@ impl AppState {
             registry,
             engine: None,
             session: Arc::new(RwLock::new(TransmissionSessionSettings::default())),
+            torrent_limits: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -127,6 +129,7 @@ impl AppState {
             registry,
             engine: Some(engine),
             session: Arc::new(RwLock::new(TransmissionSessionSettings::default())),
+            torrent_limits: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -314,7 +317,8 @@ async fn torrent_set(state: &AppState, args: &Value) -> Result<Value, String> {
         .get("download-dir")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    if labels.is_none() && location.is_none() {
+    let limit_updates = transmission_torrent_limit_updates(args);
+    if labels.is_none() && location.is_none() && limit_updates.is_none() {
         return Ok(json!({}));
     }
     for hash in ids(state, args).await {
@@ -352,8 +356,115 @@ async fn torrent_set(state: &AppState, args: &Value) -> Result<Value, String> {
                 }
             }
         }
+        if let Some(updates) = &limit_updates {
+            let mut limits = transmission_torrent_limits(state, &hash)
+                .await
+                .unwrap_or_default();
+            updates.apply(&mut limits);
+            state
+                .torrent_limits
+                .write()
+                .await
+                .insert(hash.clone(), limits.clone());
+            if let Some(engine) = &state.engine {
+                engine.update_torrent_limits(hash, limits).await?;
+            }
+        }
     }
     Ok(json!({}))
+}
+
+#[derive(Debug, Default)]
+struct TransmissionTorrentLimitUpdates {
+    download_limit: Option<Option<i64>>,
+    upload_limit: Option<Option<i64>>,
+    max_connections: Option<Option<i64>>,
+    seed_ratio_limit: Option<Option<f64>>,
+    seed_idle_limit: Option<Option<i64>>,
+    bandwidth_priority: Option<i64>,
+    sequential_download: Option<bool>,
+}
+
+impl TransmissionTorrentLimitUpdates {
+    fn apply(&self, limits: &mut EngineTorrentLimits) {
+        if let Some(value) = self.download_limit {
+            limits.download_limit = value;
+        }
+        if let Some(value) = self.upload_limit {
+            limits.upload_limit = value;
+        }
+        if let Some(value) = self.max_connections {
+            limits.max_connections = value;
+        }
+        if let Some(value) = self.seed_ratio_limit {
+            limits.seed_ratio_limit = value;
+        }
+        if let Some(value) = self.seed_idle_limit {
+            limits.seed_idle_limit = value;
+        }
+        if let Some(value) = self.sequential_download {
+            limits.sequential_download = value;
+        }
+    }
+
+    fn has_updates(&self) -> bool {
+        self.download_limit.is_some()
+            || self.upload_limit.is_some()
+            || self.max_connections.is_some()
+            || self.seed_ratio_limit.is_some()
+            || self.seed_idle_limit.is_some()
+            || self.bandwidth_priority.is_some()
+            || self.sequential_download.is_some()
+    }
+}
+
+fn transmission_torrent_limit_updates(args: &Value) -> Option<TransmissionTorrentLimitUpdates> {
+    let mut updates = TransmissionTorrentLimitUpdates::default();
+    if let Some(value) = transmission_i64_arg(args, "download-limit") {
+        updates.download_limit = Some(Some(transmission_kib_to_bytes(value)));
+    }
+    if matches!(transmission_bool_arg(args, "download-limited"), Some(false)) {
+        updates.download_limit = Some(None);
+    }
+    if let Some(value) = transmission_i64_arg(args, "upload-limit") {
+        updates.upload_limit = Some(Some(transmission_kib_to_bytes(value)));
+    }
+    if matches!(transmission_bool_arg(args, "upload-limited"), Some(false)) {
+        updates.upload_limit = Some(None);
+    }
+    if let Some(value) = transmission_i64_arg(args, "peer-limit") {
+        updates.max_connections = Some(Some(value.max(0)));
+    }
+    if let Some(value) = transmission_i64_arg(args, "max-connected-peers") {
+        updates.max_connections = Some(Some(value.max(0)));
+    }
+    if let Some(mode) = transmission_i64_arg(args, "seed-ratio-mode") {
+        if mode == 0 {
+            updates.seed_ratio_limit = Some(None);
+        }
+    }
+    if let Some(value) = transmission_f64_arg(args, "seed-ratio-limit") {
+        updates.seed_ratio_limit = Some(Some(value));
+    }
+    if let Some(mode) = transmission_i64_arg(args, "seed-idle-mode") {
+        if mode == 0 {
+            updates.seed_idle_limit = Some(None);
+        }
+    }
+    if let Some(value) = transmission_i64_arg(args, "seed-idle-limit") {
+        updates.seed_idle_limit = Some(Some(value.max(0)));
+    }
+    if let Some(value) = transmission_i64_arg(args, "bandwidth-priority") {
+        updates.bandwidth_priority = Some(value.clamp(-1, 1));
+    }
+    if let Some(value) = transmission_bool_arg(args, "sequential-download") {
+        updates.sequential_download = Some(value);
+    }
+    if updates.has_updates() {
+        Some(updates)
+    } else {
+        None
+    }
 }
 
 async fn torrent_set_tracker_list(state: &AppState, args: &Value) -> Result<Value, String> {
@@ -785,6 +896,7 @@ async fn torrent_get(state: &AppState, args: &Value) -> Value {
     };
     let mut metadata = std::collections::HashMap::new();
     let mut queue_positions = std::collections::HashMap::new();
+    let mut limits_by_hash = state.torrent_limits.read().await.clone();
     if let Some(engine) = &state.engine {
         for entry in &entries {
             if let Ok(meta) = engine.torrent_metadata(entry.info_hash.clone()).await {
@@ -792,6 +904,9 @@ async fn torrent_get(state: &AppState, args: &Value) -> Value {
             }
             if let Ok(position) = engine.queue_priority(entry.info_hash.clone()).await {
                 queue_positions.insert(entry.info_hash.clone(), position);
+            }
+            if let Ok(limits) = engine.torrent_limits(entry.info_hash.clone()).await {
+                limits_by_hash.insert(entry.info_hash.clone(), limits);
             }
         }
     }
@@ -813,6 +928,7 @@ async fn torrent_get(state: &AppState, args: &Value) -> Value {
         .enumerate()
         .map(|(idx, entry)| {
             let meta = metadata.get(&entry.info_hash);
+            let limits = limits_by_hash.get(&entry.info_hash);
             let mut obj = serde_json::Map::new();
             for field in &fields {
                 let normalized_field = field.replace('_', "-");
@@ -838,10 +954,20 @@ async fn torrent_get(state: &AppState, args: &Value) -> Value {
                     "uploadRatio" | "upload-ratio" => json!(entry.stats.ratio()),
                     "rateDownload" | "rate-download" => json!(0),
                     "rateUpload" | "rate-upload" => json!(0),
-                    "downloadLimit" | "download-limit" => json!(0),
-                    "downloadLimited" | "download-limited" => json!(false),
-                    "uploadLimit" | "upload-limit" => json!(0),
-                    "uploadLimited" | "upload-limited" => json!(false),
+                    "downloadLimit" | "download-limit" => json!(limits
+                        .and_then(|limits| limits.download_limit)
+                        .map(bytes_to_transmission_kib)
+                        .unwrap_or(0)),
+                    "downloadLimited" | "download-limited" => {
+                        json!(limits.and_then(|limits| limits.download_limit).is_some())
+                    }
+                    "uploadLimit" | "upload-limit" => json!(limits
+                        .and_then(|limits| limits.upload_limit)
+                        .map(bytes_to_transmission_kib)
+                        .unwrap_or(0)),
+                    "uploadLimited" | "upload-limited" => {
+                        json!(limits.and_then(|limits| limits.upload_limit).is_some())
+                    }
                     "status" => json!(transmission_status(entry.state.as_str())),
                     "downloadDir" | "download-dir" => json!(entry.save_path),
                     "labels" => json!(entry.tags),
@@ -863,10 +989,30 @@ async fn torrent_get(state: &AppState, args: &Value) -> Value {
                             .unwrap_or(idx as i32))
                     }
                     "recheckProgress" | "recheck-progress" => json!(0.0),
-                    "seedRatioLimit" | "seed-ratio-limit" => json!(-1.0),
-                    "seedRatioMode" | "seed-ratio-mode" => json!(0),
-                    "seedIdleLimit" | "seed-idle-limit" => json!(0),
-                    "seedIdleMode" | "seed-idle-mode" => json!(0),
+                    "seedRatioLimit" | "seed-ratio-limit" => json!(limits
+                        .and_then(|limits| limits.seed_ratio_limit)
+                        .unwrap_or(-1.0)),
+                    "seedRatioMode" | "seed-ratio-mode" => {
+                        json!(
+                            if limits.and_then(|limits| limits.seed_ratio_limit).is_some() {
+                                1
+                            } else {
+                                0
+                            }
+                        )
+                    }
+                    "seedIdleLimit" | "seed-idle-limit" => json!(limits
+                        .and_then(|limits| limits.seed_idle_limit)
+                        .unwrap_or(0)),
+                    "seedIdleMode" | "seed-idle-mode" => {
+                        json!(
+                            if limits.and_then(|limits| limits.seed_idle_limit).is_some() {
+                                1
+                            } else {
+                                0
+                            }
+                        )
+                    }
                     "addedDate" | "added-date" => json!(entry.added_at),
                     "activityDate" | "activity-date" => json!(entry.added_at),
                     "doneDate" | "done-date" => json!(entry.completed_at.unwrap_or(0)),
@@ -917,7 +1063,9 @@ async fn torrent_get(state: &AppState, args: &Value) -> Value {
                     "desiredAvailable" | "desired-available" => json!(0),
                     "corruptEver" | "corrupt-ever" => json!(0),
                     "manualAnnounceTime" | "manual-announce-time" => json!(0),
-                    "maxConnectedPeers" | "max-connected-peers" => json!(0),
+                    "maxConnectedPeers" | "max-connected-peers" => json!(limits
+                        .and_then(|limits| limits.max_connections)
+                        .unwrap_or(0)),
                     "webseeds" => json!(meta.map(|m| m.webseeds.clone()).unwrap_or_default()),
                     "webseedsSendingToUs" | "webseeds-sending-to-us" => json!(0),
                     "webseedsEx" | "webseeds-ex" => json!(transmission_webseeds_ex(meta)),
@@ -936,7 +1084,11 @@ async fn torrent_get(state: &AppState, args: &Value) -> Value {
                     }
                     "secondsDownloading" | "seconds-downloading" => json!(0),
                     "secondsSeeding" | "seconds-seeding" => json!(0),
-                    "sequentialDownload" | "sequential-download" => json!(false),
+                    "sequentialDownload" | "sequential-download" => {
+                        json!(limits
+                            .map(|limits| limits.sequential_download)
+                            .unwrap_or(false))
+                    }
                     "sequentialDownloadFromPiece" | "sequential-download-from-piece" => json!(0),
                     _ => Value::Null,
                 };
@@ -1248,6 +1400,15 @@ async fn default_download_dir(state: &AppState) -> String {
         .map(|entry| entry.save_path.clone())
         .unwrap_or_else(|| "/downloads".to_owned());
     dir
+}
+
+async fn transmission_torrent_limits(state: &AppState, hash: &str) -> Option<EngineTorrentLimits> {
+    if let Some(engine) = &state.engine {
+        if let Ok(limits) = engine.torrent_limits(hash.to_owned()).await {
+            return Some(limits);
+        }
+    }
+    state.torrent_limits.read().await.get(hash).cloned()
 }
 
 fn percent_done(total: u64, left: u64) -> f64 {
@@ -1949,6 +2110,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transmission_session_set_persists_broad_compat_settings_without_engine() {
+        let app =
+            build_transmission_router(AppState::new(Arc::new(RwLock::new(SessionRegistry::new()))));
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .header("content-type", "application/json")
+                    .header("x-transmission-session-id", SESSION_ID)
+                    .body(Body::from(
+                        r#"{"method":"session-set","arguments":{
+                            "download-dir":"/media",
+                            "incomplete-dir":"/partial",
+                            "incomplete-dir-enabled":true,
+                            "rename-partial-files":true,
+                            "start-added-torrents":false,
+                            "trash-original-torrent-files":true,
+                            "alt-speed-time-enabled":true,
+                            "alt-speed-time-begin":60,
+                            "alt-speed-time-end":120,
+                            "alt-speed-time-day":62,
+                            "download-queue-enabled":true,
+                            "download-queue-size":4,
+                            "seed-queue-enabled":true,
+                            "seed-queue-size":8,
+                            "peer-limit-global":200,
+                            "peer-limit-per-torrent":50,
+                            "peer-port":51413,
+                            "port-forwarding-enabled":true,
+                            "dht-enabled":false,
+                            "pex-enabled":false,
+                            "lpd-enabled":true,
+                            "utp-enabled":false,
+                            "preferred-transport":"utp",
+                            "blocklist-enabled":true,
+                            "blocklist-url":"https://example.invalid/blocklist.gz",
+                            "script-torrent-added-enabled":true,
+                            "script-torrent-added-filename":"/hooks/add.sh",
+                            "script-torrent-done-enabled":true,
+                            "script-torrent-done-filename":"/hooks/done.sh",
+                            "script-torrent-done-seeding-enabled":true,
+                            "script-torrent-done-seeding-filename":"/hooks/seed.sh",
+                            "seedRatioLimit":2.5,
+                            "seedRatioLimited":true,
+                            "idle-seeding-limit":1440,
+                            "idle-seeding-limit-enabled":true
+                        }}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .header("content-type", "application/json")
+                    .header("x-transmission-session-id", SESSION_ID)
+                    .body(Body::from(r#"{"method":"session-get"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        let args = &body["arguments"];
+        assert_eq!(args["download-dir"], "/media");
+        assert_eq!(args["incomplete-dir"], "/partial");
+        assert_eq!(args["incomplete-dir-enabled"], true);
+        assert_eq!(args["rename-partial-files"], true);
+        assert_eq!(args["start-added-torrents"], false);
+        assert_eq!(args["trash-original-torrent-files"], true);
+        assert_eq!(args["alt-speed-time-enabled"], true);
+        assert_eq!(args["alt-speed-time-begin"], 60);
+        assert_eq!(args["alt-speed-time-end"], 120);
+        assert_eq!(args["alt-speed-time-day"], 62);
+        assert_eq!(args["download-queue-enabled"], true);
+        assert_eq!(args["download-queue-size"], 4);
+        assert_eq!(args["seed-queue-enabled"], true);
+        assert_eq!(args["seed-queue-size"], 8);
+        assert_eq!(args["peer-limit-global"], 200);
+        assert_eq!(args["peer-limit-per-torrent"], 50);
+        assert_eq!(args["peer-port"], 51413);
+        assert_eq!(args["port-forwarding-enabled"], true);
+        assert_eq!(args["dht-enabled"], false);
+        assert_eq!(args["pex-enabled"], false);
+        assert_eq!(args["lpd-enabled"], true);
+        assert_eq!(args["utp-enabled"], false);
+        assert_eq!(args["preferred-transport"], "utp");
+        assert_eq!(args["blocklist-enabled"], true);
+        assert_eq!(
+            args["blocklist-url"],
+            "https://example.invalid/blocklist.gz"
+        );
+        assert_eq!(args["script-torrent-added-enabled"], true);
+        assert_eq!(args["script-torrent-added-filename"], "/hooks/add.sh");
+        assert_eq!(args["script-torrent-done-enabled"], true);
+        assert_eq!(args["script-torrent-done-filename"], "/hooks/done.sh");
+        assert_eq!(args["script-torrent-done-seeding-enabled"], true);
+        assert_eq!(
+            args["script-torrent-done-seeding-filename"],
+            "/hooks/seed.sh"
+        );
+        assert_eq!(args["seedRatioLimit"], 2.5);
+        assert_eq!(args["seedRatioLimited"], true);
+        assert_eq!(args["idle-seeding-limit"], 1440);
+        assert_eq!(args["idle-seeding-limit-enabled"], true);
+    }
+
+    #[tokio::test]
     async fn transmission_snake_case_rpc_roundtrips_v41_shape() {
         let registry = Arc::new(RwLock::new(SessionRegistry::new()));
         {
@@ -2174,6 +2450,66 @@ mod tests {
         let entry = reg.get(&"c".repeat(40)).unwrap();
         assert_eq!(entry.tags, vec!["tv".to_owned(), "hd".to_owned()]);
         assert_eq!(entry.save_path, "/new");
+    }
+
+    #[tokio::test]
+    async fn transmission_torrent_set_limits_roundtrip_without_engine() {
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        {
+            let mut reg = registry.write().await;
+            reg.add(TorrentEntry::new(
+                "e".repeat(40),
+                "epsilon".into(),
+                "/data".into(),
+            ))
+            .unwrap();
+        }
+        let hash = "e".repeat(40);
+        let app = build_transmission_router(AppState::new(registry));
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .header("content-type", "application/json")
+                    .header("x-transmission-session-id", SESSION_ID)
+                    .body(Body::from(format!(
+                        r#"{{"method":"torrent-set","arguments":{{"ids":["{hash}"],"download-limit":128,"download-limited":true,"upload-limit":64,"upload-limited":true,"peer-limit":42,"seed-ratio-limit":2.25,"seed-ratio-mode":1,"seed-idle-limit":90,"seed-idle-mode":1,"sequential-download":true}}}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .header("content-type", "application/json")
+                    .header("x-transmission-session-id", SESSION_ID)
+                    .body(Body::from(format!(
+                        r#"{{"method":"torrent-get","arguments":{{"ids":["{hash}"],"fields":["downloadLimit","downloadLimited","uploadLimit","uploadLimited","maxConnectedPeers","seedRatioLimit","seedRatioMode","seedIdleLimit","seedIdleMode","sequentialDownload"]}}}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        let torrent = &body["arguments"]["torrents"][0];
+        assert_eq!(torrent["downloadLimit"], 128);
+        assert_eq!(torrent["downloadLimited"], true);
+        assert_eq!(torrent["uploadLimit"], 64);
+        assert_eq!(torrent["uploadLimited"], true);
+        assert_eq!(torrent["maxConnectedPeers"], 42);
+        assert_eq!(torrent["seedRatioLimit"], 2.25);
+        assert_eq!(torrent["seedRatioMode"], 1);
+        assert_eq!(torrent["seedIdleLimit"], 90);
+        assert_eq!(torrent["seedIdleMode"], 1);
+        assert_eq!(torrent["sequentialDownload"], true);
     }
 
     #[tokio::test]

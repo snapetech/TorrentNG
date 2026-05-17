@@ -173,6 +173,11 @@ pub struct StorageIoStats {
     pub peer_read_cache_entries: usize,
     pub peer_read_cache_hits: u64,
     pub peer_read_cache_misses: u64,
+    pub peer_read_elevator_enabled: bool,
+    pub peer_read_elevator_queue_depth: usize,
+    pub peer_read_elevator_queued: usize,
+    pub peer_read_elevator_batches: u64,
+    pub peer_read_elevator_coalesced_requests: u64,
 }
 
 #[derive(Debug, Default)]
@@ -455,6 +460,8 @@ struct StorageCounters {
     preallocation_fallbacks: AtomicU64,
     peer_read_cache_hits: AtomicU64,
     peer_read_cache_misses: AtomicU64,
+    peer_read_elevator_batches: AtomicU64,
+    peer_read_elevator_coalesced_requests: AtomicU64,
 }
 
 impl Default for StorageCounters {
@@ -480,6 +487,8 @@ impl Default for StorageCounters {
             preallocation_fallbacks: AtomicU64::new(0),
             peer_read_cache_hits: AtomicU64::new(0),
             peer_read_cache_misses: AtomicU64::new(0),
+            peer_read_elevator_batches: AtomicU64::new(0),
+            peer_read_elevator_coalesced_requests: AtomicU64::new(0),
         }
     }
 }
@@ -552,6 +561,12 @@ impl PeerReadElevator {
             .await
             .map_err(|_| StorageError::Cancelled)?;
         rx.await.map_err(|_| StorageError::Cancelled)?
+    }
+
+    fn queued_len(&self) -> usize {
+        self.sender
+            .max_capacity()
+            .saturating_sub(self.sender.capacity())
     }
 }
 
@@ -651,6 +666,13 @@ async fn dispatch_peer_read_batch(
 
     match read {
         Ok(bytes) => {
+            counters
+                .peer_read_elevator_batches
+                .fetch_add(1, Ordering::Relaxed);
+            counters.peer_read_elevator_coalesced_requests.fetch_add(
+                batch.requests.len().saturating_sub(1) as u64,
+                Ordering::Relaxed,
+            );
             counters.backend_read_ops_by_class[class_index(IoClass::PeerRead)]
                 .fetch_add(1, Ordering::Relaxed);
             counters.backend_bytes_read_by_class[class_index(IoClass::PeerRead)]
@@ -831,6 +853,13 @@ impl MountScheduler {
             .lock()
             .expect("peer read cache mutex poisoned")
             .len();
+        let peer_read_elevator_queued = self
+            .peer_read_elevator
+            .lock()
+            .expect("peer read elevator mutex poisoned")
+            .as_ref()
+            .map(PeerReadElevator::queued_len)
+            .unwrap_or(0);
         StorageIoStats {
             file_pool: self.file_pool.stats(),
             io_queue_depth: self.io_pool.queued(),
@@ -862,6 +891,17 @@ impl MountScheduler {
             peer_read_cache_entries,
             peer_read_cache_hits: self.counters.peer_read_cache_hits.load(Ordering::Relaxed),
             peer_read_cache_misses: self.counters.peer_read_cache_misses.load(Ordering::Relaxed),
+            peer_read_elevator_enabled: self.peer_read_elevator_enabled,
+            peer_read_elevator_queue_depth: self.peer_read_elevator_queue_depth,
+            peer_read_elevator_queued,
+            peer_read_elevator_batches: self
+                .counters
+                .peer_read_elevator_batches
+                .load(Ordering::Relaxed),
+            peer_read_elevator_coalesced_requests: self
+                .counters
+                .peer_read_elevator_coalesced_requests
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -1818,6 +1858,14 @@ mod tests {
         assert!(
             stats.backend_read_ops_by_class[class_index(IoClass::PeerRead)] * 5 <= blocks as u64,
             "expected elevator to reduce backend reads; stats={stats:?}"
+        );
+        assert!(stats.peer_read_elevator_enabled);
+        assert!(stats.peer_read_elevator_queue_depth >= blocks);
+        assert_eq!(stats.peer_read_elevator_queued, 0);
+        assert!(stats.peer_read_elevator_batches > 0);
+        assert!(
+            stats.peer_read_elevator_coalesced_requests > 0,
+            "expected elevator to coalesce requests; stats={stats:?}"
         );
     }
 }

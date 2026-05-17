@@ -82,14 +82,14 @@ Local surface: `crates/rt-api-transmission`.
 | Protocol shape | Transmission 4.1 JSON-RPC 2.0 uses snake_case; older RPC uses kebab/camel strings | Implemented: JSON-RPC 2.0 single and batch envelopes with `params`, direct `result`, and error objects; snake_case methods/args normalize to native handlers; old envelope remains supported |
 | CSRF session ID | `X-Transmission-Session-Id` retry flow | Implemented |
 | Session reads | `session_get`, `session_stats`, `session_access_control` | Implemented; `session_get` supports field projection |
-| Session writes | `session_set`, `session_close`, queue-stalled enable/disable | Implemented for native limits and compatibility no-ops |
+| Session writes | `session_set`, `session_close`, queue-stalled enable/disable | Implemented for native limits plus broad compatibility-state roundtrip for paths, queues, scheduler, peer/network, blocklist, scripts, and seeding settings |
 | Groups | `group_get`, `group_set` | Accepted as compatibility no-ops |
 | Torrent actions | start, start now, stop, verify, reannounce, remove | Implemented |
 | Torrent add | filename magnet, base64 metainfo, paused, download dir, labels | Implemented |
 | Torrent reads | `torrent_get` common fields: identity, status, size/progress, counters, labels, paths, files, file stats, trackers, tracker stats, peers, queue, dates, private flag, magnet link; object and table formats; recently-active removed list | Implemented |
-| Torrent writes | `torrent_set`, tracker list, file priorities, wanted/unwanted, location, rename path | Implemented where native engine supports it; accepted as no-op otherwise |
+| Torrent writes | `torrent_set`, tracker list, file priorities, wanted/unwanted, location, rename path | Implemented where native engine supports it; labels, location, speed limits, peer limits, seed limits, and sequential mode roundtrip in facade state when no engine is attached |
 | Utility | `port_test`, `blocklist_update`, `free_space` | Implemented as compatibility responses |
-| Remaining field depth | detailed availability depth, group internals, live webseed activity, detailed session script/blocklist/preferred transport settings | Gap or compatibility placeholder |
+| Remaining field depth | detailed availability depth, group internals, live webseed activity, and native-backed effects for script/blocklist/preferred transport settings | Gap or compatibility placeholder |
 
 ## Deluge JSON-RPC Facade
 
@@ -102,9 +102,9 @@ Local surface: `crates/rt-api-deluge`.
 | Web host management | add/edit/remove host, connected, hosts, host status, connect/disconnect/start/stop daemon | Implemented as native/no-op compatibility |
 | Web UI | add torrents, URL download placeholder, update UI, events, torrent files, plugin list/info/upload/update/save config | Implemented; update UI honors requested torrent fields and emits filter/stat shape; URL download does not perform server-side network fetch |
 | Core session reads | stats, session status/state, rates, connections, filter tree, cache status, config, config values, config value, free space, listen port, external IP, path size, libtorrent version | Implemented |
-| Core torrent reads | torrents status, torrent status, torrent file status | Implemented with requested-field projection and label/state/hash filter dictionaries |
+| Core torrent reads | torrents status, torrent status, torrent file status | Implemented with requested-field projection, label/state/hash filter dictionaries, and torrent option projection |
 | Core torrent lifecycle | add magnet, add torrent file, pause, resume, force recheck, remove | Implemented |
-| Core torrent mutation | queue movement, set options, file priorities, trackers, prioritize first/last, connect peer, rename files/folder, move storage | Implemented where native engine supports it; accepted as no-op otherwise |
+| Core torrent mutation | queue movement, set options, file priorities, trackers, prioritize first/last, connect peer, rename files/folder, move storage | Implemented where native engine supports it; torrent options roundtrip in facade state when no engine is attached |
 | Plugin APIs | label, notifications | Implemented for common label and notification calls |
 | Remaining Deluge plugins | extractor, scheduler, execute, blocklist, autoadd plugin-specific APIs | API gap unless required by a target migration/client; migration dry runs preserve matching plugin/config files as auxiliary artifacts |
 

@@ -92,6 +92,11 @@ pub struct EngineStats {
     pub storage_peer_read_cache_entries: u64,
     pub storage_peer_read_cache_hits: u64,
     pub storage_peer_read_cache_misses: u64,
+    pub storage_peer_read_elevator_enabled: u64,
+    pub storage_peer_read_elevator_queue_depth: u64,
+    pub storage_peer_read_elevator_queued: u64,
+    pub storage_peer_read_elevator_batches: u64,
+    pub storage_peer_read_elevator_coalesced_requests: u64,
     pub piece_assembly_buffers: u64,
     pub piece_assembly_bytes: u64,
     pub piece_assembly_evictions: u64,
@@ -264,6 +269,25 @@ impl EngineStats {
         self.storage_peer_read_cache_misses = self
             .storage_peer_read_cache_misses
             .saturating_add(storage.peer_read_cache_misses);
+        self.storage_peer_read_elevator_enabled = self
+            .storage_peer_read_elevator_enabled
+            .saturating_add(if storage.peer_read_elevator_enabled {
+                1
+            } else {
+                0
+            });
+        self.storage_peer_read_elevator_queue_depth = self
+            .storage_peer_read_elevator_queue_depth
+            .saturating_add(storage.peer_read_elevator_queue_depth as u64);
+        self.storage_peer_read_elevator_queued = self
+            .storage_peer_read_elevator_queued
+            .saturating_add(storage.peer_read_elevator_queued as u64);
+        self.storage_peer_read_elevator_batches = self
+            .storage_peer_read_elevator_batches
+            .saturating_add(storage.peer_read_elevator_batches);
+        self.storage_peer_read_elevator_coalesced_requests = self
+            .storage_peer_read_elevator_coalesced_requests
+            .saturating_add(storage.peer_read_elevator_coalesced_requests);
     }
 }
 
@@ -514,13 +538,18 @@ mod tests {
             peer_read_cache_entries: 11,
             peer_read_cache_hits: 12,
             peer_read_cache_misses: 13,
+            peer_read_elevator_enabled: true,
+            peer_read_elevator_queue_depth: 14,
+            peer_read_elevator_queued: 15,
+            peer_read_elevator_batches: 16,
+            peer_read_elevator_coalesced_requests: 17,
             ..Default::default()
         };
-        storage.read_ops_by_class[0] = 14;
-        storage.read_ops_by_class[1] = 15;
-        storage.write_ops_by_class[0] = 16;
-        storage.bytes_read_by_class[0] = 17;
-        storage.bytes_written_by_class[0] = 18;
+        storage.read_ops_by_class[0] = 18;
+        storage.read_ops_by_class[1] = 19;
+        storage.write_ops_by_class[0] = 20;
+        storage.bytes_read_by_class[0] = 21;
+        storage.bytes_written_by_class[0] = 22;
         storage.backend_read_ops_by_class[4] = 3;
         storage.backend_bytes_read_by_class[4] = 4096;
         storage.read_latency_ns_by_class[4] = 100;
@@ -543,15 +572,15 @@ mod tests {
         assert_eq!(stats.storage_file_pool_open_files, 8);
         assert_eq!(stats.storage_file_pool_hits, 10);
         assert_eq!(stats.storage_file_pool_misses, 2);
-        assert_eq!(stats.storage_read_ops, 29);
-        assert_eq!(stats.storage_write_ops, 16);
-        assert_eq!(stats.storage_bytes_read, 17);
-        assert_eq!(stats.storage_bytes_written, 18);
-        assert_eq!(stats.storage_read_ops_by_class[0], 14);
-        assert_eq!(stats.storage_read_ops_by_class[1], 15);
-        assert_eq!(stats.storage_write_ops_by_class[0], 16);
-        assert_eq!(stats.storage_bytes_read_by_class[0], 17);
-        assert_eq!(stats.storage_bytes_written_by_class[0], 18);
+        assert_eq!(stats.storage_read_ops, 37);
+        assert_eq!(stats.storage_write_ops, 20);
+        assert_eq!(stats.storage_bytes_read, 21);
+        assert_eq!(stats.storage_bytes_written, 22);
+        assert_eq!(stats.storage_read_ops_by_class[0], 18);
+        assert_eq!(stats.storage_read_ops_by_class[1], 19);
+        assert_eq!(stats.storage_write_ops_by_class[0], 20);
+        assert_eq!(stats.storage_bytes_read_by_class[0], 21);
+        assert_eq!(stats.storage_bytes_written_by_class[0], 22);
         assert_eq!(stats.storage_backend_read_ops, 3);
         assert_eq!(stats.storage_backend_bytes_read, 4096);
         assert_eq!(stats.storage_backend_read_ops_by_class[4], 3);
@@ -567,6 +596,11 @@ mod tests {
         assert_eq!(stats.storage_sync_latency_ns, 300);
         assert_eq!(stats.storage_hash_latency_ns, 400);
         assert_eq!(stats.storage_peer_read_cache_hits, 12);
+        assert_eq!(stats.storage_peer_read_elevator_enabled, 1);
+        assert_eq!(stats.storage_peer_read_elevator_queue_depth, 14);
+        assert_eq!(stats.storage_peer_read_elevator_queued, 15);
+        assert_eq!(stats.storage_peer_read_elevator_batches, 16);
+        assert_eq!(stats.storage_peer_read_elevator_coalesced_requests, 17);
         assert_eq!(stats.piece_assembly_buffers, 19);
         assert_eq!(stats.piece_assembly_bytes, 20);
         assert_eq!(stats.piece_assembly_evictions, 21);

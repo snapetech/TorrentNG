@@ -59,6 +59,13 @@ fn drop_file_cache(path: &Path) {
 #[cfg(not(unix))]
 fn drop_file_cache(_path: &Path) {}
 
+fn settle_file_for_read_benchmark(path: &Path) {
+    let file = std::fs::OpenOptions::new().read(true).open(path).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    drop_file_cache(path);
+}
+
 async fn run_reads(
     scheduler: MountScheduler,
     path: PathBuf,
@@ -100,6 +107,7 @@ async fn peer_read_readahead_reduces_backend_reads_on_adjacent_blocks() {
     let path = dir.path().join("adjacent.bin");
     let data: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
     std::fs::write(&path, &data).unwrap();
+    settle_file_for_read_benchmark(&path);
 
     let scheduler = MountScheduler::new_for_path(
         StorageRootId::new(),
@@ -146,6 +154,7 @@ async fn repeated_reads_reuse_one_open_file_handle() {
     let path = dir.path().join("hot.bin");
     let data: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
     std::fs::write(&path, &data).unwrap();
+    settle_file_for_read_benchmark(&path);
 
     let scheduler = MountScheduler::new_for_path(
         StorageRootId::new(),
@@ -195,7 +204,7 @@ async fn shuffled_peer_read_baseline_reports_current_scheduler_throughput() {
     std::fs::write(&path, &data).unwrap();
 
     let offsets = shuffled_offsets(blocks, block_len);
-    drop_file_cache(&path);
+    settle_file_for_read_benchmark(&path);
 
     let scheduler = MountScheduler::new_for_path(
         StorageRootId::new(),
@@ -254,7 +263,7 @@ async fn hdd_peer_read_elevator_reduces_backend_reads_on_shuffled_adjacent_block
     std::fs::write(&path, &data).unwrap();
 
     let offsets = shuffled_offsets(blocks, block_len);
-    drop_file_cache(&path);
+    settle_file_for_read_benchmark(&path);
 
     let scheduler = MountScheduler::new_for_path(
         StorageRootId::new(),
@@ -280,8 +289,10 @@ async fn hdd_peer_read_elevator_reduces_backend_reads_on_shuffled_adjacent_block
     let mib_s = mib / elapsed.as_secs_f64();
 
     println!(
-        "tng_storage_elevator blocks={blocks} block_len={block_len} total_mib={mib:.2} elapsed_ms={} mib_s={mib_s:.2} submitted={submitted} backend_reads={backend_reads} reduction={reduction:.2}x",
+        "tng_storage_elevator blocks={blocks} block_len={block_len} total_mib={mib:.2} elapsed_ms={} mib_s={mib_s:.2} submitted={submitted} backend_reads={backend_reads} reduction={reduction:.2}x batches={} coalesced={}",
         elapsed.as_millis(),
+        stats.peer_read_elevator_batches,
+        stats.peer_read_elevator_coalesced_requests,
     );
 
     assert_eq!(submitted, blocks);

@@ -923,6 +923,41 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
     );
     metric(
         &mut out,
+        "torrentng_storage_peer_read_elevator_enabled",
+        "gauge",
+        "Running torrent schedulers with peer-read elevator enabled",
+        stats.storage_peer_read_elevator_enabled,
+    );
+    metric(
+        &mut out,
+        "torrentng_storage_peer_read_elevator_queue_depth",
+        "gauge",
+        "Configured peer-read elevator queue depth across running torrent schedulers",
+        stats.storage_peer_read_elevator_queue_depth,
+    );
+    metric(
+        &mut out,
+        "torrentng_storage_peer_read_elevator_queued",
+        "gauge",
+        "Currently queued peer-read elevator requests across running torrent schedulers",
+        stats.storage_peer_read_elevator_queued,
+    );
+    metric(
+        &mut out,
+        "torrentng_storage_peer_read_elevator_batches_total",
+        "counter",
+        "Peer-read elevator backend batches across running torrent schedulers",
+        stats.storage_peer_read_elevator_batches,
+    );
+    metric(
+        &mut out,
+        "torrentng_storage_peer_read_elevator_coalesced_requests_total",
+        "counter",
+        "Peer-read elevator logical requests coalesced into existing backend batches",
+        stats.storage_peer_read_elevator_coalesced_requests,
+    );
+    metric(
+        &mut out,
         "torrentng_piece_assembly_buffers",
         "gauge",
         "In-memory piece assembly buffers across running torrents",
@@ -1310,6 +1345,11 @@ mod tests {
             storage_write_latency_ns: 19,
             storage_sync_latency_ns: 20,
             storage_hash_latency_ns: 21,
+            storage_peer_read_elevator_enabled: 24,
+            storage_peer_read_elevator_queue_depth: 25,
+            storage_peer_read_elevator_queued: 26,
+            storage_peer_read_elevator_batches: 27,
+            storage_peer_read_elevator_coalesced_requests: 28,
             ..Default::default()
         };
         stats.storage_read_ops_by_class[4] = 10;
@@ -1354,6 +1394,13 @@ mod tests {
         assert!(rendered.contains("torrentng_storage_write_latency_nanoseconds_total 19"));
         assert!(rendered.contains("torrentng_storage_sync_latency_nanoseconds_total 20"));
         assert!(rendered.contains("torrentng_storage_hash_latency_nanoseconds_total 21"));
+        assert!(rendered.contains("torrentng_storage_peer_read_elevator_enabled 24"));
+        assert!(rendered.contains("torrentng_storage_peer_read_elevator_queue_depth 25"));
+        assert!(rendered.contains("torrentng_storage_peer_read_elevator_queued 26"));
+        assert!(rendered.contains("torrentng_storage_peer_read_elevator_batches_total 27"));
+        assert!(
+            rendered.contains("torrentng_storage_peer_read_elevator_coalesced_requests_total 28")
+        );
         assert!(rendered.contains(
             "torrentng_storage_read_latency_nanoseconds_by_class_total{class=\"peer_read\"} 22"
         ));
