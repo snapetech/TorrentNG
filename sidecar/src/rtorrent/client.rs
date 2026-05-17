@@ -4,7 +4,9 @@ use quick_xml::{events::Event, name::QName, Reader};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UnixStream};
+use tokio::net::TcpStream;
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::time::Instant;
 
@@ -145,6 +147,11 @@ impl Client {
         let response = tokio::time::timeout(self.timeout, async {
             match &self.transport {
                 Transport::Unix(path) => {
+                    #[cfg(not(unix))]
+                    bail!("Unix SCGI sockets are unsupported on this platform: {path}");
+
+                    #[cfg(unix)]
+                    {
                     let mut stream = UnixStream::connect(path)
                         .await
                         .with_context(|| format!("connect to SCGI socket {path}"))?;
@@ -152,6 +159,7 @@ impl Client {
                     let mut buf = Vec::new();
                     stream.read_to_end(&mut buf).await?;
                     Ok::<_, anyhow::Error>(buf)
+                    }
                 }
                 Transport::Tcp(addr) => {
                     let mut stream = TcpStream::connect(addr)

@@ -5,7 +5,9 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
-use std::{ffi::CString, path::Path as FsPath, sync::atomic::Ordering, time::Duration};
+#[cfg(unix)]
+use std::ffi::CString;
+use std::{path::Path as FsPath, sync::atomic::Ordering, time::Duration};
 use tokio::process::Command;
 
 use super::server::AppState;
