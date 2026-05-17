@@ -8,6 +8,9 @@ The executable feature matrix for this storage branch lives in
 [`STORAGE_NG_TEST_MATRIX.md`](STORAGE_NG_TEST_MATRIX.md).
 Open storage and memory follow-up work is tracked in
 [`STORAGE_MEMORY_GAP_REGISTER.md`](STORAGE_MEMORY_GAP_REGISTER.md).
+The current storage implementation map, including the split between the live
+torrent hot path and the backend/runtime probe path, lives in
+[`STORAGE_WORK_MAP.md`](STORAGE_WORK_MAP.md).
 
 ## Previous Gap
 
@@ -38,8 +41,8 @@ most: rotational, non-CoW local filesystems.
 
 ## Current Implementation
 
-`rt-storage::MountScheduler` now owns the disk layer beneath the class
-semaphores:
+`rt-storage::MountScheduler` now owns the live torrent disk layer beneath the
+class semaphores:
 
 - `StorageIoConfig` carries file-pool size, idle TTL, I/O worker count, queue
   depth, preallocation mode, durability mode, and peer-read readahead target.
@@ -81,7 +84,9 @@ semaphores:
   benchmarks mature. The uring worker registers file slots and worker-owned
   fixed buffers when the kernel accepts them. Kernels or containers that reject
   `io_uring` fall back to `pread` with an explicit diagnostic reason instead
-  of silently changing behavior.
+  of silently changing behavior. This runtime/backend path is currently used
+  for capability metrics and direct backend probes; `MountScheduler` still
+  performs live torrent payload I/O through its own positioned `FileExt` calls.
 - `IoClass::PeerRead` uses a small internal readahead cache when configured:
   the backend may read ahead within the same file, but callers receive exactly
   the requested byte range.
@@ -123,6 +128,21 @@ startup falls back to verification instead of trusting stale piece state.
 
 The following items are still implementation targets:
 
+- Route `MountScheduler` live torrent reads/writes/syncs through the
+  `DiskBackend` layer or a unified `StorageRuntime` API so backend selection,
+  queue bounds, registered files, and future `io_uring` improvements affect
+  the actual torrent hot path.
+- Move scheduler read/readahead buffers onto frame-pool leases or an equivalent
+  bounded storage-buffer API; the current frame pool backs `StorageRuntime`
+  reads, not the primary scheduler read path.
+- Add independent bounded queues to `PreadBackend` and `UringBackend` before
+  they become the scheduler hot path; their internal channels are currently
+  unbounded and rely on caller-side throttling.
+- Expose the remaining `StorageIoConfig` fields through native TOML so
+  operators can tune file-pool size, I/O/hash workers, queue depth, durability,
+  preallocation, and readahead without code changes.
+- Persist cross-device move/import execution state so interrupted multi-step
+  plans can resume or be audited after process restart.
 - Per-device latency observability now includes bounded Prometheus histograms
   for read/write/sync/hash work labeled by resolved device/profile, plus the
   cumulative per-device totals. Aggregate fixed-bucket histograms and counters

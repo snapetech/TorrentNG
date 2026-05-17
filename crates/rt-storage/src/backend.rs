@@ -28,6 +28,10 @@ use crate::frame::Frame;
 const URING_ENTRIES: u32 = 256;
 const URING_BATCH_LIMIT: usize = 64;
 const URING_FILE_SLOTS: u32 = URING_ENTRIES;
+/// Keep fixed buffer registration below common 8 MiB `RLIMIT_MEMLOCK`
+/// defaults. The backend can still batch more submissions than it has
+/// fixed-buffer slots; overflow submissions use ordinary read/write buffers.
+const URING_FIXED_BUFFER_SLOTS: usize = 4;
 const URING_FIXED_BUFFER_LEN: usize = 256 * 1024;
 
 /// Backend requested by configuration or environment.
@@ -348,7 +352,7 @@ fn probe_registered_files(ring: &IoUring) -> io::Result<()> {
 }
 
 fn probe_fixed_buffers(ring: &IoUring) -> io::Result<()> {
-    let mut buffers = (0..URING_BATCH_LIMIT)
+    let mut buffers = (0..URING_FIXED_BUFFER_SLOTS)
         .map(|_| vec![0u8; URING_FIXED_BUFFER_LEN])
         .collect::<Vec<_>>();
     let iovecs = buffers
@@ -527,16 +531,17 @@ impl UringWorker {
                 false
             }
         };
-        let fixed = match FixedBuffers::register(&ring, URING_BATCH_LIMIT, URING_FIXED_BUFFER_LEN) {
-            Ok(fixed) => {
-                fixed_buffers_supported.store(true, Ordering::Relaxed);
-                Some(fixed)
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "io_uring fixed-buffer registration unavailable");
-                None
-            }
-        };
+        let fixed =
+            match FixedBuffers::register(&ring, URING_FIXED_BUFFER_SLOTS, URING_FIXED_BUFFER_LEN) {
+                Ok(fixed) => {
+                    fixed_buffers_supported.store(true, Ordering::Relaxed);
+                    Some(fixed)
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "io_uring fixed-buffer registration unavailable");
+                    None
+                }
+            };
         Ok(Self {
             rx,
             ring,
@@ -1243,5 +1248,11 @@ mod tests {
         if backend.supports_fixed_buffers() {
             assert_eq!(backend.fixed_buffer_len(), URING_FIXED_BUFFER_LEN);
         }
+    }
+
+    #[test]
+    fn uring_fixed_buffer_registration_budget_stays_below_common_memlock_limit() {
+        assert!(URING_FIXED_BUFFER_SLOTS < URING_BATCH_LIMIT);
+        assert!(URING_FIXED_BUFFER_SLOTS * URING_FIXED_BUFFER_LEN <= 4 * 1024 * 1024);
     }
 }
