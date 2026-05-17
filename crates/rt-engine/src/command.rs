@@ -72,6 +72,7 @@ pub struct EngineStats {
     pub dht_queried_nodes: u64,
     pub storage_file_pool_capacity: u64,
     pub storage_file_pool_open_files: u64,
+    pub storage_file_pool_memory_bytes: u64,
     pub storage_file_pool_hits: u64,
     pub storage_file_pool_misses: u64,
     pub storage_file_pool_evictions: u64,
@@ -133,8 +134,10 @@ pub struct EngineStats {
     pub peer_command_queue_depth: u64,
     pub peer_command_queue_capacity: u64,
     pub peer_command_queue_full: u64,
+    pub peer_command_queue_bytes: u64,
     pub tracker_peer_cache_entries: u64,
     pub tracker_peer_cache_drops: u64,
+    pub tracker_peer_cache_bytes: u64,
     pub hot_torrent_memory_top: Vec<HotTorrentMemoryStats>,
     pub resources: Option<ResourceSnapshot>,
 }
@@ -182,6 +185,8 @@ pub struct TorrentRuntimeStats {
     pub peer_command_queue_full: u64,
     pub tracker_peer_cache_entries: u64,
     pub tracker_peer_cache_drops: u64,
+    pub tracker_peer_cache_bytes: u64,
+    pub peer_command_queue_bytes: u64,
     pub storage: StorageIoStats,
 }
 
@@ -235,12 +240,18 @@ impl EngineStats {
         self.peer_command_queue_full = self
             .peer_command_queue_full
             .saturating_add(runtime.peer_command_queue_full);
+        self.peer_command_queue_bytes = self
+            .peer_command_queue_bytes
+            .saturating_add(runtime.peer_command_queue_bytes);
         self.tracker_peer_cache_entries = self
             .tracker_peer_cache_entries
             .saturating_add(runtime.tracker_peer_cache_entries);
         self.tracker_peer_cache_drops = self
             .tracker_peer_cache_drops
             .saturating_add(runtime.tracker_peer_cache_drops);
+        self.tracker_peer_cache_bytes = self
+            .tracker_peer_cache_bytes
+            .saturating_add(runtime.tracker_peer_cache_bytes);
 
         let storage = runtime.storage;
         self.storage_file_pool_capacity = self
@@ -249,6 +260,9 @@ impl EngineStats {
         self.storage_file_pool_open_files = self
             .storage_file_pool_open_files
             .saturating_add(storage.file_pool.open_files as u64);
+        self.storage_file_pool_memory_bytes = self
+            .storage_file_pool_memory_bytes
+            .saturating_add(storage.file_pool.memory_bytes);
         self.storage_file_pool_hits = self
             .storage_file_pool_hits
             .saturating_add(storage.file_pool.hits);
@@ -493,9 +507,9 @@ impl EngineStats {
         let peer_buffer_bytes = runtime
             .peer_rx_buffer_bytes
             .saturating_add(runtime.peer_tx_buffer_bytes);
-        let tracker_peer_bytes = runtime.tracker_peer_cache_entries.saturating_mul(64);
-        let peer_command_queue_bytes = runtime.peer_command_queue_capacity.saturating_mul(64);
-        let storage_cache_bytes = (runtime.storage.file_pool.open_files as u64).saturating_mul(256);
+        let tracker_peer_bytes = runtime.tracker_peer_cache_bytes;
+        let peer_command_queue_bytes = runtime.peer_command_queue_bytes;
+        let storage_cache_bytes = runtime.storage.file_pool.memory_bytes;
         let estimated_bytes = runtime
             .piece_assembly_bytes
             .saturating_add(peer_buffer_bytes)
@@ -774,6 +788,7 @@ mod tests {
             file_pool: FilePoolStats {
                 capacity: 64,
                 open_files: 8,
+                memory_bytes: 4096,
                 hits: 10,
                 misses: 2,
                 evictions: 1,
@@ -839,14 +854,17 @@ mod tests {
                 peer_command_queue_depth: 27,
                 peer_command_queue_capacity: 28,
                 peer_command_queue_full: 29,
+                peer_command_queue_bytes: 1_792,
                 tracker_peer_cache_entries: 25,
                 tracker_peer_cache_drops: 26,
+                tracker_peer_cache_bytes: 1_600,
                 storage,
             },
         );
 
         assert_eq!(stats.storage_file_pool_capacity, 64);
         assert_eq!(stats.storage_file_pool_open_files, 8);
+        assert_eq!(stats.storage_file_pool_memory_bytes, 4096);
         assert_eq!(stats.storage_file_pool_hits, 10);
         assert_eq!(stats.storage_file_pool_misses, 2);
         assert_eq!(stats.storage_read_ops, 51);
@@ -932,18 +950,20 @@ mod tests {
         assert_eq!(stats.peer_command_queue_depth, 27);
         assert_eq!(stats.peer_command_queue_capacity, 28);
         assert_eq!(stats.peer_command_queue_full, 29);
+        assert_eq!(stats.peer_command_queue_bytes, 1_792);
         assert_eq!(stats.tracker_peer_cache_entries, 25);
         assert_eq!(stats.tracker_peer_cache_drops, 26);
+        assert_eq!(stats.tracker_peer_cache_bytes, 1_600);
         assert_eq!(
             stats.hot_torrent_memory_top,
             vec![HotTorrentMemoryStats {
                 info_hash: "hash-a".to_string(),
-                estimated_bytes: 5_507,
+                estimated_bytes: 7_555,
                 piece_assembly_bytes: 20,
                 peer_buffer_bytes: 47,
                 tracker_peer_bytes: 1_600,
                 peer_command_queue_bytes: 1_792,
-                storage_cache_bytes: 2_048,
+                storage_cache_bytes: 4_096,
             }]
         );
     }
@@ -960,7 +980,9 @@ mod tests {
                     peer_rx_buffer_bytes: n * 64,
                     peer_tx_buffer_bytes: n * 32,
                     peer_command_queue_capacity: n,
+                    peer_command_queue_bytes: n * 64,
                     tracker_peer_cache_entries: 1,
+                    tracker_peer_cache_bytes: 64,
                     ..Default::default()
                 },
             );
@@ -974,5 +996,41 @@ mod tests {
             .hot_torrent_memory_top
             .windows(2)
             .all(|window| window[0].estimated_bytes >= window[1].estimated_bytes));
+    }
+
+    #[test]
+    fn hot_seeding_1k_memory_attribution_stays_under_cap() {
+        let mut stats = EngineStats::default();
+        for n in 0..1_000 {
+            stats.add_torrent_runtime(
+                format!("hot-{n:04}"),
+                TorrentRuntimeStats {
+                    connected_peers: 8,
+                    outstanding_requests: 32,
+                    piece_assembly_buffers: 2,
+                    piece_assembly_bytes: 2 * 1024 * 1024,
+                    peer_rx_buffer_bytes: 32 * 16 * 1024,
+                    peer_tx_buffer_bytes: 4 * 16 * 1024,
+                    peer_command_queue_depth: 8,
+                    peer_command_queue_capacity: 64,
+                    peer_command_queue_bytes: 64 * 128,
+                    tracker_peer_cache_entries: 64,
+                    tracker_peer_cache_bytes: 64
+                        * std::mem::size_of::<std::net::SocketAddr>() as u64,
+                    ..Default::default()
+                },
+            );
+        }
+        let hot_top_total = stats
+            .hot_torrent_memory_top
+            .iter()
+            .map(|torrent| torrent.estimated_bytes)
+            .sum::<u64>();
+
+        assert_eq!(stats.hot_torrent_memory_top.len(), 10);
+        assert!(
+            hot_top_total < 64 * 1024 * 1024,
+            "top hot torrent memory attribution is {hot_top_total} bytes"
+        );
     }
 }

@@ -2418,10 +2418,9 @@ impl Engine {
         resources.classes[peer_buffer].used_bytes = stats
             .peer_rx_buffer_bytes
             .saturating_add(stats.peer_tx_buffer_bytes)
-            .saturating_add(stats.peer_command_queue_depth.saturating_mul(128));
+            .saturating_add(stats.peer_command_queue_bytes);
         let tracker_peers = MemoryClass::TrackerPeers as usize;
-        resources.classes[tracker_peers].used_bytes =
-            stats.tracker_peer_cache_entries.saturating_mul(64);
+        resources.classes[tracker_peers].used_bytes = stats.tracker_peer_cache_bytes;
         resources.classes[tracker_peers].denied_allocations = resources.classes[tracker_peers]
             .denied_allocations
             .saturating_add(stats.tracker_peer_cache_drops);
@@ -4434,8 +4433,10 @@ mod tests {
                     peer_command_queue_depth: 11,
                     peer_command_queue_capacity: 12,
                     peer_command_queue_full: 13,
+                    peer_command_queue_bytes: 11 * 128,
                     tracker_peer_cache_entries: 9,
                     tracker_peer_cache_drops: 10,
+                    tracker_peer_cache_bytes: 576,
                     ..Default::default()
                 });
             }
@@ -4510,8 +4511,10 @@ mod tests {
                     peer_command_queue_depth: 11,
                     peer_command_queue_capacity: 12,
                     peer_command_queue_full: 13,
+                    peer_command_queue_bytes: 11 * 128,
                     tracker_peer_cache_entries: 9,
                     tracker_peer_cache_drops: 10,
+                    tracker_peer_cache_bytes: 576,
                     ..Default::default()
                 });
             }
@@ -4890,8 +4893,10 @@ mod tests {
                     peer_command_queue_depth: 11,
                     peer_command_queue_capacity: 12,
                     peer_command_queue_full: 13,
+                    peer_command_queue_bytes: 11 * 128,
                     tracker_peer_cache_entries: 9,
                     tracker_peer_cache_drops: 10,
+                    tracker_peer_cache_bytes: 576,
                     ..Default::default()
                 });
             }

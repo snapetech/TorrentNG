@@ -1109,6 +1109,17 @@ impl TorrentTask {
                     .saturating_sub(peer.cmd_tx.capacity()) as u64
             })
             .sum::<u64>();
+        let peer_command_queue_bytes = self
+            .active_peers
+            .values()
+            .map(|peer| {
+                (peer.cmd_tx.max_capacity() as u64)
+                    .saturating_mul(std::mem::size_of::<PeerCommand>() as u64)
+                    .saturating_add(peer.peer_has.capacity() as u64)
+            })
+            .sum::<u64>();
+        let tracker_peer_cache_bytes = (self.known_tracker_peers.capacity() as u64)
+            .saturating_mul(std::mem::size_of::<SocketAddr>() as u64);
         TorrentRuntimeStats {
             connected_peers: self.active_peers.len() as u64,
             outstanding_requests,
@@ -1126,6 +1137,8 @@ impl TorrentTask {
             peer_command_queue_full: self.peer_command_queue_full,
             tracker_peer_cache_entries: self.known_tracker_peers.len() as u64,
             tracker_peer_cache_drops: self.tracker_peer_cache_drops,
+            tracker_peer_cache_bytes,
+            peer_command_queue_bytes,
             storage: self.storage.stats(),
         }
     }

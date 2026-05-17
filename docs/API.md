@@ -388,7 +388,7 @@ rTorrent over XMLRPC.
 | `torrentng_completed_piece_verify_from_{memory,disk}_total` | counter | Completed-piece verification source; memory verifies avoid read-after-write disk rereads |
 | `torrentng_peers_connected` | gauge | Connected peers across all torrents |
 | `torrentng_dht_*` | gauge | Native DHT routing table, lookup, tracked torrent, and announced peer cache counts |
-| `torrentng_storage_file_pool_*` | gauge/counter | Native scheduler open-file cache capacity, open files, hits, misses, evictions, and idle closes |
+| `torrentng_storage_file_pool_*` | gauge/counter | Native scheduler open-file cache capacity, open files, metadata bytes, hits, misses, evictions, and idle closes |
 | `torrentng_storage_*_queue_depth` | gauge | Native disk I/O and hashing queue depths |
 | `torrentng_storage_queued_disk_bytes` | gauge | Process-owned payload bytes currently reserved by queued or active disk, hash, and peer-read elevator jobs |
 | `torrentng_storage_queue_full_total` | counter | Disk or hash jobs denied because the bounded per-mount storage queue was full |

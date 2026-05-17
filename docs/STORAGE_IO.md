@@ -91,6 +91,9 @@ semaphores:
   foreground, or choke-critical work. HDD peer reads are wired through the
   elevator when `peer_read_elevator_budget_ms` is non-zero, and metrics expose
   enablement, queue depth, backend batches, and coalesced logical requests.
+- Schedulers that resolve to the same storage device share a process-level
+  device queue semaphore before submitting positioned disk work, so separate
+  mounts on the same spindle cannot each consume a full independent disk queue.
 
 `TorrentTask` keeps a per-file preparation registry so parent directories and
 file allocation are no longer in the per-block hot path. It also keeps

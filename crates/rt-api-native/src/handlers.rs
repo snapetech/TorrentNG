@@ -886,6 +886,13 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
     );
     metric(
         &mut out,
+        "torrentng_storage_file_pool_memory_bytes",
+        "gauge",
+        "Approximate memory used by open-file cache metadata across running torrent schedulers",
+        stats.storage_file_pool_memory_bytes,
+    );
+    metric(
+        &mut out,
         "torrentng_storage_file_pool_hits_total",
         "counter",
         "Open-file cache hits across running torrent schedulers",
@@ -2061,6 +2068,7 @@ mod tests {
             dht_tracked_torrents: 48,
             dht_outstanding_requests: 49,
             dht_queried_nodes: 50,
+            storage_file_pool_memory_bytes: 57,
             storage_file_pool_hits: 5,
             storage_read_ops: 6,
             storage_hash_ops: 7,
@@ -2169,6 +2177,7 @@ mod tests {
         assert!(rendered.contains("torrentng_dht_tracked_torrents 48"));
         assert!(rendered.contains("torrentng_dht_outstanding_requests 49"));
         assert!(rendered.contains("torrentng_dht_queried_nodes 50"));
+        assert!(rendered.contains("torrentng_storage_file_pool_memory_bytes 57"));
         assert!(rendered.contains("torrentng_storage_file_pool_hits_total 5"));
         assert!(rendered.contains("torrentng_storage_read_ops_total 6"));
         assert!(rendered.contains("torrentng_storage_hash_ops_total 7"));

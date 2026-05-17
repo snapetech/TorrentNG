@@ -203,6 +203,34 @@ async fn idle_memory_15k_under_2_5gb() {
     assert!(rss < limit, "15k idle RSS is {rss} bytes, want <{limit}");
 }
 
+#[tokio::test]
+async fn idle_memory_100k_keeps_fixed_rss_task_fd_budget() {
+    let before_rss = current_rss_bytes();
+    let before_fds = current_fd_count();
+    let before_tasks = current_task_count();
+    let app = qbit_app_with(100_000).await;
+    let _ = get_ms(app, "/api/qb/v2/torrents/info?limit=200").await;
+    let after_rss = current_rss_bytes();
+    let after_fds = current_fd_count();
+    let after_tasks = current_task_count();
+    let rss = after_rss.unwrap_or(before_rss.unwrap_or(0));
+    let limit = 2_500_u64 * 1024 * 1024;
+
+    assert!(rss < limit, "100k idle RSS is {rss} bytes, want <{limit}");
+    if let (Some(before), Some(after)) = (before_fds, after_fds) {
+        assert!(
+            after <= before + 64,
+            "100k idle fd count grew from {before} to {after}"
+        );
+    }
+    if let (Some(before), Some(after)) = (before_tasks, after_tasks) {
+        assert!(
+            after <= before + 8,
+            "100k idle task count grew from {before} to {after}"
+        );
+    }
+}
+
 #[test]
 fn tracker_restart_storm_15k_is_spread_by_jitter() {
     let interval = Duration::from_secs(30 * 60);
@@ -627,4 +655,12 @@ fn current_rss_bytes() -> Option<u64> {
         .nth(1)
         .and_then(|value| value.parse::<u64>().ok())?;
     Some(kb * 1024)
+}
+
+fn current_fd_count() -> Option<usize> {
+    Some(std::fs::read_dir("/proc/self/fd").ok()?.count())
+}
+
+fn current_task_count() -> Option<usize> {
+    Some(std::fs::read_dir("/proc/self/task").ok()?.count())
 }

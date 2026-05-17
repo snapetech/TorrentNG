@@ -2,9 +2,10 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use once_cell::sync::Lazy;
 use tokio::sync::{
     mpsc::{self as tokio_mpsc, error::TrySendError},
     oneshot, OwnedSemaphorePermit, Semaphore, TryAcquireError,
@@ -148,6 +149,7 @@ pub fn preallocation_mode_for_topology(topology: Option<&StorageTopology>) -> Pr
 pub struct FilePoolStats {
     pub capacity: usize,
     pub open_files: usize,
+    pub memory_bytes: u64,
     pub hits: u64,
     pub misses: u64,
     pub evictions: u64,
@@ -392,6 +394,14 @@ impl FilePool {
         FilePoolStats {
             capacity: self.capacity,
             open_files: entries.len(),
+            memory_bytes: entries
+                .keys()
+                .map(|path| {
+                    (std::mem::size_of::<PathBuf>() + path.as_os_str().as_encoded_bytes().len())
+                        .saturating_add(std::mem::size_of::<CachedFile>())
+                        as u64
+                })
+                .sum(),
             hits: self.counters.hits.load(Ordering::Relaxed),
             misses: self.counters.misses.load(Ordering::Relaxed),
             evictions: self.counters.evictions.load(Ordering::Relaxed),
@@ -508,6 +518,7 @@ pub struct MountScheduler {
     foreground_sem: Arc<Semaphore>,
     metadata_sem: Arc<Semaphore>,
     queue_sem: Arc<Semaphore>,
+    device_queue_sem: Arc<Semaphore>,
     io_config: StorageIoConfig,
     file_pool: Arc<FilePool>,
     io_pool: Arc<BlockingPool>,
@@ -682,6 +693,39 @@ fn queued_disk_charge(payload_bytes: u64) -> u64 {
     payload_bytes.max(QUEUED_DISK_JOB_OVERHEAD_BYTES)
 }
 
+static DEVICE_QUEUES: Lazy<Mutex<HashMap<String, Weak<Semaphore>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn device_queue_for(
+    storage_root: StorageRootId,
+    device_id: Option<&str>,
+    profile: &StorageProfile,
+    capacity: usize,
+) -> Arc<Semaphore> {
+    let key = device_queue_key(storage_root, device_id, profile);
+    let mut queues = DEVICE_QUEUES
+        .lock()
+        .expect("device queue registry mutex poisoned");
+    if let Some(queue) = queues.get(&key).and_then(Weak::upgrade) {
+        return queue;
+    }
+    queues.retain(|_, queue| queue.strong_count() > 0);
+    let queue = Arc::new(Semaphore::new(capacity.max(1)));
+    queues.insert(key, Arc::downgrade(&queue));
+    queue
+}
+
+fn device_queue_key(
+    storage_root: StorageRootId,
+    device_id: Option<&str>,
+    profile: &StorageProfile,
+) -> String {
+    match device_id {
+        Some(device_id) => format!("device:{profile:?}:{device_id}"),
+        None => format!("storage-root:{}", storage_root.0),
+    }
+}
+
 impl PeerReadElevator {
     fn spawn(
         storage_root: StorageRootId,
@@ -690,6 +734,7 @@ impl PeerReadElevator {
         file_pool: Arc<FilePool>,
         io_pool: Arc<BlockingPool>,
         queue_sem: Arc<Semaphore>,
+        device_queue_sem: Arc<Semaphore>,
         counters: Arc<StorageCounters>,
         resources: Option<ResourceGovernor>,
     ) -> Self {
@@ -701,6 +746,7 @@ impl PeerReadElevator {
             file_pool,
             io_pool,
             queue_sem,
+            device_queue_sem,
             counters.clone(),
         ));
         Self {
@@ -770,6 +816,7 @@ async fn peer_read_elevator_worker(
     file_pool: Arc<FilePool>,
     io_pool: Arc<BlockingPool>,
     queue_sem: Arc<Semaphore>,
+    device_queue_sem: Arc<Semaphore>,
     counters: Arc<StorageCounters>,
 ) {
     while let Some(first) = receiver.recv().await {
@@ -779,10 +826,18 @@ async fn peer_read_elevator_worker(
             let file_pool = file_pool.clone();
             let io_pool = io_pool.clone();
             let queue_sem = queue_sem.clone();
+            let device_queue_sem = device_queue_sem.clone();
             let counters = counters.clone();
             tokio::spawn(async move {
-                let results =
-                    dispatch_peer_read_batch(batch, file_pool, io_pool, queue_sem, counters).await;
+                let results = dispatch_peer_read_batch(
+                    batch,
+                    file_pool,
+                    io_pool,
+                    queue_sem,
+                    device_queue_sem,
+                    counters,
+                )
+                .await;
                 for (tx, result) in results {
                     let _ = tx.send(result);
                 }
@@ -858,12 +913,23 @@ async fn dispatch_peer_read_batch(
     file_pool: Arc<FilePool>,
     io_pool: Arc<BlockingPool>,
     queue_sem: Arc<Semaphore>,
+    device_queue_sem: Arc<Semaphore>,
     counters: Arc<StorageCounters>,
 ) -> Vec<(
     oneshot::Sender<Result<bytes::Bytes, StorageError>>,
     Result<bytes::Bytes, StorageError>,
 )> {
     let _queue = match queue_sem.acquire_owned().await {
+        Ok(permit) => permit,
+        Err(_) => {
+            return batch
+                .requests
+                .into_iter()
+                .map(|request| (request.tx, Err(StorageError::Cancelled)))
+                .collect();
+        }
+    };
+    let _device_queue = match device_queue_sem.acquire_owned().await {
         Ok(permit) => permit,
         Err(_) => {
             return batch
@@ -1001,6 +1067,15 @@ impl MountScheduler {
         let queue_sem = Arc::new(Semaphore::new(
             config.max_queue.min(io_config.io_queue_depth).max(1),
         ));
+        let device_id = topology
+            .as_ref()
+            .and_then(|topology| topology.device_id.as_ref().map(|device| device.0.clone()));
+        let device_queue_sem = device_queue_for(
+            storage_root,
+            device_id.as_deref(),
+            &profile,
+            config.max_queue.min(io_config.io_queue_depth).max(1),
+        );
         let counters = Arc::new(StorageCounters::default());
         let peer_read_elevator_enabled =
             matches!(profile, StorageProfile::Hdd) && io_config.peer_read_elevator_budget_ms > 0;
@@ -1014,6 +1089,7 @@ impl MountScheduler {
                     file_pool.clone(),
                     io_pool.clone(),
                     queue_sem.clone(),
+                    device_queue_sem.clone(),
                     counters.clone(),
                     config.resources.clone(),
                 ))
@@ -1031,6 +1107,7 @@ impl MountScheduler {
             foreground_sem: Arc::new(Semaphore::new(fg)),
             metadata_sem: Arc::new(Semaphore::new(md)),
             queue_sem,
+            device_queue_sem,
             file_pool,
             io_pool,
             hash_pool: Arc::new(BlockingPool::new(
@@ -1043,7 +1120,7 @@ impl MountScheduler {
             peer_read_elevator,
             peer_read_elevator_enabled,
             peer_read_elevator_queue_depth,
-            device_id: topology.and_then(|topology| topology.device_id.map(|device| device.0)),
+            device_id,
             profile,
             resources: config.resources.clone(),
             counters,
@@ -1220,6 +1297,23 @@ impl MountScheduler {
                 }
                 TryAcquireError::Closed => StorageError::Cancelled,
             })?;
+        let _device_queue = self
+            .device_queue_sem
+            .clone()
+            .try_acquire_owned()
+            .map_err(|err| match err {
+                TryAcquireError::NoPermits => {
+                    self.counters.queue_full.fetch_add(1, Ordering::Relaxed);
+                    StorageError::QueueFull {
+                        mount: self
+                            .device_id
+                            .as_ref()
+                            .map(|device| format!("storage-device-{device}"))
+                            .unwrap_or_else(|| format!("storage-root-{}", self.storage_root.0)),
+                    }
+                }
+                TryAcquireError::Closed => StorageError::Cancelled,
+            })?;
         let result = self
             .io_pool
             .run(move || {
@@ -1249,6 +1343,7 @@ impl MountScheduler {
                 self.file_pool.clone(),
                 self.io_pool.clone(),
                 self.queue_sem.clone(),
+                self.device_queue_sem.clone(),
                 self.counters.clone(),
                 self.resources.clone(),
             ));
@@ -2150,6 +2245,54 @@ mod tests {
             snapshot.classes[MemoryClass::QueuedDisk as usize].denied_allocations,
             1
         );
+    }
+
+    #[tokio::test]
+    async fn schedulers_on_same_device_share_global_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload.bin");
+        std::fs::write(&path, b"payload").unwrap();
+        let topology = StorageTopology {
+            device_id: Some(DeviceId("shared-device".to_owned())),
+            profile: StorageProfile::Hdd,
+            fs_type: Some("ext4".to_owned()),
+            cow: false,
+        };
+        let config = SchedulerConfig {
+            profile: StorageProfile::Hdd,
+            max_queue: 1,
+            storage_io: StorageIoConfig {
+                io_queue_depth: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let first = MountScheduler::new_with_profile_and_io_config(
+            StorageRootId::new(),
+            &config,
+            StorageProfile::Hdd,
+            config.storage_io.clone(),
+            Some(topology.clone()),
+        );
+        let second = MountScheduler::new_with_profile_and_io_config(
+            StorageRootId::new(),
+            &config,
+            StorageProfile::Hdd,
+            config.storage_io.clone(),
+            Some(topology),
+        );
+        let _held = first.device_queue_sem.clone().try_acquire_owned().unwrap();
+
+        let err = second
+            .read_at(IoClass::Foreground, &path, 0, b"payload".len())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            StorageError::QueueFull { mount } if mount == "storage-device-shared-device"
+        ));
+        assert_eq!(second.stats().queue_full, 1);
     }
 
     #[test]
