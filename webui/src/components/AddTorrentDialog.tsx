@@ -27,7 +27,13 @@ export function AddTorrentDialog({ onClose }: Props) {
   const { data: categories = [] } = useQuery({ queryKey: ['categories'], queryFn: api.categories.list })
 
   const addFiles = useCallback((incoming: FileList | File[]) => {
-    const valid = Array.from(incoming).filter(f => f.name.endsWith('.torrent'))
+    const all = Array.from(incoming)
+    const valid = all.filter(f => f.name.toLowerCase().endsWith('.torrent'))
+    if (valid.length !== all.length) {
+      setError('Only .torrent files can be added from the file picker.')
+    } else {
+      setError(null)
+    }
     setFiles(prev => {
       const names = new Set(prev.map(f => f.name))
       return [...prev, ...valid.filter(f => !names.has(f.name))]
@@ -82,7 +88,14 @@ export function AddTorrentDialog({ onClose }: Props) {
       }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
           <span style={{ fontWeight: 600, fontSize: 15, color: 'var(--text)' }}>Add torrent</span>
-          <button onClick={onClose} style={{ background: 'none', border: 'none', color: 'var(--faint)', fontSize: 18, cursor: 'pointer' }}>✕</button>
+          <button
+            onClick={onClose}
+            disabled={busy}
+            style={{
+              background: 'none', border: 'none', color: 'var(--faint)', fontSize: 18,
+              cursor: busy ? 'not-allowed' : 'pointer', opacity: busy ? 0.55 : 1,
+            }}
+          >✕</button>
         </div>
 
         {/* Drag-drop zone */}
@@ -169,17 +182,18 @@ export function AddTorrentDialog({ onClose }: Props) {
         )}
 
         {/* Start toggle */}
-        <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 13, color: 'var(--muted)' }}>
-          <input type="checkbox" checked={start} onChange={e => setStart(e.target.checked)} style={{ accentColor: 'var(--accent)' }} />
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: busy ? 'not-allowed' : 'pointer', fontSize: 13, color: 'var(--muted)' }}>
+          <input type="checkbox" checked={start} disabled={busy} onChange={e => setStart(e.target.checked)} style={{ accentColor: 'var(--accent)' }} />
           Start immediately
         </label>
 
         {error && <div style={{ fontSize: 12, color: '#ef4444' }}>{error}</div>}
 
         <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
-          <button onClick={onClose} style={{
+          <button onClick={onClose} disabled={busy} style={{
             background: 'none', border: '1px solid var(--border-strong)', borderRadius: 5,
             color: 'var(--faint)', padding: '6px 16px', fontSize: 13, cursor: 'pointer',
+            opacity: busy ? 0.5 : 1,
           }}>Cancel</button>
           <button onClick={submit} disabled={busy} style={{
             background: 'var(--accent-soft)', border: '1px solid var(--accent)', borderRadius: 5,

@@ -1,0 +1,11 @@
+[Unit]
+Description=Update rtorrentNG home live-main Docker build
+Wants=network-online.target
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Documents/code/rtorrentNG
+Environment=RTNG_LIVE_BRANCH=main
+Environment=RTNG_LIVE_COMPOSE_FILE=deploy/docker/compose.yml
+ExecStart=%h/Documents/code/rtorrentNG/scripts/home_live_update.sh

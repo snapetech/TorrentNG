@@ -8,6 +8,7 @@ interface Props {
   onProperties: () => void
   onEditSelected: () => void
   onSequential: () => void
+  onClearSelection: () => void
   onHelp: () => void
   busy: boolean
 }
@@ -20,7 +21,8 @@ const ACTIONS = [
 ]
 
 export function TorrentToolbar({
-  selectedCount, onAdd, onStart, onStop, onRecheck, onReannounce, onProperties, onEditSelected, onSequential, onHelp, busy,
+  selectedCount, onAdd, onStart, onStop, onRecheck, onReannounce, onProperties, onEditSelected, onSequential,
+  onClearSelection, onHelp, busy,
 }: Props) {
   const disabled = selectedCount === 0 || busy
   const handlers: Record<string, () => void> = {
@@ -32,50 +34,69 @@ export function TorrentToolbar({
 
   return (
     <div style={{
-      height: 38, flexShrink: 0, display: 'flex', alignItems: 'center', gap: 6,
+      minHeight: 40, flexShrink: 0, display: 'flex', alignItems: 'center', gap: 8,
       padding: '0 10px', background: 'var(--surface)', borderBottom: '1px solid var(--border)',
       minWidth: 0, overflowX: 'auto', overflowY: 'hidden', scrollbarWidth: 'thin',
     }}>
       <button onClick={onAdd} title="Add torrent" style={primaryButton}>+ Add</button>
       <div style={{ width: 1, height: 20, background: 'var(--border)', margin: '0 2px' }} />
-      {ACTIONS.map(action => (
+      <div style={buttonGroup}>
+        {ACTIONS.map(action => (
+          <button
+            key={action.key}
+            onClick={handlers[action.key]}
+            disabled={disabled}
+            title={action.title}
+            style={actionButton(action.color, disabled)}
+          >
+            {action.label}
+          </button>
+        ))}
+      </div>
+      <div style={buttonGroup}>
         <button
-          key={action.key}
-          onClick={handlers[action.key]}
-          disabled={disabled}
-          title={action.title}
-          style={actionButton(action.color, disabled)}
+          onClick={onProperties}
+          disabled={selectedCount !== 1 || busy}
+          title="Open selected torrent properties"
+          style={actionButton('#93c5fd', selectedCount !== 1 || busy)}
         >
-          {action.label}
+          Properties
         </button>
-      ))}
-      <button
-        onClick={onProperties}
-        disabled={selectedCount !== 1 || busy}
-        title="Open selected torrent properties"
-        style={actionButton('#93c5fd', selectedCount !== 1 || busy)}
-      >
-        Properties
-      </button>
-      <button
-        onClick={onEditSelected}
-        disabled={disabled}
-        title="Bulk edit selected torrents"
-        style={actionButton('#93c5fd', disabled)}
-      >
-        Edit selected
-      </button>
-      <button
-        onClick={onSequential}
-        disabled={disabled}
-        title="Toggle sequential download for selected torrents"
-        style={actionButton('#f59e0b', disabled)}
-      >
-        Sequential
-      </button>
-      <span style={{ color: 'var(--faint)', fontSize: 11, marginLeft: 6, whiteSpace: 'nowrap', flex: '0 0 auto' }}>
-        {selectedCount > 0 ? `${selectedCount.toLocaleString()} selected` : 'No selection'}
+        <button
+          onClick={onEditSelected}
+          disabled={disabled}
+          title="Bulk edit selected torrents"
+          style={actionButton('#93c5fd', disabled)}
+        >
+          Edit selected
+        </button>
+        <button
+          onClick={onSequential}
+          disabled={disabled}
+          title="Toggle sequential download for selected torrents"
+          style={actionButton('#f59e0b', disabled)}
+        >
+          Sequential
+        </button>
+      </div>
+      <span style={{
+        color: selectedCount > 0 ? 'var(--accent-text)' : 'var(--faint)',
+        fontSize: 11, marginLeft: 2, whiteSpace: 'nowrap', flex: '0 0 auto',
+        padding: '3px 7px', border: '1px solid var(--border)', borderRadius: 5,
+        background: selectedCount > 0 ? 'var(--accent-soft)' : 'transparent',
+      }}>
+        {busy ? 'Working...' : selectedCount > 0 ? `${selectedCount.toLocaleString()} selected` : 'No selection'}
       </span>
+      {selectedCount > 0 && (
+        <button
+          onClick={onClearSelection}
+          disabled={busy}
+          title="Clear selected torrents"
+          style={actionButton('#94a3b8', busy)}
+        >
+          Clear
+        </button>
+      )}
       <button onClick={onHelp} title="Keyboard shortcuts and docs" style={{
         marginLeft: 'auto', flex: '0 0 auto', background: 'transparent', border: '1px solid var(--border-strong)',
         borderRadius: 5, color: 'var(--muted)', padding: '4px 8px', fontSize: 12, cursor: 'pointer',
@@ -95,6 +116,13 @@ const primaryButton: React.CSSProperties = {
   padding: '4px 10px',
   fontSize: 12,
   cursor: 'pointer',
+}
+
+const buttonGroup: React.CSSProperties = {
+  flex: '0 0 auto',
+  display: 'inline-flex',
+  alignItems: 'center',
+  gap: 5,
 }
 
 function actionButton(color: string, disabled: boolean): React.CSSProperties {

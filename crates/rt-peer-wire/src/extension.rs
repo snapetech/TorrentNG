@@ -9,6 +9,8 @@ pub const EXT_HANDSHAKE_ID: u8 = 0;
 
 /// BEP 9 metadata extension name.
 pub const UT_METADATA: &str = "ut_metadata";
+/// BEP 11 peer exchange extension name.
+pub const UT_PEX: &str = "ut_pex";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionHandshake {
@@ -29,8 +31,17 @@ impl ExtensionHandshake {
         self
     }
 
+    pub fn with_ut_pex(mut self, id: u8) -> Self {
+        self.extensions.insert(UT_PEX.to_owned(), id);
+        self
+    }
+
     pub fn ut_metadata_id(&self) -> Option<u8> {
         self.extensions.get(UT_METADATA).copied()
+    }
+
+    pub fn ut_pex_id(&self) -> Option<u8> {
+        self.extensions.get(UT_PEX).copied()
     }
 
     pub fn encode(&self) -> Vec<u8> {

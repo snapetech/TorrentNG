@@ -1140,6 +1140,12 @@ async fn qb_transfer_info() {
     assert_eq!(res.status(), 200);
     let body: serde_json::Value = res.json().await.unwrap();
     assert_eq!(body["connection_status"], "connected");
+    assert_eq!(body["dl_info_speed"], 0);
+    assert_eq!(body["up_info_speed"], 0);
+    assert_eq!(body["dl_info_data"], 0);
+    assert_eq!(body["up_info_data"], 0);
+    assert_eq!(body["dl_rate_limit"], 0);
+    assert_eq!(body["up_rate_limit"], 0);
 }
 
 // --- Health ---
@@ -1187,6 +1193,30 @@ async fn native_storage_reports_configured_roots() {
             .contains("unsupported"));
     }
     assert_eq!(roots[1]["ok"], false);
+}
+
+#[tokio::test]
+async fn native_session_features_validate_request_body() {
+    let (addr, client) = spawn_server().await;
+    let res = client
+        .patch(url(addr, "/api/v1/session/features"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn native_session_features_report_rtorrent_failure() {
+    let (addr, client) = spawn_server().await;
+    let res = client
+        .patch(url(addr, "/api/v1/session/features"))
+        .json(&serde_json::json!({ "dht": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
 }
 
 #[tokio::test]

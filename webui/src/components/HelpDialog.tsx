@@ -21,12 +21,12 @@ export function HelpDialog({ onClose }: Props) {
     <div style={{
       position: 'fixed', inset: 0, background: 'rgba(2,6,23,0.72)', zIndex: 1100,
       display: 'grid', placeItems: 'center', padding: 24,
-    }}>
+    }} onClick={e => { if (e.target === e.currentTarget) onClose() }}>
       <div style={{
         width: 'min(620px, 100%)', maxHeight: '80vh', overflowY: 'auto',
         background: 'var(--panel)', border: '1px solid var(--border-strong)', borderRadius: 8,
         boxShadow: '0 24px 60px var(--shadow)',
-      }}>
+      }} onClick={e => e.stopPropagation()}>
         <div style={{
           display: 'flex', alignItems: 'center', gap: 12, padding: '14px 16px',
           borderBottom: '1px solid var(--border)',

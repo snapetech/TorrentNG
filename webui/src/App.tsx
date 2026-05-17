@@ -5,7 +5,6 @@ import { useWebSocket } from './hooks/useWebSocket'
 import { TorrentTable } from './components/TorrentTable'
 import { FilterBar } from './components/FilterBar'
 import { TorrentDetail } from './components/TorrentDetail'
-import { BulkActionBar } from './components/BulkActionBar'
 import { AddTorrentDialog } from './components/AddTorrentDialog'
 import { UserAgentPanel } from './components/UserAgentPanel'
 import { CategoriesPanel } from './components/CategoriesPanel'
@@ -163,6 +162,9 @@ export function App() {
   const [pendingDelete, setPendingDelete] = useState<TorrentSummary | null>(null)
   const [propertiesHash, setPropertiesHash] = useState<string | null>(null)
   const [bulkEditOpen, setBulkEditOpen] = useState(false)
+  const [togglingFeature, setTogglingFeature] = useState<'dht' | 'pex' | null>(null)
+  const [featureError, setFeatureError] = useState<string | null>(null)
+  const [actionNotice, setActionNotice] = useState<{ text: string; tone: 'ok' | 'error' } | null>(null)
   const [settingsSection, setSettingsSection] = useState<SettingsSection>('library')
   const [mediaInference, setMediaInference] = useState<MediaInferenceMode>(loadMediaInference)
   const [themeId, setThemeId] = useState(loadThemeId)
@@ -205,8 +207,22 @@ export function App() {
       ...prev,
       download_speed: transferInfo.dl_info_speed ?? 0,
       upload_speed: transferInfo.up_info_speed ?? 0,
+      download_total: transferInfo.dl_info_data ?? prev.download_total,
+      upload_total: transferInfo.up_info_data ?? prev.upload_total,
     }))
   }, [transferInfo])
+
+  useEffect(() => {
+    if (!featureError) return
+    const timer = window.setTimeout(() => setFeatureError(null), 5000)
+    return () => window.clearTimeout(timer)
+  }, [featureError])
+
+  useEffect(() => {
+    if (!actionNotice) return
+    const timer = window.setTimeout(() => setActionNotice(null), actionNotice.tone === 'error' ? 6000 : 3000)
+    return () => window.clearTimeout(timer)
+  }, [actionNotice])
 
   useEffect(() => {
     if (!activeTab.isActive) return
@@ -328,9 +344,13 @@ export function App() {
     const hashes = [...selected]
     if (hashes.length === 0) return
     setToolbarBusy(true)
+    setActionNotice(null)
     try {
       await api.bulk(action, hashes, false)
       qc.invalidateQueries({ queryKey: ['torrents'], exact: false })
+      setActionNotice({ text: `${action} queued for ${hashes.length.toLocaleString()} torrent${hashes.length === 1 ? '' : 's'}`, tone: 'ok' })
+    } catch {
+      setActionNotice({ text: `Failed to ${action} selected torrents`, tone: 'error' })
     } finally {
       setToolbarBusy(false)
     }
@@ -338,8 +358,32 @@ export function App() {
 
   async function toggleSequential(hashes: string[]) {
     if (hashes.length === 0) return
-    await api.torrents.toggleSequential(hashes)
-    qc.invalidateQueries({ queryKey: ['torrents'], exact: false })
+    setActionNotice(null)
+    try {
+      await api.torrents.toggleSequential(hashes)
+      qc.invalidateQueries({ queryKey: ['torrents'], exact: false })
+      setActionNotice({ text: `Sequential toggled for ${hashes.length.toLocaleString()} torrent${hashes.length === 1 ? '' : 's'}`, tone: 'ok' })
+    } catch {
+      setActionNotice({ text: 'Failed to toggle sequential download', tone: 'error' })
+    }
+  }
+
+  async function toggleSessionFeature(feature: 'dht' | 'pex') {
+    const current = liveStats[feature]
+    if ((current !== 'on' && current !== 'off') || togglingFeature) return
+    const enabled = current !== 'on'
+    setTogglingFeature(feature)
+    setFeatureError(null)
+    try {
+      const result = await api.session.setFeatures({ [feature]: enabled })
+      const applied = result[feature] ?? enabled
+      setLiveStats(prev => ({ ...prev, [feature]: applied ? 'on' : 'off' }))
+      qc.invalidateQueries({ queryKey: ['engine'] })
+    } catch {
+      setFeatureError(`Failed to toggle ${feature.toUpperCase()}`)
+    } finally {
+      setTogglingFeature(null)
+    }
   }
 
   async function runTorrent(torrent: TorrentSummary, action: 'start' | 'stop' | 'recheck' | 'reannounce') {
@@ -349,20 +393,32 @@ export function App() {
       recheck: api.torrents.recheck,
       reannounce: api.torrents.reannounce,
     }
-    await actions[action](torrent.hash)
-    qc.invalidateQueries({ queryKey: ['torrents'], exact: false })
+    setActionNotice(null)
+    try {
+      await actions[action](torrent.hash)
+      qc.invalidateQueries({ queryKey: ['torrents'], exact: false })
+      setActionNotice({ text: `${action} queued`, tone: 'ok' })
+    } catch {
+      setActionNotice({ text: `Failed to ${action} torrent`, tone: 'error' })
+    }
   }
 
   async function deleteTorrent(torrent: TorrentSummary, deleteFiles: boolean) {
-    await api.torrents.remove(torrent.hash, deleteFiles)
-    setPendingDelete(null)
-    setSelected(prev => {
-      const next = new Set(prev)
-      next.delete(torrent.hash)
-      return next
-    })
-    if (detailHash === torrent.hash) setDetailHash(null)
-    qc.invalidateQueries({ queryKey: ['torrents'], exact: false })
+    setActionNotice(null)
+    try {
+      await api.torrents.remove(torrent.hash, deleteFiles)
+      setPendingDelete(null)
+      setSelected(prev => {
+        const next = new Set(prev)
+        next.delete(torrent.hash)
+        return next
+      })
+      if (detailHash === torrent.hash) setDetailHash(null)
+      qc.invalidateQueries({ queryKey: ['torrents'], exact: false })
+      setActionNotice({ text: deleteFiles ? 'Torrent and files deleted' : 'Torrent removed', tone: 'ok' })
+    } catch {
+      setActionNotice({ text: 'Failed to delete torrent', tone: 'error' })
+    }
   }
 
   async function handleLogin(username: string, password: string) {
@@ -504,14 +560,11 @@ export function App() {
           onProperties={() => setPropertiesHash([...selected][0] ?? null)}
           onEditSelected={() => setBulkEditOpen(true)}
           onSequential={() => toggleSequential([...selected])}
+          onClearSelection={() => setSelected(new Set())}
           onHelp={() => setHelpOpen(true)}
           busy={toolbarBusy}
         />
       )}
-      {view === 'torrents' && selected.size > 0 && (
-        <BulkActionBar hashes={[...selected]} onClear={() => setSelected(new Set())} />
-      )}
-
       {/* Main content */}
       <main className="rtng-main" style={{ flex: 1, minWidth: 0, display: 'flex', overflow: 'hidden' }}>
         {view === 'settings' && (
@@ -534,8 +587,16 @@ export function App() {
             />
             <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
               {query.isError && (
-                <div style={{ padding: 24, color: 'var(--danger)', textAlign: 'center' }}>
-                  Failed to connect to sidecar API.
+                <div style={{
+                  padding: 24, color: 'var(--danger)', textAlign: 'center',
+                  display: 'grid', placeItems: 'center', gap: 10,
+                }}>
+                  <span>Failed to connect to sidecar API.</span>
+                  <button onClick={() => query.refetch()} style={{
+                    background: 'var(--surface-2)', border: '1px solid var(--border-strong)',
+                    borderRadius: 5, color: 'var(--muted)', padding: '5px 10px', fontSize: 12,
+                    cursor: 'pointer',
+                  }}>Retry</button>
                 </div>
               )}
               {query.isLoading && !query.data && (
@@ -552,7 +613,13 @@ export function App() {
                   onDetail={openAutoDetail}
                   onContextMenu={(torrent, x, y) => {
                     setContextMenu({ torrent, x, y })
-                    setSelected(prev => prev.has(torrent.hash) ? prev : new Set([torrent.hash]))
+                    setSelected(prev => {
+                      if (prev.has(torrent.hash)) return prev
+                      const next = new Set(prev)
+                      next.add(torrent.hash)
+                      return next
+                    })
+                    if (detailAutoDisplay) setDetailHash(torrent.hash)
                   }}
                   onSort={handleSort}
                   onLoadMore={() => query.fetchNextPage()}
@@ -584,6 +651,12 @@ export function App() {
         rtorrent={health?.rtorrent ?? 'connecting'}
         cached={health?.cached_torrents}
         storage={storage?.roots?.[0]}
+        togglingFeature={togglingFeature}
+        featureError={featureError}
+        actionMessage={actionNotice?.text}
+        actionTone={actionNotice?.tone}
+        onToggleDht={() => toggleSessionFeature('dht')}
+        onTogglePex={() => toggleSessionFeature('pex')}
       />
 
       {addOpen && <AddTorrentDialog onClose={() => setAddOpen(false)} />}
@@ -660,7 +733,7 @@ function SettingsView({ section, onSection, mediaInference, onMediaInference }: 
   ]
   return (
     <>
-      <aside style={{
+      <aside className="rtng-settings-sidebar" style={{
         width: 220, flexShrink: 0, background: 'var(--panel)', borderRight: '1px solid var(--border)',
         padding: 12,
       }}>
@@ -700,7 +773,7 @@ function SettingsView({ section, onSection, mediaInference, onMediaInference }: 
           </PanelFrame>
           <div style={{ padding: 18, display: 'grid', gap: 10, maxWidth: 720 }}>
             <a style={supportLink} href="https://discord.gg/4ub88HeHFm" target="_blank" rel="noreferrer">Discord support</a>
-            <a style={supportLink} href="https://github.com/rtorrentng/rtorrentng" target="_blank" rel="noreferrer">GitHub project</a>
+            <a style={supportLink} href="https://github.com/snapetech/rtorrentNG" target="_blank" rel="noreferrer">GitHub project</a>
             <button onClick={() => window.dispatchEvent(new KeyboardEvent('keydown', { key: '?' }))} style={supportButton}>Open help</button>
           </div>
         </>)}
@@ -729,7 +802,9 @@ function DeleteDialog({ torrent, onCancel, onRemove, onRemoveFiles }: {
   onRemoveFiles: () => void
 }) {
   return (
-    <div style={{
+    <div onMouseDown={e => {
+      if (e.target === e.currentTarget) onCancel()
+    }} style={{
       position: 'fixed', inset: 0, background: 'rgba(2,6,23,0.72)', zIndex: 1150,
       display: 'grid', placeItems: 'center', padding: 24,
     }}>

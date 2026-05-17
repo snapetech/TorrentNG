@@ -25,6 +25,7 @@ export function CategoriesPanel() {
   const [name, setName] = useState('')
   const [savePath, setSavePath] = useState('')
   const [editingName, setEditingName] = useState<string | null>(null)
+  const [deleteError, setDeleteError] = useState<string | null>(null)
 
   const save = useMutation({
     mutationFn: (cat: Category) => api.categories.create(cat.name, cat.save_path),
@@ -38,7 +39,9 @@ export function CategoriesPanel() {
 
   const del = useMutation({
     mutationFn: (name: string) => api.categories.delete(name),
+    onMutate: () => setDeleteError(null),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['categories'] }),
+    onError: err => setDeleteError(err instanceof Error ? err.message : 'Failed to delete category.'),
   })
 
   function startEdit(cat: Category) {
@@ -72,6 +75,7 @@ export function CategoriesPanel() {
         <div style={{ fontSize: 12, color: 'var(--faint)', marginBottom: 16 }}>No categories yet.</div>
       ) : (
         <div style={{ marginBottom: 20 }}>
+          {deleteError && <div style={{ fontSize: 12, color: 'var(--danger)', marginBottom: 8 }}>{deleteError}</div>}
           {categories.map(cat => (
             <div key={cat.name} style={{
               display: 'flex',
@@ -90,12 +94,18 @@ export function CategoriesPanel() {
               </div>
               <button
                 onClick={() => startEdit(cat)}
+                disabled={save.isPending || del.isPending}
                 style={{ background: 'none', border: '1px solid var(--border-strong)', borderRadius: 4, color: 'var(--muted)', padding: '2px 8px', fontSize: 11, cursor: 'pointer' }}
               >Edit</button>
               <button
                 onClick={() => del.mutate(cat.name)}
-                style={{ background: 'none', border: '1px solid #7f1d1d', borderRadius: 4, color: '#ef4444', padding: '2px 8px', fontSize: 11, cursor: 'pointer' }}
-              >Delete</button>
+                disabled={save.isPending || del.isPending}
+                style={{
+                  background: 'none', border: '1px solid #7f1d1d', borderRadius: 4, color: '#ef4444',
+                  padding: '2px 8px', fontSize: 11, cursor: save.isPending || del.isPending ? 'not-allowed' : 'pointer',
+                  opacity: save.isPending || del.isPending ? 0.5 : 1,
+                }}
+              >{del.isPending && del.variables === cat.name ? 'Deleting…' : 'Delete'}</button>
             </div>
           ))}
         </div>
@@ -126,9 +136,11 @@ export function CategoriesPanel() {
           />
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
-          <button type="submit" disabled={save.isPending} style={{
+          <button type="submit" disabled={save.isPending || !name.trim()} style={{
             background: 'var(--accent-soft)', border: '1px solid var(--accent)', borderRadius: 5,
-            color: 'var(--accent-text)', padding: '5px 16px', fontSize: 13, cursor: 'pointer',
+            color: 'var(--accent-text)', padding: '5px 16px', fontSize: 13,
+            cursor: save.isPending || !name.trim() ? 'not-allowed' : 'pointer',
+            opacity: save.isPending || !name.trim() ? 0.55 : 1,
           }}>
             {save.isPending ? 'Saving…' : editingName ? 'Save changes' : 'Add'}
           </button>

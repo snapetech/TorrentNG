@@ -2,13 +2,13 @@ import { useQuery } from '@tanstack/react-query'
 import { api, type EngineDiagnostics, type ProbeValue } from '../api/client'
 
 export function EnginePanel() {
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, isFetching, error, refetch } = useQuery({
     queryKey: ['engine'],
     queryFn: api.engine,
     staleTime: 2_000,
     refetchInterval: 5_000,
   })
-  const { data: commands } = useQuery({
+  const { data: commands, refetch: refetchCommands } = useQuery({
     queryKey: ['engine-commands'],
     queryFn: api.engineCommands,
     refetchInterval: 60000,
@@ -24,6 +24,20 @@ export function EnginePanel() {
           <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
             <Badge ok={driftProblems === 0} text={driftProblems === 0 ? 'profile clean' : `${driftProblems} drift`} />
             <Badge ok={data.capabilities.every(c => c.available)} text={`${data.capabilities.filter(c => c.available).length}/${data.capabilities.length} capabilities`} />
+            <button
+              onClick={() => {
+                refetch()
+                refetchCommands()
+              }}
+              disabled={isFetching}
+              style={{
+                background: 'none', border: '1px solid var(--border-strong)', borderRadius: 5,
+                color: 'var(--muted)', padding: '4px 9px', fontSize: 12,
+                cursor: isFetching ? 'not-allowed' : 'pointer', opacity: isFetching ? 0.55 : 1,
+              }}
+            >
+              {isFetching ? 'Refreshing…' : 'Refresh'}
+            </button>
           </div>
         )}
       </div>

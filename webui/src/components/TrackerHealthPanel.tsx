@@ -15,7 +15,7 @@ function fmtDate(ts: number): string {
 }
 
 export function TrackerHealthPanel() {
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, isFetching, error, refetch } = useQuery({
     queryKey: ['tracker-health'],
     queryFn: api.trackerHealth,
     staleTime: 5_000,
@@ -24,8 +24,21 @@ export function TrackerHealthPanel() {
 
   return (
     <section style={{ padding: '18px 24px' }}>
-      <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 12, color: 'var(--text)' }}>
-        Tracker Health
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
+        <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--text)', flex: 1 }}>
+          Tracker Health
+        </div>
+        <button
+          onClick={() => refetch()}
+          disabled={isFetching}
+          style={{
+            background: 'none', border: '1px solid var(--border-strong)', borderRadius: 5,
+            color: 'var(--muted)', padding: '4px 9px', fontSize: 12,
+            cursor: isFetching ? 'not-allowed' : 'pointer', opacity: isFetching ? 0.55 : 1,
+          }}
+        >
+          {isFetching ? 'Refreshing…' : 'Refresh'}
+        </button>
       </div>
 
       {isLoading && <div style={{ color: 'var(--faint)', fontSize: 12 }}>Loading tracker health…</div>}
@@ -34,7 +47,7 @@ export function TrackerHealthPanel() {
         <div style={{ color: 'var(--faint)', fontSize: 12 }}>No tracker data cached yet</div>
       )}
 
-      <div style={{ display: 'grid', gap: 8, maxWidth: 980 }}>
+      <div style={{ display: 'grid', gap: 8, maxWidth: 980, overflowX: 'auto', paddingBottom: 2 }}>
         {data?.trackers.map(tracker => {
           const errorRatio = tracker.torrent_count > 0
             ? tracker.error_count / tracker.torrent_count
@@ -46,6 +59,7 @@ export function TrackerHealthPanel() {
               style={{
                 display: 'grid',
                 gridTemplateColumns: 'minmax(220px, 1fr) 90px 90px 90px 120px',
+                minWidth: 680,
                 gap: 12,
                 alignItems: 'center',
                 border: '1px solid var(--border)',

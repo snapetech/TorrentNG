@@ -22,7 +22,7 @@ export function WorkflowsPanel() {
   const [error, setError] = useState<string | null>(null)
   const [pending, setPending] = useState<string | null>(null)
   const [preview, setPreview] = useState<{ name: string; count: number } | null>(null)
-  const { data: rules = [] } = useQuery({
+  const { data: rules = [], isLoading: rulesLoading } = useQuery({
     queryKey: ['workflows'],
     queryFn: api.workflows.list,
     staleTime: 30_000,
@@ -35,6 +35,8 @@ export function WorkflowsPanel() {
   })
 
   async function save() {
+    if (pending) return
+    setPending('__save__')
     setError(null)
     try {
       await api.workflows.save({
@@ -50,12 +52,22 @@ export function WorkflowsPanel() {
       qc.invalidateQueries({ queryKey: ['workflows'] })
     } catch (e) {
       setError(String(e))
+    } finally {
+      setPending(null)
     }
   }
 
   async function remove(id: string) {
-    await api.workflows.delete(id)
-    qc.invalidateQueries({ queryKey: ['workflows'] })
+    setPending(id)
+    setError(null)
+    try {
+      await api.workflows.delete(id)
+      qc.invalidateQueries({ queryKey: ['workflows'] })
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setPending(null)
+    }
   }
 
   async function run(rule: WorkflowRule, dryRun: boolean) {
@@ -82,23 +94,25 @@ export function WorkflowsPanel() {
       <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 12, color: 'var(--text)' }}>
         Workflow Rules
       </div>
-      <div style={{ display: 'grid', gridTemplateColumns: '150px 120px 120px 150px 1fr auto', gap: 8, maxWidth: 1080, marginBottom: 12 }}>
-        <Input value={draft.name} placeholder="Name" onChange={name => setDraft({ ...draft, name })} />
-        <Select value={draft.event} onChange={event => setDraft({ ...draft, event: event as WorkflowRule['event'] })} options={['completed', 'added', 'category_changed']} />
-        <Select value={draft.action} onChange={action => setDraft({ ...draft, action: action as WorkflowRule['action'] })} options={['webhook', 'script', 'set_category', 'set_location']} />
-        <Input value={draft.category ?? ''} placeholder="Category filter" onChange={category => setDraft({ ...draft, category })} />
-        <Input value={draft.url ?? draft.command ?? draft.target_path ?? ''} placeholder="URL, command, or path" onChange={value => setDraft({
-          ...draft,
-          url: draft.action === 'webhook' ? value : null,
-          command: draft.action === 'script' ? value : null,
-          target_path: draft.action === 'set_location' ? value : null,
-          category: draft.action === 'set_category' ? value : draft.category,
-        })} />
-        <button onClick={save} disabled={!draft.name.trim()} style={{
-          background: 'var(--accent-soft)', border: '1px solid var(--accent)', borderRadius: 5,
-          color: 'var(--accent-text)', padding: '4px 10px', fontSize: 12,
-          cursor: draft.name.trim() ? 'pointer' : 'not-allowed', opacity: draft.name.trim() ? 1 : 0.5,
-        }}>Save</button>
+      <div style={scrollX}>
+        <div style={{ display: 'grid', gridTemplateColumns: '150px 120px 120px 150px minmax(240px, 1fr) auto', gap: 8, minWidth: 860, maxWidth: 1080, marginBottom: 12 }}>
+          <Input value={draft.name} placeholder="Name" onChange={name => setDraft({ ...draft, name })} />
+          <Select value={draft.event} onChange={event => setDraft({ ...draft, event: event as WorkflowRule['event'] })} options={['completed', 'added', 'category_changed']} />
+          <Select value={draft.action} onChange={action => setDraft({ ...draft, action: action as WorkflowRule['action'] })} options={['webhook', 'script', 'set_category', 'set_location']} />
+          <Input value={draft.category ?? ''} placeholder="Category filter" onChange={category => setDraft({ ...draft, category })} />
+          <Input value={draft.url ?? draft.command ?? draft.target_path ?? ''} placeholder="URL, command, or path" onChange={value => setDraft({
+            ...draft,
+            url: draft.action === 'webhook' ? value : null,
+            command: draft.action === 'script' ? value : null,
+            target_path: draft.action === 'set_location' ? value : null,
+            category: draft.action === 'set_category' ? value : draft.category,
+          })} />
+          <button onClick={save} disabled={!draft.name.trim() || Boolean(pending)} style={{
+            background: 'var(--accent-soft)', border: '1px solid var(--accent)', borderRadius: 5,
+            color: 'var(--accent-text)', padding: '4px 10px', fontSize: 12,
+            cursor: draft.name.trim() && !pending ? 'pointer' : 'not-allowed', opacity: draft.name.trim() && !pending ? 1 : 0.5,
+          }}>{pending === '__save__' ? 'Saving…' : 'Save'}</button>
+        </div>
       </div>
       {error && <div style={{ color: '#ef4444', fontSize: 12, marginBottom: 10 }}>{error}</div>}
       {preview && (
@@ -106,10 +120,15 @@ export function WorkflowsPanel() {
           {preview.name}: {preview.count.toLocaleString()} matching torrent{preview.count === 1 ? '' : 's'}
         </div>
       )}
-      <div style={{ display: 'grid', gap: 8, maxWidth: 1080 }}>
+      <div style={{ ...scrollX, display: 'grid', gap: 8, maxWidth: 1080 }}>
+        {rulesLoading && <div style={{ color: 'var(--faint)', fontSize: 12 }}>Loading workflow rules…</div>}
+        {!rulesLoading && rules.length === 0 && (
+          <div style={{ color: 'var(--faint)', fontSize: 12, padding: '8px 0' }}>No workflow rules configured.</div>
+        )}
         {rules.map(rule => (
           <div key={rule.id} style={{
-            display: 'grid', gridTemplateColumns: '150px 120px 120px 150px 1fr auto auto auto',
+            display: 'grid', gridTemplateColumns: '150px 120px 120px 150px minmax(240px, 1fr) auto auto auto',
+            minWidth: 980,
             gap: 8, alignItems: 'center', border: '1px solid var(--border)',
             borderRadius: 6, padding: '9px 12px', background: 'var(--surface)', fontSize: 12,
           }}>
@@ -120,20 +139,20 @@ export function WorkflowsPanel() {
             <span style={{ color: 'var(--faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
               {rule.url || rule.command || rule.target_path || rule.tracker || 'configured'}
             </span>
-            <button onClick={() => run(rule, true)} disabled={pending === rule.id} style={{
+            <button onClick={() => run(rule, true)} disabled={Boolean(pending)} style={{
               background: 'none', border: '1px solid var(--border-strong)', borderRadius: 4,
               color: 'var(--muted)', padding: '3px 8px', fontSize: 11,
-              cursor: pending === rule.id ? 'not-allowed' : 'pointer',
+              cursor: pending ? 'not-allowed' : 'pointer', opacity: pending ? 0.55 : 1,
             }}>Preview</button>
-            <button onClick={() => run(rule, false)} disabled={pending === rule.id} style={{
+            <button onClick={() => run(rule, false)} disabled={Boolean(pending)} style={{
               background: 'var(--surface-2)', border: '1px solid var(--accent)', borderRadius: 4,
               color: 'var(--accent)', padding: '3px 8px', fontSize: 11,
-              cursor: pending === rule.id ? 'not-allowed' : 'pointer',
+              cursor: pending ? 'not-allowed' : 'pointer', opacity: pending ? 0.55 : 1,
             }}>Run</button>
-            <button onClick={() => remove(rule.id)} disabled={pending === rule.id} style={{
+            <button onClick={() => remove(rule.id)} disabled={Boolean(pending)} style={{
               background: 'none', border: '1px solid var(--border-strong)', borderRadius: 4,
               color: 'var(--faint)', padding: '3px 8px', fontSize: 11,
-              cursor: pending === rule.id ? 'not-allowed' : 'pointer',
+              cursor: pending ? 'not-allowed' : 'pointer', opacity: pending ? 0.55 : 1,
             }}>Delete</button>
           </div>
         ))}
@@ -141,7 +160,7 @@ export function WorkflowsPanel() {
       <div style={{ fontSize: 13, fontWeight: 600, marginTop: 20, marginBottom: 10, color: 'var(--text)' }}>
         Recent Runs
       </div>
-      <div style={{ display: 'grid', gap: 6, maxWidth: 1080 }}>
+      <div style={{ ...scrollX, display: 'grid', gap: 6, maxWidth: 1080 }}>
         {runs.slice(0, 8).map(run => <WorkflowRunRow key={run.id} run={run} />)}
         {runs.length === 0 && (
           <div style={{ color: 'var(--faint)', fontSize: 12, padding: '8px 0' }}>
@@ -153,11 +172,17 @@ export function WorkflowsPanel() {
   )
 }
 
+const scrollX: React.CSSProperties = {
+  overflowX: 'auto',
+  paddingBottom: 2,
+}
+
 function WorkflowRunRow({ run }: { run: WorkflowRun }) {
   const status = run.errors.length > 0 ? `${run.errors.length} error(s)` : run.dry_run ? 'previewed' : 'completed'
   return (
     <div style={{
       display: 'grid', gridTemplateColumns: '150px 120px 90px 90px 90px 1fr',
+      minWidth: 760,
       gap: 8, alignItems: 'center', border: '1px solid var(--border)',
       borderRadius: 6, padding: '8px 12px', background: 'var(--surface)', fontSize: 12,
     }}>

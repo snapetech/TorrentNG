@@ -45,6 +45,7 @@ export function UserAgentPanel() {
           <button
             key={p.value}
             onClick={() => setDraft(p.value)}
+            disabled={mutation.isPending}
             style={{
               background: draft === p.value ? 'var(--accent-soft)' : 'var(--surface-2)',
               border: '1px solid ' + (draft === p.value ? 'var(--accent)' : 'var(--border-strong)'),
@@ -52,7 +53,8 @@ export function UserAgentPanel() {
               color: draft === p.value ? 'var(--accent-text)' : 'var(--muted)',
               padding: '3px 10px',
               fontSize: 11,
-              cursor: 'pointer',
+              cursor: mutation.isPending ? 'not-allowed' : 'pointer',
+              opacity: mutation.isPending ? 0.55 : 1,
               whiteSpace: 'nowrap',
             }}
           >
@@ -67,6 +69,7 @@ export function UserAgentPanel() {
         type="text"
         value={draft}
         onChange={e => setDraft(e.target.value)}
+        disabled={mutation.isPending}
         placeholder={isLoading ? 'Loading…' : 'user-agent string'}
         style={{
           width: '100%',
@@ -99,13 +102,18 @@ export function UserAgentPanel() {
             padding: '5px 16px',
             fontSize: 12,
             cursor: isDirty ? 'pointer' : 'default',
+            opacity: !isDirty || mutation.isPending || !draft.trim() ? 0.6 : 1,
             fontWeight: 600,
           }}
         >
           {mutation.isPending ? 'Applying…' : 'Apply'}
         </button>
         {saved && <span style={{ fontSize: 12, color: '#22c55e' }}>Applied ✓</span>}
-        {mutation.isError && <span style={{ fontSize: 12, color: '#ef4444' }}>Failed</span>}
+        {mutation.isError && (
+          <span style={{ fontSize: 12, color: '#ef4444' }}>
+            {mutation.error instanceof Error ? mutation.error.message : 'Failed'}
+          </span>
+        )}
       </div>
 
       <div style={{ fontSize: 11, color: 'var(--faint)', marginTop: 12, lineHeight: 1.5 }}>

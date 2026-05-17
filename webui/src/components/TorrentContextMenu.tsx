@@ -47,7 +47,7 @@ export function TorrentContextMenu({
 
   return (
     <div
-      onMouseLeave={onClose}
+      onContextMenu={e => e.preventDefault()}
       style={{
         position: 'fixed', left: menu.x, top: menu.y, zIndex: 1000,
         minWidth: 176, background: 'var(--panel)', border: '1px solid var(--border-strong)',

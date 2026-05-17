@@ -8,6 +8,7 @@ interface Props {
 
 export function FilterBar({ params, onChange }: Props) {
   const [search, setSearch] = useState(params.filter ?? '')
+  const hasSidebarFilters = Boolean(params.status || params.category || params.tag || params.tracker || params.media_type)
 
   useEffect(() => {
     const t = setTimeout(() => onChange({ filter: search, offset: 0 }), 200)
@@ -59,6 +60,35 @@ export function FilterBar({ params, onChange }: Props) {
         >
           Clear search
         </button>
+      )}
+      {hasSidebarFilters && (
+        <button
+          onClick={() => onChange({
+            status: undefined,
+            category: undefined,
+            tag: undefined,
+            tracker: undefined,
+            media_type: undefined,
+            offset: 0,
+          })}
+          title="Clear sidebar filters"
+          style={{
+            background: 'none',
+            border: '1px solid var(--border-strong)',
+            borderRadius: 5,
+            color: 'var(--muted)',
+            padding: '3px 8px',
+            fontSize: 11,
+            cursor: 'pointer',
+          }}
+        >
+          Clear filters
+        </button>
+      )}
+      {hasSidebarFilters && (
+        <span style={{ color: 'var(--faint)', fontSize: 11, whiteSpace: 'nowrap' }}>
+          Filtered view
+        </span>
       )}
     </div>
   )

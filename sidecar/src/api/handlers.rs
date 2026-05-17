@@ -15,6 +15,7 @@ use super::ws::Event;
 use crate::cache::{
     Category, ListParams, RatioGroup, RssRule, SavedView, WorkflowRule, WorkflowRun,
 };
+use crate::rtorrent::XmlValue;
 
 // --- Health ---
 
@@ -113,6 +114,52 @@ pub async fn engine_diagnostics(State(s): State<AppState>) -> impl IntoResponse 
 
 pub async fn engine_commands(State(s): State<AppState>) -> impl IntoResponse {
     Json(s.rt.command_index().await)
+}
+
+#[derive(Deserialize)]
+pub struct SessionFeaturePatch {
+    dht: Option<bool>,
+    pex: Option<bool>,
+}
+
+#[derive(Serialize)]
+pub struct SessionFeatureResponse {
+    dht: Option<bool>,
+    pex: Option<bool>,
+}
+
+pub async fn set_session_features(
+    State(s): State<AppState>,
+    Json(patch): Json<SessionFeaturePatch>,
+) -> impl IntoResponse {
+    if patch.dht.is_none() && patch.pex.is_none() {
+        return (StatusCode::BAD_REQUEST, "no session feature provided").into_response();
+    }
+
+    let mut dht = None;
+    let mut pex = None;
+
+    if let Some(enabled) = patch.dht {
+        let mode = if enabled { "auto" } else { "disable" };
+        if let Err(e) = s.rt.call("dht.mode.set", &[XmlValue::from(mode)]).await {
+            tracing::error!("set dht mode: {e}");
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+        dht = Some(enabled);
+    }
+
+    if let Some(enabled) = patch.pex {
+        if let Err(e) =
+            s.rt.call("protocol.pex.set", &[XmlValue::from(enabled)])
+                .await
+        {
+            tracing::error!("set pex: {e}");
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+        pex = Some(enabled);
+    }
+
+    Json(SessionFeatureResponse { dht, pex }).into_response()
 }
 
 // --- Saved views ---

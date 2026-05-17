@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr, SocketAddrV4};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use rt_dht::{DhtError, DhtQuery, DhtResponse, KNode, KrpcMessage, NodeId, RoutingTable, K};
@@ -49,11 +49,12 @@ pub async fn run_dht(
         queried_nodes: HashMap::new(),
         torrents: HashMap::new(),
         announced_peers: HashMap::new(),
+        last_full_lookup: HashMap::new(),
     };
     task.bootstrap().await;
 
     let mut bootstrap_tick = interval(Duration::from_secs(300));
-    let mut search_tick = interval(Duration::from_secs(60));
+    let mut search_tick = interval(Duration::from_secs(30));
     let mut buf = vec![0u8; 2048];
     loop {
         tokio::select! {
@@ -92,6 +93,7 @@ struct DhtTask {
     queried_nodes: HashMap<[u8; 20], HashSet<SocketAddrV4>>,
     torrents: HashMap<[u8; 20], mpsc::Sender<TorrentCmd>>,
     announced_peers: HashMap<[u8; 20], Vec<SocketAddrV4>>,
+    last_full_lookup: HashMap<[u8; 20], Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,12 +108,13 @@ impl DhtTask {
         match cmd {
             DhtCommand::AddTorrent(torrent) => {
                 self.torrents.insert(torrent.info_hash, torrent.cmd_tx);
-                self.search_torrent(torrent.info_hash).await;
+                self.search_torrent(torrent.info_hash, true).await;
             }
             DhtCommand::RemoveTorrent(info_hash) => {
                 self.torrents.remove(&info_hash);
                 self.queried_nodes.remove(&info_hash);
                 self.announced_peers.remove(&info_hash);
+                self.last_full_lookup.remove(&info_hash);
             }
             DhtCommand::Shutdown => {
                 info!("DHT task shutting down");
@@ -312,11 +315,12 @@ impl DhtTask {
 
     async fn search_torrents(&mut self) {
         for info_hash in self.torrents.keys().copied().collect::<Vec<_>>() {
-            self.search_torrent(info_hash).await;
+            self.search_torrent(info_hash, false).await;
         }
     }
 
-    async fn search_torrent(&mut self, info_hash: [u8; 20]) {
+    async fn search_torrent(&mut self, info_hash: [u8; 20], force_restart: bool) {
+        self.maybe_restart_lookup(info_hash, force_restart);
         let target = NodeId::from_bytes(info_hash);
         let nodes: Vec<_> = self
             .table
@@ -330,6 +334,20 @@ impl DhtTask {
         }
         for addr in nodes {
             self.send_get_peers(info_hash, addr).await;
+        }
+    }
+
+    fn maybe_restart_lookup(&mut self, info_hash: [u8; 20], force_restart: bool) {
+        const DHT_LOOKUP_RESTART_AFTER: Duration = Duration::from_secs(120);
+        let now = Instant::now();
+        let should_restart = force_restart
+            || self
+                .last_full_lookup
+                .get(&info_hash)
+                .is_none_or(|last| now.duration_since(*last) >= DHT_LOOKUP_RESTART_AFTER);
+        if should_restart {
+            self.queried_nodes.remove(&info_hash);
+            self.last_full_lookup.insert(info_hash, now);
         }
     }
 
@@ -468,6 +486,7 @@ mod tests {
             queried_nodes: HashMap::new(),
             torrents: HashMap::new(),
             announced_peers: HashMap::new(),
+            last_full_lookup: HashMap::new(),
         };
 
         assert_eq!(task.transaction_id(), u16::MAX.to_be_bytes());
@@ -491,6 +510,7 @@ mod tests {
             queried_nodes: HashMap::new(),
             torrents: HashMap::new(),
             announced_peers: HashMap::new(),
+            last_full_lookup: HashMap::new(),
         };
         task.table.insert(KNode {
             id: NodeId::from_bytes([2; 20]),
@@ -520,6 +540,7 @@ mod tests {
             queried_nodes: HashMap::new(),
             torrents: HashMap::new(),
             announced_peers: HashMap::new(),
+            last_full_lookup: HashMap::new(),
         };
         let addr: SocketAddr = "127.0.0.1:60000".parse().unwrap();
         let response =
@@ -545,6 +566,7 @@ mod tests {
             queried_nodes: HashMap::new(),
             torrents: HashMap::new(),
             announced_peers: HashMap::new(),
+            last_full_lookup: HashMap::new(),
         };
         let info_hash = [9; 20];
         let addr: SocketAddr = "127.0.0.1:60000".parse().unwrap();
@@ -576,6 +598,7 @@ mod tests {
             queried_nodes: HashMap::new(),
             torrents: HashMap::new(),
             announced_peers: HashMap::new(),
+            last_full_lookup: HashMap::new(),
         };
         let token = b"token".to_vec();
         let (tx, msg) = task.announce_peer_query([9; 20], token.clone());
@@ -623,6 +646,7 @@ mod tests {
             queried_nodes: HashMap::new(),
             torrents: HashMap::from([(info_hash, cmd_tx)]),
             announced_peers: HashMap::new(),
+            last_full_lookup: HashMap::new(),
         };
         let first = std::net::SocketAddrV4::new("127.0.0.1".parse().unwrap(), 6001);
         let second = std::net::SocketAddrV4::new("127.0.0.1".parse().unwrap(), 6002);
@@ -631,7 +655,7 @@ mod tests {
             addr: first,
         });
 
-        task.search_torrent(info_hash).await;
+        task.search_torrent(info_hash, true).await;
         assert!(task.queried_nodes[&info_hash].contains(&first));
         assert_eq!(task.outstanding.len(), 1);
 
@@ -643,5 +667,38 @@ mod tests {
 
         assert!(task.queried_nodes[&info_hash].contains(&second));
         assert_eq!(task.outstanding.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn lookup_restart_clears_previously_queried_nodes() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let socket = UdpSocket::from_std(socket).unwrap();
+        let local_id = NodeId::from_bytes([1; 20]);
+        let info_hash = [9; 20];
+        let (cmd_tx, _cmd_rx) = mpsc::channel(1);
+        let first = std::net::SocketAddrV4::new("127.0.0.1".parse().unwrap(), 6001);
+        let mut task = DhtTask {
+            local_id,
+            table: RoutingTable::new(local_id),
+            socket,
+            listen_port: 6881,
+            bootstrap_nodes: Vec::new(),
+            next_tx: 1,
+            outstanding: HashMap::new(),
+            queried_nodes: HashMap::from([(info_hash, HashSet::from([first]))]),
+            torrents: HashMap::from([(info_hash, cmd_tx)]),
+            announced_peers: HashMap::new(),
+            last_full_lookup: HashMap::new(),
+        };
+        task.table.insert(KNode {
+            id: NodeId::from_bytes([2; 20]),
+            addr: first,
+        });
+
+        task.search_torrent(info_hash, true).await;
+
+        assert!(task.queried_nodes[&info_hash].contains(&first));
+        assert_eq!(task.outstanding.len(), 1);
     }
 }

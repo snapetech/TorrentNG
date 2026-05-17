@@ -4,5 +4,5 @@ pub mod files;
 pub mod torrents;
 pub mod trackers;
 
-pub use client::Client;
+pub use client::{Client, XmlValue};
 pub use torrents::TransferRates;

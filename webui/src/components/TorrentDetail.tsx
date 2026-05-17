@@ -57,15 +57,16 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
   const [editingPath, setEditingPath] = useState(false)
   const [savePath, setSavePath] = useState(t.directory || '')
   const [newTracker, setNewTracker] = useState('')
+  const [error, setError] = useState<string | null>(null)
 
-  const { data: trackers } = useQuery({
+  const { data: trackers, isLoading: trackersLoading, error: trackersError } = useQuery({
     queryKey: ['trackers', t.hash],
     queryFn: () => api.torrents.trackers(t.hash),
     staleTime: 2_000,
     refetchInterval: 5_000,
   })
 
-  const { data: files } = useQuery({
+  const { data: files, isLoading: filesLoading, error: filesError } = useQuery({
     queryKey: ['files', t.hash],
     queryFn: () => api.torrents.files(t.hash),
     staleTime: 2_000,
@@ -74,9 +75,12 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
 
   async function doAction(fn: () => Promise<void>) {
     setBusy(true)
+    setError(null)
     try {
       await fn()
       qc.invalidateQueries({ queryKey: ['torrents'], exact: false })
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Torrent action failed.')
     } finally {
       setBusy(false)
     }
@@ -84,10 +88,13 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
 
   async function remove(deleteFiles: boolean) {
     setBusy(true)
+    setError(null)
     try {
       await api.torrents.remove(t.hash, deleteFiles)
       qc.invalidateQueries({ queryKey: ['torrents'], exact: false })
       onClose()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Delete failed.')
     } finally {
       setBusy(false)
     }
@@ -183,6 +190,16 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
       </div>
 
       {/* Delete confirmation */}
+      {error && (
+        <div style={{
+          padding: '7px 14px', borderBottom: '1px solid var(--danger)',
+          background: 'color-mix(in srgb, var(--danger) 10%, var(--panel))',
+          color: 'var(--danger)', fontSize: 11, overflowWrap: 'anywhere',
+        }}>
+          {error}
+        </div>
+      )}
+
       {confirmDelete && (
         <div style={{
           padding: '10px 14px', background: 'color-mix(in srgb, var(--danger) 12%, var(--panel))', borderBottom: '1px solid var(--danger)',
@@ -190,17 +207,20 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
         }}>
           <div style={{ color: 'var(--danger)', marginBottom: 8 }}>Delete "{t.name}"?</div>
           <div style={{ display: 'flex', gap: 6 }}>
-            <button onClick={() => remove(false)} style={{
+            <button disabled={busy} onClick={() => remove(false)} style={{
               background: 'color-mix(in srgb, var(--danger) 18%, var(--surface-2))', border: 'none', borderRadius: 4,
-              color: 'var(--danger)', padding: '3px 10px', fontSize: 11, cursor: 'pointer',
+              color: 'var(--danger)', padding: '3px 10px', fontSize: 11,
+              cursor: busy ? 'not-allowed' : 'pointer', opacity: busy ? 0.55 : 1,
             }}>Remove torrent</button>
-            <button onClick={() => remove(true)} style={{
+            <button disabled={busy} onClick={() => remove(true)} style={{
               background: 'color-mix(in srgb, var(--danger) 28%, var(--surface-2))', border: 'none', borderRadius: 4,
-              color: 'var(--danger)', padding: '3px 10px', fontSize: 11, cursor: 'pointer',
+              color: 'var(--danger)', padding: '3px 10px', fontSize: 11,
+              cursor: busy ? 'not-allowed' : 'pointer', opacity: busy ? 0.55 : 1,
             }}>+ Delete files</button>
-            <button onClick={() => setConfirmDelete(false)} style={{
+            <button disabled={busy} onClick={() => setConfirmDelete(false)} style={{
               background: 'none', border: '1px solid var(--border-strong)', borderRadius: 4,
-              color: 'var(--faint)', padding: '3px 8px', fontSize: 11, cursor: 'pointer',
+              color: 'var(--faint)', padding: '3px 8px', fontSize: 11,
+              cursor: busy ? 'not-allowed' : 'pointer', opacity: busy ? 0.55 : 1,
             }}>Cancel</button>
           </div>
         </div>
@@ -326,6 +346,16 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
         <div style={MONO}>{t.hash}</div>
 
         {/* Trackers */}
+        {trackersLoading && (
+          <Section title="Trackers">
+            <div style={{ fontSize: 11, color: 'var(--faint)', marginBottom: 8 }}>Loading trackers…</div>
+          </Section>
+        )}
+        {trackersError && (
+          <Section title="Trackers">
+            <div style={{ fontSize: 11, color: 'var(--danger)', marginBottom: 8 }}>Tracker details unavailable.</div>
+          </Section>
+        )}
         {trackers && (
           <Section title="Trackers">
             <div style={{ display: 'flex', gap: 6, marginBottom: 10 }}>
@@ -385,6 +415,16 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
         )}
 
         {/* Files */}
+        {filesLoading && (
+          <Section title="Files">
+            <div style={{ fontSize: 11, color: 'var(--faint)', marginBottom: 8 }}>Loading files…</div>
+          </Section>
+        )}
+        {filesError && (
+          <Section title="Files">
+            <div style={{ fontSize: 11, color: 'var(--danger)', marginBottom: 8 }}>File details unavailable.</div>
+          </Section>
+        )}
         {files && files.length > 0 && (
           <Section title={`Files (${files.length})`}>
             {files.map(f => {

@@ -1,5 +1,8 @@
 use std::{
-    sync::Arc,
+    sync::{
+        atomic::{AtomicI64, Ordering},
+        Arc,
+    },
     time::{Duration, SystemTime},
 };
 
@@ -14,13 +17,27 @@ use crate::{
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const LIVE_SPEEDS_MAX_AGE: Duration = Duration::from_secs(8);
 const DEFAULT_INCOMING_PORT: u16 = 50000;
+static SESSION_UPLOAD_TOTAL: AtomicI64 = AtomicI64::new(0);
+static SESSION_DOWNLOAD_TOTAL: AtomicI64 = AtomicI64::new(0);
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SessionTotals {
+    pub upload: i64,
+    pub download: i64,
+}
 
 pub async fn run(rt: Arc<Client>, tx: broadcast::Sender<Event>, interval: Duration) {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_tick = tokio::time::Instant::now();
+    let mut upload_total = 0_i64;
+    let mut download_total = 0_i64;
 
     loop {
         ticker.tick().await;
+        let now = tokio::time::Instant::now();
+        let elapsed = now.duration_since(last_tick).as_secs_f64();
+        last_tick = now;
         let rates = match live_speeds_file() {
             Some(path) => read_live_speeds(&path).unwrap_or_default(),
             None => match tokio::time::timeout(PROBE_TIMEOUT, rt.transfer_rates()).await {
@@ -35,10 +52,17 @@ pub async fn run(rt: Arc<Client>, tx: broadcast::Sender<Event>, interval: Durati
                 }
             },
         };
-        let live = live_status();
+        upload_total = upload_total.saturating_add((rates.upload.max(0) as f64 * elapsed) as i64);
+        download_total =
+            download_total.saturating_add((rates.download.max(0) as f64 * elapsed) as i64);
+        SESSION_UPLOAD_TOTAL.store(upload_total, Ordering::Relaxed);
+        SESSION_DOWNLOAD_TOTAL.store(download_total, Ordering::Relaxed);
+        let live = live_status(&rt).await;
         let _ = tx.send(Event::Stats {
             upload_speed: rates.upload,
             download_speed: rates.download,
+            upload_total,
+            download_total,
             connections: live.connections,
             pending_connections: live.pending_connections,
             listen_port: live.listen_port,
@@ -46,6 +70,13 @@ pub async fn run(rt: Arc<Client>, tx: broadcast::Sender<Event>, interval: Durati
             dht: live.dht,
             pex: live.pex,
         });
+    }
+}
+
+pub fn session_totals() -> SessionTotals {
+    SessionTotals {
+        upload: SESSION_UPLOAD_TOTAL.load(Ordering::Relaxed),
+        download: SESSION_DOWNLOAD_TOTAL.load(Ordering::Relaxed),
     }
 }
 
@@ -127,10 +158,10 @@ struct LiveStatus {
     pex: String,
 }
 
-fn live_status() -> LiveStatus {
+async fn live_status(rt: &Client) -> LiveStatus {
     let listen_port = incoming_port();
     let sockets = tcp_socket_counts(listen_port);
-    let (dht, pex) = rtorrent_feature_status();
+    let (dht, pex) = rtorrent_feature_status(rt).await;
     let firewall = if sockets.listening && sockets.established > 0 {
         "open"
     } else if sockets.listening {
@@ -200,9 +231,28 @@ fn endpoint_port(endpoint: &str) -> Option<u16> {
     u16::from_str_radix(port, 16).ok()
 }
 
-fn rtorrent_feature_status() -> (String, String) {
+async fn rtorrent_feature_status(rt: &Client) -> (String, String) {
     let mut dht = "unknown".to_owned();
     let mut pex = "unknown".to_owned();
+
+    if let Ok(Ok(value)) = tokio::time::timeout(PROBE_TIMEOUT, rt.call_sync("dht.mode", &[])).await
+    {
+        if let Some(mode) = value.as_str() {
+            dht = if matches!(mode, "disable" | "off" | "no") {
+                "off".to_owned()
+            } else {
+                "on".to_owned()
+            };
+        }
+    }
+
+    if let Ok(Ok(value)) =
+        tokio::time::timeout(PROBE_TIMEOUT, rt.call_sync("protocol.pex", &[])).await
+    {
+        if let Some(enabled) = value.as_bool() {
+            pex = if enabled { "on" } else { "off" }.to_owned();
+        }
+    }
 
     for path in [
         "/etc/rtorrent/profile.rc",
@@ -218,7 +268,9 @@ fn rtorrent_feature_status() -> (String, String) {
                     &["disable", "off", "no"],
                     &["on", "auto", "enable", "yes"],
                 ) {
-                    dht = value;
+                    if dht == "unknown" {
+                        dht = value;
+                    }
                 }
                 if let Some(value) = config_switch(
                     &normalized,
@@ -226,7 +278,9 @@ fn rtorrent_feature_status() -> (String, String) {
                     &["no", "false", "0", "off", "disable"],
                     &["yes", "true", "1", "on", "enable"],
                 ) {
-                    pex = value;
+                    if pex == "unknown" {
+                        pex = value;
+                    }
                 }
             }
         }

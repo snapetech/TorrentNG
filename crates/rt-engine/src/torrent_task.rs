@@ -3,12 +3,14 @@
 /// One tokio task per torrent owns: tracker announce loop, peer connection
 /// management, piece picker, and storage writes.
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::{SinkExt, StreamExt};
+use reqwest::header::RANGE;
+use rt_bencode::{decode, BValue};
 use rusqlite::Connection;
 use tokio::net::TcpStream;
 use tokio::net::UdpSocket;
@@ -52,6 +54,7 @@ use crate::peer_id::OUR_PEER_ID;
 use crate::EnginePeerSnapshot;
 
 const LOCAL_UT_METADATA_ID: u8 = 1;
+const LOCAL_UT_PEX_ID: u8 = 2;
 const METADATA_PIECE_SIZE: usize = 16 * 1024;
 
 /// Messages from the engine to a running torrent task.
@@ -144,7 +147,12 @@ enum PeerEvent {
     ExtendedHandshake {
         peer: SocketAddr,
         ut_metadata_id: Option<u8>,
+        ut_pex_id: Option<u8>,
         metadata_size: Option<u32>,
+    },
+    PeerExchange {
+        peer: SocketAddr,
+        peers: Vec<SocketAddr>,
     },
 }
 
@@ -160,6 +168,7 @@ struct PeerHandle {
     outstanding: usize,
     requested: Vec<BlockRequest>,
     ut_metadata_id: Option<u8>,
+    ut_pex_id: Option<u8>,
     metadata_size: Option<u32>,
 }
 
@@ -205,7 +214,12 @@ pub struct TorrentTask {
     choker: Choker,
     /// active peer addresses
     active_peers: HashMap<SocketAddr, PeerHandle>,
+    known_tracker_peers: HashSet<SocketAddr>,
     allowed_private_peers: HashSet<SocketAddr>,
+    last_peerless_reannounce: Option<Instant>,
+    webseed_client: reqwest::Client,
+    webseed_next_index: usize,
+    last_progress_persist: Option<Instant>,
     paused: bool,
     max_peers: usize,
 }
@@ -280,7 +294,15 @@ impl TorrentTask {
             picker,
             choker: Choker::new(DEFAULT_MAX_UNCHOKED),
             active_peers: HashMap::new(),
+            known_tracker_peers: HashSet::new(),
             allowed_private_peers: HashSet::new(),
+            last_peerless_reannounce: None,
+            webseed_client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(http_timeout_secs.max(1)))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
+            webseed_next_index: 0,
+            last_progress_persist: None,
             paused,
             max_peers,
         };
@@ -306,6 +328,8 @@ impl TorrentTask {
 
         let mut choke_tick = interval(Duration::from_secs(10));
         let mut tracker_tick = interval(Duration::from_secs(5));
+        let mut peer_retry_tick = interval(Duration::from_secs(30));
+        let mut webseed_tick = interval(Duration::from_millis(100));
 
         loop {
             tokio::select! {
@@ -334,6 +358,7 @@ impl TorrentTask {
                         }
                         TorrentCmd::NewPeers(addrs) => {
                             if !self.paused {
+                                self.remember_tracker_peers(&addrs);
                                 self.connect_peers(addrs).await;
                             }
                         }
@@ -376,6 +401,18 @@ impl TorrentTask {
                 _ = tracker_tick.tick() => {
                     if !self.paused {
                         self.announce_due_trackers().await;
+                    }
+                }
+
+                _ = peer_retry_tick.tick() => {
+                    if !self.paused {
+                        self.retry_known_tracker_peers().await;
+                    }
+                }
+
+                _ = webseed_tick.tick() => {
+                    if !self.paused {
+                        self.download_next_webseed_block().await;
                     }
                 }
             }
@@ -759,6 +796,7 @@ impl TorrentTask {
                 outstanding: 0,
                 requested: Vec::new(),
                 ut_metadata_id: None,
+                ut_pex_id: None,
                 metadata_size: None,
             },
         );
@@ -795,9 +833,117 @@ impl TorrentTask {
     }
 
     fn remember_tracker_peers(&mut self, peers: &[SocketAddr]) {
+        self.known_tracker_peers.extend(peers.iter().copied());
         if self.meta.private {
             self.allowed_private_peers.extend(peers.iter().copied());
         }
+    }
+
+    async fn retry_known_tracker_peers(&mut self) {
+        if self.picker.is_complete() {
+            return;
+        }
+        if self.active_peers.is_empty() {
+            self.schedule_peerless_reannounce();
+        }
+        if self.active_peers.len() >= self.max_peers || self.known_tracker_peers.is_empty() {
+            return;
+        }
+        info!(
+            torrent = %self.info_hash_hex,
+            known_peers = self.known_tracker_peers.len(),
+            "retrying known peers"
+        );
+        let peers: Vec<SocketAddr> = self.known_tracker_peers.iter().copied().collect();
+        self.connect_peers(peers).await;
+    }
+
+    async fn download_next_webseed_block(&mut self) {
+        if self.picker.is_complete() || self.meta.webseeds.is_empty() || self.meta.files.len() != 1
+        {
+            return;
+        }
+
+        let peer_has_all = vec![true; self.meta.pieces.len()];
+        let Some(req) = self.picker.pick(&peer_has_all) else {
+            return;
+        };
+
+        let seed_count = self.meta.webseeds.len();
+        for attempt in 0..seed_count {
+            let idx = (self.webseed_next_index + attempt) % seed_count;
+            let Some(url) = webseed_block_url(&self.meta, &self.meta.webseeds[idx]) else {
+                continue;
+            };
+            match self.fetch_webseed_block(&url, req).await {
+                Ok(data) => {
+                    self.webseed_next_index = (idx + 1) % seed_count;
+                    self.handle_block(BlockEvent {
+                        piece: req.piece,
+                        offset: req.begin,
+                        data,
+                    })
+                    .await;
+                    return;
+                }
+                Err(e) => {
+                    warn!(
+                        torrent = %self.info_hash_hex,
+                        webseed = %self.meta.webseeds[idx],
+                        piece = req.piece,
+                        offset = req.begin,
+                        err = %e,
+                        "webseed block fetch failed"
+                    );
+                }
+            }
+        }
+
+        self.picker.cancel_request(req.piece as usize, req.begin);
+    }
+
+    async fn fetch_webseed_block(
+        &self,
+        url: &Url,
+        req: BlockRequest,
+    ) -> anyhow::Result<bytes::Bytes> {
+        let start = req.piece as u64 * self.meta.piece_length + req.begin as u64;
+        let end = start + req.length as u64 - 1;
+        let response = self
+            .webseed_client
+            .get(url.clone())
+            .header(RANGE, format!("bytes={start}-{end}"))
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            anyhow::bail!("HTTP {}", response.status());
+        }
+        let bytes = response.bytes().await?;
+        if bytes.len() != req.length as usize {
+            anyhow::bail!(
+                "expected {} bytes, received {} bytes",
+                req.length,
+                bytes.len()
+            );
+        }
+        Ok(bytes)
+    }
+
+    fn schedule_peerless_reannounce(&mut self) {
+        let now = Instant::now();
+        if self
+            .last_peerless_reannounce
+            .is_some_and(|last| now.duration_since(last) < Duration::from_secs(120))
+        {
+            return;
+        }
+        self.last_peerless_reannounce = Some(now);
+        self.tracker_event = TrackerEvent::Empty;
+        self.schedule_active_tracker_tier_now();
+        info!(
+            torrent = %self.info_hash_hex,
+            "scheduled tracker reannounce after losing all peers"
+        );
     }
 
     fn peer_source_allowed(&self, peer: SocketAddr) -> bool {
@@ -893,12 +1039,28 @@ impl TorrentTask {
             PeerEvent::ExtendedHandshake {
                 peer,
                 ut_metadata_id,
+                ut_pex_id,
                 metadata_size,
             } => {
                 if let Some(handle) = self.active_peers.get_mut(&peer) {
                     handle.ut_metadata_id = ut_metadata_id;
+                    handle.ut_pex_id = ut_pex_id;
                     handle.metadata_size = metadata_size;
                 }
+            }
+            PeerEvent::PeerExchange { peer, peers } => {
+                if self.meta.private {
+                    return;
+                }
+                let peer_count = peers.len();
+                self.remember_tracker_peers(&peers);
+                self.connect_peers(peers).await;
+                debug!(
+                    torrent = %self.info_hash_hex,
+                    peer = %peer,
+                    peers = peer_count,
+                    "peer exchange discovered peers"
+                );
             }
         }
     }
@@ -984,7 +1146,6 @@ impl TorrentTask {
             return;
         }
         self.record_download(block.data.len() as u64).await;
-        self.save_fastresume(false).await;
 
         let complete = self
             .picker
@@ -993,10 +1154,11 @@ impl TorrentTask {
             match self.verify_piece(block.piece).await {
                 VerifyResult::Valid => {
                     info!(piece = block.piece, torrent = %self.info_hash_hex, "piece complete");
-                    self.persist_progress().await;
-                    self.save_fastresume(false).await;
+                    self.persist_progress_throttled(false).await;
                     self.send_have_to_peers(block.piece).await;
                     if self.picker.is_complete() {
+                        self.persist_progress_throttled(true).await;
+                        self.save_fastresume(false).await;
                         self.tracker_event = TrackerEvent::Completed;
                         self.schedule_trackers_now();
                         self.set_state(TorrentState::Seeding).await;
@@ -1010,7 +1172,7 @@ impl TorrentTask {
                         "piece verification failed"
                     );
                     self.picker.reject_piece(block.piece as usize);
-                    self.persist_progress().await;
+                    self.persist_progress_throttled(true).await;
                     self.save_fastresume(false).await;
                 }
                 VerifyResult::Missing { file_index, reason } => {
@@ -1022,7 +1184,7 @@ impl TorrentTask {
                         "piece verification could not read data"
                     );
                     self.picker.reject_piece(block.piece as usize);
-                    self.persist_progress().await;
+                    self.persist_progress_throttled(true).await;
                     self.save_fastresume(false).await;
                 }
             }
@@ -1033,7 +1195,7 @@ impl TorrentTask {
         let peers: Vec<SocketAddr> = self.active_peers.keys().copied().collect();
         for peer in peers {
             if let Some(handle) = self.active_peers.get(&peer) {
-                let _ = handle.cmd_tx.send(PeerCommand::Have(piece)).await;
+                let _ = handle.cmd_tx.try_send(PeerCommand::Have(piece));
             }
         }
     }
@@ -1092,11 +1254,12 @@ impl TorrentTask {
         let left = self.picker.bytes_left() as i64;
         let now = Instant::now();
         let mut rows = Vec::new();
+        let mut tracker_index = 0i64;
         for (tier_idx, tier) in self.tracker_tiers.iter().enumerate() {
-            for (tracker_idx, tracker) in tier.iter().enumerate() {
+            for tracker in tier {
                 rows.push(rt_db::TorrentTrackerRow {
                     info_hash: self.info_hash_hex.clone(),
-                    tracker_index: tracker_idx as i64,
+                    tracker_index,
                     tier: tier_idx as i64,
                     url: tracker.url.clone(),
                     status: tracker_status_label(&tracker.status).to_owned(),
@@ -1112,6 +1275,7 @@ impl TorrentTask {
                     downloaded: downloaded as i64,
                     left_bytes: left,
                 });
+                tracker_index += 1;
             }
         }
         let mut db = self.db.lock().expect("database mutex poisoned");
@@ -1557,6 +1721,21 @@ impl TorrentTask {
         }
     }
 
+    async fn persist_progress_throttled(&mut self, force: bool) {
+        const PROGRESS_PERSIST_INTERVAL: Duration = Duration::from_secs(5);
+        let now = Instant::now();
+        if !force
+            && self
+                .last_progress_persist
+                .is_some_and(|last| now.duration_since(last) < PROGRESS_PERSIST_INTERVAL)
+        {
+            return;
+        }
+        self.last_progress_persist = Some(now);
+        self.persist_progress().await;
+        self.save_fastresume(false).await;
+    }
+
     fn persist_recheck_job_progress(
         &self,
         job_id: &str,
@@ -1773,6 +1952,45 @@ fn peer_client_label(peer: &PeerHandle) -> String {
     } else {
         "BitTorrent peer".to_owned()
     }
+}
+
+fn webseed_block_url(meta: &TorrentMetaV1, webseed: &str) -> Option<Url> {
+    let parsed = Url::parse(webseed).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    if webseed.ends_with('/') {
+        parsed.join(&meta.name).ok()
+    } else {
+        Some(parsed)
+    }
+}
+
+fn parse_ut_pex_peers(payload: &[u8]) -> anyhow::Result<Vec<SocketAddr>> {
+    let value = decode(payload)?;
+    let BValue::Dict(pairs) = value else {
+        anyhow::bail!("ut_pex payload must be a dict");
+    };
+    let Some(added) = pairs
+        .iter()
+        .find(|(key, _)| *key == b"added")
+        .and_then(|(_, value)| value.as_bytes())
+    else {
+        return Ok(Vec::new());
+    };
+    if !added.len().is_multiple_of(6) {
+        anyhow::bail!("ut_pex added peers length is not a multiple of 6");
+    }
+    Ok(added
+        .chunks_exact(6)
+        .filter_map(|chunk| {
+            let port = u16::from_be_bytes([chunk[4], chunk[5]]);
+            (port != 0).then_some(SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]),
+                port,
+            )))
+        })
+        .collect())
 }
 
 fn reconcile_peer_availability(availability: &mut Availability, old: &[bool], new: &[bool]) {
@@ -2094,6 +2312,7 @@ async fn run_peer_loop(
                                     .send(PeerEvent::ExtendedHandshake {
                                         peer: addr,
                                         ut_metadata_id: handshake.ut_metadata_id(),
+                                        ut_pex_id: handshake.ut_pex_id(),
                                         metadata_size: handshake.metadata_size,
                                     })
                                     .await
@@ -2123,6 +2342,23 @@ async fn run_peer_loop(
                             Ok(_) => {}
                             Err(e) => {
                                 debug!(peer = %addr, err = %e, "ignoring invalid ut_metadata message");
+                            }
+                        }
+                    }
+                    Message::Extended { ext_id: LOCAL_UT_PEX_ID, payload } => {
+                        match parse_ut_pex_peers(&payload) {
+                            Ok(peers) if !peers.is_empty() => {
+                                if peer_event_tx
+                                    .send(PeerEvent::PeerExchange { peer: addr, peers })
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                debug!(peer = %addr, err = %e, "ignoring invalid ut_pex message");
                             }
                         }
                     }
@@ -2169,6 +2405,7 @@ async fn send_extension_handshake(
         if metadata_size.is_some() {
             handshake = handshake.with_ut_metadata(LOCAL_UT_METADATA_ID);
         }
+        handshake = handshake.with_ut_pex(LOCAL_UT_PEX_ID);
         framed
             .send(Message::Extended {
                 ext_id: EXT_HANDSHAKE_ID,
@@ -2360,6 +2597,60 @@ mod tests {
         assert_eq!(
             pieces_to_bitfield(&[true, false, true, false, false, false, false, false, true]),
             vec![0b1010_0000, 0b1000_0000]
+        );
+    }
+
+    #[test]
+    fn webseed_block_url_accepts_direct_file_and_base_url() {
+        let meta = TorrentMetaV1 {
+            info_hash: [1; 20],
+            announce: None,
+            announce_list: Vec::new(),
+            webseeds: Vec::new(),
+            name: "sample.iso".into(),
+            piece_length: 16_384,
+            pieces: vec![[2; 20]],
+            files: vec![rt_metainfo::TorrentFileV1 {
+                index: 0,
+                length: 5,
+                path: rt_path::SafeRelPath::from_name("sample.iso", false).unwrap(),
+                offset: 0,
+            }],
+            private: false,
+            raw: Vec::new(),
+        };
+
+        assert_eq!(
+            webseed_block_url(&meta, "https://mirror.example/sample.iso")
+                .unwrap()
+                .as_str(),
+            "https://mirror.example/sample.iso"
+        );
+        assert_eq!(
+            webseed_block_url(&meta, "https://mirror.example/releases/")
+                .unwrap()
+                .as_str(),
+            "https://mirror.example/releases/sample.iso"
+        );
+        assert!(webseed_block_url(&meta, "ftp://mirror.example/sample.iso").is_none());
+    }
+
+    #[test]
+    fn parses_ut_pex_added_ipv4_peers() {
+        let added = [127, 0, 0, 1, 0x1a, 0xe1, 10, 0, 0, 2, 0x13, 0x88];
+        let payload = rt_bencode::encode(&BValue::Dict(vec![(
+            b"added".as_slice(),
+            BValue::Bytes(&added),
+        )]));
+
+        let peers = parse_ut_pex_peers(&payload).unwrap();
+
+        assert_eq!(
+            peers,
+            vec![
+                "127.0.0.1:6881".parse::<SocketAddr>().unwrap(),
+                "10.0.0.2:5000".parse::<SocketAddr>().unwrap(),
+            ]
         );
     }
 

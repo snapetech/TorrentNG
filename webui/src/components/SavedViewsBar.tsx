@@ -16,6 +16,8 @@ function cleanParams(params: Omit<ListParams, 'limit' | 'offset'>): Omit<ListPar
 export function SavedViewsBar({ params, onApply }: Props) {
   const qc = useQueryClient()
   const [name, setName] = useState('')
+  const [busy, setBusy] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
   const { data: views = [] } = useQuery({
     queryKey: ['saved-views'],
     queryFn: api.savedViews.list,
@@ -24,20 +26,37 @@ export function SavedViewsBar({ params, onApply }: Props) {
 
   async function saveView() {
     const trimmed = name.trim()
-    if (!trimmed) return
+    if (!trimmed || busy) return
     const next: SavedView = {
       id: '',
       name: trimmed,
       params: cleanParams(params),
     }
-    await api.savedViews.save(next)
-    setName('')
-    qc.invalidateQueries({ queryKey: ['saved-views'] })
+    setBusy('__save__')
+    setError(null)
+    try {
+      await api.savedViews.save(next)
+      setName('')
+      qc.invalidateQueries({ queryKey: ['saved-views'] })
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to save view.')
+    } finally {
+      setBusy(null)
+    }
   }
 
   async function removeView(id: string) {
-    await api.savedViews.delete(id)
-    qc.invalidateQueries({ queryKey: ['saved-views'] })
+    if (busy) return
+    setBusy(id)
+    setError(null)
+    try {
+      await api.savedViews.delete(id)
+      qc.invalidateQueries({ queryKey: ['saved-views'] })
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to delete view.')
+    } finally {
+      setBusy(null)
+    }
   }
 
   return (
@@ -47,6 +66,7 @@ export function SavedViewsBar({ params, onApply }: Props) {
       fontSize: 12,
     }}>
       <span style={{ color: 'var(--faint)', fontWeight: 600 }}>Views</span>
+      {error && <span style={{ color: 'var(--danger)' }}>{error}</span>}
 
       {views.map(view => (
         <span key={view.id} style={{
@@ -56,22 +76,26 @@ export function SavedViewsBar({ params, onApply }: Props) {
         }}>
           <button
             onClick={() => onApply(view.params)}
+            disabled={Boolean(busy)}
             title={JSON.stringify(view.params)}
             style={{
               background: 'transparent', border: 'none', color: 'var(--muted)',
-              padding: '3px 8px', fontSize: 12, cursor: 'pointer',
+              padding: '3px 8px', fontSize: 12,
+              cursor: busy ? 'not-allowed' : 'pointer', opacity: busy ? 0.55 : 1,
             }}
           >
             {view.name}
           </button>
           <button
             onClick={() => removeView(view.id)}
+            disabled={Boolean(busy)}
             style={{
               background: 'transparent', border: 'none', borderLeft: '1px solid var(--border-strong)',
-              color: 'var(--faint)', padding: '3px 6px', fontSize: 11, cursor: 'pointer',
+              color: 'var(--faint)', padding: '3px 6px', fontSize: 11,
+              cursor: busy ? 'not-allowed' : 'pointer', opacity: busy ? 0.55 : 1,
             }}
           >
-            x
+            {busy === view.id ? '…' : 'x'}
           </button>
         </span>
       ))}
@@ -81,6 +105,7 @@ export function SavedViewsBar({ params, onApply }: Props) {
           value={name}
           onChange={e => setName(e.target.value)}
           onKeyDown={e => { if (e.key === 'Enter') saveView() }}
+          disabled={Boolean(busy)}
           placeholder="Save current view"
           style={{
             width: 150, background: 'var(--surface)', border: '1px solid var(--border-strong)',
@@ -90,15 +115,15 @@ export function SavedViewsBar({ params, onApply }: Props) {
         />
         <button
           onClick={saveView}
-          disabled={!name.trim()}
+          disabled={!name.trim() || Boolean(busy)}
           style={{
             background: 'var(--accent-soft)', border: '1px solid var(--accent)', borderRadius: 5,
             color: 'var(--accent-text)', padding: '3px 8px', fontSize: 12,
-            cursor: name.trim() ? 'pointer' : 'not-allowed',
-            opacity: name.trim() ? 1 : 0.5,
+            cursor: name.trim() && !busy ? 'pointer' : 'not-allowed',
+            opacity: name.trim() && !busy ? 1 : 0.5,
           }}
         >
-          Save
+          {busy === '__save__' ? 'Saving…' : 'Save'}
         </button>
       </div>
     </div>

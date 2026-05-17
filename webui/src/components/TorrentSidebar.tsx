@@ -70,6 +70,8 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
   const qc = useQueryClient()
   const [viewName, setViewName] = useState('')
   const [trackerFilter, setTrackerFilter] = useState(params.tracker ?? '')
+  const [viewsBusy, setViewsBusy] = useState<string | null>(null)
+  const [viewsError, setViewsError] = useState<string | null>(null)
 
   const { data: categories = [] } = useQuery({
     queryKey: ['categories'],
@@ -108,16 +110,33 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
 
   async function saveView() {
     const name = viewName.trim()
-    if (!name) return
+    if (!name || viewsBusy) return
     const next: SavedView = { id: '', name, params: cleanParams(params) }
-    await api.savedViews.save(next)
-    setViewName('')
-    qc.invalidateQueries({ queryKey: ['saved-views'] })
+    setViewsBusy('__save__')
+    setViewsError(null)
+    try {
+      await api.savedViews.save(next)
+      setViewName('')
+      qc.invalidateQueries({ queryKey: ['saved-views'] })
+    } catch (err) {
+      setViewsError(err instanceof Error ? err.message : 'Failed to save view.')
+    } finally {
+      setViewsBusy(null)
+    }
   }
 
   async function removeView(id: string) {
-    await api.savedViews.delete(id)
-    qc.invalidateQueries({ queryKey: ['saved-views'] })
+    if (viewsBusy) return
+    setViewsBusy(id)
+    setViewsError(null)
+    try {
+      await api.savedViews.delete(id)
+      qc.invalidateQueries({ queryKey: ['saved-views'] })
+    } catch (err) {
+      setViewsError(err instanceof Error ? err.message : 'Failed to delete view.')
+    } finally {
+      setViewsBusy(null)
+    }
   }
 
   function clearFilters() {
@@ -279,16 +298,25 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
 
       <Section title="Saved Views">
         {views.length === 0 && <div style={{ color: '#475569', fontSize: 12, padding: '2px 4px 6px' }}>No saved views</div>}
+        {viewsError && <div style={{ color: 'var(--danger)', fontSize: 11, padding: '2px 4px 6px' }}>{viewsError}</div>}
         {views.map(view => (
           <div key={view.id} style={{ display: 'grid', gridTemplateColumns: '1fr 26px', gap: 4, marginBottom: 4 }}>
             <button
               onClick={() => onApply(view.params)}
+              disabled={Boolean(viewsBusy)}
               title={JSON.stringify(view.params)}
-              style={savedViewButtonStyle}
+              style={{ ...savedViewButtonStyle, opacity: viewsBusy ? 0.55 : 1, cursor: viewsBusy ? 'not-allowed' : 'pointer' }}
             >
               <span style={labelStyle}>{view.name}</span>
             </button>
-            <button onClick={() => removeView(view.id)} title="Delete saved view" style={deleteStyle}>x</button>
+            <button
+              onClick={() => removeView(view.id)}
+              disabled={Boolean(viewsBusy)}
+              title="Delete saved view"
+              style={{ ...deleteStyle, opacity: viewsBusy ? 0.55 : 1, cursor: viewsBusy ? 'not-allowed' : 'pointer' }}
+            >
+              {viewsBusy === view.id ? '…' : 'x'}
+            </button>
           </div>
         ))}
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 44px', gap: 6, marginTop: 6 }}>
@@ -296,10 +324,13 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
             value={viewName}
             onChange={e => setViewName(e.target.value)}
             onKeyDown={e => { if (e.key === 'Enter') saveView() }}
+            disabled={Boolean(viewsBusy)}
             placeholder="Save view"
             style={inputStyle}
           />
-          <button disabled={!viewName.trim()} onClick={saveView} style={saveStyle(Boolean(viewName.trim()))}>Save</button>
+          <button disabled={!viewName.trim() || Boolean(viewsBusy)} onClick={saveView} style={saveStyle(Boolean(viewName.trim()) && !viewsBusy)}>
+            {viewsBusy === '__save__' ? '…' : 'Save'}
+          </button>
         </div>
       </Section>
 

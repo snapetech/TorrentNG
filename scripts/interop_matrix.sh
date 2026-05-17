@@ -42,6 +42,8 @@ Environment:
   INTEROP_PUBLIC_MAX_PARALLEL=3
   INTEROP_PUBLIC_MIN_RUST_PEERS=2
   INTEROP_INCLUDE_LIBREOFFICE=1
+  INTEROP_PUBLIC_ONLY=debian
+  INTEROP_SKIP_BUILD=1
   INTEROP_KEEP_STACK=1
   INTEROP_KEEP_PUBLIC_DATA=0
   INTEROP_WORKDIR=certification/interop
@@ -403,18 +405,49 @@ client_progress() {
         jq -r --arg name "$name" '[.[] | select($name == "" or .name == $name) | .progress] | if length == 0 then 0 else min end'
       ;;
     transmission)
-      transmission_rpc '{"method":"torrent-get","arguments":{"fields":["percentDone"]}}' |
-        jq -r '[.arguments.torrents[].percentDone] | if length == 0 then 0 else min end'
+      transmission_rpc '{"method":"torrent-get","arguments":{"fields":["name","percentDone"]}}' |
+        jq -r --arg name "$name" '[.arguments.torrents[] | select($name == "" or .name == $name) | .percentDone] | if length == 0 then 0 else min end'
       ;;
     deluge)
       deluge_connect
-      deluge_rpc_checked '{"method":"web.update_ui","params":[["progress"],{}],"id":3}' |
-        jq -r '[.result.torrents[]?.progress / 100] | if length == 0 then 0 else min end'
+      deluge_rpc_checked '{"method":"web.update_ui","params":[["name","progress"],{}],"id":3}' |
+        jq -r --arg name "$name" '[.result.torrents[]? | select($name == "" or .name == $name) | .progress / 100] | if length == 0 then 0 else min end'
       ;;
     rtorrent)
-      if [[ -n "$fixture" ]] && fixture_hashes_match rtorrent "$fixture"; then echo 1; else echo 0; fi
+      if [[ -n "$fixture" ]] && fixture_hashes_match rtorrent "$fixture"; then
+        echo 1
+      elif [[ -n "$name" ]] && rtorrent_public_complete "$name"; then
+        echo 1
+      else
+        echo 0
+      fi
       ;;
   esac
+}
+
+rtorrent_public_complete() {
+  local expected_name="$1" torrent name total path size
+  shopt -s nullglob
+  for torrent in "$WORKDIR"/watch/rtorrent/*.torrent; do
+    name="$(aria2c -S "$torrent" 2>/dev/null | awk -F': ' '/^Name: / {print $2; exit}')"
+    [[ "$name" == "$expected_name" ]] || continue
+    total="$(torrent_total_bytes "$torrent")"
+    [[ -n "$name" && -n "$total" ]] || return 1
+    path="$(host_download_dir rtorrent)/$name"
+    [[ -f "$path" ]] || path="$(host_download_dir rtorrent)/public/$name"
+    if [[ -f "$path" ]]; then
+      size="$(stat -c '%s' "$path" 2>/dev/null || echo 0)"
+    elif [[ -d "$path" ]]; then
+      size="$(find "$path" -type f -printf '%s\n' 2>/dev/null | awk '{sum += $1} END {print sum + 0}')"
+    else
+      return 1
+    fi
+    [[ "$size" -ge "$total" ]] || return 1
+    shopt -u nullglob
+    return 0
+  done
+  shopt -u nullglob
+  return 1
 }
 
 poll_rust_compat() {
@@ -606,7 +639,7 @@ resolve_public_torrent() {
 }
 
 add_public_to_client() {
-  local client="$1" url="$2" save_path
+  local client="$1" url="$2" torrent_file="${3:-}" save_path
   save_path="$(download_dir "$client")/public"
   case "$client" in
     rusttorrentd)
@@ -620,18 +653,76 @@ add_public_to_client() {
       transmission_rpc "{\"method\":\"torrent-add\",\"arguments\":{\"filename\":\"$url\",\"download-dir\":\"$save_path\",\"paused\":false}}" >/dev/null
       ;;
     deluge)
-      deluge_login
-      deluge_rpc "{\"method\":\"core.add_torrent_url\",\"params\":[\"$url\",{\"download_location\":\"$save_path\"}],\"id\":4}" >/dev/null
+      deluge_connect
+      deluge_rpc_checked "{\"method\":\"core.add_torrent_url\",\"params\":[\"$url\",{\"download_location\":\"$save_path\"}],\"id\":4}" >/dev/null
       ;;
     rtorrent)
-      curl -fsSL "$url" -o "$WORKDIR/watch/rtorrent/$client-$(basename "$url")"
+      if [[ -n "$torrent_file" ]]; then
+        cp "$torrent_file" "$WORKDIR/watch/rtorrent/$client-$(basename "$url")"
+      else
+        curl -fsSL "$url" -o "$WORKDIR/watch/rtorrent/$client-$(basename "$url")"
+      fi
       ;;
   esac
 }
 
+public_torrent_metadata() {
+  local id="$1" url="$2" torrent_file name total info_hash
+  torrent_file="$WORKDIR/torrents/public-$id.torrent"
+  curl -fsSL "$url" -o "$torrent_file"
+  name="$(aria2c -S "$torrent_file" 2>/dev/null | awk -F': ' '/^Name: / {print $2; exit}')"
+  total="$(torrent_total_bytes "$torrent_file")"
+  info_hash="$(aria2c -S "$torrent_file" 2>/dev/null | awk -F': ' '/^Info Hash: / {print tolower($2); exit}')"
+  [[ -n "$name" && -n "$total" && -n "$info_hash" ]] || return 1
+  printf '%s|%s|%s|%s\n' "$torrent_file" "$name" "$total" "$info_hash"
+}
+
+torrent_total_bytes() {
+  aria2c -S "$1" 2>/dev/null |
+    sed -nE '/^Total Length:/ { s/.*\(([0-9,]+)\).*/\1/; s/,//g; p; q; }'
+}
+
+container_ip() {
+  local service="$1" cid
+  cid="$(compose ps -q "$service")"
+  [[ -n "$cid" ]] || return 1
+  docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$cid"
+}
+
+public_bridge_peers() {
+  local peers=() ip
+  if ip="$(container_ip qbittorrent 2>/dev/null)" && [[ -n "$ip" ]]; then
+    peers+=("$ip:6882")
+  fi
+  if ip="$(container_ip transmission 2>/dev/null)" && [[ -n "$ip" ]]; then
+    peers+=("$ip:6883")
+  fi
+  if ip="$(container_ip deluge 2>/dev/null)" && [[ -n "$ip" ]]; then
+    peers+=("$ip:6884")
+  fi
+  if ip="$(container_ip rtorrent 2>/dev/null)" && [[ -n "$ip" ]]; then
+    peers+=("$ip:6885")
+  fi
+  (IFS='|'; printf '%s\n' "${peers[*]}")
+}
+
+bridge_public_reference_peers_to_rust() {
+  local info_hash="$1" peers
+  peers="$(public_bridge_peers)"
+  [[ -n "$peers" ]] || return 0
+  curl -fsS -H "Authorization: Bearer $RUST_TOKEN" \
+    --data-urlencode "hashes=$info_hash" \
+    --data-urlencode "peers=$peers" \
+    "$(client_url rusttorrentd)/api/qb/v2/torrents/addPeers" >/dev/null
+  append_report "- Docker reference peers bridged to Rust: $peers"
+}
+
 run_public_entry() {
-  local entry="$1" id enabled source resolver pattern max clients url status="PASS"
+  local entry="$1" id enabled source resolver pattern max clients url metadata torrent_file torrent_name total info_hash status="PASS"
   IFS='|' read -r id enabled source resolver pattern max clients <<<"$entry"
+  if [[ -n "${INTEROP_PUBLIC_ONLY:-}" && "$id" != "$INTEROP_PUBLIC_ONLY" ]]; then
+    return 0
+  fi
   if [[ "$enabled" != "true" ]]; then
     [[ "$id" == "libreoffice" && "${INTEROP_INCLUDE_LIBREOFFICE:-0}" == "1" ]] || return 0
   fi
@@ -645,13 +736,23 @@ run_public_entry() {
     return 1
   fi
   append_report "- Resolved torrent: $url"
+  if ! metadata="$(public_torrent_metadata "$id" "$url")"; then
+    append_report "- Status: **METADATA FAIL**"
+    append_report ""
+    return 1
+  fi
+  IFS='|' read -r torrent_file torrent_name total info_hash <<<"$metadata"
+  append_report "- Torrent name: $torrent_name"
+  append_report "- Info hash: $info_hash"
+  append_report "- Total bytes: $total"
 
   local selected=()
   read -r -a selected <<<"$clients"
   for client in "${selected[@]}"; do
-    add_public_to_client "$client" "$url" || status="FAIL"
+    add_public_to_client "$client" "$url" "$torrent_file" || status="FAIL"
   done
-  if ! wait_clients_complete "${max:-$TIMEOUT_PUBLIC}" "" "${selected[@]}"; then
+  bridge_public_reference_peers_to_rust "$info_hash" || status="FAIL"
+  if ! wait_clients_complete "${max:-$TIMEOUT_PUBLIC}" "$torrent_name" "${selected[@]}"; then
     status="FAIL"
   fi
 
@@ -663,18 +764,36 @@ run_public_entry() {
   append_report "- Status: **$status**"
   append_report ""
 
-  if [[ "$KEEP_PUBLIC_DATA" != "1" ]]; then
-    for client in "${CLIENTS[@]}"; do
-      rm -rf "$(host_download_dir "$client")/public" || true
-    done
-  fi
   [[ "$status" == "PASS" ]]
+}
+
+cleanup_public_data() {
+  if [[ "$KEEP_PUBLIC_DATA" == "1" ]]; then
+    return 0
+  fi
+  chmod -R u+rwX "$WORKDIR/downloads" 2>/dev/null || true
+  for client in "${CLIENTS[@]}"; do
+    rm -rf "$(host_download_dir "$client")/public" 2>/dev/null || true
+  done
+  rm -rf "$(host_download_dir rtorrent)"/*.iso "$(host_download_dir rtorrent)"/*.img "$(host_download_dir rtorrent)"/Fedora-* 2>/dev/null || true
+  if find "$WORKDIR/downloads" \( -path '*/public/*' -o -name '*.iso' -o -name '*.img' \) 2>/dev/null | grep -q .; then
+    docker run --rm -v "$WORKDIR/downloads:/downloads" alpine:3.20 sh -lc \
+      "rm -rf /downloads/*/public /downloads/rtorrent/*.iso /downloads/rtorrent/*.img /downloads/rtorrent/Fedora-*" >/dev/null 2>&1 || true
+  fi
 }
 
 run_public_matrix() {
   local failures=0 running=0 pids=()
   append_report "# Public Legal Torrent Matrix"
   append_report ""
+  if (( PUBLIC_MAX_PARALLEL <= 1 )); then
+    while IFS= read -r entry; do
+      run_public_entry "$entry" || failures=$((failures + 1))
+    done < <(toml_entries)
+    cleanup_public_data
+    (( failures == 0 ))
+    return
+  fi
   while IFS= read -r entry; do
     while (( running >= PUBLIC_MAX_PARALLEL )); do
       wait -n || failures=$((failures + 1))
@@ -687,6 +806,7 @@ run_public_matrix() {
   for pid in "${pids[@]}"; do
     wait "$pid" || failures=$((failures + 1))
   done
+  cleanup_public_data
   (( failures == 0 ))
 }
 
@@ -716,7 +836,11 @@ main() {
   trap cleanup EXIT
 
   log "starting interop compose stack"
-  compose up -d --build
+  if [[ "${INTEROP_SKIP_BUILD:-0}" == "1" ]]; then
+    compose up -d
+  else
+    compose up -d --build
+  fi
   wait_stack
 
   local failed=0

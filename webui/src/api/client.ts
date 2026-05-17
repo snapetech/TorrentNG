@@ -223,6 +223,8 @@ export interface StorageResponse {
 export interface LiveStats {
   upload_speed: number
   download_speed: number
+  upload_total?: number
+  download_total?: number
   connections?: number
   pending_connections?: number
   listen_port?: number
@@ -231,9 +233,16 @@ export interface LiveStats {
   pex?: 'on' | 'off' | 'unknown' | string
 }
 
+export interface SessionFeatureResponse {
+  dht?: boolean
+  pex?: boolean
+}
+
 export interface TransferInfo {
   dl_info_speed: number
+  dl_info_data?: number
   up_info_speed: number
+  up_info_data?: number
 }
 
 export interface TrackerHealth {
@@ -537,6 +546,11 @@ export const api = {
   },
 
   storage: (): Promise<StorageResponse> => get('/storage'),
+
+  session: {
+    setFeatures: (features: { dht?: boolean; pex?: boolean }): Promise<SessionFeatureResponse> =>
+      patch('/session/features', features),
+  },
 
   transferInfo: (): Promise<TransferInfo> => getRoot('/api/qb/v2/transfer/info'),
 

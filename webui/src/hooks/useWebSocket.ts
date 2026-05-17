@@ -20,6 +20,8 @@ interface WsEvent {
   hash?: string
   upload_speed?: number
   download_speed?: number
+  upload_total?: number
+  download_total?: number
   connections?: number
   pending_connections?: number
   listen_port?: number
@@ -80,6 +82,8 @@ export function useWebSocket(onStats?: (stats: LiveStats) => void, enabled = tru
             statsRef.current?.({
               upload_speed: msg.upload_speed ?? 0,
               download_speed: msg.download_speed ?? 0,
+              upload_total: msg.upload_total,
+              download_total: msg.download_total,
               connections: msg.connections,
               pending_connections: msg.pending_connections,
               listen_port: msg.listen_port,

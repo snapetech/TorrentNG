@@ -131,6 +131,14 @@ input[type="radio"]:not(:disabled):hover {
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 38%, transparent);
 }
 
+.torrent-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--accent) 58%, transparent),
+    0 0 0 2px var(--hover);
+}
+
 @media (max-width: 720px) {
   .rtng-topbar {
     height: auto !important;
@@ -177,6 +185,26 @@ input[type="radio"]:not(:disabled):hover {
 
   .rtng-main {
     flex-direction: column;
+  }
+
+  .rtng-settings-sidebar {
+    width: 100% !important;
+    display: flex;
+    gap: 6px;
+    overflow-x: auto;
+    border-right: 0 !important;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .rtng-settings-sidebar > div {
+    display: none;
+  }
+
+  .rtng-settings-sidebar button {
+    flex: 0 0 auto;
+    width: auto !important;
+    margin-bottom: 0 !important;
+    white-space: nowrap;
   }
 
   .torrent-sidebar {

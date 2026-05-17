@@ -19,13 +19,15 @@ export function RatioGroupsPanel() {
   const [pending, setPending] = useState<string | null>(null)
   const [preview, setPreview] = useState<{ name: string; count: number } | null>(null)
 
-  const { data: groups = [] } = useQuery({
+  const { data: groups = [], isLoading } = useQuery({
     queryKey: ['ratio-groups'],
     queryFn: api.ratioGroups.list,
     staleTime: 30_000,
   })
 
   async function save() {
+    if (pending) return
+    setPending('__save__')
     setError(null)
     try {
       await api.ratioGroups.save({
@@ -38,12 +40,22 @@ export function RatioGroupsPanel() {
       qc.invalidateQueries({ queryKey: ['ratio-groups'] })
     } catch (e) {
       setError(String(e))
+    } finally {
+      setPending(null)
     }
   }
 
   async function remove(name: string) {
-    await api.ratioGroups.delete(name)
-    qc.invalidateQueries({ queryKey: ['ratio-groups'] })
+    setPending(name)
+    setError(null)
+    try {
+      await api.ratioGroups.delete(name)
+      qc.invalidateQueries({ queryKey: ['ratio-groups'] })
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setPending(null)
+    }
   }
 
   async function apply(name: string, dryRun: boolean) {
@@ -70,24 +82,26 @@ export function RatioGroupsPanel() {
         Ratio Groups
       </div>
 
-      <div style={{ display: 'grid', gridTemplateColumns: '160px 90px 110px 150px 1fr auto', gap: 8, maxWidth: 980, marginBottom: 12 }}>
-        <Input value={draft.name} placeholder="Name" onChange={name => setDraft({ ...draft, name })} />
-        <Input value={String(draft.ratio_limit)} placeholder="Ratio" onChange={value => setDraft({ ...draft, ratio_limit: Number(value) })} />
-        <Input value={String(draft.seeding_time_limit)} placeholder="Minutes" onChange={value => setDraft({ ...draft, seeding_time_limit: Number(value) })} />
-        <Input value={draft.category ?? ''} placeholder="Category" onChange={category => setDraft({ ...draft, category })} />
-        <Input value={draft.tracker ?? ''} placeholder="Tracker contains" onChange={tracker => setDraft({ ...draft, tracker })} />
-        <button
-          onClick={save}
-          disabled={!draft.name.trim()}
-          style={{
-            background: 'var(--accent-soft)', border: '1px solid var(--accent)', borderRadius: 5,
-            color: 'var(--accent-text)', padding: '4px 10px', fontSize: 12,
-            cursor: draft.name.trim() ? 'pointer' : 'not-allowed',
-            opacity: draft.name.trim() ? 1 : 0.5,
-          }}
-        >
-          Save
-        </button>
+      <div style={scrollX}>
+        <div style={{ display: 'grid', gridTemplateColumns: '160px 90px 110px 150px minmax(220px, 1fr) auto', gap: 8, minWidth: 820, maxWidth: 980, marginBottom: 12 }}>
+          <Input value={draft.name} placeholder="Name" onChange={name => setDraft({ ...draft, name })} />
+          <Input value={String(draft.ratio_limit)} placeholder="Ratio" onChange={value => setDraft({ ...draft, ratio_limit: Number(value) })} />
+          <Input value={String(draft.seeding_time_limit)} placeholder="Minutes" onChange={value => setDraft({ ...draft, seeding_time_limit: Number(value) })} />
+          <Input value={draft.category ?? ''} placeholder="Category" onChange={category => setDraft({ ...draft, category })} />
+          <Input value={draft.tracker ?? ''} placeholder="Tracker contains" onChange={tracker => setDraft({ ...draft, tracker })} />
+          <button
+            onClick={save}
+            disabled={!draft.name.trim() || Boolean(pending)}
+            style={{
+              background: 'var(--accent-soft)', border: '1px solid var(--accent)', borderRadius: 5,
+              color: 'var(--accent-text)', padding: '4px 10px', fontSize: 12,
+              cursor: draft.name.trim() && !pending ? 'pointer' : 'not-allowed',
+              opacity: draft.name.trim() && !pending ? 1 : 0.5,
+            }}
+          >
+            {pending === '__save__' ? 'Saving…' : 'Save'}
+          </button>
+        </div>
       </div>
 
       {error && <div style={{ color: '#ef4444', fontSize: 12, marginBottom: 10 }}>{error}</div>}
@@ -97,10 +111,15 @@ export function RatioGroupsPanel() {
         </div>
       )}
 
-      <div style={{ display: 'grid', gap: 8, maxWidth: 980 }}>
+      <div style={{ ...scrollX, display: 'grid', gap: 8, maxWidth: 980 }}>
+        {isLoading && <div style={{ color: 'var(--faint)', fontSize: 12 }}>Loading ratio groups…</div>}
+        {!isLoading && groups.length === 0 && (
+          <div style={{ color: 'var(--faint)', fontSize: 12, padding: '8px 0' }}>No ratio groups configured.</div>
+        )}
         {groups.map(group => (
           <div key={group.name} style={{
-            display: 'grid', gridTemplateColumns: '160px 90px 110px 150px 1fr auto auto auto',
+            display: 'grid', gridTemplateColumns: '160px 90px 110px 150px minmax(220px, 1fr) auto auto auto',
+            minWidth: 900,
             gap: 8, alignItems: 'center', border: '1px solid var(--border)',
             borderRadius: 6, padding: '9px 12px', background: 'var(--surface)', fontSize: 12,
           }}>
@@ -111,33 +130,36 @@ export function RatioGroupsPanel() {
             <span style={{ color: 'var(--faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{group.tracker || 'any tracker'}</span>
             <button
               onClick={() => apply(group.name, true)}
-              disabled={pending === group.name}
+              disabled={Boolean(pending)}
               style={{
                 background: 'none', border: '1px solid var(--border-strong)', borderRadius: 4,
                 color: 'var(--muted)', padding: '3px 8px', fontSize: 11,
-                cursor: pending === group.name ? 'not-allowed' : 'pointer',
+                cursor: pending ? 'not-allowed' : 'pointer',
+                opacity: pending ? 0.55 : 1,
               }}
             >
               Preview
             </button>
             <button
               onClick={() => apply(group.name, false)}
-              disabled={pending === group.name}
+              disabled={Boolean(pending)}
               style={{
                 background: 'var(--surface-2)', border: '1px solid var(--accent)', borderRadius: 4,
                 color: 'var(--accent)', padding: '3px 8px', fontSize: 11,
-                cursor: pending === group.name ? 'not-allowed' : 'pointer',
+                cursor: pending ? 'not-allowed' : 'pointer',
+                opacity: pending ? 0.55 : 1,
               }}
             >
               Apply
             </button>
             <button
               onClick={() => remove(group.name)}
-              disabled={pending === group.name}
+              disabled={Boolean(pending)}
               style={{
                 background: 'none', border: '1px solid var(--border-strong)', borderRadius: 4,
                 color: 'var(--faint)', padding: '3px 8px', fontSize: 11,
-                cursor: pending === group.name ? 'not-allowed' : 'pointer',
+                cursor: pending ? 'not-allowed' : 'pointer',
+                opacity: pending ? 0.55 : 1,
               }}
             >
               Delete
@@ -147,6 +169,11 @@ export function RatioGroupsPanel() {
       </div>
     </section>
   )
+}
+
+const scrollX: React.CSSProperties = {
+  overflowX: 'auto',
+  paddingBottom: 2,
 }
 
 function Input({ value, placeholder, onChange }: { value: string; placeholder: string; onChange: (value: string) => void }) {

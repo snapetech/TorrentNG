@@ -88,6 +88,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/sidebar-facets", get(handlers::sidebar_facets))
         .route("/api/v1/engine", get(handlers::engine_diagnostics))
         .route("/api/v1/engine/commands", get(handlers::engine_commands))
+        .route(
+            "/api/v1/session/features",
+            axum::routing::patch(handlers::set_session_features),
+        )
         .route("/api/v1/cross-seed", post(handlers::cross_seed_helper))
         .route(
             "/api/v1/saved-views",

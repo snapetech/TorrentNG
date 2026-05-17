@@ -30,16 +30,17 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
   const [fileName, setFileName] = useState('')
   const [busy, setBusy] = useState(false)
   const [message, setMessage] = useState('')
+  const [messageTone, setMessageTone] = useState<'ok' | 'error'>('ok')
 
   const { data: categories = [] } = useQuery({ queryKey: ['categories'], queryFn: api.categories.list })
   const { data: allTags = [] } = useQuery({ queryKey: ['tags'], queryFn: api.tags.list })
-  const { data: trackers = [] } = useQuery({
+  const { data: trackers = [], isLoading: trackersLoading, error: trackersError } = useQuery({
     queryKey: ['trackers', torrent.hash],
     queryFn: () => api.torrents.trackers(torrent.hash),
     staleTime: 2_000,
     refetchInterval: 5_000,
   })
-  const { data: files = [] } = useQuery({
+  const { data: files = [], isLoading: filesLoading, error: filesError } = useQuery({
     queryKey: ['files', torrent.hash],
     queryFn: () => api.torrents.files(torrent.hash),
     staleTime: 2_000,
@@ -53,6 +54,7 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
   async function apply(label: string, fn: () => Promise<void>) {
     setBusy(true)
     setMessage('')
+    setMessageTone('ok')
     try {
       await fn()
       setMessage(label)
@@ -62,7 +64,8 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
       qc.invalidateQueries({ queryKey: ['tags'] })
       qc.invalidateQueries({ queryKey: ['categories'] })
     } catch (err) {
-      setMessage(String(err))
+      setMessage(err instanceof Error ? err.message : String(err))
+      setMessageTone('error')
     } finally {
       setBusy(false)
     }
@@ -74,29 +77,30 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
     <div style={{
       position: 'fixed', inset: 0, background: 'rgba(2,6,23,0.72)', zIndex: 1200,
       display: 'grid', placeItems: 'center', padding: 22,
-    }}>
+    }} onClick={e => { if (!busy && e.target === e.currentTarget) onClose() }}>
       <div style={{
         width: 'min(820px, 100%)', height: 'min(680px, 90vh)', background: 'var(--panel)',
         border: '1px solid var(--border-strong)', borderRadius: 8, display: 'flex', flexDirection: 'column',
         boxShadow: '0 24px 60px var(--shadow)',
-      }}>
+      }} onClick={e => e.stopPropagation()}>
         <header style={{ padding: '12px 14px', borderBottom: '1px solid var(--border)', display: 'flex', gap: 12 }}>
           <div style={{ flex: 1, minWidth: 0 }}>
             <div style={{ color: 'var(--text)', fontWeight: 700, fontSize: 15 }}>Properties</div>
             <div style={{ color: 'var(--faint)', fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{torrent.name}</div>
           </div>
-          <button onClick={onClose} style={smallButton('#94a3b8')}>Close</button>
+          <button onClick={onClose} disabled={busy} style={smallButton('#94a3b8', busy)}>Close</button>
         </header>
 
         <div style={{ display: 'flex', minHeight: 0, flex: 1 }}>
           <nav style={{ width: 150, borderRight: '1px solid var(--border)', padding: 10 }}>
             {(['general', 'trackers', 'files', 'limits'] as Tab[]).map(item => (
-              <button key={item} onClick={() => setTab(item)} style={{
+              <button key={item} onClick={() => setTab(item)} disabled={busy} style={{
                 width: '100%', textAlign: 'left', marginBottom: 5, borderRadius: 5,
                 background: tab === item ? 'var(--accent-soft)' : 'transparent',
                 border: '1px solid ' + (tab === item ? 'var(--accent)' : 'transparent'),
                 color: tab === item ? 'var(--accent-text)' : 'var(--muted)',
-                padding: '7px 9px', fontSize: 12, cursor: 'pointer', textTransform: 'capitalize',
+                padding: '7px 9px', fontSize: 12, cursor: busy ? 'not-allowed' : 'pointer',
+                textTransform: 'capitalize', opacity: busy && tab !== item ? 0.55 : 1,
               }}>{item}</button>
             ))}
           </nav>
@@ -106,34 +110,34 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
               <div style={{ display: 'grid', gap: 12 }}>
                 <Field label="Name">
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: 8 }}>
-                    <input value={name} onChange={e => setName(e.target.value)} style={INPUT} />
-                    <button disabled={busy || !name.trim()} onClick={() => apply('Renamed', () => api.torrents.rename(torrent.hash, name.trim()))} style={smallButton('#93c5fd')}>Rename</button>
+                    <input value={name} onChange={e => setName(e.target.value)} disabled={busy} style={INPUT} />
+                    <button disabled={busy || !name.trim()} onClick={() => apply('Renamed', () => api.torrents.rename(torrent.hash, name.trim()))} style={smallButton('#93c5fd', busy || !name.trim())}>Rename</button>
                   </div>
                 </Field>
                 <Field label="Location">
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: 8 }}>
-                    <input value={location} onChange={e => setLocation(e.target.value)} style={{ ...INPUT, fontFamily: 'monospace' }} />
-                    <button disabled={busy || !location.trim()} onClick={() => apply('Location updated', () => api.torrents.setLocation([torrent.hash], location.trim()))} style={smallButton('#93c5fd')}>Move</button>
+                    <input value={location} onChange={e => setLocation(e.target.value)} disabled={busy} style={{ ...INPUT, fontFamily: 'monospace' }} />
+                    <button disabled={busy || !location.trim()} onClick={() => apply('Location updated', () => api.torrents.setLocation([torrent.hash], location.trim()))} style={smallButton('#93c5fd', busy || !location.trim())}>Move</button>
                   </div>
                 </Field>
                 <Field label="Category">
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: 8 }}>
-                    <select value={category} onChange={e => setCategory(e.target.value)} style={INPUT}>
+                    <select value={category} onChange={e => setCategory(e.target.value)} disabled={busy} style={INPUT}>
                       <option value="">None</option>
                       {categories.map(c => <option key={c.name} value={c.name}>{c.name}</option>)}
                     </select>
-                    <button disabled={busy} onClick={() => apply('Category updated', () => api.torrents.setCategory(torrent.hash, category))} style={smallButton('#93c5fd')}>Apply</button>
+                    <button disabled={busy} onClick={() => apply('Category updated', () => api.torrents.setCategory(torrent.hash, category))} style={smallButton('#93c5fd', busy)}>Apply</button>
                   </div>
                 </Field>
                 <Field label="Tags">
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: 8 }}>
-                    <input value={tagsText} onChange={e => setTagsText(e.target.value)} placeholder="comma,separated,tags" style={INPUT} />
-                    <button disabled={busy} onClick={() => apply('Tags updated', () => api.torrents.setTags([torrent.hash], tags))} style={smallButton('#93c5fd')}>Apply</button>
+                    <input value={tagsText} onChange={e => setTagsText(e.target.value)} disabled={busy} placeholder="comma,separated,tags" style={INPUT} />
+                    <button disabled={busy} onClick={() => apply('Tags updated', () => api.torrents.setTags([torrent.hash], tags))} style={smallButton('#93c5fd', busy)}>Apply</button>
                   </div>
                   {allTags.length > 0 && (
                     <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap', marginTop: 7 }}>
                       {allTags.map(tag => (
-                        <button key={tag} onClick={() => setTagsText(Array.from(new Set([...tags, tag])).join(','))} style={chipButton}>{tag}</button>
+                        <button key={tag} disabled={busy} onClick={() => setTagsText(Array.from(new Set([...tags, tag])).join(','))} style={{ ...chipButton, opacity: busy ? 0.55 : 1, cursor: busy ? 'not-allowed' : 'pointer' }}>{tag}</button>
                       ))}
                     </div>
                   )}
@@ -150,22 +154,27 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
             {tab === 'trackers' && (
               <div>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: 8, marginBottom: 12 }}>
-                  <input value={newTracker} onChange={e => setNewTracker(e.target.value)} placeholder="udp://tracker.example/announce" style={{ ...INPUT, fontFamily: 'monospace' }} />
+                  <input value={newTracker} onChange={e => setNewTracker(e.target.value)} disabled={busy} placeholder="udp://tracker.example/announce" style={{ ...INPUT, fontFamily: 'monospace' }} />
                   <button disabled={busy || !newTracker.trim()} onClick={() => apply('Tracker added', async () => {
                     await api.torrents.patchTrackers(torrent.hash, { add: [newTracker.trim()] })
                     setNewTracker('')
-                  })} style={smallButton('#93c5fd')}>Add</button>
+                  })} style={smallButton('#93c5fd', busy || !newTracker.trim())}>Add</button>
                 </div>
+                {trackersLoading && <div style={{ color: 'var(--faint)', fontSize: 12 }}>Loading trackers…</div>}
+                {trackersError && <div style={{ color: 'var(--danger)', fontSize: 12 }}>Tracker details unavailable.</div>}
+                {!trackersLoading && !trackersError && trackers.length === 0 && (
+                  <div style={{ color: 'var(--faint)', fontSize: 12 }}>No trackers.</div>
+                )}
                 {trackers.map(tracker => (
                   <div key={tracker.url} style={{ borderBottom: '1px solid var(--border)', padding: '8px 0' }}>
                     {editingTracker?.url === tracker.url ? (
                       <div style={{ display: 'grid', gridTemplateColumns: '1fr auto auto', gap: 7 }}>
-                        <input value={trackerUrl} onChange={e => setTrackerUrl(e.target.value)} style={{ ...INPUT, fontFamily: 'monospace' }} />
-                        <button onClick={() => apply('Tracker edited', async () => {
+                        <input value={trackerUrl} onChange={e => setTrackerUrl(e.target.value)} disabled={busy} style={{ ...INPUT, fontFamily: 'monospace' }} />
+                        <button disabled={busy || !trackerUrl.trim()} onClick={() => apply('Tracker edited', async () => {
                           await api.torrents.patchTrackers(torrent.hash, { edit: [{ orig_url: tracker.url, new_url: trackerUrl.trim() }] })
                           setEditingTracker(null)
-                        })} style={smallButton('#93c5fd')}>Save</button>
-                        <button onClick={() => setEditingTracker(null)} style={smallButton('#64748b')}>Cancel</button>
+                        })} style={smallButton('#93c5fd', busy || !trackerUrl.trim())}>Save</button>
+                        <button disabled={busy} onClick={() => setEditingTracker(null)} style={smallButton('#64748b', busy)}>Cancel</button>
                       </div>
                     ) : (
                       <div style={{ display: 'grid', gridTemplateColumns: '1fr auto auto', gap: 7, alignItems: 'center' }}>
@@ -173,8 +182,8 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
                           <div style={{ color: 'var(--text)', fontFamily: 'monospace', fontSize: 11, overflowWrap: 'anywhere' }}>{tracker.url}</div>
                           <div style={{ color: 'var(--faint)', fontSize: 11 }}>{tracker.scrape_complete} seeds, {tracker.scrape_incomplete} peers {tracker.message ? `- ${tracker.message}` : ''}</div>
                         </div>
-                        <button onClick={() => setEditingTracker(tracker)} style={smallButton('#94a3b8')}>Edit</button>
-                        <button onClick={() => apply('Tracker removed', () => api.torrents.patchTrackers(torrent.hash, { remove: [tracker.url] }))} style={smallButton('#f87171')}>Remove</button>
+                        <button disabled={busy} onClick={() => setEditingTracker(tracker)} style={smallButton('#94a3b8', busy)}>Edit</button>
+                        <button disabled={busy} onClick={() => apply('Tracker removed', () => api.torrents.patchTrackers(torrent.hash, { remove: [tracker.url] }))} style={smallButton('#f87171', busy)}>Remove</button>
                       </div>
                     )}
                   </div>
@@ -184,6 +193,11 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
 
             {tab === 'files' && (
               <div style={{ display: 'grid', gap: 7 }}>
+                {filesLoading && <div style={{ color: 'var(--faint)', fontSize: 12 }}>Loading files…</div>}
+                {filesError && <div style={{ color: 'var(--danger)', fontSize: 12 }}>File details unavailable.</div>}
+                {!filesLoading && !filesError && files.length === 0 && (
+                  <div style={{ color: 'var(--faint)', fontSize: 12 }}>No files reported.</div>
+                )}
                 {files.map(file => <FileRow
                   key={file.index}
                   file={file}
@@ -208,22 +222,22 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
             {tab === 'limits' && (
               <div style={{ display: 'grid', gap: 12, maxWidth: 420 }}>
                 <Field label="Ratio limit">
-                  <input value={ratioLimit} onChange={e => setRatioLimit(e.target.value)} placeholder="-2 uses default, -1 unlimited" style={INPUT} />
+                  <input value={ratioLimit} onChange={e => setRatioLimit(e.target.value)} disabled={busy} placeholder="-2 uses default, -1 unlimited" style={INPUT} />
                 </Field>
                 <Field label="Seeding time limit minutes">
-                  <input value={seedMinutes} onChange={e => setSeedMinutes(e.target.value)} placeholder="-2 uses default, -1 unlimited" style={INPUT} />
+                  <input value={seedMinutes} onChange={e => setSeedMinutes(e.target.value)} disabled={busy} placeholder="-2 uses default, -1 unlimited" style={INPUT} />
                 </Field>
                 <button disabled={busy} onClick={() => apply('Share limits updated', () => api.torrents.setShareLimits(
                   [torrent.hash],
                   ratioLimit.trim() ? Number(ratioLimit) : -2,
                   seedMinutes.trim() ? Number(seedMinutes) : -2,
-                ))} style={{ ...smallButton('#93c5fd'), width: 'fit-content' }}>Apply share limits</button>
-                <button disabled={busy} onClick={() => apply('Sequential toggled', () => api.torrents.toggleSequential([torrent.hash]))} style={{ ...smallButton('#f59e0b'), width: 'fit-content' }}>Toggle sequential download</button>
+                ))} style={{ ...smallButton('#93c5fd', busy), width: 'fit-content' }}>Apply share limits</button>
+                <button disabled={busy} onClick={() => apply('Sequential toggled', () => api.torrents.toggleSequential([torrent.hash]))} style={{ ...smallButton('#f59e0b', busy), width: 'fit-content' }}>Toggle sequential download</button>
               </div>
             )}
           </main>
         </div>
-        {message && <div style={{ borderTop: '1px solid var(--border)', padding: '8px 14px', color: message.startsWith('Error') ? '#f87171' : 'var(--muted)', fontSize: 12 }}>{message}</div>}
+        {message && <div style={{ borderTop: '1px solid var(--border)', padding: '8px 14px', color: messageTone === 'error' ? 'var(--danger)' : 'var(--success)', fontSize: 12 }}>{message}</div>}
       </div>
     </div>
   )
@@ -246,8 +260,8 @@ function FileRow({ file, busy, renaming, name, onName, onRenameStart, onRenameCa
       {renaming ? (
         <div style={{ display: 'grid', gridTemplateColumns: '1fr auto auto', gap: 7 }}>
           <input value={name} onChange={e => onName(e.target.value)} style={INPUT} />
-          <button disabled={busy || !name.trim()} onClick={onRenameSave} style={smallButton('#93c5fd')}>Save</button>
-          <button disabled={busy} onClick={onRenameCancel} style={smallButton('#64748b')}>Cancel</button>
+          <button disabled={busy || !name.trim()} onClick={onRenameSave} style={smallButton('#93c5fd', busy || !name.trim())}>Save</button>
+          <button disabled={busy} onClick={onRenameCancel} style={smallButton('#64748b', busy)}>Cancel</button>
         </div>
       ) : (
         <div style={{ display: 'grid', gridTemplateColumns: '1fr auto auto', gap: 7, alignItems: 'center' }}>
@@ -260,7 +274,7 @@ function FileRow({ file, busy, renaming, name, onName, onRenameStart, onRenameCa
             <option value={1}>Normal</option>
             <option value={2}>High</option>
           </select>
-          <button disabled={busy} onClick={onRenameStart} style={smallButton('#94a3b8')}>Rename</button>
+          <button disabled={busy} onClick={onRenameStart} style={smallButton('#94a3b8', busy)}>Rename</button>
         </div>
       )}
     </div>
@@ -275,10 +289,11 @@ function Info({ label, value, mono }: { label: string; value: string; mono?: boo
   return <div><div style={{ color: 'var(--faint)', fontSize: 10, textTransform: 'uppercase', marginBottom: 3 }}>{label}</div><div style={{ fontFamily: mono ? 'monospace' : undefined, overflowWrap: 'anywhere' }}>{value}</div></div>
 }
 
-function smallButton(color: string): React.CSSProperties {
+function smallButton(color: string, disabled = false): React.CSSProperties {
   return {
     background: 'var(--surface-2)', border: `1px solid ${color}66`, borderRadius: 5,
-    color, padding: '5px 9px', fontSize: 12, cursor: 'pointer',
+    color, padding: '5px 9px', fontSize: 12,
+    cursor: disabled ? 'not-allowed' : 'pointer', opacity: disabled ? 0.55 : 1,
   }
 }
 

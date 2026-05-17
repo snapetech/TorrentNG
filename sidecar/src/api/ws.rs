@@ -30,6 +30,8 @@ pub enum Event {
     Stats {
         upload_speed: i64,
         download_speed: i64,
+        upload_total: i64,
+        download_total: i64,
         connections: usize,
         pending_connections: usize,
         listen_port: u16,

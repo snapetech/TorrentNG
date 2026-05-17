@@ -10,7 +10,7 @@ function fmtBytes(bytes: number): string {
 }
 
 export function StoragePanel() {
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, isFetching, error, refetch } = useQuery({
     queryKey: ['storage'],
     queryFn: api.storage,
     staleTime: 5_000,
@@ -19,14 +19,30 @@ export function StoragePanel() {
 
   return (
     <section style={{ padding: '18px 24px' }}>
-      <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 12, color: 'var(--text)' }}>
-        Storage
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
+        <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--text)', flex: 1 }}>
+          Storage
+        </div>
+        <button
+          onClick={() => refetch()}
+          disabled={isFetching}
+          style={{
+            background: 'none', border: '1px solid var(--border-strong)', borderRadius: 5,
+            color: 'var(--muted)', padding: '4px 9px', fontSize: 12,
+            cursor: isFetching ? 'not-allowed' : 'pointer', opacity: isFetching ? 0.55 : 1,
+          }}
+        >
+          {isFetching ? 'Refreshing…' : 'Refresh'}
+        </button>
       </div>
 
       {isLoading && <div style={{ color: 'var(--faint)', fontSize: 12 }}>Loading storage stats…</div>}
       {error && <div style={{ color: '#ef4444', fontSize: 12 }}>Storage stats unavailable</div>}
 
       <div style={{ display: 'grid', gap: 10, maxWidth: 840 }}>
+        {data && data.roots.length === 0 && (
+          <div style={{ color: 'var(--faint)', fontSize: 12 }}>No storage roots reported.</div>
+        )}
         {data?.roots.map(root => (
           <div
             key={root.path}

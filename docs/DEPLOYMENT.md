@@ -71,6 +71,58 @@ docker compose -f deploy/docker/compose.yml up --build
 
 The entrypoint creates `/config/config.toml` from `deploy/docker/sidecar.config.toml` when no config file exists. Set `RTNG_SECRET_KEY` and `RTNG_API_TOKENS` in the compose environment for production auth; `RTNG_API_TOKENS` is a comma-separated list for automation clients. Override `RTNG_STATIC_DIR` only if you mount WebUI assets somewhere other than `/usr/share/rtorrentng/webui`.
 
+### Home live-main updater
+
+For a home test instance that should follow GitHub `main`, run the updater from
+the host instead of trying to mutate the running container. The Docker image must
+still be rebuilt because it contains the compiled Rust sidecar, built WebUI
+assets, and packaged rTorrent/libtorrent binaries.
+
+Install the user timer:
+
+```sh
+mkdir -p ~/.config/systemd/user
+cp deploy/systemd/rtorrentng-live-main-update.service ~/.config/systemd/user/
+cp deploy/systemd/rtorrentng-live-main-update.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now rtorrentng-live-main-update.timer
+```
+
+The sample unit assumes this checkout lives at
+`~/Documents/code/rtorrentNG`. If it lives somewhere else, edit
+`WorkingDirectory` and `ExecStart` in
+`~/.config/systemd/user/rtorrentng-live-main-update.service`.
+
+Run one update immediately:
+
+```sh
+systemctl --user start rtorrentng-live-main-update.service
+```
+
+Watch the updater logs:
+
+```sh
+journalctl --user -u rtorrentng-live-main-update.service -f
+```
+
+The updater fetches `origin/main`, fast-forwards the checkout, rebuilds
+`rtorrentng` with `docker compose -f deploy/docker/compose.yml build
+rtorrentng`, then recreates the service. It refuses to run when the checkout has
+uncommitted local changes so a test instance does not silently discard work.
+Use a clean checkout for the live instance, or set `RTNG_LIVE_ALLOW_DIRTY=1` only
+for a disposable checkout.
+
+Useful overrides:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `RTNG_LIVE_BRANCH` | `main` | Branch to follow |
+| `RTNG_LIVE_COMPOSE_FILE` | `deploy/docker/compose.yml` | Compose file to rebuild |
+| `RTNG_LIVE_SERVICE` | `rtorrentng` | Compose service to rebuild and recreate |
+| `RTNG_LIVE_FORCE` | `0` | Rebuild even when the commit did not change |
+| `RTNG_LIVE_PRUNE` | `0` | Run `docker image prune -f` after a successful update |
+| `RTNG_LIVE_DRY_RUN` | `0` | Print the commands without running them |
+
 ## Certification stack
 
 The integration certification stack starts rtorrentNG with Sonarr, Radarr, Prowlarr, autobrr, and cross-seed:
