@@ -28,3 +28,10 @@ Current covered targets:
 
 - qBit `/api/qb/v2/torrents/info` at 50k synthetic torrents: `< 500ms`
 - qBit `/api/qb/v2/sync/maindata` delta under normal churn: `< 50ms`
+
+Storage hardware checks live in `rt-storage` and can be run against a specific
+mount:
+
+```sh
+scripts/storage_real_device_benchmark.sh /path/on/storage
+```

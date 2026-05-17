@@ -28,10 +28,45 @@ pub struct AppState {
     pub session: Arc<RwLock<TransmissionSessionSettings>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TransmissionSessionSettings {
     pub queue_stalled_enabled: bool,
     pub queue_stalled_minutes: i64,
+    pub download_dir: Option<String>,
+    pub incomplete_dir: String,
+    pub incomplete_dir_enabled: bool,
+    pub rename_partial_files: bool,
+    pub start_added_torrents: bool,
+    pub trash_original_torrent_files: bool,
+    pub alt_speed_time_enabled: bool,
+    pub alt_speed_time_begin: i64,
+    pub alt_speed_time_end: i64,
+    pub alt_speed_time_day: i64,
+    pub download_queue_enabled: bool,
+    pub download_queue_size: i64,
+    pub seed_queue_enabled: bool,
+    pub seed_queue_size: i64,
+    pub peer_limit_global: i64,
+    pub peer_limit_per_torrent: i64,
+    pub peer_port: i64,
+    pub port_forwarding_enabled: bool,
+    pub dht_enabled: bool,
+    pub pex_enabled: bool,
+    pub lpd_enabled: bool,
+    pub utp_enabled: bool,
+    pub preferred_transport: String,
+    pub blocklist_enabled: bool,
+    pub blocklist_url: String,
+    pub script_torrent_added_enabled: bool,
+    pub script_torrent_added_filename: String,
+    pub script_torrent_done_enabled: bool,
+    pub script_torrent_done_filename: String,
+    pub script_torrent_done_seeding_enabled: bool,
+    pub script_torrent_done_seeding_filename: String,
+    pub seed_ratio_limit: f64,
+    pub seed_ratio_limited: bool,
+    pub idle_seeding_limit: i64,
+    pub idle_seeding_limit_enabled: bool,
 }
 
 impl Default for TransmissionSessionSettings {
@@ -39,6 +74,41 @@ impl Default for TransmissionSessionSettings {
         Self {
             queue_stalled_enabled: false,
             queue_stalled_minutes: 30,
+            download_dir: None,
+            incomplete_dir: String::new(),
+            incomplete_dir_enabled: false,
+            rename_partial_files: false,
+            start_added_torrents: true,
+            trash_original_torrent_files: false,
+            alt_speed_time_enabled: false,
+            alt_speed_time_begin: 540,
+            alt_speed_time_end: 1020,
+            alt_speed_time_day: 127,
+            download_queue_enabled: false,
+            download_queue_size: 0,
+            seed_queue_enabled: false,
+            seed_queue_size: 0,
+            peer_limit_global: 0,
+            peer_limit_per_torrent: 0,
+            peer_port: 0,
+            port_forwarding_enabled: false,
+            dht_enabled: true,
+            pex_enabled: true,
+            lpd_enabled: false,
+            utp_enabled: true,
+            preferred_transport: "tcp".to_owned(),
+            blocklist_enabled: false,
+            blocklist_url: String::new(),
+            script_torrent_added_enabled: false,
+            script_torrent_added_filename: String::new(),
+            script_torrent_done_enabled: false,
+            script_torrent_done_filename: String::new(),
+            script_torrent_done_seeding_enabled: false,
+            script_torrent_done_seeding_filename: String::new(),
+            seed_ratio_limit: -1.0,
+            seed_ratio_limited: false,
+            idle_seeding_limit: 0,
+            idle_seeding_limit_enabled: false,
         }
     }
 }
@@ -558,6 +628,7 @@ fn transmission_key_to_snake_case(key: &str) -> String {
 
 async fn session_get(state: &AppState, args: &Value) -> Value {
     let limits = transmission_global_limits(state).await;
+    let default_dir = default_download_dir(state).await;
     let session = state.session.read().await.clone();
     let value = json!({
         "version": "TorrentNG",
@@ -565,13 +636,13 @@ async fn session_get(state: &AppState, args: &Value) -> Value {
         "rpc-version-minimum": 1,
         "rpc-version-semver": "6.0.0",
         "session-id": SESSION_ID,
-        "download-dir": default_download_dir(state).await,
+        "download-dir": session.download_dir.clone().unwrap_or(default_dir),
         "config-dir": "/config",
-        "incomplete-dir": "",
-        "incomplete-dir-enabled": false,
-        "rename-partial-files": false,
-        "start-added-torrents": true,
-        "trash-original-torrent-files": false,
+        "incomplete-dir": session.incomplete_dir,
+        "incomplete-dir-enabled": session.incomplete_dir_enabled,
+        "rename-partial-files": session.rename_partial_files,
+        "start-added-torrents": session.start_added_torrents,
+        "trash-original-torrent-files": session.trash_original_torrent_files,
         "speed-limit-down-enabled": limits.download_limit > 0,
         "speed-limit-up-enabled": limits.upload_limit > 0,
         "speed-limit-down": bytes_to_transmission_kib(limits.download_limit),
@@ -579,30 +650,38 @@ async fn session_get(state: &AppState, args: &Value) -> Value {
         "alt-speed-enabled": limits.speed_limits_mode,
         "alt-speed-down": bytes_to_transmission_kib(limits.download_limit),
         "alt-speed-up": bytes_to_transmission_kib(limits.upload_limit),
-        "download-queue-enabled": false,
-        "download-queue-size": 0,
-        "seed-queue-enabled": false,
-        "seed-queue-size": 0,
+        "alt-speed-time-enabled": session.alt_speed_time_enabled,
+        "alt-speed-time-begin": session.alt_speed_time_begin,
+        "alt-speed-time-end": session.alt_speed_time_end,
+        "alt-speed-time-day": session.alt_speed_time_day,
+        "download-queue-enabled": session.download_queue_enabled,
+        "download-queue-size": session.download_queue_size,
+        "seed-queue-enabled": session.seed_queue_enabled,
+        "seed-queue-size": session.seed_queue_size,
         "queue-stalled-enabled": session.queue_stalled_enabled,
         "queue-stalled-minutes": session.queue_stalled_minutes,
-        "peer-limit-global": 0,
-        "peer-limit-per-torrent": 0,
-        "script-torrent-added-enabled": false,
-        "script-torrent-done-enabled": false,
-        "script-torrent-done-seeding-enabled": false,
-        "blocklist-enabled": false,
+        "peer-limit-global": session.peer_limit_global,
+        "peer-limit-per-torrent": session.peer_limit_per_torrent,
+        "script-torrent-added-enabled": session.script_torrent_added_enabled,
+        "script-torrent-added-filename": session.script_torrent_added_filename,
+        "script-torrent-done-enabled": session.script_torrent_done_enabled,
+        "script-torrent-done-filename": session.script_torrent_done_filename,
+        "script-torrent-done-seeding-enabled": session.script_torrent_done_seeding_enabled,
+        "script-torrent-done-seeding-filename": session.script_torrent_done_seeding_filename,
+        "blocklist-enabled": session.blocklist_enabled,
         "blocklist-size": 0,
-        "blocklist-url": "",
-        "utp-enabled": true,
-        "lpd-enabled": false,
-        "dht-enabled": true,
-        "pex-enabled": true,
-        "peer-port": 0,
-        "port-forwarding-enabled": false,
-        "seedRatioLimit": -1.0,
-        "seedRatioLimited": false,
-        "idle-seeding-limit": 0,
-        "idle-seeding-limit-enabled": false,
+        "blocklist-url": session.blocklist_url,
+        "utp-enabled": session.utp_enabled,
+        "lpd-enabled": session.lpd_enabled,
+        "dht-enabled": session.dht_enabled,
+        "pex-enabled": session.pex_enabled,
+        "peer-port": session.peer_port,
+        "port-forwarding-enabled": session.port_forwarding_enabled,
+        "preferred-transport": session.preferred_transport,
+        "seedRatioLimit": session.seed_ratio_limit,
+        "seedRatioLimited": session.seed_ratio_limited,
+        "idle-seeding-limit": session.idle_seeding_limit,
+        "idle-seeding-limit-enabled": session.idle_seeding_limit_enabled,
         "units": {
             "speed-units": ["B/s", "KB/s", "MB/s", "GB/s", "TB/s"],
             "speed-bytes": 1000,
@@ -1215,6 +1294,134 @@ async fn session_set(state: &AppState, args: &Value) -> Result<Value, String> {
     if let Some(minutes) = transmission_i64_arg(args, "queue-stalled-minutes") {
         state.session.write().await.queue_stalled_minutes = minutes.max(0);
     }
+    let mut session = state.session.write().await;
+    set_string_arg(args, "download-dir", &mut session.download_dir);
+    set_string_value_arg(args, "incomplete-dir", &mut session.incomplete_dir);
+    set_string_value_arg(
+        args,
+        "preferred-transport",
+        &mut session.preferred_transport,
+    );
+    set_string_value_arg(args, "blocklist-url", &mut session.blocklist_url);
+    set_string_value_arg(
+        args,
+        "script-torrent-added-filename",
+        &mut session.script_torrent_added_filename,
+    );
+    set_string_value_arg(
+        args,
+        "script-torrent-done-filename",
+        &mut session.script_torrent_done_filename,
+    );
+    set_string_value_arg(
+        args,
+        "script-torrent-done-seeding-filename",
+        &mut session.script_torrent_done_seeding_filename,
+    );
+    set_bool_arg(
+        args,
+        "incomplete-dir-enabled",
+        &mut session.incomplete_dir_enabled,
+    );
+    set_bool_arg(
+        args,
+        "rename-partial-files",
+        &mut session.rename_partial_files,
+    );
+    set_bool_arg(
+        args,
+        "start-added-torrents",
+        &mut session.start_added_torrents,
+    );
+    set_bool_arg(
+        args,
+        "trash-original-torrent-files",
+        &mut session.trash_original_torrent_files,
+    );
+    set_bool_arg(
+        args,
+        "alt-speed-time-enabled",
+        &mut session.alt_speed_time_enabled,
+    );
+    set_i64_arg(
+        args,
+        "alt-speed-time-begin",
+        &mut session.alt_speed_time_begin,
+        0,
+    );
+    set_i64_arg(
+        args,
+        "alt-speed-time-end",
+        &mut session.alt_speed_time_end,
+        0,
+    );
+    set_i64_arg(
+        args,
+        "alt-speed-time-day",
+        &mut session.alt_speed_time_day,
+        0,
+    );
+    set_bool_arg(
+        args,
+        "download-queue-enabled",
+        &mut session.download_queue_enabled,
+    );
+    set_i64_arg(
+        args,
+        "download-queue-size",
+        &mut session.download_queue_size,
+        0,
+    );
+    set_bool_arg(args, "seed-queue-enabled", &mut session.seed_queue_enabled);
+    set_i64_arg(args, "seed-queue-size", &mut session.seed_queue_size, 0);
+    set_i64_arg(args, "peer-limit-global", &mut session.peer_limit_global, 0);
+    set_i64_arg(
+        args,
+        "peer-limit-per-torrent",
+        &mut session.peer_limit_per_torrent,
+        0,
+    );
+    set_i64_arg(args, "peer-port", &mut session.peer_port, 0);
+    set_bool_arg(
+        args,
+        "port-forwarding-enabled",
+        &mut session.port_forwarding_enabled,
+    );
+    set_bool_arg(args, "dht-enabled", &mut session.dht_enabled);
+    set_bool_arg(args, "pex-enabled", &mut session.pex_enabled);
+    set_bool_arg(args, "lpd-enabled", &mut session.lpd_enabled);
+    set_bool_arg(args, "utp-enabled", &mut session.utp_enabled);
+    set_bool_arg(args, "blocklist-enabled", &mut session.blocklist_enabled);
+    set_bool_arg(
+        args,
+        "script-torrent-added-enabled",
+        &mut session.script_torrent_added_enabled,
+    );
+    set_bool_arg(
+        args,
+        "script-torrent-done-enabled",
+        &mut session.script_torrent_done_enabled,
+    );
+    set_bool_arg(
+        args,
+        "script-torrent-done-seeding-enabled",
+        &mut session.script_torrent_done_seeding_enabled,
+    );
+    if let Some(value) = transmission_f64_arg(args, "seedRatioLimit") {
+        session.seed_ratio_limit = value;
+    }
+    set_bool_arg(args, "seedRatioLimited", &mut session.seed_ratio_limited);
+    set_i64_arg(
+        args,
+        "idle-seeding-limit",
+        &mut session.idle_seeding_limit,
+        0,
+    );
+    set_bool_arg(
+        args,
+        "idle-seeding-limit-enabled",
+        &mut session.idle_seeding_limit_enabled,
+    );
     Ok(json!({}))
 }
 
@@ -1235,6 +1442,11 @@ fn transmission_i64_arg(args: &Value, key: &str) -> Option<i64> {
         .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))
 }
 
+fn transmission_f64_arg(args: &Value, key: &str) -> Option<f64> {
+    args.get(key)
+        .and_then(|value| value.as_f64().or_else(|| value.as_str()?.parse().ok()))
+}
+
 fn transmission_bool_arg(args: &Value, key: &str) -> Option<bool> {
     match args.get(key)? {
         Value::Bool(value) => Some(*value),
@@ -1245,6 +1457,30 @@ fn transmission_bool_arg(args: &Value, key: &str) -> Option<bool> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+fn set_bool_arg(args: &Value, key: &str, target: &mut bool) {
+    if let Some(value) = transmission_bool_arg(args, key) {
+        *target = value;
+    }
+}
+
+fn set_i64_arg(args: &Value, key: &str, target: &mut i64, min: i64) {
+    if let Some(value) = transmission_i64_arg(args, key) {
+        *target = value.max(min);
+    }
+}
+
+fn set_string_arg(args: &Value, key: &str, target: &mut Option<String>) {
+    if let Some(value) = args.get(key).and_then(Value::as_str) {
+        *target = Some(value.to_owned());
+    }
+}
+
+fn set_string_value_arg(args: &Value, key: &str, target: &mut String) {
+    if let Some(value) = args.get(key).and_then(Value::as_str) {
+        *target = value.to_owned();
     }
 }
 
@@ -1487,6 +1723,10 @@ mod tests {
                 "alt-speed-enabled",
                 "alt-speed-down",
                 "alt-speed-up",
+                "alt-speed-time-enabled",
+                "alt-speed-time-begin",
+                "alt-speed-time-end",
+                "alt-speed-time-day",
                 "download-queue-enabled",
                 "download-queue-size",
                 "seed-queue-enabled",
@@ -1495,9 +1735,13 @@ mod tests {
                 "queue-stalled-minutes",
                 "peer-limit-global",
                 "peer-limit-per-torrent",
+                "preferred-transport",
                 "script-torrent-added-enabled",
+                "script-torrent-added-filename",
                 "script-torrent-done-enabled",
+                "script-torrent-done-filename",
                 "script-torrent-done-seeding-enabled",
+                "script-torrent-done-seeding-filename",
                 "blocklist-enabled",
                 "blocklist-size",
                 "blocklist-url",

@@ -18,8 +18,8 @@ scheduler used by the native engine.
 - Piece and BEP52 hashing runs on a separate bounded hashing pool.
 - `DeviceElevator` captures the per-device Phase B scheduling policy:
   budgeted queueing, deadline and foreground bypass, choke-critical promotion,
-  offset ordering, and adjacent read coalescing. `MountScheduler` integration
-  is the next step.
+  class weights, bounded dispatch, offset ordering, and adjacent read
+  coalescing. `MountScheduler` integration is the next step.
 - `prepare_file` creates parent directories and applies preallocation before
   the first write. The default `Auto` policy resolves from mount/sysfs
   topology: full allocation for rotational non-CoW local storage, sparse

@@ -7,6 +7,15 @@ use rt_path::{StorageProfile, StorageRootId};
 
 use crate::io_class::IoClass;
 
+const ELEVATOR_CLASS_ORDER: [IoClass; 6] = [
+    IoClass::Foreground,
+    IoClass::PeerRead,
+    IoClass::PeerWrite,
+    IoClass::MoveCopy,
+    IoClass::Recheck,
+    IoClass::Metadata,
+];
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DeviceId(pub String);
 
@@ -104,6 +113,10 @@ impl DeviceElevator {
     }
 
     pub fn drain_ready(&mut self, now: Instant) -> Vec<ElevatorDispatch> {
+        self.drain_ready_limited(now, usize::MAX)
+    }
+
+    pub fn drain_ready_limited(&mut self, now: Instant, max_ops: usize) -> Vec<ElevatorDispatch> {
         let mut ready = Vec::new();
         let mut pending = VecDeque::with_capacity(self.pending.len());
         while let Some(queued) = self.pending.pop_front() {
@@ -115,7 +128,9 @@ impl DeviceElevator {
         }
         self.pending = pending;
         ready.sort_by(|a, b| compare_queued_ops(a, b, now));
-        coalesce_ready_ops(ready)
+        let selected = select_ready_ops(&mut ready, max_ops, now);
+        self.pending.extend(ready);
+        coalesce_ready_ops(selected)
     }
 
     fn is_ready(&self, queued: &QueuedOp, now: Instant) -> bool {
@@ -125,6 +140,17 @@ impl DeviceElevator {
             || now
                 .checked_duration_since(queued.queued_at)
                 .is_some_and(|age| age >= self.budget)
+    }
+}
+
+pub fn elevator_class_weight(class: IoClass) -> usize {
+    match class {
+        IoClass::Foreground => 16,
+        IoClass::PeerRead => 8,
+        IoClass::PeerWrite => 4,
+        IoClass::MoveCopy => 2,
+        IoClass::Recheck => 1,
+        IoClass::Metadata => 1,
     }
 }
 
@@ -157,6 +183,41 @@ fn promotion_rank(op: &QueuedOp, now: Instant) -> u8 {
     } else {
         0
     }
+}
+
+fn select_ready_ops(ready: &mut Vec<QueuedOp>, max_ops: usize, now: Instant) -> Vec<QueuedOp> {
+    if max_ops == 0 || ready.is_empty() {
+        return Vec::new();
+    }
+
+    let mut selected = Vec::with_capacity(max_ops.min(ready.len()));
+    let mut i = 0;
+    while i < ready.len() && selected.len() < max_ops {
+        if promotion_rank(&ready[i], now) > 0 {
+            selected.push(ready.remove(i));
+        } else {
+            i += 1;
+        }
+    }
+
+    while selected.len() < max_ops && !ready.is_empty() {
+        let selected_at_round_start = selected.len();
+        for class in ELEVATOR_CLASS_ORDER {
+            for _ in 0..elevator_class_weight(class) {
+                if selected.len() >= max_ops {
+                    break;
+                }
+                let Some(pos) = ready.iter().position(|queued| queued.op.class == class) else {
+                    break;
+                };
+                selected.push(ready.remove(pos));
+            }
+        }
+        if selected.len() == selected_at_round_start {
+            break;
+        }
+    }
+    selected
 }
 
 fn coalesce_ready_ops(ready: Vec<QueuedOp>) -> Vec<ElevatorDispatch> {
@@ -378,5 +439,68 @@ mod tests {
         assert!(dispatch[0].choke_critical);
         assert_eq!(dispatch[1].class, IoClass::Foreground);
         assert_eq!(elevator.pending_len(), 1);
+    }
+
+    #[test]
+    fn limited_drain_uses_class_weights_and_keeps_remainder_pending() {
+        let now = Instant::now();
+        let mut elevator = DeviceElevator::new(
+            DeviceId("sda".to_owned()),
+            StorageProfile::Hdd,
+            Duration::ZERO,
+        );
+        for i in 0..4 {
+            elevator.submit(
+                now,
+                op(
+                    file(&format!("recheck-{i}.bin")),
+                    0,
+                    16 * 1024,
+                    IoClass::Recheck,
+                    IoKind::Read,
+                ),
+            );
+        }
+        for i in 0..4 {
+            elevator.submit(
+                now,
+                op(
+                    file(&format!("peer-{i}.bin")),
+                    0,
+                    16 * 1024,
+                    IoClass::PeerRead,
+                    IoKind::Read,
+                ),
+            );
+        }
+
+        let dispatch = elevator.drain_ready_limited(now, 3);
+        assert_eq!(dispatch.len(), 3);
+        assert!(dispatch.iter().all(|op| op.class == IoClass::PeerRead));
+        assert_eq!(elevator.pending_len(), 5);
+    }
+
+    #[test]
+    fn zero_limited_drain_leaves_ready_ops_pending() {
+        let now = Instant::now();
+        let mut elevator = DeviceElevator::new(
+            DeviceId("sda".to_owned()),
+            StorageProfile::Hdd,
+            Duration::ZERO,
+        );
+        elevator.submit(
+            now,
+            op(
+                file("movie.bin"),
+                0,
+                16 * 1024,
+                IoClass::PeerRead,
+                IoKind::Read,
+            ),
+        );
+
+        assert!(elevator.drain_ready_limited(now, 0).is_empty());
+        assert_eq!(elevator.pending_len(), 1);
+        assert_eq!(elevator.drain_ready_limited(now, 1).len(), 1);
     }
 }

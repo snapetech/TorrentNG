@@ -26,3 +26,7 @@ if [[ "${STORAGE_PHASE_B_FULL:-0}" == "1" ]]; then
   run cargo test -p rt-api-deluge
   run cargo test -p rt-migrate
 fi
+
+if [[ "${STORAGE_PHASE_B_REAL_DEVICE:-0}" == "1" ]]; then
+  run cargo test -p rt-storage --test storage_real_device -- --ignored --nocapture
+fi

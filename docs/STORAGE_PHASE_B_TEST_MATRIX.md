@@ -18,13 +18,16 @@ that consume storage behavior:
 STORAGE_PHASE_B_FULL=1 scripts/storage_phase_b_matrix.sh
 ```
 
+Set `STORAGE_PHASE_B_REAL_DEVICE=1` to run ignored real-device storage probes.
+Use `TNG_STORAGE_BENCH_DIR` to point those probes at the target mount.
+
 ## Automated Matrix
 
 | Area | Coverage | Command |
 | --- | --- | --- |
 | Storage unit suite | fd pool, positioned I/O, durability, hashing pool, readahead, topology, elevator policy | `cargo test -p rt-storage` |
 | Linux topology | mountinfo parsing, `/sys/dev/block` parent device lookup, rotational profile, network mount device ids, CoW filesystem detection | `cargo test -p rt-storage device::tests` |
-| Device elevator | HDD queue budget, NVMe pass-through budget, offset ordering, adjacent read coalescing, write non-coalescing, deadline/foreground/choke-critical promotion | `cargo test -p rt-storage elevator::tests` |
+| Device elevator | HDD queue budget, NVMe pass-through budget, offset ordering, adjacent read coalescing, write non-coalescing, bounded dispatch, class weights, deadline/foreground/choke-critical promotion | `cargo test -p rt-storage elevator::tests` |
 | Auto preallocation | `PreallocationMode::Auto` resolves to full only for rotational non-CoW local topology and sparse otherwise | `cargo test -p rt-storage auto_preallocation_policy` |
 | Peer read locality | adjacent peer reads return exact requested bytes while reducing backend reads | `cargo test -p rt-metrics storage_peer_read_readahead_reduces_backend_reads_for_adjacent_blocks -- --nocapture` |
 | Runtime isolation | hashing and recheck work do not stall peer-read path | `cargo test -p rt-metrics storage_hash_pool_does_not_block_peer_read_path -- --nocapture` |
@@ -32,6 +35,7 @@ STORAGE_PHASE_B_FULL=1 scripts/storage_phase_b_matrix.sh
 | FD bound | file-pool capacity stays bounded under active file churn | `cargo test -p rt-metrics storage_file_pool_stays_bounded_under_active_file_churn -- --nocapture` |
 | Engine upload reads | multi-file upload reads still return exact block bytes | `cargo test -p rt-engine upload_block_reads_across_many_file_regions` |
 | Pure v2 recheck | taskless v2 recheck still verifies file roots through scheduled storage reads | `cargo test -p rt-engine pure_v2_recheck_verifies_file_roots_without_torrent_task` |
+| Real-device probes | topology printout, adjacent-read backend reduction, hot-fd reuse, shuffled peer-read baseline on a chosen mount | `STORAGE_PHASE_B_REAL_DEVICE=1 TNG_STORAGE_BENCH_DIR=/mnt/target scripts/storage_phase_b_matrix.sh` |
 
 ## Full Consumer Matrix
 
@@ -51,6 +55,12 @@ that currently project or depend on storage behavior.
 Run these on real target storage before claiming benchmark or production
 readiness. The automated unit tests mock topology where practical, but they do
 not prove kernel/filesystem performance.
+
+Run the real-device benchmark target with:
+
+```sh
+scripts/storage_real_device_benchmark.sh /path/on/storage
+```
 
 | Platform | Filesystem / mount | Expected profile | Expected preallocation | Required checks |
 | --- | --- | --- | --- | --- |
