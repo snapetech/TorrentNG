@@ -87,7 +87,15 @@ impl<'a> PieceVerifier<'a> {
             match self.read_region(region).await {
                 Ok(data) => piece_data.extend_from_slice(&data),
                 Err(e) => {
-                    tracing::warn!(piece, file_index = region.file_index, error = %e, "file read failed during verify");
+                    tracing::warn!(
+                        component = "storage",
+                        operation = "verify_piece",
+                        piece,
+                        file_index = region.file_index,
+                        result = "error",
+                        error = %e,
+                        "file read failed during verify"
+                    );
                     return VerifyResult::Missing {
                         file_index: region.file_index,
                         reason: e.to_string(),
@@ -113,7 +121,13 @@ impl<'a> PieceVerifier<'a> {
             tracing::debug!(piece, "piece valid");
             VerifyResult::Valid
         } else {
-            tracing::warn!(piece, "piece hash mismatch");
+            tracing::warn!(
+                component = "storage",
+                operation = "verify_piece",
+                piece,
+                result = "invalid",
+                "piece hash mismatch"
+            );
             VerifyResult::Invalid
         }
     }
@@ -191,7 +205,10 @@ impl<'a> V2FileVerifier<'a> {
             Ok(root) => root,
             Err(e) => {
                 tracing::warn!(
+                    component = "storage",
+                    operation = "verify_v2_file",
                     file_index = file.file_index,
+                    result = "error",
                     error = %e,
                     "file read failed during v2 verify"
                 );
@@ -204,7 +221,13 @@ impl<'a> V2FileVerifier<'a> {
         if actual == file.pieces_root {
             VerifyResult::Valid
         } else {
-            tracing::warn!(file_index = file.file_index, "v2 file root mismatch");
+            tracing::warn!(
+                component = "storage",
+                operation = "verify_v2_file",
+                file_index = file.file_index,
+                result = "invalid",
+                "v2 file root mismatch"
+            );
             VerifyResult::Invalid
         }
     }

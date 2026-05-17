@@ -659,7 +659,13 @@ impl UringWorker {
             for job in jobs {
                 match self.submit_job(job) {
                     Ok(()) => submitted += 1,
-                    Err(e) => tracing::warn!(error = %e, "io_uring submission failed"),
+                    Err(e) => tracing::warn!(
+                        component = "storage",
+                        operation = "io_uring_submit",
+                        result = "error",
+                        error = %e,
+                        "io_uring submission failed"
+                    ),
                 }
             }
             if submitted == 0 {

@@ -1737,23 +1737,33 @@ impl MountScheduler {
             let key = normalized_key(&path);
             let path_str = key.display().to_string();
             if let Some(parent) = key.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| StorageError::io(parent.display().to_string(), e))?;
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| StorageError::io(parent.display().to_string(), e))?;
             }
             let file = pool.get_or_open(&key, OpenMode::Write, true)?;
             match mode {
                 PreallocationMode::Off => {}
                 PreallocationMode::Auto => {
-                    file.set_len(len).map_err(|e| StorageError::io(&path_str, e))?;
+                    file.set_len(len)
+                        .map_err(|e| StorageError::io(&path_str, e))?;
                 }
                 PreallocationMode::Sparse => {
-                    file.set_len(len).map_err(|e| StorageError::io(&path_str, e))?;
+                    file.set_len(len)
+                        .map_err(|e| StorageError::io(&path_str, e))?;
                 }
                 PreallocationMode::Full => {
                     if let Err(e) = full_preallocate(&file, len) {
                         counters
                             .preallocation_fallbacks
                             .fetch_add(1, Ordering::Relaxed);
-                        tracing::warn!(path = %path_str, err = %e, "full preallocation failed; falling back to sparse length");
+                        tracing::warn!(
+                            component = "storage",
+                            operation = "preallocate",
+                            mode = "full",
+                            result = "fallback",
+                            error = %e,
+                            "full preallocation failed; falling back to sparse length"
+                        );
                         file.set_len(len).map_err(|fallback| {
                             counters
                                 .preallocation_failures
