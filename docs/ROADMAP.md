@@ -1,6 +1,9 @@
 # Roadmap
 
-This project has two sequential tracks. Track 1 delivers immediate value on top of rTorrent. Track 2 is the full native Rust engine that replaces rTorrent entirely. Track 2 begins after Track 1 ships.
+This project has two runtime tracks. Track 1 delivered immediate value on top
+of rTorrent and remains a compatibility/migration facade. Track 2 is the native
+Rust engine that replaces rTorrent for native deployments and is now the primary
+rewrite surface.
 
 ---
 
@@ -124,7 +127,10 @@ Sidecar-managed replacement for high-value ruTorrent plugins.
 
 # Track 2 — Native Rust Engine
 
-A ground-up Rust BitTorrent daemon optimized for 10k–100k torrents, 200+ TB libraries, private-tracker seeding, and operational observability. Starts after Track 1 ships.
+A ground-up Rust BitTorrent daemon optimized for 10k–100k torrents, 200+ TB
+libraries, private-tracker seeding, and operational observability. This track is
+implemented across the workspace and certified by
+`scripts/native_engine_certification_report.sh`.
 
 See `docs/ENGINE.md` for the full design.
 

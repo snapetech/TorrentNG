@@ -118,10 +118,10 @@ native database apply plumbing. It pairs `.torrent` files with `.fastresume`
 sidecars and imports save path, category, tags, trackers, completion state, file
 rows, transfer counters, and ratio.
 
-Operator-facing CLI wiring is still pending. Until then, use the crate API from
-integration tooling or load each `.torrent` file manually via the rtorrentNG API
-or ruTorrent UI, pointing to the existing file path. rtorrentNG will verify and
-resume without downloading.
+Operator-facing CLI wiring can use the native migration crate directly from
+integration tooling. Manual fallback remains available: load each `.torrent`
+through the rtorrentNG API, pointing at the existing file path, then let the
+native recheck job verify and resume without downloading.
 
 ---
 
@@ -135,11 +135,13 @@ resume without downloading.
 
 ### Procedure
 
-Transmission migration tooling is planned for Track 2 Phase 12. Until then:
+The native migration crate imports Transmission torrent and resume state into
+the rtorrentNG session DB. Use a dry-run report first, back up the native DB,
+then apply the import from integration tooling. Manual fallback remains:
 
 1. Export torrent files from Transmission (right-click → "Export .torrent")
-2. Add each via the rtorrentNG API or ruTorrent, pointing to the existing download path
-3. rTorrent will verify pieces and resume seeding without re-downloading
+2. Add each via the rtorrentNG API, pointing to the existing download path
+3. Run a native recheck job so verified pieces resume without re-downloading
 
 ---
 
@@ -153,7 +155,10 @@ If your download directories are in different locations in the new setup, you ne
 # d.directory.set=<new_path>/<torrent_name>
 ```
 
-The Phase 2 sidecar API (`PUT /api/v1/torrents/{hash}` with `save_path`) handles this per-torrent. A bulk path remap tool with dry-run preview is planned for Phase 4.
+The native and sidecar API surfaces both support per-torrent save path updates.
+Bulk moves should use the native storage planning flow so conflicts, capacity,
+copy/rename mode, rollback, and destructive delete approval are visible before
+data moves.
 
 ---
 

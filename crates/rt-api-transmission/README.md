@@ -1,5 +1,6 @@
 # rt-api-transmission
 
-Transmission RPC compatibility (Phase 12).
+Transmission RPC compatibility facade over native engine or sidecar-backed
+torrent state.
 
-## Status: Compatibility facade — in progress
+## Status: Implemented — compatibility facade

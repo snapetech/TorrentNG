@@ -2,185 +2,175 @@
 
 ## Overview
 
-rtorrentNG is a four-layer stack built around rTorrent as the torrent engine. The layers are cleanly separated so each can be replaced or improved independently.
+rtorrentNG now has two runtime modes:
 
-```
+- **Native engine mode:** `rusttorrentd` is the source of truth. It owns torrent
+  state, SQLite session persistence, tracker state, peer wire tasks, storage,
+  rechecks, jobs, metrics, native REST/SSE, and compatibility API projections.
+- **Track 1 sidecar mode:** `sidecar/rtorrentng` remains available for existing
+  rTorrent deployments. It talks to rTorrent over a trusted local SCGI socket,
+  keeps a SQLite cache, and exposes the same WebUI and qBittorrent-compatible
+  client surface while users migrate.
+
+The native engine supersedes the wrapper/harness path for production native
+mode. The wrapper remains useful as a migration bridge and rTorrent facade, not
+as a required dependency of `rusttorrentd`.
+
+```text
 ┌─────────────────────────────────────────────────────────┐
 │                      External Tools                      │
 │   Prowlarr · Sonarr · Radarr · autobrr · cross-seed     │
 │              NZB360 · Transdrone · etc.                  │
 └────────────────────────┬────────────────────────────────┘
-                         │ qBittorrent-compatible API
+                         │ qBit / Transmission / Deluge API
 ┌────────────────────────▼────────────────────────────────┐
 │                    WebUI (React/Vite)                    │
 │   Virtualized torrent table · Bulk ops · Tracker views  │
-│              Storage dashboard · Event log               │
+│              Storage dashboard · Event stream            │
 └────────────────────────┬────────────────────────────────┘
-                         │ Native REST + WebSocket
+                         │ Native REST + SSE
 ┌────────────────────────▼────────────────────────────────┐
-│                  Sidecar Daemon (Go)                     │
+│                rusttorrentd native daemon                │
 │                                                          │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────┐  │
-│  │ Native   │  │ qBit     │  │ WebSocket│  │ Cache  │  │
-│  │ REST API │  │ Compat   │  │ Events   │  │ SQLite │  │
-│  └──────────┘  └──────────┘  └──────────┘  └────────┘  │
-│                    Auth · Tokens · CSRF                  │
-└────────────────────────┬────────────────────────────────┘
-                         │ Trusted XMLRPC over local SCGI socket
-┌────────────────────────▼────────────────────────────────┐
-│                  rTorrent Engine                         │
-│         Pinned version · tinyxml2 build                  │
-│         Tuned session/announce/recheck config            │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌─────────────┐ │
+│  │ Native   │ │ Compat   │ │ Session  │ │ Jobs/events │ │
+│  │ REST/SSE │ │ APIs     │ │ SQLite   │ │ metrics     │ │
+│  └──────────┘ └──────────┘ └──────────┘ └─────────────┘ │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌─────────────┐ │
+│  │ Tracker  │ │ Peer     │ │ Storage  │ │ Migration   │ │
+│  │ manager  │ │ tasks    │ │ scheduler│ │ importers   │ │
+│  └──────────┘ └──────────┘ └──────────┘ └─────────────┘ │
 └─────────────────────────────────────────────────────────┘
 ```
 
-## Layer 1: Engine Profile
+Track 1 sidecar mode keeps this separate compatibility shape:
 
-**Location:** `engine-profile/`
+```text
+WebUI / automation clients
+          │
+          ▼
+sidecar/rtorrentng ── trusted XMLRPC over local SCGI ── rTorrent
+          │
+          └── SQLite cache, auth, qBit/native facade, metrics
+```
 
-rTorrent is the BitTorrent engine. We do not modify rTorrent's core behavior significantly — we pin a known-good version, standardize the build, and enforce a hardened runtime configuration.
+## Native Engine
 
-### Engine choices
+**Location:** `crates/`
+**Binary:** `crates/rusttorrentd`
 
-| Decision | Choice | Rationale |
-|---|---|---|
-| rTorrent version | 0.16.11 (pinned) | Current stable; pre-release descriptor removed |
-| XMLRPC backend | tinyxml2 | xmlrpc-c causes erratic RPC behavior (rakshasa/rtorrent#1636) |
-| SCGI exposure | Local socket only | Never expose SCGI to network; sidecar is the API firewall |
-| XMLRPC trust model | Sidecar is the only trusted client | Sidecar connects via trusted socket path; no untrusted passthrough |
+The native daemon wires the engine crates into one process. SQLite-backed
+engine state is the source of truth for torrent rows, file metadata, trackers,
+labels, jobs, metrics, and compatibility projections.
 
-### Key configuration areas
+### Core Crates
 
-- Session directory and resume behavior
-- Announce throttling (avoid tracker bans on restart)
-- Recheck concurrency limits (avoid disk storm)
-- Mount/path policies
-- Memory/mmap tuning
-- systemd socket activation or manual socket path
+- `rt-metainfo` parses v1, v2, hybrid torrents, and `btih`/`btmh` magnets.
+- `rt-db` stores durable torrents, file rows, tracker rows, limits, jobs,
+  events, settings, storage roots, mounts, tags, and categories.
+- `rt-engine` supervises torrent tasks, metadata placeholders, rechecks,
+  tracker state, DHT registration, shutdown, diagnostics, and restore.
+- `rt-storage` provides root/mount abstractions, dry-run import/move/delete
+  plans, scheduling, and v1/v2 verification.
+- `rt-tracker`, `rt-peer-wire`, `rt-peer-manager`, `rt-piece-picker`,
+  `rt-dht`, and `rt-utp` cover protocol behavior and peer/download mechanics.
+- `rt-api-native`, `rt-api-qbit`, `rt-api-transmission`, and `rt-api-deluge`
+  expose native and compatibility APIs over the same registry.
+- `rt-migrate` imports rTorrent, qBittorrent, and Transmission state.
+- `rt-metrics` and `rt-testkit` provide scale and certification evidence.
 
-## Layer 2: Sidecar Daemon
+### Native Data Flow
+
+```text
+add torrent/magnet
+      │
+      ▼
+parse metainfo or magnet identity
+      │
+      ▼
+persist torrent row, metadata, labels, trackers, and event
+      │
+      ▼
+spawn v1/hybrid torrent task or taskless pure-v2 metadata projection
+      │
+      ├── tracker manager persists announce/scrape state
+      ├── peer tasks verify pieces before completion
+      ├── storage scheduler throttles reads, writes, and rechecks
+      └── APIs project registry + metadata + fastresume state
+```
+
+Startup restores persisted torrents from the DB and metadata store. Pure v2
+rows restore as taskless metadata projections when there is no v1 peer-wire
+task to spawn.
+
+## Runtime API Layer
+
+The API layer is intentionally a projection over engine state, not the internal
+model:
+
+- Native REST/SSE is snake_case and built for the WebUI and direct integrations.
+- qBittorrent v2 compatibility preserves ecosystem behavior for automation.
+- Transmission RPC supports session, torrent, tracker, file, queue, and magnet
+  surfaces; v2 hashes project as BEP 52 `btmh` magnet links.
+- Deluge RPC is a best-effort facade over the same registry and metadata.
+
+`GET /health` is the runtime contract for readiness and capability discovery.
+In native mode it reports `engine.track1_sidecar_required=false` plus a
+machine-readable capability manifest for v1/v2/hybrid identity, storage safety,
+jobs, migration, DHT/uTP policy, compatibility facades, metrics, and
+diagnostics.
+
+## Track 1 Sidecar
 
 **Location:** `sidecar/`
-**Language:** Rust
 **Binary:** `rtorrentng`
 
-The sidecar is the control plane. It is the only process that talks to rTorrent XMLRPC. Everything else — browser, automation tools, scripts — talks to the sidecar.
+The sidecar remains a supported facade for rTorrent deployments and release
+compatibility certification. It is not required by native engine mode.
 
 ### Responsibilities
 
-- Maintain a live torrent state cache (SQLite) synced from rTorrent
-- Serve the native REST API
-- Serve the qBittorrent-compatible API
-- Serve WebSocket event stream with delta diffs
-- Handle auth (session tokens, API tokens, OIDC proxy header trust)
-- Manage long-running bulk operations (bulk move, bulk tracker edit, recheck queue)
-- Expose Prometheus metrics and health endpoint
-- Structured JSON logs via `log/slog`
+- Maintain a live torrent state cache synced from rTorrent XMLRPC.
+- Serve native REST and qBittorrent-compatible APIs for Track 1 users.
+- Serve WebSocket events and Prometheus metrics.
+- Enforce auth and script workflow policy.
+- Provide migration-compatible metadata, labels, and tracker views.
 
-### Package layout
+### Sidecar Data Flow
 
-```
-sidecar/
-  Cargo.toml
-  src/
-    main.rs           — startup, signal handling, wires all modules
-    config.rs         — TOML config, env override (RTNG_*), validation
-    sync.rs           — background tokio task: poll rTorrent → upsert cache → broadcast WS events
-    rtorrent/
-      mod.rs
-      client.rs       — async XMLRPC/SCGI client (Unix socket or TCP)
-      torrents.rs     — d.multicall2 query, CRUD, set_user_agent / get_user_agent
-    api/
-      mod.rs
-      server.rs       — axum Router, AppState
-      handlers.rs     — native REST handlers (torrents, user-agent settings, health)
-      ws.rs           — WebSocket upgrade, Event enum, broadcast fan-out
-    qbcompat/
-      mod.rs
-      handlers.rs     — qBittorrent v2 API shim (auth, app, torrents, sync, transfer)
-    cache/
-      mod.rs
-      db.rs           — rusqlite schema, WAL, upsert/delete, migrations
-      query.rs        — server-side filter/sort/paginate (no ORM)
-```
-
-### State sync model
-
-```
-rTorrent ──XMLRPC poll──► sidecar cache (SQLite)
+```text
+rTorrent ── XMLRPC poll ──► sidecar SQLite cache
                                 │
                     ┌───────────┤
                     │           │
               REST clients   WebSocket
-              (on-demand     (push delta
-               query)         on change)
 ```
 
-Poll interval: configurable, default 2s. Delta detection: compare hash of torrent state fields; push WS event only on change. This avoids full-refresh spam in the browser.
+The sidecar is the only trusted XMLRPC client in Track 1 mode. Browser,
+automation, and scripts talk to the sidecar, never directly to the SCGI socket.
 
-### qBittorrent compatibility shim
-
-The qBit shim translates qBittorrent API calls to internal sidecar operations. It does not call rTorrent directly. This means qBit API calls benefit from the same caching, auth, and safety guarantees as native API calls.
-
-Compatibility target: qBittorrent Web API v2 (as documented for qBittorrent 5.x).
-
-## Layer 3: WebUI
+## WebUI
 
 **Location:** `webui/`
-**Stack:** React 19, TypeScript strict, Vite, TanStack Query, TanStack Virtual, TanStack Table
+**Stack:** React 19, TypeScript strict, Vite, TanStack Query, TanStack Virtual,
+TanStack Table.
 
-### Key design constraints
+The WebUI is shared by native and sidecar modes. It is built around large
+libraries: virtualized rows, server-side filter/sort/page, delta events, bulk
+dry-run previews, storage/tracker views, saved views, and diagnostic actions.
 
-1. **Virtualized table** — only DOM rows in the viewport are rendered. 100k-row list must be smooth.
-2. **Server-side sort/filter** — the browser never holds the full torrent list. Queries go to sidecar with `sort`, `filter`, `offset`, `limit` params.
-3. **Delta sync** — WebSocket connection receives push events for torrent state changes. No polling loops.
-4. **No right-click dependency** — all actions available in side panels and toolbars. Mobile-safe.
-5. **Saved views** — named filter+sort+column presets stored in sidecar, synced across sessions.
-
-### View structure
-
-```
-App
-├── TorrentList (virtualized, server-side data)
-│   ├── FilterBar (saved views, quick filters, search)
-│   ├── TorrentTable (TanStack Virtual rows)
-│   └── BulkActionBar (preview before execute)
-├── TorrentDetail (sidebar/drawer)
-│   ├── General, Files, Trackers, Peers, Speed
-│   └── Actions panel
-├── StorageDashboard
-├── TrackerHealth
-├── RatioGroups
-├── EventLog
-└── Settings
-```
-
-## Layer 4: Deployment
+## Deployment
 
 **Location:** `deploy/`
 
-### Targets
+Native deployments run `rusttorrentd` with durable DB/metadata paths and storage
+roots. Sidecar deployments run the Phase 1 rTorrent bundle or host rTorrent plus
+`sidecar/rtorrentng`.
 
-- **Docker:** single container (rTorrent + sidecar + static WebUI assets)
-- **Compose:** rTorrent container + sidecar container + nginx reverse proxy
-- **systemd:** two units — `rtorrent.service` and `rtorrentng-sidecar.service`
-- **nginx:** example config with WebSocket proxy, static asset serving, auth header forwarding
-- **Helm:** minimal chart for Kubernetes/homelab deployments
+The release evidence is split the same way:
 
-### Container strategy
-
-```
-┌─────────────────────────────────────┐
-│           nginx (reverse proxy)     │
-│  /        → webui static assets     │
-│  /api/    → sidecar :8080           │
-│  /ws      → sidecar :8080 (upgrade) │
-└─────────────────────────────────────┘
-┌─────────────────┐  ┌─────────────────┐
-│ sidecar :8080   │  │ rTorrent        │
-│ (rtorrentng)    │◄─│ SCGI socket     │
-└─────────────────┘  └─────────────────┘
-          shared volume: /run/rtorrent/rpc.sock
-          shared volume: /data (downloads)
-          shared volume: /session (rTorrent session)
-```
+- `scripts/native_engine_certification_report.sh` certifies the native engine
+  rewrite and can assert a live `/health` capability manifest.
+- `scripts/pre_engine_certification_suite.sh` and
+  `scripts/pre_engine_release_report.sh` aggregate legacy compatibility,
+  integration, security, soak, and native-engine evidence.

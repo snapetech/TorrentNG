@@ -1,6 +1,6 @@
 use rt_path::SafeRelPath;
 
-/// Top-level torrent identity. V2 and Hybrid added in Phase 12 (BEP 52).
+/// Top-level torrent identity. V2 and Hybrid are first-class BEP 52 metadata.
 #[derive(Debug, Clone)]
 pub enum TorrentMeta {
     V1(TorrentMetaV1),
