@@ -97,6 +97,7 @@ else
   mark "security review automation" "FAIL" "$security_review_report"
 fi
 run_gate "security scan" "$REPORT_DIR/security-scan-suite-$(date -u +%Y%m%dT%H%M%SZ).md" "$ROOT/scripts/security_scan.sh"
+run_gate "native engine rewrite certification" "$REPORT_DIR/native-engine-suite-$(date -u +%Y%m%dT%H%M%SZ).md" "$ROOT/scripts/native_engine_certification_report.sh"
 run_gate "pre-engine release report" "$REPORT_DIR/pre-engine-release-suite-$(date -u +%Y%m%dT%H%M%SZ).md" "$ROOT/scripts/pre_engine_release_report.sh"
 
 {
