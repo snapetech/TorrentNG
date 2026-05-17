@@ -72,7 +72,9 @@ The local mode creates deterministic fixture torrents and verifies file hashes
 across client-to-client transfers. The public mode resolves Debian, Ubuntu, and
 Fedora torrents from official project indexes at runtime and fully downloads
 them by default. Set `INTEROP_INCLUDE_LIBREOFFICE=1` to include the optional
-LibreOffice entry when its official torrent is available.
+LibreOffice entry when its official torrent is available. The full matrix,
+environment reference, report format, and release-gate expectations are
+documented in [docs/INTEROP_MATRIX.md](../../docs/INTEROP_MATRIX.md).
 
 Run native-engine certification directly:
 

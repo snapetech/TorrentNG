@@ -64,7 +64,7 @@ services:
       TZ: "${TZ:-Etc/UTC}"
       TRANSMISSION_WEB_HOME: /transmission-web-control/
       TRANSMISSION_RPC_AUTHENTICATION_REQUIRED: "false"
-      TRANSMISSION_PEER_PORT: "6883"
+      TRANSMISSION_PEER_PORT: "51413"
     networks: [interop]
 
   deluge:

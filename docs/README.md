@@ -29,6 +29,9 @@ Start here when choosing, testing, or operating an rtorrentNG engine mode.
   health, metrics, and auth surfaces.
 - [INTEGRATION_COMPAT.md](INTEGRATION_COMPAT.md) - sidecar and native
   compatibility test coverage.
+- [INTEROP_MATRIX.md](INTEROP_MATRIX.md) - Docker client matrix across
+  rusttorrentd, qBittorrent, Transmission, Deluge, rTorrent, local fixtures, and
+  official public Linux torrents.
 - [ENGINE_REWRITE_BURNDOWN.md](ENGINE_REWRITE_BURNDOWN.md) - implementation
   checklist for the native rewrite.
 

@@ -157,8 +157,17 @@ scripts/native_engine_certification_report.sh
 Run the cross-client interoperability matrix:
 
 ```sh
-scripts/interop_matrix.sh
+scripts/interop_matrix.sh --local
+scripts/interop_matrix.sh --public
 ```
+
+The matrix runs `rusttorrentd` beside qBittorrent, Transmission, Deluge,
+rTorrent, opentracker, and a fixture HTTP server. Local mode verifies
+deterministic client-to-client transfers, webseeds, explicit private peers,
+restart recovery, churn, and API facade health. Public mode resolves official
+Debian, Ubuntu, and Fedora torrents at runtime and fully downloads them by
+default. See [docs/INTEROP_MATRIX.md](docs/INTEROP_MATRIX.md) for the full
+coverage table and release-gate commands.
 
 ## Documentation
 
@@ -170,6 +179,7 @@ Start with the docs index:
 - [Track 1 rTorrent deployment](docs/DEPLOYMENT.md)
 - [Configuration](docs/CONFIGURATION.md)
 - [API reference](docs/API.md)
+- [Interop matrix](docs/INTEROP_MATRIX.md)
 - [Migration](docs/MIGRATION.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Threat model](docs/THREAT_MODEL.md)
