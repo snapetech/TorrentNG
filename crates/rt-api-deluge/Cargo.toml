@@ -15,6 +15,7 @@ tokio.workspace = true
 tracing.workspace = true
 rt-engine = { path = "../rt-engine" }
 rt-metainfo = { path = "../rt-metainfo" }
+rt-metrics = { path = "../rt-metrics" }
 rt-session = { path = "../rt-session" }
 
 [dev-dependencies]

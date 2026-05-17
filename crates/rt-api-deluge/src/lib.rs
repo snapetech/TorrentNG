@@ -6,6 +6,7 @@ use axum::{extract::State, response::IntoResponse, routing::post, Json, Router};
 use base64::{engine::general_purpose, Engine as _};
 use rt_engine::{EngineHandle, EngineTorrentLimits, EngineTorrentMetadata};
 use rt_metainfo::{parse_magnet, parse_torrent};
+use rt_metrics::{MemoryClass, MemoryLease};
 use rt_session::SessionRegistry;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -43,6 +44,28 @@ impl AppState {
             move_completed_options: Arc::new(RwLock::new(HashMap::new())),
         }
     }
+}
+
+async fn reserve_deluge_api_snapshot(
+    state: &AppState,
+    bytes: u64,
+) -> Result<Option<MemoryLease>, String> {
+    let Some(engine) = &state.engine else {
+        return Ok(None);
+    };
+    engine.reserve_memory(MemoryClass::ApiSnapshot, bytes).await
+}
+
+fn estimate_deluge_torrents_snapshot_bytes(torrent_count: usize) -> u64 {
+    (torrent_count as u64).saturating_mul(3072)
+}
+
+fn estimate_deluge_update_ui_snapshot_bytes(torrent_count: usize) -> u64 {
+    32 * 1024 + (torrent_count as u64).saturating_mul(4096)
+}
+
+fn estimate_deluge_torrent_detail_snapshot_bytes() -> u64 {
+    64 * 1024
 }
 
 #[derive(Debug, Deserialize)]
@@ -599,6 +622,18 @@ async fn update_ui(state: &AppState, params: &[Value]) -> Result<Value, String> 
         let reg = state.registry.read().await;
         reg.iter().cloned().collect::<Vec<_>>()
     };
+    let _lease = if state.engine.is_some() {
+        Some(
+            reserve_deluge_api_snapshot(
+                state,
+                estimate_deluge_update_ui_snapshot_bytes(entries.len()),
+            )
+            .await?
+            .ok_or_else(|| "api snapshot memory budget exhausted".to_owned())?,
+        )
+    } else {
+        None
+    };
     let mut metadata = std::collections::HashMap::new();
     let mut limits_by_hash = state.torrent_options.read().await.clone();
     let move_completed_by_hash = state.move_completed_options.read().await.clone();
@@ -702,6 +737,18 @@ async fn torrents_status(state: &AppState, params: &[Value]) -> Result<Value, St
         let reg = state.registry.read().await;
         reg.iter().cloned().collect::<Vec<_>>()
     };
+    let _lease = if state.engine.is_some() {
+        Some(
+            reserve_deluge_api_snapshot(
+                state,
+                estimate_deluge_torrents_snapshot_bytes(entries.len()),
+            )
+            .await?
+            .ok_or_else(|| "api snapshot memory budget exhausted".to_owned())?,
+        )
+    } else {
+        None
+    };
     let mut metadata = std::collections::HashMap::new();
     let mut limits_by_hash = state.torrent_options.read().await.clone();
     let move_completed_by_hash = state.move_completed_options.read().await.clone();
@@ -784,6 +831,15 @@ async fn torrent_status(
         reg.get(hash)
             .cloned()
             .ok_or_else(|| format!("torrent {hash} not found"))?
+    };
+    let _lease = if state.engine.is_some() {
+        Some(
+            reserve_deluge_api_snapshot(state, estimate_deluge_torrent_detail_snapshot_bytes())
+                .await?
+                .ok_or_else(|| "api snapshot memory budget exhausted".to_owned())?,
+        )
+    } else {
+        None
     };
     let meta = if let Some(engine) = &state.engine {
         engine.torrent_metadata(hash.to_owned()).await.ok()
@@ -2275,5 +2331,17 @@ mod tests {
             b"dummy"
         );
         assert_eq!(decode_deluge_torrent_data("ZHVtbXk").unwrap(), b"dummy");
+    }
+
+    #[test]
+    fn deluge_api_snapshot_estimates_scale_with_torrent_count() {
+        assert_eq!(estimate_deluge_torrents_snapshot_bytes(0), 0);
+        assert_eq!(estimate_deluge_torrents_snapshot_bytes(10), 30_720);
+        assert_eq!(estimate_deluge_update_ui_snapshot_bytes(0), 32 * 1024);
+        assert_eq!(
+            estimate_deluge_update_ui_snapshot_bytes(10),
+            32 * 1024 + 40_960
+        );
+        assert_eq!(estimate_deluge_torrent_detail_snapshot_bytes(), 64 * 1024);
     }
 }

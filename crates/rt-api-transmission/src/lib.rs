@@ -15,6 +15,7 @@ use rt_engine::{
     EngineTorrentMetadata, QueueMove,
 };
 use rt_metainfo::{parse_magnet, parse_torrent};
+use rt_metrics::{MemoryClass, MemoryLease};
 use rt_session::SessionRegistry;
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
@@ -134,6 +135,24 @@ impl AppState {
     }
 }
 
+async fn reserve_transmission_api_snapshot(
+    state: &AppState,
+    bytes: u64,
+) -> Result<Option<MemoryLease>, String> {
+    let Some(engine) = &state.engine else {
+        return Ok(None);
+    };
+    engine.reserve_memory(MemoryClass::ApiSnapshot, bytes).await
+}
+
+fn estimate_transmission_torrent_get_snapshot_bytes(
+    torrent_count: usize,
+    field_count: usize,
+) -> u64 {
+    let fields = field_count.max(1) as u64;
+    16 * 1024 + (torrent_count as u64).saturating_mul(1024 + fields.saturating_mul(384))
+}
+
 pub fn build_transmission_router(state: AppState) -> Router {
     Router::new()
         .route("/transmission/rpc", post(rpc))
@@ -219,7 +238,7 @@ async fn transmission_rpc_payload(state: &AppState, body: Value) -> Value {
         "free-space" => Ok(
             json!({"path": args.get("path").and_then(Value::as_str).unwrap_or(""), "size-bytes": 0}),
         ),
-        "torrent-get" => Ok(torrent_get(&state, &args).await),
+        "torrent-get" => torrent_get(&state, &args).await,
         "torrent-add" => torrent_add(&state, &args).await,
         "torrent-set-location" => {
             let Some(location) = args.get("location").and_then(Value::as_str) else {
@@ -861,7 +880,7 @@ async fn session_stats(state: &AppState) -> Value {
     })
 }
 
-async fn torrent_get(state: &AppState, args: &Value) -> Value {
+async fn torrent_get(state: &AppState, args: &Value) -> Result<Value, String> {
     let table_format = args
         .get("format")
         .and_then(Value::as_str)
@@ -893,6 +912,18 @@ async fn torrent_get(state: &AppState, args: &Value) -> Value {
             .filter(|entry| requested.is_empty() || requested.contains(&entry.info_hash))
             .cloned()
             .collect::<Vec<_>>()
+    };
+    let _lease = if state.engine.is_some() {
+        Some(
+            reserve_transmission_api_snapshot(
+                state,
+                estimate_transmission_torrent_get_snapshot_bytes(entries.len(), fields.len()),
+            )
+            .await?
+            .ok_or_else(|| "api snapshot memory budget exhausted".to_owned())?,
+        )
+    } else {
+        None
     };
     let mut metadata = std::collections::HashMap::new();
     let mut queue_positions = std::collections::HashMap::new();
@@ -1123,7 +1154,7 @@ async fn torrent_get(state: &AppState, args: &Value) -> Value {
     if recently_active {
         response.insert("removed".to_owned(), json!([]));
     }
-    Value::Object(response)
+    Ok(Value::Object(response))
 }
 
 fn transmission_field_needs_peers(field: &str) -> bool {
@@ -2632,6 +2663,22 @@ mod tests {
         assert_eq!(
             transmission_bool_arg(&args, "alt-speed-enabled"),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn transmission_api_snapshot_estimates_scale_with_torrent_and_field_count() {
+        assert_eq!(
+            estimate_transmission_torrent_get_snapshot_bytes(0, 0),
+            16 * 1024
+        );
+        assert_eq!(
+            estimate_transmission_torrent_get_snapshot_bytes(10, 0),
+            16 * 1024 + 10 * (1024 + 384)
+        );
+        assert!(
+            estimate_transmission_torrent_get_snapshot_bytes(10, 20)
+                > estimate_transmission_torrent_get_snapshot_bytes(10, 1)
         );
     }
 }

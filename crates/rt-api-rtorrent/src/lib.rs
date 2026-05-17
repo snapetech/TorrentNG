@@ -3,6 +3,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use base64::{engine::general_purpose, Engine as _};
 use rt_engine::EngineHandle;
 use rt_metainfo::{parse_magnet, parse_torrent};
+use rt_metrics::{MemoryClass, MemoryLease};
 use rt_session::{SessionRegistry, TorrentEntry};
 use serde_json::Value;
 use tokio::sync::RwLock;
@@ -33,6 +34,25 @@ impl AppState {
             ..Self::new(registry)
         }
     }
+}
+
+async fn reserve_rtorrent_api_snapshot(
+    state: &AppState,
+    bytes: u64,
+) -> Result<Option<MemoryLease>, String> {
+    let Some(engine) = &state.engine else {
+        return Ok(None);
+    };
+    engine
+        .reserve_memory(MemoryClass::ApiSnapshot, bytes)
+        .await?
+        .map(Some)
+        .ok_or_else(|| "api snapshot memory budget exhausted".to_owned())
+}
+
+fn estimate_rtorrent_multicall_snapshot_bytes(torrent_count: usize, command_count: usize) -> u64 {
+    let commands = command_count.max(1) as u64;
+    8 * 1024 + (torrent_count as u64).saturating_mul(512 + commands.saturating_mul(160))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -229,6 +249,12 @@ async fn d_multicall(state: &AppState, params: &[RtValue]) -> Result<RtValue, St
         .filter_map(RtValue::as_str)
         .map(|command| command.trim_end_matches('=').to_owned())
         .collect::<Vec<_>>();
+    let torrent_count = state.registry.read().await.len();
+    let _lease = reserve_rtorrent_api_snapshot(
+        state,
+        estimate_rtorrent_multicall_snapshot_bytes(torrent_count, commands.len()),
+    )
+    .await?;
     let registry = state.registry.read().await;
     let custom = state.custom.read().await;
     let mut rows = Vec::new();
@@ -764,6 +790,19 @@ mod tests {
         let entry = registry.iter().next().unwrap();
         assert_eq!(entry.name, "raw-test");
         assert_eq!(entry.state, TorrentState::Downloading);
+    }
+
+    #[test]
+    fn rtorrent_api_snapshot_estimate_scales_with_torrents_and_commands() {
+        assert_eq!(estimate_rtorrent_multicall_snapshot_bytes(0, 0), 8 * 1024);
+        assert_eq!(
+            estimate_rtorrent_multicall_snapshot_bytes(10, 0),
+            8 * 1024 + 10 * (512 + 160)
+        );
+        assert!(
+            estimate_rtorrent_multicall_snapshot_bytes(10, 20)
+                > estimate_rtorrent_multicall_snapshot_bytes(10, 1)
+        );
     }
 
     fn single_file_torrent(name: &str, length: i64) -> Vec<u8> {

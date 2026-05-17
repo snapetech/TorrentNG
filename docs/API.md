@@ -96,6 +96,15 @@ The qBittorrent facade applies the same budget to `/api/qb/v2/torrents/info`
 and `/api/qb/v2/sync/maindata`, because those endpoints clone the largest
 compatibility snapshots under high torrent counts.
 
+The Deluge facade applies the same budget to `web.update_ui`,
+`core.get_torrents_status`, and `core.get_torrent_status`.
+The Transmission facade applies it to `torrent-get`, scaled by torrent count
+and requested field count. The rTorrent XMLRPC facade applies it to
+`d.multicall`/`d.multicall2`, scaled by torrent count and requested command
+count.
+The rTorrent XMLRPC facade applies it to `d.multicall`/`d.multicall2`, scaled
+by torrent count and requested command count.
+
 #### TorrentRow fields
 
 ```json

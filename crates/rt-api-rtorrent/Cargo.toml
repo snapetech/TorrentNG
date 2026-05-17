@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 rt-engine = { path = "../rt-engine" }
 rt-metainfo = { path = "../rt-metainfo" }
+rt-metrics = { path = "../rt-metrics" }
 rt-session = { path = "../rt-session" }
 base64.workspace = true
 serde_json.workspace = true
