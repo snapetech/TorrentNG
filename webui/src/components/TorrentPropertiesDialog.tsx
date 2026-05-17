@@ -146,7 +146,14 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
                   {allTags.length > 0 && (
                     <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap', marginTop: 7 }}>
                       {allTags.map(tag => (
-                        <button key={tag} disabled={busy} onClick={() => setTagsText(Array.from(new Set([...tags, tag])).join(','))} style={{ ...chipButton, opacity: busy ? 0.55 : 1, cursor: busy ? 'not-allowed' : 'pointer' }}>{tag}</button>
+                        <button
+                          key={tag}
+                          className="rtng-tag-chip"
+                          data-active={tags.includes(tag) ? 'true' : 'false'}
+                          disabled={busy}
+                          onClick={() => setTagsText(Array.from(new Set([...tags, tag])).join(','))}
+                          style={{ ...chipButton, opacity: busy ? 0.55 : 1, cursor: busy ? 'not-allowed' : 'pointer' }}
+                        >{tag}</button>
                       ))}
                     </div>
                   )}
@@ -175,7 +182,15 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
                   <EmptyState>No trackers configured.</EmptyState>
                 )}
                 {trackers.map(tracker => (
-                  <div key={tracker.url} style={{ borderBottom: '1px solid var(--border)', padding: '8px 0' }}>
+                  <div
+                    key={tracker.url}
+                    className="rtng-properties-row"
+                    data-tone={tracker.message ? 'warn' : 'ok'}
+                    style={{
+                      border: '1px solid var(--border)', borderRadius: 7, padding: 9,
+                      marginBottom: 7, background: tracker.message ? 'color-mix(in srgb, var(--warning) 7%, var(--surface))' : 'var(--surface)',
+                    }}
+                  >
                     {editingTracker?.url === tracker.url ? (
                       <div className="rtng-action-grid-3" style={{ display: 'grid', gridTemplateColumns: '1fr auto auto', gap: 7 }}>
                         <input value={trackerUrl} onChange={e => setTrackerUrl(e.target.value)} disabled={busy} style={{ ...INPUT, fontFamily: 'monospace' }} />
@@ -275,7 +290,11 @@ function FileRow({ file, busy, renaming, name, onName, onRenameStart, onRenameCa
       ? { label: 'High', color: 'var(--accent)' }
       : { label: 'Normal', color: 'var(--success)' }
   return (
-    <div style={{ border: '1px solid var(--border)', borderRadius: 7, padding: 9, background: 'var(--surface)' }}>
+    <div
+      className="rtng-properties-row"
+      data-tone={file.priority === 0 ? 'muted' : pct >= 100 ? 'ok' : 'active'}
+      style={{ border: '1px solid var(--border)', borderRadius: 7, padding: 9, background: 'var(--surface)' }}
+    >
       {renaming ? (
         <div className="rtng-action-grid-3" style={{ display: 'grid', gridTemplateColumns: '1fr auto auto', gap: 7 }}>
           <input value={name} onChange={e => onName(e.target.value)} style={INPUT} />
@@ -314,7 +333,7 @@ function FileRow({ file, busy, renaming, name, onName, onRenameStart, onRenameCa
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
-  return <label style={{
+  return <label className="rtng-form-card" style={{
     display: 'grid', gap: 6, color: 'var(--faint)', fontSize: 11, fontWeight: 700,
     textTransform: 'uppercase', background: 'var(--surface)', border: '1px solid var(--border)',
     borderRadius: 7, padding: 10,
@@ -367,7 +386,10 @@ function TabCount({ children }: { children: React.ReactNode }) {
 }
 
 function Info({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
-  return <div><div style={{ color: 'var(--faint)', fontSize: 10, textTransform: 'uppercase', marginBottom: 3 }}>{label}</div><div style={{ fontFamily: mono ? 'monospace' : undefined, overflowWrap: 'anywhere' }}>{value}</div></div>
+  return <div className="rtng-metric-tile" style={{ border: '1px solid var(--border)', borderRadius: 7, background: 'var(--surface)', padding: 9 }}>
+    <div style={{ color: 'var(--faint)', fontSize: 10, textTransform: 'uppercase', marginBottom: 3 }}>{label}</div>
+    <div style={{ fontFamily: mono ? 'monospace' : undefined, overflowWrap: 'anywhere' }}>{value}</div>
+  </div>
 }
 
 function smallButton(color: string, disabled = false): React.CSSProperties {

@@ -88,7 +88,14 @@ export function BulkEditDialog({ hashes, onClose }: Props) {
             {allTags.length > 0 && (
               <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap', marginTop: 7 }}>
                 {allTags.map(tag => (
-                  <button key={tag} disabled={busy} onClick={() => setTags(Array.from(new Set([...tagList, tag])).join(','))} style={{ ...chipButton, opacity: busy ? 0.55 : 1, cursor: busy ? 'not-allowed' : 'pointer' }}>{tag}</button>
+                  <button
+                    key={tag}
+                    className="rtng-tag-chip"
+                    data-active={tagList.includes(tag) ? 'true' : 'false'}
+                    disabled={busy}
+                    onClick={() => setTags(Array.from(new Set([...tagList, tag])).join(','))}
+                    style={{ ...chipButton, opacity: busy ? 0.55 : 1, cursor: busy ? 'not-allowed' : 'pointer' }}
+                  >{tag}</button>
                 ))}
               </div>
             )}
@@ -114,7 +121,7 @@ export function BulkEditDialog({ hashes, onClose }: Props) {
             </div>
           </Field>
 
-          <div style={{
+          <div className="rtng-form-card" style={{
             display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10,
             background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 7, padding: 10,
           }}>
@@ -138,7 +145,7 @@ export function BulkEditDialog({ hashes, onClose }: Props) {
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
-  return <label style={{
+  return <label className="rtng-form-card" style={{
     display: 'grid', gap: 6, color: 'var(--faint)', fontSize: 11, fontWeight: 700,
     textTransform: 'uppercase', background: 'var(--surface)', border: '1px solid var(--border)',
     borderRadius: 7, padding: 10,
