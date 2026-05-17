@@ -177,5 +177,6 @@ if REPORT_DIR="$report_dir" BENCHMARK_DIR="$benchmark_dir" \
   exit 1
 fi
 grep -q 'storage certification index | FAIL' "$report_dir/post-soak-release-selftest-fail.md"
+REPORT_DIR="$report_dir" "$ROOT/scripts/storage_release_certification.sh" --help >/dev/null 2>&1
 
 echo "storage certification self-test: PASS"

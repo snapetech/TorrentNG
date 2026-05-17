@@ -162,7 +162,9 @@ The following items are still release targets:
 - The release hardware report records real-device seed-read locality, bounded
   hot-file descriptor reuse, recheck runtime progress, elevator throughput, and
   optional syscall counts (`TNG_STORAGE_SYSCALLS=1`) across one or more target
-  mounts.
+  mounts. `scripts/storage_release_certification.sh` runs that report together
+  with `io_uring` graduation, real-root move/import evidence, and index
+  generation.
 
 ## Correctness Rules
 

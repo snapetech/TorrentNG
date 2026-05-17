@@ -94,6 +94,8 @@ Implemented and covered by automated tests:
   move/import evidence as separate indexed categories, and
   `scripts/certification_status.sh` reports each category separately before
   `scripts/post_soak_release_gate.sh` requires all three categories to pass.
+- `scripts/storage_release_certification.sh` runs hardware matrix,
+  `io_uring`, move/import, and index generation as one release evidence suite.
 - Scheduler read returns can keep frame ownership through `scheduled_read_owned`;
   compatibility `Bytes` consume ordinary frame payloads without copy and copy
   only when a registered slot lease must be returned to the uring backend.
@@ -109,7 +111,7 @@ Implemented and covered by automated tests:
 | --- | --- | --- | --- |
 | Deterministic LVM PV placement control | The kspls0 extent probe shows the pool can allocate independent files on multiple rotational PVs, but ordinary path writes still do not let TorrentNG choose a specific PV. | Cross-PV behavior inside the LVM pool is allocator-dependent, so path-level scheduling cannot promise physical-drive affinity. | Use LVM extent mapping for evidence, or add lower-level PV-targeted probes only if release claims require deterministic per-drive placement. |
 | `io_uring` hardware graduation | `UringBackend` now returns owned reads from registered frame slots when available and exports `fixed_buffer_strategy=frame_pool_slots`; `auto` still selects the conservative `pread` baseline. | `io_uring` may regress on restricted kernels, filesystems, or storage hardware despite the lower-copy read path. | Run `scripts/storage_uring_graduation.sh /target/root` with selected-backend, fixed-buffer, registered-file, throughput thresholds, and `TNG_STORAGE_URING_REQUIRE_FRAME_POOL_SLOTS=1` before making `uring` eligible for automatic selection. |
-| Move/import certification | The certification runner now supports real-root fixture execution and indexed PASS/FAIL evidence, but representative multi-TB operator evidence is still host/run dependent. | Large library move/import claims should not be made from unit tests alone. | Run `TNG_STORAGE_MOVE_IMPORT_ROOT=/target/root TNG_STORAGE_MOVE_IMPORT_FILES=... TNG_STORAGE_MOVE_IMPORT_MIB_PER_FILE=... scripts/storage_move_import_certification.sh` on the target storage roots and publish the generated report. |
+| Move/import certification | The certification runner supports real-root fixture execution and indexed PASS/FAIL evidence, and the release wrapper includes it by default. Representative multi-TB operator evidence is still host/run dependent. | Large library move/import claims should not be made from unit tests alone. | Run `TNG_STORAGE_MOVE_IMPORT_FILES=... TNG_STORAGE_MOVE_IMPORT_MIB_PER_FILE=... scripts/storage_release_certification.sh /target/root` on target storage roots and publish the generated report. |
 
 ## Verification Commands
 

@@ -44,7 +44,7 @@ and the remaining work needed before claiming the feature complete.
 | Priority | Area | What remains | Why it matters | First concrete task |
 | --- | --- | --- | --- | --- |
 | P1 | `io_uring` fixed-buffer/frame integration | `UringBackend` can return owned reads backed by registered frame slots and reports `fixed_buffer_strategy=frame_pool_slots` when the kernel accepts registered buffers. The graduation script can enforce `TNG_STORAGE_URING_REQUIRE_FRAME_POOL_SLOTS=1`. | Operators can distinguish true registered-frame reads from fallback `pread`; `uring` still needs target-hardware proof before it can become an automatic default. | Benchmark `pread` vs `uring` on target hardware with selected-backend, fixed-buffer, registered-file, and throughput gates before changing `auto`. |
-| P2 | Hardware evidence automation | Storage hardware, `io_uring`, and move/import certification scripts now update a generated certification report index, and the post-soak gate requires PASS rows for all three evidence categories. The hardware matrix includes seed-read locality, hot-fd reuse, recheck runtime progress, elevator throughput, optional syscall counts, and optional LVM/PV extent evidence. Operator target roots and hardware runs are still host supplied. | Production claims still need actual HDD/NVMe/network filesystem evidence, not unit tests alone. | Run the certification scripts on target hardware and publish the generated `certification/reports/storage-certification-index.md` with the release artifacts. |
+| P2 | Hardware evidence automation | `scripts/storage_release_certification.sh` runs the storage hardware matrix, `io_uring` graduation, real-root move/import fixture, and generated certification report index as one release evidence suite. The hardware matrix includes seed-read locality, hot-fd reuse, recheck runtime progress, elevator throughput, optional syscall counts, and optional LVM/PV extent evidence. Operator target roots and hardware runs are still host supplied. | Production claims still need actual HDD/NVMe/network filesystem evidence, not unit tests alone. | Run `scripts/storage_release_certification.sh /mnt/nvme /mnt/hdd` on target hardware and publish the generated reports with release artifacts. |
 | P2 | Physical PV affinity | LVM evidence can show which PVs received extents, but TorrentNG does not control ordinary write placement within an LV. | Avoids overclaiming per-spindle scheduling when the allocator owns physical placement. | Keep this as evidence-only unless the product needs explicit PV-targeted placement. |
 
 ## Verification Baseline
@@ -67,4 +67,5 @@ Before claiming production storage performance:
 TNG_STORAGE_REQUIRE_HDD_5X=1 scripts/storage_hardware_matrix.sh /mnt/nvme /mnt/hdd
 scripts/storage_uring_graduation.sh /mnt/target
 TNG_STORAGE_MOVE_IMPORT_ROOT=/mnt/target scripts/storage_move_import_certification.sh
+scripts/storage_release_certification.sh /mnt/nvme /mnt/hdd
 ```

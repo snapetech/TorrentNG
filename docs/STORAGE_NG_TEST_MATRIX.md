@@ -19,6 +19,7 @@ For release hardware evidence across multiple mounts, run:
 
 ```sh
 scripts/storage_hardware_matrix.sh /mnt/nvme /mnt/hdd
+scripts/storage_release_certification.sh /mnt/nvme /mnt/hdd
 ```
 
 The hardware matrix writes a markdown report under `certification/reports/`,
@@ -42,6 +43,7 @@ per-case syscall counters when `strace` is available.
 | Native API metrics | Prometheus projection for storage backend, frame/fd runtime, scheduler counters, bounded peer-cache pressure, peer buffer bytes, resource-governor classes | `cargo test -p rt-api-native render_metrics_includes_engine_stats` |
 | Move/import executor | plan admission, symlink-safe no-overwrite moves, copy-based move source cleanup, hardlink-or-copy import, recursive directory copy/delete, rename/copy/import symlink rejection, symlink-safe delete, staged rollback cleanup, storage-root confinement, optional real-root fixture execution | `scripts/storage_move_import_certification.sh`; set `TNG_STORAGE_MOVE_IMPORT_ROOT` for hardware-root evidence |
 | Certification index | Generated storage evidence keeps hardware, `io_uring`, and move/import rows independent; certification status reports each indexed category; post-soak release gates require PASS evidence for all three categories instead of accepting one generic storage pass | `scripts/storage_certification_selftest.sh` |
+| Release evidence wrapper | Hardware matrix, `io_uring` graduation, real-root move/import, and certification index are run as one operator command | `scripts/storage_release_certification.sh /target/root [...]` |
 
 ## Runtime Configuration Matrix
 
@@ -103,6 +105,8 @@ TNG_STORAGE_REQUIRE_HDD_5X=1 scripts/storage_hardware_matrix.sh /mnt/nvme /mnt/h
 - `scripts/storage_ng_feature_matrix.sh` passes locally.
 - `scripts/storage_certification_selftest.sh` passes and proves FAIL reports are
   not indexed as passing storage evidence.
+- `scripts/storage_release_certification.sh /target/root [...]` passes on
+  release hardware before publishing storage performance claims.
 - Real-device probes pass on at least one HDD and one SSD/NVMe host before
   claiming production storage performance.
 - `clean_shutdown = true` is only trusted when the configured durability mode
