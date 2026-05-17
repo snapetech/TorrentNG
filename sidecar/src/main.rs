@@ -50,7 +50,12 @@ async fn main() -> Result<()> {
         let ua = cfg.rtorrent.user_agent.clone();
         tokio::spawn(async move {
             if let Err(e) = rt_ua.set_user_agent(&ua).await {
-                tracing::warn!("could not set user agent after startup: {e}");
+                tracing::warn!(
+                    component = "rtorrent",
+                    operation = "set_user_agent",
+                    error = %e,
+                    "could not set user agent after startup"
+                );
             }
         });
     }
