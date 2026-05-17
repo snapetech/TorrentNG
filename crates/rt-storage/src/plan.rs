@@ -284,15 +284,17 @@ fn ensure_destination_available(path: &Path) -> Result<(), StorageError> {
 }
 
 fn copy_verify(source: &Path, destination: &Path, expected_bytes: u64) -> Result<(), StorageError> {
-    std::fs::copy(source, destination)
-        .map_err(|e| StorageError::io(destination.display().to_string(), e))?;
+    if source.is_dir() {
+        copy_dir_recursive(source, destination)?;
+    } else {
+        std::fs::copy(source, destination)
+            .map_err(|e| StorageError::io(destination.display().to_string(), e))?;
+    }
     verify_path_len(destination, expected_bytes)
 }
 
 fn verify_path_len(path: &Path, expected_bytes: u64) -> Result<(), StorageError> {
-    let actual = std::fs::metadata(path)
-        .map_err(|e| StorageError::io(path.display().to_string(), e))?
-        .len();
+    let actual = path_content_len(path)?;
     if actual == expected_bytes {
         Ok(())
     } else {
@@ -301,6 +303,43 @@ fn verify_path_len(path: &Path, expected_bytes: u64) -> Result<(), StorageError>
             expected: expected_bytes as usize,
             actual: actual as usize,
         })
+    }
+}
+
+fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), StorageError> {
+    std::fs::create_dir_all(destination)
+        .map_err(|e| StorageError::io(destination.display().to_string(), e))?;
+    for entry in
+        std::fs::read_dir(source).map_err(|e| StorageError::io(source.display().to_string(), e))?
+    {
+        let entry = entry.map_err(|e| StorageError::io(source.display().to_string(), e))?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        if source_path.is_dir() {
+            copy_dir_recursive(&source_path, &destination_path)?;
+        } else {
+            ensure_destination_available(&destination_path)?;
+            std::fs::copy(&source_path, &destination_path)
+                .map_err(|e| StorageError::io(destination_path.display().to_string(), e))?;
+        }
+    }
+    Ok(())
+}
+
+fn path_content_len(path: &Path) -> Result<u64, StorageError> {
+    let metadata =
+        std::fs::metadata(path).map_err(|e| StorageError::io(path.display().to_string(), e))?;
+    if metadata.is_dir() {
+        let mut total = 0u64;
+        for entry in
+            std::fs::read_dir(path).map_err(|e| StorageError::io(path.display().to_string(), e))?
+        {
+            let entry = entry.map_err(|e| StorageError::io(path.display().to_string(), e))?;
+            total = total.saturating_add(path_content_len(&entry.path())?);
+        }
+        Ok(total)
+    } else {
+        Ok(metadata.len())
     }
 }
 
@@ -533,5 +572,56 @@ mod tests {
 
         assert_eq!(std::fs::read(&source).unwrap(), b"data");
         assert_eq!(std::fs::read(&destination).unwrap(), b"data");
+    }
+
+    #[test]
+    fn execute_copy_verify_plan_copies_directory_tree_and_verifies_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let nested = source.join("nested");
+        let destination = dir.path().join("dest");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(source.join("a.bin"), b"abcd").unwrap();
+        std::fs::write(nested.join("b.bin"), b"ef").unwrap();
+
+        let plan = StoragePlan {
+            dry_run: false,
+            can_apply: true,
+            issues: Vec::new(),
+            steps: vec![StoragePlanStep {
+                action: PlannedStorageAction::CopyVerifyRename,
+                source: Some(source.clone()),
+                destination: Some(destination.clone()),
+                bytes: 6,
+            }],
+            rollback_steps: Vec::new(),
+        };
+
+        execute_storage_plan(&plan).unwrap();
+
+        assert_eq!(std::fs::read(source.join("a.bin")).unwrap(), b"abcd");
+        assert_eq!(std::fs::read(destination.join("a.bin")).unwrap(), b"abcd");
+        assert_eq!(
+            std::fs::read(destination.join("nested/b.bin")).unwrap(),
+            b"ef"
+        );
+    }
+
+    #[test]
+    fn execute_delete_plan_removes_directory_tree_after_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("delete-me");
+        std::fs::create_dir_all(target.join("nested")).unwrap();
+        std::fs::write(target.join("nested/file.bin"), b"data").unwrap();
+        let plan = plan_delete(&DeletePlanRequest {
+            target: target.clone(),
+            bytes: 4,
+            dry_run: false,
+            dry_run_approved: true,
+        });
+
+        execute_storage_plan(&plan).unwrap();
+
+        assert!(!target.exists());
     }
 }

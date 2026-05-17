@@ -16,6 +16,9 @@ Environment:
   TNG_STORAGE_BENCH_READS        repeated hot-file reads (default: 10000)
   TNG_STORAGE_REQUIRE_HDD_5X     require >=5x elevator wall-clock on HDD paths
   TNG_STORAGE_SYSCALLS           set to 1 to collect strace syscall counts
+  TNG_STORAGE_LVM_EXTENTS        set to 1 to map a probe file through dm/LVM extents
+  TNG_STORAGE_LVM_PROBE_MB       LVM extent probe file size (default: 256)
+  TNG_STORAGE_LVM_PROBE_FILES    number of LVM probe files (default: 4)
   TNG_STORAGE_MATRIX_REPORT      report path override
 USAGE
 }
@@ -73,6 +76,123 @@ profile_for_rota() {
   esac
 }
 
+sudo_if_available() {
+  if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+    sudo "$@"
+  else
+    "$@"
+  fi
+}
+
+append_lvm_extent_probe() {
+  local target="$1"
+  local source="$2"
+  local root_block="$3"
+  local probe_mb="${TNG_STORAGE_LVM_PROBE_MB:-256}"
+  local probe_files="${TNG_STORAGE_LVM_PROBE_FILES:-4}"
+  local clean_source="${source%%[*}"
+  [[ "${TNG_STORAGE_LVM_EXTENTS:-0}" == "1" ]] || return 0
+  [[ -b "$clean_source" && -b "$root_block" ]] || {
+    echo
+    echo "LVM/PV extent probe skipped: source or root block is not a block device."
+    return 0
+  }
+  command -v filefrag >/dev/null 2>&1 || {
+    echo
+    echo "LVM/PV extent probe skipped: filefrag not found."
+    return 0
+  }
+  command -v dmsetup >/dev/null 2>&1 || {
+    echo
+    echo "LVM/PV extent probe skipped: dmsetup not found."
+    return 0
+  }
+
+  local probe_dir table extents devices
+  probe_dir="$(mktemp -d "$target/tng-lvm-extent-probe-XXXXXX")"
+  table="$tmpdir/lvm-table-$(basename "$target" | tr -c 'A-Za-z0-9_.-' '_')"
+  extents="$tmpdir/lvm-extents-$(basename "$target" | tr -c 'A-Za-z0-9_.-' '_')"
+  devices="$tmpdir/lvm-devices-$(basename "$target" | tr -c 'A-Za-z0-9_.-' '_')"
+
+  local probes=()
+  for ((i = 0; i < probe_files; i++)); do
+    local probe="$probe_dir/probe-$i.bin"
+    dd if=/dev/zero of="$probe" bs=1M count="$probe_mb" status=none
+    probes+=("$probe")
+  done
+  sync "$probe_dir" 2>/dev/null || sync
+  if ! sudo_if_available dmsetup table "$clean_source" >"$table" 2>/dev/null; then
+    echo
+    echo "LVM/PV extent probe skipped: dmsetup table unavailable for $clean_source."
+    rm -rf "$probe_dir"
+    return 0
+  fi
+  if ! sudo_if_available filefrag -b512 -v "${probes[@]}" >"$extents" 2>/dev/null; then
+    echo
+    echo "LVM/PV extent probe skipped: filefrag unavailable for probe file."
+    rm -rf "$probe_dir"
+    return 0
+  fi
+  lsblk -rno MAJ:MIN,NAME,ROTA,TYPE >"$devices" 2>/dev/null || true
+
+  echo
+  echo "LVM/PV extent probe:"
+  echo
+  echo "| File | Extent | LV sector | Sectors | PV | PV sector | Rotational |"
+  echo "| --- | ---: | ---: | ---: | --- | ---: | ---: |"
+  awk -v table="$table" -v devices="$devices" '
+    BEGIN {
+      while ((getline line < devices) > 0) {
+        split(line, d, " ");
+        dev_name[d[1]] = d[2];
+        dev_rota[d[1]] = d[3];
+      }
+      close(devices);
+      while ((getline line < table) > 0) {
+        split(line, t, " ");
+        if (t[3] == "linear") {
+          n++;
+          lv_start[n] = t[1] + 0;
+          lv_len[n] = t[2] + 0;
+          pv_dev[n] = t[4];
+          pv_start[n] = t[5] + 0;
+        }
+      }
+      close(table);
+    }
+    /^File size of / {
+      file = $4;
+      sub(/^.*\//, "", file);
+    }
+    /^[[:space:]]*[0-9]+:/ {
+      extent = $1;
+      gsub(":", "", extent);
+      phys = $4;
+      gsub(":", "", phys);
+      split(phys, range, /\.\./);
+      lv_sector = range[1] + 0;
+      sectors = $5;
+      gsub(":", "", sectors);
+      mapped = 0;
+      for (i = 1; i <= n; i++) {
+        if (lv_sector >= lv_start[i] && lv_sector < lv_start[i] + lv_len[i]) {
+          pv_sector = pv_start[i] + (lv_sector - lv_start[i]);
+          dev = pv_dev[i];
+          name = (dev in dev_name) ? "/dev/" dev_name[dev] : dev;
+          rota = (dev in dev_rota) ? dev_rota[dev] : "unknown";
+          printf "| %s | %s | %s | %s | %s | %s | %s |\n", file, extent, lv_sector, sectors, name, pv_sector, rota;
+          mapped = 1;
+          break;
+        }
+      }
+      if (!mapped) {
+        printf "| %s | %s | %s | %s | unmapped |  | unknown |\n", file, extent, lv_sector, sectors;
+      }
+    }
+  ' "$extents" | sed -n '1,32p'
+  rm -rf "$probe_dir"
+}
+
 append_summary() {
   local log="$1"
   {
@@ -115,6 +235,7 @@ for target in "$@"; do
     echo "| root block | ${root_block:-unknown} |"
     echo "| rotational | ${rota:-unknown} |"
     echo "| inferred profile | $profile |"
+    append_lvm_extent_probe "$target" "$source" "$root_block"
     echo
   } >>"$OUT"
 

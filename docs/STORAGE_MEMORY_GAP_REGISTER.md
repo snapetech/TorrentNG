@@ -38,7 +38,8 @@ Implemented and covered by automated tests:
   device queue semaphore for all positioned disk submissions.
 - Move/import/delete plans have a conservative executor with no-overwrite
   admission, parent creation, copy-length verification, staged rollback cleanup,
-  hardlink-or-copy import, and dry-run no-op behavior.
+  recursive directory copy/delete support, hardlink-or-copy import, and dry-run
+  no-op behavior.
 - Real-device storage reports include explicit `pread` and forced `uring`
   backend roundtrips with selected backend, fallback reason, registered-file
   support, fixed-buffer support, batch length, and fixed-buffer length.
@@ -52,7 +53,7 @@ Implemented and covered by automated tests:
 | --- | --- | --- | --- |
 | LVM physical-drive placement evidence | The kspls0 HDD evidence covers the media pool as one logical device (`/dev/dm-0`) over rotational PVs, not deterministic placement on individual physical disks. | Cross-PV behavior inside the LVM pool may differ from logical-device scheduler behavior visible through normal paths. | Add an LVM extent-mapping probe or lower-level PV-targeted benchmark if release claims need per-physical-drive evidence. |
 | `io_uring` frame-pool slot pinning | `UringBackend` uses worker-owned fixed buffers when available, but the global frame pool does not yet hand out stable registered buffer slots. | Extra copies remain in the uring path, and fixed-buffer metrics can overstate how much of the full storage path is zero-copy. | Add frame-pool slot leases through the backend API after hardware reports prove `uring` should graduate from explicit opt-in. |
-| Move/import certification | Planning and a conservative executor exist, but this remains outside the per-block hot path and still needs representative multi-TB soak evidence. | Large library moves can still be operationally risky without full end-to-end hardware and rollback reports. | Run dedicated move/import certification on representative multi-TB trees and publish rollback/failure reports. |
+| Move/import certification | Planning, a conservative executor, and a local certification runner exist, but representative multi-TB hardware soak evidence is still required for release claims. | Large library moves can still be operationally risky without full end-to-end hardware and rollback reports. | Run `scripts/storage_move_import_certification.sh`, then repeat move/import certification on representative multi-TB trees and publish rollback/failure reports. |
 
 ## Verification Commands
 
@@ -66,6 +67,7 @@ cargo test -p rt-metrics resource::tests
 cargo test -p rt-api-native render_metrics_includes_engine_stats
 scripts/storage_ng_feature_matrix.sh
 scripts/api_facade_certification.sh
+scripts/storage_move_import_certification.sh
 ```
 
 Use these before claiming production storage performance:

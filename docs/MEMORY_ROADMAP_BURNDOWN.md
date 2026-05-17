@@ -21,7 +21,8 @@ Status as of 2026-05-17.
 - [x] Slow-disk plus fast-peer backpressure evidence proxy.
   - Storage scale tests exercise queue-full backpressure rather than unbounded queue growth under saturated hash/disk paths.
 - [x] Conservative move/import/delete executor below the storage planner.
-  - Applies only plans that passed admission, never overwrites destinations, creates parents, verifies copy lengths, and rolls back staged copy files on failure.
+  - Applies only plans that passed admission, never overwrites destinations, creates parents, verifies file or directory copy lengths, supports approved recursive delete, and rolls back staged copy files/directories on failure.
+  - `scripts/storage_move_import_certification.sh` records the local planner/executor and full storage suite evidence under `certification/reports/`.
 
 - [x] Current HDD/NVMe real-device release evidence with required HDD 5x target.
   - Local NVMe/SSD report: `certification/reports/storage-hardware-20260517T201259Z.md`.
