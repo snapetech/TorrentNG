@@ -728,6 +728,20 @@ pub async fn torrents_trackers(
     };
     match engine.torrent_metadata(hash).await {
         Ok(meta) => {
+            let _lease = match reserve_qbit_api_snapshot(
+                &state,
+                estimate_qbit_tracker_snapshot_bytes(meta.trackers.len()),
+            )
+            .await
+            {
+                Ok(Some(lease)) => Some(lease),
+                Ok(None) | Err(_) => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(Vec::<QbTrackerInfo>::new()),
+                    )
+                }
+            };
             let trackers = meta
                 .trackers
                 .into_iter()
@@ -880,6 +894,24 @@ pub async fn torrents_files(
     };
     match engine.torrent_metadata(hash).await {
         Ok(meta) => {
+            let _lease = match reserve_qbit_api_snapshot(
+                &state,
+                estimate_qbit_metadata_snapshot_bytes(
+                    meta.files.len(),
+                    meta.piece_count as usize,
+                    meta.webseeds.len(),
+                ),
+            )
+            .await
+            {
+                Ok(Some(lease)) => Some(lease),
+                Ok(None) | Err(_) => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(Vec::<QbFileInfo>::new()),
+                    )
+                }
+            };
             let files = meta
                 .files
                 .into_iter()
@@ -914,7 +946,20 @@ pub async fn torrents_webseeds(
         return (StatusCode::OK, Json(Vec::<String>::new()));
     };
     match engine.torrent_metadata(hash).await {
-        Ok(meta) => (StatusCode::OK, Json(meta.webseeds)),
+        Ok(meta) => {
+            let _lease = match reserve_qbit_api_snapshot(
+                &state,
+                estimate_qbit_metadata_snapshot_bytes(0, 0, meta.webseeds.len()),
+            )
+            .await
+            {
+                Ok(Some(lease)) => Some(lease),
+                Ok(None) | Err(_) => {
+                    return (StatusCode::SERVICE_UNAVAILABLE, Json(Vec::<String>::new()))
+                }
+            };
+            (StatusCode::OK, Json(meta.webseeds))
+        }
         Err(_) if exists => (StatusCode::OK, Json(Vec::<String>::new())),
         Err(_) => (StatusCode::NOT_FOUND, Json(Vec::<String>::new())),
     }
@@ -940,6 +985,17 @@ pub async fn torrents_piece_states(
     };
     match engine.torrent_metadata(hash).await {
         Ok(meta) => {
+            let _lease = match reserve_qbit_api_snapshot(
+                &state,
+                estimate_qbit_metadata_snapshot_bytes(0, meta.piece_states.len(), 0),
+            )
+            .await
+            {
+                Ok(Some(lease)) => Some(lease),
+                Ok(None) | Err(_) => {
+                    return (StatusCode::SERVICE_UNAVAILABLE, Json(Vec::<i32>::new()))
+                }
+            };
             let states = meta
                 .piece_states
                 .into_iter()
@@ -971,7 +1027,20 @@ pub async fn torrents_piece_hashes(
         return (StatusCode::OK, Json(Vec::<String>::new()));
     };
     match engine.torrent_metadata(hash).await {
-        Ok(meta) => (StatusCode::OK, Json(meta.piece_hashes)),
+        Ok(meta) => {
+            let _lease = match reserve_qbit_api_snapshot(
+                &state,
+                estimate_qbit_metadata_snapshot_bytes(0, meta.piece_hashes.len(), 0),
+            )
+            .await
+            {
+                Ok(Some(lease)) => Some(lease),
+                Ok(None) | Err(_) => {
+                    return (StatusCode::SERVICE_UNAVAILABLE, Json(Vec::<String>::new()))
+                }
+            };
+            (StatusCode::OK, Json(meta.piece_hashes))
+        }
         Err(_) if exists => (StatusCode::OK, Json(Vec::<String>::new())),
         Err(_) => (StatusCode::NOT_FOUND, Json(Vec::<String>::new())),
     }
@@ -1007,6 +1076,19 @@ pub async fn torrents_properties(
             StatusCode::NOT_FOUND,
             Json(default_torrent_properties(String::new())),
         );
+    };
+    let _lease = if state.engine.is_some() {
+        match reserve_qbit_api_snapshot(&state, estimate_qbit_properties_snapshot_bytes()).await {
+            Ok(Some(lease)) => Some(lease),
+            Ok(None) | Err(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(default_torrent_properties(String::new())),
+                )
+            }
+        }
+    } else {
+        None
     };
 
     let (piece_size, pieces_num) = if let Some(engine) = &state.engine {
@@ -1106,6 +1188,24 @@ pub async fn torrents_categories(State(state): State<AppState>) -> impl IntoResp
         };
         categories.insert(category.to_owned(), serde_json::to_value(info).unwrap());
     }
+    let _lease = if state.engine.is_some() {
+        match reserve_qbit_api_snapshot(
+            &state,
+            estimate_qbit_label_snapshot_bytes(categories.len()),
+        )
+        .await
+        {
+            Ok(Some(lease)) => Some(lease),
+            Ok(None) | Err(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::Value::Object(serde_json::Map::new())),
+                )
+            }
+        }
+    } else {
+        None
+    };
     (StatusCode::OK, Json(serde_json::Value::Object(categories)))
 }
 
@@ -1118,6 +1218,16 @@ pub async fn torrents_tags(State(state): State<AppState>) -> impl IntoResponse {
             tags.extend(entry.tags.iter().filter(|tag| !tag.is_empty()).cloned());
         }
     }
+    let _lease = if state.engine.is_some() {
+        match reserve_qbit_api_snapshot(&state, estimate_qbit_label_snapshot_bytes(tags.len()))
+            .await
+        {
+            Ok(Some(lease)) => Some(lease),
+            Ok(None) | Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, Json(Vec::new())),
+        }
+    } else {
+        None
+    };
     (StatusCode::OK, Json(tags.into_iter().collect::<Vec<_>>()))
 }
 
@@ -1832,6 +1942,27 @@ pub async fn sync_torrent_peers(
     } else {
         Vec::new()
     };
+    let _lease = if state.engine.is_some() {
+        match reserve_qbit_api_snapshot(&state, estimate_qbit_peer_snapshot_bytes(peers.len()))
+            .await
+        {
+            Ok(Some(lease)) => Some(lease),
+            Ok(None) | Err(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "rid": 1,
+                        "full_update": true,
+                        "peers": {},
+                        "peers_removed": [],
+                        "show_flags": true,
+                    })),
+                )
+            }
+        }
+    } else {
+        None
+    };
     let rid = qbit_peer_rid(&peers);
     let full_update = q
         .get("rid")
@@ -1934,12 +2065,36 @@ pub async fn log_peers(State(state): State<AppState>) -> impl IntoResponse {
             .map(|entry| entry.info_hash.clone())
             .collect::<Vec<_>>()
     };
-    let mut entries = Vec::new();
+    let mut peer_snapshots = Vec::new();
     for hash in hashes {
         let peers = engine.torrent_peers(hash.clone()).await.unwrap_or_default();
-        for peer in peers {
-            entries.push(qbit_peer_log_entry(&hash, &peer));
+        peer_snapshots.push((hash, peers));
+    }
+    let peer_count = peer_snapshots
+        .iter()
+        .map(|(_, peers)| peers.len())
+        .sum::<usize>();
+    let _lease = match reserve_qbit_api_snapshot(
+        &state,
+        estimate_qbit_peer_snapshot_bytes(peer_count),
+    )
+    .await
+    {
+        Ok(Some(lease)) => Some(lease),
+        Ok(None) | Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(Vec::<serde_json::Value>::new()),
+            )
         }
+    };
+    let mut entries = Vec::with_capacity(peer_count);
+    for (hash, peers) in peer_snapshots {
+        entries.extend(
+            peers
+                .into_iter()
+                .map(|peer| qbit_peer_log_entry(&hash, &peer)),
+        );
     }
     (StatusCode::OK, Json(entries))
 }
@@ -2143,6 +2298,24 @@ async fn torrent_limit_map(
         .map(|entry| entry.info_hash.clone())
         .collect::<Vec<_>>();
     drop(reg);
+    let _lease = if state.engine.is_some() {
+        match reserve_qbit_api_snapshot(
+            state,
+            estimate_qbit_limit_map_snapshot_bytes(entries.len()),
+        )
+        .await
+        {
+            Ok(Some(lease)) => Some(lease),
+            Ok(None) | Err(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::Value::Object(serde_json::Map::new())),
+                )
+            }
+        }
+    } else {
+        None
+    };
     let mut limits = serde_json::Map::new();
     for hash in entries {
         let value = match field {
@@ -2298,6 +2471,37 @@ fn estimate_qbit_torrent_info_snapshot_bytes(torrent_count: usize) -> u64 {
 fn estimate_qbit_maindata_snapshot_bytes(torrent_count: usize) -> u64 {
     // /sync/maindata wraps torrent info in a keyed map plus server state.
     16 * 1024 + (torrent_count as u64).saturating_mul(2304)
+}
+
+fn estimate_qbit_metadata_snapshot_bytes(
+    file_count: usize,
+    piece_count: usize,
+    webseed_count: usize,
+) -> u64 {
+    16 * 1024
+        + (file_count as u64).saturating_mul(512)
+        + (piece_count as u64).saturating_mul(96)
+        + (webseed_count as u64).saturating_mul(256)
+}
+
+fn estimate_qbit_tracker_snapshot_bytes(tracker_count: usize) -> u64 {
+    8 * 1024 + (tracker_count as u64).saturating_mul(512)
+}
+
+fn estimate_qbit_label_snapshot_bytes(item_count: usize) -> u64 {
+    8 * 1024 + (item_count as u64).saturating_mul(256)
+}
+
+fn estimate_qbit_limit_map_snapshot_bytes(torrent_count: usize) -> u64 {
+    8 * 1024 + (torrent_count as u64).saturating_mul(192)
+}
+
+fn estimate_qbit_properties_snapshot_bytes() -> u64 {
+    32 * 1024
+}
+
+fn estimate_qbit_peer_snapshot_bytes(peer_count: usize) -> u64 {
+    8 * 1024 + (peer_count as u64).saturating_mul(1024)
 }
 
 async fn queue_priority(state: &AppState, hash: &str) -> i32 {
@@ -4372,5 +4576,14 @@ mod tests {
             estimate_qbit_maindata_snapshot_bytes(10),
             16 * 1024 + 23_040
         );
+        assert_eq!(
+            estimate_qbit_metadata_snapshot_bytes(10, 100, 2),
+            16 * 1024 + 5_120 + 9_600 + 512
+        );
+        assert_eq!(estimate_qbit_tracker_snapshot_bytes(10), 8 * 1024 + 5_120);
+        assert_eq!(estimate_qbit_label_snapshot_bytes(10), 8 * 1024 + 2_560);
+        assert_eq!(estimate_qbit_limit_map_snapshot_bytes(10), 8 * 1024 + 1_920);
+        assert_eq!(estimate_qbit_properties_snapshot_bytes(), 32 * 1024);
+        assert_eq!(estimate_qbit_peer_snapshot_bytes(10), 8 * 1024 + 10_240);
     }
 }
