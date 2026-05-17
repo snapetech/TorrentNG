@@ -78,11 +78,16 @@ if [[ "$current_head" == "$new_head" && "$FORCE" != "1" ]]; then
   exit 0
 fi
 
+up_args=(up -d --no-deps)
+if [[ "$FORCE" == "1" ]]; then
+  up_args+=(--force-recreate)
+fi
+
 run "${compose_cmd[@]}" build "$SERVICE"
-run "${compose_cmd[@]}" up -d --no-deps "$SERVICE"
+run "${compose_cmd[@]}" "${up_args[@]}" "$SERVICE"
 
 if "${compose_cmd[@]}" config --services | grep -qx nginx; then
-  run "${compose_cmd[@]}" up -d --no-deps nginx
+  run "${compose_cmd[@]}" "${up_args[@]}" nginx
 fi
 
 if [[ "$PRUNE" == "1" ]]; then
