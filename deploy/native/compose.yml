@@ -1,0 +1,53 @@
+services:
+  rusttorrentd:
+    image: rtorrentng/rusttorrentd:local
+    build:
+      context: ../..
+      dockerfile: deploy/native/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+      - "6881:6881"
+      - "6881:6881/udp"
+    volumes:
+      - ./config.toml:/etc/rusttorrentd/config.toml:ro
+      - rusttorrentd-state:/var/lib/rusttorrentd
+      - downloads:/data
+    environment:
+      RUSTTORRENTD_CONFIG: /etc/rusttorrentd/config.toml
+      RUST_LOG: "${RUST_LOG:-info}"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  prometheus:
+    image: prom/prometheus:latest
+    profiles: ["observability"]
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - rusttorrentd
+
+  grafana:
+    image: grafana/grafana:latest
+    profiles: ["observability"]
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+
+volumes:
+  downloads:
+  rusttorrentd-state:
+  grafana-data:

@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: rusttorrentd
+  namespace: rtorrentng
+  labels:
+    app.kubernetes.io/name: rusttorrentd
+spec:
+  selector:
+    app.kubernetes.io/name: rusttorrentd
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+    - name: bittorrent-tcp
+      port: 6881
+      targetPort: bittorrent-tcp
+      protocol: TCP
+    - name: bittorrent-udp
+      port: 6881
+      targetPort: bittorrent-udp
+      protocol: UDP

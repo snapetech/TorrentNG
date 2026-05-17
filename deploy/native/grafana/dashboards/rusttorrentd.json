@@ -1,0 +1,204 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "expr": "rtorrentng_torrents_total",
+          "legendFormat": "torrents",
+          "refId": "A"
+        }
+      ],
+      "title": "Torrents",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "binBps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 4
+      },
+      "id": 2,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rtorrentng_bytes_downloaded_total",
+          "legendFormat": "downloaded",
+          "refId": "A"
+        },
+        {
+          "expr": "rtorrentng_bytes_uploaded_total",
+          "legendFormat": "uploaded",
+          "refId": "B"
+        },
+        {
+          "expr": "rtorrentng_bytes_left",
+          "legendFormat": "left",
+          "refId": "C"
+        }
+      ],
+      "title": "Transfer Totals",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 4
+      },
+      "id": 3,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rtorrentng_torrents_seeding",
+          "legendFormat": "seeding",
+          "refId": "A"
+        },
+        {
+          "expr": "rtorrentng_torrents_downloading",
+          "legendFormat": "downloading",
+          "refId": "B"
+        },
+        {
+          "expr": "rtorrentng_torrents_paused",
+          "legendFormat": "paused",
+          "refId": "C"
+        },
+        {
+          "expr": "rtorrentng_jobs_active",
+          "legendFormat": "active jobs",
+          "refId": "D"
+        },
+        {
+          "expr": "rtorrentng_trackers_error",
+          "legendFormat": "tracker errors",
+          "refId": "E"
+        }
+      ],
+      "title": "Runtime Pressure",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "15s",
+  "schemaVersion": 39,
+  "tags": [
+    "rtorrentng",
+    "rusttorrentd"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "rusttorrentd Overview",
+  "uid": "rusttorrentd-overview",
+  "version": 1,
+  "weekStart": ""
+}

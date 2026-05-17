@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: rusttorrentd
+    orgId: 1
+    folder: rtorrentNG
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /var/lib/grafana/dashboards

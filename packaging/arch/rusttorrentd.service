@@ -1,0 +1,32 @@
+[Unit]
+Description=rtorrentNG native BitTorrent daemon
+Documentation=https://github.com/rtorrentng/rtorrentng
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rusttorrentd
+Group=rusttorrentd
+Environment=RUSTTORRENTD_CONFIG=/etc/rusttorrentd/config.toml
+Environment=RUST_LOG=info
+ExecStart=/usr/bin/rusttorrentd
+Restart=on-failure
+RestartSec=5s
+StateDirectory=rusttorrentd
+ConfigurationDirectory=rusttorrentd
+ReadWritePaths=/var/lib/rusttorrentd /data
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

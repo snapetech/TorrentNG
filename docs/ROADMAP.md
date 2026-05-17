@@ -275,9 +275,9 @@ Required before 1.0:
 - [x] Native deployment docs
 - [x] Prometheus metrics endpoint and metrics certification
 - [x] Disaster recovery guide
-- [ ] Native packaging examples beyond source builds: systemd unit, Docker image, Compose, Kubernetes example
-- [ ] Prometheus/Grafana dashboard artifact
-- [ ] Arch/AUR package
+- [x] Native packaging examples beyond source builds: systemd unit, Docker image, Compose, Kubernetes example
+- [x] Prometheus/Grafana dashboard artifact
+- [x] Arch/AUR package template
 
 ## Track 2 benchmark targets
 
