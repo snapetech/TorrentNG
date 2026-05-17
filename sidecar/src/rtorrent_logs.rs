@@ -1,6 +1,4 @@
 use std::{
-    collections::hash_map::DefaultHasher,
-    hash::{Hash, Hasher},
     io::{Read, Seek, SeekFrom},
     path::Path,
     sync::Arc,
@@ -69,9 +67,8 @@ fn ingest_path(db: &Db, path: &Path, retention: usize, read_from_start: bool) ->
 }
 
 fn offset_key(path: &Path) -> String {
-    let mut hasher = DefaultHasher::new();
-    path.hash(&mut hasher);
-    format!("rtorrent_log_offset:{:016x}", hasher.finish())
+    let stable_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    format!("rtorrent_log_offset:{}", stable_path.to_string_lossy())
 }
 
 fn append_log_line(db: &Db, path: &Path, line: &str, retention: usize) -> Result<()> {
