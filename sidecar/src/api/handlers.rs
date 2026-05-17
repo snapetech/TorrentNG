@@ -578,20 +578,50 @@ pub async fn set_rtorrent_settings(
         restart_required = true;
     }
 
-    Json(RtorrentSettingsApplyResponse {
+    let response = RtorrentSettingsApplyResponse {
         saved: true,
         restart_required,
         applied,
         errors: apply_errors,
         overlay_path: overlay_path.display().to_string(),
-    })
+    };
+    record_operator_event(
+        &s,
+        "settings_changed",
+        "rTorrent settings saved",
+        serde_json::json!({
+            "component": "rtorrent",
+            "operation": "apply_settings",
+            "result": if response.errors.is_empty() { "saved" } else { "partial" },
+            "changed_count": normalized.len(),
+            "applied_live_count": response.applied.len(),
+            "error_count": response.errors.len(),
+            "restart_required": response.restart_required,
+            "custom_rc": !patch.custom_rc.trim().is_empty(),
+            "overlay_file": overlay_path.file_name().and_then(|name| name.to_str()).unwrap_or("rtorrent.tng.rc"),
+        }),
+        if response.errors.is_empty() { "info" } else { "warn" },
+    );
+
+    Json(response)
     .into_response()
 }
 
-pub async fn restart_process() -> impl IntoResponse {
+pub async fn restart_process(State(s): State<AppState>) -> impl IntoResponse {
+    record_operator_event(
+        &s,
+        "admin_restart_requested",
+        "TorrentNG restart requested",
+        serde_json::json!({
+            "component": "sidecar",
+            "operation": "restart",
+            "result": "requested",
+        }),
+        "warn",
+    );
     tokio::spawn(async {
         sleep(Duration::from_millis(250)).await;
-        tracing::warn!("restarting TorrentNG process by admin request");
+        tracing::warn!(component = "sidecar", operation = "restart", "restarting TorrentNG process by admin request");
         std::process::exit(0);
     });
     Json(serde_json::json!({ "restarting": true })).into_response()
@@ -1557,11 +1587,31 @@ fn record_app_event(s: &AppState, event: &Event) {
     let Some((kind, message, payload)) = app_event_projection(event) else {
         return;
     };
+    append_operator_event(s, "info", kind, message, payload);
+}
+
+fn record_operator_event(
+    s: &AppState,
+    kind: &str,
+    message: &str,
+    payload: serde_json::Value,
+    level: &str,
+) {
+    append_operator_event(s, level, kind.to_owned(), message.to_owned(), payload.to_string());
+}
+
+fn append_operator_event(
+    s: &AppState,
+    level: &str,
+    kind: String,
+    message: String,
+    payload: String,
+) {
     if let Err(e) = s.db.append_app_event(
         &AppEventRow {
             event_id: None,
             occurred_at: chrono::Utc::now().timestamp(),
-            level: "info".to_owned(),
+            level: level.to_owned(),
             kind,
             message,
             payload,
@@ -2427,7 +2477,24 @@ pub async fn set_user_agent(
     }
     match s.rt.set_user_agent(&ua).await {
         Ok(_) => {
-            tracing::info!(user_agent = %ua, "user agent updated");
+            tracing::info!(
+                component = "rtorrent",
+                operation = "set_user_agent",
+                user_agent_len = ua.len(),
+                "user agent updated"
+            );
+            record_operator_event(
+                &s,
+                "settings_changed",
+                "rTorrent user agent updated",
+                serde_json::json!({
+                    "component": "rtorrent",
+                    "operation": "set_user_agent",
+                    "result": "updated",
+                    "user_agent_len": ua.len(),
+                }),
+                "info",
+            );
             Json(UserAgentResponse { user_agent: ua }).into_response()
         }
         Err(e) => {

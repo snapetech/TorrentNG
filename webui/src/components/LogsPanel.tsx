@@ -40,6 +40,7 @@ export function LogsPanel() {
           <option value="rtorrent_sync_recovered">Sync recovery</option>
           <option value="workflow_run">Workflows</option>
           <option value="settings_changed">Settings</option>
+          <option value="admin_restart_requested">Restart requests</option>
           <option value="sidecar_started">Startup</option>
         </select>
         <button onClick={() => query.refetch()} disabled={query.isFetching} style={buttonStyle}>
