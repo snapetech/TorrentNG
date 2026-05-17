@@ -62,6 +62,19 @@ pub async fn list_torrents(State(state): State<AppState>) -> impl IntoResponse {
     (StatusCode::OK, Json(summaries)).into_response()
 }
 
+fn api_snapshot_budget_exhausted() -> axum::response::Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(
+            serde_json::to_value(ApiError::internal(
+                "api snapshot memory budget exhausted".to_owned(),
+            ))
+            .unwrap(),
+        ),
+    )
+        .into_response()
+}
+
 /// `POST /api/v1/torrents` — add a v1/hybrid `.torrent` from base64 JSON.
 pub async fn add_torrent(
     State(state): State<AppState>,
@@ -609,6 +622,39 @@ fn estimate_torrent_summary_snapshot_bytes(torrent_count: usize) -> u64 {
 
 fn estimate_torrent_delta_snapshot_bytes(torrent_count: usize) -> u64 {
     (torrent_count as u64).saturating_mul(1536)
+}
+
+fn estimate_torrent_detail_base_snapshot_bytes() -> u64 {
+    64 * 1024
+}
+
+fn estimate_torrent_detail_snapshot_bytes(
+    summary: &TorrentSummary,
+    meta: &rt_engine::EngineTorrentMetadata,
+) -> u64 {
+    let summary_strings = summary
+        .info_hash
+        .len()
+        .saturating_add(summary.name.len())
+        .saturating_add(summary.state.len())
+        .saturating_add(summary.save_path.len())
+        .saturating_add(summary.category.as_ref().map_or(0, String::len))
+        .saturating_add(summary.tags.iter().map(String::len).sum::<usize>());
+    let tracker_strings = meta.trackers.iter().map(String::len).sum::<usize>();
+    let webseed_strings = meta.webseeds.iter().map(String::len).sum::<usize>();
+    let file_strings = meta.files.iter().map(|file| file.path.len()).sum::<usize>();
+    let structured = 2048usize
+        .saturating_add(meta.trackers.len().saturating_mul(256))
+        .saturating_add(meta.webseeds.len().saturating_mul(256))
+        .saturating_add(meta.files.len().saturating_mul(512))
+        .saturating_add(meta.piece_hashes.len().saturating_mul(64))
+        .saturating_add(meta.piece_states.len().saturating_mul(8));
+    structured
+        .saturating_add(summary_strings)
+        .saturating_add(tracker_strings)
+        .saturating_add(webseed_strings)
+        .saturating_add(file_strings)
+        .max(estimate_torrent_detail_base_snapshot_bytes() as usize) as u64
 }
 
 fn torrent_summary(e: &TorrentEntry) -> TorrentSummary {
@@ -2252,5 +2298,56 @@ mod tests {
         assert_eq!(estimate_torrent_summary_snapshot_bytes(0), 0);
         assert_eq!(estimate_torrent_summary_snapshot_bytes(10), 10 * 1024);
         assert_eq!(estimate_torrent_delta_snapshot_bytes(10), 10 * 1536);
+        let summary = TorrentSummary {
+            info_hash: "a".repeat(40),
+            name: "detail.bin".to_owned(),
+            state: "downloading".to_owned(),
+            total_length: 1024,
+            downloaded: 0,
+            uploaded: 0,
+            ratio: 0.0,
+            save_path: "/data".to_owned(),
+            category: Some("linux".to_owned()),
+            tags: vec!["iso".to_owned()],
+            added_at: 1,
+            completed_at: None,
+            num_peers: 0,
+            num_seeds: 0,
+        };
+        let small_meta = rt_engine::EngineTorrentMetadata {
+            piece_length: 16 * 1024,
+            piece_count: 1,
+            piece_hashes: vec!["b".repeat(40)],
+            piece_states: Vec::new(),
+            is_private: false,
+            trackers: vec!["http://tracker/announce".to_owned()],
+            webseeds: Vec::new(),
+            files: vec![rt_engine::EngineTorrentFile {
+                index: 0,
+                path: "detail.bin".to_owned(),
+                length: 1024,
+                priority: 1,
+                wanted: true,
+            }],
+        };
+        let mut large_meta = small_meta.clone();
+        large_meta
+            .files
+            .extend((0..200).map(|idx| rt_engine::EngineTorrentFile {
+                index: idx + 1,
+                path: format!("dir/{idx}/large-detail-file-{idx}.bin"),
+                length: 1024,
+                priority: 1,
+                wanted: true,
+            }));
+
+        assert_eq!(
+            estimate_torrent_detail_snapshot_bytes(&summary, &small_meta),
+            estimate_torrent_detail_base_snapshot_bytes()
+        );
+        assert!(
+            estimate_torrent_detail_snapshot_bytes(&summary, &large_meta)
+                > estimate_torrent_detail_snapshot_bytes(&summary, &small_meta)
+        );
     }
 }
