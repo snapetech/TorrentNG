@@ -1158,7 +1158,9 @@ async fn health_unreachable_rtorrent() {
 #[tokio::test]
 async fn native_storage_reports_configured_roots() {
     let mut cfg = Config::test_default();
-    cfg.storage_roots = vec!["/".into(), "/definitely/not/a/real/rtng/path".into()];
+    let root = tempfile::tempdir().unwrap();
+    let missing = root.path().join("definitely-not-real");
+    cfg.storage_roots = vec![root.path().to_path_buf(), missing.clone()];
     let (addr, client, _) = spawn_server_with_config(cfg).await;
 
     let res = client
@@ -1170,7 +1172,7 @@ async fn native_storage_reports_configured_roots() {
     let body: serde_json::Value = res.json().await.unwrap();
     let roots = body["roots"].as_array().unwrap();
     assert_eq!(roots.len(), 2);
-    assert_eq!(roots[0]["path"], "/");
+    assert_eq!(roots[0]["path"], root.path().display().to_string());
     assert_eq!(roots[0]["ok"], true);
     assert!(roots[0]["total_bytes"].as_u64().unwrap() > 0);
     assert_eq!(roots[1]["ok"], false);
@@ -1872,7 +1874,14 @@ async fn native_workflow_script_execution_requires_config_gate() {
 async fn native_workflow_script_execution_runs_when_enabled() {
     let mut cfg = Config::test_default();
     cfg.workflows.allow_scripts = true;
-    cfg.workflows.allowed_script_dirs = vec![std::path::PathBuf::from("/bin")];
+    #[cfg(windows)]
+    let (script_dir, command) = (
+        std::path::PathBuf::from(r"C:\Windows\System32"),
+        r"C:\Windows\System32\cmd.exe /C exit 0",
+    );
+    #[cfg(not(windows))]
+    let (script_dir, command) = (std::path::PathBuf::from("/bin"), "/bin/true");
+    cfg.workflows.allowed_script_dirs = vec![script_dir];
     let (addr, client, db) = spawn_server_with_config(cfg).await;
     seed_torrent_with(&db, "script-run", "Script Run", |t| {
         t.complete = true;
@@ -1888,7 +1897,7 @@ async fn native_workflow_script_execution_runs_when_enabled() {
             "action": "script",
             "category": null,
             "tracker": null,
-            "command": "/bin/true",
+            "command": command,
             "url": null,
             "target_path": null
         }))
