@@ -41,10 +41,9 @@ report_link() {
 }
 
 local_release="$(latest_report 'local-release-*.md')"
+storage_release="$(latest_report 'storage-release-certification-*.md')"
 move_import="$(latest_report 'storage-move-import-*.md')"
-move_import_realroot="$(latest_report 'storage-move-import-realroot-*.md')"
-storage_hdd="$(latest_report 'storage-hardware-kspls0-lvm-hdd-*.md')"
-storage_pvmap="$(latest_report 'storage-hardware-kspls0-lvm-pvmap-*.md')"
+storage_hardware="$(latest_report 'storage-hardware-*.md')"
 storage_uring="$(latest_report 'storage-uring-graduation-*.md')"
 
 {
@@ -97,23 +96,23 @@ else
   row "move/import/delete executor safety" FAIL "$(report_link "$move_import")"
 fi
 
-if contains "$move_import_realroot" 'tng_storage_move_import .*root_confined=1'; then
-  row "real-root move/import fixture evidence" PASS "$(report_link "$move_import_realroot")"
+if contains "$move_import" 'tng_storage_move_import .*root_confined=1'; then
+  row "real-root move/import fixture evidence" PASS "$(report_link "$move_import")"
 else
-  row "real-root move/import fixture evidence" WARN "$(report_link "$move_import_realroot")"
+  row "real-root move/import fixture evidence" WARN "$(report_link "$move_import")"
 fi
 
-if contains "$storage_hdd" 'Overall status: PASS' &&
-  contains "$storage_hdd" 'TorrentNG storage elevator wall-clock ratio: [5-9][0-9]*\.|TorrentNG storage elevator wall-clock ratio: [5-9]\.'; then
-  row "HDD 5x elevator release evidence" PASS "$(report_link "$storage_hdd")"
+if contains "$storage_hardware" 'Overall status: PASS' &&
+  contains "$storage_hardware" 'TorrentNG storage elevator wall-clock ratio: [5-9][0-9]*\.|TorrentNG storage elevator wall-clock ratio: [5-9]\.'; then
+  row "HDD 5x elevator release evidence" PASS "$(report_link "$storage_hardware")"
 else
-  row "HDD 5x elevator release evidence" WARN "$(report_link "$storage_hdd")"
+  row "HDD 5x elevator release evidence" WARN "$(report_link "$storage_hardware")"
 fi
 
-if contains "$storage_pvmap" '/dev/sd.*\|.*\| 1 \|'; then
-  row "sampled LVM physical-PV placement evidence" PASS "$(report_link "$storage_pvmap")"
+if contains "$storage_hardware" '/dev/sd.*\|.*\| 1 \|'; then
+  row "sampled LVM physical-PV placement evidence" PASS "$(report_link "$storage_hardware")"
 else
-  row "sampled LVM physical-PV placement evidence" WARN "$(report_link "$storage_pvmap")"
+  row "sampled LVM physical-PV placement evidence" WARN "$(report_link "$storage_hardware")"
 fi
 
 if contains "$storage_uring" 'Overall status: PASS' &&
@@ -132,6 +131,12 @@ if contains "$storage_uring" 'Overall status: PASS' &&
   row "io_uring frame-pool slot graduation" PASS "$(report_link "$storage_uring")"
 else
   row "io_uring frame-pool slot graduation" WARN "$(report_link "$storage_uring")"
+fi
+
+if contains "$storage_release" 'Overall status: PASS'; then
+  row "storage release certification wrapper" PASS "$(report_link "$storage_release")"
+else
+  row "storage release certification wrapper" WARN "$(report_link "$storage_release")"
 fi
 
 {
