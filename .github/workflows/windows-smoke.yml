@@ -14,10 +14,14 @@ permissions:
 jobs:
   smoke:
     runs-on: [self-hosted, Windows, X64, packer-windows]
+    defaults:
+      run:
+        shell: pwsh
     steps:
       - uses: actions/checkout@v6
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Select Rust toolchain
+        run: rustup default stable
 
       - uses: actions/setup-node@v6
         with:
@@ -34,5 +38,5 @@ jobs:
       - name: Build webui
         working-directory: webui
         run: |
-          npm ci
-          npm run build
+          npm.cmd ci
+          npm.cmd run build
