@@ -1304,6 +1304,7 @@ impl Engine {
             trackers,
             cmd_rx,
             self.cmd_tx.clone(),
+            self.resources.clone(),
             self.config.network.listen_port,
             self.config.network.max_peers,
             self.config.tracker.http_timeout_secs,

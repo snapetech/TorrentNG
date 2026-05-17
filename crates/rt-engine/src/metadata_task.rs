@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use futures::{stream::FuturesUnordered, SinkExt, StreamExt};
 use rt_bencode::decode;
+use rt_metrics::{MemoryClass, MemoryLease, ResourceGovernor};
 use rt_peer_wire::{
     codec::PeerCodec,
     extension::{ExtensionHandshake, UtMetadataMessage, EXT_HANDSHAKE_ID},
@@ -42,6 +43,7 @@ pub async fn run_metadata_task(
     trackers: Vec<String>,
     mut cmd_rx: mpsc::Receiver<TorrentCmd>,
     engine_tx: mpsc::Sender<EngineCmd>,
+    resources: ResourceGovernor,
     listen_port: u16,
     max_peers: usize,
     http_timeout_secs: u64,
@@ -70,6 +72,7 @@ pub async fn run_metadata_task(
                             max_peers,
                             &mut peer_attempts,
                             &engine_tx,
+                            &resources,
                         )
                         .await {
                             return;
@@ -82,7 +85,7 @@ pub async fn run_metadata_task(
                     } => if paused {
                         drop(stream);
                     } else {
-                        match fetch_from_incoming_peer(stream, peer_addr, info_hash, handshake).await {
+                        match fetch_from_incoming_peer(stream, peer_addr, info_hash, handshake, resources.clone()).await {
                         Ok(info) => {
                             complete_metadata(&engine_tx, &info_hash_hex, &trackers, info).await;
                             return;
@@ -165,6 +168,7 @@ pub async fn run_metadata_task(
                     max_peers,
                     &mut peer_attempts,
                     &engine_tx,
+                    &resources,
                 )
                 .await {
                     return;
@@ -198,6 +202,7 @@ async fn try_fetch_from_peers(
     max_peers: usize,
     peer_attempts: &mut HashMap<SocketAddr, Instant>,
     engine_tx: &mpsc::Sender<EngineCmd>,
+    resources: &ResourceGovernor,
 ) -> bool {
     let mut candidates = metadata_fetch_candidates(
         peers,
@@ -212,7 +217,7 @@ async fn try_fetch_from_peers(
         let Some(peer) = candidates.pop_front() else {
             break;
         };
-        in_flight.push(metadata_fetch_attempt(peer, info_hash));
+        in_flight.push(metadata_fetch_attempt(peer, info_hash, resources.clone()));
     }
 
     while let Some((peer, result)) = in_flight.next().await {
@@ -227,7 +232,7 @@ async fn try_fetch_from_peers(
         }
 
         if let Some(peer) = candidates.pop_front() {
-            in_flight.push(metadata_fetch_attempt(peer, info_hash));
+            in_flight.push(metadata_fetch_attempt(peer, info_hash, resources.clone()));
         }
     }
 
@@ -302,8 +307,12 @@ fn prune_metadata_peer_attempts(
 async fn metadata_fetch_attempt(
     peer: SocketAddr,
     info_hash: [u8; 20],
+    resources: ResourceGovernor,
 ) -> (SocketAddr, anyhow::Result<Vec<u8>>) {
-    (peer, fetch_from_outgoing_peer(peer, info_hash).await)
+    (
+        peer,
+        fetch_from_outgoing_peer(peer, info_hash, resources).await,
+    )
 }
 
 async fn complete_metadata(
@@ -544,6 +553,7 @@ fn metadata_announce_request(
 async fn fetch_from_outgoing_peer(
     addr: SocketAddr,
     info_hash: [u8; 20],
+    resources: ResourceGovernor,
 ) -> anyhow::Result<Vec<u8>> {
     let stream = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(addr)).await??;
     stream.set_nodelay(true)?;
@@ -559,6 +569,7 @@ async fn fetch_from_outgoing_peer(
         framed,
         remote_hs.reserved.supports_extension_protocol(),
         info_hash,
+        resources,
     )
     .await
 }
@@ -568,6 +579,7 @@ async fn fetch_from_incoming_peer(
     addr: SocketAddr,
     info_hash: [u8; 20],
     remote_hs: Handshake,
+    resources: ResourceGovernor,
 ) -> anyhow::Result<Vec<u8>> {
     stream.set_nodelay(true)?;
     let mut framed = Framed::new(stream, PeerCodec);
@@ -577,6 +589,7 @@ async fn fetch_from_incoming_peer(
         framed,
         remote_hs.reserved.supports_extension_protocol(),
         info_hash,
+        resources,
     )
     .await
 }
@@ -611,6 +624,7 @@ async fn fetch_metadata(
     mut framed: Framed<TcpStream, PeerCodec>,
     remote_supports_extension: bool,
     expected_info_hash: [u8; 20],
+    resources: ResourceGovernor,
 ) -> anyhow::Result<Vec<u8>> {
     if !remote_supports_extension {
         anyhow::bail!("peer does not support BEP 10");
@@ -626,6 +640,7 @@ async fn fetch_metadata(
     framed.send(Message::Interested).await?;
 
     let (remote_ext_id, metadata_size) = read_remote_metadata_handshake(addr, &mut framed).await?;
+    let _lease = reserve_metadata_fetch_bytes(&resources, metadata_size)?;
     let piece_count = metadata_size.div_ceil(METADATA_PIECE_SIZE as u32);
     let mut pieces = BTreeMap::new();
 
@@ -660,6 +675,16 @@ async fn fetch_metadata(
     decode(&metadata).context("fetched metadata is not valid bencode")?;
     validate_metadata_info_hash(&metadata, expected_info_hash)?;
     Ok(metadata)
+}
+
+fn reserve_metadata_fetch_bytes(
+    resources: &ResourceGovernor,
+    metadata_size: u32,
+) -> anyhow::Result<MemoryLease> {
+    let bytes = u64::from(metadata_size).saturating_mul(2);
+    resources
+        .try_acquire(MemoryClass::Metadata, bytes)
+        .ok_or_else(|| anyhow::anyhow!("metadata allocation of {bytes} bytes denied"))
 }
 
 fn validate_metadata_info_hash(
@@ -884,5 +909,33 @@ mod tests {
             MAX_METADATA_FETCH_CONCURRENCY
         );
         assert_eq!(metadata_peer_candidate_cap(100), 100);
+    }
+
+    #[test]
+    fn metadata_fetch_reservation_uses_metadata_governor_class() {
+        let mut caps = [0; rt_metrics::MEMORY_CLASS_COUNT];
+        caps[MemoryClass::Metadata as usize] = 128;
+        let governor = ResourceGovernor::new(rt_metrics::ResourceGovernorConfig {
+            total_cap_bytes: 128,
+            class_caps_bytes: caps,
+            pressure_constrained_pct: 75,
+            pressure_critical_pct: 90,
+        });
+
+        let lease = reserve_metadata_fetch_bytes(&governor, 64).unwrap();
+        assert_eq!(
+            governor.snapshot().classes[MemoryClass::Metadata as usize].used_bytes,
+            128
+        );
+        drop(lease);
+        assert_eq!(
+            governor.snapshot().classes[MemoryClass::Metadata as usize].used_bytes,
+            0
+        );
+        assert!(reserve_metadata_fetch_bytes(&governor, 65).is_err());
+        assert_eq!(
+            governor.snapshot().classes[MemoryClass::Metadata as usize].denied_allocations,
+            1
+        );
     }
 }
