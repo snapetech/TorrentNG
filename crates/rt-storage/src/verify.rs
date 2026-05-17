@@ -8,7 +8,7 @@ use rt_piece_map::{FileRegion, PieceMap};
 use crate::{
     error::StorageError,
     io_class::IoClass,
-    scheduler::{scheduled_read, MountScheduler},
+    scheduler::{scheduled_read_owned, MountScheduler},
 };
 
 /// Result of verifying a single piece.
@@ -246,7 +246,7 @@ async fn read_sparse_range(
         }
         let extent_end = extent.offset.saturating_add(extent.len).min(range_end);
         if extent_end > extent.offset {
-            let data = scheduled_read(
+            let data = scheduled_read_owned(
                 scheduler,
                 IoClass::Recheck,
                 path,
@@ -254,7 +254,7 @@ async fn read_sparse_range(
                 (extent_end - extent.offset) as usize,
             )
             .await?;
-            out.extend_from_slice(&data);
+            out.extend_from_slice(data.as_slice());
             cursor = extent_end;
         }
     }
