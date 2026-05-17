@@ -363,6 +363,7 @@ rTorrent over XMLRPC.
 | `rtorrentng_storage_*_queue_depth` | gauge | Native disk I/O and hashing queue depths |
 | `rtorrentng_storage_{read,write}_ops_total` | counter | Positioned disk operations through native schedulers |
 | `rtorrentng_storage_bytes_{read,written}_total` | counter | Bytes moved through native schedulers |
+| `rtorrentng_storage_*_by_class_total{class=...}` | counter | Read/write operation and byte counters split by scheduler I/O class |
 | `rtorrentng_storage_{sync,hash}_ops_total` | counter | Durability syncs and hashing-pool work |
 | `rtorrentng_storage_preallocation_*_total` | counter | Preallocation failures and fallback events |
 | `rtorrentng_storage_peer_read_cache_*` | gauge/counter | Peer-read readahead cache entries, hits, and misses |

@@ -1231,6 +1231,11 @@ fn resume_from_bencode(value: &BValue<'_>) -> ResumeData {
             b"save_path".as_slice(),
             b"save path".as_slice(),
             b"qBt-savePath".as_slice(),
+            b"qBt-downloadPath".as_slice(),
+            b"downloadDir".as_slice(),
+            b"download_dir".as_slice(),
+            b"download_location".as_slice(),
+            b"move_completed_path".as_slice(),
             b"destination".as_slice(),
             b"path".as_slice(),
             b"rootdir".as_slice(),
@@ -1340,6 +1345,7 @@ fn resume_from_bencode(value: &BValue<'_>) -> ResumeData {
             b"wanted".as_slice(),
             b"file_wanted".as_slice(),
             b"fileWanted".as_slice(),
+            b"qBt-fileWanted".as_slice(),
         ],
     );
     resume.file_completed_bytes = first_bencode_u64_list(

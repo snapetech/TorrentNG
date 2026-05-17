@@ -721,12 +721,26 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
         "Positioned read operations across running torrent schedulers",
         stats.storage_read_ops,
     );
+    metric_by_class(
+        &mut out,
+        "rtorrentng_storage_read_ops_by_class_total",
+        "counter",
+        "Positioned read operations by I/O class across running torrent schedulers",
+        &stats.storage_read_ops_by_class,
+    );
     metric(
         &mut out,
         "rtorrentng_storage_write_ops_total",
         "counter",
         "Positioned write operations across running torrent schedulers",
         stats.storage_write_ops,
+    );
+    metric_by_class(
+        &mut out,
+        "rtorrentng_storage_write_ops_by_class_total",
+        "counter",
+        "Positioned write operations by I/O class across running torrent schedulers",
+        &stats.storage_write_ops_by_class,
     );
     metric(
         &mut out,
@@ -735,12 +749,26 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
         "Bytes read through running torrent schedulers",
         stats.storage_bytes_read,
     );
+    metric_by_class(
+        &mut out,
+        "rtorrentng_storage_bytes_read_by_class_total",
+        "counter",
+        "Bytes read by I/O class through running torrent schedulers",
+        &stats.storage_bytes_read_by_class,
+    );
     metric(
         &mut out,
         "rtorrentng_storage_bytes_written_total",
         "counter",
         "Bytes written through running torrent schedulers",
         stats.storage_bytes_written,
+    );
+    metric_by_class(
+        &mut out,
+        "rtorrentng_storage_bytes_written_by_class_total",
+        "counter",
+        "Bytes written by I/O class through running torrent schedulers",
+        &stats.storage_bytes_written_by_class,
     );
     metric(
         &mut out,
@@ -852,6 +880,36 @@ fn metric(out: &mut String, name: &str, kind: &str, help: &str, value: u64) {
     out.push(' ');
     out.push_str(&value.to_string());
     out.push('\n');
+}
+
+fn metric_by_class(out: &mut String, name: &str, kind: &str, help: &str, values: &[u64; 6]) {
+    const IO_CLASSES: [&str; 6] = [
+        "metadata",
+        "recheck",
+        "move_copy",
+        "peer_write",
+        "peer_read",
+        "foreground",
+    ];
+
+    out.push_str("# HELP ");
+    out.push_str(name);
+    out.push(' ');
+    out.push_str(help);
+    out.push('\n');
+    out.push_str("# TYPE ");
+    out.push_str(name);
+    out.push(' ');
+    out.push_str(kind);
+    out.push('\n');
+    for (class, value) in IO_CLASSES.iter().zip(values) {
+        out.push_str(name);
+        out.push_str("{class=\"");
+        out.push_str(class);
+        out.push_str("\"} ");
+        out.push_str(&value.to_string());
+        out.push('\n');
+    }
 }
 
 enum TorrentControl {
@@ -1096,7 +1154,7 @@ mod tests {
 
     #[test]
     fn render_metrics_includes_engine_stats() {
-        let stats = rt_engine::EngineStats {
+        let mut stats = rt_engine::EngineStats {
             torrents_total: 2,
             torrents_seeding: 1,
             jobs_active: 3,
@@ -1108,6 +1166,10 @@ mod tests {
             piece_assembly_evictions: 9,
             ..Default::default()
         };
+        stats.storage_read_ops_by_class[4] = 10;
+        stats.storage_write_ops_by_class[3] = 11;
+        stats.storage_bytes_read_by_class[4] = 12;
+        stats.storage_bytes_written_by_class[3] = 13;
         let rendered = render_metrics(&stats);
         assert!(rendered.contains("rtorrentng_torrents_total 2"));
         assert!(rendered.contains("rtorrentng_torrents_seeding 1"));
@@ -1118,6 +1180,15 @@ mod tests {
         assert!(rendered.contains("rtorrentng_storage_hash_ops_total 7"));
         assert!(rendered.contains("rtorrentng_storage_peer_read_cache_hits_total 8"));
         assert!(rendered.contains("rtorrentng_piece_assembly_evictions_total 9"));
+        assert!(
+            rendered.contains("rtorrentng_storage_read_ops_by_class_total{class=\"peer_read\"} 10")
+        );
+        assert!(rendered
+            .contains("rtorrentng_storage_write_ops_by_class_total{class=\"peer_write\"} 11"));
+        assert!(rendered
+            .contains("rtorrentng_storage_bytes_read_by_class_total{class=\"peer_read\"} 12"));
+        assert!(rendered
+            .contains("rtorrentng_storage_bytes_written_by_class_total{class=\"peer_write\"} 13"));
         assert!(rendered.contains("rtorrentng_storage_handles_open "));
         assert!(rendered.contains("rtorrentng_storage_frame_bytes_cap "));
     }
