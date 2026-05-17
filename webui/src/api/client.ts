@@ -333,6 +333,42 @@ export interface EngineCommandIndex {
   error: string | null
 }
 
+export interface RtorrentSettingDescriptor {
+  key: string
+  label: string
+  command: string
+  setter: string
+  value_type: 'int' | 'bool' | 'enum' | string
+  unit: string | null
+  restart_required: boolean
+  minimum: number | null
+  maximum: number | null
+  default_value: string | number | boolean
+}
+
+export interface RtorrentSettingState {
+  key: string
+  live: ProbeValue<string>
+  saved: string | null
+}
+
+export interface RtorrentSettingsResponse {
+  settings: RtorrentSettingDescriptor[]
+  values: RtorrentSettingState[]
+  overlay_path: string
+  overlay_writable: boolean
+  custom_rc: string
+  restart_supported: boolean
+}
+
+export interface RtorrentSettingsApplyResponse {
+  saved: boolean
+  restart_required: boolean
+  applied: string[]
+  errors: string[]
+  overlay_path: string
+}
+
 export interface RatioGroup {
   name: string
   ratio_limit: number
@@ -559,6 +595,16 @@ export const api = {
 
   engine: (): Promise<EngineDiagnostics> => get('/engine'),
   engineCommands: (): Promise<EngineCommandIndex> => get('/engine/commands'),
+  rtorrentSettings: {
+    get: (): Promise<RtorrentSettingsResponse> => get('/engine/rtorrent-settings'),
+    save: (
+      values: Record<string, string | number | boolean>,
+      custom_rc = '',
+      apply_live = true,
+    ): Promise<RtorrentSettingsApplyResponse> =>
+      put('/engine/rtorrent-settings', { values, custom_rc, apply_live }),
+    restart: (): Promise<{ restarting: boolean }> => post('/engine/restart'),
+  },
 
   savedViews: {
     list: (): Promise<SavedView[]> => get('/saved-views'),

@@ -93,7 +93,7 @@ pub struct ProbeValue<T: Serialize> {
 }
 
 impl<T: Serialize> ProbeValue<T> {
-    fn ok(value: T) -> Self {
+    pub fn ok(value: T) -> Self {
         Self {
             ok: true,
             value: Some(value),
@@ -101,7 +101,7 @@ impl<T: Serialize> ProbeValue<T> {
         }
     }
 
-    fn err(error: String) -> Self {
+    pub fn err(error: String) -> Self {
         Self {
             ok: false,
             value: None,

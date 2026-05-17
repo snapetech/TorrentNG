@@ -90,33 +90,33 @@ impl Client {
 }
 
 fn parse_tracker_rows(rows: Vec<XmlValue>) -> Vec<RawTracker> {
-        let mut out = Vec::with_capacity(rows.len());
-        for (idx, row) in rows.into_iter().enumerate() {
-            let f = row.into_array();
-            if f.len() < 15 {
-                continue;
-            }
-            out.push(RawTracker {
-                url: sf(&f, 0),
-                id: nf(&f, 1),
-                group: nf(&f, 2),
-                group_index: idx as i64,
-                is_enabled: bf(&f, 3),
-                is_open: bf(&f, 4),
-                is_extra_tracker: bf(&f, 5),
-                activity_time_last: nf(&f, 6),
-                activity_time_next: nf(&f, 7),
-                min_interval: nf(&f, 8),
-                normal_interval: nf(&f, 9),
-                failed_counter: nf(&f, 10),
-                success_counter: nf(&f, 11),
-                scrape_incomplete: nf(&f, 12),
-                scrape_complete: nf(&f, 13),
-                scrape_downloaded: nf(&f, 14),
-                message: String::new(),
-            });
+    let mut out = Vec::with_capacity(rows.len());
+    for (idx, row) in rows.into_iter().enumerate() {
+        let f = row.into_array();
+        if f.len() < 15 {
+            continue;
         }
-        out
+        out.push(RawTracker {
+            url: sf(&f, 0),
+            id: nf(&f, 1),
+            group: nf(&f, 2),
+            group_index: idx as i64,
+            is_enabled: bf(&f, 3),
+            is_open: bf(&f, 4),
+            is_extra_tracker: bf(&f, 5),
+            activity_time_last: nf(&f, 6),
+            activity_time_next: nf(&f, 7),
+            min_interval: nf(&f, 8),
+            normal_interval: nf(&f, 9),
+            failed_counter: nf(&f, 10),
+            success_counter: nf(&f, 11),
+            scrape_incomplete: nf(&f, 12),
+            scrape_complete: nf(&f, 13),
+            scrape_downloaded: nf(&f, 14),
+            message: String::new(),
+        });
+    }
+    out
 }
 
 fn session_trackers(hash: &str) -> Vec<RawTracker> {

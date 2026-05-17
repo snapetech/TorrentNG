@@ -7,15 +7,20 @@ use axum::{
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::ffi::CString;
-use std::{path::Path as FsPath, sync::atomic::Ordering, time::Duration};
-use tokio::process::Command;
+use std::{
+    collections::BTreeMap,
+    path::{Path as FsPath, PathBuf},
+    sync::atomic::Ordering,
+    time::Duration,
+};
+use tokio::{process::Command, time::sleep};
 
 use super::server::AppState;
 use super::ws::Event;
 use crate::cache::{
     Category, ListParams, RatioGroup, RssRule, SavedView, WorkflowRule, WorkflowRun,
 };
-use crate::rtorrent::XmlValue;
+use crate::rtorrent::{engine::ProbeValue, XmlValue};
 
 // --- Health ---
 
@@ -114,6 +119,605 @@ pub async fn engine_diagnostics(State(s): State<AppState>) -> impl IntoResponse 
 
 pub async fn engine_commands(State(s): State<AppState>) -> impl IntoResponse {
     Json(s.rt.command_index().await)
+}
+
+// --- rTorrent managed settings ---
+
+const RTORRENT_MANAGED_BEGIN: &str = "# rtorrentNG managed settings begin";
+const RTORRENT_MANAGED_END: &str = "# rtorrentNG managed settings end";
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RtorrentSettingDescriptor {
+    key: &'static str,
+    label: &'static str,
+    command: &'static str,
+    setter: &'static str,
+    value_type: &'static str,
+    unit: Option<&'static str>,
+    restart_required: bool,
+    minimum: Option<i64>,
+    maximum: Option<i64>,
+    default_value: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RtorrentSettingState {
+    key: &'static str,
+    live: ProbeValue<String>,
+    saved: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RtorrentSettingsResponse {
+    settings: Vec<RtorrentSettingDescriptor>,
+    values: Vec<RtorrentSettingState>,
+    overlay_path: String,
+    overlay_writable: bool,
+    custom_rc: String,
+    restart_supported: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RtorrentSettingsPatch {
+    values: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    custom_rc: String,
+    #[serde(default = "default_true")]
+    apply_live: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RtorrentSettingsApplyResponse {
+    saved: bool,
+    restart_required: bool,
+    applied: Vec<String>,
+    errors: Vec<String>,
+    overlay_path: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn rtorrent_settings() -> Vec<RtorrentSettingDescriptor> {
+    vec![
+        int_setting(
+            "max_uploads_global",
+            "Global upload slots",
+            "throttle.max_uploads.global",
+            "throttle.max_uploads.global.set",
+            None,
+            false,
+            0,
+            100_000,
+            350,
+        ),
+        int_setting(
+            "max_downloads_global",
+            "Global download slots",
+            "throttle.max_downloads.global",
+            "throttle.max_downloads.global.set",
+            None,
+            false,
+            0,
+            100_000,
+            300,
+        ),
+        int_setting(
+            "max_uploads",
+            "Per-torrent upload slots",
+            "throttle.max_uploads",
+            "throttle.max_uploads.set",
+            None,
+            false,
+            0,
+            10_000,
+            10,
+        ),
+        int_setting(
+            "max_downloads",
+            "Per-torrent download slots",
+            "throttle.max_downloads",
+            "throttle.max_downloads.set",
+            None,
+            false,
+            0,
+            10_000,
+            12,
+        ),
+        int_setting(
+            "pieces_memory_max",
+            "Piece memory cache",
+            "pieces.memory.max",
+            "pieces.memory.max.set",
+            Some("M"),
+            false,
+            64,
+            262_144,
+            4096,
+        ),
+        int_setting(
+            "max_open_files",
+            "Open files",
+            "network.max_open_files",
+            "network.max_open_files.set",
+            None,
+            true,
+            64,
+            1_000_000,
+            4096,
+        ),
+        int_setting(
+            "max_open_sockets",
+            "Open sockets",
+            "network.max_open_sockets",
+            "network.max_open_sockets.set",
+            None,
+            true,
+            64,
+            1_000_000,
+            2048,
+        ),
+        int_setting(
+            "http_max_open",
+            "Tracker HTTP open requests",
+            "network.http.max_open",
+            "network.http.max_open.set",
+            None,
+            false,
+            1,
+            100_000,
+            512,
+        ),
+        int_setting(
+            "http_max_total_connections",
+            "Tracker HTTP total connections",
+            "network.http.max_total_connections",
+            "network.http.max_total_connections.set",
+            None,
+            false,
+            1,
+            100_000,
+            256,
+        ),
+        int_setting(
+            "http_max_host_connections",
+            "Tracker HTTP per-host connections",
+            "network.http.max_host_connections",
+            "network.http.max_host_connections.set",
+            None,
+            false,
+            1,
+            100_000,
+            64,
+        ),
+        int_setting(
+            "http_max_cache_connections",
+            "Tracker HTTP cache connections",
+            "network.http.max_cache_connections",
+            "network.http.max_cache_connections.set",
+            None,
+            false,
+            1,
+            100_000,
+            512,
+        ),
+        int_setting(
+            "http_dns_cache_timeout",
+            "Tracker DNS cache",
+            "network.http.dns_cache_timeout",
+            "network.http.dns_cache_timeout.set",
+            Some("s"),
+            false,
+            0,
+            86_400,
+            25,
+        ),
+        int_setting(
+            "trackers_numwant",
+            "Tracker numwant",
+            "trackers.numwant",
+            "trackers.numwant.set",
+            None,
+            false,
+            0,
+            10_000,
+            200,
+        ),
+        bool_setting(
+            "hash_on_completion",
+            "Hash on completion",
+            "pieces.hash.on_completion",
+            "pieces.hash.on_completion.set",
+            false,
+            true,
+        ),
+        bool_setting(
+            "session_on_completion",
+            "Persist completion state",
+            "session.on_completion",
+            "session.on_completion.set",
+            false,
+            true,
+        ),
+        bool_setting(
+            "session_use_lock",
+            "Session lock",
+            "session.use_lock",
+            "session.use_lock.set",
+            true,
+            true,
+        ),
+        bool_setting(
+            "pex",
+            "Peer exchange",
+            "protocol.pex",
+            "protocol.pex.set",
+            false,
+            true,
+        ),
+        bool_setting(
+            "udp_trackers",
+            "UDP trackers",
+            "trackers.use_udp",
+            "trackers.use_udp.set",
+            false,
+            true,
+        ),
+        enum_setting("dht_mode", "DHT mode", "dht", "dht.mode.set", false, "auto"),
+    ]
+}
+
+fn int_setting(
+    key: &'static str,
+    label: &'static str,
+    command: &'static str,
+    setter: &'static str,
+    unit: Option<&'static str>,
+    restart_required: bool,
+    minimum: i64,
+    maximum: i64,
+    default_value: i64,
+) -> RtorrentSettingDescriptor {
+    RtorrentSettingDescriptor {
+        key,
+        label,
+        command,
+        setter,
+        value_type: "int",
+        unit,
+        restart_required,
+        minimum: Some(minimum),
+        maximum: Some(maximum),
+        default_value: serde_json::json!(default_value),
+    }
+}
+
+fn bool_setting(
+    key: &'static str,
+    label: &'static str,
+    command: &'static str,
+    setter: &'static str,
+    restart_required: bool,
+    default_value: bool,
+) -> RtorrentSettingDescriptor {
+    RtorrentSettingDescriptor {
+        key,
+        label,
+        command,
+        setter,
+        value_type: "bool",
+        unit: None,
+        restart_required,
+        minimum: None,
+        maximum: None,
+        default_value: serde_json::json!(default_value),
+    }
+}
+
+fn enum_setting(
+    key: &'static str,
+    label: &'static str,
+    command: &'static str,
+    setter: &'static str,
+    restart_required: bool,
+    default_value: &'static str,
+) -> RtorrentSettingDescriptor {
+    RtorrentSettingDescriptor {
+        key,
+        label,
+        command,
+        setter,
+        value_type: "enum",
+        unit: None,
+        restart_required,
+        minimum: None,
+        maximum: None,
+        default_value: serde_json::json!(default_value),
+    }
+}
+
+pub async fn get_rtorrent_settings(State(s): State<AppState>) -> impl IntoResponse {
+    let descriptors = rtorrent_settings();
+    let overlay_path = rtorrent_overlay_path();
+    let (saved, custom_rc) = read_rtorrent_overlay(&overlay_path);
+    let mut values = Vec::with_capacity(descriptors.len());
+    for desc in &descriptors {
+        values.push(RtorrentSettingState {
+            key: desc.key,
+            live: probe_setting(&s.rt, desc.command).await,
+            saved: saved.get(desc.key).cloned(),
+        });
+    }
+    Json(RtorrentSettingsResponse {
+        settings: descriptors,
+        values,
+        overlay_path: overlay_path.display().to_string(),
+        overlay_writable: overlay_path.parent().is_some_and(|path| path.exists()),
+        custom_rc,
+        restart_supported: true,
+    })
+    .into_response()
+}
+
+pub async fn set_rtorrent_settings(
+    State(s): State<AppState>,
+    Json(patch): Json<RtorrentSettingsPatch>,
+) -> impl IntoResponse {
+    let descriptors = rtorrent_settings();
+    let mut by_key = BTreeMap::new();
+    for desc in &descriptors {
+        by_key.insert(desc.key, desc);
+    }
+
+    let mut normalized = BTreeMap::new();
+    let mut errors = Vec::new();
+    for (key, raw) in patch.values {
+        let Some(desc) = by_key.get(key.as_str()) else {
+            errors.push(format!("{key}: unknown setting"));
+            continue;
+        };
+        match normalize_setting(desc, raw) {
+            Ok(value) => {
+                normalized.insert(key, value);
+            }
+            Err(e) => errors.push(format!("{key}: {e}")),
+        }
+    }
+
+    if !errors.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(RtorrentSettingsApplyResponse {
+                saved: false,
+                restart_required: false,
+                applied: Vec::new(),
+                errors,
+                overlay_path: rtorrent_overlay_path().display().to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    let overlay_path = rtorrent_overlay_path();
+    if let Err(e) =
+        write_rtorrent_overlay(&overlay_path, &descriptors, &normalized, &patch.custom_rc)
+    {
+        tracing::error!("write rtorrent overlay: {e}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    let mut applied = Vec::new();
+    let mut apply_errors = Vec::new();
+    let mut restart_required = false;
+    if patch.apply_live {
+        for desc in &descriptors {
+            let Some(value) = normalized.get(desc.key) else {
+                continue;
+            };
+            if desc.restart_required {
+                restart_required = true;
+                continue;
+            }
+            let arg = xml_arg(desc, value);
+            match s.rt.call(desc.setter, &[arg]).await {
+                Ok(_) => applied.push(desc.key.to_owned()),
+                Err(e) => {
+                    restart_required = true;
+                    apply_errors.push(format!("{}: {e}", desc.key));
+                }
+            }
+        }
+    } else {
+        restart_required = true;
+    }
+
+    if !patch.custom_rc.trim().is_empty() {
+        restart_required = true;
+    }
+
+    Json(RtorrentSettingsApplyResponse {
+        saved: true,
+        restart_required,
+        applied,
+        errors: apply_errors,
+        overlay_path: overlay_path.display().to_string(),
+    })
+    .into_response()
+}
+
+pub async fn restart_process() -> impl IntoResponse {
+    tokio::spawn(async {
+        sleep(Duration::from_millis(250)).await;
+        tracing::warn!("restarting rtorrentNG process by admin request");
+        std::process::exit(0);
+    });
+    Json(serde_json::json!({ "restarting": true })).into_response()
+}
+
+async fn probe_setting(rt: &crate::rtorrent::Client, command: &str) -> ProbeValue<String> {
+    match rt.call(command, &[]).await {
+        Ok(value) => ProbeValue::ok(xml_setting_display(&value)),
+        Err(e) => ProbeValue::err(e.to_string()),
+    }
+}
+
+fn normalize_setting(
+    desc: &RtorrentSettingDescriptor,
+    raw: serde_json::Value,
+) -> Result<String, String> {
+    match desc.value_type {
+        "bool" => raw
+            .as_bool()
+            .map(|value| if value { "yes" } else { "no" }.to_owned())
+            .ok_or_else(|| "expected boolean".to_owned()),
+        "enum" => {
+            let value = raw
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "expected string".to_owned())?;
+            match desc.key {
+                "dht_mode" if matches!(value, "off" | "disable" | "auto" | "on") => {
+                    Ok(if value == "off" { "disable" } else { value }.to_owned())
+                }
+                "dht_mode" => Err("expected disable, auto, or on".to_owned()),
+                _ => Ok(value.to_owned()),
+            }
+        }
+        _ => {
+            let value = raw
+                .as_i64()
+                .or_else(|| raw.as_str()?.trim().parse().ok())
+                .ok_or_else(|| "expected integer".to_owned())?;
+            if let Some(min) = desc.minimum {
+                if value < min {
+                    return Err(format!("must be >= {min}"));
+                }
+            }
+            if let Some(max) = desc.maximum {
+                if value > max {
+                    return Err(format!("must be <= {max}"));
+                }
+            }
+            Ok(match desc.unit {
+                Some("M") => format!("{value}M"),
+                _ => value.to_string(),
+            })
+        }
+    }
+}
+
+fn xml_arg(desc: &RtorrentSettingDescriptor, value: &str) -> XmlValue {
+    match desc.value_type {
+        "bool" => XmlValue::from(matches!(value, "yes" | "true" | "1" | "on")),
+        "int" if desc.unit.is_none() => value.parse::<i64>().unwrap_or_default().into(),
+        _ => value.into(),
+    }
+}
+
+fn rtorrent_overlay_path() -> PathBuf {
+    std::env::var("RTNG_RTORRENT_OVERLAY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/config/rtorrent.rc"))
+}
+
+fn read_rtorrent_overlay(path: &FsPath) -> (BTreeMap<String, String>, String) {
+    let raw = std::fs::read_to_string(path).unwrap_or_default();
+    let mut saved = BTreeMap::new();
+    let mut custom = Vec::new();
+    let mut in_managed = false;
+    let mut in_custom = false;
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed == RTORRENT_MANAGED_BEGIN {
+            in_managed = true;
+            in_custom = false;
+            continue;
+        }
+        if trimmed == RTORRENT_MANAGED_END {
+            in_managed = false;
+            in_custom = true;
+            continue;
+        }
+        if in_managed {
+            if let Some((command, value)) = trimmed.split_once('=') {
+                let command = command.trim().trim_end_matches(".set");
+                let value = value.trim();
+                if let Some(desc) = rtorrent_settings().into_iter().find(|desc| {
+                    desc.command == command || desc.setter.trim_end_matches(".set") == command
+                }) {
+                    saved.insert(desc.key.to_owned(), value.to_owned());
+                }
+            }
+        } else if in_custom {
+            custom.push(line.to_owned());
+        }
+    }
+    (saved, custom.join("\n").trim().to_owned())
+}
+
+fn write_rtorrent_overlay(
+    path: &FsPath,
+    descriptors: &[RtorrentSettingDescriptor],
+    values: &BTreeMap<String, String>,
+    custom_rc: &str,
+) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut out = String::new();
+    out.push_str("# Generated by rtorrentNG. Edit from the admin UI when possible.\n");
+    out.push_str(RTORRENT_MANAGED_BEGIN);
+    out.push('\n');
+    for desc in descriptors {
+        let value = values
+            .get(desc.key)
+            .cloned()
+            .unwrap_or_else(|| setting_json_default(desc));
+        out.push_str(desc.setter);
+        out.push_str(" = ");
+        out.push_str(&value);
+        out.push('\n');
+    }
+    out.push_str(RTORRENT_MANAGED_END);
+    out.push_str("\n\n");
+    let custom = custom_rc.trim();
+    if !custom.is_empty() {
+        out.push_str("# Custom rTorrent lines. These are imported after managed settings.\n");
+        out.push_str(custom);
+        out.push('\n');
+    }
+    std::fs::write(path, out)
+}
+
+fn setting_json_default(desc: &RtorrentSettingDescriptor) -> String {
+    match desc.value_type {
+        "bool" => {
+            if desc.default_value.as_bool().unwrap_or(false) {
+                "yes".to_owned()
+            } else {
+                "no".to_owned()
+            }
+        }
+        "int" => {
+            let value = desc.default_value.as_i64().unwrap_or_default();
+            match desc.unit {
+                Some("M") => format!("{value}M"),
+                _ => value.to_string(),
+            }
+        }
+        _ => desc.default_value.as_str().unwrap_or_default().to_owned(),
+    }
+}
+
+fn xml_setting_display(value: &XmlValue) -> String {
+    match value {
+        XmlValue::String(value) => value.trim().to_owned(),
+        XmlValue::Int(value) => value.to_string(),
+        XmlValue::Bool(value) => if *value { "yes" } else { "no" }.to_owned(),
+        _ => format!("{value:?}"),
+    }
 }
 
 #[derive(Deserialize)]

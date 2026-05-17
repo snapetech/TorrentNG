@@ -1,5 +1,5 @@
-import { useMemo, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useEffect, useMemo, useState } from 'react'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, type EngineDiagnostics, type ProbeValue } from '../api/client'
 
 export function EnginePanel() {
@@ -51,6 +51,7 @@ export function EnginePanel() {
           <Capabilities data={data} />
           <HttpStack data={data} />
           <DhtStack data={data} />
+          <RtorrentSettingsPanel />
           <ProfileDrift data={data} />
           <CommandIndex commands={commands} />
         </div>
@@ -202,6 +203,171 @@ function ProfileDrift({ data }: { data: EngineDiagnostics }) {
       )}
     </Panel>
   )
+}
+
+function RtorrentSettingsPanel() {
+  const qc = useQueryClient()
+  const { data, isLoading, error } = useQuery({
+    queryKey: ['rtorrent-settings'],
+    queryFn: api.rtorrentSettings.get,
+    staleTime: 2_000,
+  })
+  const [draft, setDraft] = useState<Record<string, string | number | boolean>>({})
+  const [customRc, setCustomRc] = useState('')
+  const [notice, setNotice] = useState<{ tone: 'ok' | 'warn' | 'error'; text: string } | null>(null)
+
+  useEffect(() => {
+    if (!data) return
+    const next: Record<string, string | number | boolean> = {}
+    for (const setting of data.settings) {
+      const row = data.values.find(value => value.key === setting.key)
+      const value = row?.saved ?? row?.live.value ?? setting.default_value
+      next[setting.key] = inputValue(setting.value_type, value)
+    }
+    setDraft(next)
+    setCustomRc(data.custom_rc)
+  }, [data])
+
+  const save = useMutation({
+    mutationFn: () => api.rtorrentSettings.save(draft, customRc, true),
+    onSuccess: result => {
+      qc.invalidateQueries({ queryKey: ['rtorrent-settings'] })
+      qc.invalidateQueries({ queryKey: ['engine'] })
+      const bits = [`saved ${result.applied.length} live setting${result.applied.length === 1 ? '' : 's'}`]
+      if (result.restart_required) bits.push('restart required')
+      if (result.errors.length) bits.push(`${result.errors.length} live apply error${result.errors.length === 1 ? '' : 's'}`)
+      setNotice({ tone: result.errors.length ? 'warn' : 'ok', text: bits.join(' · ') })
+    },
+    onError: e => setNotice({ tone: 'error', text: String(e) }),
+  })
+  const restart = useMutation({
+    mutationFn: api.rtorrentSettings.restart,
+    onSuccess: () => setNotice({ tone: 'warn', text: 'Restart requested. The container/service should come back automatically.' }),
+    onError: e => setNotice({ tone: 'error', text: String(e) }),
+  })
+
+  return (
+    <Panel wide>
+      <Subhead>rTorrent Limits</Subhead>
+      {isLoading && <span className="rtng-skeleton" style={{ width: '70%', height: 12 }} />}
+      {error && <InlineNotice>rTorrent settings unavailable</InlineNotice>}
+      {data && (
+        <div style={{ display: 'grid', gap: 10 }}>
+          <div style={{ color: 'var(--faint)', fontSize: 12 }}>
+            Saved to <span style={{ color: 'var(--muted)', fontFamily: 'monospace' }}>{data.overlay_path}</span>.
+            Live-safe values are applied immediately; port/file/socket and custom lines need a daemon restart.
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(230px, 1fr))', gap: 8 }}>
+            {data.settings.map(setting => {
+              const row = data.values.find(value => value.key === setting.key)
+              const value = draft[setting.key] ?? inputValue(setting.value_type, row?.saved ?? row?.live.value ?? setting.default_value)
+              return (
+                <label key={setting.key} className="rtng-form-card" style={{
+                  border: '1px solid var(--border)', borderRadius: 7, background: 'var(--surface)', padding: 9,
+                  display: 'grid', gap: 5,
+                }}>
+                  <span style={{ display: 'flex', justifyContent: 'space-between', gap: 8, color: 'var(--text)', fontSize: 12, fontWeight: 800 }}>
+                    <span>{setting.label}</span>
+                    {setting.restart_required && <span style={{ color: 'var(--warning)', fontSize: 10 }}>restart</span>}
+                  </span>
+                  {setting.value_type === 'bool' ? (
+                    <select
+                      value={String(Boolean(value))}
+                      onChange={e => setDraft(prev => ({ ...prev, [setting.key]: e.target.value === 'true' }))}
+                      style={inputStyle}
+                    >
+                      <option value="true">On</option>
+                      <option value="false">Off</option>
+                    </select>
+                  ) : setting.key === 'dht_mode' ? (
+                    <select value={String(value)} onChange={e => setDraft(prev => ({ ...prev, [setting.key]: e.target.value }))} style={inputStyle}>
+                      <option value="auto">Auto</option>
+                      <option value="on">On</option>
+                      <option value="disable">Disabled</option>
+                    </select>
+                  ) : (
+                    <input
+                      type="number"
+                      min={setting.minimum ?? undefined}
+                      max={setting.maximum ?? undefined}
+                      value={Number(value)}
+                      onChange={e => setDraft(prev => ({ ...prev, [setting.key]: Number(e.target.value) }))}
+                      style={inputStyle}
+                    />
+                  )}
+                  <span style={{ color: 'var(--faint)', fontSize: 10, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    live {row?.live.value ?? 'unavailable'}{setting.unit ? ` ${setting.unit}` : ''} · {setting.command}
+                  </span>
+                </label>
+              )
+            })}
+          </div>
+          <label style={{ display: 'grid', gap: 5 }}>
+            <span style={{ color: 'var(--text)', fontSize: 12, fontWeight: 800 }}>Custom rTorrent lines</span>
+            <textarea
+              value={customRc}
+              onChange={e => setCustomRc(e.target.value)}
+              rows={4}
+              placeholder="Optional advanced rtorrent.rc overrides imported after managed settings"
+              style={{ ...inputStyle, resize: 'vertical', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}
+            />
+          </label>
+          {notice && <div style={{
+            color: notice.tone === 'error' ? 'var(--danger)' : notice.tone === 'warn' ? 'var(--warning)' : 'var(--success)',
+            fontSize: 12,
+          }}>{notice.text}</div>}
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            <button onClick={() => save.mutate()} disabled={save.isPending} style={buttonStyle('var(--accent)', 'var(--accent-soft)', 'var(--accent-text)')}>
+              {save.isPending ? 'Saving…' : 'Save and apply live'}
+            </button>
+            <button
+              onClick={() => {
+                if (window.confirm('Restart rTorrent/rtorrentNG now? Active transfers will reconnect after the service comes back.')) restart.mutate()
+              }}
+              disabled={restart.isPending}
+              style={buttonStyle('var(--warning)', 'color-mix(in srgb, var(--warning) 12%, var(--surface))', 'var(--warning)')}
+            >
+              {restart.isPending ? 'Restarting…' : 'Restart daemon'}
+            </button>
+          </div>
+        </div>
+      )}
+    </Panel>
+  )
+}
+
+function inputValue(type: string, value: unknown): string | number | boolean {
+  if (type === 'bool') return value === true || value === 'true' || value === 'yes' || value === '1'
+  if (typeof value === 'number' || typeof value === 'boolean') return value
+  const text = String(value ?? '')
+  const numeric = Number(text.replace(/M$/, ''))
+  return Number.isFinite(numeric) && type === 'int' ? numeric : text
+}
+
+const inputStyle: React.CSSProperties = {
+  minWidth: 0,
+  width: '100%',
+  boxSizing: 'border-box',
+  background: 'var(--bg)',
+  border: '1px solid var(--border-strong)',
+  borderRadius: 5,
+  color: 'var(--text)',
+  padding: '5px 8px',
+  fontSize: 12,
+  outline: 'none',
+}
+
+function buttonStyle(border: string, background: string, color: string): React.CSSProperties {
+  return {
+    background,
+    border: `1px solid ${border}`,
+    borderRadius: 5,
+    color,
+    padding: '6px 10px',
+    fontSize: 12,
+    fontWeight: 800,
+    cursor: 'pointer',
+  }
 }
 
 function CommandIndex({ commands }: { commands?: { ok: boolean; count: number; commands: string[]; error: string | null } }) {

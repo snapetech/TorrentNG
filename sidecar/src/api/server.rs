@@ -1,6 +1,6 @@
 use axum::{
     middleware,
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
     Router,
 };
 use std::sync::Arc;
@@ -89,8 +89,13 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/engine", get(handlers::engine_diagnostics))
         .route("/api/v1/engine/commands", get(handlers::engine_commands))
         .route(
+            "/api/v1/engine/rtorrent-settings",
+            get(handlers::get_rtorrent_settings).put(handlers::set_rtorrent_settings),
+        )
+        .route("/api/v1/engine/restart", post(handlers::restart_process))
+        .route(
             "/api/v1/session/features",
-            axum::routing::patch(handlers::set_session_features),
+            patch(handlers::set_session_features),
         )
         .route("/api/v1/cross-seed", post(handlers::cross_seed_helper))
         .route(

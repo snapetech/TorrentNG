@@ -273,8 +273,14 @@ impl Db {
             ("active", "is_active=1"),
             ("inactive", "is_active=0"),
             ("stalled", "is_open=1 AND is_active=0"),
-            ("stalled_uploading", "complete=1 AND is_open=1 AND is_active=0"),
-            ("stalled_downloading", "complete=0 AND is_open=1 AND is_active=0"),
+            (
+                "stalled_uploading",
+                "complete=1 AND is_open=1 AND is_active=0",
+            ),
+            (
+                "stalled_downloading",
+                "complete=0 AND is_open=1 AND is_active=0",
+            ),
             ("checking", "state=2"),
             ("moving", "0=1"),
             ("error", "message != '' AND is_active=0"),

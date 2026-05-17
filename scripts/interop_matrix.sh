@@ -88,10 +88,10 @@ require_cmd() {
 
 client_url() {
   case "$1" in
-    rusttorrentd) echo "http://127.0.0.1:${INTEROP_RUST_HOST_PORT:-38080}" ;;
-    qbittorrent) echo "http://127.0.0.1:${INTEROP_QBIT_HOST_PORT:-38081}" ;;
-    transmission) echo "http://127.0.0.1:${INTEROP_TRANSMISSION_HOST_PORT:-38091}" ;;
-    deluge) echo "http://127.0.0.1:${INTEROP_DELUGE_HOST_PORT:-38112}" ;;
+    rusttorrentd) echo "http://127.0.0.1:${INTEROP_RUST_HOST_PORT:-28180}" ;;
+    qbittorrent) echo "http://127.0.0.1:${INTEROP_QBIT_HOST_PORT:-28181}" ;;
+    transmission) echo "http://127.0.0.1:${INTEROP_TRANSMISSION_HOST_PORT:-28191}" ;;
+    deluge) echo "http://127.0.0.1:${INTEROP_DELUGE_HOST_PORT:-28212}" ;;
     *) return 1 ;;
   esac
 }
@@ -541,6 +541,27 @@ wait_clients_complete() {
   done
 }
 
+wait_explicit_peer_complete() {
+  local timeout="$1" fixture="$2" info_hash="$3" peer_client="$4"; shift 4
+  local clients=("$@") start now progress
+  start="$(date +%s)"
+  while true; do
+    bridge_client_peer_to_rust "$peer_client" "$info_hash" || true
+    poll_rust_compat || true
+    local all_done=1
+    for client in "${clients[@]}"; do
+      progress="$(client_progress "$client" "$fixture" 2>/dev/null || echo 0)"
+      awk -v p="$progress" 'BEGIN { exit !(p >= 0.999) }' || all_done=0
+    done
+    [[ "$all_done" == "1" ]] && return 0
+    now="$(date +%s)"
+    if (( now - start > timeout )); then
+      return 1
+    fi
+    sleep 5
+  done
+}
+
 rust_observed_peers() {
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/qb/v2/sync/torrentPeers?hash=$1" |
     jq '.peers | length' 2>/dev/null || echo 0
@@ -555,7 +576,7 @@ bridge_client_peer_to_rust() {
   ip="$(container_ip "$client")"
   case "$client" in
     qbittorrent) port=6882 ;;
-    transmission) port=6883 ;;
+    transmission) port=51413 ;;
     deluge) port=6884 ;;
     rtorrent) port=6885 ;;
     *) return 1 ;;
@@ -721,14 +742,14 @@ run_explicit_peer_case() {
   fixture="$(case_fixture single-16m rust-explicit-peer-private)"
   torrent="$(make_torrent "$fixture" "$fixture" private-explicit)"
   info_hash="$(torrent_info_hash "$torrent")"
-  seed_fixture_for_client qbittorrent "$fixture"
-  add_to_client qbittorrent "$torrent" seed || status="FAIL"
+  seed_fixture_for_client transmission "$fixture"
+  add_to_client transmission "$torrent" seed || status="FAIL"
   add_to_client rusttorrentd "$torrent" || status="FAIL"
-  bridge_client_peer_to_rust qbittorrent "$info_hash" || status="FAIL"
-  wait_clients_complete "$TIMEOUT_LOCAL" "$fixture" qbittorrent rusttorrentd || status="FAIL"
-  verify_fixture_hashes qbittorrent "$fixture" || status="FAIL"
+  bridge_client_peer_to_rust transmission "$info_hash" || status="FAIL"
+  wait_explicit_peer_complete "$TIMEOUT_LOCAL" "$fixture" "$info_hash" transmission transmission rusttorrentd || status="FAIL"
+  verify_fixture_hashes transmission "$fixture" || status="FAIL"
   verify_fixture_hashes rusttorrentd "$fixture" || status="FAIL"
-  append_report "- Seeder: qbittorrent"
+  append_report "- Seeder: transmission"
   append_report "- Leecher: rusttorrentd"
   append_report "- Fixture: single-16m"
   append_report "- Torrent mode: private explicit peer, no tracker, no webseed"
@@ -746,17 +767,17 @@ run_restart_recovery_case() {
   fixture="$(case_fixture single-64m rust-restart-recovery)"
   torrent="$(make_torrent "$fixture" "$fixture" tracker-webseed)"
   info_hash="$(torrent_info_hash "$torrent")"
-  seed_fixture_for_client qbittorrent "$fixture"
-  add_to_client qbittorrent "$torrent" seed || status="FAIL"
+  seed_fixture_for_client transmission "$fixture"
+  add_to_client transmission "$torrent" seed || status="FAIL"
   add_to_client rusttorrentd "$torrent" || status="FAIL"
-  bridge_client_peer_to_rust qbittorrent "$info_hash" || true
+  bridge_client_peer_to_rust transmission "$info_hash" || true
   sleep "${INTEROP_RESTART_BEFORE_SECS:-5}"
   compose restart -t 20 rusttorrentd >/dev/null || status="FAIL"
   wait_http rusttorrentd "$(client_url rusttorrentd)/health" 120 || status="FAIL"
-  bridge_client_peer_to_rust qbittorrent "$info_hash" || true
-  wait_clients_complete "$TIMEOUT_LOCAL" "$fixture" qbittorrent rusttorrentd || status="FAIL"
+  bridge_client_peer_to_rust transmission "$info_hash" || true
+  wait_explicit_peer_complete "$TIMEOUT_LOCAL" "$fixture" "$info_hash" transmission transmission rusttorrentd || status="FAIL"
   verify_fixture_hashes rusttorrentd "$fixture" || status="FAIL"
-  append_report "- Seeder: qbittorrent"
+  append_report "- Seeder: transmission"
   append_report "- Leecher: rusttorrentd"
   append_report "- Fixture: single-64m"
   append_report "- Restart delay: ${INTEROP_RESTART_BEFORE_SECS:-5}s"
@@ -909,7 +930,7 @@ public_bridge_peers() {
     peers+=("$ip:6882")
   fi
   if ip="$(container_ip transmission 2>/dev/null)" && [[ -n "$ip" ]]; then
-    peers+=("$ip:6883")
+    peers+=("$ip:51413")
   fi
   if ip="$(container_ip deluge 2>/dev/null)" && [[ -n "$ip" ]]; then
     peers+=("$ip:6884")

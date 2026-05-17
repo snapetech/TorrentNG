@@ -152,13 +152,13 @@ impl Client {
 
                     #[cfg(unix)]
                     {
-                    let mut stream = UnixStream::connect(path)
-                        .await
-                        .with_context(|| format!("connect to SCGI socket {path}"))?;
-                    stream.write_all(&packet).await?;
-                    let mut buf = Vec::new();
-                    stream.read_to_end(&mut buf).await?;
-                    Ok::<_, anyhow::Error>(buf)
+                        let mut stream = UnixStream::connect(path)
+                            .await
+                            .with_context(|| format!("connect to SCGI socket {path}"))?;
+                        stream.write_all(&packet).await?;
+                        let mut buf = Vec::new();
+                        stream.read_to_end(&mut buf).await?;
+                        Ok::<_, anyhow::Error>(buf)
                     }
                 }
                 Transport::Tcp(addr) => {

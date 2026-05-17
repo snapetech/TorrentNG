@@ -15,17 +15,26 @@ protocol.pex.set = yes
 trackers.use_udp.set = yes
 
 # Performance tuning for large seed libraries
-# Limit global slots to avoid connection storms
-throttle.max_uploads.global.set = 500
-throttle.max_downloads.global.set = 50
+# Home/test builds bias toward more concurrent activity; override in
+# /config/rtorrent.rc for tighter production envelopes.
+throttle.max_uploads.global.set = 350
+throttle.max_downloads.global.set = 300
 
 # Per-torrent slot limits
 throttle.max_uploads.set = 10
-throttle.max_downloads.set = 4
+throttle.max_downloads.set = 12
 
 # Piece/chunk settings
 pieces.hash.on_completion.set = yes
-pieces.memory.max.set = 2048M
+pieces.memory.max.set = 4096M
+
+# File/socket and tracker concurrency
+network.max_open_files.set = 4096
+network.max_open_sockets.set = 2048
+network.http.max_open.set = 512
+network.http.max_total_connections.set = 256
+network.http.max_host_connections.set = 64
+network.http.max_cache_connections.set = 512
 
 # Session
 session.use_lock.set = yes
@@ -36,7 +45,7 @@ session.on_completion.set = yes
 # Do NOT expose SCGI over TCP to untrusted networks.
 
 # Announce throttling — avoid hammering trackers on restart
-trackers.numwant.set = 80
+trackers.numwant.set = 200
 
 # Logging
 log.open_file = "rtorrent", /var/log/rtorrent/rtorrent.log

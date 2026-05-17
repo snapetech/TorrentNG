@@ -171,6 +171,7 @@ export function App() {
   const [themeId, setThemeId] = useState(loadThemeId)
   const [themeMode, setThemeMode] = useState<ThemeMode>(loadThemeMode)
   const [detailAutoDisplay, setDetailAutoDisplay] = useState(loadDetailAutoDisplay)
+  const activeTheme = findPalette(themeId)[themeMode]
 
   const isAuthed = activeTab.isActive && authState === 'authenticated'
   const query = useTorrentsInfinite(params, isAuthed)
@@ -559,6 +560,21 @@ export function App() {
 
         <span className="rtng-topbar-spacer" style={{ flex: '1 0 12px' }} />
         <div className="rtng-theme-controls" style={{ display: 'flex', alignItems: 'center', gap: 6, flex: '0 0 auto' }}>
+          <span
+            className="rtng-theme-swatch"
+            title={`${findPalette(themeId).label} ${themeMode}`}
+            aria-hidden="true"
+            style={{
+              ['--swatch-bg' as string]: activeTheme.bg,
+              ['--swatch-panel' as string]: activeTheme.panel,
+              ['--swatch-surface' as string]: activeTheme.surface,
+              ['--swatch-accent' as string]: activeTheme.accent,
+            }}
+          >
+            <span />
+            <span />
+            <span />
+          </span>
           <select
             aria-label="Theme palette"
             value={themeId}
@@ -614,6 +630,10 @@ export function App() {
             onSection={setSettingsSection}
             mediaInference={mediaInference}
             onMediaInference={updateMediaInference}
+            themeId={themeId}
+            themeMode={themeMode}
+            onTheme={setThemeId}
+            onThemeMode={setThemeMode}
           />
         )}
 
@@ -788,11 +808,15 @@ function StandbyScreen({ onTakeOver }: { onTakeOver: () => void }) {
   )
 }
 
-function SettingsView({ section, onSection, mediaInference, onMediaInference }: {
+function SettingsView({ section, onSection, mediaInference, onMediaInference, themeId, themeMode, onTheme, onThemeMode }: {
   section: SettingsSection
   onSection: (section: SettingsSection) => void
   mediaInference: MediaInferenceMode
   onMediaInference: (mode: MediaInferenceMode) => void
+  themeId: string
+  themeMode: ThemeMode
+  onTheme: (id: string) => void
+  onThemeMode: (mode: ThemeMode) => void
 }) {
   const sections: Array<[SettingsSection, string, string]> = [
     ['library', 'Library', '▦'],
@@ -846,7 +870,15 @@ function SettingsView({ section, onSection, mediaInference, onMediaInference }: 
         {section === 'support' && (<>
           <PanelTitle title="Support" subtitle="Project resources and community support" />
           <PanelFrame>
-            <AppearancePanel mediaInference={mediaInference} onMediaInference={onMediaInference} />
+            <AppearancePanel
+              mediaInference={mediaInference}
+              onMediaInference={onMediaInference}
+              themes={PALETTES}
+              themeId={themeId}
+              themeMode={themeMode}
+              onTheme={onTheme}
+              onThemeMode={onThemeMode}
+            />
           </PanelFrame>
           <div style={{
             padding: 18, display: 'grid', gap: 10, maxWidth: 860,
