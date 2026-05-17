@@ -46,12 +46,14 @@ Implemented and covered by automated tests:
 - Current real-device storage evidence includes local NVMe/SSD and the kspls0
   HDD-backed LVM media pool. The LVM report passes the required 5x wall-clock
   target at 8192 blocks and collapses backend reads from 8192 to 1.
+- The kspls0 LVM/PV extent probe sampled independent files mapping to multiple
+  rotational PVs (`/dev/sdb` and `/dev/sdh`) under the same logical LV.
 
 ## Remaining Gaps
 
 | Area | Gap | Risk | Next Work |
 | --- | --- | --- | --- |
-| LVM physical-drive placement evidence | The kspls0 HDD evidence covers the media pool as one logical device (`/dev/dm-0`) over rotational PVs, not deterministic placement on individual physical disks. | Cross-PV behavior inside the LVM pool may differ from logical-device scheduler behavior visible through normal paths. | Add an LVM extent-mapping probe or lower-level PV-targeted benchmark if release claims need per-physical-drive evidence. |
+| Deterministic LVM PV placement control | The kspls0 extent probe shows the pool can allocate independent files on multiple rotational PVs, but ordinary path writes still do not let TorrentNG choose a specific PV. | Cross-PV behavior inside the LVM pool is allocator-dependent, so path-level scheduling cannot promise physical-drive affinity. | Use LVM extent mapping for evidence, or add lower-level PV-targeted probes only if release claims require deterministic per-drive placement. |
 | `io_uring` frame-pool slot pinning | `UringBackend` uses worker-owned fixed buffers when available, but the global frame pool does not yet hand out stable registered buffer slots. | Extra copies remain in the uring path, and fixed-buffer metrics can overstate how much of the full storage path is zero-copy. | Add frame-pool slot leases through the backend API after hardware reports prove `uring` should graduate from explicit opt-in. |
 | Move/import certification | Planning, a conservative executor, and a local certification runner exist, but representative multi-TB hardware soak evidence is still required for release claims. | Large library moves can still be operationally risky without full end-to-end hardware and rollback reports. | Run `scripts/storage_move_import_certification.sh`, then repeat move/import certification on representative multi-TB trees and publish rollback/failure reports. |
 
