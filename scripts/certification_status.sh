@@ -124,6 +124,7 @@ row "Proton-routed TorrentNG DHT" 'proton-tng-dht-*.md'
 row "Mobile read-flow" 'mobile-compat-*.md'
 row "Phase 1 ruTorrent" 'phase1-cert-*.md'
 row "Universal compatibility" 'universal-compat-*.md'
+row "Universal live compatibility" 'universal-live-*.md'
 row "Migration corpus" 'migration-corpus-*.md'
 row "Synthetic benchmark" 'report-*.md' "$BENCHMARK_DIR"
 row "Short soak" 'soak-202*.md'

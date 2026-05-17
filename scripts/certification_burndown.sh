@@ -32,7 +32,13 @@ action_for() {
   local status="$2"
   case "$gate:$status" in
     "Universal compatibility:PASS_WITH_SKIPS")
-      printf 'Run live legs as needed: `UNIVERSAL_COMPAT_LIVE=1 scripts/universal_compatibility_certification.sh`, `UNIVERSAL_COMPAT_PUBLIC=1 scripts/universal_compatibility_certification.sh`, and `UNIVERSAL_COMPAT_REAL_DEVICE=1 scripts/universal_compatibility_certification.sh` after configuring Docker, public-swarm policy, and storage target paths.'
+      printf 'Run `scripts/universal_live_certification.sh` for Docker local interop. Add `UNIVERSAL_LIVE_PUBLIC=1` for approved public torrent downloads and `UNIVERSAL_LIVE_REAL_DEVICE=1 TNG_STORAGE_BENCH_DIR=/mnt/target` for target storage hardware.'
+      ;;
+    "Universal live compatibility:MISSING")
+      printf 'Run `scripts/universal_live_certification.sh` for Docker local interop, or set `UNIVERSAL_LIVE_PUBLIC=1` / `UNIVERSAL_LIVE_REAL_DEVICE=1` for the external legs needed by the release.'
+      ;;
+    "Universal live compatibility:PASS_WITH_SKIPS")
+      printf 'Rerun `scripts/universal_live_certification.sh` with the skipped live legs enabled: `UNIVERSAL_LIVE_PUBLIC=1` for public torrents and/or `UNIVERSAL_LIVE_REAL_DEVICE=1 TNG_STORAGE_BENCH_DIR=/mnt/target` for storage hardware.'
       ;;
     "Migration corpus:PASS_WITH_GAPS")
       printf 'Populate `testdata/migration-corpus/{qbittorrent,transmission,deluge,utorrent,biglybt,tixati,rtorrent,generic}` with real exported artifacts, then run `TNG_REQUIRE_MIGRATION_CORPUS=1 scripts/migration_corpus_certification.sh`.'
