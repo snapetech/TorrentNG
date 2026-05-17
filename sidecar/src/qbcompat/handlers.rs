@@ -1512,7 +1512,7 @@ fn qb_server_state(rates: TransferRates) -> serde_json::Value {
 mod tests {
     use crate::{cache::AppEventRow, rtorrent::TransferRates};
 
-    use super::{qb_log_entry, qb_server_state, LogMainQuery};
+    use super::{qb_server_state, qbit_log_entry, LogMainQuery};
 
     #[test]
     fn qb_server_state_includes_current_transfer_rates() {
@@ -1528,7 +1528,7 @@ mod tests {
 
     #[test]
     fn qbit_log_entry_maps_app_event_levels() {
-        let entry = qb_log_entry(AppEventRow {
+        let entry = qbit_log_entry(AppEventRow {
             event_id: Some(7),
             occurred_at: 1_700_000_000,
             level: "warning".to_owned(),
