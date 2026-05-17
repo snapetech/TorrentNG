@@ -77,8 +77,10 @@ scripts/storage_real_device_benchmark.sh /path/on/storage
 
 ## Performance Gates
 
-These gates need benchmark harnesses before they can be marked complete in the
-burndown:
+The local harnesses exist and are wired into the storage certification scripts.
+The remaining distinction is where the evidence was collected: local proxy
+tests prove behavior; hardware-specific release claims require the matching
+target device.
 
 | Gate | Target |
 | --- | --- |

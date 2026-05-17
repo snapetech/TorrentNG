@@ -40,13 +40,17 @@ release claims.
 | Native storage config | Implemented for scheduler `StorageIoConfig` knobs in `[storage]` TOML | `rt-config` storage defaults/parse tests; `storage_io_config_maps_native_storage_toml` |
 | Root-confined move/import/delete | Implemented as a separate planned executor | `execute_storage_plan_under_roots`; move/import certification script |
 
-## External Release Evidence Gates
+## Remaining Evidence Boundaries
 
-| Priority | Area | Current implementation state | Why it matters | Required release evidence |
+These are not open implementation work. They are the remaining places
+where TorrentNG must not overclaim storage performance or topology behavior
+without running on the matching target hardware.
+
+| Boundary | Current implementation state | Why it matters | Required release evidence |
 | --- | --- | --- | --- | --- |
-| P1 | `io_uring` fixed-buffer/frame integration | `UringBackend` can return owned reads backed by registered frame slots and reports `fixed_buffer_strategy=frame_pool_slots` when the kernel accepts registered buffers. The graduation script can enforce `TNG_STORAGE_URING_REQUIRE_FRAME_POOL_SLOTS=1`. | Operators can distinguish true registered-frame reads from fallback `pread`; `uring` still needs target-hardware proof before it can become an automatic default. | Benchmark `pread` vs `uring` on target hardware with selected-backend, fixed-buffer, registered-file, and throughput gates before changing `auto`. |
-| P2 | Hardware evidence automation | `scripts/storage_release_certification.sh` runs the storage hardware matrix, `io_uring` graduation, real-root move/import fixture, and generated certification report index as one release evidence suite. The hardware matrix includes seed-read locality, hot-fd reuse, recheck runtime progress, elevator throughput, optional syscall counts, and optional LVM/PV extent evidence. Operator target roots and hardware runs are still host supplied. | Production claims still need actual HDD/NVMe/network filesystem evidence, not unit tests alone. | Run `scripts/storage_release_certification.sh /mnt/nvme /mnt/hdd` on target hardware and publish the generated reports with release artifacts. |
-| P2 | Physical PV affinity | LVM evidence can show which PVs received extents, but TorrentNG does not control ordinary write placement within an LV. | Avoids overclaiming per-spindle scheduling when the allocator owns physical placement. | Keep this as evidence-only unless the product needs explicit PV-targeted placement. |
+| `io_uring` automatic defaulting | `UringBackend` can return owned reads backed by registered frame slots and reports `fixed_buffer_strategy=frame_pool_slots` when the kernel accepts registered buffers. The graduation script can enforce `TNG_STORAGE_URING_REQUIRE_FRAME_POOL_SLOTS=1`. | Operators can distinguish true registered-frame reads from fallback `pread`; `uring` still needs target-hardware proof before it can become an automatic default. | Benchmark `pread` vs `uring` on target hardware with selected-backend, fixed-buffer, registered-file, and throughput gates before changing `auto`. |
+| Hardware performance claims | `scripts/storage_release_certification.sh` runs the storage hardware matrix, `io_uring` graduation, real-root move/import fixture, and generated certification report index as one release evidence suite. The hardware matrix includes seed-read locality, hot-fd reuse, recheck runtime progress, elevator throughput, optional syscall counts, and optional LVM/PV extent evidence. Operator target roots and hardware runs are still host supplied. | Production claims still need actual HDD/NVMe/network filesystem evidence, not unit tests alone. | Run `scripts/storage_release_certification.sh /mnt/nvme /mnt/hdd` on target hardware and publish the generated reports with release artifacts. |
+| Physical PV affinity | LVM evidence can show which PVs received extents, but TorrentNG does not control ordinary write placement within an LV. | Avoids overclaiming per-spindle scheduling when the allocator owns physical placement. | Keep this as evidence-only unless the product needs explicit PV-targeted placement. |
 
 ## Verification Baseline
 

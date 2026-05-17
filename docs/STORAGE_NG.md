@@ -1,14 +1,14 @@
 # Storage NG — Next-Generation Disk I/O Design
 
-This document specifies the next-generation disk I/O subsystem for the native
-Rust engine. It supersedes the implementation behavior of `crates/rt-storage`
-(`scheduler.rs`, `verify.rs`) while preserving its public surface
-(`MountScheduler`, `IoClass`, `SchedulerConfig`, `PieceVerifier`,
-`scheduled_read`, `scheduled_write`) as a compatibility shim during migration.
+This document describes the next-generation disk I/O subsystem in the native
+Rust engine. The implementation lives in `crates/rt-storage` and preserves the
+public surface used by `rt-engine` (`MountScheduler`, `IoClass`,
+`SchedulerConfig`, `PieceVerifier`, `scheduled_read`, `scheduled_write`) while
+adding the bounded disk layer beneath it.
 
-It is a design target, not current behavior. See
-`docs/ENGINE.md` §"Storage model" for the original principle and
-`memory`/`storage-io-gaps` for the gap analysis that motivated this.
+For the implementation/evidence map, see
+[`STORAGE_WORK_MAP.md`](STORAGE_WORK_MAP.md). For the executable matrix, see
+[`STORAGE_NG_TEST_MATRIX.md`](STORAGE_NG_TEST_MATRIX.md).
 
 ---
 
@@ -194,8 +194,8 @@ fds promptly. Handles are only ever created for `Hot` torrents.
 
 All I/O is **positioned** (`pread`/`pwrite` via `FileExt::read_at` /
 io_uring), so a single cached fd is safely shared by concurrent ops with no
-`seek` and no per-op open/close — this is the property that makes the cache
-usable and is why `seek`-based `scheduled_read` must go.
+`seek` and no per-op open/close. This is the property that makes the cache
+usable and is why the old `seek`-based `scheduled_read` path was replaced.
 
 ```rust
 pub struct HandleCache {
@@ -328,31 +328,36 @@ here instead of defaulting to `Unknown` (as `engine.rs` does today).
 
 ---
 
-## Migration / compatibility
+## Implementation Status
 
-Incremental; `rt-storage`'s public API is the seam.
+The migration phases are implemented on `main` and covered by the storage
+feature matrix:
 
-1. **Phase A (parity floor):** handle cache + positioned I/O + frame pool +
-   `PreadBackend`, behind the existing `scheduled_read`/`scheduled_write`
-   signatures. No `rt-engine` changes. Removes the open/close-per-block
-   storm immediately.
-2. **Phase B (standout):** per-device elevator + topology detection. Ship
-   early on a real HDD dataset to validate the seek win against the
-   `recheck-vs-seeding` benchmark.
-3. **Phase C (scale unlock):** tiered torrent model in `rt-engine`
-   (Dormant/Warm/Hot + shared reactor). Largest refactor, largest payoff.
-4. **Phase D (efficiency):** `UringBackend`, group-commit durability,
-   adaptive readahead + fadvise, piece-aggregated writes.
+1. **Phase A (parity floor):** handle cache, positioned I/O, frame pool, and
+   `PreadBackend` are behind the existing compatibility signatures.
+2. **Phase B (standout):** topology detection, topology-derived
+   preallocation, per-device queue sharing, peer-read readahead, and the HDD
+   peer-read elevator are implemented.
+3. **Phase C (scale unlock):** Dormant/Warm/Hot tier logic, shared timer-wheel
+   behavior, and scale proxy tests are implemented in `rt-engine`.
+4. **Phase D (efficiency):** runtime backend selection, explicit `io_uring`,
+   registered frame-slot reads, sync barriers, bounded recheck, RAM-first
+   completed-piece hashing, adaptive readahead/fadvise, and sparse recheck are
+   implemented.
 
-Each phase is independently shippable and benchmarkable.
+The remaining boundaries are release-evidence boundaries, not local
+implementation gaps: HDD throughput claims require an HDD target, LVM/PV
+placement claims require an LVM target with extent probing enabled, and
+automatic `io_uring` defaulting requires target-hardware graduation evidence.
 
 ---
 
 ## Risks and honest tradeoffs
 
-- **Tiered model is a real refactor** of the one-task-per-torrent assumption
-  in `torrent_task.rs`. Highest value, highest risk; everything else is
-  additive beneath the `MountScheduler` API.
+- **Tiered model changes the one-task-per-torrent assumption** in
+  `torrent_task.rs`. The implemented tests cover the current Dormant/Warm/Hot
+  state machine and scale proxies, but production soak evidence still matters
+  before making large-fleet memory claims.
 - **Elevator adds bounded read latency** (the budget). Invisible for
   seeding; `choke_critical` + `Foreground` bypass protect the cases that
   care. Must never delay a block to a peer about to be unchoked.
@@ -360,9 +365,9 @@ Each phase is independently shippable and benchmarkable.
   isolation contains the blast radius — correct device resolution is
   load-bearing; a wrong mapping (e.g. mergerfs branch miss) degrades
   ordering, never correctness.
-- **io_uring portability:** the `DiskBackend` trait and `PreadBackend` must
-  exist from day one, not be retrofitted. io_uring is an optimization, not a
-  requirement.
+- **io_uring portability:** the `DiskBackend` trait and `PreadBackend` are the
+  portable baseline. `io_uring` is an explicit optimization path, not a
+  requirement, until target hardware proves it should be selected by `auto`.
 - **`fadvise(DONTNEED)` can hurt** if a "cold" torrent is about to get hot;
   drive it from the tier signal, not per-op heuristics, and never on `Hot`.
 
