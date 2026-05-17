@@ -2362,7 +2362,14 @@ impl TorrentTask {
             match rt_db::get_job(&db, job_id) {
                 Ok(job) => job,
                 Err(e) => {
-                    warn!(job_id, err = %e, "failed to load recheck job");
+                    warn!(
+                        component = "db",
+                        operation = "load_recheck_job",
+                        job_id,
+                        result = "error",
+                        error = %e,
+                        "failed to load recheck job"
+                    );
                     return;
                 }
             }
@@ -2400,11 +2407,27 @@ impl TorrentTask {
         };
         let db = self.db.lock().expect("database mutex poisoned");
         if let Err(e) = rt_db::upsert_job(&db, &job) {
-            warn!(job_id, err = %e, "failed to persist recheck progress");
+            warn!(
+                component = "db",
+                operation = "persist_recheck_progress",
+                job_id,
+                state,
+                result = "error",
+                error = %e,
+                "failed to persist recheck progress"
+            );
             return;
         }
         if let Err(e) = rt_db::append_job_event(&db, &event) {
-            warn!(job_id, err = %e, "failed to append recheck progress event");
+            warn!(
+                component = "db",
+                operation = "append_job_event",
+                job_id,
+                kind = %event.kind,
+                result = "error",
+                error = %e,
+                "failed to append recheck progress event"
+            );
         }
     }
 

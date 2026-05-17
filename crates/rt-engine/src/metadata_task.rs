@@ -91,7 +91,15 @@ pub async fn run_metadata_task(
                             return;
                         }
                         Err(e) => {
-                            debug!(torrent = %info_hash_hex, peer = %peer_addr, err = %e, "incoming metadata fetch failed")
+                            debug!(
+                                component = "metadata",
+                                operation = "fetch_incoming_peer",
+                                torrent = %info_hash_hex,
+                                peer = %peer_addr,
+                                result = "error",
+                                error = %e,
+                                "incoming metadata fetch failed"
+                            )
                         }
                     }},
                     TorrentCmd::Shutdown => {
@@ -227,7 +235,15 @@ async fn try_fetch_from_peers(
                 return true;
             }
             Err(e) => {
-                debug!(torrent = %info_hash_hex, peer = %peer, err = %e, "metadata fetch failed")
+                debug!(
+                    component = "metadata",
+                    operation = "fetch_peer",
+                    torrent = %info_hash_hex,
+                    peer = %peer,
+                    result = "error",
+                    error = %e,
+                    "metadata fetch failed"
+                )
             }
         }
 
@@ -367,9 +383,12 @@ async fn announce_trackers(
             }
             Err(err) => {
                 warn!(
+                    component = "metadata",
+                    operation = "tracker_announce",
                     torrent = %info_hash_hex,
                     tracker = %tracker,
-                    err = %err,
+                    result = "error",
+                    error = %err,
                     "metadata tracker announce failed"
                 );
             }
