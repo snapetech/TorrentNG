@@ -100,7 +100,7 @@ Local implementation: `crates/rt-api-qbit`.
 | Group | Upstream API points | rtorrentNG points | Status | Test rows |
 |---|---|---|---|---|
 | Auth | `auth/login`, `auth/logout` | Same | Compat | Login/logout status and cookie shape |
-| App info | `app/version`, `webapiVersion`, `buildInfo`, `preferences`, `setPreferences`, `shutdown`, `sendTestEmail`, `getCookies`, `setCookies`, `networkInterfaceList`, `networkInterfaceAddressList`, `defaultSavePath` | Same | Native/Compat mix | Probe every endpoint, assert status/content type |
+| App info | `app/version`, `webapiVersion`, `buildInfo`, `preferences`, `setPreferences`, `shutdown`, `sendTestEmail`, `getCookies`, `setCookies`, `rotateAPIKey`, `deleteAPIKey`, `networkInterfaceList`, `networkInterfaceAddressList`, `defaultSavePath` | Same | Native/Compat mix | Probe every endpoint, assert status/content type |
 | Torrent list/add | `torrents/info`, `torrents/add` | Same | Native | Add magnet/file, list filters/sort/category/tag/hash |
 | Torrent lifecycle | `pause`, `resume`, `start`, `stop`, `delete`, `recheck`, `reannounce` | Same | Native | Lifecycle transition per endpoint |
 | Torrent trackers/peers | `trackers`, `addTrackers`, `editTracker`, `removeTrackers`, `addPeers` | Same | Native/Partial stats | Tracker mutation and explicit peer row |
@@ -120,8 +120,8 @@ qBittorrent field backlog:
 
 | Surface | Fields to audit exhaustively | Current risk |
 |---|---|---|
-| `app/preferences` | All WebUI preference keys across 5.x | Settings clients may treat absent keys as disabled features |
-| `torrents/info` | All list fields including limits, availability, tracker, ratio, seeding-time, content-path fields | Remote apps may show blank columns |
+| `app/preferences` | Broad current/legacy WebUI preference key set across paths, queueing, BitTorrent, WebUI, RSS, proxy, and advanced settings | Implemented compatibility defaults for common settings panes; remaining work is value persistence for mutable settings |
+| `torrents/info` | Core list fields plus modern path, session counter, lifecycle, limit, mode, magnet, and infohash fields; detailed availability and live swarm counters remain placeholders | Implemented compatibility breadth for common remote-app columns |
 | `torrents/properties` | Full properties object | Detail panels may show missing values |
 | `sync/maindata` | Server state, categories, tags, torrents, trackers, peers | Delta clients depend on stable RID and complete key set |
 
@@ -248,7 +248,7 @@ covered today as an import source and as an interop peer.
 | P0 | Add all-field response tests for qBit `torrents/info`, `properties`, `sync/maindata`; Transmission `torrent_get` and `session_get`; Deluge torrent status | Implemented in facade unit tests for currently supported fields |
 | P0 | Expand Transmission 4.1 JSON-RPC envelope support and semver header | Transmission API matrix |
 | P1 | Deepen Deluge `web.add_torrents` with real file upload/temp-file flows when target clients require it | Deluge API matrix |
-| P1 | Broaden qBittorrent preference and property projections to all documented keys | qBit field backlog |
+| P1 | Persist qBittorrent mutable preferences and broaden property projections to all documented keys | qBit field backlog |
 | P1 | Build real exported golden fixture corpus for qBit, Transmission, Deluge, uTorrent, BiglyBT/Vuze, Tixati, rTorrent, and compare it against the synthetic JSON/bencoded alias matrices | Import matrix |
 | P2 | Decide rTorrent XMLRPC facade scope | rTorrent matrix |
 | P2 | Import auxiliary RSS/search/scheduler/autoadd/plugin metadata as migration artifacts | Feature/import matrices |

@@ -62,11 +62,11 @@ Local surface: `crates/rt-api-qbit`.
 |---|---|---|
 | Authentication | `auth/login`, `auth/logout` | Implemented |
 | Application | version, API version, build info, shutdown, preferences, set preferences, default save path, network interface probes, test email | Implemented as native/no-op compatibility where no native equivalent exists |
-| qBittorrent 5 cookie APIs | `app/getCookies`, `app/setCookies` | Implemented as empty/no-op compatibility |
+| qBittorrent 5 cookie/API key APIs | `app/getCookies`, `app/setCookies`, `app/rotateAPIKey`, `app/deleteAPIKey` | Implemented as empty/no-op compatibility |
 | Logs | main log, peer log | Implemented as empty-compatible reads |
 | Sync | `sync/maindata`, `sync/torrentPeers` | Implemented |
 | Transfer | global info, speed limits, speed-limit mode, ban peers | Implemented |
-| Torrent reads | list, properties, trackers, web seeds, files, piece states, piece hashes, export | Implemented |
+| Torrent reads | list with modern qBit path/counter/limit/mode/magnet/infohash fields, properties, trackers, web seeds, files, piece states, piece hashes, export | Implemented |
 | Torrent lifecycle | add, pause/resume legacy aliases, start/stop v5 aliases, delete, recheck, reannounce | Implemented |
 | Torrent mutation | tracker add/edit/remove, peers, priority order, file priority, limits, share limits, force start, super seeding, auto management, sequential, first/last, location/save path, rename, category, tags | Implemented |
 | RSS | folders, feeds, items, rules, matching articles | Implemented as no-op/read-compatible |
@@ -113,7 +113,8 @@ Local surface: `crates/rt-api-deluge`.
 |---|---|---|
 | Done | Add tests that enumerate advertised facade methods and assert every advertised method returns a compatibility-shaped response | Prevents method-list drift |
 | Done | Add cross-source import/apply matrices for JSON and bencoded resume aliases | Prevents fast-resume regressions when migrating from old clients |
-| Medium | Add qBittorrent preference-key breadth for modern WebUI clients | Avoids settings panes seeing absent keys |
+| Done | Expand qBittorrent preference response breadth and API-key compatibility routes | Settings panes and modern API clients probe these before mutation |
+| Medium | Persist qBittorrent mutable preferences and deepen torrent property field values | Avoids settings panes seeing accepted writes disappear |
 | Medium | Replace synthetic import aliases with real exported golden corpora for every supported legacy client version family | Catches undocumented key variants and nested plugin state |
 | Medium | Import scheduler/RSS/search metadata as auxiliary migration artifacts | Useful for full client migration, not required for torrent progress |
 | Low | Proprietary client deep parsers for Tixati/BiglyBT plugin-only fields | Needs fixture corpus; progress import already uses generic verified paths |
