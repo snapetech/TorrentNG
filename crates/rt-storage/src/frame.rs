@@ -85,7 +85,9 @@ impl FramePool {
         let mut buf = match class {
             Some(ci) => {
                 let mut guard = self.inner.lock().expect("frame pool poisoned");
-                guard.free[ci].pop().unwrap_or_else(|| vec![0u8; SIZE_CLASSES[ci]])
+                guard.free[ci]
+                    .pop()
+                    .unwrap_or_else(|| vec![0u8; SIZE_CLASSES[ci]])
             }
             // Oversize: exact allocation, not pooled on release.
             None => vec![0u8; len],

@@ -1,5 +1,6 @@
 pub mod error;
 pub mod fd_limit;
+pub mod frame;
 pub mod io_class;
 pub mod plan;
 pub mod scheduler;
