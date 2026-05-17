@@ -769,6 +769,48 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
     );
     metric(
         &mut out,
+        "torrentng_dht_routing_nodes",
+        "gauge",
+        "DHT routing table nodes retained by the native DHT task",
+        stats.dht_routing_nodes,
+    );
+    metric(
+        &mut out,
+        "torrentng_dht_announced_peer_sets",
+        "gauge",
+        "Info-hash peer sets retained from DHT announce_peer queries",
+        stats.dht_announced_peer_sets,
+    );
+    metric(
+        &mut out,
+        "torrentng_dht_announced_peers",
+        "gauge",
+        "DHT announced peers retained across all info-hash peer sets",
+        stats.dht_announced_peers,
+    );
+    metric(
+        &mut out,
+        "torrentng_dht_tracked_torrents",
+        "gauge",
+        "Torrents registered with the native DHT task",
+        stats.dht_tracked_torrents,
+    );
+    metric(
+        &mut out,
+        "torrentng_dht_outstanding_requests",
+        "gauge",
+        "DHT KRPC requests currently awaiting responses",
+        stats.dht_outstanding_requests,
+    );
+    metric(
+        &mut out,
+        "torrentng_dht_queried_nodes",
+        "gauge",
+        "DHT nodes remembered as queried across active lookups",
+        stats.dht_queried_nodes,
+    );
+    metric(
+        &mut out,
         "torrentng_storage_file_pool_capacity",
         "gauge",
         "Configured open-file cache capacity across running torrent schedulers",
@@ -1736,6 +1778,12 @@ mod tests {
             completed_piece_verify_from_disk: 8,
             jobs_active: 3,
             trackers_error: 4,
+            dht_routing_nodes: 45,
+            dht_announced_peer_sets: 46,
+            dht_announced_peers: 47,
+            dht_tracked_torrents: 48,
+            dht_outstanding_requests: 49,
+            dht_queried_nodes: 50,
             storage_file_pool_hits: 5,
             storage_read_ops: 6,
             storage_hash_ops: 7,
@@ -1803,6 +1851,12 @@ mod tests {
         assert!(rendered.contains("torrentng_completed_piece_verify_from_disk_total 8"));
         assert!(rendered.contains("torrentng_jobs_active 3"));
         assert!(rendered.contains("torrentng_trackers_error 4"));
+        assert!(rendered.contains("torrentng_dht_routing_nodes 45"));
+        assert!(rendered.contains("torrentng_dht_announced_peer_sets 46"));
+        assert!(rendered.contains("torrentng_dht_announced_peers 47"));
+        assert!(rendered.contains("torrentng_dht_tracked_torrents 48"));
+        assert!(rendered.contains("torrentng_dht_outstanding_requests 49"));
+        assert!(rendered.contains("torrentng_dht_queried_nodes 50"));
         assert!(rendered.contains("torrentng_storage_file_pool_hits_total 5"));
         assert!(rendered.contains("torrentng_storage_read_ops_total 6"));
         assert!(rendered.contains("torrentng_storage_hash_ops_total 7"));

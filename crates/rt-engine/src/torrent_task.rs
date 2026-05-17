@@ -139,6 +139,15 @@ fn reserve_webseed_body_bytes(
         .ok_or_else(|| anyhow::anyhow!("webseed body allocation of {bytes} bytes denied"))
 }
 
+fn reserve_peer_upload_bytes(
+    resources: &ResourceGovernor,
+    bytes: u32,
+) -> anyhow::Result<MemoryLease> {
+    resources
+        .try_acquire(MemoryClass::PeerBuffer, u64::from(bytes))
+        .ok_or_else(|| anyhow::anyhow!("peer upload buffer allocation of {bytes} bytes denied"))
+}
+
 fn remember_tracker_peers_bounded(
     known: &mut HashSet<SocketAddr>,
     allowed_private: &mut HashSet<SocketAddr>,
@@ -335,6 +344,7 @@ struct UploadContext {
     save_root: PathBuf,
     piece_map: PieceMap,
     storage: MountScheduler,
+    resources: ResourceGovernor,
     have_pieces: Vec<bool>,
     metadata: Option<Arc<Vec<u8>>>,
 }
@@ -1019,6 +1029,7 @@ impl TorrentTask {
             save_root: self.save_root.clone(),
             piece_map: self.piece_map.clone(),
             storage: self.storage.clone(),
+            resources: self.resources.clone(),
             have_pieces: self.picker.have_pieces(),
             metadata: torrent_info_bytes(&self.meta.raw).ok().map(Arc::new),
         }
@@ -3054,6 +3065,7 @@ async fn read_upload_block(
     begin: u32,
     length: u32,
 ) -> anyhow::Result<bytes::Bytes> {
+    let _lease = reserve_peer_upload_bytes(&upload.resources, length)?;
     let regions = upload.piece_map.validate_request(piece, begin, length)?;
     let mut data = Vec::with_capacity(length as usize);
     for region in regions {
@@ -3728,6 +3740,7 @@ mod tests {
                     ..Default::default()
                 },
             ),
+            resources: ResourceGovernor::new(rt_metrics::ResourceGovernorConfig::default()),
             have_pieces: vec![true],
             metadata: None,
         };
@@ -3735,5 +3748,33 @@ mod tests {
         let block = read_upload_block(&upload, 0, 0, 16 * 1024).await.unwrap();
 
         assert_eq!(block.as_ref(), expected.as_slice());
+    }
+
+    #[test]
+    fn upload_block_reservation_uses_peer_buffer_governor_class() {
+        let mut caps = [0; rt_metrics::MEMORY_CLASS_COUNT];
+        caps[MemoryClass::PeerBuffer as usize] = 16 * 1024;
+        let governor = ResourceGovernor::new(rt_metrics::ResourceGovernorConfig {
+            total_cap_bytes: 16 * 1024,
+            class_caps_bytes: caps,
+            pressure_constrained_pct: 75,
+            pressure_critical_pct: 90,
+        });
+
+        let lease = reserve_peer_upload_bytes(&governor, 16 * 1024).unwrap();
+        assert_eq!(
+            governor.snapshot().classes[MemoryClass::PeerBuffer as usize].used_bytes,
+            16 * 1024
+        );
+        drop(lease);
+        assert_eq!(
+            governor.snapshot().classes[MemoryClass::PeerBuffer as usize].used_bytes,
+            0
+        );
+        assert!(reserve_peer_upload_bytes(&governor, 16 * 1024 + 1).is_err());
+        assert_eq!(
+            governor.snapshot().classes[MemoryClass::PeerBuffer as usize].denied_allocations,
+            1
+        );
     }
 }

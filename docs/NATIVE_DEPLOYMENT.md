@@ -142,6 +142,11 @@ access, run:
 scripts/local_release_gate.sh
 ```
 
+The local gate writes a markdown report under `certification/reports/` with
+the branch, commit, worktree status, each command, per-gate duration, and the
+aggregate pass/fail result. Set `TNG_STORAGE_MATRIX_TARGETS='/mnt/nvme
+/mnt/hdd'` to include real-device storage probes in the same report.
+
 When a daemon is running, bind the certification report to the live `/health`
 capability manifest as well:
 

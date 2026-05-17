@@ -8,24 +8,32 @@ OUT="${1:-$REPORT_DIR/local-release-$(date -u +%Y%m%dT%H%M%SZ).md}"
 mkdir -p "$(dirname "$OUT")"
 
 status="PASS"
+started_at="$(date +%s)"
 
 run_gate() {
   local name="$1"
   shift
+  local start end elapsed result
+  start="$(date +%s)"
   {
     echo
     echo "## $name"
     echo
+    echo "- Command: \`$*\`"
+    echo
     echo '```text'
   } >>"$OUT"
   if (cd "$ROOT" && "$@") >>"$OUT" 2>&1; then
+    result="PASS"
     echo '```' >>"$OUT"
-    printf '| %s | PASS |\n' "$name" >>"$OUT.table"
   else
+    result="FAIL"
     echo '```' >>"$OUT"
-    printf '| %s | FAIL |\n' "$name" >>"$OUT.table"
     status="FAIL"
   fi
+  end="$(date +%s)"
+  elapsed="$((end - start))s"
+  printf '| %s | %s | %s |\n' "$name" "$result" "$elapsed" >>"$OUT.table"
 }
 
 skip_gate() {
@@ -39,7 +47,7 @@ skip_gate() {
     echo "SKIP: $reason"
     echo '```'
   } >>"$OUT"
-  printf '| %s | SKIP |\n' "$name" >>"$OUT.table"
+  printf '| %s | SKIP | 0s |\n' "$name" >>"$OUT.table"
 }
 
 {
@@ -51,13 +59,28 @@ skip_gate() {
   echo "- Rust: $(rustc --version 2>/dev/null || echo unavailable)"
   echo "- Cargo: $(cargo --version 2>/dev/null || echo unavailable)"
   echo "- Commit: $(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unavailable)"
+  echo "- Branch: $(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unavailable)"
+  if git -C "$ROOT" diff --quiet --ignore-submodules -- && git -C "$ROOT" diff --cached --quiet --ignore-submodules --; then
+    echo "- Worktree: clean"
+  else
+    echo "- Worktree: dirty"
+  fi
   echo
   echo "## Gates"
   echo
-  echo "| Gate | Result |"
-  echo "|---|---|"
+  echo "| Gate | Result | Duration |"
+  echo "|---|---|---|"
 } >"$OUT"
 : >"$OUT.table"
+
+{
+  echo
+  echo "## Git Status"
+  echo
+  echo '```text'
+  git -C "$ROOT" status --short
+  echo '```'
+} >>"$OUT"
 
 run_gate "format" cargo fmt --check
 run_gate "workspace tests" cargo test --workspace
@@ -90,6 +113,7 @@ rm -f "$OUT.table"
 {
   echo
   echo "Overall status: $status"
+  echo "Total duration: $(($(date +%s) - started_at))s"
 } >>"$OUT"
 
 echo "$OUT"

@@ -369,6 +369,7 @@ rTorrent over XMLRPC.
 | `torrentng_fastresume_dirty_pieces` | gauge | Pieces validated since the last completed durability barrier |
 | `torrentng_completed_piece_verify_from_{memory,disk}_total` | counter | Completed-piece verification source; memory verifies avoid read-after-write disk rereads |
 | `torrentng_peers_connected` | gauge | Connected peers across all torrents |
+| `torrentng_dht_*` | gauge | Native DHT routing table, lookup, tracked torrent, and announced peer cache counts |
 | `torrentng_storage_file_pool_*` | gauge/counter | Native scheduler open-file cache capacity, open files, hits, misses, evictions, and idle closes |
 | `torrentng_storage_*_queue_depth` | gauge | Native disk I/O and hashing queue depths |
 | `torrentng_storage_{read,write}_ops_total` | counter | Positioned disk operations through native schedulers |
@@ -389,7 +390,7 @@ rTorrent over XMLRPC.
 | `torrentng_storage_sparse_*` | counter | Sparse recheck data extents, skipped hole bytes, and seek fallback count |
 | `torrentng_piece_assembly_*` | gauge/counter | In-memory completed-piece assembly buffers, bytes, and budget evictions |
 | `torrentng_peer_request_window_reductions_total` | counter | Peer request refills reduced because memory pressure limited in-flight piece data |
-| `torrentng_peer_{rx,tx}_buffer_bytes` | gauge | Process-owned peer buffer pressure from outstanding receive requests and upload buffers |
+| `torrentng_peer_{rx,tx}_buffer_bytes` | gauge | Process-owned peer buffer pressure from outstanding receive requests and upload buffers; upload block assembly is also charged to the `peer_buffer` memory class while in flight |
 | `torrentng_tracker_peer_cache_*` | gauge/counter | Tracker peer addresses retained or dropped by bounded per-torrent peer caches |
 | `torrentng_memory_*` | gauge/counter | Resource governor cap, current process-owned usage, pressure state, per-class caps/usage, and denied allocations |
 | `torrentng_api_requests_total` | counter | API requests served |

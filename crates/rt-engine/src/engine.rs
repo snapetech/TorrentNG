@@ -2337,6 +2337,23 @@ impl Engine {
                 _ => {}
             }
         }
+        if let Some(dht_tx) = &self.dht_tx {
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            if dht_tx.send(DhtCommand::GetStats { reply }).await.is_ok() {
+                match timeout(Duration::from_millis(250), rx).await {
+                    Ok(Ok(dht)) => {
+                        stats.dht_routing_nodes = dht.routing_nodes;
+                        stats.dht_announced_peer_sets = dht.announced_peer_sets;
+                        stats.dht_announced_peers = dht.announced_peers;
+                        stats.dht_tracked_torrents = dht.tracked_torrents;
+                        stats.dht_outstanding_requests = dht.outstanding_requests;
+                        stats.dht_queried_nodes = dht.queried_nodes;
+                    }
+                    Ok(Err(_)) => {}
+                    Err(_) => warn!("timed out collecting DHT runtime stats"),
+                }
+            }
+        }
         for (info_hash, tx) in &self.torrent_chans {
             let (reply, rx) = tokio::sync::oneshot::channel();
             if tx
@@ -2404,6 +2421,13 @@ impl Engine {
         resources.classes[tracker_peers].denied_allocations = resources.classes[tracker_peers]
             .denied_allocations
             .saturating_add(stats.tracker_peer_cache_drops);
+        let dht_table = MemoryClass::DhtTable as usize;
+        resources.classes[dht_table].used_bytes = stats
+            .dht_routing_nodes
+            .saturating_mul(64)
+            .saturating_add(stats.dht_announced_peers.saturating_mul(32))
+            .saturating_add(stats.dht_queried_nodes.saturating_mul(32))
+            .saturating_add(stats.dht_outstanding_requests.saturating_mul(64));
         resources.total_used_bytes = resources
             .classes
             .iter()
@@ -4859,6 +4883,19 @@ mod tests {
         });
         let mut torrent_chans = HashMap::new();
         torrent_chans.insert(info_hash.clone(), torrent_tx);
+        let (dht_tx, mut dht_rx) = mpsc::channel(1);
+        tokio::spawn(async move {
+            if let Some(DhtCommand::GetStats { reply }) = dht_rx.recv().await {
+                let _ = reply.send(crate::dht_task::DhtRuntimeStats {
+                    routing_nodes: 11,
+                    announced_peer_sets: 12,
+                    announced_peers: 13,
+                    tracked_torrents: 14,
+                    outstanding_requests: 15,
+                    queried_nodes: 16,
+                });
+            }
+        });
         let engine = Engine {
             config: Arc::new(Config::default()),
             registry,
@@ -4867,7 +4904,7 @@ mod tests {
             cmd_tx: mpsc::channel(1).0,
             torrent_chans,
             torrent_tasks: HashMap::new(),
-            dht_tx: None,
+            dht_tx: Some(dht_tx),
             resources: test_resource_governor(),
         };
         let job_id = engine.create_recheck_job(&info_hash).unwrap();
@@ -4945,6 +4982,12 @@ mod tests {
         assert_eq!(stats.peer_tx_buffer_bytes, 8);
         assert_eq!(stats.tracker_peer_cache_entries, 9);
         assert_eq!(stats.tracker_peer_cache_drops, 10);
+        assert_eq!(stats.dht_routing_nodes, 11);
+        assert_eq!(stats.dht_announced_peer_sets, 12);
+        assert_eq!(stats.dht_announced_peers, 13);
+        assert_eq!(stats.dht_tracked_torrents, 14);
+        assert_eq!(stats.dht_outstanding_requests, 15);
+        assert_eq!(stats.dht_queried_nodes, 16);
         let resources = stats.resources.expect("resource snapshot");
         let storage_frame = MemoryClass::StorageFrame as usize;
         assert_eq!(
@@ -4966,6 +5009,10 @@ mod tests {
         assert_eq!(
             resources.classes[MemoryClass::TrackerPeers as usize].denied_allocations,
             10
+        );
+        assert_eq!(
+            resources.classes[MemoryClass::DhtTable as usize].used_bytes,
+            11 * 64 + 13 * 32 + 16 * 32 + 15 * 64
         );
         assert!(resources.total_used_bytes >= 4096);
     }

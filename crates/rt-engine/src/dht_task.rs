@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use rt_dht::{DhtError, DhtQuery, DhtResponse, KNode, KrpcMessage, NodeId, RoutingTable, K};
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::interval;
 use tracing::{debug, info, warn};
 
@@ -24,7 +24,20 @@ pub struct DhtTorrent {
 pub enum DhtCommand {
     AddTorrent(DhtTorrent),
     RemoveTorrent([u8; 20]),
+    GetStats {
+        reply: oneshot::Sender<DhtRuntimeStats>,
+    },
     Shutdown,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DhtRuntimeStats {
+    pub routing_nodes: u64,
+    pub announced_peer_sets: u64,
+    pub announced_peers: u64,
+    pub tracked_torrents: u64,
+    pub outstanding_requests: u64,
+    pub queried_nodes: u64,
 }
 
 pub async fn run_dht(
@@ -117,6 +130,9 @@ impl DhtTask {
                 self.queried_nodes.remove(&info_hash);
                 self.announced_peers.remove(&info_hash);
                 self.last_full_lookup.remove(&info_hash);
+            }
+            DhtCommand::GetStats { reply } => {
+                let _ = reply.send(self.runtime_stats());
             }
             DhtCommand::Shutdown => {
                 info!("DHT task shutting down");
@@ -461,6 +477,25 @@ impl DhtTask {
         }
     }
 
+    fn runtime_stats(&self) -> DhtRuntimeStats {
+        DhtRuntimeStats {
+            routing_nodes: self.table.total_nodes() as u64,
+            announced_peer_sets: self.announced_peers.len() as u64,
+            announced_peers: self
+                .announced_peers
+                .values()
+                .map(|peers| peers.len() as u64)
+                .sum(),
+            tracked_torrents: self.torrents.len() as u64,
+            outstanding_requests: self.outstanding.len() as u64,
+            queried_nodes: self
+                .queried_nodes
+                .values()
+                .map(|nodes| nodes.len() as u64)
+                .sum(),
+        }
+    }
+
     fn transaction_id(&mut self) -> Vec<u8> {
         let tx = self.next_tx.to_be_bytes().to_vec();
         self.next_tx = self.next_tx.wrapping_add(1).max(1);
@@ -608,6 +643,44 @@ mod tests {
         assert!(!remember_announced_peer(&mut peers, third, 2));
 
         assert_eq!(peers, vec![first, second]);
+    }
+
+    #[tokio::test]
+    async fn runtime_stats_count_dht_owned_caches() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let socket = UdpSocket::from_std(socket).unwrap();
+        let local_id = NodeId::from_bytes([1; 20]);
+        let info_hash = [9; 20];
+        let queried = "127.0.0.1:6001".parse().unwrap();
+        let announced = "127.0.0.1:6881".parse().unwrap();
+        let (cmd_tx, _cmd_rx) = mpsc::channel(1);
+        let mut task = DhtTask {
+            local_id,
+            table: RoutingTable::new(local_id),
+            socket,
+            listen_port: 6881,
+            bootstrap_nodes: Vec::new(),
+            next_tx: 1,
+            outstanding: HashMap::from([(b"aa".to_vec(), DhtRequest::Bootstrap)]),
+            queried_nodes: HashMap::from([(info_hash, HashSet::from([queried]))]),
+            torrents: HashMap::from([(info_hash, cmd_tx)]),
+            announced_peers: HashMap::from([(info_hash, vec![announced])]),
+            last_full_lookup: HashMap::new(),
+        };
+        task.table.insert(KNode {
+            id: NodeId::from_bytes([2; 20]),
+            addr: "127.0.0.2:6881".parse().unwrap(),
+        });
+
+        let stats = task.runtime_stats();
+
+        assert_eq!(stats.routing_nodes, 1);
+        assert_eq!(stats.announced_peer_sets, 1);
+        assert_eq!(stats.announced_peers, 1);
+        assert_eq!(stats.tracked_torrents, 1);
+        assert_eq!(stats.outstanding_requests, 1);
+        assert_eq!(stats.queried_nodes, 1);
     }
 
     #[tokio::test]
