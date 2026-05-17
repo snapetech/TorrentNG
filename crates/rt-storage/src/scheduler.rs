@@ -385,23 +385,6 @@ impl FilePool {
             .collect()
     }
 
-    fn sync_path_with_backend(
-        &self,
-        path: &Path,
-        backend: &SelectedDiskBackend,
-    ) -> Result<(), StorageError> {
-        let key = normalized_key(path);
-        let file = self.open_for_sync(&key)?;
-        wait_backend_io(&key, backend.fdatasync(file))
-    }
-
-    fn sync_all_with_backend(&self, backend: &SelectedDiskBackend) -> Result<(), StorageError> {
-        for (path, file) in self.write_handles() {
-            wait_backend_io(&path, backend.fdatasync(file))?;
-        }
-        Ok(())
-    }
-
     fn stats(&self) -> FilePoolStats {
         let entries = self.entries.lock().expect("file pool mutex poisoned");
         FilePoolStats {
@@ -670,6 +653,16 @@ struct DiskSubmission {
     _device_queue: OwnedSemaphorePermit,
 }
 
+#[derive(Debug)]
+enum ReadPreparation {
+    CacheHit(bytes::Bytes),
+    BackendRead {
+        key: PathBuf,
+        file: Arc<File>,
+        read_len: usize,
+    },
+}
+
 impl QueuedDiskBytes {
     fn reserve(
         counters: Arc<StorageCounters>,
@@ -721,6 +714,22 @@ fn wait_backend_io<T>(
     rx: oneshot::Receiver<io::Result<T>>,
 ) -> Result<T, StorageError> {
     match rx.blocking_recv() {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) if error.kind() == io::ErrorKind::WouldBlock => {
+            Err(StorageError::QueueFull {
+                mount: "storage-backend".to_string(),
+            })
+        }
+        Ok(Err(error)) => Err(StorageError::io(path.display().to_string(), error)),
+        Err(_) => Err(StorageError::Cancelled),
+    }
+}
+
+async fn await_backend_io<T>(
+    path: &Path,
+    rx: oneshot::Receiver<io::Result<T>>,
+) -> Result<T, StorageError> {
+    match rx.await {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(error)) if error.kind() == io::ErrorKind::WouldBlock => {
             Err(StorageError::QueueFull {
@@ -1460,83 +1469,128 @@ impl MountScheduler {
                 return Ok(bytes);
             }
         }
-        self.submit(len as u64, move || {
-            let key = normalized_key(&path);
-            let path_str = key.display().to_string();
-            if class == IoClass::PeerRead && readahead_bytes > len && readahead_cache_entries > 0 {
-                if let Some(bytes) = peer_read_cache_hit(&peer_read_cache, &key, offset, len) {
-                    counters
-                        .peer_read_cache_hits
+        let submission = self.reserve_submission(len as u64)?;
+        let preparation_counters = counters.clone();
+        let preparation_peer_read_cache = peer_read_cache.clone();
+        let preparation = self
+            .io_pool
+            .run(move || {
+                let key = normalized_key(&path);
+                let path_str = key.display().to_string();
+                if class == IoClass::PeerRead
+                    && readahead_bytes > len
+                    && readahead_cache_entries > 0
+                {
+                    if let Some(bytes) =
+                        peer_read_cache_hit(&preparation_peer_read_cache, &key, offset, len)
+                    {
+                        preparation_counters
+                            .peer_read_cache_hits
+                            .fetch_add(1, Ordering::Relaxed);
+                        preparation_counters.read_ops_by_class[class_index(class)]
+                            .fetch_add(1, Ordering::Relaxed);
+                        preparation_counters.bytes_read_by_class[class_index(class)]
+                            .fetch_add(len as u64, Ordering::Relaxed);
+                        let latency_ns = latency_ns_since(started);
+                        preparation_counters.read_latency_ns_by_class[class_index(class)]
+                            .fetch_add(latency_ns, Ordering::Relaxed);
+                        record_latency_bucket(
+                            &preparation_counters.read_latency_buckets,
+                            latency_ns,
+                        );
+                        return Ok(ReadPreparation::CacheHit(bytes));
+                    }
+                    preparation_counters
+                        .peer_read_cache_misses
                         .fetch_add(1, Ordering::Relaxed);
-                    counters.read_ops_by_class[class_index(class)].fetch_add(1, Ordering::Relaxed);
-                    counters.bytes_read_by_class[class_index(class)]
-                        .fetch_add(len as u64, Ordering::Relaxed);
-                    let latency_ns = latency_ns_since(started);
-                    counters.read_latency_ns_by_class[class_index(class)]
-                        .fetch_add(latency_ns, Ordering::Relaxed);
-                    record_latency_bucket(&counters.read_latency_buckets, latency_ns);
-                    return Ok(bytes);
                 }
-                counters
-                    .peer_read_cache_misses
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            let file = pool.get_or_open(&key, OpenMode::Read, false)?;
-            let read_len = if class == IoClass::PeerRead
-                && readahead_bytes > len
-                && readahead_cache_entries > 0
-            {
-                let file_len = file
-                    .metadata()
-                    .map_err(|e| StorageError::io(&path_str, e))?
-                    .len();
-                if offset >= file_len {
-                    len
+                let file = pool.get_or_open(&key, OpenMode::Read, false)?;
+                let read_len = if class == IoClass::PeerRead
+                    && readahead_bytes > len
+                    && readahead_cache_entries > 0
+                {
+                    let file_len = file
+                        .metadata()
+                        .map_err(|e| StorageError::io(&path_str, e))?
+                        .len();
+                    if offset >= file_len {
+                        len
+                    } else {
+                        readahead_bytes
+                            .min(file_len.saturating_sub(offset) as usize)
+                            .max(len)
+                    }
                 } else {
-                    readahead_bytes
-                        .min(file_len.saturating_sub(offset) as usize)
-                        .max(len)
-                }
-            } else {
-                len
-            };
-            advise_for_read_class(&file, class, offset, read_len, &counters);
-            let frame_pool = FramePool::new(read_len as u64);
-            let frame =
-                frame_pool
-                    .try_acquire(read_len)
-                    .ok_or_else(|| StorageError::QueueFull {
-                        mount: "scheduler-read-frame".to_string(),
-                    })?;
-            let frame = wait_backend_io(&key, disk_backend.pread(file.clone(), frame, offset))?;
-            counters.read_ops_by_class[class_index(class)].fetch_add(1, Ordering::Relaxed);
-            counters.bytes_read_by_class[class_index(class)]
-                .fetch_add(read_len as u64, Ordering::Relaxed);
-            counters.backend_read_ops_by_class[class_index(class)].fetch_add(1, Ordering::Relaxed);
-            counters.backend_bytes_read_by_class[class_index(class)]
-                .fetch_add(read_len as u64, Ordering::Relaxed);
-            advise_after_read_class(&file, class, offset, read_len, &counters);
-            let latency_ns = latency_ns_since(started);
-            counters.read_latency_ns_by_class[class_index(class)]
-                .fetch_add(latency_ns, Ordering::Relaxed);
-            record_latency_bucket(&counters.read_latency_buckets, latency_ns);
-            let bytes = bytes::Bytes::copy_from_slice(frame.as_slice());
-            if class == IoClass::PeerRead && read_len > len && readahead_cache_entries > 0 {
-                let exact = bytes.slice(..len);
-                peer_read_cache_store(
-                    &peer_read_cache,
-                    &counters,
-                    readahead_cache_entries,
+                    len
+                };
+                advise_for_read_class(&file, class, offset, read_len, &preparation_counters);
+                Ok(ReadPreparation::BackendRead {
                     key,
-                    offset,
-                    bytes,
-                );
-                Ok(exact)
-            } else {
-                Ok(bytes)
+                    file,
+                    read_len,
+                })
+            })
+            .await;
+        if matches!(preparation, Err(StorageError::QueueFull { .. })) {
+            self.counters.queue_full.fetch_add(1, Ordering::Relaxed);
+        }
+        let preparation = preparation?;
+        match preparation {
+            ReadPreparation::CacheHit(bytes) => Ok(bytes),
+            ReadPreparation::BackendRead {
+                key,
+                file,
+                read_len,
+            } => {
+                let frame_pool = FramePool::new(read_len as u64);
+                let frame =
+                    frame_pool
+                        .try_acquire(read_len)
+                        .ok_or_else(|| StorageError::QueueFull {
+                            mount: "scheduler-read-frame".to_string(),
+                        })?;
+                let frame =
+                    match await_backend_io(&key, disk_backend.pread(file.clone(), frame, offset))
+                        .await
+                    {
+                        Ok(frame) => frame,
+                        Err(error) => {
+                            if matches!(error, StorageError::QueueFull { .. }) {
+                                counters.queue_full.fetch_add(1, Ordering::Relaxed);
+                            }
+                            return Err(error);
+                        }
+                    };
+                let _submission = submission;
+                counters.read_ops_by_class[class_index(class)].fetch_add(1, Ordering::Relaxed);
+                counters.bytes_read_by_class[class_index(class)]
+                    .fetch_add(read_len as u64, Ordering::Relaxed);
+                counters.backend_read_ops_by_class[class_index(class)]
+                    .fetch_add(1, Ordering::Relaxed);
+                counters.backend_bytes_read_by_class[class_index(class)]
+                    .fetch_add(read_len as u64, Ordering::Relaxed);
+                advise_after_read_class(&file, class, offset, read_len, &counters);
+                let latency_ns = latency_ns_since(started);
+                counters.read_latency_ns_by_class[class_index(class)]
+                    .fetch_add(latency_ns, Ordering::Relaxed);
+                record_latency_bucket(&counters.read_latency_buckets, latency_ns);
+                let bytes = bytes::Bytes::copy_from_slice(frame.as_slice());
+                if class == IoClass::PeerRead && read_len > len && readahead_cache_entries > 0 {
+                    let exact = bytes.slice(..len);
+                    peer_read_cache_store(
+                        &peer_read_cache,
+                        &counters,
+                        readahead_cache_entries,
+                        key,
+                        offset,
+                        bytes,
+                    );
+                    Ok(exact)
+                } else {
+                    Ok(bytes)
+                }
             }
-        })
-        .await
+        }
     }
 
     pub async fn write_at(
@@ -1555,27 +1609,54 @@ impl MountScheduler {
         let counters = self.counters.clone();
         let path = path.to_path_buf();
         let started = Instant::now();
-        self.submit(data.len() as u64, move || {
-            let key = normalized_key(&path);
-            let file = pool.get_or_open(&key, OpenMode::Write, create)?;
-            let written = data.len();
-            wait_backend_io(&key, disk_backend.pwrite(file.clone(), data, offset))?;
-            if strict {
-                wait_backend_io(&key, disk_backend.fdatasync(file))?;
-            } else {
-                let mut dirty = dirty_paths.lock().expect("dirty path mutex poisoned");
-                dirty.insert(key);
+        let submission = self.reserve_submission(data.len() as u64)?;
+        let key = normalized_key(&path);
+        let file = match self
+            .io_pool
+            .run({
+                let pool = pool.clone();
+                let key = key.clone();
+                move || pool.get_or_open(&key, OpenMode::Write, create)
+            })
+            .await
+        {
+            Ok(file) => file,
+            Err(error) => {
+                if matches!(error, StorageError::QueueFull { .. }) {
+                    counters.queue_full.fetch_add(1, Ordering::Relaxed);
+                }
+                return Err(error);
             }
-            counters.write_ops_by_class[class_index(class)].fetch_add(1, Ordering::Relaxed);
-            counters.bytes_written_by_class[class_index(class)]
-                .fetch_add(written as u64, Ordering::Relaxed);
-            let latency_ns = latency_ns_since(started);
-            counters.write_latency_ns_by_class[class_index(class)]
-                .fetch_add(latency_ns, Ordering::Relaxed);
-            record_latency_bucket(&counters.write_latency_buckets, latency_ns);
-            Ok(())
-        })
-        .await
+        };
+        let written = data.len();
+        let result = await_backend_io(&key, disk_backend.pwrite(file.clone(), data, offset)).await;
+        if let Err(error) = result {
+            if matches!(error, StorageError::QueueFull { .. }) {
+                counters.queue_full.fetch_add(1, Ordering::Relaxed);
+            }
+            return Err(error);
+        }
+        if strict {
+            let result = await_backend_io(&key, disk_backend.fdatasync(file)).await;
+            if let Err(error) = result {
+                if matches!(error, StorageError::QueueFull { .. }) {
+                    counters.queue_full.fetch_add(1, Ordering::Relaxed);
+                }
+                return Err(error);
+            }
+        } else {
+            let mut dirty = dirty_paths.lock().expect("dirty path mutex poisoned");
+            dirty.insert(key);
+        }
+        counters.write_ops_by_class[class_index(class)].fetch_add(1, Ordering::Relaxed);
+        counters.bytes_written_by_class[class_index(class)]
+            .fetch_add(written as u64, Ordering::Relaxed);
+        let latency_ns = latency_ns_since(started);
+        counters.write_latency_ns_by_class[class_index(class)]
+            .fetch_add(latency_ns, Ordering::Relaxed);
+        record_latency_bucket(&counters.write_latency_buckets, latency_ns);
+        drop(submission);
+        Ok(())
     }
 
     pub async fn prepare_file(
@@ -1634,20 +1715,42 @@ impl MountScheduler {
         let counters = self.counters.clone();
         let path = path.to_path_buf();
         let started = Instant::now();
-        self.submit(0, move || {
-            let key = normalized_key(&path);
-            pool.sync_path_with_backend(&key, &disk_backend)?;
-            counters.sync_ops.fetch_add(1, Ordering::Relaxed);
-            let latency_ns = latency_ns_since(started);
-            counters
-                .sync_latency_ns
-                .fetch_add(latency_ns, Ordering::Relaxed);
-            record_latency_bucket(&counters.sync_latency_buckets, latency_ns);
-            let mut dirty = dirty_paths.lock().expect("dirty path mutex poisoned");
-            dirty.remove(&key);
-            Ok(())
-        })
-        .await
+        let submission = self.reserve_submission(0)?;
+        let key = normalized_key(&path);
+        let file = match self
+            .io_pool
+            .run({
+                let pool = pool.clone();
+                let key = key.clone();
+                move || pool.open_for_sync(&key)
+            })
+            .await
+        {
+            Ok(file) => file,
+            Err(error) => {
+                if matches!(error, StorageError::QueueFull { .. }) {
+                    counters.queue_full.fetch_add(1, Ordering::Relaxed);
+                }
+                return Err(error);
+            }
+        };
+        let result = await_backend_io(&key, disk_backend.fdatasync(file)).await;
+        if let Err(error) = result {
+            if matches!(error, StorageError::QueueFull { .. }) {
+                counters.queue_full.fetch_add(1, Ordering::Relaxed);
+            }
+            return Err(error);
+        }
+        counters.sync_ops.fetch_add(1, Ordering::Relaxed);
+        let latency_ns = latency_ns_since(started);
+        counters
+            .sync_latency_ns
+            .fetch_add(latency_ns, Ordering::Relaxed);
+        record_latency_bucket(&counters.sync_latency_buckets, latency_ns);
+        let mut dirty = dirty_paths.lock().expect("dirty path mutex poisoned");
+        dirty.remove(&key);
+        drop(submission);
+        Ok(())
     }
 
     pub async fn sync_all_open_files(&self) -> Result<(), StorageError> {
@@ -1656,28 +1759,59 @@ impl MountScheduler {
         let dirty_paths = self.dirty_paths.clone();
         let counters = self.counters.clone();
         let started = Instant::now();
-        self.submit(0, move || {
-            pool.sync_all_with_backend(&disk_backend)?;
-            counters.sync_ops.fetch_add(1, Ordering::Relaxed);
-            let paths: Vec<PathBuf> = {
-                let dirty = dirty_paths.lock().expect("dirty path mutex poisoned");
-                dirty.iter().cloned().collect()
-            };
-            for path in &paths {
-                pool.sync_path_with_backend(path, &disk_backend)?;
+        let submission = self.reserve_submission(0)?;
+        let paths: Vec<PathBuf> = {
+            let dirty = dirty_paths.lock().expect("dirty path mutex poisoned");
+            dirty.iter().cloned().collect()
+        };
+        let files = match self
+            .io_pool
+            .run({
+                let pool = pool.clone();
+                let paths = paths.clone();
+                move || {
+                    let mut files = pool.write_handles();
+                    for path in paths {
+                        let key = normalized_key(&path);
+                        let file = pool.open_for_sync(&key)?;
+                        if !files.iter().any(|(existing, _)| existing == &key) {
+                            files.push((key, file));
+                        }
+                    }
+                    Ok(files)
+                }
+            })
+            .await
+        {
+            Ok(files) => files,
+            Err(error) => {
+                if matches!(error, StorageError::QueueFull { .. }) {
+                    counters.queue_full.fetch_add(1, Ordering::Relaxed);
+                }
+                return Err(error);
             }
-            let mut dirty = dirty_paths.lock().expect("dirty path mutex poisoned");
-            for path in paths {
-                dirty.remove(&path);
+        };
+        for (path, file) in files {
+            let result = await_backend_io(&path, disk_backend.fdatasync(file)).await;
+            if let Err(error) = result {
+                if matches!(error, StorageError::QueueFull { .. }) {
+                    counters.queue_full.fetch_add(1, Ordering::Relaxed);
+                }
+                return Err(error);
             }
-            let latency_ns = latency_ns_since(started);
-            counters
-                .sync_latency_ns
-                .fetch_add(latency_ns, Ordering::Relaxed);
-            record_latency_bucket(&counters.sync_latency_buckets, latency_ns);
-            Ok(())
-        })
-        .await
+        }
+        counters.sync_ops.fetch_add(1, Ordering::Relaxed);
+        let mut dirty = dirty_paths.lock().expect("dirty path mutex poisoned");
+        for path in paths {
+            dirty.remove(&path);
+        }
+        let latency_ns = latency_ns_since(started);
+        counters
+            .sync_latency_ns
+            .fetch_add(latency_ns, Ordering::Relaxed);
+        record_latency_bucket(&counters.sync_latency_buckets, latency_ns);
+        drop(submission);
+        Ok(())
     }
 
     pub async fn data_extents(
