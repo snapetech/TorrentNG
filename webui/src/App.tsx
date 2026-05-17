@@ -417,7 +417,7 @@ export function App() {
       overflow: 'hidden', background: 'var(--bg)', color: 'var(--text)',
     }}>
       {/* Topbar */}
-      <header style={{
+      <header className="rtng-topbar" style={{
         height: 44, background: 'var(--bg)', borderBottom: '1px solid var(--border)',
         display: 'flex', alignItems: 'center', padding: '0 16px', gap: 12, flexShrink: 0,
         minWidth: 0, overflowX: 'auto', overflowY: 'hidden', scrollbarWidth: 'thin',
@@ -463,8 +463,8 @@ export function App() {
           {health?.rtorrent ?? 'connecting…'}
         </span>
 
-        <span style={{ flex: '1 0 12px' }} />
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flex: '0 0 auto' }}>
+        <span className="rtng-topbar-spacer" style={{ flex: '1 0 12px' }} />
+        <div className="rtng-theme-controls" style={{ display: 'flex', alignItems: 'center', gap: 6, flex: '0 0 auto' }}>
           <select
             aria-label="Theme palette"
             value={themeId}

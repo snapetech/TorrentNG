@@ -132,6 +132,29 @@ input[type="radio"]:not(:disabled):hover {
 }
 
 @media (max-width: 720px) {
+  .rtng-topbar {
+    height: auto !important;
+    min-height: 44px;
+    flex-wrap: wrap;
+    align-content: center;
+    padding: 6px 12px !important;
+    gap: 8px !important;
+    overflow-x: hidden !important;
+    overflow-y: visible !important;
+  }
+
+  .rtng-topbar-spacer {
+    display: none;
+  }
+
+  .rtng-theme-controls {
+    min-width: 0;
+  }
+
+  .rtng-theme-controls select {
+    max-width: 150px;
+  }
+
   .rtng-main {
     flex-direction: column;
   }
