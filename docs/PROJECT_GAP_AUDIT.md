@@ -20,7 +20,8 @@ compatibility depth:
   peer/tracker/webseed details and some client-specific plugin APIs;
 - the security release checklist is intentionally unchecked until run against
   the exact deployment config;
-- the 24h soak status row is `RUNNING/UNKNOWN` in the latest status report,
+- the 24h soak status row is explicitly `STALE/INCOMPLETE` when the latest
+  report lacks an `Overall status` line and no matching soak process is active,
   even though short, transfer-churn, finalization, local release, and post-soak
   gates are passing.
 
@@ -39,7 +40,7 @@ Current `scripts/certification_status.sh` highlights:
 | Storage indexed evidence | PASS |
 | Security review and scan | PASS |
 | Pre-engine and post-soak release gates | PASS |
-| 24h soak | RUNNING/UNKNOWN |
+| 24h soak | STALE/INCOMPLETE |
 
 ## Roadmaps
 
@@ -56,8 +57,9 @@ Actionable gaps:
   plugin auxiliary APIs.
 - Keep `docs/INTEROP_MATRIX.md` as the live backlog for protocol and
   client-to-client evidence. Several protocol rows remain planned.
-- Decide whether `24h soak` should be finalized, superseded by transfer-churn
-  soak, or removed from release status if the report is stale.
+- Decide whether `24h soak` should be rerun to completion, superseded by
+  transfer-churn soak, or removed from release status if the stale report is no
+  longer a release target.
 
 ## Storage
 
@@ -91,7 +93,7 @@ Remaining memory work is evidence-bound:
 
 - production-scale soak evidence should be refreshed for the exact release
   config;
-- the current 24h soak report is still `RUNNING/UNKNOWN` in status output;
+- the current 24h soak report is stale/incomplete in status output;
 - fleet-size claims still depend on live deployment measurements, not just
   deterministic proxy tests.
 
@@ -106,12 +108,25 @@ The WebUI is implemented and builds:
 - `npm run build` passes.
 - `npm run lint` passes.
 
-Remaining WebUI gaps are product/certification depth:
+WebUI browser certification now has a local gate:
 
-- no Playwright or browser screenshot matrix is wired into the repo for
-  responsive layout, accessibility, or visual regression;
-- WebUI performance targets in the roadmap are represented by backend/API scale
-  tests, but not by a browser-driven 15k-row render benchmark in CI;
+```sh
+scripts/webui_certification.sh
+```
+
+This runs the production build, lint, and a mocked-API Playwright matrix across
+desktop and mobile viewports. The browser matrix checks first paint, table
+rendering, selection state, settings navigation, storage panel rendering, and
+console/page-error cleanliness.
+`scripts/local_release_gate.sh` now runs the same WebUI certification as part
+of the local release path.
+
+Remaining WebUI gaps are now product/certification depth:
+
+- no visual-regression screenshot baseline or accessibility audit is wired into
+  CI yet;
+- WebUI performance targets in the roadmap have backend/API scale coverage and
+  browser smoke coverage, but not a browser-driven 15k-row render benchmark;
 - some panels necessarily reflect compatibility placeholder depth from backend
   facades, especially live peer/tracker/webseed activity.
 
@@ -180,7 +195,7 @@ Remaining operational evidence:
 
 - rerun the release suite against the exact release config and target hardware;
 - attach security, storage, compatibility, and soak reports to release notes;
-- resolve the stale or still-running 24h soak row.
+- resolve the stale/incomplete 24h soak row.
 
 ## Validation Run During This Audit
 
@@ -190,6 +205,7 @@ Commands run successfully:
 scripts/certification_status.sh
 cd webui && npm run build
 cd webui && npm run lint
+scripts/webui_certification.sh
 scripts/api_facade_certification.sh
 scripts/universal_compatibility_certification.sh
 ```

@@ -85,6 +85,7 @@ skip_gate() {
 run_gate "format" cargo fmt --check
 run_gate "workspace tests" cargo test --workspace
 run_gate "Storage NG feature matrix" "$ROOT/scripts/storage_ng_feature_matrix.sh"
+run_gate "WebUI certification" "$ROOT/scripts/webui_certification.sh"
 run_gate "API facade certification" "$ROOT/scripts/api_facade_certification.sh" "$REPORT_DIR/api-facades-local-release-$(date -u +%Y%m%dT%H%M%SZ).md"
 
 run_gate "native config security review" bash -c '

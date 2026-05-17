@@ -43,6 +43,25 @@ row() {
   printf '| %s | %s | %s |\n' "$name" "$status" "$sample"
 }
 
+row_24h_soak() {
+  local file status sample active
+  file="$(latest 'soak-24h-*.md')"
+  status="$(overall "$file")"
+  sample="-"
+  if [[ -n "$file" && -f "$file" ]]; then
+    sample="$(basename "$file")"
+    if [[ "$status" == "RUNNING/UNKNOWN" ]]; then
+      active="$(pgrep -af 'soak_certification.sh' | grep -F "$sample" || true)"
+      if [[ -n "$active" ]]; then
+        status="RUNNING"
+      else
+        status="STALE/INCOMPLETE"
+      fi
+    fi
+  fi
+  printf '| %s | %s | %s |\n' "24h soak" "$status" "$sample"
+}
+
 storage_index_has() {
   local file="$1"
   local kind="$2"
@@ -107,12 +126,13 @@ row "Phase 1 ruTorrent" 'phase1-cert-*.md'
 row "Synthetic benchmark" 'report-*.md' "$BENCHMARK_DIR"
 row "Short soak" 'soak-202*.md'
 row "Transfer churn soak" 'transfer-churn-*.md'
-row "24h soak" 'soak-24h-*.md'
+row_24h_soak
 row "Soak status" 'soak-status-*.md'
 row "Soak finalization" 'soak-final-*.md'
 row "Security review" 'security-review-*.md'
 row "Security scan" 'security-scan-*.md'
 row "Native engine rewrite" 'native-engine-*.md'
+row "WebUI certification" 'webui-certification-*.md'
 row "Local release gate" 'local-release-*.md'
 row "Storage hardware matrix" 'storage-hardware-*.md'
 row "Storage io_uring capability/graduation" 'storage-uring-graduation-*.md'

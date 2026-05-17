@@ -122,6 +122,7 @@ for pattern in \
   security-review-selftest.md \
   security-scan-selftest.md \
   native-engine-selftest.md \
+  webui-certification-selftest.md \
   local-release-selftest.md \
   pre-engine-release-selftest.md \
   pre-engine-suite-selftest.md; do

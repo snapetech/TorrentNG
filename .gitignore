@@ -4,6 +4,8 @@ sidecar/target/
 sidecar/static/
 webui/node_modules/
 webui/dist/
+webui/test-results/
+webui/playwright-report/
 *.db
 *.db-wal
 *.db-shm
