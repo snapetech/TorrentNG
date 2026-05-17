@@ -1801,6 +1801,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn large_peer_and_recheck_reads_emit_page_cache_advice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.bin");
+        std::fs::write(&path, vec![7u8; 512 * 1024]).unwrap();
+        let sched = hdd_scheduler();
+
+        let peer = scheduled_read(&sched, IoClass::PeerRead, &path, 0, 300 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(peer.len(), 300 * 1024);
+        let recheck = scheduled_read(&sched, IoClass::Recheck, &path, 0, 300 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(recheck.len(), 300 * 1024);
+
+        let stats = sched.stats();
+        assert!(stats.page_cache_advise_sequential >= 2);
+        assert!(stats.page_cache_advise_willneed >= 1);
+        assert!(stats.page_cache_advise_dontneed >= 1);
+    }
+
+    #[tokio::test]
     async fn concurrent_positioned_writes_do_not_share_cursor() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("positioned.bin");
