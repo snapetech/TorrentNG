@@ -91,12 +91,21 @@ async fn rpc(
         .get("method")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    let json_rpc = body
+        .get("jsonrpc")
+        .and_then(Value::as_str)
+        .is_some_and(|version| version == "2.0");
     let snake_case_rpc = method.contains('_');
     let method_key = method.replace('_', "-");
     let args = normalize_transmission_request_keys(
-        body.get("arguments").cloned().unwrap_or_else(|| json!({})),
+        body.get(if json_rpc { "params" } else { "arguments" })
+            .or_else(|| body.get("arguments"))
+            .or_else(|| body.get("params"))
+            .cloned()
+            .unwrap_or_else(|| json!({})),
     );
     let tag = body.get("tag").cloned();
+    let id = body.get("id").cloned().unwrap_or(Value::Null);
     let result = match method_key.as_str() {
         "session-get" => Ok(session_get(&state).await),
         "session-stats" => Ok(session_stats(&state).await),
@@ -129,7 +138,13 @@ async fn rpc(
         "torrent-add" => torrent_add(&state, &args).await,
         "torrent-set-location" => {
             let Some(location) = args.get("location").and_then(Value::as_str) else {
-                return Json(response(tag.clone(), "missing location", json!({}))).into_response();
+                return Json(transmission_response(
+                    tag.clone(),
+                    id,
+                    json_rpc,
+                    Err("missing location".to_owned()),
+                ))
+                .into_response();
             };
             for hash in ids(&state, &args).await {
                 if let Some(engine) = &state.engine {
@@ -192,22 +207,18 @@ async fn rpc(
         }
         _ => Err("method name not recognized".to_owned()),
     };
-    let (result, arguments) = match result {
+    let payload = match result {
         Ok(arguments) => {
             let arguments = if snake_case_rpc {
                 transmission_response_to_snake_case(arguments)
             } else {
                 arguments
             };
-            ("success".to_owned(), arguments)
+            Ok(arguments)
         }
-        Err(result) => (result, json!({})),
+        Err(result) => Err(result),
     };
-    let mut response = json!({"result": result, "arguments": arguments});
-    if let Some(tag) = tag {
-        response["tag"] = tag;
-    }
-    Json(response).into_response()
+    Json(transmission_response(tag, id, json_rpc, payload)).into_response()
 }
 
 async fn torrent_set(state: &AppState, args: &Value) -> Result<Value, String> {
@@ -428,12 +439,48 @@ fn file_ids_arg(args: &Value, key: &str) -> Vec<u32> {
         .unwrap_or_default()
 }
 
-fn response(tag: Option<Value>, result: &str, arguments: Value) -> Value {
-    let mut response = json!({"result": result, "arguments": arguments});
+fn transmission_response(
+    tag: Option<Value>,
+    id: Value,
+    json_rpc: bool,
+    payload: Result<Value, String>,
+) -> Value {
+    if json_rpc {
+        return match payload {
+            Ok(result) => json!({
+                "jsonrpc": "2.0",
+                "result": result,
+                "id": id,
+            }),
+            Err(message) => json!({
+                "jsonrpc": "2.0",
+                "error": {
+                    "code": transmission_json_rpc_error_code(&message),
+                    "message": message,
+                    "data": {
+                        "error_string": message,
+                    },
+                },
+                "id": id,
+            }),
+        };
+    }
+
+    let mut response = match payload {
+        Ok(arguments) => json!({"result": "success", "arguments": arguments}),
+        Err(result) => json!({"result": result, "arguments": {}}),
+    };
     if let Some(tag) = tag {
         response["tag"] = tag;
     }
     response
+}
+
+fn transmission_json_rpc_error_code(message: &str) -> i64 {
+    match message {
+        "method name not recognized" => -32601,
+        _ => -32602,
+    }
 }
 
 fn normalize_transmission_request_keys(value: Value) -> Value {
@@ -1674,6 +1721,66 @@ mod tests {
         assert_eq!(body["arguments"]["torrents"][0]["percent_done"], 0.6);
         assert_eq!(body["arguments"]["torrents"][0]["left_until_done"], 40);
         assert_eq!(body["arguments"]["torrents"][0]["download_dir"], "/old");
+    }
+
+    #[tokio::test]
+    async fn transmission_json_rpc_20_uses_params_and_direct_result() {
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        {
+            let mut reg = registry.write().await;
+            let mut entry = TorrentEntry::new("f".repeat(40), "foxtrot".into(), "/data".into());
+            entry.total_length = 80;
+            entry.amount_left = 20;
+            reg.add(entry).unwrap();
+        }
+        let app = build_transmission_router(AppState::new(registry));
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .header("content-type", "application/json")
+                    .header("x-transmission-session-id", SESSION_ID)
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","method":"torrent_get","params":{"fields":["hash_string","name","percent_done","left_until_done"]},"id":7}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], 7);
+        assert!(body.get("arguments").is_none());
+        assert_eq!(body["result"]["torrents"][0]["hash_string"], "f".repeat(40));
+        assert_eq!(body["result"]["torrents"][0]["name"], "foxtrot");
+        assert_eq!(body["result"]["torrents"][0]["percent_done"], 0.75);
+        assert_eq!(body["result"]["torrents"][0]["left_until_done"], 20);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .header("content-type", "application/json")
+                    .header("x-transmission-session-id", SESSION_ID)
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","method":"no_such_method","params":{},"id":"bad"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], "bad");
+        assert_eq!(body["error"]["code"], -32601);
+        assert_eq!(body["error"]["message"], "method name not recognized");
     }
 
     #[tokio::test]

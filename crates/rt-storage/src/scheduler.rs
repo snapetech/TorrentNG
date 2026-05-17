@@ -14,6 +14,18 @@ use sha1::{Digest, Sha1};
 
 use crate::{error::StorageError, io_class::IoClass};
 
+pub const STORAGE_LATENCY_BUCKETS_NS: [u64; 8] = [
+    100_000,
+    500_000,
+    1_000_000,
+    5_000_000,
+    10_000_000,
+    50_000_000,
+    100_000_000,
+    u64::MAX,
+];
+pub const STORAGE_LATENCY_BUCKET_COUNT: usize = STORAGE_LATENCY_BUCKETS_NS.len();
+
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 #[cfg(windows)]
@@ -119,6 +131,10 @@ pub struct StorageIoStats {
     pub backend_bytes_read_by_class: [u64; 6],
     pub read_latency_ns_by_class: [u64; 6],
     pub write_latency_ns_by_class: [u64; 6],
+    pub read_latency_buckets: [u64; STORAGE_LATENCY_BUCKET_COUNT],
+    pub write_latency_buckets: [u64; STORAGE_LATENCY_BUCKET_COUNT],
+    pub sync_latency_buckets: [u64; STORAGE_LATENCY_BUCKET_COUNT],
+    pub hash_latency_buckets: [u64; STORAGE_LATENCY_BUCKET_COUNT],
     pub sync_latency_ns: u64,
     pub hash_latency_ns: u64,
     pub sync_ops: u64,
@@ -395,6 +411,10 @@ struct StorageCounters {
     backend_bytes_read_by_class: [AtomicU64; 6],
     read_latency_ns_by_class: [AtomicU64; 6],
     write_latency_ns_by_class: [AtomicU64; 6],
+    read_latency_buckets: [AtomicU64; STORAGE_LATENCY_BUCKET_COUNT],
+    write_latency_buckets: [AtomicU64; STORAGE_LATENCY_BUCKET_COUNT],
+    sync_latency_buckets: [AtomicU64; STORAGE_LATENCY_BUCKET_COUNT],
+    hash_latency_buckets: [AtomicU64; STORAGE_LATENCY_BUCKET_COUNT],
     sync_latency_ns: AtomicU64,
     hash_latency_ns: AtomicU64,
     sync_ops: AtomicU64,
@@ -416,6 +436,10 @@ impl Default for StorageCounters {
             backend_bytes_read_by_class: std::array::from_fn(|_| AtomicU64::new(0)),
             read_latency_ns_by_class: std::array::from_fn(|_| AtomicU64::new(0)),
             write_latency_ns_by_class: std::array::from_fn(|_| AtomicU64::new(0)),
+            read_latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            write_latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            sync_latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            hash_latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             sync_latency_ns: AtomicU64::new(0),
             hash_latency_ns: AtomicU64::new(0),
             sync_ops: AtomicU64::new(0),
@@ -548,6 +572,10 @@ impl MountScheduler {
             ),
             read_latency_ns_by_class: load_atomic_array(&self.counters.read_latency_ns_by_class),
             write_latency_ns_by_class: load_atomic_array(&self.counters.write_latency_ns_by_class),
+            read_latency_buckets: load_atomic_array(&self.counters.read_latency_buckets),
+            write_latency_buckets: load_atomic_array(&self.counters.write_latency_buckets),
+            sync_latency_buckets: load_atomic_array(&self.counters.sync_latency_buckets),
+            hash_latency_buckets: load_atomic_array(&self.counters.hash_latency_buckets),
             sync_latency_ns: self.counters.sync_latency_ns.load(Ordering::Relaxed),
             hash_latency_ns: self.counters.hash_latency_ns.load(Ordering::Relaxed),
             sync_ops: self.counters.sync_ops.load(Ordering::Relaxed),
@@ -934,7 +962,7 @@ fn class_index(class: IoClass) -> usize {
     class as usize
 }
 
-fn load_atomic_array(values: &[AtomicU64; 6]) -> [u64; 6] {
+fn load_atomic_array<const N: usize>(values: &[AtomicU64; N]) -> [u64; N] {
     std::array::from_fn(|index| values[index].load(Ordering::Relaxed))
 }
 
