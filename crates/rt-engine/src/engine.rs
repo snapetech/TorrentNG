@@ -2961,7 +2961,14 @@ impl Engine {
         let raw = match std::fs::read(torrent_blob_path(&self.config, info_hash_hex)) {
             Ok(raw) => raw,
             Err(e) => {
-                warn!(torrent = %info_hash_hex, err = %e, "failed to load torrent metadata for DHT registration");
+                warn!(
+                    component = "dht",
+                    operation = "register_torrent",
+                    torrent = %info_hash_hex,
+                    result = "error",
+                    error = %e,
+                    "failed to load torrent metadata for DHT registration"
+                );
                 return;
             }
         };
@@ -2988,7 +2995,13 @@ impl Engine {
         match parse_info_hash_hex(info_hash_hex) {
             Ok(info_hash) => self.register_dht_torrent(info_hash, info_hash_hex).await,
             Err(()) => {
-                warn!(torrent = %info_hash_hex, "failed to parse info hash for DHT registration")
+                warn!(
+                    component = "dht",
+                    operation = "register_torrent",
+                    torrent = %info_hash_hex,
+                    result = "error",
+                    "failed to parse info hash for DHT registration"
+                )
             }
         }
     }
