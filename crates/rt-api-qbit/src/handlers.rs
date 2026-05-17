@@ -472,7 +472,13 @@ pub async fn torrents_add(
             let magnet = match parse_magnet(url) {
                 Ok(magnet) => magnet,
                 Err(e) => {
-                    tracing::error!("qb add magnet parse failed: {e}");
+                    tracing::error!(
+                        component = "api",
+                        operation = "add_magnet",
+                        source = "magnet:redacted",
+                        error = %e,
+                        "qBit magnet parse failed"
+                    );
                     return (StatusCode::BAD_REQUEST, "Fails.").into_response();
                 }
             };
@@ -491,7 +497,12 @@ pub async fn torrents_add(
                 )
                 .await
             {
-                tracing::error!("qb add magnet failed: {e}");
+                tracing::error!(
+                    component = "api",
+                    operation = "add_magnet",
+                    error = %e,
+                    "qBit magnet add failed"
+                );
                 return (StatusCode::BAD_REQUEST, "Fails.").into_response();
             }
             added_url_torrent = true;
@@ -500,7 +511,13 @@ pub async fn torrents_add(
         match fetch_torrent_url(url).await {
             Ok(raw) => torrent_blobs.push(raw),
             Err(e) => {
-                tracing::error!("qb add torrent url {url}: {e}");
+                tracing::error!(
+                    component = "api",
+                    operation = "add_torrent_url",
+                    source = %redact_log_url(url),
+                    error = %e,
+                    "qBit torrent URL fetch failed"
+                );
                 return (StatusCode::BAD_REQUEST, "Fails.").into_response();
             }
         }
@@ -524,7 +541,12 @@ pub async fn torrents_add(
         let meta = match parse_torrent(&raw) {
             Ok(meta) => meta,
             Err(e) => {
-                tracing::error!("qb add torrent parse failed: {e}");
+                tracing::error!(
+                    component = "api",
+                    operation = "add_torrent",
+                    error = %e,
+                    "qBit torrent parse failed"
+                );
                 return (StatusCode::BAD_REQUEST, "Fails.").into_response();
             }
         };
@@ -538,7 +560,12 @@ pub async fn torrents_add(
             )
             .await
         {
-            tracing::error!("qb add torrent failed: {e}");
+            tracing::error!(
+                component = "api",
+                operation = "add_torrent",
+                error = %e,
+                "qBit torrent add failed"
+            );
             return (StatusCode::BAD_REQUEST, "Fails.").into_response();
         }
     }
@@ -2734,6 +2761,45 @@ fn qbit_magnet_uri(info_hash: &str) -> String {
     }
 }
 
+fn redact_log_url(value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    if lower.starts_with("magnet:?") {
+        return "magnet:redacted".to_owned();
+    }
+    match Url::parse(value) {
+        Ok(mut url) => {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            let sensitive = [
+                "token", "apikey", "api_key", "passkey", "auth", "password", "cookie", "session",
+            ];
+            let pairs = url
+                .query_pairs()
+                .map(|(key, value)| {
+                    if sensitive
+                        .iter()
+                        .any(|needle| key.to_ascii_lowercase().contains(needle))
+                    {
+                        (key.into_owned(), "redacted".to_owned())
+                    } else {
+                        (key.into_owned(), value.into_owned())
+                    }
+                })
+                .collect::<Vec<_>>();
+            url.set_query(None);
+            if !pairs.is_empty() {
+                let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+                for (key, value) in pairs {
+                    serializer.append_pair(&key, &value);
+                }
+                url.set_query(Some(&serializer.finish()));
+            }
+            url.to_string()
+        }
+        Err(_) => "url:invalid".to_owned(),
+    }
+}
+
 async fn qbit_tracker_projection(state: &AppState, info_hash: &str) -> (String, u32) {
     if let Some(cached) = state
         .tracker_projection_cache
@@ -4591,6 +4657,24 @@ mod tests {
         assert!(reject_private_ip("fc00::1".parse().unwrap()).is_err());
         assert!(reject_private_ip("fe80::1".parse().unwrap()).is_err());
         assert!(reject_private_ip("8.8.8.8".parse().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn redact_log_url_removes_sensitive_parts() {
+        assert_eq!(
+            redact_log_url("magnet:?xt=urn:btih:abcdef"),
+            "magnet:redacted"
+        );
+        let redacted = redact_log_url(
+            "https://user:pass@example.test/announce?passkey=secret&foo=bar&api_key=hidden",
+        );
+        assert!(redacted.starts_with("https://example.test/announce?"));
+        assert!(redacted.contains("passkey=redacted"));
+        assert!(redacted.contains("api_key=redacted"));
+        assert!(redacted.contains("foo=bar"));
+        assert!(!redacted.contains("secret"));
+        assert!(!redacted.contains("hidden"));
+        assert_eq!(redact_log_url("not a url"), "url:invalid");
     }
 
     #[test]
