@@ -81,6 +81,76 @@ async fn backend_selection_roundtrip_reports_capabilities() {
     assert_eq!(frame.as_slice(), &data[..]);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "real-device storage benchmark; run explicitly with --ignored --nocapture"]
+async fn backend_stream_roundtrip_reports_throughput() {
+    let backend_name = std::env::var("TNG_STORAGE_BACKEND").unwrap_or_else(|_| "pread".to_string());
+    let blocks = bench_size("TNG_STORAGE_BACKEND_STREAM_BLOCKS", 1024);
+    let block_len = bench_size("TNG_STORAGE_BACKEND_STREAM_BLOCK_LEN", 256 * 1024) as usize;
+    let total = blocks as usize * block_len;
+    let request = BackendRequest::parse(&backend_name);
+    let backend = SelectedDiskBackend::select(request, 1);
+    let pool = FramePool::new((block_len as u64).saturating_mul(2).max(1024 * 1024));
+
+    let dir = bench_dir();
+    print_topology(dir.path());
+    let path = dir
+        .path()
+        .join(format!("backend-stream-{backend_name}.bin"));
+    std::fs::write(&path, vec![0u8; total]).unwrap();
+    let file = std::sync::Arc::new(
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap(),
+    );
+
+    let write_started = Instant::now();
+    for block in 0..blocks {
+        let fill = (block % 251) as u8;
+        let data = bytes::Bytes::from(vec![fill; block_len]);
+        backend
+            .pwrite(file.clone(), data, block * block_len as u64)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    backend.fdatasync(file.clone()).await.unwrap().unwrap();
+    let write_elapsed = write_started.elapsed();
+
+    drop_file_cache(&path);
+    let read_started = Instant::now();
+    for block in 0..blocks {
+        let fill = (block % 251) as u8;
+        let frame = pool.try_acquire(block_len).unwrap();
+        let frame = backend
+            .pread(file.clone(), frame, block * block_len as u64)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.as_slice()[0], fill);
+        assert_eq!(frame.as_slice()[block_len - 1], fill);
+    }
+    let read_elapsed = read_started.elapsed();
+
+    let mib = total as f64 / (1024.0 * 1024.0);
+    let write_mib_s = mib / write_elapsed.as_secs_f64();
+    let read_mib_s = mib / read_elapsed.as_secs_f64();
+
+    println!(
+        "tng_storage_backend_stream requested={backend_name} selected={} reason=\"{}\" blocks={blocks} block_len={block_len} total_mib={mib:.2} write_elapsed_ms={} read_elapsed_ms={} write_mib_s={write_mib_s:.2} read_mib_s={read_mib_s:.2} fixed_buffers={} registered_files={} max_batch_len={} fixed_buffer_len={}",
+        backend.kind().as_str(),
+        backend.selection().reason,
+        write_elapsed.as_millis(),
+        read_elapsed.as_millis(),
+        backend.supports_fixed_buffers(),
+        backend.supports_registered_files(),
+        backend.max_batch_len(),
+        backend.fixed_buffer_len(),
+    );
+}
+
 fn shuffled_offsets(blocks: u64, block_len: usize) -> Vec<u64> {
     (0..blocks)
         .map(|i| i.wrapping_mul(1_103_515_245) % blocks * block_len as u64)

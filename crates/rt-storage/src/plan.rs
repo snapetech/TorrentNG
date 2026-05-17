@@ -229,6 +229,7 @@ fn execute_step(step: &StoragePlanStep) -> Result<(), StorageError> {
             let destination = required_path(step.destination.as_ref(), "import-destination")?;
             ensure_destination_available(destination)?;
             create_parent(destination)?;
+            reject_symlink(source, "import-source")?;
             match std::fs::hard_link(source, destination) {
                 Ok(()) => verify_path_len(destination, step.bytes),
                 Err(_) => copy_verify(source, destination, step.bytes),
@@ -252,12 +253,19 @@ fn execute_step(step: &StoragePlanStep) -> Result<(), StorageError> {
         }
         PlannedStorageAction::SafeDelete => {
             let source = required_path(step.source.as_ref(), "delete-source")?;
-            if source.is_dir() {
+            let metadata = safe_symlink_metadata(source, "delete-source")?;
+            let file_type = metadata.file_type();
+            if file_type.is_dir() {
                 std::fs::remove_dir_all(source)
                     .map_err(|e| StorageError::io(source.display().to_string(), e))
-            } else {
+            } else if file_type.is_file() || file_type.is_symlink() {
                 std::fs::remove_file(source)
                     .map_err(|e| StorageError::io(source.display().to_string(), e))
+            } else {
+                Err(StorageError::StagedMoveFailed {
+                    step: "delete-source",
+                    reason: format!("unsupported file type: {}", source.display()),
+                })
             }
         }
     }
@@ -780,6 +788,37 @@ mod tests {
         assert_eq!(std::fs::read(&destination).unwrap(), b"data");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn execute_import_plan_rejects_symlink_source_before_hardlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside.bin");
+        let source = dir.path().join("source-link.bin");
+        let destination = dir.path().join("dest.bin");
+        std::fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, &source).unwrap();
+        let plan = plan_import(&ImportPlanRequest {
+            source: source.clone(),
+            destination: destination.clone(),
+            bytes: 7,
+            available_bytes: Some(100),
+            hardlink_or_copy: true,
+            dry_run: false,
+        });
+
+        assert!(matches!(
+            execute_storage_plan(&plan),
+            Err(StorageError::StagedMoveFailed {
+                step: "execute",
+                ..
+            })
+        ));
+        assert!(source.exists());
+        assert!(!destination.exists());
+    }
+
     #[test]
     fn execute_copy_verify_plan_copies_directory_tree_and_verifies_bytes() {
         let dir = tempfile::tempdir().unwrap();
@@ -937,6 +976,32 @@ mod tests {
         execute_storage_plan(&plan).unwrap();
 
         assert!(!target.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_delete_plan_removes_symlink_without_following_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target_dir = dir.path().join("target-dir");
+        let target_file = target_dir.join("target.bin");
+        let link = dir.path().join("delete-link");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(&target_file, b"data").unwrap();
+        symlink(&target_dir, &link).unwrap();
+
+        let plan = plan_delete(&DeletePlanRequest {
+            target: link.clone(),
+            bytes: 0,
+            dry_run: false,
+            dry_run_approved: true,
+        });
+
+        execute_storage_plan(&plan).unwrap();
+
+        assert!(!link.exists());
+        assert_eq!(std::fs::read(&target_file).unwrap(), b"data");
     }
 
     #[test]

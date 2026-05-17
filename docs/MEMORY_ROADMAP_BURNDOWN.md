@@ -21,7 +21,7 @@ Status as of 2026-05-17.
 - [x] Slow-disk plus fast-peer backpressure evidence proxy.
   - Storage scale tests exercise queue-full backpressure rather than unbounded queue growth under saturated hash/disk paths.
 - [x] Conservative move/import/delete executor below the storage planner.
-  - Applies only plans that passed admission, never overwrites destinations, creates parents, verifies file or directory copy lengths, rejects symlinks in recursive copy sources, removes copy-move sources only after the verified rename, supports approved recursive delete, and rolls back staged copy files/directories on failure.
+  - Applies only plans that passed admission, never overwrites destinations, creates parents, verifies file or directory copy lengths, rejects symlinks in recursive copy and hardlink-import sources, uses symlink-safe delete, removes copy-move sources only after the verified rename, supports approved recursive delete, and rolls back staged copy files/directories on failure.
   - Root-confined execution validates source, destination, and rollback paths against configured storage roots before applying filesystem changes.
   - `scripts/storage_move_import_certification.sh` records the local planner/executor and full storage suite evidence under `certification/reports/`.
   - Set `TNG_STORAGE_MOVE_IMPORT_ROOT` to run the same executor on a real storage root with configurable fixture size.
@@ -42,4 +42,7 @@ Status as of 2026-05-17.
   - Correctness fallback and forced-roundtrip tests exist.
   - Real-device hardware reports now include `pread` and forced `uring`
     backend roundtrips plus registered-file/fixed-buffer capability rows.
+  - `scripts/storage_uring_graduation.sh` records real-device `pread` vs
+    `uring` stream throughput, selected backend, registered-file support, and
+    fixed-buffer support, with opt-in pass/fail thresholds for graduation.
   - `uring` remains explicit opt-in until real-device `pread` vs `uring` reports show a durable win and frame-pool registered-buffer leases remove the extra copy path.

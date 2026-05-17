@@ -34,12 +34,13 @@ per-case syscall counters when `strace` is available.
 | Formatting | Workspace Rust formatting | `cargo fmt --check` |
 | Storage core | fd pool, positioned I/O, preallocation, durability, page-cache advice, sparse recheck, readahead, topology, elevator policy | `cargo test -p rt-storage` |
 | Backend selection | `auto`/`pread`/`uring` parsing, `io_uring` probe and worker-start fallback diagnostics, selected-backend read/write roundtrip | `cargo test -p rt-storage backend::tests` |
+| Backend graduation | real-device `pread` vs `uring` stream throughput, selected backend, registered-file support, fixed-buffer support | `scripts/storage_uring_graduation.sh /target/root` |
 | Resource governor | total and per-class memory caps, pressure transitions, denied allocation counters, lease release | `cargo test -p rt-metrics resource::tests` |
 | Scale proxies | bounded crash recheck, storage fd cap, peer-read locality, hash-pool isolation, RAM verify path, sparse recheck extents | `cargo test -p rt-metrics storage_ -- --nocapture` |
 | Configuration | default storage elevator, memory caps, runtime tier switch, TOML partial parsing | `cargo test -p rt-config` |
 | Engine consumers | storage-backed recheck, upload reads across multi-file regions, resource snapshot in engine stats, taskless v2 verification | `cargo test -p rt-engine` |
 | Native API metrics | Prometheus projection for storage backend, frame/fd runtime, scheduler counters, bounded peer-cache pressure, peer buffer bytes, resource-governor classes | `cargo test -p rt-api-native render_metrics_includes_engine_stats` |
-| Move/import executor | plan admission, no-overwrite moves, copy-based move source cleanup, hardlink-or-copy import, recursive directory copy/delete, symlink rejection, staged rollback cleanup, storage-root confinement, optional real-root fixture execution | `scripts/storage_move_import_certification.sh`; set `TNG_STORAGE_MOVE_IMPORT_ROOT` for hardware-root evidence |
+| Move/import executor | plan admission, no-overwrite moves, copy-based move source cleanup, hardlink-or-copy import, recursive directory copy/delete, symlink rejection, symlink-safe delete, staged rollback cleanup, storage-root confinement, optional real-root fixture execution | `scripts/storage_move_import_certification.sh`; set `TNG_STORAGE_MOVE_IMPORT_ROOT` for hardware-root evidence |
 
 ## Runtime Configuration Matrix
 

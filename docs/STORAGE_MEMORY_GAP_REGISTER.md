@@ -39,8 +39,8 @@ Implemented and covered by automated tests:
 - Move/import/delete plans have a conservative executor with no-overwrite
   admission, parent creation, copy-length verification, staged rollback cleanup,
   recursive directory copy/delete support, copy-based move source cleanup after
-  verified rename, symlink rejection during recursive copies, hardlink-or-copy
-  import, and dry-run no-op behavior.
+  verified rename, symlink rejection during recursive copies and hardlink
+  imports, symlink-safe delete, and dry-run no-op behavior.
 - Move/import/delete execution has an opt-in storage-root confinement entry
   point that validates source, destination, and rollback paths before applying
   any filesystem change.
@@ -52,6 +52,8 @@ Implemented and covered by automated tests:
   support, fixed-buffer support, batch length, and fixed-buffer length.
 - Forced `io_uring` selection falls back to `pread` with a diagnostic if worker
   startup cannot create the ring on the host/container.
+- `scripts/storage_uring_graduation.sh` records real-device `pread` vs
+  `uring` stream throughput and optional graduation thresholds.
 - Current real-device storage evidence includes local NVMe/SSD and the kspls0
   HDD-backed LVM media pool. The LVM report passes the required 5x wall-clock
   target at 8192 blocks and collapses backend reads from 8192 to 1.
@@ -63,7 +65,7 @@ Implemented and covered by automated tests:
 | Area | Gap | Risk | Next Work |
 | --- | --- | --- | --- |
 | Deterministic LVM PV placement control | The kspls0 extent probe shows the pool can allocate independent files on multiple rotational PVs, but ordinary path writes still do not let TorrentNG choose a specific PV. | Cross-PV behavior inside the LVM pool is allocator-dependent, so path-level scheduling cannot promise physical-drive affinity. | Use LVM extent mapping for evidence, or add lower-level PV-targeted probes only if release claims require deterministic per-drive placement. |
-| `io_uring` frame-pool slot pinning | `UringBackend` uses worker-owned fixed buffers when available, but the global frame pool does not yet hand out stable registered buffer slots. | Extra copies remain in the uring path, and fixed-buffer metrics can overstate how much of the full storage path is zero-copy. | Add frame-pool slot leases through the backend API after hardware reports prove `uring` should graduate from explicit opt-in. |
+| `io_uring` frame-pool slot pinning | `UringBackend` uses worker-owned fixed buffers when available, but the global frame pool does not yet hand out stable registered buffer slots. | Extra copies remain in the uring path, and fixed-buffer metrics can overstate how much of the full storage path is zero-copy. | Run `scripts/storage_uring_graduation.sh /target/root` with selected-backend, fixed-buffer, registered-file, and throughput thresholds. Add frame-pool slot leases through the backend API only after those reports prove `uring` should graduate from explicit opt-in. |
 | Move/import certification | The certification runner now supports real-root fixture execution, but representative multi-TB operator evidence is still host/run dependent. | Large library move/import claims should not be made from unit tests alone. | Run `TNG_STORAGE_MOVE_IMPORT_ROOT=/target/root TNG_STORAGE_MOVE_IMPORT_FILES=... TNG_STORAGE_MOVE_IMPORT_MIB_PER_FILE=... scripts/storage_move_import_certification.sh` on the target storage roots and publish the generated report. |
 
 ## Verification Commands
@@ -80,6 +82,7 @@ scripts/storage_ng_feature_matrix.sh
 scripts/api_facade_certification.sh
 scripts/storage_move_import_certification.sh
 TNG_STORAGE_MOVE_IMPORT_ROOT=/target/root scripts/storage_move_import_certification.sh
+scripts/storage_uring_graduation.sh /target/root
 ```
 
 Use these before claiming production storage performance:
