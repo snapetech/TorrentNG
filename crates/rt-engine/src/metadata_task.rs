@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -33,6 +33,8 @@ const MAX_METADATA_SIZE: u32 = 16 * 1024 * 1024;
 const LOCAL_UT_METADATA_ID: u8 = 1;
 const MAX_METADATA_FETCH_CONCURRENCY: usize = 8;
 const METADATA_PEER_RETRY_AFTER: Duration = Duration::from_secs(15);
+const METADATA_PEER_ATTEMPT_CACHE_MIN: usize = 256;
+const METADATA_PEER_ATTEMPT_CACHE_MULTIPLIER: usize = 4;
 
 pub async fn run_metadata_task(
     info_hash: [u8; 20],
@@ -65,6 +67,7 @@ pub async fn run_metadata_task(
                             &info_hash_hex,
                             &trackers,
                             peers,
+                            max_peers,
                             &mut peer_attempts,
                             &engine_tx,
                         )
@@ -159,6 +162,7 @@ pub async fn run_metadata_task(
                     &info_hash_hex,
                     &trackers,
                     peers,
+                    max_peers,
                     &mut peer_attempts,
                     &engine_tx,
                 )
@@ -191,13 +195,17 @@ async fn try_fetch_from_peers(
     info_hash_hex: &str,
     trackers: &[String],
     peers: Vec<SocketAddr>,
+    max_peers: usize,
     peer_attempts: &mut HashMap<SocketAddr, Instant>,
     engine_tx: &mpsc::Sender<EngineCmd>,
 ) -> bool {
-    let mut candidates = peers
-        .into_iter()
-        .filter(|peer| should_retry_peer(peer_attempts, *peer, Instant::now()))
-        .collect::<VecDeque<_>>();
+    let mut candidates = metadata_fetch_candidates(
+        peers,
+        peer_attempts,
+        Instant::now(),
+        metadata_peer_attempt_cache_cap(max_peers),
+        metadata_peer_candidate_cap(max_peers),
+    );
     let mut in_flight = FuturesUnordered::new();
 
     while in_flight.len() < MAX_METADATA_FETCH_CONCURRENCY {
@@ -241,6 +249,56 @@ fn should_retry_peer(
     true
 }
 
+fn metadata_peer_attempt_cache_cap(max_peers: usize) -> usize {
+    max_peers
+        .saturating_mul(METADATA_PEER_ATTEMPT_CACHE_MULTIPLIER)
+        .max(METADATA_PEER_ATTEMPT_CACHE_MIN)
+}
+
+fn metadata_peer_candidate_cap(max_peers: usize) -> usize {
+    max_peers.max(MAX_METADATA_FETCH_CONCURRENCY)
+}
+
+fn metadata_fetch_candidates(
+    peers: Vec<SocketAddr>,
+    peer_attempts: &mut HashMap<SocketAddr, Instant>,
+    now: Instant,
+    attempt_cap: usize,
+    candidate_cap: usize,
+) -> VecDeque<SocketAddr> {
+    peer_attempts.retain(|_, last| now.duration_since(*last) < METADATA_PEER_RETRY_AFTER);
+    let mut candidates = VecDeque::new();
+    for peer in peers {
+        if candidates.len() >= candidate_cap {
+            break;
+        }
+        if !should_retry_peer(peer_attempts, peer, now) {
+            continue;
+        }
+        prune_metadata_peer_attempts(peer_attempts, attempt_cap, peer);
+        candidates.push_back(peer);
+    }
+    candidates
+}
+
+fn prune_metadata_peer_attempts(
+    peer_attempts: &mut HashMap<SocketAddr, Instant>,
+    attempt_cap: usize,
+    protected_peer: SocketAddr,
+) {
+    while peer_attempts.len() > attempt_cap {
+        let Some(oldest_peer) = peer_attempts
+            .iter()
+            .filter(|(peer, _)| **peer != protected_peer)
+            .min_by_key(|(_, attempted_at)| *attempted_at)
+            .map(|(peer, _)| *peer)
+        else {
+            break;
+        };
+        peer_attempts.remove(&oldest_peer);
+    }
+}
+
 async fn metadata_fetch_attempt(
     peer: SocketAddr,
     info_hash: [u8; 20],
@@ -274,6 +332,8 @@ async fn announce_trackers(
     event: TrackerEvent,
 ) -> Vec<SocketAddr> {
     let mut peers = Vec::new();
+    let mut seen = HashSet::new();
+    let peer_cap = metadata_peer_candidate_cap(max_peers);
     for tracker in trackers {
         match announce_tracker(
             tracker,
@@ -287,7 +347,14 @@ async fn announce_trackers(
         .await
         {
             Ok(resp) => {
-                peers.extend(resp.peers.into_iter().map(|peer| peer.addr));
+                for peer in resp.peers.into_iter().map(|peer| peer.addr) {
+                    if peers.len() >= peer_cap {
+                        return peers;
+                    }
+                    if seen.insert(peer) {
+                        peers.push(peer);
+                    }
+                }
             }
             Err(err) => {
                 warn!(
@@ -777,5 +844,45 @@ mod tests {
             peer,
             now + METADATA_PEER_RETRY_AFTER + Duration::from_secs(1)
         ));
+    }
+
+    #[test]
+    fn metadata_fetch_candidates_are_bounded_and_prune_retry_history() {
+        let now = Instant::now();
+        let mut attempts = HashMap::from([
+            (
+                "127.0.0.1:6881".parse().unwrap(),
+                now - METADATA_PEER_RETRY_AFTER - Duration::from_secs(1),
+            ),
+            ("127.0.0.2:6881".parse().unwrap(), now),
+        ]);
+        let peers = vec![
+            "127.0.0.1:6881".parse().unwrap(),
+            "127.0.0.2:6881".parse().unwrap(),
+            "127.0.0.3:6881".parse().unwrap(),
+            "127.0.0.4:6881".parse().unwrap(),
+        ];
+
+        let candidates = metadata_fetch_candidates(peers, &mut attempts, now, 2, 2);
+
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates.contains(&"127.0.0.1:6881".parse().unwrap()));
+        assert!(candidates.contains(&"127.0.0.3:6881".parse().unwrap()));
+        assert_eq!(attempts.len(), 2);
+        assert!(attempts.contains_key(&"127.0.0.3:6881".parse().unwrap()));
+    }
+
+    #[test]
+    fn metadata_attempt_cache_cap_scales_with_peer_limit() {
+        assert_eq!(
+            metadata_peer_attempt_cache_cap(1),
+            METADATA_PEER_ATTEMPT_CACHE_MIN
+        );
+        assert_eq!(metadata_peer_attempt_cache_cap(100), 400);
+        assert_eq!(
+            metadata_peer_candidate_cap(1),
+            MAX_METADATA_FETCH_CONCURRENCY
+        );
+        assert_eq!(metadata_peer_candidate_cap(100), 100);
     }
 }

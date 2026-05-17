@@ -1063,13 +1063,14 @@ impl TorrentTask {
     }
 
     fn runtime_stats(&self) -> TorrentRuntimeStats {
+        let outstanding_requests = self
+            .active_peers
+            .values()
+            .map(|peer| peer.outstanding as u64)
+            .sum::<u64>();
         TorrentRuntimeStats {
             connected_peers: self.active_peers.len() as u64,
-            outstanding_requests: self
-                .active_peers
-                .values()
-                .map(|peer| peer.outstanding as u64)
-                .sum(),
+            outstanding_requests,
             fastresume_dirty_pieces: self.dirty_pieces_since_barrier.len() as u64,
             completed_piece_verify_from_memory: self.completed_piece_verify_from_memory,
             completed_piece_verify_from_disk: self.completed_piece_verify_from_disk,
@@ -1077,6 +1078,8 @@ impl TorrentTask {
             piece_assembly_bytes: self.piece_assembly_bytes as u64,
             piece_assembly_evictions: self.piece_assembly_evictions,
             peer_request_window_reductions: self.peer_request_window_reductions,
+            peer_rx_buffer_bytes: outstanding_requests.saturating_mul(MAX_BLOCK_SIZE as u64),
+            peer_tx_buffer_bytes: 0,
             tracker_peer_cache_entries: self.known_tracker_peers.len() as u64,
             tracker_peer_cache_drops: self.tracker_peer_cache_drops,
             storage: self.storage.stats(),
