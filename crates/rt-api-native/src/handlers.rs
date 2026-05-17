@@ -625,6 +625,13 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
     );
     metric(
         &mut out,
+        "torrentng_fastresume_dirty_pieces",
+        "gauge",
+        "Pieces validated since the last completed durability barrier",
+        stats.fastresume_dirty_pieces,
+    );
+    metric(
+        &mut out,
         "torrentng_bytes_uploaded_total",
         "counter",
         "Uploaded bytes from session accounting",
@@ -1364,6 +1371,7 @@ mod tests {
             torrents_activity_warm: 3,
             torrents_activity_dormant: 4,
             torrent_tasks_active: 5,
+            fastresume_dirty_pieces: 6,
             jobs_active: 3,
             trackers_error: 4,
             storage_file_pool_hits: 5,
@@ -1403,6 +1411,7 @@ mod tests {
         assert!(rendered.contains("torrentng_torrents_activity_warm 3"));
         assert!(rendered.contains("torrentng_torrents_activity_dormant 4"));
         assert!(rendered.contains("torrentng_torrent_tasks_active 5"));
+        assert!(rendered.contains("torrentng_fastresume_dirty_pieces 6"));
         assert!(rendered.contains("torrentng_jobs_active 3"));
         assert!(rendered.contains("torrentng_trackers_error 4"));
         assert!(rendered.contains("torrentng_storage_file_pool_hits_total 5"));

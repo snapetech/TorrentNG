@@ -638,6 +638,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn xmlrpc_method_list_and_placeholder_multicalls_have_stable_shapes() {
+        let state = state_with_torrent().await;
+        let response = execute_xml(
+            &state,
+            r#"<?xml version="1.0"?><methodCall><methodName>method.list</methodName><params/></methodCall>"#,
+        )
+        .await;
+        assert!(response.contains("<array><data>"));
+        assert!(response.contains("<string>d.multicall2</string>"));
+        assert!(response.contains("<string>p.multicall</string>"));
+
+        assert_eq!(
+            execute(&state, "t.multicall", &[RtValue::String("main".to_owned())])
+                .await
+                .unwrap(),
+            RtValue::Array(Vec::new())
+        );
+        assert_eq!(
+            execute(&state, "p.multicall", &[RtValue::String("main".to_owned())])
+                .await
+                .unwrap(),
+            RtValue::Array(Vec::new())
+        );
+        assert_eq!(
+            execute(&state, "f.multicall", &[RtValue::String("main".to_owned())])
+                .await
+                .unwrap(),
+            RtValue::Array(vec![RtValue::Array(vec![
+                RtValue::String(String::new()),
+                RtValue::Int(0),
+                RtValue::Int(1),
+            ])])
+        );
+    }
+
+    #[test]
+    fn xml_value_parser_accepts_nested_arrays_structs_base64_and_nil() {
+        let value = parse_value(
+            r#"<value><array><data>
+              <value><string>alpha</string></value>
+              <value><struct>
+                <member><name>count</name><value><int>2</int></value></member>
+                <member><name>raw</name><value><base64>YWJj</base64></value></member>
+                <member><name>empty</name><value><nil/></value></member>
+              </struct></value>
+            </data></array></value>"#,
+        );
+        let json = value_to_json(&value);
+        assert_eq!(json[0], "alpha");
+        assert_eq!(json[1]["count"], 2);
+        assert_eq!(json[1]["raw"], "YWJj");
+        assert!(json[1]["empty"].is_null());
+    }
+
+    #[test]
+    fn value_to_json_preserves_rtorrent_types() {
+        let mut fields = BTreeMap::new();
+        fields.insert("name".to_owned(), RtValue::String("alpha".to_owned()));
+        fields.insert("active".to_owned(), RtValue::Bool(true));
+        fields.insert("ratio".to_owned(), RtValue::Int(2000));
+        let json = value_to_json(&RtValue::Struct(fields));
+        assert_eq!(json["name"], "alpha");
+        assert_eq!(json["active"], true);
+        assert_eq!(json["ratio"], 2000);
+    }
+
+    #[tokio::test]
     async fn magnet_load_and_erase_update_registry() {
         let state = AppState::new(Arc::new(RwLock::new(SessionRegistry::new())));
         execute(

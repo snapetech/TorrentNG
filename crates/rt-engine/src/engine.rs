@@ -4253,6 +4253,7 @@ mod tests {
                 let _ = reply.send(crate::command::TorrentRuntimeStats {
                     connected_peers: 1,
                     outstanding_requests: 2,
+                    fastresume_dirty_pieces: 3,
                     piece_assembly_buffers: 2,
                     piece_assembly_bytes: 4096,
                     piece_assembly_evictions: 1,
@@ -4317,6 +4318,7 @@ mod tests {
         tokio::spawn(async move {
             if let Some(TorrentCmd::GetRuntimeStats { reply }) = runtime_rx.recv().await {
                 let _ = reply.send(crate::command::TorrentRuntimeStats {
+                    fastresume_dirty_pieces: 3,
                     piece_assembly_buffers: 2,
                     piece_assembly_bytes: 4096,
                     piece_assembly_evictions: 1,
@@ -4681,6 +4683,7 @@ mod tests {
         tokio::spawn(async move {
             if let Some(TorrentCmd::GetRuntimeStats { reply }) = torrent_rx.recv().await {
                 let _ = reply.send(crate::command::TorrentRuntimeStats {
+                    fastresume_dirty_pieces: 3,
                     piece_assembly_buffers: 2,
                     piece_assembly_bytes: 4096,
                     piece_assembly_evictions: 1,
@@ -4761,6 +4764,7 @@ mod tests {
         assert_eq!(stats.trackers_total, 1);
         assert_eq!(stats.trackers_error, 1);
         assert_eq!(stats.torrent_tasks_active, 1);
+        assert_eq!(stats.fastresume_dirty_pieces, 3);
         assert_eq!(stats.torrents_activity_hot, 1);
         assert_eq!(stats.torrents_activity_warm, 0);
         assert_eq!(stats.torrents_activity_dormant, 0);

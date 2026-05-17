@@ -80,6 +80,7 @@ Run native-engine certification directly:
 
 ```sh
 ./scripts/api_facade_certification.sh
+./scripts/universal_compatibility_certification.sh
 ./scripts/native_engine_certification_report.sh
 NATIVE_ENGINE_URL=http://127.0.0.1:8080 ./scripts/native_engine_certification_report.sh
 ```

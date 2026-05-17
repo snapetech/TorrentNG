@@ -49,11 +49,7 @@ run_gate() {
 } > "$OUT"
 : > "$OUT.table"
 
-run_gate "migration dry-run and native DB import" cargo test -p rt-migrate
-run_gate "scale and performance certification" cargo test -p rt-metrics
-run_gate "native API health and capability manifest" cargo test -p rt-api-native
-run_gate "compatibility API projections" "$ROOT/scripts/api_facade_certification.sh" "$ROOT/certification/reports/api-facades-native-$(date -u +%Y%m%dT%H%M%SZ).md"
-run_gate "native engine state and recovery" cargo test -p rt-engine
+run_gate "universal compatibility certification" "$ROOT/scripts/universal_compatibility_certification.sh" "$ROOT/certification/reports/universal-compat-native-$(date -u +%Y%m%dT%H%M%SZ).md"
 
 if [[ -n "$LIVE_HEALTH_URL" ]]; then
   # shellcheck disable=SC2016 # The inner script expands $1 and $body at runtime.

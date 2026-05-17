@@ -311,6 +311,7 @@ pub struct TorrentTask {
     piece_assemblies: HashMap<u32, PieceAssembly>,
     piece_assembly_bytes: usize,
     piece_assembly_evictions: u64,
+    dirty_pieces_since_barrier: HashSet<u32>,
     prepared_files: Mutex<HashSet<u32>>,
     paused: bool,
     max_peers: usize,
@@ -401,6 +402,7 @@ impl TorrentTask {
             piece_assemblies: HashMap::new(),
             piece_assembly_bytes: 0,
             piece_assembly_evictions: 0,
+            dirty_pieces_since_barrier: HashSet::new(),
             prepared_files: Mutex::new(HashSet::new()),
             paused,
             max_peers,
@@ -1003,6 +1005,7 @@ impl TorrentTask {
                 .values()
                 .map(|peer| peer.outstanding as u64)
                 .sum(),
+            fastresume_dirty_pieces: self.dirty_pieces_since_barrier.len() as u64,
             piece_assembly_buffers: self.piece_assemblies.len() as u64,
             piece_assembly_bytes: self.piece_assembly_bytes as u64,
             piece_assembly_evictions: self.piece_assembly_evictions,
@@ -1401,6 +1404,7 @@ impl TorrentTask {
             match self.verify_completed_piece(block.piece).await {
                 VerifyResult::Valid => {
                     self.remove_piece_assembly(block.piece);
+                    self.dirty_pieces_since_barrier.insert(block.piece);
                     info!(piece = block.piece, torrent = %self.info_hash_hex, "piece complete");
                     self.send_have_to_peers(block.piece).await;
                     if self.picker.is_complete() {
@@ -1868,11 +1872,22 @@ impl TorrentTask {
         }
 
         if !state.clean_shutdown {
-            warn!(
-                torrent = %self.info_hash_hex,
-                "discarding unclean fastresume state"
-            );
-            return false;
+            match state.apply_unclean_shutdown_watermark() {
+                Some(downgraded) => {
+                    warn!(
+                        torrent = %self.info_hash_hex,
+                        downgraded,
+                        "fastresume had unclean shutdown; applying bounded dirty-piece recheck watermark"
+                    );
+                }
+                None => {
+                    warn!(
+                        torrent = %self.info_hash_hex,
+                        "discarding unclean fastresume state without durability watermark"
+                    );
+                    return false;
+                }
+            }
         }
 
         match collect_file_hints(&self.save_root, &self.meta) {
@@ -2177,7 +2192,7 @@ impl TorrentTask {
         bytes.min(self.meta.total_length()) as i64
     }
 
-    async fn save_fastresume(&self, full_verify: bool) {
+    async fn save_fastresume(&mut self, full_verify: bool) {
         let (uploaded, downloaded) = self.transfer_snapshot().await;
         let mut state = FastresumeState::new_empty(
             &self.meta.info_hash,
@@ -2207,7 +2222,13 @@ impl TorrentTask {
             .collect();
         state.uploaded_bytes = uploaded;
         state.downloaded_bytes = downloaded;
-        state.clean_shutdown = self.sync_before_clean_fastresume().await;
+        state.set_dirty_pieces_since_barrier(self.dirty_pieces_since_barrier.iter().copied());
+        if self.sync_before_clean_fastresume().await {
+            state.complete_durability_barrier();
+            self.dirty_pieces_since_barrier.clear();
+        } else {
+            state.clean_shutdown = false;
+        }
         state.file_hints = match collect_file_hints(&self.save_root, &self.meta) {
             Ok(hints) => hints,
             Err(e) => {

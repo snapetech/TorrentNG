@@ -1429,36 +1429,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "torrentng"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "bytes",
- "chrono",
- "dirs-next",
- "dotenvy",
- "hyper",
- "libc",
- "quick-xml",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-test",
- "toml",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "urlencoding",
- "uuid",
-]
-
-[[package]]
 name = "rusqlite"
 version = "0.39.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2113,6 +2083,36 @@ name = "toml_writer"
 version = "1.1.1+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "756daf9b1013ebe47a8776667b466417e2d4c5679d441c26230efd9ef78692db"
+
+[[package]]
+name = "torrentng"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "bytes",
+ "chrono",
+ "dirs-next",
+ "dotenvy",
+ "hyper",
+ "libc",
+ "quick-xml",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-test",
+ "toml",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "urlencoding",
+ "uuid",
+]
 
 [[package]]
 name = "tower"

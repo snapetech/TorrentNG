@@ -80,6 +80,7 @@ derive_primary_stack_env() {
 derive_primary_stack_env
 
 run_gate "live API/app readiness" "$REPORT_DIR/live-cert-suite-$(date -u +%Y%m%dT%H%M%SZ).md" "$ROOT/scripts/live_certification.sh"
+run_gate "universal compatibility local gates" "$REPORT_DIR/universal-compat-suite-$(date -u +%Y%m%dT%H%M%SZ).md" "$ROOT/scripts/universal_compatibility_certification.sh"
 run_gate "client configuration" "$REPORT_DIR/client-config-suite-$(date -u +%Y%m%dT%H%M%SZ).md" "$ROOT/scripts/configure_certification_clients.sh"
 if active_long_soak && [[ "${SUITE_ALLOW_PRIMARY_MUTATION:-0}" != "1" ]]; then
   mark "live transfer" "SKIP" "$(latest 'live-transfer-*.md')"

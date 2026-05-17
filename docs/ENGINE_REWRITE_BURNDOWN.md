@@ -159,8 +159,8 @@ shippable and benchmarkable.
 ### Phase D — efficiency
 
 - [ ] `UringBackend` (registered fds + fixed buffers + batched submit), probe-selected.
-- [ ] Group-commit per-device `fdatasync` barrier; fastresume watermark gated on barrier.
-- [ ] Bounded post-crash recheck (only pieces written since last barrier).
+- [x] Group-commit per-device `fdatasync` barrier; fastresume watermark gated on barrier.
+- [x] Bounded post-crash recheck (only pieces written since last barrier).
 - [ ] Piece-aggregated writes; hash from RAM on dedicated hashing pool; delete read-after-write verify.
 - [ ] Adaptive per-connection readahead + `posix_fadvise` page-cache stewardship (`DONTNEED`/`SEQUENTIAL`).
 - [ ] `SEEK_HOLE`/`SEEK_DATA`-aware recheck sweep.

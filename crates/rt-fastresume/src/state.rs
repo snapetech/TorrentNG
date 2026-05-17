@@ -35,6 +35,19 @@ pub struct PartialPieceState {
     pub received_blocks: Vec<u32>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DurabilityWatermark {
+    /// Completed storage-sync barrier generation. Valid pieces at or below this
+    /// generation can be trusted after a clean fastresume load.
+    #[serde(default)]
+    pub barrier_generation: u64,
+    /// Pieces written or revalidated since the last completed barrier. If the
+    /// process crashes before a barrier completes, only these pieces need to be
+    /// downgraded for bounded recheck.
+    #[serde(default)]
+    pub dirty_pieces_since_barrier: Vec<u32>,
+}
+
 /// Policy controlling when pieces can be marked Valid without explicit hash check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ImportPolicy {
@@ -74,6 +87,9 @@ pub struct FastresumeState {
     pub downloaded_bytes: u64,
     /// Import policy used when this state was created.
     pub import_policy: ImportPolicy,
+    /// Storage durability checkpoint state for bounded post-crash recheck.
+    #[serde(default)]
+    pub durability: DurabilityWatermark,
 }
 
 impl FastresumeState {
@@ -90,6 +106,7 @@ impl FastresumeState {
             uploaded_bytes: 0,
             downloaded_bytes: 0,
             import_policy: policy,
+            durability: DurabilityWatermark::default(),
         }
     }
 
@@ -186,6 +203,51 @@ impl FastresumeState {
 
     pub fn is_complete(&self) -> bool {
         self.pieces.iter().all(|&p| p == PieceState::Valid)
+    }
+
+    pub fn set_dirty_pieces_since_barrier<I>(&mut self, pieces: I)
+    where
+        I: IntoIterator<Item = u32>,
+    {
+        let mut pieces = pieces.into_iter().collect::<Vec<_>>();
+        pieces.sort_unstable();
+        pieces.dedup();
+        pieces.retain(|piece| (*piece as usize) < self.pieces.len());
+        self.durability.dirty_pieces_since_barrier = pieces;
+    }
+
+    pub fn complete_durability_barrier(&mut self) {
+        self.durability.barrier_generation = self.durability.barrier_generation.saturating_add(1);
+        self.durability.dirty_pieces_since_barrier.clear();
+        self.clean_shutdown = true;
+    }
+
+    pub fn apply_unclean_shutdown_watermark(&mut self) -> Option<u32> {
+        if self.clean_shutdown {
+            return Some(0);
+        }
+        if self.durability.dirty_pieces_since_barrier.is_empty() {
+            return None;
+        }
+        let mut downgraded = 0;
+        for piece in self.durability.dirty_pieces_since_barrier.iter().copied() {
+            let Some(state) = self.pieces.get_mut(piece as usize) else {
+                continue;
+            };
+            if *state == PieceState::Valid {
+                *state = PieceState::Unknown;
+                downgraded += 1;
+            }
+        }
+        self.partial_pieces.retain(|partial| {
+            !self
+                .durability
+                .dirty_pieces_since_barrier
+                .contains(&partial.piece)
+        });
+        self.clean_shutdown = true;
+        self.durability.dirty_pieces_since_barrier.clear();
+        Some(downgraded)
     }
 }
 
@@ -312,5 +374,67 @@ mod tests {
         assert!(!state.is_complete());
         state.pieces[2] = PieceState::Valid;
         assert!(state.is_complete());
+    }
+
+    #[test]
+    fn durability_barrier_clears_dirty_piece_watermark() {
+        let mut state =
+            FastresumeState::new_empty(&test_hash(), 5, ImportPolicy::RequireVerification);
+        state.clean_shutdown = false;
+        state.set_dirty_pieces_since_barrier([3, 1, 3, 99]);
+        assert_eq!(state.durability.dirty_pieces_since_barrier, vec![1, 3]);
+
+        state.complete_durability_barrier();
+        assert!(state.clean_shutdown);
+        assert_eq!(state.durability.barrier_generation, 1);
+        assert!(state.durability.dirty_pieces_since_barrier.is_empty());
+    }
+
+    #[test]
+    fn unclean_watermark_downgrades_only_dirty_valid_pieces() {
+        let mut state =
+            FastresumeState::new_empty(&test_hash(), 5, ImportPolicy::RequireVerification);
+        state.pieces = vec![
+            PieceState::Valid,
+            PieceState::Valid,
+            PieceState::Valid,
+            PieceState::Unknown,
+            PieceState::Valid,
+        ];
+        state.partial_pieces = vec![
+            PartialPieceState {
+                piece: 1,
+                received_blocks: vec![0],
+            },
+            PartialPieceState {
+                piece: 4,
+                received_blocks: vec![0],
+            },
+        ];
+        state.set_dirty_pieces_since_barrier([1, 3]);
+
+        assert_eq!(state.apply_unclean_shutdown_watermark(), Some(1));
+        assert!(state.clean_shutdown);
+        assert_eq!(
+            state.pieces,
+            vec![
+                PieceState::Valid,
+                PieceState::Unknown,
+                PieceState::Valid,
+                PieceState::Unknown,
+                PieceState::Valid,
+            ]
+        );
+        assert_eq!(state.partial_pieces.len(), 1);
+        assert_eq!(state.partial_pieces[0].piece, 4);
+    }
+
+    #[test]
+    fn unclean_without_watermark_requires_full_recheck() {
+        let mut state =
+            FastresumeState::new_empty(&test_hash(), 2, ImportPolicy::RequireVerification);
+        state.pieces = vec![PieceState::Valid, PieceState::Valid];
+        state.clean_shutdown = false;
+        assert_eq!(state.apply_unclean_shutdown_watermark(), None);
     }
 }

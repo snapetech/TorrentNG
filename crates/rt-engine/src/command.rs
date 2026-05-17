@@ -52,6 +52,7 @@ pub struct EngineStats {
     pub torrents_activity_warm: u64,
     pub torrents_activity_dormant: u64,
     pub torrent_tasks_active: u64,
+    pub fastresume_dirty_pieces: u64,
     pub bytes_uploaded: u64,
     pub bytes_downloaded: u64,
     pub bytes_left: u64,
@@ -112,6 +113,7 @@ pub struct EngineStats {
 pub struct TorrentRuntimeStats {
     pub connected_peers: u64,
     pub outstanding_requests: u64,
+    pub fastresume_dirty_pieces: u64,
     pub piece_assembly_buffers: u64,
     pub piece_assembly_bytes: u64,
     pub piece_assembly_evictions: u64,
@@ -129,6 +131,9 @@ impl EngineStats {
 
     pub fn add_torrent_runtime(&mut self, runtime: TorrentRuntimeStats) {
         self.torrent_tasks_active = self.torrent_tasks_active.saturating_add(1);
+        self.fastresume_dirty_pieces = self
+            .fastresume_dirty_pieces
+            .saturating_add(runtime.fastresume_dirty_pieces);
         self.piece_assembly_buffers = self
             .piece_assembly_buffers
             .saturating_add(runtime.piece_assembly_buffers);
@@ -581,6 +586,7 @@ mod tests {
         stats.add_torrent_runtime(TorrentRuntimeStats {
             connected_peers: 2,
             outstanding_requests: 3,
+            fastresume_dirty_pieces: 4,
             piece_assembly_buffers: 19,
             piece_assembly_bytes: 20,
             piece_assembly_evictions: 21,
@@ -621,6 +627,7 @@ mod tests {
         assert_eq!(stats.storage_peer_read_elevator_batches, 16);
         assert_eq!(stats.storage_peer_read_elevator_coalesced_requests, 17);
         assert_eq!(stats.torrent_tasks_active, 1);
+        assert_eq!(stats.fastresume_dirty_pieces, 4);
         assert_eq!(stats.piece_assembly_buffers, 19);
         assert_eq!(stats.piece_assembly_bytes, 20);
         assert_eq!(stats.piece_assembly_evictions, 21);

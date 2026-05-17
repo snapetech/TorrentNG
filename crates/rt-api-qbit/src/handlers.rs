@@ -5,7 +5,10 @@ use axum::{
     Json,
 };
 use rt_metainfo::{parse_magnet, parse_torrent};
-use serde::Deserialize;
+use serde::{
+    ser::{SerializeMap, Serializer},
+    Deserialize, Serialize,
+};
 use std::{
     collections::{hash_map::DefaultHasher, HashMap},
     hash::{Hash, Hasher},
@@ -1682,6 +1685,41 @@ pub struct SyncMaindataQuery {
     pub rid: Option<i64>,
 }
 
+#[derive(Debug, Serialize)]
+struct SyncMaindataResponse {
+    rid: i64,
+    full_update: bool,
+    torrents: SyncTorrentMap,
+    torrents_removed: &'static [&'static str],
+    server_state: QbServerState,
+}
+
+#[derive(Debug)]
+struct SyncTorrentMap {
+    infos: Vec<QbTorrentInfo>,
+    full_update: bool,
+}
+
+impl Serialize for SyncTorrentMap {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let len = if self.full_update {
+            Some(self.infos.len())
+        } else {
+            Some(0)
+        };
+        let mut map = serializer.serialize_map(len)?;
+        if self.full_update {
+            for info in &self.infos {
+                map.serialize_entry(&info.hash, info)?;
+            }
+        }
+        map.end()
+    }
+}
+
 pub async fn sync_maindata(
     State(state): State<AppState>,
     Query(q): Query<SyncMaindataQuery>,
@@ -1707,19 +1745,13 @@ pub async fn sync_maindata(
     } else {
         0.0
     };
-    let mut torrents = serde_json::Map::new();
-    if full_update {
-        for info in infos {
-            torrents.insert(info.hash.clone(), serde_json::to_value(info).unwrap());
-        }
-    }
     let limits = global_limits(&state).await;
-    let resp = serde_json::json!({
-        "rid": rid,
-        "full_update": full_update,
-        "torrents": torrents,
-        "torrents_removed": [],
-        "server_state": QbServerState {
+    let resp = SyncMaindataResponse {
+        rid,
+        full_update,
+        torrents: SyncTorrentMap { infos, full_update },
+        torrents_removed: &[],
+        server_state: QbServerState {
             dl_info_speed: 0,
             dl_info_data: 0,
             up_info_speed: 0,
@@ -1743,8 +1775,8 @@ pub async fn sync_maindata(
             up_rate_limit: limits.upload_limit,
             use_alt_speed_limits: limits.speed_limits_mode,
             write_cache_overload: "0".into(),
-        }
-    });
+        },
+    };
     (StatusCode::OK, Json(resp))
 }
 

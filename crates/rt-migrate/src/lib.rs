@@ -320,6 +320,7 @@ impl MigrationTorrent {
             uploaded_bytes: self.uploaded.unwrap_or_default(),
             downloaded_bytes: self.downloaded.unwrap_or_default(),
             import_policy: policy,
+            durability: Default::default(),
         };
         if state.pieces.len() != self.piece_count as usize {
             return None;

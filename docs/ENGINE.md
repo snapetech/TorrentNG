@@ -154,6 +154,10 @@ metadata_only           — no file I/O (metadata/announce only)
 - Positioned reads/writes; no shared seek cursor in torrent block I/O
 - File preparation and preallocation before first download write
 - Explicit durability checkpoints before trusting clean fastresume state
+- Fastresume durability watermarks track pieces validated since the last
+  completed storage barrier. Clean saves advance the barrier after sync;
+  unclean saves with a watermark downgrade only those dirty pieces on restart,
+  bounding post-crash recheck instead of forcing full-library verification.
 - Peer-read locality through internal readahead/coalescing while returning exact requested bytes
 - HDD vs SSD/NVMe I/O profile
 - Sequential vs random pressure awareness
