@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{
     mpsc::{self as tokio_mpsc, error::TrySendError},
-    oneshot, OwnedSemaphorePermit, Semaphore,
+    oneshot, OwnedSemaphorePermit, Semaphore, TryAcquireError,
 };
 use tracing::instrument;
 
@@ -156,6 +156,7 @@ pub struct StorageIoStats {
     pub file_pool: FilePoolStats,
     pub io_queue_depth: usize,
     pub hash_queue_depth: usize,
+    pub queue_full: u64,
     pub dirty_files: usize,
     pub read_ops_by_class: [u64; 6],
     pub write_ops_by_class: [u64; 6],
@@ -201,6 +202,7 @@ impl Default for StorageIoStats {
             file_pool: FilePoolStats::default(),
             io_queue_depth: 0,
             hash_queue_depth: 0,
+            queue_full: 0,
             dirty_files: 0,
             read_ops_by_class: [0; 6],
             write_ops_by_class: [0; 6],
@@ -520,6 +522,7 @@ struct StorageCounters {
     write_latency_buckets: [AtomicU64; STORAGE_LATENCY_BUCKET_COUNT],
     sync_latency_buckets: [AtomicU64; STORAGE_LATENCY_BUCKET_COUNT],
     hash_latency_buckets: [AtomicU64; STORAGE_LATENCY_BUCKET_COUNT],
+    queue_full: AtomicU64,
     sync_latency_ns: AtomicU64,
     hash_latency_ns: AtomicU64,
     sync_ops: AtomicU64,
@@ -555,6 +558,7 @@ impl Default for StorageCounters {
             write_latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             sync_latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             hash_latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            queue_full: AtomicU64::new(0),
             sync_latency_ns: AtomicU64::new(0),
             hash_latency_ns: AtomicU64::new(0),
             sync_ops: AtomicU64::new(0),
@@ -1001,6 +1005,7 @@ impl MountScheduler {
             file_pool: self.file_pool.stats(),
             io_queue_depth: self.io_pool.queued(),
             hash_queue_depth: self.hash_pool.queued(),
+            queue_full: self.counters.queue_full.load(Ordering::Relaxed),
             dirty_files,
             read_ops_by_class: load_atomic_array(&self.counters.read_ops_by_class),
             write_ops_by_class: load_atomic_array(&self.counters.write_ops_by_class),
@@ -1112,9 +1117,16 @@ impl MountScheduler {
         let _queue = self
             .queue_sem
             .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| StorageError::Cancelled)?;
+            .try_acquire_owned()
+            .map_err(|err| match err {
+                TryAcquireError::NoPermits => {
+                    self.counters.queue_full.fetch_add(1, Ordering::Relaxed);
+                    StorageError::QueueFull {
+                        mount: format!("storage-root-{}", self.storage_root.0),
+                    }
+                }
+                TryAcquireError::Closed => StorageError::Cancelled,
+            })?;
         self.io_pool.run(f).await
     }
 
@@ -1889,6 +1901,34 @@ mod tests {
         let _r = sched.acquire(IoClass::Recheck).await.unwrap();
         let permit = sched.try_acquire(IoClass::PeerRead);
         assert!(permit.is_some());
+    }
+
+    #[tokio::test]
+    async fn full_mount_queue_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queued.bin");
+        std::fs::write(&path, b"queued").unwrap();
+        let sched = MountScheduler::new(
+            StorageRootId::new(),
+            &SchedulerConfig {
+                profile: StorageProfile::Hdd,
+                max_queue: 1,
+                storage_io: StorageIoConfig {
+                    io_queue_depth: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let _held_queue = sched.queue_sem.clone().try_acquire_owned().unwrap();
+
+        let result = sched.read_at(IoClass::Foreground, &path, 0, 1).await;
+
+        assert!(matches!(
+            result,
+            Err(StorageError::QueueFull { mount }) if mount.starts_with("storage-root-")
+        ));
+        assert_eq!(sched.stats().queue_full, 1);
     }
 
     #[test]

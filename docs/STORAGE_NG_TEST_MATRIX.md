@@ -58,6 +58,7 @@ when `TNG_STORAGE_REQUIRE_HDD_5X=1` is set.
 | `torrentng_storage_backend_{max_batch_len,fixed_buffer_bytes}` | Backend batch and fixed-buffer sizing match the selected implementation |
 | `torrentng_storage_*_latency_nanoseconds_by_device_total{device=...,profile=...}` | Storage latency attribution survives multi-device aggregation |
 | `torrentng_storage_file_pool_*` | fd pool remains bounded and records hit/miss/eviction/idle-close activity |
+| `torrentng_storage_queue_full_total` | bounded storage queues expose backpressure instead of silently accumulating jobs |
 | `torrentng_storage_peer_read_elevator_*` | HDD peer-read queueing, batching, and coalescing are visible |
 | `torrentng_storage_sparse_*` | recheck reports sparse data extents, skipped holes, and fallback count |
 | `torrentng_tracker_peer_cache_entries`, `torrentng_tracker_peer_cache_drops_total` | Tracker announce responses stay bounded and expose dropped overflow peers |

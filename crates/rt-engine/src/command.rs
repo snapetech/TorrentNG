@@ -79,6 +79,7 @@ pub struct EngineStats {
     pub storage_io_queue_depth: u64,
     pub storage_hash_queue_depth: u64,
     pub storage_queued_disk_bytes: u64,
+    pub storage_queue_full: u64,
     pub storage_dirty_files: u64,
     pub storage_read_ops: u64,
     pub storage_write_ops: u64,
@@ -269,6 +270,7 @@ impl EngineStats {
                 .saturating_add(storage.peer_read_elevator_queued as u64)
                 .saturating_mul(Self::QUEUED_DISK_JOB_BYTES_ESTIMATE),
         );
+        self.storage_queue_full = self.storage_queue_full.saturating_add(storage.queue_full);
         self.storage_dirty_files = self
             .storage_dirty_files
             .saturating_add(storage.dirty_files as u64);
@@ -763,6 +765,7 @@ mod tests {
             },
             io_queue_depth: 4,
             hash_queue_depth: 5,
+            queue_full: 31,
             dirty_files: 6,
             sync_ops: 7,
             hash_ops: 8,
@@ -869,6 +872,7 @@ mod tests {
         assert_eq!(stats.storage_peer_read_elevator_queued, 15);
         assert_eq!(stats.storage_peer_read_elevator_queue_full, 30);
         assert_eq!(stats.storage_queued_disk_bytes, 24 * 16 * 1024);
+        assert_eq!(stats.storage_queue_full, 31);
         assert_eq!(stats.storage_peer_read_elevator_batches, 16);
         assert_eq!(stats.storage_peer_read_elevator_coalesced_requests, 17);
         assert_eq!(stats.storage_page_cache_advise_sequential, 18);
