@@ -148,6 +148,7 @@ row "Pre-engine release report" 'pre-engine-release-*.md'
 row "Pre-engine suite" 'pre-engine-suite-*.md'
 row "Post-soak release gate" 'post-soak-release-*.md'
 row "Certification burndown" 'certification-burndown-*.md'
+row "Release readiness" 'release-readiness-*.md'
 
 echo
 echo "## Active Long-Running Jobs"

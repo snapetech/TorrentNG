@@ -128,6 +128,7 @@ for pattern in \
   webui-certification-selftest.md \
   local-release-selftest.md \
   certification-burndown-selftest.md \
+  release-readiness-selftest.md \
   pre-engine-release-selftest.md \
   pre-engine-suite-selftest.md; do
   write_passing_report "$report_dir/$pattern"

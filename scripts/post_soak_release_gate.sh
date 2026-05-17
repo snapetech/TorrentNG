@@ -124,12 +124,14 @@ certification_status_gate() {
   "$ROOT/scripts/certification_status.sh" "$REPORT_DIR" >"$tmp"
   if awk -F'|' '
       /^\| Post-soak release gate \|/ {next}
+      /^\| Release readiness \|/ {next}
       /^\|/ && $3 ~ /FAIL|MISSING/ {bad=1}
       END {exit bad ? 0 : 1}
     ' "$tmp"; then
     result="FAIL"
     detail="$(awk -F'|' '
       /^\| Post-soak release gate \|/ {next}
+      /^\| Release readiness \|/ {next}
       /^\|/ && $3 ~ /FAIL|MISSING/ {
         gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2);
         gsub(/^[[:space:]]+|[[:space:]]+$/, "", $3);
@@ -138,12 +140,14 @@ certification_status_gate() {
     ' "$tmp" | paste -sd ';' -)"
   elif awk -F'|' '
       /^\| Post-soak release gate \|/ {next}
+      /^\| Release readiness \|/ {next}
       /^\|/ && $3 ~ /PASS_WITH_GAPS|PASS_WITH_SKIPS|PASS_WITH_WARNINGS|STALE\/INCOMPLETE|RUNNING\/UNKNOWN|RUNNING|SKIP/ {warn=1}
       END {exit warn ? 0 : 1}
     ' "$tmp"; then
     result="WARN"
     detail="$(awk -F'|' '
       /^\| Post-soak release gate \|/ {next}
+      /^\| Release readiness \|/ {next}
       /^\|/ && $3 ~ /PASS_WITH_GAPS|PASS_WITH_SKIPS|PASS_WITH_WARNINGS|STALE\/INCOMPLETE|RUNNING\/UNKNOWN|RUNNING|SKIP/ {
         gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2);
         gsub(/^[[:space:]]+|[[:space:]]+$/, "", $3);
