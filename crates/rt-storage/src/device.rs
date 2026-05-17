@@ -69,7 +69,8 @@ fn detect_storage_topology_from_roots(
         });
     }
 
-    let device = block_device_name(sys_root, &mount.major_minor)?;
+    let device = block_device_name(sys_root, &mount.major_minor)
+        .or_else(|| block_device_name_from_source(sys_root, &mount.source))?;
     Some(StorageTopology {
         device_id: Some(DeviceId(device.clone())),
         profile: profile_from_block_device(sys_root, &device),
@@ -185,6 +186,27 @@ fn block_device_name(sys_root: &Path, major_minor: &str) -> Option<String> {
 }
 
 #[cfg(target_os = "linux")]
+fn block_device_name_from_source(sys_root: &Path, source: &str) -> Option<String> {
+    if !source.starts_with("/dev/") {
+        return None;
+    }
+    let source = strip_mount_source_subpath(source);
+    let meta = std::fs::metadata(source).ok()?;
+    let rdev = std::os::unix::fs::MetadataExt::rdev(&meta);
+    if rdev == 0 {
+        return None;
+    }
+    let major = (((rdev >> 32) & 0xffff_f000) | ((rdev >> 8) & 0x0000_0fff)) as u32;
+    let minor = (((rdev >> 12) & 0xffff_ff00) | (rdev & 0x0000_00ff)) as u32;
+    block_device_name(sys_root, &format!("{major}:{minor}"))
+}
+
+#[cfg(target_os = "linux")]
+fn strip_mount_source_subpath(source: &str) -> &str {
+    source.split_once('[').map(|(s, _)| s).unwrap_or(source)
+}
+
+#[cfg(target_os = "linux")]
 fn block_device_name_from_sysfs_path(path: &Path) -> Option<String> {
     let parts: Vec<String> = path
         .components()
@@ -248,6 +270,18 @@ mod tests {
         assert_eq!(
             block_device_name_from_sysfs_path(path).as_deref(),
             Some("nvme0n1")
+        );
+    }
+
+    #[test]
+    fn mount_source_subpath_suffix_is_ignored() {
+        assert_eq!(
+            strip_mount_source_subpath("/dev/nvme0n1p2[/@home]"),
+            "/dev/nvme0n1p2"
+        );
+        assert_eq!(
+            strip_mount_source_subpath("/dev/mapper/data"),
+            "/dev/mapper/data"
         );
     }
 
