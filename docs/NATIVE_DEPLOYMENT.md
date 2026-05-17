@@ -135,6 +135,13 @@ The native release gate is:
 scripts/native_engine_certification_report.sh
 ```
 
+For a fast deterministic preflight that does not need Docker or public swarm
+access, run:
+
+```sh
+scripts/local_release_gate.sh
+```
+
 When a daemon is running, bind the certification report to the live `/health`
 capability manifest as well:
 
