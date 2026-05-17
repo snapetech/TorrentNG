@@ -204,6 +204,19 @@ Environment variables override file values where listed.
 | `timeout_secs` | `10` | - | Timeout for individual XMLRPC calls |
 | `user_agent` | `rtorrent/0.16.11` | `TNG_USER_AGENT` | Client identifier pushed to rTorrent on startup |
 
+### Sidecar `[rtorrent.logs]`
+
+When enabled, the sidecar tails configured rTorrent log files and stores new lines as durable `rtorrent_log` app events. These entries are returned by qBittorrent-compatible `/api/v2/log/main` alongside sidecar app events. Ingested lines are redacted before storage: magnet URIs, common token query parameters, cookies, and full filesystem paths are removed or shortened.
+
+By default, ingestion starts at the end of each file to avoid flooding `/log/main` with old logs on restart. Set `read_from_start = true` only for controlled imports.
+
+| Key | Default | Env override | Description |
+|---|---|---|---|
+| `enabled` | `false` | `TNG_RTORRENT_LOGS_ENABLED` | Enable rTorrent log file ingestion |
+| `paths` | `[]` | `TNG_RTORRENT_LOG_PATHS` | Log files to tail; env value is comma-separated |
+| `poll_interval_secs` | `2` | `TNG_RTORRENT_LOG_POLL_INTERVAL_SECS` | Seconds between file polls |
+| `read_from_start` | `false` | `TNG_RTORRENT_LOG_READ_FROM_START` | Read existing file contents on startup instead of only new lines |
+
 #### `user_agent`
 
 The `user_agent` value is pushed to rTorrent via `network.http.user_agent.set` on startup when the running rTorrent build exposes that XMLRPC method. TorrentNG's packaged rTorrent 0.16.11 image carries a small build patch that publishes the existing libtorrent HTTP user-agent getter/setter through XMLRPC, so this works in the Docker and certification builds. It can also be changed at runtime via `PUT /api/v1/settings/user-agent` or the Settings panel in the WebUI. Some older distro rTorrent packages do not expose tracker user-agent control; the certification harness reports that as blocked instead of assuming spoofing works.
@@ -293,6 +306,12 @@ storage_roots = ["/data", "/mnt/archive"]
 scgi_socket = "/run/rtorrent/rpc.sock"
 timeout_secs = 10
 user_agent = "rtorrent/0.16.11"
+
+[rtorrent.logs]
+enabled = false
+paths = ["/var/log/rtorrent/rtorrent.log"]
+poll_interval_secs = 2
+read_from_start = false
 
 [auth]
 secret_key = "change-me-in-production"

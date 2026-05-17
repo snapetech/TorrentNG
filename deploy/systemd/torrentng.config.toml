@@ -8,6 +8,12 @@ scgi_socket = "/run/rtorrent/rpc.sock"
 timeout_secs = 10
 user_agent = "rtorrent/0.16.11"
 
+[rtorrent.logs]
+enabled = false
+paths = ["/var/log/rtorrent/rtorrent.log"]
+poll_interval_secs = 2
+read_from_start = false
+
 [auth]
 secret_key = "change-me"
 api_tokens = []

@@ -384,6 +384,46 @@ mod tests {
         restore_env("TNG_QBITTORRENT_BUILD_QT", old_qt);
     }
 
+    #[test]
+    fn rtorrent_log_env_overrides_defaults() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let old_enabled = std::env::var("TNG_RTORRENT_LOGS_ENABLED").ok();
+        let old_paths = std::env::var("TNG_RTORRENT_LOG_PATHS").ok();
+        let old_poll = std::env::var("TNG_RTORRENT_LOG_POLL_INTERVAL_SECS").ok();
+        let old_start = std::env::var("TNG_RTORRENT_LOG_READ_FROM_START").ok();
+
+        std::env::set_var("TNG_RTORRENT_LOGS_ENABLED", "true");
+        std::env::set_var(
+            "TNG_RTORRENT_LOG_PATHS",
+            "/var/log/rtorrent.log, /tmp/rtorrent.log",
+        );
+        std::env::set_var("TNG_RTORRENT_LOG_POLL_INTERVAL_SECS", "9");
+        std::env::set_var("TNG_RTORRENT_LOG_READ_FROM_START", "1");
+
+        let mut cfg = Config::test_default();
+        cfg.apply_env();
+
+        assert!(cfg.rtorrent.logs.enabled);
+        assert_eq!(
+            cfg.rtorrent.logs.paths,
+            [PathBuf::from("/var/log/rtorrent.log"), PathBuf::from("/tmp/rtorrent.log")]
+        );
+        assert_eq!(cfg.rtorrent.logs.poll_interval_secs, 9);
+        assert!(cfg.rtorrent.logs.read_from_start);
+
+        restore_env("TNG_RTORRENT_LOGS_ENABLED", old_enabled);
+        restore_env("TNG_RTORRENT_LOG_PATHS", old_paths);
+        restore_env("TNG_RTORRENT_LOG_POLL_INTERVAL_SECS", old_poll);
+        restore_env("TNG_RTORRENT_LOG_READ_FROM_START", old_start);
+    }
+
+    #[test]
+    fn rtorrent_log_poll_interval_has_floor() {
+        let mut cfg = Config::test_default();
+        cfg.rtorrent.logs.poll_interval_secs = 0;
+        assert_eq!(cfg.rtorrent_log_poll_interval(), Duration::from_secs(1));
+    }
+
     fn restore_env(key: &str, value: Option<String>) {
         if let Some(value) = value {
             std::env::set_var(key, value);

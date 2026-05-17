@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use torrentng::{api, cache, config, metrics, rtorrent, stats, sync};
+use torrentng::{api, cache, config, metrics, rtorrent, rtorrent_logs, stats, sync};
 use tracing::info;
 
 use api::{
@@ -71,6 +71,15 @@ async fn main() -> Result<()> {
         let tx2 = tx.clone();
         tokio::spawn(async move {
             stats::run(rt2, tx2, std::time::Duration::from_secs(2)).await;
+        });
+    }
+
+    if cfg.rtorrent.logs.enabled && !cfg.rtorrent.logs.paths.is_empty() {
+        let db2 = db.clone();
+        let log_cfg = cfg.rtorrent.logs.clone();
+        let retention = cfg.logging.event_retention;
+        tokio::spawn(async move {
+            rtorrent_logs::run(db2, log_cfg, retention).await;
         });
     }
 
