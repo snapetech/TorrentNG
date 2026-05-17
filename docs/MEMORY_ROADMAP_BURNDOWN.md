@@ -22,6 +22,7 @@ Status as of 2026-05-17.
   - Storage scale tests exercise queue-full backpressure rather than unbounded queue growth under saturated hash/disk paths.
 - [x] Conservative move/import/delete executor below the storage planner.
   - Applies only plans that passed admission, never overwrites destinations, creates parents, verifies file or directory copy lengths, supports approved recursive delete, and rolls back staged copy files/directories on failure.
+  - Root-confined execution validates source, destination, and rollback paths against configured storage roots before applying filesystem changes.
   - `scripts/storage_move_import_certification.sh` records the local planner/executor and full storage suite evidence under `certification/reports/`.
 
 - [x] Current HDD/NVMe real-device release evidence with required HDD 5x target.

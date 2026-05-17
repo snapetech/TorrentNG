@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::StorageError;
 
@@ -203,6 +203,19 @@ pub fn execute_storage_plan(plan: &StoragePlan) -> Result<StoragePlanExecution, 
     Ok(execution)
 }
 
+pub fn execute_storage_plan_under_roots(
+    plan: &StoragePlan,
+    roots: &[PathBuf],
+) -> Result<StoragePlanExecution, StorageError> {
+    ensure_plan_can_apply(plan)?;
+    let roots = canonical_roots(roots)?;
+    validate_plan_paths_under_roots(plan, &roots)?;
+    if plan.dry_run {
+        return Ok(StoragePlanExecution::default());
+    }
+    execute_storage_plan(plan)
+}
+
 fn execute_step(step: &StoragePlanStep) -> Result<(), StorageError> {
     match step.action {
         PlannedStorageAction::ImportExisting => {
@@ -242,6 +255,93 @@ fn execute_step(step: &StoragePlanStep) -> Result<(), StorageError> {
             }
         }
     }
+}
+
+fn canonical_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>, StorageError> {
+    if roots.is_empty() {
+        return Err(StorageError::StagedMoveFailed {
+            step: "roots",
+            reason: "at least one storage root is required".to_string(),
+        });
+    }
+    roots
+        .iter()
+        .map(|root| {
+            std::fs::canonicalize(root).map_err(|e| StorageError::io(root.display().to_string(), e))
+        })
+        .collect()
+}
+
+fn validate_plan_paths_under_roots(
+    plan: &StoragePlan,
+    roots: &[PathBuf],
+) -> Result<(), StorageError> {
+    for step in plan.steps.iter().chain(plan.rollback_steps.iter()) {
+        if let Some(source) = &step.source {
+            ensure_path_under_roots(source, roots, "source-root")?;
+        }
+        if let Some(destination) = &step.destination {
+            ensure_path_under_roots(destination, roots, "destination-root")?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_path_under_roots(
+    path: &Path,
+    roots: &[PathBuf],
+    step: &'static str,
+) -> Result<(), StorageError> {
+    let resolved = resolve_confined_path(path)?;
+    if roots.iter().any(|root| resolved.starts_with(root)) {
+        Ok(())
+    } else {
+        Err(StorageError::StagedMoveFailed {
+            step,
+            reason: format!("path outside configured storage roots: {}", path.display()),
+        })
+    }
+}
+
+fn resolve_confined_path(path: &Path) -> Result<PathBuf, StorageError> {
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+    {
+        return Err(StorageError::StagedMoveFailed {
+            step: "path",
+            reason: format!("unsafe path component: {}", path.display()),
+        });
+    }
+    if path.exists() {
+        return std::fs::canonicalize(path)
+            .map_err(|e| StorageError::io(path.display().to_string(), e));
+    }
+
+    let mut tail = Vec::new();
+    let mut ancestor = path;
+    while !ancestor.exists() {
+        let name = ancestor
+            .file_name()
+            .ok_or_else(|| StorageError::StagedMoveFailed {
+                step: "path",
+                reason: format!("path has no existing ancestor: {}", path.display()),
+            })?;
+        tail.push(name.to_os_string());
+        ancestor = ancestor
+            .parent()
+            .ok_or_else(|| StorageError::StagedMoveFailed {
+                step: "path",
+                reason: format!("path has no existing ancestor: {}", path.display()),
+            })?;
+    }
+
+    let mut resolved = std::fs::canonicalize(ancestor)
+        .map_err(|e| StorageError::io(ancestor.display().to_string(), e))?;
+    for part in tail.iter().rev() {
+        resolved.push(part);
+    }
+    Ok(resolved)
 }
 
 fn rollback_plan(plan: &StoragePlan) -> Vec<StoragePlanStep> {
@@ -623,5 +723,116 @@ mod tests {
         execute_storage_plan(&plan).unwrap();
 
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn execute_plan_under_roots_allows_confined_move() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.bin");
+        let destination = root.join("dest.bin");
+        std::fs::write(&source, b"data").unwrap();
+
+        let plan = plan_move(&MovePlanRequest {
+            source: source.clone(),
+            destination: destination.clone(),
+            bytes: 4,
+            available_bytes: Some(100),
+            dry_run: false,
+        });
+
+        execute_storage_plan_under_roots(&plan, &[root]).unwrap();
+
+        assert!(!source.exists());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"data");
+    }
+
+    #[test]
+    fn execute_plan_under_roots_rejects_destination_escape_before_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let source = root.join("source.bin");
+        let destination = outside.join("dest.bin");
+        std::fs::write(&source, b"data").unwrap();
+
+        let plan = StoragePlan {
+            dry_run: false,
+            can_apply: true,
+            issues: Vec::new(),
+            steps: vec![StoragePlanStep {
+                action: PlannedStorageAction::CopyVerifyRename,
+                source: Some(source.clone()),
+                destination: Some(destination.clone()),
+                bytes: 4,
+            }],
+            rollback_steps: Vec::new(),
+        };
+
+        assert!(matches!(
+            execute_storage_plan_under_roots(&plan, &[root]),
+            Err(StorageError::StagedMoveFailed {
+                step: "destination-root",
+                ..
+            })
+        ));
+        assert!(source.exists());
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn execute_plan_under_roots_rejects_delete_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let outside = dir.path().join("outside.bin");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&outside, b"data").unwrap();
+
+        let plan = plan_delete(&DeletePlanRequest {
+            target: outside.clone(),
+            bytes: 4,
+            dry_run: false,
+            dry_run_approved: true,
+        });
+
+        assert!(matches!(
+            execute_storage_plan_under_roots(&plan, &[root]),
+            Err(StorageError::StagedMoveFailed {
+                step: "source-root",
+                ..
+            })
+        ));
+        assert_eq!(std::fs::read(&outside).unwrap(), b"data");
+    }
+
+    #[test]
+    fn execute_plan_under_roots_rejects_parent_dir_components() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.bin");
+        std::fs::write(&source, b"data").unwrap();
+        let destination = root.join("nested/../dest.bin");
+
+        let plan = StoragePlan {
+            dry_run: false,
+            can_apply: true,
+            issues: Vec::new(),
+            steps: vec![StoragePlanStep {
+                action: PlannedStorageAction::CopyVerifyRename,
+                source: Some(source),
+                destination: Some(destination),
+                bytes: 4,
+            }],
+            rollback_steps: Vec::new(),
+        };
+
+        assert!(matches!(
+            execute_storage_plan_under_roots(&plan, &[root]),
+            Err(StorageError::StagedMoveFailed { step: "path", .. })
+        ));
     }
 }

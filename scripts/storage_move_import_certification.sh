@@ -57,7 +57,7 @@ run_gate "full storage unit suite" cargo test -p rt-storage || overall=1
   echo
   echo "## Notes"
   echo
-  echo "- Covers no-overwrite move execution, hardlink-or-copy import, recursive directory copy verification, staged rollback cleanup, and approved directory delete."
+  echo "- Covers no-overwrite move execution, hardlink-or-copy import, recursive directory copy verification, staged rollback cleanup, approved directory delete, and storage-root confinement."
   echo "- Representative multi-TB operator soak should still use this report alongside hardware-specific move/import runs on the target storage roots."
 } >>"$OUT"
 

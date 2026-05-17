@@ -40,6 +40,9 @@ Implemented and covered by automated tests:
   admission, parent creation, copy-length verification, staged rollback cleanup,
   recursive directory copy/delete support, hardlink-or-copy import, and dry-run
   no-op behavior.
+- Move/import/delete execution has an opt-in storage-root confinement entry
+  point that validates source, destination, and rollback paths before applying
+  any filesystem change.
 - Real-device storage reports include explicit `pread` and forced `uring`
   backend roundtrips with selected backend, fallback reason, registered-file
   support, fixed-buffer support, batch length, and fixed-buffer length.
