@@ -597,6 +597,34 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
     );
     metric(
         &mut out,
+        "torrentng_torrents_activity_hot",
+        "gauge",
+        "Torrents currently classified as hot by the activity tier policy",
+        stats.torrents_activity_hot,
+    );
+    metric(
+        &mut out,
+        "torrentng_torrents_activity_warm",
+        "gauge",
+        "Torrents currently classified as warm by the activity tier policy",
+        stats.torrents_activity_warm,
+    );
+    metric(
+        &mut out,
+        "torrentng_torrents_activity_dormant",
+        "gauge",
+        "Torrents currently classified as dormant by the activity tier policy",
+        stats.torrents_activity_dormant,
+    );
+    metric(
+        &mut out,
+        "torrentng_torrent_tasks_active",
+        "gauge",
+        "Active per-torrent runtime tasks",
+        stats.torrent_tasks_active,
+    );
+    metric(
+        &mut out,
         "torrentng_bytes_uploaded_total",
         "counter",
         "Uploaded bytes from session accounting",
@@ -1332,6 +1360,10 @@ mod tests {
         let mut stats = rt_engine::EngineStats {
             torrents_total: 2,
             torrents_seeding: 1,
+            torrents_activity_hot: 2,
+            torrents_activity_warm: 3,
+            torrents_activity_dormant: 4,
+            torrent_tasks_active: 5,
             jobs_active: 3,
             trackers_error: 4,
             storage_file_pool_hits: 5,
@@ -1367,6 +1399,10 @@ mod tests {
         let rendered = render_metrics(&stats);
         assert!(rendered.contains("torrentng_torrents_total 2"));
         assert!(rendered.contains("torrentng_torrents_seeding 1"));
+        assert!(rendered.contains("torrentng_torrents_activity_hot 2"));
+        assert!(rendered.contains("torrentng_torrents_activity_warm 3"));
+        assert!(rendered.contains("torrentng_torrents_activity_dormant 4"));
+        assert!(rendered.contains("torrentng_torrent_tasks_active 5"));
         assert!(rendered.contains("torrentng_jobs_active 3"));
         assert!(rendered.contains("torrentng_trackers_error 4"));
         assert!(rendered.contains("torrentng_storage_file_pool_hits_total 5"));

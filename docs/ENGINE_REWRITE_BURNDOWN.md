@@ -152,9 +152,9 @@ shippable and benchmarkable.
 
 - [x] Introduce Dormant/Warm/Hot tiers orthogonal to `TorrentState`.
 - [x] Shared timer-wheel reactor for Dormant torrents (no task/channel/fd per torrent).
-- [ ] Promote to Hot on inbound peer/announce; demote on peer drain + idle.
-- [ ] Dormant torrents hold only piece bitmap (mmap-backed/compressed) + tracker deadline.
-- [ ] Bench: 100k torrents ≤2% active → ≤1 Tokio task per Hot torrent; idle RSS within target.
+- [x] Promote to Hot on inbound peer/announce; demote on peer drain + idle.
+- [x] Dormant torrents hold only piece bitmap (mmap-backed/compressed) + tracker deadline.
+- [x] Bench/proxy: 100k torrents ≤2% active → ≤1 Tokio task per Hot torrent; dormant heap within target.
 
 ### Phase D — efficiency
 

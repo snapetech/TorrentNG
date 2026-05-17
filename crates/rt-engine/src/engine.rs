@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Instant;
 
 use anyhow::Context;
 use rusqlite::Connection;
@@ -12,7 +13,7 @@ use sha1::{Digest, Sha1};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinHandle;
-use tokio::time::{timeout, Duration, Instant};
+use tokio::time::{timeout, Duration};
 use tracing::{info, warn};
 
 use rt_config::Config;
@@ -30,6 +31,7 @@ use crate::command::{
 };
 use crate::dht_task::{run_dht, DhtCommand, DhtTorrent};
 use crate::metadata_task::run_metadata_task;
+use crate::tier::{TierInput, TierPolicy};
 use crate::torrent_task::{TorrentCmd, TorrentTask};
 
 const EVENT_ENGINE_STARTED: &str = "engine_started";
@@ -2210,9 +2212,11 @@ impl Engine {
 
     async fn engine_stats(&self) -> CmdResult<EngineStats> {
         let mut stats = EngineStats::default();
+        let mut states = HashMap::new();
         {
             let reg = self.registry.read().await;
             for entry in reg.iter() {
+                states.insert(entry.info_hash.clone(), entry.state);
                 stats.torrents_total += 1;
                 stats.bytes_uploaded = stats.bytes_uploaded.saturating_add(entry.stats.uploaded);
                 stats.bytes_downloaded = stats
@@ -2230,6 +2234,8 @@ impl Engine {
                 }
             }
         }
+        let now = std::time::Instant::now();
+        let policy = TierPolicy::default();
         let trackers = {
             let db = self.db.lock().expect("database mutex poisoned");
             stats.jobs_active = rt_db::list_active_jobs(&db)
@@ -2246,7 +2252,7 @@ impl Engine {
                 _ => {}
             }
         }
-        for tx in self.torrent_chans.values() {
+        for (info_hash, tx) in &self.torrent_chans {
             let (reply, rx) = tokio::sync::oneshot::channel();
             if tx
                 .send(TorrentCmd::GetRuntimeStats { reply })
@@ -2256,12 +2262,44 @@ impl Engine {
                 continue;
             }
             match timeout(Duration::from_millis(250), rx).await {
-                Ok(Ok(runtime)) => stats.add_torrent_runtime(runtime),
+                Ok(Ok(runtime)) => {
+                    if let Some(state) = states.remove(info_hash) {
+                        stats.add_activity_tier(
+                            policy
+                                .decide(TierInput {
+                                    state,
+                                    connected_peers: runtime.connected_peers as usize,
+                                    outstanding_requests: runtime.outstanding_requests as usize,
+                                    inbound_peer: false,
+                                    tracker_due: false,
+                                    last_active: Some(now),
+                                    now,
+                                })
+                                .tier,
+                        );
+                    }
+                    stats.add_torrent_runtime(runtime);
+                }
                 Ok(Err(_)) => {}
                 Err(_) => {
                     warn!("timed out collecting torrent runtime stats");
                 }
             }
+        }
+        for (_, state) in states {
+            stats.add_activity_tier(
+                policy
+                    .decide(TierInput {
+                        state,
+                        connected_peers: 0,
+                        outstanding_requests: 0,
+                        inbound_peer: false,
+                        tracker_due: false,
+                        last_active: None,
+                        now,
+                    })
+                    .tier,
+            );
         }
         Ok(stats)
     }
@@ -4213,6 +4251,8 @@ mod tests {
         tokio::spawn(async move {
             if let Some(TorrentCmd::GetRuntimeStats { reply }) = torrent_rx.recv().await {
                 let _ = reply.send(crate::command::TorrentRuntimeStats {
+                    connected_peers: 1,
+                    outstanding_requests: 2,
                     piece_assembly_buffers: 2,
                     piece_assembly_bytes: 4096,
                     piece_assembly_evictions: 1,
@@ -4720,6 +4760,10 @@ mod tests {
         assert_eq!(stats.jobs_active, 1);
         assert_eq!(stats.trackers_total, 1);
         assert_eq!(stats.trackers_error, 1);
+        assert_eq!(stats.torrent_tasks_active, 1);
+        assert_eq!(stats.torrents_activity_hot, 1);
+        assert_eq!(stats.torrents_activity_warm, 0);
+        assert_eq!(stats.torrents_activity_dormant, 0);
         assert_eq!(stats.piece_assembly_buffers, 2);
         assert_eq!(stats.piece_assembly_bytes, 4096);
         assert_eq!(stats.piece_assembly_evictions, 1);

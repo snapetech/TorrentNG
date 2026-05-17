@@ -997,6 +997,12 @@ impl TorrentTask {
 
     fn runtime_stats(&self) -> TorrentRuntimeStats {
         TorrentRuntimeStats {
+            connected_peers: self.active_peers.len() as u64,
+            outstanding_requests: self
+                .active_peers
+                .values()
+                .map(|peer| peer.outstanding as u64)
+                .sum(),
             piece_assembly_buffers: self.piece_assemblies.len() as u64,
             piece_assembly_bytes: self.piece_assembly_bytes as u64,
             piece_assembly_evictions: self.piece_assembly_evictions,

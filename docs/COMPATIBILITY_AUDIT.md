@@ -127,6 +127,7 @@ Local surface: `crates/rt-api-rtorrent`.
 | Priority | Work item | Why |
 |---|---|---|
 | Done | Add tests that enumerate advertised facade methods and assert every advertised method returns a compatibility-shaped response | Prevents method-list drift |
+| Done | Add `scripts/api_facade_certification.sh` as the deterministic pass/fail gate for qBit, Transmission, Deluge, and rTorrent facade matrices | Gives the compatibility docs one local certification entry point |
 | Done | Add cross-source import/apply matrices for JSON and bencoded resume aliases | Prevents fast-resume regressions when migrating from old clients |
 | Done | Expand qBittorrent preference response breadth and API-key compatibility routes | Settings panes and modern API clients probe these before mutation |
 | Done | Persist qBittorrent mutable preferences | Avoids settings panes seeing accepted writes disappear |

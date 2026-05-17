@@ -6,6 +6,8 @@ use tokio::sync::oneshot;
 use rt_metainfo::{MagnetLink, TorrentMeta};
 use rt_storage::{StorageIoStats, STORAGE_LATENCY_BUCKET_COUNT};
 
+use crate::TorrentActivityTier;
+
 pub type CmdResult<T> = Result<T, String>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +48,10 @@ pub struct EngineStats {
     pub torrents_queued: u64,
     pub torrents_error: u64,
     pub torrents_metadata_pending: u64,
+    pub torrents_activity_hot: u64,
+    pub torrents_activity_warm: u64,
+    pub torrents_activity_dormant: u64,
+    pub torrent_tasks_active: u64,
     pub bytes_uploaded: u64,
     pub bytes_downloaded: u64,
     pub bytes_left: u64,
@@ -104,6 +110,8 @@ pub struct EngineStats {
 
 #[derive(Debug, Clone, Default)]
 pub struct TorrentRuntimeStats {
+    pub connected_peers: u64,
+    pub outstanding_requests: u64,
     pub piece_assembly_buffers: u64,
     pub piece_assembly_bytes: u64,
     pub piece_assembly_evictions: u64,
@@ -111,7 +119,16 @@ pub struct TorrentRuntimeStats {
 }
 
 impl EngineStats {
+    pub fn add_activity_tier(&mut self, tier: TorrentActivityTier) {
+        match tier {
+            TorrentActivityTier::Hot => self.torrents_activity_hot += 1,
+            TorrentActivityTier::Warm => self.torrents_activity_warm += 1,
+            TorrentActivityTier::Dormant => self.torrents_activity_dormant += 1,
+        }
+    }
+
     pub fn add_torrent_runtime(&mut self, runtime: TorrentRuntimeStats) {
+        self.torrent_tasks_active = self.torrent_tasks_active.saturating_add(1);
         self.piece_assembly_buffers = self
             .piece_assembly_buffers
             .saturating_add(runtime.piece_assembly_buffers);
@@ -562,6 +579,8 @@ mod tests {
         storage.hash_latency_ns = 400;
 
         stats.add_torrent_runtime(TorrentRuntimeStats {
+            connected_peers: 2,
+            outstanding_requests: 3,
             piece_assembly_buffers: 19,
             piece_assembly_bytes: 20,
             piece_assembly_evictions: 21,
@@ -601,6 +620,7 @@ mod tests {
         assert_eq!(stats.storage_peer_read_elevator_queued, 15);
         assert_eq!(stats.storage_peer_read_elevator_batches, 16);
         assert_eq!(stats.storage_peer_read_elevator_coalesced_requests, 17);
+        assert_eq!(stats.torrent_tasks_active, 1);
         assert_eq!(stats.piece_assembly_buffers, 19);
         assert_eq!(stats.piece_assembly_bytes, 20);
         assert_eq!(stats.piece_assembly_evictions, 21);

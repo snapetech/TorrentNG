@@ -111,6 +111,17 @@ torrent. `ActivityTimerWheel` is the shared deadline structure for tier
 promotion and idle checks; many torrents share one wheel instead of each idle
 torrent owning a timer task.
 
+The Phase C engine primitives are `CompactPieceBitmap`,
+`DormantTorrentSnapshot`, and `TierController`. A dormant snapshot keeps the
+info hash, lifecycle state, compact MSB-first piece bitmap, tracker deadline,
+and last activity timestamp; peer state, open files, channels, request queues,
+and piece assemblies are intentionally absent. `TierController` applies inbound
+peer, announce, peer-drain, request, state-change, and idle events to the tier
+policy and schedules shared idle checks through the timer wheel. `TierScaleSnapshot`
+records the release proxy for the 100k-torrent target: at most 2% hot torrents,
+at most one active Tokio task per hot torrent, and bounded dormant heap per
+torrent.
+
 ---
 
 ## Storage model

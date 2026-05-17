@@ -11,4 +11,7 @@ pub use command::{
     EngineTorrentLimits, EngineTorrentMetadata, QueueMove, TorrentDiagnostic, TorrentRuntimeStats,
 };
 pub use engine::{Engine, EngineHandle};
-pub use tier::{ActivityTimerWheel, TierDecision, TierInput, TierPolicy, TorrentActivityTier};
+pub use tier::{
+    ActivityTimerWheel, CompactPieceBitmap, DormantTorrentSnapshot, TierController, TierDecision,
+    TierEvent, TierInput, TierPolicy, TierScaleBudget, TierScaleSnapshot, TorrentActivityTier,
+};

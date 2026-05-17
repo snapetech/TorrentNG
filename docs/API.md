@@ -364,6 +364,8 @@ rTorrent over XMLRPC.
 | `torrentng_torrents_downloading` | gauge | Currently downloading |
 | `torrentng_torrents_stopped` | gauge | Stopped |
 | `torrentng_torrents_errored` | gauge | In error state |
+| `torrentng_torrents_activity_{hot,warm,dormant}` | gauge | Activity-tier classification counts from the native tier policy |
+| `torrentng_torrent_tasks_active` | gauge | Active per-torrent runtime tasks |
 | `torrentng_peers_connected` | gauge | Connected peers across all torrents |
 | `torrentng_storage_file_pool_*` | gauge/counter | Native scheduler open-file cache capacity, open files, hits, misses, evictions, and idle closes |
 | `torrentng_storage_*_queue_depth` | gauge | Native disk I/O and hashing queue depths |

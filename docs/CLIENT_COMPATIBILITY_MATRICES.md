@@ -233,8 +233,8 @@ engine does not expose yet.
 
 | Priority | Test artifact | Coverage |
 |---|---|---|
-| P0 | `api_facade_endpoint_matrix` | Implemented in crate tests: qBit route matrix, Transmission method matrix, Deluge advertised method matrix |
-| P0 | `api_response_field_matrix` | Implemented for current qBit `torrents/info`/`properties`/`sync`, Transmission `torrent-get`/`session-get`, and Deluge torrent status fields; remaining documented gaps stay in field matrices |
+| P0 | `api_facade_endpoint_matrix` | Implemented in crate tests and `scripts/api_facade_certification.sh`: qBit route matrix, Transmission method matrix, Deluge advertised method matrix, and rTorrent XMLRPC method matrix |
+| P0 | `api_response_field_matrix` | Implemented in crate tests and `scripts/api_facade_certification.sh` for current qBit `torrents/info`/`properties`/`sync`, Transmission `torrent-get`/`session-get`, Deluge torrent status fields, and representative rTorrent XMLRPC fixtures |
 | P0 | `import_fixture_matrix` | Implemented for common JSON resume fields and source-specific bencoded aliases across qBit, Transmission, Deluge, uTorrent, BiglyBT/Vuze, Tixati, and Generic; real exported golden corpora remain P1 |
 | P0 | `migration_apply_matrix` | Implemented for common JSON and bencoded resume fields across qBit, Transmission, Deluge, uTorrent, BiglyBT/Vuze, Tixati, and Generic: applies DB rows and fastresume, reloads, and asserts preservation |
 | P1 | `qbit_arr_client_matrix` | Sonarr/Radarr/Prowlarr/cross-seed/autobrr/NZB360-style qBit flows |
