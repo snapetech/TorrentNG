@@ -36,6 +36,7 @@ for report in \
   universal-compat-selftest.md \
   universal-live-selftest.md \
   migration-corpus-selftest.md \
+  external-evidence-preflight-selftest.md \
   soak-20260517-selftest.md \
   transfer-churn-selftest.md \
   soak-24h-selftest.md \

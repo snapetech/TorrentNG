@@ -8,6 +8,7 @@ strict release-ready state.
 Run the deterministic local gates first:
 
 ```sh
+scripts/external_evidence_preflight.sh
 scripts/universal_compatibility_certification.sh
 scripts/migration_corpus_certification.sh
 scripts/local_release_gate.sh
@@ -17,6 +18,9 @@ scripts/certification_burndown.sh
 
 The local release gate may report `PASS_WITH_WARNINGS` while external evidence
 is missing. That is expected before the next sections are complete.
+Use the external preflight report to check whether the current host has Docker,
+public-transfer opt-in, corpus files, a writable storage target, and an active
+24h soak before launching long gates.
 
 ## Exported Migration Corpus
 
