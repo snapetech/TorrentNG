@@ -91,7 +91,9 @@ class semaphores:
   benchmarks mature. Both backend implementations use bounded internal queues
   and fail closed when saturated. The uring worker keeps a stable per-worker
   fixed-file table keyed by file identity and registers worker-owned fixed
-  buffers when the kernel accepts them. Kernels or
+  buffers when the kernel accepts them. Metrics expose this as
+  `fixed_buffer_strategy=worker_copy` until the frame pool can lease registered
+  slots directly. Kernels or
   containers that reject `io_uring` fall back to `pread` with an explicit
   diagnostic reason instead of silently changing behavior. Direct backend
   probes remain available for hardware certification and capability metrics.
@@ -149,6 +151,8 @@ The following items are still implementation targets:
   pressure.
 - Replace the worker-owned fixed-buffer copy path with true frame-pool slot
   pinning once the global frame pool can lease stable registered buffer indexes.
+  Until then, `torrentng_storage_backend_fixed_buffer_strategy` must report
+  `worker_copy`, not `frame_pool_slots`.
 - Extend the release hardware report with recheck runtime progress.
   `scripts/storage_hardware_matrix.sh` already records real-device seed-read
   locality, bounded hot-file descriptor reuse, elevator throughput, and

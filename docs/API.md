@@ -38,7 +38,9 @@ Non-static API responses include an `X-Request-Id` header. If a client supplies 
 bounded, printable `X-Request-Id`, TorrentNG preserves it in structured request
 logs and echoes it back; otherwise the runtime generates a `tng-N` id. Health,
 metrics, websocket, and static asset requests are intentionally excluded from
-request logging noise.
+request logging noise. Request logs also include the socket peer address when
+the runtime has connect-info available; forwarded headers are not trusted for
+that field.
 
 ---
 
@@ -412,6 +414,9 @@ rTorrent over XMLRPC.
 | `torrentng_storage_backend_fixed_buffers_supported` | gauge | Whether the selected backend can use registered fixed buffers |
 | `torrentng_storage_backend_registered_files_supported` | gauge | Whether the selected backend can use registered file slots |
 | `torrentng_storage_backend_{max_batch_len,fixed_buffer_bytes}` | gauge | Selected backend batching and fixed-buffer sizing |
+| `torrentng_storage_backend_fixed_buffer_strategy{strategy=...}` | gauge | Active fixed-buffer strategy (`disabled`, `worker_copy`, or future `frame_pool_slots`) |
+| `torrentng_storage_backend_fixed_buffer_worker_copy` | gauge | Whether fixed-buffer submissions copy through backend-private worker buffers |
+| `torrentng_storage_backend_frame_pool_slots_supported` | gauge | Whether fixed-buffer submissions use registered storage frame-pool slots directly |
 | `torrentng_storage_backend_read_*` | counter | Actual backend disk read operations and bytes, excluding peer-read cache hits |
 | `torrentng_storage_*_latency_nanoseconds` | histogram/counter | Storage queue plus execution latency buckets and cumulative totals for read, write, sync, and hash work |
 | `torrentng_storage_*_latency_nanoseconds_by_device{device=...,profile=...}` | histogram/counter | Storage read/write/sync/hash latency histograms and totals split by resolved storage device/profile |

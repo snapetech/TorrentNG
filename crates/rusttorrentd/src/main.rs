@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -7,7 +8,7 @@ use std::time::Instant;
 use anyhow::Context;
 use axum::{
     body::Body,
-    extract::MatchedPath,
+    extract::{ConnectInfo, MatchedPath},
     http::{header, HeaderMap, HeaderName, HeaderValue, Request},
     middleware::{self, Next},
     response::Response,
@@ -92,9 +93,12 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    axum::serve(listener, app.into_make_service())
-        .await
-        .context("API server error")?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .context("API server error")?;
 
     Ok(())
 }
@@ -111,6 +115,10 @@ async fn request_log(req: Request<Body>, next: Next) -> Response {
         .extensions()
         .get::<MatchedPath>()
         .map(|matched| matched.as_str().to_owned());
+    let remote_addr = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| *addr);
     let request_id = request_id(req.headers());
     let started = Instant::now();
     let mut response = next.run(req).await;
@@ -133,6 +141,7 @@ async fn request_log(req: Request<Body>, next: Next) -> Response {
         method = %method,
         path = %path,
         route = route.as_deref(),
+        remote_addr = remote_addr.map(|addr| addr.to_string()).as_deref(),
         status = status.as_u16(),
         duration_ms,
         response_size,

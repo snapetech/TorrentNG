@@ -1,6 +1,6 @@
 use axum::{
     body::Body,
-    extract::MatchedPath,
+    extract::{ConnectInfo, MatchedPath},
     http::{header, HeaderMap, HeaderName, HeaderValue, Request},
     middleware,
     response::Response,
@@ -8,6 +8,7 @@ use axum::{
     Router,
 };
 use std::{
+    net::SocketAddr,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -175,6 +176,10 @@ async fn request_log(req: Request<Body>, next: middleware::Next) -> Response {
         .extensions()
         .get::<MatchedPath>()
         .map(|matched| matched.as_str().to_owned());
+    let remote_addr = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| *addr);
     let request_id = request_id(req.headers());
     let started = Instant::now();
     let mut response = next.run(req).await;
@@ -197,6 +202,7 @@ async fn request_log(req: Request<Body>, next: middleware::Next) -> Response {
         method = %method,
         path = %path,
         route = route.as_deref(),
+        remote_addr = remote_addr.map(|addr| addr.to_string()).as_deref(),
         status = status.as_u16(),
         duration_ms,
         response_size,
