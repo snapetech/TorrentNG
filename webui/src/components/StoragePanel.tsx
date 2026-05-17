@@ -64,7 +64,8 @@ function StorageRootCard({ root }: { root: NonNullable<Awaited<ReturnType<typeof
         : 'var(--success)'
   return (
     <div
-      className="rtng-card"
+      className="rtng-card rtng-storage-root"
+      data-tone={!root.ok ? 'error' : root.used_percent >= 90 ? 'error' : root.used_percent >= 75 ? 'warn' : 'ok'}
       style={{
         border: '1px solid var(--border)',
         borderRadius: 7,
@@ -94,7 +95,7 @@ function StorageRootCard({ root }: { root: NonNullable<Awaited<ReturnType<typeof
 
       {root.ok ? (
         <>
-          <div style={{ height: 8, background: 'var(--surface-2)', borderRadius: 99, overflow: 'hidden', marginBottom: 9 }}>
+          <div className="rtng-storage-meter" style={{ height: 8, background: 'var(--surface-2)', borderRadius: 99, overflow: 'hidden', marginBottom: 9 }}>
             <div style={{ width: `${Math.min(100, root.used_percent)}%`, height: '100%', background: tone }} />
           </div>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))', gap: 8, fontSize: 12 }}>
@@ -148,7 +149,7 @@ function EmptyState({ children }: { children: React.ReactNode }) {
 
 function StorageMetric({ label, value }: { label: string; value: string }) {
   return (
-    <span style={{
+    <span className="rtng-metric-tile" style={{
       display: 'grid', gap: 2, border: '1px solid var(--border)', borderRadius: 6,
       background: 'var(--bg)', padding: '6px 8px', minWidth: 0,
     }}>

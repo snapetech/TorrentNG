@@ -131,13 +131,19 @@ export function WorkflowsPanel() {
           <EmptyState title="No workflow rules configured" detail="Create a workflow above, then preview it against the current torrent list before running." />
         )}
         {rules.map(rule => (
-          <div key={rule.id} style={{
+          <div key={rule.id} className="rtng-automation-row" data-enabled={rule.enabled ? 'true' : 'false'} style={{
             display: 'grid', gridTemplateColumns: '150px 120px 120px 150px minmax(240px, 1fr) auto auto auto',
             minWidth: 980,
             gap: 8, alignItems: 'center', border: '1px solid var(--border)',
             borderRadius: 7, padding: '10px 12px', background: 'var(--surface)', fontSize: 12,
             }}>
-            <strong style={{ color: 'var(--text)' }}>{rule.name}</strong>
+            <strong style={{ color: 'var(--text)', display: 'inline-flex', alignItems: 'center', gap: 7 }}>
+              <span aria-hidden="true" style={{
+                width: 7, height: 7, borderRadius: 999,
+                background: rule.enabled ? 'var(--success)' : 'var(--faint)',
+              }} />
+              {rule.name}
+            </strong>
             <Pill tone="info">{rule.event}</Pill>
             <Pill tone={rule.enabled ? 'ok' : 'idle'}>{rule.action}</Pill>
             <span style={{ color: 'var(--faint)' }}>{rule.category || 'any category'}</span>
@@ -203,7 +209,7 @@ function WorkflowRunRow({ run }: { run: WorkflowRun }) {
   const status = run.errors.length > 0 ? `${run.errors.length} error(s)` : run.dry_run ? 'previewed' : 'completed'
   const tone = run.errors.length > 0 ? 'error' : run.dry_run ? 'info' : 'ok'
   return (
-    <div style={{
+    <div className="rtng-automation-row" data-enabled={run.errors.length === 0 ? 'true' : 'false'} style={{
       display: 'grid', gridTemplateColumns: '150px 120px 90px 90px 90px 1fr',
       minWidth: 760,
       gap: 8, alignItems: 'center', border: '1px solid var(--border)',

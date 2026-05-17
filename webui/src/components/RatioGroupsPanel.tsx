@@ -115,13 +115,19 @@ export function RatioGroupsPanel() {
           <EmptyState title="No ratio groups configured" detail="Create a group above, then preview which torrents match before applying it." />
         )}
         {groups.map(group => (
-          <div key={group.name} style={{
+          <div key={group.name} className="rtng-automation-row" data-enabled={group.enabled ? 'true' : 'false'} style={{
             display: 'grid', gridTemplateColumns: '160px 90px 110px 150px minmax(220px, 1fr) auto auto auto',
             minWidth: 900,
             gap: 8, alignItems: 'center', border: '1px solid var(--border)',
             borderRadius: 7, padding: '10px 12px', background: 'var(--surface)', fontSize: 12,
           }}>
-            <strong style={{ color: 'var(--text)' }}>{group.name}</strong>
+            <strong style={{ color: 'var(--text)', display: 'inline-flex', alignItems: 'center', gap: 7 }}>
+              <span aria-hidden="true" style={{
+                width: 7, height: 7, borderRadius: 999,
+                background: group.enabled ? 'var(--success)' : 'var(--faint)',
+              }} />
+              {group.name}
+            </strong>
             <span style={{ color: 'var(--muted)' }}>ratio {group.ratio_limit}</span>
             <span style={{ color: 'var(--muted)' }}>{group.seeding_time_limit < 0 ? 'no time cap' : `${group.seeding_time_limit}m`}</span>
             <span style={{ color: 'var(--faint)' }}>{group.category || 'any category'}</span>

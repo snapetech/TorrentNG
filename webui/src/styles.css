@@ -372,6 +372,57 @@ dialog,
   opacity: 0.82;
 }
 
+.rtng-metric-tile,
+.rtng-storage-root,
+.rtng-tracker-row,
+.rtng-automation-row {
+  transition:
+    border-color 120ms ease,
+    background-color 120ms ease,
+    box-shadow 120ms ease,
+    filter 120ms ease;
+}
+
+.rtng-metric-tile:hover,
+.rtng-storage-root:hover,
+.rtng-tracker-row:hover,
+.rtng-automation-row:hover {
+  border-color: color-mix(in srgb, var(--accent) 38%, var(--border-strong)) !important;
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--accent) 10%, transparent),
+    0 8px 22px color-mix(in srgb, var(--shadow) 38%, transparent);
+}
+
+.rtng-storage-root[data-tone="ok"],
+.rtng-tracker-row[data-tone="ok"],
+.rtng-automation-row[data-enabled="true"] {
+  box-shadow: inset 3px 0 0 color-mix(in srgb, var(--success) 58%, transparent);
+}
+
+.rtng-storage-root[data-tone="warn"],
+.rtng-tracker-row[data-tone="warn"] {
+  box-shadow: inset 3px 0 0 color-mix(in srgb, var(--warning) 68%, transparent);
+}
+
+.rtng-storage-root[data-tone="error"],
+.rtng-tracker-row[data-tone="error"],
+.rtng-automation-row[data-enabled="false"] {
+  box-shadow: inset 3px 0 0 color-mix(in srgb, var(--danger) 62%, transparent);
+}
+
+.rtng-storage-meter {
+  position: relative;
+}
+
+.rtng-storage-meter::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent 0 24%, rgba(255,255,255,0.18) 24% 25%, transparent 25% 49%, rgba(255,255,255,0.14) 49% 50%, transparent 50% 74%, rgba(255,255,255,0.12) 74% 75%, transparent 75%);
+  opacity: 0.38;
+  pointer-events: none;
+}
+
 ::selection {
   background: color-mix(in srgb, var(--accent) 40%, transparent);
   color: var(--text);

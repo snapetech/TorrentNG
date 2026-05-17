@@ -73,7 +73,8 @@ export function TrackerHealthPanel() {
           return (
             <div
               key={tracker.tracker}
-              className="rtng-card"
+              className="rtng-card rtng-tracker-row"
+              data-tone={errorRatio >= 0.5 ? 'error' : errorRatio > 0 ? 'warn' : 'ok'}
               style={{
                 display: 'grid',
                 gridTemplateColumns: 'minmax(220px, 1fr) 90px 90px 90px 120px',
@@ -113,6 +114,20 @@ export function TrackerHealthPanel() {
                 <div>{tracker.peer_count} peers</div>
                 <div style={{ color: 'var(--faint)', marginTop: 2 }}>{fmtDate(tracker.last_updated)}</div>
               </div>
+              <span aria-hidden="true" style={{
+                gridColumn: '1 / -1',
+                height: 3,
+                borderRadius: 999,
+                overflow: 'hidden',
+                background: 'color-mix(in srgb, var(--border-strong) 48%, transparent)',
+              }}>
+                <span style={{
+                  display: 'block',
+                  width: `${Math.min(100, Math.max(4, errorRatio > 0 ? errorRatio * 100 : (tracker.active_count / Math.max(1, tracker.torrent_count)) * 100))}%`,
+                  height: '100%',
+                  background: color,
+                }} />
+              </span>
             </div>
           )
         })}
@@ -151,7 +166,7 @@ function Notice({ children }: { children: React.ReactNode }) {
 function Summary({ label, value, tone }: { label: string; value: number; tone: 'ok' | 'warn' | 'neutral' }) {
   const color = tone === 'ok' ? 'var(--success)' : tone === 'warn' ? 'var(--warning)' : 'var(--muted)'
   return (
-    <span style={{
+    <span className="rtng-metric-tile" style={{
       display: 'inline-flex', alignItems: 'center', gap: 6,
       border: '1px solid var(--border)', borderRadius: 6,
       background: 'var(--surface)', padding: '5px 8px', fontSize: 12,
