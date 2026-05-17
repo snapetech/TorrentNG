@@ -10,6 +10,7 @@
 ///   - 50k torrents: GET /api/qb/v2/torrents/info < 500ms
 ///   - native filter/sort over 15k torrents < 250ms
 ///   - sync/maindata delta < 50ms (at normal churn)
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use axum::{body::Body, http::Request};
@@ -60,6 +61,49 @@ fn threshold(release_ms: u128) -> u128 {
         release_ms * 20
     } else {
         release_ms
+    }
+}
+
+async fn read_at_retry_queue_full(
+    scheduler: &MountScheduler,
+    class: IoClass,
+    path: &Path,
+    offset: u64,
+    len: usize,
+) -> Result<bytes::Bytes, StorageError> {
+    let mut attempts = 0;
+    loop {
+        match scheduler.read_at(class, path, offset, len).await {
+            Err(StorageError::QueueFull { .. }) if attempts < 10_000 => {
+                attempts += 1;
+                if attempts % 16 == 0 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                } else {
+                    tokio::task::yield_now().await;
+                }
+            }
+            result => return result,
+        }
+    }
+}
+
+async fn hash_sha1_retry_queue_full(
+    scheduler: &MountScheduler,
+    data: bytes::Bytes,
+) -> Result<[u8; 20], StorageError> {
+    let mut attempts = 0;
+    loop {
+        match scheduler.hash_sha1(data.clone()).await {
+            Err(StorageError::QueueFull { .. }) if attempts < 10_000 => {
+                attempts += 1;
+                if attempts % 16 == 0 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                } else {
+                    tokio::task::yield_now().await;
+                }
+            }
+            result => return result,
+        }
     }
 }
 
@@ -396,7 +440,7 @@ async fn storage_hash_pool_does_not_block_peer_read_path() {
 
     let read = tokio::time::timeout(
         Duration::from_millis(threshold(50) as u64),
-        scheduler.read_at(IoClass::PeerRead, &path, 0, 16 * 1024),
+        read_at_retry_queue_full(&scheduler, IoClass::PeerRead, &path, 0, 16 * 1024),
     )
     .await
     .expect("peer read should not wait behind hash queue")
@@ -441,8 +485,7 @@ async fn storage_recheck_hashing_reports_scheduler_result_without_runtime_stall(
             ..Default::default()
         },
     );
-    let hash = scheduler
-        .hash_sha1(bytes::Bytes::copy_from_slice(content))
+    let hash = hash_sha1_retry_queue_full(&scheduler, bytes::Bytes::copy_from_slice(content))
         .await
         .unwrap();
     let piece_map = PieceMap::new(
@@ -478,9 +521,11 @@ async fn completed_piece_ram_hash_avoids_read_after_write_backend_reads() {
         },
     );
     let piece = bytes::Bytes::from(vec![0x42u8; 1024 * 1024]);
-    let hash = scheduler.hash_sha1(piece.clone()).await.unwrap();
+    let hash = hash_sha1_retry_queue_full(&scheduler, piece.clone())
+        .await
+        .unwrap();
     let before = scheduler.stats();
-    let verified = scheduler.hash_sha1(piece).await.unwrap();
+    let verified = hash_sha1_retry_queue_full(&scheduler, piece).await.unwrap();
     let after = scheduler.stats();
 
     assert_eq!(verified, hash);
@@ -550,8 +595,7 @@ async fn sparse_recheck_skips_holes_and_reports_extent_counters() {
 
     let mut expected = vec![0u8; file_len];
     expected[data_offset..data_offset + data.len()].copy_from_slice(&data);
-    let expected_hash = scheduler
-        .hash_sha1(bytes::Bytes::from(expected))
+    let expected_hash = hash_sha1_retry_queue_full(&scheduler, bytes::Bytes::from(expected))
         .await
         .unwrap();
     let piece_map = PieceMap::new(

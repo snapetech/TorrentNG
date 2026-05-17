@@ -1083,12 +1083,28 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
         &stats.storage_device_latencies,
         |device| device.read_latency_ns,
     );
+    latency_histogram_by_device(
+        &mut out,
+        "torrentng_storage_read_latency_nanoseconds_by_device",
+        "Read queue plus execution latency histogram by storage device",
+        &stats.storage_device_latencies,
+        |device| &device.read_latency_buckets,
+        |device| device.read_latency_ns,
+    );
     metric_by_device(
         &mut out,
         "torrentng_storage_write_latency_nanoseconds_by_device_total",
         "counter",
         "Total write queue plus execution latency by storage device",
         &stats.storage_device_latencies,
+        |device| device.write_latency_ns,
+    );
+    latency_histogram_by_device(
+        &mut out,
+        "torrentng_storage_write_latency_nanoseconds_by_device",
+        "Write queue plus execution latency histogram by storage device",
+        &stats.storage_device_latencies,
+        |device| &device.write_latency_buckets,
         |device| device.write_latency_ns,
     );
     metric_by_device(
@@ -1099,12 +1115,28 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
         &stats.storage_device_latencies,
         |device| device.sync_latency_ns,
     );
+    latency_histogram_by_device(
+        &mut out,
+        "torrentng_storage_sync_latency_nanoseconds_by_device",
+        "Sync queue plus execution latency histogram by storage device",
+        &stats.storage_device_latencies,
+        |device| &device.sync_latency_buckets,
+        |device| device.sync_latency_ns,
+    );
     metric_by_device(
         &mut out,
         "torrentng_storage_hash_latency_nanoseconds_by_device_total",
         "counter",
         "Total hashing queue plus execution latency by storage device",
         &stats.storage_device_latencies,
+        |device| device.hash_latency_ns,
+    );
+    latency_histogram_by_device(
+        &mut out,
+        "torrentng_storage_hash_latency_nanoseconds_by_device",
+        "Hashing queue plus execution latency histogram by storage device",
+        &stats.storage_device_latencies,
+        |device| &device.hash_latency_buckets,
         |device| device.hash_latency_ns,
     );
     metric(
@@ -1716,6 +1748,59 @@ fn latency_histogram(
     out.push('\n');
 }
 
+fn latency_histogram_by_device(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    values: &[rt_engine::StorageDeviceLatencyStats],
+    buckets: impl Fn(&rt_engine::StorageDeviceLatencyStats) -> &[u64; STORAGE_LATENCY_BUCKETS_NS.len()],
+    sum_ns: impl Fn(&rt_engine::StorageDeviceLatencyStats) -> u64,
+) {
+    out.push_str("# HELP ");
+    out.push_str(name);
+    out.push(' ');
+    out.push_str(help);
+    out.push('\n');
+    out.push_str("# TYPE ");
+    out.push_str(name);
+    out.push_str(" histogram\n");
+    for device in values {
+        let buckets = buckets(device);
+        for (upper_bound, count) in STORAGE_LATENCY_BUCKETS_NS.iter().zip(buckets) {
+            out.push_str(name);
+            out.push_str("_bucket{device=\"");
+            push_label_value(out, &device.device_id);
+            out.push_str("\",profile=\"");
+            push_label_value(out, &device.profile);
+            out.push_str("\",le=\"");
+            if *upper_bound == u64::MAX {
+                out.push_str("+Inf");
+            } else {
+                out.push_str(&upper_bound.to_string());
+            }
+            out.push_str("\"} ");
+            out.push_str(&count.to_string());
+            out.push('\n');
+        }
+        out.push_str(name);
+        out.push_str("_sum{device=\"");
+        push_label_value(out, &device.device_id);
+        out.push_str("\",profile=\"");
+        push_label_value(out, &device.profile);
+        out.push_str("\"} ");
+        out.push_str(&sum_ns(device).to_string());
+        out.push('\n');
+        out.push_str(name);
+        out.push_str("_count{device=\"");
+        push_label_value(out, &device.device_id);
+        out.push_str("\",profile=\"");
+        push_label_value(out, &device.profile);
+        out.push_str("\"} ");
+        out.push_str(&buckets[STORAGE_LATENCY_BUCKETS_NS.len() - 1].to_string());
+        out.push('\n');
+    }
+}
+
 enum TorrentControl {
     Pause,
     Resume,
@@ -2031,6 +2116,26 @@ mod tests {
             write_latency_ns: 37,
             sync_latency_ns: 38,
             hash_latency_ns: 39,
+            read_latency_buckets: {
+                let mut buckets = [0; STORAGE_LATENCY_BUCKETS_NS.len()];
+                buckets[7] = 6;
+                buckets
+            },
+            write_latency_buckets: {
+                let mut buckets = [0; STORAGE_LATENCY_BUCKETS_NS.len()];
+                buckets[7] = 11;
+                buckets
+            },
+            sync_latency_buckets: {
+                let mut buckets = [0; STORAGE_LATENCY_BUCKETS_NS.len()];
+                buckets[7] = 2;
+                buckets
+            },
+            hash_latency_buckets: {
+                let mut buckets = [0; STORAGE_LATENCY_BUCKETS_NS.len()];
+                buckets[7] = 7;
+                buckets
+            },
         }];
         stats.hot_torrent_memory_top = vec![rt_engine::HotTorrentMemoryStats {
             info_hash: "abc\"def\\ghi\nj".to_owned(),
@@ -2149,6 +2254,18 @@ mod tests {
         ));
         assert!(rendered.contains(
             "torrentng_storage_hash_latency_nanoseconds_by_device_total{device=\"pool\\\"a\\\\disk\\n1\",profile=\"hdd\"} 39"
+        ));
+        assert!(rendered.contains(
+            "torrentng_storage_read_latency_nanoseconds_by_device_bucket{device=\"pool\\\"a\\\\disk\\n1\",profile=\"hdd\",le=\"+Inf\"} 6"
+        ));
+        assert!(rendered.contains(
+            "torrentng_storage_write_latency_nanoseconds_by_device_bucket{device=\"pool\\\"a\\\\disk\\n1\",profile=\"hdd\",le=\"+Inf\"} 11"
+        ));
+        assert!(rendered.contains(
+            "torrentng_storage_sync_latency_nanoseconds_by_device_count{device=\"pool\\\"a\\\\disk\\n1\",profile=\"hdd\"} 2"
+        ));
+        assert!(rendered.contains(
+            "torrentng_storage_hash_latency_nanoseconds_by_device_sum{device=\"pool\\\"a\\\\disk\\n1\",profile=\"hdd\"} 39"
         ));
         assert!(
             rendered.contains("torrentng_storage_read_latency_nanoseconds_bucket{le=\"+Inf\"} 6")

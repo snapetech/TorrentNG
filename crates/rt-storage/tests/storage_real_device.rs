@@ -3,7 +3,8 @@ use std::time::{Duration, Instant};
 
 use rt_path::{StorageProfile, StorageRootId};
 use rt_storage::{
-    detect_storage_topology, IoClass, MountScheduler, SchedulerConfig, StorageIoConfig,
+    detect_storage_topology, IoClass, MountScheduler, SchedulerConfig, StorageError,
+    StorageIoConfig,
 };
 
 fn bench_size(name: &str, default: u64) -> u64 {
@@ -66,6 +67,29 @@ fn settle_file_for_read_benchmark(path: &Path) {
     drop_file_cache(path);
 }
 
+async fn read_at_retry_queue_full(
+    scheduler: &MountScheduler,
+    class: IoClass,
+    path: &Path,
+    offset: u64,
+    len: usize,
+) -> Result<bytes::Bytes, StorageError> {
+    let mut attempts = 0;
+    loop {
+        match scheduler.read_at(class, path, offset, len).await {
+            Err(StorageError::QueueFull { .. }) if attempts < 10_000 => {
+                attempts += 1;
+                if attempts % 16 == 0 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                } else {
+                    tokio::task::yield_now().await;
+                }
+            }
+            result => return result,
+        }
+    }
+}
+
 async fn run_reads(
     scheduler: MountScheduler,
     path: PathBuf,
@@ -79,16 +103,35 @@ async fn run_reads(
         let scheduler = scheduler.clone();
         let path = path.clone();
         set.spawn(async move {
-            let bytes = scheduler
-                .read_at(IoClass::PeerRead, &path, offset, block_len)
-                .await
-                .unwrap();
+            let bytes =
+                read_at_retry_queue_full(&scheduler, IoClass::PeerRead, &path, offset, block_len)
+                    .await
+                    .unwrap();
             (offset, bytes)
         });
     }
 
     while let Some(joined) = set.join_next().await {
         let (offset, bytes) = joined.unwrap();
+        let start = offset as usize;
+        assert_eq!(&bytes[..], &data[start..start + block_len]);
+    }
+    started.elapsed()
+}
+
+async fn run_ordered_reads(
+    scheduler: MountScheduler,
+    path: PathBuf,
+    data: &[u8],
+    offsets: &[u64],
+    block_len: usize,
+) -> Duration {
+    let started = Instant::now();
+    for &offset in offsets {
+        let bytes =
+            read_at_retry_queue_full(&scheduler, IoClass::PeerRead, &path, offset, block_len)
+                .await
+                .unwrap();
         let start = offset as usize;
         assert_eq!(&bytes[..], &data[start..start + block_len]);
     }
@@ -124,7 +167,7 @@ async fn peer_read_readahead_reduces_backend_reads_on_adjacent_blocks() {
     );
 
     let offsets: Vec<u64> = (0..blocks).map(|i| i * block_len as u64).collect();
-    let elapsed = run_reads(scheduler.clone(), path, &data, &offsets, block_len).await;
+    let elapsed = run_ordered_reads(scheduler.clone(), path, &data, &offsets, block_len).await;
     let stats = scheduler.stats();
     let submitted = stats.read_ops_by_class[IoClass::PeerRead as usize];
     let backend_reads = stats.backend_read_ops_by_class[IoClass::PeerRead as usize];

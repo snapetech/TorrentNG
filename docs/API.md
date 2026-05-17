@@ -401,7 +401,7 @@ rTorrent over XMLRPC.
 | `torrentng_storage_backend_{max_batch_len,fixed_buffer_bytes}` | gauge | Selected backend batching and fixed-buffer sizing |
 | `torrentng_storage_backend_read_*` | counter | Actual backend disk read operations and bytes, excluding peer-read cache hits |
 | `torrentng_storage_*_latency_nanoseconds` | histogram/counter | Storage queue plus execution latency buckets and cumulative totals for read, write, sync, and hash work |
-| `torrentng_storage_*_latency_nanoseconds_by_device_total{device=...,profile=...}` | counter | Storage read/write/sync/hash latency totals split by resolved storage device/profile |
+| `torrentng_storage_*_latency_nanoseconds_by_device{device=...,profile=...}` | histogram/counter | Storage read/write/sync/hash latency histograms and totals split by resolved storage device/profile |
 | `torrentng_storage_{sync,hash}_ops_total` | counter | Durability syncs and hashing-pool work |
 | `torrentng_storage_preallocation_*_total` | counter | Preallocation failures and fallback events |
 | `torrentng_storage_peer_read_cache_*` | gauge/counter | Peer-read readahead cache entries, hits, and misses |

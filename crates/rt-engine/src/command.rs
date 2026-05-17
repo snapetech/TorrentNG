@@ -158,6 +158,10 @@ pub struct StorageDeviceLatencyStats {
     pub write_latency_ns: u64,
     pub sync_latency_ns: u64,
     pub hash_latency_ns: u64,
+    pub read_latency_buckets: [u64; STORAGE_LATENCY_BUCKET_COUNT],
+    pub write_latency_buckets: [u64; STORAGE_LATENCY_BUCKET_COUNT],
+    pub sync_latency_buckets: [u64; STORAGE_LATENCY_BUCKET_COUNT],
+    pub hash_latency_buckets: [u64; STORAGE_LATENCY_BUCKET_COUNT],
 }
 
 #[derive(Debug, Clone, Default)]
@@ -411,6 +415,22 @@ impl EngineStats {
         device.hash_latency_ns = device
             .hash_latency_ns
             .saturating_add(storage.hash_latency_ns);
+        add_bucket_counts(
+            &mut device.read_latency_buckets,
+            storage.read_latency_buckets,
+        );
+        add_bucket_counts(
+            &mut device.write_latency_buckets,
+            storage.write_latency_buckets,
+        );
+        add_bucket_counts(
+            &mut device.sync_latency_buckets,
+            storage.sync_latency_buckets,
+        );
+        add_bucket_counts(
+            &mut device.hash_latency_buckets,
+            storage.hash_latency_buckets,
+        );
         self.storage_sync_ops = self.storage_sync_ops.saturating_add(storage.sync_ops);
         self.storage_hash_ops = self.storage_hash_ops.saturating_add(storage.hash_ops);
         self.storage_preallocation_failures = self
@@ -864,6 +884,26 @@ mod tests {
                 write_latency_ns: 200,
                 sync_latency_ns: 300,
                 hash_latency_ns: 400,
+                read_latency_buckets: {
+                    let mut buckets = [0; STORAGE_LATENCY_BUCKET_COUNT];
+                    buckets[0] = 1;
+                    buckets
+                },
+                write_latency_buckets: {
+                    let mut buckets = [0; STORAGE_LATENCY_BUCKET_COUNT];
+                    buckets[1] = 2;
+                    buckets
+                },
+                sync_latency_buckets: {
+                    let mut buckets = [0; STORAGE_LATENCY_BUCKET_COUNT];
+                    buckets[2] = 3;
+                    buckets
+                },
+                hash_latency_buckets: {
+                    let mut buckets = [0; STORAGE_LATENCY_BUCKET_COUNT];
+                    buckets[3] = 4;
+                    buckets
+                },
             }]
         );
         assert_eq!(stats.storage_peer_read_cache_hits, 12);

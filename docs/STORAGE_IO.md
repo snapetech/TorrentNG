@@ -118,12 +118,12 @@ startup falls back to verification instead of trusting stale piece state.
 
 The following items are still implementation targets:
 
-- Extend per-device latency observability with histograms if cardinality remains
-  acceptable. Prometheus already exports cumulative read/write/sync/hash latency
-  totals by resolved storage device/profile, plus fixed-bucket aggregate
-  histograms and counters for file-pool activity, queue depth, dirty files,
-  sync/hash/preallocate work, peer-read cache, logical/backend reads, and
-  in-memory piece assembly pressure.
+- Per-device latency observability now includes bounded Prometheus histograms
+  for read/write/sync/hash work labeled by resolved device/profile, plus the
+  cumulative per-device totals. Aggregate fixed-bucket histograms and counters
+  also cover file-pool activity, queue depth, dirty files, sync/hash/preallocate
+  work, peer-read cache, logical/backend reads, and in-memory piece assembly
+  pressure.
 - Replace the worker-owned fixed-buffer copy path with true frame-pool slot
   pinning once the global frame pool can lease stable registered buffer indexes.
 - Extend the release hardware report with recheck runtime progress.

@@ -59,7 +59,7 @@ available.
 | `torrentng_storage_backend_fixed_buffers_supported` | `0` for `pread`; `1` for `uring` when the kernel accepts registered worker buffers |
 | `torrentng_storage_backend_registered_files_supported` | `0` for `pread`; `1` for `uring` when the kernel accepts registered file slots |
 | `torrentng_storage_backend_{max_batch_len,fixed_buffer_bytes}` | Backend batch and fixed-buffer sizing match the selected implementation |
-| `torrentng_storage_*_latency_nanoseconds_by_device_total{device=...,profile=...}` | Storage latency attribution survives multi-device aggregation |
+| `torrentng_storage_*_latency_nanoseconds_by_device{device=...,profile=...}` | Storage latency attribution and bounded histograms survive multi-device aggregation |
 | `torrentng_storage_file_pool_*` | fd pool remains bounded and records hit/miss/eviction/idle-close activity |
 | `torrentng_storage_queue_full_total` | bounded storage queues expose backpressure instead of silently accumulating jobs |
 | `torrentng_storage_peer_read_elevator_*` | HDD peer-read queueing, batching, and coalescing are visible |
