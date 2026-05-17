@@ -21,6 +21,12 @@ is missing. That is expected before the next sections are complete.
 Use the external preflight report to check whether the current host has Docker,
 public-transfer opt-in, corpus files, a writable storage target, and an active
 24h soak before launching long gates.
+For CI or release-blocking host validation, promote preflight warnings to
+failures:
+
+```sh
+TNG_EXTERNAL_PREFLIGHT_STRICT=1 scripts/external_evidence_preflight.sh
+```
 
 ## Exported Migration Corpus
 

@@ -112,4 +112,13 @@ REPORT_DIR="$report_dir" BENCHMARK_DIR="$benchmark_dir" \
 grep -q 'certification status rollup | PASS' "$report_dir/post-soak-policy.md"
 grep -q 'Overall status: PASS' "$report_dir/post-soak-policy.md"
 
+if TNG_EXTERNAL_PREFLIGHT_STRICT=1 \
+  TNG_MIGRATION_CORPUS_DIR="$tmpdir/missing-corpus" \
+  "$ROOT/scripts/external_evidence_preflight.sh" "$report_dir/external-preflight-strict.md" >/dev/null 2>&1; then
+  echo "strict external preflight accepted missing external evidence" >&2
+  exit 1
+fi
+grep -q 'Overall status: FAIL' "$report_dir/external-preflight-strict.md"
+grep -q 'Warnings promoted to failures by TNG_EXTERNAL_PREFLIGHT_STRICT=1' "$report_dir/external-preflight-strict.md"
+
 echo "certification policy self-test: PASS"

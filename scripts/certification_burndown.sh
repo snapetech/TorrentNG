@@ -47,7 +47,7 @@ action_for() {
       printf 'Populate `testdata/migration-corpus/{qbittorrent,transmission,deluge,utorrent,biglybt,tixati,rtorrent,generic}` with real exported artifacts, then run `TNG_REQUIRE_MIGRATION_CORPUS=1 scripts/migration_corpus_certification.sh`.'
       ;;
     "External evidence preflight:PASS_WITH_WARNINGS")
-      printf 'Open the latest external preflight report, satisfy WARN rows, then rerun `scripts/external_evidence_preflight.sh` before starting long live/corpus/soak gates.'
+      printf 'Open the latest external preflight report, satisfy WARN rows, then rerun `TNG_EXTERNAL_PREFLIGHT_STRICT=1 scripts/external_evidence_preflight.sh` before starting long live/corpus/soak gates.'
       ;;
     "24h soak:STALE/INCOMPLETE")
       printf 'Start a fresh 24h soak with `scripts/start_24h_soak.sh`, monitor it with `scripts/soak_status.sh`, then finalize with `SOAK_MIN_SAMPLES=1200 RESTORE_NORMAL=1 scripts/finalize_soak.sh <report>`. If transfer-churn soak supersedes this release requirement, remove the stale 24h row from release policy instead.'

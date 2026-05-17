@@ -6,6 +6,7 @@ REPORT_DIR="${REPORT_DIR:-$ROOT/certification/reports}"
 OUT="${1:-$REPORT_DIR/external-evidence-preflight-$(date -u +%Y%m%dT%H%M%SZ).md}"
 CORPUS_DIR="${TNG_MIGRATION_CORPUS_DIR:-$ROOT/testdata/migration-corpus}"
 STORAGE_TARGET="${TNG_STORAGE_BENCH_DIR:-}"
+STRICT="${TNG_EXTERNAL_PREFLIGHT_STRICT:-0}"
 
 mkdir -p "$(dirname "$OUT")"
 
@@ -21,16 +22,23 @@ mark() {
   printf '| %s | %s | %s |\n' "$name" "$result" "$detail" >>"$OUT"
   case "$result" in
     PASS|INFO) ;;
-    WARN) warnings=$((warnings + 1)) ;;
+    WARN)
+      warnings=$((warnings + 1))
+      if [[ "$STRICT" == "1" ]]; then
+        status="FAIL"
+      fi
+      ;;
     *) status="FAIL" ;;
   esac
 }
 
 corpus_missing=0
+missing_families=()
 for family in qbittorrent transmission deluge utorrent biglybt tixati rtorrent generic; do
   dir="$CORPUS_DIR/$family"
   if [[ ! -d "$dir" ]] || [[ -z "$(find "$dir" -type f 2>/dev/null | head -1)" ]]; then
     corpus_missing=$((corpus_missing + 1))
+    missing_families+=("$family")
   fi
 done
 
@@ -41,6 +49,7 @@ done
   echo "- Commit: $(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unavailable)"
   echo "- Corpus directory: $CORPUS_DIR"
   echo "- Storage target: ${STORAGE_TARGET:-unset}"
+  echo "- Strict mode: $STRICT"
   echo
   echo "## Checks"
   echo
@@ -73,7 +82,8 @@ fi
 if [[ "$corpus_missing" -eq 0 ]]; then
   mark "migration corpus coverage" "PASS" "all source-family directories contain files"
 else
-  mark "migration corpus coverage" "WARN" "$corpus_missing source-family directories are missing evidence files"
+  missing_csv="$(IFS=,; printf '%s' "${missing_families[*]}")"
+  mark "migration corpus coverage" "WARN" "$corpus_missing source-family directories are missing evidence files: $missing_csv"
 fi
 
 if pgrep -af 'soak_certification.sh' | grep -q 'soak-24h-'; then
@@ -89,6 +99,9 @@ fi
     echo "Warnings: $warnings"
   else
     echo "Overall status: $status"
+    if [[ "$status" == "FAIL" && "$STRICT" == "1" ]]; then
+      echo "Warnings promoted to failures by TNG_EXTERNAL_PREFLIGHT_STRICT=1"
+    fi
   fi
 } >>"$OUT"
 
