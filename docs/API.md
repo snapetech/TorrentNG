@@ -32,6 +32,14 @@ Cookie: tng_session=<token>
 
 Public endpoints (never require auth): `/health`, `/metrics`, `/api/qb/v2/auth/login`
 
+## Request Correlation
+
+Non-static API responses include an `X-Request-Id` header. If a client supplies a
+bounded, printable `X-Request-Id`, TorrentNG preserves it in structured request
+logs and echoes it back; otherwise the runtime generates a `tng-N` id. Health,
+metrics, websocket, and static asset requests are intentionally excluded from
+request logging noise.
+
 ---
 
 ## Health And Capability Manifest

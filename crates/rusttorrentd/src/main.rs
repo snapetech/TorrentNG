@@ -8,7 +8,7 @@ use anyhow::Context;
 use axum::{
     body::Body,
     extract::MatchedPath,
-    http::{header, Request},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Request},
     middleware::{self, Next},
     response::Response,
 };
@@ -111,9 +111,14 @@ async fn request_log(req: Request<Body>, next: Next) -> Response {
         .extensions()
         .get::<MatchedPath>()
         .map(|matched| matched.as_str().to_owned());
-    let request_id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let request_id = request_id(req.headers());
     let started = Instant::now();
-    let response = next.run(req).await;
+    let mut response = next.run(req).await;
+    if let Ok(value) = HeaderValue::from_str(&request_id) {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static("x-request-id"), value);
+    }
     let status = response.status();
     let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
     let response_size = response
@@ -124,7 +129,7 @@ async fn request_log(req: Request<Body>, next: Next) -> Response {
     tracing::info!(
         component = "http",
         operation = "request",
-        request_id,
+        request_id = %request_id,
         method = %method,
         path = %path,
         route = route.as_deref(),
@@ -135,6 +140,24 @@ async fn request_log(req: Request<Body>, next: Next) -> Response {
         "http request completed"
     );
     response
+}
+
+fn request_id(headers: &HeaderMap) -> String {
+    headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| valid_request_id(value))
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("tng-{}", REQUEST_ID.fetch_add(1, Ordering::Relaxed)))
+}
+
+fn valid_request_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')
+        })
 }
 
 fn skip_request_log(path: &str) -> bool {
@@ -156,7 +179,8 @@ fn is_static_asset_path(path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::skip_request_log;
+    use super::{request_id, skip_request_log};
+    use axum::http::{HeaderMap, HeaderValue};
 
     #[test]
     fn request_log_skips_health_metrics_ws_and_static_assets() {
@@ -174,6 +198,22 @@ mod tests {
         }
         assert!(!skip_request_log("/api/v1/torrents"));
         assert!(!skip_request_log("/api/qb/v2/log/main"));
+    }
+
+    #[test]
+    fn request_id_accepts_bounded_safe_header_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-request-id",
+            HeaderValue::from_static("client-123.trace/4"),
+        );
+        assert_eq!(request_id(&headers), "client-123.trace/4");
+
+        headers.insert("x-request-id", HeaderValue::from_static("bad value"));
+        assert!(request_id(&headers).starts_with("tng-"));
+
+        headers.insert("x-request-id", HeaderValue::from_static(""));
+        assert!(request_id(&headers).starts_with("tng-"));
     }
 }
 
