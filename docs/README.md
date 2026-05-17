@@ -18,6 +18,9 @@ certified status.
   mode and Track 1 sidecar mode.
 - [ROADMAP.md](ROADMAP.md) - historical track plan and current native rewrite
   acceptance criteria.
+- [PROJECT_GAP_AUDIT.md](PROJECT_GAP_AUDIT.md) - current whole-project gap
+  audit across roadmaps, storage, memory, WebUI, compatibility, interop,
+  security, and release evidence.
 
 ## Deploy And Operate
 
