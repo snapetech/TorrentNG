@@ -1886,19 +1886,40 @@ pub async fn patch_torrent_trackers(
     let mut failures = Vec::new();
     for url in add {
         if let Err(e) = s.rt.add_tracker(&hash, url).await {
-            tracing::warn!("add tracker {hash} {url}: {e}");
+            tracing::warn!(
+                component = "api",
+                operation = "add_tracker",
+                torrent = %hash,
+                tracker = %redact_log_url(url),
+                error = %e,
+                "add tracker failed"
+            );
             failures.push(format!("add {url}: {e}"));
         }
     }
     for url in remove {
         if let Err(e) = s.rt.remove_tracker(&hash, url).await {
-            tracing::warn!("remove tracker {hash} {url}: {e}");
+            tracing::warn!(
+                component = "api",
+                operation = "remove_tracker",
+                torrent = %hash,
+                tracker = %redact_log_url(url),
+                error = %e,
+                "remove tracker failed"
+            );
             failures.push(format!("remove {url}: {e}"));
         }
     }
     for (orig_url, new_url) in edit {
         if let Err(e) = s.rt.edit_tracker(&hash, orig_url, new_url).await {
-            tracing::warn!("edit tracker {hash} {orig_url}: {e}");
+            tracing::warn!(
+                component = "api",
+                operation = "edit_tracker",
+                torrent = %hash,
+                tracker = %redact_log_url(orig_url),
+                error = %e,
+                "edit tracker failed"
+            );
             failures.push(format!("edit {orig_url}: {e}"));
         }
     }
@@ -2352,4 +2373,20 @@ pub async fn set_user_agent(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+fn redact_log_url(value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    if lower.starts_with("magnet:?") {
+        return "[redacted-magnet]".to_owned();
+    }
+    let without_query = value.split(['?', '#']).next().unwrap_or(value);
+    if without_query.starts_with('/')
+        || without_query.starts_with("~/")
+        || without_query.starts_with("./")
+        || without_query.starts_with("../")
+    {
+        return "[redacted-path]".to_owned();
+    }
+    without_query.to_owned()
 }

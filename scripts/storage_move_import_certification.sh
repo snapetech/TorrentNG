@@ -77,5 +77,6 @@ fi
   echo "- Set TNG_STORAGE_MOVE_IMPORT_ROOT to run the same executor on a real storage root. Increase TNG_STORAGE_MOVE_IMPORT_FILES and TNG_STORAGE_MOVE_IMPORT_MIB_PER_FILE for larger operator soaks."
 } >>"$OUT"
 
+"$ROOT/scripts/storage_certification_index.sh" >/dev/null || true
 echo "storage move/import report: $OUT"
 exit "$overall"

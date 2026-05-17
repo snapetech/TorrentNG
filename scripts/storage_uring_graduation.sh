@@ -165,5 +165,6 @@ fi
   fi
 } >>"$OUT"
 
+"$ROOT/scripts/storage_certification_index.sh" >/dev/null || true
 echo "storage uring graduation report: $OUT"
 exit "$overall"

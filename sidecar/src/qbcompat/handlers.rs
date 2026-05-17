@@ -714,7 +714,13 @@ async fn torrents_add(State(s): State<AppState>, mut multipart: Multipart) -> im
             }
             added = true;
             if let Err(e) = s.rt.load_url(url, &save_path, &category, start).await {
-                tracing::error!("qb add url {url}: {e}");
+                tracing::error!(
+                    component = "qbcompat",
+                    operation = "add_url",
+                    source = %redact_log_url(url),
+                    error = %e,
+                    "qb add url failed"
+                );
                 return "Fails.".into_response();
             }
         }
@@ -1174,7 +1180,14 @@ async fn torrents_add_trackers(
     for hash in split_hashes(&s.db, f.hashes.as_deref()) {
         for url in &urls {
             if let Err(e) = s.rt.add_tracker(&hash, url).await {
-                tracing::warn!("qb addTrackers {hash} {url}: {e}");
+                tracing::warn!(
+                    component = "qbcompat",
+                    operation = "add_tracker",
+                    torrent = %hash,
+                    tracker = %redact_log_url(url),
+                    error = %e,
+                    "qb add tracker failed"
+                );
             }
         }
     }
@@ -1205,7 +1218,14 @@ async fn torrents_remove_trackers(
 
     for url in urls {
         if let Err(e) = s.rt.remove_tracker(&hash, url).await {
-            tracing::warn!("qb removeTrackers {hash} {url}: {e}");
+            tracing::warn!(
+                component = "qbcompat",
+                operation = "remove_tracker",
+                torrent = %hash,
+                tracker = %redact_log_url(url),
+                error = %e,
+                "qb remove tracker failed"
+            );
         }
     }
     StatusCode::OK
@@ -1566,6 +1586,22 @@ mod tests {
         assert!(warning.includes_type(2));
         assert!(!warning.includes_type(4));
     }
+
+    #[test]
+    fn redact_log_url_removes_sensitive_url_parts() {
+        assert_eq!(
+            super::redact_log_url("magnet:?xt=urn:btih:abc"),
+            "[redacted-magnet]"
+        );
+        assert_eq!(
+            super::redact_log_url("https://tracker.example/announce?passkey=secret#frag"),
+            "https://tracker.example/announce"
+        );
+        assert_eq!(
+            super::redact_log_url("/data/private/file.torrent"),
+            "[redacted-path]"
+        );
+    }
 }
 
 // --- mapping helpers ---
@@ -1733,4 +1769,20 @@ fn is_status_filter(f: &str) -> bool {
             | "moving"
             | "errored"
     )
+}
+
+fn redact_log_url(value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    if lower.starts_with("magnet:?") {
+        return "[redacted-magnet]".to_owned();
+    }
+    let without_query = value.split(['?', '#']).next().unwrap_or(value);
+    if without_query.starts_with('/')
+        || without_query.starts_with("~/")
+        || without_query.starts_with("./")
+        || without_query.starts_with("../")
+    {
+        return "[redacted-path]".to_owned();
+    }
+    without_query.to_owned()
 }

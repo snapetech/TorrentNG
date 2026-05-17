@@ -277,5 +277,6 @@ done
   fi
 } >>"$OUT"
 
+"$ROOT/scripts/storage_certification_index.sh" >/dev/null || true
 echo "storage hardware report: $OUT"
 exit "$overall"
