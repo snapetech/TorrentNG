@@ -80,6 +80,6 @@ burndown:
 | Gate | Target |
 | --- | --- |
 | FD churn | open/close syscall rate at 10k seeding torrents trends to zero after warmup |
-| HDD seed locality | aggregate seed throughput at least 5x non-elevator baseline on the same dataset after scheduler wiring |
+| HDD seed locality | current readahead gate: ≥5x backend-read reduction for adjacent peer reads; future wired-elevator gate: aggregate seed throughput at least 5x non-elevator baseline on the same dataset |
 | Recheck isolation | long rechecks do not stall peer-read or foreground classes |
 | Durability | `clean_shutdown = true` is written only after configured storage sync succeeds |

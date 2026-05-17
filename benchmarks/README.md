@@ -35,3 +35,6 @@ mount:
 ```sh
 scripts/storage_real_device_benchmark.sh /path/on/storage
 ```
+
+Recent hardware results are tracked in
+`benchmarks/STORAGE_REAL_DEVICE_RESULTS.md`.
