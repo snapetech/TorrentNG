@@ -134,9 +134,41 @@ async fn request_log(req: Request<Body>, next: Next) -> Response {
 fn skip_request_log(path: &str) -> bool {
     path == "/health"
         || path == "/metrics"
+        || path == "/ws"
         || path == "/favicon.ico"
         || path.starts_with("/assets/")
         || path.starts_with("/static/")
+        || is_static_asset_path(path)
+}
+
+fn is_static_asset_path(path: &str) -> bool {
+    matches!(
+        path.rsplit_once('.').map(|(_, ext)| ext),
+        Some("css" | "js" | "map" | "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "ico")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::skip_request_log;
+
+    #[test]
+    fn request_log_skips_health_metrics_ws_and_static_assets() {
+        for path in [
+            "/health",
+            "/metrics",
+            "/ws",
+            "/favicon.ico",
+            "/assets/app.js",
+            "/static/theme.css",
+            "/index.css",
+            "/logo.svg",
+        ] {
+            assert!(skip_request_log(path), "{path}");
+        }
+        assert!(!skip_request_log("/api/v1/torrents"));
+        assert!(!skip_request_log("/api/qb/v2/log/main"));
+    }
 }
 
 fn load_config() -> Config {
