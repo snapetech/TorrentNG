@@ -2911,8 +2911,7 @@ impl Engine {
     }
 
     #[allow(dead_code)]
-    #[allow(dead_code)]
-    fn completed_storage_plan_steps_legacy(&self, job_id: &str) -> Vec<usize> {
+    fn completed_storage_plan_steps(&self, job_id: &str) -> Vec<usize> {
         let db = self.db.lock().expect("database mutex poisoned");
         let Ok(job) = rt_db::get_job(&db, job_id) else {
             return Vec::new();
@@ -2922,105 +2921,6 @@ impl Engine {
         }
         let checkpoint = job.checkpoint.max(0) as usize;
         (0..checkpoint).collect()
-    }
-
-    #[allow(dead_code)]
-    #[allow(dead_code)]
-    fn persist_storage_plan_step_checkpoint_legacy(
-        &self,
-        job_id: &str,
-        step_index: usize,
-        step: &StoragePlanStep,
-    ) {
-        let now = unix_now_i64();
-        let completed = step_index.saturating_add(1) as i64;
-        let mut job = {
-            let db = self.db.lock().expect("database mutex poisoned");
-            match rt_db::get_job(&db, job_id) {
-                Ok(job) => job,
-                Err(e) => {
-                    warn!(job_id, err = %e, "failed to load storage plan job");
-                    return;
-                }
-            }
-        };
-        if job.kind != JOB_KIND_STORAGE_PLAN {
-            warn!(job_id, kind = %job.kind, "refusing storage plan checkpoint for non-storage job");
-            return;
-        }
-        job.state = JOB_STATE_RUNNING.to_owned();
-        job.done = completed;
-        job.checkpoint = completed;
-        job.file_index = Some(completed);
-        let step_bytes = i64::try_from(step.bytes).unwrap_or(i64::MAX);
-        job.byte_offset = Some(job.byte_offset.unwrap_or(0).saturating_add(step_bytes));
-        job.verified_bytes = job.verified_bytes.saturating_add(step_bytes);
-        job.updated_at = now;
-        if job.started_at.is_none() {
-            job.started_at = Some(now);
-        }
-        let event = rt_db::JobEventRow {
-            event_id: None,
-            job_id: job_id.to_owned(),
-            occurred_at: now,
-            kind: "storage_plan_checkpoint".to_owned(),
-            message: Some(format!("storage plan step {step_index} completed")),
-            payload: storage_plan_step_checkpoint_payload(step_index, step, completed),
-        };
-        let db = self.db.lock().expect("database mutex poisoned");
-        if let Err(e) = rt_db::upsert_job(&db, &job) {
-            warn!(job_id, err = %e, "failed to persist storage plan checkpoint");
-            return;
-        }
-        if let Err(e) = rt_db::append_job_event(&db, &event) {
-            warn!(job_id, err = %e, "failed to append storage plan checkpoint event");
-        }
-    }
-
-    #[allow(dead_code)]
-    fn complete_storage_plan_step_job_legacy(&self, job_id: &str) {
-        let now = unix_now_i64();
-        let mut job = {
-            let db = self.db.lock().expect("database mutex poisoned");
-            match rt_db::get_job(&db, job_id) {
-                Ok(job) => job,
-                Err(e) => {
-                    warn!(job_id, err = %e, "failed to load storage plan job");
-                    return;
-                }
-            }
-        };
-        if job.kind != JOB_KIND_STORAGE_PLAN {
-            warn!(job_id, kind = %job.kind, "refusing storage plan completion for non-storage job");
-            return;
-        }
-        job.state = JOB_STATE_COMPLETED.to_owned();
-        job.done = job.total;
-        job.checkpoint = job.total;
-        job.file_index = Some(job.total);
-        job.updated_at = now;
-        job.finished_at = Some(now);
-        let event = rt_db::JobEventRow {
-            event_id: None,
-            job_id: job_id.to_owned(),
-            occurred_at: now,
-            kind: "storage_plan_completed".to_owned(),
-            message: Some("storage plan completed".to_owned()),
-            payload: serde_json::json!({
-                "done": job.done,
-                "total": job.total,
-                "state": JOB_STATE_COMPLETED,
-            })
-            .to_string(),
-        };
-        let db = self.db.lock().expect("database mutex poisoned");
-        if let Err(e) = rt_db::upsert_job(&db, &job) {
-            warn!(job_id, err = %e, "failed to persist storage plan completion");
-            return;
-        }
-        if let Err(e) = rt_db::append_job_event(&db, &event) {
-            warn!(job_id, err = %e, "failed to append storage plan completion event");
-        }
     }
 
     fn update_job_state(
@@ -3362,23 +3262,6 @@ pub(crate) fn row_from_entry(entry: &TorrentEntry, meta: &TorrentMeta) -> Torren
         ratio: entry.stats.ratio(),
         trackers: meta_all_trackers(meta),
     }
-}
-
-#[allow(dead_code)]
-fn storage_plan_step_checkpoint_payload(
-    step_index: usize,
-    step: &StoragePlanStep,
-    completed: i64,
-) -> String {
-    serde_json::json!({
-        "step_index": step_index,
-        "completed_steps": completed,
-        "action": format!("{:?}", step.action),
-        "source": step.source.as_ref().map(|path| path.to_string_lossy().to_string()),
-        "destination": step.destination.as_ref().map(|path| path.to_string_lossy().to_string()),
-        "bytes": step.bytes,
-    })
-    .to_string()
 }
 
 fn persist_torrent_files(
@@ -5201,7 +5084,7 @@ mod tests {
         assert_eq!(job.byte_offset, Some(128));
         drop(db);
 
-        assert_eq!(engine.completed_storage_plan_steps_legacy(&job_id), vec![0]);
+        assert_eq!(engine.completed_storage_plan_steps(&job_id), vec![0]);
 
         engine
             .persist_storage_plan_checkpoint(&job_id, "move", &plan, &[0, 1])
