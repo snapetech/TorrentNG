@@ -337,6 +337,11 @@ impl PiecePicker {
         }
     }
 
+    /// Drop all outstanding block request bookkeeping without marking data complete.
+    pub fn reset_outstanding_requests(&mut self) {
+        self.in_progress.clear();
+    }
+
     pub fn is_complete(&self) -> bool {
         self.wanted
             .iter()
@@ -503,6 +508,23 @@ mod tests {
         p.cancel_request(0, r1.begin);
         let r3 = p.pick(&all).unwrap();
         assert_eq!(r3.begin, r1.begin);
+    }
+
+    #[test]
+    fn reset_outstanding_requests_makes_blocks_available_again() {
+        let mut p = picker_1piece(MAX_BLOCK_SIZE * 2);
+        p.availability.add_have(0);
+        let all = peer_has_all(1);
+        let r1 = p.pick(&all).unwrap();
+        let r2 = p.pick(&all).unwrap();
+        assert!(p.pick(&all).is_none());
+
+        p.reset_outstanding_requests();
+
+        let again = p.pick(&all).unwrap();
+        let next = p.pick(&all).unwrap();
+        assert_eq!(again.begin, r1.begin);
+        assert_eq!(next.begin, r2.begin);
     }
 
     #[test]

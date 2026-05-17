@@ -951,6 +951,7 @@ impl TorrentTask {
 
         let peer_has_all = vec![true; self.meta.pieces.len()];
         let Some(req) = self.picker.pick(&peer_has_all) else {
+            self.picker.reset_outstanding_requests();
             debug!(torrent = %self.info_hash_hex, "webseed skipped: no requestable block");
             return;
         };
