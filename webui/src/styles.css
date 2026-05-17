@@ -142,4 +142,17 @@ input[type="radio"]:not(:disabled):hover {
     border-right: 0 !important;
     border-bottom: 1px solid var(--border);
   }
+
+  .torrent-detail {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 36px;
+    z-index: 60;
+    width: auto !important;
+    max-height: min(52vh, 430px);
+    border-left: 0 !important;
+    border-top: 1px solid var(--border-strong);
+    box-shadow: 0 -18px 42px var(--shadow);
+  }
 }

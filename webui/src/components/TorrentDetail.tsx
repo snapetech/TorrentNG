@@ -125,7 +125,7 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
   const isRunning = t.is_open && t.is_active
 
   return (
-    <aside style={{
+    <aside className="torrent-detail" style={{
       width: 340, background: 'var(--bg)', borderLeft: '1px solid var(--border)',
       display: 'flex', flexDirection: 'column', flexShrink: 0, fontSize: 12,
     }}>
