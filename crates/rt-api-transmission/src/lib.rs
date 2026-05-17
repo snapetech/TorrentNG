@@ -88,9 +88,13 @@ async fn rpc(
         .get("method")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let args = body.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let snake_case_rpc = method.contains('_');
+    let method_key = method.replace('_', "-");
+    let args = normalize_transmission_request_keys(
+        body.get("arguments").cloned().unwrap_or_else(|| json!({})),
+    );
     let tag = body.get("tag").cloned();
-    let result = match method {
+    let result = match method_key.as_str() {
         "session-get" => Ok(session_get(&state).await),
         "session-stats" => Ok(session_stats(&state).await),
         "session-close" => Ok(json!({})),
@@ -186,7 +190,14 @@ async fn rpc(
         _ => Err("method name not recognized".to_owned()),
     };
     let (result, arguments) = match result {
-        Ok(arguments) => ("success".to_owned(), arguments),
+        Ok(arguments) => {
+            let arguments = if snake_case_rpc {
+                transmission_response_to_snake_case(arguments)
+            } else {
+                arguments
+            };
+            ("success".to_owned(), arguments)
+        }
         Err(result) => (result, json!({})),
     };
     let mut response = json!({"result": result, "arguments": arguments});
@@ -422,6 +433,68 @@ fn response(tag: Option<Value>, result: &str, arguments: Value) -> Value {
     response
 }
 
+fn normalize_transmission_request_keys(value: Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, value)| {
+                    (
+                        key.replace('_', "-"),
+                        normalize_transmission_request_keys(value),
+                    )
+                })
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(
+            values
+                .into_iter()
+                .map(normalize_transmission_request_keys)
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+fn transmission_response_to_snake_case(value: Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, value)| {
+                    (
+                        transmission_key_to_snake_case(&key),
+                        transmission_response_to_snake_case(value),
+                    )
+                })
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(
+            values
+                .into_iter()
+                .map(transmission_response_to_snake_case)
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+fn transmission_key_to_snake_case(key: &str) -> String {
+    if key.contains('-') {
+        return key.replace('-', "_");
+    }
+    let mut out = String::with_capacity(key.len());
+    for (idx, ch) in key.chars().enumerate() {
+        if ch.is_ascii_uppercase() {
+            if idx > 0 {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 async fn session_get(state: &AppState) -> Value {
     let limits = transmission_global_limits(state).await;
     let session = state.session.read().await.clone();
@@ -549,7 +622,8 @@ async fn torrent_get(state: &AppState, args: &Value) -> Value {
             let meta = metadata.get(&entry.info_hash);
             let mut obj = serde_json::Map::new();
             for field in &fields {
-                let value = match field.as_str() {
+                let normalized_field = field.replace('_', "-");
+                let value = match normalized_field.as_str() {
                     "id" => json!(idx + 1),
                     "hashString" | "hash-string" => json!(entry.info_hash),
                     "name" => json!(entry.name),
@@ -659,8 +733,9 @@ async fn torrent_get(state: &AppState, args: &Value) -> Value {
 }
 
 fn transmission_field_needs_peers(field: &str) -> bool {
+    let field = field.replace('_', "-");
     matches!(
-        field,
+        field.as_str(),
         "peers"
             | "peersConnected"
             | "peers-connected"
@@ -1247,6 +1322,61 @@ mod tests {
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["arguments"]["queue-stalled-enabled"], true);
         assert_eq!(body["arguments"]["queue-stalled-minutes"], 7);
+    }
+
+    #[tokio::test]
+    async fn transmission_snake_case_rpc_roundtrips_v41_shape() {
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        {
+            let mut reg = registry.write().await;
+            let mut entry = TorrentEntry::new("d".repeat(40), "delta".into(), "/old".into());
+            entry.total_length = 100;
+            entry.amount_left = 40;
+            reg.add(entry).unwrap();
+        }
+        let app = build_transmission_router(AppState::new(Arc::clone(&registry)));
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .header("content-type", "application/json")
+                    .header("x-transmission-session-id", SESSION_ID)
+                    .body(Body::from(
+                        r#"{"method":"session_set","arguments":{"queue_stalled_enabled":true,"queue_stalled_minutes":9}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .header("content-type", "application/json")
+                    .header("x-transmission-session-id", SESSION_ID)
+                    .body(Body::from(
+                        r#"{"method":"torrent_get","arguments":{"fields":["hash_string","percent_done","left_until_done","download_dir"]}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["result"], "success");
+        assert_eq!(
+            body["arguments"]["torrents"][0]["hash_string"],
+            "d".repeat(40)
+        );
+        assert_eq!(body["arguments"]["torrents"][0]["percent_done"], 0.6);
+        assert_eq!(body["arguments"]["torrents"][0]["left_until_done"], 40);
+        assert_eq!(body["arguments"]["torrents"][0]["download_dir"], "/old");
     }
 
     #[tokio::test]

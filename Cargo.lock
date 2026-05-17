@@ -1460,6 +1460,7 @@ version = "0.1.0"
 dependencies = [
  "rt-bencode",
  "rt-db",
+ "rt-fastresume",
  "rt-metainfo",
  "rusqlite",
  "serde",
@@ -1534,6 +1535,7 @@ name = "rt-storage"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "libc",
  "rt-hash",
  "rt-path",
  "rt-piece-map",

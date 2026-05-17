@@ -111,6 +111,14 @@ pub async fn app_send_test_email() -> impl IntoResponse {
     StatusCode::OK
 }
 
+pub async fn app_get_cookies() -> impl IntoResponse {
+    (StatusCode::OK, Json(serde_json::json!([])))
+}
+
+pub async fn app_set_cookies() -> impl IntoResponse {
+    StatusCode::OK
+}
+
 pub async fn app_network_interface_list() -> impl IntoResponse {
     (
         StatusCode::OK,

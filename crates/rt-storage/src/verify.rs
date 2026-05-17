@@ -1,8 +1,6 @@
 use std::path::Path;
 
-use rt_hash::{merkle_root, BlockHash};
 use rt_path::SafeRelPath;
-use sha1::{Digest, Sha1};
 use tracing::instrument;
 
 use rt_piece_map::{FileRegion, PieceMap};
@@ -79,11 +77,15 @@ impl<'a> PieceVerifier<'a> {
             }
         };
 
-        let mut hasher = Sha1::new();
+        let total_len = regions
+            .iter()
+            .map(|region| region.length as usize)
+            .sum::<usize>();
+        let mut piece_data = Vec::with_capacity(total_len);
 
         for region in &regions {
             match self.read_region(region).await {
-                Ok(data) => hasher.update(&data),
+                Ok(data) => piece_data.extend_from_slice(&data),
                 Err(e) => {
                     tracing::warn!(piece, file_index = region.file_index, error = %e, "file read failed during verify");
                     return VerifyResult::Missing {
@@ -94,7 +96,19 @@ impl<'a> PieceVerifier<'a> {
             }
         }
 
-        let actual: [u8; 20] = hasher.finalize().into();
+        let actual = match self
+            .scheduler
+            .hash_sha1(bytes::Bytes::from(piece_data))
+            .await
+        {
+            Ok(hash) => hash,
+            Err(e) => {
+                return VerifyResult::Missing {
+                    file_index: 0,
+                    reason: e.to_string(),
+                }
+            }
+        };
         if &actual == expected {
             tracing::debug!(piece, "piece valid");
             VerifyResult::Valid
@@ -203,19 +217,20 @@ impl<'a> V2FileVerifier<'a> {
         while offset < file.length {
             let len = (file.length - offset).min(Self::LEAF_SIZE as u64) as usize;
             let data = scheduled_read(self.scheduler, IoClass::Recheck, &path, offset, len).await?;
-            leaves.push(BlockHash::of(&data).0);
+            leaves.push(self.scheduler.hash_v2_leaf(data).await?);
             offset += len as u64;
         }
         if leaves.is_empty() {
-            leaves.push(BlockHash::of(&[]).0);
+            leaves.push(self.scheduler.hash_v2_leaf(bytes::Bytes::new()).await?);
         }
-        Ok(merkle_root(&leaves))
+        self.scheduler.hash_v2_root(leaves).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rt_hash::{merkle_root, BlockHash};
     use rt_path::SafeRelPath;
     use rt_piece_map::{FileSpan, PieceMap};
     use sha1::{Digest, Sha1};

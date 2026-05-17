@@ -12,6 +12,7 @@ tracing.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "sync", "rt"] }
 bytes.workspace = true
 sha1.workspace = true
+libc = "0.2"
 rt-hash = { path = "../rt-hash" }
 rt-path = { path = "../rt-path" }
 rt-piece-map = { path = "../rt-piece-map" }

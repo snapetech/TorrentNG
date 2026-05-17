@@ -20,6 +20,12 @@ pub enum StorageError {
     FileNotFound { path: String },
     #[error("operation cancelled")]
     Cancelled,
+    #[error("short I/O on {path}: expected {expected} bytes, got {actual}")]
+    ShortIo {
+        path: String,
+        expected: usize,
+        actual: usize,
+    },
     #[error("scheduler queue full (mount: {mount})")]
     QueueFull { mount: String },
     #[error("staged move failed at step {step}: {reason}")]

@@ -120,3 +120,46 @@ This is the working checklist for finishing the native Rust engine rewrite. It i
 - [x] Project Transmission per-file completion from torrent bytes done.
 - [x] Make public Linux ISO certification fail when `PUBLIC_TRANSFER=1` does not complete in the configured timeout.
 - [x] Add focused regression tests for qBit `rid` and Transmission file completion.
+
+## 12. Storage NG (next-gen disk I/O)
+
+See `docs/STORAGE_NG.md` for the full design. Phases A–D are independently
+shippable and benchmarkable.
+
+### Phase A — parity floor (behind existing rt-storage API)
+
+- [ ] Add `DiskBackend` trait with `PreadBackend` (dedicated bounded blocking pool, separate from Tokio's).
+- [ ] Replace `seek`+`read`/`write` with positioned `pread`/`pwrite`.
+- [ ] Add path-keyed `HandleCache` (LRU + idle-TTL sweep), capacity bounded to `RLIMIT_NOFILE`.
+- [ ] Raise `RLIMIT_NOFILE` toward the hard limit at startup; reserve fds for sockets.
+- [ ] Add global `FramePool` (size classes, hard byte cap, backpressure → `QueueFull`).
+- [ ] Call `create_dir_all` once per file at allocation, not per block.
+- [ ] Keep `scheduled_read`/`scheduled_write`/`PieceVerifier` signatures stable.
+- [ ] Bench: open/close syscall rate at 10k seeding torrents drops to ~0.
+
+### Phase B — per-device elevator + topology
+
+- [ ] Resolve storage roots to physical `DeviceId` (`/sys/block`, rotational, dm/RAID, mergerfs/ZFS/btrfs).
+- [ ] Auto-detect `StorageProfile` instead of defaulting to `Unknown`.
+- [ ] Implement `DeviceElevator`: offset-sorted, coalescing, deadline + `choke_critical` promotion.
+- [ ] Wire `MountScheduler` permit to elevator submission; per-class weights from `IoClass`.
+- [ ] Topology-derived preallocation policy (`fallocate` on rotational non-CoW only).
+- [ ] Bench: HDD aggregate seed throughput ≥ 5× non-elevator baseline on same dataset.
+
+### Phase C — tiered torrents (scale unlock)
+
+- [ ] Introduce Dormant/Warm/Hot tiers orthogonal to `TorrentState`.
+- [ ] Shared timer-wheel reactor for Dormant torrents (no task/channel/fd per torrent).
+- [ ] Promote to Hot on inbound peer/announce; demote on peer drain + idle.
+- [ ] Dormant torrents hold only piece bitmap (mmap-backed/compressed) + tracker deadline.
+- [ ] Bench: 100k torrents ≤2% active → ≤1 Tokio task per Hot torrent; idle RSS within target.
+
+### Phase D — efficiency
+
+- [ ] `UringBackend` (registered fds + fixed buffers + batched submit), probe-selected.
+- [ ] Group-commit per-device `fdatasync` barrier; fastresume watermark gated on barrier.
+- [ ] Bounded post-crash recheck (only pieces written since last barrier).
+- [ ] Piece-aggregated writes; hash from RAM on dedicated hashing pool; delete read-after-write verify.
+- [ ] Adaptive per-connection readahead + `posix_fadvise` page-cache stewardship (`DONTNEED`/`SEQUENTIAL`).
+- [ ] `SEEK_HOLE`/`SEEK_DATA`-aware recheck sweep.
+- [ ] Bench: kill -9 under write load → bounded recheck, zero silent corruption.

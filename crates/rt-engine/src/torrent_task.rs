@@ -223,6 +223,7 @@ pub struct TorrentTask {
     webseed_next_index: usize,
     webseed_failures: Vec<u8>,
     last_progress_persist: Option<Instant>,
+    prepared_files: Mutex<HashSet<u32>>,
     paused: bool,
     max_peers: usize,
 }
@@ -308,6 +309,7 @@ impl TorrentTask {
             webseed_next_index: 0,
             webseed_failures,
             last_progress_persist: None,
+            prepared_files: Mutex::new(HashSet::new()),
             paused,
             max_peers,
         };
@@ -1761,9 +1763,8 @@ impl TorrentTask {
                 .find(|file| file.index == region.file_index)
                 .ok_or_else(|| anyhow::anyhow!("file index {} out of range", region.file_index))?;
             let path = file.path.resolve(&self.save_root);
-            if let Some(parent) = path.parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
+            self.prepare_file_once(file.index, &path, file.length)
+                .await?;
             let end = data_offset + region.length as usize;
             let data = bytes::Bytes::copy_from_slice(&block.data[data_offset..end]);
             scheduled_write(
@@ -1778,6 +1779,34 @@ impl TorrentTask {
             data_offset = end;
         }
 
+        Ok(())
+    }
+
+    async fn prepare_file_once(
+        &self,
+        file_index: u32,
+        path: &std::path::Path,
+        len: u64,
+    ) -> anyhow::Result<()> {
+        {
+            let prepared = self
+                .prepared_files
+                .lock()
+                .expect("prepared file registry mutex poisoned");
+            if prepared.contains(&file_index) {
+                return Ok(());
+            }
+        }
+
+        self.storage
+            .prepare_file(path, len, self.storage.io_config().preallocation_mode)
+            .await?;
+
+        let mut prepared = self
+            .prepared_files
+            .lock()
+            .expect("prepared file registry mutex poisoned");
+        prepared.insert(file_index);
         Ok(())
     }
 
@@ -1947,7 +1976,7 @@ impl TorrentTask {
             .collect();
         state.uploaded_bytes = uploaded;
         state.downloaded_bytes = downloaded;
-        state.clean_shutdown = true;
+        state.clean_shutdown = self.sync_before_clean_fastresume().await;
         state.file_hints = match collect_file_hints(&self.save_root, &self.meta) {
             Ok(hints) => hints,
             Err(e) => {
@@ -1972,6 +2001,25 @@ impl TorrentTask {
                 err = %e,
                 "failed to save fastresume state"
             );
+        }
+    }
+
+    async fn sync_before_clean_fastresume(&self) -> bool {
+        match self.storage.io_config().durability_mode {
+            rt_storage::DurabilityMode::Fast => true,
+            rt_storage::DurabilityMode::Checkpoint | rt_storage::DurabilityMode::Strict => {
+                match self.storage.sync_all_open_files().await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        warn!(
+                            torrent = %self.info_hash_hex,
+                            err = %e,
+                            "failed to sync torrent files before clean fastresume save"
+                        );
+                        false
+                    }
+                }
+            }
         }
     }
 }

@@ -190,6 +190,7 @@ async fn recheck_does_not_starve_seeding_peer_reads() {
             max_queue: 256,
             recheck_concurrency: 1,
             peer_read_concurrency: 4,
+            ..Default::default()
         },
     );
     let _recheck = scheduler.acquire(IoClass::Recheck).await.unwrap();

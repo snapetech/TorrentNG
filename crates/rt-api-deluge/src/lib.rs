@@ -205,12 +205,9 @@ async fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Va
         "core.get_external_ip" => Ok(json!("")),
         "core.get_path_size" => Ok(json!(0)),
         "core.get_cache_status" => cache_status(state).await,
-        "core.get_config" => Ok(json!({
-            "download_location": "/downloads",
-            "move_completed": false,
-            "max_download_speed": -1.0,
-            "max_upload_speed": -1.0,
-        })),
+        "core.get_config" => Ok(deluge_config()),
+        "core.get_config_values" => Ok(deluge_config_values(params.first())),
+        "core.get_config_value" => Ok(deluge_config_value(params.first())),
         "core.get_enabled_plugins" => Ok(json!(deluge_plugins())),
         "core.enable_plugin" | "core.disable_plugin" => Ok(json!(true)),
         "core.get_available_plugins" => Ok(json!(deluge_plugins())),
@@ -229,6 +226,7 @@ fn supported_methods() -> Vec<&'static str> {
         "daemon.login",
         "daemon.info",
         "daemon.get_method_list",
+        "daemon.shutdown",
         "web.connected",
         "web.update_ui",
         "web.get_events",
@@ -236,8 +234,13 @@ fn supported_methods() -> Vec<&'static str> {
         "web.get_host_status",
         "web.connect",
         "web.disconnect",
+        "web.start_daemon",
+        "web.stop_daemon",
         "web.get_plugins",
         "web.get_plugin_info",
+        "web.upload_plugin",
+        "web.update_config",
+        "web.save_config",
         "web.get_torrent_files",
         "core.get_torrents_status",
         "core.get_torrent_status",
@@ -245,6 +248,10 @@ fn supported_methods() -> Vec<&'static str> {
         "core.get_session_state",
         "core.get_session_status",
         "core.get_stats",
+        "core.get_num_connections",
+        "core.get_download_rate",
+        "core.get_upload_rate",
+        "core.get_filter_tree",
         "core.pause_torrent",
         "core.resume_torrent",
         "core.force_recheck",
@@ -258,15 +265,28 @@ fn supported_methods() -> Vec<&'static str> {
         "core.set_torrent_options",
         "core.set_torrent_file_priorities",
         "core.set_torrent_trackers",
+        "core.set_torrent_prioritize_first_last",
+        "core.connect_peer",
+        "core.rename_files",
+        "core.rename_folder",
         "core.move_storage",
         "core.get_config",
+        "core.get_config_values",
+        "core.get_config_value",
         "core.set_config",
         "core.get_free_space",
         "core.get_listen_port",
         "core.get_external_ip",
+        "core.get_path_size",
+        "core.get_cache_status",
         "core.get_enabled_plugins",
+        "core.enable_plugin",
+        "core.disable_plugin",
         "core.get_available_plugins",
         "core.get_libtorrent_version",
+        "core.create_torrent",
+        "core.upload_plugin",
+        "core.rescan_plugins",
         "label.get_labels",
         "label.add",
         "label.remove",
@@ -274,7 +294,68 @@ fn supported_methods() -> Vec<&'static str> {
         "label.set_torrent",
         "notifications.get_handled_events",
         "notifications.get_subscriptions",
+        "notifications.set_config",
+        "notifications.add_subscription",
     ]
+}
+
+fn deluge_config() -> Value {
+    json!({
+        "download_location": "/downloads",
+        "move_completed": false,
+        "move_completed_path": "/downloads",
+        "copy_torrent_file": false,
+        "torrentfiles_location": "/downloads",
+        "autoadd_enable": false,
+        "autoadd_location": "/watch",
+        "max_download_speed": -1.0,
+        "max_upload_speed": -1.0,
+        "max_connections_global": -1,
+        "max_upload_slots_global": -1,
+        "max_active_limit": -1,
+        "max_active_downloading": -1,
+        "max_active_seeding": -1,
+        "queue_new_to_top": false,
+        "ignore_limits_on_local_network": true,
+        "share_ratio_limit": -1.0,
+        "seed_time_ratio_limit": -1.0,
+        "seed_time_limit": -1,
+        "stop_seed_at_ratio": false,
+        "stop_seed_ratio": 2.0,
+        "remove_seed_at_ratio": false,
+        "listen_ports": [0, 0],
+        "random_port": true,
+        "dht": true,
+        "upnp": false,
+        "natpmp": false,
+        "utpex": true,
+        "lsd": false,
+        "enc_in_policy": 1,
+        "enc_out_policy": 1,
+        "enc_level": 2,
+    })
+}
+
+fn deluge_config_values(keys: Option<&Value>) -> Value {
+    let config = deluge_config();
+    let Some(keys) = keys.and_then(Value::as_array) else {
+        return config;
+    };
+    let mut out = serde_json::Map::new();
+    for key in keys.iter().filter_map(Value::as_str) {
+        out.insert(
+            key.to_owned(),
+            config.get(key).cloned().unwrap_or(Value::Null),
+        );
+    }
+    Value::Object(out)
+}
+
+fn deluge_config_value(key: Option<&Value>) -> Value {
+    let Some(key) = key.and_then(Value::as_str) else {
+        return Value::Null;
+    };
+    deluge_config().get(key).cloned().unwrap_or(Value::Null)
 }
 
 async fn move_storage(state: &AppState, params: &[Value]) -> Result<Value, String> {

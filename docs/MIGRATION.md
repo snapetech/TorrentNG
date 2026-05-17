@@ -149,6 +149,37 @@ then apply the import from integration tooling. Manual fallback remains:
 
 ---
 
+## Migrating from Deluge, uTorrent, BitTorrent Classic, BiglyBT/Vuze, or Tixati
+
+The native migration crate also scans common state directories from these
+clients. It imports `.torrent` metadata, save paths, labels/categories, transfer
+counters, lifecycle timestamps, active/paused state, per-file wanted/priority
+state, per-file completed bytes, trackers, generic tracker timing/scrape state,
+and any compatible fast-resume piece state it can decode.
+
+Current fast-resume confidence:
+
+- rTorrent: complete `.rtorrent` sidecars can synthesize seed piece state when
+  matching files are present; incomplete or unsupported sidecars fall back to
+  verification.
+- Deluge: libtorrent-style resume data is imported like qBittorrent.
+- uTorrent/BitTorrent classic: aggregate `resume.dat` entries keyed by raw,
+  hex, or base32 info-hash are imported when matching `.torrent` files are
+  present.
+- BiglyBT/Vuze: aggregate `downloads.config` entries keyed by info-hash are
+  imported, including nested resume bitfields when present.
+- Tixati: metadata scanning is available; proprietary progress state remains
+  verification-first until a strict decoder is added.
+
+Use dry-run output before applying any import. The source directories are read
+only. Dry-run reports include trusted, hints, metadata-only, and none counts so
+operators can see how much state will avoid a full recheck. Low-confidence or
+unsupported resume data is downgraded to normal verification rather than trusted
+as complete. Piece-state length mismatches are reported and normalized to the
+torrent piece count before native fast-resume state is written.
+
+---
+
 ## Path remapping
 
 If your download directories are in different locations in the new setup, you need to remap paths before adding torrents.
@@ -163,6 +194,14 @@ The native and sidecar API surfaces both support per-torrent save path updates.
 Bulk moves should use the native storage planning flow so conflicts, capacity,
 copy/rename mode, rollback, and destructive delete approval are visible before
 data moves.
+
+Native migration tooling can also apply path remaps during dry-run/import. A
+remap such as `/downloads -> /data` is used both for file-hint validation, so
+trusted fast-resume state can be recognized after moving into a container, and
+for the native DB save path written during import.
+
+For native engine imports, use the combined native import path so DB rows and
+compatible fast-resume state are written together under one audited summary.
 
 ---
 

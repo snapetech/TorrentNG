@@ -125,6 +125,11 @@ metadata_only           — no file I/O (metadata/announce only)
 - Mount identity and free space awareness
 - Filesystem type detection
 - Per-mount queue depth and read/write concurrency limits
+- Bounded open-file cache with idle eviction and descriptor budgeting
+- Positioned reads/writes; no shared seek cursor in torrent block I/O
+- File preparation and preallocation before first download write
+- Explicit durability checkpoints before trusting clean fastresume state
+- Peer-read locality through internal readahead/coalescing while returning exact requested bytes
 - HDD vs SSD/NVMe I/O profile
 - Sequential vs random pressure awareness
 - Priority: recheck < background seeding < active downloads < active streams (future)

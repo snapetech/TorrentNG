@@ -11,5 +11,8 @@ pub use plan::{
     ImportPlanRequest, MovePlanRequest, PlanIssue, PlannedStorageAction, StoragePlan,
     StoragePlanStep,
 };
-pub use scheduler::{IoRequest, MountScheduler, SchedulerConfig};
+pub use scheduler::{
+    DurabilityMode, FilePoolStats, IoRequest, MountScheduler, PreallocationMode, SchedulerConfig,
+    StorageIoConfig, StorageIoStats,
+};
 pub use verify::{PieceVerifier, V2FileHash, V2FileVerifier, VerifyResult};

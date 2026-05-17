@@ -82,6 +82,7 @@ fn qbit_15k_dry_run_import_is_certified() {
     let import = plan.to_db_import(&ImportOptions {
         default_save_path: None,
         added_at: 1_700_000_000,
+        ..ImportOptions::default()
     });
     assert_eq!(import.torrents.len(), IMPORT_CERT_TORRENTS);
     assert_eq!(

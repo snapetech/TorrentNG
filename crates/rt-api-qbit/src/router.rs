@@ -26,6 +26,8 @@ fn qbit_routes() -> Router<AppState> {
             "/app/sendTestEmail",
             get(app_send_test_email).post(app_send_test_email),
         )
+        .route("/app/getCookies", get(app_get_cookies))
+        .route("/app/setCookies", post(app_set_cookies))
         .route("/app/networkInterfaceList", get(app_network_interface_list))
         .route(
             "/app/networkInterfaceAddressList",
