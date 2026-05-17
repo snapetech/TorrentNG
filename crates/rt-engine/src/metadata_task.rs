@@ -132,6 +132,9 @@ pub async fn run_metadata_task(
                     TorrentCmd::GetPeers { reply } => {
                         let _ = reply.send(Vec::new());
                     }
+                    TorrentCmd::GetRuntimeStats { reply } => {
+                        let _ = reply.send(Default::default());
+                    }
                     TorrentCmd::Recheck { .. }
                     | TorrentCmd::CancelJob { .. }
                     | TorrentCmd::ReloadFilePolicy => {}

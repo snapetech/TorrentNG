@@ -359,6 +359,14 @@ rTorrent over XMLRPC.
 | `rtorrentng_torrents_stopped` | gauge | Stopped |
 | `rtorrentng_torrents_errored` | gauge | In error state |
 | `rtorrentng_peers_connected` | gauge | Connected peers across all torrents |
+| `rtorrentng_storage_file_pool_*` | gauge/counter | Native scheduler open-file cache capacity, open files, hits, misses, evictions, and idle closes |
+| `rtorrentng_storage_*_queue_depth` | gauge | Native disk I/O and hashing queue depths |
+| `rtorrentng_storage_{read,write}_ops_total` | counter | Positioned disk operations through native schedulers |
+| `rtorrentng_storage_bytes_{read,written}_total` | counter | Bytes moved through native schedulers |
+| `rtorrentng_storage_{sync,hash}_ops_total` | counter | Durability syncs and hashing-pool work |
+| `rtorrentng_storage_preallocation_*_total` | counter | Preallocation failures and fallback events |
+| `rtorrentng_storage_peer_read_cache_*` | gauge/counter | Peer-read readahead cache entries, hits, and misses |
+| `rtorrentng_piece_assembly_*` | gauge/counter | In-memory completed-piece assembly buffers, bytes, and budget evictions |
 | `rtorrentng_api_requests_total` | counter | API requests served |
 | `rtorrentng_sync_cycles_total` | counter | Track 1 sidecar rTorrent sync cycles completed |
 | `rtorrentng_sync_errors_total` | counter | Track 1 sidecar rTorrent sync cycle errors |

@@ -51,7 +51,7 @@ use rt_tracker::{
 };
 
 use crate::peer_id::OUR_PEER_ID;
-use crate::EnginePeerSnapshot;
+use crate::{EnginePeerSnapshot, TorrentRuntimeStats};
 
 const LOCAL_UT_METADATA_ID: u8 = 1;
 const LOCAL_UT_PEX_ID: u8 = 2;
@@ -77,6 +77,9 @@ pub enum TorrentCmd {
     PriorityPeers(Vec<SocketAddr>),
     GetPeers {
         reply: oneshot::Sender<Vec<EnginePeerSnapshot>>,
+    },
+    GetRuntimeStats {
+        reply: oneshot::Sender<TorrentRuntimeStats>,
     },
     /// An inbound TCP peer whose handshake already matched this torrent.
     AcceptPeer {
@@ -465,6 +468,9 @@ impl TorrentTask {
                         }
                         TorrentCmd::GetPeers { reply } => {
                             let _ = reply.send(self.peer_snapshots());
+                        }
+                        TorrentCmd::GetRuntimeStats { reply } => {
+                            let _ = reply.send(self.runtime_stats());
                         }
                         TorrentCmd::AcceptPeer {
                             stream,
@@ -986,6 +992,15 @@ impl TorrentTask {
                 }
             })
             .collect()
+    }
+
+    fn runtime_stats(&self) -> TorrentRuntimeStats {
+        TorrentRuntimeStats {
+            piece_assembly_buffers: self.piece_assemblies.len() as u64,
+            piece_assembly_bytes: self.piece_assembly_bytes as u64,
+            piece_assembly_evictions: self.piece_assembly_evictions,
+            storage: self.storage.stats(),
+        }
     }
 
     fn remember_tracker_peers(&mut self, peers: &[SocketAddr]) {
@@ -1806,6 +1821,9 @@ impl TorrentTask {
                 Ok(TorrentCmd::PriorityPeers(_)) => {}
                 Ok(TorrentCmd::GetPeers { reply }) => {
                     let _ = reply.send(Vec::new());
+                }
+                Ok(TorrentCmd::GetRuntimeStats { reply }) => {
+                    let _ = reply.send(self.runtime_stats());
                 }
                 Ok(TorrentCmd::AcceptPeer { .. }) => {}
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return None,

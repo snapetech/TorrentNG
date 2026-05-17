@@ -3065,85 +3065,17 @@ mod tests {
 
     #[test]
     fn import_source_matrix_preserves_common_json_resume_fields() {
-        let cases: Vec<(
-            MigrationSource,
-            &str,
-            fn(&Path) -> Result<MigrationPlan, MigrationError>,
-        )> = vec![
-            (MigrationSource::QBittorrent, "fastresume", |root| {
-                dry_run_qbittorrent_backup(root)
-            }),
-            (MigrationSource::Transmission, "resume", |root| {
-                dry_run_transmission_session(root)
-            }),
-            (MigrationSource::Deluge, "fastresume", |root| {
-                dry_run_deluge_state(root)
-            }),
-            (MigrationSource::UTorrent, "dat", |root| {
-                dry_run_utorrent_config(root)
-            }),
-            (MigrationSource::BiglyBT, "config", |root| {
-                dry_run_biglybt_config(root)
-            }),
-            (MigrationSource::Tixati, "dat", |root| {
-                dry_run_tixati_config(root)
-            }),
-            (MigrationSource::Generic, "json", |root| {
-                dry_run_generic_torrent_directory(root)
-            }),
-        ];
-
-        for (source, extension, dry_run) in cases {
-            let dir = tempfile::tempdir().unwrap();
-            let torrent_path = dir.path().join("sample.torrent");
-            let info_hash = write_fixture_torrent(&torrent_path);
-            let info_hash_hex = hex_lower(&info_hash);
-            let save_path = dir.path().join("downloads");
-            std::fs::create_dir_all(&save_path).unwrap();
-            std::fs::write(save_path.join("sample.bin"), [1u8; 12]).unwrap();
-            std::fs::rename(
-                &torrent_path,
-                dir.path().join(format!("{info_hash_hex}.torrent")),
-            )
-            .unwrap();
-            let resume = serde_json::json!({
-                "qBt-savePath": save_path,
-                "qBt-category": "linux",
-                "tags": ["iso", "archive"],
-                "uploadedEver": 900,
-                "downloadedEver": 300,
-                "completed": true,
-                "addedOn": 1_700_000_000i64,
-                "completedAt": 1_700_000_100i64,
-                "paused": true,
-                "qBt-filePriority": [2],
-                "qBt-fileWanted": [true],
-                "fileCompletedBytes": [12],
-                "pieces": [1],
-                "lastAnnounce": 1_700_000_050i64,
-                "nextAnnounce": 1_700_000_500i64,
-                "seeders": 8,
-                "leechers": 2,
-            });
-            let resume_name = if source == MigrationSource::Generic {
-                "resume.dat".to_owned()
-            } else {
-                format!("{info_hash_hex}.{extension}")
-            };
-            std::fs::write(
-                dir.path().join(resume_name),
-                serde_json::to_vec(&resume).unwrap(),
-            )
-            .unwrap();
-
-            let plan = dry_run(dir.path()).unwrap();
-            assert_eq!(plan.source, source);
+        for case in import_source_matrix_cases() {
+            let source = case.source;
+            let fixture = write_common_json_resume_fixture(case.source, case.extension);
+            let plan = (case.dry_run)(fixture.root.path()).unwrap();
+            assert_eq!(plan.source, case.source);
             assert_eq!(plan.torrents.len(), 1, "{source:?}");
             let torrent = &plan.torrents[0];
-            assert_eq!(torrent.info_hash, info_hash_hex, "{source:?}");
+            assert_eq!(torrent.info_hash, fixture.info_hash, "{source:?}");
             assert_eq!(
                 torrent.save_path.as_deref(),
-                Some(save_path.as_path()),
+                Some(fixture.save_path.as_path()),
                 "{source:?}"
             );
             assert_eq!(torrent.category.as_deref(), Some("linux"), "{source:?}");
@@ -3179,6 +3111,177 @@ mod tests {
                 import.torrents[0].files[0].completed_bytes, 12,
                 "{source:?}"
             );
+        }
+    }
+
+    #[test]
+    fn native_apply_matrix_persists_common_resume_fields_for_all_sources() {
+        for case in import_source_matrix_cases() {
+            let fixture = write_common_json_resume_fixture(case.source, case.extension);
+            let plan = (case.dry_run)(fixture.root.path()).unwrap();
+            let fastresume_dir = tempfile::tempdir().unwrap();
+            let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+            rt_db::migrate(&conn).unwrap();
+
+            let summary = plan
+                .apply_native_import(
+                    &mut conn,
+                    fastresume_dir.path(),
+                    &ImportOptions::default(),
+                    ImportPolicy::TrustHints,
+                )
+                .unwrap();
+
+            assert_eq!(summary.db.torrents, 1, "{:?}", case.source);
+            assert_eq!(summary.db.files, 1, "{:?}", case.source);
+            assert_eq!(summary.db.trackers, 1, "{:?}", case.source);
+            assert_eq!(summary.fastresume.states, 1, "{:?}", case.source);
+            assert_eq!(
+                summary.fastresume.confidence.trusted, 1,
+                "{:?}",
+                case.source
+            );
+
+            let row = rt_db::get(&conn, &fixture.info_hash).unwrap();
+            assert_eq!(
+                row.save_path,
+                fixture.save_path.to_string_lossy(),
+                "{:?}",
+                case.source
+            );
+            assert_eq!(row.category.as_deref(), Some("linux"), "{:?}", case.source);
+            assert_eq!(row.uploaded, 900, "{:?}", case.source);
+            assert_eq!(row.downloaded, 300, "{:?}", case.source);
+            assert_eq!(row.completed_at, Some(1_700_000_100), "{:?}", case.source);
+            assert_eq!(
+                rt_db::list_torrent_tags(&conn, &fixture.info_hash).unwrap(),
+                vec!["archive".to_owned(), "iso".to_owned()],
+                "{:?}",
+                case.source
+            );
+            let files = rt_db::list_torrent_files(&conn, &fixture.info_hash).unwrap();
+            assert_eq!(files[0].priority, 2, "{:?}", case.source);
+            assert_eq!(files[0].wanted, true, "{:?}", case.source);
+            assert_eq!(files[0].completed_bytes, 12, "{:?}", case.source);
+            let trackers = rt_db::list_torrent_trackers(&conn, &fixture.info_hash).unwrap();
+            assert_eq!(trackers[0].seeders, Some(8), "{:?}", case.source);
+
+            let state = FastresumeStore::new(fastresume_dir.path())
+                .load(&fixture.info_hash)
+                .unwrap();
+            assert_eq!(state.pieces, vec![PieceState::Valid], "{:?}", case.source);
+            assert_eq!(state.uploaded_bytes, 900, "{:?}", case.source);
+            assert_eq!(state.downloaded_bytes, 300, "{:?}", case.source);
+            assert_eq!(
+                state.import_policy,
+                ImportPolicy::TrustHints,
+                "{:?}",
+                case.source
+            );
+        }
+    }
+
+    struct ImportSourceMatrixCase {
+        source: MigrationSource,
+        extension: &'static str,
+        dry_run: fn(&Path) -> Result<MigrationPlan, MigrationError>,
+    }
+
+    struct ImportSourceFixture {
+        root: tempfile::TempDir,
+        info_hash: String,
+        save_path: PathBuf,
+    }
+
+    fn import_source_matrix_cases() -> Vec<ImportSourceMatrixCase> {
+        vec![
+            ImportSourceMatrixCase {
+                source: MigrationSource::QBittorrent,
+                extension: "fastresume",
+                dry_run: |root| dry_run_qbittorrent_backup(root),
+            },
+            ImportSourceMatrixCase {
+                source: MigrationSource::Transmission,
+                extension: "resume",
+                dry_run: |root| dry_run_transmission_session(root),
+            },
+            ImportSourceMatrixCase {
+                source: MigrationSource::Deluge,
+                extension: "fastresume",
+                dry_run: |root| dry_run_deluge_state(root),
+            },
+            ImportSourceMatrixCase {
+                source: MigrationSource::UTorrent,
+                extension: "dat",
+                dry_run: |root| dry_run_utorrent_config(root),
+            },
+            ImportSourceMatrixCase {
+                source: MigrationSource::BiglyBT,
+                extension: "config",
+                dry_run: |root| dry_run_biglybt_config(root),
+            },
+            ImportSourceMatrixCase {
+                source: MigrationSource::Tixati,
+                extension: "dat",
+                dry_run: |root| dry_run_tixati_config(root),
+            },
+            ImportSourceMatrixCase {
+                source: MigrationSource::Generic,
+                extension: "json",
+                dry_run: |root| dry_run_generic_torrent_directory(root),
+            },
+        ]
+    }
+
+    fn write_common_json_resume_fixture(
+        source: MigrationSource,
+        extension: &str,
+    ) -> ImportSourceFixture {
+        let dir = tempfile::tempdir().unwrap();
+        let torrent_path = dir.path().join("sample.torrent");
+        let info_hash = write_fixture_torrent(&torrent_path);
+        let info_hash = hex_lower(&info_hash);
+        let save_path = dir.path().join("downloads");
+        std::fs::create_dir_all(&save_path).unwrap();
+        std::fs::write(save_path.join("sample.bin"), [1u8; 12]).unwrap();
+        std::fs::rename(
+            &torrent_path,
+            dir.path().join(format!("{info_hash}.torrent")),
+        )
+        .unwrap();
+        let resume = serde_json::json!({
+            "qBt-savePath": save_path,
+            "qBt-category": "linux",
+            "tags": ["iso", "archive"],
+            "uploadedEver": 900,
+            "downloadedEver": 300,
+            "completed": true,
+            "addedOn": 1_700_000_000i64,
+            "completedAt": 1_700_000_100i64,
+            "paused": true,
+            "qBt-filePriority": [2],
+            "qBt-fileWanted": [true],
+            "fileCompletedBytes": [12],
+            "pieces": [1],
+            "lastAnnounce": 1_700_000_050i64,
+            "nextAnnounce": 1_700_000_500i64,
+            "seeders": 8,
+            "leechers": 2,
+        });
+        let resume_name = if source == MigrationSource::Generic {
+            "resume.dat".to_owned()
+        } else {
+            format!("{info_hash}.{extension}")
+        };
+        std::fs::write(
+            dir.path().join(resume_name),
+            serde_json::to_vec(&resume).unwrap(),
+        )
+        .unwrap();
+        ImportSourceFixture {
+            root: dir,
+            info_hash,
+            save_path,
         }
     }
 

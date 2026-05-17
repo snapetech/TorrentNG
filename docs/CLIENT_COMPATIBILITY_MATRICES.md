@@ -205,7 +205,7 @@ covered today as an import source and as an interop peer.
 | P0 | `api_facade_endpoint_matrix` | Implemented in crate tests: qBit route matrix, Transmission method matrix, Deluge advertised method matrix |
 | P0 | `api_response_field_matrix` | Implemented for current qBit `torrents/info`/`properties`/`sync`, Transmission `torrent-get`/`session-get`, and Deluge torrent status fields; remaining documented gaps stay in field matrices |
 | P0 | `import_fixture_matrix` | Implemented for common JSON resume fields across qBit, Transmission, Deluge, uTorrent, BiglyBT/Vuze, Tixati, and Generic; source-specific golden corpora remain P1 |
-| P0 | `migration_apply_matrix` | Import fixture, apply native DB and fastresume, reload, assert state preservation |
+| P0 | `migration_apply_matrix` | Implemented for common resume fields across qBit, Transmission, Deluge, uTorrent, BiglyBT/Vuze, Tixati, and Generic: applies DB rows and fastresume, reloads, and asserts preservation |
 | P1 | `qbit_arr_client_matrix` | Sonarr/Radarr/Prowlarr/cross-seed/autobrr/NZB360-style qBit flows |
 | P1 | `transmission_client_matrix` | transmission-web, transmission-remote, mobile app field projections |
 | P1 | `deluge_client_matrix` | Deluge WebUI update_ui, thin-client core calls, Label plugin calls |

@@ -4,6 +4,7 @@ use std::{net::SocketAddr, path::PathBuf};
 use tokio::sync::oneshot;
 
 use rt_metainfo::{MagnetLink, TorrentMeta};
+use rt_storage::StorageIoStats;
 
 pub type CmdResult<T> = Result<T, String>;
 
@@ -53,6 +54,109 @@ pub struct EngineStats {
     pub trackers_working: u64,
     pub trackers_warning: u64,
     pub trackers_error: u64,
+    pub storage_file_pool_capacity: u64,
+    pub storage_file_pool_open_files: u64,
+    pub storage_file_pool_hits: u64,
+    pub storage_file_pool_misses: u64,
+    pub storage_file_pool_evictions: u64,
+    pub storage_file_pool_idle_closes: u64,
+    pub storage_io_queue_depth: u64,
+    pub storage_hash_queue_depth: u64,
+    pub storage_dirty_files: u64,
+    pub storage_read_ops: u64,
+    pub storage_write_ops: u64,
+    pub storage_bytes_read: u64,
+    pub storage_bytes_written: u64,
+    pub storage_sync_ops: u64,
+    pub storage_hash_ops: u64,
+    pub storage_preallocation_failures: u64,
+    pub storage_preallocation_fallbacks: u64,
+    pub storage_peer_read_cache_entries: u64,
+    pub storage_peer_read_cache_hits: u64,
+    pub storage_peer_read_cache_misses: u64,
+    pub piece_assembly_buffers: u64,
+    pub piece_assembly_bytes: u64,
+    pub piece_assembly_evictions: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TorrentRuntimeStats {
+    pub piece_assembly_buffers: u64,
+    pub piece_assembly_bytes: u64,
+    pub piece_assembly_evictions: u64,
+    pub storage: StorageIoStats,
+}
+
+impl EngineStats {
+    pub fn add_torrent_runtime(&mut self, runtime: TorrentRuntimeStats) {
+        self.piece_assembly_buffers = self
+            .piece_assembly_buffers
+            .saturating_add(runtime.piece_assembly_buffers);
+        self.piece_assembly_bytes = self
+            .piece_assembly_bytes
+            .saturating_add(runtime.piece_assembly_bytes);
+        self.piece_assembly_evictions = self
+            .piece_assembly_evictions
+            .saturating_add(runtime.piece_assembly_evictions);
+
+        let storage = runtime.storage;
+        self.storage_file_pool_capacity = self
+            .storage_file_pool_capacity
+            .saturating_add(storage.file_pool.capacity as u64);
+        self.storage_file_pool_open_files = self
+            .storage_file_pool_open_files
+            .saturating_add(storage.file_pool.open_files as u64);
+        self.storage_file_pool_hits = self
+            .storage_file_pool_hits
+            .saturating_add(storage.file_pool.hits);
+        self.storage_file_pool_misses = self
+            .storage_file_pool_misses
+            .saturating_add(storage.file_pool.misses);
+        self.storage_file_pool_evictions = self
+            .storage_file_pool_evictions
+            .saturating_add(storage.file_pool.evictions);
+        self.storage_file_pool_idle_closes = self
+            .storage_file_pool_idle_closes
+            .saturating_add(storage.file_pool.idle_closes);
+        self.storage_io_queue_depth = self
+            .storage_io_queue_depth
+            .saturating_add(storage.io_queue_depth as u64);
+        self.storage_hash_queue_depth = self
+            .storage_hash_queue_depth
+            .saturating_add(storage.hash_queue_depth as u64);
+        self.storage_dirty_files = self
+            .storage_dirty_files
+            .saturating_add(storage.dirty_files as u64);
+        self.storage_read_ops = self
+            .storage_read_ops
+            .saturating_add(storage.read_ops_by_class.iter().sum::<u64>());
+        self.storage_write_ops = self
+            .storage_write_ops
+            .saturating_add(storage.write_ops_by_class.iter().sum::<u64>());
+        self.storage_bytes_read = self
+            .storage_bytes_read
+            .saturating_add(storage.bytes_read_by_class.iter().sum::<u64>());
+        self.storage_bytes_written = self
+            .storage_bytes_written
+            .saturating_add(storage.bytes_written_by_class.iter().sum::<u64>());
+        self.storage_sync_ops = self.storage_sync_ops.saturating_add(storage.sync_ops);
+        self.storage_hash_ops = self.storage_hash_ops.saturating_add(storage.hash_ops);
+        self.storage_preallocation_failures = self
+            .storage_preallocation_failures
+            .saturating_add(storage.preallocation_failures);
+        self.storage_preallocation_fallbacks = self
+            .storage_preallocation_fallbacks
+            .saturating_add(storage.preallocation_fallbacks);
+        self.storage_peer_read_cache_entries = self
+            .storage_peer_read_cache_entries
+            .saturating_add(storage.peer_read_cache_entries as u64);
+        self.storage_peer_read_cache_hits = self
+            .storage_peer_read_cache_hits
+            .saturating_add(storage.peer_read_cache_hits);
+        self.storage_peer_read_cache_misses = self
+            .storage_peer_read_cache_misses
+            .saturating_add(storage.peer_read_cache_misses);
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -267,4 +371,61 @@ pub enum EngineCmd {
     },
     /// Graceful shutdown.
     Shutdown,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rt_storage::FilePoolStats;
+
+    #[test]
+    fn engine_stats_accumulates_torrent_runtime_storage_counters() {
+        let mut stats = EngineStats::default();
+        let mut storage = StorageIoStats {
+            file_pool: FilePoolStats {
+                capacity: 64,
+                open_files: 8,
+                hits: 10,
+                misses: 2,
+                evictions: 1,
+                idle_closes: 3,
+            },
+            io_queue_depth: 4,
+            hash_queue_depth: 5,
+            dirty_files: 6,
+            sync_ops: 7,
+            hash_ops: 8,
+            preallocation_failures: 9,
+            preallocation_fallbacks: 10,
+            peer_read_cache_entries: 11,
+            peer_read_cache_hits: 12,
+            peer_read_cache_misses: 13,
+            ..Default::default()
+        };
+        storage.read_ops_by_class[0] = 14;
+        storage.read_ops_by_class[1] = 15;
+        storage.write_ops_by_class[0] = 16;
+        storage.bytes_read_by_class[0] = 17;
+        storage.bytes_written_by_class[0] = 18;
+
+        stats.add_torrent_runtime(TorrentRuntimeStats {
+            piece_assembly_buffers: 19,
+            piece_assembly_bytes: 20,
+            piece_assembly_evictions: 21,
+            storage,
+        });
+
+        assert_eq!(stats.storage_file_pool_capacity, 64);
+        assert_eq!(stats.storage_file_pool_open_files, 8);
+        assert_eq!(stats.storage_file_pool_hits, 10);
+        assert_eq!(stats.storage_file_pool_misses, 2);
+        assert_eq!(stats.storage_read_ops, 29);
+        assert_eq!(stats.storage_write_ops, 16);
+        assert_eq!(stats.storage_bytes_read, 17);
+        assert_eq!(stats.storage_bytes_written, 18);
+        assert_eq!(stats.storage_peer_read_cache_hits, 12);
+        assert_eq!(stats.piece_assembly_buffers, 19);
+        assert_eq!(stats.piece_assembly_bytes, 20);
+        assert_eq!(stats.piece_assembly_evictions, 21);
+    }
 }

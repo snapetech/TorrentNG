@@ -2229,11 +2229,13 @@ impl Engine {
                 }
             }
         }
-        let db = self.db.lock().expect("database mutex poisoned");
-        stats.jobs_active = rt_db::list_active_jobs(&db)
-            .map_err(|e| e.to_string())?
-            .len() as u64;
-        let trackers = rt_db::list_all_torrent_trackers(&db).map_err(|e| e.to_string())?;
+        let trackers = {
+            let db = self.db.lock().expect("database mutex poisoned");
+            stats.jobs_active = rt_db::list_active_jobs(&db)
+                .map_err(|e| e.to_string())?
+                .len() as u64;
+            rt_db::list_all_torrent_trackers(&db).map_err(|e| e.to_string())?
+        };
         stats.trackers_total = trackers.len() as u64;
         for tracker in trackers {
             match tracker.status.as_str() {
@@ -2241,6 +2243,23 @@ impl Engine {
                 "warning" => stats.trackers_warning += 1,
                 "error" => stats.trackers_error += 1,
                 _ => {}
+            }
+        }
+        for tx in self.torrent_chans.values() {
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            if tx
+                .send(TorrentCmd::GetRuntimeStats { reply })
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            match timeout(Duration::from_millis(250), rx).await {
+                Ok(Ok(runtime)) => stats.add_torrent_runtime(runtime),
+                Ok(Err(_)) => {}
+                Err(_) => {
+                    warn!("timed out collecting torrent runtime stats");
+                }
             }
         }
         Ok(stats)
@@ -4189,13 +4208,27 @@ mod tests {
         let registry = Arc::new(RwLock::new(SessionRegistry::new()));
         registry.write().await.add(entry).unwrap();
         let (_tx, rx) = mpsc::channel(1);
+        let (torrent_tx, mut torrent_rx) = mpsc::channel(1);
+        tokio::spawn(async move {
+            if let Some(TorrentCmd::GetRuntimeStats { reply }) = torrent_rx.recv().await {
+                let _ = reply.send(crate::command::TorrentRuntimeStats {
+                    piece_assembly_buffers: 2,
+                    piece_assembly_bytes: 4096,
+                    piece_assembly_evictions: 1,
+                    ..Default::default()
+                });
+            }
+        });
+        let mut torrent_chans = HashMap::new();
+        torrent_chans.insert("e".repeat(40), torrent_tx);
+
         let engine = Engine {
             config: Arc::new(Config::default()),
             registry,
             db: Arc::new(Mutex::new(conn)),
             cmd_rx: rx,
             cmd_tx: mpsc::channel(1).0,
-            torrent_chans: HashMap::new(),
+            torrent_chans,
             torrent_tasks: HashMap::new(),
             dht_tx: None,
         };
@@ -4239,13 +4272,28 @@ mod tests {
         let registry = Arc::new(RwLock::new(SessionRegistry::new()));
         registry.write().await.add(entry).unwrap();
         let (_tx, rx) = mpsc::channel(1);
+        let (runtime_tx, mut runtime_rx) = mpsc::channel(1);
+        tokio::spawn(async move {
+            if let Some(TorrentCmd::GetRuntimeStats { reply }) = runtime_rx.recv().await {
+                let _ = reply.send(crate::command::TorrentRuntimeStats {
+                    piece_assembly_buffers: 2,
+                    piece_assembly_bytes: 4096,
+                    piece_assembly_evictions: 1,
+                    ..Default::default()
+                });
+            }
+        });
+        let mut torrent_chans = HashMap::new();
+        torrent_chans.insert("e".repeat(40), runtime_tx);
+        tokio::task::yield_now().await;
+
         let engine = Engine {
             config: Arc::new(Config::default()),
             registry,
             db: Arc::new(Mutex::new(conn)),
             cmd_rx: rx,
             cmd_tx: mpsc::channel(1).0,
-            torrent_chans: HashMap::new(),
+            torrent_chans,
             torrent_tasks: HashMap::new(),
             dht_tx: None,
         };
@@ -4587,24 +4635,38 @@ mod tests {
             let _ = entry.transition(TorrentState::Downloading);
             reg.add(entry).unwrap();
         }
+        let info_hash = "e".repeat(40);
+        let (torrent_tx, mut torrent_rx) = mpsc::channel(1);
+        tokio::spawn(async move {
+            if let Some(TorrentCmd::GetRuntimeStats { reply }) = torrent_rx.recv().await {
+                let _ = reply.send(crate::command::TorrentRuntimeStats {
+                    piece_assembly_buffers: 2,
+                    piece_assembly_bytes: 4096,
+                    piece_assembly_evictions: 1,
+                    ..Default::default()
+                });
+            }
+        });
+        let mut torrent_chans = HashMap::new();
+        torrent_chans.insert(info_hash.clone(), torrent_tx);
         let engine = Engine {
             config: Arc::new(Config::default()),
             registry,
             db: Arc::new(Mutex::new(conn)),
             cmd_rx: rx,
             cmd_tx: mpsc::channel(1).0,
-            torrent_chans: HashMap::new(),
+            torrent_chans,
             torrent_tasks: HashMap::new(),
             dht_tx: None,
         };
-        let job_id = engine.create_recheck_job(&"e".repeat(40)).unwrap();
+        let job_id = engine.create_recheck_job(&info_hash).unwrap();
         engine.update_job_state(&job_id, JOB_STATE_RUNNING, None, Some("running"));
         {
             let mut db = engine.db.lock().unwrap();
             rt_db::upsert(
                 &db,
                 &TorrentRow {
-                    info_hash: "e".repeat(40),
+                    info_hash: info_hash.clone(),
                     name: "stats.bin".to_owned(),
                     total_length: 100,
                     piece_length: 10,
@@ -4625,9 +4687,9 @@ mod tests {
             .unwrap();
             rt_db::replace_torrent_trackers(
                 &mut db,
-                &"e".repeat(40),
+                &info_hash,
                 &[rt_db::TorrentTrackerRow {
-                    info_hash: "e".repeat(40),
+                    info_hash: info_hash.clone(),
                     tracker_index: 0,
                     tier: 0,
                     url: "http://tracker/announce".to_owned(),
@@ -4657,6 +4719,9 @@ mod tests {
         assert_eq!(stats.jobs_active, 1);
         assert_eq!(stats.trackers_total, 1);
         assert_eq!(stats.trackers_error, 1);
+        assert_eq!(stats.piece_assembly_buffers, 2);
+        assert_eq!(stats.piece_assembly_bytes, 4096);
+        assert_eq!(stats.piece_assembly_evictions, 1);
     }
 
     #[tokio::test]

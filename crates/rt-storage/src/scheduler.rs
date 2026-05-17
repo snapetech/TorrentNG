@@ -95,7 +95,7 @@ impl Default for SchedulerConfig {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct FilePoolStats {
     pub capacity: usize,
     pub open_files: usize,
@@ -105,7 +105,7 @@ pub struct FilePoolStats {
     pub idle_closes: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct StorageIoStats {
     pub file_pool: FilePoolStats,
     pub io_queue_depth: usize,

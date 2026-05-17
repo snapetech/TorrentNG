@@ -651,6 +651,167 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
         "Trackers with error state",
         stats.trackers_error,
     );
+    metric(
+        &mut out,
+        "rtorrentng_storage_file_pool_capacity",
+        "gauge",
+        "Configured open-file cache capacity across running torrent schedulers",
+        stats.storage_file_pool_capacity,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_storage_file_pool_open_files",
+        "gauge",
+        "Open files across running torrent scheduler caches",
+        stats.storage_file_pool_open_files,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_storage_file_pool_hits_total",
+        "counter",
+        "Open-file cache hits across running torrent schedulers",
+        stats.storage_file_pool_hits,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_storage_file_pool_misses_total",
+        "counter",
+        "Open-file cache misses across running torrent schedulers",
+        stats.storage_file_pool_misses,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_storage_file_pool_evictions_total",
+        "counter",
+        "Open-file cache evictions across running torrent schedulers",
+        stats.storage_file_pool_evictions,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_storage_file_pool_idle_closes_total",
+        "counter",
+        "Idle open-file cache closes across running torrent schedulers",
+        stats.storage_file_pool_idle_closes,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_storage_io_queue_depth",
+        "gauge",
+        "Queued disk I/O jobs across running torrent schedulers",
+        stats.storage_io_queue_depth,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_storage_hash_queue_depth",
+        "gauge",
+        "Queued hashing jobs across running torrent schedulers",
+        stats.storage_hash_queue_depth,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_storage_dirty_files",
+        "gauge",
+        "Dirty files tracked by running torrent schedulers",
+        stats.storage_dirty_files,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_storage_read_ops_total",
+        "counter",
+        "Positioned read operations across running torrent schedulers",
+        stats.storage_read_ops,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_storage_write_ops_total",
+        "counter",
+        "Positioned write operations across running torrent schedulers",
+        stats.storage_write_ops,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_storage_bytes_read_total",
+        "counter",
+        "Bytes read through running torrent schedulers",
+        stats.storage_bytes_read,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_storage_bytes_written_total",
+        "counter",
+        "Bytes written through running torrent schedulers",
+        stats.storage_bytes_written,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_storage_sync_ops_total",
+        "counter",
+        "Data sync operations across running torrent schedulers",
+        stats.storage_sync_ops,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_storage_hash_ops_total",
+        "counter",
+        "Hashing operations across running torrent schedulers",
+        stats.storage_hash_ops,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_storage_preallocation_failures_total",
+        "counter",
+        "Preallocation failures across running torrent schedulers",
+        stats.storage_preallocation_failures,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_storage_preallocation_fallbacks_total",
+        "counter",
+        "Preallocation fallback events across running torrent schedulers",
+        stats.storage_preallocation_fallbacks,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_storage_peer_read_cache_entries",
+        "gauge",
+        "Peer-read readahead cache entries across running torrent schedulers",
+        stats.storage_peer_read_cache_entries,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_storage_peer_read_cache_hits_total",
+        "counter",
+        "Peer-read readahead cache hits across running torrent schedulers",
+        stats.storage_peer_read_cache_hits,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_storage_peer_read_cache_misses_total",
+        "counter",
+        "Peer-read readahead cache misses across running torrent schedulers",
+        stats.storage_peer_read_cache_misses,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_piece_assembly_buffers",
+        "gauge",
+        "In-memory piece assembly buffers across running torrents",
+        stats.piece_assembly_buffers,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_piece_assembly_bytes",
+        "gauge",
+        "In-memory piece assembly bytes across running torrents",
+        stats.piece_assembly_bytes,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_piece_assembly_evictions_total",
+        "counter",
+        "In-memory piece assembly buffers evicted by torrent-task budgets",
+        stats.piece_assembly_evictions,
+    );
     let storage = StorageRuntime::global();
     metric(
         &mut out,
@@ -940,6 +1101,11 @@ mod tests {
             torrents_seeding: 1,
             jobs_active: 3,
             trackers_error: 4,
+            storage_file_pool_hits: 5,
+            storage_read_ops: 6,
+            storage_hash_ops: 7,
+            storage_peer_read_cache_hits: 8,
+            piece_assembly_evictions: 9,
             ..Default::default()
         };
         let rendered = render_metrics(&stats);
@@ -947,6 +1113,11 @@ mod tests {
         assert!(rendered.contains("rtorrentng_torrents_seeding 1"));
         assert!(rendered.contains("rtorrentng_jobs_active 3"));
         assert!(rendered.contains("rtorrentng_trackers_error 4"));
+        assert!(rendered.contains("rtorrentng_storage_file_pool_hits_total 5"));
+        assert!(rendered.contains("rtorrentng_storage_read_ops_total 6"));
+        assert!(rendered.contains("rtorrentng_storage_hash_ops_total 7"));
+        assert!(rendered.contains("rtorrentng_storage_peer_read_cache_hits_total 8"));
+        assert!(rendered.contains("rtorrentng_piece_assembly_evictions_total 9"));
         assert!(rendered.contains("rtorrentng_storage_handles_open "));
         assert!(rendered.contains("rtorrentng_storage_frame_bytes_cap "));
     }
