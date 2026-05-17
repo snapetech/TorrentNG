@@ -385,7 +385,7 @@ export function TorrentTable({
                   <span>{visibleCols.length - 1}/{COLS.length - 1}</span>
                 </div>
                 {COLS.filter(col => !col.required).map(col => (
-                  <label key={col.key} style={{
+                  <label key={col.key} className="rtng-column-menu-item" data-active={visibleKeys.includes(col.key) ? 'true' : 'false'} style={{
                     display: 'flex', alignItems: 'center', gap: 8, color: 'var(--text)',
                     fontSize: 12, padding: '4px 3px', cursor: 'pointer',
                   }}>
@@ -427,7 +427,7 @@ export function TorrentTable({
                 position: 'absolute', inset: 0, display: 'grid', placeItems: 'center',
                 color: 'var(--faint)', fontSize: 13, textAlign: 'center', padding: 24,
               }}>
-                <div style={{
+                <div className="rtng-empty-state" data-filtered={hasFilters ? 'true' : 'false'} style={{
                   border: '1px solid var(--border)', borderRadius: 8,
                   background: 'var(--surface)', padding: '18px 22px', display: 'grid', gap: 6,
                   maxWidth: 360,

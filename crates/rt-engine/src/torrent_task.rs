@@ -925,16 +925,33 @@ impl TorrentTask {
     }
 
     async fn download_next_webseed_block(&mut self) {
-        if self.picker.is_complete() || self.meta.webseeds.is_empty() || self.meta.files.len() != 1
-        {
+        if self.picker.is_complete() {
+            return;
+        }
+        if self.meta.webseeds.is_empty() {
+            debug!(torrent = %self.info_hash_hex, "webseed skipped: no webseeds");
+            return;
+        }
+        if self.meta.files.len() != 1 {
+            debug!(
+                torrent = %self.info_hash_hex,
+                files = self.meta.files.len(),
+                "webseed skipped: multi-file torrent"
+            );
             return;
         }
         if !self.active_peers.is_empty() {
+            debug!(
+                torrent = %self.info_hash_hex,
+                peers = self.active_peers.len(),
+                "webseed skipped: active peers available"
+            );
             return;
         }
 
         let peer_has_all = vec![true; self.meta.pieces.len()];
         let Some(req) = self.picker.pick(&peer_has_all) else {
+            debug!(torrent = %self.info_hash_hex, "webseed skipped: no requestable block");
             return;
         };
 
@@ -950,8 +967,22 @@ impl TorrentTask {
                 continue;
             }
             let Some(url) = webseed_block_url(&self.meta, &self.meta.webseeds[idx]) else {
+                debug!(
+                    torrent = %self.info_hash_hex,
+                    webseed = %self.meta.webseeds[idx],
+                    "webseed skipped: unsupported url"
+                );
                 continue;
             };
+            debug!(
+                torrent = %self.info_hash_hex,
+                webseed = %self.meta.webseeds[idx],
+                url = %url,
+                piece = req.piece,
+                offset = req.begin,
+                length = req.length,
+                "fetching webseed block"
+            );
             match self.fetch_webseed_block(&url, req).await {
                 Ok(data) => {
                     self.webseed_next_index = (idx + 1) % seed_count;

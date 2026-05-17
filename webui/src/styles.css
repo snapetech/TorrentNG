@@ -696,6 +696,56 @@ summary:hover {
     inset 3px 0 0 color-mix(in srgb, var(--danger) 72%, transparent) !important;
 }
 
+.rtng-context-menu {
+  animation: rtng-modal-in 110ms ease-out;
+}
+
+.rtng-context-menu[data-status="error"] {
+  box-shadow:
+    0 18px 40px var(--shadow),
+    inset 3px 0 0 color-mix(in srgb, var(--danger) 72%, transparent) !important;
+}
+
+.rtng-context-item,
+.rtng-column-menu-item,
+.rtng-empty-state {
+  transition:
+    border-color 120ms ease,
+    background-color 120ms ease,
+    box-shadow 120ms ease,
+    filter 120ms ease;
+}
+
+.rtng-context-item:hover,
+.rtng-column-menu-item:hover {
+  background: color-mix(in srgb, var(--accent-soft) 42%, transparent) !important;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.rtng-context-item[data-danger="true"]:hover {
+  background: color-mix(in srgb, var(--danger) 12%, transparent) !important;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--danger) 18%, transparent);
+}
+
+.rtng-column-menu-item[data-active="true"] {
+  color: var(--accent-text) !important;
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border-radius: 5px;
+}
+
+.rtng-empty-state {
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.035),
+    0 14px 36px color-mix(in srgb, var(--shadow) 32%, transparent);
+}
+
+.rtng-empty-state[data-filtered="true"] {
+  border-color: color-mix(in srgb, var(--warning) 42%, var(--border)) !important;
+  box-shadow:
+    inset 3px 0 0 color-mix(in srgb, var(--warning) 68%, transparent),
+    0 14px 36px color-mix(in srgb, var(--shadow) 32%, transparent);
+}
+
 ::selection {
   background: color-mix(in srgb, var(--accent) 40%, transparent);
   color: var(--text);

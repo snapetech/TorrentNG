@@ -45,6 +45,7 @@ Environment:
   INTEROP_PUBLIC_MIN_RUST_PEERS=2
   INTEROP_INCLUDE_LIBREOFFICE=1
   INTEROP_PUBLIC_ONLY=debian
+  INTEROP_EXTENDED_ONLY=1
   INTEROP_SKIP_BUILD=1
   INTEROP_KEEP_STACK=1
   INTEROP_KEEP_PUBLIC_DATA=0
@@ -1036,9 +1037,11 @@ run_local_matrix() {
   append_report "# Deterministic Local Swarm"
   append_report ""
   create_fixture_files
-  for row in "${LOCAL_CASES[@]}"; do
-    run_local_case "$row" || failures=$((failures + 1))
-  done
+  if [[ "${INTEROP_EXTENDED_ONLY:-0}" != "1" ]]; then
+    for row in "${LOCAL_CASES[@]}"; do
+      run_local_case "$row" || failures=$((failures + 1))
+    done
+  fi
   run_extended_local_matrix || failures=$((failures + 1))
   (( failures == 0 ))
 }
