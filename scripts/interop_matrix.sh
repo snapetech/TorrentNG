@@ -345,7 +345,7 @@ add_rust() {
 transmission_rpc() {
   local body="$1" url sid
   url="$(client_url transmission)/transmission/rpc"
-  sid="$(curl --max-time "$CURL_MAX_TIME" -sS -D - -o /dev/null "$url" | awk 'tolower($0) ~ /^x-transmission-session-id:/ {print $2}' | tr -d '\r')"
+  sid="$(curl --max-time "$CURL_MAX_TIME" -sS -D - -o /dev/null -H "Content-Type: application/json" -d "$body" "$url" | awk 'tolower($0) ~ /^x-transmission-session-id:/ {print $2}' | tr -d '\r')"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "X-Transmission-Session-Id: $sid" -H "Content-Type: application/json" -d "$body" "$url"
 }
 
@@ -512,7 +512,7 @@ poll_rust_compat() {
 rust_transmission_rpc() {
   local body="$1" url sid
   url="$(client_url rusttorrentd)/transmission/rpc"
-  sid="$(curl --max-time "$CURL_MAX_TIME" -sS -D - -o /dev/null -H "Authorization: Bearer $RUST_TOKEN" "$url" | awk 'tolower($0) ~ /^x-transmission-session-id:/ {print $2}' | tr -d '\r')"
+  sid="$(curl --max-time "$CURL_MAX_TIME" -sS -D - -o /dev/null -H "Authorization: Bearer $RUST_TOKEN" -H "Content-Type: application/json" -d "$body" "$url" | awk 'tolower($0) ~ /^x-transmission-session-id:/ {print $2}' | tr -d '\r')"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" -H "X-Transmission-Session-Id: $sid" -H "Content-Type: application/json" -d "$body" "$url"
 }
 

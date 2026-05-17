@@ -215,6 +215,26 @@ impl PiecePicker {
         None
     }
 
+    /// Pick from a source that is known to have every piece but is not counted
+    /// in peer availability, such as a BEP19 webseed.
+    pub fn pick_from_seed(&mut self) -> Option<BlockRequest> {
+        for &p in &self.priority.clone() {
+            if self.wanted[p] && self.enabled[p] {
+                if let Some(req) = self.pick_block_from(p) {
+                    return Some(req);
+                }
+            }
+        }
+        for p in 0..self.piece_count {
+            if self.wanted[p] && self.enabled[p] {
+                if let Some(req) = self.pick_block_from(p) {
+                    return Some(req);
+                }
+            }
+        }
+        None
+    }
+
     /// Pick a duplicate outstanding block for endgame mode.
     ///
     /// This returns `Some` only after all enabled wanted pieces have no fresh
@@ -525,6 +545,16 @@ mod tests {
         let next = p.pick(&all).unwrap();
         assert_eq!(again.begin, r1.begin);
         assert_eq!(next.begin, r2.begin);
+    }
+
+    #[test]
+    fn seed_picker_does_not_require_peer_availability() {
+        let mut p = picker_1piece(MAX_BLOCK_SIZE * 2);
+        let r1 = p.pick_from_seed().unwrap();
+        let r2 = p.pick_from_seed().unwrap();
+        assert_eq!(r1.begin, 0);
+        assert_eq!(r2.begin, MAX_BLOCK_SIZE);
+        assert!(p.pick_from_seed().is_none());
     }
 
     #[test]
