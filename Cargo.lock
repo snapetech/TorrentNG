@@ -1441,14 +1441,17 @@ name = "rt-metrics"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bytes",
  "rt-api-native",
  "rt-api-qbit",
  "rt-db",
  "rt-path",
+ "rt-piece-map",
  "rt-session",
  "rt-storage",
  "rt-testkit",
  "rt-tracker",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tower 0.4.13",

@@ -772,6 +772,34 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
     );
     metric(
         &mut out,
+        "rtorrentng_storage_backend_read_ops_total",
+        "counter",
+        "Backend disk read operations across running torrent schedulers",
+        stats.storage_backend_read_ops,
+    );
+    metric_by_class(
+        &mut out,
+        "rtorrentng_storage_backend_read_ops_by_class_total",
+        "counter",
+        "Backend disk read operations by I/O class across running torrent schedulers",
+        &stats.storage_backend_read_ops_by_class,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_storage_backend_bytes_read_total",
+        "counter",
+        "Bytes read from backend disk operations across running torrent schedulers",
+        stats.storage_backend_bytes_read,
+    );
+    metric_by_class(
+        &mut out,
+        "rtorrentng_storage_backend_bytes_read_by_class_total",
+        "counter",
+        "Bytes read from backend disk operations by I/O class across running torrent schedulers",
+        &stats.storage_backend_bytes_read_by_class,
+    );
+    metric(
+        &mut out,
         "rtorrentng_storage_sync_ops_total",
         "counter",
         "Data sync operations across running torrent schedulers",
@@ -1164,12 +1192,16 @@ mod tests {
             storage_hash_ops: 7,
             storage_peer_read_cache_hits: 8,
             piece_assembly_evictions: 9,
+            storage_backend_read_ops: 14,
+            storage_backend_bytes_read: 15,
             ..Default::default()
         };
         stats.storage_read_ops_by_class[4] = 10;
         stats.storage_write_ops_by_class[3] = 11;
         stats.storage_bytes_read_by_class[4] = 12;
         stats.storage_bytes_written_by_class[3] = 13;
+        stats.storage_backend_read_ops_by_class[4] = 16;
+        stats.storage_backend_bytes_read_by_class[4] = 17;
         let rendered = render_metrics(&stats);
         assert!(rendered.contains("rtorrentng_torrents_total 2"));
         assert!(rendered.contains("rtorrentng_torrents_seeding 1"));
@@ -1189,6 +1221,14 @@ mod tests {
             .contains("rtorrentng_storage_bytes_read_by_class_total{class=\"peer_read\"} 12"));
         assert!(rendered
             .contains("rtorrentng_storage_bytes_written_by_class_total{class=\"peer_write\"} 13"));
+        assert!(rendered.contains("rtorrentng_storage_backend_read_ops_total 14"));
+        assert!(rendered.contains("rtorrentng_storage_backend_bytes_read_total 15"));
+        assert!(rendered.contains(
+            "rtorrentng_storage_backend_read_ops_by_class_total{class=\"peer_read\"} 16"
+        ));
+        assert!(rendered.contains(
+            "rtorrentng_storage_backend_bytes_read_by_class_total{class=\"peer_read\"} 17"
+        ));
         assert!(rendered.contains("rtorrentng_storage_handles_open "));
         assert!(rendered.contains("rtorrentng_storage_frame_bytes_cap "));
     }

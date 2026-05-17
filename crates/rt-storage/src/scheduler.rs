@@ -115,6 +115,8 @@ pub struct StorageIoStats {
     pub write_ops_by_class: [u64; 6],
     pub bytes_read_by_class: [u64; 6],
     pub bytes_written_by_class: [u64; 6],
+    pub backend_read_ops_by_class: [u64; 6],
+    pub backend_bytes_read_by_class: [u64; 6],
     pub sync_ops: u64,
     pub hash_ops: u64,
     pub preallocation_failures: u64,
@@ -385,6 +387,8 @@ struct StorageCounters {
     write_ops_by_class: [AtomicU64; 6],
     bytes_read_by_class: [AtomicU64; 6],
     bytes_written_by_class: [AtomicU64; 6],
+    backend_read_ops_by_class: [AtomicU64; 6],
+    backend_bytes_read_by_class: [AtomicU64; 6],
     sync_ops: AtomicU64,
     hash_ops: AtomicU64,
     preallocation_failures: AtomicU64,
@@ -400,6 +404,8 @@ impl Default for StorageCounters {
             write_ops_by_class: std::array::from_fn(|_| AtomicU64::new(0)),
             bytes_read_by_class: std::array::from_fn(|_| AtomicU64::new(0)),
             bytes_written_by_class: std::array::from_fn(|_| AtomicU64::new(0)),
+            backend_read_ops_by_class: std::array::from_fn(|_| AtomicU64::new(0)),
+            backend_bytes_read_by_class: std::array::from_fn(|_| AtomicU64::new(0)),
             sync_ops: AtomicU64::new(0),
             hash_ops: AtomicU64::new(0),
             preallocation_failures: AtomicU64::new(0),
@@ -524,6 +530,10 @@ impl MountScheduler {
             write_ops_by_class: load_atomic_array(&self.counters.write_ops_by_class),
             bytes_read_by_class: load_atomic_array(&self.counters.bytes_read_by_class),
             bytes_written_by_class: load_atomic_array(&self.counters.bytes_written_by_class),
+            backend_read_ops_by_class: load_atomic_array(&self.counters.backend_read_ops_by_class),
+            backend_bytes_read_by_class: load_atomic_array(
+                &self.counters.backend_bytes_read_by_class,
+            ),
             sync_ops: self.counters.sync_ops.load(Ordering::Relaxed),
             hash_ops: self.counters.hash_ops.load(Ordering::Relaxed),
             preallocation_failures: self.counters.preallocation_failures.load(Ordering::Relaxed),
@@ -652,6 +662,9 @@ impl MountScheduler {
             }
             counters.read_ops_by_class[class_index(class)].fetch_add(1, Ordering::Relaxed);
             counters.bytes_read_by_class[class_index(class)]
+                .fetch_add(read as u64, Ordering::Relaxed);
+            counters.backend_read_ops_by_class[class_index(class)].fetch_add(1, Ordering::Relaxed);
+            counters.backend_bytes_read_by_class[class_index(class)]
                 .fetch_add(read as u64, Ordering::Relaxed);
             let bytes = bytes::Bytes::from(buf);
             if class == IoClass::PeerRead && read_len > len {
@@ -1175,10 +1188,18 @@ mod tests {
         assert_eq!(stats.write_ops_by_class[class_index(IoClass::PeerWrite)], 1);
         assert_eq!(stats.read_ops_by_class[class_index(IoClass::PeerRead)], 1);
         assert_eq!(
+            stats.backend_read_ops_by_class[class_index(IoClass::PeerRead)],
+            1
+        );
+        assert_eq!(
             stats.bytes_written_by_class[class_index(IoClass::PeerWrite)],
             4
         );
         assert_eq!(stats.bytes_read_by_class[class_index(IoClass::PeerRead)], 4);
+        assert_eq!(
+            stats.backend_bytes_read_by_class[class_index(IoClass::PeerRead)],
+            4
+        );
         assert_eq!(stats.hash_ops, 1);
         assert_eq!(stats.sync_ops, 1);
         assert_eq!(stats.dirty_files, 0);
@@ -1217,6 +1238,14 @@ mod tests {
         assert_eq!(
             stats.bytes_read_by_class[class_index(IoClass::PeerRead)],
             20
+        );
+        assert_eq!(
+            stats.backend_read_ops_by_class[class_index(IoClass::PeerRead)],
+            1
+        );
+        assert_eq!(
+            stats.backend_bytes_read_by_class[class_index(IoClass::PeerRead)],
+            16
         );
     }
 }

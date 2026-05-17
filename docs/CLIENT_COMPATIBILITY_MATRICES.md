@@ -59,14 +59,14 @@ Status legend:
 
 | Source client | Expected state sources | rtorrentNG import entry point | Fields to preserve | Current status | Tests required |
 |---|---|---|---|---|---|
-| qBittorrent | `.torrent`, `.fastresume`, libtorrent resume keys | `dry_run_qbittorrent_backup_with_options` | info hash, name, save path, category, tags, added/completed times, paused/completed state, uploaded/downloaded, piece states, partial pieces, file priority/wanted/completed bytes, trackers | Native import implemented | Golden qBit profile with all fields; path remap; conflicting piece count |
+| qBittorrent | `.torrent`, `.fastresume`, libtorrent resume keys | `dry_run_qbittorrent_backup_with_options` | info hash, name, save path, category, tags, added/completed times, paused/completed state, uploaded/downloaded, piece states, partial pieces, file priority/wanted/completed bytes, trackers | Native import implemented; JSON and bencoded alias matrix covered | Golden qBit profile with all fields; path remap; conflicting piece count |
 | rTorrent | session `.torrent`, file layout, custom fields when available | `dry_run_rtorrent_session_with_options` | info hash, name, base path, size, completion by file verification, custom label fields | Partial | XMLRPC/session fixture with `d.custom*`, complete/missing files |
-| Transmission | `.torrent`, resume sidecars, legacy and 4.x key names | `dry_run_transmission_session_with_options` | download dir, labels, counters, timestamps, paused/completed, bitfield/have/valid pieces, file wanted/priority/progress, tracker stats | Native import implemented | Transmission profile with old and new key spellings |
-| Deluge | `state`, `torrents.state`, `.fastresume`, libtorrent resume | `dry_run_deluge_state_with_options` | download location, label, counters, timestamps, paused/completed, pieces, file wanted/priority/progress, trackers | Native import implemented | Deluge state fixture plus JSON-RPC field projection comparison |
-| uTorrent/BitTorrent Classic | `resume.dat`, `.dat` bencode, raw hash keys | `dry_run_utorrent_config_with_options` | path/rootdir, labels, counters, timestamps, state flags, pieces/bitfield, file priorities | Native import implemented for common bencode shapes | `resume.dat` corpus with single/multi-file and skipped files |
-| BiglyBT/Vuze | `downloads.config`, `torrents.config`, nested maps | `dry_run_biglybt_config_with_options` | hex hash keys, save path, categories, tags, counters, timestamps, file progress, tracker activity | Partial to native depending on nested resume data | BiglyBT fixture corpus with plugin category fields |
-| Tixati | config directory, `.torrent`, sidecar-like state | `dry_run_tixati_config_with_options` | metadata, path hints, counters/timestamps/progress if discoverable | Partial, verification-first | Tixati fixture corpus; document unknown/private fields |
-| Generic directory | `.torrent` plus adjacent JSON/bencode sidecars | `dry_run_generic_torrent_directory_with_options` | metadata, path remaps, sidecar resume hints | Native | Recursive fixture with symlink, oversized sidecar, path remap |
+| Transmission | `.torrent`, resume sidecars, legacy and 4.x key names | `dry_run_transmission_session_with_options` | download dir, labels, counters, timestamps, paused/completed, bitfield/have/valid pieces, file wanted/priority/progress, tracker stats | Native import implemented; JSON and bencoded alias matrix covered | Transmission profile with old and new key spellings |
+| Deluge | `state`, `torrents.state`, `.fastresume`, libtorrent resume | `dry_run_deluge_state_with_options` | download location, label, counters, timestamps, paused/completed, pieces, file wanted/priority/progress, trackers | Native import implemented; JSON and bencoded alias matrix covered | Deluge state fixture plus JSON-RPC field projection comparison |
+| uTorrent/BitTorrent Classic | `resume.dat`, `.dat` bencode, raw hash keys | `dry_run_utorrent_config_with_options` | path/rootdir, labels, counters, timestamps, state flags, pieces/bitfield, file priorities | Native import implemented; aggregate and bencoded alias matrix covered | `resume.dat` corpus with single/multi-file and skipped files |
+| BiglyBT/Vuze | `downloads.config`, `torrents.config`, nested maps | `dry_run_biglybt_config_with_options` | hex hash keys, save path, categories, tags, counters, timestamps, file progress, tracker activity | Native for common nested/sidecar resume data; bencoded alias matrix covered | BiglyBT fixture corpus with plugin category fields |
+| Tixati | config directory, `.torrent`, sidecar-like state | `dry_run_tixati_config_with_options` | metadata, path hints, counters/timestamps/progress if discoverable | Verification-first import; common bencoded alias matrix covered | Tixati fixture corpus; document unknown/private fields |
+| Generic directory | `.torrent` plus adjacent JSON/bencode sidecars | `dry_run_generic_torrent_directory_with_options` | metadata, path remaps, sidecar resume hints | Native; aggregate `resume.dat` detection and JSON/bencoded alias matrices covered | Recursive fixture with symlink, oversized sidecar, path remap |
 
 ## 3. qBittorrent API Matrix
 
@@ -108,7 +108,7 @@ kebab/camel calls and normalizes Transmission 4.1 snake_case calls.
 | Method group | Upstream methods | Local status | Test rows |
 |---|---|---|---|
 | JSON-RPC shape | JSON-RPC 2.0, snake_case names; old bespoke RPC deprecated but still common | Partial: old response envelope remains, snake_case names/keys supported | JSON-RPC 2.0 envelope row, old envelope row, CSRF header row |
-| Torrent accessor | `torrent_get` with `objects` and `table` formats, `recently_active` removed list | Partial: objects only, no removed list | All-field object row; table format row; recently-active row |
+| Torrent accessor | `torrent_get` with `objects` and `table` formats, `recently_active` removed list | Compat: objects, table rows, and empty removed list supported | All-field object row; table format row; recently-active row |
 | Torrent mutator | `torrent_set` | Partial | Per-field mutation acceptance and projection |
 | Torrent add | `torrent_add` | Native for magnet/metainfo/download dir/paused/labels | Magnet, metainfo, duplicate, invalid metainfo rows |
 | Torrent actions | `torrent_start`, `torrent_start_now`, `torrent_stop`, `torrent_verify`, `torrent_reannounce`, `torrent_remove` | Native | Lifecycle action rows |
@@ -160,9 +160,9 @@ Local implementation: `crates/rt-api-deluge`.
 |---|---|---|---|
 | JSON endpoint/auth | `/json`, `auth.login`, `auth.check_session` | Compat | Auth row |
 | Daemon | `daemon.login`, `daemon.info`, `daemon.get_method_list`, `daemon.shutdown` | Compat | Method-list parity row |
-| Web host management | `web.add_host`, `edit_host`, `remove_host`, `get_hosts`, `get_host_status`, `connect`, `disconnect`, `connected`, `start_daemon`, `stop_daemon` | Partial; add/edit/remove host gaps | Host management shape row |
-| Web torrent helpers | `web.add_torrents`, `download_torrent_from_url`, `get_torrent_files`, `update_ui`, `get_events` | Partial; URL download/add_torrents gap | Web add and update row |
-| Web config/plugins | `web.get_config`, `update_config`, `save_config`, plugins | Partial | Web config row |
+| Web host management | `web.add_host`, `edit_host`, `remove_host`, `get_hosts`, `get_host_status`, `connect`, `disconnect`, `connected`, `start_daemon`, `stop_daemon` | Compat/native shape implemented | Host management shape row |
+| Web torrent helpers | `web.add_torrents`, `download_torrent_from_url`, `get_torrent_files`, `update_ui`, `get_events` | Compat/native shape implemented; URL fetch intentionally no-op to avoid server-side fetch | Web add and update row |
+| Web config/plugins | `web.get_config`, `update_config`, `save_config`, plugins | Compat implemented | Web config row |
 | Core session | `core.get_session_status`, stats/rates/connections, filter tree, cache status, config values | Native/Compat | Session/status/config rows |
 | Core torrent reads | `get_torrents_status`, `get_torrent_status`, `get_torrent_file_status`, `get_session_state` | Native/Partial; requested-key filtering implemented | Requested-key filter row |
 | Core lifecycle | add file/magnet, pause/resume, force_recheck, remove | Native | Lifecycle rows |
@@ -204,8 +204,8 @@ covered today as an import source and as an interop peer.
 |---|---|---|
 | P0 | `api_facade_endpoint_matrix` | Implemented in crate tests: qBit route matrix, Transmission method matrix, Deluge advertised method matrix |
 | P0 | `api_response_field_matrix` | Implemented for current qBit `torrents/info`/`properties`/`sync`, Transmission `torrent-get`/`session-get`, and Deluge torrent status fields; remaining documented gaps stay in field matrices |
-| P0 | `import_fixture_matrix` | Implemented for common JSON resume fields across qBit, Transmission, Deluge, uTorrent, BiglyBT/Vuze, Tixati, and Generic; source-specific golden corpora remain P1 |
-| P0 | `migration_apply_matrix` | Implemented for common resume fields across qBit, Transmission, Deluge, uTorrent, BiglyBT/Vuze, Tixati, and Generic: applies DB rows and fastresume, reloads, and asserts preservation |
+| P0 | `import_fixture_matrix` | Implemented for common JSON resume fields and source-specific bencoded aliases across qBit, Transmission, Deluge, uTorrent, BiglyBT/Vuze, Tixati, and Generic; real exported golden corpora remain P1 |
+| P0 | `migration_apply_matrix` | Implemented for common JSON and bencoded resume fields across qBit, Transmission, Deluge, uTorrent, BiglyBT/Vuze, Tixati, and Generic: applies DB rows and fastresume, reloads, and asserts preservation |
 | P1 | `qbit_arr_client_matrix` | Sonarr/Radarr/Prowlarr/cross-seed/autobrr/NZB360-style qBit flows |
 | P1 | `transmission_client_matrix` | transmission-web, transmission-remote, mobile app field projections |
 | P1 | `deluge_client_matrix` | Deluge WebUI update_ui, thin-client core calls, Label plugin calls |
@@ -221,9 +221,9 @@ covered today as an import source and as an interop peer.
 |---|---|---|
 | P0 | Add automated endpoint/method enumeration tests for qBit, Transmission, and Deluge | Implemented in `rt-api-qbit`, `rt-api-transmission`, and `rt-api-deluge` unit tests |
 | P0 | Add all-field response tests for qBit `torrents/info`, `properties`, `sync/maindata`; Transmission `torrent_get` and `session_get`; Deluge torrent status | Implemented in facade unit tests for currently supported fields |
-| P0 | Expand Transmission 4.1 JSON-RPC envelope support, semver header, `format=table`, and `recently_active` handling | Transmission API matrix |
-| P1 | Add Deluge web host/config helper gaps: `add_host`, `edit_host`, `remove_host`, `get_config`, `download_torrent_from_url`, `add_torrents` | Deluge API matrix |
+| P0 | Expand Transmission 4.1 JSON-RPC envelope support and semver header | Transmission API matrix |
+| P1 | Deepen Deluge `web.add_torrents` with real file upload/temp-file flows when target clients require it | Deluge API matrix |
 | P1 | Broaden qBittorrent preference and property projections to all documented keys | qBit field backlog |
-| P1 | Build golden fixture corpus for qBit, Transmission, Deluge, uTorrent, BiglyBT/Vuze, Tixati, rTorrent | Import matrix |
+| P1 | Build real exported golden fixture corpus for qBit, Transmission, Deluge, uTorrent, BiglyBT/Vuze, Tixati, rTorrent, and compare it against the synthetic JSON/bencoded alias matrices | Import matrix |
 | P2 | Decide rTorrent XMLRPC facade scope | rTorrent matrix |
 | P2 | Import auxiliary RSS/search/scheduler/autoadd/plugin metadata as migration artifacts | Feature/import matrices |

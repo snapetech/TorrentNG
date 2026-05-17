@@ -85,7 +85,8 @@ The following items are still implementation targets:
 - Add latency histograms for read/write/sync/hash work. Prometheus already
   exports aggregate scheduler counters and gauges for running torrents,
   including file-pool activity, queue depth, dirty files, sync/hash/preallocate
-  counters, peer-read cache counters, and in-memory piece assembly pressure.
+  counters, peer-read cache counters, logical and backend read counters, and
+  in-memory piece assembly pressure.
 - Promote peer-read locality from per-file readahead cache to a true
   cross-torrent device elevator that coalesces adjacent requests.
 - Add benchmarks comparing syscall count, seed-read locality, recheck runtime

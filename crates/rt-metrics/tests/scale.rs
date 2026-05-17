@@ -15,9 +15,12 @@ use std::time::{Duration, Instant};
 use axum::{body::Body, http::Request};
 use rt_api_native::{build_router, AppState};
 use rt_api_qbit::AppState as QbState;
-use rt_path::{StorageProfile, StorageRootId};
+use rt_path::{SafeRelPath, StorageProfile, StorageRootId};
+use rt_piece_map::{FileSpan, PieceMap};
 use rt_session::TorrentEntry;
-use rt_storage::{IoClass, MountScheduler, SchedulerConfig};
+use rt_storage::{
+    IoClass, MountScheduler, PreallocationMode, SchedulerConfig, StorageIoConfig, VerifyResult,
+};
 use rt_tracker::backoff::jitter_interval;
 use tower::ServiceExt;
 
@@ -206,6 +209,248 @@ async fn recheck_does_not_starve_seeding_peer_reads() {
 
     assert_eq!(scheduler.available_permits(IoClass::Recheck), 0);
     assert_eq!(scheduler.available_permits(IoClass::PeerRead), 0);
+}
+
+#[tokio::test]
+async fn storage_file_pool_stays_bounded_under_active_file_churn() {
+    let dir = tempfile::tempdir().unwrap();
+    let scheduler = MountScheduler::new(
+        StorageRootId::new(),
+        &SchedulerConfig {
+            profile: StorageProfile::Hdd,
+            storage_io: StorageIoConfig {
+                file_pool_size: 8,
+                io_worker_threads: 4,
+                io_queue_depth: 64,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+
+    for i in 0..64 {
+        let path = dir.path().join(format!("payload-{i}.bin"));
+        std::fs::write(&path, vec![i as u8; 4096]).unwrap();
+        let data = scheduler
+            .read_at(IoClass::PeerRead, &path, 0, 1024)
+            .await
+            .unwrap();
+        assert_eq!(data.len(), 1024);
+    }
+
+    let stats = scheduler.stats();
+    assert_eq!(stats.file_pool.capacity, 8);
+    assert!(
+        stats.file_pool.open_files <= 8,
+        "file pool leaked descriptors: {:?}",
+        stats.file_pool
+    );
+    assert!(
+        stats.file_pool.evictions >= 56,
+        "expected LRU churn under capacity pressure: {:?}",
+        stats.file_pool
+    );
+    assert_eq!(
+        stats.read_ops_by_class[IoClass::PeerRead as usize],
+        64,
+        "every peer read should be accounted by class"
+    );
+}
+
+#[tokio::test]
+async fn storage_peer_read_readahead_reduces_backend_reads_for_adjacent_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("movie-piece.bin");
+    let payload: Vec<u8> = (0..512 * 1024).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&path, &payload).unwrap();
+    let scheduler = MountScheduler::new(
+        StorageRootId::new(),
+        &SchedulerConfig {
+            profile: StorageProfile::Hdd,
+            storage_io: StorageIoConfig {
+                peer_read_readahead_bytes: 512 * 1024,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+
+    for block in 0..32 {
+        let offset = block * 16 * 1024;
+        let data = scheduler
+            .read_at(IoClass::PeerRead, &path, offset as u64, 16 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(&data[..], &payload[offset..offset + 16 * 1024]);
+    }
+
+    let stats = scheduler.stats();
+    assert_eq!(stats.peer_read_cache_misses, 1);
+    assert_eq!(stats.peer_read_cache_hits, 31);
+    assert_eq!(stats.peer_read_cache_entries, 1);
+    assert_eq!(
+        stats.read_ops_by_class[IoClass::PeerRead as usize],
+        32,
+        "logical peer reads should still be accounted individually"
+    );
+    assert_eq!(
+        stats.backend_read_ops_by_class[IoClass::PeerRead as usize],
+        1,
+        "adjacent peer reads should be served from one backend disk read"
+    );
+    assert_eq!(
+        stats.backend_bytes_read_by_class[IoClass::PeerRead as usize],
+        512 * 1024
+    );
+}
+
+#[tokio::test]
+async fn storage_positioned_io_preserves_offsets_under_concurrency() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("positioned-payload.bin");
+    let scheduler = MountScheduler::new(
+        StorageRootId::new(),
+        &SchedulerConfig {
+            profile: StorageProfile::Ssd,
+            storage_io: StorageIoConfig {
+                io_worker_threads: 8,
+                io_queue_depth: 128,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    scheduler
+        .prepare_file(&path, 128 * 4096, PreallocationMode::Sparse)
+        .await
+        .unwrap();
+
+    let mut writes = Vec::new();
+    for block in 0..128 {
+        let scheduler = scheduler.clone();
+        let path = path.clone();
+        writes.push(tokio::spawn(async move {
+            let fill = (block % 251) as u8;
+            scheduler
+                .write_at(
+                    IoClass::PeerWrite,
+                    &path,
+                    block * 4096,
+                    bytes::Bytes::from(vec![fill; 4096]),
+                    false,
+                )
+                .await
+                .unwrap();
+        }));
+    }
+    for write in writes {
+        write.await.unwrap();
+    }
+
+    for block in [0_u64, 1, 31, 64, 127] {
+        let data = scheduler
+            .read_at(IoClass::Foreground, &path, block * 4096, 4096)
+            .await
+            .unwrap();
+        assert!(data.iter().all(|byte| *byte == (block % 251) as u8));
+    }
+
+    let stats = scheduler.stats();
+    assert_eq!(stats.write_ops_by_class[IoClass::PeerWrite as usize], 128);
+    assert_eq!(
+        stats.bytes_written_by_class[IoClass::PeerWrite as usize],
+        128 * 4096
+    );
+}
+
+#[tokio::test]
+async fn storage_hash_pool_does_not_block_peer_read_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("seed.bin");
+    std::fs::write(&path, vec![7_u8; 64 * 1024]).unwrap();
+    let scheduler = MountScheduler::new(
+        StorageRootId::new(),
+        &SchedulerConfig {
+            profile: StorageProfile::Hdd,
+            storage_io: StorageIoConfig {
+                hash_worker_threads: 1,
+                hash_queue_depth: 2,
+                io_worker_threads: 2,
+                io_queue_depth: 16,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+
+    let mut hash_tasks = Vec::new();
+    for i in 0..8 {
+        let scheduler = scheduler.clone();
+        hash_tasks.push(tokio::spawn(async move {
+            let data = bytes::Bytes::from(vec![i as u8; 1024 * 1024]);
+            scheduler.hash_sha1(data).await.unwrap()
+        }));
+    }
+
+    let read = tokio::time::timeout(
+        Duration::from_millis(threshold(50) as u64),
+        scheduler.read_at(IoClass::PeerRead, &path, 0, 16 * 1024),
+    )
+    .await
+    .expect("peer read should not wait behind hash queue")
+    .unwrap();
+    assert_eq!(read.len(), 16 * 1024);
+
+    for task in hash_tasks {
+        let hash = task.await.unwrap();
+        assert_ne!(hash, [0; 20]);
+    }
+
+    let stats = scheduler.stats();
+    assert_eq!(stats.hash_ops, 8);
+    assert_eq!(stats.read_ops_by_class[IoClass::PeerRead as usize], 1);
+}
+
+#[tokio::test]
+async fn storage_recheck_hashing_reports_scheduler_result_without_runtime_stall() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("recheck.bin");
+    let content = b"piece-zero-piece-one";
+    std::fs::write(&path, content).unwrap();
+    let scheduler = MountScheduler::new(
+        StorageRootId::new(),
+        &SchedulerConfig {
+            profile: StorageProfile::Hdd,
+            recheck_concurrency: 1,
+            peer_read_concurrency: 4,
+            ..Default::default()
+        },
+    );
+    let hash = scheduler
+        .hash_sha1(bytes::Bytes::copy_from_slice(content))
+        .await
+        .unwrap();
+    let piece_map = PieceMap::new(
+        content.len() as u64,
+        vec![FileSpan {
+            file_index: 0,
+            path: SafeRelPath::from_name("recheck.bin", false).unwrap(),
+            content_offset: 0,
+            length: content.len() as u64,
+        }],
+    )
+    .unwrap();
+    let hashes = [hash];
+    let verifier = rt_storage::PieceVerifier::new(dir.path(), &scheduler, &piece_map, &hashes);
+
+    let result = tokio::time::timeout(Duration::from_secs(2), verifier.verify_piece(0))
+        .await
+        .expect("recheck hashing should finish without stalling the runtime");
+    assert_eq!(result, VerifyResult::Valid);
+
+    let stats = scheduler.stats();
+    assert_eq!(stats.read_ops_by_class[IoClass::Recheck as usize], 1);
+    assert!(stats.hash_ops >= 2);
 }
 
 fn current_rss_bytes() -> Option<u64> {

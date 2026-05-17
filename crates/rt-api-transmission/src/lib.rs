@@ -589,6 +589,14 @@ async fn session_stats(state: &AppState) -> Value {
 }
 
 async fn torrent_get(state: &AppState, args: &Value) -> Value {
+    let table_format = args
+        .get("format")
+        .and_then(Value::as_str)
+        .is_some_and(|format| format.eq_ignore_ascii_case("table"));
+    let recently_active = args
+        .get("ids")
+        .and_then(Value::as_str)
+        .is_some_and(|ids| ids.eq_ignore_ascii_case("recently-active"));
     let fields = args
         .get("fields")
         .and_then(Value::as_array)
@@ -775,7 +783,33 @@ async fn torrent_get(state: &AppState, args: &Value) -> Value {
             Value::Object(obj)
         })
         .collect::<Vec<_>>();
-    json!({ "torrents": torrents })
+    let mut response = serde_json::Map::new();
+    if table_format {
+        let rows = torrents
+            .iter()
+            .map(|torrent| {
+                let obj = torrent.as_object();
+                Value::Array(
+                    fields
+                        .iter()
+                        .map(|field| {
+                            obj.and_then(|obj| obj.get(field))
+                                .cloned()
+                                .unwrap_or(Value::Null)
+                        })
+                        .collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        response.insert("fields".to_owned(), json!(fields));
+        response.insert("torrents".to_owned(), json!(rows));
+    } else {
+        response.insert("torrents".to_owned(), json!(torrents));
+    }
+    if recently_active {
+        response.insert("removed".to_owned(), json!([]));
+    }
+    Value::Object(response)
 }
 
 fn transmission_field_needs_peers(field: &str) -> bool {
@@ -1640,6 +1674,48 @@ mod tests {
         assert_eq!(body["arguments"]["torrents"][0]["percent_done"], 0.6);
         assert_eq!(body["arguments"]["torrents"][0]["left_until_done"], 40);
         assert_eq!(body["arguments"]["torrents"][0]["download_dir"], "/old");
+    }
+
+    #[tokio::test]
+    async fn transmission_torrent_get_supports_table_format_and_recently_active() {
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        {
+            let mut reg = registry.write().await;
+            let mut entry = TorrentEntry::new("e".repeat(40), "echo".into(), "/data".into());
+            entry.total_length = 200;
+            entry.amount_left = 50;
+            reg.add(entry).unwrap();
+        }
+        let app = build_transmission_router(AppState::new(registry));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .header("content-type", "application/json")
+                    .header("x-transmission-session-id", SESSION_ID)
+                    .body(Body::from(
+                        r#"{"method":"torrent-get","arguments":{"ids":"recently-active","format":"table","fields":["id","hashString","name","percentDone","leftUntilDone"]}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(body["result"], "success");
+        assert_eq!(
+            body["arguments"]["fields"],
+            json!(["id", "hashString", "name", "percentDone", "leftUntilDone"])
+        );
+        assert_eq!(body["arguments"]["torrents"][0][0], 1);
+        assert_eq!(body["arguments"]["torrents"][0][1], "e".repeat(40));
+        assert_eq!(body["arguments"]["torrents"][0][2], "echo");
+        assert_eq!(body["arguments"]["torrents"][0][3], 0.75);
+        assert_eq!(body["arguments"]["torrents"][0][4], 50);
+        assert_eq!(body["arguments"]["removed"], json!([]));
     }
 
     #[tokio::test]

@@ -15,10 +15,13 @@ rt-session = { path = "../rt-session" }
 rt-api-native = { path = "../rt-api-native" }
 rt-api-qbit = { path = "../rt-api-qbit" }
 rt-db = { path = "../rt-db" }
+rt-piece-map = { path = "../rt-piece-map" }
 rt-testkit = { path = "../rt-testkit" }
 rt-tracker = { path = "../rt-tracker" }
 rt-storage = { path = "../rt-storage" }
 rt-path = { path = "../rt-path" }
+bytes.workspace = true
+tempfile.workspace = true
 tokio = { version = "1", features = ["full"] }
 tower.workspace = true
 axum.workspace = true

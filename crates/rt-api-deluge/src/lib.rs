@@ -83,11 +83,16 @@ async fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Va
         "daemon.get_method_list" => Ok(json!(supported_methods())),
         "daemon.shutdown" => Ok(json!(true)),
         "web.connected" => Ok(json!(true)),
+        "web.add_host" => Ok(json!("rtorrentNG")),
+        "web.edit_host" | "web.remove_host" => Ok(json!(true)),
+        "web.get_config" => Ok(deluge_web_config()),
         "web.get_host_status" => Ok(json!(["rtorrentNG", "127.0.0.1", 0, "Online"])),
         "web.get_hosts" => Ok(json!([["rtorrentNG", "127.0.0.1", 0, "rtorrentNG"]])),
         "web.connect" | "web.disconnect" | "web.start_daemon" | "web.stop_daemon" => {
             Ok(json!(true))
         }
+        "web.download_torrent_from_url" => Ok(json!("")),
+        "web.add_torrents" => web_add_torrents(state, params).await,
         "web.get_events" => web_events(state).await,
         "web.get_plugins" => Ok(json!(deluge_plugins())),
         "web.get_plugin_info" => Ok(plugin_info(params.first().and_then(Value::as_str))),
@@ -228,6 +233,10 @@ fn supported_methods() -> Vec<&'static str> {
         "daemon.get_method_list",
         "daemon.shutdown",
         "web.connected",
+        "web.add_host",
+        "web.edit_host",
+        "web.remove_host",
+        "web.get_config",
         "web.update_ui",
         "web.get_events",
         "web.get_hosts",
@@ -236,6 +245,8 @@ fn supported_methods() -> Vec<&'static str> {
         "web.disconnect",
         "web.start_daemon",
         "web.stop_daemon",
+        "web.download_torrent_from_url",
+        "web.add_torrents",
         "web.get_plugins",
         "web.get_plugin_info",
         "web.upload_plugin",
@@ -356,6 +367,59 @@ fn deluge_config_value(key: Option<&Value>) -> Value {
         return Value::Null;
     };
     deluge_config().get(key).cloned().unwrap_or(Value::Null)
+}
+
+fn deluge_web_config() -> Value {
+    json!({
+        "base": "/",
+        "pwd_salt": "",
+        "pwd_sha1": "",
+        "sessions": {},
+        "session_timeout": 3600,
+        "default_daemon": "rtorrentNG",
+        "sidebar_show_zero": false,
+        "sidebar_multiple_filters": true,
+        "show_session_speed": false,
+        "theme": "gray",
+        "first_login": false,
+    })
+}
+
+async fn web_add_torrents(state: &AppState, params: &[Value]) -> Result<Value, String> {
+    let Some(torrents) = params.first().and_then(Value::as_array) else {
+        return Ok(json!(true));
+    };
+    if state.engine.is_none() {
+        return Ok(json!(true));
+    }
+    let mut results = Vec::new();
+    for torrent in torrents {
+        let options = torrent.get("options").or_else(|| torrent.get("params"));
+        let path = torrent
+            .get("path")
+            .or_else(|| torrent.get("url"))
+            .or_else(|| torrent.get("filename"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let result = if path.starts_with("magnet:") {
+            add_magnet(state, path, options).await
+        } else if let Some(data) = torrent
+            .get("data")
+            .or_else(|| torrent.get("torrent"))
+            .or_else(|| torrent.get("metainfo"))
+            .and_then(Value::as_str)
+        {
+            add_torrent_file(state, data, options).await
+        } else {
+            Ok(json!(true))
+        };
+        results.push(json!({
+            "path": path,
+            "success": result.is_ok(),
+            "result": result.unwrap_or(Value::Null),
+        }));
+    }
+    Ok(Value::Array(results))
 }
 
 async fn move_storage(state: &AppState, params: &[Value]) -> Result<Value, String> {
@@ -1492,6 +1556,13 @@ mod tests {
             ("daemon.get_method_list", r#"[]"#),
             ("daemon.shutdown", r#"[]"#),
             ("web.connected", r#"[]"#),
+            ("web.add_host", r#"["127.0.0.1",58846,"localclient",""]"#),
+            (
+                "web.edit_host",
+                r#"["rtorrentNG","127.0.0.1",58846,"localclient",""]"#,
+            ),
+            ("web.remove_host", r#"["rtorrentNG"]"#),
+            ("web.get_config", r#"[]"#),
             ("web.update_ui", r#"[[],{}]"#),
             ("web.get_events", r#"[]"#),
             ("web.get_hosts", r#"[]"#),
@@ -1500,6 +1571,11 @@ mod tests {
             ("web.disconnect", r#"[]"#),
             ("web.start_daemon", r#"[]"#),
             ("web.stop_daemon", r#"[]"#),
+            (
+                "web.download_torrent_from_url",
+                r#"["https://example.invalid/test.torrent"]"#,
+            ),
+            ("web.add_torrents", r#"[[]]"#),
             ("web.get_plugins", r#"[]"#),
             ("web.get_plugin_info", r#"["Label"]"#),
             ("web.upload_plugin", r#"[]"#),

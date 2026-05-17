@@ -3187,6 +3187,71 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bencoded_import_source_matrix_preserves_client_specific_aliases() {
+        for case in import_source_matrix_cases() {
+            let source = case.source;
+            let fixture = write_common_bencoded_resume_fixture(case.source, case.extension);
+            let plan = (case.dry_run)(fixture.root.path()).unwrap();
+            assert_eq!(plan.source, source);
+            assert_eq!(plan.torrents.len(), 1, "{source:?}");
+            let torrent = &plan.torrents[0];
+
+            assert_eq!(
+                torrent.save_path.as_deref(),
+                Some(fixture.save_path.as_path()),
+                "{source:?}"
+            );
+            assert_eq!(torrent.category.as_deref(), Some("linux"), "{source:?}");
+            assert_eq!(
+                torrent.tags,
+                vec!["iso".to_owned(), "archive".to_owned()],
+                "{source:?}"
+            );
+            assert_eq!(torrent.uploaded, Some(900), "{source:?}");
+            assert_eq!(torrent.downloaded, Some(300), "{source:?}");
+            assert_eq!(torrent.completed, Some(true), "{source:?}");
+            assert_eq!(torrent.paused, Some(true), "{source:?}");
+            assert_eq!(torrent.files[0].priority, 2, "{source:?}");
+            assert_eq!(torrent.files[0].wanted, true, "{source:?}");
+            assert_eq!(torrent.files[0].completed_bytes, Some(12), "{source:?}");
+            assert_eq!(torrent.tracker_activity.seeders, Some(8), "{source:?}");
+            assert_eq!(
+                torrent.resume_confidence,
+                ResumeConfidence::Trusted,
+                "{source:?}"
+            );
+
+            let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+            rt_db::migrate(&conn).unwrap();
+            let fastresume_dir = tempfile::tempdir().unwrap();
+            let summary = plan
+                .apply_native_import(
+                    &mut conn,
+                    fastresume_dir.path(),
+                    &ImportOptions::default(),
+                    ImportPolicy::TrustHints,
+                )
+                .unwrap();
+
+            assert_eq!(summary.db.torrents, 1, "{source:?}");
+            assert_eq!(summary.fastresume.states, 1, "{source:?}");
+            assert_eq!(
+                rt_db::get(&conn, &fixture.info_hash).unwrap().save_path,
+                fixture.save_path.to_string_lossy(),
+                "{source:?}"
+            );
+            let files = rt_db::list_torrent_files(&conn, &fixture.info_hash).unwrap();
+            assert_eq!(files[0].priority, 2, "{source:?}");
+            assert!(files[0].wanted, "{source:?}");
+            assert_eq!(files[0].completed_bytes, 12, "{source:?}");
+            let state = FastresumeStore::new(fastresume_dir.path())
+                .load(&fixture.info_hash)
+                .unwrap();
+            assert_eq!(state.pieces, vec![PieceState::Valid], "{source:?}");
+        }
+    }
+
     struct ImportSourceMatrixCase {
         source: MigrationSource,
         extension: &'static str,
@@ -3284,6 +3349,183 @@ mod tests {
             serde_json::to_vec(&resume).unwrap(),
         )
         .unwrap();
+        ImportSourceFixture {
+            root: dir,
+            info_hash,
+            save_path,
+        }
+    }
+
+    fn write_common_bencoded_resume_fixture(
+        source: MigrationSource,
+        extension: &str,
+    ) -> ImportSourceFixture {
+        let dir = tempfile::tempdir().unwrap();
+        let torrent_path = dir.path().join("sample.torrent");
+        let info_hash = write_fixture_torrent(&torrent_path);
+        let info_hash = hex_lower(&info_hash);
+        let save_path = dir.path().join("downloads");
+        std::fs::create_dir_all(&save_path).unwrap();
+        std::fs::write(save_path.join("sample.bin"), [1u8; 12]).unwrap();
+        std::fs::rename(
+            &torrent_path,
+            dir.path().join(format!("{info_hash}.torrent")),
+        )
+        .unwrap();
+
+        let save_path_text = save_path.to_string_lossy().into_owned();
+        let save_path_bytes = save_path_text.as_bytes();
+        let mut resume = match source {
+            MigrationSource::QBittorrent => vec![
+                (b"qBt-savePath".as_slice(), BValue::Bytes(save_path_bytes)),
+                (b"qBt-category".as_slice(), BValue::Bytes(b"linux")),
+                (b"qBt-tags".as_slice(), BValue::Bytes(b"iso,archive")),
+                (b"total_uploaded".as_slice(), BValue::Int(900)),
+                (b"total_downloaded".as_slice(), BValue::Int(300)),
+                (b"completed".as_slice(), BValue::Int(1)),
+                (b"added_on".as_slice(), BValue::Int(1_700_000_000)),
+                (b"completed_on".as_slice(), BValue::Int(1_700_000_100)),
+                (b"paused".as_slice(), BValue::Int(1)),
+                (b"qBt-filePriority".as_slice(), BValue::Bytes(&[2])),
+                (b"qBt-fileWanted".as_slice(), BValue::Bytes(&[1])),
+                (
+                    b"file_completed_bytes".as_slice(),
+                    BValue::List(vec![BValue::Int(12)]),
+                ),
+                (b"pieces".as_slice(), BValue::Bytes(&[1])),
+            ],
+            MigrationSource::Transmission => vec![
+                (b"downloadDir".as_slice(), BValue::Bytes(save_path_bytes)),
+                (b"label".as_slice(), BValue::Bytes(b"linux")),
+                (
+                    b"labels".as_slice(),
+                    BValue::List(vec![BValue::Bytes(b"iso"), BValue::Bytes(b"archive")]),
+                ),
+                (b"uploadedEver".as_slice(), BValue::Int(900)),
+                (b"downloadedEver".as_slice(), BValue::Int(300)),
+                (b"complete".as_slice(), BValue::Int(1)),
+                (b"addedAt".as_slice(), BValue::Int(1_700_000_000)),
+                (b"completedAt".as_slice(), BValue::Int(1_700_000_100)),
+                (b"paused".as_slice(), BValue::Int(1)),
+                (b"priority".as_slice(), BValue::List(vec![BValue::Int(2)])),
+                (b"wanted".as_slice(), BValue::List(vec![BValue::Int(1)])),
+                (
+                    b"fileProgress".as_slice(),
+                    BValue::List(vec![BValue::Int(12)]),
+                ),
+                (b"bitfield".as_slice(), BValue::Bytes(&[0x80])),
+            ],
+            MigrationSource::Deluge => vec![
+                (
+                    b"download_location".as_slice(),
+                    BValue::Bytes(save_path_bytes),
+                ),
+                (b"label".as_slice(), BValue::Bytes(b"linux")),
+                (
+                    b"tags".as_slice(),
+                    BValue::List(vec![BValue::Bytes(b"iso"), BValue::Bytes(b"archive")]),
+                ),
+                (b"total_uploaded".as_slice(), BValue::Int(900)),
+                (b"total_downloaded".as_slice(), BValue::Int(300)),
+                (b"finished".as_slice(), BValue::Int(1)),
+                (b"time_added".as_slice(), BValue::Int(1_700_000_000)),
+                (b"time_completed".as_slice(), BValue::Int(1_700_000_100)),
+                (b"is_paused".as_slice(), BValue::Int(1)),
+                (
+                    b"file_priorities".as_slice(),
+                    BValue::List(vec![BValue::Int(2)]),
+                ),
+                (
+                    b"file_wanted".as_slice(),
+                    BValue::List(vec![BValue::Int(1)]),
+                ),
+                (
+                    b"file_completed".as_slice(),
+                    BValue::List(vec![BValue::Int(12)]),
+                ),
+                (b"pieces".as_slice(), BValue::Bytes(&[1])),
+            ],
+            MigrationSource::UTorrent => vec![
+                (b"rootdir".as_slice(), BValue::Bytes(save_path_bytes)),
+                (b"custom1".as_slice(), BValue::Bytes(b"linux")),
+                (
+                    b"labels".as_slice(),
+                    BValue::List(vec![BValue::Bytes(b"iso"), BValue::Bytes(b"archive")]),
+                ),
+                (b"up_total".as_slice(), BValue::Int(900)),
+                (b"down_total".as_slice(), BValue::Int(300)),
+                (b"complete".as_slice(), BValue::Int(1)),
+                (b"added_on".as_slice(), BValue::Int(1_700_000_000)),
+                (b"completed_on".as_slice(), BValue::Int(1_700_000_100)),
+                (b"state".as_slice(), BValue::Bytes(b"paused")),
+                (b"priorities".as_slice(), BValue::List(vec![BValue::Int(2)])),
+                (b"wanted".as_slice(), BValue::Bytes(&[1])),
+                (
+                    b"file_progress".as_slice(),
+                    BValue::List(vec![BValue::Int(12)]),
+                ),
+                (b"bitfield".as_slice(), BValue::Bytes(&[0x80])),
+            ],
+            MigrationSource::BiglyBT => vec![
+                (b"save_dir".as_slice(), BValue::Bytes(save_path_bytes)),
+                (b"category".as_slice(), BValue::Bytes(b"linux")),
+                (b"tags".as_slice(), BValue::Bytes(b"iso,archive")),
+                (b"uploaded_bytes".as_slice(), BValue::Int(900)),
+                (b"downloaded_bytes".as_slice(), BValue::Int(300)),
+                (b"is_complete".as_slice(), BValue::Int(1)),
+                (b"added_at".as_slice(), BValue::Int(1_700_000_000)),
+                (b"completed_at".as_slice(), BValue::Int(1_700_000_100)),
+                (b"status".as_slice(), BValue::Bytes(b"paused")),
+                (
+                    b"filePriorities".as_slice(),
+                    BValue::List(vec![BValue::Int(2)]),
+                ),
+                (b"fileWanted".as_slice(), BValue::List(vec![BValue::Int(1)])),
+                (
+                    b"fileCompletedBytes".as_slice(),
+                    BValue::List(vec![BValue::Int(12)]),
+                ),
+                (b"valid".as_slice(), BValue::Bytes(&[0x80])),
+            ],
+            MigrationSource::Tixati | MigrationSource::Generic => vec![
+                (b"save_path".as_slice(), BValue::Bytes(save_path_bytes)),
+                (b"category".as_slice(), BValue::Bytes(b"linux")),
+                (b"tags".as_slice(), BValue::Bytes(b"iso,archive")),
+                (b"uploaded".as_slice(), BValue::Int(900)),
+                (b"downloaded".as_slice(), BValue::Int(300)),
+                (b"completed".as_slice(), BValue::Int(1)),
+                (b"added_at".as_slice(), BValue::Int(1_700_000_000)),
+                (b"completed_at".as_slice(), BValue::Int(1_700_000_100)),
+                (b"paused".as_slice(), BValue::Int(1)),
+                (
+                    b"file_priorities".as_slice(),
+                    BValue::List(vec![BValue::Int(2)]),
+                ),
+                (
+                    b"file_wanted".as_slice(),
+                    BValue::List(vec![BValue::Int(1)]),
+                ),
+                (
+                    b"file_completed_bytes".as_slice(),
+                    BValue::List(vec![BValue::Int(12)]),
+                ),
+                (b"pieces".as_slice(), BValue::Bytes(&[1])),
+            ],
+            MigrationSource::RTorrent => unreachable!("rTorrent is not in the sidecar matrix"),
+        };
+        resume.push((b"last_announce".as_slice(), BValue::Int(1_700_000_050)));
+        resume.push((b"next_announce".as_slice(), BValue::Int(1_700_000_500)));
+        resume.push((b"seeds".as_slice(), BValue::Int(8)));
+        resume.push((b"peers".as_slice(), BValue::Int(2)));
+        resume.sort_by(|a, b| a.0.cmp(b.0));
+
+        let resume_name = if source == MigrationSource::Generic {
+            "resume.dat".to_owned()
+        } else {
+            format!("{info_hash}.{extension}")
+        };
+        std::fs::write(dir.path().join(resume_name), encode(&BValue::Dict(resume))).unwrap();
+
         ImportSourceFixture {
             root: dir,
             info_hash,

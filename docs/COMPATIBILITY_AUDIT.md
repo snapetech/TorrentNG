@@ -34,6 +34,9 @@ Primary references checked on 2026-05-17:
 Shared import features:
 
 - Bencode and JSON sidecars.
+- Synthetic matrix coverage for common JSON fields and client-specific bencoded
+  aliases across qBittorrent, Transmission, Deluge, uTorrent/BitTorrent Classic,
+  BiglyBT/Vuze, Tixati, and generic directories.
 - Aggregate containers named `resume.dat`, `downloads.config`, `torrents.config`.
 - Hash matching by raw SHA-1 bytes, lowercase/uppercase hex, base32, and torrent stem.
 - Aggregate resume detection is source-independent for known aggregate filenames
@@ -82,7 +85,7 @@ Local surface: `crates/rt-api-transmission`.
 | Groups | `group_get`, `group_set` | Accepted as compatibility no-ops |
 | Torrent actions | start, start now, stop, verify, reannounce, remove | Implemented |
 | Torrent add | filename magnet, base64 metainfo, paused, download dir, labels | Implemented |
-| Torrent reads | `torrent_get` common fields: identity, status, size/progress, counters, labels, paths, files, file stats, trackers, tracker stats, peers, queue, dates, private flag, magnet link | Implemented |
+| Torrent reads | `torrent_get` common fields: identity, status, size/progress, counters, labels, paths, files, file stats, trackers, tracker stats, peers, queue, dates, private flag, magnet link; object and table formats; recently-active removed list | Implemented |
 | Torrent writes | `torrent_set`, tracker list, file priorities, wanted/unwanted, location, rename path | Implemented where native engine supports it; accepted as no-op otherwise |
 | Utility | `port_test`, `blocklist_update`, `free_space` | Implemented as compatibility responses |
 | Remaining field depth | detailed availability depth, group internals, live webseed activity, detailed session script/blocklist/preferred transport settings | Gap or compatibility placeholder |
@@ -95,8 +98,8 @@ Local surface: `crates/rt-api-deluge`.
 |---|---|---|
 | JSON endpoint | `/json`, `/deluge/json` | Implemented |
 | Auth/daemon | login, check session, daemon login/info/method list/shutdown | Implemented |
-| Web host management | connected, hosts, host status, connect/disconnect/start/stop daemon | Implemented as native/no-op compatibility |
-| Web UI | update UI, events, torrent files, plugin list/info/upload/update/save config | Implemented |
+| Web host management | add/edit/remove host, connected, hosts, host status, connect/disconnect/start/stop daemon | Implemented as native/no-op compatibility |
+| Web UI | add torrents, URL download placeholder, update UI, events, torrent files, plugin list/info/upload/update/save config | Implemented; URL download does not perform server-side network fetch |
 | Core session reads | stats, session status/state, rates, connections, filter tree, cache status, config, config values, config value, free space, listen port, external IP, path size, libtorrent version | Implemented |
 | Core torrent reads | torrents status, torrent status, torrent file status | Implemented |
 | Core torrent lifecycle | add magnet, add torrent file, pause, resume, force recheck, remove | Implemented |
@@ -109,6 +112,8 @@ Local surface: `crates/rt-api-deluge`.
 | Priority | Work item | Why |
 |---|---|---|
 | Done | Add tests that enumerate advertised facade methods and assert every advertised method returns a compatibility-shaped response | Prevents method-list drift |
+| Done | Add cross-source import/apply matrices for JSON and bencoded resume aliases | Prevents fast-resume regressions when migrating from old clients |
 | Medium | Add qBittorrent preference-key breadth for modern WebUI clients | Avoids settings panes seeing absent keys |
+| Medium | Replace synthetic import aliases with real exported golden corpora for every supported legacy client version family | Catches undocumented key variants and nested plugin state |
 | Medium | Import scheduler/RSS/search metadata as auxiliary migration artifacts | Useful for full client migration, not required for torrent progress |
 | Low | Proprietary client deep parsers for Tixati/BiglyBT plugin-only fields | Needs fixture corpus; progress import already uses generic verified paths |
