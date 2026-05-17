@@ -47,6 +47,7 @@ RUSTTORRENTD_CONFIG=/config/config.toml rusttorrentd
 |---|---|---|
 | `download_dir` | `~/Downloads` or `/tmp` | Default payload download directory |
 | `device_elevator_enabled` | `true` | Enable per-device peer-read elevator scheduling where storage profiles benefit |
+| `peer_read_cache_entries` | `64` | Bounded per-scheduler peer-read readahead cache entries; set to `0` to disable cached readahead reuse |
 
 ### `[memory]`
 

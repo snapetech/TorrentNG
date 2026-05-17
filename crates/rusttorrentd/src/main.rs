@@ -1,8 +1,17 @@
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
+use std::time::Instant;
 
 use anyhow::Context;
+use axum::{
+    body::Body,
+    http::{header, Request},
+    middleware::{self, Next},
+    response::Response,
+};
 use tokio::sync::RwLock;
-use tower_http::trace::TraceLayer;
 use tracing::info;
 
 use rt_api_deluge::AppState as DelugeState;
@@ -59,7 +68,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(qbit_router)
         .merge(transmission_router)
         .merge(deluge_router)
-        .layer(TraceLayer::new_for_http());
+        .layer(middleware::from_fn(request_log));
 
     let api_addr: std::net::SocketAddr = config
         .daemon
@@ -87,6 +96,47 @@ async fn main() -> anyhow::Result<()> {
         .context("API server error")?;
 
     Ok(())
+}
+
+static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+async fn request_log(req: Request<Body>, next: Next) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_owned();
+    if skip_request_log(&path) {
+        return next.run(req).await;
+    }
+    let request_id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let started = Instant::now();
+    let response = next.run(req).await;
+    let status = response.status();
+    let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let response_size = response
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    tracing::info!(
+        component = "http",
+        operation = "request",
+        request_id,
+        method = %method,
+        path = %path,
+        status = status.as_u16(),
+        duration_ms,
+        response_size,
+        result = if status.is_server_error() { "error" } else { "ok" },
+        "http request completed"
+    );
+    response
+}
+
+fn skip_request_log(path: &str) -> bool {
+    path == "/health"
+        || path == "/metrics"
+        || path == "/favicon.ico"
+        || path.starts_with("/assets/")
+        || path.starts_with("/static/")
 }
 
 fn load_config() -> Config {

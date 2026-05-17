@@ -1,13 +1,21 @@
 use axum::{
+    body::Body,
+    http::{header, Request},
     middleware,
+    response::Response,
     routing::{delete, get, patch, post, put},
     Router,
 };
-use std::sync::Arc;
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
 use tokio::sync::broadcast;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::services::{ServeDir, ServeFile};
-use tower_http::trace::TraceLayer;
 
 use crate::{
     auth::require_auth, cache::Db, config::Config, metrics::SharedMetrics, rtorrent::Client,
@@ -148,7 +156,48 @@ pub fn build_router(state: AppState) -> Router {
                 .not_found_service(ServeFile::new(format!("{static_dir}/index.html"))),
         )
         .layer(RequestBodyLimitLayer::new(64 * 1024 * 1024))
-        .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn(request_log))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth))
         .with_state(state)
+}
+
+static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+async fn request_log(req: Request<Body>, next: middleware::Next) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_owned();
+    if skip_request_log(&path) {
+        return next.run(req).await;
+    }
+    let request_id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let started = Instant::now();
+    let response = next.run(req).await;
+    let status = response.status();
+    let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let response_size = response
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    tracing::info!(
+        component = "http",
+        operation = "request",
+        request_id,
+        method = %method,
+        path = %path,
+        status = status.as_u16(),
+        duration_ms,
+        response_size,
+        result = if status.is_server_error() { "error" } else { "ok" },
+        "http request completed"
+    );
+    response
+}
+
+fn skip_request_log(path: &str) -> bool {
+    path == "/health"
+        || path == "/metrics"
+        || path == "/favicon.ico"
+        || path.starts_with("/assets/")
+        || path.starts_with("/static/")
 }

@@ -1227,6 +1227,13 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
     );
     metric(
         &mut out,
+        "torrentng_storage_peer_read_cache_evictions_total",
+        "counter",
+        "Peer-read readahead cache evictions across running torrent schedulers",
+        stats.storage_peer_read_cache_evictions,
+    );
+    metric(
+        &mut out,
         "torrentng_storage_peer_read_elevator_enabled",
         "gauge",
         "Running torrent schedulers with peer-read elevator enabled",
@@ -2075,6 +2082,7 @@ mod tests {
             storage_queued_disk_bytes: 54,
             storage_queue_full: 56,
             storage_peer_read_cache_hits: 8,
+            storage_peer_read_cache_evictions: 58,
             piece_assembly_evictions: 9,
             storage_backend_read_ops: 14,
             storage_backend_bytes_read: 15,
@@ -2184,6 +2192,7 @@ mod tests {
         assert!(rendered.contains("torrentng_storage_queued_disk_bytes 54"));
         assert!(rendered.contains("torrentng_storage_queue_full_total 56"));
         assert!(rendered.contains("torrentng_storage_peer_read_cache_hits_total 8"));
+        assert!(rendered.contains("torrentng_storage_peer_read_cache_evictions_total 58"));
         assert!(rendered.contains("torrentng_piece_assembly_evictions_total 9"));
         assert!(rendered.contains("torrentng_peer_request_window_reductions_total 40"));
         assert!(rendered.contains("torrentng_peer_rx_buffer_bytes 41"));

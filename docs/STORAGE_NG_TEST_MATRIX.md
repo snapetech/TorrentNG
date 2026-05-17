@@ -64,7 +64,7 @@ per-case syscall counters when `strace` is available.
 | `torrentng_storage_*_latency_nanoseconds_by_device{device=...,profile=...}` | Storage latency attribution and bounded histograms survive multi-device aggregation |
 | `torrentng_storage_file_pool_*` | fd pool remains bounded and records hit/miss/eviction/idle-close activity |
 | `torrentng_storage_queue_full_total` | bounded storage queues expose backpressure instead of silently accumulating jobs |
-| `torrentng_storage_peer_read_elevator_*` | HDD peer-read queueing, batching, and coalescing are visible |
+| `torrentng_storage_peer_read_cache_*`, `torrentng_storage_peer_read_elevator_*` | Bounded peer-read readahead cache hit/miss/eviction behavior and HDD peer-read queueing, batching, and coalescing are visible |
 | `torrentng_storage_sparse_*` | recheck reports sparse data extents, skipped holes, and fallback count |
 | `torrentng_tracker_peer_cache_entries`, `torrentng_tracker_peer_cache_drops_total` | Tracker announce responses stay bounded and expose dropped overflow peers |
 | `torrentng_peer_{rx,tx}_buffer_bytes`, `torrentng_peer_command_queue_*`, `torrentng_memory_class_used_bytes{class="peer_buffer"}` | Outstanding peer request/send buffers, upload block leases, and bounded peer command queues are visible for memory-pressure accounting |

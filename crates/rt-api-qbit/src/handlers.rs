@@ -3107,6 +3107,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn qbit_log_entry_projects_session_events() {
+        let row = rt_db::SessionEventRow {
+            event_id: Some(42),
+            occurred_at: 1_700_000_000,
+            info_hash: Some("a".repeat(40)),
+            kind: "tracker_warning".to_owned(),
+            message: Some("tracker warning".to_owned()),
+            payload: "{}".to_owned(),
+        };
+
+        let entry = qbit_log_entry(row);
+        assert_eq!(entry.id, 42);
+        assert_eq!(entry.message, "tracker warning");
+        assert_eq!(entry.timestamp, 1_700_000_000);
+        assert_eq!(entry.kind, 2);
+    }
+
+    #[test]
+    fn qbit_log_type_uses_level_payload_and_kind_fallbacks() {
+        assert_eq!(qbit_log_type("torrent_added", r#"{"level":"info"}"#), 1);
+        assert_eq!(qbit_log_type("tracker_warning", "{}"), 2);
+        assert_eq!(qbit_log_type("storage_failed", "{}"), 4);
+        assert_eq!(qbit_log_type("tracker", r#"{"level":"critical"}"#), 4);
+    }
+
     #[tokio::test]
     async fn login_returns_ok() {
         let app = build_qbit_router(AppState::new());

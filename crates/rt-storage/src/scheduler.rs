@@ -78,6 +78,7 @@ pub struct StorageIoConfig {
     pub preallocation_mode: PreallocationMode,
     pub durability_mode: DurabilityMode,
     pub peer_read_readahead_bytes: usize,
+    pub peer_read_cache_entries: usize,
     pub peer_read_elevator_budget_ms: u64,
 }
 
@@ -93,6 +94,7 @@ impl Default for StorageIoConfig {
             preallocation_mode: PreallocationMode::Auto,
             durability_mode: DurabilityMode::Checkpoint,
             peer_read_readahead_bytes: 512 * 1024,
+            peer_read_cache_entries: 64,
             peer_read_elevator_budget_ms: 25,
         }
     }
@@ -187,6 +189,7 @@ pub struct StorageIoStats {
     pub peer_read_cache_entries: usize,
     pub peer_read_cache_hits: u64,
     pub peer_read_cache_misses: u64,
+    pub peer_read_cache_evictions: u64,
     pub peer_read_elevator_enabled: bool,
     pub peer_read_elevator_queue_depth: usize,
     pub peer_read_elevator_queued: usize,
@@ -234,6 +237,7 @@ impl Default for StorageIoStats {
             peer_read_cache_entries: 0,
             peer_read_cache_hits: 0,
             peer_read_cache_misses: 0,
+            peer_read_cache_evictions: 0,
             peer_read_elevator_enabled: false,
             peer_read_elevator_queue_depth: 0,
             peer_read_elevator_queued: 0,
@@ -558,6 +562,7 @@ struct StorageCounters {
     preallocation_fallbacks: AtomicU64,
     peer_read_cache_hits: AtomicU64,
     peer_read_cache_misses: AtomicU64,
+    peer_read_cache_evictions: AtomicU64,
     peer_read_elevator_queue_full: AtomicU64,
     peer_read_elevator_batches: AtomicU64,
     peer_read_elevator_coalesced_requests: AtomicU64,
@@ -595,6 +600,7 @@ impl Default for StorageCounters {
             preallocation_fallbacks: AtomicU64::new(0),
             peer_read_cache_hits: AtomicU64::new(0),
             peer_read_cache_misses: AtomicU64::new(0),
+            peer_read_cache_evictions: AtomicU64::new(0),
             peer_read_elevator_queue_full: AtomicU64::new(0),
             peer_read_elevator_batches: AtomicU64::new(0),
             peer_read_elevator_coalesced_requests: AtomicU64::new(0),
@@ -1197,6 +1203,10 @@ impl MountScheduler {
             peer_read_cache_entries,
             peer_read_cache_hits: self.counters.peer_read_cache_hits.load(Ordering::Relaxed),
             peer_read_cache_misses: self.counters.peer_read_cache_misses.load(Ordering::Relaxed),
+            peer_read_cache_evictions: self
+                .counters
+                .peer_read_cache_evictions
+                .load(Ordering::Relaxed),
             peer_read_elevator_enabled: self.peer_read_elevator_enabled,
             peer_read_elevator_queue_depth: self.peer_read_elevator_queue_depth,
             peer_read_elevator_queued,
@@ -1364,6 +1374,7 @@ impl MountScheduler {
         let peer_read_cache = self.peer_read_cache.clone();
         let peer_read_elevator = self.peer_read_elevator();
         let readahead_bytes = self.io_config.peer_read_readahead_bytes;
+        let readahead_cache_entries = self.io_config.peer_read_cache_entries;
         let path = path.to_path_buf();
         let started = Instant::now();
         if class == IoClass::PeerRead && readahead_bytes <= len {
@@ -1443,9 +1454,16 @@ impl MountScheduler {
                 .fetch_add(latency_ns, Ordering::Relaxed);
             record_latency_bucket(&counters.read_latency_buckets, latency_ns);
             let bytes = bytes::Bytes::from(buf);
-            if class == IoClass::PeerRead && read_len > len {
+            if class == IoClass::PeerRead && read_len > len && readahead_cache_entries > 0 {
                 let exact = bytes.slice(..len);
-                peer_read_cache_store(&peer_read_cache, key, offset, bytes);
+                peer_read_cache_store(
+                    &peer_read_cache,
+                    &counters,
+                    readahead_cache_entries,
+                    key,
+                    offset,
+                    bytes,
+                );
                 Ok(exact)
             } else {
                 Ok(bytes)
@@ -1813,19 +1831,26 @@ fn peer_read_cache_hit(
 
 fn peer_read_cache_store(
     cache: &Mutex<HashMap<PathBuf, PeerReadCacheEntry>>,
+    counters: &StorageCounters,
+    max_entries: usize,
     key: PathBuf,
     offset: u64,
     data: bytes::Bytes,
 ) {
-    const MAX_PEER_READ_CACHE_ENTRIES: usize = 64;
+    if max_entries == 0 {
+        return;
+    }
     let mut cache = cache.lock().expect("peer read cache mutex poisoned");
-    if cache.len() >= MAX_PEER_READ_CACHE_ENTRIES {
+    if !cache.contains_key(&key) && cache.len() >= max_entries {
         if let Some(evict) = cache
             .iter()
             .min_by_key(|(_, entry)| entry.last_used)
             .map(|(key, _)| key.clone())
         {
             cache.remove(&evict);
+            counters
+                .peer_read_cache_evictions
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
     cache.insert(
