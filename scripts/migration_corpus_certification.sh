@@ -12,6 +12,7 @@ mkdir -p "$(dirname "$OUT")"
 status="PASS"
 missing=0
 failed=0
+inventory="$OUT.inventory"
 
 families=(
   qbittorrent
@@ -58,6 +59,25 @@ count_evidence() {
   find "$dir" -type f \( "${expr[@]}" \) | wc -l | tr -d ' '
 }
 
+list_evidence() {
+  local dir="$1"
+  local expr=()
+  local pattern
+
+  if [[ ! -d "$dir" ]]; then
+    return
+  fi
+
+  for pattern in "${evidence_patterns[@]}"; do
+    if [[ "${#expr[@]}" -gt 0 ]]; then
+      expr+=(-o)
+    fi
+    expr+=(-name "$pattern")
+  done
+
+  find "$dir" -type f \( "${expr[@]}" \) -print | sort
+}
+
 row() {
   local family="$1"
   local result="$2"
@@ -80,6 +100,7 @@ row() {
   echo '```text'
 } > "$OUT"
 : > "$OUT.table"
+: > "$inventory"
 
 if (cd "$ROOT" && cargo test -p rt-migrate) >> "$OUT" 2>&1; then
   echo '```' >> "$OUT"
@@ -102,6 +123,15 @@ for family in "${families[@]}"; do
   files="$(count_evidence "$dir")"
   if [[ "$files" -gt 0 ]]; then
     row "$family" "PASS" "$files" "$dir"
+    while IFS= read -r evidence; do
+      rel="${evidence#$ROOT/}"
+      if command -v sha256sum >/dev/null 2>&1; then
+        hash="$(sha256sum "$evidence" | awk '{print $1}')"
+      else
+        hash="sha256sum-unavailable"
+      fi
+      printf '| %s | %s | %s |\n' "$family" "$rel" "$hash" >> "$inventory"
+    done < <(list_evidence "$dir")
   else
     row "$family" "MISSING" "0" "$dir"
     missing=$((missing + 1))
@@ -110,6 +140,20 @@ done
 
 cat "$OUT.table" >> "$OUT"
 rm -f "$OUT.table"
+
+{
+  echo
+  echo "## Evidence Inventory"
+  echo
+  echo "| Source family | File | SHA-256 |"
+  echo "|---|---|---|"
+  if [[ -s "$inventory" ]]; then
+    cat "$inventory"
+  else
+    echo "| none | - | - |"
+  fi
+} >> "$OUT"
+rm -f "$inventory"
 
 {
   echo

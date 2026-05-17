@@ -233,4 +233,12 @@ TNG_STORAGE_REPORT_DIR="$report_dir" \
   TNG_STORAGE_ALLOW_RELEASE_SKIP=1 \
   "$ROOT/scripts/storage_release_certification.sh" "$tmpdir/storage-root" >/dev/null
 
+mkdir -p "$tmpdir/migration-corpus/qbittorrent"
+printf 'fixture' >"$tmpdir/migration-corpus/qbittorrent/sample.fastresume"
+TNG_MIGRATION_CORPUS_DIR="$tmpdir/migration-corpus" \
+  "$ROOT/scripts/migration_corpus_certification.sh" "$report_dir/migration-corpus-inventory-selftest.md" >/dev/null
+grep -q '| qbittorrent | PASS | 1 |' "$report_dir/migration-corpus-inventory-selftest.md"
+grep -q 'sample.fastresume' "$report_dir/migration-corpus-inventory-selftest.md"
+grep -q 'Overall status: PASS_WITH_GAPS' "$report_dir/migration-corpus-inventory-selftest.md"
+
 echo "storage certification self-test: PASS"

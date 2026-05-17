@@ -14,6 +14,7 @@ mkdir -p "$(dirname "$OUT")"
 
 status="PASS"
 skips=0
+docker_ready=1
 
 mark() {
   local name="$1"
@@ -85,21 +86,31 @@ skip_gate() {
 if [[ "$RUN_LOCAL" == "1" || "$RUN_PUBLIC" == "1" ]]; then
   if ! have_cmd docker; then
     mark "Docker availability" "FAIL" "docker command missing"
+    docker_ready=0
   elif ! docker info >/dev/null 2>&1; then
     mark "Docker availability" "FAIL" "docker daemon unavailable to current user"
+    docker_ready=0
   else
     mark "Docker availability" "PASS" "docker daemon reachable"
   fi
 fi
 
 if [[ "$RUN_LOCAL" == "1" ]]; then
-  run_gate "Docker client interop local matrix" "$ROOT/scripts/interop_matrix.sh" --local
+  if [[ "$docker_ready" == "1" ]]; then
+    run_gate "Docker client interop local matrix" "$ROOT/scripts/interop_matrix.sh" --local
+  else
+    skip_gate "Docker client interop local matrix" "Docker preflight failed"
+  fi
 else
   skip_gate "Docker client interop local matrix" "set UNIVERSAL_LIVE_LOCAL=1"
 fi
 
 if [[ "$RUN_PUBLIC" == "1" ]]; then
-  run_gate "public torrent interop matrix" "$ROOT/scripts/interop_matrix.sh" --public
+  if [[ "$docker_ready" == "1" ]]; then
+    run_gate "public torrent interop matrix" "$ROOT/scripts/interop_matrix.sh" --public
+  else
+    skip_gate "public torrent interop matrix" "Docker preflight failed"
+  fi
 else
   skip_gate "public torrent interop matrix" "set UNIVERSAL_LIVE_PUBLIC=1 after approving public legal torrent downloads"
 fi

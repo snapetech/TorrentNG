@@ -31,3 +31,8 @@ the exported corpus, use:
 ```sh
 TNG_REQUIRE_MIGRATION_CORPUS=1 scripts/migration_corpus_certification.sh
 ```
+
+Use `manifest.example.toml` as the checklist for the exported client/version
+families that should be attached to a release evidence bundle. The
+certification report includes a SHA-256 inventory for every discovered artifact
+so fixture changes are reviewable.

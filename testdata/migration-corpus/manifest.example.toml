@@ -1,0 +1,41 @@
+# Example only. Copy to `manifest.toml` when attaching real exported fixtures.
+
+[[family]]
+name = "qbittorrent"
+versions = ["4.6.x", "5.x"]
+expected = [".fastresume", ".torrent", "qBittorrent.conf"]
+
+[[family]]
+name = "transmission"
+versions = ["3.x", "4.x"]
+expected = ["resume/*.resume", "torrents/*.torrent", "settings.json"]
+
+[[family]]
+name = "deluge"
+versions = ["2.x"]
+expected = ["state/torrents.state", "state/*.torrent", "plugin-state"]
+
+[[family]]
+name = "utorrent"
+versions = ["2.x", "3.x"]
+expected = ["resume.dat", "*.torrent", "settings.dat"]
+
+[[family]]
+name = "biglybt"
+versions = ["3.x"]
+expected = ["downloads.config", "torrents.config", "*.torrent"]
+
+[[family]]
+name = "tixati"
+versions = ["3.x"]
+expected = ["config/state exports", "*.torrent"]
+
+[[family]]
+name = "rtorrent"
+versions = ["0.9.x", "0.15.x"]
+expected = ["session directory", "*.torrent", "fastresume bencode"]
+
+[[family]]
+name = "generic"
+versions = ["edge-cases"]
+expected = ["bencoded resume", "json resume", "*.torrent"]
