@@ -31,6 +31,10 @@ const TORRENT_FIELDS: &[&str] = &[
 
 pub const MULTICALL_RANGE_PAGE_SIZE: i64 = 100;
 
+const RTORRENT_MULTICALL_RANGE_PATCH: &str = "rtorrent-0.16.11-multicall-range";
+const LEGACY_RTORRENT_NONZERO_RATE_PATCH: &str = "rtorrent-0.16.11-multicall-nonzero-rate";
+const LEGACY_RTORRENT_LIVE_SUMMARY_PATCH: &str = "rtorrent-0.16.11-rtng-live-summary";
+
 #[derive(Debug, Clone)]
 pub struct RawTorrent {
     pub hash: String,
@@ -103,16 +107,9 @@ impl Client {
     }
 
     pub async fn has_multicall_range(&self) -> bool {
-        if std::env::var("RTNG_RTORRENT_PATCHES")
-            .unwrap_or_default()
-            .split(',')
-            .map(str::trim)
-            .any(|patch| {
-                patch == "rtorrent-0.16.11-multicall-range"
-                    || patch == "rtorrent-0.16.11-multicall-nonzero-rate"
-                    || patch == "rtorrent-0.16.11-rtng-live-summary"
-            })
-        {
+        if rtorrent_patch_manifest_enables_bounded_live(
+            &std::env::var("RTNG_RTORRENT_PATCHES").unwrap_or_default(),
+        ) {
             return true;
         }
 
@@ -391,6 +388,14 @@ impl Client {
     }
 }
 
+fn rtorrent_patch_manifest_enables_bounded_live(patches: &str) -> bool {
+    patches.split(',').map(str::trim).any(|patch| {
+        patch == RTORRENT_MULTICALL_RANGE_PATCH
+            || patch == LEGACY_RTORRENT_NONZERO_RATE_PATCH
+            || patch == LEGACY_RTORRENT_LIVE_SUMMARY_PATCH
+    })
+}
+
 fn parse_torrent_rows(rows: Vec<XmlValue>) -> Result<Vec<RawTorrent>> {
     let mut torrents = Vec::with_capacity(rows.len());
     for row in rows {
@@ -471,4 +476,33 @@ fn base64_encode(data: &[u8]) -> String {
         });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rtorrent_patch_manifest_enables_bounded_live;
+
+    #[test]
+    fn multicall_range_patch_enables_bounded_live_features() {
+        assert!(rtorrent_patch_manifest_enables_bounded_live(
+            "rtorrent-0.16.11-user-agent-command,rtorrent-0.16.11-multicall-range"
+        ));
+    }
+
+    #[test]
+    fn legacy_split_feature_patch_names_remain_accepted() {
+        assert!(rtorrent_patch_manifest_enables_bounded_live(
+            "rtorrent-0.16.11-multicall-nonzero-rate"
+        ));
+        assert!(rtorrent_patch_manifest_enables_bounded_live(
+            "rtorrent-0.16.11-rtng-live-summary"
+        ));
+    }
+
+    #[test]
+    fn unrelated_patch_manifest_does_not_enable_bounded_live_features() {
+        assert!(!rtorrent_patch_manifest_enables_bounded_live(
+            "rtorrent-0.16.11-user-agent-command"
+        ));
+    }
 }

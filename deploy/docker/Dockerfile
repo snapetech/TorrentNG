@@ -58,7 +58,7 @@ ENV RTNG_STATIC_DIR=/usr/share/rtorrentng/webui
 ENV LD_LIBRARY_PATH=/usr/local/lib
 ENV RTNG_PACKAGED_RTORRENT_VERSION=0.16.11
 ENV RTNG_PACKAGED_LIBTORRENT_VERSION=0.16.11
-ENV RTNG_RTORRENT_PATCHES=rtorrent-0.16.11-user-agent-command,rtorrent-0.16.11-multicall-range,rtorrent-0.16.11-multicall-nonzero-rate,rtorrent-0.16.11-rtng-live-summary
+ENV RTNG_RTORRENT_PATCHES=rtorrent-0.16.11-user-agent-command,rtorrent-0.16.11-multicall-range
 
 VOLUME ["/data", "/session", "/config"]
 EXPOSE 8080 50000 50000/udp

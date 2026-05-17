@@ -1,11 +1,14 @@
 # rtorrentNG API Reference
 
-Two API surfaces are exposed by the sidecar:
+rtorrentNG exposes the same client-facing API families in both native-engine
+mode and the Track 1 rTorrent sidecar:
 
-- **Native API** — `/api/v1/` — JSON REST, snake_case, designed for the WebUI and direct integrations
+- **Native API** — `/api/v1/` — JSON REST, snake_case, designed for the WebUI and direct integrations. In native-engine mode this is backed by durable engine state; in Track 1 it is a sidecar facade over rTorrent.
 - **qBittorrent compat API** — `/api/v2/` and `/api/qb/v2/` — drop-in replacement for the qBittorrent Web API v2; used by Prowlarr, Sonarr, Radarr, autobrr, cross-seed, etc.
+- **Transmission RPC** — `/transmission/rpc` and `/api/transmission/rpc` — compatibility facade over the same torrent registry.
+- **Deluge RPC** — best-effort Deluge-compatible facade for clients that expect Deluge method names.
 
-Both surfaces are served on the same port (default `8080`).
+All surfaces are served on the same port (default `8080`).
 
 ---
 
@@ -204,7 +207,7 @@ Pass `dry_run: true` to preview what would be affected without making changes.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET`  | `/health` | Health check; 200 if sidecar up, 503 if rTorrent unreachable |
+| `GET`  | `/health` | Health check. Native mode returns the engine readiness/capability manifest; Track 1 reports sidecar/rTorrent reachability. |
 | `GET`  | `/metrics` | Prometheus text format metrics |
 | `GET`  | `/ws` | WebSocket — upgrade to receive live events |
 
@@ -310,7 +313,7 @@ Implements the qBittorrent Web API v2. By default it advertises qBittorrent `5.0
 
 ### Log / Search / RSS
 
-These compatibility endpoints are present so qBittorrent clients can probe them safely. Search and RSS are intentionally inert in Track 1.
+These compatibility endpoints are present so qBittorrent clients can probe them safely. Search remains intentionally inert; RSS endpoints are backed by native RSS rules where available and degrade to compatible no-op shapes otherwise.
 
 | Method | Path | Notes |
 |--------|------|-------|
