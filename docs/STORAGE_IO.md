@@ -72,8 +72,10 @@ semaphores:
 - `rt-storage::StorageRuntime` now has a probe-selected backend layer:
   `TNG_STORAGE_BACKEND=auto|pread|uring` chooses between the portable
   positioned-I/O worker pool and Linux `io_uring` positioned reads, writes,
-  and data sync. The uring worker registers file slots and worker-owned fixed
-  buffers when the kernel accepts them. Kernels or containers that reject
+  and data sync. `auto` currently selects the conservative `pread` baseline;
+  `uring` must be requested explicitly while correctness and hardware
+  benchmarks mature. The uring worker registers file slots and worker-owned
+  fixed buffers when the kernel accepts them. Kernels or containers that reject
   `io_uring` fall back to `pread` with an explicit diagnostic reason instead
   of silently changing behavior.
 - `IoClass::PeerRead` uses a small internal readahead cache when configured:
@@ -95,6 +97,12 @@ buffers are bounded to 64 active pieces and 64 MiB per torrent task; when that
 budget is exceeded, the least recently used incomplete piece buffer is evicted
 and later validation falls back to the scheduled disk path. Pieces larger than
 the byte budget skip in-memory assembly entirely.
+
+Peer discovery and peer I/O pressure are also bounded. Tracker announce results
+are retained in a capped cache with drop counters, metadata peer retry state is
+deduplicated and pruned against the configured peer budget, and runtime stats
+surface peer receive/transmit buffer bytes so the resource governor can account
+for outstanding request memory alongside storage frames.
 
 ## Fastresume Contract
 
