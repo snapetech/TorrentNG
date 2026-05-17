@@ -36,6 +36,7 @@ pub async fn run(
         component = "rtorrent",
         operation = "sync_loop",
         interval_ms = interval.as_millis() as u64,
+        result = "started",
         "sync loop started"
     );
     let mut ticker = tokio::time::interval(interval);
@@ -47,6 +48,7 @@ pub async fn run(
         operation = "capability_probe",
         feature = "d.multicall.range",
         supported = range_supported,
+        result = "ok",
         "rTorrent capability probe complete"
     );
     let mut page_offset = 0i64;
@@ -156,6 +158,7 @@ fn append_app_event(
             component = "app_events",
             operation = "append",
             kind,
+            result = "error",
             error = %e,
             "failed to append sync app event"
         );
@@ -212,6 +215,7 @@ async fn tick_bounded(
         Err(e) => warn!(
             component = "rtorrent",
             operation = "live_summary_sync",
+            result = "error",
             error = %e,
             "live summary sync failed"
         ),
@@ -300,6 +304,7 @@ fn upsert_torrent(
             component = "cache",
             operation = "upsert_torrent",
             torrent = %t.hash,
+            result = "error",
             error = %e,
             "torrent cache upsert failed"
         );
@@ -333,6 +338,7 @@ fn write_live_speeds(download: i64, upload: i64) {
             component = "stats",
             operation = "write_live_speeds",
             target,
+            result = "error",
             error = %e,
             "live speed cache write failed"
         );

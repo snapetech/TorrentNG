@@ -228,7 +228,13 @@ async fn log_main(State(s): State<AppState>, Query(q): Query<LogMainQuery>) -> i
             ),
         ),
         Err(e) => {
-            tracing::warn!(component = "api", operation = "log_main", error = %e, "failed to read app events");
+            tracing::warn!(
+                component = "api",
+                operation = "log_main",
+                result = "error",
+                error = %e,
+                "failed to read app events"
+            );
             (StatusCode::OK, Json(Vec::<QbLogEntry>::new()))
         }
     }
@@ -338,6 +344,7 @@ async fn rss_rules(State(s): State<AppState>) -> impl IntoResponse {
             tracing::error!(
                 component = "qbcompat",
                 operation = "list_rss_rules",
+                result = "error",
                 error = %e,
                 "qBit RSS rule listing failed"
             );
@@ -369,6 +376,7 @@ async fn rss_set_rule(State(s): State<AppState>, Form(f): Form<RssSetRuleForm>) 
             tracing::warn!(
                 component = "qbcompat",
                 operation = "set_rss_rule",
+                result = "error",
                 error = %e,
                 "qBit RSS rule JSON parse failed"
             );

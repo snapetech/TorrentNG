@@ -25,6 +25,7 @@ async fn main() -> Result<()> {
         component = "sidecar",
         operation = "startup",
         version = env!("CARGO_PKG_VERSION"),
+        result = "started",
         "TorrentNG sidecar starting"
     );
     info!(
@@ -35,6 +36,7 @@ async fn main() -> Result<()> {
         log_profile = ?cfg.logging.profile,
         event_retention = cfg.logging.event_retention,
         rtorrent_log_ingest = cfg.rtorrent.logs.enabled,
+        result = "ok",
         "config loaded"
     );
 
@@ -65,6 +67,7 @@ async fn main() -> Result<()> {
                 warn!(
                     component = "rtorrent",
                     operation = "set_user_agent",
+                    result = "error",
                     error = %e,
                     "could not set user agent after startup"
                 );
@@ -130,7 +133,13 @@ async fn main() -> Result<()> {
         .parse()
         .with_context(|| format!("parse listen_addr {}", cfg.listen_addr))?;
 
-    info!(component = "http", operation = "listen", %addr, "listening");
+    info!(
+        component = "http",
+        operation = "listen",
+        %addr,
+        result = "started",
+        "listening"
+    );
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
@@ -182,6 +191,7 @@ fn append_startup_event(
             component = "app_events",
             operation = "append",
             kind,
+            result = "error",
             error = %e,
             "failed to append startup app event"
         );

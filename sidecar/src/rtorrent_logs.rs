@@ -28,6 +28,7 @@ pub async fn run(db: Arc<Db>, config: RtorrentLogConfig, retention: usize) {
                             component = "rtorrent_logs",
                             operation = "record_recovery",
                             source = log_source(path),
+                            result = "error",
                             error = %e,
                             "failed to record rtorrent log ingest recovery"
                         );
@@ -39,6 +40,7 @@ pub async fn run(db: Arc<Db>, config: RtorrentLogConfig, retention: usize) {
                         component = "rtorrent_logs",
                         operation = "ingest",
                         source,
+                        result = "error",
                         error = %e,
                         "failed to ingest rtorrent log"
                     );
@@ -47,6 +49,7 @@ pub async fn run(db: Arc<Db>, config: RtorrentLogConfig, retention: usize) {
                             component = "rtorrent_logs",
                             operation = "record_failure",
                             source,
+                            result = "error",
                             error = %event_error,
                             "failed to record rtorrent log ingest failure"
                         );

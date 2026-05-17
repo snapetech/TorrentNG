@@ -476,6 +476,7 @@ pub async fn torrents_add(
                         component = "api",
                         operation = "add_magnet",
                         source = "magnet:redacted",
+                        result = "error",
                         error = %e,
                         "qBit magnet parse failed"
                     );
@@ -500,6 +501,7 @@ pub async fn torrents_add(
                 tracing::error!(
                     component = "api",
                     operation = "add_magnet",
+                    result = "error",
                     error = %e,
                     "qBit magnet add failed"
                 );
@@ -515,6 +517,7 @@ pub async fn torrents_add(
                     component = "api",
                     operation = "add_torrent_url",
                     source = %redact_log_url(url),
+                    result = "error",
                     error = %e,
                     "qBit torrent URL fetch failed"
                 );
@@ -544,6 +547,7 @@ pub async fn torrents_add(
                 tracing::error!(
                     component = "api",
                     operation = "add_torrent",
+                    result = "error",
                     error = %e,
                     "qBit torrent parse failed"
                 );
@@ -563,6 +567,7 @@ pub async fn torrents_add(
             tracing::error!(
                 component = "api",
                 operation = "add_torrent",
+                result = "error",
                 error = %e,
                 "qBit torrent add failed"
             );
@@ -2127,7 +2132,13 @@ pub async fn log_main(
             ),
         ),
         Err(e) => {
-            tracing::warn!(component = "api", operation = "log_main", error = %e, "failed to read session events");
+            tracing::warn!(
+                component = "api",
+                operation = "log_main",
+                result = "error",
+                error = %e,
+                "failed to read session events"
+            );
             (StatusCode::OK, Json(Vec::<QbLogEntry>::new()))
         }
     }

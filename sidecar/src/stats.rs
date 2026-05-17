@@ -185,6 +185,7 @@ fn append_app_event(
             component = "app_events",
             operation = "append",
             kind,
+            result = "error",
             error = %e,
             "failed to append stats app event"
         );

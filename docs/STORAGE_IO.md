@@ -144,7 +144,7 @@ now part of the release surface:
   storage-plan queue/start/checkpoint/complete state in the durable jobs table
   so interrupted multi-step plans can resume or be audited after process
   restart. The WebUI planner can provide affected torrent metadata, completed
-  resume steps, and forward/rollback byte summaries.
+  resume steps, operation templates, and forward/rollback byte summaries.
 - Per-device latency observability includes bounded Prometheus histograms for
   read/write/sync/hash work labeled by resolved device/profile, plus the
   cumulative per-device totals. Aggregate fixed-bucket histograms and counters

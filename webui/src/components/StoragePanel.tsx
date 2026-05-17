@@ -24,6 +24,30 @@ function parseStepIndexes(value: string): number[] {
     .sort((left, right) => left - right)
 }
 
+type StoragePlanTemplate = {
+  id: string
+  label: string
+  operation: StoragePlanRequest['operation']
+  sourceSuffix?: string
+  destinationSuffix?: string
+  targetSuffix?: string
+  hardlinkOrCopy?: boolean
+  deleteApproved?: boolean
+  completedSteps?: string
+}
+
+const storagePlanTemplates: StoragePlanTemplate[] = [
+  { id: 'move-library', label: 'Move', operation: 'move', sourceSuffix: 'library/source', destinationSuffix: 'library/destination' },
+  { id: 'import-copy', label: 'Import copy', operation: 'import', sourceSuffix: 'staging/source', destinationSuffix: 'library/imported', hardlinkOrCopy: true },
+  { id: 'delete-approved', label: 'Delete', operation: 'delete', targetSuffix: 'library/orphaned', deleteApproved: true },
+  { id: 'resume-plan', label: 'Resume', operation: 'move', sourceSuffix: 'library/source', destinationSuffix: 'library/destination', completedSteps: '0' },
+]
+
+function rootPath(root: string, suffix: string): string {
+  const clean = root.replace(/\/+$/, '')
+  return clean ? `${clean}/${suffix}` : suffix
+}
+
 export function StoragePanel() {
   const [operation, setOperation] = useState<StoragePlanRequest['operation']>('move')
   const [source, setSource] = useState('')
@@ -77,6 +101,25 @@ export function StoragePanel() {
     onSuccess: setPreview,
   })
   const canExecute = Boolean(preview?.plan.can_apply && selectedRoot && (operation !== 'delete' || deleteApproved))
+  const completedIndexes = useMemo(() => parseStepIndexes(completedSteps), [completedSteps])
+  const applyTemplate = (template: StoragePlanTemplate) => {
+    setOperation(template.operation)
+    setHardlinkOrCopy(Boolean(template.hardlinkOrCopy))
+    setDeleteApproved(Boolean(template.deleteApproved))
+    setCompletedSteps(template.completedSteps ?? '')
+    setBytes('')
+    setAffectedTorrents('')
+    if (template.operation === 'delete') {
+      setSource('')
+      setDestination('')
+      setTarget(template.targetSuffix && selectedRoot ? rootPath(selectedRoot, template.targetSuffix) : '')
+    } else {
+      setSource(template.sourceSuffix && selectedRoot ? rootPath(selectedRoot, template.sourceSuffix) : '')
+      setDestination(template.destinationSuffix && selectedRoot ? rootPath(selectedRoot, template.destinationSuffix) : '')
+      setTarget('')
+    }
+    setPreview(null)
+  }
 
   return (
     <section style={{ padding: '18px 24px' }}>
@@ -132,6 +175,29 @@ export function StoragePanel() {
             {!selectedRoot && <option value="">Select root</option>}
             {roots.map(root => <option key={root.path} value={root.path}>{root.path}</option>)}
           </select>
+        </div>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: 7, flexWrap: 'wrap', marginBottom: 10 }}>
+          <span style={{ color: 'var(--faint)', fontSize: 11, fontWeight: 800, textTransform: 'uppercase' }}>Templates</span>
+          {storagePlanTemplates.map(template => (
+            <button
+              key={template.id}
+              type="button"
+              onClick={() => applyTemplate(template)}
+              style={{
+                background: template.operation === operation ? 'color-mix(in srgb, var(--accent) 14%, var(--surface))' : 'var(--surface)',
+                border: '1px solid ' + (template.operation === operation ? 'var(--accent)' : 'var(--border)'),
+                borderRadius: 5,
+                color: template.operation === operation ? 'var(--accent-text)' : 'var(--muted)',
+                padding: '4px 8px',
+                fontSize: 12,
+                fontWeight: 800,
+                cursor: 'pointer',
+              }}
+            >
+              {template.label}
+            </button>
+          ))}
         </div>
 
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 9, marginBottom: 10 }}>
@@ -195,7 +261,7 @@ export function StoragePanel() {
 
         {previewPlan.error && <Notice>Plan preview failed</Notice>}
         {executePlan.error && <Notice>Plan execution failed</Notice>}
-        {preview && <StoragePlanResult response={preview} />}
+        {preview && <StoragePlanResult response={preview} completedIndexes={completedIndexes} />}
       </div>
     </section>
   )
@@ -210,10 +276,13 @@ function PathField({ label, value, onChange }: { label: string; value: string; o
   )
 }
 
-function StoragePlanResult({ response }: { response: StoragePlanResponse }) {
+function StoragePlanResult({ response, completedIndexes }: { response: StoragePlanResponse; completedIndexes: number[] }) {
   const tone = response.plan.can_apply ? 'var(--success)' : 'var(--warning)'
   const totalBytes = response.plan.steps.reduce((sum, step) => sum + step.bytes, 0)
   const rollbackBytes = response.plan.rollback_steps.reduce((sum, step) => sum + step.bytes, 0)
+  const completedSet = new Set(completedIndexes)
+  const completed = completedIndexes.filter(index => index < response.plan.steps.length).length
+  const remaining = Math.max(0, response.plan.steps.length - completed)
   return (
     <div style={{ border: `1px solid color-mix(in srgb, ${tone} 38%, var(--border))`, borderRadius: 7, background: 'var(--surface)', padding: 12 }}>
       <div style={{ display: 'flex', gap: 10, alignItems: 'center', marginBottom: 8 }}>
@@ -223,6 +292,8 @@ function StoragePlanResult({ response }: { response: StoragePlanResponse }) {
       </div>
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 9 }}>
         <SummaryPill label="steps" value={String(response.plan.steps.length)} />
+        <SummaryPill label="done" value={String(completed)} />
+        <SummaryPill label="remaining" value={String(remaining)} />
         <SummaryPill label="bytes" value={fmtBytes(totalBytes)} />
         <SummaryPill label="rollback" value={`${response.plan.rollback_steps.length} / ${fmtBytes(rollbackBytes)}`} />
       </div>
@@ -232,25 +303,29 @@ function StoragePlanResult({ response }: { response: StoragePlanResponse }) {
         </ul>
       )}
       <div style={{ display: 'grid', gap: 6 }}>
-        {response.plan.steps.map((step, index) => (
+        {response.plan.steps.map((step, index) => {
+          const done = completedSet.has(index)
+          return (
           <div key={`${step.action}-${index}`} style={{
             display: 'grid',
             gridTemplateColumns: '132px 1fr auto',
             gap: 8,
             alignItems: 'center',
-            border: '1px solid var(--border)',
+            border: `1px solid ${done ? 'color-mix(in srgb, var(--success) 42%, var(--border))' : 'var(--border)'}`,
             borderRadius: 6,
             padding: '7px 9px',
             color: 'var(--muted)',
             fontSize: 12,
+            background: done ? 'color-mix(in srgb, var(--success) 7%, transparent)' : undefined,
           }}>
-            <strong style={{ color: 'var(--text)' }}>{step.action}</strong>
+            <strong style={{ color: 'var(--text)' }}>{done ? 'done' : step.action}</strong>
             <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={[step.source, step.destination].filter(Boolean).join(' -> ')}>
               {[step.source, step.destination].filter(Boolean).join(' -> ') || 'storage operation'}
             </span>
             <span>{fmtBytes(step.bytes)}</span>
           </div>
-        ))}
+          )
+        })}
       </div>
       {response.plan.rollback_steps.length > 0 && (
         <details style={{ marginTop: 9, color: 'var(--muted)', fontSize: 12 }}>
