@@ -150,7 +150,7 @@ shippable and benchmarkable.
 
 ### Phase C — tiered torrents (scale unlock)
 
-- [ ] Introduce Dormant/Warm/Hot tiers orthogonal to `TorrentState`.
+- [x] Introduce Dormant/Warm/Hot tiers orthogonal to `TorrentState`.
 - [ ] Shared timer-wheel reactor for Dormant torrents (no task/channel/fd per torrent).
 - [ ] Promote to Hot on inbound peer/announce; demote on peer drain + idle.
 - [ ] Dormant torrents hold only piece bitmap (mmap-backed/compressed) + tracker deadline.

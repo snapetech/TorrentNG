@@ -102,6 +102,13 @@ Seeding → Moving → Seeding
 
 Every transition is persisted and emits a structured event. No boolean soup.
 
+`TorrentActivityTier` is a separate runtime axis, not another lifecycle state:
+`Hot` torrents have active peer/protocol work, `Warm` torrents are idle but
+near tracker or recent activity, and `Dormant` torrents retain only compact
+state until promotion. This keeps user-visible `TorrentState` stable while
+letting the engine scale idle libraries without one task/channel/fd per
+torrent.
+
 ---
 
 ## Storage model

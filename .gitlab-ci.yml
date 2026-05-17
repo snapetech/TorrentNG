@@ -1,0 +1,79 @@
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+
+stages:
+  - build
+  - scan
+
+variables:
+  DOCKER_BUILDKIT: "1"
+  DOCKER_TLS_CERTDIR: "/certs"
+  PACKAGED_IMAGE_TAG: "$CI_REGISTRY_IMAGE/packaged:${CI_COMMIT_REF_SLUG}"
+  PACKAGED_IMAGE_SHA_TAG: "$CI_REGISTRY_IMAGE/packaged:${CI_COMMIT_SHORT_SHA}"
+  NATIVE_IMAGE_TAG: "$CI_REGISTRY_IMAGE/native:${CI_COMMIT_REF_SLUG}"
+  NATIVE_IMAGE_SHA_TAG: "$CI_REGISTRY_IMAGE/native:${CI_COMMIT_SHORT_SHA}"
+
+.docker_build:
+  stage: build
+  image: docker:27.5.1
+  services:
+    - name: docker:27.5.1-dind
+      command: ["--mtu=1450"]
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+    - docker buildx create --use --name gitlab-builder
+
+docker:packaged:
+  extends: .docker_build
+  script:
+    - >
+      docker buildx build
+      --file deploy/docker/Dockerfile
+      --tag "$PACKAGED_IMAGE_TAG"
+      --tag "$PACKAGED_IMAGE_SHA_TAG"
+      --push
+      .
+    - |
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        docker buildx imagetools create --tag "$CI_REGISTRY_IMAGE/packaged:$CI_COMMIT_TAG" "$PACKAGED_IMAGE_SHA_TAG"
+      fi
+
+docker:native:
+  extends: .docker_build
+  script:
+    - >
+      docker buildx build
+      --file deploy/native/Dockerfile
+      --tag "$NATIVE_IMAGE_TAG"
+      --tag "$NATIVE_IMAGE_SHA_TAG"
+      --push
+      .
+    - |
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        docker buildx imagetools create --tag "$CI_REGISTRY_IMAGE/native:$CI_COMMIT_TAG" "$NATIVE_IMAGE_SHA_TAG"
+      fi
+
+.trivy_scan:
+  stage: scan
+  image: aquasec/trivy:0.58.2
+  script:
+    - trivy image --username "$CI_REGISTRY_USER" --password "$CI_REGISTRY_PASSWORD" --exit-code 0 --severity HIGH,CRITICAL "$CS_IMAGE"
+
+container_scanning:packaged:
+  extends: .trivy_scan
+  needs: ["docker:packaged"]
+  variables:
+    CS_IMAGE: "$PACKAGED_IMAGE_SHA_TAG"
+  rules:
+    - if: '$CI_COMMIT_BRANCH || $CI_COMMIT_TAG'
+
+container_scanning:native:
+  extends: .trivy_scan
+  needs: ["docker:native"]
+  variables:
+    CS_IMAGE: "$NATIVE_IMAGE_SHA_TAG"
+  rules:
+    - if: '$CI_COMMIT_BRANCH || $CI_COMMIT_TAG'

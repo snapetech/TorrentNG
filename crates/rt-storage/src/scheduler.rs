@@ -580,30 +580,7 @@ async fn peer_read_elevator_worker(
     counters: Arc<StorageCounters>,
 ) {
     while let Some(first) = receiver.recv().await {
-        let mut requests = vec![first];
-        while let Ok(request) = receiver.try_recv() {
-            requests.push(request);
-        }
-        if !budget.is_zero() {
-            let deadline = Instant::now() + budget;
-            let quiet_slice = budget.min(Duration::from_millis(1));
-            loop {
-                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                    break;
-                };
-                let wait = quiet_slice.min(remaining);
-                match tokio::time::timeout(wait, receiver.recv()).await {
-                    Ok(Some(request)) => {
-                        requests.push(request);
-                        while let Ok(request) = receiver.try_recv() {
-                            requests.push(request);
-                        }
-                    }
-                    Ok(None) | Err(_) => break,
-                }
-            }
-        }
-
+        let requests = collect_peer_read_batch(&mut receiver, first, budget).await;
         let batches = peer_read_batches(requests);
         for batch in batches {
             let file_pool = file_pool.clone();
@@ -619,6 +596,43 @@ async fn peer_read_elevator_worker(
             });
         }
     }
+}
+
+async fn collect_peer_read_batch(
+    receiver: &mut tokio_mpsc::Receiver<PeerReadRequest>,
+    first: PeerReadRequest,
+    budget: Duration,
+) -> Vec<PeerReadRequest> {
+    let started = Instant::now();
+    let max_wait = budget.saturating_mul(4).max(budget);
+    let quiet = Duration::from_millis(2);
+    let mut requests = vec![first];
+
+    loop {
+        while let Ok(request) = receiver.try_recv() {
+            requests.push(request);
+        }
+
+        let elapsed = started.elapsed();
+        if budget.is_zero() || elapsed >= max_wait {
+            break;
+        }
+
+        let wait = if elapsed < budget {
+            budget - elapsed
+        } else {
+            quiet
+        };
+
+        match tokio::time::timeout(wait, receiver.recv()).await {
+            Ok(Some(request)) => requests.push(request),
+            Ok(None) => break,
+            Err(_) if elapsed >= budget => break,
+            Err(_) => {}
+        }
+    }
+
+    requests
 }
 
 fn peer_read_batches(mut requests: Vec<PeerReadRequest>) -> Vec<PeerReadBatch> {
