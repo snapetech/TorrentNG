@@ -2392,6 +2392,12 @@ impl Engine {
         resources.classes[storage_frame].denied_allocations = storage.frame_denied_allocations();
         let piece_assembly = MemoryClass::PieceAssembly as usize;
         resources.classes[piece_assembly].used_bytes = stats.piece_assembly_bytes;
+        let tracker_peers = MemoryClass::TrackerPeers as usize;
+        resources.classes[tracker_peers].used_bytes =
+            stats.tracker_peer_cache_entries.saturating_mul(64);
+        resources.classes[tracker_peers].denied_allocations = resources.classes[tracker_peers]
+            .denied_allocations
+            .saturating_add(stats.tracker_peer_cache_drops);
         resources.total_used_bytes = resources
             .classes
             .iter()
@@ -4387,6 +4393,8 @@ mod tests {
                     piece_assembly_bytes: 4096,
                     piece_assembly_evictions: 1,
                     peer_request_window_reductions: 6,
+                    tracker_peer_cache_entries: 7,
+                    tracker_peer_cache_drops: 8,
                     ..Default::default()
                 });
             }
@@ -4456,6 +4464,8 @@ mod tests {
                     piece_assembly_bytes: 4096,
                     piece_assembly_evictions: 1,
                     peer_request_window_reductions: 6,
+                    tracker_peer_cache_entries: 7,
+                    tracker_peer_cache_drops: 8,
                     ..Default::default()
                 });
             }
@@ -4829,6 +4839,8 @@ mod tests {
                     piece_assembly_bytes: 4096,
                     piece_assembly_evictions: 1,
                     peer_request_window_reductions: 6,
+                    tracker_peer_cache_entries: 7,
+                    tracker_peer_cache_drops: 8,
                     ..Default::default()
                 });
             }
@@ -4917,6 +4929,8 @@ mod tests {
         assert_eq!(stats.piece_assembly_bytes, 4096);
         assert_eq!(stats.piece_assembly_evictions, 1);
         assert_eq!(stats.peer_request_window_reductions, 6);
+        assert_eq!(stats.tracker_peer_cache_entries, 7);
+        assert_eq!(stats.tracker_peer_cache_drops, 8);
         let resources = stats.resources.expect("resource snapshot");
         let storage_frame = MemoryClass::StorageFrame as usize;
         assert_eq!(
@@ -4926,6 +4940,14 @@ mod tests {
         assert_eq!(
             resources.classes[MemoryClass::PieceAssembly as usize].used_bytes,
             4096
+        );
+        assert_eq!(
+            resources.classes[MemoryClass::TrackerPeers as usize].used_bytes,
+            448
+        );
+        assert_eq!(
+            resources.classes[MemoryClass::TrackerPeers as usize].denied_allocations,
+            8
         );
         assert!(resources.total_used_bytes >= 4096);
     }

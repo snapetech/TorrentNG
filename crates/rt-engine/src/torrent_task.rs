@@ -105,6 +105,8 @@ const MAX_IN_MEMORY_PIECE_ASSEMBLIES: usize = 64;
 const MAX_IN_MEMORY_PIECE_ASSEMBLY_BYTES_PER_TORRENT: usize = 64 * 1024 * 1024;
 const PEER_REQUEST_PIPELINE_NORMAL: usize = 32;
 const PEER_REQUEST_PIPELINE_CONSTRAINED: usize = 8;
+const TRACKER_PEER_CACHE_MIN: usize = 256;
+const TRACKER_PEER_CACHE_MULTIPLIER: usize = 4;
 
 fn effective_piece_assembly_soft_cap(configured_bytes: usize) -> usize {
     configured_bytes.min(MAX_IN_MEMORY_PIECE_ASSEMBLY_BYTES_PER_TORRENT)
@@ -119,6 +121,39 @@ fn memory_aware_request_pipeline(piece_assembly_bytes: usize, soft_cap_bytes: us
     } else {
         PEER_REQUEST_PIPELINE_NORMAL
     }
+}
+
+fn tracker_peer_cache_cap(max_peers: usize) -> usize {
+    max_peers
+        .saturating_mul(TRACKER_PEER_CACHE_MULTIPLIER)
+        .max(TRACKER_PEER_CACHE_MIN)
+}
+
+fn remember_tracker_peers_bounded(
+    known: &mut HashSet<SocketAddr>,
+    allowed_private: &mut HashSet<SocketAddr>,
+    peers: &[SocketAddr],
+    private: bool,
+    cap: usize,
+) -> u64 {
+    let mut dropped = 0u64;
+    for &peer in peers {
+        if known.contains(&peer) {
+            if private {
+                allowed_private.insert(peer);
+            }
+            continue;
+        }
+        if known.len() >= cap {
+            dropped = dropped.saturating_add(1);
+            continue;
+        }
+        known.insert(peer);
+        if private {
+            allowed_private.insert(peer);
+        }
+    }
+    dropped
 }
 
 /// A block received from a peer.
@@ -330,6 +365,7 @@ pub struct TorrentTask {
     piece_assembly_soft_cap_bytes: usize,
     piece_assembly_evictions: u64,
     peer_request_window_reductions: u64,
+    tracker_peer_cache_drops: u64,
     dirty_pieces_since_barrier: HashSet<u32>,
     completed_piece_verify_from_memory: u64,
     completed_piece_verify_from_disk: u64,
@@ -428,6 +464,7 @@ impl TorrentTask {
             ),
             piece_assembly_evictions: 0,
             peer_request_window_reductions: 0,
+            tracker_peer_cache_drops: 0,
             dirty_pieces_since_barrier: HashSet::new(),
             completed_piece_verify_from_memory: 0,
             completed_piece_verify_from_disk: 0,
@@ -1040,15 +1077,21 @@ impl TorrentTask {
             piece_assembly_bytes: self.piece_assembly_bytes as u64,
             piece_assembly_evictions: self.piece_assembly_evictions,
             peer_request_window_reductions: self.peer_request_window_reductions,
+            tracker_peer_cache_entries: self.known_tracker_peers.len() as u64,
+            tracker_peer_cache_drops: self.tracker_peer_cache_drops,
             storage: self.storage.stats(),
         }
     }
 
     fn remember_tracker_peers(&mut self, peers: &[SocketAddr]) {
-        self.known_tracker_peers.extend(peers.iter().copied());
-        if self.meta.private {
-            self.allowed_private_peers.extend(peers.iter().copied());
-        }
+        let dropped = remember_tracker_peers_bounded(
+            &mut self.known_tracker_peers,
+            &mut self.allowed_private_peers,
+            peers,
+            self.meta.private,
+            tracker_peer_cache_cap(self.max_peers),
+        );
+        self.tracker_peer_cache_drops = self.tracker_peer_cache_drops.saturating_add(dropped);
     }
 
     async fn retry_known_tracker_peers(&mut self) {
@@ -3441,6 +3484,38 @@ mod tests {
             PEER_REQUEST_PIPELINE_CONSTRAINED
         );
         assert_eq!(memory_aware_request_pipeline(1, 0), 0);
+    }
+
+    #[test]
+    fn tracker_peer_cache_cap_scales_with_peer_limit() {
+        assert_eq!(tracker_peer_cache_cap(1), TRACKER_PEER_CACHE_MIN);
+        assert_eq!(tracker_peer_cache_cap(100), 400);
+    }
+
+    #[test]
+    fn tracker_peer_cache_drops_new_peers_after_cap() {
+        let peers = [
+            SocketAddr::from(([127, 0, 0, 1], 6881)),
+            SocketAddr::from(([127, 0, 0, 2], 6881)),
+            SocketAddr::from(([127, 0, 0, 3], 6881)),
+        ];
+        let mut known = HashSet::new();
+        let mut allowed_private = HashSet::new();
+
+        let dropped =
+            remember_tracker_peers_bounded(&mut known, &mut allowed_private, &peers, true, 2);
+
+        assert_eq!(known.len(), 2);
+        assert_eq!(allowed_private, known);
+        assert_eq!(dropped, 1);
+
+        let duplicate = *known.iter().next().unwrap();
+        let dropped =
+            remember_tracker_peers_bounded(&mut known, &mut allowed_private, &[duplicate], true, 2);
+
+        assert_eq!(known.len(), 2);
+        assert_eq!(allowed_private, known);
+        assert_eq!(dropped, 0);
     }
 
     #[test]

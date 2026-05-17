@@ -1181,6 +1181,20 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
         "Peer request refill windows reduced because memory pressure limited in-flight piece data",
         stats.peer_request_window_reductions,
     );
+    metric(
+        &mut out,
+        "torrentng_tracker_peer_cache_entries",
+        "gauge",
+        "Tracker-discovered peer addresses retained across running torrents",
+        stats.tracker_peer_cache_entries,
+    );
+    metric(
+        &mut out,
+        "torrentng_tracker_peer_cache_drops_total",
+        "counter",
+        "Tracker-discovered peer addresses dropped because bounded peer caches were full",
+        stats.tracker_peer_cache_drops,
+    );
     if let Some(resources) = &stats.resources {
         metric(
             &mut out,
@@ -1732,6 +1746,8 @@ mod tests {
             storage_sparse_hole_bytes: 34,
             storage_sparse_seek_fallbacks: 35,
             peer_request_window_reductions: 40,
+            tracker_peer_cache_entries: 41,
+            tracker_peer_cache_drops: 42,
             ..Default::default()
         };
         stats.storage_read_ops_by_class[4] = 10;
@@ -1777,6 +1793,8 @@ mod tests {
         assert!(rendered.contains("torrentng_storage_peer_read_cache_hits_total 8"));
         assert!(rendered.contains("torrentng_piece_assembly_evictions_total 9"));
         assert!(rendered.contains("torrentng_peer_request_window_reductions_total 40"));
+        assert!(rendered.contains("torrentng_tracker_peer_cache_entries 41"));
+        assert!(rendered.contains("torrentng_tracker_peer_cache_drops_total 42"));
         assert!(
             rendered.contains("torrentng_storage_read_ops_by_class_total{class=\"peer_read\"} 10")
         );
