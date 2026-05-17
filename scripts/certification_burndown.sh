@@ -38,7 +38,7 @@ action_for() {
       printf 'Populate `testdata/migration-corpus/{qbittorrent,transmission,deluge,utorrent,biglybt,tixati,rtorrent,generic}` with real exported artifacts, then run `TNG_REQUIRE_MIGRATION_CORPUS=1 scripts/migration_corpus_certification.sh`.'
       ;;
     "24h soak:STALE/INCOMPLETE")
-      printf 'Start a fresh 24h soak with `scripts/soak_certification.sh 24h` or replace the stale requirement in release policy if transfer-churn soak supersedes it.'
+      printf 'Start a fresh 24h soak with `scripts/start_24h_soak.sh`, monitor it with `scripts/soak_status.sh`, then finalize with `SOAK_MIN_SAMPLES=1200 RESTORE_NORMAL=1 scripts/finalize_soak.sh <report>`. If transfer-churn soak supersedes this release requirement, remove the stale 24h row from release policy instead.'
       ;;
     "Local release gate:PASS_WITH_WARNINGS")
       printf 'Rerun `scripts/local_release_gate.sh` after warning rows are resolved. Set `TNG_STORAGE_MATRIX_TARGETS` for real-device storage release probes.'

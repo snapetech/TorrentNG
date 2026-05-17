@@ -181,6 +181,9 @@ of treating them as a clean evidence set.
 `scripts/certification_burndown.sh` turns those non-clean status rows into an
 action table with the exact commands or artifact drops needed to reach a clean
 release report.
+`scripts/start_24h_soak.sh` starts the long 24h soak with the correct
+`soak-24h-*` report naming, PID file, and log path so status can distinguish an
+active run from a stale partial report.
 The full Docker interop matrix still has release evidence to run:
 
 - local Docker client-to-client rows across qBittorrent, Transmission, Deluge,
