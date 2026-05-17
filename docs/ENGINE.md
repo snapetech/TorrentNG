@@ -107,7 +107,9 @@ Every transition is persisted and emits a structured event. No boolean soup.
 near tracker or recent activity, and `Dormant` torrents retain only compact
 state until promotion. This keeps user-visible `TorrentState` stable while
 letting the engine scale idle libraries without one task/channel/fd per
-torrent.
+torrent. `ActivityTimerWheel` is the shared deadline structure for tier
+promotion and idle checks; many torrents share one wheel instead of each idle
+torrent owning a timer task.
 
 ---
 

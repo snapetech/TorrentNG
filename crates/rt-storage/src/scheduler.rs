@@ -618,17 +618,12 @@ async fn collect_peer_read_batch(
             break;
         }
 
-        let wait = if elapsed < budget {
-            budget - elapsed
-        } else {
-            quiet
-        };
+        let wait = quiet.min(max_wait - elapsed);
 
         match tokio::time::timeout(wait, receiver.recv()).await {
             Ok(Some(request)) => requests.push(request),
             Ok(None) => break,
-            Err(_) if elapsed >= budget => break,
-            Err(_) => {}
+            Err(_) => break,
         }
     }
 

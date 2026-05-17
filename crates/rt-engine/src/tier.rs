@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, HashMap};
+use std::hash::Hash;
 use std::time::{Duration, Instant};
 
 use rt_session::TorrentState;
@@ -39,6 +41,71 @@ pub struct TierInput {
 pub struct TierDecision {
     pub tier: TorrentActivityTier,
     pub next_idle_check: Option<Duration>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActivityTimerWheel<K> {
+    deadlines: BTreeMap<Instant, Vec<K>>,
+    scheduled: HashMap<K, Instant>,
+}
+
+impl<K> Default for ActivityTimerWheel<K>
+where
+    K: Clone + Eq + Hash,
+{
+    fn default() -> Self {
+        Self {
+            deadlines: BTreeMap::new(),
+            scheduled: HashMap::new(),
+        }
+    }
+}
+
+impl<K> ActivityTimerWheel<K>
+where
+    K: Clone + Eq + Hash,
+{
+    pub fn len(&self) -> usize {
+        self.scheduled.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.scheduled.is_empty()
+    }
+
+    pub fn schedule(&mut self, key: K, deadline: Instant) {
+        self.cancel(&key);
+        self.deadlines
+            .entry(deadline)
+            .or_default()
+            .push(key.clone());
+        self.scheduled.insert(key, deadline);
+    }
+
+    pub fn cancel(&mut self, key: &K) -> bool {
+        self.scheduled.remove(key).is_some()
+    }
+
+    pub fn next_deadline(&self) -> Option<Instant> {
+        self.deadlines.keys().next().copied()
+    }
+
+    pub fn pop_due(&mut self, now: Instant) -> Vec<K> {
+        let due_deadlines: Vec<Instant> = self.deadlines.range(..=now).map(|(t, _)| *t).collect();
+        let mut due = Vec::new();
+        for deadline in due_deadlines {
+            let Some(keys) = self.deadlines.remove(&deadline) else {
+                continue;
+            };
+            for key in keys {
+                if self.scheduled.get(&key).copied() == Some(deadline) {
+                    self.scheduled.remove(&key);
+                    due.push(key);
+                }
+            }
+        }
+        due
+    }
 }
 
 impl TierPolicy {
@@ -190,5 +257,41 @@ mod tests {
                 TorrentActivityTier::Dormant
             );
         }
+    }
+
+    #[test]
+    fn timer_wheel_pops_due_torrents_without_one_timer_per_entry() {
+        let now = Instant::now();
+        let mut wheel = ActivityTimerWheel::<String>::default();
+        wheel.schedule("a".to_owned(), now + Duration::from_secs(10));
+        wheel.schedule("b".to_owned(), now + Duration::from_secs(20));
+        wheel.schedule("c".to_owned(), now + Duration::from_secs(20));
+
+        assert_eq!(wheel.len(), 3);
+        assert_eq!(wheel.next_deadline(), Some(now + Duration::from_secs(10)));
+        assert!(wheel.pop_due(now + Duration::from_secs(9)).is_empty());
+
+        assert_eq!(wheel.pop_due(now + Duration::from_secs(10)), vec!["a"]);
+        assert_eq!(wheel.len(), 2);
+
+        let mut due = wheel.pop_due(now + Duration::from_secs(20));
+        due.sort();
+        assert_eq!(due, vec!["b", "c"]);
+        assert!(wheel.is_empty());
+    }
+
+    #[test]
+    fn timer_wheel_reschedule_and_cancel_ignore_stale_slots() {
+        let now = Instant::now();
+        let mut wheel = ActivityTimerWheel::<String>::default();
+        let torrent = "torrent".to_owned();
+        wheel.schedule(torrent.clone(), now + Duration::from_secs(10));
+        wheel.schedule(torrent.clone(), now + Duration::from_secs(30));
+        assert!(wheel.pop_due(now + Duration::from_secs(10)).is_empty());
+        assert_eq!(wheel.len(), 1);
+
+        assert!(wheel.cancel(&torrent));
+        assert!(wheel.pop_due(now + Duration::from_secs(30)).is_empty());
+        assert!(wheel.is_empty());
     }
 }

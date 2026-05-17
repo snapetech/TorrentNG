@@ -10,7 +10,8 @@ stages:
 
 variables:
   DOCKER_BUILDKIT: "1"
-  DOCKER_TLS_CERTDIR: "/certs"
+  DOCKER_HOST: tcp://docker:2375
+  DOCKER_TLS_CERTDIR: ""
   PACKAGED_IMAGE_TAG: "$CI_REGISTRY_IMAGE/packaged:${CI_COMMIT_REF_SLUG}"
   PACKAGED_IMAGE_SHA_TAG: "$CI_REGISTRY_IMAGE/packaged:${CI_COMMIT_SHORT_SHA}"
   NATIVE_IMAGE_TAG: "$CI_REGISTRY_IMAGE/native:${CI_COMMIT_REF_SLUG}"
@@ -58,7 +59,9 @@ docker:native:
 
 .trivy_scan:
   stage: scan
-  image: aquasec/trivy:0.58.2
+  image:
+    name: aquasec/trivy:0.58.2
+    entrypoint: [""]
   script:
     - trivy image --username "$CI_REGISTRY_USER" --password "$CI_REGISTRY_PASSWORD" --exit-code 0 --severity HIGH,CRITICAL "$CS_IMAGE"
 
