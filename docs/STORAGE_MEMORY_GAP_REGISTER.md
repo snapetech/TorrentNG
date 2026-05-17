@@ -91,6 +91,7 @@ Implemented and covered by automated tests:
   `uring` stream throughput and optional graduation thresholds.
 - `scripts/storage_certification_index.sh` keeps hardware, `io_uring`, and
   move/import evidence as separate indexed categories, and
+  `scripts/certification_status.sh` reports each category separately before
   `scripts/post_soak_release_gate.sh` requires all three categories to pass.
 - Scheduler read returns can keep frame ownership through `scheduled_read_owned`
   or consume frames into compatibility `Bytes` without copying payload bytes.

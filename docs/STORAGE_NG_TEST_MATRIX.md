@@ -41,7 +41,7 @@ per-case syscall counters when `strace` is available.
 | Engine consumers | storage-backed recheck, upload reads across multi-file regions, resource snapshot in engine stats, taskless v2 verification | `cargo test -p rt-engine` |
 | Native API metrics | Prometheus projection for storage backend, frame/fd runtime, scheduler counters, bounded peer-cache pressure, peer buffer bytes, resource-governor classes | `cargo test -p rt-api-native render_metrics_includes_engine_stats` |
 | Move/import executor | plan admission, symlink-safe no-overwrite moves, copy-based move source cleanup, hardlink-or-copy import, recursive directory copy/delete, rename/copy/import symlink rejection, symlink-safe delete, staged rollback cleanup, storage-root confinement, optional real-root fixture execution | `scripts/storage_move_import_certification.sh`; set `TNG_STORAGE_MOVE_IMPORT_ROOT` for hardware-root evidence |
-| Certification index | Generated storage evidence keeps hardware, `io_uring`, and move/import rows independent; post-soak release gates require PASS evidence for all three categories instead of accepting one generic storage pass | `scripts/storage_certification_selftest.sh` |
+| Certification index | Generated storage evidence keeps hardware, `io_uring`, and move/import rows independent; certification status reports each indexed category; post-soak release gates require PASS evidence for all three categories instead of accepting one generic storage pass | `scripts/storage_certification_selftest.sh` |
 
 ## Runtime Configuration Matrix
 

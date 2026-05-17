@@ -43,6 +43,46 @@ row() {
   printf '| %s | %s | %s |\n' "$name" "$status" "$sample"
 }
 
+storage_index_has() {
+  local file="$1"
+  local kind="$2"
+  local result="$3"
+  awk -F'|' -v kind="$kind" -v result="$result" '
+    NR <= 2 { next }
+    {
+      for (i = 1; i <= NF; i++) {
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", $i)
+      }
+      if ($3 == kind && $NF == "" && $(NF - 1) == result) found = 1
+      else if ($3 == kind && $NF == result) found = 1
+    }
+    END { exit found ? 0 : 1 }
+  ' "$file"
+}
+
+storage_index_row() {
+  local name="$1"
+  local kind="$2"
+  local index sample status
+  index="$(latest 'storage-certification-index.md')"
+  sample="-"
+  if [[ -z "$index" || ! -f "$index" ]]; then
+    status="MISSING"
+  else
+    sample="$(basename "$index")"
+    if storage_index_has "$index" "$kind" PASS; then
+      status="PASS"
+    elif storage_index_has "$index" "$kind" FAIL; then
+      status="FAIL"
+    elif storage_index_has "$index" "$kind" SKIP; then
+      status="SKIP"
+    else
+      status="MISSING"
+    fi
+  fi
+  printf '| %s | %s | %s |\n' "$name" "$status" "$sample"
+}
+
 echo "# TorrentNG Certification Status"
 echo
 echo "- Date UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -77,6 +117,9 @@ row "Local release gate" 'local-release-*.md'
 row "Storage hardware matrix" 'storage-hardware-*.md'
 row "Storage io_uring capability/graduation" 'storage-uring-graduation-*.md'
 row "Storage move/import" 'storage-move-import-*.md'
+storage_index_row "Storage indexed hardware evidence" 'hardware matrix'
+storage_index_row "Storage indexed io_uring evidence" 'io_uring capability/graduation'
+storage_index_row "Storage indexed move/import evidence" 'move/import'
 row "Pre-engine release report" 'pre-engine-release-*.md'
 row "Pre-engine suite" 'pre-engine-suite-*.md'
 row "Post-soak release gate" 'post-soak-release-*.md'

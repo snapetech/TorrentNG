@@ -142,6 +142,10 @@ REPORT
 REPORT_DIR="$report_dir" BENCHMARK_DIR="$benchmark_dir" \
   "$ROOT/scripts/post_soak_release_gate.sh" "$report_dir/post-soak-release-selftest-pass.md" >/dev/null
 grep -q 'storage certification index | PASS' "$report_dir/post-soak-release-selftest-pass.md"
+BENCHMARK_DIR="$benchmark_dir" "$ROOT/scripts/certification_status.sh" "$report_dir" >"$tmpdir/status-pass.md"
+grep -q '| Storage indexed hardware evidence | PASS | storage-certification-index.md |' "$tmpdir/status-pass.md"
+grep -q '| Storage indexed io_uring evidence | PASS | storage-certification-index.md |' "$tmpdir/status-pass.md"
+grep -q '| Storage indexed move/import evidence | PASS | storage-certification-index.md |' "$tmpdir/status-pass.md"
 
 cat >"$report_dir/storage-move-import-selftest.md" <<'REPORT'
 # TorrentNG Storage Move/Import Certification
@@ -164,6 +168,8 @@ if require_row 'move/import' PASS; then
 fi
 
 require_row 'move/import' FAIL
+BENCHMARK_DIR="$benchmark_dir" "$ROOT/scripts/certification_status.sh" "$report_dir" >"$tmpdir/status-fail.md"
+grep -q '| Storage indexed move/import evidence | FAIL | storage-certification-index.md |' "$tmpdir/status-fail.md"
 
 if REPORT_DIR="$report_dir" BENCHMARK_DIR="$benchmark_dir" \
   "$ROOT/scripts/post_soak_release_gate.sh" "$report_dir/post-soak-release-selftest-fail.md" >/dev/null 2>&1; then

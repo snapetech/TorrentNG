@@ -2,7 +2,27 @@
 FROM rust:1.93-alpine AS sidecar-build
 RUN apk add --no-cache musl-dev pkgconf openssl-dev openssl-libs-static
 WORKDIR /src
-COPY sidecar/Cargo.toml sidecar/Cargo.lock ./
+RUN printf '%s\n' \
+    '[workspace]' \
+    'resolver = "2"' \
+    'exclude = ["sidecar"]' \
+    'members = ["crates/rt-logging"]' \
+    '' \
+    '[workspace.package]' \
+    'version = "0.1.0"' \
+    'edition = "2021"' \
+    'rust-version = "1.80"' \
+    'license = "GPL-3.0-or-later"' \
+    '' \
+    '[workspace.dependencies]' \
+    'serde = { version = "1", features = ["derive"] }' \
+    'tracing = "0.1"' \
+    'tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }' \
+    > Cargo.toml
+COPY sidecar/Cargo.toml sidecar/Cargo.lock ./sidecar/
+COPY crates/rt-logging/Cargo.toml ./crates/rt-logging/
+COPY crates/rt-logging/src ./crates/rt-logging/src
+WORKDIR /src/sidecar
 # Cache deps layer: build a stub main so cargo can fetch and compile deps
 RUN mkdir src && echo 'fn main(){}' > src/main.rs && echo '' > src/lib.rs && \
     cargo build --release && rm -rf src
@@ -43,7 +63,7 @@ RUN cd rtorrent && autoreconf -fi && \
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates curl libcurl ncurses openssl tinyxml2 tzdata zlib
 
-COPY --from=sidecar-build /src/target/release/torrentng /usr/local/bin/torrentng
+COPY --from=sidecar-build /src/sidecar/target/release/torrentng /usr/local/bin/torrentng
 COPY --from=webui-build   /sidecar/static /usr/share/torrentng/webui
 COPY --from=rtorrent-build /usr/local/bin/rtorrent /usr/local/bin/rtorrent
 COPY --from=rtorrent-build /usr/local/lib/libtorrent* /usr/local/lib/
