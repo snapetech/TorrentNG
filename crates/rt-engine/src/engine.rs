@@ -1271,6 +1271,7 @@ impl Engine {
             paused,
             Arc::clone(&self.registry),
             Arc::clone(&self.db),
+            self.resources.clone(),
             cmd_rx,
             fastresume_dir(&self.config),
             self.config.network.max_peers,
