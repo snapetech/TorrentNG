@@ -16,7 +16,8 @@ compatibility depth:
 - live Docker client interop and public-swarm runs are still release evidence
   gates, and the universal compatibility report now surfaces this as
   `PASS_WITH_SKIPS` unless those legs are enabled;
-- real exported migration corpora are still needed for all legacy clients;
+- the migration corpus gate exists and reports `PASS_WITH_GAPS` until real
+  exported corpora are present for all legacy clients;
 - facade compatibility still has placeholder-depth areas for live
   peer/tracker/webseed details and some client-specific plugin APIs;
 - the security release checklist is intentionally unchecked until run against
@@ -42,6 +43,7 @@ Current `scripts/certification_status.sh` highlights:
 | Security review and scan | PASS |
 | Pre-engine and post-soak release gates | PASS |
 | Universal compatibility | PASS_WITH_SKIPS unless live/public/device legs are enabled |
+| Migration corpus | PASS_WITH_GAPS until exported corpora are populated |
 | 24h soak | STALE/INCOMPLETE |
 
 ## Roadmaps
@@ -155,9 +157,15 @@ Remaining compatibility gaps:
   file/tracker/peer detail.
 - qBittorrent: common automation flows are covered; deeper live tracker delta
   fidelity and live swarm availability counters remain placeholder-depth.
+- `scripts/migration_corpus_certification.sh` now separates synthetic
+  import/apply coverage from exported fixture coverage. It runs `rt-migrate`
+  tests and scans `testdata/migration-corpus/{qbittorrent,transmission,deluge,
+  utorrent,biglybt,tixati,rtorrent,generic}`. It reports `PASS_WITH_GAPS` by
+  default while corpora are missing, or fails with
+  `TNG_REQUIRE_MIGRATION_CORPUS=1`.
 - Real exported golden fixture corpora are still needed for qBittorrent,
-  Transmission, Deluge, uTorrent/BitTorrent Classic, BiglyBT/Vuze, Tixati, and
-  rTorrent.
+  Transmission, Deluge, uTorrent/BitTorrent Classic, BiglyBT/Vuze, Tixati,
+  rTorrent, and generic bencoded/JSON edge cases.
 
 ## Wire Interop
 
@@ -212,6 +220,7 @@ cd webui && npm run build
 cd webui && npm run lint
 scripts/webui_certification.sh
 scripts/api_facade_certification.sh
+scripts/migration_corpus_certification.sh
 scripts/universal_compatibility_certification.sh
 ```
 

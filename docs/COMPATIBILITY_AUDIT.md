@@ -130,10 +130,11 @@ Local surface: `crates/rt-api-rtorrent`.
 | Done | Add `scripts/api_facade_certification.sh` as the deterministic pass/fail gate for qBit, Transmission, Deluge, and rTorrent facade matrices | Gives the compatibility docs one local certification entry point |
 | Done | Add `scripts/universal_compatibility_certification.sh` as the broad local gate for facade, migration, native API, engine, and scale compatibility evidence | Gives release certification a wider deterministic local gate before live Docker/client runs |
 | Done | Add cross-source import/apply matrices for JSON and bencoded resume aliases | Prevents fast-resume regressions when migrating from old clients |
+| Done | Add `scripts/migration_corpus_certification.sh` and `testdata/migration-corpus/` as the exported-corpus evidence gate | Keeps synthetic import/apply coverage separate from real client export coverage and can fail strict release runs with `TNG_REQUIRE_MIGRATION_CORPUS=1` |
 | Done | Expand qBittorrent preference response breadth and API-key compatibility routes | Settings panes and modern API clients probe these before mutation |
 | Done | Persist qBittorrent mutable preferences | Avoids settings panes seeing accepted writes disappear |
 | Done | Deepen qBittorrent torrent property field values | Avoids detail panes seeing compatibility placeholders for values derivable from registry/engine state |
 | Done | Add minimal rTorrent XMLRPC facade with command enumeration and request/response fixtures | Removes rTorrent facade as a universal compatibility gap while documenting placeholder depth |
-| Medium | Replace synthetic import aliases with real exported golden corpora for every supported legacy client version family | Catches undocumented key variants and nested plugin state |
+| Medium | Populate the exported golden corpus for every supported legacy client version family | Catches undocumented key variants and nested plugin state; gate exists and currently reports `PASS_WITH_GAPS` until artifacts are present |
 | Done | Preserve scheduler/RSS/search/autoadd/blocklist/execute/plugin metadata as auxiliary migration artifacts | Useful for full client migration; intentionally separate from torrent progress |
 | Low | Proprietary client deep parsers for Tixati/BiglyBT plugin-only fields | Needs fixture corpus; progress import already uses generic verified paths |

@@ -235,7 +235,7 @@ engine does not expose yet.
 |---|---|---|
 | P0 | `api_facade_endpoint_matrix` | Implemented in crate tests, `scripts/api_facade_certification.sh`, and `scripts/universal_compatibility_certification.sh`: qBit route matrix, Transmission method matrix, Deluge advertised method matrix, and rTorrent XMLRPC method matrix |
 | P0 | `api_response_field_matrix` | Implemented in crate tests, `scripts/api_facade_certification.sh`, and `scripts/universal_compatibility_certification.sh` for current qBit `torrents/info`/`properties`/`sync`, Transmission `torrent-get`/`session-get`, Deluge torrent status fields, and representative rTorrent XMLRPC fixtures |
-| P0 | `import_fixture_matrix` | Implemented for common JSON resume fields and source-specific bencoded aliases across qBit, Transmission, Deluge, uTorrent, BiglyBT/Vuze, Tixati, and Generic; real exported golden corpora remain P1 |
+| P0 | `import_fixture_matrix` | Implemented for common JSON resume fields and source-specific bencoded aliases across qBit, Transmission, Deluge, uTorrent, BiglyBT/Vuze, Tixati, and Generic; exported-corpus gate is wired through `scripts/migration_corpus_certification.sh` and reports `PASS_WITH_GAPS` until real artifacts are populated |
 | P0 | `migration_apply_matrix` | Implemented in `rt-migrate` tests and `scripts/universal_compatibility_certification.sh` for common JSON and bencoded resume fields across qBit, Transmission, Deluge, uTorrent, BiglyBT/Vuze, Tixati, and Generic: applies DB rows and fastresume, reloads, and asserts preservation |
 | P1 | `qbit_arr_client_matrix` | Sonarr/Radarr/Prowlarr/cross-seed/autobrr/NZB360-style qBit flows |
 | P1 | `transmission_client_matrix` | transmission-web, transmission-remote, mobile app field projections |
@@ -257,6 +257,6 @@ engine does not expose yet.
 | Done | Deepen Deluge `web.add_torrents` with common WebUI magnet, embedded metainfo, temp-file path, and URL-placeholder payload shapes | Deluge API matrix |
 | Done | Persist qBittorrent mutable preferences for arbitrary `setPreferences` keys | qBit field backlog |
 | Done | Broaden qBittorrent property projections to documented keys backed by registry/engine state | qBit field backlog |
-| P1 | Build real exported golden fixture corpus for qBit, Transmission, Deluge, uTorrent, BiglyBT/Vuze, Tixati, rTorrent, and compare it against the synthetic JSON/bencoded alias matrices | Import matrix |
+| P1 | Populate `testdata/migration-corpus/` with real exported golden fixtures for qBit, Transmission, Deluge, uTorrent, BiglyBT/Vuze, Tixati, rTorrent, and generic edge cases; enforce with `TNG_REQUIRE_MIGRATION_CORPUS=1` | Import matrix |
 | Done | Add minimal rTorrent XMLRPC compatibility dispatcher with command enumeration and representative fixtures | rTorrent matrix |
 | Done | Preserve auxiliary RSS/search/scheduler/autoadd/blocklist/execute/plugin/config metadata as migration artifacts | Feature/import matrices |

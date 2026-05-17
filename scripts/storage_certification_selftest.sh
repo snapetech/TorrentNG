@@ -115,6 +115,7 @@ for pattern in \
   mobile-compat-selftest.md \
   phase1-cert-selftest.md \
   universal-compat-selftest.md \
+  migration-corpus-selftest.md \
   soak-20260517-selftest.md \
   transfer-churn-selftest.md \
   soak-24h-selftest.md \

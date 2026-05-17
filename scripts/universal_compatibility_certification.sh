@@ -69,6 +69,7 @@ skip_gate() {
 
 run_gate "API facade endpoint and field matrices" "$ROOT/scripts/api_facade_certification.sh" "$ROOT/certification/reports/api-facades-universal-$(date -u +%Y%m%dT%H%M%SZ).md"
 run_gate "migration dry-run, DB import, and fastresume matrices" cargo test -p rt-migrate
+run_gate "migration exported corpus coverage" "$ROOT/scripts/migration_corpus_certification.sh" "$ROOT/certification/reports/migration-corpus-universal-$(date -u +%Y%m%dT%H%M%SZ).md"
 run_gate "Track 1 sidecar qBittorrent compatibility flows" bash -c 'cd sidecar && cargo test qb_'
 run_gate "native API compatibility manifest" cargo test -p rt-api-native
 run_gate "native engine state, tracker, and storage hooks" cargo test -p rt-engine
