@@ -61,8 +61,9 @@ async fn main() -> Result<()> {
         let tx2 = tx.clone();
         let mx2 = metrics.clone();
         let interval = cfg.sync_interval();
+        let retention = cfg.logging.event_retention;
         tokio::spawn(async move {
-            sync::run(rt2, db2, tx2, mx2, interval).await;
+            sync::run(rt2, db2, tx2, mx2, interval, retention).await;
         });
     }
 

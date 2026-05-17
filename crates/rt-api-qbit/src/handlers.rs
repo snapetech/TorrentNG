@@ -2055,6 +2055,14 @@ pub async fn transfer_ban_peers() -> impl IntoResponse {
 pub struct LogMainQuery {
     #[serde(default)]
     limit: Option<usize>,
+    #[serde(default)]
+    normal: Option<bool>,
+    #[serde(default)]
+    info: Option<bool>,
+    #[serde(default)]
+    warning: Option<bool>,
+    #[serde(default)]
+    critical: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2077,11 +2085,35 @@ pub async fn log_main(
     match engine.session_events(None, limit).await {
         Ok(events) => (
             StatusCode::OK,
-            Json(events.into_iter().map(qbit_log_entry).collect()),
+            Json(
+                events
+                    .into_iter()
+                    .map(qbit_log_entry)
+                    .filter(|entry| query.includes_type(entry.kind))
+                    .collect(),
+            ),
         ),
         Err(e) => {
             tracing::warn!(component = "api", operation = "log_main", error = %e, "failed to read session events");
             (StatusCode::OK, Json(Vec::<QbLogEntry>::new()))
+        }
+    }
+}
+
+impl LogMainQuery {
+    fn includes_type(&self, kind: i64) -> bool {
+        let any_filter = self.normal.is_some()
+            || self.info.is_some()
+            || self.warning.is_some()
+            || self.critical.is_some();
+        if !any_filter {
+            return true;
+        }
+        match kind {
+            1 => self.normal.unwrap_or(false) || self.info.unwrap_or(false),
+            2 => self.warning.unwrap_or(false),
+            4 => self.critical.unwrap_or(false),
+            _ => true,
         }
     }
 }
@@ -3131,6 +3163,42 @@ mod tests {
         assert_eq!(qbit_log_type("tracker_warning", "{}"), 2);
         assert_eq!(qbit_log_type("storage_failed", "{}"), 4);
         assert_eq!(qbit_log_type("tracker", r#"{"level":"critical"}"#), 4);
+    }
+
+    #[test]
+    fn log_main_query_filters_qbit_types() {
+        let all = LogMainQuery {
+            limit: None,
+            normal: None,
+            info: None,
+            warning: None,
+            critical: None,
+        };
+        assert!(all.includes_type(1));
+        assert!(all.includes_type(2));
+        assert!(all.includes_type(4));
+
+        let warnings = LogMainQuery {
+            limit: None,
+            normal: None,
+            info: None,
+            warning: Some(true),
+            critical: None,
+        };
+        assert!(!warnings.includes_type(1));
+        assert!(warnings.includes_type(2));
+        assert!(!warnings.includes_type(4));
+
+        let critical = LogMainQuery {
+            limit: None,
+            normal: Some(false),
+            info: Some(false),
+            warning: Some(false),
+            critical: Some(true),
+        };
+        assert!(!critical.includes_type(1));
+        assert!(!critical.includes_type(2));
+        assert!(critical.includes_type(4));
     }
 
     #[tokio::test]

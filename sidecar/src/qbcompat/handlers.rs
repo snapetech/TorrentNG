@@ -194,6 +194,10 @@ async fn zero_text() -> &'static str {
 #[derive(Debug, Deserialize)]
 struct LogMainQuery {
     limit: Option<usize>,
+    normal: Option<bool>,
+    info: Option<bool>,
+    warning: Option<bool>,
+    critical: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -210,11 +214,35 @@ async fn log_main(State(s): State<AppState>, Query(q): Query<LogMainQuery>) -> i
     match s.db.list_app_events(limit) {
         Ok(events) => (
             StatusCode::OK,
-            Json(events.into_iter().map(qbit_log_entry).collect::<Vec<_>>()),
+            Json(
+                events
+                    .into_iter()
+                    .map(qbit_log_entry)
+                    .filter(|entry| q.includes_type(entry.kind))
+                    .collect::<Vec<_>>(),
+            ),
         ),
         Err(e) => {
             tracing::warn!(component = "api", operation = "log_main", error = %e, "failed to read app events");
             (StatusCode::OK, Json(Vec::<QbLogEntry>::new()))
+        }
+    }
+}
+
+impl LogMainQuery {
+    fn includes_type(&self, kind: i64) -> bool {
+        let any_filter = self.normal.is_some()
+            || self.info.is_some()
+            || self.warning.is_some()
+            || self.critical.is_some();
+        if !any_filter {
+            return true;
+        }
+        match kind {
+            1 => self.normal.unwrap_or(false) || self.info.unwrap_or(false),
+            2 => self.warning.unwrap_or(false),
+            4 => self.critical.unwrap_or(false),
+            _ => true,
         }
     }
 }
@@ -1482,9 +1510,9 @@ fn qb_server_state(rates: TransferRates) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use crate::rtorrent::TransferRates;
+    use crate::{cache::AppEventRow, rtorrent::TransferRates};
 
-    use super::qb_server_state;
+    use super::{qb_log_entry, qb_server_state, LogMainQuery};
 
     #[test]
     fn qb_server_state_includes_current_transfer_rates() {
@@ -1496,6 +1524,47 @@ mod tests {
         assert_eq!(state["connection_status"], "connected");
         assert_eq!(state["dl_info_speed"], 1_234);
         assert_eq!(state["up_info_speed"], 567);
+    }
+
+    #[test]
+    fn qbit_log_entry_maps_app_event_levels() {
+        let entry = qb_log_entry(AppEventRow {
+            event_id: Some(7),
+            occurred_at: 1_700_000_000,
+            level: "warning".to_owned(),
+            kind: "rtorrent_log".to_owned(),
+            message: "tracker warning".to_owned(),
+            payload: "{}".to_owned(),
+        });
+        assert_eq!(entry.id, 7);
+        assert_eq!(entry.message, "tracker warning");
+        assert_eq!(entry.timestamp, 1_700_000_000);
+        assert_eq!(entry.kind, 2);
+    }
+
+    #[test]
+    fn log_main_query_filters_qbit_types() {
+        let all = LogMainQuery {
+            limit: None,
+            normal: None,
+            info: None,
+            warning: None,
+            critical: None,
+        };
+        assert!(all.includes_type(1));
+        assert!(all.includes_type(2));
+        assert!(all.includes_type(4));
+
+        let warning = LogMainQuery {
+            limit: None,
+            normal: None,
+            info: None,
+            warning: Some(true),
+            critical: None,
+        };
+        assert!(!warning.includes_type(1));
+        assert!(warning.includes_type(2));
+        assert!(!warning.includes_type(4));
     }
 }
 

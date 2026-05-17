@@ -9,7 +9,7 @@ use tracing::{info, warn};
 
 use crate::{
     api::ws::Event,
-    cache::{Db, TorrentRow},
+    cache::{AppEventRow, Db, TorrentRow},
     metrics::SharedMetrics,
     rtorrent::{torrents::MULTICALL_RANGE_PAGE_SIZE, Client},
     torrent_meta::session_tracker_url,
@@ -30,6 +30,7 @@ pub async fn run(
     tx: broadcast::Sender<Event>,
     metrics: SharedMetrics,
     interval: Duration,
+    event_retention: usize,
 ) {
     info!("sync loop started, interval={interval:?}");
     let mut ticker = tokio::time::interval(interval);
@@ -40,6 +41,7 @@ pub async fn run(
     let mut page_offset = 0i64;
     let mut full_cycle_seen = HashSet::new();
     let mut tracker_cache = HashMap::new();
+    let mut sync_error_active = false;
 
     loop {
         ticker.tick().await;
@@ -58,6 +60,21 @@ pub async fn run(
         };
         match result {
             Ok(counts) => {
+                if sync_error_active {
+                    append_app_event(
+                        &db,
+                        "info",
+                        "rtorrent_sync_recovered",
+                        "rTorrent sync recovered",
+                        serde_json::json!({
+                            "component": "rtorrent",
+                            "operation": "sync",
+                            "result": "ok",
+                        }),
+                        event_retention,
+                    );
+                    sync_error_active = false;
+                }
                 metrics.sync_cycles_total.fetch_add(1, Ordering::Relaxed);
                 metrics
                     .torrents_seeding
@@ -78,8 +95,47 @@ pub async fn run(
             Err(e) => {
                 metrics.sync_errors_total.fetch_add(1, Ordering::Relaxed);
                 warn!("sync error: {e:?}");
+                if !sync_error_active {
+                    append_app_event(
+                        &db,
+                        "warn",
+                        "rtorrent_sync_error",
+                        "rTorrent sync failed",
+                        serde_json::json!({
+                            "component": "rtorrent",
+                            "operation": "sync",
+                            "result": "error",
+                            "error": e.to_string(),
+                        }),
+                        event_retention,
+                    );
+                    sync_error_active = true;
+                }
             }
         }
+    }
+}
+
+fn append_app_event(
+    db: &Db,
+    level: &str,
+    kind: &str,
+    message: &str,
+    payload: serde_json::Value,
+    retention: usize,
+) {
+    if let Err(e) = db.append_app_event(
+        &AppEventRow {
+            event_id: None,
+            occurred_at: chrono::Utc::now().timestamp(),
+            level: level.to_owned(),
+            kind: kind.to_owned(),
+            message: message.to_owned(),
+            payload: payload.to_string(),
+        },
+        retention,
+    ) {
+        warn!("append sync app event {kind}: {e}");
     }
 }
 
@@ -237,5 +293,40 @@ fn write_live_speeds(download: i64, upload: i64) {
     {
         warn!("write live speeds {path}: {e}");
         let _ = std::fs::remove_file(tmp_path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn append_app_event_persists_sync_failure_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+
+        append_app_event(
+            &db,
+            "warn",
+            "rtorrent_sync_error",
+            "rTorrent sync failed",
+            serde_json::json!({
+                "component": "rtorrent",
+                "operation": "sync",
+                "result": "error",
+                "error": "connection refused",
+            }),
+            10,
+        );
+
+        let events = db.list_app_events(10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].level, "warn");
+        assert_eq!(events[0].kind, "rtorrent_sync_error");
+        assert_eq!(events[0].message, "rTorrent sync failed");
+        let payload: serde_json::Value = serde_json::from_str(&events[0].payload).unwrap();
+        assert_eq!(payload["component"], "rtorrent");
+        assert_eq!(payload["operation"], "sync");
+        assert_eq!(payload["result"], "error");
     }
 }
