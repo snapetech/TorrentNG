@@ -669,10 +669,10 @@ impl MountScheduler {
                     counters.read_ops_by_class[class_index(class)].fetch_add(1, Ordering::Relaxed);
                     counters.bytes_read_by_class[class_index(class)]
                         .fetch_add(len as u64, Ordering::Relaxed);
-                    counters.read_latency_ns_by_class[class_index(class)].fetch_add(
-                        started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
-                        Ordering::Relaxed,
-                    );
+                    let latency_ns = latency_ns_since(started);
+                    counters.read_latency_ns_by_class[class_index(class)]
+                        .fetch_add(latency_ns, Ordering::Relaxed);
+                    record_latency_bucket(&counters.read_latency_buckets, latency_ns);
                     return Ok(bytes);
                 }
                 counters
@@ -715,10 +715,10 @@ impl MountScheduler {
             counters.backend_read_ops_by_class[class_index(class)].fetch_add(1, Ordering::Relaxed);
             counters.backend_bytes_read_by_class[class_index(class)]
                 .fetch_add(read as u64, Ordering::Relaxed);
-            counters.read_latency_ns_by_class[class_index(class)].fetch_add(
-                started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
-                Ordering::Relaxed,
-            );
+            let latency_ns = latency_ns_since(started);
+            counters.read_latency_ns_by_class[class_index(class)]
+                .fetch_add(latency_ns, Ordering::Relaxed);
+            record_latency_bucket(&counters.read_latency_buckets, latency_ns);
             let bytes = bytes::Bytes::from(buf);
             if class == IoClass::PeerRead && read_len > len {
                 let exact = bytes.slice(..len);
@@ -773,10 +773,10 @@ impl MountScheduler {
             counters.write_ops_by_class[class_index(class)].fetch_add(1, Ordering::Relaxed);
             counters.bytes_written_by_class[class_index(class)]
                 .fetch_add(written as u64, Ordering::Relaxed);
-            counters.write_latency_ns_by_class[class_index(class)].fetch_add(
-                started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
-                Ordering::Relaxed,
-            );
+            let latency_ns = latency_ns_since(started);
+            counters.write_latency_ns_by_class[class_index(class)]
+                .fetch_add(latency_ns, Ordering::Relaxed);
+            record_latency_bucket(&counters.write_latency_buckets, latency_ns);
             Ok(())
         })
         .await
@@ -838,10 +838,11 @@ impl MountScheduler {
             let key = normalized_key(&path);
             pool.sync_path(&key)?;
             counters.sync_ops.fetch_add(1, Ordering::Relaxed);
-            counters.sync_latency_ns.fetch_add(
-                started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
-                Ordering::Relaxed,
-            );
+            let latency_ns = latency_ns_since(started);
+            counters
+                .sync_latency_ns
+                .fetch_add(latency_ns, Ordering::Relaxed);
+            record_latency_bucket(&counters.sync_latency_buckets, latency_ns);
             let mut dirty = dirty_paths.lock().expect("dirty path mutex poisoned");
             dirty.remove(&key);
             Ok(())
@@ -868,10 +869,11 @@ impl MountScheduler {
             for path in paths {
                 dirty.remove(&path);
             }
-            counters.sync_latency_ns.fetch_add(
-                started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
-                Ordering::Relaxed,
-            );
+            let latency_ns = latency_ns_since(started);
+            counters
+                .sync_latency_ns
+                .fetch_add(latency_ns, Ordering::Relaxed);
+            record_latency_bucket(&counters.sync_latency_buckets, latency_ns);
             Ok(())
         })
         .await
@@ -885,10 +887,11 @@ impl MountScheduler {
                 let mut hasher = Sha1::new();
                 hasher.update(&data);
                 counters.hash_ops.fetch_add(1, Ordering::Relaxed);
-                counters.hash_latency_ns.fetch_add(
-                    started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
-                    Ordering::Relaxed,
-                );
+                let latency_ns = latency_ns_since(started);
+                counters
+                    .hash_latency_ns
+                    .fetch_add(latency_ns, Ordering::Relaxed);
+                record_latency_bucket(&counters.hash_latency_buckets, latency_ns);
                 Ok(hasher.finalize().into())
             })
             .await
@@ -900,10 +903,11 @@ impl MountScheduler {
         self.hash_pool
             .run(move || {
                 counters.hash_ops.fetch_add(1, Ordering::Relaxed);
-                counters.hash_latency_ns.fetch_add(
-                    started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
-                    Ordering::Relaxed,
-                );
+                let latency_ns = latency_ns_since(started);
+                counters
+                    .hash_latency_ns
+                    .fetch_add(latency_ns, Ordering::Relaxed);
+                record_latency_bucket(&counters.hash_latency_buckets, latency_ns);
                 Ok(BlockHash::of(&data).0)
             })
             .await
@@ -915,10 +919,11 @@ impl MountScheduler {
         self.hash_pool
             .run(move || {
                 counters.hash_ops.fetch_add(1, Ordering::Relaxed);
-                counters.hash_latency_ns.fetch_add(
-                    started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
-                    Ordering::Relaxed,
-                );
+                let latency_ns = latency_ns_since(started);
+                counters
+                    .hash_latency_ns
+                    .fetch_add(latency_ns, Ordering::Relaxed);
+                record_latency_bucket(&counters.hash_latency_buckets, latency_ns);
                 Ok(merkle_root(&leaves))
             })
             .await
@@ -970,10 +975,7 @@ fn latency_ns_since(started: Instant) -> u64 {
     started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
-fn record_latency_bucket(
-    buckets: &[AtomicU64; STORAGE_LATENCY_BUCKET_COUNT],
-    latency_ns: u64,
-) {
+fn record_latency_bucket(buckets: &[AtomicU64; STORAGE_LATENCY_BUCKET_COUNT], latency_ns: u64) {
     for (index, upper_bound) in STORAGE_LATENCY_BUCKETS_NS.iter().enumerate() {
         if latency_ns <= *upper_bound {
             buckets[index].fetch_add(1, Ordering::Relaxed);
@@ -1300,10 +1302,26 @@ mod tests {
         );
         assert!(stats.read_latency_ns_by_class[class_index(IoClass::PeerRead)] > 0);
         assert!(stats.write_latency_ns_by_class[class_index(IoClass::PeerWrite)] > 0);
+        assert_eq!(
+            stats.read_latency_buckets[STORAGE_LATENCY_BUCKET_COUNT - 1],
+            1
+        );
+        assert_eq!(
+            stats.write_latency_buckets[STORAGE_LATENCY_BUCKET_COUNT - 1],
+            1
+        );
         assert_eq!(stats.hash_ops, 1);
         assert!(stats.hash_latency_ns > 0);
+        assert_eq!(
+            stats.hash_latency_buckets[STORAGE_LATENCY_BUCKET_COUNT - 1],
+            1
+        );
         assert_eq!(stats.sync_ops, 1);
         assert!(stats.sync_latency_ns > 0);
+        assert_eq!(
+            stats.sync_latency_buckets[STORAGE_LATENCY_BUCKET_COUNT - 1],
+            1
+        );
         assert_eq!(stats.dirty_files, 0);
     }
 

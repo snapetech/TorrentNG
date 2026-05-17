@@ -4,7 +4,7 @@ use std::{net::SocketAddr, path::PathBuf};
 use tokio::sync::oneshot;
 
 use rt_metainfo::{MagnetLink, TorrentMeta};
-use rt_storage::StorageIoStats;
+use rt_storage::{StorageIoStats, STORAGE_LATENCY_BUCKET_COUNT};
 
 pub type CmdResult<T> = Result<T, String>;
 
@@ -79,6 +79,10 @@ pub struct EngineStats {
     pub storage_write_latency_ns: u64,
     pub storage_read_latency_ns_by_class: [u64; 6],
     pub storage_write_latency_ns_by_class: [u64; 6],
+    pub storage_read_latency_buckets: [u64; STORAGE_LATENCY_BUCKET_COUNT],
+    pub storage_write_latency_buckets: [u64; STORAGE_LATENCY_BUCKET_COUNT],
+    pub storage_sync_latency_buckets: [u64; STORAGE_LATENCY_BUCKET_COUNT],
+    pub storage_hash_latency_buckets: [u64; STORAGE_LATENCY_BUCKET_COUNT],
     pub storage_sync_latency_ns: u64,
     pub storage_hash_latency_ns: u64,
     pub storage_sync_ops: u64,
@@ -221,12 +225,28 @@ impl EngineStats {
         {
             *target = target.saturating_add(value);
         }
+        add_bucket_counts(
+            &mut self.storage_read_latency_buckets,
+            storage.read_latency_buckets,
+        );
+        add_bucket_counts(
+            &mut self.storage_write_latency_buckets,
+            storage.write_latency_buckets,
+        );
         self.storage_sync_latency_ns = self
             .storage_sync_latency_ns
             .saturating_add(storage.sync_latency_ns);
+        add_bucket_counts(
+            &mut self.storage_sync_latency_buckets,
+            storage.sync_latency_buckets,
+        );
         self.storage_hash_latency_ns = self
             .storage_hash_latency_ns
             .saturating_add(storage.hash_latency_ns);
+        add_bucket_counts(
+            &mut self.storage_hash_latency_buckets,
+            storage.hash_latency_buckets,
+        );
         self.storage_sync_ops = self.storage_sync_ops.saturating_add(storage.sync_ops);
         self.storage_hash_ops = self.storage_hash_ops.saturating_add(storage.hash_ops);
         self.storage_preallocation_failures = self
@@ -244,6 +264,12 @@ impl EngineStats {
         self.storage_peer_read_cache_misses = self
             .storage_peer_read_cache_misses
             .saturating_add(storage.peer_read_cache_misses);
+    }
+}
+
+fn add_bucket_counts<const N: usize>(target: &mut [u64; N], source: [u64; N]) {
+    for (target, value) in target.iter_mut().zip(source) {
+        *target = target.saturating_add(value);
     }
 }
 
@@ -499,6 +525,10 @@ mod tests {
         storage.backend_bytes_read_by_class[4] = 4096;
         storage.read_latency_ns_by_class[4] = 100;
         storage.write_latency_ns_by_class[3] = 200;
+        storage.read_latency_buckets[0] = 1;
+        storage.write_latency_buckets[1] = 2;
+        storage.sync_latency_buckets[2] = 3;
+        storage.hash_latency_buckets[3] = 4;
         storage.sync_latency_ns = 300;
         storage.hash_latency_ns = 400;
 
@@ -530,6 +560,10 @@ mod tests {
         assert_eq!(stats.storage_write_latency_ns, 200);
         assert_eq!(stats.storage_read_latency_ns_by_class[4], 100);
         assert_eq!(stats.storage_write_latency_ns_by_class[3], 200);
+        assert_eq!(stats.storage_read_latency_buckets[0], 1);
+        assert_eq!(stats.storage_write_latency_buckets[1], 2);
+        assert_eq!(stats.storage_sync_latency_buckets[2], 3);
+        assert_eq!(stats.storage_hash_latency_buckets[3], 4);
         assert_eq!(stats.storage_sync_latency_ns, 300);
         assert_eq!(stats.storage_hash_latency_ns, 400);
         assert_eq!(stats.storage_peer_read_cache_hits, 12);

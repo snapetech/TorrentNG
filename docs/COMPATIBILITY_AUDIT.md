@@ -64,7 +64,7 @@ Local surface: `crates/rt-api-qbit`.
 | Application | version, API version, build info, shutdown, preferences, set preferences, default save path, network interface probes, test email | Implemented as native/no-op compatibility where no native equivalent exists |
 | qBittorrent 5 cookie/API key APIs | `app/getCookies`, `app/setCookies`, `app/rotateAPIKey`, `app/deleteAPIKey` | Implemented as empty/no-op compatibility |
 | Logs | main log, peer log | Implemented as empty-compatible reads |
-| Sync | `sync/maindata`, `sync/torrentPeers` | Implemented |
+| Sync | `sync/maindata`, `sync/torrentPeers` | Implemented; maindata carries broad torrent fields and server-state compatibility keys |
 | Transfer | global info, speed limits, speed-limit mode, ban peers | Implemented |
 | Torrent reads | list with modern qBit path/counter/limit/mode/magnet/infohash fields, properties, trackers, web seeds, files, piece states, piece hashes, export | Implemented |
 | Torrent lifecycle | add, pause/resume legacy aliases, start/stop v5 aliases, delete, recheck, reannounce | Implemented |
@@ -78,9 +78,9 @@ Local surface: `crates/rt-api-transmission`.
 
 | API group | Upstream surface | Local status |
 |---|---|---|
-| Protocol shape | Transmission 4.1 JSON-RPC 2.0 uses snake_case; older RPC uses kebab/camel strings | Implemented: snake_case methods and args normalize to native handlers; snake_case callers receive snake_case response keys |
+| Protocol shape | Transmission 4.1 JSON-RPC 2.0 uses snake_case; older RPC uses kebab/camel strings | Implemented: JSON-RPC 2.0 single and batch envelopes with `params`, direct `result`, and error objects; snake_case methods/args normalize to native handlers; old envelope remains supported |
 | CSRF session ID | `X-Transmission-Session-Id` retry flow | Implemented |
-| Session reads | `session_get`, `session_stats`, `session_access_control` | Implemented |
+| Session reads | `session_get`, `session_stats`, `session_access_control` | Implemented; `session_get` supports field projection |
 | Session writes | `session_set`, `session_close`, queue-stalled enable/disable | Implemented for native limits and compatibility no-ops |
 | Groups | `group_get`, `group_set` | Accepted as compatibility no-ops |
 | Torrent actions | start, start now, stop, verify, reannounce, remove | Implemented |

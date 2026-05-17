@@ -1623,6 +1623,17 @@ pub async fn sync_maindata(
     }
     let rid = sync_rid_for_infos(&infos);
     let full_update = q.rid.unwrap_or(0) != rid;
+    let (alltime_dl, alltime_ul) = infos.iter().fold((0_i64, 0_i64), |(dl, ul), info| {
+        (
+            dl.saturating_add(info.downloaded),
+            ul.saturating_add(info.uploaded),
+        )
+    });
+    let global_ratio = if alltime_dl > 0 {
+        alltime_ul as f64 / alltime_dl as f64
+    } else {
+        0.0
+    };
     let mut torrents = serde_json::Map::new();
     if full_update {
         for info in infos {
@@ -1640,11 +1651,25 @@ pub async fn sync_maindata(
             dl_info_data: 0,
             up_info_speed: 0,
             up_info_data: 0,
+            alltime_dl,
+            alltime_ul,
+            average_time_queue: 0,
             connection_status: "connected".into(),
             free_space_on_disk: 0,
+            global_ratio,
+            queued_io_jobs: 0,
+            queueing: false,
+            read_cache_hits: "0".into(),
+            read_cache_overload: "0".into(),
+            refresh_interval: 1500,
+            total_buffers_size: 0,
+            total_peer_connections: 0,
+            total_queued_size: 0,
+            total_wasted_session: 0,
             dl_rate_limit: limits.download_limit,
             up_rate_limit: limits.upload_limit,
             use_alt_speed_limits: limits.speed_limits_mode,
+            write_cache_overload: "0".into(),
         }
     });
     (StatusCode::OK, Json(resp))
@@ -3044,11 +3069,63 @@ mod tests {
                 "dl_info_data",
                 "up_info_speed",
                 "up_info_data",
+                "alltime_dl",
+                "alltime_ul",
+                "average_time_queue",
                 "connection_status",
                 "free_space_on_disk",
+                "global_ratio",
+                "queued_io_jobs",
+                "queueing",
+                "read_cache_hits",
+                "read_cache_overload",
+                "refresh_interval",
+                "total_buffers_size",
+                "total_peer_connections",
+                "total_queued_size",
+                "total_wasted_session",
                 "dl_rate_limit",
                 "up_rate_limit",
                 "use_alt_speed_limits",
+                "write_cache_overload",
+            ],
+        );
+        let sync_torrent = &body["torrents"]["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"];
+        assert_json_keys(
+            sync_torrent,
+            &[
+                "hash",
+                "name",
+                "state",
+                "size",
+                "total_size",
+                "downloaded",
+                "downloaded_session",
+                "uploaded",
+                "uploaded_session",
+                "ratio",
+                "save_path",
+                "content_path",
+                "root_path",
+                "category",
+                "tags",
+                "added_on",
+                "completion_on",
+                "last_activity",
+                "seen_complete",
+                "time_active",
+                "seeding_time",
+                "dl_limit",
+                "up_limit",
+                "seq_dl",
+                "f_l_piece_prio",
+                "force_start",
+                "super_seeding",
+                "ratio_limit",
+                "seeding_time_limit",
+                "magnet_uri",
+                "infohash_v1",
+                "infohash_v2",
             ],
         );
     }

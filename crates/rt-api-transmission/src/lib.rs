@@ -87,6 +87,18 @@ async fn rpc(
             .into_response();
     }
 
+    if let Value::Array(requests) = body {
+        let mut responses = Vec::with_capacity(requests.len());
+        for request in requests {
+            responses.push(transmission_rpc_payload(&state, request).await);
+        }
+        return Json(Value::Array(responses)).into_response();
+    }
+
+    Json(transmission_rpc_payload(&state, body).await).into_response()
+}
+
+async fn transmission_rpc_payload(state: &AppState, body: Value) -> Value {
     let method = body
         .get("method")
         .and_then(Value::as_str)
@@ -107,7 +119,7 @@ async fn rpc(
     let tag = body.get("tag").cloned();
     let id = body.get("id").cloned().unwrap_or(Value::Null);
     let result = match method_key.as_str() {
-        "session-get" => Ok(session_get(&state).await),
+        "session-get" => Ok(session_get(&state, &args).await),
         "session-stats" => Ok(session_stats(&state).await),
         "session-close" => Ok(json!({})),
         "session-set" => session_set(&state, &args).await,
@@ -138,13 +150,12 @@ async fn rpc(
         "torrent-add" => torrent_add(&state, &args).await,
         "torrent-set-location" => {
             let Some(location) = args.get("location").and_then(Value::as_str) else {
-                return Json(transmission_response(
+                return transmission_response(
                     tag.clone(),
                     id,
                     json_rpc,
                     Err("missing location".to_owned()),
-                ))
-                .into_response();
+                );
             };
             for hash in ids(&state, &args).await {
                 if let Some(engine) = &state.engine {
@@ -218,7 +229,7 @@ async fn rpc(
         }
         Err(result) => Err(result),
     };
-    Json(transmission_response(tag, id, json_rpc, payload)).into_response()
+    transmission_response(tag, id, json_rpc, payload)
 }
 
 async fn torrent_set(state: &AppState, args: &Value) -> Result<Value, String> {
@@ -545,10 +556,10 @@ fn transmission_key_to_snake_case(key: &str) -> String {
     out
 }
 
-async fn session_get(state: &AppState) -> Value {
+async fn session_get(state: &AppState, args: &Value) -> Value {
     let limits = transmission_global_limits(state).await;
     let session = state.session.read().await.clone();
-    json!({
+    let value = json!({
         "version": "rtorrentNG",
         "rpc-version": 17,
         "rpc-version-minimum": 1,
@@ -600,7 +611,32 @@ async fn session_get(state: &AppState) -> Value {
             "memory-units": ["B", "KiB", "MiB", "GiB", "TiB"],
             "memory-bytes": 1024,
         },
-    })
+    });
+    transmission_project_fields(value, args)
+}
+
+fn transmission_project_fields(value: Value, args: &Value) -> Value {
+    let Some(fields) = args.get("fields").and_then(Value::as_array) else {
+        return value;
+    };
+    if fields.is_empty() {
+        return value;
+    }
+    let Some(obj) = value.as_object() else {
+        return value;
+    };
+    Value::Object(
+        fields
+            .iter()
+            .filter_map(Value::as_str)
+            .filter_map(|field| {
+                obj.get(field)
+                    .or_else(|| obj.get(&field.replace('_', "-")))
+                    .cloned()
+                    .map(|value| (field.to_owned(), value))
+            })
+            .collect(),
+    )
 }
 
 async fn session_stats(state: &AppState) -> Value {
@@ -1781,6 +1817,46 @@ mod tests {
         assert_eq!(body["id"], "bad");
         assert_eq!(body["error"]["code"], -32601);
         assert_eq!(body["error"]["message"], "method name not recognized");
+    }
+
+    #[tokio::test]
+    async fn transmission_json_rpc_20_batch_requests_are_supported() {
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        {
+            let mut reg = registry.write().await;
+            let mut entry = TorrentEntry::new("1".repeat(40), "one".into(), "/data".into());
+            entry.total_length = 10;
+            entry.amount_left = 0;
+            reg.add(entry).unwrap();
+        }
+        let app = build_transmission_router(AppState::new(registry));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .header("content-type", "application/json")
+                    .header("x-transmission-session-id", SESSION_ID)
+                    .body(Body::from(
+                        r#"[
+                            {"jsonrpc":"2.0","method":"session_get","params":{"fields":["version"]},"id":1},
+                            {"jsonrpc":"2.0","method":"torrent_get","params":{"fields":["name","percent_done"]},"id":2}
+                        ]"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body[0]["jsonrpc"], "2.0");
+        assert_eq!(body[0]["id"], 1);
+        assert_eq!(body[0]["result"]["version"], "rtorrentNG");
+        assert_eq!(body[1]["jsonrpc"], "2.0");
+        assert_eq!(body[1]["id"], 2);
+        assert_eq!(body[1]["result"]["torrents"][0]["name"], "one");
+        assert_eq!(body[1]["result"]["torrents"][0]["percent_done"], 1.0);
     }
 
     #[tokio::test]

@@ -371,7 +371,7 @@ rTorrent over XMLRPC.
 | `rtorrentng_storage_bytes_{read,written}_total` | counter | Bytes moved through native schedulers |
 | `rtorrentng_storage_*_by_class_total{class=...}` | counter | Read/write operation and byte counters split by scheduler I/O class |
 | `rtorrentng_storage_backend_read_*` | counter | Actual backend disk read operations and bytes, excluding peer-read cache hits |
-| `rtorrentng_storage_*_latency_nanoseconds_total` | counter | Cumulative storage queue plus execution latency for read, write, sync, and hash work |
+| `rtorrentng_storage_*_latency_nanoseconds` | histogram/counter | Storage queue plus execution latency buckets and cumulative totals for read, write, sync, and hash work |
 | `rtorrentng_storage_{sync,hash}_ops_total` | counter | Durability syncs and hashing-pool work |
 | `rtorrentng_storage_preallocation_*_total` | counter | Preallocation failures and fallback events |
 | `rtorrentng_storage_peer_read_cache_*` | gauge/counter | Peer-read readahead cache entries, hits, and misses |

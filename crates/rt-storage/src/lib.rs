@@ -18,6 +18,6 @@ pub use plan::{
 };
 pub use scheduler::{
     DurabilityMode, FilePoolStats, IoRequest, MountScheduler, PreallocationMode, SchedulerConfig,
-    StorageIoConfig, StorageIoStats,
+    StorageIoConfig, StorageIoStats, STORAGE_LATENCY_BUCKETS_NS, STORAGE_LATENCY_BUCKET_COUNT,
 };
 pub use verify::{PieceVerifier, V2FileHash, V2FileVerifier, VerifyResult};

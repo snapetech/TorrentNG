@@ -16,7 +16,7 @@ use rt_api_model::{
 };
 use rt_metainfo::{parse_magnet, parse_torrent};
 use rt_session::{TorrentEntry, TorrentState};
-use rt_storage::runtime::StorageRuntime;
+use rt_storage::{runtime::StorageRuntime, STORAGE_LATENCY_BUCKETS_NS};
 
 use crate::state::AppState;
 
@@ -805,6 +805,14 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
         "Total read queue plus execution latency across running torrent schedulers",
         stats.storage_read_latency_ns,
     );
+    latency_histogram(
+        &mut out,
+        "rtorrentng_storage_read_latency_nanoseconds",
+        "Read queue plus execution latency across running torrent schedulers",
+        &stats.storage_read_latency_buckets,
+        stats.storage_read_ops,
+        stats.storage_read_latency_ns,
+    );
     metric_by_class(
         &mut out,
         "rtorrentng_storage_read_latency_nanoseconds_by_class_total",
@@ -817,6 +825,14 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
         "rtorrentng_storage_write_latency_nanoseconds_total",
         "counter",
         "Total write queue plus execution latency across running torrent schedulers",
+        stats.storage_write_latency_ns,
+    );
+    latency_histogram(
+        &mut out,
+        "rtorrentng_storage_write_latency_nanoseconds",
+        "Write queue plus execution latency across running torrent schedulers",
+        &stats.storage_write_latency_buckets,
+        stats.storage_write_ops,
         stats.storage_write_latency_ns,
     );
     metric_by_class(
@@ -833,11 +849,27 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
         "Total sync queue plus execution latency across running torrent schedulers",
         stats.storage_sync_latency_ns,
     );
+    latency_histogram(
+        &mut out,
+        "rtorrentng_storage_sync_latency_nanoseconds",
+        "Sync queue plus execution latency across running torrent schedulers",
+        &stats.storage_sync_latency_buckets,
+        stats.storage_sync_ops,
+        stats.storage_sync_latency_ns,
+    );
     metric(
         &mut out,
         "rtorrentng_storage_hash_latency_nanoseconds_total",
         "counter",
         "Total hashing queue plus execution latency across running torrent schedulers",
+        stats.storage_hash_latency_ns,
+    );
+    latency_histogram(
+        &mut out,
+        "rtorrentng_storage_hash_latency_nanoseconds",
+        "Hashing queue plus execution latency across running torrent schedulers",
+        &stats.storage_hash_latency_buckets,
+        stats.storage_hash_ops,
         stats.storage_hash_latency_ns,
     );
     metric(
@@ -980,6 +1012,44 @@ fn metric_by_class(out: &mut String, name: &str, kind: &str, help: &str, values:
         out.push_str(&value.to_string());
         out.push('\n');
     }
+}
+
+fn latency_histogram(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    buckets: &[u64; STORAGE_LATENCY_BUCKETS_NS.len()],
+    count: u64,
+    sum_ns: u64,
+) {
+    out.push_str("# HELP ");
+    out.push_str(name);
+    out.push(' ');
+    out.push_str(help);
+    out.push('\n');
+    out.push_str("# TYPE ");
+    out.push_str(name);
+    out.push_str(" histogram\n");
+    for (upper_bound, count) in STORAGE_LATENCY_BUCKETS_NS.iter().zip(buckets) {
+        out.push_str(name);
+        out.push_str("_bucket{le=\"");
+        if *upper_bound == u64::MAX {
+            out.push_str("+Inf");
+        } else {
+            out.push_str(&upper_bound.to_string());
+        }
+        out.push_str("\"} ");
+        out.push_str(&count.to_string());
+        out.push('\n');
+    }
+    out.push_str(name);
+    out.push_str("_sum ");
+    out.push_str(&sum_ns.to_string());
+    out.push('\n');
+    out.push_str(name);
+    out.push_str("_count ");
+    out.push_str(&count.to_string());
+    out.push('\n');
 }
 
 enum TorrentControl {
@@ -1250,6 +1320,10 @@ mod tests {
         stats.storage_backend_bytes_read_by_class[4] = 17;
         stats.storage_read_latency_ns_by_class[4] = 22;
         stats.storage_write_latency_ns_by_class[3] = 23;
+        stats.storage_read_latency_buckets[7] = 6;
+        stats.storage_write_latency_buckets[7] = 11;
+        stats.storage_sync_latency_buckets[7] = 2;
+        stats.storage_hash_latency_buckets[7] = 7;
         let rendered = render_metrics(&stats);
         assert!(rendered.contains("rtorrentng_torrents_total 2"));
         assert!(rendered.contains("rtorrentng_torrents_seeding 1"));
@@ -1287,6 +1361,19 @@ mod tests {
         assert!(rendered.contains(
             "rtorrentng_storage_write_latency_nanoseconds_by_class_total{class=\"peer_write\"} 23"
         ));
+        assert!(
+            rendered.contains("rtorrentng_storage_read_latency_nanoseconds_bucket{le=\"+Inf\"} 6")
+        );
+        assert!(rendered.contains("rtorrentng_storage_read_latency_nanoseconds_sum 18"));
+        assert!(rendered.contains("rtorrentng_storage_read_latency_nanoseconds_count 6"));
+        assert!(rendered
+            .contains("rtorrentng_storage_write_latency_nanoseconds_bucket{le=\"+Inf\"} 11"));
+        assert!(
+            rendered.contains("rtorrentng_storage_sync_latency_nanoseconds_bucket{le=\"+Inf\"} 2")
+        );
+        assert!(
+            rendered.contains("rtorrentng_storage_hash_latency_nanoseconds_bucket{le=\"+Inf\"} 7")
+        );
         assert!(rendered.contains("rtorrentng_storage_handles_open "));
         assert!(rendered.contains("rtorrentng_storage_frame_bytes_cap "));
     }

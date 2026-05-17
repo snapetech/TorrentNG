@@ -110,7 +110,7 @@ Local implementation: `crates/rt-api-qbit`.
 | Categories | `categories`, `createCategory`, `editCategory`, `removeCategories`, `setCategory` | Same | Native/Compat | Category create/edit/remove/set row |
 | Tags | `tags`, `createTags`, `deleteTags`, `addTags`, `setTags`, `removeTags` | Same | Native/Compat | Tags global and per-torrent row |
 | Limits/modes | `downloadLimit`, `setDownloadLimit`, `uploadLimit`, `setUploadLimit`, `setShareLimits`, `setForceStart`, `setSuperSeeding`, `setAutoTMM`, `setAutoManagement`, `toggleSequentialDownload`, `toggleFirstLastPiecePrio` | Same | Partial/Compat | Limit read/write, mode accepted, native behavior later |
-| Sync | `sync/maindata`, `sync/torrentPeers` | Same | Native/Partial peers | Full sync, delta sync, peer sync row |
+| Sync | `sync/maindata`, `sync/torrentPeers` | Same | Native/Partial peers; maindata includes broad torrent field and server-state compatibility keys | Full sync, delta sync, peer sync row |
 | Transfer | `transfer/info`, download/upload limits, speed limits mode, toggle, setters, `banPeers` | Same | Native/Compat | Global limit and ban accepted rows |
 | Logs | `log/main`, `log/peers` | Same | Compat | Shape test |
 | Search | status/categories/plugins/install/uninstall/enable/update/start/stop/results/delete | Same | Compat | Full no-plugin search flow shape |
@@ -123,7 +123,7 @@ qBittorrent field backlog:
 | `app/preferences` | Broad current/legacy WebUI preference key set across paths, queueing, BitTorrent, WebUI, RSS, proxy, and advanced settings | Implemented compatibility defaults for common settings panes; remaining work is value persistence for mutable settings |
 | `torrents/info` | Core list fields plus modern path, session counter, lifecycle, limit, mode, magnet, and infohash fields; detailed availability and live swarm counters remain placeholders | Implemented compatibility breadth for common remote-app columns |
 | `torrents/properties` | Full properties object | Detail panels may show missing values |
-| `sync/maindata` | Server state, categories, tags, torrents, trackers, peers | Delta clients depend on stable RID and complete key set |
+| `sync/maindata` | Server state, categories, tags, torrents, trackers, peers | Broad torrent and server-state key sets are matrix-tested; remaining risk is deeper live peer/tracker delta fidelity |
 
 ## 4. Transmission RPC Matrix
 
@@ -132,7 +132,7 @@ kebab/camel calls and normalizes Transmission 4.1 snake_case calls.
 
 | Method group | Upstream methods | Local status | Test rows |
 |---|---|---|---|
-| JSON-RPC shape | JSON-RPC 2.0, snake_case names; old bespoke RPC deprecated but still common | Partial: old response envelope remains, snake_case names/keys supported | JSON-RPC 2.0 envelope row, old envelope row, CSRF header row |
+| JSON-RPC shape | JSON-RPC 2.0, snake_case names; old bespoke RPC deprecated but still common | Compat: JSON-RPC 2.0 single and batch requests, `params`, direct `result`, error object, snake_case names/keys; old envelope remains supported | JSON-RPC 2.0 envelope row, batch row, old envelope row, CSRF header row |
 | Torrent accessor | `torrent_get` with `objects` and `table` formats, `recently_active` removed list | Compat: objects, table rows, and empty removed list supported | All-field object row; table format row; recently-active row |
 | Torrent mutator | `torrent_set` | Partial | Per-field mutation acceptance and projection |
 | Torrent add | `torrent_add` | Native for magnet/metainfo/download dir/paused/labels | Magnet, metainfo, duplicate, invalid metainfo rows |
@@ -141,7 +141,7 @@ kebab/camel calls and normalizes Transmission 4.1 snake_case calls.
 | File controls | `torrent_set_file_priorities`, `torrent_set_file_wanted`, `torrent_set_file_unwanted` | Native | File selection row |
 | Trackers | `torrent_set_tracker_list` | Native | Tracker list row |
 | Queue | `queue_move_top`, `queue_move_up`, `queue_move_down`, `queue_move_bottom` | Native | Queue row |
-| Session | `session_get`, `session_set`, `session_stats`, `session_close`, `session_access_control` | Partial/Compat | Session fields and mutable settings row |
+| Session | `session_get`, `session_set`, `session_stats`, `session_close`, `session_access_control` | Partial/Compat; `session_get` field projection supported | Session fields and mutable settings row |
 | Utilities | `blocklist_update`, `port_test`, `free_space` | Compat | Utility shape row |
 | Groups | `group_get`, `group_set` | Compat placeholder | Group shape row |
 
@@ -167,7 +167,7 @@ Transmission `session_get` field matrix:
 
 | Bucket | Upstream fields | rtorrentNG status |
 |---|---|---|
-| Version/protocol | `version`, `rpc_version`, `rpc_version_minimum`, `rpc_version_semver`, `session_id`, `units` | Partial; semver/header gap |
+| Version/protocol | `version`, `rpc_version`, `rpc_version_minimum`, `rpc_version_semver`, `session_id`, `units` | Compat; semver is reported, session header supported |
 | Paths/start behavior | `download_dir`, `incomplete_dir`, `incomplete_dir_enabled`, `rename_partial_files`, `start_added_torrents`, `trash_original_torrent_files` | Partial |
 | Speed limits | normal and alt speed fields, scheduler day/begin/end/enabled | Partial; scheduler fields gap |
 | Queue | download/seed queue, queue stalled settings | Partial |
@@ -246,7 +246,7 @@ covered today as an import source and as an interop peer.
 |---|---|---|
 | P0 | Add automated endpoint/method enumeration tests for qBit, Transmission, and Deluge | Implemented in `rt-api-qbit`, `rt-api-transmission`, and `rt-api-deluge` unit tests |
 | P0 | Add all-field response tests for qBit `torrents/info`, `properties`, `sync/maindata`; Transmission `torrent_get` and `session_get`; Deluge torrent status | Implemented in facade unit tests for currently supported fields |
-| P0 | Expand Transmission 4.1 JSON-RPC envelope support and semver header | Transmission API matrix |
+| P0 | Deepen Transmission 4.1 native parity beyond compatibility envelope: exact error codes, notifications, and remaining mutable session fields | Transmission API matrix |
 | P1 | Deepen Deluge `web.add_torrents` with real file upload/temp-file flows when target clients require it | Deluge API matrix |
 | P1 | Persist qBittorrent mutable preferences and broaden property projections to all documented keys | qBit field backlog |
 | P1 | Build real exported golden fixture corpus for qBit, Transmission, Deluge, uTorrent, BiglyBT/Vuze, Tixati, rTorrent, and compare it against the synthetic JSON/bencoded alias matrices | Import matrix |
