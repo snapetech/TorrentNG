@@ -20,6 +20,8 @@ Status as of 2026-05-17.
   - `hot_seeding_1k_memory_attribution_stays_under_cap` checks 1k synthetic hot seeders against the current top-hot attribution cap.
 - [x] Slow-disk plus fast-peer backpressure evidence proxy.
   - Storage scale tests exercise queue-full backpressure rather than unbounded queue growth under saturated hash/disk paths.
+- [x] Conservative move/import/delete executor below the storage planner.
+  - Applies only plans that passed admission, never overwrites destinations, creates parents, verifies copy lengths, and rolls back staged copy files on failure.
 
 ## Hardware-Gated
 

@@ -177,6 +177,133 @@ pub fn ensure_plan_can_apply(plan: &StoragePlan) -> Result<(), StorageError> {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoragePlanExecution {
+    pub applied_steps: Vec<StoragePlanStep>,
+    pub rolled_back_steps: Vec<StoragePlanStep>,
+}
+
+pub fn execute_storage_plan(plan: &StoragePlan) -> Result<StoragePlanExecution, StorageError> {
+    ensure_plan_can_apply(plan)?;
+    if plan.dry_run {
+        return Ok(StoragePlanExecution::default());
+    }
+
+    let mut execution = StoragePlanExecution::default();
+    for step in &plan.steps {
+        if let Err(error) = execute_step(step) {
+            execution.rolled_back_steps = rollback_plan(plan);
+            return Err(StorageError::StagedMoveFailed {
+                step: "execute",
+                reason: error.to_string(),
+            });
+        }
+        execution.applied_steps.push(step.clone());
+    }
+    Ok(execution)
+}
+
+fn execute_step(step: &StoragePlanStep) -> Result<(), StorageError> {
+    match step.action {
+        PlannedStorageAction::ImportExisting => {
+            let source = required_path(step.source.as_ref(), "import-source")?;
+            let destination = required_path(step.destination.as_ref(), "import-destination")?;
+            ensure_destination_available(destination)?;
+            create_parent(destination)?;
+            match std::fs::hard_link(source, destination) {
+                Ok(()) => verify_path_len(destination, step.bytes),
+                Err(_) => copy_verify(source, destination, step.bytes),
+            }
+        }
+        PlannedStorageAction::Rename => {
+            let source = required_path(step.source.as_ref(), "rename-source")?;
+            let destination = required_path(step.destination.as_ref(), "rename-destination")?;
+            ensure_destination_available(destination)?;
+            create_parent(destination)?;
+            std::fs::rename(source, destination)
+                .map_err(|e| StorageError::io(destination.display().to_string(), e))?;
+            verify_path_len(destination, step.bytes)
+        }
+        PlannedStorageAction::CopyVerifyRename => {
+            let source = required_path(step.source.as_ref(), "copy-source")?;
+            let destination = required_path(step.destination.as_ref(), "copy-destination")?;
+            ensure_destination_available(destination)?;
+            create_parent(destination)?;
+            copy_verify(source, destination, step.bytes)
+        }
+        PlannedStorageAction::SafeDelete => {
+            let source = required_path(step.source.as_ref(), "delete-source")?;
+            if source.is_dir() {
+                std::fs::remove_dir_all(source)
+                    .map_err(|e| StorageError::io(source.display().to_string(), e))
+            } else {
+                std::fs::remove_file(source)
+                    .map_err(|e| StorageError::io(source.display().to_string(), e))
+            }
+        }
+    }
+}
+
+fn rollback_plan(plan: &StoragePlan) -> Vec<StoragePlanStep> {
+    let mut rolled_back = Vec::new();
+    for step in &plan.rollback_steps {
+        if execute_step(step).is_ok() {
+            rolled_back.push(step.clone());
+        }
+    }
+    rolled_back
+}
+
+fn required_path<'a>(
+    path: Option<&'a PathBuf>,
+    step: &'static str,
+) -> Result<&'a Path, StorageError> {
+    path.map(PathBuf::as_path)
+        .ok_or_else(|| StorageError::StagedMoveFailed {
+            step,
+            reason: "missing path".to_string(),
+        })
+}
+
+fn create_parent(path: &Path) -> Result<(), StorageError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| StorageError::io(parent.display().to_string(), e))?;
+    }
+    Ok(())
+}
+
+fn ensure_destination_available(path: &Path) -> Result<(), StorageError> {
+    if path.exists() {
+        return Err(StorageError::StagedMoveFailed {
+            step: "destination",
+            reason: format!("destination exists: {}", path.display()),
+        });
+    }
+    Ok(())
+}
+
+fn copy_verify(source: &Path, destination: &Path, expected_bytes: u64) -> Result<(), StorageError> {
+    std::fs::copy(source, destination)
+        .map_err(|e| StorageError::io(destination.display().to_string(), e))?;
+    verify_path_len(destination, expected_bytes)
+}
+
+fn verify_path_len(path: &Path, expected_bytes: u64) -> Result<(), StorageError> {
+    let actual = std::fs::metadata(path)
+        .map_err(|e| StorageError::io(path.display().to_string(), e))?
+        .len();
+    if actual == expected_bytes {
+        Ok(())
+    } else {
+        Err(StorageError::ShortIo {
+            path: path.display().to_string(),
+            expected: expected_bytes as usize,
+            actual: actual as usize,
+        })
+    }
+}
+
 fn common_issues(
     source: &Path,
     destination: &Path,
@@ -315,5 +442,96 @@ mod tests {
         assert!(plan
             .issues
             .contains(&PlanIssue::DestinationExists(destination)));
+    }
+
+    #[test]
+    fn execute_move_plan_renames_without_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.bin");
+        let destination = dir.path().join("dest.bin");
+        std::fs::write(&source, b"data").unwrap();
+
+        let plan = plan_move(&MovePlanRequest {
+            source: source.clone(),
+            destination: destination.clone(),
+            bytes: 4,
+            available_bytes: Some(100),
+            dry_run: false,
+        });
+
+        let execution = execute_storage_plan(&plan).unwrap();
+        assert_eq!(execution.applied_steps.len(), 1);
+        assert!(!source.exists());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"data");
+
+        let conflict = StoragePlan {
+            dry_run: false,
+            can_apply: true,
+            issues: Vec::new(),
+            steps: vec![StoragePlanStep {
+                action: PlannedStorageAction::Rename,
+                source: Some(destination.clone()),
+                destination: Some(destination.clone()),
+                bytes: 4,
+            }],
+            rollback_steps: Vec::new(),
+        };
+        assert!(matches!(
+            execute_storage_plan(&conflict),
+            Err(StorageError::StagedMoveFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn execute_copy_verify_plan_rolls_back_staged_file_on_short_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.bin");
+        let destination = dir.path().join("dest.bin");
+        let staged = staging_path(&destination);
+        std::fs::write(&source, b"data").unwrap();
+        let plan = StoragePlan {
+            dry_run: false,
+            can_apply: true,
+            issues: Vec::new(),
+            steps: vec![StoragePlanStep {
+                action: PlannedStorageAction::CopyVerifyRename,
+                source: Some(source),
+                destination: Some(staged.clone()),
+                bytes: 99,
+            }],
+            rollback_steps: vec![StoragePlanStep {
+                action: PlannedStorageAction::SafeDelete,
+                source: Some(staged.clone()),
+                destination: None,
+                bytes: 99,
+            }],
+        };
+
+        assert!(matches!(
+            execute_storage_plan(&plan),
+            Err(StorageError::StagedMoveFailed { .. })
+        ));
+        assert!(!staged.exists());
+    }
+
+    #[test]
+    fn execute_import_plan_links_or_copies_without_removing_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.bin");
+        let destination = dir.path().join("dest.bin");
+        std::fs::write(&source, b"data").unwrap();
+        let plan = plan_import(&ImportPlanRequest {
+            source: source.clone(),
+            destination: destination.clone(),
+            bytes: 4,
+            available_bytes: Some(100),
+            hardlink_or_copy: true,
+            dry_run: false,
+        });
+
+        execute_storage_plan(&plan).unwrap();
+
+        assert_eq!(std::fs::read(&source).unwrap(), b"data");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"data");
     }
 }

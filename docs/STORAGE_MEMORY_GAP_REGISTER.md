@@ -36,6 +36,9 @@ Implemented and covered by automated tests:
   Prometheus stats.
 - Schedulers that resolve to the same storage device share a process-level
   device queue semaphore for all positioned disk submissions.
+- Move/import/delete plans have a conservative executor with no-overwrite
+  admission, parent creation, copy-length verification, staged rollback cleanup,
+  hardlink-or-copy import, and dry-run no-op behavior.
 
 ## Remaining Gaps
 
@@ -43,7 +46,7 @@ Implemented and covered by automated tests:
 | --- | --- | --- | --- |
 | Real hardware evidence | The local matrix covers unit and scale proxies, but production claims still require current HDD and SSD/NVMe hardware reports. | Scheduler and elevator tuning may regress on real rotational or network storage while proxy tests remain green. | Run `scripts/storage_hardware_matrix.sh /mnt/nvme /mnt/hdd` with `TNG_STORAGE_REQUIRE_HDD_5X=1`; keep the generated reports for release evidence. |
 | `io_uring` fixed buffers | `UringBackend` uses worker-owned fixed buffers when available, but the global frame pool does not yet hand out stable registered buffer slots. | Extra copies remain in the uring path, and fixed-buffer metrics can overstate how much of the full storage path is zero-copy. | Add frame-pool slot leases, wire them through backend requests, and benchmark `pread` vs `uring` on real devices before making `uring` the `auto` default. |
-| Move/import executor | Planning, conflict detection, and safe paths exist, but this remains outside the per-block hot path and needs separate certification when storage moves become release-critical. | Large library moves can still be operationally risky without full end-to-end soak evidence. | Run dedicated move/import certification on representative multi-TB trees and publish rollback/failure reports. |
+| Move/import certification | Planning and a conservative executor exist, but this remains outside the per-block hot path and still needs representative multi-TB soak evidence. | Large library moves can still be operationally risky without full end-to-end hardware and rollback reports. | Run dedicated move/import certification on representative multi-TB trees and publish rollback/failure reports. |
 
 ## Verification Commands
 

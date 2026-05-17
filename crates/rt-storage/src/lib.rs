@@ -22,9 +22,9 @@ pub use elevator::{
 pub use error::StorageError;
 pub use io_class::IoClass;
 pub use plan::{
-    ensure_plan_can_apply, plan_delete, plan_import, plan_move, DeletePlanRequest,
-    ImportPlanRequest, MovePlanRequest, PlanIssue, PlannedStorageAction, StoragePlan,
-    StoragePlanStep,
+    ensure_plan_can_apply, execute_storage_plan, plan_delete, plan_import, plan_move,
+    DeletePlanRequest, ImportPlanRequest, MovePlanRequest, PlanIssue, PlannedStorageAction,
+    StoragePlan, StoragePlanExecution, StoragePlanStep,
 };
 pub use scheduler::{
     preallocation_mode_for_topology, DurabilityMode, FilePoolStats, IoRequest, MountScheduler,
