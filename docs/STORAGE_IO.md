@@ -52,7 +52,9 @@ class semaphores:
 - `scheduled_read` and `scheduled_write` remain compatibility wrappers, but
   call positioned `read_at`/`write_at`. Callers that can process borrowed data
   can use `scheduled_read_owned` / `read_owned_at` to keep exact backend reads
-  in a pooled `StorageRead::Frame`.
+  in a pooled `StorageRead::Frame`. Upload assembly and sparse recheck extent
+  reads use the owned path; the plain `Bytes` path is retained for compatibility
+  and tests.
 - Disk syscalls are submitted through the probe-selected `DiskBackend`
   (`pread` baseline or explicit Linux `io_uring`) while `MountScheduler`
   preserves its per-class, per-mount, and per-device backpressure gates.

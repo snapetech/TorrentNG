@@ -223,15 +223,20 @@ function RtorrentSettingsPanel() {
 
   useEffect(() => {
     if (!data) return
+    const dirtySettings = data.settings.filter(setting => {
+      const row = data.values.find(value => value.key === setting.key)
+      return !sameSettingValue(draft[setting.key], baselineValue(setting, row?.saved ?? null, row?.live.value ?? null))
+    })
+    if (dirtySettings.length > 0 || customRc !== data.custom_rc) return
     const next: Record<string, string | number | boolean> = {}
     for (const setting of data.settings) {
       const row = data.values.find(value => value.key === setting.key)
       const value = row?.saved ?? row?.live.value ?? setting.default_value
       next[setting.key] = inputValue(setting.value_type, value)
     }
-    setDraft(next)
-    setCustomRc(data.custom_rc)
-  }, [data])
+    if (!sameDraft(draft, next)) setDraft(next)
+    if (customRc !== data.custom_rc) setCustomRc(data.custom_rc)
+  }, [customRc, data, draft])
 
   const save = useMutation({
     mutationFn: (payload: { values: Record<string, string | number | boolean>; customRc: string }) =>
@@ -1276,6 +1281,16 @@ function baselineValue(setting: RtorrentSettingDescriptor, saved: string | null,
 function sameSettingValue(left: unknown, right: unknown): boolean {
   if (typeof left === 'number' || typeof right === 'number') return Number(left) === Number(right)
   return String(left) === String(right)
+}
+
+function sameDraft(
+  left: Record<string, string | number | boolean>,
+  right: Record<string, string | number | boolean>,
+): boolean {
+  const leftKeys = Object.keys(left)
+  const rightKeys = Object.keys(right)
+  if (leftKeys.length !== rightKeys.length) return false
+  return rightKeys.every(key => sameSettingValue(left[key], right[key]))
 }
 
 function clampSettingValue(setting: RtorrentSettingDescriptor, value: number): number {
