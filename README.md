@@ -2,9 +2,15 @@
 
 [![Discord](https://img.shields.io/discord/4ub88HeHFm?label=Discord&logo=discord&logoColor=white)](https://discord.gg/4ub88HeHFm)
 
-rtorrentNG is a modern torrent management stack for headless servers. It
-provides a native Rust BitTorrent daemon, a React WebUI, automation-friendly
-APIs, and a compatibility bridge for existing rTorrent deployments.
+rtorrentNG is a universal-compatibility torrent stack for headless servers. The
+goal is to be the torrent client you can move into or out of without losing
+workflow, state, automation, or client choice: import existing libraries, expose
+familiar APIs, interoperate with other clients, and run a native Rust engine when
+you are ready to replace the old core.
+
+The stack includes a native Rust BitTorrent daemon, a React WebUI,
+automation-friendly APIs, migration/import tooling, compatibility facades for
+major client ecosystems, and a harness for existing rTorrent deployments.
 
 The project currently supports two engine modes:
 
@@ -13,8 +19,11 @@ The project currently supports two engine modes:
 | Native engine | `rusttorrentd` | rtorrentNG Rust engine and SQLite state | You want the primary rewrite path, native storage/recheck/jobs, and one model for WebUI plus APIs |
 | rTorrent sidecar | `rTorrent` + `rtorrentng` | rTorrent session state | You need an rTorrent migration bridge, compatibility comparison, or an rTorrent-backed deployment |
 
-Both modes aim to expose the same user-facing WebUI and compatibility surfaces,
-including qBittorrent-style endpoints used by common automation tools.
+Both modes aim to expose the same user-facing WebUI and compatibility surfaces.
+The compatibility target is intentionally broad: qBittorrent-style endpoints for
+common automation tools, Transmission and Deluge RPC facades, rTorrent migration
+and interop support, and import paths for the client state formats operators are
+likely to have accumulated over time.
 
 ![rtorrentNG WebUI using the Sietch Neon theme while downloading Linux ISO test data](docs/assets/rtorrentng-sietch-neon-linux-isos.png)
 
@@ -27,7 +36,11 @@ rTorrent-backed sidecar remains supported for migration, comparison, and users
 who still want the upstream rTorrent core.
 
 rtorrentNG is pre-1.0 software. APIs, configuration, and deployment details can
-still change. Track current native-engine work in
+still change. Universal compatibility is the product goal and release bar, not a
+blanket claim that every surface is complete today. Current support, partial
+coverage, no-op compatibility shapes, and gaps are tracked in
+[docs/CLIENT_COMPATIBILITY_MATRICES.md](docs/CLIENT_COMPATIBILITY_MATRICES.md).
+Track current native-engine work in
 [docs/ENGINE_REWRITE_BURNDOWN.md](docs/ENGINE_REWRITE_BURNDOWN.md), and use
 [docs/ENGINE_REWRITE.md](docs/ENGINE_REWRITE.md) for the practical native vs.
 rTorrent guide.
@@ -90,7 +103,8 @@ one stack before starting the other unless you intentionally change ports.
   DHT, uTP, peer wire, piece picking, session state, jobs, migration, metrics,
   and API projections.
 - `rusttorrentd`, the native daemon that owns torrent state and serves APIs.
-- `sidecar/rtorrentng`, the rTorrent facade for existing deployments.
+- `sidecar/rtorrentng`, the rTorrent compatibility harness for existing
+  deployments.
 - React, TypeScript, and Vite WebUI in `webui/`.
 - Docker Compose, Dockerfile, systemd, Kubernetes, nginx, Prometheus, and
   Grafana examples under `deploy/`.

@@ -2,6 +2,13 @@
 
 Start here when choosing, testing, or operating an rtorrentNG engine mode.
 
+rtorrentNG's product goal is universal torrent-client compatibility: import
+from existing clients, expose the APIs automation tools already speak,
+interoperate with independent BitTorrent clients, and provide a native Rust
+engine that can replace older cores without forcing a workflow reset. The docs
+track both sides of that goal: the target compatibility surface and the current
+certified status.
+
 ## Engine Modes
 
 - [ENGINE_REWRITE.md](ENGINE_REWRITE.md) - practical guide to the native rewrite,
@@ -27,6 +34,8 @@ Start here when choosing, testing, or operating an rtorrentNG engine mode.
 
 - [API.md](API.md) - native REST, qBittorrent-compatible, Transmission, Deluge,
   health, metrics, and auth surfaces.
+- [CLIENT_COMPATIBILITY_MATRICES.md](CLIENT_COMPATIBILITY_MATRICES.md) -
+  universal compatibility target, current status, and certification backlog.
 - [INTEGRATION_COMPAT.md](INTEGRATION_COMPAT.md) - sidecar and native
   compatibility test coverage.
 - [INTEROP_MATRIX.md](INTEROP_MATRIX.md) - Docker client matrix across

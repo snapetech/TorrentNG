@@ -1,6 +1,6 @@
 [package]
 name = "rt-migrate"
-description = "rtorrentNG: rt-migrate"
+description = "rtorrentNG: multi-client torrent state import and migration"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

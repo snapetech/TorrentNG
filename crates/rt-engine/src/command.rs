@@ -75,6 +75,12 @@ pub struct EngineStats {
     pub storage_backend_bytes_read: u64,
     pub storage_backend_read_ops_by_class: [u64; 6],
     pub storage_backend_bytes_read_by_class: [u64; 6],
+    pub storage_read_latency_ns: u64,
+    pub storage_write_latency_ns: u64,
+    pub storage_read_latency_ns_by_class: [u64; 6],
+    pub storage_write_latency_ns_by_class: [u64; 6],
+    pub storage_sync_latency_ns: u64,
+    pub storage_hash_latency_ns: u64,
     pub storage_sync_ops: u64,
     pub storage_hash_ops: u64,
     pub storage_preallocation_failures: u64,
@@ -195,6 +201,32 @@ impl EngineStats {
         {
             *target = target.saturating_add(value);
         }
+        self.storage_read_latency_ns = self
+            .storage_read_latency_ns
+            .saturating_add(storage.read_latency_ns_by_class.iter().sum::<u64>());
+        for (target, value) in self
+            .storage_read_latency_ns_by_class
+            .iter_mut()
+            .zip(storage.read_latency_ns_by_class)
+        {
+            *target = target.saturating_add(value);
+        }
+        self.storage_write_latency_ns = self
+            .storage_write_latency_ns
+            .saturating_add(storage.write_latency_ns_by_class.iter().sum::<u64>());
+        for (target, value) in self
+            .storage_write_latency_ns_by_class
+            .iter_mut()
+            .zip(storage.write_latency_ns_by_class)
+        {
+            *target = target.saturating_add(value);
+        }
+        self.storage_sync_latency_ns = self
+            .storage_sync_latency_ns
+            .saturating_add(storage.sync_latency_ns);
+        self.storage_hash_latency_ns = self
+            .storage_hash_latency_ns
+            .saturating_add(storage.hash_latency_ns);
         self.storage_sync_ops = self.storage_sync_ops.saturating_add(storage.sync_ops);
         self.storage_hash_ops = self.storage_hash_ops.saturating_add(storage.hash_ops);
         self.storage_preallocation_failures = self
@@ -465,6 +497,10 @@ mod tests {
         storage.bytes_written_by_class[0] = 18;
         storage.backend_read_ops_by_class[4] = 3;
         storage.backend_bytes_read_by_class[4] = 4096;
+        storage.read_latency_ns_by_class[4] = 100;
+        storage.write_latency_ns_by_class[3] = 200;
+        storage.sync_latency_ns = 300;
+        storage.hash_latency_ns = 400;
 
         stats.add_torrent_runtime(TorrentRuntimeStats {
             piece_assembly_buffers: 19,
@@ -490,6 +526,12 @@ mod tests {
         assert_eq!(stats.storage_backend_bytes_read, 4096);
         assert_eq!(stats.storage_backend_read_ops_by_class[4], 3);
         assert_eq!(stats.storage_backend_bytes_read_by_class[4], 4096);
+        assert_eq!(stats.storage_read_latency_ns, 100);
+        assert_eq!(stats.storage_write_latency_ns, 200);
+        assert_eq!(stats.storage_read_latency_ns_by_class[4], 100);
+        assert_eq!(stats.storage_write_latency_ns_by_class[3], 200);
+        assert_eq!(stats.storage_sync_latency_ns, 300);
+        assert_eq!(stats.storage_hash_latency_ns, 400);
         assert_eq!(stats.storage_peer_read_cache_hits, 12);
         assert_eq!(stats.piece_assembly_buffers, 19);
         assert_eq!(stats.piece_assembly_bytes, 20);

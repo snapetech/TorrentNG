@@ -800,6 +800,48 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
     );
     metric(
         &mut out,
+        "rtorrentng_storage_read_latency_nanoseconds_total",
+        "counter",
+        "Total read queue plus execution latency across running torrent schedulers",
+        stats.storage_read_latency_ns,
+    );
+    metric_by_class(
+        &mut out,
+        "rtorrentng_storage_read_latency_nanoseconds_by_class_total",
+        "counter",
+        "Total read queue plus execution latency by I/O class",
+        &stats.storage_read_latency_ns_by_class,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_storage_write_latency_nanoseconds_total",
+        "counter",
+        "Total write queue plus execution latency across running torrent schedulers",
+        stats.storage_write_latency_ns,
+    );
+    metric_by_class(
+        &mut out,
+        "rtorrentng_storage_write_latency_nanoseconds_by_class_total",
+        "counter",
+        "Total write queue plus execution latency by I/O class",
+        &stats.storage_write_latency_ns_by_class,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_storage_sync_latency_nanoseconds_total",
+        "counter",
+        "Total sync queue plus execution latency across running torrent schedulers",
+        stats.storage_sync_latency_ns,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_storage_hash_latency_nanoseconds_total",
+        "counter",
+        "Total hashing queue plus execution latency across running torrent schedulers",
+        stats.storage_hash_latency_ns,
+    );
+    metric(
+        &mut out,
         "rtorrentng_storage_sync_ops_total",
         "counter",
         "Data sync operations across running torrent schedulers",
@@ -1194,6 +1236,10 @@ mod tests {
             piece_assembly_evictions: 9,
             storage_backend_read_ops: 14,
             storage_backend_bytes_read: 15,
+            storage_read_latency_ns: 18,
+            storage_write_latency_ns: 19,
+            storage_sync_latency_ns: 20,
+            storage_hash_latency_ns: 21,
             ..Default::default()
         };
         stats.storage_read_ops_by_class[4] = 10;
@@ -1202,6 +1248,8 @@ mod tests {
         stats.storage_bytes_written_by_class[3] = 13;
         stats.storage_backend_read_ops_by_class[4] = 16;
         stats.storage_backend_bytes_read_by_class[4] = 17;
+        stats.storage_read_latency_ns_by_class[4] = 22;
+        stats.storage_write_latency_ns_by_class[3] = 23;
         let rendered = render_metrics(&stats);
         assert!(rendered.contains("rtorrentng_torrents_total 2"));
         assert!(rendered.contains("rtorrentng_torrents_seeding 1"));
@@ -1228,6 +1276,16 @@ mod tests {
         ));
         assert!(rendered.contains(
             "rtorrentng_storage_backend_bytes_read_by_class_total{class=\"peer_read\"} 17"
+        ));
+        assert!(rendered.contains("rtorrentng_storage_read_latency_nanoseconds_total 18"));
+        assert!(rendered.contains("rtorrentng_storage_write_latency_nanoseconds_total 19"));
+        assert!(rendered.contains("rtorrentng_storage_sync_latency_nanoseconds_total 20"));
+        assert!(rendered.contains("rtorrentng_storage_hash_latency_nanoseconds_total 21"));
+        assert!(rendered.contains(
+            "rtorrentng_storage_read_latency_nanoseconds_by_class_total{class=\"peer_read\"} 22"
+        ));
+        assert!(rendered.contains(
+            "rtorrentng_storage_write_latency_nanoseconds_by_class_total{class=\"peer_write\"} 23"
         ));
         assert!(rendered.contains("rtorrentng_storage_handles_open "));
         assert!(rendered.contains("rtorrentng_storage_frame_bytes_cap "));

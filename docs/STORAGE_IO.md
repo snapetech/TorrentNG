@@ -82,8 +82,8 @@ startup falls back to verification instead of trusting stale piece state.
 
 The following items are still implementation targets:
 
-- Add latency histograms for read/write/sync/hash work. Prometheus already
-  exports aggregate scheduler counters and gauges for running torrents,
+- Add full latency histograms for read/write/sync/hash work. Prometheus already
+  exports aggregate cumulative latency counters and gauges for running torrents,
   including file-pool activity, queue depth, dirty files, sync/hash/preallocate
   counters, peer-read cache counters, logical and backend read counters, and
   in-memory piece assembly pressure.

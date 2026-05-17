@@ -28,6 +28,8 @@ fn qbit_routes() -> Router<AppState> {
         )
         .route("/app/getCookies", get(app_get_cookies))
         .route("/app/setCookies", post(app_set_cookies))
+        .route("/app/rotateAPIKey", post(app_rotate_api_key))
+        .route("/app/deleteAPIKey", post(app_delete_api_key))
         .route("/app/networkInterfaceList", get(app_network_interface_list))
         .route(
             "/app/networkInterfaceAddressList",

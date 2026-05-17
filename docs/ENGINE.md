@@ -1,21 +1,26 @@
 # Native Rust Engine Design
 
-This document covers the native Rust BitTorrent engine. Track 1 compatibility
-code remains available as a migration and facade layer, but native engine state
-is now the source of truth for torrent rows, files, trackers, jobs, metrics, and
-compatibility API projections.
+This document covers the native Rust BitTorrent engine. The engine is built
+around rtorrentNG's universal compatibility goal: import from existing clients,
+project the APIs existing tools already speak, interoperate with independent
+clients, and keep one durable native model underneath those surfaces.
+
+Track 1 compatibility code remains available as a migration and facade layer,
+but native engine state is now the source of truth for torrent rows, files,
+trackers, jobs, metrics, and compatibility API projections.
 
 ---
 
 ## Product shape
 
-**Target persona:** private tracker users, seedbox operators, homelab media automation, large archive seeders, 10k–100k torrent operators, multi-hundred-TB libraries, *arr/autobrr/cross-seed power users.
+**Target persona:** private tracker users, seedbox operators, homelab media automation, large archive seeders, 10k–100k torrent operators, multi-hundred-TB libraries, *arr/autobrr/cross-seed power users, and operators migrating between rTorrent, qBittorrent, Transmission, Deluge, uTorrent/BitTorrent Classic, BiglyBT/Vuze, Tixati, and generic torrent libraries.
 
 **Not the primary target:** casual desktop torrenting, search-engine plugin users, "download one magnet and watch immediately" users.
 
-The engine is seeding-first, but the rewrite now includes native downloading,
-magnet metadata, DHT/uTP protocol crates, and pure v2/hybrid metadata support.
-Streaming remains outside the first production target.
+The engine is seeding-first and compatibility-first, but the rewrite now
+includes native downloading, magnet metadata, DHT/uTP protocol crates, and pure
+v2/hybrid metadata support. Streaming remains outside the first production
+target.
 
 ---
 
@@ -55,12 +60,12 @@ crates/
   rt-api-model/       — shared API types (serde)
   rt-api-native/      — native REST + WebSocket API (axum)
   rt-api-qbit/        — qBittorrent v2 compatibility shim
-  rt-api-transmission/ — Transmission RPC facade over native state
-  rt-api-deluge/      — Deluge best-effort facade over native state
+  rt-api-transmission/ — Transmission RPC compatibility facade over native state
+  rt-api-deluge/      — Deluge compatibility facade over native state
   rt-jobs/            — bulk op job queue, dry-run engine
   rt-metrics/         — Prometheus metrics definitions and scale certification tests
   rt-config/          — TOML config, env override, validation
-  rt-migrate/         — import from rTorrent / qBit / Transmission
+  rt-migrate/         — import from rTorrent / qBit / Transmission / Deluge / uTorrent / BiglyBT / Tixati / generic libraries
   rt-testkit/         — test fixtures, synthetic torrent generators, interop helpers
   rusttorrentd/       — binary: wires all modules, signal handling, startup
 ```

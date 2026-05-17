@@ -1,7 +1,16 @@
 # Migration Guide
 
-This guide covers moving existing client state into rtorrentNG. For the broader
-native rewrite overview and engine swap workflow, see
+This guide covers moving existing client state into rtorrentNG. The migration
+goal is the import side of universal compatibility: preserve the torrent
+metadata, paths, labels/categories/tags, counters, file priorities, and resume
+state that other clients have accumulated wherever the source format makes that
+recoverable.
+
+Current migration coverage includes rTorrent, qBittorrent, Transmission, Deluge,
+uTorrent/BitTorrent Classic, BiglyBT/Vuze, Tixati, and generic `.torrent`
+directories, with exact status tracked in
+[CLIENT_COMPATIBILITY_MATRICES.md](CLIENT_COMPATIBILITY_MATRICES.md). For the
+broader native rewrite overview and engine swap workflow, see
 [ENGINE_REWRITE.md](ENGINE_REWRITE.md).
 
 ## Migrating from rTorrent + ruTorrent

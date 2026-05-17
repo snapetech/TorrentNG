@@ -1,6 +1,6 @@
 [package]
 name = "rusttorrentd"
-description = "rtorrentNG: native Rust BitTorrent daemon"
+description = "rtorrentNG: native Rust BitTorrent daemon with compatibility API facades"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

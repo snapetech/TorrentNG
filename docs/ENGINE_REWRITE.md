@@ -5,7 +5,9 @@ it differs from the rTorrent-backed mode, and how to test either engine.
 
 ## Short Version
 
-rtorrentNG has two runtime modes:
+rtorrentNG has two runtime modes under one compatibility goal: make the project
+usable as a migration target, an interop peer, and eventually a practical
+drop-in replacement for the torrent clients and APIs operators already use.
 
 | Mode | Process | BitTorrent engine | Best for |
 |---|---|---|---|
@@ -14,7 +16,9 @@ rtorrentNG has two runtime modes:
 
 The WebUI and compatibility APIs are shared goals, but the source of truth is
 different. Native mode owns the torrent lifecycle itself. rTorrent mode reflects
-and controls rTorrent through a trusted local SCGI/XMLRPC socket.
+and controls rTorrent through a trusted local SCGI/XMLRPC socket. The
+compatibility matrix is the contract for closing the remaining gap between
+"works with common flows" and "universal in/out compatibility."
 
 ## Why the Rewrite Exists
 
@@ -32,7 +36,9 @@ and operational profiles. It could not fix the engine-level constraints:
 
 The rewrite moves those concerns into Rust crates with durable SQLite state,
 explicit storage scheduling, observable jobs, and API projections over one
-engine model.
+engine model. That single model is what makes the larger compatibility target
+credible: import from many clients, project many APIs, and certify behavior from
+one source of truth instead of binding rtorrentNG to one legacy engine.
 
 ## Native Engine Shape
 

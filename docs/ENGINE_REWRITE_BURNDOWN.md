@@ -79,7 +79,7 @@ This is the working checklist for finishing the native Rust engine rewrite. It i
 - [x] Implement qBit sync delta semantics with stable `rid`.
 - [x] Map qBit files/trackers/pieces to real engine metadata and piece state.
 - [x] Keep Transmission RPC compatible with durable engine state.
-- [x] Keep Deluge compatibility as best-effort facade.
+- [x] Keep Deluge compatibility facade backed by durable engine state.
 - [x] Add compatibility certification runs for Prowlarr/Sonarr/Radarr/autobrr/cross-seed/NZB360/Transdrone.
 
 ## 8. Migration

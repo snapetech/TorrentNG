@@ -2,7 +2,10 @@
 
 ## Overview
 
-rtorrentNG now has two runtime modes:
+rtorrentNG now has two runtime modes serving one product goal: universal
+compatibility for torrent operators who need to import, export, automate,
+interoperate, and eventually replace existing clients without rebuilding their
+workflow around one historical API.
 
 - **Native engine mode:** `rusttorrentd` is the source of truth. It owns torrent
   state, SQLite session persistence, tracker state, peer wire tasks, storage,
@@ -15,6 +18,12 @@ rtorrentNG now has two runtime modes:
 The native engine supersedes the wrapper/harness path for production native
 mode. The wrapper remains useful as a migration bridge and rTorrent facade, not
 as a required dependency of `rusttorrentd`.
+
+The compatibility promise is implemented as a set of explicit surfaces rather
+than an unchecked marketing claim: native REST/SSE, qBittorrent Web API shapes,
+Transmission RPC, Deluge JSON-RPC, rTorrent migration and interop paths,
+multi-client importers, live client certification, and wire-level transfer
+matrices.
 
 For the practical engine-selection workflow, including how to swap between the
 native rewrite and the rTorrent core for testing, see
@@ -80,7 +89,9 @@ labels, jobs, metrics, and compatibility projections.
   `rt-dht`, and `rt-utp` cover protocol behavior and peer/download mechanics.
 - `rt-api-native`, `rt-api-qbit`, `rt-api-transmission`, and `rt-api-deluge`
   expose native and compatibility APIs over the same registry.
-- `rt-migrate` imports rTorrent, qBittorrent, and Transmission state.
+- `rt-migrate` imports rTorrent, qBittorrent, Transmission, Deluge,
+  uTorrent/BitTorrent Classic, BiglyBT/Vuze, Tixati, and generic torrent
+  library state.
 - `rt-metrics` and `rt-testkit` provide scale and certification evidence.
 
 ### Native Data Flow
@@ -116,7 +127,8 @@ model:
 - qBittorrent v2 compatibility preserves ecosystem behavior for automation.
 - Transmission RPC supports session, torrent, tracker, file, queue, and magnet
   surfaces; v2 hashes project as BEP 52 `btmh` magnet links.
-- Deluge RPC is a best-effort facade over the same registry and metadata.
+- Deluge RPC is a compatibility facade over the same registry and metadata,
+  with current parity tracked in the client compatibility matrix.
 
 `GET /health` is the runtime contract for readiness and capability discovery.
 In native mode it reports `engine.track1_sidecar_required=false` plus a

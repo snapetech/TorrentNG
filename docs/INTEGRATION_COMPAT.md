@@ -1,6 +1,8 @@
 # Integration Compatibility Harness
 
-rtorrentNG has compatibility coverage for both runtime modes:
+rtorrentNG has compatibility coverage for both runtime modes. The target is
+universal in/out compatibility: client imports, API facades, automation flows,
+and wire-level interop all need evidence before they are considered complete.
 
 - Track 1 sidecar qBittorrent flows in `sidecar/tests/qbcompat.rs`.
 - Native compatibility API projections through `rt-api-qbit`,

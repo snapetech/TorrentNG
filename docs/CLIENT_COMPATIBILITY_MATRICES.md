@@ -1,8 +1,20 @@
 # Client Compatibility Matrices
 
-This file is the source-of-truth backlog for broad client compatibility. It
-compares upstream client behavior with rtorrentNG implementation and defines the
-test rows needed before a row can be called complete.
+This file is the source-of-truth backlog for rtorrentNG's universal
+compatibility goal: move into rtorrentNG from other clients, move out with
+predictable state, expose the APIs existing tools already speak, and interoperate
+with other BitTorrent clients on the wire.
+
+The goal is intentionally broad enough to include qBittorrent, Transmission,
+Deluge, rTorrent, uTorrent/BitTorrent Classic, BiglyBT/Vuze, Tixati, generic
+`.torrent` directories, common automation clients, and real public/private swarm
+behavior. A row is not considered complete because an endpoint exists; it is
+complete when behavior, state projection, import/export or migration semantics,
+and certification coverage are all documented.
+
+This matrix separates the product target from current implementation status. The
+target is universal in/out compatibility. The status column says how close the
+current code is today.
 
 Primary references checked on 2026-05-17:
 
@@ -26,6 +38,19 @@ Status legend:
 | Partial | Useful behavior exists, but fields, persistence, filtering, or error shape is incomplete |
 | Gap | Not implemented |
 | Test gap | Behavior exists, but matrix/certification coverage is missing or too shallow |
+
+Universal compatibility release rule:
+
+- Every P0/P1 row must be either `Native` or explicitly documented as
+  compatibility-only with a reason.
+- Every compatibility-only row must state whether it is a safe no-op, a
+  placeholder projection, or a deliberate non-goal.
+- Every import path must have dry-run reporting, path remapping behavior, and a
+  corpus or fixture proving preserved fields.
+- Every API facade must have endpoint/method enumeration, field-shape tests, and
+  at least one live client or automation-flow certification row.
+- Every wire-level claim must be backed by interop evidence against at least one
+  independent client.
 
 ## 1. Feature Matrix
 

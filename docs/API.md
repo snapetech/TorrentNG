@@ -4,11 +4,17 @@ rtorrentNG exposes the same client-facing API families in both native-engine
 mode and the Track 1 rTorrent sidecar:
 
 - **Native API** — `/api/v1/` — JSON REST, snake_case, designed for the WebUI and direct integrations. In native-engine mode this is backed by durable engine state; in Track 1 it is a sidecar facade over rTorrent.
-- **qBittorrent compat API** — `/api/v2/` and `/api/qb/v2/` — drop-in replacement for the qBittorrent Web API v2; used by Prowlarr, Sonarr, Radarr, autobrr, cross-seed, etc.
+- **qBittorrent compat API** — `/api/v2/` and `/api/qb/v2/` — targeted as a drop-in replacement for the qBittorrent Web API v2; used by Prowlarr, Sonarr, Radarr, autobrr, cross-seed, etc.
 - **Transmission RPC** — `/transmission/rpc` and `/api/transmission/rpc` — compatibility facade over the same torrent registry.
-- **Deluge RPC** — best-effort Deluge-compatible facade for clients that expect Deluge method names.
+- **Deluge RPC** — Deluge-compatible facade for clients that expect Deluge method names, with parity tracked in the compatibility matrix.
 
 All surfaces are served on the same port (default `8080`).
+
+The API strategy is compatibility-first: existing tools should be able to keep
+speaking the client dialect they already support while rtorrentNG projects those
+calls onto one native model. Endpoint availability does not by itself mean full
+semantic parity; current native, partial, compatibility-only, and gap status is
+tracked in [CLIENT_COMPATIBILITY_MATRICES.md](CLIENT_COMPATIBILITY_MATRICES.md).
 
 For engine selection and native-vs-rTorrent behavior, see
 [ENGINE_REWRITE.md](ENGINE_REWRITE.md).
@@ -365,6 +371,7 @@ rTorrent over XMLRPC.
 | `rtorrentng_storage_bytes_{read,written}_total` | counter | Bytes moved through native schedulers |
 | `rtorrentng_storage_*_by_class_total{class=...}` | counter | Read/write operation and byte counters split by scheduler I/O class |
 | `rtorrentng_storage_backend_read_*` | counter | Actual backend disk read operations and bytes, excluding peer-read cache hits |
+| `rtorrentng_storage_*_latency_nanoseconds_total` | counter | Cumulative storage queue plus execution latency for read, write, sync, and hash work |
 | `rtorrentng_storage_{sync,hash}_ops_total` | counter | Durability syncs and hashing-pool work |
 | `rtorrentng_storage_preallocation_*_total` | counter | Preallocation failures and fallback events |
 | `rtorrentng_storage_peer_read_cache_*` | gauge/counter | Peer-read readahead cache entries, hits, and misses |

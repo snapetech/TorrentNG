@@ -134,14 +134,20 @@ implemented across the workspace and certified by
 
 See `docs/ENGINE.md` for the full design.
 
-## North star
+## North Star
 
-> A Rust-native, headless-first BitTorrent daemon optimized for massive long-lived seeding libraries, with qBittorrent-compatible API, deterministic storage behavior, and operational observability.
+> A Rust-native, headless-first BitTorrent daemon and compatibility layer that
+> can move into, out of, and alongside the major torrent client ecosystems:
+> qBittorrent, Transmission, Deluge, rTorrent, uTorrent/BitTorrent Classic,
+> BiglyBT/Vuze, Tixati, common automation tools, and real BitTorrent swarms.
 
-The engine is **not** a general-purpose torrent client first. It is a
-**massive-library seeding engine** first. Native downloading, DHT/uTP protocol
-crates, and BEP 52 metadata/storage/API support are now part of the rewrite
-surface; streaming remains outside the first production target.
+The engine is a **massive-library seeding engine** and a **compatibility-first
+torrent control plane**. It should be able to import existing state, project the
+APIs tools expect, interoperate on the wire, and expose a native model that is
+more observable and easier to operate than the historical client-specific
+internals it replaces. Native downloading, DHT/uTP protocol crates, and BEP 52
+metadata/storage/API support are part of the rewrite surface; streaming remains
+outside the first production target.
 
 ## Track 2 — Phase 0: Research and design lock
 

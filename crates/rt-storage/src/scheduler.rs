@@ -117,6 +117,10 @@ pub struct StorageIoStats {
     pub bytes_written_by_class: [u64; 6],
     pub backend_read_ops_by_class: [u64; 6],
     pub backend_bytes_read_by_class: [u64; 6],
+    pub read_latency_ns_by_class: [u64; 6],
+    pub write_latency_ns_by_class: [u64; 6],
+    pub sync_latency_ns: u64,
+    pub hash_latency_ns: u64,
     pub sync_ops: u64,
     pub hash_ops: u64,
     pub preallocation_failures: u64,
@@ -389,6 +393,10 @@ struct StorageCounters {
     bytes_written_by_class: [AtomicU64; 6],
     backend_read_ops_by_class: [AtomicU64; 6],
     backend_bytes_read_by_class: [AtomicU64; 6],
+    read_latency_ns_by_class: [AtomicU64; 6],
+    write_latency_ns_by_class: [AtomicU64; 6],
+    sync_latency_ns: AtomicU64,
+    hash_latency_ns: AtomicU64,
     sync_ops: AtomicU64,
     hash_ops: AtomicU64,
     preallocation_failures: AtomicU64,
@@ -406,6 +414,10 @@ impl Default for StorageCounters {
             bytes_written_by_class: std::array::from_fn(|_| AtomicU64::new(0)),
             backend_read_ops_by_class: std::array::from_fn(|_| AtomicU64::new(0)),
             backend_bytes_read_by_class: std::array::from_fn(|_| AtomicU64::new(0)),
+            read_latency_ns_by_class: std::array::from_fn(|_| AtomicU64::new(0)),
+            write_latency_ns_by_class: std::array::from_fn(|_| AtomicU64::new(0)),
+            sync_latency_ns: AtomicU64::new(0),
+            hash_latency_ns: AtomicU64::new(0),
             sync_ops: AtomicU64::new(0),
             hash_ops: AtomicU64::new(0),
             preallocation_failures: AtomicU64::new(0),
@@ -534,6 +546,10 @@ impl MountScheduler {
             backend_bytes_read_by_class: load_atomic_array(
                 &self.counters.backend_bytes_read_by_class,
             ),
+            read_latency_ns_by_class: load_atomic_array(&self.counters.read_latency_ns_by_class),
+            write_latency_ns_by_class: load_atomic_array(&self.counters.write_latency_ns_by_class),
+            sync_latency_ns: self.counters.sync_latency_ns.load(Ordering::Relaxed),
+            hash_latency_ns: self.counters.hash_latency_ns.load(Ordering::Relaxed),
             sync_ops: self.counters.sync_ops.load(Ordering::Relaxed),
             hash_ops: self.counters.hash_ops.load(Ordering::Relaxed),
             preallocation_failures: self.counters.preallocation_failures.load(Ordering::Relaxed),
@@ -613,6 +629,7 @@ impl MountScheduler {
         let peer_read_cache = self.peer_read_cache.clone();
         let readahead_bytes = self.io_config.peer_read_readahead_bytes;
         let path = path.to_path_buf();
+        let started = Instant::now();
         self.submit(move || {
             let key = normalized_key(&path);
             let path_str = key.display().to_string();
@@ -624,6 +641,10 @@ impl MountScheduler {
                     counters.read_ops_by_class[class_index(class)].fetch_add(1, Ordering::Relaxed);
                     counters.bytes_read_by_class[class_index(class)]
                         .fetch_add(len as u64, Ordering::Relaxed);
+                    counters.read_latency_ns_by_class[class_index(class)].fetch_add(
+                        started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                        Ordering::Relaxed,
+                    );
                     return Ok(bytes);
                 }
                 counters
@@ -666,6 +687,10 @@ impl MountScheduler {
             counters.backend_read_ops_by_class[class_index(class)].fetch_add(1, Ordering::Relaxed);
             counters.backend_bytes_read_by_class[class_index(class)]
                 .fetch_add(read as u64, Ordering::Relaxed);
+            counters.read_latency_ns_by_class[class_index(class)].fetch_add(
+                started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                Ordering::Relaxed,
+            );
             let bytes = bytes::Bytes::from(buf);
             if class == IoClass::PeerRead && read_len > len {
                 let exact = bytes.slice(..len);
@@ -692,6 +717,7 @@ impl MountScheduler {
         let dirty_paths = self.dirty_paths.clone();
         let counters = self.counters.clone();
         let path = path.to_path_buf();
+        let started = Instant::now();
         self.submit(move || {
             let key = normalized_key(&path);
             let path_str = key.display().to_string();
@@ -719,6 +745,10 @@ impl MountScheduler {
             counters.write_ops_by_class[class_index(class)].fetch_add(1, Ordering::Relaxed);
             counters.bytes_written_by_class[class_index(class)]
                 .fetch_add(written as u64, Ordering::Relaxed);
+            counters.write_latency_ns_by_class[class_index(class)].fetch_add(
+                started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                Ordering::Relaxed,
+            );
             Ok(())
         })
         .await
@@ -775,10 +805,15 @@ impl MountScheduler {
         let dirty_paths = self.dirty_paths.clone();
         let counters = self.counters.clone();
         let path = path.to_path_buf();
+        let started = Instant::now();
         self.submit(move || {
             let key = normalized_key(&path);
             pool.sync_path(&key)?;
             counters.sync_ops.fetch_add(1, Ordering::Relaxed);
+            counters.sync_latency_ns.fetch_add(
+                started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                Ordering::Relaxed,
+            );
             let mut dirty = dirty_paths.lock().expect("dirty path mutex poisoned");
             dirty.remove(&key);
             Ok(())
@@ -790,6 +825,7 @@ impl MountScheduler {
         let pool = self.file_pool.clone();
         let dirty_paths = self.dirty_paths.clone();
         let counters = self.counters.clone();
+        let started = Instant::now();
         self.submit(move || {
             pool.sync_all()?;
             counters.sync_ops.fetch_add(1, Ordering::Relaxed);
@@ -804,6 +840,10 @@ impl MountScheduler {
             for path in paths {
                 dirty.remove(&path);
             }
+            counters.sync_latency_ns.fetch_add(
+                started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                Ordering::Relaxed,
+            );
             Ok(())
         })
         .await
@@ -811,11 +851,16 @@ impl MountScheduler {
 
     pub async fn hash_sha1(&self, data: bytes::Bytes) -> Result<[u8; 20], StorageError> {
         let counters = self.counters.clone();
+        let started = Instant::now();
         self.hash_pool
             .run(move || {
                 let mut hasher = Sha1::new();
                 hasher.update(&data);
                 counters.hash_ops.fetch_add(1, Ordering::Relaxed);
+                counters.hash_latency_ns.fetch_add(
+                    started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                    Ordering::Relaxed,
+                );
                 Ok(hasher.finalize().into())
             })
             .await
@@ -823,9 +868,14 @@ impl MountScheduler {
 
     pub async fn hash_v2_leaf(&self, data: bytes::Bytes) -> Result<[u8; 32], StorageError> {
         let counters = self.counters.clone();
+        let started = Instant::now();
         self.hash_pool
             .run(move || {
                 counters.hash_ops.fetch_add(1, Ordering::Relaxed);
+                counters.hash_latency_ns.fetch_add(
+                    started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                    Ordering::Relaxed,
+                );
                 Ok(BlockHash::of(&data).0)
             })
             .await
@@ -833,9 +883,14 @@ impl MountScheduler {
 
     pub async fn hash_v2_root(&self, leaves: Vec<[u8; 32]>) -> Result<[u8; 32], StorageError> {
         let counters = self.counters.clone();
+        let started = Instant::now();
         self.hash_pool
             .run(move || {
                 counters.hash_ops.fetch_add(1, Ordering::Relaxed);
+                counters.hash_latency_ns.fetch_add(
+                    started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                    Ordering::Relaxed,
+                );
                 Ok(merkle_root(&leaves))
             })
             .await
@@ -1200,8 +1255,12 @@ mod tests {
             stats.backend_bytes_read_by_class[class_index(IoClass::PeerRead)],
             4
         );
+        assert!(stats.read_latency_ns_by_class[class_index(IoClass::PeerRead)] > 0);
+        assert!(stats.write_latency_ns_by_class[class_index(IoClass::PeerWrite)] > 0);
         assert_eq!(stats.hash_ops, 1);
+        assert!(stats.hash_latency_ns > 0);
         assert_eq!(stats.sync_ops, 1);
+        assert!(stats.sync_latency_ns > 0);
         assert_eq!(stats.dirty_files, 0);
     }
 
