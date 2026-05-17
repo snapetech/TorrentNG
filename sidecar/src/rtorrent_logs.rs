@@ -69,9 +69,10 @@ fn ingest_path(
 
     let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     file.seek(SeekFrom::Start(cursor.offset))?;
-    let mut buf = String::new();
-    file.read_to_string(&mut buf)?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)?;
     cursor.offset = metadata.len();
+    let buf = String::from_utf8_lossy(&buf);
 
     for line in buf.lines().map(str::trim).filter(|line| !line.is_empty()) {
         append_log_line(db, path, line, retention)?;
@@ -143,16 +144,14 @@ fn redact_query_token(token: &str) -> String {
     let separators = ['&', ';'];
     let mut out = token.to_owned();
     for key in ["passkey", "apikey", "api_key", "token", "cookie"] {
-        for sep in separators {
-            let needle = format!("{key}=");
-            if let Some(pos) = out.to_ascii_lowercase().find(&needle) {
-                let value_start = pos + needle.len();
-                let value_end = out[value_start..]
-                    .find(sep)
-                    .map(|idx| value_start + idx)
-                    .unwrap_or(out.len());
-                out.replace_range(value_start..value_end, "[redacted]");
-            }
+        let needle = format!("{key}=");
+        if let Some(pos) = out.to_ascii_lowercase().find(&needle) {
+            let value_start = pos + needle.len();
+            let value_end = out[value_start..]
+                .find(separators)
+                .map(|idx| value_start + idx)
+                .unwrap_or(out.len());
+            out.replace_range(value_start..value_end, "[redacted]");
         }
     }
     out
@@ -189,6 +188,10 @@ mod tests {
         assert!(!redacted.contains("secret"));
         assert!(redacted.contains("[redacted-path:movie.mkv]"));
         assert!(redacted.contains("passkey=[redacted]"));
+
+        let redacted = redact_log_line("tracker?passkey=secret;token=also-secret&x=1");
+        assert!(!redacted.contains("secret"));
+        assert!(redacted.contains("passkey=[redacted];token=[redacted]&x=1"));
     }
 
     #[test]

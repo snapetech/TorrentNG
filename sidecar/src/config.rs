@@ -406,7 +406,10 @@ mod tests {
         assert!(cfg.rtorrent.logs.enabled);
         assert_eq!(
             cfg.rtorrent.logs.paths,
-            [PathBuf::from("/var/log/rtorrent.log"), PathBuf::from("/tmp/rtorrent.log")]
+            [
+                PathBuf::from("/var/log/rtorrent.log"),
+                PathBuf::from("/tmp/rtorrent.log")
+            ]
         );
         assert_eq!(cfg.rtorrent.logs.poll_interval_secs, 9);
         assert!(cfg.rtorrent.logs.read_from_start);
