@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, type EngineDiagnostics, type ProbeValue, type RtorrentSettingDescriptor } from '../api/client'
 
@@ -218,6 +218,7 @@ function RtorrentSettingsPanel() {
   const [viewFilter, setViewFilter] = useState<SettingsViewFilter>('all')
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set())
   const [notice, setNotice] = useState<{ tone: 'ok' | 'warn' | 'error'; text: string } | null>(null)
+  const searchRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
     if (!data) return
@@ -348,6 +349,7 @@ function RtorrentSettingsPanel() {
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
+      if (e.isComposing) return
       if (!(e.ctrlKey || e.metaKey)) return
       if (e.key.toLowerCase() === 's') {
         e.preventDefault()
@@ -361,6 +363,24 @@ function RtorrentSettingsPanel() {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [dirtyCount, resetAll, save])
+
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.isComposing) return
+      const target = e.target
+      const isTyping = target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement
+      if (e.key === '/' && !isTyping && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        e.preventDefault()
+        searchRef.current?.focus()
+      }
+      if (e.key === 'Escape' && target === searchRef.current && filter) {
+        e.preventDefault()
+        setFilter('')
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [filter])
 
   return (
     <Panel wide>
@@ -408,13 +428,23 @@ function RtorrentSettingsPanel() {
           }}>
             <label style={{ display: 'grid', gap: 5, minWidth: 0 }}>
               <span style={{ color: 'var(--text)', fontSize: 12, fontWeight: 800 }}>Find settings</span>
-              <input
-                type="search"
-                value={filter}
-                onChange={e => setFilter(e.target.value)}
-                placeholder="Filter by label, command, category, or type"
-                style={{ ...inputStyle, padding: '7px 9px' }}
-              />
+              <span style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', gap: 6 }}>
+                <input
+                  ref={searchRef}
+                  type="search"
+                  value={filter}
+                  onChange={e => setFilter(e.target.value)}
+                  aria-keyshortcuts="/"
+                  aria-label="Find settings"
+                  aria-describedby="rt-settings-result-count"
+                  title="Find settings"
+                  placeholder="Filter by label, command, category, or type"
+                  style={{ ...inputStyle, padding: '7px 9px' }}
+                />
+                <button type="button" onClick={() => { setFilter(''); searchRef.current?.focus() }} disabled={!filter} style={smallButtonStyle(Boolean(filter))}>
+                  Clear
+                </button>
+              </span>
             </label>
             <ViewFilter
               value={viewFilter}
@@ -435,7 +465,7 @@ function RtorrentSettingsPanel() {
               </span>
             </div>
           )}
-          <div role="status" aria-live="polite" style={{ color: 'var(--faint)', fontSize: 11 }}>
+          <div id="rt-settings-result-count" role="status" aria-live="polite" style={{ color: 'var(--faint)', fontSize: 11 }}>
             Showing {filteredGroups.reduce((sum, group) => sum + group.settings.length, 0).toLocaleString()} of {data.settings.length.toLocaleString()} managed settings.
           </div>
           <div style={{
@@ -456,7 +486,7 @@ function RtorrentSettingsPanel() {
                   : `${liveDirtyCount} live setting${liveDirtyCount === 1 ? '' : 's'}, ${restartDirtyCount} restart setting${restartDirtyCount === 1 ? '' : 's'}, ${customRcDirty ? 'custom lines edited' : 'custom lines unchanged'}.`}
               </div>
             </div>
-            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+            <div role="toolbar" aria-label="Settings workspace actions" style={{ display: 'flex', gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
               <button type="button" onClick={toggleAllGroups} style={smallButtonStyle(filteredGroups.length > 0)} disabled={filteredGroups.length === 0}>
                 {allGroupsCollapsed ? 'Expand all' : 'Collapse all'}
               </button>
@@ -514,7 +544,7 @@ function RtorrentSettingsPanel() {
                       <SettingPill tone="ok">{group.settings.length} shown</SettingPill>
                     </div>
                   </div>
-                  <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                  <div role="toolbar" aria-label={`${group.name} actions`} style={{ display: 'flex', gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
                     <button type="button" onClick={() => defaultGroup(group.settings)} style={smallButtonStyle(!save.isPending && data.overlay_writable)} disabled={save.isPending || !data.overlay_writable}>
                       Defaults
                     </button>
@@ -613,7 +643,7 @@ function RtorrentSettingsPanel() {
                           <span style={{ color: 'var(--faint)', fontSize: 10 }}>
                             {setting.restart_required ? 'Applies on restart' : 'Live apply supported'}
                           </span>
-                          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                          <div role="toolbar" aria-label={`${setting.label} actions`} style={{ display: 'flex', gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
                             <button
                               type="button"
                               onClick={() => setDraft(prev => ({ ...prev, [setting.key]: base }))}
@@ -732,7 +762,7 @@ function RtorrentSettingsPanel() {
             borderTop: '1px solid var(--border)',
             background: 'color-mix(in srgb, var(--surface) 92%, var(--bg))',
             padding: '10px 0 0',
-          }}>
+          }} role="toolbar" aria-label="Settings save actions">
             <button
               onClick={() => save.mutate()}
               disabled={save.isPending || dirtyCount === 0 || !data.overlay_writable}
