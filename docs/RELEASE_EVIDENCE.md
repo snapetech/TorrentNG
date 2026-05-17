@@ -82,6 +82,12 @@ Start the long soak:
 scripts/start_24h_soak.sh
 ```
 
+Check launcher preconditions without starting the background job:
+
+```sh
+TNG_24H_SOAK_DRY_RUN=1 scripts/start_24h_soak.sh
+```
+
 Monitor it:
 
 ```sh
