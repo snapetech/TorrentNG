@@ -1727,6 +1727,7 @@ impl Engine {
             &save_root,
             &SchedulerConfig {
                 profile: StorageProfile::Unknown,
+                resources: Some(self.resources.clone()),
                 ..Default::default()
             },
         );

@@ -12,6 +12,7 @@ use tokio::sync::{
 use tracing::instrument;
 
 use rt_hash::{merkle_root, BlockHash};
+use rt_metrics::{MemoryClass, MemoryLease, ResourceGovernor};
 use rt_path::{StorageProfile, StorageRootId};
 use sha1::{Digest, Sha1};
 
@@ -32,6 +33,8 @@ pub const STORAGE_LATENCY_BUCKETS_NS: [u64; 8] = [
     u64::MAX,
 ];
 pub const STORAGE_LATENCY_BUCKET_COUNT: usize = STORAGE_LATENCY_BUCKETS_NS.len();
+
+const QUEUED_DISK_JOB_OVERHEAD_BYTES: u64 = 1024;
 
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
@@ -103,6 +106,7 @@ pub struct SchedulerConfig {
     pub recheck_concurrency: usize,
     pub peer_read_concurrency: usize,
     pub storage_io: StorageIoConfig,
+    pub resources: Option<ResourceGovernor>,
 }
 
 impl Default for SchedulerConfig {
@@ -113,6 +117,7 @@ impl Default for SchedulerConfig {
             recheck_concurrency: 0,
             peer_read_concurrency: 0,
             storage_io: StorageIoConfig::default(),
+            resources: None,
         }
     }
 }
@@ -156,6 +161,7 @@ pub struct StorageIoStats {
     pub file_pool: FilePoolStats,
     pub io_queue_depth: usize,
     pub hash_queue_depth: usize,
+    pub queued_disk_bytes: u64,
     pub queue_full: u64,
     pub dirty_files: usize,
     pub read_ops_by_class: [u64; 6],
@@ -202,6 +208,7 @@ impl Default for StorageIoStats {
             file_pool: FilePoolStats::default(),
             io_queue_depth: 0,
             hash_queue_depth: 0,
+            queued_disk_bytes: 0,
             queue_full: 0,
             dirty_files: 0,
             read_ops_by_class: [0; 6],
@@ -512,6 +519,7 @@ pub struct MountScheduler {
     peer_read_elevator_queue_depth: usize,
     device_id: Option<String>,
     profile: StorageProfile,
+    resources: Option<ResourceGovernor>,
     counters: Arc<StorageCounters>,
 }
 
@@ -529,6 +537,7 @@ struct StorageCounters {
     write_latency_buckets: [AtomicU64; STORAGE_LATENCY_BUCKET_COUNT],
     sync_latency_buckets: [AtomicU64; STORAGE_LATENCY_BUCKET_COUNT],
     hash_latency_buckets: [AtomicU64; STORAGE_LATENCY_BUCKET_COUNT],
+    queued_disk_bytes: AtomicU64,
     queue_full: AtomicU64,
     sync_latency_ns: AtomicU64,
     hash_latency_ns: AtomicU64,
@@ -565,6 +574,7 @@ impl Default for StorageCounters {
             write_latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             sync_latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             hash_latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            queued_disk_bytes: AtomicU64::new(0),
             queue_full: AtomicU64::new(0),
             sync_latency_ns: AtomicU64::new(0),
             hash_latency_ns: AtomicU64::new(0),
@@ -599,6 +609,7 @@ struct PeerReadCacheEntry {
 struct PeerReadElevator {
     sender: tokio_mpsc::Sender<PeerReadRequest>,
     counters: Arc<StorageCounters>,
+    resources: Option<ResourceGovernor>,
 }
 
 #[derive(Debug)]
@@ -606,6 +617,7 @@ struct PeerReadRequest {
     path: PathBuf,
     offset: u64,
     len: usize,
+    _queued_bytes: QueuedDiskBytes,
     tx: oneshot::Sender<Result<bytes::Bytes, StorageError>>,
 }
 
@@ -617,6 +629,59 @@ struct PeerReadBatch {
     requests: Vec<PeerReadRequest>,
 }
 
+#[derive(Debug)]
+struct QueuedDiskBytes {
+    bytes: u64,
+    counters: Arc<StorageCounters>,
+    _lease: Option<MemoryLease>,
+}
+
+impl QueuedDiskBytes {
+    fn reserve(
+        counters: Arc<StorageCounters>,
+        resources: Option<&ResourceGovernor>,
+        bytes: u64,
+        mount: impl Into<String>,
+    ) -> Result<Self, StorageError> {
+        let bytes = queued_disk_charge(bytes);
+        let lease = if let Some(resources) = resources {
+            let Some(lease) = resources.try_acquire(MemoryClass::QueuedDisk, bytes) else {
+                counters.queue_full.fetch_add(1, Ordering::Relaxed);
+                return Err(StorageError::QueueFull {
+                    mount: mount.into(),
+                });
+            };
+            Some(lease)
+        } else {
+            None
+        };
+        if bytes > 0 {
+            counters
+                .queued_disk_bytes
+                .fetch_add(bytes, Ordering::Relaxed);
+        }
+        Ok(Self {
+            bytes,
+            counters,
+            _lease: lease,
+        })
+    }
+}
+
+impl Drop for QueuedDiskBytes {
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            self.counters
+                .queued_disk_bytes
+                .fetch_sub(self.bytes, Ordering::Relaxed);
+        }
+    }
+}
+
+fn queued_disk_charge(payload_bytes: u64) -> u64 {
+    payload_bytes.max(QUEUED_DISK_JOB_OVERHEAD_BYTES)
+}
+
 impl PeerReadElevator {
     fn spawn(
         storage_root: StorageRootId,
@@ -626,6 +691,7 @@ impl PeerReadElevator {
         io_pool: Arc<BlockingPool>,
         queue_sem: Arc<Semaphore>,
         counters: Arc<StorageCounters>,
+        resources: Option<ResourceGovernor>,
     ) -> Self {
         let (sender, receiver) = tokio_mpsc::channel(queue_depth.max(1));
         tokio::spawn(peer_read_elevator_worker(
@@ -637,7 +703,11 @@ impl PeerReadElevator {
             queue_sem,
             counters.clone(),
         ));
-        Self { sender, counters }
+        Self {
+            sender,
+            counters,
+            resources,
+        }
     }
 
     async fn read(
@@ -658,11 +728,18 @@ impl PeerReadElevator {
         len: usize,
     ) -> Result<oneshot::Receiver<Result<bytes::Bytes, StorageError>>, StorageError> {
         let (tx, rx) = oneshot::channel();
+        let queued_bytes = QueuedDiskBytes::reserve(
+            self.counters.clone(),
+            self.resources.as_ref(),
+            len as u64,
+            "peer-read-elevator",
+        )?;
         self.sender
             .try_send(PeerReadRequest {
                 path,
                 offset,
                 len,
+                _queued_bytes: queued_bytes,
                 tx,
             })
             .map_err(|err| match err {
@@ -938,6 +1015,7 @@ impl MountScheduler {
                     io_pool.clone(),
                     queue_sem.clone(),
                     counters.clone(),
+                    config.resources.clone(),
                 ))
             } else {
                 None
@@ -967,6 +1045,7 @@ impl MountScheduler {
             peer_read_elevator_queue_depth,
             device_id: topology.and_then(|topology| topology.device_id.map(|device| device.0)),
             profile,
+            resources: config.resources.clone(),
             counters,
             io_config,
         }
@@ -1012,6 +1091,7 @@ impl MountScheduler {
             file_pool: self.file_pool.stats(),
             io_queue_depth: self.io_pool.queued(),
             hash_queue_depth: self.hash_pool.queued(),
+            queued_disk_bytes: self.counters.queued_disk_bytes.load(Ordering::Relaxed),
             queue_full: self.counters.queue_full.load(Ordering::Relaxed),
             dirty_files,
             read_ops_by_class: load_atomic_array(&self.counters.read_ops_by_class),
@@ -1116,11 +1196,17 @@ impl MountScheduler {
         }
     }
 
-    async fn submit<T, F>(&self, f: F) -> Result<T, StorageError>
+    async fn submit<T, F>(&self, queued_bytes: u64, f: F) -> Result<T, StorageError>
     where
         T: Send + 'static,
         F: FnOnce() -> Result<T, StorageError> + Send + 'static,
     {
+        let queued_bytes = QueuedDiskBytes::reserve(
+            self.counters.clone(),
+            self.resources.as_ref(),
+            queued_bytes,
+            format!("storage-root-{}", self.storage_root.0),
+        )?;
         let _queue = self
             .queue_sem
             .clone()
@@ -1134,7 +1220,13 @@ impl MountScheduler {
                 }
                 TryAcquireError::Closed => StorageError::Cancelled,
             })?;
-        let result = self.io_pool.run(f).await;
+        let result = self
+            .io_pool
+            .run(move || {
+                let _queued_bytes = queued_bytes;
+                f()
+            })
+            .await;
         if matches!(result, Err(StorageError::QueueFull { .. })) {
             self.counters.queue_full.fetch_add(1, Ordering::Relaxed);
         }
@@ -1158,6 +1250,7 @@ impl MountScheduler {
                 self.io_pool.clone(),
                 self.queue_sem.clone(),
                 self.counters.clone(),
+                self.resources.clone(),
             ));
         }
         elevator.clone()
@@ -1191,7 +1284,7 @@ impl MountScheduler {
                 return Ok(bytes);
             }
         }
-        self.submit(move || {
+        self.submit(len as u64, move || {
             let key = normalized_key(&path);
             let path_str = key.display().to_string();
             if class == IoClass::PeerRead && readahead_bytes > len {
@@ -1281,7 +1374,7 @@ impl MountScheduler {
         let counters = self.counters.clone();
         let path = path.to_path_buf();
         let started = Instant::now();
-        self.submit(move || {
+        self.submit(data.len() as u64, move || {
             let key = normalized_key(&path);
             let path_str = key.display().to_string();
             let file = pool.get_or_open(&key, OpenMode::Write, create)?;
@@ -1327,7 +1420,7 @@ impl MountScheduler {
         let dirty_paths = self.dirty_paths.clone();
         let counters = self.counters.clone();
         let path = path.to_path_buf();
-        self.submit(move || {
+        self.submit(0, move || {
             let key = normalized_key(&path);
             let path_str = key.display().to_string();
             if let Some(parent) = key.parent() {
@@ -1372,7 +1465,7 @@ impl MountScheduler {
         let counters = self.counters.clone();
         let path = path.to_path_buf();
         let started = Instant::now();
-        self.submit(move || {
+        self.submit(0, move || {
             let key = normalized_key(&path);
             pool.sync_path(&key)?;
             counters.sync_ops.fetch_add(1, Ordering::Relaxed);
@@ -1393,7 +1486,7 @@ impl MountScheduler {
         let dirty_paths = self.dirty_paths.clone();
         let counters = self.counters.clone();
         let started = Instant::now();
-        self.submit(move || {
+        self.submit(0, move || {
             pool.sync_all()?;
             counters.sync_ops.fetch_add(1, Ordering::Relaxed);
             let paths: Vec<PathBuf> = {
@@ -1429,7 +1522,7 @@ impl MountScheduler {
         let pool = self.file_pool.clone();
         let counters = self.counters.clone();
         let path = path.to_path_buf();
-        self.submit(move || {
+        self.submit(0, move || {
             let key = normalized_key(&path);
             let path_str = key.display().to_string();
             let file = pool.get_or_open(&key, OpenMode::Read, false)?;
@@ -1468,9 +1561,16 @@ impl MountScheduler {
     pub async fn hash_sha1(&self, data: bytes::Bytes) -> Result<[u8; 20], StorageError> {
         let counters = self.counters.clone();
         let started = Instant::now();
+        let queued_bytes = QueuedDiskBytes::reserve(
+            counters.clone(),
+            self.resources.as_ref(),
+            data.len() as u64,
+            "rt-storage-hash",
+        )?;
         let result = self
             .hash_pool
             .run(move || {
+                let _queued_bytes = queued_bytes;
                 let mut hasher = Sha1::new();
                 hasher.update(&data);
                 counters.hash_ops.fetch_add(1, Ordering::Relaxed);
@@ -1491,9 +1591,16 @@ impl MountScheduler {
     pub async fn hash_v2_leaf(&self, data: bytes::Bytes) -> Result<[u8; 32], StorageError> {
         let counters = self.counters.clone();
         let started = Instant::now();
+        let queued_bytes = QueuedDiskBytes::reserve(
+            counters.clone(),
+            self.resources.as_ref(),
+            data.len() as u64,
+            "rt-storage-hash",
+        )?;
         let result = self
             .hash_pool
             .run(move || {
+                let _queued_bytes = queued_bytes;
                 counters.hash_ops.fetch_add(1, Ordering::Relaxed);
                 let latency_ns = latency_ns_since(started);
                 counters
@@ -1512,9 +1619,16 @@ impl MountScheduler {
     pub async fn hash_v2_root(&self, leaves: Vec<[u8; 32]>) -> Result<[u8; 32], StorageError> {
         let counters = self.counters.clone();
         let started = Instant::now();
+        let queued_bytes = QueuedDiskBytes::reserve(
+            counters.clone(),
+            self.resources.as_ref(),
+            (leaves.len() * 32) as u64,
+            "rt-storage-hash",
+        )?;
         let result = self
             .hash_pool
             .run(move || {
+                let _queued_bytes = queued_bytes;
                 counters.hash_ops.fetch_add(1, Ordering::Relaxed);
                 let latency_ns = latency_ns_since(started);
                 counters
@@ -1955,6 +2069,7 @@ mod tests {
             Err(StorageError::QueueFull { mount }) if mount.starts_with("storage-root-")
         ));
         assert_eq!(sched.stats().queue_full, 1);
+        assert_eq!(sched.stats().queued_disk_bytes, 0);
     }
 
     #[tokio::test]
@@ -1974,6 +2089,67 @@ mod tests {
             Err(StorageError::QueueFull { mount }) if mount == "test-blocking-pool"
         ));
         assert_eq!(pool.queued(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_disk_bytes_track_active_blocking_job_payload() {
+        let sched = hdd_scheduler();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task = tokio::spawn({
+            let sched = sched.clone();
+            async move {
+                sched
+                    .submit(4096, move || {
+                        started_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        Ok::<_, StorageError>(())
+                    })
+                    .await
+            }
+        });
+
+        started_rx.recv().unwrap();
+        assert_eq!(sched.stats().queued_disk_bytes, 4096);
+
+        release_tx.send(()).unwrap();
+        task.await.unwrap().unwrap();
+        assert_eq!(sched.stats().queued_disk_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn queued_disk_governor_denies_before_enqueue() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queued-cap.bin");
+        std::fs::write(&path, vec![1u8; 4096]).unwrap();
+        let mut caps = [1024 * 1024; rt_metrics::MEMORY_CLASS_COUNT];
+        caps[MemoryClass::QueuedDisk as usize] = 1024;
+        let resources = ResourceGovernor::new(rt_metrics::ResourceGovernorConfig {
+            total_cap_bytes: 1024 * 1024,
+            class_caps_bytes: caps,
+            ..Default::default()
+        });
+        let sched = MountScheduler::new(
+            StorageRootId::new(),
+            &SchedulerConfig {
+                profile: StorageProfile::Ssd,
+                resources: Some(resources.clone()),
+                ..Default::default()
+            },
+        );
+
+        let result = sched.read_at(IoClass::Foreground, &path, 0, 2048).await;
+
+        assert!(matches!(
+            result,
+            Err(StorageError::QueueFull { mount }) if mount.starts_with("storage-root-")
+        ));
+        assert_eq!(sched.stats().queued_disk_bytes, 0);
+        let snapshot = resources.snapshot();
+        assert_eq!(
+            snapshot.classes[MemoryClass::QueuedDisk as usize].denied_allocations,
+            1
+        );
     }
 
     #[test]
@@ -2238,6 +2414,7 @@ mod tests {
             stats.hash_latency_buckets[STORAGE_LATENCY_BUCKET_COUNT - 1],
             1
         );
+        assert_eq!(stats.queued_disk_bytes, 0);
         assert_eq!(stats.sync_ops, 1);
         assert!(stats.sync_latency_ns > 0);
         assert_eq!(
@@ -2445,6 +2622,7 @@ mod tests {
         let elevator = PeerReadElevator {
             sender,
             counters: counters.clone(),
+            resources: None,
         };
         let path = PathBuf::from("queued.bin");
         let first = elevator.try_enqueue(path.clone(), 0, 1024);

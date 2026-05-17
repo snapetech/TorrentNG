@@ -61,8 +61,9 @@ RUSTTORRENTD_CONFIG=/config/config.toml rusttorrentd
 | `pressure_constrained_pct` | `75` | Percent of total cap that reports constrained pressure |
 | `pressure_critical_pct` | `90` | Percent of total cap that reports critical pressure |
 
-The `queued_disk` memory class reports estimated bytes represented by queued
-disk, hash, and peer-read elevator jobs.
+The `queued_disk` memory class reports payload bytes reserved by queued or
+active disk, hash, and peer-read elevator jobs. Leases are acquired before
+enqueue and released on queue rejection, cancellation, or completion.
 
 ### `[runtime]`
 

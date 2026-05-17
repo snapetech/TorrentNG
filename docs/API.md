@@ -390,7 +390,7 @@ rTorrent over XMLRPC.
 | `torrentng_dht_*` | gauge | Native DHT routing table, lookup, tracked torrent, and announced peer cache counts |
 | `torrentng_storage_file_pool_*` | gauge/counter | Native scheduler open-file cache capacity, open files, hits, misses, evictions, and idle closes |
 | `torrentng_storage_*_queue_depth` | gauge | Native disk I/O and hashing queue depths |
-| `torrentng_storage_queued_disk_bytes` | gauge | Estimated process-owned bytes represented by queued disk, hash, and peer-read elevator jobs |
+| `torrentng_storage_queued_disk_bytes` | gauge | Process-owned payload bytes currently reserved by queued or active disk, hash, and peer-read elevator jobs |
 | `torrentng_storage_queue_full_total` | counter | Disk or hash jobs denied because the bounded per-mount storage queue was full |
 | `torrentng_storage_{read,write}_ops_total` | counter | Positioned disk operations through native schedulers |
 | `torrentng_storage_bytes_{read,written}_total` | counter | Bytes moved through native schedulers |

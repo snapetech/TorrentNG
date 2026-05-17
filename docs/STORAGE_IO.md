@@ -70,7 +70,9 @@ semaphores:
   files before clean fastresume saves; `Fast` preserves older relaxed behavior.
 - `StorageIoStats` exposes file-pool counters, queue depths, dirty file count,
   bytes and operations by `IoClass`, sync count, hash count, and preallocation
-  fallback/failure counters.
+  fallback/failure counters. Queued disk bytes are actual short-lived payload
+  leases held by queued or active disk, hash, and peer-read elevator jobs, not
+  queue-depth estimates.
 - `rt-storage::StorageRuntime` now has a probe-selected backend layer:
   `TNG_STORAGE_BACKEND=auto|pread|uring` chooses between the portable
   positioned-I/O worker pool and Linux `io_uring` positioned reads, writes,

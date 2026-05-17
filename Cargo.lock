@@ -1572,6 +1572,7 @@ dependencies = [
  "libc",
  "once_cell",
  "rt-hash",
+ "rt-metrics",
  "rt-path",
  "rt-piece-map",
  "sha1",

@@ -15,6 +15,7 @@ sha1.workspace = true
 once_cell.workspace = true
 libc = "0.2"
 rt-hash = { path = "../rt-hash" }
+rt-metrics = { path = "../rt-metrics" }
 rt-path = { path = "../rt-path" }
 rt-piece-map = { path = "../rt-piece-map" }
 io-uring = "0.7"

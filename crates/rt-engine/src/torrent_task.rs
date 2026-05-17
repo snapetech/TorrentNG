@@ -442,6 +442,7 @@ impl TorrentTask {
             &save_root,
             &SchedulerConfig {
                 profile: StorageProfile::Unknown,
+                resources: Some(resources.clone()),
                 ..Default::default()
             },
         );
