@@ -2,7 +2,7 @@
 
 Canonical bencode parser and encoder.
 
-## Status: Phase 1 — implementation complete
+## Status: Implemented — native engine support
 
 ## Public API
 

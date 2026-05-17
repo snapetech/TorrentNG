@@ -519,7 +519,7 @@ export function App() {
         </nav>
 
         {view === 'torrents' && (
-          <span style={{
+          <span className="rtng-topbar-pill" data-tone="neutral" style={{
             color: 'var(--muted)', background: 'var(--surface)', border: '1px solid var(--border)',
             borderRadius: 999, padding: '2px 8px', fontSize: 11, fontWeight: 700,
             whiteSpace: 'nowrap', flex: '0 0 auto',
@@ -528,7 +528,7 @@ export function App() {
           </span>
         )}
         {selected.size > 0 && view === 'torrents' && (
-          <span style={{
+          <span className="rtng-topbar-pill" data-tone="accent" style={{
             color: 'var(--accent-text)', background: 'var(--accent-soft)', border: '1px solid var(--accent)',
             borderRadius: 999, padding: '2px 8px', fontSize: 11, fontWeight: 800,
             whiteSpace: 'nowrap', flex: '0 0 auto',
@@ -542,7 +542,7 @@ export function App() {
           whiteSpace: 'nowrap', flex: '0 0 auto',
         }}>Help</button>
 
-        <span title="rTorrent connection state" style={{
+        <span className="rtng-topbar-pill" data-tone={health?.rtorrent === 'connected' ? 'ok' : 'error'} title="rTorrent connection state" style={{
           fontSize: 11, color: health?.rtorrent === 'connected' ? 'var(--success)' : 'var(--danger)',
           display: 'flex', alignItems: 'center', gap: 5, padding: '2px 7px',
           border: '1px solid ' + (health?.rtorrent === 'connected' ? 'color-mix(in srgb, var(--success) 42%, var(--border))' : 'color-mix(in srgb, var(--danger) 42%, var(--border))'),

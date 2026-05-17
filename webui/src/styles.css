@@ -303,6 +303,33 @@ dialog,
   scrollbar-width: thin;
 }
 
+.rtng-topbar-pill,
+.rtng-unsaved-view {
+  transition:
+    border-color 120ms ease,
+    background-color 120ms ease,
+    box-shadow 120ms ease,
+    filter 120ms ease;
+}
+
+.rtng-topbar-pill:hover,
+.rtng-unsaved-view:hover {
+  filter: brightness(1.08);
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, currentColor 12%, transparent),
+    0 6px 18px color-mix(in srgb, var(--shadow) 32%, transparent);
+}
+
+.rtng-toolbar[data-has-selection="true"] {
+  box-shadow: inset 3px 0 0 color-mix(in srgb, var(--accent) 64%, transparent);
+}
+
+.rtng-toolbar[data-busy="true"] {
+  box-shadow:
+    inset 3px 0 0 color-mix(in srgb, var(--warning) 70%, transparent),
+    inset 0 -1px 0 color-mix(in srgb, var(--warning) 18%, transparent);
+}
+
 .rtng-dropzone {
   position: relative;
   overflow: hidden;

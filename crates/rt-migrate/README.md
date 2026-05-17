@@ -1,6 +1,7 @@
 # rt-migrate
 
-import from rTorrent, qBittorrent, Transmission.
+Import planning and native DB apply support for rTorrent, qBittorrent, and
+Transmission state.
 
 ## Status
 
@@ -15,4 +16,12 @@ returns an auditable `MigrationPlan` or markdown report. The apply path writes
 native torrent rows, file rows, tracker rows, labels, categories, transfer
 counters, ratios, and completion state through `rt-db`.
 
-Operator-facing CLI wiring and rollback/backup documentation are still pending.
+Operator-facing migration and rollback guidance is documented in
+[../../docs/MIGRATION.md](../../docs/MIGRATION.md) and
+[../../docs/BACKUP_RESTORE.md](../../docs/BACKUP_RESTORE.md).
+
+Run focused tests:
+
+```sh
+cargo test -p rt-migrate
+```

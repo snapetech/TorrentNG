@@ -25,6 +25,8 @@ export function SavedViewsBar({ params, onApply }: Props) {
   })
   const activeParams = cleanParams(params)
   const activeKey = JSON.stringify(activeParams)
+  const hasActiveFilters = Object.keys(activeParams).length > 0
+  const hasSavedCurrentView = views.some(view => JSON.stringify(cleanParams(view.params)) === activeKey)
 
   async function saveView() {
     const trimmed = name.trim()
@@ -123,6 +125,20 @@ export function SavedViewsBar({ params, onApply }: Props) {
 
       {views.length === 0 && !error && (
         <span style={{ color: 'var(--faint)', fontSize: 11 }}>No saved views yet</span>
+      )}
+      {hasActiveFilters && !hasSavedCurrentView && !error && (
+        <span className="rtng-unsaved-view" style={{
+          color: 'var(--warning)',
+          background: 'color-mix(in srgb, var(--warning) 9%, transparent)',
+          border: '1px solid color-mix(in srgb, var(--warning) 38%, var(--border))',
+          borderRadius: 999,
+          padding: '2px 8px',
+          fontSize: 11,
+          fontWeight: 800,
+          whiteSpace: 'nowrap',
+        }}>
+          Unsaved view
+        </span>
       )}
 
       <div className="rtng-savedview-save" style={{ display: 'flex', alignItems: 'center', gap: 6, marginLeft: views.length ? 4 : 0 }}>

@@ -76,13 +76,14 @@ are available on Discord: [https://discord.gg/4ub88HeHFm](https://discord.gg/4ub
 - `webui/` - React, TypeScript, and Vite frontend for torrent management.
 - `engine-profile/` - rTorrent configuration profile and operational defaults.
 - `deploy/` - Docker, Compose, systemd, and nginx deployment examples.
-- `docs/` - API, architecture, configuration, engine, migration, and roadmap
-  notes.
+- `docs/` - Engine-mode guide, API, architecture, configuration, deployment,
+  migration, and roadmap notes.
 
 ## Documentation Map
 
 - [Engine rewrite guide](docs/ENGINE_REWRITE.md) - practical overview, swap
   workflows, native-vs-rTorrent differences, and testing checklist.
+- [Docs index](docs/README.md) - map of the full documentation set.
 - [Native engine design](docs/ENGINE.md) - deeper architecture and crate-level
   design for the rewrite.
 - [Architecture](docs/ARCHITECTURE.md) - how native mode, sidecar mode, WebUI,

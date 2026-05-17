@@ -33,7 +33,7 @@ export function TorrentToolbar({
   }
 
   return (
-    <div className="rtng-toolbar" style={{
+    <div className="rtng-toolbar" data-has-selection={selectedCount > 0 ? 'true' : 'false'} data-busy={busy ? 'true' : 'false'} style={{
       minHeight: 40, flexShrink: 0, display: 'flex', alignItems: 'center', gap: 8,
       padding: '0 10px', background: 'var(--surface)', borderBottom: '1px solid var(--border)',
       minWidth: 0, overflowX: 'auto', overflowY: 'hidden', scrollbarWidth: 'thin',

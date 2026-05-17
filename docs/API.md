@@ -347,6 +347,10 @@ These compatibility endpoints are present so qBittorrent clients can probe them 
 
 Exposed at `GET /metrics` in Prometheus text format:
 
+Native mode exposes engine/session/API metrics from `rusttorrentd`. Track 1
+sidecar mode additionally exposes rTorrent sync-loop counters because it polls
+rTorrent over XMLRPC.
+
 | Metric | Type | Description |
 |--------|------|-------------|
 | `rtorrentng_torrents_total` | gauge | Total torrents in session |
@@ -356,5 +360,5 @@ Exposed at `GET /metrics` in Prometheus text format:
 | `rtorrentng_torrents_errored` | gauge | In error state |
 | `rtorrentng_peers_connected` | gauge | Connected peers across all torrents |
 | `rtorrentng_api_requests_total` | counter | API requests served |
-| `rtorrentng_sync_cycles_total` | counter | rTorrent sync cycles completed |
-| `rtorrentng_sync_errors_total` | counter | rTorrent sync cycle errors |
+| `rtorrentng_sync_cycles_total` | counter | Track 1 sidecar rTorrent sync cycles completed |
+| `rtorrentng_sync_errors_total` | counter | Track 1 sidecar rTorrent sync cycle errors |
