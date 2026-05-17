@@ -862,6 +862,7 @@ fn deluge_torrent(
     limits: Option<&EngineTorrentLimits>,
     move_completed: Option<&DelugeMoveCompletedOptions>,
 ) -> Value {
+    let now = unix_now();
     let progress = if entry.total_length == 0 {
         0.0
     } else {
@@ -909,9 +910,9 @@ fn deluge_torrent(
         "move_on_completed_path": move_completed.map(|options| options.path.as_str()).unwrap_or(""),
         "time_added": entry.added_at,
         "completed_time": entry.completed_at.unwrap_or(0),
-        "active_time": 0,
-        "seeding_time": 0,
-        "finished_time": 0,
+        "active_time": now.saturating_sub(entry.added_at as i64),
+        "seeding_time": entry.completed_at.map(|completed| now.saturating_sub(completed as i64)).unwrap_or(0),
+        "finished_time": entry.completed_at.unwrap_or(0),
         "all_time_download": entry.stats.downloaded,
         "total_uploaded": entry.stats.uploaded,
         "total_payload_upload": entry.stats.uploaded,
@@ -1267,6 +1268,13 @@ fn bytes_to_deluge_kib(value: i64) -> f64 {
     value.max(0) as f64 / 1024.0
 }
 
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
 fn deluge_bool(value: Option<&Value>) -> Option<bool> {
     match value {
         Some(Value::Bool(value)) => Some(*value),
@@ -1559,6 +1567,8 @@ mod tests {
             let mut entry = TorrentEntry::new("a".repeat(40), "alpha".into(), "/data".into());
             entry.total_length = 100;
             entry.amount_left = 25;
+            entry.added_at = 100;
+            entry.completed_at = Some(200);
             entry.category = Some("movies".into());
             entry.tags = vec!["hd".into()];
             entry.stats.add_download(75);
@@ -1584,6 +1594,9 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), 16384).await.unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert!(body["error"].is_null(), "{:?}", body["error"]);
+        assert!(body["result"]["active_time"].as_i64().unwrap() > 0);
+        assert!(body["result"]["seeding_time"].as_i64().unwrap() > 0);
+        assert_eq!(body["result"]["finished_time"], 200);
         assert_json_keys(
             &body["result"],
             &[
@@ -2081,8 +2094,7 @@ mod tests {
 
     #[tokio::test]
     async fn deluge_web_add_torrents_accepts_common_webui_payload_shapes_without_engine() {
-        let app =
-            build_deluge_router(AppState::new(Arc::new(RwLock::new(SessionRegistry::new()))));
+        let app = build_deluge_router(AppState::new(Arc::new(RwLock::new(SessionRegistry::new()))));
         let resp = app
             .oneshot(
                 Request::builder()
@@ -2108,7 +2120,10 @@ mod tests {
         let results = body["result"].as_array().unwrap();
         assert_eq!(results.len(), 4);
         assert!(results.iter().all(|result| result["success"] == true));
-        assert_eq!(results[0]["path"], "magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(
+            results[0]["path"],
+            "magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
         assert_eq!(results[2]["path"], "https://example.invalid/file.torrent");
         assert_eq!(results[3]["path"], "inline.torrent");
     }

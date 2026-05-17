@@ -1390,6 +1390,7 @@ fn read_exact_from_pool(
     let key = normalized_key(path);
     let path_str = key.display().to_string();
     let file = pool.get_or_open(&key, OpenMode::Read, false)?;
+    advise_sequential_read(&file, offset, len);
     let mut buf = vec![0u8; len];
     let mut read = 0usize;
     while read < len {
@@ -1405,6 +1406,29 @@ fn read_exact_from_pool(
         read += n;
     }
     Ok(bytes::Bytes::from(buf))
+}
+
+fn advise_sequential_read(file: &File, offset: u64, len: usize) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+
+        if len < 256 * 1024 {
+            return;
+        }
+        let fd = file.as_raw_fd();
+        let offset = offset.min(i64::MAX as u64) as libc::off_t;
+        let len = len.min(i64::MAX as usize) as libc::off_t;
+        unsafe {
+            let _ = libc::posix_fadvise(fd, offset, len, libc::POSIX_FADV_SEQUENTIAL);
+            let _ = libc::posix_fadvise(fd, offset, len, libc::POSIX_FADV_WILLNEED);
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (file, offset, len);
+    }
 }
 
 fn clamp_file_pool_size(configured: usize) -> usize {

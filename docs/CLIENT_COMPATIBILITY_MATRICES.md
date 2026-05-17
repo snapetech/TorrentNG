@@ -202,7 +202,7 @@ Deluge torrent status field matrix:
 |---|---|---|
 | Identity/path | `hash`, `name`, `save_path`, `label`, `owner`, `shared` | Native/Compat |
 | Progress/size | `progress`, `total_size`, `total_done`, `num_files`, `num_pieces`, `piece_length` | Native/Partial |
-| State/time | `state`, `is_finished`, `eta`, `time_added`, `completed_time`, `active_time`, `seeding_time`, `finished_time` | Partial |
+| State/time | `state`, `is_finished`, `eta`, `time_added`, `completed_time`, `active_time`, `seeding_time`, `finished_time` | Compat/native; ETA remains placeholder without live rate |
 | Rates/counters | download/upload rates, total payload download/upload, all-time download, ratio | Partial |
 | Peers/seeds | `num_peers`, `num_seeds`, `total_peers`, `total_seeds`, distributed copies | Placeholder |
 | Trackers | `tracker`, `tracker_host`, `tracker_status`, `next_announce` | Partial |

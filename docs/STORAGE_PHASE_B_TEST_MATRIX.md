@@ -20,6 +20,9 @@ STORAGE_PHASE_B_FULL=1 scripts/storage_phase_b_matrix.sh
 
 Set `STORAGE_PHASE_B_REAL_DEVICE=1` to run ignored real-device storage probes.
 Use `TNG_STORAGE_BENCH_DIR` to point those probes at the target mount.
+For HDD tuning runs, use `scripts/storage_real_device_benchmark.sh /mnt/target`;
+set `TNG_STORAGE_REQUIRE_5X=1` to fail when elevator wall-clock throughput is
+less than 5x the shuffled baseline on that mount.
 
 ## Automated Matrix
 
@@ -80,6 +83,6 @@ burndown:
 | Gate | Target |
 | --- | --- |
 | FD churn | open/close syscall rate at 10k seeding torrents trends to zero after warmup |
-| HDD seed locality | ≥5x backend-read reduction for adjacent peer reads; ≥5x backend-read reduction for HDD shuffled peer-read elevator; wall-clock throughput target remains at least 5x non-elevator baseline on the same dataset |
+| HDD seed locality | ≥5x backend-read reduction for adjacent peer reads; ≥5x backend-read reduction for HDD shuffled peer-read elevator; `TNG_STORAGE_REQUIRE_5X=1 scripts/storage_real_device_benchmark.sh /mnt/hdd` enforces the wall-clock throughput target on real HDD hardware |
 | Recheck isolation | long rechecks do not stall peer-read or foreground classes |
 | Durability | `clean_shutdown = true` is written only after configured storage sync succeeds |
