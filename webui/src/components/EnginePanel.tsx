@@ -221,6 +221,7 @@ function RtorrentSettingsPanel() {
   const [lastSavedAt, setLastSavedAt] = useState<number | null>(null)
   const [lastSaveFailed, setLastSaveFailed] = useState(false)
   const searchRef = useRef<HTMLInputElement>(null)
+  const customRcRef = useRef<HTMLLabelElement>(null)
   const immediateSaveRef = useRef(0)
 
   useEffect(() => {
@@ -460,6 +461,16 @@ function RtorrentSettingsPanel() {
     return () => window.removeEventListener('keydown', onKey)
   }, [filter])
 
+  useEffect(() => {
+    function onBeforeUnload(e: BeforeUnloadEvent) {
+      if (dirtyCount === 0 || save.isPending) return
+      e.preventDefault()
+      e.returnValue = ''
+    }
+    window.addEventListener('beforeunload', onBeforeUnload)
+    return () => window.removeEventListener('beforeunload', onBeforeUnload)
+  }, [dirtyCount, save.isPending])
+
   return (
     <Panel wide>
       <Subhead>Settings Control Panel</Subhead>
@@ -474,6 +485,7 @@ function RtorrentSettingsPanel() {
           }}>
             <SettingStat label="Managed knobs" value={data.settings.length.toLocaleString()} />
             <SettingStat label="Pending autosave" value={dirtyCount.toLocaleString()} tone={dirtyCount > 0 ? 'warn' : 'ok'} />
+            <SettingStat label="Custom lines" value={customRcDirty ? 'edited' : 'saved'} tone={customRcDirty ? 'warn' : 'ok'} />
             <SettingStat label="Live unavailable" value={unavailableCount.toLocaleString()} tone={unavailableCount > 0 ? 'warn' : 'ok'} />
             <SettingStat label="Overlay" value={data.overlay_writable ? 'writable' : 'readonly'} tone={data.overlay_writable ? 'ok' : 'warn'} />
             <SettingStat label="Restart support" value={data.restart_supported ? 'available' : 'manual'} tone={data.restart_supported ? 'ok' : 'warn'} />
@@ -570,6 +582,14 @@ function RtorrentSettingsPanel() {
                   </button>
                 )
               })}
+              <button
+                type="button"
+                onClick={() => customRcRef.current?.scrollIntoView({ block: 'start', behavior: 'smooth' })}
+                style={smallButtonStyle(true)}
+                aria-controls="rt-custom-rc"
+              >
+                Custom lines ({customRc.split('\n').filter(line => line.trim()).length})
+              </button>
             </nav>
           )}
           <div style={{
@@ -843,7 +863,8 @@ function RtorrentSettingsPanel() {
               </div>
             )}
           </div>
-          <label style={{
+          <label id="rt-custom-rc" ref={customRcRef} style={{
+            scrollMarginTop: 12,
             display: 'grid',
             gap: 6,
             border: `1px solid ${customRcDirty ? 'color-mix(in srgb, var(--warning) 58%, var(--border))' : 'var(--border)'}`,
