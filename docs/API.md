@@ -85,6 +85,8 @@ the rewritten engine.
 | `GET` | `/api/v1/session-events` | Recent durable native session events; query: `limit`, `torrent`, `kind`, `level`, `last_known_id` |
 | `GET` | `/api/v1/logs` | Recent durable sidecar app/rTorrent events; query: `limit`, `kind`, `level`, `last_known_id` |
 
+`/api/v1/logs` returns retained operator events newest-first. Important `kind` values include `sidecar_started`, `rtorrent_log`, `rtorrent_log_ingest_error`, `rtorrent_log_ingest_recovered`, `rtorrent_sync_error`, `rtorrent_sync_recovered`, `rtorrent_stats_error`, `rtorrent_stats_recovered`, `rtorrent_user_agent_error`, `settings_changed`, and `admin_restart_requested`. Payloads are sanitized: magnet URLs, auth material, full filesystem paths, and raw user-agent strings are not stored.
+
 #### `GET /api/v1/torrents` query parameters
 
 | Parameter | Type | Description |
