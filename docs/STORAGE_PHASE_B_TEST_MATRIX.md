@@ -35,7 +35,7 @@ Use `TNG_STORAGE_BENCH_DIR` to point those probes at the target mount.
 | FD bound | file-pool capacity stays bounded under active file churn | `cargo test -p rt-metrics storage_file_pool_stays_bounded_under_active_file_churn -- --nocapture` |
 | Engine upload reads | multi-file upload reads still return exact block bytes | `cargo test -p rt-engine upload_block_reads_across_many_file_regions` |
 | Pure v2 recheck | taskless v2 recheck still verifies file roots through scheduled storage reads | `cargo test -p rt-engine pure_v2_recheck_verifies_file_roots_without_torrent_task` |
-| Real-device probes | topology printout, adjacent-read backend reduction, hot-fd reuse, shuffled peer-read baseline on a chosen mount | `STORAGE_PHASE_B_REAL_DEVICE=1 TNG_STORAGE_BENCH_DIR=/mnt/target scripts/storage_phase_b_matrix.sh` |
+| Real-device probes | topology printout, adjacent-read backend reduction, hot-fd reuse, shuffled peer-read baseline, HDD elevator throughput on a chosen mount | `STORAGE_PHASE_B_REAL_DEVICE=1 TNG_STORAGE_BENCH_DIR=/mnt/target scripts/storage_phase_b_matrix.sh` |
 
 ## Full Consumer Matrix
 
@@ -80,6 +80,6 @@ burndown:
 | Gate | Target |
 | --- | --- |
 | FD churn | open/close syscall rate at 10k seeding torrents trends to zero after warmup |
-| HDD seed locality | current readahead gate: ≥5x backend-read reduction for adjacent peer reads; future wired-elevator gate: aggregate seed throughput at least 5x non-elevator baseline on the same dataset |
+| HDD seed locality | ≥5x backend-read reduction for adjacent peer reads; ≥5x backend-read reduction for HDD shuffled peer-read elevator; wall-clock throughput target remains at least 5x non-elevator baseline on the same dataset |
 | Recheck isolation | long rechecks do not stall peer-read or foreground classes |
 | Durability | `clean_shutdown = true` is written only after configured storage sync succeeds |

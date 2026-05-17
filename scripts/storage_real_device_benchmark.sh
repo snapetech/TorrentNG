@@ -32,4 +32,4 @@ cd "$ROOT"
 TNG_STORAGE_BENCH_DIR="$BENCH_DIR" \
 TNG_STORAGE_BENCH_BLOCKS="${TNG_STORAGE_BENCH_BLOCKS:-16384}" \
 TNG_STORAGE_BENCH_READS="${TNG_STORAGE_BENCH_READS:-100000}" \
-cargo test -p rt-storage --release --test storage_real_device -- --ignored --nocapture
+cargo test -p rt-storage --release --test storage_real_device -- --ignored --nocapture --test-threads=1

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc as tokio_mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tracing::instrument;
 
 use rt_hash::{merkle_root, BlockHash};
@@ -71,6 +71,7 @@ pub struct StorageIoConfig {
     pub preallocation_mode: PreallocationMode,
     pub durability_mode: DurabilityMode,
     pub peer_read_readahead_bytes: usize,
+    pub peer_read_elevator_budget_ms: u64,
 }
 
 impl Default for StorageIoConfig {
@@ -85,6 +86,7 @@ impl Default for StorageIoConfig {
             preallocation_mode: PreallocationMode::Auto,
             durability_mode: DurabilityMode::Checkpoint,
             peer_read_readahead_bytes: 512 * 1024,
+            peer_read_elevator_budget_ms: 10,
         }
     }
 }
@@ -425,6 +427,9 @@ pub struct MountScheduler {
     hash_pool: Arc<BlockingPool>,
     dirty_paths: Arc<Mutex<HashSet<PathBuf>>>,
     peer_read_cache: Arc<Mutex<HashMap<PathBuf, PeerReadCacheEntry>>>,
+    peer_read_elevator: Arc<Mutex<Option<PeerReadElevator>>>,
+    peer_read_elevator_enabled: bool,
+    peer_read_elevator_queue_depth: usize,
     counters: Arc<StorageCounters>,
 }
 
@@ -484,6 +489,192 @@ struct PeerReadCacheEntry {
     offset: u64,
     data: bytes::Bytes,
     last_used: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct PeerReadElevator {
+    sender: tokio_mpsc::Sender<PeerReadRequest>,
+}
+
+#[derive(Debug)]
+struct PeerReadRequest {
+    path: PathBuf,
+    offset: u64,
+    len: usize,
+    tx: oneshot::Sender<Result<bytes::Bytes, StorageError>>,
+}
+
+#[derive(Debug)]
+struct PeerReadBatch {
+    path: PathBuf,
+    offset: u64,
+    len: usize,
+    requests: Vec<PeerReadRequest>,
+}
+
+impl PeerReadElevator {
+    fn spawn(
+        storage_root: StorageRootId,
+        queue_depth: usize,
+        budget: Duration,
+        file_pool: Arc<FilePool>,
+        io_pool: Arc<BlockingPool>,
+        queue_sem: Arc<Semaphore>,
+        counters: Arc<StorageCounters>,
+    ) -> Self {
+        let (sender, receiver) = tokio_mpsc::channel(queue_depth.max(1));
+        tokio::spawn(peer_read_elevator_worker(
+            storage_root,
+            receiver,
+            budget,
+            file_pool,
+            io_pool,
+            queue_sem,
+            counters,
+        ));
+        Self { sender }
+    }
+
+    async fn read(
+        &self,
+        path: PathBuf,
+        offset: u64,
+        len: usize,
+    ) -> Result<bytes::Bytes, StorageError> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(PeerReadRequest {
+                path,
+                offset,
+                len,
+                tx,
+            })
+            .await
+            .map_err(|_| StorageError::Cancelled)?;
+        rx.await.map_err(|_| StorageError::Cancelled)?
+    }
+}
+
+async fn peer_read_elevator_worker(
+    _storage_root: StorageRootId,
+    mut receiver: tokio_mpsc::Receiver<PeerReadRequest>,
+    budget: Duration,
+    file_pool: Arc<FilePool>,
+    io_pool: Arc<BlockingPool>,
+    queue_sem: Arc<Semaphore>,
+    counters: Arc<StorageCounters>,
+) {
+    while let Some(first) = receiver.recv().await {
+        if !budget.is_zero() {
+            tokio::time::sleep(budget).await;
+        }
+
+        let mut requests = vec![first];
+        while let Ok(request) = receiver.try_recv() {
+            requests.push(request);
+        }
+
+        let batches = peer_read_batches(requests);
+        for batch in batches {
+            let file_pool = file_pool.clone();
+            let io_pool = io_pool.clone();
+            let queue_sem = queue_sem.clone();
+            let counters = counters.clone();
+            tokio::spawn(async move {
+                let results =
+                    dispatch_peer_read_batch(batch, file_pool, io_pool, queue_sem, counters).await;
+                for (tx, result) in results {
+                    let _ = tx.send(result);
+                }
+            });
+        }
+    }
+}
+
+fn peer_read_batches(mut requests: Vec<PeerReadRequest>) -> Vec<PeerReadBatch> {
+    requests.sort_by(|a, b| {
+        normalized_key(&a.path)
+            .cmp(&normalized_key(&b.path))
+            .then_with(|| a.offset.cmp(&b.offset))
+    });
+
+    let mut batches: Vec<PeerReadBatch> = Vec::with_capacity(requests.len());
+    for request in requests {
+        let request_end = request.offset.saturating_add(request.len as u64);
+        if let Some(last) = batches.last_mut() {
+            let last_end = last.offset.saturating_add(last.len as u64);
+            if normalized_key(&last.path) == normalized_key(&request.path)
+                && request.offset <= last_end
+            {
+                last.len = request_end.saturating_sub(last.offset).max(last.len as u64) as usize;
+                last.requests.push(request);
+                continue;
+            }
+        }
+        batches.push(PeerReadBatch {
+            path: request.path.clone(),
+            offset: request.offset,
+            len: request.len,
+            requests: vec![request],
+        });
+    }
+    batches
+}
+
+async fn dispatch_peer_read_batch(
+    batch: PeerReadBatch,
+    file_pool: Arc<FilePool>,
+    io_pool: Arc<BlockingPool>,
+    queue_sem: Arc<Semaphore>,
+    counters: Arc<StorageCounters>,
+) -> Vec<(
+    oneshot::Sender<Result<bytes::Bytes, StorageError>>,
+    Result<bytes::Bytes, StorageError>,
+)> {
+    let _queue = match queue_sem.acquire_owned().await {
+        Ok(permit) => permit,
+        Err(_) => {
+            return batch
+                .requests
+                .into_iter()
+                .map(|request| (request.tx, Err(StorageError::Cancelled)))
+                .collect();
+        }
+    };
+
+    let path = batch.path.clone();
+    let offset = batch.offset;
+    let len = batch.len;
+    let read = io_pool
+        .run(move || read_exact_from_pool(&file_pool, &path, offset, len))
+        .await;
+
+    match read {
+        Ok(bytes) => {
+            counters.backend_read_ops_by_class[class_index(IoClass::PeerRead)]
+                .fetch_add(1, Ordering::Relaxed);
+            counters.backend_bytes_read_by_class[class_index(IoClass::PeerRead)]
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            batch
+                .requests
+                .into_iter()
+                .map(|request| {
+                    let relative = request.offset.saturating_sub(batch.offset) as usize;
+                    let end = relative.saturating_add(request.len);
+                    (request.tx, Ok(bytes.slice(relative..end)))
+                })
+                .collect()
+        }
+        Err(error) => {
+            let mut requests = batch.requests.into_iter();
+            let Some(first) = requests.next() else {
+                return Vec::new();
+            };
+            let mut out = vec![(first.tx, Err(error))];
+            out.extend(requests.map(|request| (request.tx, Err(StorageError::Cancelled))));
+            out
+        }
+    }
 }
 
 impl MountScheduler {
@@ -555,6 +746,38 @@ impl MountScheduler {
         } else {
             IoClass::Metadata.hdd_concurrency()
         };
+        let file_pool = Arc::new(FilePool::new(
+            clamp_file_pool_size(io_config.file_pool_size),
+            Duration::from_secs(io_config.idle_file_ttl_secs),
+        ));
+        let io_pool = Arc::new(BlockingPool::new(
+            "rt-storage-io",
+            io_config.io_worker_threads,
+            io_config.io_queue_depth,
+        ));
+        let queue_sem = Arc::new(Semaphore::new(
+            config.max_queue.min(io_config.io_queue_depth).max(1),
+        ));
+        let counters = Arc::new(StorageCounters::default());
+        let peer_read_elevator_enabled =
+            matches!(profile, StorageProfile::Hdd) && io_config.peer_read_elevator_budget_ms > 0;
+        let peer_read_elevator_queue_depth = io_config.io_queue_depth.max(peer_read_limit);
+        let peer_read_elevator =
+            if peer_read_elevator_enabled && tokio::runtime::Handle::try_current().is_ok() {
+                Some(PeerReadElevator::spawn(
+                    storage_root,
+                    peer_read_elevator_queue_depth,
+                    Duration::from_millis(io_config.peer_read_elevator_budget_ms),
+                    file_pool.clone(),
+                    io_pool.clone(),
+                    queue_sem.clone(),
+                    counters.clone(),
+                ))
+            } else {
+                None
+            };
+        let peer_read_elevator = Arc::new(Mutex::new(peer_read_elevator));
+
         MountScheduler {
             storage_root,
             recheck_sem: Arc::new(Semaphore::new(recheck_limit)),
@@ -563,18 +786,9 @@ impl MountScheduler {
             peer_read_sem: Arc::new(Semaphore::new(peer_read_limit)),
             foreground_sem: Arc::new(Semaphore::new(fg)),
             metadata_sem: Arc::new(Semaphore::new(md)),
-            queue_sem: Arc::new(Semaphore::new(
-                config.max_queue.min(io_config.io_queue_depth).max(1),
-            )),
-            file_pool: Arc::new(FilePool::new(
-                clamp_file_pool_size(io_config.file_pool_size),
-                Duration::from_secs(io_config.idle_file_ttl_secs),
-            )),
-            io_pool: Arc::new(BlockingPool::new(
-                "rt-storage-io",
-                io_config.io_worker_threads,
-                io_config.io_queue_depth,
-            )),
+            queue_sem,
+            file_pool,
+            io_pool,
             hash_pool: Arc::new(BlockingPool::new(
                 "rt-storage-hash",
                 io_config.hash_worker_threads,
@@ -582,7 +796,10 @@ impl MountScheduler {
             )),
             dirty_paths: Arc::new(Mutex::new(HashSet::new())),
             peer_read_cache: Arc::new(Mutex::new(HashMap::new())),
-            counters: Arc::new(StorageCounters::default()),
+            peer_read_elevator,
+            peer_read_elevator_enabled,
+            peer_read_elevator_queue_depth,
+            counters,
             io_config,
         }
     }
@@ -701,6 +918,28 @@ impl MountScheduler {
         self.io_pool.run(f).await
     }
 
+    fn peer_read_elevator(&self) -> Option<PeerReadElevator> {
+        if !self.peer_read_elevator_enabled {
+            return None;
+        }
+        let mut elevator = self
+            .peer_read_elevator
+            .lock()
+            .expect("peer read elevator mutex poisoned");
+        if elevator.is_none() && tokio::runtime::Handle::try_current().is_ok() {
+            *elevator = Some(PeerReadElevator::spawn(
+                self.storage_root,
+                self.peer_read_elevator_queue_depth,
+                Duration::from_millis(self.io_config.peer_read_elevator_budget_ms),
+                self.file_pool.clone(),
+                self.io_pool.clone(),
+                self.queue_sem.clone(),
+                self.counters.clone(),
+            ));
+        }
+        elevator.clone()
+    }
+
     pub async fn read_at(
         &self,
         class: IoClass,
@@ -712,9 +951,23 @@ impl MountScheduler {
         let pool = self.file_pool.clone();
         let counters = self.counters.clone();
         let peer_read_cache = self.peer_read_cache.clone();
+        let peer_read_elevator = self.peer_read_elevator();
         let readahead_bytes = self.io_config.peer_read_readahead_bytes;
         let path = path.to_path_buf();
         let started = Instant::now();
+        if class == IoClass::PeerRead && readahead_bytes <= len {
+            if let Some(elevator) = peer_read_elevator {
+                let bytes = elevator.read(path, offset, len).await?;
+                counters.read_ops_by_class[class_index(class)].fetch_add(1, Ordering::Relaxed);
+                counters.bytes_read_by_class[class_index(class)]
+                    .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                let latency_ns = latency_ns_since(started);
+                counters.read_latency_ns_by_class[class_index(class)]
+                    .fetch_add(latency_ns, Ordering::Relaxed);
+                record_latency_bucket(&counters.read_latency_buckets, latency_ns);
+                return Ok(bytes);
+            }
+        }
         self.submit(move || {
             let key = normalized_key(&path);
             let path_str = key.display().to_string();
@@ -1086,6 +1339,32 @@ fn peer_read_cache_store(
             last_used: Instant::now(),
         },
     );
+}
+
+fn read_exact_from_pool(
+    pool: &FilePool,
+    path: &Path,
+    offset: u64,
+    len: usize,
+) -> Result<bytes::Bytes, StorageError> {
+    let key = normalized_key(path);
+    let path_str = key.display().to_string();
+    let file = pool.get_or_open(&key, OpenMode::Read, false)?;
+    let mut buf = vec![0u8; len];
+    let mut read = 0usize;
+    while read < len {
+        let n = positioned_read(&file, &mut buf[read..], offset + read as u64)
+            .map_err(|e| StorageError::io(&path_str, e))?;
+        if n == 0 {
+            return Err(StorageError::ShortIo {
+                path: path_str,
+                expected: len,
+                actual: read,
+            });
+        }
+        read += n;
+    }
+    Ok(bytes::Bytes::from(buf))
 }
 
 fn clamp_file_pool_size(configured: usize) -> usize {
@@ -1486,6 +1765,59 @@ mod tests {
         assert_eq!(
             stats.backend_bytes_read_by_class[class_index(IoClass::PeerRead)],
             16
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn hdd_peer_read_elevator_batches_shuffled_adjacent_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("elevator.bin");
+        let block_len = 1024usize;
+        let blocks = 64usize;
+        let data: Vec<u8> = (0..block_len * blocks).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+        let sched = MountScheduler::new(
+            StorageRootId::new(),
+            &SchedulerConfig {
+                profile: StorageProfile::Hdd,
+                peer_read_concurrency: blocks,
+                storage_io: StorageIoConfig {
+                    peer_read_readahead_bytes: 0,
+                    peer_read_elevator_budget_ms: 5,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let mut set = tokio::task::JoinSet::new();
+        for i in (0..blocks).rev() {
+            let sched = sched.clone();
+            let path = path.clone();
+            set.spawn(async move {
+                let offset = (i * block_len) as u64;
+                let bytes = sched
+                    .read_at(IoClass::PeerRead, &path, offset, block_len)
+                    .await
+                    .unwrap();
+                (i, bytes)
+            });
+        }
+
+        while let Some(joined) = set.join_next().await {
+            let (i, bytes) = joined.unwrap();
+            let start = i * block_len;
+            assert_eq!(&bytes[..], &data[start..start + block_len]);
+        }
+
+        let stats = sched.stats();
+        assert_eq!(
+            stats.read_ops_by_class[class_index(IoClass::PeerRead)],
+            blocks as u64
+        );
+        assert!(
+            stats.backend_read_ops_by_class[class_index(IoClass::PeerRead)] * 5 <= blocks as u64,
+            "expected elevator to reduce backend reads; stats={stats:?}"
         );
     }
 }

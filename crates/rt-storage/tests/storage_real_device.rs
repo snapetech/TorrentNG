@@ -13,6 +13,10 @@ fn bench_size(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+fn bench_u64(name: &str, default: u64) -> u64 {
+    bench_size(name, default)
+}
+
 fn bench_dir() -> tempfile::TempDir {
     let root = std::env::var_os("TNG_STORAGE_BENCH_DIR")
         .map(PathBuf::from)
@@ -201,6 +205,7 @@ async fn shuffled_peer_read_baseline_reports_current_scheduler_throughput() {
             peer_read_concurrency: blocks as usize,
             storage_io: StorageIoConfig {
                 peer_read_readahead_bytes: 0,
+                peer_read_elevator_budget_ms: 0,
                 ..Default::default()
             },
             ..Default::default()
@@ -223,5 +228,65 @@ async fn shuffled_peer_read_baseline_reports_current_scheduler_throughput() {
     assert_eq!(
         stats.backend_read_ops_by_class[IoClass::PeerRead as usize],
         blocks
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real-device storage benchmark; run explicitly with --ignored --nocapture"]
+async fn hdd_peer_read_elevator_reduces_backend_reads_on_shuffled_adjacent_blocks() {
+    let blocks = bench_size("TNG_STORAGE_BENCH_BLOCKS", 4096);
+    let block_len = bench_size("TNG_STORAGE_BENCH_BLOCK_LEN", 16 * 1024) as usize;
+    let total = blocks as usize * block_len;
+
+    let dir = bench_dir();
+    print_topology(dir.path());
+    let topology = detect_storage_topology(dir.path());
+    if topology.profile != StorageProfile::Hdd {
+        println!(
+            "tng_storage_elevator skipped_non_hdd_profile={:?}",
+            topology.profile
+        );
+        return;
+    }
+
+    let path = dir.path().join("elevator-shuffled.bin");
+    let data: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&path, &data).unwrap();
+
+    let offsets = shuffled_offsets(blocks, block_len);
+    drop_file_cache(&path);
+
+    let scheduler = MountScheduler::new_for_path(
+        StorageRootId::new(),
+        dir.path(),
+        &SchedulerConfig {
+            profile: StorageProfile::Unknown,
+            peer_read_concurrency: blocks as usize,
+            storage_io: StorageIoConfig {
+                peer_read_readahead_bytes: 0,
+                peer_read_elevator_budget_ms: bench_u64("TNG_STORAGE_ELEVATOR_BUDGET_MS", 250),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+
+    let elapsed = run_reads(scheduler.clone(), path, &data, &offsets, block_len).await;
+    let stats = scheduler.stats();
+    let submitted = stats.read_ops_by_class[IoClass::PeerRead as usize];
+    let backend_reads = stats.backend_read_ops_by_class[IoClass::PeerRead as usize];
+    let reduction = submitted as f64 / backend_reads.max(1) as f64;
+    let mib = total as f64 / (1024.0 * 1024.0);
+    let mib_s = mib / elapsed.as_secs_f64();
+
+    println!(
+        "tng_storage_elevator blocks={blocks} block_len={block_len} total_mib={mib:.2} elapsed_ms={} mib_s={mib_s:.2} submitted={submitted} backend_reads={backend_reads} reduction={reduction:.2}x",
+        elapsed.as_millis(),
+    );
+
+    assert_eq!(submitted, blocks);
+    assert!(
+        backend_reads * 5 <= submitted,
+        "expected >=5x backend read reduction; submitted={submitted} backend_reads={backend_reads}"
     );
 }

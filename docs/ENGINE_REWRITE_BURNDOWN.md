@@ -142,10 +142,11 @@ shippable and benchmarkable.
 - [x] Resolve storage roots to physical `DeviceId` (`/sys/block`, rotational, dm/RAID, mergerfs/ZFS/btrfs).
 - [x] Auto-detect `StorageProfile` instead of defaulting to `Unknown`.
 - [x] Implement `DeviceElevator`: offset-sorted, coalescing, deadline + `choke_critical` promotion.
-- [ ] Wire `MountScheduler` permit to elevator submission; per-class weights from `IoClass`.
+- [x] Wire `MountScheduler` peer-read permits to HDD elevator submission with bounded queueing.
 - [x] Topology-derived preallocation policy (`fallocate` on rotational non-CoW only).
 - [x] Bench/proxy: real-device adjacent peer-read readahead reduces backend reads ≥5x on NVMe and HDD.
-- [ ] Bench: HDD aggregate seed throughput ≥ 5× non-elevator baseline on same dataset.
+- [x] Bench/proxy: HDD shuffled peer-read elevator reduces backend reads ≥5x on same dataset.
+- [ ] Bench/tune: HDD shuffled peer-read wall-clock throughput ≥5× non-elevator baseline on same dataset.
 
 ### Phase C — tiered torrents (scale unlock)
 
