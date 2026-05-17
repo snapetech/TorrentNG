@@ -219,6 +219,7 @@ function RtorrentSettingsPanel() {
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set())
   const [notice, setNotice] = useState<{ tone: 'ok' | 'warn' | 'error'; text: string } | null>(null)
   const searchRef = useRef<HTMLInputElement>(null)
+  const immediateSaveRef = useRef(0)
 
   useEffect(() => {
     if (!data) return
@@ -371,6 +372,17 @@ function RtorrentSettingsPanel() {
     if (customRcDirty) lines.push('Custom rTorrent lines: edited (restart)')
     copyText(lines.join('\n'), 'Change summary')
   }
+  const updateSetting = useCallback((setting: RtorrentSettingDescriptor, value: string | number | boolean, immediate = false) => {
+    const nextValue = setting.value_type === 'int' ? clampSettingValue(setting, Number(value)) : value
+    setDraft(prev => {
+      const next = { ...prev, [setting.key]: nextValue }
+      if (immediate && data?.overlay_writable && !save.isPending) {
+        immediateSaveRef.current = Date.now()
+        window.setTimeout(() => save.mutate({ values: next, customRc }), 0)
+      }
+      return next
+    })
+  }, [customRc, data?.overlay_writable, save])
   const saveNow = useCallback(() => {
     if (!data?.overlay_writable || dirtyCount === 0 || save.isPending) return
     save.mutate({ values: draft, customRc })
@@ -378,6 +390,7 @@ function RtorrentSettingsPanel() {
 
   useEffect(() => {
     if (!data?.overlay_writable || dirtyCount === 0 || save.isPending) return
+    if (Date.now() - immediateSaveRef.current < 700) return
     const timer = window.setTimeout(() => {
       save.mutate({ values: draft, customRc })
     }, 650)
@@ -432,7 +445,7 @@ function RtorrentSettingsPanel() {
             gap: 8,
           }}>
             <SettingStat label="Managed knobs" value={data.settings.length.toLocaleString()} />
-            <SettingStat label="Unsaved edits" value={dirtyCount.toLocaleString()} tone={dirtyCount > 0 ? 'warn' : 'ok'} />
+            <SettingStat label="Pending autosave" value={dirtyCount.toLocaleString()} tone={dirtyCount > 0 ? 'warn' : 'ok'} />
             <SettingStat label="Live unavailable" value={unavailableCount.toLocaleString()} tone={unavailableCount > 0 ? 'warn' : 'ok'} />
             <SettingStat label="Overlay" value={data.overlay_writable ? 'writable' : 'readonly'} tone={data.overlay_writable ? 'ok' : 'warn'} />
             <SettingStat label="Restart support" value={data.restart_supported ? 'available' : 'manual'} tone={data.restart_supported ? 'ok' : 'warn'} />
@@ -685,7 +698,7 @@ function RtorrentSettingsPanel() {
                             setting={setting}
                             value={Boolean(value)}
                             describedBy={descriptionId}
-                            onChange={next => setDraft(prev => ({ ...prev, [setting.key]: next }))}
+                            onChange={next => updateSetting(setting, next, true)}
                           />
                         ) : setting.key === 'dht_mode' ? (
                           <SegmentedSetting
@@ -693,15 +706,15 @@ function RtorrentSettingsPanel() {
                             value={String(value)}
                             options={[['auto', 'Auto'], ['on', 'On'], ['disable', 'Off']]}
                             describedBy={descriptionId}
-                            onChange={next => setDraft(prev => ({ ...prev, [setting.key]: next }))}
+                            onChange={next => updateSetting(setting, next, true)}
                           />
                         ) : (
                         <NumericKnob
                           setting={setting}
                           value={Number(value)}
                           describedBy={descriptionId}
-                          onChange={next => setDraft(prev => ({ ...prev, [setting.key]: clampSettingValue(setting, next) }))}
-                          onPreset={next => setDraft(prev => ({ ...prev, [setting.key]: clampSettingValue(setting, next) }))}
+                          onChange={next => updateSetting(setting, next)}
+                          onPreset={next => updateSetting(setting, next, true)}
                         />
                         )}
                         <div style={readoutGridStyle}>
@@ -718,7 +731,7 @@ function RtorrentSettingsPanel() {
                           <div role="toolbar" aria-label={`${setting.label} actions`} style={{ display: 'flex', gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
                             <button
                               type="button"
-                              onClick={() => setDraft(prev => ({ ...prev, [setting.key]: base }))}
+                              onClick={() => updateSetting(setting, base, true)}
                               disabled={!dirty || save.isPending}
                               style={smallButtonStyle(dirty && !save.isPending)}
                             >
@@ -727,7 +740,7 @@ function RtorrentSettingsPanel() {
                             {saved !== null && (
                               <button
                                 type="button"
-                                onClick={() => setDraft(prev => ({ ...prev, [setting.key]: inputValue(setting.value_type, saved) }))}
+                                onClick={() => updateSetting(setting, inputValue(setting.value_type, saved), true)}
                                 disabled={save.isPending}
                                 style={smallButtonStyle(!save.isPending)}
                               >
@@ -737,7 +750,7 @@ function RtorrentSettingsPanel() {
                             {live !== null && (
                               <button
                                 type="button"
-                                onClick={() => setDraft(prev => ({ ...prev, [setting.key]: inputValue(setting.value_type, live) }))}
+                                onClick={() => updateSetting(setting, inputValue(setting.value_type, live), true)}
                                 disabled={save.isPending}
                                 style={smallButtonStyle(!save.isPending)}
                               >
@@ -746,7 +759,7 @@ function RtorrentSettingsPanel() {
                             )}
                             <button
                               type="button"
-                              onClick={() => setDraft(prev => ({ ...prev, [setting.key]: inputValue(setting.value_type, setting.default_value) }))}
+                              onClick={() => updateSetting(setting, inputValue(setting.value_type, setting.default_value), true)}
                               disabled={save.isPending}
                               style={smallButtonStyle(!save.isPending)}
                             >
@@ -803,6 +816,7 @@ function RtorrentSettingsPanel() {
             <textarea
               value={customRc}
               onChange={e => setCustomRc(e.target.value)}
+              onBlur={saveNow}
               rows={4}
               aria-label="Custom rTorrent configuration lines"
               placeholder="Optional advanced rtorrent.rc overrides imported after managed settings"
