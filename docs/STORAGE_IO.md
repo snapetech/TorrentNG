@@ -81,12 +81,14 @@ class semaphores:
   positioned-I/O worker pool and Linux `io_uring` positioned reads, writes,
   and data sync. `auto` currently selects the conservative `pread` baseline;
   `uring` must be requested explicitly while correctness and hardware
-  benchmarks mature. The uring worker registers file slots and worker-owned
-  fixed buffers when the kernel accepts them. Kernels or containers that reject
-  `io_uring` fall back to `pread` with an explicit diagnostic reason instead
-  of silently changing behavior. This runtime/backend path is currently used
-  for capability metrics and direct backend probes; `MountScheduler` still
-  performs live torrent payload I/O through its own positioned `FileExt` calls.
+  benchmarks mature. Both backend implementations use bounded internal queues
+  and fail closed when saturated. The uring worker registers file slots and
+  worker-owned fixed buffers when the kernel accepts them. Kernels or
+  containers that reject `io_uring` fall back to `pread` with an explicit
+  diagnostic reason instead of silently changing behavior. This
+  runtime/backend path is currently used for capability metrics and direct
+  backend probes; `MountScheduler` still performs live torrent payload I/O
+  through its own positioned `FileExt` calls.
 - `IoClass::PeerRead` uses a small internal readahead cache when configured:
   the backend may read ahead within the same file, but callers receive exactly
   the requested byte range.
@@ -135,9 +137,6 @@ The following items are still implementation targets:
 - Move scheduler read/readahead buffers onto frame-pool leases or an equivalent
   bounded storage-buffer API; the current frame pool backs `StorageRuntime`
   reads, not the primary scheduler read path.
-- Add independent bounded queues to `PreadBackend` and `UringBackend` before
-  they become the scheduler hot path; their internal channels are currently
-  unbounded and rely on caller-side throttling.
 - Expose the remaining `StorageIoConfig` fields through native TOML so
   operators can tune file-pool size, I/O/hash workers, queue depth, durability,
   preallocation, and readahead without code changes.

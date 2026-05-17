@@ -173,7 +173,7 @@ impl StorageRuntime {
             })?;
         match self.backend.pread(file, frame, offset).await {
             Ok(Ok(frame)) => Ok(frame),
-            Ok(Err(e)) => Err(StorageError::io(path.display().to_string(), e)),
+            Ok(Err(e)) => Err(map_backend_io_error(path, e)),
             Err(_) => Err(StorageError::Cancelled),
         }
     }
@@ -190,9 +190,19 @@ impl StorageRuntime {
         let file = self.open_write(path, create)?;
         match self.backend.pwrite(file, data, offset).await {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(StorageError::io(path.display().to_string(), e)),
+            Ok(Err(e)) => Err(map_backend_io_error(path, e)),
             Err(_) => Err(StorageError::Cancelled),
         }
+    }
+}
+
+fn map_backend_io_error(path: &Path, error: std::io::Error) -> StorageError {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        StorageError::QueueFull {
+            mount: "storage-backend".to_string(),
+        }
+    } else {
+        StorageError::io(path.display().to_string(), error)
     }
 }
 
@@ -231,5 +241,17 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, StorageError::FileNotFound { .. }));
+    }
+
+    #[test]
+    fn backend_would_block_maps_to_queue_full() {
+        let err = map_backend_io_error(
+            Path::new("/storage/root/file.bin"),
+            std::io::Error::new(std::io::ErrorKind::WouldBlock, "storage backend queue full"),
+        );
+        assert!(matches!(
+            err,
+            StorageError::QueueFull { ref mount } if mount == "storage-backend"
+        ));
     }
 }

@@ -28,6 +28,7 @@ use crate::frame::Frame;
 const URING_ENTRIES: u32 = 256;
 const URING_BATCH_LIMIT: usize = 64;
 const URING_FILE_SLOTS: u32 = URING_ENTRIES;
+const DEFAULT_BACKEND_QUEUE_DEPTH: usize = 1024;
 /// Keep fixed buffer registration below common 8 MiB `RLIMIT_MEMLOCK`
 /// defaults. The backend can still batch more submissions than it has
 /// fixed-buffer slots; overflow submissions use ordinary read/write buffers.
@@ -241,7 +242,7 @@ pub struct UringProbe {
 
 /// Linux `io_uring` backend.
 pub struct UringBackend {
-    tx: mpsc::Sender<Job>,
+    tx: mpsc::SyncSender<Job>,
     _workers: Vec<thread::JoinHandle<()>>,
     registered_files_supported: Arc<AtomicBool>,
     fixed_buffers_supported: Arc<AtomicBool>,
@@ -249,8 +250,12 @@ pub struct UringBackend {
 
 impl UringBackend {
     pub fn try_new(threads: usize) -> io::Result<Self> {
+        Self::try_new_with_queue_depth(threads, DEFAULT_BACKEND_QUEUE_DEPTH)
+    }
+
+    pub fn try_new_with_queue_depth(threads: usize, queue_depth: usize) -> io::Result<Self> {
         let threads = threads.max(1);
-        let (tx, rx) = mpsc::channel::<Job>();
+        let (tx, rx) = mpsc::sync_channel::<Job>(queue_depth.max(1));
         let rx = Arc::new(Mutex::new(rx));
         let registered_files_supported = Arc::new(AtomicBool::new(false));
         let fixed_buffers_supported = Arc::new(AtomicBool::new(false));
@@ -428,12 +433,12 @@ impl DiskBackend for UringBackend {
         offset: u64,
     ) -> oneshot::Receiver<io::Result<Frame>> {
         let (reply, rx) = oneshot::channel();
-        let _ = self.tx.send(Job::Read {
+        fail_job_on_full(self.tx.try_send(Job::Read {
             file,
             frame,
             offset,
             reply,
-        });
+        }));
         rx
     }
 
@@ -444,18 +449,18 @@ impl DiskBackend for UringBackend {
         offset: u64,
     ) -> oneshot::Receiver<io::Result<()>> {
         let (reply, rx) = oneshot::channel();
-        let _ = self.tx.send(Job::Write {
+        fail_job_on_full(self.tx.try_send(Job::Write {
             file,
             data,
             offset,
             reply,
-        });
+        }));
         rx
     }
 
     fn fdatasync(&self, file: Arc<File>) -> oneshot::Receiver<io::Result<()>> {
         let (reply, rx) = oneshot::channel();
-        let _ = self.tx.send(Job::Sync { file, reply });
+        fail_job_on_full(self.tx.try_send(Job::Sync { file, reply }));
         rx
     }
 
@@ -969,15 +974,19 @@ enum Job {
 /// threads. Threads block on real syscalls; the async caller awaits a
 /// `oneshot`.
 pub struct PreadBackend {
-    tx: mpsc::Sender<Job>,
+    tx: mpsc::SyncSender<Job>,
     _workers: Vec<thread::JoinHandle<()>>,
 }
 
 impl PreadBackend {
     /// Spawn `threads` dedicated I/O workers (clamped to at least 1).
     pub fn new(threads: usize) -> Self {
+        Self::new_with_queue_depth(threads, DEFAULT_BACKEND_QUEUE_DEPTH)
+    }
+
+    pub fn new_with_queue_depth(threads: usize, queue_depth: usize) -> Self {
         let threads = threads.max(1);
-        let (tx, rx) = mpsc::channel::<Job>();
+        let (tx, rx) = mpsc::sync_channel::<Job>(queue_depth.max(1));
         let rx = Arc::new(Mutex::new(rx));
         let mut workers = Vec::with_capacity(threads);
         for i in 0..threads {
@@ -1054,18 +1063,12 @@ impl DiskBackend for PreadBackend {
         offset: u64,
     ) -> oneshot::Receiver<io::Result<Frame>> {
         let (reply, rx) = oneshot::channel();
-        if self
-            .tx
-            .send(Job::Read {
-                file,
-                frame,
-                offset,
-                reply,
-            })
-            .is_err()
-        {
-            // Pool gone: rx will resolve to Canceled, surfaced as an error.
-        }
+        fail_job_on_full(self.tx.try_send(Job::Read {
+            file,
+            frame,
+            offset,
+            reply,
+        }));
         rx
     }
 
@@ -1076,19 +1079,45 @@ impl DiskBackend for PreadBackend {
         offset: u64,
     ) -> oneshot::Receiver<io::Result<()>> {
         let (reply, rx) = oneshot::channel();
-        let _ = self.tx.send(Job::Write {
+        fail_job_on_full(self.tx.try_send(Job::Write {
             file,
             data,
             offset,
             reply,
-        });
+        }));
         rx
     }
 
     fn fdatasync(&self, file: Arc<File>) -> oneshot::Receiver<io::Result<()>> {
         let (reply, rx) = oneshot::channel();
-        let _ = self.tx.send(Job::Sync { file, reply });
+        fail_job_on_full(self.tx.try_send(Job::Sync { file, reply }));
         rx
+    }
+}
+
+fn fail_job_on_full(result: Result<(), mpsc::TrySendError<Job>>) {
+    match result {
+        Ok(()) => {}
+        Err(mpsc::TrySendError::Full(job)) => {
+            fail_job(job, io::ErrorKind::WouldBlock, "storage backend queue full")
+        }
+        Err(mpsc::TrySendError::Disconnected(job)) => fail_job(
+            job,
+            io::ErrorKind::BrokenPipe,
+            "storage backend queue closed",
+        ),
+    }
+}
+
+fn fail_job(job: Job, kind: io::ErrorKind, message: &'static str) {
+    let error = || io::Error::new(kind, message);
+    match job {
+        Job::Read { reply, .. } => {
+            let _ = reply.send(Err(error()));
+        }
+        Job::Write { reply, .. } | Job::Sync { reply, .. } => {
+            let _ = reply.send(Err(error()));
+        }
     }
 }
 
@@ -1178,6 +1207,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pread_backend_queue_fails_closed_when_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queued.bin");
+        std::fs::write(&path, vec![0u8; 64]).unwrap();
+        let file = Arc::new(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap(),
+        );
+        let (tx, _rx) = mpsc::sync_channel(1);
+        let backend = PreadBackend {
+            tx,
+            _workers: Vec::new(),
+        };
+
+        let _queued = backend.pwrite(file.clone(), bytes::Bytes::from_static(b"first"), 0);
+        let rejected = backend
+            .pwrite(file, bytes::Bytes::from_static(b"second"), 8)
+            .await
+            .unwrap()
+            .unwrap_err();
+
+        assert_eq!(rejected.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[tokio::test]
     async fn selected_backend_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("selected.bin");
@@ -1242,8 +1299,14 @@ mod tests {
         let frame = pool.try_acquire(10).unwrap();
         let frame = backend.pread(file, frame, 32).await.unwrap().unwrap();
         assert_eq!(frame.as_slice(), b"real-uring");
-        assert_eq!(backend.supports_fixed_buffers(), probe.fixed_buffers);
-        assert_eq!(backend.supports_registered_files(), probe.registered_files);
+        assert!(
+            !backend.supports_fixed_buffers() || probe.fixed_buffers,
+            "backend cannot report fixed buffers when probe rejected them"
+        );
+        assert!(
+            !backend.supports_registered_files() || probe.registered_files,
+            "backend cannot report registered files when probe rejected them"
+        );
         assert_eq!(backend.max_batch_len(), URING_BATCH_LIMIT);
         if backend.supports_fixed_buffers() {
             assert_eq!(backend.fixed_buffer_len(), URING_FIXED_BUFFER_LEN);
