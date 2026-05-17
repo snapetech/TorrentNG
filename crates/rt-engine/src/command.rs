@@ -79,6 +79,8 @@ pub struct EngineStats {
     pub storage_file_pool_idle_closes: u64,
     pub storage_io_queue_depth: u64,
     pub storage_hash_queue_depth: u64,
+    pub storage_device_queue_capacity: u64,
+    pub storage_device_queue_available: u64,
     pub storage_queued_disk_bytes: u64,
     pub storage_queue_full: u64,
     pub storage_dirty_files: u64,
@@ -282,6 +284,12 @@ impl EngineStats {
         self.storage_hash_queue_depth = self
             .storage_hash_queue_depth
             .saturating_add(storage.hash_queue_depth as u64);
+        self.storage_device_queue_capacity = self
+            .storage_device_queue_capacity
+            .saturating_add(storage.device_queue_capacity as u64);
+        self.storage_device_queue_available = self
+            .storage_device_queue_available
+            .saturating_add(storage.device_queue_available as u64);
         self.storage_queued_disk_bytes = self
             .storage_queued_disk_bytes
             .saturating_add(storage.queued_disk_bytes);
@@ -818,6 +826,8 @@ mod tests {
             },
             io_queue_depth: 4,
             hash_queue_depth: 5,
+            device_queue_capacity: 32,
+            device_queue_available: 31,
             queued_disk_bytes: 123_456,
             queue_full: 31,
             dirty_files: 6,
@@ -913,6 +923,8 @@ mod tests {
         assert_eq!(stats.storage_hash_latency_buckets[3], 4);
         assert_eq!(stats.storage_sync_latency_ns, 300);
         assert_eq!(stats.storage_hash_latency_ns, 400);
+        assert_eq!(stats.storage_device_queue_capacity, 32);
+        assert_eq!(stats.storage_device_queue_available, 31);
         assert_eq!(
             stats.storage_device_latencies,
             vec![StorageDeviceLatencyStats {

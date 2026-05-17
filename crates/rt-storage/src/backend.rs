@@ -625,7 +625,13 @@ impl UringWorker {
                 true
             }
             Err(e) => {
-                tracing::debug!(error = %e, "io_uring fixed-file table unavailable");
+                tracing::debug!(
+                    component = "storage",
+                    operation = "io_uring_register_files",
+                    result = "unavailable",
+                    error = %e,
+                    "io_uring fixed-file table unavailable"
+                );
                 false
             }
         };
@@ -636,7 +642,13 @@ impl UringWorker {
                     Some(fixed)
                 }
                 Err(e) => {
-                    tracing::debug!(error = %e, "io_uring fixed-buffer registration unavailable");
+                    tracing::debug!(
+                        component = "storage",
+                        operation = "io_uring_register_buffers",
+                        result = "unavailable",
+                        error = %e,
+                        "io_uring fixed-buffer registration unavailable"
+                    );
                     None
                 }
             };
@@ -848,7 +860,14 @@ impl UringWorker {
             }
             Ok(_) => None,
             Err(e) => {
-                tracing::debug!(slot, error = %e, "io_uring fixed-file update failed");
+                tracing::debug!(
+                    component = "storage",
+                    operation = "io_uring_update_fixed_file",
+                    slot,
+                    result = "error",
+                    error = %e,
+                    "io_uring fixed-file update failed"
+                );
                 None
             }
         }

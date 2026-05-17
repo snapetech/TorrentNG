@@ -1329,6 +1329,20 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
     );
     metric(
         &mut out,
+        "torrentng_storage_device_queue_capacity",
+        "gauge",
+        "Configured process-level device queue permits across running torrent schedulers",
+        stats.storage_device_queue_capacity,
+    );
+    metric(
+        &mut out,
+        "torrentng_storage_device_queue_available",
+        "gauge",
+        "Currently available process-level device queue permits across running torrent schedulers",
+        stats.storage_device_queue_available,
+    );
+    metric(
+        &mut out,
         "torrentng_storage_queued_disk_bytes",
         "gauge",
         "Estimated process-owned bytes represented by queued disk and hash jobs",
@@ -2590,6 +2604,8 @@ mod tests {
             storage_write_latency_ns: 19,
             storage_sync_latency_ns: 20,
             storage_hash_latency_ns: 21,
+            storage_device_queue_capacity: 62,
+            storage_device_queue_available: 63,
             storage_peer_read_elevator_enabled: 24,
             storage_peer_read_elevator_queue_depth: 25,
             storage_peer_read_elevator_queued: 26,
@@ -2689,6 +2705,8 @@ mod tests {
         assert!(rendered.contains("torrentng_storage_file_pool_hits_total 5"));
         assert!(rendered.contains("torrentng_storage_read_ops_total 6"));
         assert!(rendered.contains("torrentng_storage_hash_ops_total 7"));
+        assert!(rendered.contains("torrentng_storage_device_queue_capacity 62"));
+        assert!(rendered.contains("torrentng_storage_device_queue_available 63"));
         assert!(rendered.contains("torrentng_storage_queued_disk_bytes 54"));
         assert!(rendered.contains("torrentng_storage_queue_full_total 56"));
         assert!(rendered.contains("torrentng_storage_peer_read_cache_hits_total 8"));

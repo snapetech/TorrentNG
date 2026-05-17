@@ -118,7 +118,13 @@ impl<'a> PieceVerifier<'a> {
             }
         };
         if &actual == expected {
-            tracing::debug!(piece, "piece valid");
+            tracing::debug!(
+                component = "storage",
+                operation = "verify_piece",
+                piece,
+                result = "valid",
+                "piece valid"
+            );
             VerifyResult::Valid
         } else {
             tracing::warn!(

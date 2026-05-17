@@ -1192,8 +1192,11 @@ impl TorrentTask {
             return;
         }
         info!(
+            component = "peer",
+            operation = "retry_known_peers",
             torrent = %self.info_hash_hex,
             known_peers = self.known_tracker_peers.len(),
+            result = "scheduled",
             "retrying known peers"
         );
         let peers: Vec<SocketAddr> = self.known_tracker_peers.iter().copied().collect();
@@ -1205,21 +1208,36 @@ impl TorrentTask {
             return;
         }
         if self.meta.webseeds.is_empty() {
-            debug!(torrent = %self.info_hash_hex, "webseed skipped: no webseeds");
+            debug!(
+                component = "webseed",
+                operation = "select_block",
+                torrent = %self.info_hash_hex,
+                reason = "no_webseeds",
+                result = "skipped",
+                "webseed skipped: no webseeds"
+            );
             return;
         }
         if self.meta.files.len() != 1 {
             debug!(
+                component = "webseed",
+                operation = "select_block",
                 torrent = %self.info_hash_hex,
                 files = self.meta.files.len(),
+                reason = "multi_file",
+                result = "skipped",
                 "webseed skipped: multi-file torrent"
             );
             return;
         }
         if !self.active_peers.is_empty() {
             debug!(
+                component = "webseed",
+                operation = "select_block",
                 torrent = %self.info_hash_hex,
                 peers = self.active_peers.len(),
+                reason = "active_peers",
+                result = "skipped",
                 "webseed skipped: active peers available"
             );
             return;
@@ -1227,7 +1245,14 @@ impl TorrentTask {
 
         let Some(req) = self.picker.pick_from_seed() else {
             self.picker.reset_outstanding_requests();
-            debug!(torrent = %self.info_hash_hex, "webseed skipped: no requestable block");
+            debug!(
+                component = "webseed",
+                operation = "select_block",
+                torrent = %self.info_hash_hex,
+                reason = "no_requestable_block",
+                result = "skipped",
+                "webseed skipped: no requestable block"
+            );
             return;
         };
 
@@ -1611,7 +1636,14 @@ impl TorrentTask {
                     }
                     self.remove_piece_assembly(block.piece);
                     self.dirty_pieces_since_barrier.insert(block.piece);
-                    info!(piece = block.piece, torrent = %self.info_hash_hex, "piece complete");
+                    info!(
+                        component = "torrent",
+                        operation = "complete_piece",
+                        torrent = %self.info_hash_hex,
+                        piece = block.piece,
+                        result = "ok",
+                        "piece complete"
+                    );
                     self.send_have_to_peers(block.piece).await;
                     if self.picker.is_complete() {
                         self.persist_progress_throttled(true).await;
@@ -1619,7 +1651,13 @@ impl TorrentTask {
                         self.tracker_event = TrackerEvent::Completed;
                         self.schedule_trackers_now();
                         self.set_state(TorrentState::Seeding).await;
-                        info!(torrent = %self.info_hash_hex, "download complete");
+                        info!(
+                            component = "torrent",
+                            operation = "complete_download",
+                            torrent = %self.info_hash_hex,
+                            result = "ok",
+                            "download complete"
+                        );
                     }
                 }
                 VerifyResult::Invalid => {
@@ -2071,7 +2109,13 @@ impl TorrentTask {
         let mut state = match self.fastresume.load(&self.info_hash_hex) {
             Ok(state) => state,
             Err(rt_fastresume::FastresumeError::NotFound) => {
-                debug!(torrent = %self.info_hash_hex, "no fastresume state");
+                debug!(
+                    component = "fastresume",
+                    operation = "load",
+                    torrent = %self.info_hash_hex,
+                    result = "not_found",
+                    "no fastresume state"
+                );
                 return false;
             }
             Err(e) => {
@@ -2959,7 +3003,15 @@ async fn run_peer_loop(
                     }
                     Message::Have(piece) => {
                         if piece as usize >= upload.have_pieces.len() {
-                            debug!(peer = %addr, piece, "ignoring out-of-range have");
+                            debug!(
+                                component = "peer",
+                                operation = "handle_have",
+                                peer = %addr,
+                                piece,
+                                result = "ignored",
+                                reason = "out_of_range",
+                                "ignoring out-of-range have"
+                            );
                             continue;
                         }
                         if peer_event_tx.send(PeerEvent::Have { peer: addr, piece }).await.is_err() {
@@ -3054,7 +3106,13 @@ async fn run_peer_loop(
                         {
                             break;
                         }
-                        warn!(peer = %addr, "choked");
+                        warn!(
+                            component = "peer",
+                            operation = "handle_choke",
+                            peer = %addr,
+                            result = "choked",
+                            "choked"
+                        );
                     }
                     Message::KeepAlive => {}
                     Message::Extended { ext_id: EXT_HANDSHAKE_ID, payload } => {

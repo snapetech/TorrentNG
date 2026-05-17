@@ -1242,7 +1242,14 @@ impl Engine {
                 "v2_only": self.torrent_chans.get(&info_hash_hex).is_none(),
             }),
         );
-        info!(torrent = %info_hash_hex, paused, "torrent added");
+        info!(
+            component = "engine",
+            operation = "add_torrent",
+            torrent = %info_hash_hex,
+            paused,
+            result = "ok",
+            "torrent added"
+        );
         Ok(info_hash_hex)
     }
 
@@ -1341,7 +1348,14 @@ impl Engine {
                 "v2_only": magnet.info_hash_v1.is_none(),
             }),
         );
-        info!(torrent = %info_hash_hex, paused, "magnet added as metadata pending");
+        info!(
+            component = "engine",
+            operation = "add_magnet",
+            torrent = %info_hash_hex,
+            paused,
+            result = "ok",
+            "magnet added as metadata pending"
+        );
         Ok(info_hash_hex)
     }
 
@@ -1423,7 +1437,13 @@ impl Engine {
                 "v2_only": v2_only,
             }),
         );
-        info!(torrent = %info_hash_hex, "magnet metadata completed");
+        info!(
+            component = "engine",
+            operation = "complete_magnet",
+            torrent = %info_hash_hex,
+            result = "ok",
+            "magnet metadata completed"
+        );
         Ok(())
     }
 
@@ -1725,7 +1745,15 @@ impl Engine {
                     "v2_only": v2_only,
                 }),
             );
-            info!(torrent = %row.info_hash, state = %row.state, paused, "restored persisted torrent");
+            info!(
+                component = "engine",
+                operation = "restore_torrent",
+                torrent = %row.info_hash,
+                state = %row.state,
+                paused,
+                result = "ok",
+                "restored persisted torrent"
+            );
         }
         Ok(())
     }

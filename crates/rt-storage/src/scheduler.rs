@@ -163,6 +163,8 @@ pub struct StorageIoStats {
     pub file_pool: FilePoolStats,
     pub io_queue_depth: usize,
     pub hash_queue_depth: usize,
+    pub device_queue_capacity: usize,
+    pub device_queue_available: usize,
     pub queued_disk_bytes: u64,
     pub queue_full: u64,
     pub dirty_files: usize,
@@ -250,6 +252,8 @@ impl Default for StorageIoStats {
             file_pool: FilePoolStats::default(),
             io_queue_depth: 0,
             hash_queue_depth: 0,
+            device_queue_capacity: 0,
+            device_queue_available: 0,
             queued_disk_bytes: 0,
             queue_full: 0,
             dirty_files: 0,
@@ -554,6 +558,7 @@ pub struct MountScheduler {
     metadata_sem: Arc<Semaphore>,
     queue_sem: Arc<Semaphore>,
     device_queue_sem: Arc<Semaphore>,
+    device_queue_capacity: usize,
     io_config: StorageIoConfig,
     file_pool: Arc<FilePool>,
     io_pool: Arc<BlockingPool>,
@@ -1195,11 +1200,12 @@ impl MountScheduler {
         let device_id = topology
             .as_ref()
             .and_then(|topology| topology.device_id.as_ref().map(|device| device.0.clone()));
+        let device_queue_capacity = config.max_queue.min(io_config.io_queue_depth).max(1);
         let device_queue_sem = device_queue_for(
             storage_root,
             device_id.as_deref(),
             &profile,
-            config.max_queue.min(io_config.io_queue_depth).max(1),
+            device_queue_capacity,
         );
         let counters = Arc::new(StorageCounters::default());
         let peer_read_elevator_enabled =
@@ -1234,6 +1240,7 @@ impl MountScheduler {
             metadata_sem: Arc::new(Semaphore::new(md)),
             queue_sem,
             device_queue_sem,
+            device_queue_capacity,
             file_pool,
             io_pool,
             disk_backend,
@@ -1295,6 +1302,8 @@ impl MountScheduler {
             file_pool: self.file_pool.stats(),
             io_queue_depth: self.io_pool.queued(),
             hash_queue_depth: self.hash_pool.queued(),
+            device_queue_capacity: self.device_queue_capacity,
+            device_queue_available: self.device_queue_sem.available_permits(),
             queued_disk_bytes: self.counters.queued_disk_bytes.load(Ordering::Relaxed),
             queue_full: self.counters.queue_full.load(Ordering::Relaxed),
             dirty_files,
@@ -2586,7 +2595,10 @@ mod tests {
             err,
             StorageError::QueueFull { mount } if mount == "storage-device-shared-device"
         ));
-        assert_eq!(second.stats().queue_full, 1);
+        let stats = second.stats();
+        assert_eq!(stats.queue_full, 1);
+        assert_eq!(stats.device_queue_capacity, 1);
+        assert_eq!(stats.device_queue_available, 0);
     }
 
     #[test]

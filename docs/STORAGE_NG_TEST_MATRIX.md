@@ -65,6 +65,7 @@ per-case syscall counters when `strace` is available.
 | `torrentng_storage_backend_fixed_buffer_strategy{strategy=...}` | `disabled` for `pread`; `worker_copy` for current `uring` fixed buffers; future `frame_pool_slots` only after frame-pool slot leases exist |
 | `torrentng_storage_*_latency_nanoseconds_by_device{device=...,profile=...}` | Storage latency attribution and bounded histograms survive multi-device aggregation |
 | `torrentng_storage_file_pool_*` | fd pool remains bounded and records hit/miss/eviction/idle-close activity |
+| `torrentng_storage_device_queue_{capacity,available}` | process-level per-device queue sharing and available permit pressure are visible across running schedulers |
 | `torrentng_storage_queue_full_total` | bounded storage queues expose backpressure instead of silently accumulating jobs |
 | `torrentng_storage_peer_read_cache_*`, `torrentng_storage_peer_read_elevator_*` | Bounded peer-read readahead cache hit/miss/eviction behavior and HDD peer-read queueing, batching, and coalescing are visible |
 | `torrentng_storage_sparse_*` | recheck reports sparse data extents, skipped holes, and fallback count |
