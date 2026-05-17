@@ -158,15 +158,55 @@ impl Db {
     }
 
     pub fn list_app_events(&self, limit: usize) -> Result<Vec<AppEventRow>> {
+        self.list_app_events_filtered(limit, None, &[])
+    }
+
+    pub fn list_app_events_filtered(
+        &self,
+        limit: usize,
+        kind: Option<&str>,
+        levels: &[&str],
+    ) -> Result<Vec<AppEventRow>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT event_id, occurred_at, level, kind, message, payload
-             FROM app_events
-             ORDER BY event_id DESC
-             LIMIT ?1",
-        )?;
+        let limit = limit.max(1) as i64;
+        let mut sql = "SELECT event_id, occurred_at, level, kind, message, payload
+             FROM app_events"
+            .to_owned();
+        let mut clauses = Vec::new();
+        if kind.is_some() {
+            clauses.push("kind = ?");
+        }
+        let level_placeholders = if levels.is_empty() {
+            String::new()
+        } else {
+            std::iter::repeat("?")
+                .take(levels.len())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let level_clause;
+        if !levels.is_empty() {
+            level_clause = format!("lower(level) IN ({level_placeholders})");
+            clauses.push(&level_clause);
+        }
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+        sql.push_str(" ORDER BY event_id DESC LIMIT ?");
+
+        let mut values: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(kind) = kind {
+            values.push(rusqlite::types::Value::Text(kind.to_owned()));
+        }
+        for level in levels {
+            values.push(rusqlite::types::Value::Text(level.to_ascii_lowercase()));
+        }
+        values.push(rusqlite::types::Value::Integer(limit));
+
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(params![limit.max(1) as i64], |row| {
+            .query_map(rusqlite::params_from_iter(values), |row| {
                 Ok(AppEventRow {
                     event_id: Some(row.get(0)?),
                     occurred_at: row.get(1)?,
@@ -332,5 +372,43 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].message, "event 2");
         assert_eq!(events[1].message, "event 1");
+    }
+
+    #[test]
+    fn app_events_filter_before_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+        db.append_app_event(
+            &AppEventRow {
+                event_id: None,
+                occurred_at: 1,
+                level: "warn".to_owned(),
+                kind: "rtorrent_log".to_owned(),
+                message: "old warning".to_owned(),
+                payload: "{}".to_owned(),
+            },
+            10,
+        )
+        .unwrap();
+        for i in 0..3 {
+            db.append_app_event(
+                &AppEventRow {
+                    event_id: None,
+                    occurred_at: i + 2,
+                    level: "info".to_owned(),
+                    kind: "sync".to_owned(),
+                    message: format!("new info {i}"),
+                    payload: "{}".to_owned(),
+                },
+                10,
+            )
+            .unwrap();
+        }
+
+        let events = db
+            .list_app_events_filtered(1, Some("rtorrent_log"), &["warn"])
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].message, "old warning");
     }
 }

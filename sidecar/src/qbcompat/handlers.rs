@@ -211,7 +211,8 @@ struct QbLogEntry {
 
 async fn log_main(State(s): State<AppState>, Query(q): Query<LogMainQuery>) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(200).clamp(1, 1000);
-    match s.db.list_app_events(limit) {
+    let levels = q.included_levels();
+    match s.db.list_app_events_filtered(limit, None, &levels) {
         Ok(events) => (
             StatusCode::OK,
             Json(
@@ -230,6 +231,30 @@ async fn log_main(State(s): State<AppState>, Query(q): Query<LogMainQuery>) -> i
 }
 
 impl LogMainQuery {
+    fn included_levels(&self) -> Vec<&'static str> {
+        let any_filter = self.normal.is_some()
+            || self.info.is_some()
+            || self.warning.is_some()
+            || self.critical.is_some();
+        if !any_filter {
+            return Vec::new();
+        }
+
+        let mut levels = Vec::new();
+        if self.normal.unwrap_or(false) || self.info.unwrap_or(false) {
+            levels.push("info");
+        }
+        if self.warning.unwrap_or(false) {
+            levels.push("warn");
+            levels.push("warning");
+        }
+        if self.critical.unwrap_or(false) {
+            levels.push("error");
+            levels.push("critical");
+        }
+        levels
+    }
+
     fn includes_type(&self, kind: i64) -> bool {
         let any_filter = self.normal.is_some()
             || self.info.is_some()
@@ -697,7 +722,12 @@ async fn torrents_add(State(s): State<AppState>, mut multipart: Multipart) -> im
             _ => {
                 if let Some(name) = name {
                     let _ = field.text().await;
-                    tracing::debug!("qb add ignored field {name}");
+                    tracing::debug!(
+                        component = "qbcompat",
+                        operation = "add_torrent",
+                        field = %name,
+                        "ignored qBit add field"
+                    );
                 }
             }
         }
@@ -734,7 +764,12 @@ async fn torrents_add(State(s): State<AppState>, mut multipart: Multipart) -> im
             return (StatusCode::BAD_REQUEST, "Fails.").into_response();
         }
         if let Err(e) = s.rt.load_torrent(&data, &save_path, &category, start).await {
-            tracing::error!("qb add torrent: {e}");
+            tracing::error!(
+                component = "qbcompat",
+                operation = "add_torrent",
+                error = %e,
+                "qb add torrent failed"
+            );
             return "Fails.".into_response();
         }
         return "Ok.".into_response();
@@ -771,7 +806,13 @@ async fn bulk_action(s: &AppState, hashes_str: &Option<String>, action: &str) ->
             _ => Ok(()),
         };
         if let Err(e) = res {
-            tracing::warn!("qb {action} {hash}: {e}");
+            tracing::warn!(
+                component = "qbcompat",
+                operation = %action,
+                torrent = %hash,
+                error = %e,
+                "qBit torrent action failed"
+            );
         }
     }
     StatusCode::OK
@@ -788,11 +829,24 @@ async fn torrents_delete(State(s): State<AppState>, Form(f): Form<DeleteForm>) -
     let delete_files = f.delete_files.as_deref() == Some("true");
     for hash in split_hashes(&s.db, f.hashes.as_deref()) {
         if let Err(e) = s.rt.remove(&hash, delete_files).await {
-            tracing::warn!("qb delete {hash}: {e}");
+            tracing::warn!(
+                component = "qbcompat",
+                operation = "delete_torrent",
+                torrent = %hash,
+                delete_files,
+                error = %e,
+                "qBit delete failed"
+            );
             continue;
         }
         if let Err(e) = s.db.delete(&hash) {
-            tracing::warn!("qb delete cache {hash}: {e}");
+            tracing::warn!(
+                component = "cache",
+                operation = "delete_torrent",
+                torrent = %hash,
+                error = %e,
+                "cache delete failed after qBit delete"
+            );
         } else {
             emit(&s, Event::TorrentRemoved { hash: hash.clone() });
             emit(&s, Event::TrackerHealthUpdated);
@@ -930,13 +984,27 @@ async fn torrents_set_category(
     let category = f.category.as_deref().unwrap_or("");
     for hash in split_hashes(&s.db, f.hashes.as_deref()) {
         if let Err(e) = s.db.set_torrent_category(&hash, category) {
-            tracing::warn!("qb setCategory db {hash}: {e}");
+            tracing::warn!(
+                component = "cache",
+                operation = "set_category",
+                torrent = %hash,
+                category = %category,
+                error = %e,
+                "cache category update failed"
+            );
         } else {
             emit_torrent_updated(&s, &hash);
             emit(&s, Event::CategoriesUpdated);
         }
         if let Err(e) = s.rt.set_category(&hash, category).await {
-            tracing::warn!("qb setCategory rt {hash}: {e}");
+            tracing::warn!(
+                component = "rtorrent",
+                operation = "set_category",
+                torrent = %hash,
+                category = %category,
+                error = %e,
+                "rTorrent category update failed"
+            );
         }
     }
     StatusCode::OK
@@ -960,7 +1028,14 @@ async fn torrents_add_tags(State(s): State<AppState>, Form(f): Form<TagsForm>) -
     for hash in split_hashes(&s.db, f.hashes.as_deref()) {
         for tag in &tag_list {
             if let Err(e) = s.db.add_torrent_tag(&hash, tag) {
-                tracing::warn!("qb addTags {hash} {tag}: {e}");
+                tracing::warn!(
+                    component = "cache",
+                    operation = "add_tag",
+                    torrent = %hash,
+                    tag = %tag,
+                    error = %e,
+                    "cache tag add failed"
+                );
             } else {
                 emit_torrent_updated(&s, &hash);
                 emit(&s, Event::TagsUpdated);
@@ -982,7 +1057,14 @@ async fn torrents_remove_tags(State(s): State<AppState>, Form(f): Form<TagsForm>
     for hash in split_hashes(&s.db, f.hashes.as_deref()) {
         for tag in &tag_list {
             if let Err(e) = s.db.remove_torrent_tag(&hash, tag) {
-                tracing::warn!("qb removeTags {hash} {tag}: {e}");
+                tracing::warn!(
+                    component = "cache",
+                    operation = "remove_tag",
+                    torrent = %hash,
+                    tag = %tag,
+                    error = %e,
+                    "cache tag removal failed"
+                );
             } else {
                 emit_torrent_updated(&s, &hash);
                 emit(&s, Event::TagsUpdated);
@@ -1003,7 +1085,13 @@ async fn torrents_set_tags(State(s): State<AppState>, Form(f): Form<TagsForm>) -
         .collect();
     for hash in split_hashes(&s.db, f.hashes.as_deref()) {
         if let Err(e) = s.db.set_torrent_tags(&hash, &tag_list) {
-            tracing::warn!("qb setTags {hash}: {e}");
+            tracing::warn!(
+                component = "cache",
+                operation = "set_tags",
+                torrent = %hash,
+                error = %e,
+                "cache tag replace failed"
+            );
         } else {
             emit_torrent_updated(&s, &hash);
             emit(&s, Event::TagsUpdated);
@@ -1254,7 +1342,15 @@ async fn torrents_edit_tracker(
         return StatusCode::BAD_REQUEST;
     };
     if let Err(e) = s.rt.edit_tracker(&hash, &orig_url, &new_url).await {
-        tracing::warn!("qb editTracker {hash}: {e}");
+        tracing::warn!(
+            component = "qbcompat",
+            operation = "edit_tracker",
+            torrent = %hash,
+            tracker = %redact_log_url(&orig_url),
+            new_tracker = %redact_log_url(&new_url),
+            error = %e,
+            "qBit tracker edit failed"
+        );
     }
     StatusCode::OK
 }
@@ -1273,7 +1369,13 @@ async fn torrents_rename(State(s): State<AppState>, Form(f): Form<RenameForm>) -
         return StatusCode::BAD_REQUEST;
     };
     if let Err(e) = s.rt.rename_torrent(&hash, &name).await {
-        tracing::warn!("qb rename {hash}: {e}");
+        tracing::warn!(
+            component = "qbcompat",
+            operation = "rename_torrent",
+            torrent = %hash,
+            error = %e,
+            "qBit torrent rename failed"
+        );
     }
     StatusCode::OK
 }
@@ -1299,7 +1401,14 @@ async fn torrents_rename_file(
         return StatusCode::BAD_REQUEST;
     };
     if let Err(e) = s.rt.rename_file(&hash, id, &name).await {
-        tracing::warn!("qb renameFile {hash}[{id}]: {e}");
+        tracing::warn!(
+            component = "qbcompat",
+            operation = "rename_file",
+            torrent = %hash,
+            file_index = id,
+            error = %e,
+            "qBit file rename failed"
+        );
     }
     StatusCode::OK
 }
@@ -1327,7 +1436,13 @@ async fn torrents_set_share_limits(
             s.rt.set_share_limits(&hash, ratio_limit_milli, seeding_time_limit)
                 .await
         {
-            tracing::warn!("qb setShareLimits {hash}: {e}");
+            tracing::warn!(
+                component = "qbcompat",
+                operation = "set_share_limits",
+                torrent = %hash,
+                error = %e,
+                "qBit share limit update failed"
+            );
         }
     }
     StatusCode::OK
@@ -1353,16 +1468,34 @@ async fn torrents_set_location(
         match s.db.exists(&hash) {
             Ok(true) => {
                 if let Err(e) = s.db.set_torrent_location(&hash, location) {
-                    tracing::warn!("qb setLocation cache {hash}: {e}");
+                    tracing::warn!(
+                        component = "cache",
+                        operation = "set_location",
+                        torrent = %hash,
+                        error = %e,
+                        "cache location update failed"
+                    );
                 } else {
                     emit_torrent_updated(&s, &hash);
                 }
             }
             Ok(false) => {}
-            Err(e) => tracing::warn!("qb setLocation exists {hash}: {e}"),
+            Err(e) => tracing::warn!(
+                component = "cache",
+                operation = "exists",
+                torrent = %hash,
+                error = %e,
+                "cache torrent existence check failed"
+            ),
         }
         if let Err(e) = s.rt.set_location(&hash, location).await {
-            tracing::warn!("qb setLocation {hash}: {e}");
+            tracing::warn!(
+                component = "rtorrent",
+                operation = "set_location",
+                torrent = %hash,
+                error = %e,
+                "rTorrent location update failed"
+            );
         }
     }
     StatusCode::OK
@@ -1672,7 +1805,12 @@ fn split_hashes(db: &crate::cache::Db, s: Option<&str>) -> Vec<String> {
         Some(s) if s.trim() == "all" => match db.all_hashes() {
             Ok(hashes) => hashes.into_iter().collect(),
             Err(e) => {
-                tracing::warn!("qb resolve hashes=all: {e}");
+                tracing::warn!(
+                    component = "qbcompat",
+                    operation = "resolve_hashes",
+                    error = %e,
+                    "failed to resolve hashes=all"
+                );
                 vec![]
             }
         },

@@ -105,25 +105,16 @@ pub async fn list_logs(
     Query(query): Query<LogsQuery>,
 ) -> impl IntoResponse {
     let limit = query.limit.unwrap_or(200).clamp(1, 1000);
-    match s.db.list_app_events(limit) {
+    let levels = query
+        .level
+        .as_deref()
+        .map(|level| vec![level])
+        .unwrap_or_default();
+    match s
+        .db
+        .list_app_events_filtered(limit, query.kind.as_deref(), &levels)
+    {
         Ok(events) => {
-            let events = events
-                .into_iter()
-                .filter(|event| {
-                    query
-                        .kind
-                        .as_ref()
-                        .map(|kind| event.kind == *kind)
-                        .unwrap_or(true)
-                })
-                .filter(|event| {
-                    query
-                        .level
-                        .as_ref()
-                        .map(|level| event.level.eq_ignore_ascii_case(level))
-                        .unwrap_or(true)
-                })
-                .collect::<Vec<_>>();
             Json(serde_json::json!({ "logs": events })).into_response()
         }
         Err(e) => {
@@ -1811,14 +1802,26 @@ pub async fn delete_torrent(
     match s.rt.remove(&hash, delete_files).await {
         Ok(_) => {
             if let Err(e) = s.db.delete(&hash) {
-                tracing::warn!("cache delete {hash}: {e}");
+                tracing::warn!(
+                    component = "cache",
+                    operation = "delete_torrent",
+                    torrent = %hash,
+                    error = %e,
+                    "cache delete failed after native delete"
+                );
             }
             emit(&s, Event::TorrentRemoved { hash });
             emit(&s, Event::TrackerHealthUpdated);
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => {
-            tracing::error!("delete {hash}: {e}");
+            tracing::error!(
+                component = "api",
+                operation = "delete_torrent",
+                torrent = %hash,
+                error = %e,
+                "native delete failed"
+            );
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1833,7 +1836,7 @@ pub async fn torrent_start(
     match s.rt.start(&hash).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
-            tracing::error!("start {hash}: {e}");
+            tracing::error!(component = "api", operation = "start", torrent = %hash, error = %e, "native start failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1845,7 +1848,7 @@ pub async fn torrent_stop(
     match s.rt.stop(&hash).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
-            tracing::error!("stop {hash}: {e}");
+            tracing::error!(component = "api", operation = "stop", torrent = %hash, error = %e, "native stop failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1857,7 +1860,7 @@ pub async fn torrent_recheck(
     match s.rt.recheck(&hash).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
-            tracing::error!("recheck {hash}: {e}");
+            tracing::error!(component = "api", operation = "recheck", torrent = %hash, error = %e, "native recheck failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1869,7 +1872,7 @@ pub async fn torrent_reannounce(
     match s.rt.reannounce(&hash).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
-            tracing::error!("reannounce {hash}: {e}");
+            tracing::error!(component = "api", operation = "reannounce", torrent = %hash, error = %e, "native reannounce failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1988,7 +1991,7 @@ pub async fn torrent_files(
     match s.rt.list_files(&hash).await {
         Ok(files) => Json(serde_json::json!({ "files": files })).into_response(),
         Err(e) => {
-            tracing::error!("list files {hash}: {e}");
+            tracing::error!(component = "api", operation = "list_files", torrent = %hash, error = %e, "native file listing failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -2020,7 +2023,15 @@ pub async fn set_file_priorities(
             s.rt.set_file_priority(&hash, item.index, item.priority)
                 .await
         {
-            tracing::warn!("set file priority {hash}[{}]: {e}", item.index);
+            tracing::warn!(
+                component = "api",
+                operation = "set_file_priority",
+                torrent = %hash,
+                file_index = item.index,
+                priority = item.priority,
+                error = %e,
+                "native file priority update failed"
+            );
             failures.push(format!("{}: {e}", item.index));
         }
     }
@@ -2089,7 +2100,7 @@ pub async fn delete_category(
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => {
-            tracing::error!("delete category {name}: {e}");
+            tracing::error!(component = "api", operation = "delete_category", category = %name, error = %e, "category delete failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -2137,7 +2148,7 @@ pub async fn delete_tag(State(s): State<AppState>, Path(name): Path<String>) -> 
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => {
-            tracing::error!("delete tag {name}: {e}");
+            tracing::error!(component = "api", operation = "delete_tag", tag = %name, error = %e, "tag delete failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -2159,18 +2170,18 @@ pub async fn set_torrent_category(
         Ok(true) => {}
         Ok(false) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
-            tracing::error!("db exists {hash}: {e}");
+            tracing::error!(component = "cache", operation = "exists", torrent = %hash, error = %e, "cache torrent existence check failed");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     }
 
     // Persist to DB and push to rTorrent (d.custom1 = category name)
     if let Err(e) = s.db.set_torrent_category(&hash, &body.category) {
-        tracing::error!("db set category {hash}: {e}");
+        tracing::error!(component = "cache", operation = "set_category", torrent = %hash, category = %body.category, error = %e, "cache category update failed");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     if let Err(e) = s.rt.set_category(&hash, &body.category).await {
-        tracing::warn!("rt set category {hash}: {e}");
+        tracing::warn!(component = "rtorrent", operation = "set_category", torrent = %hash, category = %body.category, error = %e, "rTorrent category update failed");
     }
     emit_torrent_updated(&s, &hash);
     emit(&s, Event::CategoriesUpdated);
@@ -2196,14 +2207,14 @@ pub async fn add_torrent_tags(
         Ok(true) => {}
         Ok(false) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
-            tracing::error!("db exists {hash}: {e}");
+            tracing::error!(component = "cache", operation = "exists", torrent = %hash, error = %e, "cache torrent existence check failed");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     }
 
     for tag in &tags {
         if let Err(e) = s.db.add_torrent_tag(&hash, tag) {
-            tracing::error!("add tag {tag} to {hash}: {e}");
+            tracing::error!(component = "cache", operation = "add_tag", torrent = %hash, tag = %tag, error = %e, "cache tag add failed");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     }
@@ -2226,14 +2237,14 @@ pub async fn remove_torrent_tags(
         Ok(true) => {}
         Ok(false) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
-            tracing::error!("db exists {hash}: {e}");
+            tracing::error!(component = "cache", operation = "exists", torrent = %hash, error = %e, "cache torrent existence check failed");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     }
 
     for tag in &tags {
         if let Err(e) = s.db.remove_torrent_tag(&hash, tag) {
-            tracing::error!("remove tag {tag} from {hash}: {e}");
+            tracing::error!(component = "cache", operation = "remove_tag", torrent = %hash, tag = %tag, error = %e, "cache tag removal failed");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     }
