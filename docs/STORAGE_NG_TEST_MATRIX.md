@@ -33,7 +33,7 @@ per-case syscall counters when `strace` is available.
 | --- | --- | --- |
 | Formatting | Workspace Rust formatting | `cargo fmt --check` |
 | Storage core | fd pool, positioned I/O, preallocation, durability, page-cache advice, sparse recheck, readahead, topology, elevator policy | `cargo test -p rt-storage` |
-| Backend selection | `auto`/`pread`/`uring` parsing, `io_uring` probe fallback diagnostics, selected-backend read/write roundtrip | `cargo test -p rt-storage backend::tests` |
+| Backend selection | `auto`/`pread`/`uring` parsing, `io_uring` probe and worker-start fallback diagnostics, selected-backend read/write roundtrip | `cargo test -p rt-storage backend::tests` |
 | Resource governor | total and per-class memory caps, pressure transitions, denied allocation counters, lease release | `cargo test -p rt-metrics resource::tests` |
 | Scale proxies | bounded crash recheck, storage fd cap, peer-read locality, hash-pool isolation, RAM verify path, sparse recheck extents | `cargo test -p rt-metrics storage_ -- --nocapture` |
 | Configuration | default storage elevator, memory caps, runtime tier switch, TOML partial parsing | `cargo test -p rt-config` |

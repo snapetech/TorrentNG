@@ -50,6 +50,8 @@ Implemented and covered by automated tests:
 - Real-device storage reports include explicit `pread` and forced `uring`
   backend roundtrips with selected backend, fallback reason, registered-file
   support, fixed-buffer support, batch length, and fixed-buffer length.
+- Forced `io_uring` selection falls back to `pread` with a diagnostic if worker
+  startup cannot create the ring on the host/container.
 - Current real-device storage evidence includes local NVMe/SSD and the kspls0
   HDD-backed LVM media pool. The LVM report passes the required 5x wall-clock
   target at 8192 blocks and collapses backend reads from 8192 to 1.
