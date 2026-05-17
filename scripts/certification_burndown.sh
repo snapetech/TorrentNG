@@ -21,6 +21,8 @@ nonclean_rows() {
       gsub(/^[[:space:]]+|[[:space:]]+$/, "", report);
       if (name == "Certification burndown") next;
       if (name == "Release readiness") next;
+      if (name == "Certification bundle") next;
+      if (name == "Release evidence suite") next;
       if (status != "PASS" && status != "INFO") {
         print name "\t" status "\t" report;
       }

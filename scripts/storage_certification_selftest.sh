@@ -243,5 +243,6 @@ grep -q '| qbittorrent | PASS | 1 |' "$report_dir/migration-corpus-inventory-sel
 grep -q 'sample.fastresume' "$report_dir/migration-corpus-inventory-selftest.md"
 grep -q 'Overall status: PASS_WITH_GAPS' "$report_dir/migration-corpus-inventory-selftest.md"
 "$ROOT/scripts/certification_bundle_selftest.sh" >/dev/null
+"$ROOT/scripts/certification_policy_selftest.sh" >/dev/null
 
 echo "storage certification self-test: PASS"

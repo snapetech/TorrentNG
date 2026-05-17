@@ -103,6 +103,10 @@ release-blocking command, run:
 scripts/release_evidence_suite.sh
 ```
 
+The burndown/readiness/post-soak policy intentionally ignores meta-report rows
+such as certification bundle, burndown, readiness, and the evidence suite itself
+when deciding whether product evidence is clean.
+
 ## Evidence Bundle
 
 Package the latest status and referenced reports:
