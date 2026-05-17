@@ -3044,7 +3044,7 @@ mod tests {
 
     #[tokio::test]
     async fn qbit_alias_and_broad_compat_routes_are_registered() {
-        let app = build_qbit_router(AppState::new());
+        let app = build_qbit_router(make_state_with(&"a".repeat(40)).await);
         for (method, path, body) in qbit_route_matrix() {
             let resp = app
                 .clone()
@@ -3085,7 +3085,7 @@ mod tests {
             ("POST", "/api/qb/v2/torrents/resume", "hashes=all"),
             ("POST", "/api/qb/v2/torrents/start", "hashes=all"),
             ("POST", "/api/qb/v2/torrents/stop", "hashes=all"),
-            ("POST", "/api/qb/v2/torrents/delete", "hashes=all"),
+            ("POST", "/api/qb/v2/torrents/delete", ""),
             ("POST", "/api/qb/v2/torrents/reannounce", "hashes=all"),
             ("POST", "/api/qb/v2/torrents/recheck", "hashes=all"),
             ("GET", "/api/qb/v2/torrents/trackers", ""),
@@ -3122,7 +3122,11 @@ mod tests {
             ("GET", "/api/qb/v2/torrents/properties", ""),
             ("GET", "/api/qb/v2/torrents/categories", ""),
             ("GET", "/api/qb/v2/torrents/tags", ""),
-            ("POST", "/api/qb/v2/torrents/rename", "hash=a&name=b"),
+            (
+                "POST",
+                "/api/qb/v2/torrents/rename",
+                "hash=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&name=b",
+            ),
             (
                 "POST",
                 "/api/qb/v2/torrents/renameFile",

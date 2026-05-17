@@ -107,13 +107,13 @@ async fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Va
         "core.get_upload_rate" => Ok(json!(0.0)),
         "core.get_filter_tree" => filter_tree(state).await,
         "core.get_session_state" => session_state(state).await,
-        "core.get_torrents_status" => torrents_status(state).await,
+        "core.get_torrents_status" => torrents_status(state, params).await,
         "core.get_torrent_status" => {
             let hash = params
                 .first()
                 .and_then(Value::as_str)
                 .ok_or_else(|| "missing torrent id".to_owned())?;
-            torrent_status(state, hash).await
+            torrent_status(state, hash, params.get(1)).await
         }
         "core.pause_torrent" => {
             for hash in string_list(params.first()) {
@@ -581,7 +581,8 @@ async fn set_label(state: &AppState, hash: &str, label: &str) -> Result<(), Stri
     Ok(())
 }
 
-async fn torrents_status(state: &AppState) -> Result<Value, String> {
+async fn torrents_status(state: &AppState, params: &[Value]) -> Result<Value, String> {
+    let wanted_fields = deluge_requested_fields(params.get(1));
     let entries = {
         let reg = state.registry.read().await;
         reg.iter().cloned().collect::<Vec<_>>()
@@ -599,14 +600,21 @@ async fn torrents_status(state: &AppState) -> Result<Value, String> {
         .map(|entry| {
             (
                 entry.info_hash.clone(),
-                deluge_torrent(entry, metadata.get(&entry.info_hash)),
+                filter_deluge_torrent_fields(
+                    deluge_torrent(entry, metadata.get(&entry.info_hash)),
+                    &wanted_fields,
+                ),
             )
         })
         .collect::<serde_json::Map<_, _>>();
     Ok(Value::Object(torrents))
 }
 
-async fn torrent_status(state: &AppState, hash: &str) -> Result<Value, String> {
+async fn torrent_status(
+    state: &AppState,
+    hash: &str,
+    fields: Option<&Value>,
+) -> Result<Value, String> {
     let entry = {
         let reg = state.registry.read().await;
         reg.get(hash)
@@ -618,7 +626,43 @@ async fn torrent_status(state: &AppState, hash: &str) -> Result<Value, String> {
     } else {
         None
     };
-    Ok(deluge_torrent(&entry, meta.as_ref()))
+    let wanted_fields = deluge_requested_fields(fields);
+    Ok(filter_deluge_torrent_fields(
+        deluge_torrent(&entry, meta.as_ref()),
+        &wanted_fields,
+    ))
+}
+
+fn deluge_requested_fields(value: Option<&Value>) -> Option<std::collections::BTreeSet<String>> {
+    let fields = value?.as_array()?;
+    if fields.is_empty() {
+        return None;
+    }
+    Some(
+        fields
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
+fn filter_deluge_torrent_fields(
+    torrent: Value,
+    fields: &Option<std::collections::BTreeSet<String>>,
+) -> Value {
+    let Some(fields) = fields else {
+        return torrent;
+    };
+    let Some(obj) = torrent.as_object() else {
+        return torrent;
+    };
+    Value::Object(
+        fields
+            .iter()
+            .filter_map(|field| obj.get(field).cloned().map(|value| (field.clone(), value)))
+            .collect(),
+    )
 }
 
 async fn torrent_files(state: &AppState, hash: &str) -> Result<Value, String> {
@@ -1302,6 +1346,59 @@ mod tests {
                 "message",
             ],
         );
+    }
+
+    #[tokio::test]
+    async fn deluge_torrent_status_honors_requested_fields() {
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        {
+            let mut reg = registry.write().await;
+            let mut entry = TorrentEntry::new("a".repeat(40), "alpha".into(), "/data".into());
+            entry.total_length = 100;
+            entry.amount_left = 25;
+            reg.add(entry).unwrap();
+        }
+        let app = build_deluge_router(AppState::new(registry));
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/json")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"id":1,"method":"core.get_torrent_status","params":["{}",["name","progress"]]}}"#,
+                        "a".repeat(40)
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["result"]["name"], "alpha");
+        assert_eq!(body["result"]["progress"], 75.0);
+        assert_eq!(body["result"].as_object().unwrap().len(), 2);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/json")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"id":1,"method":"core.get_torrents_status","params":[{},["name","state"]]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        let torrent = &body["result"]["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"];
+        assert_eq!(torrent["name"], "alpha");
+        assert_eq!(torrent["state"], "Queued");
+        assert_eq!(torrent.as_object().unwrap().len(), 2);
     }
 
     fn assert_json_keys(value: &Value, keys: &[&str]) {

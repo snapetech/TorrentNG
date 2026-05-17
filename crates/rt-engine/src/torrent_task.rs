@@ -1305,17 +1305,6 @@ impl TorrentTask {
 
     async fn handle_block(&mut self, block: BlockEvent) {
         let piece = block.piece;
-        if let Err(e) = self.write_block(&block).await {
-            warn!(
-                torrent = %self.info_hash_hex,
-                piece,
-                offset = block.offset,
-                err = %e,
-                "block write failed"
-            );
-            return;
-        }
-        self.record_download(block.data.len() as u64).await;
         if let Err(e) = self.record_piece_block(&block) {
             warn!(
                 torrent = %self.info_hash_hex,
@@ -1325,7 +1314,21 @@ impl TorrentTask {
                 "failed to assemble in-memory piece for verification"
             );
             self.piece_assemblies.remove(&piece);
+            self.picker.reject_piece(piece as usize);
+            return;
         }
+        if let Err(e) = self.write_block(&block).await {
+            warn!(
+                torrent = %self.info_hash_hex,
+                piece,
+                offset = block.offset,
+                err = %e,
+                "block write failed"
+            );
+            self.piece_assemblies.remove(&piece);
+            return;
+        }
+        self.record_download(block.data.len() as u64).await;
 
         let complete = self
             .picker
