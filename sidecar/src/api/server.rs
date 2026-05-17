@@ -1,5 +1,6 @@
 use axum::{
     body::Body,
+    extract::MatchedPath,
     http::{header, Request},
     middleware,
     response::Response,
@@ -170,6 +171,10 @@ async fn request_log(req: Request<Body>, next: middleware::Next) -> Response {
     if skip_request_log(&path) {
         return next.run(req).await;
     }
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|matched| matched.as_str().to_owned());
     let request_id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     let started = Instant::now();
     let response = next.run(req).await;
@@ -186,6 +191,7 @@ async fn request_log(req: Request<Body>, next: middleware::Next) -> Response {
         request_id,
         method = %method,
         path = %path,
+        route = route.as_deref(),
         status = status.as_u16(),
         duration_ms,
         response_size,

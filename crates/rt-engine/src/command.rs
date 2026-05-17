@@ -766,6 +766,8 @@ pub enum EngineCmd {
     /// Read recent durable session events for API log projection.
     ListSessionEvents {
         info_hash: Option<String>,
+        kind: Option<String>,
+        levels: Vec<String>,
         limit: usize,
         reply: oneshot::Sender<CmdResult<Vec<rt_db::SessionEventRow>>>,
     },

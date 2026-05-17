@@ -21,8 +21,22 @@ async fn main() -> Result<()> {
     let legacy_filter = if cfg.debug { "debug" } else { "info" };
     rt_logging::init(&cfg.logging, Some(legacy_filter));
 
-    info!("TorrentNG starting");
-    info!(user_agent = %cfg.rtorrent.user_agent, "config loaded");
+    info!(
+        component = "sidecar",
+        operation = "startup",
+        version = env!("CARGO_PKG_VERSION"),
+        "TorrentNG sidecar starting"
+    );
+    info!(
+        component = "config",
+        operation = "load",
+        user_agent = %cfg.rtorrent.user_agent,
+        log_format = ?cfg.logging.format,
+        log_profile = ?cfg.logging.profile,
+        event_retention = cfg.logging.event_retention,
+        rtorrent_log_ingest = cfg.rtorrent.logs.enabled,
+        "config loaded"
+    );
 
     let rt = Arc::new(Client::new(&cfg.rtorrent).context("create rtorrent client")?);
 
@@ -103,7 +117,7 @@ async fn main() -> Result<()> {
         .parse()
         .with_context(|| format!("parse listen_addr {}", cfg.listen_addr))?;
 
-    info!(%addr, "listening");
+    info!(component = "http", operation = "listen", %addr, "listening");
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
@@ -113,7 +127,12 @@ async fn main() -> Result<()> {
         .await
         .context("http server")?;
 
-    info!("shutdown complete");
+    info!(
+        component = "sidecar",
+        operation = "shutdown",
+        result = "ok",
+        "shutdown complete"
+    );
     Ok(())
 }
 

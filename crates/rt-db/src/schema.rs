@@ -226,6 +226,23 @@ const MIGRATIONS: &[(u32, &str)] = &[
         ALTER TABLE torrent_limits ADD COLUMN auto_management INTEGER NOT NULL DEFAULT 0;
         ",
     ),
+    (
+        4,
+        "
+        PRAGMA foreign_keys = ON;
+
+        ALTER TABLE session_events ADD COLUMN level TEXT NOT NULL DEFAULT 'info';
+
+        UPDATE session_events
+        SET level = CASE
+            WHEN lower(kind) LIKE '%error%' OR lower(kind) LIKE '%failed%' THEN 'error'
+            WHEN lower(kind) LIKE '%warn%' THEN 'warn'
+            ELSE 'info'
+        END;
+
+        CREATE INDEX IF NOT EXISTS idx_session_events_level ON session_events(level);
+        ",
+    ),
 ];
 
 #[cfg(test)]
@@ -259,7 +276,7 @@ mod tests {
         let v: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 3);
+        assert_eq!(v, 4);
     }
 
     #[test]
@@ -302,5 +319,27 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 1, "{table}");
         }
+    }
+
+    #[test]
+    fn migrate_adds_session_event_level_index() {
+        let conn = open_mem();
+        migrate(&conn).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('session_events') WHERE name = 'level'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        let index_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name = 'idx_session_events_level'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 1);
     }
 }

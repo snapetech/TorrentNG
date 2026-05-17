@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { api, type EngineDiagnostics, type ProbeValue } from '../api/client'
+import { api, type EngineDiagnostics, type ProbeValue, type RtorrentSettingDescriptor } from '../api/client'
 
 export function EnginePanel() {
   const { data, isLoading, isFetching, error, refetch } = useQuery({
@@ -246,59 +246,100 @@ function RtorrentSettingsPanel() {
     onError: e => setNotice({ tone: 'error', text: String(e) }),
   })
 
+  const dirtyCount = data?.settings.filter(setting => {
+    const row = data.values.find(value => value.key === setting.key)
+    return !sameSettingValue(draft[setting.key], baselineValue(setting, row?.saved ?? null, row?.live.value ?? null))
+  }).length ?? 0
+  const resetAll = () => {
+    if (!data) return
+    const next: Record<string, string | number | boolean> = {}
+    for (const setting of data.settings) {
+      const row = data.values.find(value => value.key === setting.key)
+      next[setting.key] = baselineValue(setting, row?.saved ?? null, row?.live.value ?? null)
+    }
+    setDraft(next)
+    setCustomRc(data.custom_rc)
+    setNotice(null)
+  }
+
   return (
     <Panel wide>
-      <Subhead>rTorrent Limits</Subhead>
+      <Subhead>Settings Control Panel</Subhead>
       {isLoading && <span className="tng-skeleton" style={{ width: '70%', height: 12 }} />}
       {error && <InlineNotice>rTorrent settings unavailable</InlineNotice>}
       {data && (
         <div style={{ display: 'grid', gap: 10 }}>
-          <div style={{ color: 'var(--faint)', fontSize: 12 }}>
-            Saved to <span style={{ color: 'var(--muted)', fontFamily: 'monospace' }}>{data.overlay_path}</span>.
-            Live-safe values are applied immediately; port/file/socket and custom lines need a daemon restart.
+          <div style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+            gap: 8,
+          }}>
+            <SettingStat label="Managed knobs" value={data.settings.length.toLocaleString()} />
+            <SettingStat label="Unsaved edits" value={dirtyCount.toLocaleString()} tone={dirtyCount > 0 ? 'warn' : 'ok'} />
+            <SettingStat label="Overlay" value={data.overlay_writable ? 'writable' : 'readonly'} tone={data.overlay_writable ? 'ok' : 'warn'} />
+            <SettingStat label="Restart support" value={data.restart_supported ? 'available' : 'manual'} tone={data.restart_supported ? 'ok' : 'warn'} />
           </div>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(230px, 1fr))', gap: 8 }}>
+          <div style={{ color: 'var(--faint)', fontSize: 12, lineHeight: 1.45 }}>
+            Values are saved to <span style={{ color: 'var(--muted)', fontFamily: 'monospace' }}>{data.overlay_path}</span>. Live-safe controls are applied immediately; controls marked restart are saved for the next daemon start.
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(270px, 1fr))', gap: 9 }}>
             {data.settings.map(setting => {
               const row = data.values.find(value => value.key === setting.key)
-              const value = draft[setting.key] ?? inputValue(setting.value_type, row?.saved ?? row?.live.value ?? setting.default_value)
+              const base = baselineValue(setting, row?.saved ?? null, row?.live.value ?? null)
+              const value = draft[setting.key] ?? base
+              const saved = row?.saved ?? null
+              const live = row?.live.value ?? null
+              const dirty = !sameSettingValue(value, base)
               return (
-                <label key={setting.key} className="tng-form-card" style={{
+                <div key={setting.key} className="tng-form-card" data-dirty={dirty ? 'true' : 'false'} style={{
                   border: '1px solid var(--border)', borderRadius: 7, background: 'var(--surface)', padding: 9,
-                  display: 'grid', gap: 5,
+                  display: 'grid', gap: 8, minWidth: 0,
                 }}>
-                  <span style={{ display: 'flex', justifyContent: 'space-between', gap: 8, color: 'var(--text)', fontSize: 12, fontWeight: 800 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, color: 'var(--text)', fontSize: 12, fontWeight: 800 }}>
                     <span>{setting.label}</span>
-                    {setting.restart_required && <span style={{ color: 'var(--warning)', fontSize: 10 }}>restart</span>}
-                  </span>
+                    <span style={{ display: 'inline-flex', gap: 5, alignItems: 'center', flexShrink: 0 }}>
+                      {dirty && <SettingPill tone="warn">edited</SettingPill>}
+                      {setting.restart_required && <SettingPill tone="warn">restart</SettingPill>}
+                    </span>
+                  </div>
                   {setting.value_type === 'bool' ? (
-                    <select
-                      value={String(Boolean(value))}
-                      onChange={e => setDraft(prev => ({ ...prev, [setting.key]: e.target.value === 'true' }))}
-                      style={inputStyle}
-                    >
-                      <option value="true">On</option>
-                      <option value="false">Off</option>
-                    </select>
+                    <BooleanKnob
+                      value={Boolean(value)}
+                      onChange={next => setDraft(prev => ({ ...prev, [setting.key]: next }))}
+                    />
                   ) : setting.key === 'dht_mode' ? (
-                    <select value={String(value)} onChange={e => setDraft(prev => ({ ...prev, [setting.key]: e.target.value }))} style={inputStyle}>
-                      <option value="auto">Auto</option>
-                      <option value="on">On</option>
-                      <option value="disable">Disabled</option>
-                    </select>
+                    <SegmentedSetting
+                      value={String(value)}
+                      options={[['auto', 'Auto'], ['on', 'On'], ['disable', 'Off']]}
+                      onChange={next => setDraft(prev => ({ ...prev, [setting.key]: next }))}
+                    />
                   ) : (
-                    <input
-                      type="number"
-                      min={setting.minimum ?? undefined}
-                      max={setting.maximum ?? undefined}
+                    <NumericKnob
+                      setting={setting}
                       value={Number(value)}
-                      onChange={e => setDraft(prev => ({ ...prev, [setting.key]: Number(e.target.value) }))}
-                      style={inputStyle}
+                      onChange={next => setDraft(prev => ({ ...prev, [setting.key]: next }))}
                     />
                   )}
-                  <span style={{ color: 'var(--faint)', fontSize: 10, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    live {row?.live.value ?? 'unavailable'}{setting.unit ? ` ${setting.unit}` : ''} · {setting.command}
-                  </span>
-                </label>
+                  <div style={{
+                    display: 'grid',
+                    gridTemplateColumns: 'repeat(3, minmax(0, 1fr))',
+                    gap: 5,
+                  }}>
+                    <Readout label="Live" value={live === null ? 'unavailable' : formatSettingValue(live, setting.unit)} />
+                    <Readout label="Saved" value={saved === null ? 'default' : formatSettingValue(saved, setting.unit)} />
+                    <Readout label="Command" value={setting.command} mono />
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                    <button
+                      type="button"
+                      onClick={() => setDraft(prev => ({ ...prev, [setting.key]: base }))}
+                      disabled={!dirty || save.isPending}
+                      style={smallButtonStyle(dirty && !save.isPending)}
+                    >
+                      Reset
+                    </button>
+                  </div>
+                </div>
               )
             })}
           </div>
@@ -317,8 +358,11 @@ function RtorrentSettingsPanel() {
             fontSize: 12,
           }}>{notice.text}</div>}
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-            <button onClick={() => save.mutate()} disabled={save.isPending} style={buttonStyle('var(--accent)', 'var(--accent-soft)', 'var(--accent-text)')}>
+            <button onClick={() => save.mutate()} disabled={save.isPending || dirtyCount === 0} style={buttonStyle('var(--accent)', 'var(--accent-soft)', 'var(--accent-text)', dirtyCount > 0 && !save.isPending)}>
               {save.isPending ? 'Saving…' : 'Save and apply live'}
+            </button>
+            <button onClick={resetAll} disabled={dirtyCount === 0 || save.isPending} style={buttonStyle('var(--border-strong)', 'var(--surface-2)', 'var(--muted)', dirtyCount > 0 && !save.isPending)}>
+              Reset edits
             </button>
             <button
               onClick={() => {
@@ -334,6 +378,220 @@ function RtorrentSettingsPanel() {
       )}
     </Panel>
   )
+}
+
+function SettingStat({ label, value, tone = 'neutral' }: { label: string; value: string; tone?: 'neutral' | 'ok' | 'warn' }) {
+  const color = tone === 'ok' ? 'var(--success)' : tone === 'warn' ? 'var(--warning)' : 'var(--muted)'
+  return (
+    <div style={{
+      border: '1px solid var(--border)',
+      borderRadius: 7,
+      background: 'color-mix(in srgb, var(--surface) 82%, var(--bg))',
+      padding: '8px 10px',
+      display: 'grid',
+      gap: 2,
+      minWidth: 0,
+    }}>
+      <span style={{ color: 'var(--faint)', fontSize: 10, fontWeight: 800, textTransform: 'uppercase' }}>{label}</span>
+      <span style={{ color, fontSize: 13, fontWeight: 800, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{value}</span>
+    </div>
+  )
+}
+
+function SettingPill({ tone, children }: { tone: 'warn' | 'ok'; children: React.ReactNode }) {
+  const color = tone === 'warn' ? 'var(--warning)' : 'var(--success)'
+  return (
+    <span style={{
+      color,
+      border: `1px solid color-mix(in srgb, ${color} 48%, var(--border))`,
+      background: `color-mix(in srgb, ${color} 10%, transparent)`,
+      borderRadius: 999,
+      padding: '1px 6px',
+      fontSize: 10,
+      fontWeight: 800,
+      lineHeight: 1.5,
+    }}>
+      {children}
+    </span>
+  )
+}
+
+function NumericKnob({ setting, value, onChange }: {
+  setting: RtorrentSettingDescriptor
+  value: number
+  onChange: (value: number) => void
+}) {
+  const min = setting.minimum ?? 0
+  const max = setting.maximum ?? Math.max(value, 100)
+  const percent = Math.max(0, Math.min(100, ((value - min) / Math.max(1, max - min)) * 100))
+  const dial = `conic-gradient(var(--accent) ${percent}%, var(--surface-2) 0)`
+
+  return (
+    <div style={{
+      display: 'grid',
+      gridTemplateColumns: '72px minmax(0, 1fr)',
+      gap: 10,
+      alignItems: 'center',
+      minWidth: 0,
+    }}>
+      <div aria-hidden="true" style={{
+        width: 64,
+        height: 64,
+        borderRadius: '50%',
+        background: dial,
+        border: '1px solid var(--border-strong)',
+        display: 'grid',
+        placeItems: 'center',
+        boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.04)',
+      }}>
+        <div style={{
+          width: 42,
+          height: 42,
+          borderRadius: '50%',
+          background: 'var(--bg)',
+          border: '1px solid var(--border)',
+          display: 'grid',
+          placeItems: 'center',
+          color: 'var(--text)',
+          fontSize: 11,
+          fontWeight: 900,
+        }}>
+          {Math.round(percent)}%
+        </div>
+      </div>
+      <div style={{ display: 'grid', gap: 6, minWidth: 0 }}>
+        <input
+          type="range"
+          min={min}
+          max={max}
+          value={Number.isFinite(value) ? value : min}
+          onChange={e => onChange(Number(e.target.value))}
+          style={{ width: '100%', accentColor: 'var(--accent)' }}
+          aria-label={`${setting.label} dial`}
+        />
+        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', gap: 6, alignItems: 'center' }}>
+          <input
+            type="number"
+            min={min}
+            max={max}
+            value={Number.isFinite(value) ? value : min}
+            onChange={e => onChange(Number(e.target.value))}
+            style={inputStyle}
+            aria-label={`${setting.label} value`}
+          />
+          {setting.unit && <span style={{ color: 'var(--faint)', fontSize: 11, fontWeight: 800 }}>{setting.unit}</span>}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function BooleanKnob({ value, onChange }: { value: boolean; onChange: (value: boolean) => void }) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={value}
+      onClick={() => onChange(!value)}
+      style={{
+        width: '100%',
+        border: `1px solid ${value ? 'var(--accent)' : 'var(--border-strong)'}`,
+        borderRadius: 7,
+        background: value ? 'var(--accent-soft)' : 'var(--bg)',
+        color: value ? 'var(--accent-text)' : 'var(--muted)',
+        padding: 8,
+        display: 'grid',
+        gridTemplateColumns: '54px 1fr',
+        gap: 10,
+        alignItems: 'center',
+        textAlign: 'left',
+      }}
+    >
+      <span style={{
+        width: 48,
+        height: 26,
+        borderRadius: 999,
+        border: `1px solid ${value ? 'var(--accent)' : 'var(--border-strong)'}`,
+        background: value ? 'color-mix(in srgb, var(--accent) 35%, var(--surface))' : 'var(--surface-2)',
+        padding: 2,
+        boxSizing: 'border-box',
+        display: 'flex',
+        justifyContent: value ? 'flex-end' : 'flex-start',
+      }}>
+        <span style={{
+          width: 20,
+          height: 20,
+          borderRadius: '50%',
+          background: value ? 'var(--accent-text)' : 'var(--faint)',
+          boxShadow: '0 1px 4px var(--shadow)',
+        }} />
+      </span>
+      <span style={{ fontSize: 13, fontWeight: 800 }}>{value ? 'On' : 'Off'}</span>
+    </button>
+  )
+}
+
+function SegmentedSetting({ value, options, onChange }: {
+  value: string
+  options: Array<[string, string]>
+  onChange: (value: string) => void
+}) {
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: `repeat(${options.length}, minmax(0, 1fr))`, gap: 5 }}>
+      {options.map(([optionValue, label]) => {
+        const active = value === optionValue
+        return (
+          <button
+            key={optionValue}
+            type="button"
+            onClick={() => onChange(optionValue)}
+            style={{
+              border: `1px solid ${active ? 'var(--accent)' : 'var(--border-strong)'}`,
+              borderRadius: 6,
+              background: active ? 'var(--accent-soft)' : 'var(--bg)',
+              color: active ? 'var(--accent-text)' : 'var(--muted)',
+              padding: '7px 8px',
+              fontSize: 12,
+              fontWeight: 800,
+            }}
+          >
+            {label}
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
+function Readout({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
+  return (
+    <div style={{ minWidth: 0, display: 'grid', gap: 2 }}>
+      <span style={{ color: 'var(--faint)', fontSize: 9, fontWeight: 800, textTransform: 'uppercase' }}>{label}</span>
+      <span title={value} style={{
+        color: 'var(--muted)',
+        fontSize: 10,
+        fontFamily: mono ? 'ui-monospace, SFMono-Regular, Menlo, monospace' : undefined,
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+        whiteSpace: 'nowrap',
+      }}>
+        {value}
+      </span>
+    </div>
+  )
+}
+
+function formatSettingValue(value: string | number | boolean, unit: string | null): string {
+  return `${String(value)}${unit ? ` ${unit}` : ''}`
+}
+
+function baselineValue(setting: RtorrentSettingDescriptor, saved: string | null, live: string | null): string | number | boolean {
+  return inputValue(setting.value_type, saved ?? live ?? setting.default_value)
+}
+
+function sameSettingValue(left: unknown, right: unknown): boolean {
+  if (typeof left === 'number' || typeof right === 'number') return Number(left) === Number(right)
+  return String(left) === String(right)
 }
 
 function inputValue(type: string, value: unknown): string | number | boolean {
@@ -357,16 +615,31 @@ const inputStyle: React.CSSProperties = {
   outline: 'none',
 }
 
-function buttonStyle(border: string, background: string, color: string): React.CSSProperties {
+function smallButtonStyle(enabled: boolean): React.CSSProperties {
   return {
-    background,
+    border: '1px solid var(--border-strong)',
+    borderRadius: 5,
+    background: enabled ? 'var(--surface-2)' : 'transparent',
+    color: enabled ? 'var(--muted)' : 'var(--faint)',
+    padding: '3px 8px',
+    fontSize: 11,
+    fontWeight: 800,
+    cursor: enabled ? 'pointer' : 'default',
+    opacity: enabled ? 1 : 0.55,
+  }
+}
+
+function buttonStyle(border: string, background: string, color: string, enabled = true): React.CSSProperties {
+  return {
+    background: enabled ? background : 'var(--surface-2)',
     border: `1px solid ${border}`,
     borderRadius: 5,
-    color,
+    color: enabled ? color : 'var(--faint)',
     padding: '6px 10px',
     fontSize: 12,
     fontWeight: 800,
-    cursor: 'pointer',
+    cursor: enabled ? 'pointer' : 'default',
+    opacity: enabled ? 1 : 0.6,
   }
 }
 

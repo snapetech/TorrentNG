@@ -564,25 +564,15 @@ pub async fn list_session_events(
         );
     };
     let limit = query.limit.unwrap_or(200).clamp(1, 1000);
-    match engine.session_events(query.torrent.clone(), limit).await {
+    let levels = query.level.iter().cloned().collect::<Vec<_>>();
+    match engine
+        .session_events_filtered(query.torrent.clone(), query.kind.clone(), levels, limit)
+        .await
+    {
         Ok(events) => {
             let events = events
                 .into_iter()
                 .filter_map(session_event_response)
-                .filter(|event| {
-                    query
-                        .kind
-                        .as_ref()
-                        .map(|kind| event.kind == *kind)
-                        .unwrap_or(true)
-                })
-                .filter(|event| {
-                    query
-                        .level
-                        .as_ref()
-                        .map(|level| event.level.eq_ignore_ascii_case(level))
-                        .unwrap_or(true)
-                })
                 .collect::<Vec<_>>();
             (StatusCode::OK, Json(events))
         }

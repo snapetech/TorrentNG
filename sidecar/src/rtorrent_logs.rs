@@ -22,10 +22,14 @@ pub async fn run(db: Arc<Db>, config: RtorrentLogConfig, retention: usize) {
     loop {
         for path in &config.paths {
             if let Err(e) = ingest_path(&db, path, retention, config.read_from_start) {
+                let source = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("rtorrent.log");
                 tracing::warn!(
                     component = "rtorrent_logs",
                     operation = "ingest",
-                    path = %path.display(),
+                    source,
                     error = %e,
                     "failed to ingest rtorrent log"
                 );

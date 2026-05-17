@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection, Row};
+use rusqlite::{params, params_from_iter, types::Value, Connection, Row};
 use serde::{Deserialize, Serialize};
 
 use crate::error::DbError;
@@ -50,15 +50,17 @@ impl JobEventRow {
 }
 
 pub fn append_session_event(conn: &Connection, event: &SessionEventRow) -> Result<i64, DbError> {
+    let level = session_event_level(event);
     conn.execute(
-        "INSERT INTO session_events (occurred_at, info_hash, kind, message, payload)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO session_events (occurred_at, info_hash, kind, message, payload, level)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             event.occurred_at,
             event.info_hash,
             event.kind,
             event.message,
             event.payload,
+            level,
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -80,31 +82,95 @@ pub fn list_session_events(
     info_hash: Option<&str>,
     limit: usize,
 ) -> Result<Vec<SessionEventRow>, DbError> {
-    let limit = limit.max(1) as i64;
-    if let Some(info_hash) = info_hash {
-        let mut stmt = conn.prepare(
-            "SELECT event_id, occurred_at, info_hash, kind, message, payload
-             FROM session_events
-             WHERE info_hash = ?1
-             ORDER BY event_id DESC
-             LIMIT ?2",
-        )?;
-        let rows = stmt
-            .query_map(params![info_hash, limit], SessionEventRow::from_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        return Ok(rows);
-    }
+    list_session_events_filtered(conn, info_hash, None, &[], limit)
+}
 
-    let mut stmt = conn.prepare(
-        "SELECT event_id, occurred_at, info_hash, kind, message, payload
-         FROM session_events
-         ORDER BY event_id DESC
-         LIMIT ?1",
-    )?;
+pub fn list_session_events_filtered(
+    conn: &Connection,
+    info_hash: Option<&str>,
+    kind: Option<&str>,
+    levels: &[String],
+    limit: usize,
+) -> Result<Vec<SessionEventRow>, DbError> {
+    let limit = limit.max(1) as i64;
+    let mut sql = String::from(
+        "SELECT event_id, occurred_at, info_hash, kind, message, payload FROM session_events",
+    );
+    let mut clauses = Vec::new();
+    let mut values = Vec::<Value>::new();
+    if let Some(info_hash) = info_hash {
+        clauses.push("info_hash = ?");
+        values.push(Value::Text(info_hash.to_owned()));
+    }
+    if let Some(kind) = kind {
+        clauses.push("kind = ?");
+        values.push(Value::Text(kind.to_owned()));
+    }
+    let level_placeholders = if levels.is_empty() {
+        String::new()
+    } else {
+        std::iter::repeat("?")
+            .take(levels.len())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let level_clause;
+    if !levels.is_empty() {
+        level_clause = format!("lower(level) IN ({level_placeholders})");
+        clauses.push(&level_clause);
+    }
+    if !clauses.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&clauses.join(" AND "));
+    }
+    sql.push_str(" ORDER BY event_id DESC LIMIT ?");
+    for level in levels {
+        values.push(Value::Text(canonical_level(level)));
+    }
+    values.push(Value::Integer(limit));
+
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
-        .query_map(params![limit], SessionEventRow::from_row)?
+        .query_map(params_from_iter(values), SessionEventRow::from_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+fn session_event_level(row: &SessionEventRow) -> &'static str {
+    let payload_level = serde_json::from_str::<serde_json::Value>(&row.payload)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("level")
+                .and_then(|level| level.as_str())
+                .map(str::to_ascii_lowercase)
+        });
+    match payload_level.as_deref() {
+        Some("error") | Some("critical") => "error",
+        Some("warn") | Some("warning") => "warn",
+        Some("info") => "info",
+        _ => level_from_kind(&row.kind),
+    }
+}
+
+fn canonical_level(level: &str) -> String {
+    match level.to_ascii_lowercase().as_str() {
+        "error" | "critical" => "error".to_owned(),
+        "warn" | "warning" => "warn".to_owned(),
+        "info" => "info".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
+fn level_from_kind(kind: &str) -> &'static str {
+    let lower = kind.to_ascii_lowercase();
+    if lower.contains("error") || lower.contains("failed") {
+        "error"
+    } else if lower.contains("warn") {
+        "warn"
+    } else {
+        "info"
+    }
 }
 
 pub fn append_job_event(conn: &Connection, event: &JobEventRow) -> Result<i64, DbError> {
@@ -168,6 +234,49 @@ mod tests {
         let events = list_session_events(&conn, Some(&"a".repeat(40)), 10).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "torrent_added");
+    }
+
+    #[test]
+    fn list_session_events_filters_before_limit() {
+        let conn = setup();
+        append_session_event(
+            &conn,
+            &SessionEventRow {
+                event_id: None,
+                occurred_at: 10,
+                info_hash: Some("a".repeat(40)),
+                kind: "tracker_warning".into(),
+                message: Some("warn".into()),
+                payload: r#"{"level":"warn"}"#.into(),
+            },
+        )
+        .unwrap();
+        append_session_event(
+            &conn,
+            &SessionEventRow {
+                event_id: None,
+                occurred_at: 11,
+                info_hash: Some("a".repeat(40)),
+                kind: "torrent_added".into(),
+                message: Some("info".into()),
+                payload: r#"{"level":"info"}"#.into(),
+            },
+        )
+        .unwrap();
+
+        let events =
+            list_session_events_filtered(&conn, Some(&"a".repeat(40)), None, &["warn".into()], 1)
+                .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "tracker_warning");
+        let stored_level: String = conn
+            .query_row(
+                "SELECT level FROM session_events WHERE kind = 'tracker_warning'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_level, "warn");
     }
 
     #[test]

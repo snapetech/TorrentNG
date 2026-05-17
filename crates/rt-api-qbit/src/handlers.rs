@@ -2109,7 +2109,11 @@ pub async fn log_main(
         return (StatusCode::OK, Json(Vec::<QbLogEntry>::new()));
     };
     let limit = query.limit.unwrap_or(200).clamp(1, 1000);
-    match engine.session_events(None, limit).await {
+    let levels = query.included_levels();
+    match engine
+        .session_events_filtered(None, None, levels, limit)
+        .await
+    {
         Ok(events) => (
             StatusCode::OK,
             Json(
@@ -2142,6 +2146,30 @@ impl LogMainQuery {
             4 => self.critical.unwrap_or(false),
             _ => true,
         }
+    }
+
+    fn included_levels(&self) -> Vec<String> {
+        let any_filter = self.normal.is_some()
+            || self.info.is_some()
+            || self.warning.is_some()
+            || self.critical.is_some();
+        if !any_filter {
+            return Vec::new();
+        }
+
+        let mut levels = Vec::new();
+        if self.normal.unwrap_or(false) || self.info.unwrap_or(false) {
+            levels.push("info".to_owned());
+        }
+        if self.warning.unwrap_or(false) {
+            levels.push("warn".to_owned());
+            levels.push("warning".to_owned());
+        }
+        if self.critical.unwrap_or(false) {
+            levels.push("error".to_owned());
+            levels.push("critical".to_owned());
+        }
+        levels
     }
 }
 
@@ -3265,6 +3293,10 @@ mod tests {
         assert!(!critical.includes_type(1));
         assert!(!critical.includes_type(2));
         assert!(critical.includes_type(4));
+        assert_eq!(
+            critical.included_levels(),
+            vec!["error".to_owned(), "critical".to_owned()]
+        );
     }
 
     #[tokio::test]

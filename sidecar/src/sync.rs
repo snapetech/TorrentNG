@@ -32,12 +32,23 @@ pub async fn run(
     interval: Duration,
     event_retention: usize,
 ) {
-    info!("sync loop started, interval={interval:?}");
+    info!(
+        component = "rtorrent",
+        operation = "sync_loop",
+        interval_ms = interval.as_millis() as u64,
+        "sync loop started"
+    );
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     ticker.tick().await;
     let range_supported = rt.has_multicall_range().await;
-    info!("rTorrent d.multicall.range supported={range_supported}");
+    info!(
+        component = "rtorrent",
+        operation = "capability_probe",
+        feature = "d.multicall.range",
+        supported = range_supported,
+        "rTorrent capability probe complete"
+    );
     let mut page_offset = 0i64;
     let mut full_cycle_seen = HashSet::new();
     let mut tracker_cache = HashMap::new();
@@ -94,7 +105,13 @@ pub async fn run(
             }
             Err(e) => {
                 metrics.sync_errors_total.fetch_add(1, Ordering::Relaxed);
-                warn!("sync error: {e:?}");
+                warn!(
+                    component = "rtorrent",
+                    operation = "sync",
+                    result = "error",
+                    error = %e,
+                    "rTorrent sync failed"
+                );
                 if !sync_error_active {
                     append_app_event(
                         &db,
@@ -135,7 +152,13 @@ fn append_app_event(
         },
         retention,
     ) {
-        warn!("append sync app event {kind}: {e}");
+        warn!(
+            component = "app_events",
+            operation = "append",
+            kind,
+            error = %e,
+            "failed to append sync app event"
+        );
     }
 }
 
@@ -186,7 +209,12 @@ async fn tick_bounded(
                 }
             }
         }
-        Err(e) => warn!("live summary sync failed: {e:?}"),
+        Err(e) => warn!(
+            component = "rtorrent",
+            operation = "live_summary_sync",
+            error = %e,
+            "live summary sync failed"
+        ),
     }
 
     let page = rt
@@ -268,7 +296,13 @@ fn upsert_torrent(
         updated_at: now,
     };
     if let Err(e) = db.upsert(&row) {
-        warn!("upsert {}: {e}", t.hash);
+        warn!(
+            component = "cache",
+            operation = "upsert_torrent",
+            torrent = %t.hash,
+            error = %e,
+            "torrent cache upsert failed"
+        );
     }
     let _ = tx.send(Event::TorrentUpdated {
         hash: t.hash.clone(),
@@ -291,7 +325,17 @@ fn write_live_speeds(download: i64, upload: i64) {
     let tmp_path = format!("{path}.tmp");
     if let Err(e) = std::fs::write(&tmp_path, body).and_then(|_| std::fs::rename(&tmp_path, &path))
     {
-        warn!("write live speeds {path}: {e}");
+        let target = std::path::Path::new(&path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("live-speeds.json");
+        warn!(
+            component = "stats",
+            operation = "write_live_speeds",
+            target,
+            error = %e,
+            "live speed cache write failed"
+        );
         let _ = std::fs::remove_file(tmp_path);
     }
 }

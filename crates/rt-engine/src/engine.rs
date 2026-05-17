@@ -309,10 +309,23 @@ impl EngineHandle {
         info_hash: Option<String>,
         limit: usize,
     ) -> CmdResult<Vec<rt_db::SessionEventRow>> {
+        self.session_events_filtered(info_hash, None, Vec::new(), limit)
+            .await
+    }
+
+    pub async fn session_events_filtered(
+        &self,
+        info_hash: Option<String>,
+        kind: Option<String>,
+        levels: Vec<String>,
+        limit: usize,
+    ) -> CmdResult<Vec<rt_db::SessionEventRow>> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx
             .send(EngineCmd::ListSessionEvents {
                 info_hash,
+                kind,
+                levels,
                 limit,
                 reply,
             })
@@ -1035,11 +1048,13 @@ impl Engine {
 
             EngineCmd::ListSessionEvents {
                 info_hash,
+                kind,
+                levels,
                 limit,
                 reply,
             } => {
                 let result = self
-                    .list_session_events(info_hash.as_deref(), limit)
+                    .list_session_events(info_hash.as_deref(), kind.as_deref(), &levels, limit)
                     .map_err(|e| e.to_string());
                 let _ = reply.send(result);
             }
@@ -2827,10 +2842,12 @@ impl Engine {
     fn list_session_events(
         &self,
         info_hash: Option<&str>,
+        kind: Option<&str>,
+        levels: &[String],
         limit: usize,
     ) -> Result<Vec<rt_db::SessionEventRow>, rt_db::DbError> {
         let db = self.db.lock().expect("database mutex poisoned");
-        rt_db::list_session_events(&db, info_hash, limit)
+        rt_db::list_session_events_filtered(&db, info_hash, kind, levels, limit)
     }
 
     fn create_recheck_job(&self, info_hash: &str) -> Option<String> {

@@ -43,11 +43,21 @@ pub async fn run(rt: Arc<Client>, tx: broadcast::Sender<Event>, interval: Durati
             None => match tokio::time::timeout(PROBE_TIMEOUT, rt.transfer_rates()).await {
                 Ok(Ok(rates)) => rates,
                 Ok(Err(e)) => {
-                    warn!("transfer stats error: {e:?}");
+                    warn!(
+                        component = "rtorrent",
+                        operation = "transfer_stats",
+                        error = %e,
+                        "transfer stats probe failed"
+                    );
                     TransferRates::default()
                 }
                 Err(_) => {
-                    warn!("transfer stats probe timed out");
+                    warn!(
+                        component = "rtorrent",
+                        operation = "transfer_stats",
+                        duration_ms = PROBE_TIMEOUT.as_millis() as u64,
+                        "transfer stats probe timed out"
+                    );
                     TransferRates::default()
                 }
             },
@@ -96,11 +106,21 @@ async fn probe_transfer_rates(rt: &Client) -> TransferRates {
     match tokio::time::timeout(PROBE_TIMEOUT, rt.transfer_rates()).await {
         Ok(Ok(rates)) => rates,
         Ok(Err(e)) => {
-            warn!("transfer stats error: {e:?}");
+            warn!(
+                component = "rtorrent",
+                operation = "transfer_stats",
+                error = %e,
+                "transfer stats probe failed"
+            );
             TransferRates::default()
         }
         Err(_) => {
-            warn!("transfer stats probe timed out");
+            warn!(
+                component = "rtorrent",
+                operation = "transfer_stats",
+                duration_ms = PROBE_TIMEOUT.as_millis() as u64,
+                "transfer stats probe timed out"
+            );
             TransferRates::default()
         }
     }
