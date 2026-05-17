@@ -2942,7 +2942,14 @@ async fn run_peer_loop(
                         let pieces = match bitfield_to_pieces(&bits, upload.have_pieces.len()) {
                             Ok(pieces) => pieces,
                             Err(e) => {
-                                debug!(peer = %addr, err = %e, "ignoring invalid bitfield");
+                                debug!(
+                                    component = "peer",
+                                    operation = "parse_bitfield",
+                                    peer = %addr,
+                                    result = "error",
+                                    error = %e,
+                                    "ignoring invalid bitfield"
+                                );
                                 continue;
                             }
                         };
@@ -3067,7 +3074,14 @@ async fn run_peer_loop(
                                 }
                             }
                             Err(e) => {
-                                debug!(peer = %addr, err = %e, "ignoring invalid extension handshake");
+                                debug!(
+                                    component = "peer",
+                                    operation = "parse_extension_handshake",
+                                    peer = %addr,
+                                    result = "error",
+                                    error = %e,
+                                    "ignoring invalid extension handshake"
+                                );
                             }
                         }
                     }
@@ -3086,7 +3100,14 @@ async fn run_peer_loop(
                             }
                             Ok(_) => {}
                             Err(e) => {
-                                debug!(peer = %addr, err = %e, "ignoring invalid ut_metadata message");
+                                debug!(
+                                    component = "peer",
+                                    operation = "parse_ut_metadata",
+                                    peer = %addr,
+                                    result = "error",
+                                    error = %e,
+                                    "ignoring invalid ut_metadata message"
+                                );
                             }
                         }
                     }
@@ -3103,7 +3124,14 @@ async fn run_peer_loop(
                             }
                             Ok(_) => {}
                             Err(e) => {
-                                debug!(peer = %addr, err = %e, "ignoring invalid ut_pex message");
+                                debug!(
+                                    component = "peer",
+                                    operation = "parse_ut_pex",
+                                    peer = %addr,
+                                    result = "error",
+                                    error = %e,
+                                    "ignoring invalid ut_pex message"
+                                );
                             }
                         }
                     }
