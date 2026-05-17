@@ -11,6 +11,7 @@ webui/dist/
 .env
 benchmarks/report-*.md
 certification/reports/
+certification/interop/
 
 __pycache__/
 *.pyc

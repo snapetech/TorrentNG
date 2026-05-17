@@ -3,7 +3,7 @@
 /// One tokio task per torrent owns: tracker announce loop, peer connection
 /// management, piece picker, and storage writes.
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1752,7 +1752,19 @@ fn private_peer_source_allowed(
     allowed_private_peers: &HashSet<SocketAddr>,
     peer: SocketAddr,
 ) -> bool {
-    !is_private || allowed_private_peers.contains(&peer)
+    !is_private
+        || allowed_private_peers.contains(&peer)
+        || (private_peer_port_fallback_allowed(peer.ip())
+            && allowed_private_peers
+                .iter()
+                .any(|allowed| allowed.ip() == peer.ip()))
+}
+
+fn private_peer_port_fallback_allowed(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+        IpAddr::V6(ip) => ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local(),
+    }
 }
 
 fn peer_client_label(peer: &PeerHandle) -> String {
@@ -2520,14 +2532,29 @@ mod tests {
     #[test]
     fn private_peer_allowlist_only_accepts_tracker_peers() {
         let peer: SocketAddr = "127.0.0.1:6881".parse().unwrap();
-        let other: SocketAddr = "127.0.0.1:6882".parse().unwrap();
+        let same_host_ephemeral: SocketAddr = "127.0.0.1:49152".parse().unwrap();
+        let other: SocketAddr = "127.0.0.2:6881".parse().unwrap();
+        let public_peer: SocketAddr = "198.51.100.10:6881".parse().unwrap();
+        let public_same_host_ephemeral: SocketAddr = "198.51.100.10:49152".parse().unwrap();
         let mut allowed = HashSet::new();
 
         assert!(!private_peer_source_allowed(true, &allowed, peer));
         allowed.insert(peer);
         assert!(private_peer_source_allowed(true, &allowed, peer));
+        assert!(private_peer_source_allowed(
+            true,
+            &allowed,
+            same_host_ephemeral
+        ));
         assert!(!private_peer_source_allowed(true, &allowed, other));
         assert!(private_peer_source_allowed(false, &allowed, other));
+
+        allowed.insert(public_peer);
+        assert!(!private_peer_source_allowed(
+            true,
+            &allowed,
+            public_same_host_ephemeral
+        ));
     }
 
     #[test]
