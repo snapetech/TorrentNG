@@ -1194,9 +1194,9 @@ function NumericKnob({ setting, value, describedBy, onChange, onPreset }: {
           {setting.unit && <span style={{ color: 'var(--faint)', fontSize: 11, fontWeight: 800 }}>{setting.unit}</span>}
         </div>
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 5 }}>
-          <button type="button" onClick={() => onPreset(min)} style={miniPresetButtonStyle}>Min</button>
-          <button type="button" onClick={() => onPreset(Number(inputValue(setting.value_type, setting.default_value)))} style={miniPresetButtonStyle}>Default</button>
-          <button type="button" onClick={() => onPreset(max)} style={miniPresetButtonStyle}>Max</button>
+          <button type="button" aria-label={`Set ${setting.label} to minimum ${formatSettingValue(min, setting.unit)}`} onClick={() => onPreset(min)} style={miniPresetButtonStyle}>Min</button>
+          <button type="button" aria-label={`Set ${setting.label} to default ${formatSettingValue(inputValue(setting.value_type, setting.default_value), setting.unit)}`} onClick={() => onPreset(Number(inputValue(setting.value_type, setting.default_value)))} style={miniPresetButtonStyle}>Default</button>
+          <button type="button" aria-label={`Set ${setting.label} to maximum ${formatSettingValue(max, setting.unit)}`} onClick={() => onPreset(max)} style={miniPresetButtonStyle}>Max</button>
         </div>
       </div>
     </div>
