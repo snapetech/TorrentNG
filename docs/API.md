@@ -416,7 +416,7 @@ rTorrent over XMLRPC.
 | `torrentng_storage_backend_fixed_buffers_supported` | gauge | Whether the selected backend can use registered fixed buffers |
 | `torrentng_storage_backend_registered_files_supported` | gauge | Whether the selected backend can use registered file slots |
 | `torrentng_storage_backend_{max_batch_len,fixed_buffer_bytes}` | gauge | Selected backend batching and fixed-buffer sizing |
-| `torrentng_storage_backend_fixed_buffer_strategy{strategy=...}` | gauge | Active fixed-buffer strategy (`disabled`, `worker_copy`, or future `frame_pool_slots`) |
+| `torrentng_storage_backend_fixed_buffer_strategy{strategy=...}` | gauge | Active fixed-buffer strategy (`disabled`, reserved `worker_copy`, or `frame_pool_slots`) |
 | `torrentng_storage_backend_fixed_buffer_worker_copy` | gauge | Whether fixed-buffer submissions copy through backend-private worker buffers |
 | `torrentng_storage_backend_frame_pool_slots_supported` | gauge | Whether fixed-buffer submissions use registered storage frame-pool slots directly |
 | `torrentng_storage_backend_read_*` | counter | Actual backend disk read operations and bytes, excluding peer-read cache hits |

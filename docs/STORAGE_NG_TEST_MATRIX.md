@@ -51,7 +51,7 @@ per-case syscall counters when `strace` is available.
 | `TNG_STORAGE_DISK_THREADS` | positive integer | Sets dedicated backend worker count for the selected/fallback backend |
 | `TNG_STORAGE_FRAME_CAP_MB` | positive integer | Caps global storage frame memory; exhausted frames return queue/backpressure errors rather than unbounded allocation |
 | `TNG_STORAGE_HANDLE_IDLE_SECS` | positive integer | Controls idle cached-handle close latency |
-| `TNG_STORAGE_URING_REQUIRE_FRAME_POOL_SLOTS` | `0`, `1` | Makes `scripts/storage_uring_graduation.sh` fail unless the selected `uring` backend reports `fixed_buffer_strategy=frame_pool_slots`; worker-owned fixed buffers remain capability evidence only |
+| `TNG_STORAGE_URING_REQUIRE_FRAME_POOL_SLOTS` | `0`, `1` | Makes `scripts/storage_uring_graduation.sh` fail unless the selected `uring` backend reports `fixed_buffer_strategy=frame_pool_slots` |
 | `TNG_STORAGE_SYSCALLS` | `0`, `1` | Adds `strace` syscall counts to real-device hardware matrix summaries when available |
 | `[memory].*` | TOML config | Sets resource-governor total and class caps exposed through `/metrics` |
 
@@ -60,10 +60,10 @@ per-case syscall counters when `strace` is available.
 | Metric | Expected proof |
 | --- | --- |
 | `torrentng_storage_backend_selected{backend=...}` | Exactly one active backend sample with value `1` |
-| `torrentng_storage_backend_fixed_buffers_supported` | `0` for `pread`; `1` for `uring` when the kernel accepts registered worker buffers |
+| `torrentng_storage_backend_fixed_buffers_supported` | `0` for `pread`; `1` for `uring` when the kernel accepts registered frame slots |
 | `torrentng_storage_backend_registered_files_supported` | `0` for `pread`; `1` for `uring` when the kernel accepts registered file slots |
 | `torrentng_storage_backend_{max_batch_len,fixed_buffer_bytes}` | Backend batch and fixed-buffer sizing match the selected implementation |
-| `torrentng_storage_backend_fixed_buffer_strategy{strategy=...}` | `disabled` for `pread`; `worker_copy` for current `uring` fixed buffers; future `frame_pool_slots` only after frame-pool slot leases exist |
+| `torrentng_storage_backend_fixed_buffer_strategy{strategy=...}` | `disabled` for `pread`; `frame_pool_slots` for `uring` when registered frame slots are active; `worker_copy` remains a reserved compatibility value |
 | `torrentng_storage_*_latency_nanoseconds_by_device{device=...,profile=...}` | Storage latency attribution and bounded histograms survive multi-device aggregation |
 | `torrentng_storage_file_pool_*` | fd pool remains bounded and records hit/miss/eviction/idle-close activity |
 | `torrentng_storage_device_queue_{capacity,available}` | process-level per-device queue sharing and available permit pressure are visible across running schedulers |
@@ -107,5 +107,5 @@ TNG_STORAGE_REQUIRE_HDD_5X=1 scripts/storage_hardware_matrix.sh /mnt/nvme /mnt/h
   claiming production storage performance.
 - `clean_shutdown = true` is only trusted when the configured durability mode
   completed its storage sync requirement.
-- `UringBackend` remains a tuning target until worker-owned fixed buffers are
-  replaced by true frame-pool slot pinning and benchmarked on real hardware.
+- `UringBackend` remains explicit opt-in until registered frame-slot reads are
+  benchmarked against `pread` on real hardware.

@@ -110,9 +110,8 @@ impl FramePool {
             buf.resize(len, 0);
         }
         Some(Frame {
-            buf,
             len,
-            class,
+            backing: FrameBacking::Vec { buf, class },
             pool: self.clone(),
         })
     }
@@ -150,13 +149,19 @@ pub fn global_frame_pool() -> &'static FramePool {
     &GLOBAL
 }
 
+#[derive(Debug)]
+enum FrameBacking {
+    Vec { buf: Vec<u8>, class: Option<usize> },
+    Registered { slot: RegisteredFrameSlot },
+    Empty,
+}
+
 /// A buffer borrowed from the [`FramePool`]. Returns to the pool on drop
 /// and releases its charge against the cap.
 #[derive(Debug)]
 pub struct Frame {
-    buf: Vec<u8>,
     len: usize,
-    class: Option<usize>,
+    backing: FrameBacking,
     pool: FramePool,
 }
 
@@ -170,11 +175,19 @@ impl Frame {
     }
 
     pub fn as_slice(&self) -> &[u8] {
-        &self.buf[..self.len]
+        match &self.backing {
+            FrameBacking::Vec { buf, .. } => &buf[..self.len],
+            FrameBacking::Registered { slot } => slot.as_slice(self.len),
+            FrameBacking::Empty => &[],
+        }
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.buf[..self.len]
+        match &mut self.backing {
+            FrameBacking::Vec { buf, .. } => &mut buf[..self.len],
+            FrameBacking::Registered { slot } => slot.as_mut_slice(self.len),
+            FrameBacking::Empty => &mut [],
+        }
     }
 
     /// Consume this frame as immutable bytes without copying the payload.
@@ -184,12 +197,37 @@ impl Frame {
     /// released before returning.
     pub fn into_bytes(mut self) -> bytes::Bytes {
         let len = self.len;
-        self.pool.release_charge(len);
         self.len = 0;
-        self.class = None;
-        let mut buf = std::mem::take(&mut self.buf);
-        buf.truncate(len);
-        bytes::Bytes::from(buf)
+        match std::mem::replace(&mut self.backing, FrameBacking::Empty) {
+            FrameBacking::Vec { mut buf, .. } => {
+                self.pool.release_charge(len);
+                buf.truncate(len);
+                bytes::Bytes::from(buf)
+            }
+            FrameBacking::Registered { slot } => {
+                let bytes = bytes::Bytes::copy_from_slice(slot.as_slice(len));
+                self.pool.release_charge(len);
+                drop(slot);
+                bytes
+            }
+            FrameBacking::Empty => bytes::Bytes::new(),
+        }
+    }
+
+    /// Move this frame-pool charge onto a registered fixed-buffer slot.
+    pub fn into_registered_slot(mut self, slot: RegisteredFrameSlot) -> Self {
+        let len = self.len;
+        self.len = 0;
+        self.backing = FrameBacking::Empty;
+        Frame {
+            len,
+            backing: FrameBacking::Registered { slot },
+            pool: self.pool.clone(),
+        }
+    }
+
+    pub fn is_registered_slot(&self) -> bool {
+        matches!(self.backing, FrameBacking::Registered { .. })
     }
 }
 
@@ -208,8 +246,113 @@ impl std::ops::DerefMut for Frame {
 
 impl Drop for Frame {
     fn drop(&mut self) {
-        let buf = std::mem::take(&mut self.buf);
-        self.pool.release(buf, self.len, self.class);
+        match std::mem::replace(&mut self.backing, FrameBacking::Empty) {
+            FrameBacking::Vec { buf, class } => self.pool.release(buf, self.len, class),
+            FrameBacking::Registered { slot } => {
+                drop(slot);
+                self.pool.release_charge(self.len);
+            }
+            FrameBacking::Empty => {}
+        }
+    }
+}
+
+/// Stable registered fixed-buffer storage that can back returned frames.
+#[derive(Debug)]
+pub struct RegisteredFrameSlots {
+    buffers: Vec<RegisteredBuffer>,
+    free: Mutex<Vec<u16>>,
+}
+
+#[derive(Debug)]
+struct RegisteredBuffer {
+    ptr: std::ptr::NonNull<u8>,
+    len: usize,
+    _buf: Box<[u8]>,
+}
+
+unsafe impl Send for RegisteredFrameSlots {}
+unsafe impl Sync for RegisteredFrameSlots {}
+
+impl RegisteredFrameSlots {
+    pub fn new(slots: usize, len: usize) -> Arc<Self> {
+        let buffers = (0..slots)
+            .map(|_| {
+                let mut buf = vec![0u8; len].into_boxed_slice();
+                let ptr = std::ptr::NonNull::new(buf.as_mut_ptr()).expect("boxed slice pointer");
+                RegisteredBuffer {
+                    ptr,
+                    len: buf.len(),
+                    _buf: buf,
+                }
+            })
+            .collect::<Vec<_>>();
+        Arc::new(Self {
+            buffers,
+            free: Mutex::new((0..slots as u16).rev().collect()),
+        })
+    }
+
+    pub fn iovecs(&self) -> Vec<libc::iovec> {
+        self.buffers
+            .iter()
+            .map(|buf| libc::iovec {
+                iov_base: buf.ptr.as_ptr().cast(),
+                iov_len: buf.len,
+            })
+            .collect()
+    }
+
+    pub fn acquire(self: &Arc<Self>, len: usize) -> Option<RegisteredFrameSlot> {
+        let slot = {
+            let mut free = self.free.lock().expect("registered frame slots poisoned");
+            let slot = *free.last()?;
+            if len > self.buffers[slot as usize].len {
+                return None;
+            }
+            free.pop().expect("slot checked above")
+        };
+        Some(RegisteredFrameSlot {
+            set: Arc::clone(self),
+            slot,
+        })
+    }
+
+    fn release(&self, slot: u16) {
+        let mut free = self.free.lock().expect("registered frame slots poisoned");
+        free.push(slot);
+    }
+}
+
+#[derive(Debug)]
+pub struct RegisteredFrameSlot {
+    set: Arc<RegisteredFrameSlots>,
+    slot: u16,
+}
+
+impl RegisteredFrameSlot {
+    pub fn index(&self) -> u16 {
+        self.slot
+    }
+
+    pub fn ptr_mut(&self) -> *mut u8 {
+        self.set.buffers[self.slot as usize].ptr.as_ptr()
+    }
+
+    fn as_slice(&self, len: usize) -> &[u8] {
+        assert!(len <= self.set.buffers[self.slot as usize].len);
+        unsafe { std::slice::from_raw_parts(self.ptr_mut().cast_const(), len) }
+    }
+
+    fn as_mut_slice(&mut self, len: usize) -> &mut [u8] {
+        assert!(len <= self.set.buffers[self.slot as usize].len);
+        unsafe { std::slice::from_raw_parts_mut(self.ptr_mut(), len) }
+    }
+}
+
+impl Drop for RegisteredFrameSlot {
+    fn drop(&mut self) {
+        self.set.release(self.slot);
     }
 }
 
@@ -276,5 +419,26 @@ mod tests {
         assert_eq!(&bytes[..5], b"hello");
         assert_eq!(bytes.len(), 4096);
         assert_eq!(pool.in_use_bytes(), 0);
+    }
+
+    #[test]
+    fn registered_slot_frame_keeps_charge_until_drop() {
+        let pool = FramePool::new(1024 * 1024);
+        let slots = RegisteredFrameSlots::new(1, 4096);
+        let slot = slots.acquire(4096).unwrap();
+        unsafe {
+            std::slice::from_raw_parts_mut(slot.ptr_mut(), 5).copy_from_slice(b"slot!");
+        }
+        let frame = pool.try_acquire(4096).unwrap().into_registered_slot(slot);
+
+        assert!(frame.is_registered_slot());
+        assert_eq!(&frame.as_slice()[..5], b"slot!");
+        assert_eq!(pool.in_use_bytes(), 4096);
+        assert!(slots.acquire(1).is_none());
+
+        drop(frame);
+
+        assert_eq!(pool.in_use_bytes(), 0);
+        assert!(slots.acquire(1).is_some());
     }
 }

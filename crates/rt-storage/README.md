@@ -37,7 +37,7 @@ scheduler used by the native engine.
   selects the conservative portable worker-pool baseline, `pread` requests that
   baseline explicitly, and `uring` uses Linux `io_uring` positioned SQEs when
   the kernel allows it, keeps stable per-worker fixed-file slots by file
-  identity, registers worker-owned fixed buffers when accepted, and falls back
+  identity, returns reads from registered frame slots when accepted, and falls back
   with a diagnostic when it cannot.
 
 ## Correctness Expectations

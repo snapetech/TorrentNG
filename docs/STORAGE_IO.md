@@ -90,10 +90,9 @@ class semaphores:
   `uring` must be requested explicitly while correctness and hardware
   benchmarks mature. Both backend implementations use bounded internal queues
   and fail closed when saturated. The uring worker keeps a stable per-worker
-  fixed-file table keyed by file identity and registers worker-owned fixed
-  buffers when the kernel accepts them. Metrics expose this as
-  `fixed_buffer_strategy=worker_copy` until the frame pool can lease registered
-  slots directly. Kernels or
+  fixed-file table keyed by file identity and registers frame-pool-backed fixed
+  read slots when the kernel accepts them. Metrics expose this as
+  `fixed_buffer_strategy=frame_pool_slots`; kernels or
   containers that reject `io_uring` fall back to `pread` with an explicit
   diagnostic reason instead of silently changing behavior. Direct backend
   probes remain available for hardware certification and capability metrics.
@@ -155,11 +154,10 @@ now part of the release surface:
 
 ## Remaining Work
 
-The following items are still implementation targets:
-- Replace the worker-owned fixed-buffer copy path with true frame-pool slot
-  pinning once the global frame pool can lease stable registered buffer indexes.
-  Until then, `torrentng_storage_backend_fixed_buffer_strategy` must report
-  `worker_copy`, not `frame_pool_slots`; the final uring graduation proof uses
+The following items are still release targets:
+- Keep `io_uring` explicit opt-in until real-device reports show the registered
+  frame-slot path beats the portable `pread` baseline on target hardware. The
+  final uring graduation proof uses
   `TNG_STORAGE_URING_REQUIRE_FRAME_POOL_SLOTS=1`.
 - The release hardware report records real-device seed-read locality, bounded
   hot-file descriptor reuse, recheck runtime progress, elevator throughput, and

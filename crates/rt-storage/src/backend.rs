@@ -24,7 +24,7 @@ use std::thread;
 use io_uring::{opcode, types, IoUring};
 use tokio::sync::oneshot;
 
-use crate::frame::Frame;
+use crate::frame::{Frame, RegisteredFrameSlot, RegisteredFrameSlots};
 
 const URING_ENTRIES: u32 = 256;
 const URING_BATCH_LIMIT: usize = 64;
@@ -446,58 +446,6 @@ fn probe_fixed_buffers(ring: &IoUring) -> io::Result<()> {
     ring.submitter().unregister_buffers()
 }
 
-struct FixedBuffers {
-    buffers: Vec<Vec<u8>>,
-    free: Vec<u16>,
-}
-
-impl FixedBuffers {
-    fn register(ring: &IoUring, slots: usize, len: usize) -> io::Result<Self> {
-        let mut buffers = (0..slots).map(|_| vec![0u8; len]).collect::<Vec<_>>();
-        let iovecs = buffers
-            .iter_mut()
-            .map(|buf| libc::iovec {
-                iov_base: buf.as_mut_ptr().cast(),
-                iov_len: buf.len(),
-            })
-            .collect::<Vec<_>>();
-        unsafe {
-            ring.submitter().register_buffers(&iovecs)?;
-        }
-        Ok(Self {
-            buffers,
-            free: (0..slots as u16).rev().collect(),
-        })
-    }
-
-    fn acquire(&mut self, len: usize) -> Option<u16> {
-        if len > URING_FIXED_BUFFER_LEN {
-            return None;
-        }
-        self.free.pop()
-    }
-
-    fn release(&mut self, slot: u16) {
-        self.free.push(slot);
-    }
-
-    fn ptr_mut(&mut self, slot: u16) -> *mut u8 {
-        self.buffers[slot as usize].as_mut_ptr()
-    }
-
-    fn ptr(&self, slot: u16) -> *const u8 {
-        self.buffers[slot as usize].as_ptr()
-    }
-
-    fn copy_from(&mut self, slot: u16, data: &[u8]) {
-        self.buffers[slot as usize][..data.len()].copy_from_slice(data);
-    }
-
-    fn copy_to(&self, slot: u16, out: &mut [u8]) {
-        out.copy_from_slice(&self.buffers[slot as usize][..out.len()]);
-    }
-}
-
 impl DiskBackend for UringBackend {
     fn pread(
         &self,
@@ -559,7 +507,7 @@ impl DiskBackend for UringBackend {
 
     fn fixed_buffer_strategy(&self) -> FixedBufferStrategy {
         if self.supports_fixed_buffers() {
-            FixedBufferStrategy::WorkerCopy
+            FixedBufferStrategy::FramePoolSlots
         } else {
             FixedBufferStrategy::Disabled
         }
@@ -569,7 +517,7 @@ impl DiskBackend for UringBackend {
 struct UringWorker {
     rx: Arc<Mutex<mpsc::Receiver<Job>>>,
     ring: IoUring,
-    fixed: Option<FixedBuffers>,
+    fixed: Option<Arc<RegisteredFrameSlots>>,
     next_id: u64,
     registered_files: bool,
     file_slots: HashMap<FileIdentity, u32>,
@@ -596,14 +544,13 @@ enum PendingUring {
         file: Arc<File>,
         frame: Frame,
         expected: usize,
-        fixed_slot: Option<u16>,
+        fixed_slot: Option<RegisteredFrameSlot>,
         reply: oneshot::Sender<io::Result<Frame>>,
     },
     Write {
         file: Arc<File>,
         data: bytes::Bytes,
         expected: usize,
-        fixed_slot: Option<u16>,
         reply: oneshot::Sender<io::Result<()>>,
     },
     Sync {
@@ -635,11 +582,13 @@ impl UringWorker {
                 false
             }
         };
-        let fixed =
-            match FixedBuffers::register(&ring, URING_FIXED_BUFFER_SLOTS, URING_FIXED_BUFFER_LEN) {
-                Ok(fixed) => {
+        let fixed = {
+            let slots = RegisteredFrameSlots::new(URING_FIXED_BUFFER_SLOTS, URING_FIXED_BUFFER_LEN);
+            let iovecs = slots.iovecs();
+            match unsafe { ring.submitter().register_buffers(&iovecs) } {
+                Ok(()) => {
                     fixed_buffers_supported.store(true, Ordering::Relaxed);
-                    Some(fixed)
+                    Some(slots)
                 }
                 Err(e) => {
                     tracing::debug!(
@@ -651,7 +600,8 @@ impl UringWorker {
                     );
                     None
                 }
-            };
+            }
+        };
         Ok(Self {
             rx,
             ring,
@@ -721,22 +671,21 @@ impl UringWorker {
             } => {
                 let len = frame.len();
                 let file_slot = self.register_file_slot(&file);
-                let fixed_slot = self.fixed.as_mut().and_then(|fixed| fixed.acquire(len));
-                let entry = if let Some(buf_slot) = fixed_slot {
-                    let ptr = self
-                        .fixed
-                        .as_mut()
-                        .expect("fixed slot from set")
-                        .ptr_mut(buf_slot);
+                let fixed_slot = self.fixed.as_ref().and_then(|fixed| fixed.acquire(len));
+                let entry = if let Some(buf_slot) = fixed_slot.as_ref() {
+                    let ptr = buf_slot.ptr_mut();
                     match file_slot {
-                        Some(file_slot) => {
-                            opcode::ReadFixed::new(types::Fixed(file_slot), ptr, len as _, buf_slot)
-                        }
+                        Some(file_slot) => opcode::ReadFixed::new(
+                            types::Fixed(file_slot),
+                            ptr,
+                            len as _,
+                            buf_slot.index(),
+                        ),
                         None => opcode::ReadFixed::new(
                             types::Fd(file.as_raw_fd()),
                             ptr,
                             len as _,
-                            buf_slot,
+                            buf_slot.index(),
                         ),
                     }
                     .offset(offset)
@@ -775,39 +724,16 @@ impl UringWorker {
             } => {
                 let len = data.len();
                 let file_slot = self.register_file_slot(&file);
-                let fixed_slot = self.fixed.as_mut().and_then(|fixed| fixed.acquire(len));
-                let entry = if let Some(buf_slot) = fixed_slot {
-                    let fixed = self.fixed.as_mut().expect("fixed slot from set");
-                    fixed.copy_from(buf_slot, &data);
-                    match file_slot {
-                        Some(file_slot) => opcode::WriteFixed::new(
-                            types::Fixed(file_slot),
-                            fixed.ptr(buf_slot),
-                            len as _,
-                            buf_slot,
-                        ),
-                        None => opcode::WriteFixed::new(
-                            types::Fd(file.as_raw_fd()),
-                            fixed.ptr(buf_slot),
-                            len as _,
-                            buf_slot,
-                        ),
-                    }
-                    .offset(offset)
-                    .build()
-                    .user_data(id)
-                } else {
-                    let ptr = data.as_ptr();
-                    match file_slot {
-                        Some(slot) => opcode::Write::new(types::Fixed(slot), ptr, len as _),
-                        None => opcode::Write::new(types::Fd(file.as_raw_fd()), ptr, len as _),
-                    }
-                    .offset(offset)
-                    .build()
-                    .user_data(id)
-                };
+                let ptr = data.as_ptr();
+                let entry = match file_slot {
+                    Some(slot) => opcode::Write::new(types::Fixed(slot), ptr, len as _),
+                    None => opcode::Write::new(types::Fd(file.as_raw_fd()), ptr, len as _),
+                }
+                .offset(offset)
+                .build()
+                .user_data(id);
                 if let Err(e) = self.push_entry(entry) {
-                    self.release_submission_resources(file_slot, fixed_slot);
+                    self.release_submission_resources(file_slot, None);
                     return Err(e);
                 }
                 self.pending.insert(
@@ -816,7 +742,6 @@ impl UringWorker {
                         file,
                         data,
                         expected: len,
-                        fixed_slot,
                         reply,
                     },
                 );
@@ -873,17 +798,12 @@ impl UringWorker {
         }
     }
 
-    fn release_fixed_slot(&mut self, slot: Option<u16>) {
-        if let Some(slot) = slot {
-            self.fixed
-                .as_mut()
-                .expect("fixed slot came from registered buffer set")
-                .release(slot);
-        }
-    }
-
-    fn release_submission_resources(&mut self, _file_slot: Option<u32>, fixed_slot: Option<u16>) {
-        self.release_fixed_slot(fixed_slot);
+    fn release_submission_resources(
+        &mut self,
+        _file_slot: Option<u32>,
+        fixed_slot: Option<RegisteredFrameSlot>,
+    ) {
+        drop(fixed_slot);
     }
 
     fn push_entry(&mut self, entry: io_uring::squeue::Entry) -> io::Result<()> {
@@ -907,22 +827,19 @@ impl UringWorker {
             match pending {
                 PendingUring::Read {
                     file,
-                    mut frame,
+                    frame,
                     expected,
                     fixed_slot,
                     reply,
                 } => {
                     let _keepalive = file;
-                    let mut fixed_returned = false;
                     let _ = reply.send(match uring_result(result) {
                         Ok(n) if n == expected => {
                             if let Some(slot) = fixed_slot {
-                                let fixed = self.fixed.as_mut().expect("fixed slot from set");
-                                fixed.copy_to(slot, frame.as_mut_slice());
-                                fixed.release(slot);
-                                fixed_returned = true;
+                                Ok(frame.into_registered_slot(slot))
+                            } else {
+                                Ok(frame)
                             }
-                            Ok(frame)
                         }
                         Ok(_) => Err(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
@@ -930,20 +847,15 @@ impl UringWorker {
                         )),
                         Err(e) => Err(e),
                     });
-                    if !fixed_returned {
-                        self.release_fixed_slot(fixed_slot);
-                    }
                 }
                 PendingUring::Write {
                     file,
                     data,
                     expected,
-                    fixed_slot,
                     reply,
                 } => {
                     let _keepalive_file = file;
                     let _keepalive = data;
-                    self.release_fixed_slot(fixed_slot);
                     let _ = reply.send(match uring_result(result) {
                         Ok(n) if n == expected => Ok(()),
                         Ok(_) => Err(io::Error::new(
@@ -974,13 +886,10 @@ impl UringWorker {
                 PendingUring::Read {
                     reply, fixed_slot, ..
                 } => {
-                    self.release_fixed_slot(fixed_slot);
+                    drop(fixed_slot);
                     let _ = reply.send(Err(e()));
                 }
-                PendingUring::Write {
-                    reply, fixed_slot, ..
-                } => {
-                    self.release_fixed_slot(fixed_slot);
+                PendingUring::Write { reply, .. } => {
                     let _ = reply.send(Err(e()));
                 }
                 PendingUring::Sync { reply, .. } => {
@@ -1409,9 +1318,10 @@ mod tests {
         assert_eq!(backend.max_batch_len(), URING_BATCH_LIMIT);
         if backend.supports_fixed_buffers() {
             assert_eq!(backend.fixed_buffer_len(), URING_FIXED_BUFFER_LEN);
+            assert!(frame.is_registered_slot());
             assert_eq!(
                 backend.fixed_buffer_strategy(),
-                FixedBufferStrategy::WorkerCopy
+                FixedBufferStrategy::FramePoolSlots
             );
         } else {
             assert_eq!(
@@ -1442,18 +1352,14 @@ mod tests {
     }
 
     #[test]
-    fn uring_strategy_never_overclaims_frame_pool_slots() {
+    fn uring_strategy_reports_frame_pool_slots_only_with_registered_buffers() {
         let backend = UringBackend::try_new_with_queue_depth(1, 1);
         let Ok(backend) = backend else {
             return;
         };
         let strategy = backend.fixed_buffer_strategy();
-        assert!(
-            !strategy.uses_frame_pool_slots(),
-            "frame_pool_slots must only be reported after the frame pool leases registered slots"
-        );
         if backend.supports_fixed_buffers() {
-            assert_eq!(strategy, FixedBufferStrategy::WorkerCopy);
+            assert_eq!(strategy, FixedBufferStrategy::FramePoolSlots);
         } else {
             assert_eq!(strategy, FixedBufferStrategy::Disabled);
         }

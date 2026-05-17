@@ -80,8 +80,9 @@ Implemented and covered by automated tests:
   are awaited outside scheduler blocking workers after short open/metadata
   phases.
 - Scheduler read and peer-read elevator buffers enter the backend through the
-  same process-level frame pool used by `StorageRuntime`, then copy into
-  caller-owned `Bytes`.
+  same process-level frame pool used by `StorageRuntime`; owned reads can stay
+  as frames, while compatibility `Bytes` conversion consumes ordinary frames
+  without copying and copies only when the backing storage is a registered slot.
 - Live upload blocks hold `PeerBuffer` leases through message send, and
   scheduler-owned peer-read cache entries hold `PeerBuffer` leases while cached.
 - Native `[storage]` TOML covers scheduler `StorageIoConfig` knobs for file
@@ -93,8 +94,9 @@ Implemented and covered by automated tests:
   move/import evidence as separate indexed categories, and
   `scripts/certification_status.sh` reports each category separately before
   `scripts/post_soak_release_gate.sh` requires all three categories to pass.
-- Scheduler read returns can keep frame ownership through `scheduled_read_owned`
-  or consume frames into compatibility `Bytes` without copying payload bytes.
+- Scheduler read returns can keep frame ownership through `scheduled_read_owned`;
+  compatibility `Bytes` consume ordinary frame payloads without copy and copy
+  only when a registered slot lease must be returned to the uring backend.
 - Current real-device storage evidence includes local NVMe/SSD and the kspls0
   HDD-backed LVM media pool. The LVM report passes the required 5x wall-clock
   target at 8192 blocks and collapses backend reads from 8192 to 1.
@@ -106,7 +108,7 @@ Implemented and covered by automated tests:
 | Area | Gap | Risk | Next Work |
 | --- | --- | --- | --- |
 | Deterministic LVM PV placement control | The kspls0 extent probe shows the pool can allocate independent files on multiple rotational PVs, but ordinary path writes still do not let TorrentNG choose a specific PV. | Cross-PV behavior inside the LVM pool is allocator-dependent, so path-level scheduling cannot promise physical-drive affinity. | Use LVM extent mapping for evidence, or add lower-level PV-targeted probes only if release claims require deterministic per-drive placement. |
-| `io_uring` frame-pool slot pinning | `UringBackend` uses worker-owned fixed buffers when available and now exports `fixed_buffer_strategy=worker_copy`; the global frame pool does not yet hand out stable registered buffer slots. | Extra copies remain in the uring path, but metrics distinguish kernel fixed-buffer support from true application-frame zero-copy, and roadmap certification no longer treats worker-copy reports as final graduation. | Run `scripts/storage_uring_graduation.sh /target/root` with selected-backend, fixed-buffer, registered-file, throughput thresholds, and `TNG_STORAGE_URING_REQUIRE_FRAME_POOL_SLOTS=1` for the final gate. Add frame-pool slot leases through the backend API only after those reports prove `uring` should graduate from explicit opt-in. |
+| `io_uring` hardware graduation | `UringBackend` now returns owned reads from registered frame slots when available and exports `fixed_buffer_strategy=frame_pool_slots`; `auto` still selects the conservative `pread` baseline. | `io_uring` may regress on restricted kernels, filesystems, or storage hardware despite the lower-copy read path. | Run `scripts/storage_uring_graduation.sh /target/root` with selected-backend, fixed-buffer, registered-file, throughput thresholds, and `TNG_STORAGE_URING_REQUIRE_FRAME_POOL_SLOTS=1` before making `uring` eligible for automatic selection. |
 | Move/import certification | The certification runner now supports real-root fixture execution and indexed PASS/FAIL evidence, but representative multi-TB operator evidence is still host/run dependent. | Large library move/import claims should not be made from unit tests alone. | Run `TNG_STORAGE_MOVE_IMPORT_ROOT=/target/root TNG_STORAGE_MOVE_IMPORT_FILES=... TNG_STORAGE_MOVE_IMPORT_MIB_PER_FILE=... scripts/storage_move_import_certification.sh` on the target storage roots and publish the generated report. |
 
 ## Verification Commands

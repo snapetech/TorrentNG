@@ -136,10 +136,10 @@ impl FramePool {
 }
 ```
 
-The current `io_uring` backend can register worker-owned fixed buffers when the
-kernel accepts them. True global frame-pool slot pinning is still tracked as
-follow-up work because the frame pool does not yet lease stable registered
-buffer indexes to individual I/O operations.
+The current `io_uring` backend can return reads from registered frame slots
+when the kernel accepts fixed buffers. Those slot leases keep the frame-pool
+charge until the caller drops the returned frame; compatibility `Bytes`
+conversion copies only when it must return a registered slot lease.
 
 ### 2. Per-device elevator
 

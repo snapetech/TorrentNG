@@ -38,14 +38,14 @@ cat >"$report_dir/storage-uring-graduation-selftest.md" <<'REPORT'
 
 - Result: PASS
 - Selected: uring
-- Fixed-buffer strategy: worker_copy
+- Fixed-buffer strategy: frame_pool_slots
 
 ## Graduation Gates
 
 | Gate | Result |
 | --- | --- |
 | uring selected | PASS |
-| fixed-buffer strategy | INFO: worker_copy |
+| fixed-buffer strategy | INFO: frame_pool_slots |
 
 Overall status: PASS
 REPORT
@@ -88,7 +88,7 @@ require_row 'hardware matrix' PASS
 require_row 'io_uring capability/graduation' PASS
 require_row 'move/import' PASS
 grep -q 'storage-uring-graduation-selftest.md' "$index"
-grep -q '| uring | worker_copy |' "$index"
+grep -q '| uring | frame_pool_slots |' "$index"
 grep -q '| yes | PASS |' "$index"
 
 write_passing_report() {
