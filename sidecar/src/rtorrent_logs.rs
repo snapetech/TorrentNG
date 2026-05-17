@@ -345,7 +345,9 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "rtorrent_log_ingest_error");
         assert_eq!(events[0].level, "warn");
-        assert!(!events[0].message.contains(dir.path().to_string_lossy().as_ref()));
+        assert!(!events[0]
+            .message
+            .contains(dir.path().to_string_lossy().as_ref()));
 
         std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
         std::fs::write(&log_path, "ready\n").unwrap();

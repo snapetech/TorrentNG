@@ -148,9 +148,9 @@ async fn main() -> Result<()> {
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("http server")?;
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .context("http server")?;
 
     info!(
         component = "sidecar",

@@ -426,6 +426,8 @@ mod tests {
 
         let events = db.list_app_events_filtered(10, None, &[], Some(1)).unwrap();
         assert_eq!(events.len(), 3);
-        assert!(events.iter().all(|event| event.event_id.unwrap_or_default() > 1));
+        assert!(events
+            .iter()
+            .all(|event| event.event_id.unwrap_or_default() > 1));
     }
 }

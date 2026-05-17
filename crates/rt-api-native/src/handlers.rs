@@ -887,7 +887,7 @@ pub async fn list_session_events(
             (StatusCode::OK, Json(events))
         }
         Err(e) => {
-            tracing::warn!(component = "api", operation = "session_events", error = %e, "failed to list session events");
+            tracing::warn!(component = "api", operation = "session_events", result = "error", error = %e, "failed to list session events");
             (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(Vec::<SessionEventResponse>::new()),

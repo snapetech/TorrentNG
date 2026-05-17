@@ -264,7 +264,10 @@ mod tests {
     #[test]
     fn request_id_accepts_bounded_safe_header_values() {
         let mut headers = HeaderMap::new();
-        headers.insert("x-request-id", HeaderValue::from_static("client-123.trace/4"));
+        headers.insert(
+            "x-request-id",
+            HeaderValue::from_static("client-123.trace/4"),
+        );
         assert_eq!(request_id(&headers), "client-123.trace/4");
 
         headers.insert("x-request-id", HeaderValue::from_static("bad value"));

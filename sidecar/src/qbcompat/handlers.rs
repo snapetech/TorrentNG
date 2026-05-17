@@ -1413,15 +1413,15 @@ async fn torrents_file_prio(State(s): State<AppState>, Form(f): Form<FilePrioFor
             if let Ok(idx) = id_str.parse::<usize>() {
                 if let Err(e) = s.rt.set_file_priority(&hash, idx, priority).await {
                     tracing::warn!(
-                        component = "qbcompat",
-                        operation = "set_file_priority",
-                        torrent = %hash,
-                        file_index = idx,
-                        priority,
-                result = "error",
-                        error = %e,
-                        "qBit file priority update failed"
-                    );
+                            component = "qbcompat",
+                            operation = "set_file_priority",
+                            torrent = %hash,
+                            file_index = idx,
+                            priority,
+                    result = "error",
+                            error = %e,
+                            "qBit file priority update failed"
+                        );
                 }
             }
         }
@@ -1658,13 +1658,13 @@ async fn torrents_set_location(
             Ok(true) => {
                 if let Err(e) = s.db.set_torrent_location(&hash, location) {
                     tracing::warn!(
-                        component = "cache",
-                        operation = "set_location",
-                        torrent = %hash,
-                result = "error",
-                        error = %e,
-                        "cache location update failed"
-                    );
+                            component = "cache",
+                            operation = "set_location",
+                            torrent = %hash,
+                    result = "error",
+                            error = %e,
+                            "cache location update failed"
+                        );
                 } else {
                     emit_torrent_updated(&s, &hash);
                 }
@@ -1768,12 +1768,12 @@ async fn sync_maindata(
                     Ok(torrents) => torrents,
                     Err(e) => {
                         tracing::error!(
-                            component = "qbcompat",
-                            operation = "sync_maindata_serialize",
-                result = "error",
-                            error = %e,
-                            "qBit maindata serialization failed"
-                        );
+                                    component = "qbcompat",
+                                    operation = "sync_maindata_serialize",
+                        result = "error",
+                                    error = %e,
+                                    "qBit maindata serialization failed"
+                                );
                         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                     }
                 };
@@ -1806,12 +1806,12 @@ async fn sync_maindata(
                     Ok(torrents) => torrents,
                     Err(e) => {
                         tracing::error!(
-                            component = "qbcompat",
-                            operation = "sync_maindata_delta_serialize",
-                result = "error",
-                            error = %e,
-                            "qBit maindata delta serialization failed"
-                        );
+                                    component = "qbcompat",
+                                    operation = "sync_maindata_delta_serialize",
+                        result = "error",
+                                    error = %e,
+                                    "qBit maindata delta serialization failed"
+                                );
                         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                     }
                 };
@@ -2101,7 +2101,7 @@ fn append_operator_event(
         },
         s.cfg.logging.event_retention,
     ) {
-        tracing::warn!(component = "app_events", operation = "append", error = %e, "failed to append app event");
+        tracing::warn!(component = "app_events", operation = "append", result = "error", error = %e, "failed to append app event");
     }
 }
 
