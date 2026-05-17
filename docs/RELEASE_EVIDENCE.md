@@ -96,6 +96,13 @@ This gate fails on any `FAIL`, `MISSING`, `PASS_WITH_*`, `SKIP`,
 `STALE/INCOMPLETE`, or running/unknown certification row. Use the paired
 burndown report for exact remediation.
 
+To refresh status, burndown, strict readiness, and the evidence bundle in one
+release-blocking command, run:
+
+```sh
+scripts/release_evidence_suite.sh
+```
+
 ## Evidence Bundle
 
 Package the latest status and referenced reports:
