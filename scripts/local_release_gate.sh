@@ -87,6 +87,7 @@ skip_gate() {
     echo '```'
   } >>"$OUT"
   printf '| %s | SKIP | 0s |\n' "$name" >>"$OUT.table"
+  warnings=$((warnings + 1))
 }
 
 {

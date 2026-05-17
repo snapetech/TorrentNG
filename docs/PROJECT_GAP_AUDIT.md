@@ -43,6 +43,7 @@ Current `scripts/certification_status.sh` highlights:
 | Security review and scan | PASS |
 | Pre-engine release gate | PASS |
 | Post-soak release gate | PASS_WITH_WARNINGS while skipped/gap/stale rows remain |
+| Certification burndown | PASS_WITH_ACTIONS while warning rows remain |
 | Universal compatibility | PASS_WITH_SKIPS unless live/public/device legs are enabled |
 | Migration corpus | PASS_WITH_GAPS until exported corpora are populated |
 | 24h soak | STALE/INCOMPLETE |
@@ -177,6 +178,9 @@ are now explicit in the universal compatibility report and certification status.
 The post-soak release rollup now marks `PASS_WITH_GAPS`, `PASS_WITH_SKIPS`,
 `PASS_WITH_WARNINGS`, `SKIP`, and stale/running evidence rows as `WARN` instead
 of treating them as a clean evidence set.
+`scripts/certification_burndown.sh` turns those non-clean status rows into an
+action table with the exact commands or artifact drops needed to reach a clean
+release report.
 The full Docker interop matrix still has release evidence to run:
 
 - local Docker client-to-client rows across qBittorrent, Transmission, Deluge,
