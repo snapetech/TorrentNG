@@ -51,6 +51,9 @@ Environment:
   INTEROP_KEEP_PUBLIC_DATA=0
   INTEROP_CURL_MAX_TIME=10
   INTEROP_EXTENDED_LOCAL=1
+  INTEROP_PROTOCOL_LOCAL=1
+  INTEROP_PROTOCOL_ONLY=rust-magnet-with-tracker
+  INTEROP_EXPERIMENTAL_PROTOCOL=1
   INTEROP_WORKDIR=certification/interop
 USAGE
 }
@@ -276,6 +279,7 @@ make_torrent() {
   case "$mode" in
     tracker-webseed) args=(-a "$tracker" -w "$webseed") ;;
     tracker-only) args=(-a "$tracker") ;;
+    udp-tracker-only) args=(-a "udp://opentracker:6969/announce") ;;
     webseed-only) args=(-w "$webseed") ;;
     private-explicit) args=(-p) ;;
     *) echo "unknown torrent mode: $mode" >&2; return 1 ;;
@@ -287,6 +291,7 @@ make_torrent() {
     case "$mode" in
       tracker-webseed) cmd_args="-a '$tracker' -w '$webseed'" ;;
       tracker-only) cmd_args="-a '$tracker'" ;;
+      udp-tracker-only) cmd_args="-a 'udp://opentracker:6969/announce'" ;;
       webseed-only) cmd_args="-w '$webseed'" ;;
       private-explicit) cmd_args="-p" ;;
     esac
@@ -337,6 +342,15 @@ add_rust() {
   [[ -r "$torrent" ]] || { log "rusttorrentd torrent file is not readable: $(printf '%q' "$torrent")"; return 1; }
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
     -F "torrents=@$torrent" \
+    -F "savepath=$save_path" \
+    -F "paused=false" \
+    "$(client_url rusttorrentd)/api/qb/v2/torrents/add" >/dev/null
+}
+
+add_rust_url() {
+  local url="$1" save_path="$2"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
+    -F "urls=$url" \
     -F "savepath=$save_path" \
     -F "paused=false" \
     "$(client_url rusttorrentd)/api/qb/v2/torrents/add" >/dev/null
@@ -543,10 +557,14 @@ wait_clients_complete() {
 
 wait_explicit_peer_complete() {
   local timeout="$1" fixture="$2" info_hash="$3" peer_client="$4"; shift 4
-  local clients=("$@") start now progress
+  local clients=("$@") start now progress last_bridge=0
   start="$(date +%s)"
   while true; do
-    bridge_client_peer_to_rust "$peer_client" "$info_hash" || true
+    now="$(date +%s)"
+    if (( now - last_bridge >= ${INTEROP_EXPLICIT_PEER_REFRESH_SECS:-30} )); then
+      bridge_client_peer_to_rust "$peer_client" "$info_hash" || true
+      last_bridge="$now"
+    fi
     poll_rust_compat || true
     local all_done=1
     for client in "${clients[@]}"; do
@@ -554,7 +572,6 @@ wait_explicit_peer_complete() {
       awk -v p="$progress" 'BEGIN { exit !(p >= 0.999) }' || all_done=0
     done
     [[ "$all_done" == "1" ]] && return 0
-    now="$(date +%s)"
     if (( now - start > timeout )); then
       return 1
     fi
@@ -569,6 +586,14 @@ rust_observed_peers() {
 
 torrent_info_hash() {
   aria2c -S "$1" 2>/dev/null | awk -F': ' '/^Info Hash: / {print tolower($2); exit}'
+}
+
+torrent_name() {
+  aria2c -S "$1" 2>/dev/null | awk -F': ' '/^Name: / {print $2; exit}'
+}
+
+urlencode() {
+  jq -nr --arg v "$1" '$v|@uri'
 }
 
 bridge_client_peer_to_rust() {
@@ -820,6 +845,118 @@ run_rust_api_facade_case() {
   [[ "$status" == "PASS" ]]
 }
 
+run_magnet_tracker_case() {
+  local status="PASS" fixture torrent info_hash name magnet
+  append_report "## Protocol Local: rust-magnet-with-tracker"
+  append_report ""
+  log "running protocol local case rust-magnet-with-tracker"
+  fixture="$(case_fixture single-16m rust-magnet-with-tracker)"
+  torrent="$(make_torrent "$fixture" "$fixture" tracker-only)"
+  info_hash="$(torrent_info_hash "$torrent")"
+  name="$(torrent_name "$torrent")"
+  magnet="magnet:?xt=urn:btih:$info_hash&dn=$(urlencode "$name")&tr=$(urlencode 'http://opentracker:6969/announce')"
+  seed_fixture_for_client qbittorrent "$fixture"
+  add_to_client qbittorrent "$torrent" seed || status="FAIL"
+  add_rust_url "$magnet" "$(download_dir rusttorrentd)" || status="FAIL"
+  bridge_client_peer_to_rust qbittorrent "$info_hash" || true
+  wait_explicit_peer_complete "$TIMEOUT_LOCAL" "$fixture" "$info_hash" qbittorrent qbittorrent rusttorrentd || status="FAIL"
+  verify_fixture_hashes rusttorrentd "$fixture" || status="FAIL"
+  append_report "- Seeder: qbittorrent"
+  append_report "- Leecher: rusttorrentd"
+  append_report "- Fixture: single-16m"
+  append_report "- Add method: magnet URL with HTTP tracker"
+  append_report "- Info hash: $info_hash"
+  append_report "- Status: **$status**"
+  append_report ""
+  [[ "$status" == "PASS" ]]
+}
+
+run_udp_tracker_case() {
+  local status="PASS" fixture torrent info_hash
+  append_report "## Protocol Local: rust-udp-tracker"
+  append_report ""
+  log "running protocol local case rust-udp-tracker"
+  fixture="$(case_fixture single-16m rust-udp-tracker)"
+  torrent="$(make_torrent "$fixture" "$fixture" udp-tracker-only)"
+  info_hash="$(torrent_info_hash "$torrent")"
+  seed_fixture_for_client transmission "$fixture"
+  add_to_client transmission "$torrent" seed || status="FAIL"
+  add_to_client rusttorrentd "$torrent" || status="FAIL"
+  wait_clients_complete "$TIMEOUT_LOCAL" "$fixture" transmission rusttorrentd || status="FAIL"
+  verify_fixture_hashes rusttorrentd "$fixture" || status="FAIL"
+  append_report "- Seeder: transmission"
+  append_report "- Leecher: rusttorrentd"
+  append_report "- Fixture: single-16m"
+  append_report "- Tracker: udp://opentracker:6969/announce"
+  append_report "- Info hash: $info_hash"
+  append_report "- Status: **$status**"
+  append_report ""
+  [[ "$status" == "PASS" ]]
+}
+
+run_qbit_mutation_facade_case() {
+  local status="PASS" fixture torrent info_hash original replacement trackers
+  append_report "## Protocol Local: rust-qbit-mutation-facade"
+  append_report ""
+  log "running protocol local case rust-qbit-mutation-facade"
+  fixture="$(case_fixture multi-128m rust-qbit-mutation-facade)"
+  torrent="$(make_torrent "$fixture" "$fixture" tracker-only)"
+  info_hash="$(torrent_info_hash "$torrent")"
+  original="http://opentracker:6969/announce"
+  replacement="http://opentracker:6969/announce?rtng=edited"
+  add_to_client rusttorrentd "$torrent" || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
+    --data-urlencode "hash=$info_hash" \
+    --data-urlencode "id=0" \
+    --data-urlencode "priority=0" \
+    "$(client_url rusttorrentd)/api/qb/v2/torrents/filePrio" >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
+    --data-urlencode "hashes=$info_hash" \
+    "$(client_url rusttorrentd)/api/qb/v2/torrents/recheck" >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
+    --data-urlencode "hash=$info_hash" \
+    --data-urlencode "urls=http://127.0.0.1:9/dead-announce" \
+    "$(client_url rusttorrentd)/api/qb/v2/torrents/addTrackers" >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
+    --data-urlencode "hash=$info_hash" \
+    --data-urlencode "origUrl=$original" \
+    --data-urlencode "newUrl=$replacement" \
+    "$(client_url rusttorrentd)/api/qb/v2/torrents/editTracker" >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
+    --data-urlencode "hash=$info_hash" \
+    --data-urlencode "urls=http://127.0.0.1:9/dead-announce" \
+    "$(client_url rusttorrentd)/api/qb/v2/torrents/removeTrackers" >/dev/null || status="FAIL"
+  trackers="$(curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/qb/v2/torrents/trackers?hash=$info_hash" || true)"
+  jq -e --arg replacement "$replacement" '[.[].url] | index($replacement) != null' <<<"$trackers" >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/qb/v2/torrents/files?hash=$info_hash" |
+    jq -e 'type == "array" and length >= 1 and .[0].priority == 0' >/dev/null || status="FAIL"
+  append_report "- Target: rusttorrentd qBittorrent-compatible mutation endpoints"
+  append_report "- Checked: filePrio, recheck, addTrackers, editTracker, removeTrackers, trackers, files"
+  append_report "- Fixture: multi-128m"
+  append_report "- Info hash: $info_hash"
+  append_report "- Status: **$status**"
+  append_report ""
+  [[ "$status" == "PASS" ]]
+}
+
+run_protocol_local_matrix() {
+  local failures=0
+  [[ "${INTEROP_PROTOCOL_LOCAL:-1}" == "1" ]] || return 0
+  append_report "# Protocol Local Certification"
+  append_report ""
+  if [[ "${INTEROP_EXPERIMENTAL_PROTOCOL:-0}" == "1" &&
+    (-z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "rust-magnet-with-tracker") ]]; then
+    run_magnet_tracker_case || failures=$((failures + 1))
+  fi
+  if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "rust-udp-tracker" ]]; then
+    run_udp_tracker_case || failures=$((failures + 1))
+  fi
+  if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "rust-qbit-mutation-facade" ]]; then
+    run_qbit_mutation_facade_case || failures=$((failures + 1))
+  fi
+  (( failures == 0 ))
+}
+
 run_extended_local_matrix() {
   local failures=0
   [[ "$EXTENDED_LOCAL" == "1" ]] || return 0
@@ -1064,6 +1201,7 @@ run_local_matrix() {
     done
   fi
   run_extended_local_matrix || failures=$((failures + 1))
+  run_protocol_local_matrix || failures=$((failures + 1))
   (( failures == 0 ))
 }
 

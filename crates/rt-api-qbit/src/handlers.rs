@@ -248,6 +248,7 @@ pub async fn torrents_add(
     let mut urls = String::new();
     let mut category = String::new();
     let mut tags = Vec::<String>::new();
+    let mut added_url_torrent = false;
 
     while let Ok(Some(field)) = multipart.next_field().await {
         let name = field.name().map(str::to_owned);
@@ -306,6 +307,7 @@ pub async fn torrents_add(
                 tracing::error!("qb add magnet failed: {e}");
                 return (StatusCode::BAD_REQUEST, "Fails.").into_response();
             }
+            added_url_torrent = true;
             continue;
         }
         match fetch_torrent_url(url).await {
@@ -318,6 +320,9 @@ pub async fn torrents_add(
     }
 
     if torrent_blobs.is_empty() {
+        if added_url_torrent {
+            return (StatusCode::OK, "Ok.").into_response();
+        }
         return (StatusCode::BAD_REQUEST, "Fails.").into_response();
     }
 

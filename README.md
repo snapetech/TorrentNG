@@ -164,10 +164,11 @@ scripts/interop_matrix.sh --public
 The matrix runs `rusttorrentd` beside qBittorrent, Transmission, Deluge,
 rTorrent, opentracker, and a fixture HTTP server. Local mode verifies
 deterministic client-to-client transfers, webseeds, explicit private peers,
-restart recovery, churn, and API facade health. Public mode resolves official
-Debian, Ubuntu, and Fedora torrents at runtime and fully downloads them by
-default. See [docs/INTEROP_MATRIX.md](docs/INTEROP_MATRIX.md) for the full
-coverage table and release-gate commands.
+restart recovery, churn, protocol rows for UDP trackers and qBit mutation
+compatibility, experimental magnet coverage, and API facade health. Public mode
+resolves official Debian, Ubuntu, and Fedora torrents at runtime and fully
+downloads them by default. See [docs/INTEROP_MATRIX.md](docs/INTEROP_MATRIX.md)
+for the full coverage table and release-gate commands.
 
 ## Documentation
 

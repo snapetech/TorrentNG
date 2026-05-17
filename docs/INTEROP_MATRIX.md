@@ -109,6 +109,65 @@ Disable the extended cases for a narrower legacy local run:
 INTEROP_EXTENDED_LOCAL=0 scripts/interop_matrix.sh --local
 ```
 
+## Protocol Matrix
+
+Protocol local coverage is enabled by default with `INTEROP_PROTOCOL_LOCAL=1`.
+These rows sit between the deterministic transfer matrix and the public swarm
+matrix: they use local legal fixtures, but target specific BitTorrent protocol
+or compatibility behaviors.
+
+| Case | Coverage | Pass criteria | Status |
+|---|---|---|---|
+| `rust-magnet-with-tracker` | Rust adds a `btih` magnet URI with an HTTP tracker, fetches metadata from a reference seeder, and downloads the payload. | Complete and hash match | Experimental; API add works, metadata acquisition remains blocked |
+| `rust-udp-tracker` | Rust announces to opentracker through `udp://opentracker:6969/announce`. | Complete and hash match | Implemented |
+| `rust-qbit-mutation-facade` | qBittorrent-compatible `filePrio`, `recheck`, tracker add/edit/remove, `trackers`, and `files` endpoints. | Endpoints succeed and reflected state is visible | Implemented |
+| `magnet-dht-only` | Magnet metadata and peer discovery without trackers. | Complete and hash match | Planned |
+| `multi-tracker-fallback` | Dead tracker in the first tier, working tracker fallback. | Rust completes through fallback tracker | Planned |
+| `private-torrent-no-dht-pex` | Private torrent policy enforcement. | DHT/PEX disabled and explicit peer transfer still works | Planned |
+| `partial-file-selection` | Multi-file priority and wanted/unwanted file behavior during transfer. | Wanted files complete; skipped files remain absent or sparse | Planned |
+| `force-recheck-corruption-repair` | Corrupt an on-disk block, force recheck, and redownload. | Corruption detected and repaired | Planned |
+| `resume-after-partial-download` | Stop Rust mid-transfer and resume from persisted partial data. | Progress is retained and final hash matches | Planned |
+| `endgame-multi-peer` | Last-piece contention with multiple seeders. | Completes without duplicate-write corruption or stalls | Planned |
+| `rust-seeds-to-all-reference-clients` | Rust as the only long-running seeder for qBit, Transmission, Deluge, and rTorrent. | All reference clients complete from Rust alone | Planned |
+
+Disable protocol rows while debugging only the older deterministic cases:
+
+```sh
+INTEROP_PROTOCOL_LOCAL=0 scripts/interop_matrix.sh --local
+```
+
+Run one protocol row while developing it:
+
+```sh
+INTEROP_PROTOCOL_ONLY=rust-udp-tracker scripts/interop_matrix.sh --local
+```
+
+Run experimental protocol rows, including the currently blocked magnet metadata
+case:
+
+```sh
+INTEROP_EXPERIMENTAL_PROTOCOL=1 INTEROP_PROTOCOL_ONLY=rust-magnet-with-tracker scripts/interop_matrix.sh --local
+```
+
+## Expansion Backlog
+
+These rows are not required by the default gate yet. They define the remaining
+coverage needed before claiming broad BitTorrent compatibility rather than
+strong baseline interoperability.
+
+| Area | Planned rows |
+|---|---|
+| Magnet links | `magnet-with-tracker`, `magnet-dht-only`, `magnet-metadata-from-qbit`, `magnet-metadata-from-transmission`, `magnet-resume-after-restart` |
+| DHT, PEX, LSD | `dht-only-discovery`, `pex-peer-discovery`, `lsd-docker-lan-discovery`, `dht-bootstrap-recovery-after-restart` |
+| Trackers | `http-tracker-announce-scrape`, `udp-tracker-announce-scrape`, `multi-tracker-tiers`, `tracker-failure-fallback`, `private-tracker-policy` |
+| Protocol behavior | `extension-handshake`, `ut-metadata`, `fast-extension`, `choke-unchoke-contention`, `optimistic-unchoke`, `endgame-mode`, `rarest-first-partial-availability` |
+| File layouts | `single-file`, `deep-multi-file-tree`, `empty-files`, `unicode-paths`, `space-and-shell-hostile-paths`, `small-piece-size`, `large-piece-size`, `partial-file-selection` |
+| State and recovery | `pause-resume-persistence`, `force-recheck`, `move-storage-path`, `delete-torrent-only`, `delete-with-data`, `resume-partial-files`, `corrupt-block-repair`, `missing-file-recovery` |
+| API compatibility | `qbit-arr-endpoints`, `transmission-write-rpc`, `deluge-write-json-rpc`, `error-shape-compatibility`, `tracker-mutation-compatibility`, `file-priority-compatibility` |
+| Performance and stress | `hundreds-small-torrents`, `many-peers-per-torrent`, `parallel-public-torrents`, `long-active-soak`, `memory-fd-growth`, `rate-limit-behavior` |
+| Network adversity | `reference-client-restart`, `rust-restart-mid-transfer`, `tracker-outage`, `webseed-outage-fallback`, `slow-peer`, `corrupt-peer`, `peer-disconnect-churn`, `ipv6-transfer` |
+| Seeding | `rust-long-running-seeder`, `upload-accounting`, `ratio-seed-limit`, `time-seed-limit`, `multiple-leechers-from-rust`, `reference-clients-complete-from-rust-alone` |
+
 ## Public Matrix
 
 Public mode resolves legal torrents from official project infrastructure at
@@ -198,6 +257,9 @@ INTEROP_KEEP_STACK=1 scripts/interop_matrix.sh --local
 | `INTEROP_PUBLIC_ONLY` | unset | Run one public source, such as `debian`, `ubuntu`, or `fedora` |
 | `INTEROP_EXTENDED_LOCAL` | `1` | Include extended local coverage |
 | `INTEROP_EXTENDED_ONLY` | `0` | Run only the extended local rows |
+| `INTEROP_PROTOCOL_LOCAL` | `1` | Include protocol-specific local coverage |
+| `INTEROP_PROTOCOL_ONLY` | unset | Run one protocol row by case name |
+| `INTEROP_EXPERIMENTAL_PROTOCOL` | `0` | Include protocol rows that document known blockers |
 | `INTEROP_SKIP_BUILD` | `0` | Reuse an existing interop image instead of building |
 | `INTEROP_KEEP_STACK` | `0` | Leave containers running after the script exits |
 | `INTEROP_KEEP_PUBLIC_DATA` | `0` | Preserve public torrent payloads after report generation |
