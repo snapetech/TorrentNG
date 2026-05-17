@@ -67,6 +67,7 @@ pub struct StorageConfig {
 pub struct MemoryConfig {
     pub total_cap_mb: u64,
     pub storage_frame_cap_mb: u64,
+    pub queued_disk_cap_mb: u64,
     pub piece_assembly_cap_mb: u64,
     pub peer_buffer_cap_mb: u64,
     pub metadata_cap_mb: u64,
@@ -153,6 +154,7 @@ impl Default for MemoryConfig {
         MemoryConfig {
             total_cap_mb: 512,
             storage_frame_cap_mb: 128,
+            queued_disk_cap_mb: 64,
             piece_assembly_cap_mb: 128,
             peer_buffer_cap_mb: 128,
             metadata_cap_mb: 32,
@@ -286,6 +288,7 @@ mod tests {
         assert_eq!(c.daemon.shutdown_timeout_secs, 10);
         assert_eq!(c.memory.total_cap_mb, 512);
         assert_eq!(c.memory.storage_frame_cap_mb, 128);
+        assert_eq!(c.memory.queued_disk_cap_mb, 64);
         assert!(c.runtime.torrent_tiers_enabled);
         assert!(c.storage.device_elevator_enabled);
     }

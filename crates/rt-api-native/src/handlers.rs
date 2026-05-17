@@ -928,6 +928,13 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
     );
     metric(
         &mut out,
+        "torrentng_storage_queued_disk_bytes",
+        "gauge",
+        "Estimated process-owned bytes represented by queued disk and hash jobs",
+        stats.storage_queued_disk_bytes,
+    );
+    metric(
+        &mut out,
         "torrentng_storage_dirty_files",
         "gauge",
         "Dirty files tracked by running torrent schedulers",
@@ -1958,6 +1965,7 @@ mod tests {
             storage_file_pool_hits: 5,
             storage_read_ops: 6,
             storage_hash_ops: 7,
+            storage_queued_disk_bytes: 54,
             storage_peer_read_cache_hits: 8,
             piece_assembly_evictions: 9,
             storage_backend_read_ops: 14,
@@ -2043,6 +2051,7 @@ mod tests {
         assert!(rendered.contains("torrentng_storage_file_pool_hits_total 5"));
         assert!(rendered.contains("torrentng_storage_read_ops_total 6"));
         assert!(rendered.contains("torrentng_storage_hash_ops_total 7"));
+        assert!(rendered.contains("torrentng_storage_queued_disk_bytes 54"));
         assert!(rendered.contains("torrentng_storage_peer_read_cache_hits_total 8"));
         assert!(rendered.contains("torrentng_piece_assembly_evictions_total 9"));
         assert!(rendered.contains("torrentng_peer_request_window_reductions_total 40"));

@@ -136,8 +136,10 @@ impl FramePool {
 }
 ```
 
-Frames are registered with io_uring as fixed buffers when that backend is
-active (removes per-op buffer pinning).
+The current `io_uring` backend can register worker-owned fixed buffers when the
+kernel accepts them. True global frame-pool slot pinning is still tracked as
+follow-up work because the frame pool does not yet lease stable registered
+buffer indexes to individual I/O operations.
 
 ### 2. Per-device elevator
 

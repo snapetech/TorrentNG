@@ -6,6 +6,8 @@ libraries without mmap as the primary data path.
 
 The executable feature matrix for this storage branch lives in
 [`STORAGE_NG_TEST_MATRIX.md`](STORAGE_NG_TEST_MATRIX.md).
+Open storage and memory follow-up work is tracked in
+[`STORAGE_MEMORY_GAP_REGISTER.md`](STORAGE_MEMORY_GAP_REGISTER.md).
 
 ## Previous Gap
 

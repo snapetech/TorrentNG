@@ -3,7 +3,7 @@ use std::sync::{
     Arc,
 };
 
-pub const MEMORY_CLASS_COUNT: usize = 8;
+pub const MEMORY_CLASS_COUNT: usize = 9;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
@@ -15,7 +15,8 @@ pub enum MemoryClass {
     Metadata = 4,
     TrackerPeers = 5,
     DhtTable = 6,
-    ApiSnapshot = 7,
+    QueuedDisk = 7,
+    ApiSnapshot = 8,
 }
 
 impl MemoryClass {
@@ -27,6 +28,7 @@ impl MemoryClass {
         MemoryClass::Metadata,
         MemoryClass::TrackerPeers,
         MemoryClass::DhtTable,
+        MemoryClass::QueuedDisk,
         MemoryClass::ApiSnapshot,
     ];
 
@@ -39,6 +41,7 @@ impl MemoryClass {
             MemoryClass::Metadata => "metadata",
             MemoryClass::TrackerPeers => "tracker_peers",
             MemoryClass::DhtTable => "dht_table",
+            MemoryClass::QueuedDisk => "queued_disk",
             MemoryClass::ApiSnapshot => "api_snapshot",
         }
     }
@@ -82,6 +85,7 @@ impl Default for ResourceGovernorConfig {
                 128 * mib,
                 128 * mib,
                 128 * mib,
+                32 * mib,
                 32 * mib,
                 32 * mib,
                 32 * mib,
@@ -270,7 +274,7 @@ mod tests {
     fn config() -> ResourceGovernorConfig {
         ResourceGovernorConfig {
             total_cap_bytes: 100,
-            class_caps_bytes: [50, 80, 80, 80, 80, 80, 80, 80],
+            class_caps_bytes: [50, 80, 80, 80, 80, 80, 80, 80, 80],
             pressure_constrained_pct: 60,
             pressure_critical_pct: 90,
         }

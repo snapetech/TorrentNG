@@ -390,6 +390,7 @@ rTorrent over XMLRPC.
 | `torrentng_dht_*` | gauge | Native DHT routing table, lookup, tracked torrent, and announced peer cache counts |
 | `torrentng_storage_file_pool_*` | gauge/counter | Native scheduler open-file cache capacity, open files, hits, misses, evictions, and idle closes |
 | `torrentng_storage_*_queue_depth` | gauge | Native disk I/O and hashing queue depths |
+| `torrentng_storage_queued_disk_bytes` | gauge | Estimated process-owned bytes represented by queued disk, hash, and peer-read elevator jobs |
 | `torrentng_storage_{read,write}_ops_total` | counter | Positioned disk operations through native schedulers |
 | `torrentng_storage_bytes_{read,written}_total` | counter | Bytes moved through native schedulers |
 | `torrentng_storage_*_by_class_total{class=...}` | counter | Read/write operation and byte counters split by scheduler I/O class |
@@ -417,7 +418,7 @@ rTorrent over XMLRPC.
 | `torrentng_hot_torrent_tracker_peer_bytes{rank,info_hash}` | gauge | Tracker peer-cache portion of each hot-torrent memory estimate |
 | `torrentng_hot_torrent_peer_command_queue_bytes{rank,info_hash}` | gauge | Peer command queue portion of each hot-torrent memory estimate |
 | `torrentng_hot_torrent_storage_cache_bytes{rank,info_hash}` | gauge | Per-torrent storage cache portion of each hot-torrent memory estimate |
-| `torrentng_memory_*` | gauge/counter | Resource governor cap, current process-owned usage, pressure state, per-class caps/usage, and denied allocations |
+| `torrentng_memory_*` | gauge/counter | Resource governor cap, current process-owned usage, pressure state, per-class caps/usage, and denied allocations, including the `queued_disk` class |
 | `torrentng_api_requests_total` | counter | API requests served |
 | `torrentng_sync_cycles_total` | counter | Track 1 sidecar rTorrent sync cycles completed |
 | `torrentng_sync_errors_total` | counter | Track 1 sidecar rTorrent sync cycle errors |

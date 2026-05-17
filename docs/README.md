@@ -44,6 +44,8 @@ certified status.
 - [STORAGE_PHASE_B_TEST_MATRIX.md](STORAGE_PHASE_B_TEST_MATRIX.md) - focused
   matrix for storage topology, auto preallocation, peer-read locality, and
   per-device elevator work.
+- [STORAGE_MEMORY_GAP_REGISTER.md](STORAGE_MEMORY_GAP_REGISTER.md) - current
+  storage and memory gaps that still need implementation or hardware evidence.
 - [ENGINE_REWRITE_BURNDOWN.md](ENGINE_REWRITE_BURNDOWN.md) - implementation
   checklist for the native rewrite.
 

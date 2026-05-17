@@ -17,6 +17,7 @@ device_elevator_enabled = true
 [memory]
 total_cap_mb = 512
 storage_frame_cap_mb = 128
+queued_disk_cap_mb = 64
 piece_assembly_cap_mb = 128
 peer_buffer_cap_mb = 128
 metadata_cap_mb = 32

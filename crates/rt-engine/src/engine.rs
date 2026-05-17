@@ -86,6 +86,8 @@ fn resource_config_from_config(config: &Config) -> ResourceGovernorConfig {
         config.memory.metadata_cap_mb.saturating_mul(mib);
     class_caps_bytes[MemoryClass::DhtTable as usize] =
         config.memory.metadata_cap_mb.saturating_mul(mib);
+    class_caps_bytes[MemoryClass::QueuedDisk as usize] =
+        config.memory.queued_disk_cap_mb.saturating_mul(mib);
     class_caps_bytes[MemoryClass::ApiSnapshot as usize] =
         config.memory.metadata_cap_mb.saturating_mul(mib) / 2;
     ResourceGovernorConfig {
@@ -2429,6 +2431,8 @@ impl Engine {
             .saturating_add(stats.dht_announced_peers.saturating_mul(32))
             .saturating_add(stats.dht_queried_nodes.saturating_mul(32))
             .saturating_add(stats.dht_outstanding_requests.saturating_mul(64));
+        let queued_disk = MemoryClass::QueuedDisk as usize;
+        resources.classes[queued_disk].used_bytes = stats.storage_queued_disk_bytes;
         resources.total_used_bytes = resources
             .classes
             .iter()
@@ -5026,6 +5030,10 @@ mod tests {
         assert_eq!(
             resources.classes[MemoryClass::DhtTable as usize].used_bytes,
             11 * 64 + 13 * 32 + 16 * 32 + 15 * 64
+        );
+        assert_eq!(
+            resources.classes[MemoryClass::QueuedDisk as usize].used_bytes,
+            stats.storage_queued_disk_bytes
         );
         assert!(resources.total_used_bytes >= 4096);
     }
