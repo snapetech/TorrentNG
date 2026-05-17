@@ -23,6 +23,8 @@ export function SavedViewsBar({ params, onApply }: Props) {
     queryFn: api.savedViews.list,
     staleTime: 30_000,
   })
+  const activeParams = cleanParams(params)
+  const activeKey = JSON.stringify(activeParams)
 
   async function saveView() {
     const trimmed = name.trim()
@@ -60,47 +62,70 @@ export function SavedViewsBar({ params, onApply }: Props) {
   }
 
   return (
-    <div style={{
+    <div className="rtng-savedviews" style={{
       display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap',
       padding: '6px 12px', background: 'var(--surface)', borderBottom: '1px solid var(--border)',
       fontSize: 12,
     }}>
-      <span style={{ color: 'var(--faint)', fontWeight: 600 }}>Views</span>
-      {error && <span style={{ color: 'var(--danger)' }}>{error}</span>}
+      <span style={{
+        color: 'var(--faint)', fontWeight: 800, textTransform: 'uppercase', fontSize: 10,
+        letterSpacing: 0, display: 'inline-flex', alignItems: 'center', gap: 5,
+      }}>
+        <span style={{ color: 'var(--accent)' }}>◇</span>
+        Views
+      </span>
+      {error && <span style={{
+        color: 'var(--danger)',
+        background: 'color-mix(in srgb, var(--danger) 9%, transparent)',
+        border: '1px solid color-mix(in srgb, var(--danger) 38%, var(--border))',
+        borderRadius: 999,
+        padding: '2px 8px',
+      }}>{error}</span>}
 
-      {views.map(view => (
-        <span key={view.id} style={{
-          display: 'inline-flex', alignItems: 'center', gap: 4,
-          background: 'var(--surface-2)', border: '1px solid var(--border-strong)', borderRadius: 5,
-          overflow: 'hidden',
-        }}>
-          <button
-            onClick={() => onApply(view.params)}
-            disabled={Boolean(busy)}
-            title={JSON.stringify(view.params)}
-            style={{
-              background: 'transparent', border: 'none', color: 'var(--muted)',
-              padding: '3px 8px', fontSize: 12,
-              cursor: busy ? 'not-allowed' : 'pointer', opacity: busy ? 0.55 : 1,
-            }}
-          >
-            {view.name}
-          </button>
-          <button
-            onClick={() => removeView(view.id)}
-            disabled={Boolean(busy)}
-            style={{
-              background: 'transparent', border: 'none', borderLeft: '1px solid var(--border-strong)',
-              color: 'var(--faint)', padding: '3px 6px', fontSize: 11,
-              cursor: busy ? 'not-allowed' : 'pointer', opacity: busy ? 0.55 : 1,
-            }}
-          >
-            {busy === view.id ? '…' : 'x'}
-          </button>
-        </span>
-      ))}
+      {views.map(view => {
+        const isActive = JSON.stringify(cleanParams(view.params)) === activeKey
+        return (
+          <span key={view.id} className="rtng-savedview-chip" data-active={isActive} style={{
+            display: 'inline-flex', alignItems: 'center', gap: 4,
+            background: isActive ? 'var(--accent-soft)' : 'var(--surface-2)',
+            border: '1px solid ' + (isActive ? 'var(--accent)' : 'var(--border-strong)'),
+            borderRadius: 5,
+            overflow: 'hidden',
+          }}>
+            <button
+              onClick={() => onApply(view.params)}
+              disabled={Boolean(busy)}
+              title={JSON.stringify(view.params)}
+              style={{
+                background: 'transparent', border: 'none',
+                color: isActive ? 'var(--accent-text)' : 'var(--muted)',
+                padding: '3px 8px', fontSize: 12,
+                fontWeight: isActive ? 800 : 500,
+                cursor: busy ? 'not-allowed' : 'pointer', opacity: busy ? 0.55 : 1,
+              }}
+            >
+              {view.name}
+            </button>
+            <button
+              onClick={() => removeView(view.id)}
+              disabled={Boolean(busy)}
+              style={{
+                background: 'transparent', border: 'none', borderLeft: '1px solid var(--border-strong)',
+                color: 'var(--faint)', padding: '3px 6px', fontSize: 11,
+                cursor: busy ? 'not-allowed' : 'pointer', opacity: busy ? 0.55 : 1,
+              }}
+            >
+              {busy === view.id ? '…' : 'x'}
+            </button>
+          </span>
+        )
+      })}
 
-      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginLeft: views.length ? 4 : 0 }}>
+      {views.length === 0 && !error && (
+        <span style={{ color: 'var(--faint)', fontSize: 11 }}>No saved views yet</span>
+      )}
+
+      <div className="rtng-savedview-save" style={{ display: 'flex', alignItems: 'center', gap: 6, marginLeft: views.length ? 4 : 0 }}>
         <input
           value={name}
           onChange={e => setName(e.target.value)}

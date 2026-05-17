@@ -57,6 +57,16 @@ export function FilterBar({ params, onChange }: Props) {
             outline: 'none',
           }}
         />
+        {search && (
+          <span style={{
+            color: 'var(--accent-text)', background: 'var(--accent-soft)',
+            border: '1px solid color-mix(in srgb, var(--accent) 45%, var(--border))',
+            borderRadius: 999, padding: '1px 6px', fontSize: 10, fontWeight: 800,
+            whiteSpace: 'nowrap',
+          }}>
+            live
+          </span>
+        )}
       </label>
 
       {(params.filter || search) && (
@@ -119,7 +129,7 @@ export function FilterBar({ params, onChange }: Props) {
       {chips.length > 0 && (
         <div className="rtng-filterbar-chips" style={{ display: 'flex', gap: 5, flexWrap: 'wrap', minWidth: 0 }}>
           {chips.map(([label, value, key]) => (
-            <span key={`${label}:${value}`} title={value} style={{
+            <span key={`${label}:${value}`} className="rtng-filter-chip" title={value} style={{
               display: 'inline-flex', alignItems: 'center', gap: 4,
               maxWidth: 190, border: '1px solid var(--border)', borderRadius: 999,
               background: 'var(--surface)', color: 'var(--muted)', padding: '2px 7px',

@@ -18,6 +18,7 @@ KEEP_STACK="${INTEROP_KEEP_STACK:-0}"
 KEEP_PUBLIC_DATA="${INTEROP_KEEP_PUBLIC_DATA:-0}"
 RUST_TOKEN="${INTEROP_RUST_TOKEN:-interop-token}"
 CURL_MAX_TIME="${INTEROP_CURL_MAX_TIME:-10}"
+EXTENDED_LOCAL="${INTEROP_EXTENDED_LOCAL:-1}"
 
 CLIENTS=(rusttorrentd qbittorrent transmission deluge rtorrent)
 LOCAL_CASES=(
@@ -48,6 +49,7 @@ Environment:
   INTEROP_KEEP_STACK=1
   INTEROP_KEEP_PUBLIC_DATA=0
   INTEROP_CURL_MAX_TIME=10
+  INTEROP_EXTENDED_LOCAL=1
   INTEROP_WORKDIR=certification/interop
 USAGE
 }
@@ -235,9 +237,12 @@ ensure_mktorrent() {
 
 create_fixture_files() {
   log "creating deterministic local fixtures"
-  mkdir -p "$WORKDIR/fixtures/single-16m" "$WORKDIR/fixtures/multi-128m" "$WORKDIR/fixtures/churn"
+  mkdir -p "$WORKDIR/fixtures/single-16m" "$WORKDIR/fixtures/single-64m" "$WORKDIR/fixtures/multi-128m" "$WORKDIR/fixtures/churn"
   if [[ ! -f "$WORKDIR/fixtures/single-16m/payload.bin" ]]; then
     dd if=/dev/zero of="$WORKDIR/fixtures/single-16m/payload.bin" bs=1M count=16 status=none
+  fi
+  if [[ ! -f "$WORKDIR/fixtures/single-64m/payload.bin" ]]; then
+    dd if=/dev/zero of="$WORKDIR/fixtures/single-64m/payload.bin" bs=1M count=64 status=none
   fi
   if [[ ! -f "$WORKDIR/fixtures/multi-128m/part-07.bin" ]]; then
     for i in $(seq -w 0 7); do
@@ -261,15 +266,30 @@ case_fixture() {
 }
 
 make_torrent() {
-  local fixture="$1" name="$2" out
+  local fixture="$1" name="$2" mode="${3:-tracker-webseed}" out
   out="$WORKDIR/torrents/$name.torrent"
   [[ -f "$out" ]] && { echo "$out"; return; }
   local tracker="http://opentracker:6969/announce"
   local webseed="http://fixture-http/$fixture"
+  local args=()
+  case "$mode" in
+    tracker-webseed) args=(-a "$tracker" -w "$webseed") ;;
+    tracker-only) args=(-a "$tracker") ;;
+    webseed-only) args=(-w "$webseed") ;;
+    private-explicit) args=(-p) ;;
+    *) echo "unknown torrent mode: $mode" >&2; return 1 ;;
+  esac
   if [[ "$(ensure_mktorrent)" == "host" ]]; then
-    mktorrent -a "$tracker" -w "$webseed" -o "$out" "$WORKDIR/fixtures/$fixture" >/dev/null
+    mktorrent "${args[@]}" -o "$out" "$WORKDIR/fixtures/$fixture" >/dev/null
   else
-    docker_tool "apk add --no-cache mktorrent >/dev/null && mktorrent -a '$tracker' -w '$webseed' -o '/work/torrents/$name.torrent' '/work/fixtures/$fixture' >/dev/null" >/dev/null
+    local cmd_args=""
+    case "$mode" in
+      tracker-webseed) cmd_args="-a '$tracker' -w '$webseed'" ;;
+      tracker-only) cmd_args="-a '$tracker'" ;;
+      webseed-only) cmd_args="-w '$webseed'" ;;
+      private-explicit) cmd_args="-p" ;;
+    esac
+    docker_tool "apk add --no-cache mktorrent >/dev/null && mktorrent $cmd_args -o '/work/torrents/$name.torrent' '/work/fixtures/$fixture' >/dev/null" >/dev/null
   fi
   echo "$out"
 }

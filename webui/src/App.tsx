@@ -4,6 +4,7 @@ import { useTorrentsInfinite, flattenPages, useHealth } from './hooks/useTorrent
 import { useWebSocket } from './hooks/useWebSocket'
 import { TorrentTable } from './components/TorrentTable'
 import { FilterBar } from './components/FilterBar'
+import { SavedViewsBar } from './components/SavedViewsBar'
 import { TorrentDetail } from './components/TorrentDetail'
 import { AddTorrentDialog } from './components/AddTorrentDialog'
 import { UserAgentPanel } from './components/UserAgentPanel'
@@ -585,6 +586,9 @@ export function App() {
 
       {view === 'torrents' && (
         <FilterBar params={params} onChange={updateParams} />
+      )}
+      {view === 'torrents' && (
+        <SavedViewsBar params={params} onApply={applySavedView} />
       )}
       {view === 'torrents' && (
         <TorrentToolbar
