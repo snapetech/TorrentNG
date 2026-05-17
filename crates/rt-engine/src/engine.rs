@@ -4254,6 +4254,8 @@ mod tests {
                     connected_peers: 1,
                     outstanding_requests: 2,
                     fastresume_dirty_pieces: 3,
+                    completed_piece_verify_from_memory: 4,
+                    completed_piece_verify_from_disk: 5,
                     piece_assembly_buffers: 2,
                     piece_assembly_bytes: 4096,
                     piece_assembly_evictions: 1,
@@ -4319,6 +4321,8 @@ mod tests {
             if let Some(TorrentCmd::GetRuntimeStats { reply }) = runtime_rx.recv().await {
                 let _ = reply.send(crate::command::TorrentRuntimeStats {
                     fastresume_dirty_pieces: 3,
+                    completed_piece_verify_from_memory: 4,
+                    completed_piece_verify_from_disk: 5,
                     piece_assembly_buffers: 2,
                     piece_assembly_bytes: 4096,
                     piece_assembly_evictions: 1,
@@ -4684,6 +4688,8 @@ mod tests {
             if let Some(TorrentCmd::GetRuntimeStats { reply }) = torrent_rx.recv().await {
                 let _ = reply.send(crate::command::TorrentRuntimeStats {
                     fastresume_dirty_pieces: 3,
+                    completed_piece_verify_from_memory: 4,
+                    completed_piece_verify_from_disk: 5,
                     piece_assembly_buffers: 2,
                     piece_assembly_bytes: 4096,
                     piece_assembly_evictions: 1,
@@ -4765,6 +4771,8 @@ mod tests {
         assert_eq!(stats.trackers_error, 1);
         assert_eq!(stats.torrent_tasks_active, 1);
         assert_eq!(stats.fastresume_dirty_pieces, 3);
+        assert_eq!(stats.completed_piece_verify_from_memory, 4);
+        assert_eq!(stats.completed_piece_verify_from_disk, 5);
         assert_eq!(stats.torrents_activity_hot, 1);
         assert_eq!(stats.torrents_activity_warm, 0);
         assert_eq!(stats.torrents_activity_dormant, 0);

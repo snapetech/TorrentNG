@@ -454,6 +454,32 @@ async fn storage_recheck_hashing_reports_scheduler_result_without_runtime_stall(
     assert!(stats.hash_ops >= 2);
 }
 
+#[tokio::test]
+async fn completed_piece_ram_hash_avoids_read_after_write_backend_reads() {
+    let scheduler = MountScheduler::new(
+        StorageRootId::new(),
+        &SchedulerConfig {
+            profile: StorageProfile::Ssd,
+            ..Default::default()
+        },
+    );
+    let piece = bytes::Bytes::from(vec![0x42u8; 1024 * 1024]);
+    let hash = scheduler.hash_sha1(piece.clone()).await.unwrap();
+    let before = scheduler.stats();
+    let verified = scheduler.hash_sha1(piece).await.unwrap();
+    let after = scheduler.stats();
+
+    assert_eq!(verified, hash);
+    let before_backend_reads = before.backend_read_ops_by_class.iter().sum::<u64>();
+    let after_backend_reads = after.backend_read_ops_by_class.iter().sum::<u64>();
+    assert_eq!(
+        after_backend_reads - before_backend_reads,
+        0,
+        "RAM piece verification must not perform read-after-write disk I/O"
+    );
+    assert_eq!(after.hash_ops - before.hash_ops, 1);
+}
+
 #[test]
 fn crash_watermark_bounds_restart_recheck_to_dirty_pieces() {
     let piece_count = 100_000u32;

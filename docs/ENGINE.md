@@ -165,6 +165,9 @@ metadata_only           — no file I/O (metadata/announce only)
 - Sparse-aware recheck maps data extents with `SEEK_DATA`/`SEEK_HOLE` where
   available, hashes sparse holes as zeroes, and skips reading hole bytes from
   disk. Unsupported filesystems fall back to contiguous reads.
+- Completed download pieces are verified from assembled in-memory piece data on
+  the dedicated hashing pool whenever the full piece is still buffered; disk
+  re-read verification is only the fallback for evicted or oversized pieces.
 - HDD vs SSD/NVMe I/O profile
 - Sequential vs random pressure awareness
 - Priority: recheck < background seeding < active downloads < active streams (future)

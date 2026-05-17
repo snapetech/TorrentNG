@@ -312,6 +312,8 @@ pub struct TorrentTask {
     piece_assembly_bytes: usize,
     piece_assembly_evictions: u64,
     dirty_pieces_since_barrier: HashSet<u32>,
+    completed_piece_verify_from_memory: u64,
+    completed_piece_verify_from_disk: u64,
     prepared_files: Mutex<HashSet<u32>>,
     paused: bool,
     max_peers: usize,
@@ -403,6 +405,8 @@ impl TorrentTask {
             piece_assembly_bytes: 0,
             piece_assembly_evictions: 0,
             dirty_pieces_since_barrier: HashSet::new(),
+            completed_piece_verify_from_memory: 0,
+            completed_piece_verify_from_disk: 0,
             prepared_files: Mutex::new(HashSet::new()),
             paused,
             max_peers,
@@ -1006,6 +1010,8 @@ impl TorrentTask {
                 .map(|peer| peer.outstanding as u64)
                 .sum(),
             fastresume_dirty_pieces: self.dirty_pieces_since_barrier.len() as u64,
+            completed_piece_verify_from_memory: self.completed_piece_verify_from_memory,
+            completed_piece_verify_from_disk: self.completed_piece_verify_from_disk,
             piece_assembly_buffers: self.piece_assemblies.len() as u64,
             piece_assembly_bytes: self.piece_assembly_bytes as u64,
             piece_assembly_evictions: self.piece_assembly_evictions,
@@ -1372,6 +1378,7 @@ impl TorrentTask {
 
     async fn handle_block(&mut self, block: BlockEvent) {
         let piece = block.piece;
+        let aggregate_piece_write = self.can_aggregate_piece_write(piece);
         if let Err(e) = self.record_piece_block(&block) {
             warn!(
                 torrent = %self.info_hash_hex,
@@ -1384,16 +1391,18 @@ impl TorrentTask {
             self.picker.reject_piece(piece as usize);
             return;
         }
-        if let Err(e) = self.write_block(&block).await {
-            warn!(
-                torrent = %self.info_hash_hex,
-                piece,
-                offset = block.offset,
-                err = %e,
-                "block write failed"
-            );
-            self.remove_piece_assembly(piece);
-            return;
+        if !aggregate_piece_write {
+            if let Err(e) = self.write_block(&block).await {
+                warn!(
+                    torrent = %self.info_hash_hex,
+                    piece,
+                    offset = block.offset,
+                    err = %e,
+                    "block write failed"
+                );
+                self.remove_piece_assembly(piece);
+                return;
+            }
         }
         self.record_download(block.data.len() as u64).await;
 
@@ -1403,6 +1412,19 @@ impl TorrentTask {
         if complete {
             match self.verify_completed_piece(block.piece).await {
                 VerifyResult::Valid => {
+                    if aggregate_piece_write {
+                        if let Err(e) = self.write_completed_piece(block.piece).await {
+                            warn!(
+                                piece = block.piece,
+                                torrent = %self.info_hash_hex,
+                                err = %e,
+                                "completed piece write failed"
+                            );
+                            self.picker.reject_piece(block.piece as usize);
+                            self.remove_piece_assembly(block.piece);
+                            return;
+                        }
+                    }
                     self.remove_piece_assembly(block.piece);
                     self.dirty_pieces_since_barrier.insert(block.piece);
                     info!(piece = block.piece, torrent = %self.info_hash_hex, "piece complete");
@@ -1438,6 +1460,12 @@ impl TorrentTask {
                 }
             }
         }
+    }
+
+    fn can_aggregate_piece_write(&self, piece: u32) -> bool {
+        self.piece_length(piece)
+            .map(|len| len as usize <= MAX_IN_MEMORY_PIECE_ASSEMBLY_BYTES)
+            .unwrap_or(false)
     }
 
     fn record_piece_block(&mut self, block: &BlockEvent) -> anyhow::Result<()> {
@@ -1980,6 +2008,39 @@ impl TorrentTask {
         Ok(())
     }
 
+    async fn write_completed_piece(&self, piece: u32) -> anyhow::Result<()> {
+        let assembly = self
+            .piece_assemblies
+            .get(&piece)
+            .filter(|assembly| assembly.is_complete())
+            .ok_or_else(|| anyhow::anyhow!("piece {piece} is not fully assembled"))?;
+        let regions = self.piece_map.piece_to_file_regions(piece)?;
+        for region in regions {
+            let file = self
+                .meta
+                .files
+                .iter()
+                .find(|file| file.index == region.file_index)
+                .ok_or_else(|| anyhow::anyhow!("file index {} out of range", region.file_index))?;
+            let path = file.path.resolve(&self.save_root);
+            self.prepare_file_once(file.index, &path, file.length)
+                .await?;
+            let start = region.piece_offset as usize;
+            let end = start + region.length as usize;
+            let data = bytes::Bytes::copy_from_slice(&assembly.data[start..end]);
+            scheduled_write(
+                &self.storage,
+                IoClass::PeerWrite,
+                &path,
+                region.file_offset,
+                data,
+                true,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     async fn prepare_file_once(
         &self,
         file_index: u32,
@@ -2019,12 +2080,14 @@ impl TorrentTask {
         .await
     }
 
-    async fn verify_completed_piece(&self, piece: u32) -> VerifyResult {
+    async fn verify_completed_piece(&mut self, piece: u32) -> VerifyResult {
         if let Some(assembly) = self
             .piece_assemblies
             .get(&piece)
             .filter(|assembly| assembly.is_complete())
         {
+            self.completed_piece_verify_from_memory =
+                self.completed_piece_verify_from_memory.saturating_add(1);
             let Some(expected) = self.meta.pieces.get(piece as usize) else {
                 return VerifyResult::Missing {
                     file_index: 0,
@@ -2046,6 +2109,8 @@ impl TorrentTask {
                 }
             }
         }
+        self.completed_piece_verify_from_disk =
+            self.completed_piece_verify_from_disk.saturating_add(1);
         self.verify_piece(piece).await
     }
 
