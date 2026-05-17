@@ -445,6 +445,7 @@ async fn rss_set_rule(State(s): State<AppState>, Form(f): Form<RssSetRuleForm>) 
                 component = "qbcompat",
                 operation = "set_rss_rule",
                 rule = %name,
+                result = "error",
                 error = %e,
                 "qBit RSS rule update failed"
             );
@@ -495,6 +496,7 @@ async fn rss_rename_rule(
                 operation = "rename_rss_rule",
                 rule = %old_name,
                 new_rule = %new_name,
+                result = "error",
                 error = %e,
                 "qBit RSS rule rename failed"
             );
@@ -534,6 +536,7 @@ async fn rss_remove_rule(
                 component = "qbcompat",
                 operation = "remove_rss_rule",
                 rule = %name,
+                result = "error",
                 error = %e,
                 "qBit RSS rule removal failed"
             );
@@ -570,6 +573,7 @@ async fn rss_matching_articles(
             tracing::error!(
                 component = "qbcompat",
                 operation = "match_rss_articles",
+                result = "error",
                 error = %e,
                 "qBit RSS article matching failed"
             );
@@ -619,6 +623,7 @@ async fn app_set_preferences(
             tracing::warn!(
                 component = "qbcompat",
                 operation = "set_preferences",
+                result = "error",
                 error = %e,
                 "qBit preferences JSON parse failed"
             );
@@ -648,6 +653,7 @@ async fn app_set_preferences(
                 tracing::warn!(
                     component = "qbcompat",
                     operation = "set_user_agent",
+                result = "error",
                     error = %e,
                     "qBit user-agent preference update failed"
                 );
@@ -709,6 +715,7 @@ async fn torrents_info(State(s): State<AppState>, Query(q): Query<InfoQuery>) ->
             tracing::error!(
                 component = "qbcompat",
                 operation = "torrents_info",
+                result = "error",
                 error = %e,
                 "qBit torrent list query failed"
             );
@@ -776,6 +783,7 @@ async fn torrents_properties(
                 component = "qbcompat",
                 operation = "torrent_properties",
                 torrent = %hash,
+                result = "error",
                 error = %e,
                 "qBit torrent properties query failed"
             );
@@ -843,6 +851,7 @@ async fn torrents_add(State(s): State<AppState>, mut multipart: Multipart) -> im
                     component = "qbcompat",
                     operation = "add_url",
                     source = %redact_log_url(url),
+                result = "error",
                     error = %e,
                     "qb add url failed"
                 );
@@ -862,6 +871,7 @@ async fn torrents_add(State(s): State<AppState>, mut multipart: Multipart) -> im
             tracing::error!(
                 component = "qbcompat",
                 operation = "add_torrent",
+                result = "error",
                 error = %e,
                 "qb add torrent failed"
             );
@@ -905,6 +915,7 @@ async fn bulk_action(s: &AppState, hashes_str: &Option<String>, action: &str) ->
                 component = "qbcompat",
                 operation = %action,
                 torrent = %hash,
+                result = "error",
                 error = %e,
                 "qBit torrent action failed"
             );
@@ -929,6 +940,7 @@ async fn torrents_delete(State(s): State<AppState>, Form(f): Form<DeleteForm>) -
                 operation = "delete_torrent",
                 torrent = %hash,
                 delete_files,
+                result = "error",
                 error = %e,
                 "qBit delete failed"
             );
@@ -939,6 +951,7 @@ async fn torrents_delete(State(s): State<AppState>, Form(f): Form<DeleteForm>) -
                 component = "cache",
                 operation = "delete_torrent",
                 torrent = %hash,
+                result = "error",
                 error = %e,
                 "cache delete failed after qBit delete"
             );
@@ -989,6 +1002,7 @@ async fn torrents_trackers(
                 component = "qbcompat",
                 operation = "list_trackers",
                 torrent = %hash,
+                result = "error",
                 error = %e,
                 "qBit tracker listing failed"
             );
@@ -1040,6 +1054,7 @@ async fn torrents_files(
                 component = "qbcompat",
                 operation = "list_files",
                 torrent = %hash,
+                result = "error",
                 error = %e,
                 "qBit file listing failed"
             );
@@ -1065,6 +1080,7 @@ async fn categories(State(s): State<AppState>) -> impl IntoResponse {
             tracing::error!(
                 component = "qbcompat",
                 operation = "list_categories",
+                result = "error",
                 error = %e,
                 "qBit category listing failed"
             );
@@ -1080,6 +1096,7 @@ async fn tags(State(s): State<AppState>) -> impl IntoResponse {
             tracing::error!(
                 component = "qbcompat",
                 operation = "list_tags",
+                result = "error",
                 error = %e,
                 "qBit tag listing failed"
             );
@@ -1106,6 +1123,7 @@ async fn torrents_set_category(
                 operation = "set_category",
                 torrent = %hash,
                 category = %category,
+                result = "error",
                 error = %e,
                 "cache category update failed"
             );
@@ -1119,6 +1137,7 @@ async fn torrents_set_category(
                 operation = "set_category",
                 torrent = %hash,
                 category = %category,
+                result = "error",
                 error = %e,
                 "rTorrent category update failed"
             );
@@ -1150,6 +1169,7 @@ async fn torrents_add_tags(State(s): State<AppState>, Form(f): Form<TagsForm>) -
                     operation = "add_tag",
                     torrent = %hash,
                     tag = %tag,
+                result = "error",
                     error = %e,
                     "cache tag add failed"
                 );
@@ -1179,6 +1199,7 @@ async fn torrents_remove_tags(State(s): State<AppState>, Form(f): Form<TagsForm>
                     operation = "remove_tag",
                     torrent = %hash,
                     tag = %tag,
+                result = "error",
                     error = %e,
                     "cache tag removal failed"
                 );
@@ -1206,6 +1227,7 @@ async fn torrents_set_tags(State(s): State<AppState>, Form(f): Form<TagsForm>) -
                 component = "cache",
                 operation = "set_tags",
                 torrent = %hash,
+                result = "error",
                 error = %e,
                 "cache tag replace failed"
             );
@@ -1245,6 +1267,7 @@ async fn create_category(
                 component = "qbcompat",
                 operation = "create_category",
                 category = %name,
+                result = "error",
                 error = %e,
                 "qBit category create failed"
             );
@@ -1269,6 +1292,7 @@ async fn edit_category(State(s): State<AppState>, Form(f): Form<CreateCategoryFo
                 component = "qbcompat",
                 operation = "edit_category",
                 category = %name,
+                result = "error",
                 error = %e,
                 "qBit category edit failed"
             );
@@ -1299,6 +1323,7 @@ async fn remove_categories(
                 component = "qbcompat",
                 operation = "remove_category",
                 category = %name,
+                result = "error",
                 error = %e,
                 "qBit category removal failed"
             );
@@ -1329,6 +1354,7 @@ async fn create_tags(State(s): State<AppState>, Form(f): Form<CreateTagsForm>) -
                 component = "qbcompat",
                 operation = "create_tag",
                 tag = %tag,
+                result = "error",
                 error = %e,
                 "qBit tag create failed"
             );
@@ -1353,6 +1379,7 @@ async fn delete_tags(State(s): State<AppState>, Form(f): Form<CreateTagsForm>) -
                 component = "qbcompat",
                 operation = "delete_tag",
                 tag = %tag,
+                result = "error",
                 error = %e,
                 "qBit tag delete failed"
             );
@@ -1391,6 +1418,7 @@ async fn torrents_file_prio(State(s): State<AppState>, Form(f): Form<FilePrioFor
                         torrent = %hash,
                         file_index = idx,
                         priority,
+                result = "error",
                         error = %e,
                         "qBit file priority update failed"
                     );
@@ -1428,6 +1456,7 @@ async fn torrents_add_trackers(
                     operation = "add_tracker",
                     torrent = %hash,
                     tracker = %redact_log_url(url),
+                result = "error",
                     error = %e,
                     "qb add tracker failed"
                 );
@@ -1466,6 +1495,7 @@ async fn torrents_remove_trackers(
                 operation = "remove_tracker",
                 torrent = %hash,
                 tracker = %redact_log_url(url),
+                result = "error",
                 error = %e,
                 "qb remove tracker failed"
             );
@@ -1503,6 +1533,7 @@ async fn torrents_edit_tracker(
             torrent = %hash,
             tracker = %redact_log_url(&orig_url),
             new_tracker = %redact_log_url(&new_url),
+                result = "error",
             error = %e,
             "qBit tracker edit failed"
         );
@@ -1528,6 +1559,7 @@ async fn torrents_rename(State(s): State<AppState>, Form(f): Form<RenameForm>) -
             component = "qbcompat",
             operation = "rename_torrent",
             torrent = %hash,
+                result = "error",
             error = %e,
             "qBit torrent rename failed"
         );
@@ -1561,6 +1593,7 @@ async fn torrents_rename_file(
             operation = "rename_file",
             torrent = %hash,
             file_index = id,
+                result = "error",
             error = %e,
             "qBit file rename failed"
         );
@@ -1595,6 +1628,7 @@ async fn torrents_set_share_limits(
                 component = "qbcompat",
                 operation = "set_share_limits",
                 torrent = %hash,
+                result = "error",
                 error = %e,
                 "qBit share limit update failed"
             );
@@ -1627,6 +1661,7 @@ async fn torrents_set_location(
                         component = "cache",
                         operation = "set_location",
                         torrent = %hash,
+                result = "error",
                         error = %e,
                         "cache location update failed"
                     );
@@ -1639,6 +1674,7 @@ async fn torrents_set_location(
                 component = "cache",
                 operation = "exists",
                 torrent = %hash,
+                result = "error",
                 error = %e,
                 "cache torrent existence check failed"
             ),
@@ -1648,6 +1684,7 @@ async fn torrents_set_location(
                 component = "rtorrent",
                 operation = "set_location",
                 torrent = %hash,
+                result = "error",
                 error = %e,
                 "rTorrent location update failed"
             );
@@ -1671,6 +1708,7 @@ async fn torrents_toggle_sequential_download(
                 component = "qbcompat",
                 operation = "toggle_sequential_download",
                 torrent = %hash,
+                result = "error",
                 error = %e,
                 "qBit sequential download toggle failed"
             );
@@ -1703,6 +1741,7 @@ async fn sync_maindata(
             tracing::error!(
                 component = "qbcompat",
                 operation = "sync_maindata_metadata",
+                result = "error",
                 error = %e,
                 "qBit maindata metadata load failed"
             );
@@ -1731,6 +1770,7 @@ async fn sync_maindata(
                         tracing::error!(
                             component = "qbcompat",
                             operation = "sync_maindata_serialize",
+                result = "error",
                             error = %e,
                             "qBit maindata serialization failed"
                         );
@@ -1752,6 +1792,7 @@ async fn sync_maindata(
                 tracing::error!(
                     component = "qbcompat",
                     operation = "sync_maindata",
+                result = "error",
                     error = %e,
                     "qBit maindata query failed"
                 );
@@ -1767,6 +1808,7 @@ async fn sync_maindata(
                         tracing::error!(
                             component = "qbcompat",
                             operation = "sync_maindata_delta_serialize",
+                result = "error",
                             error = %e,
                             "qBit maindata delta serialization failed"
                         );
@@ -1788,6 +1830,7 @@ async fn sync_maindata(
                 tracing::error!(
                     component = "qbcompat",
                     operation = "sync_maindata_delta",
+                result = "error",
                     error = %e,
                     "qBit maindata delta query failed"
                 );
@@ -1996,6 +2039,7 @@ fn split_hashes(db: &crate::cache::Db, s: Option<&str>) -> Vec<String> {
                 tracing::warn!(
                     component = "qbcompat",
                     operation = "resolve_hashes",
+                result = "error",
                     error = %e,
                     "failed to resolve hashes=all"
                 );

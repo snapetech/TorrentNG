@@ -43,7 +43,7 @@ const storagePlanTemplates: StoragePlanTemplate[] = [
   { id: 'resume-plan', label: 'Resume', operation: 'move', sourceSuffix: 'library/source', destinationSuffix: 'library/destination', completedSteps: '0' },
 ]
 
-function rootPath(root: string, suffix: string): string {
+function joinRootPath(root: string, suffix: string): string {
   const clean = root.replace(/\/+$/, '')
   return clean ? `${clean}/${suffix}` : suffix
 }
@@ -112,10 +112,10 @@ export function StoragePanel() {
     if (template.operation === 'delete') {
       setSource('')
       setDestination('')
-      setTarget(template.targetSuffix && selectedRoot ? rootPath(selectedRoot, template.targetSuffix) : '')
+      setTarget(template.targetSuffix && selectedRoot ? joinRootPath(selectedRoot, template.targetSuffix) : '')
     } else {
-      setSource(template.sourceSuffix && selectedRoot ? rootPath(selectedRoot, template.sourceSuffix) : '')
-      setDestination(template.destinationSuffix && selectedRoot ? rootPath(selectedRoot, template.destinationSuffix) : '')
+      setSource(template.sourceSuffix && selectedRoot ? joinRootPath(selectedRoot, template.sourceSuffix) : '')
+      setDestination(template.destinationSuffix && selectedRoot ? joinRootPath(selectedRoot, template.destinationSuffix) : '')
       setTarget('')
     }
     setPreview(null)
