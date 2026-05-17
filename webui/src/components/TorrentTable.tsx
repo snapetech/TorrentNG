@@ -21,6 +21,7 @@ interface Props {
 }
 
 const ROW_HEIGHT = 36
+const TABLE_MIN_WIDTH = 1080
 
 function fmtSize(bytes: number): string {
   if (bytes >= 1e12) return (bytes / 1e12).toFixed(1) + ' TB'
@@ -243,88 +244,93 @@ export function TorrentTable({
   const someSelected = !allVisible && torrents.some(t => selected.has(t.hash))
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-      {/* Header */}
-      <div style={{
-        display: 'grid', gridTemplateColumns: gridTemplate, gap: '0 8px',
-        padding: '0 96px 0 12px', height: 32, alignItems: 'center',
-        background: 'var(--table-head)', borderBottom: '1px solid var(--border-strong)',
-        fontSize: 11, fontWeight: 600, color: 'var(--muted)',
-        letterSpacing: '0.05em', textTransform: 'uppercase',
-        flexShrink: 0, userSelect: 'none', position: 'relative',
-      }}>
-        {/* Select-all checkbox */}
-        <input
-          type="checkbox"
-          checked={allVisible}
-          ref={el => { if (el) el.indeterminate = someSelected }}
-          onChange={() => allVisible
-            ? onSelectAll([])
-            : onSelectAll(torrents.map(t => t.hash))
-          }
-          style={{ accentColor: 'var(--accent)', cursor: 'pointer' }}
-        />
-        {visibleCols.slice(1).map(col => (
-          <span
-            key={col.key}
-            onClick={() => col.sortKey && onSort(col.sortKey)}
-            style={{
-              cursor: col.sortKey ? 'pointer' : 'default',
-              color: col.sortKey === activeSort ? 'var(--accent-text)' : 'var(--muted)',
-              display: 'flex', alignItems: 'center', gap: 3,
-            }}
-          >
-            {col.label}
-            {col.sortKey === activeSort && (
-              <span style={{ fontSize: 9 }}>{activeDir === 'asc' ? '▲' : '▼'}</span>
-            )}
-          </span>
-        ))}
-        <button
-          onClick={() => setColumnsOpen(open => !open)}
-          title="Choose table columns"
-          style={{
-            position: 'absolute', right: 8, top: 5, background: 'var(--surface)',
-            border: '1px solid var(--border-strong)', borderRadius: 4, color: 'var(--muted)',
-            fontSize: 11, padding: '2px 7px', cursor: 'pointer',
-          }}
-        >
-          Columns
-        </button>
-        {columnsOpen && (
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minWidth: 0 }}>
+      <div style={{ flex: 1, minHeight: 0, minWidth: 0, overflowX: 'auto', overflowY: 'hidden' }}>
+        <div style={{
+          minWidth: TABLE_MIN_WIDTH, width: '100%', height: '100%',
+          display: 'flex', flexDirection: 'column',
+        }}>
+          {/* Header */}
           <div style={{
-            position: 'absolute', right: 8, top: 30, zIndex: 20, width: 210,
-            background: 'var(--panel)', border: '1px solid var(--border-strong)', borderRadius: 6,
-            boxShadow: '0 18px 40px var(--shadow)', padding: 8,
-            textTransform: 'none', letterSpacing: 0, fontWeight: 400,
+            display: 'grid', gridTemplateColumns: gridTemplate, gap: '0 8px',
+            padding: '0 96px 0 12px', height: 32, alignItems: 'center',
+            background: 'var(--table-head)', borderBottom: '1px solid var(--border-strong)',
+            fontSize: 11, fontWeight: 600, color: 'var(--muted)',
+            letterSpacing: '0.05em', textTransform: 'uppercase',
+            flexShrink: 0, userSelect: 'none', position: 'relative',
           }}>
-            <div style={{ color: 'var(--faint)', fontSize: 11, margin: '2px 4px 7px' }}>Visible columns</div>
-            {COLS.filter(col => !col.required).map(col => (
-              <label key={col.key} style={{
-                display: 'flex', alignItems: 'center', gap: 8, color: 'var(--text)',
-                fontSize: 12, padding: '4px 3px', cursor: 'pointer',
-              }}>
-                <input
-                  type="checkbox"
-                  checked={visibleKeys.includes(col.key)}
-                  onChange={e => setColumnVisible(col.key, e.target.checked)}
-                  style={{ accentColor: 'var(--accent)' }}
-                />
-                {col.label || col.key}
-              </label>
+            {/* Select-all checkbox */}
+            <input
+              type="checkbox"
+              checked={allVisible}
+              ref={el => { if (el) el.indeterminate = someSelected }}
+              onChange={() => allVisible
+                ? onSelectAll([])
+                : onSelectAll(torrents.map(t => t.hash))
+              }
+              style={{ accentColor: 'var(--accent)', cursor: 'pointer' }}
+            />
+            {visibleCols.slice(1).map(col => (
+              <span
+                key={col.key}
+                onClick={() => col.sortKey && onSort(col.sortKey)}
+                style={{
+                  cursor: col.sortKey ? 'pointer' : 'default',
+                  color: col.sortKey === activeSort ? 'var(--accent-text)' : 'var(--muted)',
+                  display: 'flex', alignItems: 'center', gap: 3,
+                }}
+              >
+                {col.label}
+                {col.sortKey === activeSort && (
+                  <span style={{ fontSize: 9 }}>{activeDir === 'asc' ? '▲' : '▼'}</span>
+                )}
+              </span>
             ))}
-            <button onClick={resetColumns} style={{
-              marginTop: 6, width: '100%', background: 'transparent',
-              border: '1px solid var(--border-strong)', borderRadius: 5, color: 'var(--muted)',
-              padding: '5px 8px', fontSize: 12, cursor: 'pointer',
-            }}>Reset columns</button>
+            <button
+              onClick={() => setColumnsOpen(open => !open)}
+              title="Choose table columns"
+              style={{
+                position: 'absolute', right: 8, top: 5, background: 'var(--surface)',
+                border: '1px solid var(--border-strong)', borderRadius: 4, color: 'var(--muted)',
+                fontSize: 11, padding: '2px 7px', cursor: 'pointer',
+              }}
+            >
+              Columns
+            </button>
+            {columnsOpen && (
+              <div style={{
+                position: 'absolute', right: 8, top: 30, zIndex: 20, width: 210,
+                background: 'var(--panel)', border: '1px solid var(--border-strong)', borderRadius: 6,
+                boxShadow: '0 18px 40px var(--shadow)', padding: 8,
+                textTransform: 'none', letterSpacing: 0, fontWeight: 400,
+              }}>
+                <div style={{ color: 'var(--faint)', fontSize: 11, margin: '2px 4px 7px' }}>Visible columns</div>
+                {COLS.filter(col => !col.required).map(col => (
+                  <label key={col.key} style={{
+                    display: 'flex', alignItems: 'center', gap: 8, color: 'var(--text)',
+                    fontSize: 12, padding: '4px 3px', cursor: 'pointer',
+                  }}>
+                    <input
+                      type="checkbox"
+                      checked={visibleKeys.includes(col.key)}
+                      onChange={e => setColumnVisible(col.key, e.target.checked)}
+                      style={{ accentColor: 'var(--accent)' }}
+                    />
+                    {col.label || col.key}
+                  </label>
+                ))}
+                <button onClick={resetColumns} style={{
+                  marginTop: 6, width: '100%', background: 'transparent',
+                  border: '1px solid var(--border-strong)', borderRadius: 5, color: 'var(--muted)',
+                  padding: '5px 8px', fontSize: 12, cursor: 'pointer',
+                }}>Reset columns</button>
+              </div>
+            )}
           </div>
-        )}
-      </div>
 
-      {/* Scrollable body */}
-      <div ref={parentRef} style={{ flex: 1, overflowY: 'auto', position: 'relative' }}>
-        <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
+          {/* Scrollable body */}
+          <div ref={parentRef} style={{ flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', position: 'relative' }}>
+            <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
           {items.map(item => {
             const t = torrents[item.index]
             const { label, color } = statusLabel(t)
@@ -410,25 +416,27 @@ export function TorrentTable({
               </div>
             )
           })}
-        </div>
+            </div>
 
-        {/* Load-more sentinel */}
-        {isFetchingMore && (
-          <div style={{ padding: '12px 0', textAlign: 'center', fontSize: 11, color: 'var(--faint)' }}>
-            Loading more…
+            {/* Load-more sentinel */}
+            {isFetchingMore && (
+              <div style={{ padding: '12px 0', textAlign: 'center', fontSize: 11, color: 'var(--faint)' }}>
+                Loading more…
+              </div>
+            )}
           </div>
-        )}
-      </div>
 
-      {hasMore && !isFetchingMore && (
-        <div style={{
-          height: 24, background: 'var(--table-head)', borderTop: '1px solid var(--border-strong)',
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-          fontSize: 11, color: 'var(--faint)', flexShrink: 0,
-        }}>
-          Scroll for more
+          {hasMore && !isFetchingMore && (
+            <div style={{
+              height: 24, background: 'var(--table-head)', borderTop: '1px solid var(--border-strong)',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              fontSize: 11, color: 'var(--faint)', flexShrink: 0,
+            }}>
+              Scroll for more
+            </div>
+          )}
         </div>
-      )}
+      </div>
     </div>
   )
 }
