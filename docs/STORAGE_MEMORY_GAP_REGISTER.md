@@ -64,6 +64,9 @@ Implemented and covered by automated tests:
 - The live torrent scheduler owns a `SelectedDiskBackend` and routes reads,
   writes, syncs, and peer-read elevator dispatch through the same bounded
   backend interface used by storage runtime probes.
+- Live scheduler read/write/sync and peer-read elevator backend completions
+  are awaited outside scheduler blocking workers after short open/metadata
+  phases.
 - Scheduler read and peer-read elevator buffers enter the backend through the
   same process-level frame pool used by `StorageRuntime`, then copy into
   caller-owned `Bytes`.
@@ -83,7 +86,6 @@ Implemented and covered by automated tests:
 | Area | Gap | Risk | Next Work |
 | --- | --- | --- | --- |
 | Storage frame ownership on returned bytes | Scheduler reads and peer-read elevator reads now borrow from the process-level frame pool before backend dispatch, but still copy backend frames into caller-owned `Bytes`. | Storage frame caps bound in-flight backend read buffers, but payloads returned to peer/API code are no longer represented as frame leases after the copy. | Add a frame-owned bytes API or equivalent lease-carrying payload type if zero-copy storage-frame ownership becomes required. |
-| Scheduler/backend double queue | Scheduler direct reads, writes, syncs, and peer-read elevator dispatch now await backend completion outside the scheduler blocking pool after a short open/metadata phase. Prepare and sparse extent probing still use the older bounded blocking bridge. | The hottest payload, durability, and elevator paths are improved, but secondary paths can still occupy scheduler workers while waiting on backend completion. | Apply the same guard/open/backend split to remaining backend I/O paths, then remove blocking backend waits from scheduler code. |
 | Restartable move/import execution | The storage executor now supports completed-step resume checkpoints, but the engine has not yet persisted those checkpoints into SQLite job rows. | A process crash during a multi-TB move still needs engine-level recovery from durable plan state instead of filesystem inspection. | Persist plan id, steps, completed steps, and rollback intent in the engine DB before invoking the checkpointed executor. |
 | Deterministic LVM PV placement control | The kspls0 extent probe shows the pool can allocate independent files on multiple rotational PVs, but ordinary path writes still do not let TorrentNG choose a specific PV. | Cross-PV behavior inside the LVM pool is allocator-dependent, so path-level scheduling cannot promise physical-drive affinity. | Use LVM extent mapping for evidence, or add lower-level PV-targeted probes only if release claims require deterministic per-drive placement. |
 | `io_uring` frame-pool slot pinning | `UringBackend` uses worker-owned fixed buffers when available, but the global frame pool does not yet hand out stable registered buffer slots. | Extra copies remain in the uring path, and fixed-buffer metrics can overstate how much of the full storage path is zero-copy. | Run `scripts/storage_uring_graduation.sh /target/root` with selected-backend, fixed-buffer, registered-file, and throughput thresholds. Add frame-pool slot leases through the backend API only after those reports prove `uring` should graduate from explicit opt-in. |
