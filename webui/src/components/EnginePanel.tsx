@@ -214,6 +214,7 @@ function RtorrentSettingsPanel() {
   })
   const [draft, setDraft] = useState<Record<string, string | number | boolean>>({})
   const [customRc, setCustomRc] = useState('')
+  const [filter, setFilter] = useState('')
   const [notice, setNotice] = useState<{ tone: 'ok' | 'warn' | 'error'; text: string } | null>(null)
 
   useEffect(() => {
@@ -246,10 +247,29 @@ function RtorrentSettingsPanel() {
     onError: e => setNotice({ tone: 'error', text: String(e) }),
   })
 
-  const dirtyCount = data?.settings.filter(setting => {
+  const dirtySettings = data?.settings.filter(setting => {
     const row = data.values.find(value => value.key === setting.key)
     return !sameSettingValue(draft[setting.key], baselineValue(setting, row?.saved ?? null, row?.live.value ?? null))
-  }).length ?? 0
+  }) ?? []
+  const customRcDirty = data ? customRc !== data.custom_rc : false
+  const dirtyCount = dirtySettings.length + (customRcDirty ? 1 : 0)
+  const filteredGroups = useMemo(() => {
+    if (!data) return []
+    const needle = filter.trim().toLowerCase()
+    return groupSettings(data.settings
+      .filter(setting => {
+        if (!needle) return true
+        return [
+          setting.key,
+          setting.label,
+          setting.command,
+          setting.setter,
+          setting.value_type,
+          settingCategory(setting),
+          settingDescription(setting),
+        ].some(value => value.toLowerCase().includes(needle))
+      }))
+  }, [data, filter])
   const resetAll = () => {
     if (!data) return
     const next: Record<string, string | number | boolean> = {}
@@ -282,73 +302,136 @@ function RtorrentSettingsPanel() {
           <div style={{ color: 'var(--faint)', fontSize: 12, lineHeight: 1.45 }}>
             Values are saved to <span style={{ color: 'var(--muted)', fontFamily: 'monospace' }}>{data.overlay_path}</span>. Live-safe controls are applied immediately; controls marked restart are saved for the next daemon start.
           </div>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(270px, 1fr))', gap: 9 }}>
-            {data.settings.map(setting => {
-              const row = data.values.find(value => value.key === setting.key)
-              const base = baselineValue(setting, row?.saved ?? null, row?.live.value ?? null)
-              const value = draft[setting.key] ?? base
-              const saved = row?.saved ?? null
-              const live = row?.live.value ?? null
-              const dirty = !sameSettingValue(value, base)
-              return (
-                <div key={setting.key} className="tng-form-card" data-dirty={dirty ? 'true' : 'false'} style={{
-                  border: '1px solid var(--border)', borderRadius: 7, background: 'var(--surface)', padding: 9,
-                  display: 'grid', gap: 8, minWidth: 0,
+          <label style={{ display: 'grid', gap: 5, maxWidth: 640 }}>
+            <span style={{ color: 'var(--text)', fontSize: 12, fontWeight: 800 }}>Find settings</span>
+            <input
+              type="search"
+              value={filter}
+              onChange={e => setFilter(e.target.value)}
+              placeholder="Filter by label, command, category, or type"
+              style={{ ...inputStyle, padding: '7px 9px' }}
+            />
+          </label>
+          <div style={{ display: 'grid', gap: 12 }}>
+            {filteredGroups.map(group => (
+              <fieldset key={group.name} style={{
+                border: '1px solid var(--border)',
+                borderRadius: 8,
+                background: 'color-mix(in srgb, var(--surface) 72%, var(--bg))',
+                padding: '10px 12px 12px',
+                minWidth: 0,
+              }}>
+                <legend style={{
+                  color: 'var(--accent-text)',
+                  fontSize: 11,
+                  fontWeight: 900,
+                  textTransform: 'uppercase',
+                  padding: '0 6px',
                 }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, color: 'var(--text)', fontSize: 12, fontWeight: 800 }}>
-                    <span>{setting.label}</span>
-                    <span style={{ display: 'inline-flex', gap: 5, alignItems: 'center', flexShrink: 0 }}>
-                      {dirty && <SettingPill tone="warn">edited</SettingPill>}
-                      {setting.restart_required && <SettingPill tone="warn">restart</SettingPill>}
-                    </span>
-                  </div>
-                  {setting.value_type === 'bool' ? (
-                    <BooleanKnob
-                      value={Boolean(value)}
-                      onChange={next => setDraft(prev => ({ ...prev, [setting.key]: next }))}
-                    />
-                  ) : setting.key === 'dht_mode' ? (
-                    <SegmentedSetting
-                      value={String(value)}
-                      options={[['auto', 'Auto'], ['on', 'On'], ['disable', 'Off']]}
-                      onChange={next => setDraft(prev => ({ ...prev, [setting.key]: next }))}
-                    />
-                  ) : (
-                    <NumericKnob
-                      setting={setting}
-                      value={Number(value)}
-                      onChange={next => setDraft(prev => ({ ...prev, [setting.key]: next }))}
-                    />
-                  )}
-                  <div style={{
-                    display: 'grid',
-                    gridTemplateColumns: 'repeat(3, minmax(0, 1fr))',
-                    gap: 5,
-                  }}>
-                    <Readout label="Live" value={live === null ? 'unavailable' : formatSettingValue(live, setting.unit)} />
-                    <Readout label="Saved" value={saved === null ? 'default' : formatSettingValue(saved, setting.unit)} />
-                    <Readout label="Command" value={setting.command} mono />
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-                    <button
-                      type="button"
-                      onClick={() => setDraft(prev => ({ ...prev, [setting.key]: base }))}
-                      disabled={!dirty || save.isPending}
-                      style={smallButtonStyle(dirty && !save.isPending)}
-                    >
-                      Reset
-                    </button>
-                  </div>
+                  {group.name}
+                </legend>
+                <div style={{ color: 'var(--faint)', fontSize: 11, marginBottom: 9 }}>{group.description}</div>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 360px), 1fr))', gap: 10 }}>
+                  {group.settings.map(setting => {
+                    const row = data.values.find(value => value.key === setting.key)
+                    const base = baselineValue(setting, row?.saved ?? null, row?.live.value ?? null)
+                    const value = draft[setting.key] ?? base
+                    const saved = row?.saved ?? null
+                    const live = row?.live.value ?? null
+                    const dirty = !sameSettingValue(value, base)
+                    const descriptionId = `rt-setting-${setting.key}-description`
+                    return (
+                      <div key={setting.key} className="tng-form-card" data-dirty={dirty ? 'true' : 'false'} style={{
+                        border: `1px solid ${dirty ? 'color-mix(in srgb, var(--warning) 58%, var(--border))' : 'var(--border)'}`,
+                        borderRadius: 7,
+                        background: dirty ? 'color-mix(in srgb, var(--warning) 7%, var(--surface))' : 'var(--surface)',
+                        padding: 10,
+                        display: 'grid',
+                        gap: 9,
+                        minWidth: 0,
+                      }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, color: 'var(--text)', fontSize: 13, fontWeight: 800 }}>
+                          <span>{setting.label}</span>
+                          <span style={{ display: 'inline-flex', gap: 5, alignItems: 'center', flexShrink: 0 }}>
+                            {dirty && <SettingPill tone="warn">edited</SettingPill>}
+                            {setting.restart_required && <SettingPill tone="warn">restart</SettingPill>}
+                          </span>
+                        </div>
+                        <div id={descriptionId} style={{ color: 'var(--faint)', fontSize: 11, lineHeight: 1.35 }}>
+                          {settingDescription(setting)}
+                        </div>
+                        {setting.value_type === 'bool' ? (
+                          <BooleanKnob
+                            setting={setting}
+                            value={Boolean(value)}
+                            describedBy={descriptionId}
+                            onChange={next => setDraft(prev => ({ ...prev, [setting.key]: next }))}
+                          />
+                        ) : setting.key === 'dht_mode' ? (
+                          <SegmentedSetting
+                            label={setting.label}
+                            value={String(value)}
+                            options={[['auto', 'Auto'], ['on', 'On'], ['disable', 'Off']]}
+                            describedBy={descriptionId}
+                            onChange={next => setDraft(prev => ({ ...prev, [setting.key]: next }))}
+                          />
+                        ) : (
+                          <NumericKnob
+                            setting={setting}
+                            value={Number(value)}
+                            describedBy={descriptionId}
+                            onChange={next => setDraft(prev => ({ ...prev, [setting.key]: next }))}
+                          />
+                        )}
+                        <div style={{
+                          display: 'grid',
+                          gridTemplateColumns: 'repeat(4, minmax(0, 1fr))',
+                          gap: 6,
+                        }}>
+                          <Readout label="Editing" value={formatSettingValue(value, setting.unit)} />
+                          <Readout label="Live" value={live === null ? 'unavailable' : formatSettingValue(live, setting.unit)} />
+                          <Readout label="Saved" value={saved === null ? 'default' : formatSettingValue(saved, setting.unit)} />
+                          <Readout label="Command" value={setting.command} mono />
+                        </div>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center' }}>
+                          <span style={{ color: 'var(--faint)', fontSize: 10 }}>
+                            {setting.restart_required ? 'Applies on restart' : 'Live apply supported'}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => setDraft(prev => ({ ...prev, [setting.key]: base }))}
+                            disabled={!dirty || save.isPending}
+                            style={smallButtonStyle(dirty && !save.isPending)}
+                          >
+                            Reset
+                          </button>
+                        </div>
+                      </div>
+                    )
+                  })}
                 </div>
-              )
-            })}
+              </fieldset>
+            ))}
+            {filteredGroups.length === 0 && (
+              <div style={{
+                color: 'var(--faint)',
+                border: '1px dashed var(--border-strong)',
+                borderRadius: 8,
+                padding: 14,
+                fontSize: 12,
+              }}>
+                No settings match the current filter.
+              </div>
+            )}
           </div>
-          <label style={{ display: 'grid', gap: 5 }}>
+          <label style={{ display: 'grid', gap: 5, border: '1px solid var(--border)', borderRadius: 8, padding: 10, background: 'var(--surface)' }}>
             <span style={{ color: 'var(--text)', fontSize: 12, fontWeight: 800 }}>Custom rTorrent lines</span>
+            <span style={{ color: 'var(--faint)', fontSize: 11 }}>Advanced overrides are imported after managed settings and usually need a restart.</span>
             <textarea
               value={customRc}
               onChange={e => setCustomRc(e.target.value)}
               rows={4}
+              aria-label="Custom rTorrent configuration lines"
               placeholder="Optional advanced rtorrent.rc overrides imported after managed settings"
               style={{ ...inputStyle, resize: 'vertical', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}
             />
@@ -356,8 +439,23 @@ function RtorrentSettingsPanel() {
           {notice && <div style={{
             color: notice.tone === 'error' ? 'var(--danger)' : notice.tone === 'warn' ? 'var(--warning)' : 'var(--success)',
             fontSize: 12,
-          }}>{notice.text}</div>}
-          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            border: `1px solid color-mix(in srgb, ${notice.tone === 'error' ? 'var(--danger)' : notice.tone === 'warn' ? 'var(--warning)' : 'var(--success)'} 42%, var(--border))`,
+            borderRadius: 6,
+            padding: '7px 9px',
+            background: 'var(--bg)',
+          }} role="status" aria-live="polite">{notice.text}</div>}
+          <div style={{
+            position: 'sticky',
+            bottom: 0,
+            zIndex: 2,
+            display: 'flex',
+            gap: 8,
+            flexWrap: 'wrap',
+            alignItems: 'center',
+            borderTop: '1px solid var(--border)',
+            background: 'color-mix(in srgb, var(--surface) 92%, var(--bg))',
+            padding: '10px 0 0',
+          }}>
             <button onClick={() => save.mutate()} disabled={save.isPending || dirtyCount === 0} style={buttonStyle('var(--accent)', 'var(--accent-soft)', 'var(--accent-text)', dirtyCount > 0 && !save.isPending)}>
               {save.isPending ? 'Saving…' : 'Save and apply live'}
             </button>
@@ -373,6 +471,9 @@ function RtorrentSettingsPanel() {
             >
               {restart.isPending ? 'Restarting…' : 'Restart daemon'}
             </button>
+            <span style={{ color: dirtyCount > 0 ? 'var(--warning)' : 'var(--faint)', fontSize: 12, fontWeight: 800 }}>
+              {dirtyCount > 0 ? `${dirtyCount} unsaved edit${dirtyCount === 1 ? '' : 's'}` : 'No unsaved edits'}
+            </span>
           </div>
         </div>
       )}
@@ -416,9 +517,10 @@ function SettingPill({ tone, children }: { tone: 'warn' | 'ok'; children: React.
   )
 }
 
-function NumericKnob({ setting, value, onChange }: {
+function NumericKnob({ setting, value, describedBy, onChange }: {
   setting: RtorrentSettingDescriptor
   value: number
+  describedBy: string
   onChange: (value: number) => void
 }) {
   const min = setting.minimum ?? 0
@@ -468,6 +570,7 @@ function NumericKnob({ setting, value, onChange }: {
           onChange={e => onChange(Number(e.target.value))}
           style={{ width: '100%', accentColor: 'var(--accent)' }}
           aria-label={`${setting.label} dial`}
+          aria-describedby={describedBy}
         />
         <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', gap: 6, alignItems: 'center' }}>
           <input
@@ -478,6 +581,7 @@ function NumericKnob({ setting, value, onChange }: {
             onChange={e => onChange(Number(e.target.value))}
             style={inputStyle}
             aria-label={`${setting.label} value`}
+            aria-describedby={describedBy}
           />
           {setting.unit && <span style={{ color: 'var(--faint)', fontSize: 11, fontWeight: 800 }}>{setting.unit}</span>}
         </div>
@@ -486,12 +590,19 @@ function NumericKnob({ setting, value, onChange }: {
   )
 }
 
-function BooleanKnob({ value, onChange }: { value: boolean; onChange: (value: boolean) => void }) {
+function BooleanKnob({ setting, value, describedBy, onChange }: {
+  setting: RtorrentSettingDescriptor
+  value: boolean
+  describedBy: string
+  onChange: (value: boolean) => void
+}) {
   return (
     <button
       type="button"
       role="switch"
       aria-checked={value}
+      aria-label={setting.label}
+      aria-describedby={describedBy}
       onClick={() => onChange(!value)}
       style={{
         width: '100%',
@@ -531,19 +642,22 @@ function BooleanKnob({ value, onChange }: { value: boolean; onChange: (value: bo
   )
 }
 
-function SegmentedSetting({ value, options, onChange }: {
+function SegmentedSetting({ label, value, options, describedBy, onChange }: {
+  label: string
   value: string
   options: Array<[string, string]>
+  describedBy: string
   onChange: (value: string) => void
 }) {
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: `repeat(${options.length}, minmax(0, 1fr))`, gap: 5 }}>
+    <div role="group" aria-label={label} aria-describedby={describedBy} style={{ display: 'grid', gridTemplateColumns: `repeat(${options.length}, minmax(0, 1fr))`, gap: 5 }}>
       {options.map(([optionValue, label]) => {
         const active = value === optionValue
         return (
           <button
             key={optionValue}
             type="button"
+            aria-pressed={active}
             onClick={() => onChange(optionValue)}
             style={{
               border: `1px solid ${active ? 'var(--accent)' : 'var(--border-strong)'}`,
@@ -583,6 +697,43 @@ function Readout({ label, value, mono }: { label: string; value: string; mono?: 
 
 function formatSettingValue(value: string | number | boolean, unit: string | null): string {
   return `${String(value)}${unit ? ` ${unit}` : ''}`
+}
+
+interface SettingGroup {
+  name: string
+  description: string
+  settings: RtorrentSettingDescriptor[]
+}
+
+function groupSettings(settings: RtorrentSettingDescriptor[]): SettingGroup[] {
+  const groups: SettingGroup[] = [
+    { name: 'Transfer Slots', description: 'Global and per-torrent concurrency limits.', settings: [] },
+    { name: 'Tracker HTTP', description: 'Tracker request pressure, connection reuse, and DNS behavior.', settings: [] },
+    { name: 'Peer Discovery', description: 'DHT, PEX, and UDP tracker discovery controls.', settings: [] },
+    { name: 'Storage And Session', description: 'Cache, file/socket ceilings, hashing, and session persistence.', settings: [] },
+    { name: 'Advanced', description: 'Settings that do not fit a narrower operational group.', settings: [] },
+  ]
+  const byName = new Map(groups.map(group => [group.name, group]))
+  for (const setting of settings) {
+    byName.get(settingCategory(setting))?.settings.push(setting)
+  }
+  return groups.filter(group => group.settings.length > 0)
+}
+
+function settingCategory(setting: RtorrentSettingDescriptor): SettingGroup['name'] {
+  if (setting.key.includes('uploads') || setting.key.includes('downloads')) return 'Transfer Slots'
+  if (setting.key.startsWith('http_') || setting.key === 'trackers_numwant') return 'Tracker HTTP'
+  if (setting.key === 'dht_mode' || setting.key === 'pex' || setting.key === 'udp_trackers') return 'Peer Discovery'
+  if (setting.key.includes('memory') || setting.key.includes('files') || setting.key.includes('sockets') || setting.key.includes('hash') || setting.key.includes('session')) return 'Storage And Session'
+  return 'Advanced'
+}
+
+function settingDescription(setting: RtorrentSettingDescriptor): string {
+  const bounds = setting.value_type === 'int' && setting.minimum !== null && setting.maximum !== null
+    ? ` Range ${setting.minimum.toLocaleString()}-${setting.maximum.toLocaleString()}${setting.unit ? ` ${setting.unit}` : ''}.`
+    : ''
+  const apply = setting.restart_required ? ' Saved immediately; daemon restart required to take effect.' : ' Saved and applied live when supported by rTorrent.'
+  return `${setting.command} via ${setting.setter}.${bounds}${apply}`
 }
 
 function baselineValue(setting: RtorrentSettingDescriptor, saved: string | null, live: string | null): string | number | boolean {
