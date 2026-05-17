@@ -18,13 +18,8 @@ async fn main() -> Result<()> {
     let cfg_path = std::env::args().nth(1);
     let cfg = Config::load(cfg_path.as_deref()).context("load config")?;
 
-    let filter = if cfg.debug { "debug" } else { "info" };
-    tracing_subscriber::fmt()
-        .json()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| filter.into()),
-        )
-        .init();
+    let legacy_filter = if cfg.debug { "debug" } else { "info" };
+    rt_logging::init(&cfg.logging, Some(legacy_filter));
 
     info!("TorrentNG starting");
     info!(user_agent = %cfg.rtorrent.user_agent, "config loaded");

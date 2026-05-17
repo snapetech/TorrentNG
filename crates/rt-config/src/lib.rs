@@ -25,6 +25,7 @@ pub struct Config {
     pub dht: DhtConfig,
     pub db: DbConfig,
     pub auth: AuthConfig,
+    pub logging: rt_logging::LoggingConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,6 +292,7 @@ mod tests {
         assert_eq!(c.memory.queued_disk_cap_mb, 64);
         assert!(c.runtime.torrent_tiers_enabled);
         assert!(c.storage.device_elevator_enabled);
+        assert_eq!(c.logging, rt_logging::LoggingConfig::default());
     }
 
     #[test]
@@ -327,5 +329,26 @@ api_tokens = ["one", "two"]
         assert!(c.dht.enabled);
         assert_eq!(c.auth.api_tokens, vec!["one", "two"]);
         assert_eq!(c.daemon.shutdown_timeout_secs, 10);
+        assert_eq!(c.logging, rt_logging::LoggingConfig::default());
+    }
+
+    #[test]
+    fn parse_logging_toml() {
+        let toml = r#"
+[daemon]
+log_level = "warn"
+
+[logging]
+format = "pretty"
+profile = "detailed"
+filter = "rt_engine=debug"
+event_retention = 2048
+"#;
+        let c: Config = toml::from_str(toml).unwrap();
+        assert_eq!(c.daemon.log_level, "warn");
+        assert_eq!(c.logging.format, rt_logging::LogFormat::Pretty);
+        assert_eq!(c.logging.profile, rt_logging::LogProfile::Detailed);
+        assert_eq!(c.logging.filter, "rt_engine=debug");
+        assert_eq!(c.logging.event_retention, 2048);
     }
 }

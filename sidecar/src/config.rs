@@ -34,6 +34,9 @@ pub struct Config {
 
     #[serde(default)]
     pub identity: IdentityConfig,
+
+    #[serde(default)]
+    pub logging: rt_logging::LoggingConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -120,6 +123,7 @@ impl Config {
             auth: AuthConfig::default(),
             workflows: WorkflowConfig::default(),
             identity: IdentityConfig::default(),
+            logging: rt_logging::LoggingConfig::default(),
         }
     }
 }
@@ -179,6 +183,28 @@ impl Config {
         }
         if let Ok(v) = std::env::var("TNG_DEBUG") {
             self.debug = v == "1" || v.eq_ignore_ascii_case("true");
+        }
+        if let Ok(v) = std::env::var("TNG_LOG_FORMAT") {
+            self.logging.format = if v.eq_ignore_ascii_case("pretty") {
+                rt_logging::LogFormat::Pretty
+            } else {
+                rt_logging::LogFormat::Json
+            };
+        }
+        if let Ok(v) = std::env::var("TNG_LOG_PROFILE") {
+            self.logging.profile = match v.to_ascii_lowercase().as_str() {
+                "detailed" => rt_logging::LogProfile::Detailed,
+                "verbose" => rt_logging::LogProfile::Verbose,
+                _ => rt_logging::LogProfile::Basic,
+            };
+        }
+        if let Ok(v) = std::env::var("TNG_LOG_FILTER") {
+            self.logging.filter = v;
+        }
+        if let Ok(v) = std::env::var("TNG_LOG_EVENT_RETENTION") {
+            if let Ok(retention) = v.parse() {
+                self.logging.event_retention = retention;
+            }
         }
         if let Ok(v) = std::env::var("TNG_SYNC_INTERVAL_SECS") {
             if let Ok(secs) = v.parse() {

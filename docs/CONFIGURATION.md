@@ -100,6 +100,19 @@ enqueue and released on queue rejection, cancellation, or completion.
 |---|---|---|
 | `api_tokens` | `[]` | Pre-shared bearer/session tokens accepted by the native API |
 
+### `[logging]`
+
+`[daemon].log_level` remains supported as the legacy filter. The structured
+logging section takes precedence when `filter` is set, and `RUST_LOG` takes
+precedence over both.
+
+| Key | Default | Description |
+|---|---|---|
+| `format` | `json` | Output format: `json` or `pretty` |
+| `profile` | `basic` | Preset filter profile: `basic`, `detailed`, or `verbose` |
+| `filter` | `""` | Explicit tracing filter, for example `rt_engine=debug,tower_http=info` |
+| `event_retention` | `10000` | In-process retention target for future event-ring consumers |
+
 ### Native minimal example
 
 ```toml
@@ -152,6 +165,12 @@ wal_checkpoint_pages = 1000
 
 [auth]
 api_tokens = ["your-automation-token"]
+
+[logging]
+format = "json"
+profile = "basic"
+filter = ""
+event_retention = 10000
 ```
 
 ## Track 1 sidecar

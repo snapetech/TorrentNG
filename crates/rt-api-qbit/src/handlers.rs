@@ -2051,8 +2051,71 @@ pub async fn transfer_ban_peers() -> impl IntoResponse {
     StatusCode::OK
 }
 
-pub async fn log_main() -> impl IntoResponse {
-    (StatusCode::OK, Json(Vec::<serde_json::Value>::new()))
+#[derive(Debug, Deserialize)]
+pub struct LogMainQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct QbLogEntry {
+    id: i64,
+    message: String,
+    timestamp: i64,
+    #[serde(rename = "type")]
+    kind: i64,
+}
+
+pub async fn log_main(
+    State(state): State<AppState>,
+    Query(query): Query<LogMainQuery>,
+) -> impl IntoResponse {
+    let Some(engine) = &state.engine else {
+        return (StatusCode::OK, Json(Vec::<QbLogEntry>::new()));
+    };
+    let limit = query.limit.unwrap_or(200).clamp(1, 1000);
+    match engine.session_events(None, limit).await {
+        Ok(events) => (
+            StatusCode::OK,
+            Json(events.into_iter().map(qbit_log_entry).collect()),
+        ),
+        Err(e) => {
+            tracing::warn!(component = "api", operation = "log_main", error = %e, "failed to read session events");
+            (StatusCode::OK, Json(Vec::<QbLogEntry>::new()))
+        }
+    }
+}
+
+fn qbit_log_entry(row: rt_db::SessionEventRow) -> QbLogEntry {
+    let message = row.message.unwrap_or_else(|| row.kind.clone());
+    QbLogEntry {
+        id: row.event_id.unwrap_or_default(),
+        message,
+        timestamp: row.occurred_at,
+        kind: qbit_log_type(&row.kind, &row.payload),
+    }
+}
+
+fn qbit_log_type(kind: &str, payload: &str) -> i64 {
+    let lower_kind = kind.to_ascii_lowercase();
+    if lower_kind.contains("error") || lower_kind.contains("failed") {
+        return 4;
+    }
+    if lower_kind.contains("warn") {
+        return 2;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return 1;
+    };
+    match value
+        .get("level")
+        .and_then(|v| v.as_str())
+        .map(str::to_ascii_lowercase)
+    {
+        Some(level) if level == "error" || level == "critical" => 4,
+        Some(level) if level == "warn" || level == "warning" => 2,
+        _ => 1,
+    }
 }
 
 pub async fn log_peers(State(state): State<AppState>) -> impl IntoResponse {

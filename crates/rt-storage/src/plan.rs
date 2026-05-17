@@ -151,7 +151,7 @@ pub fn plan_import(req: &ImportPlanRequest) -> StoragePlan {
 
 pub fn plan_delete(req: &DeletePlanRequest) -> StoragePlan {
     let mut issues = Vec::new();
-    if !req.target.exists() {
+    if !path_exists_no_follow(&req.target) {
         issues.push(PlanIssue::SourceMissing(req.target.clone()));
     }
     if !req.dry_run_approved {
@@ -388,7 +388,7 @@ fn create_parent(path: &Path) -> Result<(), StorageError> {
 }
 
 fn ensure_destination_available(path: &Path) -> Result<(), StorageError> {
-    if path.exists() {
+    if path_exists_no_follow(path) {
         return Err(StorageError::StagedMoveFailed {
             step: "destination",
             reason: format!("destination exists: {}", path.display()),
@@ -530,10 +530,10 @@ fn common_issues(
     available_bytes: Option<u64>,
 ) -> Vec<PlanIssue> {
     let mut issues = Vec::new();
-    if !source.exists() {
+    if !path_exists_no_follow(source) {
         issues.push(PlanIssue::SourceMissing(source.to_path_buf()));
     }
-    if destination.exists() {
+    if path_exists_no_follow(destination) {
         issues.push(PlanIssue::DestinationExists(destination.to_path_buf()));
     }
     if let Some(available) = available_bytes {
@@ -545,6 +545,10 @@ fn common_issues(
         }
     }
     issues
+}
+
+fn path_exists_no_follow(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
 }
 
 fn staging_path(destination: &Path) -> PathBuf {
@@ -695,6 +699,52 @@ mod tests {
         assert!(plan
             .issues
             .contains(&PlanIssue::DestinationExists(destination)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plan_import_treats_broken_destination_symlink_as_existing() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.bin");
+        let destination = dir.path().join("dest-link.bin");
+        std::fs::write(&source, b"data").unwrap();
+        symlink(dir.path().join("missing-target.bin"), &destination).unwrap();
+
+        let plan = plan_import(&ImportPlanRequest {
+            source,
+            destination: destination.clone(),
+            bytes: 4,
+            available_bytes: Some(100),
+            hardlink_or_copy: false,
+            dry_run: true,
+        });
+
+        assert!(!plan.can_apply);
+        assert!(plan
+            .issues
+            .contains(&PlanIssue::DestinationExists(destination)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plan_delete_treats_broken_symlink_as_existing_source() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("delete-link");
+        symlink(dir.path().join("missing-target"), &target).unwrap();
+
+        let plan = plan_delete(&DeletePlanRequest {
+            target,
+            bytes: 0,
+            dry_run: true,
+            dry_run_approved: true,
+        });
+
+        assert!(plan.can_apply);
+        assert!(plan.issues.is_empty());
     }
 
     #[test]

@@ -26,6 +26,7 @@ members = [
     "crates/rt-api-rtorrent",
     "crates/rt-metrics",
     "crates/rt-config",
+    "crates/rt-logging",
     "crates/rt-engine",
     "crates/rt-migrate",
     "crates/rt-testkit",

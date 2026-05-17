@@ -759,6 +759,12 @@ pub enum EngineCmd {
     GetStats {
         reply: oneshot::Sender<CmdResult<EngineStats>>,
     },
+    /// Read recent durable session events for API log projection.
+    ListSessionEvents {
+        info_hash: Option<String>,
+        limit: usize,
+        reply: oneshot::Sender<CmdResult<Vec<rt_db::SessionEventRow>>>,
+    },
     /// Reserve governor-managed memory for bounded API materialization.
     ReserveMemory {
         class: MemoryClass,

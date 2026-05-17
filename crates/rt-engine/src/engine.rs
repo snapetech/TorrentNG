@@ -275,6 +275,23 @@ impl EngineHandle {
         rx.await.map_err(|_| "engine dropped reply".to_owned())?
     }
 
+    pub async fn session_events(
+        &self,
+        info_hash: Option<String>,
+        limit: usize,
+    ) -> CmdResult<Vec<rt_db::SessionEventRow>> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(EngineCmd::ListSessionEvents {
+                info_hash,
+                limit,
+                reply,
+            })
+            .await
+            .map_err(|_| "engine shut down".to_owned())?;
+        rx.await.map_err(|_| "engine dropped reply".to_owned())?
+    }
+
     pub async fn reserve_memory(
         &self,
         class: MemoryClass,
@@ -984,6 +1001,17 @@ impl Engine {
 
             EngineCmd::GetStats { reply } => {
                 let result = self.engine_stats().await;
+                let _ = reply.send(result);
+            }
+
+            EngineCmd::ListSessionEvents {
+                info_hash,
+                limit,
+                reply,
+            } => {
+                let result = self
+                    .list_session_events(info_hash.as_deref(), limit)
+                    .map_err(|e| e.to_string());
                 let _ = reply.send(result);
             }
 
@@ -2760,6 +2788,15 @@ impl Engine {
         if let Err(e) = rt_db::append_session_event(&db, &event) {
             warn!(kind, err = %e, "failed to append session event");
         }
+    }
+
+    fn list_session_events(
+        &self,
+        info_hash: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<rt_db::SessionEventRow>, rt_db::DbError> {
+        let db = self.db.lock().expect("database mutex poisoned");
+        rt_db::list_session_events(&db, info_hash, limit)
     }
 
     fn create_recheck_job(&self, info_hash: &str) -> Option<String> {

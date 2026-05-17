@@ -14,16 +14,8 @@ use rt_session::SessionRegistry;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Logging — JSON in production, pretty in dev
-    if std::env::var("RUST_LOG").is_err() {
-        std::env::set_var("RUST_LOG", "info");
-    }
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .json()
-        .init();
-
     let config = Arc::new(load_config());
+    rt_logging::init(&config.logging, Some(&config.daemon.log_level));
     info!(
         version = env!("CARGO_PKG_VERSION"),
         api_bind = %config.daemon.api_bind,

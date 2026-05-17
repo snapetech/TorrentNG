@@ -18,6 +18,7 @@ anyhow.workspace = true
 
 axum.workspace = true
 rt-config     = { path = "../rt-config" }
+rt-logging    = { path = "../rt-logging" }
 rt-engine     = { path = "../rt-engine" }
 rt-session    = { path = "../rt-session" }
 rt-db         = { path = "../rt-db" }

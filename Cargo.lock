@@ -1299,6 +1299,7 @@ dependencies = [
  "axum",
  "reqwest",
  "rt-api-model",
+ "rt-db",
  "rt-engine",
  "rt-metainfo",
  "rt-metrics",
@@ -1355,6 +1356,7 @@ dependencies = [
 name = "rt-config"
 version = "0.1.0"
 dependencies = [
+ "rt-logging",
  "serde",
  "thiserror 1.0.69",
  "toml",
@@ -1448,6 +1450,15 @@ dependencies = [
  "thiserror 1.0.69",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "rt-logging"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1695,6 +1706,7 @@ dependencies = [
  "rt-config",
  "rt-db",
  "rt-engine",
+ "rt-logging",
  "rt-session",
  "tokio",
  "tracing",

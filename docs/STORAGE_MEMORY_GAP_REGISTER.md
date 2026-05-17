@@ -40,7 +40,8 @@ Implemented and covered by automated tests:
   admission, parent creation, copy-length verification, staged rollback cleanup,
   recursive directory copy/delete support, copy-based move source cleanup after
   verified rename, symlink rejection during recursive copies and hardlink
-  imports, symlink-safe delete, and dry-run no-op behavior.
+  imports, symlink-safe no-overwrite checks, symlink-safe delete, and dry-run
+  no-op behavior.
 - Move/import/delete execution has an opt-in storage-root confinement entry
   point that validates source, destination, and rollback paths before applying
   any filesystem change.
@@ -83,6 +84,7 @@ scripts/api_facade_certification.sh
 scripts/storage_move_import_certification.sh
 TNG_STORAGE_MOVE_IMPORT_ROOT=/target/root scripts/storage_move_import_certification.sh
 scripts/storage_uring_graduation.sh /target/root
+scripts/memory_roadmap_certification.sh
 ```
 
 Use these before claiming production storage performance:

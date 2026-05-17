@@ -34,6 +34,7 @@ rusqlite = { version = "0.39", features = ["bundled"] }
 # Logging / tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+rt-logging = { path = "../crates/rt-logging" }
 
 # Error handling
 anyhow = "1"

@@ -73,7 +73,7 @@ fi
   echo
   echo "## Notes"
   echo
-  echo "- Covers no-overwrite move execution, copy-based move source cleanup after verified rename, hardlink-or-copy import, recursive directory copy verification, symlink rejection, symlink-safe delete, staged rollback cleanup, approved directory delete, and storage-root confinement."
+  echo "- Covers symlink-safe no-overwrite move execution, copy-based move source cleanup after verified rename, hardlink-or-copy import, recursive directory copy verification, symlink rejection, symlink-safe delete, staged rollback cleanup, approved directory delete, and storage-root confinement."
   echo "- Set TNG_STORAGE_MOVE_IMPORT_ROOT to run the same executor on a real storage root. Increase TNG_STORAGE_MOVE_IMPORT_FILES and TNG_STORAGE_MOVE_IMPORT_MIB_PER_FILE for larger operator soaks."
 } >>"$OUT"
 
