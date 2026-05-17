@@ -273,7 +273,7 @@ async fn hdd_peer_read_elevator_reduces_backend_reads_on_shuffled_adjacent_block
             peer_read_concurrency: blocks as usize,
             storage_io: StorageIoConfig {
                 peer_read_readahead_bytes: 0,
-                peer_read_elevator_budget_ms: bench_u64("TNG_STORAGE_ELEVATOR_BUDGET_MS", 100),
+                peer_read_elevator_budget_ms: bench_u64("TNG_STORAGE_ELEVATOR_BUDGET_MS", 25),
                 ..Default::default()
             },
             ..Default::default()
