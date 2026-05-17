@@ -27,7 +27,7 @@ docker:packaged:
   extends: .docker_build
   script:
     - >
-      docker buildx build
+      docker buildx build --network host
       --file deploy/docker/Dockerfile
       --tag "$PACKAGED_IMAGE_TAG"
       --tag "$PACKAGED_IMAGE_SHA_TAG"
@@ -42,7 +42,7 @@ docker:native:
   extends: .docker_build
   script:
     - >
-      docker buildx build
+      docker buildx build --network host
       --file deploy/native/Dockerfile
       --tag "$NATIVE_IMAGE_TAG"
       --tag "$NATIVE_IMAGE_SHA_TAG"
