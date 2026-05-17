@@ -231,6 +231,22 @@ function RtorrentSettingsPanel() {
     setCustomRc(data.custom_rc)
   }, [data])
 
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (!(e.ctrlKey || e.metaKey)) return
+      if (e.key.toLowerCase() === 's') {
+        e.preventDefault()
+        if (dirtyCount > 0 && !save.isPending) save.mutate()
+      }
+      if (e.key.toLowerCase() === 'z' && e.shiftKey) {
+        e.preventDefault()
+        resetAll()
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  })
+
   const save = useMutation({
     mutationFn: () => api.rtorrentSettings.save(draft, customRc, true),
     onSuccess: result => {
@@ -288,6 +304,15 @@ function RtorrentSettingsPanel() {
     setCustomRc(data.custom_rc)
     setNotice(null)
   }
+  const defaultAll = () => {
+    if (!data) return
+    const next: Record<string, string | number | boolean> = {}
+    for (const setting of data.settings) {
+      next[setting.key] = inputValue(setting.value_type, setting.default_value)
+    }
+    setDraft(next)
+    setNotice({ tone: 'warn', text: 'Managed settings moved to defaults. Save to apply.' })
+  }
   const resetGroup = (settings: RtorrentSettingDescriptor[]) => {
     if (!data) return
     setDraft(prev => {
@@ -322,6 +347,16 @@ function RtorrentSettingsPanel() {
       setNotice({ tone: 'ok', text: `${label} copied` })
     } catch {
       setNotice({ tone: 'error', text: `Could not copy ${label.toLowerCase()}` })
+    }
+  }
+  const restartDirtyCount = data ? dirtySettings.filter(setting => setting.restart_required).length : 0
+  const liveDirtyCount = dirtySettings.length - restartDirtyCount
+  const allGroupsCollapsed = filteredGroups.length > 0 && filteredGroups.every(group => collapsedGroups.has(group.name))
+  const toggleAllGroups = () => {
+    if (allGroupsCollapsed) {
+      setCollapsedGroups(new Set())
+    } else {
+      setCollapsedGroups(new Set(filteredGroups.map(group => group.name)))
     }
   }
 
@@ -380,6 +415,33 @@ function RtorrentSettingsPanel() {
           )}
           <div role="status" aria-live="polite" style={{ color: 'var(--faint)', fontSize: 11 }}>
             Showing {filteredGroups.reduce((sum, group) => sum + group.settings.length, 0).toLocaleString()} of {data.settings.length.toLocaleString()} managed settings.
+          </div>
+          <div style={{
+            display: 'grid',
+            gridTemplateColumns: 'minmax(260px, 1fr) auto',
+            gap: 10,
+            alignItems: 'center',
+            border: '1px solid var(--border)',
+            borderRadius: 8,
+            background: 'color-mix(in srgb, var(--surface) 82%, var(--bg))',
+            padding: 10,
+          }}>
+            <div style={{ display: 'grid', gap: 4, minWidth: 0 }}>
+              <div style={{ color: 'var(--text)', fontSize: 12, fontWeight: 800 }}>Pending changes</div>
+              <div style={{ color: 'var(--faint)', fontSize: 11 }}>
+                {dirtyCount === 0
+                  ? 'No edits are staged.'
+                  : `${liveDirtyCount} live setting${liveDirtyCount === 1 ? '' : 's'}, ${restartDirtyCount} restart setting${restartDirtyCount === 1 ? '' : 's'}, ${customRcDirty ? 'custom lines edited' : 'custom lines unchanged'}.`}
+              </div>
+            </div>
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+              <button type="button" onClick={toggleAllGroups} style={smallButtonStyle(filteredGroups.length > 0)} disabled={filteredGroups.length === 0}>
+                {allGroupsCollapsed ? 'Expand all' : 'Collapse all'}
+              </button>
+              <button type="button" onClick={defaultAll} disabled={save.isPending} style={smallButtonStyle(!save.isPending)}>
+                Defaults all
+              </button>
+            </div>
           </div>
           <div style={{ display: 'grid', gap: 12 }}>
             {filteredGroups.map(group => {

@@ -1935,21 +1935,37 @@ impl Engine {
         name: Option<String>,
         save_path: Option<std::path::PathBuf>,
     ) -> CmdResult<()> {
+        let normalized_name = normalize_optional_text(name);
+        let current_save_path = {
+            let reg = self.registry.read().await;
+            let entry = reg
+                .get(info_hash)
+                .ok_or_else(|| format!("torrent {info_hash} not found"))?;
+            PathBuf::from(&entry.save_path)
+        };
+        let target_save_path = save_path;
+        let meta = load_meta_from_blob(&self.config, info_hash).ok();
+        if let (Some(target), Some(meta)) = (&target_save_path, meta.as_ref()) {
+            if *target != current_save_path {
+                self.move_torrent_payload_files(info_hash, &current_save_path, target, meta)?;
+            }
+        }
+
         let mut reg = self.registry.write().await;
         let entry = reg
             .get_mut(info_hash)
             .ok_or_else(|| format!("torrent {info_hash} not found"))?;
 
-        if let Some(name) = normalize_optional_text(name) {
+        if let Some(name) = normalized_name {
             entry.name = name;
         }
-        if let Some(save_path) = save_path {
+        if let Some(save_path) = target_save_path {
             entry.save_path = save_path.to_string_lossy().to_string();
         }
 
-        let row = match load_meta_from_blob(&self.config, info_hash) {
-            Ok(meta) => row_from_entry(entry, &meta),
-            Err(_) => {
+        let row = match meta {
+            Some(meta) => row_from_entry(entry, &meta),
+            None => {
                 let db = self.db.lock().expect("database mutex poisoned");
                 let mut row = rt_db::get(&db, info_hash).map_err(|e| e.to_string())?;
                 row.name = entry.name.clone();
@@ -1971,6 +1987,47 @@ impl Engine {
                 "save_path": row.save_path,
             }),
         );
+        Ok(())
+    }
+
+    fn move_torrent_payload_files(
+        &self,
+        info_hash: &str,
+        source_root: &std::path::Path,
+        destination_root: &std::path::Path,
+        meta: &TorrentMeta,
+    ) -> CmdResult<()> {
+        let mut steps = Vec::new();
+        let mut rollback_steps = Vec::new();
+        let mut issues = Vec::new();
+        for (rel_path, bytes) in meta_file_entries(meta) {
+            let source = rel_path.resolve(source_root);
+            if !source.exists() {
+                continue;
+            }
+            let destination = rel_path.resolve(destination_root);
+            let plan = rt_storage::plan_move(&rt_storage::MovePlanRequest {
+                source,
+                destination,
+                bytes,
+                available_bytes: None,
+                dry_run: false,
+            });
+            issues.extend(plan.issues);
+            steps.extend(plan.steps);
+            rollback_steps.extend(plan.rollback_steps);
+        }
+        if steps.is_empty() {
+            return Ok(());
+        }
+        let plan = StoragePlan {
+            dry_run: false,
+            can_apply: issues.is_empty(),
+            issues,
+            steps,
+            rollback_steps,
+        };
+        self.execute_storage_plan_job("move", vec![info_hash.to_owned()], &plan, Vec::new())?;
         Ok(())
     }
 
@@ -3462,6 +3519,21 @@ fn meta_file_paths(meta: &TorrentMeta) -> Vec<rt_path::SafeRelPath> {
             meta.files.iter().map(|file| file.path.clone()).collect()
         }
         TorrentMeta::V2(meta) => meta.files.iter().map(|file| file.path.clone()).collect(),
+    }
+}
+
+fn meta_file_entries(meta: &TorrentMeta) -> Vec<(rt_path::SafeRelPath, u64)> {
+    match meta {
+        TorrentMeta::V1(meta) | TorrentMeta::Hybrid(meta, _) => meta
+            .files
+            .iter()
+            .map(|file| (file.path.clone(), file.length))
+            .collect(),
+        TorrentMeta::V2(meta) => meta
+            .files
+            .iter()
+            .map(|file| (file.path.clone(), file.length))
+            .collect(),
     }
 }
 
@@ -5112,6 +5184,83 @@ mod tests {
             .any(|event| event.kind == "storage_plan_checkpoint"
                 && event.payload.contains("CopyVerifyRename")));
         assert_eq!(events[0].kind, "storage_plan_completed");
+    }
+
+    #[tokio::test]
+    async fn update_save_path_moves_existing_payload_through_storage_plan() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.daemon.session_dir = temp.path().join("session");
+        config.db.path = temp.path().join("state.db");
+        std::fs::create_dir_all(torrent_blob_dir(&config)).unwrap();
+        std::fs::create_dir_all(fastresume_dir(&config)).unwrap();
+
+        let raw = raw_single_file_torrent();
+        let TorrentMeta::V1(meta) = parse_torrent(&raw).unwrap() else {
+            panic!("expected v1 torrent");
+        };
+        let info_hash = meta
+            .info_hash
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        std::fs::write(torrent_blob_path(&config, &info_hash), &raw).unwrap();
+        let source_root = temp.path().join("old");
+        let destination_root = temp.path().join("new");
+        std::fs::create_dir_all(&source_root).unwrap();
+        std::fs::write(source_root.join("restore.bin"), vec![1u8; 1024]).unwrap();
+
+        let conn = Connection::open(config.db_path()).unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let mut entry = TorrentEntry::new(
+            info_hash.clone(),
+            meta.name.clone(),
+            source_root.to_string_lossy().into(),
+        );
+        entry.total_length = meta.total_length();
+        entry.amount_left = 0;
+        entry.state = TorrentState::Paused;
+        rt_db::upsert(&conn, &row_from_entry(&entry, &TorrentMeta::V1(meta))).unwrap();
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        registry.write().await.add(entry).unwrap();
+        let (_tx, rx) = mpsc::channel(1);
+        let engine = Engine {
+            config: Arc::new(config),
+            registry: Arc::clone(&registry),
+            db: Arc::new(Mutex::new(conn)),
+            cmd_rx: rx,
+            cmd_tx: mpsc::channel(1).0,
+            torrent_chans: HashMap::new(),
+            torrent_tasks: HashMap::new(),
+            dht_tx: None,
+            resources: test_resource_governor(),
+        };
+
+        engine
+            .update_torrent_fields_inner(&info_hash, None, Some(destination_root.clone()))
+            .await
+            .unwrap();
+
+        assert!(!source_root.join("restore.bin").exists());
+        assert_eq!(
+            std::fs::read(destination_root.join("restore.bin")).unwrap(),
+            vec![1u8; 1024]
+        );
+        let db = engine.db.lock().unwrap();
+        let row = rt_db::get(&db, &info_hash).unwrap();
+        assert_eq!(
+            row.save_path,
+            destination_root.to_string_lossy().to_string()
+        );
+        let jobs = rt_db::list_active_jobs(&db).unwrap();
+        assert!(jobs.is_empty());
+        drop(db);
+        let reg = registry.read().await;
+        let entry = reg.get(&info_hash).unwrap();
+        assert_eq!(
+            entry.save_path,
+            destination_root.to_string_lossy().to_string()
+        );
     }
 
     #[tokio::test]
