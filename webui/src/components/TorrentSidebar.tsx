@@ -133,7 +133,7 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
   }
 
   return (
-    <aside style={{
+    <aside className="torrent-sidebar" style={{
       width: 236, flexShrink: 0, background: 'var(--panel)', borderRight: '1px solid var(--border)',
       display: 'flex', flexDirection: 'column', overflowY: 'auto',
     }}>

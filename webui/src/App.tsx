@@ -513,7 +513,7 @@ export function App() {
       )}
 
       {/* Main content */}
-      <main style={{ flex: 1, minWidth: 0, display: 'flex', overflow: 'hidden' }}>
+      <main className="rtng-main" style={{ flex: 1, minWidth: 0, display: 'flex', overflow: 'hidden' }}>
         {view === 'settings' && (
           <SettingsView
             section={settingsSection}

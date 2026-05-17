@@ -130,3 +130,16 @@ input[type="radio"]:not(:disabled):hover {
 .torrent-row[aria-selected="true"] {
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 38%, transparent);
 }
+
+@media (max-width: 720px) {
+  .rtng-main {
+    flex-direction: column;
+  }
+
+  .torrent-sidebar {
+    width: 100% !important;
+    max-height: 220px;
+    border-right: 0 !important;
+    border-bottom: 1px solid var(--border);
+  }
+}
