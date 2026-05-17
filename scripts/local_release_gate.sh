@@ -8,6 +8,7 @@ OUT="${1:-$REPORT_DIR/local-release-$(date -u +%Y%m%dT%H%M%SZ).md}"
 mkdir -p "$(dirname "$OUT")"
 
 status="PASS"
+warnings=0
 started_at="$(date +%s)"
 
 run_gate() {
@@ -26,6 +27,44 @@ run_gate() {
   if (cd "$ROOT" && "$@") >>"$OUT" 2>&1; then
     result="PASS"
     echo '```' >>"$OUT"
+  else
+    result="FAIL"
+    echo '```' >>"$OUT"
+    status="FAIL"
+  fi
+  end="$(date +%s)"
+  elapsed="$((end - start))s"
+  printf '| %s | %s | %s |\n' "$name" "$result" "$elapsed" >>"$OUT.table"
+}
+
+run_report_gate() {
+  local name="$1"
+  local report="$2"
+  shift 2
+  local start end elapsed result report_status
+  start="$(date +%s)"
+  {
+    echo
+    echo "## $name"
+    echo
+    echo "- Command: \`$*\`"
+    echo
+    echo '```text'
+  } >>"$OUT"
+  if (cd "$ROOT" && "$@") >>"$OUT" 2>&1; then
+    echo '```' >>"$OUT"
+    report_status="$(awk -F': ' '/^Overall status:/ {status=$2} END {print status}' "$report" 2>/dev/null || true)"
+    case "$report_status" in
+      PASS) result="PASS" ;;
+      PASS_WITH_GAPS|PASS_WITH_SKIPS) result="WARN" ;;
+      "") result="PASS" ;;
+      *) result="$report_status" ;;
+    esac
+    if [[ "$result" == "FAIL" ]]; then
+      status="FAIL"
+    elif [[ "$result" == "WARN" ]]; then
+      warnings=$((warnings + 1))
+    fi
   else
     result="FAIL"
     echo '```' >>"$OUT"
@@ -87,6 +126,8 @@ run_gate "workspace tests" cargo test --workspace
 run_gate "Storage NG feature matrix" "$ROOT/scripts/storage_ng_feature_matrix.sh"
 run_gate "WebUI certification" "$ROOT/scripts/webui_certification.sh"
 run_gate "API facade certification" "$ROOT/scripts/api_facade_certification.sh" "$REPORT_DIR/api-facades-local-release-$(date -u +%Y%m%dT%H%M%SZ).md"
+corpus_report="$REPORT_DIR/migration-corpus-local-release-$(date -u +%Y%m%dT%H%M%SZ).md"
+run_report_gate "migration exported corpus coverage" "$corpus_report" "$ROOT/scripts/migration_corpus_certification.sh" "$corpus_report"
 
 run_gate "native config security review" bash -c '
   set -euo pipefail
@@ -113,7 +154,12 @@ rm -f "$OUT.table"
 
 {
   echo
-  echo "Overall status: $status"
+  if [[ "$status" == "PASS" && "$warnings" -gt 0 ]]; then
+    echo "Overall status: PASS_WITH_WARNINGS"
+    echo "Warnings: $warnings"
+  else
+    echo "Overall status: $status"
+  fi
   echo "Total duration: $(($(date +%s) - started_at))s"
 } >>"$OUT"
 

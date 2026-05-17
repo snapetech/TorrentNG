@@ -34,14 +34,15 @@ Current `scripts/certification_status.sh` highlights:
 | Area | Status |
 | --- | --- |
 | Native engine rewrite | PASS |
-| Local release gate | PASS |
+| Local release gate | PASS_WITH_WARNINGS while exported migration corpora are missing |
 | Storage hardware matrix | PASS |
 | Storage io_uring capability/graduation | PASS |
 | Storage move/import | PASS |
 | Storage release certification | PASS |
 | Storage indexed evidence | PASS |
 | Security review and scan | PASS |
-| Pre-engine and post-soak release gates | PASS |
+| Pre-engine release gate | PASS |
+| Post-soak release gate | PASS_WITH_WARNINGS while skipped/gap/stale rows remain |
 | Universal compatibility | PASS_WITH_SKIPS unless live/public/device legs are enabled |
 | Migration corpus | PASS_WITH_GAPS until exported corpora are populated |
 | 24h soak | STALE/INCOMPLETE |
@@ -123,7 +124,9 @@ desktop and mobile viewports. The browser matrix checks first paint, table
 rendering, selection state, settings navigation, storage panel rendering, and
 console/page-error cleanliness.
 `scripts/local_release_gate.sh` now runs the same WebUI certification as part
-of the local release path.
+of the local release path. It also runs the migration corpus gate and reports
+that leg as `WARN`, with an overall `PASS_WITH_WARNINGS`, when the synthetic
+migration tests pass but exported corpora are still missing.
 
 Remaining WebUI gaps are now product/certification depth:
 
@@ -171,6 +174,9 @@ Remaining compatibility gaps:
 
 The deterministic local compatibility certification passes. Skipped live legs
 are now explicit in the universal compatibility report and certification status.
+The post-soak release rollup now marks `PASS_WITH_GAPS`, `PASS_WITH_SKIPS`,
+`PASS_WITH_WARNINGS`, `SKIP`, and stale/running evidence rows as `WARN` instead
+of treating them as a clean evidence set.
 The full Docker interop matrix still has release evidence to run:
 
 - local Docker client-to-client rows across qBittorrent, Transmission, Deluge,

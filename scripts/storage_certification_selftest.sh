@@ -132,6 +132,12 @@ for pattern in \
 done
 write_passing_report "$benchmark_dir/report-selftest.md"
 
+cat >"$report_dir/migration-corpus-selftest.md" <<'REPORT'
+# selftest
+
+Overall status: PASS_WITH_GAPS
+REPORT
+
 cat >"$report_dir/memory-roadmap-certification-selftest.md" <<'REPORT'
 # TorrentNG Memory Roadmap Certification
 
@@ -147,6 +153,27 @@ cat >"$report_dir/storage-release-certification-selftest.md" <<'REPORT'
 
 Overall status: PASS
 REPORT
+
+REPORT_DIR="$report_dir" BENCHMARK_DIR="$benchmark_dir" \
+  "$ROOT/scripts/post_soak_release_gate.sh" "$report_dir/post-soak-release-selftest-warn.md" >/dev/null
+grep -q 'certification status rollup | WARN' "$report_dir/post-soak-release-selftest-warn.md"
+
+cat >"$report_dir/local-release-selftest.md" <<'REPORT'
+# selftest
+
+Overall status: PASS_WITH_WARNINGS
+REPORT
+
+REPORT_DIR="$report_dir" BENCHMARK_DIR="$benchmark_dir" \
+  "$ROOT/scripts/post_soak_release_gate.sh" "$report_dir/post-soak-release-selftest-local-warn.md" >/dev/null
+grep -q 'certification status rollup | WARN' "$report_dir/post-soak-release-selftest-local-warn.md"
+
+cat >"$report_dir/migration-corpus-selftest.md" <<'REPORT'
+# selftest
+
+Overall status: PASS
+REPORT
+write_passing_report "$report_dir/local-release-selftest.md"
 
 REPORT_DIR="$report_dir" BENCHMARK_DIR="$benchmark_dir" \
   "$ROOT/scripts/post_soak_release_gate.sh" "$report_dir/post-soak-release-selftest-pass.md" >/dev/null

@@ -31,6 +31,7 @@ overall() {
 }
 
 status="PASS"
+warnings=0
 
 mark() {
   local name="$1"
@@ -43,6 +44,9 @@ mark() {
     PASS|INFO|WARN) ;;
     *) status="FAIL" ;;
   esac
+  if [[ "$result" == "WARN" ]]; then
+    warnings=$((warnings + 1))
+  fi
 }
 
 gate() {
@@ -52,6 +56,12 @@ gate() {
   file="$(latest "$pattern")"
   result="$(overall "$file")"
   detail="$([[ -n "$file" ]] && basename "$file" || printf 'missing %s' "$pattern")"
+  case "$result" in
+    PASS_WITH_GAPS|PASS_WITH_SKIPS|PASS_WITH_WARNINGS)
+      detail="$detail; $result"
+      result="WARN"
+      ;;
+  esac
   mark "$name" "$result" "$detail"
 }
 
@@ -126,9 +136,23 @@ certification_status_gate() {
         print $2 "=" $3
       }
     ' "$tmp" | paste -sd ';' -)"
+  elif awk -F'|' '
+      /^\| Post-soak release gate \|/ {next}
+      /^\|/ && $3 ~ /PASS_WITH_GAPS|PASS_WITH_SKIPS|PASS_WITH_WARNINGS|STALE\/INCOMPLETE|RUNNING\/UNKNOWN|RUNNING|SKIP/ {warn=1}
+      END {exit warn ? 0 : 1}
+    ' "$tmp"; then
+    result="WARN"
+    detail="$(awk -F'|' '
+      /^\| Post-soak release gate \|/ {next}
+      /^\|/ && $3 ~ /PASS_WITH_GAPS|PASS_WITH_SKIPS|PASS_WITH_WARNINGS|STALE\/INCOMPLETE|RUNNING\/UNKNOWN|RUNNING|SKIP/ {
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2);
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", $3);
+        print $2 "=" $3
+      }
+    ' "$tmp" | paste -sd ';' -)"
   else
     result="PASS"
-    detail="all non-post-soak status rows are present and non-failing"
+    detail="all non-post-soak status rows are present, complete, and non-failing"
   fi
   rm -f "$tmp"
   mark "certification status rollup" "$result" "$detail"
@@ -161,7 +185,12 @@ certification_status_gate
   echo "- This gate rolls up the latest generated evidence. It does not replace a fresh real-device run on new release hardware."
   echo "- Memory roadmap WARN rows are allowed only when the warning is an explicit non-claim, such as physical PV affinity or host-scale evidence outside the current release target."
   echo
-  echo "Overall status: $status"
+  if [[ "$status" == "PASS" && "$warnings" -gt 0 ]]; then
+    echo "Overall status: PASS_WITH_WARNINGS"
+    echo "Warnings: $warnings"
+  else
+    echo "Overall status: $status"
+  fi
 } >>"$OUT"
 
 echo "$OUT"
