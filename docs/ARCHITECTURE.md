@@ -16,6 +16,10 @@ The native engine supersedes the wrapper/harness path for production native
 mode. The wrapper remains useful as a migration bridge and rTorrent facade, not
 as a required dependency of `rusttorrentd`.
 
+For the practical engine-selection workflow, including how to swap between the
+native rewrite and the rTorrent core for testing, see
+[ENGINE_REWRITE.md](ENGINE_REWRITE.md).
+
 ```text
 ┌─────────────────────────────────────────────────────────┐
 │                      External Tools                      │

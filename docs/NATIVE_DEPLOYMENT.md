@@ -4,6 +4,9 @@ Native mode runs `rusttorrentd` as the source of truth. qBittorrent,
 Transmission, Deluge, and legacy UI compatibility surfaces are facades over the
 same durable engine state.
 
+For the larger rewrite overview and native-vs-rTorrent comparison, see
+[ENGINE_REWRITE.md](ENGINE_REWRITE.md).
+
 ## Production Requirements
 
 - Put the session DB and torrent metadata on durable local storage.

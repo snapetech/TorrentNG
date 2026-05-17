@@ -2,7 +2,9 @@
 
 [![Discord](https://img.shields.io/discord/4ub88HeHFm?label=Discord&logo=discord&logoColor=white)](https://discord.gg/4ub88HeHFm)
 
-rtorrentNG is a torrent management stack with two runtime modes:
+rtorrentNG is a torrent management stack with two runtime modes. The native
+engine rewrite is the primary path; the rTorrent-backed sidecar remains for
+comparison, migration, and users who still want the upstream rTorrent core.
 
 - A native Rust BitTorrent daemon (`rusttorrentd`) that owns torrent state,
   tracker announces, peer wire traffic, storage, rechecks, metrics, and native
@@ -11,7 +13,8 @@ rtorrentNG is a torrent management stack with two runtime modes:
   compatibility.
 
 Both modes include a React/Vite WebUI and compatibility shims for common
-automation tools.
+automation tools. The API shape is intentionally similar, but the engine below
+it is different.
 
 ## Status
 
@@ -19,6 +22,44 @@ The native engine rewrite is the primary runtime path. The rewrite surface is
 tracked in [docs/ENGINE_REWRITE_BURNDOWN.md](docs/ENGINE_REWRITE_BURNDOWN.md)
 and certified by `scripts/native_engine_certification_report.sh`. Interfaces,
 deployment details, and runtime behavior may still change before a 1.0 release.
+
+Read [docs/ENGINE_REWRITE.md](docs/ENGINE_REWRITE.md) for the practical guide
+to the rewrite: what changed, how native mode differs from the rTorrent core,
+and how to swap between them for testing.
+
+## Choosing an Engine
+
+Use native mode when you want to test the rewrite:
+
+```sh
+docker compose -f deploy/native/compose.yml up --build
+```
+
+Native mode runs `rusttorrentd`. It owns session state, tracker state, peer
+connections, storage scheduling, rechecks, metrics, and the native and
+compatibility APIs.
+
+Use the rTorrent core when you want to compare behavior or keep the historical
+runtime:
+
+```sh
+docker compose -f deploy/docker/compose.yml up --build
+```
+
+That mode runs rTorrent plus the `rtorrentng` sidecar. rTorrent remains the
+BitTorrent engine; the sidecar bridges local SCGI/XMLRPC into the WebUI,
+native REST facade, qBittorrent-compatible endpoints, auth, cache, and metrics.
+
+The pure Phase 1 ruTorrent/rTorrent bundle is still available for low-level
+rTorrent profile testing:
+
+```sh
+docker compose -f deploy/docker/compose.phase1.yml up --build
+```
+
+Keep separate volumes or session directories when switching modes against the
+same payload data. Native mode stores durable state in `rusttorrentd` SQLite
+state; rTorrent mode stores state in the rTorrent session directory.
 
 ## Support
 
@@ -37,6 +78,20 @@ are available on Discord: [https://discord.gg/4ub88HeHFm](https://discord.gg/4ub
 - `deploy/` - Docker, Compose, systemd, and nginx deployment examples.
 - `docs/` - API, architecture, configuration, engine, migration, and roadmap
   notes.
+
+## Documentation Map
+
+- [Engine rewrite guide](docs/ENGINE_REWRITE.md) - practical overview, swap
+  workflows, native-vs-rTorrent differences, and testing checklist.
+- [Native engine design](docs/ENGINE.md) - deeper architecture and crate-level
+  design for the rewrite.
+- [Architecture](docs/ARCHITECTURE.md) - how native mode, sidecar mode, WebUI,
+  APIs, and certification fit together.
+- [Native deployment](docs/NATIVE_DEPLOYMENT.md) - production `rusttorrentd`
+  setup.
+- [Track 1 deployment](docs/DEPLOYMENT.md) - rTorrent plus sidecar setup.
+- [Migration](docs/MIGRATION.md) - importing existing rTorrent and other client
+  state.
 
 ## Legal Use
 
@@ -91,4 +146,11 @@ Run native engine certification:
 
 ```sh
 scripts/native_engine_certification_report.sh
+```
+
+Run the cross-client interop matrix when comparing the rewrite against rTorrent
+and other clients:
+
+```sh
+scripts/interop_matrix.sh
 ```

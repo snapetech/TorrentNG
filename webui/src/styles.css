@@ -423,6 +423,44 @@ dialog,
   pointer-events: none;
 }
 
+.rtng-rss-match,
+.rtng-identity-panel,
+.rtng-preset-button {
+  transition:
+    border-color 120ms ease,
+    background-color 120ms ease,
+    box-shadow 120ms ease,
+    filter 120ms ease;
+}
+
+.rtng-rss-match:hover,
+.rtng-identity-panel:hover,
+.rtng-preset-button:hover {
+  border-color: color-mix(in srgb, var(--accent) 38%, var(--border-strong)) !important;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.rtng-rss-match[data-matched="true"] {
+  box-shadow: inset 3px 0 0 color-mix(in srgb, var(--success) 62%, transparent);
+}
+
+.rtng-rss-match[data-matched="false"] {
+  box-shadow: inset 3px 0 0 color-mix(in srgb, var(--faint) 45%, transparent);
+  opacity: 0.86;
+}
+
+.rtng-identity-panel[data-dirty="true"] {
+  box-shadow:
+    inset 3px 0 0 color-mix(in srgb, var(--warning) 72%, transparent),
+    inset 0 1px 0 rgba(255,255,255,0.03);
+}
+
+.rtng-preset-button[data-active="true"] {
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.045),
+    0 0 0 1px color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
 ::selection {
   background: color-mix(in srgb, var(--accent) 40%, transparent);
   color: var(--text);

@@ -51,12 +51,14 @@ export function UserAgentPanel() {
         }}>Unsaved</span>}
       </div>
 
-      <div style={panelStyle}>
+      <div className="rtng-card rtng-identity-panel" data-dirty={isDirty ? 'true' : 'false'} style={panelStyle}>
         <div style={{ fontSize: 12, fontWeight: 800, color: 'var(--text)', marginBottom: 10 }}>Preset identity</div>
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 12 }}>
           {PRESETS.map(p => (
             <button
               key={p.value}
+              className="rtng-preset-button"
+              data-active={draft === p.value ? 'true' : 'false'}
               onClick={() => setDraft(p.value)}
               disabled={mutation.isPending}
               style={presetButton(draft === p.value, mutation.isPending)}
@@ -112,7 +114,7 @@ export function UserAgentPanel() {
         )}
       </div>
 
-      <div style={currentStyle}>
+      <div className="rtng-metric-tile" style={currentStyle}>
         <span style={{ color: 'var(--faint)', fontWeight: 800, textTransform: 'uppercase', fontSize: 10 }}>Current</span>
         <span style={{ fontFamily: 'monospace', color: 'var(--muted)', overflowWrap: 'anywhere' }}>{data?.user_agent ?? '…'}</span>
       </div>
