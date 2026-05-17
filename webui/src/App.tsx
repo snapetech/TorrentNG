@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from 'react'
+import { Suspense, lazy, useState, useCallback, useEffect } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useTorrentsInfinite, flattenPages, useHealth } from './hooks/useTorrents'
 import { useWebSocket } from './hooks/useWebSocket'
@@ -7,16 +7,9 @@ import { FilterBar } from './components/FilterBar'
 import { SavedViewsBar } from './components/SavedViewsBar'
 import { TorrentDetail } from './components/TorrentDetail'
 import { AddTorrentDialog } from './components/AddTorrentDialog'
-import { UserAgentPanel } from './components/UserAgentPanel'
 import { CategoriesPanel } from './components/CategoriesPanel'
 import { TorrentSidebar } from './components/TorrentSidebar'
-import { StoragePanel } from './components/StoragePanel'
 import { TrackerHealthPanel } from './components/TrackerHealthPanel'
-import { RatioGroupsPanel } from './components/RatioGroupsPanel'
-import { WorkflowsPanel } from './components/WorkflowsPanel'
-import { RssRulesPanel } from './components/RssRulesPanel'
-import { EnginePanel } from './components/EnginePanel'
-import { LogsPanel } from './components/LogsPanel'
 import { TorrentToolbar } from './components/TorrentToolbar'
 import { TorrentContextMenu, type ContextMenuState } from './components/TorrentContextMenu'
 import { HelpDialog } from './components/HelpDialog'
@@ -26,6 +19,14 @@ import { AppearancePanel, type MediaInferenceMode } from './components/Appearanc
 import { BulkEditDialog } from './components/BulkEditDialog'
 import { api, AuthError, type ListParams, type LiveStats, type TorrentSummary } from './api/client'
 import { PALETTES, applyTheme, findPalette, THEME_MODE_STORAGE_KEY, THEME_STORAGE_KEY, type ThemeMode } from './themes'
+
+const EnginePanel = lazy(() => import('./components/EnginePanel').then(module => ({ default: module.EnginePanel })))
+const StoragePanel = lazy(() => import('./components/StoragePanel').then(module => ({ default: module.StoragePanel })))
+const UserAgentPanel = lazy(() => import('./components/UserAgentPanel').then(module => ({ default: module.UserAgentPanel })))
+const RatioGroupsPanel = lazy(() => import('./components/RatioGroupsPanel').then(module => ({ default: module.RatioGroupsPanel })))
+const WorkflowsPanel = lazy(() => import('./components/WorkflowsPanel').then(module => ({ default: module.WorkflowsPanel })))
+const RssRulesPanel = lazy(() => import('./components/RssRulesPanel').then(module => ({ default: module.RssRulesPanel })))
+const LogsPanel = lazy(() => import('./components/LogsPanel').then(module => ({ default: module.LogsPanel })))
 
 type View = 'torrents' | 'settings'
 type AuthState = 'checking' | 'authenticated' | 'unauthenticated'
@@ -851,6 +852,7 @@ function SettingsView({ section, onSection, mediaInference, onMediaInference, th
         ))}
       </aside>
       <div style={{ flex: 1, overflowY: 'auto', background: 'var(--bg)' }}>
+        <Suspense fallback={<SettingsPanelFallback />}>
         {section === 'library' && (<>
           <PanelTitle title="Library" subtitle="Categories, storage roots, and tracker summaries" />
           <PanelFrame><CategoriesPanel /></PanelFrame>
@@ -900,8 +902,25 @@ function SettingsView({ section, onSection, mediaInference, onMediaInference, th
             </button>
           </div>
         </>)}
+        </Suspense>
       </div>
     </>
+  )
+}
+
+function SettingsPanelFallback() {
+  return (
+    <div role="status" aria-live="polite" style={{
+      padding: 24,
+      display: 'grid',
+      gap: 10,
+      color: 'var(--faint)',
+      fontSize: 12,
+    }}>
+      <span className="tng-skeleton" style={{ width: 180, height: 12 }} />
+      <span className="tng-skeleton" style={{ width: 'min(520px, 82%)', height: 10 }} />
+      <span>Loading settings panel...</span>
+    </div>
   )
 }
 

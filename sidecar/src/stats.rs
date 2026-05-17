@@ -11,6 +11,7 @@ use tracing::warn;
 
 use crate::{
     api::ws::Event,
+    cache::{AppEventRow, Db},
     rtorrent::{Client, TransferRates},
 };
 
@@ -26,12 +27,19 @@ pub struct SessionTotals {
     pub download: i64,
 }
 
-pub async fn run(rt: Arc<Client>, tx: broadcast::Sender<Event>, interval: Duration) {
+pub async fn run(
+    rt: Arc<Client>,
+    db: Arc<Db>,
+    tx: broadcast::Sender<Event>,
+    interval: Duration,
+    event_retention: usize,
+) {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_tick = tokio::time::Instant::now();
     let mut upload_total = 0_i64;
     let mut download_total = 0_i64;
+    let mut stats_error_active = false;
 
     loop {
         ticker.tick().await;
@@ -40,24 +48,49 @@ pub async fn run(rt: Arc<Client>, tx: broadcast::Sender<Event>, interval: Durati
         last_tick = now;
         let rates = match live_speeds_file() {
             Some(path) => read_live_speeds(&path).unwrap_or_default(),
-            None => match tokio::time::timeout(PROBE_TIMEOUT, rt.transfer_rates()).await {
-                Ok(Ok(rates)) => rates,
-                Ok(Err(e)) => {
+            None => match probe_transfer_rates_result(&rt).await {
+                Ok(rates) => {
+                    if stats_error_active {
+                        append_app_event(
+                            &db,
+                            "info",
+                            "rtorrent_stats_recovered",
+                            "rTorrent transfer stats recovered",
+                            serde_json::json!({
+                                "component": "rtorrent",
+                                "operation": "transfer_stats",
+                                "result": "ok",
+                            }),
+                            event_retention,
+                        );
+                        stats_error_active = false;
+                    }
+                    rates
+                }
+                Err(e) => {
                     warn!(
                         component = "rtorrent",
                         operation = "transfer_stats",
+                        result = "error",
                         error = %e,
                         "transfer stats probe failed"
                     );
-                    TransferRates::default()
-                }
-                Err(_) => {
-                    warn!(
-                        component = "rtorrent",
-                        operation = "transfer_stats",
-                        duration_ms = PROBE_TIMEOUT.as_millis() as u64,
-                        "transfer stats probe timed out"
-                    );
+                    if !stats_error_active {
+                        append_app_event(
+                            &db,
+                            "warn",
+                            "rtorrent_stats_error",
+                            "rTorrent transfer stats probe failed",
+                            serde_json::json!({
+                                "component": "rtorrent",
+                                "operation": "transfer_stats",
+                                "result": "error",
+                                "error": e.to_string(),
+                            }),
+                            event_retention,
+                        );
+                        stats_error_active = true;
+                    }
                     TransferRates::default()
                 }
             },
@@ -103,26 +136,58 @@ pub fn current_rates(rt: Arc<Client>) -> impl std::future::Future<Output = Trans
 }
 
 async fn probe_transfer_rates(rt: &Client) -> TransferRates {
-    match tokio::time::timeout(PROBE_TIMEOUT, rt.transfer_rates()).await {
-        Ok(Ok(rates)) => rates,
-        Ok(Err(e)) => {
+    match probe_transfer_rates_result(rt).await {
+        Ok(rates) => rates,
+        Err(e) => {
             warn!(
                 component = "rtorrent",
                 operation = "transfer_stats",
+                result = "error",
                 error = %e,
                 "transfer stats probe failed"
             );
             TransferRates::default()
         }
-        Err(_) => {
-            warn!(
-                component = "rtorrent",
-                operation = "transfer_stats",
-                duration_ms = PROBE_TIMEOUT.as_millis() as u64,
-                "transfer stats probe timed out"
-            );
-            TransferRates::default()
-        }
+    }
+}
+
+async fn probe_transfer_rates_result(rt: &Client) -> anyhow::Result<TransferRates> {
+    match tokio::time::timeout(PROBE_TIMEOUT, rt.transfer_rates()).await {
+        Ok(Ok(rates)) => Ok(rates),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(anyhow::anyhow!(
+            "transfer stats probe timed out after {} ms",
+            PROBE_TIMEOUT.as_millis()
+        )),
+    }
+}
+
+fn append_app_event(
+    db: &Db,
+    level: &str,
+    kind: &str,
+    message: &str,
+    payload: serde_json::Value,
+    retention: usize,
+) {
+    if let Err(e) = db.append_app_event(
+        &AppEventRow {
+            event_id: None,
+            occurred_at: chrono::Utc::now().timestamp(),
+            level: level.to_owned(),
+            kind: kind.to_owned(),
+            message: message.to_owned(),
+            payload: payload.to_string(),
+        },
+        retention,
+    ) {
+        warn!(
+            component = "app_events",
+            operation = "append",
+            kind,
+            error = %e,
+            "failed to append stats app event"
+        );
     }
 }
 

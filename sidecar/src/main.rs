@@ -99,9 +99,11 @@ async fn main() -> Result<()> {
 
     {
         let rt2 = rt.clone();
+        let db2 = db.clone();
         let tx2 = tx.clone();
+        let retention = cfg.logging.event_retention;
         tokio::spawn(async move {
-            stats::run(rt2, tx2, std::time::Duration::from_secs(2)).await;
+            stats::run(rt2, db2, tx2, std::time::Duration::from_secs(2), retention).await;
         });
     }
 
