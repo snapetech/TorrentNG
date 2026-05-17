@@ -1,0 +1,35 @@
+[daemon]
+api_bind = "0.0.0.0:8080"
+session_dir = "/var/lib/rusttorrentd"
+log_level = "info"
+shutdown_timeout_secs = 10
+
+[network]
+listen_port = 6881
+max_peers = 400
+upload_rate_limit = 0
+download_rate_limit = 0
+
+[storage]
+download_dir = "/downloads/rusttorrentd"
+
+[tracker]
+http_timeout_secs = 30
+udp_timeout_secs = 15
+min_interval_secs = 0
+
+[dht]
+enabled = true
+port = 6881
+bootstrap_nodes = [
+  "dht.transmissionbt.com:6881",
+  "router.bittorrent.com:6881",
+  "router.utorrent.com:6881",
+]
+
+[db]
+path = "/var/lib/rusttorrentd/state.db"
+wal_checkpoint_pages = 1000
+
+[auth]
+api_tokens = ["interop-token"]

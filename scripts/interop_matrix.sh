@@ -1,0 +1,725 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+COMPOSE_FILE="$ROOT/deploy/interop/compose.yml"
+PUBLIC_TOML="$ROOT/deploy/interop/public-torrents.toml"
+WORKDIR="${INTEROP_WORKDIR:-$ROOT/certification/interop}"
+REPORT_DIR="$ROOT/certification/reports"
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+REPORT="${INTEROP_REPORT:-$REPORT_DIR/interop-matrix-$STAMP.md}"
+
+MODE="all"
+TIMEOUT_LOCAL="${INTEROP_LOCAL_TIMEOUT_SECS:-900}"
+TIMEOUT_PUBLIC="${INTEROP_PUBLIC_TIMEOUT_SECS:-7200}"
+PUBLIC_MAX_PARALLEL="${INTEROP_PUBLIC_MAX_PARALLEL:-3}"
+PUBLIC_MIN_RUST_PEERS="${INTEROP_PUBLIC_MIN_RUST_PEERS:-2}"
+KEEP_STACK="${INTEROP_KEEP_STACK:-0}"
+KEEP_PUBLIC_DATA="${INTEROP_KEEP_PUBLIC_DATA:-0}"
+RUST_TOKEN="${INTEROP_RUST_TOKEN:-interop-token}"
+
+CLIENTS=(rusttorrentd qbittorrent transmission deluge rtorrent)
+LOCAL_CASES=(
+  "rust-pulls-from-qbit|qbittorrent|rusttorrentd|single-16m"
+  "rust-pulls-from-transmission|transmission|rusttorrentd|single-16m"
+  "rust-pulls-from-deluge|deluge|rusttorrentd|single-16m"
+  "rust-pulls-from-rtorrent|rtorrent|rusttorrentd|single-16m"
+  "qbit-pulls-from-rust|rusttorrentd|qbittorrent|single-16m"
+  "transmission-pulls-from-rust|rusttorrentd|transmission|single-16m"
+  "deluge-pulls-from-rust|rusttorrentd|deluge|single-16m"
+  "rtorrent-pulls-from-rust|rusttorrentd|rtorrent|single-16m"
+  "mesh-swarm|all|all|multi-128m"
+  "churn|rotating|rotating|churn"
+)
+
+usage() {
+  cat <<'USAGE'
+Usage: scripts/interop_matrix.sh [--local|--public|--all] [--report PATH]
+
+Environment:
+  INTEROP_LOCAL_TIMEOUT_SECS=900
+  INTEROP_PUBLIC_TIMEOUT_SECS=7200
+  INTEROP_PUBLIC_MAX_PARALLEL=3
+  INTEROP_PUBLIC_MIN_RUST_PEERS=2
+  INTEROP_INCLUDE_LIBREOFFICE=1
+  INTEROP_KEEP_STACK=1
+  INTEROP_KEEP_PUBLIC_DATA=0
+  INTEROP_WORKDIR=certification/interop
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --local) MODE="local" ;;
+    --public) MODE="public" ;;
+    --all) MODE="all" ;;
+    --report) shift; REPORT="${1:?missing path for --report}" ;;
+    -h|--help) usage; exit 0 ;;
+    *) REPORT="$1" ;;
+  esac
+  shift
+done
+
+compose() {
+  INTEROP_WORKDIR="$WORKDIR" docker compose -f "$COMPOSE_FILE" "$@"
+}
+
+log() {
+  printf '[interop] %s\n' "$*" >&2
+}
+
+append_report() {
+  printf '%s\n' "$*" >>"$REPORT"
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "missing required command: $1" >&2
+    exit 127
+  }
+}
+
+client_url() {
+  case "$1" in
+    rusttorrentd) echo "http://127.0.0.1:${INTEROP_RUST_HOST_PORT:-38080}" ;;
+    qbittorrent) echo "http://127.0.0.1:${INTEROP_QBIT_HOST_PORT:-38081}" ;;
+    transmission) echo "http://127.0.0.1:${INTEROP_TRANSMISSION_HOST_PORT:-38091}" ;;
+    deluge) echo "http://127.0.0.1:${INTEROP_DELUGE_HOST_PORT:-38112}" ;;
+    *) return 1 ;;
+  esac
+}
+
+download_dir() {
+  case "$1" in
+    rusttorrentd) echo "/downloads/rusttorrentd" ;;
+    qbittorrent) echo "/downloads/qbittorrent" ;;
+    transmission) echo "/downloads/transmission" ;;
+    deluge) echo "/downloads/deluge" ;;
+    rtorrent) echo "/downloads/rtorrent" ;;
+    *) return 1 ;;
+  esac
+}
+
+host_download_dir() {
+  echo "$WORKDIR/downloads/$1"
+}
+
+prepare_dirs() {
+  mkdir -p "$REPORT_DIR" "$WORKDIR"/{artifacts,torrents,fixtures,downloads,logs,watch/rtorrent,config}
+  for client in "${CLIENTS[@]}"; do
+    mkdir -p "$WORKDIR/downloads/$client"
+  done
+  prepare_client_configs
+  chmod -R a+rwX "$WORKDIR/artifacts" "$WORKDIR/downloads" "$WORKDIR/fixtures" "$WORKDIR/torrents" "$WORKDIR/watch" 2>/dev/null || true
+  chmod -R a+rwX "$WORKDIR/config/rtorrent" 2>/dev/null || true
+}
+
+prepare_client_configs() {
+  mkdir -p "$WORKDIR/config/qbittorrent/qBittorrent" "$WORKDIR/config/transmission" "$WORKDIR/config/deluge" "$WORKDIR/config/rtorrent/session"
+  if [[ ! -f "$WORKDIR/config/qbittorrent/qBittorrent/qBittorrent.conf" ]]; then
+    cat >"$WORKDIR/config/qbittorrent/qBittorrent/qBittorrent.conf" <<'EOF'
+[BitTorrent]
+Session\DefaultSavePath=/downloads/qbittorrent
+Session\Port=6882
+
+[LegalNotice]
+Accepted=true
+
+[Preferences]
+WebUI\AuthSubnetWhitelist=0.0.0.0/0,::/0
+WebUI\AuthSubnetWhitelistEnabled=true
+WebUI\LocalHostAuth=false
+WebUI\Port=8080
+EOF
+  fi
+}
+
+reset_workdir() {
+  if [[ -d "$WORKDIR" ]]; then
+    chmod -R u+rwX "$WORKDIR" 2>/dev/null || true
+    rm -rf "$WORKDIR/artifacts" "$WORKDIR/config" "$WORKDIR/downloads" "$WORKDIR/fixtures" "$WORKDIR/logs" "$WORKDIR/torrents" "$WORKDIR/watch" 2>/dev/null || \
+      docker run --rm -v "$WORKDIR:/work" alpine:3.20 sh -lc 'rm -rf /work/artifacts /work/config /work/downloads /work/fixtures /work/logs /work/torrents /work/watch'
+  fi
+}
+
+write_report_header() {
+  cat >"$REPORT" <<EOF
+# Interop Matrix Report
+
+- Generated: $STAMP
+- Mode: $MODE
+- Compose file: \`deploy/interop/compose.yml\`
+- Workdir: \`$WORKDIR\`
+- Public timeout: ${TIMEOUT_PUBLIC}s
+- Local timeout: ${TIMEOUT_LOCAL}s
+
+EOF
+}
+
+cleanup() {
+  local status=$?
+  capture_artifacts || true
+  if [[ "$KEEP_STACK" != "1" ]]; then
+    compose down --remove-orphans >/dev/null 2>&1 || true
+  else
+    log "keeping interop stack because INTEROP_KEEP_STACK=1"
+  fi
+  exit "$status"
+}
+
+capture_artifacts() {
+  mkdir -p "$WORKDIR/logs/$STAMP"
+  compose ps >"$WORKDIR/logs/$STAMP/compose-ps.txt" 2>&1 || true
+  for service in rusttorrentd qbittorrent transmission deluge rtorrent opentracker fixture-http; do
+    compose logs --no-color --tail=250 "$service" >"$WORKDIR/logs/$STAMP/$service.log" 2>&1 || true
+  done
+  curl -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/health" >"$WORKDIR/logs/$STAMP/rust-health.json" 2>/dev/null || true
+  curl -fsS "$(client_url rusttorrentd)/metrics" >"$WORKDIR/logs/$STAMP/rust-metrics.txt" 2>/dev/null || true
+  curl -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/v1/torrents" >"$WORKDIR/logs/$STAMP/rust-torrents.json" 2>/dev/null || true
+}
+
+wait_http() {
+  local name="$1" url="$2" timeout="${3:-180}" start
+  start="$(date +%s)"
+  until curl -fsS "$url" >/dev/null 2>&1; do
+    if (( "$(date +%s)" - start > timeout )); then
+      echo "timed out waiting for $name at $url" >&2
+      return 1
+    fi
+    sleep 2
+  done
+}
+
+wait_http_status() {
+  local name="$1" url="$2" pattern="$3" timeout="${4:-180}" start code
+  start="$(date +%s)"
+  while true; do
+    code="$(curl -sS -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)"
+    if [[ "$code" =~ $pattern ]]; then
+      return 0
+    fi
+    if (( "$(date +%s)" - start > timeout )); then
+      echo "timed out waiting for $name at $url; last HTTP status: ${code:-none}" >&2
+      return 1
+    fi
+    sleep 2
+  done
+}
+
+wait_stack() {
+  log "waiting for client APIs and ports"
+  wait_http rusttorrentd "$(client_url rusttorrentd)/health" 240
+  wait_http_status qbittorrent "$(client_url qbittorrent)" '^(200|401|403)$' 240
+  wait_http transmission "$(client_url transmission)/transmission/web/" 240
+  wait_http deluge "$(client_url deluge)" 240
+  local rtorrent_id
+  rtorrent_id="$(compose ps -q rtorrent)"
+  [[ -n "$rtorrent_id" ]] && [[ "$(docker inspect -f '{{.State.Running}}' "$rtorrent_id")" == "true" ]]
+}
+
+docker_tool() {
+  docker run --rm -v "$WORKDIR:/work" -w /work alpine:3.20 sh -lc "$*"
+}
+
+ensure_mktorrent() {
+  if command -v mktorrent >/dev/null 2>&1; then
+    echo "host"
+  else
+    echo "container"
+  fi
+}
+
+create_fixture_files() {
+  log "creating deterministic local fixtures"
+  mkdir -p "$WORKDIR/fixtures/single-16m" "$WORKDIR/fixtures/multi-128m" "$WORKDIR/fixtures/churn"
+  if [[ ! -f "$WORKDIR/fixtures/single-16m/payload.bin" ]]; then
+    dd if=/dev/zero of="$WORKDIR/fixtures/single-16m/payload.bin" bs=1M count=16 status=none
+  fi
+  if [[ ! -f "$WORKDIR/fixtures/multi-128m/part-07.bin" ]]; then
+    for i in $(seq -w 0 7); do
+      dd if=/dev/zero of="$WORKDIR/fixtures/multi-128m/part-$i.bin" bs=1M count=16 status=none
+    done
+  fi
+  if [[ ! -f "$WORKDIR/fixtures/churn/churn-24.bin" ]]; then
+    for i in $(seq -w 0 24); do
+      dd if=/dev/zero of="$WORKDIR/fixtures/churn/churn-$i.bin" bs=256K count=1 status=none
+    done
+  fi
+  find "$WORKDIR/fixtures" -type f -print0 | sort -z | xargs -0 sha256sum >"$WORKDIR/artifacts/fixture-sha256sums.txt"
+}
+
+case_fixture() {
+  local base="$1" case_name="$2" out
+  out="$case_name"
+  rm -rf "$WORKDIR/fixtures/$out"
+  cp -a "$WORKDIR/fixtures/$base" "$WORKDIR/fixtures/$out"
+  echo "$out"
+}
+
+make_torrent() {
+  local fixture="$1" name="$2" out
+  out="$WORKDIR/torrents/$name.torrent"
+  [[ -f "$out" ]] && { echo "$out"; return; }
+  local tracker="http://opentracker:6969/announce"
+  local webseed="http://fixture-http/$fixture"
+  if [[ "$(ensure_mktorrent)" == "host" ]]; then
+    mktorrent -a "$tracker" -w "$webseed" -o "$out" "$WORKDIR/fixtures/$fixture" >/dev/null
+  else
+    docker_tool "apk add --no-cache mktorrent >/dev/null && mktorrent -a '$tracker' -w '$webseed' -o '/work/torrents/$name.torrent' '/work/fixtures/$fixture' >/dev/null" >/dev/null
+  fi
+  echo "$out"
+}
+
+seed_fixture_for_client() {
+  local client="$1" fixture="$2" dest
+  dest="$(host_download_dir "$client")"
+  [[ -n "$dest" && -n "$fixture" ]]
+  rm -rf "${dest:?}/$fixture"
+  cp -a "$WORKDIR/fixtures/$fixture" "$dest/"
+  chmod -R a+rwX "$dest/$fixture" 2>/dev/null || true
+}
+
+copy_torrent_to_rtorrent_watch() {
+  local torrent="$1"
+  cp "$torrent" "$WORKDIR/watch/rtorrent/"
+}
+
+qb_login() {
+  local pass
+  if curl -fsS -H 'Host: localhost:8080' -c "$WORKDIR/artifacts/qbit.cookie" -d 'username=admin&password=adminadmin' "$(client_url qbittorrent)/api/v2/auth/login" >/dev/null; then
+    return 0
+  fi
+  pass="$(compose logs --no-color qbittorrent 2>/dev/null | sed -n 's/.*temporary password is provided for this session: //p' | tail -n1)"
+  [[ -n "$pass" ]] || return 1
+  curl -fsS -H 'Host: localhost:8080' -c "$WORKDIR/artifacts/qbit.cookie" --data-urlencode 'username=admin' --data-urlencode "password=$pass" "$(client_url qbittorrent)/api/v2/auth/login" >/dev/null
+}
+
+add_qb() {
+  local torrent="$1" save_path="$2" add_mode="${3:-leecher}" skip=()
+  [[ -r "$torrent" ]] || { log "qBittorrent torrent file is not readable: $(printf '%q' "$torrent")"; return 1; }
+  [[ "$add_mode" == "seed" ]] && skip=(-F "skip_checking=true")
+  qb_login
+  curl -fsS -H 'Host: localhost:8080' -b "$WORKDIR/artifacts/qbit.cookie" \
+    -F "torrents=@$torrent" \
+    -F "savepath=$save_path" \
+    -F "paused=false" \
+    "${skip[@]}" \
+    "$(client_url qbittorrent)/api/v2/torrents/add" >/dev/null
+}
+
+add_rust() {
+  local torrent="$1" save_path="$2"
+  [[ -r "$torrent" ]] || { log "rusttorrentd torrent file is not readable: $(printf '%q' "$torrent")"; return 1; }
+  curl -fsS -H "Authorization: Bearer $RUST_TOKEN" \
+    -F "torrents=@$torrent" \
+    -F "savepath=$save_path" \
+    -F "paused=false" \
+    "$(client_url rusttorrentd)/api/qb/v2/torrents/add" >/dev/null
+}
+
+transmission_rpc() {
+  local body="$1" url sid
+  url="$(client_url transmission)/transmission/rpc"
+  sid="$(curl -sS -D - -o /dev/null "$url" | awk 'tolower($0) ~ /^x-transmission-session-id:/ {print $2}' | tr -d '\r')"
+  curl -fsS -H "X-Transmission-Session-Id: $sid" -H "Content-Type: application/json" -d "$body" "$url"
+}
+
+add_transmission() {
+  local torrent="$1" save_path="$2" metainfo
+  [[ -r "$torrent" ]] || { log "Transmission torrent file is not readable: $(printf '%q' "$torrent")"; return 1; }
+  metainfo="$(base64 -w0 "$torrent")"
+  transmission_rpc "{\"method\":\"torrent-add\",\"arguments\":{\"metainfo\":\"$metainfo\",\"download-dir\":\"$save_path\",\"paused\":false}}" >/dev/null
+}
+
+deluge_rpc() {
+  local body="$1"
+  curl -fsS -c "$WORKDIR/artifacts/deluge.cookie" -b "$WORKDIR/artifacts/deluge.cookie" \
+    -H "Content-Type: application/json" -d "$body" "$(client_url deluge)/json"
+}
+
+deluge_rpc_checked() {
+  local body="$1" response
+  response="$(deluge_rpc "$body")"
+  jq -e '.error == null' <<<"$response" >/dev/null
+  printf '%s\n' "$response"
+}
+
+deluge_login() {
+  deluge_rpc_checked '{"method":"auth.login","params":["deluge"],"id":1}' >/dev/null
+}
+
+deluge_connect() {
+  local connected host_id
+  deluge_login
+  connected="$(deluge_rpc_checked '{"method":"web.connected","params":[],"id":11}' | jq -r '.result')"
+  [[ "$connected" == "true" ]] && return 0
+  host_id="$(deluge_rpc_checked '{"method":"web.get_hosts","params":[],"id":12}' | jq -r '.result[0][0] // empty')"
+  if [[ -z "$host_id" ]]; then
+    deluge_rpc_checked '{"method":"web.add_host","params":["127.0.0.1",58846,"",""],"id":13}' >/dev/null
+    host_id="$(deluge_rpc_checked '{"method":"web.get_hosts","params":[],"id":14}' | jq -r '.result[0][0] // empty')"
+  fi
+  [[ -n "$host_id" ]]
+  deluge_rpc_checked "{\"method\":\"web.connect\",\"params\":[\"$host_id\"],\"id\":15}" >/dev/null
+}
+
+add_deluge() {
+  local torrent="$1" save_path="$2" data name
+  [[ -r "$torrent" ]] || { log "Deluge torrent file is not readable: $(printf '%q' "$torrent")"; return 1; }
+  deluge_connect
+  data="$(base64 -w0 "$torrent")"
+  name="$(basename "$torrent")"
+  deluge_rpc_checked "{\"method\":\"core.add_torrent_file\",\"params\":[\"$name\",\"$data\",{\"download_location\":\"$save_path\"}],\"id\":2}" >/dev/null
+}
+
+add_rtorrent() {
+  local torrent="$1" _save_path="$2"
+  [[ -r "$torrent" ]] || { log "rTorrent torrent file is not readable: $(printf '%q' "$torrent")"; return 1; }
+  copy_torrent_to_rtorrent_watch "$torrent"
+}
+
+add_to_client() {
+  local client="$1" torrent="$2" add_mode="${3:-leecher}" save_path
+  save_path="$(download_dir "$client")"
+  case "$client" in
+    rusttorrentd) add_rust "$torrent" "$save_path" ;;
+    qbittorrent) add_qb "$torrent" "$save_path" "$add_mode" ;;
+    transmission) add_transmission "$torrent" "$save_path" ;;
+    deluge) add_deluge "$torrent" "$save_path" ;;
+    rtorrent) add_rtorrent "$torrent" "$save_path" ;;
+    *) return 1 ;;
+  esac
+}
+
+client_progress() {
+  local client="$1"
+  case "$client" in
+    rusttorrentd)
+      curl -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/qb/v2/torrents/info" |
+        jq -r '[.[].progress] | if length == 0 then 0 else min end'
+      ;;
+    qbittorrent)
+      curl -fsS -H 'Host: localhost:8080' -b "$WORKDIR/artifacts/qbit.cookie" "$(client_url qbittorrent)/api/v2/torrents/info" |
+        jq -r '[.[].progress] | if length == 0 then 0 else min end'
+      ;;
+    transmission)
+      transmission_rpc '{"method":"torrent-get","arguments":{"fields":["percentDone"]}}' |
+        jq -r '[.arguments.torrents[].percentDone] | if length == 0 then 0 else min end'
+      ;;
+    deluge)
+      deluge_connect
+      deluge_rpc_checked '{"method":"web.update_ui","params":[["progress"],{}],"id":3}' |
+        jq -r '[.result.torrents[]?.progress / 100] | if length == 0 then 0 else min end'
+      ;;
+    rtorrent)
+      if find "$(host_download_dir rtorrent)" -type f | grep -q .; then echo 1; else echo 0; fi
+      ;;
+  esac
+}
+
+poll_rust_compat() {
+  local out="$WORKDIR/artifacts/rust-api-poll-$STAMP.jsonl"
+  {
+    printf '{"endpoint":"health","ok":'
+    curl -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/health" >/dev/null && printf 'true}\n' || printf 'false}\n'
+    printf '{"endpoint":"metrics","ok":'
+    curl -fsS "$(client_url rusttorrentd)/metrics" >/dev/null && printf 'true}\n' || printf 'false}\n'
+    printf '{"endpoint":"qbit_info","ok":'
+    curl -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/qb/v2/torrents/info" >/dev/null && printf 'true}\n' || printf 'false}\n'
+    printf '{"endpoint":"qbit_sync","ok":'
+    curl -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/qb/v2/sync/maindata" >/dev/null && printf 'true}\n' || printf 'false}\n'
+    printf '{"endpoint":"qbit_transfer","ok":'
+    curl -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/qb/v2/transfer/info" >/dev/null && printf 'true}\n' || printf 'false}\n'
+    printf '{"endpoint":"transmission_stats","ok":'
+    rust_transmission_rpc '{"method":"session-stats"}' >/dev/null 2>&1 && printf 'true}\n' || printf 'false}\n'
+    printf '{"endpoint":"deluge_ui","ok":'
+    rust_deluge_rpc '{"method":"web.update_ui","params":[["progress"],{}],"id":10}' >/dev/null 2>&1 && printf 'true}\n' || printf 'false}\n'
+  } >>"$out"
+}
+
+rust_transmission_rpc() {
+  local body="$1" url sid
+  url="$(client_url rusttorrentd)/transmission/rpc"
+  sid="$(curl -sS -D - -o /dev/null -H "Authorization: Bearer $RUST_TOKEN" "$url" | awk 'tolower($0) ~ /^x-transmission-session-id:/ {print $2}' | tr -d '\r')"
+  curl -fsS -H "Authorization: Bearer $RUST_TOKEN" -H "X-Transmission-Session-Id: $sid" -H "Content-Type: application/json" -d "$body" "$url"
+}
+
+rust_deluge_rpc() {
+  local body="$1"
+  curl -fsS -H "Authorization: Bearer $RUST_TOKEN" -H "Content-Type: application/json" -d "$body" "$(client_url rusttorrentd)/json"
+}
+
+wait_clients_complete() {
+  local timeout="$1"; shift
+  local clients=("$@") start now progress
+  start="$(date +%s)"
+  while true; do
+    poll_rust_compat || true
+    local all_done=1
+    for client in "${clients[@]}"; do
+      progress="$(client_progress "$client" 2>/dev/null || echo 0)"
+      awk -v p="$progress" 'BEGIN { exit !(p >= 0.999) }' || all_done=0
+    done
+    [[ "$all_done" == "1" ]] && return 0
+    now="$(date +%s)"
+    if (( now - start > timeout )); then
+      return 1
+    fi
+    sleep 10
+  done
+}
+
+verify_fixture_hashes() {
+  local client="$1" fixture="$2" expected actual
+  expected="$WORKDIR/artifacts/expected-$fixture.sha256"
+  actual="$WORKDIR/artifacts/actual-$client-$fixture.sha256"
+  (cd "$WORKDIR/fixtures/$fixture" && find . -type f -print0 | sort -z | xargs -0 sha256sum) >"$expected"
+  (cd "$(host_download_dir "$client")/$fixture" && find . -type f -print0 | sort -z | xargs -0 sha256sum) >"$actual"
+  diff -u "$expected" "$actual" >/dev/null
+}
+
+run_local_case() {
+  local row="$1" name seeder leecher fixture torrent torrent_fixture clients=()
+  IFS='|' read -r name seeder leecher fixture <<<"$row"
+  append_report "## Local: $name"
+  append_report ""
+  log "running local case $name"
+
+  if [[ "$fixture" == "churn" ]]; then
+    run_churn_case
+    return
+  fi
+
+  if [[ "$fixture" == single-* ]]; then
+    torrent_fixture="$(case_fixture "$fixture" "$name")"
+  else
+    torrent_fixture="$fixture"
+  fi
+  torrent="$(make_torrent "$torrent_fixture" "$torrent_fixture")"
+  if [[ "$seeder" == "all" ]]; then
+    clients=("${CLIENTS[@]}")
+    for client in "${CLIENTS[@]}"; do
+      seed_fixture_for_client "$client" "$torrent_fixture"
+      add_to_client "$client" "$torrent" seed
+    done
+  else
+    seed_fixture_for_client "$seeder" "$torrent_fixture"
+    add_to_client "$seeder" "$torrent" seed
+    add_to_client "$leecher" "$torrent"
+    clients=("$seeder" "$leecher")
+  fi
+
+  local status="PASS"
+  if ! wait_clients_complete "$TIMEOUT_LOCAL" "${clients[@]}"; then
+    status="FAIL"
+  fi
+  for client in "${clients[@]}"; do
+    if ! verify_fixture_hashes "$client" "$torrent_fixture"; then
+      status="FAIL"
+    fi
+  done
+
+  append_report "- Seeder: $seeder"
+  append_report "- Leecher: $leecher"
+  append_report "- Fixture: $fixture"
+  append_report "- Torrent: \`$torrent\`"
+  append_report "- Status: **$status**"
+  append_report ""
+  [[ "$status" == "PASS" ]]
+}
+
+run_churn_case() {
+  local status="PASS" i fixture torrent seeder leecher
+  for i in $(seq -w 0 24); do
+    fixture="churn/churn-$i.bin"
+    torrent="$(make_torrent "$fixture" "churn-$i")"
+    seeder="${CLIENTS[$((10#$i % ${#CLIENTS[@]}))]}"
+    leecher="${CLIENTS[$(((10#$i + 1) % ${#CLIENTS[@]}))]}"
+    seed_fixture_for_client "$seeder" "churn"
+    add_to_client "$seeder" "$torrent" seed || status="FAIL"
+    add_to_client "$leecher" "$torrent" || status="FAIL"
+  done
+  if ! wait_clients_complete "$TIMEOUT_LOCAL" "${CLIENTS[@]}"; then
+    status="FAIL"
+  fi
+  append_report "- Fixture count: 25"
+  append_report "- Status: **$status**"
+  append_report ""
+  [[ "$status" == "PASS" ]]
+}
+
+toml_entries() {
+  awk '
+    /^\[\[torrent\]\]/ { if (id) print id "|" enabled "|" source "|" resolver "|" pattern "|" max "|" clients; id=enabled=source=resolver=pattern=max=clients="" }
+    /^id = / { gsub(/"/, "", $3); id=$3 }
+    /^enabled = / { enabled=$3 }
+    /^source_url = / { source=$0; sub(/^source_url = "/, "", source); sub(/"$/, "", source) }
+    /^resolver_url = / { resolver=$0; sub(/^resolver_url = "/, "", resolver); sub(/"$/, "", resolver) }
+    /^resolver_pattern = / { pattern=$0; sub(/^resolver_pattern = "/, "", pattern); sub(/"$/, "", pattern); gsub(/\\\\/, "\\", pattern) }
+    /^max_runtime_secs = / { max=$3 }
+    /^clients = / { clients=$0; sub(/^clients = \[/, "", clients); sub(/\]$/, "", clients); gsub(/[",]/, "", clients) }
+    END { if (id) print id "|" enabled "|" source "|" resolver "|" pattern "|" max "|" clients }
+  ' "$PUBLIC_TOML"
+}
+
+resolve_public_torrent() {
+  local id="$1" resolver="$2" pattern="$3" html url
+  if [[ "$id" == "ubuntu" ]]; then
+    local lts_dir
+    lts_dir="$(curl -fsSL "$resolver" | grep -Eo 'href="[0-9]+\.04(\.[0-9]+)?/"' | sed -E 's/^href="([^"]+)".*/\1/' | sort -V | tail -n1)"
+    [[ -n "$lts_dir" ]] || return 1
+    resolver="${resolver%/}/$lts_dir"
+  elif [[ "$id" == "libreoffice" ]]; then
+    local stable_dir
+    stable_dir="$(curl -fsSL "$resolver" | grep -Eo 'href="[0-9]+(\.[0-9]+)+/"' | sed -E 's/^href="([^"]+)".*/\1/' | sort -V | tail -n1)"
+    [[ -n "$stable_dir" ]] || return 1
+    resolver="${resolver%/}/$stable_dir/deb/x86_64/"
+  fi
+  html="$(curl -fsSL "$resolver")"
+  url="$(printf '%s' "$html" | grep -Eo "$pattern" | sort -V | tail -n1 || true)"
+  [[ -n "$url" ]] || return 1
+  if [[ "$url" =~ ^https?:// ]]; then
+    echo "$url"
+  else
+    printf '%s/%s\n' "${resolver%/}" "$url"
+  fi
+}
+
+add_public_to_client() {
+  local client="$1" url="$2" save_path
+  save_path="$(download_dir "$client")/public"
+  case "$client" in
+    rusttorrentd)
+      curl -fsS -H "Authorization: Bearer $RUST_TOKEN" -F "urls=$url" -F "savepath=$save_path" "$(client_url rusttorrentd)/api/qb/v2/torrents/add" >/dev/null
+      ;;
+    qbittorrent)
+      qb_login
+      curl -fsS -H 'Host: localhost:8080' -b "$WORKDIR/artifacts/qbit.cookie" -F "urls=$url" -F "savepath=$save_path" "$(client_url qbittorrent)/api/v2/torrents/add" >/dev/null
+      ;;
+    transmission)
+      transmission_rpc "{\"method\":\"torrent-add\",\"arguments\":{\"filename\":\"$url\",\"download-dir\":\"$save_path\",\"paused\":false}}" >/dev/null
+      ;;
+    deluge)
+      deluge_login
+      deluge_rpc "{\"method\":\"core.add_torrent_url\",\"params\":[\"$url\",{\"download_location\":\"$save_path\"}],\"id\":4}" >/dev/null
+      ;;
+    rtorrent)
+      curl -fsSL "$url" -o "$WORKDIR/watch/rtorrent/$client-$(basename "$url")"
+      ;;
+  esac
+}
+
+run_public_entry() {
+  local entry="$1" id enabled source resolver pattern max clients url status="PASS"
+  IFS='|' read -r id enabled source resolver pattern max clients <<<"$entry"
+  if [[ "$enabled" != "true" ]]; then
+    [[ "$id" == "libreoffice" && "${INTEROP_INCLUDE_LIBREOFFICE:-0}" == "1" ]] || return 0
+  fi
+  append_report "## Public: $id"
+  append_report ""
+  append_report "- Source: $source"
+  log "resolving public torrent $id from official source"
+  if ! url="$(resolve_public_torrent "$id" "$resolver" "$pattern")"; then
+    append_report "- Status: **RESOLVER FAIL**"
+    append_report ""
+    return 1
+  fi
+  append_report "- Resolved torrent: $url"
+
+  local selected=()
+  read -r -a selected <<<"$clients"
+  for client in "${selected[@]}"; do
+    add_public_to_client "$client" "$url" || status="FAIL"
+  done
+  if ! wait_clients_complete "${max:-$TIMEOUT_PUBLIC}" "${selected[@]}"; then
+    status="FAIL"
+  fi
+
+  local rust_peers
+  rust_peers="$(curl -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/qb/v2/torrents/info" | jq '[.[].num_complete + .[].num_incomplete] | add // 0' 2>/dev/null || echo 0)"
+  append_report "- Rust peer observation floor: $PUBLIC_MIN_RUST_PEERS"
+  append_report "- Rust peers observed: $rust_peers"
+  append_report "- Clients: ${selected[*]}"
+  append_report "- Status: **$status**"
+  append_report ""
+
+  if [[ "$KEEP_PUBLIC_DATA" != "1" ]]; then
+    for client in "${CLIENTS[@]}"; do
+      rm -rf "$(host_download_dir "$client")/public" || true
+    done
+  fi
+  [[ "$status" == "PASS" ]]
+}
+
+run_public_matrix() {
+  local failures=0 running=0 pids=()
+  append_report "# Public Legal Torrent Matrix"
+  append_report ""
+  while IFS= read -r entry; do
+    while (( running >= PUBLIC_MAX_PARALLEL )); do
+      wait -n || failures=$((failures + 1))
+      running=$((running - 1))
+    done
+    run_public_entry "$entry" &
+    pids+=("$!")
+    running=$((running + 1))
+  done < <(toml_entries)
+  for pid in "${pids[@]}"; do
+    wait "$pid" || failures=$((failures + 1))
+  done
+  (( failures == 0 ))
+}
+
+run_local_matrix() {
+  local failures=0
+  append_report "# Deterministic Local Swarm"
+  append_report ""
+  create_fixture_files
+  for row in "${LOCAL_CASES[@]}"; do
+    run_local_case "$row" || failures=$((failures + 1))
+  done
+  (( failures == 0 ))
+}
+
+main() {
+  require_cmd docker
+  require_cmd curl
+  require_cmd jq
+  require_cmd base64
+
+  if [[ "${INTEROP_REUSE_STACK:-0}" != "1" ]]; then
+    compose down --remove-orphans -v >/dev/null 2>&1 || true
+    reset_workdir
+  fi
+  prepare_dirs
+  write_report_header
+  trap cleanup EXIT
+
+  log "starting interop compose stack"
+  compose up -d --build
+  wait_stack
+
+  local failed=0
+  if [[ "$MODE" == "local" || "$MODE" == "all" ]]; then
+    run_local_matrix || failed=1
+  fi
+  if [[ "$MODE" == "public" || "$MODE" == "all" ]]; then
+    run_public_matrix || failed=1
+  fi
+
+  append_report "# Artifacts"
+  append_report ""
+  append_report "- Logs: \`$WORKDIR/logs/$STAMP\`"
+  append_report "- Torrents: \`$WORKDIR/torrents\`"
+  append_report "- API poll log: \`$WORKDIR/artifacts/rust-api-poll-$STAMP.jsonl\`"
+  append_report ""
+
+  if [[ "$failed" == "0" ]]; then
+    append_report "**Overall: PASS**"
+  else
+    append_report "**Overall: FAIL**"
+  fi
+  log "wrote report $REPORT"
+  return "$failed"
+}
+
+main "$@"

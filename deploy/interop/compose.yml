@@ -1,0 +1,131 @@
+name: rtorrentng-interop
+
+services:
+  rusttorrentd:
+    image: rtorrentng/rusttorrentd:interop
+    build:
+      context: ../..
+      dockerfile: deploy/native/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "${INTEROP_RUST_HOST_PORT:-38080}:8080"
+      - "${INTEROP_RUST_PEER_PORT:-36881}:6881"
+      - "${INTEROP_RUST_PEER_PORT:-36881}:6881/udp"
+    volumes:
+      - ./rusttorrentd.config.toml:/etc/rusttorrentd/config.toml:ro
+      - rusttorrentd-state:/var/lib/rusttorrentd
+      - ${INTEROP_WORKDIR:-../../certification/interop}/downloads:/downloads
+      - ${INTEROP_WORKDIR:-../../certification/interop}/artifacts:/artifacts
+    environment:
+      RUSTTORRENTD_CONFIG: /etc/rusttorrentd/config.toml
+      RUST_LOG: "${RUST_LOG:-info}"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks: [interop]
+
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    restart: unless-stopped
+    ports:
+      - "${INTEROP_QBIT_HOST_PORT:-38081}:8080"
+      - "${INTEROP_QBIT_PEER_PORT:-36882}:6882"
+      - "${INTEROP_QBIT_PEER_PORT:-36882}:6882/udp"
+    volumes:
+      - ${INTEROP_WORKDIR:-../../certification/interop}/config/qbittorrent:/config
+      - ${INTEROP_WORKDIR:-../../certification/interop}/downloads:/downloads
+      - ${INTEROP_WORKDIR:-../../certification/interop}/artifacts:/artifacts
+    environment:
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
+      TZ: "${TZ:-Etc/UTC}"
+      WEBUI_PORT: "8080"
+      TORRENTING_PORT: "6882"
+      QBT_WEBUI_PORT: "8080"
+    networks: [interop]
+
+  transmission:
+    image: lscr.io/linuxserver/transmission:latest
+    restart: unless-stopped
+    ports:
+      - "${INTEROP_TRANSMISSION_HOST_PORT:-38091}:9091"
+      - "${INTEROP_TRANSMISSION_PEER_PORT:-36883}:6883"
+      - "${INTEROP_TRANSMISSION_PEER_PORT:-36883}:6883/udp"
+    volumes:
+      - ${INTEROP_WORKDIR:-../../certification/interop}/config/transmission:/config
+      - ${INTEROP_WORKDIR:-../../certification/interop}/downloads:/downloads
+      - ${INTEROP_WORKDIR:-../../certification/interop}/artifacts:/artifacts
+    environment:
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
+      TZ: "${TZ:-Etc/UTC}"
+      TRANSMISSION_WEB_HOME: /transmission-web-control/
+      TRANSMISSION_RPC_AUTHENTICATION_REQUIRED: "false"
+      TRANSMISSION_PEER_PORT: "6883"
+    networks: [interop]
+
+  deluge:
+    image: lscr.io/linuxserver/deluge:latest
+    restart: unless-stopped
+    ports:
+      - "${INTEROP_DELUGE_HOST_PORT:-38112}:8112"
+      - "${INTEROP_DELUGE_DAEMON_PORT:-35889}:58846"
+      - "${INTEROP_DELUGE_PEER_PORT:-36884}:6884"
+      - "${INTEROP_DELUGE_PEER_PORT:-36884}:6884/udp"
+    volumes:
+      - ${INTEROP_WORKDIR:-../../certification/interop}/config/deluge:/config
+      - ${INTEROP_WORKDIR:-../../certification/interop}/downloads:/downloads
+      - ${INTEROP_WORKDIR:-../../certification/interop}/artifacts:/artifacts
+    environment:
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
+      TZ: "${TZ:-Etc/UTC}"
+      DELUGE_LOGLEVEL: info
+    networks: [interop]
+
+  rtorrent:
+    image: jesec/rtorrent:latest
+    restart: unless-stopped
+    command: ["-o", "system.daemon.set=true", "-o", "import=/config/rtorrent.rc"]
+    ports:
+      - "${INTEROP_RTORRENT_PEER_PORT:-36885}:6885"
+      - "${INTEROP_RTORRENT_PEER_PORT:-36885}:6885/udp"
+    volumes:
+      - ./rtorrent.rc:/config/rtorrent.rc:ro
+      - ${INTEROP_WORKDIR:-../../certification/interop}/config/rtorrent:/config
+      - ${INTEROP_WORKDIR:-../../certification/interop}/watch/rtorrent:/watch
+      - ${INTEROP_WORKDIR:-../../certification/interop}/downloads:/downloads
+      - ${INTEROP_WORKDIR:-../../certification/interop}/artifacts:/artifacts
+    environment:
+      TERM: xterm
+    networks: [interop]
+
+  opentracker:
+    image: lednerb/opentracker-docker:latest
+    restart: unless-stopped
+    command: ["opentracker", "-p", "6969", "-P", "6969"]
+    ports:
+      - "${INTEROP_TRACKER_HOST_PORT:-36969}:6969"
+      - "${INTEROP_TRACKER_HOST_PORT:-36969}:6969/udp"
+    networks: [interop]
+
+  fixture-http:
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "${INTEROP_FIXTURE_HTTP_PORT:-38088}:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ${INTEROP_WORKDIR:-../../certification/interop}/fixtures:/usr/share/nginx/html:ro
+      - ${INTEROP_WORKDIR:-../../certification/interop}/artifacts:/artifacts:ro
+    networks: [interop]
+
+networks:
+  interop:
+    driver: bridge
+
+volumes:
+  rusttorrentd-state:

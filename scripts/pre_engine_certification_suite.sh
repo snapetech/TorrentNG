@@ -87,6 +87,7 @@ else
   run_gate "live transfer" "$REPORT_DIR/live-transfer-suite-$(date -u +%Y%m%dT%H%M%SZ).md" "$ROOT/scripts/live_transfer_certification.sh"
 fi
 run_gate "release grab stack" "$REPORT_DIR/release-grab-suite-$(date -u +%Y%m%dT%H%M%SZ).md" "$ROOT/scripts/release_grab_certification.sh"
+run_gate "Docker interop local matrix" "$REPORT_DIR/interop-local-suite-$(date -u +%Y%m%dT%H%M%SZ).md" "$ROOT/scripts/interop_matrix.sh" --local
 run_gate "DHT/public-port wiring" "$REPORT_DIR/dht-cert-suite-$(date -u +%Y%m%dT%H%M%SZ).md" "$ROOT/scripts/dht_certification.sh"
 run_gate "mobile qBit read-flow" "$REPORT_DIR/mobile-compat-suite-$(date -u +%Y%m%dT%H%M%SZ).md" "$ROOT/scripts/mobile_compat_certification.sh"
 run_gate "Phase 1 ruTorrent" "$REPORT_DIR/phase1-cert-suite-$(date -u +%Y%m%dT%H%M%SZ).md" "$ROOT/scripts/phase1_certification.sh"

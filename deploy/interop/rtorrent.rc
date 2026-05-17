@@ -1,0 +1,12 @@
+directory.default.set = /downloads/rtorrent
+session.path.set = /config/session
+network.port_range.set = 6885-6885
+network.port_random.set = no
+dht.mode.set = auto
+dht.port.set = 6885
+protocol.pex.set = yes
+trackers.use_udp.set = yes
+pieces.hash.on_completion.set = yes
+schedule2 = watch_start, 5, 5, ((load.start, "/watch/*.torrent"))
+schedule2 = untied_directory, 5, 5, ((close_untied))
+encoding.add = UTF-8

@@ -53,6 +53,21 @@ Run the larger release-grab gate in a separate normal-sync compose project:
 
 That runner uses non-conflicting host ports, configures the app clients, then proves Prowlarr, Sonarr, and Radarr can search local Torznab fixtures, submit release grabs through their own APIs, and complete transfers through rtorrentNG. It tears the temporary stack down by default; set `CERT_GRAB_KEEP_STACK=1` to keep it for debugging.
 
+Run the Docker client interop matrix against rusttorrentd, qBittorrent,
+Transmission, Deluge, rTorrent, and opentracker:
+
+```sh
+./scripts/interop_matrix.sh --local
+./scripts/interop_matrix.sh --public
+./scripts/interop_matrix.sh --all
+```
+
+The local mode creates deterministic fixture torrents and verifies file hashes
+across client-to-client transfers. The public mode resolves Debian, Ubuntu, and
+Fedora torrents from official project indexes at runtime and fully downloads
+them by default. Set `INTEROP_INCLUDE_LIBREOFFICE=1` to include the optional
+LibreOffice entry when its official torrent is available.
+
 Refresh the short automated gate set and write a consolidated release report:
 
 ```sh
