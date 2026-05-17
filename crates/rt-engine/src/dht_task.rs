@@ -13,6 +13,8 @@ use tracing::{debug, info, warn};
 
 use crate::torrent_task::TorrentCmd;
 
+const DHT_ANNOUNCED_PEERS_PER_INFO_HASH_CAP: usize = 512;
+
 #[derive(Clone)]
 pub struct DhtTorrent {
     pub info_hash: [u8; 20],
@@ -293,10 +295,11 @@ impl DhtTask {
         } else {
             SocketAddrV4::new(*v4.ip(), port)
         };
-        let peers = self.announced_peers.entry(info_hash).or_default();
-        if !peers.contains(&peer) {
-            peers.push(peer);
-        }
+        remember_announced_peer(
+            self.announced_peers.entry(info_hash).or_default(),
+            peer,
+            DHT_ANNOUNCED_PEERS_PER_INFO_HASH_CAP,
+        );
         KrpcMessage::Response {
             transaction_id,
             response: DhtResponse::new(self.local_id),
@@ -465,6 +468,17 @@ impl DhtTask {
     }
 }
 
+fn remember_announced_peer(peers: &mut Vec<SocketAddrV4>, peer: SocketAddrV4, cap: usize) -> bool {
+    if peers.contains(&peer) {
+        return true;
+    }
+    if peers.len() >= cap {
+        return false;
+    }
+    peers.push(peer);
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -579,6 +593,21 @@ mod tests {
         assert_eq!(peers.values, vec!["127.0.0.1:6881".parse().unwrap()]);
         assert!(peers.nodes.is_empty());
         assert!(peers.token.is_some());
+    }
+
+    #[test]
+    fn announced_peer_cache_is_bounded_and_keeps_duplicates() {
+        let first = "127.0.0.1:6881".parse().unwrap();
+        let second = "127.0.0.2:6881".parse().unwrap();
+        let third = "127.0.0.3:6881".parse().unwrap();
+        let mut peers = Vec::new();
+
+        assert!(remember_announced_peer(&mut peers, first, 2));
+        assert!(remember_announced_peer(&mut peers, second, 2));
+        assert!(remember_announced_peer(&mut peers, first, 2));
+        assert!(!remember_announced_peer(&mut peers, third, 2));
+
+        assert_eq!(peers, vec![first, second]);
     }
 
     #[tokio::test]
