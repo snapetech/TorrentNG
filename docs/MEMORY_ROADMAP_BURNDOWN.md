@@ -21,7 +21,7 @@ Status as of 2026-05-17.
 - [x] Slow-disk plus fast-peer backpressure evidence proxy.
   - Storage scale tests exercise queue-full backpressure rather than unbounded queue growth under saturated hash/disk paths.
 - [x] Conservative move/import/delete executor below the storage planner.
-  - Applies only plans that passed admission, never overwrites destinations, creates parents, verifies file or directory copy lengths, removes copy-move sources only after the verified rename, supports approved recursive delete, and rolls back staged copy files/directories on failure.
+  - Applies only plans that passed admission, never overwrites destinations, creates parents, verifies file or directory copy lengths, rejects symlinks in recursive copy sources, removes copy-move sources only after the verified rename, supports approved recursive delete, and rolls back staged copy files/directories on failure.
   - Root-confined execution validates source, destination, and rollback paths against configured storage roots before applying filesystem changes.
   - `scripts/storage_move_import_certification.sh` records the local planner/executor and full storage suite evidence under `certification/reports/`.
   - Set `TNG_STORAGE_MOVE_IMPORT_ROOT` to run the same executor on a real storage root with configurable fixture size.

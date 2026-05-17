@@ -143,7 +143,16 @@ impl SelectedDiskBackend {
     }
 
     fn uring(requested: BackendRequest, threads: usize, reason: String) -> Self {
-        let backend = UringBackend::new(threads);
+        let backend = match UringBackend::try_new(threads) {
+            Ok(backend) => backend,
+            Err(error) => {
+                return Self::pread(
+                    requested,
+                    threads,
+                    format!("{reason}; io_uring worker startup failed: {error}"),
+                );
+            }
+        };
         let selection = BackendSelection {
             requested,
             selected: BackendKind::Uring,
@@ -235,7 +244,7 @@ pub struct UringBackend {
 }
 
 impl UringBackend {
-    pub fn new(threads: usize) -> Self {
+    pub fn try_new(threads: usize) -> io::Result<Self> {
         let threads = threads.max(1);
         let (tx, rx) = mpsc::channel::<Job>();
         let rx = Arc::new(Mutex::new(rx));
@@ -246,20 +255,40 @@ impl UringBackend {
             let rx = Arc::clone(&rx);
             let registered_files_supported = Arc::clone(&registered_files_supported);
             let fixed_buffers_supported = Arc::clone(&fixed_buffers_supported);
+            let (ready_tx, ready_rx) = mpsc::channel();
             let handle = thread::Builder::new()
                 .name(format!("tng-uring-{i}"))
                 .spawn(move || {
-                    UringWorker::new(rx, registered_files_supported, fixed_buffers_supported).run()
+                    match UringWorker::new(rx, registered_files_supported, fixed_buffers_supported)
+                    {
+                        Ok(worker) => {
+                            let _ = ready_tx.send(Ok(()));
+                            worker.run();
+                        }
+                        Err(error) => {
+                            let _ = ready_tx.send(Err(error));
+                        }
+                    }
                 })
                 .expect("spawn io_uring worker");
+            match ready_rx.recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => return Err(error),
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "io_uring worker exited during startup",
+                    ));
+                }
+            }
             workers.push(handle);
         }
-        Self {
+        Ok(Self {
             tx,
             _workers: workers,
             registered_files_supported,
             fixed_buffers_supported,
-        }
+        })
     }
 
     pub fn probe() -> Result<UringProbe, String> {
@@ -486,8 +515,8 @@ impl UringWorker {
         rx: Arc<Mutex<mpsc::Receiver<Job>>>,
         registered_files_supported: Arc<AtomicBool>,
         fixed_buffers_supported: Arc<AtomicBool>,
-    ) -> Self {
-        let ring = IoUring::new(URING_ENTRIES).expect("create io_uring");
+    ) -> io::Result<Self> {
+        let ring = IoUring::new(URING_ENTRIES)?;
         let registered_files = match ring.submitter().register_files_sparse(URING_FILE_SLOTS) {
             Ok(()) => {
                 registered_files_supported.store(true, Ordering::Relaxed);
@@ -508,7 +537,7 @@ impl UringWorker {
                 None
             }
         };
-        Self {
+        Ok(Self {
             rx,
             ring,
             fixed,
@@ -516,7 +545,7 @@ impl UringWorker {
             next_file_slot: 0,
             registered_files,
             pending: HashMap::new(),
-        }
+        })
     }
 
     fn run(mut self) {
@@ -1181,7 +1210,13 @@ mod tests {
         std::fs::write(&path, vec![0u8; 128]).unwrap();
 
         let backend = SelectedDiskBackend::select(BackendRequest::Uring, 1);
-        assert_eq!(backend.kind(), BackendKind::Uring);
+        if backend.kind() != BackendKind::Uring {
+            eprintln!(
+                "tng_storage_backend forced_uring_skipped reason=\"{}\"",
+                backend.selection().reason
+            );
+            return;
+        }
 
         let pool = FramePool::new(1 << 20);
         let file = Arc::new(

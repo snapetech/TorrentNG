@@ -390,11 +390,21 @@ fn ensure_destination_available(path: &Path) -> Result<(), StorageError> {
 }
 
 fn copy_verify(source: &Path, destination: &Path, expected_bytes: u64) -> Result<(), StorageError> {
-    if source.is_dir() {
+    let metadata = safe_symlink_metadata(source, "copy-source")?;
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return Err(unsafe_symlink_error(source, "copy-source"));
+    }
+    if file_type.is_dir() {
         copy_dir_recursive(source, destination)?;
-    } else {
+    } else if file_type.is_file() {
         std::fs::copy(source, destination)
             .map_err(|e| StorageError::io(destination.display().to_string(), e))?;
+    } else {
+        return Err(StorageError::StagedMoveFailed {
+            step: "copy-source",
+            reason: format!("unsupported file type: {}", source.display()),
+        });
     }
     verify_path_len(destination, expected_bytes)
 }
@@ -413,6 +423,7 @@ fn verify_path_len(path: &Path, expected_bytes: u64) -> Result<(), StorageError>
 }
 
 fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), StorageError> {
+    reject_symlink(source, "copy-source")?;
     std::fs::create_dir_all(destination)
         .map_err(|e| StorageError::io(destination.display().to_string(), e))?;
     for entry in
@@ -421,21 +432,34 @@ fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), StorageEr
         let entry = entry.map_err(|e| StorageError::io(source.display().to_string(), e))?;
         let source_path = entry.path();
         let destination_path = destination.join(entry.file_name());
-        if source_path.is_dir() {
+        let metadata = safe_symlink_metadata(&source_path, "copy-source")?;
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            return Err(unsafe_symlink_error(&source_path, "copy-source"));
+        }
+        if file_type.is_dir() {
             copy_dir_recursive(&source_path, &destination_path)?;
-        } else {
+        } else if file_type.is_file() {
             ensure_destination_available(&destination_path)?;
             std::fs::copy(&source_path, &destination_path)
                 .map_err(|e| StorageError::io(destination_path.display().to_string(), e))?;
+        } else {
+            return Err(StorageError::StagedMoveFailed {
+                step: "copy-source",
+                reason: format!("unsupported file type: {}", source_path.display()),
+            });
         }
     }
     Ok(())
 }
 
 fn path_content_len(path: &Path) -> Result<u64, StorageError> {
-    let metadata =
-        std::fs::metadata(path).map_err(|e| StorageError::io(path.display().to_string(), e))?;
-    if metadata.is_dir() {
+    let metadata = safe_symlink_metadata(path, "verify")?;
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return Err(unsafe_symlink_error(path, "verify"));
+    }
+    if file_type.is_dir() {
         let mut total = 0u64;
         for entry in
             std::fs::read_dir(path).map_err(|e| StorageError::io(path.display().to_string(), e))?
@@ -444,8 +468,50 @@ fn path_content_len(path: &Path) -> Result<u64, StorageError> {
             total = total.saturating_add(path_content_len(&entry.path())?);
         }
         Ok(total)
-    } else {
+    } else if file_type.is_file() {
         Ok(metadata.len())
+    } else {
+        Err(StorageError::StagedMoveFailed {
+            step: "verify",
+            reason: format!("unsupported file type: {}", path.display()),
+        })
+    }
+}
+
+fn safe_symlink_metadata(
+    path: &Path,
+    step: &'static str,
+) -> Result<std::fs::Metadata, StorageError> {
+    std::fs::symlink_metadata(path).map_err(|e| {
+        let err = StorageError::io(path.display().to_string(), e);
+        match err {
+            StorageError::FileNotFound { .. } => StorageError::StagedMoveFailed {
+                step,
+                reason: format!(
+                    "path missing during move/import execution: {}",
+                    path.display()
+                ),
+            },
+            other => other,
+        }
+    })
+}
+
+fn reject_symlink(path: &Path, step: &'static str) -> Result<(), StorageError> {
+    if safe_symlink_metadata(path, step)?.file_type().is_symlink() {
+        Err(unsafe_symlink_error(path, step))
+    } else {
+        Ok(())
+    }
+}
+
+fn unsafe_symlink_error(path: &Path, step: &'static str) -> StorageError {
+    StorageError::StagedMoveFailed {
+        step,
+        reason: format!(
+            "symlink entries are not allowed in move/import plans: {}",
+            path.display()
+        ),
     }
 }
 
@@ -745,6 +811,86 @@ mod tests {
             std::fs::read(destination.join("nested/b.bin")).unwrap(),
             b"ef"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_copy_verify_plan_rejects_symlink_source_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside.bin");
+        let source = dir.path().join("source-link.bin");
+        let destination = dir.path().join("dest.bin");
+        std::fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, &source).unwrap();
+
+        let plan = StoragePlan {
+            dry_run: false,
+            can_apply: true,
+            issues: Vec::new(),
+            steps: vec![StoragePlanStep {
+                action: PlannedStorageAction::CopyVerifyRename,
+                source: Some(source.clone()),
+                destination: Some(destination.clone()),
+                bytes: 7,
+            }],
+            rollback_steps: Vec::new(),
+        };
+
+        assert!(matches!(
+            execute_storage_plan(&plan),
+            Err(StorageError::StagedMoveFailed {
+                step: "execute",
+                ..
+            })
+        ));
+        assert!(source.exists());
+        assert!(!destination.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_copy_verify_plan_rejects_nested_symlink_entry() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let nested = source.join("nested");
+        let outside = dir.path().join("outside.bin");
+        let destination = dir.path().join("dest");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(source.join("a.bin"), b"abcd").unwrap();
+        std::fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, nested.join("escape.bin")).unwrap();
+
+        let plan = StoragePlan {
+            dry_run: false,
+            can_apply: true,
+            issues: Vec::new(),
+            steps: vec![StoragePlanStep {
+                action: PlannedStorageAction::CopyVerifyRename,
+                source: Some(source.clone()),
+                destination: Some(destination.clone()),
+                bytes: 11,
+            }],
+            rollback_steps: vec![StoragePlanStep {
+                action: PlannedStorageAction::SafeDelete,
+                source: Some(destination.clone()),
+                destination: None,
+                bytes: 11,
+            }],
+        };
+
+        assert!(matches!(
+            execute_storage_plan(&plan),
+            Err(StorageError::StagedMoveFailed {
+                step: "execute",
+                ..
+            })
+        ));
+        assert!(source.exists());
+        assert!(!destination.exists());
     }
 
     #[test]
