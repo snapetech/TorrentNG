@@ -1536,6 +1536,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "libc",
+ "once_cell",
  "rt-hash",
  "rt-path",
  "rt-piece-map",
