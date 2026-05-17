@@ -1213,6 +1213,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deluge_torrent_status_field_matrix_is_present() {
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        {
+            let mut reg = registry.write().await;
+            let mut entry = TorrentEntry::new("a".repeat(40), "alpha".into(), "/data".into());
+            entry.total_length = 100;
+            entry.amount_left = 25;
+            entry.category = Some("movies".into());
+            entry.tags = vec!["hd".into()];
+            entry.stats.add_download(75);
+            entry.stats.add_upload(150);
+            reg.add(entry).unwrap();
+        }
+        let app = build_deluge_router(AppState::new(registry));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/json")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"id":1,"method":"core.get_torrent_status","params":["{}",[]]}}"#,
+                        "a".repeat(40)
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 16384).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert!(body["error"].is_null(), "{:?}", body["error"]);
+        assert_json_keys(
+            &body["result"],
+            &[
+                "hash",
+                "name",
+                "state",
+                "progress",
+                "total_size",
+                "total_done",
+                "download_payload_rate",
+                "upload_payload_rate",
+                "ratio",
+                "save_path",
+                "label",
+                "tags",
+                "is_finished",
+                "eta",
+                "num_peers",
+                "num_seeds",
+                "total_peers",
+                "total_seeds",
+                "num_files",
+                "num_pieces",
+                "piece_length",
+                "distributed_copies",
+                "seeds_peers_ratio",
+                "max_download_speed",
+                "max_upload_speed",
+                "is_auto_managed",
+                "stop_at_ratio",
+                "stop_ratio",
+                "remove_at_ratio",
+                "prioritize_first_last",
+                "sequential_download",
+                "super_seeding",
+                "move_on_completed",
+                "move_on_completed_path",
+                "time_added",
+                "completed_time",
+                "active_time",
+                "seeding_time",
+                "finished_time",
+                "all_time_download",
+                "total_uploaded",
+                "total_payload_upload",
+                "total_payload_download",
+                "next_announce",
+                "private",
+                "owner",
+                "shared",
+                "tracker_host",
+                "tracker_status",
+                "tracker",
+                "comment",
+                "message",
+            ],
+        );
+    }
+
+    fn assert_json_keys(value: &Value, keys: &[&str]) {
+        let obj = value.as_object().expect("expected JSON object");
+        for key in keys {
+            assert!(obj.contains_key(*key), "missing key {key} in {obj:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn deluge_auth_and_config_are_supported() {
         let registry = Arc::new(RwLock::new(SessionRegistry::new()));
         {

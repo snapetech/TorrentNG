@@ -1144,6 +1144,170 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transmission_response_field_matrix_is_present() {
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        {
+            let mut reg = registry.write().await;
+            let mut entry = TorrentEntry::new("a".repeat(40), "alpha".into(), "/data".into());
+            entry.total_length = 100;
+            entry.amount_left = 25;
+            reg.add(entry).unwrap();
+        }
+        let app = build_transmission_router(AppState::new(registry));
+        let fields = [
+            "id",
+            "hashString",
+            "name",
+            "totalSize",
+            "leftUntilDone",
+            "percentDone",
+            "downloadedEver",
+            "uploadedEver",
+            "uploadRatio",
+            "rateDownload",
+            "rateUpload",
+            "downloadLimit",
+            "downloadLimited",
+            "uploadLimit",
+            "uploadLimited",
+            "status",
+            "downloadDir",
+            "labels",
+            "error",
+            "errorString",
+            "eta",
+            "isPrivate",
+            "isFinished",
+            "isStalled",
+            "queuePosition",
+            "recheckProgress",
+            "seedRatioLimit",
+            "seedRatioMode",
+            "seedIdleLimit",
+            "seedIdleMode",
+            "addedDate",
+            "activityDate",
+            "doneDate",
+            "startDate",
+            "dateCreated",
+            "peers",
+            "peersConnected",
+            "peersGettingFromUs",
+            "peersSendingToUs",
+            "trackers",
+            "trackerStats",
+            "files",
+            "fileStats",
+            "priorities",
+            "wanted",
+            "comment",
+            "creator",
+            "pieceCount",
+            "pieceSize",
+            "pieces",
+            "haveUnchecked",
+            "haveValid",
+            "desiredAvailable",
+            "corruptEver",
+            "manualAnnounceTime",
+            "maxConnectedPeers",
+            "webseeds",
+            "webseedsSendingToUs",
+            "bandwidthPriority",
+            "honorsSessionLimits",
+            "magnetLink",
+            "metadataPercentComplete",
+            "secondsDownloading",
+            "secondsSeeding",
+        ];
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .header("content-type", "application/json")
+                    .header("x-transmission-session-id", SESSION_ID)
+                    .body(Body::from(format!(
+                        r#"{{"method":"torrent-get","arguments":{{"fields":{}}}}}"#,
+                        serde_json::to_string(&fields).unwrap()
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 16384).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        let torrent = &body["arguments"]["torrents"][0];
+        for field in fields {
+            assert!(
+                torrent.get(field).is_some_and(|value| !value.is_null()),
+                "missing or null Transmission torrent field {field}: {torrent:?}"
+            );
+        }
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .header("content-type", "application/json")
+                    .header("x-transmission-session-id", SESSION_ID)
+                    .body(Body::from(r#"{"method":"session-get"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 16384).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_json_keys(
+            &body["arguments"],
+            &[
+                "version",
+                "rpc-version",
+                "rpc-version-minimum",
+                "download-dir",
+                "config-dir",
+                "start-added-torrents",
+                "trash-original-torrent-files",
+                "speed-limit-down-enabled",
+                "speed-limit-up-enabled",
+                "speed-limit-down",
+                "speed-limit-up",
+                "alt-speed-enabled",
+                "alt-speed-down",
+                "alt-speed-up",
+                "download-queue-enabled",
+                "download-queue-size",
+                "seed-queue-enabled",
+                "seed-queue-size",
+                "queue-stalled-enabled",
+                "queue-stalled-minutes",
+                "peer-limit-global",
+                "peer-limit-per-torrent",
+                "script-torrent-added-enabled",
+                "script-torrent-done-enabled",
+                "script-torrent-done-seeding-enabled",
+                "blocklist-enabled",
+                "blocklist-size",
+                "utp-enabled",
+                "lpd-enabled",
+                "dht-enabled",
+                "pex-enabled",
+            ],
+        );
+    }
+
+    fn assert_json_keys(value: &Value, keys: &[&str]) {
+        let obj = value.as_object().expect("expected JSON object");
+        for key in keys {
+            assert!(obj.contains_key(*key), "missing key {key} in {obj:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn transmission_torrent_get_projects_v2_magnet_links() {
         let registry = Arc::new(RwLock::new(SessionRegistry::new()));
         {

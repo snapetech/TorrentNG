@@ -61,7 +61,10 @@ semaphores:
   the requested byte range.
 
 `TorrentTask` keeps a per-file preparation registry so parent directories and
-file allocation are no longer in the per-block hot path.
+file allocation are no longer in the per-block hot path. It also keeps
+in-memory piece assembly buffers for active downloads, so completed-piece
+validation hashes the assembled bytes directly when all blocks are present and
+only falls back to disk verification when memory state is incomplete.
 
 ## Fastresume Contract
 
@@ -77,8 +80,6 @@ The following items are still implementation targets:
 
 - Export `StorageIoStats` through `rt-metrics` and Prometheus, including
   latency histograms for read/write/sync/hash work.
-- Verify completed pieces from assembled in-memory download data before falling
-  back to disk re-read.
 - Promote peer-read locality from per-file readahead cache to a true
   cross-torrent device elevator that coalesces adjacent requests.
 - Add benchmarks comparing syscall count, seed-read locality, recheck runtime

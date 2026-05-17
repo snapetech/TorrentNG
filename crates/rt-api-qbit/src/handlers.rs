@@ -2541,6 +2541,151 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn qbit_response_field_matrix_is_present() {
+        let hash = "a".repeat(40);
+        let state = make_state_with(&hash).await;
+        let app = build_qbit_router(state);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/qb/v2/torrents/info")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_json_keys(
+            &body[0],
+            &[
+                "hash",
+                "name",
+                "state",
+                "size",
+                "downloaded",
+                "uploaded",
+                "ratio",
+                "save_path",
+                "category",
+                "tags",
+                "added_on",
+                "completion_on",
+                "num_leechs",
+                "num_seeds",
+                "dlspeed",
+                "upspeed",
+                "eta",
+                "progress",
+                "priority",
+                "amount_left",
+                "auto_tmm",
+                "tracker",
+                "trackers_count",
+            ],
+        );
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/qb/v2/torrents/properties?hash={hash}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_json_keys(
+            &body,
+            &[
+                "save_path",
+                "creation_date",
+                "piece_size",
+                "comment",
+                "total_wasted",
+                "total_uploaded",
+                "total_uploaded_session",
+                "total_downloaded",
+                "total_downloaded_session",
+                "up_limit",
+                "dl_limit",
+                "time_elapsed",
+                "seeding_time",
+                "nb_connections",
+                "nb_connections_limit",
+                "share_ratio",
+                "addition_date",
+                "completion_date",
+                "created_by",
+                "dl_speed_avg",
+                "dl_speed",
+                "eta",
+                "last_seen",
+                "peers",
+                "peers_total",
+                "pieces_have",
+                "pieces_num",
+                "reannounce",
+                "seeds",
+                "seeds_total",
+                "total_size",
+                "up_speed_avg",
+                "up_speed",
+            ],
+        );
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/qb/v2/sync/maindata")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_json_keys(
+            &body,
+            &[
+                "rid",
+                "full_update",
+                "torrents",
+                "torrents_removed",
+                "server_state",
+            ],
+        );
+        assert_json_keys(
+            &body["server_state"],
+            &[
+                "dl_info_speed",
+                "dl_info_data",
+                "up_info_speed",
+                "up_info_data",
+                "connection_status",
+                "free_space_on_disk",
+                "dl_rate_limit",
+                "up_rate_limit",
+                "use_alt_speed_limits",
+            ],
+        );
+    }
+
+    fn assert_json_keys(value: &serde_json::Value, keys: &[&str]) {
+        let obj = value.as_object().expect("expected JSON object");
+        for key in keys {
+            assert!(obj.contains_key(*key), "missing key {key} in {obj:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn torrents_info_filters_by_tag_and_sorts() {
         let state = AppState::new();
         {

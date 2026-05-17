@@ -203,7 +203,7 @@ covered today as an import source and as an interop peer.
 | Priority | Test artifact | Coverage |
 |---|---|---|
 | P0 | `api_facade_endpoint_matrix` | Implemented in crate tests: qBit route matrix, Transmission method matrix, Deluge advertised method matrix |
-| P0 | `api_response_field_matrix` | Request every documented response field bucket and assert present, typed, or explicitly marked unsupported |
+| P0 | `api_response_field_matrix` | Implemented for current qBit `torrents/info`/`properties`/`sync`, Transmission `torrent-get`/`session-get`, and Deluge torrent status fields; remaining documented gaps stay in field matrices |
 | P0 | `import_fixture_matrix` | Golden fixture per source client with all supported state fields |
 | P0 | `migration_apply_matrix` | Import fixture, apply native DB and fastresume, reload, assert state preservation |
 | P1 | `qbit_arr_client_matrix` | Sonarr/Radarr/Prowlarr/cross-seed/autobrr/NZB360-style qBit flows |
@@ -220,7 +220,7 @@ covered today as an import source and as an interop peer.
 | Priority | Work item | Source matrix |
 |---|---|---|
 | P0 | Add automated endpoint/method enumeration tests for qBit, Transmission, and Deluge | Implemented in `rt-api-qbit`, `rt-api-transmission`, and `rt-api-deluge` unit tests |
-| P0 | Add all-field response tests for qBit `torrents/info`, `properties`, `sync/maindata`; Transmission `torrent_get` and `session_get`; Deluge torrent status | Field matrices |
+| P0 | Add all-field response tests for qBit `torrents/info`, `properties`, `sync/maindata`; Transmission `torrent_get` and `session_get`; Deluge torrent status | Implemented in facade unit tests for currently supported fields |
 | P0 | Expand Transmission 4.1 JSON-RPC envelope support, semver header, `format=table`, and `recently_active` handling | Transmission API matrix |
 | P0 | Fill Transmission field gaps: `availability`, `bytes_completed`, `peers_from`, `webseeds_ex`, `eta_idle`, `group`, `primary_mime_type`, sequential fields | Transmission field matrix |
 | P1 | Make Deluge `get_torrents_status` and `get_torrent_status` honor requested field lists | Deluge API matrix |

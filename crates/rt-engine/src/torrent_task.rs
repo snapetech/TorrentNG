@@ -37,7 +37,7 @@ use rt_peer_wire::{
     message::Message,
 };
 use rt_piece_map::{FileSpan, PieceMap};
-use rt_piece_picker::{Availability, BlockRequest, PiecePicker};
+use rt_piece_picker::{Availability, BlockRequest, PiecePicker, MAX_BLOCK_SIZE};
 use rt_session::{SessionRegistry, TorrentState};
 use rt_storage::{
     scheduler::{scheduled_read, scheduled_write},
@@ -105,6 +105,46 @@ pub struct BlockEvent {
     pub piece: u32,
     pub offset: u32,
     pub data: bytes::Bytes,
+}
+
+#[derive(Debug)]
+struct PieceAssembly {
+    data: Vec<u8>,
+    received: Vec<bool>,
+}
+
+impl PieceAssembly {
+    fn new(len: usize) -> Self {
+        Self {
+            data: vec![0; len],
+            received: vec![false; len.div_ceil(MAX_BLOCK_SIZE as usize)],
+        }
+    }
+
+    fn insert(&mut self, offset: u32, block: &[u8]) -> anyhow::Result<()> {
+        let start = offset as usize;
+        let end = start
+            .checked_add(block.len())
+            .ok_or_else(|| anyhow::anyhow!("piece block offset overflow"))?;
+        if end > self.data.len() {
+            anyhow::bail!(
+                "piece block range {}..{} exceeds piece length {}",
+                start,
+                end,
+                self.data.len()
+            );
+        }
+        self.data[start..end].copy_from_slice(block);
+        let block_idx = start / MAX_BLOCK_SIZE as usize;
+        if let Some(received) = self.received.get_mut(block_idx) {
+            *received = true;
+        }
+        Ok(())
+    }
+
+    fn is_complete(&self) -> bool {
+        self.received.iter().all(|received| *received)
+    }
 }
 
 #[derive(Debug)]
@@ -223,6 +263,7 @@ pub struct TorrentTask {
     webseed_next_index: usize,
     webseed_failures: Vec<u8>,
     last_progress_persist: Option<Instant>,
+    piece_assemblies: HashMap<u32, PieceAssembly>,
     prepared_files: Mutex<HashSet<u32>>,
     paused: bool,
     max_peers: usize,
@@ -309,6 +350,7 @@ impl TorrentTask {
             webseed_next_index: 0,
             webseed_failures,
             last_progress_persist: None,
+            piece_assemblies: HashMap::new(),
             prepared_files: Mutex::new(HashSet::new()),
             paused,
             max_peers,
@@ -1267,13 +1309,24 @@ impl TorrentTask {
             return;
         }
         self.record_download(block.data.len() as u64).await;
+        if let Err(e) = self.record_piece_block(&block) {
+            warn!(
+                torrent = %self.info_hash_hex,
+                piece,
+                offset = block.offset,
+                err = %e,
+                "failed to assemble in-memory piece for verification"
+            );
+            self.piece_assemblies.remove(&piece);
+        }
 
         let complete = self
             .picker
             .block_received(block.piece as usize, block.offset);
         if complete {
-            match self.verify_piece(block.piece).await {
+            match self.verify_completed_piece(block.piece).await {
                 VerifyResult::Valid => {
+                    self.piece_assemblies.remove(&block.piece);
                     info!(piece = block.piece, torrent = %self.info_hash_hex, "piece complete");
                     self.send_have_to_peers(block.piece).await;
                     if self.picker.is_complete() {
@@ -1292,6 +1345,7 @@ impl TorrentTask {
                         "piece verification failed"
                     );
                     self.picker.reject_piece(block.piece as usize);
+                    self.piece_assemblies.remove(&block.piece);
                 }
                 VerifyResult::Missing { file_index, reason } => {
                     warn!(
@@ -1302,9 +1356,18 @@ impl TorrentTask {
                         "piece verification could not read data"
                     );
                     self.picker.reject_piece(block.piece as usize);
+                    self.piece_assemblies.remove(&block.piece);
                 }
             }
         }
+    }
+
+    fn record_piece_block(&mut self, block: &BlockEvent) -> anyhow::Result<()> {
+        let len = self.piece_length(block.piece)? as usize;
+        self.piece_assemblies
+            .entry(block.piece)
+            .or_insert_with(|| PieceAssembly::new(len))
+            .insert(block.offset, &block.data)
     }
 
     async fn send_have_to_peers(&mut self, piece: u32) {
@@ -1819,6 +1882,54 @@ impl TorrentTask {
         )
         .verify_piece(piece)
         .await
+    }
+
+    async fn verify_completed_piece(&self, piece: u32) -> VerifyResult {
+        if let Some(assembly) = self
+            .piece_assemblies
+            .get(&piece)
+            .filter(|assembly| assembly.is_complete())
+        {
+            let Some(expected) = self.meta.pieces.get(piece as usize) else {
+                return VerifyResult::Missing {
+                    file_index: 0,
+                    reason: format!("no hash for piece {piece}"),
+                };
+            };
+            match self
+                .storage
+                .hash_sha1(bytes::Bytes::copy_from_slice(&assembly.data))
+                .await
+            {
+                Ok(actual) if &actual == expected => return VerifyResult::Valid,
+                Ok(_) => return VerifyResult::Invalid,
+                Err(e) => {
+                    return VerifyResult::Missing {
+                        file_index: 0,
+                        reason: e.to_string(),
+                    }
+                }
+            }
+        }
+        self.verify_piece(piece).await
+    }
+
+    fn piece_length(&self, piece: u32) -> anyhow::Result<u32> {
+        if piece as usize >= self.meta.pieces.len() {
+            anyhow::bail!("piece {piece} out of range");
+        }
+        let last = self.meta.pieces.len().saturating_sub(1) as u32;
+        if piece == last {
+            let total = self.meta.total_length();
+            let rem = total % self.meta.piece_length;
+            Ok(if rem == 0 {
+                self.meta.piece_length as u32
+            } else {
+                rem as u32
+            })
+        } else {
+            Ok(self.meta.piece_length as u32)
+        }
     }
 
     async fn set_state(&self, state: TorrentState) {
@@ -2946,6 +3057,26 @@ mod tests {
         assert_eq!(timed_out[0].piece, 1);
         assert_eq!(outstanding.len(), 1);
         assert_eq!(outstanding[0].req.piece, 2);
+    }
+
+    #[test]
+    fn piece_assembly_tracks_complete_piece_bytes() {
+        let mut assembly = PieceAssembly::new((MAX_BLOCK_SIZE * 2) as usize);
+        assembly.insert(0, &[1; MAX_BLOCK_SIZE as usize]).unwrap();
+        assert!(!assembly.is_complete());
+        assembly
+            .insert(MAX_BLOCK_SIZE, &[2; MAX_BLOCK_SIZE as usize])
+            .unwrap();
+        assert!(assembly.is_complete());
+        assert_eq!(assembly.data[0], 1);
+        assert_eq!(assembly.data[MAX_BLOCK_SIZE as usize], 2);
+    }
+
+    #[test]
+    fn piece_assembly_rejects_out_of_range_block() {
+        let mut assembly = PieceAssembly::new(4);
+        let err = assembly.insert(2, &[1, 2, 3]).unwrap_err();
+        assert!(err.to_string().contains("exceeds piece length"));
     }
 
     #[test]
