@@ -14,7 +14,7 @@ scripts/storage_real_device_benchmark.sh <path>
 | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | --- | ---: | ---: |
 | 2026-05-17 | local | `/home/keith/Documents/code` | `Nvme` | btrfs | yes | 512 | 65 | 7.88x | 8 MiB in 3 ms, 512 backend reads | 1,000 | 1 |
 | 2026-05-17 | `kspls0` | `/mnt/datapool_lvm_media` | `Hdd` | ext4 | no | 16,384 | 2,034 | 8.06x | 256 MiB in 3,069 ms, 16,384 backend reads, 83.39 MiB/s | 100,000 | 1 |
-| 2026-05-17 | `kspls0` | `/mnt/datapool_lvm_media` | `Hdd` | ext4 | no | 16,384 shuffled elevator | 1 | 16,384x | serial run: baseline 256 MiB in 10,280 ms, 24.90 MiB/s; elevator 256 MiB in 2,038 ms, 125.55 MiB/s; 5.04x wall-clock | 100,000 | 1 |
+| 2026-05-17 | `kspls0` | `/mnt/datapool_lvm_media` | `Hdd` | ext4 | no | 16,384 shuffled elevator | 1 | 16,384x | serial run: baseline 256 MiB in 11,746 ms, 21.79 MiB/s; elevator 256 MiB in 2,140 ms, 119.58 MiB/s; 5.49x wall-clock | 100,000 | 1 |
 
 Notes:
 
