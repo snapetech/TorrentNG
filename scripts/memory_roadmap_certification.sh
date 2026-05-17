@@ -105,12 +105,18 @@ fi
 if contains "$storage_hardware" 'Overall status: PASS' &&
   contains "$storage_hardware" 'TorrentNG storage elevator wall-clock ratio: [5-9][0-9]*\.|TorrentNG storage elevator wall-clock ratio: [5-9]\.'; then
   row "HDD 5x elevator release evidence" PASS "$(report_link "$storage_hardware")"
+elif contains "$storage_hardware" 'Overall status: PASS' &&
+  contains "$storage_hardware" 'tng_storage_elevator skipped_non_hdd_profile='; then
+  row "HDD 5x elevator release evidence" INFO "$(report_link "$storage_hardware") (non-HDD target)"
 else
   row "HDD 5x elevator release evidence" WARN "$(report_link "$storage_hardware")"
 fi
 
 if contains "$storage_hardware" '/dev/sd.*\|.*\| 1 \|'; then
   row "sampled LVM physical-PV placement evidence" PASS "$(report_link "$storage_hardware")"
+elif contains "$storage_hardware" 'Overall status: PASS' &&
+  ! contains "$storage_hardware" 'LVM/PV extent probe:'; then
+  row "sampled LVM physical-PV placement evidence" INFO "$(report_link "$storage_hardware") (non-LVM target)"
 else
   row "sampled LVM physical-PV placement evidence" WARN "$(report_link "$storage_hardware")"
 fi
