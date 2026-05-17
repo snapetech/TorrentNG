@@ -2603,3 +2603,21 @@ async fn qb_set_preferences_validates_json() {
     assert_eq!(events[0].level, "warn");
     assert!(!events[0].payload.contains("TorrentNG-Test/1.0"));
 }
+
+#[tokio::test]
+async fn native_user_agent_failures_are_durable_and_sanitized() {
+    let (addr, client, db) = spawn_server_with_db().await;
+
+    let res = client
+        .put(url(addr, "/api/v1/settings/user-agent"))
+        .json(&serde_json::json!({ "user_agent": "TorrentNG-Native-Test/1.0" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 500);
+
+    let events = db.list_app_events(10).unwrap();
+    assert_eq!(events[0].kind, "rtorrent_user_agent_error");
+    assert_eq!(events[0].level, "warn");
+    assert!(!events[0].payload.contains("TorrentNG-Native-Test/1.0"));
+}
