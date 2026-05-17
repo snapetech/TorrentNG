@@ -6,7 +6,7 @@ resolver_url = "https://cdimage.debian.org/debian-cd/current/amd64/bt-cd/"
 resolver_pattern = "debian-[0-9][^\"]*-amd64-netinst\\.iso\\.torrent"
 legal_note = "Official Debian BitTorrent image published by the Debian project."
 max_runtime_secs = 7200
-clients = ["rusttorrentd", "qbittorrent", "transmission", "deluge", "rtorrent"]
+clients = ["torrentngd", "qbittorrent", "transmission", "deluge", "rtorrent"]
 
 [[torrent]]
 id = "ubuntu"
@@ -16,7 +16,7 @@ resolver_url = "https://releases.ubuntu.com/"
 resolver_pattern = "ubuntu-[0-9][^\"]*-live-server-amd64\\.iso\\.torrent"
 legal_note = "Official Ubuntu torrent published through Ubuntu releases infrastructure."
 max_runtime_secs = 7200
-clients = ["rusttorrentd", "qbittorrent", "transmission", "deluge", "rtorrent"]
+clients = ["torrentngd", "qbittorrent", "transmission", "deluge", "rtorrent"]
 
 [[torrent]]
 id = "fedora"
@@ -26,7 +26,7 @@ resolver_url = "https://torrent.fedoraproject.org/torrents/"
 resolver_pattern = "Fedora-Server-dvd-x86_64-[0-9][^\"]*\\.torrent"
 legal_note = "Official Fedora torrent published by the Fedora project."
 max_runtime_secs = 7200
-clients = ["rusttorrentd", "qbittorrent", "transmission", "deluge", "rtorrent"]
+clients = ["torrentngd", "qbittorrent", "transmission", "deluge", "rtorrent"]
 
 [[torrent]]
 id = "libreoffice"
@@ -36,4 +36,4 @@ resolver_url = "https://download.documentfoundation.org/libreoffice/stable/"
 resolver_pattern = "LibreOffice_[0-9][^\"]*_Linux_x86-64_deb\\.tar\\.gz\\.torrent"
 legal_note = "Official LibreOffice torrent published by The Document Foundation."
 max_runtime_secs = 7200
-clients = ["rusttorrentd", "qbittorrent"]
+clients = ["torrentngd", "qbittorrent"]

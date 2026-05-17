@@ -1,7 +1,7 @@
 # Deployment
 
 This document covers the Track 1 rTorrent and sidecar deployment path. For the
-native `rusttorrentd` engine, use [NATIVE_DEPLOYMENT.md](NATIVE_DEPLOYMENT.md).
+native `torrentngd` engine, use [NATIVE_DEPLOYMENT.md](NATIVE_DEPLOYMENT.md).
 For the engine rewrite overview and swap/testing workflow, use
 [ENGINE_REWRITE.md](ENGINE_REWRITE.md).
 

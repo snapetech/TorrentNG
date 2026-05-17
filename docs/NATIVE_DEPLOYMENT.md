@@ -1,6 +1,6 @@
 # Native Engine Deployment
 
-Native mode runs `rusttorrentd` as the source of truth. qBittorrent,
+Native mode runs `torrentngd` as the source of truth. qBittorrent,
 Transmission, Deluge, and legacy UI compatibility surfaces are facades over the
 same durable engine state.
 
@@ -19,8 +19,8 @@ For the larger rewrite overview and native-vs-rTorrent comparison, see
 
 ## Config
 
-`rusttorrentd` loads config from `RUSTTORRENTD_CONFIG`, then
-`~/.config/rusttorrentd/config.toml`, then `/etc/rusttorrentd/config.toml`.
+`torrentngd` loads config from `TORRENTNGD_CONFIG`, then
+`~/.config/torrentngd/config.toml`, then `/etc/torrentngd/config.toml`.
 When no config exists, defaults are used.
 
 Minimal production shape:
@@ -28,7 +28,7 @@ Minimal production shape:
 ```toml
 [daemon]
 api_bind = "127.0.0.1:8080"
-session_dir = "/var/lib/rusttorrentd"
+session_dir = "/var/lib/torrentngd"
 
 [storage]
 download_dir = "/data"
@@ -44,7 +44,7 @@ config surface.
 ## Start
 
 ```sh
-RUSTTORRENTD_CONFIG=/config/config.toml rusttorrentd
+TORRENTNGD_CONFIG=/config/config.toml torrentngd
 ```
 
 Minimum validation:
@@ -57,7 +57,7 @@ curl -fsS http://127.0.0.1:8080/api/qb/v2/torrents/info
 
 ## Docker Compose
 
-The native Compose stack builds `rusttorrentd`, mounts durable state and payload
+The native Compose stack builds `torrentngd`, mounts durable state and payload
 volumes, and can optionally start Prometheus and Grafana:
 
 ```sh
@@ -75,14 +75,14 @@ Example unit and tmpfiles definitions are in [deploy/native/systemd](../deploy/n
 Install the binary and config, create the service user, then enable the unit:
 
 ```sh
-install -Dm755 target/release/rusttorrentd /usr/local/bin/rusttorrentd
-install -Dm644 deploy/native/config.toml /etc/rusttorrentd/config.toml
-install -Dm644 deploy/native/systemd/rusttorrentd.service /etc/systemd/system/rusttorrentd.service
-install -Dm644 deploy/native/systemd/sysusers.conf /etc/sysusers.d/rusttorrentd.conf
-install -Dm644 deploy/native/systemd/tmpfiles.conf /etc/tmpfiles.d/rusttorrentd.conf
-systemd-sysusers /etc/sysusers.d/rusttorrentd.conf
-systemd-tmpfiles --create /etc/tmpfiles.d/rusttorrentd.conf
-systemctl enable --now rusttorrentd
+install -Dm755 target/release/torrentngd /usr/local/bin/torrentngd
+install -Dm644 deploy/native/config.toml /etc/torrentngd/config.toml
+install -Dm644 deploy/native/systemd/torrentngd.service /etc/systemd/system/torrentngd.service
+install -Dm644 deploy/native/systemd/sysusers.conf /etc/sysusers.d/torrentngd.conf
+install -Dm644 deploy/native/systemd/tmpfiles.conf /etc/tmpfiles.d/torrentngd.conf
+systemd-sysusers /etc/sysusers.d/torrentngd.conf
+systemd-tmpfiles --create /etc/tmpfiles.d/torrentngd.conf
+systemctl enable --now torrentngd
 ```
 
 ## Kubernetes
@@ -100,12 +100,12 @@ target cluster.
 
 ## Observability
 
-`rusttorrentd` exposes Prometheus metrics at `/metrics`. The native deployment
+`torrentngd` exposes Prometheus metrics at `/metrics`. The native deployment
 directory includes:
 
 - [prometheus.yml](../deploy/native/prometheus.yml)
 - [Grafana datasource provisioning](../deploy/native/grafana/provisioning/datasources/prometheus.yml)
-- [rusttorrentd overview dashboard](../deploy/native/grafana/dashboards/rusttorrentd.json)
+- [torrentngd overview dashboard](../deploy/native/grafana/dashboards/torrentngd.json)
 
 With Compose, start them through the `observability` profile.
 

@@ -12,7 +12,7 @@ upstream rTorrent core.
 
 It has two runtime tracks:
 
-1. **Native rewrite** — `crates/rusttorrentd` owns torrent state, peer traffic,
+1. **Native rewrite** — `crates/torrentngd` owns torrent state, peer traffic,
    tracker state, storage, rechecks, jobs, metrics, native REST/SSE, and
    compatibility API projections.
 2. **Track 1 rTorrent core** — rTorrent/libtorrent remains the BitTorrent
@@ -24,7 +24,7 @@ Important layers:
 
 1. **engine-profile/** — Pinned rTorrent build config, SCGI/socket setup, tuning profiles
 2. **sidecar/** — Rust daemon for rTorrent-backed deployments
-3. **crates/** — Native engine crates and `rusttorrentd`
+3. **crates/** — Native engine crates and `torrentngd`
 4. **webui/** — React+Vite frontend, virtualized table, talks to native/sidecar APIs
 5. **deploy/** — Docker, Compose, systemd, nginx, Kubernetes examples
 
@@ -32,7 +32,7 @@ Important layers:
 
 - External tools (Prowlarr, Sonarr, Radarr, autobrr, cross-seed) talk to TorrentNG through compatibility APIs, primarily the qBittorrent-compatible API.
 - The browser talks to native REST/SSE/WebSocket-facing APIs, never directly to rTorrent SCGI.
-- In native mode, `rusttorrentd` is the source of truth and does not require rTorrent, XMLRPC, or the sidecar.
+- In native mode, `torrentngd` is the source of truth and does not require rTorrent, XMLRPC, or the sidecar.
 - In Track 1 sidecar mode, **nothing** talks to rTorrent XMLRPC/SCGI directly except the sidecar.
 - The sidecar runs beside rTorrent, communicates over a trusted local SCGI socket, and remains a migration/facade layer.
 - Auth, tokens, CSRF/OIDC/reverse-proxy trust policy live in the TorrentNG API layer.
@@ -159,7 +159,7 @@ Every release must pass:
 - Rust daemon/sidecar: axum + tokio; no unsafe except in deps; anyhow for errors in binary, thiserror for library errors
 - WebUI: TypeScript strict, TanStack Query for server state, TanStack Virtual for table
 - No ORM; raw SQL via rusqlite with bundled SQLite (no system dep)
-- Native config file: `RUSTTORRENTD_CONFIG`, `~/.config/rusttorrentd/config.toml`, or `/etc/rusttorrentd/config.toml`
+- Native config file: `TORRENTNGD_CONFIG`, `~/.config/torrentngd/config.toml`, or `/etc/torrentngd/config.toml`
 - Sidecar config file: `~/.config/torrentng/config.toml` or `/etc/torrentng/config.toml`; env vars `TNG_*` override many sidecar fields
 - All API responses: JSON, snake_case keys
 - Logs: structured JSON via tracing + tracing-subscriber JSON layer

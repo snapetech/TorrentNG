@@ -21,7 +21,7 @@ certified status.
 
 ## Deploy And Operate
 
-- [NATIVE_DEPLOYMENT.md](NATIVE_DEPLOYMENT.md) - production `rusttorrentd`
+- [NATIVE_DEPLOYMENT.md](NATIVE_DEPLOYMENT.md) - production `torrentngd`
   deployment with Compose, systemd, Kubernetes, metrics, and certification.
 - [DEPLOYMENT.md](DEPLOYMENT.md) - Track 1 rTorrent plus sidecar deployment.
 - [CONFIGURATION.md](CONFIGURATION.md) - native and sidecar config references.
@@ -39,7 +39,7 @@ certified status.
 - [INTEGRATION_COMPAT.md](INTEGRATION_COMPAT.md) - sidecar and native
   compatibility test coverage.
 - [INTEROP_MATRIX.md](INTEROP_MATRIX.md) - Docker client matrix across
-  rusttorrentd, qBittorrent, Transmission, Deluge, rTorrent, local fixtures, and
+  torrentngd, qBittorrent, Transmission, Deluge, rTorrent, local fixtures, and
   official public Linux torrents.
 - [STORAGE_PHASE_B_TEST_MATRIX.md](STORAGE_PHASE_B_TEST_MATRIX.md) - focused
   matrix for storage topology, auto preallocation, peer-read locality, and

@@ -287,9 +287,9 @@ impl Config {
 
 fn default_session_dir() -> PathBuf {
     if let Some(home) = std::env::var_os("HOME") {
-        PathBuf::from(home).join(".local/share/rusttorrentd")
+        PathBuf::from(home).join(".local/share/torrentngd")
     } else {
-        PathBuf::from("/var/lib/rusttorrentd")
+        PathBuf::from("/var/lib/torrentngd")
     }
 }
 
@@ -303,13 +303,13 @@ fn dirs_default_download() -> PathBuf {
 
 fn default_config_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Some(cfg) = std::env::var_os("RUSTTORRENTD_CONFIG") {
+    if let Some(cfg) = std::env::var_os("TORRENTNGD_CONFIG") {
         paths.push(PathBuf::from(cfg));
     }
     if let Some(home) = std::env::var_os("HOME") {
-        paths.push(PathBuf::from(home).join(".config/rusttorrentd/config.toml"));
+        paths.push(PathBuf::from(home).join(".config/torrentngd/config.toml"));
     }
-    paths.push(PathBuf::from("/etc/rusttorrentd/config.toml"));
+    paths.push(PathBuf::from("/etc/torrentngd/config.toml"));
     paths
 }
 

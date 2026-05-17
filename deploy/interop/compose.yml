@@ -1,8 +1,8 @@
 name: torrentng-interop
 
 services:
-  rusttorrentd:
-    image: torrentng/rusttorrentd:interop
+  torrentngd:
+    image: torrentng/torrentngd:interop
     build:
       context: ../..
       dockerfile: deploy/native/Dockerfile
@@ -12,12 +12,12 @@ services:
       - "${INTEROP_RUST_PEER_PORT:-29181}:6881"
       - "${INTEROP_RUST_PEER_PORT:-29181}:6881/udp"
     volumes:
-      - ./rusttorrentd.config.toml:/etc/rusttorrentd/config.toml:ro
-      - rusttorrentd-state:/var/lib/rusttorrentd
+      - ./torrentngd.config.toml:/etc/torrentngd/config.toml:ro
+      - torrentngd-state:/var/lib/torrentngd
       - ${INTEROP_WORKDIR:-../../certification/interop}/downloads:/downloads
       - ${INTEROP_WORKDIR:-../../certification/interop}/artifacts:/artifacts
     environment:
-      RUSTTORRENTD_CONFIG: /etc/rusttorrentd/config.toml
+      TORRENTNGD_CONFIG: /etc/torrentngd/config.toml
       RUST_LOG: "${RUST_LOG:-info}"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
@@ -128,4 +128,4 @@ networks:
     driver: bridge
 
 volumes:
-  rusttorrentd-state:
+  torrentngd-state:

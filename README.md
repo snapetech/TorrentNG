@@ -16,7 +16,7 @@ The project currently supports two engine modes:
 
 | Mode | Process | Source of truth | Use when |
 |---|---|---|---|
-| Native engine | `rusttorrentd` | TorrentNG Rust engine and SQLite state | You want the primary rewrite path, native storage/recheck/jobs, and one model for WebUI plus APIs |
+| Native engine | `torrentngd` | TorrentNG Rust engine and SQLite state | You want the primary rewrite path, native storage/recheck/jobs, and one model for WebUI plus APIs |
 | rTorrent sidecar | `rTorrent` + `torrentng` | rTorrent session state | You need an rTorrent migration bridge, compatibility comparison, or an rTorrent-backed deployment |
 
 Both modes aim to expose the same user-facing WebUI and compatibility surfaces.
@@ -102,7 +102,7 @@ one stack before starting the other unless you intentionally change ports.
 - Native Rust engine crates for bencode, metainfo, hashing, storage, trackers,
   DHT, uTP, peer wire, piece picking, session state, jobs, migration, metrics,
   and API projections.
-- `rusttorrentd`, the native daemon that owns torrent state and serves APIs.
+- `torrentngd`, the native daemon that owns torrent state and serves APIs.
 - `sidecar/torrentng`, the rTorrent compatibility harness for existing
   deployments.
 - React, TypeScript, and Vite WebUI in `webui/`.
@@ -116,7 +116,7 @@ one stack before starting the other unless you intentionally change ports.
 | Path | Purpose |
 |---|---|
 | `crates/` | Native engine, API, migration, metrics, and testkit crates |
-| `crates/rusttorrentd/` | Native daemon binary |
+| `crates/torrentngd/` | Native daemon binary |
 | `sidecar/` | rTorrent-backed API/WebUI sidecar |
 | `webui/` | React/Vite frontend |
 | `deploy/native/` | Native engine Compose, Docker, systemd, Kubernetes, metrics assets |
@@ -175,7 +175,7 @@ scripts/interop_matrix.sh --local
 scripts/interop_matrix.sh --public
 ```
 
-The matrix runs `rusttorrentd` beside qBittorrent, Transmission, Deluge,
+The matrix runs `torrentngd` beside qBittorrent, Transmission, Deluge,
 rTorrent, opentracker, and a fixture HTTP server. Local mode verifies
 deterministic client-to-client transfers, webseeds, explicit private peers,
 restart recovery, churn, protocol rows for UDP trackers and qBit mutation

@@ -1,6 +1,6 @@
 services:
-  rusttorrentd:
-    image: torrentng/rusttorrentd:local
+  torrentngd:
+    image: torrentng/torrentngd:local
     build:
       context: ../..
       dockerfile: deploy/native/Dockerfile
@@ -10,11 +10,11 @@ services:
       - "6881:6881"
       - "6881:6881/udp"
     volumes:
-      - ./config.toml:/etc/rusttorrentd/config.toml:ro
-      - rusttorrentd-state:/var/lib/rusttorrentd
+      - ./config.toml:/etc/torrentngd/config.toml:ro
+      - torrentngd-state:/var/lib/torrentngd
       - downloads:/data
     environment:
-      RUSTTORRENTD_CONFIG: /etc/rusttorrentd/config.toml
+      TORRENTNGD_CONFIG: /etc/torrentngd/config.toml
       RUST_LOG: "${RUST_LOG:-info}"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
@@ -32,7 +32,7 @@ services:
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
     depends_on:
-      - rusttorrentd
+      - torrentngd
 
   grafana:
     image: grafana/grafana:latest
@@ -49,5 +49,5 @@ services:
 
 volumes:
   downloads:
-  rusttorrentd-state:
+  torrentngd-state:
   grafana-data:

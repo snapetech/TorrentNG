@@ -1,13 +1,13 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: rusttorrentd
+  name: torrentngd
   namespace: torrentng
   labels:
-    app.kubernetes.io/name: rusttorrentd
+    app.kubernetes.io/name: torrentngd
 spec:
   selector:
-    app.kubernetes.io/name: rusttorrentd
+    app.kubernetes.io/name: torrentngd
   ports:
     - name: http
       port: 8080

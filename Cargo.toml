@@ -30,7 +30,7 @@ members = [
     "crates/rt-engine",
     "crates/rt-migrate",
     "crates/rt-testkit",
-    "crates/rusttorrentd",
+    "crates/torrentngd",
 ]
 
 [workspace.package]

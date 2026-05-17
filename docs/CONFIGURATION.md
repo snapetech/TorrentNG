@@ -2,32 +2,32 @@
 
 TorrentNG has two runtime configuration surfaces:
 
-- `rusttorrentd`, the native engine daemon and primary runtime.
+- `torrentngd`, the native engine daemon and primary runtime.
 - `torrentng`, the Track 1 rTorrent sidecar used for migration and compatibility deployments.
 
 The two config files are intentionally separate. Native config controls durable engine state, peer networking, tracker behavior, storage, DHT, and native API auth. Sidecar config controls the rTorrent SCGI bridge, sidecar cache, WebUI serving, and qBittorrent-compatible facade identity.
 
 ## Native daemon
 
-`rusttorrentd` loads TOML config from the first existing path in this order:
+`torrentngd` loads TOML config from the first existing path in this order:
 
-1. `RUSTTORRENTD_CONFIG`
-2. `~/.config/rusttorrentd/config.toml`
-3. `/etc/rusttorrentd/config.toml`
+1. `TORRENTNGD_CONFIG`
+2. `~/.config/torrentngd/config.toml`
+3. `/etc/torrentngd/config.toml`
 
 If no file exists, built-in defaults are used.
 
 Start with an explicit config path:
 
 ```sh
-RUSTTORRENTD_CONFIG=/config/config.toml rusttorrentd
+TORRENTNGD_CONFIG=/config/config.toml torrentngd
 ```
 
 ### `[daemon]`
 
 | Key | Default | Description |
 |---|---|---|
-| `session_dir` | `~/.local/share/rusttorrentd` or `/var/lib/rusttorrentd` | Directory for torrent metadata and session state |
+| `session_dir` | `~/.local/share/torrentngd` or `/var/lib/torrentngd` | Directory for torrent metadata and session state |
 | `api_bind` | `127.0.0.1:8080` | Bind address for the REST and compatibility APIs |
 | `log_level` | `info` | Tracing filter, for example `info` or `rt_engine=trace` |
 | `shutdown_timeout_secs` | `10` | Max seconds to wait for torrent tasks to send stopped announces during shutdown |
@@ -129,7 +129,7 @@ precedence over both.
 ```toml
 [daemon]
 api_bind = "127.0.0.1:8080"
-session_dir = "/var/lib/rusttorrentd"
+session_dir = "/var/lib/torrentngd"
 
 [storage]
 download_dir = "/data"
@@ -143,7 +143,7 @@ api_tokens = ["change-me"]
 ```toml
 [daemon]
 api_bind = "127.0.0.1:8080"
-session_dir = "/var/lib/rusttorrentd"
+session_dir = "/var/lib/torrentngd"
 log_level = "info"
 shutdown_timeout_secs = 10
 
@@ -174,7 +174,7 @@ bootstrap_nodes = [
 ]
 
 [db]
-path = "/var/lib/rusttorrentd/state.db"
+path = "/var/lib/torrentngd/state.db"
 wal_checkpoint_pages = 1000
 
 [auth]

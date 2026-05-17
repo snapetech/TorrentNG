@@ -1,6 +1,6 @@
 Created the archive-ready implementation spec here:
 
-[Download the RustTorrent engine rewrite spec](sandbox:/mnt/data/rusttorrent_engine_rewrite_spec.md)
+[Download the TorrentNG engine rewrite spec](sandbox:/mnt/data/torrentng_engine_rewrite_spec.md)
 
 Core framing: **do not ask a weaker/free model to “rewrite rTorrent.”** Ask it to implement one isolated crate, parser, endpoint, job, DB migration, or test at a time, with hard acceptance criteria.
 

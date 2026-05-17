@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+tmpdir="$(mktemp -d)"
+trap 'rm -rf "$tmpdir"' EXIT
+
+report_dir="$tmpdir/reports"
+benchmark_dir="$tmpdir/benchmarks"
+mkdir -p "$report_dir" "$benchmark_dir"
+
+cat >"$report_dir/storage-hardware-selftest.md" <<'REPORT'
+# TorrentNG Storage Hardware Matrix
+
+- Generated: 2026-05-17T00:00:00Z
+- Host: selftest
+- Commit: selftest
+- Target: /tmp/storage-selftest
+
+Overall status: PASS
+REPORT
+
+cat >"$report_dir/storage-uring-graduation-selftest.md" <<'REPORT'
+# TorrentNG io_uring Graduation Report
+
+- Generated: 2026-05-17T00:00:00Z
+- Host: selftest
+- Commit: selftest
+- Target: /tmp/storage-selftest
+
+## pread
+
+- Result: PASS
+- Selected: pread
+- Fixed-buffer strategy: disabled
+
+## uring
+
+- Result: PASS
+- Selected: uring
+- Fixed-buffer strategy: worker_copy
+
+## Graduation Gates
+
+| Gate | Result |
+| --- | --- |
+| uring selected | PASS |
+| fixed-buffer strategy | INFO: worker_copy |
+
+Overall status: PASS
+REPORT
+
+cat >"$report_dir/storage-move-import-selftest.md" <<'REPORT'
+# TorrentNG Storage Move/Import Certification
+
+- Generated: 2026-05-17T00:00:00Z
+- Host: selftest
+- Commit: selftest
+- Target: /tmp/storage-selftest
+
+tng_storage_move_import root=/tmp/storage-selftest files=1 mib_per_file=1 bytes=1048576 moved=1 imported=1 deleted=1 root_confined=1
+
+Overall status: PASS
+REPORT
+
+TNG_STORAGE_REPORT_DIR="$report_dir" \
+  TNG_STORAGE_REPORT_INDEX="$report_dir/storage-certification-index.md" \
+  "$ROOT/scripts/storage_certification_index.sh" >/dev/null
+
+index="$report_dir/storage-certification-index.md"
+
+require_row() {
+  local kind="$1"
+  local result="$2"
+  awk -F'|' -v kind="$kind" -v result="$result" '
+    NR <= 2 { next }
+    {
+      for (i = 1; i <= NF; i++) {
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", $i)
+      }
+      if ($3 == kind && $(NF - 1) == result) found = 1
+    }
+    END { exit found ? 0 : 1 }
+  ' "$index"
+}
+
+require_row 'hardware matrix' PASS
+require_row 'io_uring capability/graduation' PASS
+require_row 'move/import' PASS
+grep -q 'storage-uring-graduation-selftest.md' "$index"
+grep -q '| uring | worker_copy |' "$index"
+grep -q '| yes | PASS |' "$index"
+
+write_passing_report() {
+  local path="$1"
+  {
+    echo "# selftest"
+    echo
+    echo "Overall status: PASS"
+  } >"$path"
+}
+
+for pattern in \
+  live-cert-selftest.md \
+  client-config-selftest.md \
+  live-transfer-selftest.md \
+  release-grab-selftest.md \
+  app-add-job-selftest.md \
+  arr-app-selftest.md \
+  autobrr-selftest.md \
+  dht-cert-selftest.md \
+  natpmp-dht-selftest.md \
+  proton-natpmp-selftest.md \
+  proton-tng-dht-selftest.md \
+  mobile-compat-selftest.md \
+  phase1-cert-selftest.md \
+  soak-20260517-selftest.md \
+  transfer-churn-selftest.md \
+  soak-24h-selftest.md \
+  soak-status-selftest.md \
+  soak-final-selftest.md \
+  security-review-selftest.md \
+  security-scan-selftest.md \
+  native-engine-selftest.md \
+  local-release-selftest.md \
+  pre-engine-release-selftest.md \
+  pre-engine-suite-selftest.md; do
+  write_passing_report "$report_dir/$pattern"
+done
+write_passing_report "$benchmark_dir/report-selftest.md"
+
+cat >"$report_dir/memory-roadmap-certification-selftest.md" <<'REPORT'
+# TorrentNG Memory Roadmap Certification
+
+| Roadmap item | Status | Evidence |
+| --- | --- | --- |
+| storage selftest | PASS | generated |
+
+Overall status: PASS
+REPORT
+
+REPORT_DIR="$report_dir" BENCHMARK_DIR="$benchmark_dir" \
+  "$ROOT/scripts/post_soak_release_gate.sh" "$report_dir/post-soak-release-selftest-pass.md" >/dev/null
+grep -q 'storage certification index | PASS' "$report_dir/post-soak-release-selftest-pass.md"
+
+cat >"$report_dir/storage-move-import-selftest.md" <<'REPORT'
+# TorrentNG Storage Move/Import Certification
+
+- Generated: 2026-05-17T00:00:00Z
+- Host: selftest
+- Commit: selftest
+- Target: /tmp/storage-selftest
+
+Overall status: FAIL
+REPORT
+
+TNG_STORAGE_REPORT_DIR="$report_dir" \
+  TNG_STORAGE_REPORT_INDEX="$report_dir/storage-certification-index.md" \
+  "$ROOT/scripts/storage_certification_index.sh" >/dev/null
+
+if require_row 'move/import' PASS; then
+  echo "move/import FAIL report was indexed as PASS" >&2
+  exit 1
+fi
+
+require_row 'move/import' FAIL
+
+if REPORT_DIR="$report_dir" BENCHMARK_DIR="$benchmark_dir" \
+  "$ROOT/scripts/post_soak_release_gate.sh" "$report_dir/post-soak-release-selftest-fail.md" >/dev/null 2>&1; then
+  echo "post-soak gate accepted a failing move/import storage evidence category" >&2
+  exit 1
+fi
+grep -q 'storage certification index | FAIL' "$report_dir/post-soak-release-selftest-fail.md"
+
+echo "storage certification self-test: PASS"

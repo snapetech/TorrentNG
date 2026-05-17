@@ -20,16 +20,16 @@ RUST_TOKEN="${INTEROP_RUST_TOKEN:-interop-token}"
 CURL_MAX_TIME="${INTEROP_CURL_MAX_TIME:-10}"
 EXTENDED_LOCAL="${INTEROP_EXTENDED_LOCAL:-1}"
 
-CLIENTS=(rusttorrentd qbittorrent transmission deluge rtorrent)
+CLIENTS=(torrentngd qbittorrent transmission deluge rtorrent)
 LOCAL_CASES=(
-  "rust-pulls-from-qbit|qbittorrent|rusttorrentd|single-16m"
-  "rust-pulls-from-transmission|transmission|rusttorrentd|single-16m"
-  "rust-pulls-from-deluge|deluge|rusttorrentd|single-16m"
-  "rust-pulls-from-rtorrent|rtorrent|rusttorrentd|single-16m"
-  "qbit-pulls-from-rust|rusttorrentd|qbittorrent|single-16m"
-  "transmission-pulls-from-rust|rusttorrentd|transmission|single-16m"
-  "deluge-pulls-from-rust|rusttorrentd|deluge|single-16m"
-  "rtorrent-pulls-from-rust|rusttorrentd|rtorrent|single-16m"
+  "rust-pulls-from-qbit|qbittorrent|torrentngd|single-16m"
+  "rust-pulls-from-transmission|transmission|torrentngd|single-16m"
+  "rust-pulls-from-deluge|deluge|torrentngd|single-16m"
+  "rust-pulls-from-rtorrent|rtorrent|torrentngd|single-16m"
+  "qbit-pulls-from-rust|torrentngd|qbittorrent|single-16m"
+  "transmission-pulls-from-rust|torrentngd|transmission|single-16m"
+  "deluge-pulls-from-rust|torrentngd|deluge|single-16m"
+  "rtorrent-pulls-from-rust|torrentngd|rtorrent|single-16m"
   "mesh-swarm|all|all|multi-128m"
   "churn|rotating|rotating|churn"
 )
@@ -90,7 +90,7 @@ require_cmd() {
 
 client_url() {
   case "$1" in
-    rusttorrentd) echo "http://127.0.0.1:${INTEROP_RUST_HOST_PORT:-28180}" ;;
+    torrentngd) echo "http://127.0.0.1:${INTEROP_RUST_HOST_PORT:-28180}" ;;
     qbittorrent) echo "http://127.0.0.1:${INTEROP_QBIT_HOST_PORT:-28181}" ;;
     transmission) echo "http://127.0.0.1:${INTEROP_TRANSMISSION_HOST_PORT:-28191}" ;;
     deluge) echo "http://127.0.0.1:${INTEROP_DELUGE_HOST_PORT:-28212}" ;;
@@ -100,7 +100,7 @@ client_url() {
 
 download_dir() {
   case "$1" in
-    rusttorrentd) echo "/downloads/rusttorrentd" ;;
+    torrentngd) echo "/downloads/torrentngd" ;;
     qbittorrent) echo "/downloads/qbittorrent" ;;
     transmission) echo "/downloads/transmission" ;;
     deluge) echo "/downloads/deluge" ;;
@@ -179,12 +179,12 @@ cleanup() {
 capture_artifacts() {
   mkdir -p "$WORKDIR/logs/$STAMP"
   compose ps >"$WORKDIR/logs/$STAMP/compose-ps.txt" 2>&1 || true
-  for service in rusttorrentd qbittorrent transmission deluge rtorrent opentracker fixture-http; do
+  for service in torrentngd qbittorrent transmission deluge rtorrent opentracker fixture-http; do
     compose logs --no-color --tail=250 "$service" >"$WORKDIR/logs/$STAMP/$service.log" 2>&1 || true
   done
-  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/health" >"$WORKDIR/logs/$STAMP/rust-health.json" 2>/dev/null || true
-  curl --max-time "$CURL_MAX_TIME" -fsS "$(client_url rusttorrentd)/metrics" >"$WORKDIR/logs/$STAMP/rust-metrics.txt" 2>/dev/null || true
-  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/v1/torrents" >"$WORKDIR/logs/$STAMP/rust-torrents.json" 2>/dev/null || true
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/health" >"$WORKDIR/logs/$STAMP/rust-health.json" 2>/dev/null || true
+  curl --max-time "$CURL_MAX_TIME" -fsS "$(client_url torrentngd)/metrics" >"$WORKDIR/logs/$STAMP/rust-metrics.txt" 2>/dev/null || true
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/v1/torrents" >"$WORKDIR/logs/$STAMP/rust-torrents.json" 2>/dev/null || true
 }
 
 wait_http() {
@@ -217,7 +217,7 @@ wait_http_status() {
 
 wait_stack() {
   log "waiting for client APIs and ports"
-  wait_http rusttorrentd "$(client_url rusttorrentd)/health" 240
+  wait_http torrentngd "$(client_url torrentngd)/health" 240
   wait_http_status qbittorrent "$(client_url qbittorrent)" '^(200|401|403)$' 240
   wait_http transmission "$(client_url transmission)/transmission/web/" 240
   wait_http deluge "$(client_url deluge)" 240
@@ -349,12 +349,12 @@ qb_force_start() {
 
 add_rust() {
   local torrent="$1" save_path="$2"
-  [[ -r "$torrent" ]] || { log "rusttorrentd torrent file is not readable: $(printf '%q' "$torrent")"; return 1; }
+  [[ -r "$torrent" ]] || { log "torrentngd torrent file is not readable: $(printf '%q' "$torrent")"; return 1; }
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
     -F "torrents=@$torrent" \
     -F "savepath=$save_path" \
     -F "paused=false" \
-    "$(client_url rusttorrentd)/api/qb/v2/torrents/add" >/dev/null
+    "$(client_url torrentngd)/api/qb/v2/torrents/add" >/dev/null
 }
 
 add_rust_url() {
@@ -363,7 +363,7 @@ add_rust_url() {
     -F "urls=$url" \
     -F "savepath=$save_path" \
     -F "paused=false" \
-    "$(client_url rusttorrentd)/api/qb/v2/torrents/add" >/dev/null
+    "$(client_url torrentngd)/api/qb/v2/torrents/add" >/dev/null
 }
 
 transmission_rpc() {
@@ -446,7 +446,7 @@ add_to_client() {
   local client="$1" torrent="$2" add_mode="${3:-leecher}" save_path
   save_path="$(download_dir "$client")"
   case "$client" in
-    rusttorrentd) add_rust "$torrent" "$save_path" ;;
+    torrentngd) add_rust "$torrent" "$save_path" ;;
     qbittorrent) add_qb "$torrent" "$save_path" "$add_mode" ;;
     transmission) add_transmission "$torrent" "$save_path" ;;
     deluge) add_deluge "$torrent" "$save_path" ;;
@@ -459,8 +459,8 @@ client_progress() {
   local client="$1" fixture="${2:-}" name
   name="$(basename "$fixture")"
   case "$client" in
-    rusttorrentd)
-      curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/qb/v2/torrents/info" |
+    torrentngd)
+      curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/qb/v2/torrents/info" |
         jq -r --arg name "$name" '[.[] | select($name == "" or .name == $name) | .progress] | if length == 0 then 0 else min end'
       ;;
     qbittorrent)
@@ -517,15 +517,15 @@ poll_rust_compat() {
   local out="$WORKDIR/artifacts/rust-api-poll-$STAMP.jsonl"
   {
     printf '{"endpoint":"health","ok":'
-    curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/health" >/dev/null && printf 'true}\n' || printf 'false}\n'
+    curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/health" >/dev/null && printf 'true}\n' || printf 'false}\n'
     printf '{"endpoint":"metrics","ok":'
-    curl --max-time "$CURL_MAX_TIME" -fsS "$(client_url rusttorrentd)/metrics" >/dev/null && printf 'true}\n' || printf 'false}\n'
+    curl --max-time "$CURL_MAX_TIME" -fsS "$(client_url torrentngd)/metrics" >/dev/null && printf 'true}\n' || printf 'false}\n'
     printf '{"endpoint":"qbit_info","ok":'
-    curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/qb/v2/torrents/info" >/dev/null && printf 'true}\n' || printf 'false}\n'
+    curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/qb/v2/torrents/info" >/dev/null && printf 'true}\n' || printf 'false}\n'
     printf '{"endpoint":"qbit_sync","ok":'
-    curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/qb/v2/sync/maindata" >/dev/null && printf 'true}\n' || printf 'false}\n'
+    curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/qb/v2/sync/maindata" >/dev/null && printf 'true}\n' || printf 'false}\n'
     printf '{"endpoint":"qbit_transfer","ok":'
-    curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/qb/v2/transfer/info" >/dev/null && printf 'true}\n' || printf 'false}\n'
+    curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/qb/v2/transfer/info" >/dev/null && printf 'true}\n' || printf 'false}\n'
     printf '{"endpoint":"transmission_stats","ok":'
     rust_transmission_rpc '{"method":"session-stats"}' >/dev/null 2>&1 && printf 'true}\n' || printf 'false}\n'
     printf '{"endpoint":"deluge_ui","ok":'
@@ -535,14 +535,14 @@ poll_rust_compat() {
 
 rust_transmission_rpc() {
   local body="$1" url sid
-  url="$(client_url rusttorrentd)/transmission/rpc"
+  url="$(client_url torrentngd)/transmission/rpc"
   sid="$(curl --max-time "$CURL_MAX_TIME" -sS -D - -o /dev/null -H "Authorization: Bearer $RUST_TOKEN" -H "Content-Type: application/json" -d "$body" "$url" | awk 'tolower($0) ~ /^x-transmission-session-id:/ {print $2}' | tr -d '\r')"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" -H "X-Transmission-Session-Id: $sid" -H "Content-Type: application/json" -d "$body" "$url"
 }
 
 rust_deluge_rpc() {
   local body="$1"
-  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" -H "Content-Type: application/json" -d "$body" "$(client_url rusttorrentd)/json"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" -H "Content-Type: application/json" -d "$body" "$(client_url torrentngd)/json"
 }
 
 wait_clients_complete() {
@@ -590,7 +590,7 @@ wait_explicit_peer_complete() {
 }
 
 rust_observed_peers() {
-  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/qb/v2/sync/torrentPeers?hash=$1" |
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/qb/v2/sync/torrentPeers?hash=$1" |
     jq '.peers | length' 2>/dev/null || echo 0
 }
 
@@ -619,7 +619,7 @@ bridge_client_peer_to_rust() {
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
     --data-urlencode "hashes=$info_hash" \
     --data-urlencode "peers=$ip:$port" \
-    "$(client_url rusttorrentd)/api/qb/v2/torrents/addPeers" >/dev/null
+    "$(client_url torrentngd)/api/qb/v2/torrents/addPeers" >/dev/null
 }
 
 wait_public_complete() {
@@ -636,7 +636,7 @@ wait_public_complete() {
     done
     [[ "$all_done" == "1" ]] && return 0
 
-    rust_progress="$(client_progress rusttorrentd "$torrent_name" 2>/dev/null || echo 0)"
+    rust_progress="$(client_progress torrentngd "$torrent_name" 2>/dev/null || echo 0)"
     rust_peers="$(rust_observed_peers "$info_hash")"
     if awk -v p="$rust_progress" 'BEGIN { exit !(p >= 0.999) }' &&
       [[ "${rust_peers:-0}" -ge "$PUBLIC_MIN_RUST_PEERS" ]]; then
@@ -761,9 +761,9 @@ run_churn_case() {
     add_to_client "$leecher" "$torrent" || status="FAIL"
   done
   sleep "${INTEROP_CHURN_SETTLE_SECS:-30}"
-  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/health" >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/health" >/dev/null || status="FAIL"
   local service service_id
-  for service in rusttorrentd qbittorrent transmission deluge rtorrent opentracker fixture-http; do
+  for service in torrentngd qbittorrent transmission deluge rtorrent opentracker fixture-http; do
     service_id="$(compose ps -q "$service")"
     [[ -n "$service_id" ]] && [[ "$(docker inspect -f '{{.State.Running}}' "$service_id")" == "true" ]] || status="FAIL"
   done
@@ -780,11 +780,11 @@ run_webseed_only_case() {
   log "running extended local case rust-webseed-only"
   fixture="$(case_fixture single-16m rust-webseed-only)"
   torrent="$(make_torrent "$fixture" "$fixture" webseed-only)"
-  add_to_client rusttorrentd "$torrent" || status="FAIL"
-  wait_clients_complete "$TIMEOUT_LOCAL" "$fixture" rusttorrentd || status="FAIL"
-  verify_fixture_hashes rusttorrentd "$fixture" || status="FAIL"
+  add_to_client torrentngd "$torrent" || status="FAIL"
+  wait_clients_complete "$TIMEOUT_LOCAL" "$fixture" torrentngd || status="FAIL"
+  verify_fixture_hashes torrentngd "$fixture" || status="FAIL"
   append_report "- Seeder: fixture-http"
-  append_report "- Leecher: rusttorrentd"
+  append_report "- Leecher: torrentngd"
   append_report "- Fixture: single-16m"
   append_report "- Torrent mode: webseed-only"
   append_report "- Status: **$status**"
@@ -802,13 +802,13 @@ run_explicit_peer_case() {
   info_hash="$(torrent_info_hash "$torrent")"
   seed_fixture_for_client transmission "$fixture"
   add_to_client transmission "$torrent" seed || status="FAIL"
-  add_to_client rusttorrentd "$torrent" || status="FAIL"
+  add_to_client torrentngd "$torrent" || status="FAIL"
   bridge_client_peer_to_rust transmission "$info_hash" || status="FAIL"
-  wait_explicit_peer_complete "$TIMEOUT_LOCAL" "$fixture" "$info_hash" transmission transmission rusttorrentd || status="FAIL"
+  wait_explicit_peer_complete "$TIMEOUT_LOCAL" "$fixture" "$info_hash" transmission transmission torrentngd || status="FAIL"
   verify_fixture_hashes transmission "$fixture" || status="FAIL"
-  verify_fixture_hashes rusttorrentd "$fixture" || status="FAIL"
+  verify_fixture_hashes torrentngd "$fixture" || status="FAIL"
   append_report "- Seeder: transmission"
-  append_report "- Leecher: rusttorrentd"
+  append_report "- Leecher: torrentngd"
   append_report "- Fixture: single-16m"
   append_report "- Torrent mode: private explicit peer, no tracker, no webseed"
   append_report "- Info hash: $info_hash"
@@ -827,16 +827,16 @@ run_restart_recovery_case() {
   info_hash="$(torrent_info_hash "$torrent")"
   seed_fixture_for_client transmission "$fixture"
   add_to_client transmission "$torrent" seed || status="FAIL"
-  add_to_client rusttorrentd "$torrent" || status="FAIL"
+  add_to_client torrentngd "$torrent" || status="FAIL"
   bridge_client_peer_to_rust transmission "$info_hash" || true
   sleep "${INTEROP_RESTART_BEFORE_SECS:-5}"
-  compose restart -t 20 rusttorrentd >/dev/null || status="FAIL"
-  wait_http rusttorrentd "$(client_url rusttorrentd)/health" 120 || status="FAIL"
+  compose restart -t 20 torrentngd >/dev/null || status="FAIL"
+  wait_http torrentngd "$(client_url torrentngd)/health" 120 || status="FAIL"
   bridge_client_peer_to_rust transmission "$info_hash" || true
-  wait_explicit_peer_complete "$TIMEOUT_LOCAL" "$fixture" "$info_hash" transmission transmission rusttorrentd || status="FAIL"
-  verify_fixture_hashes rusttorrentd "$fixture" || status="FAIL"
+  wait_explicit_peer_complete "$TIMEOUT_LOCAL" "$fixture" "$info_hash" transmission transmission torrentngd || status="FAIL"
+  verify_fixture_hashes torrentngd "$fixture" || status="FAIL"
   append_report "- Seeder: transmission"
-  append_report "- Leecher: rusttorrentd"
+  append_report "- Leecher: torrentngd"
   append_report "- Fixture: single-64m"
   append_report "- Restart delay: ${INTEROP_RESTART_BEFORE_SECS:-5}s"
   append_report "- Info hash: $info_hash"
@@ -850,17 +850,17 @@ run_rust_api_facade_case() {
   append_report "## Extended Local: rust-api-facades"
   append_report ""
   log "running extended local case rust-api-facades"
-  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/health" |
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/health" |
     jq -e '.ready == true and .status == "ok"' >/dev/null || status="FAIL"
-  curl --max-time "$CURL_MAX_TIME" -fsS "$(client_url rusttorrentd)/metrics" |
+  curl --max-time "$CURL_MAX_TIME" -fsS "$(client_url torrentngd)/metrics" |
     grep -q '^# HELP' || status="FAIL"
-  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/v1/torrents" |
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/v1/torrents" |
     jq -e 'type == "array"' >/dev/null || status="FAIL"
-  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/qb/v2/torrents/info" |
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/qb/v2/torrents/info" |
     jq -e 'type == "array"' >/dev/null || status="FAIL"
-  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/qb/v2/sync/maindata" |
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/qb/v2/sync/maindata" |
     jq -e 'type == "object" and has("torrents")' >/dev/null || status="FAIL"
-  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/qb/v2/transfer/info" |
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/qb/v2/transfer/info" |
     jq -e 'type == "object"' >/dev/null || status="FAIL"
   rust_transmission_rpc '{"method":"session-stats"}' |
     jq -e '.result == "success"' >/dev/null || status="FAIL"
@@ -891,12 +891,12 @@ run_magnet_tracker_case() {
   seed_fixture_for_client qbittorrent "$fixture"
   add_to_client qbittorrent "$torrent" seed || status="FAIL"
   qb_force_start "$info_hash" || status="FAIL"
-  add_rust_url "$magnet" "$(download_dir rusttorrentd)" || status="FAIL"
+  add_rust_url "$magnet" "$(download_dir torrentngd)" || status="FAIL"
   bridge_client_peer_to_rust qbittorrent "$info_hash" || true
-  wait_explicit_peer_complete "$TIMEOUT_LOCAL" "$fixture" "$info_hash" qbittorrent qbittorrent rusttorrentd || status="FAIL"
-  verify_fixture_hashes rusttorrentd "$fixture" || status="FAIL"
+  wait_explicit_peer_complete "$TIMEOUT_LOCAL" "$fixture" "$info_hash" qbittorrent qbittorrent torrentngd || status="FAIL"
+  verify_fixture_hashes torrentngd "$fixture" || status="FAIL"
   append_report "- Seeder: qbittorrent"
-  append_report "- Leecher: rusttorrentd"
+  append_report "- Leecher: torrentngd"
   append_report "- Fixture: single-16m"
   append_report "- Add method: magnet URL with HTTP tracker"
   append_report "- Info hash: $info_hash"
@@ -915,11 +915,11 @@ run_udp_tracker_case() {
   info_hash="$(torrent_info_hash "$torrent")"
   seed_fixture_for_client transmission "$fixture"
   add_to_client transmission "$torrent" seed || status="FAIL"
-  add_to_client rusttorrentd "$torrent" || status="FAIL"
-  wait_clients_complete "$TIMEOUT_LOCAL" "$fixture" transmission rusttorrentd || status="FAIL"
-  verify_fixture_hashes rusttorrentd "$fixture" || status="FAIL"
+  add_to_client torrentngd "$torrent" || status="FAIL"
+  wait_clients_complete "$TIMEOUT_LOCAL" "$fixture" transmission torrentngd || status="FAIL"
+  verify_fixture_hashes torrentngd "$fixture" || status="FAIL"
   append_report "- Seeder: transmission"
-  append_report "- Leecher: rusttorrentd"
+  append_report "- Leecher: torrentngd"
   append_report "- Fixture: single-16m"
   append_report "- Tracker: udp://opentracker:6969/announce"
   append_report "- Info hash: $info_hash"
@@ -938,11 +938,11 @@ run_multi_tracker_fallback_case() {
   info_hash="$(torrent_info_hash "$torrent")"
   seed_fixture_for_client transmission "$fixture"
   add_to_client transmission "$torrent" seed || status="FAIL"
-  add_to_client rusttorrentd "$torrent" || status="FAIL"
-  wait_clients_complete "$TIMEOUT_LOCAL" "$fixture" transmission rusttorrentd || status="FAIL"
-  verify_fixture_hashes rusttorrentd "$fixture" || status="FAIL"
+  add_to_client torrentngd "$torrent" || status="FAIL"
+  wait_clients_complete "$TIMEOUT_LOCAL" "$fixture" transmission torrentngd || status="FAIL"
+  verify_fixture_hashes torrentngd "$fixture" || status="FAIL"
   append_report "- Seeder: transmission"
-  append_report "- Leecher: rusttorrentd"
+  append_report "- Leecher: torrentngd"
   append_report "- Fixture: single-16m"
   append_report "- First tracker: http://127.0.0.1:9/dead-announce"
   append_report "- Fallback tracker: http://opentracker:6969/announce"
@@ -962,22 +962,22 @@ run_partial_file_selection_case() {
   info_hash="$(torrent_info_hash "$torrent")"
   seed_fixture_for_client transmission "$fixture"
   add_to_client transmission "$torrent" seed || status="FAIL"
-  add_to_client rusttorrentd "$torrent" || status="FAIL"
+  add_to_client torrentngd "$torrent" || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
     --data-urlencode "hash=$info_hash" \
     --data-urlencode "id=0" \
     --data-urlencode "priority=0" \
-    "$(client_url rusttorrentd)/api/qb/v2/torrents/filePrio" >/dev/null || status="FAIL"
+    "$(client_url torrentngd)/api/qb/v2/torrents/filePrio" >/dev/null || status="FAIL"
   bridge_client_peer_to_rust transmission "$info_hash" || true
-  wait_explicit_peer_complete "$TIMEOUT_LOCAL" "$fixture" "$info_hash" transmission transmission rusttorrentd || status="FAIL"
-  verify_selected_fixture_hashes rusttorrentd "$fixture" \
+  wait_explicit_peer_complete "$TIMEOUT_LOCAL" "$fixture" "$info_hash" transmission transmission torrentngd || status="FAIL"
+  verify_selected_fixture_hashes torrentngd "$fixture" \
     ./part-1.bin ./part-2.bin ./part-3.bin ./part-4.bin \
     ./part-5.bin ./part-6.bin ./part-7.bin || status="FAIL"
-  verify_fixture_file_absent_or_empty rusttorrentd "$fixture" part-0.bin || status="FAIL"
-  files="$(curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/qb/v2/torrents/files?hash=$info_hash" || true)"
+  verify_fixture_file_absent_or_empty torrentngd "$fixture" part-0.bin || status="FAIL"
+  files="$(curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/qb/v2/torrents/files?hash=$info_hash" || true)"
   jq -e '. | length == 8 and .[0].priority == 0 and .[0].progress == 1 and ([.[1:][] | select(.priority > 0)] | length == 7)' <<<"$files" >/dev/null || status="FAIL"
   append_report "- Seeder: transmission"
-  append_report "- Leecher: rusttorrentd"
+  append_report "- Leecher: torrentngd"
   append_report "- Fixture: multi-128m"
   append_report "- Torrent mode: private explicit peer, file 0 skipped"
   append_report "- Wanted files: part-1.bin through part-7.bin"
@@ -998,33 +998,33 @@ run_qbit_mutation_facade_case() {
   info_hash="$(torrent_info_hash "$torrent")"
   original="http://opentracker:6969/announce"
   replacement="http://opentracker:6969/announce?tng=edited"
-  add_to_client rusttorrentd "$torrent" || status="FAIL"
+  add_to_client torrentngd "$torrent" || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
     --data-urlencode "hash=$info_hash" \
     --data-urlencode "id=0" \
     --data-urlencode "priority=0" \
-    "$(client_url rusttorrentd)/api/qb/v2/torrents/filePrio" >/dev/null || status="FAIL"
+    "$(client_url torrentngd)/api/qb/v2/torrents/filePrio" >/dev/null || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
     --data-urlencode "hashes=$info_hash" \
-    "$(client_url rusttorrentd)/api/qb/v2/torrents/recheck" >/dev/null || status="FAIL"
+    "$(client_url torrentngd)/api/qb/v2/torrents/recheck" >/dev/null || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
     --data-urlencode "hash=$info_hash" \
     --data-urlencode "urls=http://127.0.0.1:9/dead-announce" \
-    "$(client_url rusttorrentd)/api/qb/v2/torrents/addTrackers" >/dev/null || status="FAIL"
+    "$(client_url torrentngd)/api/qb/v2/torrents/addTrackers" >/dev/null || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
     --data-urlencode "hash=$info_hash" \
     --data-urlencode "origUrl=$original" \
     --data-urlencode "newUrl=$replacement" \
-    "$(client_url rusttorrentd)/api/qb/v2/torrents/editTracker" >/dev/null || status="FAIL"
+    "$(client_url torrentngd)/api/qb/v2/torrents/editTracker" >/dev/null || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
     --data-urlencode "hash=$info_hash" \
     --data-urlencode "urls=http://127.0.0.1:9/dead-announce" \
-    "$(client_url rusttorrentd)/api/qb/v2/torrents/removeTrackers" >/dev/null || status="FAIL"
-  trackers="$(curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/qb/v2/torrents/trackers?hash=$info_hash" || true)"
+    "$(client_url torrentngd)/api/qb/v2/torrents/removeTrackers" >/dev/null || status="FAIL"
+  trackers="$(curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/qb/v2/torrents/trackers?hash=$info_hash" || true)"
   jq -e --arg replacement "$replacement" '[.[].url] | index($replacement) != null' <<<"$trackers" >/dev/null || status="FAIL"
-  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/qb/v2/torrents/files?hash=$info_hash" |
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/qb/v2/torrents/files?hash=$info_hash" |
     jq -e 'type == "array" and length >= 1 and .[0].priority == 0' >/dev/null || status="FAIL"
-  append_report "- Target: rusttorrentd qBittorrent-compatible mutation endpoints"
+  append_report "- Target: torrentngd qBittorrent-compatible mutation endpoints"
   append_report "- Checked: filePrio, recheck, addTrackers, editTracker, removeTrackers, trackers, files"
   append_report "- Fixture: multi-128m"
   append_report "- Info hash: $info_hash"
@@ -1109,8 +1109,8 @@ add_public_to_client() {
   local client="$1" url="$2" torrent_file="${3:-}" save_path
   save_path="$(download_dir "$client")/public"
   case "$client" in
-    rusttorrentd)
-      curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" -F "urls=$url" -F "savepath=$save_path" "$(client_url rusttorrentd)/api/qb/v2/torrents/add" >/dev/null
+    torrentngd)
+      curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" -F "urls=$url" -F "savepath=$save_path" "$(client_url torrentngd)/api/qb/v2/torrents/add" >/dev/null
       ;;
     qbittorrent)
       qb_login
@@ -1184,7 +1184,7 @@ bridge_public_reference_peers_to_rust() {
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
     --data-urlencode "hashes=$info_hash" \
     --data-urlencode "peers=$peers" \
-    "$(client_url rusttorrentd)/api/qb/v2/torrents/addPeers" >/dev/null
+    "$(client_url torrentngd)/api/qb/v2/torrents/addPeers" >/dev/null
   append_report "- Docker reference peers bridged to Rust: $peers"
 }
 

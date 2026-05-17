@@ -1,5 +1,5 @@
 [package]
-name = "rusttorrentd"
+name = "torrentngd"
 description = "TorrentNG: native Rust BitTorrent daemon with compatibility API facades"
 version.workspace = true
 edition.workspace = true
@@ -7,7 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "rusttorrentd"
+name = "torrentngd"
 path = "src/main.rs"
 
 [dependencies]

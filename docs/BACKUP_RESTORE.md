@@ -6,7 +6,7 @@ metainfo, fastresume state, config, and operator-owned certification artifacts.
 ## What To Back Up
 
 - Native `config.toml` and any environment file that provides
-  `RUSTTORRENTD_CONFIG`, API tokens, storage roots, and listen ports.
+  `TORRENTNGD_CONFIG`, API tokens, storage roots, and listen ports.
 - The native session directory containing `torrentng.db`, stored `.torrent`
   blobs, fastresume state, and job/event state.
 - Storage-root metadata if deployed separately from payload files.
@@ -30,10 +30,10 @@ cp /config/config.toml /backup/config.toml
 
 ## Restore
 
-1. Stop `rusttorrentd`.
+1. Stop `torrentngd`.
 2. Move the current session directory aside.
 3. Restore `torrentng.db`, torrent blobs, fastresume state, and config.
-4. Start `rusttorrentd`.
+4. Start `torrentngd`.
 5. Check `/health`, `/api/v1/torrents`, and the qBit compatibility list.
 6. Run targeted rechecks only for torrents whose payload paths changed.
 
@@ -45,7 +45,7 @@ directory unchanged until the native engine has seeded successfully.
 
 If import output is wrong:
 
-1. Stop `rusttorrentd`.
+1. Stop `torrentngd`.
 2. Restore the pre-import native DB backup.
 3. Adjust path/category/tag remaps or source staging files.
 4. Re-run dry-run import and compare the markdown report before applying.

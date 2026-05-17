@@ -89,6 +89,9 @@ Implemented and covered by automated tests:
   durability, peer-read readahead/cache, and elevator budget.
 - `scripts/storage_uring_graduation.sh` records real-device `pread` vs
   `uring` stream throughput and optional graduation thresholds.
+- `scripts/storage_certification_index.sh` keeps hardware, `io_uring`, and
+  move/import evidence as separate indexed categories, and
+  `scripts/post_soak_release_gate.sh` requires all three categories to pass.
 - Scheduler read returns can keep frame ownership through `scheduled_read_owned`
   or consume frames into compatibility `Bytes` without copying payload bytes.
 - Current real-device storage evidence includes local NVMe/SSD and the kspls0
@@ -103,7 +106,7 @@ Implemented and covered by automated tests:
 | --- | --- | --- | --- |
 | Deterministic LVM PV placement control | The kspls0 extent probe shows the pool can allocate independent files on multiple rotational PVs, but ordinary path writes still do not let TorrentNG choose a specific PV. | Cross-PV behavior inside the LVM pool is allocator-dependent, so path-level scheduling cannot promise physical-drive affinity. | Use LVM extent mapping for evidence, or add lower-level PV-targeted probes only if release claims require deterministic per-drive placement. |
 | `io_uring` frame-pool slot pinning | `UringBackend` uses worker-owned fixed buffers when available and now exports `fixed_buffer_strategy=worker_copy`; the global frame pool does not yet hand out stable registered buffer slots. | Extra copies remain in the uring path, but metrics distinguish kernel fixed-buffer support from true application-frame zero-copy, and roadmap certification no longer treats worker-copy reports as final graduation. | Run `scripts/storage_uring_graduation.sh /target/root` with selected-backend, fixed-buffer, registered-file, throughput thresholds, and `TNG_STORAGE_URING_REQUIRE_FRAME_POOL_SLOTS=1` for the final gate. Add frame-pool slot leases through the backend API only after those reports prove `uring` should graduate from explicit opt-in. |
-| Move/import certification | The certification runner now supports real-root fixture execution, but representative multi-TB operator evidence is still host/run dependent. | Large library move/import claims should not be made from unit tests alone. | Run `TNG_STORAGE_MOVE_IMPORT_ROOT=/target/root TNG_STORAGE_MOVE_IMPORT_FILES=... TNG_STORAGE_MOVE_IMPORT_MIB_PER_FILE=... scripts/storage_move_import_certification.sh` on the target storage roots and publish the generated report. |
+| Move/import certification | The certification runner now supports real-root fixture execution and indexed PASS/FAIL evidence, but representative multi-TB operator evidence is still host/run dependent. | Large library move/import claims should not be made from unit tests alone. | Run `TNG_STORAGE_MOVE_IMPORT_ROOT=/target/root TNG_STORAGE_MOVE_IMPORT_FILES=... TNG_STORAGE_MOVE_IMPORT_MIB_PER_FILE=... scripts/storage_move_import_certification.sh` on the target storage roots and publish the generated report. |
 
 ## Verification Commands
 

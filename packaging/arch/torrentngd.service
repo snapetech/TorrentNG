@@ -6,16 +6,16 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=rusttorrentd
-Group=rusttorrentd
-Environment=RUSTTORRENTD_CONFIG=/etc/rusttorrentd/config.toml
+User=torrentngd
+Group=torrentngd
+Environment=TORRENTNGD_CONFIG=/etc/torrentngd/config.toml
 Environment=RUST_LOG=info
-ExecStart=/usr/bin/rusttorrentd
+ExecStart=/usr/bin/torrentngd
 Restart=on-failure
 RestartSec=5s
-StateDirectory=rusttorrentd
-ConfigurationDirectory=rusttorrentd
-ReadWritePaths=/var/lib/rusttorrentd /data
+StateDirectory=torrentngd
+ConfigurationDirectory=torrentngd
+ReadWritePaths=/var/lib/torrentngd /data
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

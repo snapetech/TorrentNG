@@ -43,7 +43,7 @@ scripts/security_review.sh deploy/native/config.toml
 ```
 
 Sidecar configs must provide a non-example `secret_key`. Native
-`rusttorrentd` configs do not use a session secret, so the same script records
+`torrentngd` configs do not use a session secret, so the same script records
 that check as not applicable and still enforces API-token review.
 
 ## Release Checklist

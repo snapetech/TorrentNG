@@ -67,7 +67,7 @@ crates/
   rt-config/          — TOML config, env override, validation
   rt-migrate/         — import from rTorrent / qBit / Transmission / Deluge / uTorrent / BiglyBT / Tixati / generic libraries
   rt-testkit/         — test fixtures, synthetic torrent generators, interop helpers
-  rusttorrentd/       — binary: wires all modules, signal handling, startup
+  torrentngd/       — binary: wires all modules, signal handling, startup
 ```
 
 ---
@@ -416,15 +416,15 @@ Every significant event is a structured JSON log line with consistent fields:
 ### Prometheus metrics
 
 ```
-rusttorrent_torrents_total{state}
-rusttorrent_peers_connected
-rusttorrent_tracker_announces_total{result}
-rusttorrent_disk_queue_depth{mount}
-rusttorrent_disk_bytes_total{direction, mount}
-rusttorrent_recheck_bytes_total
-rusttorrent_api_request_duration_seconds{endpoint, method}
-rusttorrent_event_lag_seconds
-rusttorrent_job_queue_depth{type}
+torrentng_torrents_total{state}
+torrentng_peers_connected
+torrentng_tracker_announces_total{result}
+torrentng_disk_queue_depth{mount}
+torrentng_disk_bytes_total{direction, mount}
+torrentng_recheck_bytes_total
+torrentng_api_request_duration_seconds{endpoint, method}
+torrentng_event_lag_seconds
+torrentng_job_queue_depth{type}
 ```
 
 ### Diagnostics API

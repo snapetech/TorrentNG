@@ -17,7 +17,7 @@ permissions:
 jobs:
   release:
     name: Build and publish release
-    runs-on: [self-hosted, Linux, X64, rtorrentng]
+    runs-on: [self-hosted, Linux, X64]
 
     steps:
       - name: Checkout
@@ -74,17 +74,17 @@ jobs:
 
       - name: Build Docker images
         run: |
-          docker build -f deploy/docker/Dockerfile -t rtorrentng:${{ steps.tag.outputs.tag }} .
-          docker build -f deploy/docker/Dockerfile.phase1 -t rtorrentng-phase1:${{ steps.tag.outputs.tag }} .
+          docker build -f deploy/docker/Dockerfile -t torrentng:${{ steps.tag.outputs.tag }} .
+          docker build -f deploy/docker/Dockerfile.phase1 -t torrentng-phase1:${{ steps.tag.outputs.tag }} .
 
       - name: Package release artifacts
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
-          cp sidecar/target/release/rtorrentng "dist/rtorrentng-linux-x86_64"
-          tar -czf "dist/rtorrentng-webui-${{ steps.tag.outputs.tag }}.tar.gz" -C sidecar/static .
-          tar -czf "dist/rtorrentng-deploy-${{ steps.tag.outputs.tag }}.tar.gz" deploy docs README.md LICENSE
+          cp sidecar/target/release/torrentng "dist/torrentng-linux-x86_64"
+          tar -czf "dist/torrentng-webui-${{ steps.tag.outputs.tag }}.tar.gz" -C sidecar/static .
+          tar -czf "dist/torrentng-deploy-${{ steps.tag.outputs.tag }}.tar.gz" deploy docs README.md LICENSE
           sha256sum dist/* > "dist/SHA256SUMS-${{ steps.tag.outputs.tag }}.txt"
 
       - name: Create GitHub release
@@ -98,7 +98,7 @@ jobs:
             gh release upload "$tag" dist/* --clobber
           else
             gh release create "$tag" dist/* \
-              --title "rtorrentNG $tag" \
+              --title "TorrentNG $tag" \
               --generate-notes \
               --verify-tag
           fi
@@ -129,9 +129,9 @@ jobs:
             --arg url "$RELEASE_URL" \
             --arg repo "$GITHUB_REPOSITORY" \
             '{
-              username: "rtorrentNG releases",
+              username: "TorrentNG releases",
               embeds: [{
-                title: ("rtorrentNG " + $tag + " released"),
+                title: ("TorrentNG " + $tag + " released"),
                 url: $url,
                 description: ("A new tagged release is available for `" + $repo + "`."),
                 color: 3447003,

@@ -387,7 +387,7 @@ These compatibility endpoints are present so qBittorrent clients can probe them 
 
 Exposed at `GET /metrics` in Prometheus text format:
 
-Native mode exposes engine/session/API metrics from `rusttorrentd`. Track 1
+Native mode exposes engine/session/API metrics from `torrentngd`. Track 1
 sidecar mode additionally exposes rTorrent sync-loop counters because it polls
 rTorrent over XMLRPC.
 

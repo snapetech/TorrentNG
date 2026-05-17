@@ -1,28 +1,28 @@
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: rusttorrentd
+  name: torrentngd
   namespace: torrentng
 spec:
-  serviceName: rusttorrentd
+  serviceName: torrentngd
   replicas: 1
   selector:
     matchLabels:
-      app.kubernetes.io/name: rusttorrentd
+      app.kubernetes.io/name: torrentngd
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: rusttorrentd
+        app.kubernetes.io/name: torrentngd
     spec:
       securityContext:
         fsGroup: 1000
       containers:
-        - name: rusttorrentd
-          image: torrentng/rusttorrentd:local
+        - name: torrentngd
+          image: torrentng/torrentngd:local
           imagePullPolicy: IfNotPresent
           env:
-            - name: RUSTTORRENTD_CONFIG
-              value: /etc/rusttorrentd/config.toml
+            - name: TORRENTNGD_CONFIG
+              value: /etc/torrentngd/config.toml
             - name: RUST_LOG
               value: info
           ports:
@@ -48,16 +48,16 @@ spec:
             periodSeconds: 20
           volumeMounts:
             - name: config
-              mountPath: /etc/rusttorrentd
+              mountPath: /etc/torrentngd
               readOnly: true
             - name: state
-              mountPath: /var/lib/rusttorrentd
+              mountPath: /var/lib/torrentngd
             - name: downloads
               mountPath: /data
       volumes:
         - name: config
           secret:
-            name: rusttorrentd-config
+            name: torrentngd-config
   volumeClaimTemplates:
     - metadata:
         name: state

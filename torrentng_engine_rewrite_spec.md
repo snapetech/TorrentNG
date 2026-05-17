@@ -1,4 +1,4 @@
-# RustTorrent Engine Rewrite Spec
+# TorrentNG Engine Rewrite Spec
 
 Date: 2026-05-15
 Target audience: implementation agents, including weaker/free coding models
@@ -79,7 +79,7 @@ Do not optimize early architecture around streaming or casual desktop usage.
 Initial product is one daemon process:
 
 ```text
-rusttorrentd
+torrentngd
 ├── native API server
 ├── qBittorrent compatibility API
 ├── optional Transmission compatibility API
@@ -128,7 +128,7 @@ Recommended runtime primitives:
 ### 2.3 Repository Layout
 
 ```text
-rusttorrent/
+torrentng/
 ├── Cargo.toml
 ├── crates/
 │   ├── rt-bencode/
@@ -155,7 +155,7 @@ rusttorrent/
 │   ├── rt-config/
 │   ├── rt-migrate/
 │   ├── rt-testkit/
-│   └── rusttorrentd/
+│   └── torrentngd/
 ├── web/
 ├── docs/
 ├── deploy/
@@ -1104,10 +1104,10 @@ Run against:
 
 Test:
 
-- RustTorrent seeds, qBit downloads
-- qBit seeds, RustTorrent downloads
-- RustTorrent announces to fake tracker correctly
-- RustTorrent qBit API works with mocked *arr calls
+- TorrentNG seeds, qBit downloads
+- qBit seeds, TorrentNG downloads
+- TorrentNG announces to fake tracker correctly
+- TorrentNG qBit API works with mocked *arr calls
 
 ### 6.3 Fuzz Targets
 
@@ -1322,7 +1322,7 @@ Crates:
 
 - rt-db
 - rt-session
-- rusttorrentd
+- torrentngd
 
 Acceptance:
 
@@ -1419,7 +1419,7 @@ Acceptance:
 ### 10.1 Standard Implementation Prompt
 
 ```text
-You are implementing one isolated crate in the RustTorrent workspace.
+You are implementing one isolated crate in the TorrentNG workspace.
 
 Before coding:
 1. Read the crate README.
@@ -1449,7 +1449,7 @@ Stop and report if:
 ### 10.2 Bug Fix Prompt
 
 ```text
-You are fixing a bug in RustTorrent.
+You are fixing a bug in TorrentNG.
 
 Rules:
 1. First add a failing test that reproduces the bug.

@@ -214,7 +214,7 @@ Exit criteria: seed a complete torrent to another client, seed multi-file torren
 ## Track 2 — Phase 5: Session daemon
 
 Build:
-- `rusttorrentd` binary
+- `torrentngd` binary
 - SQLite session DB with migrations
 - Torrent lifecycle supervisor
 - Append-only event log

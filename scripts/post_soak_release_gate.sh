@@ -82,11 +82,30 @@ storage_index_gate() {
     mark "storage certification index" "MISSING" "$detail"
     return
   fi
-  if grep -qE '\| \[[^]]+\]\([^)]*\) \| [^|]+ \| [^|]+ \| [^|]+ \| [^|]+ \| [^|]+ \| PASS \|' "$file"; then
-    mark "storage certification index" "PASS" "$detail; contains passing storage evidence"
+  if storage_index_has "$file" 'hardware matrix' 'PASS' &&
+    storage_index_has "$file" 'io_uring capability/graduation' 'PASS' &&
+    storage_index_has "$file" 'move/import' 'PASS'; then
+    mark "storage certification index" "PASS" "$detail; hardware, io_uring, and move/import evidence present"
   else
-    mark "storage certification index" "FAIL" "$detail; no passing storage evidence rows found"
+    mark "storage certification index" "FAIL" "$detail; requires PASS rows for hardware matrix, io_uring capability/graduation, and move/import"
   fi
+}
+
+storage_index_has() {
+  local file="$1"
+  local kind="$2"
+  local result="$3"
+  awk -F'|' -v kind="$kind" -v result="$result" '
+    NR <= 2 { next }
+    {
+      for (i = 1; i <= NF; i++) {
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", $i)
+      }
+      if ($3 == kind && $NF == "" && $(NF - 1) == result) found = 1
+      else if ($3 == kind && $NF == result) found = 1
+    }
+    END { exit found ? 0 : 1 }
+  ' "$file"
 }
 
 certification_status_gate() {

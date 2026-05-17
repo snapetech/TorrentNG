@@ -22,11 +22,49 @@ field_from_report() {
   sed -n "s/^- ${field}: //p" "$report" | head -1
 }
 
+uring_field_from_report() {
+  local field="$1"
+  local report="$2"
+  sed -n "s/^- ${field}: //p" "$report" | tail -1
+}
+
+real_root_evidence_for_report() {
+  local report="$1"
+  case "$(basename "$report")" in
+    storage-move-import-*)
+      if grep -qE 'tng_storage_move_import .*root_confined=1' "$report"; then
+        printf 'yes'
+      else
+        printf 'no'
+      fi
+      ;;
+    *)
+      printf 'n/a'
+      ;;
+  esac
+}
+
+selected_backend_for_report() {
+  local report="$1"
+  case "$(basename "$report")" in
+    storage-uring-graduation-*) uring_field_from_report Selected "$report" ;;
+    *) printf 'n/a' ;;
+  esac
+}
+
+fixed_buffer_strategy_for_report() {
+  local report="$1"
+  case "$(basename "$report")" in
+    storage-uring-graduation-*) uring_field_from_report 'Fixed-buffer strategy' "$report" ;;
+    *) printf 'n/a' ;;
+  esac
+}
+
 result_for_report() {
   local report="$1"
-  if grep -qE 'Result: FAIL|\|[^|]+\| FAIL \|' "$report"; then
+  if grep -qE 'Overall status: FAIL|Result: FAIL|\|[^|]+\| FAIL \|' "$report"; then
     printf 'FAIL'
-  elif grep -qE 'Result: PASS|\|[^|]+\| PASS \|' "$report"; then
+  elif grep -qE 'Overall status: PASS|Result: PASS|\|[^|]+\| PASS \|' "$report"; then
     printf 'PASS'
   elif grep -qE '\|[^|]+\| SKIP' "$report"; then
     printf 'SKIP'
@@ -42,8 +80,8 @@ result_for_report() {
   echo "- Commit: $(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
   echo "- Report directory: $REPORT_DIR"
   echo
-  echo "| Report | Kind | Generated | Host | Commit | Target | Result |"
-  echo "| --- | --- | --- | --- | --- | --- | --- |"
+  echo "| Report | Kind | Generated | Host | Commit | Target | Selected backend | Fixed-buffer strategy | Real-root evidence | Result |"
+  echo "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
   shopt -s nullglob
   reports=("$REPORT_DIR"/storage-hardware-*.md "$REPORT_DIR"/storage-uring-graduation-*.md "$REPORT_DIR"/storage-move-import-*.md)
   if [[ "${#reports[@]}" -eq 0 ]]; then
@@ -58,7 +96,7 @@ result_for_report() {
       if [[ -z "$target" ]]; then
         target="$(field_from_report 'Hardware root' "$report")"
       fi
-      printf '| [%s](../../%s) | %s | %s | %s | %s | %s | %s |\n' \
+      printf '| [%s](../../%s) | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n' \
         "$(basename "$report")" \
         "$rel" \
         "$(kind_for_report "$report")" \
@@ -66,6 +104,9 @@ result_for_report() {
         "${host:-unknown}" \
         "${commit:-unknown}" \
         "${target:-multiple/see report}" \
+        "$(selected_backend_for_report "$report")" \
+        "$(fixed_buffer_strategy_for_report "$report")" \
+        "$(real_root_evidence_for_report "$report")" \
         "$(result_for_report "$report")"
     done
   fi

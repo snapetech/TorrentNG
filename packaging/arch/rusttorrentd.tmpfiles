@@ -1,2 +1,0 @@
-d /var/lib/rusttorrentd 0750 rusttorrentd rusttorrentd -
-d /data 0750 rusttorrentd rusttorrentd -

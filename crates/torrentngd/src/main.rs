@@ -34,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
         version = env!("CARGO_PKG_VERSION"),
         api_bind = %config.daemon.api_bind,
         listen_port = config.network.listen_port,
-        "rusttorrentd starting"
+        "torrentngd starting"
     );
 
     // Ensure session directory exists
@@ -231,7 +231,7 @@ mod tests {
 
 fn load_config() -> Config {
     // Allow explicit path via env var
-    if let Ok(path) = std::env::var("RUSTTORRENTD_CONFIG") {
+    if let Ok(path) = std::env::var("TORRENTNGD_CONFIG") {
         match Config::load(std::path::Path::new(&path)) {
             Ok(c) => return c,
             Err(e) => eprintln!("config error: {e}"),

@@ -1,7 +1,7 @@
 # Docker Interop Matrix
 
 The Docker interop matrix is the release certification harness for proving that
-`rusttorrentd` works with common BitTorrent clients and with real legal public
+`torrentngd` works with common BitTorrent clients and with real legal public
 swarms. It runs the native daemon beside qBittorrent, Transmission, Deluge,
 rTorrent, opentracker, and a fixture HTTP server.
 
@@ -62,7 +62,7 @@ scripts/interop_matrix.sh --local --report certification/reports/interop-local.m
 ```
 
 The script builds and starts the interop Compose stack by default. Use
-`INTEROP_SKIP_BUILD=1` when the `torrentng/rusttorrentd:interop` image is
+`INTEROP_SKIP_BUILD=1` when the `torrentng/torrentngd:interop` image is
 already current.
 
 ```sh

@@ -22,6 +22,7 @@ run_gate "owned-read adoption guard" bash -c '
   fi
 '
 run_gate "storage unit matrix" cargo test -p rt-storage
+run_gate "storage certification script self-test" "$ROOT/scripts/storage_certification_selftest.sh"
 run_gate "resource governor and scale proxies" cargo test -p rt-metrics
 run_gate "configuration defaults" cargo test -p rt-config
 run_gate "engine storage/resource consumers" cargo test -p rt-engine

@@ -1,14 +1,14 @@
 # rt-config
 
-TOML config loading and validation for the native `rusttorrentd` daemon.
+TOML config loading and validation for the native `torrentngd` daemon.
 
 ## Status: Implemented — native engine support
 
-`rusttorrentd` loads the first existing config path in this order:
+`torrentngd` loads the first existing config path in this order:
 
-1. `RUSTTORRENTD_CONFIG`
-2. `~/.config/rusttorrentd/config.toml`
-3. `/etc/rusttorrentd/config.toml`
+1. `TORRENTNGD_CONFIG`
+2. `~/.config/torrentngd/config.toml`
+3. `/etc/torrentngd/config.toml`
 
 The config owns native daemon, network, storage, tracker, DHT, database, and
 auth settings. Track 1 sidecar config is separate and remains under

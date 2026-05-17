@@ -7,7 +7,7 @@ compatibility for torrent operators who need to import, export, automate,
 interoperate, and eventually replace existing clients without rebuilding their
 workflow around one historical API.
 
-- **Native engine mode:** `rusttorrentd` is the source of truth. It owns torrent
+- **Native engine mode:** `torrentngd` is the source of truth. It owns torrent
   state, SQLite session persistence, tracker state, peer wire tasks, storage,
   rechecks, jobs, metrics, native REST/SSE, and compatibility API projections.
 - **Track 1 sidecar mode:** `sidecar/torrentng` remains available for existing
@@ -17,7 +17,7 @@ workflow around one historical API.
 
 The native engine supersedes the wrapper/harness path for production native
 mode. The wrapper remains useful as a migration bridge and rTorrent facade, not
-as a required dependency of `rusttorrentd`.
+as a required dependency of `torrentngd`.
 
 The compatibility promise is implemented as a set of explicit surfaces rather
 than an unchecked marketing claim: native REST/SSE, qBittorrent Web API shapes,
@@ -43,7 +43,7 @@ native rewrite and the rTorrent core for testing, see
 └────────────────────────┬────────────────────────────────┘
                          │ Native REST + SSE
 ┌────────────────────────▼────────────────────────────────┐
-│                rusttorrentd native daemon                │
+│                torrentngd native daemon                │
 │                                                          │
 │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌─────────────┐ │
 │  │ Native   │ │ Compat   │ │ Session  │ │ Jobs/events │ │
@@ -70,7 +70,7 @@ sidecar/torrentng ── trusted XMLRPC over local SCGI ── rTorrent
 ## Native Engine
 
 **Location:** `crates/`
-**Binary:** `crates/rusttorrentd`
+**Binary:** `crates/torrentngd`
 
 The native daemon wires the engine crates into one process. SQLite-backed
 engine state is the source of truth for torrent rows, file metadata, trackers,
@@ -179,7 +179,7 @@ dry-run previews, storage/tracker views, saved views, and diagnostic actions.
 
 **Location:** `deploy/`
 
-Native deployments run `rusttorrentd` with durable DB/metadata paths and storage
+Native deployments run `torrentngd` with durable DB/metadata paths and storage
 roots. Sidecar deployments run the Phase 1 rTorrent bundle or host rTorrent plus
 `sidecar/torrentng`.
 

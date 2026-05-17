@@ -11,7 +11,7 @@ drop-in replacement for the torrent clients and APIs operators already use.
 
 | Mode | Process | BitTorrent engine | Best for |
 |---|---|---|---|
-| Native rewrite | `rusttorrentd` | TorrentNG Rust crates | Testing and developing the new engine, native deployments, storage/recheck/job work |
+| Native rewrite | `torrentngd` | TorrentNG Rust crates | Testing and developing the new engine, native deployments, storage/recheck/job work |
 | rTorrent core | `rTorrent` + `torrentng` sidecar | Upstream rTorrent/libtorrent | Compatibility comparison, migration bridge, existing rTorrent users |
 
 The WebUI and compatibility APIs are shared goals, but the source of truth is
@@ -42,7 +42,7 @@ one source of truth instead of binding TorrentNG to one legacy engine.
 
 ## Native Engine Shape
 
-`rusttorrentd` wires the native crates into one daemon:
+`torrentngd` wires the native crates into one daemon:
 
 ```text
 WebUI / automation clients
@@ -119,10 +119,10 @@ Default endpoints:
 Local binary flow:
 
 ```sh
-cargo build --bin rusttorrentd
-cp deploy/native/config.toml /tmp/rusttorrentd.config.toml
-$EDITOR /tmp/rusttorrentd.config.toml
-RUSTTORRENTD_CONFIG=/tmp/rusttorrentd.config.toml target/debug/rusttorrentd
+cargo build --bin torrentngd
+cp deploy/native/config.toml /tmp/torrentngd.config.toml
+$EDITOR /tmp/torrentngd.config.toml
+TORRENTNGD_CONFIG=/tmp/torrentngd.config.toml target/debug/torrentngd
 ```
 
 For local binary runs, change `session_dir`, `[db].path`, and
@@ -173,7 +173,7 @@ settings, and SCGI socket behavior.
 
 | Area | Native rewrite | rTorrent core |
 |---|---|---|
-| Source of truth | `rusttorrentd` SQLite state and metadata store | rTorrent session directory and libtorrent runtime |
+| Source of truth | `torrentngd` SQLite state and metadata store | rTorrent session directory and libtorrent runtime |
 | Control plane | Native REST/SSE plus compat APIs over engine state | Sidecar REST/WebUI/compat APIs over XMLRPC cache |
 | Peer traffic | Native Rust peer wire tasks | rTorrent/libtorrent |
 | Tracker state | Native tracker manager with persisted announce state | rTorrent tracker stack reflected through XMLRPC |
@@ -198,7 +198,7 @@ For a controlled comparison:
 5. Compare completion state, tracker messages, peer counts, file verification,
    API response shape, and restart recovery.
 
-The interop matrix automates much of this across `rusttorrentd`, qBittorrent,
+The interop matrix automates much of this across `torrentngd`, qBittorrent,
 Transmission, Deluge, and rTorrent:
 
 ```sh
@@ -213,7 +213,7 @@ reports and logs under the configured certification work directory.
 Do not treat engine swapping as an in-place state file conversion. Use import
 and verification:
 
-- Back up the rTorrent session directory and native `rusttorrentd` session DB.
+- Back up the rTorrent session directory and native `torrentngd` session DB.
 - Import existing rTorrent state through the migration flow in
   [MIGRATION.md](MIGRATION.md).
 - Point native mode at existing payload paths only when you intend to verify and
