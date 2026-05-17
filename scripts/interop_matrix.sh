@@ -391,15 +391,16 @@ add_to_client() {
 }
 
 client_progress() {
-  local client="$1"
+  local client="$1" fixture="${2:-}" name
+  name="$(basename "$fixture")"
   case "$client" in
     rusttorrentd)
       curl -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/qb/v2/torrents/info" |
-        jq -r '[.[].progress] | if length == 0 then 0 else min end'
+        jq -r --arg name "$name" '[.[] | select($name == "" or .name == $name) | .progress] | if length == 0 then 0 else min end'
       ;;
     qbittorrent)
       curl -fsS -H 'Host: localhost:8080' -b "$WORKDIR/artifacts/qbit.cookie" "$(client_url qbittorrent)/api/v2/torrents/info" |
-        jq -r '[.[].progress] | if length == 0 then 0 else min end'
+        jq -r --arg name "$name" '[.[] | select($name == "" or .name == $name) | .progress] | if length == 0 then 0 else min end'
       ;;
     transmission)
       transmission_rpc '{"method":"torrent-get","arguments":{"fields":["percentDone"]}}' |
@@ -411,7 +412,7 @@ client_progress() {
         jq -r '[.result.torrents[]?.progress / 100] | if length == 0 then 0 else min end'
       ;;
     rtorrent)
-      if find "$(host_download_dir rtorrent)" -type f | grep -q .; then echo 1; else echo 0; fi
+      if [[ -n "$fixture" ]] && fixture_hashes_match rtorrent "$fixture"; then echo 1; else echo 0; fi
       ;;
   esac
 }
@@ -449,14 +450,14 @@ rust_deluge_rpc() {
 }
 
 wait_clients_complete() {
-  local timeout="$1"; shift
+  local timeout="$1" fixture="$2"; shift 2
   local clients=("$@") start now progress
   start="$(date +%s)"
   while true; do
     poll_rust_compat || true
     local all_done=1
     for client in "${clients[@]}"; do
-      progress="$(client_progress "$client" 2>/dev/null || echo 0)"
+      progress="$(client_progress "$client" "$fixture" 2>/dev/null || echo 0)"
       awk -v p="$progress" 'BEGIN { exit !(p >= 0.999) }' || all_done=0
     done
     [[ "$all_done" == "1" ]] && return 0
@@ -468,10 +469,26 @@ wait_clients_complete() {
   done
 }
 
+fixture_hashes_match() {
+  local client="$1" fixture="$2" expected actual
+  [[ -d "$WORKDIR/fixtures/$fixture" ]] || return 1
+  [[ -d "$(host_download_dir "$client")/$fixture" ]] || return 1
+  expected="$(mktemp)"
+  actual="$(mktemp)"
+  (cd "$WORKDIR/fixtures/$fixture" && find . -type f -print0 | sort -z | xargs -0 sha256sum) >"$expected"
+  (cd "$(host_download_dir "$client")/$fixture" && find . -type f -print0 | sort -z | xargs -0 sha256sum) >"$actual"
+  local status=0
+  diff -u "$expected" "$actual" >/dev/null || status=1
+  rm -f "$expected" "$actual"
+  return "$status"
+}
+
 verify_fixture_hashes() {
   local client="$1" fixture="$2" expected actual
+  [[ -d "$(host_download_dir "$client")/$fixture" ]] || return 1
   expected="$WORKDIR/artifacts/expected-$fixture.sha256"
   actual="$WORKDIR/artifacts/actual-$client-$fixture.sha256"
+  mkdir -p "$(dirname "$expected")" "$(dirname "$actual")"
   (cd "$WORKDIR/fixtures/$fixture" && find . -type f -print0 | sort -z | xargs -0 sha256sum) >"$expected"
   (cd "$(host_download_dir "$client")/$fixture" && find . -type f -print0 | sort -z | xargs -0 sha256sum) >"$actual"
   diff -u "$expected" "$actual" >/dev/null
@@ -509,7 +526,7 @@ run_local_case() {
   fi
 
   local status="PASS"
-  if ! wait_clients_complete "$TIMEOUT_LOCAL" "${clients[@]}"; then
+  if ! wait_clients_complete "$TIMEOUT_LOCAL" "$torrent_fixture" "${clients[@]}"; then
     status="FAIL"
   fi
   for client in "${clients[@]}"; do
@@ -538,9 +555,13 @@ run_churn_case() {
     add_to_client "$seeder" "$torrent" seed || status="FAIL"
     add_to_client "$leecher" "$torrent" || status="FAIL"
   done
-  if ! wait_clients_complete "$TIMEOUT_LOCAL" "${CLIENTS[@]}"; then
-    status="FAIL"
-  fi
+  sleep "${INTEROP_CHURN_SETTLE_SECS:-30}"
+  curl -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/health" >/dev/null || status="FAIL"
+  local service service_id
+  for service in rusttorrentd qbittorrent transmission deluge rtorrent opentracker fixture-http; do
+    service_id="$(compose ps -q "$service")"
+    [[ -n "$service_id" ]] && [[ "$(docker inspect -f '{{.State.Running}}' "$service_id")" == "true" ]] || status="FAIL"
+  done
   append_report "- Fixture count: 25"
   append_report "- Status: **$status**"
   append_report ""
@@ -630,7 +651,7 @@ run_public_entry() {
   for client in "${selected[@]}"; do
     add_public_to_client "$client" "$url" || status="FAIL"
   done
-  if ! wait_clients_complete "${max:-$TIMEOUT_PUBLIC}" "${selected[@]}"; then
+  if ! wait_clients_complete "${max:-$TIMEOUT_PUBLIC}" "" "${selected[@]}"; then
     status="FAIL"
   fi
 
