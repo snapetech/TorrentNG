@@ -51,7 +51,13 @@ pub async fn run_dht(
         .await
         .with_context(|| format!("binding DHT UDP port {port}"))?;
     let bound = socket.local_addr()?;
-    info!(addr = %bound, node_id = %local_id, "DHT UDP socket bound");
+    info!(
+        component = "dht",
+        operation = "listen",
+        addr = %bound,
+        node_id = %local_id,
+        "DHT UDP socket bound"
+    );
 
     let mut task = DhtTask {
         local_id,
@@ -89,7 +95,13 @@ pub async fn run_dht(
             recv = task.socket.recv_from(&mut buf) => {
                 match recv {
                     Ok((n, addr)) => task.handle_packet(&buf[..n], addr).await,
-                    Err(e) => warn!(err = %e, "DHT UDP receive failed"),
+                    Err(e) => warn!(
+                        component = "dht",
+                        operation = "recv",
+                        result = "error",
+                        error = %e,
+                        "DHT UDP receive failed"
+                    ),
                 }
             }
         }
@@ -135,7 +147,12 @@ impl DhtTask {
                 let _ = reply.send(self.runtime_stats());
             }
             DhtCommand::Shutdown => {
-                info!("DHT task shutting down");
+                info!(
+                    component = "dht",
+                    operation = "shutdown",
+                    result = "ok",
+                    "DHT task shutting down"
+                );
                 return false;
             }
         }
@@ -147,7 +164,14 @@ impl DhtTask {
             let addrs = match tokio::net::lookup_host(&node).await {
                 Ok(addrs) => addrs,
                 Err(e) => {
-                    warn!(node = %node, err = %e, "DHT bootstrap resolve failed");
+                    warn!(
+                        component = "dht",
+                        operation = "bootstrap_resolve",
+                        node = %node,
+                        result = "error",
+                        error = %e,
+                        "DHT bootstrap resolve failed"
+                    );
                     continue;
                 }
             };
@@ -165,7 +189,14 @@ impl DhtTask {
                 };
                 self.outstanding.insert(tx, DhtRequest::Bootstrap);
                 if let Err(e) = self.socket.send_to(&msg.encode(), addr).await {
-                    warn!(node = %addr, err = %e, "DHT bootstrap query send failed");
+                    warn!(
+                        component = "dht",
+                        operation = "bootstrap_query",
+                        node = %addr,
+                        result = "error",
+                        error = %e,
+                        "DHT bootstrap query send failed"
+                    );
                 }
             }
         }
@@ -175,7 +206,14 @@ impl DhtTask {
         let msg = match KrpcMessage::parse(packet) {
             Ok(msg) => msg,
             Err(e) => {
-                debug!(peer = %addr, err = %e, "invalid DHT packet");
+                debug!(
+                    component = "dht",
+                    operation = "parse_packet",
+                    peer = %addr,
+                    result = "error",
+                    error = %e,
+                    "invalid DHT packet"
+                );
                 return;
             }
         };
@@ -254,7 +292,14 @@ impl DhtTask {
             ),
         };
         if let Err(e) = self.socket.send_to(&response.encode(), addr).await {
-            warn!(peer = %addr, err = %e, "DHT response send failed");
+            warn!(
+                component = "dht",
+                operation = "send_response",
+                peer = %addr,
+                result = "error",
+                error = %e,
+                "DHT response send failed"
+            );
         }
     }
 
@@ -412,7 +457,14 @@ impl DhtTask {
         };
         self.outstanding.insert(tx, DhtRequest::GetPeers(info_hash));
         if let Err(e) = self.socket.send_to(&msg.encode(), addr).await {
-            warn!(peer = %addr, err = %e, "DHT get_peers send failed");
+            warn!(
+                component = "dht",
+                operation = "send_get_peers",
+                peer = %addr,
+                result = "error",
+                error = %e,
+                "DHT get_peers send failed"
+            );
         }
     }
 
@@ -425,7 +477,14 @@ impl DhtTask {
         let (tx, msg) = self.announce_peer_query(info_hash, token);
         self.outstanding.insert(tx, DhtRequest::AnnouncePeer);
         if let Err(e) = self.socket.send_to(&msg.encode(), addr).await {
-            warn!(peer = %addr, err = %e, "DHT announce_peer send failed");
+            warn!(
+                component = "dht",
+                operation = "send_announce_peer",
+                peer = %addr,
+                result = "error",
+                error = %e,
+                "DHT announce_peer send failed"
+            );
         }
     }
 
