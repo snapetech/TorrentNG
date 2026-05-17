@@ -118,7 +118,7 @@ fi
 
 if contains "$storage_uring" 'Overall status: PASS' &&
   contains "$storage_uring" 'Selected: uring' &&
-  contains "$storage_uring" 'Fixed-buffer strategy: (worker_copy|frame_pool_slots)' &&
+  contains "$storage_uring" 'Fixed-buffer strategy: frame_pool_slots' &&
   contains "$storage_uring" '\| fixed-buffer strategy[^|]*\| (INFO(: [^|]+)?|PASS) \|'; then
   row "io_uring real-device capability probe" PASS "$(report_link "$storage_uring")"
 else

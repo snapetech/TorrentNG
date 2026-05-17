@@ -105,6 +105,7 @@ gate "Security scan" 'security-scan-*.md'
 gate "Native engine rewrite certification" 'native-engine-*.md'
 gate "Local release gate" 'local-release-*.md'
 gate "Storage hardware matrix" 'storage-hardware-*.md'
+gate "Storage release certification" 'storage-release-certification-*.md'
 
 {
   echo

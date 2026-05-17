@@ -412,7 +412,7 @@ rTorrent over XMLRPC.
 | `torrentng_storage_{read,write}_ops_total` | counter | Positioned disk operations through native schedulers |
 | `torrentng_storage_bytes_{read,written}_total` | counter | Bytes moved through native schedulers |
 | `torrentng_storage_*_by_class_total{class=...}` | counter | Read/write operation and byte counters split by scheduler I/O class |
-| `torrentng_storage_backend_selected{backend=...}` | gauge | Global storage backend selected at runtime (`pread` or future `uring`) |
+| `torrentng_storage_backend_selected{backend=...}` | gauge | Global storage backend selected at runtime (`pread` or explicit `uring`) |
 | `torrentng_storage_backend_fixed_buffers_supported` | gauge | Whether the selected backend can use registered fixed buffers |
 | `torrentng_storage_backend_registered_files_supported` | gauge | Whether the selected backend can use registered file slots |
 | `torrentng_storage_backend_{max_batch_len,fixed_buffer_bytes}` | gauge | Selected backend batching and fixed-buffer sizing |

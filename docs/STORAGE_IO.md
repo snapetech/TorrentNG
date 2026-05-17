@@ -152,9 +152,10 @@ now part of the release surface:
   work, peer-read cache, logical/backend reads, and in-memory piece assembly
   pressure.
 
-## Remaining Work
+## External Release Gates
 
-The following items are still release targets:
+The following items are hardware evidence gates, not missing local storage
+implementation:
 - Keep `io_uring` explicit opt-in until real-device reports show the registered
   frame-slot path beats the portable `pread` baseline on target hardware. The
   final uring graduation proof uses

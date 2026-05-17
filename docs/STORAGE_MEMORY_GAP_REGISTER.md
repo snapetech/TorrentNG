@@ -105,9 +105,9 @@ Implemented and covered by automated tests:
 - The kspls0 LVM/PV extent probe sampled independent files mapping to multiple
   rotational PVs (`/dev/sdb` and `/dev/sdh`) under the same logical LV.
 
-## Remaining Gaps
+## External Evidence Gates
 
-| Area | Gap | Risk | Next Work |
+| Area | Current implementation state | Risk | Required release evidence |
 | --- | --- | --- | --- |
 | Deterministic LVM PV placement control | The kspls0 extent probe shows the pool can allocate independent files on multiple rotational PVs, but ordinary path writes still do not let TorrentNG choose a specific PV. | Cross-PV behavior inside the LVM pool is allocator-dependent, so path-level scheduling cannot promise physical-drive affinity. | Use LVM extent mapping for evidence, or add lower-level PV-targeted probes only if release claims require deterministic per-drive placement. |
 | `io_uring` hardware graduation | `UringBackend` now returns owned reads from registered frame slots when available and exports `fixed_buffer_strategy=frame_pool_slots`; `auto` still selects the conservative `pread` baseline. | `io_uring` may regress on restricted kernels, filesystems, or storage hardware despite the lower-copy read path. | Run `scripts/storage_uring_graduation.sh /target/root` with selected-backend, fixed-buffer, registered-file, throughput thresholds, and `TNG_STORAGE_URING_REQUIRE_FRAME_POOL_SLOTS=1` before making `uring` eligible for automatic selection. |

@@ -149,6 +149,7 @@ certification_status_gate() {
 
 gate "soak finalization" 'soak-final-*.md'
 gate "local release gate" 'local-release-*.md'
+gate "storage release certification" 'storage-release-certification-*.md'
 memory_gate
 storage_index_gate
 certification_status_gate
@@ -158,7 +159,7 @@ certification_status_gate
   echo "## Boundaries"
   echo
   echo "- This gate rolls up the latest generated evidence. It does not replace a fresh real-device run on new release hardware."
-  echo "- Memory roadmap WARN rows are allowed only when the warning is an explicit non-claim, such as final io_uring frame-pool slot graduation."
+  echo "- Memory roadmap WARN rows are allowed only when the warning is an explicit non-claim, such as physical PV affinity or host-scale evidence outside the current release target."
   echo
   echo "Overall status: $status"
 } >>"$OUT"

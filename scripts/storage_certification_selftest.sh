@@ -139,6 +139,12 @@ cat >"$report_dir/memory-roadmap-certification-selftest.md" <<'REPORT'
 Overall status: PASS
 REPORT
 
+cat >"$report_dir/storage-release-certification-selftest.md" <<'REPORT'
+# TorrentNG Storage Release Certification
+
+Overall status: PASS
+REPORT
+
 REPORT_DIR="$report_dir" BENCHMARK_DIR="$benchmark_dir" \
   "$ROOT/scripts/post_soak_release_gate.sh" "$report_dir/post-soak-release-selftest-pass.md" >/dev/null
 grep -q 'storage certification index | PASS' "$report_dir/post-soak-release-selftest-pass.md"

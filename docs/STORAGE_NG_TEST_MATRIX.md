@@ -35,7 +35,7 @@ per-case syscall counters when `strace` is available.
 | Formatting | Workspace Rust formatting | `cargo fmt --check` |
 | Storage core | fd pool, positioned I/O, preallocation, durability, page-cache advice, sparse recheck, readahead, topology, elevator policy | `cargo test -p rt-storage` |
 | Backend selection | `auto`/`pread`/`uring` parsing, `io_uring` probe and worker-start fallback diagnostics, selected-backend read/write roundtrip | `cargo test -p rt-storage backend::tests` |
-| Backend graduation | real-device `pread` vs `uring` stream throughput, selected backend, registered-file support, fixed-buffer support, fixed-buffer strategy; final frame-pool graduation requires `TNG_STORAGE_URING_REQUIRE_FRAME_POOL_SLOTS=1` | `scripts/storage_uring_graduation.sh /target/root` |
+| Backend graduation | real-device `pread` vs `uring` stream throughput, selected backend, registered-file support, fixed-buffer support, fixed-buffer strategy; release graduation requires `TNG_STORAGE_URING_REQUIRE_FRAME_POOL_SLOTS=1` | `scripts/storage_uring_graduation.sh /target/root` |
 | Resource governor | total and per-class memory caps, pressure transitions, denied allocation counters, lease release | `cargo test -p rt-metrics resource::tests` |
 | Scale proxies | bounded crash recheck, storage fd cap, peer-read locality, hash-pool isolation, RAM verify path, sparse recheck extents | `cargo test -p rt-metrics storage_ -- --nocapture` |
 | Configuration | default storage elevator, memory caps, runtime tier switch, TOML partial parsing | `cargo test -p rt-config` |

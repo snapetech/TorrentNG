@@ -102,9 +102,9 @@ run_gate "sidecar config security review" bash -c '
 
 if [[ -n "${TNG_STORAGE_MATRIX_TARGETS:-}" ]]; then
   # shellcheck disable=SC2086 # Intentional whitespace-separated target list.
-  run_gate "storage hardware matrix" "$ROOT/scripts/storage_hardware_matrix.sh" $TNG_STORAGE_MATRIX_TARGETS
+  run_gate "storage release certification" "$ROOT/scripts/storage_release_certification.sh" $TNG_STORAGE_MATRIX_TARGETS
 else
-  skip_gate "storage hardware matrix" "set TNG_STORAGE_MATRIX_TARGETS='/mnt/nvme /mnt/hdd' to run real-device probes"
+  skip_gate "storage release certification" "set TNG_STORAGE_MATRIX_TARGETS='/mnt/nvme /mnt/hdd' to run real-device probes"
 fi
 
 sed -i "/|---|---|/r $OUT.table" "$OUT"
