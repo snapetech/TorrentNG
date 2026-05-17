@@ -21,6 +21,7 @@ Environment:
   TNG_STORAGE_SKIP_URING         set to 1 to skip io_uring graduation (FAIL unless TNG_STORAGE_ALLOW_RELEASE_SKIP=1)
   TNG_STORAGE_SKIP_MOVE_IMPORT   set to 1 to skip real-root move/import (FAIL unless TNG_STORAGE_ALLOW_RELEASE_SKIP=1)
   TNG_STORAGE_ALLOW_RELEASE_SKIP set to 1 to allow explicit SKIP rows for dry-run reports
+  TNG_STORAGE_RELEASE_SELFTEST   set to 1 to stub child gates for script tests
   TNG_STORAGE_REQUIRE_HDD_5X     forwarded to storage_hardware_matrix.sh
   TNG_STORAGE_URING_*            forwarded to storage_uring_graduation.sh
   TNG_STORAGE_MOVE_IMPORT_*      forwarded to storage_move_import_certification.sh
@@ -87,6 +88,22 @@ run_gate() {
   append_log "$name" "$log"
 }
 
+storage_child() {
+  local exports=()
+  while [[ "$#" -gt 0 && "$1" == *=* ]]; do
+    exports+=("$1")
+    shift
+  done
+  [[ "${1:-}" == "--" ]] && shift
+  local script="$1"
+  shift
+  if [[ "${TNG_STORAGE_RELEASE_SELFTEST:-0}" == "1" ]]; then
+    echo "selftest: $script $*"
+    return 0
+  fi
+  env "${exports[@]}" "$ROOT/scripts/$script.sh" "$@"
+}
+
 {
   echo "# TorrentNG Storage Release Certification"
   echo
@@ -103,32 +120,32 @@ uring_target="${TNG_STORAGE_URING_TARGET:-$1}"
 move_root="${TNG_STORAGE_MOVE_IMPORT_ROOT:-$1}"
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 
-run_gate "storage hardware matrix" env \
+run_gate "storage hardware matrix" storage_child \
   TNG_STORAGE_MATRIX_REPORT="${TNG_STORAGE_MATRIX_REPORT:-$REPORT_DIR/storage-hardware-release-$stamp.md}" \
-  "$ROOT/scripts/storage_hardware_matrix.sh" "$@"
+  -- storage_hardware_matrix "$@"
 
 if [[ "${TNG_STORAGE_SKIP_URING:-0}" == "1" ]]; then
   mark "io_uring graduation" SKIP "TNG_STORAGE_SKIP_URING=1"
 else
-  run_gate "io_uring graduation" env \
+  run_gate "io_uring graduation" storage_child \
     TNG_STORAGE_URING_REQUIRE_SELECTED="${TNG_STORAGE_URING_REQUIRE_SELECTED:-1}" \
     TNG_STORAGE_URING_REQUIRE_FRAME_POOL_SLOTS="${TNG_STORAGE_URING_REQUIRE_FRAME_POOL_SLOTS:-1}" \
     TNG_STORAGE_URING_REPORT="${TNG_STORAGE_URING_REPORT:-$REPORT_DIR/storage-uring-graduation-release-$stamp.md}" \
-    "$ROOT/scripts/storage_uring_graduation.sh" "$uring_target"
+    -- storage_uring_graduation "$uring_target"
 fi
 
 if [[ "${TNG_STORAGE_SKIP_MOVE_IMPORT:-0}" == "1" ]]; then
   mark "real-root move/import" SKIP "TNG_STORAGE_SKIP_MOVE_IMPORT=1"
 else
-  run_gate "real-root move/import" env TNG_STORAGE_MOVE_IMPORT_ROOT="$move_root" \
-    "$ROOT/scripts/storage_move_import_certification.sh" \
+  run_gate "real-root move/import" storage_child TNG_STORAGE_MOVE_IMPORT_ROOT="$move_root" \
+    -- storage_move_import_certification \
     "${TNG_STORAGE_MOVE_IMPORT_REPORT:-$REPORT_DIR/storage-move-import-release-$stamp.md}"
 fi
 
-run_gate "storage certification index" env \
+run_gate "storage certification index" storage_child \
   TNG_STORAGE_REPORT_DIR="$REPORT_DIR" \
   TNG_STORAGE_REPORT_INDEX="${TNG_STORAGE_REPORT_INDEX:-$REPORT_DIR/storage-certification-index.md}" \
-  "$ROOT/scripts/storage_certification_index.sh"
+  -- storage_certification_index
 
 {
   echo

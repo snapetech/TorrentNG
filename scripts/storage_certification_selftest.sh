@@ -185,4 +185,19 @@ fi
 grep -q 'storage certification index | FAIL' "$report_dir/post-soak-release-selftest-fail.md"
 REPORT_DIR="$report_dir" "$ROOT/scripts/storage_release_certification.sh" --help >/dev/null 2>&1
 
+if TNG_STORAGE_REPORT_DIR="$report_dir" \
+  TNG_STORAGE_RELEASE_SELFTEST=1 \
+  TNG_STORAGE_SKIP_URING=1 \
+  "$ROOT/scripts/storage_release_certification.sh" "$tmpdir/storage-root" >/dev/null 2>&1; then
+  echo "storage release certification accepted skipped io_uring without dry-run allowance" >&2
+  exit 1
+fi
+
+TNG_STORAGE_REPORT_DIR="$report_dir" \
+  TNG_STORAGE_RELEASE_SELFTEST=1 \
+  TNG_STORAGE_SKIP_URING=1 \
+  TNG_STORAGE_SKIP_MOVE_IMPORT=1 \
+  TNG_STORAGE_ALLOW_RELEASE_SKIP=1 \
+  "$ROOT/scripts/storage_release_certification.sh" "$tmpdir/storage-root" >/dev/null
+
 echo "storage certification self-test: PASS"
