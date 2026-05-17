@@ -10,6 +10,20 @@ function fmtBytes(bytes: number): string {
   return bytes + ' B'
 }
 
+function parseLines(value: string): string[] {
+  return value
+    .split(/[\n,]/)
+    .map(part => part.trim())
+    .filter(Boolean)
+}
+
+function parseStepIndexes(value: string): number[] {
+  return Array.from(new Set(parseLines(value)
+    .map(part => Number(part))
+    .filter(index => Number.isInteger(index) && index >= 0)))
+    .sort((left, right) => left - right)
+}
+
 export function StoragePanel() {
   const [operation, setOperation] = useState<StoragePlanRequest['operation']>('move')
   const [source, setSource] = useState('')
@@ -19,6 +33,8 @@ export function StoragePanel() {
   const [rootPath, setRootPath] = useState('')
   const [hardlinkOrCopy, setHardlinkOrCopy] = useState(false)
   const [deleteApproved, setDeleteApproved] = useState(false)
+  const [affectedTorrents, setAffectedTorrents] = useState('')
+  const [completedSteps, setCompletedSteps] = useState('')
   const [preview, setPreview] = useState<StoragePlanResponse | null>(null)
   const { data, isLoading, isFetching, error, refetch } = useQuery({
     queryKey: ['storage'],
@@ -31,6 +47,8 @@ export function StoragePanel() {
   const selectedRootInfo = roots.find(root => root.path === selectedRoot)
   const request = useMemo<StoragePlanRequest>(() => {
     const parsedBytes = bytes.trim() ? Number(bytes.trim()) : undefined
+    const affected = parseLines(affectedTorrents)
+    const completed = parseStepIndexes(completedSteps)
     return {
       operation,
       source: operation === 'delete' ? undefined : source.trim() || undefined,
@@ -42,8 +60,10 @@ export function StoragePanel() {
       dry_run: true,
       dry_run_approved: operation === 'delete' ? deleteApproved : undefined,
       roots: selectedRoot ? [selectedRoot] : undefined,
+      affected_torrents: affected.length ? affected : undefined,
+      completed_steps: completed.length ? completed : undefined,
     }
-  }, [operation, source, destination, target, bytes, selectedRoot, selectedRootInfo?.available_bytes, hardlinkOrCopy, deleteApproved])
+  }, [operation, source, destination, target, bytes, selectedRoot, selectedRootInfo?.available_bytes, hardlinkOrCopy, deleteApproved, affectedTorrents, completedSteps])
   const previewPlan = useMutation({
     mutationFn: () => api.storagePlan.preview(request),
     onSuccess: setPreview,
@@ -129,6 +149,29 @@ export function StoragePanel() {
           </label>
         </div>
 
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 9, marginBottom: 10 }}>
+          <label style={labelStyle}>
+            <span>Affected torrents</span>
+            <textarea
+              value={affectedTorrents}
+              onChange={event => { setAffectedTorrents(event.target.value); setPreview(null) }}
+              rows={3}
+              placeholder="Info hashes, one per line"
+              style={{ ...fieldStyle, resize: 'vertical', minHeight: 76 }}
+            />
+          </label>
+          <label style={labelStyle}>
+            <span>Completed steps</span>
+            <textarea
+              value={completedSteps}
+              onChange={event => { setCompletedSteps(event.target.value); setPreview(null) }}
+              rows={3}
+              placeholder="0, 1, 2"
+              style={{ ...fieldStyle, resize: 'vertical', minHeight: 76 }}
+            />
+          </label>
+        </div>
+
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 10 }}>
           {operation === 'import' && (
             <label style={checkStyle}>
@@ -169,12 +212,19 @@ function PathField({ label, value, onChange }: { label: string; value: string; o
 
 function StoragePlanResult({ response }: { response: StoragePlanResponse }) {
   const tone = response.plan.can_apply ? 'var(--success)' : 'var(--warning)'
+  const totalBytes = response.plan.steps.reduce((sum, step) => sum + step.bytes, 0)
+  const rollbackBytes = response.plan.rollback_steps.reduce((sum, step) => sum + step.bytes, 0)
   return (
     <div style={{ border: `1px solid color-mix(in srgb, ${tone} 38%, var(--border))`, borderRadius: 7, background: 'var(--surface)', padding: 12 }}>
       <div style={{ display: 'flex', gap: 10, alignItems: 'center', marginBottom: 8 }}>
         <strong style={{ color: 'var(--text)', fontSize: 13, textTransform: 'capitalize' }}>{response.operation}</strong>
         <span style={{ color: tone, fontSize: 12, fontWeight: 800 }}>{response.plan.can_apply ? 'Can apply' : 'Needs attention'}</span>
         {response.job_id && <code style={{ color: 'var(--faint)', fontSize: 11 }}>{response.job_id}</code>}
+      </div>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 9 }}>
+        <SummaryPill label="steps" value={String(response.plan.steps.length)} />
+        <SummaryPill label="bytes" value={fmtBytes(totalBytes)} />
+        <SummaryPill label="rollback" value={`${response.plan.rollback_steps.length} / ${fmtBytes(rollbackBytes)}`} />
       </div>
       {response.plan.issues.length > 0 && (
         <ul style={{ margin: '0 0 9px 16px', padding: 0, color: 'var(--warning)', fontSize: 12 }}>
@@ -202,7 +252,49 @@ function StoragePlanResult({ response }: { response: StoragePlanResponse }) {
           </div>
         ))}
       </div>
+      {response.plan.rollback_steps.length > 0 && (
+        <details style={{ marginTop: 9, color: 'var(--muted)', fontSize: 12 }}>
+          <summary style={{ cursor: 'pointer', color: 'var(--accent-text)', fontWeight: 800 }}>Rollback steps</summary>
+          <div style={{ display: 'grid', gap: 6, marginTop: 7 }}>
+            {response.plan.rollback_steps.map((step, index) => (
+              <div key={`${step.action}-rollback-${index}`} style={{
+                display: 'grid',
+                gridTemplateColumns: '132px 1fr auto',
+                gap: 8,
+                alignItems: 'center',
+                border: '1px solid var(--border)',
+                borderRadius: 6,
+                padding: '7px 9px',
+              }}>
+                <strong style={{ color: 'var(--text)' }}>{step.action}</strong>
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={[step.source, step.destination].filter(Boolean).join(' -> ')}>
+                  {[step.source, step.destination].filter(Boolean).join(' -> ') || 'storage operation'}
+                </span>
+                <span>{fmtBytes(step.bytes)}</span>
+              </div>
+            ))}
+          </div>
+        </details>
+      )}
     </div>
+  )
+}
+
+function SummaryPill({ label, value }: { label: string; value: string }) {
+  return (
+    <span style={{
+      display: 'inline-flex',
+      gap: 5,
+      alignItems: 'center',
+      border: '1px solid var(--border)',
+      borderRadius: 999,
+      padding: '2px 8px',
+      color: 'var(--muted)',
+      fontSize: 11,
+    }}>
+      <span style={{ color: 'var(--faint)' }}>{label}</span>
+      <strong style={{ color: 'var(--text)' }}>{value}</strong>
+    </span>
   )
 }
 
