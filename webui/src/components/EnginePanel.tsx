@@ -233,7 +233,8 @@ function RtorrentSettingsPanel() {
   }, [data])
 
   const save = useMutation({
-    mutationFn: () => api.rtorrentSettings.save(draft, customRc, true),
+    mutationFn: (payload: { values: Record<string, string | number | boolean>; customRc: string }) =>
+      api.rtorrentSettings.save(payload.values, payload.customRc, true),
     onSuccess: result => {
       qc.invalidateQueries({ queryKey: ['rtorrent-settings'] })
       qc.invalidateQueries({ queryKey: ['engine'] })
@@ -293,12 +294,13 @@ function RtorrentSettingsPanel() {
   }, [data])
   const defaultAll = () => {
     if (!data) return
+    if (!window.confirm('Apply defaults to every managed rTorrent setting? The changes will autosave shortly.')) return
     const next: Record<string, string | number | boolean> = {}
     for (const setting of data.settings) {
       next[setting.key] = inputValue(setting.value_type, setting.default_value)
     }
     setDraft(next)
-    setNotice({ tone: 'warn', text: 'Managed settings moved to defaults. Save to apply.' })
+    setNotice({ tone: 'warn', text: 'Managed settings moved to defaults. Autosave will apply shortly.' })
   }
   const resetGroup = (settings: RtorrentSettingDescriptor[]) => {
     if (!data) return
@@ -312,6 +314,7 @@ function RtorrentSettingsPanel() {
     })
   }
   const defaultGroup = (settings: RtorrentSettingDescriptor[]) => {
+    if (!window.confirm(`Apply defaults to ${settings.length} setting${settings.length === 1 ? '' : 's'} in this group? Autosave will apply shortly.`)) return
     setDraft(prev => {
       const next = { ...prev }
       for (const setting of settings) {
@@ -338,6 +341,10 @@ function RtorrentSettingsPanel() {
   }
   const restartDirtyCount = data ? dirtySettings.filter(setting => setting.restart_required).length : 0
   const liveDirtyCount = dirtySettings.length - restartDirtyCount
+  const visibleSettingCount = filteredGroups.reduce((sum, group) => sum + group.settings.length, 0)
+  const collapsedVisibleCount = filteredGroups
+    .filter(group => collapsedGroups.has(group.name))
+    .reduce((sum, group) => sum + group.settings.length, 0)
   const allGroupsCollapsed = filteredGroups.length > 0 && filteredGroups.every(group => collapsedGroups.has(group.name))
   const toggleAllGroups = () => {
     if (allGroupsCollapsed) {
@@ -346,6 +353,36 @@ function RtorrentSettingsPanel() {
       setCollapsedGroups(new Set(filteredGroups.map(group => group.name)))
     }
   }
+  const visibleSettings = filteredGroups.flatMap(group => group.settings)
+  const copyVisibleCommands = () => {
+    const text = visibleSettings
+      .map(setting => `${setting.label}\n  get: ${setting.command}\n  set: ${setting.setter}`)
+      .join('\n')
+    copyText(text, 'Visible commands')
+  }
+  const copyChangeSummary = () => {
+    if (!data) return
+    const lines = dirtySettings.map(setting => {
+      const row = data.values.find(value => value.key === setting.key)
+      const base = baselineValue(setting, row?.saved ?? null, row?.live.value ?? null)
+      const next = draft[setting.key] ?? base
+      return `${setting.label}: ${formatSettingValue(base, setting.unit)} -> ${formatSettingValue(next, setting.unit)} (${setting.restart_required ? 'restart' : 'live'})`
+    })
+    if (customRcDirty) lines.push('Custom rTorrent lines: edited (restart)')
+    copyText(lines.join('\n'), 'Change summary')
+  }
+  const saveNow = useCallback(() => {
+    if (!data?.overlay_writable || dirtyCount === 0 || save.isPending) return
+    save.mutate({ values: draft, customRc })
+  }, [customRc, data?.overlay_writable, dirtyCount, draft, save])
+
+  useEffect(() => {
+    if (!data?.overlay_writable || dirtyCount === 0 || save.isPending) return
+    const timer = window.setTimeout(() => {
+      save.mutate({ values: draft, customRc })
+    }, 650)
+    return () => window.clearTimeout(timer)
+  }, [customRc, data?.overlay_writable, dirtyCount, draft, save])
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
@@ -353,7 +390,7 @@ function RtorrentSettingsPanel() {
       if (!(e.ctrlKey || e.metaKey)) return
       if (e.key.toLowerCase() === 's') {
         e.preventDefault()
-        if (dirtyCount > 0 && !save.isPending) save.mutate()
+        saveNow()
       }
       if (e.key.toLowerCase() === 'z' && e.shiftKey) {
         e.preventDefault()
@@ -362,7 +399,7 @@ function RtorrentSettingsPanel() {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [dirtyCount, resetAll, save])
+  }, [resetAll, saveNow])
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
@@ -466,8 +503,34 @@ function RtorrentSettingsPanel() {
             </div>
           )}
           <div id="rt-settings-result-count" role="status" aria-live="polite" style={{ color: 'var(--faint)', fontSize: 11 }}>
-            Showing {filteredGroups.reduce((sum, group) => sum + group.settings.length, 0).toLocaleString()} of {data.settings.length.toLocaleString()} managed settings.
+            Showing {visibleSettingCount.toLocaleString()} of {data.settings.length.toLocaleString()} managed settings{collapsedVisibleCount > 0 ? `; ${collapsedVisibleCount.toLocaleString()} hidden in collapsed groups` : ''}.
           </div>
+          {filteredGroups.length > 0 && (
+            <nav aria-label="Settings groups" style={{
+              display: 'flex',
+              gap: 6,
+              flexWrap: 'wrap',
+              border: '1px solid var(--border)',
+              borderRadius: 8,
+              background: 'color-mix(in srgb, var(--surface) 70%, var(--bg))',
+              padding: 8,
+            }}>
+              {filteredGroups.map(group => {
+                const groupId = groupDomId(group.name)
+                return (
+                  <button
+                    key={group.name}
+                    type="button"
+                    onClick={() => document.getElementById(groupId)?.scrollIntoView({ block: 'start', behavior: 'smooth' })}
+                    style={smallButtonStyle(true)}
+                    aria-controls={groupId}
+                  >
+                    {group.name} ({group.settings.length})
+                  </button>
+                )
+              })}
+            </nav>
+          )}
           <div style={{
             display: 'grid',
             gridTemplateColumns: 'minmax(260px, 1fr) auto',
@@ -479,11 +542,13 @@ function RtorrentSettingsPanel() {
             padding: 10,
           }}>
             <div style={{ display: 'grid', gap: 4, minWidth: 0 }}>
-              <div style={{ color: 'var(--text)', fontSize: 12, fontWeight: 800 }}>Pending changes</div>
+              <div style={{ color: 'var(--text)', fontSize: 12, fontWeight: 800 }}>Autosave state</div>
               <div style={{ color: 'var(--faint)', fontSize: 11 }}>
-                {dirtyCount === 0
-                  ? 'No edits are staged.'
-                  : `${liveDirtyCount} live setting${liveDirtyCount === 1 ? '' : 's'}, ${restartDirtyCount} restart setting${restartDirtyCount === 1 ? '' : 's'}, ${customRcDirty ? 'custom lines edited' : 'custom lines unchanged'}.`}
+                {save.isPending
+                  ? 'Saving changes...'
+                  : dirtyCount === 0
+                    ? 'All settings are saved.'
+                    : `${dirtyCount} change${dirtyCount === 1 ? '' : 's'} will autosave shortly: ${liveDirtyCount} live, ${restartDirtyCount} restart${customRcDirty ? ', custom lines edited' : ''}.`}
               </div>
             </div>
             <div role="toolbar" aria-label="Settings workspace actions" style={{ display: 'flex', gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
@@ -492,6 +557,12 @@ function RtorrentSettingsPanel() {
               </button>
               <button type="button" onClick={defaultAll} disabled={save.isPending || !data.overlay_writable} style={smallButtonStyle(!save.isPending && data.overlay_writable)}>
                 Defaults all
+              </button>
+              <button type="button" onClick={copyVisibleCommands} disabled={visibleSettings.length === 0} style={smallButtonStyle(visibleSettings.length > 0)}>
+                Copy visible commands
+              </button>
+              <button type="button" onClick={copyChangeSummary} disabled={dirtyCount === 0} style={smallButtonStyle(dirtyCount > 0)}>
+                Copy change summary
               </button>
             </div>
           </div>
@@ -511,9 +582,10 @@ function RtorrentSettingsPanel() {
                 return !sameSettingValue(draft[setting.key], baselineValue(setting, row?.saved ?? null, row?.live.value ?? null))
               }).length
               const groupRestart = group.settings.filter(setting => setting.restart_required).length
-              const bodyId = `rt-setting-group-${group.name.replace(/\W+/g, '-').toLowerCase()}`
+              const groupId = groupDomId(group.name)
+              const bodyId = `${groupId}-body`
               return (
-              <fieldset key={group.name} style={{
+              <fieldset id={groupId} key={group.name} tabIndex={-1} style={{
                 border: '1px solid var(--border)',
                 borderRadius: 8,
                 background: 'color-mix(in srgb, var(--surface) 72%, var(--bg))',
@@ -764,13 +836,13 @@ function RtorrentSettingsPanel() {
             padding: '10px 0 0',
           }} role="toolbar" aria-label="Settings save actions">
             <button
-              onClick={() => save.mutate()}
+              onClick={saveNow}
               disabled={save.isPending || dirtyCount === 0 || !data.overlay_writable}
               aria-keyshortcuts="Control+S Meta+S"
-              title="Save and apply live"
+              title="Save pending changes now"
               style={buttonStyle('var(--accent)', 'var(--accent-soft)', 'var(--accent-text)', dirtyCount > 0 && !save.isPending && data.overlay_writable)}
             >
-              {save.isPending ? 'Saving…' : 'Save and apply live'}
+              {save.isPending ? 'Saving...' : 'Save now'}
             </button>
             <button
               onClick={resetAll}
@@ -791,7 +863,7 @@ function RtorrentSettingsPanel() {
               {restart.isPending ? 'Restarting…' : 'Restart daemon'}
             </button>
             <span style={{ color: dirtyCount > 0 ? 'var(--warning)' : 'var(--faint)', fontSize: 12, fontWeight: 800 }}>
-              {dirtyCount > 0 ? `${dirtyCount} unsaved edit${dirtyCount === 1 ? '' : 's'}` : 'No unsaved edits'}
+              {save.isPending ? 'Autosaving' : dirtyCount > 0 ? `${dirtyCount} pending autosave` : 'Saved'}
             </span>
           </div>
         </div>
@@ -850,7 +922,7 @@ function ChangeReview({ settings, draft, customRcDirty, values }: {
       padding: '8px 10px',
     }}>
       <summary style={{ color: 'var(--text)', fontSize: 12, fontWeight: 800, cursor: 'pointer' }}>
-        Review staged changes
+        Review autosave changes ({settings.length + (customRcDirty ? 1 : 0)})
       </summary>
       <div style={{ display: 'grid', gap: 6, marginTop: 8 }}>
         {settings.map(setting => {
@@ -907,7 +979,7 @@ function ViewFilter({ value, onChange, dirtyCount, restartCount, liveCount, unav
 }) {
   const options: Array<[SettingsViewFilter, string, string]> = [
     ['all', 'All', 'Show every managed setting'],
-    ['edited', `Edited ${dirtyCount}`, 'Show unsaved managed setting edits'],
+    ['edited', `Edited ${dirtyCount}`, 'Show managed settings pending autosave'],
     ['restart', `Restart ${restartCount}`, 'Show settings that need restart'],
     ['live', `Live ${liveCount}`, 'Show settings that can apply live'],
     ['unavailable', `Unavailable ${unavailableCount}`, 'Show settings without a live readback'],
@@ -1161,6 +1233,10 @@ function groupSettings(settings: RtorrentSettingDescriptor[]): SettingGroup[] {
     byName.get(settingCategory(setting))?.settings.push(setting)
   }
   return groups.filter(group => group.settings.length > 0)
+}
+
+function groupDomId(name: string): string {
+  return `rt-setting-group-${name.replace(/\W+/g, '-').toLowerCase()}`
 }
 
 function settingCategory(setting: RtorrentSettingDescriptor): SettingGroup['name'] {
