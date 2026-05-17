@@ -331,7 +331,12 @@ async fn rss_rules(State(s): State<AppState>) -> impl IntoResponse {
             Json(serde_json::Value::Object(map)).into_response()
         }
         Err(e) => {
-            tracing::error!("qb rss rules: {e}");
+            tracing::error!(
+                component = "qbcompat",
+                operation = "list_rss_rules",
+                error = %e,
+                "qBit RSS rule listing failed"
+            );
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -357,7 +362,12 @@ async fn rss_set_rule(State(s): State<AppState>, Form(f): Form<RssSetRuleForm>) 
     let value: serde_json::Value = match serde_json::from_str(raw) {
         Ok(value) => value,
         Err(e) => {
-            tracing::warn!("qb rss setRule invalid json: {e}");
+            tracing::warn!(
+                component = "qbcompat",
+                operation = "set_rss_rule",
+                error = %e,
+                "qBit RSS rule JSON parse failed"
+            );
             return StatusCode::BAD_REQUEST;
         }
     };
@@ -419,7 +429,13 @@ async fn rss_set_rule(State(s): State<AppState>, Form(f): Form<RssSetRuleForm>) 
             StatusCode::OK
         }
         Err(e) => {
-            tracing::error!("qb rss setRule: {e}");
+            tracing::error!(
+                component = "qbcompat",
+                operation = "set_rss_rule",
+                rule = %name,
+                error = %e,
+                "qBit RSS rule update failed"
+            );
             StatusCode::INTERNAL_SERVER_ERROR
         }
     }
@@ -462,7 +478,14 @@ async fn rss_rename_rule(
             StatusCode::OK
         }
         Err(e) => {
-            tracing::error!("qb rss renameRule: {e}");
+            tracing::error!(
+                component = "qbcompat",
+                operation = "rename_rss_rule",
+                rule = %old_name,
+                new_rule = %new_name,
+                error = %e,
+                "qBit RSS rule rename failed"
+            );
             StatusCode::INTERNAL_SERVER_ERROR
         }
     }
@@ -495,7 +518,13 @@ async fn rss_remove_rule(
             StatusCode::OK
         }
         Err(e) => {
-            tracing::error!("qb rss removeRule: {e}");
+            tracing::error!(
+                component = "qbcompat",
+                operation = "remove_rss_rule",
+                rule = %name,
+                error = %e,
+                "qBit RSS rule removal failed"
+            );
             StatusCode::INTERNAL_SERVER_ERROR
         }
     }
@@ -526,7 +555,12 @@ async fn rss_matching_articles(
             .collect::<Vec<_>>()))
         .into_response(),
         Err(e) => {
-            tracing::error!("qb rss matchingArticles: {e}");
+            tracing::error!(
+                component = "qbcompat",
+                operation = "match_rss_articles",
+                error = %e,
+                "qBit RSS article matching failed"
+            );
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -570,7 +604,12 @@ async fn app_set_preferences(
     let prefs: serde_json::Value = match serde_json::from_str(raw_prefs) {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!("qb setPreferences invalid json: {e}");
+            tracing::warn!(
+                component = "qbcompat",
+                operation = "set_preferences",
+                error = %e,
+                "qBit preferences JSON parse failed"
+            );
             return StatusCode::BAD_REQUEST;
         }
     };
@@ -580,7 +619,12 @@ async fn app_set_preferences(
         .and_then(|v| v.as_str())
     {
         if let Err(e) = s.rt.set_user_agent(ua).await {
-            tracing::warn!("qb setPreferences user agent: {e}");
+            tracing::warn!(
+                component = "qbcompat",
+                operation = "set_user_agent",
+                error = %e,
+                "qBit user-agent preference update failed"
+            );
         }
     }
 
@@ -1124,7 +1168,13 @@ async fn create_category(
             StatusCode::OK
         }
         Err(e) => {
-            tracing::error!("qb createCategory: {e}");
+            tracing::error!(
+                component = "qbcompat",
+                operation = "create_category",
+                category = %name,
+                error = %e,
+                "qBit category create failed"
+            );
             StatusCode::INTERNAL_SERVER_ERROR
         }
     }
@@ -1142,7 +1192,13 @@ async fn edit_category(State(s): State<AppState>, Form(f): Form<CreateCategoryFo
             StatusCode::OK
         }
         Err(e) => {
-            tracing::error!("qb editCategory: {e}");
+            tracing::error!(
+                component = "qbcompat",
+                operation = "edit_category",
+                category = %name,
+                error = %e,
+                "qBit category edit failed"
+            );
             StatusCode::INTERNAL_SERVER_ERROR
         }
     }
@@ -1166,7 +1222,13 @@ async fn remove_categories(
         .filter(|s| !s.is_empty())
     {
         if let Err(e) = s.db.delete_category(name) {
-            tracing::warn!("qb removeCategories {name}: {e}");
+            tracing::warn!(
+                component = "qbcompat",
+                operation = "remove_category",
+                category = %name,
+                error = %e,
+                "qBit category removal failed"
+            );
         } else {
             emit(&s, Event::CategoriesUpdated);
             emit(&s, Event::TrackerHealthUpdated);
@@ -1190,7 +1252,13 @@ async fn create_tags(State(s): State<AppState>, Form(f): Form<CreateTagsForm>) -
         .filter(|t| !t.is_empty())
     {
         if let Err(e) = s.db.ensure_tag(tag) {
-            tracing::warn!("qb createTags {tag}: {e}");
+            tracing::warn!(
+                component = "qbcompat",
+                operation = "create_tag",
+                tag = %tag,
+                error = %e,
+                "qBit tag create failed"
+            );
         } else {
             emit(&s, Event::TagsUpdated);
         }
@@ -1208,7 +1276,13 @@ async fn delete_tags(State(s): State<AppState>, Form(f): Form<CreateTagsForm>) -
         .filter(|t| !t.is_empty())
     {
         if let Err(e) = s.db.delete_tag(tag) {
-            tracing::warn!("qb deleteTags {tag}: {e}");
+            tracing::warn!(
+                component = "qbcompat",
+                operation = "delete_tag",
+                tag = %tag,
+                error = %e,
+                "qBit tag delete failed"
+            );
         } else {
             emit(&s, Event::TagsUpdated);
             emit(&s, Event::TrackerHealthUpdated);
@@ -1238,7 +1312,15 @@ async fn torrents_file_prio(State(s): State<AppState>, Form(f): Form<FilePrioFor
         for id_str in ids.split('|') {
             if let Ok(idx) = id_str.parse::<usize>() {
                 if let Err(e) = s.rt.set_file_priority(&hash, idx, priority).await {
-                    tracing::warn!("qb filePrio {hash}[{idx}]: {e}");
+                    tracing::warn!(
+                        component = "qbcompat",
+                        operation = "set_file_priority",
+                        torrent = %hash,
+                        file_index = idx,
+                        priority,
+                        error = %e,
+                        "qBit file priority update failed"
+                    );
                 }
             }
         }
@@ -1512,7 +1594,13 @@ async fn torrents_toggle_sequential_download(
 ) -> StatusCode {
     for hash in split_hashes(&s.db, f.hashes.as_deref()) {
         if let Err(e) = s.rt.toggle_sequential_download(&hash).await {
-            tracing::warn!("qb toggleSequentialDownload {hash}: {e}");
+            tracing::warn!(
+                component = "qbcompat",
+                operation = "toggle_sequential_download",
+                torrent = %hash,
+                error = %e,
+                "qBit sequential download toggle failed"
+            );
         }
     }
     StatusCode::OK
@@ -1539,7 +1627,12 @@ async fn sync_maindata(
     let (categories, tags) = match sync_metadata(&s) {
         Ok(metadata) => metadata,
         Err(e) => {
-            tracing::error!("qb maindata metadata: {e}");
+            tracing::error!(
+                component = "qbcompat",
+                operation = "sync_maindata_metadata",
+                error = %e,
+                "qBit maindata metadata load failed"
+            );
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -1562,7 +1655,12 @@ async fn sync_maindata(
                 let torrents = match torrents_map(&rows) {
                     Ok(torrents) => torrents,
                     Err(e) => {
-                        tracing::error!("qb maindata serialize: {e}");
+                        tracing::error!(
+                            component = "qbcompat",
+                            operation = "sync_maindata_serialize",
+                            error = %e,
+                            "qBit maindata serialization failed"
+                        );
                         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                     }
                 };
@@ -1578,7 +1676,12 @@ async fn sync_maindata(
                 .into_response()
             }
             Err(e) => {
-                tracing::error!("qb maindata: {e}");
+                tracing::error!(
+                    component = "qbcompat",
+                    operation = "sync_maindata",
+                    error = %e,
+                    "qBit maindata query failed"
+                );
                 StatusCode::INTERNAL_SERVER_ERROR.into_response()
             }
         }
@@ -1588,7 +1691,12 @@ async fn sync_maindata(
                 let torrents = match torrents_map(&rows) {
                     Ok(torrents) => torrents,
                     Err(e) => {
-                        tracing::error!("qb maindata delta serialize: {e}");
+                        tracing::error!(
+                            component = "qbcompat",
+                            operation = "sync_maindata_delta_serialize",
+                            error = %e,
+                            "qBit maindata delta serialization failed"
+                        );
                         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                     }
                 };
@@ -1604,7 +1712,12 @@ async fn sync_maindata(
                 .into_response()
             }
             Err(e) => {
-                tracing::error!("qb maindata delta: {e}");
+                tracing::error!(
+                    component = "qbcompat",
+                    operation = "sync_maindata_delta",
+                    error = %e,
+                    "qBit maindata delta query failed"
+                );
                 StatusCode::INTERNAL_SERVER_ERROR.into_response()
             }
         }

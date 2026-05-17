@@ -2432,7 +2432,7 @@ async fn qb_log_main_returns_retained_app_events() {
     assert_eq!(entries[0]["type"], 4);
 
     let res = client
-        .get(url(addr, "/api/qb/v2/log/main?warning=true"))
+        .get(url(addr, "/api/qb/v2/log/main?limit=1&warning=true"))
         .send()
         .await
         .unwrap();
@@ -2442,6 +2442,30 @@ async fn qb_log_main_returns_retained_app_events() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["message"], "operator-visible warning");
     assert_eq!(entries[0]["type"], 2);
+
+    db.append_app_event(
+        &AppEventRow {
+            event_id: None,
+            occurred_at: 1_700_000_002,
+            level: "info".to_owned(),
+            kind: "test".to_owned(),
+            message: "newer info".to_owned(),
+            payload: "{}".to_owned(),
+        },
+        16,
+    )
+    .unwrap();
+
+    let res = client
+        .get(url(addr, "/api/qb/v2/log/main?limit=1&warning=true"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let entries = body.as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["message"], "operator-visible warning");
 }
 
 #[tokio::test]
