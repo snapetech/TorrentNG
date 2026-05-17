@@ -15,6 +15,7 @@ rt-session = { path = "../rt-session" }
 rt-api-native = { path = "../rt-api-native" }
 rt-api-qbit = { path = "../rt-api-qbit" }
 rt-db = { path = "../rt-db" }
+rt-fastresume = { path = "../rt-fastresume" }
 rt-piece-map = { path = "../rt-piece-map" }
 rt-testkit = { path = "../rt-testkit" }
 rt-tracker = { path = "../rt-tracker" }

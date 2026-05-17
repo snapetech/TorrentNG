@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use axum::{body::Body, http::Request};
 use rt_api_native::{build_router, AppState};
 use rt_api_qbit::AppState as QbState;
+use rt_fastresume::{FastresumeState, ImportPolicy, PieceState};
 use rt_path::{SafeRelPath, StorageProfile, StorageRootId};
 use rt_piece_map::{FileSpan, PieceMap};
 use rt_session::TorrentEntry;
@@ -451,6 +452,87 @@ async fn storage_recheck_hashing_reports_scheduler_result_without_runtime_stall(
     let stats = scheduler.stats();
     assert_eq!(stats.read_ops_by_class[IoClass::Recheck as usize], 1);
     assert!(stats.hash_ops >= 2);
+}
+
+#[test]
+fn crash_watermark_bounds_restart_recheck_to_dirty_pieces() {
+    let piece_count = 100_000u32;
+    let dirty: Vec<u32> = (0..512).map(|piece| piece * 3).collect();
+    let mut state =
+        FastresumeState::new_empty(&[9u8; 20], piece_count, ImportPolicy::RequireVerification);
+    state.pieces.fill(PieceState::Valid);
+    state.clean_shutdown = false;
+    state.set_dirty_pieces_since_barrier(dirty.iter().copied());
+
+    let downgraded = state
+        .apply_unclean_shutdown_watermark()
+        .expect("watermark should bound unclean restart recheck");
+
+    assert_eq!(downgraded, dirty.len() as u32);
+    assert_eq!(state.unknown_piece_count(), dirty.len() as u32);
+    assert_eq!(
+        state.valid_piece_count(),
+        piece_count - dirty.len() as u32,
+        "restart should not force a full-library recheck"
+    );
+    assert!(state.clean_shutdown);
+    assert!(state.durability.dirty_pieces_since_barrier.is_empty());
+}
+
+#[tokio::test]
+async fn sparse_recheck_skips_holes_and_reports_extent_counters() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sparse-scale.bin");
+    let file_len = 4 * 1024 * 1024usize;
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len(file_len as u64).unwrap();
+    drop(file);
+    let data = vec![0x33u8; 16 * 1024];
+    let data_offset = 2 * 1024 * 1024usize;
+    std::fs::write(dir.path().join("payload.tmp"), &data).unwrap();
+    let scheduler = MountScheduler::new(
+        StorageRootId::new(),
+        &SchedulerConfig {
+            profile: StorageProfile::Ssd,
+            ..Default::default()
+        },
+    );
+    scheduler
+        .write_at(
+            IoClass::PeerWrite,
+            &path,
+            data_offset as u64,
+            bytes::Bytes::from(data.clone()),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let mut expected = vec![0u8; file_len];
+    expected[data_offset..data_offset + data.len()].copy_from_slice(&data);
+    let expected_hash = scheduler
+        .hash_sha1(bytes::Bytes::from(expected))
+        .await
+        .unwrap();
+    let piece_map = PieceMap::new(
+        file_len as u64,
+        vec![FileSpan {
+            file_index: 0,
+            path: SafeRelPath::from_name("sparse-scale.bin", false).unwrap(),
+            content_offset: 0,
+            length: file_len as u64,
+        }],
+    )
+    .unwrap();
+    let hashes = [expected_hash];
+    let verifier = rt_storage::PieceVerifier::new(dir.path(), &scheduler, &piece_map, &hashes);
+
+    assert_eq!(verifier.verify_piece(0).await, VerifyResult::Valid);
+    let stats = scheduler.stats();
+    assert!(
+        stats.sparse_data_extents > 0 || stats.sparse_seek_fallbacks > 0,
+        "sparse recheck should either map extents or record an unsupported-filesystem fallback"
+    );
 }
 
 fn current_rss_bytes() -> Option<u64> {

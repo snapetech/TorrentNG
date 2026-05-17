@@ -1457,6 +1457,7 @@ dependencies = [
  "rt-api-native",
  "rt-api-qbit",
  "rt-db",
+ "rt-fastresume",
  "rt-path",
  "rt-piece-map",
  "rt-session",

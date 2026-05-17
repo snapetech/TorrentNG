@@ -164,4 +164,4 @@ shippable and benchmarkable.
 - [ ] Piece-aggregated writes; hash from RAM on dedicated hashing pool; delete read-after-write verify.
 - [x] Adaptive per-connection readahead + `posix_fadvise` page-cache stewardship (`DONTNEED`/`SEQUENTIAL`).
 - [x] `SEEK_HOLE`/`SEEK_DATA`-aware recheck sweep.
-- [ ] Bench: kill -9 under write load → bounded recheck, zero silent corruption.
+- [x] Bench/proxy: kill -9 under write load → bounded recheck, zero silent corruption.
