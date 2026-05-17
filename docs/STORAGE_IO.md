@@ -51,8 +51,9 @@ semaphores:
   on Unix when the soft limit is available.
 - New schedulers can auto-detect HDD, SSD/NVMe, or network profiles from Linux
   mount and sysfs topology when callers do not override the storage profile.
-  The same topology read records filesystem type and whether the mount is
-  likely CoW.
+  The same topology read records a stable `DeviceId`, filesystem type, and
+  whether the mount is likely CoW. Local device ids come from `/sys/dev/block`
+  parent block devices; network mounts use the mount source.
 - Reads open read-only with `create(false)` and never create or truncate files.
 - Writes use positioned I/O and validate short writes.
 - `prepare_file` creates parents and applies `PreallocationMode::{Off, Sparse,

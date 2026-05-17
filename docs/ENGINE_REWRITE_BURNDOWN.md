@@ -139,7 +139,7 @@ shippable and benchmarkable.
 
 ### Phase B — per-device elevator + topology
 
-- [ ] Resolve storage roots to physical `DeviceId` (`/sys/block`, rotational, dm/RAID, mergerfs/ZFS/btrfs).
+- [x] Resolve storage roots to physical `DeviceId` (`/sys/block`, rotational, dm/RAID, mergerfs/ZFS/btrfs).
 - [x] Auto-detect `StorageProfile` instead of defaulting to `Unknown`.
 - [x] Implement `DeviceElevator`: offset-sorted, coalescing, deadline + `choke_critical` promotion.
 - [ ] Wire `MountScheduler` permit to elevator submission; per-class weights from `IoClass`.
