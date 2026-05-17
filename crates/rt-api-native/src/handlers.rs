@@ -1389,6 +1389,62 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
             );
         }
     }
+    for (rank, torrent) in stats.hot_torrent_memory_top.iter().enumerate() {
+        metric_with_two_labels(
+            &mut out,
+            "torrentng_hot_torrent_memory_estimated_bytes",
+            "gauge",
+            "Estimated process-owned memory attributed to top active torrents",
+            ("rank", &(rank + 1).to_string()),
+            ("info_hash", &torrent.info_hash),
+            torrent.estimated_bytes,
+        );
+        metric_with_two_labels(
+            &mut out,
+            "torrentng_hot_torrent_piece_assembly_bytes",
+            "gauge",
+            "Piece assembly bytes attributed to top active torrents",
+            ("rank", &(rank + 1).to_string()),
+            ("info_hash", &torrent.info_hash),
+            torrent.piece_assembly_bytes,
+        );
+        metric_with_two_labels(
+            &mut out,
+            "torrentng_hot_torrent_peer_buffer_bytes",
+            "gauge",
+            "Peer rx/tx buffer bytes attributed to top active torrents",
+            ("rank", &(rank + 1).to_string()),
+            ("info_hash", &torrent.info_hash),
+            torrent.peer_buffer_bytes,
+        );
+        metric_with_two_labels(
+            &mut out,
+            "torrentng_hot_torrent_tracker_peer_bytes",
+            "gauge",
+            "Tracker peer-cache bytes attributed to top active torrents",
+            ("rank", &(rank + 1).to_string()),
+            ("info_hash", &torrent.info_hash),
+            torrent.tracker_peer_bytes,
+        );
+        metric_with_two_labels(
+            &mut out,
+            "torrentng_hot_torrent_peer_command_queue_bytes",
+            "gauge",
+            "Peer command queue bytes attributed to top active torrents",
+            ("rank", &(rank + 1).to_string()),
+            ("info_hash", &torrent.info_hash),
+            torrent.peer_command_queue_bytes,
+        );
+        metric_with_two_labels(
+            &mut out,
+            "torrentng_hot_torrent_storage_cache_bytes",
+            "gauge",
+            "Per-torrent storage cache bytes attributed to top active torrents",
+            ("rank", &(rank + 1).to_string()),
+            ("info_hash", &torrent.info_hash),
+            torrent.storage_cache_bytes,
+        );
+    }
     let storage = StorageRuntime::global();
     metric_with_label(
         &mut out,
@@ -1522,6 +1578,39 @@ fn metric_with_label(
     out.push_str(label);
     out.push_str("=\"");
     push_label_value(out, label_value);
+    out.push_str("\"} ");
+    out.push_str(&value.to_string());
+    out.push('\n');
+}
+
+fn metric_with_two_labels(
+    out: &mut String,
+    name: &str,
+    kind: &str,
+    help: &str,
+    first: (&str, &str),
+    second: (&str, &str),
+    value: u64,
+) {
+    out.push_str("# HELP ");
+    out.push_str(name);
+    out.push(' ');
+    out.push_str(help);
+    out.push('\n');
+    out.push_str("# TYPE ");
+    out.push_str(name);
+    out.push(' ');
+    out.push_str(kind);
+    out.push('\n');
+    out.push_str(name);
+    out.push('{');
+    out.push_str(first.0);
+    out.push_str("=\"");
+    push_label_value(out, first.1);
+    out.push_str("\",");
+    out.push_str(second.0);
+    out.push_str("=\"");
+    push_label_value(out, second.1);
     out.push_str("\"} ");
     out.push_str(&value.to_string());
     out.push('\n');
@@ -1919,6 +2008,15 @@ mod tests {
             sync_latency_ns: 38,
             hash_latency_ns: 39,
         }];
+        stats.hot_torrent_memory_top = vec![rt_engine::HotTorrentMemoryStats {
+            info_hash: "abc\"def\\ghi\nj".to_owned(),
+            estimated_bytes: 54,
+            piece_assembly_bytes: 55,
+            peer_buffer_bytes: 56,
+            tracker_peer_bytes: 57,
+            peer_command_queue_bytes: 58,
+            storage_cache_bytes: 59,
+        }];
         let governor = rt_metrics::ResourceGovernor::new(Default::default());
         assert!(governor
             .try_acquire(MemoryClass::ApiSnapshot, u64::MAX)
@@ -1955,6 +2053,24 @@ mod tests {
         assert!(rendered.contains("torrentng_peer_command_queue_full_total 53"));
         assert!(rendered.contains("torrentng_tracker_peer_cache_entries 43"));
         assert!(rendered.contains("torrentng_tracker_peer_cache_drops_total 44"));
+        assert!(rendered.contains(
+            "torrentng_hot_torrent_memory_estimated_bytes{rank=\"1\",info_hash=\"abc\\\"def\\\\ghi\\nj\"} 54"
+        ));
+        assert!(rendered.contains(
+            "torrentng_hot_torrent_piece_assembly_bytes{rank=\"1\",info_hash=\"abc\\\"def\\\\ghi\\nj\"} 55"
+        ));
+        assert!(rendered.contains(
+            "torrentng_hot_torrent_peer_buffer_bytes{rank=\"1\",info_hash=\"abc\\\"def\\\\ghi\\nj\"} 56"
+        ));
+        assert!(rendered.contains(
+            "torrentng_hot_torrent_tracker_peer_bytes{rank=\"1\",info_hash=\"abc\\\"def\\\\ghi\\nj\"} 57"
+        ));
+        assert!(rendered.contains(
+            "torrentng_hot_torrent_peer_command_queue_bytes{rank=\"1\",info_hash=\"abc\\\"def\\\\ghi\\nj\"} 58"
+        ));
+        assert!(rendered.contains(
+            "torrentng_hot_torrent_storage_cache_bytes{rank=\"1\",info_hash=\"abc\\\"def\\\\ghi\\nj\"} 59"
+        ));
         assert!(
             rendered.contains("torrentng_storage_read_ops_by_class_total{class=\"peer_read\"} 10")
         );

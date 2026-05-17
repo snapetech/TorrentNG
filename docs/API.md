@@ -411,6 +411,12 @@ rTorrent over XMLRPC.
 | `torrentng_peer_{rx,tx}_buffer_bytes` | gauge | Process-owned peer buffer pressure from outstanding receive requests and upload buffers; upload block assembly is also charged to the `peer_buffer` memory class while in flight |
 | `torrentng_peer_command_queue_*` | gauge/counter | Active peer command queue capacity, depth, and full-send backpressure events |
 | `torrentng_tracker_peer_cache_*` | gauge/counter | Tracker peer addresses retained or dropped by bounded per-torrent peer caches |
+| `torrentng_hot_torrent_memory_estimated_bytes{rank,info_hash}` | gauge | Top active torrents by estimated process-owned memory, capped to the largest ten torrents |
+| `torrentng_hot_torrent_piece_assembly_bytes{rank,info_hash}` | gauge | Piece-assembly portion of each hot-torrent memory estimate |
+| `torrentng_hot_torrent_peer_buffer_bytes{rank,info_hash}` | gauge | Peer rx/tx buffer portion of each hot-torrent memory estimate |
+| `torrentng_hot_torrent_tracker_peer_bytes{rank,info_hash}` | gauge | Tracker peer-cache portion of each hot-torrent memory estimate |
+| `torrentng_hot_torrent_peer_command_queue_bytes{rank,info_hash}` | gauge | Peer command queue portion of each hot-torrent memory estimate |
+| `torrentng_hot_torrent_storage_cache_bytes{rank,info_hash}` | gauge | Per-torrent storage cache portion of each hot-torrent memory estimate |
 | `torrentng_memory_*` | gauge/counter | Resource governor cap, current process-owned usage, pressure state, per-class caps/usage, and denied allocations |
 | `torrentng_api_requests_total` | counter | API requests served |
 | `torrentng_sync_cycles_total` | counter | Track 1 sidecar rTorrent sync cycles completed |

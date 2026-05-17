@@ -2380,7 +2380,7 @@ impl Engine {
                                 .tier,
                         );
                     }
-                    stats.add_torrent_runtime(runtime);
+                    stats.add_torrent_runtime(info_hash.clone(), runtime);
                 }
                 Ok(Err(_)) => {}
                 Err(_) => {

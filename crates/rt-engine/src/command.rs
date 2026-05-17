@@ -132,7 +132,19 @@ pub struct EngineStats {
     pub peer_command_queue_full: u64,
     pub tracker_peer_cache_entries: u64,
     pub tracker_peer_cache_drops: u64,
+    pub hot_torrent_memory_top: Vec<HotTorrentMemoryStats>,
     pub resources: Option<ResourceSnapshot>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HotTorrentMemoryStats {
+    pub info_hash: String,
+    pub estimated_bytes: u64,
+    pub piece_assembly_bytes: u64,
+    pub peer_buffer_bytes: u64,
+    pub tracker_peer_bytes: u64,
+    pub peer_command_queue_bytes: u64,
+    pub storage_cache_bytes: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -167,6 +179,8 @@ pub struct TorrentRuntimeStats {
 }
 
 impl EngineStats {
+    const HOT_TORRENT_MEMORY_TOP_N: usize = 10;
+
     pub fn add_activity_tier(&mut self, tier: TorrentActivityTier) {
         match tier {
             TorrentActivityTier::Hot => self.torrents_activity_hot += 1,
@@ -175,7 +189,8 @@ impl EngineStats {
         }
     }
 
-    pub fn add_torrent_runtime(&mut self, runtime: TorrentRuntimeStats) {
+    pub fn add_torrent_runtime(&mut self, info_hash: String, runtime: TorrentRuntimeStats) {
+        self.record_hot_torrent_memory(info_hash, &runtime);
         self.torrent_tasks_active = self.torrent_tasks_active.saturating_add(1);
         self.fastresume_dirty_pieces = self
             .fastresume_dirty_pieces
@@ -442,6 +457,40 @@ impl EngineStats {
         self.storage_sparse_seek_fallbacks = self
             .storage_sparse_seek_fallbacks
             .saturating_add(storage.sparse_seek_fallbacks);
+    }
+
+    fn record_hot_torrent_memory(&mut self, info_hash: String, runtime: &TorrentRuntimeStats) {
+        let peer_buffer_bytes = runtime
+            .peer_rx_buffer_bytes
+            .saturating_add(runtime.peer_tx_buffer_bytes);
+        let tracker_peer_bytes = runtime.tracker_peer_cache_entries.saturating_mul(64);
+        let peer_command_queue_bytes = runtime.peer_command_queue_capacity.saturating_mul(64);
+        let storage_cache_bytes = (runtime.storage.file_pool.open_files as u64).saturating_mul(256);
+        let estimated_bytes = runtime
+            .piece_assembly_bytes
+            .saturating_add(peer_buffer_bytes)
+            .saturating_add(tracker_peer_bytes)
+            .saturating_add(peer_command_queue_bytes)
+            .saturating_add(storage_cache_bytes);
+        if estimated_bytes == 0 {
+            return;
+        }
+        self.hot_torrent_memory_top.push(HotTorrentMemoryStats {
+            info_hash,
+            estimated_bytes,
+            piece_assembly_bytes: runtime.piece_assembly_bytes,
+            peer_buffer_bytes,
+            tracker_peer_bytes,
+            peer_command_queue_bytes,
+            storage_cache_bytes,
+        });
+        self.hot_torrent_memory_top.sort_by(|a, b| {
+            b.estimated_bytes
+                .cmp(&a.estimated_bytes)
+                .then_with(|| a.info_hash.cmp(&b.info_hash))
+        });
+        self.hot_torrent_memory_top
+            .truncate(Self::HOT_TORRENT_MEMORY_TOP_N);
     }
 }
 
@@ -740,25 +789,28 @@ mod tests {
         storage.sync_latency_ns = 300;
         storage.hash_latency_ns = 400;
 
-        stats.add_torrent_runtime(TorrentRuntimeStats {
-            connected_peers: 2,
-            outstanding_requests: 3,
-            fastresume_dirty_pieces: 4,
-            completed_piece_verify_from_memory: 5,
-            completed_piece_verify_from_disk: 6,
-            piece_assembly_buffers: 19,
-            piece_assembly_bytes: 20,
-            piece_assembly_evictions: 21,
-            peer_request_window_reductions: 22,
-            peer_rx_buffer_bytes: 23,
-            peer_tx_buffer_bytes: 24,
-            peer_command_queue_depth: 27,
-            peer_command_queue_capacity: 28,
-            peer_command_queue_full: 29,
-            tracker_peer_cache_entries: 25,
-            tracker_peer_cache_drops: 26,
-            storage,
-        });
+        stats.add_torrent_runtime(
+            "hash-a".to_string(),
+            TorrentRuntimeStats {
+                connected_peers: 2,
+                outstanding_requests: 3,
+                fastresume_dirty_pieces: 4,
+                completed_piece_verify_from_memory: 5,
+                completed_piece_verify_from_disk: 6,
+                piece_assembly_buffers: 19,
+                piece_assembly_bytes: 20,
+                piece_assembly_evictions: 21,
+                peer_request_window_reductions: 22,
+                peer_rx_buffer_bytes: 23,
+                peer_tx_buffer_bytes: 24,
+                peer_command_queue_depth: 27,
+                peer_command_queue_capacity: 28,
+                peer_command_queue_full: 29,
+                tracker_peer_cache_entries: 25,
+                tracker_peer_cache_drops: 26,
+                storage,
+            },
+        );
 
         assert_eq!(stats.storage_file_pool_capacity, 64);
         assert_eq!(stats.storage_file_pool_open_files, 8);
@@ -826,5 +878,45 @@ mod tests {
         assert_eq!(stats.peer_command_queue_full, 29);
         assert_eq!(stats.tracker_peer_cache_entries, 25);
         assert_eq!(stats.tracker_peer_cache_drops, 26);
+        assert_eq!(
+            stats.hot_torrent_memory_top,
+            vec![HotTorrentMemoryStats {
+                info_hash: "hash-a".to_string(),
+                estimated_bytes: 5_507,
+                piece_assembly_bytes: 20,
+                peer_buffer_bytes: 47,
+                tracker_peer_bytes: 1_600,
+                peer_command_queue_bytes: 1_792,
+                storage_cache_bytes: 2_048,
+            }]
+        );
+    }
+
+    #[test]
+    fn engine_stats_tracks_top_hot_torrent_memory_estimates() {
+        let mut stats = EngineStats::default();
+
+        for n in 0..12 {
+            stats.add_torrent_runtime(
+                format!("hash-{n:02}"),
+                TorrentRuntimeStats {
+                    piece_assembly_bytes: n * 1_024,
+                    peer_rx_buffer_bytes: n * 64,
+                    peer_tx_buffer_bytes: n * 32,
+                    peer_command_queue_capacity: n,
+                    tracker_peer_cache_entries: 1,
+                    ..Default::default()
+                },
+            );
+        }
+
+        assert_eq!(stats.hot_torrent_memory_top.len(), 10);
+        assert_eq!(stats.hot_torrent_memory_top[0].info_hash, "hash-11");
+        assert_eq!(stats.hot_torrent_memory_top[1].info_hash, "hash-10");
+        assert_eq!(stats.hot_torrent_memory_top[9].info_hash, "hash-02");
+        assert!(stats
+            .hot_torrent_memory_top
+            .windows(2)
+            .all(|window| window[0].estimated_bytes >= window[1].estimated_bytes));
     }
 }
