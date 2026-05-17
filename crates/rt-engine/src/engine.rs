@@ -3072,10 +3072,24 @@ impl Engine {
         };
         let db = self.db.lock().expect("database mutex poisoned");
         if let Err(e) = rt_db::append_session_event(&db, &event) {
-            warn!(kind, err = %e, "failed to append session event");
+            warn!(
+                component = "db",
+                operation = "append_session_event",
+                kind,
+                result = "error",
+                error = %e,
+                "failed to append session event"
+            );
         } else if let Err(e) = rt_db::prune_session_events(&db, self.config.logging.event_retention)
         {
-            warn!(kind, err = %e, "failed to prune session events");
+            warn!(
+                component = "db",
+                operation = "prune_session_events",
+                kind,
+                result = "error",
+                error = %e,
+                "failed to prune session events"
+            );
         }
     }
 
@@ -3129,11 +3143,26 @@ impl Engine {
         };
         let db = self.db.lock().expect("database mutex poisoned");
         if let Err(e) = rt_db::upsert_job(&db, &job) {
-            warn!(torrent = %info_hash, err = %e, "failed to persist recheck job");
+            warn!(
+                component = "db",
+                operation = "persist_recheck_job",
+                torrent = %info_hash,
+                result = "error",
+                error = %e,
+                "failed to persist recheck job"
+            );
             return None;
         }
         if let Err(e) = rt_db::append_job_event(&db, &event) {
-            warn!(job_id = %job_id, err = %e, "failed to append recheck job event");
+            warn!(
+                component = "db",
+                operation = "append_job_event",
+                job_id = %job_id,
+                kind = %event.kind,
+                result = "error",
+                error = %e,
+                "failed to append recheck job event"
+            );
         }
         Some(job_id)
     }
@@ -3164,7 +3193,14 @@ impl Engine {
             match rt_db::get_job(&db, job_id) {
                 Ok(job) => job,
                 Err(e) => {
-                    warn!(job_id, err = %e, "failed to load job for state update");
+                    warn!(
+                        component = "db",
+                        operation = "load_job_for_state_update",
+                        job_id,
+                        result = "error",
+                        error = %e,
+                        "failed to load job for state update"
+                    );
                     return;
                 }
             }
@@ -3188,11 +3224,27 @@ impl Engine {
         };
         let db = self.db.lock().expect("database mutex poisoned");
         if let Err(e) = rt_db::upsert_job(&db, &job) {
-            warn!(job_id, err = %e, "failed to persist job state");
+            warn!(
+                component = "db",
+                operation = "persist_job_state",
+                job_id,
+                state,
+                result = "error",
+                error = %e,
+                "failed to persist job state"
+            );
             return;
         }
         if let Err(e) = rt_db::append_job_event(&db, &event) {
-            warn!(job_id, err = %e, "failed to append job state event");
+            warn!(
+                component = "db",
+                operation = "append_job_event",
+                job_id,
+                kind = %event.kind,
+                result = "error",
+                error = %e,
+                "failed to append job state event"
+            );
         }
         if state == JOB_STATE_RUNNING {
             let started = rt_db::JobEventRow {
@@ -3204,7 +3256,15 @@ impl Engine {
                 payload: serde_json::json!({ "state": state }).to_string(),
             };
             if let Err(e) = rt_db::append_job_event(&db, &started) {
-                warn!(job_id, err = %e, "failed to append recheck start event");
+                warn!(
+                    component = "db",
+                    operation = "append_job_event",
+                    job_id,
+                    kind = %started.kind,
+                    result = "error",
+                    error = %e,
+                    "failed to append recheck start event"
+                );
             }
         }
     }
@@ -3222,7 +3282,14 @@ impl Engine {
             match rt_db::get_job(&db, job_id) {
                 Ok(job) => job,
                 Err(e) => {
-                    warn!(job_id, err = %e, "failed to load pure v2 recheck job");
+                    warn!(
+                        component = "db",
+                        operation = "load_pure_v2_recheck_job",
+                        job_id,
+                        result = "error",
+                        error = %e,
+                        "failed to load pure v2 recheck job"
+                    );
                     return;
                 }
             }
@@ -3253,11 +3320,26 @@ impl Engine {
         };
         let db = self.db.lock().expect("database mutex poisoned");
         if let Err(e) = rt_db::upsert_job(&db, &job) {
-            warn!(job_id, err = %e, "failed to persist pure v2 recheck job");
+            warn!(
+                component = "db",
+                operation = "persist_pure_v2_recheck_job",
+                job_id,
+                result = "error",
+                error = %e,
+                "failed to persist pure v2 recheck job"
+            );
             return;
         }
         if let Err(e) = rt_db::append_job_event(&db, &event) {
-            warn!(job_id, err = %e, "failed to append pure v2 recheck event");
+            warn!(
+                component = "db",
+                operation = "append_job_event",
+                job_id,
+                kind = %event.kind,
+                result = "error",
+                error = %e,
+                "failed to append pure v2 recheck event"
+            );
         }
     }
 
