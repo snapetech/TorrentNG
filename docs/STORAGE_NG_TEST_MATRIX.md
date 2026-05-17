@@ -14,6 +14,16 @@ scripts/storage_ng_feature_matrix.sh
 Set `STORAGE_NG_REAL_DEVICE=1` and `TNG_STORAGE_BENCH_DIR=/mnt/target` to add
 the ignored real-device probes.
 
+For release hardware evidence across multiple mounts, run:
+
+```sh
+scripts/storage_hardware_matrix.sh /mnt/nvme /mnt/hdd
+```
+
+The hardware matrix writes a markdown report under `certification/reports/`,
+prints topology for each target, and enforces the HDD elevator speedup gate
+when `TNG_STORAGE_REQUIRE_HDD_5X=1` is set.
+
 ## Automated Matrix
 
 | Area | Coverage | Command |
@@ -57,6 +67,12 @@ Run:
 
 ```sh
 STORAGE_NG_REAL_DEVICE=1 TNG_STORAGE_BENCH_DIR=/mnt/target scripts/storage_ng_feature_matrix.sh
+```
+
+For a mixed-storage host, prefer:
+
+```sh
+TNG_STORAGE_REQUIRE_HDD_5X=1 scripts/storage_hardware_matrix.sh /mnt/nvme /mnt/hdd
 ```
 
 | Platform | Required evidence |

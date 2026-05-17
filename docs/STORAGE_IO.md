@@ -116,9 +116,10 @@ The following items are still implementation targets:
   in-memory piece assembly pressure.
 - Replace the worker-owned fixed-buffer copy path with true frame-pool slot
   pinning once the global frame pool can lease stable registered buffer indexes.
-- Add benchmarks comparing syscall count, seed-read locality, recheck runtime
-  progress, and bounded descriptor use under active file counts above pool
-  capacity.
+- Extend the release hardware report with syscall counters and recheck runtime
+  progress. `scripts/storage_hardware_matrix.sh` already records real-device
+  seed-read locality and bounded hot-file descriptor reuse across one or more
+  target mounts.
 
 ## Correctness Rules
 
