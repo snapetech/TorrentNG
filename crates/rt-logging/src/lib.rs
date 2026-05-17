@@ -107,6 +107,22 @@ pub fn init(config: &LoggingConfig, legacy_filter: Option<&str>) -> EffectiveLog
     effective
 }
 
+pub fn correlation_id(candidate: Option<&str>, generate: impl FnOnce() -> String) -> String {
+    candidate
+        .map(str::trim)
+        .filter(|value| valid_correlation_id(value))
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(generate)
+}
+
+pub fn valid_correlation_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,5 +155,25 @@ mod tests {
         } else {
             std::env::remove_var("RUST_LOG");
         }
+    }
+
+    #[test]
+    fn correlation_ids_are_bounded_and_header_safe() {
+        assert_eq!(
+            correlation_id(Some(" client-123.trace/4 "), || "generated".to_owned()),
+            "client-123.trace/4"
+        );
+        assert_eq!(
+            correlation_id(Some("bad value"), || "generated".to_owned()),
+            "generated"
+        );
+        assert_eq!(
+            correlation_id(Some(""), || "generated".to_owned()),
+            "generated"
+        );
+        assert_eq!(
+            correlation_id(Some(&"a".repeat(129)), || "generated".to_owned()),
+            "generated"
+        );
     }
 }

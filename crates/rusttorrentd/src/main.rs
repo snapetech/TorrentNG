@@ -143,21 +143,12 @@ async fn request_log(req: Request<Body>, next: Next) -> Response {
 }
 
 fn request_id(headers: &HeaderMap) -> String {
-    headers
-        .get("x-request-id")
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| valid_request_id(value))
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| format!("tng-{}", REQUEST_ID.fetch_add(1, Ordering::Relaxed)))
-}
-
-fn valid_request_id(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 128
-        && value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')
-        })
+    rt_logging::correlation_id(
+        headers
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok()),
+        || format!("tng-{}", REQUEST_ID.fetch_add(1, Ordering::Relaxed)),
+    )
 }
 
 fn skip_request_log(path: &str) -> bool {

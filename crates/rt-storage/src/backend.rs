@@ -84,6 +84,36 @@ pub struct BackendSelection {
     pub reason: String,
 }
 
+/// How the selected backend uses registered fixed buffers, when available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixedBufferStrategy {
+    /// No fixed buffers are registered or used.
+    Disabled,
+    /// The backend registers private worker buffers and copies between those
+    /// buffers and application frames at completion/submission time.
+    WorkerCopy,
+    /// The backend can submit application frame-pool slots directly.
+    FramePoolSlots,
+}
+
+impl FixedBufferStrategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::WorkerCopy => "worker_copy",
+            Self::FramePoolSlots => "frame_pool_slots",
+        }
+    }
+
+    pub fn uses_worker_copy(self) -> bool {
+        matches!(self, Self::WorkerCopy)
+    }
+
+    pub fn uses_frame_pool_slots(self) -> bool {
+        matches!(self, Self::FramePoolSlots)
+    }
+}
+
 /// Probe-selected disk backend.
 ///
 /// The enum keeps the scheduler/runtime selection decision narrow while the
@@ -263,6 +293,13 @@ impl DiskBackend for SelectedDiskBackend {
         match &self.inner {
             SelectedDiskBackendInner::Pread(backend) => backend.fixed_buffer_len(),
             SelectedDiskBackendInner::Uring(backend) => backend.fixed_buffer_len(),
+        }
+    }
+
+    fn fixed_buffer_strategy(&self) -> FixedBufferStrategy {
+        match &self.inner {
+            SelectedDiskBackendInner::Pread(backend) => backend.fixed_buffer_strategy(),
+            SelectedDiskBackendInner::Uring(backend) => backend.fixed_buffer_strategy(),
         }
     }
 }
@@ -517,6 +554,14 @@ impl DiskBackend for UringBackend {
             URING_FIXED_BUFFER_LEN
         } else {
             0
+        }
+    }
+
+    fn fixed_buffer_strategy(&self) -> FixedBufferStrategy {
+        if self.supports_fixed_buffers() {
+            FixedBufferStrategy::WorkerCopy
+        } else {
+            FixedBufferStrategy::Disabled
         }
     }
 }
@@ -971,6 +1016,12 @@ pub trait DiskBackend: Send + Sync {
     fn fixed_buffer_len(&self) -> usize {
         0
     }
+
+    /// Whether fixed-buffer submissions use backend-private copy buffers or
+    /// application frame-pool slots directly.
+    fn fixed_buffer_strategy(&self) -> FixedBufferStrategy {
+        FixedBufferStrategy::Disabled
+    }
 }
 
 enum Job {
@@ -1280,6 +1331,7 @@ mod tests {
         let frame = pool.try_acquire(7).unwrap();
         let frame = backend.pread(file, frame, 16).await.unwrap().unwrap();
         assert_eq!(frame.as_slice(), b"backend");
+        assert!(!backend.fixed_buffer_strategy().uses_frame_pool_slots());
     }
 
     #[tokio::test]
@@ -1332,6 +1384,15 @@ mod tests {
         assert_eq!(backend.max_batch_len(), URING_BATCH_LIMIT);
         if backend.supports_fixed_buffers() {
             assert_eq!(backend.fixed_buffer_len(), URING_FIXED_BUFFER_LEN);
+            assert_eq!(
+                backend.fixed_buffer_strategy(),
+                FixedBufferStrategy::WorkerCopy
+            );
+        } else {
+            assert_eq!(
+                backend.fixed_buffer_strategy(),
+                FixedBufferStrategy::Disabled
+            );
         }
     }
 
@@ -1339,5 +1400,17 @@ mod tests {
     fn uring_fixed_buffer_registration_budget_stays_below_common_memlock_limit() {
         assert!(URING_FIXED_BUFFER_SLOTS < URING_BATCH_LIMIT);
         assert!(URING_FIXED_BUFFER_SLOTS * URING_FIXED_BUFFER_LEN <= 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn fixed_buffer_strategy_names_are_stable_for_metrics() {
+        assert_eq!(FixedBufferStrategy::Disabled.as_str(), "disabled");
+        assert_eq!(FixedBufferStrategy::WorkerCopy.as_str(), "worker_copy");
+        assert_eq!(
+            FixedBufferStrategy::FramePoolSlots.as_str(),
+            "frame_pool_slots"
+        );
+        assert!(FixedBufferStrategy::WorkerCopy.uses_worker_copy());
+        assert!(FixedBufferStrategy::FramePoolSlots.uses_frame_pool_slots());
     }
 }

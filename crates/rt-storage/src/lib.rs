@@ -12,8 +12,8 @@ pub mod scheduler;
 pub mod verify;
 
 pub use backend::{
-    BackendKind, BackendRequest, BackendSelection, DiskBackend, PreadBackend, SelectedDiskBackend,
-    UringBackend, UringProbe,
+    BackendKind, BackendRequest, BackendSelection, DiskBackend, FixedBufferStrategy, PreadBackend,
+    SelectedDiskBackend, UringBackend, UringProbe,
 };
 pub use device::{detect_storage_profile, detect_storage_topology, StorageTopology};
 pub use elevator::{

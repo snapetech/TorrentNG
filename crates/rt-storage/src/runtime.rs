@@ -21,7 +21,9 @@ use std::time::Duration;
 
 use once_cell::sync::Lazy;
 
-use crate::backend::{BackendKind, BackendRequest, DiskBackend, SelectedDiskBackend};
+use crate::backend::{
+    BackendKind, BackendRequest, DiskBackend, FixedBufferStrategy, SelectedDiskBackend,
+};
 use crate::error::StorageError;
 use crate::fd_limit::{handle_cache_capacity, raise_nofile_limit};
 use crate::frame::{global_frame_pool, Frame, FramePool};
@@ -136,6 +138,10 @@ impl StorageRuntime {
 
     pub fn backend_fixed_buffer_len(&self) -> usize {
         self.backend.fixed_buffer_len()
+    }
+
+    pub fn backend_fixed_buffer_strategy(&self) -> FixedBufferStrategy {
+        self.backend.fixed_buffer_strategy()
     }
 
     fn open_read(&self, path: &Path) -> Result<Arc<File>, StorageError> {

@@ -1944,6 +1944,30 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
         "Bytes in each registered fixed buffer for the selected storage backend",
         storage.backend_fixed_buffer_len() as u64,
     );
+    let fixed_buffer_strategy = storage.backend_fixed_buffer_strategy();
+    metric_with_label(
+        &mut out,
+        "torrentng_storage_backend_fixed_buffer_strategy",
+        "gauge",
+        "Selected fixed-buffer strategy; value is 1 for the active strategy",
+        "strategy",
+        fixed_buffer_strategy.as_str(),
+        1,
+    );
+    metric(
+        &mut out,
+        "torrentng_storage_backend_fixed_buffer_worker_copy",
+        "gauge",
+        "Whether fixed-buffer submissions copy through backend-private worker buffers",
+        u64::from(fixed_buffer_strategy.uses_worker_copy()),
+    );
+    metric(
+        &mut out,
+        "torrentng_storage_backend_frame_pool_slots_supported",
+        "gauge",
+        "Whether fixed-buffer submissions use registered storage frame-pool slots directly",
+        u64::from(fixed_buffer_strategy.uses_frame_pool_slots()),
+    );
     metric(
         &mut out,
         "torrentng_storage_handles_open",
@@ -2784,6 +2808,9 @@ mod tests {
         assert!(rendered.contains("torrentng_storage_backend_registered_files_supported "));
         assert!(rendered.contains("torrentng_storage_backend_max_batch_len "));
         assert!(rendered.contains("torrentng_storage_backend_fixed_buffer_bytes "));
+        assert!(rendered.contains("torrentng_storage_backend_fixed_buffer_strategy{strategy=\""));
+        assert!(rendered.contains("torrentng_storage_backend_fixed_buffer_worker_copy "));
+        assert!(rendered.contains("torrentng_storage_backend_frame_pool_slots_supported "));
         assert!(rendered.contains("torrentng_storage_handles_open "));
         assert!(rendered.contains("torrentng_storage_frame_bytes_cap "));
     }
