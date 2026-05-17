@@ -66,20 +66,22 @@ export function StatusBar({ loaded, total, selected, stats, rtorrent, cached, st
     : storage?.error ?? 'Storage status unavailable'
 
   return (
-    <footer style={{
+    <footer className="rtng-statusbar" style={{
       minHeight: 36, flexShrink: 0, display: 'flex', alignItems: 'center', gap: 12,
       padding: '0 12px', background: 'var(--bg)', borderTop: '1px solid var(--border-strong)',
       color: 'var(--faint)', fontSize: 11, overflowX: 'auto',
     }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 'max-content' }}>
+      <div className="rtng-statusbar-summary" style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 'max-content' }}>
         <Badge label="Core" value={connected ? 'connected' : 'disconnected'} state={connected ? 'on' : 'closed'} />
+      </div>
+      <div className="rtng-statusbar-counts" style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 'max-content' }}>
         <span>{total.toLocaleString()} torrents</span>
         {rendered !== total && <span>{rendered.toLocaleString()} rendered</span>}
         {cached !== undefined && <span>{cached.toLocaleString()} cached</span>}
         {selected > 0 && <span style={{ color: 'var(--accent)' }}>{selected.toLocaleString()} selected</span>}
       </div>
-      <span style={{ flex: 1 }} />
-      <div style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 'max-content' }}>
+      <span className="rtng-statusbar-spacer" style={{ flex: 1 }} />
+      <div className="rtng-statusbar-metrics" style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 'max-content' }}>
         <Badge label="DL" value={fmtSpeed(stats.download_speed)} state={(stats.download_speed ?? 0) > 0 ? 'on' : 'unknown'} />
         <Badge label="UL" value={fmtSpeed(stats.upload_speed)} state={(stats.upload_speed ?? 0) > 0 ? 'on' : 'unknown'} />
         <Badge label="Disk" value={storageLabel} title={storageTitle} state={storage?.ok ? 'on' : 'unknown'} />

@@ -155,6 +155,26 @@ input[type="radio"]:not(:disabled):hover {
     max-width: 150px;
   }
 
+  .rtng-statusbar {
+    gap: 8px !important;
+  }
+
+  .rtng-statusbar-summary {
+    order: 1;
+  }
+
+  .rtng-statusbar-metrics {
+    order: 2;
+  }
+
+  .rtng-statusbar-counts {
+    order: 3;
+  }
+
+  .rtng-statusbar-spacer {
+    display: none;
+  }
+
   .rtng-main {
     flex-direction: column;
   }
