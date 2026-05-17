@@ -93,6 +93,51 @@ pub async fn storage_roots(State(s): State<AppState>) -> impl IntoResponse {
     Json(serde_json::json!({ "roots": rows }))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct LogsQuery {
+    limit: Option<usize>,
+    kind: Option<String>,
+    level: Option<String>,
+}
+
+pub async fn list_logs(
+    State(s): State<AppState>,
+    Query(query): Query<LogsQuery>,
+) -> impl IntoResponse {
+    let limit = query.limit.unwrap_or(200).clamp(1, 1000);
+    match s.db.list_app_events(limit) {
+        Ok(events) => {
+            let events = events
+                .into_iter()
+                .filter(|event| {
+                    query
+                        .kind
+                        .as_ref()
+                        .map(|kind| event.kind == *kind)
+                        .unwrap_or(true)
+                })
+                .filter(|event| {
+                    query
+                        .level
+                        .as_ref()
+                        .map(|level| event.level.eq_ignore_ascii_case(level))
+                        .unwrap_or(true)
+                })
+                .collect::<Vec<_>>();
+            Json(serde_json::json!({ "logs": events })).into_response()
+        }
+        Err(e) => {
+            tracing::error!(
+                component = "api",
+                operation = "list_logs",
+                error = %e,
+                "list logs failed"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
 pub async fn tracker_health(State(s): State<AppState>) -> impl IntoResponse {
     match s.db.tracker_health() {
         Ok(trackers) => Json(serde_json::json!({ "trackers": trackers })).into_response(),

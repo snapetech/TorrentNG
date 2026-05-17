@@ -73,6 +73,7 @@ the rewritten engine.
 | `DELETE` | `/api/v1/torrents/:hash/tags` | Remove tags (`{ tags: ["a"] }`) |
 | `GET` | `/api/v1/events` | Server-sent torrent delta stream |
 | `GET` | `/api/v1/session-events` | Recent durable native session events; query: `limit`, `torrent`, `kind`, `level` |
+| `GET` | `/api/v1/logs` | Recent durable sidecar app/rTorrent events; query: `limit`, `kind`, `level` |
 
 #### `GET /api/v1/torrents` query parameters
 

@@ -2445,6 +2445,48 @@ async fn qb_log_main_returns_retained_app_events() {
 }
 
 #[tokio::test]
+async fn native_logs_returns_filtered_app_events() {
+    let (addr, client, db) = spawn_server_with_db().await;
+    db.append_app_event(
+        &AppEventRow {
+            event_id: None,
+            occurred_at: 1_700_000_010,
+            level: "info".to_owned(),
+            kind: "sidecar_started".to_owned(),
+            message: "started".to_owned(),
+            payload: "{}".to_owned(),
+        },
+        16,
+    )
+    .unwrap();
+    db.append_app_event(
+        &AppEventRow {
+            event_id: None,
+            occurred_at: 1_700_000_011,
+            level: "warn".to_owned(),
+            kind: "rtorrent_log".to_owned(),
+            message: "tracker warning".to_owned(),
+            payload: serde_json::json!({"component":"rtorrent"}).to_string(),
+        },
+        16,
+    )
+    .unwrap();
+
+    let res = client
+        .get(url(addr, "/api/v1/logs?level=warn&kind=rtorrent_log"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let logs = body["logs"].as_array().unwrap();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0]["message"], "tracker warning");
+    assert_eq!(logs[0]["kind"], "rtorrent_log");
+    assert_eq!(logs[0]["level"], "warn");
+}
+
+#[tokio::test]
 async fn qb_set_preferences_validates_json() {
     let (addr, client) = spawn_server().await;
 
