@@ -71,6 +71,8 @@ the rewritten engine.
 | `PUT`  | `/api/v1/torrents/:hash/category` | Set category (`{ category: "name" }`) |
 | `POST` | `/api/v1/torrents/:hash/tags` | Add tags (`{ tags: ["a","b"] }`) |
 | `DELETE` | `/api/v1/torrents/:hash/tags` | Remove tags (`{ tags: ["a"] }`) |
+| `GET` | `/api/v1/events` | Server-sent torrent delta stream |
+| `GET` | `/api/v1/session-events` | Recent durable native session events; query: `limit`, `torrent`, `kind`, `level` |
 
 #### `GET /api/v1/torrents` query parameters
 
