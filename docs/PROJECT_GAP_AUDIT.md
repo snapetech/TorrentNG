@@ -195,6 +195,8 @@ non-clean certification row and writes a paired burndown report.
 `scripts/certification_bundle.sh` packages the latest certification status and
 referenced reports into a hashed `certification/bundles/` tarball for release
 notes or handoff.
+`docs/RELEASE_EVIDENCE.md` is the runbook for clearing every current warning
+row and producing the final evidence bundle.
 The full Docker interop matrix still has release evidence to run:
 
 - local Docker client-to-client rows across qBittorrent, Transmission, Deluge,
