@@ -6,7 +6,7 @@ storage_roots = ["/data"]
 [rtorrent]
 scgi_socket = "/run/rtorrent/rpc.sock"
 timeout_secs = 10
-user_agent = "rtorrentNG/0.1.0 libtorrent/0.16.11"
+user_agent = "rtorrent/0.16.11"
 
 [auth]
 secret_key = "certification-only-change-me"

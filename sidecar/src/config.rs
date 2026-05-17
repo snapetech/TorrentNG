@@ -4,7 +4,7 @@ use std::{path::PathBuf, time::Duration};
 
 /// Default user-agent announced to trackers via rTorrent.
 /// Overridden by config or RTNG_USER_AGENT env var.
-pub const DEFAULT_USER_AGENT: &str = "rtorrentNG/0.1.0 libtorrent/0.16.11";
+pub const DEFAULT_USER_AGENT: &str = "rtorrent/0.16.11";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

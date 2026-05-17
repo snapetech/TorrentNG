@@ -158,7 +158,7 @@ Environment variables override file values where listed.
 | `scgi_socket` | `/run/rtorrent/rpc.sock` | `RTNG_SCGI_SOCKET` | Path to rTorrent SCGI Unix socket |
 | `scgi_addr` | - | `RTNG_SCGI_ADDR` | `host:port` for TCP SCGI; mutually exclusive with `scgi_socket` |
 | `timeout_secs` | `10` | - | Timeout for individual XMLRPC calls |
-| `user_agent` | `rtorrentNG/0.1.0 libtorrent/0.16.11` | `RTNG_USER_AGENT` | Client identifier pushed to rTorrent on startup |
+| `user_agent` | `rtorrent/0.16.11` | `RTNG_USER_AGENT` | Client identifier pushed to rTorrent on startup |
 
 #### `user_agent`
 
@@ -166,11 +166,11 @@ The `user_agent` value is pushed to rTorrent via `network.http.user_agent.set` o
 
 ```toml
 [rtorrent]
-user_agent = "rtorrentNG/0.1.0 libtorrent/0.16.11"
+user_agent = "rtorrent/0.16.11"
 ```
 
 ```sh
-RTNG_USER_AGENT="rtorrentNG/0.1.0 libtorrent/0.16.11" rtorrentng
+RTNG_USER_AGENT="rtorrent/0.16.11" rtorrentng
 ```
 
 Known values:
@@ -237,7 +237,7 @@ storage_roots = ["/data", "/mnt/archive"]
 [rtorrent]
 scgi_socket = "/run/rtorrent/rpc.sock"
 timeout_secs = 10
-user_agent = "rtorrentNG/0.1.0 libtorrent/0.16.11"
+user_agent = "rtorrent/0.16.11"
 
 [auth]
 secret_key = "change-me-in-production"

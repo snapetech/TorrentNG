@@ -134,7 +134,7 @@ Every release must pass:
 ## user_agent
 
 Configurable via `[rtorrent] user_agent` in config or `RTNG_USER_AGENT` env var.
-Default: `rtorrentNG/0.1.0 libtorrent/0.16.11` (used in packaged releases).
+Default: `rtorrent/0.16.11` (used in packaged releases).
 Pushed to rTorrent via `network.http.user_agent.set` on startup.
 Runtime update: `PUT /api/v1/settings/user-agent` or Settings panel in WebUI.
 See `docs/CONFIGURATION.md` for known values.
