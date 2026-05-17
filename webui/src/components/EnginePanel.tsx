@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, type EngineDiagnostics, type ProbeValue, type RtorrentSettingDescriptor } from '../api/client'
 
@@ -215,7 +215,7 @@ function RtorrentSettingsPanel() {
   const [draft, setDraft] = useState<Record<string, string | number | boolean>>({})
   const [customRc, setCustomRc] = useState('')
   const [filter, setFilter] = useState('')
-  const [viewFilter, setViewFilter] = useState<'all' | 'edited' | 'restart' | 'live'>('all')
+  const [viewFilter, setViewFilter] = useState<SettingsViewFilter>('all')
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set())
   const [notice, setNotice] = useState<{ tone: 'ok' | 'warn' | 'error'; text: string } | null>(null)
 
@@ -230,22 +230,6 @@ function RtorrentSettingsPanel() {
     setDraft(next)
     setCustomRc(data.custom_rc)
   }, [data])
-
-  useEffect(() => {
-    function onKey(e: KeyboardEvent) {
-      if (!(e.ctrlKey || e.metaKey)) return
-      if (e.key.toLowerCase() === 's') {
-        e.preventDefault()
-        if (dirtyCount > 0 && !save.isPending) save.mutate()
-      }
-      if (e.key.toLowerCase() === 'z' && e.shiftKey) {
-        e.preventDefault()
-        resetAll()
-      }
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  })
 
   const save = useMutation({
     mutationFn: () => api.rtorrentSettings.save(draft, customRc, true),
@@ -271,6 +255,7 @@ function RtorrentSettingsPanel() {
   }) ?? []
   const customRcDirty = data ? customRc !== data.custom_rc : false
   const dirtyCount = dirtySettings.length + (customRcDirty ? 1 : 0)
+  const unavailableCount = data?.values.filter(value => !value.live.ok).length ?? 0
   const filteredGroups = useMemo(() => {
     if (!data) return []
     const needle = filter.trim().toLowerCase()
@@ -281,6 +266,7 @@ function RtorrentSettingsPanel() {
         if (viewFilter === 'edited' && !isDirty) return false
         if (viewFilter === 'restart' && !setting.restart_required) return false
         if (viewFilter === 'live' && setting.restart_required) return false
+        if (viewFilter === 'unavailable' && row?.live.ok !== false) return false
         if (!needle) return true
         return [
           setting.key,
@@ -293,7 +279,7 @@ function RtorrentSettingsPanel() {
         ].some(value => value.toLowerCase().includes(needle))
       }))
   }, [data, draft, filter, viewFilter])
-  const resetAll = () => {
+  const resetAll = useCallback(() => {
     if (!data) return
     const next: Record<string, string | number | boolean> = {}
     for (const setting of data.settings) {
@@ -303,7 +289,7 @@ function RtorrentSettingsPanel() {
     setDraft(next)
     setCustomRc(data.custom_rc)
     setNotice(null)
-  }
+  }, [data])
   const defaultAll = () => {
     if (!data) return
     const next: Record<string, string | number | boolean> = {}
@@ -360,6 +346,22 @@ function RtorrentSettingsPanel() {
     }
   }
 
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (!(e.ctrlKey || e.metaKey)) return
+      if (e.key.toLowerCase() === 's') {
+        e.preventDefault()
+        if (dirtyCount > 0 && !save.isPending) save.mutate()
+      }
+      if (e.key.toLowerCase() === 'z' && e.shiftKey) {
+        e.preventDefault()
+        resetAll()
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [dirtyCount, resetAll, save])
+
   return (
     <Panel wide>
       <Subhead>Settings Control Panel</Subhead>
@@ -374,9 +376,22 @@ function RtorrentSettingsPanel() {
           }}>
             <SettingStat label="Managed knobs" value={data.settings.length.toLocaleString()} />
             <SettingStat label="Unsaved edits" value={dirtyCount.toLocaleString()} tone={dirtyCount > 0 ? 'warn' : 'ok'} />
+            <SettingStat label="Live unavailable" value={unavailableCount.toLocaleString()} tone={unavailableCount > 0 ? 'warn' : 'ok'} />
             <SettingStat label="Overlay" value={data.overlay_writable ? 'writable' : 'readonly'} tone={data.overlay_writable ? 'ok' : 'warn'} />
             <SettingStat label="Restart support" value={data.restart_supported ? 'available' : 'manual'} tone={data.restart_supported ? 'ok' : 'warn'} />
           </div>
+          {!data.overlay_writable && (
+            <div role="alert" style={{
+              color: 'var(--warning)',
+              border: '1px solid color-mix(in srgb, var(--warning) 50%, var(--border))',
+              borderRadius: 7,
+              background: 'color-mix(in srgb, var(--warning) 8%, var(--surface))',
+              padding: '8px 10px',
+              fontSize: 12,
+            }}>
+              Settings overlay directory is not writable from this process. Review values is still available; save may fail until the service can write the overlay path.
+            </div>
+          )}
           <div style={{ color: 'var(--faint)', fontSize: 12, lineHeight: 1.45, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
             <span>
               Values are saved to <span style={{ color: 'var(--muted)', fontFamily: 'monospace' }}>{data.overlay_path}</span>. Live-safe controls are applied immediately; controls marked restart are saved for the next daemon start.
@@ -401,7 +416,14 @@ function RtorrentSettingsPanel() {
                 style={{ ...inputStyle, padding: '7px 9px' }}
               />
             </label>
-            <ViewFilter value={viewFilter} onChange={setViewFilter} dirtyCount={dirtySettings.length} restartCount={data.settings.filter(setting => setting.restart_required).length} liveCount={data.settings.filter(setting => !setting.restart_required).length} />
+            <ViewFilter
+              value={viewFilter}
+              onChange={setViewFilter}
+              dirtyCount={dirtySettings.length}
+              restartCount={data.settings.filter(setting => setting.restart_required).length}
+              liveCount={data.settings.filter(setting => !setting.restart_required).length}
+              unavailableCount={unavailableCount}
+            />
           </div>
           {(filter || viewFilter !== 'all') && (
             <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
@@ -438,11 +460,19 @@ function RtorrentSettingsPanel() {
               <button type="button" onClick={toggleAllGroups} style={smallButtonStyle(filteredGroups.length > 0)} disabled={filteredGroups.length === 0}>
                 {allGroupsCollapsed ? 'Expand all' : 'Collapse all'}
               </button>
-              <button type="button" onClick={defaultAll} disabled={save.isPending} style={smallButtonStyle(!save.isPending)}>
+              <button type="button" onClick={defaultAll} disabled={save.isPending || !data.overlay_writable} style={smallButtonStyle(!save.isPending && data.overlay_writable)}>
                 Defaults all
               </button>
             </div>
           </div>
+          {dirtyCount > 0 && (
+            <ChangeReview
+              settings={dirtySettings}
+              draft={draft}
+              customRcDirty={customRcDirty}
+              values={data.values}
+            />
+          )}
           <div style={{ display: 'grid', gap: 12 }}>
             {filteredGroups.map(group => {
               const collapsed = collapsedGroups.has(group.name)
@@ -485,7 +515,7 @@ function RtorrentSettingsPanel() {
                     </div>
                   </div>
                   <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-                    <button type="button" onClick={() => defaultGroup(group.settings)} style={smallButtonStyle(!save.isPending)} disabled={save.isPending}>
+                    <button type="button" onClick={() => defaultGroup(group.settings)} style={smallButtonStyle(!save.isPending && data.overlay_writable)} disabled={save.isPending || !data.overlay_writable}>
                       Defaults
                     </button>
                     <button type="button" onClick={() => resetGroup(group.settings)} style={smallButtonStyle(groupDirty > 0 && !save.isPending)} disabled={groupDirty === 0 || save.isPending}>
@@ -511,8 +541,11 @@ function RtorrentSettingsPanel() {
                     const live = row?.live.value ?? null
                     const dirty = !sameSettingValue(value, base)
                     const descriptionId = `rt-setting-${setting.key}-description`
+                    const titleId = `rt-setting-${setting.key}-title`
+                    const liveErrorId = `rt-setting-${setting.key}-live-error`
+                    const liveError = row?.live.ok === false ? row.live.error ?? 'Live readback unavailable' : null
                     return (
-                      <div key={setting.key} className="tng-form-card" data-dirty={dirty ? 'true' : 'false'} style={{
+                      <section key={setting.key} className="tng-form-card" data-dirty={dirty ? 'true' : 'false'} aria-labelledby={titleId} aria-describedby={liveError ? `${descriptionId} ${liveErrorId}` : descriptionId} style={{
                         border: `1px solid ${dirty ? 'color-mix(in srgb, var(--warning) 58%, var(--border))' : 'var(--border)'}`,
                         borderRadius: 7,
                         background: dirty ? 'color-mix(in srgb, var(--warning) 7%, var(--surface))' : 'var(--surface)',
@@ -522,15 +555,29 @@ function RtorrentSettingsPanel() {
                         minWidth: 0,
                       }}>
                         <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, color: 'var(--text)', fontSize: 13, fontWeight: 800 }}>
-                          <span>{setting.label}</span>
+                          <span id={titleId}>{setting.label}</span>
                           <span style={{ display: 'inline-flex', gap: 5, alignItems: 'center', flexShrink: 0 }}>
                             {dirty && <SettingPill tone="warn">edited</SettingPill>}
                             {setting.restart_required && <SettingPill tone="warn">restart</SettingPill>}
+                            {row?.live.ok === false && <SettingPill tone="warn">unavailable</SettingPill>}
                           </span>
                         </div>
                         <div id={descriptionId} style={{ color: 'var(--faint)', fontSize: 11, lineHeight: 1.35 }}>
                           {settingDescription(setting)}
                         </div>
+                        {liveError && (
+                          <div id={liveErrorId} role="status" style={{
+                            color: 'var(--warning)',
+                            border: '1px solid color-mix(in srgb, var(--warning) 45%, var(--border))',
+                            borderRadius: 6,
+                            background: 'color-mix(in srgb, var(--warning) 8%, var(--surface))',
+                            padding: '6px 7px',
+                            fontSize: 11,
+                            overflowWrap: 'anywhere',
+                          }}>
+                            {liveError}
+                          </div>
+                        )}
                         {setting.value_type === 'bool' ? (
                           <BooleanKnob
                             setting={setting}
@@ -562,27 +609,64 @@ function RtorrentSettingsPanel() {
                           <Readout label="Default" value={formatSettingValue(inputValue(setting.value_type, setting.default_value), setting.unit)} />
                           <Readout label="Command" value={setting.command} mono />
                         </div>
-                        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center' }}>
+                        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(120px, 1fr) auto', gap: 8, alignItems: 'center' }}>
                           <span style={{ color: 'var(--faint)', fontSize: 10 }}>
                             {setting.restart_required ? 'Applies on restart' : 'Live apply supported'}
                           </span>
-                          <button
-                            type="button"
-                            onClick={() => setDraft(prev => ({ ...prev, [setting.key]: base }))}
-                            disabled={!dirty || save.isPending}
-                            style={smallButtonStyle(dirty && !save.isPending)}
-                          >
-                            Reset
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => copyText(`${setting.command} / ${setting.setter}`, setting.label)}
-                            style={smallButtonStyle(true)}
-                          >
-                            Copy command
-                          </button>
+                          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                            <button
+                              type="button"
+                              onClick={() => setDraft(prev => ({ ...prev, [setting.key]: base }))}
+                              disabled={!dirty || save.isPending}
+                              style={smallButtonStyle(dirty && !save.isPending)}
+                            >
+                              Reset
+                            </button>
+                            {saved !== null && (
+                              <button
+                                type="button"
+                                onClick={() => setDraft(prev => ({ ...prev, [setting.key]: inputValue(setting.value_type, saved) }))}
+                                disabled={save.isPending}
+                                style={smallButtonStyle(!save.isPending)}
+                              >
+                                Saved
+                              </button>
+                            )}
+                            {live !== null && (
+                              <button
+                                type="button"
+                                onClick={() => setDraft(prev => ({ ...prev, [setting.key]: inputValue(setting.value_type, live) }))}
+                                disabled={save.isPending}
+                                style={smallButtonStyle(!save.isPending)}
+                              >
+                                Live
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => setDraft(prev => ({ ...prev, [setting.key]: inputValue(setting.value_type, setting.default_value) }))}
+                              disabled={save.isPending}
+                              style={smallButtonStyle(!save.isPending)}
+                            >
+                              Default
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => copyText(formatSettingValue(value, setting.unit), `${setting.label} value`)}
+                              style={smallButtonStyle(true)}
+                            >
+                              Copy value
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => copyText(`${setting.command} / ${setting.setter}`, setting.label)}
+                              style={smallButtonStyle(true)}
+                            >
+                              Copy command
+                            </button>
+                          </div>
                         </div>
-                      </div>
+                      </section>
                     )
                   })}
                 </div>
@@ -651,10 +735,10 @@ function RtorrentSettingsPanel() {
           }}>
             <button
               onClick={() => save.mutate()}
-              disabled={save.isPending || dirtyCount === 0}
+              disabled={save.isPending || dirtyCount === 0 || !data.overlay_writable}
               aria-keyshortcuts="Control+S Meta+S"
               title="Save and apply live"
-              style={buttonStyle('var(--accent)', 'var(--accent-soft)', 'var(--accent-text)', dirtyCount > 0 && !save.isPending)}
+              style={buttonStyle('var(--accent)', 'var(--accent-soft)', 'var(--accent-text)', dirtyCount > 0 && !save.isPending && data.overlay_writable)}
             >
               {save.isPending ? 'Saving…' : 'Save and apply live'}
             </button>
@@ -722,23 +806,86 @@ function SettingPill({ tone, children }: { tone: 'warn' | 'ok'; children: React.
   )
 }
 
-function ViewFilter({ value, onChange, dirtyCount, restartCount, liveCount }: {
-  value: 'all' | 'edited' | 'restart' | 'live'
-  onChange: (value: 'all' | 'edited' | 'restart' | 'live') => void
+function ChangeReview({ settings, draft, customRcDirty, values }: {
+  settings: RtorrentSettingDescriptor[]
+  draft: Record<string, string | number | boolean>
+  customRcDirty: boolean
+  values: Array<{ key: string; live: ProbeValue<string>; saved: string | null }>
+}) {
+  return (
+    <details style={{
+      border: '1px solid color-mix(in srgb, var(--warning) 44%, var(--border))',
+      borderRadius: 8,
+      background: 'color-mix(in srgb, var(--warning) 6%, var(--surface))',
+      padding: '8px 10px',
+    }}>
+      <summary style={{ color: 'var(--text)', fontSize: 12, fontWeight: 800, cursor: 'pointer' }}>
+        Review staged changes
+      </summary>
+      <div style={{ display: 'grid', gap: 6, marginTop: 8 }}>
+        {settings.map(setting => {
+          const row = values.find(value => value.key === setting.key)
+          const base = baselineValue(setting, row?.saved ?? null, row?.live.value ?? null)
+          const next = draft[setting.key] ?? base
+          return (
+            <div key={setting.key} style={{
+              display: 'grid',
+              gridTemplateColumns: 'minmax(140px, 1fr) minmax(90px, auto) minmax(90px, auto) auto',
+              gap: 8,
+              alignItems: 'center',
+              border: '1px solid var(--border)',
+              borderRadius: 6,
+              background: 'var(--surface)',
+              padding: '7px 8px',
+              fontSize: 11,
+              minWidth: 0,
+            }}>
+              <span title={setting.command} style={{ color: 'var(--text)', fontWeight: 800, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{setting.label}</span>
+              <span style={{ color: 'var(--faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>from {formatSettingValue(base, setting.unit)}</span>
+              <span style={{ color: 'var(--warning)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>to {formatSettingValue(next, setting.unit)}</span>
+              <SettingPill tone={setting.restart_required ? 'warn' : 'ok'}>{setting.restart_required ? 'restart' : 'live'}</SettingPill>
+            </div>
+          )
+        })}
+        {customRcDirty && (
+          <div style={{
+            border: '1px solid var(--border)',
+            borderRadius: 6,
+            background: 'var(--surface)',
+            padding: '7px 8px',
+            color: 'var(--warning)',
+            fontSize: 11,
+            fontWeight: 800,
+          }}>
+            Custom rTorrent lines edited
+          </div>
+        )}
+      </div>
+    </details>
+  )
+}
+
+type SettingsViewFilter = 'all' | 'edited' | 'restart' | 'live' | 'unavailable'
+
+function ViewFilter({ value, onChange, dirtyCount, restartCount, liveCount, unavailableCount }: {
+  value: SettingsViewFilter
+  onChange: (value: SettingsViewFilter) => void
   dirtyCount: number
   restartCount: number
   liveCount: number
+  unavailableCount: number
 }) {
-  const options: Array<['all' | 'edited' | 'restart' | 'live', string, string]> = [
+  const options: Array<[SettingsViewFilter, string, string]> = [
     ['all', 'All', 'Show every managed setting'],
     ['edited', `Edited ${dirtyCount}`, 'Show unsaved managed setting edits'],
     ['restart', `Restart ${restartCount}`, 'Show settings that need restart'],
     ['live', `Live ${liveCount}`, 'Show settings that can apply live'],
+    ['unavailable', `Unavailable ${unavailableCount}`, 'Show settings without a live readback'],
   ]
   return (
     <div style={{ display: 'grid', gap: 5, minWidth: 0 }}>
       <span style={{ color: 'var(--text)', fontSize: 12, fontWeight: 800 }}>View</span>
-      <div role="group" aria-label="Settings view filter" style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: 5 }}>
+      <div role="group" aria-label="Settings view filter" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(96px, 1fr))', gap: 5 }}>
         {options.map(([optionValue, label, title]) => {
           const active = value === optionValue
           return (
@@ -824,17 +971,20 @@ function NumericKnob({ setting, value, describedBy, onChange, onPreset }: {
           type="range"
           min={min}
           max={max}
+          step={1}
           value={Number.isFinite(value) ? value : min}
           onChange={e => onChange(Number(e.target.value))}
           style={{ width: '100%', accentColor: 'var(--accent)' }}
           aria-label={`${setting.label} dial`}
           aria-describedby={describedBy}
+          aria-valuetext={formatSettingValue(value, setting.unit)}
         />
         <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', gap: 6, alignItems: 'center' }}>
           <input
             type="number"
             min={min}
             max={max}
+            step={1}
             value={Number.isFinite(value) ? value : min}
             onChange={e => onChange(Number(e.target.value))}
             style={inputStyle}

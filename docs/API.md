@@ -167,6 +167,8 @@ Notes:
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/v1/storage` | List configured storage roots with total/used/free bytes, readonly status, and per-root errors |
+| `POST` | `/api/v1/storage/plan` | Preview move/import/delete storage plans (`{ action, source, destination, target, bytes, roots }`) |
+| `POST` | `/api/v1/storage/execute` | Execute a root-confined move/import/delete storage plan through durable engine storage-plan jobs (`roots` is required) |
 | `GET` | `/api/v1/tracker-health` | Aggregate cached torrents by tracker URL with torrent/active/complete/error/peer counts |
 | `GET` | `/api/v1/engine` | Runtime engine provenance, XMLRPC capability probes, rTorrent HTTP tracker-stack telemetry, and drift from the bundled engine profile |
 | `GET` | `/api/v1/engine/commands` | Full XMLRPC command index exposed by the running rTorrent build |

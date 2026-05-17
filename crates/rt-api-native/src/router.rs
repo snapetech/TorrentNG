@@ -1,10 +1,13 @@
-use axum::{routing::get, Router};
+use axum::{
+    routing::{get, post},
+    Router,
+};
 
 use crate::{
     handlers::{
         add_torrent, delete_torrent, diagnose_torrent, get_torrent, health, list_session_events,
         list_torrents, metrics, pause_torrent, reannounce_torrent, recheck_torrent, resume_torrent,
-        stream_events,
+        storage_execute_plan, storage_preview_plan, stream_events,
     },
     state::AppState,
 };
@@ -37,5 +40,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/torrents/:hash/diagnostics", get(diagnose_torrent))
         .route("/api/v1/events", get(stream_events))
         .route("/api/v1/session-events", get(list_session_events))
+        .route("/api/v1/storage/plan", post(storage_preview_plan))
+        .route("/api/v1/storage/execute", post(storage_execute_plan))
         .with_state(state)
 }

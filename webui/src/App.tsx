@@ -16,6 +16,7 @@ import { RatioGroupsPanel } from './components/RatioGroupsPanel'
 import { WorkflowsPanel } from './components/WorkflowsPanel'
 import { RssRulesPanel } from './components/RssRulesPanel'
 import { EnginePanel } from './components/EnginePanel'
+import { LogsPanel } from './components/LogsPanel'
 import { TorrentToolbar } from './components/TorrentToolbar'
 import { TorrentContextMenu, type ContextMenuState } from './components/TorrentContextMenu'
 import { HelpDialog } from './components/HelpDialog'
@@ -869,6 +870,7 @@ function SettingsView({ section, onSection, mediaInference, onMediaInference, th
         </>)}
         {section === 'support' && (<>
           <PanelTitle title="Support" subtitle="Project resources and community support" />
+          <PanelFrame><LogsPanel /></PanelFrame>
           <PanelFrame>
             <AppearancePanel
               mediaInference={mediaInference}

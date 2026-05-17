@@ -54,7 +54,7 @@ export interface ListParams {
   offset?: number
 }
 
-async function get<T>(path: string, params?: Record<string, string | number>): Promise<T> {
+async function get<T>(path: string, params?: Record<string, string | number | undefined>): Promise<T> {
   const url = new URL(BASE + path, window.location.origin)
   if (params) {
     for (const [k, v] of Object.entries(params)) {
@@ -258,6 +258,19 @@ export interface TrackerHealth {
 
 export interface TrackerHealthResponse {
   trackers: TrackerHealth[]
+}
+
+export interface AppLogEvent {
+  event_id: number | null
+  occurred_at: number
+  level: 'info' | 'warn' | 'warning' | 'error' | string
+  kind: string
+  message: string
+  payload: string
+}
+
+export interface LogsResponse {
+  logs: AppLogEvent[]
 }
 
 export interface SidebarFacets {
@@ -592,6 +605,12 @@ export const api = {
 
   trackerHealth: (): Promise<TrackerHealthResponse> => get('/tracker-health'),
   sidebarFacets: (): Promise<SidebarFacets> => get('/sidebar-facets'),
+  logs: (params: {
+    limit?: number
+    kind?: string
+    level?: string
+    last_known_id?: number
+  } = {}): Promise<LogsResponse> => get('/logs', params),
 
   engine: (): Promise<EngineDiagnostics> => get('/engine'),
   engineCommands: (): Promise<EngineCommandIndex> => get('/engine/commands'),

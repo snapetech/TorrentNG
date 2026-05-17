@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, convert::Infallible, time::Duration};
+use std::{collections::BTreeMap, convert::Infallible, path::PathBuf, time::Duration};
 
 use axum::{
     extract::{Path, Query, State},
@@ -17,7 +17,10 @@ use rt_api_model::{
 use rt_metainfo::{parse_magnet, parse_torrent};
 use rt_metrics::MemoryClass;
 use rt_session::{TorrentEntry, TorrentState};
-use rt_storage::{runtime::StorageRuntime, STORAGE_LATENCY_BUCKETS_NS};
+use rt_storage::{
+    runtime::StorageRuntime, DeletePlanRequest, ImportPlanRequest, MovePlanRequest, PlanIssue,
+    PlannedStorageAction, StoragePlan, StoragePlanStep, STORAGE_LATENCY_BUCKETS_NS,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::state::AppState;
@@ -305,6 +308,302 @@ pub async fn delete_torrent(
         let mut reg = state.registry.write().await;
         let _ = reg.remove(&info_hash);
         StatusCode::NO_CONTENT.into_response()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StoragePlanRequest {
+    operation: String,
+    source: Option<PathBuf>,
+    destination: Option<PathBuf>,
+    target: Option<PathBuf>,
+    bytes: Option<u64>,
+    available_bytes: Option<u64>,
+    hardlink_or_copy: Option<bool>,
+    dry_run: Option<bool>,
+    dry_run_approved: Option<bool>,
+    affected_torrents: Option<Vec<String>>,
+    roots: Option<Vec<PathBuf>>,
+    completed_steps: Option<Vec<usize>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StoragePlanResponse {
+    operation: String,
+    job_id: Option<String>,
+    plan: StoragePlanView,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StoragePlanView {
+    dry_run: bool,
+    can_apply: bool,
+    issues: Vec<String>,
+    steps: Vec<StoragePlanStepView>,
+    rollback_steps: Vec<StoragePlanStepView>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StoragePlanStepView {
+    action: String,
+    source: Option<String>,
+    destination: Option<String>,
+    bytes: u64,
+}
+
+/// `POST /api/v1/storage/plan` — preview a move/import/delete storage plan.
+pub async fn storage_preview_plan(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<StoragePlanRequest>,
+) -> impl IntoResponse {
+    if let Some(response) = require_mutation_auth(&state, &headers) {
+        return response;
+    }
+    match build_storage_plan(&req, true) {
+        Ok(plan) => {
+            if let Some(response) = validate_storage_plan_roots(&plan, req.roots.as_deref()) {
+                return response;
+            }
+            (
+                StatusCode::OK,
+                Json(storage_plan_response(&req.operation, &plan, None)),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError::bad_request(e)).unwrap()),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /api/v1/storage/execute` — execute a storage plan through durable engine jobs.
+pub async fn storage_execute_plan(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<StoragePlanRequest>,
+) -> impl IntoResponse {
+    if let Some(response) = require_mutation_auth(&state, &headers) {
+        return response;
+    }
+    let Some(engine) = &state.engine else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                serde_json::to_value(ApiError::internal(
+                    "native engine is not available".to_owned(),
+                ))
+                .unwrap(),
+            ),
+        )
+            .into_response();
+    };
+    let roots = match req.roots.clone() {
+        Some(roots) if !roots.is_empty() => roots,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    serde_json::to_value(ApiError::bad_request(
+                        "roots must include at least one configured storage root for execution"
+                            .to_owned(),
+                    ))
+                    .unwrap(),
+                ),
+            )
+                .into_response();
+        }
+    };
+    let plan = match build_storage_plan(&req, false) {
+        Ok(plan) => plan,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::to_value(ApiError::bad_request(e)).unwrap()),
+            )
+                .into_response();
+        }
+    };
+    if let Some(response) = validate_storage_plan_roots(&plan, Some(&roots)) {
+        return response;
+    }
+    match engine
+        .execute_storage_plan(
+            normalize_storage_operation(&req.operation)
+                .unwrap_or_else(|| req.operation.to_ascii_lowercase()),
+            req.affected_torrents.unwrap_or_default(),
+            plan.clone(),
+            roots,
+            req.completed_steps.unwrap_or_default(),
+        )
+        .await
+    {
+        Ok(job_id) => (
+            StatusCode::ACCEPTED,
+            Json(storage_plan_response(&req.operation, &plan, Some(job_id))),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError::bad_request(e)).unwrap()),
+        )
+            .into_response(),
+    }
+}
+
+fn build_storage_plan(req: &StoragePlanRequest, preview: bool) -> Result<StoragePlan, String> {
+    let dry_run = if preview {
+        true
+    } else {
+        req.dry_run.unwrap_or(false)
+    };
+    match normalize_storage_operation(&req.operation).as_deref() {
+        Some("move") => Ok(rt_storage::plan_move(&MovePlanRequest {
+            source: req
+                .source
+                .clone()
+                .ok_or_else(|| "source is required for move".to_owned())?,
+            destination: req
+                .destination
+                .clone()
+                .ok_or_else(|| "destination is required for move".to_owned())?,
+            bytes: req.bytes.unwrap_or(0),
+            available_bytes: req.available_bytes,
+            dry_run,
+        })),
+        Some("import") => Ok(rt_storage::plan_import(&ImportPlanRequest {
+            source: req
+                .source
+                .clone()
+                .ok_or_else(|| "source is required for import".to_owned())?,
+            destination: req
+                .destination
+                .clone()
+                .ok_or_else(|| "destination is required for import".to_owned())?,
+            bytes: req.bytes.unwrap_or(0),
+            available_bytes: req.available_bytes,
+            hardlink_or_copy: req.hardlink_or_copy.unwrap_or(false),
+            dry_run,
+        })),
+        Some("delete") => Ok(rt_storage::plan_delete(&DeletePlanRequest {
+            target: req
+                .target
+                .clone()
+                .ok_or_else(|| "target is required for delete".to_owned())?,
+            bytes: req.bytes.unwrap_or(0),
+            dry_run,
+            dry_run_approved: req.dry_run_approved.unwrap_or(!dry_run),
+        })),
+        _ => Err("operation must be one of move, import, or delete".to_owned()),
+    }
+}
+
+fn validate_storage_plan_roots(
+    plan: &StoragePlan,
+    roots: Option<&[PathBuf]>,
+) -> Option<axum::response::Response> {
+    let roots = roots?;
+    if roots.is_empty() {
+        return Some(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    serde_json::to_value(ApiError::bad_request(
+                        "roots must not be empty".to_owned(),
+                    ))
+                    .unwrap(),
+                ),
+            )
+                .into_response(),
+        );
+    }
+    let mut dry_run_plan = plan.clone();
+    dry_run_plan.dry_run = true;
+    match rt_storage::execute_storage_plan_under_roots(&dry_run_plan, roots) {
+        Ok(_) => None,
+        Err(e) => Some(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::to_value(ApiError::bad_request(e.to_string())).unwrap()),
+            )
+                .into_response(),
+        ),
+    }
+}
+
+fn storage_plan_response(
+    operation: &str,
+    plan: &StoragePlan,
+    job_id: Option<String>,
+) -> StoragePlanResponse {
+    StoragePlanResponse {
+        operation: normalize_storage_operation(operation)
+            .unwrap_or_else(|| operation.to_ascii_lowercase()),
+        job_id,
+        plan: StoragePlanView::from_plan(plan),
+    }
+}
+
+impl StoragePlanView {
+    fn from_plan(plan: &StoragePlan) -> Self {
+        Self {
+            dry_run: plan.dry_run,
+            can_apply: plan.can_apply,
+            issues: plan.issues.iter().map(storage_plan_issue_label).collect(),
+            steps: plan.steps.iter().map(StoragePlanStepView::from_step).collect(),
+            rollback_steps: plan
+                .rollback_steps
+                .iter()
+                .map(StoragePlanStepView::from_step)
+                .collect(),
+        }
+    }
+}
+
+impl StoragePlanStepView {
+    fn from_step(step: &StoragePlanStep) -> Self {
+        Self {
+            action: storage_plan_step_action_label(&step.action).to_owned(),
+            source: step.source.as_ref().map(|path| path.display().to_string()),
+            destination: step
+                .destination
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            bytes: step.bytes,
+        }
+    }
+}
+
+fn normalize_storage_operation(operation: &str) -> Option<String> {
+    match operation.trim().to_ascii_lowercase().as_str() {
+        "move" => Some("move".to_owned()),
+        "import" => Some("import".to_owned()),
+        "delete" => Some("delete".to_owned()),
+        _ => None,
+    }
+}
+
+fn storage_plan_step_action_label(action: &PlannedStorageAction) -> &'static str {
+    match action {
+        PlannedStorageAction::ImportExisting => "import_existing",
+        PlannedStorageAction::Rename => "rename",
+        PlannedStorageAction::CopyVerifyRename => "copy_verify_rename",
+        PlannedStorageAction::SafeDelete => "safe_delete",
+    }
+}
+
+fn storage_plan_issue_label(issue: &PlanIssue) -> String {
+    match issue {
+        PlanIssue::SourceMissing(path) => format!("source missing: {}", path.display()),
+        PlanIssue::DestinationExists(path) => format!("destination exists: {}", path.display()),
+        PlanIssue::InsufficientCapacity { needed, available } => {
+            format!("insufficient capacity: needed {needed}, available {available}")
+        }
+        PlanIssue::DeleteRequiresDryRunApproval => {
+            "delete requires execute confirmation".to_owned()
+        }
     }
 }
 
@@ -2073,6 +2372,60 @@ mod tests {
         assert_eq!(level_from_kind("torrent_added"), "info");
         assert_eq!(level_from_kind("tracker_warning"), "warn");
         assert_eq!(level_from_kind("storage_failed"), "error");
+    }
+
+    #[test]
+    fn storage_plan_preview_projects_move_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.bin");
+        let destination = dir.path().join("destination.bin");
+        std::fs::write(&source, b"payload").unwrap();
+        let req = StoragePlanRequest {
+            action: StoragePlanAction::Move,
+            source: Some(source),
+            destination: Some(destination),
+            target: None,
+            bytes: Some(7),
+            available_bytes: Some(7),
+            hardlink_or_copy: None,
+            dry_run: Some(true),
+            affected_torrents: None,
+            roots: None,
+            completed_steps: None,
+        };
+
+        let plan = build_storage_plan(&req).unwrap();
+        let response = storage_plan_response(&plan, None);
+
+        assert!(response.can_apply);
+        assert!(response.dry_run);
+        assert!(!response.steps.is_empty());
+        assert_eq!(response.steps[0].action, "rename");
+    }
+
+    #[test]
+    fn storage_plan_root_validation_rejects_escape() {
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let source = outside.path().join("source.bin");
+        let destination = allowed.path().join("destination.bin");
+        std::fs::write(&source, b"payload").unwrap();
+        let req = StoragePlanRequest {
+            action: StoragePlanAction::Move,
+            source: Some(source),
+            destination: Some(destination),
+            target: None,
+            bytes: Some(7),
+            available_bytes: None,
+            hardlink_or_copy: None,
+            dry_run: Some(true),
+            affected_torrents: None,
+            roots: Some(vec![allowed.path().to_path_buf()]),
+            completed_steps: None,
+        };
+
+        let plan = build_storage_plan(&req).unwrap();
+        assert!(validate_storage_plan_roots(&plan, req.roots.as_deref()).is_some());
     }
 
     async fn setup_authed_app_with_torrent() -> (axum::Router, String) {

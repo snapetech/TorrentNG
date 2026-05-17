@@ -5,7 +5,7 @@ use tokio::sync::oneshot;
 
 use rt_metainfo::{MagnetLink, TorrentMeta};
 use rt_metrics::{MemoryClass, MemoryLease, ResourceSnapshot};
-use rt_storage::{StorageIoStats, STORAGE_LATENCY_BUCKET_COUNT};
+use rt_storage::{StorageIoStats, StoragePlan, STORAGE_LATENCY_BUCKET_COUNT};
 
 use crate::TorrentActivityTier;
 
@@ -700,6 +700,15 @@ pub enum EngineCmd {
         name: Option<String>,
         save_path: Option<PathBuf>,
         reply: oneshot::Sender<CmdResult<()>>,
+    },
+    /// Execute a durable storage plan through the engine job table.
+    ExecuteStoragePlan {
+        operation: String,
+        affected_torrents: Vec<String>,
+        plan: StoragePlan,
+        roots: Vec<PathBuf>,
+        completed_steps: Vec<usize>,
+        reply: oneshot::Sender<CmdResult<String>>,
     },
     /// Replace persisted tracker URLs for a torrent.
     UpdateTorrentTrackers {

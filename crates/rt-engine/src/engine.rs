@@ -298,6 +298,29 @@ impl EngineHandle {
         rx.await.map_err(|_| "engine dropped reply".to_owned())?
     }
 
+    pub async fn execute_storage_plan(
+        &self,
+        operation: String,
+        affected_torrents: Vec<String>,
+        plan: StoragePlan,
+        roots: Vec<PathBuf>,
+        completed_steps: Vec<usize>,
+    ) -> CmdResult<String> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(EngineCmd::ExecuteStoragePlan {
+                operation,
+                affected_torrents,
+                plan,
+                roots,
+                completed_steps,
+                reply,
+            })
+            .await
+            .map_err(|_| "engine shut down".to_owned())?;
+        rx.await.map_err(|_| "engine dropped reply".to_owned())?
+    }
+
     pub async fn stats(&self) -> CmdResult<EngineStats> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx
@@ -956,6 +979,23 @@ impl Engine {
                 let result = self
                     .update_torrent_fields_inner(&info_hash, name, save_path)
                     .await;
+                let _ = reply.send(result);
+            }
+            EngineCmd::ExecuteStoragePlan {
+                operation,
+                affected_torrents,
+                plan,
+                roots,
+                completed_steps,
+                reply,
+            } => {
+                let result = self.execute_storage_plan_job(
+                    &operation,
+                    affected_torrents,
+                    &plan,
+                    &roots,
+                    completed_steps,
+                );
                 let _ = reply.send(result);
             }
             EngineCmd::UpdateTorrentTrackers {
@@ -2027,7 +2067,7 @@ impl Engine {
             steps,
             rollback_steps,
         };
-        self.execute_storage_plan_job("move", vec![info_hash.to_owned()], &plan, Vec::new())?;
+        self.execute_storage_plan_job("move", vec![info_hash.to_owned()], &plan, &[], Vec::new())?;
         Ok(())
     }
 
@@ -3140,6 +3180,7 @@ impl Engine {
         operation: &str,
         affected_torrents: Vec<String>,
         plan: &StoragePlan,
+        roots: &[PathBuf],
         completed_steps: Vec<usize>,
     ) -> Result<String, String> {
         let job_id = self.create_storage_plan_job(operation, affected_torrents, plan)?;
@@ -3151,21 +3192,27 @@ impl Engine {
         );
         let mut completed = completed_steps;
         let already_completed = completed.clone();
-        let result = rt_storage::execute_storage_plan_with_checkpoints(
-            plan,
-            &already_completed,
-            |index, _step| {
-                if !completed.contains(&index) {
-                    completed.push(index);
-                    completed.sort_unstable();
-                }
-                self.persist_storage_plan_checkpoint(&job_id, operation, plan, &completed)
-                    .map_err(|error| StorageError::StagedMoveFailed {
-                        step: "checkpoint",
-                        reason: error,
-                    })
-            },
-        );
+        let checkpoint = |index, _step: &StoragePlanStep| {
+            if !completed.contains(&index) {
+                completed.push(index);
+                completed.sort_unstable();
+            }
+            self.persist_storage_plan_checkpoint(&job_id, operation, plan, &completed)
+                .map_err(|error| StorageError::StagedMoveFailed {
+                    step: "checkpoint",
+                    reason: error,
+                })
+        };
+        let result = if roots.is_empty() {
+            rt_storage::execute_storage_plan_with_checkpoints(plan, &already_completed, checkpoint)
+        } else {
+            rt_storage::execute_storage_plan_under_roots_with_checkpoints(
+                plan,
+                roots,
+                &already_completed,
+                checkpoint,
+            )
+        };
         match result {
             Ok(_) => {
                 self.persist_storage_plan_terminal(
