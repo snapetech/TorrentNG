@@ -26,6 +26,7 @@ use rt_fastresume::{
     FastresumeState, FastresumeStore, FileHint, ImportPolicy, PartialPieceState, PieceState,
 };
 use rt_metainfo::{torrent_info_bytes, TorrentMeta, TorrentMetaV1};
+use rt_metrics::{MemoryClass, MemoryLease, ResourceGovernor};
 use rt_path::{StorageProfile, StorageRootId};
 use rt_peer_manager::{
     ChokeDecision, ChokeState, Choker, PeerId, PeerSnapshot, DEFAULT_MAX_UNCHOKED,
@@ -127,6 +128,15 @@ fn tracker_peer_cache_cap(max_peers: usize) -> usize {
     max_peers
         .saturating_mul(TRACKER_PEER_CACHE_MULTIPLIER)
         .max(TRACKER_PEER_CACHE_MIN)
+}
+
+fn reserve_webseed_body_bytes(
+    resources: &ResourceGovernor,
+    bytes: u32,
+) -> anyhow::Result<MemoryLease> {
+    resources
+        .try_acquire(MemoryClass::WebseedBody, u64::from(bytes))
+        .ok_or_else(|| anyhow::anyhow!("webseed body allocation of {bytes} bytes denied"))
 }
 
 fn remember_tracker_peers_bounded(
@@ -346,6 +356,7 @@ pub struct TorrentTask {
     min_announce_interval: Option<Duration>,
     registry: Arc<RwLock<SessionRegistry>>,
     db: Arc<Mutex<Connection>>,
+    resources: ResourceGovernor,
     cmd_rx: mpsc::Receiver<TorrentCmd>,
     peer_event_tx: mpsc::Sender<PeerEvent>,
     peer_event_rx: mpsc::Receiver<PeerEvent>,
@@ -381,6 +392,7 @@ impl TorrentTask {
         paused: bool,
         registry: Arc<RwLock<SessionRegistry>>,
         db: Arc<Mutex<Connection>>,
+        resources: ResourceGovernor,
         cmd_rx: mpsc::Receiver<TorrentCmd>,
         fastresume_dir: PathBuf,
         max_peers: usize,
@@ -441,6 +453,7 @@ impl TorrentTask {
                 .then(|| Duration::from_secs(min_interval_secs)),
             registry,
             db,
+            resources,
             cmd_rx,
             peer_event_tx,
             peer_event_rx,
@@ -1218,6 +1231,7 @@ impl TorrentTask {
         url: &Url,
         req: BlockRequest,
     ) -> anyhow::Result<bytes::Bytes> {
+        let _lease = reserve_webseed_body_bytes(&self.resources, req.length)?;
         let start = req.piece as u64 * self.meta.piece_length + req.begin as u64;
         let end = start + req.length as u64 - 1;
         let response = self
@@ -3493,6 +3507,34 @@ mod tests {
     fn tracker_peer_cache_cap_scales_with_peer_limit() {
         assert_eq!(tracker_peer_cache_cap(1), TRACKER_PEER_CACHE_MIN);
         assert_eq!(tracker_peer_cache_cap(100), 400);
+    }
+
+    #[test]
+    fn webseed_body_reservation_uses_webseed_governor_class() {
+        let mut caps = [0; rt_metrics::MEMORY_CLASS_COUNT];
+        caps[MemoryClass::WebseedBody as usize] = 16;
+        let governor = ResourceGovernor::new(rt_metrics::ResourceGovernorConfig {
+            total_cap_bytes: 16,
+            class_caps_bytes: caps,
+            pressure_constrained_pct: 75,
+            pressure_critical_pct: 90,
+        });
+
+        let lease = reserve_webseed_body_bytes(&governor, 16).unwrap();
+        assert_eq!(
+            governor.snapshot().classes[MemoryClass::WebseedBody as usize].used_bytes,
+            16
+        );
+        drop(lease);
+        assert_eq!(
+            governor.snapshot().classes[MemoryClass::WebseedBody as usize].used_bytes,
+            0
+        );
+        assert!(reserve_webseed_body_bytes(&governor, 17).is_err());
+        assert_eq!(
+            governor.snapshot().classes[MemoryClass::WebseedBody as usize].denied_allocations,
+            1
+        );
     }
 
     #[test]
