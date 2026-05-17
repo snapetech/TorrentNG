@@ -64,6 +64,17 @@ pub fn append_session_event(conn: &Connection, event: &SessionEventRow) -> Resul
     Ok(conn.last_insert_rowid())
 }
 
+pub fn prune_session_events(conn: &Connection, retention: usize) -> Result<usize, DbError> {
+    let deleted = conn.execute(
+        "DELETE FROM session_events
+         WHERE event_id NOT IN (
+             SELECT event_id FROM session_events ORDER BY event_id DESC LIMIT ?1
+         )",
+        params![retention.max(1) as i64],
+    )?;
+    Ok(deleted)
+}
+
 pub fn list_session_events(
     conn: &Connection,
     info_hash: Option<&str>,

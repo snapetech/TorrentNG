@@ -1,14 +1,14 @@
 use anyhow::{Context, Result};
-use torrentng::{api, cache, config, metrics, rtorrent, stats, sync};
 use std::sync::Arc;
 use tokio::sync::broadcast;
+use torrentng::{api, cache, config, metrics, rtorrent, stats, sync};
 use tracing::info;
 
 use api::{
     server::{build_router, AppState},
     ws::Event,
 };
-use cache::Db;
+use cache::{AppEventRow, Db};
 use config::Config;
 use metrics::Metrics;
 use rtorrent::Client;
@@ -27,6 +27,21 @@ async fn main() -> Result<()> {
     let rt = Arc::new(Client::new(&cfg.rtorrent).context("create rtorrent client")?);
 
     let db = Arc::new(Db::open(&cfg.cache_path()).context("open cache db")?);
+    let _ = db.append_app_event(
+        &AppEventRow {
+            event_id: None,
+            occurred_at: unix_now_i64(),
+            level: "info".to_owned(),
+            kind: "sidecar_started".to_owned(),
+            message: "TorrentNG sidecar started".to_owned(),
+            payload: serde_json::json!({
+                "component": "sidecar",
+                "operation": "startup",
+            })
+            .to_string(),
+        },
+        cfg.logging.event_retention,
+    );
     let metrics = Metrics::new();
     let (tx, _) = broadcast::channel::<Event>(1024);
 
@@ -85,6 +100,13 @@ async fn main() -> Result<()> {
 
     info!("shutdown complete");
     Ok(())
+}
+
+fn unix_now_i64() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 async fn shutdown_signal() {

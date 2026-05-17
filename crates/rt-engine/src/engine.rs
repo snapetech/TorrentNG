@@ -2787,6 +2787,9 @@ impl Engine {
         let db = self.db.lock().expect("database mutex poisoned");
         if let Err(e) = rt_db::append_session_event(&db, &event) {
             warn!(kind, err = %e, "failed to append session event");
+        } else if let Err(e) = rt_db::prune_session_events(&db, self.config.logging.event_retention)
+        {
+            warn!(kind, err = %e, "failed to prune session events");
         }
     }
 

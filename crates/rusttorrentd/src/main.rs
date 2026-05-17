@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use tokio::sync::RwLock;
+use tower_http::trace::TraceLayer;
 use tracing::info;
 
 use rt_api_deluge::AppState as DelugeState;
@@ -57,7 +58,8 @@ async fn main() -> anyhow::Result<()> {
     let app = native_router
         .merge(qbit_router)
         .merge(transmission_router)
-        .merge(deluge_router);
+        .merge(deluge_router)
+        .layer(TraceLayer::new_for_http());
 
     let api_addr: std::net::SocketAddr = config
         .daemon

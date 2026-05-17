@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::services::{ServeDir, ServeFile};
+use tower_http::trace::TraceLayer;
 
 use crate::{
     auth::require_auth, cache::Db, config::Config, metrics::SharedMetrics, rtorrent::Client,
@@ -147,6 +148,7 @@ pub fn build_router(state: AppState) -> Router {
                 .not_found_service(ServeFile::new(format!("{static_dir}/index.html"))),
         )
         .layer(RequestBodyLimitLayer::new(64 * 1024 * 1024))
+        .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(state.clone(), require_auth))
         .with_state(state)
 }

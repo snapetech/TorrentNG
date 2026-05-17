@@ -1429,6 +1429,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rt-logging"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "rusqlite"
 version = "0.39.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2098,6 +2107,7 @@ dependencies = [
  "libc",
  "quick-xml",
  "reqwest",
+ "rt-logging",
  "rusqlite",
  "serde",
  "serde_json",

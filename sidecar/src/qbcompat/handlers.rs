@@ -5,7 +5,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -100,8 +100,7 @@ pub fn build_router(_state: AppState) -> Router<AppState> {
         .route("/transfer/uploadLimit", get(zero_text))
         .route("/transfer/setUploadLimit", post(ok_form))
         .route("/transfer/banPeers", post(ok_form))
-        // Log/search surfaces are intentionally inert in Track 1.
-        .route("/log/main", get(empty_array))
+        .route("/log/main", get(log_main))
         .route("/log/peers", get(empty_array))
         .route("/search/status", get(search_status))
         .route("/search/categories", get(empty_array))
@@ -190,6 +189,47 @@ async fn empty_object() -> Json<serde_json::Value> {
 
 async fn zero_text() -> &'static str {
     "0"
+}
+
+#[derive(Debug, Deserialize)]
+struct LogMainQuery {
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct QbLogEntry {
+    id: i64,
+    message: String,
+    timestamp: i64,
+    #[serde(rename = "type")]
+    kind: i64,
+}
+
+async fn log_main(State(s): State<AppState>, Query(q): Query<LogMainQuery>) -> impl IntoResponse {
+    let limit = q.limit.unwrap_or(200).clamp(1, 1000);
+    match s.db.list_app_events(limit) {
+        Ok(events) => (
+            StatusCode::OK,
+            Json(events.into_iter().map(qbit_log_entry).collect::<Vec<_>>()),
+        ),
+        Err(e) => {
+            tracing::warn!(component = "api", operation = "log_main", error = %e, "failed to read app events");
+            (StatusCode::OK, Json(Vec::<QbLogEntry>::new()))
+        }
+    }
+}
+
+fn qbit_log_entry(row: crate::cache::AppEventRow) -> QbLogEntry {
+    QbLogEntry {
+        id: row.event_id.unwrap_or_default(),
+        message: row.message,
+        timestamp: row.occurred_at,
+        kind: match row.level.as_str() {
+            "error" | "critical" => 4,
+            "warn" | "warning" => 2,
+            _ => 1,
+        },
+    }
 }
 
 async fn search_status() -> Json<serde_json::Value> {

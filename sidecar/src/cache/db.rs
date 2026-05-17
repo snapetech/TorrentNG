@@ -36,6 +36,16 @@ pub struct TorrentRow {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AppEventRow {
+    pub event_id: Option<i64>,
+    pub occurred_at: i64,
+    pub level: String,
+    pub kind: String,
+    pub message: String,
+    pub payload: String,
+}
+
 #[derive(Clone)]
 pub struct Db(pub(crate) Arc<Mutex<Connection>>);
 
@@ -129,6 +139,47 @@ impl Db {
         Ok(())
     }
 
+    pub fn append_app_event(&self, event: &AppEventRow, retention: usize) -> Result<i64> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO app_events (occurred_at, level, kind, message, payload)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                event.occurred_at,
+                event.level,
+                event.kind,
+                event.message,
+                event.payload,
+            ],
+        )?;
+        let id = conn.last_insert_rowid();
+        prune_app_events_locked(&conn, retention.max(1))?;
+        Ok(id)
+    }
+
+    pub fn list_app_events(&self, limit: usize) -> Result<Vec<AppEventRow>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT event_id, occurred_at, level, kind, message, payload
+             FROM app_events
+             ORDER BY event_id DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit.max(1) as i64], |row| {
+                Ok(AppEventRow {
+                    event_id: Some(row.get(0)?),
+                    occurred_at: row.get(1)?,
+                    level: row.get(2)?,
+                    kind: row.get(3)?,
+                    message: row.get(4)?,
+                    payload: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     pub fn exists(&self, hash: &str) -> Result<bool> {
         let exists: i64 = self.conn().query_row(
             "SELECT EXISTS(SELECT 1 FROM torrents WHERE hash=?1)",
@@ -210,7 +261,58 @@ fn migrate(conn: &Connection) -> Result<()> {
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS app_events (
+            event_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+            occurred_at INTEGER NOT NULL,
+            level       TEXT NOT NULL DEFAULT 'info',
+            kind        TEXT NOT NULL,
+            message     TEXT NOT NULL DEFAULT '',
+            payload     TEXT NOT NULL DEFAULT '{}'
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_app_events_kind ON app_events(kind);
     ",
     )?;
     Ok(())
+}
+
+fn prune_app_events_locked(conn: &Connection, retention: usize) -> Result<()> {
+    conn.execute(
+        "DELETE FROM app_events
+         WHERE event_id NOT IN (
+             SELECT event_id FROM app_events ORDER BY event_id DESC LIMIT ?1
+         )",
+        params![retention as i64],
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_events_insert_list_and_prune() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+        for i in 0..3 {
+            db.append_app_event(
+                &AppEventRow {
+                    event_id: None,
+                    occurred_at: i,
+                    level: "info".to_owned(),
+                    kind: "test".to_owned(),
+                    message: format!("event {i}"),
+                    payload: "{}".to_owned(),
+                },
+                2,
+            )
+            .unwrap();
+        }
+        let events = db.list_app_events(10).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].message, "event 2");
+        assert_eq!(events[1].message, "event 1");
+    }
 }
