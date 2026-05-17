@@ -663,6 +663,13 @@ struct QueuedDiskBytes {
     _lease: Option<MemoryLease>,
 }
 
+#[derive(Debug)]
+struct DiskSubmission {
+    _queued_bytes: QueuedDiskBytes,
+    _queue: OwnedSemaphorePermit,
+    _device_queue: OwnedSemaphorePermit,
+}
+
 impl QueuedDiskBytes {
     fn reserve(
         counters: Arc<StorageCounters>,
@@ -1340,13 +1347,28 @@ impl MountScheduler {
         T: Send + 'static,
         F: FnOnce() -> Result<T, StorageError> + Send + 'static,
     {
+        let submission = self.reserve_submission(queued_bytes)?;
+        let result = self
+            .io_pool
+            .run(move || {
+                let _submission = submission;
+                f()
+            })
+            .await;
+        if matches!(result, Err(StorageError::QueueFull { .. })) {
+            self.counters.queue_full.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn reserve_submission(&self, queued_bytes: u64) -> Result<DiskSubmission, StorageError> {
         let queued_bytes = QueuedDiskBytes::reserve(
             self.counters.clone(),
             self.resources.as_ref(),
             queued_bytes,
             format!("storage-root-{}", self.storage_root.0),
         )?;
-        let _queue = self
+        let queue = self
             .queue_sem
             .clone()
             .try_acquire_owned()
@@ -1359,7 +1381,7 @@ impl MountScheduler {
                 }
                 TryAcquireError::Closed => StorageError::Cancelled,
             })?;
-        let _device_queue = self
+        let device_queue = self
             .device_queue_sem
             .clone()
             .try_acquire_owned()
@@ -1376,17 +1398,11 @@ impl MountScheduler {
                 }
                 TryAcquireError::Closed => StorageError::Cancelled,
             })?;
-        let result = self
-            .io_pool
-            .run(move || {
-                let _queued_bytes = queued_bytes;
-                f()
-            })
-            .await;
-        if matches!(result, Err(StorageError::QueueFull { .. })) {
-            self.counters.queue_full.fetch_add(1, Ordering::Relaxed);
-        }
-        result
+        Ok(DiskSubmission {
+            _queued_bytes: queued_bytes,
+            _queue: queue,
+            _device_queue: device_queue,
+        })
     }
 
     fn peer_read_elevator(&self) -> Option<PeerReadElevator> {
