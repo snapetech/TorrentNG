@@ -966,6 +966,21 @@ fn load_atomic_array<const N: usize>(values: &[AtomicU64; N]) -> [u64; N] {
     std::array::from_fn(|index| values[index].load(Ordering::Relaxed))
 }
 
+fn latency_ns_since(started: Instant) -> u64 {
+    started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+fn record_latency_bucket(
+    buckets: &[AtomicU64; STORAGE_LATENCY_BUCKET_COUNT],
+    latency_ns: u64,
+) {
+    for (index, upper_bound) in STORAGE_LATENCY_BUCKETS_NS.iter().enumerate() {
+        if latency_ns <= *upper_bound {
+            buckets[index].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 fn peer_read_cache_hit(
     cache: &Mutex<HashMap<PathBuf, PeerReadCacheEntry>>,
     key: &Path,
