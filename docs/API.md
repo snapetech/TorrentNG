@@ -82,6 +82,7 @@ the rewritten engine.
 | `POST` | `/api/v1/torrents/:hash/tags` | Add tags (`{ tags: ["a","b"] }`) |
 | `DELETE` | `/api/v1/torrents/:hash/tags` | Remove tags (`{ tags: ["a"] }`) |
 | `GET` | `/api/v1/events` | Server-sent torrent delta stream |
+| `GET` | `/api/v1/jobs` | List active durable engine jobs with progress, checkpoint, and last-error fields |
 | `GET` | `/api/v1/session-events` | Recent durable native session events; query: `limit`, `torrent`, `kind`, `level`, `last_known_id` |
 | `GET` | `/api/v1/logs` | Recent durable sidecar app/rTorrent events; query: `limit`, `kind`, `level`, `last_known_id` |
 
@@ -117,8 +118,6 @@ The Transmission facade applies it to `torrent-get`, scaled by torrent count
 and requested field count. The rTorrent XMLRPC facade applies it to
 `d.multicall`/`d.multicall2`, scaled by torrent count and requested command
 count.
-The rTorrent XMLRPC facade applies it to `d.multicall`/`d.multicall2`, scaled
-by torrent count and requested command count.
 
 #### TorrentRow fields
 
