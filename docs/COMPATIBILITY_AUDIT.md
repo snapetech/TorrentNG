@@ -108,6 +108,20 @@ Local surface: `crates/rt-api-deluge`.
 | Plugin APIs | label, notifications | Implemented for common label and notification calls |
 | Remaining Deluge plugins | extractor, scheduler, execute, blocklist, autoadd plugin-specific APIs | API gap unless required by a target migration/client; migration dry runs preserve matching plugin/config files as auxiliary artifacts |
 
+## rTorrent XMLRPC Facade
+
+Local surface: `crates/rt-api-rtorrent`.
+
+| API group | Upstream surface | Local status |
+|---|---|---|
+| System/session/network | `method.list`, `system.*`, `session.*`, `network.*`, throttle reads | Implemented as compatibility dispatcher with stable version/session/network values and zero-rate throttle placeholders |
+| Download reads | `d.hash`, `d.name`, `d.base_path`, `d.size_bytes`, `d.left_bytes`, `d.completed_bytes`, `d.complete`, `d.state`, counters, ratio | Implemented from `SessionRegistry` state |
+| Custom fields | `d.custom`, `d.custom.set` | Implemented as facade-local roundtrip state for labels and migration/client metadata |
+| Multicall/views | `d.multicall`, `d.multicall2`, `view.list`, `view.size` | Implemented with rTorrent row-array shape over the native registry |
+| Loading | `load.normal`, `load.start`, `load.raw`, `load.raw_start` | Implemented for magnet URIs and filesystem `.torrent` paths; unsupported URL fetching stays a no-op placeholder for SSRF safety |
+| Lifecycle | `d.erase`, `d.pause`, `d.resume`, `d.stop`, `d.start`, `d.tracker_announce` | Implemented as native engine hooks when attached plus registry erase projection |
+| File/tracker/peer detail | `f.*`, `t.*`, `p.*` multicalls | Implemented as stable compatibility shapes; live detail remains a placeholder until native engine snapshots expose equivalent data |
+
 ## Cross-Client API Backlog
 
 | Priority | Work item | Why |
@@ -117,6 +131,7 @@ Local surface: `crates/rt-api-deluge`.
 | Done | Expand qBittorrent preference response breadth and API-key compatibility routes | Settings panes and modern API clients probe these before mutation |
 | Done | Persist qBittorrent mutable preferences | Avoids settings panes seeing accepted writes disappear |
 | Done | Deepen qBittorrent torrent property field values | Avoids detail panes seeing compatibility placeholders for values derivable from registry/engine state |
+| Done | Add minimal rTorrent XMLRPC facade with command enumeration and request/response fixtures | Removes rTorrent facade as a universal compatibility gap while documenting placeholder depth |
 | Medium | Replace synthetic import aliases with real exported golden corpora for every supported legacy client version family | Catches undocumented key variants and nested plugin state |
 | Done | Preserve scheduler/RSS/search/autoadd/blocklist/execute/plugin metadata as auxiliary migration artifacts | Useful for full client migration; intentionally separate from torrent progress |
 | Low | Proprietary client deep parsers for Tixati/BiglyBT plugin-only fields | Needs fixture corpus; progress import already uses generic verified paths |

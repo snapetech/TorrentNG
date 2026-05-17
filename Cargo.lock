@@ -1299,6 +1299,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rt-api-rtorrent"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "rt-engine",
+ "rt-metainfo",
+ "rt-session",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "rt-api-transmission"
 version = "0.1.0"
 dependencies = [

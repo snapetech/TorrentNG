@@ -56,8 +56,8 @@ Universal compatibility release rule:
 
 | Capability | qBittorrent | Transmission | Deluge | rTorrent | TorrentNG status | Required certification rows |
 |---|---|---|---|---|---|---|
-| Add `.torrent` | Web API multipart | `torrent_add` metainfo | `core.add_torrent_file`, `web.add_torrents` | `load.*` commands | Native through qBit, Transmission, Deluge facades; rTorrent import only | Add file via every facade; verify native list and payload |
-| Add magnet | `torrents/add urls=magnet` | `torrent_add filename=magnet` | `core.add_torrent_magnet` | `load.normal` magnet-capable builds/scripts | Native through qBit, Transmission, Deluge facades | Magnet with tracker, magnet metadata fetch, DHT-only magnet |
+| Add `.torrent` | Web API multipart | `torrent_add` metainfo | `core.add_torrent_file`, `web.add_torrents` | `load.*` commands | Native through qBit, Transmission, Deluge facades; rTorrent XMLRPC accepts path/raw load shapes and projects registry state | Add file via every facade; verify native list and payload |
+| Add magnet | `torrents/add urls=magnet` | `torrent_add filename=magnet` | `core.add_torrent_magnet` | `load.normal` magnet-capable builds/scripts | Native through qBit, Transmission, Deluge facades; rTorrent XMLRPC accepts magnet load | Magnet with tracker, magnet metadata fetch, DHT-only magnet |
 | Pause/resume/start/stop | pause/resume plus v5 start/stop | start/start_now/stop | pause/resume | `d.stop`, `d.start` | Native where engine attached; registry fallback for reads | Per-facade lifecycle transition assertions |
 | Remove torrent | delete with optional data | torrent_remove | core.remove_torrent | `d.erase` | Native through qBit/Transmission/Deluge | Remove torrent-only and remove-with-data rows |
 | Force recheck | recheck | torrent_verify | force_recheck | `d.check_hash` | Native facade hooks | Corrupt data, force recheck, redownload repair |
@@ -71,7 +71,7 @@ Universal compatibility release rule:
 | Peers | addPeers, torrentPeers | peers fields | connect_peer | peer commands | Add/connect peer hooks; peer projection partial | Explicit peer private torrent row |
 | Web seeds | webseeds read | webseeds/webseeds_ex | file/web seed via libtorrent state | supported through metainfo | Read projection implemented; live webseed activity counters are placeholders | Webseed-only transfer and webseed projection row |
 | Global speed limits | transfer limits | session limits | config/options speed limits | throttle commands | Native global limits through qBit/Transmission; Deluge compat | Set/read speed limits through each facade |
-| Per-torrent speed limits | torrent limit endpoints | torrent_set limits | set_torrent_options | throttle commands | Native/Compat through qBit, Transmission, and Deluge facades; rTorrent facade gap | Per-torrent limit mutation and projection row |
+| Per-torrent speed limits | torrent limit endpoints | torrent_set limits | set_torrent_options | throttle commands | Native/Compat through qBit, Transmission, and Deluge facades; rTorrent throttle commands are compatibility placeholders | Per-torrent limit mutation and projection row |
 | Sequential/first-last | qBit toggles | 4.1 sequential fields | options/prioritize first-last | client-specific | Accepted/no-op or partial | Assert accepted; add native support if scheduler implements |
 | Super seeding | qBit setSuperSeeding | seed mode fields | super_seeding option | supported in rTorrent | Compat/no-op today | API acceptance; native behavior row later |
 | RSS | qBit RSS API | none core | plugin ecosystem | ruTorrent plugins | qBit no-op/read-compatible only | RSS API shape tests |
@@ -211,17 +211,23 @@ Deluge torrent status field matrix:
 
 ## 6. rTorrent XMLRPC Matrix
 
-TorrentNG does not currently expose a full rTorrent XMLRPC facade. rTorrent is
-covered today as an import source and as an interop peer.
+Local implementation: `crates/rt-api-rtorrent`.
+
+TorrentNG exposes a minimal rTorrent XMLRPC compatibility dispatcher for clients
+and migration/certification probes that expect rTorrent-shaped commands. The v1
+scope is intentionally compatibility-shaped: registry-backed torrent identity,
+progress, custom fields, lifecycle hooks when an engine is attached, and stable
+empty/read placeholder arrays for live file/tracker/peer details that the native
+engine does not expose yet.
 
 | Command family | Upstream examples | TorrentNG status | Test rows |
 |---|---|---|---|
-| System/session | `system.*`, `session.*`, `network.*`, throttle commands | Gap for facade | Decide whether to implement XMLRPC facade or declare non-goal |
-| Download/torrent | `d.*`, `d.multicall*`, `load.*` | Import only; no facade | Import custom fields; optional facade probe |
-| File | `f.*` | Import/file metadata only | File selection import row |
-| Tracker | `t.*`, tracker announce controls | Interop only | Tracker interop row |
-| Peer | `p.*` | Interop only | Explicit peer row |
-| Views/queue | `view.*`, priority/custom views | Gap for facade | Queue/view parity if XMLRPC facade is built |
+| System/session | `system.*`, `session.*`, `network.*`, throttle commands | Compat: version/session/network values and throttle placeholders | Method enumeration and XMLRPC fixture rows |
+| Download/torrent | `d.*`, `d.multicall*`, `load.*` | Compat/native mix: registry-backed reads, custom field roundtrip, magnet/path load, lifecycle hooks | Read projection, custom field, multicall, load/erase rows |
+| File | `f.*` | Compat placeholder: stable array shape until native file detail is wired | File multicall shape row |
+| Tracker | `t.*`, tracker announce controls | Compat placeholder for reads; announce accepted and engine tracker work remains covered by interop matrix | Tracker multicall and announce acceptance row |
+| Peer | `p.*` | Compat placeholder: stable empty peer array until live peer snapshots are exposed | Peer multicall shape row |
+| Views/queue | `view.*`, priority/custom views | Compat: `main` view and registry count; advanced custom views remain placeholder | View list/size row |
 
 ## 7. Test Matrix Backlog
 
@@ -252,5 +258,5 @@ covered today as an import source and as an interop peer.
 | Done | Persist qBittorrent mutable preferences for arbitrary `setPreferences` keys | qBit field backlog |
 | Done | Broaden qBittorrent property projections to documented keys backed by registry/engine state | qBit field backlog |
 | P1 | Build real exported golden fixture corpus for qBit, Transmission, Deluge, uTorrent, BiglyBT/Vuze, Tixati, rTorrent, and compare it against the synthetic JSON/bencoded alias matrices | Import matrix |
-| P2 | Decide rTorrent XMLRPC facade scope | rTorrent matrix |
+| Done | Add minimal rTorrent XMLRPC compatibility dispatcher with command enumeration and representative fixtures | rTorrent matrix |
 | Done | Preserve auxiliary RSS/search/scheduler/autoadd/blocklist/execute/plugin/config metadata as migration artifacts | Feature/import matrices |

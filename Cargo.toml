@@ -23,6 +23,7 @@ members = [
     "crates/rt-api-qbit",
     "crates/rt-api-transmission",
     "crates/rt-api-deluge",
+    "crates/rt-api-rtorrent",
     "crates/rt-metrics",
     "crates/rt-config",
     "crates/rt-engine",
