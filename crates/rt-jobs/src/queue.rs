@@ -21,7 +21,15 @@ impl JobQueue {
     /// Enqueue a new job. Returns the job ID.
     pub fn enqueue(&mut self, job: Job) -> JobId {
         let id = job.id.clone();
-        tracing::info!(job_id = %id, kind = ?job.kind, dry_run = job.dry_run, "job enqueued");
+        tracing::info!(
+            component = "jobs",
+            operation = "enqueue",
+            job_id = %id,
+            kind = ?job.kind,
+            dry_run = job.dry_run,
+            result = "ok",
+            "job enqueued"
+        );
         self.jobs.insert(id.clone(), job);
         id
     }
@@ -54,7 +62,13 @@ impl JobQueue {
             ));
         }
         job.cancel();
-        tracing::info!(job_id = %id, "job cancelled");
+        tracing::info!(
+            component = "jobs",
+            operation = "cancel",
+            job_id = %id,
+            result = "ok",
+            "job cancelled"
+        );
         Ok(())
     }
 

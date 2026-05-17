@@ -28,7 +28,13 @@ pub fn raise_nofile_limit() -> u64 {
                 rlim_max: 0,
             };
             if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) != 0 {
-                tracing::warn!("getrlimit(RLIMIT_NOFILE) failed; using fallback fd budget");
+                tracing::warn!(
+                    component = "storage",
+                    operation = "get_nofile_limit",
+                    result = "fallback",
+                    fallback_soft = 1024_u64,
+                    "getrlimit(RLIMIT_NOFILE) failed; using fallback fd budget"
+                );
                 return 1024;
             }
             if rlim.rlim_cur < rlim.rlim_max {
@@ -40,6 +46,9 @@ pub fn raise_nofile_limit() -> u64 {
                     rlim.rlim_cur = rlim.rlim_max;
                 } else {
                     tracing::warn!(
+                        component = "storage",
+                        operation = "set_nofile_limit",
+                        result = "error",
                         soft = rlim.rlim_cur as u64,
                         hard = rlim.rlim_max as u64,
                         "setrlimit(RLIMIT_NOFILE) failed; keeping soft limit"

@@ -69,17 +69,26 @@ impl StorageRuntime {
                 std::thread::sleep(SWEEP_INTERVAL);
                 let closed = sweep_handles.sweep_idle();
                 if closed > 0 {
-                    tracing::debug!(closed, "idle file handles closed");
+                    tracing::debug!(
+                        component = "storage",
+                        operation = "sweep_idle_handles",
+                        closed,
+                        result = "ok",
+                        "idle file handles closed"
+                    );
                 }
             })
             .expect("spawn handle sweeper");
 
         tracing::info!(
+            component = "storage",
+            operation = "init_runtime",
             handle_cap = cap,
             frame_cap_bytes = frames.cap_bytes(),
             idle_secs,
             backend = backend.kind().as_str(),
             backend_reason = %backend.selection().reason,
+            result = "ok",
             "storage runtime initialised"
         );
 
