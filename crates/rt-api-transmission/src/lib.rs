@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use std::sync::Arc;
 
 use axum::{
@@ -1232,8 +1234,12 @@ mod tests {
             "hashString",
             "name",
             "totalSize",
+            "sizeWhenDone",
             "leftUntilDone",
+            "percentComplete",
             "percentDone",
+            "bytesCompleted",
+            "availability",
             "downloadedEver",
             "uploadedEver",
             "uploadRatio",
@@ -1249,6 +1255,7 @@ mod tests {
             "error",
             "errorString",
             "eta",
+            "etaIdle",
             "isPrivate",
             "isFinished",
             "isStalled",
@@ -1267,6 +1274,7 @@ mod tests {
             "peersConnected",
             "peersGettingFromUs",
             "peersSendingToUs",
+            "peersFrom",
             "trackers",
             "trackerStats",
             "files",
@@ -1275,6 +1283,7 @@ mod tests {
             "wanted",
             "comment",
             "creator",
+            "primaryMimeType",
             "pieceCount",
             "pieceSize",
             "pieces",
@@ -1286,12 +1295,16 @@ mod tests {
             "maxConnectedPeers",
             "webseeds",
             "webseedsSendingToUs",
+            "webseedsEx",
             "bandwidthPriority",
             "honorsSessionLimits",
+            "group",
             "magnetLink",
             "metadataPercentComplete",
             "secondsDownloading",
             "secondsSeeding",
+            "sequentialDownload",
+            "sequentialDownloadFromPiece",
         ];
         let resp = app
             .clone()
@@ -1303,7 +1316,7 @@ mod tests {
                     .header("x-transmission-session-id", SESSION_ID)
                     .body(Body::from(format!(
                         r#"{{"method":"torrent-get","arguments":{{"fields":{}}}}}"#,
-                        serde_json::to_string(&fields).unwrap()
+                        serde_json::to_string(fields.as_slice()).unwrap()
                     )))
                     .unwrap(),
             )
@@ -1341,8 +1354,13 @@ mod tests {
                 "version",
                 "rpc-version",
                 "rpc-version-minimum",
+                "rpc-version-semver",
+                "session-id",
                 "download-dir",
                 "config-dir",
+                "incomplete-dir",
+                "incomplete-dir-enabled",
+                "rename-partial-files",
                 "start-added-torrents",
                 "trash-original-torrent-files",
                 "speed-limit-down-enabled",
@@ -1365,10 +1383,18 @@ mod tests {
                 "script-torrent-done-seeding-enabled",
                 "blocklist-enabled",
                 "blocklist-size",
+                "blocklist-url",
                 "utp-enabled",
                 "lpd-enabled",
                 "dht-enabled",
                 "pex-enabled",
+                "peer-port",
+                "port-forwarding-enabled",
+                "seedRatioLimit",
+                "seedRatioLimited",
+                "idle-seeding-limit",
+                "idle-seeding-limit-enabled",
+                "units",
             ],
         );
     }

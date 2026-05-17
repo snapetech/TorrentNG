@@ -3094,11 +3094,7 @@ mod tests {
                 "/api/qb/v2/torrents/addTrackers",
                 "hash=a&urls=http://tracker/announce",
             ),
-            (
-                "POST",
-                "/api/qb/v2/torrents/editTracker",
-                "hash=a&origUrl=http://a&newUrl=http://b",
-            ),
+            ("POST", "/api/qb/v2/torrents/editTracker", ""),
             (
                 "POST",
                 "/api/qb/v2/torrents/removeTrackers",

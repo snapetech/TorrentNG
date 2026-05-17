@@ -134,11 +134,18 @@ impl PieceAssembly {
                 self.data.len()
             );
         }
-        self.data[start..end].copy_from_slice(block);
         let block_idx = start / MAX_BLOCK_SIZE as usize;
-        if let Some(received) = self.received.get_mut(block_idx) {
-            *received = true;
+        let Some(received) = self.received.get_mut(block_idx) else {
+            anyhow::bail!("piece block index {block_idx} out of range");
+        };
+        if *received {
+            if self.data[start..end] == *block {
+                return Ok(());
+            }
+            anyhow::bail!("conflicting duplicate block at offset {offset}");
         }
+        self.data[start..end].copy_from_slice(block);
+        *received = true;
         Ok(())
     }
 
@@ -3077,6 +3084,18 @@ mod tests {
         let mut assembly = PieceAssembly::new(4);
         let err = assembly.insert(2, &[1, 2, 3]).unwrap_err();
         assert!(err.to_string().contains("exceeds piece length"));
+    }
+
+    #[test]
+    fn piece_assembly_rejects_conflicting_duplicate_block() {
+        let mut assembly = PieceAssembly::new(MAX_BLOCK_SIZE as usize);
+        assembly.insert(0, &[1; MAX_BLOCK_SIZE as usize]).unwrap();
+        assembly.insert(0, &[1; MAX_BLOCK_SIZE as usize]).unwrap();
+
+        let err = assembly
+            .insert(0, &[2; MAX_BLOCK_SIZE as usize])
+            .unwrap_err();
+        assert!(err.to_string().contains("conflicting duplicate block"));
     }
 
     #[test]
