@@ -346,7 +346,7 @@ These compatibility endpoints are present so qBittorrent clients can probe them 
 
 | Method | Path | Notes |
 |--------|------|-------|
-| `GET` | `/api/qb/v2/log/main` | Returns retained app/session log events in qBittorrent log shape |
+| `GET` | `/api/qb/v2/log/main` | Returns retained app/session/rTorrent log events in qBittorrent log shape; supports `limit`, `normal`, `info`, `warning`, `critical` |
 | `GET` | `/api/qb/v2/log/peers` | Returns `[]` |
 | `GET` | `/api/qb/v2/search/status` | Returns stopped status |
 | `GET` | `/api/qb/v2/search/categories` | Returns `[]` |

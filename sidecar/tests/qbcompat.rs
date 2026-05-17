@@ -2430,6 +2430,18 @@ async fn qb_log_main_returns_retained_app_events() {
     assert_eq!(entries[0]["message"], "operator-visible error");
     assert_eq!(entries[0]["timestamp"], 1_700_000_001);
     assert_eq!(entries[0]["type"], 4);
+
+    let res = client
+        .get(url(addr, "/api/qb/v2/log/main?warning=true"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let entries = body.as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["message"], "operator-visible warning");
+    assert_eq!(entries[0]["type"], 2);
 }
 
 #[tokio::test]

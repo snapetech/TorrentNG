@@ -112,7 +112,7 @@ Local implementation: `crates/rt-api-qbit`.
 | Limits/modes | `downloadLimit`, `setDownloadLimit`, `uploadLimit`, `setUploadLimit`, `setShareLimits`, `setForceStart`, `setSuperSeeding`, `setAutoTMM`, `setAutoManagement`, `toggleSequentialDownload`, `toggleFirstLastPiecePrio` | Same | Partial/Compat | Limit read/write, mode accepted, native behavior later |
 | Sync | `sync/maindata`, `sync/torrentPeers` | Same | Native/Partial peers; maindata includes broad torrent/server-state keys, torrentPeers has qBit peer shape and stable RID deltas | Full sync, delta sync, peer sync row |
 | Transfer | `transfer/info`, download/upload limits, speed limits mode, toggle, setters, `banPeers` | Same | Native/Compat | Global limit and ban accepted rows |
-| Logs | `log/main`, `log/peers` | Same | Partial | Main log retained app-event projection; peer log empty-compatible |
+| Logs | `log/main`, `log/peers` | Same | Native/Compat | Main log projects retained native session events, sidecar app events, and optional ingested rTorrent logs with qBit severity filters; peer log remains bounded/empty-compatible |
 | Search | status/categories/plugins/install/uninstall/enable/update/start/stop/results/delete | Same | Compat | Full no-plugin search flow shape |
 | RSS | items/rules/matchingArticles/addFolder/addFeed/removeItem/moveItem/markAsRead/refreshItem/setRule/renameRule/removeRule | Same | Compat | Full RSS shape/no-op flow |
 
