@@ -1279,6 +1279,7 @@ dependencies = [
  "base64",
  "futures",
  "rt-api-model",
+ "rt-db",
  "rt-engine",
  "rt-metainfo",
  "rt-metrics",

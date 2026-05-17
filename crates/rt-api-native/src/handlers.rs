@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, convert::Infallible, time::Duration};
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -18,6 +18,7 @@ use rt_metainfo::{parse_magnet, parse_torrent};
 use rt_metrics::MemoryClass;
 use rt_session::{TorrentEntry, TorrentState};
 use rt_storage::{runtime::StorageRuntime, STORAGE_LATENCY_BUCKETS_NS};
+use serde::{Deserialize, Serialize};
 
 use crate::state::AppState;
 
@@ -530,6 +531,99 @@ pub async fn stream_events(
     );
 
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SessionEventsQuery {
+    limit: Option<usize>,
+    torrent: Option<String>,
+    kind: Option<String>,
+    level: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SessionEventResponse {
+    id: i64,
+    timestamp: i64,
+    torrent: Option<String>,
+    kind: String,
+    level: String,
+    message: Option<String>,
+    payload: serde_json::Value,
+}
+
+/// `GET /api/v1/session-events` — recent durable engine events.
+pub async fn list_session_events(
+    State(state): State<AppState>,
+    Query(query): Query<SessionEventsQuery>,
+) -> impl IntoResponse {
+    let Some(engine) = &state.engine else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(Vec::<SessionEventResponse>::new()),
+        );
+    };
+    let limit = query.limit.unwrap_or(200).clamp(1, 1000);
+    match engine.session_events(query.torrent.clone(), limit).await {
+        Ok(events) => {
+            let events = events
+                .into_iter()
+                .filter_map(session_event_response)
+                .filter(|event| {
+                    query
+                        .kind
+                        .as_ref()
+                        .map(|kind| event.kind == *kind)
+                        .unwrap_or(true)
+                })
+                .filter(|event| {
+                    query
+                        .level
+                        .as_ref()
+                        .map(|level| event.level.eq_ignore_ascii_case(level))
+                        .unwrap_or(true)
+                })
+                .collect::<Vec<_>>();
+            (StatusCode::OK, Json(events))
+        }
+        Err(e) => {
+            tracing::warn!(component = "api", operation = "session_events", error = %e, "failed to list session events");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(Vec::<SessionEventResponse>::new()),
+            )
+        }
+    }
+}
+
+fn session_event_response(row: rt_db::SessionEventRow) -> Option<SessionEventResponse> {
+    let payload = serde_json::from_str::<serde_json::Value>(&row.payload)
+        .unwrap_or_else(|_| serde_json::json!({}));
+    let level = payload
+        .get("level")
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| level_from_kind(&row.kind).to_owned());
+    Some(SessionEventResponse {
+        id: row.event_id.unwrap_or_default(),
+        timestamp: row.occurred_at,
+        torrent: row.info_hash,
+        kind: row.kind,
+        level,
+        message: row.message,
+        payload,
+    })
+}
+
+fn level_from_kind(kind: &str) -> &'static str {
+    let lower = kind.to_ascii_lowercase();
+    if lower.contains("error") || lower.contains("failed") {
+        "error"
+    } else if lower.contains("warn") {
+        "warn"
+    } else {
+        "info"
+    }
 }
 
 struct EventStreamState {
@@ -1957,6 +2051,31 @@ mod tests {
             .unwrap();
         }
         (build_router(state), hash)
+    }
+
+    #[test]
+    fn session_event_response_projects_level_and_payload() {
+        let event = rt_db::SessionEventRow {
+            event_id: Some(12),
+            occurred_at: 1_700_000_000,
+            info_hash: Some("a".repeat(40)),
+            kind: "tracker_warning".to_owned(),
+            message: Some("tracker warning".to_owned()),
+            payload: r#"{"tracker":"udp://tracker","level":"warn"}"#.to_owned(),
+        };
+
+        let projected = session_event_response(event).unwrap();
+        assert_eq!(projected.id, 12);
+        assert_eq!(projected.level, "warn");
+        assert_eq!(projected.kind, "tracker_warning");
+        assert_eq!(projected.payload["tracker"], "udp://tracker");
+    }
+
+    #[test]
+    fn level_from_kind_is_conservative() {
+        assert_eq!(level_from_kind("torrent_added"), "info");
+        assert_eq!(level_from_kind("tracker_warning"), "warn");
+        assert_eq!(level_from_kind("storage_failed"), "error");
     }
 
     async fn setup_authed_app_with_torrent() -> (axum::Router, String) {
