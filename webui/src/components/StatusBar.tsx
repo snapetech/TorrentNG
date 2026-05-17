@@ -48,13 +48,29 @@ function themedTone(color: string): { color: string; bg: string; border: string 
 }
 
 function Badge({
-  label, value, title, state, onClick, disabled,
-}: { label: string; value: string; title?: string; state?: string; onClick?: () => void; disabled?: boolean }) {
+  label, value, title, state, onClick, disabled, meter,
+}: {
+  label: string
+  value: string
+  title?: string
+  state?: string
+  onClick?: () => void
+  disabled?: boolean
+  meter?: number
+}) {
   const t = tone(state)
   const Element = onClick && !disabled ? 'button' : 'span'
   const handleClick = disabled ? undefined : onClick
   return (
-    <Element title={title} onClick={handleClick} style={{
+    <Element
+      className="rtng-status-badge"
+      data-state={state ?? 'idle'}
+      role={onClick ? 'switch' : undefined}
+      aria-checked={onClick ? state === 'on' : undefined}
+      aria-disabled={disabled || undefined}
+      title={title}
+      onClick={handleClick}
+      style={{
       display: 'inline-flex',
       alignItems: 'center',
       gap: 5,
@@ -70,8 +86,25 @@ function Badge({
       font: 'inherit',
       opacity: disabled ? 0.7 : 1,
     }}>
+      <span aria-hidden="true" style={{
+        width: 6, height: 6, borderRadius: 999, background: t.color,
+        boxShadow: `0 0 0 2px color-mix(in srgb, ${t.color} 12%, transparent)`,
+        flex: '0 0 auto',
+      }} />
       <span style={{ color: 'var(--faint)' }}>{label}</span>
       <span>{value}</span>
+      {meter !== undefined && (
+        <span aria-hidden="true" style={{
+          position: 'absolute', left: 6, right: 6, bottom: 3, height: 2,
+          borderRadius: 999, overflow: 'hidden',
+          background: 'color-mix(in srgb, var(--border-strong) 54%, transparent)',
+        }}>
+          <span style={{
+            display: 'block', width: `${Math.min(100, Math.max(0, meter))}%`, height: '100%',
+            background: t.color,
+          }} />
+        </span>
+      )}
     </Element>
   )
 }
@@ -102,6 +135,9 @@ export function StatusBar({
   const storageLabel = storage?.ok
     ? `${fmtBytes(storage.used_bytes)} / ${fmtBytes(storage.total_bytes)}`
     : 'unknown'
+  const storagePct = storage?.ok && storage.total_bytes > 0
+    ? (storage.used_bytes / storage.total_bytes) * 100
+    : undefined
   const storageTitle = storage?.ok
     ? `${fmtBytes(storage.available_bytes)} free on ${storage.path}`
     : storage?.error ?? 'Storage status unavailable'
@@ -129,7 +165,13 @@ export function StatusBar({
         <Badge label="UL" value={fmtSpeed(stats.upload_speed)} state={(stats.upload_speed ?? 0) > 0 ? 'on' : 'unknown'} />
         <Badge label="DL total" value={fmtBytes(stats.download_total)} title="Downloaded during this daemon session" state="on" />
         <Badge label="UL total" value={fmtBytes(stats.upload_total)} title="Uploaded during this daemon session" state="on" />
-        <Badge label="Disk" value={storageLabel} title={storageTitle} state={storage?.ok ? 'on' : 'unknown'} />
+        <Badge
+          label="Disk"
+          value={storageLabel}
+          title={storageTitle}
+          state={storagePct !== undefined && storagePct > 92 ? 'closed' : storagePct !== undefined && storagePct > 82 ? 'unknown' : storage?.ok ? 'on' : 'unknown'}
+          meter={storagePct}
+        />
         <Badge
           label="Conn"
           value={`${(stats.connections ?? 0).toLocaleString()}${stats.pending_connections ? ` +${stats.pending_connections}` : ''}`}

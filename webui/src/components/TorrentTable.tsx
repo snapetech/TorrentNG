@@ -272,6 +272,7 @@ export function TorrentTable({
   const allVisible = torrents.length > 0 && torrents.every(t => selected.has(t.hash))
   const someSelected = !allVisible && torrents.some(t => selected.has(t.hash))
   const hasFilters = Boolean(params.filter || params.status || params.category || params.tag || params.tracker || params.media_type)
+  const selectedVisible = torrents.reduce((count, torrent) => count + (selected.has(torrent.hash) ? 1 : 0), 0)
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minWidth: 0 }}>
@@ -357,6 +358,18 @@ export function TorrentTable({
             >
               Columns
             </button>
+            {selectedVisible > 0 && (
+              <span style={{
+                position: 'absolute', right: 84, top: 6, height: 20,
+                display: 'inline-flex', alignItems: 'center',
+                border: '1px solid color-mix(in srgb, var(--accent) 35%, var(--border))',
+                background: 'color-mix(in srgb, var(--accent) 12%, transparent)',
+                color: 'var(--accent-text)', borderRadius: 999, padding: '0 7px',
+                fontSize: 10, fontWeight: 800, textTransform: 'none', letterSpacing: 0,
+              }}>
+                {selectedVisible.toLocaleString()} visible selected
+              </span>
+            )}
             {columnsOpen && (
               <div ref={columnsRef} role="menu" aria-label="Visible table columns" style={{
                 position: 'absolute', right: 8, top: 30, zIndex: 20, width: 210,
@@ -499,6 +512,8 @@ export function TorrentTable({
               <div
                 key={t.hash}
                 className="torrent-row"
+                data-status={label.toLowerCase()}
+                data-detail={isDetail ? 'true' : 'false'}
                 role="button"
                 tabIndex={0}
                 aria-selected={isSelected}

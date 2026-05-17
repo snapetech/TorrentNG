@@ -66,6 +66,10 @@ function trackerHost(url: string): string {
   }
 }
 
+function countValue(value?: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0
+}
+
 export function TorrentSidebar({ params, total, mediaInference, onChange, onApply }: Props) {
   const qc = useQueryClient()
   const [viewName, setViewName] = useState('')
@@ -183,6 +187,7 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
             label={option.label}
             active={(params.status ?? '') === option.value}
             count={facets?.status[option.value || 'all'] ?? (option.value ? undefined : total)}
+            maxCount={facets?.status.all ?? total}
             onClick={() => onChange({ status: option.value || undefined, offset: 0 })}
           />
         ))}
@@ -194,6 +199,7 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
           label="All types"
           active={!params.media_type}
           count={total}
+          maxCount={total}
           onClick={() => onChange({ media_type: undefined, offset: 0 })}
         />
         {TYPE_OPTIONS.map(option => (
@@ -203,6 +209,7 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
             label={option.label}
             active={(params.media_type ?? '') === option.value}
             count={facets?.media_type[option.value]}
+            maxCount={total}
             onClick={() => onChange({ media_type: option.value, offset: 0 })}
           />
         ))}
@@ -217,6 +224,7 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
           label="All categories"
           active={!params.category}
           count={categories.length}
+          maxCount={Math.max(categories.length, ...categories.map(category => countValue(category.torrent_count)), 1)}
           onClick={() => onChange({ category: undefined, offset: 0 })}
         />
         {categories.slice(0, MAX_SECTION_ROWS).map(category => (
@@ -226,6 +234,7 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
             label={category.name}
             active={(params.category ?? '') === category.name}
             count={category.torrent_count}
+            maxCount={Math.max(...categories.map(category => countValue(category.torrent_count)), 1)}
             onClick={() => onChange({ category: category.name, offset: 0 })}
           />
         ))}
@@ -264,6 +273,7 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
           label="All trackers"
           active={!params.tracker}
           count={trackerHealth?.trackers.length ?? 0}
+          maxCount={Math.max(trackerHealth?.trackers.length ?? 0, ...(trackerHealth?.trackers.map(row => row.torrent_count) ?? []), 1)}
           onClick={() => onChange({ tracker: undefined, offset: 0 })}
         />
         <form
@@ -288,6 +298,7 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
             label={trackerHost(row.tracker)}
             active={(params.tracker ?? '') === row.tracker}
             count={row.torrent_count}
+            maxCount={Math.max(...trackerHealth.trackers.map(row => row.torrent_count), 1)}
             tone={row.error_count > 0 ? 'warn' : 'ok'}
             onClick={() => onChange({ tracker: row.tracker, offset: 0 })}
           />
@@ -377,16 +388,30 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
   )
 }
 
-function CountRow({ icon, label, active, count, tone, onClick }: {
+function CountRow({ icon, label, active, count, maxCount, tone, onClick }: {
   icon?: string
   label: string
   active: boolean
   count?: number
+  maxCount?: number
   tone?: 'ok' | 'warn'
   onClick: () => void
 }) {
+  const pct = count !== undefined && maxCount ? Math.min(100, Math.max(4, (count / maxCount) * 100)) : 0
   return (
     <button onClick={onClick} style={rowButtonStyle(active)}>
+      {count !== undefined && maxCount !== undefined && (
+        <span aria-hidden="true" style={{
+          position: 'absolute', left: 4, right: 4, bottom: 3, height: 2,
+          borderRadius: 999, overflow: 'hidden',
+          background: 'color-mix(in srgb, var(--border-strong) 36%, transparent)',
+        }}>
+          <span style={{
+            display: 'block', width: `${pct}%`, height: '100%',
+            background: active ? 'var(--accent)' : tone === 'warn' ? 'var(--warning)' : 'color-mix(in srgb, var(--accent) 52%, transparent)',
+          }} />
+        </span>
+      )}
       {icon && <span style={iconStyle(active, tone)}>{icon}</span>}
       <span style={labelStyle}>{label}</span>
       <span style={{
@@ -541,6 +566,8 @@ function rowButtonStyle(active: boolean): React.CSSProperties {
     gap: 8,
     alignItems: 'center',
     textAlign: 'left',
+    position: 'relative',
+    overflow: 'hidden',
   }
 }
 
