@@ -24,10 +24,9 @@ use once_cell::sync::Lazy;
 use crate::backend::{BackendKind, BackendRequest, DiskBackend, SelectedDiskBackend};
 use crate::error::StorageError;
 use crate::fd_limit::{handle_cache_capacity, raise_nofile_limit};
-use crate::frame::{Frame, FramePool};
+use crate::frame::{global_frame_pool, Frame, FramePool};
 use crate::handle_cache::HandleCache;
 
-const DEFAULT_FRAME_CAP_MB: u64 = 256;
 const DEFAULT_HANDLE_IDLE_SECS: u64 = 30;
 /// How often the background sweeper closes idle handles.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
@@ -45,10 +44,8 @@ impl StorageRuntime {
         let cap = handle_cache_capacity(soft_nofile);
 
         let idle_secs = env_u64("TNG_STORAGE_HANDLE_IDLE_SECS", DEFAULT_HANDLE_IDLE_SECS);
-        let frame_cap_mb = env_u64("TNG_STORAGE_FRAME_CAP_MB", DEFAULT_FRAME_CAP_MB);
-
         let handles = HandleCache::new(cap, Duration::from_secs(idle_secs));
-        let frames = FramePool::new(frame_cap_mb.saturating_mul(1024 * 1024));
+        let frames = global_frame_pool().clone();
         let backend_request = std::env::var("TNG_STORAGE_BACKEND")
             .ok()
             .map(|value| BackendRequest::parse(&value))
@@ -77,7 +74,7 @@ impl StorageRuntime {
 
         tracing::info!(
             handle_cap = cap,
-            frame_cap_mb,
+            frame_cap_bytes = frames.cap_bytes(),
             idle_secs,
             backend = backend.kind().as_str(),
             backend_reason = %backend.selection().reason,

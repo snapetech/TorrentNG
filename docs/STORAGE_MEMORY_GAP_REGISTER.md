@@ -62,9 +62,9 @@ Implemented and covered by automated tests:
 - The live torrent scheduler owns a `SelectedDiskBackend` and routes reads,
   writes, syncs, and peer-read elevator dispatch through the same bounded
   backend interface used by storage runtime probes.
-- Scheduler read and peer-read elevator buffers enter the backend through frame
-  objects before being copied into caller-owned `Bytes`; process-level
-  frame-pool accounting for the live torrent path remains tracked below.
+- Scheduler read and peer-read elevator buffers enter the backend through the
+  same process-level frame pool used by `StorageRuntime`, then copy into
+  caller-owned `Bytes`.
 - Native `[storage]` TOML covers scheduler `StorageIoConfig` knobs for file
   pool size, idle TTL, I/O/hash workers, queue depths, preallocation,
   durability, peer-read readahead/cache, and elevator budget.
@@ -80,7 +80,7 @@ Implemented and covered by automated tests:
 
 | Area | Gap | Risk | Next Work |
 | --- | --- | --- | --- |
-| Storage frame accounting on torrent reads | Scheduler reads now dispatch through `DiskBackend`, but still copy backend frames into `Bytes`; the global `FramePool` only backs `StorageRuntime::read_frame`. | Storage frame caps do not bound the primary torrent read/recheck path, so frame metrics can understate actual storage buffer pressure. | Add scheduler frame leases or make scheduler reads consume `StorageRuntime` frames before dispatching disk work. |
+| Storage frame ownership on returned bytes | Scheduler reads and peer-read elevator reads now borrow from the process-level frame pool before backend dispatch, but still copy backend frames into caller-owned `Bytes`. | Storage frame caps bound in-flight backend read buffers, but payloads returned to peer/API code are no longer represented as frame leases after the copy. | Add a frame-owned bytes API or equivalent lease-carrying payload type if zero-copy storage-frame ownership becomes required. |
 | Scheduler/backend double queue | Scheduler direct reads, writes, syncs, and peer-read elevator dispatch now await backend completion outside the scheduler blocking pool after a short open/metadata phase. Prepare and sparse extent probing still use the older bounded blocking bridge. | The hottest payload, durability, and elevator paths are improved, but secondary paths can still occupy scheduler workers while waiting on backend completion. | Apply the same guard/open/backend split to remaining backend I/O paths, then remove blocking backend waits from scheduler code. |
 | Restartable move/import execution | The move/import/delete executor is conservative for one process execution, but multi-step move/import progress is not durably recorded. | A process crash during a multi-TB move leaves recovery dependent on filesystem inspection instead of a known persisted plan state. | Persist plan id, steps, completed steps, and rollback intent in the engine DB before executing cross-device copy/rename/delete operations. |
 | Deterministic LVM PV placement control | The kspls0 extent probe shows the pool can allocate independent files on multiple rotational PVs, but ordinary path writes still do not let TorrentNG choose a specific PV. | Cross-PV behavior inside the LVM pool is allocator-dependent, so path-level scheduling cannot promise physical-drive affinity. | Use LVM extent mapping for evidence, or add lower-level PV-targeted probes only if release claims require deterministic per-drive placement. |

@@ -22,7 +22,7 @@ use crate::{
     backend::{BackendRequest, DiskBackend, SelectedDiskBackend},
     device::{detect_storage_topology, StorageTopology},
     error::StorageError,
-    frame::FramePool,
+    frame::global_frame_pool,
     io_class::IoClass,
 };
 
@@ -992,8 +992,7 @@ async fn dispatch_peer_read_batch(
         .await
     {
         Ok((key, file)) => {
-            let frame_pool = FramePool::new(len as u64);
-            let frame = match frame_pool.try_acquire(len) {
+            let frame = match global_frame_pool().try_acquire(len) {
                 Some(frame) => frame,
                 None => {
                     counters.queue_full.fetch_add(1, Ordering::Relaxed);
@@ -1556,13 +1555,11 @@ impl MountScheduler {
                 file,
                 read_len,
             } => {
-                let frame_pool = FramePool::new(read_len as u64);
-                let frame =
-                    frame_pool
-                        .try_acquire(read_len)
-                        .ok_or_else(|| StorageError::QueueFull {
-                            mount: "scheduler-read-frame".to_string(),
-                        })?;
+                let frame = global_frame_pool().try_acquire(read_len).ok_or_else(|| {
+                    StorageError::QueueFull {
+                        mount: "scheduler-read-frame".to_string(),
+                    }
+                })?;
                 let frame =
                     match await_backend_io(&key, disk_backend.pread(file.clone(), frame, offset))
                         .await

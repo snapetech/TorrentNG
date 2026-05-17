@@ -12,6 +12,12 @@ use std::sync::{
     Arc, Mutex,
 };
 
+use once_cell::sync::Lazy;
+
+/// Default process-wide frame-pool cap when `TNG_STORAGE_FRAME_CAP_MB` is not
+/// set.
+pub const DEFAULT_FRAME_CAP_MB: u64 = 256;
+
 /// Pooled size classes. A request rounds up to the smallest class that
 /// fits; requests larger than the biggest class get an exact-size,
 /// non-pooled allocation (still counted against the cap).
@@ -124,6 +130,20 @@ impl FramePool {
         }
         // Oversize buffers are simply dropped.
     }
+}
+
+/// Process-wide storage frame pool shared by `StorageRuntime` and the live
+/// torrent scheduler.
+pub fn global_frame_pool() -> &'static FramePool {
+    static GLOBAL: Lazy<FramePool> = Lazy::new(|| {
+        let cap_mb = std::env::var("TNG_STORAGE_FRAME_CAP_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(DEFAULT_FRAME_CAP_MB);
+        FramePool::new(cap_mb.saturating_mul(1024 * 1024))
+    });
+    &GLOBAL
 }
 
 /// A buffer borrowed from the [`FramePool`]. Returns to the pool on drop
