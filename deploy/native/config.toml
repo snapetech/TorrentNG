@@ -12,6 +12,19 @@ download_rate_limit = 0
 
 [storage]
 download_dir = "/data"
+device_elevator_enabled = true
+
+[memory]
+total_cap_mb = 512
+storage_frame_cap_mb = 128
+piece_assembly_cap_mb = 128
+peer_buffer_cap_mb = 128
+metadata_cap_mb = 32
+pressure_constrained_pct = 75
+pressure_critical_pct = 90
+
+[runtime]
+torrent_tiers_enabled = true
 
 [tracker]
 http_timeout_secs = 30

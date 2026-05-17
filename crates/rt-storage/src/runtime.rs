@@ -10,7 +10,8 @@
 //! sized for a large seedbox):
 //!
 //! - `TNG_STORAGE_FRAME_CAP_MB`     frame-pool hard cap (default 256)
-//! - `TNG_STORAGE_DISK_THREADS`     pread worker threads (default: cores/2)
+//! - `TNG_STORAGE_BACKEND`          auto | pread | uring (default auto)
+//! - `TNG_STORAGE_DISK_THREADS`     backend worker threads (default: cores/2)
 //! - `TNG_STORAGE_HANDLE_IDLE_SECS` idle handle TTL      (default 30)
 
 use std::fs::File;
@@ -20,7 +21,7 @@ use std::time::Duration;
 
 use once_cell::sync::Lazy;
 
-use crate::backend::{DiskBackend, PreadBackend};
+use crate::backend::{BackendKind, BackendRequest, DiskBackend, SelectedDiskBackend};
 use crate::error::StorageError;
 use crate::fd_limit::{handle_cache_capacity, raise_nofile_limit};
 use crate::frame::{Frame, FramePool};
@@ -35,7 +36,7 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 pub struct StorageRuntime {
     handles: HandleCache,
     frames: FramePool,
-    backend: PreadBackend,
+    backend: SelectedDiskBackend,
 }
 
 impl StorageRuntime {
@@ -48,12 +49,16 @@ impl StorageRuntime {
 
         let handles = HandleCache::new(cap, Duration::from_secs(idle_secs));
         let frames = FramePool::new(frame_cap_mb.saturating_mul(1024 * 1024));
+        let backend_request = std::env::var("TNG_STORAGE_BACKEND")
+            .ok()
+            .map(|value| BackendRequest::parse(&value))
+            .unwrap_or(BackendRequest::Auto);
         let backend = match std::env::var("TNG_STORAGE_DISK_THREADS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
         {
-            Some(n) if n > 0 => PreadBackend::new(n),
-            _ => PreadBackend::with_default_threads(),
+            Some(n) if n > 0 => SelectedDiskBackend::select(backend_request, n),
+            _ => SelectedDiskBackend::select_default(backend_request),
         };
 
         // Background idle-handle sweeper. A plain OS thread so it works
@@ -74,6 +79,8 @@ impl StorageRuntime {
             handle_cap = cap,
             frame_cap_mb,
             idle_secs,
+            backend = backend.kind().as_str(),
+            backend_reason = %backend.selection().reason,
             "storage runtime initialised"
         );
 
@@ -103,6 +110,18 @@ impl StorageRuntime {
     /// Frame-pool hard cap.
     pub fn frame_cap_bytes(&self) -> u64 {
         self.frames.cap_bytes()
+    }
+
+    pub fn backend_kind(&self) -> BackendKind {
+        self.backend.kind()
+    }
+
+    pub fn backend_reason(&self) -> &str {
+        &self.backend.selection().reason
+    }
+
+    pub fn backend_supports_fixed_buffers(&self) -> bool {
+        self.backend.supports_fixed_buffers()
     }
 
     fn open_read(&self, path: &Path) -> Result<Arc<File>, StorageError> {

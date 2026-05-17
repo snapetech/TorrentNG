@@ -158,7 +158,8 @@ shippable and benchmarkable.
 
 ### Phase D — efficiency
 
-- [ ] `UringBackend` (registered fds + fixed buffers + batched submit), probe-selected.
+- [x] Probe-selected disk backend abstraction with explicit `auto`/`pread`/`uring` request handling and clean fallback diagnostics.
+- [ ] Complete `UringBackend` registered fds + fixed buffers + batched submit implementation.
 - [x] Group-commit per-device `fdatasync` barrier; fastresume watermark gated on barrier.
 - [x] Bounded post-crash recheck (only pieces written since last barrier).
 - [x] Piece-aggregated writes; hash from RAM on dedicated hashing pool; delete read-after-write verify.

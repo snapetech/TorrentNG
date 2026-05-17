@@ -1269,6 +1269,7 @@ dependencies = [
  "rt-api-model",
  "rt-engine",
  "rt-metainfo",
+ "rt-metrics",
  "rt-session",
  "rt-storage",
  "serde",

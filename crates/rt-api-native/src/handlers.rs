@@ -1075,6 +1075,62 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
         "In-memory piece assembly buffers evicted by torrent-task budgets",
         stats.piece_assembly_evictions,
     );
+    if let Some(resources) = &stats.resources {
+        metric(
+            &mut out,
+            "torrentng_memory_cap_bytes",
+            "gauge",
+            "Configured process-owned memory cap enforced by the resource governor",
+            resources.total_cap_bytes,
+        );
+        metric(
+            &mut out,
+            "torrentng_memory_used_bytes",
+            "gauge",
+            "Process-owned bytes currently leased through the resource governor",
+            resources.total_used_bytes,
+        );
+        metric(
+            &mut out,
+            "torrentng_memory_pressure_state",
+            "gauge",
+            "Resource governor memory pressure state: normal=0 constrained=1 critical=2",
+            match resources.pressure {
+                rt_metrics::MemoryPressure::Normal => 0,
+                rt_metrics::MemoryPressure::Constrained => 1,
+                rt_metrics::MemoryPressure::Critical => 2,
+            },
+        );
+        for class in resources.classes {
+            metric_with_label(
+                &mut out,
+                "torrentng_memory_class_cap_bytes",
+                "gauge",
+                "Configured process-owned memory cap by resource class",
+                "class",
+                class.class.as_str(),
+                class.cap_bytes,
+            );
+            metric_with_label(
+                &mut out,
+                "torrentng_memory_class_used_bytes",
+                "gauge",
+                "Process-owned bytes currently leased by resource class",
+                "class",
+                class.class.as_str(),
+                class.used_bytes,
+            );
+            metric_with_label(
+                &mut out,
+                "torrentng_memory_class_denied_allocations_total",
+                "counter",
+                "Denied resource governor allocation attempts by resource class",
+                "class",
+                class.class.as_str(),
+                class.denied_allocations,
+            );
+        }
+    }
     let storage = StorageRuntime::global();
     metric(
         &mut out,
@@ -1145,6 +1201,35 @@ fn metric_by_class(out: &mut String, name: &str, kind: &str, help: &str, values:
         out.push_str(&value.to_string());
         out.push('\n');
     }
+}
+
+fn metric_with_label(
+    out: &mut String,
+    name: &str,
+    kind: &str,
+    help: &str,
+    label: &str,
+    label_value: &str,
+    value: u64,
+) {
+    out.push_str("# HELP ");
+    out.push_str(name);
+    out.push(' ');
+    out.push_str(help);
+    out.push('\n');
+    out.push_str("# TYPE ");
+    out.push_str(name);
+    out.push(' ');
+    out.push_str(kind);
+    out.push('\n');
+    out.push_str(name);
+    out.push('{');
+    out.push_str(label);
+    out.push_str("=\"");
+    out.push_str(label_value);
+    out.push_str("\"} ");
+    out.push_str(&value.to_string());
+    out.push('\n');
 }
 
 fn latency_histogram(

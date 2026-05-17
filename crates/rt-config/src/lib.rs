@@ -19,6 +19,8 @@ pub struct Config {
     pub daemon: DaemonConfig,
     pub network: NetworkConfig,
     pub storage: StorageConfig,
+    pub memory: MemoryConfig,
+    pub runtime: RuntimeConfig,
     pub tracker: TrackerConfig,
     pub dht: DhtConfig,
     pub db: DbConfig,
@@ -56,6 +58,26 @@ pub struct NetworkConfig {
 pub struct StorageConfig {
     /// Default directory for downloaded content.
     pub download_dir: PathBuf,
+    /// Enable per-device peer-read elevator scheduling where storage profiles benefit.
+    pub device_elevator_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemoryConfig {
+    pub total_cap_mb: u64,
+    pub storage_frame_cap_mb: u64,
+    pub piece_assembly_cap_mb: u64,
+    pub peer_buffer_cap_mb: u64,
+    pub metadata_cap_mb: u64,
+    pub pressure_constrained_pct: u8,
+    pub pressure_critical_pct: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RuntimeConfig {
+    pub torrent_tiers_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,6 +143,29 @@ impl Default for StorageConfig {
     fn default() -> Self {
         StorageConfig {
             download_dir: dirs_default_download(),
+            device_elevator_enabled: true,
+        }
+    }
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        MemoryConfig {
+            total_cap_mb: 512,
+            storage_frame_cap_mb: 128,
+            piece_assembly_cap_mb: 128,
+            peer_buffer_cap_mb: 128,
+            metadata_cap_mb: 32,
+            pressure_constrained_pct: 75,
+            pressure_critical_pct: 90,
+        }
+    }
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        RuntimeConfig {
+            torrent_tiers_enabled: true,
         }
     }
 }
@@ -239,6 +284,10 @@ mod tests {
         assert_eq!(c.tracker.http_timeout_secs, 30);
         assert!(c.auth.api_tokens.is_empty());
         assert_eq!(c.daemon.shutdown_timeout_secs, 10);
+        assert_eq!(c.memory.total_cap_mb, 512);
+        assert_eq!(c.memory.storage_frame_cap_mb, 128);
+        assert!(c.runtime.torrent_tiers_enabled);
+        assert!(c.storage.device_elevator_enabled);
     }
 
     #[test]

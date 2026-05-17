@@ -4,6 +4,7 @@ use std::{net::SocketAddr, path::PathBuf};
 use tokio::sync::oneshot;
 
 use rt_metainfo::{MagnetLink, TorrentMeta};
+use rt_metrics::ResourceSnapshot;
 use rt_storage::{StorageIoStats, STORAGE_LATENCY_BUCKET_COUNT};
 
 use crate::TorrentActivityTier;
@@ -116,6 +117,7 @@ pub struct EngineStats {
     pub piece_assembly_buffers: u64,
     pub piece_assembly_bytes: u64,
     pub piece_assembly_evictions: u64,
+    pub resources: Option<ResourceSnapshot>,
 }
 
 #[derive(Debug, Clone, Default)]

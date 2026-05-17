@@ -30,6 +30,10 @@ scheduler used by the native engine.
   hash, and bytes-by-class counters for metrics integration.
 - `IoClass::PeerRead` can read ahead into a small per-file cache while returning
   exactly the requested block bytes to the caller.
+- `StorageRuntime` uses a probe-selected disk backend. Set
+  `TNG_STORAGE_BACKEND=auto|pread|uring` to request a backend; `uring` currently
+  falls back to `pread` with a diagnostic reason until the registered-fd,
+  fixed-buffer syscall driver is linked.
 
 ## Correctness Expectations
 
@@ -47,9 +51,10 @@ scheduler used by the native engine.
 
 Unit tests cover scheduler class isolation, read-missing behavior, write create
 policy, fd-pool hit/miss/eviction behavior, sparse preparation, and concurrent
-positioned writes on a cached fd. They also assert storage stats for read,
-write, sync, and hash work. Engine tests cover upload block assembly across
-multi-file regions and fastresume/recheck workflows.
+positioned writes on a cached fd. They also assert backend request parsing,
+probe-selected fallback behavior, storage stats for read, write, sync, and hash
+work. Engine tests cover upload block assembly across multi-file regions and
+fastresume/recheck workflows.
 
 Run:
 

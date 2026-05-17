@@ -46,6 +46,25 @@ RUSTTORRENTD_CONFIG=/config/config.toml rusttorrentd
 | Key | Default | Description |
 |---|---|---|
 | `download_dir` | `~/Downloads` or `/tmp` | Default payload download directory |
+| `device_elevator_enabled` | `true` | Enable per-device peer-read elevator scheduling where storage profiles benefit |
+
+### `[memory]`
+
+| Key | Default | Description |
+|---|---|---|
+| `total_cap_mb` | `512` | Process-owned memory cap for governor-managed buffers |
+| `storage_frame_cap_mb` | `128` | Storage frame memory class cap |
+| `piece_assembly_cap_mb` | `128` | Incomplete piece assembly memory class cap |
+| `peer_buffer_cap_mb` | `128` | Peer rx/tx and webseed buffer memory class cap |
+| `metadata_cap_mb` | `32` | Metadata, tracker peer cache, DHT table, and API snapshot class baseline cap |
+| `pressure_constrained_pct` | `75` | Percent of total cap that reports constrained pressure |
+| `pressure_critical_pct` | `90` | Percent of total cap that reports critical pressure |
+
+### `[runtime]`
+
+| Key | Default | Description |
+|---|---|---|
+| `torrent_tiers_enabled` | `true` | Keep idle torrents in Dormant/Warm tiers so only active torrents own task/runtime resources |
 
 ### `[tracker]`
 

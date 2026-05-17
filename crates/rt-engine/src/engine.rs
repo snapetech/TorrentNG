@@ -20,6 +20,7 @@ use rt_config::Config;
 use rt_db::TorrentRow;
 use rt_fastresume::{FastresumeStore, PieceState};
 use rt_metainfo::{parse_torrent, MagnetLink, TorrentMeta, TorrentMetaV1, TorrentMetaV2};
+use rt_metrics::{MemoryClass, ResourceGovernor, ResourceGovernorConfig, MEMORY_CLASS_COUNT};
 use rt_path::{StorageProfile, StorageRootId};
 use rt_peer_wire::handshake::{Handshake, HANDSHAKE_LEN};
 use rt_session::{SessionRegistry, TorrentEntry, TorrentState, TransferStats};
@@ -62,6 +63,33 @@ const SETTING_GLOBAL_DOWNLOAD_LIMIT: &str = "transfer.download_limit";
 const SETTING_GLOBAL_UPLOAD_LIMIT: &str = "transfer.upload_limit";
 const SETTING_GLOBAL_SPEED_LIMITS_MODE: &str = "transfer.speed_limits_mode";
 const SETTING_QUEUE_PREFIX: &str = "torrent.queue.";
+
+fn resource_config_from_config(config: &Config) -> ResourceGovernorConfig {
+    let mib = 1024 * 1024;
+    let mut class_caps_bytes = [0; MEMORY_CLASS_COUNT];
+    class_caps_bytes[MemoryClass::StorageFrame as usize] =
+        config.memory.storage_frame_cap_mb.saturating_mul(mib);
+    class_caps_bytes[MemoryClass::PieceAssembly as usize] =
+        config.memory.piece_assembly_cap_mb.saturating_mul(mib);
+    class_caps_bytes[MemoryClass::PeerBuffer as usize] =
+        config.memory.peer_buffer_cap_mb.saturating_mul(mib);
+    class_caps_bytes[MemoryClass::WebseedBody as usize] =
+        config.memory.peer_buffer_cap_mb.saturating_mul(mib) / 2;
+    class_caps_bytes[MemoryClass::Metadata as usize] =
+        config.memory.metadata_cap_mb.saturating_mul(mib);
+    class_caps_bytes[MemoryClass::TrackerPeers as usize] =
+        config.memory.metadata_cap_mb.saturating_mul(mib);
+    class_caps_bytes[MemoryClass::DhtTable as usize] =
+        config.memory.metadata_cap_mb.saturating_mul(mib);
+    class_caps_bytes[MemoryClass::ApiSnapshot as usize] =
+        config.memory.metadata_cap_mb.saturating_mul(mib) / 2;
+    ResourceGovernorConfig {
+        total_cap_bytes: config.memory.total_cap_mb.saturating_mul(mib),
+        class_caps_bytes,
+        pressure_constrained_pct: config.memory.pressure_constrained_pct,
+        pressure_critical_pct: config.memory.pressure_critical_pct,
+    }
+}
 
 /// Handle given to the API layer. Clone freely; all sends are channel-based.
 #[derive(Clone)]
@@ -452,6 +480,7 @@ pub struct Engine {
     torrent_chans: HashMap<String, mpsc::Sender<TorrentCmd>>,
     torrent_tasks: HashMap<String, JoinHandle<()>>,
     dht_tx: Option<mpsc::Sender<DhtCommand>>,
+    resources: ResourceGovernor,
 }
 
 impl Engine {
@@ -497,6 +526,7 @@ impl Engine {
             torrent_chans: HashMap::new(),
             torrent_tasks: HashMap::new(),
             dht_tx: dht_shutdown,
+            resources: ResourceGovernor::new(resource_config_from_config(&config)),
         };
         engine.append_session_event(
             None,
@@ -2301,6 +2331,7 @@ impl Engine {
                     .tier,
             );
         }
+        stats.resources = Some(self.resources.snapshot());
         Ok(stats)
     }
 
@@ -3326,6 +3357,10 @@ mod tests {
     use rt_metainfo::TorrentFileV1;
     use rt_path::SafeRelPath;
 
+    fn test_resource_governor() -> ResourceGovernor {
+        ResourceGovernor::new(ResourceGovernorConfig::default())
+    }
+
     fn meta() -> TorrentMetaV1 {
         TorrentMetaV1 {
             info_hash: [1u8; 20],
@@ -3568,6 +3603,7 @@ mod tests {
             torrent_chans: HashMap::new(),
             torrent_tasks: HashMap::new(),
             dht_tx: None,
+            resources: test_resource_governor(),
         };
         let job_id = engine.create_recheck_job(&info_hash).unwrap();
 
@@ -3626,6 +3662,7 @@ mod tests {
             torrent_chans: HashMap::new(),
             torrent_tasks: HashMap::new(),
             dht_tx: None,
+            resources: test_resource_governor(),
         };
         let magnet = MagnetLink {
             info_hash_v1: None,
@@ -3726,6 +3763,7 @@ mod tests {
             torrent_chans: HashMap::new(),
             torrent_tasks: HashMap::new(),
             dht_tx: None,
+            resources: test_resource_governor(),
         };
         std::fs::create_dir_all(torrent_blob_dir(&engine.config)).unwrap();
         let raw = raw_v2_torrent();
@@ -3954,6 +3992,7 @@ mod tests {
             torrent_chans: HashMap::new(),
             torrent_tasks: HashMap::new(),
             dht_tx: None,
+            resources: test_resource_governor(),
         };
 
         engine.append_session_event(
@@ -3985,6 +4024,7 @@ mod tests {
             torrent_chans: HashMap::new(),
             torrent_tasks: HashMap::new(),
             dht_tx: None,
+            resources: test_resource_governor(),
         };
 
         let job_id = engine.create_recheck_job(&"b".repeat(40)).unwrap();
@@ -4021,6 +4061,7 @@ mod tests {
             torrent_chans,
             torrent_tasks: HashMap::new(),
             dht_tx: None,
+            resources: test_resource_governor(),
         };
 
         let job_id = engine.create_recheck_job(&info_hash).unwrap();
@@ -4080,6 +4121,7 @@ mod tests {
             torrent_chans,
             torrent_tasks: HashMap::new(),
             dht_tx: None,
+            resources: test_resource_governor(),
         };
 
         engine
@@ -4106,6 +4148,7 @@ mod tests {
             torrent_chans: HashMap::new(),
             torrent_tasks: HashMap::new(),
             dht_tx: None,
+            resources: test_resource_governor(),
         };
 
         assert_eq!(
@@ -4153,6 +4196,7 @@ mod tests {
             torrent_chans: HashMap::new(),
             torrent_tasks: HashMap::new(),
             dht_tx: None,
+            resources: test_resource_governor(),
         };
 
         engine
@@ -4217,6 +4261,7 @@ mod tests {
             torrent_chans: HashMap::new(),
             torrent_tasks: HashMap::new(),
             dht_tx: None,
+            resources: test_resource_governor(),
         };
 
         engine
@@ -4275,6 +4320,7 @@ mod tests {
             torrent_chans,
             torrent_tasks: HashMap::new(),
             dht_tx: None,
+            resources: test_resource_governor(),
         };
 
         engine
@@ -4343,6 +4389,7 @@ mod tests {
             torrent_chans,
             torrent_tasks: HashMap::new(),
             dht_tx: None,
+            resources: test_resource_governor(),
         };
 
         engine
@@ -4400,6 +4447,7 @@ mod tests {
             torrent_chans,
             torrent_tasks,
             dht_tx: None,
+            resources: test_resource_governor(),
         };
 
         engine.shutdown_torrent_tasks().await;
@@ -4423,6 +4471,7 @@ mod tests {
             torrent_chans: HashMap::new(),
             torrent_tasks: HashMap::new(),
             dht_tx: None,
+            resources: test_resource_governor(),
         };
         let mut job = rt_db::JobRow {
             job_id: "job-running".to_owned(),
@@ -4528,6 +4577,7 @@ mod tests {
             torrent_chans: HashMap::new(),
             torrent_tasks: HashMap::new(),
             dht_tx: None,
+            resources: test_resource_governor(),
         };
 
         engine.load_persisted_torrents().await.unwrap();
@@ -4620,6 +4670,7 @@ mod tests {
             torrent_chans: HashMap::new(),
             torrent_tasks: HashMap::new(),
             dht_tx: None,
+            resources: test_resource_governor(),
         };
 
         engine.load_persisted_torrents().await.unwrap();
@@ -4708,6 +4759,7 @@ mod tests {
             torrent_chans,
             torrent_tasks: HashMap::new(),
             dht_tx: None,
+            resources: test_resource_governor(),
         };
         let job_id = engine.create_recheck_job(&info_hash).unwrap();
         engine.update_job_state(&job_id, JOB_STATE_RUNNING, None, Some("running"));
@@ -4804,6 +4856,7 @@ mod tests {
             torrent_chans: HashMap::new(),
             torrent_tasks: HashMap::new(),
             dht_tx: None,
+            resources: test_resource_governor(),
         };
         {
             let db = engine.db.lock().unwrap();
