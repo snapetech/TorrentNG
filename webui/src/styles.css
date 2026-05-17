@@ -746,6 +746,43 @@ summary:hover {
     0 14px 36px color-mix(in srgb, var(--shadow) 32%, transparent);
 }
 
+.rtng-category-row,
+.rtng-category-form,
+.rtng-shortcut-row {
+  transition:
+    border-color 120ms ease,
+    background-color 120ms ease,
+    box-shadow 120ms ease,
+    filter 120ms ease;
+}
+
+.rtng-category-row[data-has-path="true"] {
+  box-shadow: inset 3px 0 0 color-mix(in srgb, var(--success) 58%, transparent);
+}
+
+.rtng-category-row[data-has-path="false"] {
+  box-shadow: inset 3px 0 0 color-mix(in srgb, var(--warning) 68%, transparent);
+}
+
+.rtng-category-row[data-active="true"],
+.rtng-category-form:focus-within {
+  border-color: color-mix(in srgb, var(--accent) 70%, var(--border-strong)) !important;
+  box-shadow:
+    inset 3px 0 0 color-mix(in srgb, var(--accent) 68%, transparent),
+    0 0 0 2px color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.rtng-shortcut-row {
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 4px 6px;
+}
+
+.rtng-shortcut-row:hover {
+  border-color: color-mix(in srgb, var(--accent) 28%, var(--border)) !important;
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+}
+
 ::selection {
   background: color-mix(in srgb, var(--accent) 40%, transparent);
   color: var(--text);

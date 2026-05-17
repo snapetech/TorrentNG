@@ -44,7 +44,7 @@ export function HelpDialog({ onClose }: Props) {
             <h2 style={headingStyle}>Shortcuts</h2>
             <div style={{ display: 'grid', gap: 6 }}>
               {SHORTCUTS.map(([key, value]) => (
-                <div key={key} style={rowStyle}>
+                <div key={key} className="rtng-shortcut-row" style={rowStyle}>
                   <kbd style={kbdStyle}>{key}</kbd>
                   <span>{value}</span>
                 </div>

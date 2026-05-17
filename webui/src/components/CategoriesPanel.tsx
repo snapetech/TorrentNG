@@ -103,7 +103,7 @@ export function CategoriesPanel() {
         <div style={{ marginBottom: 20 }}>
           {deleteError && <Notice tone="error">{deleteError}</Notice>}
           {categories.map(cat => (
-            <div key={cat.name} className="rtng-card" style={{
+            <div key={cat.name} className="rtng-card rtng-category-row" data-active={editingName === cat.name ? 'true' : 'false'} data-has-path={cat.save_path ? 'true' : 'false'} style={{
               display: 'grid',
               gridTemplateColumns: 'minmax(0, 1fr) auto auto',
               alignItems: 'center',
@@ -146,7 +146,7 @@ export function CategoriesPanel() {
       )}
 
       {/* Add / edit form */}
-      <form onSubmit={submit} style={{
+      <form className="rtng-form-card rtng-category-form" onSubmit={submit} style={{
         display: 'flex', flexDirection: 'column', gap: 10, maxWidth: 520,
         border: '1px solid var(--border)', borderRadius: 8, background: 'var(--surface)', padding: 12,
         boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.03)',
