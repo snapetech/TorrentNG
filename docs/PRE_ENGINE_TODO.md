@@ -1,6 +1,10 @@
 # Pre-Engine Completion TODO
 
-This list covers work before the native BitTorrent engine rewrite. Track 2 engine crates start after these release gates are handled.
+Historical archive. This list covered work before the native BitTorrent engine
+rewrite. The native engine now has its own implementation and certification
+surface; see [ENGINE_REWRITE.md](ENGINE_REWRITE.md),
+[ENGINE_REWRITE_BURNDOWN.md](ENGINE_REWRITE_BURNDOWN.md), and
+[NATIVE_DEPLOYMENT.md](NATIVE_DEPLOYMENT.md).
 
 ## Done in sidecar scope
 
@@ -39,10 +43,7 @@ This list covers work before the native BitTorrent engine rewrite. Track 2 engin
 - Complete independent security review of script workflow policy before recommending it for production.
 - Re-run `scripts/phase1_certification.sh` immediately before release and rebuild the Phase 1 image if upstream ruTorrent/PHP base behavior changes.
 
-## Deferred to native engine rewrite
+## Moved to native engine rewrite
 
-- Native BitTorrent protocol engine.
-- Native storage/recheck/tracker/session daemon.
-- Full migration tooling from rTorrent, qBittorrent, and Transmission.
-- Transmission compatibility API.
-- DHT/PEX/LSD/uTP and BEP 52 support.
+- Historical section: these items moved into the native rewrite work tracked in
+  [ENGINE_REWRITE_BURNDOWN.md](ENGINE_REWRITE_BURNDOWN.md).

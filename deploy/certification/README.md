@@ -1,8 +1,14 @@
 # Certification Stack
 
-This directory contains the local live-certification harness for Track 1 integrations.
+This directory contains the local live-certification harness for Track 1
+rTorrent-sidecar integrations. Native-engine certification lives beside it in
+`scripts/native_engine_certification_report.sh`, and cross-client native
+interop is covered by `scripts/interop_matrix.sh`.
 
-It starts rtorrentNG alongside Sonarr, Radarr, Prowlarr, autobrr, and cross-seed. The runner verifies that the sidecar qBittorrent-compatible API is reachable from the same Docker network and writes a markdown report under `certification/reports/`.
+The Track 1 stack starts rtorrentNG alongside Sonarr, Radarr, Prowlarr, autobrr,
+and cross-seed. The runner verifies that the rTorrent-backed sidecar
+qBittorrent-compatible API is reachable from the same Docker network and writes
+a markdown report under `certification/reports/`.
 
 ## Run
 
@@ -68,6 +74,13 @@ Fedora torrents from official project indexes at runtime and fully downloads
 them by default. Set `INTEROP_INCLUDE_LIBREOFFICE=1` to include the optional
 LibreOffice entry when its official torrent is available.
 
+Run native-engine certification directly:
+
+```sh
+./scripts/native_engine_certification_report.sh
+NATIVE_ENGINE_URL=http://127.0.0.1:8080 ./scripts/native_engine_certification_report.sh
+```
+
 Refresh the short automated gate set and write a consolidated release report:
 
 ```sh
@@ -90,7 +103,10 @@ Inspect and finalize the long soak:
 
 `post_soak_release_gate.sh` is intended for after the 24-hour soak has completed. It finalizes the soak with `RESTORE_NORMAL=1`, reruns the short certification suite, and refreshes the consolidated release report.
 
-The readiness runner verifies container/API readiness plus the sidecar/qBit compatibility surface. The client-configuration script completes the first-run qBittorrent client setup through each app's API and records whether each app's own connection test accepts rtorrentNG.
+The readiness runner verifies container/API readiness plus the Track 1
+sidecar/qBit compatibility surface. The client-configuration script completes
+the first-run qBittorrent client setup through each app's API and records
+whether each app's own connection test accepts rtorrentNG.
 
 ## Host ports
 

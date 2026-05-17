@@ -5,8 +5,8 @@ metainfo, fastresume state, config, and operator-owned certification artifacts.
 
 ## What To Back Up
 
-- `config.toml` and any environment file that provides `RTNG_SECRET_KEY`,
-  `RTNG_API_TOKENS`, storage roots, and listen ports.
+- Native `config.toml` and any environment file that provides
+  `RUSTTORRENTD_CONFIG`, API tokens, storage roots, and listen ports.
 - The native session directory containing `rtorrentng.db`, stored `.torrent`
   blobs, fastresume state, and job/event state.
 - Storage-root metadata if deployed separately from payload files.

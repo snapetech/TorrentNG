@@ -1,6 +1,13 @@
 # Integration Compatibility Harness
 
-The qBittorrent shim is covered by executable flow tests in `sidecar/tests/qbcompat.rs`.
+rtorrentNG has compatibility coverage for both runtime modes:
+
+- Track 1 sidecar qBittorrent flows in `sidecar/tests/qbcompat.rs`.
+- Native compatibility API projections through `rt-api-qbit`,
+  `rt-api-transmission`, and `rt-api-deluge`, included in
+  `scripts/native_engine_certification_report.sh`.
+
+## Track 1 Sidecar Flows
 
 Current named flows:
 
@@ -20,6 +27,27 @@ cargo test qb_extended_torrent_forms_parse
 ```
 
 These tests run against an in-memory sidecar and do not require a live rTorrent instance. Endpoints that call rTorrent are expected to fail gracefully or return qBit-compatible success for no-op compatibility surfaces.
+
+## Native Engine Compatibility
+
+Run the native compatibility projection tests:
+
+```bash
+cargo test -p rt-api-qbit -p rt-api-transmission -p rt-api-deluge
+```
+
+Run the full native certification gate:
+
+```bash
+scripts/native_engine_certification_report.sh
+```
+
+When a native daemon is running, bind the report to its live capability
+manifest:
+
+```bash
+NATIVE_ENGINE_URL=http://127.0.0.1:8080 scripts/native_engine_certification_report.sh
+```
 
 Live certification:
 

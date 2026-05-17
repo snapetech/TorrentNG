@@ -20,7 +20,7 @@ export function AppearancePanel({ mediaInference, onMediaInference }: Props) {
         Configure presentation-only behavior for this browser.
       </div>
 
-      <div style={panelStyle}>
+      <div className="rtng-card rtng-appearance-panel" style={panelStyle}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, marginBottom: 10 }}>
           <div>
             <div style={{ fontSize: 12, color: 'var(--text)', fontWeight: 800 }}>Media type inference</div>
@@ -32,7 +32,7 @@ export function AppearancePanel({ mediaInference, onMediaInference }: Props) {
           }}>{MODES.find(mode => mode.value === mediaInference)?.label}</span>
         </div>
         {MODES.map(mode => (
-          <label key={mode.value} style={{
+          <label key={mode.value} className="rtng-appearance-option" data-active={mediaInference === mode.value ? 'true' : 'false'} style={{
             display: 'grid', gridTemplateColumns: 'auto 1fr auto', gap: 10, alignItems: 'start',
             border: '1px solid ' + (mediaInference === mode.value ? 'var(--accent)' : 'var(--border)'),
             borderRadius: 6, padding: 10, background: mediaInference === mode.value ? 'var(--accent-soft)' : 'var(--surface)',

@@ -108,7 +108,7 @@ function Capabilities({ data }: { data: EngineDiagnostics }) {
       <Subhead>Capabilities</Subhead>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))', gap: 8 }}>
         {data.capabilities.map(cap => (
-          <div key={cap.key} style={{
+          <div key={cap.key} className="rtng-engine-capability" data-available={cap.available ? 'true' : 'false'} style={{
             border: '1px solid var(--border)',
             borderRadius: 6,
             padding: '8px 10px',
@@ -180,7 +180,7 @@ function ProfileDrift({ data }: { data: EngineDiagnostics }) {
       {problems.length > 0 && (
         <div style={{ display: 'grid', gap: 6 }}>
           {problems.map(row => (
-            <div key={row.key} style={{
+            <div key={row.key} className="rtng-engine-drift" data-status={row.status} style={{
               display: 'grid',
               gridTemplateColumns: '180px minmax(0, 1fr) minmax(0, 1fr)',
               gap: 10,
@@ -257,7 +257,7 @@ function CommandIndex({ commands }: { commands?: { ok: boolean; count: number; c
 
 function Panel({ children, wide }: { children: React.ReactNode; wide?: boolean }) {
   return (
-    <div className="rtng-card" style={{
+    <div className="rtng-card rtng-engine-panel" style={{
       gridColumn: wide ? '1 / -1' : undefined,
       border: '1px solid var(--border)',
       borderRadius: 7,
@@ -274,7 +274,7 @@ function Rows({ rows }: { rows: [string, string][] }) {
   return (
     <div style={{ display: 'grid', gridTemplateColumns: '160px minmax(0, 1fr)', gap: '6px 12px', fontSize: 12 }}>
       {rows.map(([k, v]) => (
-        <div key={k} style={{ display: 'contents' }}>
+        <div key={k} className="rtng-engine-kv" style={{ display: 'contents' }}>
           <div style={{ color: 'var(--faint)' }}>{k}</div>
           <div title={v} style={{ color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{v}</div>
         </div>

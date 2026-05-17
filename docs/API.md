@@ -10,6 +10,9 @@ mode and the Track 1 rTorrent sidecar:
 
 All surfaces are served on the same port (default `8080`).
 
+For engine selection and native-vs-rTorrent behavior, see
+[ENGINE_REWRITE.md](ENGINE_REWRITE.md).
+
 ---
 
 ## Authentication

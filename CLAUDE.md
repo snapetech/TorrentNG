@@ -2,34 +2,66 @@
 
 ## What this project is
 
-**rtorrentNG** is a modern distribution/fork bundle targeting headless power-user seeding at scale (10k–100k torrents, 200+ TB).
+**rtorrentNG** is a modern torrent management stack targeting headless
+power-user seeding at scale (10k–100k torrents, 200+ TB).
 
-It is NOT a ruTorrent cosmetic fork. It is NOT a new BitTorrent engine.
+It is NOT a ruTorrent cosmetic fork. It now has a native Rust BitTorrent engine
+rewrite as the primary runtime path, while the rTorrent-backed sidecar remains
+available for migration, compatibility testing, and users who still want the
+upstream rTorrent core.
 
-It is four layers built around rTorrent as the engine:
+It has two runtime tracks:
+
+1. **Native rewrite** — `crates/rusttorrentd` owns torrent state, peer traffic,
+   tracker state, storage, rechecks, jobs, metrics, native REST/SSE, and
+   compatibility API projections.
+2. **Track 1 rTorrent core** — rTorrent/libtorrent remains the BitTorrent
+   engine; `sidecar/rtorrentng` bridges trusted local SCGI/XMLRPC into the
+   WebUI, native REST facade, qBittorrent-compatible API, cache, auth, and
+   metrics.
+
+Important layers:
 
 1. **engine-profile/** — Pinned rTorrent build config, SCGI/socket setup, tuning profiles
-2. **sidecar/** — Go daemon: trusted local rTorrent RPC in, sane REST/WebSocket/qBit-compat API out
-3. **webui/** — React+Vite frontend, virtualized table, talks only to sidecar API
-4. **deploy/** — Docker, Compose, systemd, nginx/Caddy, Helm stubs
+2. **sidecar/** — Rust daemon for rTorrent-backed deployments
+3. **crates/** — Native engine crates and `rusttorrentd`
+4. **webui/** — React+Vite frontend, virtualized table, talks to native/sidecar APIs
+5. **deploy/** — Docker, Compose, systemd, nginx, Kubernetes examples
 
 ## Core architectural decisions
 
-- External tools (Prowlarr, Sonarr, Radarr, autobrr, cross-seed) talk to the **sidecar** via qBittorrent-compatible API
-- The browser talks to the **sidecar** via native REST + WebSocket events
-- **Nothing** talks to rTorrent XMLRPC/SCGI directly except the sidecar
-- The sidecar runs on localhost beside rTorrent, communicates over trusted local SCGI socket
-- Auth, tokens, OIDC, CSRF protection all live in the sidecar layer
+- External tools (Prowlarr, Sonarr, Radarr, autobrr, cross-seed) talk to rtorrentNG through compatibility APIs, primarily the qBittorrent-compatible API.
+- The browser talks to native REST/SSE/WebSocket-facing APIs, never directly to rTorrent SCGI.
+- In native mode, `rusttorrentd` is the source of truth and does not require rTorrent, XMLRPC, or the sidecar.
+- In Track 1 sidecar mode, **nothing** talks to rTorrent XMLRPC/SCGI directly except the sidecar.
+- The sidecar runs beside rTorrent, communicates over a trusted local SCGI socket, and remains a migration/facade layer.
+- Auth, tokens, CSRF/OIDC/reverse-proxy trust policy live in the rtorrentNG API layer.
 
-## Why rTorrent as engine
+## Why the native rewrite exists
 
-rTorrent/libTorrent is the strongest baseline for large headless seed libraries:
+Track 1 fixed immediate rTorrent/ruTorrent pain, but could not fix engine-level
+limits:
+
+- rTorrent owns storage behavior and has no rtorrentNG userspace disk scheduler.
+- Rechecks are not durable rtorrentNG jobs with pause/resume/cancel semantics.
+- Torrent lifecycle history is limited compared with native structured events.
+- The sidecar must poll and translate XMLRPC state.
+- Engine behavior depends on rTorrent/libtorrent build details.
+- BEP 52/v2, compatibility facades, migration, and metrics are simpler when
+  projected from one native model.
+
+See `docs/ENGINE_REWRITE.md` for the practical guide and `docs/ENGINE.md` for
+the deeper design.
+
+## Why rTorrent still exists
+
+rTorrent/libTorrent remains a strong baseline for large headless seed libraries:
 - Low memory growth over time
 - Strong session persistence and resume
 - Low churn seeding workload fits its concurrency model
-- libtorrent (rTorrent's, not rasterbar's) has better mmap/memory behavior at scale than libtorrent-rasterbar 2.x
+- Existing user deployments need migration and comparison paths
 
-## Key problem rTorrent/ruTorrent has today
+## Key problem rTorrent/ruTorrent had in Track 1
 
 - rTorrent 0.16.9+ introduced trusted/untrusted XMLRPC connection model
 - Raw SCGI/httprpc passthrough breaks external clients (`load.start` blocked for untrusted connections)
@@ -66,12 +98,12 @@ rTorrent/libTorrent is the strongest baseline for large headless seed libraries:
 **Entry:** `webui/src/main.tsx`
 **Key constraints:**
 - Virtualized torrent table (TanStack Virtual or similar) — must handle 100k rows
-- Server-side sort/filter via sidecar API — never load all torrents to browser
+- Server-side sort/filter via native or sidecar API — never load all torrents to browser
 - No right-click dependency for mobile support
 - Delta sync via WebSocket — no full-refresh polling loops
 - Settings view includes `UserAgentPanel` component for live user-agent management
 
-## qBittorrent API compatibility targets (Phase 1)
+## qBittorrent API compatibility targets
 
 Must pass *arr/autobrr integration tests:
 - `POST /api/qb/v2/auth/login`
@@ -99,15 +131,15 @@ Every release must pass:
 - 1k torrents: UI first paint < 1s, filter < 100ms
 - 10k torrents: UI first paint < 2s, filter < 200ms
 - 15k torrents: UI first paint < 3s, filter < 500ms
-- 50k synthetic: sidecar API `/torrents/info` < 500ms
+- 50k synthetic: compatibility API `/torrents/info` < 500ms
 - `/sync/maindata` delta < 50ms under normal churn
-- sidecar memory < 500MB at 15k torrents after 24h
+- daemon/sidecar memory within release target at 15k torrents after 24h
 
 ## Two-track strategy
 
-**Track 1 — rTorrent sidecar** (current): fix rTorrent/ruTorrent pain without replacing the engine. Phases 0–5.
+**Track 1 — rTorrent sidecar**: fix rTorrent/ruTorrent pain without replacing the engine. Phases 0–5. This remains available for migration and rTorrent-core comparison.
 
-**Track 2 — Native Rust engine** (after Track 1 ships): ground-up Rust BitTorrent daemon, 10k–100k torrents, 200+ TB, seeding-first. 12 phases. See `docs/ENGINE.md` for full design.
+**Track 2 — Native Rust engine**: ground-up Rust BitTorrent daemon, 10k–100k torrents, 200+ TB, seeding-first. This is now the primary runtime path. See `docs/ENGINE_REWRITE.md` and `docs/ENGINE.md`.
 
 ### Track 1 phases
 
@@ -124,10 +156,11 @@ Every release must pass:
 
 ## Conventions
 
-- Rust sidecar: axum + tokio; no unsafe except in deps; anyhow for errors in binary, thiserror for library errors
+- Rust daemon/sidecar: axum + tokio; no unsafe except in deps; anyhow for errors in binary, thiserror for library errors
 - WebUI: TypeScript strict, TanStack Query for server state, TanStack Virtual for table
 - No ORM; raw SQL via rusqlite with bundled SQLite (no system dep)
-- Config file: `~/.config/rtorrentng/config.toml` or `/etc/rtorrentng/config.toml`; env vars `RTNG_*` override all
+- Native config file: `RUSTTORRENTD_CONFIG`, `~/.config/rusttorrentd/config.toml`, or `/etc/rusttorrentd/config.toml`
+- Sidecar config file: `~/.config/rtorrentng/config.toml` or `/etc/rtorrentng/config.toml`; env vars `RTNG_*` override many sidecar fields
 - All API responses: JSON, snake_case keys
 - Logs: structured JSON via tracing + tracing-subscriber JSON layer
 

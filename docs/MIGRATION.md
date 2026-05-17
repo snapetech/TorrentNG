@@ -1,5 +1,9 @@
 # Migration Guide
 
+This guide covers moving existing client state into rtorrentNG. For the broader
+native rewrite overview and engine swap workflow, see
+[ENGINE_REWRITE.md](ENGINE_REWRITE.md).
+
 ## Migrating from rTorrent + ruTorrent
 
 ### What gets imported
@@ -68,7 +72,7 @@ volumes:
 
 Place any `.rtorrent.rc` overrides in `/config/rtorrent.rc`.
 
-More deployment details are in [DEPLOYMENT.md](/home/keith/Documents/code/rtorrentNG/docs/DEPLOYMENT.md).
+More deployment details are in [DEPLOYMENT.md](DEPLOYMENT.md).
 
 **Step 5: Verify**
 
