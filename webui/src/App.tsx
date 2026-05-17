@@ -33,6 +33,7 @@ type AuthState = 'checking' | 'authenticated' | 'unauthenticated'
 type SettingsSection = 'library' | 'engine' | 'automation' | 'support'
 const MEDIA_INFERENCE_KEY = 'tng.mediaInference'
 const DETAIL_AUTO_DISPLAY_KEY = 'tng.detailAutoDisplay'
+const SETTINGS_SECTION_KEY = 'tng.settingsSection'
 const ACTIVE_TAB_KEY = 'tng.activeTab'
 const ACTIVE_TAB_TTL_MS = 8000
 
@@ -90,6 +91,21 @@ function loadDetailAutoDisplay(): boolean {
     return localStorage.getItem(DETAIL_AUTO_DISPLAY_KEY) !== 'off'
   } catch {
     return true
+  }
+}
+
+function isSettingsSection(value: string | null): value is SettingsSection {
+  return value === 'library' || value === 'engine' || value === 'automation' || value === 'support'
+}
+
+function loadSettingsSection(): SettingsSection {
+  try {
+    const hashSection = new URLSearchParams(window.location.hash.replace(/^#/, '')).get('settings')
+    if (isSettingsSection(hashSection)) return hashSection
+    const stored = localStorage.getItem(SETTINGS_SECTION_KEY)
+    return isSettingsSection(stored) ? stored : 'library'
+  } catch {
+    return 'library'
   }
 }
 
@@ -190,7 +206,7 @@ export function App() {
   const [togglingFeature, setTogglingFeature] = useState<'dht' | 'pex' | null>(null)
   const [featureError, setFeatureError] = useState<string | null>(null)
   const [actionNotice, setActionNotice] = useState<{ text: string; tone: 'ok' | 'error' } | null>(null)
-  const [settingsSection, setSettingsSection] = useState<SettingsSection>('library')
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>(() => loadSettingsSection())
   const [mediaInference, setMediaInference] = useState<MediaInferenceMode>(loadMediaInference)
   const [themeId, setThemeId] = useState(loadThemeId)
   const [themeMode, setThemeMode] = useState<ThemeMode>(loadThemeMode)
@@ -266,6 +282,32 @@ export function App() {
       })
     return () => { cancelled = true }
   }, [activeTab.isActive])
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(SETTINGS_SECTION_KEY, settingsSection)
+      if (view === 'settings') {
+        const nextHash = `settings=${settingsSection}`
+        if (window.location.hash.replace(/^#/, '') !== nextHash) {
+          history.replaceState(null, '', `#${nextHash}`)
+        }
+      }
+    } catch {
+      // Section still applies in this tab.
+    }
+  }, [settingsSection, view])
+
+  useEffect(() => {
+    function onHashChange() {
+      const section = new URLSearchParams(window.location.hash.replace(/^#/, '')).get('settings')
+      if (isSettingsSection(section)) {
+        setSettingsSection(section)
+        setView('settings')
+      }
+    }
+    window.addEventListener('hashchange', onHashChange)
+    return () => window.removeEventListener('hashchange', onHashChange)
+  }, [])
 
   useEffect(() => {
     if (activeTab.isActive) return
