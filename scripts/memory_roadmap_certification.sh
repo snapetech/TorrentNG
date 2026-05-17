@@ -128,7 +128,7 @@ fi
   echo "## Boundaries"
   echo
   echo "- Deterministic LVM physical-drive placement remains a non-claim unless a lower-level PV-targeted path is added."
-  echo "- io_uring remains explicit opt-in until graduation reports meet selected-backend, fixed-buffer, registered-file, and throughput thresholds on target hardware."
+  echo "- io_uring remains explicit opt-in until graduation reports meet selected-backend, fixed-buffer strategy, registered-file, and throughput thresholds on target hardware."
   echo "- Multi-TB move/import certification remains host/run evidence; use the real-root fixture knobs to scale the report on the target storage root."
 } >>"$OUT"
 

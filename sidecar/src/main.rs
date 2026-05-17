@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use torrentng::{api, cache, config, metrics, rtorrent, rtorrent_logs, stats, sync};
-use tracing::info;
+use tracing::{info, warn};
 
 use api::{
     server::{build_router, AppState},
@@ -41,20 +41,16 @@ async fn main() -> Result<()> {
     let rt = Arc::new(Client::new(&cfg.rtorrent).context("create rtorrent client")?);
 
     let db = Arc::new(Db::open(&cfg.cache_path()).context("open cache db")?);
-    let _ = db.append_app_event(
-        &AppEventRow {
-            event_id: None,
-            occurred_at: unix_now_i64(),
-            level: "info".to_owned(),
-            kind: "sidecar_started".to_owned(),
-            message: "TorrentNG sidecar started".to_owned(),
-            payload: serde_json::json!({
-                "component": "sidecar",
-                "operation": "startup",
-            })
-            .to_string(),
-        },
+    append_startup_event(
+        &db,
         cfg.logging.event_retention,
+        "info",
+        "sidecar_started",
+        "TorrentNG sidecar started",
+        serde_json::json!({
+            "component": "sidecar",
+            "operation": "startup",
+        }),
     );
     let metrics = Metrics::new();
     let (tx, _) = broadcast::channel::<Event>(1024);
@@ -62,13 +58,28 @@ async fn main() -> Result<()> {
     {
         let rt_ua = rt.clone();
         let ua = cfg.rtorrent.user_agent.clone();
+        let db2 = db.clone();
+        let retention = cfg.logging.event_retention;
         tokio::spawn(async move {
             if let Err(e) = rt_ua.set_user_agent(&ua).await {
-                tracing::warn!(
+                warn!(
                     component = "rtorrent",
                     operation = "set_user_agent",
                     error = %e,
                     "could not set user agent after startup"
+                );
+                append_startup_event(
+                    &db2,
+                    retention,
+                    "warn",
+                    "rtorrent_user_agent_error",
+                    "could not apply rTorrent user agent after startup",
+                    serde_json::json!({
+                        "component": "rtorrent",
+                        "operation": "set_user_agent",
+                        "result": "error",
+                        "error": e.to_string(),
+                    }),
                 );
             }
         });
@@ -144,6 +155,35 @@ fn unix_now_i64() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+fn append_startup_event(
+    db: &Db,
+    retention: usize,
+    level: &str,
+    kind: &str,
+    message: &str,
+    payload: serde_json::Value,
+) {
+    if let Err(e) = db.append_app_event(
+        &AppEventRow {
+            event_id: None,
+            occurred_at: unix_now_i64(),
+            level: level.to_owned(),
+            kind: kind.to_owned(),
+            message: message.to_owned(),
+            payload: payload.to_string(),
+        },
+        retention,
+    ) {
+        warn!(
+            component = "app_events",
+            operation = "append",
+            kind,
+            error = %e,
+            "failed to append startup app event"
+        );
+    }
 }
 
 async fn shutdown_signal() {

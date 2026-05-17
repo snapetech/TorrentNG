@@ -34,7 +34,7 @@ per-case syscall counters when `strace` is available.
 | Formatting | Workspace Rust formatting | `cargo fmt --check` |
 | Storage core | fd pool, positioned I/O, preallocation, durability, page-cache advice, sparse recheck, readahead, topology, elevator policy | `cargo test -p rt-storage` |
 | Backend selection | `auto`/`pread`/`uring` parsing, `io_uring` probe and worker-start fallback diagnostics, selected-backend read/write roundtrip | `cargo test -p rt-storage backend::tests` |
-| Backend graduation | real-device `pread` vs `uring` stream throughput, selected backend, registered-file support, fixed-buffer support | `scripts/storage_uring_graduation.sh /target/root` |
+| Backend graduation | real-device `pread` vs `uring` stream throughput, selected backend, registered-file support, fixed-buffer support, fixed-buffer strategy | `scripts/storage_uring_graduation.sh /target/root` |
 | Resource governor | total and per-class memory caps, pressure transitions, denied allocation counters, lease release | `cargo test -p rt-metrics resource::tests` |
 | Scale proxies | bounded crash recheck, storage fd cap, peer-read locality, hash-pool isolation, RAM verify path, sparse recheck extents | `cargo test -p rt-metrics storage_ -- --nocapture` |
 | Configuration | default storage elevator, memory caps, runtime tier switch, TOML partial parsing | `cargo test -p rt-config` |
@@ -61,6 +61,7 @@ per-case syscall counters when `strace` is available.
 | `torrentng_storage_backend_fixed_buffers_supported` | `0` for `pread`; `1` for `uring` when the kernel accepts registered worker buffers |
 | `torrentng_storage_backend_registered_files_supported` | `0` for `pread`; `1` for `uring` when the kernel accepts registered file slots |
 | `torrentng_storage_backend_{max_batch_len,fixed_buffer_bytes}` | Backend batch and fixed-buffer sizing match the selected implementation |
+| `torrentng_storage_backend_fixed_buffer_strategy{strategy=...}` | `disabled` for `pread`; `worker_copy` for current `uring` fixed buffers; future `frame_pool_slots` only after frame-pool slot leases exist |
 | `torrentng_storage_*_latency_nanoseconds_by_device{device=...,profile=...}` | Storage latency attribution and bounded histograms survive multi-device aggregation |
 | `torrentng_storage_file_pool_*` | fd pool remains bounded and records hit/miss/eviction/idle-close activity |
 | `torrentng_storage_queue_full_total` | bounded storage queues expose backpressure instead of silently accumulating jobs |
@@ -92,7 +93,7 @@ TNG_STORAGE_REQUIRE_HDD_5X=1 scripts/storage_hardware_matrix.sh /mnt/nvme /mnt/h
 | NVMe | NVMe profile by parent block device name, sparse preallocation, backend selection remains independent of topology |
 | NFS/CIFS/virtiofs | network `DeviceId` from mount source, sparse preallocation, reads never create missing files |
 | Container overlay | CoW/unknown-safe sparse allocation and clean `io_uring` fallback diagnostics when kernel policy disables it |
-| Backend comparison | `tng_storage_backend requested=pread` and `requested=uring` rows report selected backend, fallback reason, registered-file support, fixed-buffer support, batch length, and fixed-buffer length |
+| Backend comparison | `tng_storage_backend requested=pread` and `requested=uring` rows report selected backend, fallback reason, registered-file support, fixed-buffer support, fixed-buffer strategy, batch length, and fixed-buffer length |
 
 ## Exit Criteria
 

@@ -69,10 +69,11 @@ async fn backend_selection_roundtrip_reports_capabilities() {
     let frame = backend.pread(file, frame, 128).await.unwrap().unwrap();
 
     println!(
-        "tng_storage_backend requested={backend_name} selected={} reason=\"{}\" fixed_buffers={} registered_files={} max_batch_len={} fixed_buffer_len={}",
+        "tng_storage_backend requested={backend_name} selected={} reason=\"{}\" fixed_buffers={} fixed_buffer_strategy={} registered_files={} max_batch_len={} fixed_buffer_len={}",
         backend.kind().as_str(),
         backend.selection().reason,
         backend.supports_fixed_buffers(),
+        backend.fixed_buffer_strategy().as_str(),
         backend.supports_registered_files(),
         backend.max_batch_len(),
         backend.fixed_buffer_len(),
@@ -139,12 +140,13 @@ async fn backend_stream_roundtrip_reports_throughput() {
     let read_mib_s = mib / read_elapsed.as_secs_f64();
 
     println!(
-        "tng_storage_backend_stream requested={backend_name} selected={} reason=\"{}\" blocks={blocks} block_len={block_len} total_mib={mib:.2} write_elapsed_ms={} read_elapsed_ms={} write_mib_s={write_mib_s:.2} read_mib_s={read_mib_s:.2} fixed_buffers={} registered_files={} max_batch_len={} fixed_buffer_len={}",
+        "tng_storage_backend_stream requested={backend_name} selected={} reason=\"{}\" blocks={blocks} block_len={block_len} total_mib={mib:.2} write_elapsed_ms={} read_elapsed_ms={} write_mib_s={write_mib_s:.2} read_mib_s={read_mib_s:.2} fixed_buffers={} fixed_buffer_strategy={} registered_files={} max_batch_len={} fixed_buffer_len={}",
         backend.kind().as_str(),
         backend.selection().reason,
         write_elapsed.as_millis(),
         read_elapsed.as_millis(),
         backend.supports_fixed_buffers(),
+        backend.fixed_buffer_strategy().as_str(),
         backend.supports_registered_files(),
         backend.max_batch_len(),
         backend.fixed_buffer_len(),

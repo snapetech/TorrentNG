@@ -17,6 +17,7 @@ Environment:
   TNG_STORAGE_BACKEND_STREAM_BLOCK_LEN   block bytes (default: 262144)
   TNG_STORAGE_URING_REQUIRE_SELECTED     require selected=uring for the uring run
   TNG_STORAGE_URING_REQUIRE_FIXED        require fixed_buffers=true
+  TNG_STORAGE_URING_REQUIRE_STRATEGY     require fixed_buffer_strategy to equal this value
   TNG_STORAGE_URING_REQUIRE_FILES        require registered_files=true
   TNG_STORAGE_URING_MIN_READ_RATIO       require uring read MiB/s >= ratio * pread
   TNG_STORAGE_URING_MIN_WRITE_RATIO      require uring write MiB/s >= ratio * pread
@@ -87,6 +88,7 @@ for backend in pread uring; do
     echo "- Read MiB/s: $(field_from_log read_mib_s "$log")"
     echo "- Write MiB/s: $(field_from_log write_mib_s "$log")"
     echo "- Fixed buffers: $(field_from_log fixed_buffers "$log")"
+    echo "- Fixed-buffer strategy: $(field_from_log fixed_buffer_strategy "$log")"
     echo "- Registered files: $(field_from_log registered_files "$log")"
     echo
     echo '```text'
@@ -102,6 +104,7 @@ uring_read="$(field_from_log read_mib_s "$tmpdir/uring.log")"
 uring_write="$(field_from_log write_mib_s "$tmpdir/uring.log")"
 uring_selected="$(field_from_log selected "$tmpdir/uring.log")"
 uring_fixed="$(field_from_log fixed_buffers "$tmpdir/uring.log")"
+uring_strategy="$(field_from_log fixed_buffer_strategy "$tmpdir/uring.log")"
 uring_files="$(field_from_log registered_files "$tmpdir/uring.log")"
 
 {
@@ -132,6 +135,13 @@ if [[ "${TNG_STORAGE_URING_REQUIRE_FIXED:-0}" == "1" ]]; then
   gate "fixed buffers" test "$uring_fixed" = "true"
 else
   echo "| fixed buffers | INFO: $uring_fixed |" >>"$OUT"
+fi
+
+if [[ -n "${TNG_STORAGE_URING_REQUIRE_STRATEGY:-}" ]]; then
+  gate "fixed-buffer strategy ${TNG_STORAGE_URING_REQUIRE_STRATEGY}" \
+    test "$uring_strategy" = "$TNG_STORAGE_URING_REQUIRE_STRATEGY"
+else
+  echo "| fixed-buffer strategy | INFO: $uring_strategy |" >>"$OUT"
 fi
 
 if [[ "${TNG_STORAGE_URING_REQUIRE_FILES:-0}" == "1" ]]; then

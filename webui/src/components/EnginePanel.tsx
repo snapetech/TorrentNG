@@ -618,7 +618,13 @@ function RtorrentSettingsPanel() {
               <button type="button" onClick={toggleAllGroups} style={smallButtonStyle(filteredGroups.length > 0)} disabled={filteredGroups.length === 0}>
                 {allGroupsCollapsed ? 'Expand all' : 'Collapse all'}
               </button>
-              <button type="button" onClick={defaultAll} disabled={save.isPending || !data.overlay_writable} style={smallButtonStyle(!save.isPending && data.overlay_writable)}>
+              <button
+                type="button"
+                onClick={defaultAll}
+                title={!data.overlay_writable ? 'Settings overlay is readonly' : 'Apply defaults to all managed settings'}
+                disabled={save.isPending || !data.overlay_writable}
+                style={smallButtonStyle(!save.isPending && data.overlay_writable)}
+              >
                 Defaults all
               </button>
               <button type="button" onClick={copyVisibleCommands} disabled={visibleSettings.length === 0} style={smallButtonStyle(visibleSettings.length > 0)}>
@@ -693,7 +699,13 @@ function RtorrentSettingsPanel() {
                     </div>
                   </div>
                   <div role="toolbar" aria-label={`${group.name} actions`} style={{ display: 'flex', gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-                    <button type="button" onClick={() => defaultGroup(group.settings)} style={smallButtonStyle(!save.isPending && data.overlay_writable)} disabled={save.isPending || !data.overlay_writable}>
+                    <button
+                      type="button"
+                      onClick={() => defaultGroup(group.settings)}
+                      title={!data.overlay_writable ? 'Settings overlay is readonly' : 'Apply defaults to this group'}
+                      style={smallButtonStyle(!save.isPending && data.overlay_writable)}
+                      disabled={save.isPending || !data.overlay_writable}
+                    >
                       Defaults
                     </button>
                     <button type="button" onClick={() => resetGroup(group.settings)} style={smallButtonStyle(groupDirty > 0 && !save.isPending)} disabled={groupDirty === 0 || save.isPending}>
@@ -736,6 +748,7 @@ function RtorrentSettingsPanel() {
                           <span id={titleId}>{setting.label}</span>
                           <span style={{ display: 'inline-flex', gap: 5, alignItems: 'center', flexShrink: 0 }}>
                             {dirty && <SettingPill tone="warn">edited</SettingPill>}
+                            {dirty && <SettingPill tone={lastSaveFailed ? 'warn' : save.isPending ? 'warn' : 'ok'}>{lastSaveFailed ? 'retry' : save.isPending ? 'saving' : 'pending'}</SettingPill>}
                             {setting.restart_required && <SettingPill tone="warn">restart</SettingPill>}
                             {row?.live.ok === false && <SettingPill tone="warn">unavailable</SettingPill>}
                           </span>
@@ -789,11 +802,12 @@ function RtorrentSettingsPanel() {
                         </div>
                         <div style={{ display: 'grid', gridTemplateColumns: 'minmax(120px, 1fr) auto', gap: 8, alignItems: 'center' }}>
                           <span style={{ color: 'var(--faint)', fontSize: 10 }}>
-                            {setting.restart_required ? 'Applies on restart' : 'Live apply supported'}
+                            {setting.restart_required ? 'Autosaves now; effective after restart' : 'Autosaves and applies live'}
                           </span>
                           <div role="toolbar" aria-label={`${setting.label} actions`} style={{ display: 'flex', gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
                             <button
                               type="button"
+                              aria-label={`Reset ${setting.label} to baseline`}
                               onClick={() => updateSetting(setting, base, true)}
                               disabled={!dirty || save.isPending}
                               style={smallButtonStyle(dirty && !save.isPending)}
@@ -803,6 +817,7 @@ function RtorrentSettingsPanel() {
                             {saved !== null && (
                               <button
                                 type="button"
+                                aria-label={`Set ${setting.label} to saved value`}
                                 onClick={() => updateSetting(setting, inputValue(setting.value_type, saved), true)}
                                 disabled={save.isPending}
                                 style={smallButtonStyle(!save.isPending)}
@@ -813,6 +828,7 @@ function RtorrentSettingsPanel() {
                             {live !== null && (
                               <button
                                 type="button"
+                                aria-label={`Set ${setting.label} to live value`}
                                 onClick={() => updateSetting(setting, inputValue(setting.value_type, live), true)}
                                 disabled={save.isPending}
                                 style={smallButtonStyle(!save.isPending)}
@@ -822,6 +838,7 @@ function RtorrentSettingsPanel() {
                             )}
                             <button
                               type="button"
+                              aria-label={`Set ${setting.label} to default value`}
                               onClick={() => updateSetting(setting, inputValue(setting.value_type, setting.default_value), true)}
                               disabled={save.isPending}
                               style={smallButtonStyle(!save.isPending)}
@@ -830,6 +847,7 @@ function RtorrentSettingsPanel() {
                             </button>
                             <button
                               type="button"
+                              aria-label={`Copy ${setting.label} current value`}
                               onClick={() => copyText(formatSettingValue(value, setting.unit), `${setting.label} value`)}
                               style={smallButtonStyle(true)}
                             >
@@ -837,6 +855,7 @@ function RtorrentSettingsPanel() {
                             </button>
                             <button
                               type="button"
+                              aria-label={`Copy ${setting.label} command and setter`}
                               onClick={() => copyText(`${setting.command} / ${setting.setter}`, setting.label)}
                               style={smallButtonStyle(true)}
                             >
@@ -941,7 +960,7 @@ function RtorrentSettingsPanel() {
               {restart.isPending ? 'Restarting…' : 'Restart daemon'}
             </button>
             <span style={{ color: lastSaveFailed ? 'var(--danger)' : dirtyCount > 0 ? 'var(--warning)' : 'var(--faint)', fontSize: 12, fontWeight: 800 }}>
-              {save.isPending ? 'Autosaving' : lastSaveFailed ? 'Autosave failed' : dirtyCount > 0 ? `${dirtyCount} pending autosave` : 'Saved'}
+              {!data.overlay_writable ? 'Readonly overlay' : save.isPending ? 'Autosaving' : lastSaveFailed ? 'Autosave failed' : dirtyCount > 0 ? `${dirtyCount} pending autosave` : 'Saved'}
             </span>
           </div>
         </div>
