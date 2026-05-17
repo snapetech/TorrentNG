@@ -388,6 +388,7 @@ add_deluge() {
   payload="$(mktemp "$WORKDIR/artifacts/deluge-add.XXXXXX.json")"
   printf '{"method":"core.add_torrent_file","params":["%s","%s",{"download_location":"%s"}],"id":2}\n' "$name" "$data" "$save_path" >"$payload"
   deluge_rpc_file_checked "$payload" >/dev/null
+  rm -f "$payload"
 }
 
 add_rtorrent() {
