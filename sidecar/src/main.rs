@@ -30,7 +30,7 @@ async fn main() -> Result<()> {
     info!(
         component = "config",
         operation = "load",
-        user_agent = %cfg.rtorrent.user_agent,
+        user_agent_len = cfg.rtorrent.user_agent.len(),
         log_format = ?cfg.logging.format,
         log_profile = ?cfg.logging.profile,
         event_retention = cfg.logging.event_retention,

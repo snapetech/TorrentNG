@@ -2499,6 +2499,18 @@ pub async fn set_user_agent(
         }
         Err(e) => {
             tracing::error!(component = "api", operation = "set_user_agent", error = %e, "user-agent update failed");
+            record_operator_event(
+                &s,
+                "rtorrent_user_agent_error",
+                "rTorrent user agent update failed",
+                serde_json::json!({
+                    "component": "rtorrent",
+                    "operation": "set_user_agent",
+                    "result": "error",
+                    "error": e.to_string(),
+                }),
+                "warn",
+            );
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }

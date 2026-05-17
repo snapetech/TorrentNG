@@ -910,6 +910,13 @@ function SettingsView({ section, onSection, mediaInference, onMediaInference, th
     ['automation', 'Automation', '⟲'],
     ['support', 'Support', '?'],
   ]
+  function moveSection(current: SettingsSection, delta: number) {
+    const index = sections.findIndex(([key]) => key === current)
+    const next = sections[(index + delta + sections.length) % sections.length][0]
+    preloadSettingsSection(next)
+    onSection(next)
+    window.setTimeout(() => document.getElementById(`settings-tab-${next}`)?.focus(), 0)
+  }
   return (
     <>
       <aside className="tng-settings-sidebar" style={{
@@ -920,9 +927,12 @@ function SettingsView({ section, onSection, mediaInference, onMediaInference, th
           <div style={{ fontSize: 16, fontWeight: 800, color: 'var(--text)' }}>Settings</div>
           <div style={{ fontSize: 11, color: 'var(--faint)', marginTop: 3 }}>Daemon, library, and browser controls</div>
         </div>
+        <div role="tablist" aria-label="Settings sections">
         {sections.map(([key, label, icon]) => (
           <button
             key={key}
+            id={`settings-tab-${key}`}
+            role="tab"
             className="tng-settings-nav-button"
             data-active={section === key ? 'true' : 'false'}
             onPointerEnter={() => preloadSettingsSection(key)}
@@ -931,7 +941,27 @@ function SettingsView({ section, onSection, mediaInference, onMediaInference, th
               preloadSettingsSection(key)
               onSection(key)
             }}
-            aria-current={section === key ? 'page' : undefined}
+            onKeyDown={event => {
+              if (event.key === 'ArrowDown' || event.key === 'ArrowRight') {
+                event.preventDefault()
+                moveSection(key, 1)
+              }
+              if (event.key === 'ArrowUp' || event.key === 'ArrowLeft') {
+                event.preventDefault()
+                moveSection(key, -1)
+              }
+              if (event.key === 'Home') {
+                event.preventDefault()
+                moveSection(sections[0][0], 0)
+              }
+              if (event.key === 'End') {
+                event.preventDefault()
+                moveSection(sections[sections.length - 1][0], 0)
+              }
+            }}
+            aria-selected={section === key}
+            aria-controls={`settings-panel-${key}`}
+            tabIndex={section === key ? 0 : -1}
             style={{
             width: '100%', display: 'grid', gridTemplateColumns: '22px 1fr auto', alignItems: 'center',
             textAlign: 'left', marginBottom: 4, gap: 7,
@@ -945,27 +975,28 @@ function SettingsView({ section, onSection, mediaInference, onMediaInference, th
             {section === key && <span style={{ color: 'var(--accent-text)', fontSize: 10 }}>●</span>}
           </button>
         ))}
+        </div>
       </aside>
       <div style={{ flex: 1, overflowY: 'auto', background: 'var(--bg)' }}>
         <Suspense fallback={<SettingsPanelFallback />}>
-        {section === 'library' && (<>
+        {section === 'library' && (<section id="settings-panel-library" role="tabpanel" aria-labelledby="settings-tab-library">
           <PanelTitle title="Library" subtitle="Categories, storage roots, and tracker summaries" />
           <PanelFrame><CategoriesPanel /></PanelFrame>
           <PanelFrame><StoragePanel /></PanelFrame>
           <PanelFrame><TrackerHealthPanel /></PanelFrame>
-        </>)}
-        {section === 'engine' && (<>
+        </section>)}
+        {section === 'engine' && (<section id="settings-panel-engine" role="tabpanel" aria-labelledby="settings-tab-engine">
           <PanelTitle title="Engine" subtitle="Runtime diagnostics, user agent, and capability checks" />
           <PanelFrame><EnginePanel /></PanelFrame>
           <PanelFrame><UserAgentPanel /></PanelFrame>
-        </>)}
-        {section === 'automation' && (<>
+        </section>)}
+        {section === 'automation' && (<section id="settings-panel-automation" role="tabpanel" aria-labelledby="settings-tab-automation">
           <PanelTitle title="Automation" subtitle="Ratio groups, workflows, and RSS rules" />
           <PanelFrame><RatioGroupsPanel /></PanelFrame>
           <PanelFrame><WorkflowsPanel /></PanelFrame>
           <PanelFrame><RssRulesPanel /></PanelFrame>
-        </>)}
-        {section === 'support' && (<>
+        </section>)}
+        {section === 'support' && (<section id="settings-panel-support" role="tabpanel" aria-labelledby="settings-tab-support">
           <PanelTitle title="Support" subtitle="Project resources and community support" />
           <PanelFrame><LogsPanel /></PanelFrame>
           <PanelFrame>
@@ -996,7 +1027,7 @@ function SettingsView({ section, onSection, mediaInference, onMediaInference, th
               </span>
             </button>
           </div>
-        </>)}
+        </section>)}
         </Suspense>
       </div>
     </>
