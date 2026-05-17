@@ -42,7 +42,7 @@ use rt_piece_picker::{Availability, BlockRequest, PiecePicker, MAX_BLOCK_SIZE};
 use rt_session::{SessionRegistry, TorrentState};
 use rt_storage::{
     scheduler::{scheduled_read, scheduled_write},
-    IoClass, MountScheduler, PieceVerifier, SchedulerConfig, VerifyResult,
+    IoClass, MountScheduler, PieceVerifier, SchedulerConfig, StorageIoConfig, VerifyResult,
 };
 use rt_tracker::{
     to_http_scrape_url,
@@ -412,6 +412,7 @@ impl TorrentTask {
         udp_timeout_secs: u64,
         min_interval_secs: u64,
         piece_assembly_cap_bytes: usize,
+        storage_io: StorageIoConfig,
     ) -> Self {
         let (peer_event_tx, peer_event_rx) = mpsc::channel(512);
         let total = meta.total_length();
@@ -443,6 +444,7 @@ impl TorrentTask {
             &SchedulerConfig {
                 profile: StorageProfile::Unknown,
                 resources: Some(resources.clone()),
+                storage_io,
                 ..Default::default()
             },
         );

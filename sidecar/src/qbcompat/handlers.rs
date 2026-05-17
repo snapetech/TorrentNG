@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use crate::{
     api::{server::AppState, ws::Event},
-    cache::{ListParams, RssRule, TorrentRow},
+    cache::{AppEventRow, ListParams, RssRule, TorrentRow},
     rtorrent::TransferRates,
 };
 
@@ -1581,7 +1581,49 @@ fn split_hashes(db: &crate::cache::Db, s: Option<&str>) -> Vec<String> {
 }
 
 fn emit(s: &AppState, event: Event) {
+    record_app_event(s, &event);
     let _ = s.events.send(event);
+}
+
+fn record_app_event(s: &AppState, event: &Event) {
+    let Some((kind, message, payload)) = app_event_projection(event) else {
+        return;
+    };
+    if let Err(e) = s.db.append_app_event(
+        &AppEventRow {
+            event_id: None,
+            occurred_at: chrono::Utc::now().timestamp(),
+            level: "info".to_owned(),
+            kind,
+            message,
+            payload,
+        },
+        s.cfg.logging.event_retention,
+    ) {
+        tracing::warn!(component = "app_events", operation = "append", error = %e, "failed to append app event");
+    }
+}
+
+fn app_event_projection(event: &Event) -> Option<(String, String, String)> {
+    let (kind, message) = match event {
+        Event::TorrentAdded { .. } => ("torrent_added", "torrent added"),
+        Event::TorrentRemoved { .. } => ("torrent_removed", "torrent removed"),
+        Event::TorrentUpdated { .. } => ("torrent_updated", "torrent updated"),
+        Event::CategoriesUpdated => ("categories_updated", "categories updated"),
+        Event::TagsUpdated => ("tags_updated", "tags updated"),
+        Event::StorageUpdated => ("storage_updated", "storage updated"),
+        Event::RatioGroupsUpdated => ("ratio_groups_updated", "ratio groups updated"),
+        Event::WorkflowsUpdated => ("workflows_updated", "workflows updated"),
+        Event::WorkflowRunsUpdated => ("workflow_runs_updated", "workflow runs updated"),
+        Event::RssRulesUpdated => ("rss_rules_updated", "RSS rules updated"),
+        Event::SavedViewsUpdated => ("saved_views_updated", "saved views updated"),
+        Event::TrackerHealthUpdated | Event::Stats { .. } => return None,
+    };
+    Some((
+        kind.to_owned(),
+        message.to_owned(),
+        serde_json::to_string(event).unwrap_or_else(|_| "{}".to_owned()),
+    ))
 }
 
 fn emit_torrent_updated(s: &AppState, hash: &str) {

@@ -27,8 +27,8 @@ use rt_path::{StorageProfile, StorageRootId};
 use rt_peer_wire::handshake::{Handshake, HANDSHAKE_LEN};
 use rt_session::{SessionRegistry, TorrentEntry, TorrentState, TransferStats};
 use rt_storage::{
-    runtime::StorageRuntime, MountScheduler, SchedulerConfig, V2FileHash, V2FileVerifier,
-    VerifyResult,
+    runtime::StorageRuntime, MountScheduler, SchedulerConfig, StorageIoConfig, V2FileHash,
+    V2FileVerifier, VerifyResult,
 };
 
 use crate::command::{
@@ -95,6 +95,18 @@ fn resource_config_from_config(config: &Config) -> ResourceGovernorConfig {
         class_caps_bytes,
         pressure_constrained_pct: config.memory.pressure_constrained_pct,
         pressure_critical_pct: config.memory.pressure_critical_pct,
+    }
+}
+
+fn storage_io_config_from_config(config: &Config) -> StorageIoConfig {
+    StorageIoConfig {
+        peer_read_cache_entries: config.storage.peer_read_cache_entries,
+        peer_read_elevator_budget_ms: if config.storage.device_elevator_enabled {
+            StorageIoConfig::default().peer_read_elevator_budget_ms
+        } else {
+            0
+        },
+        ..Default::default()
     }
 }
 
@@ -1313,6 +1325,7 @@ impl Engine {
                 .memory
                 .piece_assembly_cap_mb
                 .saturating_mul(1024 * 1024) as usize,
+            storage_io_config_from_config(&self.config),
         );
         let handle = tokio::spawn(task.run());
         self.torrent_chans
@@ -1756,6 +1769,7 @@ impl Engine {
             &SchedulerConfig {
                 profile: StorageProfile::Unknown,
                 resources: Some(self.resources.clone()),
+                storage_io: storage_io_config_from_config(&self.config),
                 ..Default::default()
             },
         );

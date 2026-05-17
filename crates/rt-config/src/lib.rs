@@ -61,6 +61,8 @@ pub struct StorageConfig {
     pub download_dir: PathBuf,
     /// Enable per-device peer-read elevator scheduling where storage profiles benefit.
     pub device_elevator_enabled: bool,
+    /// Bounded peer-read readahead cache entries per torrent scheduler.
+    pub peer_read_cache_entries: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,6 +148,7 @@ impl Default for StorageConfig {
         StorageConfig {
             download_dir: dirs_default_download(),
             device_elevator_enabled: true,
+            peer_read_cache_entries: 64,
         }
     }
 }
@@ -292,6 +295,7 @@ mod tests {
         assert_eq!(c.memory.queued_disk_cap_mb, 64);
         assert!(c.runtime.torrent_tiers_enabled);
         assert!(c.storage.device_elevator_enabled);
+        assert_eq!(c.storage.peer_read_cache_entries, 64);
         assert_eq!(c.logging, rt_logging::LoggingConfig::default());
     }
 
@@ -320,6 +324,9 @@ max_peers = 500
 
 [auth]
 api_tokens = ["one", "two"]
+
+[storage]
+peer_read_cache_entries = 17
 "#;
         let c: Config = toml::from_str(toml).unwrap();
         assert_eq!(c.network.listen_port, 51413);
@@ -328,6 +335,7 @@ api_tokens = ["one", "two"]
         assert_eq!(c.tracker.http_timeout_secs, 30);
         assert!(c.dht.enabled);
         assert_eq!(c.auth.api_tokens, vec!["one", "two"]);
+        assert_eq!(c.storage.peer_read_cache_entries, 17);
         assert_eq!(c.daemon.shutdown_timeout_secs, 10);
         assert_eq!(c.logging, rt_logging::LoggingConfig::default());
     }

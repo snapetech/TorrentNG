@@ -57,6 +57,18 @@ pub struct RtorrentConfig {
     /// See docs/CONFIGURATION.md for accepted values.
     #[serde(default = "default_user_agent")]
     pub user_agent: String,
+
+    #[serde(default)]
+    pub logs: RtorrentLogConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RtorrentLogConfig {
+    pub enabled: bool,
+    pub paths: Vec<PathBuf>,
+    pub poll_interval_secs: u64,
+    pub read_from_start: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -119,6 +131,7 @@ impl Config {
                 scgi_addr: None,
                 timeout_secs: 1,
                 user_agent: DEFAULT_USER_AGENT.to_owned(),
+                logs: RtorrentLogConfig::default(),
             },
             auth: AuthConfig::default(),
             workflows: WorkflowConfig::default(),
@@ -217,6 +230,25 @@ impl Config {
         if let Ok(v) = std::env::var("TNG_USER_AGENT") {
             self.rtorrent.user_agent = v;
         }
+        if let Ok(v) = std::env::var("TNG_RTORRENT_LOGS_ENABLED") {
+            self.rtorrent.logs.enabled = v == "1" || v.eq_ignore_ascii_case("true");
+        }
+        if let Ok(v) = std::env::var("TNG_RTORRENT_LOG_PATHS") {
+            self.rtorrent.logs.paths = v
+                .split(',')
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from)
+                .collect();
+        }
+        if let Ok(v) = std::env::var("TNG_RTORRENT_LOG_POLL_INTERVAL_SECS") {
+            if let Ok(secs) = v.parse() {
+                self.rtorrent.logs.poll_interval_secs = secs;
+            }
+        }
+        if let Ok(v) = std::env::var("TNG_RTORRENT_LOG_READ_FROM_START") {
+            self.rtorrent.logs.read_from_start = v == "1" || v.eq_ignore_ascii_case("true");
+        }
         if let Ok(v) = std::env::var("TNG_SCGI_SOCKET") {
             self.rtorrent.scgi_socket = Some(v);
             self.rtorrent.scgi_addr = None;
@@ -279,6 +311,21 @@ impl Config {
 
     pub fn rtorrent_timeout(&self) -> Duration {
         Duration::from_secs(self.rtorrent.timeout_secs)
+    }
+
+    pub fn rtorrent_log_poll_interval(&self) -> Duration {
+        Duration::from_secs(self.rtorrent.logs.poll_interval_secs.max(1))
+    }
+}
+
+impl Default for RtorrentLogConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            paths: Vec::new(),
+            poll_interval_secs: 2,
+            read_from_start: false,
+        }
     }
 }
 

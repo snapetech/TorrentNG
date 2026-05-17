@@ -1393,7 +1393,7 @@ impl MountScheduler {
         self.submit(len as u64, move || {
             let key = normalized_key(&path);
             let path_str = key.display().to_string();
-            if class == IoClass::PeerRead && readahead_bytes > len {
+            if class == IoClass::PeerRead && readahead_bytes > len && readahead_cache_entries > 0 {
                 if let Some(bytes) = peer_read_cache_hit(&peer_read_cache, &key, offset, len) {
                     counters
                         .peer_read_cache_hits
@@ -1412,7 +1412,10 @@ impl MountScheduler {
                     .fetch_add(1, Ordering::Relaxed);
             }
             let file = pool.get_or_open(&key, OpenMode::Read, false)?;
-            let read_len = if class == IoClass::PeerRead && readahead_bytes > len {
+            let read_len = if class == IoClass::PeerRead
+                && readahead_bytes > len
+                && readahead_cache_entries > 0
+            {
                 let file_len = file
                     .metadata()
                     .map_err(|e| StorageError::io(&path_str, e))?
@@ -2685,6 +2688,86 @@ mod tests {
         assert_eq!(
             stats.backend_bytes_read_by_class[class_index(IoClass::PeerRead)],
             16
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_read_readahead_cache_is_config_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_path = dir.path().join("first.bin");
+        let second_path = dir.path().join("second.bin");
+        std::fs::write(&first_path, b"abcdefghijklmnopqrstuvwxyz").unwrap();
+        std::fs::write(&second_path, b"ABCDEFGHIJKLMNOPQRSTUVWXYZ").unwrap();
+        let sched = MountScheduler::new(
+            StorageRootId::new(),
+            &SchedulerConfig {
+                profile: StorageProfile::Hdd,
+                storage_io: StorageIoConfig {
+                    peer_read_readahead_bytes: 16,
+                    peer_read_cache_entries: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        scheduled_read(&sched, IoClass::PeerRead, &first_path, 0, 4)
+            .await
+            .unwrap();
+        scheduled_read(&sched, IoClass::PeerRead, &second_path, 0, 4)
+            .await
+            .unwrap();
+        let first_after_eviction = scheduled_read(&sched, IoClass::PeerRead, &first_path, 4, 4)
+            .await
+            .unwrap();
+
+        assert_eq!(&first_after_eviction[..], b"efgh");
+        let stats = sched.stats();
+        assert_eq!(stats.peer_read_cache_entries, 1);
+        assert_eq!(stats.peer_read_cache_evictions, 2);
+        assert_eq!(stats.peer_read_cache_misses, 3);
+        assert_eq!(stats.peer_read_cache_hits, 0);
+        assert_eq!(
+            stats.backend_read_ops_by_class[class_index(IoClass::PeerRead)],
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_read_readahead_cache_can_be_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disabled-readahead.bin");
+        std::fs::write(&path, b"abcdefghijklmnopqrstuvwxyz").unwrap();
+        let sched = MountScheduler::new(
+            StorageRootId::new(),
+            &SchedulerConfig {
+                profile: StorageProfile::Hdd,
+                storage_io: StorageIoConfig {
+                    peer_read_readahead_bytes: 16,
+                    peer_read_cache_entries: 0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let first = scheduled_read(&sched, IoClass::PeerRead, &path, 0, 4)
+            .await
+            .unwrap();
+        let second = scheduled_read(&sched, IoClass::PeerRead, &path, 4, 4)
+            .await
+            .unwrap();
+
+        assert_eq!(&first[..], b"abcd");
+        assert_eq!(&second[..], b"efgh");
+        let stats = sched.stats();
+        assert_eq!(stats.peer_read_cache_entries, 0);
+        assert_eq!(stats.peer_read_cache_evictions, 0);
+        assert_eq!(stats.peer_read_cache_hits, 0);
+        assert_eq!(stats.peer_read_cache_misses, 0);
+        assert_eq!(
+            stats.backend_read_ops_by_class[class_index(IoClass::PeerRead)],
+            2
         );
     }
 
