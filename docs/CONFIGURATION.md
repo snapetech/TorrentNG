@@ -1,51 +1,179 @@
 # Configuration
 
-Configuration is loaded from a TOML file. Environment variables override any file value.
+rtorrentNG has two runtime configuration surfaces:
 
-Default config path: `~/.config/rtorrentng/config.toml`
+- `rusttorrentd`, the native engine daemon and primary runtime.
+- `rtorrentng`, the Track 1 rTorrent sidecar used for migration and compatibility deployments.
 
-Override path by passing it as the first argument: `rtorrentng /path/to/config.toml`
+The two config files are intentionally separate. Native config controls durable engine state, peer networking, tracker behavior, storage, DHT, and native API auth. Sidecar config controls the rTorrent SCGI bridge, sidecar cache, WebUI serving, and qBittorrent-compatible facade identity.
 
----
+## Native daemon
 
-## Top-level options
+`rusttorrentd` loads TOML config from the first existing path in this order:
+
+1. `RUSTTORRENTD_CONFIG`
+2. `~/.config/rusttorrentd/config.toml`
+3. `/etc/rusttorrentd/config.toml`
+
+If no file exists, built-in defaults are used.
+
+Start with an explicit config path:
+
+```sh
+RUSTTORRENTD_CONFIG=/config/config.toml rusttorrentd
+```
+
+### `[daemon]`
+
+| Key | Default | Description |
+|---|---|---|
+| `session_dir` | `~/.local/share/rusttorrentd` or `/var/lib/rusttorrentd` | Directory for torrent metadata and session state |
+| `api_bind` | `127.0.0.1:8080` | Bind address for the REST and compatibility APIs |
+| `log_level` | `info` | Tracing filter, for example `info` or `rt_engine=trace` |
+| `shutdown_timeout_secs` | `10` | Max seconds to wait for torrent tasks to send stopped announces during shutdown |
+
+### `[network]`
+
+| Key | Default | Description |
+|---|---|---|
+| `listen_port` | `6881` | Incoming peer TCP port |
+| `max_peers` | `200` | Maximum peer connections across all torrents |
+| `upload_rate_limit` | `0` | Upload limit in bytes/sec; `0` means unlimited |
+| `download_rate_limit` | `0` | Download limit in bytes/sec; `0` means unlimited |
+
+### `[storage]`
+
+| Key | Default | Description |
+|---|---|---|
+| `download_dir` | `~/Downloads` or `/tmp` | Default payload download directory |
+
+### `[tracker]`
+
+| Key | Default | Description |
+|---|---|---|
+| `http_timeout_secs` | `30` | HTTP announce timeout |
+| `udp_timeout_secs` | `15` | UDP announce timeout |
+| `min_interval_secs` | `0` | Minimum announce interval override; `0` uses tracker values |
+
+### `[dht]`
+
+| Key | Default | Description |
+|---|---|---|
+| `enabled` | `true` | Enable DHT |
+| `port` | `0` | UDP DHT port; `0` uses `network.listen_port` |
+| `bootstrap_nodes` | Public BitTorrent bootstrap routers | Bootstrap nodes as `host:port` strings |
+
+### `[db]`
+
+| Key | Default | Description |
+|---|---|---|
+| `path` | `session_dir/state.db` | SQLite database path; leave empty to use the session directory |
+| `wal_checkpoint_pages` | `1000` | SQLite WAL checkpoint threshold |
+
+### `[auth]`
+
+| Key | Default | Description |
+|---|---|---|
+| `api_tokens` | `[]` | Pre-shared bearer/session tokens accepted by the native API |
+
+### Native minimal example
+
+```toml
+[daemon]
+api_bind = "127.0.0.1:8080"
+session_dir = "/var/lib/rusttorrentd"
+
+[storage]
+download_dir = "/data"
+
+[auth]
+api_tokens = ["change-me"]
+```
+
+### Native full example
+
+```toml
+[daemon]
+api_bind = "127.0.0.1:8080"
+session_dir = "/var/lib/rusttorrentd"
+log_level = "info"
+shutdown_timeout_secs = 10
+
+[network]
+listen_port = 6881
+max_peers = 200
+upload_rate_limit = 0
+download_rate_limit = 0
+
+[storage]
+download_dir = "/data"
+
+[tracker]
+http_timeout_secs = 30
+udp_timeout_secs = 15
+min_interval_secs = 0
+
+[dht]
+enabled = true
+port = 0
+bootstrap_nodes = [
+  "dht.transmissionbt.com:6881",
+  "router.bittorrent.com:6881",
+  "router.utorrent.com:6881",
+]
+
+[db]
+path = "/var/lib/rusttorrentd/state.db"
+wal_checkpoint_pages = 1000
+
+[auth]
+api_tokens = ["your-automation-token"]
+```
+
+## Track 1 sidecar
+
+The sidecar loads TOML config from `~/.config/rtorrentng/config.toml` by default. Override the path by passing it as the first argument:
+
+```sh
+rtorrentng /path/to/config.toml
+```
+
+Environment variables override file values where listed.
+
+### Top-level sidecar options
 
 | Key | Default | Env override | Description |
 |---|---|---|---|
 | `listen_addr` | `0.0.0.0:8080` | `RTNG_LISTEN_ADDR` | TCP address the sidecar listens on |
 | `debug` | `false` | `RTNG_DEBUG=1` | Enable debug logging |
-| `sync_interval_secs` | `2` | — | Seconds between rTorrent state polls |
-| `data_dir` | `~/.local/share/rtorrentng` | — | Directory for SQLite cache |
-| `storage_roots` | `[]` | — | Paths shown in the storage dashboard; defaults to `/` when empty |
+| `sync_interval_secs` | `2` | - | Seconds between rTorrent state polls |
+| `data_dir` | `~/.local/share/rtorrentng` | - | Directory for SQLite cache |
+| `storage_roots` | `[]` | - | Paths shown in the storage dashboard; defaults to `/` when empty |
 | WebUI static dir | `static` | `RTNG_STATIC_DIR` | Directory served for WebUI assets and SPA fallback |
 
----
-
-## `[rtorrent]` section
+### Sidecar `[rtorrent]`
 
 | Key | Default | Env override | Description |
 |---|---|---|---|
 | `scgi_socket` | `/run/rtorrent/rpc.sock` | `RTNG_SCGI_SOCKET` | Path to rTorrent SCGI Unix socket |
-| `scgi_addr` | — | `RTNG_SCGI_ADDR` | `host:port` for TCP SCGI (mutually exclusive with `scgi_socket`) |
-| `timeout_secs` | `10` | — | Timeout for individual XMLRPC calls |
+| `scgi_addr` | - | `RTNG_SCGI_ADDR` | `host:port` for TCP SCGI; mutually exclusive with `scgi_socket` |
+| `timeout_secs` | `10` | - | Timeout for individual XMLRPC calls |
 | `user_agent` | `rtorrentNG/0.1.0 libtorrent/0.16.11` | `RTNG_USER_AGENT` | Client identifier pushed to rTorrent on startup |
 
-### `user_agent`
+#### `user_agent`
 
 The `user_agent` value is pushed to rTorrent via `network.http.user_agent.set` on startup when the running rTorrent build exposes that XMLRPC method. rtorrentNG's packaged rTorrent 0.16.11 image carries a small build patch that publishes the existing libtorrent HTTP user-agent getter/setter through XMLRPC, so this works in the Docker and certification builds. It can also be changed at runtime via `PUT /api/v1/settings/user-agent` or the Settings panel in the WebUI. Some older distro rTorrent packages do not expose tracker user-agent control; the certification harness reports that as blocked instead of assuming spoofing works.
 
-**Config file:**
 ```toml
 [rtorrent]
 user_agent = "rtorrentNG/0.1.0 libtorrent/0.16.11"
 ```
 
-**Environment variable:**
 ```sh
 RTNG_USER_AGENT="rtorrentNG/0.1.0 libtorrent/0.16.11" rtorrentng
 ```
 
-**Known values:**
+Known values:
 
 | Client | User-agent string |
 |---|---|
@@ -55,11 +183,7 @@ RTNG_USER_AGENT="rtorrentNG/0.1.0 libtorrent/0.16.11" rtorrentng
 | Deluge 2.2.0 | `Deluge/2.2.0 libtorrent/2.0.10` |
 | Transmission 4.0 | `Transmission/4.0` |
 
-The default `rtorrentNG/0.1.0 libtorrent/0.16.11` is used in packaged releases.
-
----
-
-## `[identity]` section
+### Sidecar `[identity]`
 
 These values control the qBittorrent-compatible API identity presented to automation clients. They do not change the tracker-facing BitTorrent engine identity.
 
@@ -72,58 +196,52 @@ These values control the qBittorrent-compatible API identity presented to automa
 
 Use these only for lab compatibility testing. Tracker-facing identity is still controlled by the underlying rTorrent build and `RTNG_USER_AGENT` support.
 
----
-
-## `[auth]` section
+### Sidecar `[auth]`
 
 | Key | Default | Env override | Description |
 |---|---|---|---|
-| `secret_key` | — | `RTNG_SECRET_KEY` | Secret for signing session tokens. Set in production. |
+| `secret_key` | - | `RTNG_SECRET_KEY` | Secret for signing session tokens. Set in production. |
 | `api_tokens` | `[]` | `RTNG_API_TOKENS` | Comma-separated pre-shared bearer tokens for automation tools |
-| `trust_proxy_header` | `false` | — | Trust `X-Remote-User` from reverse proxy |
+| `trust_proxy_header` | `false` | - | Trust `X-Remote-User` from reverse proxy |
 
----
-
-## `[workflows]` section
+### Sidecar `[workflows]`
 
 | Key | Default | Env override | Description |
 |---|---|---|---|
 | `allow_scripts` | `false` | `RTNG_ALLOW_SCRIPTS=1` | Enables workflow `script` actions |
-| `script_timeout_secs` | `30` | — | Maximum runtime for each script action |
-| `allowed_script_dirs` | `[]` | — | Optional canonical directory allowlist for script paths |
+| `script_timeout_secs` | `30` | - | Maximum runtime for each script action |
+| `allowed_script_dirs` | `[]` | - | Optional canonical directory allowlist for script paths |
 
-Script actions are refused unless `allow_scripts` is true. Production configs that enable scripts should set `allowed_script_dirs` to root-owned or service-owned directories and keep those directories non-world-writable. See [docs/SECURITY_REVIEW.md](/home/keith/Documents/code/rtorrentNG/docs/SECURITY_REVIEW.md).
+Script actions are refused unless `allow_scripts` is true. Production configs that enable scripts should set `allowed_script_dirs` to root-owned or service-owned directories and keep those directories non-world-writable. See [SECURITY_REVIEW.md](SECURITY_REVIEW.md).
 
----
-
-## Minimal example
+### Sidecar minimal example
 
 ```toml
 [rtorrent]
 scgi_socket = "/run/rtorrent/rpc.sock"
 ```
 
-## Container example
+### Sidecar container example
 
-See [deploy/docker/sidecar.config.toml](/home/keith/Documents/code/rtorrentNG/deploy/docker/sidecar.config.toml) for the Phase 1 container-oriented sidecar config.
+See [deploy/docker/sidecar.config.toml](../deploy/docker/sidecar.config.toml) for the Phase 1 container-oriented sidecar config.
 
-## Full example
+### Sidecar full example
 
 ```toml
-listen_addr      = "127.0.0.1:8080"
-debug            = false
+listen_addr = "127.0.0.1:8080"
+debug = false
 sync_interval_secs = 2
-data_dir         = "/var/lib/rtorrentng"
-storage_roots   = ["/data", "/mnt/archive"]
+data_dir = "/var/lib/rtorrentng"
+storage_roots = ["/data", "/mnt/archive"]
 
 [rtorrent]
-scgi_socket  = "/run/rtorrent/rpc.sock"
+scgi_socket = "/run/rtorrent/rpc.sock"
 timeout_secs = 10
-user_agent   = "rtorrentNG/0.1.0 libtorrent/0.16.11"
+user_agent = "rtorrentNG/0.1.0 libtorrent/0.16.11"
 
 [auth]
-secret_key        = "change-me-in-production"
-api_tokens        = ["your-autobrr-token", "your-prowlarr-token"]
+secret_key = "change-me-in-production"
+api_tokens = ["your-autobrr-token", "your-prowlarr-token"]
 trust_proxy_header = false
 
 [identity]

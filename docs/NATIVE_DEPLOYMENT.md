@@ -8,16 +8,40 @@ same durable engine state.
 
 - Put the session DB and torrent metadata on durable local storage.
 - Put payload data on mounted storage roots with stable paths.
-- Set `RTNG_SECRET_KEY` and `RTNG_API_TOKENS`; do not use example secrets.
+- Set native API tokens in `[auth].api_tokens`; do not use example secrets.
 - Bind the native API behind TLS or a trusted reverse proxy.
 - Keep mutating endpoints token-protected.
 - Enable scripts only with a root-owned allowlist directory.
 - Run backup before imports, bulk moves, or upgrades.
 
+## Config
+
+`rusttorrentd` loads config from `RUSTTORRENTD_CONFIG`, then
+`~/.config/rusttorrentd/config.toml`, then `/etc/rusttorrentd/config.toml`.
+When no config exists, defaults are used.
+
+Minimal production shape:
+
+```toml
+[daemon]
+api_bind = "127.0.0.1:8080"
+session_dir = "/var/lib/rusttorrentd"
+
+[storage]
+download_dir = "/data"
+
+[auth]
+api_tokens = ["change-me"]
+```
+
+The daemon stores SQLite state at `session_dir/state.db` unless `[db].path` is
+set explicitly. See [CONFIGURATION.md](CONFIGURATION.md) for the full native
+config surface.
+
 ## Start
 
 ```sh
-rusttorrentd --config /config/config.toml
+RUSTTORRENTD_CONFIG=/config/config.toml rusttorrentd
 ```
 
 Minimum validation:

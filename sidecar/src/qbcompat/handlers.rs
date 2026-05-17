@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use crate::{
     api::{server::AppState, ws::Event},
     cache::{ListParams, RssRule, TorrentRow},
+    rtorrent::TransferRates,
 };
 
 pub fn build_router(_state: AppState) -> Router<AppState> {
@@ -1321,6 +1322,7 @@ async fn sync_maindata(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
+    let server_state = qb_server_state(crate::stats::current_rates(s.rt.clone()).await);
 
     if full {
         let params = ListParams {
@@ -1350,11 +1352,7 @@ async fn sync_maindata(
                     "torrents_removed": [],
                     "categories": categories,
                     "tags": tags,
-                    "server_state": {
-                        "connection_status": "connected",
-                        "dl_info_speed": 0,
-                        "up_info_speed": 0,
-                    },
+                    "server_state": server_state,
                 }))
                 .into_response()
             }
@@ -1380,11 +1378,7 @@ async fn sync_maindata(
                     "torrents_removed": [],
                     "categories": categories,
                     "tags": tags,
-                    "server_state": {
-                        "connection_status": "connected",
-                        "dl_info_speed": 0,
-                        "up_info_speed": 0,
-                    },
+                    "server_state": server_state,
                 }))
                 .into_response()
             }
@@ -1435,6 +1429,33 @@ async fn transfer_info(State(s): State<AppState>) -> Json<serde_json::Value> {
         "dl_rate_limit": 0,
         "up_rate_limit": 0,
     }))
+}
+
+fn qb_server_state(rates: TransferRates) -> serde_json::Value {
+    json!({
+        "connection_status": "connected",
+        "dl_info_speed": rates.download,
+        "up_info_speed": rates.upload,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::rtorrent::TransferRates;
+
+    use super::qb_server_state;
+
+    #[test]
+    fn qb_server_state_includes_current_transfer_rates() {
+        let state = qb_server_state(TransferRates {
+            download: 1_234,
+            upload: 567,
+        });
+
+        assert_eq!(state["connection_status"], "connected");
+        assert_eq!(state["dl_info_speed"], 1_234);
+        assert_eq!(state["up_info_speed"], 567);
+    }
 }
 
 // --- mapping helpers ---

@@ -1,5 +1,8 @@
 # Deployment
 
+This document covers the Track 1 rTorrent and sidecar deployment path. For the
+native `rusttorrentd` engine, use [NATIVE_DEPLOYMENT.md](NATIVE_DEPLOYMENT.md).
+
 ## Phase 1 bundle
 
 The Phase 1 bundle packages rTorrent 0.16.11, libtorrent 0.16.11, ruTorrent 5.3.1, nginx, PHP-FPM, and the rtorrentNG engine profile.
