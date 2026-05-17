@@ -95,6 +95,12 @@ pub fn plan_move(req: &MovePlanRequest) -> StoragePlan {
                 destination: Some(req.destination.clone()),
                 bytes: req.bytes,
             },
+            StoragePlanStep {
+                action: PlannedStorageAction::SafeDelete,
+                source: Some(req.source.clone()),
+                destination: None,
+                bytes: req.bytes,
+            },
         ],
         _ => unreachable!("move planner only emits move actions"),
     };
@@ -542,6 +548,40 @@ mod tests {
     }
 
     #[test]
+    fn move_plan_copy_verify_path_deletes_source_after_verified_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.bin");
+        let destination = dir.path().join("missing-parent/dest.bin");
+        std::fs::write(&source, b"data").unwrap();
+
+        let plan = plan_move(&MovePlanRequest {
+            source: source.clone(),
+            destination: destination.clone(),
+            bytes: 4,
+            available_bytes: Some(100),
+            dry_run: false,
+        });
+
+        assert!(plan.can_apply);
+        assert_eq!(
+            plan.steps
+                .iter()
+                .map(|step| &step.action)
+                .collect::<Vec<_>>(),
+            vec![
+                &PlannedStorageAction::CopyVerifyRename,
+                &PlannedStorageAction::Rename,
+                &PlannedStorageAction::SafeDelete,
+            ]
+        );
+
+        execute_storage_plan(&plan).unwrap();
+
+        assert!(!source.exists());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"data");
+    }
+
+    #[test]
     fn delete_requires_prior_dry_run_approval() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("delete.bin");
@@ -700,6 +740,34 @@ mod tests {
         execute_storage_plan(&plan).unwrap();
 
         assert_eq!(std::fs::read(source.join("a.bin")).unwrap(), b"abcd");
+        assert_eq!(std::fs::read(destination.join("a.bin")).unwrap(), b"abcd");
+        assert_eq!(
+            std::fs::read(destination.join("nested/b.bin")).unwrap(),
+            b"ef"
+        );
+    }
+
+    #[test]
+    fn move_plan_copy_verify_path_removes_source_directory_after_verified_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let nested = source.join("nested");
+        let destination = dir.path().join("missing-parent/dest");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(source.join("a.bin"), b"abcd").unwrap();
+        std::fs::write(nested.join("b.bin"), b"ef").unwrap();
+
+        let plan = plan_move(&MovePlanRequest {
+            source: source.clone(),
+            destination: destination.clone(),
+            bytes: 6,
+            available_bytes: Some(100),
+            dry_run: false,
+        });
+
+        execute_storage_plan(&plan).unwrap();
+
+        assert!(!source.exists());
         assert_eq!(std::fs::read(destination.join("a.bin")).unwrap(), b"abcd");
         assert_eq!(
             std::fs::read(destination.join("nested/b.bin")).unwrap(),

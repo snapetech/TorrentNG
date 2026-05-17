@@ -14,6 +14,9 @@ trap 'rm -rf "$tmpdir"' EXIT
   echo "- Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "- Host: $(hostname)"
   echo "- Commit: $(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  echo "- Hardware root: ${TNG_STORAGE_MOVE_IMPORT_ROOT:-not set}"
+  echo "- Hardware files: ${TNG_STORAGE_MOVE_IMPORT_FILES:-64}"
+  echo "- Hardware MiB/file: ${TNG_STORAGE_MOVE_IMPORT_MIB_PER_FILE:-1}"
   echo
   echo "| Gate | Result |"
   echo "| --- | --- |"
@@ -52,13 +55,26 @@ append_gate_log() {
 overall=0
 run_gate "storage planner/executor unit tests" cargo test -p rt-storage plan::tests || overall=1
 run_gate "full storage unit suite" cargo test -p rt-storage || overall=1
+if [[ -n "${TNG_STORAGE_MOVE_IMPORT_ROOT:-}" ]]; then
+  run_gate "real-root move/import/delete executor" \
+    cargo test -p rt-storage --test storage_move_import_hardware \
+    move_import_delete_executor_runs_on_configured_storage_root -- --ignored --nocapture || overall=1
+else
+  {
+    echo "| real-root move/import/delete executor | SKIP: set TNG_STORAGE_MOVE_IMPORT_ROOT |"
+    echo
+    echo "## real-root move/import/delete executor"
+    echo
+    echo "Skipped because TNG_STORAGE_MOVE_IMPORT_ROOT was not set."
+  } >>"$OUT"
+fi
 
 {
   echo
   echo "## Notes"
   echo
-  echo "- Covers no-overwrite move execution, hardlink-or-copy import, recursive directory copy verification, staged rollback cleanup, approved directory delete, and storage-root confinement."
-  echo "- Representative multi-TB operator soak should still use this report alongside hardware-specific move/import runs on the target storage roots."
+  echo "- Covers no-overwrite move execution, copy-based move source cleanup after verified rename, hardlink-or-copy import, recursive directory copy verification, staged rollback cleanup, approved directory delete, and storage-root confinement."
+  echo "- Set TNG_STORAGE_MOVE_IMPORT_ROOT to run the same executor on a real storage root. Increase TNG_STORAGE_MOVE_IMPORT_FILES and TNG_STORAGE_MOVE_IMPORT_MIB_PER_FILE for larger operator soaks."
 } >>"$OUT"
 
 echo "storage move/import report: $OUT"
