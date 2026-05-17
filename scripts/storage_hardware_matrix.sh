@@ -45,12 +45,13 @@ root_block_for_source() {
   local source="$1"
   source="${source%%[*}"
   [[ -b "$source" ]] || return 0
+  source="$(readlink -f "$source" 2>/dev/null || printf '%s\n' "$source")"
   local pkname
   pkname="$(lsblk -no PKNAME "$source" 2>/dev/null | head -1 || true)"
   if [[ -n "$pkname" ]]; then
     printf '/dev/%s\n' "$pkname"
   else
-    lsblk -no NAME "$source" 2>/dev/null | head -1 | sed 's#^#/dev/#'
+    printf '%s\n' "$source"
   fi
 }
 

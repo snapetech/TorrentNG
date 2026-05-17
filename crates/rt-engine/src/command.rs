@@ -113,6 +113,7 @@ pub struct EngineStats {
     pub storage_peer_read_elevator_enabled: u64,
     pub storage_peer_read_elevator_queue_depth: u64,
     pub storage_peer_read_elevator_queued: u64,
+    pub storage_peer_read_elevator_queue_full: u64,
     pub storage_peer_read_elevator_batches: u64,
     pub storage_peer_read_elevator_coalesced_requests: u64,
     pub storage_page_cache_advise_sequential: u64,
@@ -438,6 +439,9 @@ impl EngineStats {
         self.storage_peer_read_elevator_queued = self
             .storage_peer_read_elevator_queued
             .saturating_add(storage.peer_read_elevator_queued as u64);
+        self.storage_peer_read_elevator_queue_full = self
+            .storage_peer_read_elevator_queue_full
+            .saturating_add(storage.peer_read_elevator_queue_full);
         self.storage_peer_read_elevator_batches = self
             .storage_peer_read_elevator_batches
             .saturating_add(storage.peer_read_elevator_batches);
@@ -770,6 +774,7 @@ mod tests {
             peer_read_elevator_enabled: true,
             peer_read_elevator_queue_depth: 14,
             peer_read_elevator_queued: 15,
+            peer_read_elevator_queue_full: 30,
             peer_read_elevator_batches: 16,
             peer_read_elevator_coalesced_requests: 17,
             page_cache_advise_sequential: 18,
@@ -862,6 +867,7 @@ mod tests {
         assert_eq!(stats.storage_peer_read_elevator_enabled, 1);
         assert_eq!(stats.storage_peer_read_elevator_queue_depth, 14);
         assert_eq!(stats.storage_peer_read_elevator_queued, 15);
+        assert_eq!(stats.storage_peer_read_elevator_queue_full, 30);
         assert_eq!(stats.storage_queued_disk_bytes, 24 * 16 * 1024);
         assert_eq!(stats.storage_peer_read_elevator_batches, 16);
         assert_eq!(stats.storage_peer_read_elevator_coalesced_requests, 17);

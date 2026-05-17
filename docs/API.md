@@ -404,7 +404,7 @@ rTorrent over XMLRPC.
 | `torrentng_storage_{sync,hash}_ops_total` | counter | Durability syncs and hashing-pool work |
 | `torrentng_storage_preallocation_*_total` | counter | Preallocation failures and fallback events |
 | `torrentng_storage_peer_read_cache_*` | gauge/counter | Peer-read readahead cache entries, hits, and misses |
-| `torrentng_storage_peer_read_elevator_*` | gauge/counter | Peer-read elevator enablement, queue state, backend batches, and coalesced requests |
+| `torrentng_storage_peer_read_elevator_*` | gauge/counter | Peer-read elevator enablement, queue state, queue-full backpressure, backend batches, and coalesced requests |
 | `torrentng_storage_page_cache_advise_*` | counter | Page-cache advice calls (`SEQUENTIAL`, `WILLNEED`, `DONTNEED`) and failures from the storage scheduler |
 | `torrentng_storage_sparse_*` | counter | Sparse recheck data extents, skipped hole bytes, and seek fallback count |
 | `torrentng_piece_assembly_*` | gauge/counter | In-memory completed-piece assembly buffers, bytes, and budget evictions |

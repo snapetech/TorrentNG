@@ -1202,6 +1202,13 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
     );
     metric(
         &mut out,
+        "torrentng_storage_peer_read_elevator_queue_full_total",
+        "counter",
+        "Peer-read elevator requests denied because the elevator queue was full",
+        stats.storage_peer_read_elevator_queue_full,
+    );
+    metric(
+        &mut out,
         "torrentng_storage_peer_read_elevator_batches_total",
         "counter",
         "Peer-read elevator backend batches across running torrent schedulers",
@@ -1977,6 +1984,7 @@ mod tests {
             storage_peer_read_elevator_enabled: 24,
             storage_peer_read_elevator_queue_depth: 25,
             storage_peer_read_elevator_queued: 26,
+            storage_peer_read_elevator_queue_full: 55,
             storage_peer_read_elevator_batches: 27,
             storage_peer_read_elevator_coalesced_requests: 28,
             storage_page_cache_advise_sequential: 29,
@@ -2103,6 +2111,7 @@ mod tests {
         assert!(rendered.contains("torrentng_storage_peer_read_elevator_enabled 24"));
         assert!(rendered.contains("torrentng_storage_peer_read_elevator_queue_depth 25"));
         assert!(rendered.contains("torrentng_storage_peer_read_elevator_queued 26"));
+        assert!(rendered.contains("torrentng_storage_peer_read_elevator_queue_full_total 55"));
         assert!(rendered.contains("torrentng_storage_peer_read_elevator_batches_total 27"));
         assert!(
             rendered.contains("torrentng_storage_peer_read_elevator_coalesced_requests_total 28")

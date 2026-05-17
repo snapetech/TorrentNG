@@ -5,7 +5,10 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::sync::{mpsc as tokio_mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{
+    mpsc::{self as tokio_mpsc, error::TrySendError},
+    oneshot, OwnedSemaphorePermit, Semaphore,
+};
 use tracing::instrument;
 
 use rt_hash::{merkle_root, BlockHash};
@@ -178,6 +181,7 @@ pub struct StorageIoStats {
     pub peer_read_elevator_enabled: bool,
     pub peer_read_elevator_queue_depth: usize,
     pub peer_read_elevator_queued: usize,
+    pub peer_read_elevator_queue_full: u64,
     pub peer_read_elevator_batches: u64,
     pub peer_read_elevator_coalesced_requests: u64,
     pub page_cache_advise_sequential: u64,
@@ -222,6 +226,7 @@ impl Default for StorageIoStats {
             peer_read_elevator_enabled: false,
             peer_read_elevator_queue_depth: 0,
             peer_read_elevator_queued: 0,
+            peer_read_elevator_queue_full: 0,
             peer_read_elevator_batches: 0,
             peer_read_elevator_coalesced_requests: 0,
             page_cache_advise_sequential: 0,
@@ -523,6 +528,7 @@ struct StorageCounters {
     preallocation_fallbacks: AtomicU64,
     peer_read_cache_hits: AtomicU64,
     peer_read_cache_misses: AtomicU64,
+    peer_read_elevator_queue_full: AtomicU64,
     peer_read_elevator_batches: AtomicU64,
     peer_read_elevator_coalesced_requests: AtomicU64,
     page_cache_advise_sequential: AtomicU64,
@@ -557,6 +563,7 @@ impl Default for StorageCounters {
             preallocation_fallbacks: AtomicU64::new(0),
             peer_read_cache_hits: AtomicU64::new(0),
             peer_read_cache_misses: AtomicU64::new(0),
+            peer_read_elevator_queue_full: AtomicU64::new(0),
             peer_read_elevator_batches: AtomicU64::new(0),
             peer_read_elevator_coalesced_requests: AtomicU64::new(0),
             page_cache_advise_sequential: AtomicU64::new(0),
@@ -580,6 +587,7 @@ struct PeerReadCacheEntry {
 #[derive(Debug, Clone)]
 struct PeerReadElevator {
     sender: tokio_mpsc::Sender<PeerReadRequest>,
+    counters: Arc<StorageCounters>,
 }
 
 #[derive(Debug)]
@@ -616,9 +624,9 @@ impl PeerReadElevator {
             file_pool,
             io_pool,
             queue_sem,
-            counters,
+            counters.clone(),
         ));
-        Self { sender }
+        Self { sender, counters }
     }
 
     async fn read(
@@ -627,17 +635,37 @@ impl PeerReadElevator {
         offset: u64,
         len: usize,
     ) -> Result<bytes::Bytes, StorageError> {
+        self.try_enqueue(path, offset, len)?
+            .await
+            .map_err(|_| StorageError::Cancelled)?
+    }
+
+    fn try_enqueue(
+        &self,
+        path: PathBuf,
+        offset: u64,
+        len: usize,
+    ) -> Result<oneshot::Receiver<Result<bytes::Bytes, StorageError>>, StorageError> {
         let (tx, rx) = oneshot::channel();
         self.sender
-            .send(PeerReadRequest {
+            .try_send(PeerReadRequest {
                 path,
                 offset,
                 len,
                 tx,
             })
-            .await
-            .map_err(|_| StorageError::Cancelled)?;
-        rx.await.map_err(|_| StorageError::Cancelled)?
+            .map_err(|err| match err {
+                TrySendError::Full(_) => {
+                    self.counters
+                        .peer_read_elevator_queue_full
+                        .fetch_add(1, Ordering::Relaxed);
+                    StorageError::QueueFull {
+                        mount: "peer-read-elevator".to_string(),
+                    }
+                }
+                TrySendError::Closed(_) => StorageError::Cancelled,
+            })?;
+        Ok(rx)
     }
 
     fn queued_len(&self) -> usize {
@@ -1003,6 +1031,10 @@ impl MountScheduler {
             peer_read_elevator_enabled: self.peer_read_elevator_enabled,
             peer_read_elevator_queue_depth: self.peer_read_elevator_queue_depth,
             peer_read_elevator_queued,
+            peer_read_elevator_queue_full: self
+                .counters
+                .peer_read_elevator_queue_full
+                .load(Ordering::Relaxed),
             peer_read_elevator_batches: self
                 .counters
                 .peer_read_elevator_batches
@@ -2131,6 +2163,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_all_open_files_syncs_dirty_paths_after_fd_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.bin");
+        let second = dir.path().join("second.bin");
+        let sched = MountScheduler::new(
+            StorageRootId::new(),
+            &SchedulerConfig {
+                profile: StorageProfile::Hdd,
+                storage_io: StorageIoConfig {
+                    file_pool_size: 1,
+                    durability_mode: DurabilityMode::Checkpoint,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        sched
+            .write_at(
+                IoClass::PeerWrite,
+                &first,
+                0,
+                bytes::Bytes::from_static(b"dirty-a"),
+                true,
+            )
+            .await
+            .unwrap();
+        sched
+            .write_at(
+                IoClass::PeerWrite,
+                &second,
+                0,
+                bytes::Bytes::from_static(b"dirty-b"),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let before_sync = sched.stats();
+        assert_eq!(before_sync.file_pool.capacity, 1);
+        assert_eq!(before_sync.file_pool.open_files, 1);
+        assert!(before_sync.file_pool.evictions >= 1);
+        assert_eq!(before_sync.dirty_files, 2);
+
+        sched.sync_all_open_files().await.unwrap();
+
+        let after_sync = sched.stats();
+        assert_eq!(after_sync.dirty_files, 0);
+        assert_eq!(after_sync.sync_ops, 1);
+    }
+
+    #[tokio::test]
     async fn peer_read_readahead_cache_returns_exact_requested_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("readahead.bin");
@@ -2267,5 +2351,29 @@ mod tests {
         let stats = sched.stats();
         assert_eq!(stats.peer_read_elevator_batches, 1);
         assert_eq!(stats.peer_read_elevator_coalesced_requests, 0);
+    }
+
+    #[test]
+    fn peer_read_elevator_full_queue_fails_closed() {
+        let (sender, _receiver) = tokio_mpsc::channel(1);
+        let counters = Arc::new(StorageCounters::default());
+        let elevator = PeerReadElevator {
+            sender,
+            counters: counters.clone(),
+        };
+        let path = PathBuf::from("queued.bin");
+        let first = elevator.try_enqueue(path.clone(), 0, 1024);
+        assert!(first.is_ok());
+        let second = elevator.try_enqueue(path, 1024, 1024);
+        assert!(matches!(
+            second,
+            Err(StorageError::QueueFull { mount }) if mount == "peer-read-elevator"
+        ));
+        assert_eq!(
+            counters
+                .peer_read_elevator_queue_full
+                .load(Ordering::Relaxed),
+            1
+        );
     }
 }
