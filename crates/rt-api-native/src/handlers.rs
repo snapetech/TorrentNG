@@ -16,6 +16,7 @@ use rt_api_model::{
 };
 use rt_metainfo::{parse_magnet, parse_torrent};
 use rt_session::{TorrentEntry, TorrentState};
+use rt_storage::runtime::StorageRuntime;
 
 use crate::state::AppState;
 
@@ -650,6 +651,28 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
         "Trackers with error state",
         stats.trackers_error,
     );
+    let storage = StorageRuntime::global();
+    metric(
+        &mut out,
+        "rtorrentng_storage_handles_open",
+        "gauge",
+        "Open file handles in the global storage runtime cache",
+        storage.handles_open() as u64,
+    );
+    metric(
+        &mut out,
+        "rtorrentng_storage_frame_bytes_in_use",
+        "gauge",
+        "Frame-pool bytes currently checked out by storage I/O",
+        storage.frame_in_use_bytes(),
+    );
+    metric(
+        &mut out,
+        "rtorrentng_storage_frame_bytes_cap",
+        "gauge",
+        "Frame-pool byte cap for storage I/O",
+        storage.frame_cap_bytes(),
+    );
     out
 }
 
@@ -924,6 +947,8 @@ mod tests {
         assert!(rendered.contains("rtorrentng_torrents_seeding 1"));
         assert!(rendered.contains("rtorrentng_jobs_active 3"));
         assert!(rendered.contains("rtorrentng_trackers_error 4"));
+        assert!(rendered.contains("rtorrentng_storage_handles_open "));
+        assert!(rendered.contains("rtorrentng_storage_frame_bytes_cap "));
     }
 
     #[tokio::test]

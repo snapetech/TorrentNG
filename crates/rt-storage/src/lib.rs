@@ -5,6 +5,7 @@ pub mod frame;
 pub mod handle_cache;
 pub mod io_class;
 pub mod plan;
+pub mod runtime;
 pub mod scheduler;
 pub mod verify;
 

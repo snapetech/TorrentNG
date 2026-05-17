@@ -20,6 +20,7 @@ rt-api-model = { path = "../rt-api-model" }
 rt-engine = { path = "../rt-engine" }
 rt-metainfo = { path = "../rt-metainfo" }
 rt-session = { path = "../rt-session" }
+rt-storage = { path = "../rt-storage" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

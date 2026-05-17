@@ -9,7 +9,8 @@ use axum::{
 };
 use base64::{engine::general_purpose, Engine as _};
 use rt_engine::{
-    EngineGlobalLimits, EngineHandle, EnginePeerSnapshot, EngineTorrentMetadata, QueueMove,
+    EngineGlobalLimits, EngineHandle, EnginePeerSnapshot, EnginePieceState, EngineTorrentMetadata,
+    QueueMove,
 };
 use rt_metainfo::{parse_magnet, parse_torrent};
 use rt_session::SessionRegistry;
@@ -502,8 +503,13 @@ async fn session_get(state: &AppState) -> Value {
         "version": "rtorrentNG",
         "rpc-version": 17,
         "rpc-version-minimum": 1,
+        "rpc-version-semver": "6.0.0",
+        "session-id": SESSION_ID,
         "download-dir": default_download_dir(state).await,
         "config-dir": "/config",
+        "incomplete-dir": "",
+        "incomplete-dir-enabled": false,
+        "rename-partial-files": false,
         "start-added-torrents": true,
         "trash-original-torrent-files": false,
         "speed-limit-down-enabled": limits.download_limit > 0,
@@ -526,10 +532,25 @@ async fn session_get(state: &AppState) -> Value {
         "script-torrent-done-seeding-enabled": false,
         "blocklist-enabled": false,
         "blocklist-size": 0,
+        "blocklist-url": "",
         "utp-enabled": true,
         "lpd-enabled": false,
         "dht-enabled": true,
         "pex-enabled": true,
+        "peer-port": 0,
+        "port-forwarding-enabled": false,
+        "seedRatioLimit": -1.0,
+        "seedRatioLimited": false,
+        "idle-seeding-limit": 0,
+        "idle-seeding-limit-enabled": false,
+        "units": {
+            "speed-units": ["B/s", "KB/s", "MB/s", "GB/s", "TB/s"],
+            "speed-bytes": 1000,
+            "size-units": ["B", "KB", "MB", "GB", "TB"],
+            "size-bytes": 1000,
+            "memory-units": ["B", "KiB", "MiB", "GiB", "TiB"],
+            "memory-bytes": 1024,
+        },
     })
 }
 
@@ -628,10 +649,18 @@ async fn torrent_get(state: &AppState, args: &Value) -> Value {
                     "hashString" | "hash-string" => json!(entry.info_hash),
                     "name" => json!(entry.name),
                     "totalSize" | "total-size" => json!(entry.total_length),
+                    "sizeWhenDone" | "size-when-done" => json!(entry.total_length),
                     "leftUntilDone" | "left-until-done" => json!(entry.amount_left),
+                    "percentComplete" | "percent-complete" => {
+                        json!(percent_done(entry.total_length, entry.amount_left))
+                    }
                     "percentDone" | "percent-done" => {
                         json!(percent_done(entry.total_length, entry.amount_left))
                     }
+                    "bytesCompleted" | "bytes-completed" => {
+                        json!(entry.total_length.saturating_sub(entry.amount_left))
+                    }
+                    "availability" => json!(transmission_availability(meta)),
                     "downloadedEver" | "downloaded-ever" => json!(entry.stats.downloaded),
                     "uploadedEver" | "uploaded-ever" => json!(entry.stats.uploaded),
                     "uploadRatio" | "upload-ratio" => json!(entry.stats.ratio()),
@@ -649,6 +678,7 @@ async fn torrent_get(state: &AppState, args: &Value) -> Value {
                         json!(entry.error_message.clone().unwrap_or_default())
                     }
                     "eta" => json!(-1),
+                    "etaIdle" | "eta-idle" => json!(-1),
                     "isPrivate" | "is-private" => {
                         json!(meta.map(|m| m.is_private).unwrap_or(false))
                     }
@@ -687,6 +717,15 @@ async fn torrent_get(state: &AppState, args: &Value) -> Value {
                         .get(&entry.info_hash)
                         .map(|peers| peers.iter().filter(|peer| peer.download_rate > 0).count())
                         .unwrap_or(0)),
+                    "peersFrom" | "peers-from" => json!({
+                        "fromCache": 0,
+                        "fromDht": 0,
+                        "fromIncoming": 0,
+                        "fromLpd": 0,
+                        "fromLtep": 0,
+                        "fromPex": 0,
+                        "fromTracker": peers.get(&entry.info_hash).map(Vec::len).unwrap_or(0),
+                    }),
                     "trackers" => json!(transmission_trackers(meta)),
                     "trackerStats" | "tracker-stats" => json!(transmission_tracker_stats(meta)),
                     "files" => json!(transmission_files(entry, meta)),
@@ -695,6 +734,7 @@ async fn torrent_get(state: &AppState, args: &Value) -> Value {
                     "wanted" => json!(transmission_file_wanted(meta)),
                     "comment" => json!(""),
                     "creator" => json!(""),
+                    "primaryMimeType" | "primary-mime-type" => json!(""),
                     "pieceCount" | "piece-count" => json!(meta.map(|m| m.piece_count).unwrap_or(0)),
                     "pieceSize" | "piece-size" => json!(meta.map(|m| m.piece_length).unwrap_or(0)),
                     "pieces" => json!(""),
@@ -708,8 +748,10 @@ async fn torrent_get(state: &AppState, args: &Value) -> Value {
                     "maxConnectedPeers" | "max-connected-peers" => json!(0),
                     "webseeds" => json!(meta.map(|m| m.webseeds.clone()).unwrap_or_default()),
                     "webseedsSendingToUs" | "webseeds-sending-to-us" => json!(0),
+                    "webseedsEx" | "webseeds-ex" => json!(transmission_webseeds_ex(meta)),
                     "bandwidthPriority" | "bandwidth-priority" => json!(0),
                     "honorsSessionLimits" | "honors-session-limits" => json!(true),
+                    "group" => json!("default"),
                     "magnetLink" | "magnet-link" => {
                         json!(transmission_magnet_link(&entry.info_hash))
                     }
@@ -722,6 +764,8 @@ async fn torrent_get(state: &AppState, args: &Value) -> Value {
                     }
                     "secondsDownloading" | "seconds-downloading" => json!(0),
                     "secondsSeeding" | "seconds-seeding" => json!(0),
+                    "sequentialDownload" | "sequential-download" => json!(false),
+                    "sequentialDownloadFromPiece" | "sequential-download-from-piece" => json!(0),
                     _ => Value::Null,
                 };
                 obj.insert(field.clone(), value);
@@ -847,6 +891,35 @@ fn transmission_file_priorities(meta: Option<&EngineTorrentMetadata>) -> Vec<i64
 fn transmission_file_wanted(meta: Option<&EngineTorrentMetadata>) -> Vec<bool> {
     meta.map(|meta| meta.files.iter().map(|file| file.wanted).collect())
         .unwrap_or_default()
+}
+
+fn transmission_availability(meta: Option<&EngineTorrentMetadata>) -> Vec<i64> {
+    meta.map(|meta| {
+        meta.piece_states
+            .iter()
+            .map(|state| match state {
+                EnginePieceState::Complete | EnginePieceState::Partial => 1,
+                EnginePieceState::Missing => 0,
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn transmission_webseeds_ex(meta: Option<&EngineTorrentMetadata>) -> Vec<Value> {
+    meta.map(|meta| {
+        meta.webseeds
+            .iter()
+            .map(|url| {
+                json!({
+                    "url": url,
+                    "is_downloading": false,
+                    "download_bytes_per_second": 0,
+                })
+            })
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 fn transmission_trackers(meta: Option<&EngineTorrentMetadata>) -> Vec<Value> {
