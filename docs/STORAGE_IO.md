@@ -134,21 +134,27 @@ according to the configured durability mode before the fastresume state was
 saved. If that sync fails, the state is saved with `clean_shutdown = false`, so
 startup falls back to verification instead of trusting stale piece state.
 
-## Remaining Work
+## Completed Follow-Through
 
-The following items are still implementation targets:
+The following items were previously tracked as implementation targets and are
+now part of the release surface:
 
-- Wire the native move/import API command path to the storage-plan job helpers.
-  The storage executor accepts completed step indexes, and the engine now
-  persists storage-plan queue/start/checkpoint/complete state in the durable
-  jobs table so interrupted multi-step plans can resume or be audited after
-  process restart.
-- Per-device latency observability now includes bounded Prometheus histograms
-  for read/write/sync/hash work labeled by resolved device/profile, plus the
+- Native move/import/delete API calls use the storage-plan job helpers. The
+  storage executor accepts completed step indexes, and the engine persists
+  storage-plan queue/start/checkpoint/complete state in the durable jobs table
+  so interrupted multi-step plans can resume or be audited after process
+  restart. The WebUI planner can provide affected torrent metadata, completed
+  resume steps, and forward/rollback byte summaries.
+- Per-device latency observability includes bounded Prometheus histograms for
+  read/write/sync/hash work labeled by resolved device/profile, plus the
   cumulative per-device totals. Aggregate fixed-bucket histograms and counters
   also cover file-pool activity, queue depth, dirty files, sync/hash/preallocate
   work, peer-read cache, logical/backend reads, and in-memory piece assembly
   pressure.
+
+## Remaining Work
+
+The following items are still implementation targets:
 - Replace the worker-owned fixed-buffer copy path with true frame-pool slot
   pinning once the global frame pool can lease stable registered buffer indexes.
   Until then, `torrentng_storage_backend_fixed_buffer_strategy` must report

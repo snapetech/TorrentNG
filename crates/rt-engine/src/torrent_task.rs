@@ -652,7 +652,14 @@ impl TorrentTask {
                 if let Err(e) =
                     run_outgoing_peer(addr, info_hash, peer_event_tx, peer_cmd_rx, upload).await
                 {
-                    debug!(peer = %addr, err = %e, "peer ended");
+                    debug!(
+                        component = "peer",
+                        operation = "run_outgoing",
+                        peer = %addr,
+                        result = "ended",
+                        error = %e,
+                        "peer ended"
+                    );
                     let _ = disconnect_tx
                         .send(PeerEvent::Disconnected {
                             peer: addr,
@@ -1029,7 +1036,14 @@ impl TorrentTask {
             )
             .await
             {
-                debug!(peer = %peer_addr, err = %e, "incoming peer ended");
+                debug!(
+                    component = "peer",
+                    operation = "run_incoming",
+                    peer = %peer_addr,
+                    result = "ended",
+                    error = %e,
+                    "incoming peer ended"
+                );
                 let _ = disconnect_tx
                     .send(PeerEvent::Disconnected {
                         peer: peer_addr,
@@ -2340,8 +2354,11 @@ impl TorrentTask {
             let db = self.db.lock().expect("database mutex poisoned");
             if let Err(e) = rt_db::upsert(&db, &row) {
                 warn!(
+                    component = "db",
+                    operation = "persist_torrent_state",
                     torrent = %self.info_hash_hex,
-                    err = %e,
+                    result = "error",
+                    error = %e,
                     "failed to persist torrent state"
                 );
             }
@@ -2357,8 +2374,11 @@ impl TorrentTask {
             let db = self.db.lock().expect("database mutex poisoned");
             if let Err(e) = rt_db::upsert(&db, &row) {
                 warn!(
+                    component = "db",
+                    operation = "persist_torrent_progress",
                     torrent = %self.info_hash_hex,
-                    err = %e,
+                    result = "error",
+                    error = %e,
                     "failed to persist torrent progress"
                 );
             }
