@@ -45,7 +45,8 @@ fi
 allow_scripts="$(value_for allow_scripts | tr -d ' "')"
 allowed_dirs="$(value_for allowed_script_dirs)"
 tokens="$(value_for api_tokens)"
-secret="$(value_for secret_key | tr -d ' "')"
+configured_secret="$(value_for secret_key)"
+secret="$(printf '%s' "$configured_secret" | tr -d ' "')"
 trust_proxy="$(value_for trust_proxy_header | tr -d ' "')"
 
 if [[ -n "${TNG_API_TOKENS:-}" ]]; then
@@ -74,7 +75,9 @@ else
   emit "api tokens" "PASS" "non-empty and not a known example"
 fi
 
-if [[ -z "$secret" || "$secret" == "change-me" || "$secret" == "certification-only-change-me" ]]; then
+if [[ -z "$configured_secret" ]]; then
+  emit "session secret" "PASS" "not applicable for native API-token-only config"
+elif [[ -z "$secret" || "$secret" == "change-me" || "$secret" == "certification-only-change-me" ]]; then
   emit "session secret" "FAIL" "example or empty secret_key"
 else
   emit "session secret" "PASS" "non-example secret_key configured"

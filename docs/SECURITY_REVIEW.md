@@ -32,6 +32,20 @@ Runtime behavior:
   - `TNG_TRACKER`
 - The sidecar enforces a timeout and records success/failure in workflow run history.
 
+## Automated Review
+
+Run the review against the deployment config that will be shipped:
+
+```sh
+TNG_SECRET_KEY="$(openssl rand -hex 32)" TNG_API_TOKENS="token-one,token-two" \
+  scripts/security_review.sh deploy/docker/sidecar.config.toml
+scripts/security_review.sh deploy/native/config.toml
+```
+
+Sidecar configs must provide a non-example `secret_key`. Native
+`rusttorrentd` configs do not use a session secret, so the same script records
+that check as not applicable and still enforces API-token review.
+
 ## Release Checklist
 
 - [ ] Run `scripts/security_review.sh` against the release config.
