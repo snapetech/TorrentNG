@@ -43,6 +43,7 @@ the ignored real-device probes.
 | --- | --- |
 | `torrentng_storage_backend_selected{backend=...}` | Exactly one active backend sample with value `1` |
 | `torrentng_storage_backend_fixed_buffers_supported` | `0` for `pread`; `1` for `uring` when the kernel accepts registered worker buffers |
+| `torrentng_storage_*_latency_nanoseconds_by_device_total{device=...,profile=...}` | Storage latency attribution survives multi-device aggregation |
 | `torrentng_storage_file_pool_*` | fd pool remains bounded and records hit/miss/eviction/idle-close activity |
 | `torrentng_storage_peer_read_elevator_*` | HDD peer-read queueing, batching, and coalescing are visible |
 | `torrentng_storage_sparse_*` | recheck reports sparse data extents, skipped holes, and fallback count |
