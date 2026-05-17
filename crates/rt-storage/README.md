@@ -19,7 +19,7 @@ scheduler used by the native engine.
 - `DeviceElevator` captures the per-device Phase B scheduling policy:
   budgeted queueing, deadline and foreground bypass, choke-critical promotion,
   class weights, bounded dispatch, offset ordering, and adjacent read
-  coalescing. `MountScheduler` integration is the next step.
+  coalescing. `MountScheduler` sends peer-read disk misses through it.
 - `prepare_file` creates parent directories and applies preallocation before
   the first write. The default `Auto` policy resolves from mount/sysfs
   topology: full allocation for rotational non-CoW local storage, sparse
@@ -52,9 +52,10 @@ scheduler used by the native engine.
 Unit tests cover scheduler class isolation, read-missing behavior, write create
 policy, fd-pool hit/miss/eviction behavior, sparse preparation, and concurrent
 positioned writes on a cached fd. They also assert backend request parsing,
-probe-selected fallback behavior, storage stats for read, write, sync, and hash
-work. Engine tests cover upload block assembly across multi-file regions and
-fastresume/recheck workflows.
+probe-selected fallback behavior, forced `io_uring` roundtrips on kernels that
+support it, and storage stats for read, write, sync, and hash work. Engine tests
+cover upload block assembly across multi-file regions and fastresume/recheck
+workflows.
 
 Run:
 

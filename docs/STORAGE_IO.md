@@ -112,8 +112,7 @@ The following items are still implementation targets:
   read/write/sync/hash work, along with file-pool activity, queue depth, dirty
   files, sync/hash/preallocate counters, peer-read cache counters, logical and
   backend read counters, and in-memory piece assembly pressure.
-- Extend the Linux `UringBackend` with registered fds, fixed buffers, and
-  batched submit/completion handling.
+- Extend the Linux `UringBackend` with registered fds and fixed buffers.
 - Add benchmarks comparing syscall count, seed-read locality, recheck runtime
   progress, and bounded descriptor use under active file counts above pool
   capacity.
