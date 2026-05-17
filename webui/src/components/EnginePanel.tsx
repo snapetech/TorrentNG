@@ -488,6 +488,11 @@ function RtorrentSettingsPanel() {
           <div id="rt-settings-autosave-status" role="status" aria-live="polite" style={visuallyHiddenStyle}>
             {autosaveText}
           </div>
+          {lastSaveFailed && (
+            <div role="alert" style={visuallyHiddenStyle}>
+              Autosave failed. Pending changes remain in the form.
+            </div>
+          )}
           <div style={{
             display: 'grid',
             gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
