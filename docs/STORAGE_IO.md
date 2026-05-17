@@ -158,7 +158,8 @@ The following items are still implementation targets:
 - Replace the worker-owned fixed-buffer copy path with true frame-pool slot
   pinning once the global frame pool can lease stable registered buffer indexes.
   Until then, `torrentng_storage_backend_fixed_buffer_strategy` must report
-  `worker_copy`, not `frame_pool_slots`.
+  `worker_copy`, not `frame_pool_slots`; the final uring graduation proof uses
+  `TNG_STORAGE_URING_REQUIRE_FRAME_POOL_SLOTS=1`.
 - The release hardware report records real-device seed-read locality, bounded
   hot-file descriptor reuse, recheck runtime progress, elevator throughput, and
   optional syscall counts (`TNG_STORAGE_SYSCALLS=1`) across one or more target

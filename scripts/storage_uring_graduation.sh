@@ -18,6 +18,8 @@ Environment:
   TNG_STORAGE_URING_REQUIRE_SELECTED     require selected=uring for the uring run
   TNG_STORAGE_URING_REQUIRE_FIXED        require fixed_buffers=true
   TNG_STORAGE_URING_REQUIRE_STRATEGY     require fixed_buffer_strategy to equal this value
+  TNG_STORAGE_URING_REQUIRE_FRAME_POOL_SLOTS
+                                          require fixed_buffer_strategy=frame_pool_slots
   TNG_STORAGE_URING_REQUIRE_FILES        require registered_files=true
   TNG_STORAGE_URING_MIN_READ_RATIO       require uring read MiB/s >= ratio * pread
   TNG_STORAGE_URING_MIN_WRITE_RATIO      require uring write MiB/s >= ratio * pread
@@ -137,9 +139,14 @@ else
   echo "| fixed buffers | INFO: $uring_fixed |" >>"$OUT"
 fi
 
-if [[ -n "${TNG_STORAGE_URING_REQUIRE_STRATEGY:-}" ]]; then
-  gate "fixed-buffer strategy ${TNG_STORAGE_URING_REQUIRE_STRATEGY}" \
-    test "$uring_strategy" = "$TNG_STORAGE_URING_REQUIRE_STRATEGY"
+required_strategy="${TNG_STORAGE_URING_REQUIRE_STRATEGY:-}"
+if [[ "${TNG_STORAGE_URING_REQUIRE_FRAME_POOL_SLOTS:-0}" == "1" ]]; then
+  required_strategy="frame_pool_slots"
+fi
+
+if [[ -n "$required_strategy" ]]; then
+  gate "fixed-buffer strategy $required_strategy" \
+    test "$uring_strategy" = "$required_strategy"
 else
   echo "| fixed-buffer strategy | INFO: $uring_strategy |" >>"$OUT"
 fi

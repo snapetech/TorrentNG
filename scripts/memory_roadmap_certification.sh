@@ -119,10 +119,19 @@ fi
 if contains "$storage_uring" 'Overall status: PASS' &&
   contains "$storage_uring" 'Selected: uring' &&
   contains "$storage_uring" 'Fixed-buffer strategy: (worker_copy|frame_pool_slots)' &&
-  contains "$storage_uring" '\| fixed-buffer strategy[^|]*\| (INFO|PASS)'; then
-  row "io_uring real-device graduation probe" PASS "$(report_link "$storage_uring")"
+  contains "$storage_uring" '\| fixed-buffer strategy[^|]*\| (INFO(: [^|]+)?|PASS) \|'; then
+  row "io_uring real-device capability probe" PASS "$(report_link "$storage_uring")"
 else
-  row "io_uring real-device graduation probe" WARN "$(report_link "$storage_uring")"
+  row "io_uring real-device capability probe" WARN "$(report_link "$storage_uring")"
+fi
+
+if contains "$storage_uring" 'Overall status: PASS' &&
+  contains "$storage_uring" 'Selected: uring' &&
+  contains "$storage_uring" 'Fixed-buffer strategy: frame_pool_slots' &&
+  contains "$storage_uring" '\| fixed-buffer strategy frame_pool_slots \| PASS \|'; then
+  row "io_uring frame-pool slot graduation" PASS "$(report_link "$storage_uring")"
+else
+  row "io_uring frame-pool slot graduation" WARN "$(report_link "$storage_uring")"
 fi
 
 {
@@ -130,7 +139,7 @@ fi
   echo "## Boundaries"
   echo
   echo "- Deterministic LVM physical-drive placement remains a non-claim unless a lower-level PV-targeted path is added."
-  echo "- io_uring remains explicit opt-in until graduation reports meet selected-backend, fixed-buffer strategy, registered-file, and throughput thresholds on target hardware."
+  echo "- io_uring remains explicit opt-in until graduation reports meet selected-backend, registered-file, frame-pool-slot strategy, and throughput thresholds on target hardware."
   echo "- Multi-TB move/import certification remains host/run evidence; use the real-root fixture knobs to scale the report on the target storage root."
 } >>"$OUT"
 
