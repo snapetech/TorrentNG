@@ -2990,6 +2990,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn jobs_without_engine_returns_unavailable() {
+        let state = AppState::new();
+        let app = build_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/jobs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
     async fn list_torrents_with_entry() {
         let (app, _hash) = setup_app_with_torrent().await;
         let resp = app
