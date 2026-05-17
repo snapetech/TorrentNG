@@ -219,6 +219,7 @@ function RtorrentSettingsPanel() {
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set())
   const [notice, setNotice] = useState<{ tone: 'ok' | 'warn' | 'error'; text: string } | null>(null)
   const [lastSavedAt, setLastSavedAt] = useState<number | null>(null)
+  const [lastSaveFailed, setLastSaveFailed] = useState(false)
   const searchRef = useRef<HTMLInputElement>(null)
   const immediateSaveRef = useRef(0)
 
@@ -249,9 +250,13 @@ function RtorrentSettingsPanel() {
       if (result.restart_required) bits.push('restart required')
       if (result.errors.length) bits.push(`${result.errors.length} live apply error${result.errors.length === 1 ? '' : 's'}`)
       setLastSavedAt(Date.now())
+      setLastSaveFailed(false)
       setNotice({ tone: result.errors.length ? 'warn' : 'ok', text: bits.join(' · ') })
     },
-    onError: e => setNotice({ tone: 'error', text: String(e) }),
+    onError: e => {
+      setLastSaveFailed(true)
+      setNotice({ tone: 'error', text: String(e) })
+    },
   })
   const restart = useMutation({
     mutationFn: api.rtorrentSettings.restart,
@@ -301,6 +306,7 @@ function RtorrentSettingsPanel() {
     if (data.overlay_writable && !save.isPending) {
       window.setTimeout(() => save.mutate({ values: next, customRc: data.custom_rc }), 0)
     }
+    setLastSaveFailed(false)
     setNotice(null)
   }, [data, save])
   const defaultAll = () => {
@@ -311,6 +317,7 @@ function RtorrentSettingsPanel() {
       next[setting.key] = inputValue(setting.value_type, setting.default_value)
     }
     setDraft(next)
+    setLastSaveFailed(false)
     if (data.overlay_writable && !save.isPending) {
       window.setTimeout(() => save.mutate({ values: next, customRc }), 0)
     }
@@ -393,6 +400,7 @@ function RtorrentSettingsPanel() {
   }
   const updateSetting = useCallback((setting: RtorrentSettingDescriptor, value: string | number | boolean, immediate = false) => {
     const nextValue = setting.value_type === 'int' ? clampSettingValue(setting, Number(value)) : value
+    setLastSaveFailed(false)
     setDraft(prev => {
       const next = { ...prev, [setting.key]: nextValue }
       if (immediate && data?.overlay_writable && !save.isPending) {
@@ -404,6 +412,7 @@ function RtorrentSettingsPanel() {
   }, [customRc, data?.overlay_writable, save])
   const saveNow = useCallback(() => {
     if (!data?.overlay_writable || dirtyCount === 0 || save.isPending) return
+    setLastSaveFailed(false)
     save.mutate({ values: draft, customRc })
   }, [customRc, data?.overlay_writable, dirtyCount, draft, save])
 
@@ -578,7 +587,9 @@ function RtorrentSettingsPanel() {
               <div style={{ color: 'var(--faint)', fontSize: 11 }}>
                 {save.isPending
                   ? 'Saving changes...'
-                  : dirtyCount === 0
+                  : lastSaveFailed
+                    ? `${dirtyCount} change${dirtyCount === 1 ? '' : 's'} could not be saved. Retry when the API is available.`
+                    : dirtyCount === 0
                     ? `All settings are saved${lastSavedAt ? `; last save ${formatRelativeTime(lastSavedAt)}` : ''}.`
                     : `${dirtyCount} change${dirtyCount === 1 ? '' : 's'} will autosave shortly: ${liveDirtyCount} live, ${restartDirtyCount} restart${customRcDirty ? ', custom lines edited' : ''}.`}
               </div>
@@ -606,6 +617,18 @@ function RtorrentSettingsPanel() {
               values={data.values}
               saving={save.isPending}
             />
+          )}
+          {lastSaveFailed && (
+            <div role="alert" style={{
+              color: 'var(--danger)',
+              border: '1px solid color-mix(in srgb, var(--danger) 48%, var(--border))',
+              borderRadius: 8,
+              background: 'color-mix(in srgb, var(--danger) 8%, var(--surface))',
+              padding: '8px 10px',
+              fontSize: 12,
+            }}>
+              Autosave failed. Pending changes are still in the form; retry save before leaving this page.
+            </div>
           )}
           <div style={{ display: 'grid', gap: 12 }}>
             {filteredGroups.map(group => {
@@ -873,10 +896,10 @@ function RtorrentSettingsPanel() {
               onClick={saveNow}
               disabled={save.isPending || dirtyCount === 0 || !data.overlay_writable}
               aria-keyshortcuts="Control+S Meta+S"
-              title="Save pending changes now"
-              style={buttonStyle('var(--accent)', 'var(--accent-soft)', 'var(--accent-text)', dirtyCount > 0 && !save.isPending && data.overlay_writable)}
+              title={lastSaveFailed ? 'Retry autosave now' : 'Save pending changes now'}
+              style={buttonStyle(lastSaveFailed ? 'var(--danger)' : 'var(--accent)', lastSaveFailed ? 'color-mix(in srgb, var(--danger) 12%, var(--surface))' : 'var(--accent-soft)', lastSaveFailed ? 'var(--danger)' : 'var(--accent-text)', dirtyCount > 0 && !save.isPending && data.overlay_writable)}
             >
-              {save.isPending ? 'Saving...' : 'Save now'}
+              {save.isPending ? 'Saving...' : lastSaveFailed ? 'Retry save' : 'Save now'}
             </button>
             <button
               onClick={resetAll}
@@ -896,8 +919,8 @@ function RtorrentSettingsPanel() {
             >
               {restart.isPending ? 'Restarting…' : 'Restart daemon'}
             </button>
-            <span style={{ color: dirtyCount > 0 ? 'var(--warning)' : 'var(--faint)', fontSize: 12, fontWeight: 800 }}>
-              {save.isPending ? 'Autosaving' : dirtyCount > 0 ? `${dirtyCount} pending autosave` : 'Saved'}
+            <span style={{ color: lastSaveFailed ? 'var(--danger)' : dirtyCount > 0 ? 'var(--warning)' : 'var(--faint)', fontSize: 12, fontWeight: 800 }}>
+              {save.isPending ? 'Autosaving' : lastSaveFailed ? 'Autosave failed' : dirtyCount > 0 ? `${dirtyCount} pending autosave` : 'Saved'}
             </span>
           </div>
         </div>
