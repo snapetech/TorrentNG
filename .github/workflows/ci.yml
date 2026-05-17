@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   sidecar:
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: [self-hosted, Linux, X64, rtorrentng]
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -23,7 +23,7 @@ jobs:
         run: cargo build --locked
 
   webui:
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: [self-hosted, Linux, X64, rtorrentng]
     steps:
       - name: Checkout
         uses: actions/checkout@v6

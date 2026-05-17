@@ -17,7 +17,7 @@ permissions:
 jobs:
   release:
     name: Build and publish release
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: [self-hosted, Linux, X64, rtorrentng]
 
     steps:
       - name: Checkout
