@@ -303,6 +303,75 @@ dialog,
   scrollbar-width: thin;
 }
 
+.rtng-dropzone {
+  position: relative;
+  overflow: hidden;
+}
+
+.rtng-dropzone::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0;
+  background:
+    linear-gradient(90deg, transparent 0 49%, color-mix(in srgb, var(--accent) 18%, transparent) 49% 51%, transparent 51%),
+    linear-gradient(0deg, transparent 0 49%, color-mix(in srgb, var(--accent) 18%, transparent) 49% 51%, transparent 51%);
+  background-size: 34px 34px;
+  transition: opacity 120ms ease;
+}
+
+.rtng-dropzone[data-active="true"]::before {
+  opacity: 1;
+}
+
+.rtng-dropzone[data-filled="true"] {
+  max-height: min(42vh, 360px);
+  overflow: auto;
+}
+
+.rtng-staged-file {
+  transition:
+    border-color 120ms ease,
+    background-color 120ms ease,
+    transform 90ms ease;
+}
+
+.rtng-staged-file:hover {
+  border-color: color-mix(in srgb, var(--accent) 38%, var(--border-strong)) !important;
+  background: color-mix(in srgb, var(--surface-2) 75%, var(--surface)) !important;
+}
+
+.rtng-detail-stat,
+.rtng-detail-row {
+  transition:
+    border-color 120ms ease,
+    background-color 120ms ease,
+    box-shadow 120ms ease;
+}
+
+.rtng-detail-stat:hover,
+.rtng-detail-row:hover {
+  border-color: color-mix(in srgb, var(--accent) 34%, var(--border-strong)) !important;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.rtng-detail-row[data-tone="ok"] {
+  box-shadow: inset 3px 0 0 color-mix(in srgb, var(--success) 62%, transparent);
+}
+
+.rtng-detail-row[data-tone="warn"] {
+  box-shadow: inset 3px 0 0 color-mix(in srgb, var(--warning) 70%, transparent);
+}
+
+.rtng-detail-row[data-tone="active"] {
+  box-shadow: inset 3px 0 0 color-mix(in srgb, var(--accent) 62%, transparent);
+}
+
+.rtng-detail-row[data-tone="muted"] {
+  opacity: 0.82;
+}
+
 ::selection {
   background: color-mix(in srgb, var(--accent) 40%, transparent);
   color: var(--text);
@@ -506,6 +575,11 @@ dialog,
     max-width: none !important;
     max-height: calc(100vh - 20px) !important;
     border-radius: 8px !important;
+  }
+
+  .rtng-add-dialog {
+    padding: 16px !important;
+    gap: 12px !important;
   }
 
   .rtng-properties-dialog {

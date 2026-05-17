@@ -545,6 +545,26 @@ rust_observed_peers() {
     jq '.peers | length' 2>/dev/null || echo 0
 }
 
+torrent_info_hash() {
+  aria2c -S "$1" 2>/dev/null | awk -F': ' '/^Info Hash: / {print tolower($2); exit}'
+}
+
+bridge_client_peer_to_rust() {
+  local client="$1" info_hash="$2" ip port
+  ip="$(container_ip "$client")"
+  case "$client" in
+    qbittorrent) port=6882 ;;
+    transmission) port=6883 ;;
+    deluge) port=6884 ;;
+    rtorrent) port=6885 ;;
+    *) return 1 ;;
+  esac
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
+    --data-urlencode "hashes=$info_hash" \
+    --data-urlencode "peers=$ip:$port" \
+    "$(client_url rusttorrentd)/api/qb/v2/torrents/addPeers" >/dev/null
+}
+
 wait_public_complete() {
   local timeout="$1" torrent_name="$2" info_hash="$3"; shift 3
   local clients=("$@") start now rust_progress rust_peers progress
@@ -671,6 +691,123 @@ run_churn_case() {
   append_report "- Status: **$status**"
   append_report ""
   [[ "$status" == "PASS" ]]
+}
+
+run_webseed_only_case() {
+  local status="PASS" fixture torrent
+  append_report "## Extended Local: rust-webseed-only"
+  append_report ""
+  log "running extended local case rust-webseed-only"
+  fixture="$(case_fixture single-16m rust-webseed-only)"
+  torrent="$(make_torrent "$fixture" "$fixture" webseed-only)"
+  add_to_client rusttorrentd "$torrent" || status="FAIL"
+  wait_clients_complete "$TIMEOUT_LOCAL" "$fixture" rusttorrentd || status="FAIL"
+  verify_fixture_hashes rusttorrentd "$fixture" || status="FAIL"
+  append_report "- Seeder: fixture-http"
+  append_report "- Leecher: rusttorrentd"
+  append_report "- Fixture: single-16m"
+  append_report "- Torrent mode: webseed-only"
+  append_report "- Status: **$status**"
+  append_report ""
+  [[ "$status" == "PASS" ]]
+}
+
+run_explicit_peer_case() {
+  local status="PASS" fixture torrent info_hash
+  append_report "## Extended Local: rust-explicit-peer-private"
+  append_report ""
+  log "running extended local case rust-explicit-peer-private"
+  fixture="$(case_fixture single-16m rust-explicit-peer-private)"
+  torrent="$(make_torrent "$fixture" "$fixture" private-explicit)"
+  info_hash="$(torrent_info_hash "$torrent")"
+  seed_fixture_for_client qbittorrent "$fixture"
+  add_to_client qbittorrent "$torrent" seed || status="FAIL"
+  add_to_client rusttorrentd "$torrent" || status="FAIL"
+  bridge_client_peer_to_rust qbittorrent "$info_hash" || status="FAIL"
+  wait_clients_complete "$TIMEOUT_LOCAL" "$fixture" qbittorrent rusttorrentd || status="FAIL"
+  verify_fixture_hashes qbittorrent "$fixture" || status="FAIL"
+  verify_fixture_hashes rusttorrentd "$fixture" || status="FAIL"
+  append_report "- Seeder: qbittorrent"
+  append_report "- Leecher: rusttorrentd"
+  append_report "- Fixture: single-16m"
+  append_report "- Torrent mode: private explicit peer, no tracker, no webseed"
+  append_report "- Info hash: $info_hash"
+  append_report "- Status: **$status**"
+  append_report ""
+  [[ "$status" == "PASS" ]]
+}
+
+run_restart_recovery_case() {
+  local status="PASS" fixture torrent info_hash
+  append_report "## Extended Local: rust-restart-recovery"
+  append_report ""
+  log "running extended local case rust-restart-recovery"
+  fixture="$(case_fixture single-64m rust-restart-recovery)"
+  torrent="$(make_torrent "$fixture" "$fixture" tracker-webseed)"
+  info_hash="$(torrent_info_hash "$torrent")"
+  seed_fixture_for_client qbittorrent "$fixture"
+  add_to_client qbittorrent "$torrent" seed || status="FAIL"
+  add_to_client rusttorrentd "$torrent" || status="FAIL"
+  bridge_client_peer_to_rust qbittorrent "$info_hash" || true
+  sleep "${INTEROP_RESTART_BEFORE_SECS:-5}"
+  compose restart -t 20 rusttorrentd >/dev/null || status="FAIL"
+  wait_http rusttorrentd "$(client_url rusttorrentd)/health" 120 || status="FAIL"
+  bridge_client_peer_to_rust qbittorrent "$info_hash" || true
+  wait_clients_complete "$TIMEOUT_LOCAL" "$fixture" qbittorrent rusttorrentd || status="FAIL"
+  verify_fixture_hashes rusttorrentd "$fixture" || status="FAIL"
+  append_report "- Seeder: qbittorrent"
+  append_report "- Leecher: rusttorrentd"
+  append_report "- Fixture: single-64m"
+  append_report "- Restart delay: ${INTEROP_RESTART_BEFORE_SECS:-5}s"
+  append_report "- Info hash: $info_hash"
+  append_report "- Status: **$status**"
+  append_report ""
+  [[ "$status" == "PASS" ]]
+}
+
+run_rust_api_facade_case() {
+  local status="PASS"
+  append_report "## Extended Local: rust-api-facades"
+  append_report ""
+  log "running extended local case rust-api-facades"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/health" |
+    jq -e '.ready == true and .status == "ok"' >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS "$(client_url rusttorrentd)/metrics" |
+    grep -q '^# HELP' || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/v1/torrents" |
+    jq -e 'type == "array"' >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/qb/v2/torrents/info" |
+    jq -e 'type == "array"' >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/qb/v2/sync/maindata" |
+    jq -e 'type == "object" and has("torrents")' >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/qb/v2/transfer/info" |
+    jq -e 'type == "object"' >/dev/null || status="FAIL"
+  rust_transmission_rpc '{"method":"session-stats"}' |
+    jq -e '.result == "success"' >/dev/null || status="FAIL"
+  rust_transmission_rpc '{"method":"torrent-get","arguments":{"fields":["id","name","percentDone"]}}' |
+    jq -e '.result == "success" and (.arguments.torrents | type == "array")' >/dev/null || status="FAIL"
+  rust_deluge_rpc '{"method":"web.update_ui","params":[["name","progress","state"],{}],"id":30}' |
+    jq -e '.error == null and (.result.torrents | type == "object")' >/dev/null || status="FAIL"
+  append_report "- Native REST: checked"
+  append_report "- qBittorrent API: checked"
+  append_report "- Transmission RPC facade: checked"
+  append_report "- Deluge JSON-RPC facade: checked"
+  append_report "- Metrics: checked"
+  append_report "- Status: **$status**"
+  append_report ""
+  [[ "$status" == "PASS" ]]
+}
+
+run_extended_local_matrix() {
+  local failures=0
+  [[ "$EXTENDED_LOCAL" == "1" ]] || return 0
+  append_report "# Extended Local Certification"
+  append_report ""
+  run_webseed_only_case || failures=$((failures + 1))
+  run_explicit_peer_case || failures=$((failures + 1))
+  run_restart_recovery_case || failures=$((failures + 1))
+  run_rust_api_facade_case || failures=$((failures + 1))
+  (( failures == 0 ))
 }
 
 toml_entries() {
@@ -902,6 +1039,7 @@ run_local_matrix() {
   for row in "${LOCAL_CASES[@]}"; do
     run_local_case "$row" || failures=$((failures + 1))
   done
+  run_extended_local_matrix || failures=$((failures + 1))
   (( failures == 0 ))
 }
 

@@ -9,8 +9,8 @@ services:
     restart: unless-stopped
     ports:
       - "${INTEROP_RUST_HOST_PORT:-38080}:8080"
-      - "${INTEROP_RUST_PEER_PORT:-36881}:6881"
-      - "${INTEROP_RUST_PEER_PORT:-36881}:6881/udp"
+      - "${INTEROP_RUST_PEER_PORT:-46181}:6881"
+      - "${INTEROP_RUST_PEER_PORT:-46181}:6881/udp"
     volumes:
       - ./rusttorrentd.config.toml:/etc/rusttorrentd/config.toml:ro
       - rusttorrentd-state:/var/lib/rusttorrentd
@@ -32,8 +32,8 @@ services:
     restart: unless-stopped
     ports:
       - "${INTEROP_QBIT_HOST_PORT:-38081}:8080"
-      - "${INTEROP_QBIT_PEER_PORT:-36882}:6882"
-      - "${INTEROP_QBIT_PEER_PORT:-36882}:6882/udp"
+      - "${INTEROP_QBIT_PEER_PORT:-46182}:6882"
+      - "${INTEROP_QBIT_PEER_PORT:-46182}:6882/udp"
     volumes:
       - ${INTEROP_WORKDIR:-../../certification/interop}/config/qbittorrent:/config
       - ${INTEROP_WORKDIR:-../../certification/interop}/downloads:/downloads
@@ -52,8 +52,8 @@ services:
     restart: unless-stopped
     ports:
       - "${INTEROP_TRANSMISSION_HOST_PORT:-38091}:9091"
-      - "${INTEROP_TRANSMISSION_PEER_PORT:-36883}:6883"
-      - "${INTEROP_TRANSMISSION_PEER_PORT:-36883}:6883/udp"
+      - "${INTEROP_TRANSMISSION_PEER_PORT:-46183}:6883"
+      - "${INTEROP_TRANSMISSION_PEER_PORT:-46183}:6883/udp"
     volumes:
       - ${INTEROP_WORKDIR:-../../certification/interop}/config/transmission:/config
       - ${INTEROP_WORKDIR:-../../certification/interop}/downloads:/downloads
@@ -73,8 +73,8 @@ services:
     ports:
       - "${INTEROP_DELUGE_HOST_PORT:-38112}:8112"
       - "${INTEROP_DELUGE_DAEMON_PORT:-35889}:58846"
-      - "${INTEROP_DELUGE_PEER_PORT:-36884}:6884"
-      - "${INTEROP_DELUGE_PEER_PORT:-36884}:6884/udp"
+      - "${INTEROP_DELUGE_PEER_PORT:-46184}:6884"
+      - "${INTEROP_DELUGE_PEER_PORT:-46184}:6884/udp"
     volumes:
       - ${INTEROP_WORKDIR:-../../certification/interop}/config/deluge:/config
       - ${INTEROP_WORKDIR:-../../certification/interop}/downloads:/downloads
@@ -91,8 +91,8 @@ services:
     restart: unless-stopped
     command: ["-o", "system.daemon.set=true", "-o", "import=/config/rtorrent.rc"]
     ports:
-      - "${INTEROP_RTORRENT_PEER_PORT:-36885}:6885"
-      - "${INTEROP_RTORRENT_PEER_PORT:-36885}:6885/udp"
+      - "${INTEROP_RTORRENT_PEER_PORT:-46185}:6885"
+      - "${INTEROP_RTORRENT_PEER_PORT:-46185}:6885/udp"
     volumes:
       - ./rtorrent.rc:/config/rtorrent.rc:ro
       - ${INTEROP_WORKDIR:-../../certification/interop}/config/rtorrent:/config

@@ -40,7 +40,7 @@ export function HelpDialog({ onClose }: Props) {
         </div>
 
         <div style={{ padding: 16, display: 'grid', gap: 18 }}>
-          <section style={sectionCard}>
+          <section className="rtng-card" style={sectionCard}>
             <h2 style={headingStyle}>Shortcuts</h2>
             <div style={{ display: 'grid', gap: 6 }}>
               {SHORTCUTS.map(([key, value]) => (
@@ -52,7 +52,7 @@ export function HelpDialog({ onClose }: Props) {
             </div>
           </section>
 
-          <section style={sectionCard}>
+          <section className="rtng-card" style={sectionCard}>
             <h2 style={headingStyle}>Actions</h2>
             <p style={textStyle}>
               Use the toolbar for selected torrents, the left sidebar for filtering and saved views,
@@ -60,13 +60,14 @@ export function HelpDialog({ onClose }: Props) {
             </p>
           </section>
 
-          <section style={sectionCard}>
+          <section className="rtng-card" style={sectionCard}>
             <h2 style={headingStyle}>Links</h2>
             <div style={{ display: 'grid', gap: 7 }}>
               {LINKS.map(([label, href]) => (
-                <a key={href} href={href} target="_blank" rel="noreferrer" style={linkStyle}>
+                <a key={href} className="rtng-card-link" href={href} target="_blank" rel="noreferrer" style={linkStyle}>
                   <span>{label}</span>
                   <span style={{ color: 'var(--faint)', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{href.replace(/^https?:\/\//, '')}</span>
+                  <span aria-hidden="true" style={{ color: 'var(--accent-text)', justifySelf: 'end' }}>↗</span>
                 </a>
               ))}
             </div>
@@ -127,7 +128,7 @@ const linkStyle: React.CSSProperties = {
   fontSize: 13,
   textDecoration: 'none',
   display: 'grid',
-  gridTemplateColumns: '150px minmax(0, 1fr)',
+  gridTemplateColumns: '150px minmax(0, 1fr) auto',
   gap: 10,
   alignItems: 'center',
   border: '1px solid var(--border)',

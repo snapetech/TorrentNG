@@ -277,7 +277,7 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
             ['Added',       fmtDate(t.creation_date)],
             ['Completed',   fmtDate(t.timestamp_finished)],
           ].map(([lbl, val]) => (
-            <div key={lbl} style={{
+            <div key={lbl} className="rtng-detail-stat" style={{
               minWidth: 0, background: 'var(--surface)', border: '1px solid var(--border)',
               borderRadius: 6, padding: '7px 8px',
             }}>
@@ -411,7 +411,7 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
             {trackers.map((tr, i) => {
               const ok = !tr.message
               return (
-              <div key={i} style={{
+              <div key={i} className="rtng-detail-row" data-tone={ok ? 'ok' : 'warn'} style={{
                 marginBottom: 8, border: '1px solid var(--border)', borderRadius: 6,
                 padding: 8, background: ok ? 'var(--surface)' : 'color-mix(in srgb, var(--warning) 8%, var(--surface))',
               }}>
@@ -466,7 +466,7 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
               const fp = f.size_chunks > 0 ? (f.completed_chunks / f.size_chunks) * 100 : 100
               const priority = f.priority === 0 ? 'Skipped' : f.priority >= 2 ? 'High' : 'Normal'
               return (
-                <div key={f.index} style={{
+                <div key={f.index} className="rtng-detail-row" data-tone={f.priority === 0 ? 'muted' : fp >= 100 ? 'ok' : 'active'} style={{
                   marginBottom: 8, border: '1px solid var(--border)', borderRadius: 6,
                   background: 'var(--surface)', padding: 7,
                 }}>

@@ -27,6 +27,8 @@ export function AddTorrentDialog({ onClose }: Props) {
   const { data: categories = [] } = useQuery({ queryKey: ['categories'], queryFn: api.categories.list })
   const urlCount = url.split('\n').map(line => line.trim()).filter(Boolean).length
   const canSubmit = !busy && (urlCount > 0 || files.length > 0)
+  const selectedCategory = categories.find(c => c.name === category)
+  const effectiveSavePath = savePath.trim() || selectedCategory?.save_path || ''
 
   const addFiles = useCallback((incoming: FileList | File[]) => {
     const all = Array.from(incoming)
@@ -84,7 +86,7 @@ export function AddTorrentDialog({ onClose }: Props) {
       position: 'fixed', inset: 0, background: 'rgba(2,6,23,0.72)', display: 'flex',
       alignItems: 'center', justifyContent: 'center', zIndex: 100,
     }} onClick={e => { if (!busy && e.target === e.currentTarget) onClose() }}>
-      <div role="dialog" aria-modal="true" aria-label="Add torrent" className="rtng-modal" style={{
+      <div role="dialog" aria-modal="true" aria-label="Add torrent" className="rtng-modal rtng-add-dialog" style={{
         background: 'var(--panel)', border: '1px solid var(--border)', borderRadius: 10,
         width: 480, maxWidth: '95vw', padding: 24, display: 'flex', flexDirection: 'column', gap: 16,
       }}>
@@ -105,6 +107,9 @@ export function AddTorrentDialog({ onClose }: Props) {
 
         {/* Drag-drop zone */}
         <div
+          className="rtng-dropzone"
+          data-active={dragOver ? 'true' : 'false'}
+          data-filled={files.length > 0 ? 'true' : 'false'}
           role="button"
           tabIndex={0}
           aria-label="Choose or drop torrent files"
@@ -146,12 +151,13 @@ export function AddTorrentDialog({ onClose }: Props) {
           ) : (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
               {files.map(f => (
-                <div key={f.name} style={{
+                <div key={f.name} className="rtng-staged-file" style={{
                   display: 'flex', alignItems: 'center', gap: 8,
                   border: '1px solid var(--border)', borderRadius: 6, padding: '5px 7px',
                   background: 'var(--surface)',
                 }}>
                   <span style={{ fontSize: 12, color: 'var(--muted)', flex: 1, textAlign: 'left', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>📄 {f.name}</span>
+                  <span style={{ color: 'var(--faint)', fontSize: 10, fontVariantNumeric: 'tabular-nums' }}>{fmtSize(f.size)}</span>
                   <button aria-label={`Remove ${f.name}`} onClick={e => { e.stopPropagation(); setFiles(p => p.filter(x => x !== f)) }}
                     style={{ background: 'none', border: 'none', color: '#ef4444', cursor: 'pointer', fontSize: 14, padding: '0 2px' }}>✕</button>
                 </div>
@@ -209,6 +215,11 @@ export function AddTorrentDialog({ onClose }: Props) {
               <option value="">None</option>
               {categories.map(c => <option key={c.name} value={c.name}>{c.name}</option>)}
             </select>
+            {selectedCategory?.save_path && (
+              <div style={{ marginTop: 5, color: 'var(--faint)', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                Category path: <span style={{ color: 'var(--muted)' }}>{selectedCategory.save_path}</span>
+              </div>
+            )}
           </div>
         )}
 
@@ -223,8 +234,9 @@ export function AddTorrentDialog({ onClose }: Props) {
           padding: '7px 9px', border: '1px solid var(--border)', borderRadius: 6,
           background: 'var(--surface)', color: 'var(--faint)', fontSize: 12,
         }}>
-          <span>
+          <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
             {files.length.toLocaleString()} file{files.length === 1 ? '' : 's'} · {urlCount.toLocaleString()} URL{urlCount === 1 ? '' : 's'}
+            {effectiveSavePath ? ` · ${effectiveSavePath}` : ''}
           </span>
           <span style={{ color: start ? 'var(--success)' : 'var(--warning)' }}>
             {start ? 'will start' : 'paused on add'}
@@ -250,6 +262,13 @@ export function AddTorrentDialog({ onClose }: Props) {
       </div>
     </div>
   )
+}
+
+function fmtSize(bytes: number): string {
+  if (bytes >= 1e9) return (bytes / 1e9).toFixed(1) + ' GB'
+  if (bytes >= 1e6) return (bytes / 1e6).toFixed(1) + ' MB'
+  if (bytes >= 1e3) return (bytes / 1e3).toFixed(0) + ' KB'
+  return bytes.toLocaleString() + ' B'
 }
 
 const noticeStyle: React.CSSProperties = {
