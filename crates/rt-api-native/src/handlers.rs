@@ -205,51 +205,77 @@ pub async fn get_torrent(
     State(state): State<AppState>,
     Path(info_hash): Path<String>,
 ) -> impl IntoResponse {
-    let reg = state.registry.read().await;
-    match reg.get(&info_hash) {
-        Some(e) => {
-            let summary = torrent_summary(e);
-            if let Some(engine) = &state.engine {
-                match engine.torrent_metadata(info_hash.clone()).await {
-                    Ok(meta) => {
-                        let detail = TorrentDetail {
-                            summary,
-                            piece_length: meta.piece_length as i64,
-                            piece_count: meta.piece_count as i64,
-                            is_private: meta.is_private,
-                            trackers: meta.trackers,
-                            files: meta
-                                .files
-                                .into_iter()
-                                .map(|file| FileInfo {
-                                    file_index: file.index,
-                                    path: file.path,
-                                    length: file.length as i64,
-                                    priority: 1,
-                                })
-                                .collect(),
-                        };
-                        (StatusCode::OK, Json(serde_json::to_value(detail).unwrap()))
-                            .into_response()
+    let summary = {
+        let reg = state.registry.read().await;
+        match reg.get(&info_hash) {
+            Some(e) => torrent_summary(e),
+            None => return not_found(info_hash),
+        }
+    };
+    let Some(engine) = &state.engine else {
+        return (StatusCode::OK, Json(serde_json::to_value(summary).unwrap())).into_response();
+    };
+
+    let base_estimate = estimate_torrent_detail_base_snapshot_bytes();
+    let _base_lease = match engine
+        .reserve_memory(MemoryClass::ApiSnapshot, base_estimate)
+        .await
+    {
+        Ok(Some(lease)) => lease,
+        Ok(None) => return api_snapshot_budget_exhausted(),
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::to_value(ApiError::internal(e)).unwrap()),
+            )
+                .into_response();
+        }
+    };
+
+    match engine.torrent_metadata(info_hash.clone()).await {
+        Ok(meta) => {
+            let extra_estimate = estimate_torrent_detail_snapshot_bytes(&summary, &meta)
+                .saturating_sub(base_estimate);
+            let _extra_lease = if extra_estimate > 0 {
+                match engine
+                    .reserve_memory(MemoryClass::ApiSnapshot, extra_estimate)
+                    .await
+                {
+                    Ok(Some(lease)) => Some(lease),
+                    Ok(None) => return api_snapshot_budget_exhausted(),
+                    Err(e) => {
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(serde_json::to_value(ApiError::internal(e)).unwrap()),
+                        )
+                            .into_response();
                     }
-                    Err(e) => (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::to_value(ApiError::internal(e)).unwrap()),
-                    )
-                        .into_response(),
                 }
             } else {
-                (StatusCode::OK, Json(serde_json::to_value(summary).unwrap())).into_response()
-            }
+                None
+            };
+            let detail = TorrentDetail {
+                summary,
+                piece_length: meta.piece_length as i64,
+                piece_count: meta.piece_count as i64,
+                is_private: meta.is_private,
+                trackers: meta.trackers,
+                files: meta
+                    .files
+                    .into_iter()
+                    .map(|file| FileInfo {
+                        file_index: file.index,
+                        path: file.path,
+                        length: file.length as i64,
+                        priority: 1,
+                    })
+                    .collect(),
+            };
+            (StatusCode::OK, Json(serde_json::to_value(detail).unwrap())).into_response()
         }
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(
-                serde_json::to_value(ApiError::not_found(format!(
-                    "torrent {info_hash} not found"
-                )))
-                .unwrap(),
-            ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::to_value(ApiError::internal(e)).unwrap()),
         )
             .into_response(),
     }
@@ -1239,6 +1265,27 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
     );
     metric(
         &mut out,
+        "torrentng_peer_command_queue_depth",
+        "gauge",
+        "Queued peer commands across active peer tasks",
+        stats.peer_command_queue_depth,
+    );
+    metric(
+        &mut out,
+        "torrentng_peer_command_queue_capacity",
+        "gauge",
+        "Total peer command queue capacity across active peer tasks",
+        stats.peer_command_queue_capacity,
+    );
+    metric(
+        &mut out,
+        "torrentng_peer_command_queue_full_total",
+        "counter",
+        "Nonblocking peer command sends denied because peer command queues were full",
+        stats.peer_command_queue_full,
+    );
+    metric(
+        &mut out,
         "torrentng_tracker_peer_cache_entries",
         "gauge",
         "Tracker-discovered peer addresses retained across running torrents",
@@ -1810,6 +1857,9 @@ mod tests {
             peer_request_window_reductions: 40,
             peer_rx_buffer_bytes: 41,
             peer_tx_buffer_bytes: 42,
+            peer_command_queue_depth: 51,
+            peer_command_queue_capacity: 52,
+            peer_command_queue_full: 53,
             tracker_peer_cache_entries: 43,
             tracker_peer_cache_drops: 44,
             ..Default::default()
@@ -1865,6 +1915,9 @@ mod tests {
         assert!(rendered.contains("torrentng_peer_request_window_reductions_total 40"));
         assert!(rendered.contains("torrentng_peer_rx_buffer_bytes 41"));
         assert!(rendered.contains("torrentng_peer_tx_buffer_bytes 42"));
+        assert!(rendered.contains("torrentng_peer_command_queue_depth 51"));
+        assert!(rendered.contains("torrentng_peer_command_queue_capacity 52"));
+        assert!(rendered.contains("torrentng_peer_command_queue_full_total 53"));
         assert!(rendered.contains("torrentng_tracker_peer_cache_entries 43"));
         assert!(rendered.contains("torrentng_tracker_peer_cache_drops_total 44"));
         assert!(

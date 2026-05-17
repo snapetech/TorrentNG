@@ -386,6 +386,7 @@ pub struct TorrentTask {
     piece_assembly_soft_cap_bytes: usize,
     piece_assembly_evictions: u64,
     peer_request_window_reductions: u64,
+    peer_command_queue_full: u64,
     tracker_peer_cache_drops: u64,
     dirty_pieces_since_barrier: HashSet<u32>,
     completed_piece_verify_from_memory: u64,
@@ -487,6 +488,7 @@ impl TorrentTask {
             ),
             piece_assembly_evictions: 0,
             peer_request_window_reductions: 0,
+            peer_command_queue_full: 0,
             tracker_peer_cache_drops: 0,
             dirty_pieces_since_barrier: HashSet::new(),
             completed_piece_verify_from_memory: 0,
@@ -1092,6 +1094,20 @@ impl TorrentTask {
             .values()
             .map(|peer| peer.outstanding as u64)
             .sum::<u64>();
+        let peer_command_queue_capacity = self
+            .active_peers
+            .values()
+            .map(|peer| peer.cmd_tx.max_capacity() as u64)
+            .sum::<u64>();
+        let peer_command_queue_depth = self
+            .active_peers
+            .values()
+            .map(|peer| {
+                peer.cmd_tx
+                    .max_capacity()
+                    .saturating_sub(peer.cmd_tx.capacity()) as u64
+            })
+            .sum::<u64>();
         TorrentRuntimeStats {
             connected_peers: self.active_peers.len() as u64,
             outstanding_requests,
@@ -1104,6 +1120,9 @@ impl TorrentTask {
             peer_request_window_reductions: self.peer_request_window_reductions,
             peer_rx_buffer_bytes: outstanding_requests.saturating_mul(MAX_BLOCK_SIZE as u64),
             peer_tx_buffer_bytes: 0,
+            peer_command_queue_depth,
+            peer_command_queue_capacity,
+            peer_command_queue_full: self.peer_command_queue_full,
             tracker_peer_cache_entries: self.known_tracker_peers.len() as u64,
             tracker_peer_cache_drops: self.tracker_peer_cache_drops,
             storage: self.storage.stats(),
@@ -1422,6 +1441,7 @@ impl TorrentTask {
 
         let decisions = self.choker.run(&snapshots);
         let peers: Vec<SocketAddr> = self.active_peers.keys().copied().collect();
+        let mut queue_full = 0u64;
         for addr in peers {
             let Some(handle) = self.active_peers.get_mut(&addr) else {
                 continue;
@@ -1429,15 +1449,20 @@ impl TorrentTask {
             match decisions.get(&handle.id).copied() {
                 Some(ChokeDecision::Unchoke) if handle.upload_choked => {
                     handle.upload_choked = false;
-                    let _ = handle.cmd_tx.try_send(PeerCommand::Unchoke);
+                    if handle.cmd_tx.try_send(PeerCommand::Unchoke).is_err() {
+                        queue_full = queue_full.saturating_add(1);
+                    }
                 }
                 Some(ChokeDecision::Choke) if !handle.upload_choked => {
                     handle.upload_choked = true;
-                    let _ = handle.cmd_tx.try_send(PeerCommand::Choke);
+                    if handle.cmd_tx.try_send(PeerCommand::Choke).is_err() {
+                        queue_full = queue_full.saturating_add(1);
+                    }
                 }
                 _ => {}
             }
         }
+        self.peer_command_queue_full = self.peer_command_queue_full.saturating_add(queue_full);
     }
 
     async fn refill_peer_requests(&mut self, peer: SocketAddr) {
@@ -1457,6 +1482,7 @@ impl TorrentTask {
                 self.peer_request_window_reductions.saturating_add(1);
         }
 
+        let mut queue_full = 0u64;
         while handle.outstanding < request_pipeline {
             let req = match self.picker.pick(&handle.peer_has) {
                 Some(req) => req,
@@ -1471,12 +1497,14 @@ impl TorrentTask {
                 }
             };
             if handle.cmd_tx.try_send(PeerCommand::Request(req)).is_err() {
+                queue_full = queue_full.saturating_add(1);
                 self.picker.cancel_request(req.piece as usize, req.begin);
                 break;
             }
             handle.outstanding += 1;
             handle.requested.push(req);
         }
+        self.peer_command_queue_full = self.peer_command_queue_full.saturating_add(queue_full);
     }
 
     async fn handle_block(&mut self, block: BlockEvent) {
@@ -1623,11 +1651,15 @@ impl TorrentTask {
 
     async fn send_have_to_peers(&mut self, piece: u32) {
         let peers: Vec<SocketAddr> = self.active_peers.keys().copied().collect();
+        let mut queue_full = 0u64;
         for peer in peers {
             if let Some(handle) = self.active_peers.get(&peer) {
-                let _ = handle.cmd_tx.try_send(PeerCommand::Have(piece));
+                if handle.cmd_tx.try_send(PeerCommand::Have(piece)).is_err() {
+                    queue_full = queue_full.saturating_add(1);
+                }
             }
         }
+        self.peer_command_queue_full = self.peer_command_queue_full.saturating_add(queue_full);
     }
 
     async fn shutdown_peers(&mut self) {

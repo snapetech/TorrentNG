@@ -2414,7 +2414,8 @@ impl Engine {
         let peer_buffer = MemoryClass::PeerBuffer as usize;
         resources.classes[peer_buffer].used_bytes = stats
             .peer_rx_buffer_bytes
-            .saturating_add(stats.peer_tx_buffer_bytes);
+            .saturating_add(stats.peer_tx_buffer_bytes)
+            .saturating_add(stats.peer_command_queue_depth.saturating_mul(128));
         let tracker_peers = MemoryClass::TrackerPeers as usize;
         resources.classes[tracker_peers].used_bytes =
             stats.tracker_peer_cache_entries.saturating_mul(64);
@@ -4425,6 +4426,9 @@ mod tests {
                     peer_request_window_reductions: 6,
                     peer_rx_buffer_bytes: 7,
                     peer_tx_buffer_bytes: 8,
+                    peer_command_queue_depth: 11,
+                    peer_command_queue_capacity: 12,
+                    peer_command_queue_full: 13,
                     tracker_peer_cache_entries: 9,
                     tracker_peer_cache_drops: 10,
                     ..Default::default()
@@ -4498,6 +4502,9 @@ mod tests {
                     peer_request_window_reductions: 6,
                     peer_rx_buffer_bytes: 7,
                     peer_tx_buffer_bytes: 8,
+                    peer_command_queue_depth: 11,
+                    peer_command_queue_capacity: 12,
+                    peer_command_queue_full: 13,
                     tracker_peer_cache_entries: 9,
                     tracker_peer_cache_drops: 10,
                     ..Default::default()
@@ -4875,6 +4882,9 @@ mod tests {
                     peer_request_window_reductions: 6,
                     peer_rx_buffer_bytes: 7,
                     peer_tx_buffer_bytes: 8,
+                    peer_command_queue_depth: 11,
+                    peer_command_queue_capacity: 12,
+                    peer_command_queue_full: 13,
                     tracker_peer_cache_entries: 9,
                     tracker_peer_cache_drops: 10,
                     ..Default::default()
@@ -4980,6 +4990,9 @@ mod tests {
         assert_eq!(stats.peer_request_window_reductions, 6);
         assert_eq!(stats.peer_rx_buffer_bytes, 7);
         assert_eq!(stats.peer_tx_buffer_bytes, 8);
+        assert_eq!(stats.peer_command_queue_depth, 11);
+        assert_eq!(stats.peer_command_queue_capacity, 12);
+        assert_eq!(stats.peer_command_queue_full, 13);
         assert_eq!(stats.tracker_peer_cache_entries, 9);
         assert_eq!(stats.tracker_peer_cache_drops, 10);
         assert_eq!(stats.dht_routing_nodes, 11);
@@ -5000,7 +5013,7 @@ mod tests {
         );
         assert_eq!(
             resources.classes[MemoryClass::PeerBuffer as usize].used_bytes,
-            15
+            15 + 11 * 128
         );
         assert_eq!(
             resources.classes[MemoryClass::TrackerPeers as usize].used_bytes,

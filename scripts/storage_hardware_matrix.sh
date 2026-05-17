@@ -143,8 +143,12 @@ done
   echo
   if [[ "$overall" -eq 0 ]]; then
     echo "PASS"
+    echo
+    echo "Overall status: PASS"
   else
     echo "FAIL"
+    echo
+    echo "Overall status: FAIL"
   fi
 } >>"$OUT"
 

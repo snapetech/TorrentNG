@@ -127,6 +127,9 @@ pub struct EngineStats {
     pub peer_request_window_reductions: u64,
     pub peer_rx_buffer_bytes: u64,
     pub peer_tx_buffer_bytes: u64,
+    pub peer_command_queue_depth: u64,
+    pub peer_command_queue_capacity: u64,
+    pub peer_command_queue_full: u64,
     pub tracker_peer_cache_entries: u64,
     pub tracker_peer_cache_drops: u64,
     pub resources: Option<ResourceSnapshot>,
@@ -155,6 +158,9 @@ pub struct TorrentRuntimeStats {
     pub peer_request_window_reductions: u64,
     pub peer_rx_buffer_bytes: u64,
     pub peer_tx_buffer_bytes: u64,
+    pub peer_command_queue_depth: u64,
+    pub peer_command_queue_capacity: u64,
+    pub peer_command_queue_full: u64,
     pub tracker_peer_cache_entries: u64,
     pub tracker_peer_cache_drops: u64,
     pub storage: StorageIoStats,
@@ -198,6 +204,15 @@ impl EngineStats {
         self.peer_tx_buffer_bytes = self
             .peer_tx_buffer_bytes
             .saturating_add(runtime.peer_tx_buffer_bytes);
+        self.peer_command_queue_depth = self
+            .peer_command_queue_depth
+            .saturating_add(runtime.peer_command_queue_depth);
+        self.peer_command_queue_capacity = self
+            .peer_command_queue_capacity
+            .saturating_add(runtime.peer_command_queue_capacity);
+        self.peer_command_queue_full = self
+            .peer_command_queue_full
+            .saturating_add(runtime.peer_command_queue_full);
         self.tracker_peer_cache_entries = self
             .tracker_peer_cache_entries
             .saturating_add(runtime.tracker_peer_cache_entries);
@@ -737,6 +752,9 @@ mod tests {
             peer_request_window_reductions: 22,
             peer_rx_buffer_bytes: 23,
             peer_tx_buffer_bytes: 24,
+            peer_command_queue_depth: 27,
+            peer_command_queue_capacity: 28,
+            peer_command_queue_full: 29,
             tracker_peer_cache_entries: 25,
             tracker_peer_cache_drops: 26,
             storage,
@@ -803,6 +821,9 @@ mod tests {
         assert_eq!(stats.peer_request_window_reductions, 22);
         assert_eq!(stats.peer_rx_buffer_bytes, 23);
         assert_eq!(stats.peer_tx_buffer_bytes, 24);
+        assert_eq!(stats.peer_command_queue_depth, 27);
+        assert_eq!(stats.peer_command_queue_capacity, 28);
+        assert_eq!(stats.peer_command_queue_full, 29);
         assert_eq!(stats.tracker_peer_cache_entries, 25);
         assert_eq!(stats.tracker_peer_cache_drops, 26);
     }

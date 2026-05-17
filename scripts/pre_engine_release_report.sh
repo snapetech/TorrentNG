@@ -103,6 +103,8 @@ gate "Soak status" 'soak-status-*.md' "$REPORT_DIR" 0
 gate "Security review automation" 'security-review-*.md'
 gate "Security scan" 'security-scan-*.md'
 gate "Native engine rewrite certification" 'native-engine-*.md'
+gate "Local release gate" 'local-release-*.md'
+gate "Storage hardware matrix" 'storage-hardware-*.md'
 
 {
   echo
