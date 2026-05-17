@@ -68,6 +68,11 @@ semaphores:
 - `IoClass::PeerRead` uses a small internal readahead cache when configured:
   the backend may read ahead within the same file, but callers receive exactly
   the requested byte range.
+- `DeviceElevator` now exists as a self-contained per-device scheduling policy:
+  HDD/network queues can hold work for a short budget, dispatch sorted by file
+  offset, coalesce adjacent reads, and promote deadline-expired,
+  foreground, or choke-critical work. Scheduler submission wiring is still the
+  remaining integration step.
 
 `TorrentTask` keeps a per-file preparation registry so parent directories and
 file allocation are no longer in the per-block hot path. It also keeps
@@ -91,7 +96,7 @@ startup falls back to verification instead of trusting stale piece state.
 
 The following items are still implementation targets:
 
-- Add per-device latency breakdowns once the elevator lands. Prometheus already
+- Add per-device latency breakdowns once the elevator is wired. Prometheus already
   exports fixed-bucket latency histograms and cumulative latency counters for
   read/write/sync/hash work, along with file-pool activity, queue depth, dirty
   files, sync/hash/preallocate counters, peer-read cache counters, logical and

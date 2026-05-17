@@ -16,6 +16,10 @@ scheduler used by the native engine.
 - Disk operations run on dedicated blocking workers, behind a bounded queue,
   instead of Tokio's shared blocking pool.
 - Piece and BEP52 hashing runs on a separate bounded hashing pool.
+- `DeviceElevator` captures the per-device Phase B scheduling policy:
+  budgeted queueing, deadline and foreground bypass, choke-critical promotion,
+  offset ordering, and adjacent read coalescing. `MountScheduler` integration
+  is the next step.
 - `prepare_file` creates parent directories and applies preallocation before
   the first write. The default `Auto` policy resolves from mount/sysfs
   topology: full allocation for rotational non-CoW local storage, sparse

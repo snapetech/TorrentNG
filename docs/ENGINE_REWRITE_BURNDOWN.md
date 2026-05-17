@@ -141,7 +141,7 @@ shippable and benchmarkable.
 
 - [ ] Resolve storage roots to physical `DeviceId` (`/sys/block`, rotational, dm/RAID, mergerfs/ZFS/btrfs).
 - [x] Auto-detect `StorageProfile` instead of defaulting to `Unknown`.
-- [ ] Implement `DeviceElevator`: offset-sorted, coalescing, deadline + `choke_critical` promotion.
+- [x] Implement `DeviceElevator`: offset-sorted, coalescing, deadline + `choke_critical` promotion.
 - [ ] Wire `MountScheduler` permit to elevator submission; per-class weights from `IoClass`.
 - [x] Topology-derived preallocation policy (`fallocate` on rotational non-CoW only).
 - [ ] Bench: HDD aggregate seed throughput ≥ 5× non-elevator baseline on same dataset.

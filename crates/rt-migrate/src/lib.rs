@@ -41,6 +41,7 @@ pub struct MigrationPlan {
     pub source: MigrationSource,
     pub root: PathBuf,
     pub torrents: Vec<MigrationTorrent>,
+    pub auxiliary_artifacts: Vec<AuxiliaryArtifact>,
     pub skipped: Vec<SkippedEntry>,
 }
 
@@ -76,6 +77,10 @@ impl MigrationPlan {
         out.push_str(&format!("- Source: {:?}\n", self.source));
         out.push_str(&format!("- Root: `{}`\n", self.root.display()));
         out.push_str(&format!("- Importable torrents: {}\n", self.torrents.len()));
+        out.push_str(&format!(
+            "- Auxiliary artifacts: {}\n",
+            self.auxiliary_artifacts.len()
+        ));
         out.push_str(&format!("- Warnings/skipped: {}\n", self.warning_count()));
         let confidence = self.resume_confidence_summary();
         out.push_str(&format!(
@@ -114,6 +119,19 @@ impl MigrationPlan {
                     "- `{}`: {}\n",
                     skipped.path.display(),
                     skipped.reason
+                ));
+            }
+        }
+        if !self.auxiliary_artifacts.is_empty() {
+            out.push_str("\n## Auxiliary Artifacts\n\n");
+            out.push_str("| Kind | Path | Size |\n");
+            out.push_str("| --- | --- | --- |\n");
+            for artifact in &self.auxiliary_artifacts {
+                out.push_str(&format!(
+                    "| {:?} | `{}` | {} |\n",
+                    artifact.kind,
+                    artifact.path.display(),
+                    artifact.size
                 ));
             }
         }
@@ -335,6 +353,25 @@ pub struct MigrationFile {
 pub struct SkippedEntry {
     pub path: PathBuf,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum AuxiliaryArtifactKind {
+    Rss,
+    Search,
+    Scheduler,
+    AutoAdd,
+    Blocklist,
+    Execute,
+    Plugin,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuxiliaryArtifact {
+    pub path: PathBuf,
+    pub kind: AuxiliaryArtifactKind,
+    pub size: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -731,6 +768,7 @@ fn dry_run_session(
     let mut resume_by_stem = BTreeMap::new();
     let mut aggregate_resume_paths = Vec::new();
     let files = collect_files(root)?;
+    let auxiliary_artifacts = collect_auxiliary_artifacts(root, &files)?;
 
     for path in &files {
         if looks_like_aggregate_resume(path) {
@@ -760,6 +798,7 @@ fn dry_run_session(
         source,
         root: root.to_path_buf(),
         torrents,
+        auxiliary_artifacts,
         skipped,
     })
 }
@@ -1744,6 +1783,106 @@ fn collect_files_inner(path: &Path, out: &mut Vec<PathBuf>) -> Result<(), Migrat
     Ok(())
 }
 
+fn collect_auxiliary_artifacts(
+    root: &Path,
+    files: &[PathBuf],
+) -> Result<Vec<AuxiliaryArtifact>, MigrationError> {
+    let mut artifacts = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for path in files {
+        if extension_is(path, &["torrent"])
+            || looks_like_aggregate_resume(path)
+            || looks_like_sidecar_resume(path)
+        {
+            continue;
+        }
+
+        let Some(kind) = classify_auxiliary_artifact(root, path) else {
+            continue;
+        };
+        let normalized = path.clone();
+        if !seen.insert(normalized.clone()) {
+            continue;
+        }
+        let size = std::fs::metadata(path)?.len();
+        artifacts.push(AuxiliaryArtifact {
+            path: normalized,
+            kind,
+            size,
+        });
+    }
+
+    artifacts.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(artifacts)
+}
+
+fn classify_auxiliary_artifact(root: &Path, path: &Path) -> Option<AuxiliaryArtifactKind> {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    let mut tokens = relative
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .map(|component| component.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    if let Some(stem) = path.file_stem().and_then(|value| value.to_str()) {
+        tokens.push(stem.to_ascii_lowercase());
+    }
+    if let Some(name) = path.file_name().and_then(|value| value.to_str()) {
+        tokens.push(name.to_ascii_lowercase());
+    }
+    let joined = tokens.join("/");
+
+    if any_aux_token(&tokens, &["rss", "feeds", "feed", "rules"]) || joined.contains("/rss/") {
+        return Some(AuxiliaryArtifactKind::Rss);
+    }
+    if any_aux_token(
+        &tokens,
+        &["search", "searchengines", "search_engines", "nova", "engines"],
+    ) {
+        return Some(AuxiliaryArtifactKind::Search);
+    }
+    if any_aux_token(&tokens, &["scheduler", "schedule"]) {
+        return Some(AuxiliaryArtifactKind::Scheduler);
+    }
+    if any_aux_token(&tokens, &["autoadd", "auto_add", "watch", "watched"]) {
+        return Some(AuxiliaryArtifactKind::AutoAdd);
+    }
+    if any_aux_token(
+        &tokens,
+        &["blocklist", "blocklists", "ipfilter", "ip_filter", "banned"],
+    ) {
+        return Some(AuxiliaryArtifactKind::Blocklist);
+    }
+    if any_aux_token(&tokens, &["execute", "scripts", "script", "autorun"]) {
+        return Some(AuxiliaryArtifactKind::Execute);
+    }
+    if any_aux_token(
+        &tokens,
+        &[
+            "plugins",
+            "plugin",
+            "label",
+            "labels",
+            "notifications",
+            "extractor",
+        ],
+    ) {
+        return Some(AuxiliaryArtifactKind::Plugin);
+    }
+    if any_aux_token(&tokens, &["settings", "preferences", "config"]) {
+        return Some(AuxiliaryArtifactKind::Other);
+    }
+    None
+}
+
+fn any_aux_token(tokens: &[String], needles: &[&str]) -> bool {
+    tokens.iter().any(|token| {
+        needles
+            .iter()
+            .any(|needle| token == needle || token.contains(needle))
+    })
+}
+
 fn read_limited(path: &Path, max_bytes: u64) -> Result<Vec<u8>, std::io::Error> {
     let metadata = std::fs::metadata(path)?;
     if metadata.len() > max_bytes {
@@ -1902,6 +2041,20 @@ fn looks_like_aggregate_resume(path: &Path) -> bool {
                     | "torrents.config.bak"
             )
         })
+}
+
+fn looks_like_sidecar_resume(path: &Path) -> bool {
+    extension_is(
+        path,
+        &[
+            "fastresume",
+            "resume",
+            "resume_dat",
+            "rtorrent",
+            "dat",
+            "state",
+        ],
+    )
 }
 
 fn first_bencode_string<'a>(value: &'a BValue<'a>, keys: &[&[u8]]) -> Option<&'a str> {
@@ -2744,6 +2897,55 @@ mod tests {
             .iter()
             .any(|warning| warning.contains("missing resume")));
         assert!(plan.to_markdown().contains("Migration Dry Run"));
+    }
+
+    #[test]
+    fn dry_run_preserves_auxiliary_client_artifacts_separately() {
+        let dir = tempfile::tempdir().unwrap();
+        let torrent_path = dir.path().join("sample.torrent");
+        let info_hash = write_fixture_torrent(&torrent_path);
+        let info_hash_hex = hex_lower(&info_hash);
+        std::fs::write(
+            dir.path().join(format!("{info_hash_hex}.fastresume")),
+            serde_json::to_vec(&serde_json::json!({ "save_path": "/downloads" })).unwrap(),
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join("rss")).unwrap();
+        std::fs::write(dir.path().join("rss/feeds.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("scheduler.conf"), "enabled=true").unwrap();
+        std::fs::create_dir(dir.path().join("watch")).unwrap();
+        std::fs::write(dir.path().join("watch/autoadd.conf"), "/incoming").unwrap();
+        std::fs::write(dir.path().join("blocklist.txt"), "127.0.0.1").unwrap();
+        std::fs::create_dir(dir.path().join("plugins")).unwrap();
+        std::fs::write(dir.path().join("plugins/label.conf"), "linux").unwrap();
+        std::fs::create_dir(dir.path().join("searchengines")).unwrap();
+        std::fs::write(dir.path().join("searchengines/nova.py"), "pass").unwrap();
+        std::fs::create_dir(dir.path().join("scripts")).unwrap();
+        std::fs::write(dir.path().join("scripts/complete.sh"), "true").unwrap();
+        std::fs::write(dir.path().join("settings.json"), "{}").unwrap();
+
+        let plan = dry_run_qbittorrent_backup(dir.path()).unwrap();
+        let kinds = plan
+            .auxiliary_artifacts
+            .iter()
+            .map(|artifact| artifact.kind)
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(plan.torrent_count(), 1);
+        assert_eq!(plan.auxiliary_artifacts.len(), 8);
+        assert!(kinds.contains(&AuxiliaryArtifactKind::Rss));
+        assert!(kinds.contains(&AuxiliaryArtifactKind::Scheduler));
+        assert!(kinds.contains(&AuxiliaryArtifactKind::AutoAdd));
+        assert!(kinds.contains(&AuxiliaryArtifactKind::Blocklist));
+        assert!(kinds.contains(&AuxiliaryArtifactKind::Plugin));
+        assert!(kinds.contains(&AuxiliaryArtifactKind::Search));
+        assert!(kinds.contains(&AuxiliaryArtifactKind::Execute));
+        assert!(kinds.contains(&AuxiliaryArtifactKind::Other));
+        assert!(!plan
+            .auxiliary_artifacts
+            .iter()
+            .any(|artifact| extension_is(&artifact.path, &["torrent", "fastresume"])));
+        assert!(plan.to_markdown().contains("Auxiliary Artifacts"));
     }
 
     #[test]
