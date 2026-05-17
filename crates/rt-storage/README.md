@@ -33,7 +33,8 @@ scheduler used by the native engine.
 - `StorageRuntime` uses a probe-selected disk backend. Set
   `TNG_STORAGE_BACKEND=auto|pread|uring` to request a backend. `pread` is the
   portable worker-pool path; `uring` uses Linux `io_uring` positioned SQEs when
-  the kernel allows it and falls back with a diagnostic when it cannot.
+  the kernel allows it, registers per-ring file slots when accepted, and falls
+  back with a diagnostic when it cannot.
 
 ## Correctness Expectations
 

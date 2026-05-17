@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
@@ -26,6 +26,7 @@ use crate::frame::Frame;
 
 const URING_ENTRIES: u32 = 256;
 const URING_BATCH_LIMIT: usize = 64;
+const URING_FILE_SLOTS: u32 = URING_ENTRIES;
 
 /// Backend requested by configuration or environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,8 +79,8 @@ pub struct BackendSelection {
 /// Probe-selected disk backend.
 ///
 /// The enum keeps the scheduler/runtime selection decision narrow while the
-/// Linux backend grows from basic positioned SQEs to registered fds, fixed
-/// buffers, and larger batches.
+/// Linux backend grows from positioned SQEs and registered file slots to fixed
+/// buffers.
 pub struct SelectedDiskBackend {
     selection: BackendSelection,
     inner: SelectedDiskBackendInner,
@@ -99,11 +100,12 @@ impl SelectedDiskBackend {
                 threads,
                 "forced by storage backend configuration".to_string(),
             ),
-            BackendRequest::Auto => match UringBackend::probe() {
-                Ok(probe) if probe.usable => Self::uring(requested, threads, probe.reason),
-                Ok(probe) => Self::pread(requested, threads, probe.reason),
-                Err(reason) => Self::pread(requested, threads, reason),
-            },
+            BackendRequest::Auto => Self::pread(
+                requested,
+                threads,
+                "auto uses pread baseline; request io_uring explicitly after correctness benchmarks"
+                    .to_string(),
+            ),
             BackendRequest::Uring => match UringBackend::probe() {
                 Ok(probe) if probe.usable => Self::uring(requested, threads, probe.reason),
                 Ok(probe) => Self::pread(requested, threads, probe.reason),
@@ -300,9 +302,9 @@ impl DiskBackend for UringBackend {
     }
 
     fn supports_fixed_buffers(&self) -> bool {
-        // The backend uses real io_uring SQEs today. Registered fixed buffers
-        // are the next optimization once the global frame pool can hand out
-        // stable slot indexes.
+        // Fixed buffers require the frame pool to hand out stable registered
+        // slot indexes. The backend already uses registered file slots when
+        // the kernel accepts them.
         false
     }
 }
@@ -311,34 +313,49 @@ struct UringWorker {
     rx: Arc<Mutex<mpsc::Receiver<Job>>>,
     ring: IoUring,
     next_id: u64,
+    next_file_slot: u32,
+    registered_files: bool,
     pending: HashMap<u64, PendingUring>,
 }
 
 enum PendingUring {
     Read {
         file: Arc<File>,
+        file_slot: Option<u32>,
         frame: Frame,
         expected: usize,
         reply: oneshot::Sender<io::Result<Frame>>,
     },
     Write {
         file: Arc<File>,
+        file_slot: Option<u32>,
         data: bytes::Bytes,
         expected: usize,
         reply: oneshot::Sender<io::Result<()>>,
     },
     Sync {
         file: Arc<File>,
+        file_slot: Option<u32>,
         reply: oneshot::Sender<io::Result<()>>,
     },
 }
 
 impl UringWorker {
     fn new(rx: Arc<Mutex<mpsc::Receiver<Job>>>) -> Self {
+        let ring = IoUring::new(URING_ENTRIES).expect("create io_uring");
+        let registered_files = match ring.submitter().register_files_sparse(URING_FILE_SLOTS) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::debug!(error = %e, "io_uring fixed-file table unavailable");
+                false
+            }
+        };
         Self {
             rx,
-            ring: IoUring::new(URING_ENTRIES).expect("create io_uring"),
+            ring,
             next_id: 1,
+            next_file_slot: 0,
+            registered_files,
             pending: HashMap::new(),
         }
     }
@@ -394,15 +411,20 @@ impl UringWorker {
             } => {
                 let ptr = frame.as_mut_slice().as_mut_ptr();
                 let len = frame.len();
-                let entry = opcode::Read::new(types::Fd(file.as_raw_fd()), ptr, len as _)
-                    .offset(offset)
-                    .build()
-                    .user_data(id);
+                let file_slot = self.register_file_slot(file.as_raw_fd());
+                let entry = match file_slot {
+                    Some(slot) => opcode::Read::new(types::Fixed(slot), ptr, len as _),
+                    None => opcode::Read::new(types::Fd(file.as_raw_fd()), ptr, len as _),
+                }
+                .offset(offset)
+                .build()
+                .user_data(id);
                 self.push_entry(entry)?;
                 self.pending.insert(
                     id,
                     PendingUring::Read {
                         file,
+                        file_slot,
                         frame,
                         expected: len,
                         reply,
@@ -417,15 +439,20 @@ impl UringWorker {
             } => {
                 let ptr = data.as_ptr();
                 let len = data.len();
-                let entry = opcode::Write::new(types::Fd(file.as_raw_fd()), ptr, len as _)
-                    .offset(offset)
-                    .build()
-                    .user_data(id);
+                let file_slot = self.register_file_slot(file.as_raw_fd());
+                let entry = match file_slot {
+                    Some(slot) => opcode::Write::new(types::Fixed(slot), ptr, len as _),
+                    None => opcode::Write::new(types::Fd(file.as_raw_fd()), ptr, len as _),
+                }
+                .offset(offset)
+                .build()
+                .user_data(id);
                 self.push_entry(entry)?;
                 self.pending.insert(
                     id,
                     PendingUring::Write {
                         file,
+                        file_slot,
                         data,
                         expected: len,
                         reply,
@@ -433,15 +460,49 @@ impl UringWorker {
                 );
             }
             Job::Sync { file, reply } => {
-                let entry = opcode::Fsync::new(types::Fd(file.as_raw_fd()))
-                    .flags(types::FsyncFlags::DATASYNC)
-                    .build()
-                    .user_data(id);
+                let file_slot = self.register_file_slot(file.as_raw_fd());
+                let entry = match file_slot {
+                    Some(slot) => opcode::Fsync::new(types::Fixed(slot)),
+                    None => opcode::Fsync::new(types::Fd(file.as_raw_fd())),
+                }
+                .flags(types::FsyncFlags::DATASYNC)
+                .build()
+                .user_data(id);
                 self.push_entry(entry)?;
-                self.pending.insert(id, PendingUring::Sync { file, reply });
+                self.pending.insert(
+                    id,
+                    PendingUring::Sync {
+                        file,
+                        file_slot,
+                        reply,
+                    },
+                );
             }
         }
         Ok(())
+    }
+
+    fn register_file_slot(&mut self, fd: RawFd) -> Option<u32> {
+        if !self.registered_files {
+            return None;
+        }
+        let slot = self.next_file_slot;
+        self.next_file_slot = (self.next_file_slot + 1) % URING_FILE_SLOTS;
+        match self.ring.submitter().register_files_update(slot, &[fd]) {
+            Ok(1) => Some(slot),
+            Ok(_) => None,
+            Err(e) => {
+                tracing::debug!(slot, error = %e, "io_uring fixed-file update failed");
+                None
+            }
+        }
+    }
+
+    fn unregister_file_slot(&self, slot: Option<u32>) {
+        let Some(slot) = slot else {
+            return;
+        };
+        let _ = self.ring.submitter().register_files_update(slot, &[-1]);
     }
 
     fn push_entry(&mut self, entry: io_uring::squeue::Entry) -> io::Result<()> {
@@ -465,10 +526,12 @@ impl UringWorker {
             match pending {
                 PendingUring::Read {
                     file,
+                    file_slot,
                     frame,
                     expected,
                     reply,
                 } => {
+                    self.unregister_file_slot(file_slot);
                     let _keepalive = file;
                     let _ = reply.send(match uring_result(result) {
                         Ok(n) if n == expected => Ok(frame),
@@ -481,10 +544,12 @@ impl UringWorker {
                 }
                 PendingUring::Write {
                     file,
+                    file_slot,
                     data,
                     expected,
                     reply,
                 } => {
+                    self.unregister_file_slot(file_slot);
                     let _keepalive_file = file;
                     let _keepalive = data;
                     let _ = reply.send(match uring_result(result) {
@@ -496,7 +561,12 @@ impl UringWorker {
                         Err(e) => Err(e),
                     });
                 }
-                PendingUring::Sync { file, reply } => {
+                PendingUring::Sync {
+                    file,
+                    file_slot,
+                    reply,
+                } => {
+                    self.unregister_file_slot(file_slot);
                     let _keepalive = file;
                     let _ = reply.send(uring_result(result).map(|_| ()));
                 }

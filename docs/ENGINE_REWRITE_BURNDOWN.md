@@ -159,8 +159,8 @@ shippable and benchmarkable.
 ### Phase D — efficiency
 
 - [x] Probe-selected disk backend abstraction with explicit `auto`/`pread`/`uring` request handling and clean fallback diagnostics.
-- [x] Complete Linux `UringBackend` for positioned read/write/data-sync SQEs with batched submit/completion.
-- [ ] Extend `UringBackend` with registered fds + fixed buffers.
+- [x] Complete Linux `UringBackend` for positioned read/write/data-sync SQEs with registered file slots and batched submit/completion.
+- [ ] Extend `UringBackend` with registered fixed buffers.
 - [x] Group-commit per-device `fdatasync` barrier; fastresume watermark gated on barrier.
 - [x] Bounded post-crash recheck (only pieces written since last barrier).
 - [x] Piece-aggregated writes; hash from RAM on dedicated hashing pool; delete read-after-write verify.
