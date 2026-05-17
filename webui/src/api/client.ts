@@ -220,6 +220,42 @@ export interface StorageResponse {
   roots: StorageRoot[]
 }
 
+export interface StoragePlanRequest {
+  operation: 'move' | 'import' | 'delete'
+  source?: string | null
+  destination?: string | null
+  target?: string | null
+  bytes?: number | null
+  available_bytes?: number | null
+  hardlink_or_copy?: boolean | null
+  dry_run?: boolean | null
+  dry_run_approved?: boolean | null
+  roots?: string[] | null
+  affected_torrents?: string[] | null
+  completed_steps?: number[] | null
+}
+
+export interface StoragePlanStep {
+  action: string
+  source: string | null
+  destination: string | null
+  bytes: number
+}
+
+export interface StoragePlanView {
+  dry_run: boolean
+  can_apply: boolean
+  issues: string[]
+  steps: StoragePlanStep[]
+  rollback_steps: StoragePlanStep[]
+}
+
+export interface StoragePlanResponse {
+  operation: string
+  job_id: string | null
+  plan: StoragePlanView
+}
+
 export interface LiveStats {
   upload_speed: number
   download_speed: number
@@ -595,6 +631,12 @@ export const api = {
   },
 
   storage: (): Promise<StorageResponse> => get('/storage'),
+  storagePlan: {
+    preview: (body: StoragePlanRequest): Promise<StoragePlanResponse> =>
+      post('/storage/plan', body),
+    execute: (body: StoragePlanRequest): Promise<StoragePlanResponse> =>
+      post('/storage/execute', body),
+  },
 
   session: {
     setFeatures: (features: { dht?: boolean; pex?: boolean }): Promise<SessionFeatureResponse> =>
