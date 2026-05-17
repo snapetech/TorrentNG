@@ -4,6 +4,9 @@ This is the working ledger for migration/import and facade compatibility. It is
 source-driven: every supported client family has an upstream API or state source,
 the local implementation entry point, and explicit gaps.
 
+For the broader feature, API, field, and test backlog matrices, see
+`docs/CLIENT_COMPATIBILITY_MATRICES.md`.
+
 Primary references checked on 2026-05-17:
 
 - qBittorrent WebUI API 5.0:

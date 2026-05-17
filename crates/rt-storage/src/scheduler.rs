@@ -119,6 +119,9 @@ pub struct StorageIoStats {
     pub hash_ops: u64,
     pub preallocation_failures: u64,
     pub preallocation_fallbacks: u64,
+    pub peer_read_cache_entries: usize,
+    pub peer_read_cache_hits: u64,
+    pub peer_read_cache_misses: u64,
 }
 
 #[derive(Debug, Default)]
@@ -372,6 +375,7 @@ pub struct MountScheduler {
     io_pool: Arc<BlockingPool>,
     hash_pool: Arc<BlockingPool>,
     dirty_paths: Arc<Mutex<HashSet<PathBuf>>>,
+    peer_read_cache: Arc<Mutex<HashMap<PathBuf, PeerReadCacheEntry>>>,
     counters: Arc<StorageCounters>,
 }
 
@@ -385,6 +389,8 @@ struct StorageCounters {
     hash_ops: AtomicU64,
     preallocation_failures: AtomicU64,
     preallocation_fallbacks: AtomicU64,
+    peer_read_cache_hits: AtomicU64,
+    peer_read_cache_misses: AtomicU64,
 }
 
 impl Default for StorageCounters {
@@ -398,8 +404,17 @@ impl Default for StorageCounters {
             hash_ops: AtomicU64::new(0),
             preallocation_failures: AtomicU64::new(0),
             preallocation_fallbacks: AtomicU64::new(0),
+            peer_read_cache_hits: AtomicU64::new(0),
+            peer_read_cache_misses: AtomicU64::new(0),
         }
     }
+}
+
+#[derive(Debug)]
+struct PeerReadCacheEntry {
+    offset: u64,
+    data: bytes::Bytes,
+    last_used: Instant,
 }
 
 impl MountScheduler {
@@ -467,6 +482,7 @@ impl MountScheduler {
                 io_config.hash_queue_depth,
             )),
             dirty_paths: Arc::new(Mutex::new(HashSet::new())),
+            peer_read_cache: Arc::new(Mutex::new(HashMap::new())),
             counters: Arc::new(StorageCounters::default()),
             io_config,
         }
@@ -494,6 +510,11 @@ impl MountScheduler {
             .lock()
             .expect("dirty path mutex poisoned")
             .len();
+        let peer_read_cache_entries = self
+            .peer_read_cache
+            .lock()
+            .expect("peer read cache mutex poisoned")
+            .len();
         StorageIoStats {
             file_pool: self.file_pool.stats(),
             io_queue_depth: self.io_pool.queued(),
@@ -510,6 +531,9 @@ impl MountScheduler {
                 .counters
                 .preallocation_fallbacks
                 .load(Ordering::Relaxed),
+            peer_read_cache_entries,
+            peer_read_cache_hits: self.counters.peer_read_cache_hits.load(Ordering::Relaxed),
+            peer_read_cache_misses: self.counters.peer_read_cache_misses.load(Ordering::Relaxed),
         }
     }
 
@@ -576,20 +600,51 @@ impl MountScheduler {
         let _permit = self.acquire(class).await?;
         let pool = self.file_pool.clone();
         let counters = self.counters.clone();
+        let peer_read_cache = self.peer_read_cache.clone();
+        let readahead_bytes = self.io_config.peer_read_readahead_bytes;
         let path = path.to_path_buf();
         self.submit(move || {
             let key = normalized_key(&path);
             let path_str = key.display().to_string();
+            if class == IoClass::PeerRead && readahead_bytes > len {
+                if let Some(bytes) = peer_read_cache_hit(&peer_read_cache, &key, offset, len) {
+                    counters
+                        .peer_read_cache_hits
+                        .fetch_add(1, Ordering::Relaxed);
+                    counters.read_ops_by_class[class_index(class)].fetch_add(1, Ordering::Relaxed);
+                    counters.bytes_read_by_class[class_index(class)]
+                        .fetch_add(len as u64, Ordering::Relaxed);
+                    return Ok(bytes);
+                }
+                counters
+                    .peer_read_cache_misses
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             let file = pool.get_or_open(&key, OpenMode::Read, false)?;
-            let mut buf = vec![0u8; len];
+            let read_len = if class == IoClass::PeerRead && readahead_bytes > len {
+                let file_len = file
+                    .metadata()
+                    .map_err(|e| StorageError::io(&path_str, e))?
+                    .len();
+                if offset >= file_len {
+                    len
+                } else {
+                    readahead_bytes
+                        .min(file_len.saturating_sub(offset) as usize)
+                        .max(len)
+                }
+            } else {
+                len
+            };
+            let mut buf = vec![0u8; read_len];
             let mut read = 0usize;
-            while read < len {
+            while read < read_len {
                 let n = positioned_read(&file, &mut buf[read..], offset + read as u64)
                     .map_err(|e| StorageError::io(&path_str, e))?;
                 if n == 0 {
                     return Err(StorageError::ShortIo {
                         path: path_str,
-                        expected: len,
+                        expected: read_len,
                         actual: read,
                     });
                 }
@@ -598,7 +653,14 @@ impl MountScheduler {
             counters.read_ops_by_class[class_index(class)].fetch_add(1, Ordering::Relaxed);
             counters.bytes_read_by_class[class_index(class)]
                 .fetch_add(read as u64, Ordering::Relaxed);
-            Ok(bytes::Bytes::from(buf))
+            let bytes = bytes::Bytes::from(buf);
+            if class == IoClass::PeerRead && read_len > len {
+                let exact = bytes.slice(..len);
+                peer_read_cache_store(&peer_read_cache, key, offset, bytes);
+                Ok(exact)
+            } else {
+                Ok(bytes)
+            }
         })
         .await
     }
@@ -806,6 +868,51 @@ fn class_index(class: IoClass) -> usize {
 
 fn load_atomic_array(values: &[AtomicU64; 6]) -> [u64; 6] {
     std::array::from_fn(|index| values[index].load(Ordering::Relaxed))
+}
+
+fn peer_read_cache_hit(
+    cache: &Mutex<HashMap<PathBuf, PeerReadCacheEntry>>,
+    key: &Path,
+    offset: u64,
+    len: usize,
+) -> Option<bytes::Bytes> {
+    let mut cache = cache.lock().expect("peer read cache mutex poisoned");
+    let entry = cache.get_mut(key)?;
+    let relative = offset.checked_sub(entry.offset)? as usize;
+    let end = relative.checked_add(len)?;
+    if end <= entry.data.len() {
+        entry.last_used = Instant::now();
+        Some(entry.data.slice(relative..end))
+    } else {
+        None
+    }
+}
+
+fn peer_read_cache_store(
+    cache: &Mutex<HashMap<PathBuf, PeerReadCacheEntry>>,
+    key: PathBuf,
+    offset: u64,
+    data: bytes::Bytes,
+) {
+    const MAX_PEER_READ_CACHE_ENTRIES: usize = 64;
+    let mut cache = cache.lock().expect("peer read cache mutex poisoned");
+    if cache.len() >= MAX_PEER_READ_CACHE_ENTRIES {
+        if let Some(evict) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(key, _)| key.clone())
+        {
+            cache.remove(&evict);
+        }
+    }
+    cache.insert(
+        key,
+        PeerReadCacheEntry {
+            offset,
+            data,
+            last_used: Instant::now(),
+        },
+    );
 }
 
 fn clamp_file_pool_size(configured: usize) -> usize {
@@ -1075,5 +1182,41 @@ mod tests {
         assert_eq!(stats.hash_ops, 1);
         assert_eq!(stats.sync_ops, 1);
         assert_eq!(stats.dirty_files, 0);
+    }
+
+    #[tokio::test]
+    async fn peer_read_readahead_cache_returns_exact_requested_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("readahead.bin");
+        std::fs::write(&path, b"abcdefghijklmnopqrstuvwxyz").unwrap();
+        let sched = MountScheduler::new(
+            StorageRootId::new(),
+            &SchedulerConfig {
+                profile: StorageProfile::Hdd,
+                storage_io: StorageIoConfig {
+                    peer_read_readahead_bytes: 16,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let first = scheduled_read(&sched, IoClass::PeerRead, &path, 0, 4)
+            .await
+            .unwrap();
+        assert_eq!(&first[..], b"abcd");
+        let second = scheduled_read(&sched, IoClass::PeerRead, &path, 4, 4)
+            .await
+            .unwrap();
+        assert_eq!(&second[..], b"efgh");
+
+        let stats = sched.stats();
+        assert_eq!(stats.peer_read_cache_misses, 1);
+        assert_eq!(stats.peer_read_cache_hits, 1);
+        assert_eq!(stats.peer_read_cache_entries, 1);
+        assert_eq!(
+            stats.bytes_read_by_class[class_index(IoClass::PeerRead)],
+            20
+        );
     }
 }

@@ -22,6 +22,8 @@ scheduler used by the native engine.
   fastresume trust conditional on configured durability.
 - `StorageIoStats` exposes file-pool, queue, dirty-file, preallocation, sync,
   hash, and bytes-by-class counters for metrics integration.
+- `IoClass::PeerRead` can read ahead into a small per-file cache while returning
+  exactly the requested block bytes to the caller.
 
 ## Correctness Expectations
 

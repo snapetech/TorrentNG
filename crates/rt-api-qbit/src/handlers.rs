@@ -2900,72 +2900,248 @@ mod tests {
     #[tokio::test]
     async fn qbit_alias_and_broad_compat_routes_are_registered() {
         let app = build_qbit_router(AppState::new());
-        for path in [
-            "/api/v2/app/version",
-            "/api/qb/v2/auth/logout",
-            "/api/qb/v2/app/sendTestEmail",
-            "/api/qb/v2/torrents/start",
-            "/api/qb/v2/torrents/stop",
-            "/api/qb/v2/torrents/filePrio",
-            "/api/qb/v2/torrents/addTrackers",
-            "/api/qb/v2/torrents/addPeers",
-            "/api/qb/v2/torrents/removeTrackers",
-            "/api/qb/v2/torrents/renameFile",
-            "/api/qb/v2/torrents/renameFolder",
-            "/api/qb/v2/torrents/setSavePath",
-            "/api/qb/v2/torrents/setAutoManagement",
-            "/api/qb/v2/torrents/setAutoTMM",
-            "/api/qb/v2/torrents/toggleSequentialDownload",
-            "/api/qb/v2/transfer/toggleSpeedLimitsMode",
-            "/api/qb/v2/transfer/banPeers",
-            "/api/qb/v2/search/installPlugin",
-            "/api/qb/v2/search/uninstallPlugin",
-            "/api/qb/v2/search/enablePlugin",
-            "/api/qb/v2/search/updatePlugins",
-            "/api/qb/v2/search/start",
-            "/api/qb/v2/search/delete",
-            "/api/qb/v2/rss/addFeed",
-        ] {
+        for (method, path, body) in qbit_route_matrix() {
             let resp = app
                 .clone()
                 .oneshot(
                     Request::builder()
-                        .method("POST")
+                        .method(method)
                         .uri(path)
                         .header("content-type", "application/x-www-form-urlencoded")
-                        .body(Body::from("hashes=all"))
+                        .body(Body::from(body))
                         .unwrap(),
                 )
                 .await
                 .unwrap();
             assert_ne!(resp.status(), StatusCode::NOT_FOUND, "{path}");
+            assert_ne!(resp.status(), StatusCode::METHOD_NOT_ALLOWED, "{path}");
         }
+    }
 
-        for path in [
-            "/api/v2/app/webapiVersion",
-            "/api/qb/v2/app/networkInterfaceList",
-            "/api/qb/v2/app/networkInterfaceAddressList",
-            "/api/qb/v2/torrents/webseeds",
-            "/api/qb/v2/torrents/pieceStates",
-            "/api/qb/v2/torrents/pieceHashes",
-            "/api/qb/v2/torrents/export",
-            "/api/qb/v2/torrents/downloadLimit",
-            "/api/qb/v2/torrents/uploadLimit",
-            "/api/qb/v2/sync/torrentPeers",
-            "/api/qb/v2/log/main",
-            "/api/qb/v2/log/peers",
-            "/api/qb/v2/search/status",
-            "/api/qb/v2/search/categories",
-            "/api/qb/v2/transfer/speedLimitsMode",
-            "/api/qb/v2/rss/items",
-        ] {
-            let resp = app
-                .clone()
-                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(resp.status(), StatusCode::OK, "{path}");
-        }
+    fn qbit_route_matrix() -> Vec<(&'static str, &'static str, &'static str)> {
+        vec![
+            ("POST", "/api/qb/v2/auth/login", ""),
+            ("POST", "/api/qb/v2/auth/logout", ""),
+            ("GET", "/api/qb/v2/app/version", ""),
+            ("GET", "/api/qb/v2/app/webapiVersion", ""),
+            ("GET", "/api/qb/v2/app/buildInfo", ""),
+            ("GET", "/api/qb/v2/app/preferences", ""),
+            ("POST", "/api/qb/v2/app/setPreferences", "json={}"),
+            ("POST", "/api/qb/v2/app/shutdown", ""),
+            ("POST", "/api/qb/v2/app/sendTestEmail", ""),
+            ("GET", "/api/qb/v2/app/getCookies", ""),
+            ("POST", "/api/qb/v2/app/setCookies", "cookies=[]"),
+            ("GET", "/api/qb/v2/app/networkInterfaceList", ""),
+            ("GET", "/api/qb/v2/app/networkInterfaceAddressList", ""),
+            ("GET", "/api/qb/v2/app/defaultSavePath", ""),
+            ("GET", "/api/qb/v2/torrents/info", ""),
+            ("POST", "/api/qb/v2/torrents/add", ""),
+            ("POST", "/api/qb/v2/torrents/pause", "hashes=all"),
+            ("POST", "/api/qb/v2/torrents/resume", "hashes=all"),
+            ("POST", "/api/qb/v2/torrents/start", "hashes=all"),
+            ("POST", "/api/qb/v2/torrents/stop", "hashes=all"),
+            ("POST", "/api/qb/v2/torrents/delete", "hashes=all"),
+            ("POST", "/api/qb/v2/torrents/reannounce", "hashes=all"),
+            ("POST", "/api/qb/v2/torrents/recheck", "hashes=all"),
+            ("GET", "/api/qb/v2/torrents/trackers", ""),
+            (
+                "POST",
+                "/api/qb/v2/torrents/addTrackers",
+                "hash=a&urls=http://tracker/announce",
+            ),
+            (
+                "POST",
+                "/api/qb/v2/torrents/editTracker",
+                "hash=a&origUrl=http://a&newUrl=http://b",
+            ),
+            (
+                "POST",
+                "/api/qb/v2/torrents/removeTrackers",
+                "hash=a&urls=http://a",
+            ),
+            (
+                "POST",
+                "/api/qb/v2/torrents/addPeers",
+                "hashes=a&peers=127.0.0.1:6881",
+            ),
+            ("GET", "/api/qb/v2/torrents/files", ""),
+            ("GET", "/api/qb/v2/torrents/webseeds", ""),
+            ("GET", "/api/qb/v2/torrents/pieceStates", ""),
+            ("GET", "/api/qb/v2/torrents/pieceHashes", ""),
+            ("GET", "/api/qb/v2/torrents/export", ""),
+            (
+                "POST",
+                "/api/qb/v2/torrents/filePrio",
+                "hash=a&id=0&priority=1",
+            ),
+            ("POST", "/api/qb/v2/torrents/increasePrio", "hashes=all"),
+            ("POST", "/api/qb/v2/torrents/decreasePrio", "hashes=all"),
+            ("POST", "/api/qb/v2/torrents/topPrio", "hashes=all"),
+            ("POST", "/api/qb/v2/torrents/bottomPrio", "hashes=all"),
+            ("GET", "/api/qb/v2/torrents/properties", ""),
+            ("GET", "/api/qb/v2/torrents/categories", ""),
+            ("GET", "/api/qb/v2/torrents/tags", ""),
+            ("POST", "/api/qb/v2/torrents/rename", "hash=a&name=b"),
+            (
+                "POST",
+                "/api/qb/v2/torrents/renameFile",
+                "hash=a&oldPath=a&newPath=b",
+            ),
+            (
+                "POST",
+                "/api/qb/v2/torrents/renameFolder",
+                "hash=a&oldPath=a&newPath=b",
+            ),
+            (
+                "POST",
+                "/api/qb/v2/torrents/setLocation",
+                "hashes=all&location=/tmp",
+            ),
+            (
+                "POST",
+                "/api/qb/v2/torrents/setSavePath",
+                "hashes=all&savePath=/tmp",
+            ),
+            (
+                "POST",
+                "/api/qb/v2/torrents/setCategory",
+                "hashes=all&category=test",
+            ),
+            (
+                "POST",
+                "/api/qb/v2/torrents/createCategory",
+                "category=test",
+            ),
+            (
+                "POST",
+                "/api/qb/v2/torrents/editCategory",
+                "category=test&savePath=/tmp",
+            ),
+            (
+                "POST",
+                "/api/qb/v2/torrents/removeCategories",
+                "categories=test",
+            ),
+            ("POST", "/api/qb/v2/torrents/addTags", "hashes=all&tags=a,b"),
+            ("POST", "/api/qb/v2/torrents/setTags", "hashes=all&tags=a,b"),
+            (
+                "POST",
+                "/api/qb/v2/torrents/removeTags",
+                "hashes=all&tags=a,b",
+            ),
+            ("POST", "/api/qb/v2/torrents/createTags", "tags=a,b"),
+            ("POST", "/api/qb/v2/torrents/deleteTags", "tags=a,b"),
+            ("GET", "/api/qb/v2/torrents/downloadLimit", ""),
+            (
+                "POST",
+                "/api/qb/v2/torrents/setDownloadLimit",
+                "hashes=all&limit=0",
+            ),
+            ("GET", "/api/qb/v2/torrents/uploadLimit", ""),
+            (
+                "POST",
+                "/api/qb/v2/torrents/setUploadLimit",
+                "hashes=all&limit=0",
+            ),
+            (
+                "POST",
+                "/api/qb/v2/torrents/setShareLimits",
+                "hashes=all&ratioLimit=-2&seedingTimeLimit=-2",
+            ),
+            (
+                "POST",
+                "/api/qb/v2/torrents/setForceStart",
+                "hashes=all&value=false",
+            ),
+            (
+                "POST",
+                "/api/qb/v2/torrents/setSuperSeeding",
+                "hashes=all&value=false",
+            ),
+            (
+                "POST",
+                "/api/qb/v2/torrents/setAutoTMM",
+                "hashes=all&enable=false",
+            ),
+            (
+                "POST",
+                "/api/qb/v2/torrents/setAutoManagement",
+                "hashes=all&enable=false",
+            ),
+            (
+                "POST",
+                "/api/qb/v2/torrents/toggleSequentialDownload",
+                "hashes=all",
+            ),
+            (
+                "POST",
+                "/api/qb/v2/torrents/toggleFirstLastPiecePrio",
+                "hashes=all",
+            ),
+            ("GET", "/api/qb/v2/sync/maindata", ""),
+            ("GET", "/api/qb/v2/sync/torrentPeers", ""),
+            ("GET", "/api/qb/v2/transfer/info", ""),
+            ("GET", "/api/qb/v2/transfer/downloadLimit", ""),
+            ("GET", "/api/qb/v2/transfer/uploadLimit", ""),
+            ("GET", "/api/qb/v2/transfer/speedLimitsMode", ""),
+            ("POST", "/api/qb/v2/transfer/toggleSpeedLimitsMode", ""),
+            ("POST", "/api/qb/v2/transfer/setDownloadLimit", "limit=0"),
+            ("POST", "/api/qb/v2/transfer/setUploadLimit", "limit=0"),
+            (
+                "POST",
+                "/api/qb/v2/transfer/banPeers",
+                "peers=127.0.0.1:6881",
+            ),
+            ("GET", "/api/qb/v2/log/main", ""),
+            ("GET", "/api/qb/v2/log/peers", ""),
+            ("GET", "/api/qb/v2/search/status", ""),
+            ("GET", "/api/qb/v2/search/categories", ""),
+            ("GET", "/api/qb/v2/search/plugins", ""),
+            ("POST", "/api/qb/v2/search/installPlugin", "sources="),
+            ("POST", "/api/qb/v2/search/uninstallPlugin", "names="),
+            (
+                "POST",
+                "/api/qb/v2/search/enablePlugin",
+                "names=&enable=true",
+            ),
+            ("POST", "/api/qb/v2/search/updatePlugins", ""),
+            (
+                "POST",
+                "/api/qb/v2/search/start",
+                "pattern=test&plugins=all&category=all",
+            ),
+            ("POST", "/api/qb/v2/search/stop", "id=0"),
+            ("GET", "/api/qb/v2/search/results", ""),
+            ("POST", "/api/qb/v2/search/delete", "id=0"),
+            ("GET", "/api/qb/v2/rss/items", ""),
+            ("GET", "/api/qb/v2/rss/rules", ""),
+            ("GET", "/api/qb/v2/rss/matchingArticles", ""),
+            ("POST", "/api/qb/v2/rss/addFolder", "path=test"),
+            (
+                "POST",
+                "/api/qb/v2/rss/addFeed",
+                "url=http://example.com/feed&path=test",
+            ),
+            ("POST", "/api/qb/v2/rss/removeItem", "path=test"),
+            (
+                "POST",
+                "/api/qb/v2/rss/moveItem",
+                "itemPath=test&destPath=dest",
+            ),
+            (
+                "POST",
+                "/api/qb/v2/rss/markAsRead",
+                "itemPath=test&articleId=all",
+            ),
+            ("POST", "/api/qb/v2/rss/refreshItem", "itemPath=test"),
+            ("POST", "/api/qb/v2/rss/setRule", "ruleName=test&ruleDef={}"),
+            (
+                "POST",
+                "/api/qb/v2/rss/renameRule",
+                "ruleName=test&newRuleName=test2",
+            ),
+            ("POST", "/api/qb/v2/rss/removeRule", "ruleName=test"),
+        ]
     }
 
     #[tokio::test]

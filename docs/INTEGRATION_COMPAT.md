@@ -7,6 +7,9 @@ rtorrentNG has compatibility coverage for both runtime modes:
   `rt-api-transmission`, and `rt-api-deluge`, included in
   `scripts/native_engine_certification_report.sh`.
 
+The build backlog and source-to-implementation comparison live in
+`docs/CLIENT_COMPATIBILITY_MATRICES.md`.
+
 ## Track 1 Sidecar Flows
 
 Current named flows:

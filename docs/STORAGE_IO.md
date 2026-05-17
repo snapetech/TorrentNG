@@ -56,6 +56,9 @@ semaphores:
 - `StorageIoStats` exposes file-pool counters, queue depths, dirty file count,
   bytes and operations by `IoClass`, sync count, hash count, and preallocation
   fallback/failure counters.
+- `IoClass::PeerRead` uses a small internal readahead cache when configured:
+  the backend may read ahead within the same file, but callers receive exactly
+  the requested byte range.
 
 `TorrentTask` keeps a per-file preparation registry so parent directories and
 file allocation are no longer in the per-block hot path.
@@ -76,8 +79,8 @@ The following items are still implementation targets:
   latency histograms for read/write/sync/hash work.
 - Verify completed pieces from assembled in-memory download data before falling
   back to disk re-read.
-- Add peer-read readahead/coalescing for adjacent requests while returning exact
-  requested bytes to peer-wire callers.
+- Promote peer-read locality from per-file readahead cache to a true
+  cross-torrent device elevator that coalesces adjacent requests.
 - Add benchmarks comparing syscall count, seed-read locality, recheck runtime
   progress, and bounded descriptor use under active file counts above pool
   capacity.

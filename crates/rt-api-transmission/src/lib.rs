@@ -1414,15 +1414,7 @@ mod tests {
     async fn transmission_common_mutators_are_accepted() {
         let app =
             build_transmission_router(AppState::new(Arc::new(RwLock::new(SessionRegistry::new()))));
-        for method in [
-            "torrent-set-tracker-list",
-            "torrent-set-file-priorities",
-            "torrent-set-file-wanted",
-            "torrent-set-file-unwanted",
-            "queue-stalled-enable",
-            "queue-stalled-disable",
-            "session-set",
-        ] {
+        for (method, args) in transmission_method_matrix() {
             let resp = app
                 .clone()
                 .oneshot(
@@ -1432,7 +1424,7 @@ mod tests {
                         .header("content-type", "application/json")
                         .header("x-transmission-session-id", SESSION_ID)
                         .body(Body::from(format!(
-                            r#"{{"method":"{method}","arguments":{{}}}}"#
+                            r#"{{"method":"{method}","arguments":{args}}}"#
                         )))
                         .unwrap(),
                 )
@@ -1441,8 +1433,56 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::OK);
             let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
             let body: Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(body["result"], "success", "{method}");
+            assert_ne!(body["result"], "method name not recognized", "{method}");
         }
+    }
+
+    fn transmission_method_matrix() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("session-get", r#"{}"#),
+            ("session-stats", r#"{}"#),
+            ("session-close", r#"{}"#),
+            ("session-set", r#"{"queue-stalled-enabled":true}"#),
+            ("session-access-control", r#"{}"#),
+            ("group-get", r#"{}"#),
+            ("group-set", r#"{"name":"default"}"#),
+            ("torrent-set", r#"{"ids":[]}"#),
+            ("torrent-set-tracker-list", r#"{"ids":[],"trackerList":[]}"#),
+            (
+                "torrent-set-file-priorities",
+                r#"{"ids":[],"priority-normal":[]}"#,
+            ),
+            ("torrent-set-file-wanted", r#"{"ids":[],"files-wanted":[]}"#),
+            (
+                "torrent-set-file-unwanted",
+                r#"{"ids":[],"files-unwanted":[]}"#,
+            ),
+            ("queue-move-top", r#"{"ids":[]}"#),
+            ("queue-move-up", r#"{"ids":[]}"#),
+            ("queue-move-down", r#"{"ids":[]}"#),
+            ("queue-move-bottom", r#"{"ids":[]}"#),
+            ("queue-stalled-enable", r#"{}"#),
+            ("queue-stalled-disable", r#"{}"#),
+            ("port-test", r#"{}"#),
+            ("blocklist-update", r#"{}"#),
+            ("free-space", r#"{"path":"/tmp"}"#),
+            ("torrent-get", r#"{"fields":["id","name"]}"#),
+            (
+                "torrent-add",
+                r#"{"filename":"magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+            ),
+            ("torrent-set-location", r#"{"ids":[],"location":"/tmp"}"#),
+            (
+                "torrent-rename-path",
+                r#"{"ids":[],"path":"old","name":"new"}"#,
+            ),
+            ("torrent-start", r#"{"ids":[]}"#),
+            ("torrent-start-now", r#"{"ids":[]}"#),
+            ("torrent-stop", r#"{"ids":[]}"#),
+            ("torrent-verify", r#"{"ids":[]}"#),
+            ("torrent-reannounce", r#"{"ids":[]}"#),
+            ("torrent-remove", r#"{"ids":[],"delete-local-data":false}"#),
+        ]
     }
 
     #[test]

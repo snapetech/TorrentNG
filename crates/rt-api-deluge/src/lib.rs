@@ -1215,32 +1215,17 @@ mod tests {
     #[tokio::test]
     async fn deluge_auth_and_config_are_supported() {
         let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        {
+            let mut reg = registry.write().await;
+            reg.add(TorrentEntry::new(
+                "a".repeat(40),
+                "alpha".into(),
+                "/data".into(),
+            ))
+            .unwrap();
+        }
         let app = build_deluge_router(AppState::new(registry));
-        for method in [
-            "auth.login",
-            "daemon.info",
-            "daemon.get_method_list",
-            "web.connected",
-            "core.get_config",
-            "core.get_session_state",
-            "core.get_session_status",
-            "core.get_listen_port",
-            "core.get_external_ip",
-            "core.get_cache_status",
-            "core.get_available_plugins",
-            "core.get_libtorrent_version",
-            "core.queue_top",
-            "core.queue_up",
-            "core.queue_down",
-            "core.queue_bottom",
-            "core.set_torrent_file_priorities",
-            "core.set_torrent_trackers",
-            "core.get_torrent_file_status",
-            "web.get_plugins",
-            "web.get_plugin_info",
-            "notifications.get_handled_events",
-            "notifications.get_subscriptions",
-        ] {
+        for (method, params) in deluge_method_matrix() {
             let resp = app
                 .clone()
                 .oneshot(
@@ -1249,7 +1234,7 @@ mod tests {
                         .uri("/deluge/json")
                         .header("content-type", "application/json")
                         .body(Body::from(format!(
-                            r#"{{"id":1,"method":"{method}","params":[]}}"#
+                            r#"{{"id":1,"method":"{method}","params":{params}}}"#
                         )))
                         .unwrap(),
                 )
@@ -1258,12 +1243,161 @@ mod tests {
             assert!(resp.status().is_success());
             let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
             let body: Value = serde_json::from_slice(&body).unwrap();
-            assert!(
-                body["error"].is_null(),
-                "{method} returned {:?}",
-                body["error"]
-            );
+            if let Some(message) = body["error"].get("message").and_then(Value::as_str) {
+                assert!(
+                    !message.starts_with("unsupported method"),
+                    "{method} returned {:?}",
+                    body["error"]
+                );
+            }
         }
+    }
+
+    #[tokio::test]
+    async fn deluge_advertised_method_list_matches_probe_matrix() {
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        let app = build_deluge_router(AppState::new(registry));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/deluge/json")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"id":1,"method":"daemon.get_method_list","params":[]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 16384).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        let mut advertised = body["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        advertised.sort_unstable();
+        let mut probed = deluge_method_matrix()
+            .into_iter()
+            .map(|(method, _)| method)
+            .collect::<Vec<_>>();
+        probed.sort_unstable();
+        assert_eq!(advertised, probed);
+    }
+
+    fn deluge_method_matrix() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("auth.login", r#"[]"#),
+            ("auth.check_session", r#"[]"#),
+            ("daemon.login", r#"[]"#),
+            ("daemon.info", r#"[]"#),
+            ("daemon.get_method_list", r#"[]"#),
+            ("daemon.shutdown", r#"[]"#),
+            ("web.connected", r#"[]"#),
+            ("web.update_ui", r#"[[],{}]"#),
+            ("web.get_events", r#"[]"#),
+            ("web.get_hosts", r#"[]"#),
+            ("web.get_host_status", r#"[]"#),
+            ("web.connect", r#"[]"#),
+            ("web.disconnect", r#"[]"#),
+            ("web.start_daemon", r#"[]"#),
+            ("web.stop_daemon", r#"[]"#),
+            ("web.get_plugins", r#"[]"#),
+            ("web.get_plugin_info", r#"["Label"]"#),
+            ("web.upload_plugin", r#"[]"#),
+            ("web.update_config", r#"[{}]"#),
+            ("web.save_config", r#"[]"#),
+            (
+                "web.get_torrent_files",
+                r#"["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]"#,
+            ),
+            ("core.get_torrents_status", r#"[{},[]]"#),
+            (
+                "core.get_torrent_status",
+                r#"["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",[]]"#,
+            ),
+            ("core.get_torrent_file_status", r#"[]"#),
+            ("core.get_session_state", r#"[]"#),
+            ("core.get_session_status", r#"[]"#),
+            ("core.get_stats", r#"[]"#),
+            ("core.get_num_connections", r#"[]"#),
+            ("core.get_download_rate", r#"[]"#),
+            ("core.get_upload_rate", r#"[]"#),
+            ("core.get_filter_tree", r#"[]"#),
+            ("core.pause_torrent", r#"[[]]"#),
+            ("core.resume_torrent", r#"[[]]"#),
+            ("core.force_recheck", r#"[[]]"#),
+            ("core.queue_top", r#"[[]]"#),
+            ("core.queue_up", r#"[[]]"#),
+            ("core.queue_down", r#"[[]]"#),
+            ("core.queue_bottom", r#"[[]]"#),
+            (
+                "core.remove_torrent",
+                r#"["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",false]"#,
+            ),
+            (
+                "core.add_torrent_magnet",
+                r#"["magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",{}]"#,
+            ),
+            ("core.add_torrent_file", r#"["test.torrent","",{}]"#),
+            ("core.set_torrent_options", r#"[[],{}]"#),
+            (
+                "core.set_torrent_file_priorities",
+                r#"["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",[]]"#,
+            ),
+            (
+                "core.set_torrent_trackers",
+                r#"["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",[]]"#,
+            ),
+            ("core.set_torrent_prioritize_first_last", r#"[[],false]"#),
+            (
+                "core.connect_peer",
+                r#"["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","127.0.0.1",6881]"#,
+            ),
+            (
+                "core.rename_files",
+                r#"["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",[]]"#,
+            ),
+            (
+                "core.rename_folder",
+                r#"["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","old","new"]"#,
+            ),
+            ("core.move_storage", r#"[[],"/tmp"]"#),
+            ("core.get_config", r#"[]"#),
+            ("core.get_config_values", r#"[["download_location"]]"#),
+            ("core.get_config_value", r#"["download_location"]"#),
+            ("core.set_config", r#"[{}]"#),
+            ("core.get_free_space", r#"[]"#),
+            ("core.get_listen_port", r#"[]"#),
+            ("core.get_external_ip", r#"[]"#),
+            ("core.get_path_size", r#"["/tmp"]"#),
+            ("core.get_cache_status", r#"[]"#),
+            ("core.get_enabled_plugins", r#"[]"#),
+            ("core.enable_plugin", r#"["Label"]"#),
+            ("core.disable_plugin", r#"["Label"]"#),
+            ("core.get_available_plugins", r#"[]"#),
+            ("core.get_libtorrent_version", r#"[]"#),
+            ("core.create_torrent", r#"[]"#),
+            ("core.upload_plugin", r#"[]"#),
+            ("core.rescan_plugins", r#"[]"#),
+            ("label.get_labels", r#"[]"#),
+            ("label.add", r#"["test"]"#),
+            ("label.remove", r#"["test"]"#),
+            ("label.set_options", r#"["test",{}]"#),
+            (
+                "label.set_torrent",
+                r#"["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","test"]"#,
+            ),
+            ("notifications.get_handled_events", r#"[]"#),
+            ("notifications.get_subscriptions", r#"[]"#),
+            ("notifications.set_config", r#"[{}]"#),
+            (
+                "notifications.add_subscription",
+                r#"["TorrentAddedEvent","email"]"#,
+            ),
+        ]
     }
 
     #[tokio::test]
