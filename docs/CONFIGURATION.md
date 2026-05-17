@@ -47,7 +47,17 @@ RUSTTORRENTD_CONFIG=/config/config.toml rusttorrentd
 |---|---|---|
 | `download_dir` | `~/Downloads` or `/tmp` | Default payload download directory |
 | `device_elevator_enabled` | `true` | Enable per-device peer-read elevator scheduling where storage profiles benefit |
+| `file_pool_size` | `512` | Open-file cache entries per scheduler |
+| `idle_file_ttl_secs` | `300` | Seconds before idle cached file handles are eligible to close |
+| `io_worker_threads` | `4` | Dedicated positioned-I/O worker threads per scheduler |
+| `io_queue_depth` | `256` | Bounded positioned-I/O queue depth per scheduler |
+| `hash_worker_threads` | `2` | Dedicated storage hash worker threads per scheduler |
+| `hash_queue_depth` | `256` | Bounded hash queue depth per scheduler |
+| `preallocation_mode` | `auto` | Payload preallocation mode: `off`, `auto`, `sparse`, or `full` |
+| `durability_mode` | `checkpoint` | Payload durability mode: `fast`, `checkpoint`, or `strict` |
+| `peer_read_readahead_bytes` | `524288` | Peer-read readahead size used before returning the exact requested slice |
 | `peer_read_cache_entries` | `64` | Bounded per-scheduler peer-read readahead cache entries; set to `0` to disable cached readahead reuse |
+| `peer_read_elevator_budget_ms` | `25` | HDD/network peer-read elevator batching window; ignored when `device_elevator_enabled = false` |
 
 ### `[memory]`
 
@@ -145,6 +155,9 @@ download_rate_limit = 0
 
 [storage]
 download_dir = "/data"
+preallocation_mode = "auto"
+durability_mode = "checkpoint"
+peer_read_cache_entries = 64
 
 [tracker]
 http_timeout_secs = 30
@@ -208,7 +221,7 @@ Environment variables override file values where listed.
 
 When enabled, the sidecar tails configured rTorrent log files and stores new lines as durable `rtorrent_log` app events. These entries are returned by qBittorrent-compatible `/api/v2/log/main` alongside sidecar app events. Ingested lines are redacted before storage: magnet URIs, common token query parameters, cookies, and full filesystem paths are removed or shortened.
 
-By default, ingestion starts at the end of each file to avoid flooding `/log/main` with old logs on restart. Set `read_from_start = true` only for controlled imports.
+By default, first-time ingestion starts at the end of each file to avoid flooding `/log/main` with old logs. The sidecar persists per-file offsets in its cache DB, so subsequent restarts continue from the last ingested byte and capture lines written while the sidecar was down. Set `read_from_start = true` only for controlled imports.
 
 | Key | Default | Env override | Description |
 |---|---|---|---|

@@ -61,8 +61,35 @@ pub struct StorageConfig {
     pub download_dir: PathBuf,
     /// Enable per-device peer-read elevator scheduling where storage profiles benefit.
     pub device_elevator_enabled: bool,
+    pub file_pool_size: usize,
+    pub idle_file_ttl_secs: u64,
+    pub io_worker_threads: usize,
+    pub io_queue_depth: usize,
+    pub hash_worker_threads: usize,
+    pub hash_queue_depth: usize,
+    pub preallocation_mode: StoragePreallocationMode,
+    pub durability_mode: StorageDurabilityMode,
+    pub peer_read_readahead_bytes: usize,
     /// Bounded peer-read readahead cache entries per torrent scheduler.
     pub peer_read_cache_entries: usize,
+    pub peer_read_elevator_budget_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StoragePreallocationMode {
+    Off,
+    Auto,
+    Sparse,
+    Full,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageDurabilityMode {
+    Fast,
+    Checkpoint,
+    Strict,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,7 +175,17 @@ impl Default for StorageConfig {
         StorageConfig {
             download_dir: dirs_default_download(),
             device_elevator_enabled: true,
+            file_pool_size: 512,
+            idle_file_ttl_secs: 300,
+            io_worker_threads: 4,
+            io_queue_depth: 256,
+            hash_worker_threads: 2,
+            hash_queue_depth: 256,
+            preallocation_mode: StoragePreallocationMode::Auto,
+            durability_mode: StorageDurabilityMode::Checkpoint,
+            peer_read_readahead_bytes: 512 * 1024,
             peer_read_cache_entries: 64,
+            peer_read_elevator_budget_ms: 25,
         }
     }
 }
@@ -295,7 +332,17 @@ mod tests {
         assert_eq!(c.memory.queued_disk_cap_mb, 64);
         assert!(c.runtime.torrent_tiers_enabled);
         assert!(c.storage.device_elevator_enabled);
+        assert_eq!(c.storage.file_pool_size, 512);
+        assert_eq!(c.storage.idle_file_ttl_secs, 300);
+        assert_eq!(c.storage.io_worker_threads, 4);
+        assert_eq!(c.storage.io_queue_depth, 256);
+        assert_eq!(c.storage.hash_worker_threads, 2);
+        assert_eq!(c.storage.hash_queue_depth, 256);
+        assert_eq!(c.storage.preallocation_mode, StoragePreallocationMode::Auto);
+        assert_eq!(c.storage.durability_mode, StorageDurabilityMode::Checkpoint);
+        assert_eq!(c.storage.peer_read_readahead_bytes, 512 * 1024);
         assert_eq!(c.storage.peer_read_cache_entries, 64);
+        assert_eq!(c.storage.peer_read_elevator_budget_ms, 25);
         assert_eq!(c.logging, rt_logging::LoggingConfig::default());
     }
 
@@ -326,7 +373,17 @@ max_peers = 500
 api_tokens = ["one", "two"]
 
 [storage]
+file_pool_size = 99
+idle_file_ttl_secs = 12
+io_worker_threads = 3
+io_queue_depth = 77
+hash_worker_threads = 4
+hash_queue_depth = 88
+preallocation_mode = "sparse"
+durability_mode = "strict"
+peer_read_readahead_bytes = 131072
 peer_read_cache_entries = 17
+peer_read_elevator_budget_ms = 9
 "#;
         let c: Config = toml::from_str(toml).unwrap();
         assert_eq!(c.network.listen_port, 51413);
@@ -335,7 +392,20 @@ peer_read_cache_entries = 17
         assert_eq!(c.tracker.http_timeout_secs, 30);
         assert!(c.dht.enabled);
         assert_eq!(c.auth.api_tokens, vec!["one", "two"]);
+        assert_eq!(c.storage.file_pool_size, 99);
+        assert_eq!(c.storage.idle_file_ttl_secs, 12);
+        assert_eq!(c.storage.io_worker_threads, 3);
+        assert_eq!(c.storage.io_queue_depth, 77);
+        assert_eq!(c.storage.hash_worker_threads, 4);
+        assert_eq!(c.storage.hash_queue_depth, 88);
+        assert_eq!(
+            c.storage.preallocation_mode,
+            StoragePreallocationMode::Sparse
+        );
+        assert_eq!(c.storage.durability_mode, StorageDurabilityMode::Strict);
+        assert_eq!(c.storage.peer_read_readahead_bytes, 131072);
         assert_eq!(c.storage.peer_read_cache_entries, 17);
+        assert_eq!(c.storage.peer_read_elevator_budget_ms, 9);
         assert_eq!(c.daemon.shutdown_timeout_secs, 10);
         assert_eq!(c.logging, rt_logging::LoggingConfig::default());
     }

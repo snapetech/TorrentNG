@@ -47,7 +47,8 @@ class semaphores:
 - `StorageIoConfig` carries file-pool size, idle TTL, I/O worker count, queue
   depth, preallocation mode, durability mode, and peer-read readahead target.
   `PreallocationMode::Auto` resolves at scheduler construction time from the
-  detected topology.
+  detected topology. Native `[storage]` TOML exposes these scheduler knobs so
+  operators can tune them without code changes.
 - `scheduled_read` and `scheduled_write` remain compatibility wrappers, but
   call positioned `read_at`/`write_at`.
 - Disk syscalls run on a bounded dedicated worker pool instead of Tokio's shared
@@ -137,9 +138,6 @@ The following items are still implementation targets:
 - Move scheduler read/readahead buffers onto frame-pool leases or an equivalent
   bounded storage-buffer API; the current frame pool backs `StorageRuntime`
   reads, not the primary scheduler read path.
-- Expose the remaining `StorageIoConfig` fields through native TOML so
-  operators can tune file-pool size, I/O/hash workers, queue depth, durability,
-  preallocation, and readahead without code changes.
 - Persist cross-device move/import execution state so interrupted multi-step
   plans can resume or be audited after process restart.
 - Per-device latency observability now includes bounded Prometheus histograms

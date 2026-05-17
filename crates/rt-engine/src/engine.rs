@@ -27,8 +27,8 @@ use rt_path::{StorageProfile, StorageRootId};
 use rt_peer_wire::handshake::{Handshake, HANDSHAKE_LEN};
 use rt_session::{SessionRegistry, TorrentEntry, TorrentState, TransferStats};
 use rt_storage::{
-    runtime::StorageRuntime, MountScheduler, SchedulerConfig, StorageIoConfig, V2FileHash,
-    V2FileVerifier, VerifyResult,
+    runtime::StorageRuntime, DurabilityMode, MountScheduler, PreallocationMode, SchedulerConfig,
+    StorageIoConfig, V2FileHash, V2FileVerifier, VerifyResult,
 };
 
 use crate::command::{
@@ -100,13 +100,30 @@ fn resource_config_from_config(config: &Config) -> ResourceGovernorConfig {
 
 fn storage_io_config_from_config(config: &Config) -> StorageIoConfig {
     StorageIoConfig {
+        file_pool_size: config.storage.file_pool_size,
+        idle_file_ttl_secs: config.storage.idle_file_ttl_secs,
+        io_worker_threads: config.storage.io_worker_threads,
+        io_queue_depth: config.storage.io_queue_depth,
+        hash_worker_threads: config.storage.hash_worker_threads,
+        hash_queue_depth: config.storage.hash_queue_depth,
+        preallocation_mode: match config.storage.preallocation_mode {
+            rt_config::StoragePreallocationMode::Off => PreallocationMode::Off,
+            rt_config::StoragePreallocationMode::Auto => PreallocationMode::Auto,
+            rt_config::StoragePreallocationMode::Sparse => PreallocationMode::Sparse,
+            rt_config::StoragePreallocationMode::Full => PreallocationMode::Full,
+        },
+        durability_mode: match config.storage.durability_mode {
+            rt_config::StorageDurabilityMode::Fast => DurabilityMode::Fast,
+            rt_config::StorageDurabilityMode::Checkpoint => DurabilityMode::Checkpoint,
+            rt_config::StorageDurabilityMode::Strict => DurabilityMode::Strict,
+        },
+        peer_read_readahead_bytes: config.storage.peer_read_readahead_bytes,
         peer_read_cache_entries: config.storage.peer_read_cache_entries,
         peer_read_elevator_budget_ms: if config.storage.device_elevator_enabled {
-            StorageIoConfig::default().peer_read_elevator_budget_ms
+            config.storage.peer_read_elevator_budget_ms
         } else {
             0
         },
-        ..Default::default()
     }
 }
 
@@ -3536,6 +3553,42 @@ mod tests {
             pressure_constrained_pct: 75,
             pressure_critical_pct: 90,
         })
+    }
+
+    #[test]
+    fn storage_io_config_maps_native_storage_toml() {
+        let mut config = Config::default();
+        config.storage.file_pool_size = 99;
+        config.storage.idle_file_ttl_secs = 12;
+        config.storage.io_worker_threads = 3;
+        config.storage.io_queue_depth = 77;
+        config.storage.hash_worker_threads = 4;
+        config.storage.hash_queue_depth = 88;
+        config.storage.preallocation_mode = rt_config::StoragePreallocationMode::Full;
+        config.storage.durability_mode = rt_config::StorageDurabilityMode::Strict;
+        config.storage.peer_read_readahead_bytes = 128 * 1024;
+        config.storage.peer_read_cache_entries = 17;
+        config.storage.peer_read_elevator_budget_ms = 9;
+
+        let io = storage_io_config_from_config(&config);
+
+        assert_eq!(io.file_pool_size, 99);
+        assert_eq!(io.idle_file_ttl_secs, 12);
+        assert_eq!(io.io_worker_threads, 3);
+        assert_eq!(io.io_queue_depth, 77);
+        assert_eq!(io.hash_worker_threads, 4);
+        assert_eq!(io.hash_queue_depth, 88);
+        assert_eq!(io.preallocation_mode, PreallocationMode::Full);
+        assert_eq!(io.durability_mode, DurabilityMode::Strict);
+        assert_eq!(io.peer_read_readahead_bytes, 128 * 1024);
+        assert_eq!(io.peer_read_cache_entries, 17);
+        assert_eq!(io.peer_read_elevator_budget_ms, 9);
+
+        config.storage.device_elevator_enabled = false;
+        assert_eq!(
+            storage_io_config_from_config(&config).peer_read_elevator_budget_ms,
+            0
+        );
     }
 
     fn meta() -> TorrentMetaV1 {
