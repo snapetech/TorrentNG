@@ -4,18 +4,21 @@
 
 rtorrentNG is a torrent management stack with two runtime modes:
 
-- A Phase 1 rTorrent sidecar for existing rTorrent deployments.
 - A native Rust BitTorrent daemon (`rusttorrentd`) that owns torrent state,
   tracker announces, peer wire traffic, storage, rechecks, metrics, and native
   REST/SSE APIs.
+- A Track 1 rTorrent sidecar for existing rTorrent deployments and migration
+  compatibility.
 
 Both modes include a React/Vite WebUI and compatibility shims for common
 automation tools.
 
 ## Status
 
-This repository is early-stage software. Interfaces, deployment details, and
-runtime behavior may change while the project is being developed.
+The native engine rewrite is the primary runtime path. The rewrite surface is
+tracked in [docs/ENGINE_REWRITE_BURNDOWN.md](docs/ENGINE_REWRITE_BURNDOWN.md)
+and certified by `scripts/native_engine_certification_report.sh`. Interfaces,
+deployment details, and runtime behavior may still change before a 1.0 release.
 
 ## Support
 
@@ -82,4 +85,10 @@ Run Rust tests:
 
 ```sh
 cargo test
+```
+
+Run native engine certification:
+
+```sh
+scripts/native_engine_certification_report.sh
 ```
