@@ -709,22 +709,6 @@ fn queued_disk_charge(payload_bytes: u64) -> u64 {
     payload_bytes.max(QUEUED_DISK_JOB_OVERHEAD_BYTES)
 }
 
-fn wait_backend_io<T>(
-    path: &Path,
-    rx: oneshot::Receiver<io::Result<T>>,
-) -> Result<T, StorageError> {
-    match rx.blocking_recv() {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(error)) if error.kind() == io::ErrorKind::WouldBlock => {
-            Err(StorageError::QueueFull {
-                mount: "storage-backend".to_string(),
-            })
-        }
-        Ok(Err(error)) => Err(StorageError::io(path.display().to_string(), error)),
-        Err(_) => Err(StorageError::Cancelled),
-    }
-}
-
 async fn await_backend_io<T>(
     path: &Path,
     rx: oneshot::Receiver<io::Result<T>>,
@@ -998,18 +982,45 @@ async fn dispatch_peer_read_batch(
     let offset = batch.offset;
     let len = batch.len;
     let read_counters = counters.clone();
-    let read = io_pool
+    let read = match io_pool
         .run(move || {
-            read_exact_from_pool(
-                &file_pool,
-                &disk_backend,
-                &path,
-                offset,
-                len,
-                &read_counters,
-            )
+            let key = normalized_key(&path);
+            let file = file_pool.get_or_open(&key, OpenMode::Read, false)?;
+            advise_for_read_class(&file, IoClass::PeerRead, offset, len, &read_counters);
+            Ok::<_, StorageError>((key, file))
         })
-        .await;
+        .await
+    {
+        Ok((key, file)) => {
+            let frame_pool = FramePool::new(len as u64);
+            let frame = match frame_pool.try_acquire(len) {
+                Some(frame) => frame,
+                None => {
+                    counters.queue_full.fetch_add(1, Ordering::Relaxed);
+                    return batch
+                        .requests
+                        .into_iter()
+                        .map(|request| {
+                            (
+                                request.tx,
+                                Err(StorageError::QueueFull {
+                                    mount: "scheduler-read-frame".to_string(),
+                                }),
+                            )
+                        })
+                        .collect();
+                }
+            };
+            match await_backend_io(&key, disk_backend.pread(file.clone(), frame, offset)).await {
+                Ok(frame) => {
+                    advise_after_read_class(&file, IoClass::PeerRead, offset, len, &counters);
+                    Ok(bytes::Bytes::copy_from_slice(frame.as_slice()))
+                }
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    };
 
     match read {
         Ok(bytes) => {
@@ -1035,6 +1046,9 @@ async fn dispatch_peer_read_batch(
                 .collect()
         }
         Err(error) => {
+            if matches!(error, StorageError::QueueFull { .. }) {
+                counters.queue_full.fetch_add(1, Ordering::Relaxed);
+            }
             let mut requests = batch.requests.into_iter();
             let Some(first) = requests.next() else {
                 return Vec::new();
@@ -2052,28 +2066,6 @@ fn peer_read_cache_store(
             last_used: Instant::now(),
         },
     );
-}
-
-fn read_exact_from_pool(
-    pool: &FilePool,
-    disk_backend: &SelectedDiskBackend,
-    path: &Path,
-    offset: u64,
-    len: usize,
-    counters: &StorageCounters,
-) -> Result<bytes::Bytes, StorageError> {
-    let key = normalized_key(path);
-    let file = pool.get_or_open(&key, OpenMode::Read, false)?;
-    advise_for_read_class(&file, IoClass::PeerRead, offset, len, counters);
-    let frame_pool = FramePool::new(len as u64);
-    let frame = frame_pool
-        .try_acquire(len)
-        .ok_or_else(|| StorageError::QueueFull {
-            mount: "scheduler-read-frame".to_string(),
-        })?;
-    let frame = wait_backend_io(&key, disk_backend.pread(file.clone(), frame, offset))?;
-    advise_after_read_class(&file, IoClass::PeerRead, offset, len, counters);
-    Ok(bytes::Bytes::copy_from_slice(frame.as_slice()))
 }
 
 fn advise_for_read_class(
