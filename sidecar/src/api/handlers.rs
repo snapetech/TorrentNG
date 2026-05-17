@@ -98,6 +98,7 @@ pub struct LogsQuery {
     limit: Option<usize>,
     kind: Option<String>,
     level: Option<String>,
+    last_known_id: Option<i64>,
 }
 
 pub async fn list_logs(
@@ -112,7 +113,12 @@ pub async fn list_logs(
         .unwrap_or_default();
     match s
         .db
-        .list_app_events_filtered(limit, query.kind.as_deref(), &levels, None)
+        .list_app_events_filtered(
+            limit,
+            query.kind.as_deref(),
+            &levels,
+            query.last_known_id,
+        )
     {
         Ok(events) => {
             Json(serde_json::json!({ "logs": events })).into_response()

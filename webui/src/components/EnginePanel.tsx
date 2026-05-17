@@ -649,10 +649,22 @@ function RtorrentSettingsPanel() {
             background: 'color-mix(in srgb, var(--surface) 92%, var(--bg))',
             padding: '10px 0 0',
           }}>
-            <button onClick={() => save.mutate()} disabled={save.isPending || dirtyCount === 0} style={buttonStyle('var(--accent)', 'var(--accent-soft)', 'var(--accent-text)', dirtyCount > 0 && !save.isPending)}>
+            <button
+              onClick={() => save.mutate()}
+              disabled={save.isPending || dirtyCount === 0}
+              aria-keyshortcuts="Control+S Meta+S"
+              title="Save and apply live"
+              style={buttonStyle('var(--accent)', 'var(--accent-soft)', 'var(--accent-text)', dirtyCount > 0 && !save.isPending)}
+            >
               {save.isPending ? 'Saving…' : 'Save and apply live'}
             </button>
-            <button onClick={resetAll} disabled={dirtyCount === 0 || save.isPending} style={buttonStyle('var(--border-strong)', 'var(--surface-2)', 'var(--muted)', dirtyCount > 0 && !save.isPending)}>
+            <button
+              onClick={resetAll}
+              disabled={dirtyCount === 0 || save.isPending}
+              aria-keyshortcuts="Control+Shift+Z Meta+Shift+Z"
+              title="Reset edits"
+              style={buttonStyle('var(--border-strong)', 'var(--surface-2)', 'var(--muted)', dirtyCount > 0 && !save.isPending)}
+            >
               Reset edits
             </button>
             <button

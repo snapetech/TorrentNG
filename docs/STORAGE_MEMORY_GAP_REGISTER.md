@@ -51,6 +51,10 @@ Implemented and covered by automated tests:
   any filesystem change.
 - Move/import/delete execution can resume from caller-supplied completed step
   indexes and reports newly completed steps through checkpoint callbacks.
+- Engine save-path updates execute existing payload moves through the
+  checkpointed storage-plan executor and persist storage-plan job
+  queue/running/checkpoint/completed state in SQLite before committing the new
+  `save_path`.
 - Move/import/delete certification can run against a real storage root with
   configurable fixture size by setting `TNG_STORAGE_MOVE_IMPORT_ROOT`,
   `TNG_STORAGE_MOVE_IMPORT_FILES`, and `TNG_STORAGE_MOVE_IMPORT_MIB_PER_FILE`.
@@ -88,7 +92,7 @@ Implemented and covered by automated tests:
 | Area | Gap | Risk | Next Work |
 | --- | --- | --- | --- |
 | Zero-copy storage read ownership | Scheduler reads and peer-read elevator reads now borrow from the process-level frame pool before backend dispatch; upload returned blocks and scheduler-owned cache entries are memory-leased, but generic `scheduled_read` still returns plain `Bytes`. | The hot upload/cache lifetimes are accounted; full zero-copy ownership would require a public storage read payload type and downstream API changes. | Add a frame-owned bytes API only if measurements show the remaining copy matters. |
-| Restartable move/import execution | The storage executor now supports completed-step resume checkpoints, but the engine has not yet persisted those checkpoints into SQLite job rows. | A process crash during a multi-TB move still needs engine-level recovery from durable plan state instead of filesystem inspection. | Persist plan id, steps, completed steps, and rollback intent in the engine DB before invoking the checkpointed executor. |
+| Move/import API breadth | The engine save-path update path now persists storage-plan checkpoints in SQLite and moves existing payload files before committing the new root, but dedicated native preview/execute APIs for import/delete planning are not yet exposed. | Operators should not have to infer import/delete plan behavior from lower-level certification helpers once those workflows become product UI. | Add native API endpoints for move/import/delete plan preview and execution when product workflow requires them. |
 | Deterministic LVM PV placement control | The kspls0 extent probe shows the pool can allocate independent files on multiple rotational PVs, but ordinary path writes still do not let TorrentNG choose a specific PV. | Cross-PV behavior inside the LVM pool is allocator-dependent, so path-level scheduling cannot promise physical-drive affinity. | Use LVM extent mapping for evidence, or add lower-level PV-targeted probes only if release claims require deterministic per-drive placement. |
 | `io_uring` frame-pool slot pinning | `UringBackend` uses worker-owned fixed buffers when available, but the global frame pool does not yet hand out stable registered buffer slots. | Extra copies remain in the uring path, and fixed-buffer metrics can overstate how much of the full storage path is zero-copy. | Run `scripts/storage_uring_graduation.sh /target/root` with selected-backend, fixed-buffer, registered-file, and throughput thresholds. Add frame-pool slot leases through the backend API only after those reports prove `uring` should graduate from explicit opt-in. |
 | Move/import certification | The certification runner now supports real-root fixture execution, but representative multi-TB operator evidence is still host/run dependent. | Large library move/import claims should not be made from unit tests alone. | Run `TNG_STORAGE_MOVE_IMPORT_ROOT=/target/root TNG_STORAGE_MOVE_IMPORT_FILES=... TNG_STORAGE_MOVE_IMPORT_MIB_PER_FILE=... scripts/storage_move_import_certification.sh` on the target storage roots and publish the generated report. |

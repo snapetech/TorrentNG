@@ -2520,6 +2520,18 @@ async fn native_logs_returns_filtered_app_events() {
     assert_eq!(logs[0]["message"], "tracker warning");
     assert_eq!(logs[0]["kind"], "rtorrent_log");
     assert_eq!(logs[0]["level"], "warn");
+
+    let res = client
+        .get(url(addr, "/api/v1/logs?last_known_id=1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let logs = body["logs"].as_array().unwrap();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0]["message"], "tracker warning");
+    assert!(logs[0]["event_id"].as_i64().unwrap() > 1);
 }
 
 #[tokio::test]
