@@ -33,3 +33,9 @@ wal_checkpoint_pages = 1000
 
 [auth]
 api_tokens = ["interop-token"]
+
+[logging]
+format = "json"
+profile = "basic"
+filter = ""
+event_retention = 10000

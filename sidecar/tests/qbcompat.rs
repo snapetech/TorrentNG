@@ -15,7 +15,7 @@ use tokio::{
 // Re-use internal modules via the binary crate root.
 use torrentng::{
     api::{server::AppState, ws::Event},
-    cache::{Db, TorrentRow},
+    cache::{AppEventRow, Db, TorrentRow},
     config::Config,
     metrics::Metrics,
 };
@@ -2388,6 +2388,48 @@ async fn qb_inert_surfaces_are_compatible() {
         assert_eq!(res.status(), 200, "{path}");
         assert_eq!(res.text().await.unwrap(), "0");
     }
+}
+
+#[tokio::test]
+async fn qb_log_main_returns_retained_app_events() {
+    let (addr, client, db) = spawn_server_with_db().await;
+    db.append_app_event(
+        &AppEventRow {
+            event_id: None,
+            occurred_at: 1_700_000_000,
+            level: "warn".to_owned(),
+            kind: "test".to_owned(),
+            message: "operator-visible warning".to_owned(),
+            payload: "{}".to_owned(),
+        },
+        16,
+    )
+    .unwrap();
+    db.append_app_event(
+        &AppEventRow {
+            event_id: None,
+            occurred_at: 1_700_000_001,
+            level: "error".to_owned(),
+            kind: "test".to_owned(),
+            message: "operator-visible error".to_owned(),
+            payload: "{}".to_owned(),
+        },
+        16,
+    )
+    .unwrap();
+
+    let res = client
+        .get(url(addr, "/api/qb/v2/log/main?limit=1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let entries = body.as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["message"], "operator-visible error");
+    assert_eq!(entries[0]["timestamp"], 1_700_000_001);
+    assert_eq!(entries[0]["type"], 4);
 }
 
 #[tokio::test]

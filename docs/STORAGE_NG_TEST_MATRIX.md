@@ -40,7 +40,7 @@ per-case syscall counters when `strace` is available.
 | Configuration | default storage elevator, memory caps, runtime tier switch, TOML partial parsing | `cargo test -p rt-config` |
 | Engine consumers | storage-backed recheck, upload reads across multi-file regions, resource snapshot in engine stats, taskless v2 verification | `cargo test -p rt-engine` |
 | Native API metrics | Prometheus projection for storage backend, frame/fd runtime, scheduler counters, bounded peer-cache pressure, peer buffer bytes, resource-governor classes | `cargo test -p rt-api-native render_metrics_includes_engine_stats` |
-| Move/import executor | plan admission, symlink-safe no-overwrite moves, copy-based move source cleanup, hardlink-or-copy import, recursive directory copy/delete, symlink rejection, symlink-safe delete, staged rollback cleanup, storage-root confinement, optional real-root fixture execution | `scripts/storage_move_import_certification.sh`; set `TNG_STORAGE_MOVE_IMPORT_ROOT` for hardware-root evidence |
+| Move/import executor | plan admission, symlink-safe no-overwrite moves, copy-based move source cleanup, hardlink-or-copy import, recursive directory copy/delete, rename/copy/import symlink rejection, symlink-safe delete, staged rollback cleanup, storage-root confinement, optional real-root fixture execution | `scripts/storage_move_import_certification.sh`; set `TNG_STORAGE_MOVE_IMPORT_ROOT` for hardware-root evidence |
 
 ## Runtime Configuration Matrix
 

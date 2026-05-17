@@ -111,7 +111,7 @@ precedence over both.
 | `format` | `json` | Output format: `json` or `pretty` |
 | `profile` | `basic` | Preset filter profile: `basic`, `detailed`, or `verbose` |
 | `filter` | `""` | Explicit tracing filter, for example `rt_engine=debug,tower_http=info` |
-| `event_retention` | `10000` | In-process retention target for future event-ring consumers |
+| `event_retention` | `10000` | Number of newest durable session events to retain for qBit-compatible main logs |
 
 ### Native minimal example
 
@@ -247,6 +247,17 @@ Use these only for lab compatibility testing. Tracker-facing identity is still c
 | `api_tokens` | `[]` | `TNG_API_TOKENS` | Comma-separated pre-shared bearer tokens for automation tools |
 | `trust_proxy_header` | `false` | - | Trust `X-Remote-User` from reverse proxy |
 
+### Sidecar `[logging]`
+
+`debug = true` and `TNG_DEBUG=1` remain supported as legacy aliases for debug-level logging. `RUST_LOG` has the highest precedence, followed by `TNG_LOG_FILTER` or `logging.filter`, then `logging.profile`, then the legacy debug setting.
+
+| Key | Default | Env override | Description |
+|---|---|---|---|
+| `format` | `json` | `TNG_LOG_FORMAT` | Output format: `json` or `pretty` |
+| `profile` | `basic` | `TNG_LOG_PROFILE` | Preset filter profile: `basic`, `detailed`, or `verbose` |
+| `filter` | `""` | `TNG_LOG_FILTER` | Explicit tracing filter, for example `torrentng=debug,tower_http=info` |
+| `event_retention` | `10000` | `TNG_LOG_EVENT_RETENTION` | Number of newest durable sidecar app events to retain for qBit-compatible main logs |
+
 ### Sidecar `[workflows]`
 
 | Key | Default | Env override | Description |
@@ -292,6 +303,12 @@ qbittorrent_version = "5.0.0"
 qbittorrent_webapi_version = "2.11.0"
 qbittorrent_build_libtorrent = "0.16.11"
 qbittorrent_build_qt = "6.7.0"
+
+[logging]
+format = "json"
+profile = "basic"
+filter = ""
+event_retention = 10000
 
 [workflows]
 allow_scripts = false

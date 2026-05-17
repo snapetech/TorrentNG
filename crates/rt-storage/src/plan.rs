@@ -240,6 +240,7 @@ fn execute_step(step: &StoragePlanStep) -> Result<(), StorageError> {
             let destination = required_path(step.destination.as_ref(), "rename-destination")?;
             ensure_destination_available(destination)?;
             create_parent(destination)?;
+            reject_symlink(source, "rename-source")?;
             std::fs::rename(source, destination)
                 .map_err(|e| StorageError::io(destination.display().to_string(), e))?;
             verify_path_len(destination, step.bytes)
@@ -783,6 +784,41 @@ mod tests {
             execute_storage_plan(&conflict),
             Err(StorageError::StagedMoveFailed { .. })
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_move_plan_rejects_symlink_source_before_rename() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside.bin");
+        let source = dir.path().join("source-link.bin");
+        let destination = dir.path().join("dest.bin");
+        std::fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, &source).unwrap();
+        let plan = StoragePlan {
+            dry_run: false,
+            can_apply: true,
+            issues: Vec::new(),
+            steps: vec![StoragePlanStep {
+                action: PlannedStorageAction::Rename,
+                source: Some(source.clone()),
+                destination: Some(destination.clone()),
+                bytes: 7,
+            }],
+            rollback_steps: Vec::new(),
+        };
+
+        assert!(matches!(
+            execute_storage_plan(&plan),
+            Err(StorageError::StagedMoveFailed {
+                step: "execute",
+                ..
+            })
+        ));
+        assert!(source.exists());
+        assert!(!destination.exists());
     }
 
     #[test]

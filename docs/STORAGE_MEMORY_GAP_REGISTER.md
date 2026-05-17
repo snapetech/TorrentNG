@@ -39,9 +39,9 @@ Implemented and covered by automated tests:
 - Move/import/delete plans have a conservative executor with no-overwrite
   admission, parent creation, copy-length verification, staged rollback cleanup,
   recursive directory copy/delete support, copy-based move source cleanup after
-  verified rename, symlink rejection during recursive copies and hardlink
-  imports, symlink-safe no-overwrite checks, symlink-safe delete, and dry-run
-  no-op behavior.
+  verified rename, symlink rejection for rename/copy/hardlink-import sources,
+  symlink-safe no-overwrite checks, symlink-safe delete, and dry-run no-op
+  behavior.
 - Move/import/delete execution has an opt-in storage-root confinement entry
   point that validates source, destination, and rollback paths before applying
   any filesystem change.

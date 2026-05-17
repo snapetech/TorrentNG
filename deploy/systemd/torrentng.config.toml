@@ -13,6 +13,12 @@ secret_key = "change-me"
 api_tokens = []
 trust_proxy_header = false
 
+[logging]
+format = "json"
+profile = "basic"
+filter = ""
+event_retention = 10000
+
 [workflows]
 allow_scripts = false
 script_timeout_secs = 30
