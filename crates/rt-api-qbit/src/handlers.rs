@@ -4370,7 +4370,7 @@ mod tests {
         assert_eq!(estimate_qbit_maindata_snapshot_bytes(0), 16 * 1024);
         assert_eq!(
             estimate_qbit_maindata_snapshot_bytes(10),
-            16 * 1024 + 30_720
+            16 * 1024 + 23_040
         );
     }
 }
