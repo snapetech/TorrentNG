@@ -117,10 +117,9 @@ append_lvm_extent_probe() {
   local probes=()
   for ((i = 0; i < probe_files; i++)); do
     local probe="$probe_dir/probe-$i.bin"
-    dd if=/dev/zero of="$probe" bs=1M count="$probe_mb" status=none
+    dd if=/dev/zero of="$probe" bs=1M count="$probe_mb" conv=fsync status=none
     probes+=("$probe")
   done
-  sync "$probe_dir" 2>/dev/null || sync
   if ! sudo_if_available dmsetup table "$clean_source" >"$table" 2>/dev/null; then
     echo
     echo "LVM/PV extent probe skipped: dmsetup table unavailable for $clean_source."
