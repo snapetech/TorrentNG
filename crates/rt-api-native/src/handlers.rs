@@ -552,7 +552,11 @@ impl StoragePlanView {
             dry_run: plan.dry_run,
             can_apply: plan.can_apply,
             issues: plan.issues.iter().map(storage_plan_issue_label).collect(),
-            steps: plan.steps.iter().map(StoragePlanStepView::from_step).collect(),
+            steps: plan
+                .steps
+                .iter()
+                .map(StoragePlanStepView::from_step)
+                .collect(),
             rollback_steps: plan
                 .rollback_steps
                 .iter()
@@ -2381,7 +2385,7 @@ mod tests {
         let destination = dir.path().join("destination.bin");
         std::fs::write(&source, b"payload").unwrap();
         let req = StoragePlanRequest {
-            action: StoragePlanAction::Move,
+            operation: "move".to_owned(),
             source: Some(source),
             destination: Some(destination),
             target: None,
@@ -2389,18 +2393,20 @@ mod tests {
             available_bytes: Some(7),
             hardlink_or_copy: None,
             dry_run: Some(true),
+            dry_run_approved: None,
             affected_torrents: None,
             roots: None,
             completed_steps: None,
         };
 
-        let plan = build_storage_plan(&req).unwrap();
-        let response = storage_plan_response(&plan, None);
+        let plan = build_storage_plan(&req, true).unwrap();
+        let response = storage_plan_response(&req.operation, &plan, None);
 
-        assert!(response.can_apply);
-        assert!(response.dry_run);
-        assert!(!response.steps.is_empty());
-        assert_eq!(response.steps[0].action, "rename");
+        assert_eq!(response.operation, "move");
+        assert!(response.plan.can_apply);
+        assert!(response.plan.dry_run);
+        assert!(!response.plan.steps.is_empty());
+        assert_eq!(response.plan.steps[0].action, "rename");
     }
 
     #[test]
@@ -2411,7 +2417,7 @@ mod tests {
         let destination = allowed.path().join("destination.bin");
         std::fs::write(&source, b"payload").unwrap();
         let req = StoragePlanRequest {
-            action: StoragePlanAction::Move,
+            operation: "move".to_owned(),
             source: Some(source),
             destination: Some(destination),
             target: None,
@@ -2419,12 +2425,13 @@ mod tests {
             available_bytes: None,
             hardlink_or_copy: None,
             dry_run: Some(true),
+            dry_run_approved: None,
             affected_torrents: None,
             roots: Some(vec![allowed.path().to_path_buf()]),
             completed_steps: None,
         };
 
-        let plan = build_storage_plan(&req).unwrap();
+        let plan = build_storage_plan(&req, true).unwrap();
         assert!(validate_storage_plan_roots(&plan, req.roots.as_deref()).is_some());
     }
 
