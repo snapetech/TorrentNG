@@ -130,6 +130,10 @@ impl FramePool {
         }
         // Oversize buffers are simply dropped.
     }
+
+    fn release_charge(&self, len: usize) {
+        self.in_use.fetch_sub(len as u64, Ordering::AcqRel);
+    }
 }
 
 /// Process-wide storage frame pool shared by `StorageRuntime` and the live
@@ -171,6 +175,21 @@ impl Frame {
 
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         &mut self.buf[..self.len]
+    }
+
+    /// Consume this frame as immutable bytes without copying the payload.
+    ///
+    /// The backing allocation is not returned to the idle frame cache because
+    /// ownership moves to [`bytes::Bytes`], but the in-use frame-pool charge is
+    /// released before returning.
+    pub fn into_bytes(mut self) -> bytes::Bytes {
+        let len = self.len;
+        self.pool.release_charge(len);
+        self.len = 0;
+        self.class = None;
+        let mut buf = std::mem::take(&mut self.buf);
+        buf.truncate(len);
+        bytes::Bytes::from(buf)
     }
 }
 
@@ -242,6 +261,20 @@ mod tests {
         assert_eq!(f.len(), big);
         assert_eq!(pool.in_use_bytes(), big as u64);
         drop(f);
+        assert_eq!(pool.in_use_bytes(), 0);
+    }
+
+    #[test]
+    fn into_bytes_releases_charge_without_copying_payload() {
+        let pool = FramePool::new(1024 * 1024);
+        let mut frame = pool.try_acquire(4096).unwrap();
+        frame.as_mut_slice()[..5].copy_from_slice(b"hello");
+        assert_eq!(pool.in_use_bytes(), 4096);
+
+        let bytes = frame.into_bytes();
+
+        assert_eq!(&bytes[..5], b"hello");
+        assert_eq!(bytes.len(), 4096);
         assert_eq!(pool.in_use_bytes(), 0);
     }
 }

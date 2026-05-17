@@ -238,7 +238,7 @@ impl StorageRead {
 
     pub fn into_bytes(self) -> bytes::Bytes {
         match self {
-            StorageRead::Frame(frame) => bytes::Bytes::copy_from_slice(frame.as_slice()),
+            StorageRead::Frame(frame) => frame.into_bytes(),
             StorageRead::Bytes(bytes) => bytes,
         }
     }
@@ -1058,7 +1058,7 @@ async fn dispatch_peer_read_batch(
             match await_backend_io(&key, disk_backend.pread(file.clone(), frame, offset)).await {
                 Ok(frame) => {
                     advise_after_read_class(&file, IoClass::PeerRead, offset, len, &counters);
-                    Ok(bytes::Bytes::copy_from_slice(frame.as_slice()))
+                    Ok(frame.into_bytes())
                 }
                 Err(error) => Err(error),
             }
@@ -1647,7 +1647,7 @@ impl MountScheduler {
                     .fetch_add(latency_ns, Ordering::Relaxed);
                 record_latency_bucket(&counters.read_latency_buckets, latency_ns);
                 if class == IoClass::PeerRead && read_len > len && readahead_cache_entries > 0 {
-                    let bytes = bytes::Bytes::copy_from_slice(frame.as_slice());
+                    let bytes = frame.into_bytes();
                     let exact = bytes.slice(..len);
                     peer_read_cache_store(
                         &peer_read_cache,
