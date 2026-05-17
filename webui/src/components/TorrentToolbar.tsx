@@ -34,6 +34,7 @@ export function TorrentToolbar({
     <div style={{
       height: 38, flexShrink: 0, display: 'flex', alignItems: 'center', gap: 6,
       padding: '0 10px', background: 'var(--surface)', borderBottom: '1px solid var(--border)',
+      minWidth: 0, overflowX: 'auto', overflowY: 'hidden', scrollbarWidth: 'thin',
     }}>
       <button onClick={onAdd} title="Add torrent" style={primaryButton}>+ Add</button>
       <div style={{ width: 1, height: 20, background: 'var(--border)', margin: '0 2px' }} />
@@ -72,11 +73,11 @@ export function TorrentToolbar({
       >
         Sequential
       </button>
-      <span style={{ color: 'var(--faint)', fontSize: 11, marginLeft: 6 }}>
+      <span style={{ color: 'var(--faint)', fontSize: 11, marginLeft: 6, whiteSpace: 'nowrap', flex: '0 0 auto' }}>
         {selectedCount > 0 ? `${selectedCount.toLocaleString()} selected` : 'No selection'}
       </span>
       <button onClick={onHelp} title="Keyboard shortcuts and docs" style={{
-        marginLeft: 'auto', background: 'transparent', border: '1px solid var(--border-strong)',
+        marginLeft: 'auto', flex: '0 0 auto', background: 'transparent', border: '1px solid var(--border-strong)',
         borderRadius: 5, color: 'var(--muted)', padding: '4px 8px', fontSize: 12, cursor: 'pointer',
       }}>
         Help
@@ -86,6 +87,7 @@ export function TorrentToolbar({
 }
 
 const primaryButton: React.CSSProperties = {
+  flex: '0 0 auto',
   background: 'var(--accent-soft)',
   border: '1px solid var(--accent)',
   borderRadius: 5,
@@ -98,6 +100,7 @@ const primaryButton: React.CSSProperties = {
 function actionButton(color: string, disabled: boolean): React.CSSProperties {
   return {
     background: 'var(--surface-2)',
+    flex: '0 0 auto',
     border: `1px solid ${color}55`,
     borderRadius: 5,
     color,

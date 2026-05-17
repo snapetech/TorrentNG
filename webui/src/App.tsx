@@ -412,17 +412,21 @@ export function App() {
   }
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', background: 'var(--bg)', color: 'var(--text)' }}>
+    <div style={{
+      display: 'flex', flexDirection: 'column', height: '100vh', width: '100vw',
+      overflow: 'hidden', background: 'var(--bg)', color: 'var(--text)',
+    }}>
       {/* Topbar */}
       <header style={{
         height: 44, background: 'var(--bg)', borderBottom: '1px solid var(--border)',
         display: 'flex', alignItems: 'center', padding: '0 16px', gap: 12, flexShrink: 0,
+        minWidth: 0, overflowX: 'auto', overflowY: 'hidden', scrollbarWidth: 'thin',
       }}>
-        <span style={{ fontWeight: 700, fontSize: 15, color: 'var(--text)' }}>
+        <span style={{ fontWeight: 700, fontSize: 15, color: 'var(--text)', flex: '0 0 auto' }}>
           rtorrentNG
         </span>
 
-        <nav style={{ display: 'flex', gap: 4, marginLeft: 4 }}>
+        <nav style={{ display: 'flex', gap: 4, marginLeft: 4, flex: '0 0 auto' }}>
           {(['torrents', 'settings'] as View[]).map(v => (
             <button key={v} onClick={() => setView(v)} style={{
               background: view === v ? 'var(--accent-soft)' : 'transparent',
@@ -456,8 +460,8 @@ export function App() {
           {health?.rtorrent ?? 'connecting…'}
         </span>
 
-        <span style={{ flex: 1 }} />
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <span style={{ flex: '1 0 12px' }} />
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flex: '0 0 auto' }}>
           <select
             aria-label="Theme palette"
             value={themeId}
@@ -505,7 +509,7 @@ export function App() {
       )}
 
       {/* Main content */}
-      <main style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
+      <main style={{ flex: 1, minWidth: 0, display: 'flex', overflow: 'hidden' }}>
         {view === 'settings' && (
           <SettingsView
             section={settingsSection}
@@ -524,7 +528,7 @@ export function App() {
               onChange={updateParams}
               onApply={applySavedView}
             />
-            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+            <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
               {query.isError && (
                 <div style={{ padding: 24, color: 'var(--danger)', textAlign: 'center' }}>
                   Failed to connect to sidecar API.
