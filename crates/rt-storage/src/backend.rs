@@ -2,23 +2,30 @@
 //!
 //! All positioned I/O goes through a [`DiskBackend`]. Storage NG ships the
 //! [`PreadBackend`] (a dedicated, bounded blocking thread pool calling
-//! `pread`/`pwrite` via positioned I/O) as the portable default. Backend
-//! selection is explicit so Linux hosts can request the `io_uring` path as it
-//! lands while older kernels and restricted containers fall back cleanly.
+//! `pread`/`pwrite` via positioned I/O) as the portable default and a Linux
+//! [`UringBackend`] for positioned `io_uring` reads, writes, and data sync.
+//! Backend selection is explicit so older kernels and restricted containers
+//! fall back cleanly.
 //!
 //! The pool is deliberately *separate* from Tokio's generic blocking pool
 //! so disk I/O can neither starve nor be starved by unrelated
 //! `spawn_blocking` work.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt;
+use std::os::unix::io::AsRawFd;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
+use io_uring::{opcode, types, IoUring};
 use tokio::sync::oneshot;
 
 use crate::frame::Frame;
+
+const URING_ENTRIES: u32 = 256;
+const URING_BATCH_LIMIT: usize = 64;
 
 /// Backend requested by configuration or environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,11 +77,9 @@ pub struct BackendSelection {
 
 /// Probe-selected disk backend.
 ///
-/// Today this is intentionally conservative: the `PreadBackend` is selected
-/// unless a real `io_uring` syscall backend is compiled in. Keeping the enum
-/// in the public storage layer lets the scheduler/runtime make one selection
-/// decision and gives the registered-fd/fixed-buffer implementation a narrow
-/// insertion point.
+/// The enum keeps the scheduler/runtime selection decision narrow while the
+/// Linux backend grows from basic positioned SQEs to registered fds, fixed
+/// buffers, and larger batches.
 pub struct SelectedDiskBackend {
     selection: BackendSelection,
     inner: SelectedDiskBackendInner,
@@ -194,20 +199,29 @@ pub struct UringProbe {
     pub reason: String,
 }
 
-/// Linux `io_uring` backend insertion point.
-///
-/// The current implementation delegates to `PreadBackend` until the crate
-/// links a real uring driver. This keeps all caller-facing wiring, selection,
-/// tests, and diagnostics in place without exposing a half-implemented syscall
-/// path.
+/// Linux `io_uring` backend.
 pub struct UringBackend {
-    fallback: PreadBackend,
+    tx: mpsc::Sender<Job>,
+    _workers: Vec<thread::JoinHandle<()>>,
 }
 
 impl UringBackend {
     pub fn new(threads: usize) -> Self {
+        let threads = threads.max(1);
+        let (tx, rx) = mpsc::channel::<Job>();
+        let rx = Arc::new(Mutex::new(rx));
+        let mut workers = Vec::with_capacity(threads);
+        for i in 0..threads {
+            let rx = Arc::clone(&rx);
+            let handle = thread::Builder::new()
+                .name(format!("tng-uring-{i}"))
+                .spawn(move || UringWorker::new(rx).run())
+                .expect("spawn io_uring worker");
+            workers.push(handle);
+        }
         Self {
-            fallback: PreadBackend::new(threads),
+            tx,
+            _workers: workers,
         }
     }
 
@@ -224,9 +238,15 @@ impl UringBackend {
                     reason: format!("kernel reports io_uring disabled ({disabled})"),
                 });
             }
+            if let Err(e) = IoUring::new(8) {
+                return Ok(UringProbe {
+                    usable: false,
+                    reason: format!("io_uring probe failed: {e}"),
+                });
+            }
             return Ok(UringProbe {
-                usable: false,
-                reason: "io_uring syscall backend not linked; using pread fallback".to_string(),
+                usable: true,
+                reason: "io_uring probe succeeded".to_string(),
             });
         }
 
@@ -247,7 +267,14 @@ impl DiskBackend for UringBackend {
         frame: Frame,
         offset: u64,
     ) -> oneshot::Receiver<io::Result<Frame>> {
-        self.fallback.pread(file, frame, offset)
+        let (reply, rx) = oneshot::channel();
+        let _ = self.tx.send(Job::Read {
+            file,
+            frame,
+            offset,
+            reply,
+        });
+        rx
     }
 
     fn pwrite(
@@ -256,15 +283,248 @@ impl DiskBackend for UringBackend {
         data: bytes::Bytes,
         offset: u64,
     ) -> oneshot::Receiver<io::Result<()>> {
-        self.fallback.pwrite(file, data, offset)
+        let (reply, rx) = oneshot::channel();
+        let _ = self.tx.send(Job::Write {
+            file,
+            data,
+            offset,
+            reply,
+        });
+        rx
     }
 
     fn fdatasync(&self, file: Arc<File>) -> oneshot::Receiver<io::Result<()>> {
-        self.fallback.fdatasync(file)
+        let (reply, rx) = oneshot::channel();
+        let _ = self.tx.send(Job::Sync { file, reply });
+        rx
     }
 
     fn supports_fixed_buffers(&self) -> bool {
+        // The backend uses real io_uring SQEs today. Registered fixed buffers
+        // are the next optimization once the global frame pool can hand out
+        // stable slot indexes.
         false
+    }
+}
+
+struct UringWorker {
+    rx: Arc<Mutex<mpsc::Receiver<Job>>>,
+    ring: IoUring,
+    next_id: u64,
+    pending: HashMap<u64, PendingUring>,
+}
+
+enum PendingUring {
+    Read {
+        file: Arc<File>,
+        frame: Frame,
+        expected: usize,
+        reply: oneshot::Sender<io::Result<Frame>>,
+    },
+    Write {
+        file: Arc<File>,
+        data: bytes::Bytes,
+        expected: usize,
+        reply: oneshot::Sender<io::Result<()>>,
+    },
+    Sync {
+        file: Arc<File>,
+        reply: oneshot::Sender<io::Result<()>>,
+    },
+}
+
+impl UringWorker {
+    fn new(rx: Arc<Mutex<mpsc::Receiver<Job>>>) -> Self {
+        Self {
+            rx,
+            ring: IoUring::new(URING_ENTRIES).expect("create io_uring"),
+            next_id: 1,
+            pending: HashMap::new(),
+        }
+    }
+
+    fn run(mut self) {
+        while let Some(first) = self.recv_job() {
+            let jobs = self.recv_batch(first);
+            let mut submitted = 0;
+            for job in jobs {
+                match self.submit_job(job) {
+                    Ok(()) => submitted += 1,
+                    Err(e) => tracing::warn!(error = %e, "io_uring submission failed"),
+                }
+            }
+            if submitted == 0 {
+                continue;
+            }
+            if let Err(e) = self.ring.submit_and_wait(submitted) {
+                self.fail_all(e);
+                continue;
+            }
+            self.complete_ready();
+        }
+    }
+
+    fn recv_job(&self) -> Option<Job> {
+        let guard = self.rx.lock().expect("uring job queue poisoned");
+        guard.recv().ok()
+    }
+
+    fn recv_batch(&self, first: Job) -> Vec<Job> {
+        let mut jobs = Vec::with_capacity(URING_BATCH_LIMIT);
+        jobs.push(first);
+        let guard = self.rx.lock().expect("uring job queue poisoned");
+        while jobs.len() < URING_BATCH_LIMIT {
+            match guard.try_recv() {
+                Ok(job) => jobs.push(job),
+                Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+        jobs
+    }
+
+    fn submit_job(&mut self, job: Job) -> io::Result<()> {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        match job {
+            Job::Read {
+                file,
+                mut frame,
+                offset,
+                reply,
+            } => {
+                let ptr = frame.as_mut_slice().as_mut_ptr();
+                let len = frame.len();
+                let entry = opcode::Read::new(types::Fd(file.as_raw_fd()), ptr, len as _)
+                    .offset(offset)
+                    .build()
+                    .user_data(id);
+                self.push_entry(entry)?;
+                self.pending.insert(
+                    id,
+                    PendingUring::Read {
+                        file,
+                        frame,
+                        expected: len,
+                        reply,
+                    },
+                );
+            }
+            Job::Write {
+                file,
+                data,
+                offset,
+                reply,
+            } => {
+                let ptr = data.as_ptr();
+                let len = data.len();
+                let entry = opcode::Write::new(types::Fd(file.as_raw_fd()), ptr, len as _)
+                    .offset(offset)
+                    .build()
+                    .user_data(id);
+                self.push_entry(entry)?;
+                self.pending.insert(
+                    id,
+                    PendingUring::Write {
+                        file,
+                        data,
+                        expected: len,
+                        reply,
+                    },
+                );
+            }
+            Job::Sync { file, reply } => {
+                let entry = opcode::Fsync::new(types::Fd(file.as_raw_fd()))
+                    .flags(types::FsyncFlags::DATASYNC)
+                    .build()
+                    .user_data(id);
+                self.push_entry(entry)?;
+                self.pending.insert(id, PendingUring::Sync { file, reply });
+            }
+        }
+        Ok(())
+    }
+
+    fn push_entry(&mut self, entry: io_uring::squeue::Entry) -> io::Result<()> {
+        unsafe {
+            self.ring
+                .submission()
+                .push(&entry)
+                .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "io_uring SQ full"))
+        }
+    }
+
+    fn complete_ready(&mut self) {
+        let completions = self
+            .ring
+            .completion()
+            .map(|cqe| (cqe.user_data(), cqe.result()));
+        for (id, result) in completions.collect::<Vec<_>>() {
+            let Some(pending) = self.pending.remove(&id) else {
+                continue;
+            };
+            match pending {
+                PendingUring::Read {
+                    file,
+                    frame,
+                    expected,
+                    reply,
+                } => {
+                    let _keepalive = file;
+                    let _ = reply.send(match uring_result(result) {
+                        Ok(n) if n == expected => Ok(frame),
+                        Ok(_) => Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "short io_uring read",
+                        )),
+                        Err(e) => Err(e),
+                    });
+                }
+                PendingUring::Write {
+                    file,
+                    data,
+                    expected,
+                    reply,
+                } => {
+                    let _keepalive_file = file;
+                    let _keepalive = data;
+                    let _ = reply.send(match uring_result(result) {
+                        Ok(n) if n == expected => Ok(()),
+                        Ok(_) => Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "short io_uring write",
+                        )),
+                        Err(e) => Err(e),
+                    });
+                }
+                PendingUring::Sync { file, reply } => {
+                    let _keepalive = file;
+                    let _ = reply.send(uring_result(result).map(|_| ()));
+                }
+            }
+        }
+    }
+
+    fn fail_all(&mut self, err: io::Error) {
+        let message = err.to_string();
+        for (_, pending) in self.pending.drain() {
+            let e = || io::Error::new(err.kind(), message.clone());
+            match pending {
+                PendingUring::Read { reply, .. } => {
+                    let _ = reply.send(Err(e()));
+                }
+                PendingUring::Write { reply, .. } | PendingUring::Sync { reply, .. } => {
+                    let _ = reply.send(Err(e()));
+                }
+            }
+        }
+    }
+}
+
+fn uring_result(result: i32) -> io::Result<usize> {
+    if result < 0 {
+        Err(io::Error::from_raw_os_error(-result))
+    } else {
+        Ok(result as usize)
     }
 }
 
@@ -545,5 +805,40 @@ mod tests {
         let frame = pool.try_acquire(7).unwrap();
         let frame = backend.pread(file, frame, 16).await.unwrap().unwrap();
         assert_eq!(frame.as_slice(), b"backend");
+    }
+
+    #[tokio::test]
+    async fn forced_uring_roundtrip_when_kernel_supports_it() {
+        let probe = UringBackend::probe().unwrap();
+        if !probe.usable {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("uring.bin");
+        std::fs::write(&path, vec![0u8; 128]).unwrap();
+
+        let backend = SelectedDiskBackend::select(BackendRequest::Uring, 1);
+        assert_eq!(backend.kind(), BackendKind::Uring);
+
+        let pool = FramePool::new(1 << 20);
+        let file = Arc::new(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap(),
+        );
+
+        backend
+            .pwrite(file.clone(), bytes::Bytes::from_static(b"real-uring"), 32)
+            .await
+            .unwrap()
+            .unwrap();
+        backend.fdatasync(file.clone()).await.unwrap().unwrap();
+
+        let frame = pool.try_acquire(10).unwrap();
+        let frame = backend.pread(file, frame, 32).await.unwrap().unwrap();
+        assert_eq!(frame.as_slice(), b"real-uring");
     }
 }

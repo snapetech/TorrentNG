@@ -32,6 +32,7 @@ struct PoolInner {
 pub struct FramePool {
     inner: Arc<Mutex<PoolInner>>,
     in_use: Arc<AtomicU64>,
+    denied: Arc<AtomicU64>,
     cap_bytes: u64,
 }
 
@@ -43,6 +44,7 @@ impl FramePool {
                 free: Default::default(),
             })),
             in_use: Arc::new(AtomicU64::new(0)),
+            denied: Arc::new(AtomicU64::new(0)),
             cap_bytes,
         }
     }
@@ -53,6 +55,10 @@ impl FramePool {
 
     pub fn in_use_bytes(&self) -> u64 {
         self.in_use.load(Ordering::Relaxed)
+    }
+
+    pub fn denied_allocations(&self) -> u64 {
+        self.denied.load(Ordering::Relaxed)
     }
 
     fn class_for(len: usize) -> Option<usize> {
@@ -70,6 +76,7 @@ impl FramePool {
             let cur = self.in_use.load(Ordering::Acquire);
             let next = cur.checked_add(charge)?;
             if next > self.cap_bytes {
+                self.denied.fetch_add(1, Ordering::Relaxed);
                 return None;
             }
             if self
@@ -188,9 +195,11 @@ mod tests {
         let a = pool.try_acquire(16 * 1024).unwrap();
         // 16K taken, 20K cap → an 8K request must fail (no overshoot).
         assert!(pool.try_acquire(8 * 1024).is_none());
+        assert_eq!(pool.denied_allocations(), 1);
         drop(a);
         // Freed → now it fits.
         assert!(pool.try_acquire(8 * 1024).is_some());
+        assert_eq!(pool.denied_allocations(), 1);
     }
 
     #[test]

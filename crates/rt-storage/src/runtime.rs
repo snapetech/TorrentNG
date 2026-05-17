@@ -107,6 +107,11 @@ impl StorageRuntime {
         self.frames.in_use_bytes()
     }
 
+    /// Frame-pool acquisition attempts denied because the hard cap was reached.
+    pub fn frame_denied_allocations(&self) -> u64 {
+        self.frames.denied_allocations()
+    }
+
     /// Frame-pool hard cap.
     pub fn frame_cap_bytes(&self) -> u64 {
         self.frames.cap_bytes()

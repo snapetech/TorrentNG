@@ -4,6 +4,9 @@ This document tracks the native engine storage path for large seedboxes. The
 target is explicit userspace I/O control for 10k-100k torrents and 200+ TB
 libraries without mmap as the primary data path.
 
+The executable feature matrix for this storage branch lives in
+[`STORAGE_NG_TEST_MATRIX.md`](STORAGE_NG_TEST_MATRIX.md).
+
 ## Previous Gap
 
 The original native path used a simple per-block primitive:
@@ -68,10 +71,10 @@ semaphores:
   fallback/failure counters.
 - `rt-storage::StorageRuntime` now has a probe-selected backend layer:
   `TNG_STORAGE_BACKEND=auto|pread|uring` chooses between the portable
-  positioned-I/O worker pool and the Linux `io_uring` insertion point. Until
-  the registered-fd/fixed-buffer uring driver is linked, `uring` requests
-  fall back to `pread` with an explicit diagnostic reason instead of silently
-  changing behavior.
+  positioned-I/O worker pool and Linux `io_uring` positioned reads, writes,
+  and data sync. Kernels or containers that reject `io_uring` fall back to
+  `pread` with an explicit diagnostic reason instead of silently changing
+  behavior.
 - `IoClass::PeerRead` uses a small internal readahead cache when configured:
   the backend may read ahead within the same file, but callers receive exactly
   the requested byte range.
@@ -109,9 +112,8 @@ The following items are still implementation targets:
   read/write/sync/hash work, along with file-pool activity, queue depth, dirty
   files, sync/hash/preallocate counters, peer-read cache counters, logical and
   backend read counters, and in-memory piece assembly pressure.
-- Complete the Linux `UringBackend` syscall driver with registered fds, fixed
-  buffers, batched submit/completion handling, and the same short-I/O/error
-  mapping guarantees as the `pread` backend.
+- Extend the Linux `UringBackend` with registered fds, fixed buffers, and
+  batched submit/completion handling.
 - Add benchmarks comparing syscall count, seed-read locality, recheck runtime
   progress, and bounded descriptor use under active file counts above pool
   capacity.

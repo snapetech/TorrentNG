@@ -31,9 +31,9 @@ scheduler used by the native engine.
 - `IoClass::PeerRead` can read ahead into a small per-file cache while returning
   exactly the requested block bytes to the caller.
 - `StorageRuntime` uses a probe-selected disk backend. Set
-  `TNG_STORAGE_BACKEND=auto|pread|uring` to request a backend; `uring` currently
-  falls back to `pread` with a diagnostic reason until the registered-fd,
-  fixed-buffer syscall driver is linked.
+  `TNG_STORAGE_BACKEND=auto|pread|uring` to request a backend. `pread` is the
+  portable worker-pool path; `uring` uses Linux `io_uring` positioned SQEs when
+  the kernel allows it and falls back with a diagnostic when it cannot.
 
 ## Correctness Expectations
 

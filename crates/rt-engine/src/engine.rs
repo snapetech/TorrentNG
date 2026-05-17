@@ -20,11 +20,16 @@ use rt_config::Config;
 use rt_db::TorrentRow;
 use rt_fastresume::{FastresumeStore, PieceState};
 use rt_metainfo::{parse_torrent, MagnetLink, TorrentMeta, TorrentMetaV1, TorrentMetaV2};
-use rt_metrics::{MemoryClass, ResourceGovernor, ResourceGovernorConfig, MEMORY_CLASS_COUNT};
+use rt_metrics::{
+    MemoryClass, MemoryPressure, ResourceGovernor, ResourceGovernorConfig, MEMORY_CLASS_COUNT,
+};
 use rt_path::{StorageProfile, StorageRootId};
 use rt_peer_wire::handshake::{Handshake, HANDSHAKE_LEN};
 use rt_session::{SessionRegistry, TorrentEntry, TorrentState, TransferStats};
-use rt_storage::{MountScheduler, SchedulerConfig, V2FileHash, V2FileVerifier, VerifyResult};
+use rt_storage::{
+    runtime::StorageRuntime, MountScheduler, SchedulerConfig, V2FileHash, V2FileVerifier,
+    VerifyResult,
+};
 
 use crate::command::{
     CmdResult, EngineCmd, EngineGlobalLimits, EnginePeerSnapshot, EnginePieceState, EngineStats,
@@ -88,6 +93,25 @@ fn resource_config_from_config(config: &Config) -> ResourceGovernorConfig {
         class_caps_bytes,
         pressure_constrained_pct: config.memory.pressure_constrained_pct,
         pressure_critical_pct: config.memory.pressure_critical_pct,
+    }
+}
+
+fn memory_pressure_for(
+    used: u64,
+    cap: u64,
+    constrained_pct: u8,
+    critical_pct: u8,
+) -> MemoryPressure {
+    if cap == 0 {
+        return MemoryPressure::Critical;
+    }
+    let used_pct = used.saturating_mul(100) / cap;
+    if used_pct >= critical_pct as u64 {
+        MemoryPressure::Critical
+    } else if used_pct >= constrained_pct as u64 {
+        MemoryPressure::Constrained
+    } else {
+        MemoryPressure::Normal
     }
 }
 
@@ -1229,6 +1253,10 @@ impl Engine {
             self.config.tracker.http_timeout_secs,
             self.config.tracker.udp_timeout_secs,
             self.config.tracker.min_interval_secs,
+            self.config
+                .memory
+                .piece_assembly_cap_mb
+                .saturating_mul(1024 * 1024) as usize,
         );
         let handle = tokio::spawn(task.run());
         self.torrent_chans
@@ -2331,7 +2359,25 @@ impl Engine {
                     .tier,
             );
         }
-        stats.resources = Some(self.resources.snapshot());
+        let mut resources = self.resources.snapshot();
+        let storage = StorageRuntime::global();
+        let storage_frame = MemoryClass::StorageFrame as usize;
+        resources.classes[storage_frame].cap_bytes = storage.frame_cap_bytes();
+        resources.classes[storage_frame].used_bytes = storage.frame_in_use_bytes();
+        resources.classes[storage_frame].denied_allocations = storage.frame_denied_allocations();
+        let piece_assembly = MemoryClass::PieceAssembly as usize;
+        resources.classes[piece_assembly].used_bytes = stats.piece_assembly_bytes;
+        resources.total_used_bytes = resources
+            .classes
+            .iter()
+            .fold(0u64, |total, class| total.saturating_add(class.used_bytes));
+        resources.pressure = memory_pressure_for(
+            resources.total_used_bytes,
+            resources.total_cap_bytes,
+            self.config.memory.pressure_constrained_pct,
+            self.config.memory.pressure_critical_pct,
+        );
+        stats.resources = Some(resources);
         Ok(stats)
     }
 
@@ -4831,6 +4877,17 @@ mod tests {
         assert_eq!(stats.piece_assembly_buffers, 2);
         assert_eq!(stats.piece_assembly_bytes, 4096);
         assert_eq!(stats.piece_assembly_evictions, 1);
+        let resources = stats.resources.expect("resource snapshot");
+        let storage_frame = MemoryClass::StorageFrame as usize;
+        assert_eq!(
+            resources.classes[storage_frame].cap_bytes,
+            StorageRuntime::global().frame_cap_bytes()
+        );
+        assert_eq!(
+            resources.classes[MemoryClass::PieceAssembly as usize].used_bytes,
+            4096
+        );
+        assert!(resources.total_used_bytes >= 4096);
     }
 
     #[tokio::test]

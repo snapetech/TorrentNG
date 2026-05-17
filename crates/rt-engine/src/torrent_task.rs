@@ -102,7 +102,11 @@ const JOB_STATE_PAUSED: &str = "paused";
 const JOB_STATE_CANCELLED: &str = "cancelled";
 const JOB_STATE_COMPLETED: &str = "completed";
 const MAX_IN_MEMORY_PIECE_ASSEMBLIES: usize = 64;
-const MAX_IN_MEMORY_PIECE_ASSEMBLY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_IN_MEMORY_PIECE_ASSEMBLY_BYTES_PER_TORRENT: usize = 64 * 1024 * 1024;
+
+fn effective_piece_assembly_soft_cap(configured_bytes: usize) -> usize {
+    configured_bytes.min(MAX_IN_MEMORY_PIECE_ASSEMBLY_BYTES_PER_TORRENT)
+}
 
 /// A block received from a peer.
 #[derive(Debug)]
@@ -310,6 +314,7 @@ pub struct TorrentTask {
     last_progress_persist: Option<Instant>,
     piece_assemblies: HashMap<u32, PieceAssembly>,
     piece_assembly_bytes: usize,
+    piece_assembly_soft_cap_bytes: usize,
     piece_assembly_evictions: u64,
     dirty_pieces_since_barrier: HashSet<u32>,
     completed_piece_verify_from_memory: u64,
@@ -333,6 +338,7 @@ impl TorrentTask {
         http_timeout_secs: u64,
         udp_timeout_secs: u64,
         min_interval_secs: u64,
+        piece_assembly_cap_bytes: usize,
     ) -> Self {
         let (peer_event_tx, peer_event_rx) = mpsc::channel(512);
         let total = meta.total_length();
@@ -403,6 +409,9 @@ impl TorrentTask {
             last_progress_persist: None,
             piece_assemblies: HashMap::new(),
             piece_assembly_bytes: 0,
+            piece_assembly_soft_cap_bytes: effective_piece_assembly_soft_cap(
+                piece_assembly_cap_bytes,
+            ),
             piece_assembly_evictions: 0,
             dirty_pieces_since_barrier: HashSet::new(),
             completed_piece_verify_from_memory: 0,
@@ -1464,13 +1473,13 @@ impl TorrentTask {
 
     fn can_aggregate_piece_write(&self, piece: u32) -> bool {
         self.piece_length(piece)
-            .map(|len| len as usize <= MAX_IN_MEMORY_PIECE_ASSEMBLY_BYTES)
+            .map(|len| len as usize <= self.piece_assembly_soft_cap_bytes)
             .unwrap_or(false)
     }
 
     fn record_piece_block(&mut self, block: &BlockEvent) -> anyhow::Result<()> {
         let len = self.piece_length(block.piece)? as usize;
-        if len > MAX_IN_MEMORY_PIECE_ASSEMBLY_BYTES {
+        if len > self.piece_assembly_soft_cap_bytes {
             return Ok(());
         }
 
@@ -1513,7 +1522,7 @@ impl TorrentTask {
             &mut self.piece_assembly_bytes,
             current_piece,
             MAX_IN_MEMORY_PIECE_ASSEMBLIES,
-            MAX_IN_MEMORY_PIECE_ASSEMBLY_BYTES,
+            self.piece_assembly_soft_cap_bytes,
         );
         self.piece_assembly_evictions = self.piece_assembly_evictions.saturating_add(evictions);
     }
@@ -3380,6 +3389,18 @@ mod tests {
         assert_eq!(evictions, 0);
         assert_eq!(bytes, 16);
         assert!(assemblies.contains_key(&7));
+    }
+
+    #[test]
+    fn configured_piece_assembly_cap_is_per_torrent_soft_ceiling() {
+        assert_eq!(
+            effective_piece_assembly_soft_cap(8 * 1024 * 1024),
+            8 * 1024 * 1024
+        );
+        assert_eq!(
+            effective_piece_assembly_soft_cap(512 * 1024 * 1024),
+            MAX_IN_MEMORY_PIECE_ASSEMBLY_BYTES_PER_TORRENT
+        );
     }
 
     #[test]

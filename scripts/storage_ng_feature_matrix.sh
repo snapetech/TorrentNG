@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+run_gate() {
+  local name="$1"
+  shift
+  printf '\n== %s ==\n' "$name"
+  "$@"
+}
+
+run_gate "format" cargo fmt --check
+run_gate "storage unit matrix" cargo test -p rt-storage
+run_gate "resource governor and scale proxies" cargo test -p rt-metrics
+run_gate "configuration defaults" cargo test -p rt-config
+run_gate "engine storage/resource consumers" cargo test -p rt-engine
+run_gate "native API metrics projection" cargo test -p rt-api-native
+
+if [[ "${STORAGE_NG_REAL_DEVICE:-0}" == "1" ]]; then
+  run_gate "real-device storage probes" \
+    bash -c 'STORAGE_PHASE_B_REAL_DEVICE=1 "$1"' _ "$ROOT/scripts/storage_phase_b_matrix.sh"
+fi
+
