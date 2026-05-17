@@ -44,6 +44,16 @@ The native release gate is:
 scripts/native_engine_certification_report.sh
 ```
 
+When a daemon is running, bind the certification report to the live `/health`
+capability manifest as well:
+
+```sh
+NATIVE_ENGINE_URL=http://127.0.0.1:8080 scripts/native_engine_certification_report.sh
+```
+
+The post-soak release gate also reruns native engine rewrite certification
+directly before refreshing the aggregate release report.
+
 Live public transfer evidence is optional for offline CI but required before a
 production release:
 

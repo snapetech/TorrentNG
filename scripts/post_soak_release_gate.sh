@@ -50,6 +50,7 @@ run_gate() {
 
 run_gate "soak status" "$REPORT_DIR/soak-status-$(date -u +%Y%m%dT%H%M%SZ).md" "$ROOT/scripts/soak_status.sh" "$REPORT"
 RESTORE_NORMAL=1 run_gate "soak finalization and restore" "$REPORT_DIR/soak-final-$(date -u +%Y%m%dT%H%M%SZ).md" "$ROOT/scripts/finalize_soak.sh" "$REPORT"
+run_gate "native engine rewrite certification" "$REPORT_DIR/native-engine-post-soak-$(date -u +%Y%m%dT%H%M%SZ).md" "$ROOT/scripts/native_engine_certification_report.sh"
 run_gate "short certification suite" "$REPORT_DIR/pre-engine-suite-post-soak-$(date -u +%Y%m%dT%H%M%SZ).md" "$ROOT/scripts/pre_engine_certification_suite.sh"
 run_gate "release report refresh" "$REPORT_DIR/pre-engine-release-post-soak-$(date -u +%Y%m%dT%H%M%SZ).md" "$ROOT/scripts/pre_engine_release_report.sh"
 
