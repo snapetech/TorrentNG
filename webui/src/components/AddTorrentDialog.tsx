@@ -170,7 +170,10 @@ export function AddTorrentDialog({ onClose }: Props) {
         </div>
 
         {/* URL input */}
-        <div>
+        <div className="rtng-form-card" style={{
+          border: '1px solid var(--border)', borderRadius: 7, background: 'var(--surface)',
+          padding: '9px 10px',
+        }}>
           <label style={{ fontSize: 11, color: 'var(--faint)', display: 'block', marginBottom: 4 }}>
             Magnet links or URLs (one per line)
           </label>
@@ -189,7 +192,10 @@ export function AddTorrentDialog({ onClose }: Props) {
         </div>
 
         {/* Save path */}
-        <div>
+        <div className="rtng-form-card" style={{
+          border: '1px solid var(--border)', borderRadius: 7, background: 'var(--surface)',
+          padding: '9px 10px',
+        }}>
           <label style={{ fontSize: 11, color: 'var(--faint)', display: 'block', marginBottom: 4 }}>Save path</label>
           <input
             value={savePath}
@@ -201,7 +207,10 @@ export function AddTorrentDialog({ onClose }: Props) {
 
         {/* Category */}
         {categories.length > 0 && (
-          <div>
+          <div className="rtng-form-card" style={{
+            border: '1px solid var(--border)', borderRadius: 7, background: 'var(--surface)',
+            padding: '9px 10px',
+          }}>
             <label style={{ fontSize: 11, color: 'var(--faint)', display: 'block', marginBottom: 4 }}>Category</label>
             <select
               value={category}
@@ -224,12 +233,16 @@ export function AddTorrentDialog({ onClose }: Props) {
         )}
 
         {/* Start toggle */}
-        <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: busy ? 'not-allowed' : 'pointer', fontSize: 13, color: 'var(--muted)' }}>
+        <label className="rtng-form-card" data-start={start ? 'true' : 'false'} style={{
+          display: 'flex', alignItems: 'center', gap: 8, cursor: busy ? 'not-allowed' : 'pointer',
+          fontSize: 13, color: 'var(--muted)', border: '1px solid var(--border)', borderRadius: 7,
+          background: 'var(--surface)', padding: '8px 10px',
+        }}>
           <input type="checkbox" checked={start} disabled={busy} onChange={e => setStart(e.target.checked)} style={{ accentColor: 'var(--accent)' }} />
           Start immediately
         </label>
 
-        <div style={{
+        <div className="rtng-add-summary" data-ready={canSubmit ? 'true' : 'false'} data-start={start ? 'true' : 'false'} style={{
           display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10,
           padding: '7px 9px', border: '1px solid var(--border)', borderRadius: 6,
           background: 'var(--surface)', color: 'var(--faint)', fontSize: 12,

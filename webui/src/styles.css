@@ -597,6 +597,34 @@ summary:hover {
     0 0 0 2px color-mix(in srgb, var(--accent) 10%, transparent);
 }
 
+.rtng-form-card[data-start="true"] {
+  box-shadow: inset 3px 0 0 color-mix(in srgb, var(--success) 58%, transparent);
+}
+
+.rtng-form-card[data-start="false"] {
+  box-shadow: inset 3px 0 0 color-mix(in srgb, var(--warning) 68%, transparent);
+}
+
+.rtng-add-summary {
+  transition:
+    border-color 120ms ease,
+    background-color 120ms ease,
+    box-shadow 120ms ease;
+}
+
+.rtng-add-summary[data-ready="true"] {
+  border-color: color-mix(in srgb, var(--success) 38%, var(--border)) !important;
+  box-shadow: inset 3px 0 0 color-mix(in srgb, var(--success) 62%, transparent);
+}
+
+.rtng-add-summary[data-ready="false"] {
+  box-shadow: inset 3px 0 0 color-mix(in srgb, var(--faint) 36%, transparent);
+}
+
+.rtng-add-summary[data-start="false"] {
+  border-color: color-mix(in srgb, var(--warning) 42%, var(--border)) !important;
+}
+
 .rtng-properties-row[data-tone="ok"] {
   box-shadow: inset 3px 0 0 color-mix(in srgb, var(--success) 58%, transparent);
 }
