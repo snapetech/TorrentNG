@@ -26,7 +26,10 @@ pub async fn list_torrents(State(state): State<AppState>) -> impl IntoResponse {
     if let Some(engine) = &state.engine {
         let torrent_count = state.registry.read().await.iter().count();
         let estimate = estimate_torrent_summary_snapshot_bytes(torrent_count);
-        match engine.reserve_memory(MemoryClass::ApiSnapshot, estimate).await {
+        match engine
+            .reserve_memory(MemoryClass::ApiSnapshot, estimate)
+            .await
+        {
             Ok(Some(_lease)) => {
                 let reg = state.registry.read().await;
                 let summaries: Vec<TorrentSummary> = reg.iter().map(torrent_summary).collect();

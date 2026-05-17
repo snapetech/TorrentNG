@@ -283,13 +283,18 @@ impl UringBackend {
 }
 
 fn probe_fixed_buffers(ring: &IoUring) -> io::Result<()> {
-    let mut buf = vec![0u8; 4096];
-    let iovec = libc::iovec {
-        iov_base: buf.as_mut_ptr().cast(),
-        iov_len: buf.len(),
-    };
+    let mut buffers = (0..URING_BATCH_LIMIT)
+        .map(|_| vec![0u8; URING_FIXED_BUFFER_LEN])
+        .collect::<Vec<_>>();
+    let iovecs = buffers
+        .iter_mut()
+        .map(|buf| libc::iovec {
+            iov_base: buf.as_mut_ptr().cast(),
+            iov_len: buf.len(),
+        })
+        .collect::<Vec<_>>();
     unsafe {
-        ring.submitter().register_buffers(&[iovec])?;
+        ring.submitter().register_buffers(&iovecs)?;
     }
     ring.submitter().unregister_buffers()
 }
