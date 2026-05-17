@@ -1132,6 +1132,22 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
         }
     }
     let storage = StorageRuntime::global();
+    metric_with_label(
+        &mut out,
+        "torrentng_storage_backend_selected",
+        "gauge",
+        "Selected global storage backend; value is 1 for the active backend",
+        "backend",
+        storage.backend_kind().as_str(),
+        1,
+    );
+    metric(
+        &mut out,
+        "torrentng_storage_backend_fixed_buffers_supported",
+        "gauge",
+        "Whether the selected storage backend supports fixed registered buffers",
+        u64::from(storage.backend_supports_fixed_buffers()),
+    );
     metric(
         &mut out,
         "torrentng_storage_handles_open",
@@ -1632,6 +1648,8 @@ mod tests {
         assert!(
             rendered.contains("torrentng_storage_hash_latency_nanoseconds_bucket{le=\"+Inf\"} 7")
         );
+        assert!(rendered.contains("torrentng_storage_backend_selected{backend=\""));
+        assert!(rendered.contains("torrentng_storage_backend_fixed_buffers_supported "));
         assert!(rendered.contains("torrentng_storage_handles_open "));
         assert!(rendered.contains("torrentng_storage_frame_bytes_cap "));
     }
