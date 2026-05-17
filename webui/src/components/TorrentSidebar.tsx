@@ -150,13 +150,32 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
       offset: 0,
     })
   }
+  const activeFilterCount = [params.status, params.category, params.tag, params.tracker, params.media_type, params.filter]
+    .filter(Boolean).length
 
   return (
     <aside className="torrent-sidebar" style={{
       width: 236, flexShrink: 0, background: 'var(--panel)', borderRight: '1px solid var(--border)',
       display: 'flex', flexDirection: 'column', overflowY: 'auto',
     }}>
-      <Section title="State">
+      <div style={{
+        position: 'sticky', top: 0, zIndex: 2, background: 'var(--panel)',
+        borderBottom: '1px solid var(--border)', padding: '9px 10px',
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+          <span style={{ color: 'var(--text)', fontWeight: 700, fontSize: 13 }}>Library</span>
+          <span style={{
+            color: activeFilterCount ? 'var(--accent-text)' : 'var(--faint)',
+            background: activeFilterCount ? 'var(--accent-soft)' : 'var(--surface)',
+            border: '1px solid ' + (activeFilterCount ? 'var(--accent)' : 'var(--border)'),
+            borderRadius: 999, padding: '1px 7px', fontSize: 10, fontWeight: 700,
+          }}>
+            {activeFilterCount ? `${activeFilterCount} active` : 'all'}
+          </span>
+        </div>
+      </div>
+
+      <Section title="State" summary={facets ? `${facets.status.all?.toLocaleString() ?? total.toLocaleString()} total` : undefined}>
         {STATUS_OPTIONS.map(option => (
           <CountRow
             key={option.value}
@@ -169,7 +188,7 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
         ))}
       </Section>
 
-      <Section title="Type">
+      <Section title="Type" summary={mediaInference === 'off' ? 'manual' : 'inferred'}>
         <CountRow
           icon="◇"
           label="All types"
@@ -192,7 +211,7 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
         )}
       </Section>
 
-      <Section title="Categories / Labels">
+      <Section title="Categories / Labels" summary={categories.length ? categories.length.toLocaleString() : undefined}>
         <CountRow
           icon="⌁"
           label="All categories"
@@ -216,7 +235,7 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
       </Section>
 
       {tags.length > 0 && (
-        <Section title="Tags">
+        <Section title="Tags" summary={tags.length.toLocaleString()}>
           <CountRow
             icon="#"
             label="All tags"
@@ -239,7 +258,7 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
         </Section>
       )}
 
-      <Section title="Trackers">
+      <Section title="Trackers" summary={trackerHealth?.trackers.length.toLocaleString()}>
         <CountRow
           icon="☊"
           label="All trackers"
@@ -269,6 +288,7 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
             label={trackerHost(row.tracker)}
             active={(params.tracker ?? '') === row.tracker}
             count={row.torrent_count}
+            tone={row.error_count > 0 ? 'warn' : 'ok'}
             onClick={() => onChange({ tracker: row.tracker, offset: 0 })}
           />
         ))}
@@ -296,11 +316,15 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
         </div>
       </Section>
 
-      <Section title="Saved Views">
-        {views.length === 0 && <div style={{ color: '#475569', fontSize: 12, padding: '2px 4px 6px' }}>No saved views</div>}
-        {viewsError && <div style={{ color: 'var(--danger)', fontSize: 11, padding: '2px 4px 6px' }}>{viewsError}</div>}
+      <Section title="Saved Views" summary={viewsBusy ? 'working' : views.length ? views.length.toLocaleString() : undefined}>
+        {views.length === 0 && (
+          <div style={emptySavedViewStyle}>
+            Save the current filters as a named view.
+          </div>
+        )}
+        {viewsError && <div style={sidebarNoticeStyle}>{viewsError}</div>}
         {views.map(view => (
-          <div key={view.id} style={{ display: 'grid', gridTemplateColumns: '1fr 26px', gap: 4, marginBottom: 4 }}>
+          <div key={view.id} style={savedViewRowStyle}>
             <button
               onClick={() => onApply(view.params)}
               disabled={Boolean(viewsBusy)}
@@ -310,6 +334,7 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
               <span style={labelStyle}>{view.name}</span>
             </button>
             <button
+              aria-label={`Delete ${view.name}`}
               onClick={() => removeView(view.id)}
               disabled={Boolean(viewsBusy)}
               title="Delete saved view"
@@ -319,7 +344,7 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
             </button>
           </div>
         ))}
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 44px', gap: 6, marginTop: 6 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 44px', gap: 6, marginTop: 7 }}>
           <input
             value={viewName}
             onChange={e => setViewName(e.target.value)}
@@ -334,8 +359,12 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
         </div>
       </Section>
 
-      {(params.status || params.category || params.tag || params.tracker || params.media_type || params.filter) && (
-        <div style={{ padding: '10px 12px 14px', borderTop: '1px solid var(--border)' }}>
+      {activeFilterCount > 0 && (
+        <div style={{
+          position: 'sticky', bottom: 0, background: 'var(--panel)',
+          padding: '10px 12px 14px', borderTop: '1px solid var(--border)',
+          boxShadow: '0 -10px 22px var(--shadow)',
+        }}>
           <button onClick={clearFilters} style={{
             width: '100%', background: 'transparent', border: '1px solid var(--border-strong)', borderRadius: 5,
             color: 'var(--muted)', padding: '6px 8px', fontSize: 12, cursor: 'pointer',
@@ -348,31 +377,43 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
   )
 }
 
-function CountRow({ icon, label, active, count, onClick }: {
+function CountRow({ icon, label, active, count, tone, onClick }: {
   icon?: string
   label: string
   active: boolean
   count?: number
+  tone?: 'ok' | 'warn'
   onClick: () => void
 }) {
   return (
     <button onClick={onClick} style={rowButtonStyle(active)}>
-      {icon && <span style={iconStyle(active)}>{icon}</span>}
+      {icon && <span style={iconStyle(active, tone)}>{icon}</span>}
       <span style={labelStyle}>{label}</span>
-      <span style={{ color: active ? 'var(--accent-text)' : 'var(--faint)', fontVariantNumeric: 'tabular-nums' }}>
+      <span style={{
+        color: active ? 'var(--accent-text)' : tone === 'warn' ? 'var(--warning)' : 'var(--faint)',
+        fontVariantNumeric: 'tabular-nums',
+        border: count !== undefined ? '1px solid var(--border)' : undefined,
+        borderRadius: 999,
+        padding: count !== undefined ? '0 6px' : undefined,
+        background: count !== undefined ? 'var(--surface)' : undefined,
+      }}>
         {count === undefined ? '' : count.toLocaleString()}
       </span>
     </button>
   )
 }
 
-function Section({ title, children }: { title: string; children: React.ReactNode }) {
+function Section({ title, summary, children }: { title: string; summary?: string; children: React.ReactNode }) {
   return (
     <section style={{ padding: '10px 10px 8px', borderBottom: '1px solid var(--border)' }}>
       <div style={{
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8,
         color: 'var(--faint)', fontSize: 11, fontWeight: 700, textTransform: 'uppercase',
         margin: '0 4px 7px',
-      }}>{title}</div>
+      }}>
+        <span>{title}</span>
+        {summary && <span style={{ color: 'var(--faint)', fontWeight: 600, textTransform: 'none' }}>{summary}</span>}
+      </div>
       {children}
     </section>
   )
@@ -392,10 +433,10 @@ const labelStyle: React.CSSProperties = {
   whiteSpace: 'nowrap',
 }
 
-function iconStyle(active: boolean): React.CSSProperties {
+function iconStyle(active: boolean, tone?: 'ok' | 'warn'): React.CSSProperties {
   return {
     width: 18,
-    color: active ? 'var(--accent-text)' : 'var(--accent)',
+    color: active ? 'var(--accent-text)' : tone === 'warn' ? 'var(--warning)' : tone === 'ok' ? 'var(--success)' : 'var(--accent)',
     fontSize: 15,
     lineHeight: '14px',
     textAlign: 'center',
@@ -426,7 +467,7 @@ const inputStyle: React.CSSProperties = {
 }
 
 const deleteStyle: React.CSSProperties = {
-  background: 'transparent',
+  background: 'var(--surface)',
   border: '1px solid var(--border-strong)',
   borderRadius: 5,
   color: 'var(--faint)',
@@ -437,8 +478,8 @@ const deleteStyle: React.CSSProperties = {
 const savedViewButtonStyle: React.CSSProperties = {
   width: '100%',
   minWidth: 0,
-  background: 'transparent',
-  border: '1px solid transparent',
+  background: 'var(--surface)',
+  border: '1px solid var(--border-strong)',
   borderRadius: 5,
   color: 'var(--muted)',
   padding: '5px 7px',
@@ -446,6 +487,36 @@ const savedViewButtonStyle: React.CSSProperties = {
   cursor: 'pointer',
   display: 'block',
   textAlign: 'left',
+}
+
+const savedViewRowStyle: React.CSSProperties = {
+  display: 'grid',
+  gridTemplateColumns: '1fr 26px',
+  gap: 4,
+  marginBottom: 4,
+}
+
+const emptySavedViewStyle: React.CSSProperties = {
+  color: 'var(--faint)',
+  background: 'color-mix(in srgb, var(--surface) 72%, transparent)',
+  border: '1px dashed var(--border-strong)',
+  borderRadius: 6,
+  fontSize: 11,
+  lineHeight: 1.35,
+  padding: '8px 9px',
+  marginBottom: 7,
+}
+
+const sidebarNoticeStyle: React.CSSProperties = {
+  color: 'var(--danger)',
+  background: 'color-mix(in srgb, var(--danger) 9%, var(--surface))',
+  border: '1px solid color-mix(in srgb, var(--danger) 40%, var(--border))',
+  borderRadius: 6,
+  fontSize: 11,
+  lineHeight: 1.35,
+  padding: '7px 8px',
+  marginBottom: 7,
+  overflowWrap: 'anywhere',
 }
 
 const overflowNote: React.CSSProperties = {

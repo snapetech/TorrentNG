@@ -1969,7 +1969,7 @@ impl Engine {
             );
             return Ok(());
         }
-        self.send_to_torrent(info_hash, TorrentCmd::NewPeers(peers))
+        self.send_to_torrent(info_hash, TorrentCmd::PriorityPeers(peers))
             .await
     }
 
@@ -4030,7 +4030,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             torrent_rx.recv().await,
-            Some(TorrentCmd::NewPeers(peers)) if peers == vec![peer]
+            Some(TorrentCmd::PriorityPeers(peers)) if peers == vec![peer]
         ));
     }
 

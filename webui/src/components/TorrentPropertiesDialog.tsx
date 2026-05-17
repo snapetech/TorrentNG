@@ -78,7 +78,7 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
       position: 'fixed', inset: 0, background: 'rgba(2,6,23,0.72)', zIndex: 1200,
       display: 'grid', placeItems: 'center', padding: 22,
     }} onClick={e => { if (!busy && e.target === e.currentTarget) onClose() }}>
-      <div style={{
+      <div role="dialog" aria-modal="true" aria-label={`Properties for ${torrent.name}`} className="rtng-properties-dialog rtng-modal" style={{
         width: 'min(820px, 100%)', height: 'min(680px, 90vh)', background: 'var(--panel)',
         border: '1px solid var(--border-strong)', borderRadius: 8, display: 'flex', flexDirection: 'column',
         boxShadow: '0 24px 60px var(--shadow)',
@@ -88,11 +88,15 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
             <div style={{ color: 'var(--text)', fontWeight: 700, fontSize: 15 }}>Properties</div>
             <div style={{ color: 'var(--faint)', fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{torrent.name}</div>
           </div>
+          {busy && <span style={{
+            alignSelf: 'center', color: 'var(--accent-text)', background: 'var(--accent-soft)', border: '1px solid var(--accent)',
+            borderRadius: 999, padding: '2px 8px', fontSize: 11, fontWeight: 700,
+          }}>Saving</span>}
           <button onClick={onClose} disabled={busy} style={smallButton('#94a3b8', busy)}>Close</button>
         </header>
 
-        <div style={{ display: 'flex', minHeight: 0, flex: 1 }}>
-          <nav style={{ width: 150, borderRight: '1px solid var(--border)', padding: 10 }}>
+        <div className="rtng-properties-body" style={{ display: 'flex', minHeight: 0, flex: 1 }}>
+          <nav className="rtng-properties-tabs" style={{ width: 150, borderRight: '1px solid var(--border)', padding: 10 }}>
             {(['general', 'trackers', 'files', 'limits'] as Tab[]).map(item => (
               <button key={item} onClick={() => setTab(item)} disabled={busy} style={{
                 width: '100%', textAlign: 'left', marginBottom: 5, borderRadius: 5,
@@ -101,11 +105,16 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
                 color: tab === item ? 'var(--accent-text)' : 'var(--muted)',
                 padding: '7px 9px', fontSize: 12, cursor: busy ? 'not-allowed' : 'pointer',
                 textTransform: 'capitalize', opacity: busy && tab !== item ? 0.55 : 1,
-              }}>{item}</button>
+                display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8,
+              }}>
+                <span>{item}</span>
+                {item === 'trackers' && trackers.length > 0 && <TabCount>{trackers.length}</TabCount>}
+                {item === 'files' && files.length > 0 && <TabCount>{files.length}</TabCount>}
+              </button>
             ))}
           </nav>
 
-          <main style={{ flex: 1, overflowY: 'auto', padding: 14 }}>
+          <main className="rtng-properties-main" style={{ flex: 1, overflowY: 'auto', padding: 14 }}>
             {tab === 'general' && (
               <div style={{ display: 'grid', gap: 12 }}>
                 <Field label="Name">
@@ -142,7 +151,7 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
                     </div>
                   )}
                 </Field>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, color: 'var(--muted)', fontSize: 12 }}>
+                <div className="rtng-two-col" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, color: 'var(--muted)', fontSize: 12 }}>
                   <Info label="Hash" value={torrent.hash} mono />
                   <Info label="Tracker" value={torrent.tracker_url || '-'} mono />
                   <Info label="Save path" value={torrent.directory || '-'} mono />
@@ -160,15 +169,15 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
                     setNewTracker('')
                   })} style={smallButton('#93c5fd', busy || !newTracker.trim())}>Add</button>
                 </div>
-                {trackersLoading && <div style={{ color: 'var(--faint)', fontSize: 12 }}>Loading trackers…</div>}
-                {trackersError && <div style={{ color: 'var(--danger)', fontSize: 12 }}>Tracker details unavailable.</div>}
+                {trackersLoading && <LoadingRows count={2} />}
+                {trackersError && <Notice>Tracker details unavailable.</Notice>}
                 {!trackersLoading && !trackersError && trackers.length === 0 && (
-                  <div style={{ color: 'var(--faint)', fontSize: 12 }}>No trackers.</div>
+                  <EmptyState>No trackers configured.</EmptyState>
                 )}
                 {trackers.map(tracker => (
                   <div key={tracker.url} style={{ borderBottom: '1px solid var(--border)', padding: '8px 0' }}>
                     {editingTracker?.url === tracker.url ? (
-                      <div style={{ display: 'grid', gridTemplateColumns: '1fr auto auto', gap: 7 }}>
+                      <div className="rtng-action-grid-3" style={{ display: 'grid', gridTemplateColumns: '1fr auto auto', gap: 7 }}>
                         <input value={trackerUrl} onChange={e => setTrackerUrl(e.target.value)} disabled={busy} style={{ ...INPUT, fontFamily: 'monospace' }} />
                         <button disabled={busy || !trackerUrl.trim()} onClick={() => apply('Tracker edited', async () => {
                           await api.torrents.patchTrackers(torrent.hash, { edit: [{ orig_url: tracker.url, new_url: trackerUrl.trim() }] })
@@ -177,7 +186,7 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
                         <button disabled={busy} onClick={() => setEditingTracker(null)} style={smallButton('#64748b', busy)}>Cancel</button>
                       </div>
                     ) : (
-                      <div style={{ display: 'grid', gridTemplateColumns: '1fr auto auto', gap: 7, alignItems: 'center' }}>
+                      <div className="rtng-action-grid-3" style={{ display: 'grid', gridTemplateColumns: '1fr auto auto', gap: 7, alignItems: 'center' }}>
                         <div>
                           <div style={{ color: 'var(--text)', fontFamily: 'monospace', fontSize: 11, overflowWrap: 'anywhere' }}>{tracker.url}</div>
                           <div style={{ color: 'var(--faint)', fontSize: 11 }}>{tracker.scrape_complete} seeds, {tracker.scrape_incomplete} peers {tracker.message ? `- ${tracker.message}` : ''}</div>
@@ -193,10 +202,10 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
 
             {tab === 'files' && (
               <div style={{ display: 'grid', gap: 7 }}>
-                {filesLoading && <div style={{ color: 'var(--faint)', fontSize: 12 }}>Loading files…</div>}
-                {filesError && <div style={{ color: 'var(--danger)', fontSize: 12 }}>File details unavailable.</div>}
+                {filesLoading && <LoadingRows count={3} />}
+                {filesError && <Notice>File details unavailable.</Notice>}
                 {!filesLoading && !filesError && files.length === 0 && (
-                  <div style={{ color: 'var(--faint)', fontSize: 12 }}>No files reported.</div>
+                  <EmptyState>No files reported.</EmptyState>
                 )}
                 {files.map(file => <FileRow
                   key={file.index}
@@ -237,7 +246,12 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
             )}
           </main>
         </div>
-        {message && <div style={{ borderTop: '1px solid var(--border)', padding: '8px 14px', color: messageTone === 'error' ? 'var(--danger)' : 'var(--success)', fontSize: 12 }}>{message}</div>}
+        {message && <div role={messageTone === 'error' ? 'alert' : 'status'} style={{
+          borderTop: '1px solid var(--border)', padding: '8px 14px',
+          color: messageTone === 'error' ? 'var(--danger)' : 'var(--success)', fontSize: 12,
+          background: messageTone === 'error' ? 'color-mix(in srgb, var(--danger) 8%, transparent)' : 'color-mix(in srgb, var(--success) 7%, transparent)',
+          overflowWrap: 'anywhere',
+        }}>{message}</div>}
       </div>
     </div>
   )
@@ -255,19 +269,37 @@ function FileRow({ file, busy, renaming, name, onName, onRenameStart, onRenameCa
   onPriority: (priority: number) => void
 }) {
   const pct = file.size_chunks ? Math.round((file.completed_chunks / file.size_chunks) * 100) : 100
+  const priority = file.priority === 0
+    ? { label: 'Skipped', color: 'var(--faint)' }
+    : file.priority >= 2
+      ? { label: 'High', color: 'var(--accent)' }
+      : { label: 'Normal', color: 'var(--success)' }
   return (
-    <div style={{ border: '1px solid var(--border)', borderRadius: 5, padding: 8, background: 'var(--surface)' }}>
+    <div style={{ border: '1px solid var(--border)', borderRadius: 7, padding: 9, background: 'var(--surface)' }}>
       {renaming ? (
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr auto auto', gap: 7 }}>
+        <div className="rtng-action-grid-3" style={{ display: 'grid', gridTemplateColumns: '1fr auto auto', gap: 7 }}>
           <input value={name} onChange={e => onName(e.target.value)} style={INPUT} />
           <button disabled={busy || !name.trim()} onClick={onRenameSave} style={smallButton('#93c5fd', busy || !name.trim())}>Save</button>
           <button disabled={busy} onClick={onRenameCancel} style={smallButton('#64748b', busy)}>Cancel</button>
         </div>
       ) : (
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr auto auto', gap: 7, alignItems: 'center' }}>
+        <div className="rtng-action-grid-3" style={{ display: 'grid', gridTemplateColumns: '1fr auto auto', gap: 7, alignItems: 'center' }}>
           <div style={{ minWidth: 0 }}>
             <div style={{ color: 'var(--text)', fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={file.path}>{file.path}</div>
-            <div style={{ color: 'var(--faint)', fontSize: 11 }}>{pct}% complete, priority {file.priority}</div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 4 }}>
+              <div style={{ flex: 1, height: 4, background: 'var(--surface-2)', borderRadius: 999, overflow: 'hidden' }}>
+                <div style={{
+                  width: `${Math.min(100, Math.max(0, pct))}%`, height: '100%',
+                  background: pct >= 100 ? 'var(--success)' : 'var(--accent)',
+                }} />
+              </div>
+              <span style={{ color: 'var(--faint)', fontSize: 10, flexShrink: 0 }}>{pct}%</span>
+              <span style={{
+                color: priority.color, fontSize: 10, fontWeight: 700,
+                border: '1px solid var(--border)', borderRadius: 999, padding: '0 6px',
+                background: 'var(--bg)',
+              }}>{priority.label}</span>
+            </div>
           </div>
           <select value={file.priority} disabled={busy} onChange={e => onPriority(Number(e.target.value))} style={{ ...INPUT, width: 112 }}>
             <option value={0}>Do not download</option>
@@ -282,7 +314,56 @@ function FileRow({ file, busy, renaming, name, onName, onRenameStart, onRenameCa
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
-  return <label style={{ display: 'grid', gap: 5, color: 'var(--faint)', fontSize: 11, fontWeight: 700, textTransform: 'uppercase' }}>{label}{children}</label>
+  return <label style={{
+    display: 'grid', gap: 6, color: 'var(--faint)', fontSize: 11, fontWeight: 700,
+    textTransform: 'uppercase', background: 'var(--surface)', border: '1px solid var(--border)',
+    borderRadius: 7, padding: 10,
+  }}>{label}{children}</label>
+}
+
+function LoadingRows({ count }: { count: number }) {
+  return (
+    <div style={{ display: 'grid', gap: 7 }}>
+      {Array.from({ length: count }, (_, index) => (
+        <div key={index} style={{
+          border: '1px solid var(--border)', borderRadius: 7, background: 'var(--surface)',
+          padding: '9px 10px', display: 'grid', gap: 7,
+        }}>
+          <span className="rtng-skeleton" style={{ width: index % 2 ? '46%' : '64%', height: 10 }} />
+          <span className="rtng-skeleton" style={{ width: index % 2 ? '76%' : '52%', height: 8 }} />
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function EmptyState({ children }: { children: React.ReactNode }) {
+  return <div style={{
+    color: 'var(--faint)', fontSize: 12,
+    border: '1px dashed var(--border-strong)', borderRadius: 7,
+    background: 'color-mix(in srgb, var(--surface) 72%, transparent)',
+    padding: '12px 13px',
+  }}>{children}</div>
+}
+
+function Notice({ children }: { children: React.ReactNode }) {
+  return <div role="alert" style={{
+    color: 'var(--danger)', fontSize: 12,
+    background: 'color-mix(in srgb, var(--danger) 9%, var(--surface))',
+    border: '1px solid color-mix(in srgb, var(--danger) 45%, var(--border))',
+    borderRadius: 6,
+    padding: '8px 9px',
+    overflowWrap: 'anywhere',
+  }}>{children}</div>
+}
+
+function TabCount({ children }: { children: React.ReactNode }) {
+  return (
+    <span style={{
+      border: '1px solid var(--border)', borderRadius: 999, padding: '0 6px',
+      background: 'var(--surface)', color: 'var(--faint)', fontSize: 10,
+    }}>{children}</span>
+  )
 }
 
 function Info({ label, value, mono }: { label: string; value: string; mono?: boolean }) {

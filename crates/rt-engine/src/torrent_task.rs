@@ -71,8 +71,10 @@ pub enum TorrentCmd {
     Reannounce,
     ReloadFilePolicy,
     Shutdown,
-    /// Peers discovered by DHT or tracker.
+    /// Peers discovered by DHT, tracker, or peer exchange.
     NewPeers(Vec<SocketAddr>),
+    /// Peers explicitly added through a client API.
+    PriorityPeers(Vec<SocketAddr>),
     GetPeers {
         reply: oneshot::Sender<Vec<EnginePeerSnapshot>>,
     },
@@ -219,6 +221,7 @@ pub struct TorrentTask {
     last_peerless_reannounce: Option<Instant>,
     webseed_client: reqwest::Client,
     webseed_next_index: usize,
+    webseed_failures: Vec<u8>,
     last_progress_persist: Option<Instant>,
     paused: bool,
     max_peers: usize,
@@ -247,6 +250,7 @@ impl TorrentTask {
             total % meta.piece_length
         };
         let piece_count = meta.pieces.len();
+        let webseed_failures = vec![0; meta.webseeds.len()];
         let picker = PiecePicker::new(piece_count, meta.piece_length as u32, last_piece_len as u32);
         let info_hash_hex = meta.info_hash.iter().map(|b| format!("{b:02x}")).collect();
         let piece_map = PieceMap::new(
@@ -302,6 +306,7 @@ impl TorrentTask {
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             webseed_next_index: 0,
+            webseed_failures,
             last_progress_persist: None,
             paused,
             max_peers,
@@ -360,6 +365,12 @@ impl TorrentTask {
                             if !self.paused {
                                 self.remember_tracker_peers(&addrs);
                                 self.connect_peers(addrs).await;
+                            }
+                        }
+                        TorrentCmd::PriorityPeers(addrs) => {
+                            if !self.paused {
+                                self.remember_tracker_peers(&addrs);
+                                self.connect_priority_peers(addrs).await;
                             }
                         }
                         TorrentCmd::GetPeers { reply } => {
@@ -453,6 +464,59 @@ impl TorrentTask {
                         .await;
                 }
             });
+        }
+    }
+
+    async fn connect_priority_peers(&mut self, addrs: Vec<SocketAddr>) {
+        let preferred: HashSet<SocketAddr> = addrs.iter().copied().collect();
+        for addr in addrs {
+            if self.active_peers.contains_key(&addr) {
+                continue;
+            }
+            if self.active_peers.len() >= self.max_peers {
+                self.drop_replaceable_peer(&preferred).await;
+            }
+            if self.active_peers.len() >= self.max_peers {
+                break;
+            }
+            self.connect_peers(vec![addr]).await;
+        }
+    }
+
+    async fn drop_replaceable_peer(&mut self, preferred: &HashSet<SocketAddr>) {
+        let victim = self
+            .active_peers
+            .iter()
+            .find(|(addr, peer)| !preferred.contains(addr) && peer.choked && peer.outstanding == 0)
+            .map(|(addr, _)| *addr)
+            .or_else(|| {
+                self.active_peers
+                    .iter()
+                    .find(|(addr, peer)| !preferred.contains(addr) && peer.outstanding == 0)
+                    .map(|(addr, _)| *addr)
+            })
+            .or_else(|| {
+                self.active_peers
+                    .keys()
+                    .find(|addr| !preferred.contains(addr))
+                    .copied()
+            });
+
+        let Some(victim) = victim else {
+            return;
+        };
+        if let Some(handle) = self.active_peers.remove(&victim) {
+            let bitfield = pieces_to_bitfield(&handle.peer_has);
+            self.picker.availability.remove_bitfield(&bitfield);
+            for req in handle.requested {
+                self.picker.cancel_request(req.piece as usize, req.begin);
+            }
+            let _ = handle.cmd_tx.try_send(PeerCommand::Shutdown);
+            debug!(
+                torrent = %self.info_hash_hex,
+                peer = %victim,
+                "dropped peer to connect priority peer"
+            );
         }
     }
 
@@ -863,6 +927,9 @@ impl TorrentTask {
         {
             return;
         }
+        if !self.active_peers.is_empty() {
+            return;
+        }
 
         let peer_has_all = vec![true; self.meta.pieces.len()];
         let Some(req) = self.picker.pick(&peer_has_all) else {
@@ -872,12 +939,23 @@ impl TorrentTask {
         let seed_count = self.meta.webseeds.len();
         for attempt in 0..seed_count {
             let idx = (self.webseed_next_index + attempt) % seed_count;
+            if self
+                .webseed_failures
+                .get(idx)
+                .copied()
+                .is_some_and(|failures| failures >= 3)
+            {
+                continue;
+            }
             let Some(url) = webseed_block_url(&self.meta, &self.meta.webseeds[idx]) else {
                 continue;
             };
             match self.fetch_webseed_block(&url, req).await {
                 Ok(data) => {
                     self.webseed_next_index = (idx + 1) % seed_count;
+                    if let Some(failures) = self.webseed_failures.get_mut(idx) {
+                        *failures = 0;
+                    }
                     self.handle_block(BlockEvent {
                         piece: req.piece,
                         offset: req.begin,
@@ -887,12 +965,20 @@ impl TorrentTask {
                     return;
                 }
                 Err(e) => {
+                    let err = e.to_string();
+                    if let Some(failures) = self.webseed_failures.get_mut(idx) {
+                        if err.contains("HTTP 404") || err.contains("HTTP 410") {
+                            *failures = 3;
+                        } else {
+                            *failures = failures.saturating_add(1);
+                        }
+                    }
                     warn!(
                         torrent = %self.info_hash_hex,
                         webseed = %self.meta.webseeds[idx],
                         piece = req.piece,
                         offset = req.begin,
-                        err = %e,
+                        err = %err,
                         "webseed block fetch failed"
                     );
                 }
@@ -1090,11 +1176,11 @@ impl TorrentTask {
             match decisions.get(&handle.id).copied() {
                 Some(ChokeDecision::Unchoke) if handle.upload_choked => {
                     handle.upload_choked = false;
-                    let _ = handle.cmd_tx.send(PeerCommand::Unchoke).await;
+                    let _ = handle.cmd_tx.try_send(PeerCommand::Unchoke);
                 }
                 Some(ChokeDecision::Choke) if !handle.upload_choked => {
                     handle.upload_choked = true;
-                    let _ = handle.cmd_tx.send(PeerCommand::Choke).await;
+                    let _ = handle.cmd_tx.try_send(PeerCommand::Choke);
                 }
                 _ => {}
             }
@@ -1124,7 +1210,7 @@ impl TorrentTask {
                     req
                 }
             };
-            if handle.cmd_tx.send(PeerCommand::Request(req)).await.is_err() {
+            if handle.cmd_tx.try_send(PeerCommand::Request(req)).is_err() {
                 self.picker.cancel_request(req.piece as usize, req.begin);
                 break;
             }
@@ -1154,7 +1240,6 @@ impl TorrentTask {
             match self.verify_piece(block.piece).await {
                 VerifyResult::Valid => {
                     info!(piece = block.piece, torrent = %self.info_hash_hex, "piece complete");
-                    self.persist_progress_throttled(false).await;
                     self.send_have_to_peers(block.piece).await;
                     if self.picker.is_complete() {
                         self.persist_progress_throttled(true).await;
@@ -1172,8 +1257,6 @@ impl TorrentTask {
                         "piece verification failed"
                     );
                     self.picker.reject_piece(block.piece as usize);
-                    self.persist_progress_throttled(true).await;
-                    self.save_fastresume(false).await;
                 }
                 VerifyResult::Missing { file_index, reason } => {
                     warn!(
@@ -1184,8 +1267,6 @@ impl TorrentTask {
                         "piece verification could not read data"
                     );
                     self.picker.reject_piece(block.piece as usize);
-                    self.persist_progress_throttled(true).await;
-                    self.save_fastresume(false).await;
                 }
             }
         }
@@ -1529,6 +1610,7 @@ impl TorrentTask {
                     return Some(RecheckOutcome::Cancelled);
                 }
                 Ok(TorrentCmd::NewPeers(_)) => {}
+                Ok(TorrentCmd::PriorityPeers(_)) => {}
                 Ok(TorrentCmd::GetPeers { reply }) => {
                     let _ = reply.send(Vec::new());
                 }

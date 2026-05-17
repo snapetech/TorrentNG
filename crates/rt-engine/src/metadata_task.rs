@@ -56,7 +56,7 @@ pub async fn run_metadata_task(
         tokio::select! {
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {
-                    TorrentCmd::NewPeers(peers) => {
+                    TorrentCmd::NewPeers(peers) | TorrentCmd::PriorityPeers(peers) => {
                         if paused {
                             continue;
                         }

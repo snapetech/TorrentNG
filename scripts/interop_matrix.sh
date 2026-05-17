@@ -17,6 +17,7 @@ PUBLIC_MIN_RUST_PEERS="${INTEROP_PUBLIC_MIN_RUST_PEERS:-2}"
 KEEP_STACK="${INTEROP_KEEP_STACK:-0}"
 KEEP_PUBLIC_DATA="${INTEROP_KEEP_PUBLIC_DATA:-0}"
 RUST_TOKEN="${INTEROP_RUST_TOKEN:-interop-token}"
+CURL_MAX_TIME="${INTEROP_CURL_MAX_TIME:-10}"
 
 CLIENTS=(rusttorrentd qbittorrent transmission deluge rtorrent)
 LOCAL_CASES=(
@@ -46,6 +47,7 @@ Environment:
   INTEROP_SKIP_BUILD=1
   INTEROP_KEEP_STACK=1
   INTEROP_KEEP_PUBLIC_DATA=0
+  INTEROP_CURL_MAX_TIME=10
   INTEROP_WORKDIR=certification/interop
 USAGE
 }
@@ -175,15 +177,15 @@ capture_artifacts() {
   for service in rusttorrentd qbittorrent transmission deluge rtorrent opentracker fixture-http; do
     compose logs --no-color --tail=250 "$service" >"$WORKDIR/logs/$STAMP/$service.log" 2>&1 || true
   done
-  curl -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/health" >"$WORKDIR/logs/$STAMP/rust-health.json" 2>/dev/null || true
-  curl -fsS "$(client_url rusttorrentd)/metrics" >"$WORKDIR/logs/$STAMP/rust-metrics.txt" 2>/dev/null || true
-  curl -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/v1/torrents" >"$WORKDIR/logs/$STAMP/rust-torrents.json" 2>/dev/null || true
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/health" >"$WORKDIR/logs/$STAMP/rust-health.json" 2>/dev/null || true
+  curl --max-time "$CURL_MAX_TIME" -fsS "$(client_url rusttorrentd)/metrics" >"$WORKDIR/logs/$STAMP/rust-metrics.txt" 2>/dev/null || true
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/v1/torrents" >"$WORKDIR/logs/$STAMP/rust-torrents.json" 2>/dev/null || true
 }
 
 wait_http() {
   local name="$1" url="$2" timeout="${3:-180}" start
   start="$(date +%s)"
-  until curl -fsS "$url" >/dev/null 2>&1; do
+  until curl --max-time "$CURL_MAX_TIME" -fsS "$url" >/dev/null 2>&1; do
     if (( "$(date +%s)" - start > timeout )); then
       echo "timed out waiting for $name at $url" >&2
       return 1
@@ -196,7 +198,7 @@ wait_http_status() {
   local name="$1" url="$2" pattern="$3" timeout="${4:-180}" start code
   start="$(date +%s)"
   while true; do
-    code="$(curl -sS -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)"
+    code="$(curl --max-time "$CURL_MAX_TIME" -sS -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)"
     if [[ "$code" =~ $pattern ]]; then
       return 0
     fi
@@ -288,12 +290,12 @@ copy_torrent_to_rtorrent_watch() {
 
 qb_login() {
   local pass
-  if curl -fsS -H 'Host: localhost:8080' -c "$WORKDIR/artifacts/qbit.cookie" -d 'username=admin&password=adminadmin' "$(client_url qbittorrent)/api/v2/auth/login" >/dev/null; then
+  if curl --max-time "$CURL_MAX_TIME" -fsS -H 'Host: localhost:8080' -c "$WORKDIR/artifacts/qbit.cookie" -d 'username=admin&password=adminadmin' "$(client_url qbittorrent)/api/v2/auth/login" >/dev/null; then
     return 0
   fi
   pass="$(compose logs --no-color qbittorrent 2>/dev/null | sed -n 's/.*temporary password is provided for this session: //p' | tail -n1)"
   [[ -n "$pass" ]] || return 1
-  curl -fsS -H 'Host: localhost:8080' -c "$WORKDIR/artifacts/qbit.cookie" --data-urlencode 'username=admin' --data-urlencode "password=$pass" "$(client_url qbittorrent)/api/v2/auth/login" >/dev/null
+  curl --max-time "$CURL_MAX_TIME" -fsS -H 'Host: localhost:8080' -c "$WORKDIR/artifacts/qbit.cookie" --data-urlencode 'username=admin' --data-urlencode "password=$pass" "$(client_url qbittorrent)/api/v2/auth/login" >/dev/null
 }
 
 add_qb() {
@@ -301,7 +303,7 @@ add_qb() {
   [[ -r "$torrent" ]] || { log "qBittorrent torrent file is not readable: $(printf '%q' "$torrent")"; return 1; }
   [[ "$add_mode" == "seed" ]] && skip=(-F "skip_checking=true")
   qb_login
-  curl -fsS -H 'Host: localhost:8080' -b "$WORKDIR/artifacts/qbit.cookie" \
+  curl --max-time "$CURL_MAX_TIME" -fsS -H 'Host: localhost:8080' -b "$WORKDIR/artifacts/qbit.cookie" \
     -F "torrents=@$torrent" \
     -F "savepath=$save_path" \
     -F "paused=false" \
@@ -312,7 +314,7 @@ add_qb() {
 add_rust() {
   local torrent="$1" save_path="$2"
   [[ -r "$torrent" ]] || { log "rusttorrentd torrent file is not readable: $(printf '%q' "$torrent")"; return 1; }
-  curl -fsS -H "Authorization: Bearer $RUST_TOKEN" \
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
     -F "torrents=@$torrent" \
     -F "savepath=$save_path" \
     -F "paused=false" \
@@ -322,8 +324,8 @@ add_rust() {
 transmission_rpc() {
   local body="$1" url sid
   url="$(client_url transmission)/transmission/rpc"
-  sid="$(curl -sS -D - -o /dev/null "$url" | awk 'tolower($0) ~ /^x-transmission-session-id:/ {print $2}' | tr -d '\r')"
-  curl -fsS -H "X-Transmission-Session-Id: $sid" -H "Content-Type: application/json" -d "$body" "$url"
+  sid="$(curl --max-time "$CURL_MAX_TIME" -sS -D - -o /dev/null "$url" | awk 'tolower($0) ~ /^x-transmission-session-id:/ {print $2}' | tr -d '\r')"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "X-Transmission-Session-Id: $sid" -H "Content-Type: application/json" -d "$body" "$url"
 }
 
 add_transmission() {
@@ -335,13 +337,26 @@ add_transmission() {
 
 deluge_rpc() {
   local body="$1"
-  curl -fsS -c "$WORKDIR/artifacts/deluge.cookie" -b "$WORKDIR/artifacts/deluge.cookie" \
+  curl --max-time "$CURL_MAX_TIME" -fsS -c "$WORKDIR/artifacts/deluge.cookie" -b "$WORKDIR/artifacts/deluge.cookie" \
     -H "Content-Type: application/json" -d "$body" "$(client_url deluge)/json"
+}
+
+deluge_rpc_file() {
+  local body_file="$1"
+  curl --max-time "$CURL_MAX_TIME" -fsS -c "$WORKDIR/artifacts/deluge.cookie" -b "$WORKDIR/artifacts/deluge.cookie" \
+    -H "Content-Type: application/json" --data-binary "@$body_file" "$(client_url deluge)/json"
 }
 
 deluge_rpc_checked() {
   local body="$1" response
   response="$(deluge_rpc "$body")"
+  jq -e '.error == null' <<<"$response" >/dev/null
+  printf '%s\n' "$response"
+}
+
+deluge_rpc_file_checked() {
+  local body_file="$1" response
+  response="$(deluge_rpc_file "$body_file")"
   jq -e '.error == null' <<<"$response" >/dev/null
   printf '%s\n' "$response"
 }
@@ -365,12 +380,14 @@ deluge_connect() {
 }
 
 add_deluge() {
-  local torrent="$1" save_path="$2" data name
+  local torrent="$1" save_path="$2" data name payload
   [[ -r "$torrent" ]] || { log "Deluge torrent file is not readable: $(printf '%q' "$torrent")"; return 1; }
   deluge_connect
   data="$(base64 -w0 "$torrent")"
   name="$(basename "$torrent")"
-  deluge_rpc_checked "{\"method\":\"core.add_torrent_file\",\"params\":[\"$name\",\"$data\",{\"download_location\":\"$save_path\"}],\"id\":2}" >/dev/null
+  payload="$(mktemp "$WORKDIR/artifacts/deluge-add.XXXXXX.json")"
+  printf '{"method":"core.add_torrent_file","params":["%s","%s",{"download_location":"%s"}],"id":2}\n' "$name" "$data" "$save_path" >"$payload"
+  deluge_rpc_file_checked "$payload" >/dev/null
 }
 
 add_rtorrent() {
@@ -397,11 +414,11 @@ client_progress() {
   name="$(basename "$fixture")"
   case "$client" in
     rusttorrentd)
-      curl -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/qb/v2/torrents/info" |
+      curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/qb/v2/torrents/info" |
         jq -r --arg name "$name" '[.[] | select($name == "" or .name == $name) | .progress] | if length == 0 then 0 else min end'
       ;;
     qbittorrent)
-      curl -fsS -H 'Host: localhost:8080' -b "$WORKDIR/artifacts/qbit.cookie" "$(client_url qbittorrent)/api/v2/torrents/info" |
+      curl --max-time "$CURL_MAX_TIME" -fsS -H 'Host: localhost:8080' -b "$WORKDIR/artifacts/qbit.cookie" "$(client_url qbittorrent)/api/v2/torrents/info" |
         jq -r --arg name "$name" '[.[] | select($name == "" or .name == $name) | .progress] | if length == 0 then 0 else min end'
       ;;
     transmission)
@@ -454,15 +471,15 @@ poll_rust_compat() {
   local out="$WORKDIR/artifacts/rust-api-poll-$STAMP.jsonl"
   {
     printf '{"endpoint":"health","ok":'
-    curl -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/health" >/dev/null && printf 'true}\n' || printf 'false}\n'
+    curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/health" >/dev/null && printf 'true}\n' || printf 'false}\n'
     printf '{"endpoint":"metrics","ok":'
-    curl -fsS "$(client_url rusttorrentd)/metrics" >/dev/null && printf 'true}\n' || printf 'false}\n'
+    curl --max-time "$CURL_MAX_TIME" -fsS "$(client_url rusttorrentd)/metrics" >/dev/null && printf 'true}\n' || printf 'false}\n'
     printf '{"endpoint":"qbit_info","ok":'
-    curl -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/qb/v2/torrents/info" >/dev/null && printf 'true}\n' || printf 'false}\n'
+    curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/qb/v2/torrents/info" >/dev/null && printf 'true}\n' || printf 'false}\n'
     printf '{"endpoint":"qbit_sync","ok":'
-    curl -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/qb/v2/sync/maindata" >/dev/null && printf 'true}\n' || printf 'false}\n'
+    curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/qb/v2/sync/maindata" >/dev/null && printf 'true}\n' || printf 'false}\n'
     printf '{"endpoint":"qbit_transfer","ok":'
-    curl -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/qb/v2/transfer/info" >/dev/null && printf 'true}\n' || printf 'false}\n'
+    curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/qb/v2/transfer/info" >/dev/null && printf 'true}\n' || printf 'false}\n'
     printf '{"endpoint":"transmission_stats","ok":'
     rust_transmission_rpc '{"method":"session-stats"}' >/dev/null 2>&1 && printf 'true}\n' || printf 'false}\n'
     printf '{"endpoint":"deluge_ui","ok":'
@@ -473,13 +490,13 @@ poll_rust_compat() {
 rust_transmission_rpc() {
   local body="$1" url sid
   url="$(client_url rusttorrentd)/transmission/rpc"
-  sid="$(curl -sS -D - -o /dev/null -H "Authorization: Bearer $RUST_TOKEN" "$url" | awk 'tolower($0) ~ /^x-transmission-session-id:/ {print $2}' | tr -d '\r')"
-  curl -fsS -H "Authorization: Bearer $RUST_TOKEN" -H "X-Transmission-Session-Id: $sid" -H "Content-Type: application/json" -d "$body" "$url"
+  sid="$(curl --max-time "$CURL_MAX_TIME" -sS -D - -o /dev/null -H "Authorization: Bearer $RUST_TOKEN" "$url" | awk 'tolower($0) ~ /^x-transmission-session-id:/ {print $2}' | tr -d '\r')"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" -H "X-Transmission-Session-Id: $sid" -H "Content-Type: application/json" -d "$body" "$url"
 }
 
 rust_deluge_rpc() {
   local body="$1"
-  curl -fsS -H "Authorization: Bearer $RUST_TOKEN" -H "Content-Type: application/json" -d "$body" "$(client_url rusttorrentd)/json"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" -H "Content-Type: application/json" -d "$body" "$(client_url rusttorrentd)/json"
 }
 
 wait_clients_complete() {
@@ -494,6 +511,40 @@ wait_clients_complete() {
       awk -v p="$progress" 'BEGIN { exit !(p >= 0.999) }' || all_done=0
     done
     [[ "$all_done" == "1" ]] && return 0
+    now="$(date +%s)"
+    if (( now - start > timeout )); then
+      return 1
+    fi
+    sleep 10
+  done
+}
+
+rust_observed_peers() {
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/qb/v2/sync/torrentPeers?hash=$1" |
+    jq '.peers | length' 2>/dev/null || echo 0
+}
+
+wait_public_complete() {
+  local timeout="$1" torrent_name="$2" info_hash="$3"; shift 3
+  local clients=("$@") start now rust_progress rust_peers progress
+  start="$(date +%s)"
+  while true; do
+    poll_rust_compat || true
+
+    local all_done=1
+    for client in "${clients[@]}"; do
+      progress="$(client_progress "$client" "$torrent_name" 2>/dev/null || echo 0)"
+      awk -v p="$progress" 'BEGIN { exit !(p >= 0.999) }' || all_done=0
+    done
+    [[ "$all_done" == "1" ]] && return 0
+
+    rust_progress="$(client_progress rusttorrentd "$torrent_name" 2>/dev/null || echo 0)"
+    rust_peers="$(rust_observed_peers "$info_hash")"
+    if awk -v p="$rust_progress" 'BEGIN { exit !(p >= 0.999) }' &&
+      [[ "${rust_peers:-0}" -ge "$PUBLIC_MIN_RUST_PEERS" ]]; then
+      return 0
+    fi
+
     now="$(date +%s)"
     if (( now - start > timeout )); then
       return 1
@@ -589,7 +640,7 @@ run_churn_case() {
     add_to_client "$leecher" "$torrent" || status="FAIL"
   done
   sleep "${INTEROP_CHURN_SETTLE_SECS:-30}"
-  curl -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/health" >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/health" >/dev/null || status="FAIL"
   local service service_id
   for service in rusttorrentd qbittorrent transmission deluge rtorrent opentracker fixture-http; do
     service_id="$(compose ps -q "$service")"
@@ -619,16 +670,16 @@ resolve_public_torrent() {
   local id="$1" resolver="$2" pattern="$3" html url
   if [[ "$id" == "ubuntu" ]]; then
     local lts_dir
-    lts_dir="$(curl -fsSL "$resolver" | grep -Eo 'href="[0-9]+\.04(\.[0-9]+)?/"' | sed -E 's/^href="([^"]+)".*/\1/' | sort -V | tail -n1)"
+    lts_dir="$(curl --max-time "$CURL_MAX_TIME" -fsSL "$resolver" | grep -Eo 'href="[0-9]+\.04(\.[0-9]+)?/"' | sed -E 's/^href="([^"]+)".*/\1/' | sort -V | tail -n1)"
     [[ -n "$lts_dir" ]] || return 1
     resolver="${resolver%/}/$lts_dir"
   elif [[ "$id" == "libreoffice" ]]; then
     local stable_dir
-    stable_dir="$(curl -fsSL "$resolver" | grep -Eo 'href="[0-9]+(\.[0-9]+)+/"' | sed -E 's/^href="([^"]+)".*/\1/' | sort -V | tail -n1)"
+    stable_dir="$(curl --max-time "$CURL_MAX_TIME" -fsSL "$resolver" | grep -Eo 'href="[0-9]+(\.[0-9]+)+/"' | sed -E 's/^href="([^"]+)".*/\1/' | sort -V | tail -n1)"
     [[ -n "$stable_dir" ]] || return 1
     resolver="${resolver%/}/$stable_dir/deb/x86_64/"
   fi
-  html="$(curl -fsSL "$resolver")"
+  html="$(curl --max-time "$CURL_MAX_TIME" -fsSL "$resolver")"
   url="$(printf '%s' "$html" | grep -Eo "$pattern" | sort -V | tail -n1 || true)"
   [[ -n "$url" ]] || return 1
   if [[ "$url" =~ ^https?:// ]]; then
@@ -643,24 +694,28 @@ add_public_to_client() {
   save_path="$(download_dir "$client")/public"
   case "$client" in
     rusttorrentd)
-      curl -fsS -H "Authorization: Bearer $RUST_TOKEN" -F "urls=$url" -F "savepath=$save_path" "$(client_url rusttorrentd)/api/qb/v2/torrents/add" >/dev/null
+      curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" -F "urls=$url" -F "savepath=$save_path" "$(client_url rusttorrentd)/api/qb/v2/torrents/add" >/dev/null
       ;;
     qbittorrent)
       qb_login
-      curl -fsS -H 'Host: localhost:8080' -b "$WORKDIR/artifacts/qbit.cookie" -F "urls=$url" -F "savepath=$save_path" "$(client_url qbittorrent)/api/v2/torrents/add" >/dev/null
+      curl --max-time "$CURL_MAX_TIME" -fsS -H 'Host: localhost:8080' -b "$WORKDIR/artifacts/qbit.cookie" -F "urls=$url" -F "savepath=$save_path" "$(client_url qbittorrent)/api/v2/torrents/add" >/dev/null
       ;;
     transmission)
       transmission_rpc "{\"method\":\"torrent-add\",\"arguments\":{\"filename\":\"$url\",\"download-dir\":\"$save_path\",\"paused\":false}}" >/dev/null
       ;;
     deluge)
-      deluge_connect
-      deluge_rpc_checked "{\"method\":\"core.add_torrent_url\",\"params\":[\"$url\",{\"download_location\":\"$save_path\"}],\"id\":4}" >/dev/null
+      if [[ -n "$torrent_file" ]]; then
+        add_deluge "$torrent_file" "$save_path"
+      else
+        deluge_connect
+        deluge_rpc_checked "{\"method\":\"core.add_torrent_url\",\"params\":[\"$url\",{\"download_location\":\"$save_path\"}],\"id\":4}" >/dev/null
+      fi
       ;;
     rtorrent)
       if [[ -n "$torrent_file" ]]; then
         cp "$torrent_file" "$WORKDIR/watch/rtorrent/$client-$(basename "$url")"
       else
-        curl -fsSL "$url" -o "$WORKDIR/watch/rtorrent/$client-$(basename "$url")"
+        curl --max-time "$CURL_MAX_TIME" -fsSL "$url" -o "$WORKDIR/watch/rtorrent/$client-$(basename "$url")"
       fi
       ;;
   esac
@@ -669,7 +724,7 @@ add_public_to_client() {
 public_torrent_metadata() {
   local id="$1" url="$2" torrent_file name total info_hash
   torrent_file="$WORKDIR/torrents/public-$id.torrent"
-  curl -fsSL "$url" -o "$torrent_file"
+  curl --max-time "$CURL_MAX_TIME" -fsSL "$url" -o "$torrent_file"
   name="$(aria2c -S "$torrent_file" 2>/dev/null | awk -F': ' '/^Name: / {print $2; exit}')"
   total="$(torrent_total_bytes "$torrent_file")"
   info_hash="$(aria2c -S "$torrent_file" 2>/dev/null | awk -F': ' '/^Info Hash: / {print tolower($2); exit}')"
@@ -710,7 +765,7 @@ bridge_public_reference_peers_to_rust() {
   local info_hash="$1" peers
   peers="$(public_bridge_peers)"
   [[ -n "$peers" ]] || return 0
-  curl -fsS -H "Authorization: Bearer $RUST_TOKEN" \
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
     --data-urlencode "hashes=$info_hash" \
     --data-urlencode "peers=$peers" \
     "$(client_url rusttorrentd)/api/qb/v2/torrents/addPeers" >/dev/null
@@ -720,17 +775,25 @@ bridge_public_reference_peers_to_rust() {
 run_public_entry() {
   local entry="$1" id enabled source resolver pattern max clients url metadata torrent_file torrent_name total info_hash status="PASS"
   IFS='|' read -r id enabled source resolver pattern max clients <<<"$entry"
+  local optional=false
   if [[ -n "${INTEROP_PUBLIC_ONLY:-}" && "$id" != "$INTEROP_PUBLIC_ONLY" ]]; then
     return 0
   fi
   if [[ "$enabled" != "true" ]]; then
     [[ "$id" == "libreoffice" && "${INTEROP_INCLUDE_LIBREOFFICE:-0}" == "1" ]] || return 0
+    optional=true
   fi
   append_report "## Public: $id"
   append_report ""
   append_report "- Source: $source"
   log "resolving public torrent $id from official source"
   if ! url="$(resolve_public_torrent "$id" "$resolver" "$pattern")"; then
+    if [[ "$optional" == "true" ]]; then
+      append_report "- Status: **SKIP**"
+      append_report "- Reason: optional official source did not publish a matching torrent"
+      append_report ""
+      return 0
+    fi
     append_report "- Status: **RESOLVER FAIL**"
     append_report ""
     return 1
@@ -752,12 +815,12 @@ run_public_entry() {
     add_public_to_client "$client" "$url" "$torrent_file" || status="FAIL"
   done
   bridge_public_reference_peers_to_rust "$info_hash" || status="FAIL"
-  if ! wait_clients_complete "${max:-$TIMEOUT_PUBLIC}" "$torrent_name" "${selected[@]}"; then
+  if ! wait_public_complete "${max:-$TIMEOUT_PUBLIC}" "$torrent_name" "$info_hash" "${selected[@]}"; then
     status="FAIL"
   fi
 
   local rust_peers
-  rust_peers="$(curl -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url rusttorrentd)/api/qb/v2/torrents/info" | jq '[.[].num_complete + .[].num_incomplete] | add // 0' 2>/dev/null || echo 0)"
+  rust_peers="$(rust_observed_peers "$info_hash")"
   append_report "- Rust peer observation floor: $PUBLIC_MIN_RUST_PEERS"
   append_report "- Rust peers observed: $rust_peers"
   append_report "- Clients: ${selected[*]}"

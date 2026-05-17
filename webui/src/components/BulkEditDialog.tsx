@@ -48,11 +48,11 @@ export function BulkEditDialog({ hashes, onClose }: Props) {
   const tagList = tags.split(',').map(tag => tag.trim()).filter(Boolean)
 
   return (
-    <div style={{
+    <div className="rtng-modal-backdrop" style={{
       position: 'fixed', inset: 0, background: 'rgba(2,6,23,0.72)', zIndex: 1200,
       display: 'grid', placeItems: 'center', padding: 22,
     }} onClick={e => { if (!busy && e.target === e.currentTarget) onClose() }}>
-      <div style={{
+      <div role="dialog" aria-modal="true" aria-label="Edit selected torrents" aria-busy={busy} className="rtng-modal" style={{
         width: 'min(620px, 100%)', maxHeight: '88vh', overflowY: 'auto',
         background: 'var(--panel)', border: '1px solid var(--border-strong)', borderRadius: 8,
         boxShadow: '0 24px 60px var(--shadow)',
@@ -62,6 +62,10 @@ export function BulkEditDialog({ hashes, onClose }: Props) {
             <div style={{ color: 'var(--text)', fontWeight: 700, fontSize: 15 }}>Edit selected torrents</div>
             <div style={{ color: 'var(--faint)', fontSize: 12 }}>{hashes.length.toLocaleString()} torrent{hashes.length === 1 ? '' : 's'} selected</div>
           </div>
+          {busy && <span style={{
+            color: 'var(--accent-text)', background: 'var(--accent-soft)', border: '1px solid var(--accent)',
+            borderRadius: 999, padding: '2px 8px', fontSize: 11, fontWeight: 700,
+          }}>Applying</span>}
           <button onClick={onClose} disabled={busy} style={smallButton('#94a3b8', busy)}>Close</button>
         </header>
 
@@ -99,7 +103,7 @@ export function BulkEditDialog({ hashes, onClose }: Props) {
           </Field>
 
           <Field label="Share limits">
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr auto', gap: 8 }}>
+            <div className="rtng-action-grid-3" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr auto', gap: 8 }}>
               <input value={ratioLimit} onChange={e => setRatioLimit(e.target.value)} disabled={busy} placeholder="Ratio -2 default, -1 unlimited" style={INPUT} />
               <input value={seedMinutes} onChange={e => setSeedMinutes(e.target.value)} disabled={busy} placeholder="Minutes -2 default, -1 unlimited" style={INPUT} />
               <button disabled={busy} onClick={() => apply('Share limits applied', () => api.torrents.setShareLimits(
@@ -110,11 +114,23 @@ export function BulkEditDialog({ hashes, onClose }: Props) {
             </div>
           </Field>
 
-          <div style={{ display: 'flex', gap: 8 }}>
-            <button disabled={busy} onClick={() => apply('Sequential toggled', () => api.torrents.toggleSequential(hashes))} style={smallButton('#f59e0b', busy)}>Toggle sequential download</button>
+          <div style={{
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10,
+            background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 7, padding: 10,
+          }}>
+            <div>
+              <div style={{ color: 'var(--text)', fontSize: 12, fontWeight: 700 }}>Playback order</div>
+              <div style={{ color: 'var(--faint)', fontSize: 11, marginTop: 2 }}>Toggle sequential mode for every selected torrent.</div>
+            </div>
+            <button disabled={busy} onClick={() => apply('Sequential toggled', () => api.torrents.toggleSequential(hashes))} style={smallButton('#f59e0b', busy)}>Toggle sequential</button>
           </div>
 
-          {message && <div style={{ color: messageTone === 'error' ? 'var(--danger)' : 'var(--success)', fontSize: 12 }}>{message}</div>}
+          {message && <div role={messageTone === 'error' ? 'alert' : 'status'} style={{
+            color: messageTone === 'error' ? 'var(--danger)' : 'var(--success)', fontSize: 12,
+            background: messageTone === 'error' ? 'color-mix(in srgb, var(--danger) 9%, var(--surface))' : 'color-mix(in srgb, var(--success) 8%, var(--surface))',
+            border: '1px solid ' + (messageTone === 'error' ? 'color-mix(in srgb, var(--danger) 45%, var(--border))' : 'color-mix(in srgb, var(--success) 40%, var(--border))'),
+            borderRadius: 6, padding: '8px 9px', overflowWrap: 'anywhere',
+          }}>{message}</div>}
         </div>
       </div>
     </div>
@@ -122,7 +138,15 @@ export function BulkEditDialog({ hashes, onClose }: Props) {
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
-  return <label style={{ display: 'grid', gap: 5, color: 'var(--faint)', fontSize: 11, fontWeight: 700, textTransform: 'uppercase' }}>{label}{children}</label>
+  return <label style={{
+    display: 'grid', gap: 6, color: 'var(--faint)', fontSize: 11, fontWeight: 700,
+    textTransform: 'uppercase', background: 'var(--surface)', border: '1px solid var(--border)',
+    borderRadius: 7, padding: 10,
+    boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.025)',
+  }}>
+    <span>{label}</span>
+    {children}
+  </label>
 }
 
 function smallButton(color: string, disabled = false): React.CSSProperties {

@@ -36,60 +36,124 @@ export function StoragePanel() {
         </button>
       </div>
 
-      {isLoading && <div style={{ color: 'var(--faint)', fontSize: 12 }}>Loading storage stats…</div>}
-      {error && <div style={{ color: '#ef4444', fontSize: 12 }}>Storage stats unavailable</div>}
+      {isLoading && <SkeletonRows rows={2} />}
+      {error && <Notice>Storage stats unavailable</Notice>}
 
       <div style={{ display: 'grid', gap: 10, maxWidth: 840 }}>
         {data && data.roots.length === 0 && (
-          <div style={{ color: 'var(--faint)', fontSize: 12 }}>No storage roots reported.</div>
+          <EmptyState>No storage roots reported.</EmptyState>
         )}
         {data?.roots.map(root => (
-          <div
+          <StorageRootCard
             key={root.path}
-            style={{
-              border: '1px solid var(--border)',
-              borderRadius: 6,
-              padding: 12,
-              background: 'var(--surface)',
-            }}
-          >
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
-              <div style={{
-                flex: 1, minWidth: 0, color: root.ok ? 'var(--text)' : '#fca5a5',
-                fontSize: 13, fontFamily: 'monospace', overflow: 'hidden',
-                textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-              }} title={root.path}>
-                {root.path}
-              </div>
-              {root.readonly && (
-                <span style={{ color: '#f59e0b', fontSize: 11 }}>read-only</span>
-              )}
-              <span style={{ color: root.ok ? 'var(--muted)' : '#ef4444', fontSize: 12 }}>
-                {root.ok ? `${root.used_percent.toFixed(1)}% used` : 'unavailable'}
-              </span>
-            </div>
-
-            {root.ok ? (
-              <>
-                <div style={{ height: 6, background: 'var(--surface-2)', borderRadius: 3, overflow: 'hidden', marginBottom: 8 }}>
-                  <div style={{
-                    width: `${Math.min(100, root.used_percent)}%`,
-                    height: '100%',
-                    background: root.used_percent >= 90 ? '#ef4444' : root.used_percent >= 75 ? '#f59e0b' : '#22c55e',
-                  }} />
-                </div>
-                <div style={{ display: 'flex', gap: 18, flexWrap: 'wrap', fontSize: 12, color: 'var(--faint)' }}>
-                  <span>Used {fmtBytes(root.used_bytes)}</span>
-                  <span>Free {fmtBytes(root.available_bytes)}</span>
-                  <span>Total {fmtBytes(root.total_bytes)}</span>
-                </div>
-              </>
-            ) : (
-              <div style={{ color: '#ef4444', fontSize: 12 }}>{root.error}</div>
-            )}
-          </div>
+            root={root}
+          />
         ))}
       </div>
     </section>
+  )
+}
+
+function StorageRootCard({ root }: { root: NonNullable<Awaited<ReturnType<typeof api.storage>>['roots']>[number] }) {
+  const tone = !root.ok
+    ? 'var(--danger)'
+    : root.used_percent >= 90
+      ? 'var(--danger)'
+      : root.used_percent >= 75
+        ? 'var(--warning)'
+        : 'var(--success)'
+  return (
+    <div
+      className="rtng-card"
+      style={{
+        border: '1px solid var(--border)',
+        borderRadius: 7,
+        padding: 12,
+        background: 'var(--surface)',
+      }}
+    >
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+        <div style={{
+          flex: 1, minWidth: 0, color: root.ok ? 'var(--text)' : 'var(--danger)',
+          fontSize: 13, fontFamily: 'monospace', overflow: 'hidden',
+          textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+        }} title={root.path}>
+          {root.path}
+        </div>
+        {root.readonly && (
+          <span style={{
+            color: 'var(--warning)', border: '1px solid color-mix(in srgb, var(--warning) 45%, var(--border))',
+            background: 'color-mix(in srgb, var(--warning) 9%, transparent)', borderRadius: 999,
+            padding: '1px 7px', fontSize: 11, fontWeight: 700,
+          }}>read-only</span>
+        )}
+        <span style={{ color: tone, fontSize: 12, fontWeight: 700 }}>
+          {root.ok ? `${root.used_percent.toFixed(1)}% used` : 'unavailable'}
+        </span>
+      </div>
+
+      {root.ok ? (
+        <>
+          <div style={{ height: 8, background: 'var(--surface-2)', borderRadius: 99, overflow: 'hidden', marginBottom: 9 }}>
+            <div style={{ width: `${Math.min(100, root.used_percent)}%`, height: '100%', background: tone }} />
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))', gap: 8, fontSize: 12 }}>
+            <StorageMetric label="Used" value={fmtBytes(root.used_bytes)} />
+            <StorageMetric label="Free" value={fmtBytes(root.available_bytes)} />
+            <StorageMetric label="Total" value={fmtBytes(root.total_bytes)} />
+          </div>
+        </>
+      ) : (
+        <div style={{ color: 'var(--danger)', fontSize: 12 }}>{root.error}</div>
+      )}
+    </div>
+  )
+}
+
+function SkeletonRows({ rows }: { rows: number }) {
+  return (
+    <div style={{ display: 'grid', gap: 10, maxWidth: 840 }}>
+      {Array.from({ length: rows }).map((_, index) => (
+        <div key={index} style={{
+          border: '1px solid var(--border)', borderRadius: 7, background: 'var(--surface)', padding: 12,
+          display: 'grid', gap: 9,
+        }}>
+          <span className="rtng-skeleton" style={{ width: '55%', height: 12 }} />
+          <span className="rtng-skeleton" style={{ width: '100%', height: 8 }} />
+          <span className="rtng-skeleton" style={{ width: '72%', height: 24 }} />
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function Notice({ children }: { children: React.ReactNode }) {
+  return (
+    <div style={{
+      color: 'var(--danger)', background: 'color-mix(in srgb, var(--danger) 9%, var(--surface))',
+      border: '1px solid color-mix(in srgb, var(--danger) 45%, var(--border))',
+      borderRadius: 6, padding: '8px 9px', fontSize: 12, marginBottom: 10,
+    }}>{children}</div>
+  )
+}
+
+function EmptyState({ children }: { children: React.ReactNode }) {
+  return (
+    <div style={{
+      color: 'var(--faint)', fontSize: 12, border: '1px dashed var(--border-strong)',
+      borderRadius: 7, background: 'color-mix(in srgb, var(--surface) 72%, transparent)', padding: 14,
+    }}>{children}</div>
+  )
+}
+
+function StorageMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <span style={{
+      display: 'grid', gap: 2, border: '1px solid var(--border)', borderRadius: 6,
+      background: 'var(--bg)', padding: '6px 8px', minWidth: 0,
+    }}>
+      <span style={{ color: 'var(--faint)', fontSize: 10, textTransform: 'uppercase', fontWeight: 700 }}>{label}</span>
+      <span style={{ color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{value}</span>
+    </span>
   )
 }

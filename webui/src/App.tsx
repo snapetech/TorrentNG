@@ -456,9 +456,20 @@ export function App() {
     return (
       <div style={{
         minHeight: '100vh', background: 'var(--bg)', color: 'var(--faint)',
-        display: 'grid', placeItems: 'center', fontSize: 13,
+        display: 'grid', placeItems: 'center', fontSize: 13, padding: 24,
       }}>
-        Checking session...
+        <div style={{
+          display: 'grid', gap: 10, justifyItems: 'center',
+          border: '1px solid var(--border)', borderRadius: 8,
+          background: 'var(--panel)', padding: '18px 22px',
+        }}>
+          <span style={{
+            width: 22, height: 22, borderRadius: '50%',
+            border: '2px solid var(--border-strong)', borderTopColor: 'var(--accent)',
+            animation: 'rtng-spin 800ms linear infinite',
+          }} />
+          <span>Checking session...</span>
+        </div>
       </div>
     )
   }
@@ -478,28 +489,51 @@ export function App() {
         display: 'flex', alignItems: 'center', padding: '0 16px', gap: 12, flexShrink: 0,
         minWidth: 0, overflowX: 'auto', overflowY: 'hidden', scrollbarWidth: 'thin',
       }}>
-        <span style={{ fontWeight: 700, fontSize: 15, color: 'var(--text)', flex: '0 0 auto' }}>
+        <span style={{
+          fontWeight: 800, fontSize: 15, color: 'var(--text)', flex: '0 0 auto',
+          display: 'inline-flex', alignItems: 'center', gap: 7,
+        }}>
+          <span style={{
+            width: 9, height: 9, borderRadius: 3,
+            background: 'linear-gradient(135deg, var(--accent), var(--success))',
+            boxShadow: '0 0 14px color-mix(in srgb, var(--accent) 48%, transparent)',
+          }} />
           rtorrentNG
         </span>
 
-        <nav style={{ display: 'flex', gap: 4, marginLeft: 4, flex: '0 0 auto' }}>
+        <nav aria-label="Primary" style={{ display: 'flex', gap: 4, marginLeft: 4, flex: '0 0 auto' }}>
           {(['torrents', 'settings'] as View[]).map(v => (
-            <button key={v} onClick={() => setView(v)} style={{
+            <button key={v} onClick={() => setView(v)} aria-current={view === v ? 'page' : undefined} style={{
               background: view === v ? 'var(--accent-soft)' : 'transparent',
               border: '1px solid ' + (view === v ? 'var(--accent)' : 'transparent'),
               borderRadius: 5, color: view === v ? 'var(--accent-text)' : 'var(--faint)',
               padding: '2px 10px', fontSize: 12, cursor: 'pointer', textTransform: 'capitalize',
-              whiteSpace: 'nowrap', flex: '0 0 auto',
-            }}>{v}</button>
+              whiteSpace: 'nowrap', flex: '0 0 auto', display: 'inline-flex', alignItems: 'center', gap: 6,
+              fontWeight: view === v ? 800 : 600,
+            }}>
+              <span style={{ color: view === v ? 'var(--accent-text)' : 'var(--accent)' }}>{v === 'torrents' ? '▤' : '⚙'}</span>
+              {v}
+            </button>
           ))}
         </nav>
 
         {view === 'torrents' && (
-          <button onClick={() => setAddOpen(true)} title="Add torrent (A)" style={{
-            background: 'var(--accent-soft)', border: '1px solid var(--accent)', borderRadius: 5,
-            color: 'var(--accent-text)', padding: '3px 12px', fontSize: 12, cursor: 'pointer',
+          <span style={{
+            color: 'var(--muted)', background: 'var(--surface)', border: '1px solid var(--border)',
+            borderRadius: 999, padding: '2px 8px', fontSize: 11, fontWeight: 700,
             whiteSpace: 'nowrap', flex: '0 0 auto',
-          }}>+ Add</button>
+          }}>
+            {total.toLocaleString()} torrents
+          </span>
+        )}
+        {selected.size > 0 && view === 'torrents' && (
+          <span style={{
+            color: 'var(--accent-text)', background: 'var(--accent-soft)', border: '1px solid var(--accent)',
+            borderRadius: 999, padding: '2px 8px', fontSize: 11, fontWeight: 800,
+            whiteSpace: 'nowrap', flex: '0 0 auto',
+          }}>
+            {selected.size.toLocaleString()} selected
+          </span>
         )}
         <button onClick={() => setHelpOpen(true)} title="Help and links" style={{
           background: 'transparent', border: '1px solid var(--border-strong)', borderRadius: 5,
@@ -507,13 +541,16 @@ export function App() {
           whiteSpace: 'nowrap', flex: '0 0 auto',
         }}>Help</button>
 
-        <span style={{
-          fontSize: 11, color: health?.rtorrent === 'connected' ? '#22c55e' : '#ef4444',
-          display: 'flex', alignItems: 'center', gap: 4,
+        <span title="rTorrent connection state" style={{
+          fontSize: 11, color: health?.rtorrent === 'connected' ? 'var(--success)' : 'var(--danger)',
+          display: 'flex', alignItems: 'center', gap: 5, padding: '2px 7px',
+          border: '1px solid ' + (health?.rtorrent === 'connected' ? 'color-mix(in srgb, var(--success) 42%, var(--border))' : 'color-mix(in srgb, var(--danger) 42%, var(--border))'),
+          borderRadius: 999,
+          background: health?.rtorrent === 'connected' ? 'color-mix(in srgb, var(--success) 9%, transparent)' : 'color-mix(in srgb, var(--danger) 9%, transparent)',
         }}>
           <span style={{
             width: 6, height: 6, borderRadius: '50%',
-            background: health?.rtorrent === 'connected' ? '#22c55e' : '#ef4444',
+            background: health?.rtorrent === 'connected' ? 'var(--success)' : 'var(--danger)',
             display: 'inline-block',
           }} />
           {health?.rtorrent ?? 'connecting…'}
@@ -591,7 +628,14 @@ export function App() {
                   padding: 24, color: 'var(--danger)', textAlign: 'center',
                   display: 'grid', placeItems: 'center', gap: 10,
                 }}>
-                  <span>Failed to connect to sidecar API.</span>
+                  <div style={{
+                    border: '1px solid color-mix(in srgb, var(--danger) 45%, var(--border))',
+                    background: 'color-mix(in srgb, var(--danger) 9%, var(--surface))',
+                    borderRadius: 8, padding: '16px 18px', display: 'grid', gap: 8, minWidth: 280,
+                  }}>
+                    <span style={{ fontWeight: 800 }}>Failed to connect to sidecar API.</span>
+                    <span style={{ color: 'var(--faint)', fontSize: 12 }}>The table will refresh when the API responds again.</span>
+                  </div>
                   <button onClick={() => query.refetch()} style={{
                     background: 'var(--surface-2)', border: '1px solid var(--border-strong)',
                     borderRadius: 5, color: 'var(--muted)', padding: '5px 10px', fontSize: 12,
@@ -600,7 +644,20 @@ export function App() {
                 </div>
               )}
               {query.isLoading && !query.data && (
-                <div style={{ padding: 24, color: 'var(--faint)', textAlign: 'center' }}>Loading…</div>
+                <div style={{
+                  padding: 24, color: 'var(--faint)', display: 'grid', gap: 10,
+                  alignContent: 'start',
+                }}>
+                  {Array.from({ length: 8 }, (_, index) => (
+                    <div key={index} style={{
+                      border: '1px solid var(--border)', borderRadius: 7, background: 'var(--surface)',
+                      padding: '10px 12px', display: 'grid', gap: 8,
+                    }}>
+                      <span className="rtng-skeleton" style={{ width: index % 2 ? '44%' : '62%', height: 12 }} />
+                      <span className="rtng-skeleton" style={{ width: index % 3 ? '72%' : '38%', height: 8 }} />
+                    </div>
+                  ))}
+                </div>
               )}
               {query.data && (
                 <TorrentTable
@@ -705,8 +762,16 @@ function StandbyScreen({ onTakeOver }: { onTakeOver: () => void }) {
       <div style={{
         width: 'min(460px, 100%)', border: '1px solid var(--border)', borderRadius: 8,
         background: 'var(--panel)', padding: 20, display: 'flex', flexDirection: 'column', gap: 12,
+        boxShadow: '0 24px 60px var(--shadow)',
       }}>
-        <div style={{ fontWeight: 700, fontSize: 18 }}>rtorrentNG is open in another tab</div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <span style={{
+            width: 30, height: 30, borderRadius: 8, display: 'inline-grid', placeItems: 'center',
+            color: 'var(--accent-text)', background: 'var(--accent-soft)', border: '1px solid var(--accent)',
+            fontWeight: 900,
+          }}>▣</span>
+          <div style={{ fontWeight: 800, fontSize: 18 }}>rtorrentNG is open in another tab</div>
+        </div>
         <div style={{ color: 'var(--muted)', fontSize: 13, lineHeight: 1.45 }}>
           This standby tab is not connected to the API or websocket. Use one active tab for large libraries.
         </div>
@@ -725,11 +790,11 @@ function SettingsView({ section, onSection, mediaInference, onMediaInference }: 
   mediaInference: MediaInferenceMode
   onMediaInference: (mode: MediaInferenceMode) => void
 }) {
-  const sections: Array<[SettingsSection, string]> = [
-    ['library', 'Library'],
-    ['engine', 'Engine'],
-    ['automation', 'Automation'],
-    ['support', 'Support'],
+  const sections: Array<[SettingsSection, string, string]> = [
+    ['library', 'Library', '▦'],
+    ['engine', 'Engine', '⚙'],
+    ['automation', 'Automation', '⟲'],
+    ['support', 'Support', '?'],
   ]
   return (
     <>
@@ -737,15 +802,23 @@ function SettingsView({ section, onSection, mediaInference, onMediaInference }: 
         width: 220, flexShrink: 0, background: 'var(--panel)', borderRight: '1px solid var(--border)',
         padding: 12,
       }}>
-        <div style={{ fontSize: 16, fontWeight: 700, color: 'var(--text)', margin: '4px 4px 12px' }}>Settings</div>
-        {sections.map(([key, label]) => (
-          <button key={key} onClick={() => onSection(key)} style={{
-            width: '100%', display: 'block', textAlign: 'left', marginBottom: 4,
+        <div style={{ margin: '4px 4px 12px' }}>
+          <div style={{ fontSize: 16, fontWeight: 800, color: 'var(--text)' }}>Settings</div>
+          <div style={{ fontSize: 11, color: 'var(--faint)', marginTop: 3 }}>Daemon, library, and browser controls</div>
+        </div>
+        {sections.map(([key, label, icon]) => (
+          <button key={key} onClick={() => onSection(key)} aria-current={section === key ? 'page' : undefined} style={{
+            width: '100%', display: 'grid', gridTemplateColumns: '22px 1fr auto', alignItems: 'center',
+            textAlign: 'left', marginBottom: 4, gap: 7,
             background: section === key ? 'var(--accent-soft)' : 'transparent',
             border: '1px solid ' + (section === key ? 'var(--accent)' : 'transparent'),
             borderRadius: 5, color: section === key ? 'var(--accent-text)' : 'var(--muted)',
             padding: '7px 9px', fontSize: 13, cursor: 'pointer',
-          }}>{label}</button>
+          }}>
+            <span style={{ color: section === key ? 'var(--accent-text)' : 'var(--accent)', textAlign: 'center' }}>{icon}</span>
+            <span>{label}</span>
+            {section === key && <span style={{ color: 'var(--accent-text)', fontSize: 10 }}>●</span>}
+          </button>
         ))}
       </aside>
       <div style={{ flex: 1, overflowY: 'auto', background: 'var(--bg)' }}>
@@ -771,10 +844,22 @@ function SettingsView({ section, onSection, mediaInference, onMediaInference }: 
           <PanelFrame>
             <AppearancePanel mediaInference={mediaInference} onMediaInference={onMediaInference} />
           </PanelFrame>
-          <div style={{ padding: 18, display: 'grid', gap: 10, maxWidth: 720 }}>
-            <a style={supportLink} href="https://discord.gg/4ub88HeHFm" target="_blank" rel="noreferrer">Discord support</a>
-            <a style={supportLink} href="https://github.com/snapetech/rtorrentNG" target="_blank" rel="noreferrer">GitHub project</a>
-            <button onClick={() => window.dispatchEvent(new KeyboardEvent('keydown', { key: '?' }))} style={supportButton}>Open help</button>
+          <div style={{
+            padding: 18, display: 'grid', gap: 10, maxWidth: 860,
+            gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+          }}>
+            <SupportCard icon="☊" title="Discord support" href="https://discord.gg/4ub88HeHFm" detail="Community support and release discussion" />
+            <SupportCard icon="⌘" title="GitHub project" href="https://github.com/snapetech/rtorrentNG" detail="Source, issues, and deployment files" />
+            <button onClick={() => window.dispatchEvent(new KeyboardEvent('keydown', { key: '?' }))} style={{
+              ...supportButton, width: '100%', minHeight: 72, textAlign: 'left',
+              display: 'grid', gridTemplateColumns: '32px 1fr', alignItems: 'center',
+            }}>
+              <span style={{ fontSize: 18, textAlign: 'center' }}>?</span>
+              <span>
+                <span style={{ display: 'block', fontWeight: 700 }}>Open help</span>
+                <span style={{ display: 'block', color: 'var(--faint)', fontSize: 12, marginTop: 2 }}>Shortcuts and workflow notes</span>
+              </span>
+            </button>
           </div>
         </>)}
       </div>
@@ -784,9 +869,20 @@ function SettingsView({ section, onSection, mediaInference, onMediaInference }: 
 
 function PanelTitle({ title, subtitle }: { title: string; subtitle: string }) {
   return (
-    <div style={{ padding: '18px 22px', borderBottom: '1px solid var(--border)' }}>
-      <div style={{ fontSize: 17, fontWeight: 700, color: 'var(--text)' }}>{title}</div>
-      <div style={{ marginTop: 3, fontSize: 12, color: 'var(--faint)' }}>{subtitle}</div>
+    <div style={{
+      padding: '18px 22px', borderBottom: '1px solid var(--border)',
+      background: 'linear-gradient(180deg, color-mix(in srgb, var(--surface) 72%, transparent), transparent)',
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+        <div style={{
+          width: 8, height: 24, borderRadius: 99,
+          background: 'linear-gradient(180deg, var(--accent), var(--success))',
+        }} />
+        <div>
+          <div style={{ fontSize: 17, fontWeight: 800, color: 'var(--text)' }}>{title}</div>
+          <div style={{ marginTop: 3, fontSize: 12, color: 'var(--faint)' }}>{subtitle}</div>
+        </div>
+      </div>
     </div>
   )
 }
@@ -802,21 +898,35 @@ function DeleteDialog({ torrent, onCancel, onRemove, onRemoveFiles }: {
   onRemoveFiles: () => void
 }) {
   return (
-    <div onMouseDown={e => {
+    <div role="presentation" onMouseDown={e => {
       if (e.target === e.currentTarget) onCancel()
     }} style={{
       position: 'fixed', inset: 0, background: 'rgba(2,6,23,0.72)', zIndex: 1150,
       display: 'grid', placeItems: 'center', padding: 24,
     }}>
-      <div style={{
+      <div role="dialog" aria-modal="true" aria-label={`Delete ${torrent.name}`} style={{
         width: 'min(480px, 100%)', background: 'var(--panel)', border: '1px solid var(--danger)',
         borderRadius: 8, boxShadow: '0 24px 60px var(--shadow)',
       }}>
         <div style={{ padding: 16, borderBottom: '1px solid var(--border)' }}>
-          <div style={{ fontSize: 16, fontWeight: 700, color: 'var(--danger)' }}>Delete torrent</div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 9 }}>
+            <span style={{
+              display: 'inline-grid', placeItems: 'center', width: 26, height: 26,
+              borderRadius: 999, background: 'color-mix(in srgb, var(--danger) 14%, transparent)',
+              border: '1px solid color-mix(in srgb, var(--danger) 45%, var(--border))',
+              color: 'var(--danger)', fontWeight: 800,
+            }}>!</span>
+            <div style={{ fontSize: 16, fontWeight: 800, color: 'var(--danger)' }}>Delete torrent</div>
+          </div>
           <div style={{ marginTop: 8, color: 'var(--text)', fontSize: 13, lineHeight: 1.4, wordBreak: 'break-word' }}>{torrent.name}</div>
+          <div style={{
+            marginTop: 10, color: 'var(--faint)', fontSize: 12, lineHeight: 1.45,
+            border: '1px solid var(--border)', borderRadius: 6, background: 'var(--surface)', padding: 9,
+          }}>
+            Removing only the torrent keeps downloaded files. Deleting files removes the saved payload from disk.
+          </div>
         </div>
-        <div style={{ padding: 14, display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+        <div style={{ padding: 14, display: 'flex', justifyContent: 'flex-end', gap: 8, flexWrap: 'wrap' }}>
           <button onClick={onCancel} style={dialogButton('#64748b')}>Cancel</button>
           <button onClick={onRemove} style={dialogButton('#f87171')}>Remove torrent</button>
           <button onClick={onRemoveFiles} style={dialogButton('#ef4444')}>Delete files</button>
@@ -830,6 +940,30 @@ const supportLink: React.CSSProperties = {
   color: 'var(--accent)',
   textDecoration: 'none',
   fontSize: 14,
+}
+
+function SupportCard({ icon, title, href, detail }: { icon: string; title: string; href: string; detail: string }) {
+  return (
+    <a className="rtng-card-link" style={{
+      ...supportLink,
+      display: 'grid',
+      gridTemplateColumns: '32px 1fr',
+      alignItems: 'center',
+      gap: 10,
+      minHeight: 70,
+      border: '1px solid var(--border)',
+      borderRadius: 7,
+      background: 'var(--surface)',
+      padding: 12,
+    }} href={href} target="_blank" rel="noreferrer">
+      <span style={{ color: 'var(--accent)', fontSize: 18, textAlign: 'center' }}>{icon}</span>
+      <span>
+        <span style={{ display: 'block', color: 'var(--text)', fontWeight: 700 }}>{title}</span>
+        <span style={{ display: 'block', color: 'var(--faint)', fontSize: 12, marginTop: 2 }}>{detail}</span>
+        <span style={{ display: 'block', color: 'var(--accent)', fontSize: 11, marginTop: 4, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{href.replace(/^https?:\/\//, '')}</span>
+      </span>
+    </a>
+  )
 }
 
 const supportButton: React.CSSProperties = {
@@ -887,9 +1021,16 @@ function LoginScreen({ message, onLogin }: {
       <form onSubmit={submit} style={{
         width: 'min(360px, 100%)', border: '1px solid var(--border)', borderRadius: 8,
         background: 'var(--panel)', padding: 20, display: 'flex', flexDirection: 'column', gap: 12,
+        boxShadow: '0 24px 60px var(--shadow)',
       }}>
         <div>
-          <div style={{ fontWeight: 700, fontSize: 18 }}>rtorrentNG</div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{
+              width: 10, height: 10, borderRadius: 3,
+              background: 'linear-gradient(135deg, var(--accent), var(--success))',
+            }} />
+            <div style={{ fontWeight: 800, fontSize: 18 }}>rtorrentNG</div>
+          </div>
           <div style={{ color: 'var(--faint)', fontSize: 12, marginTop: 4 }}>Sign in to manage torrents</div>
         </div>
         <label style={{ display: 'flex', flexDirection: 'column', gap: 5, fontSize: 12, color: 'var(--muted)' }}>
@@ -918,7 +1059,12 @@ function LoginScreen({ message, onLogin }: {
             }}
           />
         </label>
-        {error && <div style={{ color: 'var(--danger)', fontSize: 12 }}>{error}</div>}
+        {error && <div style={{
+          color: 'var(--danger)', fontSize: 12,
+          background: 'color-mix(in srgb, var(--danger) 9%, var(--surface))',
+          border: '1px solid color-mix(in srgb, var(--danger) 45%, var(--border))',
+          borderRadius: 6, padding: '8px 9px',
+        }}>{error}</div>}
         <button disabled={busy} style={{
           marginTop: 4, background: busy ? 'var(--surface-2)' : 'var(--accent-soft)',
           border: '1px solid var(--accent)', borderRadius: 5, color: 'var(--accent-text)',

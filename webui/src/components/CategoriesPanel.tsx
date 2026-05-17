@@ -64,31 +64,65 @@ export function CategoriesPanel() {
 
   return (
     <div style={{ padding: '20px 24px' }}>
-      <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 16, color: 'var(--text)' }}>
-        Categories
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 16 }}>
+        <div>
+          <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--text)' }}>Categories</div>
+          <div style={{ fontSize: 12, color: 'var(--faint)', marginTop: 2 }}>
+            {categories.length.toLocaleString()} configured
+          </div>
+        </div>
+        {(save.isPending || del.isPending) && (
+          <span style={{
+            color: 'var(--accent-text)', background: 'var(--accent-soft)', border: '1px solid var(--accent)',
+            borderRadius: 999, padding: '2px 8px', fontSize: 11, fontWeight: 700,
+          }}>Working</span>
+        )}
       </div>
 
       {/* Category list */}
       {isLoading ? (
-        <div style={{ fontSize: 12, color: 'var(--faint)', marginBottom: 16 }}>Loading…</div>
+        <div style={{ display: 'grid', gap: 8, marginBottom: 20, maxWidth: 720 }}>
+          {Array.from({ length: 3 }, (_, index) => (
+            <div key={index} style={{
+              border: '1px solid var(--border)', borderRadius: 7, background: 'var(--surface)',
+              padding: '10px 12px', display: 'grid', gap: 8,
+            }}>
+              <span className="rtng-skeleton" style={{ width: index === 1 ? '36%' : '52%', height: 12 }} />
+              <span className="rtng-skeleton" style={{ width: index === 2 ? '68%' : '44%', height: 8 }} />
+            </div>
+          ))}
+        </div>
       ) : categories.length === 0 ? (
-        <div style={{ fontSize: 12, color: 'var(--faint)', marginBottom: 16 }}>No categories yet.</div>
+        <div style={{
+          fontSize: 12, color: 'var(--faint)', marginBottom: 16,
+          border: '1px dashed var(--border-strong)', borderRadius: 7,
+          background: 'color-mix(in srgb, var(--surface) 72%, transparent)', padding: 14,
+          maxWidth: 720,
+        }}>No categories yet.</div>
       ) : (
         <div style={{ marginBottom: 20 }}>
-          {deleteError && <div style={{ fontSize: 12, color: 'var(--danger)', marginBottom: 8 }}>{deleteError}</div>}
+          {deleteError && <Notice tone="error">{deleteError}</Notice>}
           {categories.map(cat => (
-            <div key={cat.name} style={{
-              display: 'flex',
+            <div key={cat.name} className="rtng-card" style={{
+              display: 'grid',
+              gridTemplateColumns: 'minmax(0, 1fr) auto auto',
               alignItems: 'center',
               gap: 12,
-              padding: '8px 12px',
-              background: 'var(--surface-2)',
+              padding: '10px 12px',
+              background: editingName === cat.name ? 'var(--accent-soft)' : 'var(--surface)',
+              border: '1px solid ' + (editingName === cat.name ? 'var(--accent)' : 'var(--border)'),
               borderRadius: 6,
               marginBottom: 6,
             }}>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 13, color: 'var(--text)', fontWeight: 500 }}>{cat.name}</div>
-                <div style={{ fontSize: 11, color: 'var(--faint)', fontFamily: 'monospace', marginTop: 2 }}>
+              <div style={{ minWidth: 0 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                  <span style={{
+                    width: 7, height: 7, borderRadius: '50%', background: cat.save_path ? 'var(--success)' : 'var(--warning)',
+                    flexShrink: 0,
+                  }} />
+                  <span style={{ fontSize: 13, color: 'var(--text)', fontWeight: 700, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{cat.name}</span>
+                </div>
+                <div style={{ fontSize: 11, color: 'var(--faint)', fontFamily: 'monospace', marginTop: 4, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                   {cat.save_path || '(no save path)'}
                 </div>
               </div>
@@ -112,7 +146,11 @@ export function CategoriesPanel() {
       )}
 
       {/* Add / edit form */}
-      <form onSubmit={submit} style={{ display: 'flex', flexDirection: 'column', gap: 10, maxWidth: 420 }}>
+      <form onSubmit={submit} style={{
+        display: 'flex', flexDirection: 'column', gap: 10, maxWidth: 520,
+        border: '1px solid var(--border)', borderRadius: 8, background: 'var(--surface)', padding: 12,
+        boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.03)',
+      }}>
         <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--faint)', letterSpacing: '0.05em', textTransform: 'uppercase' }}>
           {editingName ? `Edit "${editingName}"` : 'Add category'}
         </div>
@@ -151,8 +189,23 @@ export function CategoriesPanel() {
             }}>Cancel</button>
           )}
         </div>
-        {save.isError && <div style={{ fontSize: 12, color: '#ef4444' }}>Failed to save.</div>}
+        {save.isError && <Notice tone="error">Failed to save.</Notice>}
       </form>
     </div>
+  )
+}
+
+function Notice({ tone, children }: { tone: 'error' | 'ok'; children: React.ReactNode }) {
+  return (
+    <div style={{
+      fontSize: 12,
+      color: tone === 'error' ? 'var(--danger)' : 'var(--success)',
+      background: tone === 'error' ? 'color-mix(in srgb, var(--danger) 9%, var(--surface))' : 'color-mix(in srgb, var(--success) 8%, var(--surface))',
+      border: '1px solid ' + (tone === 'error' ? 'color-mix(in srgb, var(--danger) 45%, var(--border))' : 'color-mix(in srgb, var(--success) 40%, var(--border))'),
+      borderRadius: 6,
+      padding: '8px 9px',
+      marginBottom: 8,
+      overflowWrap: 'anywhere',
+    }}>{children}</div>
   )
 }

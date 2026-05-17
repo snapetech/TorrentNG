@@ -15,6 +15,11 @@ function fmtDate(ts: number): string {
   return new Date(ts * 1000).toLocaleString()
 }
 
+function fmtSpeed(bps: number): string {
+  if (!bps) return '0 B/s'
+  return `${fmtSize(bps)}/s`
+}
+
 interface Props {
   torrent: TorrentSummary
   onClose: () => void
@@ -130,6 +135,15 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
   const ratio = (t.ratio / 1000).toFixed(3)
   const tags = t.tags ? t.tags.split(',').filter(Boolean) : []
   const isRunning = t.is_open && t.is_active
+  const state = t.message && !t.is_active
+    ? { label: 'Error', color: 'var(--danger)' }
+    : !t.is_open
+      ? { label: 'Stopped', color: 'var(--faint)' }
+      : t.complete && t.is_active
+        ? { label: 'Seeding', color: 'var(--success)' }
+        : !t.complete && t.is_active
+          ? { label: 'Downloading', color: 'var(--accent)' }
+          : { label: 'Queued', color: 'var(--muted)' }
 
   return (
     <aside className="torrent-detail" style={{
@@ -141,9 +155,17 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
         padding: '10px 14px', borderBottom: '1px solid var(--border)',
         display: 'flex', alignItems: 'flex-start', gap: 8,
       }}>
-        <span style={{ flex: 1, fontWeight: 600, fontSize: 13, color: 'var(--text)', lineHeight: 1.3 }}>
-          {t.name}
-        </span>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <span style={{ display: 'block', fontWeight: 700, fontSize: 13, color: 'var(--text)', lineHeight: 1.3, overflowWrap: 'anywhere' }}>
+            {t.name}
+          </span>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 7 }}>
+            <Pill color={state.color}>{state.label}</Pill>
+            {t.complete && <Pill color="var(--success)">Complete</Pill>}
+            {t.down_rate > 0 && <Pill color="var(--accent)">DL {fmtSpeed(t.down_rate)}</Pill>}
+            {t.up_rate > 0 && <Pill color="var(--success)">UL {fmtSpeed(t.up_rate)}</Pill>}
+          </div>
+        </div>
         <button onClick={onClose} title="Hide details" aria-label="Hide details" style={{
           background: 'var(--surface-2)', border: '1px solid var(--border-strong)', borderRadius: 5,
           cursor: 'pointer', color: 'var(--muted)', fontSize: 16, lineHeight: 1,
@@ -181,12 +203,12 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
         display: 'flex', flexWrap: 'wrap', gap: 6,
       }}>
         {isRunning
-          ? <ActionBtn label="Stop"      color="#64748b" disabled={busy} onClick={() => doAction(() => api.torrents.stop(t.hash))} />
-          : <ActionBtn label="Start"     color="#22c55e" disabled={busy} onClick={() => doAction(() => api.torrents.start(t.hash))} />
+          ? <ActionBtn label="Stop"      color="var(--muted)" disabled={busy} onClick={() => doAction(() => api.torrents.stop(t.hash))} />
+          : <ActionBtn label="Start"     color="var(--success)" disabled={busy} onClick={() => doAction(() => api.torrents.start(t.hash))} />
         }
-        <ActionBtn label="Recheck"    color="#f59e0b" disabled={busy} onClick={() => doAction(() => api.torrents.recheck(t.hash))} />
-        <ActionBtn label="Reannounce" color="#3b82f6" disabled={busy} onClick={() => doAction(() => api.torrents.reannounce(t.hash))} />
-        <ActionBtn label="Delete"     color="#ef4444" disabled={busy} onClick={() => setConfirmDelete(true)} />
+        <ActionBtn label="Recheck"    color="var(--warning)" disabled={busy} onClick={() => doAction(() => api.torrents.recheck(t.hash))} />
+        <ActionBtn label="Reannounce" color="var(--accent)" disabled={busy} onClick={() => doAction(() => api.torrents.reannounce(t.hash))} />
+        <ActionBtn label="Delete"     color="var(--danger)" disabled={busy} onClick={() => setConfirmDelete(true)} />
       </div>
 
       {/* Delete confirmation */}
@@ -244,7 +266,7 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
         </div>
 
         {/* Stats grid */}
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0 16px' }}>
+        <div className="rtng-two-col" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 14 }}>
           {[
             ['Size',        fmtSize(t.size_bytes)],
             ['Downloaded',  fmtSize(t.bytes_done)],
@@ -255,9 +277,12 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
             ['Added',       fmtDate(t.creation_date)],
             ['Completed',   fmtDate(t.timestamp_finished)],
           ].map(([lbl, val]) => (
-            <div key={lbl}>
+            <div key={lbl} style={{
+              minWidth: 0, background: 'var(--surface)', border: '1px solid var(--border)',
+              borderRadius: 6, padding: '7px 8px',
+            }}>
               <div style={LABEL}>{lbl}</div>
-              <div style={VALUE}>{val}</div>
+              <div style={{ ...VALUE, marginBottom: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={val}>{val}</div>
             </div>
           ))}
         </div>
@@ -348,12 +373,12 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
         {/* Trackers */}
         {trackersLoading && (
           <Section title="Trackers">
-            <div style={{ fontSize: 11, color: 'var(--faint)', marginBottom: 8 }}>Loading trackers…</div>
+            <LoadingBlock />
           </Section>
         )}
         {trackersError && (
           <Section title="Trackers">
-            <div style={{ fontSize: 11, color: 'var(--danger)', marginBottom: 8 }}>Tracker details unavailable.</div>
+            <Notice>Tracker details unavailable.</Notice>
           </Section>
         )}
         {trackers && (
@@ -383,9 +408,18 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
                 Add
               </button>
             </div>
-            {trackers.map((tr, i) => (
-              <div key={i} style={{ marginBottom: 8 }}>
+            {trackers.map((tr, i) => {
+              const ok = !tr.message
+              return (
+              <div key={i} style={{
+                marginBottom: 8, border: '1px solid var(--border)', borderRadius: 6,
+                padding: 8, background: ok ? 'var(--surface)' : 'color-mix(in srgb, var(--warning) 8%, var(--surface))',
+              }}>
                 <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                  <span style={{
+                    width: 7, height: 7, borderRadius: '50%', flexShrink: 0,
+                    background: ok ? 'var(--success)' : 'var(--warning)',
+                  }} />
                   <div style={{
                     flex: 1, minWidth: 0, fontSize: 11, color: 'var(--muted)', overflow: 'hidden',
                     textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontFamily: 'monospace',
@@ -407,9 +441,10 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
                   {tr.message ? ` · ${tr.message}` : ''}
                 </div>
               </div>
-            ))}
+              )
+            })}
             {trackers.length === 0 && (
-              <div style={{ fontSize: 11, color: 'var(--faint)', marginBottom: 8 }}>No trackers</div>
+              <EmptyBlock>No trackers configured.</EmptyBlock>
             )}
           </Section>
         )}
@@ -417,20 +452,24 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
         {/* Files */}
         {filesLoading && (
           <Section title="Files">
-            <div style={{ fontSize: 11, color: 'var(--faint)', marginBottom: 8 }}>Loading files…</div>
+            <LoadingBlock />
           </Section>
         )}
         {filesError && (
           <Section title="Files">
-            <div style={{ fontSize: 11, color: 'var(--danger)', marginBottom: 8 }}>File details unavailable.</div>
+            <Notice>File details unavailable.</Notice>
           </Section>
         )}
         {files && files.length > 0 && (
           <Section title={`Files (${files.length})`}>
             {files.map(f => {
               const fp = f.size_chunks > 0 ? (f.completed_chunks / f.size_chunks) * 100 : 100
+              const priority = f.priority === 0 ? 'Skipped' : f.priority >= 2 ? 'High' : 'Normal'
               return (
-                <div key={f.index} style={{ marginBottom: 8 }}>
+                <div key={f.index} style={{
+                  marginBottom: 8, border: '1px solid var(--border)', borderRadius: 6,
+                  background: 'var(--surface)', padding: 7,
+                }}>
                   <div style={{
                     fontSize: 11, color: 'var(--muted)', overflow: 'hidden',
                     textOverflow: 'ellipsis', whiteSpace: 'nowrap',
@@ -440,16 +479,38 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
                       <div style={{ width: `${fp}%`, height: '100%', background: fp >= 100 ? 'var(--success)' : 'var(--accent)' }} />
                     </div>
                     <span style={{ fontSize: 10, color: 'var(--faint)', flexShrink: 0 }}>{fmtSize(f.size_bytes)}</span>
+                    <span style={{ fontSize: 10, color: f.priority === 0 ? 'var(--faint)' : f.priority >= 2 ? 'var(--accent)' : 'var(--success)', flexShrink: 0 }}>{priority}</span>
                   </div>
                 </div>
               )
             })}
           </Section>
         )}
+        {files && files.length === 0 && (
+          <Section title="Files">
+            <EmptyBlock>No file list available yet.</EmptyBlock>
+          </Section>
+        )}
 
         <div style={{ height: 14 }} />
       </div>
     </aside>
+  )
+}
+
+function Pill({ color, children }: { color: string; children: React.ReactNode }) {
+  return (
+    <span style={{
+      display: 'inline-flex', alignItems: 'center', minHeight: 18,
+      border: `1px solid color-mix(in srgb, ${color} 42%, transparent)`,
+      background: `color-mix(in srgb, ${color} 12%, transparent)`,
+      color,
+      borderRadius: 999,
+      padding: '0 7px',
+      fontSize: 10,
+      fontWeight: 700,
+      whiteSpace: 'nowrap',
+    }}>{children}</span>
   )
 }
 
@@ -462,5 +523,42 @@ function Section({ title, children }: { title: string; children: React.ReactNode
       }}>{title}</div>
       {children}
     </div>
+  )
+}
+
+function LoadingBlock() {
+  return (
+    <div style={{
+      border: '1px solid var(--border)', borderRadius: 6, background: 'var(--surface)',
+      padding: 9, display: 'grid', gap: 7,
+    }}>
+      <span className="rtng-skeleton" style={{ width: '58%', height: 10 }} />
+      <span className="rtng-skeleton" style={{ width: '82%', height: 8 }} />
+    </div>
+  )
+}
+
+function EmptyBlock({ children }: { children: React.ReactNode }) {
+  return (
+    <div style={{
+      border: '1px dashed var(--border-strong)', borderRadius: 6,
+      background: 'color-mix(in srgb, var(--surface) 70%, transparent)',
+      color: 'var(--faint)', fontSize: 11, padding: '9px 10px', marginBottom: 8,
+    }}>{children}</div>
+  )
+}
+
+function Notice({ children }: { children: React.ReactNode }) {
+  return (
+    <div style={{
+      border: '1px solid color-mix(in srgb, var(--danger) 45%, var(--border))',
+      borderRadius: 6,
+      background: 'color-mix(in srgb, var(--danger) 9%, var(--surface))',
+      color: 'var(--danger)',
+      fontSize: 11,
+      padding: '8px 9px',
+      marginBottom: 8,
+      overflowWrap: 'anywhere',
+    }}>{children}</div>
   )
 }

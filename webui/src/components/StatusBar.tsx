@@ -33,10 +33,18 @@ function fmtBytes(bytes?: number): string {
 }
 
 function tone(value?: string): { color: string; bg: string; border: string } {
-  if (value === 'open' || value === 'on') return { color: '#86efac', bg: 'rgba(34,197,94,.12)', border: 'rgba(34,197,94,.35)' }
-  if (value === 'listening' || value === 'unknown') return { color: '#fbbf24', bg: 'rgba(245,158,11,.14)', border: 'rgba(245,158,11,.5)' }
-  if (value === 'closed' || value === 'off') return { color: '#fca5a5', bg: 'rgba(239,68,68,.14)', border: 'rgba(239,68,68,.5)' }
-  return { color: '#94a3b8', bg: 'rgba(148,163,184,.08)', border: 'rgba(148,163,184,.22)' }
+  if (value === 'open' || value === 'on') return themedTone('var(--success)')
+  if (value === 'listening' || value === 'unknown') return themedTone('var(--warning)')
+  if (value === 'closed' || value === 'off') return themedTone('var(--danger)')
+  return themedTone('var(--muted)')
+}
+
+function themedTone(color: string): { color: string; bg: string; border: string } {
+  return {
+    color,
+    bg: `color-mix(in srgb, ${color} 12%, transparent)`,
+    border: `color-mix(in srgb, ${color} 38%, var(--border))`,
+  }
 }
 
 function Badge({
@@ -68,6 +76,23 @@ function Badge({
   )
 }
 
+function Notice({ tone, children }: { tone: 'ok' | 'error'; children: React.ReactNode }) {
+  return (
+    <span style={{
+      display: 'inline-flex', alignItems: 'center', gap: 5, minHeight: 22,
+      border: '1px solid ' + (tone === 'error' ? 'color-mix(in srgb, var(--danger) 45%, var(--border))' : 'color-mix(in srgb, var(--success) 38%, var(--border))'),
+      background: tone === 'error' ? 'color-mix(in srgb, var(--danger) 12%, transparent)' : 'color-mix(in srgb, var(--success) 10%, transparent)',
+      color: tone === 'error' ? 'var(--danger)' : 'var(--success)',
+      borderRadius: 6,
+      padding: '0 8px',
+      whiteSpace: 'nowrap',
+    }}>
+      <span>{tone === 'error' ? '!' : '✓'}</span>
+      <span>{children}</span>
+    </span>
+  )
+}
+
 export function StatusBar({
   loaded, total, selected, stats, rtorrent, cached, storage, togglingFeature, onToggleDht, onTogglePex,
   featureError, actionMessage, actionTone = 'ok',
@@ -91,16 +116,12 @@ export function StatusBar({
         <Badge label="Core" value={connected ? 'connected' : 'disconnected'} state={connected ? 'on' : 'closed'} />
       </div>
       <div className="rtng-statusbar-counts" style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 'max-content' }}>
-        <span>{total.toLocaleString()} torrents</span>
-        {rendered !== total && <span>{rendered.toLocaleString()} rendered</span>}
-        {cached !== undefined && <span>{cached.toLocaleString()} cached</span>}
-        {selected > 0 && <span style={{ color: 'var(--accent)' }}>{selected.toLocaleString()} selected</span>}
-        {featureError && <span style={{ color: 'var(--danger)' }}>{featureError}</span>}
-        {actionMessage && (
-          <span style={{ color: actionTone === 'error' ? 'var(--danger)' : 'var(--success)' }}>
-            {actionMessage}
-          </span>
-        )}
+        <Badge label="Torrents" value={total.toLocaleString()} state="idle" />
+        {rendered !== total && <Badge label="Rendered" value={rendered.toLocaleString()} state="idle" />}
+        {cached !== undefined && <Badge label="Cached" value={cached.toLocaleString()} state="idle" />}
+        {selected > 0 && <Badge label="Selected" value={selected.toLocaleString()} state="on" />}
+        {featureError && <Notice tone="error">{featureError}</Notice>}
+        {actionMessage && <Notice tone={actionTone}>{actionMessage}</Notice>}
       </div>
       <span className="rtng-statusbar-spacer" style={{ flex: 1 }} />
       <div className="rtng-statusbar-metrics" style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 'max-content' }}>
@@ -123,18 +144,18 @@ export function StatusBar({
         />
         <Badge
           label="DHT"
-          value={stats.dht ?? 'unknown'}
           title="Toggle runtime rTorrent DHT"
           state={stats.dht}
           disabled={togglingFeature === 'dht'}
+          value={togglingFeature === 'dht' ? '...' : (stats.dht ?? 'unknown')}
           onClick={stats.dht === 'unknown' || togglingFeature ? undefined : onToggleDht}
         />
         <Badge
           label="PEX"
-          value={stats.pex ?? 'unknown'}
           title="Toggle runtime rTorrent peer exchange"
           state={stats.pex}
           disabled={togglingFeature === 'pex'}
+          value={togglingFeature === 'pex' ? '...' : (stats.pex ?? 'unknown')}
           onClick={stats.pex === 'unknown' || togglingFeature ? undefined : onTogglePex}
         />
       </div>

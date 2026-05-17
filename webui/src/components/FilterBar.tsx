@@ -9,6 +9,14 @@ interface Props {
 export function FilterBar({ params, onChange }: Props) {
   const [search, setSearch] = useState(params.filter ?? '')
   const hasSidebarFilters = Boolean(params.status || params.category || params.tag || params.tracker || params.media_type)
+  const activeCount = [params.filter || search, params.status, params.category, params.tag, params.tracker, params.media_type].filter(Boolean).length
+  const chips = [
+    params.status && ['State', params.status, 'status'],
+    params.media_type && ['Type', params.media_type, 'media_type'],
+    params.category && ['Category', params.category, 'category'],
+    params.tag && ['Tag', params.tag, 'tag'],
+    params.tracker && ['Tracker', params.tracker, 'tracker'],
+  ].filter(Boolean) as Array<[string, string, keyof ListParams]>
 
   useEffect(() => {
     const t = setTimeout(() => onChange({ filter: search, offset: 0 }), 200)
@@ -16,7 +24,7 @@ export function FilterBar({ params, onChange }: Props) {
   }, [search, onChange])
 
   return (
-    <div style={{
+    <div className="rtng-filterbar" style={{
       display: 'flex',
       gap: 8,
       padding: '7px 12px',
@@ -25,25 +33,37 @@ export function FilterBar({ params, onChange }: Props) {
       alignItems: 'center',
       flexWrap: 'wrap',
     }}>
-      <input
-        type="search"
-        placeholder="Search torrents"
-        value={search}
-        onChange={e => setSearch(e.target.value)}
-        style={{
-          flex: '1 1 160px',
-          background: 'var(--bg)',
-          border: '1px solid var(--border-strong)',
-          borderRadius: 6,
-          color: 'var(--text)',
-          padding: '4px 10px',
-          fontSize: 13,
-          outline: 'none',
-        }}
-      />
+      <label className="rtng-filterbar-search" style={{
+        flex: '1 1 220px', minWidth: 0, display: 'flex', alignItems: 'center', gap: 7,
+        background: 'var(--bg)', border: '1px solid ' + (search ? 'var(--accent)' : 'var(--border-strong)'), borderRadius: 6,
+        padding: '0 9px',
+        boxShadow: search ? '0 0 0 2px color-mix(in srgb, var(--accent) 14%, transparent)' : undefined,
+      }}>
+        <span style={{ color: 'var(--faint)', fontSize: 12 }}>⌕</span>
+        <input
+          aria-label="Search torrents"
+          type="search"
+          placeholder="Search torrents"
+          value={search}
+          onChange={e => setSearch(e.target.value)}
+          style={{
+            flex: 1,
+            minWidth: 0,
+            background: 'transparent',
+            border: 0,
+            color: 'var(--text)',
+            padding: '5px 0',
+            fontSize: 13,
+            outline: 'none',
+          }}
+        />
+      </label>
 
       {(params.filter || search) && (
         <button
+          className="rtng-filterbar-button"
+          type="button"
+          aria-label="Clear torrent search"
           onClick={() => {
             setSearch('')
             onChange({ filter: undefined, offset: 0 })
@@ -63,6 +83,9 @@ export function FilterBar({ params, onChange }: Props) {
       )}
       {hasSidebarFilters && (
         <button
+          className="rtng-filterbar-button"
+          type="button"
+          aria-label="Clear sidebar filters"
           onClick={() => onChange({
             status: undefined,
             category: undefined,
@@ -86,9 +109,38 @@ export function FilterBar({ params, onChange }: Props) {
         </button>
       )}
       {hasSidebarFilters && (
-        <span style={{ color: 'var(--faint)', fontSize: 11, whiteSpace: 'nowrap' }}>
-          Filtered view
+        <span className="rtng-filterbar-count" style={{
+          color: 'var(--accent-text)', background: 'var(--accent-soft)', border: '1px solid var(--accent)',
+          borderRadius: 999, padding: '2px 8px', fontSize: 11, fontWeight: 800, whiteSpace: 'nowrap',
+        }}>
+          {activeCount.toLocaleString()} active
         </span>
+      )}
+      {chips.length > 0 && (
+        <div className="rtng-filterbar-chips" style={{ display: 'flex', gap: 5, flexWrap: 'wrap', minWidth: 0 }}>
+          {chips.map(([label, value, key]) => (
+            <span key={`${label}:${value}`} title={value} style={{
+              display: 'inline-flex', alignItems: 'center', gap: 4,
+              maxWidth: 190, border: '1px solid var(--border)', borderRadius: 999,
+              background: 'var(--surface)', color: 'var(--muted)', padding: '2px 7px',
+              fontSize: 11,
+            }}>
+              <span style={{ color: 'var(--faint)' }}>{label}</span>
+              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{value}</span>
+              <button
+                type="button"
+                aria-label={`Clear ${label} filter`}
+                onClick={() => onChange({ [key]: undefined, offset: 0 })}
+                style={{
+                  background: 'transparent', border: 0, color: 'var(--faint)', padding: '0 0 0 2px',
+                  fontSize: 12, lineHeight: 1, cursor: 'pointer',
+                }}
+              >
+                ×
+              </button>
+            </span>
+          ))}
+        </div>
       )}
     </div>
   )
