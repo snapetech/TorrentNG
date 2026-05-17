@@ -10,7 +10,9 @@ export function FilterBar({ params, onChange }: Props) {
   const [search, setSearch] = useState(params.filter ?? '')
   const hasSidebarFilters = Boolean(params.status || params.category || params.tag || params.tracker || params.media_type)
   const activeCount = [params.filter || search, params.status, params.category, params.tag, params.tracker, params.media_type].filter(Boolean).length
+  const sortLabel = `${params.sort ?? 'name'} ${params.dir === 'desc' ? 'desc' : 'asc'}`
   const chips = [
+    (params.filter || search) && ['Search', params.filter || search, 'filter'],
     params.status && ['State', params.status, 'status'],
     params.media_type && ['Type', params.media_type, 'media_type'],
     params.category && ['Category', params.category, 'category'],
@@ -126,8 +128,17 @@ export function FilterBar({ params, onChange }: Props) {
           {activeCount.toLocaleString()} active
         </span>
       )}
-      {chips.length > 0 && (
+      {(chips.length > 0 || params.sort) && (
         <div className="rtng-filterbar-chips" style={{ display: 'flex', gap: 5, flexWrap: 'wrap', minWidth: 0 }}>
+          <span className="rtng-filter-chip rtng-filter-chip-muted" title={`Sorted by ${sortLabel}`} style={{
+            display: 'inline-flex', alignItems: 'center', gap: 4,
+            maxWidth: 190, border: '1px solid var(--border)', borderRadius: 999,
+            background: 'var(--surface)', color: 'var(--muted)', padding: '2px 7px',
+            fontSize: 11,
+          }}>
+            <span style={{ color: 'var(--faint)' }}>Sort</span>
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{sortLabel}</span>
+          </span>
           {chips.map(([label, value, key]) => (
             <span key={`${label}:${value}`} className="rtng-filter-chip" title={value} style={{
               display: 'inline-flex', alignItems: 'center', gap: 4,
@@ -140,7 +151,10 @@ export function FilterBar({ params, onChange }: Props) {
               <button
                 type="button"
                 aria-label={`Clear ${label} filter`}
-                onClick={() => onChange({ [key]: undefined, offset: 0 })}
+                onClick={() => {
+                  if (key === 'filter') setSearch('')
+                  onChange({ [key]: undefined, offset: 0 })
+                }}
                 style={{
                   background: 'transparent', border: 0, color: 'var(--faint)', padding: '0 0 0 2px',
                   fontSize: 12, lineHeight: 1, cursor: 'pointer',

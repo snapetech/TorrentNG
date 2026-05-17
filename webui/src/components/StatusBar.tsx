@@ -143,7 +143,11 @@ export function StatusBar({
     : storage?.error ?? 'Storage status unavailable'
 
   return (
-    <footer className="rtng-statusbar" style={{
+    <footer
+      className="rtng-statusbar"
+      data-connected={connected ? 'true' : 'false'}
+      data-selected={selected > 0 ? 'true' : 'false'}
+      style={{
       minHeight: 38, flexShrink: 0, display: 'flex', alignItems: 'center', gap: 12,
       padding: '0 12px', background: 'var(--bg)', borderTop: '1px solid var(--border-strong)',
       color: 'var(--faint)', fontSize: 11, overflowX: 'auto',
