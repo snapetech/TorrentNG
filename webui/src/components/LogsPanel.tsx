@@ -34,6 +34,8 @@ export function LogsPanel() {
         <select value={kind} onChange={event => setKind(event.target.value)} style={selectStyle} aria-label="Log kind">
           <option value="">All kinds</option>
           <option value="rtorrent_log">rTorrent</option>
+          <option value="rtorrent_log_ingest_error">rTorrent ingest errors</option>
+          <option value="rtorrent_log_ingest_recovered">rTorrent ingest recovery</option>
           <option value="rtorrent_sync_error">Sync errors</option>
           <option value="rtorrent_sync_recovered">Sync recovery</option>
           <option value="workflow_run">Workflows</option>
@@ -145,7 +147,7 @@ function formatTime(timestamp: number): string {
 function parsePayload(payload: string): string | null {
   try {
     const value = JSON.parse(payload) as Record<string, unknown>
-    const parts = ['component', 'operation', 'result', 'torrent', 'job_id', 'tracker']
+    const parts = ['component', 'operation', 'result', 'source', 'torrent', 'job_id', 'tracker', 'error']
       .flatMap(key => value[key] ? [`${key}=${String(value[key])}`] : [])
     return parts.length > 0 ? parts.join(' ') : null
   } catch {

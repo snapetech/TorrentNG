@@ -245,6 +245,12 @@ impl Db {
         Ok(())
     }
 
+    pub fn delete_kv(&self, key: &str) -> Result<()> {
+        self.conn()
+            .execute("DELETE FROM kv WHERE key=?1", params![key])?;
+        Ok(())
+    }
+
     pub fn exists(&self, hash: &str) -> Result<bool> {
         let exists: i64 = self.conn().query_row(
             "SELECT EXISTS(SELECT 1 FROM torrents WHERE hash=?1)",
