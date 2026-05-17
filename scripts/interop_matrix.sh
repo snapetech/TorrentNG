@@ -53,7 +53,6 @@ Environment:
   INTEROP_EXTENDED_LOCAL=1
   INTEROP_PROTOCOL_LOCAL=1
   INTEROP_PROTOCOL_ONLY=rust-magnet-with-tracker
-  INTEROP_EXPERIMENTAL_PROTOCOL=1
   INTEROP_WORKDIR=certification/interop
 USAGE
 }
@@ -335,6 +334,15 @@ add_qb() {
     -F "paused=false" \
     "${skip[@]}" \
     "$(client_url qbittorrent)/api/v2/torrents/add" >/dev/null
+}
+
+qb_force_start() {
+  local info_hash="$1"
+  qb_login
+  curl --max-time "$CURL_MAX_TIME" -fsS -H 'Host: localhost:8080' -b "$WORKDIR/artifacts/qbit.cookie" \
+    --data-urlencode "hashes=$info_hash" \
+    --data-urlencode "value=true" \
+    "$(client_url qbittorrent)/api/v2/torrents/setForceStart" >/dev/null
 }
 
 add_rust() {
@@ -857,6 +865,7 @@ run_magnet_tracker_case() {
   magnet="magnet:?xt=urn:btih:$info_hash&dn=$(urlencode "$name")&tr=$(urlencode 'http://opentracker:6969/announce')"
   seed_fixture_for_client qbittorrent "$fixture"
   add_to_client qbittorrent "$torrent" seed || status="FAIL"
+  qb_force_start "$info_hash" || status="FAIL"
   add_rust_url "$magnet" "$(download_dir rusttorrentd)" || status="FAIL"
   bridge_client_peer_to_rust qbittorrent "$info_hash" || true
   wait_explicit_peer_complete "$TIMEOUT_LOCAL" "$fixture" "$info_hash" qbittorrent qbittorrent rusttorrentd || status="FAIL"
@@ -944,8 +953,7 @@ run_protocol_local_matrix() {
   [[ "${INTEROP_PROTOCOL_LOCAL:-1}" == "1" ]] || return 0
   append_report "# Protocol Local Certification"
   append_report ""
-  if [[ "${INTEROP_EXPERIMENTAL_PROTOCOL:-0}" == "1" &&
-    (-z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "rust-magnet-with-tracker") ]]; then
+  if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "rust-magnet-with-tracker" ]]; then
     run_magnet_tracker_case || failures=$((failures + 1))
   fi
   if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "rust-udp-tracker" ]]; then

@@ -118,7 +118,7 @@ or compatibility behaviors.
 
 | Case | Coverage | Pass criteria | Status |
 |---|---|---|---|
-| `rust-magnet-with-tracker` | Rust adds a `btih` magnet URI with an HTTP tracker, fetches metadata from a reference seeder, and downloads the payload. | Complete and hash match | Experimental; API add works, metadata acquisition remains blocked |
+| `rust-magnet-with-tracker` | Rust adds a `btih` magnet URI with an HTTP tracker, fetches metadata from a reference seeder, and downloads the payload. | Complete and hash match | Implemented |
 | `rust-udp-tracker` | Rust announces to opentracker through `udp://opentracker:6969/announce`. | Complete and hash match | Implemented |
 | `rust-qbit-mutation-facade` | qBittorrent-compatible `filePrio`, `recheck`, tracker add/edit/remove, `trackers`, and `files` endpoints. | Endpoints succeed and reflected state is visible | Implemented |
 | `magnet-dht-only` | Magnet metadata and peer discovery without trackers. | Complete and hash match | Planned |
@@ -142,11 +142,10 @@ Run one protocol row while developing it:
 INTEROP_PROTOCOL_ONLY=rust-udp-tracker scripts/interop_matrix.sh --local
 ```
 
-Run experimental protocol rows, including the currently blocked magnet metadata
-case:
+Run the magnet metadata row directly:
 
 ```sh
-INTEROP_EXPERIMENTAL_PROTOCOL=1 INTEROP_PROTOCOL_ONLY=rust-magnet-with-tracker scripts/interop_matrix.sh --local
+INTEROP_PROTOCOL_ONLY=rust-magnet-with-tracker scripts/interop_matrix.sh --local
 ```
 
 ## Expansion Backlog
@@ -259,7 +258,6 @@ INTEROP_KEEP_STACK=1 scripts/interop_matrix.sh --local
 | `INTEROP_EXTENDED_ONLY` | `0` | Run only the extended local rows |
 | `INTEROP_PROTOCOL_LOCAL` | `1` | Include protocol-specific local coverage |
 | `INTEROP_PROTOCOL_ONLY` | unset | Run one protocol row by case name |
-| `INTEROP_EXPERIMENTAL_PROTOCOL` | `0` | Include protocol rows that document known blockers |
 | `INTEROP_SKIP_BUILD` | `0` | Reuse an existing interop image instead of building |
 | `INTEROP_KEEP_STACK` | `0` | Leave containers running after the script exits |
 | `INTEROP_KEEP_PUBLIC_DATA` | `0` | Preserve public torrent payloads after report generation |

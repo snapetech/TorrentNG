@@ -32,7 +32,7 @@ const METADATA_PIECE_SIZE: usize = 16 * 1024;
 const MAX_METADATA_SIZE: u32 = 16 * 1024 * 1024;
 const LOCAL_UT_METADATA_ID: u8 = 1;
 const MAX_METADATA_FETCH_CONCURRENCY: usize = 8;
-const METADATA_PEER_RETRY_AFTER: Duration = Duration::from_secs(300);
+const METADATA_PEER_RETRY_AFTER: Duration = Duration::from_secs(15);
 
 pub async fn run_metadata_task(
     info_hash: [u8; 20],
@@ -528,7 +528,11 @@ async fn write_handshake(
 async fn read_handshake(framed: &mut Framed<TcpStream, PeerCodec>) -> anyhow::Result<Handshake> {
     use tokio::io::AsyncReadExt;
     let mut hs_buf = [0u8; 68];
-    framed.get_mut().read_exact(&mut hs_buf).await?;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        framed.get_mut().read_exact(&mut hs_buf),
+    )
+    .await??;
     Ok(Handshake::parse(&hs_buf)?)
 }
 
@@ -549,6 +553,7 @@ async fn fetch_metadata(
                 .encode(),
         })
         .await?;
+    framed.send(Message::Interested).await?;
 
     let (remote_ext_id, metadata_size) = read_remote_metadata_handshake(addr, &mut framed).await?;
     let piece_count = metadata_size.div_ceil(METADATA_PIECE_SIZE as u32);
@@ -762,7 +767,7 @@ mod tests {
         assert!(!should_retry_peer(
             &mut attempts,
             peer,
-            now + Duration::from_secs(60)
+            now + Duration::from_secs(10)
         ));
         assert!(should_retry_peer(
             &mut attempts,
