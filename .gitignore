@@ -13,6 +13,7 @@ webui/playwright-report/
 .env
 benchmarks/report-*.md
 certification/reports/
+certification/bundles/
 certification/interop/
 
 __pycache__/

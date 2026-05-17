@@ -129,6 +129,7 @@ for pattern in \
   local-release-selftest.md \
   certification-burndown-selftest.md \
   release-readiness-selftest.md \
+  certification-bundle-selftest.md \
   pre-engine-release-selftest.md \
   pre-engine-suite-selftest.md; do
   write_passing_report "$report_dir/$pattern"
