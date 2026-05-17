@@ -1309,7 +1309,7 @@ pub async fn upsert_workflow(
             Json(rules).into_response()
         }
         Err(e) => {
-            tracing::error!("upsert workflow rule: {e}");
+            tracing::error!(component = "api", operation = "upsert_workflow_rule", error = %e, "workflow rule upsert failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1325,7 +1325,7 @@ pub async fn delete_workflow(
             Json(rules).into_response()
         }
         Err(e) => {
-            tracing::error!("delete workflow rule {id}: {e}");
+            tracing::error!(component = "api", operation = "delete_workflow_rule", rule_id = %id, error = %e, "workflow rule delete failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1346,7 +1346,7 @@ pub async fn run_workflow(
         Ok(Some(rule)) => rule,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
-            tracing::error!("get workflow rule {id}: {e}");
+            tracing::error!(component = "api", operation = "get_workflow_rule", rule_id = %id, error = %e, "workflow rule lookup failed");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -1356,7 +1356,7 @@ pub async fn run_workflow(
     let hashes = match s.db.workflow_hashes(&rule) {
         Ok(hashes) => hashes,
         Err(e) => {
-            tracing::error!("workflow hashes {id}: {e}");
+            tracing::error!(component = "api", operation = "workflow_hashes", rule_id = %id, error = %e, "workflow hash query failed");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -1536,7 +1536,7 @@ fn record_workflow_run(
         started_at: chrono::Utc::now().timestamp(),
     };
     if let Err(e) = s.db.record_workflow_run(run) {
-        tracing::error!("record workflow run {}: {e}", rule.id);
+        tracing::error!(component = "api", operation = "record_workflow_run", rule_id = %rule.id, error = %e, "workflow run record failed");
     } else {
         emit(s, Event::WorkflowRunsUpdated);
     }
@@ -1675,7 +1675,7 @@ pub async fn list_torrents(
             Json(serde_json::json!({ "total": total, "torrents": rows })).into_response()
         }
         Err(e) => {
-            tracing::error!("list torrents: {e}");
+            tracing::error!(component = "api", operation = "list_torrents", error = %e, "torrent list query failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1688,7 +1688,7 @@ pub async fn get_torrent(State(s): State<AppState>, Path(hash): Path<String>) ->
         Ok(Some(row)) => Json(row).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
-            tracing::error!("get torrent {hash}: {e}");
+            tracing::error!(component = "api", operation = "get_torrent", torrent = %hash, error = %e, "torrent lookup failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1715,17 +1715,17 @@ pub async fn update_torrent(
         Ok(true) => {}
         Ok(false) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
-            tracing::error!("db exists {hash}: {e}");
+            tracing::error!(component = "cache", operation = "exists", torrent = %hash, error = %e, "cache torrent existence check failed");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     }
 
     if let Err(e) = s.rt.set_location(&hash, save_path).await {
-        tracing::error!("set location {hash}: {e}");
+        tracing::error!(component = "rtorrent", operation = "set_location", torrent = %hash, error = %e, "rTorrent location update failed");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     if let Err(e) = s.db.set_torrent_location(&hash, save_path) {
-        tracing::error!("db set location {hash}: {e}");
+        tracing::error!(component = "cache", operation = "set_location", torrent = %hash, error = %e, "cache location update failed");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     emit_torrent_updated(&s, &hash);
@@ -1771,7 +1771,7 @@ pub async fn add_torrent(State(s): State<AppState>, mut multipart: Multipart) ->
         match s.rt.load_magnet(m, &save_path, &category, start).await {
             Ok(_) => return StatusCode::ACCEPTED.into_response(),
             Err(e) => {
-                tracing::error!("add magnet: {e}");
+                tracing::error!(component = "api", operation = "add_magnet", error = %e, "native magnet add failed");
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         }
@@ -1783,7 +1783,7 @@ pub async fn add_torrent(State(s): State<AppState>, mut multipart: Multipart) ->
         match s.rt.load_torrent(&data, &save_path, &category, start).await {
             Ok(_) => return StatusCode::ACCEPTED.into_response(),
             Err(e) => {
-                tracing::error!("add torrent: {e}");
+                tracing::error!(component = "api", operation = "add_torrent", error = %e, "native torrent add failed");
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         }
@@ -1887,7 +1887,7 @@ pub async fn torrent_trackers(
     match s.rt.list_trackers(&hash).await {
         Ok(trackers) => Json(serde_json::json!({ "trackers": trackers })).into_response(),
         Err(e) => {
-            tracing::error!("list trackers {hash}: {e}");
+            tracing::error!(component = "api", operation = "list_trackers", torrent = %hash, error = %e, "native tracker listing failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -2051,7 +2051,7 @@ pub async fn list_categories(State(s): State<AppState>) -> impl IntoResponse {
     match s.db.list_categories() {
         Ok(cats) => Json(cats).into_response(),
         Err(e) => {
-            tracing::error!("list categories: {e}");
+            tracing::error!(component = "api", operation = "list_categories", error = %e, "category listing failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -2083,7 +2083,7 @@ pub async fn upsert_category(
             .into_response()
         }
         Err(e) => {
-            tracing::error!("upsert category: {e}");
+            tracing::error!(component = "api", operation = "upsert_category", category = %name, error = %e, "category upsert failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -2112,7 +2112,7 @@ pub async fn list_tags(State(s): State<AppState>) -> impl IntoResponse {
     match s.db.list_tags() {
         Ok(tags) => Json(tags).into_response(),
         Err(e) => {
-            tracing::error!("list tags: {e}");
+            tracing::error!(component = "api", operation = "list_tags", error = %e, "tag listing failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -2134,7 +2134,7 @@ pub async fn create_tag(State(s): State<AppState>, Json(body): Json<TagBody>) ->
             StatusCode::CREATED.into_response()
         }
         Err(e) => {
-            tracing::error!("create tag: {e}");
+            tracing::error!(component = "api", operation = "create_tag", tag = %name, error = %e, "tag create failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -2405,7 +2405,7 @@ pub async fn get_user_agent(State(s): State<AppState>) -> impl IntoResponse {
     match s.rt.get_user_agent().await {
         Ok(ua) => Json(UserAgentResponse { user_agent: ua }).into_response(),
         Err(e) => {
-            tracing::error!("get user agent: {e}");
+            tracing::error!(component = "api", operation = "get_user_agent", error = %e, "user-agent lookup failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -2425,7 +2425,7 @@ pub async fn set_user_agent(
             Json(UserAgentResponse { user_agent: ua }).into_response()
         }
         Err(e) => {
-            tracing::error!("set user agent: {e}");
+            tracing::error!(component = "api", operation = "set_user_agent", error = %e, "user-agent update failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
