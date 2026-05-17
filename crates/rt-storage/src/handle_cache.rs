@@ -95,12 +95,7 @@ impl HandleCache {
     /// file); otherwise a read-only handle that never creates. The open
     /// syscall runs outside the lock; a concurrent opener racing the same
     /// key is resolved by keeping whichever landed first.
-    pub fn get_or_open(
-        &self,
-        path: &Path,
-        write: bool,
-        create: bool,
-    ) -> io::Result<Arc<OpenFile>> {
+    pub fn get_or_open(&self, path: &Path, write: bool, create: bool) -> io::Result<Arc<OpenFile>> {
         let access = if write { Access::Write } else { Access::Read };
         let key: Key = (path.to_path_buf(), access);
 
