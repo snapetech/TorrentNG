@@ -108,11 +108,16 @@ journalctl --user -u rtorrentng-live-main-update.service -f
 ```
 
 The updater fetches `origin/main`, fast-forwards the checkout, rebuilds
-`rtorrentng` with `docker compose -f deploy/docker/compose.yml build
-rtorrentng`, then recreates the service. It refuses to run when the checkout has
-uncommitted local changes so a test instance does not silently discard work.
-Use a clean checkout for the live instance, or set `RTNG_LIVE_ALLOW_DIRTY=1` only
-for a disposable checkout.
+`rtorrentng`, then recreates the service. The sample unit targets the local
+certification stack on `http://localhost:28081`, using
+`deploy/certification/compose.yml` and `deploy/certification/.env`, so the same
+home test instance used by Sonarr/Radarr/Prowlarr/autobrr is refreshed from
+`main`. Set `RTNG_LIVE_COMPOSE_FILE`, `RTNG_LIVE_COMPOSE_ENV_FILE`,
+`RTNG_HOST_PORT`, and `RTNG_INCOMING_PORT` in the unit if your local instance
+uses different compose wiring or ports. It refuses to run when the checkout has
+uncommitted local changes so a test instance does not silently discard work. Use
+a clean checkout for the live instance, or set `RTNG_LIVE_ALLOW_DIRTY=1` only for
+a disposable checkout.
 
 Useful overrides:
 

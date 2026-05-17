@@ -6,6 +6,7 @@ REPO_DIR="${RTNG_LIVE_REPO_DIR:-$(cd -- "$SCRIPT_DIR/.." && pwd)}"
 REMOTE="${RTNG_LIVE_REMOTE:-origin}"
 BRANCH="${RTNG_LIVE_BRANCH:-main}"
 COMPOSE_FILE="${RTNG_LIVE_COMPOSE_FILE:-deploy/docker/compose.yml}"
+COMPOSE_ENV_FILE="${RTNG_LIVE_COMPOSE_ENV_FILE:-}"
 SERVICE="${RTNG_LIVE_SERVICE:-rtorrentng}"
 LOCK_FILE="${RTNG_LIVE_LOCK_FILE:-/tmp/rtorrentng-live-main-update.lock}"
 ALLOW_DIRTY="${RTNG_LIVE_ALLOW_DIRTY:-0}"
@@ -42,6 +43,16 @@ if [[ ! -f "$COMPOSE_FILE" ]]; then
   exit 2
 fi
 
+compose_cmd=(docker compose)
+if [[ -n "$COMPOSE_ENV_FILE" ]]; then
+  if [[ ! -f "$COMPOSE_ENV_FILE" ]]; then
+    log "compose env file not found: $COMPOSE_ENV_FILE"
+    exit 2
+  fi
+  compose_cmd+=(--env-file "$COMPOSE_ENV_FILE")
+fi
+compose_cmd+=(-f "$COMPOSE_FILE")
+
 if [[ "$ALLOW_DIRTY" != "1" ]] && [[ -n "$(git status --porcelain)" ]]; then
   log "worktree has local changes; refusing to auto-update"
   log "commit/stash the changes, or set RTNG_LIVE_ALLOW_DIRTY=1 for a disposable checkout"
@@ -67,11 +78,11 @@ if [[ "$current_head" == "$new_head" && "$FORCE" != "1" ]]; then
   exit 0
 fi
 
-run docker compose -f "$COMPOSE_FILE" build "$SERVICE"
-run docker compose -f "$COMPOSE_FILE" up -d --no-deps "$SERVICE"
+run "${compose_cmd[@]}" build "$SERVICE"
+run "${compose_cmd[@]}" up -d --no-deps "$SERVICE"
 
-if docker compose -f "$COMPOSE_FILE" config --services | grep -qx nginx; then
-  run docker compose -f "$COMPOSE_FILE" up -d --no-deps nginx
+if "${compose_cmd[@]}" config --services | grep -qx nginx; then
+  run "${compose_cmd[@]}" up -d --no-deps nginx
 fi
 
 if [[ "$PRUNE" == "1" ]]; then
