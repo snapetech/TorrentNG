@@ -36,6 +36,28 @@ const DETAIL_AUTO_DISPLAY_KEY = 'tng.detailAutoDisplay'
 const ACTIVE_TAB_KEY = 'tng.activeTab'
 const ACTIVE_TAB_TTL_MS = 8000
 
+const preloadSettingsPanels = {
+  library: () => void import('./components/StoragePanel'),
+  engine: () => {
+    void import('./components/EnginePanel')
+    void import('./components/UserAgentPanel')
+  },
+  automation: () => {
+    void import('./components/RatioGroupsPanel')
+    void import('./components/WorkflowsPanel')
+    void import('./components/RssRulesPanel')
+  },
+  support: () => void import('./components/LogsPanel'),
+} satisfies Record<SettingsSection, () => void>
+
+function preloadSettingsSection(section: SettingsSection) {
+  preloadSettingsPanels[section]()
+}
+
+function preloadAllSettingsPanels() {
+  ;(Object.keys(preloadSettingsPanels) as SettingsSection[]).forEach(preloadSettingsSection)
+}
+
 function loadThemeId(): string {
   try {
     const value = localStorage.getItem(THEME_STORAGE_KEY)
@@ -258,6 +280,17 @@ export function App() {
       setDetailHash(null)
     }
   }, [query.error])
+
+  useEffect(() => {
+    if (authState !== 'authenticated' || !activeTab.isActive) return
+    const win = window as typeof window & { requestIdleCallback?: (callback: () => void, options?: { timeout: number }) => number; cancelIdleCallback?: (id: number) => void }
+    if (win.requestIdleCallback) {
+      const id = win.requestIdleCallback(preloadAllSettingsPanels, { timeout: 5000 })
+      return () => win.cancelIdleCallback?.(id)
+    }
+    const id = window.setTimeout(preloadAllSettingsPanels, 2500)
+    return () => window.clearTimeout(id)
+  }, [activeTab.isActive, authState])
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -507,7 +540,16 @@ export function App() {
 
         <nav aria-label="Primary" style={{ display: 'flex', gap: 4, marginLeft: 4, flex: '0 0 auto' }}>
           {(['torrents', 'settings'] as View[]).map(v => (
-            <button key={v} onClick={() => setView(v)} aria-current={view === v ? 'page' : undefined} style={{
+            <button
+              key={v}
+              onPointerEnter={() => { if (v === 'settings') preloadSettingsSection(settingsSection) }}
+              onFocus={() => { if (v === 'settings') preloadSettingsSection(settingsSection) }}
+              onClick={() => {
+                if (v === 'settings') preloadSettingsSection(settingsSection)
+                setView(v)
+              }}
+              aria-current={view === v ? 'page' : undefined}
+              style={{
               background: view === v ? 'var(--accent-soft)' : 'transparent',
               border: '1px solid ' + (view === v ? 'var(--accent)' : 'transparent'),
               borderRadius: 5, color: view === v ? 'var(--accent-text)' : 'var(--faint)',
@@ -837,7 +879,18 @@ function SettingsView({ section, onSection, mediaInference, onMediaInference, th
           <div style={{ fontSize: 11, color: 'var(--faint)', marginTop: 3 }}>Daemon, library, and browser controls</div>
         </div>
         {sections.map(([key, label, icon]) => (
-          <button key={key} className="tng-settings-nav-button" data-active={section === key ? 'true' : 'false'} onClick={() => onSection(key)} aria-current={section === key ? 'page' : undefined} style={{
+          <button
+            key={key}
+            className="tng-settings-nav-button"
+            data-active={section === key ? 'true' : 'false'}
+            onPointerEnter={() => preloadSettingsSection(key)}
+            onFocus={() => preloadSettingsSection(key)}
+            onClick={() => {
+              preloadSettingsSection(key)
+              onSection(key)
+            }}
+            aria-current={section === key ? 'page' : undefined}
+            style={{
             width: '100%', display: 'grid', gridTemplateColumns: '22px 1fr auto', alignItems: 'center',
             textAlign: 'left', marginBottom: 4, gap: 7,
             background: section === key ? 'var(--accent-soft)' : 'transparent',
