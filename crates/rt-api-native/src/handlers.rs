@@ -529,6 +529,28 @@ struct TorrentDelta {
 }
 
 async fn torrent_delta(state: &AppState, previous: &BTreeMap<String, String>) -> TorrentDelta {
+    let _lease = if let Some(engine) = &state.engine {
+        let torrent_count = state.registry.read().await.iter().count();
+        match engine
+            .reserve_memory(
+                MemoryClass::ApiSnapshot,
+                estimate_torrent_delta_snapshot_bytes(torrent_count),
+            )
+            .await
+        {
+            Ok(Some(lease)) => Some(lease),
+            Ok(None) | Err(_) => {
+                return TorrentDelta {
+                    current: BTreeMap::new(),
+                    torrents: Vec::new(),
+                    removed: Vec::new(),
+                };
+            }
+        }
+    } else {
+        None
+    };
+
     let reg = state.registry.read().await;
     let mut current = BTreeMap::new();
     let mut torrents = Vec::new();
@@ -557,6 +579,10 @@ fn estimate_torrent_summary_snapshot_bytes(torrent_count: usize) -> u64 {
     // Conservative enough to cover Vec growth and cloned strings for typical
     // summaries without letting a huge API snapshot bypass governor pressure.
     (torrent_count as u64).saturating_mul(1024)
+}
+
+fn estimate_torrent_delta_snapshot_bytes(torrent_count: usize) -> u64 {
+    (torrent_count as u64).saturating_mul(1536)
 }
 
 fn torrent_summary(e: &TorrentEntry) -> TorrentSummary {
@@ -932,6 +958,38 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
         "Total write queue plus execution latency by I/O class",
         &stats.storage_write_latency_ns_by_class,
     );
+    metric_by_device(
+        &mut out,
+        "torrentng_storage_read_latency_nanoseconds_by_device_total",
+        "counter",
+        "Total read queue plus execution latency by storage device",
+        &stats.storage_device_latencies,
+        |device| device.read_latency_ns,
+    );
+    metric_by_device(
+        &mut out,
+        "torrentng_storage_write_latency_nanoseconds_by_device_total",
+        "counter",
+        "Total write queue plus execution latency by storage device",
+        &stats.storage_device_latencies,
+        |device| device.write_latency_ns,
+    );
+    metric_by_device(
+        &mut out,
+        "torrentng_storage_sync_latency_nanoseconds_by_device_total",
+        "counter",
+        "Total sync queue plus execution latency by storage device",
+        &stats.storage_device_latencies,
+        |device| device.sync_latency_ns,
+    );
+    metric_by_device(
+        &mut out,
+        "torrentng_storage_hash_latency_nanoseconds_by_device_total",
+        "counter",
+        "Total hashing queue plus execution latency by storage device",
+        &stats.storage_device_latencies,
+        |device| device.hash_latency_ns,
+    );
     metric(
         &mut out,
         "torrentng_storage_sync_latency_nanoseconds_total",
@@ -1283,10 +1341,51 @@ fn metric_with_label(
     out.push('{');
     out.push_str(label);
     out.push_str("=\"");
-    out.push_str(label_value);
+    push_label_value(out, label_value);
     out.push_str("\"} ");
     out.push_str(&value.to_string());
     out.push('\n');
+}
+
+fn push_label_value(out: &mut String, value: &str) {
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(ch),
+        }
+    }
+}
+
+fn metric_by_device(
+    out: &mut String,
+    name: &str,
+    kind: &str,
+    help: &str,
+    values: &[rt_engine::StorageDeviceLatencyStats],
+    value: impl Fn(&rt_engine::StorageDeviceLatencyStats) -> u64,
+) {
+    out.push_str("# HELP ");
+    out.push_str(name);
+    out.push(' ');
+    out.push_str(help);
+    out.push('\n');
+    out.push_str("# TYPE ");
+    out.push_str(name);
+    out.push(' ');
+    out.push_str(kind);
+    out.push('\n');
+    for device in values {
+        out.push_str(name);
+        out.push_str("{device=\"");
+        push_label_value(out, &device.device_id);
+        out.push_str("\",profile=\"");
+        push_label_value(out, &device.profile);
+        out.push_str("\"} ");
+        out.push_str(&value(device).to_string());
+        out.push('\n');
+    }
 }
 
 fn latency_histogram(
@@ -1618,6 +1717,19 @@ mod tests {
         stats.storage_write_latency_buckets[7] = 11;
         stats.storage_sync_latency_buckets[7] = 2;
         stats.storage_hash_latency_buckets[7] = 7;
+        stats.storage_device_latencies = vec![rt_engine::StorageDeviceLatencyStats {
+            device_id: "pool\"a\\disk\n1".to_owned(),
+            profile: "hdd".to_owned(),
+            read_latency_ns: 36,
+            write_latency_ns: 37,
+            sync_latency_ns: 38,
+            hash_latency_ns: 39,
+        }];
+        let governor = rt_metrics::ResourceGovernor::new(Default::default());
+        assert!(governor
+            .try_acquire(MemoryClass::ApiSnapshot, u64::MAX)
+            .is_none());
+        stats.resources = Some(governor.snapshot());
         let rendered = render_metrics(&stats);
         assert!(rendered.contains("torrentng_torrents_total 2"));
         assert!(rendered.contains("torrentng_torrents_seeding 1"));
@@ -1675,6 +1787,18 @@ mod tests {
         assert!(rendered.contains(
             "torrentng_storage_write_latency_nanoseconds_by_class_total{class=\"peer_write\"} 23"
         ));
+        assert!(rendered.contains(
+            "torrentng_storage_read_latency_nanoseconds_by_device_total{device=\"pool\\\"a\\\\disk\\n1\",profile=\"hdd\"} 36"
+        ));
+        assert!(rendered.contains(
+            "torrentng_storage_write_latency_nanoseconds_by_device_total{device=\"pool\\\"a\\\\disk\\n1\",profile=\"hdd\"} 37"
+        ));
+        assert!(rendered.contains(
+            "torrentng_storage_sync_latency_nanoseconds_by_device_total{device=\"pool\\\"a\\\\disk\\n1\",profile=\"hdd\"} 38"
+        ));
+        assert!(rendered.contains(
+            "torrentng_storage_hash_latency_nanoseconds_by_device_total{device=\"pool\\\"a\\\\disk\\n1\",profile=\"hdd\"} 39"
+        ));
         assert!(
             rendered.contains("torrentng_storage_read_latency_nanoseconds_bucket{le=\"+Inf\"} 6")
         );
@@ -1689,6 +1813,10 @@ mod tests {
         assert!(
             rendered.contains("torrentng_storage_hash_latency_nanoseconds_bucket{le=\"+Inf\"} 7")
         );
+        assert!(rendered.contains("torrentng_memory_cap_bytes "));
+        assert!(rendered.contains("torrentng_memory_class_cap_bytes{class=\"api_snapshot\"} "));
+        assert!(rendered
+            .contains("torrentng_memory_class_denied_allocations_total{class=\"api_snapshot\"} 1"));
         assert!(rendered.contains("torrentng_storage_backend_selected{backend=\""));
         assert!(rendered.contains("torrentng_storage_backend_fixed_buffers_supported "));
         assert!(rendered.contains("torrentng_storage_handles_open "));
@@ -1941,5 +2069,12 @@ mod tests {
         let second = torrent_delta(&state, &first.current).await;
         assert!(second.torrents.is_empty());
         assert_eq!(second.removed, vec![hash]);
+    }
+
+    #[test]
+    fn api_snapshot_estimates_scale_with_torrent_count() {
+        assert_eq!(estimate_torrent_summary_snapshot_bytes(0), 0);
+        assert_eq!(estimate_torrent_summary_snapshot_bytes(10), 10 * 1024);
+        assert_eq!(estimate_torrent_delta_snapshot_bytes(10), 10 * 1536);
     }
 }

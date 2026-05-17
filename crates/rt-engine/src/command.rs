@@ -93,6 +93,7 @@ pub struct EngineStats {
     pub storage_write_latency_buckets: [u64; STORAGE_LATENCY_BUCKET_COUNT],
     pub storage_sync_latency_buckets: [u64; STORAGE_LATENCY_BUCKET_COUNT],
     pub storage_hash_latency_buckets: [u64; STORAGE_LATENCY_BUCKET_COUNT],
+    pub storage_device_latencies: Vec<StorageDeviceLatencyStats>,
     pub storage_sync_latency_ns: u64,
     pub storage_hash_latency_ns: u64,
     pub storage_sync_ops: u64,
@@ -118,6 +119,16 @@ pub struct EngineStats {
     pub piece_assembly_bytes: u64,
     pub piece_assembly_evictions: u64,
     pub resources: Option<ResourceSnapshot>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StorageDeviceLatencyStats {
+    pub device_id: String,
+    pub profile: String,
+    pub read_latency_ns: u64,
+    pub write_latency_ns: u64,
+    pub sync_latency_ns: u64,
+    pub hash_latency_ns: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -293,6 +304,41 @@ impl EngineStats {
             &mut self.storage_hash_latency_buckets,
             storage.hash_latency_buckets,
         );
+        let device_id = storage
+            .device_id
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        let profile = storage_profile_label(&storage.profile).to_string();
+        let device = match self
+            .storage_device_latencies
+            .iter_mut()
+            .find(|device| device.device_id == device_id && device.profile == profile)
+        {
+            Some(device) => device,
+            None => {
+                self.storage_device_latencies
+                    .push(StorageDeviceLatencyStats {
+                        device_id,
+                        profile,
+                        ..Default::default()
+                    });
+                self.storage_device_latencies
+                    .last_mut()
+                    .expect("just inserted device latency stats")
+            }
+        };
+        device.read_latency_ns = device
+            .read_latency_ns
+            .saturating_add(storage.read_latency_ns_by_class.iter().sum::<u64>());
+        device.write_latency_ns = device
+            .write_latency_ns
+            .saturating_add(storage.write_latency_ns_by_class.iter().sum::<u64>());
+        device.sync_latency_ns = device
+            .sync_latency_ns
+            .saturating_add(storage.sync_latency_ns);
+        device.hash_latency_ns = device
+            .hash_latency_ns
+            .saturating_add(storage.hash_latency_ns);
         self.storage_sync_ops = self.storage_sync_ops.saturating_add(storage.sync_ops);
         self.storage_hash_ops = self.storage_hash_ops.saturating_add(storage.hash_ops);
         self.storage_preallocation_failures = self
@@ -350,6 +396,16 @@ impl EngineStats {
         self.storage_sparse_seek_fallbacks = self
             .storage_sparse_seek_fallbacks
             .saturating_add(storage.sparse_seek_fallbacks);
+    }
+}
+
+fn storage_profile_label(profile: &rt_path::StorageProfile) -> &'static str {
+    match profile {
+        rt_path::StorageProfile::Hdd => "hdd",
+        rt_path::StorageProfile::Ssd => "ssd",
+        rt_path::StorageProfile::Nvme => "nvme",
+        rt_path::StorageProfile::Network => "network",
+        rt_path::StorageProfile::Unknown => "unknown",
     }
 }
 
@@ -588,6 +644,8 @@ mod tests {
     fn engine_stats_accumulates_torrent_runtime_storage_counters() {
         let mut stats = EngineStats::default();
         let mut storage = StorageIoStats {
+            device_id: Some("nvme0n1".to_string()),
+            profile: rt_path::StorageProfile::Nvme,
             file_pool: FilePoolStats {
                 capacity: 64,
                 open_files: 8,
@@ -675,6 +733,17 @@ mod tests {
         assert_eq!(stats.storage_hash_latency_buckets[3], 4);
         assert_eq!(stats.storage_sync_latency_ns, 300);
         assert_eq!(stats.storage_hash_latency_ns, 400);
+        assert_eq!(
+            stats.storage_device_latencies,
+            vec![StorageDeviceLatencyStats {
+                device_id: "nvme0n1".to_string(),
+                profile: "nvme".to_string(),
+                read_latency_ns: 100,
+                write_latency_ns: 200,
+                sync_latency_ns: 300,
+                hash_latency_ns: 400,
+            }]
+        );
         assert_eq!(stats.storage_peer_read_cache_hits, 12);
         assert_eq!(stats.storage_peer_read_elevator_enabled, 1);
         assert_eq!(stats.storage_peer_read_elevator_queue_depth, 14);

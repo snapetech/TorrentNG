@@ -108,11 +108,12 @@ startup falls back to verification instead of trusting stale piece state.
 
 The following items are still implementation targets:
 
-- Add per-device latency breakdowns once the elevator is wired. Prometheus already
-  exports fixed-bucket latency histograms and cumulative latency counters for
-  read/write/sync/hash work, along with file-pool activity, queue depth, dirty
-  files, sync/hash/preallocate counters, peer-read cache counters, logical and
-  backend read counters, and in-memory piece assembly pressure.
+- Extend per-device latency observability with histograms if cardinality remains
+  acceptable. Prometheus already exports cumulative read/write/sync/hash latency
+  totals by resolved storage device/profile, plus fixed-bucket aggregate
+  histograms and counters for file-pool activity, queue depth, dirty files,
+  sync/hash/preallocate work, peer-read cache, logical/backend reads, and
+  in-memory piece assembly pressure.
 - Replace the worker-owned fixed-buffer copy path with true frame-pool slot
   pinning once the global frame pool can lease stable registered buffer indexes.
 - Add benchmarks comparing syscall count, seed-read locality, recheck runtime

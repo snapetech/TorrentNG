@@ -3432,6 +3432,17 @@ mod tests {
         ResourceGovernor::new(ResourceGovernorConfig::default())
     }
 
+    fn tiny_api_snapshot_governor() -> ResourceGovernor {
+        let mut class_caps_bytes = [0; MEMORY_CLASS_COUNT];
+        class_caps_bytes[MemoryClass::ApiSnapshot as usize] = 4;
+        ResourceGovernor::new(ResourceGovernorConfig {
+            total_cap_bytes: 4,
+            class_caps_bytes,
+            pressure_constrained_pct: 75,
+            pressure_critical_pct: 90,
+        })
+    }
+
     fn meta() -> TorrentMetaV1 {
         TorrentMetaV1 {
             info_hash: [1u8; 20],
@@ -4913,6 +4924,62 @@ mod tests {
             4096
         );
         assert!(resources.total_used_bytes >= 4096);
+    }
+
+    #[tokio::test]
+    async fn reserve_memory_command_holds_and_releases_lease() {
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let (_tx, rx) = mpsc::channel(1);
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        let mut engine = Engine {
+            config: Arc::new(Config::default()),
+            registry,
+            db: Arc::new(Mutex::new(conn)),
+            cmd_rx: rx,
+            cmd_tx: mpsc::channel(1).0,
+            torrent_chans: HashMap::new(),
+            torrent_tasks: HashMap::new(),
+            dht_tx: None,
+            resources: tiny_api_snapshot_governor(),
+        };
+
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        assert!(
+            engine
+                .handle_cmd(EngineCmd::ReserveMemory {
+                    class: MemoryClass::ApiSnapshot,
+                    bytes: 4,
+                    reply,
+                })
+                .await
+        );
+        let lease = rx.await.unwrap().unwrap().expect("lease granted");
+
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        assert!(
+            engine
+                .handle_cmd(EngineCmd::ReserveMemory {
+                    class: MemoryClass::ApiSnapshot,
+                    bytes: 1,
+                    reply,
+                })
+                .await
+        );
+        assert!(rx.await.unwrap().unwrap().is_none());
+
+        drop(lease);
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        assert!(
+            engine
+                .handle_cmd(EngineCmd::ReserveMemory {
+                    class: MemoryClass::ApiSnapshot,
+                    bytes: 4,
+                    reply,
+                })
+                .await
+        );
+        assert!(rx.await.unwrap().unwrap().is_some());
     }
 
     #[tokio::test]

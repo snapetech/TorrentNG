@@ -146,8 +146,10 @@ pub struct FilePoolStats {
     pub idle_closes: u64,
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageIoStats {
+    pub device_id: Option<String>,
+    pub profile: StorageProfile,
     pub file_pool: FilePoolStats,
     pub io_queue_depth: usize,
     pub hash_queue_depth: usize,
@@ -185,6 +187,52 @@ pub struct StorageIoStats {
     pub sparse_data_extents: u64,
     pub sparse_hole_bytes: u64,
     pub sparse_seek_fallbacks: u64,
+}
+
+impl Default for StorageIoStats {
+    fn default() -> Self {
+        Self {
+            device_id: None,
+            profile: StorageProfile::Unknown,
+            file_pool: FilePoolStats::default(),
+            io_queue_depth: 0,
+            hash_queue_depth: 0,
+            dirty_files: 0,
+            read_ops_by_class: [0; 6],
+            write_ops_by_class: [0; 6],
+            bytes_read_by_class: [0; 6],
+            bytes_written_by_class: [0; 6],
+            backend_read_ops_by_class: [0; 6],
+            backend_bytes_read_by_class: [0; 6],
+            read_latency_ns_by_class: [0; 6],
+            write_latency_ns_by_class: [0; 6],
+            read_latency_buckets: [0; STORAGE_LATENCY_BUCKET_COUNT],
+            write_latency_buckets: [0; STORAGE_LATENCY_BUCKET_COUNT],
+            sync_latency_buckets: [0; STORAGE_LATENCY_BUCKET_COUNT],
+            hash_latency_buckets: [0; STORAGE_LATENCY_BUCKET_COUNT],
+            sync_latency_ns: 0,
+            hash_latency_ns: 0,
+            sync_ops: 0,
+            hash_ops: 0,
+            preallocation_failures: 0,
+            preallocation_fallbacks: 0,
+            peer_read_cache_entries: 0,
+            peer_read_cache_hits: 0,
+            peer_read_cache_misses: 0,
+            peer_read_elevator_enabled: false,
+            peer_read_elevator_queue_depth: 0,
+            peer_read_elevator_queued: 0,
+            peer_read_elevator_batches: 0,
+            peer_read_elevator_coalesced_requests: 0,
+            page_cache_advise_sequential: 0,
+            page_cache_advise_willneed: 0,
+            page_cache_advise_dontneed: 0,
+            page_cache_advise_failures: 0,
+            sparse_data_extents: 0,
+            sparse_hole_bytes: 0,
+            sparse_seek_fallbacks: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -448,6 +496,8 @@ pub struct MountScheduler {
     peer_read_elevator: Arc<Mutex<Option<PeerReadElevator>>>,
     peer_read_elevator_enabled: bool,
     peer_read_elevator_queue_depth: usize,
+    device_id: Option<String>,
+    profile: StorageProfile,
     counters: Arc<StorageCounters>,
 }
 
@@ -758,6 +808,7 @@ impl MountScheduler {
             config,
             config.profile.clone(),
             effective_io_config_for_topology(&config.storage_io, None),
+            None,
         )
     }
 
@@ -776,6 +827,7 @@ impl MountScheduler {
             config,
             profile,
             effective_io_config_for_topology(&config.storage_io, Some(&topology)),
+            Some(topology),
         )
     }
 
@@ -784,6 +836,7 @@ impl MountScheduler {
         config: &SchedulerConfig,
         profile: StorageProfile,
         io_config: StorageIoConfig,
+        topology: Option<StorageTopology>,
     ) -> Self {
         let ssd = matches!(profile, StorageProfile::Ssd | StorageProfile::Nvme);
         let recheck_limit = if config.recheck_concurrency > 0 {
@@ -873,6 +926,8 @@ impl MountScheduler {
             peer_read_elevator,
             peer_read_elevator_enabled,
             peer_read_elevator_queue_depth,
+            device_id: topology.and_then(|topology| topology.device_id.map(|device| device.0)),
+            profile,
             counters,
             io_config,
         }
@@ -913,6 +968,8 @@ impl MountScheduler {
             .map(PeerReadElevator::queued_len)
             .unwrap_or(0);
         StorageIoStats {
+            device_id: self.device_id.clone(),
+            profile: self.profile.clone(),
             file_pool: self.file_pool.stats(),
             io_queue_depth: self.io_pool.queued(),
             hash_queue_depth: self.hash_pool.queued(),
