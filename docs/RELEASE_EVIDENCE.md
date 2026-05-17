@@ -105,4 +105,6 @@ scripts/certification_bundle.sh
 ```
 
 The output tarball is written under `certification/bundles/`, and its generated
-report includes the bundle SHA-256.
+report includes the bundle, manifest, and status SHA-256 values. If any report
+referenced by certification status is missing at packaging time, the bundle
+report is downgraded to `PASS_WITH_WARNINGS`.

@@ -17,8 +17,13 @@ status_report="$tmpdir/certification-status.md"
 manifest="$tmpdir/MANIFEST.md"
 bundle_root="$tmpdir/torrentng-certification-bundle-$STAMP"
 mkdir -p "$bundle_root/reports"
+missing=0
 
 BENCHMARK_DIR="$BENCHMARK_DIR" "$ROOT/scripts/certification_status.sh" "$REPORT_DIR" >"$status_report"
+
+if [[ -n "${TNG_CERT_BUNDLE_TEST_REMOVE_REPORT:-}" ]]; then
+  rm -f "$REPORT_DIR/$TNG_CERT_BUNDLE_TEST_REMOVE_REPORT" "$BENCHMARK_DIR/$TNG_CERT_BUNDLE_TEST_REMOVE_REPORT"
+fi
 
 cp "$status_report" "$bundle_root/certification-status.md"
 
@@ -36,15 +41,8 @@ cp "$status_report" "$bundle_root/certification-status.md"
   echo "|---|---|---|---|"
 } >"$manifest"
 
-awk -F'|' '
-  /^\|/ && $2 !~ /^---/ && $2 !~ /Gate/ {
-    gate=$2; status=$3; report=$4;
-    gsub(/^[[:space:]]+|[[:space:]]+$/, "", gate);
-    gsub(/^[[:space:]]+|[[:space:]]+$/, "", status);
-    gsub(/^[[:space:]]+|[[:space:]]+$/, "", report);
-    if (report != "-" && report != "") print gate "\t" status "\t" report;
-  }
-' "$status_report" | while IFS=$'\t' read -r gate status report; do
+while IFS=$'\t' read -r gate status report; do
+  [[ -n "$gate" ]] || continue
   src="$REPORT_DIR/$report"
   dest_prefix="reports"
   if [[ ! -f "$src" && -f "$BENCHMARK_DIR/$report" ]]; then
@@ -57,13 +55,31 @@ awk -F'|' '
     hash="$(sha256sum "$src" | awk '{print $1}')"
     printf '| %s | %s | %s/%s | %s |\n' "$gate" "$status" "$dest_prefix" "$report" "$hash" >>"$manifest"
   else
+    missing=$((missing + 1))
     printf '| %s | %s | %s | missing at bundle time |\n' "$gate" "$status" "$report" >>"$manifest"
   fi
-done
+done < <(awk -F'|' '
+  /^\|/ && $2 !~ /^---/ && $2 !~ /Gate/ {
+    gate=$2; status=$3; report=$4;
+    gsub(/^[[:space:]]+|[[:space:]]+$/, "", gate);
+    gsub(/^[[:space:]]+|[[:space:]]+$/, "", status);
+    gsub(/^[[:space:]]+|[[:space:]]+$/, "", report);
+    if (report != "-" && report != "") print gate "\t" status "\t" report;
+  }
+' "$status_report")
 
 cp "$manifest" "$bundle_root/MANIFEST.md"
+status_hash="$(sha256sum "$bundle_root/certification-status.md" | awk '{print $1}')"
+manifest_hash="$(sha256sum "$bundle_root/MANIFEST.md" | awk '{print $1}')"
 
 tar -C "$tmpdir" -czf "$OUT" "$(basename "$bundle_root")"
+bundle_hash="$(sha256sum "$OUT" | awk '{print $1}')"
+included_reports="$(find "$bundle_root/reports" "$bundle_root/benchmarks" -type f 2>/dev/null | wc -l | tr -d ' ')"
+if [[ "$missing" -gt 0 ]]; then
+  status="PASS_WITH_WARNINGS"
+else
+  status="PASS"
+fi
 
 report="$REPORT_DIR/certification-bundle-$STAMP.md"
 {
@@ -71,10 +87,14 @@ report="$REPORT_DIR/certification-bundle-$STAMP.md"
   echo
   echo "- Date UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "- Bundle: $OUT"
-  echo "- SHA-256: $(sha256sum "$OUT" | awk '{print $1}')"
-  echo "- Included reports: $(find "$bundle_root/reports" -type f | wc -l | tr -d ' ')"
+  echo "- Bundle SHA-256: $bundle_hash"
+  echo "- Manifest SHA-256: $manifest_hash"
+  echo "- Certification status SHA-256: $status_hash"
+  echo "- Included reports: $included_reports"
+  echo "- Missing referenced reports: $missing"
   echo
-  echo "Overall status: PASS"
+  echo "Overall status: $status"
 } >"$report"
 
 echo "$OUT"
+[[ "$status" == "PASS" ]]
