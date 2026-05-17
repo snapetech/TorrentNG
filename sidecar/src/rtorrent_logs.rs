@@ -1,7 +1,8 @@
 use std::{
-    collections::HashMap,
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
     io::{Read, Seek, SeekFrom},
-    path::{Path, PathBuf},
+    path::Path,
     sync::Arc,
     time::Duration,
 };
@@ -14,29 +15,15 @@ use crate::{
     config::RtorrentLogConfig,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct LogCursor {
-    offset: u64,
-}
-
 pub async fn run(db: Arc<Db>, config: RtorrentLogConfig, retention: usize) {
     if !config.enabled || config.paths.is_empty() {
         return;
-    }
-    let mut cursors = HashMap::new();
-    for path in &config.paths {
-        let offset = if config.read_from_start {
-            0
-        } else {
-            std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
-        };
-        cursors.insert(path.clone(), LogCursor { offset });
     }
     let interval = Duration::from_secs(config.poll_interval_secs.max(1));
 
     loop {
         for path in &config.paths {
-            if let Err(e) = ingest_path(&db, path, &mut cursors, retention) {
+            if let Err(e) = ingest_path(&db, path, retention, config.read_from_start) {
                 tracing::warn!(
                     component = "rtorrent_logs",
                     operation = "ingest",
@@ -50,34 +37,41 @@ pub async fn run(db: Arc<Db>, config: RtorrentLogConfig, retention: usize) {
     }
 }
 
-fn ingest_path(
-    db: &Db,
-    path: &Path,
-    cursors: &mut HashMap<PathBuf, LogCursor>,
-    retention: usize,
-) -> Result<()> {
+fn ingest_path(db: &Db, path: &Path, retention: usize, read_from_start: bool) -> Result<()> {
     let metadata = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
-    let cursor = cursors.entry(path.to_path_buf()).or_insert(LogCursor {
-        offset: metadata.len(),
-    });
-    if metadata.len() < cursor.offset {
-        cursor.offset = 0;
+    let offset_key = offset_key(path);
+    let mut offset = match db.get_kv(&offset_key)?.and_then(|value| value.parse().ok()) {
+        Some(offset) => offset,
+        None if read_from_start => 0,
+        None => {
+            db.set_kv(&offset_key, &metadata.len().to_string())?;
+            return Ok(());
+        }
+    };
+    if metadata.len() < offset {
+        offset = 0;
     }
-    if metadata.len() == cursor.offset {
+    if metadata.len() == offset {
         return Ok(());
     }
 
     let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-    file.seek(SeekFrom::Start(cursor.offset))?;
+    file.seek(SeekFrom::Start(offset))?;
     let mut buf = Vec::new();
     file.read_to_end(&mut buf)?;
-    cursor.offset = metadata.len();
     let buf = String::from_utf8_lossy(&buf);
 
     for line in buf.lines().map(str::trim).filter(|line| !line.is_empty()) {
         append_log_line(db, path, line, retention)?;
     }
+    db.set_kv(&offset_key, &metadata.len().to_string())?;
     Ok(())
+}
+
+fn offset_key(path: &Path) -> String {
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    format!("rtorrent_log_offset:{:016x}", hasher.finish())
 }
 
 fn append_log_line(db: &Db, path: &Path, line: &str, retention: usize) -> Result<()> {
@@ -207,9 +201,8 @@ mod tests {
         let log_path = dir.path().join("rtorrent.log");
         let db = Db::open(&dir.path().join("cache.db")).unwrap();
         std::fs::write(&log_path, "first line\n").unwrap();
-        let mut cursors = HashMap::new();
 
-        ingest_path(&db, &log_path, &mut cursors, 10).unwrap();
+        ingest_path(&db, &log_path, 10, false).unwrap();
         assert!(db.list_app_events(10).unwrap().is_empty());
 
         std::fs::write(
@@ -217,16 +210,30 @@ mod tests {
             "first line\nsecond warning /tmp/secret/file.torrent\n",
         )
         .unwrap();
-        ingest_path(&db, &log_path, &mut cursors, 10).unwrap();
+        ingest_path(&db, &log_path, 10, false).unwrap();
         let events = db.list_app_events(10).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].level, "warn");
         assert!(!events[0].message.contains("/tmp/secret"));
 
         std::fs::write(&log_path, "rotated error\n").unwrap();
-        ingest_path(&db, &log_path, &mut cursors, 10).unwrap();
+        ingest_path(&db, &log_path, 10, false).unwrap();
         let events = db.list_app_events(10).unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].level, "error");
+    }
+
+    #[test]
+    fn ingest_path_can_import_existing_file_when_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("rtorrent.log");
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+        std::fs::write(&log_path, "existing line\n").unwrap();
+
+        ingest_path(&db, &log_path, 10, true).unwrap();
+
+        let events = db.list_app_events(10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].message, "existing line");
     }
 }

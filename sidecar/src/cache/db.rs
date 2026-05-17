@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::{
     collections::HashSet,
     path::Path,
@@ -178,6 +178,24 @@ impl Db {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    pub fn get_kv(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn()
+            .query_row("SELECT value FROM kv WHERE key=?1", params![key], |r| {
+                r.get(0)
+            })
+            .optional()?)
+    }
+
+    pub fn set_kv(&self, key: &str, value: &str) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO kv(key, value) VALUES(?1,?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
     }
 
     pub fn exists(&self, hash: &str) -> Result<bool> {
