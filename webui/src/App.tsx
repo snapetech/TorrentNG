@@ -433,6 +433,7 @@ export function App() {
               border: '1px solid ' + (view === v ? 'var(--accent)' : 'transparent'),
               borderRadius: 5, color: view === v ? 'var(--accent-text)' : 'var(--faint)',
               padding: '2px 10px', fontSize: 12, cursor: 'pointer', textTransform: 'capitalize',
+              whiteSpace: 'nowrap', flex: '0 0 auto',
             }}>{v}</button>
           ))}
         </nav>
@@ -441,11 +442,13 @@ export function App() {
           <button onClick={() => setAddOpen(true)} title="Add torrent (A)" style={{
             background: 'var(--accent-soft)', border: '1px solid var(--accent)', borderRadius: 5,
             color: 'var(--accent-text)', padding: '3px 12px', fontSize: 12, cursor: 'pointer',
+            whiteSpace: 'nowrap', flex: '0 0 auto',
           }}>+ Add</button>
         )}
         <button onClick={() => setHelpOpen(true)} title="Help and links" style={{
           background: 'transparent', border: '1px solid var(--border-strong)', borderRadius: 5,
           color: 'var(--muted)', padding: '3px 10px', fontSize: 12, cursor: 'pointer',
+          whiteSpace: 'nowrap', flex: '0 0 auto',
         }}>Help</button>
 
         <span style={{
@@ -483,6 +486,7 @@ export function App() {
         <button onClick={handleLogout} title="Log out" style={{
           background: 'transparent', border: '1px solid var(--border-strong)', borderRadius: 5,
           color: 'var(--muted)', padding: '3px 10px', fontSize: 12, cursor: 'pointer',
+          whiteSpace: 'nowrap', flex: '0 0 auto',
         }}>Log out</button>
       </header>
 
@@ -853,6 +857,7 @@ function LoginScreen({ message, onLogin }: {
 }
 
 const themeSelectStyle: React.CSSProperties = {
+  flex: '0 0 auto',
   width: 132,
   background: 'var(--surface)',
   border: '1px solid var(--border-strong)',
@@ -864,6 +869,7 @@ const themeSelectStyle: React.CSSProperties = {
 }
 
 const themeButtonStyle: React.CSSProperties = {
+  flex: '0 0 auto',
   background: 'var(--surface)',
   border: '1px solid var(--border-strong)',
   borderRadius: 5,
@@ -871,4 +877,5 @@ const themeButtonStyle: React.CSSProperties = {
   padding: '3px 10px',
   fontSize: 12,
   cursor: 'pointer',
+  whiteSpace: 'nowrap',
 }
