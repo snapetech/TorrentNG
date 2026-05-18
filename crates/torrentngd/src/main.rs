@@ -46,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
         _ => {}
     }
 
-    let config = Arc::new(load_config());
+    let config = Arc::new(load_config()?);
     rt_logging::init(&config.logging, Some(&config.daemon.log_level));
     info!(
         component = "daemon",
@@ -249,13 +249,10 @@ mod tests {
     }
 }
 
-fn load_config() -> Config {
-    // Allow explicit path via env var
+fn load_config() -> anyhow::Result<Config> {
     if let Ok(path) = std::env::var("TORRENTNGD_CONFIG") {
-        match Config::load(std::path::Path::new(&path)) {
-            Ok(c) => return c,
-            Err(e) => eprintln!("config error: {e}"),
-        }
+        return Config::load(std::path::Path::new(&path))
+            .with_context(|| format!("loading explicit config from {path}"));
     }
-    Config::load_default()
+    Ok(Config::load_default())
 }
