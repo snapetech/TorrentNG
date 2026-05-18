@@ -9,6 +9,8 @@ pub enum ConfigError {
     Io(#[from] std::io::Error),
     #[error("TOML parse error: {0}")]
     Toml(#[from] toml::de::Error),
+    #[error("config validation error: {0}")]
+    Validation(String),
 }
 
 /// Top-level daemon configuration.
@@ -250,7 +252,9 @@ impl Config {
     /// Load from a TOML file, falling back to defaults for missing fields.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let text = std::fs::read_to_string(path)?;
-        Ok(toml::from_str(&text)?)
+        let config: Self = toml::from_str(&text)?;
+        config.validate()?;
+        Ok(config)
     }
 
     /// Load from the standard search path, returning defaults if no file exists.
@@ -264,6 +268,60 @@ impl Config {
             }
         }
         Self::default()
+    }
+
+    /// Validate config invariants that would otherwise turn into runtime footguns.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        require(!self.daemon.api_bind.trim().is_empty(), "daemon.api_bind must not be empty")?;
+        require(self.daemon.shutdown_timeout_secs > 0, "daemon.shutdown_timeout_secs must be greater than zero")?;
+        require(self.network.max_peers > 0, "network.max_peers must be greater than zero")?;
+        require(!self.storage.download_dir.as_os_str().is_empty(), "storage.download_dir must not be empty")?;
+        require(self.storage.file_pool_size > 0, "storage.file_pool_size must be greater than zero")?;
+        require(self.storage.io_worker_threads > 0, "storage.io_worker_threads must be greater than zero")?;
+        require(self.storage.io_queue_depth > 0, "storage.io_queue_depth must be greater than zero")?;
+        require(self.storage.hash_worker_threads > 0, "storage.hash_worker_threads must be greater than zero")?;
+        require(self.storage.hash_queue_depth > 0, "storage.hash_queue_depth must be greater than zero")?;
+        require(
+            self.storage.peer_read_readahead_bytes <= 64 * 1024 * 1024,
+            "storage.peer_read_readahead_bytes must be <= 64MiB",
+        )?;
+        require(
+            self.memory.total_cap_mb > 0,
+            "memory.total_cap_mb must be greater than zero",
+        )?;
+        require(
+            self.memory.pressure_constrained_pct < self.memory.pressure_critical_pct,
+            "memory.pressure_constrained_pct must be less than memory.pressure_critical_pct",
+        )?;
+        require(
+            self.memory.pressure_critical_pct <= 100,
+            "memory.pressure_critical_pct must be <= 100",
+        )?;
+        for (field, value) in [
+            ("memory.storage_frame_cap_mb", self.memory.storage_frame_cap_mb),
+            ("memory.queued_disk_cap_mb", self.memory.queued_disk_cap_mb),
+            ("memory.piece_assembly_cap_mb", self.memory.piece_assembly_cap_mb),
+            ("memory.peer_buffer_cap_mb", self.memory.peer_buffer_cap_mb),
+            ("memory.metadata_cap_mb", self.memory.metadata_cap_mb),
+        ] {
+            require(value <= self.memory.total_cap_mb, format!("{field} must be <= memory.total_cap_mb"))?;
+        }
+        require(
+            self.tracker.http_timeout_secs > 0,
+            "tracker.http_timeout_secs must be greater than zero",
+        )?;
+        require(
+            self.tracker.udp_timeout_secs > 0,
+            "tracker.udp_timeout_secs must be greater than zero",
+        )?;
+        require(
+            self.db.wal_checkpoint_pages > 0,
+            "db.wal_checkpoint_pages must be greater than zero",
+        )?;
+        for token in &self.auth.api_tokens {
+            require(!token.trim().is_empty(), "auth.api_tokens must not contain empty tokens")?;
+        }
+        Ok(())
     }
 
     /// Resolved DB path (falls back to session_dir/state.db).
@@ -282,6 +340,14 @@ impl Config {
         } else {
             self.dht.port
         }
+    }
+}
+
+fn require(condition: bool, message: impl Into<String>) -> Result<(), ConfigError> {
+    if condition {
+        Ok(())
+    } else {
+        Err(ConfigError::Validation(message.into()))
     }
 }
 
@@ -320,6 +386,7 @@ mod tests {
     #[test]
     fn default_config_is_valid() {
         let c = Config::default();
+        c.validate().unwrap();
         assert_eq!(c.network.listen_port, 6881);
         assert_eq!(c.network.max_peers, 200);
         assert!(c.dht.enabled);
@@ -363,6 +430,22 @@ mod tests {
     }
 
     #[test]
+    fn invalid_config_is_rejected() {
+        let mut c = Config::default();
+        c.storage.io_worker_threads = 0;
+        assert!(matches!(c.validate(), Err(ConfigError::Validation(_))));
+
+        let mut c = Config::default();
+        c.memory.pressure_constrained_pct = 95;
+        c.memory.pressure_critical_pct = 90;
+        assert!(matches!(c.validate(), Err(ConfigError::Validation(_))));
+
+        let mut c = Config::default();
+        c.auth.api_tokens = vec!["".to_owned()];
+        assert!(matches!(c.validate(), Err(ConfigError::Validation(_))));
+    }
+
+    #[test]
     fn parse_toml_partial() {
         let toml = r#"
 [network]
@@ -386,6 +469,7 @@ peer_read_cache_entries = 17
 peer_read_elevator_budget_ms = 9
 "#;
         let c: Config = toml::from_str(toml).unwrap();
+        c.validate().unwrap();
         assert_eq!(c.network.listen_port, 51413);
         assert_eq!(c.network.max_peers, 500);
         // defaults preserved for unset fields
@@ -423,6 +507,7 @@ filter = "rt_engine=debug"
 event_retention = 2048
 "#;
         let c: Config = toml::from_str(toml).unwrap();
+        c.validate().unwrap();
         assert_eq!(c.daemon.log_level, "warn");
         assert_eq!(c.logging.format, rt_logging::LogFormat::Pretty);
         assert_eq!(c.logging.profile, rt_logging::LogProfile::Detailed);
