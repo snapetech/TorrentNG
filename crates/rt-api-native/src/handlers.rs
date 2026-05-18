@@ -37,13 +37,62 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::state::{AppState, JsonMap};
 
 /// `POST /api/v1/auth/login` — native WebUI session probe.
-pub async fn auth_login() -> impl IntoResponse {
-    (StatusCode::OK, "Ok.")
+pub async fn auth_login(State(state): State<AppState>, body: String) -> impl IntoResponse {
+    let token = auth_form_token(&body);
+    if !state.api_tokens.is_empty() {
+        let Some(token) = token.as_deref() else {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(
+                    serde_json::to_value(ApiError::new(
+                        "UNAUTHORIZED",
+                        "missing or invalid API token",
+                    ))
+                    .unwrap(),
+                ),
+            )
+                .into_response();
+        };
+        if !token_allowed(&state, token) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(
+                    serde_json::to_value(ApiError::new(
+                        "UNAUTHORIZED",
+                        "missing or invalid API token",
+                    ))
+                    .unwrap(),
+                ),
+            )
+                .into_response();
+        }
+    }
+    let cookie = token
+        .filter(|token| !token.is_empty())
+        .map(|token| {
+            format!(
+                "tng_session={}; HttpOnly; SameSite=Lax; Path=/",
+                cookie_component_encode(&token)
+            )
+        })
+        .unwrap_or_else(|| "tng_session=; Max-Age=0; HttpOnly; SameSite=Lax; Path=/".to_owned());
+    (
+        StatusCode::OK,
+        [(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap())],
+        "Ok.",
+    )
+        .into_response()
 }
 
 /// `POST /api/v1/auth/logout` — native WebUI logout probe.
 pub async fn auth_logout() -> impl IntoResponse {
-    StatusCode::OK
+    (
+        StatusCode::OK,
+        [(
+            header::SET_COOKIE,
+            HeaderValue::from_static("tng_session=; Max-Age=0; HttpOnly; SameSite=Lax; Path=/"),
+        )],
+    )
 }
 
 /// `GET /api/v1/torrents` — list all torrents.
@@ -5001,7 +5050,7 @@ fn require_mutation_auth(
     headers: &HeaderMap,
 ) -> Option<axum::response::Response> {
     if state.api_tokens.is_empty()
-        || presented_token(headers).is_some_and(|token| token_allowed(state, token))
+        || presented_token(headers).is_some_and(|token| token_allowed(state, &token))
     {
         return None;
     }
@@ -5024,11 +5073,103 @@ fn token_allowed(state: &AppState, token: &str) -> bool {
     state.api_tokens.iter().any(|allowed| allowed == token)
 }
 
-fn presented_token(headers: &HeaderMap) -> Option<&str> {
+fn auth_form_token(body: &str) -> Option<String> {
+    let mut username = None;
+    let mut password = None;
+    for pair in body.split('&') {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        match form_component_decode(key).as_deref() {
+            Some("username") => username = form_component_decode(value),
+            Some("password") => password = form_component_decode(value),
+            _ => {}
+        }
+    }
+    password.or(username)
+}
+
+fn form_component_decode(input: &str) -> Option<String> {
+    let mut out = Vec::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut idx = 0;
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b'+' => {
+                out.push(b' ');
+                idx += 1;
+            }
+            b'%' if idx + 2 < bytes.len() => {
+                let hi = hex_value(bytes[idx + 1])?;
+                let lo = hex_value(bytes[idx + 2])?;
+                out.push((hi << 4) | lo);
+                idx += 3;
+            }
+            b'%' => return None,
+            byte => {
+                out.push(byte);
+                idx += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn cookie_component_encode(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'0'..=b'9'
+            | b'a'..=b'z'
+            | b'A'..=b'Z'
+            | b'!'
+            | b'#'
+            | b'$'
+            | b'&'
+            | b'\''
+            | b'('
+            | b')'
+            | b'*'
+            | b'+'
+            | b'-'
+            | b'.'
+            | b'/'
+            | b':'
+            | b'<'
+            | b'='
+            | b'>'
+            | b'?'
+            | b'@'
+            | b'['
+            | b']'
+            | b'^'
+            | b'_'
+            | b'`'
+            | b'{'
+            | b'|'
+            | b'}'
+            | b'~' => out.push(byte as char),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn presented_token(headers: &HeaderMap) -> Option<String> {
     headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
+        .map(ToOwned::to_owned)
         .or_else(|| {
             headers
                 .get(header::COOKIE)
@@ -5037,10 +5178,11 @@ fn presented_token(headers: &HeaderMap) -> Option<&str> {
         })
 }
 
-fn extract_session_cookie(cookie: &str) -> Option<&str> {
+fn extract_session_cookie(cookie: &str) -> Option<String> {
     cookie.split(';').find_map(|part| {
         let part = part.trim();
         part.strip_prefix("tng_session=")
+            .and_then(form_component_decode)
     })
 }
 
@@ -5950,6 +6092,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_login_issues_session_cookie_and_validates_tokens() {
+        let app = build_router(AppState::with_tokens(None, vec!["secret token".to_owned()]));
+        let bad = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/login")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("username=bad&password=wrong"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::UNAUTHORIZED);
+
+        let ok = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/login")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("username=operator&password=secret+token"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        let cookie = ok
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap();
+        assert!(cookie.starts_with("tng_session=secret%20token;"));
+    }
+
+    #[tokio::test]
     async fn get_torrent_not_found() {
         let state = AppState::new();
         let app = build_router(state);
@@ -6006,6 +6185,23 @@ mod tests {
                     .method("DELETE")
                     .uri(format!("/api/v1/torrents/{hash}"))
                     .header(header::AUTHORIZATION, "Bearer secret-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn mutating_endpoint_accepts_session_cookie_token() {
+        let (app, hash) = setup_authed_app_with_torrent().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/v1/torrents/{hash}"))
+                    .header(header::COOKIE, "other=1; tng_session=secret-token")
                     .body(Body::empty())
                     .unwrap(),
             )

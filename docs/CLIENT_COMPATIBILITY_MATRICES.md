@@ -123,7 +123,7 @@ Local implementation: `crates/rt-api-qbit`.
 
 | Group | Upstream API points | TorrentNG points | Status | Test rows |
 |---|---|---|---|---|
-| Auth | `auth/login`, `auth/logout` | Same | Compat | Login/logout status and cookie shape |
+| Auth | `auth/login`, `auth/logout` | Same | Compat | Login/logout status and `SID` cookie shape |
 | App info | `app/version`, `webapiVersion`, `buildInfo`, `preferences`, `setPreferences`, `shutdown`, `sendTestEmail`, `getCookies`, `setCookies`, `rotateAPIKey`, `deleteAPIKey`, `networkInterfaceList`, `networkInterfaceAddressList`, `defaultSavePath` | Same | Native/Compat mix; preferences, cookies, and API-key lifecycle round-trip in facade state | Probe every endpoint plus preference/cookie/API-key persistence |
 | Backend capability manifest | n/a | `/api/v1/engine` backend capabilities | Native | Capability flags enumerate every backend-dependent read/mutation surface: export, webseed/piece/peer reads, peer add/ban, queue order, limits, mode flags, location/rename, runtime user-agent, rTorrent overlay, and restart |
 | Torrent list/add | `torrents/info`, `torrents/add` | Same | Native | Add magnet/file, list filters/sort/category/tag/hash |
@@ -131,7 +131,7 @@ Local implementation: `crates/rt-api-qbit`.
 | Torrent trackers/peers | `trackers`, `addTrackers`, `editTracker`, `removeTrackers`, `addPeers` | Same | Native/Partial stats; persisted engine tracker rows project status, message, and scrape counts where available | Tracker mutation and explicit peer row |
 | Torrent files/pieces | `files`, `webseeds`, `pieceStates`, `pieceHashes`, `export`, `filePrio` | Same | Native/Partial | File priority and piece state are engine-backed; `export` returns the persisted raw `.torrent` bytes for known torrents with stored metadata |
 | Queue priority | `increasePrio`, `decreasePrio`, `topPrio`, `bottomPrio` | Same | Native | Queue ordering row |
-| Properties | `properties` | Same | Partial projection | Full property key presence row |
+| Properties | `properties` | Same | Native/Compat | Full property key presence row; registry counters/lifecycle and engine metadata project the documented properties object |
 | Categories | `categories`, `createCategory`, `editCategory`, `removeCategories`, `setCategory` | Same | Native/Compat; configured category save paths apply on set | Category create/edit/remove/set row |
 | Tags | `tags`, `createTags`, `deleteTags`, `addTags`, `setTags`, `removeTags` | Same | Native/Compat; global tags persist and clean up when unused | Tags global and per-torrent row |
 | Limits/modes | `downloadLimit`, `setDownloadLimit`, `uploadLimit`, `setUploadLimit`, `setShareLimits`, `setForceStart`, `setSuperSeeding`, `setAutoTMM`, `setAutoManagement`, `toggleSequentialDownload`, `toggleFirstLastPiecePrio` | Same | Native/Compat | Limit read/write and qBit mode mutations are backend-backed where the selected backend exposes equivalent behavior; unavailable backend modes return compatible success with logged unsupported detail |

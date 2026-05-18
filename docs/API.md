@@ -80,8 +80,8 @@ the rewritten engine.
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/api/v1/auth/login` | Native WebUI session probe; returns `Ok.` when the request reaches TorrentNG. Token validation is handled by the shared auth layer. |
-| `POST` | `/api/v1/auth/logout` | Native WebUI logout probe; clears no server-side state in token mode and returns success for UI compatibility. |
+| `POST` | `/api/v1/auth/login` | Native WebUI session login. With `auth.api_tokens`, username or password must match an API token; success returns `Ok.` and a `tng_session` cookie. |
+| `POST` | `/api/v1/auth/logout` | Native WebUI logout probe; expires the `tng_session` cookie. |
 
 ### Torrents
 
@@ -305,8 +305,8 @@ Implements the qBittorrent Web API v2. By default it advertises qBittorrent `5.0
 
 | Method | Path | Notes |
 |--------|------|-------|
-| `POST` | `/api/qb/v2/auth/login` | In no-auth mode accepts any credentials; with `auth.api_tokens`, use an API token as username or password to receive an `tng_session` cookie |
-| `POST` | `/api/qb/v2/auth/logout` | No-op |
+| `POST` | `/api/qb/v2/auth/login` | qBittorrent-compatible login probe; accepts credentials and returns `Ok.` with a `SID` cookie for clients that require qBit session shape |
+| `POST` | `/api/qb/v2/auth/logout` | Expires the qBittorrent-compatible `SID` cookie |
 
 ### App
 

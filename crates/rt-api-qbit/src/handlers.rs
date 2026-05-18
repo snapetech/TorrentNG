@@ -1,6 +1,6 @@
 use axum::{
     extract::{Multipart, Query, State},
-    http::{header, StatusCode},
+    http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -35,13 +35,26 @@ use crate::{
 // Auth
 // ---------------------------------------------------------------------------
 
-/// `POST /api/qb/v2/auth/login` — always succeeds (auth handled at sidecar layer).
+/// `POST /api/qb/v2/auth/login` — qBittorrent-compatible session probe.
 pub async fn auth_login() -> impl IntoResponse {
-    (StatusCode::OK, "Ok.")
+    (
+        StatusCode::OK,
+        [(
+            header::SET_COOKIE,
+            HeaderValue::from_static("SID=torrentng; HttpOnly; SameSite=Lax; Path=/"),
+        )],
+        "Ok.",
+    )
 }
 
 pub async fn auth_logout() -> impl IntoResponse {
-    StatusCode::OK
+    (
+        StatusCode::OK,
+        [(
+            header::SET_COOKIE,
+            HeaderValue::from_static("SID=; Max-Age=0; HttpOnly; SameSite=Lax; Path=/"),
+        )],
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -4027,6 +4040,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        let cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap();
+        assert!(cookie.starts_with("SID=torrentng;"));
     }
 
     #[tokio::test]
