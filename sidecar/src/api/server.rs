@@ -4,7 +4,7 @@ use axum::{
     http::{header, HeaderMap, HeaderName, HeaderValue, Request},
     middleware,
     response::Response,
-    routing::{delete, get, patch, post, put},
+    routing::{delete, get, post, put},
     Router,
 };
 use std::{
@@ -114,7 +114,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/engine/restart", post(handlers::restart_process))
         .route(
             "/api/v1/session/features",
-            patch(handlers::set_session_features),
+            get(handlers::get_session_features)
+                .patch(handlers::set_session_features)
+                .put(handlers::set_session_features),
         )
         .route("/api/v1/cross-seed", post(handlers::cross_seed_helper))
         .route(

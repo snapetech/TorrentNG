@@ -836,6 +836,15 @@ pub struct SessionFeatureResponse {
     pex: Option<bool>,
 }
 
+pub async fn get_session_features(State(s): State<AppState>) -> impl IntoResponse {
+    let (dht, pex) = s.backend.feature_status().await;
+    Json(SessionFeatureResponse {
+        dht: feature_status_to_bool(&dht),
+        pex: feature_status_to_bool(&pex),
+    })
+    .into_response()
+}
+
 pub async fn set_session_features(
     State(s): State<AppState>,
     Json(patch): Json<SessionFeaturePatch>,
@@ -864,6 +873,14 @@ pub async fn set_session_features(
     }
 
     Json(SessionFeatureResponse { dht, pex }).into_response()
+}
+
+fn feature_status_to_bool(status: &str) -> Option<bool> {
+    match status {
+        "enabled" | "on" | "true" | "1" | "yes" => Some(true),
+        "disabled" | "off" | "false" | "0" | "no" => Some(false),
+        _ => None,
+    }
 }
 
 // --- Saved views ---

@@ -1230,6 +1230,28 @@ async fn native_session_features_validate_request_body() {
 }
 
 #[tokio::test]
+async fn native_session_features_can_be_read_and_put() {
+    let (addr, client) = spawn_server().await;
+    let res = client
+        .get(url(addr, "/api/v1/session/features"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert!(body.get("dht").is_some());
+    assert!(body.get("pex").is_some());
+
+    let res = client
+        .put(url(addr, "/api/v1/session/features"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn native_session_features_report_rtorrent_failure() {
     let (addr, client) = spawn_server().await;
     let res = client
