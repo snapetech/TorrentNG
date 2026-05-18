@@ -56,7 +56,7 @@ pub async fn run(
                             &db,
                             "info",
                             "rtorrent_stats_recovered",
-                            "rTorrent transfer stats recovered",
+                            "backend transfer stats recovered",
                             serde_json::json!({
                                 "component": backend.backend_type().as_str(),
                                 "operation": "transfer_stats",
@@ -81,7 +81,7 @@ pub async fn run(
                             &db,
                             "warn",
                             "rtorrent_stats_error",
-                            "rTorrent transfer stats probe failed",
+                            "backend transfer stats probe failed",
                             serde_json::json!({
                                 "component": backend.backend_type().as_str(),
                                 "operation": "transfer_stats",
@@ -143,7 +143,7 @@ async fn probe_transfer_rates(backend: &dyn TorrentBackend) -> TransferRates {
         Ok(rates) => rates,
         Err(e) => {
             warn!(
-                component = "rtorrent",
+                component = backend.backend_type().as_str(),
                 operation = "transfer_stats",
                 result = "error",
                 error = %e,

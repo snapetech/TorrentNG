@@ -255,7 +255,7 @@ Pass `dry_run: true` to preview what would be affected without making changes.
 | `GET`  | `/metrics` | Prometheus text format metrics |
 | `GET`  | `/ws` | WebSocket — upgrade to receive live events |
 
-When configured with `backend.type = "torrentng"`, the sidecar forwards torrent add/remove, pause/resume, recheck/reannounce, category, file-priority, and tracker patch operations to a native `torrentngd` daemon over these `/api/v1` endpoints.
+When configured with `backend.type = "torrentng"`, the sidecar forwards torrent add/remove, pause/resume, recheck/reannounce, category/tag changes, location/name updates, file-priority and file-rename changes, and tracker patch operations to a native `torrentngd` daemon over these `/api/v1` endpoints.
 
 #### WebSocket events
 
@@ -394,9 +394,9 @@ These compatibility endpoints are present so qBittorrent clients can probe them 
 
 Exposed at `GET /metrics` in Prometheus text format:
 
-Native mode exposes engine/session/API metrics from `torrentngd`. Track 1
-sidecar mode additionally exposes rTorrent sync-loop counters because it polls
-rTorrent over XMLRPC.
+Native mode exposes engine/session/API metrics from `torrentngd`. Sidecar mode
+additionally exposes backend sync-loop counters because it polls the selected
+backend adapter.
 
 | Metric | Type | Description |
 |--------|------|-------------|
@@ -448,5 +448,5 @@ rTorrent over XMLRPC.
 | `torrentng_hot_torrent_storage_cache_bytes{rank,info_hash}` | gauge | Per-torrent storage cache portion of each hot-torrent memory estimate |
 | `torrentng_memory_*` | gauge/counter | Resource governor cap, current process-owned usage, pressure state, per-class caps/usage, and denied allocations, including the `queued_disk` class |
 | `torrentng_api_requests_total` | counter | API requests served |
-| `torrentng_sync_cycles_total` | counter | Track 1 sidecar rTorrent sync cycles completed |
-| `torrentng_sync_errors_total` | counter | Track 1 sidecar rTorrent sync cycle errors |
+| `torrentng_sync_cycles_total` | counter | Sidecar backend sync cycles completed |
+| `torrentng_sync_errors_total` | counter | Sidecar backend sync cycle errors |
