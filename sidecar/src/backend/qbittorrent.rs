@@ -327,6 +327,64 @@ impl TorrentBackend for QbittorrentBackend {
         .await
     }
 
+    async fn set_location(&self, hash: &str, location: &str) -> Result<()> {
+        self.post_form(
+            "api/v2/torrents/setLocation",
+            &[("hashes", hash), ("location", location)],
+        )
+        .await
+    }
+
+    async fn rename_torrent(&self, hash: &str, name: &str) -> Result<()> {
+        self.post_form(
+            "api/v2/torrents/rename",
+            &[("hash", hash), ("name", name)],
+        )
+        .await
+    }
+
+    async fn rename_file(&self, hash: &str, file_index: usize, name: &str) -> Result<()> {
+        self.post_form(
+            "api/v2/torrents/renameFile",
+            &[
+                ("hash", hash),
+                ("id", &file_index.to_string()),
+                ("name", name),
+            ],
+        )
+        .await
+    }
+
+    async fn set_share_limits(
+        &self,
+        hash: &str,
+        ratio_limit_milli: i64,
+        seeding_time_limit: i64,
+    ) -> Result<()> {
+        let ratio_limit = if ratio_limit_milli >= 0 {
+            (ratio_limit_milli as f64 / 1000.0).to_string()
+        } else {
+            ratio_limit_milli.to_string()
+        };
+        self.post_form(
+            "api/v2/torrents/setShareLimits",
+            &[
+                ("hashes", hash),
+                ("ratioLimit", &ratio_limit),
+                ("seedingTimeLimit", &seeding_time_limit.to_string()),
+            ],
+        )
+        .await
+    }
+
+    async fn toggle_sequential_download(&self, hash: &str) -> Result<()> {
+        self.post_form(
+            "api/v2/torrents/toggleSequentialDownload",
+            &[("hashes", hash)],
+        )
+        .await
+    }
+
     async fn add_tags(&self, hash: &str, tags: &[&str]) -> Result<()> {
         self.post_form(
             "api/v2/torrents/addTags",

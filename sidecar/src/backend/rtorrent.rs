@@ -129,6 +129,33 @@ impl TorrentBackend for RtorrentBackend {
         self.client.set_category(hash, category).await
     }
 
+    async fn set_location(&self, hash: &str, location: &str) -> Result<()> {
+        self.client.set_location(hash, location).await
+    }
+
+    async fn rename_torrent(&self, hash: &str, name: &str) -> Result<()> {
+        self.client.rename_torrent(hash, name).await
+    }
+
+    async fn rename_file(&self, hash: &str, file_index: usize, name: &str) -> Result<()> {
+        self.client.rename_file(hash, file_index, name).await
+    }
+
+    async fn set_share_limits(
+        &self,
+        hash: &str,
+        ratio_limit_milli: i64,
+        seeding_time_limit: i64,
+    ) -> Result<()> {
+        self.client
+            .set_share_limits(hash, ratio_limit_milli, seeding_time_limit)
+            .await
+    }
+
+    async fn toggle_sequential_download(&self, hash: &str) -> Result<()> {
+        self.client.toggle_sequential_download(hash).await
+    }
+
     async fn has_bounded_sync(&self) -> bool {
         self.client.has_multicall_range().await
     }

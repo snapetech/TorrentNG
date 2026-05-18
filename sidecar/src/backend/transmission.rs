@@ -91,7 +91,7 @@ impl TorrentBackend for TransmissionBackend {
             supports_tags: false,
             supports_categories: true,
             supports_file_priority: true,
-            supports_tracker_edit: false,
+            supports_tracker_edit: true,
             supports_recheck: true,
             supports_runtime_user_agent: false,
             supports_config_overlay: false,
@@ -241,12 +241,24 @@ impl TorrentBackend for TransmissionBackend {
         Ok(())
     }
 
-    async fn edit_tracker(&self, _hash: &str, _original_url: &str, _new_url: &str) -> Result<()> {
-        bail!("Transmission tracker edit is not supported by this adapter")
+    async fn edit_tracker(&self, hash: &str, original_url: &str, new_url: &str) -> Result<()> {
+        let tracker_id = self.tracker_id_by_url(hash, original_url).await?;
+        self.rpc(
+            "torrent-set",
+            json!({ "ids": [hash], "trackerReplace": [[tracker_id, new_url]] }),
+        )
+        .await?;
+        Ok(())
     }
 
-    async fn remove_tracker(&self, _hash: &str, _url: &str) -> Result<()> {
-        bail!("Transmission tracker removal requires tracker ids and is not supported by this adapter")
+    async fn remove_tracker(&self, hash: &str, url: &str) -> Result<()> {
+        let tracker_id = self.tracker_id_by_url(hash, url).await?;
+        self.rpc(
+            "torrent-set",
+            json!({ "ids": [hash], "trackerRemove": [tracker_id] }),
+        )
+        .await?;
+        Ok(())
     }
 
     async fn list_files(&self, hash: &str) -> Result<Vec<RawFile>> {
@@ -312,6 +324,17 @@ impl TorrentBackend for TransmissionBackend {
         )
         .await?;
         Ok(())
+    }
+}
+
+impl TransmissionBackend {
+    async fn tracker_id_by_url(&self, hash: &str, url: &str) -> Result<i64> {
+        let trackers = self.list_trackers(hash).await?;
+        trackers
+            .into_iter()
+            .find(|tracker| tracker.url == url)
+            .map(|tracker| tracker.id)
+            .with_context(|| format!("Transmission tracker not found: {url}"))
     }
 }
 
@@ -407,5 +430,51 @@ fn string(value: &Value, key: &str) -> String {
 }
 
 fn int(value: &Value, key: &str) -> i64 {
-    value.get(key).and_then(Value::as_i64).unwrap_or(0)
+    value
+        .get(key)
+        .and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_bool().map(i64::from))
+        })
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transmission_backend_advertises_tracker_mutations() {
+        let backend = TransmissionBackend::new(&TransmissionConfig::default()).unwrap();
+
+        let capabilities = backend.capabilities();
+
+        assert!(capabilities.supports_file_priority);
+        assert!(capabilities.supports_tracker_edit);
+        assert!(capabilities.supports_recheck);
+    }
+
+    #[test]
+    fn maps_transmission_tracker_ids_for_mutation_calls() {
+        let tracker = json!({
+            "announce": "https://tracker.example/announce",
+            "id": 17,
+            "tier": 2,
+            "lastAnnounceSucceeded": true,
+            "lastAnnounceTime": 100,
+            "nextAnnounceTime": 200,
+            "leecherCount": 3,
+            "seederCount": 4,
+            "downloadCount": 5
+        });
+
+        let mapped = map_tracker((0, &tracker));
+
+        assert_eq!(mapped.url, "https://tracker.example/announce");
+        assert_eq!(mapped.id, 17);
+        assert_eq!(mapped.group, 2);
+        assert!(mapped.is_open);
+        assert_eq!(mapped.scrape_complete, 4);
+    }
 }

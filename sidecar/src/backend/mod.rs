@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use async_trait::async_trait;
 use serde::Serialize;
 
@@ -111,6 +111,26 @@ pub trait TorrentBackend: Send + Sync {
     async fn list_files(&self, hash: &str) -> Result<Vec<RawFile>>;
     async fn set_file_priority(&self, hash: &str, file_index: usize, priority: i64) -> Result<()>;
     async fn set_category(&self, hash: &str, category: &str) -> Result<()>;
+    async fn set_location(&self, _hash: &str, _location: &str) -> Result<()> {
+        bail!("{} backend does not support location updates", self.backend_type().as_str())
+    }
+    async fn rename_torrent(&self, _hash: &str, _name: &str) -> Result<()> {
+        bail!("{} backend does not support torrent renames", self.backend_type().as_str())
+    }
+    async fn rename_file(&self, _hash: &str, _file_index: usize, _name: &str) -> Result<()> {
+        bail!("{} backend does not support file renames", self.backend_type().as_str())
+    }
+    async fn set_share_limits(
+        &self,
+        _hash: &str,
+        _ratio_limit_milli: i64,
+        _seeding_time_limit: i64,
+    ) -> Result<()> {
+        bail!("{} backend does not support share limits", self.backend_type().as_str())
+    }
+    async fn toggle_sequential_download(&self, _hash: &str) -> Result<()> {
+        bail!("{} backend does not support sequential download toggles", self.backend_type().as_str())
+    }
     async fn add_tags(&self, _hash: &str, _tags: &[&str]) -> Result<()> {
         Ok(())
     }
