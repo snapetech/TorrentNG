@@ -136,7 +136,6 @@ test('torrent workspace has no serious automated accessibility violations', asyn
   const results = await new AxeBuilder({ page })
     .include('body')
     .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'])
-    .disableRules(['color-contrast'])
     .analyze()
   const serious = results.violations.filter(violation => violation.impact === 'serious' || violation.impact === 'critical')
 
@@ -156,7 +155,6 @@ test('settings library panel has no serious automated accessibility violations',
   const results = await new AxeBuilder({ page })
     .include('body')
     .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'])
-    .disableRules(['color-contrast'])
     .analyze()
   const serious = results.violations.filter(violation => violation.impact === 'serious' || violation.impact === 'critical')
 

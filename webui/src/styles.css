@@ -15,7 +15,7 @@
   --border-strong: #334155;
   --text: #e2e8f0;
   --muted: #94a3b8;
-  --faint: #64748b;
+  --faint: #9aa8ba;
   --accent: #3b82f6;
   --accent-soft: #1e3a5f;
   --accent-text: #bfdbfe;
@@ -23,7 +23,7 @@
   --press: color-mix(in srgb, var(--accent) 20%, transparent);
   --success: #22c55e;
   --warning: #f59e0b;
-  --danger: #ef4444;
+  --danger: #f87171;
   --shadow: rgba(0,0,0,0.45);
   color-scheme: dark;
 }

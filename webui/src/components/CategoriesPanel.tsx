@@ -129,13 +129,16 @@ export function CategoriesPanel() {
               <button
                 onClick={() => startEdit(cat)}
                 disabled={save.isPending || del.isPending}
-                style={{ background: 'none', border: '1px solid var(--border-strong)', borderRadius: 4, color: 'var(--muted)', padding: '2px 8px', fontSize: 11, cursor: 'pointer' }}
+                style={{ background: 'var(--surface-2)', border: '1px solid var(--border-strong)', borderRadius: 4, color: 'var(--text)', padding: '2px 8px', fontSize: 11, cursor: 'pointer' }}
               >Edit</button>
               <button
                 onClick={() => del.mutate(cat.name)}
                 disabled={save.isPending || del.isPending}
                 style={{
-                  background: 'none', border: '1px solid #7f1d1d', borderRadius: 4, color: '#ef4444',
+                  background: 'color-mix(in srgb, var(--danger) 10%, var(--surface))',
+                  border: '1px solid color-mix(in srgb, var(--danger) 55%, var(--border))',
+                  borderRadius: 4,
+                  color: 'var(--danger)',
                   padding: '2px 8px', fontSize: 11, cursor: save.isPending || del.isPending ? 'not-allowed' : 'pointer',
                   opacity: save.isPending || del.isPending ? 0.5 : 1,
                 }}

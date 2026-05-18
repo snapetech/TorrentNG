@@ -22,7 +22,7 @@ const darkBase = {
   borderStrong: '#334155',
   text: '#e2e8f0',
   muted: '#94a3b8',
-  faint: '#64748b',
+  faint: '#9aa8ba',
   shadow: 'rgba(0,0,0,0.45)',
 }
 
@@ -51,7 +51,7 @@ function palette(id: string, label: string, dark: Partial<ThemeTokens>, light: P
       ...darkBase,
       success: '#22c55e',
       warning: '#f59e0b',
-      danger: '#ef4444',
+      danger: '#f87171',
       ...dark,
     },
     light: {
@@ -68,8 +68,8 @@ export const PALETTES: ThemePalette[] = [
   palette('tng', 'TorrentNG', {
     bg: '#0b1220', panel: '#111827', surface: '#162033', surface2: '#202b42',
     tableHead: '#1b2740', row: '#101826', rowAlt: '#152033', selected: '#17335f',
-    border: '#22324d', borderStrong: '#40516f', text: '#e6edf7', muted: '#a9b8cc', faint: '#73849c',
-    accent: '#4f8cff', accentSoft: '#17335f', accentText: '#dbe8ff', shadow: 'rgba(2,6,23,0.52)',
+    border: '#22324d', borderStrong: '#40516f', text: '#e6edf7', muted: '#b7c4d6', faint: '#9aa8ba',
+    accent: '#4f8cff', accentSoft: '#17335f', accentText: '#dbe8ff', danger: '#f87171', shadow: 'rgba(2,6,23,0.52)',
   }, {
     bg: '#eef5ff', panel: '#fdfefe', surface: '#e3edf9', surface2: '#cfdef0',
     tableHead: '#d7e5f6', row: '#ffffff', rowAlt: '#edf4fc', selected: '#cfe2ff',

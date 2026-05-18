@@ -141,9 +141,9 @@ Remaining WebUI gaps are now product/certification depth:
 
 - visual-regression screenshot baselines are wired into the WebUI browser
   matrix for the main workspace and storage settings panel;
-- axe-based accessibility certification is wired in for serious/critical
-  structural WCAG violations, but color-contrast remediation remains a visual
-  design follow-up before enabling the contrast rule as a hard gate;
+- axe-based accessibility certification is wired in for serious/critical WCAG
+  violations, including color contrast on the certified workspace/settings
+  surfaces;
 - the browser-driven 15k-row benchmark now verifies bounded DOM rendering and
   load-more responsiveness, but release hardware still needs a measured
   end-to-end first-paint threshold;
