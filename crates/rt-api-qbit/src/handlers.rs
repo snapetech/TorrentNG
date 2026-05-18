@@ -18,7 +18,8 @@ use std::{
 use url::Url;
 
 use rt_engine::{
-    EngineGlobalLimits, EnginePeerSnapshot, EnginePieceState, EngineTorrentLimits, QueueMove,
+    EngineGlobalLimits, EnginePeerSnapshot, EnginePieceState, EngineTorrentLimits,
+    EngineTrackerSnapshot, QueueMove,
 };
 use rt_metrics::{MemoryClass, MemoryLease};
 
@@ -758,11 +759,11 @@ pub async fn torrents_trackers(
     let Some(engine) = &state.engine else {
         return (StatusCode::OK, Json(Vec::<QbTrackerInfo>::new()));
     };
-    match engine.torrent_metadata(hash).await {
-        Ok(meta) => {
+    match engine.torrent_trackers(hash.clone()).await {
+        Ok(trackers) => {
             let _lease = match reserve_qbit_api_snapshot(
                 &state,
-                estimate_qbit_tracker_snapshot_bytes(meta.trackers.len()),
+                estimate_qbit_tracker_snapshot_bytes(trackers.len()),
             )
             .await
             {
@@ -774,25 +775,47 @@ pub async fn torrents_trackers(
                     )
                 }
             };
-            let trackers = meta
-                .trackers
-                .into_iter()
-                .enumerate()
-                .map(|(idx, url)| QbTrackerInfo {
-                    url,
-                    status: 0,
-                    tier: idx as i32,
-                    num_peers: -1,
-                    num_seeds: -1,
-                    num_leeches: -1,
-                    num_downloaded: -1,
-                    msg: String::new(),
-                })
-                .collect();
-            (StatusCode::OK, Json(trackers))
+            (
+                StatusCode::OK,
+                Json(qbit_trackers_from_snapshots(&trackers)),
+            )
         }
-        Err(_) if exists => (StatusCode::OK, Json(Vec::<QbTrackerInfo>::new())),
-        Err(_) => (StatusCode::NOT_FOUND, Json(Vec::<QbTrackerInfo>::new())),
+        Err(_) => match engine.torrent_metadata(hash).await {
+            Ok(meta) => {
+                let _lease = match reserve_qbit_api_snapshot(
+                    &state,
+                    estimate_qbit_tracker_snapshot_bytes(meta.trackers.len()),
+                )
+                .await
+                {
+                    Ok(Some(lease)) => Some(lease),
+                    Ok(None) | Err(_) => {
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(Vec::<QbTrackerInfo>::new()),
+                        )
+                    }
+                };
+                let trackers = meta
+                    .trackers
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, url)| QbTrackerInfo {
+                        url,
+                        status: 0,
+                        tier: idx as i32,
+                        num_peers: -1,
+                        num_seeds: -1,
+                        num_leeches: -1,
+                        num_downloaded: -1,
+                        msg: String::new(),
+                    })
+                    .collect();
+                (StatusCode::OK, Json(trackers))
+            }
+            Err(_) if exists => (StatusCode::OK, Json(Vec::<QbTrackerInfo>::new())),
+            Err(_) => (StatusCode::NOT_FOUND, Json(Vec::<QbTrackerInfo>::new())),
+        },
     }
 }
 
@@ -2671,6 +2694,49 @@ fn estimate_qbit_metadata_snapshot_bytes(
 
 fn estimate_qbit_tracker_snapshot_bytes(tracker_count: usize) -> u64 {
     8 * 1024 + (tracker_count as u64).saturating_mul(512)
+}
+
+fn qbit_trackers_from_snapshots(trackers: &[EngineTrackerSnapshot]) -> Vec<QbTrackerInfo> {
+    trackers
+        .iter()
+        .map(|tracker| QbTrackerInfo {
+            url: tracker.announce.clone(),
+            status: qbit_tracker_status_code(&tracker.status),
+            tier: tracker.tier as i32,
+            num_peers: tracker
+                .seeders
+                .unwrap_or(0)
+                .saturating_add(tracker.leechers.unwrap_or(0)) as i32,
+            num_seeds: tracker.seeders.unwrap_or(-1) as i32,
+            num_leeches: tracker.leechers.unwrap_or(-1) as i32,
+            num_downloaded: tracker.completed.unwrap_or(-1) as i32,
+            msg: qbit_tracker_message(tracker),
+        })
+        .collect()
+}
+
+fn qbit_tracker_status_code(status: &str) -> i32 {
+    match status {
+        "working" => 2,
+        "warning" => 3,
+        "error" => 4,
+        "pending" => 1,
+        _ => 0,
+    }
+}
+
+fn qbit_tracker_message(tracker: &EngineTrackerSnapshot) -> String {
+    tracker
+        .failure_reason
+        .clone()
+        .filter(|message| !message.is_empty())
+        .or_else(|| {
+            tracker
+                .warning_message
+                .clone()
+                .filter(|message| !message.is_empty())
+        })
+        .unwrap_or_default()
 }
 
 fn estimate_qbit_label_snapshot_bytes(item_count: usize) -> u64 {
@@ -4912,6 +4978,34 @@ mod tests {
                 "udp://two/announce".to_owned()
             ]
         );
+    }
+
+    #[test]
+    fn qbit_tracker_projection_uses_persisted_engine_state() {
+        let trackers = vec![EngineTrackerSnapshot {
+            id: 1,
+            tier: 2,
+            announce: "https://tracker.example/announce".to_owned(),
+            status: "warning".to_owned(),
+            last_announce_at: Some(100),
+            next_announce_at: Some(200),
+            last_success_at: Some(90),
+            failure_reason: None,
+            warning_message: Some("slow scrape".to_owned()),
+            seeders: Some(3),
+            leechers: Some(4),
+            completed: Some(5),
+        }];
+        let projected = qbit_trackers_from_snapshots(&trackers);
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].url, "https://tracker.example/announce");
+        assert_eq!(projected[0].status, 3);
+        assert_eq!(projected[0].tier, 2);
+        assert_eq!(projected[0].num_peers, 7);
+        assert_eq!(projected[0].num_seeds, 3);
+        assert_eq!(projected[0].num_leeches, 4);
+        assert_eq!(projected[0].num_downloaded, 5);
+        assert_eq!(projected[0].msg, "slow scrape");
     }
 
     #[test]
