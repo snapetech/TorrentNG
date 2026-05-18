@@ -27,8 +27,6 @@ likely to have accumulated over time.
 
 ![TorrentNG WebUI using the Sietch Neon theme while downloading Linux ISO test data](docs/assets/torrentng-sietch-neon-linux-isos.png)
 
-Screenshot uses mocked Linux ISO torrent data, not a live user session.
-
 ## Status
 
 The native Rust engine is the primary development and deployment path. The
