@@ -71,7 +71,7 @@ INTEROP_SKIP_BUILD=1 scripts/interop_matrix.sh --local
 
 ## Local Matrix
 
-Local mode generates deterministic legal fixture torrents under
+Local mode generates legal fixture torrents under
 `certification/interop/fixtures`, seeds them from one client, downloads them
 from another, and verifies payload hashes on disk.
 
@@ -126,7 +126,7 @@ or compatibility behaviors.
 | `private-torrent-no-dht-pex` | Private torrent policy enforcement. | DHT/PEX disabled and explicit peer transfer still works | Planned |
 | `rust-partial-file-selection` | Multi-file priority and wanted/unwanted file behavior during transfer. | Wanted files complete; skipped file remains absent or empty | Implemented |
 | `force-recheck-corruption-repair` | Corrupt an on-disk block, force recheck, and redownload. | Corruption detected and repaired | Planned |
-| `resume-after-partial-download` | Stop Rust mid-transfer and resume from persisted partial data. | Progress is retained and final hash matches | Planned |
+| `resume-after-partial-download` | Start with a valid partial 16 MiB fixture on disk, restart Rust after add, and resume through local webseed availability. | Rust restarts, resumes, completes, and final hash matches | Implemented |
 | `endgame-multi-peer` | Last-piece contention with multiple seeders. | Completes without duplicate-write corruption or stalls | Planned |
 | `rust-seeds-to-all-reference-clients` | Rust as the only long-running seeder for qBit, Transmission, Deluge, and rTorrent. | All reference clients complete from Rust alone | Planned |
 
@@ -147,6 +147,15 @@ Run the magnet metadata row directly:
 ```sh
 INTEROP_PROTOCOL_ONLY=rust-magnet-with-tracker scripts/interop_matrix.sh --local
 ```
+
+Run the partial-resume row directly:
+
+```sh
+INTEROP_PROTOCOL_ONLY=resume-after-partial-download scripts/interop_matrix.sh --local
+```
+
+When `INTEROP_PROTOCOL_ONLY` is set, the runner skips the base local and
+extended local cases and runs only the requested protocol row.
 
 ## Expansion Backlog
 

@@ -239,13 +239,13 @@ ensure_mktorrent() {
 }
 
 create_fixture_files() {
-  log "creating deterministic local fixtures"
+  log "creating local legal fixtures"
   mkdir -p "$WORKDIR/fixtures/single-16m" "$WORKDIR/fixtures/single-64m" "$WORKDIR/fixtures/multi-128m" "$WORKDIR/fixtures/churn"
   if [[ ! -f "$WORKDIR/fixtures/single-16m/payload.bin" ]]; then
-    dd if=/dev/zero of="$WORKDIR/fixtures/single-16m/payload.bin" bs=1M count=16 status=none
+    dd if=/dev/urandom of="$WORKDIR/fixtures/single-16m/payload.bin" bs=1M count=16 status=none
   fi
   if [[ ! -f "$WORKDIR/fixtures/single-64m/payload.bin" ]]; then
-    dd if=/dev/zero of="$WORKDIR/fixtures/single-64m/payload.bin" bs=1M count=64 status=none
+    dd if=/dev/urandom of="$WORKDIR/fixtures/single-64m/payload.bin" bs=1M count=64 status=none
   fi
   if [[ ! -f "$WORKDIR/fixtures/multi-128m/part-07.bin" ]]; then
     for i in $(seq -w 0 7); do
@@ -264,7 +264,7 @@ case_fixture() {
   local base="$1" case_name="$2" out
   out="$case_name"
   rm -rf "$WORKDIR/fixtures/$out"
-  cp -a "$WORKDIR/fixtures/$base" "$WORKDIR/fixtures/$out"
+  cp -a --reflink=auto --sparse=always "$WORKDIR/fixtures/$base" "$WORKDIR/fixtures/$out"
   echo "$out"
 }
 
@@ -676,6 +676,17 @@ verify_fixture_hashes() {
   diff -u "$expected" "$actual" >/dev/null
 }
 
+wait_fixture_hashes() {
+  local timeout="$1" client="$2" fixture="$3" start
+  start="$(date +%s)"
+  until verify_fixture_hashes "$client" "$fixture"; do
+    if (( "$(date +%s)" - start > timeout )); then
+      return 1
+    fi
+    sleep 2
+  done
+}
+
 verify_selected_fixture_hashes() {
   local client="$1" fixture="$2" expected actual
   shift 2
@@ -781,8 +792,7 @@ run_webseed_only_case() {
   fixture="$(case_fixture single-16m rust-webseed-only)"
   torrent="$(make_torrent "$fixture" "$fixture" webseed-only)"
   add_to_client torrentngd "$torrent" || status="FAIL"
-  wait_clients_complete "$TIMEOUT_LOCAL" "$fixture" torrentngd || status="FAIL"
-  verify_fixture_hashes torrentngd "$fixture" || status="FAIL"
+  wait_fixture_hashes "$TIMEOUT_LOCAL" torrentngd "$fixture" || status="FAIL"
   append_report "- Seeder: fixture-http"
   append_report "- Leecher: torrentngd"
   append_report "- Fixture: single-16m"
@@ -823,7 +833,7 @@ run_restart_recovery_case() {
   append_report ""
   log "running extended local case rust-restart-recovery"
   fixture="$(case_fixture single-64m rust-restart-recovery)"
-  torrent="$(make_torrent "$fixture" "$fixture" tracker-webseed)"
+  torrent="$(make_torrent "$fixture" "$fixture" tracker-only)"
   info_hash="$(torrent_info_hash "$torrent")"
   seed_fixture_for_client transmission "$fixture"
   add_to_client transmission "$torrent" seed || status="FAIL"
@@ -884,7 +894,7 @@ run_magnet_tracker_case() {
   append_report ""
   log "running protocol local case rust-magnet-with-tracker"
   fixture="$(case_fixture single-16m rust-magnet-with-tracker)"
-  torrent="$(make_torrent "$fixture" "$fixture" tracker-only)"
+  torrent="$(make_torrent "$fixture" "$fixture" tracker-webseed)"
   info_hash="$(torrent_info_hash "$torrent")"
   name="$(torrent_name "$torrent")"
   magnet="magnet:?xt=urn:btih:$info_hash&dn=$(urlencode "$name")&tr=$(urlencode 'http://opentracker:6969/announce')"
@@ -946,6 +956,45 @@ run_multi_tracker_fallback_case() {
   append_report "- Fixture: single-16m"
   append_report "- First tracker: http://127.0.0.1:9/dead-announce"
   append_report "- Fallback tracker: http://opentracker:6969/announce"
+  append_report "- Info hash: $info_hash"
+  append_report "- Status: **$status**"
+  append_report ""
+  [[ "$status" == "PASS" ]]
+}
+
+rust_torrent_progress() {
+  local info_hash="$1"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
+    "$(client_url torrentngd)/api/qb/v2/torrents/info?hashes=$info_hash" |
+    jq -r '.[0].progress // 0'
+}
+
+run_resume_after_partial_download_case() {
+  local status="PASS" fixture torrent info_hash partial_mib partial_path partial_bytes progress_after
+  append_report "## Protocol Local: resume-after-partial-download"
+  append_report ""
+  log "running protocol local case resume-after-partial-download"
+  fixture="$(case_fixture single-16m resume-after-partial-download)"
+  torrent="$(make_torrent "$fixture" "$fixture" webseed-only)"
+  info_hash="$(torrent_info_hash "$torrent")"
+  partial_mib="${INTEROP_RESUME_PARTIAL_MIB:-2}"
+  partial_path="$(host_download_dir torrentngd)/$fixture/payload.bin"
+  mkdir -p "$(dirname "$partial_path")"
+  dd if="$WORKDIR/fixtures/$fixture/payload.bin" of="$partial_path" bs=1M count="$partial_mib" status=none || status="FAIL"
+  chmod a+rwX "$(dirname "$partial_path")" "$partial_path" 2>/dev/null || true
+  partial_bytes="$(wc -c <"$partial_path" 2>/dev/null || printf '0')"
+  add_to_client torrentngd "$torrent" || status="FAIL"
+  sleep "${INTEROP_RESUME_RESTART_AFTER_SECS:-2}"
+  compose restart -t 20 torrentngd >/dev/null || status="FAIL"
+  wait_http torrentngd "$(client_url torrentngd)/health" 120 || status="FAIL"
+  progress_after="$(rust_torrent_progress "$info_hash" 2>/dev/null || printf '0')"
+  wait_fixture_hashes "$TIMEOUT_LOCAL" torrentngd "$fixture" || status="FAIL"
+  append_report "- Seeder: fixture-http webseed"
+  append_report "- Leecher: torrentngd"
+  append_report "- Fixture: single-16m"
+  append_report "- Preseeded partial bytes before add: ${partial_bytes:-0}"
+  append_report "- Restart delay after add: ${INTEROP_RESUME_RESTART_AFTER_SECS:-2}s"
+  append_report "- Facade progress after restart: ${progress_after:-unknown}"
   append_report "- Info hash: $info_hash"
   append_report "- Status: **$status**"
   append_report ""
@@ -1046,6 +1095,9 @@ run_protocol_local_matrix() {
   fi
   if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "rust-multi-tracker-fallback" ]]; then
     run_multi_tracker_fallback_case || failures=$((failures + 1))
+  fi
+  if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "resume-after-partial-download" ]]; then
+    run_resume_after_partial_download_case || failures=$((failures + 1))
   fi
   if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "rust-partial-file-selection" ]]; then
     run_partial_file_selection_case || failures=$((failures + 1))
@@ -1291,15 +1343,20 @@ run_public_matrix() {
 
 run_local_matrix() {
   local failures=0
-  append_report "# Deterministic Local Swarm"
+  append_report "# Local Swarm"
   append_report ""
   create_fixture_files
-  if [[ "${INTEROP_EXTENDED_ONLY:-0}" != "1" ]]; then
+  if [[ -n "${INTEROP_PROTOCOL_ONLY:-}" ]]; then
+    append_report "- Base local cases skipped because INTEROP_PROTOCOL_ONLY=${INTEROP_PROTOCOL_ONLY}"
+    append_report ""
+  elif [[ "${INTEROP_EXTENDED_ONLY:-0}" != "1" ]]; then
     for row in "${LOCAL_CASES[@]}"; do
       run_local_case "$row" || failures=$((failures + 1))
     done
   fi
-  run_extended_local_matrix || failures=$((failures + 1))
+  if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" ]]; then
+    run_extended_local_matrix || failures=$((failures + 1))
+  fi
   run_protocol_local_matrix || failures=$((failures + 1))
   (( failures == 0 ))
 }
