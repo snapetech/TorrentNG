@@ -19,7 +19,8 @@ use url::Url;
 
 use rt_engine::{
     EngineGlobalLimits, EngineNetworkFeatures, EnginePeerSnapshot, EnginePieceState,
-    EngineTorrentLimits, EngineTrackerSnapshot, QueueMove,
+    EngineTorrentFile, EngineTorrentLimits, EngineTorrentMetadata, EngineTrackerSnapshot,
+    QueueMove,
 };
 use rt_metrics::{MemoryClass, MemoryLease};
 
@@ -1059,11 +1060,9 @@ pub async fn torrents_files(
     let Some(engine) = &state.engine else {
         return (StatusCode::OK, Json(Vec::<QbFileInfo>::new()));
     };
-    let complete = {
+    let entry = {
         let reg = state.registry.read().await;
-        reg.get(&hash)
-            .map(|entry| entry.completed_at.is_some() || entry.amount_left == 0)
-            .unwrap_or(false)
+        reg.get(&hash).cloned()
     };
     match engine.torrent_metadata(hash).await {
         Ok(meta) => {
@@ -1085,17 +1084,10 @@ pub async fn torrents_files(
                     )
                 }
             };
-            let files = meta
-                .files
-                .into_iter()
-                .map(|file| QbFileInfo {
-                    index: file.index,
-                    name: file.path,
-                    size: file.length as i64,
-                    priority: file.priority.clamp(0, 2) as u8,
-                    progress: if complete || !file.wanted { 1.0 } else { 0.0 },
-                })
-                .collect();
+            let files = entry
+                .as_ref()
+                .map(|entry| qbit_file_infos(entry, &meta))
+                .unwrap_or_default();
             (StatusCode::OK, Json(files))
         }
         Err(_) if exists => (StatusCode::OK, Json(Vec::<QbFileInfo>::new())),
@@ -2949,6 +2941,47 @@ fn default_torrent_properties(save_path: String) -> QbTorrentProperties {
         up_speed_avg: 0,
         up_speed: 0,
     }
+}
+
+fn qbit_file_infos(
+    entry: &rt_session::TorrentEntry,
+    meta: &EngineTorrentMetadata,
+) -> Vec<QbFileInfo> {
+    let completed = qbit_file_completed_bytes(entry, &meta.files);
+    meta.files
+        .iter()
+        .zip(completed)
+        .map(|(file, completed)| QbFileInfo {
+            index: file.index,
+            name: file.path.clone(),
+            size: file.length as i64,
+            priority: file.priority.clamp(0, 2) as u8,
+            progress: qbit_file_progress(file, completed),
+        })
+        .collect()
+}
+
+fn qbit_file_completed_bytes(
+    entry: &rt_session::TorrentEntry,
+    files: &[EngineTorrentFile],
+) -> Vec<u64> {
+    let done = entry.total_length.saturating_sub(entry.amount_left);
+    let mut offset = 0u64;
+    files
+        .iter()
+        .map(|file| {
+            let file_start = offset;
+            offset = offset.saturating_add(file.length);
+            done.saturating_sub(file_start).min(file.length)
+        })
+        .collect()
+}
+
+fn qbit_file_progress(file: &EngineTorrentFile, completed: u64) -> f64 {
+    if file.length == 0 || !file.wanted {
+        return 1.0;
+    }
+    ((completed as f64) / (file.length as f64)).clamp(0.0, 1.0)
 }
 
 async fn torrent_limit_map(
@@ -6153,5 +6186,45 @@ mod tests {
         assert_eq!(estimate_qbit_limit_map_snapshot_bytes(10), 8 * 1024 + 1_920);
         assert_eq!(estimate_qbit_properties_snapshot_bytes(), 32 * 1024);
         assert_eq!(estimate_qbit_peer_snapshot_bytes(10), 8 * 1024 + 10_240);
+    }
+
+    #[test]
+    fn qbit_files_project_partial_per_file_progress() {
+        let mut entry = TorrentEntry::new("a".repeat(40), "files".into(), "/data".into());
+        entry.total_length = 300;
+        entry.amount_left = 125;
+        let meta = EngineTorrentMetadata {
+            piece_length: 100,
+            piece_count: 3,
+            piece_hashes: Vec::new(),
+            piece_states: Vec::new(),
+            is_private: false,
+            trackers: Vec::new(),
+            webseeds: Vec::new(),
+            comment: None,
+            created_by: None,
+            creation_date: None,
+            files: vec![
+                EngineTorrentFile {
+                    index: 0,
+                    path: "one.bin".to_owned(),
+                    length: 100,
+                    priority: 1,
+                    wanted: true,
+                },
+                EngineTorrentFile {
+                    index: 1,
+                    path: "two.bin".to_owned(),
+                    length: 200,
+                    priority: 0,
+                    wanted: true,
+                },
+            ],
+        };
+
+        let files = qbit_file_infos(&entry, &meta);
+        assert_eq!(files[0].progress, 1.0);
+        assert_eq!(files[1].progress, 0.375);
+        assert_eq!(files[1].priority, 0);
     }
 }

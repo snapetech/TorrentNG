@@ -64,7 +64,7 @@ Universal compatibility release rule:
 | Reannounce | reannounce | torrent_reannounce | tracker update/force reannounce indirectly | `d.tracker_announce` | Native qBit/Transmission | HTTP/UDP tracker announce row |
 | Move storage | setLocation/setSavePath | torrent_set_location | move_storage | directory/base path commands | Native where engine attached; registry fallback | Move path during stopped and active torrent |
 | Rename torrent/file/folder | rename/renameFile/renameFolder | torrent_rename_path | rename_files/rename_folder | path custom commands/plugins | Native for file/folder where engine supports | Rename file/folder and verify metadata projection |
-| File priority/wanted | filePrio | file priority/wanted calls | set_torrent_file_priorities | priority commands/plugins | Native facade hooks | Partial file selection row across facades |
+| File priority/wanted | filePrio | file priority/wanted calls | set_torrent_file_priorities | priority commands/plugins | Native/Compat; qBit, Transmission, and Deluge mutations call native file-priority updates, and rTorrent file multicall projects native priority/wanted rows | File selection row across facades |
 | Queue ordering | top/bottom/increase/decrease | queue_move_* | queue_top/up/down/bottom | priority views | Native facade hooks | Queue mutation plus list-order projection |
 | Categories/labels/tags | categories, tags | labels | Label plugin | custom fields | Native category/tags model | Label/category import and API mutation rows |
 | Trackers | list/add/edit/remove | tracker list mutation, tracker_stats | set_torrent_trackers | tracker commands | Native metadata mutation; stats partially projected | Tracker add/edit/remove and stats row |
@@ -128,14 +128,14 @@ Local implementation: `crates/rt-api-qbit`.
 | Backend capability manifest | n/a | `/api/v1/engine` backend capabilities | Native | Capability flags enumerate every backend-dependent read/mutation surface: export, webseed/piece/peer reads, peer add/ban, queue order, limits, mode flags, location/rename, runtime user-agent, rTorrent overlay, and restart |
 | Torrent list/add | `torrents/info`, `torrents/add` | Same | Native | Add magnet/file, list filters/sort/category/tag/hash |
 | Torrent lifecycle | `pause`, `resume`, `start`, `stop`, `delete`, `recheck`, `reannounce` | Same | Native | Lifecycle transition per endpoint; qBittorrent list state projects active recheck jobs as checking |
-| Torrent trackers/peers | `trackers`, `addTrackers`, `editTracker`, `removeTrackers`, `addPeers` | Same | Native/Partial stats; persisted engine tracker rows project status, message, and scrape counts where available | Tracker mutation and explicit peer row |
-| Torrent files/pieces | `files`, `webseeds`, `pieceStates`, `pieceHashes`, `export`, `filePrio` | Same | Native/Partial | File priority and piece state are engine-backed; `export` returns the persisted raw `.torrent` bytes for known torrents with stored metadata |
+| Torrent trackers/peers | `trackers`, `addTrackers`, `editTracker`, `removeTrackers`, `addPeers` | Same | Native/Compat; persisted engine tracker rows project status, message, scrape counts, and live peer rows where available | Tracker mutation and explicit peer row |
+| Torrent files/pieces | `files`, `webseeds`, `pieceStates`, `pieceHashes`, `export`, `filePrio` | Same | Native/Compat | File priority, wanted state, per-file progress, and piece state are engine-backed; `export` returns the persisted raw `.torrent` bytes for known torrents with stored metadata |
 | Queue priority | `increasePrio`, `decreasePrio`, `topPrio`, `bottomPrio` | Same | Native | Queue ordering row |
 | Properties | `properties` | Same | Native/Compat | Full property key presence row; registry counters/lifecycle and engine metadata project the documented properties object |
 | Categories | `categories`, `createCategory`, `editCategory`, `removeCategories`, `setCategory` | Same | Native/Compat; configured category save paths apply on set | Category create/edit/remove/set row |
 | Tags | `tags`, `createTags`, `deleteTags`, `addTags`, `setTags`, `removeTags` | Same | Native/Compat; global tags persist and clean up when unused | Tags global and per-torrent row |
 | Limits/modes | `downloadLimit`, `setDownloadLimit`, `uploadLimit`, `setUploadLimit`, `setShareLimits`, `setForceStart`, `setSuperSeeding`, `setAutoTMM`, `setAutoManagement`, `toggleSequentialDownload`, `toggleFirstLastPiecePrio` | Same | Native/Compat | Limit read/write and qBit mode mutations are backend-backed where the selected backend exposes equivalent behavior; unavailable backend modes return compatible success with logged unsupported detail |
-| Sync | `sync/maindata`, `sync/torrentPeers` | Same | Native/Partial peers; maindata includes broad torrent/server-state keys, torrentPeers has qBit peer shape and stable RID deltas | Full sync, delta sync, peer sync row |
+| Sync | `sync/maindata`, `sync/torrentPeers` | Same | Native/Compat; maindata includes broad torrent/server-state keys, torrentPeers has qBit peer shape, live tracker digests, and stable RID deltas | Full sync, delta sync, peer sync row |
 | Transfer | `transfer/info`, download/upload limits, speed limits mode, toggle, setters, `banPeers` | Same | Native/Compat | Global limits round-trip; native qB facade persists `banPeers` into `app/preferences.banned_ips`, and sidecar routes bans to backends that support them |
 | Logs | `log/main`, `log/peers` | Same | Native/Compat | Main log projects retained native session events, sidecar app events, and optional ingested rTorrent logs with qBit severity filters; peer log projects native/qB backend peer snapshots where supported |
 | Search | status/categories/plugins/install/uninstall/enable/update/start/stop/results/delete | Same | Compat | Plugin install/enable/uninstall plus job start/results/delete lifecycle |
@@ -226,11 +226,11 @@ Deluge torrent status field matrix:
 | Field bucket | Common Deluge fields | TorrentNG status |
 |---|---|---|
 | Identity/path | `hash`, `name`, `save_path`, `label`, `owner`, `shared` | Native/Compat |
-| Progress/size | `progress`, `total_size`, `total_done`, `num_files`, `num_pieces`, `piece_length` | Native/Partial |
+| Progress/size | `progress`, `total_size`, `total_done`, `num_files`, `num_pieces`, `piece_length` | Native/Compat; registry progress and engine metadata provide size, file count, piece count, and piece length |
 | State/time | `state`, `is_finished`, `eta`, `time_added`, `completed_time`, `active_time`, `seeding_time`, `finished_time` | Compat/native; ETA projects from native peer rates where available and active recheck jobs project `Checking` state |
 | Rates/counters | download/upload rates, total payload download/upload, all-time download, ratio | Native/compat: rates project native peer snapshots when available; counters project registry stats |
 | Peers/seeds | `num_peers`, `num_seeds`, `total_peers`, `total_seeds`, distributed copies | Native/compat from peer snapshots when an engine is attached |
-| Trackers | `tracker`, `tracker_host`, `tracker_status`, `next_announce` | Native/Partial; persisted engine tracker rows project URL, host, status/warning/error text, and next announce where available |
+| Trackers | `tracker`, `tracker_host`, `tracker_status`, `next_announce` | Native/Compat; persisted engine tracker rows project URL, host, status/warning/error text, and next announce where available |
 | Options | max speeds, auto managed, stop ratio, move completed, sequential, super seeding, first/last | Compat/native for speed, auto-managed, stop ratio, move-completed, sequential, super seeding, first/last |
 | Messages | `comment`, `message`, `private` | Compat/native for torrent comments, error message, and private flag |
 
