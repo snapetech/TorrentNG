@@ -830,7 +830,8 @@ fn native_engine_capabilities() -> serde_json::Value {
             "http_trackers": true,
             "udp_trackers": true,
             "dht": true,
-            "utp": true,
+            "utp_packet_codec": true,
+            "utp_transport": false,
             "private_torrent_dht_pex_lsd_default_off": true,
         },
         "compatibility": {
@@ -2648,6 +2649,8 @@ mod tests {
         assert_eq!(capabilities["jobs"]["durable_recheck"], true);
         assert_eq!(capabilities["storage"]["v2_file_root_verify"], true);
         assert_eq!(capabilities["networking"]["dht"], true);
+        assert_eq!(capabilities["networking"]["utp_packet_codec"], true);
+        assert_eq!(capabilities["networking"]["utp_transport"], false);
         assert_eq!(capabilities["compatibility"]["qbittorrent_v2"], true);
         assert_eq!(capabilities["migration"]["transmission"], true);
         assert_eq!(capabilities["operations"]["prometheus_metrics"], true);

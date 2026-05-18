@@ -73,7 +73,8 @@ if [[ -n "$LIVE_HEALTH_URL" ]]; then
       and .engine.capabilities.jobs.durable_recheck == true
       and .engine.capabilities.storage.v2_file_root_verify == true
       and .engine.capabilities.networking.dht == true
-      and .engine.capabilities.networking.utp == true
+      and .engine.capabilities.networking.utp_packet_codec == true
+      and .engine.capabilities.networking.utp_transport == false
       and .engine.capabilities.compatibility.qbittorrent_v2 == true
       and .engine.capabilities.compatibility.transmission_rpc == true
       and .engine.capabilities.compatibility.deluge_rpc == true

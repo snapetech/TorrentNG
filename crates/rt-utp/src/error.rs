@@ -10,4 +10,19 @@ pub enum UtpError {
 
     #[error("unknown packet type: {0}")]
     UnknownPacketType(u8),
+
+    #[error(
+        "uTP extension header truncated after extension type {extension}: {remaining} bytes remain"
+    )]
+    ExtensionHeaderTruncated { extension: u8, remaining: usize },
+
+    #[error("uTP extension {extension} length {length} exceeds remaining payload {remaining}")]
+    ExtensionTruncated {
+        extension: u8,
+        length: usize,
+        remaining: usize,
+    },
+
+    #[error("uTP extension {extension} is too long to encode: {length} bytes")]
+    ExtensionTooLong { extension: u8, length: usize },
 }

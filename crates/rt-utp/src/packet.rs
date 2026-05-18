@@ -1,4 +1,4 @@
-/// BEP 29 uTP packet header codec.
+/// BEP 29 uTP packet codec.
 ///
 /// uTP header: 20 bytes fixed.
 /// type_ver(1) | extension(1) | connection_id(2) | timestamp_us(4) |
@@ -32,7 +32,7 @@ impl PacketType {
 }
 
 /// Decoded uTP packet header.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UtpHeader {
     pub packet_type: PacketType,
     pub version: u8,
@@ -43,6 +43,25 @@ pub struct UtpHeader {
     pub wnd_size: u32,
     pub seq_nr: u16,
     pub ack_nr: u16,
+}
+
+/// A BEP 29 extension entry.
+///
+/// The fixed header's `extension` byte names the first extension kind. Each
+/// extension entry then stores the next extension kind, a one-byte payload
+/// length, and that extension's bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UtpExtension {
+    pub kind: u8,
+    pub data: Vec<u8>,
+}
+
+/// Decoded uTP packet including extension chain and application payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UtpPacket {
+    pub header: UtpHeader,
+    pub extensions: Vec<UtpExtension>,
+    pub payload: Vec<u8>,
 }
 
 impl UtpHeader {
@@ -82,6 +101,82 @@ impl UtpHeader {
         buf[16..18].copy_from_slice(&self.seq_nr.to_be_bytes());
         buf[18..20].copy_from_slice(&self.ack_nr.to_be_bytes());
         buf
+    }
+}
+
+impl UtpPacket {
+    pub fn parse(buf: &[u8]) -> Result<Self, UtpError> {
+        let header = UtpHeader::parse(buf)?;
+        let mut offset = HEADER_SIZE;
+        let mut extension = header.extension;
+        let mut extensions = Vec::new();
+
+        while extension != 0 {
+            let remaining = buf.len().saturating_sub(offset);
+            if remaining < 2 {
+                return Err(UtpError::ExtensionHeaderTruncated {
+                    extension,
+                    remaining,
+                });
+            }
+            let next_extension = buf[offset];
+            let length = usize::from(buf[offset + 1]);
+            offset += 2;
+            let remaining = buf.len().saturating_sub(offset);
+            if remaining < length {
+                return Err(UtpError::ExtensionTruncated {
+                    extension,
+                    length,
+                    remaining,
+                });
+            }
+            extensions.push(UtpExtension {
+                kind: extension,
+                data: buf[offset..offset + length].to_vec(),
+            });
+            offset += length;
+            extension = next_extension;
+        }
+
+        Ok(Self {
+            header,
+            extensions,
+            payload: buf[offset..].to_vec(),
+        })
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, UtpError> {
+        let mut header = self.header.clone();
+        header.extension = self.extensions.first().map(|ext| ext.kind).unwrap_or(0);
+        for ext in &self.extensions {
+            if ext.data.len() > u8::MAX as usize {
+                return Err(UtpError::ExtensionTooLong {
+                    extension: ext.kind,
+                    length: ext.data.len(),
+                });
+            }
+        }
+
+        let extension_len = self
+            .extensions
+            .iter()
+            .map(|ext| 2 + ext.data.len())
+            .sum::<usize>();
+        let mut out = Vec::with_capacity(HEADER_SIZE + extension_len + self.payload.len());
+        out.extend_from_slice(&header.encode());
+
+        for (idx, ext) in self.extensions.iter().enumerate() {
+            let next = self
+                .extensions
+                .get(idx + 1)
+                .map(|ext| ext.kind)
+                .unwrap_or(0);
+            out.push(next);
+            out.push(ext.data.len() as u8);
+            out.extend_from_slice(&ext.data);
+        }
+        out.extend_from_slice(&self.payload);
+        Ok(out)
     }
 }
 
@@ -157,5 +252,94 @@ mod tests {
             let decoded = UtpHeader::parse(&h.encode()).unwrap();
             assert_eq!(decoded.packet_type, pt);
         }
+    }
+
+    #[test]
+    fn packet_without_extensions_roundtrips_payload() {
+        let packet = UtpPacket {
+            header: syn_header(),
+            extensions: Vec::new(),
+            payload: b"hello".to_vec(),
+        };
+
+        let decoded = UtpPacket::parse(&packet.encode().unwrap()).unwrap();
+        assert_eq!(decoded.header, packet.header);
+        assert!(decoded.extensions.is_empty());
+        assert_eq!(decoded.payload, b"hello");
+    }
+
+    #[test]
+    fn packet_extension_chain_roundtrips() {
+        let packet = UtpPacket {
+            header: syn_header(),
+            extensions: vec![
+                UtpExtension {
+                    kind: 1,
+                    data: vec![10, 11, 12],
+                },
+                UtpExtension {
+                    kind: 2,
+                    data: vec![20, 21],
+                },
+            ],
+            payload: b"payload".to_vec(),
+        };
+
+        let encoded = packet.encode().unwrap();
+        let decoded = UtpPacket::parse(&encoded).unwrap();
+        assert_eq!(decoded.header.extension, 1);
+        assert_eq!(decoded.extensions, packet.extensions);
+        assert_eq!(decoded.payload, b"payload");
+    }
+
+    #[test]
+    fn truncated_extension_header_errors() {
+        let mut bytes = syn_header().encode().to_vec();
+        bytes[1] = 1;
+        bytes.push(0);
+
+        assert!(matches!(
+            UtpPacket::parse(&bytes),
+            Err(UtpError::ExtensionHeaderTruncated {
+                extension: 1,
+                remaining: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn truncated_extension_payload_errors() {
+        let mut bytes = syn_header().encode().to_vec();
+        bytes[1] = 3;
+        bytes.extend_from_slice(&[0, 4, 1, 2]);
+
+        assert!(matches!(
+            UtpPacket::parse(&bytes),
+            Err(UtpError::ExtensionTruncated {
+                extension: 3,
+                length: 4,
+                remaining: 2
+            })
+        ));
+    }
+
+    #[test]
+    fn oversized_extension_encode_errors() {
+        let packet = UtpPacket {
+            header: syn_header(),
+            extensions: vec![UtpExtension {
+                kind: 1,
+                data: vec![0; 256],
+            }],
+            payload: Vec::new(),
+        };
+
+        assert!(matches!(
+            packet.encode(),
+            Err(UtpError::ExtensionTooLong {
+                extension: 1,
+                length: 256
+            })
+        ));
     }
 }
