@@ -60,6 +60,10 @@ pub struct TransmissionSessionSettings {
     pub peer_limit_per_torrent: i64,
     pub peer_port: i64,
     pub port_forwarding_enabled: bool,
+    pub rpc_authentication_required: bool,
+    pub rpc_whitelist_enabled: bool,
+    pub rpc_username: String,
+    pub rpc_bind_address: String,
     pub dht_enabled: bool,
     pub pex_enabled: bool,
     pub lpd_enabled: bool,
@@ -126,6 +130,10 @@ impl Default for TransmissionSessionSettings {
             peer_limit_per_torrent: 0,
             peer_port: 0,
             port_forwarding_enabled: false,
+            rpc_authentication_required: false,
+            rpc_whitelist_enabled: false,
+            rpc_username: String::new(),
+            rpc_bind_address: "0.0.0.0".to_owned(),
             dht_enabled: true,
             pex_enabled: true,
             lpd_enabled: false,
@@ -258,11 +266,16 @@ async fn transmission_rpc_payload(state: &AppState, body: Value) -> Value {
         "session-set" => session_set(&state, &args).await,
         "session-subscribe" => session_subscribe(&state, &args).await,
         "session-unsubscribe" => session_unsubscribe(&state, &args).await,
-        "session-access-control" => Ok(json!({
-            "blocklist-enabled": false,
-            "rpc-authentication-required": false,
-            "rpc-whitelist-enabled": false,
-        })),
+        "session-access-control" => {
+            let session = state.session.read().await;
+            Ok(json!({
+                "blocklist-enabled": session.blocklist_enabled,
+                "rpc-authentication-required": session.rpc_authentication_required,
+                "rpc-whitelist-enabled": session.rpc_whitelist_enabled,
+                "rpc-username": session.rpc_username,
+                "rpc-bind-address": session.rpc_bind_address,
+            }))
+        }
         "group-get" => group_get(&state, &args).await,
         "group-set" => group_set(&state, &args).await,
         "torrent-set" => torrent_set(&state, &args).await,
@@ -976,6 +989,10 @@ async fn session_get(state: &AppState, args: &Value) -> Value {
         "queue-stalled-minutes": session.queue_stalled_minutes,
         "peer-limit-global": session.peer_limit_global,
         "peer-limit-per-torrent": session.peer_limit_per_torrent,
+        "rpc-authentication-required": session.rpc_authentication_required,
+        "rpc-whitelist-enabled": session.rpc_whitelist_enabled,
+        "rpc-username": session.rpc_username,
+        "rpc-bind-address": session.rpc_bind_address,
         "script-torrent-added-enabled": session.script_torrent_added_enabled,
         "script-torrent-added-filename": session.script_torrent_added_filename,
         "script-torrent-done-enabled": session.script_torrent_done_enabled,
@@ -2111,6 +2128,18 @@ async fn session_set(state: &AppState, args: &Value) -> Result<Value, String> {
         "port-forwarding-enabled",
         &mut session.port_forwarding_enabled,
     );
+    set_bool_arg(
+        args,
+        "rpc-authentication-required",
+        &mut session.rpc_authentication_required,
+    );
+    set_bool_arg(
+        args,
+        "rpc-whitelist-enabled",
+        &mut session.rpc_whitelist_enabled,
+    );
+    set_string_value_arg(args, "rpc-username", &mut session.rpc_username);
+    set_string_value_arg(args, "rpc-bind-address", &mut session.rpc_bind_address);
     set_bool_arg(args, "dht-enabled", &mut session.dht_enabled);
     set_bool_arg(args, "pex-enabled", &mut session.pex_enabled);
     set_bool_arg(args, "lpd-enabled", &mut session.lpd_enabled);
@@ -2814,6 +2843,10 @@ mod tests {
                             "peer-limit-per-torrent":50,
                             "peer-port":51413,
                             "port-forwarding-enabled":true,
+                            "rpc-authentication-required":true,
+                            "rpc-whitelist-enabled":true,
+                            "rpc-username":"operator",
+                            "rpc-bind-address":"127.0.0.1",
                             "dht-enabled":false,
                             "pex-enabled":false,
                             "lpd-enabled":true,
@@ -2873,6 +2906,10 @@ mod tests {
         assert_eq!(args["peer-limit-per-torrent"], 50);
         assert_eq!(args["peer-port"], 51413);
         assert_eq!(args["port-forwarding-enabled"], true);
+        assert_eq!(args["rpc-authentication-required"], true);
+        assert_eq!(args["rpc-whitelist-enabled"], true);
+        assert_eq!(args["rpc-username"], "operator");
+        assert_eq!(args["rpc-bind-address"], "127.0.0.1");
         assert_eq!(args["dht-enabled"], false);
         assert_eq!(args["pex-enabled"], false);
         assert_eq!(args["lpd-enabled"], true);
@@ -2897,6 +2934,50 @@ mod tests {
         assert_eq!(args["seedRatioLimited"], true);
         assert_eq!(args["idle-seeding-limit"], 1440);
         assert_eq!(args["idle-seeding-limit-enabled"], true);
+    }
+
+    #[tokio::test]
+    async fn transmission_session_access_control_projects_session_security_state() {
+        let app =
+            build_transmission_router(AppState::new(Arc::new(RwLock::new(SessionRegistry::new()))));
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .header("content-type", "application/json")
+                    .header("x-transmission-session-id", SESSION_ID)
+                    .body(Body::from(
+                        r#"{"method":"session-set","arguments":{"blocklist-enabled":true,"rpc-authentication-required":true,"rpc-whitelist-enabled":true,"rpc-username":"operator","rpc-bind-address":"127.0.0.1"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .header("content-type", "application/json")
+                    .header("x-transmission-session-id", SESSION_ID)
+                    .body(Body::from(r#"{"method":"session-access-control"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        let args = &body["arguments"];
+        assert_eq!(args["blocklist-enabled"], true);
+        assert_eq!(args["rpc-authentication-required"], true);
+        assert_eq!(args["rpc-whitelist-enabled"], true);
+        assert_eq!(args["rpc-username"], "operator");
+        assert_eq!(args["rpc-bind-address"], "127.0.0.1");
     }
 
     #[tokio::test]

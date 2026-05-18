@@ -196,7 +196,7 @@ Transmission `session_get` field matrix:
 | Speed limits | normal and alt speed fields, scheduler day/begin/end/enabled | Native global limits plus compat scheduler fields |
 | Queue | download/seed queue, queue stalled settings | Compat; mutable settings roundtrip in facade state |
 | Peer/network | peer limits, peer port, port forwarding, DHT/PEX/LPD/uTP, preferred transports | Compat; mutable settings roundtrip in facade state |
-| RPC/security | auth, whitelist, bind address, anti brute force, username | Compat placeholder |
+| RPC/security | auth, whitelist, bind address, anti brute force, username | Compat state roundtrip for auth, whitelist, bind address, and username; anti brute force remains deployment/runtime policy |
 | Blocklist | enabled, size, URL | Compat; enabled/URL/size roundtrip plus update response projection |
 | Scripts | added/done/done-seeding script paths/enabled | Compat; mutable settings roundtrip in facade state |
 | Seeding | ratio and idle limits | Compat; mutable settings roundtrip in facade state |
