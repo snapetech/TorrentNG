@@ -215,6 +215,7 @@ async fn transmission_rpc_payload(state: &AppState, body: Value) -> Value {
         "session-stats" => Ok(session_stats(&state).await),
         "session-close" => Ok(json!({})),
         "session-set" => session_set(&state, &args).await,
+        "session-subscribe" | "session-unsubscribe" => Ok(json!({})),
         "session-access-control" => Ok(json!({
             "blocklist-enabled": false,
             "rpc-authentication-required": false,
@@ -2576,6 +2577,8 @@ mod tests {
             ("session-stats", r#"{}"#),
             ("session-close", r#"{}"#),
             ("session-set", r#"{"queue-stalled-enabled":true}"#),
+            ("session-subscribe", r#"{"fields":["torrent-added","torrent-removed"]}"#),
+            ("session-unsubscribe", r#"{"fields":["torrent-added"]}"#),
             ("session-access-control", r#"{}"#),
             ("group-get", r#"{}"#),
             ("group-set", r#"{"name":"default"}"#),

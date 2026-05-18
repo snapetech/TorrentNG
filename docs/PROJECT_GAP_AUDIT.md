@@ -164,9 +164,10 @@ Local deterministic API compatibility is passing:
 
 Remaining compatibility gaps:
 
-- Transmission: deeper 4.1 native parity beyond the compatibility envelope
-  remains P1, especially exact error codes, notifications, group internals, and
-  native-backed effects for script/blocklist/preferred transport settings.
+- Transmission: JSON-RPC 2.0 method errors, no-op notification subscription
+  probes, and broad mutable session settings are covered in the facade matrix;
+  true push notification delivery and group internals remain future live-client
+  parity work.
 - Deluge: extractor, scheduler, execute, blocklist, and autoadd plugin-specific
   APIs remain gaps unless a target migration/client requires them.
 - rTorrent: file/tracker/peer multicalls are stable compatibility shapes, but
