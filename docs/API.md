@@ -250,7 +250,7 @@ Pass `dry_run: true` to preview what would be affected without making changes.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET`  | `/health` | Health check. Sidecar mode returns generic backend reachability in `backend`, preserves legacy `rtorrent`, and includes cache count. |
+| `GET`  | `/health` | Health check. Sidecar mode returns generic backend reachability in `backend`, preserves legacy `rtorrent`, and includes cache count. Supported sidecar backends are rTorrent, qBittorrent, Transmission, and Deluge. |
 | `GET`  | `/metrics` | Prometheus text format metrics |
 | `GET`  | `/ws` | WebSocket — upgrade to receive live events |
 

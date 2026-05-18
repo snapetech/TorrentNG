@@ -126,7 +126,7 @@ impl TorrentBackend for TransmissionBackend {
                         "hashString", "name", "totalSize", "sizeWhenDone", "haveValid",
                         "rateDownload", "rateUpload", "uploadedEver", "downloadedEver",
                         "uploadRatio", "status", "downloadDir", "addedDate", "doneDate",
-                        "peersConnected", "errorString", "percentDone", "trackerStats", "group"
+                        "peersConnected", "errorString", "percentDone", "trackerStats", "labels", "group"
                     ]
                 }),
             )
@@ -140,7 +140,13 @@ impl TorrentBackend for TransmissionBackend {
             .collect())
     }
 
-    async fn add_magnet(&self, magnet: &str, save_path: &str, category: &str, start: bool) -> Result<()> {
+    async fn add_magnet(
+        &self,
+        magnet: &str,
+        save_path: &str,
+        category: &str,
+        start: bool,
+    ) -> Result<()> {
         self.rpc(
             "torrent-add",
             json!({
@@ -154,7 +160,13 @@ impl TorrentBackend for TransmissionBackend {
         Ok(())
     }
 
-    async fn add_torrent(&self, data: &[u8], save_path: &str, category: &str, start: bool) -> Result<()> {
+    async fn add_torrent(
+        &self,
+        data: &[u8],
+        save_path: &str,
+        category: &str,
+        start: bool,
+    ) -> Result<()> {
         self.rpc(
             "torrent-add",
             json!({
@@ -197,7 +209,8 @@ impl TorrentBackend for TransmissionBackend {
     }
 
     async fn reannounce(&self, hash: &str) -> Result<()> {
-        self.rpc("torrent-reannounce", json!({ "ids": [hash] })).await?;
+        self.rpc("torrent-reannounce", json!({ "ids": [hash] }))
+            .await?;
         Ok(())
     }
 
@@ -333,14 +346,18 @@ fn map_torrent(t: &Value) -> RawTorrent {
         is_active: status != 0,
         is_open: status != 0,
         complete,
-        state: if string(t, "errorString").is_empty() { 1 } else { 3 },
+        state: if string(t, "errorString").is_empty() {
+            1
+        } else {
+            3
+        },
         priority: 0,
         category: t
             .get("labels")
-            .or_else(|| t.get("group"))
             .and_then(Value::as_array)
             .and_then(|items| items.first())
             .and_then(Value::as_str)
+            .or_else(|| t.get("group").and_then(Value::as_str))
             .unwrap_or("")
             .to_owned(),
         base_path: string(t, "downloadDir"),

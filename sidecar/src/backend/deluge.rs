@@ -141,7 +141,13 @@ impl TorrentBackend for DelugeBackend {
             .collect())
     }
 
-    async fn add_magnet(&self, magnet: &str, save_path: &str, _category: &str, start: bool) -> Result<()> {
+    async fn add_magnet(
+        &self,
+        magnet: &str,
+        save_path: &str,
+        _category: &str,
+        start: bool,
+    ) -> Result<()> {
         self.rpc(
             "core.add_torrent_magnet",
             json!([magnet, { "download_location": save_path, "add_paused": !start }]),
@@ -150,7 +156,13 @@ impl TorrentBackend for DelugeBackend {
         Ok(())
     }
 
-    async fn add_torrent(&self, data: &[u8], save_path: &str, _category: &str, start: bool) -> Result<()> {
+    async fn add_torrent(
+        &self,
+        data: &[u8],
+        save_path: &str,
+        _category: &str,
+        start: bool,
+    ) -> Result<()> {
         self.rpc(
             "core.add_torrent_file",
             json!([
@@ -164,7 +176,8 @@ impl TorrentBackend for DelugeBackend {
     }
 
     async fn remove(&self, hash: &str, delete_data: bool) -> Result<()> {
-        self.rpc("core.remove_torrent", json!([hash, delete_data])).await?;
+        self.rpc("core.remove_torrent", json!([hash, delete_data]))
+            .await?;
         Ok(())
     }
 
@@ -190,7 +203,10 @@ impl TorrentBackend for DelugeBackend {
 
     async fn list_trackers(&self, hash: &str) -> Result<Vec<RawTracker>> {
         let torrent = self
-            .rpc("core.get_torrent_status", json!([hash, ["trackers", "tracker_status"]]))
+            .rpc(
+                "core.get_torrent_status",
+                json!([hash, ["trackers", "tracker_status"]]),
+            )
             .await?;
         Ok(torrent
             .get("trackers")
@@ -248,7 +264,10 @@ impl TorrentBackend for DelugeBackend {
 
     async fn list_files(&self, hash: &str) -> Result<Vec<RawFile>> {
         let torrent = self
-            .rpc("core.get_torrent_status", json!([hash, ["files", "file_priorities"]]))
+            .rpc(
+                "core.get_torrent_status",
+                json!([hash, ["files", "file_priorities"]]),
+            )
             .await?;
         let priorities = torrent
             .get("file_priorities")
@@ -279,7 +298,11 @@ impl TorrentBackend for DelugeBackend {
 
     async fn set_file_priority(&self, hash: &str, file_index: usize, priority: i64) -> Result<()> {
         let mut files = self.list_files(hash).await?;
-        let max_index = files.iter().map(|file| file.index).max().unwrap_or(file_index);
+        let max_index = files
+            .iter()
+            .map(|file| file.index)
+            .max()
+            .unwrap_or(file_index);
         let mut priorities = vec![1_i64; max_index + 1];
         for file in files.drain(..) {
             priorities[file.index] = file.priority;
@@ -287,8 +310,11 @@ impl TorrentBackend for DelugeBackend {
         if file_index < priorities.len() {
             priorities[file_index] = priority;
         }
-        self.rpc("core.set_torrent_file_priorities", json!([hash, priorities]))
-            .await?;
+        self.rpc(
+            "core.set_torrent_file_priorities",
+            json!([hash, priorities]),
+        )
+        .await?;
         Ok(())
     }
 
@@ -383,6 +409,11 @@ fn int(value: &Value, key: &str) -> i64 {
     value
         .get(key)
         .and_then(Value::as_i64)
-        .or_else(|| value.get(key).and_then(Value::as_f64).map(|value| value as i64))
+        .or_else(|| {
+            value
+                .get(key)
+                .and_then(Value::as_f64)
+                .map(|value| value as i64)
+        })
         .unwrap_or(0)
 }

@@ -7,10 +7,10 @@ use crate::rtorrent::torrents::{LiveSummary, RawTorrent};
 use crate::rtorrent::trackers::RawTracker;
 use crate::rtorrent::TransferRates;
 
+pub mod deluge;
 pub mod qbittorrent;
 pub mod rtorrent;
 pub mod transmission;
-pub mod deluge;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]

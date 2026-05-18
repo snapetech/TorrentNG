@@ -214,7 +214,7 @@ Environment variables override file values where listed.
 
 | Key | Default | Env override | Description |
 |---|---|---|---|
-| `type` | `rtorrent` | `TNG_BACKEND` | Backend adapter: `rtorrent` or `qbittorrent`. `transmission`, `deluge`, and `torrentng` are reserved and rejected until their adapters land. |
+| `type` | `rtorrent` | `TNG_BACKEND` | Backend adapter: `rtorrent`, `qbittorrent`, `transmission`, or `deluge`. `torrentng` is reserved for the native daemon API. |
 
 ```toml
 [backend]
@@ -257,6 +257,46 @@ url = "http://127.0.0.1:8080"
 username = "admin"
 password = "adminadmin"
 timeout_secs = 10
+```
+
+### Sidecar `[transmission]`
+
+The Transmission backend talks to an external Transmission RPC endpoint. Categories are mapped to Transmission labels where available; tags and runtime user-agent changes are unsupported.
+
+| Key | Default | Env override | Description |
+|---|---|---|---|
+| `url` | `http://127.0.0.1:9091/transmission/rpc` | `TNG_TRANSMISSION_URL` | Transmission RPC URL |
+| `username` | - | `TNG_TRANSMISSION_USERNAME` | Optional RPC username |
+| `password` | - | `TNG_TRANSMISSION_PASSWORD` | Optional RPC password |
+| `timeout_secs` | `10` | - | Timeout for Transmission RPC requests |
+| `accept_invalid_certs` | `false` | - | Accept invalid TLS certificates for lab deployments |
+
+```toml
+[backend]
+type = "transmission"
+
+[transmission]
+url = "http://127.0.0.1:9091/transmission/rpc"
+```
+
+### Sidecar `[deluge]`
+
+The Deluge backend talks to the Deluge Web JSON-RPC endpoint. File priority, tracker replacement, pause/resume, remove, add, and recheck are mapped to Deluge core methods; categories/tags and runtime user-agent changes are unsupported.
+
+| Key | Default | Env override | Description |
+|---|---|---|---|
+| `url` | `http://127.0.0.1:8112/json` | `TNG_DELUGE_URL` | Deluge Web JSON-RPC URL |
+| `password` | - | `TNG_DELUGE_PASSWORD` | Optional Deluge Web password |
+| `timeout_secs` | `10` | - | Timeout for Deluge JSON-RPC requests |
+| `accept_invalid_certs` | `false` | - | Accept invalid TLS certificates for lab deployments |
+
+```toml
+[backend]
+type = "deluge"
+
+[deluge]
+url = "http://127.0.0.1:8112/json"
+password = "deluge"
 ```
 
 ### Sidecar `[rtorrent.logs]`
@@ -355,9 +395,11 @@ The Docker compose stack also includes a qBittorrent profile:
 
 ```sh
 docker compose -f deploy/docker/compose.yml --profile qbittorrent up torrentng-qbittorrent qbittorrent
+docker compose -f deploy/docker/compose.yml --profile transmission up torrentng-transmission transmission
+docker compose -f deploy/docker/compose.yml --profile deluge up torrentng-deluge deluge
 ```
 
-That starts TorrentNG on host port `8082` in front of qBittorrent-nox, whose native WebUI is exposed on host port `8081`.
+Those profiles expose TorrentNG on host ports `8082`, `8083`, and `8084` respectively. Native client WebUIs remain exposed on their usual profile ports for troubleshooting.
 
 ### Sidecar full example
 
