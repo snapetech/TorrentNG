@@ -1,6 +1,6 @@
 use axum::{
     extract::{Form, Multipart, Query, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{AppendHeaders, IntoResponse},
     routing::{get, post},
     Json, Router,
@@ -53,6 +53,7 @@ pub fn build_router(_state: AppState) -> Router<AppState> {
         .route("/torrents/recheck", post(torrents_recheck))
         .route("/torrents/reannounce", post(torrents_reannounce))
         .route("/torrents/trackers", get(torrents_trackers))
+        .route("/torrents/export", get(torrents_export))
         .route("/torrents/webseeds", get(torrents_webseeds))
         .route("/torrents/files", get(torrents_files))
         .route("/torrents/pieceStates", get(torrents_piece_states))
@@ -1417,6 +1418,36 @@ async fn torrents_trackers(
                 "qBit tracker listing failed"
             );
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn torrents_export(State(s): State<AppState>, Query(q): Query<HashQuery>) -> impl IntoResponse {
+    let Some(hash) = q.hash else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if !matches!(s.db.get(&hash), Ok(Some(_))) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match s.backend.torrent_blob(&hash).await {
+        Ok(raw) => {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/x-bittorrent"),
+            );
+            (StatusCode::OK, headers, raw).into_response()
+        }
+        Err(e) => {
+            tracing::warn!(
+                component = "qbcompat",
+                operation = "torrent_export",
+                torrent = %hash,
+                result = "error",
+                error = %e,
+                "qBit torrent export failed"
+            );
+            StatusCode::NOT_FOUND.into_response()
         }
     }
 }

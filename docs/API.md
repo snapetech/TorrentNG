@@ -312,10 +312,12 @@ Implements the qBittorrent Web API v2. By default it advertises qBittorrent `5.0
 | `POST` | `/api/qb/v2/torrents/recheck` | Form: `hashes` |
 | `POST` | `/api/qb/v2/torrents/reannounce` | Form: `hashes` |
 | `GET`  | `/api/qb/v2/torrents/trackers` | Query: `hash` |
+| `GET`  | `/api/qb/v2/torrents/export` | Query: `hash`; streams the persisted `.torrent` blob where supported |
 | `GET`  | `/api/qb/v2/torrents/webseeds` | Query: `hash`; backend-backed where supported, otherwise `[]` |
 | `GET`  | `/api/qb/v2/torrents/files` | Query: `hash` |
 | `GET`  | `/api/qb/v2/torrents/pieceStates` | Query: `hash`; backend-backed where supported, otherwise `[]` |
 | `GET`  | `/api/qb/v2/torrents/pieceHashes` | Query: `hash`; backend-backed where supported, otherwise `[]` |
+| `GET`  | `/api/qb/v2/torrents/export` | Query: `hash`; streams `application/x-bittorrent` where the backend has the original torrent blob |
 | `POST` | `/api/qb/v2/torrents/filePrio` | Form: `hash`, `id` (pipe-separated indices), `priority` |
 | `POST` | `/api/qb/v2/torrents/setCategory` | Form: `hashes`, `category` |
 | `POST` | `/api/qb/v2/torrents/addTags` | Form: `hashes`, `tags` (comma-separated) |
@@ -331,15 +333,15 @@ Implements the qBittorrent Web API v2. By default it advertises qBittorrent `5.0
 | `POST` | `/api/qb/v2/torrents/rename` | Form: `hash`, `name` |
 | `POST` | `/api/qb/v2/torrents/renameFile` | Form: `hash`, `id`, `name` |
 | `POST` | `/api/qb/v2/torrents/renameFolder` | Form: `hash`, `id`, `name` |
-| `GET`  | `/api/qb/v2/torrents/downloadLimit` | Returns `{}` |
-| `POST` | `/api/qb/v2/torrents/setDownloadLimit` | Accepted |
-| `GET`  | `/api/qb/v2/torrents/uploadLimit` | Returns `{}` |
-| `POST` | `/api/qb/v2/torrents/setUploadLimit` | Accepted |
+| `GET`  | `/api/qb/v2/torrents/downloadLimit` | Query: `hashes`; returns `{ "hash": limit }` where supported |
+| `POST` | `/api/qb/v2/torrents/setDownloadLimit` | Form: `hashes`, `limit`; backend-backed where supported |
+| `GET`  | `/api/qb/v2/torrents/uploadLimit` | Query: `hashes`; returns `{ "hash": limit }` where supported |
+| `POST` | `/api/qb/v2/torrents/setUploadLimit` | Form: `hashes`, `limit`; backend-backed where supported |
 | `POST` | `/api/qb/v2/torrents/setShareLimits` | Form: `hashes`, `ratioLimit`, `seedingTimeLimit` |
 | `POST` | `/api/qb/v2/torrents/setLocation` | Form: `hashes`, `location` |
 | `POST` | `/api/qb/v2/torrents/setSavePath` | Form: `hashes`, `location` |
 | `POST` | `/api/qb/v2/torrents/addTrackers` | Form: `hashes`, `urls` (newline-separated) |
-| `POST` | `/api/qb/v2/torrents/setAutoTMM` | Accepted as a compatibility no-op |
+| `POST` | `/api/qb/v2/torrents/setAutoTMM` | Backend-backed where supported |
 | `POST` | `/api/qb/v2/torrents/editTracker` | Form: `hash`, `origUrl`, `newUrl` |
 | `POST` | `/api/qb/v2/torrents/removeTrackers` | Form: `hash`, `urls` (pipe-separated) |
 | `POST` | `/api/qb/v2/torrents/toggleSequentialDownload` | Form: `hashes` |
@@ -348,9 +350,9 @@ Implements the qBittorrent Web API v2. By default it advertises qBittorrent `5.0
 | `POST` | `/api/qb/v2/torrents/decreasePrio` | Engine-backed where supported |
 | `POST` | `/api/qb/v2/torrents/topPrio` | Engine-backed where supported |
 | `POST` | `/api/qb/v2/torrents/bottomPrio` | Engine-backed where supported |
-| `POST` | `/api/qb/v2/torrents/setAutoManagement` | Accepted |
-| `POST` | `/api/qb/v2/torrents/setForceStart` | Accepted |
-| `POST` | `/api/qb/v2/torrents/setSuperSeeding` | Accepted |
+| `POST` | `/api/qb/v2/torrents/setAutoManagement` | Backend-backed where supported |
+| `POST` | `/api/qb/v2/torrents/setForceStart` | Backend-backed where supported |
+| `POST` | `/api/qb/v2/torrents/setSuperSeeding` | Backend-backed where supported |
 | `POST` | `/api/qb/v2/torrents/toggleFirstLastPiecePrio` | Accepted |
 
 ### Sync / Transfer

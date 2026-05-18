@@ -161,6 +161,26 @@ impl TorrentBackend for TorrentngBackend {
         Ok(())
     }
 
+    async fn torrent_blob(&self, hash: &str) -> Result<Vec<u8>> {
+        Ok(self
+            .request(
+                reqwest::Method::GET,
+                &format!(
+                    "api/qb/v2/torrents/export?hash={}",
+                    urlencoding::encode(hash)
+                ),
+            )?
+            .send()
+            .await
+            .with_context(|| format!("TorrentNG GET torrent export {hash}"))?
+            .error_for_status()
+            .with_context(|| format!("TorrentNG GET torrent export {hash}"))?
+            .bytes()
+            .await
+            .with_context(|| format!("read TorrentNG torrent export {hash}"))?
+            .to_vec())
+    }
+
     async fn remove(&self, hash: &str, delete_data: bool) -> Result<()> {
         let path = if delete_data {
             format!("api/v1/torrents/{hash}?delete_files=true")

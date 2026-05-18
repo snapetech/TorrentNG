@@ -79,6 +79,10 @@ impl TorrentBackend for RtorrentBackend {
             .await
     }
 
+    async fn torrent_blob(&self, hash: &str) -> Result<Vec<u8>> {
+        Ok(crate::torrent_meta::session_torrent_blob(hash)?)
+    }
+
     async fn remove(&self, hash: &str, delete_data: bool) -> Result<()> {
         self.client.remove(hash, delete_data).await
     }

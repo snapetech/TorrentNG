@@ -21,15 +21,22 @@ pub fn session_tracker_url(hash: &str, cache: &mut HashMap<String, Option<String
 }
 
 pub fn session_tracker_urls(hash: &str) -> Vec<String> {
-    let normalized = hash.trim().to_ascii_uppercase();
-    if normalized.is_empty() {
-        return Vec::new();
-    }
-    let path = session_dir().join(format!("{normalized}.torrent"));
-    std::fs::read(path)
+    session_torrent_blob(hash)
         .ok()
         .map(|raw| tracker_urls_from_torrent(&raw))
         .unwrap_or_default()
+}
+
+pub fn session_torrent_blob(hash: &str) -> std::io::Result<Vec<u8>> {
+    let normalized = hash.trim().to_ascii_uppercase();
+    if normalized.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "empty torrent hash",
+        ));
+    }
+    let path = session_dir().join(format!("{normalized}.torrent"));
+    std::fs::read(path)
 }
 
 fn session_dir() -> PathBuf {

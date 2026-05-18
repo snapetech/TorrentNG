@@ -100,6 +100,12 @@ pub trait TorrentBackend: Send + Sync {
         category: &str,
         start: bool,
     ) -> Result<()>;
+    async fn torrent_blob(&self, _hash: &str) -> Result<Vec<u8>> {
+        bail!(
+            "{} backend does not support torrent export",
+            self.backend_type().as_str()
+        )
+    }
     async fn add_url(&self, url: &str, save_path: &str, category: &str, start: bool) -> Result<()> {
         if url.starts_with("magnet:") {
             return self.add_magnet(url, save_path, category, start).await;

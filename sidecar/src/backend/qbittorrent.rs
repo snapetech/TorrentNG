@@ -249,6 +249,25 @@ impl TorrentBackend for QbittorrentBackend {
         Ok(())
     }
 
+    async fn torrent_blob(&self, hash: &str) -> Result<Vec<u8>> {
+        self.ensure_login().await?;
+        Ok(self
+            .client
+            .get(self.url(&format!(
+                "api/v2/torrents/export?hash={}",
+                urlencoding::encode(hash)
+            ))?)
+            .send()
+            .await
+            .context("qBittorrent GET api/v2/torrents/export")?
+            .error_for_status()
+            .context("qBittorrent GET api/v2/torrents/export")?
+            .bytes()
+            .await
+            .context("read qBittorrent torrent export body")?
+            .to_vec())
+    }
+
     async fn add_url(&self, url: &str, save_path: &str, category: &str, start: bool) -> Result<()> {
         self.add_magnet(url, save_path, category, start).await
     }

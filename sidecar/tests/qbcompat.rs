@@ -2408,6 +2408,33 @@ async fn qb_inert_surfaces_are_compatible() {
 }
 
 #[tokio::test]
+async fn qb_torrent_export_streams_rtorrent_session_blob() {
+    let session = tempfile::tempdir().unwrap();
+    std::env::set_var("TNG_SESSION_DIR", session.path());
+    let (addr, client, db) = spawn_server_with_db().await;
+    seed_torrent(&db, "ABCDEF", "Exported");
+    let raw = b"d4:infod4:name8:exportedee".to_vec();
+    std::fs::write(session.path().join("ABCDEF.torrent"), &raw).unwrap();
+
+    let res = client
+        .get(url(addr, "/api/qb/v2/torrents/export?hash=ABCDEF"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(
+        res.headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "application/x-bittorrent"
+    );
+    assert_eq!(res.bytes().await.unwrap().as_ref(), raw.as_slice());
+    std::env::remove_var("TNG_SESSION_DIR");
+}
+
+#[tokio::test]
 async fn qb_search_plugins_jobs_and_rss_items_are_stateful() {
     let (addr, client) = spawn_server().await;
 
