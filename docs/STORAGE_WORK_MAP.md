@@ -11,7 +11,7 @@ release claims.
 | --- | --- | --- | --- |
 | Torrent payload I/O | `rt-storage::MountScheduler` | Download writes, seed reads, recheck reads, v2 file verification, fastresume syncs | This is the production torrent hot path. It owns per-class semaphores, its own file pool, a scheduler-owned `DiskBackend`, hashing pool, peer-read cache, and HDD peer-read elevator. |
 | Global storage runtime | `rt-storage::StorageRuntime` | Backend capability metrics, frame-pool metrics, direct backend tests and real-device backend probes | This path owns the process-level `FramePool` and `HandleCache` API. It uses the same `DiskBackend` implementations and global frame pool as `MountScheduler`. |
-| Move/import/delete executor | `rt-storage::plan` | Planned library movement and deletion helpers | Covered by unit tests and an optional real-root certification script. It is separate from per-block torrent I/O. |
+| Move/import/delete executor | `rt-storage::plan` | Implemented root-confined movement, import, delete, checkpoint, and resume helpers | Covered by unit tests and an optional real-root certification script. It is separate from per-block torrent I/O. |
 
 ## Implemented In The Torrent Hot Path
 
