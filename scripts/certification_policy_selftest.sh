@@ -149,6 +149,17 @@ grep -q "report_dir=$report_dir" "$report_dir/release-evidence-suite-env-selftes
 grep -q "benchmark_dir=$benchmark_dir" "$report_dir/release-evidence-suite-env-selftest.md"
 grep -q 'Overall status: PASS' "$report_dir/release-evidence-suite-env-selftest.md"
 
+REPORT_DIR="$report_dir" TNG_UNIVERSAL_COMPAT_SELFTEST=1 \
+  "$ROOT/scripts/universal_compatibility_certification.sh" "$report_dir/universal-compat-env-selftest.md" >/dev/null
+grep -q "Report directory: $report_dir" "$report_dir/universal-compat-env-selftest.md"
+grep -q "$report_dir/api-facades-universal-" "$report_dir/universal-compat-env-selftest.md"
+grep -q "$report_dir/migration-corpus-universal-" "$report_dir/universal-compat-env-selftest.md"
+grep -q "report_dir=$report_dir" "$report_dir/universal-compat-env-selftest.md"
+if grep -q "$ROOT/certification/reports" "$report_dir/universal-compat-env-selftest.md"; then
+  echo "universal compatibility selftest leaked default report directory" >&2
+  exit 1
+fi
+
 write_report "$report_dir/universal-compat-selftest.md" PASS_WITH_SKIPS
 write_report "$report_dir/universal-live-selftest.md" PASS_WITH_SKIPS
 REPORT_DIR="$report_dir" BENCHMARK_DIR="$benchmark_dir" \
