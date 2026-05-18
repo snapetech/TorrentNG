@@ -14,6 +14,7 @@ pub type JsonMap = serde_json::Map<String, serde_json::Value>;
 pub struct AppState {
     pub registry: Arc<RwLock<SessionRegistry>>,
     pub engine: Option<EngineHandle>,
+    pub api_tokens: Arc<Vec<String>>,
     pub categories: Arc<RwLock<BTreeMap<String, String>>>,
     pub tags: Arc<RwLock<BTreeSet<String>>>,
     pub tracker_projection_cache: Arc<RwLock<HashMap<String, (String, u32)>>>,
@@ -34,6 +35,7 @@ impl AppState {
         AppState {
             registry: Arc::new(RwLock::new(SessionRegistry::new())),
             engine: None,
+            api_tokens: Arc::new(Vec::new()),
             categories: Arc::new(RwLock::new(BTreeMap::new())),
             tags: Arc::new(RwLock::new(BTreeSet::new())),
             tracker_projection_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -54,6 +56,7 @@ impl AppState {
         AppState {
             registry,
             engine: None,
+            api_tokens: Arc::new(Vec::new()),
             categories: Arc::new(RwLock::new(BTreeMap::new())),
             tags: Arc::new(RwLock::new(BTreeSet::new())),
             tracker_projection_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -71,9 +74,18 @@ impl AppState {
     }
 
     pub fn with_engine(registry: Arc<RwLock<SessionRegistry>>, engine: EngineHandle) -> Self {
+        Self::with_engine_and_tokens(registry, engine, Vec::new())
+    }
+
+    pub fn with_engine_and_tokens(
+        registry: Arc<RwLock<SessionRegistry>>,
+        engine: EngineHandle,
+        api_tokens: Vec<String>,
+    ) -> Self {
         AppState {
             registry,
             engine: Some(engine),
+            api_tokens: Arc::new(api_tokens),
             categories: Arc::new(RwLock::new(BTreeMap::new())),
             tags: Arc::new(RwLock::new(BTreeSet::new())),
             tracker_projection_cache: Arc::new(RwLock::new(HashMap::new())),
