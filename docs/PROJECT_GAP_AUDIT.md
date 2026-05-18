@@ -203,8 +203,10 @@ Remaining compatibility gaps:
   tracker snapshots when the engine is attached. Remaining depth is live-client
   presentation parity for client-specific edge cases.
 - DHT-only magnets: DHT `get_peers` forwarding and trackerless BEP 9 metadata
-  completion from discovered peers are unit-covered in `rt-engine`; the
-  remaining row is Docker-level trackerless transfer certification.
+  completion from discovered peers are unit-covered in `rt-engine`; the Docker
+  matrix now also includes `rust-trackerless-magnet` for trackerless metadata
+  and payload transfer through an explicit peer bridge. Public DHT-only swarm
+  discovery remains external release evidence.
 - uTP: `rt-utp` provides the packet/state/UDP stream layer, and the native
   engine has policy-gated outbound peer-wire, boolean-gated incoming peer-wire,
   and metadata-fetch paths. `/health` reports the active `utp_transport_paths`

@@ -597,9 +597,14 @@ pub async fn transfer_limits(State(state): State<AppState>) -> impl IntoResponse
 
 /// `GET /api/v1/transfer/info` — qBit-compatible aggregate transfer counters.
 pub async fn transfer_info(State(state): State<AppState>) -> impl IntoResponse {
+    let hashes = {
+        let reg = state.registry.read().await;
+        reg.iter()
+            .map(|entry| entry.info_hash.clone())
+            .collect::<Vec<_>>()
+    };
+    let (dl_info_speed, up_info_speed) = native_session_peer_rates(&state, &hashes).await;
     let reg = state.registry.read().await;
-    let dl_info_speed = 0i64;
-    let up_info_speed = 0i64;
     let mut dl_info_data = 0i64;
     let mut up_info_data = 0i64;
     for entry in reg.iter() {
@@ -643,6 +648,23 @@ pub async fn transfer_info(State(state): State<AppState>) -> impl IntoResponse {
         },
     })
     .into_response()
+}
+
+async fn native_session_peer_rates(state: &AppState, hashes: &[String]) -> (i64, i64) {
+    let Some(engine) = &state.engine else {
+        return (0, 0);
+    };
+    let mut download_rate = 0i64;
+    let mut upload_rate = 0i64;
+    for hash in hashes {
+        if let Ok(peers) = engine.torrent_peers(hash.clone()).await {
+            for peer in peers {
+                download_rate = download_rate.saturating_add(peer.download_rate);
+                upload_rate = upload_rate.saturating_add(peer.upload_rate);
+            }
+        }
+    }
+    (download_rate, upload_rate)
 }
 
 /// `PUT /api/v1/transfer/limits` — merge global transfer limits.
@@ -5892,6 +5914,7 @@ mod tests {
                 "/api/v1/transfer/limits".to_owned(),
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
+            ("GET", "/api/v1/transfer/info".to_owned(), StatusCode::OK),
             (
                 "GET",
                 "/api/v1/session/features".to_owned(),
@@ -6145,6 +6168,72 @@ mod tests {
             registry.read().await.get(&hash).unwrap().tags,
             vec!["keep".to_owned(), "new".to_owned()]
         );
+    }
+
+    #[tokio::test]
+    async fn tag_post_delete_and_bulk_set_are_native() {
+        let state = AppState::new();
+        let hash = "e".repeat(40);
+        {
+            let mut reg = state.registry.write().await;
+            let mut entry = TorrentEntry::new(hash.clone(), "tags.torrent".into(), "/data".into());
+            entry.tags = vec!["old".to_owned()];
+            reg.add(entry).unwrap();
+        }
+        let registry = state.registry.clone();
+        let app = build_router(state);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/torrents/{hash}/tags"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"tags":["new"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            registry.read().await.get(&hash).unwrap().tags,
+            vec!["old".to_owned(), "new".to_owned()]
+        );
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/bulk/set-tags")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"hashes":["{hash}"],"tags":["final"],"dry_run":false}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            registry.read().await.get(&hash).unwrap().tags,
+            vec!["final".to_owned()]
+        );
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/v1/torrents/{hash}/tags"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"tags":["final"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(registry.read().await.get(&hash).unwrap().tags.is_empty());
     }
 
     #[tokio::test]
