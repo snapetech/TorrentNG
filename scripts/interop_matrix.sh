@@ -1060,6 +1060,34 @@ run_missing_file_recovery_case() {
   [[ "$status" == "PASS" ]]
 }
 
+run_rust_seeds_to_all_reference_clients_case() {
+  local status="PASS" fixture torrent info_hash client
+  local leechers=(qbittorrent transmission deluge rtorrent)
+  append_report "## Protocol Local: rust-seeds-to-all-reference-clients"
+  append_report ""
+  log "running protocol local case rust-seeds-to-all-reference-clients"
+  fixture="$(case_fixture single-16m rust-seeds-to-all-reference-clients)"
+  torrent="$(make_torrent "$fixture" "$fixture" tracker-webseed)"
+  info_hash="$(torrent_info_hash "$torrent")"
+  seed_fixture_for_client torrentngd "$fixture"
+  add_to_client torrentngd "$torrent" seed || status="FAIL"
+  for client in "${leechers[@]}"; do
+    add_to_client "$client" "$torrent" || status="FAIL"
+  done
+  wait_clients_complete "$TIMEOUT_LOCAL" "$fixture" "${leechers[@]}" || status="FAIL"
+  verify_fixture_hashes torrentngd "$fixture" || status="FAIL"
+  for client in "${leechers[@]}"; do
+    verify_fixture_hashes "$client" "$fixture" || status="FAIL"
+  done
+  append_report "- Seeder: torrentngd"
+  append_report "- Leechers: ${leechers[*]}"
+  append_report "- Fixture: single-16m"
+  append_report "- Info hash: $info_hash"
+  append_report "- Status: **$status**"
+  append_report ""
+  [[ "$status" == "PASS" ]]
+}
+
 run_partial_file_selection_case() {
   local status="PASS" fixture torrent info_hash files
   append_report "## Protocol Local: rust-partial-file-selection"
@@ -1163,6 +1191,9 @@ run_protocol_local_matrix() {
   fi
   if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "missing-file-recovery" ]]; then
     run_missing_file_recovery_case || failures=$((failures + 1))
+  fi
+  if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "rust-seeds-to-all-reference-clients" ]]; then
+    run_rust_seeds_to_all_reference_clients_case || failures=$((failures + 1))
   fi
   if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "rust-partial-file-selection" ]]; then
     run_partial_file_selection_case || failures=$((failures + 1))

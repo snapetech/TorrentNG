@@ -240,7 +240,7 @@ engine does not expose yet.
 | P1 | `qbit_arr_client_matrix` | Sonarr/Radarr/Prowlarr/cross-seed/autobrr/NZB360-style qBit flows |
 | P1 | `transmission_client_matrix` | transmission-web, transmission-remote, mobile app field projections |
 | P1 | `deluge_client_matrix` | Deluge WebUI update_ui, thin-client core calls, Label plugin calls |
-| P1 | `interop_transfer_matrix` | qBit/Transmission/Deluge/rTorrent seed and leech with TorrentNG both directions |
+| P1 | `interop_transfer_matrix` | qBit/Transmission/Deluge/rTorrent seed and leech with TorrentNG both directions; the Docker protocol row `rust-seeds-to-all-reference-clients` covers TorrentNG as the sole seeder for all reference clients in one swarm |
 | P1 | `tracker_peer_matrix` | HTTP tracker, UDP tracker, private torrent, explicit peer, tracker outage |
 | P1 | `storage_resume_matrix` | stop mid-transfer/restart/resume, corrupt block recheck repair, and missing file recovery are covered by Docker protocol rows `resume-after-partial-download`, `force-recheck-corruption-repair`, and `missing-file-recovery`; local storage topology coverage is included in `scripts/universal_compatibility_certification.sh` |
 | P2 | `plugin_aux_matrix` | Migration artifact preservation implemented for RSS/search/scheduler/autoadd/blocklist/execute/plugin/config files; facade API shapes remain targeted work |
