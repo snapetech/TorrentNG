@@ -179,8 +179,8 @@ Remaining compatibility gaps:
 - rTorrent: file/tracker/peer multicalls now project native metadata, persisted
   tracker state, and peer snapshots when an engine is attached, with registry
   fallback file rows for in-memory compatibility probes. Global throttle reads
-  use native limits where available; advanced custom views remain compatibility
-  placeholders.
+  use native limits where available, and common view sizes are registry-backed;
+  arbitrary custom views remain compatibility placeholders.
 - qBittorrent: common automation flows are covered, and `torrents/info`,
   `sync/maindata`, and `transfer/info` now project native peer snapshots into
   live seed/leecher counters and aggregate rates. `torrents/trackers` projects

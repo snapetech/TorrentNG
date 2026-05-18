@@ -146,8 +146,13 @@ pub async fn execute(
         "network.port_random" => Ok(RtValue::Bool(false)),
         "throttle.global_down.max_rate" => Ok(RtValue::Int(global_down_limit(state).await)),
         "throttle.global_up.max_rate" => Ok(RtValue::Int(global_up_limit(state).await)),
-        "view.list" => Ok(RtValue::Array(vec![RtValue::String("main".to_owned())])),
-        "view.size" => Ok(RtValue::Int(state.registry.read().await.len() as i64)),
+        "view.list" => Ok(RtValue::Array(
+            rtorrent_views()
+                .iter()
+                .map(|view| RtValue::String((*view).to_owned()))
+                .collect(),
+        )),
+        "view.size" => Ok(RtValue::Int(view_size(state, params).await)),
         "d.multicall" | "d.multicall2" => d_multicall(state, params).await,
         "load.normal" | "load.start" | "load.raw" | "load.raw_start" => {
             load(state, method, params).await
@@ -400,6 +405,33 @@ async fn global_up_limit(state: &AppState) -> i64 {
         .await
         .map(|limits| limits.upload_limit)
         .unwrap_or(0)
+}
+
+fn rtorrent_views() -> &'static [&'static str] {
+    &["main", "started", "stopped", "complete", "incomplete"]
+}
+
+async fn view_size(state: &AppState, params: &[RtValue]) -> i64 {
+    let view = params.first().and_then(RtValue::as_str).unwrap_or("main");
+    let registry = state.registry.read().await;
+    registry
+        .iter()
+        .filter(|entry| rtorrent_view_matches(entry, view))
+        .count() as i64
+}
+
+fn rtorrent_view_matches(entry: &TorrentEntry, view: &str) -> bool {
+    match view {
+        "main" | "" => true,
+        "started" => matches!(
+            entry.state.as_str(),
+            "downloading" | "seeding" | "checking" | "metadata_pending"
+        ),
+        "stopped" => matches!(entry.state.as_str(), "paused" | "stopped"),
+        "complete" => entry.total_length > 0 && entry.amount_left == 0,
+        "incomplete" => entry.amount_left > 0,
+        _ => false,
+    }
 }
 
 fn multicall_commands(params: &[RtValue]) -> Vec<String> {
@@ -870,6 +902,57 @@ mod tests {
         assert_eq!(
             execute(&state, "d.ratio", &[hash]).await.unwrap(),
             RtValue::Int(2000)
+        );
+    }
+
+    #[tokio::test]
+    async fn view_size_projects_registry_backed_compat_views() {
+        let state = state_with_torrent().await;
+        {
+            let mut complete =
+                TorrentEntry::new("b".repeat(40), "beta".into(), "/data/beta".into());
+            complete.total_length = 10;
+            complete.amount_left = 0;
+            complete.transition(TorrentState::Downloading).unwrap();
+            complete.transition(TorrentState::Seeding).unwrap();
+            state.registry.write().await.add(complete).unwrap();
+        }
+
+        let views = execute(&state, "view.list", &[]).await.unwrap();
+        assert_eq!(
+            views,
+            RtValue::Array(
+                ["main", "started", "stopped", "complete", "incomplete"]
+                    .into_iter()
+                    .map(|view| RtValue::String(view.to_owned()))
+                    .collect()
+            )
+        );
+        assert_eq!(
+            execute(&state, "view.size", &[RtValue::String("main".to_owned())])
+                .await
+                .unwrap(),
+            RtValue::Int(2)
+        );
+        assert_eq!(
+            execute(
+                &state,
+                "view.size",
+                &[RtValue::String("complete".to_owned())]
+            )
+            .await
+            .unwrap(),
+            RtValue::Int(1)
+        );
+        assert_eq!(
+            execute(
+                &state,
+                "view.size",
+                &[RtValue::String("incomplete".to_owned())]
+            )
+            .await
+            .unwrap(),
+            RtValue::Int(1)
         );
     }
 

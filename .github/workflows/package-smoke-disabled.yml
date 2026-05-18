@@ -1,0 +1,16 @@
+name: Package Smoke Disabled
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to validate
+        required: true
+
+jobs:
+  disabled:
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: packaging/smoke/package-smoke torrentng github-binary "${{ inputs.tag }}" --arch amd64
