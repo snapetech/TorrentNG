@@ -24,5 +24,7 @@ rt-metrics = { path = "../rt-metrics" }
 rt-session = { path = "../rt-session" }
 
 [dev-dependencies]
+rt-config = { path = "../rt-config" }
+tempfile.workspace = true
 tokio = { version = "1", features = ["full"] }
 tower.workspace = true

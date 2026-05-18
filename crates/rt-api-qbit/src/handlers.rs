@@ -3233,7 +3233,11 @@ async fn default_save_path(state: &AppState) -> String {
 mod tests {
     use super::*;
     use axum::{body::Body, http::Request};
-    use rt_session::TorrentEntry;
+    use rt_config::Config;
+    use rt_engine::Engine;
+    use rt_session::{SessionRegistry, TorrentEntry};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
     use tower::ServiceExt;
 
     use crate::router::build_qbit_router;
@@ -4612,6 +4616,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn qbit_torrent_export_streams_persisted_torrent_blob() {
+        let temp = tempfile::tempdir().unwrap();
+        let hash = "f".repeat(40);
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        registry
+            .write()
+            .await
+            .add(TorrentEntry::new(
+                hash.clone(),
+                "exported".into(),
+                temp.path().join("downloads").to_string_lossy().into(),
+            ))
+            .unwrap();
+
+        let mut config = Config::default();
+        config.daemon.session_dir = temp.path().join("session");
+        config.storage.download_dir = temp.path().join("downloads");
+        config.network.listen_port = 0;
+        config.dht.enabled = false;
+        let blob_dir = config.daemon.session_dir.join("torrents");
+        std::fs::create_dir_all(&blob_dir).unwrap();
+        let raw = b"d4:infod4:name8:exportedee".to_vec();
+        std::fs::write(blob_dir.join(format!("{hash}.torrent")), &raw).unwrap();
+
+        let engine = Engine::start(Arc::new(config), Arc::clone(&registry))
+            .await
+            .unwrap();
+        let app = build_qbit_router(AppState::with_engine(registry, engine));
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/qb/v2/torrents/export?hash={hash}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/x-bittorrent"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        assert_eq!(&body[..], &raw[..]);
     }
 
     #[tokio::test]
