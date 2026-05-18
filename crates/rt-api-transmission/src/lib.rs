@@ -15,7 +15,8 @@ use axum::{
 use base64::{engine::general_purpose, Engine as _};
 use rt_engine::{
     EngineGlobalLimits, EngineHandle, EngineJob, EnginePeerSnapshot, EnginePieceState,
-    EngineTorrentLimits, EngineTorrentMetadata, EngineTrackerSnapshot, QueueMove,
+    EngineTorrentLimits, EngineTorrentMetadata, EngineTrackerSnapshot, EngineWebseedSnapshot,
+    QueueMove,
 };
 use rt_metainfo::{parse_magnet, parse_torrent};
 use rt_metrics::{MemoryClass, MemoryLease};
@@ -1030,6 +1031,7 @@ async fn torrent_get(state: &AppState, args: &Value) -> Result<Value, String> {
     let mut peers = std::collections::HashMap::new();
     let mut tracker_snapshots = std::collections::HashMap::new();
     let mut recheck_jobs = std::collections::HashMap::new();
+    let mut webseed_snapshots = std::collections::HashMap::new();
     if let Some(engine) = &state.engine {
         if fields
             .iter()
@@ -1058,6 +1060,14 @@ async fn torrent_get(state: &AppState, args: &Value) -> Result<Value, String> {
             {
                 if let Ok(snapshot) = engine.torrent_trackers(entry.info_hash.clone()).await {
                     tracker_snapshots.insert(entry.info_hash.clone(), snapshot);
+                }
+            }
+            if fields
+                .iter()
+                .any(|field| transmission_field_needs_webseeds(field))
+            {
+                if let Ok(snapshot) = engine.torrent_webseeds(entry.info_hash.clone()).await {
+                    webseed_snapshots.insert(entry.info_hash.clone(), snapshot);
                 }
             }
         }
@@ -1234,8 +1244,15 @@ async fn torrent_get(state: &AppState, args: &Value) -> Result<Value, String> {
                         .and_then(|limits| limits.max_connections)
                         .unwrap_or(0)),
                     "webseeds" => json!(meta.map(|m| m.webseeds.clone()).unwrap_or_default()),
-                    "webseedsSendingToUs" | "webseeds-sending-to-us" => json!(0),
-                    "webseedsEx" | "webseeds-ex" => json!(transmission_webseeds_ex(meta)),
+                    "webseedsSendingToUs" | "webseeds-sending-to-us" => {
+                        json!(transmission_webseeds_sending_to_us(
+                            webseed_snapshots.get(&entry.info_hash)
+                        ))
+                    }
+                    "webseedsEx" | "webseeds-ex" => json!(transmission_webseeds_ex(
+                        meta,
+                        webseed_snapshots.get(&entry.info_hash)
+                    )),
                     "bandwidthPriority" | "bandwidth-priority" => json!(0),
                     "honorsSessionLimits" | "honors-session-limits" => json!(true),
                     "group" => json!("default"),
@@ -1316,6 +1333,14 @@ fn transmission_field_needs_trackers(field: &str) -> bool {
     matches!(
         field.as_str(),
         "trackers" | "trackerStats" | "tracker-stats"
+    )
+}
+
+fn transmission_field_needs_webseeds(field: &str) -> bool {
+    let field = field.replace('_', "-");
+    matches!(
+        field.as_str(),
+        "webseedsSendingToUs" | "webseeds-sending-to-us" | "webseedsEx" | "webseeds-ex"
     )
 }
 
@@ -1602,7 +1627,33 @@ fn transmission_desired_available(
     bytes.min(entry.total_length)
 }
 
-fn transmission_webseeds_ex(meta: Option<&EngineTorrentMetadata>) -> Vec<Value> {
+fn transmission_webseeds_sending_to_us(webseeds: Option<&Vec<EngineWebseedSnapshot>>) -> usize {
+    webseeds
+        .map(|webseeds| {
+            webseeds
+                .iter()
+                .filter(|webseed| webseed.is_downloading)
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+fn transmission_webseeds_ex(
+    meta: Option<&EngineTorrentMetadata>,
+    webseeds: Option<&Vec<EngineWebseedSnapshot>>,
+) -> Vec<Value> {
+    if let Some(webseeds) = webseeds {
+        return webseeds
+            .iter()
+            .map(|webseed| {
+                json!({
+                    "url": webseed.url,
+                    "is_downloading": webseed.is_downloading,
+                    "download_bytes_per_second": webseed.download_rate.max(0),
+                })
+            })
+            .collect();
+    }
     meta.map(|meta| {
         meta.webseeds
             .iter()
@@ -2456,6 +2507,31 @@ mod tests {
         assert_eq!(transmission_have_valid(&entry, Some(&meta)), 100);
         assert_eq!(transmission_have_unchecked(&entry, Some(&meta)), 100);
         assert_eq!(transmission_desired_available(&entry, Some(&meta)), 200);
+    }
+
+    #[test]
+    fn transmission_webseed_activity_projects_engine_snapshots() {
+        let webseeds = vec![
+            EngineWebseedSnapshot {
+                url: "https://seed.example/one.bin".to_owned(),
+                is_downloading: true,
+                download_rate: 16_384,
+                failures: 0,
+            },
+            EngineWebseedSnapshot {
+                url: "https://mirror.example/one.bin".to_owned(),
+                is_downloading: false,
+                download_rate: 0,
+                failures: 2,
+            },
+        ];
+
+        assert_eq!(transmission_webseeds_sending_to_us(Some(&webseeds)), 1);
+        let projected = transmission_webseeds_ex(None, Some(&webseeds));
+        assert_eq!(projected[0]["url"], "https://seed.example/one.bin");
+        assert_eq!(projected[0]["is_downloading"], true);
+        assert_eq!(projected[0]["download_bytes_per_second"], 16_384);
+        assert!(transmission_field_needs_webseeds("webseeds_ex"));
     }
 
     #[test]

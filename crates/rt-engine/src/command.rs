@@ -649,6 +649,14 @@ pub struct EnginePeerSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineWebseedSnapshot {
+    pub url: String,
+    pub is_downloading: bool,
+    pub download_rate: i64,
+    pub failures: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineTrackerSnapshot {
     pub id: i64,
     pub tier: i64,
@@ -833,6 +841,10 @@ pub enum EngineCmd {
     GetTorrentPeers {
         info_hash: String,
         reply: oneshot::Sender<CmdResult<Vec<EnginePeerSnapshot>>>,
+    },
+    GetTorrentWebseeds {
+        info_hash: String,
+        reply: oneshot::Sender<CmdResult<Vec<EngineWebseedSnapshot>>>,
     },
     GetGlobalLimits {
         reply: oneshot::Sender<CmdResult<EngineGlobalLimits>>,

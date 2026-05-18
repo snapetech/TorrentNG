@@ -35,7 +35,7 @@ use rt_storage::{
 use crate::command::{
     CmdResult, EngineCmd, EngineGlobalLimits, EngineJob, EnginePeerSnapshot, EnginePieceState,
     EngineStats, EngineTorrentFile, EngineTorrentLimits, EngineTorrentMetadata,
-    EngineTrackerSnapshot, QueueMove, TorrentDiagnostic,
+    EngineTrackerSnapshot, EngineWebseedSnapshot, QueueMove, TorrentDiagnostic,
 };
 use crate::dht_task::{run_dht, DhtCommand, DhtTorrent};
 use crate::metadata_task::run_metadata_task;
@@ -576,6 +576,18 @@ impl EngineHandle {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx
             .send(EngineCmd::GetTorrentPeers { info_hash, reply })
+            .await
+            .map_err(|_| "engine shut down".to_owned())?;
+        rx.await.map_err(|_| "engine dropped reply".to_owned())?
+    }
+
+    pub async fn torrent_webseeds(
+        &self,
+        info_hash: String,
+    ) -> CmdResult<Vec<EngineWebseedSnapshot>> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(EngineCmd::GetTorrentWebseeds { info_hash, reply })
             .await
             .map_err(|_| "engine shut down".to_owned())?;
         rx.await.map_err(|_| "engine dropped reply".to_owned())?
@@ -1154,6 +1166,10 @@ impl Engine {
             }
             EngineCmd::GetTorrentPeers { info_hash, reply } => {
                 let result = self.torrent_peers_inner(&info_hash).await;
+                let _ = reply.send(result);
+            }
+            EngineCmd::GetTorrentWebseeds { info_hash, reply } => {
+                let result = self.torrent_webseeds_inner(&info_hash).await;
                 let _ = reply.send(result);
             }
             EngineCmd::GetGlobalLimits { reply } => {
@@ -2443,6 +2459,34 @@ impl Engine {
         };
         let (reply, rx) = tokio::sync::oneshot::channel();
         tx.send(TorrentCmd::GetPeers { reply })
+            .await
+            .map_err(|_| "torrent task gone".to_owned())?;
+        rx.await
+            .map_err(|_| "torrent task dropped reply".to_owned())
+    }
+
+    async fn torrent_webseeds_inner(
+        &self,
+        info_hash: &str,
+    ) -> CmdResult<Vec<EngineWebseedSnapshot>> {
+        let tx = self.torrent_chans.get(info_hash).cloned();
+        let Some(tx) = tx else {
+            let meta = self
+                .load_torrent_metadata(info_hash)
+                .map_err(|e| e.to_string())?;
+            return Ok(meta
+                .webseeds
+                .into_iter()
+                .map(|url| EngineWebseedSnapshot {
+                    url,
+                    is_downloading: false,
+                    download_rate: 0,
+                    failures: 0,
+                })
+                .collect());
+        };
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        tx.send(TorrentCmd::GetWebseeds { reply })
             .await
             .map_err(|_| "torrent task gone".to_owned())?;
         rx.await

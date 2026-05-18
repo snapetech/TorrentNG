@@ -52,7 +52,7 @@ use rt_tracker::{
 };
 
 use crate::peer_id::OUR_PEER_ID;
-use crate::{EnginePeerSnapshot, TorrentRuntimeStats};
+use crate::{EnginePeerSnapshot, EngineWebseedSnapshot, TorrentRuntimeStats};
 
 const LOCAL_UT_METADATA_ID: u8 = 1;
 const LOCAL_UT_PEX_ID: u8 = 2;
@@ -78,6 +78,9 @@ pub enum TorrentCmd {
     PriorityPeers(Vec<SocketAddr>),
     GetPeers {
         reply: oneshot::Sender<Vec<EnginePeerSnapshot>>,
+    },
+    GetWebseeds {
+        reply: oneshot::Sender<Vec<EngineWebseedSnapshot>>,
     },
     GetRuntimeStats {
         reply: oneshot::Sender<TorrentRuntimeStats>,
@@ -386,6 +389,8 @@ pub struct TorrentTask {
     webseed_client: reqwest::Client,
     webseed_next_index: usize,
     webseed_failures: Vec<u8>,
+    webseed_last_rates: Vec<i64>,
+    webseed_last_success: Vec<Option<Instant>>,
     last_progress_persist: Option<Instant>,
     piece_assemblies: HashMap<u32, PieceAssembly>,
     piece_assembly_bytes: usize,
@@ -429,6 +434,8 @@ impl TorrentTask {
         };
         let piece_count = meta.pieces.len();
         let webseed_failures = vec![0; meta.webseeds.len()];
+        let webseed_last_rates = vec![0; meta.webseeds.len()];
+        let webseed_last_success = vec![None; meta.webseeds.len()];
         let picker = PiecePicker::new(piece_count, meta.piece_length as u32, last_piece_len as u32);
         let info_hash_hex = meta.info_hash.iter().map(|b| format!("{b:02x}")).collect();
         let piece_map = PieceMap::new(
@@ -489,6 +496,8 @@ impl TorrentTask {
                 .unwrap_or_else(|_| reqwest::Client::new()),
             webseed_next_index: 0,
             webseed_failures,
+            webseed_last_rates,
+            webseed_last_success,
             last_progress_persist: None,
             piece_assemblies: HashMap::new(),
             piece_assembly_bytes: 0,
@@ -570,6 +579,9 @@ impl TorrentTask {
                         }
                         TorrentCmd::GetPeers { reply } => {
                             let _ = reply.send(self.peer_snapshots());
+                        }
+                        TorrentCmd::GetWebseeds { reply } => {
+                            let _ = reply.send(self.webseed_snapshots());
                         }
                         TorrentCmd::GetRuntimeStats { reply } => {
                             let _ = reply.send(self.runtime_stats());
@@ -1118,6 +1130,32 @@ impl TorrentTask {
             .collect()
     }
 
+    fn webseed_snapshots(&self) -> Vec<EngineWebseedSnapshot> {
+        let now = Instant::now();
+        self.meta
+            .webseeds
+            .iter()
+            .enumerate()
+            .map(|(idx, url)| {
+                let recent = self
+                    .webseed_last_success
+                    .get(idx)
+                    .and_then(|instant| *instant)
+                    .is_some_and(|instant| now.duration_since(instant) <= Duration::from_secs(10));
+                EngineWebseedSnapshot {
+                    url: url.clone(),
+                    is_downloading: recent,
+                    download_rate: if recent {
+                        self.webseed_last_rates.get(idx).copied().unwrap_or(0)
+                    } else {
+                        0
+                    },
+                    failures: self.webseed_failures.get(idx).copied().unwrap_or(0),
+                }
+            })
+            .collect()
+    }
+
     fn runtime_stats(&self) -> TorrentRuntimeStats {
         let outstanding_requests = self
             .active_peers
@@ -1286,11 +1324,20 @@ impl TorrentTask {
                 length = req.length,
                 "fetching webseed block"
             );
+            let started = Instant::now();
             match self.fetch_webseed_block(&url, req).await {
                 Ok(data) => {
+                    let elapsed = started.elapsed().as_secs_f64().max(0.001);
+                    let rate = (data.len() as f64 / elapsed).round() as i64;
                     self.webseed_next_index = (idx + 1) % seed_count;
                     if let Some(failures) = self.webseed_failures.get_mut(idx) {
                         *failures = 0;
+                    }
+                    if let Some(last_rate) = self.webseed_last_rates.get_mut(idx) {
+                        *last_rate = rate.max(0);
+                    }
+                    if let Some(last_success) = self.webseed_last_success.get_mut(idx) {
+                        *last_success = Some(Instant::now());
                     }
                     self.handle_block(BlockEvent {
                         piece: req.piece,
@@ -2094,6 +2141,9 @@ impl TorrentTask {
                 Ok(TorrentCmd::PriorityPeers(_)) => {}
                 Ok(TorrentCmd::GetPeers { reply }) => {
                     let _ = reply.send(Vec::new());
+                }
+                Ok(TorrentCmd::GetWebseeds { reply }) => {
+                    let _ = reply.send(self.webseed_snapshots());
                 }
                 Ok(TorrentCmd::GetRuntimeStats { reply }) => {
                     let _ = reply.send(self.runtime_stats());

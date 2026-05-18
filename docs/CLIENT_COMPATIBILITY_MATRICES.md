@@ -69,7 +69,7 @@ Universal compatibility release rule:
 | Categories/labels/tags | categories, tags | labels | Label plugin | custom fields | Native category/tags model | Label/category import and API mutation rows |
 | Trackers | list/add/edit/remove | tracker list mutation, tracker_stats | set_torrent_trackers | tracker commands | Native metadata mutation; stats partially projected | Tracker add/edit/remove and stats row |
 | Peers | addPeers, torrentPeers | peers fields | connect_peer | peer commands | Add/connect peer hooks; peer projection partial | Explicit peer private torrent row |
-| Web seeds | webseeds read | webseeds/webseeds_ex | file/web seed via libtorrent state | supported through metainfo | Read projection implemented; live webseed activity counters are placeholders | Webseed-only transfer and webseed projection row |
+| Web seeds | webseeds read | webseeds/webseeds_ex | file/web seed via libtorrent state | supported through metainfo | Read projection implemented; Transmission activity fields project native webseed snapshots when an engine is attached | Webseed-only transfer and webseed projection row |
 | Global speed limits | transfer limits | session limits | config/options speed limits | throttle commands | Native global limits through qBit/Transmission; Deluge compat | Set/read speed limits through each facade |
 | Per-torrent speed limits | torrent limit endpoints | torrent_set limits | set_torrent_options | throttle commands | Native/Compat through qBit, Transmission, and Deluge facades; rTorrent throttle commands are compatibility placeholders | Per-torrent limit mutation and projection row |
 | Sequential/first-last | qBit toggles | 4.1 sequential fields | options/prioritize first-last | client-specific | Accepted/no-op or partial | Assert accepted; add native support if scheduler implements |
@@ -158,7 +158,7 @@ Transmission `torrent_get` field matrix:
 | Files | `files`, `file_stats`, `priorities`, `wanted` | Native/Partial |
 | Peers | `peers`, `peers_connected`, `peers_from`, `peers_getting_from_us`, `peers_sending_to_us` | Partial; `peers_from` shape implemented with best-effort counts |
 | Trackers | `trackers`, `tracker_stats` including announce/scrape states and counts | Native/Partial; persisted announce status, timestamps, failure/warning messages, and scrape counts project from engine tracker rows |
-| Web seeds | `webseeds`, `webseeds_sending_to_us`, `webseeds_ex` | Partial; `webseeds_ex` shape implemented with activity placeholders |
+| Web seeds | `webseeds`, `webseeds_sending_to_us`, `webseeds_ex` | Native/Partial; URL list projects from metainfo and activity/rate fields project native webseed snapshots when available |
 | Queue/group | `queue_position`, `group` | Partial; default group compatibility implemented |
 | Comments/creator | `comment`, `creator`, `primary_mime_type` | Native/Partial; torrent comment, creator, creation date, and primary MIME type project from parsed metainfo where available |
 | Sequential | `sequential_download`, `sequential_download_from_piece` | Sequential flag mutation/projection implemented; from-piece remains placeholder |
