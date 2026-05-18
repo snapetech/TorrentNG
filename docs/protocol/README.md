@@ -15,3 +15,7 @@ BEP documents are referenced here. Do not implement protocol behavior without re
 | BEP 27 | Private torrents | 3 | https://www.bittorrent.org/beps/bep_0027.html |
 | BEP 29 | uTP | 10 | https://www.bittorrent.org/beps/bep_0029.html |
 | BEP 52 | BitTorrent v2 / hybrid | 11 | https://www.bittorrent.org/beps/bep_0052.html |
+
+Detailed local notes:
+
+- [BEP 29 uTP status](UTP.md)

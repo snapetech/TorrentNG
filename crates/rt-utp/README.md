@@ -17,3 +17,6 @@ is wiring `UtpStream` into peer-wire handshakes, peer selection, incoming peer
 dispatch, and engine lifecycle. The native `/health` capability manifest reports
 this split explicitly as `networking.utp_packet_codec=true` and
 `networking.utp_transport=false` until that end-to-end engine path is active.
+
+See `docs/protocol/UTP.md` for the module inventory, tested behavior, public API
+example, and engine-integration checklist.

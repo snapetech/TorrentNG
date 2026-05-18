@@ -236,7 +236,7 @@ Moving 200+ TB is a database migration, not a file copy:
 | BEP 15 | UDP trackers | implemented for v1; v2 UDP announces are rejected explicitly |
 | BEP 23 | Compact peer list | implemented |
 | BEP 27 | Private torrents | implemented |
-| BEP 29 | uTP | transport crate implemented |
+| BEP 29 | uTP | `rt-utp` packet/state/UDP stream primitives implemented; engine peer-wire integration pending |
 | BEP 32 | IPv6 | later |
 | BEP 52 | BitTorrent v2 / hybrid | implemented for parsing, identity, metadata projection, storage root verification, fastresume, and compatibility projections |
 
