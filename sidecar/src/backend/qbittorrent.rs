@@ -4,8 +4,8 @@ use reqwest::Url;
 use std::{collections::BTreeMap, net::SocketAddr};
 
 use super::{
-    BackendCapabilities, BackendStatus, BackendTransferLimits, BackendType, QueueMove,
-    TorrentBackend,
+    BackendCapabilities, BackendPieceState, BackendStatus, BackendTransferLimits, BackendType,
+    QueueMove, TorrentBackend,
 };
 use crate::{
     config::QbittorrentConfig,
@@ -330,6 +330,39 @@ impl TorrentBackend for QbittorrentBackend {
             ))
             .await?;
         Ok(files.into_iter().enumerate().map(map_file).collect())
+    }
+
+    async fn list_webseeds(&self, hash: &str) -> Result<Vec<String>> {
+        self.get_json(&format!(
+            "api/v2/torrents/webseeds?hash={}",
+            urlencoding::encode(hash)
+        ))
+        .await
+    }
+
+    async fn piece_states(&self, hash: &str) -> Result<Vec<BackendPieceState>> {
+        let states: Vec<i64> = self
+            .get_json(&format!(
+                "api/v2/torrents/pieceStates?hash={}",
+                urlencoding::encode(hash)
+            ))
+            .await?;
+        Ok(states
+            .into_iter()
+            .map(|state| match state {
+                2 => BackendPieceState::Complete,
+                1 => BackendPieceState::Partial,
+                _ => BackendPieceState::Missing,
+            })
+            .collect())
+    }
+
+    async fn piece_hashes(&self, hash: &str) -> Result<Vec<String>> {
+        self.get_json(&format!(
+            "api/v2/torrents/pieceHashes?hash={}",
+            urlencoding::encode(hash)
+        ))
+        .await
     }
 
     async fn set_file_priority(&self, hash: &str, file_index: usize, priority: i64) -> Result<()> {

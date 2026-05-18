@@ -312,10 +312,10 @@ Implements the qBittorrent Web API v2. By default it advertises qBittorrent `5.0
 | `POST` | `/api/qb/v2/torrents/recheck` | Form: `hashes` |
 | `POST` | `/api/qb/v2/torrents/reannounce` | Form: `hashes` |
 | `GET`  | `/api/qb/v2/torrents/trackers` | Query: `hash` |
-| `GET`  | `/api/qb/v2/torrents/webseeds` | Returns `[]` |
+| `GET`  | `/api/qb/v2/torrents/webseeds` | Query: `hash`; backend-backed where supported, otherwise `[]` |
 | `GET`  | `/api/qb/v2/torrents/files` | Query: `hash` |
-| `GET`  | `/api/qb/v2/torrents/pieceStates` | Returns `[]` |
-| `GET`  | `/api/qb/v2/torrents/pieceHashes` | Returns `[]` |
+| `GET`  | `/api/qb/v2/torrents/pieceStates` | Query: `hash`; backend-backed where supported, otherwise `[]` |
+| `GET`  | `/api/qb/v2/torrents/pieceHashes` | Query: `hash`; backend-backed where supported, otherwise `[]` |
 | `POST` | `/api/qb/v2/torrents/filePrio` | Form: `hash`, `id` (pipe-separated indices), `priority` |
 | `POST` | `/api/qb/v2/torrents/setCategory` | Form: `hashes`, `category` |
 | `POST` | `/api/qb/v2/torrents/addTags` | Form: `hashes`, `tags` (comma-separated) |
@@ -392,7 +392,7 @@ These compatibility endpoints are present so qBittorrent clients can probe them 
 | `POST` | `/api/qb/v2/rss/setRule` | Creates/updates compatibility RSS rule JSON |
 | `POST` | `/api/qb/v2/rss/renameRule` | Renames compatibility RSS rule |
 | `POST` | `/api/qb/v2/rss/removeRule` | Deletes compatibility RSS rule |
-| `POST` | `/api/qb/v2/rss/addFolder`, `/addFeed`, `/removeItem`, `/moveItem`, `/markAsRead`, `/refreshItem` | Accepted as compatibility no-ops |
+| `POST` | `/api/qb/v2/rss/addFolder`, `/addFeed`, `/removeItem`, `/moveItem`, `/markAsRead`, `/refreshItem` | Maintains qBit-shaped compatibility folder/feed item state |
 
 ---
 

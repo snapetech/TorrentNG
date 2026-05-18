@@ -155,6 +155,10 @@ async fn main() -> Result<()> {
         db,
         events: tx,
         metrics,
+        qbit_search_plugins: Arc::new(tokio::sync::RwLock::new(serde_json::Map::new())),
+        qbit_search_jobs: Arc::new(tokio::sync::RwLock::new(serde_json::Map::new())),
+        qbit_next_search_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        qbit_rss_items: Arc::new(tokio::sync::RwLock::new(serde_json::Map::new())),
     };
     let app = build_router(state);
 

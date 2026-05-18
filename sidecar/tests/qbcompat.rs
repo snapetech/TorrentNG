@@ -57,6 +57,10 @@ async fn spawn_server_with_config_and_events(
         db: db.clone(),
         events: tx.clone(),
         metrics,
+        qbit_search_plugins: Arc::new(tokio::sync::RwLock::new(serde_json::Map::new())),
+        qbit_search_jobs: Arc::new(tokio::sync::RwLock::new(serde_json::Map::new())),
+        qbit_next_search_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        qbit_rss_items: Arc::new(tokio::sync::RwLock::new(serde_json::Map::new())),
     };
     let app: Router = torrentng::api::server::build_router(state);
 
@@ -2390,7 +2394,7 @@ async fn qb_inert_surfaces_are_compatible() {
         .unwrap();
     assert_eq!(res.status(), 200);
     let body: serde_json::Value = res.json().await.unwrap();
-    assert_eq!(body["id"], 0);
+    assert_eq!(body["id"], 1);
 
     for path in [
         "/api/qb/v2/transfer/speedLimitsMode",
@@ -2401,6 +2405,133 @@ async fn qb_inert_surfaces_are_compatible() {
         assert_eq!(res.status(), 200, "{path}");
         assert_eq!(res.text().await.unwrap(), "0");
     }
+}
+
+#[tokio::test]
+async fn qb_search_plugins_jobs_and_rss_items_are_stateful() {
+    let (addr, client) = spawn_server().await;
+
+    let res = client
+        .post(url(addr, "/api/qb/v2/search/installPlugin"))
+        .form(&[("sources", "https://example.test/plugins/linux.py")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    let plugins: serde_json::Value = client
+        .get(url(addr, "/api/qb/v2/search/plugins"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(plugins.as_array().unwrap()[0]["name"], "linux.py");
+
+    let res = client
+        .post(url(addr, "/api/qb/v2/search/enablePlugin"))
+        .form(&[("names", "linux.py"), ("enable", "false")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    let plugins: serde_json::Value = client
+        .get(url(addr, "/api/qb/v2/search/plugins"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(plugins.as_array().unwrap()[0]["enabled"], false);
+
+    let job: serde_json::Value = client
+        .post(url(addr, "/api/qb/v2/search/start"))
+        .form(&[("pattern", "debian"), ("plugins", "linux.py")])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(job["id"], 1);
+
+    let results: serde_json::Value = client
+        .get(url(addr, "/api/qb/v2/search/results?id=1"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(results["pattern"], "debian");
+    assert_eq!(results["plugins"], "linux.py");
+
+    for (endpoint, form) in [
+        ("/api/qb/v2/rss/addFolder", vec![("path", "linux")]),
+        (
+            "/api/qb/v2/rss/addFeed",
+            vec![
+                ("url", "https://example.test/rss"),
+                ("path", "linux/example"),
+            ],
+        ),
+    ] {
+        let res = client
+            .post(url(addr, endpoint))
+            .form(&form)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200, "{endpoint}");
+    }
+
+    let items: serde_json::Value = client
+        .get(url(addr, "/api/qb/v2/rss/items"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(items["linux"]["type"], "folder");
+    assert_eq!(items["linux/example"]["url"], "https://example.test/rss");
+
+    let res = client
+        .post(url(addr, "/api/qb/v2/rss/moveItem"))
+        .form(&[("itemPath", "linux/example"), ("destPath", "linux/moved")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let res = client
+        .post(url(addr, "/api/qb/v2/rss/markAsRead"))
+        .form(&[("itemPath", "linux/moved")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let res = client
+        .post(url(addr, "/api/qb/v2/rss/refreshItem"))
+        .form(&[("itemPath", "linux/moved")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    let items: serde_json::Value = client
+        .get(url(addr, "/api/qb/v2/rss/items"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(items.get("linux/example").is_none());
+    assert_eq!(items["linux/moved"]["read"], true);
+    assert!(items["linux/moved"]["lastBuildDate"].as_i64().unwrap() > 0);
 }
 
 #[tokio::test]

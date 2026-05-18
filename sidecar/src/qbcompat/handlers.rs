@@ -7,11 +7,16 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{collections::HashMap, net::SocketAddr};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::atomic::Ordering,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use crate::{
     api::{server::AppState, ws::Event},
-    backend::QueueMove,
+    backend::{BackendPieceState, QueueMove},
     cache::{AppEventRow, ListParams, RssRule, TorrentRow},
     rtorrent::TransferRates,
 };
@@ -48,10 +53,10 @@ pub fn build_router(_state: AppState) -> Router<AppState> {
         .route("/torrents/recheck", post(torrents_recheck))
         .route("/torrents/reannounce", post(torrents_reannounce))
         .route("/torrents/trackers", get(torrents_trackers))
-        .route("/torrents/webseeds", get(empty_array))
+        .route("/torrents/webseeds", get(torrents_webseeds))
         .route("/torrents/files", get(torrents_files))
-        .route("/torrents/pieceStates", get(empty_array))
-        .route("/torrents/pieceHashes", get(empty_array))
+        .route("/torrents/pieceStates", get(torrents_piece_states))
+        .route("/torrents/pieceHashes", get(torrents_piece_hashes))
         .route("/torrents/setCategory", post(torrents_set_category))
         .route("/torrents/addTags", post(torrents_add_tags))
         .route("/torrents/removeTags", post(torrents_remove_tags))
@@ -111,22 +116,22 @@ pub fn build_router(_state: AppState) -> Router<AppState> {
         .route("/log/peers", get(empty_array))
         .route("/search/status", get(search_status))
         .route("/search/categories", get(empty_array))
-        .route("/search/plugins", get(empty_array))
-        .route("/search/installPlugin", post(ok_form))
-        .route("/search/uninstallPlugin", post(ok_form))
-        .route("/search/enablePlugin", post(ok_form))
-        .route("/search/updatePlugins", post(ok_form))
+        .route("/search/plugins", get(search_plugins))
+        .route("/search/installPlugin", post(search_install_plugin))
+        .route("/search/uninstallPlugin", post(search_uninstall_plugin))
+        .route("/search/enablePlugin", post(search_enable_plugin))
+        .route("/search/updatePlugins", post(search_update_plugins))
         .route("/search/start", post(search_start))
-        .route("/search/stop", post(ok_form))
+        .route("/search/stop", post(search_stop))
         .route("/search/results", get(search_results))
-        .route("/search/delete", post(ok_form))
-        .route("/rss/items", get(empty_object))
-        .route("/rss/addFolder", post(ok_form))
-        .route("/rss/addFeed", post(ok_form))
-        .route("/rss/removeItem", post(ok_form))
-        .route("/rss/moveItem", post(ok_form))
-        .route("/rss/markAsRead", post(ok_form))
-        .route("/rss/refreshItem", post(ok_form))
+        .route("/search/delete", post(search_delete))
+        .route("/rss/items", get(rss_items))
+        .route("/rss/addFolder", post(rss_add_folder))
+        .route("/rss/addFeed", post(rss_add_feed))
+        .route("/rss/removeItem", post(rss_remove_item))
+        .route("/rss/moveItem", post(rss_move_item))
+        .route("/rss/markAsRead", post(rss_mark_as_read))
+        .route("/rss/refreshItem", post(rss_refresh_item))
         .route("/rss/setRule", post(rss_set_rule))
         .route("/rss/renameRule", post(rss_rename_rule))
         .route("/rss/removeRule", post(rss_remove_rule))
@@ -188,10 +193,6 @@ async fn ok_form(Form(_f): Form<HashMap<String, String>>) -> StatusCode {
 
 async fn empty_array() -> Json<serde_json::Value> {
     Json(json!([]))
-}
-
-async fn empty_object() -> Json<serde_json::Value> {
-    Json(json!({}))
 }
 
 #[derive(Debug, Deserialize)]
@@ -298,25 +299,284 @@ fn qbit_log_entry(row: crate::cache::AppEventRow) -> QbLogEntry {
     }
 }
 
-async fn search_status() -> Json<serde_json::Value> {
+async fn search_status(State(s): State<AppState>) -> Json<serde_json::Value> {
+    let jobs = s.qbit_search_jobs.read().await;
+    let running = jobs
+        .values()
+        .any(|job| job.get("status").and_then(|v| v.as_str()) == Some("Running"));
+    let plugins = s
+        .qbit_search_plugins
+        .read()
+        .await
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
     Json(json!({
-        "status": "Stopped",
-        "total": 0,
+        "status": if running { "Running" } else { "Stopped" },
+        "plugins": plugins,
     }))
 }
 
-async fn search_start(Form(_f): Form<HashMap<String, String>>) -> Json<serde_json::Value> {
-    Json(json!({
-        "id": 0,
-    }))
+async fn search_plugins(State(s): State<AppState>) -> Json<serde_json::Value> {
+    let plugins = s
+        .qbit_search_plugins
+        .read()
+        .await
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    Json(json!(plugins))
 }
 
-async fn search_results(Query(_q): Query<HashMap<String, String>>) -> Json<serde_json::Value> {
-    Json(json!({
+async fn search_install_plugin(
+    State(s): State<AppState>,
+    Form(f): Form<HashMap<String, String>>,
+) -> StatusCode {
+    let mut plugins = s.qbit_search_plugins.write().await;
+    for source in f
+        .get("sources")
+        .map(|raw| split_qbit_list(raw))
+        .unwrap_or_default()
+    {
+        let name = plugin_name_from_source(&source);
+        plugins.insert(name.clone(), search_plugin_value(&name, &source, true));
+    }
+    StatusCode::OK
+}
+
+async fn search_uninstall_plugin(
+    State(s): State<AppState>,
+    Form(f): Form<HashMap<String, String>>,
+) -> StatusCode {
+    let mut plugins = s.qbit_search_plugins.write().await;
+    for name in f
+        .get("names")
+        .map(|raw| split_qbit_list(raw))
+        .unwrap_or_default()
+    {
+        plugins.remove(&name);
+    }
+    StatusCode::OK
+}
+
+async fn search_enable_plugin(
+    State(s): State<AppState>,
+    Form(f): Form<HashMap<String, String>>,
+) -> StatusCode {
+    let enabled = parse_bool_param(f.get("enable").map(String::as_str), true);
+    let mut plugins = s.qbit_search_plugins.write().await;
+    for name in f
+        .get("names")
+        .map(|raw| split_qbit_list(raw))
+        .unwrap_or_default()
+    {
+        let entry = plugins
+            .entry(name.clone())
+            .or_insert_with(|| search_plugin_value(&name, "", enabled));
+        if let Some(map) = entry.as_object_mut() {
+            map.insert("enabled".into(), enabled.into());
+        }
+    }
+    StatusCode::OK
+}
+
+async fn search_update_plugins() -> StatusCode {
+    StatusCode::OK
+}
+
+async fn search_start(
+    State(s): State<AppState>,
+    Form(f): Form<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let id = s.qbit_next_search_id.fetch_add(1, Ordering::Relaxed);
+    let job = json!({
+        "id": id,
+        "pattern": f.get("pattern").cloned().unwrap_or_default(),
+        "plugins": f.get("plugins").cloned().unwrap_or_else(|| "all".to_owned()),
+        "category": f.get("category").cloned().unwrap_or_else(|| "all".to_owned()),
         "status": "Stopped",
         "total": 0,
         "results": [],
-    }))
+    });
+    s.qbit_search_jobs
+        .write()
+        .await
+        .insert(id.to_string(), job);
+    Json(json!({ "id": id }))
+}
+
+async fn search_stop(
+    State(s): State<AppState>,
+    Form(f): Form<HashMap<String, String>>,
+) -> StatusCode {
+    if let Some(id) = f.get("id") {
+        if let Some(job) = s.qbit_search_jobs.write().await.get_mut(id) {
+            if let Some(map) = job.as_object_mut() {
+                map.insert("status".into(), "Stopped".into());
+            }
+        }
+    }
+    StatusCode::OK
+}
+
+async fn search_results(
+    State(s): State<AppState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let jobs = s.qbit_search_jobs.read().await;
+    let job = q
+        .get("id")
+        .and_then(|id| jobs.get(id))
+        .or_else(|| jobs.iter().next_back().map(|(_, job)| job));
+    let Some(job) = job else {
+        return Json(json!({
+            "status": "Stopped",
+            "total": 0,
+            "results": [],
+        }));
+    };
+    let mut response = job.clone();
+    if let Some(map) = response.as_object_mut() {
+        let results = map
+            .get("results")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let offset = q
+            .get("offset")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        let limit = q
+            .get("limit")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or_else(|| results.len().saturating_sub(offset));
+        let sliced = results.into_iter().skip(offset).take(limit).collect::<Vec<_>>();
+        map.insert("results".into(), serde_json::Value::Array(sliced));
+    }
+    Json(response)
+}
+
+async fn search_delete(
+    State(s): State<AppState>,
+    Form(f): Form<HashMap<String, String>>,
+) -> StatusCode {
+    if let Some(id) = f.get("id") {
+        s.qbit_search_jobs.write().await.remove(id);
+    }
+    StatusCode::OK
+}
+
+async fn rss_items(State(s): State<AppState>) -> Json<serde_json::Value> {
+    Json(serde_json::Value::Object(
+        s.qbit_rss_items.read().await.clone(),
+    ))
+}
+
+async fn rss_add_folder(
+    State(s): State<AppState>,
+    Form(f): Form<HashMap<String, String>>,
+) -> StatusCode {
+    let Some(path) = f.get("path").filter(|p| !p.trim().is_empty()) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    s.qbit_rss_items.write().await.insert(
+        path.clone(),
+        json!({
+            "uid": path,
+            "name": rss_leaf_name(path),
+            "type": "folder",
+            "isLoading": false,
+            "hasError": false,
+            "articles": [],
+        }),
+    );
+    StatusCode::OK
+}
+
+async fn rss_add_feed(
+    State(s): State<AppState>,
+    Form(f): Form<HashMap<String, String>>,
+) -> StatusCode {
+    let Some(url) = f.get("url").filter(|u| !u.trim().is_empty()) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let path = f
+        .get("path")
+        .filter(|p| !p.trim().is_empty())
+        .cloned()
+        .unwrap_or_else(|| url.clone());
+    s.qbit_rss_items.write().await.insert(
+        path.clone(),
+        json!({
+            "uid": path,
+            "name": rss_leaf_name(&path),
+            "type": "feed",
+            "url": url,
+            "isLoading": false,
+            "hasError": false,
+            "articles": [],
+        }),
+    );
+    StatusCode::OK
+}
+
+async fn rss_remove_item(
+    State(s): State<AppState>,
+    Form(f): Form<HashMap<String, String>>,
+) -> StatusCode {
+    if let Some(path) = f.get("path") {
+        s.qbit_rss_items.write().await.remove(path);
+    }
+    StatusCode::OK
+}
+
+async fn rss_move_item(
+    State(s): State<AppState>,
+    Form(f): Form<HashMap<String, String>>,
+) -> StatusCode {
+    let Some(item_path) = f.get("itemPath") else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let Some(dest_path) = f.get("destPath") else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let mut items = s.qbit_rss_items.write().await;
+    if let Some(mut item) = items.remove(item_path) {
+        if let Some(map) = item.as_object_mut() {
+            map.insert("uid".into(), dest_path.clone().into());
+            map.insert("name".into(), rss_leaf_name(dest_path).into());
+        }
+        items.insert(dest_path.clone(), item);
+    }
+    StatusCode::OK
+}
+
+async fn rss_mark_as_read(
+    State(s): State<AppState>,
+    Form(f): Form<HashMap<String, String>>,
+) -> StatusCode {
+    if let Some(item_path) = f.get("itemPath") {
+        if let Some(item) = s.qbit_rss_items.write().await.get_mut(item_path) {
+            if let Some(map) = item.as_object_mut() {
+                map.insert("read".into(), true.into());
+            }
+        }
+    }
+    StatusCode::OK
+}
+
+async fn rss_refresh_item(
+    State(s): State<AppState>,
+    Form(f): Form<HashMap<String, String>>,
+) -> StatusCode {
+    if let Some(item_path) = f.get("itemPath") {
+        if let Some(item) = s.qbit_rss_items.write().await.get_mut(item_path) {
+            if let Some(map) = item.as_object_mut() {
+                map.insert("lastBuildDate".into(), now_unix_secs().into());
+            }
+        }
+    }
+    StatusCode::OK
 }
 
 async fn rss_rules(State(s): State<AppState>) -> impl IntoResponse {
@@ -361,6 +621,8 @@ struct RssSetRuleForm {
     #[serde(rename = "ruleName")]
     rule_name: Option<String>,
     rule: Option<String>,
+    #[serde(rename = "ruleDef")]
+    rule_def: Option<String>,
 }
 
 async fn rss_set_rule(State(s): State<AppState>, Form(f): Form<RssSetRuleForm>) -> StatusCode {
@@ -372,7 +634,7 @@ async fn rss_set_rule(State(s): State<AppState>, Form(f): Form<RssSetRuleForm>) 
     else {
         return StatusCode::BAD_REQUEST;
     };
-    let raw = f.rule.as_deref().unwrap_or("{}");
+    let raw = f.rule.as_deref().or(f.rule_def.as_deref()).unwrap_or("{}");
     let value: serde_json::Value = match serde_json::from_str(raw) {
         Ok(value) => value,
         Err(e) => {
@@ -1148,6 +1410,95 @@ async fn torrents_files(
         }
     }
 }
+
+async fn torrents_webseeds(
+    State(s): State<AppState>,
+    Query(q): Query<HashQuery>,
+) -> impl IntoResponse {
+    let Some(hash) = q.hash else {
+        return Json(json!([])).into_response();
+    };
+    match s.backend.list_webseeds(&hash).await {
+        Ok(webseeds) => Json(json!(webseeds)).into_response(),
+        Err(_) => match s.db.get(&hash) {
+            Ok(Some(_)) | Ok(None) => Json(json!([])).into_response(),
+            Err(e) => {
+                tracing::error!(
+                    component = "qbcompat",
+                    operation = "list_webseeds",
+                    torrent = %hash,
+                    result = "error",
+                    error = %e,
+                    "qBit webseed listing failed"
+                );
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+        },
+    }
+}
+
+async fn torrents_piece_states(
+    State(s): State<AppState>,
+    Query(q): Query<HashQuery>,
+) -> impl IntoResponse {
+    let Some(hash) = q.hash else {
+        return Json(json!([])).into_response();
+    };
+    match s.backend.piece_states(&hash).await {
+        Ok(states) => {
+            let states: Vec<i32> = states
+                .into_iter()
+                .map(|state| match state {
+                    BackendPieceState::Missing => 0,
+                    BackendPieceState::Partial => 1,
+                    BackendPieceState::Complete => 2,
+                })
+                .collect();
+            Json(json!(states)).into_response()
+        }
+        Err(_) => match s.db.get(&hash) {
+            Ok(Some(_)) | Ok(None) => Json(json!([])).into_response(),
+            Err(e) => {
+                tracing::error!(
+                    component = "qbcompat",
+                    operation = "piece_states",
+                    torrent = %hash,
+                    result = "error",
+                    error = %e,
+                    "qBit piece state query failed"
+                );
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+        },
+    }
+}
+
+async fn torrents_piece_hashes(
+    State(s): State<AppState>,
+    Query(q): Query<HashQuery>,
+) -> impl IntoResponse {
+    let Some(hash) = q.hash else {
+        return Json(json!([])).into_response();
+    };
+    match s.backend.piece_hashes(&hash).await {
+        Ok(hashes) => Json(json!(hashes)).into_response(),
+        Err(_) => match s.db.get(&hash) {
+            Ok(Some(_)) | Ok(None) => Json(json!([])).into_response(),
+            Err(e) => {
+                tracing::error!(
+                    component = "qbcompat",
+                    operation = "piece_hashes",
+                    torrent = %hash,
+                    result = "error",
+                    error = %e,
+                    "qBit piece hash query failed"
+                );
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+        },
+    }
+}
+
 async fn categories(State(s): State<AppState>) -> impl IntoResponse {
     match s.db.list_categories() {
         Ok(cats) => {
@@ -2527,6 +2878,59 @@ fn is_status_filter(f: &str) -> bool {
             | "moving"
             | "errored"
     )
+}
+
+fn search_plugin_value(name: &str, source: &str, enabled: bool) -> serde_json::Value {
+    json!({
+        "name": name,
+        "fullName": name,
+        "version": "",
+        "url": source,
+        "enabled": enabled,
+        "supportedCategories": ["all"],
+    })
+}
+
+fn plugin_name_from_source(source: &str) -> String {
+    source
+        .trim_end_matches('/')
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(source)
+        .to_owned()
+}
+
+fn split_qbit_list(raw: &str) -> Vec<String> {
+    raw.split(['|', ','])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn parse_bool_param(value: Option<&str>, default: bool) -> bool {
+    match value.map(str::trim).map(str::to_ascii_lowercase) {
+        Some(value) if matches!(value.as_str(), "true" | "1" | "yes" | "on") => true,
+        Some(value) if matches!(value.as_str(), "false" | "0" | "no" | "off") => false,
+        _ => default,
+    }
+}
+
+fn rss_leaf_name(path: &str) -> String {
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(path)
+        .to_owned()
+}
+
+fn now_unix_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 fn redact_log_url(value: &str) -> String {

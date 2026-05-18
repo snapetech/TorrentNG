@@ -117,6 +117,27 @@ pub trait TorrentBackend: Send + Sync {
     async fn edit_tracker(&self, hash: &str, original_url: &str, new_url: &str) -> Result<()>;
     async fn remove_tracker(&self, hash: &str, url: &str) -> Result<()>;
     async fn list_files(&self, hash: &str) -> Result<Vec<RawFile>>;
+    async fn list_webseeds(&self, _hash: &str) -> Result<Vec<String>> {
+        bail!(
+            "{} backend does not support webseed reads",
+            self.backend_type().as_str()
+        )
+    }
+
+    async fn piece_states(&self, _hash: &str) -> Result<Vec<BackendPieceState>> {
+        bail!(
+            "{} backend does not support piece state reads",
+            self.backend_type().as_str()
+        )
+    }
+
+    async fn piece_hashes(&self, _hash: &str) -> Result<Vec<String>> {
+        bail!(
+            "{} backend does not support piece hash reads",
+            self.backend_type().as_str()
+        )
+    }
+
     async fn set_file_priority(&self, hash: &str, file_index: usize, priority: i64) -> Result<()>;
     async fn set_category(&self, hash: &str, category: &str) -> Result<()>;
     async fn set_location(&self, _hash: &str, _location: &str) -> Result<()> {
@@ -329,4 +350,12 @@ pub enum QueueMove {
     Down,
     Top,
     Bottom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackendPieceState {
+    Missing,
+    Partial,
+    Complete,
 }

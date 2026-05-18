@@ -15,7 +15,7 @@ use std::{
     },
     time::Instant,
 };
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, RwLock};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::services::{ServeDir, ServeFile};
 
@@ -34,6 +34,10 @@ pub struct AppState {
     pub db: Arc<Db>,
     pub events: broadcast::Sender<crate::api::ws::Event>,
     pub metrics: SharedMetrics,
+    pub qbit_search_plugins: Arc<RwLock<serde_json::Map<String, serde_json::Value>>>,
+    pub qbit_search_jobs: Arc<RwLock<serde_json::Map<String, serde_json::Value>>>,
+    pub qbit_next_search_id: Arc<AtomicU64>,
+    pub qbit_rss_items: Arc<RwLock<serde_json::Map<String, serde_json::Value>>>,
 }
 
 pub fn build_router(state: AppState) -> Router {
