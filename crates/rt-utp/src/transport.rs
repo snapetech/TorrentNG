@@ -1,10 +1,16 @@
 use std::{
+    collections::HashMap,
     net::SocketAddr,
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use rand::Rng;
-use tokio::{net::UdpSocket, time::timeout};
+use tokio::{
+    net::UdpSocket,
+    sync::{mpsc, Mutex},
+    time::timeout,
+};
 
 use crate::{
     error::UtpError,
@@ -36,13 +42,38 @@ pub struct UtpListener {
     config: UtpTransportConfig,
 }
 
+#[derive(Clone)]
+pub struct UtpEndpoint {
+    socket: Arc<UdpSocket>,
+    config: UtpTransportConfig,
+    accepted_rx: Arc<Mutex<mpsc::Receiver<Result<UtpStream, UtpError>>>>,
+}
+
 pub struct UtpStream {
-    socket: UdpSocket,
+    socket: Arc<UdpSocket>,
     peer: SocketAddr,
     conn: UtpConnection,
     config: UtpTransportConfig,
     last_remote_timestamp_us: u32,
     read_buf: Vec<u8>,
+    routed_rx: Option<mpsc::Receiver<UtpPacket>>,
+}
+
+impl std::fmt::Debug for UtpStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UtpStream")
+            .field("peer", &self.peer)
+            .field("state", &self.conn.state())
+            .field("ids", &self.conn.ids())
+            .field("routed", &self.routed_rx.is_some())
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct UtpRouteKey {
+    peer: SocketAddr,
+    recv_connection_id: u16,
 }
 
 impl UtpListener {
@@ -89,13 +120,135 @@ impl UtpListener {
             let state = conn.build_state(now_us(), timestamp_diff_us(packet.header.timestamp_us));
             send_packet(&self.socket, &state).await?;
             return Ok(UtpStream {
-                socket: self.socket,
+                socket: Arc::new(self.socket),
                 peer,
                 conn,
                 config: self.config,
                 last_remote_timestamp_us: packet.header.timestamp_us,
                 read_buf: Vec::new(),
+                routed_rx: None,
             });
+        }
+    }
+}
+
+impl UtpEndpoint {
+    pub async fn bind(addr: SocketAddr) -> Result<Self, UtpError> {
+        Self::bind_with_config(addr, UtpTransportConfig::default()).await
+    }
+
+    pub async fn bind_with_config(
+        addr: SocketAddr,
+        config: UtpTransportConfig,
+    ) -> Result<Self, UtpError> {
+        let socket = UdpSocket::bind(addr)
+            .await
+            .map_err(|err| UtpError::Io(err.to_string()))?;
+        let socket = Arc::new(socket);
+        let streams = Arc::new(Mutex::new(HashMap::new()));
+        let (accepted_tx, accepted_rx) = mpsc::channel(256);
+        tokio::spawn(run_endpoint_recv(
+            socket.clone(),
+            config,
+            streams.clone(),
+            accepted_tx,
+        ));
+        Ok(Self {
+            socket,
+            config,
+            accepted_rx: Arc::new(Mutex::new(accepted_rx)),
+        })
+    }
+
+    pub fn local_addr(&self) -> Result<SocketAddr, UtpError> {
+        self.socket
+            .local_addr()
+            .map_err(|err| UtpError::Io(err.to_string()))
+    }
+
+    pub async fn accept(&self) -> Result<UtpStream, UtpError> {
+        timeout(self.config.handshake_timeout, async {
+            self.accepted_rx
+                .lock()
+                .await
+                .recv()
+                .await
+                .ok_or(UtpError::Closed)?
+        })
+        .await
+        .map_err(|_| UtpError::Timeout)?
+    }
+}
+
+async fn run_endpoint_recv(
+    socket: Arc<UdpSocket>,
+    config: UtpTransportConfig,
+    streams: Arc<Mutex<HashMap<UtpRouteKey, mpsc::Sender<UtpPacket>>>>,
+    accepted_tx: mpsc::Sender<Result<UtpStream, UtpError>>,
+) {
+    let mut buf = vec![0u8; config.max_datagram_len];
+    loop {
+        let (len, peer) = match socket.recv_from(&mut buf).await {
+            Ok(result) => result,
+            Err(err) => {
+                let _ = accepted_tx.send(Err(UtpError::Io(err.to_string()))).await;
+                break;
+            }
+        };
+        let packet = match UtpPacket::parse(&buf[..len]) {
+            Ok(packet) => packet,
+            Err(error) => {
+                let _ = accepted_tx.send(Err(error)).await;
+                continue;
+            }
+        };
+        let key = UtpRouteKey {
+            peer,
+            recv_connection_id: packet.header.connection_id,
+        };
+        if packet.header.packet_type != PacketType::Syn {
+            let tx = {
+                let streams = streams.lock().await;
+                streams.get(&key).cloned()
+            };
+            if let Some(tx) = tx {
+                let _ = tx.try_send(packet);
+            }
+            continue;
+        }
+
+        let conn = match UtpConnection::accept(&packet.header, random_seq_nr()) {
+            Ok(conn) => conn,
+            Err(error) => {
+                let _ = accepted_tx.send(Err(error)).await;
+                continue;
+            }
+        };
+        let state = conn.build_state(now_us(), timestamp_diff_us(packet.header.timestamp_us));
+        if let Err(error) = send_packet_to(&socket, peer, &state).await {
+            let _ = accepted_tx.send(Err(error)).await;
+            continue;
+        }
+
+        let (tx, rx) = mpsc::channel(256);
+        streams.lock().await.insert(
+            UtpRouteKey {
+                peer,
+                recv_connection_id: conn.ids().recv,
+            },
+            tx,
+        );
+        let stream = UtpStream {
+            socket: socket.clone(),
+            peer,
+            conn,
+            config,
+            last_remote_timestamp_us: packet.header.timestamp_us,
+            read_buf: Vec::new(),
+            routed_rx: Some(rx),
+        };
+        if accepted_tx.send(Ok(stream)).await.is_err() {
+            break;
         }
     }
 }
@@ -144,12 +297,13 @@ impl UtpStream {
             });
         }
         Ok(Self {
-            socket,
+            socket: Arc::new(socket),
             peer,
             conn,
             config,
             last_remote_timestamp_us: packet.header.timestamp_us,
             read_buf: Vec::new(),
+            routed_rx: None,
         })
     }
 
@@ -170,15 +324,9 @@ impl UtpStream {
             );
             let mut acknowledged = false;
             for _ in 0..=self.config.max_retransmits {
-                send_packet(&self.socket, &packet).await?;
+                self.send_packet(&packet).await?;
                 loop {
-                    let ack = match recv_packet(
-                        &self.socket,
-                        self.config.io_timeout,
-                        self.config.max_datagram_len,
-                    )
-                    .await
-                    {
+                    let ack = match self.recv_packet(self.config.io_timeout).await {
                         Ok(ack) => ack,
                         Err(UtpError::Timeout) => {
                             self.conn.on_timeout();
@@ -232,26 +380,21 @@ impl UtpStream {
 
     pub async fn recv(&mut self) -> Result<Vec<u8>, UtpError> {
         loop {
-            let packet = recv_packet(
-                &self.socket,
-                self.config.io_timeout,
-                self.config.max_datagram_len,
-            )
-            .await?;
+            let packet = self.recv_packet(self.config.io_timeout).await?;
             self.last_remote_timestamp_us = packet.header.timestamp_us;
             match self.conn.on_inbound(&packet)? {
                 InboundAction::DeliverPayload => {
                     let ack = self
                         .conn
                         .build_state(now_us(), timestamp_diff_us(packet.header.timestamp_us));
-                    send_packet(&self.socket, &ack).await?;
+                    self.send_packet(&ack).await?;
                     return Ok(packet.payload);
                 }
                 InboundAction::Close => {
                     let ack = self
                         .conn
                         .build_state(now_us(), timestamp_diff_us(packet.header.timestamp_us));
-                    send_packet(&self.socket, &ack).await?;
+                    self.send_packet(&ack).await?;
                     self.conn.mark_closed();
                     return Ok(Vec::new());
                 }
@@ -267,14 +410,8 @@ impl UtpStream {
             .build_fin(now_us(), timestamp_diff_us(self.last_remote_timestamp_us));
         let mut packet = None;
         for _ in 0..=self.config.max_retransmits {
-            send_packet(&self.socket, &fin).await?;
-            match recv_packet(
-                &self.socket,
-                self.config.io_timeout,
-                self.config.max_datagram_len,
-            )
-            .await
-            {
+            self.send_packet(&fin).await?;
+            match self.recv_packet(self.config.io_timeout).await {
                 Ok(received) => {
                     packet = Some(received);
                     break;
@@ -291,12 +428,44 @@ impl UtpStream {
         self.conn.mark_closed();
         Ok(())
     }
+
+    async fn send_packet(&self, packet: &UtpPacket) -> Result<(), UtpError> {
+        if self.routed_rx.is_some() {
+            send_packet_to(&self.socket, self.peer, packet).await
+        } else {
+            send_packet(&self.socket, packet).await
+        }
+    }
+
+    async fn recv_packet(&mut self, wait: Duration) -> Result<UtpPacket, UtpError> {
+        if let Some(rx) = &mut self.routed_rx {
+            timeout(wait, rx.recv())
+                .await
+                .map_err(|_| UtpError::Timeout)?
+                .ok_or(UtpError::Closed)
+        } else {
+            recv_packet(&self.socket, wait, self.config.max_datagram_len).await
+        }
+    }
 }
 
 async fn send_packet(socket: &UdpSocket, packet: &UtpPacket) -> Result<(), UtpError> {
     let bytes = packet.encode()?;
     socket
         .send(&bytes)
+        .await
+        .map(|_| ())
+        .map_err(|err| UtpError::Io(err.to_string()))
+}
+
+async fn send_packet_to(
+    socket: &UdpSocket,
+    peer: SocketAddr,
+    packet: &UtpPacket,
+) -> Result<(), UtpError> {
+    let bytes = packet.encode()?;
+    socket
+        .send_to(&bytes, peer)
         .await
         .map(|_| ())
         .map_err(|err| UtpError::Io(err.to_string()))
@@ -391,6 +560,34 @@ mod tests {
         client.read_exact(&mut second).await.unwrap();
         assert_eq!(&first, b"hel");
         assert_eq!(&second, b"loworld");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn utp_endpoint_accepts_multiple_streams_on_one_socket() {
+        let endpoint = UtpEndpoint::bind_with_config("127.0.0.1:0".parse().unwrap(), test_config())
+            .await
+            .unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut first = endpoint.accept().await.unwrap();
+            let mut second = endpoint.accept().await.unwrap();
+            assert_eq!(first.recv().await.unwrap(), b"first");
+            assert_eq!(second.recv().await.unwrap(), b"second");
+            first.send(b"ack-first").await.unwrap();
+            second.send(b"ack-second").await.unwrap();
+        });
+
+        let mut first = UtpStream::connect_with_config(addr, test_config())
+            .await
+            .unwrap();
+        let mut second = UtpStream::connect_with_config(addr, test_config())
+            .await
+            .unwrap();
+        first.send(b"first").await.unwrap();
+        second.send(b"second").await.unwrap();
+        assert_eq!(first.recv().await.unwrap(), b"ack-first");
+        assert_eq!(second.recv().await.unwrap(), b"ack-second");
         server.await.unwrap();
     }
 }

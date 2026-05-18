@@ -68,9 +68,9 @@ pub fn build_router(_state: AppState) -> Router<AppState> {
         .route("/torrents/renameFile", post(torrents_rename_file))
         .route("/torrents/renameFolder", post(torrents_rename_file))
         .route("/torrents/downloadLimit", get(empty_object))
-        .route("/torrents/setDownloadLimit", post(ok_form))
+        .route("/torrents/setDownloadLimit", post(torrents_set_download_limit))
         .route("/torrents/uploadLimit", get(empty_object))
-        .route("/torrents/setUploadLimit", post(ok_form))
+        .route("/torrents/setUploadLimit", post(torrents_set_upload_limit))
         .route("/torrents/setShareLimits", post(torrents_set_share_limits))
         .route("/torrents/setLocation", post(torrents_set_location))
         .route("/torrents/setSavePath", post(torrents_set_location))
@@ -1661,6 +1661,57 @@ struct ShareLimitsForm {
     ratio_limit: Option<f64>,
     #[serde(rename = "seedingTimeLimit")]
     seeding_time_limit: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct SpeedLimitForm {
+    hashes: Option<String>,
+    limit: Option<i64>,
+}
+
+async fn torrents_set_download_limit(
+    State(s): State<AppState>,
+    Form(f): Form<SpeedLimitForm>,
+) -> StatusCode {
+    torrents_set_speed_limit(s, f, true).await
+}
+
+async fn torrents_set_upload_limit(
+    State(s): State<AppState>,
+    Form(f): Form<SpeedLimitForm>,
+) -> StatusCode {
+    torrents_set_speed_limit(s, f, false).await
+}
+
+async fn torrents_set_speed_limit(
+    s: AppState,
+    f: SpeedLimitForm,
+    download: bool,
+) -> StatusCode {
+    let limit = f.limit.filter(|value| *value > 0);
+    let operation = if download {
+        "set_download_limit"
+    } else {
+        "set_upload_limit"
+    };
+    for hash in split_hashes(&s.db, f.hashes.as_deref()) {
+        let result = if download {
+            s.backend.set_download_limit(&hash, limit).await
+        } else {
+            s.backend.set_upload_limit(&hash, limit).await
+        };
+        if let Err(e) = result {
+            tracing::warn!(
+                component = "qbcompat",
+                operation,
+                torrent = %hash,
+                result = "error",
+                error = %e,
+                "qBit speed limit update failed"
+            );
+        }
+    }
+    StatusCode::OK
 }
 
 async fn torrents_set_share_limits(

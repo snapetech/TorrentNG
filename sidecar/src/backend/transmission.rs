@@ -371,6 +371,60 @@ impl TorrentBackend for TransmissionBackend {
         .await?;
         Ok(())
     }
+
+    async fn set_download_limit(&self, hash: &str, limit: Option<i64>) -> Result<()> {
+        let kib = limit.filter(|value| *value > 0).map(bytes_to_kib_ceil);
+        self.rpc(
+            "torrent-set",
+            json!({
+                "ids": [hash],
+                "downloadLimited": kib.is_some(),
+                "downloadLimit": kib,
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn set_upload_limit(&self, hash: &str, limit: Option<i64>) -> Result<()> {
+        let kib = limit.filter(|value| *value > 0).map(bytes_to_kib_ceil);
+        self.rpc(
+            "torrent-set",
+            json!({
+                "ids": [hash],
+                "uploadLimited": kib.is_some(),
+                "uploadLimit": kib,
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn set_global_download_limit(&self, limit: i64) -> Result<()> {
+        let kib = (limit > 0).then_some(bytes_to_kib_ceil(limit));
+        self.rpc(
+            "session-set",
+            json!({
+                "speed-limit-down-enabled": kib.is_some(),
+                "speed-limit-down": kib.unwrap_or(0),
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn set_global_upload_limit(&self, limit: i64) -> Result<()> {
+        let kib = (limit > 0).then_some(bytes_to_kib_ceil(limit));
+        self.rpc(
+            "session-set",
+            json!({
+                "speed-limit-up-enabled": kib.is_some(),
+                "speed-limit-up": kib.unwrap_or(0),
+            }),
+        )
+        .await?;
+        Ok(())
+    }
 }
 
 impl TransmissionBackend {
@@ -390,6 +444,10 @@ fn empty_to_null(value: &str) -> Value {
     } else {
         json!(value)
     }
+}
+
+fn bytes_to_kib_ceil(bytes: i64) -> i64 {
+    (bytes + 1023) / 1024
 }
 
 fn map_torrent(t: &Value) -> RawTorrent {

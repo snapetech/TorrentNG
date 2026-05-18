@@ -102,6 +102,7 @@ pub async fn run_metadata_task(
                             )
                         }
                     }},
+                    TorrentCmd::AcceptUtpPeer { .. } => {}
                     TorrentCmd::Shutdown => {
                         if !paused {
                             announce_trackers(

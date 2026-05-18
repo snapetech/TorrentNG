@@ -374,6 +374,40 @@ impl TorrentBackend for QbittorrentBackend {
         .await
     }
 
+    async fn set_download_limit(&self, hash: &str, limit: Option<i64>) -> Result<()> {
+        let limit = limit.unwrap_or(0).max(0).to_string();
+        self.post_form(
+            "api/v2/torrents/setDownloadLimit",
+            &[("hashes", hash), ("limit", &limit)],
+        )
+        .await
+    }
+
+    async fn set_upload_limit(&self, hash: &str, limit: Option<i64>) -> Result<()> {
+        let limit = limit.unwrap_or(0).max(0).to_string();
+        self.post_form(
+            "api/v2/torrents/setUploadLimit",
+            &[("hashes", hash), ("limit", &limit)],
+        )
+        .await
+    }
+
+    async fn set_global_download_limit(&self, limit: i64) -> Result<()> {
+        self.post_form(
+            "api/v2/transfer/setDownloadLimit",
+            &[("limit", &limit.max(0).to_string())],
+        )
+        .await
+    }
+
+    async fn set_global_upload_limit(&self, limit: i64) -> Result<()> {
+        self.post_form(
+            "api/v2/transfer/setUploadLimit",
+            &[("limit", &limit.max(0).to_string())],
+        )
+        .await
+    }
+
     async fn toggle_sequential_download(&self, hash: &str) -> Result<()> {
         self.post_form(
             "api/v2/torrents/toggleSequentialDownload",

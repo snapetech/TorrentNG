@@ -41,6 +41,11 @@ TORRENTNGD_CONFIG=/config/config.toml torrentngd
 | `upload_rate_limit` | `0` | Upload limit in bytes/sec; `0` means unlimited |
 | `download_rate_limit` | `0` | Download limit in bytes/sec; `0` means unlimited |
 
+Experimental uTP transport is controlled by environment while it remains
+opt-in. `TNG_UTP_OUTGOING=prefer|only` enables outbound uTP peer-wire dialing
+(`prefer` falls back to TCP), and `TNG_UTP_INCOMING=1` binds the shared UDP
+incoming uTP endpoint on `listen_port`.
+
 ### `[storage]`
 
 | Key | Default | Description |

@@ -349,6 +349,36 @@ impl TorrentBackend for TorrentngBackend {
         .await
     }
 
+    async fn set_download_limit(&self, hash: &str, limit: Option<i64>) -> Result<()> {
+        self.put_limits(
+            hash,
+            json!({
+                "download_limit": limit.filter(|value| *value > 0).map_or(Value::Null, Value::from),
+            }),
+        )
+        .await
+    }
+
+    async fn set_upload_limit(&self, hash: &str, limit: Option<i64>) -> Result<()> {
+        self.put_limits(
+            hash,
+            json!({
+                "upload_limit": limit.filter(|value| *value > 0).map_or(Value::Null, Value::from),
+            }),
+        )
+        .await
+    }
+
+    async fn set_global_download_limit(&self, limit: i64) -> Result<()> {
+        self.put_transfer_limits(json!({ "download_limit": limit.max(0) }))
+            .await
+    }
+
+    async fn set_global_upload_limit(&self, limit: i64) -> Result<()> {
+        self.put_transfer_limits(json!({ "upload_limit": limit.max(0) }))
+            .await
+    }
+
     async fn toggle_sequential_download(&self, hash: &str) -> Result<()> {
         let limits: Value = self
             .get_json(&format!("api/v1/torrents/{hash}/limits"))
@@ -413,6 +443,17 @@ impl TorrentngBackend {
         .with_context(|| format!("TorrentNG PUT torrent {hash} limits"))?
         .error_for_status()
         .with_context(|| format!("TorrentNG PUT torrent {hash} limits"))?;
+        Ok(())
+    }
+
+    async fn put_transfer_limits(&self, body: Value) -> Result<()> {
+        self.request(reqwest::Method::PUT, "api/v1/transfer/limits")?
+            .json(&body)
+            .send()
+            .await
+            .context("TorrentNG PUT transfer limits")?
+            .error_for_status()
+            .context("TorrentNG PUT transfer limits")?;
         Ok(())
     }
 }

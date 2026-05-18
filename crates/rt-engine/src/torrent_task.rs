@@ -98,6 +98,12 @@ pub enum TorrentCmd {
         peer_addr: SocketAddr,
         handshake: Handshake,
     },
+    /// An inbound uTP peer whose handshake already matched this torrent.
+    AcceptUtpPeer {
+        stream: UtpStream,
+        peer_addr: SocketAddr,
+        handshake: Handshake,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -643,6 +649,15 @@ impl TorrentTask {
                                 self.accept_peer(stream, peer_addr, handshake).await;
                             }
                         }
+                        TorrentCmd::AcceptUtpPeer {
+                            stream,
+                            peer_addr,
+                            handshake,
+                        } => {
+                            if !self.paused {
+                                self.accept_utp_peer(stream, peer_addr, handshake).await;
+                            }
+                        }
                         TorrentCmd::Recheck { job_id } => {
                             if matches!(self.run_recheck(job_id).await, RecheckOutcome::Shutdown) {
                                 break;
@@ -1118,6 +1133,58 @@ impl TorrentTask {
                     result = "ended",
                     error = %e,
                     "incoming peer ended"
+                );
+                let _ = disconnect_tx
+                    .send(PeerEvent::Disconnected {
+                        peer: peer_addr,
+                        outstanding: Vec::new(),
+                    })
+                    .await;
+            }
+        });
+    }
+
+    async fn accept_utp_peer(
+        &mut self,
+        stream: UtpStream,
+        peer_addr: SocketAddr,
+        handshake: Handshake,
+    ) {
+        if self.active_peers.len() >= self.max_peers || self.active_peers.contains_key(&peer_addr) {
+            return;
+        }
+        if !self.peer_source_allowed(peer_addr) {
+            debug!(
+                torrent = %self.info_hash_hex,
+                peer = %peer_addr,
+                "rejecting inbound uTP peer not returned by private tracker"
+            );
+            return;
+        }
+        let info_hash = self.meta.info_hash;
+        let peer_cmd_rx = self.register_peer(peer_addr);
+        let peer_event_tx = self.peer_event_tx.clone();
+        let upload = self.upload_context(peer_addr);
+        tokio::spawn(async move {
+            let disconnect_tx = peer_event_tx.clone();
+            if let Err(e) = run_incoming_utp_peer(
+                stream,
+                peer_addr,
+                info_hash,
+                peer_event_tx,
+                peer_cmd_rx,
+                upload,
+                handshake.reserved.supports_extension_protocol(),
+            )
+            .await
+            {
+                debug!(
+                    component = "peer",
+                    operation = "run_incoming_utp",
+                    peer = %peer_addr,
+                    result = "ended",
+                    error = %e,
+                    "incoming uTP peer ended"
                 );
                 let _ = disconnect_tx
                     .send(PeerEvent::Disconnected {
@@ -2410,6 +2477,7 @@ impl TorrentTask {
                     let _ = reply.send(self.runtime_stats());
                 }
                 Ok(TorrentCmd::AcceptPeer { .. }) => {}
+                Ok(TorrentCmd::AcceptUtpPeer { .. }) => {}
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return None,
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                     return Some(RecheckOutcome::Shutdown);
@@ -3356,6 +3424,35 @@ async fn run_incoming_peer(
     }
 
     let mut peer_io = PeerIo::Tcp(framed);
+    send_extension_handshake(
+        &mut peer_io,
+        upload.metadata.as_ref(),
+        upload.is_private,
+        remote_supports_extension,
+    )
+    .await?;
+    send_have_state(&mut peer_io, &upload.have_pieces).await?;
+    peer_io.send(Message::Interested).await?;
+    run_peer_loop(addr, peer_io, peer_event_tx, peer_cmd_rx, upload).await
+}
+
+async fn run_incoming_utp_peer(
+    mut stream: UtpStream,
+    addr: SocketAddr,
+    info_hash: [u8; 20],
+    peer_event_tx: mpsc::Sender<PeerEvent>,
+    peer_cmd_rx: mpsc::Receiver<PeerCommand>,
+    upload: UploadContext,
+    remote_supports_extension: bool,
+) -> anyhow::Result<()> {
+    let our_hs = Handshake {
+        info_hash,
+        peer_id: OUR_PEER_ID,
+        reserved: ExtensionFlags::with_extension_protocol(),
+    };
+    stream.write_all(&our_hs.encode()).await?;
+
+    let mut peer_io = PeerIo::Utp(UtpPeerIo { stream });
     send_extension_handshake(
         &mut peer_io,
         upload.metadata.as_ref(),

@@ -24,6 +24,11 @@ still routes peer-wire sessions through TCP.
   - payload receive and ACK response;
   - FIN close;
   - bounded retransmission attempts.
+- Shared UDP `UtpEndpoint` acceptor:
+  - binds one UDP socket for the peer port;
+  - demultiplexes packets by remote address and receive connection ID;
+  - accepts multiple incoming uTP streams without consuming the listener socket;
+  - routes DATA/FIN/STATE packets into per-stream bounded queues.
 - Byte-stream helpers over DATA payloads:
   - `write_all` chunks arbitrary byte slices across uTP DATA packets;
   - `read_exact` buffers received DATA payloads and can satisfy reads across
@@ -117,9 +122,13 @@ The native health capability surface also reports:
 - `networking.utp_udp_stream=true`: `rt-utp` has async UDP stream primitives.
 - `networking.utp_outgoing_opt_in=true`: the engine contains an explicit
   outbound uTP peer-wire path.
+- `networking.utp_incoming_opt_in=true`: the engine can bind a shared incoming
+  uTP peer endpoint when `TNG_UTP_INCOMING=1` is set.
 - `networking.utp_outgoing_policy`: `TNG_UTP_OUTGOING` when set, otherwise
   `prefer` for the legacy `TNG_ENABLE_UTP_OUTGOING` flag or `off`.
 - `networking.utp_outgoing_enabled`: whether either outbound uTP opt-in is set.
+- `networking.utp_incoming_enabled`: whether `TNG_UTP_INCOMING` is currently
+  enabled for the engine process.
 
 ## Engine Integration Progress
 
@@ -127,5 +136,10 @@ The engine peer loop now has a transport-neutral `PeerIo` adapter and an
 outbound `UtpStream` peer-wire path. `TNG_UTP_OUTGOING=prefer` attempts uTP and
 falls back to TCP if the uTP connect fails; `TNG_UTP_OUTGOING=only` disables
 that fallback. The legacy `TNG_ENABLE_UTP_OUTGOING` flag maps to `prefer`.
-The path remains opt-in while the incoming UDP listener, connection demux, and
-default policy are still incomplete.
+The engine also has an incoming shared `UtpEndpoint` peer listener behind
+`TNG_UTP_INCOMING=1`; accepted streams are routed by peer-wire handshake to the
+same torrent tasks as TCP peers.
+
+The path remains opt-in while default policy, production interop, metadata
+fetch over incoming uTP, and tracker/DHT peer transport preference evidence are
+still incomplete.

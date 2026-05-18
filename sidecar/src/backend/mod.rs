@@ -140,6 +140,34 @@ pub trait TorrentBackend: Send + Sync {
             self.backend_type().as_str()
         )
     }
+    async fn set_download_limit(&self, _hash: &str, _limit: Option<i64>) -> Result<()> {
+        bail!(
+            "{} backend does not support per-torrent download limits",
+            self.backend_type().as_str()
+        )
+    }
+
+    async fn set_upload_limit(&self, _hash: &str, _limit: Option<i64>) -> Result<()> {
+        bail!(
+            "{} backend does not support per-torrent upload limits",
+            self.backend_type().as_str()
+        )
+    }
+
+    async fn set_global_download_limit(&self, _limit: i64) -> Result<()> {
+        bail!(
+            "{} backend does not support global download limits",
+            self.backend_type().as_str()
+        )
+    }
+
+    async fn set_global_upload_limit(&self, _limit: i64) -> Result<()> {
+        bail!(
+            "{} backend does not support global upload limits",
+            self.backend_type().as_str()
+        )
+    }
+
     async fn toggle_sequential_download(&self, _hash: &str) -> Result<()> {
         bail!(
             "{} backend does not support sequential download toggles",

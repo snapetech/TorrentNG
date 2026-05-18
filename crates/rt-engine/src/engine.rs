@@ -1,5 +1,6 @@
-/// Top-level engine: manages torrent task lifecycle and incoming TCP listener.
 use std::collections::HashMap;
+/// Top-level engine: manages torrent task lifecycle and incoming peer listeners.
+use std::future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,6 +32,7 @@ use rt_storage::{
     StorageError, StorageIoConfig, StoragePlan, StoragePlanStep, V2FileHash, V2FileVerifier,
     VerifyResult,
 };
+use rt_utp::{UtpEndpoint, UtpStream};
 
 use crate::command::{
     CmdResult, EngineCmd, EngineGlobalLimits, EngineJob, EnginePeerSnapshot, EnginePieceState,
@@ -719,7 +721,7 @@ impl Engine {
         engine.recover_interrupted_jobs()?;
         engine.load_persisted_torrents().await?;
 
-        // Spawn TCP listener
+        // Spawn TCP listener.
         let listen_addr: SocketAddr = format!("0.0.0.0:{}", config.network.listen_port)
             .parse()
             .context("invalid listen_port")?;
@@ -730,12 +732,26 @@ impl Engine {
             addr = %listen_addr,
             "TCP peer listener bound"
         );
+        let utp_endpoint = if incoming_utp_enabled() {
+            let endpoint = UtpEndpoint::bind(listen_addr)
+                .await
+                .context("binding uTP peer listener")?;
+            info!(
+                component = "peer_listener",
+                operation = "listen_utp",
+                addr = %listen_addr,
+                "uTP peer listener bound"
+            );
+            Some(endpoint)
+        } else {
+            None
+        };
 
-        tokio::spawn(engine.run(listener));
+        tokio::spawn(engine.run(listener, utp_endpoint));
         Ok(handle)
     }
 
-    async fn run(mut self, listener: TcpListener) {
+    async fn run(mut self, listener: TcpListener, utp_endpoint: Option<UtpEndpoint>) {
         loop {
             tokio::select! {
                 Some(cmd) = self.cmd_rx.recv() => {
@@ -759,6 +775,34 @@ impl Engine {
                             );
                         }
                     });
+                }
+                utp_result = accept_utp_peer(utp_endpoint.as_ref()) => {
+                    match utp_result {
+                        Ok((stream, peer_addr)) => {
+                            let chans = self.torrent_chans.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = handle_incoming_utp(stream, peer_addr, chans).await {
+                                    warn!(
+                                        component = "peer_listener",
+                                        operation = "accept_utp_peer",
+                                        peer = %peer_addr,
+                                        result = "error",
+                                        error = %e,
+                                        "incoming uTP peer error"
+                                    );
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            warn!(
+                                component = "peer_listener",
+                                operation = "accept_utp_peer",
+                                result = "error",
+                                error = %e,
+                                "uTP accept failed"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -6317,4 +6361,52 @@ async fn handle_incoming(
     .await
     .map_err(|_| anyhow::anyhow!("torrent task gone for incoming info_hash {info_hash_hex}"))?;
     Ok(())
+}
+
+async fn accept_utp_peer(
+    endpoint: Option<&UtpEndpoint>,
+) -> anyhow::Result<(UtpStream, SocketAddr)> {
+    let Some(endpoint) = endpoint else {
+        future::pending::<()>().await;
+        unreachable!("pending future never resolves");
+    };
+    let stream = endpoint.accept().await?;
+    let peer_addr = stream.peer_addr();
+    Ok((stream, peer_addr))
+}
+
+async fn handle_incoming_utp(
+    mut stream: UtpStream,
+    peer_addr: SocketAddr,
+    torrent_chans: HashMap<String, mpsc::Sender<TorrentCmd>>,
+) -> anyhow::Result<()> {
+    let mut hs = [0u8; HANDSHAKE_LEN];
+    stream.read_exact(&mut hs).await?;
+    let handshake = Handshake::parse(&hs)?;
+    let info_hash_hex: String = handshake
+        .info_hash
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let tx = torrent_chans
+        .get(&info_hash_hex)
+        .ok_or_else(|| anyhow::anyhow!("no torrent for incoming uTP info_hash {info_hash_hex}"))?;
+    tx.send(TorrentCmd::AcceptUtpPeer {
+        stream,
+        peer_addr,
+        handshake,
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("torrent task gone for incoming uTP info_hash {info_hash_hex}"))?;
+    Ok(())
+}
+
+fn incoming_utp_enabled() -> bool {
+    match std::env::var("TNG_UTP_INCOMING") {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
 }

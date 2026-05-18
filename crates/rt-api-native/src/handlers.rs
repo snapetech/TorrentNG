@@ -14,7 +14,7 @@ use futures::Stream;
 use rt_api_model::{
     AddTorrentRequest, AddTorrentResponse, ApiError, FileInfo, TorrentDetail, TorrentSummary,
 };
-use rt_engine::{EngineJob, EngineTorrentLimits};
+use rt_engine::{EngineGlobalLimits, EngineJob, EngineTorrentLimits};
 use rt_metainfo::{parse_magnet, parse_torrent};
 use rt_metrics::MemoryClass;
 use rt_session::{TorrentEntry, TorrentState};
@@ -504,6 +504,98 @@ where
     D: Deserializer<'de>,
 {
     serde_json::Value::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Serialize)]
+pub struct TransferLimitsResponse {
+    pub download_limit: i64,
+    pub upload_limit: i64,
+    pub speed_limits_mode: bool,
+}
+
+impl From<EngineGlobalLimits> for TransferLimitsResponse {
+    fn from(limits: EngineGlobalLimits) -> Self {
+        Self {
+            download_limit: limits.download_limit,
+            upload_limit: limits.upload_limit,
+            speed_limits_mode: limits.speed_limits_mode,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateTransferLimitsRequest {
+    pub download_limit: Option<i64>,
+    pub upload_limit: Option<i64>,
+    pub speed_limits_mode: Option<bool>,
+}
+
+/// `GET /api/v1/transfer/limits` — read global transfer limits.
+pub async fn transfer_limits(State(state): State<AppState>) -> impl IntoResponse {
+    let Some(engine) = &state.engine else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                serde_json::to_value(ApiError::internal("native engine is not available")).unwrap(),
+            ),
+        )
+            .into_response();
+    };
+    match engine.global_limits().await {
+        Ok(limits) => (StatusCode::OK, Json(TransferLimitsResponse::from(limits))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError::bad_request(e)).unwrap()),
+        )
+            .into_response(),
+    }
+}
+
+/// `PUT /api/v1/transfer/limits` — merge global transfer limits.
+pub async fn update_transfer_limits(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<UpdateTransferLimitsRequest>,
+) -> impl IntoResponse {
+    if let Some(response) = require_mutation_auth(&state, &headers) {
+        return response;
+    }
+    let Some(engine) = &state.engine else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                serde_json::to_value(ApiError::internal("native engine is not available")).unwrap(),
+            ),
+        )
+            .into_response();
+    };
+    let mut limits = match engine.global_limits().await {
+        Ok(limits) => limits,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::to_value(ApiError::bad_request(e)).unwrap()),
+            )
+                .into_response()
+        }
+    };
+    if let Some(value) = req.download_limit {
+        limits.download_limit = value.max(0);
+    }
+    if let Some(value) = req.upload_limit {
+        limits.upload_limit = value.max(0);
+    }
+    if let Some(value) = req.speed_limits_mode {
+        limits.speed_limits_mode = value;
+    }
+    match engine.update_global_limits(limits).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError::bad_request(e)).unwrap()),
+        )
+            .into_response(),
+    }
 }
 
 /// `GET /api/v1/torrents/{hash}/limits` — read persisted per-torrent limits.
@@ -1455,6 +1547,7 @@ fn native_engine_capabilities() -> serde_json::Value {
             "utp_packet_codec": true,
             "utp_udp_stream": true,
             "utp_outgoing_opt_in": true,
+            "utp_incoming_opt_in": true,
             "utp_outgoing_policy": std::env::var("TNG_UTP_OUTGOING")
                 .ok()
                 .unwrap_or_else(|| if std::env::var_os("TNG_ENABLE_UTP_OUTGOING").is_some() {
@@ -1464,6 +1557,13 @@ fn native_engine_capabilities() -> serde_json::Value {
                 }),
             "utp_outgoing_enabled": std::env::var_os("TNG_ENABLE_UTP_OUTGOING").is_some()
                 || std::env::var_os("TNG_UTP_OUTGOING").is_some(),
+            "utp_incoming_enabled": std::env::var("TNG_UTP_INCOMING")
+                .ok()
+                .map(|value| matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                ))
+                .unwrap_or(false),
             "utp_transport": false,
             "private_torrent_dht_pex_lsd_default_off": true,
         },
@@ -3285,6 +3385,7 @@ mod tests {
         assert_eq!(capabilities["networking"]["utp_packet_codec"], true);
         assert_eq!(capabilities["networking"]["utp_udp_stream"], true);
         assert_eq!(capabilities["networking"]["utp_outgoing_opt_in"], true);
+        assert_eq!(capabilities["networking"]["utp_incoming_opt_in"], true);
         assert_eq!(capabilities["networking"]["utp_transport"], false);
         assert_eq!(capabilities["compatibility"]["qbittorrent_v2"], true);
         assert_eq!(capabilities["migration"]["transmission"], true);
@@ -3725,6 +3826,22 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
+    #[tokio::test]
+    async fn transfer_limits_without_engine_returns_unavailable() {
+        let state = AppState::new();
+        let app = build_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/transfer/limits")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
     #[test]
     fn update_torrent_limits_request_distinguishes_null_from_absent() {
         let req: UpdateTorrentLimitsRequest = serde_json::from_value(serde_json::json!({
@@ -3767,6 +3884,11 @@ mod tests {
                 "GET",
                 format!("/api/v1/torrents/{hash}/trackers"),
                 StatusCode::OK,
+            ),
+            (
+                "GET",
+                "/api/v1/transfer/limits".to_owned(),
+                StatusCode::SERVICE_UNAVAILABLE,
             ),
         ] {
             let resp = app

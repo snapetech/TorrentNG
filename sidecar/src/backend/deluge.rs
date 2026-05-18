@@ -353,6 +353,46 @@ impl TorrentBackend for DelugeBackend {
         }
         Ok(())
     }
+
+    async fn set_download_limit(&self, hash: &str, limit: Option<i64>) -> Result<()> {
+        let value = limit
+            .filter(|value| *value > 0)
+            .map(bytes_to_kib)
+            .unwrap_or(-1.0);
+        self.rpc(
+            "core.set_torrent_options",
+            json!([[hash], { "max_download_speed": value }]),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn set_upload_limit(&self, hash: &str, limit: Option<i64>) -> Result<()> {
+        let value = limit
+            .filter(|value| *value > 0)
+            .map(bytes_to_kib)
+            .unwrap_or(-1.0);
+        self.rpc(
+            "core.set_torrent_options",
+            json!([[hash], { "max_upload_speed": value }]),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn set_global_download_limit(&self, limit: i64) -> Result<()> {
+        let value = if limit > 0 { bytes_to_kib(limit) } else { -1.0 };
+        self.rpc("core.set_config", json!([{ "max_download_speed": value }]))
+            .await?;
+        Ok(())
+    }
+
+    async fn set_global_upload_limit(&self, limit: i64) -> Result<()> {
+        let value = if limit > 0 { bytes_to_kib(limit) } else { -1.0 };
+        self.rpc("core.set_config", json!([{ "max_upload_speed": value }]))
+            .await?;
+        Ok(())
+    }
 }
 
 fn deluge_share_options(
@@ -378,6 +418,10 @@ fn deluge_share_options(
         options.insert("max_seed_time".to_owned(), json!(-1));
     }
     options
+}
+
+fn bytes_to_kib(bytes: i64) -> f64 {
+    bytes as f64 / 1024.0
 }
 
 impl DelugeBackend {

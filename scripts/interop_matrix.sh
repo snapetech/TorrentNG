@@ -1278,6 +1278,14 @@ run_partial_file_selection_case() {
     --data-urlencode "id=0" \
     --data-urlencode "priority=0" \
     "$(client_url torrentngd)/api/qb/v2/torrents/filePrio" >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
+    --data-urlencode "hashes=$info_hash" \
+    --data-urlencode "limit=1048576" \
+    "$(client_url torrentngd)/api/qb/v2/torrents/setDownloadLimit" >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
+    --data-urlencode "hashes=$info_hash" \
+    --data-urlencode "limit=524288" \
+    "$(client_url torrentngd)/api/qb/v2/torrents/setUploadLimit" >/dev/null || status="FAIL"
   bridge_client_peer_to_rust transmission "$info_hash" || true
   wait_explicit_peer_complete "$TIMEOUT_LOCAL" "$fixture" "$info_hash" transmission transmission torrentngd || status="FAIL"
   verify_selected_fixture_hashes torrentngd "$fixture" \
@@ -1351,13 +1359,18 @@ run_qbit_mutation_facade_case() {
   curl --max-time "$CURL_MAX_TIME" -fsS -X PATCH -H "Authorization: Bearer $RUST_TOKEN" -H "Content-Type: application/json" \
     -d '{"add":["http://127.0.0.1:9/native-dead-announce"],"remove":["http://127.0.0.1:9/native-dead-announce"],"edit":[]}' \
     "$(client_url torrentngd)/api/v1/torrents/$info_hash/trackers" >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -X PUT -H "Authorization: Bearer $RUST_TOKEN" -H "Content-Type: application/json" \
+    -d '{"download_limit":1048576,"upload_limit":524288,"seed_ratio_limit":null,"sequential_download":true}' \
+    "$(client_url torrentngd)/api/v1/torrents/$info_hash/limits" >/dev/null || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/v1/torrents/$info_hash/files" |
     jq -e 'type == "array" and length >= 1' >/dev/null || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/v1/torrents/$info_hash/trackers" |
     jq -e 'type == "array"' >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/v1/torrents/$info_hash/limits" |
+    jq -e '.download_limit == 1048576 and .upload_limit == 524288 and .seed_ratio_limit == null and .sequential_download == true' >/dev/null || status="FAIL"
   append_report "- Target: torrentngd qBittorrent-compatible mutation endpoints"
-  append_report "- Checked qBit facade: filePrio, recheck, addTrackers, editTracker, removeTrackers, trackers, files"
-  append_report "- Checked native REST: start, stop, update metadata, file priorities, tags, trackers, files/trackers projection"
+  append_report "- Checked qBit facade: filePrio, setDownloadLimit, setUploadLimit, recheck, addTrackers, editTracker, removeTrackers, trackers, files"
+  append_report "- Checked native REST: start, stop, update metadata, file priorities, tags, trackers, limits, files/trackers/limits projection"
   append_report "- Fixture: multi-128m"
   append_report "- Info hash: $info_hash"
   append_report "- Status: **$status**"

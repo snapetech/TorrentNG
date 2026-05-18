@@ -16,4 +16,4 @@ pub use state::{
     sequence_before, ConnectionIds, ConnectionState, EndpointRole, InboundAction, UtpConnection,
     DEFAULT_INITIAL_WINDOW_BYTES, DEFAULT_MTU_PAYLOAD_BYTES, DEFAULT_RETRANSMIT_TIMEOUT_US,
 };
-pub use transport::{UtpListener, UtpStream, UtpTransportConfig};
+pub use transport::{UtpEndpoint, UtpListener, UtpStream, UtpTransportConfig};
