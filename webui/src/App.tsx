@@ -629,19 +629,19 @@ export function App() {
           whiteSpace: 'nowrap', flex: '0 0 auto',
         }}>Help</button>
 
-        <span className="tng-topbar-pill" data-tone={health?.rtorrent === 'connected' ? 'ok' : 'error'} title="rTorrent connection state" style={{
-          fontSize: 11, color: health?.rtorrent === 'connected' ? 'var(--success)' : 'var(--danger)',
+        <span className="tng-topbar-pill" data-tone={health?.backend?.status === 'connected' ? 'ok' : 'error'} title="Selected backend connection state" style={{
+          fontSize: 11, color: health?.backend?.status === 'connected' ? 'var(--success)' : 'var(--danger)',
           display: 'flex', alignItems: 'center', gap: 5, padding: '2px 7px',
-          border: '1px solid ' + (health?.rtorrent === 'connected' ? 'color-mix(in srgb, var(--success) 42%, var(--border))' : 'color-mix(in srgb, var(--danger) 42%, var(--border))'),
+          border: '1px solid ' + (health?.backend?.status === 'connected' ? 'color-mix(in srgb, var(--success) 42%, var(--border))' : 'color-mix(in srgb, var(--danger) 42%, var(--border))'),
           borderRadius: 999,
-          background: health?.rtorrent === 'connected' ? 'color-mix(in srgb, var(--success) 9%, transparent)' : 'color-mix(in srgb, var(--danger) 9%, transparent)',
+          background: health?.backend?.status === 'connected' ? 'color-mix(in srgb, var(--success) 9%, transparent)' : 'color-mix(in srgb, var(--danger) 9%, transparent)',
         }}>
           <span style={{
             width: 6, height: 6, borderRadius: '50%',
-            background: health?.rtorrent === 'connected' ? 'var(--success)' : 'var(--danger)',
+            background: health?.backend?.status === 'connected' ? 'var(--success)' : 'var(--danger)',
             display: 'inline-block',
           }} />
-          {health?.rtorrent ?? 'connecting…'}
+          {health?.backend ? `${health.backend.type}: ${health.backend.status}` : 'connecting...'}
         </span>
 
         <span className="tng-topbar-spacer" style={{ flex: '1 0 12px' }} />
@@ -815,7 +815,8 @@ export function App() {
         total={total}
         selected={selected.size}
         stats={liveStats}
-        rtorrent={health?.rtorrent ?? 'connecting'}
+        backendType={health?.backend?.type ?? 'backend'}
+        backendStatus={health?.backend?.status ?? health?.rtorrent ?? 'connecting'}
         cached={health?.cached_torrents}
         storage={storage?.roots?.[0]}
         togglingFeature={togglingFeature}
@@ -906,7 +907,7 @@ function SettingsView({ section, onSection, mediaInference, onMediaInference, th
 }) {
   const sections: Array<[SettingsSection, string, string]> = [
     ['library', 'Library', '▦'],
-    ['engine', 'Engine', '⚙'],
+    ['engine', 'Backend', '⚙'],
     ['automation', 'Automation', '⟲'],
     ['support', 'Support', '?'],
   ]
@@ -992,7 +993,7 @@ function SettingsView({ section, onSection, mediaInference, onMediaInference, th
           <PanelFrame><TrackerHealthPanel /></PanelFrame>
         </section>)}
         {section === 'engine' && (<section id="settings-panel-engine" role="tabpanel" aria-labelledby="settings-tab-engine" tabIndex={0}>
-          <PanelTitle title="Engine" subtitle="Runtime diagnostics, user agent, and capability checks" />
+          <PanelTitle title="Backend" subtitle="Runtime diagnostics, settings, and capability checks" />
           <PanelFrame><EnginePanel /></PanelFrame>
           <PanelFrame><UserAgentPanel /></PanelFrame>
         </section>)}

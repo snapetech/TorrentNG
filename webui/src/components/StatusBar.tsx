@@ -5,7 +5,8 @@ interface Props {
   total: number
   selected: number
   stats: LiveStats
-  rtorrent: string
+  backendType: string
+  backendStatus: string
   cached?: number
   storage?: StorageRoot
   togglingFeature?: 'dht' | 'pex' | null
@@ -127,10 +128,10 @@ function Notice({ tone, children }: { tone: 'ok' | 'error'; children: React.Reac
 }
 
 export function StatusBar({
-  loaded, total, selected, stats, rtorrent, cached, storage, togglingFeature, onToggleDht, onTogglePex,
+  loaded, total, selected, stats, backendType, backendStatus, cached, storage, togglingFeature, onToggleDht, onTogglePex,
   featureError, actionMessage, actionTone = 'ok',
 }: Props) {
-  const connected = rtorrent === 'connected'
+  const connected = backendStatus === 'connected'
   const rendered = Math.min(loaded, total)
   const storageLabel = storage?.ok
     ? `${fmtBytes(storage.used_bytes)} / ${fmtBytes(storage.total_bytes)}`
@@ -153,7 +154,7 @@ export function StatusBar({
       color: 'var(--faint)', fontSize: 11, overflowX: 'auto',
     }}>
       <div className="tng-statusbar-summary" style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 'max-content' }}>
-        <Badge label="Core" value={connected ? 'connected' : 'disconnected'} state={connected ? 'on' : 'closed'} />
+        <Badge label={backendType} value={connected ? 'connected' : 'disconnected'} state={connected ? 'on' : 'closed'} />
       </div>
       <div className="tng-statusbar-counts" style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 'max-content' }}>
         <Badge label="Torrents" value={total.toLocaleString()} state="idle" />
@@ -190,7 +191,7 @@ export function StatusBar({
         />
         <Badge
           label="DHT"
-          title="Toggle runtime rTorrent DHT"
+          title="Toggle runtime backend DHT"
           state={stats.dht}
           disabled={togglingFeature === 'dht'}
           value={togglingFeature === 'dht' ? '...' : (stats.dht ?? 'unknown')}
@@ -198,7 +199,7 @@ export function StatusBar({
         />
         <Badge
           label="PEX"
-          title="Toggle runtime rTorrent peer exchange"
+          title="Toggle runtime backend peer exchange"
           state={stats.pex}
           disabled={togglingFeature === 'pex'}
           value={togglingFeature === 'pex' ? '...' : (stats.pex ?? 'unknown')}

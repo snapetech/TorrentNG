@@ -223,6 +223,10 @@ impl TorrentBackend for QbittorrentBackend {
         Ok(())
     }
 
+    async fn add_url(&self, url: &str, save_path: &str, category: &str, start: bool) -> Result<()> {
+        self.add_magnet(url, save_path, category, start).await
+    }
+
     async fn remove(&self, hash: &str, delete_data: bool) -> Result<()> {
         self.post_form(
             "api/v2/torrents/delete",

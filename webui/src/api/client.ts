@@ -351,7 +351,25 @@ export interface EngineCapability {
   detail: string | null
 }
 
+export interface BackendCapabilities {
+  supports_tags: boolean
+  supports_categories: boolean
+  supports_file_priority: boolean
+  supports_tracker_edit: boolean
+  supports_recheck: boolean
+  supports_runtime_user_agent: boolean
+  supports_config_overlay: boolean
+  supports_restart: boolean
+}
+
+export interface BackendInfo {
+  type: string
+  status?: string
+  capabilities: BackendCapabilities
+}
+
 export interface EngineDiagnostics {
+  backend: BackendInfo
   provenance: {
     sidecar_version: string
     rtorrent_version: string | null
@@ -386,6 +404,16 @@ export interface EngineDiagnostics {
     statistics: ProbeValue<string>
   }
   drift: EngineDrift[]
+}
+
+export interface HealthResponse {
+  status: string
+  backend?: {
+    type: string
+    status: string
+  }
+  rtorrent: string
+  cached_torrents: number
 }
 
 export interface EngineDrift {
@@ -724,6 +752,6 @@ export const api = {
       post('/rss-rules/apply', { title, link, dry_run }),
   },
 
-  health: (): Promise<{ status: string; rtorrent: string; cached_torrents: number }> =>
+  health: (): Promise<HealthResponse> =>
     getRoot('/health'),
 }

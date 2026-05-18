@@ -117,12 +117,15 @@ The native health capability surface also reports:
 - `networking.utp_udp_stream=true`: `rt-utp` has async UDP stream primitives.
 - `networking.utp_outgoing_opt_in=true`: the engine contains an explicit
   outbound uTP peer-wire path.
-- `networking.utp_outgoing_enabled`: whether the current process was started
-  with `TNG_ENABLE_UTP_OUTGOING`.
+- `networking.utp_outgoing_policy`: `TNG_UTP_OUTGOING` when set, otherwise
+  `prefer` for the legacy `TNG_ENABLE_UTP_OUTGOING` flag or `off`.
+- `networking.utp_outgoing_enabled`: whether either outbound uTP opt-in is set.
 
 ## Engine Integration Progress
 
 The engine peer loop now has a transport-neutral `PeerIo` adapter and an
-outbound `UtpStream` peer-wire path. It is intentionally behind the
-`TNG_ENABLE_UTP_OUTGOING` environment opt-in while the incoming UDP listener,
-connection demux, and policy defaults are still incomplete.
+outbound `UtpStream` peer-wire path. `TNG_UTP_OUTGOING=prefer` attempts uTP and
+falls back to TCP if the uTP connect fails; `TNG_UTP_OUTGOING=only` disables
+that fallback. The legacy `TNG_ENABLE_UTP_OUTGOING` flag maps to `prefer`.
+The path remains opt-in while the incoming UDP listener, connection demux, and
+default policy are still incomplete.

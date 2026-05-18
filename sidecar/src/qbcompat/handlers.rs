@@ -846,7 +846,7 @@ async fn torrents_add(State(s): State<AppState>, mut multipart: Multipart) -> im
                 continue;
             }
             added = true;
-            if let Err(e) = s.rt.load_url(url, &save_path, &category, start).await {
+            if let Err(e) = s.backend.add_url(url, &save_path, &category, start).await {
                 tracing::error!(
                     component = "qbcompat",
                     operation = "add_url",
@@ -867,7 +867,11 @@ async fn torrents_add(State(s): State<AppState>, mut multipart: Multipart) -> im
         if data.is_empty() {
             return (StatusCode::BAD_REQUEST, "Fails.").into_response();
         }
-        if let Err(e) = s.rt.load_torrent(&data, &save_path, &category, start).await {
+        if let Err(e) = s
+            .backend
+            .add_torrent(&data, &save_path, &category, start)
+            .await
+        {
             tracing::error!(
                 component = "qbcompat",
                 operation = "add_torrent",
@@ -904,10 +908,10 @@ async fn torrents_reannounce(State(s): State<AppState>, Form(f): Form<HashesForm
 async fn bulk_action(s: &AppState, hashes_str: &Option<String>, action: &str) -> StatusCode {
     for hash in split_hashes(&s.db, hashes_str.as_deref()) {
         let res = match action {
-            "start" => s.rt.start(&hash).await,
-            "stop" => s.rt.stop(&hash).await,
-            "recheck" => s.rt.recheck(&hash).await,
-            "reannounce" => s.rt.reannounce(&hash).await,
+            "start" => s.backend.start(&hash).await,
+            "stop" => s.backend.stop(&hash).await,
+            "recheck" => s.backend.recheck(&hash).await,
+            "reannounce" => s.backend.reannounce(&hash).await,
             _ => Ok(()),
         };
         if let Err(e) = res {
@@ -934,7 +938,7 @@ struct DeleteForm {
 async fn torrents_delete(State(s): State<AppState>, Form(f): Form<DeleteForm>) -> StatusCode {
     let delete_files = f.delete_files.as_deref() == Some("true");
     for hash in split_hashes(&s.db, f.hashes.as_deref()) {
-        if let Err(e) = s.rt.remove(&hash, delete_files).await {
+        if let Err(e) = s.backend.remove(&hash, delete_files).await {
             tracing::warn!(
                 component = "qbcompat",
                 operation = "delete_torrent",
@@ -971,7 +975,7 @@ async fn torrents_trackers(
         Some(h) => h.clone(),
         None => return Json(json!([])).into_response(),
     };
-    match s.rt.list_trackers(&hash).await {
+    match s.backend.list_trackers(&hash).await {
         Ok(trackers) => {
             let out: Vec<_> = trackers
                 .iter()
@@ -1019,7 +1023,7 @@ async fn torrents_files(
         Some(h) => h.clone(),
         None => return Json(json!([])).into_response(),
     };
-    match s.rt.list_files(&hash).await {
+    match s.backend.list_files(&hash).await {
         Ok(files) => {
             let out: Vec<_> = files
                 .iter()
@@ -1131,7 +1135,7 @@ async fn torrents_set_category(
             emit_torrent_updated(&s, &hash);
             emit(&s, Event::CategoriesUpdated);
         }
-        if let Err(e) = s.rt.set_category(&hash, category).await {
+        if let Err(e) = s.backend.set_category(&hash, category).await {
             tracing::warn!(
                 component = "rtorrent",
                 operation = "set_category",
@@ -1411,7 +1415,7 @@ async fn torrents_file_prio(State(s): State<AppState>, Form(f): Form<FilePrioFor
     if let Some(ids) = f.id {
         for id_str in ids.split('|') {
             if let Ok(idx) = id_str.parse::<usize>() {
-                if let Err(e) = s.rt.set_file_priority(&hash, idx, priority).await {
+                if let Err(e) = s.backend.set_file_priority(&hash, idx, priority).await {
                     tracing::warn!(
                             component = "qbcompat",
                             operation = "set_file_priority",
@@ -1450,7 +1454,7 @@ async fn torrents_add_trackers(
 
     for hash in split_hashes(&s.db, f.hashes.as_deref()) {
         for url in &urls {
-            if let Err(e) = s.rt.add_tracker(&hash, url).await {
+            if let Err(e) = s.backend.add_tracker(&hash, url).await {
                 tracing::warn!(
                     component = "qbcompat",
                     operation = "add_tracker",
@@ -1489,7 +1493,7 @@ async fn torrents_remove_trackers(
         .collect();
 
     for url in urls {
-        if let Err(e) = s.rt.remove_tracker(&hash, url).await {
+        if let Err(e) = s.backend.remove_tracker(&hash, url).await {
             tracing::warn!(
                 component = "qbcompat",
                 operation = "remove_tracker",
@@ -1526,7 +1530,7 @@ async fn torrents_edit_tracker(
     let Some(new_url) = f.new_url else {
         return StatusCode::BAD_REQUEST;
     };
-    if let Err(e) = s.rt.edit_tracker(&hash, &orig_url, &new_url).await {
+    if let Err(e) = s.backend.edit_tracker(&hash, &orig_url, &new_url).await {
         tracing::warn!(
             component = "qbcompat",
             operation = "edit_tracker",

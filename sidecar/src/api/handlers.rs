@@ -496,6 +496,9 @@ fn enum_setting(
 }
 
 pub async fn get_rtorrent_settings(State(s): State<AppState>) -> impl IntoResponse {
+    if !s.backend.capabilities().supports_config_overlay {
+        return StatusCode::NOT_IMPLEMENTED.into_response();
+    }
     let descriptors = rtorrent_settings();
     let overlay_path = rtorrent_overlay_path();
     let (saved, custom_rc) = read_rtorrent_overlay(&overlay_path);
@@ -522,6 +525,9 @@ pub async fn set_rtorrent_settings(
     State(s): State<AppState>,
     Json(patch): Json<RtorrentSettingsPatch>,
 ) -> impl IntoResponse {
+    if !s.backend.capabilities().supports_config_overlay {
+        return StatusCode::NOT_IMPLEMENTED.into_response();
+    }
     let descriptors = rtorrent_settings();
     let mut by_key = BTreeMap::new();
     for desc in &descriptors {
@@ -627,6 +633,9 @@ pub async fn set_rtorrent_settings(
 }
 
 pub async fn restart_process(State(s): State<AppState>) -> impl IntoResponse {
+    if !s.backend.capabilities().supports_restart {
+        return StatusCode::NOT_IMPLEMENTED.into_response();
+    }
     record_operator_event(
         &s,
         "admin_restart_requested",
@@ -1261,12 +1270,12 @@ pub async fn cross_seed_helper(
     for hash in hashes {
         let mut hash_errors = Vec::new();
         for tracker in &trackers {
-            if let Err(e) = s.rt.add_tracker(hash, tracker).await {
+            if let Err(e) = s.backend.add_tracker(hash, tracker).await {
                 hash_errors.push(format!("add tracker {tracker}: {e}"));
             }
         }
         if body.reannounce {
-            if let Err(e) = s.rt.reannounce(hash).await {
+            if let Err(e) = s.backend.reannounce(hash).await {
                 hash_errors.push(format!("reannounce: {e}"));
             }
         }
@@ -1443,7 +1452,7 @@ pub async fn run_workflow(
                     errors.push(format!("{hash}: {e}"));
                     continue;
                 }
-                match s.rt.set_category(&hash, category).await {
+                match s.backend.set_category(&hash, category).await {
                     Ok(()) => {
                         emit_torrent_updated(&s, &hash);
                         applied.push(hash);
@@ -1853,7 +1862,7 @@ pub async fn add_torrent(State(s): State<AppState>, mut multipart: Multipart) ->
         if m.is_empty() {
             return (StatusCode::BAD_REQUEST, "magnet must not be empty").into_response();
         }
-        match s.rt.load_magnet(m, &save_path, &category, start).await {
+        match s.backend.add_magnet(m, &save_path, &category, start).await {
             Ok(_) => return StatusCode::ACCEPTED.into_response(),
             Err(e) => {
                 tracing::error!(component = "api", operation = "add_magnet", result = "error", error = %e, "native magnet add failed");
@@ -1865,7 +1874,11 @@ pub async fn add_torrent(State(s): State<AppState>, mut multipart: Multipart) ->
         if data.is_empty() {
             return (StatusCode::BAD_REQUEST, "torrent file must not be empty").into_response();
         }
-        match s.rt.load_torrent(&data, &save_path, &category, start).await {
+        match s
+            .backend
+            .add_torrent(&data, &save_path, &category, start)
+            .await
+        {
             Ok(_) => return StatusCode::ACCEPTED.into_response(),
             Err(e) => {
                 tracing::error!(component = "api", operation = "add_torrent", result = "error", error = %e, "native torrent add failed");
@@ -1884,7 +1897,7 @@ pub async fn delete_torrent(
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
     let delete_files = q.get("delete_files").map(|v| v == "true").unwrap_or(false);
-    match s.rt.remove(&hash, delete_files).await {
+    match s.backend.remove(&hash, delete_files).await {
         Ok(_) => {
             if let Err(e) = s.db.delete(&hash) {
                 tracing::warn!(
@@ -1920,7 +1933,7 @@ pub async fn torrent_start(
     State(s): State<AppState>,
     Path(hash): Path<String>,
 ) -> impl IntoResponse {
-    match s.rt.start(&hash).await {
+    match s.backend.start(&hash).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
             tracing::error!(component = "api", operation = "start", result = "error", torrent = %hash, error = %e, "native start failed");
@@ -1932,7 +1945,7 @@ pub async fn torrent_stop(
     State(s): State<AppState>,
     Path(hash): Path<String>,
 ) -> impl IntoResponse {
-    match s.rt.stop(&hash).await {
+    match s.backend.stop(&hash).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
             tracing::error!(component = "api", operation = "stop", result = "error", torrent = %hash, error = %e, "native stop failed");
@@ -1944,7 +1957,7 @@ pub async fn torrent_recheck(
     State(s): State<AppState>,
     Path(hash): Path<String>,
 ) -> impl IntoResponse {
-    match s.rt.recheck(&hash).await {
+    match s.backend.recheck(&hash).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
             tracing::error!(component = "api", operation = "recheck", result = "error", torrent = %hash, error = %e, "native recheck failed");
@@ -1956,7 +1969,7 @@ pub async fn torrent_reannounce(
     State(s): State<AppState>,
     Path(hash): Path<String>,
 ) -> impl IntoResponse {
-    match s.rt.reannounce(&hash).await {
+    match s.backend.reannounce(&hash).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
             tracing::error!(component = "api", operation = "reannounce", result = "error", torrent = %hash, error = %e, "native reannounce failed");
@@ -1971,7 +1984,7 @@ pub async fn torrent_trackers(
     State(s): State<AppState>,
     Path(hash): Path<String>,
 ) -> impl IntoResponse {
-    match s.rt.list_trackers(&hash).await {
+    match s.backend.list_trackers(&hash).await {
         Ok(trackers) => Json(serde_json::json!({ "trackers": trackers })).into_response(),
         Err(e) => {
             tracing::error!(component = "api", operation = "list_trackers", result = "error", torrent = %hash, error = %e, "native tracker listing failed");
@@ -2020,7 +2033,7 @@ pub async fn patch_torrent_trackers(
 
     let mut failures = Vec::new();
     for url in add {
-        if let Err(e) = s.rt.add_tracker(&hash, url).await {
+        if let Err(e) = s.backend.add_tracker(&hash, url).await {
             tracing::warn!(
                 component = "api",
                 operation = "add_tracker",
@@ -2034,7 +2047,7 @@ pub async fn patch_torrent_trackers(
         }
     }
     for url in remove {
-        if let Err(e) = s.rt.remove_tracker(&hash, url).await {
+        if let Err(e) = s.backend.remove_tracker(&hash, url).await {
             tracing::warn!(
                 component = "api",
                 operation = "remove_tracker",
@@ -2048,7 +2061,7 @@ pub async fn patch_torrent_trackers(
         }
     }
     for (orig_url, new_url) in edit {
-        if let Err(e) = s.rt.edit_tracker(&hash, orig_url, new_url).await {
+        if let Err(e) = s.backend.edit_tracker(&hash, orig_url, new_url).await {
             tracing::warn!(
                 component = "api",
                 operation = "edit_tracker",
@@ -2078,7 +2091,7 @@ pub async fn torrent_files(
     State(s): State<AppState>,
     Path(hash): Path<String>,
 ) -> impl IntoResponse {
-    match s.rt.list_files(&hash).await {
+    match s.backend.list_files(&hash).await {
         Ok(files) => Json(serde_json::json!({ "files": files })).into_response(),
         Err(e) => {
             tracing::error!(component = "api", operation = "list_files", result = "error", torrent = %hash, error = %e, "native file listing failed");
@@ -2109,9 +2122,10 @@ pub async fn set_file_priorities(
 
     let mut failures = Vec::new();
     for item in &body.files {
-        if let Err(e) =
-            s.rt.set_file_priority(&hash, item.index, item.priority)
-                .await
+        if let Err(e) = s
+            .backend
+            .set_file_priority(&hash, item.index, item.priority)
+            .await
         {
             tracing::warn!(
                 component = "api",
@@ -2271,7 +2285,7 @@ pub async fn set_torrent_category(
         tracing::error!(component = "cache", operation = "set_category", result = "error", torrent = %hash, category = %body.category, error = %e, "cache category update failed");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
-    if let Err(e) = s.rt.set_category(&hash, &body.category).await {
+    if let Err(e) = s.backend.set_category(&hash, &body.category).await {
         tracing::warn!(component = "rtorrent", operation = "set_category", result = "error", torrent = %hash, category = %body.category, error = %e, "rTorrent category update failed");
     }
     emit_torrent_updated(&s, &hash);
@@ -2411,10 +2425,10 @@ pub async fn bulk_action(
     let mut errors = Vec::new();
     for hash in &body.hashes {
         let res = match action.as_str() {
-            "start" => s.rt.start(hash).await,
-            "stop" => s.rt.stop(hash).await,
-            "recheck" => s.rt.recheck(hash).await,
-            "reannounce" => s.rt.reannounce(hash).await,
+            "start" => s.backend.start(hash).await,
+            "stop" => s.backend.stop(hash).await,
+            "recheck" => s.backend.recheck(hash).await,
+            "reannounce" => s.backend.reannounce(hash).await,
             "set-category" => {
                 let category = category.expect("category was validated");
                 match s.db.exists(hash) {
@@ -2433,7 +2447,7 @@ pub async fn bulk_action(
                         continue;
                     }
                 }
-                s.rt.set_category(hash, category).await
+                s.backend.set_category(hash, category).await
             }
             "set-location" => {
                 let save_path = save_path.expect("save_path was validated");
@@ -2493,6 +2507,9 @@ pub struct SetUserAgentBody {
 }
 
 pub async fn get_user_agent(State(s): State<AppState>) -> impl IntoResponse {
+    if !s.backend.capabilities().supports_runtime_user_agent {
+        return StatusCode::NOT_IMPLEMENTED.into_response();
+    }
     match s.rt.get_user_agent().await {
         Ok(ua) => Json(UserAgentResponse { user_agent: ua }).into_response(),
         Err(e) => {
@@ -2506,6 +2523,9 @@ pub async fn set_user_agent(
     State(s): State<AppState>,
     Json(body): Json<SetUserAgentBody>,
 ) -> impl IntoResponse {
+    if !s.backend.capabilities().supports_runtime_user_agent {
+        return StatusCode::NOT_IMPLEMENTED.into_response();
+    }
     let ua = body.user_agent.trim().to_owned();
     if ua.is_empty() {
         return (StatusCode::BAD_REQUEST, "user_agent must not be empty").into_response();

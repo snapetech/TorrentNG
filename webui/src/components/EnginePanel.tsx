@@ -13,18 +13,22 @@ export function EnginePanel() {
     queryKey: ['engine-commands'],
     queryFn: api.engineCommands,
     refetchInterval: 60000,
+    enabled: data?.backend?.type === 'rtorrent',
   })
 
   const driftProblems = data?.drift.filter(row => row.status !== 'match').length ?? 0
+  const isRtorrent = data?.backend?.type === 'rtorrent'
+  const supportsOverlay = data?.backend?.capabilities.supports_config_overlay === true
 
   return (
     <section style={{ padding: '16px 24px' }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 12 }}>
-        <h2 style={{ fontSize: 13, margin: 0, color: 'var(--text)' }}>Engine</h2>
+        <h2 style={{ fontSize: 13, margin: 0, color: 'var(--text)' }}>Backend</h2>
         {data && (
           <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-            <Badge ok={driftProblems === 0} text={driftProblems === 0 ? 'profile clean' : `${driftProblems} drift`} />
-            <Badge ok={data.capabilities.every(c => c.available)} text={`${data.capabilities.filter(c => c.available).length}/${data.capabilities.length} capabilities`} />
+            <Badge ok text={data.backend.type} />
+            {isRtorrent && <Badge ok={driftProblems === 0} text={driftProblems === 0 ? 'profile clean' : `${driftProblems} drift`} />}
+            {isRtorrent && <Badge ok={data.capabilities.every(c => c.available)} text={`${data.capabilities.filter(c => c.available).length}/${data.capabilities.length} XMLRPC`} />}
             <button
               onClick={() => {
                 refetch()
@@ -47,16 +51,38 @@ export function EnginePanel() {
       {error && <Notice>Engine diagnostics unavailable</Notice>}
       {data && (
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: 16 }}>
+          <BackendSummary data={data} />
           <Provenance data={data} />
-          <Capabilities data={data} />
-          <HttpStack data={data} />
-          <DhtStack data={data} />
-          <RtorrentSettingsPanel />
-          <ProfileDrift data={data} />
-          <CommandIndex commands={commands} />
+          {isRtorrent && <Capabilities data={data} />}
+          {isRtorrent && <HttpStack data={data} />}
+          {isRtorrent && <DhtStack data={data} />}
+          {supportsOverlay && <RtorrentSettingsPanel />}
+          {isRtorrent && <ProfileDrift data={data} />}
+          {isRtorrent && <CommandIndex commands={commands} />}
         </div>
       )}
     </section>
+  )
+}
+
+function BackendSummary({ data }: { data: EngineDiagnostics }) {
+  const caps = data.backend.capabilities
+  const rows = [
+    ['Type', data.backend.type],
+    ['Tags', yesNo(caps.supports_tags)],
+    ['Categories', yesNo(caps.supports_categories)],
+    ['File priority', yesNo(caps.supports_file_priority)],
+    ['Tracker edit', yesNo(caps.supports_tracker_edit)],
+    ['Recheck', yesNo(caps.supports_recheck)],
+    ['Runtime user agent', yesNo(caps.supports_runtime_user_agent)],
+    ['Config overlay', yesNo(caps.supports_config_overlay)],
+    ['Restart', yesNo(caps.supports_restart)],
+  ]
+  return (
+    <Panel>
+      <Subhead>Backend</Subhead>
+      <Rows rows={rows} />
+    </Panel>
   )
 }
 
@@ -92,15 +118,21 @@ function Provenance({ data }: { data: EngineDiagnostics }) {
       <Subhead>Provenance</Subhead>
       <Rows rows={[
         ['Sidecar', p.sidecar_version],
-        ['rTorrent', p.rtorrent_version ?? 'unknown'],
-        ['libtorrent', p.libtorrent_version ?? 'unknown'],
-        ['XMLRPC', p.xmlrpc_backend],
-        ['Packaged rTorrent', p.packaged_rtorrent_version ?? 'not declared'],
-        ['Packaged libtorrent', p.packaged_libtorrent_version ?? 'not declared'],
-        ['Patches', p.patch_set.length ? p.patch_set.join(', ') : 'none declared'],
+        ...(data.backend.type === 'rtorrent' ? [
+          ['rTorrent', p.rtorrent_version ?? 'unknown'],
+          ['libtorrent', p.libtorrent_version ?? 'unknown'],
+          ['XMLRPC', p.xmlrpc_backend],
+          ['Packaged rTorrent', p.packaged_rtorrent_version ?? 'not declared'],
+          ['Packaged libtorrent', p.packaged_libtorrent_version ?? 'not declared'],
+          ['Patches', p.patch_set.length ? p.patch_set.join(', ') : 'none declared'],
+        ] as Array<[string, string]> : []),
       ]} />
     </Panel>
   )
+}
+
+function yesNo(value: boolean): string {
+  return value ? 'yes' : 'no'
 }
 
 function Capabilities({ data }: { data: EngineDiagnostics }) {

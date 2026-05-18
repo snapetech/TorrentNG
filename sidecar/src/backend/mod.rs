@@ -89,6 +89,13 @@ pub trait TorrentBackend: Send + Sync {
         category: &str,
         start: bool,
     ) -> Result<()>;
+    async fn add_url(&self, url: &str, save_path: &str, category: &str, start: bool) -> Result<()> {
+        if url.starts_with("magnet:") {
+            return self.add_magnet(url, save_path, category, start).await;
+        }
+        let data = reqwest::get(url).await?.error_for_status()?.bytes().await?;
+        self.add_torrent(&data, save_path, category, start).await
+    }
     async fn remove(&self, hash: &str, delete_data: bool) -> Result<()>;
     async fn start(&self, hash: &str) -> Result<()>;
     async fn stop(&self, hash: &str) -> Result<()>;

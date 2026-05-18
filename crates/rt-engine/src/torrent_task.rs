@@ -714,14 +714,18 @@ impl TorrentTask {
             let peer_cmd_rx = self.register_peer(addr);
             let peer_event_tx = self.peer_event_tx.clone();
             let upload = self.upload_context(addr);
-            let use_utp = outgoing_utp_enabled();
+            let transport_policy = outgoing_transport_policy();
             tokio::spawn(async move {
                 let disconnect_tx = peer_event_tx.clone();
-                let result = if use_utp {
-                    run_outgoing_utp_peer(addr, info_hash, peer_event_tx, peer_cmd_rx, upload).await
-                } else {
-                    run_outgoing_peer(addr, info_hash, peer_event_tx, peer_cmd_rx, upload).await
-                };
+                let result = run_outgoing_peer_with_policy(
+                    addr,
+                    info_hash,
+                    peer_event_tx,
+                    peer_cmd_rx,
+                    upload,
+                    transport_policy,
+                )
+                .await;
                 if let Err(e) = result {
                     debug!(
                         component = "peer",
@@ -2935,8 +2939,31 @@ impl TorrentTask {
     }
 }
 
-fn outgoing_utp_enabled() -> bool {
-    std::env::var_os("TNG_ENABLE_UTP_OUTGOING").is_some()
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutgoingTransportPolicy {
+    TcpOnly,
+    PreferUtp,
+    UtpOnly,
+}
+
+fn outgoing_transport_policy() -> OutgoingTransportPolicy {
+    if let Ok(value) = std::env::var("TNG_UTP_OUTGOING") {
+        return parse_outgoing_transport_policy(&value);
+    }
+    if std::env::var_os("TNG_ENABLE_UTP_OUTGOING").is_some() {
+        return OutgoingTransportPolicy::PreferUtp;
+    }
+    OutgoingTransportPolicy::TcpOnly
+}
+
+fn parse_outgoing_transport_policy(value: &str) -> OutgoingTransportPolicy {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "prefer" | "prefer-utp" | "utp-prefer" => {
+            OutgoingTransportPolicy::PreferUtp
+        }
+        "only" | "utp" | "utp-only" => OutgoingTransportPolicy::UtpOnly,
+        _ => OutgoingTransportPolicy::TcpOnly,
+    }
 }
 
 fn collect_file_hints(
@@ -3167,6 +3194,48 @@ fn tracker_warning_message(status: &TrackerStatus) -> Option<String> {
 }
 
 /// Open a TCP connection, complete BEP 3 handshake, receive Piece messages.
+async fn run_outgoing_peer_with_policy(
+    addr: SocketAddr,
+    info_hash: [u8; 20],
+    peer_event_tx: mpsc::Sender<PeerEvent>,
+    peer_cmd_rx: mpsc::Receiver<PeerCommand>,
+    upload: UploadContext,
+    policy: OutgoingTransportPolicy,
+) -> anyhow::Result<()> {
+    match policy {
+        OutgoingTransportPolicy::TcpOnly => {
+            run_outgoing_peer(addr, info_hash, peer_event_tx, peer_cmd_rx, upload).await
+        }
+        OutgoingTransportPolicy::UtpOnly => {
+            run_outgoing_utp_peer(addr, info_hash, peer_event_tx, peer_cmd_rx, upload).await
+        }
+        OutgoingTransportPolicy::PreferUtp => match UtpStream::connect(addr).await {
+            Ok(stream) => {
+                run_established_utp_peer(
+                    addr,
+                    info_hash,
+                    peer_event_tx,
+                    peer_cmd_rx,
+                    upload,
+                    stream,
+                )
+                .await
+            }
+            Err(e) => {
+                debug!(
+                    component = "peer",
+                    operation = "connect_utp",
+                    peer = %addr,
+                    result = "fallback",
+                    error = %e,
+                    "uTP peer path failed; falling back to TCP"
+                );
+                run_outgoing_peer(addr, info_hash, peer_event_tx, peer_cmd_rx, upload).await
+            }
+        },
+    }
+}
+
 async fn run_outgoing_peer(
     addr: SocketAddr,
     info_hash: [u8; 20],
@@ -3223,7 +3292,18 @@ async fn run_outgoing_utp_peer(
     peer_cmd_rx: mpsc::Receiver<PeerCommand>,
     upload: UploadContext,
 ) -> anyhow::Result<()> {
-    let mut stream = UtpStream::connect(addr).await?;
+    let stream = UtpStream::connect(addr).await?;
+    run_established_utp_peer(addr, info_hash, peer_event_tx, peer_cmd_rx, upload, stream).await
+}
+
+async fn run_established_utp_peer(
+    addr: SocketAddr,
+    info_hash: [u8; 20],
+    peer_event_tx: mpsc::Sender<PeerEvent>,
+    peer_cmd_rx: mpsc::Receiver<PeerCommand>,
+    upload: UploadContext,
+    mut stream: UtpStream,
+) -> anyhow::Result<()> {
     let our_hs = Handshake {
         info_hash,
         peer_id: OUR_PEER_ID,
@@ -3916,6 +3996,22 @@ mod tests {
         assert_eq!(stricter_limit(Some(30), None), Some(30));
         assert_eq!(stricter_limit(None, Some(40)), Some(40));
         assert_eq!(stricter_limit(None, None), None);
+    }
+
+    #[test]
+    fn parses_outgoing_utp_policy() {
+        assert_eq!(
+            parse_outgoing_transport_policy("prefer"),
+            OutgoingTransportPolicy::PreferUtp
+        );
+        assert_eq!(
+            parse_outgoing_transport_policy("utp-only"),
+            OutgoingTransportPolicy::UtpOnly
+        );
+        assert_eq!(
+            parse_outgoing_transport_policy("off"),
+            OutgoingTransportPolicy::TcpOnly
+        );
     }
 
     #[test]
