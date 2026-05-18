@@ -164,7 +164,7 @@ Local deterministic API compatibility is passing:
 
 Remaining compatibility gaps:
 
-- Transmission: JSON-RPC 2.0 method errors, no-op notification subscription
+- Transmission: JSON-RPC 2.0 method errors, stateful notification subscription
   probes, broad mutable session settings, group limit state roundtrips, and
   aggregate native peer rates are covered in the facade matrix. ETA now projects
   from native peer rates, and tracker stats project persisted engine announce

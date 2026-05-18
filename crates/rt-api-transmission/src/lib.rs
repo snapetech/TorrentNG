@@ -1,7 +1,7 @@
 #![recursion_limit = "256"]
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
 };
 
@@ -33,6 +33,7 @@ pub struct AppState {
     pub session: Arc<RwLock<TransmissionSessionSettings>>,
     pub torrent_limits: Arc<RwLock<HashMap<String, EngineTorrentLimits>>>,
     pub groups: Arc<RwLock<BTreeMap<String, TransmissionGroup>>>,
+    pub notification_subscriptions: Arc<RwLock<BTreeSet<String>>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -151,6 +152,7 @@ impl AppState {
             session: Arc::new(RwLock::new(TransmissionSessionSettings::default())),
             torrent_limits: Arc::new(RwLock::new(HashMap::new())),
             groups: Arc::new(RwLock::new(BTreeMap::new())),
+            notification_subscriptions: Arc::new(RwLock::new(BTreeSet::new())),
         }
     }
 
@@ -161,6 +163,7 @@ impl AppState {
             session: Arc::new(RwLock::new(TransmissionSessionSettings::default())),
             torrent_limits: Arc::new(RwLock::new(HashMap::new())),
             groups: Arc::new(RwLock::new(BTreeMap::new())),
+            notification_subscriptions: Arc::new(RwLock::new(BTreeSet::new())),
         }
     }
 }
@@ -245,7 +248,8 @@ async fn transmission_rpc_payload(state: &AppState, body: Value) -> Value {
         "session-stats" => Ok(session_stats(&state).await),
         "session-close" => Ok(json!({})),
         "session-set" => session_set(&state, &args).await,
-        "session-subscribe" | "session-unsubscribe" => Ok(json!({})),
+        "session-subscribe" => session_subscribe(&state, &args).await,
+        "session-unsubscribe" => session_unsubscribe(&state, &args).await,
         "session-access-control" => Ok(json!({
             "blocklist-enabled": false,
             "rpc-authentication-required": false,
@@ -467,6 +471,48 @@ async fn group_set(state: &AppState, args: &Value) -> Result<Value, String> {
         group.speed_limit_up = value.max(0);
     }
     Ok(json!({}))
+}
+
+async fn session_subscribe(state: &AppState, args: &Value) -> Result<Value, String> {
+    let requested = transmission_subscription_fields(args);
+    let mut subscriptions = state.notification_subscriptions.write().await;
+    for field in requested {
+        subscriptions.insert(field);
+    }
+    Ok(json!({
+        "subscriptions": subscriptions.iter().cloned().collect::<Vec<_>>(),
+    }))
+}
+
+async fn session_unsubscribe(state: &AppState, args: &Value) -> Result<Value, String> {
+    let requested = transmission_subscription_fields(args);
+    let mut subscriptions = state.notification_subscriptions.write().await;
+    if requested.is_empty() {
+        subscriptions.clear();
+    } else {
+        for field in requested {
+            subscriptions.remove(&field);
+        }
+    }
+    Ok(json!({
+        "subscriptions": subscriptions.iter().cloned().collect::<Vec<_>>(),
+    }))
+}
+
+fn transmission_subscription_fields(args: &Value) -> Vec<String> {
+    args.get("fields")
+        .or_else(|| args.get("events"))
+        .and_then(Value::as_array)
+        .map(|fields| {
+            fields
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|field| !field.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn transmission_group_json(group: &TransmissionGroup) -> Value {
@@ -847,6 +893,13 @@ async fn session_get(state: &AppState, args: &Value) -> Value {
     let limits = transmission_global_limits(state).await;
     let default_dir = default_download_dir(state).await;
     let session = state.session.read().await.clone();
+    let notification_subscriptions = state
+        .notification_subscriptions
+        .read()
+        .await
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
     let value = json!({
         "version": "TorrentNG",
         "rpc-version": 17,
@@ -899,6 +952,7 @@ async fn session_get(state: &AppState, args: &Value) -> Value {
         "seedRatioLimited": session.seed_ratio_limited,
         "idle-seeding-limit": session.idle_seeding_limit,
         "idle-seeding-limit-enabled": session.idle_seeding_limit_enabled,
+        "notification-subscriptions": notification_subscriptions,
         "units": {
             "speed-units": ["B/s", "KB/s", "MB/s", "GB/s", "TB/s"],
             "speed-bytes": 1000,
@@ -2834,6 +2888,77 @@ mod tests {
         assert_eq!(group["speed-limit-down"], 2048);
         assert_eq!(group["speed-limit-up-enabled"], true);
         assert_eq!(group["speed-limit-up"], 1024);
+    }
+
+    #[tokio::test]
+    async fn transmission_notification_subscriptions_roundtrip_state() {
+        let app =
+            build_transmission_router(AppState::new(Arc::new(RwLock::new(SessionRegistry::new()))));
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .header("content-type", "application/json")
+                    .header("x-transmission-session-id", SESSION_ID)
+                    .body(Body::from(
+                        r#"{"method":"session-subscribe","arguments":{"fields":["torrent-added","torrent-removed"]}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body["arguments"]["subscriptions"],
+            json!(["torrent-added", "torrent-removed"])
+        );
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .header("content-type", "application/json")
+                    .header("x-transmission-session-id", SESSION_ID)
+                    .body(Body::from(
+                        r#"{"method":"session-unsubscribe","arguments":{"fields":["torrent-added"]}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body["arguments"]["subscriptions"],
+            json!(["torrent-removed"])
+        );
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .header("content-type", "application/json")
+                    .header("x-transmission-session-id", SESSION_ID)
+                    .body(Body::from(
+                        r#"{"method":"session-get","arguments":{"fields":["notification-subscriptions"]}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body["arguments"]["notification-subscriptions"],
+            json!(["torrent-removed"])
+        );
     }
 
     #[tokio::test]

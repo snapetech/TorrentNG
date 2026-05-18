@@ -81,8 +81,8 @@ Local surface: `crates/rt-api-transmission`.
 |---|---|---|
 | Protocol shape | Transmission 4.1 JSON-RPC 2.0 uses snake_case; older RPC uses kebab/camel strings | Implemented: JSON-RPC 2.0 single and batch envelopes with `params`, direct `result`, and error objects; snake_case methods/args normalize to native handlers; old envelope remains supported |
 | CSRF session ID | `X-Transmission-Session-Id` retry flow | Implemented |
-| Session reads | `session_get`, `session_stats`, `session_access_control` | Implemented; `session_get` supports field projection |
-| Session writes | `session_set`, `session_close`, queue-stalled enable/disable | Implemented for native limits plus broad compatibility-state roundtrip for paths, queues, scheduler, peer/network, blocklist, scripts, and seeding settings |
+| Session reads | `session_get`, `session_stats`, `session_access_control` | Implemented; `session_get` supports field projection and projects facade notification subscriptions |
+| Session writes | `session_set`, `session_close`, `session_subscribe`, `session_unsubscribe`, queue-stalled enable/disable | Implemented for native limits plus broad compatibility-state roundtrip for paths, queues, scheduler, peer/network, blocklist, scripts, seeding settings, and notification subscriptions |
 | Groups | `group_get`, `group_set` | Implemented as compatibility state round-trips for honors-session-limits and group speed limits; native group scheduling effects remain future work |
 | Torrent actions | start, start now, stop, verify, reannounce, remove | Implemented |
 | Torrent add | filename magnet, base64 metainfo, paused, download dir, labels | Implemented |
