@@ -163,21 +163,6 @@ async function logout(): Promise<void> {
   })
 }
 
-async function qbPost(path: string, fields: Record<string, string | number | boolean | undefined | null>): Promise<void> {
-  const form = new URLSearchParams()
-  for (const [key, value] of Object.entries(fields)) {
-    if (value !== undefined && value !== null) form.set(key, String(value))
-  }
-  const res = await fetch('/api/qb/v2' + path, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-TNG-CSRF': '1' },
-    body: form,
-    credentials: 'same-origin',
-  })
-  if (res.status === 401) throw new AuthError()
-  if (!res.ok) throw new Error(`API ${res.status}: ${path}`)
-}
-
 export interface Category {
   name: string
   save_path: string
@@ -193,6 +178,7 @@ export interface BulkResult {
 export interface BulkOptions {
   category?: string
   save_path?: string
+  tags?: string[]
 }
 
 export interface Tracker {
@@ -596,6 +582,32 @@ interface FilesResponse {
   files: TorrentFile[]
 }
 
+interface NativeTorrentFile {
+  file_index?: number
+  index?: number
+  path: string
+  length?: number
+  size_bytes?: number
+  priority: number
+}
+
+async function nativeTorrentFiles(hash: string): Promise<TorrentFile[]> {
+  const body = await get<FilesResponse | NativeTorrentFile[]>(`/torrents/${hash}/files`)
+  const files = (Array.isArray(body) ? body : body.files) as Array<TorrentFile | NativeTorrentFile>
+  return files.map(file => {
+    const size = file.size_bytes ?? ('length' in file ? file.length ?? 0 : 0)
+    return {
+      index: file.index ?? ('file_index' in file ? file.file_index ?? 0 : 0),
+      path: file.path,
+      size_bytes: size,
+      completed_chunks: 0,
+      size_chunks: Math.ceil(size / 16384),
+      priority: file.priority,
+      is_created: true,
+    }
+  })
+}
+
 export const api = {
   auth: {
     login,
@@ -621,20 +633,19 @@ export const api = {
       put(`/torrents/${hash}`, body),
 
     rename: (hash: string, name: string) =>
-      qbPost('/torrents/rename', { hash, name }),
+      put(`/torrents/${hash}`, { name }),
 
     setLocation: (hashes: string[], location: string) =>
-      qbPost('/torrents/setLocation', { hashes: hashes.join('|'), location }),
+      post('/bulk/set-location', { hashes, save_path: location, dry_run: false }),
 
     setShareLimits: (hashes: string[], ratioLimit: number, seedingTimeLimit: number) =>
-      qbPost('/torrents/setShareLimits', {
-        hashes: hashes.join('|'),
-        ratioLimit,
-        seedingTimeLimit,
-      }),
+      Promise.all(hashes.map(hash => put(`/torrents/${hash}/limits`, {
+        seed_ratio_limit: ratioLimit < 0 ? null : ratioLimit,
+        seed_idle_limit: seedingTimeLimit < 0 ? null : seedingTimeLimit,
+      }))).then(() => undefined),
 
     toggleSequential: (hashes: string[]) =>
-      qbPost('/torrents/toggleSequentialDownload', { hashes: hashes.join('|') }),
+      Promise.all(hashes.map(hash => put(`/torrents/${hash}/limits`, { sequential_download: true }))).then(() => undefined),
 
     trackers: async (hash: string): Promise<Tracker[]> =>
       (await get<TrackersResponse>(`/torrents/${hash}/trackers`)).trackers,
@@ -642,8 +653,7 @@ export const api = {
     patchTrackers: (hash: string, body: TrackerPatch) =>
       patch(`/torrents/${hash}/trackers`, body),
 
-    files: async (hash: string): Promise<TorrentFile[]> =>
-      (await get<FilesResponse>(`/torrents/${hash}/files`)).files,
+    files: nativeTorrentFiles,
 
     setCategory: (hash: string, category: string) =>
       put(`/torrents/${hash}/category`, { category }),
@@ -655,13 +665,15 @@ export const api = {
       del(`/torrents/${hash}/tags`, { tags }),
 
     setTags: (hashes: string[], tags: string[]) =>
-      qbPost('/torrents/setTags', { hashes: hashes.join('|'), tags: tags.join(',') }),
+      post('/bulk/set-tags', { hashes, tags, dry_run: false }),
 
     setFilePriority: (hash: string, fileIds: number[], priority: number) =>
-      qbPost('/torrents/filePrio', { hash, id: fileIds.join('|'), priority }),
+      patch(`/torrents/${hash}/files`, {
+        files: fileIds.map(index => ({ index, priority })),
+      }),
 
     renameFile: (hash: string, id: number, name: string) =>
-      qbPost('/torrents/renameFile', { hash, id, name }),
+      patch(`/torrents/${hash}/files`, { files: [{ index: id, path: name }] }),
 
     addFile: (file: File, savePath = '', category = '', start = true) => {
       const fd = new FormData()
@@ -730,7 +742,7 @@ export const api = {
       put('/session/features', features),
   },
 
-  transferInfo: (): Promise<TransferInfo> => getRoot('/api/qb/v2/transfer/info'),
+  transferInfo: (): Promise<TransferInfo> => get('/transfer/info'),
 
   trackerHealth: (): Promise<TrackerHealthResponse> => get('/tracker-health'),
   sidebarFacets: (): Promise<SidebarFacets> => get('/sidebar-facets'),

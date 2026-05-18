@@ -256,10 +256,12 @@ The full Docker interop matrix still has release evidence to run:
   rTorrent, and TorrentNG now have refreshed passing evidence through
   `scripts/universal_live_certification.sh`;
 - public legal torrent matrix;
-- the planned default-gate protocol row is DHT-only magnet. The DHT core now has unit evidence
-  that `get_peers` responses are forwarded into torrent peer commands, but
-  full trackerless local metadata fetch and transfer still needs an end-to-end
-  Docker row. `tracker-outage-after-peer-discovery`, `webseed-outage-fallback`,
+- the Docker protocol matrix now includes `rust-trackerless-magnet`, which adds
+  TorrentNG from a trackerless magnet and completes via an explicit bridged
+  peer, covering trackerless BEP 9 metadata and payload transfer in the local
+  client stack. DHT-only public peer discovery remains a stricter public/live
+  evidence row because it depends on swarm reachability and deployment network
+  policy. `tracker-outage-after-peer-discovery`, `webseed-outage-fallback`,
   `endgame-multi-peer`, `private-torrent-no-dht-pex`,
   `rust-seeds-to-all-reference-clients`, `resume-after-partial-download`,
   `force-recheck-corruption-repair`, and `missing-file-recovery` are now

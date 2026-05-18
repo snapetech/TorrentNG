@@ -120,6 +120,18 @@ This gate fails on any `FAIL`, `MISSING`, `PASS_WITH_*`, `SKIP`,
 `STALE/INCOMPLETE`, or running/unknown certification row. Use the paired
 burndown report for exact remediation.
 
+For a local-only release scope where public-swarm, real-device, and 24h soak
+evidence are intentionally out of scope, run:
+
+```sh
+TNG_RELEASE_SCOPE=local scripts/release_readiness_gate.sh
+```
+
+This does not mark external evidence as passed. It removes the documented
+opt-in rows from the blocking set for that readiness report while leaving them
+visible in `scripts/certification_status.sh` and the burndown report. Use the
+default strict scope for public releases.
+
 To refresh status, burndown, strict readiness, and the evidence bundle in one
 release-blocking command, run:
 

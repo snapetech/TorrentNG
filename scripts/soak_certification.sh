@@ -82,10 +82,14 @@ while (( SECONDS < deadline || samples == 0 )); do
   torrents="$(curl -ksS -b "$COOKIE_JAR" "$TNG_HOST_URL/api/qb/v2/torrents/info?limit=$SOAK_LIST_LIMIT" | jq 'length' 2>/dev/null || echo 0)"
   sync_code="$(curl -ksS -o "$BODY" -w '%{http_code}' -b "$COOKIE_JAR" "$TNG_HOST_URL/api/qb/v2/sync/maindata?rid=0" || true)"
   rss="$(rss_mb)"
-  awk -v a="$rss" -v b="$max_rss" 'BEGIN {exit !(a > b)}' && max_rss="$rss"
+  if awk -v a="$rss" -v b="$max_rss" 'BEGIN {exit !(a > b)}'; then
+    max_rss="$rss"
+  fi
   printf '| %s | %s | %s | %s | %s |\n' "$now" "$health" "$torrents" "$rss" "$sync_code" >> "$OUT"
   samples=$((samples + 1))
-  (( SECONDS >= deadline )) && break
+  if (( SECONDS >= deadline )); then
+    break
+  fi
   sleep "$SOAK_INTERVAL_SECONDS"
 done
 

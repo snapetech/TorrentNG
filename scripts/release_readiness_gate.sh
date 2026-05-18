@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPORT_DIR="${REPORT_DIR:-$ROOT/certification/reports}"
 OUT="${1:-$REPORT_DIR/release-readiness-$(date -u +%Y%m%dT%H%M%SZ).md}"
+RELEASE_SCOPE="${TNG_RELEASE_SCOPE:-strict}"
 
 mkdir -p "$(dirname "$OUT")"
 
@@ -15,7 +16,17 @@ trap 'rm -f "$status_report"' EXIT
 "$ROOT/scripts/certification_burndown.sh" "$burndown_report" >/dev/null
 
 nonclean="$(
-  awk -F'|' '
+  awk -F'|' -v scope="$RELEASE_SCOPE" '
+    function local_scope_ignored(name, status) {
+      if (scope != "local") return 0;
+      if (name == "Universal compatibility" && status == "PASS_WITH_SKIPS") return 1;
+      if (name == "Universal live compatibility" && status == "PASS_WITH_SKIPS") return 1;
+      if (name == "External evidence preflight") return 1;
+      if (name == "24h soak" && status == "STALE/INCOMPLETE") return 1;
+      if (name == "Local release gate" && status == "PASS_WITH_WARNINGS") return 1;
+      if (name == "Post-soak release gate" && status == "PASS_WITH_WARNINGS") return 1;
+      return 0;
+    }
     /^\|/ && $2 !~ /^---/ && $2 !~ /Gate/ {
       name=$2; status=$3; report=$4;
       gsub(/^[[:space:]]+|[[:space:]]+$/, "", name);
@@ -26,6 +37,7 @@ nonclean="$(
       if (name == "Certification bundle") next;
       if (name == "Release evidence suite") next;
       if (name == "Certification JSON status") next;
+      if (local_scope_ignored(name, status)) next;
       if (status != "PASS" && status != "INFO") {
         print "| " name " | " status " | " report " |";
       }
@@ -40,6 +52,10 @@ nonclean="$(
   echo "- Commit: $(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unavailable)"
   echo "- Report directory: $REPORT_DIR"
   echo "- Burndown report: $(basename "$burndown_report")"
+  echo "- Scope: $RELEASE_SCOPE"
+  if [[ "$RELEASE_SCOPE" == "local" ]]; then
+    echo "- Scope policy: external opt-in evidence rows are documented but not release-blocking for this local readiness run"
+  fi
   echo
   echo "## Non-Clean Certification Rows"
   echo

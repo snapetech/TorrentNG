@@ -137,6 +137,7 @@ write_report "$report_dir/migration-corpus-selftest.md" PASS
 
 TNG_LOCAL_RELEASE_SELFTEST=1 \
   TNG_LOCAL_RELEASE_SELFTEST_REPORT_STATUS=PASS_WITH_WARNINGS \
+  env -u TNG_STORAGE_MATRIX_TARGETS \
   "$ROOT/scripts/local_release_gate.sh" "$report_dir/local-release-warning-selftest.md" >/dev/null
 grep -q '| migration exported corpus coverage | WARN |' "$report_dir/local-release-warning-selftest.md"
 grep -q 'Overall status: PASS_WITH_WARNINGS' "$report_dir/local-release-warning-selftest.md"

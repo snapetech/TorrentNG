@@ -10,6 +10,7 @@ webui/playwright-report/
 *.db-wal
 *.db-shm
 /config/
+.run/
 .env
 benchmarks/report-*.md
 certification/reports/

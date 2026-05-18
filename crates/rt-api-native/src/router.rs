@@ -1,22 +1,22 @@
 use axum::{
-    routing::{delete, get, patch, post, put},
+    routing::{delete, get, post, put},
     Router,
 };
 
 use crate::{
     handlers::{
-        add_torrent, add_torrent_peers, apply_rss_rules, bulk_action, categories, create_tag,
-        cross_seed, delete_category, delete_saved_json, delete_tag, delete_torrent,
+        add_torrent, add_torrent_peers, add_torrent_tags, apply_rss_rules, bulk_action, categories,
+        create_tag, cross_seed, delete_category, delete_saved_json, delete_tag, delete_torrent,
         diagnose_torrent, engine_commands, engine_diagnostics, get_torrent, get_user_agent, health,
         list_json_map, list_session_events, list_torrent_files, list_torrent_trackers,
         list_torrents, list_workflow_runs, logs, metrics, patch_torrent_files,
-        patch_torrent_trackers, pause_torrent, reannounce_torrent, recheck_torrent, restart_engine,
-        resume_torrent, rtorrent_settings, run_json_workflow, save_rtorrent_settings,
-        session_features, set_torrent_category, set_user_agent, sidebar_facets, storage,
-        storage_execute_plan, storage_preview_plan, stream_events, tags, test_rss_rules,
-        torrent_limits, tracker_health, transfer_limits, update_session_features, update_torrent,
-        update_torrent_limits, update_torrent_queue, update_transfer_limits, upsert_category,
-        upsert_json_map,
+        patch_torrent_trackers, pause_torrent, reannounce_torrent, recheck_torrent,
+        remove_torrent_tags, restart_engine, resume_torrent, rtorrent_settings, run_json_workflow,
+        save_rtorrent_settings, session_features, set_torrent_category, set_user_agent,
+        sidebar_facets, storage, storage_execute_plan, storage_preview_plan, stream_events, tags,
+        test_rss_rules, torrent_limits, tracker_health, transfer_info, transfer_limits,
+        update_session_features, update_torrent, update_torrent_limits, update_torrent_queue,
+        update_transfer_limits, upsert_category, upsert_json_map,
     },
     state::AppState,
 };
@@ -65,13 +65,16 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/transfer/limits",
             get(transfer_limits).put(update_transfer_limits),
         )
+        .route("/api/v1/transfer/info", get(transfer_info))
         .route(
             "/api/v1/session/features",
             get(session_features).put(update_session_features),
         )
         .route(
             "/api/v1/torrents/:hash/tags",
-            patch(crate::handlers::patch_torrent_tags),
+            post(add_torrent_tags)
+                .patch(crate::handlers::patch_torrent_tags)
+                .delete(remove_torrent_tags),
         )
         .route("/api/v1/categories", get(categories).post(upsert_category))
         .route("/api/v1/categories/:name", delete(delete_category))

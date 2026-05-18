@@ -595,6 +595,56 @@ pub async fn transfer_limits(State(state): State<AppState>) -> impl IntoResponse
     }
 }
 
+/// `GET /api/v1/transfer/info` — qBit-compatible aggregate transfer counters.
+pub async fn transfer_info(State(state): State<AppState>) -> impl IntoResponse {
+    let reg = state.registry.read().await;
+    let dl_info_speed = 0i64;
+    let up_info_speed = 0i64;
+    let mut dl_info_data = 0i64;
+    let mut up_info_data = 0i64;
+    for entry in reg.iter() {
+        dl_info_data = dl_info_data.saturating_add(entry.stats.downloaded as i64);
+        up_info_data = up_info_data.saturating_add(entry.stats.uploaded as i64);
+    }
+    drop(reg);
+
+    let (dl_rate_limit, up_rate_limit) = if let Some(engine) = &state.engine {
+        match engine.global_limits().await {
+            Ok(limits) => (
+                if limits.download_limit > 0 {
+                    limits.download_limit
+                } else {
+                    -1
+                },
+                if limits.upload_limit > 0 {
+                    limits.upload_limit
+                } else {
+                    -1
+                },
+            ),
+            Err(_) => (-1, -1),
+        }
+    } else {
+        (-1, -1)
+    };
+
+    Json(TransferInfoResponse {
+        dl_info_speed,
+        up_info_speed,
+        dl_info_data,
+        up_info_data,
+        dl_rate_limit,
+        up_rate_limit,
+        dht_nodes: 0,
+        connection_status: if state.engine.is_some() {
+            "connected".to_owned()
+        } else {
+            "firewalled".to_owned()
+        },
+    })
+    .into_response()
+}
+
 /// `PUT /api/v1/transfer/limits` — merge global transfer limits.
 pub async fn update_transfer_limits(
     State(state): State<AppState>,
@@ -1006,6 +1056,46 @@ pub async fn patch_torrent_tags(
     }
 }
 
+/// `POST /api/v1/torrents/{hash}/tags` — add persisted torrent tags.
+pub async fn add_torrent_tags(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(info_hash): Path<String>,
+    Json(req): Json<TagsRequest>,
+) -> impl IntoResponse {
+    patch_torrent_tags(
+        State(state),
+        headers,
+        Path(info_hash),
+        Json(PatchTagsRequest {
+            add: req.tags,
+            remove: Vec::new(),
+        }),
+    )
+    .await
+    .into_response()
+}
+
+/// `DELETE /api/v1/torrents/{hash}/tags` — remove persisted torrent tags.
+pub async fn remove_torrent_tags(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(info_hash): Path<String>,
+    Json(req): Json<TagsRequest>,
+) -> impl IntoResponse {
+    patch_torrent_tags(
+        State(state),
+        headers,
+        Path(info_hash),
+        Json(PatchTagsRequest {
+            add: Vec::new(),
+            remove: req.tags,
+        }),
+    )
+    .await
+    .into_response()
+}
+
 fn normalize_tags(tags: Vec<String>) -> Vec<String> {
     let mut normalized = Vec::new();
     for tag in tags {
@@ -1344,6 +1434,7 @@ pub struct BulkRequest {
     dry_run: Option<bool>,
     category: Option<String>,
     save_path: Option<PathBuf>,
+    tags: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1364,6 +1455,23 @@ pub struct CrossSeedRequest {
 #[derive(Debug, Deserialize)]
 pub struct UserAgentRequest {
     user_agent: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TagsRequest {
+    tags: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TransferInfoResponse {
+    dl_info_speed: i64,
+    up_info_speed: i64,
+    dl_info_data: i64,
+    up_info_data: i64,
+    dl_rate_limit: i64,
+    up_rate_limit: i64,
+    dht_nodes: i64,
+    connection_status: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1800,7 +1908,7 @@ pub async fn bulk_action(
     let dry_run = req.dry_run.unwrap_or(false);
     if !matches!(
         action.as_str(),
-        "start" | "stop" | "recheck" | "reannounce" | "set-category" | "set-location"
+        "start" | "stop" | "recheck" | "reannounce" | "set-category" | "set-location" | "set-tags"
     ) {
         return (
             StatusCode::BAD_REQUEST,
@@ -1837,6 +1945,13 @@ pub async fn bulk_action(
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::to_value(ApiError::bad_request("save_path is required")).unwrap()),
+        )
+            .into_response();
+    }
+    if action == "set-tags" && req.tags.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError::bad_request("tags is required")).unwrap()),
         )
             .into_response();
     }
@@ -4571,6 +4686,23 @@ async fn run_bulk_action(
                     )
                     .await
             }
+            "set-tags" => {
+                let tags = normalize_tags(req.tags.clone().unwrap_or_default());
+                let existing = state
+                    .registry
+                    .read()
+                    .await
+                    .get(hash)
+                    .map(|entry| entry.tags.clone())
+                    .unwrap_or_default();
+                let remove_tags = existing
+                    .into_iter()
+                    .filter(|tag| !tags.contains(tag))
+                    .collect::<Vec<_>>();
+                engine
+                    .update_torrent_labels(hash.to_owned(), None, tags, remove_tags)
+                    .await
+            }
             "set-location" => {
                 let save_path = req
                     .save_path
@@ -4590,6 +4722,7 @@ async fn run_bulk_action(
         "reannounce" => Ok(()),
         "set-category" => set_registry_category(state, hash, req.category.clone()).await,
         "set-location" => set_registry_location(state, hash, req.save_path.clone()).await,
+        "set-tags" => set_registry_tags(state, hash, req.tags.clone().unwrap_or_default()).await,
         _ => Err(format!("unsupported bulk action {action}")),
     }
 }
@@ -4632,6 +4765,15 @@ async fn set_registry_location(
         .get_mut(hash)
         .ok_or_else(|| "torrent not found".to_owned())?;
     entry.save_path = save_path.display().to_string();
+    Ok(())
+}
+
+async fn set_registry_tags(state: &AppState, hash: &str, tags: Vec<String>) -> Result<(), String> {
+    let mut reg = state.registry.write().await;
+    let entry = reg
+        .get_mut(hash)
+        .ok_or_else(|| "torrent not found".to_owned())?;
+    entry.tags = normalize_tags(tags);
     Ok(())
 }
 

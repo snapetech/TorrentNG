@@ -134,8 +134,16 @@ else
   mark "migration corpus manifest" "WARN" "manifest.toml missing; copy manifest.example.toml and record artifact provenance"
 fi
 
-if pgrep -af '[s]oak_certification.sh' | grep -q 'soak-24h-'; then
-  mark "24h soak active" "PASS" "$(pgrep -af '[s]oak_certification.sh' | grep 'soak-24h-' | head -1)"
+SOAK_PID_FILE="${TNG_24H_SOAK_PID_FILE:-$ROOT/.run/soak-24h.pid}"
+soak_process="$(pgrep -af '[s]oak_certification.sh' | grep 'soak-24h-' | head -1 || true)"
+if [[ -z "$soak_process" && -f "$SOAK_PID_FILE" ]]; then
+  soak_pid="$(cat "$SOAK_PID_FILE" 2>/dev/null || true)"
+  if [[ "$soak_pid" =~ ^[0-9]+$ ]]; then
+    soak_process="$(ps -p "$soak_pid" -o args= 2>/dev/null | grep 'soak_certification.sh' | grep 'soak-24h-' || true)"
+  fi
+fi
+if [[ -n "$soak_process" ]]; then
+  mark "24h soak active" "PASS" "$soak_process"
 else
   mark "24h soak active" "WARN" "no active soak-24h run detected; use scripts/start_24h_soak.sh"
 fi

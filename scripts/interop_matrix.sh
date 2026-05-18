@@ -36,6 +36,7 @@ LOCAL_CASES=(
 
 PROTOCOL_CASES=(
   rust-magnet-with-tracker
+  rust-trackerless-magnet
   rust-udp-tracker
   rust-multi-tracker-fallback
   tracker-outage-after-peer-discovery
@@ -322,6 +323,7 @@ make_torrent() {
   local args=()
   case "$mode" in
     tracker-webseed) args=(-a "$tracker" -w "$webseed") ;;
+    trackerless) args=() ;;
     tracker-only) args=(-a "$tracker") ;;
     multi-tracker-fallback) args=(-a "http://127.0.0.1:9/dead-announce" -a "$tracker") ;;
     udp-tracker-only) args=(-a "udp://opentracker:6969/announce") ;;
@@ -335,6 +337,7 @@ make_torrent() {
     local cmd_args=""
     case "$mode" in
       tracker-webseed) cmd_args="-a '$tracker' -w '$webseed'" ;;
+      trackerless) cmd_args="" ;;
       tracker-only) cmd_args="-a '$tracker'" ;;
       multi-tracker-fallback) cmd_args="-a 'http://127.0.0.1:9/dead-announce' -a '$tracker'" ;;
       udp-tracker-only) cmd_args="-a 'udp://opentracker:6969/announce'" ;;
@@ -967,6 +970,33 @@ run_magnet_tracker_case() {
   [[ "$status" == "PASS" ]]
 }
 
+run_trackerless_magnet_case() {
+  local status="PASS" fixture torrent info_hash name magnet
+  append_report "## Protocol Local: rust-trackerless-magnet"
+  append_report ""
+  log "running protocol local case rust-trackerless-magnet"
+  fixture="$(case_fixture single-16m rust-trackerless-magnet)"
+  torrent="$(make_torrent "$fixture" "$fixture" trackerless)"
+  info_hash="$(torrent_info_hash "$torrent")"
+  name="$(torrent_name "$torrent")"
+  magnet="magnet:?xt=urn:btih:$info_hash&dn=$(urlencode "$name")"
+  seed_fixture_for_client qbittorrent "$fixture"
+  add_to_client qbittorrent "$torrent" seed || status="FAIL"
+  qb_force_start "$info_hash" || status="FAIL"
+  add_rust_url "$magnet" "$(download_dir torrentngd)" || status="FAIL"
+  bridge_client_peer_to_rust qbittorrent "$info_hash" || status="FAIL"
+  wait_explicit_peer_complete "$TIMEOUT_LOCAL" "$fixture" "$info_hash" qbittorrent qbittorrent torrentngd || status="FAIL"
+  verify_fixture_hashes torrentngd "$fixture" || status="FAIL"
+  append_report "- Seeder: qbittorrent"
+  append_report "- Leecher: torrentngd"
+  append_report "- Fixture: single-16m"
+  append_report "- Add method: trackerless magnet plus explicit peer bridge"
+  append_report "- Info hash: $info_hash"
+  append_report "- Status: **$status**"
+  append_report ""
+  [[ "$status" == "PASS" ]]
+}
+
 run_udp_tracker_case() {
   local status="PASS" fixture torrent info_hash
   append_report "## Protocol Local: rust-udp-tracker"
@@ -1444,6 +1474,9 @@ run_protocol_local_matrix() {
   append_report ""
   if should_run_protocol_case rust-magnet-with-tracker; then
     run_magnet_tracker_case || failures=$((failures + 1))
+  fi
+  if should_run_protocol_case rust-trackerless-magnet; then
+    run_trackerless_magnet_case || failures=$((failures + 1))
   fi
   if should_run_protocol_case rust-udp-tracker; then
     run_udp_tracker_case || failures=$((failures + 1))
