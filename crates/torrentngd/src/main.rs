@@ -24,8 +24,18 @@ use rt_config::Config;
 use rt_engine::Engine;
 use rt_session::SessionRegistry;
 
+mod migrate;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("migrate") {
+        let rest = argv[2..].to_vec();
+        return tokio::task::spawn_blocking(move || migrate::run(&rest))
+            .await
+            .context("migrate task panicked")?;
+    }
+
     let config = Arc::new(load_config());
     rt_logging::init(&config.logging, Some(&config.daemon.log_level));
     info!(

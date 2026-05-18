@@ -356,29 +356,29 @@ Implements the qBittorrent Web API v2. By default it advertises qBittorrent `5.0
 
 ### Log / Search / RSS
 
-These compatibility endpoints are present so qBittorrent clients can probe them safely. Search remains intentionally inert; RSS endpoints are backed by native RSS rules where available and degrade to compatible no-op shapes otherwise.
+These compatibility endpoints are present so qBittorrent clients can probe them safely. Search keeps plugin and job lifecycle state while returning inert local result sets; RSS keeps in-memory folder, feed, and rule mutation state and can later project native RSS rules.
 
 | Method | Path | Notes |
 |--------|------|-------|
 | `GET` | `/api/qb/v2/log/main` | Returns retained app/session/rTorrent log events in qBittorrent log shape; supports `limit`, `last_known_id`, `normal`, `info`, `warning`, `critical` |
 | `GET` | `/api/qb/v2/log/peers` | Returns `[]` |
-| `GET` | `/api/qb/v2/search/status` | Returns stopped status |
+| `GET` | `/api/qb/v2/search/status` | Returns stopped/running status plus known plugin state |
 | `GET` | `/api/qb/v2/search/categories` | Returns `[]` |
-| `GET` | `/api/qb/v2/search/plugins` | Returns `[]` |
-| `POST` | `/api/qb/v2/search/installPlugin` | Accepted |
-| `POST` | `/api/qb/v2/search/uninstallPlugin` | Accepted |
-| `POST` | `/api/qb/v2/search/enablePlugin` | Accepted |
+| `GET` | `/api/qb/v2/search/plugins` | Returns installed compatibility plugin records |
+| `POST` | `/api/qb/v2/search/installPlugin` | Records plugin source/name metadata |
+| `POST` | `/api/qb/v2/search/uninstallPlugin` | Removes plugin records |
+| `POST` | `/api/qb/v2/search/enablePlugin` | Updates plugin enabled state |
 | `POST` | `/api/qb/v2/search/updatePlugins` | Accepted |
-| `POST` | `/api/qb/v2/search/start` | Returns `{ "id": 0 }` |
-| `POST` | `/api/qb/v2/search/stop` | Accepted |
-| `GET` | `/api/qb/v2/search/results` | Returns empty stopped result set |
-| `POST` | `/api/qb/v2/search/delete` | Accepted |
-| `GET` | `/api/qb/v2/rss/items` | Returns `{}` |
-| `GET` | `/api/qb/v2/rss/rules` | Returns native RSS rules in qBit-shaped rule map |
-| `GET` | `/api/qb/v2/rss/matchingArticles` | Returns names of native RSS rules matching `article` |
-| `POST` | `/api/qb/v2/rss/setRule` | Creates/updates native RSS rule from qBit rule JSON |
-| `POST` | `/api/qb/v2/rss/renameRule` | Renames native RSS rule |
-| `POST` | `/api/qb/v2/rss/removeRule` | Deletes native RSS rule |
+| `POST` | `/api/qb/v2/search/start` | Returns a stable per-process search job id |
+| `POST` | `/api/qb/v2/search/stop` | Stops the requested compatibility search job |
+| `GET` | `/api/qb/v2/search/results` | Returns the requested job plus empty local result set |
+| `POST` | `/api/qb/v2/search/delete` | Deletes the requested compatibility search job |
+| `GET` | `/api/qb/v2/rss/items` | Returns compatibility folder/feed state |
+| `GET` | `/api/qb/v2/rss/rules` | Returns compatibility qBit-shaped rule map |
+| `GET` | `/api/qb/v2/rss/matchingArticles` | Returns known rule names |
+| `POST` | `/api/qb/v2/rss/setRule` | Creates/updates compatibility RSS rule JSON |
+| `POST` | `/api/qb/v2/rss/renameRule` | Renames compatibility RSS rule |
+| `POST` | `/api/qb/v2/rss/removeRule` | Deletes compatibility RSS rule |
 | `POST` | `/api/qb/v2/rss/addFolder`, `/addFeed`, `/removeItem`, `/moveItem`, `/markAsRead`, `/refreshItem` | Accepted as compatibility no-ops |
 
 ---

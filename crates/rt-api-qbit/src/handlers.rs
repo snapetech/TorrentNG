@@ -2334,65 +2334,386 @@ fn qbit_peer_log_entry(info_hash: &str, peer: &EnginePeerSnapshot) -> serde_json
     })
 }
 
-pub async fn search_status() -> impl IntoResponse {
+pub async fn search_status(State(state): State<AppState>) -> impl IntoResponse {
+    let jobs = state.search_jobs.read().await;
+    let running = jobs
+        .values()
+        .any(|job| job.get("status").and_then(|v| v.as_str()) == Some("Running"));
+    let plugins = state
+        .search_plugins
+        .read()
+        .await
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
     (
         StatusCode::OK,
         Json(serde_json::json!({
-            "status": "Stopped",
-            "plugins": [],
+            "status": if running { "Running" } else { "Stopped" },
+            "plugins": plugins,
         })),
     )
 }
 
-pub async fn search_plugins() -> impl IntoResponse {
-    (StatusCode::OK, Json(Vec::<String>::new()))
+pub async fn search_plugins(State(state): State<AppState>) -> impl IntoResponse {
+    let plugins = state
+        .search_plugins
+        .read()
+        .await
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    (StatusCode::OK, Json(plugins))
 }
 
 pub async fn search_categories() -> impl IntoResponse {
     (StatusCode::OK, Json(Vec::<String>::new()))
 }
 
-pub async fn search_plugin_noop() -> impl IntoResponse {
+pub async fn search_install_plugin(
+    State(state): State<AppState>,
+    body: String,
+) -> impl IntoResponse {
+    let params = parse_form_body(&body);
+    let sources = params
+        .get("sources")
+        .map(|s| split_qbit_list(s))
+        .unwrap_or_default();
+    let mut plugins = state.search_plugins.write().await;
+    for source in sources.into_iter().filter(|s| !s.is_empty()) {
+        let name = plugin_name_from_source(&source);
+        plugins.insert(name.clone(), search_plugin_value(&name, &source, true));
+    }
     StatusCode::OK
 }
 
-pub async fn search_start() -> impl IntoResponse {
-    (StatusCode::OK, Json(serde_json::json!({ "id": 0 })))
-}
-
-pub async fn search_stop() -> impl IntoResponse {
+pub async fn search_uninstall_plugin(
+    State(state): State<AppState>,
+    body: String,
+) -> impl IntoResponse {
+    let params = parse_form_body(&body);
+    let names = params
+        .get("names")
+        .map(|s| split_qbit_list(s))
+        .unwrap_or_default();
+    let mut plugins = state.search_plugins.write().await;
+    for name in names {
+        plugins.remove(&name);
+    }
     StatusCode::OK
 }
 
-pub async fn search_results() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "status": "Stopped",
-            "total": 0,
-            "results": [],
-        })),
-    )
-}
-
-pub async fn search_delete() -> impl IntoResponse {
+pub async fn search_enable_plugin(
+    State(state): State<AppState>,
+    body: String,
+) -> impl IntoResponse {
+    let params = parse_form_body(&body);
+    let enabled = parse_bool_param(params.get("enable").map(String::as_str), true);
+    let names = params
+        .get("names")
+        .map(|s| split_qbit_list(s))
+        .unwrap_or_default();
+    let mut plugins = state.search_plugins.write().await;
+    for name in names.into_iter().filter(|s| !s.is_empty()) {
+        let entry = plugins
+            .entry(name.clone())
+            .or_insert_with(|| search_plugin_value(&name, "", enabled));
+        if let Some(map) = entry.as_object_mut() {
+            map.insert("enabled".into(), enabled.into());
+        }
+    }
     StatusCode::OK
 }
 
-pub async fn rss_items() -> impl IntoResponse {
-    (StatusCode::OK, Json(serde_json::json!({})))
-}
-
-pub async fn rss_rules() -> impl IntoResponse {
-    (StatusCode::OK, Json(serde_json::json!({})))
-}
-
-pub async fn rss_matching_articles() -> impl IntoResponse {
-    (StatusCode::OK, Json(Vec::<serde_json::Value>::new()))
-}
-
-pub async fn rss_noop() -> impl IntoResponse {
+pub async fn search_update_plugins() -> impl IntoResponse {
     StatusCode::OK
+}
+
+pub async fn search_start(State(state): State<AppState>, body: String) -> impl IntoResponse {
+    let params = parse_form_body(&body);
+    let mut next_id = state.next_search_id.write().await;
+    let id = *next_id;
+    *next_id += 1;
+    drop(next_id);
+
+    let job = serde_json::json!({
+        "id": id,
+        "pattern": params.get("pattern").cloned().unwrap_or_default(),
+        "plugins": params.get("plugins").cloned().unwrap_or_else(|| "all".to_owned()),
+        "category": params.get("category").cloned().unwrap_or_else(|| "all".to_owned()),
+        "status": "Stopped",
+        "total": 0,
+        "results": [],
+    });
+    state.search_jobs.write().await.insert(id.to_string(), job);
+    (StatusCode::OK, Json(serde_json::json!({ "id": id })))
+}
+
+pub async fn search_stop(State(state): State<AppState>, body: String) -> impl IntoResponse {
+    if let Some(id) = parse_form_body(&body).get("id").cloned() {
+        if let Some(job) = state.search_jobs.write().await.get_mut(&id) {
+            if let Some(map) = job.as_object_mut() {
+                map.insert("status".into(), "Stopped".into());
+            }
+        }
+    }
+    StatusCode::OK
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SearchResultsQuery {
+    id: Option<i64>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+pub async fn search_results(
+    State(state): State<AppState>,
+    Query(query): Query<SearchResultsQuery>,
+) -> impl IntoResponse {
+    let jobs = state.search_jobs.read().await;
+    let job = query
+        .id
+        .and_then(|id| jobs.get(&id.to_string()))
+        .or_else(|| jobs.iter().next_back().map(|(_, job)| job));
+    let Some(job) = job else {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "Stopped",
+                "total": 0,
+                "results": [],
+            })),
+        );
+    };
+    let mut response = job.clone();
+    if let Some(map) = response.as_object_mut() {
+        let results = map
+            .get("results")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let offset = query.offset.unwrap_or(0);
+        let limit = query.limit.unwrap_or(results.len().saturating_sub(offset));
+        let sliced = results
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect::<Vec<_>>();
+        map.insert("results".into(), serde_json::Value::Array(sliced));
+    }
+    (StatusCode::OK, Json(response))
+}
+
+pub async fn search_delete(State(state): State<AppState>, body: String) -> impl IntoResponse {
+    if let Some(id) = parse_form_body(&body).get("id").cloned() {
+        state.search_jobs.write().await.remove(&id);
+    }
+    StatusCode::OK
+}
+
+pub async fn rss_items(State(state): State<AppState>) -> impl IntoResponse {
+    let items = state.rss_items.read().await.clone();
+    (StatusCode::OK, Json(serde_json::Value::Object(items)))
+}
+
+pub async fn rss_rules(State(state): State<AppState>) -> impl IntoResponse {
+    let rules = state.rss_rules.read().await.clone();
+    (StatusCode::OK, Json(serde_json::Value::Object(rules)))
+}
+
+pub async fn rss_matching_articles(State(state): State<AppState>) -> impl IntoResponse {
+    let rules = state
+        .rss_rules
+        .read()
+        .await
+        .keys()
+        .cloned()
+        .map(serde_json::Value::String)
+        .collect::<Vec<_>>();
+    (StatusCode::OK, Json(rules))
+}
+
+pub async fn rss_add_folder(State(state): State<AppState>, body: String) -> impl IntoResponse {
+    let params = parse_form_body(&body);
+    let Some(path) = params.get("path").filter(|p| !p.is_empty()) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    state.rss_items.write().await.insert(
+        path.clone(),
+        serde_json::json!({
+            "uid": path,
+            "name": rss_leaf_name(path),
+            "type": "folder",
+            "isLoading": false,
+            "hasError": false,
+            "articles": [],
+        }),
+    );
+    StatusCode::OK
+}
+
+pub async fn rss_add_feed(State(state): State<AppState>, body: String) -> impl IntoResponse {
+    let params = parse_form_body(&body);
+    let Some(url) = params.get("url").filter(|u| !u.is_empty()) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let path = params
+        .get("path")
+        .filter(|p| !p.is_empty())
+        .cloned()
+        .unwrap_or_else(|| url.clone());
+    state.rss_items.write().await.insert(
+        path.clone(),
+        serde_json::json!({
+            "uid": path,
+            "name": rss_leaf_name(&path),
+            "type": "feed",
+            "url": url,
+            "isLoading": false,
+            "hasError": false,
+            "articles": [],
+        }),
+    );
+    StatusCode::OK
+}
+
+pub async fn rss_remove_item(State(state): State<AppState>, body: String) -> impl IntoResponse {
+    if let Some(path) = parse_form_body(&body).get("path").cloned() {
+        state.rss_items.write().await.remove(&path);
+    }
+    StatusCode::OK
+}
+
+pub async fn rss_move_item(State(state): State<AppState>, body: String) -> impl IntoResponse {
+    let params = parse_form_body(&body);
+    let Some(item_path) = params.get("itemPath") else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let Some(dest_path) = params.get("destPath") else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let mut items = state.rss_items.write().await;
+    if let Some(mut item) = items.remove(item_path) {
+        if let Some(map) = item.as_object_mut() {
+            map.insert("uid".into(), dest_path.clone().into());
+            map.insert("name".into(), rss_leaf_name(dest_path).into());
+        }
+        items.insert(dest_path.clone(), item);
+    }
+    StatusCode::OK
+}
+
+pub async fn rss_mark_as_read(State(state): State<AppState>, body: String) -> impl IntoResponse {
+    let params = parse_form_body(&body);
+    if let Some(item_path) = params.get("itemPath") {
+        if let Some(item) = state.rss_items.write().await.get_mut(item_path) {
+            if let Some(map) = item.as_object_mut() {
+                map.insert("read".into(), true.into());
+            }
+        }
+    }
+    StatusCode::OK
+}
+
+pub async fn rss_refresh_item(State(state): State<AppState>, body: String) -> impl IntoResponse {
+    let params = parse_form_body(&body);
+    if let Some(item_path) = params.get("itemPath") {
+        if let Some(item) = state.rss_items.write().await.get_mut(item_path) {
+            if let Some(map) = item.as_object_mut() {
+                map.insert("lastBuildDate".into(), now_secs().into());
+            }
+        }
+    }
+    StatusCode::OK
+}
+
+pub async fn rss_set_rule(State(state): State<AppState>, body: String) -> impl IntoResponse {
+    let params = parse_form_body(&body);
+    let Some(name) = params.get("ruleName").filter(|n| !n.is_empty()) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let rule = params
+        .get("ruleDef")
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    state.rss_rules.write().await.insert(name.clone(), rule);
+    StatusCode::OK
+}
+
+pub async fn rss_rename_rule(State(state): State<AppState>, body: String) -> impl IntoResponse {
+    let params = parse_form_body(&body);
+    let Some(rule_name) = params.get("ruleName") else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let Some(new_rule_name) = params.get("newRuleName") else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let mut rules = state.rss_rules.write().await;
+    if let Some(rule) = rules.remove(rule_name) {
+        rules.insert(new_rule_name.clone(), rule);
+    }
+    StatusCode::OK
+}
+
+pub async fn rss_remove_rule(State(state): State<AppState>, body: String) -> impl IntoResponse {
+    if let Some(rule_name) = parse_form_body(&body).get("ruleName").cloned() {
+        state.rss_rules.write().await.remove(&rule_name);
+    }
+    StatusCode::OK
+}
+
+fn search_plugin_value(name: &str, source: &str, enabled: bool) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "fullName": name,
+        "version": "",
+        "url": source,
+        "enabled": enabled,
+        "supportedCategories": ["all"],
+    })
+}
+
+fn plugin_name_from_source(source: &str) -> String {
+    source
+        .trim_end_matches('/')
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(source)
+        .to_owned()
+}
+
+fn rss_leaf_name(path: &str) -> String {
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(path)
+        .to_owned()
+}
+
+fn split_qbit_list(raw: &str) -> Vec<String> {
+    raw.split(['|', ','])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn parse_bool_param(value: Option<&str>, default: bool) -> bool {
+    match value.map(|v| v.to_ascii_lowercase()) {
+        Some(v) if matches!(v.as_str(), "true" | "1" | "yes" | "on") => true,
+        Some(v) if matches!(v.as_str(), "false" | "0" | "no" | "off") => false,
+        _ => default,
+    }
+}
+
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -4724,6 +5045,181 @@ mod tests {
             let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(body, serde_json::json!([]));
         }
+    }
+
+    #[tokio::test]
+    async fn qbit_search_plugins_and_jobs_are_stateful() {
+        let hash = "d".repeat(40);
+        let app = build_qbit_router(make_state_with(&hash).await);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/search/installPlugin")
+                    .body(Body::from("sources=https%3A%2F%2Fexample.test%2Fjackett"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/qb/v2/search/plugins")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let plugins: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(plugins[0]["name"], "jackett");
+        assert_eq!(plugins[0]["enabled"], true);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/search/start")
+                    .body(Body::from("pattern=ubuntu&plugins=all&category=all"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let started: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let id = started["id"].as_i64().unwrap();
+        assert!(id > 0);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/qb/v2/search/results?id={id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let results: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(results["pattern"], "ubuntu");
+        assert_eq!(results["status"], "Stopped");
+        assert_eq!(results["total"], 0);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/search/delete")
+                    .body(Body::from(format!("id={id}")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn qbit_rss_items_and_rules_round_trip() {
+        let hash = "d".repeat(40);
+        let app = build_qbit_router(make_state_with(&hash).await);
+
+        for (path, body) in [
+            ("/api/qb/v2/rss/addFolder", "path=linux"),
+            (
+                "/api/qb/v2/rss/addFeed",
+                "url=https%3A%2F%2Fexample.test%2Frss&path=linux%2Fexample",
+            ),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/qb/v2/rss/items")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let items: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(items["linux"]["type"], "folder");
+        assert_eq!(items["linux/example"]["url"], "https://example.test/rss");
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/rss/setRule")
+                    .body(Body::from(
+                        "ruleName=linux&ruleDef=%7B%22enabled%22%3Atrue%7D",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/rss/renameRule")
+                    .body(Body::from("ruleName=linux&newRuleName=linux-renamed"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/qb/v2/rss/rules")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let rules: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(rules["linux-renamed"]["enabled"], true);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/rss/removeRule")
+                    .body(Body::from("ruleName=linux-renamed"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]

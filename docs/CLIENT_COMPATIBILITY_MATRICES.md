@@ -74,8 +74,8 @@ Universal compatibility release rule:
 | Per-torrent speed limits | torrent limit endpoints | torrent_set limits | set_torrent_options | throttle commands | Native/Compat through qBit, Transmission, and Deluge facades; rTorrent throttle commands are compatibility placeholders | Per-torrent limit mutation and projection row |
 | Sequential/first-last | qBit toggles | 4.1 sequential fields | options/prioritize first-last | client-specific | Accepted/no-op or partial | Assert accepted; add native support if scheduler implements |
 | Super seeding | qBit setSuperSeeding | seed mode fields | super_seeding option | supported in rTorrent | Compat/no-op today | API acceptance; native behavior row later |
-| RSS | qBit RSS API | none core | plugin ecosystem | ruTorrent plugins | qBit no-op/read-compatible only | RSS API shape tests |
-| Search | qBit search API | none core | plugin ecosystem | ruTorrent plugins | qBit no-op/read-compatible only | Search API shape tests |
+| RSS | qBit RSS API | none core | plugin ecosystem | ruTorrent plugins | qBit stateful in-memory compatibility for folders, feeds, and rules | RSS API shape and mutation tests |
+| Search | qBit search API | none core | plugin ecosystem | ruTorrent plugins | qBit stateful plugin/job compatibility with inert local result sets | Search API shape and lifecycle tests |
 | Logs | qBit log endpoints | none core | events | log files | qBit main log backed by retained app/session events and peer log projects native peer snapshots when an engine is attached; Deluge events basic | Log/event shape tests |
 | Session stats | transfer/info, sync | session_stats | session_status/stats | global commands | Native counters; qBit, Transmission, and Deluge session rates aggregate native peer snapshots where available | Cross-facade stats consistency row |
 | Auth/session handshake | cookie login | CSRF/session id plus JSON-RPC 2.0 | JSON-RPC auth.login | external HTTP auth | Compat | Auth handshake rows for every facade |
@@ -113,8 +113,8 @@ Local implementation: `crates/rt-api-qbit`.
 | Sync | `sync/maindata`, `sync/torrentPeers` | Same | Native/Partial peers; maindata includes broad torrent/server-state keys, torrentPeers has qBit peer shape and stable RID deltas | Full sync, delta sync, peer sync row |
 | Transfer | `transfer/info`, download/upload limits, speed limits mode, toggle, setters, `banPeers` | Same | Native/Compat | Global limit and ban accepted rows |
 | Logs | `log/main`, `log/peers` | Same | Native/Compat | Main log projects retained native session events, sidecar app events, and optional ingested rTorrent logs with qBit severity filters; peer log projects bounded native peer snapshots when an engine is attached |
-| Search | status/categories/plugins/install/uninstall/enable/update/start/stop/results/delete | Same | Compat | Full no-plugin search flow shape |
-| RSS | items/rules/matchingArticles/addFolder/addFeed/removeItem/moveItem/markAsRead/refreshItem/setRule/renameRule/removeRule | Same | Compat | Full RSS shape/no-op flow |
+| Search | status/categories/plugins/install/uninstall/enable/update/start/stop/results/delete | Same | Compat | Plugin install/enable/uninstall plus job start/results/delete lifecycle |
+| RSS | items/rules/matchingArticles/addFolder/addFeed/removeItem/moveItem/markAsRead/refreshItem/setRule/renameRule/removeRule | Same | Compat | Folder/feed and rule mutation round-trip |
 
 qBittorrent field backlog:
 
