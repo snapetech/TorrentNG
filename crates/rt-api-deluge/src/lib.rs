@@ -1,6 +1,10 @@
 #![recursion_limit = "256"]
 
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
+    sync::Arc,
+};
 
 use axum::{extract::State, response::IntoResponse, routing::post, Json, Router};
 use base64::{engine::general_purpose, Engine as _};
@@ -799,9 +803,11 @@ async fn update_ui(state: &AppState, params: &[Value]) -> Result<Value, String> 
     let mut metadata = std::collections::HashMap::new();
     let mut peers = std::collections::HashMap::new();
     let mut trackers = std::collections::HashMap::new();
+    let mut active_rechecks = HashSet::new();
     let mut limits_by_hash = state.torrent_options.read().await.clone();
     let move_completed_by_hash = state.move_completed_options.read().await.clone();
     if let Some(engine) = &state.engine {
+        active_rechecks = deluge_active_recheck_hashes(engine).await;
         for entry in &entries {
             if let Ok(meta) = engine.torrent_metadata(entry.info_hash.clone()).await {
                 metadata.insert(entry.info_hash.clone(), meta);
@@ -834,6 +840,7 @@ async fn update_ui(state: &AppState, params: &[Value]) -> Result<Value, String> 
                         trackers.get(&entry.info_hash).map(Vec::as_slice),
                         limits_by_hash.get(&entry.info_hash),
                         move_completed_by_hash.get(&entry.info_hash),
+                        active_rechecks.contains(&entry.info_hash),
                     ),
                     &wanted_fields,
                 ),
@@ -843,7 +850,7 @@ async fn update_ui(state: &AppState, params: &[Value]) -> Result<Value, String> 
     Ok(json!({
         "connected": true,
         "torrents": torrents,
-        "filters": deluge_filters_from_entries(&entries),
+        "filters": deluge_filters_from_entries(&entries, &active_rechecks),
         "stats": {
             "download_rate": 0.0,
             "upload_rate": 0.0,
@@ -855,11 +862,17 @@ async fn update_ui(state: &AppState, params: &[Value]) -> Result<Value, String> 
     }))
 }
 
-fn deluge_filters_from_entries(entries: &[rt_session::TorrentEntry]) -> Value {
+fn deluge_filters_from_entries(
+    entries: &[rt_session::TorrentEntry],
+    active_rechecks: &HashSet<String>,
+) -> Value {
     let mut states = std::collections::BTreeMap::<String, usize>::new();
     for entry in entries {
         *states
-            .entry(deluge_state(entry.state.as_str()).to_owned())
+            .entry(deluge_state_with_recheck(
+                entry.state.as_str(),
+                active_rechecks.contains(&entry.info_hash),
+            ))
             .or_default() += 1;
     }
     let mut state_filters = vec![json!(["All", entries.len()])];
@@ -928,9 +941,11 @@ async fn torrents_status(state: &AppState, params: &[Value]) -> Result<Value, St
     let mut metadata = std::collections::HashMap::new();
     let mut peers = std::collections::HashMap::new();
     let mut trackers = std::collections::HashMap::new();
+    let mut active_rechecks = HashSet::new();
     let mut limits_by_hash = state.torrent_options.read().await.clone();
     let move_completed_by_hash = state.move_completed_options.read().await.clone();
     if let Some(engine) = &state.engine {
+        active_rechecks = deluge_active_recheck_hashes(engine).await;
         for entry in &entries {
             if let Ok(meta) = engine.torrent_metadata(entry.info_hash.clone()).await {
                 metadata.insert(entry.info_hash.clone(), meta);
@@ -952,7 +967,9 @@ async fn torrents_status(state: &AppState, params: &[Value]) -> Result<Value, St
     }
     let torrents = entries
         .iter()
-        .filter(|entry| deluge_torrent_matches_filter(entry, filter))
+        .filter(|entry| {
+            deluge_torrent_matches_filter(entry, filter, active_rechecks.contains(&entry.info_hash))
+        })
         .map(|entry| {
             (
                 entry.info_hash.clone(),
@@ -964,6 +981,7 @@ async fn torrents_status(state: &AppState, params: &[Value]) -> Result<Value, St
                         trackers.get(&entry.info_hash).map(Vec::as_slice),
                         limits_by_hash.get(&entry.info_hash),
                         move_completed_by_hash.get(&entry.info_hash),
+                        active_rechecks.contains(&entry.info_hash),
                     ),
                     &wanted_fields,
                 ),
@@ -973,7 +991,11 @@ async fn torrents_status(state: &AppState, params: &[Value]) -> Result<Value, St
     Ok(Value::Object(torrents))
 }
 
-fn deluge_torrent_matches_filter(entry: &rt_session::TorrentEntry, filter: Option<&Value>) -> bool {
+fn deluge_torrent_matches_filter(
+    entry: &rt_session::TorrentEntry,
+    filter: Option<&Value>,
+    active_recheck: bool,
+) -> bool {
     let Some(filter) = filter.and_then(Value::as_object) else {
         return true;
     };
@@ -998,9 +1020,10 @@ fn deluge_torrent_matches_filter(entry: &rt_session::TorrentEntry, filter: Optio
             "state" => {
                 let values = string_list(Some(value));
                 if !values.is_empty()
-                    && !values
-                        .iter()
-                        .any(|state| deluge_state(entry.state.as_str()).eq_ignore_ascii_case(state))
+                    && !values.iter().any(|state| {
+                        deluge_state_with_recheck(entry.state.as_str(), active_recheck)
+                            .eq_ignore_ascii_case(state)
+                    })
                 {
                     return false;
                 }
@@ -1046,6 +1069,11 @@ async fn torrent_status(
     } else {
         None
     };
+    let active_recheck = if let Some(engine) = &state.engine {
+        deluge_active_recheck_hashes(engine).await.contains(hash)
+    } else {
+        false
+    };
     let limits = deluge_torrent_limits(state, hash).await;
     let move_completed = state.move_completed_options.read().await.get(hash).cloned();
     let wanted_fields = deluge_requested_fields(fields);
@@ -1057,6 +1085,7 @@ async fn torrent_status(
             trackers.as_deref(),
             limits.as_ref(),
             move_completed.as_ref(),
+            active_recheck,
         ),
         &wanted_fields,
     ))
@@ -1126,6 +1155,22 @@ fn deluge_fields_need_trackers(fields: &Option<std::collections::BTreeSet<String
     })
 }
 
+async fn deluge_active_recheck_hashes(engine: &EngineHandle) -> HashSet<String> {
+    let Ok(jobs) = engine.list_jobs().await else {
+        return HashSet::new();
+    };
+    jobs.into_iter()
+        .filter(|job| {
+            job.kind == "recheck_torrent"
+                && !matches!(
+                    job.state.as_str(),
+                    "completed" | "failed" | "cancelled" | "canceled"
+                )
+        })
+        .flat_map(|job| job.affected_torrents)
+        .collect()
+}
+
 async fn torrent_files(state: &AppState, hash: &str) -> Result<Value, String> {
     if let Some(engine) = &state.engine {
         if let Ok(meta) = engine.torrent_metadata(hash.to_owned()).await {
@@ -1153,6 +1198,7 @@ fn deluge_torrent(
     trackers: Option<&[EngineTrackerSnapshot]>,
     limits: Option<&EngineTorrentLimits>,
     move_completed: Option<&DelugeMoveCompletedOptions>,
+    active_recheck: bool,
 ) -> Value {
     let now = unix_now();
     let progress = if entry.total_length == 0 {
@@ -1176,7 +1222,7 @@ fn deluge_torrent(
     json!({
         "hash": entry.info_hash,
         "name": entry.name,
-        "state": deluge_state(entry.state.as_str()),
+        "state": deluge_state_with_recheck(entry.state.as_str(), active_recheck),
         "progress": progress,
         "total_size": entry.total_length,
         "total_done": entry.total_length.saturating_sub(entry.amount_left),
@@ -1868,6 +1914,14 @@ fn deluge_state(state: &str) -> &'static str {
     }
 }
 
+fn deluge_state_with_recheck(state: &str, active_recheck: bool) -> String {
+    if active_recheck {
+        "Checking".to_owned()
+    } else {
+        deluge_state(state).to_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1925,6 +1979,12 @@ mod tests {
                 "free_space",
             ],
         );
+    }
+
+    #[test]
+    fn deluge_state_projects_active_recheck_as_checking() {
+        assert_eq!(deluge_state_with_recheck("downloading", true), "Checking");
+        assert_eq!(deluge_state_with_recheck("seeding", false), "Seeding");
     }
 
     #[tokio::test]
@@ -2222,7 +2282,7 @@ mod tests {
         let mut entry = TorrentEntry::new("c".repeat(40), "charlie".into(), "/data".into());
         entry.total_length = 100;
         entry.amount_left = 50;
-        let body = deluge_torrent(&entry, None, None, Some(&[tracker]), None, None);
+        let body = deluge_torrent(&entry, None, None, Some(&[tracker]), None, None, false);
         assert_eq!(body["tracker"], "https://tracker.example/announce");
         assert_eq!(body["tracker_host"], "tracker.example");
         assert_eq!(body["tracker_status"], "Warning: slow scrape");
