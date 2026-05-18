@@ -105,8 +105,6 @@ not merely that the protocol crate can exchange UDP packets.
 
 Before flipping `networking.utp_transport=true`, the engine still needs:
 
-- default peer dialing policy that chooses TCP or uTP based on
-  tracker/DHT/PEX peer source, user preference, and private-torrent policy;
 - production alert thresholds and dashboards for the exported uTP connects,
   accepts, retransmits, timeouts, congestion window, RTT, bytes, and failure
   metrics;
@@ -124,8 +122,9 @@ The native health capability surface also reports:
 - `networking.utp_incoming_opt_in=true`: the engine can bind a shared incoming
   uTP peer endpoint when `TNG_UTP_INCOMING=1` is set.
 - `networking.utp_outgoing_policy`: `TNG_UTP_OUTGOING` when set, otherwise
-  `prefer` for the legacy `TNG_ENABLE_UTP_OUTGOING` flag or `off`.
-- `networking.utp_outgoing_enabled`: whether either outbound uTP opt-in is set.
+  `prefer` for the legacy `TNG_ENABLE_UTP_OUTGOING` flag or `auto`.
+- `networking.utp_outgoing_enabled`: whether outbound uTP may be attempted for
+  at least one peer source under the current policy.
 - `networking.utp_metadata_policy`: `TNG_UTP_METADATA` when set, otherwise
   `TNG_UTP_OUTGOING`, legacy `prefer`, or `off`.
 - `networking.utp_metadata_enabled`: whether metadata fetch can attempt uTP.
@@ -135,9 +134,12 @@ The native health capability surface also reports:
 ## Engine Integration Progress
 
 The engine peer loop now has a transport-neutral `PeerIo` adapter and an
-outbound `UtpStream` peer-wire path. `TNG_UTP_OUTGOING=prefer` attempts uTP and
-falls back to TCP if the uTP connect fails; `TNG_UTP_OUTGOING=only` disables
-that fallback. The legacy `TNG_ENABLE_UTP_OUTGOING` flag maps to `prefer`.
+outbound `UtpStream` peer-wire path. The default `TNG_UTP_OUTGOING=auto`
+policy keeps tracker-discovered peers on TCP, attempts uTP first for DHT, PEX,
+and manually added peers, and forces TCP for private torrents. Explicit
+`TNG_UTP_OUTGOING=prefer` attempts uTP for eligible peers and falls back to TCP
+if the uTP connect fails; `TNG_UTP_OUTGOING=only` disables that fallback. The
+legacy `TNG_ENABLE_UTP_OUTGOING` flag maps to `prefer`.
 The engine also has an incoming shared `UtpEndpoint` peer listener behind
 `TNG_UTP_INCOMING=1`; accepted streams are routed by peer-wire handshake to the
 same torrent tasks as TCP peers. Magnet metadata fetch can use uTP through the
@@ -145,6 +147,6 @@ same byte-stream adapter when `TNG_UTP_METADATA=prefer|only` is set; if that is
 not set it follows `TNG_UTP_OUTGOING`, then the legacy
 `TNG_ENABLE_UTP_OUTGOING` flag.
 
-The path remains opt-in while default policy, production interop, richer RTT and
-congestion-window histograms, and tracker/DHT peer transport preference evidence
-are still incomplete.
+The path remains guarded by `networking.utp_transport=false` while production
+interop, alert thresholds, dashboards, and tracker/DHT peer transport preference
+evidence are still incomplete.

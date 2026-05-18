@@ -1666,10 +1666,15 @@ fn native_engine_capabilities() -> serde_json::Value {
                 .unwrap_or_else(|| if std::env::var_os("TNG_ENABLE_UTP_OUTGOING").is_some() {
                     "prefer".to_owned()
                 } else {
-                    "off".to_owned()
+                    "auto".to_owned()
                 }),
-            "utp_outgoing_enabled": std::env::var_os("TNG_ENABLE_UTP_OUTGOING").is_some()
-                || std::env::var_os("TNG_UTP_OUTGOING").is_some(),
+            "utp_outgoing_enabled": std::env::var("TNG_UTP_OUTGOING")
+                .ok()
+                .map(|value| !matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "no" | "off" | "tcp" | "tcp-only"
+                ))
+                .unwrap_or(true),
             "utp_metadata_policy": std::env::var("TNG_UTP_METADATA")
                 .ok()
                 .or_else(|| std::env::var("TNG_UTP_OUTGOING").ok())
@@ -3642,6 +3647,8 @@ mod tests {
         assert_eq!(capabilities["networking"]["utp_udp_stream"], true);
         assert_eq!(capabilities["networking"]["utp_outgoing_opt_in"], true);
         assert_eq!(capabilities["networking"]["utp_incoming_opt_in"], true);
+        assert_eq!(capabilities["networking"]["utp_outgoing_policy"], "auto");
+        assert_eq!(capabilities["networking"]["utp_outgoing_enabled"], true);
         assert_eq!(capabilities["networking"]["utp_metadata_policy"], "off");
         assert_eq!(capabilities["networking"]["utp_metadata_enabled"], false);
         assert_eq!(capabilities["networking"]["utp_transport"], false);

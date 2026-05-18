@@ -79,7 +79,7 @@ pub enum TorrentCmd {
     UpdateLimits(EngineTorrentLimits),
     UpdateGlobalLimits(EngineGlobalLimits),
     Shutdown,
-    /// Peers discovered by DHT, tracker, or peer exchange.
+    /// Peers discovered by DHT.
     NewPeers(Vec<SocketAddr>),
     /// Peers explicitly added through a client API.
     PriorityPeers(Vec<SocketAddr>),
@@ -621,8 +621,10 @@ impl TorrentTask {
                         }
                         TorrentCmd::NewPeers(addrs) => {
                             if !self.paused {
-                                self.remember_tracker_peers(&addrs);
-                                self.connect_peers(addrs).await;
+                                if !self.meta.private {
+                                    self.remember_tracker_peers(&addrs);
+                                }
+                                self.connect_peers(addrs, PeerSource::Dht).await;
                             }
                         }
                         TorrentCmd::PriorityPeers(addrs) => {
@@ -709,7 +711,7 @@ impl TorrentTask {
         }
     }
 
-    async fn connect_peers(&mut self, addrs: Vec<SocketAddr>) {
+    async fn connect_peers(&mut self, addrs: Vec<SocketAddr>, source: PeerSource) {
         for addr in addrs {
             if self.active_peers.len() >= self.max_peers {
                 break;
@@ -729,7 +731,11 @@ impl TorrentTask {
             let peer_cmd_rx = self.register_peer(addr);
             let peer_event_tx = self.peer_event_tx.clone();
             let upload = self.upload_context(addr);
-            let transport_policy = outgoing_transport_policy();
+            let transport_policy = outgoing_transport_policy_for_peer(
+                outgoing_transport_policy_configured(),
+                source,
+                self.meta.private,
+            );
             tokio::spawn(async move {
                 let disconnect_tx = peer_event_tx.clone();
                 let result = run_outgoing_peer_with_policy(
@@ -773,7 +779,7 @@ impl TorrentTask {
             if self.active_peers.len() >= self.max_peers {
                 break;
             }
-            self.connect_peers(vec![addr]).await;
+            self.connect_peers(vec![addr], PeerSource::Manual).await;
         }
     }
 
@@ -859,7 +865,7 @@ impl TorrentTask {
                             peers = peers.len(),
                             "tracker announce returned peers"
                         );
-                        self.connect_peers(peers).await;
+                        self.connect_peers(peers, PeerSource::Tracker).await;
                     }
                 }
                 Err(err) => {
@@ -1376,7 +1382,7 @@ impl TorrentTask {
             "retrying known peers"
         );
         let peers: Vec<SocketAddr> = self.known_tracker_peers.iter().copied().collect();
-        self.connect_peers(peers).await;
+        self.connect_peers(peers, PeerSource::Tracker).await;
     }
 
     async fn download_next_webseed_block(&mut self) {
@@ -1670,7 +1676,7 @@ impl TorrentTask {
                 }
                 let peer_count = peers.len();
                 self.remember_tracker_peers(&peers);
-                self.connect_peers(peers).await;
+                self.connect_peers(peers, PeerSource::PeerExchange).await;
                 debug!(
                     torrent = %self.info_hash_hex,
                     peer = %peer,
@@ -3009,28 +3015,58 @@ impl TorrentTask {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutgoingTransportPolicy {
+    Auto,
     TcpOnly,
     PreferUtp,
     UtpOnly,
 }
 
-fn outgoing_transport_policy() -> OutgoingTransportPolicy {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerSource {
+    Tracker,
+    Dht,
+    PeerExchange,
+    Manual,
+}
+
+fn outgoing_transport_policy_configured() -> OutgoingTransportPolicy {
     if let Ok(value) = std::env::var("TNG_UTP_OUTGOING") {
         return parse_outgoing_transport_policy(&value);
     }
     if std::env::var_os("TNG_ENABLE_UTP_OUTGOING").is_some() {
         return OutgoingTransportPolicy::PreferUtp;
     }
-    OutgoingTransportPolicy::TcpOnly
+    OutgoingTransportPolicy::Auto
 }
 
 fn parse_outgoing_transport_policy(value: &str) -> OutgoingTransportPolicy {
     match value.trim().to_ascii_lowercase().as_str() {
+        "" | "auto" | "default" => OutgoingTransportPolicy::Auto,
+        "0" | "false" | "no" | "off" | "tcp" | "tcp-only" => OutgoingTransportPolicy::TcpOnly,
         "1" | "true" | "yes" | "prefer" | "prefer-utp" | "utp-prefer" => {
             OutgoingTransportPolicy::PreferUtp
         }
         "only" | "utp" | "utp-only" => OutgoingTransportPolicy::UtpOnly,
-        _ => OutgoingTransportPolicy::TcpOnly,
+        _ => OutgoingTransportPolicy::Auto,
+    }
+}
+
+fn outgoing_transport_policy_for_peer(
+    configured: OutgoingTransportPolicy,
+    source: PeerSource,
+    private: bool,
+) -> OutgoingTransportPolicy {
+    if private {
+        return OutgoingTransportPolicy::TcpOnly;
+    }
+    match configured {
+        OutgoingTransportPolicy::Auto => match source {
+            PeerSource::Tracker => OutgoingTransportPolicy::TcpOnly,
+            PeerSource::Dht | PeerSource::PeerExchange | PeerSource::Manual => {
+                OutgoingTransportPolicy::PreferUtp
+            }
+        },
+        explicit => explicit,
     }
 }
 
@@ -3271,6 +3307,9 @@ async fn run_outgoing_peer_with_policy(
     policy: OutgoingTransportPolicy,
 ) -> anyhow::Result<()> {
     match policy {
+        OutgoingTransportPolicy::Auto => {
+            run_outgoing_peer(addr, info_hash, peer_event_tx, peer_cmd_rx, upload).await
+        }
         OutgoingTransportPolicy::TcpOnly => {
             run_outgoing_peer(addr, info_hash, peer_event_tx, peer_cmd_rx, upload).await
         }
@@ -4098,6 +4137,10 @@ mod tests {
     #[test]
     fn parses_outgoing_utp_policy() {
         assert_eq!(
+            parse_outgoing_transport_policy("auto"),
+            OutgoingTransportPolicy::Auto
+        );
+        assert_eq!(
             parse_outgoing_transport_policy("prefer"),
             OutgoingTransportPolicy::PreferUtp
         );
@@ -4107,6 +4150,42 @@ mod tests {
         );
         assert_eq!(
             parse_outgoing_transport_policy("off"),
+            OutgoingTransportPolicy::TcpOnly
+        );
+    }
+
+    #[test]
+    fn auto_outgoing_utp_policy_is_source_and_privacy_aware() {
+        assert_eq!(
+            outgoing_transport_policy_for_peer(
+                OutgoingTransportPolicy::Auto,
+                PeerSource::Tracker,
+                false
+            ),
+            OutgoingTransportPolicy::TcpOnly
+        );
+        assert_eq!(
+            outgoing_transport_policy_for_peer(
+                OutgoingTransportPolicy::Auto,
+                PeerSource::Dht,
+                false
+            ),
+            OutgoingTransportPolicy::PreferUtp
+        );
+        assert_eq!(
+            outgoing_transport_policy_for_peer(
+                OutgoingTransportPolicy::Auto,
+                PeerSource::PeerExchange,
+                false
+            ),
+            OutgoingTransportPolicy::PreferUtp
+        );
+        assert_eq!(
+            outgoing_transport_policy_for_peer(
+                OutgoingTransportPolicy::UtpOnly,
+                PeerSource::Manual,
+                true
+            ),
             OutgoingTransportPolicy::TcpOnly
         );
     }
