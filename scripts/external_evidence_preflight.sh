@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPORT_DIR="${REPORT_DIR:-$ROOT/certification/reports}"
 OUT="${1:-$REPORT_DIR/external-evidence-preflight-$(date -u +%Y%m%dT%H%M%SZ).md}"
 CORPUS_DIR="${TNG_MIGRATION_CORPUS_DIR:-$ROOT/testdata/migration-corpus}"
+CORPUS_MANIFEST="$CORPUS_DIR/manifest.toml"
 STORAGE_TARGET="${TNG_STORAGE_BENCH_DIR:-}"
 STRICT="${TNG_EXTERNAL_PREFLIGHT_STRICT:-0}"
 
@@ -84,6 +85,18 @@ if [[ "$corpus_missing" -eq 0 ]]; then
 else
   missing_csv="$(IFS=,; printf '%s' "${missing_families[*]}")"
   mark "migration corpus coverage" "WARN" "$corpus_missing source-family directories are missing evidence files: $missing_csv"
+fi
+
+if [[ -f "$CORPUS_MANIFEST" ]]; then
+  manifest_report="$REPORT_DIR/external-preflight-migration-corpus-$(date -u +%Y%m%dT%H%M%SZ).md"
+  if TNG_MIGRATION_CORPUS_DIR="$CORPUS_DIR" TNG_REQUIRE_MIGRATION_CORPUS=1 \
+    "$ROOT/scripts/migration_corpus_certification.sh" "$manifest_report" >/dev/null; then
+    mark "migration corpus manifest" "PASS" "validated by $manifest_report"
+  else
+    mark "migration corpus manifest" "WARN" "manifest exists but validation failed; see $manifest_report"
+  fi
+else
+  mark "migration corpus manifest" "WARN" "manifest.toml missing; copy manifest.example.toml and record artifact provenance"
 fi
 
 if pgrep -af 'soak_certification.sh' | grep -q 'soak-24h-'; then
