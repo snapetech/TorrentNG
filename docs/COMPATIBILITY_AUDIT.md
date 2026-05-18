@@ -120,7 +120,7 @@ Local surface: `crates/rt-api-rtorrent`.
 | Multicall/views | `d.multicall`, `d.multicall2`, `view.list`, `view.size` | Implemented with rTorrent row-array shape over the native registry |
 | Loading | `load.normal`, `load.start`, `load.raw`, `load.raw_start` | Implemented for magnet URIs and filesystem `.torrent` paths; unsupported URL fetching stays a no-op placeholder for SSRF safety |
 | Lifecycle | `d.erase`, `d.pause`, `d.resume`, `d.stop`, `d.start`, `d.tracker_announce` | Implemented as native engine hooks when attached plus registry erase projection |
-| File/tracker/peer detail | `f.*`, `t.*`, `p.*` multicalls | Implemented as stable compatibility shapes; live detail remains a placeholder until native engine snapshots expose equivalent data |
+| File/tracker/peer detail | `f.*`, `t.*`, `p.*` multicalls | Implemented as rTorrent row-array projections: files fall back to registry state and use native metadata when attached, trackers use native metadata, and peers use native peer snapshots |
 
 ## Cross-Client API Backlog
 

@@ -216,17 +216,17 @@ Local implementation: `crates/rt-api-rtorrent`.
 TorrentNG exposes a minimal rTorrent XMLRPC compatibility dispatcher for clients
 and migration/certification probes that expect rTorrent-shaped commands. The v1
 scope is intentionally compatibility-shaped: registry-backed torrent identity,
-progress, custom fields, lifecycle hooks when an engine is attached, and stable
-empty/read placeholder arrays for live file/tracker/peer details that the native
-engine does not expose yet.
+progress, custom fields, lifecycle hooks when an engine is attached, registry
+fallback file rows, and native-backed file/tracker/peer multicall projections
+when engine metadata or peer snapshots are available.
 
 | Command family | Upstream examples | TorrentNG status | Test rows |
 |---|---|---|---|
 | System/session | `system.*`, `session.*`, `network.*`, throttle commands | Compat: version/session/network values and throttle placeholders | Method enumeration and XMLRPC fixture rows |
 | Download/torrent | `d.*`, `d.multicall*`, `load.*` | Compat/native mix: registry-backed reads, custom field roundtrip, magnet/path load, lifecycle hooks | Read projection, custom field, multicall, load/erase rows |
-| File | `f.*` | Compat placeholder: stable array shape until native file detail is wired | File multicall shape row |
-| Tracker | `t.*`, tracker announce controls | Compat placeholder for reads; announce accepted and engine tracker work remains covered by interop matrix | Tracker multicall and announce acceptance row |
-| Peer | `p.*` | Compat placeholder: stable empty peer array until live peer snapshots are exposed | Peer multicall shape row |
+| File | `f.*` | Native/compat: registry fallback row without an engine; native metadata rows expose path, size, offsets, piece ranges, priority, and completion | File multicall shape and projection rows |
+| Tracker | `t.*`, tracker announce controls | Native/compat: tracker rows expose native announce URLs and stable status counters; announce accepted and engine tracker work remains covered by interop matrix | Tracker multicall and announce acceptance row |
+| Peer | `p.*` | Native/compat: peer rows expose native peer address, port, client, progress, rates, choke/interested flags when an engine is attached | Peer multicall projection row |
 | Views/queue | `view.*`, priority/custom views | Compat: `main` view and registry count; advanced custom views remain placeholder | View list/size row |
 
 ## 7. Test Matrix Backlog

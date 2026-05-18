@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use base64::{engine::general_purpose, Engine as _};
-use rt_engine::EngineHandle;
+use rt_engine::{EngineHandle, EnginePeerSnapshot, EngineTorrentFile, EngineTorrentMetadata};
 use rt_metainfo::{parse_magnet, parse_torrent};
 use rt_metrics::{MemoryClass, MemoryLease};
 use rt_session::{SessionRegistry, TorrentEntry};
@@ -152,12 +152,9 @@ pub async fn execute(
         "d.pause" | "d.stop" => lifecycle(state, params, Lifecycle::Pause).await,
         "d.resume" | "d.start" => lifecycle(state, params, Lifecycle::Resume).await,
         "d.tracker_announce" => Ok(RtValue::Int(0)),
-        "f.multicall" => Ok(RtValue::Array(vec![RtValue::Array(vec![
-            RtValue::String(String::new()),
-            RtValue::Int(0),
-            RtValue::Int(1),
-        ])])),
-        "t.multicall" | "p.multicall" => Ok(RtValue::Array(Vec::new())),
+        "f.multicall" => file_multicall(state, params).await,
+        "t.multicall" => tracker_multicall(state, params).await,
+        "p.multicall" => peer_multicall(state, params).await,
         _ if method.starts_with("d.") => d_read_or_write(state, method, params).await,
         _ => Err(format!("unsupported rTorrent XMLRPC method {method}")),
     }
@@ -268,6 +265,218 @@ async fn d_multicall(state: &AppState, params: &[RtValue]) -> Result<RtValue, St
         rows.push(RtValue::Array(row));
     }
     Ok(RtValue::Array(rows))
+}
+
+async fn file_multicall(state: &AppState, params: &[RtValue]) -> Result<RtValue, String> {
+    let commands = multicall_commands(params);
+    let Some(entry) = selected_torrent_entry(state, params).await else {
+        return Ok(RtValue::Array(Vec::new()));
+    };
+    let meta = torrent_metadata_snapshot(state, &entry.info_hash).await;
+    let rows = if let Some(meta) = meta.as_ref() {
+        meta.files
+            .iter()
+            .map(|file| {
+                RtValue::Array(
+                    commands
+                        .iter()
+                        .map(|command| project_file_field(file, command, meta))
+                        .collect(),
+                )
+            })
+            .collect()
+    } else {
+        vec![RtValue::Array(
+            commands
+                .iter()
+                .map(|command| project_registry_file_field(&entry, command))
+                .collect(),
+        )]
+    };
+    Ok(RtValue::Array(rows))
+}
+
+async fn tracker_multicall(state: &AppState, params: &[RtValue]) -> Result<RtValue, String> {
+    let commands = multicall_commands(params);
+    let Some(entry) = selected_torrent_entry(state, params).await else {
+        return Ok(RtValue::Array(Vec::new()));
+    };
+    let Some(meta) = torrent_metadata_snapshot(state, &entry.info_hash).await else {
+        return Ok(RtValue::Array(Vec::new()));
+    };
+    Ok(RtValue::Array(
+        meta.trackers
+            .iter()
+            .enumerate()
+            .map(|(idx, tracker)| {
+                RtValue::Array(
+                    commands
+                        .iter()
+                        .map(|command| project_tracker_field(idx, tracker, command))
+                        .collect(),
+                )
+            })
+            .collect(),
+    ))
+}
+
+async fn peer_multicall(state: &AppState, params: &[RtValue]) -> Result<RtValue, String> {
+    let commands = multicall_commands(params);
+    let Some(entry) = selected_torrent_entry(state, params).await else {
+        return Ok(RtValue::Array(Vec::new()));
+    };
+    let Some(engine) = &state.engine else {
+        return Ok(RtValue::Array(Vec::new()));
+    };
+    let peers = engine
+        .torrent_peers(entry.info_hash)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|peer| {
+            RtValue::Array(
+                commands
+                    .iter()
+                    .map(|command| project_peer_field(&peer, command))
+                    .collect(),
+            )
+        })
+        .collect();
+    Ok(RtValue::Array(peers))
+}
+
+async fn selected_torrent_entry(state: &AppState, params: &[RtValue]) -> Option<TorrentEntry> {
+    let registry = state.registry.read().await;
+    params
+        .iter()
+        .filter_map(RtValue::as_str)
+        .find_map(|value| registry.get(value).cloned())
+        .or_else(|| registry.iter().next().cloned())
+}
+
+async fn torrent_metadata_snapshot(state: &AppState, hash: &str) -> Option<EngineTorrentMetadata> {
+    let engine = state.engine.as_ref()?;
+    engine.torrent_metadata(hash.to_owned()).await.ok()
+}
+
+fn multicall_commands(params: &[RtValue]) -> Vec<String> {
+    let commands = params
+        .iter()
+        .filter_map(RtValue::as_str)
+        .filter(|value| value.ends_with('='))
+        .map(|command| command.trim_end_matches('=').to_owned())
+        .collect::<Vec<_>>();
+    if commands.is_empty() {
+        vec!["".to_owned()]
+    } else {
+        commands
+    }
+}
+
+fn project_registry_file_field(entry: &TorrentEntry, command: &str) -> RtValue {
+    match command {
+        "" | "f.path" | "f.frozen_path" => RtValue::String(entry.name.clone()),
+        "f.size_bytes" => RtValue::Int(entry.total_length as i64),
+        "f.completed_bytes" => {
+            RtValue::Int(entry.total_length.saturating_sub(entry.amount_left) as i64)
+        }
+        "f.priority" => RtValue::Int(1),
+        "f.is_created" | "f.is_open" => RtValue::Bool(true),
+        "f.is_complete" => RtValue::Bool(entry.total_length > 0 && entry.amount_left == 0),
+        "f.offset" | "f.range_first" | "f.range_second" => RtValue::Int(0),
+        _ => RtValue::Nil,
+    }
+}
+
+fn project_file_field(
+    file: &EngineTorrentFile,
+    command: &str,
+    meta: &EngineTorrentMetadata,
+) -> RtValue {
+    match command {
+        "" | "f.path" | "f.frozen_path" => RtValue::String(file.path.clone()),
+        "f.size_bytes" => RtValue::Int(file.length as i64),
+        "f.priority" => RtValue::Int(file.priority),
+        "f.is_created" | "f.is_open" => RtValue::Bool(true),
+        "f.is_complete" => RtValue::Bool(file_is_complete(file, meta)),
+        "f.completed_bytes" => {
+            if file_is_complete(file, meta) {
+                RtValue::Int(file.length as i64)
+            } else {
+                RtValue::Int(0)
+            }
+        }
+        "f.offset" => RtValue::Int(file_start_offset(file, meta) as i64),
+        "f.range_first" => RtValue::Int(file_first_piece(file, meta) as i64),
+        "f.range_second" => RtValue::Int(file_last_piece(file, meta) as i64),
+        _ => RtValue::Nil,
+    }
+}
+
+fn file_start_offset(file: &EngineTorrentFile, meta: &EngineTorrentMetadata) -> u64 {
+    meta.files
+        .iter()
+        .filter(|candidate| candidate.index < file.index)
+        .map(|candidate| candidate.length)
+        .sum()
+}
+
+fn file_first_piece(file: &EngineTorrentFile, meta: &EngineTorrentMetadata) -> usize {
+    if meta.piece_length == 0 {
+        return 0;
+    }
+    (file_start_offset(file, meta) / meta.piece_length) as usize
+}
+
+fn file_last_piece(file: &EngineTorrentFile, meta: &EngineTorrentMetadata) -> usize {
+    if meta.piece_length == 0 || file.length == 0 {
+        return file_first_piece(file, meta);
+    }
+    ((file_start_offset(file, meta) + file.length - 1) / meta.piece_length) as usize
+}
+
+fn file_is_complete(file: &EngineTorrentFile, meta: &EngineTorrentMetadata) -> bool {
+    if meta.piece_states.is_empty() {
+        return false;
+    }
+    let first = file_first_piece(file, meta);
+    if first >= meta.piece_states.len() {
+        return false;
+    }
+    let last = file_last_piece(file, meta).min(meta.piece_states.len().saturating_sub(1));
+    meta.piece_states[first..=last]
+        .iter()
+        .all(|state| matches!(state, rt_engine::EnginePieceState::Complete))
+}
+
+fn project_tracker_field(idx: usize, tracker: &str, command: &str) -> RtValue {
+    match command {
+        "" | "t.url" | "t.group" => RtValue::String(tracker.to_owned()),
+        "t.is_enabled" | "t.is_open" => RtValue::Bool(true),
+        "t.type" | "t.id" => RtValue::Int(idx as i64),
+        "t.latest_event"
+        | "t.latest_sum_peers"
+        | "t.scrape_complete"
+        | "t.scrape_incomplete"
+        | "t.scrape_downloaded" => RtValue::Int(0),
+        _ => RtValue::Nil,
+    }
+}
+
+fn project_peer_field(peer: &EnginePeerSnapshot, command: &str) -> RtValue {
+    match command {
+        "" | "p.address" => RtValue::String(peer.addr.ip().to_string()),
+        "p.port" => RtValue::Int(peer.addr.port() as i64),
+        "p.client_version" => RtValue::String(peer.client.clone()),
+        "p.completed_percent" => RtValue::Int((peer.progress * 100.0).round() as i64),
+        "p.down_rate" | "p.down_rate_total" => RtValue::Int(peer.download_rate),
+        "p.up_rate" | "p.up_rate_total" => RtValue::Int(peer.upload_rate),
+        "p.completed_chunks" => RtValue::Int(peer.pieces as i64),
+        "p.is_encrypted" | "p.is_incoming" => RtValue::Bool(false),
+        "p.is_interested" => RtValue::Bool(peer.interested),
+        "p.is_choked" => RtValue::Bool(peer.choked),
+        _ => RtValue::Nil,
+    }
 }
 
 async fn load(state: &AppState, method: &str, params: &[RtValue]) -> Result<RtValue, String> {
@@ -541,6 +750,9 @@ pub fn value_to_json(value: &RtValue) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use rt_engine::{EnginePieceState, EngineTorrentFile, EngineTorrentMetadata};
     use rt_session::{TorrentEntry, TorrentState};
 
     async fn state_with_torrent() -> AppState {
@@ -664,7 +876,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn xmlrpc_method_list_and_placeholder_multicalls_have_stable_shapes() {
+    async fn xmlrpc_method_list_and_detail_multicalls_have_stable_shapes() {
         let state = state_with_torrent().await;
         let response = execute_xml(
             &state,
@@ -691,11 +903,114 @@ mod tests {
             execute(&state, "f.multicall", &[RtValue::String("main".to_owned())])
                 .await
                 .unwrap(),
-            RtValue::Array(vec![RtValue::Array(vec![
+            RtValue::Array(vec![RtValue::Array(vec![RtValue::String(
+                "alpha".to_owned()
+            ),])])
+        );
+    }
+
+    #[tokio::test]
+    async fn file_multicall_projects_registry_fallback_fields() {
+        let state = state_with_torrent().await;
+        let value = execute(
+            &state,
+            "f.multicall",
+            &[
+                RtValue::String("a".repeat(40)),
                 RtValue::String(String::new()),
-                RtValue::Int(0),
-                RtValue::Int(1),
+                RtValue::String("f.path=".to_owned()),
+                RtValue::String("f.size_bytes=".to_owned()),
+                RtValue::String("f.completed_bytes=".to_owned()),
+                RtValue::String("f.is_complete=".to_owned()),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            value,
+            RtValue::Array(vec![RtValue::Array(vec![
+                RtValue::String("alpha".to_owned()),
+                RtValue::Int(100),
+                RtValue::Int(75),
+                RtValue::Bool(false),
             ])])
+        );
+    }
+
+    #[test]
+    fn file_tracker_and_peer_projectors_use_native_snapshot_fields() {
+        let meta = EngineTorrentMetadata {
+            piece_length: 16,
+            piece_count: 3,
+            piece_hashes: vec![],
+            piece_states: vec![
+                EnginePieceState::Complete,
+                EnginePieceState::Complete,
+                EnginePieceState::Missing,
+            ],
+            is_private: false,
+            trackers: vec!["udp://tracker.example:6969/announce".to_owned()],
+            webseeds: vec![],
+            files: vec![
+                EngineTorrentFile {
+                    index: 0,
+                    path: "disc/a.bin".to_owned(),
+                    length: 16,
+                    priority: 2,
+                    wanted: true,
+                },
+                EngineTorrentFile {
+                    index: 1,
+                    path: "disc/b.bin".to_owned(),
+                    length: 32,
+                    priority: 1,
+                    wanted: true,
+                },
+            ],
+        };
+        assert_eq!(
+            project_file_field(&meta.files[0], "f.path", &meta),
+            RtValue::String("disc/a.bin".to_owned())
+        );
+        assert_eq!(
+            project_file_field(&meta.files[0], "f.is_complete", &meta),
+            RtValue::Bool(true)
+        );
+        assert_eq!(
+            project_file_field(&meta.files[1], "f.range_first", &meta),
+            RtValue::Int(1)
+        );
+        assert_eq!(
+            project_file_field(&meta.files[1], "f.is_complete", &meta),
+            RtValue::Bool(false)
+        );
+        assert_eq!(
+            project_tracker_field(0, &meta.trackers[0], "t.url"),
+            RtValue::String("udp://tracker.example:6969/announce".to_owned())
+        );
+
+        let peer = EnginePeerSnapshot {
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)), 51413),
+            client: "Transmission 4.0".to_owned(),
+            choked: false,
+            upload_choked: true,
+            interested: true,
+            pieces: 2,
+            pieces_total: 3,
+            progress: 2.0 / 3.0,
+            download_rate: 12_000,
+            upload_rate: 4_000,
+            downloaded: 20,
+            uploaded: 10,
+        };
+        assert_eq!(
+            project_peer_field(&peer, "p.address"),
+            RtValue::String("10.0.0.7".to_owned())
+        );
+        assert_eq!(project_peer_field(&peer, "p.port"), RtValue::Int(51413));
+        assert_eq!(
+            project_peer_field(&peer, "p.completed_percent"),
+            RtValue::Int(67)
         );
     }
 

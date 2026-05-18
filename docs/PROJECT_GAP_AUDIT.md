@@ -170,9 +170,10 @@ Remaining compatibility gaps:
   parity work.
 - Deluge: extractor, scheduler, execute, blocklist, and autoadd plugin-specific
   APIs remain gaps unless a target migration/client requires them.
-- rTorrent: file/tracker/peer multicalls are stable compatibility shapes, but
-  live detail remains placeholder-depth until native snapshots expose equivalent
-  file/tracker/peer detail.
+- rTorrent: file/tracker/peer multicalls now project native metadata and peer
+  snapshots when an engine is attached, with registry fallback file rows for
+  in-memory compatibility probes; advanced view and throttle semantics remain
+  compatibility placeholders.
 - qBittorrent: common automation flows are covered; deeper live tracker delta
   fidelity and live swarm availability counters remain placeholder-depth.
 - `scripts/migration_corpus_certification.sh` now separates synthetic
