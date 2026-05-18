@@ -41,10 +41,14 @@ TORRENTNGD_CONFIG=/config/config.toml torrentngd
 | `upload_rate_limit` | `0` | Upload limit in bytes/sec; `0` means unlimited |
 | `download_rate_limit` | `0` | Download limit in bytes/sec; `0` means unlimited |
 
-Experimental uTP transport is controlled by environment while it remains
-opt-in. `TNG_UTP_OUTGOING=prefer|only` enables outbound uTP peer-wire dialing
-(`prefer` falls back to TCP), and `TNG_UTP_INCOMING=1` binds the shared UDP
-incoming uTP endpoint on `listen_port`.
+uTP transport policy is controlled by environment so operators can roll it out
+without changing durable config. By default, `TNG_UTP_OUTGOING=auto` attempts
+uTP first for DHT, PEX, and manually added peers while tracker-discovered peers
+stay on TCP. `TNG_UTP_OUTGOING=prefer|only` broadens outbound uTP peer-wire
+dialing (`prefer` falls back to TCP, `only` does not), and
+`TNG_UTP_OUTGOING=tcp-only` disables outbound uTP. `TNG_UTP_INCOMING=1` binds
+the shared UDP incoming uTP endpoint on `listen_port`, and
+`TNG_UTP_METADATA=prefer|only` enables uTP magnet metadata fetch explicitly.
 
 ### `[storage]`
 

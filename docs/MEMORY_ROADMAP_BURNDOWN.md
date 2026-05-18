@@ -22,7 +22,8 @@ evidence rollup and non-claim boundary report.
   - Scheduler reads, writes, durability syncs, and HDD peer-read elevator dispatch use `DiskBackend` calls instead of direct positioned file operations.
 - [x] Scheduler read buffers use frame leases before backend dispatch.
   - Direct scheduler reads and peer-read elevator reads acquire `FramePool` frames before issuing backend `pread`.
-  - Returned `Bytes` are still copied out of the frame today; full zero-copy frame ownership remains tied to the optional `io_uring`/registered-buffer graduation work.
+  - New `scheduled_read_owned`/`read_owned_at` callers can keep frame ownership through upload assembly and verifier paths.
+  - Compatibility `Bytes` returns consume ordinary frame payloads without an extra copy; registered `io_uring` slots still copy on conversion so the slot lease can return to the backend.
 - [x] 10k/100k idle torrent RSS/task/fd evidence proxy.
   - `idle_memory_100k_keeps_fixed_rss_task_fd_budget` checks 100k idle API shape under fixed RSS, task, and fd growth targets.
 - [x] 1k hot seeding memory-cap evidence proxy.
