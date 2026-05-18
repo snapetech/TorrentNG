@@ -213,9 +213,9 @@ Moving 200+ TB is a database migration, not a file copy:
 ### Peer connection manager
 
 - TCP listener
-- uTP packet codec, connection-state support, and async UDP stream primitives;
-  engine peer-wire integration remains behind the runtime capability
-  `networking.utp_transport=false`
+- uTP packet codec, connection-state support, async UDP stream primitives,
+  shared incoming endpoint demux, and opt-in peer-wire paths; default app-level
+  transport remains behind the runtime capability `networking.utp_transport=false`
 - Outgoing connection queue with backpressure
 - Per-torrent and global peer caps
 - Peer scoring and ban/eject rules

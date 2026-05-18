@@ -1286,6 +1286,12 @@ run_partial_file_selection_case() {
     --data-urlencode "hashes=$info_hash" \
     --data-urlencode "limit=524288" \
     "$(client_url torrentngd)/api/qb/v2/torrents/setUploadLimit" >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
+    --data-urlencode "limit=2097152" \
+    "$(client_url torrentngd)/api/qb/v2/transfer/setDownloadLimit" >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
+    --data-urlencode "limit=1048576" \
+    "$(client_url torrentngd)/api/qb/v2/transfer/setUploadLimit" >/dev/null || status="FAIL"
   bridge_client_peer_to_rust transmission "$info_hash" || true
   wait_explicit_peer_complete "$TIMEOUT_LOCAL" "$fixture" "$info_hash" transmission transmission torrentngd || status="FAIL"
   verify_selected_fixture_hashes torrentngd "$fixture" \
@@ -1368,9 +1374,11 @@ run_qbit_mutation_facade_case() {
     jq -e 'type == "array"' >/dev/null || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/v1/torrents/$info_hash/limits" |
     jq -e '.download_limit == 1048576 and .upload_limit == 524288 and .seed_ratio_limit == null and .sequential_download == true' >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/v1/transfer/limits" |
+    jq -e '.download_limit == 2097152 and .upload_limit == 1048576' >/dev/null || status="FAIL"
   append_report "- Target: torrentngd qBittorrent-compatible mutation endpoints"
-  append_report "- Checked qBit facade: filePrio, setDownloadLimit, setUploadLimit, recheck, addTrackers, editTracker, removeTrackers, trackers, files"
-  append_report "- Checked native REST: start, stop, update metadata, file priorities, tags, trackers, limits, files/trackers/limits projection"
+  append_report "- Checked qBit facade: filePrio, torrent setDownloadLimit/setUploadLimit, transfer setDownloadLimit/setUploadLimit, recheck, addTrackers, editTracker, removeTrackers, trackers, files"
+  append_report "- Checked native REST: start, stop, update metadata, file priorities, tags, trackers, torrent limits, transfer limits, files/trackers/limits projection"
   append_report "- Fixture: multi-128m"
   append_report "- Info hash: $info_hash"
   append_report "- Status: **$status**"

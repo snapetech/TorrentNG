@@ -101,15 +101,9 @@ not merely that the protocol crate can exchange UDP packets.
 
 Before flipping `networking.utp_transport=true`, the engine still needs:
 
-- incoming UDP listener ownership next to the TCP listener;
-- demultiplexing by connection ID and remote address;
-- default outbound peer dialing policy that chooses TCP or uTP based on
+- default peer dialing policy that chooses TCP or uTP based on
   tracker/DHT/PEX peer source, user preference, and private-torrent policy;
-- peer-wire handshake over `UtpStream`;
 - metadata exchange over `UtpStream`;
-- piece request/response loops over `UtpStream`;
-- per-peer lifecycle accounting, caps, scoring, and ban/eject behavior shared
-  with TCP peers;
 - metrics for uTP connects, accepts, retransmits, timeouts, congestion window,
   RTT, bytes, and failures;
 - integration tests proving a torrent can complete through uTP.
