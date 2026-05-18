@@ -343,11 +343,11 @@ Implements the qBittorrent Web API v2. By default it advertises qBittorrent `5.0
 | `POST` | `/api/qb/v2/torrents/editTracker` | Form: `hash`, `origUrl`, `newUrl` |
 | `POST` | `/api/qb/v2/torrents/removeTrackers` | Form: `hash`, `urls` (pipe-separated) |
 | `POST` | `/api/qb/v2/torrents/toggleSequentialDownload` | Form: `hashes` |
-| `POST` | `/api/qb/v2/torrents/addPeers` | Accepted |
-| `POST` | `/api/qb/v2/torrents/increasePrio` | Accepted |
-| `POST` | `/api/qb/v2/torrents/decreasePrio` | Accepted |
-| `POST` | `/api/qb/v2/torrents/topPrio` | Accepted |
-| `POST` | `/api/qb/v2/torrents/bottomPrio` | Accepted |
+| `POST` | `/api/qb/v2/torrents/addPeers` | Engine-backed where supported |
+| `POST` | `/api/qb/v2/torrents/increasePrio` | Engine-backed where supported |
+| `POST` | `/api/qb/v2/torrents/decreasePrio` | Engine-backed where supported |
+| `POST` | `/api/qb/v2/torrents/topPrio` | Engine-backed where supported |
+| `POST` | `/api/qb/v2/torrents/bottomPrio` | Engine-backed where supported |
 | `POST` | `/api/qb/v2/torrents/setAutoManagement` | Accepted |
 | `POST` | `/api/qb/v2/torrents/setForceStart` | Accepted |
 | `POST` | `/api/qb/v2/torrents/setSuperSeeding` | Accepted |
