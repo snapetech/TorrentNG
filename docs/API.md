@@ -181,8 +181,8 @@ Notes:
 | `POST` | `/api/v1/storage/plan` | Preview move/import/delete storage plans (`{ operation, source, destination, target, bytes, roots }`) |
 | `POST` | `/api/v1/storage/execute` | Execute a root-confined move/import/delete storage plan through durable engine storage-plan jobs (`roots` is required; delete execution also uses `dry_run_approved`) |
 | `GET` | `/api/v1/tracker-health` | Aggregate cached torrents by tracker URL with torrent/active/complete/error/peer counts |
-| `GET` | `/api/v1/engine` | Runtime engine provenance, XMLRPC capability probes, rTorrent HTTP tracker-stack telemetry, and drift from the bundled engine profile |
-| `GET` | `/api/v1/engine/commands` | Full XMLRPC command index exposed by the running rTorrent build |
+| `GET` | `/api/v1/engine` | Runtime backend type/capabilities plus rTorrent provenance, XMLRPC probes, tracker-stack telemetry, and profile drift when the selected backend is rTorrent |
+| `GET` | `/api/v1/engine/commands` | Full XMLRPC command index exposed by the running rTorrent build; rTorrent-only |
 | `POST` | `/api/v1/cross-seed` | Preview/apply cross-seed helper (`{ hashes, trackers, reannounce, dry_run }`) |
 
 ### Saved Views
@@ -243,14 +243,14 @@ Pass `dry_run: true` to preview what would be affected without making changes.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET`  | `/api/v1/settings/user-agent` | Get current rTorrent user-agent string |
-| `PUT`  | `/api/v1/settings/user-agent` | Set user-agent (`{ user_agent: "..." }`) — takes effect immediately |
+| `GET`  | `/api/v1/settings/user-agent` | Get current runtime user-agent string when supported by the selected backend |
+| `PUT`  | `/api/v1/settings/user-agent` | Set user-agent (`{ user_agent: "..." }`) when supported; rTorrent packaged builds apply it immediately |
 
 ### Infrastructure
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET`  | `/health` | Health check. Native mode returns the engine readiness/capability manifest; Track 1 reports sidecar/rTorrent reachability. |
+| `GET`  | `/health` | Health check. Sidecar mode returns generic backend reachability in `backend`, preserves legacy `rtorrent`, and includes cache count. |
 | `GET`  | `/metrics` | Prometheus text format metrics |
 | `GET`  | `/ws` | WebSocket — upgrade to receive live events |
 

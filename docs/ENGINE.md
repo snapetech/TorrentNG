@@ -237,7 +237,7 @@ Moving 200+ TB is a database migration, not a file copy:
 | BEP 23 | Compact peer list | implemented |
 | BEP 27 | Private torrents | implemented |
 | BEP 29 | uTP | `rt-utp` packet/state/UDP stream primitives implemented; engine peer-wire integration pending |
-| BEP 32 | IPv6 | later |
+| BEP 32 | IPv6 | partial: tracker compact IPv6 peers and DHT compact IPv6 peer values are parsed/forwarded; DHT routing nodes remain IPv4-only |
 | BEP 52 | BitTorrent v2 / hybrid | implemented for parsing, identity, metadata projection, storage root verification, fastresume, and compatibility projections |
 
 DHT is implemented in Phase 10. Private-tracker profiles disable DHT/PEX/LSD by default.

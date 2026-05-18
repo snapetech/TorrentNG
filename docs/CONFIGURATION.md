@@ -203,10 +203,28 @@ Environment variables override file values where listed.
 |---|---|---|---|
 | `listen_addr` | `0.0.0.0:8080` | `TNG_LISTEN_ADDR` | TCP address the sidecar listens on |
 | `debug` | `false` | `TNG_DEBUG=1` | Enable debug logging |
-| `sync_interval_secs` | `2` | - | Seconds between rTorrent state polls |
+| `sync_interval_secs` | `2` | `TNG_SYNC_INTERVAL_SECS` | Seconds between backend state polls |
 | `data_dir` | `~/.local/share/torrentng` | - | Directory for SQLite cache |
 | `storage_roots` | `[]` | - | Paths shown in the storage dashboard; defaults to `/` when empty |
 | WebUI static dir | `static` | `TNG_STATIC_DIR` | Directory served for WebUI assets and SPA fallback |
+
+### Sidecar `[backend]`
+
+`[backend]` selects the BitTorrent client controlled by the sidecar. Existing configs that only define `[rtorrent]` still load as rTorrent-backed deployments.
+
+| Key | Default | Env override | Description |
+|---|---|---|---|
+| `type` | `rtorrent` | `TNG_BACKEND` | Backend adapter: `rtorrent` or `qbittorrent`. `transmission`, `deluge`, and `torrentng` are reserved and rejected until their adapters land. |
+
+```toml
+[backend]
+type = "rtorrent"
+```
+
+```toml
+[backend]
+type = "qbittorrent"
+```
 
 ### Sidecar `[rtorrent]`
 
@@ -216,6 +234,30 @@ Environment variables override file values where listed.
 | `scgi_addr` | - | `TNG_SCGI_ADDR` | `host:port` for TCP SCGI; mutually exclusive with `scgi_socket` |
 | `timeout_secs` | `10` | - | Timeout for individual XMLRPC calls |
 | `user_agent` | `rtorrent/0.16.11` | `TNG_USER_AGENT` | Client identifier pushed to rTorrent on startup |
+
+### Sidecar `[qbittorrent]`
+
+The qBittorrent backend talks to qBittorrent-nox through the qBittorrent Web API. The sidecar keeps the TorrentNG WebUI and compatibility API in front while qBittorrent owns torrent execution.
+
+| Key | Default | Env override | Description |
+|---|---|---|---|
+| `url` | `http://127.0.0.1:8080` | `TNG_QBITTORRENT_URL` | Base URL for qBittorrent Web API |
+| `username` | - | `TNG_QBITTORRENT_USERNAME` | Optional WebUI username |
+| `password` | - | `TNG_QBITTORRENT_PASSWORD` | Optional WebUI password |
+| `timeout_secs` | `10` | - | Timeout for qBittorrent Web API requests |
+| `no_auth` | `false` | `TNG_QBITTORRENT_NO_AUTH=1` | Skip login for trusted no-auth local WebUI deployments |
+| `accept_invalid_certs` | `false` | - | Accept invalid TLS certificates for lab deployments |
+
+```toml
+[backend]
+type = "qbittorrent"
+
+[qbittorrent]
+url = "http://127.0.0.1:8080"
+username = "admin"
+password = "adminadmin"
+timeout_secs = 10
+```
 
 ### Sidecar `[rtorrent.logs]`
 
@@ -298,6 +340,9 @@ Script actions are refused unless `allow_scripts` is true. Production configs th
 ### Sidecar minimal example
 
 ```toml
+[backend]
+type = "rtorrent"
+
 [rtorrent]
 scgi_socket = "/run/rtorrent/rpc.sock"
 ```
@@ -305,6 +350,14 @@ scgi_socket = "/run/rtorrent/rpc.sock"
 ### Sidecar container example
 
 See [deploy/docker/sidecar.config.toml](../deploy/docker/sidecar.config.toml) for the Phase 1 container-oriented sidecar config.
+
+The Docker compose stack also includes a qBittorrent profile:
+
+```sh
+docker compose -f deploy/docker/compose.yml --profile qbittorrent up torrentng-qbittorrent qbittorrent
+```
+
+That starts TorrentNG on host port `8082` in front of qBittorrent-nox, whose native WebUI is exposed on host port `8081`.
 
 ### Sidecar full example
 
@@ -314,6 +367,9 @@ debug = false
 sync_interval_secs = 2
 data_dir = "/var/lib/torrentng"
 storage_roots = ["/data", "/mnt/archive"]
+
+[backend]
+type = "rtorrent"
 
 [rtorrent]
 scgi_socket = "/run/rtorrent/rpc.sock"

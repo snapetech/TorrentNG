@@ -32,6 +32,51 @@ services:
       timeout: 5s
       retries: 3
 
+  torrentng-qbittorrent:
+    image: torrentng:latest
+    profiles: ["qbittorrent"]
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8082:8080"
+    volumes:
+      - ./config-qbittorrent:/config
+      - downloads:/data
+    environment:
+      TORRENTNG_CONFIG: /config/config.toml
+      TNG_BACKEND: qbittorrent
+      TNG_QBITTORRENT_URL: http://qbittorrent:8080
+      TNG_QBITTORRENT_USERNAME: "${QBITTORRENT_USERNAME:-admin}"
+      TNG_QBITTORRENT_PASSWORD: "${QBITTORRENT_PASSWORD:-adminadmin}"
+      TNG_SECRET_KEY: "${TNG_SECRET_KEY:-change-me}"
+      TNG_API_TOKENS: "${TNG_API_TOKENS:-}"
+    depends_on:
+      - qbittorrent
+    healthcheck:
+      test: ["CMD", "/bin/sh", "-c", "wget -qO- http://localhost:8080/health >/dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    profiles: ["qbittorrent"]
+    restart: unless-stopped
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: "${TZ:-UTC}"
+      WEBUI_PORT: "8080"
+    volumes:
+      - qbittorrent_config:/config
+      - downloads:/downloads
+    ports:
+      - "8081:8080"
+      - "6881:6881"
+      - "6881:6881/udp"
+
   nginx:
     image: nginx:alpine
     restart: unless-stopped
@@ -45,3 +90,4 @@ services:
 volumes:
   downloads:
   session:
+  qbittorrent_config:

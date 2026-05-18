@@ -34,6 +34,12 @@ pub struct Config {
     pub qbittorrent: QbittorrentConfig,
 
     #[serde(default)]
+    pub transmission: TransmissionConfig,
+
+    #[serde(default)]
+    pub deluge: DelugeConfig,
+
+    #[serde(default)]
     pub auth: AuthConfig,
 
     #[serde(default)]
@@ -94,6 +100,25 @@ pub struct QbittorrentConfig {
     pub password: Option<String>,
     pub timeout_secs: u64,
     pub no_auth: bool,
+    pub accept_invalid_certs: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct TransmissionConfig {
+    pub url: String,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub timeout_secs: u64,
+    pub accept_invalid_certs: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DelugeConfig {
+    pub url: String,
+    pub password: Option<String>,
+    pub timeout_secs: u64,
     pub accept_invalid_certs: bool,
 }
 
@@ -185,6 +210,29 @@ impl Default for QbittorrentConfig {
     }
 }
 
+impl Default for TransmissionConfig {
+    fn default() -> Self {
+        Self {
+            url: "http://127.0.0.1:9091/transmission/rpc".to_owned(),
+            username: None,
+            password: None,
+            timeout_secs: default_timeout_secs(),
+            accept_invalid_certs: false,
+        }
+    }
+}
+
+impl Default for DelugeConfig {
+    fn default() -> Self {
+        Self {
+            url: "http://127.0.0.1:8112/json".to_owned(),
+            password: None,
+            timeout_secs: default_timeout_secs(),
+            accept_invalid_certs: false,
+        }
+    }
+}
+
 impl Config {
     /// Minimal config for unit/integration tests — no real rTorrent connection.
     pub fn test_default() -> Self {
@@ -203,6 +251,8 @@ impl Config {
                 logs: RtorrentLogConfig::default(),
             },
             qbittorrent: QbittorrentConfig::default(),
+            transmission: TransmissionConfig::default(),
+            deluge: DelugeConfig::default(),
             auth: AuthConfig::default(),
             workflows: WorkflowConfig::default(),
             identity: IdentityConfig::default(),
@@ -321,6 +371,21 @@ impl Config {
         if let Ok(v) = std::env::var("TNG_QBITTORRENT_NO_AUTH") {
             self.qbittorrent.no_auth = v == "1" || v.eq_ignore_ascii_case("true");
         }
+        if let Ok(v) = std::env::var("TNG_TRANSMISSION_URL") {
+            self.transmission.url = v;
+        }
+        if let Ok(v) = std::env::var("TNG_TRANSMISSION_USERNAME") {
+            self.transmission.username = Some(v);
+        }
+        if let Ok(v) = std::env::var("TNG_TRANSMISSION_PASSWORD") {
+            self.transmission.password = Some(v);
+        }
+        if let Ok(v) = std::env::var("TNG_DELUGE_URL") {
+            self.deluge.url = v;
+        }
+        if let Ok(v) = std::env::var("TNG_DELUGE_PASSWORD") {
+            self.deluge.password = Some(v);
+        }
         if let Ok(v) = std::env::var("TNG_RTORRENT_LOGS_ENABLED") {
             self.rtorrent.logs.enabled = v == "1" || v.eq_ignore_ascii_case("true");
         }
@@ -390,7 +455,17 @@ impl Config {
                     bail!("qbittorrent: url must be set");
                 }
             }
-            BackendKind::Transmission | BackendKind::Deluge | BackendKind::Torrentng => {
+            BackendKind::Transmission => {
+                if self.transmission.url.trim().is_empty() {
+                    bail!("transmission: url must be set");
+                }
+            }
+            BackendKind::Deluge => {
+                if self.deluge.url.trim().is_empty() {
+                    bail!("deluge: url must be set");
+                }
+            }
+            BackendKind::Torrentng => {
                 bail!(
                     "backend {} is configured but not implemented in the sidecar yet",
                     self.backend_name()

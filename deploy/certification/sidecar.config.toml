@@ -3,6 +3,9 @@ sync_interval_secs = 2
 data_dir = "/var/lib/torrentng"
 storage_roots = ["/data"]
 
+[backend]
+type = "rtorrent"
+
 [rtorrent]
 scgi_socket = "/run/rtorrent/rpc.sock"
 timeout_secs = 10

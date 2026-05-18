@@ -1,7 +1,7 @@
 //! Minimal BEP 5 DHT service loop.
 
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -119,7 +119,7 @@ struct DhtTask {
     outstanding: HashMap<Vec<u8>, DhtRequest>,
     queried_nodes: HashMap<[u8; 20], HashSet<SocketAddrV4>>,
     torrents: HashMap<[u8; 20], mpsc::Sender<TorrentCmd>>,
-    announced_peers: HashMap<[u8; 20], Vec<SocketAddrV4>>,
+    announced_peers: HashMap<[u8; 20], Vec<SocketAddr>>,
     last_full_lookup: HashMap<[u8; 20], Instant>,
 }
 
@@ -342,19 +342,10 @@ impl DhtTask {
                 },
             };
         }
-        let SocketAddr::V4(v4) = addr else {
-            return KrpcMessage::Error {
-                transaction_id,
-                error: DhtError {
-                    code: 203,
-                    message: "IPv6 announce_peer not supported".to_owned(),
-                },
-            };
-        };
         let peer = if implied_port {
-            v4
+            addr
         } else {
-            SocketAddrV4::new(*v4.ip(), port)
+            socket_addr_with_port(addr, port)
         };
         remember_announced_peer(
             self.announced_peers.entry(info_hash).or_default(),
@@ -507,14 +498,13 @@ impl DhtTask {
         (transaction_id, msg)
     }
 
-    async fn forward_peers(&mut self, info_hash: [u8; 20], peers: Vec<std::net::SocketAddrV4>) {
+    async fn forward_peers(&mut self, info_hash: [u8; 20], peers: Vec<SocketAddr>) {
         if peers.is_empty() {
             return;
         }
         let Some(tx) = self.torrents.get(&info_hash) else {
             return;
         };
-        let peers = peers.into_iter().map(SocketAddr::V4).collect::<Vec<_>>();
         if tx.send(TorrentCmd::NewPeers(peers)).await.is_err() {
             self.torrents.remove(&info_hash);
         }
@@ -562,7 +552,7 @@ impl DhtTask {
     }
 }
 
-fn remember_announced_peer(peers: &mut Vec<SocketAddrV4>, peer: SocketAddrV4, cap: usize) -> bool {
+fn remember_announced_peer(peers: &mut Vec<SocketAddr>, peer: SocketAddr, cap: usize) -> bool {
     if peers.contains(&peer) {
         return true;
     }
@@ -571,6 +561,13 @@ fn remember_announced_peer(peers: &mut Vec<SocketAddrV4>, peer: SocketAddrV4, ca
     }
     peers.push(peer);
     true
+}
+
+fn socket_addr_with_port(addr: SocketAddr, port: u16) -> SocketAddr {
+    match addr {
+        SocketAddr::V4(v4) => SocketAddr::V4(SocketAddrV4::new(*v4.ip(), port)),
+        SocketAddr::V6(v6) => SocketAddr::V6(SocketAddrV6::new(*v6.ip(), port, 0, v6.scope_id())),
+    }
 }
 
 #[cfg(test)]
@@ -689,11 +686,43 @@ mod tests {
         assert!(peers.token.is_some());
     }
 
+    #[tokio::test]
+    async fn announce_peer_stores_ipv6_peer_and_get_peers_returns_it() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let socket = UdpSocket::from_std(socket).unwrap();
+        let local_id = NodeId::from_bytes([1; 20]);
+        let mut task = DhtTask {
+            local_id,
+            table: RoutingTable::new(local_id),
+            socket,
+            listen_port: 6881,
+            bootstrap_nodes: Vec::new(),
+            next_tx: 1,
+            outstanding: HashMap::new(),
+            queried_nodes: HashMap::new(),
+            torrents: HashMap::new(),
+            announced_peers: HashMap::new(),
+            last_full_lookup: HashMap::new(),
+        };
+        let info_hash = [9; 20];
+        let addr: SocketAddr = "[2001:db8::1]:60000".parse().unwrap();
+        let token = task.token_for_addr(addr);
+        let response =
+            task.handle_announce_peer(b"aa".to_vec(), addr, false, info_hash, 6881, token);
+        assert!(matches!(response, KrpcMessage::Response { .. }));
+
+        let peers = task.get_peers_response(info_hash, addr);
+        assert_eq!(peers.values, vec!["[2001:db8::1]:6881".parse().unwrap()]);
+        assert!(peers.nodes.is_empty());
+        assert!(peers.token.is_some());
+    }
+
     #[test]
     fn announced_peer_cache_is_bounded_and_keeps_duplicates() {
-        let first = "127.0.0.1:6881".parse().unwrap();
-        let second = "127.0.0.2:6881".parse().unwrap();
-        let third = "127.0.0.3:6881".parse().unwrap();
+        let first: SocketAddr = "127.0.0.1:6881".parse().unwrap();
+        let second: SocketAddr = "127.0.0.2:6881".parse().unwrap();
+        let third: SocketAddr = "127.0.0.3:6881".parse().unwrap();
         let mut peers = Vec::new();
 
         assert!(remember_announced_peer(&mut peers, first, 2));
@@ -712,7 +741,7 @@ mod tests {
         let local_id = NodeId::from_bytes([1; 20]);
         let info_hash = [9; 20];
         let queried = "127.0.0.1:6001".parse().unwrap();
-        let announced = "127.0.0.1:6881".parse().unwrap();
+        let announced: SocketAddr = "127.0.0.1:6881".parse().unwrap();
         let (cmd_tx, _cmd_rx) = mpsc::channel(1);
         let mut task = DhtTask {
             local_id,
@@ -871,7 +900,7 @@ mod tests {
         let local_id = NodeId::from_bytes([1; 20]);
         let remote_id = NodeId::from_bytes([2; 20]);
         let info_hash = [9; 20];
-        let discovered_peer = "127.0.0.1:51413".parse().unwrap();
+        let discovered_peer: SocketAddr = "127.0.0.1:51413".parse().unwrap();
         let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
         let mut task = DhtTask {
             local_id,
@@ -901,7 +930,7 @@ mod tests {
 
         match cmd_rx.recv().await {
             Some(TorrentCmd::NewPeers(peers)) => {
-                assert_eq!(peers, vec![SocketAddr::V4(discovered_peer)]);
+                assert_eq!(peers, vec![discovered_peer]);
             }
             other => panic!("unexpected torrent command: {other:?}"),
         }

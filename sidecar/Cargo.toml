@@ -46,6 +46,7 @@ dotenvy = "0.15"
 
 # Misc
 bytes = "1"
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 quick-xml = "0.40"

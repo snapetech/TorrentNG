@@ -1,6 +1,6 @@
 //! BEP 5 KRPC message codec.
 
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 use rt_bencode::{encode, BValue, Decoder};
 
@@ -53,7 +53,7 @@ impl DhtQuery {
 pub struct DhtResponse {
     pub id: NodeId,
     pub nodes: Vec<KNode>,
-    pub values: Vec<SocketAddrV4>,
+    pub values: Vec<SocketAddr>,
     pub token: Option<Vec<u8>>,
 }
 
@@ -169,16 +169,7 @@ fn encode_query(transaction_id: &[u8], query: &DhtQuery) -> Vec<u8> {
 fn encode_response(transaction_id: &[u8], response: &DhtResponse) -> Vec<u8> {
     let id = *response.id.as_bytes();
     let nodes = encode_compact_nodes(&response.nodes);
-    let compact_values: Vec<[u8; 6]> = response
-        .values
-        .iter()
-        .map(|peer| {
-            let mut compact = [0u8; 6];
-            compact[..4].copy_from_slice(&peer.ip().octets());
-            compact[4..].copy_from_slice(&peer.port().to_be_bytes());
-            compact
-        })
-        .collect();
+    let compact_values = encode_compact_peer_values(&response.values);
     let mut pairs = vec![(b"id".as_ref(), BValue::Bytes(&id))];
     if !nodes.is_empty() {
         pairs.push((b"nodes".as_ref(), BValue::Bytes(&nodes)));
@@ -340,21 +331,64 @@ pub fn parse_compact_nodes(bytes: &[u8]) -> Result<Vec<KNode>, KrpcError> {
         .collect())
 }
 
-pub fn parse_compact_peers(bytes: &[u8]) -> Result<Vec<SocketAddrV4>, KrpcError> {
-    if !bytes.len().is_multiple_of(6) {
-        return Err(KrpcError::Invalid(
-            "compact peers length is not a multiple of 6",
-        ));
+pub fn parse_compact_peers(bytes: &[u8]) -> Result<Vec<SocketAddr>, KrpcError> {
+    if bytes.len() == 18 {
+        let mut octets = [0u8; 16];
+        octets.copy_from_slice(&bytes[..16]);
+        return Ok(vec![SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::from(octets),
+            u16::from_be_bytes([bytes[16], bytes[17]]),
+            0,
+            0,
+        ))]);
     }
-    Ok(bytes
-        .chunks_exact(6)
-        .map(|chunk| {
-            SocketAddrV4::new(
-                Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]),
-                u16::from_be_bytes([chunk[4], chunk[5]]),
-            )
+    if bytes.len().is_multiple_of(6) {
+        return Ok(bytes
+            .chunks_exact(6)
+            .map(|chunk| {
+                SocketAddr::V4(SocketAddrV4::new(
+                    Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]),
+                    u16::from_be_bytes([chunk[4], chunk[5]]),
+                ))
+            })
+            .collect());
+    }
+    if bytes.len().is_multiple_of(18) {
+        return Ok(bytes
+            .chunks_exact(18)
+            .map(|chunk| {
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&chunk[..16]);
+                SocketAddr::V6(SocketAddrV6::new(
+                    Ipv6Addr::from(octets),
+                    u16::from_be_bytes([chunk[16], chunk[17]]),
+                    0,
+                    0,
+                ))
+            })
+            .collect());
+    }
+    Err(KrpcError::Invalid(
+        "compact peers length is not a multiple of 6 or 18",
+    ))
+}
+
+fn encode_compact_peer_values(peers: &[SocketAddr]) -> Vec<Vec<u8>> {
+    peers
+        .iter()
+        .map(|peer| {
+            let mut compact = Vec::with_capacity(match peer.ip() {
+                IpAddr::V4(_) => 6,
+                IpAddr::V6(_) => 18,
+            });
+            match peer.ip() {
+                IpAddr::V4(ip) => compact.extend_from_slice(&ip.octets()),
+                IpAddr::V6(ip) => compact.extend_from_slice(&ip.octets()),
+            }
+            compact.extend_from_slice(&peer.port().to_be_bytes());
+            compact
         })
-        .collect())
+        .collect()
 }
 
 fn required_bytes<'a>(value: &'a BValue<'a>, key: &[u8]) -> Result<&'a [u8], KrpcError> {
@@ -459,6 +493,7 @@ mod tests {
             addr: "127.0.0.1:6881".parse().unwrap(),
         });
         response.values.push("10.0.0.2:51413".parse().unwrap());
+        response.values.push("[2001:db8::1]:51413".parse().unwrap());
         response.token = Some(b"token".to_vec());
         let msg = KrpcMessage::Response {
             transaction_id: b"rr".to_vec(),
@@ -483,5 +518,17 @@ mod tests {
     fn rejects_bad_compact_lengths() {
         assert!(parse_compact_nodes(&[0; 25]).is_err());
         assert!(parse_compact_peers(&[0; 5]).is_err());
+    }
+
+    #[test]
+    fn compact_peer_values_roundtrip_ipv4_and_ipv6() {
+        let peers = vec![
+            "10.0.0.2:51413".parse().unwrap(),
+            "[2001:db8::1]:51413".parse().unwrap(),
+        ];
+        let compact = encode_compact_peer_values(&peers);
+
+        assert_eq!(parse_compact_peers(&compact[0]).unwrap(), vec![peers[0]]);
+        assert_eq!(parse_compact_peers(&compact[1]).unwrap(), vec![peers[1]]);
     }
 }
