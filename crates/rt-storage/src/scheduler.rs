@@ -1744,6 +1744,7 @@ impl MountScheduler {
             return Err(error);
         }
         if strict {
+            let sync_started = Instant::now();
             let result = await_backend_io(&key, disk_backend.fdatasync(file)).await;
             if let Err(error) = result {
                 if matches!(error, StorageError::QueueFull { .. }) {
@@ -1751,6 +1752,7 @@ impl MountScheduler {
                 }
                 return Err(error);
             }
+            record_sync_completion(&counters, sync_started);
         } else {
             let mut dirty = dirty_paths.lock().expect("dirty path mutex poisoned");
             dirty.insert(key);
@@ -1858,12 +1860,7 @@ impl MountScheduler {
             }
             return Err(error);
         }
-        counters.sync_ops.fetch_add(1, Ordering::Relaxed);
-        let latency_ns = latency_ns_since(started);
-        counters
-            .sync_latency_ns
-            .fetch_add(latency_ns, Ordering::Relaxed);
-        record_latency_bucket(&counters.sync_latency_buckets, latency_ns);
+        record_sync_completion(&counters, started);
         let mut dirty = dirty_paths.lock().expect("dirty path mutex poisoned");
         dirty.remove(&key);
         drop(submission);
@@ -1917,16 +1914,11 @@ impl MountScheduler {
                 return Err(error);
             }
         }
-        counters.sync_ops.fetch_add(1, Ordering::Relaxed);
         let mut dirty = dirty_paths.lock().expect("dirty path mutex poisoned");
         for path in paths {
             dirty.remove(&path);
         }
-        let latency_ns = latency_ns_since(started);
-        counters
-            .sync_latency_ns
-            .fetch_add(latency_ns, Ordering::Relaxed);
-        record_latency_bucket(&counters.sync_latency_buckets, latency_ns);
+        record_sync_completion(&counters, started);
         drop(submission);
         Ok(())
     }
@@ -2128,6 +2120,15 @@ fn record_latency_bucket(buckets: &[AtomicU64; STORAGE_LATENCY_BUCKET_COUNT], la
             buckets[index].fetch_add(1, Ordering::Relaxed);
         }
     }
+}
+
+fn record_sync_completion(counters: &StorageCounters, started: Instant) {
+    counters.sync_ops.fetch_add(1, Ordering::Relaxed);
+    let latency_ns = latency_ns_since(started);
+    counters
+        .sync_latency_ns
+        .fetch_add(latency_ns, Ordering::Relaxed);
+    record_latency_bucket(&counters.sync_latency_buckets, latency_ns);
 }
 
 fn peer_read_cache_hit(
@@ -2976,6 +2977,39 @@ mod tests {
         let after_sync = sched.stats();
         assert_eq!(after_sync.dirty_files, 0);
         assert_eq!(after_sync.sync_ops, 1);
+    }
+
+    #[tokio::test]
+    async fn strict_write_sync_is_counted_and_not_left_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("strict.bin");
+        let sched = MountScheduler::new(
+            StorageRootId::new(),
+            &SchedulerConfig {
+                profile: StorageProfile::Ssd,
+                storage_io: StorageIoConfig {
+                    durability_mode: DurabilityMode::Strict,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        scheduled_write(
+            &sched,
+            IoClass::PeerWrite,
+            &path,
+            0,
+            bytes::Bytes::from_static(b"strict"),
+            true,
+        )
+        .await
+        .unwrap();
+
+        let stats = sched.stats();
+        assert_eq!(stats.dirty_files, 0);
+        assert_eq!(stats.sync_ops, 1);
+        assert!(stats.sync_latency_ns > 0);
     }
 
     #[tokio::test]
