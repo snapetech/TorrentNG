@@ -46,6 +46,35 @@ DB and fast-resume directory are taken from the resolved config, so point
 `--config` at the same config the daemon uses, and back up the native DB (see
 [BACKUP_RESTORE.md](BACKUP_RESTORE.md)) before `--apply`.
 
+### Reading the confidence summary
+
+The four buckets describe what was decoded at scan time, not the final
+recheck decision:
+
+- **trusted** — piece state decoded *and* every backing file matched the
+  expected size on disk. Resumes with no recheck.
+- **hints** — piece state decoded, but not all files validated by size at
+  scan time. This is the **normal label for an in-progress download**: the
+  partially-written file can never size-match the full torrent length, so the
+  torrent is reported as `hints` even though its completed-piece map was fully
+  imported.
+- **metadata-only** — no decodable piece state (e.g. an incomplete rTorrent
+  torrent, or Tixati). Save path, labels, and counters import; content is
+  rechecked.
+- **none** — only `.torrent` metadata was importable.
+
+A `hints` partial still skips the full recheck under the default
+`trust-hints` policy. The engine's startup guard invalidates only pieces
+whose backing files *changed since import* — not pieces that are merely
+incomplete — so a half-finished qBittorrent/Deluge download keeps its
+completed pieces and only fetches the rest. The label is a scan-time artifact
+of size-only file validation, not a downgrade of the imported piece state.
+Only `--policy verify` forces a full rehash of decoded state; `trust-all`
+trusts it even if files are absent. For this guard to hold, import **after**
+the data is in its final location (use `--remap`); moving or re-copying files
+after `--apply` changes their size/mtime and reverts the affected pieces to
+verification.
+
 ## Migrating from rTorrent + ruTorrent
 
 ### What gets imported

@@ -1861,15 +1861,16 @@ pub async fn transfer_speed_limits_mode(State(state): State<AppState>) -> impl I
 }
 
 pub async fn transfer_toggle_speed_limits_mode(State(state): State<AppState>) -> impl IntoResponse {
-    let Some(engine) = &state.engine else {
-        return StatusCode::OK;
-    };
     let mut limits = global_limits(&state).await;
     limits.speed_limits_mode = !limits.speed_limits_mode;
-    match engine.update_global_limits(limits).await {
-        Ok(()) => StatusCode::OK,
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    if let Some(engine) = &state.engine {
+        match engine.update_global_limits(limits.clone()).await {
+            Ok(()) => {}
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+        }
     }
+    *state.global_limits.write().await = limits;
+    StatusCode::OK
 }
 
 /// `GET /api/qb/v2/transfer/downloadLimit`.
@@ -2919,9 +2920,6 @@ async fn update_limit_field(
 }
 
 async fn update_global_limit(state: &AppState, body: &str, field: LimitField) -> StatusCode {
-    let Some(engine) = &state.engine else {
-        return StatusCode::OK;
-    };
     let params = parse_form_body(body);
     let limit = params
         .get("limit")
@@ -2933,10 +2931,14 @@ async fn update_global_limit(state: &AppState, body: &str, field: LimitField) ->
         LimitField::Download => limits.download_limit = limit,
         LimitField::Upload => limits.upload_limit = limit,
     }
-    match engine.update_global_limits(limits).await {
-        Ok(()) => StatusCode::OK,
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    if let Some(engine) = &state.engine {
+        match engine.update_global_limits(limits.clone()).await {
+            Ok(()) => {}
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+        }
     }
+    *state.global_limits.write().await = limits;
+    StatusCode::OK
 }
 
 async fn update_bool_limit_field(
@@ -2981,10 +2983,13 @@ async fn update_bool_limit_field(
 }
 
 async fn global_limits(state: &AppState) -> EngineGlobalLimits {
-    let Some(engine) = &state.engine else {
-        return EngineGlobalLimits::default();
-    };
-    engine.global_limits().await.unwrap_or_default()
+    if let Some(engine) = &state.engine {
+        if let Ok(limits) = engine.global_limits().await {
+            *state.global_limits.write().await = limits.clone();
+            return limits;
+        }
+    }
+    state.global_limits.read().await.clone()
 }
 
 async fn reserve_qbit_api_snapshot(
@@ -5360,9 +5365,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transfer_limit_endpoints_are_qbit_compatible_noops() {
+    async fn transfer_limit_endpoints_roundtrip_without_engine() {
         let hash = "e".repeat(40);
         let app = build_qbit_router(make_state_with(&hash).await);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/transfer/setDownloadLimit")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("limit=4096"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/transfer/setUploadLimit")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("limit=2048"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
         let resp = app
             .clone()
             .oneshot(
@@ -5375,7 +5408,47 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
-        assert_eq!(std::str::from_utf8(&body).unwrap(), "0");
+        assert_eq!(std::str::from_utf8(&body).unwrap(), "4096");
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/qb/v2/transfer/uploadLimit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(std::str::from_utf8(&body).unwrap(), "2048");
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/transfer/toggleSpeedLimitsMode")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/qb/v2/transfer/speedLimitsMode")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(std::str::from_utf8(&body).unwrap(), "1");
 
         let resp = app
             .clone()

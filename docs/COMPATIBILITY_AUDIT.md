@@ -70,8 +70,8 @@ Local surface: `crates/rt-api-qbit`.
 | Torrent reads | list with modern qBit path/counter/limit/mode/magnet/infohash fields, properties, trackers, web seeds, files, piece states, piece hashes, export | Implemented; properties include registry/engine-backed counters, lifecycle times, piece counts, and limits where available; export streams persisted raw `.torrent` bytes instead of a placeholder body |
 | Torrent lifecycle | add, pause/resume legacy aliases, start/stop v5 aliases, delete, recheck, reannounce | Implemented |
 | Torrent mutation | tracker add/edit/remove, peers, priority order, file priority, limits, share limits, force start, super seeding, auto management, sequential, first/last, location/save path, rename, category with configured save paths, tags with global tag cleanup | Implemented |
-| RSS | folders, feeds, items, rules, matching articles | Implemented as no-op/read-compatible |
-| Search | status, categories, plugins, plugin mutation, start/stop/results/delete | Implemented as no-op/read-compatible |
+| RSS | folders, feeds, items, rules, matching articles | Implemented as stateful compatibility: folders, feeds, read markers, refresh timestamps, and rule JSON round-trip in facade state |
+| Search | status, categories, plugins, plugin mutation, start/stop/results/delete | Implemented as stateful compatibility: plugin metadata/enabled state and search job lifecycle round-trip, with intentionally empty local result sets |
 
 ## Transmission RPC Facade
 
@@ -83,7 +83,7 @@ Local surface: `crates/rt-api-transmission`.
 | CSRF session ID | `X-Transmission-Session-Id` retry flow | Implemented |
 | Session reads | `session_get`, `session_stats`, `session_access_control` | Implemented; `session_get` supports field projection |
 | Session writes | `session_set`, `session_close`, queue-stalled enable/disable | Implemented for native limits plus broad compatibility-state roundtrip for paths, queues, scheduler, peer/network, blocklist, scripts, and seeding settings |
-| Groups | `group_get`, `group_set` | Accepted as compatibility no-ops |
+| Groups | `group_get`, `group_set` | Implemented as compatibility state round-trips for honors-session-limits and group speed limits; native group scheduling effects remain future work |
 | Torrent actions | start, start now, stop, verify, reannounce, remove | Implemented |
 | Torrent add | filename magnet, base64 metainfo, paused, download dir, labels | Implemented |
 | Torrent reads | `torrent_get` common fields: identity, status, size/progress, counters, labels, paths, files, file stats, trackers, tracker stats, peers, queue, dates, private flag, magnet link; object and table formats; recently-active removed list | Implemented |
