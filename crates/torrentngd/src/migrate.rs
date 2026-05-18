@@ -316,8 +316,22 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         .apply_native_import(&mut conn, &fastresume_dir, &options, args.policy)
         .map_err(|e| anyhow!("native import failed: {e}"))?;
 
+    // Persist the .torrent metainfo into the engine blob dir so the native
+    // state is complete: the daemon can load it, and `torrentngd export` can
+    // project it back out without first running the daemon.
+    let blob_dir = config.daemon.session_dir.join("torrents");
+    std::fs::create_dir_all(&blob_dir)
+        .with_context(|| format!("creating {}", blob_dir.display()))?;
+    let mut blobs = 0usize;
+    for torrent in &plan.torrents {
+        let dest = blob_dir.join(format!("{}.torrent", torrent.info_hash));
+        if std::fs::copy(&torrent.torrent_path, &dest).is_ok() {
+            blobs += 1;
+        }
+    }
+
     println!(
-        "\nImported {} torrent(s), {} file(s), {} tracker(s).",
+        "\nImported {} torrent(s), {} file(s), {} tracker(s); {blobs} .torrent blob(s) persisted.",
         result.db.torrents, result.db.files, result.db.trackers,
     );
     println!(

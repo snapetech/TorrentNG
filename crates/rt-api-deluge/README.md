@@ -10,9 +10,10 @@ registry, not a Deluge-compatible internal model.
 
 Supported surfaces include auth/session probes, host status, torrent list/detail
 projection, file and tracker views, pause/resume/recheck/remove, add torrent
-file, add magnet, storage moves, and selected WebUI update calls. Unsupported
-plugin-management and UI-only methods degrade to compatible no-op responses
-where safe.
+file, add magnet, storage moves, selected WebUI update calls, and stateful
+compatibility for common auxiliary plugin facades such as blocklist, autoadd,
+scheduler, extractor, execute, and enabled-plugin metadata. Unsupported UI-only
+methods degrade to compatible no-op responses where safe.
 
 Run focused tests:
 

@@ -331,6 +331,61 @@ compatible fast-resume state are written together under one audited summary.
 
 ---
 
+## Leaving TorrentNG (`torrentngd export`)
+
+Reverse migration is a first-class, no-lock-in path. `torrentngd export`
+reads native state **read-only** (the session DB, persisted `.torrent`
+blobs, and fast-resume state) and writes another client's on-disk layout so
+you can resume seeding elsewhere — without a full recheck wherever the target
+format can carry piece state.
+
+```sh
+torrentngd export --format <FMT> --to <DIR> [OPTIONS]
+```
+
+- `--format` — `generic`, `libtorrent` (qBittorrent/Deluge), `transmission`,
+  `rtorrent`, `utorrent`, or `biglybt`
+- `--to` — output directory for the exported layout
+- `--apply` — write the export; **omit for a dry-run report** (the default)
+- `--report FILE` — also write the markdown dry-run report
+- `--config FILE` — config file (else `TORRENTNGD_CONFIG` / defaults); this
+  locates the native DB, `.torrent` blobs, and fast-resume directory
+- `--yes` — skip the confirmation prompt with `--apply`
+
+The native state is never modified. The dry-run report and post-apply summary
+break torrents into **recheck-free / complete-only / metadata-only /
+torrent-only** so you can see how much seeding state survives the move:
+
+| Target | Layout written | Fidelity |
+| --- | --- | --- |
+| `libtorrent` | `<hash>.torrent` + `<hash>.fastresume` (qBittorrent `BT_backup` / Deluge state dir) | Recheck-free, partials included |
+| `transmission` | `torrents/` + `resume/` | Recheck-free, partials included |
+| `rtorrent` | `<hash>.torrent` + `<hash>.rtorrent` session sidecar | Recheck-free for **complete** torrents; partials metadata-only (rTorrent's format has no decodable partial bitfield) |
+| `utorrent` | aggregate `resume.dat` | Recheck-free at whole-piece granularity |
+| `biglybt` | aggregate `downloads.config` | Recheck-free at whole-piece granularity |
+| `generic` | `<hash>.torrent` files + `manifest.json` | Always correct; destination rechecks |
+
+Example — leave for qBittorrent with seeding state intact:
+
+```sh
+torrentngd export --format libtorrent --to /tmp/leaving --report /tmp/exit.md
+# review the fidelity summary, then:
+torrentngd export --format libtorrent --to /tmp/leaving --apply
+```
+
+Then point qBittorrent/Deluge at the exported directory (qBittorrent: copy
+into `BT_backup/`). `generic` is the universal safety valve: it always
+produces usable `.torrent` files plus a manifest of save paths, categories,
+tags, counters, and completed-piece counts.
+
+Torrents imported via `torrentngd migrate --apply` persist their `.torrent`
+blob into the session directory, so a migrate-in then export-out round trip
+works without first starting the daemon. A torrent with no native fast-resume
+state exports as `torrent-only` (the destination rechecks) — that is honest,
+not a failure.
+
+---
+
 ## Rolling back
 
 If migration causes problems:

@@ -108,7 +108,7 @@ Local implementation: `crates/rt-api-qbit`.
 | Group | Upstream API points | TorrentNG points | Status | Test rows |
 |---|---|---|---|---|
 | Auth | `auth/login`, `auth/logout` | Same | Compat | Login/logout status and cookie shape |
-| App info | `app/version`, `webapiVersion`, `buildInfo`, `preferences`, `setPreferences`, `shutdown`, `sendTestEmail`, `getCookies`, `setCookies`, `rotateAPIKey`, `deleteAPIKey`, `networkInterfaceList`, `networkInterfaceAddressList`, `defaultSavePath` | Same | Native/Compat mix | Probe every endpoint, assert status/content type |
+| App info | `app/version`, `webapiVersion`, `buildInfo`, `preferences`, `setPreferences`, `shutdown`, `sendTestEmail`, `getCookies`, `setCookies`, `rotateAPIKey`, `deleteAPIKey`, `networkInterfaceList`, `networkInterfaceAddressList`, `defaultSavePath` | Same | Native/Compat mix; preferences, cookies, and API-key lifecycle round-trip in facade state | Probe every endpoint plus preference/cookie/API-key persistence |
 | Torrent list/add | `torrents/info`, `torrents/add` | Same | Native | Add magnet/file, list filters/sort/category/tag/hash |
 | Torrent lifecycle | `pause`, `resume`, `start`, `stop`, `delete`, `recheck`, `reannounce` | Same | Native | Lifecycle transition per endpoint; qBittorrent list state projects active recheck jobs as checking |
 | Torrent trackers/peers | `trackers`, `addTrackers`, `editTracker`, `removeTrackers`, `addPeers` | Same | Native/Partial stats; persisted engine tracker rows project status, message, and scrape counts where available | Tracker mutation and explicit peer row |

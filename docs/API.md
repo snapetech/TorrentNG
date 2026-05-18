@@ -277,14 +277,18 @@ Implements the qBittorrent Web API v2. By default it advertises qBittorrent `5.0
 
 ### App
 
-| Method | Path |
-|--------|------|
+| Method | Path | Notes |
+|--------|------|-------|
 | `GET` | `/api/qb/v2/app/version` |
 | `GET` | `/api/qb/v2/app/webapiVersion` |
 | `GET` | `/api/qb/v2/app/buildInfo` |
 | `GET` | `/api/qb/v2/app/preferences` |
 | `GET` | `/api/qb/v2/app/defaultSavePath` |
 | `POST` | `/api/qb/v2/app/setPreferences` | Form: `json` preference object; unsupported keys are accepted and ignored |
+| `GET` | `/api/qb/v2/app/getCookies` | Returns facade-stored cookie objects sorted by host/name |
+| `POST` | `/api/qb/v2/app/setCookies` | Accepts JSON array, `{ "cookies": [...] }`, or form `cookies=<json array>` |
+| `POST` | `/api/qb/v2/app/rotateAPIKey` | Stores and returns a generated facade API key as `{ "apiKey": "..." }` |
+| `POST` | `/api/qb/v2/app/deleteAPIKey` | Clears the facade API key |
 
 ### Torrents
 

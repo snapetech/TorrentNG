@@ -63,7 +63,7 @@ Local surface: `crates/rt-api-qbit`.
 |---|---|---|
 | Authentication | `auth/login`, `auth/logout` | Implemented |
 | Application | version, API version, build info, shutdown, preferences, set preferences, default save path, network interface probes, test email | Implemented as native/no-op compatibility where no native equivalent exists; `setPreferences` persists arbitrary qBit preference keys in facade state |
-| qBittorrent 5 cookie/API key APIs | `app/getCookies`, `app/setCookies`, `app/rotateAPIKey`, `app/deleteAPIKey` | Implemented as empty/no-op compatibility |
+| qBittorrent 5 cookie/API key APIs | `app/getCookies`, `app/setCookies`, `app/rotateAPIKey`, `app/deleteAPIKey` | Implemented as stateful facade compatibility: cookie arrays round-trip in app state and API-key rotate/delete persists facade lifecycle state |
 | Logs | main log, peer log | Main log projects retained app/session events; peer log projects native peer snapshots when an engine is attached |
 | Sync | `sync/maindata`, `sync/torrentPeers` | Implemented; maindata carries broad torrent/server-state keys and torrentPeers carries qBit peer shape with stable RID deltas |
 | Transfer | global info, speed limits, speed-limit mode, ban peers | Implemented |

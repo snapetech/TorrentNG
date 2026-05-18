@@ -99,24 +99,52 @@ pub async fn app_send_test_email() -> impl IntoResponse {
     StatusCode::OK
 }
 
-pub async fn app_get_cookies() -> impl IntoResponse {
-    (StatusCode::OK, Json(serde_json::json!([])))
+pub async fn app_get_cookies(State(state): State<AppState>) -> impl IntoResponse {
+    let mut cookies = state.app_cookies.read().await.clone();
+    cookies.sort_by(|a, b| {
+        a.get("host")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .cmp(
+                b.get("host")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default(),
+            )
+            .then_with(|| {
+                a.get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .cmp(
+                        b.get("name")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default(),
+                    )
+            })
+    });
+    (StatusCode::OK, Json(cookies))
 }
 
-pub async fn app_set_cookies() -> impl IntoResponse {
+pub async fn app_set_cookies(State(state): State<AppState>, body: String) -> impl IntoResponse {
+    let Some(cookies) = qbit_cookie_payload(&body) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    *state.app_cookies.write().await = cookies;
     StatusCode::OK
 }
 
-pub async fn app_rotate_api_key() -> impl IntoResponse {
+pub async fn app_rotate_api_key(State(state): State<AppState>) -> impl IntoResponse {
+    let key = new_qbit_api_key();
+    *state.api_key.write().await = Some(key.clone());
     (
         StatusCode::OK,
         Json(serde_json::json!({
-            "apiKey": "",
+            "apiKey": key,
         })),
     )
 }
 
-pub async fn app_delete_api_key() -> impl IntoResponse {
+pub async fn app_delete_api_key(State(state): State<AppState>) -> impl IntoResponse {
+    *state.api_key.write().await = None;
     StatusCode::OK
 }
 
@@ -306,6 +334,38 @@ fn qbit_preference_payload(body: &str) -> Option<serde_json::Value> {
     parse_form_body(trimmed)
         .remove("json")
         .and_then(|json| serde_json::from_str(&json).ok())
+}
+
+fn qbit_cookie_payload(body: &str) -> Option<Vec<serde_json::Value>> {
+    let trimmed = body.trim();
+    let value = if trimmed.starts_with('[') {
+        serde_json::from_str(trimmed).ok()?
+    } else if trimmed.starts_with('{') {
+        serde_json::from_str(trimmed)
+            .ok()
+            .and_then(|value: serde_json::Value| value.get("cookies").cloned())?
+    } else {
+        parse_form_body(trimmed)
+            .remove("cookies")
+            .and_then(|json| serde_json::from_str(&json).ok())?
+    };
+    match value {
+        serde_json::Value::Array(cookies) => Some(
+            cookies
+                .into_iter()
+                .filter(|cookie| cookie.is_object())
+                .collect::<Vec<_>>(),
+        ),
+        _ => None,
+    }
+}
+
+fn new_qbit_api_key() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    format!("tng_{nanos:032x}")
 }
 
 // ---------------------------------------------------------------------------
@@ -4107,6 +4167,69 @@ mod tests {
         assert_eq!(v["web_ui_port"], 9090);
         assert_eq!(v["rss_processing_enabled"], true);
         assert_eq!(v["save_path"], "/incoming");
+    }
+
+    #[tokio::test]
+    async fn app_cookies_and_api_key_roundtrip() {
+        let app = build_qbit_router(AppState::new());
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/app/setCookies")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(
+                        "cookies=%5B%7B%22host%22%3A%22tracker.example%22%2C%22name%22%3A%22sid%22%2C%22value%22%3A%22abc%22%7D%5D",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/qb/v2/app/getCookies")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let cookies: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(cookies[0]["host"], "tracker.example");
+        assert_eq!(cookies[0]["name"], "sid");
+        assert_eq!(cookies[0]["value"], "abc");
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/app/rotateAPIKey")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let rotated: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(rotated["apiKey"].as_str().unwrap().starts_with("tng_"));
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/app/deleteAPIKey")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
