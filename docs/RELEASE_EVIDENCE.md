@@ -9,6 +9,7 @@ Run the deterministic local gates first:
 
 ```sh
 scripts/external_evidence_preflight.sh
+scripts/certification_status_json.sh
 scripts/universal_compatibility_certification.sh
 scripts/migration_corpus_certification.sh
 scripts/local_release_gate.sh
@@ -120,8 +121,8 @@ scripts/release_evidence_suite.sh
 ```
 
 The burndown/readiness/post-soak policy intentionally ignores meta-report rows
-such as certification bundle, burndown, readiness, and the evidence suite itself
-when deciding whether product evidence is clean.
+such as certification bundle, burndown, readiness, JSON status, and the evidence
+suite itself when deciding whether product evidence is clean.
 
 ## Evidence Bundle
 
@@ -135,3 +136,7 @@ The output tarball is written under `certification/bundles/`, and its generated
 report includes the bundle, manifest, and status SHA-256 values. If any report
 referenced by certification status is missing at packaging time, the bundle
 report is downgraded to `PASS_WITH_WARNINGS`.
+
+`scripts/certification_status_json.sh` writes a machine-readable
+`certification-status-*.json` file plus a companion Markdown report for the
+status table.

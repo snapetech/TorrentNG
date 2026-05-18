@@ -152,6 +152,7 @@ row "Certification burndown" 'certification-burndown-*.md'
 row "Release readiness" 'release-readiness-*.md'
 row "Certification bundle" 'certification-bundle-*.md'
 row "Release evidence suite" 'release-evidence-suite-*.md'
+row "Certification JSON status" 'certification-status-*.md'
 
 echo
 echo "## Active Long-Running Jobs"

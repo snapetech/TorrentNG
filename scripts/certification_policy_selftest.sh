@@ -96,6 +96,7 @@ write_report "$report_dir/certification-burndown-selftest.md" PASS_WITH_ACTIONS
 write_report "$report_dir/release-readiness-selftest.md" FAIL
 write_report "$report_dir/certification-bundle-selftest.md" PASS_WITH_WARNINGS
 write_report "$report_dir/release-evidence-suite-selftest.md" FAIL
+write_report "$report_dir/certification-status-selftest.md" FAIL
 
 REPORT_DIR="$report_dir" BENCHMARK_DIR="$benchmark_dir" \
   "$ROOT/scripts/certification_burndown.sh" "$report_dir/certification-burndown-policy.md" >/dev/null

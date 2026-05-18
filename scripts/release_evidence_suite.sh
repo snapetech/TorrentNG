@@ -46,6 +46,7 @@ run_capture() {
 : >"$OUT.table"
 
 run_capture "certification status" "$ROOT/scripts/certification_status.sh" "$REPORT_DIR"
+run_capture "certification JSON status" "$ROOT/scripts/certification_status_json.sh"
 run_capture "external evidence preflight" "$ROOT/scripts/external_evidence_preflight.sh"
 run_capture "certification burndown" "$ROOT/scripts/certification_burndown.sh"
 run_capture "strict release readiness" "$ROOT/scripts/release_readiness_gate.sh"

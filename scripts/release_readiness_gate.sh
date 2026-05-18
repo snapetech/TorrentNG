@@ -25,6 +25,7 @@ nonclean="$(
       if (name == "Release readiness") next;
       if (name == "Certification bundle") next;
       if (name == "Release evidence suite") next;
+      if (name == "Certification JSON status") next;
       if (status != "PASS" && status != "INFO") {
         print "| " name " | " status " | " report " |";
       }

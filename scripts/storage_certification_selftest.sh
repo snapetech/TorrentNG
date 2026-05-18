@@ -132,6 +132,7 @@ for pattern in \
   release-readiness-selftest.md \
   certification-bundle-selftest.md \
   release-evidence-suite-selftest.md \
+  certification-status-selftest.md \
   pre-engine-release-selftest.md \
   pre-engine-suite-selftest.md; do
   write_passing_report "$report_dir/$pattern"

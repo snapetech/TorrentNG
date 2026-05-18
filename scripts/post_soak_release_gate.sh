@@ -128,6 +128,7 @@ certification_status_gate() {
       /^\| Certification burndown \|/ {next}
       /^\| Certification bundle \|/ {next}
       /^\| Release evidence suite \|/ {next}
+      /^\| Certification JSON status \|/ {next}
       /^\|/ && $3 ~ /FAIL|MISSING/ {bad=1}
       END {exit bad ? 0 : 1}
     ' "$tmp"; then
@@ -138,6 +139,7 @@ certification_status_gate() {
       /^\| Certification burndown \|/ {next}
       /^\| Certification bundle \|/ {next}
       /^\| Release evidence suite \|/ {next}
+      /^\| Certification JSON status \|/ {next}
       /^\|/ && $3 ~ /FAIL|MISSING/ {
         gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2);
         gsub(/^[[:space:]]+|[[:space:]]+$/, "", $3);
@@ -150,6 +152,7 @@ certification_status_gate() {
       /^\| Certification burndown \|/ {next}
       /^\| Certification bundle \|/ {next}
       /^\| Release evidence suite \|/ {next}
+      /^\| Certification JSON status \|/ {next}
       /^\|/ && $3 ~ /PASS_WITH_GAPS|PASS_WITH_SKIPS|PASS_WITH_WARNINGS|STALE\/INCOMPLETE|RUNNING\/UNKNOWN|RUNNING|SKIP/ {warn=1}
       END {exit warn ? 0 : 1}
     ' "$tmp"; then
@@ -160,6 +163,7 @@ certification_status_gate() {
       /^\| Certification burndown \|/ {next}
       /^\| Certification bundle \|/ {next}
       /^\| Release evidence suite \|/ {next}
+      /^\| Certification JSON status \|/ {next}
       /^\|/ && $3 ~ /PASS_WITH_GAPS|PASS_WITH_SKIPS|PASS_WITH_WARNINGS|STALE\/INCOMPLETE|RUNNING\/UNKNOWN|RUNNING|SKIP/ {
         gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2);
         gsub(/^[[:space:]]+|[[:space:]]+$/, "", $3);
