@@ -199,8 +199,21 @@ Run the multi-peer completion row directly:
 INTEROP_PROTOCOL_ONLY=endgame-multi-peer scripts/interop_matrix.sh --local
 ```
 
+Run the partial file-selection row directly:
+
+```sh
+INTEROP_PROTOCOL_ONLY=rust-partial-file-selection scripts/interop_matrix.sh --local
+```
+
+Run the qBittorrent mutation facade row directly:
+
+```sh
+INTEROP_PROTOCOL_ONLY=rust-qbit-mutation-facade scripts/interop_matrix.sh --local
+```
+
 When `INTEROP_PROTOCOL_ONLY` is set, the runner skips the base local and
-extended local cases and runs only the requested protocol row.
+extended local cases and runs only the requested protocol row. Unknown protocol
+row names fail before the Compose stack is started.
 
 ## Expansion Backlog
 

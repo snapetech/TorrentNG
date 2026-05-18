@@ -34,6 +34,22 @@ LOCAL_CASES=(
   "churn|rotating|rotating|churn"
 )
 
+PROTOCOL_CASES=(
+  rust-magnet-with-tracker
+  rust-udp-tracker
+  rust-multi-tracker-fallback
+  tracker-outage-after-peer-discovery
+  webseed-outage-fallback
+  private-torrent-no-dht-pex
+  resume-after-partial-download
+  force-recheck-corruption-repair
+  missing-file-recovery
+  rust-seeds-to-all-reference-clients
+  endgame-multi-peer
+  rust-partial-file-selection
+  rust-qbit-mutation-facade
+)
+
 usage() {
   cat <<'USAGE'
 Usage: scripts/interop_matrix.sh [--local|--public|--all] [--report PATH]
@@ -86,6 +102,27 @@ require_cmd() {
     echo "missing required command: $1" >&2
     exit 127
   }
+}
+
+validate_protocol_only() {
+  local requested="${INTEROP_PROTOCOL_ONLY:-}" valid
+  [[ -n "$requested" ]] || return 0
+  for valid in "${PROTOCOL_CASES[@]}"; do
+    if [[ "$requested" == "$valid" ]]; then
+      return 0
+    fi
+  done
+  {
+    echo "unknown INTEROP_PROTOCOL_ONLY=$requested"
+    echo "valid protocol rows:"
+    printf '  %s\n' "${PROTOCOL_CASES[@]}"
+  } >&2
+  return 2
+}
+
+should_run_protocol_case() {
+  local name="$1"
+  [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "$name" ]]
 }
 
 client_url() {
@@ -1312,43 +1349,43 @@ run_protocol_local_matrix() {
   [[ "${INTEROP_PROTOCOL_LOCAL:-1}" == "1" ]] || return 0
   append_report "# Protocol Local Certification"
   append_report ""
-  if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "rust-magnet-with-tracker" ]]; then
+  if should_run_protocol_case rust-magnet-with-tracker; then
     run_magnet_tracker_case || failures=$((failures + 1))
   fi
-  if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "rust-udp-tracker" ]]; then
+  if should_run_protocol_case rust-udp-tracker; then
     run_udp_tracker_case || failures=$((failures + 1))
   fi
-  if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "rust-multi-tracker-fallback" ]]; then
+  if should_run_protocol_case rust-multi-tracker-fallback; then
     run_multi_tracker_fallback_case || failures=$((failures + 1))
   fi
-  if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "tracker-outage-after-peer-discovery" ]]; then
+  if should_run_protocol_case tracker-outage-after-peer-discovery; then
     run_tracker_outage_after_peer_discovery_case || failures=$((failures + 1))
   fi
-  if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "webseed-outage-fallback" ]]; then
+  if should_run_protocol_case webseed-outage-fallback; then
     run_webseed_outage_fallback_case || failures=$((failures + 1))
   fi
-  if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "private-torrent-no-dht-pex" ]]; then
+  if should_run_protocol_case private-torrent-no-dht-pex; then
     run_private_torrent_no_dht_pex_case || failures=$((failures + 1))
   fi
-  if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "resume-after-partial-download" ]]; then
+  if should_run_protocol_case resume-after-partial-download; then
     run_resume_after_partial_download_case || failures=$((failures + 1))
   fi
-  if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "force-recheck-corruption-repair" ]]; then
+  if should_run_protocol_case force-recheck-corruption-repair; then
     run_force_recheck_corruption_repair_case || failures=$((failures + 1))
   fi
-  if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "missing-file-recovery" ]]; then
+  if should_run_protocol_case missing-file-recovery; then
     run_missing_file_recovery_case || failures=$((failures + 1))
   fi
-  if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "rust-seeds-to-all-reference-clients" ]]; then
+  if should_run_protocol_case rust-seeds-to-all-reference-clients; then
     run_rust_seeds_to_all_reference_clients_case || failures=$((failures + 1))
   fi
-  if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "endgame-multi-peer" ]]; then
+  if should_run_protocol_case endgame-multi-peer; then
     run_endgame_multi_peer_case || failures=$((failures + 1))
   fi
-  if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "rust-partial-file-selection" ]]; then
+  if should_run_protocol_case rust-partial-file-selection; then
     run_partial_file_selection_case || failures=$((failures + 1))
   fi
-  if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "rust-qbit-mutation-facade" ]]; then
+  if should_run_protocol_case rust-qbit-mutation-facade; then
     run_qbit_mutation_facade_case || failures=$((failures + 1))
   fi
   (( failures == 0 ))
@@ -1612,6 +1649,7 @@ main() {
   require_cmd curl
   require_cmd jq
   require_cmd base64
+  validate_protocol_only
 
   if [[ "${INTEROP_REUSE_STACK:-0}" != "1" ]]; then
     compose down --remove-orphans -v >/dev/null 2>&1 || true
