@@ -661,11 +661,15 @@ impl TorrentTask {
             let peer_cmd_rx = self.register_peer(addr);
             let peer_event_tx = self.peer_event_tx.clone();
             let upload = self.upload_context();
+            let use_utp = outgoing_utp_enabled();
             tokio::spawn(async move {
                 let disconnect_tx = peer_event_tx.clone();
-                if let Err(e) =
+                let result = if use_utp {
+                    run_outgoing_utp_peer(addr, info_hash, peer_event_tx, peer_cmd_rx, upload).await
+                } else {
                     run_outgoing_peer(addr, info_hash, peer_event_tx, peer_cmd_rx, upload).await
-                {
+                };
+                if let Err(e) = result {
                     debug!(
                         component = "peer",
                         operation = "run_outgoing",
@@ -2677,6 +2681,10 @@ impl TorrentTask {
             }
         }
     }
+}
+
+fn outgoing_utp_enabled() -> bool {
+    std::env::var_os("TNG_ENABLE_UTP_OUTGOING").is_some()
 }
 
 fn collect_file_hints(

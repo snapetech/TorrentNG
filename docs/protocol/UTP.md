@@ -98,8 +98,8 @@ Before flipping `networking.utp_transport=true`, the engine still needs:
 
 - incoming UDP listener ownership next to the TCP listener;
 - demultiplexing by connection ID and remote address;
-- outbound peer dialing that chooses TCP or uTP based on tracker/DHT/PEX peer
-  source, user preference, and private-torrent policy;
+- default outbound peer dialing policy that chooses TCP or uTP based on
+  tracker/DHT/PEX peer source, user preference, and private-torrent policy;
 - peer-wire handshake over `UtpStream`;
 - metadata exchange over `UtpStream`;
 - piece request/response loops over `UtpStream`;
@@ -111,3 +111,10 @@ Before flipping `networking.utp_transport=true`, the engine still needs:
 
 Until those pieces are wired, `networking.utp_packet_codec=true` and
 `networking.utp_transport=false` is the honest app-level status.
+
+## Engine Integration Progress
+
+The engine peer loop now has a transport-neutral `PeerIo` adapter and an
+outbound `UtpStream` peer-wire path. It is intentionally behind the
+`TNG_ENABLE_UTP_OUTGOING` environment opt-in while the incoming UDP listener,
+connection demux, and policy defaults are still incomplete.
