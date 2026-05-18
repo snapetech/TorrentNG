@@ -1352,6 +1352,13 @@ run_qbit_mutation_facade_case() {
     "$(client_url torrentngd)/api/qb/v2/torrents/toggleFirstLastPiecePrio" >/dev/null || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
     --data-urlencode "hashes=$info_hash" \
+    --data-urlencode "peers=127.0.0.1:9" \
+    "$(client_url torrentngd)/api/qb/v2/torrents/addPeers" >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
+    --data-urlencode "hashes=$info_hash" \
+    "$(client_url torrentngd)/api/qb/v2/torrents/topPrio" >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
+    --data-urlencode "hashes=$info_hash" \
     "$(client_url torrentngd)/api/qb/v2/torrents/recheck" >/dev/null || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
     --data-urlencode "hash=$info_hash" \
@@ -1386,6 +1393,12 @@ run_qbit_mutation_facade_case() {
   curl --max-time "$CURL_MAX_TIME" -fsS -X PATCH -H "Authorization: Bearer $RUST_TOKEN" -H "Content-Type: application/json" \
     -d '{"add":["http://127.0.0.1:9/native-dead-announce"],"remove":["http://127.0.0.1:9/native-dead-announce"],"edit":[]}' \
     "$(client_url torrentngd)/api/v1/torrents/$info_hash/trackers" >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -X POST -H "Authorization: Bearer $RUST_TOKEN" -H "Content-Type: application/json" \
+    -d '{"peers":["127.0.0.1:9"]}' \
+    "$(client_url torrentngd)/api/v1/torrents/$info_hash/peers" >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -X POST -H "Authorization: Bearer $RUST_TOKEN" -H "Content-Type: application/json" \
+    -d "{\"hashes\":[\"$info_hash\"],\"move\":\"top\"}" \
+    "$(client_url torrentngd)/api/v1/torrents/queue" >/dev/null || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -X PUT -H "Authorization: Bearer $RUST_TOKEN" -H "Content-Type: application/json" \
     -d '{"download_limit":1048576,"upload_limit":524288,"seed_ratio_limit":null,"sequential_download":true}' \
     "$(client_url torrentngd)/api/v1/torrents/$info_hash/limits" >/dev/null || status="FAIL"
@@ -1405,8 +1418,8 @@ run_qbit_mutation_facade_case() {
   [[ "$(curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/qb/v2/transfer/uploadLimit" || true)" == "1048576" ]] || status="FAIL"
   [[ "$(curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/qb/v2/transfer/speedLimitsMode" || true)" == "1" ]] || status="FAIL"
   append_report "- Target: torrentngd qBittorrent-compatible mutation endpoints"
-  append_report "- Checked qBit facade: filePrio, torrent setDownloadLimit/setUploadLimit, transfer setDownloadLimit/setUploadLimit/toggleSpeedLimitsMode, setForceStart, setSuperSeeding, setAutoTMM, setAutoManagement, toggleFirstLastPiecePrio, recheck, addTrackers, editTracker, removeTrackers, trackers, files"
-  append_report "- Checked native REST: start, stop, update metadata, file priorities, tags, trackers, torrent limits, transfer limits, files/trackers/limits projection"
+  append_report "- Checked qBit facade: filePrio, torrent setDownloadLimit/setUploadLimit, transfer setDownloadLimit/setUploadLimit/toggleSpeedLimitsMode, setForceStart, setSuperSeeding, setAutoTMM, setAutoManagement, toggleFirstLastPiecePrio, addPeers, topPrio, recheck, addTrackers, editTracker, removeTrackers, trackers, files"
+  append_report "- Checked native REST: start, stop, update metadata, file priorities, tags, trackers, peers, queue, torrent limits, transfer limits, files/trackers/limits projection"
   append_report "- Fixture: multi-128m"
   append_report "- Info hash: $info_hash"
   append_report "- Status: **$status**"
