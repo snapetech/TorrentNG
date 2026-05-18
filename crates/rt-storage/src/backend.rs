@@ -11,29 +11,45 @@
 //! so disk I/O can neither starve nor be starved by unrelated
 //! `spawn_blocking` work.
 
+#[cfg(target_os = "linux")]
 use std::collections::HashMap;
 use std::fmt;
 use std::fs::File;
 use std::io;
+#[cfg(all(unix, not(target_os = "linux")))]
+use std::os::unix::fs::FileExt;
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::{FileExt, MetadataExt};
+#[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
+#[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
+#[cfg(target_os = "linux")]
 use io_uring::{opcode, types, IoUring};
 use tokio::sync::oneshot;
 
-use crate::frame::{Frame, RegisteredFrameSlot, RegisteredFrameSlots};
+use crate::frame::Frame;
+#[cfg(target_os = "linux")]
+use crate::frame::{RegisteredFrameSlot, RegisteredFrameSlots};
 
-const URING_ENTRIES: u32 = 256;
-const URING_BATCH_LIMIT: usize = 64;
-const URING_FILE_SLOTS: u32 = URING_ENTRIES;
 const DEFAULT_BACKEND_QUEUE_DEPTH: usize = 1024;
+#[cfg(target_os = "linux")]
+const URING_ENTRIES: u32 = 256;
+#[cfg(target_os = "linux")]
+const URING_BATCH_LIMIT: usize = 64;
+#[cfg(target_os = "linux")]
+const URING_FILE_SLOTS: u32 = URING_ENTRIES;
 /// Keep fixed buffer registration below common 8 MiB `RLIMIT_MEMLOCK`
 /// defaults. The backend can still batch more submissions than it has
 /// fixed-buffer slots; overflow submissions use ordinary read/write buffers.
+#[cfg(target_os = "linux")]
 const URING_FIXED_BUFFER_SLOTS: usize = 4;
+#[cfg(target_os = "linux")]
 const URING_FIXED_BUFFER_LEN: usize = 256 * 1024;
 
 /// Backend requested by configuration or environment.
@@ -126,6 +142,7 @@ pub struct SelectedDiskBackend {
 
 enum SelectedDiskBackendInner {
     Pread(PreadBackend),
+    #[cfg(target_os = "linux")]
     Uring(UringBackend),
 }
 
@@ -165,6 +182,11 @@ impl SelectedDiskBackend {
             ),
             BackendRequest::Uring => match UringBackend::probe() {
                 Ok(probe) if probe.usable => {
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        Self::pread(requested, threads, queue_depth, probe.reason)
+                    }
+                    #[cfg(target_os = "linux")]
                     Self::uring(requested, threads, queue_depth, probe.reason)
                 }
                 Ok(probe) => Self::pread(requested, threads, queue_depth, probe.reason),
@@ -207,6 +229,7 @@ impl SelectedDiskBackend {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn uring(
         requested: BackendRequest,
         threads: usize,
@@ -245,6 +268,7 @@ impl DiskBackend for SelectedDiskBackend {
     ) -> oneshot::Receiver<io::Result<Frame>> {
         match &self.inner {
             SelectedDiskBackendInner::Pread(backend) => backend.pread(file, frame, offset),
+            #[cfg(target_os = "linux")]
             SelectedDiskBackendInner::Uring(backend) => backend.pread(file, frame, offset),
         }
     }
@@ -257,6 +281,7 @@ impl DiskBackend for SelectedDiskBackend {
     ) -> oneshot::Receiver<io::Result<()>> {
         match &self.inner {
             SelectedDiskBackendInner::Pread(backend) => backend.pwrite(file, data, offset),
+            #[cfg(target_os = "linux")]
             SelectedDiskBackendInner::Uring(backend) => backend.pwrite(file, data, offset),
         }
     }
@@ -264,6 +289,7 @@ impl DiskBackend for SelectedDiskBackend {
     fn fdatasync(&self, file: Arc<File>) -> oneshot::Receiver<io::Result<()>> {
         match &self.inner {
             SelectedDiskBackendInner::Pread(backend) => backend.fdatasync(file),
+            #[cfg(target_os = "linux")]
             SelectedDiskBackendInner::Uring(backend) => backend.fdatasync(file),
         }
     }
@@ -271,6 +297,7 @@ impl DiskBackend for SelectedDiskBackend {
     fn supports_fixed_buffers(&self) -> bool {
         match &self.inner {
             SelectedDiskBackendInner::Pread(backend) => backend.supports_fixed_buffers(),
+            #[cfg(target_os = "linux")]
             SelectedDiskBackendInner::Uring(backend) => backend.supports_fixed_buffers(),
         }
     }
@@ -278,6 +305,7 @@ impl DiskBackend for SelectedDiskBackend {
     fn supports_registered_files(&self) -> bool {
         match &self.inner {
             SelectedDiskBackendInner::Pread(backend) => backend.supports_registered_files(),
+            #[cfg(target_os = "linux")]
             SelectedDiskBackendInner::Uring(backend) => backend.supports_registered_files(),
         }
     }
@@ -285,6 +313,7 @@ impl DiskBackend for SelectedDiskBackend {
     fn max_batch_len(&self) -> usize {
         match &self.inner {
             SelectedDiskBackendInner::Pread(backend) => backend.max_batch_len(),
+            #[cfg(target_os = "linux")]
             SelectedDiskBackendInner::Uring(backend) => backend.max_batch_len(),
         }
     }
@@ -292,6 +321,7 @@ impl DiskBackend for SelectedDiskBackend {
     fn fixed_buffer_len(&self) -> usize {
         match &self.inner {
             SelectedDiskBackendInner::Pread(backend) => backend.fixed_buffer_len(),
+            #[cfg(target_os = "linux")]
             SelectedDiskBackendInner::Uring(backend) => backend.fixed_buffer_len(),
         }
     }
@@ -299,6 +329,7 @@ impl DiskBackend for SelectedDiskBackend {
     fn fixed_buffer_strategy(&self) -> FixedBufferStrategy {
         match &self.inner {
             SelectedDiskBackendInner::Pread(backend) => backend.fixed_buffer_strategy(),
+            #[cfg(target_os = "linux")]
             SelectedDiskBackendInner::Uring(backend) => backend.fixed_buffer_strategy(),
         }
     }
@@ -314,6 +345,7 @@ pub struct UringProbe {
 }
 
 /// Linux `io_uring` backend.
+#[cfg(target_os = "linux")]
 pub struct UringBackend {
     tx: mpsc::SyncSender<Job>,
     _workers: Vec<thread::JoinHandle<()>>,
@@ -321,6 +353,10 @@ pub struct UringBackend {
     fixed_buffers_supported: Arc<AtomicBool>,
 }
 
+#[cfg(not(target_os = "linux"))]
+pub struct UringBackend;
+
+#[cfg(target_os = "linux")]
 impl UringBackend {
     pub fn try_new(threads: usize) -> io::Result<Self> {
         Self::try_new_with_queue_depth(threads, DEFAULT_BACKEND_QUEUE_DEPTH)
@@ -424,11 +460,25 @@ impl UringBackend {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+impl UringBackend {
+    pub fn probe() -> Result<UringProbe, String> {
+        Ok(UringProbe {
+            usable: false,
+            registered_files: false,
+            fixed_buffers: false,
+            reason: "io_uring is only available on Linux; using pread fallback".to_string(),
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn probe_registered_files(ring: &IoUring) -> io::Result<()> {
     ring.submitter().register_files_sparse(1)?;
     ring.submitter().unregister_files()
 }
 
+#[cfg(target_os = "linux")]
 fn probe_fixed_buffers(ring: &IoUring) -> io::Result<()> {
     let mut buffers = (0..URING_FIXED_BUFFER_SLOTS)
         .map(|_| vec![0u8; URING_FIXED_BUFFER_LEN])
@@ -446,6 +496,7 @@ fn probe_fixed_buffers(ring: &IoUring) -> io::Result<()> {
     ring.submitter().unregister_buffers()
 }
 
+#[cfg(target_os = "linux")]
 impl DiskBackend for UringBackend {
     fn pread(
         &self,
@@ -514,6 +565,7 @@ impl DiskBackend for UringBackend {
     }
 }
 
+#[cfg(target_os = "linux")]
 struct UringWorker {
     rx: Arc<Mutex<mpsc::Receiver<Job>>>,
     ring: IoUring,
@@ -525,12 +577,14 @@ struct UringWorker {
     pending: HashMap<u64, PendingUring>,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct FileIdentity {
     dev: u64,
     ino: u64,
 }
 
+#[cfg(target_os = "linux")]
 fn file_identity(file: &File) -> Option<FileIdentity> {
     let metadata = file.metadata().ok()?;
     Some(FileIdentity {
@@ -539,6 +593,7 @@ fn file_identity(file: &File) -> Option<FileIdentity> {
     })
 }
 
+#[cfg(target_os = "linux")]
 enum PendingUring {
     Read {
         file: Arc<File>,
@@ -559,6 +614,7 @@ enum PendingUring {
     },
 }
 
+#[cfg(target_os = "linux")]
 impl UringWorker {
     fn new(
         rx: Arc<Mutex<mpsc::Receiver<Job>>>,
@@ -900,6 +956,7 @@ impl UringWorker {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn uring_result(result: i32) -> io::Result<usize> {
     if result < 0 {
         Err(io::Error::from_raw_os_error(-result))
@@ -977,6 +1034,72 @@ enum Job {
     },
 }
 
+#[cfg(unix)]
+fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+    while !buf.is_empty() {
+        match file.read_at(buf, offset) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => {
+                offset += n as u64;
+                let (_, rest) = buf.split_at_mut(n);
+                buf = rest;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+    while !buf.is_empty() {
+        match file.seek_read(buf, offset) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => {
+                offset += n as u64;
+                let (_, rest) = buf.split_at_mut(n);
+                buf = rest;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+    while !buf.is_empty() {
+        match file.write_at(buf, offset) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => {
+                offset += n as u64;
+                buf = &buf[n..];
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+    while !buf.is_empty() {
+        match file.seek_write(buf, offset) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => {
+                offset += n as u64;
+                buf = &buf[n..];
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 /// `pread`/`pwrite` backend backed by a fixed pool of dedicated OS
 /// threads. Threads block on real syscalls; the async caller awaits a
 /// `oneshot`.
@@ -1034,9 +1157,7 @@ impl PreadBackend {
                     offset,
                     reply,
                 } => {
-                    let res = file
-                        .read_exact_at(frame.as_mut_slice(), offset)
-                        .map(|()| frame);
+                    let res = read_exact_at(&file, frame.as_mut_slice(), offset).map(|()| frame);
                     let _ = reply.send(res);
                 }
                 Job::Write {
@@ -1045,7 +1166,7 @@ impl PreadBackend {
                     offset,
                     reply,
                 } => {
-                    let _ = reply.send(file.write_all_at(&data, offset));
+                    let _ = reply.send(write_all_at(&file, &data, offset));
                 }
                 Job::Sync { file, reply } => {
                     let _ = reply.send(file.sync_data());
@@ -1268,6 +1389,7 @@ mod tests {
         assert!(!backend.fixed_buffer_strategy().uses_frame_pool_slots());
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn forced_uring_roundtrip_when_kernel_supports_it() {
         let probe = UringBackend::probe().unwrap();
@@ -1331,6 +1453,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn uring_fixed_buffer_registration_budget_stays_below_common_memlock_limit() {
         assert!(URING_FIXED_BUFFER_SLOTS < URING_BATCH_LIMIT);
@@ -1351,6 +1474,7 @@ mod tests {
         assert!(FixedBufferStrategy::FramePoolSlots.uses_frame_pool_slots());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn uring_strategy_reports_frame_pool_slots_only_with_registered_buffers() {
         let backend = UringBackend::try_new_with_queue_depth(1, 1);

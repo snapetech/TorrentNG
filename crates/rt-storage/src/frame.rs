@@ -293,6 +293,7 @@ impl RegisteredFrameSlots {
         })
     }
 
+    #[cfg(target_os = "linux")]
     pub fn iovecs(&self) -> Vec<libc::iovec> {
         self.buffers
             .iter()

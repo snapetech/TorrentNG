@@ -18,6 +18,8 @@ rt-hash = { path = "../rt-hash" }
 rt-metrics = { path = "../rt-metrics" }
 rt-path = { path = "../rt-path" }
 rt-piece-map = { path = "../rt-piece-map" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
 
 [dev-dependencies]
