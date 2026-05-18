@@ -79,7 +79,7 @@ the rewritten engine.
 | `GET`  | `/api/v1/torrents/:hash/trackers` | List trackers |
 | `PATCH` | `/api/v1/torrents/:hash/trackers` | Add/remove/edit trackers (`{ add: ["url"], remove: ["url"], edit: [{ orig_url, new_url }] }`); native daemon applies this by replacing the engine tracker list after the patch |
 | `GET`  | `/api/v1/torrents/:hash/files` | List files |
-| `PATCH` | `/api/v1/torrents/:hash/files` | Set file priorities (`{ files: [{index, priority}] }`); native daemon routes each file priority update through the engine |
+| `PATCH` | `/api/v1/torrents/:hash/files` | Set file priorities and/or paths (`{ files: [{index, priority, path}] }`); native daemon routes each file priority and rename update through the engine |
 | `PUT`  | `/api/v1/torrents/:hash/category` | Set or clear category (`{ category: "name" }`, or `null`/empty to clear) |
 | `PATCH` | `/api/v1/torrents/:hash/tags` | Add/remove tags (`{ add: ["a"], remove: ["b"] }`); native daemon routes tag changes through the engine label update path |
 | `GET` | `/api/v1/events` | Server-sent torrent delta stream |

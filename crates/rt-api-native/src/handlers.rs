@@ -544,7 +544,8 @@ pub async fn list_torrent_files(
 #[derive(Debug, Deserialize)]
 pub struct FilePriorityPatchItem {
     pub index: u32,
-    pub priority: i64,
+    pub priority: Option<i64>,
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -553,7 +554,7 @@ pub struct PatchFilesRequest {
     pub files: Vec<FilePriorityPatchItem>,
 }
 
-/// `PATCH /api/v1/torrents/{hash}/files` — update one or more file priorities.
+/// `PATCH /api/v1/torrents/{hash}/files` — update file priorities and/or paths.
 pub async fn patch_torrent_files(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -579,11 +580,32 @@ pub async fn patch_torrent_files(
 
     let mut failures = Vec::new();
     for item in req.files {
-        if let Err(e) = engine
-            .update_file_priorities(info_hash.clone(), vec![item.index], item.priority)
-            .await
+        let mut changed = false;
+        if let Some(priority) = item.priority {
+            changed = true;
+            if let Err(e) = engine
+                .update_file_priorities(info_hash.clone(), vec![item.index], priority)
+                .await
+            {
+                failures.push(format!("{} priority: {e}", item.index));
+            }
+        }
+        if let Some(path) = item
+            .path
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
         {
-            failures.push(format!("{}: {e}", item.index));
+            changed = true;
+            if let Err(e) = engine
+                .rename_file_path(info_hash.clone(), item.index, path.to_owned())
+                .await
+            {
+                failures.push(format!("{} path: {e}", item.index));
+            }
+        }
+        if !changed {
+            failures.push(format!("{}: priority or path is required", item.index));
         }
     }
     if failures.is_empty() {

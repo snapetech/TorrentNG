@@ -336,11 +336,8 @@ impl TorrentBackend for QbittorrentBackend {
     }
 
     async fn rename_torrent(&self, hash: &str, name: &str) -> Result<()> {
-        self.post_form(
-            "api/v2/torrents/rename",
-            &[("hash", hash), ("name", name)],
-        )
-        .await
+        self.post_form("api/v2/torrents/rename", &[("hash", hash), ("name", name)])
+            .await
     }
 
     async fn rename_file(&self, hash: &str, file_index: usize, name: &str) -> Result<()> {

@@ -323,7 +323,8 @@ impl TorrentBackend for DelugeBackend {
     }
 
     async fn set_location(&self, hash: &str, location: &str) -> Result<()> {
-        self.rpc("core.move_storage", json!([[hash], location])).await?;
+        self.rpc("core.move_storage", json!([[hash], location]))
+            .await?;
         Ok(())
     }
 

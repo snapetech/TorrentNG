@@ -294,6 +294,37 @@ impl TorrentBackend for TorrentngBackend {
         Ok(())
     }
 
+    async fn set_location(&self, hash: &str, location: &str) -> Result<()> {
+        self.request(reqwest::Method::PUT, &format!("api/v1/torrents/{hash}"))?
+            .json(&json!({ "save_path": location }))
+            .send()
+            .await
+            .with_context(|| format!("TorrentNG PUT torrent {hash} location"))?
+            .error_for_status()
+            .with_context(|| format!("TorrentNG PUT torrent {hash} location"))?;
+        Ok(())
+    }
+
+    async fn rename_torrent(&self, hash: &str, name: &str) -> Result<()> {
+        self.request(reqwest::Method::PUT, &format!("api/v1/torrents/{hash}"))?
+            .json(&json!({ "name": name }))
+            .send()
+            .await
+            .with_context(|| format!("TorrentNG PUT torrent {hash} name"))?
+            .error_for_status()
+            .with_context(|| format!("TorrentNG PUT torrent {hash} name"))?;
+        Ok(())
+    }
+
+    async fn rename_file(&self, hash: &str, file_index: usize, name: &str) -> Result<()> {
+        self.patch_json(
+            &format!("api/v1/torrents/{hash}/files"),
+            json!({ "files": [{ "index": file_index, "path": name }] }),
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn add_tags(&self, hash: &str, tags: &[&str]) -> Result<()> {
         self.patch_json(
             &format!("api/v1/torrents/{hash}/tags"),

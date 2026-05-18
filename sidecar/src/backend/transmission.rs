@@ -478,11 +478,7 @@ fn string(value: &Value, key: &str) -> String {
 fn int(value: &Value, key: &str) -> i64 {
     value
         .get(key)
-        .and_then(|value| {
-            value
-                .as_i64()
-                .or_else(|| value.as_bool().map(i64::from))
-        })
+        .and_then(|value| value.as_i64().or_else(|| value.as_bool().map(i64::from)))
         .unwrap_or(0)
 }
 

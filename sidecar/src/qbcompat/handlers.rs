@@ -1137,13 +1137,13 @@ async fn torrents_set_category(
         }
         if let Err(e) = s.backend.set_category(&hash, category).await {
             tracing::warn!(
-                component = "rtorrent",
+                component = "backend",
                 operation = "set_category",
                 torrent = %hash,
                 category = %category,
                 result = "error",
                 error = %e,
-                "rTorrent category update failed"
+                "backend category update failed"
             );
         }
     }
@@ -1594,7 +1594,7 @@ async fn torrents_rename(State(s): State<AppState>, Form(f): Form<RenameForm>) -
     let Some(name) = f.name else {
         return StatusCode::BAD_REQUEST;
     };
-    if let Err(e) = s.rt.rename_torrent(&hash, &name).await {
+    if let Err(e) = s.backend.rename_torrent(&hash, &name).await {
         tracing::warn!(
             component = "qbcompat",
             operation = "rename_torrent",
@@ -1627,7 +1627,7 @@ async fn torrents_rename_file(
     let Some(name) = f.name else {
         return StatusCode::BAD_REQUEST;
     };
-    if let Err(e) = s.rt.rename_file(&hash, id, &name).await {
+    if let Err(e) = s.backend.rename_file(&hash, id, &name).await {
         tracing::warn!(
             component = "qbcompat",
             operation = "rename_file",
@@ -1660,9 +1660,10 @@ async fn torrents_set_share_limits(
         .unwrap_or(-2);
     let seeding_time_limit = f.seeding_time_limit.unwrap_or(-2);
     for hash in split_hashes(&s.db, f.hashes.as_deref()) {
-        if let Err(e) =
-            s.rt.set_share_limits(&hash, ratio_limit_milli, seeding_time_limit)
-                .await
+        if let Err(e) = s
+            .backend
+            .set_share_limits(&hash, ratio_limit_milli, seeding_time_limit)
+            .await
         {
             tracing::warn!(
                 component = "qbcompat",
@@ -1719,14 +1720,14 @@ async fn torrents_set_location(
                 "cache torrent existence check failed"
             ),
         }
-        if let Err(e) = s.rt.set_location(&hash, location).await {
+        if let Err(e) = s.backend.set_location(&hash, location).await {
             tracing::warn!(
-                component = "rtorrent",
+                component = "backend",
                 operation = "set_location",
                 torrent = %hash,
                 result = "error",
                 error = %e,
-                "rTorrent location update failed"
+                "backend location update failed"
             );
         }
     }
@@ -1743,7 +1744,7 @@ async fn torrents_toggle_sequential_download(
     Form(f): Form<ToggleSequentialForm>,
 ) -> StatusCode {
     for hash in split_hashes(&s.db, f.hashes.as_deref()) {
-        if let Err(e) = s.rt.toggle_sequential_download(&hash).await {
+        if let Err(e) = s.backend.toggle_sequential_download(&hash).await {
             tracing::warn!(
                 component = "qbcompat",
                 operation = "toggle_sequential_download",

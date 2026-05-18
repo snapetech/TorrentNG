@@ -1465,7 +1465,7 @@ pub async fn run_workflow(
                     errors.push(format!("{hash}: target_path is not configured"));
                     continue;
                 };
-                match s.rt.set_location(&hash, target_path).await {
+                match s.backend.set_location(&hash, target_path).await {
                     Ok(()) => {
                         if let Err(e) = s.db.set_torrent_location(&hash, target_path) {
                             errors.push(format!("{hash}: {e}"));
@@ -1814,8 +1814,8 @@ pub async fn update_torrent(
         }
     }
 
-    if let Err(e) = s.rt.set_location(&hash, save_path).await {
-        tracing::error!(component = "rtorrent", operation = "set_location", result = "error", torrent = %hash, error = %e, "rTorrent location update failed");
+    if let Err(e) = s.backend.set_location(&hash, save_path).await {
+        tracing::error!(component = "api", operation = "set_location", result = "error", torrent = %hash, error = %e, "backend location update failed");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     if let Err(e) = s.db.set_torrent_location(&hash, save_path) {
@@ -2280,13 +2280,13 @@ pub async fn set_torrent_category(
         }
     }
 
-    // Persist to DB and push to rTorrent (d.custom1 = category name)
+    // Persist to DB and push to the selected backend.
     if let Err(e) = s.db.set_torrent_category(&hash, &body.category) {
         tracing::error!(component = "cache", operation = "set_category", result = "error", torrent = %hash, category = %body.category, error = %e, "cache category update failed");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     if let Err(e) = s.backend.set_category(&hash, &body.category).await {
-        tracing::warn!(component = "rtorrent", operation = "set_category", result = "error", torrent = %hash, category = %body.category, error = %e, "rTorrent category update failed");
+        tracing::warn!(component = "backend", operation = "set_category", result = "error", torrent = %hash, category = %body.category, error = %e, "backend category update failed");
     }
     emit_torrent_updated(&s, &hash);
     emit(&s, Event::CategoriesUpdated);
@@ -2472,7 +2472,7 @@ pub async fn bulk_action(
                         continue;
                     }
                 }
-                match s.rt.set_location(hash, save_path).await {
+                match s.backend.set_location(hash, save_path).await {
                     Ok(()) => {
                         if let Err(e) = s.db.set_torrent_location(hash, save_path) {
                             errors.push(format!("{hash}: {e}"));
