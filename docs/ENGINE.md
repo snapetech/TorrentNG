@@ -54,7 +54,7 @@ crates/
   rt-peer-manager/    — connection pool, choking, unchoking, peer scoring, ban rules
   rt-piece-picker/    — rarest-first, endgame, file priority
   rt-dht/             — DHT (Phase 10, private-tracker-off by default)
-  rt-utp/             — uTP packet codec and transport-state primitives (Phase 10)
+  rt-utp/             — uTP packet codec, transport state, and async UDP stream primitives (Phase 10)
   rt-session/         — torrent lifecycle types and registry
   rt-db/              — SQLite schema, durable rows, events, jobs, labels, storage roots
   rt-api-model/       — shared API types (serde)
@@ -213,8 +213,9 @@ Moving 200+ TB is a database migration, not a file copy:
 ### Peer connection manager
 
 - TCP listener
-- uTP packet codec and connection-state support; full socket transport remains
-  behind the runtime capability `networking.utp_transport=false`
+- uTP packet codec, connection-state support, and async UDP stream primitives;
+  engine peer-wire integration remains behind the runtime capability
+  `networking.utp_transport=false`
 - Outgoing connection queue with backpressure
 - Per-torrent and global peer caps
 - Peer scoring and ban/eject rules

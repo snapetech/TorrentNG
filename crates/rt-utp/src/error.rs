@@ -41,4 +41,10 @@ pub enum UtpError {
         oldest_unacked: u16,
         newest_sent: u16,
     },
+
+    #[error("uTP I/O error: {0}")]
+    Io(String),
+
+    #[error("uTP operation timed out")]
+    Timeout,
 }

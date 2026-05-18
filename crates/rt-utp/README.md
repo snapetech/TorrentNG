@@ -7,11 +7,12 @@ uTP packet and transport-state primitives for the native engine.
 This crate currently provides BEP 29 fixed-header parsing/encoding, full packet
 payload framing, extension-chain parsing/encoding with truncation and
 oversized-extension validation, selective ACK helpers, connection ID derivation,
-state transitions, send-window accounting, RTT sampling, and retransmit timeout
-tracking.
+state transitions, send-window accounting, RTT sampling, retransmit timeout
+tracking, and an async UDP `UtpListener`/`UtpStream` transport with SYN/STATE
+handshake, DATA/ACK exchange, FIN close, and bounded retransmission attempts.
 
-Full uTP socket transport integration remains a native-engine hardening item:
-the remaining work is the async UDP driver that wires these primitives to
-peer-wire handshakes, retransmission scheduling, and engine peer lifecycle. The
-native `/health` capability manifest reports this split explicitly as
-`networking.utp_packet_codec=true` and `networking.utp_transport=false`.
+Full native-engine uTP integration remains a hardening item: the remaining work
+is wiring `UtpStream` into peer-wire handshakes, peer selection, incoming peer
+dispatch, and engine lifecycle. The native `/health` capability manifest reports
+this split explicitly as `networking.utp_packet_codec=true` and
+`networking.utp_transport=false` until that end-to-end engine path is active.

@@ -260,9 +260,10 @@ Full UI replacing the Track 1 WebUI, backed by the native engine API. Same desig
 ## Track 2 — Phase 10: DHT / PEX / LSD / uTP
 
 Implemented for DHT policy, DHT peer discovery plumbing, PEX policy/parsing, and
-uTP packet-codec/state primitives. Full uTP socket transport is not advertised as
-a runtime capability until the native engine can accept and initiate BEP 29
-transfers. Private-tracker profiles keep DHT/PEX/LSD disabled by default;
+uTP packet-codec/state plus async UDP transport primitives. Full uTP engine
+transport is not advertised as a runtime capability until the native engine can
+accept and initiate BEP 29 peer-wire transfers. Private-tracker profiles keep
+DHT/PEX/LSD disabled by default;
 public-swarm certification remains the release quality bar.
 
 ## Track 2 — Phase 11: BEP 52 / v2 / hybrid torrents
