@@ -1413,6 +1413,7 @@ dependencies = [
  "rt-session",
  "rt-storage",
  "rt-tracker",
+ "rt-utp",
  "rusqlite",
  "serde",
  "serde_json",

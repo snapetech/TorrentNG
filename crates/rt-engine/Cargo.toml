@@ -37,6 +37,7 @@ rt-piece-map   = { path = "../rt-piece-map" }
 rt-storage     = { path = "../rt-storage" }
 rt-tracker     = { path = "../rt-tracker" }
 rt-metrics     = { path = "../rt-metrics" }
+rt-utp         = { path = "../rt-utp" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

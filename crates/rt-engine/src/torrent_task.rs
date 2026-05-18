@@ -50,6 +50,7 @@ use rt_tracker::{
     AnnounceRequest, AnnounceResponse, InfoHash, ScrapeStats, TrackerError, TrackerEvent,
     TrackerState, TrackerStatus,
 };
+use rt_utp::UtpStream;
 
 use crate::peer_id::OUR_PEER_ID;
 use crate::{EnginePeerSnapshot, EngineWebseedSnapshot, TorrentRuntimeStats};
@@ -2941,17 +2942,55 @@ async fn run_outgoing_peer(
         remote_hs.reserved.supports_extension_protocol()
     };
 
+    let mut peer_io = PeerIo::Tcp(framed);
     send_extension_handshake(
-        &mut framed,
+        &mut peer_io,
         upload.metadata.as_ref(),
         upload.is_private,
         remote_supports_extension,
     )
     .await?;
-    send_have_state(&mut framed, &upload.have_pieces).await?;
-    framed.send(Message::Interested).await?;
+    send_have_state(&mut peer_io, &upload.have_pieces).await?;
+    peer_io.send(Message::Interested).await?;
 
-    run_peer_loop(addr, framed, peer_event_tx, peer_cmd_rx, upload).await
+    run_peer_loop(addr, peer_io, peer_event_tx, peer_cmd_rx, upload).await
+}
+
+async fn run_outgoing_utp_peer(
+    addr: SocketAddr,
+    info_hash: [u8; 20],
+    peer_event_tx: mpsc::Sender<PeerEvent>,
+    peer_cmd_rx: mpsc::Receiver<PeerCommand>,
+    upload: UploadContext,
+) -> anyhow::Result<()> {
+    let mut stream = UtpStream::connect(addr).await?;
+    let our_hs = Handshake {
+        info_hash,
+        peer_id: OUR_PEER_ID,
+        reserved: ExtensionFlags::with_extension_protocol(),
+    };
+    stream.write_all(&our_hs.encode()).await?;
+
+    let mut hs_buf = [0u8; 68];
+    stream.read_exact(&mut hs_buf).await?;
+    let remote_hs = Handshake::parse(&hs_buf)?;
+    if remote_hs.info_hash != info_hash {
+        anyhow::bail!("info_hash mismatch from {addr}");
+    }
+    let remote_supports_extension = remote_hs.reserved.supports_extension_protocol();
+
+    let mut peer_io = PeerIo::Utp(UtpPeerIo { stream });
+    send_extension_handshake(
+        &mut peer_io,
+        upload.metadata.as_ref(),
+        upload.is_private,
+        remote_supports_extension,
+    )
+    .await?;
+    send_have_state(&mut peer_io, &upload.have_pieces).await?;
+    peer_io.send(Message::Interested).await?;
+
+    run_peer_loop(addr, peer_io, peer_event_tx, peer_cmd_rx, upload).await
 }
 
 async fn run_incoming_peer(
@@ -2976,21 +3015,75 @@ async fn run_incoming_peer(
         framed.get_mut().write_all(&our_hs.encode()).await?;
     }
 
+    let mut peer_io = PeerIo::Tcp(framed);
     send_extension_handshake(
-        &mut framed,
+        &mut peer_io,
         upload.metadata.as_ref(),
         upload.is_private,
         remote_supports_extension,
     )
     .await?;
-    send_have_state(&mut framed, &upload.have_pieces).await?;
-    framed.send(Message::Interested).await?;
-    run_peer_loop(addr, framed, peer_event_tx, peer_cmd_rx, upload).await
+    send_have_state(&mut peer_io, &upload.have_pieces).await?;
+    peer_io.send(Message::Interested).await?;
+    run_peer_loop(addr, peer_io, peer_event_tx, peer_cmd_rx, upload).await
+}
+
+enum PeerIo {
+    Tcp(Framed<TcpStream, PeerCodec>),
+    Utp(UtpPeerIo),
+}
+
+struct UtpPeerIo {
+    stream: UtpStream,
+}
+
+impl PeerIo {
+    async fn send(&mut self, msg: Message) -> anyhow::Result<()> {
+        match self {
+            PeerIo::Tcp(framed) => framed.send(msg).await.map_err(Into::into),
+            PeerIo::Utp(io) => io.send(msg).await,
+        }
+    }
+
+    async fn next(&mut self) -> anyhow::Result<Option<Message>> {
+        match self {
+            PeerIo::Tcp(framed) => match framed.next().await {
+                Some(result) => result.map(Some).map_err(Into::into),
+                None => Ok(None),
+            },
+            PeerIo::Utp(io) => io.next().await,
+        }
+    }
+}
+
+impl UtpPeerIo {
+    async fn send(&mut self, msg: Message) -> anyhow::Result<()> {
+        self.stream.write_all(&msg.encode()).await?;
+        Ok(())
+    }
+
+    async fn next(&mut self) -> anyhow::Result<Option<Message>> {
+        let mut len_buf = [0u8; 4];
+        match self.stream.read_exact(&mut len_buf).await {
+            Ok(()) => {}
+            Err(rt_utp::UtpError::Closed) => return Ok(None),
+            Err(err) => return Err(err.into()),
+        }
+        let len = u32::from_be_bytes(len_buf);
+        if len > rt_peer_wire::message::MAX_MESSAGE_LEN {
+            anyhow::bail!("peer message too large: {len}");
+        }
+        let mut payload = vec![0u8; len as usize];
+        if len > 0 {
+            self.stream.read_exact(&mut payload).await?;
+        }
+        Ok(Some(Message::parse(&payload)?))
+    }
 }
 
 async fn run_peer_loop(
     addr: SocketAddr,
-    mut framed: Framed<TcpStream, PeerCodec>,
+    mut peer_io: PeerIo,
     peer_event_tx: mpsc::Sender<PeerEvent>,
     mut peer_cmd_rx: mpsc::Receiver<PeerCommand>,
     mut upload: UploadContext,
@@ -3005,7 +3098,7 @@ async fn run_peer_loop(
             Some(cmd) = peer_cmd_rx.recv() => {
                 match cmd {
                     PeerCommand::Request(req) => {
-                        framed.send(Message::Request {
+                        peer_io.send(Message::Request {
                             piece: req.piece,
                             begin: req.begin,
                             length: req.length,
@@ -3016,26 +3109,26 @@ async fn run_peer_loop(
                         if let Some(has_piece) = upload.have_pieces.get_mut(piece as usize) {
                             *has_piece = true;
                         }
-                        framed.send(Message::Have(piece)).await?;
+                        peer_io.send(Message::Have(piece)).await?;
                     }
                     PeerCommand::Choke => {
                         upload_choked = true;
-                        framed.send(Message::Choke).await?;
+                        peer_io.send(Message::Choke).await?;
                     }
                     PeerCommand::Unchoke => {
                         upload_choked = false;
-                        framed.send(Message::Unchoke).await?;
+                        peer_io.send(Message::Unchoke).await?;
                     }
                     PeerCommand::Shutdown => {
                         break;
                     }
                 }
             }
-            msg_result = framed.next() => {
-                let Some(msg_result) = msg_result else {
+            msg_result = peer_io.next() => {
+                let Some(msg) = msg_result? else {
                     break;
                 };
-                match msg_result? {
+                match msg {
                     Message::Bitfield(bits) => {
                         let pieces = match bitfield_to_pieces(&bits, upload.have_pieces.len()) {
                             Ok(pieces) => pieces,
@@ -3119,7 +3212,7 @@ async fn run_peer_loop(
                             match read_upload_block(&upload, piece, begin, length).await {
                                 Ok(block) => {
                                     let bytes = block.data.len() as u64;
-                                    framed.send(Message::Piece {
+                                    peer_io.send(Message::Piece {
                                         piece,
                                         begin,
                                         data: block.data.to_vec(),
@@ -3205,7 +3298,7 @@ async fn run_peer_loop(
                                     .as_ref()
                                     .map(|metadata| metadata_response(piece, metadata))
                                     .unwrap_or(UtMetadataMessage::Reject { piece });
-                                framed.send(Message::Extended {
+                                peer_io.send(Message::Extended {
                                     ext_id: LOCAL_UT_METADATA_ID,
                                     payload: response.encode(),
                                 }).await?;
@@ -3280,14 +3373,14 @@ async fn run_peer_loop(
 }
 
 async fn send_extension_handshake(
-    framed: &mut Framed<TcpStream, PeerCodec>,
+    peer_io: &mut PeerIo,
     metadata: Option<&Arc<Vec<u8>>>,
     is_private: bool,
     remote_supports_extension: bool,
 ) -> anyhow::Result<()> {
     if remote_supports_extension {
         let handshake = extension_handshake_for_torrent(metadata, is_private);
-        framed
+        peer_io
             .send(Message::Extended {
                 ext_id: EXT_HANDSHAKE_ID,
                 payload: handshake.encode(),
@@ -3340,13 +3433,10 @@ impl OutstandingRequest {
     }
 }
 
-async fn send_have_state(
-    framed: &mut Framed<TcpStream, PeerCodec>,
-    have_pieces: &[bool],
-) -> anyhow::Result<()> {
+async fn send_have_state(peer_io: &mut PeerIo, have_pieces: &[bool]) -> anyhow::Result<()> {
     let bitfield = pieces_to_bitfield(have_pieces);
     if bitfield.iter().any(|byte| *byte != 0) {
-        framed.send(Message::Bitfield(bitfield)).await?;
+        peer_io.send(Message::Bitfield(bitfield)).await?;
     }
     Ok(())
 }
