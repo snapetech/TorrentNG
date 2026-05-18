@@ -85,7 +85,7 @@ Universal compatibility release rule:
 | Source client | Expected state sources | TorrentNG import entry point | Fields to preserve | Current status | Tests required |
 |---|---|---|---|---|---|
 | qBittorrent | `.torrent`, `.fastresume`, libtorrent resume keys | `dry_run_qbittorrent_backup_with_options` | info hash, name, save path, category, tags, added/completed times, paused/completed state, uploaded/downloaded, piece states, partial pieces, file priority/wanted/completed bytes, trackers | Native import implemented; JSON and bencoded alias matrix covered | Golden qBit profile with all fields; path remap; conflicting piece count |
-| rTorrent | session `.torrent`, file layout, custom fields when available | `dry_run_rtorrent_session_with_options` | info hash, name, base path, size, completion by file verification, custom label fields | Partial | XMLRPC/session fixture with `d.custom*`, complete/missing files |
+| rTorrent | session `.torrent`, `.rtorrent` resume sidecars, file layout, `d.custom*` | `dry_run_rtorrent_session_with_options` | info hash, name, directory/save path, `d.custom1` label, counters, completed state; complete-state piece synthesis when files are present | Native import implemented; complete torrents synthesise trusted seed state (recheck-free), partials verification-first (sidecar has no decodable partial bitfield) | `round_trip_matrix.rs` rTorrent complete/partial; session fixture with `d.custom*`, missing/resized files |
 | Transmission | `.torrent`, resume sidecars, legacy and 4.x key names | `dry_run_transmission_session_with_options` | download dir, labels, counters, timestamps, paused/completed, bitfield/have/valid pieces, file wanted/priority/progress, tracker stats | Native import implemented; JSON and bencoded alias matrix covered | Transmission profile with old and new key spellings |
 | Deluge | `state`, `torrents.state`, `.fastresume`, libtorrent resume | `dry_run_deluge_state_with_options` | download location, label, counters, timestamps, paused/completed, pieces, file wanted/priority/progress, trackers | Native import implemented; JSON and bencoded alias matrix covered | Deluge state fixture plus JSON-RPC field projection comparison |
 | uTorrent/BitTorrent Classic | `resume.dat`, `.dat` bencode, raw hash keys | `dry_run_utorrent_config_with_options` | path/rootdir, labels, counters, timestamps, state flags, pieces/bitfield, file priorities | Native import implemented; aggregate and bencoded alias matrix covered | `resume.dat` corpus with single/multi-file and skipped files |
@@ -93,13 +93,29 @@ Universal compatibility release rule:
 | Tixati | config directory, `.torrent`, sidecar-like state | `dry_run_tixati_config_with_options` | metadata, path hints, counters/timestamps/progress if discoverable | Verification-first import; common bencoded alias matrix covered | Tixati fixture corpus; document unknown/private fields |
 | Generic directory | `.torrent` plus adjacent JSON/bencode sidecars | `dry_run_generic_torrent_directory_with_options` | metadata, path remaps, sidecar resume hints | Native; aggregate `resume.dat` detection and JSON/bencoded alias matrices covered | Recursive fixture with symlink, oversized sidecar, path remap |
 
-Reverse export is implemented in `rt_migrate::export` for qBittorrent/Deluge
-libtorrent fastresume, Transmission `torrents/` + `resume/`, rTorrent session
-sidecars, uTorrent/BitTorrent Classic `resume.dat`, BiglyBT/Vuze
-`downloads.config`, and generic `.torrent` + manifest output. The unit matrix
-round-trips each emitted format through the corresponding importer where the
-target format supports it. Export fidelity is reported as recheck-free,
-complete-only, metadata-only, or torrent-only.
+### Reverse export matrix (`torrentngd export` / `rt_migrate::export`)
+
+Export reads native state read-only (DB rows + persisted `.torrent` blobs +
+fast-resume) and writes the target client's on-disk layout. Fidelity is
+reported per torrent as recheck-free / complete-only / metadata-only /
+torrent-only.
+
+| Target | `--format` | Layout written | Fidelity | Round-trip test |
+|---|---|---|---|---|
+| qBittorrent / Deluge | `libtorrent` | `<hash>.torrent` + `<hash>.fastresume` | Recheck-free, partials included | `round_trip_matrix.rs` |
+| Transmission | `transmission` | `torrents/` + `resume/` | Recheck-free, partials included | `round_trip_matrix.rs` |
+| rTorrent | `rtorrent` | `<hash>.torrent` + `<hash>.rtorrent` | Recheck-free for complete; partials metadata-only | `round_trip_matrix.rs` |
+| uTorrent/BitTorrent Classic | `utorrent` | aggregate `resume.dat` | Recheck-free, whole-piece granularity | `round_trip_matrix.rs` |
+| BiglyBT/Vuze | `biglybt` | aggregate `downloads.config` | Recheck-free, whole-piece granularity | `round_trip_matrix.rs` |
+| Tixati | _(none)_ | use `generic` | Proprietary progress format has no encoder | covered via generic |
+| Generic / any | `generic` | `<hash>.torrent` files + `manifest.json` | Torrent-only; destination rechecks | `round_trip_matrix.rs` |
+
+Certification: `crates/rt-migrate/tests/round_trip_matrix.rs` exercises every
+client across IMPORT, EXPORT, and ROUND-TRIP (export → re-import) directions
+with ISO-shaped single-file and multi-file fixtures in both complete and
+partial state, and is reported by
+`scripts/migration_corpus_certification.sh` under "Bidirectional Round-Trip
+Matrix".
 
 ## 3. qBittorrent API Matrix
 

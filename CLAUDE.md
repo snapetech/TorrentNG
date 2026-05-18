@@ -70,6 +70,24 @@ rTorrent/libTorrent remains a strong baseline for large headless seed libraries:
 - ruTorrent 10k+ torrent UI is sluggish (hotfix shipped in v5.2.10)
 - No clean daemon/API/event model — everything is PHP polling XMLRPC
 
+## torrentngd CLI subcommands
+
+`crates/torrentngd` is daemon-first, but `argv[1]` dispatches two offline
+state tools before the daemon starts (run via `spawn_blocking`):
+
+- `torrentngd migrate --source <client> --from <dir> [--apply]` — import other
+  clients' state into the native model. Dry-run by default; `--apply` writes
+  DB rows + `rt-fastresume` state and persists `.torrent` blobs into
+  `session_dir/torrents`. `--remap OLD=NEW`, `--policy verify|trust-hints|trust-all`.
+- `torrentngd export --format <client> --to <dir> [--apply]` — reverse
+  migration (anti-lock-in). Reads native state read-only, writes the target
+  client layout.
+
+Both reuse `crates/rt-migrate` (`rt_migrate::export` for the reverse path) and
+report fidelity buckets. Source code: `crates/torrentngd/src/{migrate,export}.rs`.
+Certification: `crates/rt-migrate/tests/round_trip_matrix.rs` (all clients ×
+import/export/round-trip) plus `scripts/migration_corpus_certification.sh`.
+
 ## sidecar — Rust daemon
 
 **Entry:** `sidecar/src/main.rs`

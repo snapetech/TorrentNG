@@ -32,8 +32,10 @@ certified status.
 - [CONFIGURATION.md](CONFIGURATION.md) - native and sidecar config references.
 - [BACKUP_RESTORE.md](BACKUP_RESTORE.md) - native state backup, restore, and
   migration rollback.
-- [MIGRATION.md](MIGRATION.md) - importing state from rTorrent, qBittorrent, and
-  Transmission.
+- [MIGRATION.md](MIGRATION.md) - `torrentngd migrate` (import) and
+  `torrentngd export` (reverse / leave) for rTorrent, qBittorrent, Deluge,
+  Transmission, uTorrent, BiglyBT, Tixati, and generic state, with fidelity
+  rules and rollback.
 
 ## APIs And Compatibility
 

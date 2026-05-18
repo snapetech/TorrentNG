@@ -74,6 +74,34 @@ Add observability with Prometheus and Grafana:
 docker compose -f deploy/native/compose.yml --profile observability up --build
 ```
 
+## Migrate In And Out
+
+No lock-in: `torrentngd` has first-class subcommands to move a whole library
+**into** the native engine and back **out** to another client. Both default to
+a read-only dry-run with a fidelity summary; `--apply` performs the change.
+
+```sh
+# Import an existing client's state (read-only source; --apply to write)
+torrentngd migrate --source qbittorrent --from ~/.local/share/qBittorrent/BT_backup --apply
+torrentngd migrate --source rtorrent --from ~/.rtorrent-session --remap /old=/data --apply
+
+# Leave for another client, keeping seeding state where the format allows it
+torrentngd export --format libtorrent   --to /tmp/leaving --apply   # qBittorrent/Deluge
+torrentngd export --format transmission --to /tmp/leaving --apply
+torrentngd export --format generic      --to /tmp/leaving --apply   # universal valve
+```
+
+Supported both directions: qBittorrent, Deluge, Transmission, rTorrent,
+uTorrent/BitTorrent Classic, BiglyBT/Vuze, and a generic `.torrent` + manifest
+path. Tixati imports metadata (its progress format is proprietary; `generic`
+is its exit). libtorrent/Transmission/uTorrent/BiglyBT carry the full piece
+map so completed *and* in-progress torrents resume without a full recheck;
+rTorrent is recheck-free for complete torrents. Dry-run and post-apply
+summaries bucket every torrent as recheck-free / complete-only /
+metadata-only / torrent-only. See
+[docs/MIGRATION.md](docs/MIGRATION.md) for the full guide, fidelity rules, and
+rollback.
+
 ## rTorrent Mode
 
 Start the rTorrent-backed stack when you need the historical engine path:

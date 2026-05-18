@@ -117,6 +117,25 @@ fi
 
 {
   echo
+  echo "## Bidirectional Round-Trip Matrix"
+  echo
+  echo "Every supported client x import/export/round-trip direction, with"
+  echo "ISO-shaped single-file and multi-file fixtures and complete + partial"
+  echo "piece state. Source: \`crates/rt-migrate/tests/round_trip_matrix.rs\`."
+  echo
+  echo '```text'
+} >> "$OUT"
+
+if (cd "$ROOT" && cargo test -p rt-migrate --test round_trip_matrix) >> "$OUT" 2>&1; then
+  echo '```' >> "$OUT"
+else
+  echo '```' >> "$OUT"
+  status="FAIL"
+  failed=1
+fi
+
+{
+  echo
   echo "## Exported Corpus Coverage"
   echo
   echo "| Source family | Result | Evidence files | Evidence root |"
