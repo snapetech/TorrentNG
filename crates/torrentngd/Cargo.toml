@@ -16,13 +16,20 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
 
+rusqlite.workspace = true
+
 axum.workspace = true
 rt-config     = { path = "../rt-config" }
 rt-logging    = { path = "../rt-logging" }
 rt-engine     = { path = "../rt-engine" }
 rt-session    = { path = "../rt-session" }
 rt-db         = { path = "../rt-db" }
+rt-migrate    = { path = "../rt-migrate" }
+rt-fastresume = { path = "../rt-fastresume" }
 rt-api-native = { path = "../rt-api-native" }
 rt-api-qbit   = { path = "../rt-api-qbit" }
 rt-api-transmission = { path = "../rt-api-transmission" }
 rt-api-deluge = { path = "../rt-api-deluge" }
+
+[dev-dependencies]
+tempfile.workspace = true

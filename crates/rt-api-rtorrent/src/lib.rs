@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use base64::{engine::general_purpose, Engine as _};
 use rt_engine::{
@@ -18,6 +21,7 @@ pub struct AppState {
     pub session_path: String,
     pub network_port: i64,
     custom: Arc<RwLock<BTreeMap<String, BTreeMap<String, RtValue>>>>,
+    views: Arc<RwLock<BTreeSet<String>>>,
 }
 
 impl AppState {
@@ -28,6 +32,7 @@ impl AppState {
             session_path: String::new(),
             network_port: 0,
             custom: Arc::new(RwLock::new(BTreeMap::new())),
+            views: Arc::new(RwLock::new(default_rtorrent_views())),
         }
     }
 
@@ -90,6 +95,8 @@ pub fn supported_methods() -> &'static [&'static str] {
         "throttle.global_down.max_rate",
         "throttle.global_up.max_rate",
         "view.list",
+        "view.add",
+        "view.set",
         "view.size",
         "d.hash",
         "d.name",
@@ -146,12 +153,8 @@ pub async fn execute(
         "network.port_random" => Ok(RtValue::Bool(false)),
         "throttle.global_down.max_rate" => Ok(RtValue::Int(global_down_limit(state).await)),
         "throttle.global_up.max_rate" => Ok(RtValue::Int(global_up_limit(state).await)),
-        "view.list" => Ok(RtValue::Array(
-            rtorrent_views()
-                .iter()
-                .map(|view| RtValue::String((*view).to_owned()))
-                .collect(),
-        )),
+        "view.list" => Ok(RtValue::Array(rtorrent_views(state).await)),
+        "view.add" | "view.set" => rtorrent_view_add(state, params).await,
         "view.size" => Ok(RtValue::Int(view_size(state, params).await)),
         "d.multicall" | "d.multicall2" => d_multicall(state, params).await,
         "load.normal" | "load.start" | "load.raw" | "load.raw_start" => {
@@ -407,8 +410,48 @@ async fn global_up_limit(state: &AppState) -> i64 {
         .unwrap_or(0)
 }
 
-fn rtorrent_views() -> &'static [&'static str] {
-    &["main", "started", "stopped", "complete", "incomplete"]
+fn default_rtorrent_views() -> BTreeSet<String> {
+    rtorrent_builtin_views()
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn rtorrent_builtin_views() -> [&'static str; 5] {
+    ["main", "started", "stopped", "complete", "incomplete"]
+}
+
+async fn rtorrent_views(state: &AppState) -> Vec<RtValue> {
+    let views = state
+        .views
+        .read()
+        .await
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut ordered = rtorrent_builtin_views()
+        .into_iter()
+        .filter(|view| views.contains(*view))
+        .map(|view| RtValue::String(view.to_owned()))
+        .collect::<Vec<_>>();
+    ordered.extend(
+        views
+            .into_iter()
+            .filter(|view| !rtorrent_builtin_views().contains(&view.as_str()))
+            .map(RtValue::String),
+    );
+    ordered
+}
+
+async fn rtorrent_view_add(state: &AppState, params: &[RtValue]) -> Result<RtValue, String> {
+    let Some(view) = params.iter().find_map(RtValue::as_str).map(str::trim) else {
+        return Err("view name required".to_owned());
+    };
+    if view.is_empty() {
+        return Err("view name required".to_owned());
+    }
+    state.views.write().await.insert(view.to_owned());
+    Ok(RtValue::Int(0))
 }
 
 async fn view_size(state: &AppState, params: &[RtValue]) -> i64 {
@@ -430,7 +473,7 @@ fn rtorrent_view_matches(entry: &TorrentEntry, view: &str) -> bool {
         "stopped" => matches!(entry.state.as_str(), "paused" | "stopped"),
         "complete" => entry.total_length > 0 && entry.amount_left == 0,
         "incomplete" => entry.amount_left > 0,
-        _ => false,
+        _ => true,
     }
 }
 
@@ -954,6 +997,20 @@ mod tests {
             .unwrap(),
             RtValue::Int(1)
         );
+        execute(&state, "view.add", &[RtValue::String("sonarr".to_owned())])
+            .await
+            .unwrap();
+        assert_eq!(
+            execute(&state, "view.size", &[RtValue::String("sonarr".to_owned())])
+                .await
+                .unwrap(),
+            RtValue::Int(2)
+        );
+        let views = execute(&state, "view.list", &[]).await.unwrap();
+        let RtValue::Array(views) = views else {
+            panic!("expected view list")
+        };
+        assert!(views.contains(&RtValue::String("sonarr".to_owned())));
     }
 
     #[tokio::test]

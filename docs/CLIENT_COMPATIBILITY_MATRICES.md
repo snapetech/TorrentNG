@@ -227,7 +227,7 @@ when engine metadata or peer snapshots are available.
 | File | `f.*` | Native/compat: registry fallback row without an engine; native metadata rows expose path, size, offsets, piece ranges, priority, and completion | File multicall shape and projection rows |
 | Tracker | `t.*`, tracker announce controls | Native/Compat: tracker rows expose native announce URLs, and persisted engine tracker status/scrape counters when available; announce accepted and engine tracker work remains covered by interop matrix | Tracker multicall and announce acceptance row |
 | Peer | `p.*` | Native/compat: peer rows expose native peer address, port, client, progress, rates, choke/interested flags when an engine is attached | Peer multicall projection row |
-| Views/queue | `view.*`, priority/custom views | Native/Compat: registry-backed `main`, `started`, `stopped`, `complete`, and `incomplete` view sizes; arbitrary custom views remain placeholder | View list/size row |
+| Views/queue | `view.*`, priority/custom views | Native/Compat: registry-backed built-in view sizes plus stateful custom `view.add`/`view.set` list and size projection | View list/size row |
 
 ## 7. Test Matrix Backlog
 
