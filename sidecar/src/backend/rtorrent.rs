@@ -195,4 +195,17 @@ impl TorrentBackend for RtorrentBackend {
 
         (dht, pex)
     }
+
+    async fn set_dht(&self, enabled: bool) -> Result<()> {
+        let mode = if enabled { "auto" } else { "disable" };
+        self.client.call("dht.mode.set", &[mode.into()]).await?;
+        Ok(())
+    }
+
+    async fn set_pex(&self, enabled: bool) -> Result<()> {
+        self.client
+            .call("protocol.pex.set", &[enabled.into()])
+            .await?;
+        Ok(())
+    }
 }

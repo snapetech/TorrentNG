@@ -848,20 +848,16 @@ pub async fn set_session_features(
     let mut pex = None;
 
     if let Some(enabled) = patch.dht {
-        let mode = if enabled { "auto" } else { "disable" };
-        if let Err(e) = s.rt.call("dht.mode.set", &[XmlValue::from(mode)]).await {
-            tracing::error!(component = "rtorrent", operation = "set_dht_mode", result = "error", enabled, error = %e, "rTorrent DHT mode update failed");
+        if let Err(e) = s.backend.set_dht(enabled).await {
+            tracing::error!(component = "backend", operation = "set_dht_mode", result = "error", enabled, error = %e, "backend DHT mode update failed");
             return StatusCode::BAD_GATEWAY.into_response();
         }
         dht = Some(enabled);
     }
 
     if let Some(enabled) = patch.pex {
-        if let Err(e) =
-            s.rt.call("protocol.pex.set", &[XmlValue::from(enabled)])
-                .await
-        {
-            tracing::error!(component = "rtorrent", operation = "set_pex", result = "error", enabled, error = %e, "rTorrent PEX update failed");
+        if let Err(e) = s.backend.set_pex(enabled).await {
+            tracing::error!(component = "backend", operation = "set_pex", result = "error", enabled, error = %e, "backend PEX update failed");
             return StatusCode::BAD_GATEWAY.into_response();
         }
         pex = Some(enabled);
