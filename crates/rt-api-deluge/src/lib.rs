@@ -25,6 +25,9 @@ pub struct AppState {
     pub engine: Option<EngineHandle>,
     pub torrent_options: Arc<RwLock<HashMap<String, EngineTorrentLimits>>>,
     pub move_completed_options: Arc<RwLock<HashMap<String, DelugeMoveCompletedOptions>>>,
+    pub enabled_plugins: Arc<RwLock<HashSet<String>>>,
+    pub plugin_configs: Arc<RwLock<HashMap<String, Value>>>,
+    pub execute_commands: Arc<RwLock<Vec<Value>>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -40,6 +43,9 @@ impl AppState {
             engine: None,
             torrent_options: Arc::new(RwLock::new(HashMap::new())),
             move_completed_options: Arc::new(RwLock::new(HashMap::new())),
+            enabled_plugins: Arc::new(RwLock::new(default_enabled_plugins())),
+            plugin_configs: Arc::new(RwLock::new(HashMap::new())),
+            execute_commands: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -49,6 +55,9 @@ impl AppState {
             engine: Some(engine),
             torrent_options: Arc::new(RwLock::new(HashMap::new())),
             move_completed_options: Arc::new(RwLock::new(HashMap::new())),
+            enabled_plugins: Arc::new(RwLock::new(default_enabled_plugins())),
+            plugin_configs: Arc::new(RwLock::new(HashMap::new())),
+            execute_commands: Arc::new(RwLock::new(Vec::new())),
         }
     }
 }
@@ -255,22 +264,26 @@ async fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Va
         "core.get_config" => Ok(deluge_config()),
         "core.get_config_values" => Ok(deluge_config_values(params.first())),
         "core.get_config_value" => Ok(deluge_config_value(params.first())),
-        "core.get_enabled_plugins" => Ok(json!(deluge_plugins())),
-        "core.enable_plugin" | "core.disable_plugin" => Ok(json!(true)),
+        "core.get_enabled_plugins" => enabled_plugins(state).await,
+        "core.enable_plugin" => set_plugin_enabled(state, params, true).await,
+        "core.disable_plugin" => set_plugin_enabled(state, params, false).await,
         "core.get_available_plugins" => Ok(json!(deluge_plugins())),
         "core.get_libtorrent_version" => Ok(json!("native")),
-        "blocklist.get_config" => Ok(blocklist_config()),
-        "blocklist.set_config" => Ok(json!(true)),
-        "blocklist.get_status" | "blocklist.check_import" => Ok(blocklist_status()),
+        "blocklist.get_config" => plugin_config(state, "blocklist", blocklist_config()).await,
+        "blocklist.set_config" => set_plugin_config(state, "blocklist", params).await,
+        "blocklist.get_status" | "blocklist.check_import" => blocklist_status(state).await,
         "blocklist.import" => Ok(json!(true)),
-        "autoadd.get_config" => Ok(autoadd_config()),
-        "autoadd.set_config" | "autoadd.enable" | "autoadd.disable" => Ok(json!(true)),
-        "execute.get_commands" => Ok(json!([])),
-        "execute.save_command" | "execute.remove_command" => Ok(json!(true)),
-        "scheduler.get_config" => Ok(scheduler_config()),
-        "scheduler.set_config" => Ok(json!(true)),
-        "extractor.get_config" => Ok(extractor_config()),
-        "extractor.set_config" => Ok(json!(true)),
+        "autoadd.get_config" => plugin_config(state, "autoadd", autoadd_config()).await,
+        "autoadd.set_config" => set_plugin_config(state, "autoadd", params).await,
+        "autoadd.enable" => set_autoadd_enabled(state, true).await,
+        "autoadd.disable" => set_autoadd_enabled(state, false).await,
+        "execute.get_commands" => execute_commands(state).await,
+        "execute.save_command" => save_execute_command(state, params).await,
+        "execute.remove_command" => remove_execute_command(state, params).await,
+        "scheduler.get_config" => plugin_config(state, "scheduler", scheduler_config()).await,
+        "scheduler.set_config" => set_plugin_config(state, "scheduler", params).await,
+        "extractor.get_config" => plugin_config(state, "extractor", extractor_config()).await,
+        "extractor.set_config" => set_plugin_config(state, "extractor", params).await,
         "notifications.get_handled_events" => Ok(json!(notification_events())),
         "notifications.get_subscriptions" => Ok(notification_subscriptions()),
         "notifications.set_config" | "notifications.add_subscription" => Ok(json!(true)),
@@ -643,6 +656,57 @@ fn deluge_plugins() -> Vec<&'static str> {
     ]
 }
 
+fn default_enabled_plugins() -> HashSet<String> {
+    deluge_plugins()
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<HashSet<_>>()
+}
+
+fn canonical_plugin_name(name: &str) -> Option<&'static str> {
+    match name {
+        "AutoAdd" | "autoadd" => Some("AutoAdd"),
+        "Blocklist" | "blocklist" => Some("Blocklist"),
+        "Execute" | "execute" => Some("Execute"),
+        "Extractor" | "extractor" => Some("Extractor"),
+        "Label" | "label" => Some("Label"),
+        "Notifications" | "notifications" => Some("Notifications"),
+        "Scheduler" | "scheduler" => Some("Scheduler"),
+        _ => None,
+    }
+}
+
+async fn enabled_plugins(state: &AppState) -> Result<Value, String> {
+    let mut plugins = state
+        .enabled_plugins
+        .read()
+        .await
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    plugins.sort();
+    Ok(json!(plugins))
+}
+
+async fn set_plugin_enabled(
+    state: &AppState,
+    params: &[Value],
+    enabled: bool,
+) -> Result<Value, String> {
+    let name = params
+        .first()
+        .and_then(Value::as_str)
+        .and_then(canonical_plugin_name)
+        .ok_or_else(|| "missing plugin name".to_owned())?;
+    let mut plugins = state.enabled_plugins.write().await;
+    if enabled {
+        plugins.insert(name.to_owned());
+    } else {
+        plugins.remove(name);
+    }
+    Ok(json!(true))
+}
+
 fn plugin_info(name: Option<&str>) -> Value {
     let name = name.unwrap_or_default();
     match name {
@@ -710,17 +774,6 @@ fn blocklist_config() -> Value {
     })
 }
 
-fn blocklist_status() -> Value {
-    json!({
-        "state": "Disabled",
-        "message": "No native blocklist configured",
-        "num_blocked": 0,
-        "file_progress": 0.0,
-        "file_type": "",
-        "up_to_date": true,
-    })
-}
-
 fn autoadd_config() -> Value {
     json!({
         "enabled": false,
@@ -745,6 +798,124 @@ fn extractor_config() -> Value {
         "extract_path": "",
         "use_name_folder": true,
     })
+}
+
+async fn blocklist_status(state: &AppState) -> Result<Value, String> {
+    let config = plugin_config_value(state, "blocklist", blocklist_config()).await;
+    let enabled = config
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let url = config
+        .get("url")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    Ok(json!({
+        "state": if enabled { "Idle" } else { "Disabled" },
+        "message": if enabled && !url.is_empty() { "Blocklist configured" } else { "No native blocklist configured" },
+        "num_blocked": config.get("list_size").and_then(Value::as_i64).unwrap_or(0).max(0),
+        "file_progress": 0.0,
+        "file_type": "",
+        "up_to_date": true,
+    }))
+}
+
+async fn plugin_config(state: &AppState, key: &str, default: Value) -> Result<Value, String> {
+    Ok(plugin_config_value(state, key, default).await)
+}
+
+async fn plugin_config_value(state: &AppState, key: &str, default: Value) -> Value {
+    state
+        .plugin_configs
+        .read()
+        .await
+        .get(key)
+        .cloned()
+        .unwrap_or(default)
+}
+
+async fn set_plugin_config(state: &AppState, key: &str, params: &[Value]) -> Result<Value, String> {
+    let incoming = params.first().cloned().unwrap_or_else(|| json!({}));
+    let mut current = plugin_config_value(state, key, default_plugin_config(key)).await;
+    merge_json_object(&mut current, incoming);
+    state
+        .plugin_configs
+        .write()
+        .await
+        .insert(key.to_owned(), current);
+    Ok(json!(true))
+}
+
+async fn set_autoadd_enabled(state: &AppState, enabled: bool) -> Result<Value, String> {
+    let mut current = plugin_config_value(state, "autoadd", autoadd_config()).await;
+    if let Some(map) = current.as_object_mut() {
+        map.insert("enabled".to_owned(), enabled.into());
+    }
+    state
+        .plugin_configs
+        .write()
+        .await
+        .insert("autoadd".to_owned(), current);
+    Ok(json!(true))
+}
+
+fn default_plugin_config(key: &str) -> Value {
+    match key {
+        "blocklist" => blocklist_config(),
+        "autoadd" => autoadd_config(),
+        "scheduler" => scheduler_config(),
+        "extractor" => extractor_config(),
+        _ => json!({}),
+    }
+}
+
+fn merge_json_object(target: &mut Value, incoming: Value) {
+    let Some(target_map) = target.as_object_mut() else {
+        *target = incoming;
+        return;
+    };
+    let Some(incoming_map) = incoming.as_object() else {
+        *target = incoming;
+        return;
+    };
+    for (key, value) in incoming_map {
+        target_map.insert(key.clone(), value.clone());
+    }
+}
+
+async fn execute_commands(state: &AppState) -> Result<Value, String> {
+    Ok(Value::Array(state.execute_commands.read().await.clone()))
+}
+
+async fn save_execute_command(state: &AppState, params: &[Value]) -> Result<Value, String> {
+    let event = params
+        .first()
+        .and_then(Value::as_str)
+        .unwrap_or("complete")
+        .to_owned();
+    let command = params
+        .get(1)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let mut commands = state.execute_commands.write().await;
+    let id = commands.len() as i64 + 1;
+    commands.push(json!({
+        "id": id,
+        "event": event,
+        "command": command,
+    }));
+    Ok(json!(id))
+}
+
+async fn remove_execute_command(state: &AppState, params: &[Value]) -> Result<Value, String> {
+    let id = params.first().and_then(Value::as_i64).unwrap_or_default();
+    state
+        .execute_commands
+        .write()
+        .await
+        .retain(|command| command.get("id").and_then(Value::as_i64) != Some(id));
+    Ok(json!(true))
 }
 
 fn notification_events() -> Vec<&'static str> {
@@ -2556,6 +2727,132 @@ mod tests {
             assert!(body["error"].is_null());
             assert!(!body["result"][assertion_key].is_null(), "{method}");
         }
+    }
+
+    #[tokio::test]
+    async fn deluge_auxiliary_plugin_state_roundtrips() {
+        let app = build_deluge_router(AppState::new(Arc::new(RwLock::new(SessionRegistry::new()))));
+
+        for body in [
+            r#"{"id":1,"method":"blocklist.set_config","params":[{"enabled":true,"url":"https://example.test/blocklist","list_size":42}]}"#,
+            r#"{"id":2,"method":"autoadd.set_config","params":[{"watchdirs":{"1":{"path":"/watch","enabled":true}}}]}"#,
+            r#"{"id":3,"method":"autoadd.enable","params":[1]}"#,
+            r#"{"id":4,"method":"scheduler.set_config","params":[{"low_down":10.0,"button_state":[[1,1,1,1,1,1,1,1]]}]}"#,
+            r#"{"id":5,"method":"extractor.set_config","params":[{"enabled":true,"extract_path":"/extract"}]}"#,
+            r#"{"id":6,"method":"execute.save_command","params":["complete","echo done"]}"#,
+            r#"{"id":7,"method":"core.disable_plugin","params":["Execute"]}"#,
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/json")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        }
+
+        for (method, expected) in [
+            (
+                "blocklist.get_config",
+                json!({"enabled": true, "url": "https://example.test/blocklist", "list_size": 42}),
+            ),
+            (
+                "autoadd.get_config",
+                json!({"enabled": true, "watchdirs": {"1": {"path": "/watch", "enabled": true}}}),
+            ),
+            (
+                "scheduler.get_config",
+                json!({"low_down": 10.0, "button_state": [[1,1,1,1,1,1,1,1]]}),
+            ),
+            (
+                "extractor.get_config",
+                json!({"enabled": true, "extract_path": "/extract"}),
+            ),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/json")
+                        .header("content-type", "application/json")
+                        .body(Body::from(format!(
+                            r#"{{"id":10,"method":"{method}","params":[]}}"#
+                        )))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            for (key, value) in expected.as_object().unwrap() {
+                assert_eq!(&body["result"][key], value, "{method} {key}");
+            }
+        }
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/json")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"id":11,"method":"blocklist.get_status","params":[]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["result"]["state"], "Idle");
+        assert_eq!(body["result"]["num_blocked"], 42);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/json")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"id":12,"method":"execute.get_commands","params":[]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["result"][0]["event"], "complete");
+        assert_eq!(body["result"][0]["command"], "echo done");
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/json")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"id":13,"method":"core.get_enabled_plugins","params":[]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert!(!body["result"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("Execute")));
     }
 
     #[tokio::test]

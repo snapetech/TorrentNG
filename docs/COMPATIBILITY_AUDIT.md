@@ -106,7 +106,7 @@ Local surface: `crates/rt-api-deluge`.
 | Core torrent lifecycle | add magnet, add torrent file, pause, resume, force recheck, remove | Implemented |
 | Core torrent mutation | queue movement, set options, file priorities, trackers, prioritize first/last, connect peer, rename files/folder, move storage | Implemented where native engine supports it; torrent options roundtrip in facade state when no engine is attached |
 | Plugin APIs | label, notifications | Implemented for common label and notification calls |
-| Auxiliary Deluge plugins | extractor, scheduler, execute, blocklist, autoadd plugin-specific APIs | Implemented as structured compatibility surfaces with safe no-op mutation responses; migration dry runs also preserve matching plugin/config files as auxiliary artifacts |
+| Auxiliary Deluge plugins | extractor, scheduler, execute, blocklist, autoadd plugin-specific APIs | Implemented as stateful compatibility surfaces: plugin config, enabled-plugin state, and execute command rows round-trip in facade state; migration dry runs also preserve matching plugin/config files as auxiliary artifacts |
 
 ## rTorrent XMLRPC Facade
 
