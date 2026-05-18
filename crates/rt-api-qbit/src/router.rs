@@ -1,4 +1,8 @@
 use axum::{
+    body::Body,
+    http::{header, HeaderMap, Request, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Router,
 };
@@ -7,9 +11,55 @@ use crate::{handlers::*, state::AppState};
 
 pub fn build_qbit_router(state: AppState) -> Router {
     Router::new()
-        .nest("/api/qb/v2", qbit_routes())
-        .nest("/api/v2", qbit_routes())
+        .nest("/api/qb/v2", protected_qbit_routes(state.clone()))
+        .nest("/api/v2", protected_qbit_routes(state.clone()))
         .with_state(state)
+}
+
+fn protected_qbit_routes(state: AppState) -> Router<AppState> {
+    qbit_routes().route_layer(middleware::from_fn_with_state(state, qbit_auth_guard))
+}
+
+async fn qbit_auth_guard(
+    State(state): axum::extract::State<AppState>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    if state.api_tokens.is_empty() || qbit_presented_token(req.headers()).is_some_and(|token| qbit_token_allowed(&state, &token)) {
+        return next.run(req).await;
+    }
+
+    (
+        StatusCode::FORBIDDEN,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        "Forbidden.",
+    )
+        .into_response()
+}
+
+fn qbit_token_allowed(state: &AppState, token: &str) -> bool {
+    state.api_tokens.iter().any(|allowed| allowed == token)
+}
+
+fn qbit_presented_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::to_owned)
+        .or_else(|| {
+            headers
+                .get(header::COOKIE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(qbit_sid_cookie)
+        })
+}
+
+fn qbit_sid_cookie(cookie: &str) -> Option<String> {
+    cookie.split(';').find_map(|part| {
+        let part = part.trim();
+        part.strip_prefix("SID=").map(str::to_owned)
+    })
 }
 
 fn qbit_routes() -> Router<AppState> {
