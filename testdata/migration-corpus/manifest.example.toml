@@ -4,6 +4,13 @@
 name = "qbittorrent"
 versions = ["4.6.x", "5.x"]
 expected = [".fastresume", ".torrent", "qBittorrent.conf"]
+# Optional per-artifact metadata. Paths are relative to this corpus root and
+# must not escape it. Only include artifacts that can legally be committed or
+# attached to release evidence.
+# [[family.artifacts]]
+# path = "qbittorrent/example.fastresume"
+# source = "qBittorrent 5.x exported profile with private data redacted"
+# permission = "operator-owned fixture approved for TorrentNG test corpus"
 
 [[family]]
 name = "transmission"

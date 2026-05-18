@@ -33,6 +33,9 @@ TNG_REQUIRE_MIGRATION_CORPUS=1 scripts/migration_corpus_certification.sh
 ```
 
 Use `manifest.example.toml` as the checklist for the exported client/version
-families that should be attached to a release evidence bundle. The
-certification report includes a SHA-256 inventory for every discovered artifact
-so fixture changes are reviewable.
+families that should be attached to a release evidence bundle. When real
+artifacts are present, copy it to `manifest.toml`; the certification script
+validates that all required families are listed and that declared artifact paths
+exist under this corpus root. Each declared artifact should include source and
+permission metadata so fixture provenance is reviewable. The certification
+report includes a SHA-256 inventory for every discovered artifact.

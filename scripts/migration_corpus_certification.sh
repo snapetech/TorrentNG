@@ -6,13 +6,17 @@ REPORT_DIR="${TNG_MIGRATION_CORPUS_REPORT_DIR:-$ROOT/certification/reports}"
 OUT="${1:-$REPORT_DIR/migration-corpus-$(date -u +%Y%m%dT%H%M%SZ).md}"
 CORPUS_DIR="${TNG_MIGRATION_CORPUS_DIR:-$ROOT/testdata/migration-corpus}"
 REQUIRE_CORPUS="${TNG_REQUIRE_MIGRATION_CORPUS:-0}"
+MANIFEST="$CORPUS_DIR/manifest.toml"
 
 mkdir -p "$(dirname "$OUT")"
 
 status="PASS"
 missing=0
 failed=0
+manifest_status="SKIP"
+manifest_detail="manifest.toml not present"
 inventory="$OUT.inventory"
+manifest_report="$OUT.manifest"
 
 families=(
   qbittorrent
@@ -101,6 +105,7 @@ row() {
 } > "$OUT"
 : > "$OUT.table"
 : > "$inventory"
+: > "$manifest_report"
 
 if (cd "$ROOT" && cargo test -p rt-migrate) >> "$OUT" 2>&1; then
   echo '```' >> "$OUT"
@@ -141,6 +146,103 @@ done
 cat "$OUT.table" >> "$OUT"
 rm -f "$OUT.table"
 
+if [[ -f "$MANIFEST" ]]; then
+  if python3 - "$MANIFEST" "$CORPUS_DIR" "${families[@]}" >"$manifest_report" <<'PY'
+import pathlib
+import sys
+import tomllib
+
+manifest = pathlib.Path(sys.argv[1]).resolve()
+root = pathlib.Path(sys.argv[2]).resolve()
+required = set(sys.argv[3:])
+
+with manifest.open("rb") as fh:
+    data = tomllib.load(fh)
+
+families = data.get("family", [])
+if not isinstance(families, list):
+    raise SystemExit("manifest key [[family]] must be an array of tables")
+
+seen = set()
+artifact_rows = []
+for family in families:
+    if not isinstance(family, dict):
+        raise SystemExit("each [[family]] entry must be a table")
+    name = family.get("name")
+    if not isinstance(name, str) or not name:
+        raise SystemExit("each [[family]] entry needs a non-empty name")
+    if name not in required:
+        raise SystemExit(f"unknown source family in manifest: {name}")
+    if name in seen:
+        raise SystemExit(f"duplicate source family in manifest: {name}")
+    seen.add(name)
+    versions = family.get("versions", [])
+    if not isinstance(versions, list) or not versions or not all(isinstance(v, str) and v for v in versions):
+        raise SystemExit(f"{name}: versions must be a non-empty string array")
+    expected = family.get("expected", [])
+    if not isinstance(expected, list) or not expected or not all(isinstance(v, str) and v for v in expected):
+        raise SystemExit(f"{name}: expected must be a non-empty string array")
+    artifacts = family.get("artifacts", [])
+    if artifacts and not isinstance(artifacts, list):
+        raise SystemExit(f"{name}: artifacts must be an array of tables")
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            raise SystemExit(f"{name}: each artifact must be a table")
+        rel = artifact.get("path")
+        source = artifact.get("source")
+        permission = artifact.get("permission")
+        if not isinstance(rel, str) or not rel:
+            raise SystemExit(f"{name}: artifact path must be non-empty")
+        path = (root / rel).resolve()
+        if root not in path.parents and path != root:
+            raise SystemExit(f"{name}: artifact path escapes corpus root: {rel}")
+        if not path.is_file():
+            raise SystemExit(f"{name}: artifact path is missing: {rel}")
+        if not isinstance(source, str) or not source:
+            raise SystemExit(f"{name}: artifact {rel} needs source")
+        if not isinstance(permission, str) or not permission:
+            raise SystemExit(f"{name}: artifact {rel} needs permission")
+        artifact_rows.append((name, rel, source, permission))
+
+missing = sorted(required - seen)
+if missing:
+    raise SystemExit("manifest missing source families: " + ", ".join(missing))
+
+print("| Source family | Artifact | Source | Permission |")
+print("|---|---|---|---|")
+if artifact_rows:
+    for row in artifact_rows:
+        print("| " + " | ".join(cell.replace("|", "\\|") for cell in row) + " |")
+else:
+    print("| none declared | - | - | - |")
+PY
+  then
+    manifest_status="PASS"
+    manifest_detail="$MANIFEST"
+  else
+    manifest_status="FAIL"
+    manifest_detail="$(tr '\n' ' ' <"$manifest_report")"
+    status="FAIL"
+  fi
+fi
+
+{
+  echo
+  echo "## Corpus Manifest"
+  echo
+  echo "- Manifest: $MANIFEST"
+  echo "- Status: $manifest_status"
+  echo "- Detail: $manifest_detail"
+  echo
+  if [[ "$manifest_status" == "PASS" ]]; then
+    cat "$manifest_report"
+  else
+    echo 'Copy `manifest.example.toml` to `manifest.toml` and list every required source family.'
+    echo 'Declared artifacts must stay under the corpus root and include `path`, `source`, and `permission`.'
+  fi
+} >> "$OUT"
+rm -f "$manifest_report"
+
 {
   echo
   echo "## Evidence Inventory"
@@ -171,6 +273,7 @@ rm -f "$inventory"
   echo '```'
   echo
   echo "Place real exported client resume/config/torrent artifacts under each source family."
+  echo "When artifacts are present, copy manifest.example.toml to manifest.toml and record source/version/permission metadata."
   echo "Set TNG_REQUIRE_MIGRATION_CORPUS=1 to make missing source-family corpora fail this gate."
   echo
   echo "- Missing source families: $missing"
