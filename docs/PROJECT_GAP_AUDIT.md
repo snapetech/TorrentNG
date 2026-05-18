@@ -179,6 +179,9 @@ Remaining compatibility gaps:
 - qBittorrent: common automation flows are covered, and `torrents/info` now
   projects native peer snapshots into live seed/leecher counters and aggregate
   rates; deeper tracker delta fidelity remains placeholder-depth.
+- DHT-only magnets: DHT `get_peers` forwarding and trackerless BEP 9 metadata
+  completion from discovered peers are unit-covered in `rt-engine`; the
+  remaining row is Docker-level trackerless transfer certification.
 - `scripts/migration_corpus_certification.sh` now separates synthetic
   import/apply coverage from exported fixture coverage. It runs `rt-migrate`
   tests and scans `testdata/migration-corpus/{qbittorrent,transmission,deluge,

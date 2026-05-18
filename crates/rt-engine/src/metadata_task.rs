@@ -849,6 +849,8 @@ fn write_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[test]
     fn validates_metadata_piece_lengths() {
@@ -956,5 +958,100 @@ mod tests {
             governor.snapshot().classes[MemoryClass::Metadata as usize].denied_allocations,
             1
         );
+    }
+
+    #[tokio::test]
+    async fn dht_only_peer_candidates_can_complete_magnet_metadata() {
+        let info =
+            b"d6:lengthi4e4:name4:test12:piece lengthi16384e6:pieces20:abcdefghijklmnopqrste";
+        let mut hasher = Sha1::new();
+        hasher.update(info);
+        let info_hash: [u8; 20] = hasher.finalize().into();
+        let info_hash_hex = hex::encode(info_hash);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = listener.local_addr().unwrap();
+        let info_for_peer = info.to_vec();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut handshake = [0_u8; 68];
+            stream.read_exact(&mut handshake).await.unwrap();
+            let remote = Handshake::parse(&handshake).unwrap();
+            let response = Handshake {
+                info_hash: remote.info_hash,
+                peer_id: [b'P'; 20],
+                reserved: ExtensionFlags::with_extension_protocol(),
+            };
+            stream.write_all(&response.encode()).await.unwrap();
+
+            let mut framed = Framed::new(stream, PeerCodec);
+            framed
+                .send(Message::Extended {
+                    ext_id: EXT_HANDSHAKE_ID,
+                    payload: ExtensionHandshake::new(Some(info_for_peer.len() as u32))
+                        .with_ut_metadata(7)
+                        .encode(),
+                })
+                .await
+                .unwrap();
+            while let Some(message) = framed.next().await {
+                let Message::Extended { ext_id: 7, payload } = message.unwrap() else {
+                    continue;
+                };
+                let UtMetadataMessage::Request { piece } =
+                    UtMetadataMessage::parse(&payload).unwrap()
+                else {
+                    continue;
+                };
+                let start = piece as usize * METADATA_PIECE_SIZE;
+                let end = (start + METADATA_PIECE_SIZE).min(info_for_peer.len());
+                framed
+                    .send(Message::Extended {
+                        ext_id: LOCAL_UT_METADATA_ID,
+                        payload: UtMetadataMessage::Data {
+                            piece,
+                            total_size: info_for_peer.len() as u32,
+                            data: info_for_peer[start..end].to_vec(),
+                        }
+                        .encode(),
+                    })
+                    .await
+                    .unwrap();
+                break;
+            }
+        });
+        let mut caps = [0; rt_metrics::MEMORY_CLASS_COUNT];
+        caps[MemoryClass::Metadata as usize] = 1024 * 1024;
+        let governor = ResourceGovernor::new(rt_metrics::ResourceGovernorConfig {
+            total_cap_bytes: 1024 * 1024,
+            class_caps_bytes: caps,
+            pressure_constrained_pct: 75,
+            pressure_critical_pct: 90,
+        });
+        let (engine_tx, mut engine_rx) = mpsc::channel(1);
+        let mut attempts = HashMap::new();
+
+        assert!(
+            try_fetch_from_peers(
+                info_hash,
+                &info_hash_hex,
+                &[],
+                vec![peer_addr],
+                8,
+                &mut attempts,
+                &engine_tx,
+                &governor,
+            )
+            .await
+        );
+        let cmd = engine_rx.recv().await.unwrap();
+        match cmd {
+            EngineCmd::CompleteMagnet { info_hash, raw } => {
+                assert_eq!(info_hash, info_hash_hex);
+                let parsed = rt_metainfo::parse_torrent(&raw).unwrap();
+                assert_eq!(parsed.name(), "test");
+            }
+            other => panic!("unexpected engine command: {other:?}"),
+        }
+        peer.await.unwrap();
     }
 }

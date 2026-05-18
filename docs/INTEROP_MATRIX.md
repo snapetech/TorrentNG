@@ -121,7 +121,7 @@ or compatibility behaviors.
 | `rust-magnet-with-tracker` | Rust adds a `btih` magnet URI with an HTTP tracker, fetches metadata from a reference seeder, and downloads the payload. | Complete and hash match | Implemented |
 | `rust-udp-tracker` | Rust announces to opentracker through `udp://opentracker:6969/announce`. | Complete and hash match | Implemented |
 | `rust-qbit-mutation-facade` | qBittorrent-compatible `filePrio`, `recheck`, tracker add/edit/remove, `trackers`, and `files` endpoints. | Endpoints succeed and reflected state is visible | Implemented |
-| `magnet-dht-only` | Magnet metadata and peer discovery without trackers. DHT `get_peers` forwarding into torrent peer commands is covered by `rt-engine` tests; full local trackerless metadata fetch and transfer remains planned. | Complete and hash match | Planned |
+| `magnet-dht-only` | Magnet metadata and peer discovery without trackers. DHT `get_peers` forwarding into torrent commands and trackerless BEP 9 metadata completion from discovered peers are covered by `rt-engine` tests; full Docker transfer certification remains planned. | Complete and hash match | Planned |
 | `rust-multi-tracker-fallback` | Dead tracker in the first tier, working tracker fallback. | Rust completes through fallback tracker | Implemented |
 | `tracker-outage-after-peer-discovery` | Stop the local tracker after TorrentNG has an explicit known peer for a tracker-only transfer. | Transfer continues through the known peer and final hash matches | Implemented |
 | `webseed-outage-fallback` | Stop the fixture HTTP webseed after TorrentNG has an explicit known peer for a tracker+webseed transfer. | Transfer falls back to the peer source and final hash matches | Implemented |

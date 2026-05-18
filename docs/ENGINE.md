@@ -226,7 +226,7 @@ Moving 200+ TB is a database migration, not a file copy:
 | BEP | Description | Status |
 |---|---|---|
 | BEP 3 | BitTorrent v1 baseline | implemented |
-| BEP 9 | Metadata exchange / magnet | implemented for v1 metadata; pure v2 placeholders/completion are taskless |
+| BEP 9 | Metadata exchange / magnet | implemented for v1 metadata from tracker or DHT-discovered peers; pure v2 placeholders/completion are taskless |
 | BEP 10 | Extension protocol | implemented |
 | BEP 11 | PEX | compatibility policy present; private torrents disable peer discovery by default |
 | BEP 12 | Multitracker | implemented |
