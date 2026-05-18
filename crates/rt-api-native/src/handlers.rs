@@ -1310,6 +1310,13 @@ pub async fn storage_preview_plan(
             if let Some(response) = validate_storage_plan_roots(&plan, req.roots.as_deref()) {
                 return response;
             }
+            if let Err(e) = validate_completed_steps(&plan, req.completed_steps.as_deref()) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::to_value(ApiError::bad_request(e)).unwrap()),
+                )
+                    .into_response();
+            }
             (
                 StatusCode::OK,
                 Json(storage_plan_response(&req.operation, &plan, None)),
@@ -3729,6 +3736,32 @@ mod tests {
         let plan = build_storage_plan(&req, false).unwrap();
 
         assert!(validate_completed_steps(&plan, req.completed_steps.as_deref()).is_err());
+    }
+
+    #[test]
+    fn storage_plan_completed_steps_accept_sorted_unique_subset() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.bin");
+        let destination = dir.path().join("destination.bin");
+        std::fs::write(&source, b"payload").unwrap();
+        let req = StoragePlanRequest {
+            operation: "import".to_owned(),
+            source: Some(source),
+            destination: Some(destination),
+            target: None,
+            bytes: Some(7),
+            available_bytes: Some(7),
+            hardlink_or_copy: Some(false),
+            dry_run: Some(false),
+            dry_run_approved: None,
+            affected_torrents: None,
+            roots: None,
+            completed_steps: Some(vec![0, 1]),
+        };
+
+        let plan = build_storage_plan(&req, false).unwrap();
+
+        assert!(validate_completed_steps(&plan, req.completed_steps.as_deref()).is_ok());
     }
 
     #[test]

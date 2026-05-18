@@ -38,7 +38,8 @@ type StoragePlanTemplate = {
 
 const storagePlanTemplates: StoragePlanTemplate[] = [
   { id: 'move-library', label: 'Move', operation: 'move', sourceSuffix: 'library/source', destinationSuffix: 'library/destination' },
-  { id: 'import-copy', label: 'Import copy', operation: 'import', sourceSuffix: 'staging/source', destinationSuffix: 'library/imported', hardlinkOrCopy: true },
+  { id: 'import-copy', label: 'Import copy', operation: 'import', sourceSuffix: 'staging/source', destinationSuffix: 'library/imported', hardlinkOrCopy: false },
+  { id: 'import-link', label: 'Import link', operation: 'import', sourceSuffix: 'staging/source', destinationSuffix: 'library/linked', hardlinkOrCopy: true },
   { id: 'delete-approved', label: 'Delete', operation: 'delete', targetSuffix: 'library/orphaned', deleteApproved: true },
   { id: 'resume-plan', label: 'Resume', operation: 'move', sourceSuffix: 'library/source', destinationSuffix: 'library/destination', completedSteps: '0' },
 ]
@@ -85,7 +86,7 @@ export function StoragePanel() {
       source: operation === 'delete' ? undefined : source.trim() || undefined,
       destination: operation === 'delete' ? undefined : destination.trim() || undefined,
       target: operation === 'delete' ? target.trim() || undefined : undefined,
-      bytes: Number.isFinite(parsedBytes) ? parsedBytes : undefined,
+      bytes: parsedBytes !== undefined && Number.isFinite(parsedBytes) && parsedBytes >= 0 ? parsedBytes : undefined,
       available_bytes: selectedRootInfo?.available_bytes,
       hardlink_or_copy: operation === 'import' ? hardlinkOrCopy : undefined,
       dry_run: true,
@@ -109,6 +110,11 @@ export function StoragePanel() {
   })
   const canExecute = Boolean(preview?.plan.can_apply && selectedRoot && (operation !== 'delete' || deleteApproved))
   const completedIndexes = useMemo(() => parseStepIndexes(completedSteps), [completedSteps])
+  const invalidCompletedIndexes = useMemo(() => {
+    if (!preview) return []
+    return completedIndexes.filter(index => index >= preview.plan.steps.length)
+  }, [completedIndexes, preview])
+  const canExecutePlan = canExecute && invalidCompletedIndexes.length === 0
   const applyTemplate = (template: StoragePlanTemplate) => {
     setOperation(template.operation)
     setHardlinkOrCopy(Boolean(template.hardlinkOrCopy))
@@ -265,11 +271,14 @@ export function StoragePanel() {
           <button onClick={() => previewPlan.mutate()} disabled={previewPlan.isPending || !selectedRoot} style={actionButtonStyle(!previewPlan.isPending && Boolean(selectedRoot))}>
             {previewPlan.isPending ? 'Previewing...' : 'Preview plan'}
           </button>
-          <button onClick={() => executePlan.mutate()} disabled={executePlan.isPending || !canExecute} style={actionButtonStyle(!executePlan.isPending && canExecute)}>
+          <button onClick={() => executePlan.mutate()} disabled={executePlan.isPending || !canExecutePlan} style={actionButtonStyle(!executePlan.isPending && canExecutePlan)}>
             {executePlan.isPending ? 'Starting...' : 'Execute plan'}
           </button>
         </div>
 
+        {invalidCompletedIndexes.length > 0 && (
+          <Notice>Completed steps outside this plan: {invalidCompletedIndexes.join(', ')}</Notice>
+        )}
         {previewPlan.error && <Notice>Plan preview failed</Notice>}
         {executePlan.error && <Notice>Plan execution failed</Notice>}
         {preview && <StoragePlanResult response={preview} completedIndexes={completedIndexes} />}

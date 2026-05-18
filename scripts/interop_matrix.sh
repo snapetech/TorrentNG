@@ -1329,7 +1329,7 @@ run_qbit_mutation_facade_case() {
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
     --data-urlencode "limit=1048576" \
     "$(client_url torrentngd)/api/qb/v2/transfer/setUploadLimit" >/dev/null || status="FAIL"
-  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
+  curl --max-time "$CURL_MAX_TIME" -fsS -X POST -H "Authorization: Bearer $RUST_TOKEN" \
     "$(client_url torrentngd)/api/qb/v2/transfer/toggleSpeedLimitsMode" >/dev/null || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
     --data-urlencode "hashes=$info_hash" \
