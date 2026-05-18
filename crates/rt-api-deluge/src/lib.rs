@@ -4,7 +4,7 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use axum::{extract::State, response::IntoResponse, routing::post, Json, Router};
 use base64::{engine::general_purpose, Engine as _};
-use rt_engine::{EngineHandle, EngineTorrentLimits, EngineTorrentMetadata};
+use rt_engine::{EngineHandle, EnginePeerSnapshot, EngineTorrentLimits, EngineTorrentMetadata};
 use rt_metainfo::{parse_magnet, parse_torrent};
 use rt_metrics::{MemoryClass, MemoryLease};
 use rt_session::SessionRegistry;
@@ -754,12 +754,18 @@ async fn update_ui(state: &AppState, params: &[Value]) -> Result<Value, String> 
         None
     };
     let mut metadata = std::collections::HashMap::new();
+    let mut peers = std::collections::HashMap::new();
     let mut limits_by_hash = state.torrent_options.read().await.clone();
     let move_completed_by_hash = state.move_completed_options.read().await.clone();
     if let Some(engine) = &state.engine {
         for entry in &entries {
             if let Ok(meta) = engine.torrent_metadata(entry.info_hash.clone()).await {
                 metadata.insert(entry.info_hash.clone(), meta);
+            }
+            if deluge_fields_need_peers(&wanted_fields) {
+                if let Ok(snapshot) = engine.torrent_peers(entry.info_hash.clone()).await {
+                    peers.insert(entry.info_hash.clone(), snapshot);
+                }
             }
             if let Ok(limits) = engine.torrent_limits(entry.info_hash.clone()).await {
                 limits_by_hash.insert(entry.info_hash.clone(), limits);
@@ -775,6 +781,7 @@ async fn update_ui(state: &AppState, params: &[Value]) -> Result<Value, String> 
                     deluge_torrent(
                         entry,
                         metadata.get(&entry.info_hash),
+                        peers.get(&entry.info_hash).map(Vec::as_slice),
                         limits_by_hash.get(&entry.info_hash),
                         move_completed_by_hash.get(&entry.info_hash),
                     ),
@@ -869,12 +876,18 @@ async fn torrents_status(state: &AppState, params: &[Value]) -> Result<Value, St
         None
     };
     let mut metadata = std::collections::HashMap::new();
+    let mut peers = std::collections::HashMap::new();
     let mut limits_by_hash = state.torrent_options.read().await.clone();
     let move_completed_by_hash = state.move_completed_options.read().await.clone();
     if let Some(engine) = &state.engine {
         for entry in &entries {
             if let Ok(meta) = engine.torrent_metadata(entry.info_hash.clone()).await {
                 metadata.insert(entry.info_hash.clone(), meta);
+            }
+            if deluge_fields_need_peers(&wanted_fields) {
+                if let Ok(snapshot) = engine.torrent_peers(entry.info_hash.clone()).await {
+                    peers.insert(entry.info_hash.clone(), snapshot);
+                }
             }
             if let Ok(limits) = engine.torrent_limits(entry.info_hash.clone()).await {
                 limits_by_hash.insert(entry.info_hash.clone(), limits);
@@ -891,6 +904,7 @@ async fn torrents_status(state: &AppState, params: &[Value]) -> Result<Value, St
                     deluge_torrent(
                         entry,
                         metadata.get(&entry.info_hash),
+                        peers.get(&entry.info_hash).map(Vec::as_slice),
                         limits_by_hash.get(&entry.info_hash),
                         move_completed_by_hash.get(&entry.info_hash),
                     ),
@@ -965,6 +979,11 @@ async fn torrent_status(
     } else {
         None
     };
+    let peers = if let Some(engine) = &state.engine {
+        engine.torrent_peers(hash.to_owned()).await.ok()
+    } else {
+        None
+    };
     let limits = deluge_torrent_limits(state, hash).await;
     let move_completed = state.move_completed_options.read().await.get(hash).cloned();
     let wanted_fields = deluge_requested_fields(fields);
@@ -972,6 +991,7 @@ async fn torrent_status(
         deluge_torrent(
             &entry,
             meta.as_ref(),
+            peers.as_deref(),
             limits.as_ref(),
             move_completed.as_ref(),
         ),
@@ -1011,6 +1031,26 @@ fn filter_deluge_torrent_fields(
     )
 }
 
+fn deluge_fields_need_peers(fields: &Option<std::collections::BTreeSet<String>>) -> bool {
+    let Some(fields) = fields else {
+        return true;
+    };
+    fields.iter().any(|field| {
+        matches!(
+            field.as_str(),
+            "download_payload_rate"
+                | "upload_payload_rate"
+                | "eta"
+                | "num_peers"
+                | "num_seeds"
+                | "total_peers"
+                | "total_seeds"
+                | "distributed_copies"
+                | "seeds_peers_ratio"
+        )
+    })
+}
+
 async fn torrent_files(state: &AppState, hash: &str) -> Result<Value, String> {
     if let Some(engine) = &state.engine {
         if let Ok(meta) = engine.torrent_metadata(hash.to_owned()).await {
@@ -1034,6 +1074,7 @@ async fn torrent_files(state: &AppState, hash: &str) -> Result<Value, String> {
 fn deluge_torrent(
     entry: &rt_session::TorrentEntry,
     meta: Option<&EngineTorrentMetadata>,
+    peers: Option<&[EnginePeerSnapshot]>,
     limits: Option<&EngineTorrentLimits>,
     move_completed: Option<&DelugeMoveCompletedOptions>,
 ) -> Value {
@@ -1063,23 +1104,23 @@ fn deluge_torrent(
         "progress": progress,
         "total_size": entry.total_length,
         "total_done": entry.total_length.saturating_sub(entry.amount_left),
-        "download_payload_rate": 0,
-        "upload_payload_rate": 0,
+        "download_payload_rate": deluge_peer_download_rate(peers),
+        "upload_payload_rate": deluge_peer_upload_rate(peers),
         "ratio": entry.stats.ratio(),
         "save_path": entry.save_path,
         "label": entry.category.clone().unwrap_or_default(),
         "tags": entry.tags,
         "is_finished": entry.completed_at.is_some(),
-        "eta": 0,
-        "num_peers": 0,
-        "num_seeds": 0,
-        "total_peers": 0,
-        "total_seeds": 0,
+        "eta": deluge_eta(entry.amount_left, deluge_peer_download_rate(peers)),
+        "num_peers": deluge_leecher_count(peers),
+        "num_seeds": deluge_seed_count(peers),
+        "total_peers": peers.map(|peers| peers.len()).unwrap_or(0),
+        "total_seeds": deluge_seed_count(peers),
         "num_files": meta.map(|meta| meta.files.len()).unwrap_or(0),
         "num_pieces": meta.map(|meta| meta.piece_count).unwrap_or(0),
         "piece_length": meta.map(|meta| meta.piece_length).unwrap_or(0),
-        "distributed_copies": 0.0,
-        "seeds_peers_ratio": 0.0,
+        "distributed_copies": deluge_distributed_copies(peers),
+        "seeds_peers_ratio": deluge_seeds_peers_ratio(peers),
         "max_download_speed": limits.and_then(|limits| limits.download_limit).map(bytes_to_deluge_kib).unwrap_or(-1.0),
         "max_upload_speed": limits.and_then(|limits| limits.upload_limit).map(bytes_to_deluge_kib).unwrap_or(-1.0),
         "is_auto_managed": limits.map(|limits| limits.auto_management).unwrap_or(false),
@@ -1121,6 +1162,68 @@ fn tracker_host(announce: &str) -> String {
         .next()
         .unwrap_or_default()
         .to_owned()
+}
+
+fn deluge_peer_download_rate(peers: Option<&[EnginePeerSnapshot]>) -> i64 {
+    peers
+        .map(|peers| {
+            peers
+                .iter()
+                .fold(0_i64, |sum, peer| sum.saturating_add(peer.download_rate))
+        })
+        .unwrap_or(0)
+}
+
+fn deluge_peer_upload_rate(peers: Option<&[EnginePeerSnapshot]>) -> i64 {
+    peers
+        .map(|peers| {
+            peers
+                .iter()
+                .fold(0_i64, |sum, peer| sum.saturating_add(peer.upload_rate))
+        })
+        .unwrap_or(0)
+}
+
+fn deluge_seed_count(peers: Option<&[EnginePeerSnapshot]>) -> usize {
+    peers
+        .map(|peers| peers.iter().filter(|peer| peer.progress >= 1.0).count())
+        .unwrap_or(0)
+}
+
+fn deluge_leecher_count(peers: Option<&[EnginePeerSnapshot]>) -> usize {
+    peers
+        .map(|peers| peers.iter().filter(|peer| peer.progress < 1.0).count())
+        .unwrap_or(0)
+}
+
+fn deluge_eta(amount_left: u64, download_rate: i64) -> i64 {
+    if amount_left == 0 {
+        0
+    } else if download_rate > 0 {
+        (amount_left / download_rate as u64) as i64
+    } else {
+        -1
+    }
+}
+
+fn deluge_distributed_copies(peers: Option<&[EnginePeerSnapshot]>) -> f64 {
+    let Some(peers) = peers else {
+        return 0.0;
+    };
+    peers
+        .iter()
+        .map(|peer| peer.progress.clamp(0.0, 1.0))
+        .fold(0.0_f64, f64::max)
+}
+
+fn deluge_seeds_peers_ratio(peers: Option<&[EnginePeerSnapshot]>) -> f64 {
+    let seeds = deluge_seed_count(peers);
+    let leechers = deluge_leecher_count(peers);
+    if leechers == 0 {
+        seeds as f64
+    } else {
+        seeds as f64 / leechers as f64
+    }
 }
 
 fn labels_from_entries<'a>(
@@ -1937,6 +2040,49 @@ mod tests {
                 .len(),
             3
         );
+    }
+
+    #[test]
+    fn deluge_peer_projection_uses_native_snapshots() {
+        let seed = EnginePeerSnapshot {
+            addr: "127.0.0.1:6881".parse().unwrap(),
+            client: "seed".to_owned(),
+            choked: false,
+            upload_choked: false,
+            interested: false,
+            pieces: 10,
+            pieces_total: 10,
+            progress: 1.0,
+            download_rate: 1_000,
+            upload_rate: 2_000,
+            downloaded: 10,
+            uploaded: 20,
+        };
+        let leecher = EnginePeerSnapshot {
+            addr: "127.0.0.2:6881".parse().unwrap(),
+            client: "leecher".to_owned(),
+            choked: false,
+            upload_choked: false,
+            interested: true,
+            pieces: 3,
+            pieces_total: 10,
+            progress: 0.3,
+            download_rate: 3_000,
+            upload_rate: 4_000,
+            downloaded: 30,
+            uploaded: 40,
+        };
+        let peers = [seed, leecher];
+        assert_eq!(deluge_peer_download_rate(Some(&peers)), 4_000);
+        assert_eq!(deluge_peer_upload_rate(Some(&peers)), 6_000);
+        assert_eq!(deluge_seed_count(Some(&peers)), 1);
+        assert_eq!(deluge_leecher_count(Some(&peers)), 1);
+        assert_eq!(
+            deluge_eta(8_000, deluge_peer_download_rate(Some(&peers))),
+            2
+        );
+        assert_eq!(deluge_distributed_copies(Some(&peers)), 1.0);
+        assert_eq!(deluge_seeds_peers_ratio(Some(&peers)), 1.0);
     }
 
     fn assert_json_keys(value: &Value, keys: &[&str]) {

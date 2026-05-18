@@ -171,8 +171,9 @@ Remaining compatibility gaps:
   live-client parity work.
 - Deluge: extractor, scheduler, execute, blocklist, and autoadd plugin-specific
   APIs now have structured compatibility surfaces with safe no-op mutations;
-  remaining plugin work is native behavioral effects only where TorrentNG
-  explicitly chooses to own those workflows.
+  torrent peer/rate fields project native snapshots when available; remaining
+  plugin work is native behavioral effects only where TorrentNG explicitly
+  chooses to own those workflows.
 - rTorrent: file/tracker/peer multicalls now project native metadata and peer
   snapshots when an engine is attached, with registry fallback file rows for
   in-memory compatibility probes; advanced view and throttle semantics remain
