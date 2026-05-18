@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
+    net::SocketAddr,
     sync::Arc,
 };
 use tokio::sync::RwLock;
@@ -20,6 +21,7 @@ pub struct AppState {
     pub app_cookies: Arc<RwLock<Vec<serde_json::Value>>>,
     pub api_key: Arc<RwLock<Option<String>>>,
     pub global_limits: Arc<RwLock<EngineGlobalLimits>>,
+    pub banned_peers: Arc<RwLock<BTreeSet<SocketAddr>>>,
     pub search_plugins: Arc<RwLock<JsonMap>>,
     pub search_jobs: Arc<RwLock<JsonMap>>,
     pub next_search_id: Arc<RwLock<i64>>,
@@ -39,6 +41,7 @@ impl AppState {
             app_cookies: Arc::new(RwLock::new(Vec::new())),
             api_key: Arc::new(RwLock::new(None)),
             global_limits: Arc::new(RwLock::new(EngineGlobalLimits::default())),
+            banned_peers: Arc::new(RwLock::new(BTreeSet::new())),
             search_plugins: Arc::new(RwLock::new(serde_json::Map::new())),
             search_jobs: Arc::new(RwLock::new(serde_json::Map::new())),
             next_search_id: Arc::new(RwLock::new(1)),
@@ -58,6 +61,7 @@ impl AppState {
             app_cookies: Arc::new(RwLock::new(Vec::new())),
             api_key: Arc::new(RwLock::new(None)),
             global_limits: Arc::new(RwLock::new(EngineGlobalLimits::default())),
+            banned_peers: Arc::new(RwLock::new(BTreeSet::new())),
             search_plugins: Arc::new(RwLock::new(serde_json::Map::new())),
             search_jobs: Arc::new(RwLock::new(serde_json::Map::new())),
             next_search_id: Arc::new(RwLock::new(1)),
@@ -77,6 +81,7 @@ impl AppState {
             app_cookies: Arc::new(RwLock::new(Vec::new())),
             api_key: Arc::new(RwLock::new(None)),
             global_limits: Arc::new(RwLock::new(EngineGlobalLimits::default())),
+            banned_peers: Arc::new(RwLock::new(BTreeSet::new())),
             search_plugins: Arc::new(RwLock::new(serde_json::Map::new())),
             search_jobs: Arc::new(RwLock::new(serde_json::Map::new())),
             next_search_id: Arc::new(RwLock::new(1)),

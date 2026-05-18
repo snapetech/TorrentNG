@@ -73,6 +73,18 @@ pub async fn app_preferences(State(state): State<AppState>) -> impl IntoResponse
     let save_path = default_save_path(&state).await;
     let mut preferences = qbit_preferences(save_path);
     if let Some(map) = preferences.as_object_mut() {
+        let banned_ips = state
+            .banned_peers
+            .read()
+            .await
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        map.insert(
+            "banned_ips".to_owned(),
+            serde_json::Value::String(banned_ips),
+        );
         for (key, value) in state.preference_overrides.read().await.iter() {
             map.insert(key.clone(), value.clone());
         }
@@ -2197,7 +2209,16 @@ pub async fn transfer_info(State(state): State<AppState>) -> impl IntoResponse {
     )
 }
 
-pub async fn transfer_ban_peers() -> impl IntoResponse {
+pub async fn transfer_ban_peers(State(state): State<AppState>, body: String) -> impl IntoResponse {
+    let params = parse_form_body(&body);
+    let peers = params
+        .get("peers")
+        .map(|peers| parse_peer_addrs(peers))
+        .unwrap_or_default();
+    if peers.is_empty() {
+        return StatusCode::OK;
+    }
+    state.banned_peers.write().await.extend(peers);
     StatusCode::OK
 }
 
@@ -5600,6 +5621,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn transfer_ban_peers_roundtrips_through_preferences_without_engine() {
+        let app = build_qbit_router(AppState::new());
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/transfer/banPeers")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("peers=127.0.0.1:6881|[::1]:6882|bad"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/qb/v2/app/preferences")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        let prefs: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let banned = prefs["banned_ips"].as_str().unwrap();
+        assert!(banned.contains("127.0.0.1:6881"));
+        assert!(banned.contains("[::1]:6882"));
+        assert!(!banned.contains("bad"));
     }
 
     #[tokio::test]

@@ -377,7 +377,7 @@ Implements the qBittorrent Web API v2. By default it advertises qBittorrent `5.0
 | `POST` | `/api/qb/v2/transfer/setDownloadLimit` | Form: `limit`; backend-backed where supported |
 | `GET` | `/api/qb/v2/transfer/uploadLimit` | Returns current global upload limit |
 | `POST` | `/api/qb/v2/transfer/setUploadLimit` | Form: `limit`; backend-backed where supported |
-| `POST` | `/api/qb/v2/transfer/banPeers` | Backend-backed where supported; qB-compatible OK otherwise |
+| `POST` | `/api/qb/v2/transfer/banPeers` | Backend-backed where supported; native qB facade also persists banned peers into `app/preferences.banned_ips` |
 
 ### Log / Search / RSS
 

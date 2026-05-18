@@ -100,7 +100,7 @@ Local surface: `crates/rt-api-deluge`.
 | JSON endpoint | `/json`, `/deluge/json` | Implemented |
 | Auth/daemon | login, check session, daemon login/info/method list/shutdown | Implemented |
 | Web host management | add/edit/remove host, connected, hosts, host status, connect/disconnect/start/stop daemon | Implemented as native/no-op compatibility |
-| Web UI | add torrents, URL download placeholder, update UI, events, torrent files, plugin list/info/upload/update/save config | Implemented; `web.add_torrents` accepts common magnet, embedded metainfo, temp-file path, and URL-placeholder shapes; update UI honors requested torrent fields and emits filter/stat shape; URL download does not perform server-side network fetch |
+| Web UI | add torrents, URL download token, update UI, events, torrent files, plugin list/info/upload/update/save config | Implemented; `web.download_torrent_from_url` returns a stateful safe token without server-side fetching, and `web.add_torrents` accepts that token plus common magnet, embedded metainfo, temp-file path, and URL shapes; update UI honors requested torrent fields and emits filter/stat shape |
 | Core session reads | stats, session status/state, rates, connections, filter tree, cache status, config, config values, config value, free space, listen port, external IP, path size, libtorrent version | Implemented |
 | Core torrent reads | torrents status, torrent status, torrent file status | Implemented with requested-field projection, label/state/hash filter dictionaries, and torrent option projection |
 | Core torrent lifecycle | add magnet, add torrent file, pause, resume, force recheck, remove | Implemented |

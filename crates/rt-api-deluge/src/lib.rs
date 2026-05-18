@@ -25,6 +25,8 @@ pub struct AppState {
     pub engine: Option<EngineHandle>,
     pub torrent_options: Arc<RwLock<HashMap<String, EngineTorrentLimits>>>,
     pub move_completed_options: Arc<RwLock<HashMap<String, DelugeMoveCompletedOptions>>>,
+    pub url_downloads: Arc<RwLock<HashMap<String, String>>>,
+    pub next_url_download_id: Arc<RwLock<u64>>,
     pub enabled_plugins: Arc<RwLock<HashSet<String>>>,
     pub plugin_configs: Arc<RwLock<HashMap<String, Value>>>,
     pub execute_commands: Arc<RwLock<Vec<Value>>>,
@@ -43,6 +45,8 @@ impl AppState {
             engine: None,
             torrent_options: Arc::new(RwLock::new(HashMap::new())),
             move_completed_options: Arc::new(RwLock::new(HashMap::new())),
+            url_downloads: Arc::new(RwLock::new(HashMap::new())),
+            next_url_download_id: Arc::new(RwLock::new(1)),
             enabled_plugins: Arc::new(RwLock::new(default_enabled_plugins())),
             plugin_configs: Arc::new(RwLock::new(HashMap::new())),
             execute_commands: Arc::new(RwLock::new(Vec::new())),
@@ -55,6 +59,8 @@ impl AppState {
             engine: Some(engine),
             torrent_options: Arc::new(RwLock::new(HashMap::new())),
             move_completed_options: Arc::new(RwLock::new(HashMap::new())),
+            url_downloads: Arc::new(RwLock::new(HashMap::new())),
+            next_url_download_id: Arc::new(RwLock::new(1)),
             enabled_plugins: Arc::new(RwLock::new(default_enabled_plugins())),
             plugin_configs: Arc::new(RwLock::new(HashMap::new())),
             execute_commands: Arc::new(RwLock::new(Vec::new())),
@@ -142,7 +148,7 @@ async fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Va
         "web.connect" | "web.disconnect" | "web.start_daemon" | "web.stop_daemon" => {
             Ok(json!(true))
         }
-        "web.download_torrent_from_url" => Ok(json!("")),
+        "web.download_torrent_from_url" => web_download_torrent_from_url(state, params).await,
         "web.add_torrents" => web_add_torrents(state, params).await,
         "web.get_events" => web_events(state).await,
         "web.get_plugins" => Ok(json!(deluge_plugins())),
@@ -484,8 +490,22 @@ async fn web_add_torrents(state: &AppState, params: &[Value]) -> Result<Value, S
             .unwrap_or_default();
         let result = if path.starts_with("magnet:") {
             add_magnet(state, path, options).await
+        } else if let Some(url) = state.url_downloads.write().await.remove(path) {
+            if url.starts_with("magnet:") {
+                add_magnet(state, &url, options).await
+            } else {
+                Ok(json!({
+                    "url": url,
+                    "downloaded": false,
+                    "reason": "server-side URL fetch is disabled; token preserves Deluge WebUI flow",
+                }))
+            }
         } else if path.starts_with("http://") || path.starts_with("https://") {
-            Ok(json!(true))
+            Ok(json!({
+                "url": path,
+                "downloaded": false,
+                "reason": "server-side URL fetch is disabled; pass web.download_torrent_from_url token to preserve flow",
+            }))
         } else if let Some(data) = torrent
             .get("data")
             .or_else(|| torrent.get("torrent"))
@@ -507,6 +527,31 @@ async fn web_add_torrents(state: &AppState, params: &[Value]) -> Result<Value, S
         }));
     }
     Ok(Value::Array(results))
+}
+
+async fn web_download_torrent_from_url(
+    state: &AppState,
+    params: &[Value],
+) -> Result<Value, String> {
+    let url = params
+        .first()
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "missing URL".to_owned())?;
+    if !(url.starts_with("http://") || url.starts_with("https://") || url.starts_with("magnet:")) {
+        return Err("unsupported torrent URL scheme".to_owned());
+    }
+
+    let mut next = state.next_url_download_id.write().await;
+    let token = format!("torrentng-url-download-{}.torrent", *next);
+    *next = next.saturating_add(1);
+    state
+        .url_downloads
+        .write()
+        .await
+        .insert(token.clone(), url.to_owned());
+    Ok(json!(token))
 }
 
 async fn move_storage(state: &AppState, params: &[Value]) -> Result<Value, String> {
@@ -2980,6 +3025,107 @@ mod tests {
         );
         assert_eq!(results[2]["path"], "https://example.invalid/file.torrent");
         assert_eq!(results[3]["path"], "inline.torrent");
+    }
+
+    #[tokio::test]
+    async fn deluge_url_download_returns_stateful_safe_token() {
+        let app = build_deluge_router(AppState::new(Arc::new(RwLock::new(SessionRegistry::new()))));
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/json")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"id":1,"method":"web.download_torrent_from_url","params":["https://example.invalid/file.torrent"]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert!(body["error"].is_null(), "{:?}", body["error"]);
+        let token = body["result"].as_str().unwrap();
+        assert!(token.starts_with("torrentng-url-download-"));
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/json")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"id":2,"method":"web.add_torrents","params":[[{{"path":"{token}","options":{{}}}}]]}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert!(body["error"].is_null(), "{:?}", body["error"]);
+        let result = &body["result"][0];
+        assert_eq!(result["success"], true);
+        assert_eq!(result["path"], token);
+        assert_eq!(
+            result["result"]["url"],
+            "https://example.invalid/file.torrent"
+        );
+        assert_eq!(result["result"]["downloaded"], false);
+    }
+
+    #[tokio::test]
+    async fn deluge_url_download_tokens_are_one_shot_and_magnets_use_add_path() {
+        let app = build_deluge_router(AppState::new(Arc::new(RwLock::new(SessionRegistry::new()))));
+        let magnet = "magnet:?xt=urn:btih:0123456789012345678901234567890123456789&dn=TokenMagnet";
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/json")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"id":1,"method":"web.download_torrent_from_url","params":["{magnet}"]}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        let token = body["result"].as_str().unwrap();
+
+        for id in [2, 3] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/json")
+                        .header("content-type", "application/json")
+                        .body(Body::from(format!(
+                            r#"{{"id":{id},"method":"web.add_torrents","params":[[{{"path":"{token}","options":{{}}}}]]}}"#
+                        )))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert!(body["error"].is_null(), "{:?}", body["error"]);
+            let result = &body["result"][0];
+            assert_eq!(result["success"], true);
+            if id == 2 {
+                assert_eq!(result["result"], true);
+            } else {
+                assert_eq!(result["result"], true);
+                assert!(result["result"]["downloaded"].is_null());
+            }
+        }
     }
 
     #[tokio::test]
