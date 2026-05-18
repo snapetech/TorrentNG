@@ -20,7 +20,8 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::{
-    auth::require_auth, cache::Db, config::Config, metrics::SharedMetrics, rtorrent::Client,
+    auth::require_auth, backend::TorrentBackend, cache::Db, config::Config, metrics::SharedMetrics,
+    rtorrent::Client,
 };
 
 use super::handlers;
@@ -29,6 +30,7 @@ use super::handlers;
 pub struct AppState {
     pub cfg: Arc<Config>,
     pub rt: Arc<Client>,
+    pub backend: Arc<dyn TorrentBackend>,
     pub db: Arc<Db>,
     pub events: broadcast::Sender<crate::api::ws::Event>,
     pub metrics: SharedMetrics,

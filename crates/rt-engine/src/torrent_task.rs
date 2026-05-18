@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use tokio::net::TcpStream;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, RwLock};
-use tokio::time::interval;
+use tokio::time::{interval, sleep};
 use tokio_util::codec::Framed;
 use tracing::{debug, info, warn};
 use url::Url;
@@ -342,6 +342,7 @@ enum PeerCommand {
     Have(u32),
     Choke,
     Unchoke,
+    UpdateUploadLimit(Option<u64>),
     Shutdown,
 }
 
@@ -354,6 +355,7 @@ struct UploadContext {
     have_pieces: Vec<bool>,
     metadata: Option<Arc<Vec<u8>>>,
     is_private: bool,
+    upload_limit_bytes_per_sec: Option<u64>,
 }
 
 struct LeasedUploadBlock {
@@ -407,6 +409,7 @@ pub struct TorrentTask {
     download_limit_bytes_per_sec: Option<u64>,
     download_tokens: u64,
     download_tokens_updated: Instant,
+    upload_limit_bytes_per_sec: Option<u64>,
     completed_piece_verify_from_memory: u64,
     completed_piece_verify_from_disk: u64,
     prepared_files: Mutex<HashSet<u32>>,
@@ -520,6 +523,7 @@ impl TorrentTask {
             download_limit_bytes_per_sec: None,
             download_tokens: u64::MAX,
             download_tokens_updated: Instant::now(),
+            upload_limit_bytes_per_sec: None,
             completed_piece_verify_from_memory: 0,
             completed_piece_verify_from_disk: 0,
             prepared_files: Mutex::new(HashSet::new()),
@@ -1101,6 +1105,7 @@ impl TorrentTask {
             have_pieces: visible_pieces,
             metadata: torrent_info_bytes(&self.meta.raw).ok().map(Arc::new),
             is_private: self.meta.private,
+            upload_limit_bytes_per_sec: self.upload_limit_bytes_per_sec,
         }
     }
 
@@ -2052,6 +2057,7 @@ impl TorrentTask {
         }
         self.super_seeding = limits.super_seeding;
         self.set_download_limit(limits.download_limit);
+        self.set_upload_limit(limits.upload_limit);
         self.apply_file_policy_from_db();
     }
 
@@ -2060,6 +2066,24 @@ impl TorrentTask {
             limit.and_then(|value| (value > 0).then_some(value as u64));
         self.download_tokens_updated = Instant::now();
         self.download_tokens = self.download_limit_bytes_per_sec.unwrap_or(u64::MAX);
+    }
+
+    fn set_upload_limit(&mut self, limit: Option<i64>) {
+        self.upload_limit_bytes_per_sec =
+            limit.and_then(|value| (value > 0).then_some(value as u64));
+        let mut queue_full = 0u64;
+        for handle in self.active_peers.values() {
+            if handle
+                .cmd_tx
+                .try_send(PeerCommand::UpdateUploadLimit(
+                    self.upload_limit_bytes_per_sec,
+                ))
+                .is_err()
+            {
+                queue_full = queue_full.saturating_add(1);
+            }
+        }
+        self.peer_command_queue_full = self.peer_command_queue_full.saturating_add(queue_full);
     }
 
     fn torrent_limits_from_db(db: &Connection, info_hash: &str) -> EngineTorrentLimits {
@@ -3241,6 +3265,9 @@ async fn run_peer_loop(
 ) -> anyhow::Result<()> {
     let mut outstanding = Vec::<OutstandingRequest>::new();
     let mut upload_choked = true;
+    let mut upload_limit_bytes_per_sec = upload.upload_limit_bytes_per_sec;
+    let mut upload_tokens = upload_limit_bytes_per_sec.unwrap_or(u64::MAX);
+    let mut upload_tokens_updated = Instant::now();
     let mut timeout_tick = interval(Duration::from_secs(5));
 
     let result: anyhow::Result<()> = async {
@@ -3269,6 +3296,11 @@ async fn run_peer_loop(
                     PeerCommand::Unchoke => {
                         upload_choked = false;
                         peer_io.send(Message::Unchoke).await?;
+                    }
+                    PeerCommand::UpdateUploadLimit(limit) => {
+                        upload_limit_bytes_per_sec = limit;
+                        upload_tokens = upload_limit_bytes_per_sec.unwrap_or(u64::MAX);
+                        upload_tokens_updated = Instant::now();
                     }
                     PeerCommand::Shutdown => {
                         break;
@@ -3363,6 +3395,13 @@ async fn run_peer_loop(
                             match read_upload_block(&upload, piece, begin, length).await {
                                 Ok(block) => {
                                     let bytes = block.data.len() as u64;
+                                    wait_for_upload_budget(
+                                        upload_limit_bytes_per_sec,
+                                        &mut upload_tokens,
+                                        &mut upload_tokens_updated,
+                                        bytes,
+                                    )
+                                    .await;
                                     peer_io.send(Message::Piece {
                                         piece,
                                         begin,
@@ -3624,6 +3663,32 @@ async fn read_upload_block(
         data: bytes::Bytes::from(data),
         _lease: lease,
     })
+}
+
+async fn wait_for_upload_budget(
+    limit: Option<u64>,
+    tokens: &mut u64,
+    tokens_updated: &mut Instant,
+    bytes: u64,
+) {
+    let Some(limit) = limit.filter(|limit| *limit > 0) else {
+        *tokens = u64::MAX;
+        *tokens_updated = Instant::now();
+        return;
+    };
+    loop {
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(*tokens_updated);
+        *tokens_updated = now;
+        let refill = (elapsed.as_secs_f64() * limit as f64).floor() as u64;
+        *tokens = tokens.saturating_add(refill).min(limit);
+        if *tokens >= bytes {
+            *tokens = tokens.saturating_sub(bytes);
+            return;
+        }
+        let missing = bytes.saturating_sub(*tokens);
+        sleep(Duration::from_secs_f64(missing as f64 / limit as f64)).await;
+    }
 }
 
 fn bitfield_to_pieces(bits: &[u8], piece_count: usize) -> anyhow::Result<Vec<bool>> {
@@ -4342,6 +4407,7 @@ mod tests {
             have_pieces: vec![true],
             metadata: None,
             is_private: false,
+            upload_limit_bytes_per_sec: None,
         };
 
         let block = read_upload_block(&upload, 0, 0, 16 * 1024).await.unwrap();

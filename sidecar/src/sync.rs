@@ -9,9 +9,10 @@ use tracing::{info, warn};
 
 use crate::{
     api::ws::Event,
+    backend::TorrentBackend,
     cache::{AppEventRow, Db, TorrentRow},
     metrics::SharedMetrics,
-    rtorrent::{torrents::MULTICALL_RANGE_PAGE_SIZE, Client},
+    rtorrent::torrents::{RawTorrent, MULTICALL_RANGE_PAGE_SIZE},
     torrent_meta::session_tracker_url,
 };
 
@@ -25,7 +26,7 @@ struct SyncCounts {
 }
 
 pub async fn run(
-    rt: Arc<Client>,
+    backend: Arc<dyn TorrentBackend>,
     db: Arc<Db>,
     tx: broadcast::Sender<Event>,
     metrics: SharedMetrics,
@@ -33,7 +34,7 @@ pub async fn run(
     event_retention: usize,
 ) {
     info!(
-        component = "rtorrent",
+        component = backend.backend_type().as_str(),
         operation = "sync_loop",
         interval_ms = interval.as_millis() as u64,
         result = "started",
@@ -42,9 +43,9 @@ pub async fn run(
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     ticker.tick().await;
-    let range_supported = rt.has_multicall_range().await;
+    let range_supported = backend.has_bounded_sync().await;
     info!(
-        component = "rtorrent",
+        component = backend.backend_type().as_str(),
         operation = "capability_probe",
         feature = "d.multicall.range",
         supported = range_supported,
@@ -60,7 +61,7 @@ pub async fn run(
         ticker.tick().await;
         let result = if range_supported {
             tick_bounded(
-                &rt,
+                backend.as_ref(),
                 &db,
                 &tx,
                 &mut page_offset,
@@ -69,7 +70,7 @@ pub async fn run(
             )
             .await
         } else {
-            tick_full(&rt, &db, &tx, &mut tracker_cache).await
+            tick_full(backend.as_ref(), &db, &tx, &mut tracker_cache).await
         };
         match result {
             Ok(counts) => {
@@ -80,7 +81,7 @@ pub async fn run(
                         "rtorrent_sync_recovered",
                         "rTorrent sync recovered",
                         serde_json::json!({
-                            "component": "rtorrent",
+                        "component": backend.backend_type().as_str(),
                             "operation": "sync",
                             "result": "ok",
                         }),
@@ -108,7 +109,7 @@ pub async fn run(
             Err(e) => {
                 metrics.sync_errors_total.fetch_add(1, Ordering::Relaxed);
                 warn!(
-                    component = "rtorrent",
+                    component = backend.backend_type().as_str(),
                     operation = "sync",
                     result = "error",
                     error = %e,
@@ -121,7 +122,7 @@ pub async fn run(
                         "rtorrent_sync_error",
                         "rTorrent sync failed",
                         serde_json::json!({
-                            "component": "rtorrent",
+                            "component": backend.backend_type().as_str(),
                             "operation": "sync",
                             "result": "error",
                             "error": e.to_string(),
@@ -166,12 +167,12 @@ fn append_app_event(
 }
 
 async fn tick_full(
-    rt: &Client,
+    backend: &dyn TorrentBackend,
     db: &Db,
     tx: &broadcast::Sender<Event>,
     tracker_cache: &mut HashMap<String, Option<String>>,
 ) -> anyhow::Result<SyncCounts> {
-    let torrents = rt.list_torrents().await?;
+    let torrents = backend.list_torrents().await?;
     let now = chrono::Utc::now().timestamp();
 
     let seen: HashSet<String> = torrents.iter().map(|t| t.hash.clone()).collect();
@@ -192,7 +193,7 @@ async fn tick_full(
 }
 
 async fn tick_bounded(
-    rt: &Client,
+    backend: &dyn TorrentBackend,
     db: &Db,
     tx: &broadcast::Sender<Event>,
     page_offset: &mut i64,
@@ -203,7 +204,7 @@ async fn tick_bounded(
     let mut counts = SyncCounts::default();
     let mut touched = HashSet::new();
 
-    match rt.live_summary("main", MULTICALL_RANGE_PAGE_SIZE).await {
+    match backend.live_summary("main", MULTICALL_RANGE_PAGE_SIZE).await {
         Ok(summary) => {
             write_live_speeds(summary.rates.download, summary.rates.upload);
             for t in &summary.moving {
@@ -221,7 +222,7 @@ async fn tick_bounded(
         ),
     }
 
-    let page = rt
+    let page = backend
         .list_torrents_range("main", *page_offset, MULTICALL_RANGE_PAGE_SIZE)
         .await?;
     let page_len = page.len() as i64;
@@ -251,7 +252,7 @@ async fn tick_bounded(
 fn upsert_torrent(
     db: &Db,
     tx: &broadcast::Sender<Event>,
-    t: &crate::rtorrent::torrents::RawTorrent,
+    t: &RawTorrent,
     now: i64,
     counts: &mut SyncCounts,
     tracker_cache: &mut HashMap<String, Option<String>>,

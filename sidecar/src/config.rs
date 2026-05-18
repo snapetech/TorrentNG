@@ -24,7 +24,14 @@ pub struct Config {
     #[serde(default)]
     pub storage_roots: Vec<PathBuf>,
 
+    #[serde(default)]
+    pub backend: BackendConfig,
+
+    #[serde(default)]
     pub rtorrent: RtorrentConfig,
+
+    #[serde(default)]
+    pub qbittorrent: QbittorrentConfig,
 
     #[serde(default)]
     pub auth: AuthConfig,
@@ -60,6 +67,34 @@ pub struct RtorrentConfig {
 
     #[serde(default)]
     pub logs: RtorrentLogConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct BackendConfig {
+    #[serde(rename = "type")]
+    pub backend_type: BackendKind,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BackendKind {
+    Rtorrent,
+    Qbittorrent,
+    Transmission,
+    Deluge,
+    Torrentng,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct QbittorrentConfig {
+    pub url: String,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub timeout_secs: u64,
+    pub no_auth: bool,
+    pub accept_invalid_certs: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -117,6 +152,39 @@ impl Default for WorkflowConfig {
     }
 }
 
+impl Default for BackendConfig {
+    fn default() -> Self {
+        Self {
+            backend_type: BackendKind::Rtorrent,
+        }
+    }
+}
+
+impl Default for RtorrentConfig {
+    fn default() -> Self {
+        Self {
+            scgi_socket: Some("/run/rtorrent/rpc.sock".to_owned()),
+            scgi_addr: None,
+            timeout_secs: default_timeout_secs(),
+            user_agent: default_user_agent(),
+            logs: RtorrentLogConfig::default(),
+        }
+    }
+}
+
+impl Default for QbittorrentConfig {
+    fn default() -> Self {
+        Self {
+            url: "http://127.0.0.1:8080".to_owned(),
+            username: None,
+            password: None,
+            timeout_secs: default_timeout_secs(),
+            no_auth: false,
+            accept_invalid_certs: false,
+        }
+    }
+}
+
 impl Config {
     /// Minimal config for unit/integration tests — no real rTorrent connection.
     pub fn test_default() -> Self {
@@ -126,6 +194,7 @@ impl Config {
             sync_interval_secs: 60,
             data_dir: None,
             storage_roots: vec![PathBuf::from("/")],
+            backend: BackendConfig::default(),
             rtorrent: RtorrentConfig {
                 scgi_socket: Some("/nonexistent".into()),
                 scgi_addr: None,
@@ -133,6 +202,7 @@ impl Config {
                 user_agent: DEFAULT_USER_AGENT.to_owned(),
                 logs: RtorrentLogConfig::default(),
             },
+            qbittorrent: QbittorrentConfig::default(),
             auth: AuthConfig::default(),
             workflows: WorkflowConfig::default(),
             identity: IdentityConfig::default(),
@@ -230,6 +300,27 @@ impl Config {
         if let Ok(v) = std::env::var("TNG_USER_AGENT") {
             self.rtorrent.user_agent = v;
         }
+        if let Ok(v) = std::env::var("TNG_BACKEND") {
+            self.backend.backend_type = match v.to_ascii_lowercase().as_str() {
+                "qbittorrent" | "qbit" => BackendKind::Qbittorrent,
+                "transmission" => BackendKind::Transmission,
+                "deluge" => BackendKind::Deluge,
+                "torrentng" | "native" => BackendKind::Torrentng,
+                _ => BackendKind::Rtorrent,
+            };
+        }
+        if let Ok(v) = std::env::var("TNG_QBITTORRENT_URL") {
+            self.qbittorrent.url = v;
+        }
+        if let Ok(v) = std::env::var("TNG_QBITTORRENT_USERNAME") {
+            self.qbittorrent.username = Some(v);
+        }
+        if let Ok(v) = std::env::var("TNG_QBITTORRENT_PASSWORD") {
+            self.qbittorrent.password = Some(v);
+        }
+        if let Ok(v) = std::env::var("TNG_QBITTORRENT_NO_AUTH") {
+            self.qbittorrent.no_auth = v == "1" || v.eq_ignore_ascii_case("true");
+        }
         if let Ok(v) = std::env::var("TNG_RTORRENT_LOGS_ENABLED") {
             self.rtorrent.logs.enabled = v == "1" || v.eq_ignore_ascii_case("true");
         }
@@ -286,14 +377,37 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
-        match (&self.rtorrent.scgi_socket, &self.rtorrent.scgi_addr) {
-            (None, None) => bail!("rtorrent: one of scgi_socket or scgi_addr must be set"),
-            (Some(_), Some(_)) => {
-                bail!("rtorrent: only one of scgi_socket or scgi_addr may be set")
+        match self.backend.backend_type {
+            BackendKind::Rtorrent => match (&self.rtorrent.scgi_socket, &self.rtorrent.scgi_addr) {
+                (None, None) => bail!("rtorrent: one of scgi_socket or scgi_addr must be set"),
+                (Some(_), Some(_)) => {
+                    bail!("rtorrent: only one of scgi_socket or scgi_addr may be set")
+                }
+                _ => {}
+            },
+            BackendKind::Qbittorrent => {
+                if self.qbittorrent.url.trim().is_empty() {
+                    bail!("qbittorrent: url must be set");
+                }
             }
-            _ => {}
+            BackendKind::Transmission | BackendKind::Deluge | BackendKind::Torrentng => {
+                bail!(
+                    "backend {} is configured but not implemented in the sidecar yet",
+                    self.backend_name()
+                )
+            }
         }
         Ok(())
+    }
+
+    pub fn backend_name(&self) -> &'static str {
+        match self.backend.backend_type {
+            BackendKind::Rtorrent => "rtorrent",
+            BackendKind::Qbittorrent => "qbittorrent",
+            BackendKind::Transmission => "transmission",
+            BackendKind::Deluge => "deluge",
+            BackendKind::Torrentng => "torrentng",
+        }
     }
 
     pub fn cache_path(&self) -> PathBuf {

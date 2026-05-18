@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use torrentng::{api, cache, config, metrics, rtorrent, rtorrent_logs, stats, sync};
+use torrentng::{api, backend, cache, config, metrics, rtorrent, rtorrent_logs, stats, sync};
 use tracing::{info, warn};
 
 use api::{
@@ -9,7 +9,8 @@ use api::{
     ws::Event,
 };
 use cache::{AppEventRow, Db};
-use config::Config;
+use backend::TorrentBackend;
+use config::{BackendKind, Config};
 use metrics::Metrics;
 use rtorrent::Client;
 
@@ -41,6 +42,16 @@ async fn main() -> Result<()> {
     );
 
     let rt = Arc::new(Client::new(&cfg.rtorrent).context("create rtorrent client")?);
+    let backend: Arc<dyn TorrentBackend> = match cfg.backend.backend_type {
+        BackendKind::Rtorrent => Arc::new(backend::rtorrent::RtorrentBackend::new(rt.clone())),
+        BackendKind::Qbittorrent => Arc::new(
+            backend::qbittorrent::QbittorrentBackend::new(&cfg.qbittorrent)
+                .context("create qbittorrent backend")?,
+        ),
+        BackendKind::Transmission | BackendKind::Deluge | BackendKind::Torrentng => {
+            unreachable!("unsupported backend should be rejected during config validation")
+        }
+    };
 
     let db = Arc::new(Db::open(&cfg.cache_path()).context("open cache db")?);
     append_startup_event(
@@ -89,24 +100,24 @@ async fn main() -> Result<()> {
     }
 
     {
-        let rt2 = rt.clone();
+        let backend2 = backend.clone();
         let db2 = db.clone();
         let tx2 = tx.clone();
         let mx2 = metrics.clone();
         let interval = cfg.sync_interval();
         let retention = cfg.logging.event_retention;
         tokio::spawn(async move {
-            sync::run(rt2, db2, tx2, mx2, interval, retention).await;
+            sync::run(backend2, db2, tx2, mx2, interval, retention).await;
         });
     }
 
     {
-        let rt2 = rt.clone();
+        let backend2 = backend.clone();
         let db2 = db.clone();
         let tx2 = tx.clone();
         let retention = cfg.logging.event_retention;
         tokio::spawn(async move {
-            stats::run(rt2, db2, tx2, std::time::Duration::from_secs(2), retention).await;
+            stats::run(backend2, db2, tx2, std::time::Duration::from_secs(2), retention).await;
         });
     }
 
@@ -122,6 +133,7 @@ async fn main() -> Result<()> {
     let state = AppState {
         cfg: Arc::new(cfg.clone()),
         rt,
+        backend,
         db,
         events: tx,
         metrics,
