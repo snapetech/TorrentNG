@@ -168,6 +168,14 @@ impl UtpConnection {
         self.retransmit_timeout_us
     }
 
+    pub fn rtt_us(&self) -> Option<u32> {
+        self.rtt_us
+    }
+
+    pub fn rtt_var_us(&self) -> Option<u32> {
+        self.rtt_var_us
+    }
+
     pub fn available_send_window(&self) -> u32 {
         self.remote_window_bytes
             .min(self.congestion.cwnd_bytes())
@@ -180,6 +188,10 @@ impl UtpConnection {
 
     pub fn congestion_base_delay_us(&self) -> Option<u32> {
         self.congestion.base_delay_us()
+    }
+
+    pub fn congestion_current_delay_us(&self) -> Option<u32> {
+        self.congestion.current_delay_us()
     }
 
     pub fn is_established(&self) -> bool {

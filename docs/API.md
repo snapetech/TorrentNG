@@ -374,9 +374,9 @@ These compatibility endpoints are present so qBittorrent clients can probe them 
 | Method | Path | Notes |
 |--------|------|-------|
 | `GET` | `/api/qb/v2/log/main` | Returns retained app/session/rTorrent log events in qBittorrent log shape; supports `limit`, `last_known_id`, `normal`, `info`, `warning`, `critical` |
-| `GET` | `/api/qb/v2/log/peers` | Returns `[]` |
+| `GET` | `/api/qb/v2/log/peers` | Returns backend peer snapshots in qBittorrent peer log shape where supported; otherwise `[]` |
 | `GET` | `/api/qb/v2/search/status` | Returns stopped/running status plus known plugin state |
-| `GET` | `/api/qb/v2/search/categories` | Returns `[]` |
+| `GET` | `/api/qb/v2/search/categories` | Returns enabled compatibility plugin categories |
 | `GET` | `/api/qb/v2/search/plugins` | Returns installed compatibility plugin records |
 | `POST` | `/api/qb/v2/search/installPlugin` | Records plugin source/name metadata |
 | `POST` | `/api/qb/v2/search/uninstallPlugin` | Removes plugin records |

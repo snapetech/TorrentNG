@@ -2994,6 +2994,76 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
         "uTP datagrams dropped because no stream route or queue slot was available",
         utp.route_drops,
     );
+    metric(
+        &mut out,
+        "torrentng_utp_rtt_samples_total",
+        "counter",
+        "uTP RTT samples observed from packet timestamp deltas",
+        utp.rtt_samples,
+    );
+    metric(
+        &mut out,
+        "torrentng_utp_rtt_us",
+        "gauge",
+        "Last smoothed uTP RTT in microseconds",
+        utp.rtt_us,
+    );
+    metric(
+        &mut out,
+        "torrentng_utp_rtt_min_us",
+        "gauge",
+        "Minimum observed smoothed uTP RTT in microseconds",
+        utp.rtt_min_us,
+    );
+    metric(
+        &mut out,
+        "torrentng_utp_rtt_max_us",
+        "gauge",
+        "Maximum observed smoothed uTP RTT in microseconds",
+        utp.rtt_max_us,
+    );
+    metric(
+        &mut out,
+        "torrentng_utp_rtt_var_us",
+        "gauge",
+        "Last smoothed uTP RTT variance in microseconds",
+        utp.rtt_var_us,
+    );
+    metric(
+        &mut out,
+        "torrentng_utp_retransmit_timeout_us",
+        "gauge",
+        "Current uTP retransmission timeout in microseconds",
+        utp.retransmit_timeout_us,
+    );
+    metric(
+        &mut out,
+        "torrentng_utp_congestion_window_bytes",
+        "gauge",
+        "Last observed uTP congestion window in bytes",
+        utp.congestion_window_bytes,
+    );
+    metric(
+        &mut out,
+        "torrentng_utp_congestion_base_delay_us",
+        "gauge",
+        "Last observed uTP base delay in microseconds",
+        utp.congestion_base_delay_us,
+    );
+    metric(
+        &mut out,
+        "torrentng_utp_congestion_current_delay_us",
+        "gauge",
+        "Last observed uTP current delay in microseconds",
+        utp.congestion_current_delay_us,
+    );
+    metric(
+        &mut out,
+        "torrentng_utp_bytes_in_flight",
+        "gauge",
+        "Last observed uTP bytes in flight",
+        utp.bytes_in_flight,
+    );
     out
 }
 
@@ -3863,6 +3933,16 @@ mod tests {
         assert!(rendered.contains("torrentng_utp_recv_timeouts_total "));
         assert!(rendered.contains("torrentng_utp_retransmits_total "));
         assert!(rendered.contains("torrentng_utp_route_drops_total "));
+        assert!(rendered.contains("torrentng_utp_rtt_samples_total "));
+        assert!(rendered.contains("torrentng_utp_rtt_us "));
+        assert!(rendered.contains("torrentng_utp_rtt_min_us "));
+        assert!(rendered.contains("torrentng_utp_rtt_max_us "));
+        assert!(rendered.contains("torrentng_utp_rtt_var_us "));
+        assert!(rendered.contains("torrentng_utp_retransmit_timeout_us "));
+        assert!(rendered.contains("torrentng_utp_congestion_window_bytes "));
+        assert!(rendered.contains("torrentng_utp_congestion_base_delay_us "));
+        assert!(rendered.contains("torrentng_utp_congestion_current_delay_us "));
+        assert!(rendered.contains("torrentng_utp_bytes_in_flight "));
     }
 
     #[tokio::test]

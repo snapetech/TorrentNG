@@ -16,7 +16,7 @@ use std::{
 
 use crate::{
     api::{server::AppState, ws::Event},
-    backend::{BackendPieceState, QueueMove},
+    backend::{BackendPeer, BackendPieceState, QueueMove},
     cache::{AppEventRow, ListParams, RssRule, TorrentRow},
     rtorrent::TransferRates,
 };
@@ -113,9 +113,9 @@ pub fn build_router(_state: AppState) -> Router<AppState> {
         .route("/transfer/setUploadLimit", post(transfer_set_upload_limit))
         .route("/transfer/banPeers", post(ok_form))
         .route("/log/main", get(log_main))
-        .route("/log/peers", get(empty_array))
+        .route("/log/peers", get(log_peers))
         .route("/search/status", get(search_status))
-        .route("/search/categories", get(empty_array))
+        .route("/search/categories", get(search_categories))
         .route("/search/plugins", get(search_plugins))
         .route("/search/installPlugin", post(search_install_plugin))
         .route("/search/uninstallPlugin", post(search_uninstall_plugin))
@@ -191,10 +191,6 @@ async fn ok_form(Form(_f): Form<HashMap<String, String>>) -> StatusCode {
     StatusCode::OK
 }
 
-async fn empty_array() -> Json<serde_json::Value> {
-    Json(json!([]))
-}
-
 #[derive(Debug, Deserialize)]
 struct LogMainQuery {
     limit: Option<usize>,
@@ -242,6 +238,38 @@ async fn log_main(State(s): State<AppState>, Query(q): Query<LogMainQuery>) -> i
             (StatusCode::OK, Json(Vec::<QbLogEntry>::new()))
         }
     }
+}
+
+async fn log_peers(State(s): State<AppState>) -> impl IntoResponse {
+    let hashes = match s.db.list(&ListParams {
+        limit: Some(50_000),
+        ..Default::default()
+    }) {
+        Ok((rows, _)) => rows.into_iter().map(|row| row.hash).collect::<Vec<_>>(),
+        Err(e) => {
+            tracing::warn!(
+                component = "api",
+                operation = "log_peers",
+                result = "error",
+                error = %e,
+                "failed to read torrent cache for peer log"
+            );
+            return (StatusCode::OK, Json(Vec::<serde_json::Value>::new()));
+        }
+    };
+
+    let mut entries = Vec::new();
+    for hash in hashes {
+        let Ok(peers) = s.backend.list_peers(&hash).await else {
+            continue;
+        };
+        entries.extend(
+            peers
+                .into_iter()
+                .map(|peer| qbit_peer_log_entry(&hash, peer)),
+        );
+    }
+    (StatusCode::OK, Json(entries))
 }
 
 impl LogMainQuery {
@@ -299,6 +327,21 @@ fn qbit_log_entry(row: crate::cache::AppEventRow) -> QbLogEntry {
     }
 }
 
+fn qbit_peer_log_entry(info_hash: &str, peer: BackendPeer) -> serde_json::Value {
+    json!({
+        "torrent": info_hash,
+        "ip": peer.addr.ip().to_string(),
+        "port": peer.addr.port(),
+        "client": peer.client,
+        "connection": "BT",
+        "progress": peer.progress,
+        "dl_speed": peer.download_rate,
+        "up_speed": peer.upload_rate,
+        "downloaded": peer.downloaded,
+        "uploaded": peer.uploaded,
+    })
+}
+
 async fn search_status(State(s): State<AppState>) -> Json<serde_json::Value> {
     let jobs = s.qbit_search_jobs.read().await;
     let running = jobs
@@ -326,6 +369,29 @@ async fn search_plugins(State(s): State<AppState>) -> Json<serde_json::Value> {
         .cloned()
         .collect::<Vec<_>>();
     Json(json!(plugins))
+}
+
+async fn search_categories(State(s): State<AppState>) -> Json<serde_json::Value> {
+    let plugins = s.qbit_search_plugins.read().await;
+    let mut categories = std::collections::BTreeSet::new();
+    for plugin in plugins.values() {
+        if plugin.get("enabled").and_then(|v| v.as_bool()) == Some(false) {
+            continue;
+        }
+        let Some(values) = plugin
+            .get("supportedCategories")
+            .and_then(|value| value.as_array())
+        else {
+            continue;
+        };
+        for category in values.iter().filter_map(|value| value.as_str()) {
+            let category = category.trim();
+            if !category.is_empty() {
+                categories.insert(category.to_owned());
+            }
+        }
+    }
+    Json(json!(categories.into_iter().collect::<Vec<_>>()))
 }
 
 async fn search_install_plugin(

@@ -138,6 +138,13 @@ pub trait TorrentBackend: Send + Sync {
         )
     }
 
+    async fn list_peers(&self, _hash: &str) -> Result<Vec<BackendPeer>> {
+        bail!(
+            "{} backend does not support peer snapshot reads",
+            self.backend_type().as_str()
+        )
+    }
+
     async fn set_file_priority(&self, hash: &str, file_index: usize, priority: i64) -> Result<()>;
     async fn set_category(&self, hash: &str, category: &str) -> Result<()>;
     async fn set_location(&self, _hash: &str, _location: &str) -> Result<()> {
@@ -358,4 +365,15 @@ pub enum BackendPieceState {
     Missing,
     Partial,
     Complete,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BackendPeer {
+    pub addr: SocketAddr,
+    pub client: String,
+    pub progress: f64,
+    pub download_rate: i64,
+    pub upload_rate: i64,
+    pub downloaded: i64,
+    pub uploaded: i64,
 }

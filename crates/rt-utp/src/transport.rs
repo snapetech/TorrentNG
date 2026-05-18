@@ -72,6 +72,16 @@ pub struct UtpStats {
     pub recv_timeouts: u64,
     pub retransmits: u64,
     pub route_drops: u64,
+    pub rtt_samples: u64,
+    pub rtt_us: u64,
+    pub rtt_min_us: u64,
+    pub rtt_max_us: u64,
+    pub rtt_var_us: u64,
+    pub retransmit_timeout_us: u64,
+    pub congestion_window_bytes: u64,
+    pub congestion_base_delay_us: u64,
+    pub congestion_current_delay_us: u64,
+    pub bytes_in_flight: u64,
 }
 
 static UTP_CONNECTS: AtomicU64 = AtomicU64::new(0);
@@ -82,6 +92,16 @@ static UTP_SEND_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 static UTP_RECV_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 static UTP_RETRANSMITS: AtomicU64 = AtomicU64::new(0);
 static UTP_ROUTE_DROPS: AtomicU64 = AtomicU64::new(0);
+static UTP_RTT_SAMPLES: AtomicU64 = AtomicU64::new(0);
+static UTP_RTT_US: AtomicU64 = AtomicU64::new(0);
+static UTP_RTT_MIN_US: AtomicU64 = AtomicU64::new(0);
+static UTP_RTT_MAX_US: AtomicU64 = AtomicU64::new(0);
+static UTP_RTT_VAR_US: AtomicU64 = AtomicU64::new(0);
+static UTP_RETRANSMIT_TIMEOUT_US: AtomicU64 = AtomicU64::new(0);
+static UTP_CONGESTION_WINDOW_BYTES: AtomicU64 = AtomicU64::new(0);
+static UTP_CONGESTION_BASE_DELAY_US: AtomicU64 = AtomicU64::new(0);
+static UTP_CONGESTION_CURRENT_DELAY_US: AtomicU64 = AtomicU64::new(0);
+static UTP_BYTES_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
 
 pub fn stats_snapshot() -> UtpStats {
     UtpStats {
@@ -93,6 +113,51 @@ pub fn stats_snapshot() -> UtpStats {
         recv_timeouts: UTP_RECV_TIMEOUTS.load(Ordering::Relaxed),
         retransmits: UTP_RETRANSMITS.load(Ordering::Relaxed),
         route_drops: UTP_ROUTE_DROPS.load(Ordering::Relaxed),
+        rtt_samples: UTP_RTT_SAMPLES.load(Ordering::Relaxed),
+        rtt_us: UTP_RTT_US.load(Ordering::Relaxed),
+        rtt_min_us: UTP_RTT_MIN_US.load(Ordering::Relaxed),
+        rtt_max_us: UTP_RTT_MAX_US.load(Ordering::Relaxed),
+        rtt_var_us: UTP_RTT_VAR_US.load(Ordering::Relaxed),
+        retransmit_timeout_us: UTP_RETRANSMIT_TIMEOUT_US.load(Ordering::Relaxed),
+        congestion_window_bytes: UTP_CONGESTION_WINDOW_BYTES.load(Ordering::Relaxed),
+        congestion_base_delay_us: UTP_CONGESTION_BASE_DELAY_US.load(Ordering::Relaxed),
+        congestion_current_delay_us: UTP_CONGESTION_CURRENT_DELAY_US.load(Ordering::Relaxed),
+        bytes_in_flight: UTP_BYTES_IN_FLIGHT.load(Ordering::Relaxed),
+    }
+}
+
+fn observe_connection(conn: &UtpConnection) {
+    UTP_RETRANSMIT_TIMEOUT_US.store(conn.retransmit_timeout_us(), Ordering::Relaxed);
+    UTP_CONGESTION_WINDOW_BYTES.store(conn.congestion_window_bytes() as u64, Ordering::Relaxed);
+    UTP_BYTES_IN_FLIGHT.store(conn.bytes_in_flight() as u64, Ordering::Relaxed);
+    if let Some(rtt) = conn.rtt_us() {
+        let rtt = rtt as u64;
+        UTP_RTT_SAMPLES.fetch_add(1, Ordering::Relaxed);
+        UTP_RTT_US.store(rtt, Ordering::Relaxed);
+        record_nonzero_min(&UTP_RTT_MIN_US, rtt);
+        UTP_RTT_MAX_US.fetch_max(rtt, Ordering::Relaxed);
+    }
+    if let Some(rtt_var) = conn.rtt_var_us() {
+        UTP_RTT_VAR_US.store(rtt_var as u64, Ordering::Relaxed);
+    }
+    if let Some(base_delay) = conn.congestion_base_delay_us() {
+        UTP_CONGESTION_BASE_DELAY_US.store(base_delay as u64, Ordering::Relaxed);
+    }
+    if let Some(current_delay) = conn.congestion_current_delay_us() {
+        UTP_CONGESTION_CURRENT_DELAY_US.store(current_delay as u64, Ordering::Relaxed);
+    }
+}
+
+fn record_nonzero_min(target: &AtomicU64, value: u64) {
+    let mut current = target.load(Ordering::Relaxed);
+    loop {
+        if current != 0 && current <= value {
+            return;
+        }
+        match target.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(next) => current = next,
+        }
     }
 }
 
@@ -156,6 +221,7 @@ impl UtpListener {
             let conn = UtpConnection::accept(&packet.header, random_seq_nr())?;
             let state = conn.build_state(now_us(), timestamp_diff_us(packet.header.timestamp_us));
             send_packet(&self.socket, &state).await?;
+            observe_connection(&conn);
             UTP_ACCEPTS.fetch_add(1, Ordering::Relaxed);
             return Ok(UtpStream {
                 socket: Arc::new(self.socket),
@@ -289,6 +355,7 @@ async fn run_endpoint_recv(
             read_buf: Vec::new(),
             routed_rx: Some(rx),
         };
+        observe_connection(&stream.conn);
         UTP_ACCEPTS.fetch_add(1, Ordering::Relaxed);
         if accepted_tx.send(Ok(stream)).await.is_err() {
             break;
@@ -333,6 +400,7 @@ impl UtpStream {
         }
         let packet = packet.ok_or(UtpError::Timeout)?;
         conn.on_inbound(&packet)?;
+        observe_connection(&conn);
         if !conn.is_established() {
             return Err(UtpError::InvalidStatePacket {
                 state: conn.state(),
@@ -377,6 +445,7 @@ impl UtpStream {
                         Ok(ack) => ack,
                         Err(UtpError::Timeout) => {
                             self.conn.on_timeout();
+                            observe_connection(&self.conn);
                             UTP_SEND_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
                             break;
                         }
@@ -384,6 +453,7 @@ impl UtpStream {
                     };
                     self.last_remote_timestamp_us = ack.header.timestamp_us;
                     self.conn.on_inbound(&ack)?;
+                    observe_connection(&self.conn);
                     if ack.header.packet_type == PacketType::State {
                         acknowledged = true;
                         break;
@@ -431,7 +501,9 @@ impl UtpStream {
         loop {
             let packet = self.recv_packet(self.config.io_timeout).await?;
             self.last_remote_timestamp_us = packet.header.timestamp_us;
-            match self.conn.on_inbound(&packet)? {
+            let action = self.conn.on_inbound(&packet)?;
+            observe_connection(&self.conn);
+            match action {
                 InboundAction::DeliverPayload => {
                     let ack = self
                         .conn
@@ -471,6 +543,7 @@ impl UtpStream {
                 }
                 Err(UtpError::Timeout) => {
                     self.conn.on_timeout();
+                    observe_connection(&self.conn);
                     UTP_SEND_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
@@ -479,6 +552,7 @@ impl UtpStream {
         }
         let packet = packet.ok_or(UtpError::Timeout)?;
         self.conn.on_inbound(&packet)?;
+        observe_connection(&self.conn);
         self.conn.mark_closed();
         Ok(())
     }

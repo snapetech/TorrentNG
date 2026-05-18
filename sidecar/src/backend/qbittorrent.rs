@@ -4,8 +4,8 @@ use reqwest::Url;
 use std::{collections::BTreeMap, net::SocketAddr};
 
 use super::{
-    BackendCapabilities, BackendPieceState, BackendStatus, BackendTransferLimits, BackendType,
-    QueueMove, TorrentBackend,
+    BackendCapabilities, BackendPeer, BackendPieceState, BackendStatus, BackendTransferLimits,
+    BackendType, QueueMove, TorrentBackend,
 };
 use crate::{
     config::QbittorrentConfig,
@@ -365,6 +365,16 @@ impl TorrentBackend for QbittorrentBackend {
         .await
     }
 
+    async fn list_peers(&self, hash: &str) -> Result<Vec<BackendPeer>> {
+        let response: serde_json::Value = self
+            .get_json(&format!(
+                "api/v2/sync/torrentPeers?hash={}",
+                urlencoding::encode(hash)
+            ))
+            .await?;
+        Ok(parse_qbit_peer_response(&response))
+    }
+
     async fn set_file_priority(&self, hash: &str, file_index: usize, priority: i64) -> Result<()> {
         self.post_form(
             "api/v2/torrents/filePrio",
@@ -683,5 +693,86 @@ fn map_file((index, file): (usize, QbitFile)) -> RawFile {
         priority: file.priority,
         is_created: true,
         is_open: true,
+    }
+}
+
+fn parse_qbit_peer_response(response: &serde_json::Value) -> Vec<BackendPeer> {
+    response
+        .get("peers")
+        .and_then(|peers| peers.as_object())
+        .map(|peers| {
+            peers
+                .iter()
+                .filter_map(|(key, peer)| parse_qbit_peer(key, peer))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_qbit_peer(key: &str, peer: &serde_json::Value) -> Option<BackendPeer> {
+    let addr = if let Some(ip) = peer.get("ip").and_then(|value| value.as_str()) {
+        let port = peer.get("port").and_then(|value| value.as_u64()).unwrap_or(0);
+        format!("{ip}:{port}").parse().ok()?
+    } else {
+        key.parse().ok()?
+    };
+    Some(BackendPeer {
+        addr,
+        client: peer
+            .get("client")
+            .or_else(|| peer.get("peer_id_client"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_owned(),
+        progress: peer
+            .get("progress")
+            .or_else(|| peer.get("relevance"))
+            .and_then(|value| value.as_f64())
+            .unwrap_or(0.0),
+        download_rate: peer
+            .get("dl_speed")
+            .and_then(|value| value.as_i64())
+            .unwrap_or(0),
+        upload_rate: peer
+            .get("up_speed")
+            .and_then(|value| value.as_i64())
+            .unwrap_or(0),
+        downloaded: peer
+            .get("downloaded")
+            .and_then(|value| value.as_i64())
+            .unwrap_or(0),
+        uploaded: peer
+            .get("uploaded")
+            .and_then(|value| value.as_i64())
+            .unwrap_or(0),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_qbit_peer_response() {
+        let response = serde_json::json!({
+            "peers": {
+                "127.0.0.1:6881": {
+                    "client": "TorrentNG",
+                    "progress": 0.5,
+                    "dl_speed": 1024,
+                    "up_speed": 512,
+                    "downloaded": 4096,
+                    "uploaded": 2048
+                }
+            }
+        });
+
+        let peers = parse_qbit_peer_response(&response);
+
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].addr, "127.0.0.1:6881".parse().unwrap());
+        assert_eq!(peers[0].client, "TorrentNG");
+        assert_eq!(peers[0].download_rate, 1024);
+        assert_eq!(peers[0].upload_rate, 512);
     }
 }

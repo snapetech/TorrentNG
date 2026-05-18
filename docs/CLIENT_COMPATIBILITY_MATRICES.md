@@ -136,7 +136,7 @@ Local implementation: `crates/rt-api-qbit`.
 | Limits/modes | `downloadLimit`, `setDownloadLimit`, `uploadLimit`, `setUploadLimit`, `setShareLimits`, `setForceStart`, `setSuperSeeding`, `setAutoTMM`, `setAutoManagement`, `toggleSequentialDownload`, `toggleFirstLastPiecePrio` | Same | Partial/Compat | Limit read/write, sequential/first-last/super-seeding native effects implemented; remaining modes are state/projection unless tied to active engine behavior |
 | Sync | `sync/maindata`, `sync/torrentPeers` | Same | Native/Partial peers; maindata includes broad torrent/server-state keys, torrentPeers has qBit peer shape and stable RID deltas | Full sync, delta sync, peer sync row |
 | Transfer | `transfer/info`, download/upload limits, speed limits mode, toggle, setters, `banPeers` | Same | Native/Compat | Global limit and ban accepted rows |
-| Logs | `log/main`, `log/peers` | Same | Native/Compat | Main log projects retained native session events, sidecar app events, and optional ingested rTorrent logs with qBit severity filters; peer log projects bounded native peer snapshots when an engine is attached |
+| Logs | `log/main`, `log/peers` | Same | Native/Compat | Main log projects retained native session events, sidecar app events, and optional ingested rTorrent logs with qBit severity filters; peer log projects native/qB backend peer snapshots where supported |
 | Search | status/categories/plugins/install/uninstall/enable/update/start/stop/results/delete | Same | Compat | Plugin install/enable/uninstall plus job start/results/delete lifecycle |
 | RSS | items/rules/matchingArticles/addFolder/addFeed/removeItem/moveItem/markAsRead/refreshItem/setRule/renameRule/removeRule | Same | Compat | Folder/feed and rule mutation round-trip |
 

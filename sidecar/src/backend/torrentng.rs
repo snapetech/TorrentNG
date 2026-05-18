@@ -6,8 +6,8 @@ use serde_json::{json, Value};
 use std::{collections::BTreeMap, net::SocketAddr};
 
 use super::{
-    BackendCapabilities, BackendPieceState, BackendStatus, BackendTransferLimits, BackendType,
-    QueueMove, TorrentBackend,
+    BackendCapabilities, BackendPeer, BackendPieceState, BackendStatus, BackendTransferLimits,
+    BackendType, QueueMove, TorrentBackend,
 };
 use crate::{
     config::TorrentngConfig,
@@ -306,6 +306,16 @@ impl TorrentBackend for TorrentngBackend {
             urlencoding::encode(hash)
         ))
         .await
+    }
+
+    async fn list_peers(&self, hash: &str) -> Result<Vec<BackendPeer>> {
+        let response: Value = self
+            .get_json(&format!(
+                "api/qb/v2/sync/torrentPeers?hash={}",
+                urlencoding::encode(hash)
+            ))
+            .await?;
+        Ok(parse_qbit_peer_response(&response))
     }
 
     async fn set_file_priority(&self, hash: &str, file_index: usize, priority: i64) -> Result<()> {
@@ -678,6 +688,46 @@ fn int(value: &Value, key: &str) -> i64 {
                 .map(|value| value as i64)
         })
         .unwrap_or(0)
+}
+
+fn parse_qbit_peer_response(response: &Value) -> Vec<BackendPeer> {
+    response
+        .get("peers")
+        .and_then(Value::as_object)
+        .map(|peers| {
+            peers
+                .iter()
+                .filter_map(|(key, peer)| parse_qbit_peer(key, peer))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_qbit_peer(key: &str, peer: &Value) -> Option<BackendPeer> {
+    let addr = if let Some(ip) = peer.get("ip").and_then(Value::as_str) {
+        let port = peer.get("port").and_then(Value::as_u64).unwrap_or(0);
+        format!("{ip}:{port}").parse().ok()?
+    } else {
+        key.parse().ok()?
+    };
+    Some(BackendPeer {
+        addr,
+        client: peer
+            .get("client")
+            .or_else(|| peer.get("peer_id_client"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        progress: peer
+            .get("progress")
+            .or_else(|| peer.get("relevance"))
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0),
+        download_rate: int(peer, "dl_speed"),
+        upload_rate: int(peer, "up_speed"),
+        downloaded: int(peer, "downloaded"),
+        uploaded: int(peer, "uploaded"),
+    })
 }
 
 #[cfg(test)]

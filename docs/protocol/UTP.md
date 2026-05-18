@@ -107,8 +107,9 @@ Before flipping `networking.utp_transport=true`, the engine still needs:
 - default peer dialing policy that chooses TCP or uTP based on
   tracker/DHT/PEX peer source, user preference, and private-torrent policy;
 - metadata exchange over `UtpStream`;
-- metrics for uTP connects, accepts, retransmits, timeouts, congestion window,
-  RTT, bytes, and failures;
+- production alert thresholds and dashboards for the exported uTP connects,
+  accepts, retransmits, timeouts, congestion window, RTT, bytes, and failure
+  metrics;
 - integration tests proving a torrent can complete through uTP.
 
 Until those pieces are wired, `networking.utp_packet_codec=true` and

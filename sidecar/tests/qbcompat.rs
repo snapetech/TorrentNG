@@ -2429,6 +2429,16 @@ async fn qb_search_plugins_jobs_and_rss_items_are_stateful() {
         .unwrap();
     assert_eq!(plugins.as_array().unwrap()[0]["name"], "linux.py");
 
+    let categories: serde_json::Value = client
+        .get(url(addr, "/api/qb/v2/search/categories"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(categories, serde_json::json!(["all"]));
+
     let res = client
         .post(url(addr, "/api/qb/v2/search/enablePlugin"))
         .form(&[("names", "linux.py"), ("enable", "false")])
@@ -2446,6 +2456,16 @@ async fn qb_search_plugins_jobs_and_rss_items_are_stateful() {
         .await
         .unwrap();
     assert_eq!(plugins.as_array().unwrap()[0]["enabled"], false);
+
+    let categories: serde_json::Value = client
+        .get(url(addr, "/api/qb/v2/search/categories"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(categories, serde_json::json!([]));
 
     let job: serde_json::Value = client
         .post(url(addr, "/api/qb/v2/search/start"))
