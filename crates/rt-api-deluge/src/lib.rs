@@ -4,7 +4,10 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use axum::{extract::State, response::IntoResponse, routing::post, Json, Router};
 use base64::{engine::general_purpose, Engine as _};
-use rt_engine::{EngineHandle, EnginePeerSnapshot, EngineTorrentLimits, EngineTorrentMetadata};
+use rt_engine::{
+    EngineHandle, EnginePeerSnapshot, EngineTorrentLimits, EngineTorrentMetadata,
+    EngineTrackerSnapshot,
+};
 use rt_metainfo::{parse_magnet, parse_torrent};
 use rt_metrics::{MemoryClass, MemoryLease};
 use rt_session::SessionRegistry;
@@ -795,6 +798,7 @@ async fn update_ui(state: &AppState, params: &[Value]) -> Result<Value, String> 
     };
     let mut metadata = std::collections::HashMap::new();
     let mut peers = std::collections::HashMap::new();
+    let mut trackers = std::collections::HashMap::new();
     let mut limits_by_hash = state.torrent_options.read().await.clone();
     let move_completed_by_hash = state.move_completed_options.read().await.clone();
     if let Some(engine) = &state.engine {
@@ -810,6 +814,11 @@ async fn update_ui(state: &AppState, params: &[Value]) -> Result<Value, String> 
             if let Ok(limits) = engine.torrent_limits(entry.info_hash.clone()).await {
                 limits_by_hash.insert(entry.info_hash.clone(), limits);
             }
+            if deluge_fields_need_trackers(&wanted_fields) {
+                if let Ok(snapshot) = engine.torrent_trackers(entry.info_hash.clone()).await {
+                    trackers.insert(entry.info_hash.clone(), snapshot);
+                }
+            }
         }
     }
     let torrents = entries
@@ -822,6 +831,7 @@ async fn update_ui(state: &AppState, params: &[Value]) -> Result<Value, String> 
                         entry,
                         metadata.get(&entry.info_hash),
                         peers.get(&entry.info_hash).map(Vec::as_slice),
+                        trackers.get(&entry.info_hash).map(Vec::as_slice),
                         limits_by_hash.get(&entry.info_hash),
                         move_completed_by_hash.get(&entry.info_hash),
                     ),
@@ -917,6 +927,7 @@ async fn torrents_status(state: &AppState, params: &[Value]) -> Result<Value, St
     };
     let mut metadata = std::collections::HashMap::new();
     let mut peers = std::collections::HashMap::new();
+    let mut trackers = std::collections::HashMap::new();
     let mut limits_by_hash = state.torrent_options.read().await.clone();
     let move_completed_by_hash = state.move_completed_options.read().await.clone();
     if let Some(engine) = &state.engine {
@@ -932,6 +943,11 @@ async fn torrents_status(state: &AppState, params: &[Value]) -> Result<Value, St
             if let Ok(limits) = engine.torrent_limits(entry.info_hash.clone()).await {
                 limits_by_hash.insert(entry.info_hash.clone(), limits);
             }
+            if deluge_fields_need_trackers(&wanted_fields) {
+                if let Ok(snapshot) = engine.torrent_trackers(entry.info_hash.clone()).await {
+                    trackers.insert(entry.info_hash.clone(), snapshot);
+                }
+            }
         }
     }
     let torrents = entries
@@ -945,6 +961,7 @@ async fn torrents_status(state: &AppState, params: &[Value]) -> Result<Value, St
                         entry,
                         metadata.get(&entry.info_hash),
                         peers.get(&entry.info_hash).map(Vec::as_slice),
+                        trackers.get(&entry.info_hash).map(Vec::as_slice),
                         limits_by_hash.get(&entry.info_hash),
                         move_completed_by_hash.get(&entry.info_hash),
                     ),
@@ -1024,6 +1041,11 @@ async fn torrent_status(
     } else {
         None
     };
+    let trackers = if let Some(engine) = &state.engine {
+        engine.torrent_trackers(hash.to_owned()).await.ok()
+    } else {
+        None
+    };
     let limits = deluge_torrent_limits(state, hash).await;
     let move_completed = state.move_completed_options.read().await.get(hash).cloned();
     let wanted_fields = deluge_requested_fields(fields);
@@ -1032,6 +1054,7 @@ async fn torrent_status(
             &entry,
             meta.as_ref(),
             peers.as_deref(),
+            trackers.as_deref(),
             limits.as_ref(),
             move_completed.as_ref(),
         ),
@@ -1091,6 +1114,18 @@ fn deluge_fields_need_peers(fields: &Option<std::collections::BTreeSet<String>>)
     })
 }
 
+fn deluge_fields_need_trackers(fields: &Option<std::collections::BTreeSet<String>>) -> bool {
+    let Some(fields) = fields else {
+        return true;
+    };
+    fields.iter().any(|field| {
+        matches!(
+            field.as_str(),
+            "tracker" | "tracker_host" | "tracker_status" | "next_announce"
+        )
+    })
+}
+
 async fn torrent_files(state: &AppState, hash: &str) -> Result<Value, String> {
     if let Some(engine) = &state.engine {
         if let Ok(meta) = engine.torrent_metadata(hash.to_owned()).await {
@@ -1115,6 +1150,7 @@ fn deluge_torrent(
     entry: &rt_session::TorrentEntry,
     meta: Option<&EngineTorrentMetadata>,
     peers: Option<&[EnginePeerSnapshot]>,
+    trackers: Option<&[EngineTrackerSnapshot]>,
     limits: Option<&EngineTorrentLimits>,
     move_completed: Option<&DelugeMoveCompletedOptions>,
 ) -> Value {
@@ -1125,18 +1161,18 @@ fn deluge_torrent(
         entry.total_length.saturating_sub(entry.amount_left) as f64 * 100.0
             / entry.total_length as f64
     };
-    let tracker = meta
-        .and_then(|meta| meta.trackers.first())
-        .cloned()
-        .unwrap_or_default();
     let message = entry.error_message.clone().unwrap_or_default();
-    let tracker_status = if entry.state.as_str() == "error" && !message.is_empty() {
-        format!("Error: {message}")
-    } else if tracker.is_empty() {
-        String::new()
-    } else {
-        "Announce OK".to_owned()
-    };
+    let tracker_state = trackers.and_then(|trackers| trackers.first());
+    let tracker = tracker_state
+        .map(|tracker| tracker.announce.clone())
+        .or_else(|| meta.and_then(|meta| meta.trackers.first()).cloned())
+        .unwrap_or_default();
+    let next_announce = tracker_state
+        .and_then(|tracker| tracker.next_announce_at)
+        .unwrap_or(0);
+    let tracker_status = tracker_state
+        .map(deluge_tracker_status)
+        .unwrap_or_else(|| deluge_fallback_tracker_status(entry, &tracker));
     json!({
         "hash": entry.info_hash,
         "name": entry.name,
@@ -1181,7 +1217,7 @@ fn deluge_torrent(
         "total_uploaded": entry.stats.uploaded,
         "total_payload_upload": entry.stats.uploaded,
         "total_payload_download": entry.stats.downloaded,
-        "next_announce": 0,
+        "next_announce": next_announce,
         "private": meta.map(|meta| meta.is_private).unwrap_or(false),
         "owner": "localclient",
         "shared": false,
@@ -1202,6 +1238,42 @@ fn tracker_host(announce: &str) -> String {
         .next()
         .unwrap_or_default()
         .to_owned()
+}
+
+fn deluge_tracker_status(tracker: &EngineTrackerSnapshot) -> String {
+    if let Some(reason) = tracker
+        .failure_reason
+        .as_deref()
+        .filter(|reason| !reason.is_empty())
+    {
+        return format!("Error: {reason}");
+    }
+    if let Some(warning) = tracker
+        .warning_message
+        .as_deref()
+        .filter(|warning| !warning.is_empty())
+    {
+        return format!("Warning: {warning}");
+    }
+    match tracker.status.as_str() {
+        "working" => "Announce OK".to_owned(),
+        "error" => "Error".to_owned(),
+        "warning" => "Warning".to_owned(),
+        "pending" => "Announce pending".to_owned(),
+        status if status.is_empty() => String::new(),
+        status => status.to_owned(),
+    }
+}
+
+fn deluge_fallback_tracker_status(entry: &rt_session::TorrentEntry, tracker: &str) -> String {
+    let message = entry.error_message.clone().unwrap_or_default();
+    if entry.state.as_str() == "error" && !message.is_empty() {
+        format!("Error: {message}")
+    } else if tracker.is_empty() {
+        String::new()
+    } else {
+        "Announce OK".to_owned()
+    }
 }
 
 fn deluge_peer_download_rate(peers: Option<&[EnginePeerSnapshot]>) -> i64 {
@@ -2123,6 +2195,36 @@ mod tests {
         );
         assert_eq!(deluge_distributed_copies(Some(&peers)), 1.0);
         assert_eq!(deluge_seeds_peers_ratio(Some(&peers)), 1.0);
+    }
+
+    #[test]
+    fn deluge_tracker_projection_uses_persisted_engine_state() {
+        let tracker = EngineTrackerSnapshot {
+            id: 1,
+            tier: 0,
+            announce: "https://tracker.example/announce".to_owned(),
+            status: "warning".to_owned(),
+            last_announce_at: Some(100),
+            next_announce_at: Some(200),
+            last_success_at: Some(90),
+            failure_reason: None,
+            warning_message: Some("slow scrape".to_owned()),
+            seeders: Some(3),
+            leechers: Some(4),
+            completed: Some(5),
+        };
+        assert_eq!(
+            deluge_tracker_status(&tracker),
+            "Warning: slow scrape".to_owned()
+        );
+        let mut entry = TorrentEntry::new("c".repeat(40), "charlie".into(), "/data".into());
+        entry.total_length = 100;
+        entry.amount_left = 50;
+        let body = deluge_torrent(&entry, None, None, Some(&[tracker]), None, None);
+        assert_eq!(body["tracker"], "https://tracker.example/announce");
+        assert_eq!(body["tracker_host"], "tracker.example");
+        assert_eq!(body["tracker_status"], "Warning: slow scrape");
+        assert_eq!(body["next_announce"], 200);
     }
 
     fn assert_json_keys(value: &Value, keys: &[&str]) {

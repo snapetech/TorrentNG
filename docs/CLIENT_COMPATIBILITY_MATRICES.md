@@ -205,7 +205,7 @@ Deluge torrent status field matrix:
 | State/time | `state`, `is_finished`, `eta`, `time_added`, `completed_time`, `active_time`, `seeding_time`, `finished_time` | Compat/native; ETA remains placeholder without live rate |
 | Rates/counters | download/upload rates, total payload download/upload, all-time download, ratio | Native/compat: rates project native peer snapshots when available; counters project registry stats |
 | Peers/seeds | `num_peers`, `num_seeds`, `total_peers`, `total_seeds`, distributed copies | Native/compat from peer snapshots when an engine is attached |
-| Trackers | `tracker`, `tracker_host`, `tracker_status`, `next_announce` | Partial |
+| Trackers | `tracker`, `tracker_host`, `tracker_status`, `next_announce` | Native/Partial; persisted engine tracker rows project URL, host, status/warning/error text, and next announce where available |
 | Options | max speeds, auto managed, stop ratio, move completed, sequential, super seeding, first/last | Compat/native for speed, auto-managed, stop ratio, move-completed, sequential, super seeding, first/last |
 | Messages | `comment`, `message`, `private` | Compat/native for error message and private flag; torrent comments remain placeholder |
 
