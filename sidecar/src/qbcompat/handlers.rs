@@ -96,9 +96,9 @@ pub fn build_router(_state: AppState) -> Router<AppState> {
         .route("/transfer/speedLimitsMode", get(zero_text))
         .route("/transfer/toggleSpeedLimitsMode", post(ok_form))
         .route("/transfer/downloadLimit", get(zero_text))
-        .route("/transfer/setDownloadLimit", post(ok_form))
+        .route("/transfer/setDownloadLimit", post(transfer_set_download_limit))
         .route("/transfer/uploadLimit", get(zero_text))
-        .route("/transfer/setUploadLimit", post(ok_form))
+        .route("/transfer/setUploadLimit", post(transfer_set_upload_limit))
         .route("/transfer/banPeers", post(ok_form))
         .route("/log/main", get(log_main))
         .route("/log/peers", get(empty_array))
@@ -1710,6 +1710,44 @@ async fn torrents_set_speed_limit(
                 "qBit speed limit update failed"
             );
         }
+    }
+    StatusCode::OK
+}
+
+async fn transfer_set_download_limit(
+    State(s): State<AppState>,
+    Form(f): Form<SpeedLimitForm>,
+) -> StatusCode {
+    transfer_set_speed_limit(s, f.limit.unwrap_or(0), true).await
+}
+
+async fn transfer_set_upload_limit(
+    State(s): State<AppState>,
+    Form(f): Form<SpeedLimitForm>,
+) -> StatusCode {
+    transfer_set_speed_limit(s, f.limit.unwrap_or(0), false).await
+}
+
+async fn transfer_set_speed_limit(s: AppState, limit: i64, download: bool) -> StatusCode {
+    let limit = limit.max(0);
+    let operation = if download {
+        "set_global_download_limit"
+    } else {
+        "set_global_upload_limit"
+    };
+    let result = if download {
+        s.backend.set_global_download_limit(limit).await
+    } else {
+        s.backend.set_global_upload_limit(limit).await
+    };
+    if let Err(e) = result {
+        tracing::warn!(
+            component = "qbcompat",
+            operation,
+            result = "error",
+            error = %e,
+            "qBit global speed limit update failed"
+        );
     }
     StatusCode::OK
 }
