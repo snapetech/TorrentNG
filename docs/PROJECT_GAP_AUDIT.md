@@ -216,10 +216,11 @@ The full Docker interop matrix still has release evidence to run:
 - public legal torrent matrix;
 - planned protocol rows: DHT-only magnet, private torrent DHT/PEX policy,
   endgame multi-peer, and TorrentNG as the sole long-running seeder for
-  reference clients; `resume-after-partial-download` and
-  `force-recheck-corruption-repair` are now implemented Docker protocol rows
-  covering preseeded partial restart/resume and corrupt payload repair with
-  final hash verification;
+  reference clients; `resume-after-partial-download`,
+  `force-recheck-corruption-repair`, and `missing-file-recovery` are now
+  implemented Docker protocol rows covering preseeded partial restart/resume,
+  corrupt payload repair, and deleted payload recreation with final hash
+  verification;
 - expansion backlog for DHT/PEX/LSD, multi-tracker tiers, file layout edge
   cases, network adversity, stress, and seeding behavior.
 

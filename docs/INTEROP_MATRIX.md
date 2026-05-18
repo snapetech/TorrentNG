@@ -127,6 +127,7 @@ or compatibility behaviors.
 | `rust-partial-file-selection` | Multi-file priority and wanted/unwanted file behavior during transfer. | Wanted files complete; skipped file remains absent or empty | Implemented |
 | `force-recheck-corruption-repair` | Complete from a local webseed, corrupt on-disk bytes, force recheck, and redownload the damaged range. | Corruption detected, repair completes, and final hash matches | Implemented |
 | `resume-after-partial-download` | Start with a valid partial 16 MiB fixture on disk, restart Rust after add, and resume through local webseed availability. | Rust restarts, resumes, completes, and final hash matches | Implemented |
+| `missing-file-recovery` | Complete from a local webseed, delete the payload file, force recheck, and redownload the missing file. | Missing file is detected, recreated, and final hash matches | Implemented |
 | `endgame-multi-peer` | Last-piece contention with multiple seeders. | Completes without duplicate-write corruption or stalls | Planned |
 | `rust-seeds-to-all-reference-clients` | Rust as the only long-running seeder for qBit, Transmission, Deluge, and rTorrent. | All reference clients complete from Rust alone | Planned |
 
@@ -158,6 +159,12 @@ Run the corruption-repair row directly:
 
 ```sh
 INTEROP_PROTOCOL_ONLY=force-recheck-corruption-repair scripts/interop_matrix.sh --local
+```
+
+Run the missing-file recovery row directly:
+
+```sh
+INTEROP_PROTOCOL_ONLY=missing-file-recovery scripts/interop_matrix.sh --local
 ```
 
 When `INTEROP_PROTOCOL_ONLY` is set, the runner skips the base local and

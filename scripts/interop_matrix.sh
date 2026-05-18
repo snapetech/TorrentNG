@@ -1032,6 +1032,34 @@ run_force_recheck_corruption_repair_case() {
   [[ "$status" == "PASS" ]]
 }
 
+run_missing_file_recovery_case() {
+  local status="PASS" fixture torrent info_hash
+  append_report "## Protocol Local: missing-file-recovery"
+  append_report ""
+  log "running protocol local case missing-file-recovery"
+  fixture="$(case_fixture single-16m missing-file-recovery)"
+  torrent="$(make_torrent "$fixture" "$fixture" webseed-only)"
+  info_hash="$(torrent_info_hash "$torrent")"
+  add_to_client torrentngd "$torrent" || status="FAIL"
+  wait_fixture_hashes "$TIMEOUT_LOCAL" torrentngd "$fixture" || status="FAIL"
+  compose exec -T torrentngd rm -f "/downloads/torrentngd/$fixture/payload.bin" || status="FAIL"
+  if verify_fixture_hashes torrentngd "$fixture"; then
+    status="FAIL"
+  fi
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
+    --data-urlencode "hashes=$info_hash" \
+    "$(client_url torrentngd)/api/qb/v2/torrents/recheck" >/dev/null || status="FAIL"
+  wait_fixture_hashes "$TIMEOUT_LOCAL" torrentngd "$fixture" || status="FAIL"
+  append_report "- Seeder: fixture-http webseed"
+  append_report "- Leecher: torrentngd"
+  append_report "- Fixture: single-16m"
+  append_report "- Deleted before recheck: payload.bin"
+  append_report "- Info hash: $info_hash"
+  append_report "- Status: **$status**"
+  append_report ""
+  [[ "$status" == "PASS" ]]
+}
+
 run_partial_file_selection_case() {
   local status="PASS" fixture torrent info_hash files
   append_report "## Protocol Local: rust-partial-file-selection"
@@ -1132,6 +1160,9 @@ run_protocol_local_matrix() {
   fi
   if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "force-recheck-corruption-repair" ]]; then
     run_force_recheck_corruption_repair_case || failures=$((failures + 1))
+  fi
+  if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "missing-file-recovery" ]]; then
+    run_missing_file_recovery_case || failures=$((failures + 1))
   fi
   if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "rust-partial-file-selection" ]]; then
     run_partial_file_selection_case || failures=$((failures + 1))
