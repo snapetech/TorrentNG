@@ -1105,8 +1105,14 @@ async fn torrent_get(state: &AppState, args: &Value) -> Result<Value, String> {
                     "errorString" | "error-string" => {
                         json!(entry.error_message.clone().unwrap_or_default())
                     }
-                    "eta" => json!(-1),
-                    "etaIdle" | "eta-idle" => json!(-1),
+                    "eta" => json!(transmission_eta(
+                        entry.amount_left,
+                        transmission_peer_download_rate(peers.get(&entry.info_hash))
+                    )),
+                    "etaIdle" | "eta-idle" => json!(transmission_eta(
+                        entry.amount_left,
+                        transmission_peer_download_rate(peers.get(&entry.info_hash))
+                    )),
                     "isPrivate" | "is-private" => {
                         json!(meta.map(|m| m.is_private).unwrap_or(false))
                     }
@@ -1345,6 +1351,16 @@ fn transmission_peer_upload_rate(peers: Option<&Vec<EnginePeerSnapshot>>) -> i64
                 .fold(0_i64, |sum, peer| sum.saturating_add(peer.upload_rate))
         })
         .unwrap_or(0)
+}
+
+fn transmission_eta(amount_left: u64, download_rate: i64) -> i64 {
+    if amount_left == 0 {
+        return 0;
+    }
+    if download_rate <= 0 {
+        return -1;
+    }
+    ((amount_left as f64) / (download_rate as f64)).ceil() as i64
 }
 
 fn transmission_files(
@@ -2380,6 +2396,9 @@ mod tests {
         assert_eq!(transmission_peer_upload_rate(Some(&peers)), 6_000);
         assert_eq!(transmission_peer_download_rate(None), 0);
         assert_eq!(transmission_peer_upload_rate(None), 0);
+        assert_eq!(transmission_eta(8_001, 4_000), 3);
+        assert_eq!(transmission_eta(0, 4_000), 0);
+        assert_eq!(transmission_eta(8_001, 0), -1);
     }
 
     #[tokio::test]

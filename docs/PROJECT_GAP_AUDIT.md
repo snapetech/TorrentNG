@@ -166,10 +166,11 @@ Remaining compatibility gaps:
 
 - Transmission: JSON-RPC 2.0 method errors, no-op notification subscription
   probes, broad mutable session settings, group limit state roundtrips, and
-  aggregate native peer rates are covered in the facade matrix. Tracker stats
-  now project persisted engine announce state, including timestamps, status
-  messages, and scrape counts; true push notification delivery and native group
-  scheduling effects remain future live-client parity work.
+  aggregate native peer rates are covered in the facade matrix. ETA now projects
+  from native peer rates, and tracker stats project persisted engine announce
+  state, including timestamps, status messages, and scrape counts; true push
+  notification delivery and native group scheduling effects remain future
+  live-client parity work.
 - Deluge: extractor, scheduler, execute, blocklist, and autoadd plugin-specific
   APIs now have structured compatibility surfaces with safe no-op mutations;
   torrent peer/rate fields project native snapshots when available; remaining
