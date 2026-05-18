@@ -1,0 +1,10 @@
+{
+  "torrents": [
+    {
+      "name": "torrentng-generated-deluge",
+      "download_location": "/downloads",
+      "label": "generated",
+      "paused": true
+    }
+  ]
+}

@@ -1,9 +1,12 @@
 # TorrentNG Migration Corpus
 
-This directory is the drop point for real exported migration fixtures. The
-synthetic `rt-migrate` fixture matrix covers known common aliases; this corpus is
-for artifacts exported from actual client installs so undocumented key variants,
-sidecar files, plugin state, and version-specific layouts are exercised.
+This directory contains a checked-in generated fixture corpus for deterministic
+strict local gates, and is also the drop point for additional real exported
+migration fixtures. The synthetic `rt-migrate` fixture matrix covers known
+common aliases; generated artifacts here keep every source-family directory and
+manifest path exercised in CI. Real client exports can be added beside these
+fixtures when release evidence needs undocumented key variants, sidecar files,
+plugin state, and version-specific layouts from actual installs.
 
 Expected source-family directories:
 
@@ -24,21 +27,18 @@ Run:
 scripts/migration_corpus_certification.sh
 ```
 
-By default the gate reports `PASS_WITH_GAPS` when real corpora are missing but
-the synthetic import/apply baseline passes. For a release run that must require
-the exported corpus, use:
+The checked-in generated manifest lets strict local corpus validation pass. For
+a release run that must require the corpus manifest and all declared artifacts,
+use:
 
 ```sh
 TNG_REQUIRE_MIGRATION_CORPUS=1 scripts/migration_corpus_certification.sh
 ```
 
-Use `manifest.example.toml` as the checklist for the exported client/version
-families that should be attached to a release evidence bundle. When real
-artifacts are present, copy it to `manifest.toml`; the certification script
-validates that all required families are listed and that declared artifact paths
-exist under the matching source-family directory. Each declared artifact must
-include source and permission metadata so fixture provenance is reviewable, and
-may include an expected `sha256` digest. In strict release mode
+Use `manifest.example.toml` as the checklist for extra exported client/version
+families that should be attached to a release evidence bundle. Every declared
+artifact must include source and permission metadata so fixture provenance is
+reviewable, and may include an expected `sha256` digest. In strict release mode
 (`TNG_REQUIRE_MIGRATION_CORPUS=1`), `manifest.toml` is mandatory, every source
 family must declare at least one artifact, and every discovered evidence file
 must be declared in the manifest. The certification report includes a SHA-256

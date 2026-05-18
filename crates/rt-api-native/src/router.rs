@@ -8,9 +8,10 @@ use crate::{
         add_torrent, add_torrent_peers, delete_torrent, diagnose_torrent, get_torrent, health,
         list_session_events, list_torrent_files, list_torrent_trackers, list_torrents, metrics,
         patch_torrent_files, patch_torrent_trackers, pause_torrent, reannounce_torrent,
-        recheck_torrent, resume_torrent, set_torrent_category, storage_execute_plan,
-        storage_preview_plan, stream_events, torrent_limits, transfer_limits, update_torrent,
-        update_torrent_limits, update_torrent_queue, update_transfer_limits,
+        recheck_torrent, resume_torrent, session_features, set_torrent_category,
+        storage_execute_plan, storage_preview_plan, stream_events, torrent_limits, transfer_limits,
+        update_session_features, update_torrent, update_torrent_limits, update_torrent_queue,
+        update_transfer_limits,
     },
     state::AppState,
 };
@@ -58,6 +59,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/v1/transfer/limits",
             get(transfer_limits).put(update_transfer_limits),
+        )
+        .route(
+            "/api/v1/session/features",
+            get(session_features).put(update_session_features),
         )
         .route(
             "/api/v1/torrents/:hash/tags",

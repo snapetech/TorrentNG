@@ -1,0 +1,7 @@
+{
+  "name": "torrentng-generated-transmission",
+  "download-dir": "/downloads",
+  "labels": ["generated", "ci"],
+  "paused": true,
+  "progress": 0.5
+}

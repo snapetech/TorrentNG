@@ -489,6 +489,36 @@ impl TorrentBackend for TorrentngBackend {
         })
     }
 
+    async fn feature_status(&self) -> (String, String) {
+        match self.get_json::<Value>("api/v1/session/features").await {
+            Ok(features) => (
+                bool_status(features.get("dht").and_then(Value::as_bool)),
+                bool_status(features.get("pex").and_then(Value::as_bool)),
+            ),
+            Err(_) => ("unknown".to_owned(), "unknown".to_owned()),
+        }
+    }
+
+    async fn set_dht(&self, enabled: bool) -> Result<()> {
+        self.send_json(
+            reqwest::Method::PUT,
+            "api/v1/session/features",
+            json!({ "dht": enabled }),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn set_pex(&self, enabled: bool) -> Result<()> {
+        self.send_json(
+            reqwest::Method::PUT,
+            "api/v1/session/features",
+            json!({ "pex": enabled }),
+        )
+        .await
+        .map(|_| ())
+    }
+
     async fn toggle_global_speed_limits_mode(&self) -> Result<()> {
         let limits = self.global_limits().await?;
         self.put_transfer_limits(json!({ "speed_limits_mode": !limits.speed_limits_mode }))
@@ -780,6 +810,14 @@ fn parse_qbit_peer(key: &str, peer: &Value) -> Option<BackendPeer> {
         downloaded: int(peer, "downloaded"),
         uploaded: int(peer, "uploaded"),
     })
+}
+
+fn bool_status(value: Option<bool>) -> String {
+    match value {
+        Some(true) => "enabled".to_owned(),
+        Some(false) => "disabled".to_owned(),
+        None => "unknown".to_owned(),
+    }
 }
 
 #[cfg(test)]

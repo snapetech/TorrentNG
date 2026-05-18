@@ -16,7 +16,9 @@ use futures::Stream;
 use rt_api_model::{
     AddTorrentRequest, AddTorrentResponse, ApiError, FileInfo, TorrentDetail, TorrentSummary,
 };
-use rt_engine::{EngineGlobalLimits, EngineJob, EngineTorrentLimits, QueueMove};
+use rt_engine::{
+    EngineGlobalLimits, EngineJob, EngineNetworkFeatures, EngineTorrentLimits, QueueMove,
+};
 use rt_metainfo::{parse_magnet, parse_torrent};
 use rt_metrics::MemoryClass;
 use rt_session::{TorrentEntry, TorrentState};
@@ -545,6 +547,27 @@ pub struct UpdateTransferLimitsRequest {
     pub speed_limits_mode: Option<bool>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct NetworkFeaturesResponse {
+    pub dht: bool,
+    pub pex: bool,
+}
+
+impl From<EngineNetworkFeatures> for NetworkFeaturesResponse {
+    fn from(features: EngineNetworkFeatures) -> Self {
+        Self {
+            dht: features.dht,
+            pex: features.pex,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateNetworkFeaturesRequest {
+    pub dht: Option<bool>,
+    pub pex: Option<bool>,
+}
+
 /// `GET /api/v1/transfer/limits` — read global transfer limits.
 pub async fn transfer_limits(State(state): State<AppState>) -> impl IntoResponse {
     let Some(engine) = &state.engine else {
@@ -604,6 +627,75 @@ pub async fn update_transfer_limits(
         limits.speed_limits_mode = value;
     }
     match engine.update_global_limits(limits).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError::bad_request(e)).unwrap()),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /api/v1/session/features` — read runtime DHT/PEX feature switches.
+pub async fn session_features(State(state): State<AppState>) -> impl IntoResponse {
+    let Some(engine) = &state.engine else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                serde_json::to_value(ApiError::internal("native engine is not available")).unwrap(),
+            ),
+        )
+            .into_response();
+    };
+    match engine.network_features().await {
+        Ok(features) => (
+            StatusCode::OK,
+            Json(NetworkFeaturesResponse::from(features)),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError::bad_request(e)).unwrap()),
+        )
+            .into_response(),
+    }
+}
+
+/// `PUT /api/v1/session/features` — merge runtime DHT/PEX feature switches.
+pub async fn update_session_features(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<UpdateNetworkFeaturesRequest>,
+) -> impl IntoResponse {
+    if let Some(response) = require_mutation_auth(&state, &headers) {
+        return response;
+    }
+    let Some(engine) = &state.engine else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                serde_json::to_value(ApiError::internal("native engine is not available")).unwrap(),
+            ),
+        )
+            .into_response();
+    };
+    let mut features = match engine.network_features().await {
+        Ok(features) => features,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::to_value(ApiError::bad_request(e)).unwrap()),
+            )
+                .into_response()
+        }
+    };
+    if let Some(value) = req.dht {
+        features.dht = value;
+    }
+    if let Some(value) = req.pex {
+        features.pex = value;
+    }
+    match engine.update_network_features(features).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,

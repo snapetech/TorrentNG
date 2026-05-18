@@ -35,8 +35,8 @@ use rt_storage::{
 use rt_utp::{UtpEndpoint, UtpStream};
 
 use crate::command::{
-    CmdResult, EngineCmd, EngineGlobalLimits, EngineJob, EnginePeerSnapshot, EnginePieceState,
-    EngineStats, EngineTorrentFile, EngineTorrentLimits, EngineTorrentMetadata,
+    CmdResult, EngineCmd, EngineGlobalLimits, EngineJob, EngineNetworkFeatures, EnginePeerSnapshot,
+    EnginePieceState, EngineStats, EngineTorrentFile, EngineTorrentLimits, EngineTorrentMetadata,
     EngineTrackerSnapshot, EngineWebseedSnapshot, QueueMove, TorrentDiagnostic,
 };
 use crate::dht_task::{run_dht, DhtCommand, DhtTorrent};
@@ -73,6 +73,8 @@ static STORAGE_PLAN_JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const SETTING_GLOBAL_DOWNLOAD_LIMIT: &str = "transfer.download_limit";
 const SETTING_GLOBAL_UPLOAD_LIMIT: &str = "transfer.upload_limit";
 const SETTING_GLOBAL_SPEED_LIMITS_MODE: &str = "transfer.speed_limits_mode";
+const SETTING_NETWORK_DHT: &str = "network.dht";
+const SETTING_NETWORK_PEX: &str = "network.pex";
 const SETTING_QUEUE_PREFIX: &str = "torrent.queue.";
 
 fn resource_config_from_config(config: &Config) -> ResourceGovernorConfig {
@@ -131,6 +133,25 @@ fn storage_io_config_from_config(config: &Config) -> StorageIoConfig {
             0
         },
     }
+}
+
+fn spawn_dht_task(config: &Config) -> mpsc::Sender<DhtCommand> {
+    let (dht_tx, dht_rx) = mpsc::channel(64);
+    let dht_port = config.dht_port();
+    let listen_port = config.network.listen_port;
+    let bootstrap_nodes = config.dht.bootstrap_nodes.clone();
+    tokio::spawn(async move {
+        if let Err(e) = run_dht(dht_port, listen_port, bootstrap_nodes, dht_rx).await {
+            warn!(
+                component = "dht",
+                operation = "run",
+                result = "error",
+                error = %e,
+                "DHT task exited with error"
+            );
+        }
+    });
+    dht_tx
 }
 
 fn memory_pressure_for(
@@ -613,6 +634,24 @@ impl EngineHandle {
         rx.await.map_err(|_| "engine dropped reply".to_owned())?
     }
 
+    pub async fn network_features(&self) -> CmdResult<EngineNetworkFeatures> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(EngineCmd::GetNetworkFeatures { reply })
+            .await
+            .map_err(|_| "engine shut down".to_owned())?;
+        rx.await.map_err(|_| "engine dropped reply".to_owned())?
+    }
+
+    pub async fn update_network_features(&self, features: EngineNetworkFeatures) -> CmdResult<()> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(EngineCmd::UpdateNetworkFeatures { features, reply })
+            .await
+            .map_err(|_| "engine shut down".to_owned())?;
+        rx.await.map_err(|_| "engine dropped reply".to_owned())?
+    }
+
     pub async fn queue_priority(&self, info_hash: String) -> CmdResult<i32> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx
@@ -677,23 +716,9 @@ impl Engine {
         rt_db::migrate(&conn).context("migrating database")?;
         register_configured_storage(&conn, &config).context("registering configured storage")?;
 
-        let dht_shutdown = if config.dht.enabled {
-            let (dht_tx, dht_rx) = mpsc::channel(64);
-            let dht_port = config.dht_port();
-            let listen_port = config.network.listen_port;
-            let bootstrap_nodes = config.dht.bootstrap_nodes.clone();
-            tokio::spawn(async move {
-                if let Err(e) = run_dht(dht_port, listen_port, bootstrap_nodes, dht_rx).await {
-                    warn!(
-                        component = "dht",
-                        operation = "run",
-                        result = "error",
-                        error = %e,
-                        "DHT task exited with error"
-                    );
-                }
-            });
-            Some(dht_tx)
+        let dht_enabled = setting_bool_with_default(&conn, SETTING_NETWORK_DHT, config.dht.enabled);
+        let dht_shutdown = if dht_enabled {
+            Some(spawn_dht_task(&config))
         } else {
             None
         };
@@ -715,7 +740,7 @@ impl Engine {
             Some("native engine started"),
             serde_json::json!({
                 "listen_port": config.network.listen_port,
-                "dht_enabled": config.dht.enabled,
+                "dht_enabled": dht_enabled,
             }),
         );
         engine.recover_interrupted_jobs()?;
@@ -1231,6 +1256,14 @@ impl Engine {
                 }
                 let _ = reply.send(result);
             }
+            EngineCmd::GetNetworkFeatures { reply } => {
+                let result = self.network_features_inner();
+                let _ = reply.send(result);
+            }
+            EngineCmd::UpdateNetworkFeatures { features, reply } => {
+                let result = self.update_network_features_inner(features).await;
+                let _ = reply.send(result);
+            }
             EngineCmd::GetQueuePriority { info_hash, reply } => {
                 let result = self.queue_priority_inner(&info_hash);
                 let _ = reply.send(result);
@@ -1588,6 +1621,7 @@ impl Engine {
                 .piece_assembly_cap_mb
                 .saturating_mul(1024 * 1024) as usize,
             storage_io_config_from_config(&self.config),
+            self.peer_exchange_enabled(),
         );
         let handle = tokio::spawn(task.run());
         self.torrent_chans
@@ -2677,6 +2711,62 @@ impl Engine {
         Ok(())
     }
 
+    fn network_features_inner(&self) -> CmdResult<EngineNetworkFeatures> {
+        let db = self.db.lock().expect("database mutex poisoned");
+        Ok(EngineNetworkFeatures {
+            dht: self.dht_tx.is_some()
+                && setting_bool_with_default(&db, SETTING_NETWORK_DHT, self.config.dht.enabled),
+            pex: setting_bool_with_default(&db, SETTING_NETWORK_PEX, true),
+        })
+    }
+
+    async fn update_network_features_inner(
+        &mut self,
+        features: EngineNetworkFeatures,
+    ) -> CmdResult<()> {
+        {
+            let db = self.db.lock().expect("database mutex poisoned");
+            let now = unix_now_i64();
+            rt_db::set_setting(
+                &db,
+                SETTING_NETWORK_DHT,
+                if features.dht { "1" } else { "0" },
+                now,
+            )
+            .map_err(|e| e.to_string())?;
+            rt_db::set_setting(
+                &db,
+                SETTING_NETWORK_PEX,
+                if features.pex { "1" } else { "0" },
+                now,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+
+        match (features.dht, self.dht_tx.is_some()) {
+            (false, true) => {
+                if let Some(tx) = self.dht_tx.take() {
+                    let _ = tx.send(DhtCommand::Shutdown).await;
+                }
+            }
+            (true, false) => {
+                let tx = spawn_dht_task(&self.config);
+                self.dht_tx = Some(tx);
+                self.register_all_dht_torrents().await;
+            }
+            _ => {}
+        }
+        for tx in self.torrent_chans.values() {
+            let _ = tx.send(TorrentCmd::UpdatePeerExchange(features.pex)).await;
+        }
+        Ok(())
+    }
+
+    fn peer_exchange_enabled(&self) -> bool {
+        let db = self.db.lock().expect("database mutex poisoned");
+        setting_bool_with_default(&db, SETTING_NETWORK_PEX, true)
+    }
+
     fn queue_priority_inner(&self, info_hash: &str) -> CmdResult<i32> {
         let db = self.db.lock().expect("database mutex poisoned");
         let key = queue_setting_key(info_hash);
@@ -3195,6 +3285,18 @@ impl Engine {
                     "failed to parse info hash for DHT registration"
                 )
             }
+        }
+    }
+
+    async fn register_all_dht_torrents(&self) {
+        let hashes = {
+            let reg = self.registry.read().await;
+            reg.iter()
+                .map(|entry| entry.info_hash.clone())
+                .collect::<Vec<_>>()
+        };
+        for hash in hashes {
+            self.register_dht_torrent_from_storage_or_hash(&hash).await;
         }
     }
 
@@ -4143,6 +4245,13 @@ fn setting_i64(conn: &Connection, key: &str) -> i64 {
 
 fn setting_bool(conn: &Connection, key: &str) -> bool {
     matches!(rt_db::get_setting(conn, key).as_deref(), Ok("1" | "true"))
+}
+
+fn setting_bool_with_default(conn: &Connection, key: &str, default: bool) -> bool {
+    rt_db::get_setting(conn, key)
+        .ok()
+        .map(|value| matches!(value.as_str(), "1" | "true"))
+        .unwrap_or(default)
 }
 
 fn queue_setting_key(info_hash: &str) -> String {
@@ -5248,6 +5357,46 @@ mod tests {
                 speed_limits_mode: true,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn network_features_persist_and_notify_running_torrents() {
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let (_tx, rx) = mpsc::channel(1);
+        let (torrent_tx, mut torrent_rx) = mpsc::channel(4);
+        let mut torrent_chans = HashMap::new();
+        torrent_chans.insert("a".repeat(40), torrent_tx);
+        let mut engine = Engine {
+            config: Arc::new(Config::default()),
+            registry: Arc::new(RwLock::new(SessionRegistry::new())),
+            db: Arc::new(Mutex::new(conn)),
+            cmd_rx: rx,
+            cmd_tx: mpsc::channel(1).0,
+            torrent_chans,
+            torrent_tasks: HashMap::new(),
+            dht_tx: None,
+            resources: test_resource_governor(),
+        };
+
+        engine
+            .update_network_features_inner(EngineNetworkFeatures {
+                dht: false,
+                pex: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.network_features_inner().unwrap(),
+            EngineNetworkFeatures {
+                dht: false,
+                pex: false,
+            }
+        );
+        match torrent_rx.recv().await {
+            Some(TorrentCmd::UpdatePeerExchange(false)) => {}
+            other => panic!("expected PEX update, got {other:?}"),
+        }
     }
 
     #[tokio::test]

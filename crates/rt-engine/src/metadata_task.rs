@@ -212,7 +212,8 @@ pub async fn run_metadata_task(
                     | TorrentCmd::CancelJob { .. }
                     | TorrentCmd::ReloadFilePolicy
                     | TorrentCmd::UpdateLimits(_)
-                    | TorrentCmd::UpdateGlobalLimits(_) => {}
+                    | TorrentCmd::UpdateGlobalLimits(_)
+                    | TorrentCmd::UpdatePeerExchange(_) => {}
                 }
             }
             _ = tracker_tick.tick(), if !paused && !trackers.is_empty() => {

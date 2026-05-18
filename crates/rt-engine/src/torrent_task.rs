@@ -78,6 +78,7 @@ pub enum TorrentCmd {
     ReloadFilePolicy,
     UpdateLimits(EngineTorrentLimits),
     UpdateGlobalLimits(EngineGlobalLimits),
+    UpdatePeerExchange(bool),
     Shutdown,
     /// Peers discovered by DHT.
     NewPeers(Vec<SocketAddr>),
@@ -384,6 +385,7 @@ struct UploadContext {
     have_pieces: Vec<bool>,
     metadata: Option<Arc<Vec<u8>>>,
     is_private: bool,
+    pex_enabled: bool,
     upload_limit_bytes_per_sec: Option<u64>,
 }
 
@@ -448,6 +450,7 @@ pub struct TorrentTask {
     prepared_files: Mutex<HashSet<u32>>,
     paused: bool,
     max_peers: usize,
+    pex_enabled: bool,
 }
 
 impl TorrentTask {
@@ -467,6 +470,7 @@ impl TorrentTask {
         min_interval_secs: u64,
         piece_assembly_cap_bytes: usize,
         storage_io: StorageIoConfig,
+        pex_enabled: bool,
     ) -> Self {
         let (peer_event_tx, peer_event_rx) = mpsc::channel(512);
         let total = meta.total_length();
@@ -566,6 +570,7 @@ impl TorrentTask {
             prepared_files: Mutex::new(HashSet::new()),
             paused,
             max_peers,
+            pex_enabled,
         };
         task.apply_file_policy_from_db();
         task.apply_torrent_limits_from_db();
@@ -678,6 +683,9 @@ impl TorrentTask {
                         }
                         TorrentCmd::UpdateGlobalLimits(limits) => {
                             self.apply_global_limits(&limits);
+                        }
+                        TorrentCmd::UpdatePeerExchange(enabled) => {
+                            self.pex_enabled = enabled;
                         }
                     }
                 }
@@ -1217,6 +1225,7 @@ impl TorrentTask {
             have_pieces: visible_pieces,
             metadata: torrent_info_bytes(&self.meta.raw).ok().map(Arc::new),
             is_private: self.meta.private,
+            pex_enabled: self.pex_enabled,
             upload_limit_bytes_per_sec: self.upload_limit_bytes_per_sec,
         }
     }
@@ -2462,6 +2471,9 @@ impl TorrentTask {
                 Ok(TorrentCmd::UpdateGlobalLimits(limits)) => {
                     self.apply_global_limits(&limits);
                 }
+                Ok(TorrentCmd::UpdatePeerExchange(enabled)) => {
+                    self.pex_enabled = enabled;
+                }
                 Ok(TorrentCmd::Recheck { .. }) => {}
                 Ok(TorrentCmd::CancelJob { job_id }) => {
                     debug!(
@@ -3383,6 +3395,7 @@ async fn run_outgoing_peer(
         &mut peer_io,
         upload.metadata.as_ref(),
         upload.is_private,
+        upload.pex_enabled,
         remote_supports_extension,
     )
     .await?;
@@ -3431,6 +3444,7 @@ async fn run_established_utp_peer(
         &mut peer_io,
         upload.metadata.as_ref(),
         upload.is_private,
+        upload.pex_enabled,
         remote_supports_extension,
     )
     .await?;
@@ -3467,6 +3481,7 @@ async fn run_incoming_peer(
         &mut peer_io,
         upload.metadata.as_ref(),
         upload.is_private,
+        upload.pex_enabled,
         remote_supports_extension,
     )
     .await?;
@@ -3496,6 +3511,7 @@ async fn run_incoming_utp_peer(
         &mut peer_io,
         upload.metadata.as_ref(),
         upload.is_private,
+        upload.pex_enabled,
         remote_supports_extension,
     )
     .await?;
@@ -3808,6 +3824,9 @@ async fn run_peer_loop(
                         }
                     }
                     Message::Extended { ext_id: LOCAL_UT_PEX_ID, payload } => {
+                        if !upload.pex_enabled || upload.is_private {
+                            continue;
+                        }
                         match parse_ut_pex_peers(&payload) {
                             Ok(peers) if !peers.is_empty() => {
                                 if peer_event_tx
@@ -3867,10 +3886,11 @@ async fn send_extension_handshake(
     peer_io: &mut PeerIo,
     metadata: Option<&Arc<Vec<u8>>>,
     is_private: bool,
+    pex_enabled: bool,
     remote_supports_extension: bool,
 ) -> anyhow::Result<()> {
     if remote_supports_extension {
-        let handshake = extension_handshake_for_torrent(metadata, is_private);
+        let handshake = extension_handshake_for_torrent(metadata, is_private, pex_enabled);
         peer_io
             .send(Message::Extended {
                 ext_id: EXT_HANDSHAKE_ID,
@@ -3884,13 +3904,14 @@ async fn send_extension_handshake(
 fn extension_handshake_for_torrent(
     metadata: Option<&Arc<Vec<u8>>>,
     is_private: bool,
+    pex_enabled: bool,
 ) -> ExtensionHandshake {
     let metadata_size = metadata.and_then(|bytes| u32::try_from(bytes.len()).ok());
     let mut handshake = ExtensionHandshake::new(metadata_size);
     if metadata_size.is_some() {
         handshake = handshake.with_ut_metadata(LOCAL_UT_METADATA_ID);
     }
-    if !is_private {
+    if pex_enabled && !is_private {
         handshake = handshake.with_ut_pex(LOCAL_UT_PEX_ID);
     }
     handshake
@@ -4302,13 +4323,16 @@ mod tests {
     fn private_torrent_extension_handshake_does_not_advertise_pex() {
         let metadata = Arc::new(vec![1, 2, 3, 4]);
 
-        let public = extension_handshake_for_torrent(Some(&metadata), false);
-        let private = extension_handshake_for_torrent(Some(&metadata), true);
+        let public = extension_handshake_for_torrent(Some(&metadata), false, true);
+        let private = extension_handshake_for_torrent(Some(&metadata), true, true);
+        let disabled = extension_handshake_for_torrent(Some(&metadata), false, false);
 
         assert_eq!(public.ut_metadata_id(), Some(LOCAL_UT_METADATA_ID));
         assert_eq!(public.ut_pex_id(), Some(LOCAL_UT_PEX_ID));
         assert_eq!(private.ut_metadata_id(), Some(LOCAL_UT_METADATA_ID));
         assert_eq!(private.ut_pex_id(), None);
+        assert_eq!(disabled.ut_metadata_id(), Some(LOCAL_UT_METADATA_ID));
+        assert_eq!(disabled.ut_pex_id(), None);
     }
 
     #[test]
@@ -4773,6 +4797,7 @@ mod tests {
             have_pieces: vec![true],
             metadata: None,
             is_private: false,
+            pex_enabled: true,
             upload_limit_bytes_per_sec: None,
         };
 

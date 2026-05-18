@@ -18,8 +18,8 @@ use std::{
 use url::Url;
 
 use rt_engine::{
-    EngineGlobalLimits, EnginePeerSnapshot, EnginePieceState, EngineTorrentLimits,
-    EngineTrackerSnapshot, QueueMove,
+    EngineGlobalLimits, EngineNetworkFeatures, EnginePeerSnapshot, EnginePieceState,
+    EngineTorrentLimits, EngineTrackerSnapshot, QueueMove,
 };
 use rt_metrics::{MemoryClass, MemoryLease};
 
@@ -73,6 +73,12 @@ pub async fn app_preferences(State(state): State<AppState>) -> impl IntoResponse
     let save_path = default_save_path(&state).await;
     let mut preferences = qbit_preferences(save_path);
     if let Some(map) = preferences.as_object_mut() {
+        if let Some(engine) = &state.engine {
+            if let Ok(features) = engine.network_features().await {
+                map.insert("dht".to_owned(), serde_json::Value::Bool(features.dht));
+                map.insert("pex".to_owned(), serde_json::Value::Bool(features.pex));
+            }
+        }
         let banned_ips = state
             .banned_peers
             .read()
@@ -95,6 +101,32 @@ pub async fn app_preferences(State(state): State<AppState>) -> impl IntoResponse
 pub async fn app_set_preferences(State(state): State<AppState>, body: String) -> impl IntoResponse {
     match qbit_preference_payload(&body) {
         Some(serde_json::Value::Object(updates)) => {
+            if let Some(engine) = &state.engine {
+                if updates.contains_key("dht") || updates.contains_key("pex") {
+                    let mut features = match engine.network_features().await {
+                        Ok(features) => features,
+                        Err(_) => EngineNetworkFeatures {
+                            dht: updates
+                                .get("dht")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(true),
+                            pex: updates
+                                .get("pex")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(true),
+                        },
+                    };
+                    if let Some(value) = updates.get("dht").and_then(serde_json::Value::as_bool) {
+                        features.dht = value;
+                    }
+                    if let Some(value) = updates.get("pex").and_then(serde_json::Value::as_bool) {
+                        features.pex = value;
+                    }
+                    if engine.update_network_features(features).await.is_err() {
+                        return StatusCode::INTERNAL_SERVER_ERROR;
+                    }
+                }
+            }
             state.preference_overrides.write().await.extend(updates);
             StatusCode::OK
         }
@@ -2030,10 +2062,12 @@ pub async fn sync_maindata(
     };
     let active_rechecks = active_recheck_hashes(&state).await;
     let mut infos = Vec::with_capacity(entries.len());
+    let mut tracker_digests = Vec::with_capacity(entries.len());
     for entry in &entries {
         infos.push(qbit_torrent_info(&state, entry, &active_rechecks).await);
+        tracker_digests.push(qbit_tracker_snapshot_digest(&state, &entry.info_hash).await);
     }
-    let rid = sync_rid_for_infos(&infos);
+    let rid = sync_rid_for_infos_and_trackers(&infos, &tracker_digests);
     let full_update = q.rid.unwrap_or(0) != rid;
     let (alltime_dl, alltime_ul) = infos.iter().fold((0_i64, 0_i64), |(dl, ul), info| {
         (
@@ -3469,7 +3503,15 @@ async fn qbit_tracker_projection(state: &AppState, info_hash: &str) -> (String, 
     projection
 }
 
+#[cfg(test)]
 fn sync_rid_for_infos(infos: &[QbTorrentInfo]) -> i64 {
+    sync_rid_for_infos_and_trackers(infos, &[])
+}
+
+fn sync_rid_for_infos_and_trackers(
+    infos: &[QbTorrentInfo],
+    tracker_digests: &[(String, u64)],
+) -> i64 {
     let mut hasher = DefaultHasher::new();
     let mut infos = infos.iter().collect::<Vec<_>>();
     infos.sort_by(|a, b| a.hash.cmp(&b.hash));
@@ -3491,8 +3533,42 @@ fn sync_rid_for_infos(infos: &[QbTorrentInfo]) -> i64 {
         info.progress.to_bits().hash(&mut hasher);
         info.ratio.to_bits().hash(&mut hasher);
     }
+    let mut tracker_digests = tracker_digests.iter().collect::<Vec<_>>();
+    tracker_digests.sort_by(|a, b| a.0.cmp(&b.0));
+    for (hash, digest) in tracker_digests {
+        hash.hash(&mut hasher);
+        digest.hash(&mut hasher);
+    }
     let rid = (hasher.finish() & 0x7fff_ffff_ffff_ffff) as i64;
     rid.max(1)
+}
+
+async fn qbit_tracker_snapshot_digest(state: &AppState, hash: &str) -> (String, u64) {
+    let mut hasher = DefaultHasher::new();
+    hash.hash(&mut hasher);
+    let Some(engine) = &state.engine else {
+        return (hash.to_owned(), hasher.finish());
+    };
+    if let Ok(mut trackers) = engine.torrent_trackers(hash.to_owned()).await {
+        trackers.sort_by(|a, b| {
+            a.tier
+                .cmp(&b.tier)
+                .then_with(|| a.announce.cmp(&b.announce))
+        });
+        for tracker in trackers {
+            tracker.announce.hash(&mut hasher);
+            tracker.tier.hash(&mut hasher);
+            tracker.status.hash(&mut hasher);
+            tracker.failure_reason.hash(&mut hasher);
+            tracker.warning_message.hash(&mut hasher);
+            tracker.seeders.hash(&mut hasher);
+            tracker.leechers.hash(&mut hasher);
+            tracker.completed.hash(&mut hasher);
+            tracker.last_announce_at.hash(&mut hasher);
+            tracker.next_announce_at.hash(&mut hasher);
+        }
+    }
+    (hash.to_owned(), hasher.finish())
 }
 
 fn extract_hashes_from_str(s: &str) -> Vec<String> {
@@ -4728,6 +4804,18 @@ mod tests {
 
         let changed = qbit_info("a", "udp://tracker-c", 2);
         assert_ne!(sync_rid_for_infos(&[first]), sync_rid_for_infos(&[changed]));
+    }
+
+    #[test]
+    fn sync_rid_covers_tracker_snapshot_digest() {
+        let info = qbit_info("a", "udp://tracker-a", 1);
+        let first = vec![("a".to_owned(), 1_u64)];
+        let changed = vec![("a".to_owned(), 2_u64)];
+
+        assert_ne!(
+            sync_rid_for_infos_and_trackers(std::slice::from_ref(&info), &first),
+            sync_rid_for_infos_and_trackers(&[info], &changed)
+        );
     }
 
     #[tokio::test]

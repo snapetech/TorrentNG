@@ -633,6 +633,12 @@ pub struct EngineGlobalLimits {
     pub speed_limits_mode: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct EngineNetworkFeatures {
+    pub dht: bool,
+    pub pex: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnginePeerSnapshot {
     pub addr: SocketAddr,
@@ -852,6 +858,13 @@ pub enum EngineCmd {
     },
     UpdateGlobalLimits {
         limits: EngineGlobalLimits,
+        reply: oneshot::Sender<CmdResult<()>>,
+    },
+    GetNetworkFeatures {
+        reply: oneshot::Sender<CmdResult<EngineNetworkFeatures>>,
+    },
+    UpdateNetworkFeatures {
+        features: EngineNetworkFeatures,
         reply: oneshot::Sender<CmdResult<()>>,
     },
     GetQueuePriority {
