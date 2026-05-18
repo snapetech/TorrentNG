@@ -1069,8 +1069,12 @@ async fn torrent_get(state: &AppState, args: &Value) -> Result<Value, String> {
                     "downloadedEver" | "downloaded-ever" => json!(entry.stats.downloaded),
                     "uploadedEver" | "uploaded-ever" => json!(entry.stats.uploaded),
                     "uploadRatio" | "upload-ratio" => json!(entry.stats.ratio()),
-                    "rateDownload" | "rate-download" => json!(0),
-                    "rateUpload" | "rate-upload" => json!(0),
+                    "rateDownload" | "rate-download" => {
+                        json!(transmission_peer_download_rate(peers.get(&entry.info_hash)))
+                    }
+                    "rateUpload" | "rate-upload" => {
+                        json!(transmission_peer_upload_rate(peers.get(&entry.info_hash)))
+                    }
                     "downloadLimit" | "download-limit" => json!(limits
                         .and_then(|limits| limits.download_limit)
                         .map(bytes_to_transmission_kib)
@@ -1254,6 +1258,10 @@ fn transmission_field_needs_peers(field: &str) -> bool {
             | "peers-getting-from-us"
             | "peersSendingToUs"
             | "peers-sending-to-us"
+            | "rateDownload"
+            | "rate-download"
+            | "rateUpload"
+            | "rate-upload"
     )
 }
 
@@ -1290,6 +1298,26 @@ fn transmission_peers(peers: &[EnginePeerSnapshot]) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+fn transmission_peer_download_rate(peers: Option<&Vec<EnginePeerSnapshot>>) -> i64 {
+    peers
+        .map(|peers| {
+            peers
+                .iter()
+                .fold(0_i64, |sum, peer| sum.saturating_add(peer.download_rate))
+        })
+        .unwrap_or(0)
+}
+
+fn transmission_peer_upload_rate(peers: Option<&Vec<EnginePeerSnapshot>>) -> i64 {
+    peers
+        .map(|peers| {
+            peers
+                .iter()
+                .fold(0_i64, |sum, peer| sum.saturating_add(peer.upload_rate))
+        })
+        .unwrap_or(0)
 }
 
 fn transmission_files(
@@ -2131,6 +2159,44 @@ mod tests {
         assert_eq!(files[1]["bytesCompleted"], 75);
         let stats = transmission_file_stats(&entry, Some(&meta));
         assert_eq!(stats[1]["bytesCompleted"], 75);
+    }
+
+    #[test]
+    fn transmission_peer_rates_sum_native_snapshots() {
+        let peers = vec![
+            EnginePeerSnapshot {
+                addr: "127.0.0.1:6881".parse().unwrap(),
+                client: "peer-a".to_owned(),
+                choked: false,
+                upload_choked: false,
+                interested: true,
+                pieces: 1,
+                pieces_total: 2,
+                progress: 0.5,
+                download_rate: 1_000,
+                upload_rate: 2_000,
+                downloaded: 10,
+                uploaded: 20,
+            },
+            EnginePeerSnapshot {
+                addr: "127.0.0.2:6881".parse().unwrap(),
+                client: "peer-b".to_owned(),
+                choked: false,
+                upload_choked: false,
+                interested: true,
+                pieces: 2,
+                pieces_total: 2,
+                progress: 1.0,
+                download_rate: 3_000,
+                upload_rate: 4_000,
+                downloaded: 30,
+                uploaded: 40,
+            },
+        ];
+        assert_eq!(transmission_peer_download_rate(Some(&peers)), 4_000);
+        assert_eq!(transmission_peer_upload_rate(Some(&peers)), 6_000);
+        assert_eq!(transmission_peer_download_rate(None), 0);
+        assert_eq!(transmission_peer_upload_rate(None), 0);
     }
 
     #[tokio::test]

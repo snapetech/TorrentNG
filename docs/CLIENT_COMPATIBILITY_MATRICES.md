@@ -153,7 +153,7 @@ Transmission `torrent_get` field matrix:
 | Size/progress | `total_size`, `left_until_done`, `percent_complete`, `percent_done`, `size_when_done`, `have_valid`, `have_unchecked`, `desired_available`, `bytes_completed`, `availability`, `pieces`, `piece_count`, `piece_size` | Partial; implemented with compatibility placeholders where native availability depth is unavailable |
 | State/dates | `status`, `error`, `error_string`, `eta`, `eta_idle`, `is_finished`, `is_stalled`, `recheck_progress`, `activity_date`, `added_date`, `done_date`, `start_date`, `date_created`, `seconds_downloading`, `seconds_seeding` | Partial; implemented with compatibility placeholders for ETA/recheck |
 | Counters/ratio | `downloaded_ever`, `uploaded_ever`, `upload_ratio`, `corrupt_ever` | Native/Compat |
-| Rates/limits | `rate_download`, `rate_upload`, `download_limit`, `download_limited`, `upload_limit`, `upload_limited`, `bandwidth_priority`, `honors_session_limits`, `max_connected_peers` | Compat/native for limit mutation/projection; live rates remain placeholders |
+| Rates/limits | `rate_download`, `rate_upload`, `download_limit`, `download_limited`, `upload_limit`, `upload_limited`, `bandwidth_priority`, `honors_session_limits`, `max_connected_peers` | Native/compat for aggregate peer rates and limit mutation/projection; bandwidth priority and session-limit flags remain compatibility fields |
 | Seed limits | `seed_ratio_limit`, `seed_ratio_mode`, `seed_idle_limit`, `seed_idle_mode` | Compat/native mutation and projection |
 | Files | `files`, `file_stats`, `priorities`, `wanted` | Native/Partial |
 | Peers | `peers`, `peers_connected`, `peers_from`, `peers_getting_from_us`, `peers_sending_to_us` | Partial; `peers_from` shape implemented with best-effort counts |
