@@ -14,8 +14,8 @@ use axum::{
 };
 use base64::{engine::general_purpose, Engine as _};
 use rt_engine::{
-    EngineGlobalLimits, EngineHandle, EnginePeerSnapshot, EnginePieceState, EngineTorrentLimits,
-    EngineTorrentMetadata, EngineTrackerSnapshot, QueueMove,
+    EngineGlobalLimits, EngineHandle, EngineJob, EnginePeerSnapshot, EnginePieceState,
+    EngineTorrentLimits, EngineTorrentMetadata, EngineTrackerSnapshot, QueueMove,
 };
 use rt_metainfo::{parse_magnet, parse_torrent};
 use rt_metrics::{MemoryClass, MemoryLease};
@@ -1029,7 +1029,20 @@ async fn torrent_get(state: &AppState, args: &Value) -> Result<Value, String> {
     }
     let mut peers = std::collections::HashMap::new();
     let mut tracker_snapshots = std::collections::HashMap::new();
+    let mut recheck_jobs = std::collections::HashMap::new();
     if let Some(engine) = &state.engine {
+        if fields
+            .iter()
+            .any(|field| transmission_field_is_recheck_progress(field))
+        {
+            if let Ok(jobs) = engine.list_jobs().await {
+                for entry in &entries {
+                    if let Some(progress) = transmission_recheck_progress(&jobs, &entry.info_hash) {
+                        recheck_jobs.insert(entry.info_hash.clone(), progress);
+                    }
+                }
+            }
+        }
         for entry in &entries {
             if fields
                 .iter()
@@ -1124,7 +1137,9 @@ async fn torrent_get(state: &AppState, args: &Value) -> Result<Value, String> {
                             .copied()
                             .unwrap_or(idx as i32))
                     }
-                    "recheckProgress" | "recheck-progress" => json!(0.0),
+                    "recheckProgress" | "recheck-progress" => {
+                        json!(recheck_jobs.get(&entry.info_hash).copied().unwrap_or(0.0))
+                    }
                     "seedRatioLimit" | "seed-ratio-limit" => json!(limits
                         .and_then(|limits| limits.seed_ratio_limit)
                         .unwrap_or(-1.0)),
@@ -1302,6 +1317,31 @@ fn transmission_field_needs_trackers(field: &str) -> bool {
         field.as_str(),
         "trackers" | "trackerStats" | "tracker-stats"
     )
+}
+
+fn transmission_field_is_recheck_progress(field: &str) -> bool {
+    let field = field.replace('_', "-");
+    matches!(field.as_str(), "recheckProgress" | "recheck-progress")
+}
+
+fn transmission_recheck_progress(jobs: &[EngineJob], info_hash: &str) -> Option<f64> {
+    jobs.iter()
+        .filter(|job| {
+            job.kind == "recheck_torrent"
+                && job.affected_torrents.iter().any(|hash| hash == info_hash)
+                && !matches!(
+                    job.state.as_str(),
+                    "completed" | "failed" | "cancelled" | "canceled"
+                )
+        })
+        .max_by_key(|job| job.updated_at)
+        .map(|job| {
+            if job.total <= 0 {
+                0.0
+            } else {
+                (job.done as f64 / job.total as f64).clamp(0.0, 1.0)
+            }
+        })
 }
 
 fn transmission_magnet_link(info_hash: &str) -> String {
@@ -3134,6 +3174,70 @@ mod tests {
             transmission_bool_arg(&args, "alt-speed-enabled"),
             Some(true)
         );
+    }
+
+    #[test]
+    fn transmission_recheck_progress_projects_active_engine_job() {
+        let jobs = vec![
+            EngineJob {
+                job_id: "old".to_owned(),
+                kind: "recheck_torrent".to_owned(),
+                state: "running".to_owned(),
+                dry_run: false,
+                affected_torrents: vec!["a".repeat(40)],
+                total: 100,
+                done: 20,
+                checkpoint: 0,
+                byte_offset: None,
+                verified_bytes: 0,
+                error: None,
+                created_at: 1,
+                started_at: Some(1),
+                updated_at: 10,
+                finished_at: None,
+            },
+            EngineJob {
+                job_id: "new".to_owned(),
+                kind: "recheck_torrent".to_owned(),
+                state: "paused".to_owned(),
+                dry_run: false,
+                affected_torrents: vec!["a".repeat(40)],
+                total: 100,
+                done: 75,
+                checkpoint: 0,
+                byte_offset: None,
+                verified_bytes: 0,
+                error: None,
+                created_at: 2,
+                started_at: Some(2),
+                updated_at: 20,
+                finished_at: None,
+            },
+            EngineJob {
+                job_id: "done".to_owned(),
+                kind: "recheck_torrent".to_owned(),
+                state: "completed".to_owned(),
+                dry_run: false,
+                affected_torrents: vec!["b".repeat(40)],
+                total: 100,
+                done: 100,
+                checkpoint: 0,
+                byte_offset: None,
+                verified_bytes: 0,
+                error: None,
+                created_at: 3,
+                started_at: Some(3),
+                updated_at: 30,
+                finished_at: Some(30),
+            },
+        ];
+
+        assert_eq!(
+            transmission_recheck_progress(&jobs, &"a".repeat(40)),
+            Some(0.75)
+        );
+        assert_eq!(transmission_recheck_progress(&jobs, &"b".repeat(40)), None);
+        assert!(transmission_field_is_recheck_progress("recheck_progress"));
     }
 
     #[test]

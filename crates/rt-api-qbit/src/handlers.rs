@@ -10,7 +10,7 @@ use serde::{
     Deserialize, Serialize,
 };
 use std::{
-    collections::{hash_map::DefaultHasher, HashMap},
+    collections::{hash_map::DefaultHasher, HashMap, HashSet},
     hash::{Hash, Hasher},
     net::{IpAddr, SocketAddr},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -412,9 +412,10 @@ pub async fn torrents_info(
     } else {
         entries.to_vec()
     };
+    let active_rechecks = active_recheck_hashes(&state).await;
     let mut infos = Vec::with_capacity(entries.len());
     for entry in &entries {
-        infos.push(qbit_torrent_info(&state, entry).await);
+        infos.push(qbit_torrent_info(&state, entry, &active_rechecks).await);
     }
 
     (StatusCode::OK, Json(infos)).into_response()
@@ -1954,9 +1955,10 @@ pub async fn sync_maindata(
         let reg = state.registry.read().await;
         reg.iter().cloned().collect::<Vec<_>>()
     };
+    let active_rechecks = active_recheck_hashes(&state).await;
     let mut infos = Vec::with_capacity(entries.len());
     for entry in &entries {
-        infos.push(qbit_torrent_info(&state, entry).await);
+        infos.push(qbit_torrent_info(&state, entry, &active_rechecks).await);
     }
     let rid = sync_rid_for_infos(&infos);
     let full_update = q.rid.unwrap_or(0) != rid;
@@ -2820,7 +2822,38 @@ fn parse_qbit_bool(value: &str) -> Option<bool> {
     }
 }
 
-async fn qbit_torrent_info(state: &AppState, e: &rt_session::TorrentEntry) -> QbTorrentInfo {
+async fn active_recheck_hashes(state: &AppState) -> HashSet<String> {
+    let Some(engine) = &state.engine else {
+        return HashSet::new();
+    };
+    let Ok(jobs) = engine.list_jobs().await else {
+        return HashSet::new();
+    };
+    jobs.into_iter()
+        .filter(|job| {
+            job.kind == "recheck_torrent"
+                && !matches!(
+                    job.state.as_str(),
+                    "completed" | "failed" | "cancelled" | "canceled"
+                )
+        })
+        .flat_map(|job| job.affected_torrents)
+        .collect()
+}
+
+fn qbit_state_with_recheck(entry_state: &str, active_recheck: bool) -> String {
+    if active_recheck {
+        "checkingDL".to_owned()
+    } else {
+        to_qbit_state(entry_state).to_owned()
+    }
+}
+
+async fn qbit_torrent_info(
+    state: &AppState,
+    e: &rt_session::TorrentEntry,
+    active_rechecks: &HashSet<String>,
+) -> QbTorrentInfo {
     let progress = torrent_progress(e.total_length, e.amount_left, e.completed_at.is_some());
     let (tracker, trackers_count) = if state.engine.is_some() {
         qbit_tracker_projection(state, &e.info_hash).await
@@ -2833,7 +2866,7 @@ async fn qbit_torrent_info(state: &AppState, e: &rt_session::TorrentEntry) -> Qb
     QbTorrentInfo {
         hash: e.info_hash.clone(),
         name: e.name.clone(),
-        state: to_qbit_state(e.state.as_str()).to_owned(),
+        state: qbit_state_with_recheck(e.state.as_str(), active_rechecks.contains(&e.info_hash)),
         size: e.total_length as i64,
         total_size: e.total_length as i64,
         downloaded: e.stats.downloaded as i64,
@@ -4970,6 +5003,12 @@ mod tests {
         assert_eq!(pieces_have(1_000, 0, false, 100, 10), 10);
         assert_eq!(pieces_have(1_000, 250, false, 0, 10), 0);
         assert_eq!(pieces_have(1_000, 250, false, 100, 0), 0);
+    }
+
+    #[test]
+    fn qbit_state_projects_active_recheck_as_checking() {
+        assert_eq!(qbit_state_with_recheck("downloading", true), "checkingDL");
+        assert_eq!(qbit_state_with_recheck("seeding", false), "uploading");
     }
 
     #[test]

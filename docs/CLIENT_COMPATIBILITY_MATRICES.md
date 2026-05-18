@@ -102,7 +102,7 @@ Local implementation: `crates/rt-api-qbit`.
 | Auth | `auth/login`, `auth/logout` | Same | Compat | Login/logout status and cookie shape |
 | App info | `app/version`, `webapiVersion`, `buildInfo`, `preferences`, `setPreferences`, `shutdown`, `sendTestEmail`, `getCookies`, `setCookies`, `rotateAPIKey`, `deleteAPIKey`, `networkInterfaceList`, `networkInterfaceAddressList`, `defaultSavePath` | Same | Native/Compat mix | Probe every endpoint, assert status/content type |
 | Torrent list/add | `torrents/info`, `torrents/add` | Same | Native | Add magnet/file, list filters/sort/category/tag/hash |
-| Torrent lifecycle | `pause`, `resume`, `start`, `stop`, `delete`, `recheck`, `reannounce` | Same | Native | Lifecycle transition per endpoint |
+| Torrent lifecycle | `pause`, `resume`, `start`, `stop`, `delete`, `recheck`, `reannounce` | Same | Native | Lifecycle transition per endpoint; qBittorrent list state projects active recheck jobs as checking |
 | Torrent trackers/peers | `trackers`, `addTrackers`, `editTracker`, `removeTrackers`, `addPeers` | Same | Native/Partial stats; persisted engine tracker rows project status, message, and scrape counts where available | Tracker mutation and explicit peer row |
 | Torrent files/pieces | `files`, `webseeds`, `pieceStates`, `pieceHashes`, `export`, `filePrio` | Same | Native/Partial | File priority and piece state are engine-backed; `export` returns the persisted raw `.torrent` bytes for known torrents with stored metadata |
 | Queue priority | `increasePrio`, `decreasePrio`, `topPrio`, `bottomPrio` | Same | Native | Queue ordering row |
@@ -151,7 +151,7 @@ Transmission `torrent_get` field matrix:
 |---|---|---|
 | Identity | `id`, `hash_string`, `name`, `magnet_link`, `metadata_percent_complete`, `is_private` | Native/Compat |
 | Size/progress | `total_size`, `left_until_done`, `percent_complete`, `percent_done`, `size_when_done`, `have_valid`, `have_unchecked`, `desired_available`, `bytes_completed`, `availability`, `pieces`, `piece_count`, `piece_size` | Native/partial: byte counters, piece counts, availability, valid/unchecked/desired availability, and compact `pieces` bitfield use registry and native piece state where available |
-| State/dates | `status`, `error`, `error_string`, `eta`, `eta_idle`, `is_finished`, `is_stalled`, `recheck_progress`, `activity_date`, `added_date`, `done_date`, `start_date`, `date_created`, `seconds_downloading`, `seconds_seeding` | Partial; ETA projects from native peer rates where available; recheck progress remains compatibility placeholder |
+| State/dates | `status`, `error`, `error_string`, `eta`, `eta_idle`, `is_finished`, `is_stalled`, `recheck_progress`, `activity_date`, `added_date`, `done_date`, `start_date`, `date_created`, `seconds_downloading`, `seconds_seeding` | Native/Partial; ETA projects from native peer rates where available and active recheck jobs project `recheck_progress` |
 | Counters/ratio | `downloaded_ever`, `uploaded_ever`, `upload_ratio`, `corrupt_ever` | Native/Compat |
 | Rates/limits | `rate_download`, `rate_upload`, `download_limit`, `download_limited`, `upload_limit`, `upload_limited`, `bandwidth_priority`, `honors_session_limits`, `max_connected_peers` | Native/compat for aggregate peer rates and limit mutation/projection; bandwidth priority and session-limit flags remain compatibility fields |
 | Seed limits | `seed_ratio_limit`, `seed_ratio_mode`, `seed_idle_limit`, `seed_idle_mode` | Compat/native mutation and projection |
