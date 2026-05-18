@@ -77,6 +77,94 @@ services:
       - "6881:6881"
       - "6881:6881/udp"
 
+  torrentng-transmission:
+    image: torrentng:latest
+    profiles: ["transmission"]
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8083:8080"
+    volumes:
+      - ./config-transmission:/config
+      - downloads:/data
+    environment:
+      TORRENTNG_CONFIG: /config/config.toml
+      TNG_BACKEND: transmission
+      TNG_TRANSMISSION_URL: http://transmission:9091/transmission/rpc
+      TNG_TRANSMISSION_USERNAME: "${TRANSMISSION_USERNAME:-}"
+      TNG_TRANSMISSION_PASSWORD: "${TRANSMISSION_PASSWORD:-}"
+      TNG_SECRET_KEY: "${TNG_SECRET_KEY:-change-me}"
+      TNG_API_TOKENS: "${TNG_API_TOKENS:-}"
+    depends_on:
+      - transmission
+    healthcheck:
+      test: ["CMD", "/bin/sh", "-c", "wget -qO- http://localhost:8080/health >/dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  transmission:
+    image: lscr.io/linuxserver/transmission:latest
+    profiles: ["transmission"]
+    restart: unless-stopped
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: "${TZ:-UTC}"
+    volumes:
+      - transmission_config:/config
+      - downloads:/downloads
+    ports:
+      - "9091:9091"
+      - "51413:51413"
+      - "51413:51413/udp"
+
+  torrentng-deluge:
+    image: torrentng:latest
+    profiles: ["deluge"]
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8084:8080"
+    volumes:
+      - ./config-deluge:/config
+      - downloads:/data
+    environment:
+      TORRENTNG_CONFIG: /config/config.toml
+      TNG_BACKEND: deluge
+      TNG_DELUGE_URL: http://deluge:8112/json
+      TNG_DELUGE_PASSWORD: "${DELUGE_PASSWORD:-deluge}"
+      TNG_SECRET_KEY: "${TNG_SECRET_KEY:-change-me}"
+      TNG_API_TOKENS: "${TNG_API_TOKENS:-}"
+    depends_on:
+      - deluge
+    healthcheck:
+      test: ["CMD", "/bin/sh", "-c", "wget -qO- http://localhost:8080/health >/dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  deluge:
+    image: lscr.io/linuxserver/deluge:latest
+    profiles: ["deluge"]
+    restart: unless-stopped
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: "${TZ:-UTC}"
+    volumes:
+      - deluge_config:/config
+      - downloads:/downloads
+    ports:
+      - "8112:8112"
+      - "58846:58846"
+      - "58946:58946"
+      - "58946:58946/udp"
+
   nginx:
     image: nginx:alpine
     restart: unless-stopped
@@ -91,3 +179,5 @@ volumes:
   downloads:
   session:
   qbittorrent_config:
+  transmission_config:
+  deluge_config:

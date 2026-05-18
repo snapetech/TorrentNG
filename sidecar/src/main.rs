@@ -48,7 +48,14 @@ async fn main() -> Result<()> {
             backend::qbittorrent::QbittorrentBackend::new(&cfg.qbittorrent)
                 .context("create qbittorrent backend")?,
         ),
-        BackendKind::Transmission | BackendKind::Deluge | BackendKind::Torrentng => {
+        BackendKind::Transmission => Arc::new(
+            backend::transmission::TransmissionBackend::new(&cfg.transmission)
+                .context("create transmission backend")?,
+        ),
+        BackendKind::Deluge => Arc::new(
+            backend::deluge::DelugeBackend::new(&cfg.deluge).context("create deluge backend")?,
+        ),
+        BackendKind::Torrentng => {
             unreachable!("unsupported backend should be rejected during config validation")
         }
     };
@@ -68,7 +75,7 @@ async fn main() -> Result<()> {
     let metrics = Metrics::new();
     let (tx, _) = broadcast::channel::<Event>(1024);
 
-    {
+    if cfg.backend.backend_type == BackendKind::Rtorrent {
         let rt_ua = rt.clone();
         let ua = cfg.rtorrent.user_agent.clone();
         let db2 = db.clone();
@@ -128,7 +135,10 @@ async fn main() -> Result<()> {
         });
     }
 
-    if cfg.rtorrent.logs.enabled && !cfg.rtorrent.logs.paths.is_empty() {
+    if cfg.backend.backend_type == BackendKind::Rtorrent
+        && cfg.rtorrent.logs.enabled
+        && !cfg.rtorrent.logs.paths.is_empty()
+    {
         let db2 = db.clone();
         let log_cfg = cfg.rtorrent.logs.clone();
         let retention = cfg.logging.event_retention;
