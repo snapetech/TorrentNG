@@ -135,18 +135,46 @@ pub fn plan_import(req: &ImportPlanRequest) -> StoragePlan {
     } else {
         PlannedStorageAction::CopyVerifyRename
     };
-    let steps = vec![StoragePlanStep {
-        action,
-        source: Some(req.source.clone()),
-        destination: Some(req.destination.clone()),
-        bytes: req.bytes,
-    }];
+    let (steps, rollback_steps) = match action {
+        PlannedStorageAction::ImportExisting => (
+            vec![StoragePlanStep {
+                action,
+                source: Some(req.source.clone()),
+                destination: Some(req.destination.clone()),
+                bytes: req.bytes,
+            }],
+            Vec::new(),
+        ),
+        PlannedStorageAction::CopyVerifyRename => (
+            vec![
+                StoragePlanStep {
+                    action: PlannedStorageAction::CopyVerifyRename,
+                    source: Some(req.source.clone()),
+                    destination: Some(staging_path(&req.destination)),
+                    bytes: req.bytes,
+                },
+                StoragePlanStep {
+                    action: PlannedStorageAction::Rename,
+                    source: Some(staging_path(&req.destination)),
+                    destination: Some(req.destination.clone()),
+                    bytes: req.bytes,
+                },
+            ],
+            vec![StoragePlanStep {
+                action: PlannedStorageAction::SafeDelete,
+                source: Some(staging_path(&req.destination)),
+                destination: None,
+                bytes: req.bytes,
+            }],
+        ),
+        _ => unreachable!("import planner only emits import or copy actions"),
+    };
     StoragePlan {
         dry_run: req.dry_run,
         can_apply: issues.is_empty(),
         issues,
         steps,
-        rollback_steps: Vec::new(),
+        rollback_steps,
     }
 }
 
@@ -732,6 +760,44 @@ mod tests {
             .contains(&PlanIssue::DestinationExists(destination)));
     }
 
+    #[test]
+    fn import_copy_plan_stages_before_final_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.bin");
+        let destination = dir.path().join("dest.bin");
+        let staged = staging_path(&destination);
+        std::fs::write(&source, b"data").unwrap();
+
+        let plan = plan_import(&ImportPlanRequest {
+            source,
+            destination: destination.clone(),
+            bytes: 4,
+            available_bytes: Some(100),
+            hardlink_or_copy: false,
+            dry_run: false,
+        });
+
+        assert_eq!(
+            plan.steps
+                .iter()
+                .map(|step| (&step.action, step.destination.as_ref()))
+                .collect::<Vec<_>>(),
+            vec![
+                (&PlannedStorageAction::CopyVerifyRename, Some(&staged)),
+                (&PlannedStorageAction::Rename, Some(&destination)),
+            ]
+        );
+        assert_eq!(
+            plan.rollback_steps,
+            vec![StoragePlanStep {
+                action: PlannedStorageAction::SafeDelete,
+                source: Some(staged),
+                destination: None,
+                bytes: 4,
+            }]
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn plan_import_treats_broken_destination_symlink_as_existing() {
@@ -880,6 +946,31 @@ mod tests {
             execute_storage_plan(&plan),
             Err(StorageError::StagedMoveFailed { .. })
         ));
+        assert!(!staged.exists());
+    }
+
+    #[test]
+    fn execute_import_copy_failure_does_not_leave_final_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.bin");
+        let destination = dir.path().join("dest.bin");
+        let staged = staging_path(&destination);
+        std::fs::write(&source, b"data").unwrap();
+        let plan = plan_import(&ImportPlanRequest {
+            source: source.clone(),
+            destination: destination.clone(),
+            bytes: 99,
+            available_bytes: Some(100),
+            hardlink_or_copy: false,
+            dry_run: false,
+        });
+
+        assert!(matches!(
+            execute_storage_plan(&plan),
+            Err(StorageError::StagedMoveFailed { .. })
+        ));
+        assert_eq!(std::fs::read(&source).unwrap(), b"data");
+        assert!(!destination.exists());
         assert!(!staged.exists());
     }
 

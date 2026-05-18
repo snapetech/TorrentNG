@@ -11,7 +11,7 @@ release claims.
 | --- | --- | --- | --- |
 | Torrent payload I/O | `rt-storage::MountScheduler` | Download writes, seed reads, recheck reads, v2 file verification, fastresume syncs | This is the production torrent hot path. It owns per-class semaphores, its own file pool, a scheduler-owned `DiskBackend`, hashing pool, peer-read cache, and HDD peer-read elevator. |
 | Global storage runtime | `rt-storage::StorageRuntime` | Backend capability metrics, frame-pool metrics, direct backend tests and real-device backend probes | This path owns the process-level `FramePool` and `HandleCache` API. It uses the same `DiskBackend` implementations and global frame pool as `MountScheduler`. |
-| Move/import/delete executor | `rt-storage::plan` | Implemented root-confined movement, import, delete, checkpoint, and resume helpers | Covered by unit tests and an optional real-root certification script. It is separate from per-block torrent I/O. |
+| Move/import/delete executor | `rt-storage::plan` | Implemented root-confined movement, staged copy import/move, delete, checkpoint, and resume helpers | Covered by unit tests and an optional real-root certification script. It is separate from per-block torrent I/O. |
 
 ## Implemented In The Torrent Hot Path
 
@@ -34,7 +34,7 @@ release claims.
 | Frame-owned read API | Implemented beside the `Bytes` compatibility path and adopted for upload assembly reads | `MountScheduler::read_owned_at`; `scheduled_read_owned`; exact backend reads return `StorageRead::Frame`; `read_upload_block` consumes `StorageRead::as_slice` |
 | Returned read accounting | Implemented for live upload blocks and scheduler-owned peer-read cache entries | Upload blocks hold `PeerBuffer` leases through send; peer-read cache entries hold `PeerBuffer` leases while cached |
 | Stable `io_uring` file slots | Implemented as a conservative per-worker file-identity table | `UringWorker::file_slots`; file slots are keyed by device/inode and fall back to raw fd when the table is full |
-| Restartable move/import primitive | Implemented at the storage-plan executor and engine job boundaries | `execute_storage_plan_with_checkpoints`; `execute_storage_plan_under_roots_with_checkpoints`; checkpointed steps are skipped on resume; engine storage-plan jobs persist queued/running/checkpoint/completed state |
+| Restartable move/import primitive | Implemented at the storage-plan executor and engine job boundaries | `execute_storage_plan_with_checkpoints`; `execute_storage_plan_under_roots_with_checkpoints`; copy-based move/import writes to staged paths before final rename; checkpointed steps are skipped on resume; engine storage-plan jobs persist queued/running/checkpoint/completed state |
 | Save-path move execution | Implemented for engine field updates | `update_torrent_fields_inner`; `move_torrent_payload_files`; qBit/native set-location paths now move existing payload files before committing `save_path` |
 | Native storage plan API | Implemented for preview and execution | `/api/v1/storage/plan`; `/api/v1/storage/execute`; execution goes through durable engine storage-plan jobs |
 | Storage plan UI workflow | Implemented in the Library storage panel | Operators can select move/import/delete, choose a writable storage root, preview root-confined steps and issues, then execute through the native durable storage-plan API |
