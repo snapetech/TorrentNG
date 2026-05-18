@@ -3697,6 +3697,7 @@ impl Engine {
         roots: &[PathBuf],
         completed_steps: Vec<usize>,
     ) -> Result<String, String> {
+        let completed_steps = normalize_storage_plan_completed_steps(plan, completed_steps)?;
         let job_id = self.create_storage_plan_job(operation, affected_torrents, plan)?;
         self.update_job_state(
             &job_id,
@@ -3832,6 +3833,26 @@ impl Engine {
         rt_db::append_job_event(&db, &event).map_err(|e| e.to_string())?;
         Ok(())
     }
+}
+
+#[allow(dead_code)]
+fn normalize_storage_plan_completed_steps(
+    plan: &StoragePlan,
+    mut completed_steps: Vec<usize>,
+) -> Result<Vec<usize>, String> {
+    completed_steps.sort_unstable();
+    completed_steps.dedup();
+    if let Some(index) = completed_steps
+        .iter()
+        .copied()
+        .find(|index| *index >= plan.steps.len())
+    {
+        return Err(format!(
+            "completed storage-plan step {index} is outside plan length {}",
+            plan.steps.len()
+        ));
+    }
+    Ok(completed_steps)
 }
 
 #[allow(dead_code)]
@@ -5905,6 +5926,36 @@ mod tests {
             .any(|event| event.kind == "storage_plan_checkpoint"
                 && event.payload.contains("CopyVerifyRename")));
         assert_eq!(events[0].kind, "storage_plan_completed");
+    }
+
+    #[test]
+    fn storage_plan_resume_steps_are_sorted_unique_and_bounded() {
+        let plan = StoragePlan {
+            dry_run: false,
+            can_apply: true,
+            issues: Vec::new(),
+            steps: vec![
+                StoragePlanStep {
+                    action: rt_storage::PlannedStorageAction::CopyVerifyRename,
+                    source: Some(PathBuf::from("/mnt/a/source")),
+                    destination: Some(PathBuf::from("/mnt/b/.target.tng-copy")),
+                    bytes: 128,
+                },
+                StoragePlanStep {
+                    action: rt_storage::PlannedStorageAction::Rename,
+                    source: Some(PathBuf::from("/mnt/b/.target.tng-copy")),
+                    destination: Some(PathBuf::from("/mnt/b/target")),
+                    bytes: 128,
+                },
+            ],
+            rollback_steps: Vec::new(),
+        };
+
+        assert_eq!(
+            normalize_storage_plan_completed_steps(&plan, vec![1, 0, 1]).unwrap(),
+            vec![0, 1]
+        );
+        assert!(normalize_storage_plan_completed_steps(&plan, vec![2]).is_err());
     }
 
     #[tokio::test]

@@ -1374,6 +1374,13 @@ pub async fn storage_execute_plan(
     if let Some(response) = validate_storage_plan_roots(&plan, Some(&roots)) {
         return response;
     }
+    if let Err(e) = validate_completed_steps(&plan, req.completed_steps.as_deref()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError::bad_request(e)).unwrap()),
+        )
+            .into_response();
+    }
     match engine
         .execute_storage_plan(
             normalize_storage_operation(&req.operation)
@@ -1476,6 +1483,26 @@ fn build_storage_plan(req: &StoragePlanRequest, preview: bool) -> Result<Storage
         })),
         _ => Err("operation must be one of move, import, or delete".to_owned()),
     }
+}
+
+fn validate_completed_steps(
+    plan: &StoragePlan,
+    completed_steps: Option<&[usize]>,
+) -> Result<(), String> {
+    let Some(completed_steps) = completed_steps else {
+        return Ok(());
+    };
+    if let Some(index) = completed_steps
+        .iter()
+        .copied()
+        .find(|index| *index >= plan.steps.len())
+    {
+        return Err(format!(
+            "completed storage-plan step {index} is outside plan length {}",
+            plan.steps.len()
+        ));
+    }
+    Ok(())
 }
 
 fn validate_storage_plan_roots(
@@ -3676,6 +3703,32 @@ mod tests {
         );
         assert_eq!(response.plan.rollback_steps.len(), 1);
         assert_eq!(response.plan.rollback_steps[0].action, "safe_delete");
+    }
+
+    #[test]
+    fn storage_plan_completed_steps_are_bounded_by_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.bin");
+        let destination = dir.path().join("destination.bin");
+        std::fs::write(&source, b"payload").unwrap();
+        let req = StoragePlanRequest {
+            operation: "move".to_owned(),
+            source: Some(source),
+            destination: Some(destination),
+            target: None,
+            bytes: Some(7),
+            available_bytes: Some(7),
+            hardlink_or_copy: None,
+            dry_run: Some(false),
+            dry_run_approved: None,
+            affected_torrents: None,
+            roots: None,
+            completed_steps: Some(vec![1]),
+        };
+
+        let plan = build_storage_plan(&req, false).unwrap();
+
+        assert!(validate_completed_steps(&plan, req.completed_steps.as_deref()).is_err());
     }
 
     #[test]
