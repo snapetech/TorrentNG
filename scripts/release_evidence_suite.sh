@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPORT_DIR="${REPORT_DIR:-$ROOT/certification/reports}"
+BENCHMARK_DIR="${BENCHMARK_DIR:-$ROOT/benchmarks}"
 OUT="${1:-$REPORT_DIR/release-evidence-suite-$(date -u +%Y%m%dT%H%M%SZ).md}"
 
 mkdir -p "$(dirname "$OUT")"
@@ -21,7 +22,14 @@ run_capture() {
     echo
     echo '```text'
   } >>"$OUT"
-  if (cd "$ROOT" && "$@") >>"$OUT" 2>&1; then
+  if [[ "${TNG_RELEASE_EVIDENCE_SELFTEST:-0}" == "1" ]]; then
+    {
+      echo "selftest: $*"
+      echo "report_dir=$REPORT_DIR"
+      echo "benchmark_dir=$BENCHMARK_DIR"
+    } >>"$OUT"
+    result="PASS"
+  elif (cd "$ROOT" && REPORT_DIR="$REPORT_DIR" BENCHMARK_DIR="$BENCHMARK_DIR" "$@") >>"$OUT" 2>&1; then
     result="PASS"
   else
     result="FAIL"
@@ -37,6 +45,7 @@ run_capture() {
   echo "- Date UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "- Commit: $(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unavailable)"
   echo "- Report directory: $REPORT_DIR"
+  echo "- Benchmark directory: $BENCHMARK_DIR"
   echo
   echo "## Gates"
   echo

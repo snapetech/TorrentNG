@@ -120,6 +120,13 @@ grep -q '| migration exported corpus coverage | WARN |' "$report_dir/local-relea
 grep -q 'Overall status: PASS_WITH_WARNINGS' "$report_dir/local-release-warning-selftest.md"
 grep -q 'Warnings: 2' "$report_dir/local-release-warning-selftest.md"
 
+REPORT_DIR="$report_dir" BENCHMARK_DIR="$benchmark_dir" \
+  TNG_RELEASE_EVIDENCE_SELFTEST=1 \
+  "$ROOT/scripts/release_evidence_suite.sh" "$report_dir/release-evidence-suite-env-selftest.md" >/dev/null
+grep -q "report_dir=$report_dir" "$report_dir/release-evidence-suite-env-selftest.md"
+grep -q "benchmark_dir=$benchmark_dir" "$report_dir/release-evidence-suite-env-selftest.md"
+grep -q 'Overall status: PASS' "$report_dir/release-evidence-suite-env-selftest.md"
+
 write_report "$report_dir/universal-compat-selftest.md" PASS_WITH_SKIPS
 write_report "$report_dir/universal-live-selftest.md" PASS_WITH_SKIPS
 REPORT_DIR="$report_dir" BENCHMARK_DIR="$benchmark_dir" \
