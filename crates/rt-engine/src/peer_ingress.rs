@@ -152,7 +152,7 @@ mod tests {
         });
         let now = Instant::now();
         let permit = budget.try_begin(addr(1), now).unwrap();
-        assert_eq!(budget.try_begin(addr(2), now), Err(PeerIngressReject::GlobalBudget));
+        assert!(matches!(budget.try_begin(addr(2), now), Err(PeerIngressReject::GlobalBudget)));
         drop(permit);
         assert!(budget.try_begin(addr(3), now).is_ok());
         assert_eq!(budget.stats().rejected_global_budget, 1);
@@ -169,7 +169,7 @@ mod tests {
         let now = Instant::now();
         let _a = budget.try_begin(addr(1), now).unwrap();
         let _b = budget.try_begin(addr(2), now).unwrap();
-        assert_eq!(budget.try_begin(addr(3), now), Err(PeerIngressReject::PerIpBudget));
+        assert!(matches!(budget.try_begin(addr(3), now), Err(PeerIngressReject::PerIpBudget)));
         assert_eq!(budget.stats().rejected_ip_budget, 1);
 
         assert!(budget
