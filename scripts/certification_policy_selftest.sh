@@ -113,6 +113,13 @@ REPORT_DIR="$report_dir" BENCHMARK_DIR="$benchmark_dir" \
 grep -q 'certification status rollup | PASS' "$report_dir/post-soak-policy.md"
 grep -q 'Overall status: PASS' "$report_dir/post-soak-policy.md"
 
+TNG_LOCAL_RELEASE_SELFTEST=1 \
+  TNG_LOCAL_RELEASE_SELFTEST_REPORT_STATUS=PASS_WITH_WARNINGS \
+  "$ROOT/scripts/local_release_gate.sh" "$report_dir/local-release-warning-selftest.md" >/dev/null
+grep -q '| migration exported corpus coverage | WARN |' "$report_dir/local-release-warning-selftest.md"
+grep -q 'Overall status: PASS_WITH_WARNINGS' "$report_dir/local-release-warning-selftest.md"
+grep -q 'Warnings: 2' "$report_dir/local-release-warning-selftest.md"
+
 write_report "$report_dir/universal-compat-selftest.md" PASS_WITH_SKIPS
 write_report "$report_dir/universal-live-selftest.md" PASS_WITH_SKIPS
 REPORT_DIR="$report_dir" BENCHMARK_DIR="$benchmark_dir" \

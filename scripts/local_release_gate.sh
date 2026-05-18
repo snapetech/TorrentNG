@@ -24,7 +24,11 @@ run_gate() {
     echo
     echo '```text'
   } >>"$OUT"
-  if (cd "$ROOT" && "$@") >>"$OUT" 2>&1; then
+  if [[ "${TNG_LOCAL_RELEASE_SELFTEST:-0}" == "1" ]]; then
+    echo "selftest: $*" >>"$OUT"
+    result="PASS"
+    echo '```' >>"$OUT"
+  elif (cd "$ROOT" && "$@") >>"$OUT" 2>&1; then
     result="PASS"
     echo '```' >>"$OUT"
   else
@@ -51,12 +55,32 @@ run_report_gate() {
     echo
     echo '```text'
   } >>"$OUT"
-  if (cd "$ROOT" && "$@") >>"$OUT" 2>&1; then
+  if [[ "${TNG_LOCAL_RELEASE_SELFTEST:-0}" == "1" ]]; then
+    echo "selftest: $*" >>"$OUT"
+    {
+      echo "# selftest"
+      echo
+      echo "Overall status: ${TNG_LOCAL_RELEASE_SELFTEST_REPORT_STATUS:-PASS}"
+    } >"$report"
     echo '```' >>"$OUT"
     report_status="$(awk -F': ' '/^Overall status:/ {status=$2} END {print status}' "$report" 2>/dev/null || true)"
     case "$report_status" in
       PASS) result="PASS" ;;
-      PASS_WITH_GAPS|PASS_WITH_SKIPS) result="WARN" ;;
+      PASS_WITH_GAPS|PASS_WITH_SKIPS|PASS_WITH_WARNINGS) result="WARN" ;;
+      "") result="PASS" ;;
+      *) result="$report_status" ;;
+    esac
+    if [[ "$result" == "FAIL" ]]; then
+      status="FAIL"
+    elif [[ "$result" == "WARN" ]]; then
+      warnings=$((warnings + 1))
+    fi
+  elif (cd "$ROOT" && "$@") >>"$OUT" 2>&1; then
+    echo '```' >>"$OUT"
+    report_status="$(awk -F': ' '/^Overall status:/ {status=$2} END {print status}' "$report" 2>/dev/null || true)"
+    case "$report_status" in
+      PASS) result="PASS" ;;
+      PASS_WITH_GAPS|PASS_WITH_SKIPS|PASS_WITH_WARNINGS) result="WARN" ;;
       "") result="PASS" ;;
       *) result="$report_status" ;;
     esac
