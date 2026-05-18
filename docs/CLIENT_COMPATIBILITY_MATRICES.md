@@ -160,7 +160,7 @@ Transmission `torrent_get` field matrix:
 | Trackers | `trackers`, `tracker_stats` including announce/scrape states and counts | Native/Partial; persisted announce status, timestamps, failure/warning messages, and scrape counts project from engine tracker rows |
 | Web seeds | `webseeds`, `webseeds_sending_to_us`, `webseeds_ex` | Partial; `webseeds_ex` shape implemented with activity placeholders |
 | Queue/group | `queue_position`, `group` | Partial; default group compatibility implemented |
-| Comments/creator | `comment`, `creator`, `primary_mime_type` | Partial; primary MIME type compatibility implemented as empty string |
+| Comments/creator | `comment`, `creator`, `primary_mime_type` | Partial; primary MIME type is inferred from the largest torrent file where possible, torrent comment/creator require metainfo parser expansion |
 | Sequential | `sequential_download`, `sequential_download_from_piece` | Sequential flag mutation/projection implemented; from-piece remains placeholder |
 
 Transmission `session_get` field matrix:

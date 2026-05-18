@@ -1194,7 +1194,9 @@ async fn torrent_get(state: &AppState, args: &Value) -> Result<Value, String> {
                     "wanted" => json!(transmission_file_wanted(meta)),
                     "comment" => json!(""),
                     "creator" => json!(""),
-                    "primaryMimeType" | "primary-mime-type" => json!(""),
+                    "primaryMimeType" | "primary-mime-type" => {
+                        json!(transmission_primary_mime_type(entry, meta))
+                    }
                     "pieceCount" | "piece-count" => json!(meta.map(|m| m.piece_count).unwrap_or(0)),
                     "pieceSize" | "piece-size" => json!(meta.map(|m| m.piece_length).unwrap_or(0)),
                     "pieces" => json!(transmission_pieces(meta)),
@@ -1429,6 +1431,51 @@ fn transmission_file_priorities(meta: Option<&EngineTorrentMetadata>) -> Vec<i64
 fn transmission_file_wanted(meta: Option<&EngineTorrentMetadata>) -> Vec<bool> {
     meta.map(|meta| meta.files.iter().map(|file| file.wanted).collect())
         .unwrap_or_default()
+}
+
+fn transmission_primary_mime_type(
+    entry: &rt_session::TorrentEntry,
+    meta: Option<&EngineTorrentMetadata>,
+) -> String {
+    let path = meta
+        .and_then(|meta| {
+            meta.files
+                .iter()
+                .max_by_key(|file| file.length)
+                .map(|file| file.path.as_str())
+        })
+        .unwrap_or(entry.name.as_str());
+    mime_type_from_path(path).to_owned()
+}
+
+fn mime_type_from_path(path: &str) -> &'static str {
+    let Some(ext) = path.rsplit('.').next().map(str::to_ascii_lowercase) else {
+        return "";
+    };
+    if ext == path.to_ascii_lowercase() {
+        return "";
+    }
+    match ext.as_str() {
+        "avi" => "video/x-msvideo",
+        "flac" => "audio/flac",
+        "gif" => "image/gif",
+        "jpg" | "jpeg" => "image/jpeg",
+        "m4a" => "audio/mp4",
+        "m4v" | "mp4" => "video/mp4",
+        "mkv" => "video/x-matroska",
+        "mov" => "video/quicktime",
+        "mp3" => "audio/mpeg",
+        "ogg" | "oga" => "audio/ogg",
+        "ogv" => "video/ogg",
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "srt" => "application/x-subrip",
+        "txt" => "text/plain",
+        "wav" => "audio/wav",
+        "webm" => "video/webm",
+        "zip" => "application/zip",
+        _ => "",
+    }
 }
 
 fn transmission_availability(meta: Option<&EngineTorrentMetadata>) -> Vec<i64> {
@@ -2341,7 +2388,7 @@ mod tests {
                 },
                 EngineTorrentFile {
                     index: 1,
-                    path: "two.bin".into(),
+                    path: "two.mkv".into(),
                     length: 200,
                     priority: 0,
                     wanted: false,
@@ -2354,6 +2401,10 @@ mod tests {
         assert_eq!(files[1]["bytesCompleted"], 75);
         let stats = transmission_file_stats(&entry, Some(&meta));
         assert_eq!(stats[1]["bytesCompleted"], 75);
+        assert_eq!(
+            transmission_primary_mime_type(&entry, Some(&meta)),
+            "video/x-matroska"
+        );
         assert_eq!(transmission_pieces(Some(&meta)), "gA==");
         assert_eq!(transmission_have_valid(&entry, Some(&meta)), 100);
         assert_eq!(transmission_have_unchecked(&entry, Some(&meta)), 100);
