@@ -113,6 +113,21 @@ REPORT_DIR="$report_dir" BENCHMARK_DIR="$benchmark_dir" \
 grep -q 'certification status rollup | PASS' "$report_dir/post-soak-policy.md"
 grep -q 'Overall status: PASS' "$report_dir/post-soak-policy.md"
 
+awk '
+  /^PROTOCOL_CASES=\(/ { in_cases=1; next }
+  in_cases && /^\)/ { in_cases=0; next }
+  in_cases {
+    gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+    if ($0 != "") print $0
+  }
+' "$ROOT/scripts/interop_matrix.sh" >"$tmpdir/protocol-cases.txt"
+while IFS= read -r protocol_case; do
+  grep -q "| \`$protocol_case\` |" "$ROOT/docs/INTEROP_MATRIX.md" || {
+    echo "protocol case $protocol_case is missing from docs/INTEROP_MATRIX.md" >&2
+    exit 1
+  }
+done <"$tmpdir/protocol-cases.txt"
+
 write_report "$report_dir/migration-corpus-20260518T000000Z.md" PASS_WITH_GAPS
 write_report "$report_dir/migration-corpus-local-release-20260518T999999Z.md" PASS_WITH_WARNINGS
 write_report "$report_dir/migration-corpus-universal-20260518T999999Z.md" PASS
