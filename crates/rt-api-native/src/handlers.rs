@@ -288,11 +288,86 @@ pub async fn get_torrent(
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct UpdateTorrentRequest {
+    pub name: Option<String>,
+    pub save_path: Option<String>,
+}
+
+/// `PUT /api/v1/torrents/{hash}` — update mutable torrent metadata.
+pub async fn update_torrent(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(info_hash): Path<String>,
+    Json(req): Json<UpdateTorrentRequest>,
+) -> impl IntoResponse {
+    if let Some(response) = require_mutation_auth(&state, &headers) {
+        return response;
+    }
+    if !torrent_exists(&state, &info_hash).await {
+        return not_found(info_hash);
+    }
+
+    let name = normalize_optional_text(req.name);
+    let save_path = req
+        .save_path
+        .map(|save_path| save_path.trim().to_owned())
+        .filter(|save_path| !save_path.is_empty())
+        .map(PathBuf::from);
+    if name.is_none() && save_path.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::to_value(ApiError::bad_request(
+                    "name or save_path is required".to_owned(),
+                ))
+                .unwrap(),
+            ),
+        )
+            .into_response();
+    }
+
+    if let Some(engine) = &state.engine {
+        return match engine
+            .update_torrent_fields(info_hash.clone(), name, save_path)
+            .await
+        {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(e) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::to_value(ApiError::bad_request(e)).unwrap()),
+            )
+                .into_response(),
+        };
+    }
+
+    let mut reg = state.registry.write().await;
+    match reg.get_mut(&info_hash) {
+        Some(entry) => {
+            if let Some(name) = name {
+                entry.name = name;
+            }
+            if let Some(save_path) = save_path {
+                entry.save_path = save_path.to_string_lossy().to_string();
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+        None => not_found(info_hash),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeleteTorrentQuery {
+    #[serde(default)]
+    pub delete_files: bool,
+}
+
 /// `DELETE /api/v1/torrents/{hash}` — remove a torrent.
 pub async fn delete_torrent(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(info_hash): Path<String>,
+    Query(query): Query<DeleteTorrentQuery>,
 ) -> impl IntoResponse {
     if let Some(response) = require_mutation_auth(&state, &headers) {
         return response;
@@ -301,7 +376,10 @@ pub async fn delete_torrent(
         return not_found(info_hash);
     }
     if let Some(engine) = &state.engine {
-        match engine.remove_torrent(info_hash.clone(), false).await {
+        match engine
+            .remove_torrent(info_hash.clone(), query.delete_files)
+            .await
+        {
             Ok(()) => StatusCode::NO_CONTENT.into_response(),
             Err(_) => not_found(info_hash),
         }
@@ -310,6 +388,12 @@ pub async fn delete_torrent(
         let _ = reg.remove(&info_hash);
         StatusCode::NO_CONTENT.into_response()
     }
+}
+
+fn normalize_optional_text(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 #[derive(Debug, Deserialize)]
@@ -424,6 +508,39 @@ fn normalize_tags(tags: Vec<String>) -> Vec<String> {
     normalized
 }
 
+/// `GET /api/v1/torrents/{hash}/files` — list files for one torrent.
+pub async fn list_torrent_files(
+    State(state): State<AppState>,
+    Path(info_hash): Path<String>,
+) -> impl IntoResponse {
+    if !torrent_exists(&state, &info_hash).await {
+        return not_found(info_hash);
+    }
+    let Some(engine) = &state.engine else {
+        return (StatusCode::OK, Json(serde_json::json!([]))).into_response();
+    };
+    match engine.torrent_metadata(info_hash).await {
+        Ok(meta) => {
+            let files: Vec<FileInfo> = meta
+                .files
+                .into_iter()
+                .map(|file| FileInfo {
+                    file_index: file.index,
+                    path: file.path,
+                    length: file.length as i64,
+                    priority: 1,
+                })
+                .collect();
+            (StatusCode::OK, Json(serde_json::to_value(files).unwrap())).into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError::bad_request(e)).unwrap()),
+        )
+            .into_response(),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct FilePriorityPatchItem {
     pub index: u32,
@@ -483,6 +600,31 @@ pub async fn patch_torrent_files(
             ),
         )
             .into_response()
+    }
+}
+
+/// `GET /api/v1/torrents/{hash}/trackers` — list tracker announce URLs for one torrent.
+pub async fn list_torrent_trackers(
+    State(state): State<AppState>,
+    Path(info_hash): Path<String>,
+) -> impl IntoResponse {
+    if !torrent_exists(&state, &info_hash).await {
+        return not_found(info_hash);
+    }
+    let Some(engine) = &state.engine else {
+        return (StatusCode::OK, Json(serde_json::json!([]))).into_response();
+    };
+    match engine.torrent_metadata(info_hash).await {
+        Ok(meta) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(meta.trackers).unwrap()),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError::bad_request(e)).unwrap()),
+        )
+            .into_response(),
     }
 }
 
@@ -3304,6 +3446,80 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn update_torrent_without_engine_updates_registry() {
+        let state = AppState::new();
+        let hash = "u".repeat(40);
+        {
+            let mut reg = state.registry.write().await;
+            reg.add(TorrentEntry::new(
+                hash.clone(),
+                "old.torrent".into(),
+                "/data".into(),
+            ))
+            .unwrap();
+        }
+        let registry = state.registry.clone();
+        let app = build_router(state);
+        let body = serde_json::json!({ "name": "new.torrent", "save_path": "/new-data" });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/v1/torrents/{hash}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let reg = registry.read().await;
+        let entry = reg.get(&hash).unwrap();
+        assert_eq!(entry.name, "new.torrent");
+        assert_eq!(entry.save_path, "/new-data");
+    }
+
+    #[tokio::test]
+    async fn native_alias_and_projection_routes_are_exposed() {
+        let (app, hash) = setup_app_with_torrent().await;
+        for (method, uri, expected) in [
+            (
+                "POST",
+                format!("/api/v1/torrents/{hash}/start"),
+                StatusCode::NO_CONTENT,
+            ),
+            (
+                "POST",
+                format!("/api/v1/torrents/{hash}/stop"),
+                StatusCode::NO_CONTENT,
+            ),
+            (
+                "GET",
+                format!("/api/v1/torrents/{hash}/files"),
+                StatusCode::OK,
+            ),
+            (
+                "GET",
+                format!("/api/v1/torrents/{hash}/trackers"),
+                StatusCode::OK,
+            ),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), expected, "{method}");
+        }
     }
 
     #[tokio::test]

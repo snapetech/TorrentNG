@@ -68,10 +68,12 @@ the rewritten engine.
 | `GET`  | `/api/v1/torrents` | List torrents with filter/sort/page |
 | `POST` | `/api/v1/torrents` | Add torrent (multipart: `torrent` file or `magnet` URL, `save_path`, `category`, `start`) |
 | `GET`  | `/api/v1/torrents/:hash` | Get single torrent by hash |
-| `PUT`  | `/api/v1/torrents/:hash` | Update torrent metadata (`{ save_path }`) |
+| `PUT`  | `/api/v1/torrents/:hash` | Update torrent metadata (`{ name, save_path }`; at least one required) |
 | `DELETE` | `/api/v1/torrents/:hash` | Remove torrent (`?delete_files=true` to also delete data) |
 | `POST` | `/api/v1/torrents/:hash/start` | Start torrent |
+| `POST` | `/api/v1/torrents/:hash/resume` | Resume torrent (alias of `start`) |
 | `POST` | `/api/v1/torrents/:hash/stop` | Stop torrent |
+| `POST` | `/api/v1/torrents/:hash/pause` | Pause torrent (alias of `stop`) |
 | `POST` | `/api/v1/torrents/:hash/recheck` | Force hash check |
 | `POST` | `/api/v1/torrents/:hash/reannounce` | Force tracker announce |
 | `GET`  | `/api/v1/torrents/:hash/trackers` | List trackers |

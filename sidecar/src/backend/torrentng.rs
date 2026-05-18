@@ -157,8 +157,13 @@ impl TorrentBackend for TorrentngBackend {
         Ok(())
     }
 
-    async fn remove(&self, hash: &str, _delete_data: bool) -> Result<()> {
-        self.request(reqwest::Method::DELETE, &format!("api/v1/torrents/{hash}"))?
+    async fn remove(&self, hash: &str, delete_data: bool) -> Result<()> {
+        let path = if delete_data {
+            format!("api/v1/torrents/{hash}?delete_files=true")
+        } else {
+            format!("api/v1/torrents/{hash}")
+        };
+        self.request(reqwest::Method::DELETE, &path)?
             .send()
             .await
             .with_context(|| format!("TorrentNG DELETE torrent {hash}"))?
@@ -168,13 +173,13 @@ impl TorrentBackend for TorrentngBackend {
     }
 
     async fn start(&self, hash: &str) -> Result<()> {
-        self.post_json(&format!("api/v1/torrents/{hash}/resume"), json!({}))
+        self.post_json(&format!("api/v1/torrents/{hash}/start"), json!({}))
             .await?;
         Ok(())
     }
 
     async fn stop(&self, hash: &str) -> Result<()> {
-        self.post_json(&format!("api/v1/torrents/{hash}/pause"), json!({}))
+        self.post_json(&format!("api/v1/torrents/{hash}/stop"), json!({}))
             .await?;
         Ok(())
     }
@@ -192,12 +197,11 @@ impl TorrentBackend for TorrentngBackend {
     }
 
     async fn list_trackers(&self, hash: &str) -> Result<Vec<RawTracker>> {
-        let detail: Value = self.get_json(&format!("api/v1/torrents/{hash}")).await?;
-        Ok(detail
-            .get("trackers")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
+        let trackers: Vec<Value> = self
+            .get_json(&format!("api/v1/torrents/{hash}/trackers"))
+            .await?;
+        Ok(trackers
+            .iter()
             .enumerate()
             .map(|(index, tracker)| RawTracker {
                 url: tracker.as_str().unwrap_or_default().to_owned(),
@@ -249,12 +253,11 @@ impl TorrentBackend for TorrentngBackend {
     }
 
     async fn list_files(&self, hash: &str) -> Result<Vec<RawFile>> {
-        let detail: Value = self.get_json(&format!("api/v1/torrents/{hash}")).await?;
-        Ok(detail
-            .get("files")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
+        let files: Vec<Value> = self
+            .get_json(&format!("api/v1/torrents/{hash}/files"))
+            .await?;
+        Ok(files
+            .iter()
             .map(|file| RawFile {
                 index: int(file, "file_index") as usize,
                 path: string(file, "path"),

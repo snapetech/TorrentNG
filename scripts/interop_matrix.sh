@@ -1335,8 +1335,29 @@ run_qbit_mutation_facade_case() {
   jq -e --arg replacement "$replacement" '[.[].url] | index($replacement) != null' <<<"$trackers" >/dev/null || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/qb/v2/torrents/files?hash=$info_hash" |
     jq -e 'type == "array" and length >= 1 and .[0].priority == 0' >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -X POST -H "Authorization: Bearer $RUST_TOKEN" \
+    "$(client_url torrentngd)/api/v1/torrents/$info_hash/stop" >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -X POST -H "Authorization: Bearer $RUST_TOKEN" \
+    "$(client_url torrentngd)/api/v1/torrents/$info_hash/start" >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -X PUT -H "Authorization: Bearer $RUST_TOKEN" -H "Content-Type: application/json" \
+    -d '{"name":"native-mutation-facade","save_path":"/downloads/torrentngd"}' \
+    "$(client_url torrentngd)/api/v1/torrents/$info_hash" >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -X PATCH -H "Authorization: Bearer $RUST_TOKEN" -H "Content-Type: application/json" \
+    -d '{"files":[{"index":0,"priority":1}]}' \
+    "$(client_url torrentngd)/api/v1/torrents/$info_hash/files" >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -X PATCH -H "Authorization: Bearer $RUST_TOKEN" -H "Content-Type: application/json" \
+    -d '{"add":["native-matrix"],"remove":[]}' \
+    "$(client_url torrentngd)/api/v1/torrents/$info_hash/tags" >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -X PATCH -H "Authorization: Bearer $RUST_TOKEN" -H "Content-Type: application/json" \
+    -d '{"add":["http://127.0.0.1:9/native-dead-announce"],"remove":["http://127.0.0.1:9/native-dead-announce"],"edit":[]}' \
+    "$(client_url torrentngd)/api/v1/torrents/$info_hash/trackers" >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/v1/torrents/$info_hash/files" |
+    jq -e 'type == "array" and length >= 1' >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/v1/torrents/$info_hash/trackers" |
+    jq -e 'type == "array"' >/dev/null || status="FAIL"
   append_report "- Target: torrentngd qBittorrent-compatible mutation endpoints"
-  append_report "- Checked: filePrio, recheck, addTrackers, editTracker, removeTrackers, trackers, files"
+  append_report "- Checked qBit facade: filePrio, recheck, addTrackers, editTracker, removeTrackers, trackers, files"
+  append_report "- Checked native REST: start, stop, update metadata, file priorities, tags, trackers, files/trackers projection"
   append_report "- Fixture: multi-128m"
   append_report "- Info hash: $info_hash"
   append_report "- Status: **$status**"

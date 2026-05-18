@@ -6,9 +6,10 @@ use axum::{
 use crate::{
     handlers::{
         add_torrent, delete_torrent, diagnose_torrent, get_torrent, health, list_session_events,
-        list_torrents, metrics, patch_torrent_files, patch_torrent_trackers, pause_torrent,
-        reannounce_torrent, recheck_torrent, resume_torrent, set_torrent_category,
-        storage_execute_plan, storage_preview_plan, stream_events,
+        list_torrent_files, list_torrent_trackers, list_torrents, metrics, patch_torrent_files,
+        patch_torrent_trackers, pause_torrent, reannounce_torrent, recheck_torrent, resume_torrent,
+        set_torrent_category, storage_execute_plan, storage_preview_plan, stream_events,
+        update_torrent,
     },
     state::AppState,
 };
@@ -20,11 +21,19 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/torrents", get(list_torrents).post(add_torrent))
         .route(
             "/api/v1/torrents/:hash",
-            get(get_torrent).delete(delete_torrent),
+            get(get_torrent).put(update_torrent).delete(delete_torrent),
+        )
+        .route(
+            "/api/v1/torrents/:hash/stop",
+            axum::routing::post(pause_torrent),
         )
         .route(
             "/api/v1/torrents/:hash/pause",
             axum::routing::post(pause_torrent),
+        )
+        .route(
+            "/api/v1/torrents/:hash/start",
+            axum::routing::post(resume_torrent),
         )
         .route(
             "/api/v1/torrents/:hash/resume",
@@ -43,10 +52,13 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/torrents/:hash/tags",
             patch(crate::handlers::patch_torrent_tags),
         )
-        .route("/api/v1/torrents/:hash/files", patch(patch_torrent_files))
+        .route(
+            "/api/v1/torrents/:hash/files",
+            get(list_torrent_files).patch(patch_torrent_files),
+        )
         .route(
             "/api/v1/torrents/:hash/trackers",
-            patch(patch_torrent_trackers),
+            get(list_torrent_trackers).patch(patch_torrent_trackers),
         )
         .route("/api/v1/torrents/:hash/diagnostics", get(diagnose_torrent))
         .route("/api/v1/events", get(stream_events))
