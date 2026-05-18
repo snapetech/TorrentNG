@@ -31,10 +31,6 @@ jobs:
             suffix: linux-aarch64
             binary: torrentngd
             archive: tar.gz
-          - os: macos-13
-            suffix: macos-x86_64
-            binary: torrentngd
-            archive: tar.gz
           - os: macos-14
             suffix: macos-aarch64
             binary: torrentngd
