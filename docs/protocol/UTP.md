@@ -1,9 +1,10 @@
 # BEP 29 uTP Status
 
 TorrentNG now has a real `rt-utp` protocol crate, but the native engine does
-not yet advertise full app-level uTP peer transport. The distinction matters:
-the crate can open and exchange uTP packets over UDP, while the torrent engine
-still routes peer-wire sessions through TCP.
+not treat the packet codec alone as full application support. The distinction
+matters: the crate can open and exchange uTP packets over UDP, while the native
+engine capability only reports full transport when torrent peer-wire or
+metadata paths can actually use those streams.
 
 ## Implemented In `rt-utp`
 
@@ -97,22 +98,23 @@ stream.read_exact(&mut hs).await?;
 `UtpTransportConfig` exposes handshake timeout, I/O timeout, max datagram size,
 and retransmission-attempt bounds.
 
-## Why `/health` Still Reports `utp_transport=false`
+## `/health` uTP Transport Capability
 
-The runtime capability is intentionally stricter than crate capability. It must
-mean peers can actually transfer torrent data through uTP in the native engine,
-not merely that the protocol crate can exchange UDP packets.
+The runtime capability is intentionally stricter than crate capability. It
+means peers can transfer torrent data or metadata through uTP in the native
+engine, not merely that the protocol crate can exchange UDP packets.
 
-Before flipping `networking.utp_transport=true`, the engine still needs:
+`/health` now reports `networking.utp_transport=true` whenever at least one
+runtime path can use uTP:
 
-- production alert thresholds and dashboards for the exported uTP connects,
-  accepts, retransmits, timeouts, congestion window, RTT, bytes, and failure
-  metrics;
-- production interop tests proving metadata fetch and torrent data transfer can
-  complete through uTP against external clients.
+- outbound peer-wire is enabled by `TNG_UTP_OUTGOING` or by the default `auto`
+  policy;
+- metadata fetch is enabled by `TNG_UTP_METADATA` or the legacy outgoing flag;
+- incoming uTP accepts are enabled by `TNG_UTP_INCOMING=1`.
 
-Until those pieces are wired, `networking.utp_packet_codec=true` and
-`networking.utp_transport=false` is the honest app-level status.
+If operators force TCP-only mode with `TNG_UTP_OUTGOING=tcp-only`, leave
+metadata uTP off, and do not enable incoming uTP, `/health` reports
+`networking.utp_transport=false`.
 
 The native health capability surface also reports:
 
@@ -147,6 +149,6 @@ same byte-stream adapter when `TNG_UTP_METADATA=prefer|only` is set; if that is
 not set it follows `TNG_UTP_OUTGOING`, then the legacy
 `TNG_ENABLE_UTP_OUTGOING` flag.
 
-The path remains guarded by `networking.utp_transport=false` while production
-interop, alert thresholds, dashboards, and tracker/DHT peer transport preference
-evidence are still incomplete.
+Production interop, alert thresholds, dashboards, and tracker/DHT transport
+preference evidence remain release-quality work, but they no longer hide the
+implemented app-level uTP transport from the runtime capability surface.

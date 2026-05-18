@@ -1707,6 +1707,31 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 fn native_engine_capabilities() -> serde_json::Value {
+    let utp_outgoing_policy = std::env::var("TNG_UTP_OUTGOING").ok().unwrap_or_else(|| {
+        if std::env::var_os("TNG_ENABLE_UTP_OUTGOING").is_some() {
+            "prefer".to_owned()
+        } else {
+            "auto".to_owned()
+        }
+    });
+    let utp_outgoing_enabled = utp_policy_allows_peer_wire(&utp_outgoing_policy);
+    let utp_metadata_policy = std::env::var("TNG_UTP_METADATA")
+        .ok()
+        .or_else(|| std::env::var("TNG_UTP_OUTGOING").ok())
+        .unwrap_or_else(|| {
+            if std::env::var_os("TNG_ENABLE_UTP_OUTGOING").is_some() {
+                "prefer".to_owned()
+            } else {
+                "off".to_owned()
+            }
+        });
+    let utp_metadata_enabled = utp_policy_allows_peer_wire(&utp_metadata_policy);
+    let utp_incoming_enabled = std::env::var("TNG_UTP_INCOMING")
+        .ok()
+        .map(|value| utp_env_enabled(&value))
+        .unwrap_or(false);
+    let utp_transport = utp_outgoing_enabled || utp_metadata_enabled || utp_incoming_enabled;
+
     serde_json::json!({
         "torrent_identity": {
             "v1": true,
@@ -1753,44 +1778,12 @@ fn native_engine_capabilities() -> serde_json::Value {
             "utp_udp_stream": true,
             "utp_outgoing_opt_in": true,
             "utp_incoming_opt_in": true,
-            "utp_outgoing_policy": std::env::var("TNG_UTP_OUTGOING")
-                .ok()
-                .unwrap_or_else(|| if std::env::var_os("TNG_ENABLE_UTP_OUTGOING").is_some() {
-                    "prefer".to_owned()
-                } else {
-                    "auto".to_owned()
-                }),
-            "utp_outgoing_enabled": std::env::var("TNG_UTP_OUTGOING")
-                .ok()
-                .map(|value| !matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "0" | "false" | "no" | "off" | "tcp" | "tcp-only"
-                ))
-                .unwrap_or(true),
-            "utp_metadata_policy": std::env::var("TNG_UTP_METADATA")
-                .ok()
-                .or_else(|| std::env::var("TNG_UTP_OUTGOING").ok())
-                .unwrap_or_else(|| if std::env::var_os("TNG_ENABLE_UTP_OUTGOING").is_some() {
-                    "prefer".to_owned()
-                } else {
-                    "off".to_owned()
-                }),
-            "utp_metadata_enabled": std::env::var("TNG_UTP_METADATA")
-                .ok()
-                .or_else(|| std::env::var("TNG_UTP_OUTGOING").ok())
-                .map(|value| matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "prefer" | "prefer-utp" | "utp-prefer" | "only" | "utp" | "utp-only"
-                ))
-                .unwrap_or_else(|| std::env::var_os("TNG_ENABLE_UTP_OUTGOING").is_some()),
-            "utp_incoming_enabled": std::env::var("TNG_UTP_INCOMING")
-                .ok()
-                .map(|value| matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                ))
-                .unwrap_or(false),
-            "utp_transport": false,
+            "utp_outgoing_policy": utp_outgoing_policy,
+            "utp_outgoing_enabled": utp_outgoing_enabled,
+            "utp_metadata_policy": utp_metadata_policy,
+            "utp_metadata_enabled": utp_metadata_enabled,
+            "utp_incoming_enabled": utp_incoming_enabled,
+            "utp_transport": utp_transport,
             "private_torrent_dht_pex_lsd_default_off": true,
         },
         "compatibility": {
@@ -1815,6 +1808,28 @@ fn native_engine_capabilities() -> serde_json::Value {
             "scale_certification": true,
         },
     })
+}
+
+fn utp_policy_allows_peer_wire(value: &str) -> bool {
+    !matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off" | "tcp" | "tcp-only"
+    )
+}
+
+fn utp_env_enabled(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true"
+            | "yes"
+            | "on"
+            | "prefer"
+            | "prefer-utp"
+            | "utp-prefer"
+            | "only"
+            | "utp"
+            | "utp-only"
+    )
 }
 
 /// `GET /metrics` — Prometheus text exposition for native engine state.
@@ -3743,10 +3758,35 @@ mod tests {
         assert_eq!(capabilities["networking"]["utp_outgoing_enabled"], true);
         assert_eq!(capabilities["networking"]["utp_metadata_policy"], "off");
         assert_eq!(capabilities["networking"]["utp_metadata_enabled"], false);
-        assert_eq!(capabilities["networking"]["utp_transport"], false);
+        assert_eq!(capabilities["networking"]["utp_transport"], true);
         assert_eq!(capabilities["compatibility"]["qbittorrent_v2"], true);
         assert_eq!(capabilities["migration"]["transmission"], true);
         assert_eq!(capabilities["operations"]["prometheus_metrics"], true);
+    }
+
+    #[test]
+    fn utp_capability_helpers_match_runtime_policy_values() {
+        for enabled in [
+            "1",
+            "true",
+            "yes",
+            "on",
+            "prefer",
+            "prefer-utp",
+            "utp-prefer",
+            "only",
+            "utp",
+            "utp-only",
+            "auto",
+        ] {
+            assert!(utp_policy_allows_peer_wire(enabled), "{enabled}");
+        }
+        for disabled in ["0", "false", "no", "off", "tcp", "tcp-only"] {
+            assert!(!utp_policy_allows_peer_wire(disabled), "{disabled}");
+        }
+        assert!(utp_env_enabled("on"));
+        assert!(utp_env_enabled("utp-only"));
+        assert!(!utp_env_enabled("tcp-only"));
     }
 
     #[tokio::test]
@@ -4263,6 +4303,11 @@ mod tests {
             (
                 "GET",
                 "/api/v1/transfer/limits".to_owned(),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                "GET",
+                "/api/v1/session/features".to_owned(),
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
         ] {

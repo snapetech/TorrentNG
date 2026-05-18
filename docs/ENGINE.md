@@ -214,8 +214,9 @@ Moving 200+ TB is a database migration, not a file copy:
 
 - TCP listener
 - uTP packet codec, connection-state support, async UDP stream primitives,
-  shared incoming endpoint demux, and opt-in peer-wire paths; default app-level
-  transport remains behind the runtime capability `networking.utp_transport=false`
+  shared incoming endpoint demux, opt-in incoming and outgoing peer-wire paths,
+  and metadata-fetch support; runtime capability reports whether any uTP
+  transport path is enabled by current policy
 - Outgoing connection queue with backpressure
 - Per-torrent and global peer caps
 - Peer scoring and ban/eject rules
@@ -236,7 +237,7 @@ Moving 200+ TB is a database migration, not a file copy:
 | BEP 15 | UDP trackers | implemented for v1; v2 UDP announces are rejected explicitly |
 | BEP 23 | Compact peer list | implemented |
 | BEP 27 | Private torrents | implemented |
-| BEP 29 | uTP | `rt-utp` packet/state/UDP stream primitives implemented; engine peer-wire integration pending |
+| BEP 29 | uTP | implemented for packet/state/UDP stream primitives plus opt-in engine peer-wire and metadata paths; public interop remains release evidence |
 | BEP 32 | IPv6 | partial: tracker compact IPv6 peers and DHT compact IPv6 peer values are parsed/forwarded; DHT routing nodes remain IPv4-only |
 | BEP 52 | BitTorrent v2 / hybrid | implemented for parsing, identity, metadata projection, storage root verification, fastresume, and compatibility projections |
 
