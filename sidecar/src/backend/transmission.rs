@@ -325,6 +325,52 @@ impl TorrentBackend for TransmissionBackend {
         .await?;
         Ok(())
     }
+
+    async fn set_location(&self, hash: &str, location: &str) -> Result<()> {
+        self.rpc(
+            "torrent-set-location",
+            json!({ "ids": [hash], "location": location, "move": true }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn rename_file(&self, hash: &str, file_index: usize, name: &str) -> Result<()> {
+        let files = self.list_files(hash).await?;
+        let Some(file) = files.into_iter().find(|file| file.index == file_index) else {
+            bail!("Transmission file index not found: {file_index}");
+        };
+        self.rpc(
+            "torrent-rename-path",
+            json!({ "ids": [hash], "path": file.path, "name": name }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn set_share_limits(
+        &self,
+        hash: &str,
+        ratio_limit_milli: i64,
+        seeding_time_limit: i64,
+    ) -> Result<()> {
+        let ratio_limit = (ratio_limit_milli >= 0).then_some(ratio_limit_milli as f64 / 1000.0);
+        let seed_ratio_mode = if ratio_limit.is_some() { 1 } else { 0 };
+        let seed_idle_limit = (seeding_time_limit >= 0).then_some(seeding_time_limit);
+        let seed_idle_mode = if seed_idle_limit.is_some() { 1 } else { 0 };
+        self.rpc(
+            "torrent-set",
+            json!({
+                "ids": [hash],
+                "seedRatioLimit": ratio_limit,
+                "seedRatioMode": seed_ratio_mode,
+                "seedIdleLimit": seed_idle_limit,
+                "seedIdleMode": seed_idle_mode,
+            }),
+        )
+        .await?;
+        Ok(())
+    }
 }
 
 impl TransmissionBackend {

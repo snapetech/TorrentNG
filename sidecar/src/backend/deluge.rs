@@ -321,6 +321,39 @@ impl TorrentBackend for DelugeBackend {
     async fn set_category(&self, _hash: &str, _category: &str) -> Result<()> {
         Ok(())
     }
+
+    async fn set_location(&self, hash: &str, location: &str) -> Result<()> {
+        self.rpc("core.move_storage", json!([[hash], location])).await?;
+        Ok(())
+    }
+
+    async fn rename_file(&self, hash: &str, file_index: usize, name: &str) -> Result<()> {
+        self.rpc(
+            "core.rename_files",
+            json!([hash, [[file_index as i64, name]]]),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn set_share_limits(
+        &self,
+        hash: &str,
+        ratio_limit_milli: i64,
+        seeding_time_limit: i64,
+    ) -> Result<()> {
+        if seeding_time_limit >= 0 {
+            bail!("Deluge per-torrent seeding time limits are not supported by this adapter");
+        }
+        if ratio_limit_milli >= 0 {
+            self.rpc(
+                "core.set_torrent_options",
+                json!([[hash], { "stop_at_ratio": true, "stop_ratio": ratio_limit_milli as f64 / 1000.0 }]),
+            )
+            .await?;
+        }
+        Ok(())
+    }
 }
 
 impl DelugeBackend {
