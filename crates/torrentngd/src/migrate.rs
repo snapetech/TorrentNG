@@ -185,7 +185,7 @@ pub fn dry_run(
     Ok(plan)
 }
 
-fn load_config(path: Option<&Path>) -> Config {
+pub(crate) fn load_config(path: Option<&Path>) -> Config {
     if let Some(path) = path {
         match Config::load(path) {
             Ok(c) => return c,
@@ -200,8 +200,12 @@ fn load_config(path: Option<&Path>) -> Config {
     Config::load_default()
 }
 
-fn confirm<R: BufRead, W: Write>(mut reader: R, mut writer: W) -> io::Result<bool> {
-    write!(writer, "Type 'yes' to apply this import: ")?;
+pub(crate) fn confirm<R: BufRead, W: Write>(
+    mut reader: R,
+    mut writer: W,
+    prompt: &str,
+) -> io::Result<bool> {
+    write!(writer, "{prompt}")?;
     writer.flush()?;
     let mut line = String::new();
     if reader.read_line(&mut line)? == 0 {
@@ -285,7 +289,13 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
 
     if !args.assume_yes {
         let stdin = io::stdin();
-        if !confirm(stdin.lock(), io::stdout()).context("reading confirmation")? {
+        if !confirm(
+            stdin.lock(),
+            io::stdout(),
+            "Type 'yes' to apply this import: ",
+        )
+        .context("reading confirmation")?
+        {
             println!("Aborted. No native state was written.");
             return Ok(());
         }
@@ -423,10 +433,11 @@ mod tests {
     #[test]
     fn confirm_accepts_yes_only() {
         let mut out = Vec::new();
-        assert!(confirm(io::Cursor::new(b"yes\n"), &mut out).unwrap());
-        assert!(confirm(io::Cursor::new(b"  Y \n"), &mut io::sink()).unwrap());
-        assert!(!confirm(io::Cursor::new(b"no\n"), &mut io::sink()).unwrap());
-        assert!(!confirm(io::Cursor::new(b""), &mut io::sink()).unwrap());
+        let p = "Type 'yes' to apply this import: ";
+        assert!(confirm(io::Cursor::new(b"yes\n"), &mut out, p).unwrap());
+        assert!(confirm(io::Cursor::new(b"  Y \n"), &mut io::sink(), p).unwrap());
+        assert!(!confirm(io::Cursor::new(b"no\n"), &mut io::sink(), p).unwrap());
+        assert!(!confirm(io::Cursor::new(b""), &mut io::sink(), p).unwrap());
         assert!(String::from_utf8(out).unwrap().contains("Type 'yes'"));
     }
 

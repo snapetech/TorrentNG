@@ -1,7 +1,7 @@
 # rt-migrate
 
-Import planning, native DB apply support, and fast-resume state import for
-major BitTorrent clients.
+Import planning, native DB apply support, fast-resume state import, and
+reverse export for major BitTorrent clients.
 
 ## Status
 
@@ -66,6 +66,25 @@ and returns both summaries.
 Operator-facing migration and rollback guidance is documented in
 [../../docs/MIGRATION.md](../../docs/MIGRATION.md) and
 [../../docs/BACKUP_RESTORE.md](../../docs/BACKUP_RESTORE.md).
+
+## Reverse export
+
+`rt_migrate::export` is the anti-lock-in path. It reads native state
+read-only from the session DB, persisted `.torrent` blobs, and native
+fastresume files, then writes target-client layouts:
+
+- `ExportFormat::Libtorrent` for qBittorrent/Deluge style `.fastresume`
+- `ExportFormat::Transmission` for `torrents/` plus `resume/`
+- `ExportFormat::Rtorrent` for session `.torrent` plus complete-state sidecars
+- `ExportFormat::Utorrent` for aggregate `resume.dat`
+- `ExportFormat::Biglybt` for aggregate `downloads.config`
+- `ExportFormat::Generic` for `.torrent` files plus a JSON manifest
+
+The export plan reports fidelity as recheck-free, complete-only,
+metadata-only, or torrent-only. Libtorrent, Transmission, uTorrent, and
+BiglyBT exports carry piece maps when native fastresume exists. rTorrent can
+only avoid recheck for complete torrents. Generic export is always correct but
+expects the destination client to recheck.
 
 Run focused tests:
 

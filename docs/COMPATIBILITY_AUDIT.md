@@ -135,6 +135,7 @@ Local surface: `crates/rt-api-rtorrent`.
 | Done | Persist qBittorrent mutable preferences | Avoids settings panes seeing accepted writes disappear |
 | Done | Deepen qBittorrent torrent property field values | Avoids detail panes seeing compatibility placeholders for values derivable from registry/engine state |
 | Done | Add minimal rTorrent XMLRPC facade with command enumeration and request/response fixtures | Removes rTorrent facade as a universal compatibility gap while documenting placeholder depth |
+| Done | Add reverse export plans for qBit/Deluge, Transmission, rTorrent, uTorrent, BiglyBT, and generic layouts | Preserves an exit path and proves emitted state round-trips through importers |
 | Medium | Populate the exported golden corpus for every supported legacy client version family | Catches undocumented key variants and nested plugin state; gate exists and currently reports `PASS_WITH_GAPS` until artifacts are present |
 | Done | Preserve scheduler/RSS/search/autoadd/blocklist/execute/plugin metadata as auxiliary migration artifacts | Useful for full client migration; intentionally separate from torrent progress |
 | Low | Proprietary client deep parsers for Tixati/BiglyBT plugin-only fields | Needs fixture corpus; progress import already uses generic verified paths |

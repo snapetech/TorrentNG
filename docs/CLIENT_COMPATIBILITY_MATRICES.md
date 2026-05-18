@@ -93,6 +93,14 @@ Universal compatibility release rule:
 | Tixati | config directory, `.torrent`, sidecar-like state | `dry_run_tixati_config_with_options` | metadata, path hints, counters/timestamps/progress if discoverable | Verification-first import; common bencoded alias matrix covered | Tixati fixture corpus; document unknown/private fields |
 | Generic directory | `.torrent` plus adjacent JSON/bencode sidecars | `dry_run_generic_torrent_directory_with_options` | metadata, path remaps, sidecar resume hints | Native; aggregate `resume.dat` detection and JSON/bencoded alias matrices covered | Recursive fixture with symlink, oversized sidecar, path remap |
 
+Reverse export is implemented in `rt_migrate::export` for qBittorrent/Deluge
+libtorrent fastresume, Transmission `torrents/` + `resume/`, rTorrent session
+sidecars, uTorrent/BitTorrent Classic `resume.dat`, BiglyBT/Vuze
+`downloads.config`, and generic `.torrent` + manifest output. The unit matrix
+round-trips each emitted format through the corresponding importer where the
+target format supports it. Export fidelity is reported as recheck-free,
+complete-only, metadata-only, or torrent-only.
+
 ## 3. qBittorrent API Matrix
 
 Local implementation: `crates/rt-api-qbit`.
@@ -235,7 +243,7 @@ when engine metadata or peer snapshots are available.
 |---|---|---|
 | P0 | `api_facade_endpoint_matrix` | Implemented in crate tests, `scripts/api_facade_certification.sh`, and `scripts/universal_compatibility_certification.sh`: qBit route matrix, Transmission method matrix, Deluge advertised method matrix, and rTorrent XMLRPC method matrix |
 | P0 | `api_response_field_matrix` | Implemented in crate tests, `scripts/api_facade_certification.sh`, and `scripts/universal_compatibility_certification.sh` for current qBit `torrents/info`/`properties`/`sync`, Transmission `torrent-get`/`session-get`, Deluge torrent status fields, and representative rTorrent XMLRPC fixtures |
-| P0 | `import_fixture_matrix` | Implemented for common JSON resume fields and source-specific bencoded aliases across qBit, Transmission, Deluge, uTorrent, BiglyBT/Vuze, Tixati, and Generic; exported-corpus gate is wired through `scripts/migration_corpus_certification.sh` and reports `PASS_WITH_GAPS` until real artifacts are populated |
+| P0 | `import_fixture_matrix` | Implemented for common JSON resume fields and source-specific bencoded aliases across qBit, Transmission, Deluge, uTorrent, BiglyBT/Vuze, Tixati, and Generic; reverse export round-trips through qBit/libtorrent, Transmission, rTorrent, uTorrent, BiglyBT, and Generic importers; exported-corpus gate is wired through `scripts/migration_corpus_certification.sh` and reports `PASS_WITH_GAPS` until real artifacts are populated |
 | P0 | `migration_apply_matrix` | Implemented in `rt-migrate` tests and `scripts/universal_compatibility_certification.sh` for common JSON and bencoded resume fields across qBit, Transmission, Deluge, uTorrent, BiglyBT/Vuze, Tixati, and Generic: applies DB rows and fastresume, reloads, and asserts preservation |
 | P1 | `qbit_arr_client_matrix` | Sonarr/Radarr/Prowlarr/cross-seed/autobrr-style qBit flows are covered by Track 1 sidecar tests, `scripts/configure_certification_clients.sh`, `scripts/arr_app_certification.sh`, `scripts/app_add_job_certification.sh`, `scripts/autobrr_certification.sh`, and `scripts/release_grab_certification.sh`; NZB360/Transdrone-style qBit read flows are covered by `scripts/mobile_compat_certification.sh` and can be included in the universal gate with `UNIVERSAL_COMPAT_MOBILE=1` |
 | P1 | `transmission_client_matrix` | transmission-web/transmission-remote field projection, mutable session settings, queue/file/tracker/torrent actions, JSON-RPC 2.0 error shape, and no-op notification subscription probes are covered by `rt-api-transmission` tests and `scripts/api_facade_certification.sh`; live mobile-style qBit read compatibility is covered by `scripts/mobile_compat_certification.sh` |

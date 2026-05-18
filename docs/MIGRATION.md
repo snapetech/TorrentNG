@@ -6,6 +6,14 @@ metadata, paths, labels/categories/tags, counters, file priorities, and resume
 state that other clients have accumulated wherever the source format makes that
 recoverable.
 
+TorrentNG also has a reverse export library path in `rt_migrate::export` for
+anti-lock-in workflows. It projects native DB rows, persisted `.torrent` blobs,
+and native fastresume state back into qBittorrent/Deluge libtorrent,
+Transmission, rTorrent, uTorrent/BitTorrent Classic, BiglyBT/Vuze, or generic
+`.torrent` + manifest layouts. Export plans report whether each torrent is
+recheck-free, complete-only, metadata-only, or torrent-only for the chosen
+target.
+
 Current migration coverage includes rTorrent, qBittorrent, Transmission, Deluge,
 uTorrent/BitTorrent Classic, BiglyBT/Vuze, Tixati, and generic `.torrent`
 directories, with exact status tracked in
