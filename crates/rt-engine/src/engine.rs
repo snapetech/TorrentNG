@@ -2345,9 +2345,10 @@ impl Engine {
             auto_tmm: limits.auto_tmm,
             auto_management: limits.auto_management,
         };
-        let db = self.db.lock().expect("database mutex poisoned");
-        rt_db::upsert_torrent_limits(&db, &row).map_err(|e| e.to_string())?;
-        drop(db);
+        {
+            let db = self.db.lock().expect("database mutex poisoned");
+            rt_db::upsert_torrent_limits(&db, &row).map_err(|e| e.to_string())?;
+        }
         self.append_session_event(
             Some(info_hash),
             EVENT_LIMITS_UPDATED,
@@ -2364,6 +2365,9 @@ impl Engine {
                 "super_seeding": row.super_seeding,
             }),
         );
+        if let Some(tx) = self.torrent_chans.get(info_hash).cloned() {
+            let _ = tx.send(TorrentCmd::UpdateLimits(limits)).await;
+        }
         Ok(())
     }
 
@@ -5455,6 +5459,50 @@ mod tests {
         assert!(limits.force_start);
         assert!(limits.auto_tmm);
         assert!(limits.auto_management);
+    }
+
+    #[tokio::test]
+    async fn update_torrent_limits_notifies_running_torrent_task() {
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let info_hash = "f".repeat(40);
+        let entry = TorrentEntry::new(info_hash.clone(), "running".into(), "/data".into());
+        let row = row_from_entry(&entry, &TorrentMeta::V1(meta()));
+        rt_db::upsert(&conn, &row).unwrap();
+
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        registry.write().await.add(entry).unwrap();
+        let (_tx, rx) = mpsc::channel(1);
+        let (torrent_tx, mut torrent_rx) = mpsc::channel(1);
+        let mut torrent_chans = HashMap::new();
+        torrent_chans.insert(info_hash.clone(), torrent_tx);
+        let engine = Engine {
+            config: Arc::new(Config::default()),
+            registry,
+            db: Arc::new(Mutex::new(conn)),
+            cmd_rx: rx,
+            cmd_tx: mpsc::channel(1).0,
+            torrent_chans,
+            torrent_tasks: HashMap::new(),
+            dht_tx: None,
+            resources: test_resource_governor(),
+        };
+
+        engine
+            .update_torrent_limits_inner(
+                &info_hash,
+                EngineTorrentLimits {
+                    sequential_download: true,
+                    ..EngineTorrentLimits::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            torrent_rx.recv().await,
+            Some(TorrentCmd::UpdateLimits(limits)) if limits.sequential_download
+        ));
     }
 
     #[tokio::test]

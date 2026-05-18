@@ -1,4 +1,4 @@
-/// Piece selection strategy: rarest-first with sequential fallback for endgame.
+/// Piece selection strategy: rarest-first with optional sequential mode.
 ///
 /// Maintains a `wanted` bitset (pieces we still need) and delegates
 /// ordering to the `Availability` map. Priority pieces (e.g., file head/tail
@@ -111,8 +111,10 @@ pub struct PiecePicker {
     enabled: Vec<bool>,
     /// In-progress pieces (piece index → state).
     in_progress: std::collections::HashMap<usize, PieceState>,
-    /// Priority pieces (selected before rarest-first).
+    /// Priority pieces (selected before rarest-first or sequential order).
     priority: Vec<usize>,
+    sequential: bool,
+    sequential_start_piece: usize,
     pub availability: Availability,
 }
 
@@ -126,6 +128,8 @@ impl PiecePicker {
             enabled: vec![true; piece_count],
             in_progress: std::collections::HashMap::new(),
             priority: Vec::new(),
+            sequential: false,
+            sequential_start_piece: 0,
             availability: Availability::new(piece_count),
         }
     }
@@ -184,6 +188,20 @@ impl PiecePicker {
         self.priority = pieces;
     }
 
+    /// Enable or disable sequential piece selection.
+    pub fn set_sequential(&mut self, enabled: bool) {
+        self.sequential = enabled;
+    }
+
+    /// Set the first piece considered by sequential mode.
+    pub fn set_sequential_from_piece(&mut self, piece: usize) {
+        self.sequential_start_piece = piece.min(self.piece_count.saturating_sub(1));
+    }
+
+    pub fn sequential(&self) -> bool {
+        self.sequential
+    }
+
     /// Pick the next block to request from a peer with given bitfield.
     ///
     /// Returns `None` if nothing is available from this peer right now.
@@ -195,6 +213,17 @@ impl PiecePicker {
                     return Some(req);
                 }
             }
+        }
+
+        if self.sequential {
+            for p in self.sequential_order() {
+                if self.wanted[p] && self.enabled[p] && peer_has.get(p).copied().unwrap_or(false) {
+                    if let Some(req) = self.pick_block_from(p) {
+                        return Some(req);
+                    }
+                }
+            }
+            return None;
         }
 
         // Rarest-first among wanted pieces the peer has.
@@ -224,6 +253,16 @@ impl PiecePicker {
                     return Some(req);
                 }
             }
+        }
+        if self.sequential {
+            for p in self.sequential_order() {
+                if self.wanted[p] && self.enabled[p] {
+                    if let Some(req) = self.pick_block_from(p) {
+                        return Some(req);
+                    }
+                }
+            }
+            return None;
         }
         for p in 0..self.piece_count {
             if self.wanted[p] && self.enabled[p] {
@@ -300,18 +339,31 @@ impl PiecePicker {
             }
         }
 
-        let wanted_enabled: Vec<bool> = self
-            .wanted
-            .iter()
-            .zip(self.enabled.iter())
-            .map(|(wanted, enabled)| *wanted && *enabled)
-            .collect();
-        for piece in self.availability.rarest_first(&wanted_enabled) {
+        let remaining = if self.sequential {
+            self.sequential_order()
+        } else {
+            let wanted_enabled: Vec<bool> = self
+                .wanted
+                .iter()
+                .zip(self.enabled.iter())
+                .map(|(wanted, enabled)| *wanted && *enabled)
+                .collect();
+            self.availability.rarest_first(&wanted_enabled)
+        };
+        for piece in remaining {
             if !ordered.contains(&piece) {
                 ordered.push(piece);
             }
         }
         ordered
+    }
+
+    fn sequential_order(&self) -> Vec<usize> {
+        if self.piece_count == 0 {
+            return Vec::new();
+        }
+        let start = self.sequential_start_piece.min(self.piece_count - 1);
+        (start..self.piece_count).chain(0..start).collect()
     }
 
     fn piece_length_for(&self, piece: usize) -> u32 {
@@ -614,6 +666,62 @@ mod tests {
         p.set_priority(vec![2]);
         let req = p.pick(&peer_has_all(4)).unwrap();
         assert_eq!(req.piece, 2);
+    }
+
+    #[test]
+    fn sequential_mode_picks_lowest_piece_before_rarest() {
+        let mut p = picker_4pieces(MAX_BLOCK_SIZE, MAX_BLOCK_SIZE);
+        p.availability.add_have(0);
+        p.availability.add_have(1);
+        p.availability.add_have(1);
+        p.availability.add_have(2);
+        p.availability.add_have(2);
+        p.availability.add_have(3);
+        p.availability.add_have(3);
+        p.set_sequential(true);
+
+        let req = p.pick(&peer_has_all(4)).unwrap();
+
+        assert_eq!(req.piece, 0);
+    }
+
+    #[test]
+    fn sequential_from_piece_starts_at_configured_piece() {
+        let mut p = picker_4pieces(MAX_BLOCK_SIZE, MAX_BLOCK_SIZE);
+        p.set_sequential(true);
+        p.set_sequential_from_piece(2);
+
+        let req = p.pick(&peer_has_all(4)).unwrap();
+
+        assert_eq!(req.piece, 2);
+    }
+
+    #[test]
+    fn seed_picker_respects_sequential_from_piece() {
+        let mut p = picker_4pieces(MAX_BLOCK_SIZE, MAX_BLOCK_SIZE);
+        p.set_sequential(true);
+        p.set_sequential_from_piece(3);
+
+        let req = p.pick_from_seed().unwrap();
+
+        assert_eq!(req.piece, 3);
+    }
+
+    #[test]
+    fn endgame_pick_order_respects_sequential_from_piece() {
+        let mut p = picker_4pieces(MAX_BLOCK_SIZE, MAX_BLOCK_SIZE);
+        p.set_sequential(true);
+        p.set_sequential_from_piece(2);
+        let all = peer_has_all(4);
+        let requested: Vec<_> = (0..4).map(|_| p.pick(&all).unwrap()).collect();
+        assert_eq!(
+            requested.iter().map(|req| req.piece).collect::<Vec<_>>(),
+            vec![2, 3, 0, 1]
+        );
+
+        let duplicate = p.pick_endgame(&all, &[]).unwrap();
+
+        assert_eq!(duplicate.piece, 2);
     }
 
     #[test]

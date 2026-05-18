@@ -154,7 +154,8 @@ pub async fn run_metadata_task(
                     }
                     TorrentCmd::Recheck { .. }
                     | TorrentCmd::CancelJob { .. }
-                    | TorrentCmd::ReloadFilePolicy => {}
+                    | TorrentCmd::ReloadFilePolicy
+                    | TorrentCmd::UpdateLimits(_) => {}
                 }
             }
             _ = tracker_tick.tick(), if !paused && !trackers.is_empty() => {

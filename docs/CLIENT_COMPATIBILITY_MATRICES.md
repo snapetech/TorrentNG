@@ -72,7 +72,7 @@ Universal compatibility release rule:
 | Web seeds | webseeds read | webseeds/webseeds_ex | file/web seed via libtorrent state | supported through metainfo | Read projection implemented; Transmission activity fields project native webseed snapshots when an engine is attached | Webseed-only transfer and webseed projection row |
 | Global speed limits | transfer limits | session limits | config/options speed limits | throttle commands | Native global limits through qBit/Transmission; Deluge and rTorrent compat roundtrip | Set/read speed limits through each facade |
 | Per-torrent speed limits | torrent limit endpoints | torrent_set limits | set_torrent_options | throttle commands | Native/Compat through qBit, Transmission, Deluge, and rTorrent facades | Per-torrent limit mutation and projection row |
-| Sequential/first-last | qBit toggles | 4.1 sequential fields | options/prioritize first-last | client-specific | Mutation/projection implemented where facades expose the fields; native scheduler effects remain per-client depth | Assert accepted; add native support if scheduler implements |
+| Sequential/first-last | qBit toggles | 4.1 sequential fields | options/prioritize first-last | client-specific | Mutation/projection implemented where facades expose the fields; native picker honors sequential mode for running torrents; first/last maps through priority pieces | Assert accepted plus picker behavior |
 | Super seeding | qBit setSuperSeeding | seed mode fields | super_seeding option | supported in rTorrent | Mutation/projection implemented as torrent limit state; native choking strategy effects remain later | API acceptance plus projection row |
 | RSS | qBit RSS API | none core | plugin ecosystem | ruTorrent plugins | qBit stateful in-memory compatibility for folders, feeds, and rules | RSS API shape and mutation tests |
 | Search | qBit search API | none core | plugin ecosystem | ruTorrent plugins | qBit stateful plugin/job compatibility with inert local result sets | Search API shape and lifecycle tests |
@@ -185,7 +185,7 @@ Transmission `torrent_get` field matrix:
 | Web seeds | `webseeds`, `webseeds_sending_to_us`, `webseeds_ex` | Native/Partial; URL list projects from metainfo and activity/rate fields project native webseed snapshots when available |
 | Queue/group | `queue_position`, `group` | Partial; default group compatibility implemented |
 | Comments/creator | `comment`, `creator`, `primary_mime_type` | Native/Partial; torrent comment, creator, creation date, and primary MIME type project from parsed metainfo where available |
-| Sequential | `sequential_download`, `sequential_download_from_piece` | Sequential flag and from-piece mutation/projection roundtrip implemented; picker-level behavioral effects remain native work |
+| Sequential | `sequential_download`, `sequential_download_from_piece` | Sequential flag mutation/projection updates native picker ordering; from-piece is retained in Transmission facade state until the engine limit model carries a start-piece field |
 
 Transmission `session_get` field matrix:
 

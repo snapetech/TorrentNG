@@ -53,7 +53,7 @@ use rt_tracker::{
 use rt_utp::UtpStream;
 
 use crate::peer_id::OUR_PEER_ID;
-use crate::{EnginePeerSnapshot, EngineWebseedSnapshot, TorrentRuntimeStats};
+use crate::{EnginePeerSnapshot, EngineTorrentLimits, EngineWebseedSnapshot, TorrentRuntimeStats};
 
 const LOCAL_UT_METADATA_ID: u8 = 1;
 const LOCAL_UT_PEX_ID: u8 = 2;
@@ -72,6 +72,7 @@ pub enum TorrentCmd {
     },
     Reannounce,
     ReloadFilePolicy,
+    UpdateLimits(EngineTorrentLimits),
     Shutdown,
     /// Peers discovered by DHT, tracker, or peer exchange.
     NewPeers(Vec<SocketAddr>),
@@ -517,6 +518,7 @@ impl TorrentTask {
             max_peers,
         };
         task.apply_file_policy_from_db();
+        task.apply_torrent_limits_from_db();
         task
     }
 
@@ -608,6 +610,9 @@ impl TorrentTask {
                         }
                         TorrentCmd::ReloadFilePolicy => {
                             self.apply_file_policy_from_db();
+                        }
+                        TorrentCmd::UpdateLimits(limits) => {
+                            self.apply_torrent_limits(&limits);
                         }
                     }
                 }
@@ -1921,9 +1926,11 @@ impl TorrentTask {
     }
 
     fn apply_file_policy_from_db(&mut self) {
-        let rows = {
+        let (rows, limits) = {
             let db = self.db.lock().expect("database mutex poisoned");
-            rt_db::list_torrent_files(&db, &self.info_hash_hex).unwrap_or_default()
+            let rows = rt_db::list_torrent_files(&db, &self.info_hash_hex).unwrap_or_default();
+            let limits = Self::torrent_limits_from_db(&db, &self.info_hash_hex);
+            (rows, limits)
         };
         if rows.is_empty() {
             return;
@@ -1932,6 +1939,12 @@ impl TorrentTask {
             .into_iter()
             .map(|row| (row.file_index as u32, (row.wanted, row.priority)))
             .collect();
+        let file_lengths: HashMap<u32, u64> = self
+            .meta
+            .files
+            .iter()
+            .map(|file| (file.index, file.length))
+            .collect();
         let mut priority_pieces = Vec::new();
         for piece in 0..self.piece_map.piece_count {
             let Ok(regions) = self.piece_map.piece_to_file_regions(piece) else {
@@ -1939,18 +1952,67 @@ impl TorrentTask {
             };
             let mut any_wanted = false;
             let mut any_high = false;
+            let mut any_first_last = false;
             for region in regions {
                 let (wanted, priority) =
                     policy.get(&region.file_index).copied().unwrap_or((true, 1));
                 any_wanted |= wanted && priority > 0;
                 any_high |= wanted && priority > 1;
+                if limits.first_last_piece_prio && wanted && priority > 0 {
+                    let file_len = file_lengths.get(&region.file_index).copied().unwrap_or(0);
+                    any_first_last |= region.file_offset == 0
+                        || region.file_offset.saturating_add(region.length) >= file_len;
+                }
             }
             self.picker.set_piece_enabled(piece as usize, any_wanted);
-            if any_high {
+            if any_high || any_first_last {
                 priority_pieces.push(piece as usize);
             }
         }
         self.picker.set_priority(priority_pieces);
+    }
+
+    fn apply_torrent_limits_from_db(&mut self) {
+        let limits = {
+            let db = self.db.lock().expect("database mutex poisoned");
+            Self::torrent_limits_from_db(&db, &self.info_hash_hex)
+        };
+        self.apply_torrent_limits(&limits);
+    }
+
+    fn apply_torrent_limits(&mut self, limits: &EngineTorrentLimits) {
+        self.picker.set_sequential(limits.sequential_download);
+        self.apply_file_policy_from_db();
+    }
+
+    fn torrent_limits_from_db(db: &Connection, info_hash: &str) -> EngineTorrentLimits {
+        match rt_db::get_torrent_limits(db, info_hash) {
+            Ok(row) => EngineTorrentLimits {
+                download_limit: row.download_limit,
+                upload_limit: row.upload_limit,
+                max_connections: row.max_connections,
+                seed_ratio_limit: row.seed_ratio_limit,
+                seed_idle_limit: row.seed_idle_limit,
+                sequential_download: row.sequential_download,
+                first_last_piece_prio: row.first_last_piece_prio,
+                force_start: row.force_start,
+                super_seeding: row.super_seeding,
+                auto_tmm: row.auto_tmm,
+                auto_management: row.auto_management,
+            },
+            Err(rt_db::DbError::NotFound(_)) => EngineTorrentLimits::default(),
+            Err(e) => {
+                warn!(
+                    component = "db",
+                    operation = "load_torrent_limits",
+                    torrent = %info_hash,
+                    result = "error",
+                    error = %e,
+                    "failed to load torrent limits"
+                );
+                EngineTorrentLimits::default()
+            }
+        }
     }
 
     fn advance_tracker_tier(&mut self) {
@@ -2132,6 +2194,9 @@ impl TorrentTask {
                 }
                 Ok(TorrentCmd::ReloadFilePolicy) => {
                     self.apply_file_policy_from_db();
+                }
+                Ok(TorrentCmd::UpdateLimits(limits)) => {
+                    self.apply_torrent_limits(&limits);
                 }
                 Ok(TorrentCmd::Recheck { .. }) => {}
                 Ok(TorrentCmd::CancelJob { job_id }) => {
