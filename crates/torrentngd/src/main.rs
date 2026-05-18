@@ -87,7 +87,11 @@ async fn main() -> anyhow::Result<()> {
     );
     let native_router = rt_api_native::router::build_router(native_state);
 
-    let qbit_state = QbitState::with_engine(Arc::clone(&registry), engine_handle.clone());
+    let qbit_state = QbitState::with_engine_and_tokens(
+        Arc::clone(&registry),
+        engine_handle.clone(),
+        config.auth.api_tokens.clone(),
+    );
     let qbit_router = rt_api_qbit::router::build_qbit_router(qbit_state);
 
     let transmission_state =
