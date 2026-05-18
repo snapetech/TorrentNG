@@ -32,6 +32,7 @@ pub struct AppState {
     pub engine: Option<EngineHandle>,
     pub session: Arc<RwLock<TransmissionSessionSettings>>,
     pub torrent_limits: Arc<RwLock<HashMap<String, EngineTorrentLimits>>>,
+    pub torrent_groups: Arc<RwLock<HashMap<String, String>>>,
     pub groups: Arc<RwLock<BTreeMap<String, TransmissionGroup>>>,
     pub notification_subscriptions: Arc<RwLock<BTreeSet<String>>>,
 }
@@ -153,6 +154,7 @@ impl AppState {
             engine: None,
             session: Arc::new(RwLock::new(TransmissionSessionSettings::default())),
             torrent_limits: Arc::new(RwLock::new(HashMap::new())),
+            torrent_groups: Arc::new(RwLock::new(HashMap::new())),
             groups: Arc::new(RwLock::new(BTreeMap::new())),
             notification_subscriptions: Arc::new(RwLock::new(BTreeSet::new())),
         }
@@ -164,6 +166,7 @@ impl AppState {
             engine: Some(engine),
             session: Arc::new(RwLock::new(TransmissionSessionSettings::default())),
             torrent_limits: Arc::new(RwLock::new(HashMap::new())),
+            torrent_groups: Arc::new(RwLock::new(HashMap::new())),
             groups: Arc::new(RwLock::new(BTreeMap::new())),
             notification_subscriptions: Arc::new(RwLock::new(BTreeSet::new())),
         }
@@ -375,8 +378,14 @@ async fn torrent_set(state: &AppState, args: &Value) -> Result<Value, String> {
         .get("download-dir")
         .and_then(Value::as_str)
         .map(str::to_owned);
+    let group = args
+        .get("group")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|group| !group.is_empty())
+        .map(str::to_owned);
     let limit_updates = transmission_torrent_limit_updates(args);
-    if labels.is_none() && location.is_none() && limit_updates.is_none() {
+    if labels.is_none() && location.is_none() && group.is_none() && limit_updates.is_none() {
         return Ok(json!({}));
     }
     for hash in ids(state, args).await {
@@ -413,6 +422,19 @@ async fn torrent_set(state: &AppState, args: &Value) -> Result<Value, String> {
                     entry.save_path = location.clone();
                 }
             }
+        }
+        if let Some(group) = &group {
+            state
+                .groups
+                .write()
+                .await
+                .entry(group.clone())
+                .or_insert_with(|| TransmissionGroup::new(group.clone()));
+            state
+                .torrent_groups
+                .write()
+                .await
+                .insert(hash.clone(), group.clone());
         }
         if let Some(updates) = &limit_updates {
             let mut limits = transmission_torrent_limits(state, &hash)
@@ -1130,12 +1152,19 @@ async fn torrent_get(state: &AppState, args: &Value) -> Result<Value, String> {
             }
         }
     }
+    let torrent_groups = state.torrent_groups.read().await.clone();
+    let groups = state.groups.read().await.clone();
     let torrents = entries
         .iter()
         .enumerate()
         .map(|(idx, entry)| {
             let meta = metadata.get(&entry.info_hash);
             let limits = limits_by_hash.get(&entry.info_hash);
+            let group_name = torrent_groups
+                .get(&entry.info_hash)
+                .map(String::as_str)
+                .unwrap_or("default");
+            let group = groups.get(group_name);
             let mut obj = serde_json::Map::new();
             for field in &fields {
                 let normalized_field = field.replace('_', "-");
@@ -1312,8 +1341,10 @@ async fn torrent_get(state: &AppState, args: &Value) -> Result<Value, String> {
                         webseed_snapshots.get(&entry.info_hash)
                     )),
                     "bandwidthPriority" | "bandwidth-priority" => json!(0),
-                    "honorsSessionLimits" | "honors-session-limits" => json!(true),
-                    "group" => json!("default"),
+                    "honorsSessionLimits" | "honors-session-limits" => json!(group
+                        .map(|group| group.honors_session_limits)
+                        .unwrap_or(true)),
+                    "group" => json!(group_name),
                     "magnetLink" | "magnet-link" => {
                         json!(transmission_magnet_link(&entry.info_hash))
                     }
@@ -2895,6 +2926,75 @@ mod tests {
         assert_eq!(group["speed-limit-down"], 2048);
         assert_eq!(group["speed-limit-up-enabled"], true);
         assert_eq!(group["speed-limit-up"], 1024);
+    }
+
+    #[tokio::test]
+    async fn transmission_torrent_group_assignment_roundtrips_in_torrent_get() {
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        {
+            let mut reg = registry.write().await;
+            reg.add(TorrentEntry::new(
+                "b".repeat(40),
+                "beta".into(),
+                "/downloads".into(),
+            ))
+            .unwrap();
+        }
+        let app = build_transmission_router(AppState::new(registry));
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .header("content-type", "application/json")
+                    .header("x-transmission-session-id", SESSION_ID)
+                    .body(Body::from(
+                        r#"{"method":"group-set","arguments":{"group":"archive","honors-session-limits":false}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .header("content-type", "application/json")
+                    .header("x-transmission-session-id", SESSION_ID)
+                    .body(Body::from(
+                        r#"{"method":"torrent-set","arguments":{"ids":["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"group":"archive"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .header("content-type", "application/json")
+                    .header("x-transmission-session-id", SESSION_ID)
+                    .body(Body::from(
+                        r#"{"method":"torrent-get","arguments":{"fields":["group","honorsSessionLimits"]}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        let torrent = &body["arguments"]["torrents"][0];
+        assert_eq!(torrent["group"], "archive");
+        assert_eq!(torrent["honorsSessionLimits"], false);
     }
 
     #[tokio::test]

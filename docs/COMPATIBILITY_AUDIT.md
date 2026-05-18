@@ -83,7 +83,7 @@ Local surface: `crates/rt-api-transmission`.
 | CSRF session ID | `X-Transmission-Session-Id` retry flow | Implemented |
 | Session reads | `session_get`, `session_stats`, `session_access_control` | Implemented; `session_get` supports field projection and projects facade notification subscriptions |
 | Session writes | `session_set`, `session_close`, `session_subscribe`, `session_unsubscribe`, queue-stalled enable/disable | Implemented for native limits plus broad compatibility-state roundtrip for paths, queues, scheduler, peer/network, blocklist, scripts, seeding settings, and notification subscriptions |
-| Groups | `group_get`, `group_set` | Implemented as compatibility state round-trips for honors-session-limits and group speed limits; native group scheduling effects remain future work |
+| Groups | `group_get`, `group_set` | Implemented as compatibility state round-trips for honors-session-limits, group speed limits, and per-torrent group projection; native group scheduling effects remain future work |
 | Torrent actions | start, start now, stop, verify, reannounce, remove | Implemented |
 | Torrent add | filename magnet, base64 metainfo, paused, download dir, labels | Implemented |
 | Torrent reads | `torrent_get` common fields: identity, status, size/progress, counters, labels, paths, files, file stats, trackers, tracker stats, peers, queue, dates, private flag, magnet link; object and table formats; recently-active removed list | Implemented |
