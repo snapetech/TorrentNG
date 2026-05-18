@@ -1177,11 +1177,15 @@ async fn torrent_get(state: &AppState, args: &Value) -> Result<Value, String> {
                     "pieceCount" | "piece-count" => json!(meta.map(|m| m.piece_count).unwrap_or(0)),
                     "pieceSize" | "piece-size" => json!(meta.map(|m| m.piece_length).unwrap_or(0)),
                     "pieces" => json!(""),
-                    "haveUnchecked" | "have-unchecked" => json!(0),
-                    "haveValid" | "have-valid" => {
-                        json!(entry.total_length.saturating_sub(entry.amount_left))
+                    "haveUnchecked" | "have-unchecked" => {
+                        json!(transmission_have_unchecked(entry, meta))
                     }
-                    "desiredAvailable" | "desired-available" => json!(0),
+                    "haveValid" | "have-valid" => {
+                        json!(transmission_have_valid(entry, meta))
+                    }
+                    "desiredAvailable" | "desired-available" => {
+                        json!(transmission_desired_available(entry, meta))
+                    }
                     "corruptEver" | "corrupt-ever" => json!(0),
                     "manualAnnounceTime" | "manual-announce-time" => json!(0),
                     "maxConnectedPeers" | "max-connected-peers" => json!(limits
@@ -1399,6 +1403,60 @@ fn transmission_availability(meta: Option<&EngineTorrentMetadata>) -> Vec<i64> {
             .collect()
     })
     .unwrap_or_default()
+}
+
+fn transmission_have_valid(
+    entry: &rt_session::TorrentEntry,
+    meta: Option<&EngineTorrentMetadata>,
+) -> u64 {
+    let Some(meta) = meta else {
+        return entry.total_length.saturating_sub(entry.amount_left);
+    };
+    let complete_pieces = meta
+        .piece_states
+        .iter()
+        .filter(|state| matches!(state, EnginePieceState::Complete))
+        .count() as u64;
+    complete_pieces
+        .saturating_mul(meta.piece_length)
+        .min(entry.total_length)
+}
+
+fn transmission_have_unchecked(
+    entry: &rt_session::TorrentEntry,
+    meta: Option<&EngineTorrentMetadata>,
+) -> u64 {
+    let Some(meta) = meta else {
+        return 0;
+    };
+    let bytes = meta
+        .piece_states
+        .iter()
+        .filter(|state| matches!(state, EnginePieceState::Partial))
+        .count() as u64
+        * meta.piece_length;
+    bytes.min(entry.total_length)
+}
+
+fn transmission_desired_available(
+    entry: &rt_session::TorrentEntry,
+    meta: Option<&EngineTorrentMetadata>,
+) -> u64 {
+    let Some(meta) = meta else {
+        return 0;
+    };
+    let bytes = meta
+        .piece_states
+        .iter()
+        .filter(|state| {
+            matches!(
+                state,
+                EnginePieceState::Complete | EnginePieceState::Partial
+            )
+        })
+        .count() as u64
+        * meta.piece_length;
+    bytes.min(entry.total_length)
 }
 
 fn transmission_webseeds_ex(meta: Option<&EngineTorrentMetadata>) -> Vec<Value> {
@@ -2159,6 +2217,9 @@ mod tests {
         assert_eq!(files[1]["bytesCompleted"], 75);
         let stats = transmission_file_stats(&entry, Some(&meta));
         assert_eq!(stats[1]["bytesCompleted"], 75);
+        assert_eq!(transmission_have_valid(&entry, Some(&meta)), 100);
+        assert_eq!(transmission_have_unchecked(&entry, Some(&meta)), 100);
+        assert_eq!(transmission_desired_available(&entry, Some(&meta)), 200);
     }
 
     #[test]
