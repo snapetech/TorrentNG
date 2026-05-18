@@ -862,4 +862,48 @@ mod tests {
         assert!(task.queried_nodes[&info_hash].contains(&first));
         assert_eq!(task.outstanding.len(), 1);
     }
+
+    #[tokio::test]
+    async fn get_peers_response_forwards_discovered_peers_to_torrent() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let socket = UdpSocket::from_std(socket).unwrap();
+        let local_id = NodeId::from_bytes([1; 20]);
+        let remote_id = NodeId::from_bytes([2; 20]);
+        let info_hash = [9; 20];
+        let discovered_peer = "127.0.0.1:51413".parse().unwrap();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
+        let mut task = DhtTask {
+            local_id,
+            table: RoutingTable::new(local_id),
+            socket,
+            listen_port: 6881,
+            bootstrap_nodes: Vec::new(),
+            next_tx: 1,
+            outstanding: HashMap::from([(b"gp".to_vec(), DhtRequest::GetPeers(info_hash))]),
+            queried_nodes: HashMap::new(),
+            torrents: HashMap::from([(info_hash, cmd_tx)]),
+            announced_peers: HashMap::new(),
+            last_full_lookup: HashMap::new(),
+        };
+        let response = KrpcMessage::Response {
+            transaction_id: b"gp".to_vec(),
+            response: DhtResponse {
+                id: remote_id,
+                nodes: Vec::new(),
+                values: vec![discovered_peer],
+                token: None,
+            },
+        };
+
+        task.handle_packet(&response.encode(), "127.0.0.1:6001".parse().unwrap())
+            .await;
+
+        match cmd_rx.recv().await {
+            Some(TorrentCmd::NewPeers(peers)) => {
+                assert_eq!(peers, vec![SocketAddr::V4(discovered_peer)]);
+            }
+            other => panic!("unexpected torrent command: {other:?}"),
+        }
+    }
 }

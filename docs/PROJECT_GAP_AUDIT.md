@@ -215,8 +215,11 @@ The full Docker interop matrix still has release evidence to run:
 - local Docker client-to-client rows across qBittorrent, Transmission, Deluge,
   rTorrent, and TorrentNG;
 - public legal torrent matrix;
-- planned protocol rows: DHT-only magnet; `tracker-outage-after-peer-discovery`,
-  `endgame-multi-peer`, `private-torrent-no-dht-pex`,
+- planned protocol rows: DHT-only magnet. The DHT core now has unit evidence
+  that `get_peers` responses are forwarded into torrent peer commands, but
+  full trackerless local metadata fetch and transfer still needs an end-to-end
+  Docker row. `tracker-outage-after-peer-discovery`, `endgame-multi-peer`,
+  `private-torrent-no-dht-pex`,
   `rust-seeds-to-all-reference-clients`, `resume-after-partial-download`,
   `force-recheck-corruption-repair`, and `missing-file-recovery` are now
   implemented Docker protocol rows covering tracker outage after peer discovery,
