@@ -97,6 +97,21 @@ impl TorrentBackend for TorrentngBackend {
             supports_file_priority: true,
             supports_tracker_edit: true,
             supports_recheck: true,
+            supports_torrent_export: true,
+            supports_webseed_reads: true,
+            supports_piece_state_reads: true,
+            supports_piece_hash_reads: true,
+            supports_peer_snapshots: true,
+            supports_peer_add: true,
+            supports_peer_ban: true,
+            supports_queue_order: true,
+            supports_per_torrent_limits: true,
+            supports_global_limits: true,
+            supports_share_limits: true,
+            supports_mode_flags: true,
+            supports_location_update: true,
+            supports_torrent_rename: true,
+            supports_file_rename: true,
             supports_runtime_user_agent: false,
             supports_config_overlay: false,
             supports_restart: false,
@@ -505,7 +520,8 @@ impl TorrentBackend for TorrentngBackend {
     }
 
     async fn set_force_start(&self, hash: &str, enabled: bool) -> Result<()> {
-        self.put_limits(hash, json!({ "force_start": enabled })).await
+        self.put_limits(hash, json!({ "force_start": enabled }))
+            .await
     }
 
     async fn set_super_seeding(&self, hash: &str, enabled: bool) -> Result<()> {
@@ -812,5 +828,20 @@ mod tests {
         assert!(capabilities.supports_file_priority);
         assert!(capabilities.supports_tracker_edit);
         assert!(capabilities.supports_recheck);
+        assert!(capabilities.supports_torrent_export);
+        assert!(capabilities.supports_webseed_reads);
+        assert!(capabilities.supports_piece_state_reads);
+        assert!(capabilities.supports_piece_hash_reads);
+        assert!(capabilities.supports_peer_snapshots);
+        assert!(capabilities.supports_peer_add);
+        assert!(capabilities.supports_peer_ban);
+        assert!(capabilities.supports_queue_order);
+        assert!(capabilities.supports_per_torrent_limits);
+        assert!(capabilities.supports_global_limits);
+        assert!(capabilities.supports_share_limits);
+        assert!(capabilities.supports_mode_flags);
+        assert!(capabilities.supports_location_update);
+        assert!(capabilities.supports_torrent_rename);
+        assert!(capabilities.supports_file_rename);
     }
 }

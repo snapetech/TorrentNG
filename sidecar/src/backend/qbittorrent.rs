@@ -176,6 +176,21 @@ impl TorrentBackend for QbittorrentBackend {
             supports_file_priority: true,
             supports_tracker_edit: true,
             supports_recheck: true,
+            supports_torrent_export: true,
+            supports_webseed_reads: true,
+            supports_piece_state_reads: true,
+            supports_piece_hash_reads: true,
+            supports_peer_snapshots: true,
+            supports_peer_add: true,
+            supports_peer_ban: true,
+            supports_queue_order: true,
+            supports_per_torrent_limits: true,
+            supports_global_limits: true,
+            supports_share_limits: true,
+            supports_mode_flags: true,
+            supports_location_update: true,
+            supports_torrent_rename: true,
+            supports_file_rename: true,
             supports_runtime_user_agent: false,
             supports_config_overlay: false,
             supports_restart: false,
@@ -480,7 +495,8 @@ impl TorrentBackend for QbittorrentBackend {
     }
 
     async fn download_limits(&self, hashes: &[String]) -> Result<BTreeMap<String, i64>> {
-        self.limit_map("api/v2/torrents/downloadLimit", hashes).await
+        self.limit_map("api/v2/torrents/downloadLimit", hashes)
+            .await
     }
 
     async fn upload_limits(&self, hashes: &[String]) -> Result<BTreeMap<String, i64>> {
@@ -740,7 +756,10 @@ fn parse_qbit_peer_response(response: &serde_json::Value) -> Vec<BackendPeer> {
 
 fn parse_qbit_peer(key: &str, peer: &serde_json::Value) -> Option<BackendPeer> {
     let addr = if let Some(ip) = peer.get("ip").and_then(|value| value.as_str()) {
-        let port = peer.get("port").and_then(|value| value.as_u64()).unwrap_or(0);
+        let port = peer
+            .get("port")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
         format!("{ip}:{port}").parse().ok()?
     } else {
         key.parse().ok()?

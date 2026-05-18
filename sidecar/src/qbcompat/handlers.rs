@@ -461,10 +461,7 @@ async fn search_start(
         "total": 0,
         "results": [],
     });
-    s.qbit_search_jobs
-        .write()
-        .await
-        .insert(id.to_string(), job);
+    s.qbit_search_jobs.write().await.insert(id.to_string(), job);
     Json(json!({ "id": id }))
 }
 
@@ -513,7 +510,11 @@ async fn search_results(
             .get("limit")
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or_else(|| results.len().saturating_sub(offset));
-        let sliced = results.into_iter().skip(offset).take(limit).collect::<Vec<_>>();
+        let sliced = results
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect::<Vec<_>>();
         map.insert("results".into(), serde_json::Value::Array(sliced));
     }
     Json(response)
@@ -927,12 +928,21 @@ async fn app_build_info(State(s): State<AppState>) -> Json<serde_json::Value> {
         "bitness": 64,
     }))
 }
-async fn app_preferences() -> Json<serde_json::Value> {
-    Json(json!({
+async fn app_preferences(State(s): State<AppState>) -> Json<serde_json::Value> {
+    let (dht, pex) = s.backend.feature_status().await;
+    let mut prefs = json!({
         "save_path": "/data/downloads",
         "queueing_enabled": false,
         "max_active_torrents": -1,
-    }))
+        "dht": feature_status_to_bool(&dht),
+        "pex": feature_status_to_bool(&pex),
+    });
+    if s.backend.capabilities().supports_runtime_user_agent {
+        if let Ok(user_agent) = s.backend.get_user_agent().await {
+            prefs["network_http_user_agent"] = json!(user_agent);
+        }
+    }
+    Json(prefs)
 }
 async fn app_default_save_path() -> &'static str {
     "/data/downloads"
@@ -958,6 +968,44 @@ async fn app_set_preferences(
             return StatusCode::BAD_REQUEST;
         }
     };
+
+    for setting in ["dht", "pex"] {
+        if let Some(enabled) = prefs.get(setting).and_then(serde_json::Value::as_bool) {
+            let result = match setting {
+                "dht" => s.backend.set_dht(enabled).await,
+                "pex" => s.backend.set_pex(enabled).await,
+                _ => unreachable!(),
+            };
+            match result {
+                Ok(_) => record_operator_event(
+                    &s,
+                    "info",
+                    "settings_changed",
+                    "qBittorrent preferences updated backend session feature",
+                    serde_json::json!({
+                        "component": "qbcompat",
+                        "backend": s.backend.backend_type().as_str(),
+                        "operation": "set_preferences",
+                        "setting": setting,
+                        "enabled": enabled,
+                        "result": "updated",
+                    }),
+                ),
+                Err(e) => {
+                    tracing::debug!(
+                        component = "qbcompat",
+                        backend = s.backend.backend_type().as_str(),
+                        operation = "set_preferences",
+                        setting,
+                        enabled,
+                        result = "unsupported",
+                        error = %e,
+                        "qBit session feature preference could not be applied by backend"
+                    );
+                }
+            }
+        }
+    }
 
     if let Some(ua) = prefs
         .get("network_http_user_agent")
@@ -1016,6 +1064,14 @@ async fn app_set_preferences(
     }
 
     StatusCode::OK
+}
+
+fn feature_status_to_bool(status: &str) -> Option<bool> {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "on" | "enabled" | "enable" | "true" | "1" | "yes" => Some(true),
+        "off" | "disabled" | "disable" | "false" | "0" | "no" => Some(false),
+        _ => None,
+    }
 }
 
 // --- Torrents ---
@@ -1275,11 +1331,17 @@ async fn torrents_add_peers(State(s): State<AppState>, Form(f): Form<AddPeersFor
     StatusCode::OK
 }
 
-async fn torrents_increase_prio(State(s): State<AppState>, Form(f): Form<HashesForm>) -> StatusCode {
+async fn torrents_increase_prio(
+    State(s): State<AppState>,
+    Form(f): Form<HashesForm>,
+) -> StatusCode {
     torrents_update_queue_order(s, f.hashes, QueueMove::Up).await
 }
 
-async fn torrents_decrease_prio(State(s): State<AppState>, Form(f): Form<HashesForm>) -> StatusCode {
+async fn torrents_decrease_prio(
+    State(s): State<AppState>,
+    Form(f): Form<HashesForm>,
+) -> StatusCode {
     torrents_update_queue_order(s, f.hashes, QueueMove::Down).await
 }
 
@@ -1422,7 +1484,10 @@ async fn torrents_trackers(
     }
 }
 
-async fn torrents_export(State(s): State<AppState>, Query(q): Query<HashQuery>) -> impl IntoResponse {
+async fn torrents_export(
+    State(s): State<AppState>,
+    Query(q): Query<HashQuery>,
+) -> impl IntoResponse {
     let Some(hash) = q.hash else {
         return StatusCode::BAD_REQUEST.into_response();
     };
@@ -2201,7 +2266,11 @@ async fn torrents_upload_limit(
     torrents_limit_map(s, q.hashes.as_deref(), false).await
 }
 
-async fn torrents_limit_map(s: AppState, hashes: Option<&str>, download: bool) -> impl IntoResponse {
+async fn torrents_limit_map(
+    s: AppState,
+    hashes: Option<&str>,
+    download: bool,
+) -> impl IntoResponse {
     let hashes = split_hashes(&s.db, hashes);
     let result = if download {
         s.backend.download_limits(&hashes).await
@@ -2225,11 +2294,7 @@ async fn torrents_set_upload_limit(
     torrents_set_speed_limit(s, f, false).await
 }
 
-async fn torrents_set_speed_limit(
-    s: AppState,
-    f: SpeedLimitForm,
-    download: bool,
-) -> StatusCode {
+async fn torrents_set_speed_limit(s: AppState, f: SpeedLimitForm, download: bool) -> StatusCode {
     let limit = f.limit.filter(|value| *value > 0);
     let operation = if download {
         "set_download_limit"

@@ -357,6 +357,21 @@ export interface BackendCapabilities {
   supports_file_priority: boolean
   supports_tracker_edit: boolean
   supports_recheck: boolean
+  supports_torrent_export: boolean
+  supports_webseed_reads: boolean
+  supports_piece_state_reads: boolean
+  supports_piece_hash_reads: boolean
+  supports_peer_snapshots: boolean
+  supports_peer_add: boolean
+  supports_peer_ban: boolean
+  supports_queue_order: boolean
+  supports_per_torrent_limits: boolean
+  supports_global_limits: boolean
+  supports_share_limits: boolean
+  supports_mode_flags: boolean
+  supports_location_update: boolean
+  supports_torrent_rename: boolean
+  supports_file_rename: boolean
   supports_runtime_user_agent: boolean
   supports_config_overlay: boolean
   supports_restart: boolean

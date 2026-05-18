@@ -610,12 +610,20 @@ async fn qb_integration_flow_read_only_clients() {
     for path in [
         "/api/qb/v2/app/version",
         "/api/qb/v2/app/webapiVersion",
-        "/api/qb/v2/app/preferences",
         "/api/qb/v2/transfer/info",
     ] {
         let res = client.get(url(addr, path)).send().await.unwrap();
         assert_eq!(res.status(), 200, "{path}");
     }
+    let res = client
+        .get(url(addr, "/api/qb/v2/app/preferences"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let prefs: serde_json::Value = res.json().await.unwrap();
+    assert!(prefs.as_object().unwrap().contains_key("dht"));
+    assert!(prefs.as_object().unwrap().contains_key("pex"));
 
     let res = client
         .get(url(
@@ -2765,6 +2773,14 @@ async fn qb_set_preferences_validates_json() {
     let res = client
         .post(url(addr, "/api/qb/v2/app/setPreferences"))
         .form(&[("json", r#"{"queueing_enabled":false}"#)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    let res = client
+        .post(url(addr, "/api/qb/v2/app/setPreferences"))
+        .form(&[("json", r#"{"dht":true,"pex":false}"#)])
         .send()
         .await
         .unwrap();

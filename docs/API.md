@@ -53,6 +53,16 @@ advertises rewrite-level support for v1/v2/hybrid identity, `btih`/`btmh`
 magnets, durable session/job state, storage safety, DHT/uTP policy, native REST,
 qBittorrent, Transmission, Deluge, migration, metrics, and diagnostics.
 
+Sidecar `/api/v1/engine` also exposes the selected backend adapter and its
+capabilities. Adapter capability flags cover tags, categories, file priority,
+tracker edit, recheck, torrent export, webseed reads, piece state/hash reads,
+peer snapshots, explicit peer add/ban, queue ordering, per-torrent/global/share
+limits, qBittorrent-style mode flags, location updates, torrent/file renames,
+runtime user-agent changes, rTorrent config overlay, and backend restart. Where
+a flag is false, native/backend endpoints return an explicit unsupported result
+or the documented compatibility empty response instead of pretending mutation
+success.
+
 The `engine.track1_sidecar_required` field is always `false` for native-engine
 mode; Track 1 remains a migration/facade layer, not a runtime dependency for
 the rewritten engine.
@@ -291,9 +301,9 @@ Implements the qBittorrent Web API v2. By default it advertises qBittorrent `5.0
 | `GET` | `/api/qb/v2/app/version` |
 | `GET` | `/api/qb/v2/app/webapiVersion` |
 | `GET` | `/api/qb/v2/app/buildInfo` |
-| `GET` | `/api/qb/v2/app/preferences` |
+| `GET` | `/api/qb/v2/app/preferences` | Includes queue defaults plus backend-derived `dht`/`pex` status when known and `network_http_user_agent` when supported |
 | `GET` | `/api/qb/v2/app/defaultSavePath` |
-| `POST` | `/api/qb/v2/app/setPreferences` | Form: `json` preference object; unsupported keys are accepted and ignored |
+| `POST` | `/api/qb/v2/app/setPreferences` | Form: `json` preference object; applies `dht`, `pex`, and `network_http_user_agent` when backend-supported; unsupported keys are accepted and ignored |
 | `GET` | `/api/qb/v2/app/getCookies` | Returns facade-stored cookie objects sorted by host/name |
 | `POST` | `/api/qb/v2/app/setCookies` | Accepts JSON array, `{ "cookies": [...] }`, or form `cookies=<json array>` |
 | `POST` | `/api/qb/v2/app/rotateAPIKey` | Stores and returns a generated facade API key as `{ "apiKey": "..." }` |

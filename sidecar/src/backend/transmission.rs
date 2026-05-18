@@ -93,6 +93,21 @@ impl TorrentBackend for TransmissionBackend {
             supports_file_priority: true,
             supports_tracker_edit: true,
             supports_recheck: true,
+            supports_torrent_export: false,
+            supports_webseed_reads: false,
+            supports_piece_state_reads: false,
+            supports_piece_hash_reads: false,
+            supports_peer_snapshots: false,
+            supports_peer_add: false,
+            supports_peer_ban: false,
+            supports_queue_order: false,
+            supports_per_torrent_limits: true,
+            supports_global_limits: true,
+            supports_share_limits: true,
+            supports_mode_flags: false,
+            supports_location_update: true,
+            supports_torrent_rename: false,
+            supports_file_rename: true,
             supports_runtime_user_agent: false,
             supports_config_overlay: false,
             supports_restart: false,
@@ -553,6 +568,13 @@ mod tests {
         assert!(capabilities.supports_file_priority);
         assert!(capabilities.supports_tracker_edit);
         assert!(capabilities.supports_recheck);
+        assert!(capabilities.supports_per_torrent_limits);
+        assert!(capabilities.supports_global_limits);
+        assert!(capabilities.supports_share_limits);
+        assert!(capabilities.supports_location_update);
+        assert!(capabilities.supports_file_rename);
+        assert!(!capabilities.supports_peer_add);
+        assert!(!capabilities.supports_peer_ban);
     }
 
     #[test]
