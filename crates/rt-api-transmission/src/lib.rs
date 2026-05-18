@@ -459,6 +459,10 @@ async fn torrent_set(state: &AppState, args: &Value) -> Result<Value, String> {
                 .write()
                 .await
                 .insert(hash.clone(), group.clone());
+            let group_state = state.groups.read().await.get(group).cloned();
+            if let Some(group_state) = group_state {
+                apply_transmission_group_limits(state, &hash, &group_state).await?;
+            }
         }
         if let Some(piece) = sequential_from_piece {
             state
@@ -520,26 +524,67 @@ async fn group_set(state: &AppState, args: &Value) -> Result<Value, String> {
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .ok_or_else(|| "missing group".to_owned())?;
-    let mut groups = state.groups.write().await;
-    let group = groups
-        .entry(name.to_owned())
-        .or_insert_with(|| TransmissionGroup::new(name.to_owned()));
-    if let Some(value) = transmission_bool_arg(args, "honors-session-limits") {
-        group.honors_session_limits = value;
-    }
-    if let Some(value) = transmission_bool_arg(args, "speed-limit-down-enabled") {
-        group.speed_limit_down_enabled = value;
-    }
-    if let Some(value) = transmission_i64_arg(args, "speed-limit-down") {
-        group.speed_limit_down = value.max(0);
-    }
-    if let Some(value) = transmission_bool_arg(args, "speed-limit-up-enabled") {
-        group.speed_limit_up_enabled = value;
-    }
-    if let Some(value) = transmission_i64_arg(args, "speed-limit-up") {
-        group.speed_limit_up = value.max(0);
+    let group = {
+        let mut groups = state.groups.write().await;
+        let group = groups
+            .entry(name.to_owned())
+            .or_insert_with(|| TransmissionGroup::new(name.to_owned()));
+        if let Some(value) = transmission_bool_arg(args, "honors-session-limits") {
+            group.honors_session_limits = value;
+        }
+        if let Some(value) = transmission_bool_arg(args, "speed-limit-down-enabled") {
+            group.speed_limit_down_enabled = value;
+        }
+        if let Some(value) = transmission_i64_arg(args, "speed-limit-down") {
+            group.speed_limit_down = value.max(0);
+        }
+        if let Some(value) = transmission_bool_arg(args, "speed-limit-up-enabled") {
+            group.speed_limit_up_enabled = value;
+        }
+        if let Some(value) = transmission_i64_arg(args, "speed-limit-up") {
+            group.speed_limit_up = value.max(0);
+        }
+        group.clone()
+    };
+    let assigned = state
+        .torrent_groups
+        .read()
+        .await
+        .iter()
+        .filter_map(|(hash, assigned)| (assigned == name).then_some(hash.clone()))
+        .collect::<Vec<_>>();
+    for hash in assigned {
+        apply_transmission_group_limits(state, &hash, &group).await?;
     }
     Ok(json!({}))
+}
+
+async fn apply_transmission_group_limits(
+    state: &AppState,
+    hash: &str,
+    group: &TransmissionGroup,
+) -> Result<(), String> {
+    if !group.speed_limit_down_enabled && !group.speed_limit_up_enabled {
+        return Ok(());
+    }
+    let Some(engine) = &state.engine else {
+        return Ok(());
+    };
+    let mut limits = transmission_torrent_limits(state, hash)
+        .await
+        .unwrap_or_default();
+    if group.speed_limit_down_enabled {
+        limits.download_limit = Some(transmission_kib_to_bytes(group.speed_limit_down));
+    }
+    if group.speed_limit_up_enabled {
+        limits.upload_limit = Some(transmission_kib_to_bytes(group.speed_limit_up));
+    }
+    state
+        .torrent_limits
+        .write()
+        .await
+        .insert(hash.to_owned(), limits.clone());
+    engine.update_torrent_limits(hash.to_owned(), limits).await
 }
 
 async fn session_subscribe(state: &AppState, args: &Value) -> Result<Value, String> {
