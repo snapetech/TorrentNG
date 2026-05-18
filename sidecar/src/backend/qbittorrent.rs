@@ -416,6 +416,50 @@ impl TorrentBackend for QbittorrentBackend {
         .await
     }
 
+    async fn toggle_first_last_piece_priority(&self, hash: &str) -> Result<()> {
+        self.post_form(
+            "api/v2/torrents/toggleFirstLastPiecePrio",
+            &[("hashes", hash)],
+        )
+        .await
+    }
+
+    async fn set_force_start(&self, hash: &str, enabled: bool) -> Result<()> {
+        let value = if enabled { "true" } else { "false" };
+        self.post_form(
+            "api/v2/torrents/setForceStart",
+            &[("hashes", hash), ("value", value)],
+        )
+        .await
+    }
+
+    async fn set_super_seeding(&self, hash: &str, enabled: bool) -> Result<()> {
+        let value = if enabled { "true" } else { "false" };
+        self.post_form(
+            "api/v2/torrents/setSuperSeeding",
+            &[("hashes", hash), ("value", value)],
+        )
+        .await
+    }
+
+    async fn set_auto_tmm(&self, hash: &str, enabled: bool) -> Result<()> {
+        let value = if enabled { "true" } else { "false" };
+        self.post_form(
+            "api/v2/torrents/setAutoTMM",
+            &[("hashes", hash), ("enable", value)],
+        )
+        .await
+    }
+
+    async fn set_auto_management(&self, hash: &str, enabled: bool) -> Result<()> {
+        let value = if enabled { "true" } else { "false" };
+        self.post_form(
+            "api/v2/torrents/setAutoManagement",
+            &[("hashes", hash), ("enable", value)],
+        )
+        .await
+    }
+
     async fn add_tags(&self, hash: &str, tags: &[&str]) -> Result<()> {
         self.post_form(
             "api/v2/torrents/addTags",

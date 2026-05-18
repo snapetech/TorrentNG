@@ -74,15 +74,18 @@ pub fn build_router(_state: AppState) -> Router<AppState> {
         .route("/torrents/setShareLimits", post(torrents_set_share_limits))
         .route("/torrents/setLocation", post(torrents_set_location))
         .route("/torrents/setSavePath", post(torrents_set_location))
-        .route("/torrents/setAutoManagement", post(ok_form))
-        .route("/torrents/setAutoTMM", post(ok_form))
-        .route("/torrents/setForceStart", post(ok_form))
-        .route("/torrents/setSuperSeeding", post(ok_form))
+        .route("/torrents/setAutoManagement", post(torrents_set_auto_management))
+        .route("/torrents/setAutoTMM", post(torrents_set_auto_tmm))
+        .route("/torrents/setForceStart", post(torrents_set_force_start))
+        .route("/torrents/setSuperSeeding", post(torrents_set_super_seeding))
         .route(
             "/torrents/toggleSequentialDownload",
             post(torrents_toggle_sequential_download),
         )
-        .route("/torrents/toggleFirstLastPiecePrio", post(ok_form))
+        .route(
+            "/torrents/toggleFirstLastPiecePrio",
+            post(torrents_toggle_first_last_piece_prio),
+        )
         .route("/torrents/categories", get(categories))
         .route("/torrents/createCategory", post(create_category))
         .route("/torrents/editCategory", post(edit_category))
@@ -1841,6 +1844,65 @@ struct ToggleSequentialForm {
     hashes: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct TorrentModeForm {
+    hashes: Option<String>,
+    value: Option<bool>,
+    enable: Option<bool>,
+}
+
+async fn torrents_set_force_start(
+    State(s): State<AppState>,
+    Form(f): Form<TorrentModeForm>,
+) -> StatusCode {
+    torrents_set_mode_flag(s, f, "set_force_start").await
+}
+
+async fn torrents_set_super_seeding(
+    State(s): State<AppState>,
+    Form(f): Form<TorrentModeForm>,
+) -> StatusCode {
+    torrents_set_mode_flag(s, f, "set_super_seeding").await
+}
+
+async fn torrents_set_auto_tmm(
+    State(s): State<AppState>,
+    Form(f): Form<TorrentModeForm>,
+) -> StatusCode {
+    torrents_set_mode_flag(s, f, "set_auto_tmm").await
+}
+
+async fn torrents_set_auto_management(
+    State(s): State<AppState>,
+    Form(f): Form<TorrentModeForm>,
+) -> StatusCode {
+    torrents_set_mode_flag(s, f, "set_auto_management").await
+}
+
+async fn torrents_set_mode_flag(s: AppState, f: TorrentModeForm, operation: &str) -> StatusCode {
+    let enabled = f.value.or(f.enable).unwrap_or(false);
+    for hash in split_hashes(&s.db, f.hashes.as_deref()) {
+        let result = match operation {
+            "set_force_start" => s.backend.set_force_start(&hash, enabled).await,
+            "set_super_seeding" => s.backend.set_super_seeding(&hash, enabled).await,
+            "set_auto_tmm" => s.backend.set_auto_tmm(&hash, enabled).await,
+            "set_auto_management" => s.backend.set_auto_management(&hash, enabled).await,
+            _ => Ok(()),
+        };
+        if let Err(e) = result {
+            tracing::warn!(
+                component = "qbcompat",
+                operation,
+                torrent = %hash,
+                result = "error",
+                error = %e,
+                "qBit torrent mode update failed"
+            );
+        }
+    }
+    StatusCode::OK
+}
+
 async fn torrents_toggle_sequential_download(
     State(s): State<AppState>,
     Form(f): Form<ToggleSequentialForm>,
@@ -1854,6 +1916,25 @@ async fn torrents_toggle_sequential_download(
                 result = "error",
                 error = %e,
                 "qBit sequential download toggle failed"
+            );
+        }
+    }
+    StatusCode::OK
+}
+
+async fn torrents_toggle_first_last_piece_prio(
+    State(s): State<AppState>,
+    Form(f): Form<ToggleSequentialForm>,
+) -> StatusCode {
+    for hash in split_hashes(&s.db, f.hashes.as_deref()) {
+        if let Err(e) = s.backend.toggle_first_last_piece_priority(&hash).await {
+            tracing::warn!(
+                component = "qbcompat",
+                operation = "toggle_first_last_piece_prio",
+                torrent = %hash,
+                result = "error",
+                error = %e,
+                "qBit first/last piece priority toggle failed"
             );
         }
     }

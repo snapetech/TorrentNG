@@ -391,6 +391,36 @@ impl TorrentBackend for TorrentngBackend {
             .await
     }
 
+    async fn toggle_first_last_piece_priority(&self, hash: &str) -> Result<()> {
+        let limits: Value = self
+            .get_json(&format!("api/v1/torrents/{hash}/limits"))
+            .await?;
+        let next = !limits
+            .get("first_last_piece_prio")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        self.put_limits(hash, json!({ "first_last_piece_prio": next }))
+            .await
+    }
+
+    async fn set_force_start(&self, hash: &str, enabled: bool) -> Result<()> {
+        self.put_limits(hash, json!({ "force_start": enabled })).await
+    }
+
+    async fn set_super_seeding(&self, hash: &str, enabled: bool) -> Result<()> {
+        self.put_limits(hash, json!({ "super_seeding": enabled }))
+            .await
+    }
+
+    async fn set_auto_tmm(&self, hash: &str, enabled: bool) -> Result<()> {
+        self.put_limits(hash, json!({ "auto_tmm": enabled })).await
+    }
+
+    async fn set_auto_management(&self, hash: &str, enabled: bool) -> Result<()> {
+        self.put_limits(hash, json!({ "auto_management": enabled }))
+            .await
+    }
+
     async fn add_tags(&self, hash: &str, tags: &[&str]) -> Result<()> {
         self.patch_json(
             &format!("api/v1/torrents/{hash}/tags"),
