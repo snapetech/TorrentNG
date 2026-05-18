@@ -2,6 +2,7 @@ import { expect, test, type Page } from '@playwright/test'
 
 const SCALE_TOTAL = 15_000
 const DEFAULT_LIMIT = 200
+const FIRST_VISIBLE_THRESHOLD_MS = Number(process.env.TNG_WEBUI_FIRST_VISIBLE_MS ?? 8000)
 
 function makeTorrent(index: number) {
   const n = index + 1
@@ -196,7 +197,7 @@ test('desktop handles 15k torrents without rendering every row', async ({ page, 
 
   const startedAt = Date.now()
   await expect(page.getByText('TorrentNG scale fixture 00001')).toBeVisible()
-  expect(Date.now() - startedAt).toBeLessThan(8000)
+  expect(Date.now() - startedAt).toBeLessThan(FIRST_VISIBLE_THRESHOLD_MS)
   await expect(page.getByText('15,000 torrents')).toBeVisible()
 
   const renderedRows = await page.locator('.torrent-row').count()

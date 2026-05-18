@@ -36,6 +36,7 @@ overall=0
   echo
   echo "- Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "- Commit: $(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  echo "- 15k first-visible threshold: ${TNG_WEBUI_FIRST_VISIBLE_MS:-8000}ms"
   echo
   echo "| Gate | Result |"
   echo "| --- | --- |"

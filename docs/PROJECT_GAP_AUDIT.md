@@ -144,9 +144,9 @@ Remaining WebUI gaps are now product/certification depth:
 - axe-based accessibility certification is wired in for serious/critical WCAG
   violations, including color contrast on the certified workspace/settings
   surfaces;
-- the browser-driven 15k-row benchmark now verifies bounded DOM rendering and
-  load-more responsiveness, but release hardware still needs a measured
-  end-to-end first-paint threshold;
+- the browser-driven 15k-row benchmark now verifies bounded DOM rendering,
+  load-more responsiveness, and a configurable first-visible threshold through
+  `TNG_WEBUI_FIRST_VISIBLE_MS` in `scripts/webui_certification.sh`;
 - some panels necessarily reflect compatibility placeholder depth from backend
   facades, especially live peer/tracker/webseed activity.
 
