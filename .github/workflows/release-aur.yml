@@ -1,0 +1,77 @@
+name: Publish AUR
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish, for example main-v0.1.0
+        required: true
+        type: string
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  publish-aur:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.event.release.tag_name }}"
+          if [[ "$tag" != main-* ]]; then
+            echo "Release tags must start with main-; got $tag." >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      - name: Configure AUR SSH
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${AUR_SSH_KEY:-}" ]]; then
+            echo "AUR_SSH_KEY is not configured; skipping AUR publish."
+            exit 0
+          fi
+          install -d -m 0700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur
+          chmod 0600 ~/.ssh/aur
+          cat > ~/.ssh/config <<'EOF'
+          Host aur.archlinux.org
+            HostName aur.archlinux.org
+            User aur
+            IdentityFile ~/.ssh/aur
+            IdentitiesOnly yes
+          EOF
+          ssh-keyscan -H aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Publish torrentngd-git
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "${AUR_SSH_KEY:-}" ]] || exit 0
+          workdir="$(mktemp -d)"
+          git clone ssh://aur@aur.archlinux.org/torrentngd-git.git "$workdir/torrentngd-git"
+          cp packaging/arch/PKGBUILD "$workdir/torrentngd-git/PKGBUILD"
+          cp packaging/arch/torrentngd.{service,sysusers,tmpfiles} "$workdir/torrentngd-git/"
+          docker run --rm \
+            -v "$workdir/torrentngd-git:/pkg" \
+            archlinux:base-devel \
+            bash -lc 'pacman -Sy --noconfirm --needed pacman-contrib && cd /pkg && makepkg --printsrcinfo > .SRCINFO'
+          git -C "$workdir/torrentngd-git" config user.name "snapetech release bot"
+          git -C "$workdir/torrentngd-git" config user.email "release@snapetech.local"
+          git -C "$workdir/torrentngd-git" add PKGBUILD .SRCINFO torrentngd.service torrentngd.sysusers torrentngd.tmpfiles
+          git -C "$workdir/torrentngd-git" commit -m "Update to ${{ steps.tag.outputs.tag }}" || exit 0
+          git -C "$workdir/torrentngd-git" push

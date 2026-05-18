@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      - "main-*"
   workflow_dispatch:
     inputs:
       tag:
@@ -13,6 +13,8 @@ on:
 
 permissions:
   contents: write
+  packages: write
+  actions: write
 
 jobs:
   release:
@@ -36,8 +38,8 @@ jobs:
           else
             tag="${GITHUB_REF_NAME}"
           fi
-          if [[ "$tag" != v* ]]; then
-            echo "Release tags must start with v; got $tag." >&2
+          if [[ "$tag" != main-* ]]; then
+            echo "Release tags must start with main-; got $tag." >&2
             exit 1
           fi
           git fetch --force origin main --tags
@@ -77,6 +79,38 @@ jobs:
           docker build -f deploy/docker/Dockerfile -t torrentng:${{ steps.tag.outputs.tag }} .
           docker build -f deploy/docker/Dockerfile.phase1 -t torrentng-phase1:${{ steps.tag.outputs.tag }} .
 
+      - name: Publish Docker images
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#main-}"
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+          if [[ -n "${DOCKERHUB_USERNAME:-}" && -n "${DOCKERHUB_TOKEN:-}" ]]; then
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+          fi
+
+          publish_image() {
+            local local_image="$1"
+            local ghcr_image="$2"
+            local dockerhub_image="$3"
+            for tag in "$RELEASE_TAG" "$version" latest; do
+              docker tag "$local_image:$RELEASE_TAG" "$ghcr_image:$tag"
+              docker push "$ghcr_image:$tag"
+              if [[ -n "${DOCKERHUB_USERNAME:-}" && -n "${DOCKERHUB_TOKEN:-}" ]]; then
+                docker tag "$local_image:$RELEASE_TAG" "$dockerhub_image:$tag"
+                docker push "$dockerhub_image:$tag"
+              fi
+            done
+          }
+
+          publish_image torrentng ghcr.io/snapetech/torrentng/native snapetech/torrentng-native
+          publish_image torrentng-phase1 ghcr.io/snapetech/torrentng/phase1 snapetech/torrentng-phase1
+
       - name: Package release artifacts
         shell: bash
         run: |
@@ -102,6 +136,12 @@ jobs:
               --generate-notes \
               --verify-tag
           fi
+
+      - name: Dispatch AUR publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: gh workflow run release-aur.yml --ref main -f tag="${{ steps.tag.outputs.tag }}"
 
       - name: Check Discord webhook configuration
         id: discord
