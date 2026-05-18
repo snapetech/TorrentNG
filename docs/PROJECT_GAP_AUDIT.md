@@ -124,6 +124,9 @@ The WebUI is implemented and builds:
   hooks, bulk edit dialogs, tracker health, ratio groups, storage planner,
   saved views, mobile-safe controls, logs, RSS rules, workflows, appearance,
   and engine/storage panels exist in `webui/src`.
+- The top bar and status bar consume `/health` runtime capabilities for uTP, so
+  operators can see whether peer-wire, metadata, or incoming uTP paths are
+  actually active rather than inferring from implementation support alone.
 - `npm run build` passes.
 - `npm run lint` passes.
 

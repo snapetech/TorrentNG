@@ -9,6 +9,9 @@ interface Props {
   backendStatus: string
   cached?: number
   storage?: StorageRoot
+  utpLabel?: string
+  utpTitle?: string
+  utpEnabled?: boolean
   togglingFeature?: 'dht' | 'pex' | null
   featureError?: string | null
   actionMessage?: string | null
@@ -129,7 +132,7 @@ function Notice({ tone, children }: { tone: 'ok' | 'error'; children: React.Reac
 
 export function StatusBar({
   loaded, total, selected, stats, backendType, backendStatus, cached, storage, togglingFeature, onToggleDht, onTogglePex,
-  featureError, actionMessage, actionTone = 'ok',
+  featureError, actionMessage, actionTone = 'ok', utpLabel, utpTitle, utpEnabled,
 }: Props) {
   const connected = backendStatus === 'connected'
   const rendered = Math.min(loaded, total)
@@ -205,6 +208,14 @@ export function StatusBar({
           value={togglingFeature === 'pex' ? '...' : (stats.pex ?? 'unknown')}
           onClick={stats.pex === 'unknown' || togglingFeature ? undefined : onTogglePex}
         />
+        {utpLabel && (
+          <Badge
+            label="uTP"
+            value={utpLabel}
+            title={utpTitle}
+            state={utpEnabled ? 'on' : 'off'}
+          />
+        )}
       </div>
     </footer>
   )

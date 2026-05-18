@@ -423,9 +423,28 @@ export interface EngineDiagnostics {
 
 export interface HealthResponse {
   status: string
+  ready?: boolean
+  native_engine?: boolean
+  torrent_count?: number
   backend?: {
     type: string
     status: string
+  }
+  engine?: {
+    mode?: string
+    source_of_truth?: string
+    track1_sidecar_required?: boolean
+    capabilities?: {
+      networking?: {
+        utp_transport?: boolean
+        utp_transport_paths?: string[]
+        utp_outgoing_enabled?: boolean
+        utp_metadata_enabled?: boolean
+        utp_incoming_enabled?: boolean
+        utp_outgoing_policy?: string
+        utp_metadata_policy?: string
+      }
+    }
   }
   rtorrent: string
   cached_torrents: number

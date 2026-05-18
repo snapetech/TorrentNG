@@ -33,6 +33,33 @@ type AuthState = 'checking' | 'authenticated' | 'unauthenticated'
 type SettingsSection = 'library' | 'engine' | 'automation' | 'support'
 const MEDIA_INFERENCE_KEY = 'tng.mediaInference'
 const DETAIL_AUTO_DISPLAY_KEY = 'tng.detailAutoDisplay'
+
+function utpPathLabel(path: string): string {
+  switch (path) {
+    case 'outgoing_peer_wire': return 'outgoing'
+    case 'metadata_fetch': return 'metadata'
+    case 'incoming_peer_wire': return 'incoming'
+    default: return path.replaceAll('_', ' ')
+  }
+}
+
+function utpStatus(capabilities: NonNullable<Awaited<ReturnType<typeof api.health>>['engine']>['capabilities'] | undefined) {
+  const networking = capabilities?.networking
+  if (!networking) return null
+  const paths = networking.utp_transport_paths ?? []
+  const label = paths.length
+    ? paths.map(utpPathLabel).join('+')
+    : networking.utp_transport ? 'enabled' : 'off'
+  const policy = [
+    networking.utp_outgoing_policy ? `outgoing=${networking.utp_outgoing_policy}` : null,
+    networking.utp_metadata_policy ? `metadata=${networking.utp_metadata_policy}` : null,
+    networking.utp_incoming_enabled !== undefined ? `incoming=${networking.utp_incoming_enabled ? 'on' : 'off'}` : null,
+  ].filter(Boolean).join(', ')
+  const title = paths.length
+    ? `Active uTP runtime paths: ${paths.map(utpPathLabel).join(', ')}${policy ? ` (${policy})` : ''}`
+    : `No active uTP runtime transport path${policy ? ` (${policy})` : ''}`
+  return { label, title, enabled: networking.utp_transport === true }
+}
 const SETTINGS_SECTION_KEY = 'tng.settingsSection'
 const ACTIVE_TAB_KEY = 'tng.activeTab'
 const ACTIVE_TAB_TTL_MS = 8000
@@ -217,6 +244,7 @@ export function App() {
   const query = useTorrentsInfinite(params, isAuthed)
   const { torrents, total } = flattenPages(query.data)
   const { data: health } = useHealth(activeTab.isActive && authState === 'authenticated')
+  const healthUtp = utpStatus(health?.engine?.capabilities)
   const { data: storage } = useQuery({
     queryKey: ['storage', 'status-bar'],
     queryFn: api.storage,
@@ -645,6 +673,19 @@ export function App() {
           {health?.backend ? `${health.backend.type}: ${health.backend.status}` : 'connecting...'}
         </span>
 
+        {healthUtp && (
+          <span className="tng-topbar-pill" data-tone={healthUtp.enabled ? 'ok' : 'neutral'} title={healthUtp.title} style={{
+            fontSize: 11,
+            color: healthUtp.enabled ? 'var(--success)' : 'var(--muted)',
+            display: 'flex', alignItems: 'center', gap: 5, padding: '2px 7px',
+            border: '1px solid ' + (healthUtp.enabled ? 'color-mix(in srgb, var(--success) 42%, var(--border))' : 'var(--border)'),
+            borderRadius: 999,
+            background: healthUtp.enabled ? 'color-mix(in srgb, var(--success) 9%, transparent)' : 'var(--surface)',
+          }}>
+            uTP {healthUtp.label}
+          </span>
+        )}
+
         <span className="tng-topbar-spacer" style={{ flex: '1 0 12px' }} />
         <div className="tng-theme-controls" style={{ display: 'flex', alignItems: 'center', gap: 6, flex: '0 0 auto' }}>
           <span
@@ -820,6 +861,9 @@ export function App() {
         backendStatus={health?.backend?.status ?? health?.rtorrent ?? 'connecting'}
         cached={health?.cached_torrents}
         storage={storage?.roots?.[0]}
+        utpLabel={healthUtp?.label}
+        utpTitle={healthUtp?.title}
+        utpEnabled={healthUtp?.enabled}
         togglingFeature={togglingFeature}
         featureError={featureError}
         actionMessage={actionNotice?.text}
