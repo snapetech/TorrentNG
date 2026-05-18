@@ -129,8 +129,8 @@ scripts/webui_certification.sh
 This runs the production build, lint, and a mocked-API Playwright matrix across
 desktop and mobile viewports. The browser matrix checks first paint, table
 rendering, selection state, settings navigation, storage panel rendering,
-15k-row virtualized table behavior, core accessible control names, and
-console/page-error cleanliness.
+15k-row virtualized table behavior, core accessible control names, automated
+axe WCAG structural checks, and console/page-error cleanliness.
 `scripts/local_release_gate.sh` now runs the same WebUI certification as part
 of the local release path. It also runs the migration corpus gate and reports
 that leg as `WARN`, with an overall `PASS_WITH_WARNINGS`, when the synthetic
@@ -138,8 +138,10 @@ migration tests pass but exported corpora are still missing.
 
 Remaining WebUI gaps are now product/certification depth:
 
-- no visual-regression screenshot baseline or full axe-style accessibility
-  audit is wired into CI yet;
+- no visual-regression screenshot baseline is wired into CI yet;
+- axe-based accessibility certification is wired in for serious/critical
+  structural WCAG violations, but color-contrast remediation remains a visual
+  design follow-up before enabling the contrast rule as a hard gate;
 - the browser-driven 15k-row benchmark now verifies bounded DOM rendering and
   load-more responsiveness, but release hardware still needs a measured
   end-to-end first-paint threshold;

@@ -331,7 +331,6 @@ export function TorrentTable({
                   onClick={() => onSort(sortKey)}
                   title={`Sort by ${col.label}`}
                   aria-label={`Sort by ${col.label}`}
-                  aria-sort={col.sortKey === activeSort ? (activeDir === 'asc' ? 'ascending' : 'descending') : undefined}
                   style={{
                     background: 'transparent', border: 0, padding: 0, margin: 0,
                     color: col.sortKey === activeSort ? 'var(--accent-text)' : 'var(--muted)',
@@ -514,18 +513,8 @@ export function TorrentTable({
                 className="torrent-row"
                 data-status={label.toLowerCase()}
                 data-detail={isDetail ? 'true' : 'false'}
-                role="button"
-                tabIndex={0}
-                aria-selected={isSelected}
-                aria-label={`${isSelected ? 'Deselect' : 'Select'} torrent ${t.name}`}
                 title={`${isSelected ? 'Deselect' : 'Select'} ${t.name}`}
                 onClick={() => onSelect(t.hash)}
-                onKeyDown={e => {
-                  if (e.key === 'Enter' || e.key === ' ') {
-                    e.preventDefault()
-                    onSelect(t.hash)
-                  }
-                }}
                 onContextMenu={e => {
                   e.preventDefault()
                   onContextMenu(t, e.clientX, e.clientY)

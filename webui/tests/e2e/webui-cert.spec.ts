@@ -191,7 +191,7 @@ test('desktop renders torrent workspace and table rows', async ({ page }) => {
   await expect(page.getByText('TorrentNG fixture 001')).toBeVisible()
   await expect(page.getByText('TorrentNG fixture 010')).toBeVisible()
   await expect(page.getByRole('button', { name: /Sort by Name/i })).toBeVisible()
-  await page.getByRole('button', { name: /Select torrent TorrentNG fixture 001|Select TorrentNG fixture 001/i }).first().click()
+  await page.getByLabel(/Select TorrentNG fixture 001/i).first().click()
   await expect(page.getByText('1 selected').first()).toBeVisible()
 })
 

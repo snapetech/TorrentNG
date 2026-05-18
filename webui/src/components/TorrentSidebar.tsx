@@ -286,6 +286,7 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
           <input
             value={trackerFilter}
             onChange={e => setTrackerFilter(e.target.value)}
+            aria-label="Filter trackers"
             placeholder="Tracker contains"
             style={inputStyle}
           />
@@ -313,6 +314,7 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
 
       <Section title="Sort">
         <select
+          aria-label="Sort torrents by"
           value={params.sort ?? 'name'}
           onChange={e => onChange({ sort: e.target.value, offset: 0 })}
           style={selectStyle}
@@ -361,6 +363,7 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
             onChange={e => setViewName(e.target.value)}
             onKeyDown={e => { if (e.key === 'Enter') saveView() }}
             disabled={Boolean(viewsBusy)}
+            aria-label="Save current view"
             placeholder="Save view"
             style={inputStyle}
           />
