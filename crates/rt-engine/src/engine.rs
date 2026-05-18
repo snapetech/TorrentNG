@@ -2339,6 +2339,9 @@ impl Engine {
             seed_ratio_limit: limits.seed_ratio_limit.filter(|value| *value >= 0.0),
             seed_idle_limit: limits.seed_idle_limit.filter(|value| *value >= 0),
             sequential_download: limits.sequential_download,
+            sequential_download_from_piece: limits
+                .sequential_download_from_piece
+                .filter(|value| *value >= 0),
             first_last_piece_prio: limits.first_last_piece_prio,
             force_start: limits.force_start,
             super_seeding: limits.super_seeding,
@@ -2360,6 +2363,7 @@ impl Engine {
                 "seed_ratio_limit": row.seed_ratio_limit,
                 "seed_idle_limit": row.seed_idle_limit,
                 "sequential_download": row.sequential_download,
+                "sequential_download_from_piece": row.sequential_download_from_piece,
                 "first_last_piece_prio": row.first_last_piece_prio,
                 "force_start": row.force_start,
                 "super_seeding": row.super_seeding,
@@ -4172,6 +4176,7 @@ fn engine_limits_from_row(row: rt_db::TorrentLimitRow) -> EngineTorrentLimits {
         seed_ratio_limit: row.seed_ratio_limit,
         seed_idle_limit: row.seed_idle_limit,
         sequential_download: row.sequential_download,
+        sequential_download_from_piece: row.sequential_download_from_piece,
         first_last_piece_prio: row.first_last_piece_prio,
         force_start: row.force_start,
         super_seeding: row.super_seeding,
@@ -5442,6 +5447,7 @@ mod tests {
                     upload_limit: Some(2000),
                     seed_ratio_limit: Some(1.5),
                     sequential_download: true,
+                    sequential_download_from_piece: Some(7),
                     force_start: true,
                     auto_tmm: true,
                     auto_management: true,
@@ -5456,6 +5462,7 @@ mod tests {
         assert_eq!(limits.upload_limit, Some(2000));
         assert_eq!(limits.seed_ratio_limit, Some(1.5));
         assert!(limits.sequential_download);
+        assert_eq!(limits.sequential_download_from_piece, Some(7));
         assert!(limits.force_start);
         assert!(limits.auto_tmm);
         assert!(limits.auto_management);
@@ -5493,6 +5500,7 @@ mod tests {
                 &info_hash,
                 EngineTorrentLimits {
                     sequential_download: true,
+                    sequential_download_from_piece: Some(5),
                     ..EngineTorrentLimits::default()
                 },
             )
@@ -5501,7 +5509,8 @@ mod tests {
 
         assert!(matches!(
             torrent_rx.recv().await,
-            Some(TorrentCmd::UpdateLimits(limits)) if limits.sequential_download
+            Some(TorrentCmd::UpdateLimits(limits))
+                if limits.sequential_download && limits.sequential_download_from_piece == Some(5)
         ));
     }
 

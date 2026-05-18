@@ -466,6 +466,18 @@ async fn torrent_set(state: &AppState, args: &Value) -> Result<Value, String> {
                 .write()
                 .await
                 .insert(hash.clone(), piece);
+            if let Some(engine) = &state.engine {
+                let mut limits = transmission_torrent_limits(state, &hash)
+                    .await
+                    .unwrap_or_default();
+                limits.sequential_download_from_piece = Some(piece);
+                state
+                    .torrent_limits
+                    .write()
+                    .await
+                    .insert(hash.clone(), limits.clone());
+                engine.update_torrent_limits(hash.clone(), limits).await?;
+            }
         }
         if let Some(updates) = &limit_updates {
             let mut limits = transmission_torrent_limits(state, &hash)
@@ -1399,9 +1411,9 @@ async fn torrent_get(state: &AppState, args: &Value) -> Result<Value, String> {
                             .unwrap_or(false))
                     }
                     "sequentialDownloadFromPiece" | "sequential-download-from-piece" => {
-                        json!(sequential_from_piece
-                            .get(&entry.info_hash)
-                            .copied()
+                        json!(limits
+                            .and_then(|limits| limits.sequential_download_from_piece)
+                            .or_else(|| sequential_from_piece.get(&entry.info_hash).copied())
                             .unwrap_or(0))
                     }
                     _ => Value::Null,

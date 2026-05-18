@@ -618,6 +618,7 @@ pub struct EngineTorrentLimits {
     pub seed_ratio_limit: Option<f64>,
     pub seed_idle_limit: Option<i64>,
     pub sequential_download: bool,
+    pub sequential_download_from_piece: Option<i64>,
     pub first_last_piece_prio: bool,
     pub force_start: bool,
     pub super_seeding: bool,

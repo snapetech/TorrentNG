@@ -1982,6 +1982,9 @@ impl TorrentTask {
 
     fn apply_torrent_limits(&mut self, limits: &EngineTorrentLimits) {
         self.picker.set_sequential(limits.sequential_download);
+        if let Some(piece) = limits.sequential_download_from_piece {
+            self.picker.set_sequential_from_piece(piece as usize);
+        }
         self.apply_file_policy_from_db();
     }
 
@@ -1994,6 +1997,7 @@ impl TorrentTask {
                 seed_ratio_limit: row.seed_ratio_limit,
                 seed_idle_limit: row.seed_idle_limit,
                 sequential_download: row.sequential_download,
+                sequential_download_from_piece: row.sequential_download_from_piece,
                 first_last_piece_prio: row.first_last_piece_prio,
                 force_start: row.force_start,
                 super_seeding: row.super_seeding,

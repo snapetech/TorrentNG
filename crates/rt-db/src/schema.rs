@@ -243,6 +243,14 @@ const MIGRATIONS: &[(u32, &str)] = &[
         CREATE INDEX IF NOT EXISTS idx_session_events_level ON session_events(level);
         ",
     ),
+    (
+        5,
+        "
+        PRAGMA foreign_keys = ON;
+
+        ALTER TABLE torrent_limits ADD COLUMN sequential_download_from_piece INTEGER;
+        ",
+    ),
 ];
 
 #[cfg(test)]
@@ -276,7 +284,7 @@ mod tests {
         let v: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 4);
+        assert_eq!(v, 5);
     }
 
     #[test]
