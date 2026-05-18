@@ -290,6 +290,45 @@ impl TorrentBackend for TorrentngBackend {
         .with_context(|| format!("TorrentNG PUT torrent {hash} category"))?;
         Ok(())
     }
+
+    async fn add_tags(&self, hash: &str, tags: &[&str]) -> Result<()> {
+        self.patch_json(
+            &format!("api/v1/torrents/{hash}/tags"),
+            json!({ "add": tags, "remove": [] }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn remove_tags(&self, hash: &str, tags: &[&str]) -> Result<()> {
+        self.patch_json(
+            &format!("api/v1/torrents/{hash}/tags"),
+            json!({ "add": [], "remove": tags }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn set_tags(&self, hash: &str, tags: &[&str]) -> Result<()> {
+        let current = self
+            .list_torrents()
+            .await?
+            .into_iter()
+            .find(|torrent| torrent.hash.eq_ignore_ascii_case(hash))
+            .map(|torrent| torrent.tags)
+            .unwrap_or_default();
+        let current_tags: Vec<&str> = current
+            .split(',')
+            .map(str::trim)
+            .filter(|tag| !tag.is_empty())
+            .collect();
+        self.patch_json(
+            &format!("api/v1/torrents/{hash}/tags"),
+            json!({ "add": tags, "remove": current_tags }),
+        )
+        .await?;
+        Ok(())
+    }
 }
 
 fn map_summary(t: &Value) -> RawTorrent {

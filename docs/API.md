@@ -79,8 +79,7 @@ the rewritten engine.
 | `GET`  | `/api/v1/torrents/:hash/files` | List files |
 | `PATCH` | `/api/v1/torrents/:hash/files` | Set file priorities (`{ files: [{index, priority}] }`); native daemon routes each file priority update through the engine |
 | `PUT`  | `/api/v1/torrents/:hash/category` | Set or clear category (`{ category: "name" }`, or `null`/empty to clear) |
-| `POST` | `/api/v1/torrents/:hash/tags` | Add tags (`{ tags: ["a","b"] }`) |
-| `DELETE` | `/api/v1/torrents/:hash/tags` | Remove tags (`{ tags: ["a"] }`) |
+| `PATCH` | `/api/v1/torrents/:hash/tags` | Add/remove tags (`{ add: ["a"], remove: ["b"] }`); native daemon routes tag changes through the engine label update path |
 | `GET` | `/api/v1/events` | Server-sent torrent delta stream |
 | `GET` | `/api/v1/jobs` | List active durable engine jobs with progress, checkpoint, and last-error fields |
 | `GET` | `/api/v1/session-events` | Recent durable native session events; query: `limit`, `torrent`, `kind`, `level`, `last_known_id` |

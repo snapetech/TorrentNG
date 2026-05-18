@@ -39,6 +39,10 @@ pub fn build_router(state: AppState) -> Router {
             axum::routing::post(reannounce_torrent),
         )
         .route("/api/v1/torrents/:hash/category", put(set_torrent_category))
+        .route(
+            "/api/v1/torrents/:hash/tags",
+            patch(crate::handlers::patch_torrent_tags),
+        )
         .route("/api/v1/torrents/:hash/files", patch(patch_torrent_files))
         .route(
             "/api/v1/torrents/:hash/trackers",

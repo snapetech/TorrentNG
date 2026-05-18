@@ -359,6 +359,72 @@ pub async fn set_torrent_category(
 }
 
 #[derive(Debug, Deserialize)]
+pub struct PatchTagsRequest {
+    #[serde(default)]
+    pub add: Vec<String>,
+    #[serde(default)]
+    pub remove: Vec<String>,
+}
+
+/// `PATCH /api/v1/torrents/{hash}/tags` — add or remove persisted torrent tags.
+pub async fn patch_torrent_tags(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(info_hash): Path<String>,
+    Json(req): Json<PatchTagsRequest>,
+) -> impl IntoResponse {
+    if let Some(response) = require_mutation_auth(&state, &headers) {
+        return response;
+    }
+    if !torrent_exists(&state, &info_hash).await {
+        return not_found(info_hash);
+    }
+
+    let add_tags = normalize_tags(req.add);
+    let remove_tags = normalize_tags(req.remove);
+    if let Some(engine) = &state.engine {
+        return match engine
+            .update_torrent_labels(info_hash.clone(), None, add_tags, remove_tags)
+            .await
+        {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(e) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::to_value(ApiError::bad_request(e)).unwrap()),
+            )
+                .into_response(),
+        };
+    }
+
+    let mut reg = state.registry.write().await;
+    match reg.get_mut(&info_hash) {
+        Some(entry) => {
+            for tag in add_tags {
+                if !entry.tags.contains(&tag) {
+                    entry.tags.push(tag);
+                }
+            }
+            if !remove_tags.is_empty() {
+                entry.tags.retain(|tag| !remove_tags.contains(tag));
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+        None => not_found(info_hash),
+    }
+}
+
+fn normalize_tags(tags: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for tag in tags {
+        let tag = tag.trim().to_owned();
+        if !tag.is_empty() && !normalized.contains(&tag) {
+            normalized.push(tag);
+        }
+    }
+    normalized
+}
+
+#[derive(Debug, Deserialize)]
 pub struct FilePriorityPatchItem {
     pub index: u32,
     pub priority: i64,
@@ -3441,6 +3507,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn patch_tags_without_engine_updates_registry() {
+        let state = AppState::new();
+        let hash = "d".repeat(40);
+        {
+            let mut reg = state.registry.write().await;
+            let mut entry = TorrentEntry::new(hash.clone(), "tags.torrent".into(), "/data".into());
+            entry.tags = vec!["old".to_owned(), "keep".to_owned()];
+            reg.add(entry).unwrap();
+        }
+        let registry = state.registry.clone();
+        let app = build_router(state);
+        let body = serde_json::json!({ "add": ["new", " keep ", ""], "remove": ["old"] });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/v1/torrents/{hash}/tags"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            registry.read().await.get(&hash).unwrap().tags,
+            vec!["keep".to_owned(), "new".to_owned()]
+        );
     }
 
     #[tokio::test]
