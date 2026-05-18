@@ -128,7 +128,7 @@ or compatibility behaviors.
 | `force-recheck-corruption-repair` | Complete from a local webseed, corrupt on-disk bytes, force recheck, and redownload the damaged range. | Corruption detected, repair completes, and final hash matches | Implemented |
 | `resume-after-partial-download` | Start with a valid partial 16 MiB fixture on disk, restart Rust after add, and resume through local webseed availability. | Rust restarts, resumes, completes, and final hash matches | Implemented |
 | `missing-file-recovery` | Complete from a local webseed, delete the payload file, force recheck, and redownload the missing file. | Missing file is detected, recreated, and final hash matches | Implemented |
-| `endgame-multi-peer` | Last-piece contention with multiple seeders. | Completes without duplicate-write corruption or stalls | Planned |
+| `endgame-multi-peer` | TorrentNG downloads a 64 MiB fixture while all four reference clients seed the same tracker-only torrent. | Completes from multiple peer sources without duplicate-write corruption or stalls, and final hash matches | Implemented |
 | `rust-seeds-to-all-reference-clients` | Rust as the only long-running seeder for qBit, Transmission, Deluge, and rTorrent. | All reference clients complete from Rust and final hashes match | Implemented |
 
 Disable protocol rows while debugging only the older deterministic cases:
@@ -177,6 +177,12 @@ Run the Rust-to-all-reference-clients seeding row directly:
 
 ```sh
 INTEROP_PROTOCOL_ONLY=rust-seeds-to-all-reference-clients scripts/interop_matrix.sh --local
+```
+
+Run the multi-peer completion row directly:
+
+```sh
+INTEROP_PROTOCOL_ONLY=endgame-multi-peer scripts/interop_matrix.sh --local
 ```
 
 When `INTEROP_PROTOCOL_ONLY` is set, the runner skips the base local and

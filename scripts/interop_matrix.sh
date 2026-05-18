@@ -1124,6 +1124,35 @@ run_rust_seeds_to_all_reference_clients_case() {
   [[ "$status" == "PASS" ]]
 }
 
+run_endgame_multi_peer_case() {
+  local status="PASS" fixture torrent info_hash seeder
+  local seeders=(qbittorrent transmission deluge rtorrent)
+  append_report "## Protocol Local: endgame-multi-peer"
+  append_report ""
+  log "running protocol local case endgame-multi-peer"
+  fixture="$(case_fixture single-64m endgame-multi-peer)"
+  torrent="$(make_torrent "$fixture" "$fixture" tracker-only)"
+  info_hash="$(torrent_info_hash "$torrent")"
+  for seeder in "${seeders[@]}"; do
+    seed_fixture_for_client "$seeder" "$fixture"
+    add_to_client "$seeder" "$torrent" seed || status="FAIL"
+  done
+  add_to_client torrentngd "$torrent" || status="FAIL"
+  for seeder in "${seeders[@]}"; do
+    bridge_client_peer_to_rust "$seeder" "$info_hash" || true
+  done
+  wait_explicit_peer_complete "$TIMEOUT_LOCAL" "$fixture" "$info_hash" transmission torrentngd || status="FAIL"
+  verify_fixture_hashes torrentngd "$fixture" || status="FAIL"
+  append_report "- Seeders: ${seeders[*]}"
+  append_report "- Leecher: torrentngd"
+  append_report "- Fixture: single-64m"
+  append_report "- Torrent mode: tracker-only with all reference seeders bridged"
+  append_report "- Info hash: $info_hash"
+  append_report "- Status: **$status**"
+  append_report ""
+  [[ "$status" == "PASS" ]]
+}
+
 run_partial_file_selection_case() {
   local status="PASS" fixture torrent info_hash files
   append_report "## Protocol Local: rust-partial-file-selection"
@@ -1233,6 +1262,9 @@ run_protocol_local_matrix() {
   fi
   if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "rust-seeds-to-all-reference-clients" ]]; then
     run_rust_seeds_to_all_reference_clients_case || failures=$((failures + 1))
+  fi
+  if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "endgame-multi-peer" ]]; then
+    run_endgame_multi_peer_case || failures=$((failures + 1))
   fi
   if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "rust-partial-file-selection" ]]; then
     run_partial_file_selection_case || failures=$((failures + 1))
