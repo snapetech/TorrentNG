@@ -64,6 +64,7 @@ pub struct TransmissionSessionSettings {
     pub utp_enabled: bool,
     pub preferred_transport: String,
     pub blocklist_enabled: bool,
+    pub blocklist_size: i64,
     pub blocklist_url: String,
     pub script_torrent_added_enabled: bool,
     pub script_torrent_added_filename: String,
@@ -129,6 +130,7 @@ impl Default for TransmissionSessionSettings {
             utp_enabled: true,
             preferred_transport: "tcp".to_owned(),
             blocklist_enabled: false,
+            blocklist_size: 0,
             blocklist_url: String::new(),
             script_torrent_added_enabled: false,
             script_torrent_added_filename: String::new(),
@@ -269,7 +271,9 @@ async fn transmission_rpc_payload(state: &AppState, body: Value) -> Value {
         "queue-stalled-enable" => queue_stalled_set(&state, true).await,
         "queue-stalled-disable" => queue_stalled_set(&state, false).await,
         "port-test" => Ok(json!({"port-is-open": true})),
-        "blocklist-update" => Ok(json!({"blocklist-size": 0})),
+        "blocklist-update" => Ok(json!({
+            "blocklist-size": state.session.read().await.blocklist_size,
+        })),
         "free-space" => Ok(
             json!({"path": args.get("path").and_then(Value::as_str).unwrap_or(""), "size-bytes": 0}),
         ),
@@ -939,7 +943,7 @@ async fn session_get(state: &AppState, args: &Value) -> Value {
         "script-torrent-done-seeding-enabled": session.script_torrent_done_seeding_enabled,
         "script-torrent-done-seeding-filename": session.script_torrent_done_seeding_filename,
         "blocklist-enabled": session.blocklist_enabled,
-        "blocklist-size": 0,
+        "blocklist-size": session.blocklist_size,
         "blocklist-url": session.blocklist_url,
         "utp-enabled": session.utp_enabled,
         "lpd-enabled": session.lpd_enabled,
@@ -1967,6 +1971,7 @@ async fn session_set(state: &AppState, args: &Value) -> Result<Value, String> {
         &mut session.preferred_transport,
     );
     set_string_value_arg(args, "blocklist-url", &mut session.blocklist_url);
+    set_i64_arg(args, "blocklist-size", &mut session.blocklist_size, 0);
     set_string_value_arg(
         args,
         "script-torrent-added-filename",
@@ -2760,6 +2765,7 @@ mod tests {
                             "utp-enabled":false,
                             "preferred-transport":"utp",
                             "blocklist-enabled":true,
+                            "blocklist-size":42,
                             "blocklist-url":"https://example.invalid/blocklist.gz",
                             "script-torrent-added-enabled":true,
                             "script-torrent-added-filename":"/hooks/add.sh",
@@ -2818,6 +2824,7 @@ mod tests {
         assert_eq!(args["utp-enabled"], false);
         assert_eq!(args["preferred-transport"], "utp");
         assert_eq!(args["blocklist-enabled"], true);
+        assert_eq!(args["blocklist-size"], 42);
         assert_eq!(
             args["blocklist-url"],
             "https://example.invalid/blocklist.gz"
