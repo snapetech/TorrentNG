@@ -50,7 +50,7 @@ pub async fn run(
         feature = "d.multicall.range",
         supported = range_supported,
         result = "ok",
-        "rTorrent capability probe complete"
+        "backend capability probe complete"
     );
     let mut page_offset = 0i64;
     let mut full_cycle_seen = HashSet::new();
@@ -79,7 +79,7 @@ pub async fn run(
                         &db,
                         "info",
                         "rtorrent_sync_recovered",
-                        "rTorrent sync recovered",
+                        "backend sync recovered",
                         serde_json::json!({
                         "component": backend.backend_type().as_str(),
                             "operation": "sync",
@@ -113,14 +113,14 @@ pub async fn run(
                     operation = "sync",
                     result = "error",
                     error = %e,
-                    "rTorrent sync failed"
+                    "backend sync failed"
                 );
                 if !sync_error_active {
                     append_app_event(
                         &db,
                         "warn",
                         "rtorrent_sync_error",
-                        "rTorrent sync failed",
+                        "backend sync failed",
                         serde_json::json!({
                             "component": backend.backend_type().as_str(),
                             "operation": "sync",
@@ -217,7 +217,7 @@ async fn tick_bounded(
             }
         }
         Err(e) => warn!(
-            component = "rtorrent",
+            component = backend.backend_type().as_str(),
             operation = "live_summary_sync",
             result = "error",
             error = %e,
@@ -363,7 +363,7 @@ mod tests {
             &db,
             "warn",
             "rtorrent_sync_error",
-            "rTorrent sync failed",
+            "backend sync failed",
             serde_json::json!({
                 "component": "rtorrent",
                 "operation": "sync",
@@ -377,7 +377,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].level, "warn");
         assert_eq!(events[0].kind, "rtorrent_sync_error");
-        assert_eq!(events[0].message, "rTorrent sync failed");
+        assert_eq!(events[0].message, "backend sync failed");
         let payload: serde_json::Value = serde_json::from_str(&events[0].payload).unwrap();
         assert_eq!(payload["component"], "rtorrent");
         assert_eq!(payload["operation"], "sync");

@@ -3,9 +3,9 @@
 TorrentNG has two runtime configuration surfaces:
 
 - `torrentngd`, the native engine daemon and primary runtime.
-- `torrentng`, the Track 1 rTorrent sidecar used for migration and compatibility deployments.
+- `torrentng`, the sidecar WebUI/API control plane used with rTorrent, qBittorrent, Transmission, Deluge, or a separate TorrentNG native daemon.
 
-The two config files are intentionally separate. Native config controls durable engine state, peer networking, tracker behavior, storage, DHT, and native API auth. Sidecar config controls the rTorrent SCGI bridge, sidecar cache, WebUI serving, and qBittorrent-compatible facade identity.
+The two config files are intentionally separate. Native config controls durable engine state, peer networking, tracker behavior, storage, DHT, and native API auth. Sidecar config controls the selected backend adapter, sidecar cache, WebUI serving, and qBittorrent-compatible facade identity.
 
 ## Native daemon
 
@@ -261,7 +261,7 @@ timeout_secs = 10
 
 ### Sidecar `[transmission]`
 
-The Transmission backend talks to an external Transmission RPC endpoint. Categories are mapped to Transmission labels where available; tags and runtime user-agent changes are unsupported.
+The Transmission backend talks to an external Transmission RPC endpoint. Categories are mapped to Transmission labels where available. File priority, tracker add/edit/remove, pause/resume, remove, add, recheck, location moves, file rename, and share limits are mapped to Transmission RPC where supported; tags, torrent rename, sequential toggles, and runtime user-agent changes are unsupported.
 
 | Key | Default | Env override | Description |
 |---|---|---|---|
@@ -281,7 +281,7 @@ url = "http://127.0.0.1:9091/transmission/rpc"
 
 ### Sidecar `[deluge]`
 
-The Deluge backend talks to the Deluge Web JSON-RPC endpoint. File priority, tracker replacement, pause/resume, remove, add, and recheck are mapped to Deluge core methods; categories/tags and runtime user-agent changes are unsupported.
+The Deluge backend talks to the Deluge Web JSON-RPC endpoint. File priority, tracker replacement, pause/resume, remove, add, recheck, storage moves, file rename, ratio share limits, and seeding-time share limits are mapped to Deluge core methods where supported; categories, tags, torrent rename, sequential toggles, and runtime user-agent changes are unsupported.
 
 | Key | Default | Env override | Description |
 |---|---|---|---|
@@ -301,7 +301,7 @@ password = "deluge"
 
 ### Sidecar `[torrentng]`
 
-The TorrentNG backend talks to a native TorrentNG daemon over its native HTTP API. This is primarily for deployments that want the sidecar WebUI/API compatibility layer in front of a separate native daemon. The adapter forwards torrent add/remove, pause/resume, recheck/reannounce, category changes, file-priority changes, and tracker add/edit/remove operations to the native daemon; sidecar-only catalog metadata such as saved views and RSS rules remains in the sidecar cache.
+The TorrentNG backend talks to a native TorrentNG daemon over its native HTTP API. This is primarily for deployments that want the sidecar WebUI/API compatibility layer in front of a separate native daemon. The adapter forwards torrent add/remove, pause/resume, recheck/reannounce, category/tag changes, location/name updates, file-priority and file-rename changes, and tracker add/edit/remove operations to the native daemon; sidecar-only catalog metadata such as saved views and RSS rules remains in the sidecar cache.
 
 | Key | Default | Env override | Description |
 |---|---|---|---|
