@@ -214,13 +214,14 @@ The full Docker interop matrix still has release evidence to run:
 - local Docker client-to-client rows across qBittorrent, Transmission, Deluge,
   rTorrent, and TorrentNG;
 - public legal torrent matrix;
-- planned protocol rows: DHT-only magnet, private torrent DHT/PEX policy, and
-  endgame multi-peer; `rust-seeds-to-all-reference-clients`,
+- planned protocol rows: DHT-only magnet and endgame multi-peer;
+  `private-torrent-no-dht-pex`, `rust-seeds-to-all-reference-clients`,
   `resume-after-partial-download`,
   `force-recheck-corruption-repair`, and `missing-file-recovery` are now
-  implemented Docker protocol rows covering TorrentNG as sole seeder to all
-  reference clients, preseeded partial restart/resume, corrupt payload repair,
-  and deleted payload recreation with final hash verification;
+  implemented Docker protocol rows covering private torrent DHT/PEX policy,
+  TorrentNG as sole seeder to all reference clients, preseeded partial
+  restart/resume, corrupt payload repair, and deleted payload recreation with
+  final hash verification;
 - expansion backlog for DHT/PEX/LSD, multi-tracker tiers, file layout edge
   cases, network adversity, stress, and seeding behavior.
 

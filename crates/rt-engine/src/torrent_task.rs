@@ -347,6 +347,7 @@ struct UploadContext {
     resources: ResourceGovernor,
     have_pieces: Vec<bool>,
     metadata: Option<Arc<Vec<u8>>>,
+    is_private: bool,
 }
 
 struct LeasedUploadBlock {
@@ -1062,6 +1063,7 @@ impl TorrentTask {
             resources: self.resources.clone(),
             have_pieces: self.picker.have_pieces(),
             metadata: torrent_info_bytes(&self.meta.raw).ok().map(Arc::new),
+            is_private: self.meta.private,
         }
     }
 
@@ -2892,6 +2894,7 @@ async fn run_outgoing_peer(
     send_extension_handshake(
         &mut framed,
         upload.metadata.as_ref(),
+        upload.is_private,
         remote_supports_extension,
     )
     .await?;
@@ -2926,6 +2929,7 @@ async fn run_incoming_peer(
     send_extension_handshake(
         &mut framed,
         upload.metadata.as_ref(),
+        upload.is_private,
         remote_supports_extension,
     )
     .await?;
@@ -3228,15 +3232,11 @@ async fn run_peer_loop(
 async fn send_extension_handshake(
     framed: &mut Framed<TcpStream, PeerCodec>,
     metadata: Option<&Arc<Vec<u8>>>,
+    is_private: bool,
     remote_supports_extension: bool,
 ) -> anyhow::Result<()> {
     if remote_supports_extension {
-        let metadata_size = metadata.and_then(|bytes| u32::try_from(bytes.len()).ok());
-        let mut handshake = ExtensionHandshake::new(metadata_size);
-        if metadata_size.is_some() {
-            handshake = handshake.with_ut_metadata(LOCAL_UT_METADATA_ID);
-        }
-        handshake = handshake.with_ut_pex(LOCAL_UT_PEX_ID);
+        let handshake = extension_handshake_for_torrent(metadata, is_private);
         framed
             .send(Message::Extended {
                 ext_id: EXT_HANDSHAKE_ID,
@@ -3245,6 +3245,21 @@ async fn send_extension_handshake(
             .await?;
     }
     Ok(())
+}
+
+fn extension_handshake_for_torrent(
+    metadata: Option<&Arc<Vec<u8>>>,
+    is_private: bool,
+) -> ExtensionHandshake {
+    let metadata_size = metadata.and_then(|bytes| u32::try_from(bytes.len()).ok());
+    let mut handshake = ExtensionHandshake::new(metadata_size);
+    if metadata_size.is_some() {
+        handshake = handshake.with_ut_metadata(LOCAL_UT_METADATA_ID);
+    }
+    if !is_private {
+        handshake = handshake.with_ut_pex(LOCAL_UT_PEX_ID);
+    }
+    handshake
 }
 
 fn metadata_response(piece: u32, metadata: &[u8]) -> UtMetadataMessage {
@@ -3516,6 +3531,19 @@ mod tests {
                 "10.0.0.2:5000".parse::<SocketAddr>().unwrap(),
             ]
         );
+    }
+
+    #[test]
+    fn private_torrent_extension_handshake_does_not_advertise_pex() {
+        let metadata = Arc::new(vec![1, 2, 3, 4]);
+
+        let public = extension_handshake_for_torrent(Some(&metadata), false);
+        let private = extension_handshake_for_torrent(Some(&metadata), true);
+
+        assert_eq!(public.ut_metadata_id(), Some(LOCAL_UT_METADATA_ID));
+        assert_eq!(public.ut_pex_id(), Some(LOCAL_UT_PEX_ID));
+        assert_eq!(private.ut_metadata_id(), Some(LOCAL_UT_METADATA_ID));
+        assert_eq!(private.ut_pex_id(), None);
     }
 
     #[test]
@@ -3973,6 +4001,7 @@ mod tests {
             resources: ResourceGovernor::new(rt_metrics::ResourceGovernorConfig::default()),
             have_pieces: vec![true],
             metadata: None,
+            is_private: false,
         };
 
         let block = read_upload_block(&upload, 0, 0, 16 * 1024).await.unwrap();

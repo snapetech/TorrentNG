@@ -594,6 +594,12 @@ rust_observed_peers() {
     jq '.peers | length' 2>/dev/null || echo 0
 }
 
+rust_metric_value() {
+  local metric="$1"
+  curl --max-time "$CURL_MAX_TIME" -fsS "$(client_url torrentngd)/metrics" |
+    awk -v metric="$metric" '$1 == metric { value=$2 } END { print value + 0 }'
+}
+
 torrent_info_hash() {
   aria2c -S "$1" 2>/dev/null | awk -F': ' '/^Info Hash: / {print tolower($2); exit}'
 }
@@ -962,6 +968,36 @@ run_multi_tracker_fallback_case() {
   [[ "$status" == "PASS" ]]
 }
 
+run_private_torrent_no_dht_pex_case() {
+  local status="PASS" fixture torrent info_hash dht_before dht_after
+  append_report "## Protocol Local: private-torrent-no-dht-pex"
+  append_report ""
+  log "running protocol local case private-torrent-no-dht-pex"
+  fixture="$(case_fixture single-16m private-torrent-no-dht-pex)"
+  torrent="$(make_torrent "$fixture" "$fixture" private-explicit)"
+  info_hash="$(torrent_info_hash "$torrent")"
+  dht_before="$(rust_metric_value torrentng_dht_tracked_torrents)"
+  seed_fixture_for_client transmission "$fixture"
+  add_to_client transmission "$torrent" seed || status="FAIL"
+  add_to_client torrentngd "$torrent" || status="FAIL"
+  bridge_client_peer_to_rust transmission "$info_hash" || status="FAIL"
+  wait_explicit_peer_complete "$TIMEOUT_LOCAL" "$fixture" "$info_hash" transmission transmission torrentngd || status="FAIL"
+  verify_fixture_hashes torrentngd "$fixture" || status="FAIL"
+  dht_after="$(rust_metric_value torrentng_dht_tracked_torrents)"
+  [[ "${dht_after:-0}" == "${dht_before:-0}" ]] || status="FAIL"
+  append_report "- Seeder: transmission"
+  append_report "- Leecher: torrentngd"
+  append_report "- Fixture: single-16m"
+  append_report "- Torrent mode: private explicit peer, no tracker, no webseed"
+  append_report "- DHT tracked torrents before add: ${dht_before:-unknown}"
+  append_report "- DHT tracked torrents after private add: ${dht_after:-unknown}"
+  append_report "- PEX policy: private torrents do not advertise ut_pex"
+  append_report "- Info hash: $info_hash"
+  append_report "- Status: **$status**"
+  append_report ""
+  [[ "$status" == "PASS" ]]
+}
+
 rust_torrent_progress() {
   local info_hash="$1"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
@@ -1182,6 +1218,9 @@ run_protocol_local_matrix() {
   fi
   if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "rust-multi-tracker-fallback" ]]; then
     run_multi_tracker_fallback_case || failures=$((failures + 1))
+  fi
+  if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "private-torrent-no-dht-pex" ]]; then
+    run_private_torrent_no_dht_pex_case || failures=$((failures + 1))
   fi
   if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "resume-after-partial-download" ]]; then
     run_resume_after_partial_download_case || failures=$((failures + 1))

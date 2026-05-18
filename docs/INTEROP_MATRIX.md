@@ -123,7 +123,7 @@ or compatibility behaviors.
 | `rust-qbit-mutation-facade` | qBittorrent-compatible `filePrio`, `recheck`, tracker add/edit/remove, `trackers`, and `files` endpoints. | Endpoints succeed and reflected state is visible | Implemented |
 | `magnet-dht-only` | Magnet metadata and peer discovery without trackers. | Complete and hash match | Planned |
 | `rust-multi-tracker-fallback` | Dead tracker in the first tier, working tracker fallback. | Rust completes through fallback tracker | Implemented |
-| `private-torrent-no-dht-pex` | Private torrent policy enforcement. | DHT/PEX disabled and explicit peer transfer still works | Planned |
+| `private-torrent-no-dht-pex` | Private torrent policy enforcement with no tracker and an explicit allowed peer. | DHT registration does not increase, PEX is not advertised, explicit peer transfer completes, and final hash matches | Implemented |
 | `rust-partial-file-selection` | Multi-file priority and wanted/unwanted file behavior during transfer. | Wanted files complete; skipped file remains absent or empty | Implemented |
 | `force-recheck-corruption-repair` | Complete from a local webseed, corrupt on-disk bytes, force recheck, and redownload the damaged range. | Corruption detected, repair completes, and final hash matches | Implemented |
 | `resume-after-partial-download` | Start with a valid partial 16 MiB fixture on disk, restart Rust after add, and resume through local webseed availability. | Rust restarts, resumes, completes, and final hash matches | Implemented |
@@ -147,6 +147,12 @@ Run the magnet metadata row directly:
 
 ```sh
 INTEROP_PROTOCOL_ONLY=rust-magnet-with-tracker scripts/interop_matrix.sh --local
+```
+
+Run the private torrent policy row directly:
+
+```sh
+INTEROP_PROTOCOL_ONLY=private-torrent-no-dht-pex scripts/interop_matrix.sh --local
 ```
 
 Run the partial-resume row directly:
