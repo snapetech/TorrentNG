@@ -1,4 +1,9 @@
 use axum::{
+    body::Body,
+    extract::State,
+    http::{header, HeaderMap, Request, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{delete, get, post, put},
     Router,
 };
@@ -158,5 +163,56 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/storage", get(storage))
         .route("/api/v1/storage/plan", post(storage_preview_plan))
         .route("/api/v1/storage/execute", post(storage_execute_plan))
+        .route_layer(middleware::from_fn_with_state(state.clone(), native_auth_guard))
         .with_state(state)
+}
+
+async fn native_auth_guard(
+    State(state): State<AppState>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    let path = req.uri().path();
+    if native_public_path(path)
+        || state.api_tokens.is_empty()
+        || native_presented_token(req.headers()).is_some_and(|token| native_token_allowed(&state, &token))
+    {
+        return next.run(req).await;
+    }
+
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::CONTENT_TYPE, "application/json")],
+        r#"{"code":"UNAUTHORIZED","message":"missing or invalid API token"}"#,
+    )
+        .into_response()
+}
+
+fn native_public_path(path: &str) -> bool {
+    matches!(path, "/health" | "/api/v1/auth/login" | "/api/v1/auth/logout")
+}
+
+fn native_token_allowed(state: &AppState, token: &str) -> bool {
+    state.api_tokens.iter().any(|allowed| allowed == token)
+}
+
+fn native_presented_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::to_owned)
+        .or_else(|| {
+            headers
+                .get(header::COOKIE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(native_session_cookie)
+        })
+}
+
+fn native_session_cookie(cookie: &str) -> Option<String> {
+    cookie.split(';').find_map(|part| {
+        let part = part.trim();
+        part.strip_prefix("tng_session=").map(str::to_owned)
+    })
 }
