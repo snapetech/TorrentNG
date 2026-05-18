@@ -10,6 +10,12 @@ pub enum MetainfoError {
     MissingField(&'static str),
     #[error("invalid field type for: {0}")]
     InvalidFieldType(&'static str),
+    #[error("invalid integer value for {field}: {value}")]
+    InvalidIntegerValue { field: &'static str, value: i64 },
+    #[error("integer overflow while parsing field: {0}")]
+    IntegerOverflow(&'static str),
+    #[error("metainfo limit exceeded for {field}: limit {limit}")]
+    LimitExceeded { field: &'static str, limit: usize },
     #[error("invalid pieces length: {0} (must be multiple of 20)")]
     InvalidPiecesLength(usize),
     #[error("invalid piece length: {0}")]
