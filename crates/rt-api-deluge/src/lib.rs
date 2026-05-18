@@ -143,8 +143,8 @@ async fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Va
         "core.get_session_status" => session_status(state).await,
         "core.get_stats" => session_status(state).await,
         "core.get_num_connections" => Ok(json!(0)),
-        "core.get_download_rate" => Ok(json!(0.0)),
-        "core.get_upload_rate" => Ok(json!(0.0)),
+        "core.get_download_rate" => Ok(json!(deluge_session_download_rate(state).await)),
+        "core.get_upload_rate" => Ok(json!(deluge_session_upload_rate(state).await)),
         "core.get_filter_tree" => filter_tree(state).await,
         "core.get_session_state" => session_state(state).await,
         "core.get_torrents_status" => torrents_status(state, params).await,
@@ -526,16 +526,56 @@ async fn session_status(state: &AppState) -> Result<Value, String> {
     let total_payload_upload = reg
         .iter()
         .fold(0_u64, |acc, entry| acc.saturating_add(entry.stats.uploaded));
+    let download_rate = deluge_session_download_rate(state).await;
+    let upload_rate = deluge_session_upload_rate(state).await;
     Ok(json!({
-        "payload_download_rate": 0.0,
-        "payload_upload_rate": 0.0,
-        "download_rate": 0.0,
-        "upload_rate": 0.0,
+        "payload_download_rate": download_rate,
+        "payload_upload_rate": upload_rate,
+        "download_rate": download_rate,
+        "upload_rate": upload_rate,
         "num_connections": 0,
         "total_payload_download": total_payload_download,
         "total_payload_upload": total_payload_upload,
         "num_torrents": torrent_count,
     }))
+}
+
+async fn deluge_session_download_rate(state: &AppState) -> i64 {
+    let Some(engine) = &state.engine else {
+        return 0;
+    };
+    let hashes = {
+        let reg = state.registry.read().await;
+        reg.iter()
+            .map(|entry| entry.info_hash.clone())
+            .collect::<Vec<_>>()
+    };
+    let mut total = 0_i64;
+    for hash in hashes {
+        if let Ok(peers) = engine.torrent_peers(hash).await {
+            total = total.saturating_add(deluge_peer_download_rate(Some(&peers)));
+        }
+    }
+    total
+}
+
+async fn deluge_session_upload_rate(state: &AppState) -> i64 {
+    let Some(engine) = &state.engine else {
+        return 0;
+    };
+    let hashes = {
+        let reg = state.registry.read().await;
+        reg.iter()
+            .map(|entry| entry.info_hash.clone())
+            .collect::<Vec<_>>()
+    };
+    let mut total = 0_i64;
+    for hash in hashes {
+        if let Ok(peers) = engine.torrent_peers(hash).await {
+            total = total.saturating_add(deluge_peer_upload_rate(Some(&peers)));
+        }
+    }
+    total
 }
 
 async fn cache_status(state: &AppState) -> Result<Value, String> {

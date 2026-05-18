@@ -188,13 +188,13 @@ Local implementation: `crates/rt-api-deluge`.
 | Web host management | `web.add_host`, `edit_host`, `remove_host`, `get_hosts`, `get_host_status`, `connect`, `disconnect`, `connected`, `start_daemon`, `stop_daemon` | Compat/native shape implemented | Host management shape row |
 | Web torrent helpers | `web.add_torrents`, `download_torrent_from_url`, `get_torrent_files`, `update_ui`, `get_events` | Compat/native shape implemented; `web.add_torrents` accepts magnet, temp-file path, embedded metainfo/base64, and URL placeholder payloads; `update_ui` honors requested fields and emits filter/stat shape; URL fetch intentionally no-op to avoid server-side fetch | Web add and update row |
 | Web config/plugins | `web.get_config`, `update_config`, `save_config`, plugins | Compat implemented | Web config row |
-| Core session | `core.get_session_status`, stats/rates/connections, filter tree, cache status, config values | Native/Compat | Session/status/config rows |
+| Core session | `core.get_session_status`, stats/rates/connections, filter tree, cache status, config values | Native/Compat; rates aggregate native peer snapshots when available | Session/status/config rows |
 | Core torrent reads | `get_torrents_status`, `get_torrent_status`, `get_torrent_file_status`, `get_session_state` | Native/Compat; requested-key filtering, label/state/hash filters, and option projection implemented | Requested-key/filter row |
 | Core lifecycle | add file/magnet, pause/resume, force_recheck, remove | Native | Lifecycle rows |
 | Core mutation | set options, priorities, trackers, queue, move, rename, connect_peer | Native/Compat; torrent options roundtrip in facade state and apply to engine when available | Mutation rows |
 | Label plugin | label list/add/remove/options/set_torrent | Native/Compat | Label plugin row |
 | Notifications plugin | handled events, subscriptions, config/add subscription | Compat | Notification shape row |
-| Other plugins | AutoAdd, Blocklist, Execute, Extractor, Scheduler | Migration artifact preservation implemented; facade APIs remain gap | Artifact preservation row plus optional plugin API rows |
+| Other plugins | AutoAdd, Blocklist, Execute, Extractor, Scheduler | Migration artifact preservation implemented; facade APIs expose structured safe no-op compatibility surfaces | Artifact preservation and plugin API rows |
 
 Deluge torrent status field matrix:
 
