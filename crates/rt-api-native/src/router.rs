@@ -1,17 +1,22 @@
 use axum::{
-    routing::{get, patch, post, put},
+    routing::{delete, get, patch, post, put},
     Router,
 };
 
 use crate::{
     handlers::{
-        add_torrent, add_torrent_peers, delete_torrent, diagnose_torrent, get_torrent, health,
-        list_session_events, list_torrent_files, list_torrent_trackers, list_torrents, metrics,
-        patch_torrent_files, patch_torrent_trackers, pause_torrent, reannounce_torrent,
-        recheck_torrent, resume_torrent, session_features, set_torrent_category, storage,
-        storage_execute_plan, storage_preview_plan, stream_events, torrent_limits, transfer_limits,
-        update_session_features, update_torrent, update_torrent_limits, update_torrent_queue,
-        update_transfer_limits,
+        add_torrent, add_torrent_peers, apply_rss_rules, bulk_action, categories, create_tag,
+        cross_seed, delete_category, delete_saved_json, delete_tag, delete_torrent,
+        diagnose_torrent, engine_commands, engine_diagnostics, get_torrent, get_user_agent, health,
+        list_json_map, list_session_events, list_torrent_files, list_torrent_trackers,
+        list_torrents, list_workflow_runs, logs, metrics, patch_torrent_files,
+        patch_torrent_trackers, pause_torrent, reannounce_torrent, recheck_torrent, restart_engine,
+        resume_torrent, rtorrent_settings, run_json_workflow, save_rtorrent_settings,
+        session_features, set_torrent_category, set_user_agent, sidebar_facets, storage,
+        storage_execute_plan, storage_preview_plan, stream_events, tags, test_rss_rules,
+        torrent_limits, tracker_health, transfer_limits, update_session_features, update_torrent,
+        update_torrent_limits, update_torrent_queue, update_transfer_limits, upsert_category,
+        upsert_json_map,
     },
     state::AppState,
 };
@@ -67,6 +72,71 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/v1/torrents/:hash/tags",
             patch(crate::handlers::patch_torrent_tags),
+        )
+        .route("/api/v1/categories", get(categories).post(upsert_category))
+        .route("/api/v1/categories/:name", delete(delete_category))
+        .route("/api/v1/tags", get(tags).post(create_tag))
+        .route("/api/v1/tags/:name", delete(delete_tag))
+        .route("/api/v1/bulk/:action", post(bulk_action))
+        .route("/api/v1/cross-seed", post(cross_seed))
+        .route("/api/v1/tracker-health", get(tracker_health))
+        .route("/api/v1/sidebar-facets", get(sidebar_facets))
+        .route("/api/v1/logs", get(logs))
+        .route(
+            "/api/v1/saved-views",
+            get(list_json_map::<crate::handlers::SavedViewsStore>)
+                .post(upsert_json_map::<crate::handlers::SavedViewsStore>),
+        )
+        .route(
+            "/api/v1/saved-views/:id",
+            delete(delete_saved_json::<crate::handlers::SavedViewsStore>),
+        )
+        .route(
+            "/api/v1/ratio-groups",
+            get(list_json_map::<crate::handlers::RatioGroupsStore>)
+                .post(upsert_json_map::<crate::handlers::RatioGroupsStore>),
+        )
+        .route(
+            "/api/v1/ratio-groups/:id",
+            post(run_json_workflow::<crate::handlers::RatioGroupsStore>)
+                .delete(delete_saved_json::<crate::handlers::RatioGroupsStore>),
+        )
+        .route(
+            "/api/v1/workflows",
+            get(list_json_map::<crate::handlers::WorkflowsStore>)
+                .post(upsert_json_map::<crate::handlers::WorkflowsStore>),
+        )
+        .route(
+            "/api/v1/workflows/:id",
+            post(run_json_workflow::<crate::handlers::WorkflowsStore>)
+                .delete(delete_saved_json::<crate::handlers::WorkflowsStore>),
+        )
+        .route("/api/v1/workflow-runs", get(list_workflow_runs))
+        .route(
+            "/api/v1/rss-rules",
+            get(list_json_map::<crate::handlers::RssRulesStore>)
+                .post(upsert_json_map::<crate::handlers::RssRulesStore>),
+        )
+        .route("/api/v1/rss-rules/test", post(test_rss_rules))
+        .route("/api/v1/rss-rules/apply", post(apply_rss_rules))
+        .route(
+            "/api/v1/rss-rules/:id",
+            delete(delete_saved_json::<crate::handlers::RssRulesStore>),
+        )
+        .route("/api/v1/engine", get(engine_diagnostics))
+        .route("/api/v1/engine/commands", get(engine_commands))
+        .route(
+            "/api/v1/engine/rtorrent-settings",
+            get(rtorrent_settings).put(save_rtorrent_settings),
+        )
+        .route("/api/v1/engine/restart", post(restart_engine))
+        .route(
+            "/api/v1/engine/user-agent",
+            get(get_user_agent).put(set_user_agent),
+        )
+        .route(
+            "/api/v1/settings/user-agent",
+            get(get_user_agent).put(set_user_agent),
         )
         .route(
             "/api/v1/torrents/:hash/files",

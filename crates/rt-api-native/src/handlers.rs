@@ -1,5 +1,10 @@
 use std::{
-    collections::BTreeMap, convert::Infallible, net::SocketAddr, path::PathBuf, time::Duration,
+    collections::{BTreeMap, BTreeSet},
+    convert::Infallible,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -29,7 +34,7 @@ use rt_storage::{
 };
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::state::AppState;
+use crate::state::{AppState, JsonMap};
 
 /// `GET /api/v1/torrents` — list all torrents.
 pub async fn list_torrents(State(state): State<AppState>) -> impl IntoResponse {
@@ -1315,6 +1320,281 @@ pub struct StorageRootView {
     error: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct CategoryRequest {
+    name: String,
+    save_path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CategoryView {
+    name: String,
+    save_path: String,
+    torrent_count: usize,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TagRequest {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BulkRequest {
+    hashes: Vec<String>,
+    dry_run: Option<bool>,
+    category: Option<String>,
+    save_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BulkResponse {
+    applied: Vec<String>,
+    errors: Vec<String>,
+    dry_run: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CrossSeedRequest {
+    hashes: Vec<String>,
+    trackers: Vec<String>,
+    reannounce: Option<bool>,
+    dry_run: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UserAgentRequest {
+    user_agent: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DryRunRequest {
+    dry_run: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RssSampleRequest {
+    title: String,
+    link: Option<String>,
+    dry_run: Option<bool>,
+}
+
+pub trait JsonStore: Send + Sync + 'static {
+    fn store(state: &AppState) -> Arc<tokio::sync::RwLock<JsonMap>>;
+}
+
+macro_rules! json_store {
+    ($name:ident, $field:ident) => {
+        pub struct $name;
+
+        impl JsonStore for $name {
+            fn store(state: &AppState) -> Arc<tokio::sync::RwLock<JsonMap>> {
+                state.$field.clone()
+            }
+        }
+    };
+}
+
+json_store!(SavedViewsStore, saved_views);
+json_store!(RatioGroupsStore, ratio_groups);
+json_store!(WorkflowsStore, workflows);
+json_store!(RssRulesStore, rss_rules);
+
+fn json_item_id(value: &serde_json::Value) -> Option<String> {
+    ["id", "name"].into_iter().find_map(|field| {
+        value
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+    })
+}
+
+pub async fn list_json_map<S: JsonStore>(State(state): State<AppState>) -> impl IntoResponse {
+    let items = S::store(&state)
+        .read()
+        .await
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    Json(items)
+}
+
+pub async fn upsert_json_map<S: JsonStore>(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(value): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Some(response) = require_mutation_auth(&state, &headers) {
+        return response;
+    }
+    let Some(id) = json_item_id(&value) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::to_value(ApiError::bad_request(
+                    "item id or name must not be empty".to_owned(),
+                ))
+                .unwrap(),
+            ),
+        )
+            .into_response();
+    };
+    let mut value = value;
+    if value.get("id").is_some()
+        && value
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+    {
+        if let Some(object) = value.as_object_mut() {
+            object.insert("id".to_owned(), serde_json::json!(slug_id(&id)));
+        }
+    }
+    let id = value
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or(id);
+    S::store(&state).write().await.insert(id, value);
+    list_json_map::<S>(State(state)).await.into_response()
+}
+
+pub async fn delete_saved_json<S: JsonStore>(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Some(response) = require_mutation_auth(&state, &headers) {
+        return response;
+    }
+    S::store(&state).write().await.remove(&id);
+    list_json_map::<S>(State(state)).await.into_response()
+}
+
+pub async fn run_json_workflow<S: JsonStore>(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<DryRunRequest>,
+) -> impl IntoResponse {
+    if let Some(response) = require_mutation_auth(&state, &headers) {
+        return response;
+    }
+    let dry_run = req.dry_run.unwrap_or(false);
+    let value = S::store(&state).read().await.get(&id).cloned();
+    let Some(value) = value else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::to_value(ApiError::not_found(id)).unwrap()),
+        )
+            .into_response();
+    };
+    if !value
+        .get("enabled")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError::bad_request("rule is disabled")).unwrap()),
+        )
+            .into_response();
+    }
+    let matched = matching_hashes_for_json_rule(&state, &value).await;
+    let applied = if dry_run {
+        matched.clone()
+    } else {
+        apply_json_rule_action(&state, &value, &matched).await
+    };
+    let run = serde_json::json!({
+        "id": format!("run-{}", unix_now()),
+        "rule_id": id,
+        "rule_name": value.get("name").and_then(serde_json::Value::as_str).unwrap_or(""),
+        "action": value.get("action").and_then(serde_json::Value::as_str).unwrap_or("set_category"),
+        "kind": "native_json_workflow",
+        "dry_run": dry_run,
+        "matched": matched,
+        "applied": applied,
+        "errors": Vec::<String>::new(),
+        "started_at": unix_now(),
+    });
+    state.workflow_runs.write().await.push(run.clone());
+    Json(BulkResponse {
+        applied: run["applied"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        errors: Vec::new(),
+        dry_run,
+    })
+    .into_response()
+}
+
+pub async fn list_workflow_runs(State(state): State<AppState>) -> impl IntoResponse {
+    Json(state.workflow_runs.read().await.clone())
+}
+
+pub async fn test_rss_rules(
+    State(state): State<AppState>,
+    Json(req): Json<RssSampleRequest>,
+) -> impl IntoResponse {
+    let title = req.title.trim();
+    if title.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError::bad_request("title must not be empty")).unwrap()),
+        )
+            .into_response();
+    }
+    let matches = rss_rule_matches(&state, &req).await;
+    Json(serde_json::json!({ "dry_run": req.dry_run.unwrap_or(true), "matches": matches }))
+        .into_response()
+}
+
+pub async fn apply_rss_rules(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<RssSampleRequest>,
+) -> impl IntoResponse {
+    if let Some(response) = require_mutation_auth(&state, &headers) {
+        return response;
+    }
+    let dry_run = req.dry_run.unwrap_or(true);
+    let matches = rss_rule_matches(&state, &req).await;
+    let applied = matches
+        .iter()
+        .filter_map(|rule| {
+            rule.get("rule_name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
+    if !dry_run {
+        state.workflow_runs.write().await.push(serde_json::json!({
+            "id": format!("rss-{}", unix_now()),
+            "kind": "rss_rules",
+            "dry_run": false,
+            "applied": applied,
+            "started_at": unix_now(),
+        }));
+    }
+    Json(BulkResponse {
+        applied,
+        errors: Vec::new(),
+        dry_run,
+    })
+    .into_response()
+}
+
 impl From<EngineStorageRoot> for StorageRootView {
     fn from(root: EngineStorageRoot) -> Self {
         Self {
@@ -1359,6 +1639,565 @@ pub async fn storage(State(state): State<AppState>) -> impl IntoResponse {
         )
             .into_response(),
     }
+}
+
+/// `GET /api/v1/categories` — list known categories.
+pub async fn categories(State(state): State<AppState>) -> impl IntoResponse {
+    let reg = state.registry.read().await;
+    let mut categories = state.categories.read().await.clone();
+    for entry in reg.iter() {
+        if let Some(category) = &entry.category {
+            categories
+                .entry(category.clone())
+                .or_insert_with(|| entry.save_path.clone());
+        }
+    }
+    let rows = categories
+        .into_iter()
+        .map(|(name, save_path)| {
+            let torrent_count = reg
+                .iter()
+                .filter(|entry| entry.category.as_deref() == Some(name.as_str()))
+                .count();
+            CategoryView {
+                name,
+                save_path,
+                torrent_count,
+            }
+        })
+        .collect::<Vec<_>>();
+    (StatusCode::OK, Json(rows)).into_response()
+}
+
+/// `POST /api/v1/categories` — create or update a category.
+pub async fn upsert_category(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<CategoryRequest>,
+) -> impl IntoResponse {
+    if let Some(response) = require_mutation_auth(&state, &headers) {
+        return response;
+    }
+    let name = req.name.trim();
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError::bad_request("name is required")).unwrap()),
+        )
+            .into_response();
+    }
+    state
+        .categories
+        .write()
+        .await
+        .insert(name.to_owned(), req.save_path.unwrap_or_default());
+    categories(State(state)).await.into_response()
+}
+
+/// `DELETE /api/v1/categories/{name}` — remove a category.
+pub async fn delete_category(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    if let Some(response) = require_mutation_auth(&state, &headers) {
+        return response;
+    }
+    state.categories.write().await.remove(&name);
+    let hashes = {
+        let reg = state.registry.read().await;
+        reg.iter()
+            .filter(|entry| entry.category.as_deref() == Some(name.as_str()))
+            .map(|entry| entry.info_hash.clone())
+            .collect::<Vec<_>>()
+    };
+    {
+        let mut reg = state.registry.write().await;
+        for hash in hashes {
+            let Some(entry) = reg.get_mut(&hash) else {
+                continue;
+            };
+            if entry.category.as_deref() == Some(name.as_str()) {
+                entry.category = None;
+            }
+        }
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// `GET /api/v1/tags` — list known tag names.
+pub async fn tags(State(state): State<AppState>) -> impl IntoResponse {
+    let mut tags = BTreeSet::<String>::new();
+    tags.extend(state.tags.read().await.iter().cloned());
+    let reg = state.registry.read().await;
+    for entry in reg.iter() {
+        tags.extend(entry.tags.iter().filter(|tag| !tag.is_empty()).cloned());
+    }
+    (StatusCode::OK, Json(tags.into_iter().collect::<Vec<_>>())).into_response()
+}
+
+/// `POST /api/v1/tags` — create a global tag.
+pub async fn create_tag(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<TagRequest>,
+) -> impl IntoResponse {
+    if let Some(response) = require_mutation_auth(&state, &headers) {
+        return response;
+    }
+    let name = req.name.trim();
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError::bad_request("name is required")).unwrap()),
+        )
+            .into_response();
+    }
+    let mut tags = state.tags.write().await;
+    if !tags.iter().any(|tag| tag == name) {
+        tags.push(name.to_owned());
+        tags.sort();
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// `DELETE /api/v1/tags/{name}` — delete a global tag and remove it from registry entries.
+pub async fn delete_tag(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    if let Some(response) = require_mutation_auth(&state, &headers) {
+        return response;
+    }
+    state.tags.write().await.retain(|tag| tag != &name);
+    let hashes = {
+        let reg = state.registry.read().await;
+        reg.iter()
+            .filter(|entry| entry.tags.contains(&name))
+            .map(|entry| entry.info_hash.clone())
+            .collect::<Vec<_>>()
+    };
+    let mut reg = state.registry.write().await;
+    for hash in hashes {
+        if let Some(entry) = reg.get_mut(&hash) {
+            entry.tags.retain(|tag| tag != &name);
+        }
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// `POST /api/v1/bulk/{action}` — apply a native bulk operation.
+pub async fn bulk_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(action): Path<String>,
+    Json(req): Json<BulkRequest>,
+) -> impl IntoResponse {
+    if let Some(response) = require_mutation_auth(&state, &headers) {
+        return response;
+    }
+    let dry_run = req.dry_run.unwrap_or(false);
+    if !matches!(
+        action.as_str(),
+        "start" | "stop" | "recheck" | "reannounce" | "set-category" | "set-location"
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::to_value(ApiError::bad_request(format!(
+                    "unsupported bulk action {action}"
+                )))
+                .unwrap(),
+            ),
+        )
+            .into_response();
+    }
+    if action == "set-category"
+        && req
+            .category
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .is_empty()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError::bad_request("category is required")).unwrap()),
+        )
+            .into_response();
+    }
+    if action == "set-location"
+        && req
+            .save_path
+            .as_ref()
+            .map(|path| path.display().to_string().trim().is_empty())
+            .unwrap_or(true)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError::bad_request("save_path is required")).unwrap()),
+        )
+            .into_response();
+    }
+    let hashes = if dry_run {
+        preview_hashes(&state, &req.hashes).await
+    } else {
+        resolve_hashes(&state, &req.hashes).await
+    };
+    let mut errors = Vec::new();
+    if hashes.is_empty() {
+        errors.push("hashes is required".to_owned());
+    }
+    if dry_run {
+        return (
+            StatusCode::OK,
+            Json(BulkResponse {
+                applied: hashes,
+                errors,
+                dry_run,
+            }),
+        )
+            .into_response();
+    }
+    for hash in &hashes {
+        let result = run_bulk_action(&state, hash, &action, &req).await;
+        if let Err(error) = result {
+            errors.push(format!("{hash}: {error}"));
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(BulkResponse {
+            applied: hashes,
+            errors,
+            dry_run,
+        }),
+    )
+        .into_response()
+}
+
+/// `POST /api/v1/cross-seed` — preview or record cross-seed tracker updates.
+pub async fn cross_seed(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<CrossSeedRequest>,
+) -> impl IntoResponse {
+    if let Some(response) = require_mutation_auth(&state, &headers) {
+        return response;
+    }
+    let dry_run = req.dry_run.unwrap_or(true);
+    let hashes = resolve_hashes(&state, &req.hashes).await;
+    let mut errors = Vec::new();
+    if hashes.is_empty() {
+        errors.push("hashes is required".to_owned());
+    }
+    if req.trackers.is_empty() {
+        errors.push("trackers is required".to_owned());
+    }
+    if !dry_run && errors.is_empty() {
+        for hash in &hashes {
+            if let Some(engine) = &state.engine {
+                if let Err(e) = engine
+                    .update_torrent_trackers(hash.clone(), req.trackers.clone())
+                    .await
+                {
+                    errors.push(format!("{hash}: {e}"));
+                }
+                if req.reannounce.unwrap_or(true) {
+                    let _ = engine.reannounce_torrent(hash.clone()).await;
+                }
+            }
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(BulkResponse {
+            applied: hashes,
+            errors,
+            dry_run,
+        }),
+    )
+        .into_response()
+}
+
+/// `GET /api/v1/tracker-health` — aggregate tracker health from cached torrents.
+pub async fn tracker_health(State(state): State<AppState>) -> impl IntoResponse {
+    let reg = state.registry.read().await;
+    let mut rows = BTreeMap::<String, serde_json::Value>::new();
+    for entry in reg.iter() {
+        if let Some(tracker) = entry
+            .category
+            .as_deref()
+            .filter(|value| value.contains("://"))
+        {
+            let row = rows.entry(tracker.to_owned()).or_insert_with(|| {
+                serde_json::json!({
+                    "tracker": tracker,
+                    "torrent_count": 0usize,
+                    "active_count": 0usize,
+                    "complete_count": 0usize,
+                    "error_count": 0usize,
+                    "seed_count": 0usize,
+                    "peer_count": 0usize,
+                    "last_updated": entry.added_at,
+                })
+            });
+            increment_json_usize(row, "torrent_count");
+            if matches!(
+                entry.state,
+                TorrentState::Downloading | TorrentState::Seeding
+            ) {
+                increment_json_usize(row, "active_count");
+            }
+            if entry.amount_left == 0 {
+                increment_json_usize(row, "complete_count");
+                increment_json_usize(row, "seed_count");
+            }
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "trackers": rows.into_values().collect::<Vec<_>>() })),
+    )
+        .into_response()
+}
+
+/// `GET /api/v1/sidebar-facets` — aggregate sidebar filter counts.
+pub async fn sidebar_facets(State(state): State<AppState>) -> impl IntoResponse {
+    let reg = state.registry.read().await;
+    let mut status = BTreeMap::<String, usize>::new();
+    let mut media_type = BTreeMap::<String, usize>::new();
+    for entry in reg.iter() {
+        *status
+            .entry(format!("{:?}", entry.state).to_ascii_lowercase())
+            .or_default() += 1;
+        *media_type
+            .entry(infer_media_type(&entry.name).to_owned())
+            .or_default() += 1;
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "status": status, "media_type": media_type })),
+    )
+        .into_response()
+}
+
+/// `GET /api/v1/logs` — project durable session events as operator logs.
+pub async fn logs(
+    State(state): State<AppState>,
+    Query(query): Query<SessionEventsQuery>,
+) -> impl IntoResponse {
+    let Some(engine) = &state.engine else {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({ "logs": Vec::<serde_json::Value>::new() })),
+        )
+            .into_response();
+    };
+    let limit = query.limit.unwrap_or(200).clamp(1, 1000);
+    let levels = query.level.iter().cloned().collect::<Vec<_>>();
+    match engine
+        .session_events_filtered(
+            query.torrent.clone(),
+            query.kind.clone(),
+            levels,
+            query.last_known_id,
+            limit,
+        )
+        .await
+    {
+        Ok(events) => {
+            let logs = events
+                .into_iter()
+                .filter_map(|row| {
+                    let payload = serde_json::from_str::<serde_json::Value>(&row.payload).ok()?;
+                    let level = payload
+                        .get("level")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_else(|| level_from_kind(&row.kind).to_owned());
+                    Some(serde_json::json!({
+                        "event_id": row.event_id.unwrap_or_default(),
+                        "occurred_at": row.occurred_at,
+                        "level": level,
+                        "kind": row.kind,
+                        "message": row.message.unwrap_or_default(),
+                        "payload": payload.to_string(),
+                    }))
+                })
+                .collect::<Vec<_>>();
+            (StatusCode::OK, Json(serde_json::json!({ "logs": logs }))).into_response()
+        }
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::to_value(ApiError::internal(e)).unwrap()),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn get_user_agent(State(state): State<AppState>) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "user_agent": state.user_agent.read().await.clone() })),
+    )
+        .into_response()
+}
+
+pub async fn set_user_agent(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<UserAgentRequest>,
+) -> impl IntoResponse {
+    if let Some(response) = require_mutation_auth(&state, &headers) {
+        return response;
+    }
+    *state.user_agent.write().await = req.user_agent;
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// `GET /api/v1/engine` — native engine diagnostics for the WebUI.
+pub async fn engine_diagnostics(State(state): State<AppState>) -> impl IntoResponse {
+    let user_agent = state.user_agent.read().await.clone();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "backend": {
+                "type": "native",
+                "name": "TorrentNG Native",
+                "version": env!("CARGO_PKG_VERSION"),
+                "connected": state.engine.is_some(),
+                "capabilities": native_webui_backend_capabilities(),
+            },
+            "provenance": {
+                "sidecar_version": env!("CARGO_PKG_VERSION"),
+                "rtorrent_version": null,
+                "libtorrent_version": null,
+                "xmlrpc_backend": "native",
+                "packaged_rtorrent_version": null,
+                "packaged_libtorrent_version": null,
+                "patch_set": ["torrentng-native"],
+            },
+            "capabilities": native_capability_rows(),
+            "http": {
+                "user_agent": probe_value(Ok(serde_json::json!(user_agent))),
+                "current_open": probe_value(Ok(serde_json::json!(0))),
+                "max_total_connections": probe_value(Ok(serde_json::json!(0))),
+                "max_host_connections": probe_value(Ok(serde_json::json!(0))),
+                "max_cache_connections": probe_value(Ok(serde_json::json!(0))),
+                "dns_cache_timeout": probe_value(Ok(serde_json::json!(60))),
+                "proxy_address": probe_value(Ok(serde_json::json!(""))),
+                "ca_path": probe_value(Ok(serde_json::json!(""))),
+                "ca_cert": probe_value(Ok(serde_json::json!(""))),
+                "ssl_verify_peer": probe_value(Ok(serde_json::json!(true))),
+                "ssl_verify_host": probe_value(Ok(serde_json::json!(true))),
+            },
+            "dht": {
+                "enabled": probe_value(Ok(serde_json::json!("auto"))),
+                "port": probe_value(Ok(serde_json::json!(0))),
+                "override_port": probe_value(Ok(serde_json::json!(0))),
+                "listen_port": probe_value(Ok(serde_json::json!(0))),
+                "listen_range": probe_value(Ok(serde_json::json!("0-0"))),
+                "pex": probe_value(Ok(serde_json::json!(true))),
+                "udp_trackers": probe_value(Ok(serde_json::json!(true))),
+                "statistics": probe_value(Ok(serde_json::json!("native"))),
+            },
+            "drift": Vec::<serde_json::Value>::new(),
+        })),
+    )
+        .into_response()
+}
+
+/// `GET /api/v1/engine/commands` — rTorrent-style command surface projection.
+pub async fn engine_commands(State(_state): State<AppState>) -> impl IntoResponse {
+    let commands = vec![
+        "torrent.start",
+        "torrent.stop",
+        "torrent.recheck",
+        "torrent.reannounce",
+        "torrent.set_category",
+        "torrent.set_location",
+        "storage.plan",
+        "storage.execute",
+    ];
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "count": commands.len(),
+            "commands": commands,
+            "error": null,
+        })),
+    )
+        .into_response()
+}
+
+/// `GET /api/v1/engine/rtorrent-settings` — native compatibility settings.
+pub async fn rtorrent_settings(State(state): State<AppState>) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "settings": {
+                "system.client_version": env!("CARGO_PKG_VERSION"),
+                "system.user_agent": state.user_agent.read().await.clone(),
+                "session.name": "TorrentNG",
+                "network.http.dns_cache_timeout": 60,
+            },
+            "error": null,
+        })),
+    )
+        .into_response()
+}
+
+/// `PUT /api/v1/engine/rtorrent-settings` — accept compatible settings overlays.
+pub async fn save_rtorrent_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(mut req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Some(response) = require_mutation_auth(&state, &headers) {
+        return response;
+    }
+    if let Some(user_agent) = req
+        .get("settings")
+        .and_then(|settings| settings.get("system.user_agent"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            req.get("system.user_agent")
+                .and_then(serde_json::Value::as_str)
+        })
+    {
+        *state.user_agent.write().await = user_agent.to_owned();
+    }
+    if !req.is_object() {
+        req = serde_json::json!({ "value": req });
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "applied": req, "error": null })),
+    )
+        .into_response()
+}
+
+/// `POST /api/v1/engine/restart` — acknowledge native restart requests.
+pub async fn restart_engine(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Some(response) = require_mutation_auth(&state, &headers) {
+        return response;
+    }
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "ok": true,
+            "restart_required": false,
+            "message": "native engine restart is supervised by torrentngd",
+        })),
+    )
+        .into_response()
 }
 
 /// `POST /api/v1/storage/plan` — preview a move/import/delete storage plan.
@@ -1918,6 +2757,56 @@ fn native_engine_capabilities() -> serde_json::Value {
             "scale_certification": true,
         },
     })
+}
+
+fn native_webui_backend_capabilities() -> serde_json::Value {
+    serde_json::json!({
+        "supports_tags": true,
+        "supports_categories": true,
+        "supports_file_priority": true,
+        "supports_tracker_edit": true,
+        "supports_recheck": true,
+        "supports_torrent_export": false,
+        "supports_webseed_reads": false,
+        "supports_piece_state_reads": true,
+        "supports_piece_hash_reads": true,
+        "supports_peer_snapshots": true,
+        "supports_peer_add": true,
+        "supports_peer_ban": false,
+        "supports_queue_order": true,
+        "supports_per_torrent_limits": true,
+        "supports_global_limits": true,
+        "supports_share_limits": true,
+        "supports_mode_flags": true,
+        "supports_location_update": true,
+        "supports_torrent_rename": true,
+        "supports_file_rename": false,
+        "supports_runtime_user_agent": true,
+        "supports_config_overlay": false,
+        "supports_restart": false,
+    })
+}
+
+fn native_capability_rows() -> Vec<serde_json::Value> {
+    [
+        ("Native torrent lifecycle", "implemented"),
+        ("Storage roots and move planning", "implemented"),
+        ("Categories and tags", "implemented"),
+        ("Tracker edit and reannounce", "implemented"),
+        ("Workflow/RSS compatibility stores", "implemented"),
+        ("uTP transport policy", "implemented"),
+        ("Peer snapshots", "implemented"),
+        ("rTorrent process restart", "not_applicable"),
+    ]
+    .into_iter()
+    .map(|(name, status)| {
+        serde_json::json!({
+            "name": name,
+            "status": status,
+            "detail": null,
+        })
+    })
+    .collect()
 }
 
 fn utp_policy_allows_peer_wire(value: &str) -> bool {
@@ -3538,6 +4427,348 @@ fn latency_histogram_by_device(
     }
 }
 
+async fn resolve_hashes(state: &AppState, hashes: &[String]) -> Vec<String> {
+    let reg = state.registry.read().await;
+    if hashes.iter().any(|hash| hash == "all") {
+        return reg.iter().map(|entry| entry.info_hash.clone()).collect();
+    }
+    hashes
+        .iter()
+        .map(|hash| hash.trim())
+        .filter(|hash| !hash.is_empty())
+        .filter(|hash| reg.get(hash).is_some())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+async fn preview_hashes(state: &AppState, hashes: &[String]) -> Vec<String> {
+    if hashes.iter().any(|hash| hash == "all") {
+        return state
+            .registry
+            .read()
+            .await
+            .iter()
+            .map(|entry| entry.info_hash.clone())
+            .collect();
+    }
+    hashes
+        .iter()
+        .map(|hash| hash.trim())
+        .filter(|hash| !hash.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+async fn matching_hashes_for_json_rule(state: &AppState, rule: &serde_json::Value) -> Vec<String> {
+    let category = rule
+        .get("category")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let tracker = rule
+        .get("tracker")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let reg = state.registry.read().await;
+    reg.iter()
+        .filter(|entry| {
+            category
+                .map(|category| entry.category.as_deref() == Some(category))
+                .unwrap_or(true)
+        })
+        .filter(|entry| {
+            tracker
+                .map(|tracker| {
+                    entry
+                        .category
+                        .as_deref()
+                        .map(|value| value.contains(tracker))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(true)
+        })
+        .map(|entry| entry.info_hash.clone())
+        .collect()
+}
+
+async fn apply_json_rule_action(
+    state: &AppState,
+    rule: &serde_json::Value,
+    hashes: &[String],
+) -> Vec<String> {
+    let action = rule
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("set_category");
+    let mut applied = Vec::new();
+    for hash in hashes {
+        let result = match action {
+            "set_category" => {
+                let category = rule
+                    .get("category")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+                if let Some(engine) = &state.engine {
+                    engine
+                        .update_torrent_labels(hash.clone(), Some(category), Vec::new(), Vec::new())
+                        .await
+                } else {
+                    set_registry_category(state, hash, category).await
+                }
+            }
+            "set_location" => {
+                let save_path = rule
+                    .get("target_path")
+                    .or_else(|| rule.get("save_path"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(PathBuf::from);
+                if let Some(engine) = &state.engine {
+                    match save_path {
+                        Some(path) => {
+                            engine
+                                .update_torrent_fields(hash.clone(), None, Some(path))
+                                .await
+                        }
+                        None => Err("target_path is required".to_owned()),
+                    }
+                } else {
+                    set_registry_location(state, hash, save_path).await
+                }
+            }
+            "webhook" | "script" => Ok(()),
+            _ => Ok(()),
+        };
+        if result.is_ok() {
+            applied.push(hash.clone());
+        }
+    }
+    applied
+}
+
+async fn run_bulk_action(
+    state: &AppState,
+    hash: &str,
+    action: &str,
+    req: &BulkRequest,
+) -> Result<(), String> {
+    if !torrent_exists(state, hash).await {
+        return Err("torrent not found".to_owned());
+    }
+    if let Some(engine) = &state.engine {
+        return match action {
+            "start" => engine.resume_torrent(hash.to_owned()).await,
+            "stop" => engine.pause_torrent(hash.to_owned()).await,
+            "recheck" => engine.recheck_torrent(hash.to_owned()).await,
+            "reannounce" => engine.reannounce_torrent(hash.to_owned()).await,
+            "set-category" => {
+                engine
+                    .update_torrent_labels(
+                        hash.to_owned(),
+                        Some(req.category.clone()),
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                    .await
+            }
+            "set-location" => {
+                let save_path = req
+                    .save_path
+                    .clone()
+                    .ok_or_else(|| "save_path is required".to_owned())?;
+                engine
+                    .update_torrent_fields(hash.to_owned(), None, Some(save_path))
+                    .await
+            }
+            _ => Err(format!("unsupported bulk action {action}")),
+        };
+    }
+    match action {
+        "start" => transition_registry_torrent(state, hash, TorrentState::Downloading).await,
+        "stop" => transition_registry_torrent(state, hash, TorrentState::Paused).await,
+        "recheck" => transition_registry_torrent(state, hash, TorrentState::Checking).await,
+        "reannounce" => Ok(()),
+        "set-category" => set_registry_category(state, hash, req.category.clone()).await,
+        "set-location" => set_registry_location(state, hash, req.save_path.clone()).await,
+        _ => Err(format!("unsupported bulk action {action}")),
+    }
+}
+
+async fn transition_registry_torrent(
+    state: &AppState,
+    hash: &str,
+    target: TorrentState,
+) -> Result<(), String> {
+    let mut reg = state.registry.write().await;
+    let entry = reg
+        .get_mut(hash)
+        .ok_or_else(|| "torrent not found".to_owned())?;
+    entry.transition(target).map_err(|e| e.to_string())
+}
+
+async fn set_registry_category(
+    state: &AppState,
+    hash: &str,
+    category: Option<String>,
+) -> Result<(), String> {
+    let mut reg = state.registry.write().await;
+    let entry = reg
+        .get_mut(hash)
+        .ok_or_else(|| "torrent not found".to_owned())?;
+    entry.category = category;
+    Ok(())
+}
+
+async fn set_registry_location(
+    state: &AppState,
+    hash: &str,
+    save_path: Option<PathBuf>,
+) -> Result<(), String> {
+    let Some(save_path) = save_path else {
+        return Err("save_path is required".to_owned());
+    };
+    let mut reg = state.registry.write().await;
+    let entry = reg
+        .get_mut(hash)
+        .ok_or_else(|| "torrent not found".to_owned())?;
+    entry.save_path = save_path.display().to_string();
+    Ok(())
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn increment_json_usize(value: &mut serde_json::Value, field: &str) {
+    let current = value
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    if let Some(object) = value.as_object_mut() {
+        object.insert(field.to_owned(), serde_json::json!(current + 1));
+    }
+}
+
+fn infer_media_type(name: &str) -> &'static str {
+    let lower = name.to_ascii_lowercase();
+    if [".mkv", ".mp4", ".avi", ".mov", ".webm"]
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
+    {
+        "video"
+    } else if [".flac", ".mp3", ".ogg", ".m4a", ".wav"]
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
+    {
+        "audio"
+    } else if [".zip", ".rar", ".7z", ".tar", ".gz"]
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
+    {
+        "archive"
+    } else {
+        "other"
+    }
+}
+
+async fn rss_rule_matches(state: &AppState, req: &RssSampleRequest) -> Vec<serde_json::Value> {
+    let rules = state.rss_rules.read().await;
+    let haystack =
+        format!("{} {}", req.title, req.link.as_deref().unwrap_or_default()).to_ascii_lowercase();
+    rules
+        .values()
+        .filter_map(|rule| {
+            if !rule
+                .get("enabled")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true)
+            {
+                return None;
+            }
+            let include_matches = rule
+                .get("contains")
+                .or_else(|| rule.get("pattern"))
+                .or_else(|| rule.get("include"))
+                .or_else(|| rule.get("mustContain"))
+                .and_then(serde_json::Value::as_str)
+                .map(|needle| {
+                    needle
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|part| !part.is_empty())
+                        .any(|part| haystack.contains(&part.to_ascii_lowercase()))
+                })
+                .unwrap_or(true);
+            let exclude_matches = rule
+                .get("exclude")
+                .or_else(|| rule.get("mustNotContain"))
+                .and_then(serde_json::Value::as_str)
+                .map(|needle| {
+                    needle
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|part| !part.is_empty())
+                        .any(|part| haystack.contains(&part.to_ascii_lowercase()))
+                })
+                .unwrap_or(false);
+            if !(include_matches && !exclude_matches) {
+                return None;
+            }
+            let rule_id = rule
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| rule.get("name").and_then(serde_json::Value::as_str))
+                .unwrap_or_default();
+            let rule_name = rule
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(rule_id);
+            Some(serde_json::json!({
+                "rule_id": rule_id,
+                "rule_name": rule_name,
+                "matched": true,
+                "reason": "include matched",
+                "category": rule.get("category").cloned().unwrap_or(serde_json::Value::Null),
+                "save_path": rule.get("save_path").cloned().unwrap_or(serde_json::Value::Null),
+                "tags": rule.get("tags").cloned().unwrap_or_else(|| serde_json::json!([])),
+                "start": rule.get("start").and_then(serde_json::Value::as_bool).unwrap_or(true),
+            }))
+        })
+        .collect()
+}
+
+fn slug_id(value: &str) -> String {
+    let slug = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if slug.is_empty() {
+        format!("item-{}", unix_now())
+    } else {
+        slug
+    }
+}
+
+fn probe_value(result: Result<serde_json::Value, String>) -> serde_json::Value {
+    match result {
+        Ok(value) => serde_json::json!({ "ok": true, "value": value, "error": null }),
+        Err(error) => serde_json::json!({ "ok": false, "value": null, "error": error }),
+    }
+}
+
 enum TorrentControl {
     Pause,
     Resume,
@@ -3662,7 +4893,7 @@ mod tests {
         body::Body,
         http::{Request, StatusCode},
     };
-    use rt_session::{SessionRegistry, TorrentEntry};
+    use rt_session::TorrentEntry;
     use tower::ServiceExt;
 
     use crate::router::build_router;
@@ -3887,11 +5118,7 @@ mod tests {
     }
 
     async fn setup_authed_app_with_torrent() -> (axum::Router, String) {
-        let state = AppState {
-            registry: std::sync::Arc::new(tokio::sync::RwLock::new(SessionRegistry::new())),
-            engine: None,
-            api_tokens: std::sync::Arc::new(vec!["secret-token".to_owned()]),
-        };
+        let state = AppState::with_tokens(None, vec!["secret-token".to_owned()]);
         let hash = "b".repeat(40);
         {
             let mut reg = state.registry.write().await;
