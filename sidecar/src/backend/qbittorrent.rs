@@ -101,7 +101,6 @@ struct QbitTorrent {
     num_seeds: Option<i64>,
     num_leechs: Option<i64>,
     tracker: Option<String>,
-    tags: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]

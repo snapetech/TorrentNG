@@ -20,6 +20,7 @@ use super::ws::Event;
 use crate::cache::{
     AppEventRow, Category, ListParams, RatioGroup, RssRule, SavedView, WorkflowRule, WorkflowRun,
 };
+use crate::backend::{BackendHealth, BackendStatus};
 use crate::rtorrent::{engine::ProbeValue, XmlValue};
 
 // --- Health ---
@@ -27,14 +28,16 @@ use crate::rtorrent::{engine::ProbeValue, XmlValue};
 #[derive(Serialize)]
 pub struct HealthResponse {
     status: &'static str,
+    backend: BackendHealth,
     rtorrent: &'static str,
     cached_torrents: i64,
 }
 
 pub async fn health(State(s): State<AppState>) -> impl IntoResponse {
     let cached = s.db.count().unwrap_or(0);
-    let rtorrent_connected = s.rt.call("system.client_version", &[]).await.is_ok();
-    let status = if rtorrent_connected {
+    let backend_status = s.backend.health().await;
+    let connected = backend_status == BackendStatus::Connected;
+    let status = if connected {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
@@ -42,11 +45,15 @@ pub async fn health(State(s): State<AppState>) -> impl IntoResponse {
     (
         status,
         Json(HealthResponse {
-            status: if rtorrent_connected { "ok" } else { "degraded" },
-            rtorrent: if rtorrent_connected {
-                "connected"
+            status: if connected { "ok" } else { "degraded" },
+            backend: BackendHealth {
+                backend_type: s.backend.backend_type().as_str(),
+                status: backend_status.as_str(),
+            },
+            rtorrent: if s.backend.backend_type() == crate::backend::BackendType::Rtorrent {
+                backend_status.as_str()
             } else {
-                "unreachable"
+                "not_selected"
             },
             cached_torrents: cached,
         }),
@@ -154,7 +161,18 @@ pub async fn sidebar_facets(State(s): State<AppState>) -> impl IntoResponse {
 }
 
 pub async fn engine_diagnostics(State(s): State<AppState>) -> impl IntoResponse {
-    Json(s.rt.engine_diagnostics().await)
+    let mut diagnostics = serde_json::to_value(s.rt.engine_diagnostics().await)
+        .unwrap_or_else(|_| serde_json::json!({}));
+    if let serde_json::Value::Object(ref mut obj) = diagnostics {
+        obj.insert(
+            "backend".to_owned(),
+            serde_json::json!({
+                "type": s.backend.backend_type().as_str(),
+                "capabilities": s.backend.capabilities(),
+            }),
+        );
+    }
+    Json(diagnostics)
 }
 
 pub async fn engine_commands(State(s): State<AppState>) -> impl IntoResponse {

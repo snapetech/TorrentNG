@@ -1748,7 +1748,7 @@ async fn sync_maindata(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    let server_state = qb_server_state(crate::stats::current_rates(s.rt.clone()).await);
+    let server_state = qb_server_state(crate::stats::current_rates(s.backend.clone()).await);
 
     if full {
         let params = ListParams {
@@ -1868,7 +1868,7 @@ fn sync_metadata(
 }
 
 async fn transfer_info(State(s): State<AppState>) -> Json<serde_json::Value> {
-    let rates = crate::stats::current_rates(s.rt.clone()).await;
+    let rates = crate::stats::current_rates(s.backend.clone()).await;
     let totals = crate::stats::session_totals();
 
     Json(json!({

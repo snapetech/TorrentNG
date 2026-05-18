@@ -46,10 +46,12 @@ async fn spawn_server_with_config_and_events(
     // Stub rTorrent client pointing at a non-existent socket.
     // Tests that call rTorrent fail gracefully — we only exercise DB-backed endpoints here.
     let rt = Arc::new(torrentng::rtorrent::Client::new_unix("/nonexistent", 1));
+    let backend = Arc::new(torrentng::backend::rtorrent::RtorrentBackend::new(rt.clone()));
 
     let state = AppState {
         cfg,
         rt,
+        backend,
         db: db.clone(),
         events: tx.clone(),
         metrics,

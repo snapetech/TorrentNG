@@ -11,8 +11,9 @@ use tracing::warn;
 
 use crate::{
     api::ws::Event,
+    backend::TorrentBackend,
     cache::{AppEventRow, Db},
-    rtorrent::{Client, TransferRates},
+    rtorrent::TransferRates,
 };
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -28,7 +29,7 @@ pub struct SessionTotals {
 }
 
 pub async fn run(
-    rt: Arc<Client>,
+    backend: Arc<dyn TorrentBackend>,
     db: Arc<Db>,
     tx: broadcast::Sender<Event>,
     interval: Duration,
@@ -48,7 +49,7 @@ pub async fn run(
         last_tick = now;
         let rates = match live_speeds_file() {
             Some(path) => read_live_speeds(&path).unwrap_or_default(),
-            None => match probe_transfer_rates_result(&rt).await {
+            None => match probe_transfer_rates_result(backend.as_ref()).await {
                 Ok(rates) => {
                     if stats_error_active {
                         append_app_event(
@@ -57,7 +58,7 @@ pub async fn run(
                             "rtorrent_stats_recovered",
                             "rTorrent transfer stats recovered",
                             serde_json::json!({
-                                "component": "rtorrent",
+                                "component": backend.backend_type().as_str(),
                                 "operation": "transfer_stats",
                                 "result": "ok",
                             }),
@@ -69,7 +70,7 @@ pub async fn run(
                 }
                 Err(e) => {
                     warn!(
-                        component = "rtorrent",
+                        component = backend.backend_type().as_str(),
                         operation = "transfer_stats",
                         result = "error",
                         error = %e,
@@ -82,7 +83,7 @@ pub async fn run(
                             "rtorrent_stats_error",
                             "rTorrent transfer stats probe failed",
                             serde_json::json!({
-                                "component": "rtorrent",
+                                "component": backend.backend_type().as_str(),
                                 "operation": "transfer_stats",
                                 "result": "error",
                                 "error": e.to_string(),
@@ -100,7 +101,7 @@ pub async fn run(
             download_total.saturating_add((rates.download.max(0) as f64 * elapsed) as i64);
         SESSION_UPLOAD_TOTAL.store(upload_total, Ordering::Relaxed);
         SESSION_DOWNLOAD_TOTAL.store(download_total, Ordering::Relaxed);
-        let live = live_status(&rt).await;
+        let live = live_status(backend.as_ref()).await;
         let _ = tx.send(Event::Stats {
             upload_speed: rates.upload,
             download_speed: rates.download,
@@ -123,7 +124,7 @@ pub fn session_totals() -> SessionTotals {
     }
 }
 
-pub fn current_rates(rt: Arc<Client>) -> impl std::future::Future<Output = TransferRates> {
+pub fn current_rates(backend: Arc<dyn TorrentBackend>) -> impl std::future::Future<Output = TransferRates> {
     async move {
         if let Some(path) = live_speeds_file() {
             if let Some(rates) = read_live_speeds(&path) {
@@ -131,12 +132,12 @@ pub fn current_rates(rt: Arc<Client>) -> impl std::future::Future<Output = Trans
             }
             return TransferRates::default();
         }
-        probe_transfer_rates(&rt).await
+        probe_transfer_rates(backend.as_ref()).await
     }
 }
 
-async fn probe_transfer_rates(rt: &Client) -> TransferRates {
-    match probe_transfer_rates_result(rt).await {
+async fn probe_transfer_rates(backend: &dyn TorrentBackend) -> TransferRates {
+    match probe_transfer_rates_result(backend).await {
         Ok(rates) => rates,
         Err(e) => {
             warn!(
@@ -151,8 +152,8 @@ async fn probe_transfer_rates(rt: &Client) -> TransferRates {
     }
 }
 
-async fn probe_transfer_rates_result(rt: &Client) -> anyhow::Result<TransferRates> {
-    match tokio::time::timeout(PROBE_TIMEOUT, rt.transfer_rates()).await {
+async fn probe_transfer_rates_result(backend: &dyn TorrentBackend) -> anyhow::Result<TransferRates> {
+    match tokio::time::timeout(PROBE_TIMEOUT, backend.transfer_rates()).await {
         Ok(Ok(rates)) => Ok(rates),
         Ok(Err(e)) => Err(e),
         Err(_) => Err(anyhow::anyhow!(
@@ -244,10 +245,10 @@ struct LiveStatus {
     pex: String,
 }
 
-async fn live_status(rt: &Client) -> LiveStatus {
+async fn live_status(backend: &dyn TorrentBackend) -> LiveStatus {
     let listen_port = incoming_port();
     let sockets = tcp_socket_counts(listen_port);
-    let (dht, pex) = rtorrent_feature_status(rt).await;
+    let (mut dht, mut pex) = backend.feature_status().await;
     let firewall = if sockets.listening && sockets.established > 0 {
         "open"
     } else if sockets.listening {
@@ -261,7 +262,10 @@ async fn live_status(rt: &Client) -> LiveStatus {
         pending_connections: sockets.pending,
         listen_port,
         firewall: firewall.to_owned(),
-        dht,
+        dht: {
+            fill_feature_status_from_config(&mut dht, &mut pex);
+            dht
+        },
         pex,
     }
 }
@@ -317,29 +321,7 @@ fn endpoint_port(endpoint: &str) -> Option<u16> {
     u16::from_str_radix(port, 16).ok()
 }
 
-async fn rtorrent_feature_status(rt: &Client) -> (String, String) {
-    let mut dht = "unknown".to_owned();
-    let mut pex = "unknown".to_owned();
-
-    if let Ok(Ok(value)) = tokio::time::timeout(PROBE_TIMEOUT, rt.call_sync("dht.mode", &[])).await
-    {
-        if let Some(mode) = value.as_str() {
-            dht = if matches!(mode, "disable" | "off" | "no") {
-                "off".to_owned()
-            } else {
-                "on".to_owned()
-            };
-        }
-    }
-
-    if let Ok(Ok(value)) =
-        tokio::time::timeout(PROBE_TIMEOUT, rt.call_sync("protocol.pex", &[])).await
-    {
-        if let Some(enabled) = value.as_bool() {
-            pex = if enabled { "on" } else { "off" }.to_owned();
-        }
-    }
-
+fn fill_feature_status_from_config(dht: &mut String, pex: &mut String) {
     for path in [
         "/etc/rtorrent/profile.rc",
         "/etc/rtorrent/user.rc",
@@ -355,7 +337,7 @@ async fn rtorrent_feature_status(rt: &Client) -> (String, String) {
                     &["on", "auto", "enable", "yes"],
                 ) {
                     if dht == "unknown" {
-                        dht = value;
+                        *dht = value;
                     }
                 }
                 if let Some(value) = config_switch(
@@ -365,14 +347,12 @@ async fn rtorrent_feature_status(rt: &Client) -> (String, String) {
                     &["yes", "true", "1", "on", "enable"],
                 ) {
                     if pex == "unknown" {
-                        pex = value;
+                        *pex = value;
                     }
                 }
             }
         }
     }
-
-    (dht, pex)
 }
 
 fn config_switch(raw: &str, key: &str, off_values: &[&str], on_values: &[&str]) -> Option<String> {

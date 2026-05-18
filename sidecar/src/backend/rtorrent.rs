@@ -5,7 +5,7 @@ use std::sync::Arc;
 use super::{BackendCapabilities, BackendStatus, BackendType, TorrentBackend};
 use crate::rtorrent::{
     torrents::{LiveSummary, RawTorrent},
-    Client, TransferRates, XmlValue,
+    Client, TransferRates,
 };
 
 pub struct RtorrentBackend {

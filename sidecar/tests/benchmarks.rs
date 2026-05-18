@@ -24,9 +24,11 @@ async fn spawn_server_with_db() -> (SocketAddr, Client, Arc<Db>) {
     let (tx, _) = broadcast::channel::<Event>(16);
     let metrics = Metrics::new();
     let rt = Arc::new(torrentng::rtorrent::Client::new_unix("/nonexistent", 1));
+    let backend = Arc::new(torrentng::backend::rtorrent::RtorrentBackend::new(rt.clone()));
     let state = AppState {
         cfg,
         rt,
+        backend,
         db: db.clone(),
         events: tx,
         metrics,
