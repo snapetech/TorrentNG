@@ -214,7 +214,7 @@ Environment variables override file values where listed.
 
 | Key | Default | Env override | Description |
 |---|---|---|---|
-| `type` | `rtorrent` | `TNG_BACKEND` | Backend adapter: `rtorrent`, `qbittorrent`, `transmission`, or `deluge`. `torrentng` is reserved for the native daemon API. |
+| `type` | `rtorrent` | `TNG_BACKEND` | Backend adapter: `rtorrent`, `qbittorrent`, `transmission`, `deluge`, or `torrentng`. |
 
 ```toml
 [backend]
@@ -297,6 +297,26 @@ type = "deluge"
 [deluge]
 url = "http://127.0.0.1:8112/json"
 password = "deluge"
+```
+
+### Sidecar `[torrentng]`
+
+The TorrentNG backend talks to a native TorrentNG daemon over its native HTTP API. This is primarily for deployments that want the sidecar WebUI/API compatibility layer in front of a separate native daemon. The adapter forwards torrent add/remove, pause/resume, recheck/reannounce, category changes, file-priority changes, and tracker add/edit/remove operations to the native daemon; sidecar-only catalog metadata such as saved views and RSS rules remains in the sidecar cache.
+
+| Key | Default | Env override | Description |
+|---|---|---|---|
+| `url` | `http://127.0.0.1:8080` | `TNG_TORRENTNG_URL` | Base URL for the native daemon |
+| `api_token` | - | `TNG_TORRENTNG_API_TOKEN` | Optional bearer token for mutation endpoints |
+| `timeout_secs` | `10` | - | Timeout for native API requests |
+| `accept_invalid_certs` | `false` | - | Accept invalid TLS certificates for lab deployments |
+
+```toml
+[backend]
+type = "torrentng"
+
+[torrentng]
+url = "http://127.0.0.1:8080"
+api_token = "optional-token"
 ```
 
 ### Sidecar `[rtorrent.logs]`

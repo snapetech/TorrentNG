@@ -75,10 +75,10 @@ the rewritten engine.
 | `POST` | `/api/v1/torrents/:hash/recheck` | Force hash check |
 | `POST` | `/api/v1/torrents/:hash/reannounce` | Force tracker announce |
 | `GET`  | `/api/v1/torrents/:hash/trackers` | List trackers |
-| `PATCH` | `/api/v1/torrents/:hash/trackers` | Add/remove/edit trackers (`{ add: ["url"], remove: ["url"], edit: [{ orig_url, new_url }] }`) |
+| `PATCH` | `/api/v1/torrents/:hash/trackers` | Add/remove/edit trackers (`{ add: ["url"], remove: ["url"], edit: [{ orig_url, new_url }] }`); native daemon applies this by replacing the engine tracker list after the patch |
 | `GET`  | `/api/v1/torrents/:hash/files` | List files |
-| `PATCH` | `/api/v1/torrents/:hash/files` | Set file priorities (`{ files: [{index, priority}] }`) |
-| `PUT`  | `/api/v1/torrents/:hash/category` | Set category (`{ category: "name" }`) |
+| `PATCH` | `/api/v1/torrents/:hash/files` | Set file priorities (`{ files: [{index, priority}] }`); native daemon routes each file priority update through the engine |
+| `PUT`  | `/api/v1/torrents/:hash/category` | Set or clear category (`{ category: "name" }`, or `null`/empty to clear) |
 | `POST` | `/api/v1/torrents/:hash/tags` | Add tags (`{ tags: ["a","b"] }`) |
 | `DELETE` | `/api/v1/torrents/:hash/tags` | Remove tags (`{ tags: ["a"] }`) |
 | `GET` | `/api/v1/events` | Server-sent torrent delta stream |
@@ -250,9 +250,11 @@ Pass `dry_run: true` to preview what would be affected without making changes.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET`  | `/health` | Health check. Sidecar mode returns generic backend reachability in `backend`, preserves legacy `rtorrent`, and includes cache count. Supported sidecar backends are rTorrent, qBittorrent, Transmission, and Deluge. |
+| `GET`  | `/health` | Health check. Sidecar mode returns generic backend reachability in `backend`, preserves legacy `rtorrent`, and includes cache count. Supported sidecar backends are rTorrent, qBittorrent, Transmission, Deluge, and TorrentNG native. |
 | `GET`  | `/metrics` | Prometheus text format metrics |
 | `GET`  | `/ws` | WebSocket — upgrade to receive live events |
+
+When configured with `backend.type = "torrentng"`, the sidecar forwards torrent add/remove, pause/resume, recheck/reannounce, category, file-priority, and tracker patch operations to a native `torrentngd` daemon over these `/api/v1` endpoints.
 
 #### WebSocket events
 

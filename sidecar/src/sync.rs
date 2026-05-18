@@ -300,7 +300,7 @@ fn upsert_torrent(
         } else {
             t.tracker_url.clone()
         },
-        tags: String::new(),
+        tags: t.tags.clone(),
         updated_at: now,
     };
     if let Err(e) = db.upsert(&row) {

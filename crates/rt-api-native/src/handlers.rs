@@ -312,6 +312,192 @@ pub async fn delete_torrent(
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SetCategoryRequest {
+    pub category: Option<String>,
+}
+
+/// `PUT /api/v1/torrents/{hash}/category` — update the persisted torrent category.
+pub async fn set_torrent_category(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(info_hash): Path<String>,
+    Json(req): Json<SetCategoryRequest>,
+) -> impl IntoResponse {
+    if let Some(response) = require_mutation_auth(&state, &headers) {
+        return response;
+    }
+    if !torrent_exists(&state, &info_hash).await {
+        return not_found(info_hash);
+    }
+    let category = req
+        .category
+        .map(|category| category.trim().to_owned())
+        .filter(|category| !category.is_empty());
+    if let Some(engine) = &state.engine {
+        return match engine
+            .update_torrent_labels(info_hash.clone(), Some(category), Vec::new(), Vec::new())
+            .await
+        {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(e) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::to_value(ApiError::bad_request(e)).unwrap()),
+            )
+                .into_response(),
+        };
+    }
+
+    let mut reg = state.registry.write().await;
+    match reg.get_mut(&info_hash) {
+        Some(entry) => {
+            entry.category = category;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        None => not_found(info_hash),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FilePriorityPatchItem {
+    pub index: u32,
+    pub priority: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PatchFilesRequest {
+    #[serde(default)]
+    pub files: Vec<FilePriorityPatchItem>,
+}
+
+/// `PATCH /api/v1/torrents/{hash}/files` — update one or more file priorities.
+pub async fn patch_torrent_files(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(info_hash): Path<String>,
+    Json(req): Json<PatchFilesRequest>,
+) -> impl IntoResponse {
+    if let Some(response) = require_mutation_auth(&state, &headers) {
+        return response;
+    }
+    if req.files.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError::bad_request("files must not be empty")).unwrap()),
+        )
+            .into_response();
+    }
+    if !torrent_exists(&state, &info_hash).await {
+        return not_found(info_hash);
+    }
+    let Some(engine) = &state.engine else {
+        return StatusCode::NO_CONTENT.into_response();
+    };
+
+    let mut failures = Vec::new();
+    for item in req.files {
+        if let Err(e) = engine
+            .update_file_priorities(info_hash.clone(), vec![item.index], item.priority)
+            .await
+        {
+            failures.push(format!("{}: {e}", item.index));
+        }
+    }
+    if failures.is_empty() {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::to_value(ApiError::bad_request(format!(
+                    "failed to update file priorities: {}",
+                    failures.join("; ")
+                )))
+                .unwrap(),
+            ),
+        )
+            .into_response()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TrackerEditPatchItem {
+    pub orig_url: String,
+    pub new_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PatchTrackersRequest {
+    #[serde(default)]
+    pub add: Vec<String>,
+    #[serde(default)]
+    pub remove: Vec<String>,
+    #[serde(default)]
+    pub edit: Vec<TrackerEditPatchItem>,
+}
+
+/// `PATCH /api/v1/torrents/{hash}/trackers` — replace tracker URLs after applying a patch.
+pub async fn patch_torrent_trackers(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(info_hash): Path<String>,
+    Json(req): Json<PatchTrackersRequest>,
+) -> impl IntoResponse {
+    if let Some(response) = require_mutation_auth(&state, &headers) {
+        return response;
+    }
+    if !torrent_exists(&state, &info_hash).await {
+        return not_found(info_hash);
+    }
+    let Some(engine) = &state.engine else {
+        return StatusCode::NO_CONTENT.into_response();
+    };
+
+    let mut trackers = match engine.torrent_metadata(info_hash.clone()).await {
+        Ok(meta) => meta.trackers,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::to_value(ApiError::bad_request(e)).unwrap()),
+            )
+                .into_response()
+        }
+    };
+    for edit in req.edit {
+        let orig_url = edit.orig_url.trim();
+        let new_url = edit.new_url.trim();
+        if orig_url.is_empty() || new_url.is_empty() {
+            continue;
+        }
+        for tracker in &mut trackers {
+            if tracker == orig_url {
+                *tracker = new_url.to_owned();
+            }
+        }
+    }
+    for remove in req.remove {
+        let remove = remove.trim();
+        if !remove.is_empty() {
+            trackers.retain(|tracker| tracker != remove);
+        }
+    }
+    for add in req.add {
+        let add = add.trim();
+        if !add.is_empty() && !trackers.iter().any(|tracker| tracker == add) {
+            trackers.push(add.to_owned());
+        }
+    }
+
+    match engine.update_torrent_trackers(info_hash, trackers).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError::bad_request(e)).unwrap()),
+        )
+            .into_response(),
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct StoragePlanRequest {
     operation: String,
@@ -3193,6 +3379,80 @@ mod tests {
                     .method("POST")
                     .uri(format!("/api/v1/torrents/{hash}/reannounce"))
                     .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn set_category_without_engine_updates_registry() {
+        let state = AppState::new();
+        let hash = "c".repeat(40);
+        {
+            let mut reg = state.registry.write().await;
+            reg.add(TorrentEntry::new(
+                hash.clone(),
+                "category.torrent".into(),
+                "/data".into(),
+            ))
+            .unwrap();
+        }
+        let registry = state.registry.clone();
+        let app = build_router(state);
+        let body = serde_json::json!({ "category": "Movies" });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/v1/torrents/{hash}/category"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            registry
+                .read()
+                .await
+                .get(&hash)
+                .unwrap()
+                .category
+                .as_deref(),
+            Some("Movies")
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_files_rejects_empty_body() {
+        let (app, hash) = setup_app_with_torrent().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/v1/torrents/{hash}/files"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"files":[]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn patch_trackers_without_engine_accepts_existing_torrent() {
+        let (app, hash) = setup_app_with_torrent().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/v1/torrents/{hash}/trackers"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"add":["udp://tracker/announce"]}"#))
                     .unwrap(),
             )
             .await

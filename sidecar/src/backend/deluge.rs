@@ -372,6 +372,7 @@ fn map_torrent(hash: &str, t: &Value) -> RawTorrent {
         peers_complete: int(t, "num_seeds"),
         message,
         tracker_url,
+        tags: String::new(),
     }
 }
 

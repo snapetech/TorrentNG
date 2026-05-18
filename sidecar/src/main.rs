@@ -55,9 +55,10 @@ async fn main() -> Result<()> {
         BackendKind::Deluge => Arc::new(
             backend::deluge::DelugeBackend::new(&cfg.deluge).context("create deluge backend")?,
         ),
-        BackendKind::Torrentng => {
-            unreachable!("unsupported backend should be rejected during config validation")
-        }
+        BackendKind::Torrentng => Arc::new(
+            backend::torrentng::TorrentngBackend::new(&cfg.torrentng)
+                .context("create torrentng native backend")?,
+        ),
     };
 
     let db = Arc::new(Db::open(&cfg.cache_path()).context("open cache db")?);

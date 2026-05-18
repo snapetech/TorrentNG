@@ -369,6 +369,7 @@ fn map_torrent(t: &Value) -> RawTorrent {
         peers_complete: 0,
         message: string(t, "errorString"),
         tracker_url: tracker,
+        tags: String::new(),
     }
 }
 

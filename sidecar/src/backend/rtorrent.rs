@@ -28,7 +28,7 @@ impl TorrentBackend for RtorrentBackend {
 
     fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities {
-            supports_tags: true,
+            supports_tags: false,
             supports_categories: true,
             supports_file_priority: true,
             supports_tracker_edit: true,

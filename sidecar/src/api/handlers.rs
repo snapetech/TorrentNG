@@ -2323,6 +2323,11 @@ pub async fn add_torrent_tags(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     }
+    if s.backend.capabilities().supports_tags {
+        if let Err(e) = s.backend.add_tags(&hash, &tags).await {
+            tracing::warn!(component = "api", operation = "add_tags", result = "error", torrent = %hash, error = %e, "backend tag add failed");
+        }
+    }
     emit_torrent_updated(&s, &hash);
     emit(&s, Event::TagsUpdated);
     StatusCode::NO_CONTENT.into_response()
@@ -2351,6 +2356,11 @@ pub async fn remove_torrent_tags(
         if let Err(e) = s.db.remove_torrent_tag(&hash, tag) {
             tracing::error!(component = "cache", operation = "remove_tag", result = "error", torrent = %hash, tag = %tag, error = %e, "cache tag removal failed");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+    if s.backend.capabilities().supports_tags {
+        if let Err(e) = s.backend.remove_tags(&hash, &tags).await {
+            tracing::warn!(component = "api", operation = "remove_tags", result = "error", torrent = %hash, error = %e, "backend tag removal failed");
         }
     }
     emit_torrent_updated(&s, &hash);

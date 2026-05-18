@@ -40,6 +40,9 @@ pub struct Config {
     pub deluge: DelugeConfig,
 
     #[serde(default)]
+    pub torrentng: TorrentngConfig,
+
+    #[serde(default)]
     pub auth: AuthConfig,
 
     #[serde(default)]
@@ -118,6 +121,15 @@ pub struct TransmissionConfig {
 pub struct DelugeConfig {
     pub url: String,
     pub password: Option<String>,
+    pub timeout_secs: u64,
+    pub accept_invalid_certs: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct TorrentngConfig {
+    pub url: String,
+    pub api_token: Option<String>,
     pub timeout_secs: u64,
     pub accept_invalid_certs: bool,
 }
@@ -233,6 +245,17 @@ impl Default for DelugeConfig {
     }
 }
 
+impl Default for TorrentngConfig {
+    fn default() -> Self {
+        Self {
+            url: "http://127.0.0.1:8080".to_owned(),
+            api_token: None,
+            timeout_secs: default_timeout_secs(),
+            accept_invalid_certs: false,
+        }
+    }
+}
+
 impl Config {
     /// Minimal config for unit/integration tests — no real rTorrent connection.
     pub fn test_default() -> Self {
@@ -253,6 +276,7 @@ impl Config {
             qbittorrent: QbittorrentConfig::default(),
             transmission: TransmissionConfig::default(),
             deluge: DelugeConfig::default(),
+            torrentng: TorrentngConfig::default(),
             auth: AuthConfig::default(),
             workflows: WorkflowConfig::default(),
             identity: IdentityConfig::default(),
@@ -386,6 +410,12 @@ impl Config {
         if let Ok(v) = std::env::var("TNG_DELUGE_PASSWORD") {
             self.deluge.password = Some(v);
         }
+        if let Ok(v) = std::env::var("TNG_TORRENTNG_URL") {
+            self.torrentng.url = v;
+        }
+        if let Ok(v) = std::env::var("TNG_TORRENTNG_API_TOKEN") {
+            self.torrentng.api_token = Some(v);
+        }
         if let Ok(v) = std::env::var("TNG_RTORRENT_LOGS_ENABLED") {
             self.rtorrent.logs.enabled = v == "1" || v.eq_ignore_ascii_case("true");
         }
@@ -466,10 +496,9 @@ impl Config {
                 }
             }
             BackendKind::Torrentng => {
-                bail!(
-                    "backend {} is configured but not implemented in the sidecar yet",
-                    self.backend_name()
-                )
+                if self.torrentng.url.trim().is_empty() {
+                    bail!("torrentng: url must be set");
+                }
             }
         }
         Ok(())
@@ -571,6 +600,78 @@ mod tests {
         restore_env("TNG_QBITTORRENT_WEBAPI_VERSION", old_api);
         restore_env("TNG_QBITTORRENT_BUILD_LIBTORRENT", old_lt);
         restore_env("TNG_QBITTORRENT_BUILD_QT", old_qt);
+    }
+
+    #[test]
+    fn backend_env_selects_all_supported_backends() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let old_backend = std::env::var("TNG_BACKEND").ok();
+        for (raw, expected) in [
+            ("rtorrent", BackendKind::Rtorrent),
+            ("qbittorrent", BackendKind::Qbittorrent),
+            ("qbit", BackendKind::Qbittorrent),
+            ("transmission", BackendKind::Transmission),
+            ("deluge", BackendKind::Deluge),
+            ("torrentng", BackendKind::Torrentng),
+            ("native", BackendKind::Torrentng),
+        ] {
+            std::env::set_var("TNG_BACKEND", raw);
+            let mut cfg = Config::test_default();
+            cfg.apply_env();
+            assert_eq!(cfg.backend.backend_type, expected, "{raw}");
+        }
+        restore_env("TNG_BACKEND", old_backend);
+    }
+
+    #[test]
+    fn external_backend_env_overrides_connection_fields() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let old_qb_url = std::env::var("TNG_QBITTORRENT_URL").ok();
+        let old_qb_user = std::env::var("TNG_QBITTORRENT_USERNAME").ok();
+        let old_qb_pass = std::env::var("TNG_QBITTORRENT_PASSWORD").ok();
+        let old_tr_url = std::env::var("TNG_TRANSMISSION_URL").ok();
+        let old_tr_user = std::env::var("TNG_TRANSMISSION_USERNAME").ok();
+        let old_tr_pass = std::env::var("TNG_TRANSMISSION_PASSWORD").ok();
+        let old_de_url = std::env::var("TNG_DELUGE_URL").ok();
+        let old_de_pass = std::env::var("TNG_DELUGE_PASSWORD").ok();
+        let old_tng_url = std::env::var("TNG_TORRENTNG_URL").ok();
+        let old_tng_token = std::env::var("TNG_TORRENTNG_API_TOKEN").ok();
+
+        std::env::set_var("TNG_QBITTORRENT_URL", "http://qbit:8080");
+        std::env::set_var("TNG_QBITTORRENT_USERNAME", "qb-user");
+        std::env::set_var("TNG_QBITTORRENT_PASSWORD", "qb-pass");
+        std::env::set_var("TNG_TRANSMISSION_URL", "http://tr:9091/transmission/rpc");
+        std::env::set_var("TNG_TRANSMISSION_USERNAME", "tr-user");
+        std::env::set_var("TNG_TRANSMISSION_PASSWORD", "tr-pass");
+        std::env::set_var("TNG_DELUGE_URL", "http://deluge:8112/json");
+        std::env::set_var("TNG_DELUGE_PASSWORD", "deluge-pass");
+        std::env::set_var("TNG_TORRENTNG_URL", "http://native:8080");
+        std::env::set_var("TNG_TORRENTNG_API_TOKEN", "native-token");
+
+        let mut cfg = Config::test_default();
+        cfg.apply_env();
+
+        assert_eq!(cfg.qbittorrent.url, "http://qbit:8080");
+        assert_eq!(cfg.qbittorrent.username.as_deref(), Some("qb-user"));
+        assert_eq!(cfg.qbittorrent.password.as_deref(), Some("qb-pass"));
+        assert_eq!(cfg.transmission.url, "http://tr:9091/transmission/rpc");
+        assert_eq!(cfg.transmission.username.as_deref(), Some("tr-user"));
+        assert_eq!(cfg.transmission.password.as_deref(), Some("tr-pass"));
+        assert_eq!(cfg.deluge.url, "http://deluge:8112/json");
+        assert_eq!(cfg.deluge.password.as_deref(), Some("deluge-pass"));
+        assert_eq!(cfg.torrentng.url, "http://native:8080");
+        assert_eq!(cfg.torrentng.api_token.as_deref(), Some("native-token"));
+
+        restore_env("TNG_QBITTORRENT_URL", old_qb_url);
+        restore_env("TNG_QBITTORRENT_USERNAME", old_qb_user);
+        restore_env("TNG_QBITTORRENT_PASSWORD", old_qb_pass);
+        restore_env("TNG_TRANSMISSION_URL", old_tr_url);
+        restore_env("TNG_TRANSMISSION_USERNAME", old_tr_user);
+        restore_env("TNG_TRANSMISSION_PASSWORD", old_tr_pass);
+        restore_env("TNG_DELUGE_URL", old_de_url);
+        restore_env("TNG_DELUGE_PASSWORD", old_de_pass);
+        restore_env("TNG_TORRENTNG_URL", old_tng_url);
+        restore_env("TNG_TORRENTNG_API_TOKEN", old_tng_token);
     }
 
     #[test]

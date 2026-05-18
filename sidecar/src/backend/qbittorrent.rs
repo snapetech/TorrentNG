@@ -111,6 +111,7 @@ struct QbitTorrent {
     num_seeds: Option<i64>,
     num_leechs: Option<i64>,
     tracker: Option<String>,
+    tags: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -325,6 +326,44 @@ impl TorrentBackend for QbittorrentBackend {
         )
         .await
     }
+
+    async fn add_tags(&self, hash: &str, tags: &[&str]) -> Result<()> {
+        self.post_form(
+            "api/v2/torrents/addTags",
+            &[("hashes", hash), ("tags", &tags.join(","))],
+        )
+        .await
+    }
+
+    async fn remove_tags(&self, hash: &str, tags: &[&str]) -> Result<()> {
+        self.post_form(
+            "api/v2/torrents/removeTags",
+            &[("hashes", hash), ("tags", &tags.join(","))],
+        )
+        .await
+    }
+
+    async fn set_tags(&self, hash: &str, tags: &[&str]) -> Result<()> {
+        let current = self
+            .list_torrents()
+            .await?
+            .into_iter()
+            .find(|torrent| torrent.hash.eq_ignore_ascii_case(hash))
+            .map(|torrent| torrent.tags)
+            .unwrap_or_default();
+        let current_tags: Vec<&str> = current
+            .split(',')
+            .map(str::trim)
+            .filter(|tag| !tag.is_empty())
+            .collect();
+        if !current_tags.is_empty() {
+            self.remove_tags(hash, &current_tags).await?;
+        }
+        if !tags.is_empty() {
+            self.add_tags(hash, tags).await?;
+        }
+        Ok(())
+    }
 }
 
 fn map_torrent(t: QbitTorrent) -> RawTorrent {
@@ -370,6 +409,7 @@ fn map_torrent(t: QbitTorrent) -> RawTorrent {
         peers_complete: t.num_complete.unwrap_or(0),
         message,
         tracker_url: t.tracker.unwrap_or_default(),
+        tags: t.tags.unwrap_or_default(),
     }
 }
 

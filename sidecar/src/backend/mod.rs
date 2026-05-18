@@ -10,6 +10,7 @@ use crate::rtorrent::TransferRates;
 pub mod deluge;
 pub mod qbittorrent;
 pub mod rtorrent;
+pub mod torrentng;
 pub mod transmission;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -110,6 +111,15 @@ pub trait TorrentBackend: Send + Sync {
     async fn list_files(&self, hash: &str) -> Result<Vec<RawFile>>;
     async fn set_file_priority(&self, hash: &str, file_index: usize, priority: i64) -> Result<()>;
     async fn set_category(&self, hash: &str, category: &str) -> Result<()>;
+    async fn add_tags(&self, _hash: &str, _tags: &[&str]) -> Result<()> {
+        Ok(())
+    }
+    async fn remove_tags(&self, _hash: &str, _tags: &[&str]) -> Result<()> {
+        Ok(())
+    }
+    async fn set_tags(&self, _hash: &str, _tags: &[&str]) -> Result<()> {
+        Ok(())
+    }
 
     async fn has_bounded_sync(&self) -> bool {
         false

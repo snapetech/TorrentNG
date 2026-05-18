@@ -61,6 +61,7 @@ pub struct RawTorrent {
     pub peers_complete: i64,
     pub message: String,
     pub tracker_url: String,
+    pub tags: String,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -428,6 +429,7 @@ fn parse_torrent_rows(rows: Vec<XmlValue>) -> Result<Vec<RawTorrent>> {
             peers_complete: int_field(&fields, 21),
             message: str_field(&fields, 22),
             tracker_url: String::new(),
+            tags: String::new(),
         });
     }
     Ok(torrents)

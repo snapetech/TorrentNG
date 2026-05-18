@@ -1182,6 +1182,18 @@ async fn torrents_add_tags(State(s): State<AppState>, Form(f): Form<TagsForm>) -
                 emit(&s, Event::TagsUpdated);
             }
         }
+        if s.backend.capabilities().supports_tags {
+            if let Err(e) = s.backend.add_tags(&hash, &tag_list).await {
+                tracing::warn!(
+                    component = "qbcompat",
+                    operation = "add_tags",
+                    torrent = %hash,
+                    result = "error",
+                    error = %e,
+                    "backend tag add failed"
+                );
+            }
+        }
     }
     StatusCode::OK
 }
@@ -1212,6 +1224,18 @@ async fn torrents_remove_tags(State(s): State<AppState>, Form(f): Form<TagsForm>
                 emit(&s, Event::TagsUpdated);
             }
         }
+        if s.backend.capabilities().supports_tags {
+            if let Err(e) = s.backend.remove_tags(&hash, &tag_list).await {
+                tracing::warn!(
+                    component = "qbcompat",
+                    operation = "remove_tags",
+                    torrent = %hash,
+                    result = "error",
+                    error = %e,
+                    "backend tag removal failed"
+                );
+            }
+        }
     }
     StatusCode::OK
 }
@@ -1238,6 +1262,18 @@ async fn torrents_set_tags(State(s): State<AppState>, Form(f): Form<TagsForm>) -
         } else {
             emit_torrent_updated(&s, &hash);
             emit(&s, Event::TagsUpdated);
+        }
+        if s.backend.capabilities().supports_tags {
+            if let Err(e) = s.backend.set_tags(&hash, &tag_list).await {
+                tracing::warn!(
+                    component = "qbcompat",
+                    operation = "set_tags",
+                    torrent = %hash,
+                    result = "error",
+                    error = %e,
+                    "backend tag replace failed"
+                );
+            }
         }
     }
     StatusCode::OK

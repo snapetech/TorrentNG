@@ -1,12 +1,13 @@
 use axum::{
-    routing::{get, post},
+    routing::{get, patch, post, put},
     Router,
 };
 
 use crate::{
     handlers::{
         add_torrent, delete_torrent, diagnose_torrent, get_torrent, health, list_session_events,
-        list_torrents, metrics, pause_torrent, reannounce_torrent, recheck_torrent, resume_torrent,
+        list_torrents, metrics, patch_torrent_files, patch_torrent_trackers, pause_torrent,
+        reannounce_torrent, recheck_torrent, resume_torrent, set_torrent_category,
         storage_execute_plan, storage_preview_plan, stream_events,
     },
     state::AppState,
@@ -36,6 +37,12 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/v1/torrents/:hash/reannounce",
             axum::routing::post(reannounce_torrent),
+        )
+        .route("/api/v1/torrents/:hash/category", put(set_torrent_category))
+        .route("/api/v1/torrents/:hash/files", patch(patch_torrent_files))
+        .route(
+            "/api/v1/torrents/:hash/trackers",
+            patch(patch_torrent_trackers),
         )
         .route("/api/v1/torrents/:hash/diagnostics", get(diagnose_torrent))
         .route("/api/v1/events", get(stream_events))
