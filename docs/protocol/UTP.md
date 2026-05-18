@@ -24,6 +24,11 @@ still routes peer-wire sessions through TCP.
   - payload receive and ACK response;
   - FIN close;
   - bounded retransmission attempts.
+- Byte-stream helpers over DATA payloads:
+  - `write_all` chunks arbitrary byte slices across uTP DATA packets;
+  - `read_exact` buffers received DATA payloads and can satisfy reads across
+    packet boundaries, which is the bridge needed for peer-wire handshakes and
+    length-prefixed messages.
 
 ## Tested Behavior
 
@@ -40,6 +45,7 @@ The local `rt-utp` test suite covers:
 - ACK out-of-window rejection and zero-ACK startup handling;
 - congestion-window growth, reduction, and timeout floor behavior;
 - loopback UDP transport handshake, payload exchange, ACK, and close.
+- byte-stream reads spanning multiple uTP payload chunks.
 
 Run:
 
@@ -69,6 +75,14 @@ client.send(b"piece block").await?;
 let echoed = client.recv().await?;
 client.close().await?;
 server.await??;
+```
+
+For peer-wire integration, callers can use the byte-stream helpers:
+
+```rust
+let mut hs = [0u8; 68];
+stream.write_all(&handshake_bytes).await?;
+stream.read_exact(&mut hs).await?;
 ```
 
 `UtpTransportConfig` exposes handshake timeout, I/O timeout, max datagram size,

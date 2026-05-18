@@ -47,4 +47,7 @@ pub enum UtpError {
 
     #[error("uTP operation timed out")]
     Timeout,
+
+    #[error("uTP stream closed")]
+    Closed,
 }

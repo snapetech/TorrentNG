@@ -42,6 +42,7 @@ pub struct UtpStream {
     conn: UtpConnection,
     config: UtpTransportConfig,
     last_remote_timestamp_us: u32,
+    read_buf: Vec<u8>,
 }
 
 impl UtpListener {
@@ -93,6 +94,7 @@ impl UtpListener {
                 conn,
                 config: self.config,
                 last_remote_timestamp_us: packet.header.timestamp_us,
+                read_buf: Vec::new(),
             });
         }
     }
@@ -147,6 +149,7 @@ impl UtpStream {
             conn,
             config,
             last_remote_timestamp_us: packet.header.timestamp_us,
+            read_buf: Vec::new(),
         })
     }
 
@@ -197,6 +200,32 @@ impl UtpStream {
             if !acknowledged {
                 return Err(UtpError::Timeout);
             }
+        }
+        Ok(())
+    }
+
+    pub async fn write_all(&mut self, mut bytes: &[u8]) -> Result<(), UtpError> {
+        while !bytes.is_empty() {
+            let len = bytes.len().min(DEFAULT_MTU_PAYLOAD_BYTES);
+            self.send(&bytes[..len]).await?;
+            bytes = &bytes[len..];
+        }
+        Ok(())
+    }
+
+    pub async fn read_exact(&mut self, out: &mut [u8]) -> Result<(), UtpError> {
+        let mut filled = 0;
+        while filled < out.len() {
+            if self.read_buf.is_empty() {
+                self.read_buf = self.recv().await?;
+                if self.read_buf.is_empty() {
+                    return Err(UtpError::Closed);
+                }
+            }
+            let n = (out.len() - filled).min(self.read_buf.len());
+            out[filled..filled + n].copy_from_slice(&self.read_buf[..n]);
+            self.read_buf.drain(..n);
+            filled += n;
         }
         Ok(())
     }
@@ -338,6 +367,30 @@ mod tests {
         client.send(b"hello over utp").await.unwrap();
         assert_eq!(client.recv().await.unwrap(), b"ack");
         let _ = client.recv().await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn utp_stream_read_exact_spans_payload_chunks() {
+        let listener = UtpListener::bind_with_config("127.0.0.1:0".parse().unwrap(), test_config())
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.unwrap();
+            stream.write_all(b"hello").await.unwrap();
+            stream.write_all(b"world").await.unwrap();
+        });
+
+        let mut client = UtpStream::connect_with_config(addr, test_config())
+            .await
+            .unwrap();
+        let mut first = [0u8; 3];
+        let mut second = [0u8; 7];
+        client.read_exact(&mut first).await.unwrap();
+        client.read_exact(&mut second).await.unwrap();
+        assert_eq!(&first, b"hel");
+        assert_eq!(&second, b"loworld");
         server.await.unwrap();
     }
 }

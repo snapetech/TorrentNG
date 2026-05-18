@@ -10,7 +10,8 @@ oversized-extension validation, selective ACK helpers, connection ID derivation,
 state transitions, send-window accounting, RTT sampling, retransmit timeout
 tracking, delay-based congestion-window adjustment, and an async UDP
 `UtpListener`/`UtpStream` transport with SYN/STATE handshake, DATA/ACK exchange,
-FIN close, and bounded retransmission attempts.
+FIN close, bounded retransmission attempts, and byte-stream `read_exact` /
+`write_all` helpers over uTP DATA payloads.
 
 Full native-engine uTP integration remains a hardening item: the remaining work
 is wiring `UtpStream` into peer-wire handshakes, peer selection, incoming peer
