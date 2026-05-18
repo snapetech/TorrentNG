@@ -9,10 +9,10 @@ use std::time::Instant;
 use anyhow::Context;
 use axum::{
     body::Body,
-    extract::{ConnectInfo, MatchedPath},
-    http::{header, HeaderMap, HeaderName, HeaderValue, Request},
+    extract::{ConnectInfo, MatchedPath, State},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Request, StatusCode},
     middleware::{self, Next},
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use tokio::sync::RwLock;
 use tower_http::services::{ServeDir, ServeFile};
@@ -127,7 +127,11 @@ async fn main() -> anyhow::Result<()> {
         .fallback_service(
             ServeDir::new(&static_dir).not_found_service(ServeFile::new(&static_index)),
         )
-        .layer(middleware::from_fn(request_log));
+        .layer(middleware::from_fn(request_log))
+        .layer(middleware::from_fn_with_state(
+            Arc::new(config.auth.api_tokens.clone()),
+            daemon_auth_guard,
+        ));
 
     let api_addr: std::net::SocketAddr = config
         .daemon
@@ -184,6 +188,55 @@ fn static_dir() -> PathBuf {
 }
 
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+async fn daemon_auth_guard(
+    State(api_tokens): State<Arc<Vec<String>>>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    if api_tokens.is_empty()
+        || daemon_public_path(req.uri().path())
+        || daemon_presented_token(req.headers()).is_some_and(|token| api_tokens.iter().any(|allowed| allowed == &token))
+    {
+        return next.run(req).await;
+    }
+
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::CONTENT_TYPE, "application/json")],
+        r#"{"code":"UNAUTHORIZED","message":"missing or invalid API token"}"#,
+    )
+        .into_response()
+}
+
+fn daemon_public_path(path: &str) -> bool {
+    matches!(path, "/health" | "/api/v1/auth/login" | "/api/v1/auth/logout")
+}
+
+fn daemon_presented_token(headers: &HeaderMap) -> Option<String> {
+    bearer_token(headers).or_else(|| session_cookie(headers, "tng_session")).or_else(|| session_cookie(headers, "SID"))
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::to_owned)
+}
+
+fn session_cookie(headers: &HeaderMap, cookie_name: &str) -> Option<String> {
+    let prefix = format!("{cookie_name}=");
+    headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|cookie| {
+            cookie.split(';').find_map(|part| {
+                let part = part.trim();
+                part.strip_prefix(&prefix).map(str::to_owned)
+            })
+        })
+}
 
 async fn request_log(req: Request<Body>, next: Next) -> Response {
     let method = req.method().clone();
