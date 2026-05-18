@@ -132,8 +132,11 @@ falls back to TCP if the uTP connect fails; `TNG_UTP_OUTGOING=only` disables
 that fallback. The legacy `TNG_ENABLE_UTP_OUTGOING` flag maps to `prefer`.
 The engine also has an incoming shared `UtpEndpoint` peer listener behind
 `TNG_UTP_INCOMING=1`; accepted streams are routed by peer-wire handshake to the
-same torrent tasks as TCP peers.
+same torrent tasks as TCP peers. Magnet metadata fetch can use uTP through the
+same byte-stream adapter when `TNG_UTP_METADATA=prefer|only` is set; if that is
+not set it follows `TNG_UTP_OUTGOING`, then the legacy
+`TNG_ENABLE_UTP_OUTGOING` flag.
 
-The path remains opt-in while default policy, production interop, metadata
-fetch over incoming uTP, and tracker/DHT peer transport preference evidence are
-still incomplete.
+The path remains opt-in while default policy, production interop, detailed uTP
+metrics, and tracker/DHT peer transport preference evidence are still
+incomplete.

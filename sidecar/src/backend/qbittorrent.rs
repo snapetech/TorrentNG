@@ -1,8 +1,11 @@
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use reqwest::Url;
+use std::collections::BTreeMap;
 
-use super::{BackendCapabilities, BackendStatus, BackendType, TorrentBackend};
+use super::{
+    BackendCapabilities, BackendStatus, BackendTransferLimits, BackendType, TorrentBackend,
+};
 use crate::{
     config::QbittorrentConfig,
     rtorrent::{files::RawFile, torrents::RawTorrent, trackers::RawTracker, TransferRates},
@@ -88,6 +91,24 @@ impl QbittorrentBackend {
             .with_context(|| format!("qBittorrent POST {path}"))?;
         Ok(())
     }
+
+    async fn limit_map(&self, path: &str, hashes: &[String]) -> Result<BTreeMap<String, i64>> {
+        self.ensure_login().await?;
+        let hashes_param = hashes.join("|");
+        let mut url = self.url(path)?;
+        url.query_pairs_mut().append_pair("hashes", &hashes_param);
+        Ok(self
+            .client
+            .get(url)
+            .send()
+            .await
+            .with_context(|| format!("qBittorrent GET {path}"))?
+            .error_for_status()
+            .with_context(|| format!("qBittorrent GET {path}"))?
+            .json()
+            .await
+            .with_context(|| format!("decode qBittorrent GET {path}"))?)
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -118,6 +139,9 @@ struct QbitTorrent {
 struct QbitTransferInfo {
     dl_info_speed: Option<i64>,
     up_info_speed: Option<i64>,
+    dl_rate_limit: Option<i64>,
+    up_rate_limit: Option<i64>,
+    use_alt_speed_limits: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -392,6 +416,14 @@ impl TorrentBackend for QbittorrentBackend {
         .await
     }
 
+    async fn download_limits(&self, hashes: &[String]) -> Result<BTreeMap<String, i64>> {
+        self.limit_map("api/v2/torrents/downloadLimit", hashes).await
+    }
+
+    async fn upload_limits(&self, hashes: &[String]) -> Result<BTreeMap<String, i64>> {
+        self.limit_map("api/v2/torrents/uploadLimit", hashes).await
+    }
+
     async fn set_global_download_limit(&self, limit: i64) -> Result<()> {
         self.post_form(
             "api/v2/transfer/setDownloadLimit",
@@ -400,12 +432,26 @@ impl TorrentBackend for QbittorrentBackend {
         .await
     }
 
+    async fn global_limits(&self) -> Result<BackendTransferLimits> {
+        let info: QbitTransferInfo = self.get_json("api/v2/transfer/info").await?;
+        Ok(BackendTransferLimits {
+            download_limit: info.dl_rate_limit.unwrap_or(0).max(0),
+            upload_limit: info.up_rate_limit.unwrap_or(0).max(0),
+            speed_limits_mode: info.use_alt_speed_limits.unwrap_or(false),
+        })
+    }
+
     async fn set_global_upload_limit(&self, limit: i64) -> Result<()> {
         self.post_form(
             "api/v2/transfer/setUploadLimit",
             &[("limit", &limit.max(0).to_string())],
         )
         .await
+    }
+
+    async fn toggle_global_speed_limits_mode(&self) -> Result<()> {
+        self.post_form("api/v2/transfer/toggleSpeedLimitsMode", &[])
+            .await
     }
 
     async fn toggle_sequential_download(&self, hash: &str) -> Result<()> {

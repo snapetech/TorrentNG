@@ -1278,39 +1278,6 @@ run_partial_file_selection_case() {
     --data-urlencode "id=0" \
     --data-urlencode "priority=0" \
     "$(client_url torrentngd)/api/qb/v2/torrents/filePrio" >/dev/null || status="FAIL"
-  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
-    --data-urlencode "hashes=$info_hash" \
-    --data-urlencode "limit=1048576" \
-    "$(client_url torrentngd)/api/qb/v2/torrents/setDownloadLimit" >/dev/null || status="FAIL"
-  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
-    --data-urlencode "hashes=$info_hash" \
-    --data-urlencode "limit=524288" \
-    "$(client_url torrentngd)/api/qb/v2/torrents/setUploadLimit" >/dev/null || status="FAIL"
-  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
-    --data-urlencode "limit=2097152" \
-    "$(client_url torrentngd)/api/qb/v2/transfer/setDownloadLimit" >/dev/null || status="FAIL"
-  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
-    --data-urlencode "limit=1048576" \
-    "$(client_url torrentngd)/api/qb/v2/transfer/setUploadLimit" >/dev/null || status="FAIL"
-  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
-    --data-urlencode "hashes=$info_hash" \
-    --data-urlencode "value=true" \
-    "$(client_url torrentngd)/api/qb/v2/torrents/setForceStart" >/dev/null || status="FAIL"
-  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
-    --data-urlencode "hashes=$info_hash" \
-    --data-urlencode "value=true" \
-    "$(client_url torrentngd)/api/qb/v2/torrents/setSuperSeeding" >/dev/null || status="FAIL"
-  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
-    --data-urlencode "hashes=$info_hash" \
-    --data-urlencode "enable=true" \
-    "$(client_url torrentngd)/api/qb/v2/torrents/setAutoTMM" >/dev/null || status="FAIL"
-  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
-    --data-urlencode "hashes=$info_hash" \
-    --data-urlencode "enable=true" \
-    "$(client_url torrentngd)/api/qb/v2/torrents/setAutoManagement" >/dev/null || status="FAIL"
-  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
-    --data-urlencode "hashes=$info_hash" \
-    "$(client_url torrentngd)/api/qb/v2/torrents/toggleFirstLastPiecePrio" >/dev/null || status="FAIL"
   bridge_client_peer_to_rust transmission "$info_hash" || true
   wait_explicit_peer_complete "$TIMEOUT_LOCAL" "$fixture" "$info_hash" transmission transmission torrentngd || status="FAIL"
   verify_selected_fixture_hashes torrentngd "$fixture" \
@@ -1348,6 +1315,41 @@ run_qbit_mutation_facade_case() {
     --data-urlencode "id=0" \
     --data-urlencode "priority=0" \
     "$(client_url torrentngd)/api/qb/v2/torrents/filePrio" >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
+    --data-urlencode "hashes=$info_hash" \
+    --data-urlencode "limit=1048576" \
+    "$(client_url torrentngd)/api/qb/v2/torrents/setDownloadLimit" >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
+    --data-urlencode "hashes=$info_hash" \
+    --data-urlencode "limit=524288" \
+    "$(client_url torrentngd)/api/qb/v2/torrents/setUploadLimit" >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
+    --data-urlencode "limit=2097152" \
+    "$(client_url torrentngd)/api/qb/v2/transfer/setDownloadLimit" >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
+    --data-urlencode "limit=1048576" \
+    "$(client_url torrentngd)/api/qb/v2/transfer/setUploadLimit" >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
+    "$(client_url torrentngd)/api/qb/v2/transfer/toggleSpeedLimitsMode" >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
+    --data-urlencode "hashes=$info_hash" \
+    --data-urlencode "value=true" \
+    "$(client_url torrentngd)/api/qb/v2/torrents/setForceStart" >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
+    --data-urlencode "hashes=$info_hash" \
+    --data-urlencode "value=true" \
+    "$(client_url torrentngd)/api/qb/v2/torrents/setSuperSeeding" >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
+    --data-urlencode "hashes=$info_hash" \
+    --data-urlencode "enable=true" \
+    "$(client_url torrentngd)/api/qb/v2/torrents/setAutoTMM" >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
+    --data-urlencode "hashes=$info_hash" \
+    --data-urlencode "enable=true" \
+    "$(client_url torrentngd)/api/qb/v2/torrents/setAutoManagement" >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
+    --data-urlencode "hashes=$info_hash" \
+    "$(client_url torrentngd)/api/qb/v2/torrents/toggleFirstLastPiecePrio" >/dev/null || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
     --data-urlencode "hashes=$info_hash" \
     "$(client_url torrentngd)/api/qb/v2/torrents/recheck" >/dev/null || status="FAIL"
@@ -1394,9 +1396,16 @@ run_qbit_mutation_facade_case() {
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/v1/torrents/$info_hash/limits" |
     jq -e '.download_limit == 1048576 and .upload_limit == 524288 and .seed_ratio_limit == null and .sequential_download == true and .first_last_piece_prio == true and .force_start == true and .super_seeding == true and .auto_tmm == true and .auto_management == true' >/dev/null || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/v1/transfer/limits" |
-    jq -e '.download_limit == 2097152 and .upload_limit == 1048576' >/dev/null || status="FAIL"
+    jq -e '.download_limit == 2097152 and .upload_limit == 1048576 and .speed_limits_mode == true' >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/qb/v2/torrents/downloadLimit?hashes=$info_hash" |
+    jq -e --arg hash "$info_hash" '.[$hash] == 1048576' >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/qb/v2/torrents/uploadLimit?hashes=$info_hash" |
+    jq -e --arg hash "$info_hash" '.[$hash] == 524288' >/dev/null || status="FAIL"
+  [[ "$(curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/qb/v2/transfer/downloadLimit" || true)" == "2097152" ]] || status="FAIL"
+  [[ "$(curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/qb/v2/transfer/uploadLimit" || true)" == "1048576" ]] || status="FAIL"
+  [[ "$(curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/qb/v2/transfer/speedLimitsMode" || true)" == "1" ]] || status="FAIL"
   append_report "- Target: torrentngd qBittorrent-compatible mutation endpoints"
-  append_report "- Checked qBit facade: filePrio, torrent setDownloadLimit/setUploadLimit, transfer setDownloadLimit/setUploadLimit, setForceStart, setSuperSeeding, setAutoTMM, setAutoManagement, toggleFirstLastPiecePrio, recheck, addTrackers, editTracker, removeTrackers, trackers, files"
+  append_report "- Checked qBit facade: filePrio, torrent setDownloadLimit/setUploadLimit, transfer setDownloadLimit/setUploadLimit/toggleSpeedLimitsMode, setForceStart, setSuperSeeding, setAutoTMM, setAutoManagement, toggleFirstLastPiecePrio, recheck, addTrackers, editTracker, removeTrackers, trackers, files"
   append_report "- Checked native REST: start, stop, update metadata, file priorities, tags, trackers, torrent limits, transfer limits, files/trackers/limits projection"
   append_report "- Fixture: multi-128m"
   append_report "- Info hash: $info_hash"

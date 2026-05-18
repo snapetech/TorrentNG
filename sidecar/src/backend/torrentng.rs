@@ -3,8 +3,11 @@ use async_trait::async_trait;
 use base64::{engine::general_purpose, Engine as _};
 use reqwest::Url;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 
-use super::{BackendCapabilities, BackendStatus, BackendType, TorrentBackend};
+use super::{
+    BackendCapabilities, BackendStatus, BackendTransferLimits, BackendType, TorrentBackend,
+};
 use crate::{
     config::TorrentngConfig,
     rtorrent::{files::RawFile, torrents::RawTorrent, trackers::RawTracker, TransferRates},
@@ -369,6 +372,14 @@ impl TorrentBackend for TorrentngBackend {
         .await
     }
 
+    async fn download_limits(&self, hashes: &[String]) -> Result<BTreeMap<String, i64>> {
+        self.torrent_limit_map(hashes, "download_limit").await
+    }
+
+    async fn upload_limits(&self, hashes: &[String]) -> Result<BTreeMap<String, i64>> {
+        self.torrent_limit_map(hashes, "upload_limit").await
+    }
+
     async fn set_global_download_limit(&self, limit: i64) -> Result<()> {
         self.put_transfer_limits(json!({ "download_limit": limit.max(0) }))
             .await
@@ -376,6 +387,32 @@ impl TorrentBackend for TorrentngBackend {
 
     async fn set_global_upload_limit(&self, limit: i64) -> Result<()> {
         self.put_transfer_limits(json!({ "upload_limit": limit.max(0) }))
+            .await
+    }
+
+    async fn global_limits(&self) -> Result<BackendTransferLimits> {
+        let limits: Value = self.get_json("api/v1/transfer/limits").await?;
+        Ok(BackendTransferLimits {
+            download_limit: limits
+                .get("download_limit")
+                .and_then(Value::as_i64)
+                .unwrap_or(0)
+                .max(0),
+            upload_limit: limits
+                .get("upload_limit")
+                .and_then(Value::as_i64)
+                .unwrap_or(0)
+                .max(0),
+            speed_limits_mode: limits
+                .get("speed_limits_mode")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        })
+    }
+
+    async fn toggle_global_speed_limits_mode(&self) -> Result<()> {
+        let limits = self.global_limits().await?;
+        self.put_transfer_limits(json!({ "speed_limits_mode": !limits.speed_limits_mode }))
             .await
     }
 
@@ -485,6 +522,28 @@ impl TorrentngBackend {
             .error_for_status()
             .context("TorrentNG PUT transfer limits")?;
         Ok(())
+    }
+
+    async fn torrent_limit_map(
+        &self,
+        hashes: &[String],
+        field: &str,
+    ) -> Result<BTreeMap<String, i64>> {
+        let mut out = BTreeMap::new();
+        for hash in hashes {
+            let limits: Value = self
+                .get_json(&format!("api/v1/torrents/{hash}/limits"))
+                .await?;
+            out.insert(
+                hash.clone(),
+                limits
+                    .get(field)
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0)
+                    .max(0),
+            );
+        }
+        Ok(out)
     }
 }
 

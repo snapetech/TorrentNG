@@ -16,6 +16,7 @@ use rt_tracker::{
     udp::{UdpAnnounceRequest, UdpAnnounceResponse, UdpConnectRequest, UdpConnectResponse},
     AnnounceRequest, AnnounceResponse, InfoHash, TrackerError, TrackerEvent,
 };
+use rt_utp::UtpStream;
 use sha1::{Digest, Sha1};
 use tokio::net::TcpStream;
 use tokio::net::UdpSocket;
@@ -36,6 +37,36 @@ const MAX_METADATA_FETCH_CONCURRENCY: usize = 8;
 const METADATA_PEER_RETRY_AFTER: Duration = Duration::from_secs(15);
 const METADATA_PEER_ATTEMPT_CACHE_MIN: usize = 256;
 const METADATA_PEER_ATTEMPT_CACHE_MULTIPLIER: usize = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataTransportPolicy {
+    TcpOnly,
+    PreferUtp,
+    UtpOnly,
+}
+
+fn metadata_outgoing_transport_policy() -> MetadataTransportPolicy {
+    if let Ok(value) = std::env::var("TNG_UTP_METADATA") {
+        return parse_metadata_transport_policy(&value);
+    }
+    if let Ok(value) = std::env::var("TNG_UTP_OUTGOING") {
+        return parse_metadata_transport_policy(&value);
+    }
+    if std::env::var_os("TNG_ENABLE_UTP_OUTGOING").is_some() {
+        return MetadataTransportPolicy::PreferUtp;
+    }
+    MetadataTransportPolicy::TcpOnly
+}
+
+fn parse_metadata_transport_policy(value: &str) -> MetadataTransportPolicy {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "prefer" | "prefer-utp" | "utp-prefer" => {
+            MetadataTransportPolicy::PreferUtp
+        }
+        "only" | "utp" | "utp-only" => MetadataTransportPolicy::UtpOnly,
+        _ => MetadataTransportPolicy::TcpOnly,
+    }
+}
 
 pub async fn run_metadata_task(
     info_hash: [u8; 20],
@@ -102,7 +133,31 @@ pub async fn run_metadata_task(
                             )
                         }
                     }},
-                    TorrentCmd::AcceptUtpPeer { .. } => {}
+                    TorrentCmd::AcceptUtpPeer {
+                        stream,
+                        peer_addr,
+                        handshake,
+                    } => if paused {
+                        drop(stream);
+                    } else {
+                        match fetch_from_incoming_utp_peer(stream, peer_addr, info_hash, handshake, resources.clone()).await {
+                            Ok(info) => {
+                                complete_metadata(&engine_tx, &info_hash_hex, &trackers, info).await;
+                                return;
+                            }
+                            Err(e) => {
+                                debug!(
+                                    component = "metadata",
+                                    operation = "fetch_incoming_utp_peer",
+                                    torrent = %info_hash_hex,
+                                    peer = %peer_addr,
+                                    result = "error",
+                                    error = %e,
+                                    "incoming uTP metadata fetch failed"
+                                )
+                            }
+                        }
+                    },
                     TorrentCmd::Shutdown => {
                         if !paused {
                             announce_trackers(
@@ -331,10 +386,31 @@ async fn metadata_fetch_attempt(
     info_hash: [u8; 20],
     resources: ResourceGovernor,
 ) -> (SocketAddr, anyhow::Result<Vec<u8>>) {
-    (
-        peer,
-        fetch_from_outgoing_peer(peer, info_hash, resources).await,
-    )
+    let result = match metadata_outgoing_transport_policy() {
+        MetadataTransportPolicy::TcpOnly => {
+            fetch_from_outgoing_peer(peer, info_hash, resources).await
+        }
+        MetadataTransportPolicy::UtpOnly => {
+            fetch_from_outgoing_utp_peer(peer, info_hash, resources).await
+        }
+        MetadataTransportPolicy::PreferUtp => {
+            match fetch_from_outgoing_utp_peer(peer, info_hash, resources.clone()).await {
+                Ok(info) => Ok(info),
+                Err(e) => {
+                    debug!(
+                        component = "metadata",
+                        operation = "fetch_outgoing_utp_peer",
+                        peer = %peer,
+                        result = "fallback",
+                        error = %e,
+                        "uTP metadata fetch failed; falling back to TCP"
+                    );
+                    fetch_from_outgoing_peer(peer, info_hash, resources).await
+                }
+            }
+        }
+    };
+    (peer, result)
 }
 
 async fn complete_metadata(
@@ -619,6 +695,46 @@ async fn fetch_from_incoming_peer(
     .await
 }
 
+async fn fetch_from_outgoing_utp_peer(
+    addr: SocketAddr,
+    info_hash: [u8; 20],
+    resources: ResourceGovernor,
+) -> anyhow::Result<Vec<u8>> {
+    let mut stream = UtpStream::connect(addr).await?;
+    write_utp_handshake(&mut stream, info_hash).await?;
+
+    let remote_hs = read_utp_handshake(&mut stream).await?;
+    if remote_hs.info_hash != info_hash {
+        anyhow::bail!("info_hash mismatch from {addr}");
+    }
+    fetch_metadata_over_io(
+        addr,
+        MetadataPeerIo::Utp(stream),
+        remote_hs.reserved.supports_extension_protocol(),
+        info_hash,
+        resources,
+    )
+    .await
+}
+
+async fn fetch_from_incoming_utp_peer(
+    mut stream: UtpStream,
+    addr: SocketAddr,
+    info_hash: [u8; 20],
+    remote_hs: Handshake,
+    resources: ResourceGovernor,
+) -> anyhow::Result<Vec<u8>> {
+    write_utp_handshake(&mut stream, info_hash).await?;
+    fetch_metadata_over_io(
+        addr,
+        MetadataPeerIo::Utp(stream),
+        remote_hs.reserved.supports_extension_protocol(),
+        info_hash,
+        resources,
+    )
+    .await
+}
+
 async fn write_handshake(
     framed: &mut Framed<TcpStream, PeerCodec>,
     info_hash: [u8; 20],
@@ -644,9 +760,42 @@ async fn read_handshake(framed: &mut Framed<TcpStream, PeerCodec>) -> anyhow::Re
     Ok(Handshake::parse(&hs_buf)?)
 }
 
+async fn write_utp_handshake(stream: &mut UtpStream, info_hash: [u8; 20]) -> anyhow::Result<()> {
+    let hs = Handshake {
+        info_hash,
+        peer_id: OUR_PEER_ID,
+        reserved: ExtensionFlags::with_extension_protocol(),
+    };
+    stream.write_all(&hs.encode()).await?;
+    Ok(())
+}
+
+async fn read_utp_handshake(stream: &mut UtpStream) -> anyhow::Result<Handshake> {
+    let mut hs_buf = [0u8; 68];
+    stream.read_exact(&mut hs_buf).await?;
+    Ok(Handshake::parse(&hs_buf)?)
+}
+
 async fn fetch_metadata(
     addr: SocketAddr,
-    mut framed: Framed<TcpStream, PeerCodec>,
+    framed: Framed<TcpStream, PeerCodec>,
+    remote_supports_extension: bool,
+    expected_info_hash: [u8; 20],
+    resources: ResourceGovernor,
+) -> anyhow::Result<Vec<u8>> {
+    fetch_metadata_over_io(
+        addr,
+        MetadataPeerIo::Tcp(framed),
+        remote_supports_extension,
+        expected_info_hash,
+        resources,
+    )
+    .await
+}
+
+async fn fetch_metadata_over_io(
+    addr: SocketAddr,
+    mut peer_io: MetadataPeerIo,
     remote_supports_extension: bool,
     expected_info_hash: [u8; 20],
     resources: ResourceGovernor,
@@ -654,7 +803,7 @@ async fn fetch_metadata(
     if !remote_supports_extension {
         anyhow::bail!("peer does not support BEP 10");
     }
-    framed
+    peer_io
         .send(Message::Extended {
             ext_id: EXT_HANDSHAKE_ID,
             payload: ExtensionHandshake::new(None)
@@ -662,15 +811,15 @@ async fn fetch_metadata(
                 .encode(),
         })
         .await?;
-    framed.send(Message::Interested).await?;
+    peer_io.send(Message::Interested).await?;
 
-    let (remote_ext_id, metadata_size) = read_remote_metadata_handshake(addr, &mut framed).await?;
+    let (remote_ext_id, metadata_size) = read_remote_metadata_handshake(addr, &mut peer_io).await?;
     let _lease = reserve_metadata_fetch_bytes(&resources, metadata_size)?;
     let piece_count = metadata_size.div_ceil(METADATA_PIECE_SIZE as u32);
     let mut pieces = BTreeMap::new();
 
     for piece in 0..piece_count {
-        framed
+        peer_io
             .send(Message::Extended {
                 ext_id: remote_ext_id,
                 payload: UtMetadataMessage::Request { piece }.encode(),
@@ -678,7 +827,7 @@ async fn fetch_metadata(
             .await?;
         match read_metadata_piece(
             addr,
-            &mut framed,
+            &mut peer_io,
             LOCAL_UT_METADATA_ID,
             piece,
             metadata_size,
@@ -700,6 +849,49 @@ async fn fetch_metadata(
     decode(&metadata).context("fetched metadata is not valid bencode")?;
     validate_metadata_info_hash(&metadata, expected_info_hash)?;
     Ok(metadata)
+}
+
+enum MetadataPeerIo {
+    Tcp(Framed<TcpStream, PeerCodec>),
+    Utp(UtpStream),
+}
+
+impl MetadataPeerIo {
+    async fn send(&mut self, msg: Message) -> anyhow::Result<()> {
+        match self {
+            MetadataPeerIo::Tcp(framed) => framed.send(msg).await.map_err(Into::into),
+            MetadataPeerIo::Utp(stream) => {
+                stream.write_all(&msg.encode()).await?;
+                Ok(())
+            }
+        }
+    }
+
+    async fn next(&mut self) -> anyhow::Result<Option<Message>> {
+        match self {
+            MetadataPeerIo::Tcp(framed) => match framed.next().await {
+                Some(result) => result.map(Some).map_err(Into::into),
+                None => Ok(None),
+            },
+            MetadataPeerIo::Utp(stream) => {
+                let mut len_buf = [0u8; 4];
+                match stream.read_exact(&mut len_buf).await {
+                    Ok(()) => {}
+                    Err(rt_utp::UtpError::Closed) => return Ok(None),
+                    Err(err) => return Err(err.into()),
+                }
+                let len = u32::from_be_bytes(len_buf);
+                if len > rt_peer_wire::message::MAX_MESSAGE_LEN {
+                    anyhow::bail!("peer message too large: {len}");
+                }
+                let mut payload = vec![0u8; len as usize];
+                if len > 0 {
+                    stream.read_exact(&mut payload).await?;
+                }
+                Ok(Some(Message::parse(&payload)?))
+            }
+        }
+    }
 }
 
 fn reserve_metadata_fetch_bytes(
@@ -731,12 +923,12 @@ fn validate_metadata_info_hash(
 
 async fn read_remote_metadata_handshake(
     addr: SocketAddr,
-    framed: &mut Framed<TcpStream, PeerCodec>,
+    peer_io: &mut MetadataPeerIo,
 ) -> anyhow::Result<(u8, u32)> {
     loop {
-        let msg = tokio::time::timeout(Duration::from_secs(15), framed.next())
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("peer closed before extension handshake"))??;
+        let msg = tokio::time::timeout(Duration::from_secs(15), peer_io.next())
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("peer closed before extension handshake"))?;
         if let Message::Extended {
             ext_id: EXT_HANDSHAKE_ID,
             payload,
@@ -759,15 +951,15 @@ async fn read_remote_metadata_handshake(
 
 async fn read_metadata_piece(
     _addr: SocketAddr,
-    framed: &mut Framed<TcpStream, PeerCodec>,
+    peer_io: &mut MetadataPeerIo,
     local_ext_id: u8,
     expected_piece: u32,
     expected_total_size: u32,
 ) -> anyhow::Result<Option<Vec<u8>>> {
     loop {
-        let msg = tokio::time::timeout(Duration::from_secs(15), framed.next())
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("peer closed during metadata transfer"))??;
+        let msg = tokio::time::timeout(Duration::from_secs(15), peer_io.next())
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("peer closed during metadata transfer"))?;
         let Message::Extended { ext_id, payload } = msg else {
             continue;
         };
@@ -1059,5 +1251,21 @@ mod tests {
             other => panic!("unexpected engine command: {other:?}"),
         }
         peer.await.unwrap();
+    }
+
+    #[test]
+    fn parses_metadata_transport_policy() {
+        assert_eq!(
+            parse_metadata_transport_policy("prefer"),
+            MetadataTransportPolicy::PreferUtp
+        );
+        assert_eq!(
+            parse_metadata_transport_policy("utp-only"),
+            MetadataTransportPolicy::UtpOnly
+        );
+        assert_eq!(
+            parse_metadata_transport_policy("off"),
+            MetadataTransportPolicy::TcpOnly
+        );
     }
 }

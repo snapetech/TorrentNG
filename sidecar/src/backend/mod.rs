@@ -1,6 +1,7 @@
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 use crate::rtorrent::files::RawFile;
 use crate::rtorrent::torrents::{LiveSummary, RawTorrent};
@@ -68,6 +69,13 @@ pub struct BackendCapabilities {
     pub supports_runtime_user_agent: bool,
     pub supports_config_overlay: bool,
     pub supports_restart: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct BackendTransferLimits {
+    pub download_limit: i64,
+    pub upload_limit: i64,
+    pub speed_limits_mode: bool,
 }
 
 #[async_trait]
@@ -154,6 +162,20 @@ pub trait TorrentBackend: Send + Sync {
         )
     }
 
+    async fn download_limits(&self, _hashes: &[String]) -> Result<BTreeMap<String, i64>> {
+        bail!(
+            "{} backend does not support per-torrent download limit reads",
+            self.backend_type().as_str()
+        )
+    }
+
+    async fn upload_limits(&self, _hashes: &[String]) -> Result<BTreeMap<String, i64>> {
+        bail!(
+            "{} backend does not support per-torrent upload limit reads",
+            self.backend_type().as_str()
+        )
+    }
+
     async fn set_global_download_limit(&self, _limit: i64) -> Result<()> {
         bail!(
             "{} backend does not support global download limits",
@@ -161,9 +183,23 @@ pub trait TorrentBackend: Send + Sync {
         )
     }
 
+    async fn global_limits(&self) -> Result<BackendTransferLimits> {
+        bail!(
+            "{} backend does not support global transfer limit reads",
+            self.backend_type().as_str()
+        )
+    }
+
     async fn set_global_upload_limit(&self, _limit: i64) -> Result<()> {
         bail!(
             "{} backend does not support global upload limits",
+            self.backend_type().as_str()
+        )
+    }
+
+    async fn toggle_global_speed_limits_mode(&self) -> Result<()> {
+        bail!(
+            "{} backend does not support global speed-limit mode toggles",
             self.backend_type().as_str()
         )
     }

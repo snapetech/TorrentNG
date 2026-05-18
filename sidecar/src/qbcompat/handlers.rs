@@ -67,9 +67,9 @@ pub fn build_router(_state: AppState) -> Router<AppState> {
         .route("/torrents/rename", post(torrents_rename))
         .route("/torrents/renameFile", post(torrents_rename_file))
         .route("/torrents/renameFolder", post(torrents_rename_file))
-        .route("/torrents/downloadLimit", get(empty_object))
+        .route("/torrents/downloadLimit", get(torrents_download_limit))
         .route("/torrents/setDownloadLimit", post(torrents_set_download_limit))
-        .route("/torrents/uploadLimit", get(empty_object))
+        .route("/torrents/uploadLimit", get(torrents_upload_limit))
         .route("/torrents/setUploadLimit", post(torrents_set_upload_limit))
         .route("/torrents/setShareLimits", post(torrents_set_share_limits))
         .route("/torrents/setLocation", post(torrents_set_location))
@@ -96,11 +96,14 @@ pub fn build_router(_state: AppState) -> Router<AppState> {
         // Sync / transfer
         .route("/sync/maindata", get(sync_maindata))
         .route("/transfer/info", get(transfer_info))
-        .route("/transfer/speedLimitsMode", get(zero_text))
-        .route("/transfer/toggleSpeedLimitsMode", post(ok_form))
-        .route("/transfer/downloadLimit", get(zero_text))
+        .route("/transfer/speedLimitsMode", get(transfer_speed_limits_mode))
+        .route(
+            "/transfer/toggleSpeedLimitsMode",
+            post(transfer_toggle_speed_limits_mode),
+        )
+        .route("/transfer/downloadLimit", get(transfer_download_limit))
         .route("/transfer/setDownloadLimit", post(transfer_set_download_limit))
-        .route("/transfer/uploadLimit", get(zero_text))
+        .route("/transfer/uploadLimit", get(transfer_upload_limit))
         .route("/transfer/setUploadLimit", post(transfer_set_upload_limit))
         .route("/transfer/banPeers", post(ok_form))
         .route("/log/main", get(log_main))
@@ -188,10 +191,6 @@ async fn empty_array() -> Json<serde_json::Value> {
 
 async fn empty_object() -> Json<serde_json::Value> {
     Json(json!({}))
-}
-
-async fn zero_text() -> &'static str {
-    "0"
 }
 
 #[derive(Debug, Deserialize)]
@@ -1672,6 +1671,35 @@ struct SpeedLimitForm {
     limit: Option<i64>,
 }
 
+#[derive(Deserialize)]
+struct HashesQuery {
+    hashes: Option<String>,
+}
+
+async fn torrents_download_limit(
+    State(s): State<AppState>,
+    Query(q): Query<HashesQuery>,
+) -> impl IntoResponse {
+    torrents_limit_map(s, q.hashes.as_deref(), true).await
+}
+
+async fn torrents_upload_limit(
+    State(s): State<AppState>,
+    Query(q): Query<HashesQuery>,
+) -> impl IntoResponse {
+    torrents_limit_map(s, q.hashes.as_deref(), false).await
+}
+
+async fn torrents_limit_map(s: AppState, hashes: Option<&str>, download: bool) -> impl IntoResponse {
+    let hashes = split_hashes(&s.db, hashes);
+    let result = if download {
+        s.backend.download_limits(&hashes).await
+    } else {
+        s.backend.upload_limits(&hashes).await
+    };
+    Json(result.unwrap_or_default())
+}
+
 async fn torrents_set_download_limit(
     State(s): State<AppState>,
     Form(f): Form<SpeedLimitForm>,
@@ -1753,6 +1781,42 @@ async fn transfer_set_speed_limit(s: AppState, limit: i64, download: bool) -> St
         );
     }
     StatusCode::OK
+}
+
+async fn transfer_toggle_speed_limits_mode(State(s): State<AppState>) -> StatusCode {
+    if let Err(e) = s.backend.toggle_global_speed_limits_mode().await {
+        tracing::warn!(
+            component = "qbcompat",
+            operation = "toggle_global_speed_limits_mode",
+            result = "error",
+            error = %e,
+            "qBit global speed-limit mode toggle failed"
+        );
+    }
+    StatusCode::OK
+}
+
+async fn transfer_speed_limits_mode(State(s): State<AppState>) -> impl IntoResponse {
+    match s.backend.global_limits().await {
+        Ok(limits) if limits.speed_limits_mode => "1".to_owned(),
+        Ok(_) | Err(_) => "0".to_owned(),
+    }
+}
+
+async fn transfer_download_limit(State(s): State<AppState>) -> impl IntoResponse {
+    s.backend
+        .global_limits()
+        .await
+        .map(|limits| limits.download_limit.max(0).to_string())
+        .unwrap_or_else(|_| "0".to_owned())
+}
+
+async fn transfer_upload_limit(State(s): State<AppState>) -> impl IntoResponse {
+    s.backend
+        .global_limits()
+        .await
+        .map(|limits| limits.upload_limit.max(0).to_string())
+        .unwrap_or_else(|_| "0".to_owned())
 }
 
 async fn torrents_set_share_limits(
