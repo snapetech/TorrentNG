@@ -99,8 +99,8 @@ else
   mark "migration corpus manifest" "WARN" "manifest.toml missing; copy manifest.example.toml and record artifact provenance"
 fi
 
-if pgrep -af 'soak_certification.sh' | grep -q 'soak-24h-'; then
-  mark "24h soak active" "PASS" "$(pgrep -af 'soak_certification.sh' | grep 'soak-24h-' | head -1)"
+if pgrep -af '[s]oak_certification.sh' | grep -q 'soak-24h-'; then
+  mark "24h soak active" "PASS" "$(pgrep -af '[s]oak_certification.sh' | grep 'soak-24h-' | head -1)"
 else
   mark "24h soak active" "WARN" "no active soak-24h run detected; use scripts/start_24h_soak.sh"
 fi

@@ -51,7 +51,7 @@ row_24h_soak() {
   if [[ -n "$file" && -f "$file" ]]; then
     sample="$(basename "$file")"
     if [[ "$status" == "RUNNING/UNKNOWN" ]]; then
-      active="$(pgrep -af 'soak_certification.sh' | grep -F "$sample" || true)"
+      active="$(pgrep -af '[s]oak_certification.sh' | grep -F "$sample" || true)"
       if [[ -n "$active" ]]; then
         status="RUNNING"
       else
@@ -157,4 +157,4 @@ row "Certification JSON status" 'certification-status-*.md'
 echo
 echo "## Active Long-Running Jobs"
 echo
-pgrep -af 'soak_certification.sh' || true
+pgrep -af '[s]oak_certification.sh' || true

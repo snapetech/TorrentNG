@@ -31,7 +31,7 @@ min_torrents="$(awk -F'|' '/^\| 20[0-9][0-9]-/ {gsub(/ /, "", $4); if (min == ""
 max_rss="$(awk -F'|' '/^\| 20[0-9][0-9]-/ {gsub(/ /, "", $5); if ($5+0 > max) max=$5+0} END {printf "%.1f", max}' "$REPORT")"
 bad_health="$(awk -F'|' '/^\| 20[0-9][0-9]-/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $3); if ($3 != "200") bad++} END {print bad+0}' "$REPORT")"
 bad_sync="$(awk -F'|' '/^\| 20[0-9][0-9]-/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $6); if ($6 != "200") bad++} END {print bad+0}' "$REPORT")"
-active="$(pgrep -af 'soak_certification.sh' | grep -F "$(basename "$REPORT")" || true)"
+active="$(pgrep -af '[s]oak_certification.sh' | grep -F "$(basename "$REPORT")" || true)"
 
 elapsed="unknown"
 remaining="unknown"

@@ -37,7 +37,7 @@ latest() {
 }
 
 active_long_soak() {
-  pgrep -af 'soak_certification.sh' | grep -q 'soak-24h-' 2>/dev/null
+  pgrep -af '[s]oak_certification.sh' | grep -q 'soak-24h-' 2>/dev/null
 }
 
 mapped_port() {

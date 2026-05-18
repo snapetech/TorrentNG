@@ -123,7 +123,7 @@ if [[ -n "$SOAK_REPORT" && -f "$SOAK_REPORT" ]]; then
   bad_health="$(awk -F'|' '/^\| 20[0-9][0-9]-/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $3); if ($3 != "200") bad++} END {print bad+0}' "$SOAK_REPORT")"
   bad_sync="$(awk -F'|' '/^\| 20[0-9][0-9]-/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $6); if ($6 != "200") bad++} END {print bad+0}' "$SOAK_REPORT")"
   soak_status="$(overall "$SOAK_REPORT")"
-  active="$(pgrep -af 'soak_certification.sh' | tr '\n' '; ' || true)"
+  active="$(pgrep -af '[s]oak_certification.sh' | tr '\n' '; ' || true)"
 
   mark "source report" "$([[ "$soak_status" == "PASS" ]] && echo PASS || echo RUNNING)" "$(basename "$SOAK_REPORT") status=$soak_status"
   mark "active process" "$([[ -n "$active" ]] && echo RUNNING || echo INFO)" "${active:-not currently running}"

@@ -12,9 +12,9 @@ DRY_RUN="${TNG_24H_SOAK_DRY_RUN:-0}"
 
 mkdir -p "$REPORT_DIR" "$RUN_DIR"
 
-if pgrep -af 'soak_certification.sh' | grep -q 'soak-24h-'; then
+if pgrep -af '[s]oak_certification.sh' | grep -q 'soak-24h-'; then
   echo "24h soak already appears to be running:" >&2
-  pgrep -af 'soak_certification.sh' | grep 'soak-24h-' >&2
+  pgrep -af '[s]oak_certification.sh' | grep 'soak-24h-' >&2
   exit 1
 fi
 
