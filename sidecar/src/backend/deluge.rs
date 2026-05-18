@@ -343,18 +343,41 @@ impl TorrentBackend for DelugeBackend {
         ratio_limit_milli: i64,
         seeding_time_limit: i64,
     ) -> Result<()> {
-        if seeding_time_limit >= 0 {
-            bail!("Deluge per-torrent seeding time limits are not supported by this adapter");
-        }
-        if ratio_limit_milli >= 0 {
+        let options = deluge_share_options(ratio_limit_milli, seeding_time_limit);
+        if !options.is_empty() {
             self.rpc(
                 "core.set_torrent_options",
-                json!([[hash], { "stop_at_ratio": true, "stop_ratio": ratio_limit_milli as f64 / 1000.0 }]),
+                json!([[hash], Value::Object(options)]),
             )
             .await?;
         }
         Ok(())
     }
+}
+
+fn deluge_share_options(
+    ratio_limit_milli: i64,
+    seeding_time_limit: i64,
+) -> serde_json::Map<String, Value> {
+    let mut options = serde_json::Map::new();
+    if ratio_limit_milli >= 0 {
+        options.insert("stop_at_ratio".to_owned(), json!(true));
+        options.insert(
+            "stop_ratio".to_owned(),
+            json!(ratio_limit_milli as f64 / 1000.0),
+        );
+    } else if ratio_limit_milli == -1 {
+        options.insert("stop_at_ratio".to_owned(), json!(false));
+    }
+
+    if seeding_time_limit >= 0 {
+        options.insert("seed_time_limit".to_owned(), json!(seeding_time_limit));
+        options.insert("max_seed_time".to_owned(), json!(seeding_time_limit));
+    } else if seeding_time_limit == -1 {
+        options.insert("seed_time_limit".to_owned(), json!(-1));
+        options.insert("max_seed_time".to_owned(), json!(-1));
+    }
+    options
 }
 
 impl DelugeBackend {
@@ -451,4 +474,28 @@ fn int(value: &Value, key: &str) -> i64 {
                 .map(|value| value as i64)
         })
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deluge_share_options_map_ratio_and_seed_time_limits() {
+        let options = deluge_share_options(1250, 1440);
+
+        assert_eq!(options["stop_at_ratio"], true);
+        assert_eq!(options["stop_ratio"], 1.25);
+        assert_eq!(options["seed_time_limit"], 1440);
+        assert_eq!(options["max_seed_time"], 1440);
+    }
+
+    #[test]
+    fn deluge_share_options_disable_ratio_and_seed_time() {
+        let options = deluge_share_options(-1, -1);
+
+        assert_eq!(options["stop_at_ratio"], false);
+        assert_eq!(options["seed_time_limit"], -1);
+        assert_eq!(options["max_seed_time"], -1);
+    }
 }
