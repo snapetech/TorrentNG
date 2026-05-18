@@ -52,6 +52,10 @@ manifest. Existing readiness fields remain stable (`status`, `ready`,
 advertises rewrite-level support for v1/v2/hybrid identity, `btih`/`btmh`
 magnets, durable session/job state, storage safety, DHT/uTP policy, native REST,
 qBittorrent, Transmission, Deluge, migration, metrics, and diagnostics.
+The uTP section distinguishes implementation capability from active runtime
+paths through `utp_transport_paths`, which can include `outgoing_peer_wire`,
+`metadata_fetch`, and `incoming_peer_wire` depending on the current
+`TNG_UTP_*` environment policy.
 
 Sidecar `/api/v1/engine` also exposes the selected backend adapter and its
 capabilities. Adapter capability flags cover tags, categories, file priority,

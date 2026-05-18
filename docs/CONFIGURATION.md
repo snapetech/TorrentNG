@@ -46,9 +46,11 @@ without changing durable config. By default, `TNG_UTP_OUTGOING=auto` attempts
 uTP first for DHT, PEX, and manually added peers while tracker-discovered peers
 stay on TCP. `TNG_UTP_OUTGOING=prefer|only` broadens outbound uTP peer-wire
 dialing (`prefer` falls back to TCP, `only` does not), and
-`TNG_UTP_OUTGOING=tcp-only` disables outbound uTP. `TNG_UTP_INCOMING=1` binds
-the shared UDP incoming uTP endpoint on `listen_port`, and
-`TNG_UTP_METADATA=prefer|only` enables uTP magnet metadata fetch explicitly.
+`TNG_UTP_OUTGOING=tcp-only` disables outbound uTP. `TNG_UTP_INCOMING=1`
+binds the shared UDP incoming uTP endpoint on `listen_port`; the incoming
+listener flag is boolean only (`1`, `true`, `yes`, or `on`) and does not accept
+policy words such as `prefer` or `utp-only`. `TNG_UTP_METADATA=prefer|only`
+enables uTP magnet metadata fetch explicitly.
 
 ### `[storage]`
 

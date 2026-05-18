@@ -6532,6 +6532,18 @@ mod tests {
             .iter()
             .any(|reason| reason.contains("no persisted trackers")));
     }
+
+    #[test]
+    fn incoming_utp_listener_flag_is_boolean_only() {
+        for enabled in ["1", "true", "yes", "on"] {
+            assert!(parse_incoming_utp_enabled(enabled), "{enabled}");
+        }
+        for disabled in [
+            "0", "false", "no", "off", "tcp-only", "prefer", "utp", "utp-only",
+        ] {
+            assert!(!parse_incoming_utp_enabled(disabled), "{disabled}");
+        }
+    }
 }
 
 /// Handle an incoming TCP peer connection: read the handshake's info_hash and
@@ -6603,10 +6615,14 @@ async fn handle_incoming_utp(
 
 fn incoming_utp_enabled() -> bool {
     match std::env::var("TNG_UTP_INCOMING") {
-        Ok(value) => matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        ),
+        Ok(value) => parse_incoming_utp_enabled(&value),
         Err(_) => false,
     }
+}
+
+fn parse_incoming_utp_enabled(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }

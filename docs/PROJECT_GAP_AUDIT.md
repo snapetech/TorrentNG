@@ -22,6 +22,10 @@ compatibility depth:
   corpora remains optional release-depth evidence for undocumented variants;
 - facade compatibility still has placeholder-depth areas for live
   peer/tracker/webseed details and some client-specific plugin APIs;
+- uTP is implemented at the application transport layer for outbound
+  peer-wire, incoming peer-wire when explicitly enabled, and magnet metadata
+  fetch; remaining uTP work is public/live interop evidence and operational
+  tuning rather than a hidden packet-codec-only implementation gap;
 - the security release checklist is intentionally unchecked until run against
   the exact deployment config;
 - the 24h soak status row is explicitly `STALE/INCOMPLETE` when the latest
@@ -195,6 +199,11 @@ Remaining compatibility gaps:
 - DHT-only magnets: DHT `get_peers` forwarding and trackerless BEP 9 metadata
   completion from discovered peers are unit-covered in `rt-engine`; the
   remaining row is Docker-level trackerless transfer certification.
+- uTP: `rt-utp` provides the packet/state/UDP stream layer, and the native
+  engine has policy-gated outbound peer-wire, boolean-gated incoming peer-wire,
+  and metadata-fetch paths. `/health` reports the active `utp_transport_paths`
+  so operators can distinguish enabled runtime paths from crate capability.
+  Remaining depth is public-swarm interop, dashboards, and deployment tuning.
 - `scripts/migration_corpus_certification.sh` now separates synthetic
   import/apply coverage from fixture artifact coverage. It runs `rt-migrate`
   tests and scans `testdata/migration-corpus/{qbittorrent,transmission,deluge,

@@ -1762,9 +1762,19 @@ fn native_engine_capabilities() -> serde_json::Value {
     let utp_metadata_enabled = utp_policy_allows_peer_wire(&utp_metadata_policy);
     let utp_incoming_enabled = std::env::var("TNG_UTP_INCOMING")
         .ok()
-        .map(|value| utp_env_enabled(&value))
+        .map(|value| utp_incoming_env_enabled(&value))
         .unwrap_or(false);
     let utp_transport = utp_outgoing_enabled || utp_metadata_enabled || utp_incoming_enabled;
+    let mut utp_transport_paths = Vec::new();
+    if utp_outgoing_enabled {
+        utp_transport_paths.push("outgoing_peer_wire");
+    }
+    if utp_metadata_enabled {
+        utp_transport_paths.push("metadata_fetch");
+    }
+    if utp_incoming_enabled {
+        utp_transport_paths.push("incoming_peer_wire");
+    }
 
     serde_json::json!({
         "torrent_identity": {
@@ -1818,6 +1828,7 @@ fn native_engine_capabilities() -> serde_json::Value {
             "utp_metadata_enabled": utp_metadata_enabled,
             "utp_incoming_enabled": utp_incoming_enabled,
             "utp_transport": utp_transport,
+            "utp_transport_paths": utp_transport_paths,
             "private_torrent_dht_pex_lsd_default_off": true,
         },
         "compatibility": {
@@ -1851,18 +1862,10 @@ fn utp_policy_allows_peer_wire(value: &str) -> bool {
     )
 }
 
-fn utp_env_enabled(value: &str) -> bool {
+fn utp_incoming_env_enabled(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
-        "1" | "true"
-            | "yes"
-            | "on"
-            | "prefer"
-            | "prefer-utp"
-            | "utp-prefer"
-            | "only"
-            | "utp"
-            | "utp-only"
+        "1" | "true" | "yes" | "on"
     )
 }
 
@@ -3887,6 +3890,10 @@ mod tests {
         assert_eq!(capabilities["networking"]["utp_metadata_policy"], "off");
         assert_eq!(capabilities["networking"]["utp_metadata_enabled"], false);
         assert_eq!(capabilities["networking"]["utp_transport"], true);
+        assert_eq!(
+            capabilities["networking"]["utp_transport_paths"][0],
+            "outgoing_peer_wire"
+        );
         assert_eq!(capabilities["compatibility"]["qbittorrent_v2"], true);
         assert_eq!(capabilities["migration"]["transmission"], true);
         assert_eq!(capabilities["operations"]["prometheus_metrics"], true);
@@ -3912,9 +3919,11 @@ mod tests {
         for disabled in ["0", "false", "no", "off", "tcp", "tcp-only"] {
             assert!(!utp_policy_allows_peer_wire(disabled), "{disabled}");
         }
-        assert!(utp_env_enabled("on"));
-        assert!(utp_env_enabled("utp-only"));
-        assert!(!utp_env_enabled("tcp-only"));
+        assert!(utp_incoming_env_enabled("on"));
+        assert!(utp_incoming_env_enabled("1"));
+        assert!(!utp_incoming_env_enabled("utp-only"));
+        assert!(!utp_incoming_env_enabled("prefer"));
+        assert!(!utp_incoming_env_enabled("tcp-only"));
     }
 
     #[tokio::test]

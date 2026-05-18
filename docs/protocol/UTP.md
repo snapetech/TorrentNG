@@ -131,7 +131,11 @@ The native health capability surface also reports:
   `TNG_UTP_OUTGOING`, legacy `prefer`, or `off`.
 - `networking.utp_metadata_enabled`: whether metadata fetch can attempt uTP.
 - `networking.utp_incoming_enabled`: whether `TNG_UTP_INCOMING` is currently
-  enabled for the engine process.
+  enabled for the engine process. This is a boolean listener switch; use
+  `1`, `true`, `yes`, or `on`.
+- `networking.utp_transport_paths`: the runtime paths that can currently use
+  uTP, drawn from `outgoing_peer_wire`, `metadata_fetch`, and
+  `incoming_peer_wire`.
 
 ## Engine Integration Progress
 
