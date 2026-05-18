@@ -526,6 +526,22 @@ impl TorrentBackend for TorrentngBackend {
         Ok(())
     }
 
+    async fn ban_peers(&self, peers: &[SocketAddr]) -> Result<()> {
+        let peers = peers
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("|");
+        self.request(reqwest::Method::POST, "api/qb/v2/transfer/banPeers")?
+            .form(&[("peers", peers)])
+            .send()
+            .await
+            .context("TorrentNG POST qBit banPeers")?
+            .error_for_status()
+            .context("TorrentNG POST qBit banPeers")?;
+        Ok(())
+    }
+
     async fn add_tags(&self, hash: &str, tags: &[&str]) -> Result<()> {
         self.patch_json(
             &format!("api/v1/torrents/{hash}/tags"),

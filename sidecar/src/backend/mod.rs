@@ -287,6 +287,14 @@ pub trait TorrentBackend: Send + Sync {
             self.backend_type().as_str()
         )
     }
+
+    async fn ban_peers(&self, _peers: &[SocketAddr]) -> Result<()> {
+        bail!(
+            "{} backend does not support peer bans",
+            self.backend_type().as_str()
+        )
+    }
+
     async fn add_tags(&self, _hash: &str, _tags: &[&str]) -> Result<()> {
         Ok(())
     }

@@ -111,7 +111,7 @@ pub fn build_router(_state: AppState) -> Router<AppState> {
         .route("/transfer/setDownloadLimit", post(transfer_set_download_limit))
         .route("/transfer/uploadLimit", get(transfer_upload_limit))
         .route("/transfer/setUploadLimit", post(transfer_set_upload_limit))
-        .route("/transfer/banPeers", post(ok_form))
+        .route("/transfer/banPeers", post(transfer_ban_peers))
         .route("/log/main", get(log_main))
         .route("/log/peers", get(log_peers))
         .route("/search/status", get(search_status))
@@ -185,10 +185,6 @@ async fn auth_logout() -> impl IntoResponse {
         ]),
         StatusCode::OK,
     )
-}
-
-async fn ok_form(Form(_f): Form<HashMap<String, String>>) -> StatusCode {
-    StatusCode::OK
 }
 
 #[derive(Debug, Deserialize)]
@@ -2241,6 +2237,29 @@ async fn transfer_set_upload_limit(
     Form(f): Form<SpeedLimitForm>,
 ) -> StatusCode {
     transfer_set_speed_limit(s, f.limit.unwrap_or(0), false).await
+}
+
+async fn transfer_ban_peers(
+    State(s): State<AppState>,
+    Form(f): Form<HashMap<String, String>>,
+) -> StatusCode {
+    let peers = f
+        .get("peers")
+        .map(|raw| parse_peer_addrs(raw))
+        .unwrap_or_default();
+    if peers.is_empty() {
+        return StatusCode::OK;
+    }
+    if let Err(e) = s.backend.ban_peers(&peers).await {
+        tracing::warn!(
+            component = "qbcompat",
+            operation = "ban_peers",
+            result = "unsupported",
+            error = %e,
+            "qBit peer ban not supported by backend"
+        );
+    }
+    StatusCode::OK
 }
 
 async fn transfer_set_speed_limit(s: AppState, limit: i64, download: bool) -> StatusCode {

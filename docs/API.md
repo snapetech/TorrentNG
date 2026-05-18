@@ -365,7 +365,7 @@ Implements the qBittorrent Web API v2. By default it advertises qBittorrent `5.0
 | `POST` | `/api/qb/v2/transfer/setDownloadLimit` |
 | `GET` | `/api/qb/v2/transfer/uploadLimit` |
 | `POST` | `/api/qb/v2/transfer/setUploadLimit` |
-| `POST` | `/api/qb/v2/transfer/banPeers` |
+| `POST` | `/api/qb/v2/transfer/banPeers` | Backend-backed where supported; qB-compatible OK otherwise |
 
 ### Log / Search / RSS
 

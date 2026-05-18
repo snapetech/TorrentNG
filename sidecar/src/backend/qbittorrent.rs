@@ -574,6 +574,16 @@ impl TorrentBackend for QbittorrentBackend {
         self.post_form(path, &[("hashes", &hashes)]).await
     }
 
+    async fn ban_peers(&self, peers: &[SocketAddr]) -> Result<()> {
+        let peers = peers
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("|");
+        self.post_form("api/v2/transfer/banPeers", &[("peers", &peers)])
+            .await
+    }
+
     async fn add_tags(&self, hash: &str, tags: &[&str]) -> Result<()> {
         self.post_form(
             "api/v2/torrents/addTags",
