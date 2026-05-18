@@ -17,10 +17,10 @@ use tokio::{process::Command, time::sleep};
 
 use super::server::AppState;
 use super::ws::Event;
+use crate::backend::{BackendHealth, BackendStatus};
 use crate::cache::{
     AppEventRow, Category, ListParams, RatioGroup, RssRule, SavedView, WorkflowRule, WorkflowRun,
 };
-use crate::backend::{BackendHealth, BackendStatus};
 use crate::rtorrent::{engine::ProbeValue, XmlValue};
 
 // --- Health ---

@@ -124,7 +124,9 @@ pub fn session_totals() -> SessionTotals {
     }
 }
 
-pub fn current_rates(backend: Arc<dyn TorrentBackend>) -> impl std::future::Future<Output = TransferRates> {
+pub fn current_rates(
+    backend: Arc<dyn TorrentBackend>,
+) -> impl std::future::Future<Output = TransferRates> {
     async move {
         if let Some(path) = live_speeds_file() {
             if let Some(rates) = read_live_speeds(&path) {
@@ -152,7 +154,9 @@ async fn probe_transfer_rates(backend: &dyn TorrentBackend) -> TransferRates {
     }
 }
 
-async fn probe_transfer_rates_result(backend: &dyn TorrentBackend) -> anyhow::Result<TransferRates> {
+async fn probe_transfer_rates_result(
+    backend: &dyn TorrentBackend,
+) -> anyhow::Result<TransferRates> {
     match tokio::time::timeout(PROBE_TIMEOUT, backend.transfer_rates()).await {
         Ok(Ok(rates)) => Ok(rates),
         Ok(Err(e)) => Err(e),

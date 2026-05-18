@@ -1177,7 +1177,14 @@ impl Engine {
                 let _ = reply.send(result);
             }
             EngineCmd::UpdateGlobalLimits { limits, reply } => {
-                let result = self.update_global_limits_inner(limits);
+                let result = self.update_global_limits_inner(limits.clone());
+                if result.is_ok() {
+                    for tx in self.torrent_chans.values() {
+                        let _ = tx
+                            .send(TorrentCmd::UpdateGlobalLimits(limits.clone()))
+                            .await;
+                    }
+                }
                 let _ = reply.send(result);
             }
             EngineCmd::GetQueuePriority { info_hash, reply } => {

@@ -204,7 +204,10 @@ async fn tick_bounded(
     let mut counts = SyncCounts::default();
     let mut touched = HashSet::new();
 
-    match backend.live_summary("main", MULTICALL_RANGE_PAGE_SIZE).await {
+    match backend
+        .live_summary("main", MULTICALL_RANGE_PAGE_SIZE)
+        .await
+    {
         Ok(summary) => {
             write_live_speeds(summary.rates.download, summary.rates.upload);
             for t in &summary.moving {

@@ -2,7 +2,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::Serialize;
 
+use crate::rtorrent::files::RawFile;
 use crate::rtorrent::torrents::{LiveSummary, RawTorrent};
+use crate::rtorrent::trackers::RawTracker;
 use crate::rtorrent::TransferRates;
 
 pub mod qbittorrent;
@@ -73,6 +75,32 @@ pub trait TorrentBackend: Send + Sync {
     async fn health(&self) -> BackendStatus;
     async fn transfer_rates(&self) -> Result<TransferRates>;
     async fn list_torrents(&self) -> Result<Vec<RawTorrent>>;
+    async fn add_magnet(
+        &self,
+        magnet: &str,
+        save_path: &str,
+        category: &str,
+        start: bool,
+    ) -> Result<()>;
+    async fn add_torrent(
+        &self,
+        data: &[u8],
+        save_path: &str,
+        category: &str,
+        start: bool,
+    ) -> Result<()>;
+    async fn remove(&self, hash: &str, delete_data: bool) -> Result<()>;
+    async fn start(&self, hash: &str) -> Result<()>;
+    async fn stop(&self, hash: &str) -> Result<()>;
+    async fn recheck(&self, hash: &str) -> Result<()>;
+    async fn reannounce(&self, hash: &str) -> Result<()>;
+    async fn list_trackers(&self, hash: &str) -> Result<Vec<RawTracker>>;
+    async fn add_tracker(&self, hash: &str, url: &str) -> Result<()>;
+    async fn edit_tracker(&self, hash: &str, original_url: &str, new_url: &str) -> Result<()>;
+    async fn remove_tracker(&self, hash: &str, url: &str) -> Result<()>;
+    async fn list_files(&self, hash: &str) -> Result<Vec<RawFile>>;
+    async fn set_file_priority(&self, hash: &str, file_index: usize, priority: i64) -> Result<()>;
+    async fn set_category(&self, hash: &str, category: &str) -> Result<()>;
 
     async fn has_bounded_sync(&self) -> bool {
         false

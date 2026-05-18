@@ -8,8 +8,8 @@ use api::{
     server::{build_router, AppState},
     ws::Event,
 };
-use cache::{AppEventRow, Db};
 use backend::TorrentBackend;
+use cache::{AppEventRow, Db};
 use config::{BackendKind, Config};
 use metrics::Metrics;
 use rtorrent::Client;
@@ -117,7 +117,14 @@ async fn main() -> Result<()> {
         let tx2 = tx.clone();
         let retention = cfg.logging.event_retention;
         tokio::spawn(async move {
-            stats::run(backend2, db2, tx2, std::time::Duration::from_secs(2), retention).await;
+            stats::run(
+                backend2,
+                db2,
+                tx2,
+                std::time::Duration::from_secs(2),
+                retention,
+            )
+            .await;
         });
     }
 

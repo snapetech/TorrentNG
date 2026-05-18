@@ -5,10 +5,7 @@ use reqwest::Url;
 use super::{BackendCapabilities, BackendStatus, BackendType, TorrentBackend};
 use crate::{
     config::QbittorrentConfig,
-    rtorrent::{
-        torrents::RawTorrent,
-        TransferRates,
-    },
+    rtorrent::{files::RawFile, torrents::RawTorrent, trackers::RawTracker, TransferRates},
 };
 
 pub struct QbittorrentBackend {
@@ -78,6 +75,19 @@ impl QbittorrentBackend {
             .await
             .with_context(|| format!("decode qBittorrent GET {path}"))?)
     }
+
+    async fn post_form(&self, path: &str, form: &[(&str, &str)]) -> Result<()> {
+        self.ensure_login().await?;
+        self.client
+            .post(self.url(path)?)
+            .form(form)
+            .send()
+            .await
+            .with_context(|| format!("qBittorrent POST {path}"))?
+            .error_for_status()
+            .with_context(|| format!("qBittorrent POST {path}"))?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -109,6 +119,24 @@ struct QbitTransferInfo {
     up_info_speed: Option<i64>,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct QbitTracker {
+    url: String,
+    status: Option<i64>,
+    msg: Option<String>,
+    num_seeds: Option<i64>,
+    num_leeches: Option<i64>,
+    num_downloaded: Option<i64>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct QbitFile {
+    name: String,
+    size: i64,
+    progress: f64,
+    priority: i64,
+}
+
 #[async_trait]
 impl TorrentBackend for QbittorrentBackend {
     fn backend_type(&self) -> BackendType {
@@ -129,7 +157,10 @@ impl TorrentBackend for QbittorrentBackend {
     }
 
     async fn health(&self) -> BackendStatus {
-        match self.get_json::<serde_json::Value>("api/v2/app/version").await {
+        match self
+            .get_json::<serde_json::Value>("api/v2/app/version")
+            .await
+        {
             Ok(_) => BackendStatus::Connected,
             Err(_) => BackendStatus::Unreachable,
         }
@@ -146,6 +177,149 @@ impl TorrentBackend for QbittorrentBackend {
     async fn list_torrents(&self) -> Result<Vec<RawTorrent>> {
         let torrents: Vec<QbitTorrent> = self.get_json("api/v2/torrents/info").await?;
         Ok(torrents.into_iter().map(map_torrent).collect())
+    }
+
+    async fn add_magnet(
+        &self,
+        magnet: &str,
+        save_path: &str,
+        category: &str,
+        start: bool,
+    ) -> Result<()> {
+        self.post_form(
+            "api/v2/torrents/add",
+            &[
+                ("urls", magnet),
+                ("savepath", save_path),
+                ("category", category),
+                ("paused", if start { "false" } else { "true" }),
+            ],
+        )
+        .await
+    }
+
+    async fn add_torrent(
+        &self,
+        data: &[u8],
+        save_path: &str,
+        category: &str,
+        start: bool,
+    ) -> Result<()> {
+        self.ensure_login().await?;
+        let part = reqwest::multipart::Part::bytes(data.to_vec()).file_name("upload.torrent");
+        let form = reqwest::multipart::Form::new()
+            .part("torrents", part)
+            .text("savepath", save_path.to_owned())
+            .text("category", category.to_owned())
+            .text("paused", if start { "false" } else { "true" });
+        self.client
+            .post(self.url("api/v2/torrents/add")?)
+            .multipart(form)
+            .send()
+            .await
+            .context("qBittorrent POST api/v2/torrents/add")?
+            .error_for_status()
+            .context("qBittorrent POST api/v2/torrents/add")?;
+        Ok(())
+    }
+
+    async fn remove(&self, hash: &str, delete_data: bool) -> Result<()> {
+        self.post_form(
+            "api/v2/torrents/delete",
+            &[
+                ("hashes", hash),
+                ("deleteFiles", if delete_data { "true" } else { "false" }),
+            ],
+        )
+        .await
+    }
+
+    async fn start(&self, hash: &str) -> Result<()> {
+        self.post_form("api/v2/torrents/resume", &[("hashes", hash)])
+            .await
+    }
+
+    async fn stop(&self, hash: &str) -> Result<()> {
+        self.post_form("api/v2/torrents/pause", &[("hashes", hash)])
+            .await
+    }
+
+    async fn recheck(&self, hash: &str) -> Result<()> {
+        self.post_form("api/v2/torrents/recheck", &[("hashes", hash)])
+            .await
+    }
+
+    async fn reannounce(&self, hash: &str) -> Result<()> {
+        self.post_form("api/v2/torrents/reannounce", &[("hashes", hash)])
+            .await
+    }
+
+    async fn list_trackers(&self, hash: &str) -> Result<Vec<RawTracker>> {
+        let trackers: Vec<QbitTracker> = self
+            .get_json(&format!(
+                "api/v2/torrents/trackers?hash={}",
+                urlencoding::encode(hash)
+            ))
+            .await?;
+        Ok(trackers.into_iter().enumerate().map(map_tracker).collect())
+    }
+
+    async fn add_tracker(&self, hash: &str, url: &str) -> Result<()> {
+        self.post_form(
+            "api/v2/torrents/addTrackers",
+            &[("hash", hash), ("urls", url)],
+        )
+        .await
+    }
+
+    async fn edit_tracker(&self, hash: &str, original_url: &str, new_url: &str) -> Result<()> {
+        self.post_form(
+            "api/v2/torrents/editTracker",
+            &[
+                ("hash", hash),
+                ("origUrl", original_url),
+                ("newUrl", new_url),
+            ],
+        )
+        .await
+    }
+
+    async fn remove_tracker(&self, hash: &str, url: &str) -> Result<()> {
+        self.post_form(
+            "api/v2/torrents/removeTrackers",
+            &[("hash", hash), ("urls", url)],
+        )
+        .await
+    }
+
+    async fn list_files(&self, hash: &str) -> Result<Vec<RawFile>> {
+        let files: Vec<QbitFile> = self
+            .get_json(&format!(
+                "api/v2/torrents/files?hash={}",
+                urlencoding::encode(hash)
+            ))
+            .await?;
+        Ok(files.into_iter().enumerate().map(map_file).collect())
+    }
+
+    async fn set_file_priority(&self, hash: &str, file_index: usize, priority: i64) -> Result<()> {
+        self.post_form(
+            "api/v2/torrents/filePrio",
+            &[
+                ("hash", hash),
+                ("id", &file_index.to_string()),
+                ("priority", &priority.to_string()),
+            ],
+        )
+        .await
+    }
+
+    async fn set_category(&self, hash: &str, category: &str) -> Result<()> {
+        self.post_form(
+            "api/v2/torrents/setCategory",
+            &[("hashes", hash), ("category", category)],
+        )
+        .await
     }
 }
 
@@ -185,9 +359,48 @@ fn map_torrent(t: QbitTorrent) -> RawTorrent {
         creation_date: t.added_on.unwrap_or(0),
         timestamp_finished: t.completion_on.unwrap_or(0),
         tracker_focus: 0,
-        peers_connected: t.num_seeds.unwrap_or(0).saturating_add(t.num_leechs.unwrap_or(0)),
+        peers_connected: t
+            .num_seeds
+            .unwrap_or(0)
+            .saturating_add(t.num_leechs.unwrap_or(0)),
         peers_complete: t.num_complete.unwrap_or(0),
         message,
         tracker_url: t.tracker.unwrap_or_default(),
+    }
+}
+
+fn map_tracker((idx, tracker): (usize, QbitTracker)) -> RawTracker {
+    let status = tracker.status.unwrap_or(0);
+    RawTracker {
+        url: tracker.url,
+        id: idx as i64,
+        group: 0,
+        group_index: idx as i64,
+        is_enabled: status != 4,
+        is_open: status == 2,
+        is_extra_tracker: false,
+        activity_time_last: 0,
+        activity_time_next: 0,
+        min_interval: 0,
+        normal_interval: 0,
+        failed_counter: 0,
+        success_counter: 0,
+        scrape_incomplete: tracker.num_leeches.unwrap_or(0),
+        scrape_complete: tracker.num_seeds.unwrap_or(0),
+        scrape_downloaded: tracker.num_downloaded.unwrap_or(0),
+        message: tracker.msg.unwrap_or_default(),
+    }
+}
+
+fn map_file((index, file): (usize, QbitFile)) -> RawFile {
+    RawFile {
+        index,
+        path: file.name,
+        size_bytes: file.size,
+        size_chunks: file.size,
+        completed_chunks: (file.size as f64 * file.progress.clamp(0.0, 1.0)) as i64,
+        priority: file.priority,
+        is_created: true,
+        is_open: true,
     }
 }

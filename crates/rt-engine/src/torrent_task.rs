@@ -54,7 +54,10 @@ use rt_tracker::{
 use rt_utp::UtpStream;
 
 use crate::peer_id::OUR_PEER_ID;
-use crate::{EnginePeerSnapshot, EngineTorrentLimits, EngineWebseedSnapshot, TorrentRuntimeStats};
+use crate::{
+    EngineGlobalLimits, EnginePeerSnapshot, EngineTorrentLimits, EngineWebseedSnapshot,
+    TorrentRuntimeStats,
+};
 
 const LOCAL_UT_METADATA_ID: u8 = 1;
 const LOCAL_UT_PEX_ID: u8 = 2;
@@ -74,6 +77,7 @@ pub enum TorrentCmd {
     Reannounce,
     ReloadFilePolicy,
     UpdateLimits(EngineTorrentLimits),
+    UpdateGlobalLimits(EngineGlobalLimits),
     Shutdown,
     /// Peers discovered by DHT, tracker, or peer exchange.
     NewPeers(Vec<SocketAddr>),
@@ -128,6 +132,25 @@ fn memory_aware_request_pipeline(piece_assembly_bytes: usize, soft_cap_bytes: us
     } else {
         PEER_REQUEST_PIPELINE_NORMAL
     }
+}
+
+fn stricter_limit(torrent_limit: Option<u64>, global_limit: Option<u64>) -> Option<u64> {
+    match (torrent_limit, global_limit) {
+        (Some(torrent), Some(global)) => Some(torrent.min(global)),
+        (Some(limit), None) | (None, Some(limit)) => Some(limit),
+        (None, None) => None,
+    }
+}
+
+fn setting_i64(conn: &Connection, key: &str) -> i64 {
+    rt_db::get_setting(conn, key)
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
+fn setting_bool(conn: &Connection, key: &str) -> bool {
+    setting_i64(conn, key) != 0
 }
 
 fn tracker_peer_cache_cap(max_peers: usize) -> usize {
@@ -410,6 +433,10 @@ pub struct TorrentTask {
     download_tokens: u64,
     download_tokens_updated: Instant,
     upload_limit_bytes_per_sec: Option<u64>,
+    torrent_download_limit_bytes_per_sec: Option<u64>,
+    torrent_upload_limit_bytes_per_sec: Option<u64>,
+    global_download_limit_bytes_per_sec: Option<u64>,
+    global_upload_limit_bytes_per_sec: Option<u64>,
     completed_piece_verify_from_memory: u64,
     completed_piece_verify_from_disk: u64,
     prepared_files: Mutex<HashSet<u32>>,
@@ -524,6 +551,10 @@ impl TorrentTask {
             download_tokens: u64::MAX,
             download_tokens_updated: Instant::now(),
             upload_limit_bytes_per_sec: None,
+            torrent_download_limit_bytes_per_sec: None,
+            torrent_upload_limit_bytes_per_sec: None,
+            global_download_limit_bytes_per_sec: None,
+            global_upload_limit_bytes_per_sec: None,
             completed_piece_verify_from_memory: 0,
             completed_piece_verify_from_disk: 0,
             prepared_files: Mutex::new(HashSet::new()),
@@ -532,6 +563,7 @@ impl TorrentTask {
         };
         task.apply_file_policy_from_db();
         task.apply_torrent_limits_from_db();
+        task.apply_global_limits_from_db();
         task
     }
 
@@ -626,6 +658,9 @@ impl TorrentTask {
                         }
                         TorrentCmd::UpdateLimits(limits) => {
                             self.apply_torrent_limits(&limits);
+                        }
+                        TorrentCmd::UpdateGlobalLimits(limits) => {
+                            self.apply_global_limits(&limits);
                         }
                     }
                 }
@@ -2056,21 +2091,68 @@ impl TorrentTask {
             self.picker.set_sequential_from_piece(piece as usize);
         }
         self.super_seeding = limits.super_seeding;
-        self.set_download_limit(limits.download_limit);
-        self.set_upload_limit(limits.upload_limit);
+        self.set_torrent_download_limit(limits.download_limit);
+        self.set_torrent_upload_limit(limits.upload_limit);
         self.apply_file_policy_from_db();
     }
 
-    fn set_download_limit(&mut self, limit: Option<i64>) {
-        self.download_limit_bytes_per_sec =
+    fn apply_global_limits_from_db(&mut self) {
+        let limits = {
+            let db = self.db.lock().expect("database mutex poisoned");
+            EngineGlobalLimits {
+                download_limit: setting_i64(&db, "transfer.download_limit"),
+                upload_limit: setting_i64(&db, "transfer.upload_limit"),
+                speed_limits_mode: setting_bool(&db, "transfer.speed_limits_mode"),
+            }
+        };
+        self.apply_global_limits(&limits);
+    }
+
+    fn apply_global_limits(&mut self, limits: &EngineGlobalLimits) {
+        let download = (limits.speed_limits_mode && limits.download_limit > 0)
+            .then_some(limits.download_limit as u64);
+        let upload = (limits.speed_limits_mode && limits.upload_limit > 0)
+            .then_some(limits.upload_limit as u64);
+        self.set_global_download_limit(download);
+        self.set_global_upload_limit(upload);
+    }
+
+    fn set_torrent_download_limit(&mut self, limit: Option<i64>) {
+        self.torrent_download_limit_bytes_per_sec =
             limit.and_then(|value| (value > 0).then_some(value as u64));
+        self.recompute_download_limit();
+    }
+
+    fn set_global_download_limit(&mut self, limit: Option<u64>) {
+        self.global_download_limit_bytes_per_sec = limit;
+        self.recompute_download_limit();
+    }
+
+    fn recompute_download_limit(&mut self) {
+        self.download_limit_bytes_per_sec = stricter_limit(
+            self.torrent_download_limit_bytes_per_sec,
+            self.global_download_limit_bytes_per_sec,
+        );
         self.download_tokens_updated = Instant::now();
         self.download_tokens = self.download_limit_bytes_per_sec.unwrap_or(u64::MAX);
     }
 
-    fn set_upload_limit(&mut self, limit: Option<i64>) {
-        self.upload_limit_bytes_per_sec =
+    fn set_torrent_upload_limit(&mut self, limit: Option<i64>) {
+        self.torrent_upload_limit_bytes_per_sec =
             limit.and_then(|value| (value > 0).then_some(value as u64));
+        self.recompute_upload_limit();
+    }
+
+    fn set_global_upload_limit(&mut self, limit: Option<u64>) {
+        self.global_upload_limit_bytes_per_sec = limit;
+        self.recompute_upload_limit();
+    }
+
+    fn recompute_upload_limit(&mut self) {
+        self.upload_limit_bytes_per_sec = stricter_limit(
+            self.torrent_upload_limit_bytes_per_sec,
+            self.global_upload_limit_bytes_per_sec,
+        );
         let mut queue_full = 0u64;
         for handle in self.active_peers.values() {
             if handle
@@ -2299,6 +2381,9 @@ impl TorrentTask {
                 }
                 Ok(TorrentCmd::UpdateLimits(limits)) => {
                     self.apply_torrent_limits(&limits);
+                }
+                Ok(TorrentCmd::UpdateGlobalLimits(limits)) => {
+                    self.apply_global_limits(&limits);
                 }
                 Ok(TorrentCmd::Recheck { .. }) => {}
                 Ok(TorrentCmd::CancelJob { job_id }) => {
@@ -3822,6 +3907,15 @@ mod tests {
             pieces_to_bitfield(&[true, false, true, false, false, false, false, false, true]),
             vec![0b1010_0000, 0b1000_0000]
         );
+    }
+
+    #[test]
+    fn stricter_limit_uses_lowest_enabled_limit() {
+        assert_eq!(stricter_limit(Some(10), Some(20)), Some(10));
+        assert_eq!(stricter_limit(Some(30), Some(20)), Some(20));
+        assert_eq!(stricter_limit(Some(30), None), Some(30));
+        assert_eq!(stricter_limit(None, Some(40)), Some(40));
+        assert_eq!(stricter_limit(None, None), None);
     }
 
     #[test]
