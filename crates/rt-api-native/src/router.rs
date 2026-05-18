@@ -5,18 +5,18 @@ use axum::{
 
 use crate::{
     handlers::{
-        add_torrent, add_torrent_peers, add_torrent_tags, apply_rss_rules, bulk_action, categories,
-        create_tag, cross_seed, delete_category, delete_saved_json, delete_tag, delete_torrent,
-        diagnose_torrent, engine_commands, engine_diagnostics, get_torrent, get_user_agent, health,
-        list_json_map, list_session_events, list_torrent_files, list_torrent_trackers,
-        list_torrents, list_workflow_runs, logs, metrics, patch_torrent_files,
-        patch_torrent_trackers, pause_torrent, reannounce_torrent, recheck_torrent,
-        remove_torrent_tags, restart_engine, resume_torrent, rtorrent_settings, run_json_workflow,
-        save_rtorrent_settings, session_features, set_torrent_category, set_user_agent,
-        sidebar_facets, storage, storage_execute_plan, storage_preview_plan, stream_events, tags,
-        test_rss_rules, torrent_limits, tracker_health, transfer_info, transfer_limits,
-        update_session_features, update_torrent, update_torrent_limits, update_torrent_queue,
-        update_transfer_limits, upsert_category, upsert_json_map,
+        add_torrent, add_torrent_peers, add_torrent_tags, apply_rss_rules, auth_login, auth_logout,
+        bulk_action, categories, create_tag, cross_seed, delete_category, delete_saved_json,
+        delete_tag, delete_torrent, diagnose_torrent, engine_commands, engine_diagnostics,
+        get_torrent, get_user_agent, health, list_json_map, list_session_events,
+        list_torrent_files, list_torrent_trackers, list_torrents, list_workflow_runs, logs,
+        metrics, patch_torrent_files, patch_torrent_trackers, pause_torrent, reannounce_torrent,
+        recheck_torrent, remove_torrent_tags, restart_engine, resume_torrent, rtorrent_settings,
+        run_json_workflow, save_rtorrent_settings, session_features, set_torrent_category,
+        set_user_agent, sidebar_facets, storage, storage_execute_plan, storage_preview_plan,
+        stream_events, tags, test_rss_rules, torrent_limits, tracker_health, transfer_info,
+        transfer_limits, update_session_features, update_torrent, update_torrent_limits,
+        update_torrent_queue, update_transfer_limits, upsert_category, upsert_json_map,
     },
     state::AppState,
 };
@@ -25,6 +25,8 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
+        .route("/api/v1/auth/login", post(auth_login))
+        .route("/api/v1/auth/logout", post(auth_logout))
         .route("/api/v1/torrents", get(list_torrents).post(add_torrent))
         .route(
             "/api/v1/torrents/:hash",

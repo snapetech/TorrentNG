@@ -36,6 +36,16 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::state::{AppState, JsonMap};
 
+/// `POST /api/v1/auth/login` — native WebUI session probe.
+pub async fn auth_login() -> impl IntoResponse {
+    (StatusCode::OK, "Ok.")
+}
+
+/// `POST /api/v1/auth/logout` — native WebUI logout probe.
+pub async fn auth_logout() -> impl IntoResponse {
+    StatusCode::OK
+}
+
 /// `GET /api/v1/torrents` — list all torrents.
 pub async fn list_torrents(State(state): State<AppState>) -> impl IntoResponse {
     if let Some(engine) = &state.engine {
@@ -5920,6 +5930,8 @@ mod tests {
                 "/api/v1/session/features".to_owned(),
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
+            ("POST", "/api/v1/auth/login".to_owned(), StatusCode::OK),
+            ("POST", "/api/v1/auth/logout".to_owned(), StatusCode::OK),
         ] {
             let resp = app
                 .clone()

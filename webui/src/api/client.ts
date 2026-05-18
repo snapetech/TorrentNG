@@ -144,7 +144,7 @@ async function login(username: string, password: string): Promise<void> {
   const form = new URLSearchParams()
   form.set('username', username)
   form.set('password', password)
-  const res = await fetch('/api/qb/v2/auth/login', {
+  const res = await fetch(`${BASE}/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: form,
@@ -157,7 +157,7 @@ async function login(username: string, password: string): Promise<void> {
 }
 
 async function logout(): Promise<void> {
-  await fetch('/api/qb/v2/auth/logout', {
+  await fetch(`${BASE}/auth/logout`, {
     method: 'POST',
     credentials: 'same-origin',
   })

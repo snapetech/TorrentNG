@@ -30,7 +30,8 @@ Authorization: Bearer <token>
 Cookie: tng_session=<token>
 ```
 
-Public endpoints (never require auth): `/health`, `/metrics`, `/api/qb/v2/auth/login`
+Public endpoints (never require auth): `/health`, `/metrics`,
+`/api/v1/auth/login`, `/api/qb/v2/auth/login`
 
 ## Request Correlation
 
@@ -74,6 +75,13 @@ the rewritten engine.
 ---
 
 ## Native API — `/api/v1`
+
+### Auth
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/v1/auth/login` | Native WebUI session probe; returns `Ok.` when the request reaches TorrentNG. Token validation is handled by the shared auth layer. |
+| `POST` | `/api/v1/auth/logout` | Native WebUI logout probe; clears no server-side state in token mode and returns success for UI compatibility. |
 
 ### Torrents
 
