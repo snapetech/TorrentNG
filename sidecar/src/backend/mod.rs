@@ -179,4 +179,18 @@ pub trait TorrentBackend: Send + Sync {
     async fn feature_status(&self) -> (String, String) {
         ("unknown".to_owned(), "unknown".to_owned())
     }
+
+    async fn set_dht(&self, _enabled: bool) -> Result<()> {
+        bail!(
+            "{} backend does not support runtime DHT toggles",
+            self.backend_type().as_str()
+        )
+    }
+
+    async fn set_pex(&self, _enabled: bool) -> Result<()> {
+        bail!(
+            "{} backend does not support runtime peer exchange toggles",
+            self.backend_type().as_str()
+        )
+    }
 }
