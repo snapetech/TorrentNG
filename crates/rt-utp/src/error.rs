@@ -25,4 +25,20 @@ pub enum UtpError {
 
     #[error("uTP extension {extension} is too long to encode: {length} bytes")]
     ExtensionTooLong { extension: u8, length: usize },
+
+    #[error("uTP packet type {packet_type:?} is invalid while connection is {state:?}")]
+    InvalidStatePacket {
+        state: crate::state::ConnectionState,
+        packet_type: crate::packet::PacketType,
+    },
+
+    #[error("uTP packet connection id {actual} did not match expected {expected}")]
+    ConnectionIdMismatch { expected: u16, actual: u16 },
+
+    #[error("uTP ack {ack_nr} is outside send window {oldest_unacked}..={newest_sent}")]
+    AckOutOfWindow {
+        ack_nr: u16,
+        oldest_unacked: u16,
+        newest_sent: u16,
+    },
 }
