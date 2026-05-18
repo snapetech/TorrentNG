@@ -831,6 +831,9 @@ fn native_engine_capabilities() -> serde_json::Value {
             "udp_trackers": true,
             "dht": true,
             "utp_packet_codec": true,
+            "utp_udp_stream": true,
+            "utp_outgoing_opt_in": true,
+            "utp_outgoing_enabled": std::env::var_os("TNG_ENABLE_UTP_OUTGOING").is_some(),
             "utp_transport": false,
             "private_torrent_dht_pex_lsd_default_off": true,
         },
@@ -2650,6 +2653,8 @@ mod tests {
         assert_eq!(capabilities["storage"]["v2_file_root_verify"], true);
         assert_eq!(capabilities["networking"]["dht"], true);
         assert_eq!(capabilities["networking"]["utp_packet_codec"], true);
+        assert_eq!(capabilities["networking"]["utp_udp_stream"], true);
+        assert_eq!(capabilities["networking"]["utp_outgoing_opt_in"], true);
         assert_eq!(capabilities["networking"]["utp_transport"], false);
         assert_eq!(capabilities["compatibility"]["qbittorrent_v2"], true);
         assert_eq!(capabilities["migration"]["transmission"], true);

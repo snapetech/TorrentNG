@@ -112,6 +112,14 @@ Before flipping `networking.utp_transport=true`, the engine still needs:
 Until those pieces are wired, `networking.utp_packet_codec=true` and
 `networking.utp_transport=false` is the honest app-level status.
 
+The native health capability surface also reports:
+
+- `networking.utp_udp_stream=true`: `rt-utp` has async UDP stream primitives.
+- `networking.utp_outgoing_opt_in=true`: the engine contains an explicit
+  outbound uTP peer-wire path.
+- `networking.utp_outgoing_enabled`: whether the current process was started
+  with `TNG_ENABLE_UTP_OUTGOING`.
+
 ## Engine Integration Progress
 
 The engine peer loop now has a transport-neutral `PeerIo` adapter and an
