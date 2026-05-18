@@ -252,6 +252,18 @@ async fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Va
         "core.enable_plugin" | "core.disable_plugin" => Ok(json!(true)),
         "core.get_available_plugins" => Ok(json!(deluge_plugins())),
         "core.get_libtorrent_version" => Ok(json!("native")),
+        "blocklist.get_config" => Ok(blocklist_config()),
+        "blocklist.set_config" => Ok(json!(true)),
+        "blocklist.get_status" | "blocklist.check_import" => Ok(blocklist_status()),
+        "blocklist.import" => Ok(json!(true)),
+        "autoadd.get_config" => Ok(autoadd_config()),
+        "autoadd.set_config" | "autoadd.enable" | "autoadd.disable" => Ok(json!(true)),
+        "execute.get_commands" => Ok(json!([])),
+        "execute.save_command" | "execute.remove_command" => Ok(json!(true)),
+        "scheduler.get_config" => Ok(scheduler_config()),
+        "scheduler.set_config" => Ok(json!(true)),
+        "extractor.get_config" => Ok(extractor_config()),
+        "extractor.set_config" => Ok(json!(true)),
         "notifications.get_handled_events" => Ok(json!(notification_events())),
         "notifications.get_subscriptions" => Ok(notification_subscriptions()),
         "notifications.set_config" | "notifications.add_subscription" => Ok(json!(true)),
@@ -333,6 +345,22 @@ fn supported_methods() -> Vec<&'static str> {
         "core.create_torrent",
         "core.upload_plugin",
         "core.rescan_plugins",
+        "blocklist.get_config",
+        "blocklist.set_config",
+        "blocklist.get_status",
+        "blocklist.check_import",
+        "blocklist.import",
+        "autoadd.get_config",
+        "autoadd.set_config",
+        "autoadd.enable",
+        "autoadd.disable",
+        "execute.get_commands",
+        "execute.save_command",
+        "execute.remove_command",
+        "scheduler.get_config",
+        "scheduler.set_config",
+        "extractor.get_config",
+        "extractor.set_config",
         "label.get_labels",
         "label.add",
         "label.remove",
@@ -557,12 +585,48 @@ async fn web_events(state: &AppState) -> Result<Value, String> {
 }
 
 fn deluge_plugins() -> Vec<&'static str> {
-    vec!["Label", "Notifications"]
+    vec![
+        "AutoAdd",
+        "Blocklist",
+        "Execute",
+        "Extractor",
+        "Label",
+        "Notifications",
+        "Scheduler",
+    ]
 }
 
 fn plugin_info(name: Option<&str>) -> Value {
     let name = name.unwrap_or_default();
     match name {
+        "AutoAdd" | "autoadd" => json!({
+            "name": "AutoAdd",
+            "version": "TorrentNG",
+            "author": "TorrentNG",
+            "description": "Watch-directory compatibility configuration; server-side watch execution is disabled unless native automation owns it.",
+            "enabled": true,
+        }),
+        "Blocklist" | "blocklist" => json!({
+            "name": "Blocklist",
+            "version": "TorrentNG",
+            "author": "TorrentNG",
+            "description": "Blocklist compatibility configuration with zero-entry status until a native blocklist backend is configured.",
+            "enabled": true,
+        }),
+        "Execute" | "execute" => json!({
+            "name": "Execute",
+            "version": "TorrentNG",
+            "author": "TorrentNG",
+            "description": "Execute plugin compatibility surface; arbitrary command execution is intentionally not performed by the facade.",
+            "enabled": true,
+        }),
+        "Extractor" | "extractor" => json!({
+            "name": "Extractor",
+            "version": "TorrentNG",
+            "author": "TorrentNG",
+            "description": "Extractor plugin compatibility configuration; archive extraction is left to explicit operator workflows.",
+            "enabled": true,
+        }),
         "Label" | "label" => json!({
             "name": "Label",
             "version": "TorrentNG",
@@ -577,8 +641,63 @@ fn plugin_info(name: Option<&str>) -> Value {
             "description": "Native session event notification compatibility.",
             "enabled": true,
         }),
+        "Scheduler" | "scheduler" => json!({
+            "name": "Scheduler",
+            "version": "TorrentNG",
+            "author": "TorrentNG",
+            "description": "Scheduler plugin compatibility configuration; native limits remain controlled by TorrentNG settings.",
+            "enabled": true,
+        }),
         _ => json!({}),
     }
+}
+
+fn blocklist_config() -> Value {
+    json!({
+        "enabled": false,
+        "url": "",
+        "load_on_start": false,
+        "check_after_days": 4,
+        "list_size": 0,
+        "last_update": 0,
+    })
+}
+
+fn blocklist_status() -> Value {
+    json!({
+        "state": "Disabled",
+        "message": "No native blocklist configured",
+        "num_blocked": 0,
+        "file_progress": 0.0,
+        "file_type": "",
+        "up_to_date": true,
+    })
+}
+
+fn autoadd_config() -> Value {
+    json!({
+        "enabled": false,
+        "watchdirs": {},
+        "next_id": 1,
+    })
+}
+
+fn scheduler_config() -> Value {
+    json!({
+        "low_down": -1.0,
+        "low_up": -1.0,
+        "high_down": -1.0,
+        "high_up": -1.0,
+        "button_state": [[0, 0, 0, 0, 0, 0, 0, 0]],
+    })
+}
+
+fn extractor_config() -> Value {
+    json!({
+        "enabled": false,
+        "extract_path": "",
+        "use_name_folder": true,
+    })
 }
 
 fn notification_events() -> Vec<&'static str> {
@@ -2009,6 +2128,22 @@ mod tests {
             ("core.create_torrent", r#"[]"#),
             ("core.upload_plugin", r#"[]"#),
             ("core.rescan_plugins", r#"[]"#),
+            ("blocklist.get_config", r#"[]"#),
+            ("blocklist.set_config", r#"[{}]"#),
+            ("blocklist.get_status", r#"[]"#),
+            ("blocklist.check_import", r#"[]"#),
+            ("blocklist.import", r#"[]"#),
+            ("autoadd.get_config", r#"[]"#),
+            ("autoadd.set_config", r#"[{}]"#),
+            ("autoadd.enable", r#"[1]"#),
+            ("autoadd.disable", r#"[1]"#),
+            ("execute.get_commands", r#"[]"#),
+            ("execute.save_command", r#"["complete","echo done"]"#),
+            ("execute.remove_command", r#"[1]"#),
+            ("scheduler.get_config", r#"[]"#),
+            ("scheduler.set_config", r#"[{}]"#),
+            ("extractor.get_config", r#"[]"#),
+            ("extractor.set_config", r#"[{}]"#),
             ("label.get_labels", r#"[]"#),
             ("label.add", r#"["test"]"#),
             ("label.remove", r#"["test"]"#),
@@ -2041,10 +2176,14 @@ mod tests {
         for (method, assertion_key) in [
             ("core.get_cache_status", "cache_size"),
             ("web.get_plugin_info", "name"),
+            ("blocklist.get_status", "num_blocked"),
+            ("autoadd.get_config", "watchdirs"),
+            ("scheduler.get_config", "button_state"),
+            ("extractor.get_config", "extract_path"),
             ("notifications.get_subscriptions", "TorrentAddedEvent"),
         ] {
             let params = if method == "web.get_plugin_info" {
-                r#"["Label"]"#
+                r#"["Blocklist"]"#
             } else {
                 "[]"
             };

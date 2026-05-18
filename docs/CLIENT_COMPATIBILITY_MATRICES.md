@@ -243,7 +243,7 @@ when engine metadata or peer snapshots are available.
 | P1 | `interop_transfer_matrix` | qBit/Transmission/Deluge/rTorrent seed and leech with TorrentNG both directions; the Docker protocol row `rust-seeds-to-all-reference-clients` covers TorrentNG as the sole seeder for all reference clients in one swarm |
 | P1 | `tracker_peer_matrix` | HTTP tracker, UDP tracker, private torrent DHT/PEX policy, explicit peer, multi-tracker fallback, tracker outage after peer discovery, and multi-peer completion are covered by Docker protocol rows in `scripts/interop_matrix.sh` |
 | P1 | `storage_resume_matrix` | stop mid-transfer/restart/resume, corrupt block recheck repair, and missing file recovery are covered by Docker protocol rows `resume-after-partial-download`, `force-recheck-corruption-repair`, and `missing-file-recovery`; local storage topology coverage is included in `scripts/universal_compatibility_certification.sh` |
-| P2 | `plugin_aux_matrix` | Migration artifact preservation implemented for RSS/search/scheduler/autoadd/blocklist/execute/plugin/config files; facade API shapes remain targeted work |
+| P2 | `plugin_aux_matrix` | Migration artifact preservation implemented for RSS/search/scheduler/autoadd/blocklist/execute/plugin/config files; Deluge auxiliary plugin facade shapes are implemented for autoadd, blocklist, execute, extractor, and scheduler; remaining work is native behavioral effects only where explicitly supported |
 | P2 | `scale_matrix` | 15k imported torrents, hundreds active, many files, hostile paths; local scale coverage is included in `scripts/universal_compatibility_certification.sh` |
 
 ## 8. Build Backlog From Matrices
