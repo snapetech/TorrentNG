@@ -3,6 +3,7 @@
 /// One tokio task per torrent owns: tracker announce loop, peer connection
 /// management, piece picker, and storage writes.
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -402,6 +403,7 @@ pub struct TorrentTask {
     peer_command_queue_full: u64,
     tracker_peer_cache_drops: u64,
     dirty_pieces_since_barrier: HashSet<u32>,
+    super_seeding: bool,
     completed_piece_verify_from_memory: u64,
     completed_piece_verify_from_disk: u64,
     prepared_files: Mutex<HashSet<u32>>,
@@ -511,6 +513,7 @@ impl TorrentTask {
             peer_command_queue_full: 0,
             tracker_peer_cache_drops: 0,
             dirty_pieces_since_barrier: HashSet::new(),
+            super_seeding: false,
             completed_piece_verify_from_memory: 0,
             completed_piece_verify_from_disk: 0,
             prepared_files: Mutex::new(HashSet::new()),
@@ -665,7 +668,7 @@ impl TorrentTask {
             let info_hash = self.meta.info_hash;
             let peer_cmd_rx = self.register_peer(addr);
             let peer_event_tx = self.peer_event_tx.clone();
-            let upload = self.upload_context();
+            let upload = self.upload_context(addr);
             let use_utp = outgoing_utp_enabled();
             tokio::spawn(async move {
                 let disconnect_tx = peer_event_tx.clone();
@@ -1045,7 +1048,7 @@ impl TorrentTask {
         let info_hash = self.meta.info_hash;
         let peer_cmd_rx = self.register_peer(peer_addr);
         let peer_event_tx = self.peer_event_tx.clone();
-        let upload = self.upload_context();
+        let upload = self.upload_context(peer_addr);
         tokio::spawn(async move {
             let disconnect_tx = peer_event_tx.clone();
             if let Err(e) = run_incoming_peer(
@@ -1077,13 +1080,19 @@ impl TorrentTask {
         });
     }
 
-    fn upload_context(&self) -> UploadContext {
+    fn upload_context(&self, peer_addr: SocketAddr) -> UploadContext {
+        let have_pieces = self.picker.have_pieces();
+        let visible_pieces = if self.super_seeding && self.picker.is_complete() {
+            super_seed_visible_pieces(&have_pieces, peer_addr)
+        } else {
+            have_pieces
+        };
         UploadContext {
             save_root: self.save_root.clone(),
             piece_map: self.piece_map.clone(),
             storage: self.storage.clone(),
             resources: self.resources.clone(),
-            have_pieces: self.picker.have_pieces(),
+            have_pieces: visible_pieces,
             metadata: torrent_info_bytes(&self.meta.raw).ok().map(Arc::new),
             is_private: self.meta.private,
         }
@@ -1800,6 +1809,9 @@ impl TorrentTask {
     }
 
     async fn send_have_to_peers(&mut self, piece: u32) {
+        if self.super_seeding && self.picker.is_complete() {
+            return;
+        }
         let peers: Vec<SocketAddr> = self.active_peers.keys().copied().collect();
         let mut queue_full = 0u64;
         for peer in peers {
@@ -1985,6 +1997,7 @@ impl TorrentTask {
         if let Some(piece) = limits.sequential_download_from_piece {
             self.picker.set_sequential_from_piece(piece as usize);
         }
+        self.super_seeding = limits.super_seeding;
         self.apply_file_policy_from_db();
     }
 
@@ -3591,6 +3604,24 @@ fn pieces_to_bitfield(pieces: &[bool]) -> Vec<u8> {
     bits
 }
 
+fn super_seed_visible_pieces(have_pieces: &[bool], peer_addr: SocketAddr) -> Vec<bool> {
+    let mut visible = vec![false; have_pieces.len()];
+    let available: Vec<usize> = have_pieces
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, have)| have.then_some(idx))
+        .collect();
+    if available.is_empty() {
+        return visible;
+    }
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    peer_addr.hash(&mut hasher);
+    let selected = available[(hasher.finish() as usize) % available.len()];
+    visible[selected] = true;
+    visible
+}
+
 fn take_matching_outstanding(
     outstanding: &mut Vec<OutstandingRequest>,
     piece: u32,
@@ -3664,6 +3695,25 @@ mod tests {
         assert_eq!(
             pieces_to_bitfield(&[true, false, true, false, false, false, false, false, true]),
             vec![0b1010_0000, 0b1000_0000]
+        );
+    }
+
+    #[test]
+    fn super_seed_visible_pieces_reveals_one_available_piece() {
+        let addr = "127.0.0.1:6881".parse().unwrap();
+        let visible = super_seed_visible_pieces(&[true, true, false, true], addr);
+
+        assert_eq!(visible.iter().filter(|piece| **piece).count(), 1);
+        assert!(!visible[2]);
+    }
+
+    #[test]
+    fn super_seed_visible_pieces_handles_empty_have_set() {
+        let addr = "127.0.0.1:6881".parse().unwrap();
+
+        assert_eq!(
+            super_seed_visible_pieces(&[false, false, false], addr),
+            vec![false, false, false]
         );
     }
 
