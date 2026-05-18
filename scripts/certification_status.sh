@@ -161,7 +161,7 @@ row "Mobile read-flow" 'mobile-compat-*.md'
 row "Phase 1 ruTorrent" 'phase1-cert-*.md'
 row "Universal compatibility" 'universal-compat-*.md'
 row "Universal live compatibility" 'universal-live-*.md'
-row_excluding "Migration corpus" 'migration-corpus-*.md' "$REPORT_DIR" 'migration-corpus-local-release-*'
+row_excluding "Migration corpus" 'migration-corpus-*.md' "$REPORT_DIR" 'migration-corpus-local-release-*' 'migration-corpus-universal-*'
 row "External evidence preflight" 'external-evidence-preflight-*.md'
 row "Synthetic benchmark" 'report-*.md' "$BENCHMARK_DIR"
 row "Short soak" 'soak-202*.md'

@@ -115,6 +115,7 @@ grep -q 'Overall status: PASS' "$report_dir/post-soak-policy.md"
 
 write_report "$report_dir/migration-corpus-20260518T000000Z.md" PASS_WITH_GAPS
 write_report "$report_dir/migration-corpus-local-release-20260518T999999Z.md" PASS_WITH_WARNINGS
+write_report "$report_dir/migration-corpus-universal-20260518T999999Z.md" PASS
 BENCHMARK_DIR="$benchmark_dir" "$ROOT/scripts/certification_status.sh" "$report_dir" >"$report_dir/status-migration-selector.md"
 grep -q '| Migration corpus | PASS_WITH_GAPS | migration-corpus-20260518T000000Z.md |' "$report_dir/status-migration-selector.md"
 write_report "$report_dir/migration-corpus-selftest.md" PASS
