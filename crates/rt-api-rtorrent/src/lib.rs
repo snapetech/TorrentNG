@@ -1,7 +1,10 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use base64::{engine::general_purpose, Engine as _};
-use rt_engine::{EngineHandle, EnginePeerSnapshot, EngineTorrentFile, EngineTorrentMetadata};
+use rt_engine::{
+    EngineHandle, EnginePeerSnapshot, EngineTorrentFile, EngineTorrentMetadata,
+    EngineTrackerSnapshot,
+};
 use rt_metainfo::{parse_magnet, parse_torrent};
 use rt_metrics::{MemoryClass, MemoryLease};
 use rt_session::{SessionRegistry, TorrentEntry};
@@ -141,7 +144,8 @@ pub async fn execute(
         "session.path" => Ok(RtValue::String(state.session_path.clone())),
         "network.port_open" => Ok(RtValue::Int(state.network_port)),
         "network.port_random" => Ok(RtValue::Bool(false)),
-        "throttle.global_down.max_rate" | "throttle.global_up.max_rate" => Ok(RtValue::Int(0)),
+        "throttle.global_down.max_rate" => Ok(RtValue::Int(global_down_limit(state).await)),
+        "throttle.global_up.max_rate" => Ok(RtValue::Int(global_up_limit(state).await)),
         "view.list" => Ok(RtValue::Array(vec![RtValue::String("main".to_owned())])),
         "view.size" => Ok(RtValue::Int(state.registry.read().await.len() as i64)),
         "d.multicall" | "d.multicall2" => d_multicall(state, params).await,
@@ -301,6 +305,23 @@ async fn tracker_multicall(state: &AppState, params: &[RtValue]) -> Result<RtVal
     let Some(entry) = selected_torrent_entry(state, params).await else {
         return Ok(RtValue::Array(Vec::new()));
     };
+    if let Some(engine) = &state.engine {
+        if let Ok(trackers) = engine.torrent_trackers(entry.info_hash.clone()).await {
+            return Ok(RtValue::Array(
+                trackers
+                    .iter()
+                    .map(|tracker| {
+                        RtValue::Array(
+                            commands
+                                .iter()
+                                .map(|command| project_tracker_snapshot_field(tracker, command))
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+            ));
+        }
+    }
     let Some(meta) = torrent_metadata_snapshot(state, &entry.info_hash).await else {
         return Ok(RtValue::Array(Vec::new()));
     };
@@ -357,6 +378,28 @@ async fn selected_torrent_entry(state: &AppState, params: &[RtValue]) -> Option<
 async fn torrent_metadata_snapshot(state: &AppState, hash: &str) -> Option<EngineTorrentMetadata> {
     let engine = state.engine.as_ref()?;
     engine.torrent_metadata(hash.to_owned()).await.ok()
+}
+
+async fn global_down_limit(state: &AppState) -> i64 {
+    let Some(engine) = &state.engine else {
+        return 0;
+    };
+    engine
+        .global_limits()
+        .await
+        .map(|limits| limits.download_limit)
+        .unwrap_or(0)
+}
+
+async fn global_up_limit(state: &AppState) -> i64 {
+    let Some(engine) = &state.engine else {
+        return 0;
+    };
+    engine
+        .global_limits()
+        .await
+        .map(|limits| limits.upload_limit)
+        .unwrap_or(0)
 }
 
 fn multicall_commands(params: &[RtValue]) -> Vec<String> {
@@ -459,6 +502,25 @@ fn project_tracker_field(idx: usize, tracker: &str, command: &str) -> RtValue {
         | "t.scrape_complete"
         | "t.scrape_incomplete"
         | "t.scrape_downloaded" => RtValue::Int(0),
+        _ => RtValue::Nil,
+    }
+}
+
+fn project_tracker_snapshot_field(tracker: &EngineTrackerSnapshot, command: &str) -> RtValue {
+    match command {
+        "" | "t.url" | "t.group" => RtValue::String(tracker.announce.clone()),
+        "t.is_enabled" | "t.is_open" => RtValue::Bool(true),
+        "t.type" | "t.id" => RtValue::Int(tracker.id),
+        "t.latest_event" => RtValue::String(tracker.status.clone()),
+        "t.latest_sum_peers" => RtValue::Int(
+            tracker
+                .seeders
+                .unwrap_or(0)
+                .saturating_add(tracker.leechers.unwrap_or(0)),
+        ),
+        "t.scrape_complete" => RtValue::Int(tracker.seeders.unwrap_or(0)),
+        "t.scrape_incomplete" => RtValue::Int(tracker.leechers.unwrap_or(0)),
+        "t.scrape_downloaded" => RtValue::Int(tracker.completed.unwrap_or(0)),
         _ => RtValue::Nil,
     }
 }
@@ -987,6 +1049,40 @@ mod tests {
         assert_eq!(
             project_tracker_field(0, &meta.trackers[0], "t.url"),
             RtValue::String("udp://tracker.example:6969/announce".to_owned())
+        );
+        let tracker = EngineTrackerSnapshot {
+            id: 3,
+            tier: 1,
+            announce: meta.trackers[0].clone(),
+            status: "working".to_owned(),
+            last_announce_at: Some(100),
+            next_announce_at: Some(200),
+            last_success_at: Some(90),
+            failure_reason: None,
+            warning_message: None,
+            seeders: Some(8),
+            leechers: Some(5),
+            completed: Some(2),
+        };
+        assert_eq!(
+            project_tracker_snapshot_field(&tracker, "t.latest_event"),
+            RtValue::String("working".to_owned())
+        );
+        assert_eq!(
+            project_tracker_snapshot_field(&tracker, "t.latest_sum_peers"),
+            RtValue::Int(13)
+        );
+        assert_eq!(
+            project_tracker_snapshot_field(&tracker, "t.scrape_complete"),
+            RtValue::Int(8)
+        );
+        assert_eq!(
+            project_tracker_snapshot_field(&tracker, "t.scrape_incomplete"),
+            RtValue::Int(5)
+        );
+        assert_eq!(
+            project_tracker_snapshot_field(&tracker, "t.scrape_downloaded"),
+            RtValue::Int(2)
         );
 
         let peer = EnginePeerSnapshot {

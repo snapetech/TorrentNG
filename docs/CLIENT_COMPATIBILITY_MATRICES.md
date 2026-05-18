@@ -222,10 +222,10 @@ when engine metadata or peer snapshots are available.
 
 | Command family | Upstream examples | TorrentNG status | Test rows |
 |---|---|---|---|
-| System/session | `system.*`, `session.*`, `network.*`, throttle commands | Compat: version/session/network values and throttle placeholders | Method enumeration and XMLRPC fixture rows |
+| System/session | `system.*`, `session.*`, `network.*`, throttle commands | Native/Compat: version/session/network values plus native global throttle reads when an engine is attached | Method enumeration and XMLRPC fixture rows |
 | Download/torrent | `d.*`, `d.multicall*`, `load.*` | Compat/native mix: registry-backed reads, custom field roundtrip, magnet/path load, lifecycle hooks | Read projection, custom field, multicall, load/erase rows |
 | File | `f.*` | Native/compat: registry fallback row without an engine; native metadata rows expose path, size, offsets, piece ranges, priority, and completion | File multicall shape and projection rows |
-| Tracker | `t.*`, tracker announce controls | Native/compat: tracker rows expose native announce URLs and stable status counters; announce accepted and engine tracker work remains covered by interop matrix | Tracker multicall and announce acceptance row |
+| Tracker | `t.*`, tracker announce controls | Native/Compat: tracker rows expose native announce URLs, and persisted engine tracker status/scrape counters when available; announce accepted and engine tracker work remains covered by interop matrix | Tracker multicall and announce acceptance row |
 | Peer | `p.*` | Native/compat: peer rows expose native peer address, port, client, progress, rates, choke/interested flags when an engine is attached | Peer multicall projection row |
 | Views/queue | `view.*`, priority/custom views | Compat: `main` view and registry count; advanced custom views remain placeholder | View list/size row |
 

@@ -175,10 +175,11 @@ Remaining compatibility gaps:
   torrent peer/rate fields project native snapshots when available; remaining
   plugin work is native behavioral effects only where TorrentNG explicitly
   chooses to own those workflows.
-- rTorrent: file/tracker/peer multicalls now project native metadata and peer
-  snapshots when an engine is attached, with registry fallback file rows for
-  in-memory compatibility probes; advanced view and throttle semantics remain
-  compatibility placeholders.
+- rTorrent: file/tracker/peer multicalls now project native metadata, persisted
+  tracker state, and peer snapshots when an engine is attached, with registry
+  fallback file rows for in-memory compatibility probes. Global throttle reads
+  use native limits where available; advanced custom views remain compatibility
+  placeholders.
 - qBittorrent: common automation flows are covered, and `torrents/info`,
   `sync/maindata`, and `transfer/info` now project native peer snapshots into
   live seed/leecher counters and aggregate rates; deeper tracker delta fidelity
