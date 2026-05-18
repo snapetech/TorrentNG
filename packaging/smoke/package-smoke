@@ -157,6 +157,26 @@ release_url() {
   printf 'https://github.com/%s/releases/download/%s/%s' "$GITHUB_REPOSITORY" "$version" "$asset"
 }
 
+binary_asset_for_host() {
+  case "$(uname -s)" in
+    Darwin)
+      if [[ "$(uname -m)" == "arm64" || "$(uname -m)" == "aarch64" ]]; then
+        printf '%s\n' "${MACOS_ARM64_ARCHIVE_ASSET:-$MACOS_ARCHIVE_ASSET}"
+      else
+        printf '%s\n' "$MACOS_ARCHIVE_ASSET"
+      fi
+      ;;
+    MINGW*|MSYS*|CYGWIN*) printf '%s\n' "$WINDOWS_ARCHIVE_ASSET" ;;
+    *)
+      if [[ "$(uname -m)" == "aarch64" || "$(uname -m)" == "arm64" ]]; then
+        printf '%s\n' "${LINUX_ARM64_ARCHIVE_ASSET:-$LINUX_ARCHIVE_ASSET}"
+      else
+        printf '%s\n' "$LINUX_ARCHIVE_ASSET"
+      fi
+      ;;
+  esac
+}
+
 find_release_asset() {
   local pattern="$1"
   local api="https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$version"
@@ -204,11 +224,8 @@ smoke_http_process() {
 }
 
 install_github_archive() {
-  local asset="$LINUX_ARCHIVE_ASSET"
-  case "$(uname -s)" in
-    Darwin) asset="$MACOS_ARCHIVE_ASSET" ;;
-    MINGW*|MSYS*|CYGWIN*) asset="$WINDOWS_ARCHIVE_ASSET" ;;
-  esac
+  local asset
+  asset="$(binary_asset_for_host)"
   local url; url="$(release_url "$asset")"
   wait_for_url "$url" 30 20 || die "release archive unavailable: $url"
   local archive="$tmp_dir/$asset"
@@ -227,7 +244,8 @@ install_github_archive() {
 }
 
 install_github_binary() {
-  local asset="$LINUX_ARCHIVE_ASSET"
+  local asset
+  asset="$(binary_asset_for_host)"
   local url; url="$(release_url "$asset")"
   wait_for_url "$url" 30 20 || die "release binary unavailable: $url"
   local bin="$tmp_dir/$asset"

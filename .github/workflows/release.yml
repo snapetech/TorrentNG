@@ -17,10 +17,33 @@ permissions:
   actions: write
 
 jobs:
-  release:
-    name: Build and publish release
-    runs-on: [self-hosted, Linux, X64]
-
+  native-binaries:
+    name: Native binary (${{ matrix.suffix }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            suffix: linux-x86_64
+            binary: torrentngd
+            archive: tar.gz
+          - os: ubuntu-24.04-arm
+            suffix: linux-aarch64
+            binary: torrentngd
+            archive: tar.gz
+          - os: macos-13
+            suffix: macos-x86_64
+            binary: torrentngd
+            archive: tar.gz
+          - os: macos-14
+            suffix: macos-aarch64
+            binary: torrentngd
+            archive: tar.gz
+          - os: windows-latest
+            suffix: windows-x86_64
+            binary: torrentngd.exe
+            archive: zip
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -44,13 +67,91 @@ jobs:
           fi
           git fetch --force origin main --tags
           tag_commit="$(git rev-list -n 1 "$tag")"
-          main_commit="$(git rev-parse origin/main)"
           if ! git merge-base --is-ancestor "$tag_commit" origin/main; then
-            echo "Tag $tag points at $tag_commit, which is not on origin/main ($main_commit)." >&2
+            echo "Tag $tag points at $tag_commit, which is not on origin/main." >&2
             exit 1
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "tag_commit=$tag_commit" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Build WebUI
+        working-directory: webui
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci
+          TNG_WEBUI_OUT_DIR=dist npm run build
+
+      - name: Build native daemon
+        shell: bash
+        run: cargo build --release --locked -p torrentngd
+
+      - name: Smoke native daemon version
+        shell: bash
+        run: |
+          set -euo pipefail
+          "target/release/${{ matrix.binary }}" --version
+
+      - name: Package native assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.tag }}"
+          suffix="${{ matrix.suffix }}"
+          mkdir -p dist native/usr/bin native/usr/share/torrentng/webui
+          cp "target/release/${{ matrix.binary }}" "dist/torrentngd-${suffix}${{ matrix.binary == 'torrentngd.exe' && '.exe' || '' }}"
+          cp "target/release/${{ matrix.binary }}" "native/usr/bin/${{ matrix.binary }}"
+          cp -a webui/dist/. native/usr/share/torrentng/webui/
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            powershell -NoProfile -Command "Compress-Archive -Path native/* -DestinationPath dist/torrentngd-native-${tag}-${suffix}.zip -Force"
+          else
+            tar -czf "dist/torrentngd-native-${tag}-${suffix}.tar.gz" -C native .
+          fi
+
+      - name: Upload native artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.suffix }}
+          path: dist/*
+
+  linux-release-assets:
+    name: Linux containers and shared assets
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            tag="${{ github.event.inputs.tag }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          if [[ "$tag" != main-* ]]; then
+            echo "Release tags must start with main-; got $tag." >&2
+            exit 1
+          fi
+          git fetch --force origin main --tags
+          tag_commit="$(git rev-list -n 1 "$tag")"
+          if ! git merge-base --is-ancestor "$tag_commit" origin/main; then
+            echo "Tag $tag points at $tag_commit, which is not on origin/main." >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -68,14 +169,11 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Build webui
+      - name: Build WebUI
         working-directory: webui
         run: |
           npm ci
           TNG_WEBUI_OUT_DIR=dist npm run build
-
-      - name: Build native daemon
-        run: cargo build --release --locked -p torrentngd
 
       - name: Build Docker images
         run: |
@@ -116,20 +214,59 @@ jobs:
           publish_image torrentng ghcr.io/snapetech/torrentng/sidecar snapetech/torrentng-sidecar
           publish_image torrentng-phase1 ghcr.io/snapetech/torrentng/phase1 snapetech/torrentng-phase1
 
-      - name: Package release artifacts
+      - name: Package shared assets
         shell: bash
         run: |
           set -euo pipefail
+          tag="${{ steps.tag.outputs.tag }}"
           mkdir -p dist
-          cp target/release/torrentngd "dist/torrentngd-linux-x86_64"
           cp sidecar/target/release/torrentng "dist/torrentng-linux-x86_64"
-          mkdir -p dist/native/usr/bin dist/native/usr/share/torrentng/webui
-          cp target/release/torrentngd dist/native/usr/bin/torrentngd
-          cp -a webui/dist/. dist/native/usr/share/torrentng/webui/
-          tar -czf "dist/torrentngd-native-${{ steps.tag.outputs.tag }}-linux-x86_64.tar.gz" -C dist/native .
-          tar -czf "dist/torrentng-webui-${{ steps.tag.outputs.tag }}.tar.gz" -C webui/dist .
-          tar -czf "dist/torrentng-deploy-${{ steps.tag.outputs.tag }}.tar.gz" deploy docs README.md LICENSE
-          sha256sum dist/* > "dist/SHA256SUMS-${{ steps.tag.outputs.tag }}.txt"
+          tar -czf "dist/torrentng-webui-${tag}.tar.gz" -C webui/dist .
+          tar -czf "dist/torrentng-deploy-${tag}.tar.gz" deploy docs README.md LICENSE
+
+      - name: Upload shared artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: shared-linux-assets
+          path: dist/*
+
+  publish:
+    name: Publish release
+    runs-on: [self-hosted, Linux, X64]
+    needs:
+      - native-binaries
+      - linux-release-assets
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            tag="${{ github.event.inputs.tag }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum * > "SHA256SUMS-${{ steps.tag.outputs.tag }}.txt"
 
       - name: Create GitHub release
         env:
