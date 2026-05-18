@@ -1938,6 +1938,7 @@ pub async fn sync_maindata(
     } else {
         0.0
     };
+    let session_rates = qbit_session_rates_from_infos(&infos);
     let limits = global_limits(&state).await;
     let resp = SyncMaindataResponse {
         rid,
@@ -1945,9 +1946,9 @@ pub async fn sync_maindata(
         torrents: SyncTorrentMap { infos, full_update },
         torrents_removed: &[],
         server_state: QbServerState {
-            dl_info_speed: 0,
+            dl_info_speed: session_rates.download_rate,
             dl_info_data: 0,
-            up_info_speed: 0,
+            up_info_speed: session_rates.upload_rate,
             up_info_data: 0,
             alltime_dl,
             alltime_ul,
@@ -2083,12 +2084,13 @@ fn qbit_peer_map(peers: &[EnginePeerSnapshot]) -> serde_json::Map<String, serde_
 
 pub async fn transfer_info(State(state): State<AppState>) -> impl IntoResponse {
     let limits = global_limits(&state).await;
+    let session_rates = qbit_session_rates(&state).await;
     (
         StatusCode::OK,
         Json(serde_json::json!({
-            "dl_info_speed": 0,
+            "dl_info_speed": session_rates.download_rate,
             "dl_info_data": 0,
-            "up_info_speed": 0,
+            "up_info_speed": session_rates.upload_rate,
             "up_info_data": 0,
             "connection_status": "connected",
             "free_space_on_disk": 0,
@@ -2821,6 +2823,31 @@ struct QbitSwarmProjection {
     leechers: u32,
     download_rate: i64,
     upload_rate: i64,
+}
+
+async fn qbit_session_rates(state: &AppState) -> QbitSwarmProjection {
+    let entries = {
+        let reg = state.registry.read().await;
+        reg.iter().map(|entry| entry.info_hash.clone()).collect::<Vec<_>>()
+    };
+    let mut projection = QbitSwarmProjection::default();
+    for hash in entries {
+        let swarm = qbit_swarm_projection(state, &hash).await;
+        projection.download_rate = projection.download_rate.saturating_add(swarm.download_rate);
+        projection.upload_rate = projection.upload_rate.saturating_add(swarm.upload_rate);
+    }
+    projection
+}
+
+fn qbit_session_rates_from_infos(infos: &[QbTorrentInfo]) -> QbitSwarmProjection {
+    infos.iter().fold(
+        QbitSwarmProjection::default(),
+        |mut projection, info| {
+            projection.download_rate = projection.download_rate.saturating_add(info.dlspeed);
+            projection.upload_rate = projection.upload_rate.saturating_add(info.upspeed);
+            projection
+        },
+    )
 }
 
 async fn qbit_swarm_projection(state: &AppState, info_hash: &str) -> QbitSwarmProjection {
@@ -5019,6 +5046,26 @@ mod tests {
                 leechers: 1,
                 download_rate: 300,
                 upload_rate: 3_000,
+            }
+        );
+    }
+
+    #[test]
+    fn qbit_session_rates_sum_torrent_info_rates() {
+        let mut first = qbit_info(&"a".repeat(40), "", 0);
+        first.dlspeed = 123;
+        first.upspeed = 456;
+        let mut second = qbit_info(&"b".repeat(40), "", 0);
+        second.dlspeed = 10;
+        second.upspeed = 20;
+
+        assert_eq!(
+            qbit_session_rates_from_infos(&[first, second]),
+            QbitSwarmProjection {
+                seeds: 0,
+                leechers: 0,
+                download_rate: 133,
+                upload_rate: 476,
             }
         );
     }

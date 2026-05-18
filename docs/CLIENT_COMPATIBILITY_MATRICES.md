@@ -77,7 +77,7 @@ Universal compatibility release rule:
 | RSS | qBit RSS API | none core | plugin ecosystem | ruTorrent plugins | qBit no-op/read-compatible only | RSS API shape tests |
 | Search | qBit search API | none core | plugin ecosystem | ruTorrent plugins | qBit no-op/read-compatible only | Search API shape tests |
 | Logs | qBit log endpoints | none core | events | log files | qBit main log backed by retained app/session events; peer log empty-compatible; Deluge events basic | Log/event shape tests |
-| Session stats | transfer/info, sync | session_stats | session_status/stats | global commands | Native counters with zero-rate placeholders | Cross-facade stats consistency row |
+| Session stats | transfer/info, sync | session_stats | session_status/stats | global commands | Native counters; qBit, Transmission, and Deluge session rates aggregate native peer snapshots where available | Cross-facade stats consistency row |
 | Auth/session handshake | cookie login | CSRF/session id plus JSON-RPC 2.0 | JSON-RPC auth.login | external HTTP auth | Compat | Auth handshake rows for every facade |
 
 ## 2. Import And Fast-Resume Matrix

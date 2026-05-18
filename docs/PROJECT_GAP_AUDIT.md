@@ -178,9 +178,10 @@ Remaining compatibility gaps:
   snapshots when an engine is attached, with registry fallback file rows for
   in-memory compatibility probes; advanced view and throttle semantics remain
   compatibility placeholders.
-- qBittorrent: common automation flows are covered, and `torrents/info` now
-  projects native peer snapshots into live seed/leecher counters and aggregate
-  rates; deeper tracker delta fidelity remains placeholder-depth.
+- qBittorrent: common automation flows are covered, and `torrents/info`,
+  `sync/maindata`, and `transfer/info` now project native peer snapshots into
+  live seed/leecher counters and aggregate rates; deeper tracker delta fidelity
+  remains placeholder-depth.
 - DHT-only magnets: DHT `get_peers` forwarding and trackerless BEP 9 metadata
   completion from discovered peers are unit-covered in `rt-engine`; the
   remaining row is Docker-level trackerless transfer certification.
