@@ -50,6 +50,14 @@ pub struct NetworkConfig {
     pub listen_port: u16,
     /// Maximum total peer connections across all torrents.
     pub max_peers: usize,
+    /// Maximum accepted-but-not-routed inbound peer handshakes across the daemon.
+    pub max_incoming_handshakes: usize,
+    /// Maximum inbound handshakes accepted from one IP during the configured window.
+    pub max_incoming_handshakes_per_ip: usize,
+    /// Sliding window for per-IP inbound handshake throttling.
+    pub incoming_handshake_window_secs: u64,
+    /// Timeout for inbound peer handshakes before routing to a torrent task.
+    pub incoming_handshake_timeout_secs: u64,
     /// Maximum upload rate in bytes/sec (0 = unlimited).
     pub upload_rate_limit: u64,
     /// Maximum download rate in bytes/sec (0 = unlimited).
@@ -122,6 +130,16 @@ pub struct TrackerConfig {
     pub udp_timeout_secs: u64,
     /// Minimum announce interval override in seconds (0 = use tracker's value).
     pub min_interval_secs: u64,
+    pub allow_http_trackers: bool,
+    pub allow_https_trackers: bool,
+    pub allow_udp_trackers: bool,
+    pub allow_http_webseeds: bool,
+    pub allow_https_webseeds: bool,
+    pub allow_loopback_egress: bool,
+    pub allow_private_egress: bool,
+    pub allow_link_local_egress: bool,
+    pub allow_multicast_egress: bool,
+    pub allow_unspecified_egress: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,6 +184,10 @@ impl Default for NetworkConfig {
         NetworkConfig {
             listen_port: 6881,
             max_peers: 200,
+            max_incoming_handshakes: 256,
+            max_incoming_handshakes_per_ip: 16,
+            incoming_handshake_window_secs: 30,
+            incoming_handshake_timeout_secs: 10,
             upload_rate_limit: 0,
             download_rate_limit: 0,
         }
@@ -221,6 +243,16 @@ impl Default for TrackerConfig {
             http_timeout_secs: 30,
             udp_timeout_secs: 15,
             min_interval_secs: 0,
+            allow_http_trackers: true,
+            allow_https_trackers: true,
+            allow_udp_trackers: true,
+            allow_http_webseeds: true,
+            allow_https_webseeds: true,
+            allow_loopback_egress: false,
+            allow_private_egress: false,
+            allow_link_local_egress: false,
+            allow_multicast_egress: false,
+            allow_unspecified_egress: false,
         }
     }
 }
@@ -275,6 +307,10 @@ impl Config {
         require(!self.daemon.api_bind.trim().is_empty(), "daemon.api_bind must not be empty")?;
         require(self.daemon.shutdown_timeout_secs > 0, "daemon.shutdown_timeout_secs must be greater than zero")?;
         require(self.network.max_peers > 0, "network.max_peers must be greater than zero")?;
+        require(self.network.max_incoming_handshakes > 0, "network.max_incoming_handshakes must be greater than zero")?;
+        require(self.network.max_incoming_handshakes_per_ip > 0, "network.max_incoming_handshakes_per_ip must be greater than zero")?;
+        require(self.network.incoming_handshake_window_secs > 0, "network.incoming_handshake_window_secs must be greater than zero")?;
+        require(self.network.incoming_handshake_timeout_secs > 0, "network.incoming_handshake_timeout_secs must be greater than zero")?;
         require(!self.storage.download_dir.as_os_str().is_empty(), "storage.download_dir must not be empty")?;
         require(self.storage.file_pool_size > 0, "storage.file_pool_size must be greater than zero")?;
         require(self.storage.io_worker_threads > 0, "storage.io_worker_threads must be greater than zero")?;
@@ -313,6 +349,14 @@ impl Config {
         require(
             self.tracker.udp_timeout_secs > 0,
             "tracker.udp_timeout_secs must be greater than zero",
+        )?;
+        require(
+            self.tracker.allow_http_trackers || self.tracker.allow_https_trackers || self.tracker.allow_udp_trackers,
+            "at least one tracker scheme must be enabled",
+        )?;
+        require(
+            self.tracker.allow_http_webseeds || self.tracker.allow_https_webseeds,
+            "at least one webseed scheme must be enabled",
         )?;
         require(
             self.db.wal_checkpoint_pages > 0,
@@ -389,9 +433,21 @@ mod tests {
         c.validate().unwrap();
         assert_eq!(c.network.listen_port, 6881);
         assert_eq!(c.network.max_peers, 200);
+        assert_eq!(c.network.max_incoming_handshakes, 256);
+        assert_eq!(c.network.max_incoming_handshakes_per_ip, 16);
+        assert_eq!(c.network.incoming_handshake_window_secs, 30);
+        assert_eq!(c.network.incoming_handshake_timeout_secs, 10);
         assert!(c.dht.enabled);
         assert!(!c.dht.bootstrap_nodes.is_empty());
         assert_eq!(c.tracker.http_timeout_secs, 30);
+        assert!(c.tracker.allow_http_trackers);
+        assert!(c.tracker.allow_https_trackers);
+        assert!(c.tracker.allow_udp_trackers);
+        assert!(c.tracker.allow_http_webseeds);
+        assert!(c.tracker.allow_https_webseeds);
+        assert!(!c.tracker.allow_loopback_egress);
+        assert!(!c.tracker.allow_private_egress);
+        assert!(!c.tracker.allow_link_local_egress);
         assert!(c.auth.api_tokens.is_empty());
         assert_eq!(c.daemon.shutdown_timeout_secs, 10);
         assert_eq!(c.memory.total_cap_mb, 512);
@@ -443,6 +499,16 @@ mod tests {
         let mut c = Config::default();
         c.auth.api_tokens = vec!["".to_owned()];
         assert!(matches!(c.validate(), Err(ConfigError::Validation(_))));
+
+        let mut c = Config::default();
+        c.network.max_incoming_handshakes = 0;
+        assert!(matches!(c.validate(), Err(ConfigError::Validation(_))));
+
+        let mut c = Config::default();
+        c.tracker.allow_http_trackers = false;
+        c.tracker.allow_https_trackers = false;
+        c.tracker.allow_udp_trackers = false;
+        assert!(matches!(c.validate(), Err(ConfigError::Validation(_))));
     }
 
     #[test]
@@ -451,9 +517,17 @@ mod tests {
 [network]
 listen_port = 51413
 max_peers = 500
+max_incoming_handshakes = 128
+max_incoming_handshakes_per_ip = 8
+incoming_handshake_window_secs = 20
+incoming_handshake_timeout_secs = 5
 
 [auth]
 api_tokens = ["one", "two"]
+
+[tracker]
+allow_private_egress = true
+allow_link_local_egress = true
 
 [storage]
 file_pool_size = 99
@@ -472,8 +546,14 @@ peer_read_elevator_budget_ms = 9
         c.validate().unwrap();
         assert_eq!(c.network.listen_port, 51413);
         assert_eq!(c.network.max_peers, 500);
+        assert_eq!(c.network.max_incoming_handshakes, 128);
+        assert_eq!(c.network.max_incoming_handshakes_per_ip, 8);
+        assert_eq!(c.network.incoming_handshake_window_secs, 20);
+        assert_eq!(c.network.incoming_handshake_timeout_secs, 5);
         // defaults preserved for unset fields
         assert_eq!(c.tracker.http_timeout_secs, 30);
+        assert!(c.tracker.allow_private_egress);
+        assert!(c.tracker.allow_link_local_egress);
         assert!(c.dht.enabled);
         assert_eq!(c.auth.api_tokens, vec!["one", "two"]);
         assert_eq!(c.storage.file_pool_size, 99);
