@@ -261,11 +261,9 @@ async fn read_sparse_range(
     offset: u64,
     len: u64,
 ) -> Result<bytes::Bytes, StorageError> {
-    let extents = scheduler.data_extents(path, offset, len).await?;
+    let extents = recheck_data_extents(scheduler, path, offset, len).await?;
     if extents.is_empty() {
-        return scheduled_read_owned(scheduler, IoClass::Recheck, path, offset, len as usize)
-            .await
-            .map(|read| read.into_bytes());
+        return recheck_read_owned(scheduler, path, offset, len as usize).await;
     }
 
     let mut out = Vec::with_capacity(len as usize);
@@ -277,15 +275,14 @@ async fn read_sparse_range(
         }
         let extent_end = extent.offset.saturating_add(extent.len).min(range_end);
         if extent_end > extent.offset {
-            let data = scheduled_read_owned(
+            let data = recheck_read_owned(
                 scheduler,
-                IoClass::Recheck,
                 path,
                 extent.offset,
                 (extent_end - extent.offset) as usize,
             )
             .await?;
-            out.extend_from_slice(data.as_slice());
+            out.extend_from_slice(&data);
             cursor = extent_end;
         }
     }
@@ -293,6 +290,52 @@ async fn read_sparse_range(
         out.resize(out.len() + (range_end - cursor) as usize, 0);
     }
     Ok(bytes::Bytes::from(out))
+}
+
+async fn recheck_read_owned(
+    scheduler: &MountScheduler,
+    path: &Path,
+    offset: u64,
+    len: usize,
+) -> Result<bytes::Bytes, StorageError> {
+    let mut attempts = 0;
+    loop {
+        match scheduled_read_owned(scheduler, IoClass::Recheck, path, offset, len).await {
+            Ok(read) => return Ok(read.into_bytes()),
+            Err(StorageError::QueueFull { .. }) if attempts < 10_000 => {
+                attempts += 1;
+                if attempts % 16 == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                } else {
+                    tokio::task::yield_now().await;
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+async fn recheck_data_extents(
+    scheduler: &MountScheduler,
+    path: &Path,
+    offset: u64,
+    len: u64,
+) -> Result<Vec<crate::scheduler::DataExtent>, StorageError> {
+    let mut attempts = 0;
+    loop {
+        match scheduler.data_extents(path, offset, len).await {
+            Ok(extents) => return Ok(extents),
+            Err(StorageError::QueueFull { .. }) if attempts < 10_000 => {
+                attempts += 1;
+                if attempts % 16 == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                } else {
+                    tokio::task::yield_now().await;
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 #[cfg(test)]
