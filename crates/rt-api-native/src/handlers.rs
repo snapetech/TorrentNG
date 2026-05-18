@@ -3637,6 +3637,48 @@ mod tests {
     }
 
     #[test]
+    fn storage_plan_preview_projects_staged_import_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.bin");
+        let destination = dir.path().join("destination.bin");
+        std::fs::write(&source, b"payload").unwrap();
+        let req = StoragePlanRequest {
+            operation: "import".to_owned(),
+            source: Some(source),
+            destination: Some(destination.clone()),
+            target: None,
+            bytes: Some(7),
+            available_bytes: Some(7),
+            hardlink_or_copy: Some(false),
+            dry_run: Some(true),
+            dry_run_approved: None,
+            affected_torrents: None,
+            roots: None,
+            completed_steps: None,
+        };
+
+        let plan = build_storage_plan(&req, true).unwrap();
+        let response = storage_plan_response(&req.operation, &plan, None);
+
+        assert_eq!(response.operation, "import");
+        assert!(response.plan.can_apply);
+        assert_eq!(response.plan.steps.len(), 2);
+        assert_eq!(response.plan.steps[0].action, "copy_verify_rename");
+        let destination = destination.display().to_string();
+        assert_ne!(
+            response.plan.steps[0].destination.as_deref(),
+            Some(destination.as_str())
+        );
+        assert_eq!(response.plan.steps[1].action, "rename");
+        assert_eq!(
+            response.plan.steps[1].destination.as_deref(),
+            Some(destination.as_str())
+        );
+        assert_eq!(response.plan.rollback_steps.len(), 1);
+        assert_eq!(response.plan.rollback_steps[0].action, "safe_delete");
+    }
+
+    #[test]
     fn storage_plan_root_validation_rejects_escape() {
         let allowed = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
