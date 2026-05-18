@@ -645,6 +645,22 @@ pub struct EnginePeerSnapshot {
     pub uploaded: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineTrackerSnapshot {
+    pub id: i64,
+    pub tier: i64,
+    pub announce: String,
+    pub status: String,
+    pub last_announce_at: Option<i64>,
+    pub next_announce_at: Option<i64>,
+    pub last_success_at: Option<i64>,
+    pub failure_reason: Option<String>,
+    pub warning_message: Option<String>,
+    pub seeders: Option<i64>,
+    pub leechers: Option<i64>,
+    pub completed: Option<i64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueMove {
     Up,
@@ -739,6 +755,11 @@ pub enum EngineCmd {
     GetTorrentBlob {
         info_hash: String,
         reply: oneshot::Sender<CmdResult<Vec<u8>>>,
+    },
+    /// Read persisted tracker state for compatibility facades.
+    GetTorrentTrackers {
+        info_hash: String,
+        reply: oneshot::Sender<CmdResult<Vec<EngineTrackerSnapshot>>>,
     },
     /// Update category and/or tags, then persist the session row.
     UpdateTorrentLabels {

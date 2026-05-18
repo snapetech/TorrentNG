@@ -2828,7 +2828,9 @@ struct QbitSwarmProjection {
 async fn qbit_session_rates(state: &AppState) -> QbitSwarmProjection {
     let entries = {
         let reg = state.registry.read().await;
-        reg.iter().map(|entry| entry.info_hash.clone()).collect::<Vec<_>>()
+        reg.iter()
+            .map(|entry| entry.info_hash.clone())
+            .collect::<Vec<_>>()
     };
     let mut projection = QbitSwarmProjection::default();
     for hash in entries {
@@ -2840,14 +2842,13 @@ async fn qbit_session_rates(state: &AppState) -> QbitSwarmProjection {
 }
 
 fn qbit_session_rates_from_infos(infos: &[QbTorrentInfo]) -> QbitSwarmProjection {
-    infos.iter().fold(
-        QbitSwarmProjection::default(),
-        |mut projection, info| {
+    infos
+        .iter()
+        .fold(QbitSwarmProjection::default(), |mut projection, info| {
             projection.download_rate = projection.download_rate.saturating_add(info.dlspeed);
             projection.upload_rate = projection.upload_rate.saturating_add(info.upspeed);
             projection
-        },
-    )
+        })
 }
 
 async fn qbit_swarm_projection(state: &AppState, info_hash: &str) -> QbitSwarmProjection {

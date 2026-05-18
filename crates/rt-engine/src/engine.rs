@@ -34,8 +34,8 @@ use rt_storage::{
 
 use crate::command::{
     CmdResult, EngineCmd, EngineGlobalLimits, EngineJob, EnginePeerSnapshot, EnginePieceState,
-    EngineStats, EngineTorrentFile, EngineTorrentLimits, EngineTorrentMetadata, QueueMove,
-    TorrentDiagnostic,
+    EngineStats, EngineTorrentFile, EngineTorrentLimits, EngineTorrentMetadata,
+    EngineTrackerSnapshot, QueueMove, TorrentDiagnostic,
 };
 use crate::dht_task::{run_dht, DhtCommand, DhtTorrent};
 use crate::metadata_task::run_metadata_task;
@@ -303,6 +303,18 @@ impl EngineHandle {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx
             .send(EngineCmd::GetTorrentBlob { info_hash, reply })
+            .await
+            .map_err(|_| "engine shut down".to_owned())?;
+        rx.await.map_err(|_| "engine dropped reply".to_owned())?
+    }
+
+    pub async fn torrent_trackers(
+        &self,
+        info_hash: String,
+    ) -> CmdResult<Vec<EngineTrackerSnapshot>> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(EngineCmd::GetTorrentTrackers { info_hash, reply })
             .await
             .map_err(|_| "engine shut down".to_owned())?;
         rx.await.map_err(|_| "engine dropped reply".to_owned())?
@@ -1022,7 +1034,14 @@ impl Engine {
             }
 
             EngineCmd::GetTorrentBlob { info_hash, reply } => {
-                let result = self.load_torrent_blob(&info_hash).map_err(|e| e.to_string());
+                let result = self
+                    .load_torrent_blob(&info_hash)
+                    .map_err(|e| e.to_string());
+                let _ = reply.send(result);
+            }
+
+            EngineCmd::GetTorrentTrackers { info_hash, reply } => {
+                let result = self.torrent_trackers_inner(&info_hash);
                 let _ = reply.send(result);
             }
 
@@ -2430,6 +2449,14 @@ impl Engine {
             .map_err(|_| "torrent task dropped reply".to_owned())
     }
 
+    fn torrent_trackers_inner(&self, info_hash: &str) -> CmdResult<Vec<EngineTrackerSnapshot>> {
+        let db = self.db.lock().expect("database mutex poisoned");
+        let row = rt_db::get(&db, info_hash).map_err(|e| e.to_string())?;
+        rt_db::list_torrent_trackers(&db, &row.info_hash)
+            .map(|trackers| trackers.into_iter().map(engine_tracker_snapshot).collect())
+            .map_err(|e| e.to_string())
+    }
+
     async fn rename_file_path_inner(
         &self,
         info_hash: &str,
@@ -3755,6 +3782,23 @@ fn state_from_str(state: &str) -> TorrentState {
 
 fn is_v2_only_placeholder_row(row: &TorrentRow) -> bool {
     row.info_hash.len() == 64 && row.total_length == 0 && row.piece_count == 0
+}
+
+fn engine_tracker_snapshot(row: rt_db::TorrentTrackerRow) -> EngineTrackerSnapshot {
+    EngineTrackerSnapshot {
+        id: row.tracker_index,
+        tier: row.tier,
+        announce: row.url,
+        status: row.status,
+        last_announce_at: row.last_announce_at,
+        next_announce_at: row.next_announce_at,
+        last_success_at: row.last_success_at,
+        failure_reason: row.failure_reason,
+        warning_message: row.warning_message,
+        seeders: row.seeders,
+        leechers: row.leechers,
+        completed: row.completed,
+    }
 }
 
 fn torrent_blob_dir(config: &Config) -> PathBuf {

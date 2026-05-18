@@ -8,8 +8,9 @@ pub mod torrent_task;
 
 pub use command::{
     EngineGlobalLimits, EngineJob, EnginePeerSnapshot, EnginePieceState, EngineStats,
-    EngineTorrentFile, EngineTorrentLimits, EngineTorrentMetadata, HotTorrentMemoryStats,
-    QueueMove, StorageDeviceLatencyStats, TorrentDiagnostic, TorrentRuntimeStats,
+    EngineTorrentFile, EngineTorrentLimits, EngineTorrentMetadata, EngineTrackerSnapshot,
+    HotTorrentMemoryStats, QueueMove, StorageDeviceLatencyStats, TorrentDiagnostic,
+    TorrentRuntimeStats,
 };
 pub use engine::{Engine, EngineHandle};
 pub use tier::{

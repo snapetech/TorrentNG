@@ -157,7 +157,7 @@ Transmission `torrent_get` field matrix:
 | Seed limits | `seed_ratio_limit`, `seed_ratio_mode`, `seed_idle_limit`, `seed_idle_mode` | Compat/native mutation and projection |
 | Files | `files`, `file_stats`, `priorities`, `wanted` | Native/Partial |
 | Peers | `peers`, `peers_connected`, `peers_from`, `peers_getting_from_us`, `peers_sending_to_us` | Partial; `peers_from` shape implemented with best-effort counts |
-| Trackers | `trackers`, `tracker_stats` including announce/scrape states and counts | Partial; detailed states/counts gap |
+| Trackers | `trackers`, `tracker_stats` including announce/scrape states and counts | Native/Partial; persisted announce status, timestamps, failure/warning messages, and scrape counts project from engine tracker rows |
 | Web seeds | `webseeds`, `webseeds_sending_to_us`, `webseeds_ex` | Partial; `webseeds_ex` shape implemented with activity placeholders |
 | Queue/group | `queue_position`, `group` | Partial; default group compatibility implemented |
 | Comments/creator | `comment`, `creator`, `primary_mime_type` | Partial; primary MIME type compatibility implemented as empty string |

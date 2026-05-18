@@ -15,7 +15,7 @@ use axum::{
 use base64::{engine::general_purpose, Engine as _};
 use rt_engine::{
     EngineGlobalLimits, EngineHandle, EnginePeerSnapshot, EnginePieceState, EngineTorrentLimits,
-    EngineTorrentMetadata, QueueMove,
+    EngineTorrentMetadata, EngineTrackerSnapshot, QueueMove,
 };
 use rt_metainfo::{parse_magnet, parse_torrent};
 use rt_metrics::{MemoryClass, MemoryLease};
@@ -1028,6 +1028,7 @@ async fn torrent_get(state: &AppState, args: &Value) -> Result<Value, String> {
         }
     }
     let mut peers = std::collections::HashMap::new();
+    let mut tracker_snapshots = std::collections::HashMap::new();
     if let Some(engine) = &state.engine {
         for entry in &entries {
             if fields
@@ -1036,6 +1037,14 @@ async fn torrent_get(state: &AppState, args: &Value) -> Result<Value, String> {
             {
                 if let Ok(snapshot) = engine.torrent_peers(entry.info_hash.clone()).await {
                     peers.insert(entry.info_hash.clone(), snapshot);
+                }
+            }
+            if fields
+                .iter()
+                .any(|field| transmission_field_needs_trackers(field))
+            {
+                if let Ok(snapshot) = engine.torrent_trackers(entry.info_hash.clone()).await {
+                    tracker_snapshots.insert(entry.info_hash.clone(), snapshot);
                 }
             }
         }
@@ -1165,8 +1174,14 @@ async fn torrent_get(state: &AppState, args: &Value) -> Result<Value, String> {
                         "fromPex": 0,
                         "fromTracker": peers.get(&entry.info_hash).map(Vec::len).unwrap_or(0),
                     }),
-                    "trackers" => json!(transmission_trackers(meta)),
-                    "trackerStats" | "tracker-stats" => json!(transmission_tracker_stats(meta)),
+                    "trackers" => json!(transmission_trackers(
+                        meta,
+                        tracker_snapshots.get(&entry.info_hash)
+                    )),
+                    "trackerStats" | "tracker-stats" => json!(transmission_tracker_stats(
+                        meta,
+                        tracker_snapshots.get(&entry.info_hash)
+                    )),
                     "files" => json!(transmission_files(entry, meta)),
                     "fileStats" | "file-stats" => json!(transmission_file_stats(entry, meta)),
                     "priorities" => json!(transmission_file_priorities(meta)),
@@ -1266,6 +1281,14 @@ fn transmission_field_needs_peers(field: &str) -> bool {
             | "rate-download"
             | "rateUpload"
             | "rate-upload"
+    )
+}
+
+fn transmission_field_needs_trackers(field: &str) -> bool {
+    let field = field.replace('_', "-");
+    matches!(
+        field.as_str(),
+        "trackers" | "trackerStats" | "tracker-stats"
     )
 }
 
@@ -1488,7 +1511,23 @@ fn transmission_webseeds_ex(meta: Option<&EngineTorrentMetadata>) -> Vec<Value> 
     .unwrap_or_default()
 }
 
-fn transmission_trackers(meta: Option<&EngineTorrentMetadata>) -> Vec<Value> {
+fn transmission_trackers(
+    meta: Option<&EngineTorrentMetadata>,
+    trackers: Option<&Vec<EngineTrackerSnapshot>>,
+) -> Vec<Value> {
+    if let Some(trackers) = trackers {
+        return trackers
+            .iter()
+            .map(|tracker| {
+                json!({
+                    "id": tracker.id,
+                    "announce": tracker.announce,
+                    "scrape": "",
+                    "tier": tracker.tier,
+                })
+            })
+            .collect();
+    }
     meta.map(|meta| {
         meta.trackers
             .iter()
@@ -1506,7 +1545,13 @@ fn transmission_trackers(meta: Option<&EngineTorrentMetadata>) -> Vec<Value> {
     .unwrap_or_default()
 }
 
-fn transmission_tracker_stats(meta: Option<&EngineTorrentMetadata>) -> Vec<Value> {
+fn transmission_tracker_stats(
+    meta: Option<&EngineTorrentMetadata>,
+    trackers: Option<&Vec<EngineTrackerSnapshot>>,
+) -> Vec<Value> {
+    if let Some(trackers) = trackers {
+        return trackers.iter().map(transmission_tracker_stat).collect();
+    }
     meta.map(|meta| {
         meta.trackers
             .iter()
@@ -1535,6 +1580,36 @@ fn transmission_tracker_stats(meta: Option<&EngineTorrentMetadata>) -> Vec<Value
             .collect()
     })
     .unwrap_or_default()
+}
+
+fn transmission_tracker_stat(tracker: &EngineTrackerSnapshot) -> Value {
+    let failure = tracker.failure_reason.clone().unwrap_or_default();
+    let warning = tracker.warning_message.clone().unwrap_or_default();
+    let last_result = if !failure.is_empty() {
+        failure
+    } else {
+        warning
+    };
+    let last_announce_succeeded = tracker.status == "working" || tracker.last_success_at.is_some();
+    json!({
+        "id": tracker.id,
+        "announce": tracker.announce,
+        "host": tracker_host(&tracker.announce),
+        "tier": tracker.tier,
+        "lastAnnounceSucceeded": last_announce_succeeded,
+        "lastAnnounceTime": tracker.last_announce_at.unwrap_or(0),
+        "lastAnnounceResult": last_result,
+        "nextAnnounceTime": tracker.next_announce_at.unwrap_or(0),
+        "lastScrapeSucceeded": tracker.seeders.is_some() || tracker.leechers.is_some() || tracker.completed.is_some(),
+        "lastScrapeTime": tracker.last_announce_at.unwrap_or(0),
+        "lastScrapeResult": "",
+        "nextScrapeTime": tracker.next_announce_at.unwrap_or(0),
+        "seederCount": tracker.seeders.unwrap_or(-1),
+        "leecherCount": tracker.leechers.unwrap_or(-1),
+        "downloadCount": tracker.completed.unwrap_or(-1),
+        "hasAnnounced": tracker.last_announce_at.is_some(),
+        "hasScraped": tracker.seeders.is_some() || tracker.leechers.is_some() || tracker.completed.is_some(),
+    })
 }
 
 fn tracker_host(announce: &str) -> String {
@@ -1883,7 +1958,7 @@ fn transmission_status(state: &str) -> i64 {
 mod tests {
     use super::*;
     use axum::{body::Body, http::Request};
-    use rt_engine::{EnginePieceState, EngineTorrentFile};
+    use rt_engine::{EnginePieceState, EngineTorrentFile, EngineTrackerSnapshot};
     use rt_session::TorrentEntry;
     use tower::ServiceExt;
 
@@ -1946,6 +2021,39 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("magnet:?xt=urn:btih:"));
+    }
+
+    #[test]
+    fn transmission_tracker_stats_project_persisted_engine_state() {
+        let trackers = vec![EngineTrackerSnapshot {
+            id: 7,
+            tier: 2,
+            announce: "https://tracker.example/announce".to_owned(),
+            status: "warning".to_owned(),
+            last_announce_at: Some(100),
+            next_announce_at: Some(200),
+            last_success_at: Some(90),
+            failure_reason: None,
+            warning_message: Some("tracker warning".to_owned()),
+            seeders: Some(11),
+            leechers: Some(22),
+            completed: Some(33),
+        }];
+
+        let stats = transmission_tracker_stats(None, Some(&trackers));
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0]["id"], 7);
+        assert_eq!(stats[0]["tier"], 2);
+        assert_eq!(stats[0]["host"], "tracker.example");
+        assert_eq!(stats[0]["lastAnnounceSucceeded"], true);
+        assert_eq!(stats[0]["lastAnnounceTime"], 100);
+        assert_eq!(stats[0]["nextAnnounceTime"], 200);
+        assert_eq!(stats[0]["lastAnnounceResult"], "tracker warning");
+        assert_eq!(stats[0]["seederCount"], 11);
+        assert_eq!(stats[0]["leecherCount"], 22);
+        assert_eq!(stats[0]["downloadCount"], 33);
+        assert_eq!(stats[0]["hasAnnounced"], true);
+        assert_eq!(stats[0]["hasScraped"], true);
     }
 
     #[tokio::test]
