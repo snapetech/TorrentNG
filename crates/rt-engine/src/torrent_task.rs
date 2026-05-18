@@ -404,6 +404,9 @@ pub struct TorrentTask {
     tracker_peer_cache_drops: u64,
     dirty_pieces_since_barrier: HashSet<u32>,
     super_seeding: bool,
+    download_limit_bytes_per_sec: Option<u64>,
+    download_tokens: u64,
+    download_tokens_updated: Instant,
     completed_piece_verify_from_memory: u64,
     completed_piece_verify_from_disk: u64,
     prepared_files: Mutex<HashSet<u32>>,
@@ -514,6 +517,9 @@ impl TorrentTask {
             tracker_peer_cache_drops: 0,
             dirty_pieces_since_barrier: HashSet::new(),
             super_seeding: false,
+            download_limit_bytes_per_sec: None,
+            download_tokens: u64::MAX,
+            download_tokens_updated: Instant::now(),
             completed_piece_verify_from_memory: 0,
             completed_piece_verify_from_disk: 0,
             prepared_files: Mutex::new(HashSet::new()),
@@ -1314,6 +1320,10 @@ impl TorrentTask {
             );
             return;
         };
+        if !self.try_consume_download_tokens(req.length) {
+            self.picker.cancel_request(req.piece as usize, req.begin);
+            return;
+        }
 
         let seed_count = self.meta.webseeds.len();
         for attempt in 0..seed_count {
@@ -1603,6 +1613,9 @@ impl TorrentTask {
     }
 
     async fn refill_peer_requests(&mut self, peer: SocketAddr) {
+        self.refill_download_tokens();
+        let mut download_tokens = self.download_tokens;
+        let download_limited = self.download_limit_bytes_per_sec.is_some();
         let Some(handle) = self.active_peers.get_mut(&peer) else {
             return;
         };
@@ -1621,6 +1634,9 @@ impl TorrentTask {
 
         let mut queue_full = 0u64;
         while handle.outstanding < request_pipeline {
+            if download_limited && download_tokens == 0 {
+                break;
+            }
             let req = match self.picker.pick(&handle.peer_has) {
                 Some(req) => req,
                 None => {
@@ -1633,13 +1649,23 @@ impl TorrentTask {
                     req
                 }
             };
+            if download_limited && download_tokens < u64::from(req.length) {
+                self.picker.cancel_request(req.piece as usize, req.begin);
+                break;
+            }
             if handle.cmd_tx.try_send(PeerCommand::Request(req)).is_err() {
                 queue_full = queue_full.saturating_add(1);
                 self.picker.cancel_request(req.piece as usize, req.begin);
                 break;
             }
+            if download_limited {
+                download_tokens = download_tokens.saturating_sub(u64::from(req.length));
+            }
             handle.outstanding += 1;
             handle.requested.push(req);
+        }
+        if download_limited {
+            self.download_tokens = download_tokens;
         }
         self.peer_command_queue_full = self.peer_command_queue_full.saturating_add(queue_full);
     }
@@ -1824,6 +1850,33 @@ impl TorrentTask {
         self.peer_command_queue_full = self.peer_command_queue_full.saturating_add(queue_full);
     }
 
+    fn try_consume_download_tokens(&mut self, bytes: u32) -> bool {
+        self.refill_download_tokens();
+        let Some(limit) = self.download_limit_bytes_per_sec else {
+            return true;
+        };
+        let bytes = u64::from(bytes);
+        if self.download_tokens < bytes {
+            return false;
+        }
+        self.download_tokens = self.download_tokens.saturating_sub(bytes);
+        self.download_tokens = self.download_tokens.min(limit);
+        true
+    }
+
+    fn refill_download_tokens(&mut self) {
+        let now = Instant::now();
+        let Some(limit) = self.download_limit_bytes_per_sec else {
+            self.download_tokens = u64::MAX;
+            self.download_tokens_updated = now;
+            return;
+        };
+        let elapsed = now.saturating_duration_since(self.download_tokens_updated);
+        self.download_tokens_updated = now;
+        let refill = (elapsed.as_secs_f64() * limit as f64).floor() as u64;
+        self.download_tokens = self.download_tokens.saturating_add(refill).min(limit);
+    }
+
     async fn shutdown_peers(&mut self) {
         let handles: Vec<mpsc::Sender<PeerCommand>> = self
             .active_peers
@@ -1998,7 +2051,15 @@ impl TorrentTask {
             self.picker.set_sequential_from_piece(piece as usize);
         }
         self.super_seeding = limits.super_seeding;
+        self.set_download_limit(limits.download_limit);
         self.apply_file_policy_from_db();
+    }
+
+    fn set_download_limit(&mut self, limit: Option<i64>) {
+        self.download_limit_bytes_per_sec =
+            limit.and_then(|value| (value > 0).then_some(value as u64));
+        self.download_tokens_updated = Instant::now();
+        self.download_tokens = self.download_limit_bytes_per_sec.unwrap_or(u64::MAX);
     }
 
     fn torrent_limits_from_db(db: &Connection, info_hash: &str) -> EngineTorrentLimits {
