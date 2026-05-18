@@ -226,6 +226,14 @@ wait_stack() {
   [[ -n "$rtorrent_id" ]] && [[ "$(docker inspect -f '{{.State.Running}}' "$rtorrent_id")" == "true" ]]
 }
 
+ensure_services_running() {
+  if [[ "$#" -eq 0 ]]; then
+    return 0
+  fi
+  log "ensuring interop services are running: $*"
+  compose up -d "$@" >/dev/null
+}
+
 docker_tool() {
   docker run --rm -v "$WORKDIR:/work" -w /work alpine:3.20 sh -lc "$*"
 }
@@ -899,6 +907,7 @@ run_magnet_tracker_case() {
   append_report "## Protocol Local: rust-magnet-with-tracker"
   append_report ""
   log "running protocol local case rust-magnet-with-tracker"
+  ensure_services_running opentracker fixture-http || status="FAIL"
   fixture="$(case_fixture single-16m rust-magnet-with-tracker)"
   torrent="$(make_torrent "$fixture" "$fixture" tracker-webseed)"
   info_hash="$(torrent_info_hash "$torrent")"
@@ -926,6 +935,7 @@ run_udp_tracker_case() {
   append_report "## Protocol Local: rust-udp-tracker"
   append_report ""
   log "running protocol local case rust-udp-tracker"
+  ensure_services_running opentracker || status="FAIL"
   fixture="$(case_fixture single-16m rust-udp-tracker)"
   torrent="$(make_torrent "$fixture" "$fixture" udp-tracker-only)"
   info_hash="$(torrent_info_hash "$torrent")"
@@ -949,6 +959,7 @@ run_multi_tracker_fallback_case() {
   append_report "## Protocol Local: rust-multi-tracker-fallback"
   append_report ""
   log "running protocol local case rust-multi-tracker-fallback"
+  ensure_services_running opentracker || status="FAIL"
   fixture="$(case_fixture single-16m rust-multi-tracker-fallback)"
   torrent="$(make_torrent "$fixture" "$fixture" multi-tracker-fallback)"
   info_hash="$(torrent_info_hash "$torrent")"
@@ -973,6 +984,7 @@ run_tracker_outage_after_peer_discovery_case() {
   append_report "## Protocol Local: tracker-outage-after-peer-discovery"
   append_report ""
   log "running protocol local case tracker-outage-after-peer-discovery"
+  ensure_services_running opentracker || status="FAIL"
   fixture="$(case_fixture single-64m tracker-outage-after-peer-discovery)"
   torrent="$(make_torrent "$fixture" "$fixture" tracker-only)"
   info_hash="$(torrent_info_hash "$torrent")"
@@ -1000,6 +1012,7 @@ run_webseed_outage_fallback_case() {
   append_report "## Protocol Local: webseed-outage-fallback"
   append_report ""
   log "running protocol local case webseed-outage-fallback"
+  ensure_services_running opentracker fixture-http || status="FAIL"
   fixture="$(case_fixture single-64m webseed-outage-fallback)"
   torrent="$(make_torrent "$fixture" "$fixture" tracker-webseed)"
   info_hash="$(torrent_info_hash "$torrent")"
@@ -1064,6 +1077,7 @@ run_resume_after_partial_download_case() {
   append_report "## Protocol Local: resume-after-partial-download"
   append_report ""
   log "running protocol local case resume-after-partial-download"
+  ensure_services_running fixture-http || status="FAIL"
   fixture="$(case_fixture single-16m resume-after-partial-download)"
   torrent="$(make_torrent "$fixture" "$fixture" webseed-only)"
   info_hash="$(torrent_info_hash "$torrent")"
@@ -1096,6 +1110,7 @@ run_force_recheck_corruption_repair_case() {
   append_report "## Protocol Local: force-recheck-corruption-repair"
   append_report ""
   log "running protocol local case force-recheck-corruption-repair"
+  ensure_services_running fixture-http || status="FAIL"
   fixture="$(case_fixture single-16m force-recheck-corruption-repair)"
   torrent="$(make_torrent "$fixture" "$fixture" webseed-only)"
   info_hash="$(torrent_info_hash "$torrent")"
@@ -1127,6 +1142,7 @@ run_missing_file_recovery_case() {
   append_report "## Protocol Local: missing-file-recovery"
   append_report ""
   log "running protocol local case missing-file-recovery"
+  ensure_services_running fixture-http || status="FAIL"
   fixture="$(case_fixture single-16m missing-file-recovery)"
   torrent="$(make_torrent "$fixture" "$fixture" webseed-only)"
   info_hash="$(torrent_info_hash "$torrent")"
@@ -1156,6 +1172,7 @@ run_rust_seeds_to_all_reference_clients_case() {
   append_report "## Protocol Local: rust-seeds-to-all-reference-clients"
   append_report ""
   log "running protocol local case rust-seeds-to-all-reference-clients"
+  ensure_services_running opentracker fixture-http || status="FAIL"
   fixture="$(case_fixture single-16m rust-seeds-to-all-reference-clients)"
   torrent="$(make_torrent "$fixture" "$fixture" tracker-webseed)"
   info_hash="$(torrent_info_hash "$torrent")"
@@ -1184,6 +1201,7 @@ run_endgame_multi_peer_case() {
   append_report "## Protocol Local: endgame-multi-peer"
   append_report ""
   log "running protocol local case endgame-multi-peer"
+  ensure_services_running opentracker || status="FAIL"
   fixture="$(case_fixture single-64m endgame-multi-peer)"
   torrent="$(make_torrent "$fixture" "$fixture" tracker-only)"
   info_hash="$(torrent_info_hash "$torrent")"
@@ -1248,6 +1266,7 @@ run_qbit_mutation_facade_case() {
   append_report "## Protocol Local: rust-qbit-mutation-facade"
   append_report ""
   log "running protocol local case rust-qbit-mutation-facade"
+  ensure_services_running opentracker || status="FAIL"
   fixture="$(case_fixture multi-128m rust-qbit-mutation-facade)"
   torrent="$(make_torrent "$fixture" "$fixture" tracker-only)"
   info_hash="$(torrent_info_hash "$torrent")"
