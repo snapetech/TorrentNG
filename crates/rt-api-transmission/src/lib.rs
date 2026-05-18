@@ -1176,7 +1176,7 @@ async fn torrent_get(state: &AppState, args: &Value) -> Result<Value, String> {
                     "primaryMimeType" | "primary-mime-type" => json!(""),
                     "pieceCount" | "piece-count" => json!(meta.map(|m| m.piece_count).unwrap_or(0)),
                     "pieceSize" | "piece-size" => json!(meta.map(|m| m.piece_length).unwrap_or(0)),
-                    "pieces" => json!(""),
+                    "pieces" => json!(transmission_pieces(meta)),
                     "haveUnchecked" | "have-unchecked" => {
                         json!(transmission_have_unchecked(entry, meta))
                     }
@@ -1403,6 +1403,19 @@ fn transmission_availability(meta: Option<&EngineTorrentMetadata>) -> Vec<i64> {
             .collect()
     })
     .unwrap_or_default()
+}
+
+fn transmission_pieces(meta: Option<&EngineTorrentMetadata>) -> String {
+    let Some(meta) = meta else {
+        return String::new();
+    };
+    let mut bytes = vec![0_u8; meta.piece_states.len().div_ceil(8)];
+    for (idx, state) in meta.piece_states.iter().enumerate() {
+        if matches!(state, EnginePieceState::Complete) {
+            bytes[idx / 8] |= 0x80 >> (idx % 8);
+        }
+    }
+    general_purpose::STANDARD.encode(bytes)
 }
 
 fn transmission_have_valid(
@@ -2217,6 +2230,7 @@ mod tests {
         assert_eq!(files[1]["bytesCompleted"], 75);
         let stats = transmission_file_stats(&entry, Some(&meta));
         assert_eq!(stats[1]["bytesCompleted"], 75);
+        assert_eq!(transmission_pieces(Some(&meta)), "gA==");
         assert_eq!(transmission_have_valid(&entry, Some(&meta)), 100);
         assert_eq!(transmission_have_unchecked(&entry, Some(&meta)), 100);
         assert_eq!(transmission_desired_available(&entry, Some(&meta)), 200);
