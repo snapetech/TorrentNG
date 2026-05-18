@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -14,6 +15,7 @@ use axum::{
     response::Response,
 };
 use tokio::sync::RwLock;
+use tower_http::services::{ServeDir, ServeFile};
 use tracing::info;
 
 use rt_api_deluge::AppState as DelugeState;
@@ -31,6 +33,14 @@ mod migrate;
 async fn main() -> anyhow::Result<()> {
     let argv: Vec<String> = std::env::args().collect();
     match argv.get(1).map(String::as_str) {
+        Some("-h" | "--help" | "help") => {
+            print_help();
+            return Ok(());
+        }
+        Some("-V" | "--version" | "version") => {
+            println!("torrentngd {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
         Some("migrate") => {
             let rest = argv[2..].to_vec();
             return tokio::task::spawn_blocking(move || migrate::run(&rest))
@@ -88,10 +98,31 @@ async fn main() -> anyhow::Result<()> {
     let deluge_router = rt_api_deluge::build_deluge_router(deluge_state);
 
     // Merge into a single axum app
+    let static_dir = static_dir();
+    let static_index = static_dir.join("index.html");
+    if static_index.exists() {
+        info!(
+            component = "http",
+            operation = "static_webui",
+            static_dir = %static_dir.display(),
+            "serving WebUI assets"
+        );
+    } else {
+        tracing::warn!(
+            component = "http",
+            operation = "static_webui",
+            static_dir = %static_dir.display(),
+            "WebUI index.html not found; API will run but / will return 404"
+        );
+    }
+
     let app = native_router
         .merge(qbit_router)
         .merge(transmission_router)
         .merge(deluge_router)
+        .fallback_service(
+            ServeDir::new(&static_dir).not_found_service(ServeFile::new(&static_index)),
+        )
         .layer(middleware::from_fn(request_log));
 
     let api_addr: std::net::SocketAddr = config
@@ -133,6 +164,19 @@ async fn main() -> anyhow::Result<()> {
     .context("API server error")?;
 
     Ok(())
+}
+
+fn print_help() {
+    println!(
+        "torrentngd {}\n\nUSAGE:\n    torrentngd [migrate|export] [OPTIONS]\n\nENV:\n    TORRENTNGD_CONFIG  Path to native daemon config\n    TNG_STATIC_DIR     Built WebUI directory to serve, default /usr/share/torrentng/webui\n\nCOMMANDS:\n    migrate            Import existing client state into the native engine\n    export             Export native state for another client\n    help               Print this help\n    version            Print version",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+fn static_dir() -> PathBuf {
+    std::env::var_os("TNG_STATIC_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/usr/share/torrentng/webui"))
 }
 
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -211,7 +255,7 @@ fn is_static_asset_path(path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{request_id, skip_request_log};
+    use super::{request_id, skip_request_log, static_dir};
     use axum::http::{HeaderMap, HeaderValue};
 
     #[test]
@@ -230,6 +274,14 @@ mod tests {
         }
         assert!(!skip_request_log("/api/v1/torrents"));
         assert!(!skip_request_log("/api/qb/v2/log/main"));
+    }
+
+    #[test]
+    fn static_dir_defaults_to_packaged_webui_path() {
+        assert_eq!(
+            static_dir(),
+            std::path::PathBuf::from("/usr/share/torrentng/webui")
+        );
     }
 
     #[test]

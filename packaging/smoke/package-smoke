@@ -280,11 +280,23 @@ install_container() {
   echo "$version_out"
   [[ $version_rc -eq 0 ]] && assert_version_reported "$version_out"
   started_container="package-smoke-$project-${channel//[^a-zA-Z0-9]/-}-$$"
-  run docker run -d --name "$started_container" --platform "$platform" "$image:$registry_tag"
-  sleep 5
+  run docker run -d --name "$started_container" --platform "$platform" -p 127.0.0.1::8080 "$image:$registry_tag"
+  local port
+  port="$(docker port "$started_container" 8080/tcp | sed 's/.*://')"
+  [[ -n "$port" ]] || die "container did not publish API/WebUI port"
+  for _ in $(seq 1 40); do
+    endpoint_status="$(curl -fsS -o "$tmp_dir/health" -w "%{http_code}" "http://127.0.0.1:$port$HEALTH_PATH" || true)"
+    [[ "$endpoint_status" =~ ^2|3 ]] && break
+    sleep 1
+  done
+  [[ "$endpoint_status" =~ ^2|3 ]] || die "container health smoke failed with status $endpoint_status"
+  local webui_status
+  webui_status="$(curl -fsS -o "$tmp_dir/index.html" -w "%{http_code}" "http://127.0.0.1:$port/" || true)"
+  [[ "$webui_status" =~ ^2|3 ]] || die "container WebUI smoke failed with status $webui_status"
+  grep -q '<div id="root">' "$tmp_dir/index.html" || die "container WebUI did not serve the React app shell"
   run docker logs "$started_container"
   resolved_version="$(docker image inspect "$image:$registry_tag" --format '{{index .RepoTags 0}} {{.Id}}')"
-  endpoint_status="container started"
+  endpoint_status="health=$endpoint_status webui=$webui_status"
   uninstall_status="container removed by cleanup"
 }
 

@@ -161,6 +161,18 @@ prepare_dirs() {
   chmod -R a+rwX "$WORKDIR/config/rtorrent" 2>/dev/null || true
 }
 
+acquire_interop_lock() {
+  if [[ "${INTEROP_NO_LOCK:-0}" == "1" ]]; then
+    return 0
+  fi
+  mkdir -p "$WORKDIR"
+  exec 9>"$WORKDIR/interop.lock"
+  if ! flock -w "${INTEROP_LOCK_TIMEOUT_SECS:-1800}" 9; then
+    echo "timed out waiting for interop lock at $WORKDIR/interop.lock" >&2
+    return 1
+  fi
+}
+
 prepare_client_configs() {
   mkdir -p "$WORKDIR/config/qbittorrent/qBittorrent" "$WORKDIR/config/transmission" "$WORKDIR/config/deluge" "$WORKDIR/config/rtorrent/session"
   if [[ ! -f "$WORKDIR/config/qbittorrent/qBittorrent/qBittorrent.conf" ]]; then
@@ -268,8 +280,30 @@ ensure_services_running() {
   if [[ "$#" -eq 0 ]]; then
     return 0
   fi
+  local service
   log "ensuring interop services are running: $*"
   compose up -d "$@" >/dev/null
+  for service in "$@"; do
+    case "$service" in
+      torrentngd)
+        wait_http torrentngd "$(client_url torrentngd)/health" 240 || return 1
+        ;;
+      qbittorrent)
+        wait_http_status qbittorrent "$(client_url qbittorrent)" '^(200|401|403)$' 240 || return 1
+        ;;
+      transmission)
+        wait_http transmission "$(client_url transmission)/transmission/web/" 240 || return 1
+        ;;
+      deluge)
+        wait_http deluge "$(client_url deluge)" 240 || return 1
+        ;;
+      fixture-http)
+        wait_http fixture-http "http://127.0.0.1:${INTEROP_FIXTURE_HTTP_PORT:-28188}/" 240 || return 1
+        ;;
+      opentracker|rtorrent)
+        ;;
+    esac
+  done
 }
 
 docker_tool() {
@@ -1776,6 +1810,7 @@ main() {
   require_cmd jq
   require_cmd base64
   validate_protocol_only
+  acquire_interop_lock
 
   if [[ "${INTEROP_REUSE_STACK:-0}" != "1" ]]; then
     compose down --remove-orphans -v >/dev/null 2>&1 || true

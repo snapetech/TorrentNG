@@ -7,7 +7,7 @@ arch=("x86_64")
 url="https://github.com/snapetech/TorrentNG"
 license=("GPL-3.0-or-later")
 depends=("gcc-libs" "sqlite")
-makedepends=("cargo" "git")
+makedepends=("cargo" "git" "npm")
 backup=("etc/torrentngd/config.toml")
 source=(
   "git+https://github.com/snapetech/TorrentNG.git"
@@ -25,6 +25,9 @@ pkgver() {
 build() {
   cd torrentng
   cargo build --release --locked -p torrentngd
+  cd webui
+  npm ci
+  TNG_WEBUI_OUT_DIR=dist npm run build
 }
 
 check() {
@@ -36,6 +39,8 @@ package() {
   cd torrentng
   install -Dm755 target/release/torrentngd "$pkgdir/usr/bin/torrentngd"
   install -Dm644 deploy/native/config.toml "$pkgdir/etc/torrentngd/config.toml"
+  mkdir -p "$pkgdir/usr/share/torrentng/webui"
+  cp -a webui/dist/. "$pkgdir/usr/share/torrentng/webui/"
   install -Dm644 "$srcdir/torrentngd.service" "$pkgdir/usr/lib/systemd/system/torrentngd.service"
   install -Dm644 "$srcdir/torrentngd.sysusers" "$pkgdir/usr/lib/sysusers.d/torrentngd.conf"
   install -Dm644 "$srcdir/torrentngd.tmpfiles" "$pkgdir/usr/lib/tmpfiles.d/torrentngd.conf"

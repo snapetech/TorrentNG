@@ -9,6 +9,7 @@ Type=simple
 User=torrentngd
 Group=torrentngd
 Environment=TORRENTNGD_CONFIG=/etc/torrentngd/config.toml
+Environment=TNG_STATIC_DIR=/usr/share/torrentng/webui
 Environment=RUST_LOG=info
 ExecStart=/usr/bin/torrentngd
 Restart=on-failure

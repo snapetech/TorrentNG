@@ -10,7 +10,7 @@ export default defineConfig({
     },
   },
   build: {
-    outDir: '../sidecar/static',
+    outDir: process.env.TNG_WEBUI_OUT_DIR ?? '../sidecar/static',
     emptyOutDir: true,
   },
 })

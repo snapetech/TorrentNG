@@ -72,10 +72,14 @@ jobs:
         working-directory: webui
         run: |
           npm ci
-          npm run build
+          TNG_WEBUI_OUT_DIR=dist npm run build
+
+      - name: Build native daemon
+        run: cargo build --release --locked -p torrentngd
 
       - name: Build Docker images
         run: |
+          docker build -f deploy/native/Dockerfile -t torrentng-native:${{ steps.tag.outputs.tag }} .
           docker build -f deploy/docker/Dockerfile -t torrentng:${{ steps.tag.outputs.tag }} .
           docker build -f deploy/docker/Dockerfile.phase1 -t torrentng-phase1:${{ steps.tag.outputs.tag }} .
 
@@ -108,7 +112,8 @@ jobs:
             done
           }
 
-          publish_image torrentng ghcr.io/snapetech/torrentng/native snapetech/torrentng-native
+          publish_image torrentng-native ghcr.io/snapetech/torrentng/native snapetech/torrentng-native
+          publish_image torrentng ghcr.io/snapetech/torrentng/sidecar snapetech/torrentng-sidecar
           publish_image torrentng-phase1 ghcr.io/snapetech/torrentng/phase1 snapetech/torrentng-phase1
 
       - name: Package release artifacts
@@ -116,8 +121,13 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
+          cp target/release/torrentngd "dist/torrentngd-linux-x86_64"
           cp sidecar/target/release/torrentng "dist/torrentng-linux-x86_64"
-          tar -czf "dist/torrentng-webui-${{ steps.tag.outputs.tag }}.tar.gz" -C sidecar/static .
+          mkdir -p dist/native/usr/bin dist/native/usr/share/torrentng/webui
+          cp target/release/torrentngd dist/native/usr/bin/torrentngd
+          cp -a webui/dist/. dist/native/usr/share/torrentng/webui/
+          tar -czf "dist/torrentngd-native-${{ steps.tag.outputs.tag }}-linux-x86_64.tar.gz" -C dist/native .
+          tar -czf "dist/torrentng-webui-${{ steps.tag.outputs.tag }}.tar.gz" -C webui/dist .
           tar -czf "dist/torrentng-deploy-${{ steps.tag.outputs.tag }}.tar.gz" deploy docs README.md LICENSE
           sha256sum dist/* > "dist/SHA256SUMS-${{ steps.tag.outputs.tag }}.txt"
 
