@@ -1,5 +1,6 @@
 pub mod command;
 mod dht_task;
+pub mod egress_policy;
 pub mod engine;
 mod metadata_task;
 pub mod peer_id;
@@ -12,6 +13,7 @@ pub use command::{
     EngineTrackerSnapshot, EngineWebseedSnapshot, HotTorrentMemoryStats, QueueMove,
     StorageDeviceLatencyStats, TorrentDiagnostic, TorrentRuntimeStats,
 };
+pub use egress_policy::{AddressClass, EgressPolicyError, OutboundEgressPolicy, OutboundTargetKind};
 pub use engine::{Engine, EngineHandle};
 pub use tier::{
     ActivityTimerWheel, CompactPieceBitmap, DormantTorrentSnapshot, TierController, TierDecision,
