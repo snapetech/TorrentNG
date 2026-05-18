@@ -455,7 +455,8 @@ export function App() {
     setFeatureError(null)
     try {
       const result = await api.session.setFeatures({ [feature]: enabled })
-      const applied = result[feature] ?? enabled
+      const refreshed = await api.session.getFeatures().catch(() => result)
+      const applied = refreshed[feature] ?? result[feature] ?? enabled
       setLiveStats(prev => ({ ...prev, [feature]: applied ? 'on' : 'off' }))
       qc.invalidateQueries({ queryKey: ['engine'] })
     } catch {

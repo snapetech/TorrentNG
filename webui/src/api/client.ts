@@ -706,8 +706,9 @@ export const api = {
   },
 
   session: {
+    getFeatures: (): Promise<SessionFeatureResponse> => get('/session/features'),
     setFeatures: (features: { dht?: boolean; pex?: boolean }): Promise<SessionFeatureResponse> =>
-      patch('/session/features', features),
+      put('/session/features', features),
   },
 
   transferInfo: (): Promise<TransferInfo> => getRoot('/api/qb/v2/transfer/info'),
