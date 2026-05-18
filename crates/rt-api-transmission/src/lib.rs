@@ -1,6 +1,9 @@
 #![recursion_limit = "256"]
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 
 use axum::{
     extract::State,
@@ -28,6 +31,7 @@ pub struct AppState {
     pub engine: Option<EngineHandle>,
     pub session: Arc<RwLock<TransmissionSessionSettings>>,
     pub torrent_limits: Arc<RwLock<HashMap<String, EngineTorrentLimits>>>,
+    pub groups: Arc<RwLock<BTreeMap<String, TransmissionGroup>>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -69,6 +73,29 @@ pub struct TransmissionSessionSettings {
     pub seed_ratio_limited: bool,
     pub idle_seeding_limit: i64,
     pub idle_seeding_limit_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TransmissionGroup {
+    pub name: String,
+    pub honors_session_limits: bool,
+    pub speed_limit_down_enabled: bool,
+    pub speed_limit_down: i64,
+    pub speed_limit_up_enabled: bool,
+    pub speed_limit_up: i64,
+}
+
+impl TransmissionGroup {
+    fn new(name: String) -> Self {
+        Self {
+            name,
+            honors_session_limits: true,
+            speed_limit_down_enabled: false,
+            speed_limit_down: 0,
+            speed_limit_up_enabled: false,
+            speed_limit_up: 0,
+        }
+    }
 }
 
 impl Default for TransmissionSessionSettings {
@@ -122,6 +149,7 @@ impl AppState {
             engine: None,
             session: Arc::new(RwLock::new(TransmissionSessionSettings::default())),
             torrent_limits: Arc::new(RwLock::new(HashMap::new())),
+            groups: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
 
@@ -131,6 +159,7 @@ impl AppState {
             engine: Some(engine),
             session: Arc::new(RwLock::new(TransmissionSessionSettings::default())),
             torrent_limits: Arc::new(RwLock::new(HashMap::new())),
+            groups: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
 }
@@ -221,8 +250,8 @@ async fn transmission_rpc_payload(state: &AppState, body: Value) -> Value {
             "rpc-authentication-required": false,
             "rpc-whitelist-enabled": false,
         })),
-        "group-get" => Ok(json!({ "groups": [] })),
-        "group-set" => Ok(json!({})),
+        "group-get" => group_get(&state, &args).await,
+        "group-set" => group_set(&state, &args).await,
         "torrent-set" => torrent_set(&state, &args).await,
         "torrent-set-tracker-list" => torrent_set_tracker_list(&state, &args).await,
         "torrent-set-file-priorities" => torrent_set_file_priorities(&state, &args).await,
@@ -392,6 +421,62 @@ async fn torrent_set(state: &AppState, args: &Value) -> Result<Value, String> {
         }
     }
     Ok(json!({}))
+}
+
+async fn group_get(state: &AppState, args: &Value) -> Result<Value, String> {
+    let requested = args
+        .get("group")
+        .or_else(|| args.get("name"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let groups = state.groups.read().await;
+    let groups = groups
+        .values()
+        .filter(|group| requested.as_ref().is_none_or(|name| &group.name == name))
+        .map(transmission_group_json)
+        .collect::<Vec<_>>();
+    Ok(json!({ "groups": groups }))
+}
+
+async fn group_set(state: &AppState, args: &Value) -> Result<Value, String> {
+    let name = args
+        .get("group")
+        .or_else(|| args.get("name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| "missing group".to_owned())?;
+    let mut groups = state.groups.write().await;
+    let group = groups
+        .entry(name.to_owned())
+        .or_insert_with(|| TransmissionGroup::new(name.to_owned()));
+    if let Some(value) = transmission_bool_arg(args, "honors-session-limits") {
+        group.honors_session_limits = value;
+    }
+    if let Some(value) = transmission_bool_arg(args, "speed-limit-down-enabled") {
+        group.speed_limit_down_enabled = value;
+    }
+    if let Some(value) = transmission_i64_arg(args, "speed-limit-down") {
+        group.speed_limit_down = value.max(0);
+    }
+    if let Some(value) = transmission_bool_arg(args, "speed-limit-up-enabled") {
+        group.speed_limit_up_enabled = value;
+    }
+    if let Some(value) = transmission_i64_arg(args, "speed-limit-up") {
+        group.speed_limit_up = value.max(0);
+    }
+    Ok(json!({}))
+}
+
+fn transmission_group_json(group: &TransmissionGroup) -> Value {
+    json!({
+        "name": group.name,
+        "honors-session-limits": group.honors_session_limits,
+        "speed-limit-down-enabled": group.speed_limit_down_enabled,
+        "speed-limit-down": group.speed_limit_down,
+        "speed-limit-up-enabled": group.speed_limit_up_enabled,
+        "speed-limit-up": group.speed_limit_up,
+    })
 }
 
 #[derive(Debug, Default)]
@@ -2257,6 +2342,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transmission_group_methods_roundtrip_compat_state() {
+        let app =
+            build_transmission_router(AppState::new(Arc::new(RwLock::new(SessionRegistry::new()))));
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .header("content-type", "application/json")
+                    .header("x-transmission-session-id", SESSION_ID)
+                    .body(Body::from(
+                        r#"{"method":"group-set","arguments":{
+                            "group":"archive",
+                            "honors-session-limits":false,
+                            "speed-limit-down-enabled":true,
+                            "speed-limit-down":2048,
+                            "speed-limit-up-enabled":true,
+                            "speed-limit-up":1024
+                        }}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .header("content-type", "application/json")
+                    .header("x-transmission-session-id", SESSION_ID)
+                    .body(Body::from(
+                        r#"{"method":"group-get","arguments":{"group":"archive"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        let group = &body["arguments"]["groups"][0];
+        assert_eq!(group["name"], "archive");
+        assert_eq!(group["honors-session-limits"], false);
+        assert_eq!(group["speed-limit-down-enabled"], true);
+        assert_eq!(group["speed-limit-down"], 2048);
+        assert_eq!(group["speed-limit-up-enabled"], true);
+        assert_eq!(group["speed-limit-up"], 1024);
+    }
+
+    #[tokio::test]
     async fn transmission_snake_case_rpc_roundtrips_v41_shape() {
         let registry = Arc::new(RwLock::new(SessionRegistry::new()));
         {
@@ -2577,7 +2715,10 @@ mod tests {
             ("session-stats", r#"{}"#),
             ("session-close", r#"{}"#),
             ("session-set", r#"{"queue-stalled-enabled":true}"#),
-            ("session-subscribe", r#"{"fields":["torrent-added","torrent-removed"]}"#),
+            (
+                "session-subscribe",
+                r#"{"fields":["torrent-added","torrent-removed"]}"#,
+            ),
             ("session-unsubscribe", r#"{"fields":["torrent-added"]}"#),
             ("session-access-control", r#"{}"#),
             ("group-get", r#"{}"#),

@@ -143,7 +143,7 @@ kebab/camel calls and normalizes Transmission 4.1 snake_case calls.
 | Queue | `queue_move_top`, `queue_move_up`, `queue_move_down`, `queue_move_bottom` | Native | Queue row |
 | Session | `session_get`, `session_set`, `session_stats`, `session_close`, `session_access_control` | Compat/native mix; `session_get` field projection supported and broad mutable settings roundtrip in facade state | Session fields and mutable settings row |
 | Utilities | `blocklist_update`, `port_test`, `free_space` | Compat | Utility shape row |
-| Groups | `group_get`, `group_set` | Compat placeholder | Group shape row |
+| Groups | `group_get`, `group_set` | Compat: group limit state roundtrips for remote-client parity; native behavioral effects remain future work | Group shape and mutation row |
 
 Transmission `torrent_get` field matrix:
 

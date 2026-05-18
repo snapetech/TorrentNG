@@ -165,9 +165,9 @@ Local deterministic API compatibility is passing:
 Remaining compatibility gaps:
 
 - Transmission: JSON-RPC 2.0 method errors, no-op notification subscription
-  probes, and broad mutable session settings are covered in the facade matrix;
-  true push notification delivery and group internals remain future live-client
-  parity work.
+  probes, broad mutable session settings, and group limit state roundtrips are
+  covered in the facade matrix; true push notification delivery and native group
+  scheduling effects remain future live-client parity work.
 - Deluge: extractor, scheduler, execute, blocklist, and autoadd plugin-specific
   APIs now have structured compatibility surfaces with safe no-op mutations;
   remaining plugin work is native behavioral effects only where TorrentNG
