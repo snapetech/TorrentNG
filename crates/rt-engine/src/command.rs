@@ -735,6 +735,11 @@ pub enum EngineCmd {
         info_hash: String,
         reply: oneshot::Sender<CmdResult<EngineTorrentMetadata>>,
     },
+    /// Read the persisted raw `.torrent` metainfo bytes for export endpoints.
+    GetTorrentBlob {
+        info_hash: String,
+        reply: oneshot::Sender<CmdResult<Vec<u8>>>,
+    },
     /// Update category and/or tags, then persist the session row.
     UpdateTorrentLabels {
         info_hash: String,

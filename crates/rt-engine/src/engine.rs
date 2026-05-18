@@ -299,6 +299,15 @@ impl EngineHandle {
         rx.await.map_err(|_| "engine dropped reply".to_owned())?
     }
 
+    pub async fn torrent_blob(&self, info_hash: String) -> CmdResult<Vec<u8>> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(EngineCmd::GetTorrentBlob { info_hash, reply })
+            .await
+            .map_err(|_| "engine shut down".to_owned())?;
+        rx.await.map_err(|_| "engine dropped reply".to_owned())?
+    }
+
     pub async fn execute_storage_plan(
         &self,
         operation: String,
@@ -1009,6 +1018,11 @@ impl Engine {
                 let result = self
                     .load_torrent_metadata(&info_hash)
                     .map_err(|e| e.to_string());
+                let _ = reply.send(result);
+            }
+
+            EngineCmd::GetTorrentBlob { info_hash, reply } => {
+                let result = self.load_torrent_blob(&info_hash).map_err(|e| e.to_string());
                 let _ = reply.send(result);
             }
 
@@ -1823,6 +1837,12 @@ impl Engine {
         }
         std::fs::write(path, raw)?;
         Ok(())
+    }
+
+    fn load_torrent_blob(&self, info_hash: &str) -> anyhow::Result<Vec<u8>> {
+        let blob_path = torrent_blob_path(&self.config, info_hash);
+        std::fs::read(&blob_path)
+            .with_context(|| format!("reading persisted torrent blob {}", blob_path.display()))
     }
 
     fn delete_persisted_torrent(&self, info_hash: &str) -> anyhow::Result<()> {
@@ -4396,6 +4416,35 @@ mod tests {
         assert_eq!(projected.files[0].index, 7);
         assert_eq!(projected.files[0].path, "dir/file.bin");
         assert_eq!(projected.files[0].length, 42);
+    }
+
+    #[test]
+    fn torrent_blob_export_preserves_raw_metainfo_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.daemon.session_dir = temp.path().join("session");
+        std::fs::create_dir_all(torrent_blob_dir(&config)).unwrap();
+
+        let raw = raw_single_file_torrent();
+        let meta = parse_torrent(&raw).unwrap();
+        let info_hash = meta_info_hash_hex(&meta);
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let (_tx, rx) = mpsc::channel(1);
+        let engine = Engine {
+            config: Arc::new(config),
+            registry: Arc::new(RwLock::new(SessionRegistry::new())),
+            db: Arc::new(Mutex::new(conn)),
+            cmd_rx: rx,
+            cmd_tx: mpsc::channel(1).0,
+            torrent_chans: HashMap::new(),
+            torrent_tasks: HashMap::new(),
+            dht_tx: None,
+            resources: test_resource_governor(),
+        };
+        engine.save_torrent_blob(&info_hash, &raw).unwrap();
+
+        assert_eq!(engine.load_torrent_blob(&info_hash).unwrap(), raw);
     }
 
     #[test]

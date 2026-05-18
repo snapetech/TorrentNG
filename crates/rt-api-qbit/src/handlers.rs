@@ -1,7 +1,7 @@
 use axum::{
     extract::{Multipart, Query, State},
     http::{header, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     Json,
 };
 use rt_metainfo::{parse_magnet, parse_torrent};
@@ -1079,12 +1079,32 @@ pub async fn torrents_piece_hashes(
 }
 
 /// `GET /api/qb/v2/torrents/export`.
-pub async fn torrents_export() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/x-bittorrent")],
-        Vec::<u8>::new(),
-    )
+pub async fn torrents_export(
+    State(state): State<AppState>,
+    Query(q): Query<HashQuery>,
+) -> Response {
+    let Some(hash) = q.hash else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let exists = {
+        let reg = state.registry.read().await;
+        reg.get(&hash).is_some()
+    };
+    if !exists {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Some(engine) = &state.engine else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match engine.torrent_blob(hash).await {
+        Ok(raw) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/x-bittorrent")],
+            raw,
+        )
+            .into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// `GET /api/qb/v2/torrents/properties`.
@@ -4563,6 +4583,35 @@ mod tests {
             let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(body, serde_json::json!([]));
         }
+    }
+
+    #[tokio::test]
+    async fn qbit_torrent_export_requires_hash_and_engine_blob() {
+        let hash = "e".repeat(40);
+        let app = build_qbit_router(make_state_with(&hash).await);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/qb/v2/torrents/export")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/qb/v2/torrents/export?hash={hash}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

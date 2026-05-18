@@ -67,7 +67,7 @@ Local surface: `crates/rt-api-qbit`.
 | Logs | main log, peer log | Main log projects retained app/session events; peer log remains empty-compatible |
 | Sync | `sync/maindata`, `sync/torrentPeers` | Implemented; maindata carries broad torrent/server-state keys and torrentPeers carries qBit peer shape with stable RID deltas |
 | Transfer | global info, speed limits, speed-limit mode, ban peers | Implemented |
-| Torrent reads | list with modern qBit path/counter/limit/mode/magnet/infohash fields, properties, trackers, web seeds, files, piece states, piece hashes, export | Implemented; properties include registry/engine-backed counters, lifecycle times, piece counts, and limits where available |
+| Torrent reads | list with modern qBit path/counter/limit/mode/magnet/infohash fields, properties, trackers, web seeds, files, piece states, piece hashes, export | Implemented; properties include registry/engine-backed counters, lifecycle times, piece counts, and limits where available; export streams persisted raw `.torrent` bytes instead of a placeholder body |
 | Torrent lifecycle | add, pause/resume legacy aliases, start/stop v5 aliases, delete, recheck, reannounce | Implemented |
 | Torrent mutation | tracker add/edit/remove, peers, priority order, file priority, limits, share limits, force start, super seeding, auto management, sequential, first/last, location/save path, rename, category with configured save paths, tags with global tag cleanup | Implemented |
 | RSS | folders, feeds, items, rules, matching articles | Implemented as no-op/read-compatible |

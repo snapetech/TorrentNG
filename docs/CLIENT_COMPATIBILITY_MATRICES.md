@@ -104,7 +104,7 @@ Local implementation: `crates/rt-api-qbit`.
 | Torrent list/add | `torrents/info`, `torrents/add` | Same | Native | Add magnet/file, list filters/sort/category/tag/hash |
 | Torrent lifecycle | `pause`, `resume`, `start`, `stop`, `delete`, `recheck`, `reannounce` | Same | Native | Lifecycle transition per endpoint |
 | Torrent trackers/peers | `trackers`, `addTrackers`, `editTracker`, `removeTrackers`, `addPeers` | Same | Native/Partial stats | Tracker mutation and explicit peer row |
-| Torrent files/pieces | `files`, `webseeds`, `pieceStates`, `pieceHashes`, `export`, `filePrio` | Same | Native/Partial | File priority, piece state, export metadata |
+| Torrent files/pieces | `files`, `webseeds`, `pieceStates`, `pieceHashes`, `export`, `filePrio` | Same | Native/Partial | File priority and piece state are engine-backed; `export` returns the persisted raw `.torrent` bytes for known torrents with stored metadata |
 | Queue priority | `increasePrio`, `decreasePrio`, `topPrio`, `bottomPrio` | Same | Native | Queue ordering row |
 | Properties | `properties` | Same | Partial projection | Full property key presence row |
 | Categories | `categories`, `createCategory`, `editCategory`, `removeCategories`, `setCategory` | Same | Native/Compat; configured category save paths apply on set | Category create/edit/remove/set row |
