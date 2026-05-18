@@ -219,14 +219,15 @@ The full Docker interop matrix still has release evidence to run:
 - planned protocol rows: DHT-only magnet. The DHT core now has unit evidence
   that `get_peers` responses are forwarded into torrent peer commands, but
   full trackerless local metadata fetch and transfer still needs an end-to-end
-  Docker row. `tracker-outage-after-peer-discovery`, `endgame-multi-peer`,
-  `private-torrent-no-dht-pex`,
+  Docker row. `tracker-outage-after-peer-discovery`, `webseed-outage-fallback`,
+  `endgame-multi-peer`, `private-torrent-no-dht-pex`,
   `rust-seeds-to-all-reference-clients`, `resume-after-partial-download`,
   `force-recheck-corruption-repair`, and `missing-file-recovery` are now
   implemented Docker protocol rows covering tracker outage after peer discovery,
-  multi-peer completion, private torrent DHT/PEX policy, TorrentNG as sole
-  seeder to all reference clients, preseeded partial restart/resume, corrupt
-  payload repair, and deleted payload recreation with final hash verification;
+  webseed outage fallback, multi-peer completion, private torrent DHT/PEX
+  policy, TorrentNG as sole seeder to all reference clients, preseeded partial
+  restart/resume, corrupt payload repair, and deleted payload recreation with
+  final hash verification;
 - expansion backlog for DHT/PEX/LSD, multi-tracker tiers, file layout edge
   cases, network adversity, stress, and seeding behavior.
 

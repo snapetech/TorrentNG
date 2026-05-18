@@ -124,6 +124,7 @@ or compatibility behaviors.
 | `magnet-dht-only` | Magnet metadata and peer discovery without trackers. DHT `get_peers` forwarding into torrent peer commands is covered by `rt-engine` tests; full local trackerless metadata fetch and transfer remains planned. | Complete and hash match | Planned |
 | `rust-multi-tracker-fallback` | Dead tracker in the first tier, working tracker fallback. | Rust completes through fallback tracker | Implemented |
 | `tracker-outage-after-peer-discovery` | Stop the local tracker after TorrentNG has an explicit known peer for a tracker-only transfer. | Transfer continues through the known peer and final hash matches | Implemented |
+| `webseed-outage-fallback` | Stop the fixture HTTP webseed after TorrentNG has an explicit known peer for a tracker+webseed transfer. | Transfer falls back to the peer source and final hash matches | Implemented |
 | `private-torrent-no-dht-pex` | Private torrent policy enforcement with no tracker and an explicit allowed peer. | DHT registration does not increase, PEX is not advertised, explicit peer transfer completes, and final hash matches | Implemented |
 | `rust-partial-file-selection` | Multi-file priority and wanted/unwanted file behavior during transfer. | Wanted files complete; skipped file remains absent or empty | Implemented |
 | `force-recheck-corruption-repair` | Complete from a local webseed, corrupt on-disk bytes, force recheck, and redownload the damaged range. | Corruption detected, repair completes, and final hash matches | Implemented |
@@ -160,6 +161,12 @@ Run the tracker outage row directly:
 
 ```sh
 INTEROP_PROTOCOL_ONLY=tracker-outage-after-peer-discovery scripts/interop_matrix.sh --local
+```
+
+Run the webseed outage fallback row directly:
+
+```sh
+INTEROP_PROTOCOL_ONLY=webseed-outage-fallback scripts/interop_matrix.sh --local
 ```
 
 Run the partial-resume row directly:
@@ -211,7 +218,7 @@ strong baseline interoperability.
 | State and recovery | `pause-resume-persistence`, `force-recheck`, `move-storage-path`, `delete-torrent-only`, `delete-with-data`, `resume-partial-files`, `corrupt-block-repair`, `missing-file-recovery` |
 | API compatibility | `qbit-arr-endpoints`, `transmission-write-rpc`, `deluge-write-json-rpc`, `error-shape-compatibility`, `tracker-mutation-compatibility`, `file-priority-compatibility` |
 | Performance and stress | `hundreds-small-torrents`, `many-peers-per-torrent`, `parallel-public-torrents`, `long-active-soak`, `memory-fd-growth`, `rate-limit-behavior` |
-| Network adversity | `reference-client-restart`, `rust-restart-mid-transfer`, `webseed-outage-fallback`, `slow-peer`, `corrupt-peer`, `peer-disconnect-churn`, `ipv6-transfer`; tracker outage after peer discovery is implemented as `tracker-outage-after-peer-discovery` |
+| Network adversity | `reference-client-restart`, `rust-restart-mid-transfer`, `slow-peer`, `corrupt-peer`, `peer-disconnect-churn`, `ipv6-transfer`; tracker outage after peer discovery is implemented as `tracker-outage-after-peer-discovery`, and webseed outage fallback is implemented as `webseed-outage-fallback` |
 | Seeding | `rust-long-running-seeder`, `upload-accounting`, `ratio-seed-limit`, `time-seed-limit`, `multiple-leechers-from-rust`, `reference-clients-complete-from-rust-alone` |
 
 ## Public Matrix

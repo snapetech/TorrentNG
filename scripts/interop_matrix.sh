@@ -995,6 +995,33 @@ run_tracker_outage_after_peer_discovery_case() {
   [[ "$status" == "PASS" ]]
 }
 
+run_webseed_outage_fallback_case() {
+  local status="PASS" fixture torrent info_hash
+  append_report "## Protocol Local: webseed-outage-fallback"
+  append_report ""
+  log "running protocol local case webseed-outage-fallback"
+  fixture="$(case_fixture single-64m webseed-outage-fallback)"
+  torrent="$(make_torrent "$fixture" "$fixture" tracker-webseed)"
+  info_hash="$(torrent_info_hash "$torrent")"
+  seed_fixture_for_client transmission "$fixture"
+  add_to_client transmission "$torrent" seed || status="FAIL"
+  add_to_client torrentngd "$torrent" || status="FAIL"
+  bridge_client_peer_to_rust transmission "$info_hash" || status="FAIL"
+  sleep "${INTEROP_WEBSEED_OUTAGE_AFTER_SECS:-2}"
+  compose stop -t 10 fixture-http >/dev/null || status="FAIL"
+  wait_explicit_peer_complete "$TIMEOUT_LOCAL" "$fixture" "$info_hash" transmission transmission torrentngd || status="FAIL"
+  verify_fixture_hashes torrentngd "$fixture" || status="FAIL"
+  append_report "- Seeder: transmission"
+  append_report "- Leecher: torrentngd"
+  append_report "- Fixture: single-64m"
+  append_report "- Webseed stopped after: ${INTEROP_WEBSEED_OUTAGE_AFTER_SECS:-2}s"
+  append_report "- Fallback source: tracker/explicit known peer"
+  append_report "- Info hash: $info_hash"
+  append_report "- Status: **$status**"
+  append_report ""
+  [[ "$status" == "PASS" ]]
+}
+
 run_private_torrent_no_dht_pex_case() {
   local status="PASS" fixture torrent info_hash dht_before dht_after
   append_report "## Protocol Local: private-torrent-no-dht-pex"
@@ -1277,6 +1304,9 @@ run_protocol_local_matrix() {
   fi
   if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "tracker-outage-after-peer-discovery" ]]; then
     run_tracker_outage_after_peer_discovery_case || failures=$((failures + 1))
+  fi
+  if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "webseed-outage-fallback" ]]; then
+    run_webseed_outage_fallback_case || failures=$((failures + 1))
   fi
   if [[ -z "${INTEROP_PROTOCOL_ONLY:-}" || "${INTEROP_PROTOCOL_ONLY:-}" == "private-torrent-no-dht-pex" ]]; then
     run_private_torrent_no_dht_pex_case || failures=$((failures + 1))
