@@ -33,6 +33,7 @@ pub struct AppState {
     pub session: Arc<RwLock<TransmissionSessionSettings>>,
     pub torrent_limits: Arc<RwLock<HashMap<String, EngineTorrentLimits>>>,
     pub torrent_groups: Arc<RwLock<HashMap<String, String>>>,
+    pub torrent_sequential_from_piece: Arc<RwLock<HashMap<String, i64>>>,
     pub groups: Arc<RwLock<BTreeMap<String, TransmissionGroup>>>,
     pub notification_subscriptions: Arc<RwLock<BTreeSet<String>>>,
 }
@@ -155,6 +156,7 @@ impl AppState {
             session: Arc::new(RwLock::new(TransmissionSessionSettings::default())),
             torrent_limits: Arc::new(RwLock::new(HashMap::new())),
             torrent_groups: Arc::new(RwLock::new(HashMap::new())),
+            torrent_sequential_from_piece: Arc::new(RwLock::new(HashMap::new())),
             groups: Arc::new(RwLock::new(BTreeMap::new())),
             notification_subscriptions: Arc::new(RwLock::new(BTreeSet::new())),
         }
@@ -167,6 +169,7 @@ impl AppState {
             session: Arc::new(RwLock::new(TransmissionSessionSettings::default())),
             torrent_limits: Arc::new(RwLock::new(HashMap::new())),
             torrent_groups: Arc::new(RwLock::new(HashMap::new())),
+            torrent_sequential_from_piece: Arc::new(RwLock::new(HashMap::new())),
             groups: Arc::new(RwLock::new(BTreeMap::new())),
             notification_subscriptions: Arc::new(RwLock::new(BTreeSet::new())),
         }
@@ -384,8 +387,16 @@ async fn torrent_set(state: &AppState, args: &Value) -> Result<Value, String> {
         .map(str::trim)
         .filter(|group| !group.is_empty())
         .map(str::to_owned);
+    let sequential_from_piece = transmission_i64_arg(args, "sequential-download-from-piece")
+        .or_else(|| transmission_i64_arg(args, "sequentialDownloadFromPiece"))
+        .map(|piece| piece.max(0));
     let limit_updates = transmission_torrent_limit_updates(args);
-    if labels.is_none() && location.is_none() && group.is_none() && limit_updates.is_none() {
+    if labels.is_none()
+        && location.is_none()
+        && group.is_none()
+        && sequential_from_piece.is_none()
+        && limit_updates.is_none()
+    {
         return Ok(json!({}));
     }
     for hash in ids(state, args).await {
@@ -435,6 +446,13 @@ async fn torrent_set(state: &AppState, args: &Value) -> Result<Value, String> {
                 .write()
                 .await
                 .insert(hash.clone(), group.clone());
+        }
+        if let Some(piece) = sequential_from_piece {
+            state
+                .torrent_sequential_from_piece
+                .write()
+                .await
+                .insert(hash.clone(), piece);
         }
         if let Some(updates) = &limit_updates {
             let mut limits = transmission_torrent_limits(state, &hash)
@@ -1153,6 +1171,7 @@ async fn torrent_get(state: &AppState, args: &Value) -> Result<Value, String> {
         }
     }
     let torrent_groups = state.torrent_groups.read().await.clone();
+    let sequential_from_piece = state.torrent_sequential_from_piece.read().await.clone();
     let groups = state.groups.read().await.clone();
     let torrents = entries
         .iter()
@@ -1362,7 +1381,12 @@ async fn torrent_get(state: &AppState, args: &Value) -> Result<Value, String> {
                             .map(|limits| limits.sequential_download)
                             .unwrap_or(false))
                     }
-                    "sequentialDownloadFromPiece" | "sequential-download-from-piece" => json!(0),
+                    "sequentialDownloadFromPiece" | "sequential-download-from-piece" => {
+                        json!(sequential_from_piece
+                            .get(&entry.info_hash)
+                            .copied()
+                            .unwrap_or(0))
+                    }
                     _ => Value::Null,
                 };
                 obj.insert(field.clone(), value);
@@ -2995,6 +3019,59 @@ mod tests {
         let torrent = &body["arguments"]["torrents"][0];
         assert_eq!(torrent["group"], "archive");
         assert_eq!(torrent["honorsSessionLimits"], false);
+    }
+
+    #[tokio::test]
+    async fn transmission_sequential_from_piece_roundtrips_in_torrent_get() {
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        {
+            let mut reg = registry.write().await;
+            reg.add(TorrentEntry::new(
+                "c".repeat(40),
+                "gamma".into(),
+                "/downloads".into(),
+            ))
+            .unwrap();
+        }
+        let app = build_transmission_router(AppState::new(registry));
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .header("content-type", "application/json")
+                    .header("x-transmission-session-id", SESSION_ID)
+                    .body(Body::from(
+                        r#"{"method":"torrent-set","arguments":{"ids":["cccccccccccccccccccccccccccccccccccccccc"],"sequentialDownloadFromPiece":123}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .header("content-type", "application/json")
+                    .header("x-transmission-session-id", SESSION_ID)
+                    .body(Body::from(
+                        r#"{"method":"torrent-get","arguments":{"fields":["sequentialDownloadFromPiece"]}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body["arguments"]["torrents"][0]["sequentialDownloadFromPiece"],
+            123
+        );
     }
 
     #[tokio::test]

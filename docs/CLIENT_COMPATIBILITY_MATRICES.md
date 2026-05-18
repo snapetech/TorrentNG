@@ -185,7 +185,7 @@ Transmission `torrent_get` field matrix:
 | Web seeds | `webseeds`, `webseeds_sending_to_us`, `webseeds_ex` | Native/Partial; URL list projects from metainfo and activity/rate fields project native webseed snapshots when available |
 | Queue/group | `queue_position`, `group` | Partial; default group compatibility implemented |
 | Comments/creator | `comment`, `creator`, `primary_mime_type` | Native/Partial; torrent comment, creator, creation date, and primary MIME type project from parsed metainfo where available |
-| Sequential | `sequential_download`, `sequential_download_from_piece` | Sequential flag mutation/projection implemented; from-piece remains placeholder |
+| Sequential | `sequential_download`, `sequential_download_from_piece` | Sequential flag and from-piece mutation/projection roundtrip implemented; picker-level behavioral effects remain native work |
 
 Transmission `session_get` field matrix:
 
