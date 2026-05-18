@@ -18,13 +18,14 @@ release claims.
 | Area | Status | Evidence |
 | --- | --- | --- |
 | Positioned reads/writes | Implemented through a scheduler-owned `SelectedDiskBackend` | `crates/rt-storage/src/scheduler.rs` `read_at`, `write_at`; `crates/rt-storage/src/backend.rs`; `concurrent_positioned_writes_do_not_share_cursor` |
+| Short I/O handling | Implemented for scheduler and runtime backend completions | `UnexpectedEof` and `WriteZero` backend results map to `StorageError::ShortIo`; `short_positioned_read_maps_to_storage_error`; `backend_short_io_maps_to_storage_error` |
 | Dedicated blocking workers | Implemented in `MountScheduler::submit` through its bounded `BlockingPool` | `crates/rt-storage/src/scheduler.rs`; `full_mount_queue_fails_closed`, `queued_disk_bytes_track_active_blocking_job_payload` |
 | Open-file pool | Implemented for scheduler hot path | `FilePoolStats`; `file_pool_records_hits_and_evictions`; real-device `repeated_reads_reuse_one_open_file_handle` |
 | Per-file preparation | Implemented in `TorrentTask` with a prepared-file registry | `crates/rt-engine/src/torrent_task.rs`; `sparse_prepare_creates_parent_once` |
 | Auto preallocation | Implemented from detected topology | `preallocation_mode_for_topology`; `auto_preallocation_policy_uses_full_only_for_non_cow_hdd` |
 | Durability barrier | Implemented for scheduler dirty files and fastresume trust | `sync_data`, `sync_all_open_files`; fastresume save paths in `TorrentTask` |
 | Hash isolation | Implemented with a dedicated scheduler hash pool | `hash_sha1`, `hash_v2_leaf`, `hash_v2_root`; scale tests for hash-pool isolation |
-| Peer-read locality | Implemented as bounded readahead cache and HDD elevator | `peer_read_readahead_cache_*`, `hdd_peer_read_elevator_*`, real-device benchmark probes |
+| Peer-read locality | Implemented as bounded readahead cache and HDD elevator | `peer_read_readahead_cache_*`, `hdd_peer_read_elevator_*`, real-device benchmark probes; requested-byte counters stay separate from backend readahead bytes |
 | Sparse recheck | Implemented via data/hole probing where supported | `data_extents`; `verify_sparse_piece_hashes_holes_as_zeroes`; `sparse_recheck_skips_holes_and_reports_extent_counters` |
 | Backend queue bounds | Implemented for `PreadBackend` and `UringBackend` with bounded sync queues and immediate `WouldBlock` failures on full queue | `pread_backend_queue_fails_closed_when_full`; `backend::tests` |
 | Hot-path backend integration | Implemented for scheduler reads, writes, syncs, and peer-read elevator dispatch | `MountScheduler::disk_backend`; `SelectedDiskBackend::select_with_queue_depth`; `read_and_write_roundtrip`; `hdd_peer_read_elevator_*` |

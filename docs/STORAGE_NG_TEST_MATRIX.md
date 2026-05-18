@@ -33,7 +33,7 @@ per-case syscall counters when `strace` is available.
 | Area | Coverage | Command |
 | --- | --- | --- |
 | Formatting | Workspace Rust formatting | `cargo fmt --check` |
-| Storage core | fd pool, positioned I/O, preallocation, durability, page-cache advice, sparse recheck, readahead, topology, elevator policy | `cargo test -p rt-storage` |
+| Storage core | fd pool, positioned I/O, short-I/O error mapping, preallocation, durability, page-cache advice, sparse recheck, readahead, topology, elevator policy | `cargo test -p rt-storage` |
 | Backend selection | `auto`/`pread`/`uring` parsing, `io_uring` probe and worker-start fallback diagnostics, selected-backend read/write roundtrip | `cargo test -p rt-storage backend::tests` |
 | Backend graduation | real-device `pread` vs `uring` stream throughput, selected backend, registered-file support, fixed-buffer support, fixed-buffer strategy; release graduation requires `TNG_STORAGE_URING_REQUIRE_FRAME_POOL_SLOTS=1` | `scripts/storage_uring_graduation.sh /target/root` |
 | Resource governor | total and per-class memory caps, pressure transitions, denied allocation counters, lease release | `cargo test -p rt-metrics resource::tests` |
@@ -67,6 +67,7 @@ per-case syscall counters when `strace` is available.
 | `torrentng_storage_backend_{max_batch_len,fixed_buffer_bytes}` | Backend batch and fixed-buffer sizing match the selected implementation |
 | `torrentng_storage_backend_fixed_buffer_strategy{strategy=...}` | `disabled` for `pread`; `frame_pool_slots` for `uring` when registered frame slots are active; `worker_copy` remains a reserved compatibility value |
 | `torrentng_storage_*_latency_nanoseconds_by_device{device=...,profile=...}` | Storage latency attribution and bounded histograms survive multi-device aggregation |
+| `torrentng_storage_*_bytes_total` | Requested read/write bytes stay separate from backend bytes so readahead and coalesced reads do not inflate user-visible transfer accounting |
 | `torrentng_storage_file_pool_*` | fd pool remains bounded and records hit/miss/eviction/idle-close activity |
 | `torrentng_storage_device_queue_{capacity,available}` | process-level per-device queue sharing and available permit pressure are visible across running schedulers |
 | `torrentng_storage_queue_full_total` | bounded storage queues expose backpressure instead of silently accumulating jobs |

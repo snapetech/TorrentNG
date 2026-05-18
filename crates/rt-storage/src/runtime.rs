@@ -185,7 +185,7 @@ impl StorageRuntime {
             })?;
         match self.backend.pread(file, frame, offset).await {
             Ok(Ok(frame)) => Ok(frame),
-            Ok(Err(e)) => Err(map_backend_io_error(path, e)),
+            Ok(Err(e)) => Err(map_backend_io_error(path, e, Some(len))),
             Err(_) => Err(StorageError::Cancelled),
         }
     }
@@ -200,18 +200,32 @@ impl StorageRuntime {
         create: bool,
     ) -> Result<(), StorageError> {
         let file = self.open_write(path, create)?;
+        let len = data.len();
         match self.backend.pwrite(file, data, offset).await {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(map_backend_io_error(path, e)),
+            Ok(Err(e)) => Err(map_backend_io_error(path, e, Some(len))),
             Err(_) => Err(StorageError::Cancelled),
         }
     }
 }
 
-fn map_backend_io_error(path: &Path, error: std::io::Error) -> StorageError {
+fn map_backend_io_error(
+    path: &Path,
+    error: std::io::Error,
+    expected_len: Option<usize>,
+) -> StorageError {
     if error.kind() == std::io::ErrorKind::WouldBlock {
         StorageError::QueueFull {
             mount: "storage-backend".to_string(),
+        }
+    } else if matches!(
+        error.kind(),
+        std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::WriteZero
+    ) {
+        StorageError::ShortIo {
+            path: path.display().to_string(),
+            expected: expected_len.unwrap_or(0),
+            actual: 0,
         }
     } else {
         StorageError::io(path.display().to_string(), error)
@@ -260,10 +274,28 @@ mod tests {
         let err = map_backend_io_error(
             Path::new("/storage/root/file.bin"),
             std::io::Error::new(std::io::ErrorKind::WouldBlock, "storage backend queue full"),
+            None,
         );
         assert!(matches!(
             err,
             StorageError::QueueFull { ref mount } if mount == "storage-backend"
+        ));
+    }
+
+    #[test]
+    fn backend_short_io_maps_to_storage_error() {
+        let err = map_backend_io_error(
+            Path::new("/storage/root/file.bin"),
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "short read"),
+            Some(4096),
+        );
+        assert!(matches!(
+            err,
+            StorageError::ShortIo {
+                expected: 4096,
+                actual: 0,
+                ..
+            }
         ));
     }
 }

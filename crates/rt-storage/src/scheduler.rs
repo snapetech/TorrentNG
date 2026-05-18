@@ -758,11 +758,31 @@ async fn await_backend_io<T>(
     path: &Path,
     rx: oneshot::Receiver<io::Result<T>>,
 ) -> Result<T, StorageError> {
+    await_backend_io_with_expected(path, rx, None).await
+}
+
+async fn await_backend_io_with_expected<T>(
+    path: &Path,
+    rx: oneshot::Receiver<io::Result<T>>,
+    expected_len: Option<usize>,
+) -> Result<T, StorageError> {
     match rx.await {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(error)) if error.kind() == io::ErrorKind::WouldBlock => {
             Err(StorageError::QueueFull {
                 mount: "storage-backend".to_string(),
+            })
+        }
+        Ok(Err(error))
+            if matches!(
+                error.kind(),
+                io::ErrorKind::UnexpectedEof | io::ErrorKind::WriteZero
+            ) =>
+        {
+            Err(StorageError::ShortIo {
+                path: path.display().to_string(),
+                expected: expected_len.unwrap_or(0),
+                actual: 0,
             })
         }
         Ok(Err(error)) => Err(StorageError::io(path.display().to_string(), error)),
@@ -1055,7 +1075,13 @@ async fn dispatch_peer_read_batch(
                         .collect();
                 }
             };
-            match await_backend_io(&key, disk_backend.pread(file.clone(), frame, offset)).await {
+            match await_backend_io_with_expected(
+                &key,
+                disk_backend.pread(file.clone(), frame, offset),
+                Some(len),
+            )
+            .await
+            {
                 Ok(frame) => {
                     advise_after_read_class(&file, IoClass::PeerRead, offset, len, &counters);
                     Ok(frame.into_bytes())
@@ -1621,22 +1647,25 @@ impl MountScheduler {
                         mount: "scheduler-read-frame".to_string(),
                     }
                 })?;
-                let frame =
-                    match await_backend_io(&key, disk_backend.pread(file.clone(), frame, offset))
-                        .await
-                    {
-                        Ok(frame) => frame,
-                        Err(error) => {
-                            if matches!(error, StorageError::QueueFull { .. }) {
-                                counters.queue_full.fetch_add(1, Ordering::Relaxed);
-                            }
-                            return Err(error);
+                let frame = match await_backend_io_with_expected(
+                    &key,
+                    disk_backend.pread(file.clone(), frame, offset),
+                    Some(read_len),
+                )
+                .await
+                {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        if matches!(error, StorageError::QueueFull { .. }) {
+                            counters.queue_full.fetch_add(1, Ordering::Relaxed);
                         }
-                    };
+                        return Err(error);
+                    }
+                };
                 let _submission = submission;
                 counters.read_ops_by_class[class_index(class)].fetch_add(1, Ordering::Relaxed);
                 counters.bytes_read_by_class[class_index(class)]
-                    .fetch_add(read_len as u64, Ordering::Relaxed);
+                    .fetch_add(len as u64, Ordering::Relaxed);
                 counters.backend_read_ops_by_class[class_index(class)]
                     .fetch_add(1, Ordering::Relaxed);
                 counters.backend_bytes_read_by_class[class_index(class)]
@@ -1702,7 +1731,12 @@ impl MountScheduler {
             }
         };
         let written = data.len();
-        let result = await_backend_io(&key, disk_backend.pwrite(file.clone(), data, offset)).await;
+        let result = await_backend_io_with_expected(
+            &key,
+            disk_backend.pwrite(file.clone(), data, offset),
+            Some(written),
+        )
+        .await;
         if let Err(error) = result {
             if matches!(error, StorageError::QueueFull { .. }) {
                 counters.queue_full.fetch_add(1, Ordering::Relaxed);
@@ -2680,6 +2714,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn short_positioned_read_maps_to_storage_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("short-read.bin");
+        std::fs::write(&path, b"tiny").unwrap();
+        let sched = hdd_scheduler();
+
+        let result = scheduled_read(&sched, IoClass::Foreground, &path, 0, 8).await;
+
+        assert!(matches!(
+            result,
+            Err(StorageError::ShortIo {
+                expected: 8,
+                actual: 0,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
     async fn read_and_write_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.bin");
@@ -2955,10 +3008,7 @@ mod tests {
         assert_eq!(stats.peer_read_cache_misses, 1);
         assert_eq!(stats.peer_read_cache_hits, 1);
         assert_eq!(stats.peer_read_cache_entries, 1);
-        assert_eq!(
-            stats.bytes_read_by_class[class_index(IoClass::PeerRead)],
-            20
-        );
+        assert_eq!(stats.bytes_read_by_class[class_index(IoClass::PeerRead)], 8);
         assert_eq!(
             stats.backend_read_ops_by_class[class_index(IoClass::PeerRead)],
             1
