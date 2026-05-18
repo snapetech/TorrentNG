@@ -45,6 +45,30 @@ impl TorrentMeta {
             TorrentMeta::Hybrid(m, _) => m.private,
         }
     }
+
+    pub fn comment(&self) -> Option<&str> {
+        match self {
+            TorrentMeta::V1(m) => m.comment.as_deref(),
+            TorrentMeta::V2(m) => m.comment.as_deref(),
+            TorrentMeta::Hybrid(m, _) => m.comment.as_deref(),
+        }
+    }
+
+    pub fn created_by(&self) -> Option<&str> {
+        match self {
+            TorrentMeta::V1(m) => m.created_by.as_deref(),
+            TorrentMeta::V2(m) => m.created_by.as_deref(),
+            TorrentMeta::Hybrid(m, _) => m.created_by.as_deref(),
+        }
+    }
+
+    pub fn creation_date(&self) -> Option<i64> {
+        match self {
+            TorrentMeta::V1(m) => m.creation_date,
+            TorrentMeta::V2(m) => m.creation_date,
+            TorrentMeta::Hybrid(m, _) => m.creation_date,
+        }
+    }
 }
 
 /// Parsed v1 torrent metainfo.
@@ -57,6 +81,9 @@ pub struct TorrentMetaV1 {
     pub announce_list: Vec<Vec<String>>,
     /// BEP 19 HTTP/FTP web seeds.
     pub webseeds: Vec<String>,
+    pub comment: Option<String>,
+    pub created_by: Option<String>,
+    pub creation_date: Option<i64>,
     pub name: String,
     pub piece_length: u64,
     /// One SHA-1 hash per piece.
@@ -117,6 +144,9 @@ pub struct TorrentMetaV2 {
     pub announce: Option<String>,
     pub announce_list: Vec<Vec<String>>,
     pub webseeds: Vec<String>,
+    pub comment: Option<String>,
+    pub created_by: Option<String>,
+    pub creation_date: Option<i64>,
     pub name: String,
     /// Piece length must be a power of two, minimum 16 KiB.
     pub piece_length: u64,

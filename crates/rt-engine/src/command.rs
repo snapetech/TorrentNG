@@ -36,6 +36,9 @@ pub struct EngineTorrentMetadata {
     pub is_private: bool,
     pub trackers: Vec<String>,
     pub webseeds: Vec<String>,
+    pub comment: Option<String>,
+    pub created_by: Option<String>,
+    pub creation_date: Option<i64>,
     pub files: Vec<EngineTorrentFile>,
 }
 

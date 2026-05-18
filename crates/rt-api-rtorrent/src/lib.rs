@@ -1096,6 +1096,9 @@ mod tests {
             is_private: false,
             trackers: vec!["udp://tracker.example:6969/announce".to_owned()],
             webseeds: vec![],
+            comment: None,
+            created_by: None,
+            creation_date: None,
             files: vec![
                 EngineTorrentFile {
                     index: 0,

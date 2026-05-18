@@ -1224,7 +1224,9 @@ fn deluge_torrent(
         "tracker_host": tracker_host(&tracker),
         "tracker_status": tracker_status,
         "tracker": tracker,
-        "comment": "",
+        "comment": meta
+            .and_then(|meta| meta.comment.as_deref())
+            .unwrap_or(""),
         "message": message,
     })
 }

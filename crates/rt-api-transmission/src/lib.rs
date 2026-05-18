@@ -1153,7 +1153,9 @@ async fn torrent_get(state: &AppState, args: &Value) -> Result<Value, String> {
                     "activityDate" | "activity-date" => json!(entry.added_at),
                     "doneDate" | "done-date" => json!(entry.completed_at.unwrap_or(0)),
                     "startDate" | "start-date" => json!(entry.added_at),
-                    "dateCreated" | "date-created" => json!(entry.added_at),
+                    "dateCreated" | "date-created" => json!(meta
+                        .and_then(|meta| meta.creation_date)
+                        .unwrap_or(entry.added_at as i64)),
                     "peers" => json!(transmission_peers(
                         peers
                             .get(&entry.info_hash)
@@ -1192,8 +1194,10 @@ async fn torrent_get(state: &AppState, args: &Value) -> Result<Value, String> {
                     "fileStats" | "file-stats" => json!(transmission_file_stats(entry, meta)),
                     "priorities" => json!(transmission_file_priorities(meta)),
                     "wanted" => json!(transmission_file_wanted(meta)),
-                    "comment" => json!(""),
-                    "creator" => json!(""),
+                    "comment" => json!(meta.and_then(|meta| meta.comment.as_deref()).unwrap_or("")),
+                    "creator" => json!(meta
+                        .and_then(|meta| meta.created_by.as_deref())
+                        .unwrap_or("")),
                     "primaryMimeType" | "primary-mime-type" => {
                         json!(transmission_primary_mime_type(entry, meta))
                     }
@@ -2378,6 +2382,9 @@ mod tests {
             is_private: false,
             trackers: Vec::new(),
             webseeds: vec!["https://seed.example/one.bin".to_owned()],
+            comment: None,
+            created_by: None,
+            creation_date: None,
             files: vec![
                 EngineTorrentFile {
                     index: 0,

@@ -160,7 +160,7 @@ Transmission `torrent_get` field matrix:
 | Trackers | `trackers`, `tracker_stats` including announce/scrape states and counts | Native/Partial; persisted announce status, timestamps, failure/warning messages, and scrape counts project from engine tracker rows |
 | Web seeds | `webseeds`, `webseeds_sending_to_us`, `webseeds_ex` | Partial; `webseeds_ex` shape implemented with activity placeholders |
 | Queue/group | `queue_position`, `group` | Partial; default group compatibility implemented |
-| Comments/creator | `comment`, `creator`, `primary_mime_type` | Partial; primary MIME type is inferred from the largest torrent file where possible, torrent comment/creator require metainfo parser expansion |
+| Comments/creator | `comment`, `creator`, `primary_mime_type` | Native/Partial; torrent comment, creator, creation date, and primary MIME type project from parsed metainfo where available |
 | Sequential | `sequential_download`, `sequential_download_from_piece` | Sequential flag mutation/projection implemented; from-piece remains placeholder |
 
 Transmission `session_get` field matrix:
@@ -202,12 +202,12 @@ Deluge torrent status field matrix:
 |---|---|---|
 | Identity/path | `hash`, `name`, `save_path`, `label`, `owner`, `shared` | Native/Compat |
 | Progress/size | `progress`, `total_size`, `total_done`, `num_files`, `num_pieces`, `piece_length` | Native/Partial |
-| State/time | `state`, `is_finished`, `eta`, `time_added`, `completed_time`, `active_time`, `seeding_time`, `finished_time` | Compat/native; ETA remains placeholder without live rate |
+| State/time | `state`, `is_finished`, `eta`, `time_added`, `completed_time`, `active_time`, `seeding_time`, `finished_time` | Compat/native; ETA projects from native peer rates where available |
 | Rates/counters | download/upload rates, total payload download/upload, all-time download, ratio | Native/compat: rates project native peer snapshots when available; counters project registry stats |
 | Peers/seeds | `num_peers`, `num_seeds`, `total_peers`, `total_seeds`, distributed copies | Native/compat from peer snapshots when an engine is attached |
 | Trackers | `tracker`, `tracker_host`, `tracker_status`, `next_announce` | Native/Partial; persisted engine tracker rows project URL, host, status/warning/error text, and next announce where available |
 | Options | max speeds, auto managed, stop ratio, move completed, sequential, super seeding, first/last | Compat/native for speed, auto-managed, stop ratio, move-completed, sequential, super seeding, first/last |
-| Messages | `comment`, `message`, `private` | Compat/native for error message and private flag; torrent comments remain placeholder |
+| Messages | `comment`, `message`, `private` | Compat/native for torrent comments, error message, and private flag |
 
 ## 6. rTorrent XMLRPC Matrix
 

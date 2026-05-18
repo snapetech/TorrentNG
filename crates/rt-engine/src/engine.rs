@@ -4142,6 +4142,9 @@ fn metadata_from_meta(meta: &TorrentMeta) -> EngineTorrentMetadata {
             is_private: meta.private,
             trackers: meta.all_trackers(),
             webseeds: meta.webseeds.clone(),
+            comment: meta.comment.clone(),
+            created_by: meta.created_by.clone(),
+            creation_date: meta.creation_date,
             files: meta
                 .files
                 .iter()
@@ -4164,6 +4167,9 @@ fn metadata_from_meta(meta: &TorrentMeta) -> EngineTorrentMetadata {
                 is_private: meta.private,
                 trackers: v2_all_trackers(meta),
                 webseeds: meta.webseeds.clone(),
+                comment: meta.comment.clone(),
+                created_by: meta.created_by.clone(),
+                creation_date: meta.creation_date,
                 files: meta
                     .files
                     .iter()
@@ -4189,6 +4195,9 @@ fn metadata_from_placeholder_row(row: &TorrentRow) -> EngineTorrentMetadata {
         is_private: row.is_private,
         trackers: row.trackers.clone(),
         webseeds: Vec::new(),
+        comment: None,
+        created_by: None,
+        creation_date: None,
         files: Vec::new(),
     }
 }
@@ -4294,6 +4303,9 @@ mod tests {
             announce: Some("http://tracker.example.com/announce".into()),
             announce_list: Vec::new(),
             webseeds: Vec::new(),
+            comment: None,
+            created_by: None,
+            creation_date: None,
             name: "sample.bin".into(),
             piece_length: 16_384,
             pieces: vec![[2u8; 20], [3u8; 20]],
@@ -4433,6 +4445,9 @@ mod tests {
             "http://tracker.example.com/announce".into(),
             "udp://tracker.two:6969/announce".into(),
         ]];
+        meta.comment = Some("Release notes".to_owned());
+        meta.created_by = Some("TorrentNG fixture".to_owned());
+        meta.creation_date = Some(1_700_000_000);
         meta.files = vec![TorrentFileV1 {
             index: 7,
             length: 42,
@@ -4449,6 +4464,9 @@ mod tests {
             vec![hex::encode([2u8; 20]), hex::encode([3u8; 20])]
         );
         assert!(projected.is_private);
+        assert_eq!(projected.comment.as_deref(), Some("Release notes"));
+        assert_eq!(projected.created_by.as_deref(), Some("TorrentNG fixture"));
+        assert_eq!(projected.creation_date, Some(1_700_000_000));
         assert_eq!(
             projected.trackers,
             vec![

@@ -1166,14 +1166,15 @@ pub async fn torrents_properties(
         None
     };
 
-    let (piece_size, pieces_num) = if let Some(engine) = &state.engine {
-        match engine.torrent_metadata(hash.clone()).await {
-            Ok(meta) => (meta.piece_length as i64, meta.piece_count as i64),
-            Err(_) => (0, 0),
-        }
+    let meta = if let Some(engine) = &state.engine {
+        engine.torrent_metadata(hash.clone()).await.ok()
     } else {
-        (0, 0)
+        None
     };
+    let (piece_size, pieces_num) = meta
+        .as_ref()
+        .map(|meta| (meta.piece_length as i64, meta.piece_count as i64))
+        .unwrap_or((0, 0));
 
     let limits = get_torrent_limits(&state, &hash).await;
     let now = unix_now();
@@ -1200,9 +1201,15 @@ pub async fn torrents_properties(
     );
     let props = QbTorrentProperties {
         save_path: format!("{}/", entry.save_path.trim_end_matches('/')),
-        creation_date: entry.added_at as i64,
+        creation_date: meta
+            .as_ref()
+            .and_then(|meta| meta.creation_date)
+            .unwrap_or(entry.added_at as i64),
         piece_size,
-        comment: String::new(),
+        comment: meta
+            .as_ref()
+            .and_then(|meta| meta.comment.clone())
+            .unwrap_or_default(),
         total_wasted: 0,
         total_uploaded: entry.stats.uploaded as i64,
         total_uploaded_session: entry.stats.uploaded as i64,
@@ -1217,7 +1224,10 @@ pub async fn torrents_properties(
         share_ratio: entry.stats.ratio(),
         addition_date: entry.added_at as i64,
         completion_date: entry.completed_at.map(|t| t as i64).unwrap_or(-1),
-        created_by: String::new(),
+        created_by: meta
+            .as_ref()
+            .and_then(|meta| meta.created_by.clone())
+            .unwrap_or_default(),
         dl_speed_avg: 0,
         dl_speed,
         eta,

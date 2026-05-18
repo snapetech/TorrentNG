@@ -37,6 +37,9 @@ pub fn parse_torrent(raw: &[u8]) -> Result<TorrentMeta, MetainfoError> {
     let announce = parse_announce(root);
     let announce_list = parse_announce_list(root);
     let webseeds = parse_webseeds(root);
+    let comment = parse_optional_string(root, b"comment");
+    let created_by = parse_optional_string(root, b"created by");
+    let creation_date = root.get(b"creation date").and_then(|v| v.as_int());
 
     let name = get_string(info, b"name", "name")?;
     if name.is_empty() {
@@ -85,6 +88,9 @@ pub fn parse_torrent(raw: &[u8]) -> Result<TorrentMeta, MetainfoError> {
                 announce: announce.clone(),
                 announce_list: announce_list.clone(),
                 webseeds: webseeds.clone(),
+                comment: comment.clone(),
+                created_by: created_by.clone(),
+                creation_date,
                 name: name.clone(),
                 piece_length,
                 pieces,
@@ -97,6 +103,9 @@ pub fn parse_torrent(raw: &[u8]) -> Result<TorrentMeta, MetainfoError> {
                 announce,
                 announce_list,
                 webseeds,
+                comment,
+                created_by,
+                creation_date,
                 name,
                 piece_length,
                 files: files_v2,
@@ -119,6 +128,9 @@ pub fn parse_torrent(raw: &[u8]) -> Result<TorrentMeta, MetainfoError> {
             announce,
             announce_list,
             webseeds,
+            comment,
+            created_by,
+            creation_date,
             name,
             piece_length,
             files: files_v2,
@@ -149,6 +161,9 @@ pub fn parse_torrent(raw: &[u8]) -> Result<TorrentMeta, MetainfoError> {
         announce,
         announce_list,
         webseeds,
+        comment,
+        created_by,
+        creation_date,
         name,
         piece_length,
         pieces,
@@ -238,10 +253,16 @@ fn walk_file_tree<'a>(
 }
 
 fn parse_announce(root: &BValue<'_>) -> Option<String> {
-    root.get(b"announce")
+    parse_optional_string(root, b"announce")
+}
+
+fn parse_optional_string(root: &BValue<'_>, key: &[u8]) -> Option<String> {
+    root.get(key)
         .and_then(|v| v.as_bytes())
         .and_then(|b| std::str::from_utf8(b).ok())
-        .map(|s| s.to_owned())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn parse_files_v1(info: &BValue<'_>, name: &str) -> Result<Vec<TorrentFileV1>, MetainfoError> {
@@ -481,6 +502,34 @@ mod tests {
             panic!("expected V1")
         };
         assert!(m.private);
+    }
+
+    #[test]
+    fn parse_top_level_comment_creator_and_creation_date() {
+        let pieces_data = make_pieces(1);
+        let mut info_pairs: Vec<(&[u8], BValue<'_>)> = vec![
+            (b"length", BValue::Int(1024)),
+            (b"name", BValue::Bytes(b"noted.bin")),
+            (b"piece length", BValue::Int(512 * 1024)),
+            (b"pieces", BValue::Bytes(&pieces_data)),
+        ];
+        info_pairs.sort_by(|a, b| a.0.cmp(b.0));
+        let mut root: Vec<(&[u8], BValue<'_>)> = vec![
+            (b"announce", BValue::Bytes(b"http://t.example/a")),
+            (b"comment", BValue::Bytes(b" Release notes ")),
+            (b"created by", BValue::Bytes(b"TorrentNG test fixture")),
+            (b"creation date", BValue::Int(1_700_000_000)),
+            (b"info", BValue::Dict(info_pairs)),
+        ];
+        root.sort_by(|a, b| a.0.cmp(b.0));
+        let raw = encode(&BValue::Dict(root));
+
+        let TorrentMeta::V1(m) = parse_torrent(&raw).unwrap() else {
+            panic!("expected V1")
+        };
+        assert_eq!(m.comment.as_deref(), Some("Release notes"));
+        assert_eq!(m.created_by.as_deref(), Some("TorrentNG test fixture"));
+        assert_eq!(m.creation_date, Some(1_700_000_000));
     }
 
     #[test]

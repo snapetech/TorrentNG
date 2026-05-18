@@ -3241,6 +3241,9 @@ mod tests {
             is_private: false,
             trackers: vec!["http://tracker/announce".to_owned()],
             webseeds: Vec::new(),
+            comment: None,
+            created_by: None,
+            creation_date: None,
             files: vec![rt_engine::EngineTorrentFile {
                 index: 0,
                 path: "detail.bin".to_owned(),
