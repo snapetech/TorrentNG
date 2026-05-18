@@ -193,4 +193,18 @@ pub trait TorrentBackend: Send + Sync {
             self.backend_type().as_str()
         )
     }
+
+    async fn get_user_agent(&self) -> Result<String> {
+        bail!(
+            "{} backend does not support runtime user-agent reads",
+            self.backend_type().as_str()
+        )
+    }
+
+    async fn set_user_agent(&self, _user_agent: &str) -> Result<()> {
+        bail!(
+            "{} backend does not support runtime user-agent updates",
+            self.backend_type().as_str()
+        )
+    }
 }

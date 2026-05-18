@@ -2516,7 +2516,7 @@ pub async fn get_user_agent(State(s): State<AppState>) -> impl IntoResponse {
     if !s.backend.capabilities().supports_runtime_user_agent {
         return StatusCode::NOT_IMPLEMENTED.into_response();
     }
-    match s.rt.get_user_agent().await {
+    match s.backend.get_user_agent().await {
         Ok(ua) => Json(UserAgentResponse { user_agent: ua }).into_response(),
         Err(e) => {
             tracing::error!(component = "api", operation = "get_user_agent", result = "error", error = %e, "user-agent lookup failed");
@@ -2536,10 +2536,10 @@ pub async fn set_user_agent(
     if ua.is_empty() {
         return (StatusCode::BAD_REQUEST, "user_agent must not be empty").into_response();
     }
-    match s.rt.set_user_agent(&ua).await {
+    match s.backend.set_user_agent(&ua).await {
         Ok(_) => {
             tracing::info!(
-                component = "rtorrent",
+                component = s.backend.backend_type().as_str(),
                 operation = "set_user_agent",
                 user_agent_len = ua.len(),
                 "user agent updated"
@@ -2547,9 +2547,9 @@ pub async fn set_user_agent(
             record_operator_event(
                 &s,
                 "settings_changed",
-                "rTorrent user agent updated",
+                "backend user agent updated",
                 serde_json::json!({
-                    "component": "rtorrent",
+                    "component": s.backend.backend_type().as_str(),
                     "operation": "set_user_agent",
                     "result": "updated",
                     "user_agent_len": ua.len(),
@@ -2563,9 +2563,9 @@ pub async fn set_user_agent(
             record_operator_event(
                 &s,
                 "rtorrent_user_agent_error",
-                "rTorrent user agent update failed",
+                "backend user agent update failed",
                 serde_json::json!({
-                    "component": "rtorrent",
+                    "component": s.backend.backend_type().as_str(),
                     "operation": "set_user_agent",
                     "result": "error",
                     "error": e.to_string(),

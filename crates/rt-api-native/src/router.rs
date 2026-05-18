@@ -9,7 +9,7 @@ use crate::{
         list_torrent_files, list_torrent_trackers, list_torrents, metrics, patch_torrent_files,
         patch_torrent_trackers, pause_torrent, reannounce_torrent, recheck_torrent, resume_torrent,
         set_torrent_category, storage_execute_plan, storage_preview_plan, stream_events,
-        update_torrent,
+        torrent_limits, update_torrent, update_torrent_limits,
     },
     state::AppState,
 };
@@ -48,6 +48,10 @@ pub fn build_router(state: AppState) -> Router {
             axum::routing::post(reannounce_torrent),
         )
         .route("/api/v1/torrents/:hash/category", put(set_torrent_category))
+        .route(
+            "/api/v1/torrents/:hash/limits",
+            get(torrent_limits).put(update_torrent_limits),
+        )
         .route(
             "/api/v1/torrents/:hash/tags",
             patch(crate::handlers::patch_torrent_tags),

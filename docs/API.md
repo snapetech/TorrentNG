@@ -81,13 +81,15 @@ the rewritten engine.
 | `GET`  | `/api/v1/torrents/:hash/files` | List files |
 | `PATCH` | `/api/v1/torrents/:hash/files` | Set file priorities and/or paths (`{ files: [{index, priority, path}] }`); native daemon routes each file priority and rename update through the engine |
 | `PUT`  | `/api/v1/torrents/:hash/category` | Set or clear category (`{ category: "name" }`, or `null`/empty to clear) |
+| `GET`  | `/api/v1/torrents/:hash/limits` | Read per-torrent limits and mode flags |
+| `PUT`  | `/api/v1/torrents/:hash/limits` | Merge per-torrent limits (`download_limit`, `upload_limit`, `max_connections`, `seed_ratio_limit`, `seed_idle_limit`, `sequential_download`, `first_last_piece_prio`, `force_start`, `super_seeding`, `auto_tmm`, `auto_management`; use `null` for nullable limits) |
 | `PATCH` | `/api/v1/torrents/:hash/tags` | Add/remove tags (`{ add: ["a"], remove: ["b"] }`); native daemon routes tag changes through the engine label update path |
 | `GET` | `/api/v1/events` | Server-sent torrent delta stream |
 | `GET` | `/api/v1/jobs` | List active durable engine jobs with progress, checkpoint, and last-error fields |
 | `GET` | `/api/v1/session-events` | Recent durable native session events; query: `limit`, `torrent`, `kind`, `level`, `last_known_id` |
-| `GET` | `/api/v1/logs` | Recent durable sidecar app/rTorrent events; query: `limit`, `kind`, `level`, `last_known_id` |
+| `GET` | `/api/v1/logs` | Recent durable sidecar app/backend events plus rTorrent log-ingest events when that adapter is selected; query: `limit`, `kind`, `level`, `last_known_id` |
 
-`/api/v1/logs` returns retained operator events newest-first. Important `kind` values include `sidecar_started`, `rtorrent_log`, `rtorrent_log_ingest_error`, `rtorrent_log_ingest_recovered`, `rtorrent_sync_error`, `rtorrent_sync_recovered`, `rtorrent_stats_error`, `rtorrent_stats_recovered`, `rtorrent_user_agent_error`, `torrent_added`, `torrent_removed`, `torrent_updated`, `categories_updated`, `tags_updated`, `saved_views_updated`, `ratio_groups_updated`, `rss_rules_updated`, `workflows_updated`, `workflow_runs_updated`, `settings_changed`, and `admin_restart_requested`. Payloads are sanitized: magnet URLs, auth material, full filesystem paths, and raw user-agent strings are not stored.
+`/api/v1/logs` returns retained operator events newest-first. Important `kind` values include `sidecar_started`, `rtorrent_log`, `rtorrent_log_ingest_error`, `rtorrent_log_ingest_recovered`, `rtorrent_sync_error`, `rtorrent_sync_recovered`, `rtorrent_stats_error`, `rtorrent_stats_recovered`, `rtorrent_user_agent_error`, `torrent_added`, `torrent_removed`, `torrent_updated`, `categories_updated`, `tags_updated`, `saved_views_updated`, `ratio_groups_updated`, `rss_rules_updated`, `workflows_updated`, `workflow_runs_updated`, `settings_changed`, and `admin_restart_requested`. The `rtorrent_sync_*` and `rtorrent_stats_*` names are retained as legacy event kinds, but their payloads include the selected backend. Payloads are sanitized: magnet URLs, auth material, full filesystem paths, and raw user-agent strings are not stored.
 
 #### `GET /api/v1/torrents` query parameters
 

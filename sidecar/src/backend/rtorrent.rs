@@ -208,4 +208,12 @@ impl TorrentBackend for RtorrentBackend {
             .await?;
         Ok(())
     }
+
+    async fn get_user_agent(&self) -> Result<String> {
+        self.client.get_user_agent().await
+    }
+
+    async fn set_user_agent(&self, user_agent: &str) -> Result<()> {
+        self.client.set_user_agent(user_agent).await
+    }
 }

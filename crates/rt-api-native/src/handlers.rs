@@ -14,7 +14,7 @@ use futures::Stream;
 use rt_api_model::{
     AddTorrentRequest, AddTorrentResponse, ApiError, FileInfo, TorrentDetail, TorrentSummary,
 };
-use rt_engine::EngineJob;
+use rt_engine::{EngineJob, EngineTorrentLimits};
 use rt_metainfo::{parse_magnet, parse_torrent};
 use rt_metrics::MemoryClass;
 use rt_session::{TorrentEntry, TorrentState};
@@ -22,7 +22,7 @@ use rt_storage::{
     runtime::StorageRuntime, DeletePlanRequest, ImportPlanRequest, MovePlanRequest, PlanIssue,
     PlannedStorageAction, StoragePlan, StoragePlanStep, STORAGE_LATENCY_BUCKETS_NS,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::state::AppState;
 
@@ -440,6 +440,212 @@ pub async fn set_torrent_category(
         }
         None => not_found(info_hash),
     }
+}
+
+#[derive(Debug, Serialize)]
+pub struct TorrentLimitsResponse {
+    pub download_limit: Option<i64>,
+    pub upload_limit: Option<i64>,
+    pub max_connections: Option<i64>,
+    pub seed_ratio_limit: Option<f64>,
+    pub seed_idle_limit: Option<i64>,
+    pub sequential_download: bool,
+    pub sequential_download_from_piece: Option<i64>,
+    pub first_last_piece_prio: bool,
+    pub force_start: bool,
+    pub super_seeding: bool,
+    pub auto_tmm: bool,
+    pub auto_management: bool,
+}
+
+impl From<EngineTorrentLimits> for TorrentLimitsResponse {
+    fn from(limits: EngineTorrentLimits) -> Self {
+        Self {
+            download_limit: limits.download_limit,
+            upload_limit: limits.upload_limit,
+            max_connections: limits.max_connections,
+            seed_ratio_limit: limits.seed_ratio_limit,
+            seed_idle_limit: limits.seed_idle_limit,
+            sequential_download: limits.sequential_download,
+            sequential_download_from_piece: limits.sequential_download_from_piece,
+            first_last_piece_prio: limits.first_last_piece_prio,
+            force_start: limits.force_start,
+            super_seeding: limits.super_seeding,
+            auto_tmm: limits.auto_tmm,
+            auto_management: limits.auto_management,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateTorrentLimitsRequest {
+    #[serde(default, deserialize_with = "deserialize_present_value")]
+    pub download_limit: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "deserialize_present_value")]
+    pub upload_limit: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "deserialize_present_value")]
+    pub max_connections: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "deserialize_present_value")]
+    pub seed_ratio_limit: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "deserialize_present_value")]
+    pub seed_idle_limit: Option<serde_json::Value>,
+    pub sequential_download: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_present_value")]
+    pub sequential_download_from_piece: Option<serde_json::Value>,
+    pub first_last_piece_prio: Option<bool>,
+    pub force_start: Option<bool>,
+    pub super_seeding: Option<bool>,
+    pub auto_tmm: Option<bool>,
+    pub auto_management: Option<bool>,
+}
+
+fn deserialize_present_value<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    serde_json::Value::deserialize(deserializer).map(Some)
+}
+
+/// `GET /api/v1/torrents/{hash}/limits` — read persisted per-torrent limits.
+pub async fn torrent_limits(
+    State(state): State<AppState>,
+    Path(info_hash): Path<String>,
+) -> impl IntoResponse {
+    if !torrent_exists(&state, &info_hash).await {
+        return not_found(info_hash);
+    }
+    let Some(engine) = &state.engine else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                serde_json::to_value(ApiError::internal("native engine is not available")).unwrap(),
+            ),
+        )
+            .into_response();
+    };
+    match engine.torrent_limits(info_hash).await {
+        Ok(limits) => (StatusCode::OK, Json(TorrentLimitsResponse::from(limits))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError::bad_request(e)).unwrap()),
+        )
+            .into_response(),
+    }
+}
+
+/// `PUT /api/v1/torrents/{hash}/limits` — merge and persist per-torrent limits.
+pub async fn update_torrent_limits(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(info_hash): Path<String>,
+    Json(req): Json<UpdateTorrentLimitsRequest>,
+) -> impl IntoResponse {
+    if let Some(response) = require_mutation_auth(&state, &headers) {
+        return response;
+    }
+    if !torrent_exists(&state, &info_hash).await {
+        return not_found(info_hash);
+    }
+    let Some(engine) = &state.engine else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                serde_json::to_value(ApiError::internal("native engine is not available")).unwrap(),
+            ),
+        )
+            .into_response();
+    };
+
+    let mut limits = match engine.torrent_limits(info_hash.clone()).await {
+        Ok(limits) => limits,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::to_value(ApiError::bad_request(e)).unwrap()),
+            )
+                .into_response()
+        }
+    };
+    if let Err(e) = merge_torrent_limits(&mut limits, req) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError::bad_request(e)).unwrap()),
+        )
+            .into_response();
+    }
+
+    match engine.update_torrent_limits(info_hash, limits).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError::bad_request(e)).unwrap()),
+        )
+            .into_response(),
+    }
+}
+
+fn merge_torrent_limits(
+    limits: &mut EngineTorrentLimits,
+    req: UpdateTorrentLimitsRequest,
+) -> Result<(), String> {
+    if let Some(value) = req.download_limit {
+        limits.download_limit = nullable_i64(value, "download_limit")?;
+    }
+    if let Some(value) = req.upload_limit {
+        limits.upload_limit = nullable_i64(value, "upload_limit")?;
+    }
+    if let Some(value) = req.max_connections {
+        limits.max_connections = nullable_i64(value, "max_connections")?;
+    }
+    if let Some(value) = req.seed_ratio_limit {
+        limits.seed_ratio_limit = nullable_f64(value, "seed_ratio_limit")?;
+    }
+    if let Some(value) = req.seed_idle_limit {
+        limits.seed_idle_limit = nullable_i64(value, "seed_idle_limit")?;
+    }
+    if let Some(value) = req.sequential_download {
+        limits.sequential_download = value;
+    }
+    if let Some(value) = req.sequential_download_from_piece {
+        limits.sequential_download_from_piece =
+            nullable_i64(value, "sequential_download_from_piece")?;
+    }
+    if let Some(value) = req.first_last_piece_prio {
+        limits.first_last_piece_prio = value;
+    }
+    if let Some(value) = req.force_start {
+        limits.force_start = value;
+    }
+    if let Some(value) = req.super_seeding {
+        limits.super_seeding = value;
+    }
+    if let Some(value) = req.auto_tmm {
+        limits.auto_tmm = value;
+    }
+    if let Some(value) = req.auto_management {
+        limits.auto_management = value;
+    }
+    Ok(())
+}
+
+fn nullable_i64(value: serde_json::Value, field: &str) -> Result<Option<i64>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_i64()
+        .map(Some)
+        .ok_or_else(|| format!("{field} must be an integer or null"))
+}
+
+fn nullable_f64(value: serde_json::Value, field: &str) -> Result<Option<f64>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_f64()
+        .map(Some)
+        .ok_or_else(|| format!("{field} must be a number or null"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -3502,6 +3708,40 @@ mod tests {
         let entry = reg.get(&hash).unwrap();
         assert_eq!(entry.name, "new.torrent");
         assert_eq!(entry.save_path, "/new-data");
+    }
+
+    #[tokio::test]
+    async fn torrent_limits_without_engine_returns_unavailable() {
+        let (app, hash) = setup_app_with_torrent().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/torrents/{hash}/limits"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn update_torrent_limits_request_distinguishes_null_from_absent() {
+        let req: UpdateTorrentLimitsRequest = serde_json::from_value(serde_json::json!({
+            "seed_ratio_limit": null,
+            "sequential_download": true
+        }))
+        .unwrap();
+        let mut limits = EngineTorrentLimits {
+            seed_ratio_limit: Some(2.0),
+            ..Default::default()
+        };
+        assert!(matches!(req.download_limit, None));
+
+        merge_torrent_limits(&mut limits, req).unwrap();
+
+        assert_eq!(limits.seed_ratio_limit, None);
+        assert!(limits.sequential_download);
     }
 
     #[tokio::test]

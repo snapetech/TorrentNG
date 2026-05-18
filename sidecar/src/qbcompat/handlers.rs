@@ -635,14 +635,26 @@ async fn app_set_preferences(
         .get("network_http_user_agent")
         .and_then(|v| v.as_str())
     {
-        match s.rt.set_user_agent(ua).await {
+        if !s.backend.capabilities().supports_runtime_user_agent {
+            tracing::debug!(
+                component = "qbcompat",
+                backend = s.backend.backend_type().as_str(),
+                operation = "set_preferences",
+                setting = "network_http_user_agent",
+                result = "unsupported",
+                "qBit user-agent preference ignored because backend does not support runtime user-agent updates"
+            );
+            return StatusCode::OK;
+        }
+        match s.backend.set_user_agent(ua).await {
             Ok(_) => record_operator_event(
                 &s,
                 "info",
                 "settings_changed",
-                "qBittorrent preferences updated rTorrent user agent",
+                "qBittorrent preferences updated backend user agent",
                 serde_json::json!({
                     "component": "qbcompat",
+                    "backend": s.backend.backend_type().as_str(),
                     "operation": "set_preferences",
                     "setting": "network_http_user_agent",
                     "result": "updated",
@@ -661,9 +673,10 @@ async fn app_set_preferences(
                     &s,
                     "warn",
                     "rtorrent_user_agent_error",
-                    "qBittorrent preference update could not apply rTorrent user agent",
+                    "qBittorrent preference update could not apply backend user agent",
                     serde_json::json!({
                         "component": "qbcompat",
+                        "backend": s.backend.backend_type().as_str(),
                         "operation": "set_preferences",
                         "setting": "network_http_user_agent",
                         "result": "error",

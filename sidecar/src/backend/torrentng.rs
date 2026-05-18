@@ -325,6 +325,42 @@ impl TorrentBackend for TorrentngBackend {
         Ok(())
     }
 
+    async fn set_share_limits(
+        &self,
+        hash: &str,
+        ratio_limit_milli: i64,
+        seeding_time_limit: i64,
+    ) -> Result<()> {
+        self.put_limits(
+            hash,
+            json!({
+                "seed_ratio_limit": if ratio_limit_milli >= 0 {
+                    json!(ratio_limit_milli as f64 / 1000.0)
+                } else {
+                    Value::Null
+                },
+                "seed_idle_limit": if seeding_time_limit >= 0 {
+                    json!(seeding_time_limit)
+                } else {
+                    Value::Null
+                },
+            }),
+        )
+        .await
+    }
+
+    async fn toggle_sequential_download(&self, hash: &str) -> Result<()> {
+        let limits: Value = self
+            .get_json(&format!("api/v1/torrents/{hash}/limits"))
+            .await?;
+        let next = !limits
+            .get("sequential_download")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        self.put_limits(hash, json!({ "sequential_download": next }))
+            .await
+    }
+
     async fn add_tags(&self, hash: &str, tags: &[&str]) -> Result<()> {
         self.patch_json(
             &format!("api/v1/torrents/{hash}/tags"),
@@ -361,6 +397,22 @@ impl TorrentBackend for TorrentngBackend {
             json!({ "add": tags, "remove": current_tags }),
         )
         .await?;
+        Ok(())
+    }
+}
+
+impl TorrentngBackend {
+    async fn put_limits(&self, hash: &str, body: Value) -> Result<()> {
+        self.request(
+            reqwest::Method::PUT,
+            &format!("api/v1/torrents/{hash}/limits"),
+        )?
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("TorrentNG PUT torrent {hash} limits"))?
+        .error_for_status()
+        .with_context(|| format!("TorrentNG PUT torrent {hash} limits"))?;
         Ok(())
     }
 }

@@ -72,13 +72,13 @@ impl Metrics {
         counter(
             &mut out,
             "torrentng_sync_cycles_total",
-            "Total rTorrent sync cycles completed",
+            "Total sidecar backend sync cycles completed",
             self.sync_cycles_total.load(Ordering::Relaxed),
         );
         counter(
             &mut out,
             "torrentng_sync_errors_total",
-            "Total rTorrent sync cycle errors",
+            "Total sidecar backend sync cycle errors",
             self.sync_errors_total.load(Ordering::Relaxed),
         );
         out
