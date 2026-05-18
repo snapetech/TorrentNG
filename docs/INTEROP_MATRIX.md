@@ -217,22 +217,22 @@ row names fail before the Compose stack is started.
 
 ## Expansion Backlog
 
-These rows are not required by the default gate yet. They define the remaining
-coverage needed before claiming broad BitTorrent compatibility rather than
-strong baseline interoperability.
+These rows are not all release blockers. They separate default-gate coverage
+that already exists from additional rows needed before claiming broad
+BitTorrent compatibility rather than strong baseline interoperability.
 
-| Area | Planned rows |
-|---|---|
-| Magnet links | `magnet-with-tracker`, `magnet-dht-only`, `magnet-metadata-from-qbit`, `magnet-metadata-from-transmission`, `magnet-resume-after-restart` |
-| DHT, PEX, LSD | `dht-only-discovery`, `pex-peer-discovery`, `lsd-docker-lan-discovery`, `dht-bootstrap-recovery-after-restart` |
-| Trackers | `http-tracker-announce-scrape`, `udp-tracker-announce-scrape`, `multi-tracker-tiers`, `private-tracker-policy` |
-| Protocol behavior | `extension-handshake`, `ut-metadata`, `fast-extension`, `choke-unchoke-contention`, `optimistic-unchoke`, `endgame-mode`, `rarest-first-partial-availability` |
-| File layouts | `single-file`, `deep-multi-file-tree`, `empty-files`, `unicode-paths`, `space-and-shell-hostile-paths`, `small-piece-size`, `large-piece-size` |
-| State and recovery | `pause-resume-persistence`, `force-recheck`, `move-storage-path`, `delete-torrent-only`, `delete-with-data`, `resume-partial-files`, `corrupt-block-repair`, `missing-file-recovery` |
-| API compatibility | `qbit-arr-endpoints`, `transmission-write-rpc`, `deluge-write-json-rpc`, `error-shape-compatibility`, `tracker-mutation-compatibility`, `file-priority-compatibility` |
-| Performance and stress | `hundreds-small-torrents`, `many-peers-per-torrent`, `parallel-public-torrents`, `long-active-soak`, `memory-fd-growth`, `rate-limit-behavior` |
-| Network adversity | `reference-client-restart`, `rust-restart-mid-transfer`, `slow-peer`, `corrupt-peer`, `peer-disconnect-churn`, `ipv6-transfer`; tracker outage after peer discovery is implemented as `tracker-outage-after-peer-discovery`, and webseed outage fallback is implemented as `webseed-outage-fallback` |
-| Seeding | `rust-long-running-seeder`, `upload-accounting`, `ratio-seed-limit`, `time-seed-limit`, `multiple-leechers-from-rust`, `reference-clients-complete-from-rust-alone` |
+| Area | Implemented coverage | Remaining rows |
+|---|---|---|
+| Magnet links | `rust-magnet-with-tracker`; engine unit coverage for trackerless DHT peer candidates and BEP 9 metadata fetch | `magnet-dht-only` Docker transfer, `magnet-metadata-from-qbit`, `magnet-metadata-from-transmission`, `magnet-resume-after-restart` |
+| DHT, PEX, LSD | `private-torrent-no-dht-pex`; DHT get-peers and metadata-fetch unit evidence | `dht-only-discovery` Docker row, `pex-peer-discovery`, `lsd-docker-lan-discovery`, `dht-bootstrap-recovery-after-restart` |
+| Trackers | `rust-udp-tracker`, `rust-multi-tracker-fallback`, `tracker-outage-after-peer-discovery`, `private-torrent-no-dht-pex` | HTTP scrape detail, UDP scrape detail, deeper multi-tracker tier ordering |
+| Protocol behavior | `rust-magnet-with-tracker` exercises extension handshake and `ut_metadata`; `endgame-multi-peer` covers duplicate-write/endgame pressure | fast extension, choke/unchoke contention, optimistic unchoke, rarest-first partial availability |
+| File layouts | base single-file rows, `mesh-swarm` multi-file, `rust-partial-file-selection` | deep multi-file tree, empty files, unicode paths, shell-hostile paths, small and large piece sizes |
+| State and recovery | `rust-restart-recovery`, `resume-after-partial-download`, `force-recheck-corruption-repair`, `missing-file-recovery` | pause/resume persistence, move-storage-path, delete-torrent-only, delete-with-data |
+| API compatibility | `rust-api-facades`, `rust-qbit-mutation-facade`, API facade certification scripts | deeper Transmission write RPC live effects, Deluge write JSON-RPC live effects, cross-client error-shape parity |
+| Performance and stress | `churn`, `mesh-swarm`, `endgame-multi-peer`, `rust-seeds-to-all-reference-clients` | hundreds-small-torrents, many-peers-per-torrent, parallel-public-torrents, long-active-soak, memory-fd-growth, rate-limit-behavior |
+| Network adversity | `rust-restart-recovery`, `tracker-outage-after-peer-discovery`, `webseed-outage-fallback` | reference-client restart, slow peer, corrupt peer, peer-disconnect churn, IPv6 transfer |
+| Seeding | `rust-seeds-to-all-reference-clients`, `endgame-multi-peer`, base Rust-as-seeder rows | upload accounting, ratio seed limit, time seed limit, multiple long-running leechers from Rust |
 
 ## Public Matrix
 

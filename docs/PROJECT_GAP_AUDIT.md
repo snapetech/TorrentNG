@@ -69,7 +69,8 @@ Actionable gaps:
   public transfer interop, storage resume scenarios, golden import corpora, and
   plugin auxiliary APIs.
 - Keep `docs/INTEROP_MATRIX.md` as the live backlog for protocol and
-  client-to-client evidence. Several protocol rows remain planned.
+  client-to-client evidence. Its expansion backlog now separates implemented
+  default-gate rows from remaining Docker/live coverage.
 - Decide whether `24h soak` should be rerun to completion, superseded by
   transfer-churn soak, or removed from release status if the stale report is no
   longer a release target.
@@ -236,7 +237,7 @@ The full Docker interop matrix still has release evidence to run:
   rTorrent, and TorrentNG now have refreshed passing evidence through
   `scripts/universal_live_certification.sh`;
 - public legal torrent matrix;
-- planned protocol rows: DHT-only magnet. The DHT core now has unit evidence
+- the planned default-gate protocol row is DHT-only magnet. The DHT core now has unit evidence
   that `get_peers` responses are forwarded into torrent peer commands, but
   full trackerless local metadata fetch and transfer still needs an end-to-end
   Docker row. `tracker-outage-after-peer-discovery`, `webseed-outage-fallback`,
