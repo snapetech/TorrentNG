@@ -29,9 +29,10 @@ failures:
 TNG_EXTERNAL_PREFLIGHT_STRICT=1 scripts/external_evidence_preflight.sh
 ```
 
-## Exported Migration Corpus
+## Migration Corpus
 
-Populate the real exported client corpus:
+The repository includes generated corpus fixtures for every supported source
+family:
 
 ```text
 testdata/migration-corpus/qbittorrent/
@@ -44,7 +45,7 @@ testdata/migration-corpus/rtorrent/
 testdata/migration-corpus/generic/
 ```
 
-Then enforce it:
+Enforce the generated corpus and manifest:
 
 ```sh
 TNG_REQUIRE_MIGRATION_CORPUS=1 scripts/migration_corpus_certification.sh
@@ -54,7 +55,9 @@ The report includes SHA-256 hashes for every discovered artifact. In strict
 mode, `manifest.toml` is mandatory, each source family must declare at least
 one artifact, every declared artifact must stay under its matching family
 directory, and every discovered evidence file must be declared with source and
-permission metadata. Declared `sha256` values are verified when present.
+permission metadata. Declared `sha256` values are verified when present. Add
+real exported client artifacts beside the generated fixtures when a release
+needs extra version-specific evidence.
 
 ## Live Compatibility
 

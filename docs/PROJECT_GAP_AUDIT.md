@@ -17,8 +17,9 @@ compatibility depth:
   public-swarm and real-device storage legs remain opt-in external release
   gates; universal compatibility reports surface skipped optional legs as
   `PASS_WITH_SKIPS`;
-- the migration corpus gate exists and reports `PASS_WITH_GAPS` until real
-  exported corpora are present for all legacy clients;
+- the migration corpus gate now has checked-in generated fixtures for every
+  legacy client family and passes strict local validation; adding real exported
+  corpora remains optional release-depth evidence for undocumented variants;
 - facade compatibility still has placeholder-depth areas for live
   peer/tracker/webseed details and some client-specific plugin APIs;
 - the security release checklist is intentionally unchecked until run against
@@ -35,7 +36,7 @@ Current `scripts/certification_status.sh` highlights:
 | Area | Status |
 | --- | --- |
 | Native engine rewrite | PASS |
-| Local release gate | PASS_WITH_WARNINGS while exported migration corpora are missing |
+| Local release gate | PASS_WITH_WARNINGS only while optional live/public/device/soak rows are skipped or stale |
 | Storage hardware matrix | PASS |
 | Storage io_uring capability/graduation | PASS |
 | Storage move/import | PASS |
@@ -51,7 +52,7 @@ Current `scripts/certification_status.sh` highlights:
 | Certification JSON status | Machine-readable status export for CI/release automation |
 | Universal compatibility | PASS_WITH_SKIPS unless live/public/device legs are enabled |
 | Universal live compatibility | PASS_WITH_SKIPS while public/device legs are skipped; latest local Docker interop leg passed |
-| Migration corpus | PASS_WITH_GAPS until exported corpora are populated |
+| Migration corpus | PASS with generated checked-in corpus; strict local gate passes |
 | External evidence preflight | Host readiness for live/corpus/soak external evidence |
 | 24h soak | STALE/INCOMPLETE |
 
@@ -135,9 +136,9 @@ rendering, selection state, settings navigation, storage panel rendering,
 axe WCAG structural checks, deterministic visual-regression baselines for the
 main workspace and storage settings panel, and console/page-error cleanliness.
 `scripts/local_release_gate.sh` now runs the same WebUI certification as part
-of the local release path. It also runs the migration corpus gate and reports
-that leg as `WARN`, with an overall `PASS_WITH_WARNINGS`, when the synthetic
-migration tests pass but exported corpora are still missing.
+of the local release path. It also runs the migration corpus gate against the
+checked-in generated corpus so strict local validation has artifact coverage
+for every supported source family.
 
 Remaining WebUI gaps are now product/certification depth:
 
@@ -193,14 +194,15 @@ Remaining compatibility gaps:
   completion from discovered peers are unit-covered in `rt-engine`; the
   remaining row is Docker-level trackerless transfer certification.
 - `scripts/migration_corpus_certification.sh` now separates synthetic
-  import/apply coverage from exported fixture coverage. It runs `rt-migrate`
+  import/apply coverage from fixture artifact coverage. It runs `rt-migrate`
   tests and scans `testdata/migration-corpus/{qbittorrent,transmission,deluge,
-  utorrent,biglybt,tixati,rtorrent,generic}`. It reports `PASS_WITH_GAPS` by
-  default while corpora are missing, or fails with
+  utorrent,biglybt,tixati,rtorrent,generic}`. The checked-in generated corpus
+  and manifest cover every source family and pass with
   `TNG_REQUIRE_MIGRATION_CORPUS=1`.
-- Real exported golden fixture corpora are still needed for qBittorrent,
+- Real exported golden fixture corpora can still be added for qBittorrent,
   Transmission, Deluge, uTorrent/BitTorrent Classic, BiglyBT/Vuze, Tixati,
-  rTorrent, and generic bencoded/JSON edge cases.
+  rTorrent, and generic bencoded/JSON edge cases when release evidence needs
+  undocumented client/version variants beyond generated fixtures.
 - `scripts/external_evidence_preflight.sh` uses the same artifact filename
   patterns as `scripts/migration_corpus_certification.sh`, so placeholder
   files such as `README.md` do not satisfy exported-corpus coverage.
