@@ -57,6 +57,15 @@ impl CompactPieceBitmap {
         }
     }
 
+    pub fn complete(piece_count: u32) -> Self {
+        let mut bitmap = Self {
+            piece_count,
+            bytes: vec![0xff; (piece_count as usize).div_ceil(8)],
+        };
+        bitmap.clear_unused_tail_bits();
+        bitmap
+    }
+
     pub fn from_pieces(pieces: &[bool]) -> Self {
         let mut bytes = vec![0u8; pieces.len().div_ceil(8)];
         for (idx, has_piece) in pieces.iter().copied().enumerate() {
@@ -78,14 +87,11 @@ impl CompactPieceBitmap {
                 bytes.len()
             ));
         }
-        if piece_count % 8 != 0 && !bytes.is_empty() {
-            let used_bits = piece_count % 8;
-            let unused_mask = (1 << (8 - used_bits)) - 1;
-            if bytes[bytes.len() - 1] & unused_mask != 0 {
-                return Err("piece bitmap has set bits beyond piece_count".to_owned());
-            }
+        let bitmap = Self { piece_count, bytes };
+        if bitmap.has_unused_tail_bits_set() {
+            return Err("piece bitmap has set bits beyond piece_count".to_owned());
         }
-        Ok(Self { piece_count, bytes })
+        Ok(bitmap)
     }
 
     pub fn piece_count(&self) -> u32 {
@@ -104,12 +110,52 @@ impl CompactPieceBitmap {
         self.bytes[idx / 8] & (1 << (7 - (idx % 8))) != 0
     }
 
+    pub fn set_piece(&mut self, piece: u32, present: bool) -> bool {
+        if piece >= self.piece_count {
+            return false;
+        }
+        let idx = piece as usize;
+        let mask = 1 << (7 - (idx % 8));
+        if present {
+            self.bytes[idx / 8] |= mask;
+        } else {
+            self.bytes[idx / 8] &= !mask;
+        }
+        true
+    }
+
+    pub fn set_all_from_bitfield(&mut self, pieces: &[bool]) -> Result<(), String> {
+        if pieces.len() != self.piece_count as usize {
+            return Err(format!(
+                "piece bitfield has {} pieces, expected {}",
+                pieces.len(), self.piece_count
+            ));
+        }
+        self.bytes.fill(0);
+        for (idx, has_piece) in pieces.iter().copied().enumerate() {
+            if has_piece {
+                self.bytes[idx / 8] |= 1 << (7 - (idx % 8));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn to_bitfield(&self) -> Vec<bool> {
+        (0..self.piece_count)
+            .map(|piece| self.has_piece(piece))
+            .collect()
+    }
+
     pub fn complete_pieces(&self) -> u32 {
         if self.piece_count == 0 {
             return 0;
         }
-        let mut total = 0;
-        for piece in 0..self.piece_count {
+        let full_bytes = (self.piece_count / 8) as usize;
+        let mut total = self.bytes[..full_bytes]
+            .iter()
+            .map(|byte| byte.count_ones())
+            .sum::<u32>();
+        for piece in (full_bytes as u32 * 8)..self.piece_count {
             if self.has_piece(piece) {
                 total += 1;
             }
@@ -119,6 +165,25 @@ impl CompactPieceBitmap {
 
     pub fn estimated_heap_bytes(&self) -> usize {
         self.bytes.capacity()
+    }
+
+    fn has_unused_tail_bits_set(&self) -> bool {
+        if self.piece_count % 8 == 0 || self.bytes.is_empty() {
+            return false;
+        }
+        let used_bits = self.piece_count % 8;
+        let unused_mask = (1 << (8 - used_bits)) - 1;
+        self.bytes[self.bytes.len() - 1] & unused_mask != 0
+    }
+
+    fn clear_unused_tail_bits(&mut self) {
+        if self.piece_count % 8 == 0 || self.bytes.is_empty() {
+            return;
+        }
+        let used_bits = self.piece_count % 8;
+        let unused_mask = (1 << (8 - used_bits)) - 1;
+        let idx = self.bytes.len() - 1;
+        self.bytes[idx] &= !unused_mask;
     }
 }
 
@@ -598,6 +663,28 @@ mod tests {
         );
         assert!(CompactPieceBitmap::from_bytes(9, vec![0, 0b0100_0000]).is_err());
         assert!(CompactPieceBitmap::from_bytes(9, vec![0]).is_err());
+    }
+
+    #[test]
+    fn compact_piece_bitmap_supports_mutation_and_projection() {
+        let mut bitmap = CompactPieceBitmap::missing(10);
+        assert_eq!(bitmap.complete_pieces(), 0);
+        assert!(bitmap.set_piece(0, true));
+        assert!(bitmap.set_piece(9, true));
+        assert!(!bitmap.set_piece(10, true));
+        assert!(bitmap.has_piece(0));
+        assert!(bitmap.has_piece(9));
+        assert_eq!(bitmap.complete_pieces(), 2);
+        assert_eq!(bitmap.to_bitfield()[9], true);
+
+        bitmap.set_all_from_bitfield(&[true, false, true, false, true, false, true, false, true, false]).unwrap();
+        assert_eq!(bitmap.complete_pieces(), 5);
+        assert_eq!(bitmap.bytes(), &[0b1010_1010, 0b1000_0000]);
+        assert!(bitmap.set_all_from_bitfield(&[true]).is_err());
+
+        let complete = CompactPieceBitmap::complete(10);
+        assert_eq!(complete.complete_pieces(), 10);
+        assert_eq!(complete.bytes(), &[0xff, 0b1100_0000]);
     }
 
     #[test]
