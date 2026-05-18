@@ -114,7 +114,7 @@ Local surface: `crates/rt-api-rtorrent`.
 
 | API group | Upstream surface | Local status |
 |---|---|---|
-| System/session/network | `method.list`, `system.*`, `session.*`, `network.*`, throttle reads | Implemented as compatibility dispatcher with stable version/session/network values and zero-rate throttle placeholders |
+| System/session/network | `method.list`, `system.*`, `session.*`, `network.*`, throttle reads/writes | Implemented as compatibility dispatcher with stable version/session/network values plus global throttle read/write projection |
 | Download reads | `d.hash`, `d.name`, `d.base_path`, `d.size_bytes`, `d.left_bytes`, `d.completed_bytes`, `d.complete`, `d.state`, counters, ratio | Implemented from `SessionRegistry` state |
 | Custom fields | `d.custom`, `d.custom.set` | Implemented as facade-local roundtrip state for labels and migration/client metadata |
 | Multicall/views | `d.multicall`, `d.multicall2`, `view.list`, `view.size` | Implemented with rTorrent row-array shape over the native registry |

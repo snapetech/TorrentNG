@@ -5,7 +5,7 @@ use std::{
 
 use base64::{engine::general_purpose, Engine as _};
 use rt_engine::{
-    EngineHandle, EnginePeerSnapshot, EngineTorrentFile, EngineTorrentMetadata,
+    EngineGlobalLimits, EngineHandle, EnginePeerSnapshot, EngineTorrentFile, EngineTorrentMetadata,
     EngineTrackerSnapshot,
 };
 use rt_metainfo::{parse_magnet, parse_torrent};
@@ -20,6 +20,8 @@ pub struct AppState {
     pub engine: Option<EngineHandle>,
     pub session_path: String,
     pub network_port: i64,
+    global_down_limit: Arc<RwLock<i64>>,
+    global_up_limit: Arc<RwLock<i64>>,
     custom: Arc<RwLock<BTreeMap<String, BTreeMap<String, RtValue>>>>,
     views: Arc<RwLock<BTreeSet<String>>>,
 }
@@ -31,6 +33,8 @@ impl AppState {
             engine: None,
             session_path: String::new(),
             network_port: 0,
+            global_down_limit: Arc::new(RwLock::new(0)),
+            global_up_limit: Arc::new(RwLock::new(0)),
             custom: Arc::new(RwLock::new(BTreeMap::new())),
             views: Arc::new(RwLock::new(default_rtorrent_views())),
         }
@@ -94,6 +98,8 @@ pub fn supported_methods() -> &'static [&'static str] {
         "network.port_random",
         "throttle.global_down.max_rate",
         "throttle.global_up.max_rate",
+        "throttle.global_down.max_rate.set",
+        "throttle.global_up.max_rate.set",
         "view.list",
         "view.add",
         "view.set",
@@ -153,6 +159,8 @@ pub async fn execute(
         "network.port_random" => Ok(RtValue::Bool(false)),
         "throttle.global_down.max_rate" => Ok(RtValue::Int(global_down_limit(state).await)),
         "throttle.global_up.max_rate" => Ok(RtValue::Int(global_up_limit(state).await)),
+        "throttle.global_down.max_rate.set" => set_global_limit(state, params, true).await,
+        "throttle.global_up.max_rate.set" => set_global_limit(state, params, false).await,
         "view.list" => Ok(RtValue::Array(rtorrent_views(state).await)),
         "view.add" | "view.set" => rtorrent_view_add(state, params).await,
         "view.size" => Ok(RtValue::Int(view_size(state, params).await)),
@@ -389,25 +397,61 @@ async fn torrent_metadata_snapshot(state: &AppState, hash: &str) -> Option<Engin
 }
 
 async fn global_down_limit(state: &AppState) -> i64 {
-    let Some(engine) = &state.engine else {
-        return 0;
-    };
-    engine
-        .global_limits()
-        .await
-        .map(|limits| limits.download_limit)
-        .unwrap_or(0)
+    if let Some(engine) = &state.engine {
+        return engine
+            .global_limits()
+            .await
+            .map(|limits| limits.download_limit)
+            .unwrap_or(0);
+    }
+    *state.global_down_limit.read().await
 }
 
 async fn global_up_limit(state: &AppState) -> i64 {
-    let Some(engine) = &state.engine else {
-        return 0;
-    };
-    engine
-        .global_limits()
-        .await
-        .map(|limits| limits.upload_limit)
+    if let Some(engine) = &state.engine {
+        return engine
+            .global_limits()
+            .await
+            .map(|limits| limits.upload_limit)
+            .unwrap_or(0);
+    }
+    *state.global_up_limit.read().await
+}
+
+async fn set_global_limit(
+    state: &AppState,
+    params: &[RtValue],
+    download: bool,
+) -> Result<RtValue, String> {
+    let value = params
+        .first()
+        .and_then(|value| match value {
+            RtValue::Int(value) => Some(*value),
+            RtValue::String(value) => value.parse::<i64>().ok(),
+            _ => None,
+        })
         .unwrap_or(0)
+        .max(0);
+
+    if let Some(engine) = &state.engine {
+        let mut limits = engine.global_limits().await.unwrap_or_default();
+        if download {
+            limits.download_limit = value;
+        } else {
+            limits.upload_limit = value;
+        }
+        engine
+            .update_global_limits(EngineGlobalLimits {
+                speed_limits_mode: limits.speed_limits_mode,
+                ..limits
+            })
+            .await?;
+    } else if download {
+        *state.global_down_limit.write().await = value;
+    } else {
+        *state.global_up_limit.write().await = value;
+    }
+    Ok(RtValue::Int(0))
 }
 
 fn default_rtorrent_views() -> BTreeSet<String> {
@@ -913,6 +957,7 @@ mod tests {
             "system.client_version",
             "session.path",
             "network.port_open",
+            "throttle.global_down.max_rate.set",
             "d.hash",
             "d.multicall2",
             "load.normal",
@@ -1037,6 +1082,44 @@ mod tests {
             .await
             .unwrap(),
             RtValue::String("movies".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn global_throttle_setters_roundtrip_without_engine() {
+        let state = state_with_torrent().await;
+
+        assert_eq!(
+            execute(
+                &state,
+                "throttle.global_down.max_rate.set",
+                &[RtValue::Int(1234)]
+            )
+            .await
+            .unwrap(),
+            RtValue::Int(0)
+        );
+        assert_eq!(
+            execute(
+                &state,
+                "throttle.global_up.max_rate.set",
+                &[RtValue::String("5678".to_owned())]
+            )
+            .await
+            .unwrap(),
+            RtValue::Int(0)
+        );
+        assert_eq!(
+            execute(&state, "throttle.global_down.max_rate", &[])
+                .await
+                .unwrap(),
+            RtValue::Int(1234)
+        );
+        assert_eq!(
+            execute(&state, "throttle.global_up.max_rate", &[])
+                .await
+                .unwrap(),
+            RtValue::Int(5678)
         );
     }
 
