@@ -159,7 +159,8 @@ Local deterministic API compatibility is passing:
 - `scripts/universal_compatibility_certification.sh` passed for local
   deterministic coverage. When the Docker live, public torrent, or real-device
   legs are not enabled, the report status is `PASS_WITH_SKIPS` instead of plain
-  PASS.
+  PASS. The live mobile qBittorrent read matrix is now an explicit optional
+  universal gate through `UNIVERSAL_COMPAT_MOBILE=1`.
 
 Remaining compatibility gaps:
 

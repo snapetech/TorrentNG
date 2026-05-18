@@ -82,6 +82,12 @@ else
   skip_gate "Docker client interop local matrix" "set UNIVERSAL_COMPAT_LIVE=1 to run Docker qBit/Transmission/Deluge/rTorrent transfer interop"
 fi
 
+if [[ "${UNIVERSAL_COMPAT_MOBILE:-0}" == "1" ]]; then
+  run_gate "mobile qBittorrent compatibility matrix" "$ROOT/scripts/mobile_compat_certification.sh" "$ROOT/certification/reports/mobile-compat-universal-$(date -u +%Y%m%dT%H%M%SZ).md"
+else
+  skip_gate "mobile qBittorrent compatibility matrix" "set UNIVERSAL_COMPAT_MOBILE=1 with a running TorrentNG daemon to exercise NZB360/Transdrone-style qBit reads"
+fi
+
 if [[ "${UNIVERSAL_COMPAT_PUBLIC:-0}" == "1" ]]; then
   run_gate "public torrent interop matrix" "$ROOT/scripts/interop_matrix.sh" --public
 else

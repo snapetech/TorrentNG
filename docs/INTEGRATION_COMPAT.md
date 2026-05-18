@@ -11,8 +11,9 @@ and wire-level interop all need evidence before they are considered complete.
 - The broad local compatibility gate in
   `scripts/universal_compatibility_certification.sh`, which covers API facades,
   migration/fastresume, Track 1 qBit flows, native API, engine hooks, scale,
-  and storage topology. Set `UNIVERSAL_COMPAT_LIVE=1` for Docker client interop
-  and `UNIVERSAL_COMPAT_PUBLIC=1` for official public torrent downloads.
+  and storage topology. Set `UNIVERSAL_COMPAT_LIVE=1` for Docker client interop,
+  `UNIVERSAL_COMPAT_MOBILE=1` for live NZB360/Transdrone-style qBit read
+  flows, and `UNIVERSAL_COMPAT_PUBLIC=1` for official public torrent downloads.
 
 The build backlog and source-to-implementation comparison live in
 `docs/CLIENT_COMPATIBILITY_MATRICES.md`.
