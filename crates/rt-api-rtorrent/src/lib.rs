@@ -5,8 +5,8 @@ use std::{
 
 use base64::{engine::general_purpose, Engine as _};
 use rt_engine::{
-    EngineGlobalLimits, EngineHandle, EnginePeerSnapshot, EngineTorrentFile, EngineTorrentMetadata,
-    EngineTrackerSnapshot,
+    EngineGlobalLimits, EngineHandle, EnginePeerSnapshot, EngineTorrentFile, EngineTorrentLimits,
+    EngineTorrentMetadata, EngineTrackerSnapshot,
 };
 use rt_metainfo::{parse_magnet, parse_torrent};
 use rt_metrics::{MemoryClass, MemoryLease};
@@ -22,6 +22,7 @@ pub struct AppState {
     pub network_port: i64,
     global_down_limit: Arc<RwLock<i64>>,
     global_up_limit: Arc<RwLock<i64>>,
+    torrent_limits: Arc<RwLock<BTreeMap<String, EngineTorrentLimits>>>,
     custom: Arc<RwLock<BTreeMap<String, BTreeMap<String, RtValue>>>>,
     views: Arc<RwLock<BTreeSet<String>>>,
 }
@@ -35,6 +36,7 @@ impl AppState {
             network_port: 0,
             global_down_limit: Arc::new(RwLock::new(0)),
             global_up_limit: Arc::new(RwLock::new(0)),
+            torrent_limits: Arc::new(RwLock::new(BTreeMap::new())),
             custom: Arc::new(RwLock::new(BTreeMap::new())),
             views: Arc::new(RwLock::new(default_rtorrent_views())),
         }
@@ -117,6 +119,10 @@ pub fn supported_methods() -> &'static [&'static str] {
         "d.state_changed",
         "d.up.total",
         "d.down.total",
+        "d.down.max_rate",
+        "d.down.max_rate.set",
+        "d.up.max_rate",
+        "d.up.max_rate.set",
         "d.ratio",
         "d.custom",
         "d.custom.set",
@@ -214,6 +220,12 @@ async fn d_read_or_write(
             .insert(key.to_owned(), value);
         return Ok(RtValue::Int(0));
     }
+    if method == "d.down.max_rate.set" || method == "d.up.max_rate.set" {
+        let value = params.get(1).and_then(rt_value_i64).unwrap_or(0).max(0);
+        set_torrent_limit(state, hash, method == "d.down.max_rate.set", value).await?;
+        return Ok(RtValue::Int(0));
+    }
+    let limits = torrent_limits(state, hash).await;
     let registry = state.registry.read().await;
     let entry = registry
         .get(hash)
@@ -221,6 +233,7 @@ async fn d_read_or_write(
     Ok(project_download_field(
         entry,
         method,
+        limits.as_ref(),
         state.custom.read().await.get(hash),
         params.get(1).and_then(RtValue::as_str),
     ))
@@ -229,6 +242,7 @@ async fn d_read_or_write(
 fn project_download_field(
     entry: &TorrentEntry,
     method: &str,
+    limits: Option<&EngineTorrentLimits>,
     custom: Option<&BTreeMap<String, RtValue>>,
     custom_key: Option<&str>,
 ) -> RtValue {
@@ -250,6 +264,10 @@ fn project_download_field(
         "d.state_changed" => RtValue::Int(entry.added_at as i64),
         "d.up.total" => RtValue::Int(entry.stats.uploaded as i64),
         "d.down.total" => RtValue::Int(entry.stats.downloaded as i64),
+        "d.down.max_rate" => {
+            RtValue::Int(limits.and_then(|limits| limits.download_limit).unwrap_or(0))
+        }
+        "d.up.max_rate" => RtValue::Int(limits.and_then(|limits| limits.upload_limit).unwrap_or(0)),
         "d.ratio" => RtValue::Int((entry.stats.ratio() * 1000.0).round() as i64),
         "d.custom" => custom
             .and_then(|values| custom_key.and_then(|key| values.get(key)))
@@ -274,12 +292,21 @@ async fn d_multicall(state: &AppState, params: &[RtValue]) -> Result<RtValue, St
     .await?;
     let registry = state.registry.read().await;
     let custom = state.custom.read().await;
+    let local_limits = state.torrent_limits.read().await.clone();
     let mut rows = Vec::new();
     for entry in registry.iter() {
+        let engine_limits = if let Some(engine) = &state.engine {
+            engine.torrent_limits(entry.info_hash.clone()).await.ok()
+        } else {
+            None
+        };
+        let limits = engine_limits
+            .as_ref()
+            .or_else(|| local_limits.get(&entry.info_hash));
         let row = commands
             .iter()
             .map(|command| {
-                project_download_field(entry, command, custom.get(&entry.info_hash), None)
+                project_download_field(entry, command, limits, custom.get(&entry.info_hash), None)
             })
             .collect();
         rows.push(RtValue::Array(row));
@@ -418,20 +445,46 @@ async fn global_up_limit(state: &AppState) -> i64 {
     *state.global_up_limit.read().await
 }
 
+async fn torrent_limits(state: &AppState, hash: &str) -> Option<EngineTorrentLimits> {
+    if let Some(engine) = &state.engine {
+        if let Ok(limits) = engine.torrent_limits(hash.to_owned()).await {
+            return Some(limits);
+        }
+    }
+    state.torrent_limits.read().await.get(hash).cloned()
+}
+
+async fn set_torrent_limit(
+    state: &AppState,
+    hash: &str,
+    download: bool,
+    value: i64,
+) -> Result<(), String> {
+    let mut limits = torrent_limits(state, hash).await.unwrap_or_default();
+    if download {
+        limits.download_limit = (value > 0).then_some(value);
+    } else {
+        limits.upload_limit = (value > 0).then_some(value);
+    }
+    state
+        .torrent_limits
+        .write()
+        .await
+        .insert(hash.to_owned(), limits.clone());
+    if let Some(engine) = &state.engine {
+        engine
+            .update_torrent_limits(hash.to_owned(), limits)
+            .await?;
+    }
+    Ok(())
+}
+
 async fn set_global_limit(
     state: &AppState,
     params: &[RtValue],
     download: bool,
 ) -> Result<RtValue, String> {
-    let value = params
-        .first()
-        .and_then(|value| match value {
-            RtValue::Int(value) => Some(*value),
-            RtValue::String(value) => value.parse::<i64>().ok(),
-            _ => None,
-        })
-        .unwrap_or(0)
-        .max(0);
+    let value = params.first().and_then(rt_value_i64).unwrap_or(0).max(0);
 
     if let Some(engine) = &state.engine {
         let mut limits = engine.global_limits().await.unwrap_or_default();
@@ -452,6 +505,15 @@ async fn set_global_limit(
         *state.global_up_limit.write().await = value;
     }
     Ok(RtValue::Int(0))
+}
+
+fn rt_value_i64(value: &RtValue) -> Option<i64> {
+    match value {
+        RtValue::Int(value) => Some(*value),
+        RtValue::Bool(value) => Some(i64::from(*value)),
+        RtValue::String(value) => value.parse().ok(),
+        _ => None,
+    }
 }
 
 fn default_rtorrent_views() -> BTreeSet<String> {
@@ -1120,6 +1182,62 @@ mod tests {
                 .await
                 .unwrap(),
             RtValue::Int(5678)
+        );
+    }
+
+    #[tokio::test]
+    async fn torrent_throttle_setters_roundtrip_without_engine() {
+        let state = state_with_torrent().await;
+        let hash = RtValue::String("a".repeat(40));
+
+        assert_eq!(
+            execute(
+                &state,
+                "d.down.max_rate.set",
+                &[hash.clone(), RtValue::Int(333)]
+            )
+            .await
+            .unwrap(),
+            RtValue::Int(0)
+        );
+        assert_eq!(
+            execute(
+                &state,
+                "d.up.max_rate.set",
+                &[hash.clone(), RtValue::String("444".to_owned())]
+            )
+            .await
+            .unwrap(),
+            RtValue::Int(0)
+        );
+        assert_eq!(
+            execute(&state, "d.down.max_rate", &[hash.clone()])
+                .await
+                .unwrap(),
+            RtValue::Int(333)
+        );
+        assert_eq!(
+            execute(&state, "d.up.max_rate", &[hash.clone()])
+                .await
+                .unwrap(),
+            RtValue::Int(444)
+        );
+        assert_eq!(
+            execute(
+                &state,
+                "d.multicall2",
+                &[
+                    RtValue::String("main".to_owned()),
+                    RtValue::String("d.down.max_rate=".to_owned()),
+                    RtValue::String("d.up.max_rate=".to_owned()),
+                ],
+            )
+            .await
+            .unwrap(),
+            RtValue::Array(vec![RtValue::Array(vec![
+                RtValue::Int(333),
+                RtValue::Int(444)
+            ])])
         );
     }
 
