@@ -244,6 +244,100 @@ TNG_MIGRATION_CORPUS_DIR="$tmpdir/migration-corpus" \
 grep -q '| qbittorrent | PASS | 1 |' "$report_dir/migration-corpus-inventory-selftest.md"
 grep -q 'sample.fastresume' "$report_dir/migration-corpus-inventory-selftest.md"
 grep -q 'Overall status: PASS_WITH_GAPS' "$report_dir/migration-corpus-inventory-selftest.md"
+
+if TNG_MIGRATION_CORPUS_DIR="$tmpdir/migration-corpus" \
+  TNG_REQUIRE_MIGRATION_CORPUS=1 \
+  "$ROOT/scripts/migration_corpus_certification.sh" "$report_dir/migration-corpus-strict-missing-manifest-selftest.md" >/dev/null 2>&1; then
+  echo "strict migration corpus accepted missing manifest" >&2
+  exit 1
+fi
+grep -q 'manifest.toml is required' "$report_dir/migration-corpus-strict-missing-manifest-selftest.md"
+
+strict_corpus="$tmpdir/migration-corpus-strict"
+mkdir -p "$strict_corpus"/{qbittorrent,transmission,deluge,utorrent,biglybt,tixati,rtorrent,generic}
+for family in qbittorrent transmission deluge utorrent biglybt tixati rtorrent generic; do
+  printf '%s fixture\n' "$family" >"$strict_corpus/$family/sample.torrent"
+done
+qb_hash="$(sha256sum "$strict_corpus/qbittorrent/sample.torrent" | awk '{print $1}')"
+cat >"$strict_corpus/manifest.toml" <<EOF
+[[family]]
+name = "qbittorrent"
+versions = ["selftest"]
+expected = ["sample.torrent"]
+[[family.artifacts]]
+path = "qbittorrent/sample.torrent"
+source = "selftest"
+permission = "selftest"
+sha256 = "$qb_hash"
+
+[[family]]
+name = "transmission"
+versions = ["selftest"]
+expected = ["sample.torrent"]
+[[family.artifacts]]
+path = "transmission/sample.torrent"
+source = "selftest"
+permission = "selftest"
+
+[[family]]
+name = "deluge"
+versions = ["selftest"]
+expected = ["sample.torrent"]
+[[family.artifacts]]
+path = "deluge/sample.torrent"
+source = "selftest"
+permission = "selftest"
+
+[[family]]
+name = "utorrent"
+versions = ["selftest"]
+expected = ["sample.torrent"]
+[[family.artifacts]]
+path = "utorrent/sample.torrent"
+source = "selftest"
+permission = "selftest"
+
+[[family]]
+name = "biglybt"
+versions = ["selftest"]
+expected = ["sample.torrent"]
+[[family.artifacts]]
+path = "biglybt/sample.torrent"
+source = "selftest"
+permission = "selftest"
+
+[[family]]
+name = "tixati"
+versions = ["selftest"]
+expected = ["sample.torrent"]
+[[family.artifacts]]
+path = "tixati/sample.torrent"
+source = "selftest"
+permission = "selftest"
+
+[[family]]
+name = "rtorrent"
+versions = ["selftest"]
+expected = ["sample.torrent"]
+[[family.artifacts]]
+path = "rtorrent/sample.torrent"
+source = "selftest"
+permission = "selftest"
+
+[[family]]
+name = "generic"
+versions = ["selftest"]
+expected = ["sample.torrent"]
+[[family.artifacts]]
+path = "generic/sample.torrent"
+source = "selftest"
+permission = "selftest"
+EOF
+TNG_MIGRATION_CORPUS_DIR="$strict_corpus" \
+  TNG_REQUIRE_MIGRATION_CORPUS=1 \
+  "$ROOT/scripts/migration_corpus_certification.sh" "$report_dir/migration-corpus-strict-selftest.md" >/dev/null
+grep -q 'Overall status: PASS' "$report_dir/migration-corpus-strict-selftest.md"
+grep -q "$qb_hash" "$report_dir/migration-corpus-strict-selftest.md"
 "$ROOT/scripts/certification_bundle_selftest.sh" >/dev/null
 "$ROOT/scripts/certification_policy_selftest.sh" >/dev/null
 

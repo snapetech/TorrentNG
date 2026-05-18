@@ -147,14 +147,30 @@ cat "$OUT.table" >> "$OUT"
 rm -f "$OUT.table"
 
 if [[ -f "$MANIFEST" ]]; then
-  if python3 - "$MANIFEST" "$CORPUS_DIR" "${families[@]}" >"$manifest_report" <<'PY'
+  if python3 - "$MANIFEST" "$CORPUS_DIR" "$REQUIRE_CORPUS" "${families[@]}" >"$manifest_report" <<'PY'
+import fnmatch
+import hashlib
 import pathlib
 import sys
 import tomllib
 
 manifest = pathlib.Path(sys.argv[1]).resolve()
 root = pathlib.Path(sys.argv[2]).resolve()
-required = set(sys.argv[3:])
+strict = sys.argv[3] == "1"
+required = set(sys.argv[4:])
+evidence_patterns = [
+    "*.torrent",
+    "*.fastresume",
+    "*.resume",
+    "*.resume.json",
+    "*.state",
+    "*.dat",
+    "*.conf",
+    "*.config",
+    "resume.dat",
+    "downloads.config",
+    "torrents.config",
+]
 
 with manifest.open("rb") as fh:
     data = tomllib.load(fh)
@@ -165,6 +181,7 @@ if not isinstance(families, list):
 
 seen = set()
 artifact_rows = []
+declared = set()
 for family in families:
     if not isinstance(family, dict):
         raise SystemExit("each [[family]] entry must be a table")
@@ -185,6 +202,8 @@ for family in families:
     artifacts = family.get("artifacts", [])
     if artifacts and not isinstance(artifacts, list):
         raise SystemExit(f"{name}: artifacts must be an array of tables")
+    if strict and not artifacts:
+        raise SystemExit(f"{name}: strict corpus mode requires at least one declared artifact")
     for artifact in artifacts:
         if not isinstance(artifact, dict):
             raise SystemExit(f"{name}: each artifact must be a table")
@@ -196,25 +215,54 @@ for family in families:
         path = (root / rel).resolve()
         if root not in path.parents and path != root:
             raise SystemExit(f"{name}: artifact path escapes corpus root: {rel}")
+        try:
+            rel_path = path.relative_to(root)
+        except ValueError:
+            raise SystemExit(f"{name}: artifact path escapes corpus root: {rel}")
+        if not rel_path.parts or rel_path.parts[0] != name:
+            raise SystemExit(f"{name}: artifact path must live under {name}/: {rel}")
         if not path.is_file():
             raise SystemExit(f"{name}: artifact path is missing: {rel}")
         if not isinstance(source, str) or not source:
             raise SystemExit(f"{name}: artifact {rel} needs source")
         if not isinstance(permission, str) or not permission:
             raise SystemExit(f"{name}: artifact {rel} needs permission")
-        artifact_rows.append((name, rel, source, permission))
+        declared.add(rel_path.as_posix())
+        expected_sha256 = artifact.get("sha256")
+        actual_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+        if expected_sha256 is not None:
+            if not isinstance(expected_sha256, str) or not expected_sha256:
+                raise SystemExit(f"{name}: artifact {rel} sha256 must be a non-empty string")
+            if expected_sha256.lower() != actual_sha256:
+                raise SystemExit(
+                    f"{name}: artifact {rel} sha256 mismatch: expected "
+                    f"{expected_sha256.lower()} got {actual_sha256}"
+                )
+        artifact_rows.append((name, rel_path.as_posix(), source, permission, actual_sha256))
 
 missing = sorted(required - seen)
 if missing:
     raise SystemExit("manifest missing source families: " + ", ".join(missing))
 
-print("| Source family | Artifact | Source | Permission |")
-print("|---|---|---|---|")
+if strict:
+    discovered = set()
+    for path in root.rglob("*"):
+        if not path.is_file() or path.name == "manifest.toml":
+            continue
+        rel = path.relative_to(root).as_posix()
+        if any(fnmatch.fnmatch(path.name, pattern) or fnmatch.fnmatch(rel, pattern) for pattern in evidence_patterns):
+            discovered.add(rel)
+    undeclared = sorted(discovered - declared)
+    if undeclared:
+        raise SystemExit("strict corpus manifest missing artifact declarations: " + ", ".join(undeclared))
+
+print("| Source family | Artifact | Source | Permission | SHA-256 |")
+print("|---|---|---|---|---|")
 if artifact_rows:
     for row in artifact_rows:
         print("| " + " | ".join(cell.replace("|", "\\|") for cell in row) + " |")
 else:
-    print("| none declared | - | - | - |")
+    print("| none declared | - | - | - | - |")
 PY
   then
     manifest_status="PASS"
@@ -224,6 +272,12 @@ PY
     manifest_detail="$(tr '\n' ' ' <"$manifest_report")"
     status="FAIL"
   fi
+fi
+
+if [[ "$REQUIRE_CORPUS" == "1" && ! -f "$MANIFEST" ]]; then
+  manifest_status="FAIL"
+  manifest_detail="manifest.toml is required when TNG_REQUIRE_MIGRATION_CORPUS=1"
+  status="FAIL"
 fi
 
 {
@@ -238,7 +292,7 @@ fi
     cat "$manifest_report"
   else
     echo 'Copy `manifest.example.toml` to `manifest.toml` and list every required source family.'
-    echo 'Declared artifacts must stay under the corpus root and include `path`, `source`, and `permission`.'
+    echo 'Declared artifacts must stay under the matching source-family directory and include `path`, `source`, and `permission`.'
   fi
 } >> "$OUT"
 rm -f "$manifest_report"
@@ -274,6 +328,7 @@ rm -f "$inventory"
   echo
   echo "Place real exported client resume/config/torrent artifacts under each source family."
   echo "When artifacts are present, copy manifest.example.toml to manifest.toml and record source/version/permission metadata."
+  echo "Strict release mode requires a manifest, family-confined declared artifacts, and declarations for every discovered evidence file."
   echo "Set TNG_REQUIRE_MIGRATION_CORPUS=1 to make missing source-family corpora fail this gate."
   echo
   echo "- Missing source families: $missing"

@@ -34,12 +34,21 @@ Fast-resume import is confidence-rated:
 The current trusted/hints decoders cover libtorrent-style resume data used by
 qBittorrent and Deluge, Transmission progress bitfields, and aggregate
 `resume.dat` dictionaries keyed by raw, hex, or base32 info-hash as used by
-uTorrent/BitTorrent classic. rTorrent complete-state sidecars can synthesize
+uTorrent/BitTorrent classic. The per-torrent uTorrent entry's `have`/`bitfield`
+byte string is decoded to per-piece state, so completed pieces import as
+`Valid` and skip the full recheck under the default `TrustHints` policy, the
+same as qBittorrent/Deluge. rTorrent complete-state sidecars can synthesize
 seed piece state when matching files are present, and BiglyBT/Vuze
 `downloads.config` style aggregate state is matched by info-hash and imports
-nested resume bitfields when present. Tixati is scannable now, with unsupported
-or proprietary resume details kept metadata-only until a strict decoder is
-added.
+nested resume bitfields when present.
+
+Tixati is scannable for `.torrent` metadata, but its progress/resume state is
+an undocumented proprietary binary format (not bencode/JSON). It is kept
+verification-first by design: an opaque or corrupt Tixati sidecar must never
+be guessed into trusted piece state (that would risk seeding corrupt data), so
+it falls back to a normal recheck. Lifting this requires a real Tixati state
+corpus and a strict, validated decoder, not a heuristic — tracked as a known
+gap, not a silent one.
 
 Decoded piece vectors are normalized to the torrent piece count with warnings
 when imported state has to be truncated or padded. Partial-piece block lists are

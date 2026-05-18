@@ -3169,6 +3169,73 @@ mod tests {
     }
 
     #[test]
+    fn utorrent_bitfield_resume_imports_piece_state_under_trust_hints() {
+        // uTorrent resume.dat per-torrent entries carry completed pieces as a
+        // `bitfield`/`have` byte string. This must decode to Valid pieces and
+        // survive the *default* TrustHints policy (not just TrustAll), so a
+        // uTorrent import skips the full recheck like qBittorrent/Deluge.
+        let dir = tempfile::tempdir().unwrap();
+        let torrent_path = dir.path().join("sample.torrent");
+        let info_hash = write_fixture_torrent(&torrent_path);
+        let entry = BValue::Dict(vec![
+            (b"bitfield".as_slice(), BValue::Bytes(&[0b1000_0000])),
+            (b"downloaded".as_slice(), BValue::Int(12)),
+            (b"path".as_slice(), BValue::Bytes(b"/legacy/downloads")),
+            (b"uploaded".as_slice(), BValue::Int(34)),
+        ]);
+        std::fs::write(
+            dir.path().join("resume.dat"),
+            encode(&BValue::Dict(vec![(info_hash.as_slice(), entry)])),
+        )
+        .unwrap();
+
+        let plan = dry_run_utorrent_config(dir.path()).unwrap();
+        let torrent = &plan.torrents[0];
+
+        assert_eq!(torrent.resume_confidence, ResumeConfidence::Hints);
+        let trusted = torrent
+            .to_fastresume_state(ImportPolicy::TrustHints)
+            .expect("fastresume state");
+        assert_eq!(trusted.pieces, vec![PieceState::Valid]);
+        assert_eq!(trusted.import_policy, ImportPolicy::TrustHints);
+        // verify policy must still force a rehash.
+        let verify = torrent
+            .to_fastresume_state(ImportPolicy::RequireVerification)
+            .expect("fastresume state");
+        assert_eq!(verify.pieces, vec![PieceState::Unknown]);
+    }
+
+    #[test]
+    fn tixati_proprietary_state_stays_verification_first() {
+        // Tixati keeps progress in an undocumented proprietary binary format
+        // (not bencode/JSON). It must never be guessed into trusted piece
+        // state: a corrupt/opaque sidecar has to fall back to verification,
+        // never produce false Valid pieces.
+        let dir = tempfile::tempdir().unwrap();
+        let torrent_path = dir.path().join("sample.torrent");
+        write_fixture_torrent(&torrent_path);
+        // Proprietary, non-bencode/non-JSON bytes paired by file stem.
+        std::fs::write(
+            dir.path().join("sample.dat"),
+            [0x00u8, 0xFF, 0x7F, b'T', b'I', b'X', 0x01, 0x02],
+        )
+        .unwrap();
+
+        let plan = dry_run_tixati_config(dir.path()).unwrap();
+        let torrent = &plan.torrents[0];
+
+        assert_ne!(torrent.resume_confidence, ResumeConfidence::Trusted);
+        assert_ne!(torrent.resume_confidence, ResumeConfidence::Hints);
+        assert!(torrent
+            .to_fastresume_state(ImportPolicy::TrustAll)
+            .is_none());
+        assert!(torrent
+            .warnings
+            .iter()
+            .any(|w| w.contains("resume parse failed")));
+    }
+
+    #[test]
     fn biglybt_downloads_config_matches_hex_entries() {
         let dir = tempfile::tempdir().unwrap();
         let torrent_path = dir.path().join("sample.torrent");

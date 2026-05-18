@@ -11,6 +11,7 @@ expected = [".fastresume", ".torrent", "qBittorrent.conf"]
 # path = "qbittorrent/example.fastresume"
 # source = "qBittorrent 5.x exported profile with private data redacted"
 # permission = "operator-owned fixture approved for TorrentNG test corpus"
+# sha256 = "optional-but-recommended artifact digest"
 
 [[family]]
 name = "transmission"

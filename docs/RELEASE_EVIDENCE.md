@@ -50,7 +50,11 @@ Then enforce it:
 TNG_REQUIRE_MIGRATION_CORPUS=1 scripts/migration_corpus_certification.sh
 ```
 
-The report includes SHA-256 hashes for every discovered artifact.
+The report includes SHA-256 hashes for every discovered artifact. In strict
+mode, `manifest.toml` is mandatory, each source family must declare at least
+one artifact, every declared artifact must stay under its matching family
+directory, and every discovered evidence file must be declared with source and
+permission metadata. Declared `sha256` values are verified when present.
 
 ## Live Compatibility
 

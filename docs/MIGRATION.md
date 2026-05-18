@@ -277,12 +277,16 @@ Current fast-resume confidence:
   verification.
 - Deluge: libtorrent-style resume data is imported like qBittorrent.
 - uTorrent/BitTorrent classic: aggregate `resume.dat` entries keyed by raw,
-  hex, or base32 info-hash are imported when matching `.torrent` files are
-  present.
+  hex, or base32 info-hash are imported. The per-torrent `have`/`bitfield`
+  piece map is decoded, so completed pieces resume **without a full recheck**
+  under the default `trust-hints` policy — the same as qBittorrent/Deluge.
 - BiglyBT/Vuze: aggregate `downloads.config` entries keyed by info-hash are
   imported, including nested resume bitfields when present.
-- Tixati: metadata scanning is available; proprietary progress state remains
-  verification-first until a strict decoder is added.
+- Tixati: `.torrent` metadata, save paths, labels, and counters import, but
+  progress state is an undocumented proprietary binary format and is
+  **verification-first by design** — Tixati torrents are rechecked rather than
+  risk trusting guessed piece state. This is a deliberate safety choice;
+  lifting it needs a real Tixati state corpus and a strict decoder.
 
 Use dry-run output before applying any import. The source directories are read
 only. Dry-run reports include trusted, hints, metadata-only, and none counts so

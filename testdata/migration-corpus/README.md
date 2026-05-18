@@ -36,6 +36,10 @@ Use `manifest.example.toml` as the checklist for the exported client/version
 families that should be attached to a release evidence bundle. When real
 artifacts are present, copy it to `manifest.toml`; the certification script
 validates that all required families are listed and that declared artifact paths
-exist under this corpus root. Each declared artifact should include source and
-permission metadata so fixture provenance is reviewable. The certification
-report includes a SHA-256 inventory for every discovered artifact.
+exist under the matching source-family directory. Each declared artifact must
+include source and permission metadata so fixture provenance is reviewable, and
+may include an expected `sha256` digest. In strict release mode
+(`TNG_REQUIRE_MIGRATION_CORPUS=1`), `manifest.toml` is mandatory, every source
+family must declare at least one artifact, and every discovered evidence file
+must be declared in the manifest. The certification report includes a SHA-256
+inventory for every discovered artifact.
