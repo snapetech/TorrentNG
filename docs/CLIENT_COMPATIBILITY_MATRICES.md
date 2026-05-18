@@ -148,7 +148,7 @@ qBittorrent field backlog:
 | `app/preferences` | Broad current/legacy WebUI preference key set across paths, queueing, BitTorrent, WebUI, RSS, proxy, and advanced settings | Implemented compatibility defaults plus in-memory `setPreferences` persistence for arbitrary qBit preference keys |
 | `torrents/info` | Core list fields plus modern path, session counter, lifecycle, limit, mode, magnet, infohash, and native-backed live swarm counters/rates | Implemented compatibility breadth for common remote-app columns |
 | `torrents/properties` | Full properties object | Implemented key set with registry/engine-backed counters, lifecycle times, piece counts, and per-torrent limits where available |
-| `sync/maindata` / `sync/torrentPeers` | Server state, categories, tags, torrents, trackers, peers | Broad torrent/server-state key sets and peer shape/RID stability are matrix-tested; remaining risk is deeper live tracker delta fidelity |
+| `sync/maindata` / `sync/torrentPeers` | Server state, categories, tags, torrents, trackers, peers | Broad torrent/server-state key sets and peer shape/RID stability are matrix-tested; RID and torrent-row tracker/count projection include live tracker snapshot changes when native engine state is attached |
 
 ## 4. Transmission RPC Matrix
 

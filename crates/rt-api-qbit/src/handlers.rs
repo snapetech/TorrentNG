@@ -3474,6 +3474,14 @@ fn redact_log_url(value: &str) -> String {
 }
 
 async fn qbit_tracker_projection(state: &AppState, info_hash: &str) -> (String, u32) {
+    if let Some(engine) = &state.engine {
+        if let Ok(trackers) = engine.torrent_trackers(info_hash.to_owned()).await {
+            let projection = qbit_tracker_projection_from_snapshots(&trackers);
+            if projection.1 > 0 {
+                return projection;
+            }
+        }
+    }
     if let Some(cached) = state
         .tracker_projection_cache
         .read()
@@ -3501,6 +3509,17 @@ async fn qbit_tracker_projection(state: &AppState, info_hash: &str) -> (String, 
             .insert(info_hash.to_owned(), projection.clone());
     }
     projection
+}
+
+fn qbit_tracker_projection_from_snapshots(trackers: &[EngineTrackerSnapshot]) -> (String, u32) {
+    let Some(first) = trackers.iter().min_by(|a, b| {
+        a.tier
+            .cmp(&b.tier)
+            .then_with(|| a.announce.cmp(&b.announce))
+    }) else {
+        return (String::new(), 0);
+    };
+    (first.announce.clone(), trackers.len() as u32)
 }
 
 #[cfg(test)]
@@ -4815,6 +4834,45 @@ mod tests {
         assert_ne!(
             sync_rid_for_infos_and_trackers(std::slice::from_ref(&info), &first),
             sync_rid_for_infos_and_trackers(&[info], &changed)
+        );
+    }
+
+    #[test]
+    fn qbit_tracker_projection_prefers_live_snapshot_order() {
+        let trackers = vec![
+            EngineTrackerSnapshot {
+                id: 2,
+                tier: 2,
+                announce: "https://tracker-b.example/announce".to_owned(),
+                status: "working".to_owned(),
+                last_announce_at: None,
+                next_announce_at: None,
+                last_success_at: None,
+                failure_reason: None,
+                warning_message: None,
+                seeders: None,
+                leechers: None,
+                completed: None,
+            },
+            EngineTrackerSnapshot {
+                id: 1,
+                tier: 1,
+                announce: "https://tracker-a.example/announce".to_owned(),
+                status: "working".to_owned(),
+                last_announce_at: None,
+                next_announce_at: None,
+                last_success_at: None,
+                failure_reason: None,
+                warning_message: None,
+                seeders: None,
+                leechers: None,
+                completed: None,
+            },
+        ];
+
+        assert_eq!(
+            qbit_tracker_projection_from_snapshots(&trackers),
+            ("https://tracker-a.example/announce".to_owned(), 2)
         );
     }
 

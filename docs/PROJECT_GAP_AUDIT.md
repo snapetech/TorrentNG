@@ -188,8 +188,10 @@ Remaining compatibility gaps:
 - qBittorrent: common automation flows are covered, and `torrents/info`,
   `sync/maindata`, and `transfer/info` now project native peer snapshots into
   live seed/leecher counters and aggregate rates. `torrents/trackers` projects
-  persisted engine tracker status/messages/counts where available; deeper
-  tracker delta fidelity remains placeholder-depth.
+  persisted engine tracker status/messages/counts where available, and
+  `sync/maindata` now refreshes torrent-row tracker/count projection from live
+  tracker snapshots when the engine is attached. Remaining depth is live-client
+  presentation parity for client-specific edge cases.
 - DHT-only magnets: DHT `get_peers` forwarding and trackerless BEP 9 metadata
   completion from discovered peers are unit-covered in `rt-engine`; the
   remaining row is Docker-level trackerless transfer certification.
