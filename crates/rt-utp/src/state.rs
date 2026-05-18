@@ -1,4 +1,5 @@
 use crate::{
+    congestion::{DelaySample, UtpCongestionController},
     error::UtpError,
     packet::{PacketType, UtpExtension, UtpHeader, UtpPacket},
     selective_ack::SelectiveAck,
@@ -97,6 +98,7 @@ pub struct UtpConnection {
     rtt_us: Option<u32>,
     rtt_var_us: Option<u32>,
     retransmit_timeout_us: u64,
+    congestion: UtpCongestionController,
 }
 
 impl UtpConnection {
@@ -114,6 +116,7 @@ impl UtpConnection {
             rtt_us: None,
             rtt_var_us: None,
             retransmit_timeout_us: DEFAULT_RETRANSMIT_TIMEOUT_US,
+            congestion: UtpCongestionController::default(),
         }
     }
 
@@ -137,6 +140,7 @@ impl UtpConnection {
             rtt_us: None,
             rtt_var_us: None,
             retransmit_timeout_us: DEFAULT_RETRANSMIT_TIMEOUT_US,
+            congestion: UtpCongestionController::default(),
         })
     }
 
@@ -166,7 +170,16 @@ impl UtpConnection {
 
     pub fn available_send_window(&self) -> u32 {
         self.remote_window_bytes
+            .min(self.congestion.cwnd_bytes())
             .saturating_sub(self.bytes_in_flight)
+    }
+
+    pub fn congestion_window_bytes(&self) -> u32 {
+        self.congestion.cwnd_bytes()
+    }
+
+    pub fn congestion_base_delay_us(&self) -> Option<u32> {
+        self.congestion.base_delay_us()
     }
 
     pub fn is_established(&self) -> bool {
@@ -239,6 +252,10 @@ impl UtpConnection {
         self.remote_window_bytes = packet.header.wnd_size;
         if packet.header.timestamp_diff > 0 {
             self.update_rtt(packet.header.timestamp_diff);
+            self.congestion.on_ack(DelaySample {
+                timestamp_diff_us: packet.header.timestamp_diff,
+                bytes_acked: packet.payload.len() as u32,
+            });
         }
         self.apply_ack(packet.header.ack_nr)?;
 
@@ -282,6 +299,10 @@ impl UtpConnection {
         self.state = ConnectionState::Closed;
     }
 
+    pub fn on_timeout(&mut self) {
+        self.congestion.on_timeout();
+    }
+
     fn header(
         &self,
         packet_type: PacketType,
@@ -309,6 +330,9 @@ impl UtpConnection {
     }
 
     fn apply_ack(&mut self, ack_nr: u16) -> Result<(), UtpError> {
+        if ack_nr == 0 {
+            return Ok(());
+        }
         if sequence_before(self.newest_sent, ack_nr) {
             return Err(UtpError::AckOutOfWindow {
                 ack_nr,
@@ -504,6 +528,13 @@ mod tests {
                 newest_sent: 10
             })
         ));
+    }
+
+    #[test]
+    fn zero_ack_is_treated_as_no_ack_before_peer_has_seen_sequence() {
+        let mut conn = UtpConnection::connect(1, 10);
+        let state = inbound_state(conn.ids(), 2, 0);
+        assert_eq!(conn.on_inbound(&state).unwrap(), InboundAction::None);
     }
 
     #[test]

@@ -177,7 +177,10 @@ impl UtpStream {
                     .await
                     {
                         Ok(ack) => ack,
-                        Err(UtpError::Timeout) => break,
+                        Err(UtpError::Timeout) => {
+                            self.conn.on_timeout();
+                            break;
+                        }
                         Err(err) => return Err(err),
                     };
                     self.last_remote_timestamp_us = ack.header.timestamp_us;
@@ -247,7 +250,10 @@ impl UtpStream {
                     packet = Some(received);
                     break;
                 }
-                Err(UtpError::Timeout) => continue,
+                Err(UtpError::Timeout) => {
+                    self.conn.on_timeout();
+                    continue;
+                }
                 Err(err) => return Err(err),
             }
         }

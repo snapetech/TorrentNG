@@ -8,8 +8,9 @@ This crate currently provides BEP 29 fixed-header parsing/encoding, full packet
 payload framing, extension-chain parsing/encoding with truncation and
 oversized-extension validation, selective ACK helpers, connection ID derivation,
 state transitions, send-window accounting, RTT sampling, retransmit timeout
-tracking, and an async UDP `UtpListener`/`UtpStream` transport with SYN/STATE
-handshake, DATA/ACK exchange, FIN close, and bounded retransmission attempts.
+tracking, delay-based congestion-window adjustment, and an async UDP
+`UtpListener`/`UtpStream` transport with SYN/STATE handshake, DATA/ACK exchange,
+FIN close, and bounded retransmission attempts.
 
 Full native-engine uTP integration remains a hardening item: the remaining work
 is wiring `UtpStream` into peer-wire handshakes, peer selection, incoming peer

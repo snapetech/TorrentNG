@@ -1,9 +1,14 @@
+pub mod congestion;
 pub mod error;
 pub mod packet;
 pub mod selective_ack;
 pub mod state;
 pub mod transport;
 
+pub use congestion::{
+    DelaySample, UtpCongestionController, MAX_CONGESTION_WINDOW_BYTES, MIN_CONGESTION_WINDOW_BYTES,
+    TARGET_DELAY_US,
+};
 pub use error::UtpError;
 pub use packet::{PacketType, UtpExtension, UtpHeader, UtpPacket, HEADER_SIZE};
 pub use selective_ack::SelectiveAck;
