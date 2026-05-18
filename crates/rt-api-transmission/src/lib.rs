@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -1448,8 +1449,12 @@ async fn torrent_get(state: &AppState, args: &Value) -> Result<Value, String> {
                             1.0
                         })
                     }
-                    "secondsDownloading" | "seconds-downloading" => json!(0),
-                    "secondsSeeding" | "seconds-seeding" => json!(0),
+                    "secondsDownloading" | "seconds-downloading" => {
+                        json!(transmission_seconds_downloading(entry, unix_now_secs()))
+                    }
+                    "secondsSeeding" | "seconds-seeding" => {
+                        json!(transmission_seconds_seeding(entry, unix_now_secs()))
+                    }
                     "sequentialDownload" | "sequential-download" => {
                         json!(limits
                             .map(|limits| limits.sequential_download)
@@ -1619,6 +1624,28 @@ fn transmission_eta(amount_left: u64, download_rate: i64) -> i64 {
         return -1;
     }
     ((amount_left as f64) / (download_rate as f64)).ceil() as i64
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn transmission_seconds_downloading(entry: &rt_session::TorrentEntry, now: u64) -> u64 {
+    if entry.added_at == 0 {
+        return 0;
+    }
+    let end = entry.completed_at.unwrap_or(now);
+    end.saturating_sub(entry.added_at)
+}
+
+fn transmission_seconds_seeding(entry: &rt_session::TorrentEntry, now: u64) -> u64 {
+    entry
+        .completed_at
+        .map(|completed| now.saturating_sub(completed))
+        .unwrap_or(0)
 }
 
 fn transmission_files(
@@ -2707,6 +2734,21 @@ mod tests {
         assert_eq!(transmission_have_valid(&entry, Some(&meta)), 100);
         assert_eq!(transmission_have_unchecked(&entry, Some(&meta)), 100);
         assert_eq!(transmission_desired_available(&entry, Some(&meta)), 200);
+    }
+
+    #[test]
+    fn transmission_lifecycle_seconds_project_registry_timestamps() {
+        let mut active = TorrentEntry::new("a".repeat(40), "active".into(), "/data".into());
+        active.added_at = 1_000;
+        active.completed_at = None;
+        assert_eq!(transmission_seconds_downloading(&active, 1_090), 90);
+        assert_eq!(transmission_seconds_seeding(&active, 1_090), 0);
+
+        let mut seeding = TorrentEntry::new("b".repeat(40), "seed".into(), "/data".into());
+        seeding.added_at = 1_000;
+        seeding.completed_at = Some(1_075);
+        assert_eq!(transmission_seconds_downloading(&seeding, 1_150), 75);
+        assert_eq!(transmission_seconds_seeding(&seeding, 1_150), 75);
     }
 
     #[test]
