@@ -67,7 +67,7 @@ export function EnginePanel() {
 
 function BackendSummary({ data }: { data: EngineDiagnostics }) {
   const caps = data.backend.capabilities
-  const rows = [
+  const rows: Array<[string, string]> = [
     ['Type', data.backend.type],
     ['Tags', yesNo(caps.supports_tags)],
     ['Categories', yesNo(caps.supports_categories)],

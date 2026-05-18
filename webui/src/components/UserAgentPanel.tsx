@@ -11,7 +11,17 @@ const PRESETS = [
 
 export function UserAgentPanel() {
   const qc = useQueryClient()
-  const { data, isLoading } = useQuery({ queryKey: ['user-agent'], queryFn: api.settings.getUserAgent })
+  const { data: engine } = useQuery({
+    queryKey: ['engine'],
+    queryFn: api.engine,
+    staleTime: 5_000,
+  })
+  const supported = engine?.backend.capabilities.supports_runtime_user_agent !== false
+  const { data, isLoading } = useQuery({
+    queryKey: ['user-agent'],
+    queryFn: api.settings.getUserAgent,
+    enabled: supported,
+  })
   const [draft, setDraft] = useState('')
   const [saved, setSaved] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
@@ -31,6 +41,15 @@ export function UserAgentPanel() {
 
   const isDirty = data && draft !== data.user_agent
   const isCustom = !PRESETS.some(p => p.value === draft)
+
+  if (!supported) {
+    return (
+      <div style={{ padding: '18px 20px', maxWidth: 680 }}>
+        <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--text)' }}>Client Identifier</div>
+        <div style={noticeStyle}>The selected backend does not support runtime tracker user-agent changes.</div>
+      </div>
+    )
+  }
 
   return (
     <div style={{ padding: '18px 20px', maxWidth: 680 }}>
