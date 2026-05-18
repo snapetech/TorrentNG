@@ -1383,6 +1383,10 @@ run_qbit_mutation_facade_case() {
     jq -e 'type == "array"' >/dev/null || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/qb/v2/torrents/pieceHashes?hash=$info_hash" |
     jq -e 'type == "array"' >/dev/null || status="FAIL"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
+    -o "$WORKDIR/artifacts/rust-qbit-mutation-facade-export.torrent" \
+    "$(client_url torrentngd)/api/qb/v2/torrents/export?hash=$info_hash" || status="FAIL"
+  [[ -s "$WORKDIR/artifacts/rust-qbit-mutation-facade-export.torrent" ]] || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -X POST -H "Authorization: Bearer $RUST_TOKEN" \
     "$(client_url torrentngd)/api/v1/torrents/$info_hash/stop" >/dev/null || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -X POST -H "Authorization: Bearer $RUST_TOKEN" \
@@ -1424,7 +1428,7 @@ run_qbit_mutation_facade_case() {
   [[ "$(curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/qb/v2/transfer/uploadLimit" || true)" == "1048576" ]] || status="FAIL"
   [[ "$(curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/qb/v2/transfer/speedLimitsMode" || true)" == "1" ]] || status="FAIL"
   append_report "- Target: torrentngd qBittorrent-compatible mutation endpoints"
-  append_report "- Checked qBit facade: filePrio, torrent setDownloadLimit/setUploadLimit, transfer setDownloadLimit/setUploadLimit/toggleSpeedLimitsMode, setForceStart, setSuperSeeding, setAutoTMM, setAutoManagement, toggleFirstLastPiecePrio, addPeers, topPrio, recheck, addTrackers, editTracker, removeTrackers, trackers, files, webseeds, pieceStates, pieceHashes"
+  append_report "- Checked qBit facade: filePrio, torrent setDownloadLimit/setUploadLimit, transfer setDownloadLimit/setUploadLimit/toggleSpeedLimitsMode, setForceStart, setSuperSeeding, setAutoTMM, setAutoManagement, toggleFirstLastPiecePrio, addPeers, topPrio, recheck, addTrackers, editTracker, removeTrackers, trackers, files, webseeds, pieceStates, pieceHashes, export"
   append_report "- Checked native REST: start, stop, update metadata, file priorities, tags, trackers, peers, queue, torrent limits, transfer limits, files/trackers/limits projection"
   append_report "- Fixture: multi-128m"
   append_report "- Info hash: $info_hash"
