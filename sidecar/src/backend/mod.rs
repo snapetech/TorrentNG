@@ -174,6 +174,41 @@ pub trait TorrentBackend: Send + Sync {
             self.backend_type().as_str()
         )
     }
+
+    async fn toggle_first_last_piece_priority(&self, _hash: &str) -> Result<()> {
+        bail!(
+            "{} backend does not support first/last piece priority toggles",
+            self.backend_type().as_str()
+        )
+    }
+
+    async fn set_force_start(&self, _hash: &str, _enabled: bool) -> Result<()> {
+        bail!(
+            "{} backend does not support force-start updates",
+            self.backend_type().as_str()
+        )
+    }
+
+    async fn set_super_seeding(&self, _hash: &str, _enabled: bool) -> Result<()> {
+        bail!(
+            "{} backend does not support super-seeding updates",
+            self.backend_type().as_str()
+        )
+    }
+
+    async fn set_auto_tmm(&self, _hash: &str, _enabled: bool) -> Result<()> {
+        bail!(
+            "{} backend does not support automatic torrent management updates",
+            self.backend_type().as_str()
+        )
+    }
+
+    async fn set_auto_management(&self, _hash: &str, _enabled: bool) -> Result<()> {
+        bail!(
+            "{} backend does not support automatic management updates",
+            self.backend_type().as_str()
+        )
+    }
     async fn add_tags(&self, _hash: &str, _tags: &[&str]) -> Result<()> {
         Ok(())
     }
