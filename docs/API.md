@@ -353,20 +353,20 @@ Implements the qBittorrent Web API v2. By default it advertises qBittorrent `5.0
 | `POST` | `/api/qb/v2/torrents/setAutoManagement` | Backend-backed where supported |
 | `POST` | `/api/qb/v2/torrents/setForceStart` | Backend-backed where supported |
 | `POST` | `/api/qb/v2/torrents/setSuperSeeding` | Backend-backed where supported |
-| `POST` | `/api/qb/v2/torrents/toggleFirstLastPiecePrio` | Accepted |
+| `POST` | `/api/qb/v2/torrents/toggleFirstLastPiecePrio` | Backend-backed where supported |
 
 ### Sync / Transfer
 
 | Method | Path |
 |--------|------|
 | `GET` | `/api/qb/v2/sync/maindata` | Full (`rid=0`) and incremental (`rid>0`) torrent updates; includes current `categories` map and `tags` list |
-| `GET` | `/api/qb/v2/transfer/info` |
-| `GET` | `/api/qb/v2/transfer/speedLimitsMode` |
-| `POST` | `/api/qb/v2/transfer/toggleSpeedLimitsMode` |
-| `GET` | `/api/qb/v2/transfer/downloadLimit` |
-| `POST` | `/api/qb/v2/transfer/setDownloadLimit` |
-| `GET` | `/api/qb/v2/transfer/uploadLimit` |
-| `POST` | `/api/qb/v2/transfer/setUploadLimit` |
+| `GET` | `/api/qb/v2/transfer/info` | Returns aggregate rates plus current global speed-limit state |
+| `GET` | `/api/qb/v2/transfer/speedLimitsMode` | Returns `1` when alternate/global speed-limit mode is enabled, otherwise `0` |
+| `POST` | `/api/qb/v2/transfer/toggleSpeedLimitsMode` | Toggles backend global speed-limit mode where supported |
+| `GET` | `/api/qb/v2/transfer/downloadLimit` | Returns current global download limit |
+| `POST` | `/api/qb/v2/transfer/setDownloadLimit` | Form: `limit`; backend-backed where supported |
+| `GET` | `/api/qb/v2/transfer/uploadLimit` | Returns current global upload limit |
+| `POST` | `/api/qb/v2/transfer/setUploadLimit` | Form: `limit`; backend-backed where supported |
 | `POST` | `/api/qb/v2/transfer/banPeers` | Backend-backed where supported; qB-compatible OK otherwise |
 
 ### Log / Search / RSS
@@ -383,7 +383,7 @@ These compatibility endpoints are present so qBittorrent clients can probe them 
 | `POST` | `/api/qb/v2/search/installPlugin` | Records plugin source/name metadata |
 | `POST` | `/api/qb/v2/search/uninstallPlugin` | Removes plugin records |
 | `POST` | `/api/qb/v2/search/enablePlugin` | Updates plugin enabled state |
-| `POST` | `/api/qb/v2/search/updatePlugins` | Accepted |
+| `POST` | `/api/qb/v2/search/updatePlugins` | Safe compatibility refresh probe; local plugin records are unchanged |
 | `POST` | `/api/qb/v2/search/start` | Returns a stable per-process search job id |
 | `POST` | `/api/qb/v2/search/stop` | Stops the requested compatibility search job |
 | `GET` | `/api/qb/v2/search/results` | Returns the requested job plus empty local result set |

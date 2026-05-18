@@ -1413,7 +1413,7 @@ impl MountScheduler {
         }
     }
 
-    async fn submit<T, F>(&self, queued_bytes: u64, f: F) -> Result<T, StorageError>
+    async fn run_queued_blocking<T, F>(&self, queued_bytes: u64, f: F) -> Result<T, StorageError>
     where
         T: Send + 'static,
         F: FnOnce() -> Result<T, StorageError> + Send + 'static,
@@ -1742,7 +1742,7 @@ impl MountScheduler {
         let dirty_paths = self.dirty_paths.clone();
         let counters = self.counters.clone();
         let path = path.to_path_buf();
-        self.submit(0, move || {
+        self.run_queued_blocking(0, move || {
             let key = normalized_key(&path);
             let path_str = key.display().to_string();
             if let Some(parent) = key.parent() {
@@ -1909,7 +1909,7 @@ impl MountScheduler {
         let pool = self.file_pool.clone();
         let counters = self.counters.clone();
         let path = path.to_path_buf();
-        self.submit(0, move || {
+        self.run_queued_blocking(0, move || {
             let key = normalized_key(&path);
             let path_str = key.display().to_string();
             let file = pool.get_or_open(&key, OpenMode::Read, false)?;
@@ -2469,7 +2469,7 @@ mod tests {
             let sched = sched.clone();
             async move {
                 sched
-                    .submit(4096, move || {
+                    .run_queued_blocking(4096, move || {
                         started_tx.send(()).unwrap();
                         release_rx.recv().unwrap();
                         Ok::<_, StorageError>(())
