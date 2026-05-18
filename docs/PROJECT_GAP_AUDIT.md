@@ -20,8 +20,10 @@ compatibility depth:
 - the migration corpus gate now has checked-in generated fixtures for every
   legacy client family and passes strict local validation; adding real exported
   corpora remains optional release-depth evidence for undocumented variants;
-- facade compatibility still has placeholder-depth areas for live
-  peer/tracker/webseed details and some client-specific plugin APIs;
+- facade compatibility now has native-backed qBit, Transmission, Deluge, and
+  rTorrent field projection for the local matrix; remaining compatibility depth
+  is live-client behavior and plugin effects that require external clients or a
+  deliberate TorrentNG-native workflow owner;
 - uTP is implemented at the application transport layer for outbound
   peer-wire, incoming peer-wire when explicitly enabled, and magnet metadata
   fetch; remaining uTP work is public/live interop evidence and operational
@@ -160,8 +162,9 @@ Remaining WebUI gaps are now product/certification depth:
 - the browser-driven 15k-row benchmark now verifies bounded DOM rendering,
   load-more responsiveness, and a configurable first-visible threshold through
   `TNG_WEBUI_FIRST_VISIBLE_MS` in `scripts/webui_certification.sh`;
-- some panels necessarily reflect compatibility placeholder depth from backend
-  facades, especially live peer/tracker/webseed activity.
+- some plugin panels intentionally show compatibility-state surfaces until
+  TorrentNG owns native plugin workflows such as blocklist, execute, extractor,
+  scheduler, or auto-add behavior.
 
 ## API And Compatibility
 
@@ -175,7 +178,7 @@ Local deterministic API compatibility is passing:
   PASS. The live mobile qBittorrent read matrix is now an explicit optional
   universal gate through `UNIVERSAL_COMPAT_MOBILE=1`.
 
-Remaining compatibility gaps:
+Remaining compatibility depth:
 
 - Transmission: JSON-RPC 2.0 method errors, stateful notification subscription
   probes, broad mutable session settings, group limit state roundtrips, and
@@ -196,12 +199,11 @@ Remaining compatibility gaps:
   custom views round-trip through `view.add`/`view.set` with registry size
   projection. Deeper per-view filter expressions remain compatibility depth.
 - qBittorrent: common automation flows are covered, and `torrents/info`,
-  `sync/maindata`, and `transfer/info` now project native peer snapshots into
-  live seed/leecher counters and aggregate rates. `torrents/trackers` projects
-  persisted engine tracker status/messages/counts where available, and
-  `sync/maindata` now refreshes torrent-row tracker/count projection from live
-  tracker snapshots when the engine is attached. Remaining depth is live-client
-  presentation parity for client-specific edge cases.
+  `sync/maindata`, `transfer/info`, `torrents/files`, and
+  `torrents/trackers` now project native peer snapshots, per-file progress,
+  aggregate rates, and persisted tracker status/messages/counts where
+  available. Remaining depth is live-client presentation parity for
+  client-specific edge cases.
 - DHT-only magnets: DHT `get_peers` forwarding and trackerless BEP 9 metadata
   completion from discovered peers are unit-covered in `rt-engine`; the Docker
   matrix now also includes `rust-trackerless-magnet` for trackerless metadata

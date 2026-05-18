@@ -399,12 +399,25 @@ async fn recheck_range_reports_runtime_progress() {
         .iter()
         .filter(|(_, result)| matches!(result, VerifyResult::Valid))
         .count();
+    let invalid = results
+        .iter()
+        .filter(|(_, result)| matches!(result, VerifyResult::Invalid))
+        .count();
+    let missing = results
+        .iter()
+        .filter(|(_, result)| matches!(result, VerifyResult::Missing { .. }))
+        .count();
+    let first_missing = results.iter().find_map(|(_, result)| match result {
+        VerifyResult::Missing { reason, .. } => Some(reason.as_str()),
+        _ => None,
+    });
     let stats = scheduler.stats();
     let total_mib = total as f64 / (1024.0 * 1024.0);
     let mib_s = total_mib / elapsed.as_secs_f64();
 
     println!(
-        "tng_storage_recheck pieces={pieces} piece_len={piece_len} total_mib={total_mib:.2} valid={valid} elapsed_ms={} mib_s={mib_s:.2} read_ops={} backend_reads={} hash_ops={} hash_latency_ms={}",
+        "tng_storage_recheck pieces={pieces} piece_len={piece_len} total_mib={total_mib:.2} valid={valid} invalid={invalid} missing={missing} first_missing={:?} elapsed_ms={} mib_s={mib_s:.2} read_ops={} backend_reads={} hash_ops={} hash_latency_ms={}",
+        first_missing,
         elapsed.as_millis(),
         stats.read_ops_by_class[IoClass::Recheck as usize],
         stats.backend_read_ops_by_class[IoClass::Recheck as usize],

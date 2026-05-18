@@ -263,7 +263,9 @@ async fn read_sparse_range(
 ) -> Result<bytes::Bytes, StorageError> {
     let extents = scheduler.data_extents(path, offset, len).await?;
     if extents.is_empty() {
-        return Ok(bytes::Bytes::from(vec![0; len as usize]));
+        return scheduled_read_owned(scheduler, IoClass::Recheck, path, offset, len as usize)
+            .await
+            .map(|read| read.into_bytes());
     }
 
     let mut out = Vec::with_capacity(len as usize);
