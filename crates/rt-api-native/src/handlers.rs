@@ -17,7 +17,8 @@ use rt_api_model::{
     AddTorrentRequest, AddTorrentResponse, ApiError, FileInfo, TorrentDetail, TorrentSummary,
 };
 use rt_engine::{
-    EngineGlobalLimits, EngineJob, EngineNetworkFeatures, EngineTorrentLimits, QueueMove,
+    EngineGlobalLimits, EngineJob, EngineNetworkFeatures, EngineStorageRoot, EngineTorrentLimits,
+    QueueMove,
 };
 use rt_metainfo::{parse_magnet, parse_torrent};
 use rt_metrics::MemoryClass;
@@ -1294,6 +1295,70 @@ pub struct JobView {
     updated_at: i64,
     finished_at: Option<i64>,
     progress: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StorageRootsResponse {
+    roots: Vec<StorageRootView>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StorageRootView {
+    id: String,
+    path: PathBuf,
+    profile: String,
+    total_bytes: u64,
+    available_bytes: u64,
+    used_bytes: u64,
+    readonly: bool,
+    ok: bool,
+    error: Option<String>,
+}
+
+impl From<EngineStorageRoot> for StorageRootView {
+    fn from(root: EngineStorageRoot) -> Self {
+        Self {
+            id: root.id,
+            path: root.path,
+            profile: root.profile,
+            total_bytes: root.total_bytes,
+            available_bytes: root.available_bytes,
+            used_bytes: root.used_bytes,
+            readonly: false,
+            ok: root.ok,
+            error: root.error,
+        }
+    }
+}
+
+/// `GET /api/v1/storage` — list configured storage roots and live capacity.
+pub async fn storage(State(state): State<AppState>) -> impl IntoResponse {
+    let Some(engine) = &state.engine else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                serde_json::to_value(ApiError::internal(
+                    "native engine is not available".to_owned(),
+                ))
+                .unwrap(),
+            ),
+        )
+            .into_response();
+    };
+    match engine.list_storage_roots().await {
+        Ok(roots) => (
+            StatusCode::OK,
+            Json(StorageRootsResponse {
+                roots: roots.into_iter().map(StorageRootView::from).collect(),
+            }),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::to_value(ApiError::internal(e)).unwrap()),
+        )
+            .into_response(),
+    }
 }
 
 /// `POST /api/v1/storage/plan` — preview a move/import/delete storage plan.
@@ -4288,6 +4353,22 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/jobs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn storage_without_engine_returns_unavailable() {
+        let state = AppState::new();
+        let app = build_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/storage")
                     .body(Body::empty())
                     .unwrap(),
             )

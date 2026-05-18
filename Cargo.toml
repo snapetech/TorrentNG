@@ -87,6 +87,7 @@ url = "2"
 hex = "0.4"
 base64 = "0.22"
 once_cell = "1"
+libc = "0.2"
 
 # test utilities (dev only)
 proptest = "1"

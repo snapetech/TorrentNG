@@ -192,6 +192,18 @@ pub struct EngineJob {
     pub finished_at: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineStorageRoot {
+    pub id: String,
+    pub path: PathBuf,
+    pub profile: String,
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+    pub used_bytes: u64,
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
 impl From<rt_db::JobRow> for EngineJob {
     fn from(row: rt_db::JobRow) -> Self {
         Self {
@@ -806,6 +818,10 @@ pub enum EngineCmd {
     /// List active durable jobs.
     ListJobs {
         reply: oneshot::Sender<CmdResult<Vec<EngineJob>>>,
+    },
+    /// List configured storage roots with live filesystem capacity probes.
+    ListStorageRoots {
+        reply: oneshot::Sender<CmdResult<Vec<EngineStorageRoot>>>,
     },
     /// Replace persisted tracker URLs for a torrent.
     UpdateTorrentTrackers {

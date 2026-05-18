@@ -36,8 +36,9 @@ use rt_utp::{UtpEndpoint, UtpStream};
 
 use crate::command::{
     CmdResult, EngineCmd, EngineGlobalLimits, EngineJob, EngineNetworkFeatures, EnginePeerSnapshot,
-    EnginePieceState, EngineStats, EngineTorrentFile, EngineTorrentLimits, EngineTorrentMetadata,
-    EngineTrackerSnapshot, EngineWebseedSnapshot, QueueMove, TorrentDiagnostic,
+    EnginePieceState, EngineStats, EngineStorageRoot, EngineTorrentFile, EngineTorrentLimits,
+    EngineTorrentMetadata, EngineTrackerSnapshot, EngineWebseedSnapshot, QueueMove,
+    TorrentDiagnostic,
 };
 use crate::dht_task::{run_dht, DhtCommand, DhtTorrent};
 use crate::metadata_task::run_metadata_task;
@@ -370,6 +371,15 @@ impl EngineHandle {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx
             .send(EngineCmd::ListJobs { reply })
+            .await
+            .map_err(|_| "engine shut down".to_owned())?;
+        rx.await.map_err(|_| "engine dropped reply".to_owned())?
+    }
+
+    pub async fn list_storage_roots(&self) -> CmdResult<Vec<EngineStorageRoot>> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(EngineCmd::ListStorageRoots { reply })
             .await
             .map_err(|_| "engine shut down".to_owned())?;
         rx.await.map_err(|_| "engine dropped reply".to_owned())?
@@ -1168,6 +1178,10 @@ impl Engine {
             }
             EngineCmd::ListJobs { reply } => {
                 let result = self.list_active_jobs();
+                let _ = reply.send(result);
+            }
+            EngineCmd::ListStorageRoots { reply } => {
+                let result = self.list_storage_roots_inner();
                 let _ = reply.send(result);
             }
             EngineCmd::UpdateTorrentTrackers {
@@ -3468,6 +3482,13 @@ impl Engine {
             .map_err(|e| e.to_string())
     }
 
+    fn list_storage_roots_inner(&self) -> CmdResult<Vec<EngineStorageRoot>> {
+        let db = self.db.lock().expect("database mutex poisoned");
+        rt_db::list_storage_roots(&db)
+            .map(|roots| roots.into_iter().map(engine_storage_root).collect())
+            .map_err(|e| e.to_string())
+    }
+
     #[allow(dead_code)]
     fn completed_storage_plan_steps(&self, job_id: &str) -> Vec<usize> {
         let db = self.db.lock().expect("database mutex poisoned");
@@ -4209,6 +4230,67 @@ fn normalized_path_string(path: &std::path::Path) -> String {
         .unwrap_or_else(|_| path.to_path_buf())
         .to_string_lossy()
         .to_string()
+}
+
+fn engine_storage_root(row: rt_db::StorageRootRow) -> EngineStorageRoot {
+    let path = PathBuf::from(&row.path);
+    match storage_capacity(&path) {
+        Ok((total_bytes, available_bytes)) => EngineStorageRoot {
+            id: row.root_id,
+            path,
+            profile: row.profile,
+            total_bytes,
+            available_bytes,
+            used_bytes: total_bytes.saturating_sub(available_bytes),
+            ok: true,
+            error: None,
+        },
+        Err(error) => EngineStorageRoot {
+            id: row.root_id,
+            path,
+            profile: row.profile,
+            total_bytes: 0,
+            available_bytes: 0,
+            used_bytes: 0,
+            ok: false,
+            error: Some(error),
+        },
+    }
+}
+
+#[cfg(unix)]
+fn storage_capacity(path: &std::path::Path) -> Result<(u64, u64), String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        format!(
+            "storage root path contains an interior NUL: {}",
+            path.display()
+        )
+    })?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(format!(
+            "statvfs failed for {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    let stat = unsafe { stat.assume_init() };
+    let block_size = stat.f_frsize.max(stat.f_bsize) as u64;
+    let total = (stat.f_blocks as u64).saturating_mul(block_size);
+    let available = (stat.f_bavail as u64).saturating_mul(block_size);
+    Ok((total, available))
+}
+
+#[cfg(not(unix))]
+fn storage_capacity(path: &std::path::Path) -> Result<(u64, u64), String> {
+    if path.exists() {
+        Ok((0, 0))
+    } else {
+        Err(format!("storage root does not exist: {}", path.display()))
+    }
 }
 
 fn stable_mount_id(path: &std::path::Path) -> String {
@@ -6229,6 +6311,54 @@ mod tests {
         assert_eq!(mounts[0].queue_depth, 1);
         assert_eq!(mounts[0].read_concurrency, 1);
         assert_eq!(mounts[0].write_concurrency, 1);
+    }
+
+    #[test]
+    fn storage_root_projection_reports_capacity_and_root_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.download_dir = temp.path().join("downloads");
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        register_configured_storage(&conn, &config).unwrap();
+        rt_db::upsert_storage_root(
+            &conn,
+            &rt_db::StorageRootRow {
+                root_id: "missing".to_owned(),
+                path: temp.path().join("missing").to_string_lossy().to_string(),
+                profile: "auto".to_owned(),
+                created_at: 1,
+            },
+        )
+        .unwrap();
+        let (_tx, rx) = mpsc::channel(1);
+        let engine = Engine {
+            config: Arc::new(config),
+            registry: Arc::new(RwLock::new(SessionRegistry::new())),
+            db: Arc::new(Mutex::new(conn)),
+            cmd_rx: rx,
+            cmd_tx: mpsc::channel(1).0,
+            torrent_chans: HashMap::new(),
+            torrent_tasks: HashMap::new(),
+            dht_tx: None,
+            resources: test_resource_governor(),
+        };
+
+        let roots = engine.list_storage_roots_inner().unwrap();
+        assert_eq!(roots.len(), 2);
+        let ok = roots.iter().find(|root| root.ok).unwrap();
+        assert!(ok.total_bytes > 0);
+        assert!(ok.available_bytes <= ok.total_bytes);
+        assert_eq!(
+            ok.used_bytes,
+            ok.total_bytes.saturating_sub(ok.available_bytes)
+        );
+        let missing = roots.iter().find(|root| !root.ok).unwrap();
+        assert_eq!(missing.total_bytes, 0);
+        assert!(missing
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("statvfs")));
     }
 
     #[tokio::test]

@@ -86,7 +86,10 @@ Storage implementation is closed locally. The current live path includes
 bounded positioned I/O, fd pooling, preallocation, durability barriers,
 dedicated disk/hash workers, peer-read readahead, HDD elevator, topology
 detection, sparse recheck, move/import/delete planning, storage-plan jobs, and
-release certification wrappers.
+release certification wrappers. Native REST now also exposes
+`GET /api/v1/storage` directly from the engine storage-root registry with live
+capacity probes, so WebUI/native deployments no longer depend on sidecar-only
+storage status projection.
 
 Remaining storage work is evidence-bound:
 

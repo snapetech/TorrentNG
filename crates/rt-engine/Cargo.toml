@@ -21,6 +21,7 @@ serde_json.workspace = true
 url.workspace = true
 hex.workspace = true
 sha1.workspace = true
+libc.workspace = true
 
 rt-config      = { path = "../rt-config" }
 rt-bencode     = { path = "../rt-bencode" }

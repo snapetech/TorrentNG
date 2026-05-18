@@ -8,7 +8,7 @@ use crate::{
         add_torrent, add_torrent_peers, delete_torrent, diagnose_torrent, get_torrent, health,
         list_session_events, list_torrent_files, list_torrent_trackers, list_torrents, metrics,
         patch_torrent_files, patch_torrent_trackers, pause_torrent, reannounce_torrent,
-        recheck_torrent, resume_torrent, session_features, set_torrent_category,
+        recheck_torrent, resume_torrent, session_features, set_torrent_category, storage,
         storage_execute_plan, storage_preview_plan, stream_events, torrent_limits, transfer_limits,
         update_session_features, update_torrent, update_torrent_limits, update_torrent_queue,
         update_transfer_limits,
@@ -80,6 +80,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/events", get(stream_events))
         .route("/api/v1/session-events", get(list_session_events))
         .route("/api/v1/jobs", get(crate::handlers::list_jobs))
+        .route("/api/v1/storage", get(storage))
         .route("/api/v1/storage/plan", post(storage_preview_plan))
         .route("/api/v1/storage/execute", post(storage_execute_plan))
         .with_state(state)
