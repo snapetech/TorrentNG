@@ -12,6 +12,27 @@ latest() {
     | sort -nr | awk 'NR==1 {print $2}'
 }
 
+latest_excluding() {
+  local pattern="$1"
+  local dir="$2"
+  shift 2
+  local excludes=("$@")
+  find "$dir" -maxdepth 1 -type f -name "$pattern" -printf '%T@ %p\n' 2>/dev/null \
+    | while read -r ts path; do
+        local base skip exclude
+        base="$(basename "$path")"
+        skip=0
+        for exclude in "${excludes[@]}"; do
+          if [[ "$base" == $exclude ]]; then
+            skip=1
+            break
+          fi
+        done
+        [[ "$skip" == "1" ]] || printf '%s %s\n' "$ts" "$path"
+      done \
+    | sort -nr | awk 'NR==1 {print $2}'
+}
+
 overall() {
   local file="$1"
   if [[ -z "$file" || ! -f "$file" ]]; then
@@ -35,6 +56,21 @@ row() {
   local dir="${3:-$REPORT_DIR}"
   local file status sample
   file="$(latest "$pattern" "$dir")"
+  status="$(overall "$file")"
+  sample="-"
+  if [[ -n "$file" && -f "$file" ]]; then
+    sample="$(basename "$file")"
+  fi
+  printf '| %s | %s | %s |\n' "$name" "$status" "$sample"
+}
+
+row_excluding() {
+  local name="$1"
+  local pattern="$2"
+  local dir="$3"
+  shift 3
+  local file status sample
+  file="$(latest_excluding "$pattern" "$dir" "$@")"
   status="$(overall "$file")"
   sample="-"
   if [[ -n "$file" && -f "$file" ]]; then
@@ -125,7 +161,7 @@ row "Mobile read-flow" 'mobile-compat-*.md'
 row "Phase 1 ruTorrent" 'phase1-cert-*.md'
 row "Universal compatibility" 'universal-compat-*.md'
 row "Universal live compatibility" 'universal-live-*.md'
-row "Migration corpus" 'migration-corpus-*.md'
+row_excluding "Migration corpus" 'migration-corpus-*.md' "$REPORT_DIR" 'migration-corpus-local-release-*'
 row "External evidence preflight" 'external-evidence-preflight-*.md'
 row "Synthetic benchmark" 'report-*.md' "$BENCHMARK_DIR"
 row "Short soak" 'soak-202*.md'
