@@ -14,6 +14,20 @@ mkdir -p "$(dirname "$OUT")"
 status="PASS"
 warnings=0
 
+evidence_patterns=(
+  "*.torrent"
+  "*.fastresume"
+  "*.resume"
+  "*.resume.json"
+  "*.state"
+  "*.dat"
+  "*.conf"
+  "*.config"
+  "resume.dat"
+  "downloads.config"
+  "torrents.config"
+)
+
 mark() {
   local name="$1"
   local result="$2"
@@ -33,11 +47,32 @@ mark() {
   esac
 }
 
+count_corpus_evidence() {
+  local dir="$1"
+  local pattern
+  local expr=()
+
+  [[ -d "$dir" ]] || {
+    printf '0'
+    return
+  }
+
+  for pattern in "${evidence_patterns[@]}"; do
+    if [[ "${#expr[@]}" -gt 0 ]]; then
+      expr+=(-o)
+    fi
+    expr+=(-name "$pattern")
+  done
+
+  find "$dir" -type f \( "${expr[@]}" \) | wc -l | tr -d ' '
+}
+
 corpus_missing=0
 missing_families=()
 for family in qbittorrent transmission deluge utorrent biglybt tixati rtorrent generic; do
   dir="$CORPUS_DIR/$family"
-  if [[ ! -d "$dir" ]] || [[ -z "$(find "$dir" -type f 2>/dev/null | head -1)" ]]; then
+  files="$(count_corpus_evidence "$dir")"
+  if [[ "$files" -eq 0 ]]; then
     corpus_missing=$((corpus_missing + 1))
     missing_families+=("$family")
   fi
@@ -81,7 +116,7 @@ else
 fi
 
 if [[ "$corpus_missing" -eq 0 ]]; then
-  mark "migration corpus coverage" "PASS" "all source-family directories contain files"
+  mark "migration corpus coverage" "PASS" "all source-family directories contain migration evidence files"
 else
   missing_csv="$(IFS=,; printf '%s' "${missing_families[*]}")"
   mark "migration corpus coverage" "WARN" "$corpus_missing source-family directories are missing evidence files: $missing_csv"

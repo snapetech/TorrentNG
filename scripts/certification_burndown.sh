@@ -34,15 +34,16 @@ nonclean_rows() {
 action_for() {
   local gate="$1"
   local status="$2"
+  local report="${3:-}"
   case "$gate:$status" in
     "Universal compatibility:PASS_WITH_SKIPS")
-      printf 'Run `scripts/universal_live_certification.sh` for Docker local interop. Add `UNIVERSAL_LIVE_PUBLIC=1` for approved public torrent downloads and `UNIVERSAL_LIVE_REAL_DEVICE=1 TNG_STORAGE_BENCH_DIR=/mnt/target` for target storage hardware.'
+      printf 'Rerun `scripts/universal_compatibility_certification.sh` with the skipped optional legs enabled as needed: `UNIVERSAL_COMPAT_LIVE=1` for Docker client interop, `UNIVERSAL_COMPAT_PUBLIC=1` for approved public torrent downloads, `UNIVERSAL_COMPAT_REAL_DEVICE=1 TNG_STORAGE_BENCH_DIR=/mnt/target` for target storage hardware, and `UNIVERSAL_COMPAT_MOBILE=1` for the mobile read-flow leg.'
       ;;
     "Universal live compatibility:MISSING")
       printf 'Run `scripts/universal_live_certification.sh` for Docker local interop, or set `UNIVERSAL_LIVE_PUBLIC=1` / `UNIVERSAL_LIVE_REAL_DEVICE=1` for the external legs needed by the release.'
       ;;
     "Universal live compatibility:PASS_WITH_SKIPS")
-      printf 'Rerun `scripts/universal_live_certification.sh` with the skipped live legs enabled: `UNIVERSAL_LIVE_PUBLIC=1` for public torrents and/or `UNIVERSAL_LIVE_REAL_DEVICE=1 TNG_STORAGE_BENCH_DIR=/mnt/target` for storage hardware.'
+      printf 'Latest universal-live report `%s` may already include a passing local Docker interop leg; skipped rows are external only unless the report says otherwise. Rerun with `UNIVERSAL_LIVE_PUBLIC=1` for approved public torrents and/or `UNIVERSAL_LIVE_REAL_DEVICE=1 TNG_STORAGE_BENCH_DIR=/mnt/target` for target storage hardware.' "$report"
       ;;
     "Migration corpus:PASS_WITH_GAPS")
       printf 'Populate `testdata/migration-corpus/{qbittorrent,transmission,deluge,utorrent,biglybt,tixati,rtorrent,generic}` with real exported artifacts, then run `TNG_REQUIRE_MIGRATION_CORPUS=1 scripts/migration_corpus_certification.sh`.'
@@ -88,7 +89,7 @@ count=0
 while IFS=$'\t' read -r gate status report; do
   [[ -n "$gate" ]] || continue
   count=$((count + 1))
-  action="$(action_for "$gate" "$status")"
+  action="$(action_for "$gate" "$status" "$report")"
   action="${action//|/\\|}"
   printf '| %s | %s | %s | %s |\n' "$gate" "$status" "$report" "$action" >>"$OUT"
 done < <(nonclean_rows)

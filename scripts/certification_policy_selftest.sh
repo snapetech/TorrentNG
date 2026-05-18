@@ -113,6 +113,13 @@ REPORT_DIR="$report_dir" BENCHMARK_DIR="$benchmark_dir" \
 grep -q 'certification status rollup | PASS' "$report_dir/post-soak-policy.md"
 grep -q 'Overall status: PASS' "$report_dir/post-soak-policy.md"
 
+write_report "$report_dir/universal-compat-selftest.md" PASS_WITH_SKIPS
+write_report "$report_dir/universal-live-selftest.md" PASS_WITH_SKIPS
+REPORT_DIR="$report_dir" BENCHMARK_DIR="$benchmark_dir" \
+  "$ROOT/scripts/certification_burndown.sh" "$report_dir/certification-burndown-skips.md" >/dev/null
+grep -q 'UNIVERSAL_COMPAT_LIVE=1' "$report_dir/certification-burndown-skips.md"
+grep -q 'Latest universal-live report `universal-live-selftest.md` may already include a passing local Docker interop leg' "$report_dir/certification-burndown-skips.md"
+
 if TNG_EXTERNAL_PREFLIGHT_STRICT=1 \
   TNG_MIGRATION_CORPUS_DIR="$tmpdir/missing-corpus" \
   "$ROOT/scripts/external_evidence_preflight.sh" "$report_dir/external-preflight-strict.md" >/dev/null 2>&1; then
@@ -121,5 +128,18 @@ if TNG_EXTERNAL_PREFLIGHT_STRICT=1 \
 fi
 grep -q 'Overall status: FAIL' "$report_dir/external-preflight-strict.md"
 grep -q 'Warnings promoted to failures by TNG_EXTERNAL_PREFLIGHT_STRICT=1' "$report_dir/external-preflight-strict.md"
+
+placeholder_corpus="$tmpdir/placeholder-corpus"
+for family in qbittorrent transmission deluge utorrent biglybt tixati rtorrent generic; do
+  mkdir -p "$placeholder_corpus/$family"
+  printf 'placeholder\n' >"$placeholder_corpus/$family/README.md"
+done
+if TNG_EXTERNAL_PREFLIGHT_STRICT=1 \
+  TNG_MIGRATION_CORPUS_DIR="$placeholder_corpus" \
+  "$ROOT/scripts/external_evidence_preflight.sh" "$report_dir/external-preflight-placeholders.md" >/dev/null 2>&1; then
+  echo "strict external preflight accepted placeholder corpus files" >&2
+  exit 1
+fi
+grep -q 'missing evidence files' "$report_dir/external-preflight-placeholders.md"
 
 echo "certification policy self-test: PASS"
