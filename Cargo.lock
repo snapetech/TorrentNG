@@ -1285,6 +1285,7 @@ dependencies = [
  "rt-metrics",
  "rt-session",
  "rt-storage",
+ "rt-utp",
  "serde",
  "serde_json",
  "tempfile",

@@ -29,6 +29,9 @@ still routes peer-wire sessions through TCP.
   - demultiplexes packets by remote address and receive connection ID;
   - accepts multiple incoming uTP streams without consuming the listener socket;
   - routes DATA/FIN/STATE packets into per-stream bounded queues.
+- Process-level uTP counters exported through native Prometheus metrics:
+  connects, accepts, sent/received bytes, send/receive timeouts,
+  retransmissions, and route drops.
 - Byte-stream helpers over DATA payloads:
   - `write_all` chunks arbitrary byte slices across uTP DATA packets;
   - `read_exact` buffers received DATA payloads and can satisfy reads across
@@ -137,6 +140,6 @@ same byte-stream adapter when `TNG_UTP_METADATA=prefer|only` is set; if that is
 not set it follows `TNG_UTP_OUTGOING`, then the legacy
 `TNG_ENABLE_UTP_OUTGOING` flag.
 
-The path remains opt-in while default policy, production interop, detailed uTP
-metrics, and tracker/DHT peer transport preference evidence are still
-incomplete.
+The path remains opt-in while default policy, production interop, richer RTT and
+congestion-window histograms, and tracker/DHT peer transport preference evidence
+are still incomplete.

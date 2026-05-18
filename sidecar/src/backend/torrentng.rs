@@ -3,10 +3,11 @@ use async_trait::async_trait;
 use base64::{engine::general_purpose, Engine as _};
 use reqwest::Url;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, net::SocketAddr};
 
 use super::{
-    BackendCapabilities, BackendStatus, BackendTransferLimits, BackendType, TorrentBackend,
+    BackendCapabilities, BackendStatus, BackendTransferLimits, BackendType, QueueMove,
+    TorrentBackend,
 };
 use crate::{
     config::TorrentngConfig,
@@ -456,6 +457,30 @@ impl TorrentBackend for TorrentngBackend {
     async fn set_auto_management(&self, hash: &str, enabled: bool) -> Result<()> {
         self.put_limits(hash, json!({ "auto_management": enabled }))
             .await
+    }
+
+    async fn add_peers(&self, hash: &str, peers: &[SocketAddr]) -> Result<()> {
+        self.post_json(
+            &format!("api/v1/torrents/{hash}/peers"),
+            json!({ "peers": peers.iter().map(ToString::to_string).collect::<Vec<_>>() }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn update_queue_order(&self, hashes: &[String], queue_move: QueueMove) -> Result<()> {
+        let queue_move = match queue_move {
+            QueueMove::Up => "up",
+            QueueMove::Down => "down",
+            QueueMove::Top => "top",
+            QueueMove::Bottom => "bottom",
+        };
+        self.post_json(
+            "api/v1/torrents/queue",
+            json!({ "hashes": hashes, "move": queue_move }),
+        )
+        .await?;
+        Ok(())
     }
 
     async fn add_tags(&self, hash: &str, tags: &[&str]) -> Result<()> {

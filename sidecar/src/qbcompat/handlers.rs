@@ -7,10 +7,11 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
+use std::{collections::HashMap, net::SocketAddr};
 
 use crate::{
     api::{server::AppState, ws::Event},
+    backend::QueueMove,
     cache::{AppEventRow, ListParams, RssRule, TorrentRow},
     rtorrent::TransferRates,
 };
@@ -55,14 +56,14 @@ pub fn build_router(_state: AppState) -> Router<AppState> {
         .route("/torrents/addTags", post(torrents_add_tags))
         .route("/torrents/removeTags", post(torrents_remove_tags))
         .route("/torrents/setTags", post(torrents_set_tags))
-        .route("/torrents/addPeers", post(ok_form))
+        .route("/torrents/addPeers", post(torrents_add_peers))
         .route("/torrents/editTracker", post(torrents_edit_tracker))
         .route("/torrents/addTrackers", post(torrents_add_trackers))
         .route("/torrents/removeTrackers", post(torrents_remove_trackers))
-        .route("/torrents/increasePrio", post(ok_form))
-        .route("/torrents/decreasePrio", post(ok_form))
-        .route("/torrents/topPrio", post(ok_form))
-        .route("/torrents/bottomPrio", post(ok_form))
+        .route("/torrents/increasePrio", post(torrents_increase_prio))
+        .route("/torrents/decreasePrio", post(torrents_decrease_prio))
+        .route("/torrents/topPrio", post(torrents_top_prio))
+        .route("/torrents/bottomPrio", post(torrents_bottom_prio))
         .route("/torrents/filePrio", post(torrents_file_prio))
         .route("/torrents/rename", post(torrents_rename))
         .route("/torrents/renameFile", post(torrents_rename_file))
@@ -918,6 +919,72 @@ async fn torrents_recheck(State(s): State<AppState>, Form(f): Form<HashesForm>) 
 }
 async fn torrents_reannounce(State(s): State<AppState>, Form(f): Form<HashesForm>) -> StatusCode {
     bulk_action(&s, &f.hashes, "reannounce").await
+}
+
+#[derive(Deserialize)]
+struct AddPeersForm {
+    hashes: Option<String>,
+    hash: Option<String>,
+    peers: Option<String>,
+}
+
+async fn torrents_add_peers(State(s): State<AppState>, Form(f): Form<AddPeersForm>) -> StatusCode {
+    let hashes = f.hashes.as_deref().or(f.hash.as_deref());
+    let hashes = split_hashes(&s.db, hashes);
+    let peers = f.peers.as_deref().map(parse_peer_addrs).unwrap_or_default();
+    if hashes.is_empty() || peers.is_empty() {
+        return StatusCode::BAD_REQUEST;
+    }
+    for hash in hashes {
+        if let Err(e) = s.backend.add_peers(&hash, &peers).await {
+            tracing::warn!(
+                component = "qbcompat",
+                operation = "add_peers",
+                torrent = %hash,
+                result = "error",
+                error = %e,
+                "qBit explicit peer add failed"
+            );
+        }
+    }
+    StatusCode::OK
+}
+
+async fn torrents_increase_prio(State(s): State<AppState>, Form(f): Form<HashesForm>) -> StatusCode {
+    torrents_update_queue_order(s, f.hashes, QueueMove::Up).await
+}
+
+async fn torrents_decrease_prio(State(s): State<AppState>, Form(f): Form<HashesForm>) -> StatusCode {
+    torrents_update_queue_order(s, f.hashes, QueueMove::Down).await
+}
+
+async fn torrents_top_prio(State(s): State<AppState>, Form(f): Form<HashesForm>) -> StatusCode {
+    torrents_update_queue_order(s, f.hashes, QueueMove::Top).await
+}
+
+async fn torrents_bottom_prio(State(s): State<AppState>, Form(f): Form<HashesForm>) -> StatusCode {
+    torrents_update_queue_order(s, f.hashes, QueueMove::Bottom).await
+}
+
+async fn torrents_update_queue_order(
+    s: AppState,
+    hashes: Option<String>,
+    queue_move: QueueMove,
+) -> StatusCode {
+    let hashes = split_hashes(&s.db, hashes.as_deref());
+    if hashes.is_empty() {
+        return StatusCode::BAD_REQUEST;
+    }
+    if let Err(e) = s.backend.update_queue_order(&hashes, queue_move).await {
+        tracing::warn!(
+            component = "qbcompat",
+            operation = "update_queue_order",
+            result = "error",
+            error = %e,
+            "qBit queue order update failed"
+        );
+    }
+    StatusCode::OK
 }
 
 async fn bulk_action(s: &AppState, hashes_str: &Option<String>, action: &str) -> StatusCode {
@@ -2341,6 +2408,13 @@ fn split_hashes(db: &crate::cache::Db, s: Option<&str>) -> Vec<String> {
             .map(str::to_owned)
             .collect(),
     }
+}
+
+fn parse_peer_addrs(values: &str) -> Vec<SocketAddr> {
+    values
+        .split('|')
+        .filter_map(|peer| peer.trim().parse::<SocketAddr>().ok())
+        .collect()
 }
 
 fn emit(s: &AppState, event: Event) {

@@ -1,10 +1,11 @@
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use reqwest::Url;
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, net::SocketAddr};
 
 use super::{
-    BackendCapabilities, BackendStatus, BackendTransferLimits, BackendType, TorrentBackend,
+    BackendCapabilities, BackendStatus, BackendTransferLimits, BackendType, QueueMove,
+    TorrentBackend,
 };
 use crate::{
     config::QbittorrentConfig,
@@ -504,6 +505,30 @@ impl TorrentBackend for QbittorrentBackend {
             &[("hashes", hash), ("enable", value)],
         )
         .await
+    }
+
+    async fn add_peers(&self, hash: &str, peers: &[SocketAddr]) -> Result<()> {
+        let peers = peers
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("|");
+        self.post_form(
+            "api/v2/torrents/addPeers",
+            &[("hashes", hash), ("peers", &peers)],
+        )
+        .await
+    }
+
+    async fn update_queue_order(&self, hashes: &[String], queue_move: QueueMove) -> Result<()> {
+        let hashes = hashes.join("|");
+        let path = match queue_move {
+            QueueMove::Up => "api/v2/torrents/increasePrio",
+            QueueMove::Down => "api/v2/torrents/decreasePrio",
+            QueueMove::Top => "api/v2/torrents/topPrio",
+            QueueMove::Bottom => "api/v2/torrents/bottomPrio",
+        };
+        self.post_form(path, &[("hashes", &hashes)]).await
     }
 
     async fn add_tags(&self, hash: &str, tags: &[&str]) -> Result<()> {

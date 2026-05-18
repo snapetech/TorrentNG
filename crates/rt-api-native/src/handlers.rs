@@ -1,4 +1,6 @@
-use std::{collections::BTreeMap, convert::Infallible, path::PathBuf, time::Duration};
+use std::{
+    collections::BTreeMap, convert::Infallible, net::SocketAddr, path::PathBuf, time::Duration,
+};
 
 use axum::{
     extract::{Path, Query, State},
@@ -14,7 +16,7 @@ use futures::Stream;
 use rt_api_model::{
     AddTorrentRequest, AddTorrentResponse, ApiError, FileInfo, TorrentDetail, TorrentSummary,
 };
-use rt_engine::{EngineGlobalLimits, EngineJob, EngineTorrentLimits};
+use rt_engine::{EngineGlobalLimits, EngineJob, EngineTorrentLimits, QueueMove};
 use rt_metainfo::{parse_magnet, parse_torrent};
 use rt_metrics::MemoryClass;
 use rt_session::{TorrentEntry, TorrentState};
@@ -499,6 +501,19 @@ pub struct UpdateTorrentLimitsRequest {
     pub auto_management: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct AddTorrentPeersRequest {
+    #[serde(default)]
+    pub peers: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct QueueOrderRequest {
+    pub hashes: Vec<String>,
+    #[serde(rename = "move")]
+    pub queue_move: String,
+}
+
 fn deserialize_present_value<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
 where
     D: Deserializer<'de>,
@@ -667,6 +682,104 @@ pub async fn update_torrent_limits(
     }
 
     match engine.update_torrent_limits(info_hash, limits).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError::bad_request(e)).unwrap()),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /api/v1/torrents/{hash}/peers` — add explicit peers to a torrent.
+pub async fn add_torrent_peers(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(info_hash): Path<String>,
+    Json(req): Json<AddTorrentPeersRequest>,
+) -> impl IntoResponse {
+    if let Some(response) = require_mutation_auth(&state, &headers) {
+        return response;
+    }
+    if !torrent_exists(&state, &info_hash).await {
+        return not_found(info_hash);
+    }
+    let peers = req
+        .peers
+        .iter()
+        .filter_map(|peer| peer.trim().parse::<SocketAddr>().ok())
+        .collect::<Vec<_>>();
+    if peers.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError::bad_request("peers is required")).unwrap()),
+        )
+            .into_response();
+    }
+    let Some(engine) = &state.engine else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                serde_json::to_value(ApiError::internal("native engine is not available")).unwrap(),
+            ),
+        )
+            .into_response();
+    };
+    match engine.add_peers(info_hash, peers).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError::bad_request(e)).unwrap()),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /api/v1/torrents/queue` — move torrents in the persisted queue order.
+pub async fn update_torrent_queue(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<QueueOrderRequest>,
+) -> impl IntoResponse {
+    if let Some(response) = require_mutation_auth(&state, &headers) {
+        return response;
+    }
+    let queue_move = match req.queue_move.trim().to_ascii_lowercase().as_str() {
+        "up" => QueueMove::Up,
+        "down" => QueueMove::Down,
+        "top" => QueueMove::Top,
+        "bottom" => QueueMove::Bottom,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::to_value(ApiError::bad_request("invalid queue move")).unwrap()),
+            )
+                .into_response()
+        }
+    };
+    let hashes = req
+        .hashes
+        .into_iter()
+        .map(|hash| hash.trim().to_owned())
+        .filter(|hash| !hash.is_empty())
+        .collect::<Vec<_>>();
+    if hashes.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError::bad_request("hashes is required")).unwrap()),
+        )
+            .into_response();
+    }
+    let Some(engine) = &state.engine else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                serde_json::to_value(ApiError::internal("native engine is not available")).unwrap(),
+            ),
+        )
+            .into_response();
+    };
+    match engine.update_queue_order(hashes, queue_move).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
@@ -2824,6 +2937,63 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
         "Frame-pool byte cap for storage I/O",
         storage.frame_cap_bytes(),
     );
+    let utp = rt_utp::stats_snapshot();
+    metric(
+        &mut out,
+        "torrentng_utp_connects_total",
+        "counter",
+        "Outbound uTP streams that completed the SYN/STATE handshake",
+        utp.connects,
+    );
+    metric(
+        &mut out,
+        "torrentng_utp_accepts_total",
+        "counter",
+        "Inbound uTP streams accepted by listeners or shared endpoints",
+        utp.accepts,
+    );
+    metric(
+        &mut out,
+        "torrentng_utp_bytes_sent_total",
+        "counter",
+        "uTP UDP payload bytes sent including protocol headers",
+        utp.bytes_sent,
+    );
+    metric(
+        &mut out,
+        "torrentng_utp_bytes_received_total",
+        "counter",
+        "uTP application payload bytes delivered to streams",
+        utp.bytes_received,
+    );
+    metric(
+        &mut out,
+        "torrentng_utp_send_timeouts_total",
+        "counter",
+        "uTP send or close operations that timed out waiting for acknowledgement",
+        utp.send_timeouts,
+    );
+    metric(
+        &mut out,
+        "torrentng_utp_recv_timeouts_total",
+        "counter",
+        "uTP receive operations that timed out waiting for packets",
+        utp.recv_timeouts,
+    );
+    metric(
+        &mut out,
+        "torrentng_utp_retransmits_total",
+        "counter",
+        "uTP packet retransmission attempts",
+        utp.retransmits,
+    );
+    metric(
+        &mut out,
+        "torrentng_utp_route_drops_total",
+        "counter",
+        "uTP datagrams dropped because no stream route or queue slot was available",
+        utp.route_drops,
+    );
     out
 }
 
@@ -3685,6 +3855,14 @@ mod tests {
         assert!(rendered.contains("torrentng_storage_backend_frame_pool_slots_supported "));
         assert!(rendered.contains("torrentng_storage_handles_open "));
         assert!(rendered.contains("torrentng_storage_frame_bytes_cap "));
+        assert!(rendered.contains("torrentng_utp_connects_total "));
+        assert!(rendered.contains("torrentng_utp_accepts_total "));
+        assert!(rendered.contains("torrentng_utp_bytes_sent_total "));
+        assert!(rendered.contains("torrentng_utp_bytes_received_total "));
+        assert!(rendered.contains("torrentng_utp_send_timeouts_total "));
+        assert!(rendered.contains("torrentng_utp_recv_timeouts_total "));
+        assert!(rendered.contains("torrentng_utp_retransmits_total "));
+        assert!(rendered.contains("torrentng_utp_route_drops_total "));
     }
 
     #[tokio::test]

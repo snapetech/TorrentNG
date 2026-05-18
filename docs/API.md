@@ -83,6 +83,8 @@ the rewritten engine.
 | `PUT`  | `/api/v1/torrents/:hash/category` | Set or clear category (`{ category: "name" }`, or `null`/empty to clear) |
 | `GET`  | `/api/v1/torrents/:hash/limits` | Read per-torrent limits and mode flags |
 | `PUT`  | `/api/v1/torrents/:hash/limits` | Merge per-torrent limits (`download_limit`, `upload_limit`, `max_connections`, `seed_ratio_limit`, `seed_idle_limit`, `sequential_download`, `first_last_piece_prio`, `force_start`, `super_seeding`, `auto_tmm`, `auto_management`; use `null` for nullable limits) |
+| `POST` | `/api/v1/torrents/:hash/peers` | Add explicit peers (`{ peers: ["host:port"] }`) |
+| `POST` | `/api/v1/torrents/queue` | Move torrents in queue order (`{ hashes: ["..."], move: "up" \| "down" \| "top" \| "bottom" }`) |
 | `PATCH` | `/api/v1/torrents/:hash/tags` | Add/remove tags (`{ add: ["a"], remove: ["b"] }`); native daemon routes tag changes through the engine label update path |
 | `GET` | `/api/v1/events` | Server-sent torrent delta stream |
 | `GET` | `/api/v1/jobs` | List active durable engine jobs with progress, checkpoint, and last-error fields |

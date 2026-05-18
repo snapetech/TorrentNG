@@ -1,7 +1,10 @@
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -57,6 +60,40 @@ pub struct UtpStream {
     last_remote_timestamp_us: u32,
     read_buf: Vec<u8>,
     routed_rx: Option<mpsc::Receiver<UtpPacket>>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UtpStats {
+    pub connects: u64,
+    pub accepts: u64,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub send_timeouts: u64,
+    pub recv_timeouts: u64,
+    pub retransmits: u64,
+    pub route_drops: u64,
+}
+
+static UTP_CONNECTS: AtomicU64 = AtomicU64::new(0);
+static UTP_ACCEPTS: AtomicU64 = AtomicU64::new(0);
+static UTP_BYTES_SENT: AtomicU64 = AtomicU64::new(0);
+static UTP_BYTES_RECEIVED: AtomicU64 = AtomicU64::new(0);
+static UTP_SEND_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+static UTP_RECV_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+static UTP_RETRANSMITS: AtomicU64 = AtomicU64::new(0);
+static UTP_ROUTE_DROPS: AtomicU64 = AtomicU64::new(0);
+
+pub fn stats_snapshot() -> UtpStats {
+    UtpStats {
+        connects: UTP_CONNECTS.load(Ordering::Relaxed),
+        accepts: UTP_ACCEPTS.load(Ordering::Relaxed),
+        bytes_sent: UTP_BYTES_SENT.load(Ordering::Relaxed),
+        bytes_received: UTP_BYTES_RECEIVED.load(Ordering::Relaxed),
+        send_timeouts: UTP_SEND_TIMEOUTS.load(Ordering::Relaxed),
+        recv_timeouts: UTP_RECV_TIMEOUTS.load(Ordering::Relaxed),
+        retransmits: UTP_RETRANSMITS.load(Ordering::Relaxed),
+        route_drops: UTP_ROUTE_DROPS.load(Ordering::Relaxed),
+    }
 }
 
 impl std::fmt::Debug for UtpStream {
@@ -119,6 +156,7 @@ impl UtpListener {
             let conn = UtpConnection::accept(&packet.header, random_seq_nr())?;
             let state = conn.build_state(now_us(), timestamp_diff_us(packet.header.timestamp_us));
             send_packet(&self.socket, &state).await?;
+            UTP_ACCEPTS.fetch_add(1, Ordering::Relaxed);
             return Ok(UtpStream {
                 socket: Arc::new(self.socket),
                 peer,
@@ -212,7 +250,11 @@ async fn run_endpoint_recv(
                 streams.get(&key).cloned()
             };
             if let Some(tx) = tx {
-                let _ = tx.try_send(packet);
+                if tx.try_send(packet).is_err() {
+                    UTP_ROUTE_DROPS.fetch_add(1, Ordering::Relaxed);
+                }
+            } else {
+                UTP_ROUTE_DROPS.fetch_add(1, Ordering::Relaxed);
             }
             continue;
         }
@@ -247,6 +289,7 @@ async fn run_endpoint_recv(
             read_buf: Vec::new(),
             routed_rx: Some(rx),
         };
+        UTP_ACCEPTS.fetch_add(1, Ordering::Relaxed);
         if accepted_tx.send(Ok(stream)).await.is_err() {
             break;
         }
@@ -296,6 +339,7 @@ impl UtpStream {
                 packet_type: packet.header.packet_type,
             });
         }
+        UTP_CONNECTS.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
             socket: Arc::new(socket),
             peer,
@@ -323,13 +367,17 @@ impl UtpStream {
                 chunk.to_vec(),
             );
             let mut acknowledged = false;
-            for _ in 0..=self.config.max_retransmits {
+            for attempt in 0..=self.config.max_retransmits {
+                if attempt > 0 {
+                    UTP_RETRANSMITS.fetch_add(1, Ordering::Relaxed);
+                }
                 self.send_packet(&packet).await?;
                 loop {
                     let ack = match self.recv_packet(self.config.io_timeout).await {
                         Ok(ack) => ack,
                         Err(UtpError::Timeout) => {
                             self.conn.on_timeout();
+                            UTP_SEND_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
                             break;
                         }
                         Err(err) => return Err(err),
@@ -346,6 +394,7 @@ impl UtpStream {
                 }
             }
             if !acknowledged {
+                UTP_SEND_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
                 return Err(UtpError::Timeout);
             }
         }
@@ -388,6 +437,7 @@ impl UtpStream {
                         .conn
                         .build_state(now_us(), timestamp_diff_us(packet.header.timestamp_us));
                     self.send_packet(&ack).await?;
+                    UTP_BYTES_RECEIVED.fetch_add(packet.payload.len() as u64, Ordering::Relaxed);
                     return Ok(packet.payload);
                 }
                 InboundAction::Close => {
@@ -409,7 +459,10 @@ impl UtpStream {
             .conn
             .build_fin(now_us(), timestamp_diff_us(self.last_remote_timestamp_us));
         let mut packet = None;
-        for _ in 0..=self.config.max_retransmits {
+        for attempt in 0..=self.config.max_retransmits {
+            if attempt > 0 {
+                UTP_RETRANSMITS.fetch_add(1, Ordering::Relaxed);
+            }
             self.send_packet(&fin).await?;
             match self.recv_packet(self.config.io_timeout).await {
                 Ok(received) => {
@@ -418,6 +471,7 @@ impl UtpStream {
                 }
                 Err(UtpError::Timeout) => {
                     self.conn.on_timeout();
+                    UTP_SEND_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
                 Err(err) => return Err(err),
@@ -454,7 +508,9 @@ async fn send_packet(socket: &UdpSocket, packet: &UtpPacket) -> Result<(), UtpEr
     socket
         .send(&bytes)
         .await
-        .map(|_| ())
+        .map(|written| {
+            UTP_BYTES_SENT.fetch_add(written as u64, Ordering::Relaxed);
+        })
         .map_err(|err| UtpError::Io(err.to_string()))
 }
 
@@ -467,7 +523,9 @@ async fn send_packet_to(
     socket
         .send_to(&bytes, peer)
         .await
-        .map(|_| ())
+        .map(|written| {
+            UTP_BYTES_SENT.fetch_add(written as u64, Ordering::Relaxed);
+        })
         .map_err(|err| UtpError::Io(err.to_string()))
 }
 
@@ -479,7 +537,10 @@ async fn recv_packet(
     let mut buf = vec![0u8; max_datagram_len];
     let len = timeout(wait, socket.recv(&mut buf))
         .await
-        .map_err(|_| UtpError::Timeout)?
+        .map_err(|_| {
+            UTP_RECV_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+            UtpError::Timeout
+        })?
         .map_err(|err| UtpError::Io(err.to_string()))?;
     UtpPacket::parse(&buf[..len])
 }
@@ -518,6 +579,7 @@ mod tests {
 
     #[tokio::test]
     async fn utp_stream_connects_and_exchanges_payload() {
+        let before = stats_snapshot();
         let listener = UtpListener::bind_with_config("127.0.0.1:0".parse().unwrap(), test_config())
             .await
             .unwrap();
@@ -537,6 +599,11 @@ mod tests {
         assert_eq!(client.recv().await.unwrap(), b"ack");
         let _ = client.recv().await.unwrap();
         server.await.unwrap();
+        let after = stats_snapshot();
+        assert!(after.connects > before.connects);
+        assert!(after.accepts > before.accepts);
+        assert!(after.bytes_sent > before.bytes_sent);
+        assert!(after.bytes_received > before.bytes_received);
     }
 
     #[tokio::test]

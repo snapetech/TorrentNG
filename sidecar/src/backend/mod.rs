@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, net::SocketAddr};
 
 use crate::rtorrent::files::RawFile;
 use crate::rtorrent::torrents::{LiveSummary, RawTorrent};
@@ -245,6 +245,20 @@ pub trait TorrentBackend: Send + Sync {
             self.backend_type().as_str()
         )
     }
+
+    async fn add_peers(&self, _hash: &str, _peers: &[SocketAddr]) -> Result<()> {
+        bail!(
+            "{} backend does not support explicit peer adds",
+            self.backend_type().as_str()
+        )
+    }
+
+    async fn update_queue_order(&self, _hashes: &[String], _queue_move: QueueMove) -> Result<()> {
+        bail!(
+            "{} backend does not support queue order updates",
+            self.backend_type().as_str()
+        )
+    }
     async fn add_tags(&self, _hash: &str, _tags: &[&str]) -> Result<()> {
         Ok(())
     }
@@ -306,4 +320,13 @@ pub trait TorrentBackend: Send + Sync {
             self.backend_type().as_str()
         )
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QueueMove {
+    Up,
+    Down,
+    Top,
+    Bottom,
 }
