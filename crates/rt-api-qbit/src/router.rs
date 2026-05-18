@@ -1,5 +1,6 @@
 use axum::{
     body::Body,
+    extract::State,
     http::{header, HeaderMap, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -21,7 +22,7 @@ fn protected_qbit_routes(state: AppState) -> Router<AppState> {
 }
 
 async fn qbit_auth_guard(
-    State(state): axum::extract::State<AppState>,
+    State(state): State<AppState>,
     req: Request<Body>,
     next: Next,
 ) -> Response {
