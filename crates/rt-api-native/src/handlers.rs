@@ -2218,6 +2218,7 @@ pub async fn engine_diagnostics(State(state): State<AppState>) -> impl IntoRespo
                 "capabilities": native_webui_backend_capabilities(),
             },
             "provenance": {
+                "daemon_version": env!("CARGO_PKG_VERSION"),
                 "sidecar_version": env!("CARGO_PKG_VERSION"),
                 "rtorrent_version": null,
                 "libtorrent_version": null,

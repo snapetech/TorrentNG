@@ -58,7 +58,7 @@ paths through `utp_transport_paths`, which can include `outgoing_peer_wire`,
 `metadata_fetch`, and `incoming_peer_wire` depending on the current
 `TNG_UTP_*` environment policy.
 
-Sidecar `/api/v1/engine` also exposes the selected backend adapter and its
+Native `/api/v1/engine` also exposes the selected backend adapter and its
 capabilities. Adapter capability flags cover tags, categories, file priority,
 tracker edit, recheck, torrent export, webseed reads, piece state/hash reads,
 peer snapshots, explicit peer add/ban, queue ordering, per-torrent/global/share
@@ -111,7 +111,7 @@ the rewritten engine.
 | `GET` | `/api/v1/events` | Server-sent torrent delta stream |
 | `GET` | `/api/v1/jobs` | List active durable engine jobs with progress, checkpoint, and last-error fields |
 | `GET` | `/api/v1/session-events` | Recent durable native session events; query: `limit`, `torrent`, `kind`, `level`, `last_known_id` |
-| `GET` | `/api/v1/logs` | Recent durable sidecar app/backend events plus rTorrent log-ingest events when that adapter is selected; query: `limit`, `kind`, `level`, `last_known_id` |
+| `GET` | `/api/v1/logs` | Recent durable TorrentNG app/backend events plus rTorrent log-ingest events when that adapter is selected; query: `limit`, `kind`, `level`, `last_known_id` |
 | `GET` | `/api/v1/transfer/limits` | Read global transfer limits and speed-limits mode |
 | `PUT` | `/api/v1/transfer/limits` | Merge global transfer limits (`download_limit`, `upload_limit`, `speed_limits_mode`) |
 | `GET` | `/api/v1/session/features` | Read runtime network feature switches (`dht`, `pex`) |

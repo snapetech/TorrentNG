@@ -372,6 +372,7 @@ export interface BackendInfo {
 export interface EngineDiagnostics {
   backend: BackendInfo
   provenance: {
+    daemon_version?: string
     sidecar_version: string
     rtorrent_version: string | null
     libtorrent_version: string | null

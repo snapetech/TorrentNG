@@ -132,7 +132,7 @@ function Provenance({ data }: { data: EngineDiagnostics }) {
     <Panel>
       <Subhead>Provenance</Subhead>
       <Rows rows={[
-        ['Sidecar', p.sidecar_version],
+        ['TorrentNG', p.daemon_version ?? p.sidecar_version],
         ...(data.backend.type === 'rtorrent' ? [
           ['rTorrent', p.rtorrent_version ?? 'unknown'],
           ['libtorrent', p.libtorrent_version ?? 'unknown'],

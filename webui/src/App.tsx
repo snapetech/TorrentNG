@@ -785,7 +785,7 @@ export function App() {
                     background: 'color-mix(in srgb, var(--danger) 9%, var(--surface))',
                     borderRadius: 8, padding: '16px 18px', display: 'grid', gap: 8, minWidth: 280,
                   }}>
-                    <span style={{ fontWeight: 800 }}>Failed to connect to sidecar API.</span>
+                    <span style={{ fontWeight: 800 }}>Failed to connect to TorrentNG API.</span>
                     <span style={{ color: 'var(--faint)', fontSize: 12 }}>The table will refresh when the API responds again.</span>
                   </div>
                   <button onClick={() => query.refetch()} style={{
