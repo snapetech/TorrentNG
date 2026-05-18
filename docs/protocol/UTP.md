@@ -29,9 +29,10 @@ still routes peer-wire sessions through TCP.
   - demultiplexes packets by remote address and receive connection ID;
   - accepts multiple incoming uTP streams without consuming the listener socket;
   - routes DATA/FIN/STATE packets into per-stream bounded queues.
-- Process-level uTP counters exported through native Prometheus metrics:
-  connects, accepts, sent/received bytes, send/receive timeouts,
-  retransmissions, and route drops.
+- Process-level uTP counters and gauges exported through native Prometheus
+  metrics: connects, accepts, sent/received bytes, send/receive timeouts,
+  retransmissions, route drops, RTT, RTT variance, retransmit timeout,
+  congestion window, delay samples, and bytes in flight.
 - Byte-stream helpers over DATA payloads:
   - `write_all` chunks arbitrary byte slices across uTP DATA packets;
   - `read_exact` buffers received DATA payloads and can satisfy reads across
@@ -106,11 +107,11 @@ Before flipping `networking.utp_transport=true`, the engine still needs:
 
 - default peer dialing policy that chooses TCP or uTP based on
   tracker/DHT/PEX peer source, user preference, and private-torrent policy;
-- metadata exchange over `UtpStream`;
 - production alert thresholds and dashboards for the exported uTP connects,
   accepts, retransmits, timeouts, congestion window, RTT, bytes, and failure
   metrics;
-- integration tests proving a torrent can complete through uTP.
+- production interop tests proving metadata fetch and torrent data transfer can
+  complete through uTP against external clients.
 
 Until those pieces are wired, `networking.utp_packet_codec=true` and
 `networking.utp_transport=false` is the honest app-level status.
@@ -125,6 +126,9 @@ The native health capability surface also reports:
 - `networking.utp_outgoing_policy`: `TNG_UTP_OUTGOING` when set, otherwise
   `prefer` for the legacy `TNG_ENABLE_UTP_OUTGOING` flag or `off`.
 - `networking.utp_outgoing_enabled`: whether either outbound uTP opt-in is set.
+- `networking.utp_metadata_policy`: `TNG_UTP_METADATA` when set, otherwise
+  `TNG_UTP_OUTGOING`, legacy `prefer`, or `off`.
+- `networking.utp_metadata_enabled`: whether metadata fetch can attempt uTP.
 - `networking.utp_incoming_enabled`: whether `TNG_UTP_INCOMING` is currently
   enabled for the engine process.
 

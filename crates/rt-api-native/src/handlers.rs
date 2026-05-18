@@ -1670,6 +1670,22 @@ fn native_engine_capabilities() -> serde_json::Value {
                 }),
             "utp_outgoing_enabled": std::env::var_os("TNG_ENABLE_UTP_OUTGOING").is_some()
                 || std::env::var_os("TNG_UTP_OUTGOING").is_some(),
+            "utp_metadata_policy": std::env::var("TNG_UTP_METADATA")
+                .ok()
+                .or_else(|| std::env::var("TNG_UTP_OUTGOING").ok())
+                .unwrap_or_else(|| if std::env::var_os("TNG_ENABLE_UTP_OUTGOING").is_some() {
+                    "prefer".to_owned()
+                } else {
+                    "off".to_owned()
+                }),
+            "utp_metadata_enabled": std::env::var("TNG_UTP_METADATA")
+                .ok()
+                .or_else(|| std::env::var("TNG_UTP_OUTGOING").ok())
+                .map(|value| matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "prefer" | "prefer-utp" | "utp-prefer" | "only" | "utp" | "utp-only"
+                ))
+                .unwrap_or_else(|| std::env::var_os("TNG_ENABLE_UTP_OUTGOING").is_some()),
             "utp_incoming_enabled": std::env::var("TNG_UTP_INCOMING")
                 .ok()
                 .map(|value| matches!(
@@ -3626,6 +3642,8 @@ mod tests {
         assert_eq!(capabilities["networking"]["utp_udp_stream"], true);
         assert_eq!(capabilities["networking"]["utp_outgoing_opt_in"], true);
         assert_eq!(capabilities["networking"]["utp_incoming_opt_in"], true);
+        assert_eq!(capabilities["networking"]["utp_metadata_policy"], "off");
+        assert_eq!(capabilities["networking"]["utp_metadata_enabled"], false);
         assert_eq!(capabilities["networking"]["utp_transport"], false);
         assert_eq!(capabilities["compatibility"]["qbittorrent_v2"], true);
         assert_eq!(capabilities["migration"]["transmission"], true);
