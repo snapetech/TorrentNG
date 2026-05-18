@@ -176,8 +176,9 @@ Remaining compatibility gaps:
   snapshots when an engine is attached, with registry fallback file rows for
   in-memory compatibility probes; advanced view and throttle semantics remain
   compatibility placeholders.
-- qBittorrent: common automation flows are covered; deeper live tracker delta
-  fidelity and live swarm availability counters remain placeholder-depth.
+- qBittorrent: common automation flows are covered, and `torrents/info` now
+  projects native peer snapshots into live seed/leecher counters and aggregate
+  rates; deeper tracker delta fidelity remains placeholder-depth.
 - `scripts/migration_corpus_certification.sh` now separates synthetic
   import/apply coverage from exported fixture coverage. It runs `rt-migrate`
   tests and scans `testdata/migration-corpus/{qbittorrent,transmission,deluge,

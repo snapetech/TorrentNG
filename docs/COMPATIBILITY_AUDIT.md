@@ -89,7 +89,7 @@ Local surface: `crates/rt-api-transmission`.
 | Torrent reads | `torrent_get` common fields: identity, status, size/progress, counters, labels, paths, files, file stats, trackers, tracker stats, peers, queue, dates, private flag, magnet link; object and table formats; recently-active removed list | Implemented |
 | Torrent writes | `torrent_set`, tracker list, file priorities, wanted/unwanted, location, rename path | Implemented where native engine supports it; labels, location, speed limits, peer limits, seed limits, and sequential mode roundtrip in facade state when no engine is attached |
 | Utility | `port_test`, `blocklist_update`, `free_space` | Implemented as compatibility responses |
-| Remaining field depth | detailed availability depth, group internals, live webseed activity, and native-backed effects for script/blocklist/preferred transport settings | Gap or compatibility placeholder |
+| Remaining field depth | detailed availability depth, tracker delta internals, group internals, live webseed activity, and native-backed effects for script/blocklist/preferred transport settings | Gap or compatibility placeholder; main qBit list rows now project live peer counters/rates from native snapshots |
 
 ## Deluge JSON-RPC Facade
 

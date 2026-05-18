@@ -2729,6 +2729,7 @@ async fn qbit_torrent_info(state: &AppState, e: &rt_session::TorrentEntry) -> Qb
     } else {
         (String::new(), 0)
     };
+    let swarm = qbit_swarm_projection(state, &e.info_hash).await;
     let priority = queue_priority(state, &e.info_hash).await;
     let limits = get_torrent_limits(state, &e.info_hash).await;
     QbTorrentInfo {
@@ -2761,10 +2762,10 @@ async fn qbit_torrent_info(state: &AppState, e: &rt_session::TorrentEntry) -> Qb
         seen_complete: e.completed_at.map(|t| t as i64).unwrap_or(-1),
         time_active: 0,
         seeding_time: 0,
-        num_leechs: 0,
-        num_seeds: 0,
-        dlspeed: 0,
-        upspeed: 0,
+        num_leechs: swarm.leechers,
+        num_seeds: swarm.seeds,
+        dlspeed: swarm.download_rate,
+        upspeed: swarm.upload_rate,
         dl_limit: limits.download_limit.unwrap_or(-1),
         up_limit: limits.upload_limit.unwrap_or(-1),
         eta: -1,
@@ -2792,6 +2793,39 @@ async fn qbit_torrent_info(state: &AppState, e: &rt_session::TorrentEntry) -> Qb
             String::new()
         },
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct QbitSwarmProjection {
+    seeds: u32,
+    leechers: u32,
+    download_rate: i64,
+    upload_rate: i64,
+}
+
+async fn qbit_swarm_projection(state: &AppState, info_hash: &str) -> QbitSwarmProjection {
+    let Some(engine) = &state.engine else {
+        return QbitSwarmProjection::default();
+    };
+    engine
+        .torrent_peers(info_hash.to_owned())
+        .await
+        .map(|peers| qbit_swarm_from_peers(&peers))
+        .unwrap_or_default()
+}
+
+fn qbit_swarm_from_peers(peers: &[EnginePeerSnapshot]) -> QbitSwarmProjection {
+    let mut projection = QbitSwarmProjection::default();
+    for peer in peers {
+        if peer.progress >= 1.0 {
+            projection.seeds = projection.seeds.saturating_add(1);
+        } else {
+            projection.leechers = projection.leechers.saturating_add(1);
+        }
+        projection.download_rate = projection.download_rate.saturating_add(peer.download_rate);
+        projection.upload_rate = projection.upload_rate.saturating_add(peer.upload_rate);
+    }
+    projection
 }
 
 fn qbit_magnet_uri(info_hash: &str) -> String {
@@ -4844,6 +4878,47 @@ mod tests {
                 "up_speed",
                 "uploaded",
             ],
+        );
+    }
+
+    #[test]
+    fn qbit_swarm_projection_counts_live_peers_and_rates() {
+        let seed = EnginePeerSnapshot {
+            addr: "127.0.0.1:6881".parse().unwrap(),
+            client: "seed".to_owned(),
+            choked: false,
+            upload_choked: false,
+            interested: false,
+            pieces: 10,
+            pieces_total: 10,
+            progress: 1.0,
+            download_rate: 100,
+            upload_rate: 1_000,
+            downloaded: 10,
+            uploaded: 20,
+        };
+        let leecher = EnginePeerSnapshot {
+            addr: "127.0.0.2:6881".parse().unwrap(),
+            client: "leecher".to_owned(),
+            choked: false,
+            upload_choked: false,
+            interested: true,
+            pieces: 3,
+            pieces_total: 10,
+            progress: 0.3,
+            download_rate: 200,
+            upload_rate: 2_000,
+            downloaded: 30,
+            uploaded: 40,
+        };
+        assert_eq!(
+            qbit_swarm_from_peers(&[seed, leecher]),
+            QbitSwarmProjection {
+                seeds: 1,
+                leechers: 1,
+                download_rate: 300,
+                upload_rate: 3_000,
+            }
         );
     }
 
