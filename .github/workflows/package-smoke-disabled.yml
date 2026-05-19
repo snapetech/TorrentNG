@@ -7,6 +7,8 @@ on:
         description: Existing release tag to validate
         required: true
 
+permissions: {}
+
 jobs:
   disabled:
     if: false
