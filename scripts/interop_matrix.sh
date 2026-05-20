@@ -233,7 +233,7 @@ capture_artifacts() {
     compose logs --no-color --tail=250 "$service" >"$WORKDIR/logs/$STAMP/$service.log" 2>&1 || true
   done
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/health" >"$WORKDIR/logs/$STAMP/rust-health.json" 2>/dev/null || true
-  curl --max-time "$CURL_MAX_TIME" -fsS "$(client_url torrentngd)/metrics" >"$WORKDIR/logs/$STAMP/rust-metrics.txt" 2>/dev/null || true
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/metrics" >"$WORKDIR/logs/$STAMP/rust-metrics.txt" 2>/dev/null || true
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/v1/torrents" >"$WORKDIR/logs/$STAMP/rust-torrents.json" 2>/dev/null || true
 }
 
@@ -601,7 +601,7 @@ poll_rust_compat() {
     printf '{"endpoint":"health","ok":'
     curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/health" >/dev/null && printf 'true}\n' || printf 'false}\n'
     printf '{"endpoint":"metrics","ok":'
-    curl --max-time "$CURL_MAX_TIME" -fsS "$(client_url torrentngd)/metrics" >/dev/null && printf 'true}\n' || printf 'false}\n'
+    curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/metrics" >/dev/null && printf 'true}\n' || printf 'false}\n'
     printf '{"endpoint":"qbit_info","ok":'
     curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/qb/v2/torrents/info" >/dev/null && printf 'true}\n' || printf 'false}\n'
     printf '{"endpoint":"qbit_sync","ok":'
@@ -678,7 +678,7 @@ rust_observed_peers() {
 
 rust_metric_value() {
   local metric="$1"
-  curl --max-time "$CURL_MAX_TIME" -fsS "$(client_url torrentngd)/metrics" |
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/metrics" |
     awk -v metric="$metric" '$1 == metric { value=$2 } END { print value + 0 }'
 }
 
@@ -950,7 +950,7 @@ run_rust_api_facade_case() {
   log "running extended local case rust-api-facades"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/health" |
     jq -e '.ready == true and .status == "ok"' >/dev/null || status="FAIL"
-  curl --max-time "$CURL_MAX_TIME" -fsS "$(client_url torrentngd)/metrics" |
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/metrics" |
     grep -q '^# HELP' || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/v1/torrents" |
     jq -e 'type == "array"' >/dev/null || status="FAIL"

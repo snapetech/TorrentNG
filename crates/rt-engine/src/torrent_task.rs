@@ -1835,6 +1835,10 @@ impl TorrentTask {
         let complete = self
             .picker
             .block_received(block.piece as usize, block.offset);
+        // Persist progress periodically so amount_left stays current even
+        // before the first piece verifies. The picker tracks partial piece
+        // bytes so progress is visible as blocks arrive.
+        self.persist_progress_throttled(false).await;
         if complete {
             match self.verify_completed_piece(block.piece).await {
                 VerifyResult::Valid => {

@@ -430,12 +430,25 @@ impl PiecePicker {
     }
 
     pub fn bytes_left(&self) -> u64 {
-        self.wanted
+        let mut left: u64 = self
+            .wanted
             .iter()
             .enumerate()
             .filter(|&(piece, wanted)| *wanted && self.enabled[piece])
             .map(|(piece, _)| self.piece_length_for(piece) as u64)
-            .sum()
+            .sum();
+        // Subtract bytes already received for in-progress pieces so progress
+        // is visible before the first piece finishes hashing.
+        for (&piece, state) in &self.in_progress {
+            if piece < self.piece_count && self.wanted[piece] && self.enabled[piece] {
+                let received_blocks: u64 = state.received.iter().filter(|r| **r).count() as u64;
+                let max_block = MAX_BLOCK_SIZE as u64;
+                let recv = received_blocks.saturating_mul(max_block);
+                let piece_len = self.piece_length_for(piece) as u64;
+                left = left.saturating_sub(recv.min(piece_len));
+            }
+        }
+        left
     }
 
     pub fn have_pieces(&self) -> Vec<bool> {
@@ -531,6 +544,19 @@ mod tests {
         p.mark_have(0);
         p.mark_have(3);
         assert_eq!(p.bytes_left(), 20);
+    }
+
+    #[test]
+    fn bytes_left_subtracts_partially_received_blocks() {
+        let mut p = picker_1piece(MAX_BLOCK_SIZE * 3 + 1);
+        p.availability.add_have(0);
+        let all = peer_has_all(1);
+        let req = p.pick(&all).unwrap();
+        let begin = req.begin;
+        p.block_received(0, begin); // 1 block of ~16KB received
+        // piece length = MAX_BLOCK_SIZE*3+1 = 49153, one block = 16384
+        let expected = (MAX_BLOCK_SIZE * 3 + 1) as u64 - MAX_BLOCK_SIZE as u64;
+        assert_eq!(p.bytes_left(), expected);
     }
 
     #[test]
