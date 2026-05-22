@@ -112,7 +112,7 @@ jobs:
           fi
 
       - name: Upload native artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: native-${{ matrix.suffix }}
           path: dist/*
@@ -221,7 +221,7 @@ jobs:
           tar -czf "dist/torrentng-deploy-${tag}.tar.gz" deploy docs README.md LICENSE
 
       - name: Upload shared artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: shared-linux-assets
           path: dist/*
