@@ -40,7 +40,11 @@ impl Default for OutboundEgressPolicy {
 }
 
 impl OutboundEgressPolicy {
-    pub fn validate_url(&self, kind: OutboundTargetKind, url: &Url) -> Result<(), EgressPolicyError> {
+    pub fn validate_url(
+        &self,
+        kind: OutboundTargetKind,
+        url: &Url,
+    ) -> Result<(), EgressPolicyError> {
         let scheme = url.scheme();
         match kind {
             OutboundTargetKind::Tracker => match scheme {

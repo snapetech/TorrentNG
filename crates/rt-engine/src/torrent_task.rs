@@ -53,7 +53,6 @@ use rt_tracker::{
 };
 use rt_utp::UtpStream;
 
-use crate::peer_id::OUR_PEER_ID;
 use crate::{
     EngineGlobalLimits, EnginePeerSnapshot, EngineTorrentLimits, EngineWebseedSnapshot,
     TorrentRuntimeStats,
@@ -945,7 +944,7 @@ impl TorrentTask {
         let (uploaded, downloaded) = self.transfer_snapshot().await;
         let req = AnnounceRequest {
             info_hash: InfoHash::V1(self.meta.info_hash),
-            peer_id: OUR_PEER_ID,
+            peer_id: crate::peer_id::our_peer_id(),
             port: self.listen_port,
             uploaded,
             downloaded,
@@ -957,7 +956,7 @@ impl TorrentTask {
         let url = req.to_http_query(tracker_url)?;
         let response = reqwest::Client::builder()
             .timeout(self.http_timeout)
-            .user_agent(crate::peer_id::USER_AGENT)
+            .user_agent(crate::peer_id::user_agent())
             .build()
             .map_err(|e| TrackerError::Network(e.to_string()))?
             .get(url)
@@ -1045,7 +1044,7 @@ impl TorrentTask {
         let (uploaded, downloaded) = self.transfer_snapshot().await;
         let req = AnnounceRequest {
             info_hash: InfoHash::V1(self.meta.info_hash),
-            peer_id: OUR_PEER_ID,
+            peer_id: crate::peer_id::our_peer_id(),
             port: self.listen_port,
             uploaded,
             downloaded,
@@ -1088,7 +1087,7 @@ impl TorrentTask {
         let url = to_http_scrape_url(tracker_url, InfoHash::V1(self.meta.info_hash))?;
         let resp = reqwest::Client::new()
             .get(url)
-            .header(reqwest::header::USER_AGENT, crate::peer_id::USER_AGENT)
+            .header(reqwest::header::USER_AGENT, crate::peer_id::user_agent())
             .timeout(self.http_timeout)
             .send()
             .await
@@ -3373,7 +3372,7 @@ async fn run_outgoing_peer(
 
     let our_hs = Handshake {
         info_hash,
-        peer_id: OUR_PEER_ID,
+        peer_id: crate::peer_id::our_peer_id(),
         reserved: ExtensionFlags::with_extension_protocol(),
     };
     // Send our handshake as raw bytes before the codec takes over.
@@ -3430,7 +3429,7 @@ async fn run_established_utp_peer(
 ) -> anyhow::Result<()> {
     let our_hs = Handshake {
         info_hash,
-        peer_id: OUR_PEER_ID,
+        peer_id: crate::peer_id::our_peer_id(),
         reserved: ExtensionFlags::with_extension_protocol(),
     };
     stream.write_all(&our_hs.encode()).await?;
@@ -3472,7 +3471,7 @@ async fn run_incoming_peer(
 
     let our_hs = Handshake {
         info_hash,
-        peer_id: OUR_PEER_ID,
+        peer_id: crate::peer_id::our_peer_id(),
         reserved: ExtensionFlags::with_extension_protocol(),
     };
     {
@@ -3505,7 +3504,7 @@ async fn run_incoming_utp_peer(
 ) -> anyhow::Result<()> {
     let our_hs = Handshake {
         info_hash,
-        peer_id: OUR_PEER_ID,
+        peer_id: crate::peer_id::our_peer_id(),
         reserved: ExtensionFlags::with_extension_protocol(),
     };
     stream.write_all(&our_hs.encode()).await?;

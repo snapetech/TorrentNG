@@ -2156,6 +2156,8 @@ dependencies = [
  "rt-migrate",
  "rt-session",
  "rusqlite",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tower-http 0.5.2",

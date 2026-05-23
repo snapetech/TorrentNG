@@ -779,7 +779,9 @@ fn dry_run_session(
         }
         if extension_is(&path, resume_extensions) {
             if let Some(stem) = path.file_stem().and_then(|value| value.to_str()) {
-                resume_by_stem.insert(stem.to_owned(), path.clone());
+                for key in resume_sidecar_keys(stem) {
+                    resume_by_stem.insert(key, path.clone());
+                }
             }
         }
     }
@@ -804,6 +806,17 @@ fn dry_run_session(
         auxiliary_artifacts,
         skipped,
     })
+}
+
+fn resume_sidecar_keys(stem: &str) -> Vec<String> {
+    let mut keys = vec![stem.to_owned(), stem.to_ascii_lowercase()];
+    if let Some(torrent_stem) = stem.strip_suffix(".torrent") {
+        keys.push(torrent_stem.to_owned());
+        keys.push(torrent_stem.to_ascii_lowercase());
+    }
+    keys.sort();
+    keys.dedup();
+    keys
 }
 
 fn migration_torrent_from_path(
@@ -3000,6 +3013,35 @@ mod tests {
             .to_fastresume_state(ImportPolicy::RequireVerification)
             .expect("fastresume state");
         assert_eq!(verify.pieces, vec![PieceState::Unknown]);
+    }
+
+    #[test]
+    fn rtorrent_pairs_hash_torrent_rtorrent_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let torrent_path = dir.path().join("sample.torrent");
+        let info_hash = write_fixture_torrent(&torrent_path);
+        let info_hash_hex = hex_lower(&info_hash);
+        let upper = info_hash_hex.to_ascii_uppercase();
+        std::fs::rename(&torrent_path, dir.path().join(format!("{upper}.torrent"))).unwrap();
+        std::fs::write(dir.path().join("sample.bin"), [1u8; 12]).unwrap();
+        let mut resume = vec![
+            (b"complete".as_slice(), BValue::Int(1)),
+            (
+                b"directory".as_slice(),
+                BValue::Bytes(dir.path().as_os_str().as_encoded_bytes()),
+            ),
+        ];
+        resume.sort_by(|a, b| a.0.cmp(b.0));
+        let resume_path = dir.path().join(format!("{upper}.torrent.rtorrent"));
+        std::fs::write(&resume_path, encode(&BValue::Dict(resume))).unwrap();
+
+        let plan = dry_run_rtorrent_session(dir.path()).unwrap();
+        let torrent = &plan.torrents[0];
+
+        assert_eq!(torrent.info_hash, info_hash_hex);
+        assert_eq!(torrent.resume_path.as_deref(), Some(resume_path.as_path()));
+        assert_eq!(torrent.resume_confidence, ResumeConfidence::Trusted);
+        assert_eq!(torrent.completed, Some(true));
     }
 
     #[test]

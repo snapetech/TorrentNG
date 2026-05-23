@@ -5,7 +5,7 @@ log_level = "info"
 shutdown_timeout_secs = 10
 
 [network]
-listen_port = 6881
+listen_port = 44444
 max_peers = 200
 upload_rate_limit = 0
 download_rate_limit = 0

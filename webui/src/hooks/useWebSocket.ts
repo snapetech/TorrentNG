@@ -45,6 +45,7 @@ export function useWebSocket(onStats?: (stats: LiveStats) => void, enabled = tru
     let reconnectTimer: ReturnType<typeof setTimeout>
     let closed = false
     let reconnectDelayMs = 3000
+    let eventSource: EventSource | null = null
 
     function scheduleTorrentInvalidation(hash?: string) {
       if (hash) detailHashes.current.add(hash)
@@ -67,7 +68,87 @@ export function useWebSocket(onStats?: (stats: LiveStats) => void, enabled = tru
       }
     }
 
-    function connect() {
+    function handleEvent(msg: WsEvent) {
+      if (msg.type === 'stats') {
+        statsRef.current?.({
+          upload_speed: msg.upload_speed ?? 0,
+          download_speed: msg.download_speed ?? 0,
+          upload_total: msg.upload_total,
+          download_total: msg.download_total,
+          connections: msg.connections,
+          pending_connections: msg.pending_connections,
+          listen_port: msg.listen_port,
+          firewall: msg.firewall,
+          dht: msg.dht,
+          pex: msg.pex,
+        })
+        return
+      }
+      switch (msg.type) {
+        case 'torrent_added':
+        case 'torrent_removed':
+        case 'torrent_updated':
+          scheduleTorrentInvalidation(msg.hash)
+          break
+        case 'categories_updated':
+          qc.invalidateQueries({ queryKey: ['categories'] })
+          scheduleTorrentInvalidation()
+          break
+        case 'tags_updated':
+          qc.invalidateQueries({ queryKey: ['tags'] })
+          scheduleTorrentInvalidation()
+          break
+        case 'tracker_health_updated':
+          qc.invalidateQueries({ queryKey: ['tracker-health'] })
+          break
+        case 'storage_updated':
+          qc.invalidateQueries({ queryKey: ['storage'] })
+          break
+        case 'ratio_groups_updated':
+          qc.invalidateQueries({ queryKey: ['ratio-groups'] })
+          break
+        case 'workflows_updated':
+          qc.invalidateQueries({ queryKey: ['workflows'] })
+          break
+        case 'workflow_runs_updated':
+          qc.invalidateQueries({ queryKey: ['workflow-runs'] })
+          break
+        case 'rss_rules_updated':
+          qc.invalidateQueries({ queryKey: ['rss-rules'] })
+          break
+        case 'saved_views_updated':
+          qc.invalidateQueries({ queryKey: ['saved-views'] })
+          break
+      }
+    }
+
+    function connectSse() {
+      const source = new EventSource('/api/v1/events', { withCredentials: true })
+      eventSource = source
+      source.onopen = () => {
+        reconnectDelayMs = 3000
+      }
+      source.addEventListener('torrent_delta', (e) => {
+        try {
+          const msg = JSON.parse((e as MessageEvent).data) as { torrents?: Array<{ info_hash?: string }>; removed?: string[] }
+          if (msg.torrents?.length || msg.removed?.length) {
+            for (const torrent of msg.torrents ?? []) scheduleTorrentInvalidation(torrent.info_hash)
+            for (const hash of msg.removed ?? []) scheduleTorrentInvalidation(hash)
+          }
+        } catch {
+          // malformed event - ignore
+        }
+      })
+      source.onerror = () => {
+        source.close()
+        if (!closed) {
+          reconnectTimer = setTimeout(connectSse, reconnectDelayMs)
+          reconnectDelayMs = Math.min(reconnectDelayMs * 2, 30_000)
+        }
+      }
+    }
+
+    function connectWebSocket() {
       const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`
       const socket = new WebSocket(url)
       ws.current = socket
@@ -77,72 +158,25 @@ export function useWebSocket(onStats?: (stats: LiveStats) => void, enabled = tru
 
       socket.onmessage = (e) => {
         try {
-          const msg: WsEvent = JSON.parse(e.data)
-          if (msg.type === 'stats') {
-            statsRef.current?.({
-              upload_speed: msg.upload_speed ?? 0,
-              download_speed: msg.download_speed ?? 0,
-              upload_total: msg.upload_total,
-              download_total: msg.download_total,
-              connections: msg.connections,
-              pending_connections: msg.pending_connections,
-              listen_port: msg.listen_port,
-              firewall: msg.firewall,
-              dht: msg.dht,
-              pex: msg.pex,
-            })
-            return
-          }
-          switch (msg.type) {
-            case 'torrent_added':
-            case 'torrent_removed':
-            case 'torrent_updated':
-              scheduleTorrentInvalidation(msg.hash)
-              break
-            case 'categories_updated':
-              qc.invalidateQueries({ queryKey: ['categories'] })
-              scheduleTorrentInvalidation()
-              break
-            case 'tags_updated':
-              qc.invalidateQueries({ queryKey: ['tags'] })
-              scheduleTorrentInvalidation()
-              break
-            case 'tracker_health_updated':
-              qc.invalidateQueries({ queryKey: ['tracker-health'] })
-              break
-            case 'storage_updated':
-              qc.invalidateQueries({ queryKey: ['storage'] })
-              break
-            case 'ratio_groups_updated':
-              qc.invalidateQueries({ queryKey: ['ratio-groups'] })
-              break
-            case 'workflows_updated':
-              qc.invalidateQueries({ queryKey: ['workflows'] })
-              break
-            case 'workflow_runs_updated':
-              qc.invalidateQueries({ queryKey: ['workflow-runs'] })
-              break
-            case 'rss_rules_updated':
-              qc.invalidateQueries({ queryKey: ['rss-rules'] })
-              break
-            case 'saved_views_updated':
-              qc.invalidateQueries({ queryKey: ['saved-views'] })
-              break
-          }
+          handleEvent(JSON.parse(e.data) as WsEvent)
         } catch {
-          // malformed event — ignore
+          // malformed event - ignore
         }
       }
 
       socket.onclose = () => {
         if (!closed) {
-          reconnectTimer = setTimeout(connect, reconnectDelayMs)
+          reconnectTimer = setTimeout(connectWebSocket, reconnectDelayMs)
           reconnectDelayMs = Math.min(reconnectDelayMs * 2, 30_000)
         }
       }
     }
 
-    connect()
+    if ('EventSource' in window) {
+      connectSse()
+    } else {
+      connectWebSocket()
+    }
     return () => {
       closed = true
       clearTimeout(reconnectTimer)
@@ -151,6 +185,7 @@ export function useWebSocket(onStats?: (stats: LiveStats) => void, enabled = tru
       torrentsInvalidationTimer.current = null
       detailInvalidationTimer.current = null
       detailHashes.current.clear()
+      eventSource?.close()
       ws.current?.close()
     }
   }, [qc, enabled])

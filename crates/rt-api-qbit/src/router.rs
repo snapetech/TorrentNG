@@ -26,7 +26,10 @@ async fn qbit_auth_guard(
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    if state.api_tokens.is_empty() || qbit_presented_token(req.headers()).is_some_and(|token| qbit_token_allowed(&state, &token)) {
+    if state.api_tokens.is_empty()
+        || qbit_presented_token(req.headers())
+            .is_some_and(|token| qbit_token_allowed(&state, &token))
+    {
         return next.run(req).await;
     }
 

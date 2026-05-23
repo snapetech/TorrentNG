@@ -143,7 +143,7 @@ pub fn build_router(_state: AppState) -> Router<AppState> {
 
 // --- Auth ---
 
-async fn auth_login(
+pub(crate) async fn auth_login(
     State(s): State<AppState>,
     Form(f): Form<HashMap<String, String>>,
 ) -> impl IntoResponse {
@@ -172,7 +172,7 @@ async fn auth_login(
         "Fails.".into_response()
     }
 }
-async fn auth_logout() -> impl IntoResponse {
+pub(crate) async fn auth_logout() -> impl IntoResponse {
     (
         AppendHeaders([
             (

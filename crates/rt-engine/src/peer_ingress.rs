@@ -63,7 +63,11 @@ impl PeerIngressBudget {
         self.config
     }
 
-    pub fn try_begin(&self, peer_addr: SocketAddr, now: Instant) -> Result<PeerIngressPermit, PeerIngressReject> {
+    pub fn try_begin(
+        &self,
+        peer_addr: SocketAddr,
+        now: Instant,
+    ) -> Result<PeerIngressPermit, PeerIngressReject> {
         self.prune_ip_window(peer_addr.ip(), now);
         if !self.reserve_ip_slot(peer_addr.ip(), now) {
             self.rejected_ip_budget.fetch_add(1, Ordering::Relaxed);
@@ -91,7 +95,10 @@ impl PeerIngressBudget {
     }
 
     fn prune_ip_window(&self, ip: IpAddr, now: Instant) {
-        let mut per_ip = self.per_ip.lock().expect("peer ingress budget mutex poisoned");
+        let mut per_ip = self
+            .per_ip
+            .lock()
+            .expect("peer ingress budget mutex poisoned");
         if let Some(events) = per_ip.get_mut(&ip) {
             while events
                 .front()
@@ -107,7 +114,10 @@ impl PeerIngressBudget {
     }
 
     fn reserve_ip_slot(&self, ip: IpAddr, now: Instant) -> bool {
-        let mut per_ip = self.per_ip.lock().expect("peer ingress budget mutex poisoned");
+        let mut per_ip = self
+            .per_ip
+            .lock()
+            .expect("peer ingress budget mutex poisoned");
         let events = per_ip.entry(ip).or_default();
         if events.len() >= self.config.max_handshakes_per_ip.max(1) {
             return false;
@@ -126,8 +136,12 @@ pub enum PeerIngressReject {
 impl std::fmt::Display for PeerIngressReject {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PeerIngressReject::GlobalBudget => write!(f, "global inbound handshake budget exhausted"),
-            PeerIngressReject::PerIpBudget => write!(f, "per-IP inbound handshake budget exhausted"),
+            PeerIngressReject::GlobalBudget => {
+                write!(f, "global inbound handshake budget exhausted")
+            }
+            PeerIngressReject::PerIpBudget => {
+                write!(f, "per-IP inbound handshake budget exhausted")
+            }
         }
     }
 }
@@ -152,7 +166,10 @@ mod tests {
         });
         let now = Instant::now();
         let permit = budget.try_begin(addr(1), now).unwrap();
-        assert!(matches!(budget.try_begin(addr(2), now), Err(PeerIngressReject::GlobalBudget)));
+        assert!(matches!(
+            budget.try_begin(addr(2), now),
+            Err(PeerIngressReject::GlobalBudget)
+        ));
         drop(permit);
         assert!(budget.try_begin(addr(3), now).is_ok());
         assert_eq!(budget.stats().rejected_global_budget, 1);
@@ -169,7 +186,10 @@ mod tests {
         let now = Instant::now();
         let _a = budget.try_begin(addr(1), now).unwrap();
         let _b = budget.try_begin(addr(2), now).unwrap();
-        assert!(matches!(budget.try_begin(addr(3), now), Err(PeerIngressReject::PerIpBudget)));
+        assert!(matches!(
+            budget.try_begin(addr(3), now),
+            Err(PeerIngressReject::PerIpBudget)
+        ));
         assert_eq!(budget.stats().rejected_ip_budget, 1);
 
         assert!(budget

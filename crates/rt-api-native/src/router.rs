@@ -163,7 +163,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/storage", get(storage))
         .route("/api/v1/storage/plan", post(storage_preview_plan))
         .route("/api/v1/storage/execute", post(storage_execute_plan))
-        .route_layer(middleware::from_fn_with_state(state.clone(), native_auth_guard))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            native_auth_guard,
+        ))
         .with_state(state)
 }
 
@@ -175,7 +178,8 @@ async fn native_auth_guard(
     let path = req.uri().path();
     if native_public_path(path)
         || state.api_tokens.is_empty()
-        || native_presented_token(req.headers()).is_some_and(|token| native_token_allowed(&state, &token))
+        || native_presented_token(req.headers())
+            .is_some_and(|token| native_token_allowed(&state, &token))
     {
         return next.run(req).await;
     }
@@ -189,7 +193,10 @@ async fn native_auth_guard(
 }
 
 fn native_public_path(path: &str) -> bool {
-    matches!(path, "/health" | "/api/v1/auth/login" | "/api/v1/auth/logout")
+    matches!(
+        path,
+        "/health" | "/api/v1/auth/login" | "/api/v1/auth/logout"
+    )
 }
 
 fn native_token_allowed(state: &AppState, token: &str) -> bool {

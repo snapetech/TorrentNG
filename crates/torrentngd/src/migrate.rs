@@ -17,8 +17,9 @@ use rt_migrate::{
     dry_run_generic_torrent_directory_with_options, dry_run_qbittorrent_backup_with_options,
     dry_run_rtorrent_session_with_options, dry_run_tixati_config_with_options,
     dry_run_transmission_session_with_options, dry_run_utorrent_config_with_options, ImportOptions,
-    MigrationPlan, MigrationSource, PathRemap,
+    MigrationPlan, MigrationSource, MigrationTorrent, PathRemap, ResumeConfidence,
 };
+use serde::Serialize;
 
 const USAGE: &str = "\
 torrentngd migrate — import existing client state into the native engine
@@ -39,7 +40,11 @@ OPTIONS:
                        (e.g. --remap /downloads=/data)
     --default-save-path <DIR>
                        fallback save path for torrents with none recorded
+    --only-trusted     import only torrents with Trusted resume confidence
+    --only-complete    import only torrents marked completed by source state
     --report <FILE>    also write the markdown dry-run report to FILE
+    --report-json <FILE>
+                       also write a machine-readable dry-run report to FILE
     --config <FILE>    config file (else TORRENTNGD_CONFIG / defaults)
     --yes              skip the confirmation prompt with --apply
     -h, --help         show this help
@@ -62,7 +67,10 @@ pub struct MigrateArgs {
     pub policy: ImportPolicy,
     pub remaps: Vec<PathRemap>,
     pub default_save_path: Option<PathBuf>,
+    pub only_trusted: bool,
+    pub only_complete: bool,
     pub report: Option<PathBuf>,
+    pub report_json: Option<PathBuf>,
     pub config: Option<PathBuf>,
     pub assume_yes: bool,
 }
@@ -109,7 +117,10 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
     let mut policy = ImportPolicy::TrustHints;
     let mut remaps = Vec::new();
     let mut default_save_path = None;
+    let mut only_trusted = false;
+    let mut only_complete = false;
     let mut report = None;
+    let mut report_json = None;
     let mut config = None;
     let mut assume_yes = false;
 
@@ -138,7 +149,10 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
             "--default-save-path" => {
                 default_save_path = Some(PathBuf::from(value("--default-save-path")?))
             }
+            "--only-trusted" => only_trusted = true,
+            "--only-complete" => only_complete = true,
             "--report" => report = Some(PathBuf::from(value("--report")?)),
+            "--report-json" => report_json = Some(PathBuf::from(value("--report-json")?)),
             "--config" => config = Some(PathBuf::from(value("--config")?)),
             other => return Err(format!("unknown argument `{other}` (try --help)")),
         }
@@ -153,7 +167,10 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
         policy,
         remaps,
         default_save_path,
+        only_trusted,
+        only_complete,
         report,
+        report_json,
         config,
         assume_yes,
     }))
@@ -183,6 +200,79 @@ pub fn dry_run(
     }
     .with_context(|| format!("scanning {source:?} state at {}", root.display()))?;
     Ok(plan)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MigrationFilter {
+    pub only_trusted: bool,
+    pub only_complete: bool,
+}
+
+impl MigrationFilter {
+    fn enabled(self) -> bool {
+        self.only_trusted || self.only_complete
+    }
+}
+
+pub fn filter_plan(mut plan: MigrationPlan, filter: MigrationFilter) -> MigrationPlan {
+    if !filter.enabled() {
+        return plan;
+    }
+    plan.torrents.retain(|torrent| {
+        (!filter.only_trusted || torrent.resume_confidence == ResumeConfidence::Trusted)
+            && (!filter.only_complete || torrent.completed == Some(true))
+    });
+    plan
+}
+
+#[derive(Debug, Serialize)]
+struct JsonMigrationReport<'a> {
+    source: MigrationSource,
+    root: &'a Path,
+    torrent_count: usize,
+    confidence: rt_migrate::ResumeConfidenceSummary,
+    torrents: Vec<JsonMigrationTorrent<'a>>,
+}
+
+#[derive(Debug, Serialize)]
+struct JsonMigrationTorrent<'a> {
+    info_hash: &'a str,
+    name: &'a str,
+    torrent_path: &'a Path,
+    resume_path: Option<&'a Path>,
+    save_path: Option<&'a Path>,
+    completed: Option<bool>,
+    resume_confidence: ResumeConfidence,
+    warnings: &'a [String],
+}
+
+impl<'a> From<&'a MigrationTorrent> for JsonMigrationTorrent<'a> {
+    fn from(torrent: &'a MigrationTorrent) -> Self {
+        Self {
+            info_hash: &torrent.info_hash,
+            name: &torrent.name,
+            torrent_path: &torrent.torrent_path,
+            resume_path: torrent.resume_path.as_deref(),
+            save_path: torrent.save_path.as_deref(),
+            completed: torrent.completed,
+            resume_confidence: torrent.resume_confidence,
+            warnings: &torrent.warnings,
+        }
+    }
+}
+
+fn json_report(plan: &MigrationPlan) -> JsonMigrationReport<'_> {
+    JsonMigrationReport {
+        source: plan.source,
+        root: &plan.root,
+        torrent_count: plan.torrent_count(),
+        confidence: plan.resume_confidence_summary(),
+        torrents: plan
+            .torrents
+            .iter()
+            .map(JsonMigrationTorrent::from)
+            .collect(),
+    }
 }
 
 pub(crate) fn load_config(path: Option<&Path>) -> Config {
@@ -245,7 +335,13 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         added_at: now_unix(),
     };
 
-    let plan = dry_run(args.source, &args.from, &options)?;
+    let plan = filter_plan(
+        dry_run(args.source, &args.from, &options)?,
+        MigrationFilter {
+            only_trusted: args.only_trusted,
+            only_complete: args.only_complete,
+        },
+    );
     let report = plan.to_markdown();
     println!("{report}");
 
@@ -253,6 +349,13 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         std::fs::write(path, &report)
             .with_context(|| format!("writing report to {}", path.display()))?;
         println!("Report written to {}", path.display());
+    }
+    if let Some(path) = &args.report_json {
+        let json = serde_json::to_string_pretty(&json_report(&plan))
+            .context("serializing JSON migration report")?;
+        std::fs::write(path, json)
+            .with_context(|| format!("writing JSON report to {}", path.display()))?;
+        println!("JSON report written to {}", path.display());
     }
 
     let summary = plan.resume_confidence_summary();
@@ -385,8 +488,12 @@ mod tests {
             "/old=/new",
             "--default-save-path",
             "/data",
+            "--only-trusted",
+            "--only-complete",
             "--report",
             "/tmp/r.md",
+            "--report-json",
+            "/tmp/r.json",
             "--config",
             "/etc/torrentngd/config.toml",
         ]))
@@ -401,7 +508,10 @@ mod tests {
         assert_eq!(a.remaps.len(), 2);
         assert_eq!(a.remaps[0], PathRemap::new("/downloads", "/data"));
         assert_eq!(a.default_save_path, Some(PathBuf::from("/data")));
+        assert!(a.only_trusted);
+        assert!(a.only_complete);
         assert_eq!(a.report, Some(PathBuf::from("/tmp/r.md")));
+        assert_eq!(a.report_json, Some(PathBuf::from("/tmp/r.json")));
         assert_eq!(a.config, Some(PathBuf::from("/etc/torrentngd/config.toml")));
     }
 
@@ -478,5 +588,68 @@ mod tests {
             .unwrap();
         assert_eq!(summary.db.torrents, 0);
         assert!(db_path.exists());
+    }
+
+    #[test]
+    fn filter_plan_keeps_only_trusted_complete_when_requested() {
+        fn torrent(
+            hash: &str,
+            completed: Option<bool>,
+            confidence: ResumeConfidence,
+        ) -> MigrationTorrent {
+            MigrationTorrent {
+                info_hash: hash.to_owned(),
+                name: hash.to_owned(),
+                total_length: 1,
+                piece_length: 1,
+                piece_count: 1,
+                is_private: false,
+                files: Vec::new(),
+                torrent_path: PathBuf::from(format!("{hash}.torrent")),
+                resume_path: Some(PathBuf::from(format!("{hash}.rtorrent"))),
+                save_path: Some(PathBuf::from("/data")),
+                category: None,
+                tags: Vec::new(),
+                uploaded: None,
+                downloaded: None,
+                completed,
+                added_at: None,
+                completed_at: None,
+                paused: None,
+                tracker_activity: rt_migrate::TrackerActivity::default(),
+                resume_confidence: confidence,
+                fastresume: None,
+                trackers: Vec::new(),
+                warnings: Vec::new(),
+            }
+        }
+
+        let plan = MigrationPlan {
+            source: MigrationSource::RTorrent,
+            root: PathBuf::from("/session"),
+            torrents: vec![
+                torrent("trusted-complete", Some(true), ResumeConfidence::Trusted),
+                torrent("trusted-partial", Some(false), ResumeConfidence::Trusted),
+                torrent(
+                    "metadata-complete",
+                    Some(true),
+                    ResumeConfidence::MetadataOnly,
+                ),
+                torrent("unknown-complete", None, ResumeConfidence::Trusted),
+            ],
+            auxiliary_artifacts: Vec::new(),
+            skipped: Vec::new(),
+        };
+
+        let filtered = filter_plan(
+            plan,
+            MigrationFilter {
+                only_trusted: true,
+                only_complete: true,
+            },
+        );
+
+        assert_eq!(filtered.torrents.len(), 1);
+        assert_eq!(filtered.torrents[0].info_hash, "trusted-complete");
     }
 }

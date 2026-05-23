@@ -151,6 +151,15 @@ curl -H "Authorization: Bearer $TNG_API_TOKEN" http://localhost:28080/api/v1/eng
 `/api/v1/engine` reports packaged/live rTorrent versions, bundled patch provenance, rTorrent HTTP tracker-stack settings, available XMLRPC capabilities, and drift from `engine-profile/rtorrent.rc`.
 The drift gate intentionally checks only settings with stable readback commands in rTorrent `0.16.11`; set-only commands such as `protocol.encryption.set` and `dht.mode.set` remain covered by the packaged profile and source-controlled config.
 
+The Docker image declares the packaged rTorrent patches in
+`TNG_RTORRENT_PATCHES`. Production-like deployments should verify
+`d.multicall.range` and `tng.live_summary` through `/api/v1/engine/commands`
+or startup logs before relying on large-list sidecar sync. The sidecar must keep
+rTorrent's leading XMLRPC target argument on patched calls; for global calls
+that argument is the empty string, followed by the view/range parameters.
+Without it, rTorrent returns `invalid target`, torrent-list sync fails, and the
+WebUI reports the backend as disconnected.
+
 For VPN-backed public DHT/peer reachability, TorrentNG can consume the same
 forwarded-port state contract used by the slskdN VPN agent. The adapter reads
 `/var/lib/slskdN-vpn/pf*.env`, `/etc/slskdN-vpn/static-forwards/pf*.env`, or a

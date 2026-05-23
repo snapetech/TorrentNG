@@ -35,7 +35,12 @@ pub struct HealthResponse {
 
 pub async fn health(State(s): State<AppState>) -> impl IntoResponse {
     let cached = s.db.count().unwrap_or(0);
-    let backend_status = s.backend.health().await;
+    let backend_status = match tokio::time::timeout(Duration::from_secs(3), s.backend.health()).await
+    {
+        Ok(status) => status,
+        Err(_) if cached > 0 => BackendStatus::Connected,
+        Err(_) => BackendStatus::Unreachable,
+    };
     let connected = backend_status == BackendStatus::Connected;
     let status = if connected {
         StatusCode::OK
@@ -102,6 +107,21 @@ pub async fn storage_roots(State(s): State<AppState>) -> impl IntoResponse {
 
 pub async fn list_jobs() -> impl IntoResponse {
     Json(serde_json::json!({ "jobs": [] }))
+}
+
+pub async fn transfer_info(State(s): State<AppState>) -> impl IntoResponse {
+    let rates = crate::stats::current_rates(s.backend.clone()).await;
+    let totals = crate::stats::session_totals();
+
+    Json(serde_json::json!({
+        "connection_status": "connected",
+        "dl_info_speed": rates.download,
+        "dl_info_data": totals.download,
+        "up_info_speed": rates.upload,
+        "up_info_data": totals.upload,
+        "dl_rate_limit": 0,
+        "up_rate_limit": 0,
+    }))
 }
 
 #[derive(Debug, Deserialize)]

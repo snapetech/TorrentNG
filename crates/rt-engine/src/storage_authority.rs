@@ -6,12 +6,16 @@ pub struct ServerStorageRoots {
 }
 
 impl ServerStorageRoots {
-    pub fn from_configured_paths(paths: impl IntoIterator<Item = PathBuf>) -> Result<Self, StorageAuthorityError> {
+    pub fn from_configured_paths(
+        paths: impl IntoIterator<Item = PathBuf>,
+    ) -> Result<Self, StorageAuthorityError> {
         let mut roots = Vec::new();
         for path in paths {
-            let canonical = std::fs::canonicalize(&path).map_err(|source| StorageAuthorityError::InvalidRoot {
-                path: path.clone(),
-                source: source.to_string(),
+            let canonical = std::fs::canonicalize(&path).map_err(|source| {
+                StorageAuthorityError::InvalidRoot {
+                    path: path.clone(),
+                    source: source.to_string(),
+                }
             })?;
             if !roots.iter().any(|existing| existing == &canonical) {
                 roots.push(canonical);
@@ -41,9 +45,15 @@ pub enum StorageAuthorityError {
 impl std::fmt::Display for StorageAuthorityError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            StorageAuthorityError::NoConfiguredRoots => write!(f, "no configured storage roots are available for execution"),
+            StorageAuthorityError::NoConfiguredRoots => {
+                write!(f, "no configured storage roots are available for execution")
+            }
             StorageAuthorityError::InvalidRoot { path, source } => {
-                write!(f, "invalid configured storage root {}: {source}", path.display())
+                write!(
+                    f,
+                    "invalid configured storage root {}: {source}",
+                    path.display()
+                )
             }
         }
     }
@@ -60,8 +70,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let roots = ServerStorageRoots::from_configured_paths([
             dir.path().to_path_buf(),
-            dir.path().join(".")
-        ]).unwrap();
+            dir.path().join("."),
+        ])
+        .unwrap();
         assert_eq!(roots.roots().len(), 1);
         assert_eq!(roots.roots()[0], std::fs::canonicalize(dir.path()).unwrap());
     }

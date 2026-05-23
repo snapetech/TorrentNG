@@ -554,7 +554,7 @@ mod tests {
         let req = p.pick(&all).unwrap();
         let begin = req.begin;
         p.block_received(0, begin); // 1 block of ~16KB received
-        // piece length = MAX_BLOCK_SIZE*3+1 = 49153, one block = 16384
+                                    // piece length = MAX_BLOCK_SIZE*3+1 = 49153, one block = 16384
         let expected = (MAX_BLOCK_SIZE * 3 + 1) as u64 - MAX_BLOCK_SIZE as u64;
         assert_eq!(p.bytes_left(), expected);
     }

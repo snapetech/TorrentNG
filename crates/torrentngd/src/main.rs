@@ -196,7 +196,8 @@ async fn daemon_auth_guard(
 ) -> Response {
     if api_tokens.is_empty()
         || daemon_public_path(req.uri().path())
-        || daemon_presented_token(req.headers()).is_some_and(|token| api_tokens.iter().any(|allowed| allowed == &token))
+        || daemon_presented_token(req.headers())
+            .is_some_and(|token| api_tokens.iter().any(|allowed| allowed == &token))
     {
         return next.run(req).await;
     }
@@ -210,11 +211,16 @@ async fn daemon_auth_guard(
 }
 
 fn daemon_public_path(path: &str) -> bool {
-    matches!(path, "/health" | "/api/v1/auth/login" | "/api/v1/auth/logout")
+    matches!(
+        path,
+        "/health" | "/api/v1/auth/login" | "/api/v1/auth/logout"
+    ) || is_webui_path(path)
 }
 
 fn daemon_presented_token(headers: &HeaderMap) -> Option<String> {
-    bearer_token(headers).or_else(|| session_cookie(headers, "tng_session")).or_else(|| session_cookie(headers, "SID"))
+    bearer_token(headers)
+        .or_else(|| session_cookie(headers, "tng_session"))
+        .or_else(|| session_cookie(headers, "SID"))
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<String> {
@@ -303,6 +309,10 @@ fn skip_request_log(path: &str) -> bool {
         || is_static_asset_path(path)
 }
 
+fn is_webui_path(path: &str) -> bool {
+    !path.starts_with("/api/") && path != "/metrics" && path != "/ws"
+}
+
 fn is_static_asset_path(path: &str) -> bool {
     matches!(
         path.rsplit_once('.').map(|(_, ext)| ext),
@@ -312,7 +322,7 @@ fn is_static_asset_path(path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{request_id, skip_request_log, static_dir};
+    use super::{daemon_public_path, request_id, skip_request_log, static_dir};
     use axum::http::{HeaderMap, HeaderValue};
 
     #[test]
@@ -331,6 +341,31 @@ mod tests {
         }
         assert!(!skip_request_log("/api/v1/torrents"));
         assert!(!skip_request_log("/api/qb/v2/log/main"));
+    }
+
+    #[test]
+    fn daemon_auth_allows_webui_but_keeps_api_private() {
+        for path in [
+            "/",
+            "/index.html",
+            "/assets/app.js",
+            "/favicon.ico",
+            "/torrents/abc123",
+            "/health",
+            "/api/v1/auth/login",
+            "/api/v1/auth/logout",
+        ] {
+            assert!(daemon_public_path(path), "{path}");
+        }
+
+        for path in [
+            "/api/v1/torrents",
+            "/api/qb/v2/torrents/info",
+            "/metrics",
+            "/ws",
+        ] {
+            assert!(!daemon_public_path(path), "{path}");
+        }
     }
 
     #[test]

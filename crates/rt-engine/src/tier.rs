@@ -128,7 +128,8 @@ impl CompactPieceBitmap {
         if pieces.len() != self.piece_count as usize {
             return Err(format!(
                 "piece bitfield has {} pieces, expected {}",
-                pieces.len(), self.piece_count
+                pieces.len(),
+                self.piece_count
             ));
         }
         self.bytes.fill(0);
@@ -677,7 +678,11 @@ mod tests {
         assert_eq!(bitmap.complete_pieces(), 2);
         assert_eq!(bitmap.to_bitfield()[9], true);
 
-        bitmap.set_all_from_bitfield(&[true, false, true, false, true, false, true, false, true, false]).unwrap();
+        bitmap
+            .set_all_from_bitfield(&[
+                true, false, true, false, true, false, true, false, true, false,
+            ])
+            .unwrap();
         assert_eq!(bitmap.complete_pieces(), 5);
         assert_eq!(bitmap.bytes(), &[0b1010_1010, 0b1000_0000]);
         assert!(bitmap.set_all_from_bitfield(&[true]).is_err());

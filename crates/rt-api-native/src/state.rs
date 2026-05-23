@@ -35,7 +35,7 @@ impl AppState {
             workflows: Arc::new(RwLock::new(BTreeMap::new())),
             workflow_runs: Arc::new(RwLock::new(Vec::new())),
             rss_rules: Arc::new(RwLock::new(BTreeMap::new())),
-            user_agent: Arc::new(RwLock::new(rt_engine::peer_id::USER_AGENT.to_owned())),
+            user_agent: Arc::new(RwLock::new(rt_engine::peer_id::user_agent().to_owned())),
         }
     }
 
@@ -51,7 +51,7 @@ impl AppState {
             workflows: Arc::new(RwLock::new(BTreeMap::new())),
             workflow_runs: Arc::new(RwLock::new(Vec::new())),
             rss_rules: Arc::new(RwLock::new(BTreeMap::new())),
-            user_agent: Arc::new(RwLock::new(rt_engine::peer_id::USER_AGENT.to_owned())),
+            user_agent: Arc::new(RwLock::new(rt_engine::peer_id::user_agent().to_owned())),
         }
     }
 
@@ -67,7 +67,7 @@ impl AppState {
             workflows: Arc::new(RwLock::new(BTreeMap::new())),
             workflow_runs: Arc::new(RwLock::new(Vec::new())),
             rss_rules: Arc::new(RwLock::new(BTreeMap::new())),
-            user_agent: Arc::new(RwLock::new(rt_engine::peer_id::USER_AGENT.to_owned())),
+            user_agent: Arc::new(RwLock::new(rt_engine::peer_id::user_agent().to_owned())),
         }
     }
 
@@ -83,7 +83,7 @@ impl AppState {
             workflows: Arc::new(RwLock::new(BTreeMap::new())),
             workflow_runs: Arc::new(RwLock::new(Vec::new())),
             rss_rules: Arc::new(RwLock::new(BTreeMap::new())),
-            user_agent: Arc::new(RwLock::new(rt_engine::peer_id::USER_AGENT.to_owned())),
+            user_agent: Arc::new(RwLock::new(rt_engine::peer_id::user_agent().to_owned())),
         }
     }
 
@@ -103,7 +103,7 @@ impl AppState {
             workflows: Arc::new(RwLock::new(BTreeMap::new())),
             workflow_runs: Arc::new(RwLock::new(Vec::new())),
             rss_rules: Arc::new(RwLock::new(BTreeMap::new())),
-            user_agent: Arc::new(RwLock::new(rt_engine::peer_id::USER_AGENT.to_owned())),
+            user_agent: Arc::new(RwLock::new(rt_engine::peer_id::user_agent().to_owned())),
         }
     }
 }

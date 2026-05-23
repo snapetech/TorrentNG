@@ -70,7 +70,10 @@ pub async fn require_auth(
     }
 
     // qBit compat login endpoint is always open
-    if path.starts_with("/api/qb/v2/auth/") || path.starts_with("/api/v2/auth/") {
+    if path.starts_with("/api/v1/auth/")
+        || path.starts_with("/api/qb/v2/auth/")
+        || path.starts_with("/api/v2/auth/")
+    {
         return next.run(req).await;
     }
 

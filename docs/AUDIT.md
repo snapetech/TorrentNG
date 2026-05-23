@@ -56,6 +56,14 @@ rTorrent 0.16.9 introduced a trusted/untrusted XMLRPC connection model. Connecti
 | Upstream impact | ⚠️ | rTorrent 0.16.11 initializes libtorrent's HTTP user-agent internally, but does not publish XMLRPC commands for reading or changing it |
 | TorrentNG fix | ✅ | Docker builds apply `deploy/docker/patches/rtorrent-0.16.11-user-agent-command.patch`, which wires the existing libtorrent getter/setter into rTorrent's XMLRPC command map |
 
+### Patched bounded multicall commands
+
+| Field | Status | Notes |
+|---|---|---|
+| Runtime support | ✅ | Packaged images expose `d.multicall.range` and `tng.live_summary` from `deploy/docker/patches/rtorrent-0.16.11-multicall-range.patch` |
+| Sidecar calling convention | ✅ | These calls still use rTorrent's normal leading target argument. For global calls the sidecar must send an empty string as argument 0, followed by the view/range parameters. |
+| Regression coverage | ✅ | `sidecar/src/rtorrent/torrents.rs` has tests that assert bounded list, nonzero-rate, and live-summary calls keep the required empty target argument. Removing it makes rTorrent return `invalid target` and the sidecar reports backend disconnected. |
+
 ### XMLRPC parsererror on torrent list
 
 **Symptom:** ruTorrent shows "Bad response from server: (200 [parsererror,list])" (ruTorrent#2977).

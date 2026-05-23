@@ -746,7 +746,10 @@ mod tests {
         let raw = single_file_torrent("bad.bin", 1024, -1, None);
         assert!(matches!(
             parse_torrent(&raw),
-            Err(MetainfoError::InvalidIntegerValue { field: "piece length", value: -1 })
+            Err(MetainfoError::InvalidIntegerValue {
+                field: "piece length",
+                value: -1
+            })
         ));
     }
 
@@ -764,7 +767,10 @@ mod tests {
         let raw = single_file_torrent("bad.bin", -1, 512 * 1024, None);
         assert!(matches!(
             parse_torrent(&raw),
-            Err(MetainfoError::InvalidIntegerValue { field: "length", value: -1 })
+            Err(MetainfoError::InvalidIntegerValue {
+                field: "length",
+                value: -1
+            })
         ));
     }
 
@@ -773,7 +779,10 @@ mod tests {
         let raw = multi_file_torrent("dir", &[("bad.bin", -1)]);
         assert!(matches!(
             parse_torrent(&raw),
-            Err(MetainfoError::InvalidIntegerValue { field: "file length", value: -1 })
+            Err(MetainfoError::InvalidIntegerValue {
+                field: "file length",
+                value: -1
+            })
         ));
     }
 
@@ -834,7 +843,10 @@ mod tests {
         let raw = v2_torrent("mydir", "bad.bin", -1);
         assert!(matches!(
             parse_torrent(&raw),
-            Err(MetainfoError::InvalidIntegerValue { field: "file tree length", value: -1 })
+            Err(MetainfoError::InvalidIntegerValue {
+                field: "file tree length",
+                value: -1
+            })
         ));
     }
 

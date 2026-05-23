@@ -27,7 +27,6 @@ use tracing::{debug, warn};
 use url::Url;
 
 use crate::command::EngineCmd;
-use crate::peer_id::OUR_PEER_ID;
 use crate::torrent_task::TorrentCmd;
 
 const METADATA_PIECE_SIZE: usize = 16 * 1024;
@@ -527,7 +526,7 @@ async fn announce_http(
     let url = req.to_http_query(tracker_url)?;
     let response = reqwest::Client::builder()
         .timeout(http_timeout)
-        .user_agent(crate::peer_id::USER_AGENT)
+        .user_agent(crate::peer_id::user_agent())
         .build()
         .map_err(|e| TrackerError::Network(e.to_string()))?
         .get(url)
@@ -641,7 +640,7 @@ fn metadata_announce_request(
 ) -> AnnounceRequest {
     AnnounceRequest {
         info_hash: InfoHash::V1(info_hash),
-        peer_id: OUR_PEER_ID,
+        peer_id: crate::peer_id::our_peer_id(),
         port: listen_port,
         uploaded: 0,
         downloaded: 0,
@@ -743,7 +742,7 @@ async fn write_handshake(
     use tokio::io::AsyncWriteExt;
     let hs = Handshake {
         info_hash,
-        peer_id: OUR_PEER_ID,
+        peer_id: crate::peer_id::our_peer_id(),
         reserved: ExtensionFlags::with_extension_protocol(),
     };
     framed.get_mut().write_all(&hs.encode()).await?;
@@ -764,7 +763,7 @@ async fn read_handshake(framed: &mut Framed<TcpStream, PeerCodec>) -> anyhow::Re
 async fn write_utp_handshake(stream: &mut UtpStream, info_hash: [u8; 20]) -> anyhow::Result<()> {
     let hs = Handshake {
         info_hash,
-        peer_id: OUR_PEER_ID,
+        peer_id: crate::peer_id::our_peer_id(),
         reserved: ExtensionFlags::with_extension_protocol(),
     };
     stream.write_all(&hs.encode()).await?;

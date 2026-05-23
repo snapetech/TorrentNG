@@ -6,9 +6,9 @@ services:
       dockerfile: deploy/native/Dockerfile
     restart: unless-stopped
     ports:
-      - "8080:8080"
-      - "6881:6881"
-      - "6881:6881/udp"
+      - "28082:8080"
+      - "44444:44444"
+      - "44444:44444/udp"
     volumes:
       - ./config.toml:/etc/torrentngd/config.toml:ro
       - torrentngd-state:/var/lib/torrentngd
@@ -49,5 +49,7 @@ services:
 
 volumes:
   downloads:
+    external: true
+    name: certification_downloads
   torrentngd-state:
   grafana-data:

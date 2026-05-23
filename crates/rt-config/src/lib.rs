@@ -304,19 +304,58 @@ impl Config {
 
     /// Validate config invariants that would otherwise turn into runtime footguns.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        require(!self.daemon.api_bind.trim().is_empty(), "daemon.api_bind must not be empty")?;
-        require(self.daemon.shutdown_timeout_secs > 0, "daemon.shutdown_timeout_secs must be greater than zero")?;
-        require(self.network.max_peers > 0, "network.max_peers must be greater than zero")?;
-        require(self.network.max_incoming_handshakes > 0, "network.max_incoming_handshakes must be greater than zero")?;
-        require(self.network.max_incoming_handshakes_per_ip > 0, "network.max_incoming_handshakes_per_ip must be greater than zero")?;
-        require(self.network.incoming_handshake_window_secs > 0, "network.incoming_handshake_window_secs must be greater than zero")?;
-        require(self.network.incoming_handshake_timeout_secs > 0, "network.incoming_handshake_timeout_secs must be greater than zero")?;
-        require(!self.storage.download_dir.as_os_str().is_empty(), "storage.download_dir must not be empty")?;
-        require(self.storage.file_pool_size > 0, "storage.file_pool_size must be greater than zero")?;
-        require(self.storage.io_worker_threads > 0, "storage.io_worker_threads must be greater than zero")?;
-        require(self.storage.io_queue_depth > 0, "storage.io_queue_depth must be greater than zero")?;
-        require(self.storage.hash_worker_threads > 0, "storage.hash_worker_threads must be greater than zero")?;
-        require(self.storage.hash_queue_depth > 0, "storage.hash_queue_depth must be greater than zero")?;
+        require(
+            !self.daemon.api_bind.trim().is_empty(),
+            "daemon.api_bind must not be empty",
+        )?;
+        require(
+            self.daemon.shutdown_timeout_secs > 0,
+            "daemon.shutdown_timeout_secs must be greater than zero",
+        )?;
+        require(
+            self.network.max_peers > 0,
+            "network.max_peers must be greater than zero",
+        )?;
+        require(
+            self.network.max_incoming_handshakes > 0,
+            "network.max_incoming_handshakes must be greater than zero",
+        )?;
+        require(
+            self.network.max_incoming_handshakes_per_ip > 0,
+            "network.max_incoming_handshakes_per_ip must be greater than zero",
+        )?;
+        require(
+            self.network.incoming_handshake_window_secs > 0,
+            "network.incoming_handshake_window_secs must be greater than zero",
+        )?;
+        require(
+            self.network.incoming_handshake_timeout_secs > 0,
+            "network.incoming_handshake_timeout_secs must be greater than zero",
+        )?;
+        require(
+            !self.storage.download_dir.as_os_str().is_empty(),
+            "storage.download_dir must not be empty",
+        )?;
+        require(
+            self.storage.file_pool_size > 0,
+            "storage.file_pool_size must be greater than zero",
+        )?;
+        require(
+            self.storage.io_worker_threads > 0,
+            "storage.io_worker_threads must be greater than zero",
+        )?;
+        require(
+            self.storage.io_queue_depth > 0,
+            "storage.io_queue_depth must be greater than zero",
+        )?;
+        require(
+            self.storage.hash_worker_threads > 0,
+            "storage.hash_worker_threads must be greater than zero",
+        )?;
+        require(
+            self.storage.hash_queue_depth > 0,
+            "storage.hash_queue_depth must be greater than zero",
+        )?;
         require(
             self.storage.peer_read_readahead_bytes <= 64 * 1024 * 1024,
             "storage.peer_read_readahead_bytes must be <= 64MiB",
@@ -334,13 +373,22 @@ impl Config {
             "memory.pressure_critical_pct must be <= 100",
         )?;
         for (field, value) in [
-            ("memory.storage_frame_cap_mb", self.memory.storage_frame_cap_mb),
+            (
+                "memory.storage_frame_cap_mb",
+                self.memory.storage_frame_cap_mb,
+            ),
             ("memory.queued_disk_cap_mb", self.memory.queued_disk_cap_mb),
-            ("memory.piece_assembly_cap_mb", self.memory.piece_assembly_cap_mb),
+            (
+                "memory.piece_assembly_cap_mb",
+                self.memory.piece_assembly_cap_mb,
+            ),
             ("memory.peer_buffer_cap_mb", self.memory.peer_buffer_cap_mb),
             ("memory.metadata_cap_mb", self.memory.metadata_cap_mb),
         ] {
-            require(value <= self.memory.total_cap_mb, format!("{field} must be <= memory.total_cap_mb"))?;
+            require(
+                value <= self.memory.total_cap_mb,
+                format!("{field} must be <= memory.total_cap_mb"),
+            )?;
         }
         require(
             self.tracker.http_timeout_secs > 0,
@@ -351,7 +399,9 @@ impl Config {
             "tracker.udp_timeout_secs must be greater than zero",
         )?;
         require(
-            self.tracker.allow_http_trackers || self.tracker.allow_https_trackers || self.tracker.allow_udp_trackers,
+            self.tracker.allow_http_trackers
+                || self.tracker.allow_https_trackers
+                || self.tracker.allow_udp_trackers,
             "at least one tracker scheme must be enabled",
         )?;
         require(
@@ -363,7 +413,10 @@ impl Config {
             "db.wal_checkpoint_pages must be greater than zero",
         )?;
         for token in &self.auth.api_tokens {
-            require(!token.trim().is_empty(), "auth.api_tokens must not contain empty tokens")?;
+            require(
+                !token.trim().is_empty(),
+                "auth.api_tokens must not contain empty tokens",
+            )?;
         }
         Ok(())
     }

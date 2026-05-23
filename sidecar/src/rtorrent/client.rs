@@ -399,6 +399,25 @@ fn xml_escape(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+fn describe_xml_value(value: &XmlValue) -> String {
+    match value {
+        XmlValue::String(value) | XmlValue::Base64(value) => value.clone(),
+        XmlValue::Int(value) => value.to_string(),
+        XmlValue::Bool(value) => value.to_string(),
+        XmlValue::Nil => "nil".to_owned(),
+        XmlValue::Array(items) => items
+            .iter()
+            .map(describe_xml_value)
+            .collect::<Vec<_>>()
+            .join(", "),
+        XmlValue::Struct(fields) => fields
+            .iter()
+            .map(|(key, value)| format!("{key}={}", describe_xml_value(value)))
+            .collect::<Vec<_>>()
+            .join(", "),
+    }
+}
+
 // --- XMLRPC parser ---
 
 fn parse_xmlrpc_response(xml: &[u8]) -> Result<XmlValue> {
@@ -419,7 +438,13 @@ fn parse_xmlrpc_response(xml: &[u8]) -> Result<XmlValue> {
     loop {
         match reader.read_event()? {
             Event::Start(e) => match e.name().as_ref() {
-                b"fault" => bail!("XMLRPC fault returned by rTorrent"),
+                b"fault" => {
+                    let fault = parse_value(&mut reader)?;
+                    bail!(
+                        "XMLRPC fault returned by rTorrent: {}",
+                        describe_xml_value(&fault)
+                    )
+                }
                 b"params" => break,
                 _ => {}
             },

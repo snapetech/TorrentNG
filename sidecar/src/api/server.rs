@@ -47,6 +47,8 @@ pub fn build_router(state: AppState) -> Router {
 
     Router::new()
         // Native API.
+        .route("/api/v1/auth/login", post(crate::qbcompat::auth_login))
+        .route("/api/v1/auth/logout", post(crate::qbcompat::auth_logout))
         .route(
             "/api/v1/torrents",
             get(handlers::list_torrents).post(handlers::add_torrent),
@@ -101,6 +103,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/tags/{name}", delete(handlers::delete_tag))
         .route("/api/v1/bulk/{action}", post(handlers::bulk_action))
         .route("/api/v1/storage", get(handlers::storage_roots))
+        .route("/api/v1/transfer/info", get(handlers::transfer_info))
         .route("/api/v1/jobs", get(handlers::list_jobs))
         .route("/api/v1/logs", get(handlers::list_logs))
         .route("/api/v1/tracker-health", get(handlers::tracker_health))

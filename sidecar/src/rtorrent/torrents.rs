@@ -126,13 +126,7 @@ impl Client {
         offset: i64,
         limit: i64,
     ) -> Result<Vec<RawTorrent>> {
-        let mut args: Vec<XmlValue> = vec![
-            "".into(),
-            view.to_owned().into(),
-            offset.into(),
-            limit.into(),
-        ];
-        args.extend(TORRENT_FIELDS.iter().map(|&f| XmlValue::from(f)));
+        let args = bounded_range_args(view, offset, limit);
 
         let result = self
             .call_sync("d.multicall.range", &args)
@@ -147,8 +141,7 @@ impl Client {
         view: &str,
         limit: i64,
     ) -> Result<Vec<RawTorrent>> {
-        let mut args: Vec<XmlValue> = vec!["".into(), view.to_owned().into(), limit.into()];
-        args.extend(TORRENT_FIELDS.iter().map(|&f| XmlValue::from(f)));
+        let args = nonzero_rate_args(view, limit);
 
         let result = self
             .call_sync("d.multicall.nonzero_rate", &args)
@@ -159,8 +152,7 @@ impl Client {
     }
 
     pub async fn live_summary(&self, view: &str, limit: i64) -> Result<LiveSummary> {
-        let mut args: Vec<XmlValue> = vec!["".into(), view.to_owned().into(), limit.into()];
-        args.extend(TORRENT_FIELDS.iter().map(|&f| XmlValue::from(f)));
+        let args = live_summary_args(view, limit);
 
         let result = self
             .call_sync("tng.live_summary", &args)
@@ -389,6 +381,29 @@ impl Client {
     }
 }
 
+fn bounded_range_args(view: &str, offset: i64, limit: i64) -> Vec<XmlValue> {
+    let mut args: Vec<XmlValue> = vec![
+        "".into(),
+        view.to_owned().into(),
+        offset.into(),
+        limit.into(),
+    ];
+    args.extend(TORRENT_FIELDS.iter().map(|&f| XmlValue::from(f)));
+    args
+}
+
+fn nonzero_rate_args(view: &str, limit: i64) -> Vec<XmlValue> {
+    let mut args: Vec<XmlValue> = vec!["".into(), view.to_owned().into(), limit.into()];
+    args.extend(TORRENT_FIELDS.iter().map(|&f| XmlValue::from(f)));
+    args
+}
+
+fn live_summary_args(view: &str, limit: i64) -> Vec<XmlValue> {
+    let mut args: Vec<XmlValue> = vec!["".into(), view.to_owned().into(), limit.into()];
+    args.extend(TORRENT_FIELDS.iter().map(|&f| XmlValue::from(f)));
+    args
+}
+
 fn rtorrent_patch_manifest_enables_bounded_live(patches: &str) -> bool {
     patches.split(',').map(str::trim).any(|patch| {
         patch == RTORRENT_MULTICALL_RANGE_PATCH
@@ -482,7 +497,11 @@ fn base64_encode(data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::rtorrent_patch_manifest_enables_bounded_live;
+    use super::{
+        bounded_range_args, live_summary_args, nonzero_rate_args,
+        rtorrent_patch_manifest_enables_bounded_live,
+    };
+    use crate::rtorrent::XmlValue;
 
     #[test]
     fn multicall_range_patch_enables_bounded_live_features() {
@@ -506,5 +525,44 @@ mod tests {
         assert!(!rtorrent_patch_manifest_enables_bounded_live(
             "rtorrent-0.16.11-user-agent-command"
         ));
+    }
+
+    #[test]
+    fn bounded_multicall_args_keep_required_rtorrent_target() {
+        let args = bounded_range_args("main", 25, 100);
+
+        assert_eq!(str_arg(&args, 0), "");
+        assert_eq!(str_arg(&args, 1), "main");
+        assert_eq!(int_arg(&args, 2), 25);
+        assert_eq!(int_arg(&args, 3), 100);
+        assert_eq!(str_arg(&args, 4), "d.hash=");
+    }
+
+    #[test]
+    fn live_summary_args_keep_required_rtorrent_target() {
+        let args = live_summary_args("main", 100);
+
+        assert_eq!(str_arg(&args, 0), "");
+        assert_eq!(str_arg(&args, 1), "main");
+        assert_eq!(int_arg(&args, 2), 100);
+        assert_eq!(str_arg(&args, 3), "d.hash=");
+    }
+
+    #[test]
+    fn nonzero_rate_args_keep_required_rtorrent_target() {
+        let args = nonzero_rate_args("active", 50);
+
+        assert_eq!(str_arg(&args, 0), "");
+        assert_eq!(str_arg(&args, 1), "active");
+        assert_eq!(int_arg(&args, 2), 50);
+        assert_eq!(str_arg(&args, 3), "d.hash=");
+    }
+
+    fn str_arg(args: &[XmlValue], index: usize) -> &str {
+        args.get(index).and_then(XmlValue::as_str).unwrap()
+    }
+
+    fn int_arg(args: &[XmlValue], index: usize) -> i64 {
+        args.get(index).and_then(XmlValue::as_i64).unwrap()
     }
 }

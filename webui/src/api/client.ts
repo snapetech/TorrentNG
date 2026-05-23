@@ -41,6 +41,23 @@ export interface TorrentListResponse {
   torrents: TorrentSummary[]
 }
 
+interface NativeTorrentSummary {
+  info_hash: string
+  name: string
+  state: string
+  total_length: number
+  downloaded: number
+  uploaded: number
+  ratio: number
+  save_path: string
+  category: string | null
+  tags: string[]
+  added_at: number
+  completed_at: number | null
+  num_peers: number
+  num_seeds: number
+}
+
 export interface ListParams {
   filter?: string
   status?: string
@@ -65,6 +82,61 @@ async function get<T>(path: string, params?: Record<string, string | number | un
   if (res.status === 401) throw new AuthError()
   if (!res.ok) throw new Error(`API ${res.status}: ${url.pathname}`)
   return res.json()
+}
+
+function torrentStateCode(state: string): number {
+  switch (state) {
+    case 'checking': return 2
+    default: return 0
+  }
+}
+
+function normalizeNativeTorrent(t: NativeTorrentSummary): TorrentSummary {
+  const size = Number(t.total_length ?? 0)
+  const done = Number(t.downloaded ?? 0)
+  const complete = size > 0 && done >= size
+  const active = t.state === 'seeding' || t.state === 'downloading'
+  return {
+    hash: t.info_hash,
+    name: t.name,
+    size_bytes: size,
+    bytes_done: done,
+    down_rate: 0,
+    up_rate: 0,
+    up_total: Number(t.uploaded ?? 0),
+    down_total: done,
+    ratio: Math.round(Number(t.ratio ?? 0) * 1000),
+    is_active: active,
+    is_open: t.state !== 'paused' && t.state !== 'stopped',
+    complete,
+    state: torrentStateCode(t.state),
+    priority: 0,
+    category: t.category ?? '',
+    base_path: t.save_path,
+    directory: t.save_path,
+    creation_date: Number(t.added_at ?? 0),
+    timestamp_finished: Number(t.completed_at ?? 0),
+    tracker_focus: 0,
+    peers_connected: Number(t.num_peers ?? 0),
+    peers_complete: Number(t.num_seeds ?? 0),
+    message: '',
+    tracker_url: '',
+    tags: Array.isArray(t.tags) ? t.tags.join(', ') : '',
+    updated_at: Date.now(),
+  }
+}
+
+function normalizeTorrentList(body: TorrentListResponse | TorrentSummary[] | NativeTorrentSummary[], params: ListParams = {}): TorrentListResponse {
+  if (!Array.isArray(body)) return body
+  const torrents = body.map(item =>
+    'info_hash' in item ? normalizeNativeTorrent(item as NativeTorrentSummary) : item as TorrentSummary,
+  )
+  const offset = Math.max(0, Number(params.offset ?? 0))
+  const limit = params.limit === undefined ? torrents.length : Math.max(0, Number(params.limit))
+  return {
+    total: torrents.length,
+    torrents: torrents.slice(offset, offset + limit),
+  }
 }
 
 async function getRoot<T>(path: string): Promise<T> {
@@ -613,12 +685,16 @@ export const api = {
   auth: {
     login,
     logout,
-    check: (): Promise<TorrentListResponse> => get('/torrents', { limit: 1 }),
+    check: async (): Promise<TorrentListResponse> =>
+      normalizeTorrentList(await get<TorrentListResponse | TorrentSummary[] | NativeTorrentSummary[]>('/torrents', { limit: 1 }), { limit: 1 }),
   },
 
   torrents: {
-    list: (p: ListParams = {}): Promise<TorrentListResponse> =>
-      get('/torrents', p as Record<string, string | number>),
+    list: async (p: ListParams = {}): Promise<TorrentListResponse> =>
+      normalizeTorrentList(
+        await get<TorrentListResponse | TorrentSummary[] | NativeTorrentSummary[]>('/torrents', p as Record<string, string | number>),
+        p,
+      ),
 
     get: (hash: string): Promise<TorrentSummary> =>
       get(`/torrents/${hash}`),

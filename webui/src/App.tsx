@@ -60,6 +60,31 @@ function utpStatus(capabilities: NonNullable<Awaited<ReturnType<typeof api.healt
     : `No active uTP runtime transport path${policy ? ` (${policy})` : ''}`
   return { label, title, enabled: networking.utp_transport === true }
 }
+
+function backendHealthLabel(health: Awaited<ReturnType<typeof api.health>> | undefined) {
+  if (health?.backend) {
+    return {
+      type: health.backend.type,
+      status: health.backend.status,
+      connected: health.backend.status === 'connected',
+      label: `${health.backend.type}: ${health.backend.status}`,
+    }
+  }
+  if (health?.native_engine) {
+    return {
+      type: 'native',
+      status: health.ready === false ? 'starting' : 'connected',
+      connected: health.ready !== false,
+      label: `native: ${health.ready === false ? 'starting' : 'connected'}`,
+    }
+  }
+  return {
+    type: 'backend',
+    status: health?.rtorrent ?? 'connecting',
+    connected: health?.rtorrent === 'connected',
+    label: health?.rtorrent ? `backend: ${health.rtorrent}` : 'connecting...',
+  }
+}
 const SETTINGS_SECTION_KEY = 'tng.settingsSection'
 const ACTIVE_TAB_KEY = 'tng.activeTab'
 const ACTIVE_TAB_TTL_MS = 8000
@@ -245,6 +270,7 @@ export function App() {
   const { torrents, total } = flattenPages(query.data)
   const { data: health } = useHealth(activeTab.isActive && authState === 'authenticated')
   const healthUtp = utpStatus(health?.engine?.capabilities)
+  const backendHealth = backendHealthLabel(health)
   const { data: storage } = useQuery({
     queryKey: ['storage', 'status-bar'],
     queryFn: api.storage,
@@ -658,19 +684,19 @@ export function App() {
           whiteSpace: 'nowrap', flex: '0 0 auto',
         }}>Help</button>
 
-        <span className="tng-topbar-pill" data-tone={health?.backend?.status === 'connected' ? 'ok' : 'error'} title="Selected backend connection state" style={{
-          fontSize: 11, color: health?.backend?.status === 'connected' ? 'var(--success)' : 'var(--danger)',
+        <span className="tng-topbar-pill" data-tone={backendHealth.connected ? 'ok' : 'error'} title="Selected backend connection state" style={{
+          fontSize: 11, color: backendHealth.connected ? 'var(--success)' : 'var(--danger)',
           display: 'flex', alignItems: 'center', gap: 5, padding: '2px 7px',
-          border: '1px solid ' + (health?.backend?.status === 'connected' ? 'color-mix(in srgb, var(--success) 42%, var(--border))' : 'color-mix(in srgb, var(--danger) 42%, var(--border))'),
+          border: '1px solid ' + (backendHealth.connected ? 'color-mix(in srgb, var(--success) 42%, var(--border))' : 'color-mix(in srgb, var(--danger) 42%, var(--border))'),
           borderRadius: 999,
-          background: health?.backend?.status === 'connected' ? 'color-mix(in srgb, var(--success) 9%, transparent)' : 'color-mix(in srgb, var(--danger) 9%, transparent)',
+          background: backendHealth.connected ? 'color-mix(in srgb, var(--success) 9%, transparent)' : 'color-mix(in srgb, var(--danger) 9%, transparent)',
         }}>
           <span style={{
             width: 6, height: 6, borderRadius: '50%',
-            background: health?.backend?.status === 'connected' ? 'var(--success)' : 'var(--danger)',
+            background: backendHealth.connected ? 'var(--success)' : 'var(--danger)',
             display: 'inline-block',
           }} />
-          {health?.backend ? `${health.backend.type}: ${health.backend.status}` : 'connecting...'}
+          {backendHealth.label}
         </span>
 
         {healthUtp && (
@@ -857,8 +883,8 @@ export function App() {
         total={total}
         selected={selected.size}
         stats={liveStats}
-        backendType={health?.backend?.type ?? 'backend'}
-        backendStatus={health?.backend?.status ?? health?.rtorrent ?? 'connecting'}
+        backendType={backendHealth.type}
+        backendStatus={backendHealth.status}
         cached={health?.cached_torrents}
         storage={storage?.roots?.[0]}
         utpLabel={healthUtp?.label}
