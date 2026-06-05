@@ -16,7 +16,7 @@
     "@tanstack/react-table": "^8.17.0",
     "@tanstack/react-virtual": "^3.5.0",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.2.7"
   },
   "devDependencies": {
     "@axe-core/playwright": "^4.11.3",
