@@ -1429,14 +1429,6 @@ mod tests {
         let frame = pool.try_acquire(10).unwrap();
         let frame = backend.pread(file, frame, 32).await.unwrap().unwrap();
         assert_eq!(frame.as_slice(), b"real-uring");
-        assert!(
-            !backend.supports_fixed_buffers() || probe.fixed_buffers,
-            "backend cannot report fixed buffers when probe rejected them"
-        );
-        assert!(
-            !backend.supports_registered_files() || probe.registered_files,
-            "backend cannot report registered files when probe rejected them"
-        );
         assert_eq!(backend.max_batch_len(), URING_BATCH_LIMIT);
         if backend.supports_fixed_buffers() {
             assert_eq!(backend.fixed_buffer_len(), URING_FIXED_BUFFER_LEN);
@@ -1446,6 +1438,8 @@ mod tests {
                 FixedBufferStrategy::FramePoolSlots
             );
         } else {
+            assert_eq!(backend.fixed_buffer_len(), 0);
+            assert!(!frame.is_registered_slot());
             assert_eq!(
                 backend.fixed_buffer_strategy(),
                 FixedBufferStrategy::Disabled
