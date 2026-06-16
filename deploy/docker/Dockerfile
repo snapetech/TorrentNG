@@ -1,5 +1,5 @@
 # Stage 1: Build Rust sidecar
-FROM rust:1.93-alpine AS sidecar-build
+FROM rust:1.96-alpine AS sidecar-build
 RUN apk add --no-cache musl-dev pkgconf openssl-dev openssl-libs-static
 WORKDIR /src
 RUN printf '%s\n' \
