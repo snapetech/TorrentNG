@@ -997,6 +997,19 @@ async fn qb_torrent_properties_from_cache() {
     assert_eq!(body["total_size"], 100);
     assert_eq!(body["share_ratio"], 0.0);
 
+    seed_torrent(&db, "ABCDEF1234567890", "Uppercase Hash");
+    let res = client
+        .get(url(
+            addr,
+            "/api/qb/v2/torrents/properties?hash=abcdef1234567890",
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["total_size"], 100);
+
     let res = client
         .get(url(addr, "/api/qb/v2/torrents/properties"))
         .send()

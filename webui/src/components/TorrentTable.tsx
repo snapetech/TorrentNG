@@ -37,7 +37,7 @@ function fmtSpeed(bps: number): string {
 
 function statusLabel(t: TorrentSummary): { label: string; color: string } {
   if (t.message && !t.is_active) return { label: 'Error', color: 'var(--danger)' }
-  if (!t.is_open) return { label: 'Stopped', color: 'var(--faint)' }
+  if (t.state === 0) return { label: 'Stopped', color: 'var(--faint)' }
   if (t.state === 2) return { label: 'Checking', color: 'var(--warning)' }
   if (t.complete && t.is_active) return { label: 'Seeding', color: 'var(--success)' }
   if (!t.complete && t.is_active) return { label: 'DL', color: 'var(--accent)' }
@@ -46,8 +46,8 @@ function statusLabel(t: TorrentSummary): { label: string; color: string } {
 
 function rowAccent(t: TorrentSummary): string {
   if (t.message && !t.is_active) return 'var(--danger)'
+  if (t.state === 0) return 'var(--faint)'
   if (t.state === 2) return 'var(--warning)'
-  if (!t.is_open) return 'var(--faint)'
   if (t.complete && t.is_active) return 'var(--success)'
   if (!t.complete && t.is_active) return 'var(--accent)'
   return 'transparent'

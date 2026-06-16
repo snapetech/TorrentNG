@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use tokio::sync::broadcast;
 use torrentng::{api, backend, cache, config, metrics, rtorrent, rtorrent_logs, stats, sync};
 use tracing::{info, warn};
@@ -79,10 +79,26 @@ async fn main() -> Result<()> {
     if cfg.backend.backend_type == BackendKind::Rtorrent {
         let rt_ua = rt.clone();
         let ua = cfg.rtorrent.user_agent.clone();
+        let peer_id = cfg.rtorrent.peer_id.clone();
         let db2 = db.clone();
         let retention = cfg.logging.event_retention;
         tokio::spawn(async move {
-            if let Err(e) = rt_ua.set_user_agent(&ua).await {
+            let mut user_agent_error = None;
+            for attempt in 1..=3 {
+                match rt_ua.set_user_agent(&ua).await {
+                    Ok(()) => {
+                        user_agent_error = None;
+                        break;
+                    }
+                    Err(e) => {
+                        user_agent_error = Some(e);
+                        if attempt < 3 {
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                        }
+                    }
+                }
+            }
+            if let Some(e) = user_agent_error {
                 warn!(
                     component = "rtorrent",
                     operation = "set_user_agent",
@@ -99,6 +115,28 @@ async fn main() -> Result<()> {
                     serde_json::json!({
                         "component": "rtorrent",
                         "operation": "set_user_agent",
+                        "result": "error",
+                        "error": e.to_string(),
+                    }),
+                );
+            }
+            if let Err(e) = rt_ua.set_all_peer_ids(&peer_id).await {
+                warn!(
+                    component = "rtorrent",
+                    operation = "set_peer_id",
+                    result = "error",
+                    error = %e,
+                    "could not set rTorrent peer id after startup"
+                );
+                append_startup_event(
+                    &db2,
+                    retention,
+                    "warn",
+                    "rtorrent_peer_id_error",
+                    "could not apply rTorrent peer id after startup",
+                    serde_json::json!({
+                        "component": "rtorrent",
+                        "operation": "set_peer_id",
                         "result": "error",
                         "error": e.to_string(),
                     }),

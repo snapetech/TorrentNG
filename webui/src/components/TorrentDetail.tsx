@@ -134,11 +134,13 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
   const progress = t.size_bytes > 0 ? (t.bytes_done / t.size_bytes) * 100 : 0
   const ratio = (t.ratio / 1000).toFixed(3)
   const tags = t.tags ? t.tags.split(',').filter(Boolean) : []
-  const isRunning = t.is_open && t.is_active
+  const canStop = t.state !== 0
   const state = t.message && !t.is_active
     ? { label: 'Error', color: 'var(--danger)' }
-    : !t.is_open
+    : t.state === 0
       ? { label: 'Stopped', color: 'var(--faint)' }
+      : t.state === 2
+        ? { label: 'Checking', color: 'var(--warning)' }
       : t.complete && t.is_active
         ? { label: 'Seeding', color: 'var(--success)' }
         : !t.complete && t.is_active
@@ -202,7 +204,7 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
         padding: '8px 14px', borderBottom: '1px solid var(--border)',
         display: 'flex', flexWrap: 'wrap', gap: 6,
       }}>
-        {isRunning
+        {canStop
           ? <ActionBtn label="Stop"      color="var(--muted)" disabled={busy} onClick={() => doAction(() => api.torrents.stop(t.hash))} />
           : <ActionBtn label="Start"     color="var(--success)" disabled={busy} onClick={() => doAction(() => api.torrents.start(t.hash))} />
         }

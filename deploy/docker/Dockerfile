@@ -39,7 +39,7 @@ COPY webui/ ./
 RUN npm run build
 
 # Stage 3: Build modern rTorrent/libtorrent.
-# The patch exposes libtorrent's HTTP user-agent getter/setter through rTorrent XMLRPC.
+# The patches expose tracker identity controls used by the sidecar.
 FROM alpine:3.20 AS rtorrent-build
 ARG RTORRENT_VERSION=0.16.11
 ARG LIBTORRENT_VERSION=0.16.11
@@ -50,8 +50,9 @@ WORKDIR /src
 RUN git clone --depth=1 --branch "v${LIBTORRENT_VERSION}" https://github.com/rakshasa/libtorrent.git && \
     git clone --depth=1 --branch "v${RTORRENT_VERSION}" https://github.com/rakshasa/rtorrent.git
 COPY deploy/docker/patches/rtorrent-0.16.11-user-agent-command.patch /tmp/rtorrent-user-agent-command.patch
+COPY deploy/docker/patches/rtorrent-0.16.11-local-id-command.patch /tmp/rtorrent-local-id-command.patch
 COPY deploy/docker/patches/rtorrent-0.16.11-multicall-range.patch /tmp/rtorrent-multicall-range.patch
-RUN cd rtorrent && git apply /tmp/rtorrent-user-agent-command.patch && git apply /tmp/rtorrent-multicall-range.patch
+RUN cd rtorrent && git apply /tmp/rtorrent-user-agent-command.patch && git apply /tmp/rtorrent-local-id-command.patch && git apply /tmp/rtorrent-multicall-range.patch
 RUN cd libtorrent && autoreconf -fi && \
     ./configure --prefix=/usr/local && \
     make -j"$(nproc)" && make install
@@ -78,7 +79,7 @@ ENV TNG_STATIC_DIR=/usr/share/torrentng/webui
 ENV LD_LIBRARY_PATH=/usr/local/lib
 ENV TNG_PACKAGED_RTORRENT_VERSION=0.16.11
 ENV TNG_PACKAGED_LIBTORRENT_VERSION=0.16.11
-ENV TNG_RTORRENT_PATCHES=rtorrent-0.16.11-user-agent-command,rtorrent-0.16.11-multicall-range
+ENV TNG_RTORRENT_PATCHES=rtorrent-0.16.11-user-agent-command,rtorrent-0.16.11-local-id-command,rtorrent-0.16.11-multicall-range
 
 VOLUME ["/data", "/session", "/config"]
 EXPOSE 8080 50000 50000/udp

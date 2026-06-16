@@ -362,6 +362,7 @@ fn prune_app_events_locked(conn: &Connection, retention: usize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::query::ListParams;
 
     #[test]
     fn app_events_insert_list_and_prune() {
@@ -429,5 +430,67 @@ mod tests {
         assert!(events
             .iter()
             .all(|event| event.event_id.unwrap_or_default() > 1));
+    }
+
+    #[test]
+    fn stopped_and_queued_statuses_are_distinct() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+        db.upsert(&torrent_row("queued", 1, false, false)).unwrap();
+        db.upsert(&torrent_row("stopped", 0, false, false)).unwrap();
+
+        let facets = db.sidebar_facets().unwrap();
+        assert_eq!(facets.status.get("queued"), Some(&1));
+        assert_eq!(facets.status.get("stopped"), Some(&1));
+        assert_eq!(facets.status.get("inactive"), Some(&2));
+
+        let (queued, _) = db
+            .list(&ListParams {
+                status: Some("queued".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].hash, "queued");
+
+        let (stopped, _) = db
+            .list(&ListParams {
+                status: Some("stopped".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(stopped.len(), 1);
+        assert_eq!(stopped[0].hash, "stopped");
+    }
+
+    fn torrent_row(hash: &str, state: i64, is_active: bool, is_open: bool) -> TorrentRow {
+        TorrentRow {
+            hash: hash.to_owned(),
+            name: hash.to_owned(),
+            size_bytes: 100,
+            bytes_done: 0,
+            down_rate: 0,
+            up_rate: 0,
+            up_total: 0,
+            down_total: 0,
+            ratio: 0,
+            is_active,
+            is_open,
+            complete: false,
+            state,
+            priority: 0,
+            category: String::new(),
+            base_path: "/downloads/test".to_owned(),
+            directory: "/downloads/test".to_owned(),
+            creation_date: 0,
+            timestamp_finished: 0,
+            tracker_focus: 0,
+            peers_connected: 0,
+            peers_complete: 0,
+            message: String::new(),
+            tracker_url: String::new(),
+            tags: String::new(),
+            updated_at: 0,
+        }
     }
 }

@@ -3,8 +3,17 @@ use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, time::Duration};
 
 /// Default user-agent announced to trackers via rTorrent.
-/// Overridden by config or TNG_USER_AGENT env var.
-pub const DEFAULT_USER_AGENT: &str = "rtorrent/0.16.11";
+///
+/// Keep this paired with DEFAULT_PEER_ID. Do not strip it to
+/// "rtorrent/0.16.11"; rTorrent 0.16.11 appends libtorrent's 0.16.11 version.
+pub const DEFAULT_USER_AGENT: &str = "rtorrent/0.16.11/0.16.11";
+
+/// Default rTorrent peer ID written to rTorrent download local_id values.
+///
+/// This is libtorrent 0.16.11's PEER_NAME prefix with deterministic padding.
+/// Do not replace it with "rtorrent/0.16.11/000" or a guessed "-lt1011-"
+/// prefix. It must be exactly 20 ASCII bytes for BitTorrent and trackers.
+pub const DEFAULT_PEER_ID: &str = "-lt100B-000000000000";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -70,9 +79,15 @@ pub struct RtorrentConfig {
 
     /// User-agent string pushed to rTorrent's network.http.user_agent on startup.
     /// Override with TNG_USER_AGENT env var.
-    /// See docs/CONFIGURATION.md for accepted values.
+    /// See docs/TRACKER-IDENTITY.md before changing the default pair.
     #[serde(default = "default_user_agent")]
     pub user_agent: String,
+
+    /// Peer ID pushed to rTorrent download local_id values on startup.
+    /// Override with TNG_PEER_ID env var.
+    /// See docs/TRACKER-IDENTITY.md before changing the default pair.
+    #[serde(default = "default_peer_id")]
+    pub peer_id: String,
 
     #[serde(default)]
     pub logs: RtorrentLogConfig,
@@ -204,6 +219,7 @@ impl Default for RtorrentConfig {
             scgi_addr: None,
             timeout_secs: default_timeout_secs(),
             user_agent: default_user_agent(),
+            peer_id: default_peer_id(),
             logs: RtorrentLogConfig::default(),
         }
     }
@@ -271,6 +287,7 @@ impl Config {
                 scgi_addr: None,
                 timeout_secs: 1,
                 user_agent: DEFAULT_USER_AGENT.to_owned(),
+                peer_id: DEFAULT_PEER_ID.to_owned(),
                 logs: RtorrentLogConfig::default(),
             },
             qbittorrent: QbittorrentConfig::default(),
@@ -298,6 +315,9 @@ fn default_timeout_secs() -> u64 {
 }
 fn default_user_agent() -> String {
     DEFAULT_USER_AGENT.to_owned()
+}
+fn default_peer_id() -> String {
+    DEFAULT_PEER_ID.to_owned()
 }
 
 // --- loading ---
@@ -371,8 +391,12 @@ impl Config {
         if let Ok(v) = std::env::var("TNG_DATA_DIR") {
             self.data_dir = Some(PathBuf::from(v));
         }
-        if let Ok(v) = std::env::var("TNG_USER_AGENT") {
+        if let Ok(v) = std::env::var("TNG_USER_AGENT").or_else(|_| std::env::var("RTNG_USER_AGENT"))
+        {
             self.rtorrent.user_agent = v;
+        }
+        if let Ok(v) = std::env::var("TNG_PEER_ID").or_else(|_| std::env::var("RTNG_PEER_ID")) {
+            self.rtorrent.peer_id = v;
         }
         if let Ok(v) = std::env::var("TNG_BACKEND") {
             self.backend.backend_type = match v.to_ascii_lowercase().as_str() {
@@ -478,7 +502,11 @@ impl Config {
                 (Some(_), Some(_)) => {
                     bail!("rtorrent: only one of scgi_socket or scgi_addr may be set")
                 }
-                _ => {}
+                _ => {
+                    if self.rtorrent.peer_id.len() != 20 || !self.rtorrent.peer_id.is_ascii() {
+                        bail!("rtorrent: peer_id must be exactly 20 ASCII bytes");
+                    }
+                }
             },
             BackendKind::Qbittorrent => {
                 if self.qbittorrent.url.trim().is_empty() {

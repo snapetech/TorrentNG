@@ -203,6 +203,25 @@ impl Db {
         )?;
         Ok(())
     }
+
+    pub fn set_torrent_runtime_state(
+        &self,
+        hash: &str,
+        state: i64,
+        is_active: bool,
+        is_open: bool,
+    ) -> Result<()> {
+        self.0.lock().expect("db").execute(
+            "UPDATE torrents SET state=?1, is_active=?2, is_open=?3, updated_at=(
+                SELECT MAX(v) FROM (
+                    SELECT CAST(strftime('%s','now') AS INTEGER) AS v
+                    UNION ALL SELECT COALESCE(MAX(updated_at), 0) + 1 FROM torrents
+                )
+             ) WHERE hash=?4",
+            params![state, is_active as i64, is_open as i64, hash],
+        )?;
+        Ok(())
+    }
 }
 
 fn touch_torrent(conn: &rusqlite::Connection, hash: &str) -> Result<()> {

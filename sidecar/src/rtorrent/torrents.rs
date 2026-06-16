@@ -292,12 +292,12 @@ impl Client {
     }
 
     pub async fn start(&self, hash: &str) -> Result<()> {
-        self.call("d.start", &[hash.into()]).await?;
+        self.call_xmlrpc("d.start", &[hash.into()]).await?;
         Ok(())
     }
 
     pub async fn stop(&self, hash: &str) -> Result<()> {
-        self.call("d.stop", &[hash.into()]).await?;
+        self.call_xmlrpc("d.stop", &[hash.into()]).await?;
         Ok(())
     }
 
@@ -362,12 +362,33 @@ impl Client {
     /// Push user_agent to rTorrent's HTTP user agent setting.
     /// Called on startup and on config change via API.
     pub async fn set_user_agent(&self, user_agent: &str) -> Result<()> {
+        self.call("network.http.user_agent.set", &["".into(), user_agent.into()])
+            .await
+            .context("set network.http.user_agent")?;
+        Ok(())
+    }
+
+    /// Push a tracker-facing peer ID to every loaded rTorrent download.
+    ///
+    /// rTorrent stores the peer ID as each download's local_id, so existing
+    /// session torrents need an explicit rewrite after package identity changes.
+    pub async fn set_all_peer_ids(&self, peer_id: &str) -> Result<()> {
+        if peer_id.len() != 20 || !peer_id.is_ascii() {
+            anyhow::bail!("peer_id must be exactly 20 ASCII bytes");
+        }
+
+        let set_cmd = format!("d.local_id.set={peer_id}");
         self.call(
-            "network.http.user_agent.set",
-            &["".into(), user_agent.into()],
+            "d.multicall2",
+            &[
+                "".into(),
+                "main".into(),
+                set_cmd.as_str().into(),
+                "d.save_full_session=".into(),
+            ],
         )
         .await
-        .context("set network.http.user_agent")?;
+        .context("set rTorrent download local_id values")?;
         Ok(())
     }
 
@@ -556,6 +577,13 @@ mod tests {
         assert_eq!(str_arg(&args, 1), "active");
         assert_eq!(int_arg(&args, 2), 50);
         assert_eq!(str_arg(&args, 3), "d.hash=");
+    }
+
+    #[test]
+    fn rtorrent_peer_id_default_is_valid() {
+        assert_eq!(crate::config::DEFAULT_PEER_ID.len(), 20);
+        assert!(crate::config::DEFAULT_PEER_ID.is_ascii());
+        assert!(crate::config::DEFAULT_PEER_ID.starts_with("-lt100B-"));
     }
 
     fn str_arg(args: &[XmlValue], index: usize) -> &str {

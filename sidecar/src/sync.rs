@@ -320,6 +320,7 @@ fn upsert_torrent(
 
 fn write_live_speeds(download: i64, upload: i64) {
     let Some(path) = std::env::var("TNG_LIVE_SPEEDS_FILE")
+        .or_else(|_| std::env::var("RTNG_LIVE_SPEEDS_FILE"))
         .ok()
         .filter(|path| !path.trim().is_empty())
     else {

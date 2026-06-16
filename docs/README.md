@@ -30,6 +30,8 @@ certified status.
   deployment with Compose, systemd, Kubernetes, metrics, and certification.
 - [DEPLOYMENT.md](DEPLOYMENT.md) - Track 1 rTorrent plus sidecar deployment.
 - [CONFIGURATION.md](CONFIGURATION.md) - native and sidecar config references.
+- [TRACKER-IDENTITY.md](TRACKER-IDENTITY.md) - pinned native and sidecar
+  rTorrent/libtorrent tracker identity pair and drift checks.
 - [BACKUP_RESTORE.md](BACKUP_RESTORE.md) - native state backup, restore, and
   migration rollback.
 - [MIGRATION.md](MIGRATION.md) - `torrentngd migrate` (import) and

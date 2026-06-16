@@ -19,6 +19,7 @@ const STATUS_OPTIONS = [
   { value: 'seeding', label: 'Seeding', icon: '⇡' },
   { value: 'completed', label: 'Completed', icon: '✓' },
   { value: 'running', label: 'Running', icon: '▶' },
+  { value: 'queued', label: 'Queued', icon: '…' },
   { value: 'stopped', label: 'Stopped', icon: '■' },
   { value: 'active', label: 'Active', icon: '⇅' },
   { value: 'inactive', label: 'Inactive', icon: '⇵' },

@@ -17,7 +17,7 @@ use crate::{
 };
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-const LIVE_SPEEDS_MAX_AGE: Duration = Duration::from_secs(8);
+const LIVE_SPEEDS_MAX_AGE: Duration = Duration::from_secs(60);
 const DEFAULT_INCOMING_PORT: u16 = 50000;
 static SESSION_UPLOAD_TOTAL: AtomicI64 = AtomicI64::new(0);
 static SESSION_DOWNLOAD_TOTAL: AtomicI64 = AtomicI64::new(0);
@@ -47,8 +47,8 @@ pub async fn run(
         let now = tokio::time::Instant::now();
         let elapsed = now.duration_since(last_tick).as_secs_f64();
         last_tick = now;
-        let rates = match live_speeds_file() {
-            Some(path) => read_live_speeds(&path).unwrap_or_default(),
+        let rates = match live_speeds_file().and_then(|path| read_live_speeds(&path)) {
+            Some(rates) => rates,
             None => match probe_transfer_rates_result(backend.as_ref()).await {
                 Ok(rates) => {
                     if stats_error_active {
@@ -132,7 +132,6 @@ pub fn current_rates(
             if let Some(rates) = read_live_speeds(&path) {
                 return rates;
             }
-            return TransferRates::default();
         }
         probe_transfer_rates(backend.as_ref()).await
     }
@@ -157,6 +156,12 @@ async fn probe_transfer_rates(backend: &dyn TorrentBackend) -> TransferRates {
 async fn probe_transfer_rates_result(
     backend: &dyn TorrentBackend,
 ) -> anyhow::Result<TransferRates> {
+    if let Ok(Ok(summary)) =
+        tokio::time::timeout(PROBE_TIMEOUT, backend.live_summary("main", 1)).await
+    {
+        return Ok(summary.rates);
+    }
+
     match tokio::time::timeout(PROBE_TIMEOUT, backend.transfer_rates()).await {
         Ok(Ok(rates)) => Ok(rates),
         Ok(Err(e)) => Err(e),
@@ -199,6 +204,7 @@ fn append_app_event(
 
 fn live_speeds_file() -> Option<String> {
     std::env::var("TNG_LIVE_SPEEDS_FILE")
+        .or_else(|_| std::env::var("RTNG_LIVE_SPEEDS_FILE"))
         .ok()
         .filter(|path| !path.trim().is_empty())
 }

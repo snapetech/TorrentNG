@@ -336,6 +336,7 @@ Start with the docs index:
 - [Native deployment](docs/NATIVE_DEPLOYMENT.md)
 - [Track 1 rTorrent deployment](docs/DEPLOYMENT.md)
 - [Configuration](docs/CONFIGURATION.md)
+- [Tracker identity](docs/TRACKER-IDENTITY.md)
 - [API reference](docs/API.md)
 - [Interop matrix](docs/INTEROP_MATRIX.md)
 - [Migration](docs/MIGRATION.md)

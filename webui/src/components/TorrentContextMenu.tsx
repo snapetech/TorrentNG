@@ -28,13 +28,15 @@ export function TorrentContextMenu({
   onCopyHash, onCopyName, onToggleSequential,
 }: Props) {
   const menuRef = useRef<HTMLDivElement>(null)
-  const isRunning = menu.torrent.is_open && menu.torrent.is_active
+  const canStop = menu.torrent.state !== 0
   const left = Math.min(menu.x, window.innerWidth - 236)
   const top = Math.min(menu.y, window.innerHeight - 356)
   const status = menu.torrent.message && !menu.torrent.is_active
     ? { label: 'Error', color: 'var(--danger)' }
-    : !menu.torrent.is_open
+    : menu.torrent.state === 0
       ? { label: 'Stopped', color: 'var(--faint)' }
+      : menu.torrent.state === 2
+        ? { label: 'Checking', color: 'var(--warning)' }
       : menu.torrent.complete && menu.torrent.is_active
         ? { label: 'Seeding', color: 'var(--success)' }
         : menu.torrent.is_active
@@ -45,7 +47,7 @@ export function TorrentContextMenu({
     { label: 'Edit selected...', icon: '✎', action: onEditSelected },
     { label: 'Show details', icon: '▣', action: onDetail },
     { separator: true, label: 'run-separator', action: () => undefined },
-    isRunning ? { label: 'Stop', icon: '■', action: onStop } : { label: 'Start', icon: '▶', action: onStart },
+    canStop ? { label: 'Stop', icon: '■', action: onStop } : { label: 'Start', icon: '▶', action: onStart },
     { label: 'Recheck', icon: '↻', action: onRecheck },
     { label: 'Reannounce', icon: '⇄', action: onReannounce },
     { label: 'Toggle sequential download', icon: '≡', action: onToggleSequential },

@@ -1392,6 +1392,8 @@ async fn bulk_action(s: &AppState, hashes_str: &Option<String>, action: &str) ->
                 error = %e,
                 "qBit torrent action failed"
             );
+        } else {
+            update_cached_lifecycle_state(s, &hash, action);
         }
     }
     StatusCode::OK
@@ -3029,6 +3031,25 @@ fn emit_torrent_updated(s: &AppState, hash: &str) {
         },
     );
     emit(s, Event::TrackerHealthUpdated);
+}
+
+fn update_cached_lifecycle_state(s: &AppState, hash: &str, action: &str) {
+    let res = match action {
+        "start" => s.db.set_torrent_runtime_state(hash, 1, false, true),
+        "stop" => s.db.set_torrent_runtime_state(hash, 0, false, false),
+        _ => return,
+    };
+    if let Err(e) = res {
+        tracing::warn!(
+            component = "cache",
+            operation = "set_torrent_runtime_state",
+            torrent = %hash,
+            action,
+            result = "error",
+            error = %e,
+            "torrent runtime cache update failed"
+        );
+    }
 }
 
 fn map_sort(s: &str) -> &str {

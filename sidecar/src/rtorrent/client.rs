@@ -57,6 +57,18 @@ impl Client {
             .await
     }
 
+    /// Execute a single XML-RPC method without trying rTorrent's JSON-RPC
+    /// adapter first. Some rTorrent mutators return success through JSON-RPC
+    /// without applying the state transition.
+    pub async fn call_xmlrpc(&self, method: &str, args: &[XmlValue]) -> Result<XmlValue> {
+        let _permit = self
+            .rpc_gate
+            .acquire()
+            .await
+            .context("rTorrent RPC gate closed")?;
+        self.call_xml(method, args).await
+    }
+
     pub async fn call_sync(&self, method: &str, args: &[XmlValue]) -> Result<XmlValue> {
         self.call_with_priority(method, args, RpcPriority::Background)
             .await

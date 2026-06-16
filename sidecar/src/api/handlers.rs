@@ -1725,6 +1725,25 @@ fn emit_torrent_updated(s: &AppState, hash: &str) {
     emit(s, Event::TrackerHealthUpdated);
 }
 
+fn update_cached_lifecycle_state(s: &AppState, hash: &str, action: &str) {
+    let res = match action {
+        "start" => s.db.set_torrent_runtime_state(hash, 1, false, true),
+        "stop" => s.db.set_torrent_runtime_state(hash, 0, false, false),
+        _ => return,
+    };
+    if let Err(e) = res {
+        tracing::warn!(
+            component = "cache",
+            operation = "set_torrent_runtime_state",
+            torrent = %hash,
+            action,
+            result = "error",
+            error = %e,
+            "torrent runtime cache update failed"
+        );
+    }
+}
+
 fn storage_root(path: &FsPath) -> StorageRoot {
     match statvfs(path) {
         Ok(stat) => {
@@ -1967,7 +1986,11 @@ pub async fn torrent_start(
     Path(hash): Path<String>,
 ) -> impl IntoResponse {
     match s.backend.start(&hash).await {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => {
+            update_cached_lifecycle_state(&s, &hash, "start");
+            emit_torrent_updated(&s, &hash);
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => {
             tracing::error!(component = "api", operation = "start", result = "error", torrent = %hash, error = %e, "native start failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -1979,7 +2002,11 @@ pub async fn torrent_stop(
     Path(hash): Path<String>,
 ) -> impl IntoResponse {
     match s.backend.stop(&hash).await {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => {
+            update_cached_lifecycle_state(&s, &hash, "stop");
+            emit_torrent_updated(&s, &hash);
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => {
             tracing::error!(component = "api", operation = "stop", result = "error", torrent = %hash, error = %e, "native stop failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -2520,6 +2547,7 @@ pub async fn bulk_action(
         };
         match res {
             Ok(_) => {
+                update_cached_lifecycle_state(&s, hash, &action);
                 emit_torrent_updated(&s, hash);
                 if action == "set-category" {
                     emit(&s, Event::CategoriesUpdated);

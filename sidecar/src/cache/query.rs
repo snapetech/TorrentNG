@@ -53,7 +53,7 @@ impl Db {
                 FROM torrent_tags
                 GROUP BY hash
              ) tags ON tags.hash=t.hash
-             WHERE t.hash=?1",
+             WHERE t.hash=?1 COLLATE NOCASE",
         )?;
         let mut rows = stmt.query(params![hash])?;
         match rows.next()? {
@@ -269,7 +269,8 @@ impl Db {
             ("seeding", "complete=1 AND is_active=1"),
             ("completed", "complete=1"),
             ("running", "is_open=1"),
-            ("stopped", "is_active=0"),
+            ("queued", "state=1 AND is_active=0"),
+            ("stopped", "state=0 AND is_active=0"),
             ("active", "is_active=1"),
             ("inactive", "is_active=0"),
             ("stalled", "is_open=1 AND is_active=0"),
@@ -358,7 +359,8 @@ fn build_where(p: &ListParams) -> (String, Vec<String>) {
             "completed" => clauses.push("t.complete=1".into()),
             "active" => clauses.push("t.is_active=1".into()),
             "inactive" => clauses.push("t.is_active=0".into()),
-            "paused" | "stopped" => clauses.push("t.is_active=0".into()),
+            "queued" => clauses.push("t.state=1 AND t.is_active=0".into()),
+            "paused" | "stopped" => clauses.push("t.state=0 AND t.is_active=0".into()),
             "stalled" => clauses.push("t.is_open=1 AND t.is_active=0".into()),
             "stalled_uploading" => {
                 clauses.push("t.complete=1 AND t.is_open=1 AND t.is_active=0".into())

@@ -244,7 +244,12 @@ type = "qbittorrent"
 | `scgi_socket` | `/run/rtorrent/rpc.sock` | `TNG_SCGI_SOCKET` | Path to rTorrent SCGI Unix socket |
 | `scgi_addr` | - | `TNG_SCGI_ADDR` | `host:port` for TCP SCGI; mutually exclusive with `scgi_socket` |
 | `timeout_secs` | `10` | - | Timeout for individual XMLRPC calls |
-| `user_agent` | `rtorrent/0.16.11` | `TNG_USER_AGENT` | Client identifier pushed to rTorrent on startup |
+| `user_agent` | `rtorrent/0.16.11/0.16.11` | `TNG_USER_AGENT` | Tracker HTTP user-agent pushed to rTorrent on startup |
+| `peer_id` | `-lt100B-000000000000` | `TNG_PEER_ID` | 20-byte tracker peer ID pushed to loaded rTorrent downloads on startup |
+
+The packaged rTorrent backend deliberately pins the upstream rTorrent/libtorrent
+0.16.11 tracker identity pair. See [TRACKER-IDENTITY.md](TRACKER-IDENTITY.md)
+before changing either value.
 
 ### Sidecar `[qbittorrent]`
 
@@ -347,21 +352,45 @@ By default, first-time ingestion starts at the end of each file to avoid floodin
 
 The `user_agent` value is pushed to rTorrent via `network.http.user_agent.set` on startup when the running rTorrent build exposes that XMLRPC method. TorrentNG's packaged rTorrent 0.16.11 image carries a small build patch that publishes the existing libtorrent HTTP user-agent getter/setter through XMLRPC, so this works in the Docker and certification builds. It can also be changed at runtime via `PUT /api/v1/settings/user-agent` or the Settings panel in the WebUI. Some older distro rTorrent packages do not expose tracker user-agent control; the certification harness reports that as blocked instead of assuming spoofing works.
 
+For packaged rTorrent 0.16.11, keep this as `rtorrent/0.16.11/0.16.11`.
+Do not strip it to `rtorrent/0.16.11`; upstream rTorrent includes the linked
+libtorrent version in the tracker User-Agent.
+
 ```toml
 [rtorrent]
-user_agent = "rtorrent/0.16.11"
+user_agent = "rtorrent/0.16.11/0.16.11"
 ```
 
 ```sh
-TNG_USER_AGENT="rtorrent/0.16.11" torrentng
+TNG_USER_AGENT="rtorrent/0.16.11/0.16.11" torrentng
 ```
 
-Known values:
+#### `peer_id`
+
+The `peer_id` value is pushed to existing rTorrent downloads via the packaged
+`d.local_id.set` command on startup, then each session file is saved. This keeps
+the tracker-facing peer ID paired with rTorrent's upstream HTTP user-agent. The
+value must be exactly 20 ASCII bytes.
+
+For packaged rTorrent/libtorrent 0.16.11, keep this as
+`-lt100B-000000000000`. The `-lt100B-` prefix is libtorrent 0.16.11's upstream
+peer-name encoding; it is not `-lt1011-`, and the peer ID is not the literal
+string `rtorrent/0.16.11/000`.
+
+```toml
+[rtorrent]
+peer_id = "-lt100B-000000000000"
+```
+
+```bash
+TNG_PEER_ID="-lt100B-000000000000" torrentng
+```
+
+Known user-agent presets:
 
 | Client | User-agent string |
 |---|---|
-| rTorrent 0.16.11 | `rtorrent/0.16.11` |
-| libtorrent 0.16.11 | `libtorrent/0.16.11` |
+| rTorrent 0.16.11 + libtorrent 0.16.11 | `rtorrent/0.16.11/0.16.11` |
 | qBittorrent 5.0.0 | `qBittorrent/5.0.0` |
 | Deluge 2.2.0 | `Deluge/2.2.0 libtorrent/2.0.10` |
 | Transmission 4.0 | `Transmission/4.0` |
@@ -447,7 +476,8 @@ type = "rtorrent"
 [rtorrent]
 scgi_socket = "/run/rtorrent/rpc.sock"
 timeout_secs = 10
-user_agent = "rtorrent/0.16.11"
+user_agent = "rtorrent/0.16.11/0.16.11"
+peer_id = "-lt100B-000000000000"
 
 [rtorrent.logs]
 enabled = false
