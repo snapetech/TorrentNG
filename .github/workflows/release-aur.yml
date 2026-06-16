@@ -67,9 +67,20 @@ jobs:
           cp packaging/arch/PKGBUILD "$workdir/torrentngd-git/PKGBUILD"
           cp packaging/arch/torrentngd.{service,sysusers,tmpfiles} "$workdir/torrentngd-git/"
           docker run --rm \
+            -e HOST_UID="$(id -u)" \
+            -e HOST_GID="$(id -g)" \
             -v "$workdir/torrentngd-git:/pkg" \
             archlinux:base-devel \
-            bash -lc 'pacman -Sy --noconfirm --needed pacman-contrib && cd /pkg && makepkg --printsrcinfo > .SRCINFO'
+            bash -lc '
+              set -euo pipefail
+              pacman -Sy --noconfirm --needed pacman-contrib
+              if ! getent group "$HOST_GID" >/dev/null; then
+                groupadd -g "$HOST_GID" builder
+              fi
+              useradd -m -u "$HOST_UID" -g "$HOST_GID" builder
+              chown -R "$HOST_UID:$HOST_GID" /pkg
+              su builder -c "cd /pkg && makepkg --printsrcinfo > .SRCINFO"
+            '
           git -C "$workdir/torrentngd-git" config user.name "snapetech release bot"
           git -C "$workdir/torrentngd-git" config user.email "release@snapetech.local"
           git -C "$workdir/torrentngd-git" add PKGBUILD .SRCINFO torrentngd.service torrentngd.sysusers torrentngd.tmpfiles
