@@ -1,0 +1,135 @@
+name: Publish COPR
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish, for example main-20260616-1"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish-copr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.event.release.tag_name }}"
+          if [[ "$tag" != main-* ]]; then
+            echo "Release tags must start with main-; got $tag." >&2
+            exit 1
+          fi
+          rpm_version="${tag#main-}"
+          rpm_version="${rpm_version//-/.}"
+          {
+            echo "tag=$tag"
+            echo "rpm_version=$rpm_version"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+
+      - name: Download native release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.version.outputs.tag }}"
+          asset="torrentngd-native-${tag}-linux-x86_64.tar.gz"
+          for attempt in {1..80}; do
+            if gh release download "$tag" -R "$GITHUB_REPOSITORY" --pattern "$asset" --clobber; then
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "Timed out waiting for release asset: $asset" >&2
+          exit 1
+
+      - name: Install RPM/COPR tooling
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates krb5-user oathtool rpm python3-pip python3-venv
+          python3 -m venv /tmp/torrentng-copr
+          /tmp/torrentng-copr/bin/python -m pip install --upgrade pip
+          /tmp/torrentng-copr/bin/python -m pip install copr-cli requests-gssapi rich
+          echo /tmp/torrentng-copr/bin >> "$GITHUB_PATH"
+
+      - name: Configure COPR
+        env:
+          COPR_LOGIN: ${{ secrets.COPR_LOGIN }}
+          COPR_TOKEN: ${{ secrets.COPR_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${COPR_LOGIN:-}" || -z "${COPR_TOKEN:-}" ]]; then
+            echo "COPR_LOGIN and COPR_TOKEN are required." >&2
+            exit 1
+          fi
+          mkdir -p ~/.config
+          cat > ~/.config/copr <<EOF
+          [copr-cli]
+          login = ${COPR_LOGIN}
+          username = slskdn
+          token = ${COPR_TOKEN}
+          copr_url = https://copr.fedorainfracloud.org
+          EOF
+          copr-cli whoami >/dev/null
+
+      - name: Build SRPM
+        run: |
+          set -euo pipefail
+          tag="${{ steps.version.outputs.tag }}"
+          rpm_version="${{ steps.version.outputs.rpm_version }}"
+          asset="torrentngd-native-${tag}-linux-x86_64.tar.gz"
+          rpm_top="$(mktemp -d "/tmp/torrentng-rpmbuild-${rpm_version}.XXXXXX")"
+          mkdir -p "$rpm_top"/{SOURCES,SPECS,SRPMS}
+          cp "$asset" "$rpm_top/SOURCES/"
+          cp packaging/arch/torrentngd.service "$rpm_top/SOURCES/"
+          cp packaging/arch/torrentngd.sysusers "$rpm_top/SOURCES/"
+          cp packaging/arch/torrentngd.tmpfiles "$rpm_top/SOURCES/"
+          cp deploy/native/config.toml "$rpm_top/SOURCES/config.toml"
+          cp packaging/rpm/torrentngd.spec "$rpm_top/SPECS/"
+          sed -i "s/^Version:.*/Version:        ${rpm_version}/" "$rpm_top/SPECS/torrentngd.spec"
+          sed -i "s|^Source0:.*|Source0:        ${asset}|" "$rpm_top/SPECS/torrentngd.spec"
+          rpmbuild -bs "$rpm_top/SPECS/torrentngd.spec" --define "_topdir $rpm_top"
+          srpm="$rpm_top/SRPMS/torrentngd-${rpm_version}-1.src.rpm"
+          test -f "$srpm"
+          mkdir -p dist
+          cp "$srpm" "dist/torrentngd-${rpm_version}-1.src.rpm"
+          echo "TORRENTNG_SRPM=dist/torrentngd-${rpm_version}-1.src.rpm" >> "$GITHUB_ENV"
+
+      - name: Ensure COPR project exists
+        run: |
+          set -euo pipefail
+          if copr-cli get torrentng >/dev/null 2>&1; then
+            copr-cli modify torrentng \
+              --chroot fedora-43-x86_64 \
+              --chroot fedora-rawhide-x86_64 \
+              --description "TorrentNG RPM builds" \
+              --instructions "dnf copr enable slskdn/torrentng && dnf install torrentngd"
+          else
+            copr-cli create torrentng \
+              --chroot fedora-43-x86_64 \
+              --chroot fedora-rawhide-x86_64 \
+              --description "TorrentNG RPM builds" \
+              --instructions "dnf copr enable slskdn/torrentng && dnf install torrentngd"
+          fi
+
+      - name: Upload to COPR
+        run: |
+          set -euo pipefail
+          srpm="${TORRENTNG_SRPM:?Build SRPM step did not publish an SRPM path}"
+          test -f "$srpm"
+          copr-cli build \
+            --chroot fedora-43-x86_64 \
+            --chroot fedora-rawhide-x86_64 \
+            --nowait \
+            torrentng "$srpm"
