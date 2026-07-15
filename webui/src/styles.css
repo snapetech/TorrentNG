@@ -355,6 +355,43 @@ summary:hover {
   border-top-color: color-mix(in srgb, var(--accent) 45%, var(--border-strong)) !important;
 }
 
+.tng-status-support {
+  align-items: center;
+  display: flex;
+  gap: 5px;
+  min-width: max-content;
+}
+
+.tng-status-support > span {
+  color: var(--faint);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.tng-status-support a {
+  background: color-mix(in srgb, var(--accent) 9%, var(--bg));
+  border: 1px solid color-mix(in srgb, var(--accent) 32%, var(--border));
+  border-radius: 999px;
+  color: var(--accent-text);
+  font-size: 10px;
+  font-weight: 700;
+  padding: 3px 7px;
+  text-decoration: none;
+}
+
+.tng-status-support a:last-child {
+  color: color-mix(in srgb, var(--danger) 76%, var(--text));
+}
+
+.tng-status-support a:hover,
+.tng-status-support a:focus-visible {
+  border-color: currentColor;
+  box-shadow: 0 0 0 2px color-mix(in srgb, currentColor 18%, transparent);
+  outline: 0;
+}
+
 .tng-filter-chip,
 .tng-savedview-chip {
   transition:
@@ -1078,6 +1115,10 @@ summary:hover {
 
   .tng-statusbar-counts {
     order: 3;
+  }
+
+  .tng-status-support {
+    order: 4;
   }
 
   .tng-statusbar-spacer {
