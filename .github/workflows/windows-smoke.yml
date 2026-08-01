@@ -23,7 +23,7 @@ jobs:
       - name: Select Rust toolchain
         run: rustup default stable
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
 
