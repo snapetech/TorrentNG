@@ -21,6 +21,8 @@ certified status.
 - [PROJECT_GAP_AUDIT.md](PROJECT_GAP_AUDIT.md) - current whole-project gap
   audit across roadmaps, storage, memory, WebUI, compatibility, interop,
   security, and release evidence.
+- [WEBUI_AUDIT.md](WEBUI_AUDIT.md) - torrent-table alignment, status semantics,
+  field coverage, and the remaining cross-client projection gaps.
 - [RELEASE_EVIDENCE.md](RELEASE_EVIDENCE.md) - operator runbook for clearing
   warning rows, enforcing strict readiness, and packaging release evidence.
 

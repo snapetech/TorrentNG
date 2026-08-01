@@ -2781,9 +2781,12 @@ fn qb_server_state(rates: TransferRates) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use crate::{cache::AppEventRow, rtorrent::TransferRates};
+    use crate::{
+        cache::{AppEventRow, TorrentRow},
+        rtorrent::TransferRates,
+    };
 
-    use super::{qb_server_state, qbit_log_entry, LogMainQuery};
+    use super::{qb_server_state, qbit_log_entry, to_qb_torrent, LogMainQuery};
 
     #[test]
     fn qb_server_state_includes_current_transfer_rates() {
@@ -2811,6 +2814,16 @@ mod tests {
         assert_eq!(entry.message, "tracker warning");
         assert_eq!(entry.timestamp, 1_700_000_000);
         assert_eq!(entry.kind, 2);
+    }
+
+    #[test]
+    fn qb_torrent_maps_started_idle_rows_as_stalled() {
+        let stalled_downloading = to_qb_torrent(&torrent_row("down", false, true, false));
+        let stalled_uploading = to_qb_torrent(&torrent_row("up", false, true, true));
+
+        assert_eq!(stalled_downloading["state"], "stalledDL");
+        assert_eq!(stalled_uploading["state"], "stalledUP");
+        assert_eq!(stalled_uploading["content_path"], "/downloads/test");
     }
 
     #[test]
@@ -2855,6 +2868,37 @@ mod tests {
             "[redacted-path]"
         );
     }
+
+    fn torrent_row(hash: &str, is_active: bool, is_open: bool, complete: bool) -> TorrentRow {
+        TorrentRow {
+            hash: hash.to_owned(),
+            name: hash.to_owned(),
+            size_bytes: 100,
+            bytes_done: if complete { 100 } else { 0 },
+            down_rate: 0,
+            up_rate: 0,
+            up_total: 0,
+            down_total: 0,
+            ratio: 0,
+            is_active,
+            is_open,
+            complete,
+            state: 1,
+            priority: 0,
+            category: String::new(),
+            base_path: "/downloads/test".to_owned(),
+            directory: "/downloads/test".to_owned(),
+            creation_date: 0,
+            timestamp_finished: 0,
+            tracker_focus: 0,
+            peers_connected: 0,
+            peers_complete: 0,
+            message: String::new(),
+            tracker_url: String::new(),
+            tags: String::new(),
+            updated_at: 0,
+        }
+    }
 }
 
 // --- mapping helpers ---
@@ -2874,6 +2918,10 @@ pub fn to_qb_torrent(t: &TorrentRow) -> serde_json::Value {
         "uploading"
     } else if !t.complete && t.is_active {
         "downloading"
+    } else if t.complete {
+        "stalledUP"
+    } else if t.state == 1 {
+        "stalledDL"
     } else {
         "pausedUP"
     };
@@ -2901,6 +2949,7 @@ pub fn to_qb_torrent(t: &TorrentRow) -> serde_json::Value {
         "added_on":      t.creation_date,
         "completion_on": t.timestamp_finished,
         "save_path":     t.directory,
+        "content_path":  t.base_path,
         "downloaded":    t.down_total,
         "uploaded":      t.up_total,
         "amount_left":   (t.size_bytes - t.bytes_done).max(0),

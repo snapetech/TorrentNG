@@ -437,12 +437,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("cache.db")).unwrap();
         db.upsert(&torrent_row("queued", 1, false, false)).unwrap();
+        db.upsert(&torrent_row("stalled", 1, false, true)).unwrap();
         db.upsert(&torrent_row("stopped", 0, false, false)).unwrap();
 
         let facets = db.sidebar_facets().unwrap();
         assert_eq!(facets.status.get("queued"), Some(&1));
         assert_eq!(facets.status.get("stopped"), Some(&1));
-        assert_eq!(facets.status.get("inactive"), Some(&2));
+        assert_eq!(facets.status.get("stalled"), Some(&1));
+        assert_eq!(facets.status.get("inactive"), Some(&3));
 
         let (queued, _) = db
             .list(&ListParams {

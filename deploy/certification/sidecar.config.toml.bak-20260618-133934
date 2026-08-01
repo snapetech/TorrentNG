@@ -10,6 +10,7 @@ type = "rtorrent"
 scgi_socket = "/run/rtorrent/rpc.sock"
 timeout_secs = 10
 user_agent = "rtorrent/0.16.11/0.16.11"
+peer_id = "-lt100B-000000000000"
 
 [auth]
 secret_key = "certification-only-change-me"

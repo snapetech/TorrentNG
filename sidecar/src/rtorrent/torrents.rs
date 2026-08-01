@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::path::{Component, Path};
 
 use super::client::{Client, XmlValue};
 
@@ -34,6 +35,7 @@ pub const MULTICALL_RANGE_PAGE_SIZE: i64 = 100;
 const RTORRENT_MULTICALL_RANGE_PATCH: &str = "rtorrent-0.16.11-multicall-range";
 const LEGACY_RTORRENT_NONZERO_RATE_PATCH: &str = "rtorrent-0.16.11-multicall-nonzero-rate";
 const LEGACY_RTORRENT_LIVE_SUMMARY_PATCH: &str = "rtorrent-0.16.11-tng-live-summary";
+const RTORRENT_DEFAULT_SAVE_PATH: &str = "/downloads/temp";
 
 #[derive(Debug, Clone)]
 pub struct RawTorrent {
@@ -230,6 +232,7 @@ impl Client {
         start: bool,
     ) -> Result<()> {
         let method = if start { "load.start" } else { "load.normal" };
+        let save_path = normalize_rtorrent_save_path(save_path);
         let dir_cmd = format!("d.directory.set={save_path}");
         let category_cmd = format!("d.custom1.set={category}");
         self.call(
@@ -274,6 +277,7 @@ impl Client {
         start: bool,
     ) -> Result<()> {
         let method = if start { "load.raw_start" } else { "load.raw" };
+        let save_path = normalize_rtorrent_save_path(save_path);
         let dir_cmd = format!("d.directory.set={save_path}");
         let category_cmd = format!("d.custom1.set={category}");
         // rTorrent's raw loader expects XMLRPC base64, not a plain string.
@@ -292,7 +296,11 @@ impl Client {
     }
 
     pub async fn start(&self, hash: &str) -> Result<()> {
+        self.call_xmlrpc("d.open", &[hash.into()]).await?;
+        self.call_xmlrpc("d.resume", &[hash.into()]).await?;
+        self.call_xmlrpc("d.try_start", &[hash.into()]).await?;
         self.call_xmlrpc("d.start", &[hash.into()]).await?;
+        self.announce_trackers(hash).await?;
         Ok(())
     }
 
@@ -316,8 +324,19 @@ impl Client {
     }
 
     pub async fn reannounce(&self, hash: &str) -> Result<()> {
-        self.call("d.tracker_announce", &[hash.into()]).await?;
+        self.announce_trackers(hash).await?;
         Ok(())
+    }
+
+    async fn announce_trackers(&self, hash: &str) -> Result<()> {
+        match self.call_xmlrpc("d.tracker_announce", &[hash.into()]).await {
+            Ok(_) => Ok(()),
+            Err(err) => self
+                .call_xmlrpc("d.tracker_announce.force", &[hash.into()])
+                .await
+                .with_context(|| format!("d.tracker_announce failed first: {err}"))
+                .map(|_| ()),
+        }
     }
 
     pub async fn set_category(&self, hash: &str, category: &str) -> Result<()> {
@@ -327,7 +346,8 @@ impl Client {
     }
 
     pub async fn set_location(&self, hash: &str, location: &str) -> Result<()> {
-        self.call("d.directory.set", &[hash.into(), location.into()])
+        let location = normalize_rtorrent_save_path(location);
+        self.call_xmlrpc("d.directory.set", &[hash.into(), location.into()])
             .await?;
         Ok(())
     }
@@ -485,6 +505,36 @@ fn bool_field(fields: &[XmlValue], i: usize) -> bool {
     fields.get(i).and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
+fn normalize_rtorrent_save_path(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || trimmed == "." {
+        return RTORRENT_DEFAULT_SAVE_PATH.to_owned();
+    }
+    if trimmed.starts_with('/') {
+        return trimmed.trim_end_matches('/').to_owned();
+    }
+
+    let mut parts = Vec::new();
+    for component in Path::new(trimmed).components() {
+        match component {
+            Component::Normal(part) => {
+                if let Some(part) = part.to_str() {
+                    if !part.is_empty() {
+                        parts.push(part);
+                    }
+                }
+            }
+            Component::CurDir | Component::ParentDir | Component::RootDir | Component::Prefix(_) => {}
+        }
+    }
+
+    if parts.is_empty() {
+        RTORRENT_DEFAULT_SAVE_PATH.to_owned()
+    } else {
+        format!("{}/{}", RTORRENT_DEFAULT_SAVE_PATH, parts.join("/"))
+    }
+}
+
 fn base64_encode(data: &[u8]) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
@@ -519,7 +569,7 @@ fn base64_encode(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        bounded_range_args, live_summary_args, nonzero_rate_args,
+        bounded_range_args, live_summary_args, nonzero_rate_args, normalize_rtorrent_save_path,
         rtorrent_patch_manifest_enables_bounded_live,
     };
     use crate::rtorrent::XmlValue;
@@ -584,6 +634,28 @@ mod tests {
         assert_eq!(crate::config::DEFAULT_PEER_ID.len(), 20);
         assert!(crate::config::DEFAULT_PEER_ID.is_ascii());
         assert!(crate::config::DEFAULT_PEER_ID.starts_with("-lt100B-"));
+    }
+
+    #[test]
+    fn normalizes_relative_rtorrent_save_paths_under_writable_download_root() {
+        assert_eq!(normalize_rtorrent_save_path(""), "/downloads/temp");
+        assert_eq!(normalize_rtorrent_save_path("."), "/downloads/temp");
+        assert_eq!(
+            normalize_rtorrent_save_path("./Movie.Name.2026"),
+            "/downloads/temp/Movie.Name.2026"
+        );
+        assert_eq!(
+            normalize_rtorrent_save_path("Movie.Name.2026"),
+            "/downloads/temp/Movie.Name.2026"
+        );
+        assert_eq!(
+            normalize_rtorrent_save_path("../Movie.Name.2026"),
+            "/downloads/temp/Movie.Name.2026"
+        );
+        assert_eq!(
+            normalize_rtorrent_save_path("/downloads/download/movies"),
+            "/downloads/download/movies"
+        );
     }
 
     fn str_arg(args: &[XmlValue], index: usize) -> &str {

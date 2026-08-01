@@ -21,6 +21,8 @@ if [ ! -f "$CONFIG_FILE" ]; then
 fi
 
 if [ "$BACKEND" = "rtorrent" ]; then
+  cd /data
+
   # Start rTorrent in background
   rtorrent -n -o "import=/etc/rtorrent/rtorrent.rc" \
            -o "system.daemon.set=true" \

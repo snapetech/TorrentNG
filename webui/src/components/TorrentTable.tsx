@@ -21,7 +21,7 @@ interface Props {
 }
 
 const ROW_HEIGHT = 36
-const TABLE_MIN_WIDTH = 1080
+const TABLE_MIN_WIDTH = 1280
 
 function fmtSize(bytes: number): string {
   if (bytes >= 1e12) return (bytes / 1e12).toFixed(1) + ' TB'
@@ -35,12 +35,51 @@ function fmtSpeed(bps: number): string {
   return fmtSize(bps) + '/s'
 }
 
+function fmtDuration(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return '—'
+  const whole = Math.max(0, Math.floor(seconds))
+  const days = Math.floor(whole / 86400)
+  const hours = Math.floor((whole % 86400) / 3600)
+  const minutes = Math.floor((whole % 3600) / 60)
+  const secs = whole % 60
+  if (days > 0) return `${days}d ${hours}h`
+  if (hours > 0) return `${hours}h ${minutes}m`
+  if (minutes > 0) return `${minutes}m ${secs}s`
+  return `${secs}s`
+}
+
+function remainingBytes(t: TorrentSummary): number {
+  return Math.max(0, t.size_bytes - t.bytes_done)
+}
+
+function fmtEta(t: TorrentSummary): string {
+  if (t.size_bytes <= 0) return '—'
+  const remaining = remainingBytes(t)
+  if (remaining === 0 || t.complete) return 'Done'
+  if (t.down_rate > 0) return fmtDuration(remaining / t.down_rate)
+  if (t.is_open && !t.message) return '∞'
+  return '—'
+}
+
+function priorityLabel(priority: number): string {
+  if (priority > 0) return `High (${priority})`
+  if (priority < 0) return `Low (${priority})`
+  return 'Normal'
+}
+
+function shortPath(path: string): string {
+  if (!path) return '—'
+  if (path.length <= 34) return path
+  return `…${path.slice(-33)}`
+}
+
 function statusLabel(t: TorrentSummary): { label: string; color: string } {
   if (t.message && !t.is_active) return { label: 'Error', color: 'var(--danger)' }
   if (t.state === 0) return { label: 'Stopped', color: 'var(--faint)' }
   if (t.state === 2) return { label: 'Checking', color: 'var(--warning)' }
   if (t.complete && t.is_active) return { label: 'Seeding', color: 'var(--success)' }
   if (!t.complete && t.is_active) return { label: 'DL', color: 'var(--accent)' }
+  if (t.is_open) return { label: 'Stalled', color: 'var(--warning)' }
   return { label: 'Queued', color: 'var(--muted)' }
 }
 
@@ -50,6 +89,7 @@ function rowAccent(t: TorrentSummary): string {
   if (t.state === 2) return 'var(--warning)'
   if (t.complete && t.is_active) return 'var(--success)'
   if (!t.complete && t.is_active) return 'var(--accent)'
+  if (t.is_open) return 'var(--warning)'
   return 'transparent'
 }
 
@@ -60,30 +100,50 @@ type ColKey =
   | 'status'
   | 'size'
   | 'progress'
+  | 'remaining'
+  | 'eta'
   | 'down_rate'
   | 'up_rate'
+  | 'seeds'
+  | 'peers'
   | 'ratio'
   | 'added'
+  | 'completed'
+  | 'downloaded'
+  | 'uploaded'
+  | 'priority'
   | 'category'
   | 'tags'
   | 'tracker'
+  | 'path'
+  | 'actions'
 
 interface Col { key: ColKey; label: string; width: string; sortKey?: string; required?: boolean }
 
 const COLS: Col[] = [
-  { key: 'check',     label: '',         width: '32px', required: true },
-  { key: 'kind',      label: 'Type',     width: '52px' },
-  { key: 'name',      label: 'Name',     width: 'minmax(200px, 1fr)', sortKey: 'name' },
-  { key: 'status',    label: 'Status',   width: '72px' },
-  { key: 'size',      label: 'Size',     width: '74px', sortKey: 'size' },
-  { key: 'progress',  label: '%',        width: '56px', sortKey: 'progress' },
-  { key: 'down_rate', label: '↓',        width: '74px', sortKey: 'speed_down' },
-  { key: 'up_rate',   label: '↑',        width: '74px', sortKey: 'speed_up' },
-  { key: 'ratio',     label: 'Ratio',    width: '54px', sortKey: 'ratio' },
-  { key: 'added',     label: 'Added',    width: '80px', sortKey: 'added' },
-  { key: 'category',  label: 'Category', width: '90px' },
-  { key: 'tags',      label: 'Tags',     width: '96px' },
-  { key: 'tracker',   label: 'Tracker',  width: '120px' },
+  { key: 'check',      label: '',          width: '32px', required: true },
+  { key: 'kind',       label: 'Type',      width: '52px' },
+  { key: 'name',       label: 'Name',      width: 'minmax(220px, 1fr)', sortKey: 'name' },
+  { key: 'status',     label: 'Status',    width: '78px' },
+  { key: 'size',       label: 'Size',      width: '78px', sortKey: 'size' },
+  { key: 'progress',   label: '%',         width: '72px', sortKey: 'progress' },
+  { key: 'remaining',  label: 'Left',      width: '86px', sortKey: 'remaining' },
+  { key: 'eta',        label: 'ETA',       width: '76px' },
+  { key: 'down_rate',  label: '↓',         width: '92px', sortKey: 'speed_down' },
+  { key: 'up_rate',    label: '↑',         width: '92px', sortKey: 'speed_up' },
+  { key: 'seeds',      label: 'Seeds',     width: '60px', sortKey: 'seeds' },
+  { key: 'peers',      label: 'Peers',     width: '60px', sortKey: 'peers' },
+  { key: 'ratio',      label: 'Ratio',     width: '60px', sortKey: 'ratio' },
+  { key: 'added',      label: 'Added',     width: '88px', sortKey: 'added' },
+  { key: 'completed',  label: 'Completed', width: '96px', sortKey: 'completed' },
+  { key: 'downloaded', label: 'Downloaded', width: '92px' },
+  { key: 'uploaded',   label: 'Uploaded', width: '86px' },
+  { key: 'priority',   label: 'Priority',  width: '82px' },
+  { key: 'category',   label: 'Category',  width: '96px' },
+  { key: 'tags',       label: 'Tags',      width: '112px' },
+  { key: 'tracker',    label: 'Tracker',   width: '140px' },
+  { key: 'path',       label: 'Save path', width: 'minmax(160px, 1fr)' },
+  { key: 'actions',    label: '',          width: '132px', required: true },
 ]
 
 const DEFAULT_VISIBLE: ColKey[] = [
@@ -93,18 +153,23 @@ const DEFAULT_VISIBLE: ColKey[] = [
   'status',
   'size',
   'progress',
+  'remaining',
+  'eta',
   'down_rate',
   'up_rate',
+  'seeds',
+  'peers',
   'ratio',
   'added',
+  'completed',
   'category',
   'tags',
   'tracker',
 ]
 
-const COMPACT_VISIBLE: ColKey[] = ['check', 'kind', 'name', 'status', 'progress', 'down_rate', 'up_rate', 'ratio']
+const COMPACT_VISIBLE: ColKey[] = ['check', 'kind', 'name', 'status', 'progress', 'remaining', 'eta', 'down_rate', 'up_rate', 'seeds', 'peers', 'ratio']
 
-const COLUMN_STORAGE_KEY = 'tng.visibleColumns'
+const COLUMN_STORAGE_KEY = 'tng.visibleColumns.v2'
 
 function fmtDate(ts: number): string {
   if (!ts) return '—'
@@ -284,10 +349,10 @@ export function TorrentTable({
           {/* Header */}
           <div style={{
             display: 'grid', gridTemplateColumns: gridTemplate, gap: '0 8px',
-            padding: '0 96px 0 12px', height: 32, alignItems: 'center',
+            padding: '0 12px', height: 32, alignItems: 'center',
             background: 'var(--table-head)', borderBottom: '1px solid var(--border-strong)',
             fontSize: 11, fontWeight: 600, color: 'var(--muted)',
-            letterSpacing: '0.05em', textTransform: 'uppercase',
+            letterSpacing: '0.05em', textTransform: 'uppercase', fontVariantNumeric: 'tabular-nums',
             flexShrink: 0, userSelect: 'none', position: 'relative',
           }}>
             {/* Select-all checkbox */}
@@ -381,7 +446,7 @@ export function TorrentTable({
                   color: 'var(--faint)', fontSize: 11, margin: '2px 4px 7px',
                 }}>
                   <span>Visible columns</span>
-                  <span>{visibleCols.length - 1}/{COLS.length - 1}</span>
+                  <span>{visibleCols.filter(col => !col.required).length}/{COLS.filter(col => !col.required).length}</span>
                 </div>
                 {COLS.filter(col => !col.required).map(col => (
                   <label key={col.key} className="tng-column-menu-item" data-active={visibleKeys.includes(col.key) ? 'true' : 'false'} style={{
@@ -499,13 +564,23 @@ export function TorrentTable({
               ),
               size: <span style={{ color: 'var(--muted)' }}>{fmtSize(t.size_bytes)}</span>,
               progress: <ProgressCell value={t.size_bytes ? Math.min(100, Math.max(0, (t.bytes_done / t.size_bytes) * 100)) : null} />,
+              remaining: <span style={{ color: t.size_bytes <= 0 ? 'var(--faint)' : remainingBytes(t) ? 'var(--muted)' : 'var(--success)' }}>{t.size_bytes <= 0 ? '—' : remainingBytes(t) ? fmtSize(remainingBytes(t)) : 'Done'}</span>,
+              eta: <span title={t.down_rate > 0 ? `${remainingBytes(t).toLocaleString()} bytes at ${fmtSpeed(t.down_rate)}` : undefined} style={{ color: t.complete ? 'var(--success)' : t.is_open ? 'var(--warning)' : 'var(--faint)' }}>{fmtEta(t)}</span>,
               down_rate: <span style={{ color: t.down_rate ? 'var(--accent)' : 'var(--faint)' }}>{fmtSpeed(t.down_rate)}</span>,
               up_rate: <span style={{ color: t.up_rate ? 'var(--success)' : 'var(--faint)' }}>{fmtSpeed(t.up_rate)}</span>,
+              seeds: <span style={{ color: t.peers_complete ? 'var(--success)' : 'var(--faint)' }} title="Connected seeds">{t.peers_complete}</span>,
+              peers: <span style={{ color: t.peers_connected ? 'var(--muted)' : 'var(--faint)' }} title="Connected peers">{t.peers_connected}</span>,
               ratio: <span style={{ color: t.ratio >= 1000 ? 'var(--success)' : 'var(--muted)' }}>{(t.ratio / 1000).toFixed(2)}</span>,
               added: <span style={{ color: 'var(--faint)' }}>{fmtDate(t.creation_date)}</span>,
+              completed: <span style={{ color: 'var(--faint)' }}>{fmtDate(t.timestamp_finished)}</span>,
+              downloaded: <span style={{ color: 'var(--muted)' }}>{fmtSize(t.down_total)}</span>,
+              uploaded: <span style={{ color: 'var(--muted)' }}>{fmtSize(t.up_total)}</span>,
+              priority: <span style={{ color: 'var(--faint)' }} title={`Priority value ${t.priority}`}>{priorityLabel(t.priority)}</span>,
               category: <span style={{ color: 'var(--faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.category || '—'}</span>,
               tags: <span style={{ color: 'var(--faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={t.tags}>{t.tags || '—'}</span>,
               tracker: <span style={{ color: 'var(--faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={t.tracker_url}>{trackerHost(t.tracker_url)}</span>,
+              path: <span style={{ color: 'var(--faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={t.base_path || t.directory}>{shortPath(t.base_path || t.directory)}</span>,
+              actions: null,
             }
             return (
               <div
@@ -524,7 +599,7 @@ export function TorrentTable({
                   position: 'absolute', top: item.start, left: 0, right: 0,
                   height: ROW_HEIGHT, display: 'grid', gridTemplateColumns: gridTemplate,
                   gap: '0 8px', padding: '0 12px', alignItems: 'center',
-                  cursor: 'pointer', fontSize: 13,
+                  cursor: 'pointer', fontSize: 13, fontVariantNumeric: 'tabular-nums',
                   background: isDetail || isSelected ? 'var(--selected)'
                     : item.index % 2 === 0 ? 'var(--row)' : 'var(--row-alt)',
                   borderBottom: '1px solid var(--border)',

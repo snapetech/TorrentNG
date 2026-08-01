@@ -269,7 +269,7 @@ impl Db {
             ("seeding", "complete=1 AND is_active=1"),
             ("completed", "complete=1"),
             ("running", "is_open=1"),
-            ("queued", "state=1 AND is_active=0"),
+            ("queued", "state=1 AND is_open=0"),
             ("stopped", "state=0 AND is_active=0"),
             ("active", "is_active=1"),
             ("inactive", "is_active=0"),
@@ -359,7 +359,7 @@ fn build_where(p: &ListParams) -> (String, Vec<String>) {
             "completed" => clauses.push("t.complete=1".into()),
             "active" => clauses.push("t.is_active=1".into()),
             "inactive" => clauses.push("t.is_active=0".into()),
-            "queued" => clauses.push("t.state=1 AND t.is_active=0".into()),
+            "queued" => clauses.push("t.state=1 AND t.is_open=0".into()),
             "paused" | "stopped" => clauses.push("t.state=0 AND t.is_active=0".into()),
             "stalled" => clauses.push("t.is_open=1 AND t.is_active=0".into()),
             "stalled_uploading" => {
@@ -457,10 +457,14 @@ fn order_clause(sort: Option<&str>, dir: Option<&str>) -> String {
     let col = match sort {
         Some("name") => "t.name COLLATE NOCASE",
         Some("size") => "t.size_bytes",
+        Some("remaining") => "(t.size_bytes - t.bytes_done)",
         Some("added") => "t.creation_date",
+        Some("completed") => "t.timestamp_finished",
         Some("ratio") => "t.ratio",
         Some("speed_down") => "t.down_rate",
         Some("speed_up") => "t.up_rate",
+        Some("seeds") => "t.peers_complete",
+        Some("peers") => "t.peers_connected",
         Some("progress") => "CAST(t.bytes_done AS REAL) / NULLIF(t.size_bytes, 0)",
         _ => "t.name COLLATE NOCASE",
     };

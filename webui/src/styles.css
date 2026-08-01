@@ -201,6 +201,10 @@ button:disabled {
   background-image: linear-gradient(90deg, color-mix(in srgb, var(--warning) 8%, transparent), transparent 22%) !important;
 }
 
+.torrent-row[data-status="stalled"] {
+  background-image: linear-gradient(90deg, color-mix(in srgb, var(--warning) 7%, transparent), transparent 22%) !important;
+}
+
 .torrent-row[data-status="seeding"] {
   background-image: linear-gradient(90deg, color-mix(in srgb, var(--success) 6%, transparent), transparent 18%) !important;
 }

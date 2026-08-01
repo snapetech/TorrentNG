@@ -62,7 +62,7 @@ RUN cd rtorrent && autoreconf -fi && \
 
 # Stage 4: Runtime
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates curl libcurl ncurses openssl tinyxml2 tzdata zlib
+RUN apk add --no-cache ca-certificates curl libcurl ncurses openssl socat tinyxml2 tzdata zlib
 
 COPY --from=sidecar-build /src/sidecar/target/release/torrentng /usr/local/bin/torrentng
 COPY --from=webui-build   /sidecar/static /usr/share/torrentng/webui
