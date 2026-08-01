@@ -2,6 +2,8 @@
 
 [![Discord](https://img.shields.io/discord/4ub88HeHFm?label=Discord&logo=discord&logoColor=white)](https://discord.gg/4ub88HeHFm)
 
+Support TorrentNG through [PayPal](https://www.paypal.com/donate/?business=donations%40snape.tech) or [Ko-fi](https://ko-fi.com/snapetech).
+
 TorrentNG is a universal-compatibility torrent stack for headless servers. The
 goal is to be the torrent client you can move into or out of without losing
 workflow, state, automation, or client choice: import existing libraries, expose

@@ -167,6 +167,21 @@ export function StatusBar({
         {featureError && <Notice tone="error">{featureError}</Notice>}
         {actionMessage && <Notice tone={actionTone}>{actionMessage}</Notice>}
       </div>
+      <nav className="tng-status-support" aria-label="Support TorrentNG">
+        <span>Keep seeding</span>
+        <a
+          href="https://www.paypal.com/donate/?business=donations%40snape.tech"
+          target="_blank"
+          rel="noreferrer"
+          title="Support TorrentNG development with PayPal"
+        >PayPal</a>
+        <a
+          href="https://ko-fi.com/snapetech"
+          target="_blank"
+          rel="noreferrer"
+          title="Support TorrentNG development on Ko-fi"
+        >Ko-fi</a>
+      </nav>
       <span className="tng-statusbar-spacer" style={{ flex: 1 }} />
       <div className="tng-statusbar-metrics" style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 'max-content' }}>
         <Badge label="DL" value={fmtSpeed(stats.download_speed)} state={(stats.download_speed ?? 0) > 0 ? 'on' : 'unknown'} />
