@@ -13,7 +13,7 @@ const SHORTCUTS = [
 
 const LINKS = [
   ['Project', 'https://github.com/snapetech/TorrentNG'],
-  ['Discord support', 'https://discord.gg/4ub88HeHFm'],
+  ['Discord support', 'https://discord.gg/5PyXBfvS6T'],
   ['Donate with PayPal', 'https://www.paypal.com/donate/?business=donations%40snape.tech'],
   ['Support on Ko-fi', 'https://ko-fi.com/snapetech'],
   ['qBittorrent API compatibility', 'https://github.com/qbittorrent/qBittorrent/wiki/WebUI-API-(qBittorrent-4.1)'],

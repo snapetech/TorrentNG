@@ -1,6 +1,6 @@
 # TorrentNG
 
-[![Discord](https://img.shields.io/discord/4ub88HeHFm?label=Discord&logo=discord&logoColor=white)](https://discord.gg/4ub88HeHFm)
+[![Discord](https://img.shields.io/discord/5PyXBfvS6T?label=Discord&logo=discord&logoColor=white)](https://discord.gg/5PyXBfvS6T)
 
 Support TorrentNG through [PayPal](https://www.paypal.com/donate/?business=donations%40snape.tech) or [Ko-fi](https://ko-fi.com/snapetech).
 
@@ -351,7 +351,7 @@ Project support, setup help, integration discussion, and development updates are
 available on Discord:
 
 ```text
-https://discord.gg/4ub88HeHFm
+https://discord.gg/5PyXBfvS6T
 ```
 
 ## Legal Use

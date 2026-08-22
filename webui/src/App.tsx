@@ -1092,7 +1092,7 @@ function SettingsView({ section, onSection, mediaInference, onMediaInference, th
             padding: 18, display: 'grid', gap: 10, maxWidth: 860,
             gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
           }}>
-            <SupportCard icon="☊" title="Discord support" href="https://discord.gg/4ub88HeHFm" detail="Community support and release discussion" />
+            <SupportCard icon="☊" title="Discord support" href="https://discord.gg/5PyXBfvS6T" detail="Community support and release discussion" />
             <SupportCard icon="⌘" title="GitHub project" href="https://github.com/snapetech/TorrentNG" detail="Source, issues, and deployment files" />
             <button onClick={() => window.dispatchEvent(new KeyboardEvent('keydown', { key: '?' }))} style={{
               ...supportButton, width: '100%', minHeight: 72, textAlign: 'left',
