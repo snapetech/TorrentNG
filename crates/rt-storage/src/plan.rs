@@ -607,7 +607,10 @@ fn common_issues(
 }
 
 fn path_exists_no_follow(path: &Path) -> bool {
-    safe_symlink_metadata(path, "plan-path").is_ok()
+    let Ok(resolved) = resolve_confined_path(path) else {
+        return false;
+    };
+    safe_symlink_metadata(&resolved, "plan-path").is_ok()
 }
 
 fn staging_path(destination: &Path) -> PathBuf {

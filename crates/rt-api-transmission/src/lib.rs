@@ -240,7 +240,7 @@ async fn rpc(
             )
                 .into_response();
         }
-        let mut responses = Vec::with_capacity(requests.len());
+        let mut responses = Vec::new();
         for request in requests {
             responses.push(transmission_rpc_payload(&state, request).await);
         }

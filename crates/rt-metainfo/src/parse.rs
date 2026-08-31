@@ -618,10 +618,7 @@ mod tests {
                 (b"length", BValue::Int(28)),
                 (
                     b"path",
-                    BValue::List(vec![
-                        BValue::Bytes(b".pad"),
-                        BValue::Bytes(b"128"),
-                    ]),
+                    BValue::List(vec![BValue::Bytes(b".pad"), BValue::Bytes(b"128")]),
                 ),
             ];
             p.sort_by(|a, b| a.0.cmp(b.0));
