@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
 use crate::StorageError;
+use rt_path::SafeRelPath;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlannedStorageAction {
@@ -393,15 +394,43 @@ fn canonical_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>, StorageError> {
 }
 
 fn confine_plan_path(path: &Path, roots: &[PathBuf]) -> Result<PathBuf, StorageError> {
-    let resolved = resolve_confined_path(path)?;
-    if roots.iter().any(|root| resolved.starts_with(root)) {
-        Ok(resolved)
-    } else {
-        Err(StorageError::StagedMoveFailed {
+    let root = roots
+        .iter()
+        .find(|root| path.starts_with(root))
+        .ok_or_else(|| StorageError::StagedMoveFailed {
             step: "plan-path",
             reason: format!("path outside configured storage roots: {}", path.display()),
+        })?;
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| StorageError::StagedMoveFailed {
+            step: "plan-path",
+            reason: format!("path outside configured storage roots: {}", path.display()),
+        })?;
+    let components = relative
+        .components()
+        .map(|component| match component {
+            Component::Normal(value) => {
+                value
+                    .to_str()
+                    .ok_or_else(|| StorageError::StagedMoveFailed {
+                        step: "plan-path",
+                        reason: format!("path is not valid UTF-8: {}", path.display()),
+                    })
+            }
+            _ => Err(StorageError::StagedMoveFailed {
+                step: "plan-path",
+                reason: format!("unsafe path component: {}", path.display()),
+            }),
         })
-    }
+        .collect::<Result<Vec<_>, _>>()?;
+    let relative = SafeRelPath::from_components(&components, cfg!(windows)).map_err(|error| {
+        StorageError::StagedMoveFailed {
+            step: "plan-path",
+            reason: error.to_string(),
+        }
+    })?;
+    Ok(relative.resolve(root))
 }
 
 fn validate_plan_paths_under_roots(
