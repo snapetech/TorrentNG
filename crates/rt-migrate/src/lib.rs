@@ -1926,25 +1926,49 @@ fn collect_auxiliary_artifacts(
 }
 
 fn classify_auxiliary_artifact(root: &Path, path: &Path) -> Option<AuxiliaryArtifactKind> {
+    // Directory components are meaningful for substring matching (a
+    // "rss_feeds" folder should match "feed"). The filename stem is NOT:
+    // for per-torrent sidecar files it's frequently a 40-hex-char info
+    // hash, which - being effectively random - will occasionally contain
+    // short all-hex-letter needles like "feed" ("cfeed", "dead", "cafe",
+    // ...) purely by chance. Confirmed against a real 7351-torrent
+    // production session: several `<hash>.torrent.libtorrent_resume`
+    // sidecars (an expected, harmless rTorrent file this crate doesn't
+    // otherwise use) were misclassified as RSS config purely because
+    // their hash happened to contain "feed". So: substring match against
+    // path components, exact match only against the filename stem/name.
     let relative = path.strip_prefix(root).unwrap_or(path);
-    let mut tokens = relative
-        .components()
+    // `relative`'s own last component is the filename, not a directory -
+    // `Path::components()` doesn't distinguish, so it must be dropped here
+    // or every plain (non-nested) file would get its own random filename
+    // substring-matched as if it were a meaningful directory name.
+    let path_tokens = relative
+        .parent()
+        .into_iter()
+        .flat_map(|parent| parent.components())
         .filter_map(|component| component.as_os_str().to_str())
         .map(|component| component.to_ascii_lowercase())
         .collect::<Vec<_>>();
+    let mut name_tokens = Vec::new();
     if let Some(stem) = path.file_stem().and_then(|value| value.to_str()) {
-        tokens.push(stem.to_ascii_lowercase());
+        name_tokens.push(stem.to_ascii_lowercase());
     }
     if let Some(name) = path.file_name().and_then(|value| value.to_str()) {
-        tokens.push(name.to_ascii_lowercase());
+        name_tokens.push(name.to_ascii_lowercase());
     }
-    let joined = tokens.join("/");
+    let joined = path_tokens.join("/");
 
-    if any_aux_token(&tokens, &["rss", "feeds", "feed", "rules"]) || joined.contains("/rss/") {
+    if any_aux_token(
+        &path_tokens,
+        &name_tokens,
+        &["rss", "feeds", "feed", "rules"],
+    ) || joined.contains("/rss/")
+    {
         return Some(AuxiliaryArtifactKind::Rss);
     }
     if any_aux_token(
-        &tokens,
+        &path_tokens,
+        &name_tokens,
         &[
             "search",
             "searchengines",
@@ -1955,23 +1979,33 @@ fn classify_auxiliary_artifact(root: &Path, path: &Path) -> Option<AuxiliaryArti
     ) {
         return Some(AuxiliaryArtifactKind::Search);
     }
-    if any_aux_token(&tokens, &["scheduler", "schedule"]) {
+    if any_aux_token(&path_tokens, &name_tokens, &["scheduler", "schedule"]) {
         return Some(AuxiliaryArtifactKind::Scheduler);
     }
-    if any_aux_token(&tokens, &["autoadd", "auto_add", "watch", "watched"]) {
+    if any_aux_token(
+        &path_tokens,
+        &name_tokens,
+        &["autoadd", "auto_add", "watch", "watched"],
+    ) {
         return Some(AuxiliaryArtifactKind::AutoAdd);
     }
     if any_aux_token(
-        &tokens,
+        &path_tokens,
+        &name_tokens,
         &["blocklist", "blocklists", "ipfilter", "ip_filter", "banned"],
     ) {
         return Some(AuxiliaryArtifactKind::Blocklist);
     }
-    if any_aux_token(&tokens, &["execute", "scripts", "script", "autorun"]) {
+    if any_aux_token(
+        &path_tokens,
+        &name_tokens,
+        &["execute", "scripts", "script", "autorun"],
+    ) {
         return Some(AuxiliaryArtifactKind::Execute);
     }
     if any_aux_token(
-        &tokens,
+        &path_tokens,
+        &name_tokens,
         &[
             "plugins",
             "plugin",
@@ -1983,18 +2017,23 @@ fn classify_auxiliary_artifact(root: &Path, path: &Path) -> Option<AuxiliaryArti
     ) {
         return Some(AuxiliaryArtifactKind::Plugin);
     }
-    if any_aux_token(&tokens, &["settings", "preferences", "config"]) {
+    if any_aux_token(
+        &path_tokens,
+        &name_tokens,
+        &["settings", "preferences", "config"],
+    ) {
         return Some(AuxiliaryArtifactKind::Other);
     }
     None
 }
 
-fn any_aux_token(tokens: &[String], needles: &[&str]) -> bool {
-    tokens.iter().any(|token| {
-        needles
+fn any_aux_token(path_tokens: &[String], name_tokens: &[String], needles: &[&str]) -> bool {
+    path_tokens
+        .iter()
+        .any(|token| needles.iter().any(|needle| token.contains(needle)))
+        || name_tokens
             .iter()
-            .any(|needle| token == needle || token.contains(needle))
-    })
+            .any(|token| needles.iter().any(|needle| token == needle))
 }
 
 fn read_limited(path: &Path, max_bytes: u64) -> Result<Vec<u8>, std::io::Error> {
@@ -3133,6 +3172,40 @@ mod tests {
             .iter()
             .any(|artifact| extension_is(&artifact.path, &["torrent", "fastresume"])));
         assert!(plan.to_markdown().contains("Auxiliary Artifacts"));
+    }
+
+    #[test]
+    fn auxiliary_classification_ignores_hash_coincidences_in_filenames() {
+        // Regression test for a real false positive found scanning a real
+        // 7351-torrent production session: a per-torrent sidecar file
+        // named after its (effectively random) 40-hex-char info hash can
+        // coincidentally contain a short all-hex-letter needle like "feed"
+        // ("...c3633cfeedb..."). That must never misclassify an ordinary
+        // session file as RSS config - only meaningful path components
+        // (not the random filename) should substring-match.
+        let dir = tempfile::tempdir().unwrap();
+        let torrent_path = dir.path().join("sample.torrent");
+        let info_hash = write_fixture_torrent(&torrent_path);
+        let info_hash_hex = hex_lower(&info_hash);
+        std::fs::rename(
+            &torrent_path,
+            dir.path().join(format!("{info_hash_hex}.torrent")),
+        )
+        .unwrap();
+        // A real hash from the production session that contains "feed".
+        std::fs::write(
+            dir.path()
+                .join("128DACFE8285BA9260E26E6F15574C3633CFEEDB.torrent.libtorrent_resume"),
+            b"irrelevant contents",
+        )
+        .unwrap();
+
+        let plan = dry_run_rtorrent_session(dir.path()).unwrap();
+        assert!(
+            plan.auxiliary_artifacts.is_empty(),
+            "a hash that happens to contain \"feed\" must not be classified as RSS config: {:?}",
+            plan.auxiliary_artifacts
+        );
     }
 
     #[test]

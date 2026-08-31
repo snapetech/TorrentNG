@@ -314,7 +314,18 @@ fn parse_files_v1(info: &BValue<'_>, name: &str) -> Result<Vec<TorrentFileV1>, M
                         .to_owned(),
                     _ => return Err(MetainfoError::InvalidFieldType("path component")),
                 };
-                components.push(s);
+                // Some (old, real-world) torrent creation tools emit a
+                // vestigial empty leading path component - e.g.
+                // `path: ["", "movie.mkv"]`. Confirmed against a real,
+                // actively-seeding rTorrent production torrent: rTorrent
+                // itself silently drops it (files land at
+                // `<name>/movie.mkv`, no empty-named subdirectory), so
+                // rejecting the whole file here would import less than a
+                // real client does. `SafeRelPath` still rejects a path
+                // that ends up with zero components after this filtering.
+                if !s.is_empty() {
+                    components.push(s);
+                }
             }
             let path = SafeRelPath::from_components(&components, false)?;
             let pad = is_pad_attr(entry);
@@ -831,6 +842,52 @@ mod tests {
             panic!("expected V1")
         };
         assert_eq!(m.piece_length, 7_995_392);
+    }
+
+    #[test]
+    fn multi_file_drops_vestigial_empty_leading_path_component() {
+        // A real, ~20-year-old scene release, still actively seeding on a
+        // real rTorrent box, encodes each file's path as
+        // ["", "movie.mkv"] - a vestigial empty leading component. Real
+        // clients (confirmed: rTorrent) place the file at
+        // `<name>/movie.mkv` directly, no empty-named subdirectory.
+        // Rejecting the whole torrent over this imports less than a real
+        // client does.
+        let file_entry = BValue::Dict({
+            let mut p: Vec<(&[u8], BValue<'_>)> = vec![
+                (b"length", BValue::Int(1024)),
+                (
+                    b"path",
+                    BValue::List(vec![BValue::Bytes(b""), BValue::Bytes(b"movie.mkv")]),
+                ),
+            ];
+            p.sort_by(|a, b| a.0.cmp(b.0));
+            p
+        });
+        let pieces_data = make_pieces(1);
+        let mut info_pairs: Vec<(&[u8], BValue<'_>)> = vec![
+            (b"files", BValue::List(vec![file_entry])),
+            (b"name", BValue::Bytes(b"Old.Release-GROUP")),
+            (b"piece length", BValue::Int(512 * 1024)),
+            (b"pieces", BValue::Bytes(&pieces_data)),
+        ];
+        info_pairs.sort_by(|a, b| a.0.cmp(b.0));
+        let mut root: Vec<(&[u8], BValue<'_>)> = vec![
+            (b"announce", BValue::Bytes(b"http://t.example/a")),
+            (b"info", BValue::Dict(info_pairs)),
+        ];
+        root.sort_by(|a, b| a.0.cmp(b.0));
+        let raw = encode(&BValue::Dict(root));
+
+        let TorrentMeta::V1(m) = parse_torrent(&raw).unwrap() else {
+            panic!("expected V1")
+        };
+        assert_eq!(m.files.len(), 1);
+        assert_eq!(
+            m.files[0].path.as_display(),
+            "Old.Release-GROUP/movie.mkv",
+            "the empty component must be dropped, not preserved as a subdirectory"
+        );
     }
 
     #[test]
