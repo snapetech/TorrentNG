@@ -20,8 +20,8 @@ use rt_migrate::export::{ExportFormat, ExportPlan};
 use rt_migrate::{
     dry_run_biglybt_config, dry_run_deluge_state, dry_run_generic_torrent_directory,
     dry_run_qbittorrent_backup, dry_run_rtorrent_session, dry_run_tixati_config,
-    dry_run_transmission_session, dry_run_utorrent_config, MigrationError, MigrationPlan,
-    ResumeConfidence,
+    dry_run_transmission_session, dry_run_utorrent_config, ImportOptions, MigrationError,
+    MigrationPlan, ResumeConfidence,
 };
 
 const PIECE_LEN: i64 = 262_144;
@@ -690,4 +690,261 @@ fn generic_export_is_universal_exit() {
             .torrent_count(),
         1
     );
+}
+
+// --- production-shape regression tests --------------------------------
+//
+// These reproduce exact real-world shapes found by importing live
+// production torrents from a real rTorrent seedbox (not synthetic-only
+// coverage): real non-zero file content, `directory` pointing directly at
+// the content folder (rTorrent's own-subdirectory default, unlike
+// qBittorrent's save_path-is-parent convention this file's
+// `rtorrent_fixture` above deliberately uses), a BEP47 padding file, and
+// a folder renamed by an external tool. Each of these caused a real
+// import failure before being found and fixed this way; they must never
+// regress silently.
+
+/// Distinguishable, non-zero content so a byte-corruption bug (truncation,
+/// wrong-file swap, zero-fill) is actually detectable - unlike this file's
+/// `lay_down_data` above, which writes all-zero placeholders.
+fn distinct_content(seed: u8, len: usize) -> Vec<u8> {
+    (0..len).map(|i| seed.wrapping_add(i as u8)).collect()
+}
+
+struct MultiFileFixture {
+    raw: Vec<u8>,
+    hash_hex: String,
+    name: String,
+    /// (relative path within the content folder, content) for real files.
+    files: Vec<(String, Vec<u8>)>,
+}
+
+/// A real multi-file v1 torrent with two real files and, optionally, a
+/// BEP47 padding entry (`attr: "p"`) that is deliberately never written to
+/// disk - exactly matching what every real client does.
+fn multi_file_fixture(name: &str, include_padding: bool) -> MultiFileFixture {
+    let file_a = distinct_content(0x11, 300);
+    let file_b = distinct_content(0x77, 500);
+    let mut file_entries = vec![
+        B::D(vec![
+            (b"length".to_vec(), B::I(file_a.len() as i64)),
+            (b"path".to_vec(), B::L(vec![bs("01 - track.flac")])),
+        ]),
+        B::D(vec![
+            (b"length".to_vec(), B::I(file_b.len() as i64)),
+            (b"path".to_vec(), B::L(vec![bs("02 - track.flac")])),
+        ]),
+    ];
+    if include_padding {
+        file_entries.push(B::D(vec![
+            (b"attr".to_vec(), bs("p")),
+            (b"length".to_vec(), B::I(28)),
+            (b"path".to_vec(), B::L(vec![bs(".pad"), bs("28")])),
+        ]));
+    }
+    let total = file_a.len() as i64 + file_b.len() as i64 + if include_padding { 28 } else { 0 };
+    let piece_count = (((total + PIECE_LEN - 1) / PIECE_LEN).max(1)) as usize;
+    let pieces_blob = vec![9u8; 20 * piece_count];
+    let info = B::D(vec![
+        (b"files".to_vec(), B::L(file_entries)),
+        (b"name".to_vec(), bs(name)),
+        (b"piece length".to_vec(), B::I(PIECE_LEN)),
+        (b"pieces".to_vec(), B::S(pieces_blob)),
+    ]);
+    let raw = bencode(B::D(vec![
+        (
+            b"announce".to_vec(),
+            bs("https://tracker.example/announce"),
+        ),
+        (b"info".to_vec(), info),
+    ]));
+    let info_hash = parse_hash(&raw);
+    MultiFileFixture {
+        hash_hex: hex(&info_hash),
+        name: name.to_string(),
+        files: vec![
+            ("01 - track.flac".to_string(), file_a),
+            ("02 - track.flac".to_string(), file_b),
+        ],
+        raw,
+    }
+}
+
+/// A real rTorrent-style `.rtorrent` resume sidecar whose `directory`
+/// points directly at `content_dir` - rTorrent's actual multi-file
+/// convention, not the qBittorrent-style parent this file's
+/// `rtorrent_fixture` (above) uses.
+fn write_real_rtorrent_sidecar(session_dir: &Path, fx: &MultiFileFixture, content_dir: &Path) {
+    std::fs::write(
+        session_dir.join(format!("{}.torrent", fx.hash_hex)),
+        &fx.raw,
+    )
+    .unwrap();
+    let entry = B::D(vec![
+        (b"complete".to_vec(), B::I(1)),
+        (b"directory".to_vec(), bs(&content_dir.to_string_lossy())),
+    ]);
+    std::fs::write(
+        session_dir.join(format!("{}.rtorrent", fx.hash_hex)),
+        bencode(entry),
+    )
+    .unwrap();
+}
+
+#[test]
+fn production_shape_directory_equals_content_folder_bytes_preserved_and_trusted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session_dir = tmp.path().join("session");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let fx = multi_file_fixture("Real Album", false);
+
+    // rTorrent's own-subdirectory convention: directory == parent/name.
+    let content_dir = tmp.path().join("downloads").join(&fx.name);
+    std::fs::create_dir_all(&content_dir).unwrap();
+    for (rel, content) in &fx.files {
+        std::fs::write(content_dir.join(rel), content).unwrap();
+    }
+    write_real_rtorrent_sidecar(&session_dir, &fx, &content_dir);
+
+    let plan = dry_run_rtorrent_session(&session_dir).unwrap();
+    let torrent = one(&plan);
+    assert_eq!(
+        torrent.resume_confidence,
+        ResumeConfidence::Trusted,
+        "warnings: {:?}",
+        torrent.warnings
+    );
+
+    let fastresume_dir = tempfile::tempdir().unwrap();
+    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+    rt_db::migrate(&conn).unwrap();
+    plan.apply_native_import(
+        &mut conn,
+        fastresume_dir.path(),
+        &ImportOptions::default(),
+        ImportPolicy::TrustHints,
+    )
+    .unwrap();
+
+    // Prove what actually matters: reconstruct exactly what the daemon
+    // does at runtime (re-parse the persisted .torrent fresh, resolve
+    // each file against the DB's save_path) and verify the bytes are the
+    // real, untouched, correct ones - not just that the dry-run report
+    // claims success.
+    let row = rt_db::get(&conn, &fx.hash_hex).unwrap();
+    let save_root = PathBuf::from(&row.save_path);
+    let TorrentMeta::V1(meta) = parse_torrent(&fx.raw).unwrap() else {
+        panic!("expected V1");
+    };
+    for (file, (_, expected_content)) in meta.files.iter().zip(&fx.files) {
+        let resolved = file.path.resolve(&save_root);
+        let actual = std::fs::read(&resolved)
+            .unwrap_or_else(|e| panic!("daemon would fail to find {resolved:?}: {e}"));
+        assert_eq!(
+            &actual, expected_content,
+            "file at {resolved:?} must be byte-identical to what was on disk before import"
+        );
+    }
+}
+
+#[test]
+fn production_shape_bep47_padding_file_not_wanted_real_files_trusted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session_dir = tmp.path().join("session");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let fx = multi_file_fixture("Padded Album", true);
+
+    let content_dir = tmp.path().join("downloads").join(&fx.name);
+    std::fs::create_dir_all(&content_dir).unwrap();
+    for (rel, content) in &fx.files {
+        std::fs::write(content_dir.join(rel), content).unwrap();
+    }
+    // Deliberately never write the padding file - matching every real
+    // client (qBittorrent/rTorrent skip materializing it on disk).
+    write_real_rtorrent_sidecar(&session_dir, &fx, &content_dir);
+
+    let plan = dry_run_rtorrent_session(&session_dir).unwrap();
+    let torrent = one(&plan);
+    assert_eq!(
+        torrent.resume_confidence,
+        ResumeConfidence::Trusted,
+        "a missing padding file must not prevent trusting the real files; warnings: {:?}",
+        torrent.warnings
+    );
+
+    let fastresume_dir = tempfile::tempdir().unwrap();
+    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+    rt_db::migrate(&conn).unwrap();
+    plan.apply_native_import(
+        &mut conn,
+        fastresume_dir.path(),
+        &ImportOptions::default(),
+        ImportPolicy::TrustHints,
+    )
+    .unwrap();
+
+    let files = rt_db::list_torrent_files(&conn, &fx.hash_hex).unwrap();
+    assert_eq!(files.len(), 3, "2 real files + 1 padding entry");
+    let pad_row = files
+        .iter()
+        .find(|f| f.path.ends_with(".pad/28"))
+        .expect("padding file row present");
+    assert!(
+        !pad_row.wanted,
+        "a BEP47 padding file must never be marked wanted"
+    );
+    let real_rows: Vec<_> = files.iter().filter(|f| f.path != pad_row.path).collect();
+    assert_eq!(real_rows.len(), 2);
+    assert!(real_rows.iter().all(|f| f.wanted));
+}
+
+#[test]
+fn production_shape_directory_renamed_by_external_tool_stays_safe_metadata_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session_dir = tmp.path().join("session");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let fx = multi_file_fixture("Renamed Album", false);
+
+    // An external tool (autobrr/cross-seed-style) renamed the content
+    // folder without updating it to match the torrent's own name.
+    let content_dir = tmp
+        .path()
+        .join("downloads")
+        .join(format!("{}.__temp_owned_1", fx.name));
+    std::fs::create_dir_all(&content_dir).unwrap();
+    for (rel, content) in &fx.files {
+        std::fs::write(content_dir.join(rel), content).unwrap();
+    }
+    write_real_rtorrent_sidecar(&session_dir, &fx, &content_dir);
+
+    let plan = dry_run_rtorrent_session(&session_dir).unwrap();
+    let torrent = one(&plan);
+    assert_eq!(
+        torrent.resume_confidence,
+        ResumeConfidence::MetadataOnly,
+        "must degrade safely (recheck needed) rather than claim Trusted with paths \
+         that don't actually resolve"
+    );
+    assert_eq!(torrent.save_path.as_deref(), Some(content_dir.as_path()));
+
+    let fastresume_dir = tempfile::tempdir().unwrap();
+    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+    rt_db::migrate(&conn).unwrap();
+    plan.apply_native_import(
+        &mut conn,
+        fastresume_dir.path(),
+        &ImportOptions::default(),
+        ImportPolicy::TrustHints,
+    )
+    .unwrap();
+
+    // The real files must be completely untouched by the whole plan +
+    // apply pipeline, even though this torrent's paths don't resolve.
+    for (rel, expected_content) in &fx.files {
+        let actual = std::fs::read(content_dir.join(rel)).unwrap();
+        assert_eq!(
+            &actual, expected_content,
+            "apply must never touch real file bytes, even for a torrent it can't resolve"
+        );
+    }
 }

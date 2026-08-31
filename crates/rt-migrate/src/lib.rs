@@ -792,7 +792,6 @@ fn dry_run_session(
         }
         match migration_torrent_from_path(
             &path,
-            source,
             &resume_by_stem,
             &aggregate_resume_paths,
             options,
@@ -826,7 +825,6 @@ fn resume_sidecar_keys(stem: &str) -> Vec<String> {
 
 fn migration_torrent_from_path(
     path: &Path,
-    source: MigrationSource,
     resume_by_stem: &BTreeMap<String, PathBuf>,
     aggregate_resume_paths: &[PathBuf],
     options: &ImportOptions,
@@ -880,27 +878,37 @@ fn migration_torrent_from_path(
     let trackers = migration_trackers(&meta);
     let mut files = migration_files(&meta);
 
-    // Only correct when the parsed file paths actually carry a
+    // Only relevant when the parsed file paths actually carry a
     // torrent-name *prefix component* (v1 multi-file always does; v1
     // single-file never does - its path equals the name outright, with no
     // '/', which must NOT be mistaken for a prefix; v2/hybrid always does
-    // regardless of file count - see `strip_rtorrent_own_subdir`'s doc
+    // regardless of file count - see `correct_own_subdir_save_path`'s doc
     // comment).
-    let files_use_name_prefix = files.first().is_some_and(|file| {
-        file.path
-            .split_once('/')
-            .is_some_and(|(first, _rest)| first == meta.name())
-    });
-    if source == MigrationSource::RTorrent && files_use_name_prefix {
+    let files_use_name_prefix = files
+        .first()
+        .is_some_and(|file| file.path.contains('/'));
+    if files_use_name_prefix {
         if let Some(save_path) = &resume.save_path {
-            if let Some(corrected) = strip_rtorrent_own_subdir(save_path, meta.name()) {
-                warnings.push(format!(
-                    "rTorrent save path `{}` already includes the torrent's own \
-                     content folder; using its parent `{}` so file paths resolve correctly",
-                    save_path.display(),
-                    corrected.display()
-                ));
-                resume.save_path = Some(corrected);
+            let remapped = options.remap_path(save_path);
+            if let Some(corrected_remapped) = correct_own_subdir_save_path(&remapped, &files) {
+                // Un-remap: keep resume.save_path in the same (pre-remap)
+                // space it started in, since remap is applied again later
+                // in to_db_rows/collect_file_hints. Both a plain
+                // parent-of-original and parent-of-remapped give the same
+                // relative correction as long as remap is a prefix
+                // substitution, which PathRemap always is.
+                let corrected = save_path.parent().map(Path::to_path_buf);
+                if let Some(corrected) = corrected {
+                    warnings.push(format!(
+                        "resume save path `{}` already contains this torrent's files \
+                         directly (found on disk at `{}`); using its parent `{}` so file \
+                         paths resolve correctly",
+                        save_path.display(),
+                        corrected_remapped.display(),
+                        corrected.display()
+                    ));
+                    resume.save_path = Some(corrected);
+                }
             }
         }
     }
@@ -1774,16 +1782,46 @@ fn normalize_piece_states(
 /// runtime path resolution) assumes the qBittorrent convention: save_path
 /// is the parent, and each file's own relative path already carries the
 /// torrent-name prefix (`parse_files_v1`'s multi-file branch always
-/// prepends it). Left uncorrected, every rTorrent-imported multi-file
-/// torrent's files are unreachable both at import time and at runtime,
-/// forcing a full recheck/redownload of otherwise-complete content.
-/// Confirmed against a real rTorrent production session, not synthetic
-/// data: a multi-file torrent whose sidecar's `directory` already ended
-/// in the torrent's own name came back `ResumeConfidence::MetadataOnly`
-/// (no file hints at all) before this correction.
-fn strip_rtorrent_own_subdir(save_path: &Path, torrent_name: &str) -> Option<PathBuf> {
-    if save_path.file_name().and_then(|name| name.to_str()) == Some(torrent_name) {
-        save_path.parent().map(Path::to_path_buf)
+/// prepends it). Left uncorrected, every affected multi-file torrent's
+/// files are unreachable both at import time and at runtime, forcing a
+/// full recheck/redownload of otherwise-complete content.
+///
+/// Important constraint this has to respect: at runtime the daemon does
+/// **not** use this crate's `MigrationFile.path` at all - it re-parses the
+/// persisted `.torrent` blob fresh on every restart, and always resolves
+/// each file via `save_root.join(<that fresh, always name-prefixed
+/// path>)`. So `save_path` (this function's return value, which becomes
+/// `TorrentRow.save_path`) is the *only* lever available, and taking its
+/// parent is only ever a valid correction when `save_path`'s own basename
+/// really is the torrent's name - only then does
+/// `parent.join("<name>/<rest>")` land back on `save_path` itself and
+/// resolve real files.
+///
+/// Confirmed against two real rTorrent production torrents: one where the
+/// content folder's name matched exactly (this correction fires and is
+/// verified below), and one where an external tool (autobrr/cross-seed
+/// -style) had renamed it to `<name>.__temp_owned_<timestamp>_<n>` - a
+/// case this deliberately does **not** "fix", since no valid `save_path`
+/// value makes the daemon's unmodifiable, name-prefixed path resolution
+/// reach a differently-named folder (that would need an actual filesystem
+/// rename/symlink during apply, which this does not attempt). That case
+/// safely stays at `MetadataOnly` confidence (needs one full recheck, no
+/// data risk per the storage-layer shrink guard) rather than being
+/// silently misreported as trusted with paths that don't actually work.
+fn correct_own_subdir_save_path(save_path: &Path, files: &[MigrationFile]) -> Option<PathBuf> {
+    let parent = save_path.parent()?;
+    let mut as_is_matches = 0usize;
+    let mut via_parent_matches = 0usize;
+    for file in files.iter().take(8) {
+        if save_path.join(&file.path).is_file() {
+            as_is_matches += 1;
+        }
+        if parent.join(&file.path).is_file() {
+            via_parent_matches += 1;
+        }
+    }
+    if via_parent_matches > 0 && via_parent_matches > as_is_matches {
+        Some(parent.to_path_buf())
     } else {
         None
     }
@@ -3206,11 +3244,74 @@ mod tests {
         assert!(torrent
             .warnings
             .iter()
-            .any(|w| w.contains("already includes the torrent's own content folder")));
+            .any(|w| w.contains("already contains this torrent's files directly")));
         let trusted = torrent
             .to_fastresume_state(ImportPolicy::TrustHints)
             .expect("fastresume state");
         assert!(trusted.pieces.iter().all(|p| *p == PieceState::Valid));
+    }
+
+    #[test]
+    fn rtorrent_multi_file_directory_renamed_by_external_tool_stays_safe_not_silently_broken() {
+        // A second real-world shape found on the same production box: an
+        // external tool (autobrr/cross-seed-style) had renamed the content
+        // folder to "<name>.__temp_owned_<timestamp>_<n>" without updating
+        // it to match the torrent's own name. Unlike the exact-name-match
+        // case, this is NOT fixable via save_path alone: the daemon always
+        // re-derives each file's path fresh from the .torrent blob
+        // (unconditionally name-prefixed for multi-file torrents), so no
+        // save_path value makes it resolve into a differently-named
+        // folder without an actual filesystem rename/symlink, which this
+        // crate does not perform. The correction must NOT fire here - the
+        // torrent should stay at MetadataOnly (a safe recheck-on-import,
+        // not a false "trusted, but paths silently don't work").
+        let dir = tempfile::tempdir().unwrap();
+        let torrent_path = dir.path().join("multi.torrent");
+        let info_hash = write_two_file_fixture_torrent(&torrent_path);
+        let info_hash_hex = hex_lower(&info_hash);
+        std::fs::rename(
+            &torrent_path,
+            dir.path().join(format!("{info_hash_hex}.torrent")),
+        )
+        .unwrap();
+
+        let content_dir = dir.path().join("multi.__temp_owned_20260705T183359Z_1");
+        std::fs::create_dir_all(&content_dir).unwrap();
+        std::fs::write(content_dir.join("a.bin"), [1u8; 5]).unwrap();
+        std::fs::write(content_dir.join("b.bin"), [2u8; 7]).unwrap();
+
+        let mut resume = vec![
+            (b"complete".as_slice(), BValue::Int(1)),
+            (
+                b"directory".as_slice(),
+                BValue::Bytes(content_dir.as_os_str().as_encoded_bytes()),
+            ),
+        ];
+        resume.sort_by(|a, b| a.0.cmp(b.0));
+        std::fs::write(
+            dir.path().join(format!("{info_hash_hex}.rtorrent")),
+            encode(&BValue::Dict(resume)),
+        )
+        .unwrap();
+
+        let plan = dry_run_rtorrent_session(dir.path()).unwrap();
+        let torrent = &plan.torrents[0];
+
+        assert_eq!(
+            torrent.save_path.as_deref(),
+            Some(content_dir.as_path()),
+            "save_path must be left as-is; taking its parent would produce a path \
+             that silently fails to resolve any real file at daemon runtime"
+        );
+        assert_eq!(
+            torrent.resume_confidence,
+            ResumeConfidence::MetadataOnly,
+            "must degrade safely (needs a recheck) rather than falsely report Trusted"
+        );
+        assert!(!torrent
+            .warnings
+            .iter()
+            .any(|w| w.contains("already contains this torrent's files directly")));
     }
 
     #[test]
@@ -3256,7 +3357,7 @@ mod tests {
         assert!(!torrent
             .warnings
             .iter()
-            .any(|w| w.contains("already includes the torrent's own content folder")));
+            .any(|w| w.contains("already contains this torrent's files directly")));
     }
 
     #[test]
