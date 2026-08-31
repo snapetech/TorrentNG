@@ -170,6 +170,11 @@ function Capabilities({ data }: { data: EngineDiagnostics }) {
             <div title={cap.command} style={{ fontSize: 11, color: 'var(--faint)', marginTop: 4, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
               {cap.command}
             </div>
+            {cap.detail && (
+              <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 5, lineHeight: 1.4 }}>
+                {cap.detail}
+              </div>
+            )}
           </div>
         ))}
       </div>

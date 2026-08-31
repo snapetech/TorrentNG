@@ -63,6 +63,7 @@ impl Db {
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
         )?;
 
+        register_media_type_function(&conn)?;
         migrate(&conn)?;
 
         Ok(Self(Arc::new(Mutex::new(conn))))
@@ -277,6 +278,34 @@ impl Db {
     }
 }
 
+/// Registers `tng_media_type_match(name, category, directory, tags, media_type)`
+/// so SQL queries can classify torrents with the same word-boundary-aware
+/// logic used everywhere else, instead of raw `LIKE '%...%'` globs (which
+/// are both imprecise and, for season/episode globs, catastrophically so).
+fn register_media_type_function(conn: &Connection) -> Result<()> {
+    conn.create_scalar_function(
+        "tng_media_type_match",
+        5,
+        rusqlite::functions::FunctionFlags::SQLITE_UTF8
+            | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let name = ctx.get::<String>(0)?;
+            let category = ctx.get::<String>(1)?;
+            let directory = ctx.get::<String>(2)?;
+            let tags = ctx.get::<String>(3)?;
+            let media_type = ctx.get::<String>(4)?;
+            Ok(crate::media_type::matches(
+                &name,
+                &category,
+                &directory,
+                &tags,
+                &media_type,
+            ))
+        },
+    )?;
+    Ok(())
+}
+
 fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
@@ -440,7 +469,7 @@ mod tests {
         db.upsert(&torrent_row("stalled", 1, false, true)).unwrap();
         db.upsert(&torrent_row("stopped", 0, false, false)).unwrap();
 
-        let facets = db.sidebar_facets().unwrap();
+        let facets = db.sidebar_facets(&ListParams::default()).unwrap();
         assert_eq!(facets.status.get("queued"), Some(&1));
         assert_eq!(facets.status.get("stopped"), Some(&1));
         assert_eq!(facets.status.get("stalled"), Some(&1));

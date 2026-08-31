@@ -382,9 +382,12 @@ impl Client {
     /// Push user_agent to rTorrent's HTTP user agent setting.
     /// Called on startup and on config change via API.
     pub async fn set_user_agent(&self, user_agent: &str) -> Result<()> {
-        self.call("network.http.user_agent.set", &["".into(), user_agent.into()])
-            .await
-            .context("set network.http.user_agent")?;
+        self.call(
+            "network.http.user_agent.set",
+            &["".into(), user_agent.into()],
+        )
+        .await
+        .context("set network.http.user_agent")?;
         Ok(())
     }
 
@@ -475,7 +478,7 @@ fn parse_torrent_rows(rows: Vec<XmlValue>) -> Result<Vec<RawTorrent>> {
             complete: bool_field(&fields, 11),
             state: int_field(&fields, 12),
             priority: int_field(&fields, 13),
-            category: str_field(&fields, 14),
+            category: decode_legacy_category(str_field(&fields, 14)),
             base_path: str_field(&fields, 15),
             directory: str_field(&fields, 16),
             creation_date: int_field(&fields, 17),
@@ -489,6 +492,23 @@ fn parse_torrent_rows(rows: Vec<XmlValue>) -> Result<Vec<RawTorrent>> {
         });
     }
     Ok(torrents)
+}
+
+/// Classic ruTorrent stores the `label`/category value in `d.custom1` using
+/// PHP's `rawurlencode()` so commas and other separator characters used
+/// elsewhere in the field don't collide with real content. TorrentNG reads
+/// `d.custom1` raw, so a library migrated from ruTorrent shows categories
+/// like `linux%20iso` instead of `linux iso`. Decode defensively: only when
+/// the value actually contains a `%XX` escape and decodes to valid UTF-8, so
+/// a category that legitimately contains a literal `%` is left alone.
+fn decode_legacy_category(raw: String) -> String {
+    if !raw.contains('%') {
+        return raw;
+    }
+    match urlencoding::decode(&raw) {
+        Ok(decoded) if decoded != raw => decoded.into_owned(),
+        _ => raw,
+    }
 }
 
 fn str_field(fields: &[XmlValue], i: usize) -> String {
@@ -524,7 +544,10 @@ fn normalize_rtorrent_save_path(path: &str) -> String {
                     }
                 }
             }
-            Component::CurDir | Component::ParentDir | Component::RootDir | Component::Prefix(_) => {}
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => {}
         }
     }
 
@@ -569,10 +592,21 @@ fn base64_encode(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        bounded_range_args, live_summary_args, nonzero_rate_args, normalize_rtorrent_save_path,
-        rtorrent_patch_manifest_enables_bounded_live,
+        bounded_range_args, decode_legacy_category, live_summary_args, nonzero_rate_args,
+        normalize_rtorrent_save_path, rtorrent_patch_manifest_enables_bounded_live,
     };
     use crate::rtorrent::XmlValue;
+
+    #[test]
+    fn decode_legacy_category_decodes_rutorrent_style_encoding() {
+        assert_eq!(
+            decode_legacy_category("linux%20iso".to_owned()),
+            "linux iso"
+        );
+        assert_eq!(decode_legacy_category("books".to_owned()), "books");
+        // A literal, non-escape '%' is left alone rather than mangled.
+        assert_eq!(decode_legacy_category("100% done".to_owned()), "100% done");
+    }
 
     #[test]
     fn multicall_range_patch_enables_bounded_live_features() {

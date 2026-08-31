@@ -4,11 +4,16 @@ interface Props {
 
 const SHORTCUTS = [
   ['A', 'Open add torrent dialog'],
+  ['?', 'Open this help dialog'],
   ['Esc', 'Close dialog, details, or clear selection'],
+  ['Delete', 'Delete the selected torrent (with confirmation)'],
+  ['Ctrl/⌘+A', 'Select every loaded torrent'],
   ['Click row', 'Select or deselect torrent'],
   ['Double click row', 'Open details'],
   ['Right click row', 'Select and open actions'],
   ['Column header', 'Sort table'],
+  ['Drag column edge', 'Resize a column'],
+  ['Drag column header', 'Reorder columns'],
 ]
 
 const LINKS = [

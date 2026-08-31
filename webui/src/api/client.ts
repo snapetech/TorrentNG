@@ -822,7 +822,8 @@ export const api = {
   transferInfo: (): Promise<TransferInfo> => get('/transfer/info'),
 
   trackerHealth: (): Promise<TrackerHealthResponse> => get('/tracker-health'),
-  sidebarFacets: (): Promise<SidebarFacets> => get('/sidebar-facets'),
+  sidebarFacets: (p: Pick<ListParams, 'filter' | 'category' | 'tag' | 'tracker'> = {}): Promise<SidebarFacets> =>
+    get('/sidebar-facets', p as Record<string, string | undefined>),
   logs: (params: {
     limit?: number
     kind?: string

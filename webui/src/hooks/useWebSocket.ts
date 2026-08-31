@@ -45,7 +45,6 @@ export function useWebSocket(onStats?: (stats: LiveStats) => void, enabled = tru
     let reconnectTimer: ReturnType<typeof setTimeout>
     let closed = false
     let reconnectDelayMs = 3000
-    let eventSource: EventSource | null = null
 
     function scheduleTorrentInvalidation(hash?: string) {
       if (hash) detailHashes.current.add(hash)
@@ -122,32 +121,6 @@ export function useWebSocket(onStats?: (stats: LiveStats) => void, enabled = tru
       }
     }
 
-    function connectSse() {
-      const source = new EventSource('/api/v1/events', { withCredentials: true })
-      eventSource = source
-      source.onopen = () => {
-        reconnectDelayMs = 3000
-      }
-      source.addEventListener('torrent_delta', (e) => {
-        try {
-          const msg = JSON.parse((e as MessageEvent).data) as { torrents?: Array<{ info_hash?: string }>; removed?: string[] }
-          if (msg.torrents?.length || msg.removed?.length) {
-            for (const torrent of msg.torrents ?? []) scheduleTorrentInvalidation(torrent.info_hash)
-            for (const hash of msg.removed ?? []) scheduleTorrentInvalidation(hash)
-          }
-        } catch {
-          // malformed event - ignore
-        }
-      })
-      source.onerror = () => {
-        source.close()
-        if (!closed) {
-          reconnectTimer = setTimeout(connectSse, reconnectDelayMs)
-          reconnectDelayMs = Math.min(reconnectDelayMs * 2, 30_000)
-        }
-      }
-    }
-
     function connectWebSocket() {
       const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`
       const socket = new WebSocket(url)
@@ -164,6 +137,10 @@ export function useWebSocket(onStats?: (stats: LiveStats) => void, enabled = tru
         }
       }
 
+      socket.onerror = () => {
+        socket.close()
+      }
+
       socket.onclose = () => {
         if (!closed) {
           reconnectTimer = setTimeout(connectWebSocket, reconnectDelayMs)
@@ -172,11 +149,7 @@ export function useWebSocket(onStats?: (stats: LiveStats) => void, enabled = tru
       }
     }
 
-    if ('EventSource' in window) {
-      connectSse()
-    } else {
-      connectWebSocket()
-    }
+    connectWebSocket()
     return () => {
       closed = true
       clearTimeout(reconnectTimer)
@@ -185,7 +158,6 @@ export function useWebSocket(onStats?: (stats: LiveStats) => void, enabled = tru
       torrentsInvalidationTimer.current = null
       detailInvalidationTimer.current = null
       detailHashes.current.clear()
-      eventSource?.close()
       ws.current?.close()
     }
   }, [qc, enabled])

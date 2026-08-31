@@ -158,7 +158,7 @@ impl Db {
         let conn = self.0.lock().expect("db mutex");
 
         let total: i64 = conn.query_row(
-            &format!("SELECT COUNT(*) FROM torrents t{where_sql}"),
+            &format!("SELECT COUNT(*) FROM torrents t{TAGS_JOIN}{where_sql}"),
             params_from_iter(args.iter()),
             |r: &rusqlite::Row<'_>| r.get(0),
         )?;
@@ -259,66 +259,73 @@ impl Db {
         Ok(rows)
     }
 
-    pub fn sidebar_facets(&self) -> Result<SidebarFacets> {
+    /// Computes sidebar facet counts. `shared` supplies the free-text
+    /// search plus category/tag/tracker filters (its own `status` and
+    /// `media_type` fields are ignored) so counts stay in sync with an
+    /// active search instead of always reflecting the whole library.
+    pub fn sidebar_facets(&self, shared: &ListParams) -> Result<SidebarFacets> {
         let conn = self.0.lock().expect("db mutex");
+        let (shared_clauses, shared_args) = shared_clauses(shared);
         let mut status = std::collections::BTreeMap::new();
 
         let status_queries = [
             ("all", "1=1"),
-            ("downloading", "complete=0 AND is_active=1"),
-            ("seeding", "complete=1 AND is_active=1"),
-            ("completed", "complete=1"),
-            ("running", "is_open=1"),
-            ("queued", "state=1 AND is_open=0"),
-            ("stopped", "state=0 AND is_active=0"),
-            ("active", "is_active=1"),
-            ("inactive", "is_active=0"),
-            ("stalled", "is_open=1 AND is_active=0"),
+            ("downloading", "t.complete=0 AND t.is_active=1"),
+            ("seeding", "t.complete=1 AND t.is_active=1"),
+            ("completed", "t.complete=1"),
+            ("running", "t.is_open=1"),
+            ("queued", "t.state=1 AND t.is_open=0"),
+            ("stopped", "t.state=0 AND t.is_active=0"),
+            ("active", "t.is_active=1"),
+            ("inactive", "t.is_active=0"),
+            ("stalled", "t.is_open=1 AND t.is_active=0"),
             (
                 "stalled_uploading",
-                "complete=1 AND is_open=1 AND is_active=0",
+                "t.complete=1 AND t.is_open=1 AND t.is_active=0",
             ),
             (
                 "stalled_downloading",
-                "complete=0 AND is_open=1 AND is_active=0",
+                "t.complete=0 AND t.is_open=1 AND t.is_active=0",
             ),
-            ("checking", "state=2"),
+            ("checking", "t.state=2"),
             ("moving", "0=1"),
-            ("error", "message != '' AND is_active=0"),
+            ("error", "t.message != '' AND t.is_active=0"),
         ];
-        for (key, where_sql) in status_queries {
+        for (key, bucket_sql) in status_queries {
+            let mut clauses = shared_clauses.clone();
+            clauses.push(bucket_sql.to_owned());
+            let where_sql = clauses.join(" AND ");
             let count: i64 = conn.query_row(
-                &format!("SELECT COUNT(*) FROM torrents WHERE {where_sql}"),
-                [],
+                &format!("SELECT COUNT(*) FROM torrents t{TAGS_JOIN} WHERE {where_sql}"),
+                params_from_iter(shared_args.iter()),
                 |r| r.get(0),
             )?;
             status.insert(key.to_owned(), count);
         }
 
         let mut media_type = std::collections::BTreeMap::new();
-        let media_types = ["ebook", "tv", "video", "audio", "image", "game", "software"];
-        for key in media_types {
-            let mut clauses = Vec::new();
-            let mut args = Vec::new();
+        for key in KNOWN_MEDIA_TYPES {
+            let mut clauses = shared_clauses.clone();
+            let mut args = shared_args.clone();
             append_media_type_clause(key, &mut clauses, &mut args);
-            let where_sql = if clauses.is_empty() {
-                "1=0".to_owned()
-            } else {
-                clauses.join(" AND ")
-            };
+            let where_sql = clauses.join(" AND ");
             let count: i64 = conn.query_row(
-                &format!("SELECT COUNT(*) FROM torrents t WHERE {where_sql}"),
+                &format!("SELECT COUNT(*) FROM torrents t{TAGS_JOIN} WHERE {where_sql}"),
                 params_from_iter(args.iter()),
                 |r| r.get(0),
             )?;
-            media_type.insert(key.to_owned(), count);
+            media_type.insert((*key).to_owned(), count);
         }
 
         Ok(SidebarFacets { status, media_type })
     }
 }
 
-fn build_where(p: &ListParams) -> (String, Vec<String>) {
+/// Clauses shared by both the main torrent list query and the sidebar facet
+/// counts: free-text search plus category/tag/tracker filters. Deliberately
+/// excludes `status` and `media_type` so each facet dimension can apply its
+/// own bucket on top without filtering itself out of its own counts.
+fn shared_clauses(p: &ListParams) -> (Vec<String>, Vec<String>) {
     let mut clauses = Vec::new();
     let mut args = Vec::new();
 
@@ -348,6 +355,13 @@ fn build_where(p: &ListParams) -> (String, Vec<String>) {
             args.push(format!("%{tracker}%"));
         }
     }
+
+    (clauses, args)
+}
+
+fn build_where(p: &ListParams) -> (String, Vec<String>) {
+    let (mut clauses, mut args) = shared_clauses(p);
+
     if let Some(media_type) = &p.media_type {
         append_media_type_clause(media_type, &mut clauses, &mut args);
     }
@@ -384,73 +398,22 @@ fn build_where(p: &ListParams) -> (String, Vec<String>) {
     (where_sql, args)
 }
 
+/// Known media-type bucket keys. Anything else classifies as "no match"
+/// rather than silently matching everything.
+const KNOWN_MEDIA_TYPES: &[&str] = &["ebook", "tv", "video", "audio", "image", "game", "software"];
+
+const TAGS_JOIN: &str = " LEFT JOIN (SELECT hash, GROUP_CONCAT(tag) AS tags FROM torrent_tags GROUP BY hash) tags ON tags.hash=t.hash";
+
 fn append_media_type_clause(media_type: &str, clauses: &mut Vec<String>, args: &mut Vec<String>) {
-    let patterns: &[&str] = match media_type {
-        "ebook" => &[
-            "ebook",
-            "ebooks",
-            "book",
-            "books",
-            "audiobook",
-            ".epub",
-            ".mobi",
-            ".azw3",
-            ".pdf",
-            ".cbz",
-            ".cbr",
-        ],
-        "tv" => &[
-            "s%e%", "season", "episode", "hdtv", "web-dl", "webrip", "tv",
-        ],
-        "video" => &[
-            "movie", "movies", "film", "bluray", "bdrip", "dvdrip", "x264", "x265", "2160p",
-            "1080p", "720p", ".mkv", ".mp4", ".avi", ".mov", ".wmv", ".m4v",
-        ],
-        "audio" => &[
-            "music",
-            "album",
-            "discography",
-            ".flac",
-            ".mp3",
-            ".aac",
-            ".ogg",
-            ".opus",
-            ".wav",
-            ".m4a",
-        ],
-        "image" => &[
-            ".iso",
-            ".img",
-            ".dmg",
-            "installer",
-            "image",
-            "linux",
-            "ubuntu",
-            "debian",
-            "fedora",
-        ],
-        "game" => &[
-            "game", "games", "gog", "steam", "switch", "ps4", "ps5", "xbox",
-        ],
-        "software" => &[
-            "app", "software", "source", "code", "github", "windows", "macos", ".exe", ".msi",
-            ".pkg", ".deb", ".rpm", ".zip", ".tar", ".gz", ".xz", ".7z", ".rar",
-        ],
-        _ => &[],
-    };
-    if patterns.is_empty() {
+    if !KNOWN_MEDIA_TYPES.contains(&media_type) {
+        clauses.push("0".to_owned());
         return;
     }
-
-    let mut terms = Vec::new();
-    for pattern in patterns {
-        let idx = args.len() + 1;
-        terms.push(format!(
-            "(t.name LIKE ?{idx} COLLATE NOCASE OR t.category LIKE ?{idx} COLLATE NOCASE OR t.directory LIKE ?{idx} COLLATE NOCASE)"
-        ));
-        args.push(format!("%{pattern}%"));
-    }
-    clauses.push(format!("({})", terms.join(" OR ")));
+    let idx = args.len() + 1;
+    clauses.push(format!(
+        "tng_media_type_match(t.name, t.category, t.directory, COALESCE(tags.tags, ''), ?{idx}) = 1"
+    ));
+    args.push(media_type.to_owned());
 }
 
 fn order_clause(sort: Option<&str>, dir: Option<&str>) -> String {

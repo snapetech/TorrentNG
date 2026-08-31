@@ -2,7 +2,7 @@
 set -e
 
 RTORRENT_SOCKET=${RTORRENT_SCGI_SOCKET:-/run/rtorrent/rpc.sock}
-CONFIG_FILE=${TORRENTNG_CONFIG:-/config/config.toml}
+CONFIG_FILE=${TORRENTNG_CONFIG:-${RTORRENTNG_CONFIG:-/config/config.toml}}
 INCOMING_PORT=${RTORRENT_INCOMING_PORT:-50000}
 BACKEND=${TNG_BACKEND:-rtorrent}
 export TERM=${TERM:-xterm}

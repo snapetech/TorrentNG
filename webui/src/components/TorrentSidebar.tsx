@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, type ListParams, type SavedView } from '../api/client'
+import { maskAnnounceUrl } from '../lib/maskUrl'
 import type { MediaInferenceMode } from './AppearancePanel'
 
 type Params = Omit<ListParams, 'limit' | 'offset'>
@@ -55,7 +56,9 @@ const MAX_SECTION_ROWS = 80
 
 function cleanParams(params: Params): Params {
   return Object.fromEntries(
-    Object.entries(params).filter(([, value]) => value !== undefined && value !== ''),
+    Object.entries(params).filter(([key, value]) =>
+      key !== 'offset' && key !== 'limit' && value !== undefined && value !== null && value !== '',
+    ),
   ) as Params
 }
 
@@ -63,8 +66,24 @@ function trackerHost(url: string): string {
   try {
     return new URL(url).hostname
   } catch {
-    return url
+    return maskAnnounceUrl(url)
   }
+}
+
+function trackerFilterLabel(value: string): string {
+  if (!value) return ''
+  try {
+    return new URL(value).hostname || maskAnnounceUrl(value)
+  } catch {
+    return maskAnnounceUrl(value)
+  }
+}
+
+function safeViewTitle(params: Params): string {
+  return JSON.stringify({
+    ...params,
+    tracker: params.tracker ? maskAnnounceUrl(params.tracker) : params.tracker,
+  })
 }
 
 function countValue(value?: number): number {
@@ -74,9 +93,12 @@ function countValue(value?: number): number {
 export function TorrentSidebar({ params, total, mediaInference, onChange, onApply }: Props) {
   const qc = useQueryClient()
   const [viewName, setViewName] = useState('')
-  const [trackerFilter, setTrackerFilter] = useState(params.tracker ?? '')
+  const [trackerFilter, setTrackerFilter] = useState(() => trackerFilterLabel(params.tracker ?? ''))
   const [viewsBusy, setViewsBusy] = useState<string | null>(null)
   const [viewsError, setViewsError] = useState<string | null>(null)
+  // On narrow viewports the sidebar starts collapsed so the torrent table
+  // gets the vertical space by default; desktop ignores this (see styles.css).
+  const [mobileOpen, setMobileOpen] = useState(false)
 
   const { data: categories = [] } = useQuery({
     queryKey: ['categories'],
@@ -102,15 +124,16 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
     staleTime: 5_000,
     refetchInterval: 10_000,
   })
+  const facetParams = { filter: params.filter, category: params.category, tag: params.tag, tracker: params.tracker }
   const { data: facets } = useQuery({
-    queryKey: ['sidebar-facets'],
-    queryFn: api.sidebarFacets,
+    queryKey: ['sidebar-facets', facetParams],
+    queryFn: () => api.sidebarFacets(facetParams),
     staleTime: 5_000,
     refetchInterval: 10_000,
   })
 
   useEffect(() => {
-    setTrackerFilter(params.tracker ?? '')
+    setTrackerFilter(trackerFilterLabel(params.tracker ?? ''))
   }, [params.tracker])
 
   async function saveView() {
@@ -159,7 +182,7 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
     .filter(Boolean).length
 
   return (
-    <aside className="torrent-sidebar" style={{
+    <aside className="torrent-sidebar" aria-label="Library filters" style={{
       width: 236, flexShrink: 0, background: 'var(--panel)', borderRight: '1px solid var(--border)',
       display: 'flex', flexDirection: 'column', overflowY: 'auto',
     }}>
@@ -169,17 +192,32 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
       }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
           <span style={{ color: 'var(--text)', fontWeight: 700, fontSize: 13 }}>Library</span>
-          <span style={{
-            color: activeFilterCount ? 'var(--accent-text)' : 'var(--faint)',
-            background: activeFilterCount ? 'var(--accent-soft)' : 'var(--surface)',
-            border: '1px solid ' + (activeFilterCount ? 'var(--accent)' : 'var(--border)'),
-            borderRadius: 999, padding: '1px 7px', fontSize: 10, fontWeight: 700,
-          }}>
-            {activeFilterCount ? `${activeFilterCount} active` : 'all'}
+          <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <span style={{
+              color: activeFilterCount ? 'var(--accent-text)' : 'var(--faint)',
+              background: activeFilterCount ? 'var(--accent-soft)' : 'var(--surface)',
+              border: '1px solid ' + (activeFilterCount ? 'var(--accent)' : 'var(--border)'),
+              borderRadius: 999, padding: '1px 7px', fontSize: 10, fontWeight: 700,
+            }}>
+              {activeFilterCount ? `${activeFilterCount} active` : 'all'}
+            </span>
+            <button
+              type="button"
+              className="tng-sidebar-mobile-toggle"
+              onClick={() => setMobileOpen(o => !o)}
+              aria-expanded={mobileOpen}
+              style={{
+                background: 'var(--surface)', border: '1px solid var(--border-strong)', borderRadius: 5,
+                color: 'var(--muted)', padding: '3px 8px', fontSize: 11, cursor: 'pointer',
+              }}
+            >
+              {mobileOpen ? 'Hide filters' : 'Filters'}
+            </button>
           </span>
         </div>
       </div>
 
+      <div className="tng-sidebar-body" data-mobile-open={mobileOpen ? 'true' : 'false'}>
       <Section title="State" summary={facets ? `${facets.status.all?.toLocaleString() ?? total.toLocaleString()} total` : undefined}>
         {STATUS_OPTIONS.map(option => (
           <CountRow
@@ -342,7 +380,7 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
             <button
               onClick={() => onApply(view.params)}
               disabled={Boolean(viewsBusy)}
-              title={JSON.stringify(view.params)}
+              title={safeViewTitle(view.params)}
               style={{ ...savedViewButtonStyle, opacity: viewsBusy ? 0.55 : 1, cursor: viewsBusy ? 'not-allowed' : 'pointer' }}
             >
               <span style={labelStyle}>{view.name}</span>
@@ -388,6 +426,7 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
           </button>
         </div>
       )}
+      </div>
     </aside>
   )
 }

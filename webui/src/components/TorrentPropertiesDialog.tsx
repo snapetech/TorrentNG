@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, type TorrentSummary, type TorrentFile, type Tracker } from '../api/client'
+import { TrackerUrl } from '../lib/maskUrl'
 
 type Tab = 'general' | 'trackers' | 'files' | 'limits'
 
@@ -160,7 +161,10 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
                 </Field>
                 <div className="tng-two-col" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, color: 'var(--muted)', fontSize: 12 }}>
                   <Info label="Hash" value={torrent.hash} mono />
-                  <Info label="Tracker" value={torrent.tracker_url || '-'} mono />
+                  <div className="tng-metric-tile" style={{ border: '1px solid var(--border)', borderRadius: 7, background: 'var(--surface)', padding: 9 }}>
+                    <div style={{ color: 'var(--faint)', fontSize: 10, textTransform: 'uppercase', marginBottom: 3 }}>Tracker</div>
+                    <div style={{ overflowWrap: 'anywhere' }}>{torrent.tracker_url ? <TrackerUrl url={torrent.tracker_url} /> : '-'}</div>
+                  </div>
                   <Info label="Save path" value={torrent.directory || '-'} mono />
                   <Info label="Message" value={torrent.message || '-'} />
                 </div>
@@ -203,7 +207,7 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
                     ) : (
                       <div className="tng-action-grid-3" style={{ display: 'grid', gridTemplateColumns: '1fr auto auto', gap: 7, alignItems: 'center' }}>
                         <div>
-                          <div style={{ color: 'var(--text)', fontFamily: 'monospace', fontSize: 11, overflowWrap: 'anywhere' }}>{tracker.url}</div>
+                          <div style={{ color: 'var(--text)', fontSize: 11, overflowWrap: 'anywhere' }}><TrackerUrl url={tracker.url} /></div>
                           <div style={{ color: 'var(--faint)', fontSize: 11 }}>{tracker.scrape_complete} seeds, {tracker.scrape_incomplete} peers {tracker.message ? `- ${tracker.message}` : ''}</div>
                         </div>
                         <button disabled={busy} onClick={() => setEditingTracker(tracker)} style={smallButton('#94a3b8', busy)}>Edit</button>
@@ -225,6 +229,7 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
                 {files.map(file => <FileRow
                   key={file.index}
                   file={file}
+                  torrentComplete={torrent.complete}
                   busy={busy}
                   renaming={renamingFile?.index === file.index}
                   name={fileName}
@@ -272,8 +277,9 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
   )
 }
 
-function FileRow({ file, busy, renaming, name, onName, onRenameStart, onRenameCancel, onRenameSave, onPriority }: {
+function FileRow({ file, torrentComplete, busy, renaming, name, onName, onRenameStart, onRenameCancel, onRenameSave, onPriority }: {
   file: TorrentFile
+  torrentComplete: boolean
   busy: boolean
   renaming: boolean
   name: string
@@ -283,7 +289,13 @@ function FileRow({ file, busy, renaming, name, onName, onRenameStart, onRenameCa
   onRenameSave: () => void
   onPriority: (priority: number) => void
 }) {
-  const pct = file.size_chunks ? Math.round((file.completed_chunks / file.size_chunks) * 100) : 100
+  // A wanted file (priority !== 0) in a torrent the backend already reports
+  // as fully complete can't itself be incomplete - trust that over a
+  // stale/uninitialized per-file chunk count (observed showing 0% for files
+  // that are actually done).
+  const pct = torrentComplete && file.priority !== 0
+    ? 100
+    : file.size_chunks ? Math.round((file.completed_chunks / file.size_chunks) * 100) : 100
   const priority = file.priority === 0
     ? { label: 'Skipped', color: 'var(--faint)' }
     : file.priority >= 2

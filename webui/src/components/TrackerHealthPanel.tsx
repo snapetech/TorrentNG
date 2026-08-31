@@ -1,11 +1,12 @@
 import { useQuery } from '@tanstack/react-query'
 import { api } from '../api/client'
+import { maskAnnounceUrl, TrackerUrl } from '../lib/maskUrl'
 
 function hostLabel(url: string): string {
   try {
-    return new URL(url).host || url
+    return new URL(url).host || maskAnnounceUrl(url)
   } catch {
-    return url
+    return maskAnnounceUrl(url)
   }
 }
 
@@ -14,7 +15,16 @@ function fmtDate(ts: number): string {
   return new Date(ts * 1000).toLocaleString()
 }
 
-export function TrackerHealthPanel() {
+interface Props {
+  /** Jump to the torrent list filtered to this tracker. Errored trackers are
+   * otherwise a dead end: this panel can tell you 208 torrents have tracker
+   * errors, but without this there's no way to find which ones - the
+   * per-torrent STATE "Errored" filter tracks a different thing (the
+   * torrent's own message/is_active) and stays at 0 regardless. */
+  onSelectTracker?: (tracker: string) => void
+}
+
+export function TrackerHealthPanel({ onSelectTracker }: Props) {
   const { data, isLoading, isFetching, error, refetch } = useQuery({
     queryKey: ['tracker-health'],
     queryFn: api.trackerHealth,
@@ -75,12 +85,16 @@ export function TrackerHealthPanel() {
               key={tracker.tracker}
               className="tng-card tng-tracker-row"
               data-tone={errorRatio >= 0.5 ? 'error' : errorRatio > 0 ? 'warn' : 'ok'}
+              role={onSelectTracker ? 'group' : undefined}
+              title={onSelectTracker ? `View torrents on ${hostLabel(tracker.tracker)}` : undefined}
+              onClick={onSelectTracker ? () => onSelectTracker(tracker.tracker) : undefined}
               style={{
                 display: 'grid',
                 gridTemplateColumns: 'minmax(220px, 1fr) 90px 90px 90px 120px',
                 minWidth: 680,
                 gap: 12,
                 alignItems: 'center',
+                cursor: onSelectTracker ? 'pointer' : undefined,
                 border: `1px solid color-mix(in srgb, ${color} 45%, var(--border))`,
                 borderRadius: 6,
                 padding: '9px 12px',
@@ -94,15 +108,31 @@ export function TrackerHealthPanel() {
                   <span style={{
                     color: 'var(--text)', fontWeight: 700, overflow: 'hidden',
                     textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                  }} title={tracker.tracker}>
+                  }} title={maskAnnounceUrl(tracker.tracker)}>
                     {hostLabel(tracker.tracker)}
                   </span>
+                  {onSelectTracker && (
+                    <button
+                      type="button"
+                      onClick={e => { e.stopPropagation(); onSelectTracker(tracker.tracker) }}
+                      style={{
+                        border: 0, background: 'none', padding: 0,
+                        color: 'var(--accent)', fontSize: 11, flexShrink: 0,
+                        cursor: 'pointer',
+                      }}
+                    >
+                      View torrents →
+                    </button>
+                  )}
                 </div>
-                <div style={{
-                  color: 'var(--faint)', fontFamily: 'monospace', overflow: 'hidden',
-                  textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: 2,
-                }} title={tracker.tracker}>
-                  {tracker.tracker}
+                <div
+                  onClick={e => e.stopPropagation()}
+                  style={{
+                    color: 'var(--faint)', overflow: 'hidden',
+                    textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: 2,
+                  }}
+                >
+                  <TrackerUrl url={tracker.tracker} />
                 </div>
               </div>
 

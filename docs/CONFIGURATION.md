@@ -416,6 +416,10 @@ Use these only for lab compatibility testing. Tracker-facing identity is still c
 | `api_tokens` | `[]` | `TNG_API_TOKENS` | Comma-separated pre-shared bearer tokens for automation tools |
 | `trust_proxy_header` | `false` | - | Trust `X-Remote-User` from reverse proxy |
 
+For compatibility with older installed `rtorrentng-prod` units, the sidecar
+also accepts the former `RTNG_*` spelling for environment overrides. When both
+names are set, the canonical `TNG_*` value wins.
+
 ### Sidecar `[logging]`
 
 `debug = true` and `TNG_DEBUG=1` remain supported as legacy aliases for debug-level logging. `RUST_LOG` has the highest precedence, followed by `TNG_LOG_FILTER` or `logging.filter`, then `logging.profile`, then the legacy debug setting.

@@ -35,12 +35,12 @@ pub struct HealthResponse {
 
 pub async fn health(State(s): State<AppState>) -> impl IntoResponse {
     let cached = s.db.count().unwrap_or(0);
-    let backend_status = match tokio::time::timeout(Duration::from_secs(3), s.backend.health()).await
-    {
-        Ok(status) => status,
-        Err(_) if cached > 0 => BackendStatus::Connected,
-        Err(_) => BackendStatus::Unreachable,
-    };
+    let backend_status =
+        match tokio::time::timeout(Duration::from_secs(3), s.backend.health()).await {
+            Ok(status) => status,
+            Err(_) if cached > 0 => BackendStatus::Connected,
+            Err(_) => BackendStatus::Unreachable,
+        };
     let connected = backend_status == BackendStatus::Connected;
     let status = if connected {
         StatusCode::OK
@@ -170,8 +170,11 @@ pub async fn tracker_health(State(s): State<AppState>) -> impl IntoResponse {
     }
 }
 
-pub async fn sidebar_facets(State(s): State<AppState>) -> impl IntoResponse {
-    match s.db.sidebar_facets() {
+pub async fn sidebar_facets(
+    State(s): State<AppState>,
+    Query(params): Query<ListParams>,
+) -> impl IntoResponse {
+    match s.db.sidebar_facets(&params) {
         Ok(facets) => Json(facets).into_response(),
         Err(e) => {
             tracing::error!(component = "api", operation = "sidebar_facets", result = "error", error = %e, "sidebar facet query failed");

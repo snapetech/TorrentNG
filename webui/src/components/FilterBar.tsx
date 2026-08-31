@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import type { ListParams } from '../api/client'
+import { maskAnnounceUrl } from '../lib/maskUrl'
 
 interface Props {
   params: ListParams
@@ -21,9 +22,14 @@ export function FilterBar({ params, onChange }: Props) {
   ].filter(Boolean) as Array<[string, string, keyof ListParams]>
 
   useEffect(() => {
+    if (search === (params.filter ?? '')) return
     const t = setTimeout(() => onChange({ filter: search, offset: 0 }), 200)
     return () => clearTimeout(t)
-  }, [search, onChange])
+  }, [search, params.filter, onChange])
+
+  useEffect(() => {
+    setSearch(params.filter ?? '')
+  }, [params.filter])
 
   return (
     <div className="tng-filterbar" style={{
@@ -140,14 +146,14 @@ export function FilterBar({ params, onChange }: Props) {
             <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{sortLabel}</span>
           </span>
           {chips.map(([label, value, key]) => (
-            <span key={`${label}:${value}`} className="tng-filter-chip" title={value} style={{
+            <span key={`${label}:${value}`} className="tng-filter-chip" title={key === 'tracker' ? maskAnnounceUrl(value) : value} style={{
               display: 'inline-flex', alignItems: 'center', gap: 4,
               maxWidth: 190, border: '1px solid var(--border)', borderRadius: 999,
               background: 'var(--surface)', color: 'var(--muted)', padding: '2px 7px',
               fontSize: 11,
             }}>
               <span style={{ color: 'var(--faint)' }}>{label}</span>
-              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{value}</span>
+              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{key === 'tracker' ? maskAnnounceUrl(value) : value}</span>
               <button
                 type="button"
                 aria-label={`Clear ${label} filter`}

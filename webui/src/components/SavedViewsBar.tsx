@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, type ListParams, type SavedView } from '../api/client'
+import { maskAnnounceUrl } from '../lib/maskUrl'
 
 interface Props {
   params: Omit<ListParams, 'limit' | 'offset'>
@@ -9,8 +10,35 @@ interface Props {
 
 function cleanParams(params: Omit<ListParams, 'limit' | 'offset'>): Omit<ListParams, 'limit' | 'offset'> {
   return Object.fromEntries(
-    Object.entries(params).filter(([, value]) => value !== undefined && value !== ''),
+    Object.entries(params).filter(([key, value]) =>
+      // `offset` is pagination position, not filter identity - several
+      // onChange calls pass `offset: 0` as a side-channel "reset to page 1"
+      // signal alongside an unrelated real change (or, from FilterBar's
+      // debounced search effect, with no real change at all), so it ends up
+      // in `params` even though the Props type says it shouldn't. Treating
+      // it as a "filter" made every view look permanently unsaved.
+      key !== 'offset' && key !== 'limit' && value !== undefined && value !== null && value !== '',
+    ),
   ) as Omit<ListParams, 'limit' | 'offset'>
+}
+
+/** JSON.stringify with sorted keys, so two objects with the same fields in a
+ * different order (e.g. `sort` before `dir` vs after, which happens
+ * depending on where a params object came from) compare as equal. Without
+ * this, the "Unsaved view" badge showed permanently, even immediately after
+ * login with zero filters applied, whenever a saved view's params happened
+ * to serialize with a different key order than the live params object. */
+function stableKey(params: Omit<ListParams, 'limit' | 'offset'>): string {
+  return JSON.stringify(
+    Object.fromEntries(Object.entries(params).sort(([a], [b]) => a.localeCompare(b))),
+  )
+}
+
+function safeViewTitle(params: Omit<ListParams, 'limit' | 'offset'>): string {
+  return JSON.stringify({
+    ...params,
+    tracker: params.tracker ? maskAnnounceUrl(params.tracker) : params.tracker,
+  })
 }
 
 export function SavedViewsBar({ params, onApply }: Props) {
@@ -24,9 +52,15 @@ export function SavedViewsBar({ params, onApply }: Props) {
     staleTime: 30_000,
   })
   const activeParams = cleanParams(params)
-  const activeKey = JSON.stringify(activeParams)
-  const hasActiveFilters = Object.keys(activeParams).length > 0
-  const hasSavedCurrentView = views.some(view => JSON.stringify(cleanParams(view.params)) === activeKey)
+  const activeKey = stableKey(activeParams)
+  // sort/dir are always present (name/asc by default) and aren't something
+  // a user would think of as a "filter" - only count the fields that narrow
+  // the result set, so the badge doesn't light up on a pristine, unfiltered
+  // view just because there's no saved view whose sort/dir happens to match.
+  const hasActiveFilters = Object.keys(activeParams).some(
+    key => key !== 'sort' && key !== 'dir',
+  )
+  const hasSavedCurrentView = views.some(view => stableKey(cleanParams(view.params)) === activeKey)
 
   async function saveView() {
     const trimmed = name.trim()
@@ -85,7 +119,7 @@ export function SavedViewsBar({ params, onApply }: Props) {
       }}>{error}</span>}
 
       {views.map(view => {
-        const isActive = JSON.stringify(cleanParams(view.params)) === activeKey
+        const isActive = stableKey(cleanParams(view.params)) === activeKey
         return (
           <span key={view.id} className="tng-savedview-chip" data-active={isActive} style={{
             display: 'inline-flex', alignItems: 'center', gap: 4,
@@ -97,7 +131,7 @@ export function SavedViewsBar({ params, onApply }: Props) {
             <button
               onClick={() => onApply(view.params)}
               disabled={Boolean(busy)}
-              title={JSON.stringify(view.params)}
+              title={safeViewTitle(view.params)}
               style={{
                 background: 'transparent', border: 'none',
                 color: isActive ? 'var(--accent-text)' : 'var(--muted)',

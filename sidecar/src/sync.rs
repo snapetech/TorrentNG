@@ -54,6 +54,7 @@ pub async fn run(
     );
     let mut page_offset = 0i64;
     let mut full_cycle_seen = HashSet::new();
+    let mut full_cycle_had_errors = false;
     let mut tracker_cache = HashMap::new();
     let mut sync_error_active = false;
 
@@ -66,6 +67,7 @@ pub async fn run(
                 &tx,
                 &mut page_offset,
                 &mut full_cycle_seen,
+                &mut full_cycle_had_errors,
                 &mut tracker_cache,
             )
             .await
@@ -108,11 +110,17 @@ pub async fn run(
             }
             Err(e) => {
                 metrics.sync_errors_total.fetch_add(1, Ordering::Relaxed);
+                // `e.to_string()`/`%e` only print the outermost `.context()`
+                // layer (e.g. "d.multicall.range main offset=200 limit=100")
+                // and silently drop the actual XMLRPC fault underneath it,
+                // which is the one detail that would explain *why* the
+                // multicall failed. `error_chain` keeps the whole chain.
+                let chain = error_chain(&e);
                 warn!(
                     component = backend.backend_type().as_str(),
                     operation = "sync",
                     result = "error",
-                    error = %e,
+                    error = %chain,
                     "backend sync failed"
                 );
                 if !sync_error_active {
@@ -125,7 +133,7 @@ pub async fn run(
                             "component": backend.backend_type().as_str(),
                             "operation": "sync",
                             "result": "error",
-                            "error": e.to_string(),
+                            "error": chain,
                         }),
                         event_retention,
                     );
@@ -134,6 +142,20 @@ pub async fn run(
             }
         }
     }
+}
+
+/// Renders every layer of an anyhow error chain, not just the outermost
+/// `.context()` message. `anyhow::Error::to_string()` / `%e` only show the
+/// top layer, which for these sync errors is always the same generic
+/// "d.multicall.range <view> offset=<n> limit=<n>" wrapper - the actual
+/// XMLRPC fault (the useful part for diagnosing *why* it failed) is one or
+/// more levels deeper and was previously invisible in both the tracing log
+/// and the persisted operator-log event.
+pub(crate) fn error_chain(e: &anyhow::Error) -> String {
+    e.chain()
+        .map(|cause| cause.to_string())
+        .collect::<Vec<_>>()
+        .join(" -> caused by: ")
 }
 
 fn append_app_event(
@@ -198,6 +220,7 @@ async fn tick_bounded(
     tx: &broadcast::Sender<Event>,
     page_offset: &mut i64,
     full_cycle_seen: &mut HashSet<String>,
+    full_cycle_had_errors: &mut bool,
     tracker_cache: &mut HashMap<String, Option<String>>,
 ) -> anyhow::Result<SyncCounts> {
     let now = chrono::Utc::now().timestamp();
@@ -225,31 +248,106 @@ async fn tick_bounded(
         ),
     }
 
-    let page = backend
-        .list_torrents_range("main", *page_offset, MULTICALL_RANGE_PAGE_SIZE)
-        .await?;
-    let page_len = page.len() as i64;
+    let fetched = fetch_range_resilient(backend, *page_offset, MULTICALL_RANGE_PAGE_SIZE).await;
+    let page_len = fetched.torrents.len() as i64;
+    *full_cycle_had_errors |= fetched.had_errors;
 
-    for t in &page {
+    for t in &fetched.torrents {
         full_cycle_seen.insert(t.hash.clone());
         if touched.insert(t.hash.clone()) {
             upsert_torrent(db, tx, t, now, &mut counts, tracker_cache);
         }
     }
 
+    // A short page means "reached the end of the torrent list". Only perform
+    // removed-torrent cleanup after a completely clean cycle: a failed page
+    // may have omitted a live torrent, and deleting it from the cache here
+    // would turn a transient XMLRPC fault into data loss. The error flag must
+    // live for the whole cycle, not just this final short page.
     if page_len < MULTICALL_RANGE_PAGE_SIZE {
-        let known = db.all_hashes()?;
-        for hash in known.difference(full_cycle_seen) {
-            let _ = db.delete(hash);
-            let _ = tx.send(Event::TorrentRemoved { hash: hash.clone() });
+        if !*full_cycle_had_errors {
+            let known = db.all_hashes()?;
+            for hash in known.difference(full_cycle_seen) {
+                let _ = db.delete(hash);
+                let _ = tx.send(Event::TorrentRemoved { hash: hash.clone() });
+            }
+        } else {
+            warn!(
+                component = backend.backend_type().as_str(),
+                operation = "bounded_sync_cleanup",
+                result = "skipped",
+                "skipping removed-torrent cleanup because an earlier page in this cycle had fetch errors"
+            );
         }
         full_cycle_seen.clear();
+        *full_cycle_had_errors = false;
         *page_offset = 0;
     } else {
-        *page_offset += page_len;
+        *page_offset += MULTICALL_RANGE_PAGE_SIZE;
     }
 
     Ok(counts)
+}
+
+struct ResilientFetch {
+    torrents: Vec<RawTorrent>,
+    /// True if any sub-range in this fetch failed (and was skipped) even
+    /// after bisecting down to a single torrent. The caller must not treat
+    /// a short result as "end of list" when this is set.
+    had_errors: bool,
+}
+
+/// Fetches `[offset, offset+limit)` via `d.multicall.range`, and on failure
+/// bisects the range and retries each half so a single torrent whose fields
+/// can't be read (observed in production as intermittent
+/// `d.multicall.range` faults at varying offsets) only costs that one
+/// torrent's data for this tick, rather than the entire page silently going
+/// stale until the next successful cycle.
+fn fetch_range_resilient(
+    backend: &dyn TorrentBackend,
+    offset: i64,
+    limit: i64,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ResilientFetch> + Send + '_>> {
+    Box::pin(async move {
+        match backend.list_torrents_range("main", offset, limit).await {
+            Ok(torrents) => ResilientFetch {
+                torrents,
+                had_errors: false,
+            },
+            Err(e) if limit > 1 => {
+                warn!(
+                    component = backend.backend_type().as_str(),
+                    operation = "list_torrents_range_bisect",
+                    offset,
+                    limit,
+                    error = %error_chain(&e),
+                    "range fetch failed, bisecting to isolate the faulting torrent(s)"
+                );
+                let left_limit = limit / 2;
+                let right_limit = limit - left_limit;
+                let mut left = fetch_range_resilient(backend, offset, left_limit).await;
+                let right = fetch_range_resilient(backend, offset + left_limit, right_limit).await;
+                left.torrents.extend(right.torrents);
+                ResilientFetch {
+                    torrents: left.torrents,
+                    had_errors: left.had_errors || right.had_errors,
+                }
+            }
+            Err(e) => {
+                warn!(
+                    component = backend.backend_type().as_str(),
+                    operation = "list_torrents_range_skip",
+                    offset,
+                    error = %error_chain(&e),
+                    "skipping one torrent whose fields could not be fetched this cycle"
+                );
+                ResilientFetch {
+                    torrents: Vec::new(),
+                    had_errors: true,
+                }
+            }
+        }
+    })
 }
 
 fn upsert_torrent(

@@ -94,13 +94,14 @@ const preloadSettingsPanels = {
   engine: () => {
     void import('./components/EnginePanel')
     void import('./components/UserAgentPanel')
+    void import('./components/LogsPanel')
   },
   automation: () => {
     void import('./components/RatioGroupsPanel')
     void import('./components/WorkflowsPanel')
     void import('./components/RssRulesPanel')
   },
-  support: () => void import('./components/LogsPanel'),
+  support: () => {},
 } satisfies Record<SettingsSection, () => void>
 
 function preloadSettingsSection(section: SettingsSection) {
@@ -265,6 +266,10 @@ export function App() {
   const [detailAutoDisplay, setDetailAutoDisplay] = useState(loadDetailAutoDisplay)
   const activeTheme = findPalette(themeId)[themeMode]
 
+  const updateParams = useCallback((p: Partial<typeof params>) => {
+    setParams(prev => ({ ...prev, ...p }))
+  }, [])
+
   const isAuthed = activeTab.isActive && authState === 'authenticated'
   const query = useTorrentsInfinite(params, isAuthed)
   const { torrents, total } = flattenPages(query.data)
@@ -281,7 +286,9 @@ export function App() {
     queryKey: ['transfer-info', 'status-bar'],
     queryFn: api.transferInfo,
     enabled: isAuthed,
-    refetchInterval: 2_000,
+    // Live speeds normally arrive via the WebSocket `stats` event; this is
+    // a slow safety net for when the socket is unavailable.
+    refetchInterval: 15_000,
   })
 
   const handleStats = useCallback((stats: LiveStats) => setLiveStats(stats), [])
@@ -401,21 +408,36 @@ export function App() {
         if (detailHash) { setDetailHash(null); return }
         if (selected.size > 0) { setSelected(new Set()); return }
       }
-      if (e.key === '?' && !(e.target instanceof HTMLInputElement) && !(e.target instanceof HTMLTextAreaElement)) {
+      const inTextField = e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement
+      if (e.key === '?' && !inTextField) {
         setHelpOpen(true)
         return
       }
       // 'a' key to open add dialog when not in an input
-      if (e.key === 'a' && !(e.target instanceof HTMLInputElement) && !(e.target instanceof HTMLTextAreaElement)) {
+      if (e.key === 'a' && !inTextField && !e.ctrlKey && !e.metaKey) {
         setAddOpen(true)
+        return
+      }
+      if ((e.key === 'Delete' || e.key === 'Backspace') && !inTextField && selected.size === 1
+        && !contextMenu && !helpOpen && !pendingDelete && !bulkEditOpen && !propertiesHash && !addOpen) {
+        const hash = [...selected][0]
+        const torrent = torrents.find(t => t.hash === hash)
+        if (torrent) { e.preventDefault(); setPendingDelete(torrent) }
+        return
+      }
+      if (e.key === 'a' && (e.ctrlKey || e.metaKey) && !inTextField) {
+        e.preventDefault()
+        handleSelectAll(torrents.map(t => t.hash))
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [addOpen, bulkEditOpen, contextMenu, detailHash, helpOpen, pendingDelete, propertiesHash, selected.size])
+  }, [addOpen, bulkEditOpen, contextMenu, detailHash, helpOpen, pendingDelete, propertiesHash, selected, torrents])
 
-  function updateParams(p: Partial<typeof params>) {
-    setParams(prev => ({ ...prev, ...p }))
+  function goToTrackerTorrents(tracker: string) {
+    setParams(prev => ({ ...prev, tracker, offset: 0 }))
+    setSelected(new Set())
+    setView('torrents')
   }
 
   function applySavedView(next: typeof params) {
@@ -623,17 +645,16 @@ export function App() {
         display: 'flex', alignItems: 'center', padding: '0 16px', gap: 12, flexShrink: 0,
         minWidth: 0, overflowX: 'auto', overflowY: 'hidden', scrollbarWidth: 'thin',
       }}>
-        <span style={{
+        <h1 style={{
           fontWeight: 800, fontSize: 15, color: 'var(--text)', flex: '0 0 auto',
-          display: 'inline-flex', alignItems: 'center', gap: 7,
+          display: 'inline-flex', alignItems: 'center', gap: 7, margin: 0,
         }}>
-          <span style={{
+          <span aria-hidden="true" style={{
             width: 9, height: 9, borderRadius: 3,
             background: 'linear-gradient(135deg, var(--accent), var(--success))',
             boxShadow: '0 0 14px color-mix(in srgb, var(--accent) 48%, transparent)',
           }} />
-          TorrentNG
-        </span>
+          TorrentNG</h1>
 
         <nav aria-label="Primary" style={{ display: 'flex', gap: 4, marginLeft: 4, flex: '0 0 auto' }}>
           {(['torrents', 'settings'] as View[]).map(v => (
@@ -755,26 +776,24 @@ export function App() {
       </header>
 
       {view === 'torrents' && (
-        <FilterBar params={params} onChange={updateParams} />
-      )}
-      {view === 'torrents' && (
-        <SavedViewsBar params={params} onApply={applySavedView} />
-      )}
-      {view === 'torrents' && (
-        <TorrentToolbar
-          selectedCount={selected.size}
-          onAdd={() => setAddOpen(true)}
-          onStart={() => runBulk('start')}
-          onStop={() => runBulk('stop')}
-          onRecheck={() => runBulk('recheck')}
-          onReannounce={() => runBulk('reannounce')}
-          onProperties={() => setPropertiesHash([...selected][0] ?? null)}
-          onEditSelected={() => setBulkEditOpen(true)}
-          onSequential={() => toggleSequential([...selected])}
-          onClearSelection={() => setSelected(new Set())}
-          onHelp={() => setHelpOpen(true)}
-          busy={toolbarBusy}
-        />
+        <nav aria-label="Torrent list filters and actions">
+          <FilterBar params={params} onChange={updateParams} />
+          <SavedViewsBar params={params} onApply={applySavedView} />
+          <TorrentToolbar
+            selectedCount={selected.size}
+            onAdd={() => setAddOpen(true)}
+            onStart={() => runBulk('start')}
+            onStop={() => runBulk('stop')}
+            onRecheck={() => runBulk('recheck')}
+            onReannounce={() => runBulk('reannounce')}
+            onProperties={() => setPropertiesHash([...selected][0] ?? null)}
+            onEditSelected={() => setBulkEditOpen(true)}
+            onSequential={() => toggleSequential([...selected])}
+            onClearSelection={() => setSelected(new Set())}
+            onHelp={() => setHelpOpen(true)}
+            busy={toolbarBusy}
+          />
+        </nav>
       )}
       {/* Main content */}
       <main className="tng-main" style={{ flex: 1, minWidth: 0, display: 'flex', overflow: 'hidden' }}>
@@ -788,6 +807,7 @@ export function App() {
             themeMode={themeMode}
             onTheme={setThemeId}
             onThemeMode={setThemeMode}
+            onSelectTracker={goToTrackerTorrents}
           />
         )}
 
@@ -966,7 +986,7 @@ function StandbyScreen({ onTakeOver }: { onTakeOver: () => void }) {
   )
 }
 
-function SettingsView({ section, onSection, mediaInference, onMediaInference, themeId, themeMode, onTheme, onThemeMode }: {
+function SettingsView({ section, onSection, mediaInference, onMediaInference, themeId, themeMode, onTheme, onThemeMode, onSelectTracker }: {
   section: SettingsSection
   onSection: (section: SettingsSection) => void
   mediaInference: MediaInferenceMode
@@ -974,6 +994,7 @@ function SettingsView({ section, onSection, mediaInference, onMediaInference, th
   themeId: string
   themeMode: ThemeMode
   onTheme: (id: string) => void
+  onSelectTracker: (tracker: string) => void
   onThemeMode: (mode: ThemeMode) => void
 }) {
   const sections: Array<[SettingsSection, string, string]> = [
@@ -1061,12 +1082,13 @@ function SettingsView({ section, onSection, mediaInference, onMediaInference, th
           <PanelTitle title="Library" subtitle="Categories, storage roots, and tracker summaries" />
           <PanelFrame><CategoriesPanel /></PanelFrame>
           <PanelFrame><StoragePanel /></PanelFrame>
-          <PanelFrame><TrackerHealthPanel /></PanelFrame>
+          <PanelFrame><TrackerHealthPanel onSelectTracker={onSelectTracker} /></PanelFrame>
         </section>)}
         {section === 'engine' && (<section id="settings-panel-engine" role="tabpanel" aria-labelledby="settings-tab-engine" tabIndex={0}>
           <PanelTitle title="Backend" subtitle="Runtime diagnostics, settings, and capability checks" />
           <PanelFrame><EnginePanel /></PanelFrame>
           <PanelFrame><UserAgentPanel /></PanelFrame>
+          <PanelFrame><LogsPanel /></PanelFrame>
         </section>)}
         {section === 'automation' && (<section id="settings-panel-automation" role="tabpanel" aria-labelledby="settings-tab-automation" tabIndex={0}>
           <PanelTitle title="Automation" subtitle="Ratio groups, workflows, and RSS rules" />
@@ -1075,8 +1097,7 @@ function SettingsView({ section, onSection, mediaInference, onMediaInference, th
           <PanelFrame><RssRulesPanel /></PanelFrame>
         </section>)}
         {section === 'support' && (<section id="settings-panel-support" role="tabpanel" aria-labelledby="settings-tab-support" tabIndex={0}>
-          <PanelTitle title="Support" subtitle="Project resources and community support" />
-          <PanelFrame><LogsPanel /></PanelFrame>
+          <PanelTitle title="Support" subtitle="Appearance, community links, and project resources" />
           <PanelFrame>
             <AppearancePanel
               mediaInference={mediaInference}
@@ -1297,6 +1318,8 @@ function LoginScreen({ message, onLogin }: {
         <label className="tng-form-card" style={{ display: 'flex', flexDirection: 'column', gap: 5, fontSize: 12, color: 'var(--muted)' }}>
           Username
           <input
+            id="tng-login-username"
+            name="username"
             autoFocus
             value={username}
             onChange={e => setUsername(e.target.value)}
@@ -1310,6 +1333,8 @@ function LoginScreen({ message, onLogin }: {
         <label className="tng-form-card" style={{ display: 'flex', flexDirection: 'column', gap: 5, fontSize: 12, color: 'var(--muted)' }}>
           Password
           <input
+            id="tng-login-password"
+            name="password"
             type="password"
             value={password}
             onChange={e => setPassword(e.target.value)}

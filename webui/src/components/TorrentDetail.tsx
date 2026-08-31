@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../api/client'
 import type { TorrentSummary } from '../api/client'
+import { TrackerUrl } from '../lib/maskUrl'
 
 function fmtSize(bytes: number): string {
   if (bytes >= 1e12) return (bytes / 1e12).toFixed(2) + ' TB'
@@ -44,9 +45,16 @@ function ActionBtn({
   return (
     <button onClick={onClick} disabled={disabled} style={{
       background: 'var(--surface-2)',
-      border: `1px solid ${color}55`,
+      // NOTE: color is a var(--token) reference, not a hex string - a
+      // "${color}55" suffix (previously used here) is not valid CSS and the
+      // whole border declaration would be silently dropped by the browser.
+      // color-mix() is the correct way to apply alpha/tinting to a CSS
+      // variable. The text color is blended further toward --text so it
+      // clears the 4.5:1 AA contrast ratio against --surface-2 (the raw
+      // accent tint alone measured 4.39:1 in the default theme).
+      border: `1px solid color-mix(in srgb, ${color} 42%, var(--border))`,
       borderRadius: 4,
-      color,
+      color: `color-mix(in srgb, ${color} 82%, var(--text))`,
       padding: '3px 9px',
       fontSize: 11,
       cursor: disabled ? 'not-allowed' : 'pointer',
@@ -148,7 +156,7 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
           : { label: 'Queued', color: 'var(--muted)' }
 
   return (
-    <aside className="torrent-detail" style={{
+    <aside className="torrent-detail" aria-label="Torrent details" style={{
       width: 340, background: 'var(--bg)', borderLeft: '1px solid var(--border)',
       display: 'flex', flexDirection: 'column', flexShrink: 0, fontSize: 12,
     }}>
@@ -423,9 +431,8 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
                     background: ok ? 'var(--success)' : 'var(--warning)',
                   }} />
                   <div style={{
-                    flex: 1, minWidth: 0, fontSize: 11, color: 'var(--muted)', overflow: 'hidden',
-                    textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontFamily: 'monospace',
-                  }} title={tr.url}>{tr.url}</div>
+                    flex: 1, minWidth: 0, fontSize: 11, color: 'var(--muted)',
+                  }}><TrackerUrl url={tr.url} /></div>
                   <button
                     onClick={() => removeTracker(tr.url)}
                     disabled={busy}
@@ -465,7 +472,14 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
         {files && files.length > 0 && (
           <Section title={`Files (${files.length})`}>
             {files.map(f => {
-              const fp = f.size_chunks > 0 ? (f.completed_chunks / f.size_chunks) * 100 : 100
+              // A wanted file (priority !== 0) in a torrent the backend
+              // already reports as fully complete can't itself be
+              // incomplete - trust that over a stale/uninitialized
+              // per-file chunk count (observed showing 0% for files that
+              // are actually done).
+              const fp = t.complete && f.priority !== 0
+                ? 100
+                : f.size_chunks > 0 ? (f.completed_chunks / f.size_chunks) * 100 : 100
               const priority = f.priority === 0 ? 'Skipped' : f.priority >= 2 ? 'High' : 'Normal'
               return (
                 <div key={f.index} className="tng-detail-row" data-tone={f.priority === 0 ? 'muted' : fp >= 100 ? 'ok' : 'active'} style={{

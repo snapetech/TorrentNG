@@ -16,7 +16,11 @@ export function useTorrentsInfinite(params: Omit<ListParams, 'limit' | 'offset'>
     },
     placeholderData: (prev) => prev,
     staleTime: 1000,
-    refetchInterval: enabled ? 2_000 : false,
+    // Real-time updates are pushed over the WebSocket (see useWebSocket),
+    // which invalidates this query key on torrent add/remove/update. This
+    // interval is only a safety net for when the socket is down (e.g. a
+    // proxy that blocks WS upgrades), so it can be slow.
+    refetchInterval: enabled ? 20_000 : false,
   })
 }
 

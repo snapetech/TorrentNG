@@ -69,11 +69,12 @@ pub async fn run(
                     rates
                 }
                 Err(e) => {
+                    let chain = crate::sync::error_chain(&e);
                     warn!(
                         component = backend.backend_type().as_str(),
                         operation = "transfer_stats",
                         result = "error",
-                        error = %e,
+                        error = %chain,
                         "transfer stats probe failed"
                     );
                     if !stats_error_active {
@@ -86,7 +87,7 @@ pub async fn run(
                                 "component": backend.backend_type().as_str(),
                                 "operation": "transfer_stats",
                                 "result": "error",
-                                "error": e.to_string(),
+                                "error": chain,
                             }),
                             event_retention,
                         );
@@ -145,7 +146,7 @@ async fn probe_transfer_rates(backend: &dyn TorrentBackend) -> TransferRates {
                 component = backend.backend_type().as_str(),
                 operation = "transfer_stats",
                 result = "error",
-                error = %e,
+                error = %crate::sync::error_chain(&e),
                 "transfer stats probe failed"
             );
             TransferRates::default()

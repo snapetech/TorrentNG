@@ -320,6 +320,15 @@ fn default_peer_id() -> String {
     DEFAULT_PEER_ID.to_owned()
 }
 
+/// Keep the pre-rename `RTNG_*` environment names working for installed
+/// systemd/container units while new deployments use the canonical `TNG_*`
+/// names. The canonical name always wins when both are present.
+fn env_override(primary: &str, legacy: &str) -> Option<String> {
+    std::env::var(primary)
+        .ok()
+        .or_else(|| std::env::var(legacy).ok())
+}
+
 // --- loading ---
 
 impl Config {
@@ -355,50 +364,49 @@ impl Config {
     }
 
     fn apply_env(&mut self) {
-        if let Ok(v) = std::env::var("TNG_LISTEN_ADDR") {
+        if let Some(v) = env_override("TNG_LISTEN_ADDR", "RTNG_LISTEN_ADDR") {
             self.listen_addr = v;
         }
-        if let Ok(v) = std::env::var("TNG_DEBUG") {
+        if let Some(v) = env_override("TNG_DEBUG", "RTNG_DEBUG") {
             self.debug = v == "1" || v.eq_ignore_ascii_case("true");
         }
-        if let Ok(v) = std::env::var("TNG_LOG_FORMAT") {
+        if let Some(v) = env_override("TNG_LOG_FORMAT", "RTNG_LOG_FORMAT") {
             self.logging.format = if v.eq_ignore_ascii_case("pretty") {
                 rt_logging::LogFormat::Pretty
             } else {
                 rt_logging::LogFormat::Json
             };
         }
-        if let Ok(v) = std::env::var("TNG_LOG_PROFILE") {
+        if let Some(v) = env_override("TNG_LOG_PROFILE", "RTNG_LOG_PROFILE") {
             self.logging.profile = match v.to_ascii_lowercase().as_str() {
                 "detailed" => rt_logging::LogProfile::Detailed,
                 "verbose" => rt_logging::LogProfile::Verbose,
                 _ => rt_logging::LogProfile::Basic,
             };
         }
-        if let Ok(v) = std::env::var("TNG_LOG_FILTER") {
+        if let Some(v) = env_override("TNG_LOG_FILTER", "RTNG_LOG_FILTER") {
             self.logging.filter = v;
         }
-        if let Ok(v) = std::env::var("TNG_LOG_EVENT_RETENTION") {
+        if let Some(v) = env_override("TNG_LOG_EVENT_RETENTION", "RTNG_LOG_EVENT_RETENTION") {
             if let Ok(retention) = v.parse() {
                 self.logging.event_retention = retention;
             }
         }
-        if let Ok(v) = std::env::var("TNG_SYNC_INTERVAL_SECS") {
+        if let Some(v) = env_override("TNG_SYNC_INTERVAL_SECS", "RTNG_SYNC_INTERVAL_SECS") {
             if let Ok(secs) = v.parse() {
                 self.sync_interval_secs = secs;
             }
         }
-        if let Ok(v) = std::env::var("TNG_DATA_DIR") {
+        if let Some(v) = env_override("TNG_DATA_DIR", "RTNG_DATA_DIR") {
             self.data_dir = Some(PathBuf::from(v));
         }
-        if let Ok(v) = std::env::var("TNG_USER_AGENT").or_else(|_| std::env::var("RTNG_USER_AGENT"))
-        {
+        if let Some(v) = env_override("TNG_USER_AGENT", "RTNG_USER_AGENT") {
             self.rtorrent.user_agent = v;
         }
-        if let Ok(v) = std::env::var("TNG_PEER_ID").or_else(|_| std::env::var("RTNG_PEER_ID")) {
+        if let Some(v) = env_override("TNG_PEER_ID", "RTNG_PEER_ID") {
             self.rtorrent.peer_id = v;
         }
-        if let Ok(v) = std::env::var("TNG_BACKEND") {
+        if let Some(v) = env_override("TNG_BACKEND", "RTNG_BACKEND") {
             self.backend.backend_type = match v.to_ascii_lowercase().as_str() {
                 "qbittorrent" | "qbit" => BackendKind::Qbittorrent,
                 "transmission" => BackendKind::Transmission,
@@ -407,43 +415,43 @@ impl Config {
                 _ => BackendKind::Rtorrent,
             };
         }
-        if let Ok(v) = std::env::var("TNG_QBITTORRENT_URL") {
+        if let Some(v) = env_override("TNG_QBITTORRENT_URL", "RTNG_QBITTORRENT_URL") {
             self.qbittorrent.url = v;
         }
-        if let Ok(v) = std::env::var("TNG_QBITTORRENT_USERNAME") {
+        if let Some(v) = env_override("TNG_QBITTORRENT_USERNAME", "RTNG_QBITTORRENT_USERNAME") {
             self.qbittorrent.username = Some(v);
         }
-        if let Ok(v) = std::env::var("TNG_QBITTORRENT_PASSWORD") {
+        if let Some(v) = env_override("TNG_QBITTORRENT_PASSWORD", "RTNG_QBITTORRENT_PASSWORD") {
             self.qbittorrent.password = Some(v);
         }
-        if let Ok(v) = std::env::var("TNG_QBITTORRENT_NO_AUTH") {
+        if let Some(v) = env_override("TNG_QBITTORRENT_NO_AUTH", "RTNG_QBITTORRENT_NO_AUTH") {
             self.qbittorrent.no_auth = v == "1" || v.eq_ignore_ascii_case("true");
         }
-        if let Ok(v) = std::env::var("TNG_TRANSMISSION_URL") {
+        if let Some(v) = env_override("TNG_TRANSMISSION_URL", "RTNG_TRANSMISSION_URL") {
             self.transmission.url = v;
         }
-        if let Ok(v) = std::env::var("TNG_TRANSMISSION_USERNAME") {
+        if let Some(v) = env_override("TNG_TRANSMISSION_USERNAME", "RTNG_TRANSMISSION_USERNAME") {
             self.transmission.username = Some(v);
         }
-        if let Ok(v) = std::env::var("TNG_TRANSMISSION_PASSWORD") {
+        if let Some(v) = env_override("TNG_TRANSMISSION_PASSWORD", "RTNG_TRANSMISSION_PASSWORD") {
             self.transmission.password = Some(v);
         }
-        if let Ok(v) = std::env::var("TNG_DELUGE_URL") {
+        if let Some(v) = env_override("TNG_DELUGE_URL", "RTNG_DELUGE_URL") {
             self.deluge.url = v;
         }
-        if let Ok(v) = std::env::var("TNG_DELUGE_PASSWORD") {
+        if let Some(v) = env_override("TNG_DELUGE_PASSWORD", "RTNG_DELUGE_PASSWORD") {
             self.deluge.password = Some(v);
         }
-        if let Ok(v) = std::env::var("TNG_TORRENTNG_URL") {
+        if let Some(v) = env_override("TNG_TORRENTNG_URL", "RTNG_TORRENTNG_URL") {
             self.torrentng.url = v;
         }
-        if let Ok(v) = std::env::var("TNG_TORRENTNG_API_TOKEN") {
+        if let Some(v) = env_override("TNG_TORRENTNG_API_TOKEN", "RTNG_TORRENTNG_API_TOKEN") {
             self.torrentng.api_token = Some(v);
         }
-        if let Ok(v) = std::env::var("TNG_RTORRENT_LOGS_ENABLED") {
+        if let Some(v) = env_override("TNG_RTORRENT_LOGS_ENABLED", "RTNG_RTORRENT_LOGS_ENABLED") {
             self.rtorrent.logs.enabled = v == "1" || v.eq_ignore_ascii_case("true");
         }
-        if let Ok(v) = std::env::var("TNG_RTORRENT_LOG_PATHS") {
+        if let Some(v) = env_override("TNG_RTORRENT_LOG_PATHS", "RTNG_RTORRENT_LOG_PATHS") {
             self.rtorrent.logs.paths = v
                 .split(',')
                 .map(str::trim)
@@ -451,26 +459,32 @@ impl Config {
                 .map(PathBuf::from)
                 .collect();
         }
-        if let Ok(v) = std::env::var("TNG_RTORRENT_LOG_POLL_INTERVAL_SECS") {
+        if let Some(v) = env_override(
+            "TNG_RTORRENT_LOG_POLL_INTERVAL_SECS",
+            "RTNG_RTORRENT_LOG_POLL_INTERVAL_SECS",
+        ) {
             if let Ok(secs) = v.parse() {
                 self.rtorrent.logs.poll_interval_secs = secs;
             }
         }
-        if let Ok(v) = std::env::var("TNG_RTORRENT_LOG_READ_FROM_START") {
+        if let Some(v) = env_override(
+            "TNG_RTORRENT_LOG_READ_FROM_START",
+            "RTNG_RTORRENT_LOG_READ_FROM_START",
+        ) {
             self.rtorrent.logs.read_from_start = v == "1" || v.eq_ignore_ascii_case("true");
         }
-        if let Ok(v) = std::env::var("TNG_SCGI_SOCKET") {
+        if let Some(v) = env_override("TNG_SCGI_SOCKET", "RTNG_SCGI_SOCKET") {
             self.rtorrent.scgi_socket = Some(v);
             self.rtorrent.scgi_addr = None;
         }
-        if let Ok(v) = std::env::var("TNG_SCGI_ADDR") {
+        if let Some(v) = env_override("TNG_SCGI_ADDR", "RTNG_SCGI_ADDR") {
             self.rtorrent.scgi_addr = Some(v);
             self.rtorrent.scgi_socket = None;
         }
-        if let Ok(v) = std::env::var("TNG_SECRET_KEY") {
+        if let Some(v) = env_override("TNG_SECRET_KEY", "RTNG_SECRET_KEY") {
             self.auth.secret_key = Some(v);
         }
-        if let Ok(v) = std::env::var("TNG_API_TOKENS") {
+        if let Some(v) = env_override("TNG_API_TOKENS", "RTNG_API_TOKENS") {
             self.auth.api_tokens = v
                 .split(',')
                 .map(str::trim)
@@ -478,19 +492,25 @@ impl Config {
                 .map(ToOwned::to_owned)
                 .collect();
         }
-        if let Ok(v) = std::env::var("TNG_ALLOW_SCRIPTS") {
+        if let Some(v) = env_override("TNG_ALLOW_SCRIPTS", "RTNG_ALLOW_SCRIPTS") {
             self.workflows.allow_scripts = v == "1" || v.eq_ignore_ascii_case("true");
         }
-        if let Ok(v) = std::env::var("TNG_QBITTORRENT_VERSION") {
+        if let Some(v) = env_override("TNG_QBITTORRENT_VERSION", "RTNG_QBITTORRENT_VERSION") {
             self.identity.qbittorrent_version = v;
         }
-        if let Ok(v) = std::env::var("TNG_QBITTORRENT_WEBAPI_VERSION") {
+        if let Some(v) = env_override(
+            "TNG_QBITTORRENT_WEBAPI_VERSION",
+            "RTNG_QBITTORRENT_WEBAPI_VERSION",
+        ) {
             self.identity.qbittorrent_webapi_version = v;
         }
-        if let Ok(v) = std::env::var("TNG_QBITTORRENT_BUILD_LIBTORRENT") {
+        if let Some(v) = env_override(
+            "TNG_QBITTORRENT_BUILD_LIBTORRENT",
+            "RTNG_QBITTORRENT_BUILD_LIBTORRENT",
+        ) {
             self.identity.qbittorrent_build_libtorrent = v;
         }
-        if let Ok(v) = std::env::var("TNG_QBITTORRENT_BUILD_QT") {
+        if let Some(v) = env_override("TNG_QBITTORRENT_BUILD_QT", "RTNG_QBITTORRENT_BUILD_QT") {
             self.identity.qbittorrent_build_qt = v;
         }
     }
@@ -782,5 +802,52 @@ scgi_socket = "/tmp/rtorrent.sock"
 
         restore_env("TNG_SYNC_INTERVAL_SECS", old_sync);
         restore_env("TNG_DATA_DIR", old_data_dir);
+    }
+
+    #[test]
+    fn legacy_rtng_env_aliases_keep_existing_units_compatible() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let keys = [
+            "TNG_SYNC_INTERVAL_SECS",
+            "RTNG_SYNC_INTERVAL_SECS",
+            "TNG_DATA_DIR",
+            "RTNG_DATA_DIR",
+            "TNG_SECRET_KEY",
+            "RTNG_SECRET_KEY",
+            "TNG_API_TOKENS",
+            "RTNG_API_TOKENS",
+            "TNG_USER_AGENT",
+            "RTNG_USER_AGENT",
+            "TNG_QBITTORRENT_VERSION",
+            "RTNG_QBITTORRENT_VERSION",
+        ];
+        let old = keys
+            .iter()
+            .map(|key| (*key, std::env::var(key).ok()))
+            .collect::<Vec<_>>();
+        for key in keys {
+            std::env::remove_var(key);
+        }
+
+        std::env::set_var("RTNG_SYNC_INTERVAL_SECS", "17");
+        std::env::set_var("RTNG_DATA_DIR", "/legacy-data");
+        std::env::set_var("RTNG_SECRET_KEY", "legacy-secret");
+        std::env::set_var("RTNG_API_TOKENS", "legacy-one, legacy-two");
+        std::env::set_var("RTNG_USER_AGENT", "legacy-agent");
+        std::env::set_var("RTNG_QBITTORRENT_VERSION", "legacy-qbit");
+
+        let mut cfg = Config::test_default();
+        cfg.apply_env();
+
+        assert_eq!(cfg.sync_interval_secs, 17);
+        assert_eq!(cfg.data_dir, Some(PathBuf::from("/legacy-data")));
+        assert_eq!(cfg.auth.secret_key.as_deref(), Some("legacy-secret"));
+        assert_eq!(cfg.auth.api_tokens, ["legacy-one", "legacy-two"]);
+        assert_eq!(cfg.rtorrent.user_agent, "legacy-agent");
+        assert_eq!(cfg.identity.qbittorrent_version, "legacy-qbit");
+
+        for (key, value) in old {
+            restore_env(key, value);
+        }
     }
 }

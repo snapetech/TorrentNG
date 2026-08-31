@@ -1001,6 +1001,14 @@ summary:hover {
   }
 }
 
+.tng-sidebar-mobile-toggle {
+  display: none;
+}
+
+.tng-statusbar-more-toggle {
+  display: none;
+}
+
 @media (max-width: 720px) {
   .tng-topbar {
     height: auto !important;
@@ -1072,16 +1080,17 @@ summary:hover {
 
   .tng-toolbar {
     min-height: auto !important;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
     align-items: center !important;
-    overflow-x: hidden !important;
+    overflow-x: auto !important;
     overflow-y: visible !important;
     padding: 7px 10px !important;
     gap: 6px !important;
   }
 
   .tng-toolbar-group {
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
+    flex-shrink: 0;
     min-width: 0;
   }
 
@@ -1162,9 +1171,41 @@ summary:hover {
 
   .torrent-sidebar {
     width: 100% !important;
-    max-height: 220px;
+    max-height: none;
     border-right: 0 !important;
     border-bottom: 1px solid var(--border);
+  }
+
+  .tng-sidebar-mobile-toggle {
+    display: inline-flex;
+  }
+
+  .tng-sidebar-body {
+    max-height: 0;
+    overflow: hidden;
+  }
+
+  .tng-sidebar-body[data-mobile-open="true"] {
+    max-height: 60vh;
+    overflow-y: auto;
+  }
+
+  .tng-statusbar-more-toggle {
+    display: inline-flex;
+    order: 0;
+  }
+
+  .tng-statusbar-metrics,
+  .tng-status-support {
+    display: none !important;
+  }
+
+  .tng-statusbar[data-mobile-expanded="true"] .tng-statusbar-metrics {
+    display: flex !important;
+  }
+
+  .tng-statusbar[data-mobile-expanded="true"] .tng-status-support {
+    display: flex !important;
   }
 
   .torrent-detail {

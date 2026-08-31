@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import type { LiveStats, StorageRoot } from '../api/client'
 
 interface Props {
@@ -134,6 +135,7 @@ export function StatusBar({
   loaded, total, selected, stats, backendType, backendStatus, cached, storage, togglingFeature, onToggleDht, onTogglePex,
   featureError, actionMessage, actionTone = 'ok', utpLabel, utpTitle, utpEnabled,
 }: Props) {
+  const [mobileExpanded, setMobileExpanded] = useState(false)
   const connected = backendStatus === 'connected'
   const rendered = Math.min(loaded, total)
   const storageLabel = storage?.ok
@@ -151,6 +153,7 @@ export function StatusBar({
       className="tng-statusbar"
       data-connected={connected ? 'true' : 'false'}
       data-selected={selected > 0 ? 'true' : 'false'}
+      data-mobile-expanded={mobileExpanded ? 'true' : 'false'}
       style={{
       minHeight: 38, flexShrink: 0, display: 'flex', alignItems: 'center', gap: 12,
       padding: '0 12px', background: 'var(--bg)', borderTop: '1px solid var(--border-strong)',
@@ -183,11 +186,25 @@ export function StatusBar({
         >Ko-fi</a>
       </nav>
       <span className="tng-statusbar-spacer" style={{ flex: 1 }} />
-      <div className="tng-statusbar-metrics" style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 'max-content' }}>
+      <div className="tng-statusbar-live" style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 'max-content' }}>
         <Badge label="DL" value={fmtSpeed(stats.download_speed)} state={(stats.download_speed ?? 0) > 0 ? 'on' : 'unknown'} />
         <Badge label="UL" value={fmtSpeed(stats.upload_speed)} state={(stats.upload_speed ?? 0) > 0 ? 'on' : 'unknown'} />
-        <Badge label="DL total" value={fmtBytes(stats.download_total)} title="Downloaded during this daemon session" state="on" />
-        <Badge label="UL total" value={fmtBytes(stats.upload_total)} title="Uploaded during this daemon session" state="on" />
+      </div>
+      <button
+        type="button"
+        className="tng-statusbar-more-toggle"
+        onClick={() => setMobileExpanded(v => !v)}
+        aria-expanded={mobileExpanded}
+        style={{
+          background: 'var(--surface)', border: '1px solid var(--border-strong)', borderRadius: 5,
+          color: 'var(--muted)', padding: '2px 8px', fontSize: 11, cursor: 'pointer', minWidth: 'max-content',
+        }}
+      >
+        {mobileExpanded ? 'Less ▴' : 'More ▾'}
+      </button>
+      <div className="tng-statusbar-metrics" style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 'max-content' }}>
+        <Badge label="DL total" value={fmtBytes(stats.download_total)} title="Downloaded since the daemon last started (not a lifetime total)" state="on" />
+        <Badge label="UL total" value={fmtBytes(stats.upload_total)} title="Uploaded since the daemon last started (not a lifetime total)" state="on" />
         <Badge
           label="Disk"
           value={storageLabel}

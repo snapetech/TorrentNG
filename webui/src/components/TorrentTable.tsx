@@ -2,6 +2,7 @@ import { useRef, useEffect, useMemo, useState } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import type { TorrentSummary, ListParams } from '../api/client'
 import type { MediaInferenceMode } from './AppearancePanel'
+import { maskAnnounceUrl } from '../lib/maskUrl'
 
 interface Props {
   torrents: TorrentSummary[]
@@ -22,6 +23,8 @@ interface Props {
 
 const ROW_HEIGHT = 36
 const TABLE_MIN_WIDTH = 1280
+const TABLE_CELL_GAP = 8
+const TABLE_HORIZONTAL_PADDING = 12
 
 function fmtSize(bytes: number): string {
   if (bytes >= 1e12) return (bytes / 1e12).toFixed(1) + ' TB'
@@ -120,10 +123,16 @@ type ColKey =
 
 interface Col { key: ColKey; label: string; width: string; sortKey?: string; required?: boolean }
 
+/** Columns pinned to the left edge while horizontally scrolling, so the
+ * torrent's identity stays visible past the swarm/tracker/timestamp columns.
+ * Their widths must stay fixed px (not flexible) for the sticky offsets below
+ * to be correct. */
+const STICKY_KEYS: ColKey[] = ['check', 'kind', 'name']
+
 const COLS: Col[] = [
   { key: 'check',      label: '',          width: '32px', required: true },
   { key: 'kind',       label: 'Type',      width: '52px' },
-  { key: 'name',       label: 'Name',      width: 'minmax(220px, 1fr)', sortKey: 'name' },
+  { key: 'name',       label: 'Name',      width: '260px', sortKey: 'name' },
   { key: 'status',     label: 'Status',    width: '78px' },
   { key: 'size',       label: 'Size',      width: '78px', sortKey: 'size' },
   { key: 'progress',   label: '%',         width: '72px', sortKey: 'progress' },
@@ -143,8 +152,11 @@ const COLS: Col[] = [
   { key: 'tags',       label: 'Tags',      width: '112px' },
   { key: 'tracker',    label: 'Tracker',   width: '140px' },
   { key: 'path',       label: 'Save path', width: 'minmax(160px, 1fr)' },
-  { key: 'actions',    label: '',          width: '132px', required: true },
+  { key: 'actions',    label: '',          width: 'minmax(96px, 1fr)', required: true },
 ]
+
+const MIN_COL_WIDTH = 44
+const DEFAULT_ORDER: ColKey[] = COLS.map(c => c.key)
 
 const DEFAULT_VISIBLE: ColKey[] = [
   'check',
@@ -181,7 +193,7 @@ function trackerHost(url: string): string {
   try {
     return new URL(url).hostname
   } catch {
-    return url
+    return maskAnnounceUrl(url)
   }
 }
 
@@ -203,7 +215,7 @@ function mediaKind(t: TorrentSummary, mode: MediaInferenceMode): MediaKind {
   if (has([/\b(ebook|ebooks|book|books|audiobook|epub|mobi|azw3|pdf|cbz|cbr)\b/, /^(epub|mobi|azw3|pdf|cbz|cbr)$/])) {
     return { icon: '📚', label: 'Ebook', color: '#a78bfa' }
   }
-  if (has([/\b(s\d{1,2}e\d{1,2}|season|episode|hdtv|web-dl|webrip|tv)\b/])) {
+  if (has([/\b(s\d{1,2}e\d{1,3}|season|episode|hdtv|web-dl|webrip|tv)\b/])) {
     return { icon: '📺', label: 'TV', color: '#38bdf8' }
   }
   if (has([/\b(movie|movies|film|bluray|bdrip|dvdrip|x264|x265|h\.264|h\.265|2160p|1080p|720p)\b/, /^(mkv|mp4|avi|mov|wmv|m4v)$/])) {
@@ -252,6 +264,44 @@ function loadColumns(): ColKey[] {
   }
 }
 
+const COLUMN_ORDER_KEY = 'tng.columnOrder.v1'
+const COLUMN_WIDTHS_KEY = 'tng.columnWidths.v1'
+
+function loadOrder(): ColKey[] {
+  try {
+    const raw = localStorage.getItem(COLUMN_ORDER_KEY)
+    if (!raw) return DEFAULT_ORDER
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return DEFAULT_ORDER
+    const valid = new Set(COLS.map(c => c.key))
+    const loaded = parsed.filter((key): key is ColKey => valid.has(key))
+    // Any column added since this order was saved (new release) is appended
+    // at the end rather than silently disappearing from the table.
+    const missing = DEFAULT_ORDER.filter(key => !loaded.includes(key))
+    return [...loaded, ...missing]
+  } catch {
+    return DEFAULT_ORDER
+  }
+}
+
+function loadWidths(): Partial<Record<ColKey, number>> {
+  try {
+    const raw = localStorage.getItem(COLUMN_WIDTHS_KEY)
+    if (!raw) return {}
+    const parsed = JSON.parse(raw) as Record<string, number>
+    const valid = new Set(COLS.map(c => c.key))
+    const out: Partial<Record<ColKey, number>> = {}
+    for (const [key, value] of Object.entries(parsed)) {
+      if (valid.has(key as ColKey) && typeof value === 'number' && value >= MIN_COL_WIDTH) {
+        out[key as ColKey] = value
+      }
+    }
+    return out
+  } catch {
+    return {}
+  }
+}
+
 export function TorrentTable({
   torrents, total, selected, params, onSelect, onSelectAll, onDetail, onContextMenu, onSort,
   onLoadMore, hasMore, isFetchingMore, detailHash, mediaInference,
@@ -261,12 +311,53 @@ export function TorrentTable({
   const loadMoreRef = useRef(false)
   const [visibleKeys, setVisibleKeys] = useState<ColKey[]>(loadColumns)
   const [columnsOpen, setColumnsOpen] = useState(false)
+  const [order, setOrder] = useState<ColKey[]>(loadOrder)
+  const [widths, setWidths] = useState<Partial<Record<ColKey, number>>>(loadWidths)
+  const [dragKey, setDragKey] = useState<ColKey | null>(null)
+  const resizeState = useRef<{ key: ColKey; startX: number; startWidth: number } | null>(null)
+
+  const colByKey = useMemo(() => new Map(COLS.map(c => [c.key, c])), [])
 
   const visibleCols = useMemo(() => {
     const visible = new Set(visibleKeys)
-    return COLS.filter(col => col.required || visible.has(col.key))
-  }, [visibleKeys])
-  const gridTemplate = visibleCols.map(c => c.width).join(' ')
+    const ordered = order.map(key => colByKey.get(key)).filter((c): c is Col => Boolean(c))
+    // 'check' always leads and 'actions' always trails regardless of drag
+    // order - both are structural (selection checkbox, columns menu anchor)
+    // rather than data the user would want to reposition.
+    // The other sticky identity columns must lead as well; otherwise a user
+    // could drag a non-sticky column ahead of Type/Name and leave the pinned
+    // columns stranded in the middle of the horizontal scroll region.
+    const middle = ordered.filter(c => !c.required && visible.has(c.key) && !STICKY_KEYS.includes(c.key))
+    const check = colByKey.get('check')!
+    const actions = colByKey.get('actions')!
+    const sticky = STICKY_KEYS.slice(1)
+      .map(key => colByKey.get(key))
+      .filter((c): c is Col => Boolean(c && visible.has(c.key)))
+    return [check, ...sticky, ...middle, actions]
+  }, [visibleKeys, order, colByKey])
+
+  function resolvedWidth(col: Col): string {
+    const override = widths[col.key]
+    return override ? `${override}px` : col.width
+  }
+  const gridTemplate = visibleCols.map(resolvedWidth).join(' ')
+
+  // Pixel offset of each sticky column's left edge, for position:sticky.
+  const stickyLeft = useMemo(() => {
+    const offsets: Partial<Record<ColKey, number>> = {}
+    let x = TABLE_HORIZONTAL_PADDING
+    for (const [index, col] of visibleCols.entries()) {
+      if (STICKY_KEYS.includes(col.key)) {
+        offsets[col.key] = x
+      }
+      const overriddenWidth = widths[col.key]
+      const parsedWidth = Number.parseFloat(col.width)
+      x += overriddenWidth ?? (Number.isFinite(parsedWidth) ? parsedWidth : 0)
+      if (index < visibleCols.length - 1) x += TABLE_CELL_GAP
+    }
+    return offsets
+  }, [visibleCols, widths])
+  const lastStickyKey = [...visibleCols].reverse().find(c => STICKY_KEYS.includes(c.key))?.key
 
   function setColumnVisible(key: ColKey, visible: boolean) {
     setVisibleKeys(prev => {
@@ -281,7 +372,49 @@ export function TorrentTable({
 
   function resetColumns() {
     localStorage.setItem(COLUMN_STORAGE_KEY, JSON.stringify(DEFAULT_VISIBLE))
+    localStorage.removeItem(COLUMN_ORDER_KEY)
+    localStorage.removeItem(COLUMN_WIDTHS_KEY)
     setVisibleKeys(DEFAULT_VISIBLE)
+    setOrder(DEFAULT_ORDER)
+    setWidths({})
+  }
+
+  function reorderColumn(source: ColKey, target: ColKey) {
+    if (source === target) return
+    setOrder(prev => {
+      const next = prev.filter(k => k !== source)
+      const targetIndex = next.indexOf(target)
+      if (targetIndex === -1) return prev
+      next.splice(targetIndex, 0, source)
+      localStorage.setItem(COLUMN_ORDER_KEY, JSON.stringify(next))
+      return next
+    })
+  }
+
+  function beginResize(e: React.PointerEvent, col: Col) {
+    e.preventDefault()
+    e.stopPropagation()
+    const startWidth = widths[col.key] ?? parseInt(col.width, 10) ?? 80
+    resizeState.current = { key: col.key, startX: e.clientX, startWidth }
+    function onMove(ev: PointerEvent) {
+      if (!resizeState.current) return
+      const delta = ev.clientX - resizeState.current.startX
+      const next = Math.max(MIN_COL_WIDTH, Math.round(resizeState.current.startWidth + delta))
+      setWidths(prev => ({ ...prev, [resizeState.current!.key]: next }))
+    }
+    function onUp() {
+      if (resizeState.current) {
+        setWidths(prev => {
+          localStorage.setItem(COLUMN_WIDTHS_KEY, JSON.stringify(prev))
+          return prev
+        })
+      }
+      resizeState.current = null
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+    }
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
   }
 
   function useCompactColumns() {
@@ -341,34 +474,56 @@ export function TorrentTable({
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minWidth: 0 }}>
-      <div style={{ flex: 1, minHeight: 0, minWidth: 0, overflowX: 'auto', overflowY: 'hidden' }}>
-        <div style={{
-          minWidth: TABLE_MIN_WIDTH, width: '100%', height: '100%',
-          display: 'flex', flexDirection: 'column',
-        }}>
+      {/* A single element must own both scroll axes: position:sticky for the
+          pinned header/columns needs one unambiguous scrolling ancestor, and
+          CSS auto-promotes overflow-x:visible to 'auto' whenever overflow-y
+          isn't visible - splitting the axes across two nested elements (as
+          this used to do) silently breaks sticky-left positioning. */}
+      <div ref={parentRef} style={{ flex: 1, minHeight: 0, minWidth: 0, overflow: 'auto', position: 'relative' }}>
+        {torrents.length === 0 && (
+          <div style={{
+            position: 'absolute', inset: 0, display: 'grid', placeItems: 'center',
+            color: 'var(--faint)', fontSize: 13, textAlign: 'center', padding: 24, zIndex: 6,
+          }}>
+            <div className="tng-empty-state" data-filtered={hasFilters ? 'true' : 'false'} style={{
+              border: '1px solid var(--border)', borderRadius: 8,
+              background: 'var(--surface)', padding: '18px 22px', display: 'grid', gap: 6,
+              maxWidth: 360,
+            }}>
+              <span style={{ color: 'var(--text)', fontWeight: 700 }}>No torrents match this view</span>
+              <span>{hasFilters ? 'Clear filters or change the search text.' : 'Add a torrent to populate the table.'}</span>
+            </div>
+          </div>
+        )}
+        <div style={{ minWidth: TABLE_MIN_WIDTH }}>
           {/* Header */}
           <div style={{
-            display: 'grid', gridTemplateColumns: gridTemplate, gap: '0 8px',
-            padding: '0 12px', height: 32, alignItems: 'center',
+            display: 'grid', gridTemplateColumns: gridTemplate, gap: `0 ${TABLE_CELL_GAP}px`,
+            padding: `0 ${TABLE_HORIZONTAL_PADDING}px`, height: 32, alignItems: 'center',
             background: 'var(--table-head)', borderBottom: '1px solid var(--border-strong)',
             fontSize: 11, fontWeight: 600, color: 'var(--muted)',
             letterSpacing: '0.05em', textTransform: 'uppercase', fontVariantNumeric: 'tabular-nums',
-            flexShrink: 0, userSelect: 'none', position: 'relative',
+            flexShrink: 0, userSelect: 'none', position: 'sticky', top: 0, zIndex: 5,
           }}>
             {/* Select-all checkbox */}
-            <input
-              type="checkbox"
-              aria-label={allVisible ? 'Clear visible torrent selection' : 'Select all visible torrents'}
-              title={allVisible ? 'Clear visible selection' : 'Select all visible torrents'}
-              checked={allVisible}
-              ref={el => { if (el) el.indeterminate = someSelected }}
-              onChange={() => allVisible
-                ? onSelectAll([])
-                : onSelectAll(torrents.map(t => t.hash))
-              }
-              style={{ accentColor: 'var(--accent)', cursor: 'pointer' }}
-            />
-            {visibleCols.slice(1).map(col => {
+            <span style={STICKY_KEYS.includes('check') ? {
+              position: 'sticky', left: stickyLeft.check ?? 0, zIndex: 3,
+              background: 'var(--table-head)', display: 'flex', alignItems: 'center',
+            } : undefined}>
+              <input
+                type="checkbox"
+                aria-label={allVisible ? 'Clear visible torrent selection' : 'Select all visible torrents'}
+                title={allVisible ? 'Clear visible selection' : 'Select all visible torrents'}
+                checked={allVisible}
+                ref={el => { if (el) el.indeterminate = someSelected }}
+                onChange={() => allVisible
+                  ? onSelectAll([])
+                  : onSelectAll(torrents.map(t => t.hash))
+                }
+                style={{ accentColor: 'var(--accent)', cursor: 'pointer' }}
+              />
+            </span>
+            {visibleCols.slice(1, -1).map(col => {
               const content = (
                 <>
                   {col.label}
@@ -378,34 +533,60 @@ export function TorrentTable({
                 </>
               )
               const sortKey = col.sortKey
-              if (!sortKey) {
-                return (
-                  <span
-                    key={col.key}
-                    style={{
-                      color: 'var(--muted)', display: 'flex', alignItems: 'center', gap: 3,
-                    }}
-                  >
-                    {content}
-                  </span>
-                )
-              }
-              return (
+              const isSticky = STICKY_KEYS.includes(col.key)
+              const isLastSticky = col.key === lastStickyKey
+              const draggable = !isSticky
+              const inner = !sortKey ? (
+                <span style={{ color: 'var(--muted)', display: 'flex', alignItems: 'center', gap: 3, overflow: 'hidden' }}>
+                  {content}
+                </span>
+              ) : (
                 <button
-                  key={col.key}
                   onClick={() => onSort(sortKey)}
                   title={`Sort by ${col.label}`}
                   aria-label={`Sort by ${col.label}`}
                   style={{
                     background: 'transparent', border: 0, padding: 0, margin: 0,
                     color: col.sortKey === activeSort ? 'var(--accent-text)' : 'var(--muted)',
-                    display: 'flex', alignItems: 'center', gap: 3,
+                    display: 'flex', alignItems: 'center', gap: 3, overflow: 'hidden',
                     font: 'inherit', fontWeight: 600, textTransform: 'uppercase',
-                    letterSpacing: '0.05em', cursor: 'pointer',
+                    letterSpacing: '0.05em', cursor: 'pointer', width: '100%',
                   }}
                 >
                   {content}
                 </button>
+              )
+              return (
+                <span
+                  key={col.key}
+                  draggable={draggable}
+                  onDragStart={draggable ? (e: React.DragEvent) => { setDragKey(col.key); e.dataTransfer.effectAllowed = 'move' } : undefined}
+                  onDragOver={draggable ? (e: React.DragEvent) => e.preventDefault() : undefined}
+                  onDrop={draggable ? (e: React.DragEvent) => { e.preventDefault(); if (dragKey) reorderColumn(dragKey, col.key); setDragKey(null) } : undefined}
+                  onDragEnd={draggable ? () => setDragKey(null) : undefined}
+                  title={draggable ? `${col.label} - drag to reorder columns` : undefined}
+                  style={{
+                    position: 'relative', minWidth: 0, overflow: 'hidden',
+                    cursor: draggable ? 'grab' : undefined,
+                    opacity: dragKey === col.key ? 0.4 : 1,
+                    outline: dragKey && dragKey !== col.key ? '1px dashed var(--border-strong)' : undefined,
+                    ...(isSticky ? {
+                      position: 'sticky', left: stickyLeft[col.key] ?? 0, zIndex: 3,
+                      background: 'var(--table-head)',
+                      boxShadow: isLastSticky ? '2px 0 0 var(--border-strong)' : undefined,
+                    } : null),
+                  }}
+                >
+                  {inner}
+                  <span
+                    onPointerDown={e => beginResize(e, col)}
+                    title="Drag to resize column"
+                    style={{
+                      position: 'absolute', top: 0, right: -4, bottom: 0, width: 8,
+                      cursor: 'col-resize', zIndex: 4,
+                    }}
+                  />
+                </span>
               )
             })}
             <button
@@ -484,23 +665,8 @@ export function TorrentTable({
             )}
           </div>
 
-          {/* Scrollable body */}
-          <div ref={parentRef} style={{ flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', position: 'relative' }}>
-            {torrents.length === 0 && (
-              <div style={{
-                position: 'absolute', inset: 0, display: 'grid', placeItems: 'center',
-                color: 'var(--faint)', fontSize: 13, textAlign: 'center', padding: 24,
-              }}>
-                <div className="tng-empty-state" data-filtered={hasFilters ? 'true' : 'false'} style={{
-                  border: '1px solid var(--border)', borderRadius: 8,
-                  background: 'var(--surface)', padding: '18px 22px', display: 'grid', gap: 6,
-                  maxWidth: 360,
-                }}>
-                  <span style={{ color: 'var(--text)', fontWeight: 700 }}>No torrents match this view</span>
-                  <span>{hasFilters ? 'Clear filters or change the search text.' : 'Add a torrent to populate the table.'}</span>
-                </div>
-              </div>
-            )}
+          {/* Scrollable body (rows render into parentRef above, not a nested scroller) */}
+          <div style={{ position: 'relative' }}>
             <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
           {items.map(item => {
             const t = torrents[item.index]
@@ -578,10 +744,12 @@ export function TorrentTable({
               priority: <span style={{ color: 'var(--faint)' }} title={`Priority value ${t.priority}`}>{priorityLabel(t.priority)}</span>,
               category: <span style={{ color: 'var(--faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.category || '—'}</span>,
               tags: <span style={{ color: 'var(--faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={t.tags}>{t.tags || '—'}</span>,
-              tracker: <span style={{ color: 'var(--faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={t.tracker_url}>{trackerHost(t.tracker_url)}</span>,
+              tracker: <span style={{ color: 'var(--faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={t.tracker_url ? maskAnnounceUrl(t.tracker_url) : undefined}>{trackerHost(t.tracker_url)}</span>,
               path: <span style={{ color: 'var(--faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={t.base_path || t.directory}>{shortPath(t.base_path || t.directory)}</span>,
               actions: null,
             }
+            const rowBg = isDetail || isSelected ? 'var(--selected)'
+              : item.index % 2 === 0 ? 'var(--row)' : 'var(--row-alt)'
             return (
               <div
                 key={t.hash}
@@ -598,17 +766,27 @@ export function TorrentTable({
                 style={{
                   position: 'absolute', top: item.start, left: 0, right: 0,
                   height: ROW_HEIGHT, display: 'grid', gridTemplateColumns: gridTemplate,
-                  gap: '0 8px', padding: '0 12px', alignItems: 'center',
+                  gap: `0 ${TABLE_CELL_GAP}px`, padding: `0 ${TABLE_HORIZONTAL_PADDING}px`, alignItems: 'center',
                   cursor: 'pointer', fontSize: 13, fontVariantNumeric: 'tabular-nums',
-                  background: isDetail || isSelected ? 'var(--selected)'
-                    : item.index % 2 === 0 ? 'var(--row)' : 'var(--row-alt)',
+                  background: rowBg,
                   borderBottom: '1px solid var(--border)',
                   borderLeft: isDetail ? '3px solid var(--accent)' : isSelected ? '3px solid color-mix(in srgb, var(--accent) 62%, transparent)' : `3px solid ${accent}`,
                 }}
               >
-                {visibleCols.map(col => (
-                  <span key={col.key} style={{ minWidth: 0, overflow: 'hidden' }}>{cells[col.key]}</span>
-                ))}
+                {visibleCols.map(col => {
+                  const isSticky = STICKY_KEYS.includes(col.key)
+                  const isLastSticky = col.key === lastStickyKey
+                  return (
+                    <span key={col.key} style={{
+                      minWidth: 0, overflow: 'hidden',
+                      ...(isSticky ? {
+                        position: 'sticky', left: stickyLeft[col.key] ?? 0, zIndex: 2,
+                        background: rowBg,
+                        boxShadow: isLastSticky ? '2px 0 0 var(--border-strong)' : undefined,
+                      } : null),
+                    }}>{cells[col.key]}</span>
+                  )
+                })}
               </div>
             )
           })}
@@ -625,23 +803,23 @@ export function TorrentTable({
               </div>
             )}
           </div>
-
-          {hasMore && !isFetchingMore && (
-            <button
-              onClick={onLoadMore}
-              title="Load the next page of torrents"
-              style={{
-              minHeight: 30, background: 'var(--table-head)', borderTop: '1px solid var(--border-strong)',
-              borderLeft: 0, borderRight: 0, borderBottom: 0, width: '100%',
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              fontSize: 11, color: 'var(--accent-text)', flexShrink: 0, cursor: 'pointer', gap: 6,
-            }}>
-              <span>Load more torrents</span>
-              <span style={{ color: 'var(--faint)' }}>{torrents.length.toLocaleString()} / {total.toLocaleString()}</span>
-            </button>
-          )}
         </div>
       </div>
+
+      {hasMore && !isFetchingMore && (
+        <button
+          onClick={onLoadMore}
+          title="Load the next page of torrents"
+          style={{
+          minHeight: 30, background: 'var(--table-head)', borderTop: '1px solid var(--border-strong)',
+          borderLeft: 0, borderRight: 0, borderBottom: 0, width: '100%',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          fontSize: 11, color: 'var(--accent-text)', flexShrink: 0, cursor: 'pointer', gap: 6,
+        }}>
+          <span>Load more torrents</span>
+          <span style={{ color: 'var(--faint)' }}>{torrents.length.toLocaleString()} / {total.toLocaleString()}</span>
+        </button>
+      )}
     </div>
   )
 }

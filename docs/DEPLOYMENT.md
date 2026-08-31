@@ -193,10 +193,10 @@ TNG_SECRET_KEY="$(openssl rand -hex 32)" TNG_API_TOKENS="token-one,token-two" ./
 ## Tagged Releases
 
 Release builds are intentionally tag-only. Pushing commits to `main` does not
-build or publish a release. To publish, create and push a `v*` tag that points
-at a commit already on `main`; the release workflow verifies the tag ancestry,
-builds the sidecar, WebUI, Docker images, creates or updates the GitHub Release,
-and posts a Discord announcement.
+build or publish a release. To publish, create and push a `main-*` tag that
+points at a commit already on `main`; the release workflow verifies the tag
+ancestry, builds the sidecar, WebUI, Docker images, creates or updates the
+GitHub Release, and posts a Discord announcement.
 
 Configure the Discord announcement webhook as the GitHub Actions secret
 `DISCORD_RELEASE_WEBHOOK`. Do not commit webhook URLs to the repository.

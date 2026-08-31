@@ -420,9 +420,11 @@ fn capability_matrix(methods: &[String]) -> Vec<EngineCapability> {
         ("live_summary", "TorrentNG live summary", "tng.live_summary"),
     ];
 
+    let has_method = |name: &str| methods.iter().any(|m| m == name);
+
     CAPS.iter()
         .map(|(key, label, command)| {
-            let available = methods.iter().any(|m| m == command);
+            let available = has_method(command);
             EngineCapability {
                 key,
                 label,
@@ -430,6 +432,27 @@ fn capability_matrix(methods: &[String]) -> Vec<EngineCapability> {
                 available,
                 detail: if available {
                     None
+                } else if *key == "trusted_rpc_toggle" {
+                    // This toggle accepts *all* RPC connections (including
+                    // remote/network ones) as trusted - broader than what
+                    // TorrentNG needs. The sidecar always talks to rTorrent
+                    // over the local SCGI socket (see RTORRENT_SCGI_SOCKET),
+                    // which rTorrent already trusts by default per its
+                    // 0.16.9+ connection-trust model, so the calls that
+                    // actually depend on being trusted (load.start,
+                    // load.raw_start) are the ones worth checking here.
+                    let loads_ok = has_method("load.start") && has_method("load.raw_start");
+                    Some(if loads_ok {
+                        "Optional broader accept-all toggle; not required here because the sidecar \
+                         already connects over the trusted local SCGI socket - load.start and \
+                         load.raw_start below confirm untrusted-connection rejection isn't in effect."
+                            .to_owned()
+                    } else {
+                        "Not exposed by this rTorrent build, AND load.start/load.raw_start are also \
+                         unavailable - torrent add calls from *arr apps are likely being rejected as \
+                         untrusted. See docs/AUDIT.md (RPC Trust Model)."
+                            .to_owned()
+                    })
                 } else {
                     Some("command not exposed by running rTorrent build".to_owned())
                 },

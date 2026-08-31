@@ -160,7 +160,11 @@ function actionButton(color: string, disabled: boolean): React.CSSProperties {
     gap: 5,
     border: `1px solid color-mix(in srgb, ${color} 42%, var(--border))`,
     borderRadius: 5,
-    color,
+    // Text needs AA contrast (4.5:1) against the button background; the raw
+    // tint color alone can fall short (e.g. the default theme's accent blue
+    // measured 4.39:1 on --surface-2), so blend it toward --text, which is
+    // tuned for that contrast, while keeping a visible per-action tint.
+    color: `color-mix(in srgb, ${color} 82%, var(--text))`,
     padding: '4px 9px',
     fontSize: 12,
     cursor: disabled ? 'not-allowed' : 'pointer',

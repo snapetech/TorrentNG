@@ -43,7 +43,9 @@ pub struct AppState {
 pub fn build_router(state: AppState) -> Router {
     let qb = crate::qbcompat::build_router(state.clone());
 
-    let static_dir = std::env::var("TNG_STATIC_DIR").unwrap_or_else(|_| "static".to_owned());
+    let static_dir = std::env::var("TNG_STATIC_DIR")
+        .or_else(|_| std::env::var("RTNG_STATIC_DIR"))
+        .unwrap_or_else(|_| "static".to_owned());
 
     Router::new()
         // Native API.

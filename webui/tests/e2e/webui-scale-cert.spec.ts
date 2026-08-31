@@ -248,3 +248,12 @@ test('core workspace controls expose accessible names', async ({ page }) => {
   await page.keyboard.press('Tab')
   await expect.poll(() => page.evaluate(() => document.activeElement?.tagName ?? '')).not.toBe('BODY')
 })
+
+test('Ctrl+A selects the loaded page without opening add-torrent', async ({ page }) => {
+  await expect(page.getByText('TorrentNG scale fixture 00001')).toBeVisible()
+
+  await page.keyboard.press('Control+a')
+
+  await expect(page.getByRole('navigation', { name: 'Torrent list filters and actions' }).getByText('200 selected', { exact: true })).toBeVisible()
+  await expect(page.getByRole('dialog', { name: 'Add torrent' })).toHaveCount(0)
+})
