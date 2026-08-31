@@ -752,10 +752,7 @@ fn multi_file_fixture(name: &str, include_padding: bool) -> MultiFileFixture {
         (b"pieces".to_vec(), B::S(pieces_blob)),
     ]);
     let raw = bencode(B::D(vec![
-        (
-            b"announce".to_vec(),
-            bs("https://tracker.example/announce"),
-        ),
+        (b"announce".to_vec(), bs("https://tracker.example/announce")),
         (b"info".to_vec(), info),
     ]));
     let info_hash = parse_hash(&raw);

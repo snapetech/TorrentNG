@@ -790,12 +790,8 @@ fn dry_run_session(
         if !extension_is(&path, &["torrent"]) {
             continue;
         }
-        match migration_torrent_from_path(
-            &path,
-            &resume_by_stem,
-            &aggregate_resume_paths,
-            options,
-        ) {
+        match migration_torrent_from_path(&path, &resume_by_stem, &aggregate_resume_paths, options)
+        {
             Ok(torrent) => torrents.push(torrent),
             Err(reason) => skipped.push(SkippedEntry { path, reason }),
         }
@@ -884,9 +880,7 @@ fn migration_torrent_from_path(
     // '/', which must NOT be mistaken for a prefix; v2/hybrid always does
     // regardless of file count - see `correct_own_subdir_save_path`'s doc
     // comment).
-    let files_use_name_prefix = files
-        .first()
-        .is_some_and(|file| file.path.contains('/'));
+    let files_use_name_prefix = files.first().is_some_and(|file| file.path.contains('/'));
     if files_use_name_prefix {
         if let Some(save_path) = &resume.save_path {
             let remapped = options.remap_path(save_path);
