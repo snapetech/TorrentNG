@@ -827,6 +827,7 @@ fn migration_torrent_from_path(
 ) -> Result<MigrationTorrent, String> {
     let raw = read_limited(path, MAX_TORRENT_BYTES).map_err(|e| e.to_string())?;
     let meta = parse_torrent(&raw).map_err(|e| e.to_string())?;
+    let piece_count = migration_piece_count(&meta);
     let info_hash = migration_info_hash(&meta);
     let file_stem = path.file_stem().and_then(|stem| stem.to_str());
     let resume_path = resume_by_stem
@@ -837,7 +838,7 @@ fn migration_torrent_from_path(
     let mut resume = resume_path
         .as_ref()
         .and_then(
-            |path| match parse_resume_file(path, &info_hash, file_stem) {
+            |path| match parse_resume_file(path, &info_hash, file_stem, piece_count) {
                 Ok(resume) => Some(resume),
                 Err(error) => {
                     warnings.push(format!("resume parse failed: {error}"));
@@ -850,7 +851,7 @@ fn migration_torrent_from_path(
     if resume_path.is_none() {
         let mut aggregate_parse_errors = BTreeSet::new();
         for path in aggregate_resume_paths {
-            match parse_resume_file(path, &info_hash, file_stem) {
+            match parse_resume_file(path, &info_hash, file_stem, piece_count) {
                 Ok(candidate) if candidate.has_importable_data() => {
                     resume = candidate;
                     resolved_resume_path = Some(path.clone());
@@ -1092,6 +1093,7 @@ fn parse_resume_file(
     path: &Path,
     info_hash: &str,
     file_stem: Option<&str>,
+    piece_count: u64,
 ) -> Result<ResumeData, String> {
     let bytes = read_limited(path, MAX_RESUME_BYTES).map_err(|e| e.to_string())?;
     if bytes.is_empty() {
@@ -1105,9 +1107,10 @@ fn parse_resume_file(
     let value = decode(&bytes)
         .or_else(|_| Decoder::new(&bytes).with_strict_dict_keys(false).decode())
         .map_err(|e| e.to_string())?;
-    Ok(resume_from_bencode(select_bencode_resume_entry(
-        &value, info_hash, file_stem,
-    )))
+    Ok(resume_from_bencode(
+        select_bencode_resume_entry(&value, info_hash, file_stem),
+        piece_count,
+    ))
 }
 
 fn select_json_resume_entry<'a>(
@@ -1317,7 +1320,7 @@ fn resume_from_json(value: &serde_json::Value) -> ResumeData {
     resume
 }
 
-fn resume_from_bencode(value: &BValue<'_>) -> ResumeData {
+fn resume_from_bencode(value: &BValue<'_>, piece_count: u64) -> ResumeData {
     let mut resume = ResumeData::default();
     resume.save_path = first_bencode_string(
         value,
@@ -1393,7 +1396,7 @@ fn resume_from_bencode(value: &BValue<'_>) -> ResumeData {
             b"finished".as_slice(),
         ],
     )
-    .or_else(|| bencode_completed_from_pieces(value));
+    .or_else(|| bencode_completed_from_pieces(value, piece_count));
     resume.added_at = first_bencode_i64(
         value,
         &[
@@ -1454,7 +1457,7 @@ fn resume_from_bencode(value: &BValue<'_>) -> ResumeData {
         ],
     );
     resume.tracker_activity = tracker_activity_from_bencode(value);
-    resume.pieces = libtorrent_piece_states(value)
+    resume.pieces = libtorrent_piece_states(value, piece_count)
         .or_else(|| transmission_piece_states(value))
         .or_else(|| nested_piece_states(value));
     resume.partial_pieces = libtorrent_partial_pieces(value);
@@ -1477,10 +1480,38 @@ fn resume_from_bencode(value: &BValue<'_>) -> ResumeData {
     resume
 }
 
-fn libtorrent_piece_states(value: &BValue<'_>) -> Option<Vec<PieceState>> {
+/// libtorrent has used two incompatible encodings for a resume file's
+/// `pieces` field across its history:
+///   - classic (1.x-era, `file-version` absent/1): one **byte** per piece.
+///   - modern (2.x, `file-version: 2`, confirmed against a real qBittorrent
+///     v5.2.3 / libtorrent 2.1.1.0 resume file): one **bit** per piece,
+///     packed MSB-first exactly like a BEP3 wire bitfield - `ceil(piece
+///     count / 8)` bytes, not `piece count` bytes.
+///
+/// Blindly assuming either encoding is wrong for the other: a real
+/// 4513-piece movie's modern resume file had `pieces` as 565 bytes
+/// (`ceil(4513/8) == 565`); reading that as one-byte-per-piece silently
+/// truncated/padded 3948 real, valid pieces down to `Unknown`, which
+/// wouldn't destroy the file (the storage-layer shrink guard prevents
+/// that) but would force a near-total, entirely unnecessary re-verify/
+/// re-download of an already-complete file.
+///
+/// Disambiguate using the piece count we already know from the .torrent
+/// itself: an exact `bytes.len() == piece_count` match is the classic
+/// encoding (and is what small torrents with 8 or fewer pieces look like
+/// under *either* encoding, so exact-length match wins ties); only when
+/// the lengths don't match but `bytes.len() == ceil(piece_count / 8)` is
+/// it unambiguously the modern packed bitfield.
+fn libtorrent_piece_states(value: &BValue<'_>, piece_count: u64) -> Option<Vec<PieceState>> {
     let bytes = value.get(b"pieces")?.as_bytes()?;
     if bytes.is_empty() {
         return None;
+    }
+    let packed_bitfield_len = piece_count.div_ceil(8) as usize;
+    if bytes.len() != piece_count as usize && bytes.len() == packed_bitfield_len {
+        let mut pieces = bitfield_to_piece_states(bytes);
+        pieces.truncate(piece_count as usize);
+        return Some(pieces);
     }
     Some(
         bytes
@@ -1582,8 +1613,8 @@ fn bitfield_to_piece_states(bitfield: &[u8]) -> Vec<PieceState> {
     pieces
 }
 
-fn bencode_completed_from_pieces(value: &BValue<'_>) -> Option<bool> {
-    let pieces = libtorrent_piece_states(value)
+fn bencode_completed_from_pieces(value: &BValue<'_>, piece_count: u64) -> Option<bool> {
+    let pieces = libtorrent_piece_states(value, piece_count)
         .or_else(|| transmission_piece_states(value))
         .or_else(|| nested_piece_states(value))?;
     Some(!pieces.is_empty() && pieces.iter().all(|piece| *piece == PieceState::Valid))
@@ -2584,6 +2615,81 @@ mod tests {
         assert_eq!(state.file_hints.len(), 1);
         assert_eq!(state.uploaded_bytes, 10);
         assert_eq!(state.downloaded_bytes, 12);
+    }
+
+    #[test]
+    fn qbit_libtorrent2_resume_unpacks_bit_packed_pieces_field() {
+        // Regression test for a real bug found importing a real, complete,
+        // 4513-piece movie from a real, currently-running qBittorrent
+        // v5.2.3 instance (libtorrent 2.1.1.0, resume file-version 2):
+        // its "pieces" field is a *bit-packed* bitfield (565 bytes ==
+        // ceil(4513/8)), not the classic one-byte-per-piece encoding the
+        // sibling test above exercises. Misreading it as byte-per-piece
+        // silently treated 3948 of 4513 real, valid pieces as Unknown -
+        // safe (the storage-layer shrink guard prevents data loss) but it
+        // would have forced a near-total, entirely unnecessary
+        // re-verify/re-download of an already-complete file.
+        let dir = tempfile::tempdir().unwrap();
+        let piece_len = 16_384i64;
+        let piece_count = 20usize;
+        let total = piece_len * piece_count as i64;
+        let pieces_data = vec![7u8; 20 * piece_count];
+        let mut info_pairs: Vec<(&[u8], BValue<'_>)> = vec![
+            (b"length", BValue::Int(total)),
+            (b"name", BValue::Bytes(b"movie.mkv")),
+            (b"piece length", BValue::Int(piece_len)),
+            (b"pieces", BValue::Bytes(&pieces_data)),
+        ];
+        info_pairs.sort_by(|a, b| a.0.cmp(b.0));
+        let mut root: Vec<(&[u8], BValue<'_>)> = vec![
+            (b"announce", BValue::Bytes(b"http://t.example/a")),
+            (b"info", BValue::Dict(info_pairs)),
+        ];
+        root.sort_by(|a, b| a.0.cmp(b.0));
+        let raw = encode(&BValue::Dict(root));
+        let info_hash = match parse_torrent(&raw).unwrap() {
+            TorrentMeta::V1(m) => m.info_hash,
+            _ => panic!("expected V1"),
+        };
+        let info_hash_hex = hex_lower(&info_hash);
+        std::fs::write(dir.path().join(format!("{info_hash_hex}.torrent")), &raw).unwrap();
+
+        // 20 pieces packed MSB-first into ceil(20/8) = 3 bytes, all set
+        // (every real client - and this crate's own bitfield_to_piece_states
+        // - packs/unpacks bitfields this same way).
+        let packed_pieces: &[u8] = &[0xFF, 0xFF, 0xF0];
+        let mut resume = vec![
+            (
+                b"qBt-savePath".as_slice(),
+                BValue::Bytes(dir.path().as_os_str().as_encoded_bytes()),
+            ),
+            (b"file-format".as_slice(), BValue::Bytes(b"libtorrent resume file")),
+            (b"file-version".as_slice(), BValue::Int(2)),
+            (b"libtorrent-version".as_slice(), BValue::Bytes(b"2.1.1.0")),
+            (b"pieces".as_slice(), BValue::Bytes(packed_pieces)),
+        ];
+        resume.sort_by(|a, b| a.0.cmp(b.0));
+        std::fs::write(
+            dir.path().join(format!("{info_hash_hex}.fastresume")),
+            encode(&BValue::Dict(resume)),
+        )
+        .unwrap();
+
+        let plan = dry_run_qbittorrent_backup(dir.path()).unwrap();
+        let torrent = &plan.torrents[0];
+        let state = torrent
+            .to_fastresume_state(ImportPolicy::TrustHints)
+            .expect("fastresume state");
+        assert_eq!(
+            state.pieces.len(),
+            piece_count,
+            "must not be silently truncated/padded from misreading byte length as piece count"
+        );
+        assert!(
+            state.pieces.iter().all(|p| *p == PieceState::Valid),
+            "all 20 real pieces must come back Valid, not mostly Unknown: {:?}",
+            state.pieces
+        );
     }
 
     #[test]
