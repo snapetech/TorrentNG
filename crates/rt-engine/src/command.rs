@@ -811,7 +811,6 @@ pub enum EngineCmd {
         operation: String,
         affected_torrents: Vec<String>,
         plan: StoragePlan,
-        roots: Vec<PathBuf>,
         completed_steps: Vec<usize>,
         reply: oneshot::Sender<CmdResult<String>>,
     },

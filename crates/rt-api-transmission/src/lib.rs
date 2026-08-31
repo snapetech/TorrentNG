@@ -26,6 +26,7 @@ use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
 const SESSION_ID: &str = "TorrentNG";
+const MAX_TRANSMISSION_BATCH_REQUESTS: usize = 128;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -230,6 +231,15 @@ async fn rpc(
     }
 
     if let Value::Array(requests) = body {
+        if requests.len() > MAX_TRANSMISSION_BATCH_REQUESTS {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(json!({
+                    "result": "request batch exceeds the maximum supported size"
+                })),
+            )
+                .into_response();
+        }
         let mut responses = Vec::with_capacity(requests.len());
         for request in requests {
             responses.push(transmission_rpc_payload(&state, request).await);
@@ -3478,6 +3488,34 @@ mod tests {
         assert_eq!(body[1]["id"], 2);
         assert_eq!(body[1]["result"]["torrents"][0]["name"], "one");
         assert_eq!(body[1]["result"]["torrents"][0]["percent_done"], 1.0);
+    }
+
+    #[tokio::test]
+    async fn transmission_batches_are_bounded_before_response_allocation() {
+        let app =
+            build_transmission_router(AppState::new(Arc::new(RwLock::new(SessionRegistry::new()))));
+        let requests = vec![
+            json!({
+                "jsonrpc": "2.0",
+                "method": "session_get",
+                "params": {},
+                "id": 1
+            });
+            MAX_TRANSMISSION_BATCH_REQUESTS + 1
+        ];
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .header("content-type", "application/json")
+                    .header("x-transmission-session-id", SESSION_ID)
+                    .body(Body::from(serde_json::to_vec(&requests).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]

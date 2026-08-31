@@ -2453,22 +2453,6 @@ pub async fn storage_execute_plan(
         )
             .into_response();
     };
-    let roots = match req.roots.clone() {
-        Some(roots) if !roots.is_empty() => roots,
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(
-                    serde_json::to_value(ApiError::bad_request(
-                        "roots must include at least one configured storage root for execution"
-                            .to_owned(),
-                    ))
-                    .unwrap(),
-                ),
-            )
-                .into_response();
-        }
-    };
     let plan = match build_storage_plan(&req, false) {
         Ok(plan) => plan,
         Err(e) => {
@@ -2479,9 +2463,6 @@ pub async fn storage_execute_plan(
                 .into_response();
         }
     };
-    if let Some(response) = validate_storage_plan_roots(&plan, Some(&roots)) {
-        return response;
-    }
     if let Err(e) = validate_completed_steps(&plan, req.completed_steps.as_deref()) {
         return (
             StatusCode::BAD_REQUEST,
@@ -2495,7 +2476,6 @@ pub async fn storage_execute_plan(
                 .unwrap_or_else(|| req.operation.to_ascii_lowercase()),
             req.affected_torrents.unwrap_or_default(),
             plan.clone(),
-            roots,
             req.completed_steps.unwrap_or_default(),
         )
         .await

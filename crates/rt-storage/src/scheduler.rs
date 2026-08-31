@@ -186,6 +186,7 @@ pub struct StorageIoStats {
     pub hash_ops: u64,
     pub preallocation_failures: u64,
     pub preallocation_fallbacks: u64,
+    pub preallocation_shrink_refused: u64,
     pub peer_read_cache_entries: usize,
     pub peer_read_cache_hits: u64,
     pub peer_read_cache_misses: u64,
@@ -275,6 +276,7 @@ impl Default for StorageIoStats {
             hash_ops: 0,
             preallocation_failures: 0,
             preallocation_fallbacks: 0,
+            preallocation_shrink_refused: 0,
             peer_read_cache_entries: 0,
             peer_read_cache_hits: 0,
             peer_read_cache_misses: 0,
@@ -597,6 +599,7 @@ struct StorageCounters {
     hash_ops: AtomicU64,
     preallocation_failures: AtomicU64,
     preallocation_fallbacks: AtomicU64,
+    preallocation_shrink_refused: AtomicU64,
     peer_read_cache_hits: AtomicU64,
     peer_read_cache_misses: AtomicU64,
     peer_read_cache_evictions: AtomicU64,
@@ -635,6 +638,7 @@ impl Default for StorageCounters {
             hash_ops: AtomicU64::new(0),
             preallocation_failures: AtomicU64::new(0),
             preallocation_fallbacks: AtomicU64::new(0),
+            preallocation_shrink_refused: AtomicU64::new(0),
             peer_read_cache_hits: AtomicU64::new(0),
             peer_read_cache_misses: AtomicU64::new(0),
             peer_read_cache_evictions: AtomicU64::new(0),
@@ -1356,6 +1360,10 @@ impl MountScheduler {
                 .counters
                 .preallocation_fallbacks
                 .load(Ordering::Relaxed),
+            preallocation_shrink_refused: self
+                .counters
+                .preallocation_shrink_refused
+                .load(Ordering::Relaxed),
             peer_read_cache_entries,
             peer_read_cache_hits: self.counters.peer_read_cache_hits.load(Ordering::Relaxed),
             peer_read_cache_misses: self.counters.peer_read_cache_misses.load(Ordering::Relaxed),
@@ -1786,6 +1794,30 @@ impl MountScheduler {
                     .map_err(|e| StorageError::io(parent.display().to_string(), e))?;
             }
             let file = pool.get_or_open(&key, OpenMode::Write, true)?;
+            if mode != PreallocationMode::Off {
+                let current_len = file
+                    .metadata()
+                    .map_err(|e| StorageError::io(&path_str, e))?
+                    .len();
+                if current_len > len {
+                    counters
+                        .preallocation_shrink_refused
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::error!(
+                        component = "storage",
+                        operation = "prepare_file",
+                        path = %path_str,
+                        current_len,
+                        requested_len = len,
+                        "refusing to shrink an existing file below its current on-disk size"
+                    );
+                    return Err(StorageError::RefuseShrink {
+                        path: path_str,
+                        current_len,
+                        requested_len: len,
+                    });
+                }
+            }
             match mode {
                 PreallocationMode::Off => {}
                 PreallocationMode::Auto => {
@@ -2860,6 +2892,75 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 12);
+    }
+
+    #[tokio::test]
+    async fn prepare_file_refuses_to_shrink_existing_data() {
+        // Regression test: `prepare_file` must never truncate a file that
+        // already holds more data than the requested length, whatever the
+        // upstream reason for the mismatched length is (metainfo parsing
+        // bug, stale hint, wrong path, ...). Silent truncation here is what
+        // destroys already-downloaded data on import.
+        for mode in [
+            PreallocationMode::Auto,
+            PreallocationMode::Sparse,
+            PreallocationMode::Full,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("complete.bin");
+            let original = vec![0xABu8; 4096];
+            std::fs::write(&path, &original).unwrap();
+            let sched = hdd_scheduler();
+
+            let err = sched
+                .prepare_file(&path, 1024, mode)
+                .await
+                .expect_err("shrink must be refused");
+            assert!(
+                matches!(
+                    err,
+                    StorageError::RefuseShrink {
+                        current_len: 4096,
+                        requested_len: 1024,
+                        ..
+                    }
+                ),
+                "unexpected error for {mode:?}: {err:?}"
+            );
+
+            let stats = sched.stats();
+            assert_eq!(
+                stats.preallocation_shrink_refused, 1,
+                "shrink-refused counter should record the refusal for {mode:?}"
+            );
+
+            let on_disk = std::fs::read(&path).unwrap();
+            assert_eq!(
+                on_disk, original,
+                "file bytes must be untouched after a refused shrink for {mode:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn prepare_file_extends_without_disturbing_existing_bytes() {
+        // A length request >= current size (normal preallocation for a
+        // growing/partial file) must still work exactly as before.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("partial.bin");
+        let original = vec![0xCDu8; 1024];
+        std::fs::write(&path, &original).unwrap();
+        let sched = hdd_scheduler();
+
+        sched
+            .prepare_file(&path, 4096, PreallocationMode::Sparse)
+            .await
+            .unwrap();
+
+        let on_disk = std::fs::read(&path).unwrap();
+        assert_eq!(on_disk.len(), 4096);
+        assert_eq!(&on_disk[..1024], &original[..]);
+        assert_eq!(sched.stats().preallocation_shrink_refused, 0);
     }
 
     #[tokio::test]

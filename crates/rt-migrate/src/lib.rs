@@ -994,6 +994,11 @@ fn migration_trackers(meta: &TorrentMeta) -> Vec<String> {
 }
 
 fn migration_files(meta: &TorrentMeta) -> Vec<MigrationFile> {
+    // BEP 47 padding files (`"attr"` contains `'p'`) are never materialized
+    // on disk by real clients and must never be treated as wanted content -
+    // otherwise the engine expects a file that will never exist and, before
+    // the fastresume hint fix, that could poison trust for every other file
+    // in the same torrent.
     match meta {
         TorrentMeta::V1(meta) | TorrentMeta::Hybrid(meta, _) => meta
             .files
@@ -1003,8 +1008,8 @@ fn migration_files(meta: &TorrentMeta) -> Vec<MigrationFile> {
                 path: file.path.as_display(),
                 length: file.length,
                 offset: file.offset,
-                priority: 1,
-                wanted: true,
+                priority: if file.pad { 0 } else { 1 },
+                wanted: !file.pad,
                 completed_bytes: None,
             })
             .collect(),
@@ -1016,8 +1021,8 @@ fn migration_files(meta: &TorrentMeta) -> Vec<MigrationFile> {
                 path: file.path.as_display(),
                 length: file.length,
                 offset: file.offset,
-                priority: 1,
-                wanted: true,
+                priority: if file.pad { 0 } else { 1 },
+                wanted: !file.pad,
                 completed_bytes: None,
             })
             .collect(),
@@ -2293,6 +2298,79 @@ mod tests {
             TorrentMeta::V1(meta) | TorrentMeta::Hybrid(meta, _) => meta.info_hash,
             TorrentMeta::V2(_) => unreachable!(),
         }
+    }
+
+    /// A real file plus a BEP 47 padding file (`"attr": "p"`), the shape
+    /// real clients never materialize on disk.
+    fn write_padded_fixture_torrent(path: &Path) -> [u8; 20] {
+        let pieces = [7u8; 20];
+        let mut file0 = vec![
+            (b"length".as_slice(), BValue::Int(5)),
+            (
+                b"path".as_slice(),
+                BValue::List(vec![BValue::Bytes(b"a.bin")]),
+            ),
+        ];
+        file0.sort_by(|a, b| a.0.cmp(b.0));
+        let mut file1 = vec![
+            (b"attr".as_slice(), BValue::Bytes(b"p")),
+            (b"length".as_slice(), BValue::Int(3)),
+            (
+                b"path".as_slice(),
+                BValue::List(vec![BValue::Bytes(b".pad"), BValue::Bytes(b"3")]),
+            ),
+        ];
+        file1.sort_by(|a, b| a.0.cmp(b.0));
+        let mut info = vec![
+            (
+                b"files".as_slice(),
+                BValue::List(vec![BValue::Dict(file0), BValue::Dict(file1)]),
+            ),
+            (b"name".as_slice(), BValue::Bytes(b"padded")),
+            (b"piece length".as_slice(), BValue::Int(16_384)),
+            (b"pieces".as_slice(), BValue::Bytes(&pieces)),
+        ];
+        info.sort_by(|a, b| a.0.cmp(b.0));
+        let mut torrent = vec![
+            (
+                b"announce".as_slice(),
+                BValue::Bytes(b"https://tracker/announce"),
+            ),
+            (b"info".as_slice(), BValue::Dict(info)),
+        ];
+        torrent.sort_by(|a, b| a.0.cmp(b.0));
+        std::fs::write(path, encode(&BValue::Dict(torrent))).unwrap();
+        match parse_torrent(&std::fs::read(path).unwrap()).unwrap() {
+            TorrentMeta::V1(meta) | TorrentMeta::Hybrid(meta, _) => meta.info_hash,
+            TorrentMeta::V2(_) => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn padding_files_are_never_marked_wanted() {
+        let dir = tempfile::tempdir().unwrap();
+        let torrent_path = dir.path().join("padded.torrent");
+        let info_hash = write_padded_fixture_torrent(&torrent_path);
+        let info_hash_hex = hex_lower(&info_hash);
+        std::fs::rename(
+            &torrent_path,
+            dir.path().join(format!("{info_hash_hex}.torrent")),
+        )
+        .unwrap();
+
+        let plan = dry_run_qbittorrent_backup(dir.path()).unwrap();
+        let import = plan.to_db_import(&ImportOptions::default());
+        let files = &import.torrents[0].files;
+
+        assert_eq!(files.len(), 2);
+        assert!(files[0].wanted, "the real file must stay wanted");
+        assert_eq!(files[0].priority, 1);
+        assert!(
+            !files[1].wanted,
+            "a BEP47 padding file must never be marked wanted - real clients \
+             never write it to disk, so requiring it forces a needless recheck"
+        );
+        assert_eq!(files[1].priority, 0);
     }
 
     #[test]

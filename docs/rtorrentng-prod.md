@@ -14,6 +14,20 @@ sudo systemctl daemon-reload
 sudo systemctl restart rtorrentng-prod.service
 ```
 
+Create the root-only environment file before restarting the service. Generate
+new values if credentials were ever embedded in a unit or repository:
+
+```sh
+sudo install -o root -g root -m 0600 deploy/systemd/rtorrentng-prod.secrets.env.example \
+  /etc/rtorrentng-prod/secrets.env
+sudoedit /etc/rtorrentng-prod/secrets.env
+openssl rand -hex 32
+openssl rand -base64 32
+```
+
+The service reads `RTNG_SECRET_KEY` and `RTNG_API_TOKENS` from that file. Do
+not put populated credentials in the unit, image, config bind mount, or git.
+
 The drop-in requires `/mnt/datapool_lvm_media` to be mounted before the service
 can start. Torrent data, app state, rTorrent scratch config, and logs are all
 bound to persistent storage:

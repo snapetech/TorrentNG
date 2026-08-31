@@ -2564,28 +2564,14 @@ impl TorrentTask {
             }
         }
 
-        match collect_file_hints(&self.save_root, &self.meta) {
-            Ok(hints) => {
-                let invalidated = state.apply_file_hints(hints, &self.piece_map);
-                if invalidated > 0 {
-                    warn!(
-                        torrent = %self.info_hash_hex,
-                        invalidated,
-                        "fastresume file hints changed"
-                    );
-                }
-            }
-            Err(e) => {
-                warn!(
-                    component = "fastresume",
-                    operation = "collect_file_hints",
-                    torrent = %self.info_hash_hex,
-                    result = "error",
-                    error = %e,
-                    "could not collect file hints for fastresume"
-                );
-                return false;
-            }
+        let hints = collect_file_hints(&self.save_root, &self.meta);
+        let invalidated = state.apply_file_hints(hints, &self.piece_map);
+        if invalidated > 0 {
+            warn!(
+                torrent = %self.info_hash_hex,
+                invalidated,
+                "fastresume file hints changed"
+            );
         }
 
         for (piece, piece_state) in state.pieces.iter().copied().enumerate() {
@@ -2637,6 +2623,15 @@ impl TorrentTask {
                 .iter()
                 .find(|file| file.index == region.file_index)
                 .ok_or_else(|| anyhow::anyhow!("file index {} out of range", region.file_index))?;
+            // Padding files are still written (even though real clients
+            // never create them): `PieceVerifier::verify_piece`
+            // (rt-storage/src/verify.rs) reads every region composing a
+            // piece from disk during recheck and treats a missing file as
+            // the whole piece being unverifiable, not as an implicit-zero
+            // region. Skipping the write here would make any piece that
+            // straddles a padding boundary permanently fail recheck. See
+            // also `file.pad` handling in `collect_file_hints`/rt-migrate,
+            // which does make padding files optional for fastresume trust.
             let path = file.path.resolve(&self.save_root);
             self.prepare_file_once(file.index, &path, file.length)
                 .await?;
@@ -2671,6 +2666,7 @@ impl TorrentTask {
                 .iter()
                 .find(|file| file.index == region.file_index)
                 .ok_or_else(|| anyhow::anyhow!("file index {} out of range", region.file_index))?;
+            // Padding files are still written - see write_block.
             let path = file.path.resolve(&self.save_root);
             self.prepare_file_once(file.index, &path, file.length)
                 .await?;
@@ -2972,20 +2968,7 @@ impl TorrentTask {
         } else {
             state.clean_shutdown = false;
         }
-        state.file_hints = match collect_file_hints(&self.save_root, &self.meta) {
-            Ok(hints) => hints,
-            Err(e) => {
-                warn!(
-                    component = "fastresume",
-                    operation = "collect_file_hints",
-                    torrent = %self.info_hash_hex,
-                    result = "error",
-                    error = %e,
-                    "failed to collect fastresume file hints"
-                );
-                Vec::new()
-            }
-        };
+        state.file_hints = collect_file_hints(&self.save_root, &self.meta);
         if full_verify {
             state.last_full_verify = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -3085,15 +3068,33 @@ fn outgoing_transport_policy_for_peer(
     }
 }
 
-fn collect_file_hints(
-    root: &std::path::Path,
-    meta: &TorrentMetaV1,
-) -> anyhow::Result<Vec<FileHint>> {
+/// Collect on-disk size/mtime/inode hints for every file in `meta`.
+///
+/// Per-file, not all-or-nothing: a file that can't be stat'd (missing,
+/// permission error, a BEP47 padding file real clients never materialize,
+/// ...) is simply omitted from the result rather than aborting the whole
+/// collection. `apply_file_hints` already treats a missing hint as "this
+/// file changed" and invalidates only *that* file's pieces — one bad file
+/// must not poison fastresume trust for every other file in the torrent.
+fn collect_file_hints(root: &std::path::Path, meta: &TorrentMetaV1) -> Vec<FileHint> {
     meta.files
         .iter()
-        .map(|file| {
+        .filter_map(|file| {
             let path = file.path.resolve(root);
-            let metadata = std::fs::metadata(&path)?;
+            let metadata = match std::fs::metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(e) => {
+                    debug!(
+                        component = "fastresume",
+                        operation = "collect_file_hints",
+                        file_index = file.index,
+                        path = %path.display(),
+                        error = %e,
+                        "could not stat file; omitting its hint"
+                    );
+                    return None;
+                }
+            };
             let modified = metadata
                 .modified()
                 .ok()
@@ -3109,7 +3110,7 @@ fn collect_file_hints(
             #[cfg(not(unix))]
             let inode = 0;
 
-            Ok(FileHint {
+            Some(FileHint {
                 file_index: file.index,
                 size: metadata.len(),
                 mtime_secs: modified,
@@ -4251,6 +4252,7 @@ mod tests {
                 length: 5,
                 path: rt_path::SafeRelPath::from_name("sample.iso", false).unwrap(),
                 offset: 0,
+                pad: false,
             }],
             private: false,
             raw: Vec::new(),
@@ -4290,6 +4292,7 @@ mod tests {
                 path: rt_path::SafeRelPath::from_components(&["payload-dir", "payload.bin"], false)
                     .unwrap(),
                 offset: 0,
+                pad: false,
             }],
             private: false,
             raw: Vec::new(),
@@ -4359,17 +4362,67 @@ mod tests {
                 length: 5,
                 path: rt_path::SafeRelPath::from_name("sample.bin", false).unwrap(),
                 offset: 0,
+                pad: false,
             }],
             private: false,
             raw: Vec::new(),
         };
 
-        let hints = collect_file_hints(dir.path(), &meta).unwrap();
+        let hints = collect_file_hints(dir.path(), &meta);
 
         assert_eq!(hints.len(), 1);
         assert_eq!(hints[0].file_index, 3);
         assert_eq!(hints[0].size, 5);
         assert!(hints[0].mtime_secs > 0);
+    }
+
+    #[test]
+    fn file_hints_omit_missing_files_without_failing_the_whole_torrent() {
+        // Regression test for the "one missing file poisons the whole
+        // torrent's fastresume trust" bug: a multi-file torrent where one
+        // file is absent (e.g. a BEP47 padding file real clients never
+        // write, or a renamed/deleted file) must still return hints for
+        // every OTHER file that does exist on disk.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("present.bin"), b"hello").unwrap();
+        // "missing.bin" is intentionally never created.
+
+        let meta = TorrentMetaV1 {
+            info_hash: [1; 20],
+            announce: None,
+            announce_list: Vec::new(),
+            webseeds: Vec::new(),
+            comment: None,
+            created_by: None,
+            creation_date: None,
+            name: "multi".into(),
+            piece_length: 16_384,
+            pieces: vec![[2; 20]],
+            files: vec![
+                rt_metainfo::TorrentFileV1 {
+                    index: 0,
+                    length: 5,
+                    path: rt_path::SafeRelPath::from_name("present.bin", false).unwrap(),
+                    offset: 0,
+                    pad: false,
+                },
+                rt_metainfo::TorrentFileV1 {
+                    index: 1,
+                    length: 0,
+                    path: rt_path::SafeRelPath::from_name("missing.bin", false).unwrap(),
+                    offset: 5,
+                    pad: false,
+                },
+            ],
+            private: false,
+            raw: Vec::new(),
+        };
+
+        let hints = collect_file_hints(dir.path(), &meta);
+
+        assert_eq!(hints.len(), 1, "only the present file should have a hint");
+        assert_eq!(hints[0].file_index, 0);
+        assert_eq!(hints[0].size, 5);
     }
 
     #[test]
@@ -4652,6 +4705,7 @@ mod tests {
                 length: 5,
                 path: rt_path::SafeRelPath::from_name("sample.bin", false).unwrap(),
                 offset: 0,
+                pad: false,
             }],
             private: true,
             raw: Vec::new(),

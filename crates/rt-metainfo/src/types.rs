@@ -134,6 +134,11 @@ pub struct TorrentFileV1 {
     pub path: SafeRelPath,
     /// Byte offset of this file within the concatenated content stream.
     pub offset: u64,
+    /// BEP 47 padding file (`"attr"` contains `'p'`). Real clients never
+    /// materialize these on disk; they exist purely to align the next real
+    /// file to a piece boundary. Downstream code must not require this
+    /// file to exist, and must not treat it as wanted content.
+    pub pad: bool,
 }
 
 /// Parsed v2 torrent metainfo (BEP 52).
@@ -197,4 +202,7 @@ pub struct TorrentFileV2 {
     pub offset: u64,
     /// SHA-256 merkle root of this file's 16 KiB leaf hashes.
     pub pieces_root: [u8; 32],
+    /// BEP 47 padding file (`"attr"` contains `'p'`). See
+    /// [`TorrentFileV1::pad`].
+    pub pad: bool,
 }

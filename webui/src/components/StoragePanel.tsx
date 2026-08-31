@@ -104,6 +104,8 @@ export function StoragePanel() {
     mutationFn: () => api.storagePlan.execute({
       ...request,
       dry_run: false,
+      // Preview roots are advisory UI state. The server owns execution roots.
+      roots: undefined,
       dry_run_approved: operation === 'delete' ? deleteApproved : undefined,
     }),
     onSuccess: setPreview,

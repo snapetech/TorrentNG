@@ -42,6 +42,7 @@ use crate::command::{
 };
 use crate::dht_task::{run_dht, DhtCommand, DhtTorrent};
 use crate::metadata_task::run_metadata_task;
+use crate::storage_authority::ServerStorageRoots;
 use crate::tier::{TierInput, TierPolicy};
 use crate::torrent_task::{TorrentCmd, TorrentTask};
 
@@ -349,7 +350,6 @@ impl EngineHandle {
         operation: String,
         affected_torrents: Vec<String>,
         plan: StoragePlan,
-        roots: Vec<PathBuf>,
         completed_steps: Vec<usize>,
     ) -> CmdResult<String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
@@ -358,7 +358,6 @@ impl EngineHandle {
                 operation,
                 affected_torrents,
                 plan,
-                roots,
                 completed_steps,
                 reply,
             })
@@ -1163,7 +1162,6 @@ impl Engine {
                 operation,
                 affected_torrents,
                 plan,
-                roots,
                 completed_steps,
                 reply,
             } => {
@@ -1171,7 +1169,6 @@ impl Engine {
                     &operation,
                     affected_torrents,
                     &plan,
-                    &roots,
                     completed_steps,
                 );
                 let _ = reply.send(result);
@@ -2366,7 +2363,7 @@ impl Engine {
             steps,
             rollback_steps,
         };
-        self.execute_storage_plan_job("move", vec![info_hash.to_owned()], &plan, &[], Vec::new())?;
+        self.execute_storage_plan_job("move", vec![info_hash.to_owned()], &plan, Vec::new())?;
         Ok(())
     }
 
@@ -3489,6 +3486,20 @@ impl Engine {
             .map_err(|e| e.to_string())
     }
 
+    fn configured_storage_roots_for_execution(&self) -> Result<Vec<PathBuf>, String> {
+        let paths = {
+            let db = self.db.lock().expect("database mutex poisoned");
+            rt_db::list_storage_roots(&db)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(|root| PathBuf::from(root.path))
+                .collect::<Vec<_>>()
+        };
+        ServerStorageRoots::from_configured_paths(paths)
+            .map(ServerStorageRoots::into_roots)
+            .map_err(|e| e.to_string())
+    }
+
     #[allow(dead_code)]
     fn completed_storage_plan_steps(&self, job_id: &str) -> Vec<usize> {
         let db = self.db.lock().expect("database mutex poisoned");
@@ -3715,10 +3726,10 @@ impl Engine {
         operation: &str,
         affected_torrents: Vec<String>,
         plan: &StoragePlan,
-        roots: &[PathBuf],
         completed_steps: Vec<usize>,
     ) -> Result<String, String> {
         let completed_steps = normalize_storage_plan_completed_steps(plan, completed_steps)?;
+        let server_roots = self.configured_storage_roots_for_execution()?;
         let job_id = self.create_storage_plan_job(operation, affected_torrents, plan)?;
         self.update_job_state(
             &job_id,
@@ -3739,16 +3750,12 @@ impl Engine {
                     reason: error,
                 })
         };
-        let result = if roots.is_empty() {
-            rt_storage::execute_storage_plan_with_checkpoints(plan, &already_completed, checkpoint)
-        } else {
-            rt_storage::execute_storage_plan_under_roots_with_checkpoints(
-                plan,
-                roots,
-                &already_completed,
-                checkpoint,
-            )
-        };
+        let result = rt_storage::execute_storage_plan_under_roots_with_checkpoints(
+            plan,
+            &server_roots,
+            &already_completed,
+            checkpoint,
+        );
         match result {
             Ok(_) => {
                 self.persist_storage_plan_terminal(
@@ -4630,6 +4637,7 @@ mod tests {
                 length: 20_000,
                 path: SafeRelPath::from_name("sample.bin", false).unwrap(),
                 offset: 0,
+                pad: false,
             }],
             private: false,
             raw: b"torrent".to_vec(),
@@ -4769,6 +4777,7 @@ mod tests {
             length: 42,
             path: SafeRelPath::from_components(&["dir", "file.bin"], false).unwrap(),
             offset: 0,
+            pad: false,
         }];
 
         let projected = metadata_from_meta(&TorrentMeta::V1(meta));
@@ -6040,12 +6049,82 @@ mod tests {
         assert!(normalize_storage_plan_completed_steps(&plan, vec![2]).is_err());
     }
 
+    #[test]
+    fn storage_plan_execution_uses_persisted_roots_and_fails_closed() {
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let source = outside.path().join("source.bin");
+        let destination = allowed.path().join("destination.bin");
+        std::fs::write(&source, b"payload").unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        rt_db::upsert_storage_root(
+            &conn,
+            &rt_db::StorageRootRow {
+                root_id: "allowed".to_owned(),
+                path: allowed.path().to_string_lossy().into_owned(),
+                profile: "test".to_owned(),
+                created_at: 1,
+            },
+        )
+        .unwrap();
+        let (_tx, rx) = mpsc::channel(1);
+        let engine = Engine {
+            config: Arc::new(Config::default()),
+            registry: Arc::new(RwLock::new(SessionRegistry::new())),
+            db: Arc::new(Mutex::new(conn)),
+            cmd_rx: rx,
+            cmd_tx: mpsc::channel(1).0,
+            torrent_chans: HashMap::new(),
+            torrent_tasks: HashMap::new(),
+            dht_tx: None,
+            resources: test_resource_governor(),
+        };
+        let plan = rt_storage::plan_move(&rt_storage::MovePlanRequest {
+            source: source.clone(),
+            destination: destination.clone(),
+            bytes: 7,
+            available_bytes: None,
+            dry_run: false,
+        });
+
+        let error = engine
+            .execute_storage_plan_job("move", Vec::new(), &plan, Vec::new())
+            .unwrap_err();
+        assert!(error.contains("outside configured storage roots"));
+        assert!(source.exists());
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn storage_plan_execution_rejects_missing_server_roots() {
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let (_tx, rx) = mpsc::channel(1);
+        let engine = Engine {
+            config: Arc::new(Config::default()),
+            registry: Arc::new(RwLock::new(SessionRegistry::new())),
+            db: Arc::new(Mutex::new(conn)),
+            cmd_rx: rx,
+            cmd_tx: mpsc::channel(1).0,
+            torrent_chans: HashMap::new(),
+            torrent_tasks: HashMap::new(),
+            dht_tx: None,
+            resources: test_resource_governor(),
+        };
+
+        let error = engine.configured_storage_roots_for_execution().unwrap_err();
+        assert!(error.contains("no configured storage roots"));
+    }
+
     #[tokio::test]
     async fn update_save_path_moves_existing_payload_through_storage_plan() {
         let temp = tempfile::tempdir().unwrap();
         let mut config = Config::default();
         config.daemon.session_dir = temp.path().join("session");
         config.db.path = temp.path().join("state.db");
+        config.storage.download_dir = temp.path().to_path_buf();
         std::fs::create_dir_all(torrent_blob_dir(&config)).unwrap();
         std::fs::create_dir_all(fastresume_dir(&config)).unwrap();
 
@@ -6066,6 +6145,7 @@ mod tests {
 
         let conn = Connection::open(config.db_path()).unwrap();
         rt_db::migrate(&conn).unwrap();
+        register_configured_storage(&conn, &config).unwrap();
         let mut entry = TorrentEntry::new(
             info_hash.clone(),
             meta.name.clone(),

@@ -607,7 +607,7 @@ fn common_issues(
 }
 
 fn path_exists_no_follow(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok()
+    safe_symlink_metadata(path, "plan-path").is_ok()
 }
 
 fn staging_path(destination: &Path) -> PathBuf {
@@ -624,9 +624,13 @@ fn staging_path(destination: &Path) -> PathBuf {
 fn same_filesystem(source: &Path, destination: &Path) -> Option<bool> {
     use std::os::unix::fs::MetadataExt;
 
-    let source_dev = std::fs::metadata(source).ok()?.dev();
+    let source_dev = safe_symlink_metadata(source, "filesystem-source")
+        .ok()?
+        .dev();
     let dest_parent = destination.parent().unwrap_or_else(|| Path::new("."));
-    let dest_dev = std::fs::metadata(dest_parent).ok()?.dev();
+    let dest_dev = safe_symlink_metadata(dest_parent, "filesystem-destination")
+        .ok()?
+        .dev();
     Some(source_dev == dest_dev)
 }
 

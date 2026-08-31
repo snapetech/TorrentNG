@@ -210,7 +210,7 @@ Notes:
 |---|---|---|
 | `GET` | `/api/v1/storage` | List configured storage roots with total/used/free bytes, readonly status, and per-root errors |
 | `POST` | `/api/v1/storage/plan` | Preview move/import/delete storage plans (`{ operation, source, destination, target, bytes, available_bytes, hardlink_or_copy, roots, completed_steps }`); import uses staged copy unless `hardlink_or_copy` allows same-filesystem hardlinks, and completed-step resume indexes are validated against the generated plan |
-| `POST` | `/api/v1/storage/execute` | Execute a root-confined move/import/delete storage plan through durable engine storage-plan jobs (`roots` is required; delete execution also uses `dry_run_approved`; `completed_steps` resumes only validated plan steps from the matching previewed plan) |
+| `POST` | `/api/v1/storage/execute` | Execute a root-confined move/import/delete storage plan through durable engine storage-plan jobs; execution uses server-configured storage roots and ignores any client-supplied `roots` (delete execution also uses `dry_run_approved`; `completed_steps` resumes only validated plan steps from the matching previewed plan) |
 | `GET` | `/api/v1/tracker-health` | Aggregate cached torrents by tracker URL with torrent/active/complete/error/peer counts |
 | `GET` | `/api/v1/engine` | Runtime backend type/capabilities plus rTorrent provenance, XMLRPC probes, tracker-stack telemetry, and profile drift when the selected backend is rTorrent |
 | `GET` | `/api/v1/engine/commands` | Full XMLRPC command index exposed by the running rTorrent build; rTorrent-only |

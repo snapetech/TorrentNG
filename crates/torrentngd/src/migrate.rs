@@ -358,14 +358,9 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         println!("JSON report written to {}", path.display());
     }
 
-    let summary = plan.resume_confidence_summary();
     println!(
-        "\n{} torrent(s): {} trusted, {} hints, {} metadata-only, {} none; {} warning(s)/skipped.",
+        "\n{} torrent(s); {} warning(s)/skipped.",
         plan.torrent_count(),
-        summary.trusted,
-        summary.hints,
-        summary.metadata_only,
-        summary.none,
         plan.warning_count(),
     );
 
@@ -438,13 +433,8 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         result.db.torrents, result.db.files, result.db.trackers,
     );
     println!(
-        "Fast-resume: {} state(s) written, {} skipped ({} trusted, {} hints, {} metadata-only, {} none).",
-        result.fastresume.states,
-        result.fastresume.skipped,
-        result.fastresume.confidence.trusted,
-        result.fastresume.confidence.hints,
-        result.fastresume.confidence.metadata_only,
-        result.fastresume.confidence.none,
+        "Fast-resume: {} state(s) written, {} skipped.",
+        result.fastresume.states, result.fastresume.skipped,
     );
     println!("Start torrentngd to resume; complete torrents skip the full recheck.");
     Ok(())

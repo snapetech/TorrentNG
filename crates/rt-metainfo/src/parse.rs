@@ -186,6 +186,15 @@ fn parse_file_tree(
         .get(b"file tree")
         .ok_or(MetainfoError::MissingField("file tree"))?;
 
+    // Unlike v1, BEP 52 does not special-case single-file torrents: the
+    // file tree is always rooted under `name` as a container directory,
+    // even when it holds exactly one file. Real v2-capable clients
+    // (libtorrent-based: qBittorrent, rTorrent) place such a file at
+    // `save_path/name/<leaf>`, not flatly at `save_path/name` - confirmed
+    // against this crate's own cryptographically-verified fixtures in
+    // `crates/rt-engine/src/engine.rs` (`pure_v2_recheck_verifies_file_roots_without_torrent_task`).
+    // Do not "fix" this into flat placement without re-verifying against
+    // real client output first.
     let mut files = Vec::new();
     let mut offset = 0u64;
     walk_file_tree(file_tree, &[torrent_name], &mut files, &mut offset)?;
@@ -241,6 +250,7 @@ fn walk_file_tree<'a>(
             path,
             offset: *offset,
             pieces_root,
+            pad: is_pad_attr(leaf),
         });
         add_offset(offset, length, "file tree offset")?;
         return Ok(());
@@ -307,11 +317,13 @@ fn parse_files_v1(info: &BValue<'_>, name: &str) -> Result<Vec<TorrentFileV1>, M
                 components.push(s);
             }
             let path = SafeRelPath::from_components(&components, false)?;
+            let pad = is_pad_attr(entry);
             files.push(TorrentFileV1 {
                 index: idx as u32,
                 length,
                 path,
                 offset,
+                pad,
             });
             add_offset(&mut offset, length, "file offset")?;
         }
@@ -325,6 +337,7 @@ fn parse_files_v1(info: &BValue<'_>, name: &str) -> Result<Vec<TorrentFileV1>, M
             length,
             path,
             offset: 0,
+            pad: false,
         }])
     }
 }
@@ -418,6 +431,15 @@ fn parse_piece_hashes(info: &BValue<'_>) -> Result<Vec<[u8; 20]>, MetainfoError>
         .chunks_exact(20)
         .map(|c| c.try_into().unwrap())
         .collect())
+}
+
+/// BEP 47: a file dict/leaf carries `"attr"` as a short string of one-letter
+/// flags; `'p'` marks a padding file real clients never write to disk.
+fn is_pad_attr(dict: &BValue<'_>) -> bool {
+    match dict.get(b"attr") {
+        Some(BValue::Bytes(b)) => b.contains(&b'p'),
+        _ => false,
+    }
 }
 
 fn get_bytes<'a>(
@@ -578,6 +600,56 @@ mod tests {
         assert_eq!(m.files[1].offset, 100);
         assert_eq!(m.total_length(), 300);
         assert!(!m.is_single_file());
+    }
+
+    #[test]
+    fn parse_multi_file_marks_bep47_padding_files() {
+        let real_pairs: Vec<(&[u8], BValue<'_>)> = {
+            let mut p: Vec<(&[u8], BValue<'_>)> = vec![
+                (b"length", BValue::Int(100)),
+                (b"path", BValue::List(vec![BValue::Bytes(b"a.txt")])),
+            ];
+            p.sort_by(|a, b| a.0.cmp(b.0));
+            p
+        };
+        let pad_pairs: Vec<(&[u8], BValue<'_>)> = {
+            let mut p: Vec<(&[u8], BValue<'_>)> = vec![
+                (b"attr", BValue::Bytes(b"p")),
+                (b"length", BValue::Int(28)),
+                (
+                    b"path",
+                    BValue::List(vec![
+                        BValue::Bytes(b".pad"),
+                        BValue::Bytes(b"128"),
+                    ]),
+                ),
+            ];
+            p.sort_by(|a, b| a.0.cmp(b.0));
+            p
+        };
+        let file_entries = vec![BValue::Dict(real_pairs), BValue::Dict(pad_pairs)];
+
+        let pieces_data = make_pieces(1);
+        let mut info_pairs: Vec<(&[u8], BValue<'_>)> = vec![
+            (b"files", BValue::List(file_entries)),
+            (b"name", BValue::Bytes(b"mydir")),
+            (b"piece length", BValue::Int(512 * 1024)),
+            (b"pieces", BValue::Bytes(&pieces_data)),
+        ];
+        info_pairs.sort_by(|a, b| a.0.cmp(b.0));
+        let mut root: Vec<(&[u8], BValue<'_>)> = vec![
+            (b"announce", BValue::Bytes(b"http://t.example/a")),
+            (b"info", BValue::Dict(info_pairs)),
+        ];
+        root.sort_by(|a, b| a.0.cmp(b.0));
+        let raw = encode(&BValue::Dict(root));
+
+        let TorrentMeta::V1(m) = parse_torrent(&raw).unwrap() else {
+            panic!("expected V1")
+        };
+        assert_eq!(m.files.len(), 2);
+        assert!(!m.files[0].pad, "real file must not be marked pad");
+        assert!(m.files[1].pad, "attr:p file must be marked pad");
     }
 
     #[test]
@@ -836,6 +908,193 @@ mod tests {
         assert_eq!(m.files.len(), 1);
         assert_eq!(m.files[0].length, 65536);
         assert_eq!(m.info_hash_v2.len(), 32);
+    }
+
+    // Regression coverage for the v2 single-file wrapper-directory bug:
+    // real v2-capable clients (libtorrent-based qBittorrent/rTorrent,
+    // Transmission) place a true single-file v2 torrent flatly at
+    // `save_path/name`, matching v1 single-file placement. Only when the
+    // tree genuinely encodes a subdirectory should `name/` be prepended.
+
+    fn v2_multi_file_torrent(dir_name: &str, files: &[(&str, i64)]) -> Vec<u8> {
+        let pieces_root = vec![0xCDu8; 32];
+        let mut leaves: Vec<(&[u8], BValue<'_>)> = files
+            .iter()
+            .map(|(fname, length)| {
+                let leaf = BValue::Dict({
+                    let mut p: Vec<(&[u8], BValue<'_>)> = vec![
+                        (b"length", BValue::Int(*length)),
+                        (b"pieces root", BValue::Bytes(&pieces_root)),
+                    ];
+                    p.sort_by(|a, b| a.0.cmp(b.0));
+                    p
+                });
+                let node = BValue::Dict(vec![(b"".as_ref(), leaf)]);
+                (fname.as_bytes(), node)
+            })
+            .collect();
+        leaves.sort_by(|a, b| a.0.cmp(b.0));
+        let file_tree = BValue::Dict(leaves);
+
+        let mut info_pairs: Vec<(&[u8], BValue<'_>)> = vec![
+            (b"file tree", file_tree),
+            (b"meta version", BValue::Int(2)),
+            (b"name", BValue::Bytes(dir_name.as_bytes())),
+            (b"piece length", BValue::Int(16 * 1024)),
+        ];
+        info_pairs.sort_by(|a, b| a.0.cmp(b.0));
+
+        let mut root: Vec<(&[u8], BValue<'_>)> = vec![
+            (b"announce", BValue::Bytes(b"http://t.example/a")),
+            (b"info", BValue::Dict(info_pairs)),
+        ];
+        root.sort_by(|a, b| a.0.cmp(b.0));
+        encode(&BValue::Dict(root))
+    }
+
+    fn v2_single_file_in_subdir_torrent(
+        name: &str,
+        dir: &str,
+        file_name: &str,
+        length: i64,
+    ) -> Vec<u8> {
+        let pieces_root = vec![0xEFu8; 32];
+        let leaf = BValue::Dict({
+            let mut p: Vec<(&[u8], BValue<'_>)> = vec![
+                (b"length", BValue::Int(length)),
+                (b"pieces root", BValue::Bytes(&pieces_root)),
+            ];
+            p.sort_by(|a, b| a.0.cmp(b.0));
+            p
+        });
+        let file_node = BValue::Dict(vec![(b"".as_ref(), leaf)]);
+        let subdir_node = BValue::Dict(vec![(file_name.as_bytes(), file_node)]);
+        let file_tree = BValue::Dict(vec![(dir.as_bytes(), subdir_node)]);
+
+        let mut info_pairs: Vec<(&[u8], BValue<'_>)> = vec![
+            (b"file tree", file_tree),
+            (b"meta version", BValue::Int(2)),
+            (b"name", BValue::Bytes(name.as_bytes())),
+            (b"piece length", BValue::Int(16 * 1024)),
+        ];
+        info_pairs.sort_by(|a, b| a.0.cmp(b.0));
+
+        let mut root: Vec<(&[u8], BValue<'_>)> = vec![
+            (b"announce", BValue::Bytes(b"http://t.example/a")),
+            (b"info", BValue::Dict(info_pairs)),
+        ];
+        root.sort_by(|a, b| a.0.cmp(b.0));
+        encode(&BValue::Dict(root))
+    }
+
+    #[test]
+    fn v2_single_file_keeps_name_as_wrapper_directory() {
+        // Unlike v1, BEP 52 does not special-case single-file torrents:
+        // even one file lives under `name/` as a container directory. Do
+        // not "fix" this into flat `save_path/name` placement without
+        // re-verifying against real client output first - an earlier
+        // attempt at exactly that broke `crates/rt-engine/src/engine.rs`'s
+        // cryptographically-verified v2 fixtures
+        // (`pure_v2_recheck_verifies_file_roots_without_torrent_task`).
+        let raw = v2_torrent("mydir", "data.bin", 65536);
+        let TorrentMeta::V2(m) = parse_torrent(&raw).unwrap() else {
+            panic!("expected V2")
+        };
+        assert_eq!(m.files.len(), 1);
+        assert_eq!(m.files[0].path.as_display(), "mydir/data.bin");
+    }
+
+    #[test]
+    fn v2_leaf_marks_bep47_padding_files() {
+        let real_root = vec![0x11u8; 32];
+        let pad_root = vec![0x22u8; 32];
+        let real_leaf = BValue::Dict({
+            let mut p: Vec<(&[u8], BValue<'_>)> = vec![
+                (b"length", BValue::Int(1000)),
+                (b"pieces root", BValue::Bytes(&real_root)),
+            ];
+            p.sort_by(|a, b| a.0.cmp(b.0));
+            p
+        });
+        let pad_leaf = BValue::Dict({
+            let mut p: Vec<(&[u8], BValue<'_>)> = vec![
+                (b"attr", BValue::Bytes(b"p")),
+                (b"length", BValue::Int(24)),
+                (b"pieces root", BValue::Bytes(&pad_root)),
+            ];
+            p.sort_by(|a, b| a.0.cmp(b.0));
+            p
+        });
+        let file_tree = BValue::Dict({
+            let mut p: Vec<(&[u8], BValue<'_>)> = vec![
+                (
+                    b"01.flac".as_ref(),
+                    BValue::Dict(vec![(b"".as_ref(), real_leaf)]),
+                ),
+                (
+                    b".pad".as_ref(),
+                    BValue::Dict(vec![(
+                        b"24".as_ref(),
+                        BValue::Dict(vec![(b"".as_ref(), pad_leaf)]),
+                    )]),
+                ),
+            ];
+            p.sort_by(|a, b| a.0.cmp(b.0));
+            p
+        });
+
+        let mut info_pairs: Vec<(&[u8], BValue<'_>)> = vec![
+            (b"file tree", file_tree),
+            (b"meta version", BValue::Int(2)),
+            (b"name", BValue::Bytes(b"album")),
+            (b"piece length", BValue::Int(16 * 1024)),
+        ];
+        info_pairs.sort_by(|a, b| a.0.cmp(b.0));
+        let mut root: Vec<(&[u8], BValue<'_>)> = vec![
+            (b"announce", BValue::Bytes(b"http://t.example/a")),
+            (b"info", BValue::Dict(info_pairs)),
+        ];
+        root.sort_by(|a, b| a.0.cmp(b.0));
+        let raw = encode(&BValue::Dict(root));
+
+        let TorrentMeta::V2(m) = parse_torrent(&raw).unwrap() else {
+            panic!("expected V2")
+        };
+        assert_eq!(m.files.len(), 2);
+        let real = m
+            .files
+            .iter()
+            .find(|f| f.path.as_display() == "album/01.flac")
+            .unwrap();
+        let pad = m
+            .files
+            .iter()
+            .find(|f| f.path.as_display() == "album/.pad/24")
+            .unwrap();
+        assert!(!real.pad);
+        assert!(pad.pad);
+    }
+
+    #[test]
+    fn v2_multi_file_root_keeps_name_as_wrapper_directory() {
+        let raw = v2_multi_file_torrent("album", &[("01.flac", 1000), ("02.flac", 2000)]);
+        let TorrentMeta::V2(m) = parse_torrent(&raw).unwrap() else {
+            panic!("expected V2")
+        };
+        assert_eq!(m.files.len(), 2);
+        let paths: Vec<String> = m.files.iter().map(|f| f.path.as_display()).collect();
+        assert!(paths.contains(&"album/01.flac".to_owned()));
+        assert!(paths.contains(&"album/02.flac".to_owned()));
+    }
+
+    #[test]
+    fn v2_single_file_nested_in_subdirectory_keeps_name_and_subdir() {
+        let raw = v2_single_file_in_subdir_torrent("mydir", "docs", "readme.txt", 42);
+        let TorrentMeta::V2(m) = parse_torrent(&raw).unwrap() else {
+            panic!("expected V2")
+        };
+        assert_eq!(m.files.len(), 1);
+        assert_eq!(m.files[0].path.as_display(), "mydir/docs/readme.txt");
     }
 
     #[test]

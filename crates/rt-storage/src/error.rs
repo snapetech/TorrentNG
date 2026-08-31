@@ -32,6 +32,14 @@ pub enum StorageError {
     StagedMoveFailed { step: &'static str, reason: String },
     #[error("path error: {0}")]
     Path(#[from] rt_path::PathError),
+    #[error(
+        "refusing to shrink {path}: on-disk size {current_len} exceeds requested length {requested_len}"
+    )]
+    RefuseShrink {
+        path: String,
+        current_len: u64,
+        requested_len: u64,
+    },
 }
 
 impl StorageError {
