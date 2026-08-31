@@ -64,6 +64,16 @@ fn contains_any_ext(haystack_lower: &str, exts: &[&str]) -> bool {
     exts.iter().any(|e| contains_extension(haystack_lower, e))
 }
 
+fn is_ebook(haystack_lower: &str) -> bool {
+    contains_any_word(
+        haystack_lower,
+        &["ebook", "ebooks", "book", "books", "audiobook"],
+    ) || contains_any_ext(
+        haystack_lower,
+        &[".epub", ".mobi", ".azw3", ".pdf", ".cbz", ".cbr"],
+    )
+}
+
 /// True if `haystack_lower` contains a whole SxxExx-style season/episode
 /// marker, e.g. "S01E05", "s1e1", "S12E345". Requires 's', 1-2 digits,
 /// 'e', 1-3 digits, with non-alphanumeric boundaries around the marker -
@@ -102,15 +112,7 @@ fn contains_season_episode(haystack_lower: &str) -> bool {
 pub fn matches(name: &str, category: &str, directory: &str, tags: &str, media_type: &str) -> bool {
     let haystack = format!("{name} {category} {tags} {directory}").to_ascii_lowercase();
     match media_type {
-        "ebook" => {
-            contains_any_word(
-                &haystack,
-                &["ebook", "ebooks", "book", "books", "audiobook"],
-            ) || contains_any_ext(
-                &haystack,
-                &[".epub", ".mobi", ".azw3", ".pdf", ".cbz", ".cbr"],
-            )
-        }
+        "ebook" => is_ebook(&haystack),
         "tv" => {
             contains_any_word(
                 &haystack,
@@ -139,12 +141,18 @@ pub fn matches(name: &str, category: &str, directory: &str, tags: &str, media_ty
                 &["installer", "image", "linux", "ubuntu", "debian", "fedora"],
             ) || contains_any_ext(&haystack, &[".iso", ".img", ".dmg"])
         }
-        "game" => contains_any_word(
-            &haystack,
-            &[
-                "game", "games", "gog", "steam", "switch", "ps4", "ps5", "xbox",
-            ],
-        ),
+        // Match the client-side precedence: a clearly identified ebook is
+        // not also treated as a game just because its title contains the
+        // whole word "games" (e.g. "Empire Games 02.epub").
+        "game" => {
+            !is_ebook(&haystack)
+                && contains_any_word(
+                    &haystack,
+                    &[
+                        "game", "games", "gog", "steam", "switch", "ps4", "ps5", "xbox",
+                    ],
+                )
+        }
         "software" => {
             contains_any_word(
                 &haystack,
@@ -223,8 +231,8 @@ mod tests {
             "",
             "game"
         ));
-        // "games" as a real whole word is still a legitimate (if ambiguous) match.
-        assert!(matches(
+        // A title word is not enough to override a strong ebook signal.
+        assert!(!matches(
             "Charles Stross - Empire Games 02.epub",
             "books",
             "",
