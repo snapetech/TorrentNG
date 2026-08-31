@@ -60,7 +60,7 @@ pub fn parse_torrent(raw: &[u8]) -> Result<TorrentMeta, MetainfoError> {
         return Err(MetainfoError::ZeroLengthName);
     }
 
-    let piece_length = get_positive_power_of_two_u64(info, b"piece length", "piece length")?;
+    let piece_length = get_positive_u64(info, b"piece length", "piece length")?;
 
     let private = info
         .get(b"private")
@@ -478,13 +478,22 @@ fn get_nonnegative_u64(
     u64::try_from(value).map_err(|_| MetainfoError::InvalidIntegerValue { field, value })
 }
 
-fn get_positive_power_of_two_u64(
+/// BEP 3 recommends (does not require) a power-of-two piece length, and
+/// nothing downstream (rt-piece-map, rt-piece-picker, rt-storage) relies on
+/// it - all piece-boundary math here uses plain division/modulo, never bit
+/// shifts. Requiring it anyway rejects real, actively-seeded torrents from
+/// well-known release groups: confirmed against a 7351-torrent production
+/// rTorrent session, where 43 legitimate torrents (e.g. a UHD BluRay remux
+/// with `piece length` 7995392, not a power of two) were otherwise skipped
+/// outright. Piece-count DoS protection is handled separately by
+/// `MAX_PIECES` in `parse_piece_hashes`, independent of piece-length shape.
+fn get_positive_u64(
     dict: &BValue<'_>,
     key: &[u8],
     field: &'static str,
 ) -> Result<u64, MetainfoError> {
     let value = get_nonnegative_u64(dict, key, field)?;
-    if value == 0 || value & (value - 1) != 0 {
+    if value == 0 {
         return Err(MetainfoError::InvalidPieceLength(value));
     }
     Ok(value)
@@ -808,6 +817,20 @@ mod tests {
             parse_torrent(&raw),
             Err(MetainfoError::InvalidPieceLength(0))
         ));
+    }
+
+    #[test]
+    fn accepts_non_power_of_two_piece_length() {
+        // A real, currently-seeding torrent from a well-known release
+        // group uses this exact non-power-of-two piece length; nothing
+        // downstream requires a power of two (see get_positive_u64's doc
+        // comment), and rejecting it means importing 100% of a real
+        // library isn't actually achievable.
+        let raw = single_file_torrent("Black.Phone.2.mkv", 1024, 7_995_392, None);
+        let TorrentMeta::V1(m) = parse_torrent(&raw).unwrap() else {
+            panic!("expected V1")
+        };
+        assert_eq!(m.piece_length, 7_995_392);
     }
 
     #[test]
