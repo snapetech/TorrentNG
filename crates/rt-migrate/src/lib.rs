@@ -881,12 +881,16 @@ fn migration_torrent_from_path(
     let mut files = migration_files(&meta);
 
     // Only correct when the parsed file paths actually carry a
-    // torrent-name prefix (v1 multi-file always does; v1 single-file
-    // never does; v2/hybrid always does regardless of file count - see
-    // `strip_rtorrent_own_subdir`'s doc comment).
-    let files_use_name_prefix = files
-        .first()
-        .is_some_and(|file| file.path.split('/').next() == Some(meta.name()));
+    // torrent-name *prefix component* (v1 multi-file always does; v1
+    // single-file never does - its path equals the name outright, with no
+    // '/', which must NOT be mistaken for a prefix; v2/hybrid always does
+    // regardless of file count - see `strip_rtorrent_own_subdir`'s doc
+    // comment).
+    let files_use_name_prefix = files.first().is_some_and(|file| {
+        file.path
+            .split_once('/')
+            .is_some_and(|(first, _rest)| first == meta.name())
+    });
     if source == MigrationSource::RTorrent && files_use_name_prefix {
         if let Some(save_path) = &resume.save_path {
             if let Some(corrected) = strip_rtorrent_own_subdir(save_path, meta.name()) {
@@ -3142,6 +3146,117 @@ mod tests {
             .to_fastresume_state(ImportPolicy::RequireVerification)
             .expect("fastresume state");
         assert_eq!(verify.pieces, vec![PieceState::Unknown]);
+    }
+
+    #[test]
+    fn rtorrent_multi_file_directory_already_includes_torrent_name() {
+        // Regression test for a real-world bug found by importing an actual
+        // production rTorrent session: rTorrent's `directory` resume field,
+        // for a multi-file torrent with the default "create own
+        // subdirectory" behavior, already points AT the torrent's own
+        // content folder - e.g. `directory` = "<root>/multi", not
+        // "<root>" with "multi" appended by our own file.path convention.
+        // Before this fix that made every rTorrent multi-file import come
+        // back MetadataOnly (no file hints at all) even for a fully
+        // complete, byte-identical torrent, forcing a needless full
+        // recheck/redownload of real, correct data.
+        let dir = tempfile::tempdir().unwrap();
+        let torrent_path = dir.path().join("multi.torrent");
+        let info_hash = write_two_file_fixture_torrent(&torrent_path);
+        let info_hash_hex = hex_lower(&info_hash);
+        std::fs::rename(
+            &torrent_path,
+            dir.path().join(format!("{info_hash_hex}.torrent")),
+        )
+        .unwrap();
+
+        let content_dir = dir.path().join("multi");
+        std::fs::create_dir_all(&content_dir).unwrap();
+        std::fs::write(content_dir.join("a.bin"), [1u8; 5]).unwrap();
+        std::fs::write(content_dir.join("b.bin"), [2u8; 7]).unwrap();
+
+        let mut resume = vec![
+            (b"complete".as_slice(), BValue::Int(1)),
+            (
+                b"directory".as_slice(),
+                BValue::Bytes(content_dir.as_os_str().as_encoded_bytes()),
+            ),
+        ];
+        resume.sort_by(|a, b| a.0.cmp(b.0));
+        std::fs::write(
+            dir.path().join(format!("{info_hash_hex}.rtorrent")),
+            encode(&BValue::Dict(resume)),
+        )
+        .unwrap();
+
+        let plan = dry_run_rtorrent_session(dir.path()).unwrap();
+        let torrent = &plan.torrents[0];
+
+        assert_eq!(
+            torrent.save_path.as_deref(),
+            Some(dir.path()),
+            "save_path must be corrected to the parent, not the content folder itself"
+        );
+        assert_eq!(
+            torrent.resume_confidence,
+            ResumeConfidence::Trusted,
+            "a fully complete, byte-identical multi-file torrent must be Trusted, \
+             not fall back to MetadataOnly because file hints couldn't be found"
+        );
+        assert!(torrent
+            .warnings
+            .iter()
+            .any(|w| w.contains("already includes the torrent's own content folder")));
+        let trusted = torrent
+            .to_fastresume_state(ImportPolicy::TrustHints)
+            .expect("fastresume state");
+        assert!(trusted.pieces.iter().all(|p| *p == PieceState::Valid));
+    }
+
+    #[test]
+    fn rtorrent_single_file_directory_is_left_unchanged() {
+        // The single-file case must NOT be touched: single-file v1 paths
+        // never carry a name prefix, so directory is already correct as-is
+        // (this mirrors the real "books" single-file torrent that already
+        // worked correctly before this fix).
+        let dir = tempfile::tempdir().unwrap();
+        let torrent_path = dir.path().join("sample.torrent");
+        let info_hash = write_fixture_torrent(&torrent_path);
+        let info_hash_hex = hex_lower(&info_hash);
+        std::fs::rename(
+            &torrent_path,
+            dir.path().join(format!("{info_hash_hex}.torrent")),
+        )
+        .unwrap();
+        // Deliberately name the containing folder the same as the torrent
+        // name ("sample.bin") to prove single-file torrents are exempt
+        // from the multi-file correction even in this edge case.
+        let content_dir = dir.path().join("sample.bin");
+        std::fs::create_dir_all(&content_dir).unwrap();
+        std::fs::write(content_dir.join("sample.bin"), [1u8; 12]).unwrap();
+
+        let mut resume = vec![
+            (b"complete".as_slice(), BValue::Int(1)),
+            (
+                b"directory".as_slice(),
+                BValue::Bytes(content_dir.as_os_str().as_encoded_bytes()),
+            ),
+        ];
+        resume.sort_by(|a, b| a.0.cmp(b.0));
+        std::fs::write(
+            dir.path().join(format!("{info_hash_hex}.rtorrent")),
+            encode(&BValue::Dict(resume)),
+        )
+        .unwrap();
+
+        let plan = dry_run_rtorrent_session(dir.path()).unwrap();
+        let torrent = &plan.torrents[0];
+
+        assert_eq!(torrent.save_path.as_deref(), Some(content_dir.as_path()));
+        assert!(!torrent
+            .warnings
+            .iter()
+            .any(|w| w.contains("already includes the torrent's own content folder")));
     }
 
     #[test]

@@ -1420,6 +1420,7 @@ pub struct StoragePlanRequest {
     dry_run: Option<bool>,
     dry_run_approved: Option<bool>,
     affected_torrents: Option<Vec<String>>,
+    #[allow(dead_code)]
     roots: Option<Vec<PathBuf>>,
     completed_steps: Option<Vec<usize>>,
 }
@@ -2555,6 +2556,7 @@ pub async fn list_jobs(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
+#[cfg(test)]
 fn build_storage_plan(req: &StoragePlanRequest, preview: bool) -> Result<StoragePlan, String> {
     let dry_run = if preview {
         true
@@ -2685,6 +2687,7 @@ fn validate_completed_steps(
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_storage_plan_roots(
     plan: &StoragePlan,
     roots: Option<&[PathBuf]>,
