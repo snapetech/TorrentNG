@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../api/client'
+import { maskAnnounceUrl } from '../lib/maskUrl'
 import type { WorkflowRule, WorkflowRun } from '../api/client'
 
 const EMPTY: WorkflowRule = {
@@ -148,7 +149,7 @@ export function WorkflowsPanel() {
             <Pill tone={rule.enabled ? 'ok' : 'idle'}>{rule.action}</Pill>
             <span style={{ color: 'var(--faint)' }}>{rule.category || 'any category'}</span>
             <span style={{ color: 'var(--faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-              {rule.url || rule.command || rule.target_path || rule.tracker || 'configured'}
+              {rule.url || rule.command || rule.target_path || (rule.tracker ? maskAnnounceUrl(rule.tracker) : null) || 'configured'}
             </span>
             <button onClick={() => run(rule, true)} disabled={Boolean(pending)} style={{
               background: 'none', border: '1px solid var(--border-strong)', borderRadius: 4,

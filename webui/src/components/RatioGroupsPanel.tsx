@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../api/client'
+import { maskAnnounceUrl } from '../lib/maskUrl'
 import type { RatioGroup } from '../api/client'
 
 const EMPTY: RatioGroup = {
@@ -131,7 +132,7 @@ export function RatioGroupsPanel() {
             <span style={{ color: 'var(--muted)' }}>ratio {group.ratio_limit}</span>
             <span style={{ color: 'var(--muted)' }}>{group.seeding_time_limit < 0 ? 'no time cap' : `${group.seeding_time_limit}m`}</span>
             <span style={{ color: 'var(--faint)' }}>{group.category || 'any category'}</span>
-            <span style={{ color: 'var(--faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{group.tracker || 'any tracker'}</span>
+            <span style={{ color: 'var(--faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={group.tracker ? maskAnnounceUrl(group.tracker) : undefined}>{group.tracker ? maskAnnounceUrl(group.tracker) : 'any tracker'}</span>
             <button
               onClick={() => apply(group.name, true)}
               disabled={Boolean(pending)}

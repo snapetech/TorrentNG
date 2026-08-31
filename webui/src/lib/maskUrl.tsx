@@ -1,8 +1,19 @@
 import { useState } from 'react'
 
 const CREDENTIAL_QUERY_KEYS = new Set([
-  'passkey', 'pass', 'pid', 'auth', 'authkey', 'token', 'key', 'secret', 'uk', 'rss_key', 'apikey',
+  'passkey', 'pass', 'pid', 'auth', 'authkey', 'token', 'key', 'secret', 'uk', 'rsskey', 'apikey',
+  'password', 'passwd', 'cookie', 'session', 'torrentpass', 'trackerpass', 'privatekey',
 ])
+
+function isCredentialQueryKey(key: string): boolean {
+  // Treat underscore- and hyphen-separated spellings alike (`api_key`,
+  // `api-key`, `torrent_pass`, etc.). A suffix match covers namespaced token
+  // keys such as `access_token` without masking ordinary query parameters.
+  const normalized = decodedLower(key).replace(/[-_]/g, '')
+  return CREDENTIAL_QUERY_KEYS.has(normalized)
+    || normalized.endsWith('token')
+    || normalized.endsWith('passkey')
+}
 
 const MASK = '•'.repeat(8)
 
@@ -38,7 +49,7 @@ export function maskAnnounceUrl(url: string): string {
   ).replace(
     /([?&])([^=&#]+)=([^&#]*)/g,
     (match, sep: string, key: string, value: string) =>
-      CREDENTIAL_QUERY_KEYS.has(decodedLower(key)) && value
+      isCredentialQueryKey(key) && value
         ? `${sep}${key}=${MASK}`
         : match,
   )
@@ -80,7 +91,8 @@ export function TrackerUrl({ url, mono = true }: { url: string; mono?: boolean }
 
   async function copy() {
     try {
-      await navigator.clipboard?.writeText(url)
+      if (!navigator.clipboard) return
+      await navigator.clipboard.writeText(url)
       setCopied(true)
       window.setTimeout(() => setCopied(false), 1500)
     } catch {

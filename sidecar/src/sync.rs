@@ -243,7 +243,7 @@ async fn tick_bounded(
             component = backend.backend_type().as_str(),
             operation = "live_summary_sync",
             result = "error",
-            error = %e,
+            error = %error_chain(&e),
             "live summary sync failed"
         ),
     }
