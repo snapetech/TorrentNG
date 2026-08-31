@@ -121,6 +121,22 @@ pub fn plan_move(req: &MovePlanRequest) -> StoragePlan {
     }
 }
 
+pub fn plan_move_under_roots(
+    req: &MovePlanRequest,
+    roots: &[PathBuf],
+) -> Result<StoragePlan, StorageError> {
+    let roots = canonical_roots(roots)?;
+    let source = confine_plan_path(&req.source, &roots)?;
+    let destination = confine_plan_path(&req.destination, &roots)?;
+    Ok(plan_move(&MovePlanRequest {
+        source,
+        destination,
+        bytes: req.bytes,
+        available_bytes: req.available_bytes,
+        dry_run: req.dry_run,
+    }))
+}
+
 pub fn plan_import(req: &ImportPlanRequest) -> StoragePlan {
     let issues = common_issues(
         &req.source,
@@ -178,6 +194,23 @@ pub fn plan_import(req: &ImportPlanRequest) -> StoragePlan {
     }
 }
 
+pub fn plan_import_under_roots(
+    req: &ImportPlanRequest,
+    roots: &[PathBuf],
+) -> Result<StoragePlan, StorageError> {
+    let roots = canonical_roots(roots)?;
+    let source = confine_plan_path(&req.source, &roots)?;
+    let destination = confine_plan_path(&req.destination, &roots)?;
+    Ok(plan_import(&ImportPlanRequest {
+        source,
+        destination,
+        bytes: req.bytes,
+        available_bytes: req.available_bytes,
+        hardlink_or_copy: req.hardlink_or_copy,
+        dry_run: req.dry_run,
+    }))
+}
+
 pub fn plan_delete(req: &DeletePlanRequest) -> StoragePlan {
     let mut issues = Vec::new();
     if !path_exists_no_follow(&req.target) {
@@ -199,6 +232,20 @@ pub fn plan_delete(req: &DeletePlanRequest) -> StoragePlan {
         steps,
         rollback_steps: Vec::new(),
     }
+}
+
+pub fn plan_delete_under_roots(
+    req: &DeletePlanRequest,
+    roots: &[PathBuf],
+) -> Result<StoragePlan, StorageError> {
+    let roots = canonical_roots(roots)?;
+    let target = confine_plan_path(&req.target, &roots)?;
+    Ok(plan_delete(&DeletePlanRequest {
+        target,
+        bytes: req.bytes,
+        dry_run: req.dry_run,
+        dry_run_approved: req.dry_run_approved,
+    }))
 }
 
 pub fn ensure_plan_can_apply(plan: &StoragePlan) -> Result<(), StorageError> {
@@ -343,6 +390,18 @@ fn canonical_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>, StorageError> {
             std::fs::canonicalize(root).map_err(|e| StorageError::io(root.display().to_string(), e))
         })
         .collect()
+}
+
+fn confine_plan_path(path: &Path, roots: &[PathBuf]) -> Result<PathBuf, StorageError> {
+    let resolved = resolve_confined_path(path)?;
+    if roots.iter().any(|root| resolved.starts_with(root)) {
+        Ok(resolved)
+    } else {
+        Err(StorageError::StagedMoveFailed {
+            step: "plan-path",
+            reason: format!("path outside configured storage roots: {}", path.display()),
+        })
+    }
 }
 
 fn validate_plan_paths_under_roots(

@@ -440,7 +440,7 @@ fn parse_xmlrpc_response(xml: &[u8]) -> Result<XmlValue> {
     // Seek to <methodResponse>
     loop {
         match reader.read_event()? {
-            Event::Start(e) if e.name().as_ref() == b"methodResponse" => break,
+            Event::Start(e) if e.name().into_inner() == "methodResponse" => break,
             Event::Eof => bail!("XMLRPC response missing <methodResponse>"),
             _ => {}
         }
@@ -449,15 +449,15 @@ fn parse_xmlrpc_response(xml: &[u8]) -> Result<XmlValue> {
     // Check for <fault> vs <params>
     loop {
         match reader.read_event()? {
-            Event::Start(e) => match e.name().as_ref() {
-                b"fault" => {
+            Event::Start(e) => match e.name().into_inner() {
+                "fault" => {
                     let fault = parse_value(&mut reader)?;
                     bail!(
                         "XMLRPC fault returned by rTorrent: {}",
                         describe_xml_value(&fault)
                     )
                 }
-                b"params" => break,
+                "params" => break,
                 _ => {}
             },
             Event::Eof => bail!("unexpected EOF in XMLRPC response"),
@@ -472,7 +472,7 @@ fn parse_value(reader: &mut Reader<&[u8]>) -> Result<XmlValue> {
     // Seek to <value>
     loop {
         match reader.read_event()? {
-            Event::Start(e) if e.name().as_ref() == b"value" => break,
+            Event::Start(e) if e.name().into_inner() == "value" => break,
             Event::End(_) | Event::Eof => return Ok(XmlValue::Nil),
             _ => {}
         }
@@ -484,22 +484,22 @@ fn parse_value_content(reader: &mut Reader<&[u8]>) -> Result<XmlValue> {
     loop {
         match reader.read_event()? {
             Event::Start(e) => {
-                let val = match e.name().as_ref() {
-                    b"string" => {
+                let val = match e.name().into_inner() {
+                    "string" => {
                         let text = read_text_string(reader, e.name())?;
                         XmlValue::String(text)
                     }
-                    b"int" | b"i4" | b"i8" => {
+                    "int" | "i4" | "i8" => {
                         let text = read_text_string(reader, e.name())?;
                         XmlValue::Int(text.trim().parse().unwrap_or(0))
                     }
-                    b"boolean" => {
+                    "boolean" => {
                         let text = read_text_string(reader, e.name())?;
                         XmlValue::Bool(text.trim() == "1")
                     }
-                    b"array" => parse_array(reader)?,
-                    b"struct" => parse_struct(reader)?,
-                    b"nil" => {
+                    "array" => parse_array(reader)?,
+                    "struct" => parse_struct(reader)?,
+                    "nil" => {
                         let _ = reader.read_text(e.name());
                         XmlValue::Nil
                     }
@@ -511,7 +511,7 @@ fn parse_value_content(reader: &mut Reader<&[u8]>) -> Result<XmlValue> {
                 return Ok(val);
             }
             Event::Text(t) => {
-                let s = t.decode()?.trim().to_owned();
+                let s = t.into_inner().trim().to_owned();
                 if !s.is_empty() {
                     return Ok(XmlValue::String(s));
                 }
@@ -527,10 +527,10 @@ fn parse_array(reader: &mut Reader<&[u8]>) -> Result<XmlValue> {
     let mut items = Vec::new();
     loop {
         match reader.read_event()? {
-            Event::Start(e) if e.name().as_ref() == b"value" => {
+            Event::Start(e) if e.name().into_inner() == "value" => {
                 items.push(parse_value_content(reader)?);
             }
-            Event::End(e) if e.name().as_ref() == b"array" => break,
+            Event::End(e) if e.name().into_inner() == "array" => break,
             Event::Eof => break,
             _ => {}
         }
@@ -543,17 +543,17 @@ fn parse_struct(reader: &mut Reader<&[u8]>) -> Result<XmlValue> {
     let mut current_name = String::new();
     loop {
         match reader.read_event()? {
-            Event::Start(e) => match e.name().as_ref() {
-                b"name" => {
+            Event::Start(e) => match e.name().into_inner() {
+                "name" => {
                     current_name = read_text_string(reader, e.name())?;
                 }
-                b"value" => {
+                "value" => {
                     let val = parse_value_content(reader)?;
                     fields.push((std::mem::take(&mut current_name), val));
                 }
                 _ => {}
             },
-            Event::End(e) if e.name().as_ref() == b"struct" => break,
+            Event::End(e) if e.name().into_inner() == "struct" => break,
             Event::Eof => break,
             _ => {}
         }
@@ -562,5 +562,5 @@ fn parse_struct(reader: &mut Reader<&[u8]>) -> Result<XmlValue> {
 }
 
 fn read_text_string(reader: &mut Reader<&[u8]>, end: QName<'_>) -> Result<String> {
-    Ok(reader.read_text(end)?.decode()?.into_owned())
+    Ok(reader.read_text(end)?.into_inner().into_owned())
 }

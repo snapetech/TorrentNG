@@ -790,8 +790,13 @@ fn dry_run_session(
         if !extension_is(&path, &["torrent"]) {
             continue;
         }
-        match migration_torrent_from_path(&path, &resume_by_stem, &aggregate_resume_paths, options)
-        {
+        match migration_torrent_from_path(
+            &path,
+            source,
+            &resume_by_stem,
+            &aggregate_resume_paths,
+            options,
+        ) {
             Ok(torrent) => torrents.push(torrent),
             Err(reason) => skipped.push(SkippedEntry { path, reason }),
         }
@@ -821,6 +826,7 @@ fn resume_sidecar_keys(stem: &str) -> Vec<String> {
 
 fn migration_torrent_from_path(
     path: &Path,
+    source: MigrationSource,
     resume_by_stem: &BTreeMap<String, PathBuf>,
     aggregate_resume_paths: &[PathBuf],
     options: &ImportOptions,
@@ -873,6 +879,28 @@ fn migration_torrent_from_path(
 
     let trackers = migration_trackers(&meta);
     let mut files = migration_files(&meta);
+
+    // Only correct when the parsed file paths actually carry a
+    // torrent-name prefix (v1 multi-file always does; v1 single-file
+    // never does; v2/hybrid always does regardless of file count - see
+    // `strip_rtorrent_own_subdir`'s doc comment).
+    let files_use_name_prefix = files
+        .first()
+        .is_some_and(|file| file.path.split('/').next() == Some(meta.name()));
+    if source == MigrationSource::RTorrent && files_use_name_prefix {
+        if let Some(save_path) = &resume.save_path {
+            if let Some(corrected) = strip_rtorrent_own_subdir(save_path, meta.name()) {
+                warnings.push(format!(
+                    "rTorrent save path `{}` already includes the torrent's own \
+                     content folder; using its parent `{}` so file paths resolve correctly",
+                    save_path.display(),
+                    corrected.display()
+                ));
+                resume.save_path = Some(corrected);
+            }
+        }
+    }
+
     apply_file_resume_state(
         &mut files,
         &resume.file_priorities,
@@ -1732,6 +1760,29 @@ fn normalize_piece_states(
     pieces.truncate(piece_count);
     pieces.resize(piece_count, PieceState::Unknown);
     (pieces, warning)
+}
+
+/// rTorrent's `directory` resume field, for a multi-file torrent with the
+/// (default) "create own subdirectory" behavior, already points AT the
+/// torrent's own content folder - unlike qBittorrent/libtorrent's
+/// `save_path`, which is the *parent* the content folder gets created
+/// under. Every multi-file path in this crate (and the daemon's own
+/// runtime path resolution) assumes the qBittorrent convention: save_path
+/// is the parent, and each file's own relative path already carries the
+/// torrent-name prefix (`parse_files_v1`'s multi-file branch always
+/// prepends it). Left uncorrected, every rTorrent-imported multi-file
+/// torrent's files are unreachable both at import time and at runtime,
+/// forcing a full recheck/redownload of otherwise-complete content.
+/// Confirmed against a real rTorrent production session, not synthetic
+/// data: a multi-file torrent whose sidecar's `directory` already ended
+/// in the torrent's own name came back `ResumeConfidence::MetadataOnly`
+/// (no file hints at all) before this correction.
+fn strip_rtorrent_own_subdir(save_path: &Path, torrent_name: &str) -> Option<PathBuf> {
+    if save_path.file_name().and_then(|name| name.to_str()) == Some(torrent_name) {
+        save_path.parent().map(Path::to_path_buf)
+    } else {
+        None
+    }
 }
 
 fn collect_file_hints(

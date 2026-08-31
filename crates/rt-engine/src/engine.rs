@@ -384,6 +384,18 @@ impl EngineHandle {
         rx.await.map_err(|_| "engine dropped reply".to_owned())?
     }
 
+    pub async fn configured_storage_roots(&self) -> CmdResult<Vec<PathBuf>> {
+        let roots = self.list_storage_roots().await?;
+        ServerStorageRoots::from_configured_paths(
+            roots
+                .into_iter()
+                .map(|root| PathBuf::from(root.path))
+                .collect::<Vec<_>>(),
+        )
+        .map(ServerStorageRoots::into_roots)
+        .map_err(|error| error.to_string())
+    }
+
     pub async fn stats(&self) -> CmdResult<EngineStats> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx

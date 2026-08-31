@@ -2406,11 +2406,30 @@ pub async fn storage_preview_plan(
     if let Some(response) = require_mutation_auth(&state, &headers) {
         return response;
     }
-    match build_storage_plan(&req, true) {
+    let Some(engine) = &state.engine else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                serde_json::to_value(ApiError::internal(
+                    "native engine is not available".to_owned(),
+                ))
+                .unwrap(),
+            ),
+        )
+            .into_response();
+    };
+    let roots = match engine.configured_storage_roots().await {
+        Ok(roots) => roots,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::to_value(ApiError::internal(error)).unwrap()),
+            )
+                .into_response();
+        }
+    };
+    match build_storage_plan_under_roots(&req, true, &roots) {
         Ok(plan) => {
-            if let Some(response) = validate_storage_plan_roots(&plan, req.roots.as_deref()) {
-                return response;
-            }
             if let Err(e) = validate_completed_steps(&plan, req.completed_steps.as_deref()) {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -2453,7 +2472,17 @@ pub async fn storage_execute_plan(
         )
             .into_response();
     };
-    let plan = match build_storage_plan(&req, false) {
+    let roots = match engine.configured_storage_roots().await {
+        Ok(roots) => roots,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::to_value(ApiError::internal(error)).unwrap()),
+            )
+                .into_response();
+        }
+    };
+    let plan = match build_storage_plan_under_roots(&req, false, &roots) {
         Ok(plan) => plan,
         Err(e) => {
             return (
@@ -2569,6 +2598,69 @@ fn build_storage_plan(req: &StoragePlanRequest, preview: bool) -> Result<Storage
             dry_run,
             dry_run_approved: req.dry_run_approved.unwrap_or(!dry_run),
         })),
+        _ => Err("operation must be one of move, import, or delete".to_owned()),
+    }
+}
+
+fn build_storage_plan_under_roots(
+    req: &StoragePlanRequest,
+    preview: bool,
+    roots: &[PathBuf],
+) -> Result<StoragePlan, String> {
+    let dry_run = if preview {
+        true
+    } else {
+        req.dry_run.unwrap_or(false)
+    };
+    match normalize_storage_operation(&req.operation).as_deref() {
+        Some("move") => rt_storage::plan_move_under_roots(
+            &MovePlanRequest {
+                source: req
+                    .source
+                    .clone()
+                    .ok_or_else(|| "source is required for move".to_owned())?,
+                destination: req
+                    .destination
+                    .clone()
+                    .ok_or_else(|| "destination is required for move".to_owned())?,
+                bytes: req.bytes.unwrap_or(0),
+                available_bytes: req.available_bytes,
+                dry_run,
+            },
+            roots,
+        )
+        .map_err(|error| error.to_string()),
+        Some("import") => rt_storage::plan_import_under_roots(
+            &ImportPlanRequest {
+                source: req
+                    .source
+                    .clone()
+                    .ok_or_else(|| "source is required for import".to_owned())?,
+                destination: req
+                    .destination
+                    .clone()
+                    .ok_or_else(|| "destination is required for import".to_owned())?,
+                bytes: req.bytes.unwrap_or(0),
+                available_bytes: req.available_bytes,
+                hardlink_or_copy: req.hardlink_or_copy.unwrap_or(false),
+                dry_run,
+            },
+            roots,
+        )
+        .map_err(|error| error.to_string()),
+        Some("delete") => rt_storage::plan_delete_under_roots(
+            &DeletePlanRequest {
+                target: req
+                    .target
+                    .clone()
+                    .ok_or_else(|| "target is required for delete".to_owned())?,
+                bytes: req.bytes.unwrap_or(0),
+                dry_run,
+                dry_run_approved: req.dry_run_approved.unwrap_or(!dry_run),
+            },
+            roots,
+        )
+        .map_err(|error| error.to_string()),
         _ => Err("operation must be one of move, import, or delete".to_owned()),
     }
 }
