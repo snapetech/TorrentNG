@@ -1891,7 +1891,7 @@ impl Engine {
             }
 
             let state = state_from_str(&row.state);
-            let paused = !matches!(state, TorrentState::Downloading);
+            let paused = !matches!(state, TorrentState::Downloading | TorrentState::Seeding);
             let is_private = meta.is_private();
             let v2_only = matches!(meta, TorrentMeta::V2(_));
             if let Some(v1) = meta_v1(meta) {
@@ -6281,6 +6281,84 @@ mod tests {
         assert_eq!(trackers.len(), 1);
         assert_eq!(trackers[0].url, "http://tracker.example.com/announce");
         drop(db);
+        if let Some(tx) = engine.torrent_chans.remove(&info_hash) {
+            let _ = tx.send(TorrentCmd::Shutdown).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn load_persisted_torrents_resumes_seeding_rows_not_paused() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.daemon.session_dir = temp.path().join("session");
+        config.db.path = temp.path().join("state.db");
+        std::fs::create_dir_all(torrent_blob_dir(&config)).unwrap();
+        std::fs::create_dir_all(fastresume_dir(&config)).unwrap();
+
+        let conn = Connection::open(config.db_path()).unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let raw = raw_single_file_torrent();
+        let TorrentMeta::V1(meta) = parse_torrent(&raw).unwrap() else {
+            panic!("expected v1 torrent");
+        };
+        let info_hash = meta
+            .info_hash
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        std::fs::write(torrent_blob_path(&config, &info_hash), &raw).unwrap();
+        rt_db::upsert(
+            &conn,
+            &TorrentRow {
+                info_hash: info_hash.clone(),
+                name: meta.name.clone(),
+                total_length: meta.total_length() as i64,
+                piece_length: meta.piece_length as i64,
+                piece_count: meta.pieces.len() as i64,
+                is_private: false,
+                save_path: temp.path().join("downloads").to_string_lossy().to_string(),
+                category: None,
+                tags: vec![],
+                // A torrent that was seeding when the daemon last shut down
+                // must resume active (seeding/checking), never come back
+                // Paused -- an operator restart/upgrade must not silently
+                // stop every previously-healthy seed.
+                state: "seeding".to_owned(),
+                added_at: 10,
+                completed_at: Some(20),
+                uploaded: 5,
+                downloaded: 1024,
+                ratio: 0.5,
+                trackers: meta.all_trackers(),
+            },
+        )
+        .unwrap();
+
+        let (_tx, rx) = mpsc::channel(1);
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        let mut engine = Engine {
+            config: Arc::new(config),
+            registry: Arc::clone(&registry),
+            db: Arc::new(Mutex::new(conn)),
+            cmd_rx: rx,
+            cmd_tx: mpsc::channel(1).0,
+            torrent_chans: HashMap::new(),
+            torrent_tasks: HashMap::new(),
+            dht_tx: None,
+            resources: test_resource_governor(),
+        };
+
+        engine.load_persisted_torrents().await.unwrap();
+
+        assert!(engine.torrent_chans.contains_key(&info_hash));
+        let reg = registry.read().await;
+        let restored = reg.get(&info_hash).unwrap();
+        assert_ne!(
+            restored.state,
+            TorrentState::Paused,
+            "a persisted seeding torrent must not restore as paused"
+        );
+        drop(reg);
         if let Some(tx) = engine.torrent_chans.remove(&info_hash) {
             let _ = tx.send(TorrentCmd::Shutdown).await;
         }
