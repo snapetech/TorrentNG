@@ -1542,15 +1542,40 @@ impl Engine {
             }
         }
 
-        self.save_torrent_blob(&info_hash_hex, meta_raw(&meta))
-            .map_err(|e| e.to_string())?;
-        {
+        if let Err(error) = self.save_torrent_blob(&info_hash_hex, meta_raw(&meta)) {
+            // TNG-008: `reg.add(entry)` above already made this torrent
+            // visible to any concurrent reader (list/get). If we can't
+            // even write its blob, don't leave that phantom row behind --
+            // nothing could ever load this torrent's metadata again.
+            let _ = self.registry.write().await.remove(&info_hash_hex);
+            return Err(error.to_string());
+        }
+        let persisted = {
             let reg = self.registry.read().await;
             let entry = reg
                 .get(&info_hash_hex)
                 .ok_or_else(|| format!("torrent {info_hash_hex} missing from registry"))?;
             self.persist_entry(entry, &meta)
-                .map_err(|e| e.to_string())?;
+        };
+        if let Err(error) = persisted {
+            // Same rollback, and also clean up the blob the previous step
+            // wrote -- left alone it would be an orphan file with nothing
+            // in the registry or DB pointing at it.
+            let _ = self.registry.write().await.remove(&info_hash_hex);
+            if let Err(cleanup_error) =
+                std::fs::remove_file(torrent_blob_path(&self.config, &info_hash_hex))
+            {
+                if cleanup_error.kind() != std::io::ErrorKind::NotFound {
+                    warn!(
+                        component = "engine",
+                        operation = "add_torrent_rollback",
+                        torrent = %info_hash_hex,
+                        error = %cleanup_error,
+                        "failed to remove orphaned torrent blob after a failed add"
+                    );
+                }
+            }
+            return Err(error.to_string());
         }
 
         let is_private = meta.is_private();
@@ -5342,6 +5367,114 @@ mod tests {
             let cancelled_job = rt_db::get_job(&db, &cancelled_job_id).unwrap();
             assert_eq!(cancelled_job.state, JOB_STATE_CANCELLED);
         }
+    }
+
+    #[tokio::test]
+    async fn add_torrent_rolls_back_registry_row_when_blob_write_fails() {
+        // TNG-008: `add_torrent` registers the torrent in the in-memory
+        // registry before writing its blob to disk. If the blob write
+        // fails, that registry row must not be left behind as a phantom
+        // entry with nothing on disk backing it.
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.daemon.session_dir = temp.path().join("session");
+        config.storage.download_dir = temp.path().join("downloads");
+        std::fs::create_dir_all(&config.storage.download_dir).unwrap();
+        std::fs::create_dir_all(&config.daemon.session_dir).unwrap();
+        // Block `save_torrent_blob`'s `create_dir_all(session_dir/torrents)`
+        // by occupying that path with a plain file instead of a directory.
+        std::fs::write(
+            config.daemon.session_dir.join("torrents"),
+            b"not a directory",
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        register_configured_storage(&conn, &config).unwrap();
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        let (_tx, rx) = mpsc::channel(1);
+        let mut engine = Engine {
+            config: Arc::new(config),
+            registry: Arc::clone(&registry),
+            db: Arc::new(Mutex::new(conn)),
+            cmd_rx: rx,
+            cmd_tx: mpsc::channel(1).0,
+            torrent_chans: HashMap::new(),
+            torrent_tasks: HashMap::new(),
+            dht_tx: None,
+            resources: test_resource_governor(),
+            network_budget: GlobalNetworkBudget::unlimited(),
+            shutdown_reply: None,
+        };
+
+        let raw = raw_single_file_torrent();
+        let meta = parse_torrent(&raw).unwrap();
+        let info_hash = meta_info_hash_hex(&meta);
+
+        let result = engine.add_torrent(meta, None, true, None, vec![]).await;
+
+        assert!(
+            result.is_err(),
+            "expected the blob write failure to surface as an error"
+        );
+        assert!(
+            registry.read().await.get(&info_hash).is_none(),
+            "a torrent whose blob could not be written must not remain in the registry"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_torrent_rolls_back_registry_and_blob_when_db_persist_fails() {
+        // TNG-008: if the blob write succeeds but the DB upsert fails,
+        // both the registry row *and* the now-orphaned blob file must be
+        // rolled back -- otherwise a blob with nothing in the registry or
+        // DB pointing at it is left behind indefinitely.
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.daemon.session_dir = temp.path().join("session");
+        config.storage.download_dir = temp.path().join("downloads");
+        std::fs::create_dir_all(&config.storage.download_dir).unwrap();
+        std::fs::create_dir_all(&config.daemon.session_dir).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        register_configured_storage(&conn, &config).unwrap();
+        conn.execute_batch("PRAGMA query_only = ON;").unwrap();
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        let (_tx, rx) = mpsc::channel(1);
+        let mut engine = Engine {
+            config: Arc::new(config.clone()),
+            registry: Arc::clone(&registry),
+            db: Arc::new(Mutex::new(conn)),
+            cmd_rx: rx,
+            cmd_tx: mpsc::channel(1).0,
+            torrent_chans: HashMap::new(),
+            torrent_tasks: HashMap::new(),
+            dht_tx: None,
+            resources: test_resource_governor(),
+            network_budget: GlobalNetworkBudget::unlimited(),
+            shutdown_reply: None,
+        };
+
+        let raw = raw_single_file_torrent();
+        let meta = parse_torrent(&raw).unwrap();
+        let info_hash = meta_info_hash_hex(&meta);
+
+        let result = engine.add_torrent(meta, None, true, None, vec![]).await;
+
+        assert!(
+            result.is_err(),
+            "expected the read-only-database persist failure to surface as an error"
+        );
+        assert!(
+            registry.read().await.get(&info_hash).is_none(),
+            "a torrent whose DB row could not be persisted must not remain in the registry"
+        );
+        assert!(
+            !torrent_blob_path(&config, &info_hash).exists(),
+            "the blob written before the DB failure must be cleaned up, not left orphaned"
+        );
     }
 
     #[tokio::test]

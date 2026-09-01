@@ -431,20 +431,62 @@ permit-release tests under concurrent load.
 
 ### TNG-008 — Persistence updates are not transactional with runtime state
 
-**Status: Open** · **Priority: P0** · **Confidence: high**
+**Status: In progress** · **Priority: P0** · **Confidence: high**
 
-Evidence: add and update paths mutate the registry before later DB/blob work;
-per-block transfer updates hold runtime and DB locks and perform full upserts;
-job state/events are separate operations; migrations apply DDL and update
-`user_version` separately.
+Original evidence: add and update paths mutate the registry before later
+DB/blob work; per-block transfer updates hold runtime and DB locks and
+perform full upserts; job state/events are separate operations; migrations
+apply DDL and update `user_version` separately.
 
-Required action: define transaction boundaries and an authoritative state
-machine; commit DB + event + in-memory publication atomically or recoverably;
-batch transfer deltas; make migration version advancement transactional;
-reconcile interrupted operations on startup.
+Verified evidence (this session): fixed the specific, concrete "phantom
+registry row" case the acceptance criteria lists first, for the highest-
+traffic write path (`add_torrent`). `engine.rs`'s `add_torrent` was
+confirmed to do exactly what the finding described: `reg.add(entry)` makes
+the torrent visible to any concurrent reader (list/get) *before*
+`save_torrent_blob` (disk write) and `persist_entry` (DB upsert) run, and
+neither failure path rolled the registry entry back -- a blob-write or
+DB-upsert failure left a torrent visible via the API with no blob, no DB
+row, and no way to ever load its metadata again. Fixed by rolling back the
+registry entry on either failure, and additionally cleaning up the
+now-orphaned blob file if the blob write succeeded but the DB upsert
+failed afterward (best-effort, logged if cleanup itself fails). Two new
+regression tests: one forces the blob write to fail (occupying
+`session_dir/torrents` with a plain file instead of a directory) and
+confirms no phantom registry row remains; the other forces the DB upsert
+to fail (`PRAGMA query_only = ON` on the connection) and confirms both the
+registry row and the orphaned blob are cleaned up. Verified both are real
+regression tests, not tautologies: temporarily disabled the rollback logic
+and confirmed both tests fail before restoring the fix.
 
-Acceptance: injected failure at every write boundary, crash/restart recovery,
-no phantom registry rows, no lost transitions, and bounded write amplification.
+Full workspace `cargo test --workspace --all-targets --locked`,
+`cargo fmt --all -- --check`, and
+`cargo clippy --workspace --all-targets --locked -- -D warnings` all green
+(`rt-engine` 129 tests, up from 127).
+
+Not yet evidenced (why this stays "In progress", not "Resolved" -- this
+finding's full scope is large): `add_magnet` and the update/tracker/label
+paths were not audited or fixed for the same before-DB-write registry
+mutation pattern; per-block transfer updates' full-upsert-per-block cost
+(a write-amplification/scale concern, not a phantom-row one) is untouched;
+job state and session-event writes are still separate, non-atomic
+operations; migration DDL + `user_version` advancement is still two
+separate steps; there is no startup reconciliation pass that detects and
+repairs state left inconsistent by a crash between these steps (this
+session's fix prevents *new* phantom rows going forward, it does not
+repair any that already exist on disk from before the fix).
+
+Required action (remaining): audit and apply the same
+registry-add-then-rollback-on-failure pattern to `add_magnet` and any
+other path that adds a registry row ahead of durable writes; batch/coalesce
+per-block transfer persistence; make job-state + event writes atomic with
+each other; make migration DDL + version bump transactional; add a startup
+reconciliation pass for interrupted operations.
+
+Acceptance: injected failure at every write boundary (partially done --
+add_torrent's two failure points are covered; others are not), crash/restart
+recovery (not done), no phantom registry rows (done for add_torrent; not
+audited elsewhere), no lost transitions (not done), and bounded write
+amplification (not done).
 
 ## P1 — runtime, scale, and lifecycle
 
@@ -938,6 +980,7 @@ claims:
 | 2026-09-01 | Second session: resumed from the exact handoff point (verified via file content match + no live cargo process), found and fixed a livelock in `network_budget`'s rate limiter (`std::time::Instant` instead of `tokio::time::Instant`, invisible to production but hung the *entire* `cargo test --workspace` under `start_paused` tests), fixed 4 tests asserting old pre-honesty-fix behavior, fixed 1 test-fixture bug (piece-count mismatch, caught by real new validation), fixed 2 clippy findings, corrected both `rust-version` fields from an unverified/untrue "1.80" to the real verified floor (1.88 main, 1.97 sidecar -- transitive-dependency-driven, not first-party code). Independently spot-verified ~10 of the prior session's specific implementation claims against the actual diff rather than trusting the transcript narration (one self-correction recorded in TNG-009's note: initially misread upload rate-limiting as unwired due to an incomplete grep, corrected after checking the real send path). Updated 15 ledger items from Open to In progress or Resolved with cited evidence and explicit gaps; left 14 untouched items (TNG-001/002/003/008/010/011/013/014/019/020/022/026/027/029) as Open -- no work found on any of them; a closer pass then found real TNG-001 evidence that a first look missed and corrected its status. | `cargo test --workspace --all-targets --locked` (green, was hanging), `cargo fmt --all -- --check` (green), `cargo clippy --workspace --all-targets --locked -- -D warnings` (green), `cargo +1.88 test --workspace ...` (green), `cargo +1.97 test --manifest-path sidecar/Cargo.toml ...` (green), `cargo test --manifest-path sidecar/Cargo.toml --locked` (green, 75 passed). | Tree is a real, buildable, green checkpoint for the first time since remediation began. TNG-021 fully Resolved; other items moved Open -> In progress with specific verified evidence and specific remaining gaps recorded per item, so a future session can resume without re-deriving what's already true. Committed as `a479bf0`. |
 | 2026-09-01 | Third session (same date, continuing "build it all out"): implemented TNG-003's two headline complaints for real. Added streaming SHA-1 content verification (`verify_content_matches`/`hash_file_sha1` in `crates/rt-storage/src/plan.rs`) so `copy_verify()` no longer trusts aggregate length alone. Rewrote `rollback_plan()` to return both succeeded and *failed* rollback steps (previously a failed rollback step was silently dropped via `.is_ok()`); failures are folded into the returned `StorageError` message since that is the only channel the existing caller (`engine.rs`'s `execute_storage_plan_job`) reads. Added `StoragePlanExecution::rollback_failures` + `rollback_fully_succeeded()`. Wrote two new targeted tests: a same-length bit-flip that length-only verification would have missed, and a rollback step that itself fails being surfaced in the error while the other rollback step still runs. | `cargo build -p rt-storage` (clean), `cargo test -p rt-storage --lib` (111 passed, up from 109, 0 failed), full `cargo test --workspace --all-targets --locked` (green), `cargo fmt --all -- --check` (green), `cargo clippy --workspace --all-targets --locked -- -D warnings` (green). | TNG-003 moved Open -> In progress (not Resolved: permission-failure, destination-full, resume-after-interruption, and idempotent-retry tests from its acceptance list are still missing -- see item detail). |
 | 2026-09-01 | Fourth session (same date, continuing "build it all out"): implemented TNG-002's quiesce/resume storage-transition protocol. New `TorrentCmd::QuiesceForStorageMove`/`ResumeAfterStorageMove` in `crates/rt-engine/src/torrent_task.rs`, handled in the main actor loop, inside `pending_recheck_control` (an in-progress recheck reads files too), and in `metadata_task.rs` (no-op for not-yet-materialized torrents). `engine.rs`'s `move_torrent_payload_files` and the generic `EngineCmd::ExecuteStoragePlan` handler (`POST /api/v1/storage/execute`) both now quiesce affected running tasks before touching files and resume them afterward. Wrote a real regression test using a genuinely spawned `TorrentTask` (not the taskless path) proving a live task's cached save_root is correctly re-pointed after a move and a post-move recheck finds the content at the new location -- verified this actually catches the bug by temporarily reverting the fix and confirming the test fails (`Downloading` instead of `Seeding`) before restoring it. While building that test, found and fixed a real, separate, pre-existing bug: `rt-session`'s state machine had no `(Seeding, Checking)`/`(Seeding, Downloading)` transitions, so rechecking an already-seeding torrent via the *existing* `TorrentCmd::Recheck` command could never have its outcome reflected in the registry (`set_state` silently discards `transition()`'s `Result`). Fixed with a regression test. | `cargo test -p rt-engine -p rt-session --lib` (rt-engine 127 passed, up from 126; rt-session 19, up from 18; 0 failed), full `cargo test --workspace --all-targets --locked` (green), `cargo fmt --all -- --check` (green), `cargo clippy --workspace --all-targets --locked -- -D warnings` (green), `cargo test --manifest-path sidecar/Cargo.toml --locked` (green, 75 passed, unaffected). | TNG-002 moved Open -> In progress (not Resolved: live-peer move-under-transfer, cancellation, crash/restart tests still missing -- see item detail). Uncovered and fixed an independent state-machine bug along the way (recheck-of-seeding-torrent outcome was unobservable), which also directly strengthens TNG-002's and TNG-003's own recheck-after-move safety net. |
+| 2026-09-01 | Fifth session (same date, continuing "build it all out"): fixed TNG-008's first concrete "phantom registry row" case in `add_torrent` (`crates/rt-engine/src/engine.rs`) -- `reg.add(entry)` made a torrent visible before its blob was written and its DB row upserted, and neither failure path rolled the registry entry back. Now both failure points roll back the registry row; a DB-upsert failure after a successful blob write also cleans up the now-orphaned blob (best-effort, logged on cleanup failure). Two new regression tests force each failure independently (blocking the blob directory with a plain file; `PRAGMA query_only = ON` on the DB connection) and confirm no phantom row remains -- verified both are real by temporarily disabling the rollback and confirming both tests fail first. | `cargo test -p rt-engine --lib` (129 passed, up from 127, 0 failed), full `cargo test --workspace --all-targets --locked` (green), `cargo fmt --all -- --check` (green), `cargo clippy --workspace --all-targets --locked -- -D warnings` (green). | TNG-008 moved Open -> In progress. This is a deliberately narrow slice of a very broad finding -- `add_magnet` and other registry-mutating paths are not yet audited for the same pattern, and job-state/event atomicity, migration transactionality, per-block write amplification, and crash-restart reconciliation are all still open (see item detail for the explicit remaining list). |
 
 ## Release gate
 
