@@ -676,7 +676,7 @@ mod tests {
         assert!(bitmap.has_piece(0));
         assert!(bitmap.has_piece(9));
         assert_eq!(bitmap.complete_pieces(), 2);
-        assert_eq!(bitmap.to_bitfield()[9], true);
+        assert!(bitmap.to_bitfield()[9]);
 
         bitmap
             .set_all_from_bitfield(&[

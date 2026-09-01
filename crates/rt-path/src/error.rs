@@ -14,6 +14,8 @@ pub enum PathError {
     WindowsReservedName(String),
     #[error("path component contains illegal character: {0:?}")]
     IllegalCharacter(char),
+    #[error("path component is too long: {len} > max {max}")]
+    ComponentTooLong { len: usize, max: usize },
     #[error("path is empty")]
     EmptyPath,
 }

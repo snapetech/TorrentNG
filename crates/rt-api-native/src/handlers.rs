@@ -71,7 +71,7 @@ pub async fn auth_login(State(state): State<AppState>, body: String) -> impl Int
         .filter(|token| !token.is_empty())
         .map(|token| {
             format!(
-                "tng_session={}; HttpOnly; SameSite=Lax; Path=/",
+                "tng_session={}; Max-Age=86400; HttpOnly; SameSite=Lax; Path=/",
                 cookie_component_encode(&token)
             )
         })
@@ -95,20 +95,46 @@ pub async fn auth_logout() -> impl IntoResponse {
     )
 }
 
-/// `GET /api/v1/torrents` — list all torrents.
-pub async fn list_torrents(State(state): State<AppState>) -> impl IntoResponse {
-    if let Some(engine) = &state.engine {
-        let torrent_count = state.registry.read().await.iter().count();
-        let estimate = estimate_torrent_summary_snapshot_bytes(torrent_count);
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TorrentListQuery {
+    pub filter: Option<String>,
+    pub status: Option<String>,
+    pub category: Option<String>,
+    pub tag: Option<String>,
+    pub sort: Option<String>,
+    pub dir: Option<String>,
+    pub reverse: Option<bool>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TorrentListResponse {
+    pub total: usize,
+    pub torrents: Vec<TorrentSummary>,
+}
+
+/// `GET /api/v1/torrents` — bounded, filterable, deterministic torrent list.
+pub async fn list_torrents(
+    State(state): State<AppState>,
+    Query(query): Query<TorrentListQuery>,
+) -> impl IntoResponse {
+    let total = {
+        let reg = state.registry.read().await;
+        reg.iter()
+            .filter(|entry| torrent_matches(entry, &query))
+            .count()
+    };
+    let limit = query.limit.unwrap_or(200).clamp(1, 5_000);
+    let offset = query.offset.unwrap_or(0);
+    let estimate = estimate_torrent_summary_snapshot_bytes(limit.min(total));
+
+    let lease = if let Some(engine) = &state.engine {
         match engine
             .reserve_memory(MemoryClass::ApiSnapshot, estimate)
             .await
         {
-            Ok(Some(_lease)) => {
-                let reg = state.registry.read().await;
-                let summaries: Vec<TorrentSummary> = reg.iter().map(torrent_summary).collect();
-                return (StatusCode::OK, Json(summaries)).into_response();
-            }
+            Ok(Some(lease)) => Some(lease),
             Ok(None) => return api_snapshot_budget_exhausted(),
             Err(e) => {
                 return (
@@ -118,11 +144,115 @@ pub async fn list_torrents(State(state): State<AppState>) -> impl IntoResponse {
                     .into_response();
             }
         }
-    }
+    } else {
+        None
+    };
 
     let reg = state.registry.read().await;
-    let summaries: Vec<TorrentSummary> = reg.iter().map(torrent_summary).collect();
-    (StatusCode::OK, Json(summaries)).into_response()
+    let mut entries = reg
+        .iter()
+        .filter(|entry| torrent_matches(entry, &query))
+        .collect::<Vec<_>>();
+    sort_torrent_entries(&mut entries, &query);
+    let summaries = entries
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(torrent_summary)
+        .collect::<Vec<_>>();
+    drop(lease);
+    (
+        StatusCode::OK,
+        Json(TorrentListResponse {
+            total,
+            torrents: summaries,
+        }),
+    )
+        .into_response()
+}
+
+fn torrent_matches(entry: &TorrentEntry, query: &TorrentListQuery) -> bool {
+    if let Some(filter) = query
+        .filter
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let filter = filter.to_ascii_lowercase();
+        if !entry.name.to_ascii_lowercase().contains(&filter)
+            && !entry.info_hash.to_ascii_lowercase().contains(&filter)
+        {
+            return false;
+        }
+    }
+    if let Some(status) = query
+        .status
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let status = status.to_ascii_lowercase();
+        let state = entry.state.as_str();
+        let matches = match status.as_str() {
+            "active" => matches!(state, "downloading" | "seeding" | "checking"),
+            "completed" | "complete" => state == "seeding",
+            "stopped" => matches!(state, "stopped" | "paused"),
+            value => state == value,
+        };
+        if !matches {
+            return false;
+        }
+    }
+    if query
+        .category
+        .as_deref()
+        .is_some_and(|category| entry.category.as_deref() != Some(category))
+    {
+        return false;
+    }
+    if query
+        .tag
+        .as_deref()
+        .is_some_and(|tag| !entry.tags.iter().any(|value| value == tag))
+    {
+        return false;
+    }
+    true
+}
+
+fn sort_torrent_entries(entries: &mut [&TorrentEntry], query: &TorrentListQuery) {
+    let sort = query.sort.as_deref().unwrap_or("added");
+    entries.sort_by(|left, right| {
+        let ordering = match sort {
+            "name" => left
+                .name
+                .to_ascii_lowercase()
+                .cmp(&right.name.to_ascii_lowercase()),
+            "size" | "total_length" => left.total_length.cmp(&right.total_length),
+            "ratio" => left
+                .stats
+                .ratio()
+                .partial_cmp(&right.stats.ratio())
+                .unwrap_or(std::cmp::Ordering::Equal),
+            "progress" => left
+                .total_length
+                .saturating_sub(left.amount_left)
+                .cmp(&right.total_length.saturating_sub(right.amount_left)),
+            "hash" => left.info_hash.cmp(&right.info_hash),
+            _ => left.added_at.cmp(&right.added_at),
+        };
+        let ordering = if query.reverse.unwrap_or(false)
+            || query
+                .dir
+                .as_deref()
+                .is_some_and(|dir| dir.eq_ignore_ascii_case("desc"))
+        {
+            ordering.reverse()
+        } else {
+            ordering
+        };
+        ordering.then_with(|| left.info_hash.cmp(&right.info_hash))
+    });
 }
 
 fn api_snapshot_budget_exhausted() -> axum::response::Response {
@@ -2556,6 +2686,80 @@ pub async fn list_jobs(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
+async fn control_job(
+    state: &AppState,
+    job_id: String,
+    action: JobAction,
+) -> axum::response::Response {
+    let Some(engine) = &state.engine else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                serde_json::to_value(ApiError::internal(
+                    "native engine is not available".to_owned(),
+                ))
+                .unwrap(),
+            ),
+        )
+            .into_response();
+    };
+    let result = match action {
+        JobAction::Pause => engine.pause_job(job_id).await,
+        JobAction::Resume => engine.resume_job(job_id).await,
+        JobAction::Cancel => engine.cancel_job(job_id).await,
+    };
+    match result {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError::bad_request(error)).unwrap()),
+        )
+            .into_response(),
+    }
+}
+
+enum JobAction {
+    Pause,
+    Resume,
+    Cancel,
+}
+
+/// `POST /api/v1/jobs/{id}/pause` — pause a durable job.
+pub async fn pause_job(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+) -> impl IntoResponse {
+    if let Some(response) = require_mutation_auth(&state, &headers) {
+        return response;
+    }
+    control_job(&state, job_id, JobAction::Pause).await
+}
+
+/// `POST /api/v1/jobs/{id}/resume` — resume a durable job.
+pub async fn resume_job(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+) -> impl IntoResponse {
+    if let Some(response) = require_mutation_auth(&state, &headers) {
+        return response;
+    }
+    control_job(&state, job_id, JobAction::Resume).await
+}
+
+/// `POST /api/v1/jobs/{id}/cancel` — cancel a durable job.
+pub async fn cancel_job(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+) -> impl IntoResponse {
+    if let Some(response) = require_mutation_auth(&state, &headers) {
+        return response;
+    }
+    control_job(&state, job_id, JobAction::Cancel).await
+}
+
 #[cfg(test)]
 fn build_storage_plan(req: &StoragePlanRequest, preview: bool) -> Result<StoragePlan, String> {
     let dry_run = if preview {
@@ -2964,7 +3168,8 @@ fn native_engine_capabilities() -> serde_json::Value {
             "torrent_files": true,
             "magnets": true,
             "pure_v2_metadata_placeholders": true,
-            "pure_v2_metadata_completion": true,
+            "pure_v2_metadata_completion": false,
+            "pure_v2_transfer": false,
         },
         "session": {
             "durable_torrents": true,
@@ -2979,14 +3184,15 @@ fn native_engine_capabilities() -> serde_json::Value {
             "durable_recheck": true,
             "pause_resume_cancel": true,
             "crash_recovery": true,
-            "storage_throttled": true,
+            "storage_plan_controls": false,
+            "storage_throttled": false,
         },
         "storage": {
             "root_registry": true,
             "mount_identity": true,
             "dry_run_import": true,
-            "safe_move": true,
-            "safe_delete_after_dry_run": true,
+            "safe_move": false,
+            "safe_delete_after_dry_run": false,
             "v2_file_root_verify": true,
         },
         "networking": {
@@ -3024,9 +3230,9 @@ fn native_engine_capabilities() -> serde_json::Value {
         "operations": {
             "prometheus_metrics": true,
             "diagnostics": true,
-            "bounded_shutdown": true,
+            "bounded_shutdown": false,
             "api_token_auth": true,
-            "scale_certification": true,
+            "scale_certification": false,
         },
     })
 }
@@ -5559,7 +5765,7 @@ mod tests {
         assert_eq!(capabilities["torrent_identity"]["v2"], true);
         assert_eq!(
             capabilities["metadata"]["pure_v2_metadata_completion"],
-            true
+            false
         );
         assert_eq!(capabilities["session"]["crash_restore"], true);
         assert_eq!(capabilities["jobs"]["durable_recheck"], true);
@@ -5581,6 +5787,8 @@ mod tests {
         assert_eq!(capabilities["compatibility"]["qbittorrent_v2"], true);
         assert_eq!(capabilities["migration"]["transmission"], true);
         assert_eq!(capabilities["operations"]["prometheus_metrics"], true);
+        assert_eq!(capabilities["operations"]["bounded_shutdown"], false);
+        assert_eq!(capabilities["operations"]["scale_certification"], false);
     }
 
     #[test]
@@ -5939,7 +6147,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v, serde_json::json!([]));
+        assert_eq!(v, serde_json::json!({"total": 0, "torrents": []}));
     }
 
     #[tokio::test]
@@ -5998,7 +6206,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_torrents_with_entry() {
-        let (app, _hash) = setup_app_with_torrent().await;
+        let (app, hash) = setup_app_with_torrent().await;
         let resp = app
             .oneshot(
                 Request::builder()
@@ -6011,7 +6219,52 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v.as_array().unwrap().len(), 1);
+        assert_eq!(v["total"], serde_json::json!(1));
+        let torrents = v["torrents"].as_array().unwrap();
+        assert_eq!(torrents.len(), 1);
+        assert_eq!(torrents[0]["info_hash"], serde_json::json!(hash));
+    }
+
+    #[tokio::test]
+    async fn list_torrents_reports_total_independent_of_page_size() {
+        // TNG-021 acceptance: `total` is the full filtered count, not the
+        // page size -- a caller must be able to tell "more exist" apart
+        // from "that's everything".
+        let state = AppState::new();
+        {
+            let mut reg = state.registry.write().await;
+            for i in 0..3 {
+                reg.add(TorrentEntry::new(
+                    format!("{i}").repeat(40),
+                    format!("torrent-{i}.bin"),
+                    "/data".into(),
+                ))
+                .unwrap();
+            }
+        }
+        let app = build_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/torrents?limit=1&sort=name")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["total"],
+            serde_json::json!(3),
+            "total must count all 3, not just the page"
+        );
+        assert_eq!(
+            v["torrents"].as_array().unwrap().len(),
+            1,
+            "page must be bounded by limit"
+        );
     }
 
     #[tokio::test]
@@ -6105,7 +6358,7 @@ mod tests {
             seed_ratio_limit: Some(2.0),
             ..Default::default()
         };
-        assert!(matches!(req.download_limit, None));
+        assert!(req.download_limit.is_none());
 
         merge_torrent_limits(&mut limits, req).unwrap();
 

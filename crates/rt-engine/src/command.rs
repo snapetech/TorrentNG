@@ -915,8 +915,9 @@ pub enum EngineCmd {
         info_hash: String,
         reply: oneshot::Sender<CmdResult<TorrentDiagnostic>>,
     },
-    /// Graceful shutdown.
-    Shutdown,
+    /// Graceful shutdown. The reply is sent only after the engine has drained
+    /// its torrent and DHT tasks.
+    Shutdown { reply: oneshot::Sender<()> },
 }
 
 #[cfg(test)]

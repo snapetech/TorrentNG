@@ -3,6 +3,7 @@ mod dht_task;
 pub mod egress_policy;
 pub mod engine;
 mod metadata_task;
+pub(crate) mod network_budget;
 pub mod peer_id;
 pub mod peer_ingress;
 pub mod storage_authority;

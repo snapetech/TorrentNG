@@ -26,7 +26,8 @@ async fn qbit_auth_guard(
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    if state.api_tokens.is_empty()
+    if qbit_public_path(req.uri().path())
+        || state.api_tokens.is_empty()
         || qbit_presented_token(req.headers())
             .is_some_and(|token| qbit_token_allowed(&state, &token))
     {
@@ -39,6 +40,10 @@ async fn qbit_auth_guard(
         "Forbidden.",
     )
         .into_response()
+}
+
+fn qbit_public_path(path: &str) -> bool {
+    path.ends_with("/auth/login") || path.ends_with("/auth/logout")
 }
 
 fn qbit_token_allowed(state: &AppState, token: &str) -> bool {
@@ -62,8 +67,38 @@ fn qbit_presented_token(headers: &HeaderMap) -> Option<String> {
 fn qbit_sid_cookie(cookie: &str) -> Option<String> {
     cookie.split(';').find_map(|part| {
         let part = part.trim();
-        part.strip_prefix("SID=").map(str::to_owned)
+        part.strip_prefix("SID=").and_then(cookie_component_decode)
     })
+}
+
+fn cookie_component_decode(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            output.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        if index + 2 >= bytes.len() {
+            return None;
+        }
+        let high = hex_value(bytes[index + 1])?;
+        let low = hex_value(bytes[index + 2])?;
+        output.push((high << 4) | low);
+        index += 3;
+    }
+    String::from_utf8(output).ok()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn qbit_routes() -> Router<AppState> {

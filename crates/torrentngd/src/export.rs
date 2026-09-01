@@ -116,7 +116,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         Command::Export(args) => args,
     };
 
-    let config = load_config(args.config.as_deref());
+    let config = load_config(args.config.as_deref())?;
     let db_path = config.db_path();
     let blob_dir = config.daemon.session_dir.join("torrents");
     let fastresume_dir = config.daemon.session_dir.join("fastresume");

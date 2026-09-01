@@ -37,15 +37,128 @@ use crate::{
 // ---------------------------------------------------------------------------
 
 /// `POST /api/qb/v2/auth/login` — qBittorrent-compatible session probe.
-pub async fn auth_login() -> impl IntoResponse {
+pub async fn auth_login(State(state): State<AppState>, body: String) -> Response {
+    let submitted = qbit_form_token(&body);
+    let sid = if state.api_tokens.is_empty() {
+        "torrentng".to_owned()
+    } else {
+        let Some(token) = submitted.filter(|token| token_allowed(&state, token)) else {
+            return (
+                StatusCode::FORBIDDEN,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                "Forbidden.",
+            )
+                .into_response();
+        };
+        token
+    };
+    let cookie = format!(
+        "SID={}; Max-Age=86400; HttpOnly; SameSite=Lax; Path=/",
+        cookie_component_encode(&sid)
+    );
     (
         StatusCode::OK,
-        [(
-            header::SET_COOKIE,
-            HeaderValue::from_static("SID=torrentng; HttpOnly; SameSite=Lax; Path=/"),
-        )],
+        [(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap())],
         "Ok.",
     )
+        .into_response()
+}
+
+fn token_allowed(state: &AppState, token: &str) -> bool {
+    state.api_tokens.iter().any(|allowed| allowed == token)
+}
+
+fn qbit_form_token(body: &str) -> Option<String> {
+    let mut username = None;
+    let mut password = None;
+    for pair in body.split('&') {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        let Some(key) = form_component_decode(key) else {
+            continue;
+        };
+        if key != "password" && key != "username" {
+            continue;
+        }
+        let Some(value) = form_component_decode(value) else {
+            continue;
+        };
+        if key == "password" {
+            password = Some(value);
+        } else {
+            username = Some(value);
+        }
+    }
+    password.or(username)
+}
+
+fn form_component_decode(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => out.push(b' '),
+            b'%' if index + 2 < bytes.len() => {
+                let high = hex_value(bytes[index + 1])?;
+                let low = hex_value(bytes[index + 2])?;
+                out.push((high << 4) | low);
+                index += 2;
+            }
+            b'%' => return None,
+            byte => out.push(byte),
+        }
+        index += 1;
+    }
+    String::from_utf8(out).ok()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn cookie_component_encode(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'0'..=b'9'
+            | b'a'..=b'z'
+            | b'A'..=b'Z'
+            | b'!'
+            | b'#'
+            | b'$'
+            | b'&'
+            | b'\''
+            | b'('
+            | b')'
+            | b'*'
+            | b'+'
+            | b'-'
+            | b'.'
+            | b'/'
+            | b':'
+            | b'<'
+            | b'='
+            | b'>'
+            | b'?'
+            | b'@'
+            | b'['
+            | b']'
+            | b'^'
+            | b'_'
+            | b'`'
+            | b'|'
+            | b'~' => output.push(byte as char),
+            _ => output.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    output
 }
 
 pub async fn auth_logout() -> impl IntoResponse {
@@ -503,10 +616,8 @@ pub async fn torrents_info(
                                 return false;
                             }
                         }
-                        "paused" => {
-                            if !matches!(qb_state, "pausedUP" | "pausedDL") {
-                                return false;
-                            }
+                        "paused" if !matches!(qb_state, "pausedUP" | "pausedDL") => {
+                            return false;
                         }
                         _ => {}
                     }
@@ -1070,7 +1181,7 @@ pub async fn torrents_files(
                 &state,
                 estimate_qbit_metadata_snapshot_bytes(
                     meta.files.len(),
-                    meta.piece_count as usize,
+                    meta.piece_count,
                     meta.webseeds.len(),
                 ),
             )
@@ -2167,7 +2278,8 @@ pub async fn sync_torrent_peers(
     let full_update = q
         .get("rid")
         .and_then(|rid| rid.parse::<i64>().ok())
-        .is_none_or(|requested| requested != rid);
+        .map(|requested| requested != rid)
+        .unwrap_or(true);
     let peer_map = if full_update {
         qbit_peer_map(&peers)
     } else {
@@ -4079,6 +4191,59 @@ mod tests {
             .and_then(|value| value.to_str().ok())
             .unwrap();
         assert!(cookie.starts_with("SID=torrentng;"));
+    }
+
+    #[tokio::test]
+    async fn login_requires_configured_token_and_cookie_auth_round_trips() {
+        let mut state = AppState::new();
+        state.api_tokens = Arc::new(vec!["secret token".to_owned()]);
+        let app = build_qbit_router(state);
+        let bad = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/auth/login")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("username=operator&password=wrong"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::FORBIDDEN);
+
+        let ok = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/auth/login")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("username=operator&password=secret+token"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        let cookie = ok
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .to_owned();
+        assert!(cookie.starts_with("SID=secret%20token; Max-Age=86400;"));
+
+        let protected = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/qb/v2/app/version")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(protected.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -6071,7 +6236,10 @@ mod tests {
             download_rate: 999,
             ..first.clone()
         };
-        assert_ne!(qbit_peer_rid(&[first.clone()]), qbit_peer_rid(&[changed]));
+        assert_ne!(
+            qbit_peer_rid(std::slice::from_ref(&first)),
+            qbit_peer_rid(&[changed])
+        );
 
         let peers = qbit_peer_map(&[first]);
         let peer = &peers["10.0.0.2:51413"];

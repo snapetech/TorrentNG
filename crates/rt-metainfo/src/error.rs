@@ -18,6 +18,8 @@ pub enum MetainfoError {
     LimitExceeded { field: &'static str, limit: usize },
     #[error("invalid pieces length: {0} (must be multiple of 20)")]
     InvalidPiecesLength(usize),
+    #[error("invalid piece count: expected {expected}, got {actual}")]
+    InvalidPieceCount { expected: usize, actual: usize },
     #[error("invalid piece length: {0}")]
     InvalidPieceLength(u64),
     #[error("invalid file path: {0}")]

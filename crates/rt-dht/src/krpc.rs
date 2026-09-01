@@ -311,7 +311,7 @@ pub fn encode_compact_nodes(nodes: &[KNode]) -> Vec<u8> {
 }
 
 pub fn parse_compact_nodes(bytes: &[u8]) -> Result<Vec<KNode>, KrpcError> {
-    if !bytes.len().is_multiple_of(26) {
+    if bytes.len() % 26 != 0 {
         return Err(KrpcError::Invalid(
             "compact nodes length is not a multiple of 26",
         ));
@@ -342,7 +342,7 @@ pub fn parse_compact_peers(bytes: &[u8]) -> Result<Vec<SocketAddr>, KrpcError> {
             0,
         ))]);
     }
-    if bytes.len().is_multiple_of(6) {
+    if bytes.len() % 6 == 0 {
         return Ok(bytes
             .chunks_exact(6)
             .map(|chunk| {
@@ -353,7 +353,7 @@ pub fn parse_compact_peers(bytes: &[u8]) -> Result<Vec<SocketAddr>, KrpcError> {
             })
             .collect());
     }
-    if bytes.len().is_multiple_of(18) {
+    if bytes.len() % 18 == 0 {
         return Ok(bytes
             .chunks_exact(18)
             .map(|chunk| {

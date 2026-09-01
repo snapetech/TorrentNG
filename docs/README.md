@@ -21,6 +21,9 @@ certified status.
 - [PROJECT_GAP_AUDIT.md](PROJECT_GAP_AUDIT.md) - current whole-project gap
   audit across roadmaps, storage, memory, WebUI, compatibility, interop,
   security, and release evidence.
+- [BACKEND_AUDIT_BURN_DOWN.md](BACKEND_AUDIT_BURN_DOWN.md) - canonical,
+  evidence-backed remediation ledger for the native backend audit; this is the
+  release-facing source of truth for open findings and unsupported claims.
 - [WEBUI_AUDIT.md](WEBUI_AUDIT.md) - torrent-table alignment, status semantics,
   field coverage, and the remaining cross-client projection gaps.
 - [RELEASE_EVIDENCE.md](RELEASE_EVIDENCE.md) - operator runbook for clearing

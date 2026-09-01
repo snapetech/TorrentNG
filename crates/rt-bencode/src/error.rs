@@ -12,6 +12,8 @@ pub enum BencodeError {
     StringTooLong { len: usize, max: usize },
     #[error("recursion depth exceeded: {0}")]
     DepthExceeded(usize),
+    #[error("node limit exceeded: {nodes} > max {max}")]
+    NodeLimitExceeded { nodes: usize, max: usize },
     #[error("unsorted dictionary keys")]
     UnsortedDictKeys,
     #[error("unexpected byte {0:#04x} at offset {1}")]

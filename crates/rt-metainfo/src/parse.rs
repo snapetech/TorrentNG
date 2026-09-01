@@ -13,8 +13,12 @@ const MAX_TORRENT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_FILES: usize = 100_000;
 const MAX_PATH_COMPONENTS: usize = 256;
 const MAX_TRACKER_URLS: usize = 4096;
+const MAX_TRACKER_TIERS: usize = 256;
+const MAX_TRACKER_URL_BYTES: usize = 8192;
 const MAX_WEBSEED_URLS: usize = 4096;
+const MAX_WEBSEED_URL_BYTES: usize = 8192;
 const MAX_PIECES: usize = 16_000_000;
+const MAX_NAME_BYTES: usize = 4096;
 
 /// Parse a `.torrent` file from raw bytes. Handles v1, v2 (BEP 52), and hybrid.
 pub fn parse_torrent(raw: &[u8]) -> Result<TorrentMeta, MetainfoError> {
@@ -59,8 +63,17 @@ pub fn parse_torrent(raw: &[u8]) -> Result<TorrentMeta, MetainfoError> {
     if name.is_empty() {
         return Err(MetainfoError::ZeroLengthName);
     }
+    if name.len() > MAX_NAME_BYTES {
+        return Err(MetainfoError::LimitExceeded {
+            field: "name bytes",
+            limit: MAX_NAME_BYTES,
+        });
+    }
 
     let piece_length = get_positive_u64(info, b"piece length", "piece length")?;
+    if piece_length > u32::MAX as u64 {
+        return Err(MetainfoError::InvalidPieceLength(piece_length));
+    }
 
     let private = info
         .get(b"private")
@@ -84,9 +97,10 @@ pub fn parse_torrent(raw: &[u8]) -> Result<TorrentMeta, MetainfoError> {
         let pieces = parse_piece_hashes(info)?;
         let files_v1 = parse_files_v1(info, &name)?;
         let files_v2 = parse_file_tree(info, &name)?;
+        validate_piece_count(&pieces, &files_v1, piece_length)?;
 
         return Ok(TorrentMeta::Hybrid(
-            TorrentMetaV1 {
+            Box::new(TorrentMetaV1 {
                 info_hash: info_hash_v1,
                 announce: announce.clone(),
                 announce_list: announce_list.clone(),
@@ -100,7 +114,7 @@ pub fn parse_torrent(raw: &[u8]) -> Result<TorrentMeta, MetainfoError> {
                 files: files_v1,
                 private,
                 raw: raw.to_vec(),
-            },
+            }),
             TorrentMetaV2 {
                 info_hash_v2,
                 announce,
@@ -150,6 +164,7 @@ pub fn parse_torrent(raw: &[u8]) -> Result<TorrentMeta, MetainfoError> {
     };
     let pieces = parse_piece_hashes(info)?;
     let files = parse_files_v1(info, &name)?;
+    validate_piece_count(&pieces, &files, piece_length)?;
 
     Ok(TorrentMeta::V1(TorrentMetaV1 {
         info_hash,
@@ -357,6 +372,12 @@ fn parse_announce_list(root: &BValue<'_>) -> Result<Vec<Vec<String>>, MetainfoEr
     let Some(BValue::List(tiers)) = root.get(b"announce-list") else {
         return Ok(Vec::new());
     };
+    if tiers.len() > MAX_TRACKER_TIERS {
+        return Err(MetainfoError::LimitExceeded {
+            field: "tracker tiers",
+            limit: MAX_TRACKER_TIERS,
+        });
+    }
     let mut total = 0usize;
     let mut out = Vec::new();
     for tier in tiers {
@@ -373,7 +394,13 @@ fn parse_announce_list(root: &BValue<'_>) -> Result<Vec<Vec<String>>, MetainfoEr
             else {
                 continue;
             };
-            total += 1;
+            if url.len() > MAX_TRACKER_URL_BYTES {
+                return Err(MetainfoError::LimitExceeded {
+                    field: "tracker url bytes",
+                    limit: MAX_TRACKER_URL_BYTES,
+                });
+            }
+            total = total.saturating_add(1);
             if total > MAX_TRACKER_URLS {
                 return Err(MetainfoError::LimitExceeded {
                     field: "tracker urls",
@@ -422,6 +449,12 @@ fn push_webseed_bytes(bytes: &[u8], out: &mut Vec<String>) -> Result<(), Metainf
             limit: MAX_WEBSEED_URLS,
         });
     }
+    if value.len() > MAX_WEBSEED_URL_BYTES {
+        return Err(MetainfoError::LimitExceeded {
+            field: "webseed url bytes",
+            limit: MAX_WEBSEED_URL_BYTES,
+        });
+    }
     out.push(value.to_owned());
     Ok(())
 }
@@ -442,6 +475,35 @@ fn parse_piece_hashes(info: &BValue<'_>) -> Result<Vec<[u8; 20]>, MetainfoError>
         .chunks_exact(20)
         .map(|c| c.try_into().unwrap())
         .collect())
+}
+
+fn validate_piece_count(
+    pieces: &[[u8; 20]],
+    files: &[TorrentFileV1],
+    piece_length: u64,
+) -> Result<(), MetainfoError> {
+    let total_length = files.iter().try_fold(0u64, |total, file| {
+        total
+            .checked_add(file.length)
+            .ok_or(MetainfoError::IntegerOverflow("total length"))
+    })?;
+    let expected = if total_length == 0 {
+        0
+    } else {
+        total_length
+            .checked_add(piece_length - 1)
+            .ok_or(MetainfoError::IntegerOverflow("piece count"))?
+            / piece_length
+    };
+    let expected =
+        usize::try_from(expected).map_err(|_| MetainfoError::IntegerOverflow("piece count"))?;
+    if pieces.len() != expected {
+        return Err(MetainfoError::InvalidPieceCount {
+            expected,
+            actual: pieces.len(),
+        });
+    }
+    Ok(())
 }
 
 /// BEP 47: a file dict/leaf carries `"attr"` as a short string of one-letter
@@ -571,7 +633,7 @@ mod tests {
             })
             .collect();
 
-        let pieces_data = make_pieces(2);
+        let pieces_data = make_pieces(1);
         let mut info_pairs: Vec<(&[u8], BValue<'_>)> = vec![
             (b"files", BValue::List(file_entries)),
             (b"name", BValue::Bytes(name.as_bytes())),

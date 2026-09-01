@@ -11,17 +11,18 @@ use axum::{
 use crate::{
     handlers::{
         add_torrent, add_torrent_peers, add_torrent_tags, apply_rss_rules, auth_login, auth_logout,
-        bulk_action, categories, create_tag, cross_seed, delete_category, delete_saved_json,
-        delete_tag, delete_torrent, diagnose_torrent, engine_commands, engine_diagnostics,
-        get_torrent, get_user_agent, health, list_json_map, list_session_events,
-        list_torrent_files, list_torrent_trackers, list_torrents, list_workflow_runs, logs,
-        metrics, patch_torrent_files, patch_torrent_trackers, pause_torrent, reannounce_torrent,
-        recheck_torrent, remove_torrent_tags, restart_engine, resume_torrent, rtorrent_settings,
-        run_json_workflow, save_rtorrent_settings, session_features, set_torrent_category,
-        set_user_agent, sidebar_facets, storage, storage_execute_plan, storage_preview_plan,
-        stream_events, tags, test_rss_rules, torrent_limits, tracker_health, transfer_info,
-        transfer_limits, update_session_features, update_torrent, update_torrent_limits,
-        update_torrent_queue, update_transfer_limits, upsert_category, upsert_json_map,
+        bulk_action, cancel_job, categories, create_tag, cross_seed, delete_category,
+        delete_saved_json, delete_tag, delete_torrent, diagnose_torrent, engine_commands,
+        engine_diagnostics, get_torrent, get_user_agent, health, list_json_map,
+        list_session_events, list_torrent_files, list_torrent_trackers, list_torrents,
+        list_workflow_runs, logs, metrics, patch_torrent_files, patch_torrent_trackers, pause_job,
+        pause_torrent, reannounce_torrent, recheck_torrent, remove_torrent_tags, restart_engine,
+        resume_job, resume_torrent, rtorrent_settings, run_json_workflow, save_rtorrent_settings,
+        session_features, set_torrent_category, set_user_agent, sidebar_facets, storage,
+        storage_execute_plan, storage_preview_plan, stream_events, tags, test_rss_rules,
+        torrent_limits, tracker_health, transfer_info, transfer_limits, update_session_features,
+        update_torrent, update_torrent_limits, update_torrent_queue, update_transfer_limits,
+        upsert_category, upsert_json_map,
     },
     state::AppState,
 };
@@ -160,6 +161,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/events", get(stream_events))
         .route("/api/v1/session-events", get(list_session_events))
         .route("/api/v1/jobs", get(crate::handlers::list_jobs))
+        .route("/api/v1/jobs/:id/pause", post(pause_job))
+        .route("/api/v1/jobs/:id/resume", post(resume_job))
+        .route("/api/v1/jobs/:id/cancel", post(cancel_job))
         .route("/api/v1/storage", get(storage))
         .route("/api/v1/storage/plan", post(storage_preview_plan))
         .route("/api/v1/storage/execute", post(storage_execute_plan))
@@ -220,6 +224,37 @@ fn native_presented_token(headers: &HeaderMap) -> Option<String> {
 fn native_session_cookie(cookie: &str) -> Option<String> {
     cookie.split(';').find_map(|part| {
         let part = part.trim();
-        part.strip_prefix("tng_session=").map(str::to_owned)
+        part.strip_prefix("tng_session=")
+            .and_then(cookie_component_decode)
     })
+}
+
+fn cookie_component_decode(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            output.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        if index + 2 >= bytes.len() {
+            return None;
+        }
+        let high = hex_value(bytes[index + 1])?;
+        let low = hex_value(bytes[index + 2])?;
+        output.push((high << 4) | low);
+        index += 3;
+    }
+    String::from_utf8(output).ok()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }

@@ -8,13 +8,19 @@ use rt_migrate::{dry_run_qbittorrent_backup, ImportOptions};
 const IMPORT_CERT_TORRENTS: usize = 15_000;
 
 fn write_torrent(path: &Path, index: usize) -> String {
-    let pieces = vec![(index % 251) as u8; 20];
+    let piece_length: i64 = 16_384;
     let name = format!("import-cert-{index:05}.bin");
-    let length = 16_384 + index as i64;
+    let length = piece_length + index as i64;
+    // Piece hash count must match ceil(length / piece_length), or the
+    // parser's piece-count validation (TNG-004) correctly rejects it.
+    let piece_count = ((length + piece_length - 1) / piece_length) as usize;
+    let pieces: Vec<u8> = (0..piece_count)
+        .flat_map(|p| vec![((index + p) % 251) as u8; 20])
+        .collect();
     let mut info = vec![
         (b"length".as_slice(), BValue::Int(length)),
         (b"name".as_slice(), BValue::Bytes(name.as_bytes())),
-        (b"piece length".as_slice(), BValue::Int(16_384)),
+        (b"piece length".as_slice(), BValue::Int(piece_length)),
         (b"pieces".as_slice(), BValue::Bytes(&pieces)),
     ];
     info.sort_by(|a, b| a.0.cmp(b.0));
@@ -27,7 +33,8 @@ fn write_torrent(path: &Path, index: usize) -> String {
     let raw = encode(&BValue::Dict(torrent));
     std::fs::write(path, &raw).unwrap();
     match parse_torrent(&raw).unwrap() {
-        TorrentMeta::V1(meta) | TorrentMeta::Hybrid(meta, _) => hex_lower(&meta.info_hash),
+        TorrentMeta::V1(meta) => hex_lower(&meta.info_hash),
+        TorrentMeta::Hybrid(meta, _) => hex_lower(&meta.info_hash),
         TorrentMeta::V2(_) => unreachable!(),
     }
 }

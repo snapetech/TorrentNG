@@ -11,7 +11,8 @@ For the larger rewrite overview and native-vs-rTorrent comparison, see
 
 - Put the session DB and torrent metadata on durable local storage.
 - Put payload data on mounted storage roots with stable paths.
-- Set native API tokens in `[auth].api_tokens`; do not use example secrets.
+- Set native API tokens in `[auth].api_tokens`; public binds reject missing,
+  short, or placeholder tokens at startup.
 - Bind the native API behind TLS or a trusted reverse proxy.
 - Keep mutating endpoints token-protected.
 - Enable scripts only with a root-owned allowlist directory.
@@ -34,7 +35,7 @@ session_dir = "/var/lib/torrentngd"
 download_dir = "/data"
 
 [auth]
-api_tokens = ["change-me"]
+api_tokens = ["REPLACE_WITH_A_RANDOM_TOKEN_OF_AT_LEAST_16_CHARACTERS"]
 ```
 
 The daemon stores SQLite state at `session_dir/state.db` unless `[db].path` is
@@ -66,8 +67,9 @@ docker compose -f deploy/native/compose.yml --profile observability up --build
 ```
 
 The example config is [deploy/native/config.toml](../deploy/native/config.toml).
-Change `[auth].api_tokens`, storage paths, and public peer port before using it
-outside local testing.
+Replace the token placeholder with a random value, then change storage paths and
+the public peer port before using it outside local testing. The shipped example
+intentionally refuses to start until the placeholder is replaced.
 
 ## systemd
 

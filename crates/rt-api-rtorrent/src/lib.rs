@@ -1040,11 +1040,13 @@ mod tests {
         let state = state_with_torrent().await;
         let hash = RtValue::String("a".repeat(40));
         assert_eq!(
-            execute(&state, "d.name", &[hash.clone()]).await.unwrap(),
+            execute(&state, "d.name", std::slice::from_ref(&hash))
+                .await
+                .unwrap(),
             RtValue::String("alpha".to_owned())
         );
         assert_eq!(
-            execute(&state, "d.completed_bytes", &[hash.clone()])
+            execute(&state, "d.completed_bytes", std::slice::from_ref(&hash))
                 .await
                 .unwrap(),
             RtValue::Int(75)
@@ -1211,13 +1213,13 @@ mod tests {
             RtValue::Int(0)
         );
         assert_eq!(
-            execute(&state, "d.down.max_rate", &[hash.clone()])
+            execute(&state, "d.down.max_rate", std::slice::from_ref(&hash))
                 .await
                 .unwrap(),
             RtValue::Int(333)
         );
         assert_eq!(
-            execute(&state, "d.up.max_rate", &[hash.clone()])
+            execute(&state, "d.up.max_rate", std::slice::from_ref(&hash))
                 .await
                 .unwrap(),
             RtValue::Int(444)

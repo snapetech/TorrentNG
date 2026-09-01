@@ -636,7 +636,8 @@ mod tests {
             BValue::Dict(info),
         )]));
         let hash = match rt_metainfo::parse_torrent(&raw).unwrap() {
-            rt_metainfo::TorrentMeta::V1(m) | rt_metainfo::TorrentMeta::Hybrid(m, _) => m.info_hash,
+            rt_metainfo::TorrentMeta::V1(m) => m.info_hash,
+            rt_metainfo::TorrentMeta::Hybrid(m, _) => m.info_hash,
             rt_metainfo::TorrentMeta::V2(_) => unreachable!(),
         };
         (raw, hash)
@@ -749,10 +750,8 @@ mod tests {
         fn run_biglybt(path: &Path) -> Result<crate::MigrationPlan, crate::MigrationError> {
             dry_run_biglybt_config(path)
         }
-        let cases: [(
-            ExportFormat,
-            fn(&Path) -> Result<crate::MigrationPlan, crate::MigrationError>,
-        ); 2] = [
+        type ExportPlanParser = fn(&Path) -> Result<crate::MigrationPlan, crate::MigrationError>;
+        let cases: [(ExportFormat, ExportPlanParser); 2] = [
             (ExportFormat::Utorrent, run_utorrent),
             (ExportFormat::Biglybt, run_biglybt),
         ];

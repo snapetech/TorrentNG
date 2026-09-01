@@ -30,7 +30,7 @@ pub fn detect_storage_profile(path: &Path) -> StorageProfile {
 }
 
 pub fn detect_storage_topology(path: &Path) -> StorageTopology {
-    detect_storage_topology_inner(path).unwrap_or_else(|| StorageTopology {
+    detect_storage_topology_inner(path).unwrap_or(StorageTopology {
         device_id: None,
         profile: StorageProfile::Unknown,
         fs_type: None,

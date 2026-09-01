@@ -275,19 +275,15 @@ fn json_report(plan: &MigrationPlan) -> JsonMigrationReport<'_> {
     }
 }
 
-pub(crate) fn load_config(path: Option<&Path>) -> Config {
+pub(crate) fn load_config(path: Option<&Path>) -> anyhow::Result<Config> {
     if let Some(path) = path {
-        match Config::load(path) {
-            Ok(c) => return c,
-            Err(e) => eprintln!("config error ({}): {e}", path.display()),
-        }
-    } else if let Ok(env_path) = std::env::var("TORRENTNGD_CONFIG") {
-        match Config::load(Path::new(&env_path)) {
-            Ok(c) => return c,
-            Err(e) => eprintln!("config error ({env_path}): {e}"),
-        }
+        return Config::load(path)
+            .map_err(anyhow::Error::from)
+            .with_context(|| format!("loading config from {}", path.display()));
     }
     Config::load_default()
+        .map_err(anyhow::Error::from)
+        .context("loading default config")
 }
 
 pub(crate) fn confirm<R: BufRead, W: Write>(
@@ -374,7 +370,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let config = load_config(args.config.as_deref());
+    let config = load_config(args.config.as_deref())?;
     let db_path = config.db_path();
     let fastresume_dir = config.daemon.session_dir.join("fastresume");
 

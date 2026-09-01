@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -289,17 +290,18 @@ impl Config {
         Ok(config)
     }
 
-    /// Load from the standard search path, returning defaults if no file exists.
-    pub fn load_default() -> Self {
+    /// Load from the standard search path, returning defaults only when no
+    /// config file exists. An existing but invalid file is an operator error
+    /// and is never silently ignored.
+    pub fn load_default() -> Result<Self, ConfigError> {
         for path in default_config_paths() {
             if path.exists() {
-                match Self::load(&path) {
-                    Ok(c) => return c,
-                    Err(e) => eprintln!("config error in {}: {e}", path.display()),
-                }
+                return Self::load(&path).map_err(|error| {
+                    ConfigError::Validation(format!("{}: {error}", path.display()))
+                });
             }
         }
-        Self::default()
+        Ok(Self::default())
     }
 
     /// Validate config invariants that would otherwise turn into runtime footguns.
@@ -308,6 +310,11 @@ impl Config {
             !self.daemon.api_bind.trim().is_empty(),
             "daemon.api_bind must not be empty",
         )?;
+        let api_addr = self
+            .daemon
+            .api_bind
+            .parse::<SocketAddr>()
+            .map_err(|error| ConfigError::Validation(format!("daemon.api_bind: {error}")))?;
         require(
             self.daemon.shutdown_timeout_secs > 0,
             "daemon.shutdown_timeout_secs must be greater than zero",
@@ -417,6 +424,23 @@ impl Config {
                 !token.trim().is_empty(),
                 "auth.api_tokens must not contain empty tokens",
             )?;
+            require(
+                !is_placeholder_token(token),
+                "auth.api_tokens must not contain a placeholder token",
+            )?;
+        }
+        if !api_addr.ip().is_loopback() {
+            require(
+                !self.auth.api_tokens.is_empty(),
+                "public daemon.api_bind requires at least one API token",
+            )?;
+            require(
+                self.auth
+                    .api_tokens
+                    .iter()
+                    .all(|token| token.trim().len() >= 16),
+                "public daemon.api_bind requires API tokens of at least 16 characters",
+            )?;
         }
         Ok(())
     }
@@ -446,6 +470,13 @@ fn require(condition: bool, message: impl Into<String>) -> Result<(), ConfigErro
     } else {
         Err(ConfigError::Validation(message.into()))
     }
+}
+
+fn is_placeholder_token(token: &str) -> bool {
+    matches!(
+        token.trim().to_ascii_lowercase().as_str(),
+        "change-me" | "changeme" | "replace-me" | "replace_with_random_token"
+    ) || token.trim().to_ascii_uppercase().contains("REPLACE_WITH")
 }
 
 fn default_session_dir() -> PathBuf {
@@ -556,6 +587,23 @@ mod tests {
         let mut c = Config::default();
         c.network.max_incoming_handshakes = 0;
         assert!(matches!(c.validate(), Err(ConfigError::Validation(_))));
+
+        let mut c = Config::default();
+        c.daemon.api_bind = "0.0.0.0:8080".to_owned();
+        assert!(matches!(c.validate(), Err(ConfigError::Validation(_))));
+
+        let mut c = Config::default();
+        c.daemon.api_bind = "0.0.0.0:8080".to_owned();
+        c.auth.api_tokens = vec!["REPLACE_WITH_RANDOM_TOKEN".to_owned()];
+        assert!(matches!(c.validate(), Err(ConfigError::Validation(_))));
+
+        let mut c = Config::default();
+        c.daemon.api_bind = "0.0.0.0:8080".to_owned();
+        c.auth.api_tokens = vec!["short-token".to_owned()];
+        assert!(matches!(c.validate(), Err(ConfigError::Validation(_))));
+
+        c.auth.api_tokens = vec!["a-real-random-token-1234".to_owned()];
+        c.validate().unwrap();
 
         let mut c = Config::default();
         c.tracker.allow_http_trackers = false;

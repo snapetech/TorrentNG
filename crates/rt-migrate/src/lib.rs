@@ -377,8 +377,9 @@ pub struct AuxiliaryArtifact {
     pub size: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResumeConfidence {
+    #[default]
     None,
     MetadataOnly,
     Hints,
@@ -391,12 +392,6 @@ pub struct ResumeConfidenceSummary {
     pub metadata_only: usize,
     pub hints: usize,
     pub trusted: usize,
-}
-
-impl Default for ResumeConfidence {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -435,21 +430,11 @@ impl TrackerActivity {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ImportOptions {
     pub default_save_path: Option<PathBuf>,
     pub path_remaps: Vec<PathRemap>,
     pub added_at: i64,
-}
-
-impl Default for ImportOptions {
-    fn default() -> Self {
-        Self {
-            default_save_path: None,
-            path_remaps: Vec::new(),
-            added_at: 0,
-        }
-    }
 }
 
 impl ImportOptions {
@@ -777,7 +762,7 @@ fn dry_run_session(
         if looks_like_aggregate_resume(path) {
             aggregate_resume_paths.push(path.clone());
         }
-        if extension_is(&path, resume_extensions) {
+        if extension_is(path, resume_extensions) {
             if let Some(stem) = path.file_stem().and_then(|value| value.to_str()) {
                 for key in resume_sidecar_keys(stem) {
                     resume_by_stem.insert(key, path.clone());
@@ -982,35 +967,40 @@ fn migration_torrent_from_path(
 
 fn migration_info_hash(meta: &TorrentMeta) -> String {
     match meta {
-        TorrentMeta::V1(meta) | TorrentMeta::Hybrid(meta, _) => hex_lower(&meta.info_hash),
+        TorrentMeta::V1(meta) => hex_lower(&meta.info_hash),
+        TorrentMeta::Hybrid(meta, _) => hex_lower(&meta.info_hash),
         TorrentMeta::V2(meta) => hex_lower(&meta.info_hash_v2),
     }
 }
 
 fn migration_total_length(meta: &TorrentMeta) -> u64 {
     match meta {
-        TorrentMeta::V1(meta) | TorrentMeta::Hybrid(meta, _) => meta.total_length(),
+        TorrentMeta::V1(meta) => meta.total_length(),
+        TorrentMeta::Hybrid(meta, _) => meta.total_length(),
         TorrentMeta::V2(meta) => meta.total_length(),
     }
 }
 
 fn migration_piece_length(meta: &TorrentMeta) -> u64 {
     match meta {
-        TorrentMeta::V1(meta) | TorrentMeta::Hybrid(meta, _) => meta.piece_length,
+        TorrentMeta::V1(meta) => meta.piece_length,
+        TorrentMeta::Hybrid(meta, _) => meta.piece_length,
         TorrentMeta::V2(meta) => meta.piece_length,
     }
 }
 
 fn migration_piece_count(meta: &TorrentMeta) -> u64 {
     match meta {
-        TorrentMeta::V1(meta) | TorrentMeta::Hybrid(meta, _) => meta.pieces.len() as u64,
+        TorrentMeta::V1(meta) => meta.pieces.len() as u64,
+        TorrentMeta::Hybrid(meta, _) => meta.pieces.len() as u64,
         TorrentMeta::V2(meta) => meta.total_length().div_ceil(meta.piece_length),
     }
 }
 
 fn migration_trackers(meta: &TorrentMeta) -> Vec<String> {
     match meta {
-        TorrentMeta::V1(meta) | TorrentMeta::Hybrid(meta, _) => meta.all_trackers(),
+        TorrentMeta::V1(meta) => meta.all_trackers(),
+        TorrentMeta::Hybrid(meta, _) => meta.all_trackers(),
         TorrentMeta::V2(meta) => {
             let mut out = Vec::new();
             if let Some(announce) = &meta.announce {
@@ -1035,7 +1025,20 @@ fn migration_files(meta: &TorrentMeta) -> Vec<MigrationFile> {
     // the fastresume hint fix, that could poison trust for every other file
     // in the same torrent.
     match meta {
-        TorrentMeta::V1(meta) | TorrentMeta::Hybrid(meta, _) => meta
+        TorrentMeta::V1(meta) => meta
+            .files
+            .iter()
+            .map(|file| MigrationFile {
+                index: file.index,
+                path: file.path.as_display(),
+                length: file.length,
+                offset: file.offset,
+                priority: if file.pad { 0 } else { 1 },
+                wanted: !file.pad,
+                completed_bytes: None,
+            })
+            .collect(),
+        TorrentMeta::Hybrid(meta, _) => meta
             .files
             .iter()
             .map(|file| MigrationFile {
@@ -1205,6 +1208,7 @@ fn bencode_resume_keys(info_hash: &str, file_stem: Option<&str>) -> Vec<Vec<u8>>
     keys
 }
 
+#[allow(clippy::field_reassign_with_default)]
 fn resume_from_json(value: &serde_json::Value) -> ResumeData {
     let mut resume = ResumeData::default();
     resume.save_path = first_json_string(
@@ -2256,7 +2260,7 @@ fn first_bencode_list(value: &BValue<'_>, keys: &[&[u8]]) -> Vec<String> {
                     .map(str::to_owned)
                     .collect(),
             ),
-            Some(bytes) => bytes.as_str().map(|tags| split_list(tags)),
+            Some(bytes) => bytes.as_str().map(split_list),
             None => None,
         })
         .unwrap_or_default()
@@ -2328,7 +2332,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 }
 
 fn decode_hex(value: &str) -> Option<Vec<u8>> {
-    if !value.len().is_multiple_of(2) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if value.len() % 2 != 0 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
     let mut out = Vec::with_capacity(value.len() / 2);
@@ -2409,7 +2413,8 @@ mod tests {
         torrent.sort_by(|a, b| a.0.cmp(b.0));
         std::fs::write(path, encode(&BValue::Dict(torrent))).unwrap();
         match parse_torrent(&std::fs::read(path).unwrap()).unwrap() {
-            TorrentMeta::V1(meta) | TorrentMeta::Hybrid(meta, _) => meta.info_hash,
+            TorrentMeta::V1(meta) => meta.info_hash,
+            TorrentMeta::Hybrid(meta, _) => meta.info_hash,
             TorrentMeta::V2(_) => unreachable!(),
         }
     }
@@ -2452,7 +2457,8 @@ mod tests {
         torrent.sort_by(|a, b| a.0.cmp(b.0));
         std::fs::write(path, encode(&BValue::Dict(torrent))).unwrap();
         match parse_torrent(&std::fs::read(path).unwrap()).unwrap() {
-            TorrentMeta::V1(meta) | TorrentMeta::Hybrid(meta, _) => meta.info_hash,
+            TorrentMeta::V1(meta) => meta.info_hash,
+            TorrentMeta::Hybrid(meta, _) => meta.info_hash,
             TorrentMeta::V2(_) => unreachable!(),
         }
     }
@@ -2498,7 +2504,8 @@ mod tests {
         torrent.sort_by(|a, b| a.0.cmp(b.0));
         std::fs::write(path, encode(&BValue::Dict(torrent))).unwrap();
         match parse_torrent(&std::fs::read(path).unwrap()).unwrap() {
-            TorrentMeta::V1(meta) | TorrentMeta::Hybrid(meta, _) => meta.info_hash,
+            TorrentMeta::V1(meta) => meta.info_hash,
+            TorrentMeta::Hybrid(meta, _) => meta.info_hash,
             TorrentMeta::V2(_) => unreachable!(),
         }
     }
@@ -2663,7 +2670,10 @@ mod tests {
                 b"qBt-savePath".as_slice(),
                 BValue::Bytes(dir.path().as_os_str().as_encoded_bytes()),
             ),
-            (b"file-format".as_slice(), BValue::Bytes(b"libtorrent resume file")),
+            (
+                b"file-format".as_slice(),
+                BValue::Bytes(b"libtorrent resume file"),
+            ),
             (b"file-version".as_slice(), BValue::Int(2)),
             (b"libtorrent-version".as_slice(), BValue::Bytes(b"2.1.1.0")),
             (b"pieces".as_slice(), BValue::Bytes(packed_pieces)),
@@ -3933,7 +3943,7 @@ mod tests {
             assert_eq!(torrent.completed, Some(true), "{source:?}");
             assert_eq!(torrent.paused, Some(true), "{source:?}");
             assert_eq!(torrent.files[0].priority, 2, "{source:?}");
-            assert_eq!(torrent.files[0].wanted, true, "{source:?}");
+            assert!(torrent.files[0].wanted, "{source:?}");
             assert_eq!(torrent.files[0].completed_bytes, Some(12), "{source:?}");
             assert_eq!(torrent.tracker_activity.seeders, Some(8), "{source:?}");
             assert_eq!(
@@ -4005,7 +4015,7 @@ mod tests {
             );
             let files = rt_db::list_torrent_files(&conn, &fixture.info_hash).unwrap();
             assert_eq!(files[0].priority, 2, "{:?}", case.source);
-            assert_eq!(files[0].wanted, true, "{:?}", case.source);
+            assert!(files[0].wanted, "{:?}", case.source);
             assert_eq!(files[0].completed_bytes, 12, "{:?}", case.source);
             let trackers = rt_db::list_torrent_trackers(&conn, &fixture.info_hash).unwrap();
             assert_eq!(trackers[0].seeders, Some(8), "{:?}", case.source);
@@ -4051,7 +4061,7 @@ mod tests {
             assert_eq!(torrent.completed, Some(true), "{source:?}");
             assert_eq!(torrent.paused, Some(true), "{source:?}");
             assert_eq!(torrent.files[0].priority, 2, "{source:?}");
-            assert_eq!(torrent.files[0].wanted, true, "{source:?}");
+            assert!(torrent.files[0].wanted, "{source:?}");
             assert_eq!(torrent.files[0].completed_bytes, Some(12), "{source:?}");
             assert_eq!(torrent.tracker_activity.seeders, Some(8), "{source:?}");
             assert_eq!(

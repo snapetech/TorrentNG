@@ -20,14 +20,16 @@ use rt_utp::UtpStream;
 use sha1::{Digest, Sha1};
 use tokio::net::TcpStream;
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit};
 use tokio::time::interval;
 use tokio_util::codec::Framed;
 use tracing::{debug, warn};
 use url::Url;
 
 use crate::command::EngineCmd;
-use crate::torrent_task::TorrentCmd;
+use crate::egress_policy::{OutboundEgressPolicy, OutboundTargetKind};
+use crate::network_budget::GlobalNetworkBudget;
+use crate::torrent_task::{bounded_response_body, TorrentCmd};
 
 const METADATA_PIECE_SIZE: usize = 16 * 1024;
 const MAX_METADATA_SIZE: u32 = 16 * 1024 * 1024;
@@ -67,6 +69,10 @@ fn parse_metadata_transport_policy(value: &str) -> MetadataTransportPolicy {
     }
 }
 
+// Metadata acquisition currently has separate transport, persistence, and
+// admission dependencies. Keep those boundaries explicit until the task
+// context object is introduced as part of the engine seam refactor.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_metadata_task(
     info_hash: [u8; 20],
     info_hash_hex: String,
@@ -79,6 +85,8 @@ pub async fn run_metadata_task(
     http_timeout_secs: u64,
     udp_timeout_secs: u64,
     paused: bool,
+    egress_policy: OutboundEgressPolicy,
+    network_budget: GlobalNetworkBudget,
 ) {
     let mut paused = paused;
     let mut peer_attempts = HashMap::new();
@@ -103,6 +111,7 @@ pub async fn run_metadata_task(
                             &mut peer_attempts,
                             &engine_tx,
                             &resources,
+                            &network_budget,
                         )
                         .await {
                             return;
@@ -112,10 +121,11 @@ pub async fn run_metadata_task(
                         stream,
                         peer_addr,
                         handshake,
+                        peer_permit,
                     } => if paused {
                         drop(stream);
                     } else {
-                        match fetch_from_incoming_peer(stream, peer_addr, info_hash, handshake, resources.clone()).await {
+                        match fetch_from_incoming_peer(stream, peer_addr, info_hash, handshake, resources.clone(), peer_permit).await {
                         Ok(info) => {
                             complete_metadata(&engine_tx, &info_hash_hex, &trackers, info).await;
                             return;
@@ -136,10 +146,11 @@ pub async fn run_metadata_task(
                         stream,
                         peer_addr,
                         handshake,
+                        peer_permit,
                     } => if paused {
                         drop(stream);
                     } else {
-                        match fetch_from_incoming_utp_peer(stream, peer_addr, info_hash, handshake, resources.clone()).await {
+                        match fetch_from_incoming_utp_peer(stream, peer_addr, info_hash, handshake, resources.clone(), peer_permit).await {
                             Ok(info) => {
                                 complete_metadata(&engine_tx, &info_hash_hex, &trackers, info).await;
                                 return;
@@ -168,6 +179,7 @@ pub async fn run_metadata_task(
                                 http_timeout,
                                 udp_timeout,
                                 TrackerEvent::Stopped,
+                                &egress_policy,
                             )
                             .await;
                         }
@@ -184,6 +196,7 @@ pub async fn run_metadata_task(
                                 http_timeout,
                                 udp_timeout,
                                 TrackerEvent::Stopped,
+                                &egress_policy,
                             )
                             .await;
                         }
@@ -225,6 +238,7 @@ pub async fn run_metadata_task(
                     http_timeout,
                     udp_timeout,
                     tracker_event,
+                    &egress_policy,
                 ).await;
                 if tracker_event == TrackerEvent::Started {
                     tracker_event = TrackerEvent::Empty;
@@ -238,6 +252,7 @@ pub async fn run_metadata_task(
                     &mut peer_attempts,
                     &engine_tx,
                     &resources,
+                    &network_budget,
                 )
                 .await {
                     return;
@@ -254,6 +269,7 @@ pub async fn run_metadata_task(
                         http_timeout,
                         udp_timeout,
                         TrackerEvent::Stopped,
+                        &egress_policy,
                     )
                     .await;
                 }
@@ -263,6 +279,7 @@ pub async fn run_metadata_task(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn try_fetch_from_peers(
     info_hash: [u8; 20],
     info_hash_hex: &str,
@@ -272,6 +289,7 @@ async fn try_fetch_from_peers(
     peer_attempts: &mut HashMap<SocketAddr, Instant>,
     engine_tx: &mpsc::Sender<EngineCmd>,
     resources: &ResourceGovernor,
+    network_budget: &GlobalNetworkBudget,
 ) -> bool {
     let mut candidates = metadata_fetch_candidates(
         peers,
@@ -286,7 +304,12 @@ async fn try_fetch_from_peers(
         let Some(peer) = candidates.pop_front() else {
             break;
         };
-        in_flight.push(metadata_fetch_attempt(peer, info_hash, resources.clone()));
+        in_flight.push(metadata_fetch_attempt(
+            peer,
+            info_hash,
+            resources.clone(),
+            network_budget.clone(),
+        ));
     }
 
     while let Some((peer, result)) = in_flight.next().await {
@@ -309,7 +332,12 @@ async fn try_fetch_from_peers(
         }
 
         if let Some(peer) = candidates.pop_front() {
-            in_flight.push(metadata_fetch_attempt(peer, info_hash, resources.clone()));
+            in_flight.push(metadata_fetch_attempt(
+                peer,
+                info_hash,
+                resources.clone(),
+                network_budget.clone(),
+            ));
         }
     }
 
@@ -385,30 +413,34 @@ async fn metadata_fetch_attempt(
     peer: SocketAddr,
     info_hash: [u8; 20],
     resources: ResourceGovernor,
+    network_budget: GlobalNetworkBudget,
 ) -> (SocketAddr, anyhow::Result<Vec<u8>>) {
-    let result = match metadata_outgoing_transport_policy() {
-        MetadataTransportPolicy::TcpOnly => {
-            fetch_from_outgoing_peer(peer, info_hash, resources).await
-        }
-        MetadataTransportPolicy::UtpOnly => {
-            fetch_from_outgoing_utp_peer(peer, info_hash, resources).await
-        }
-        MetadataTransportPolicy::PreferUtp => {
-            match fetch_from_outgoing_utp_peer(peer, info_hash, resources.clone()).await {
-                Ok(info) => Ok(info),
-                Err(e) => {
-                    debug!(
-                        component = "metadata",
-                        operation = "fetch_outgoing_utp_peer",
-                        peer = %peer,
-                        result = "fallback",
-                        error = %e,
-                        "uTP metadata fetch failed; falling back to TCP"
-                    );
-                    fetch_from_outgoing_peer(peer, info_hash, resources).await
+    let result = match network_budget.try_acquire_peer() {
+        Ok(_peer_permit) => match metadata_outgoing_transport_policy() {
+            MetadataTransportPolicy::TcpOnly => {
+                fetch_from_outgoing_peer(peer, info_hash, resources).await
+            }
+            MetadataTransportPolicy::UtpOnly => {
+                fetch_from_outgoing_utp_peer(peer, info_hash, resources).await
+            }
+            MetadataTransportPolicy::PreferUtp => {
+                match fetch_from_outgoing_utp_peer(peer, info_hash, resources.clone()).await {
+                    Ok(info) => Ok(info),
+                    Err(e) => {
+                        debug!(
+                            component = "metadata",
+                            operation = "fetch_outgoing_utp_peer",
+                            peer = %peer,
+                            result = "fallback",
+                            error = %e,
+                            "uTP metadata fetch failed; falling back to TCP"
+                        );
+                        fetch_from_outgoing_peer(peer, info_hash, resources).await
+                    }
                 }
             }
-        }
+        },
+        Err(_) => Err(anyhow::anyhow!("global peer connection budget exhausted")),
     };
     (peer, result)
 }
@@ -428,6 +460,7 @@ async fn complete_metadata(
         .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn announce_trackers(
     info_hash: [u8; 20],
     info_hash_hex: &str,
@@ -437,6 +470,7 @@ async fn announce_trackers(
     http_timeout: Duration,
     udp_timeout: Duration,
     event: TrackerEvent,
+    egress_policy: &OutboundEgressPolicy,
 ) -> Vec<SocketAddr> {
     let mut peers = Vec::new();
     let mut seen = HashSet::new();
@@ -450,6 +484,7 @@ async fn announce_trackers(
             http_timeout,
             udp_timeout,
             event,
+            egress_policy,
         )
         .await
         {
@@ -479,6 +514,11 @@ async fn announce_trackers(
     peers
 }
 
+// TNG-005: egress_policy is the 8th parameter, added so every tracker
+// announce path (this one and torrent_task's) routes through one
+// server-owned outbound policy rather than each having its own client.
+// Single call site (below) -- a context struct would be pure ceremony here.
+#[allow(clippy::too_many_arguments)]
 async fn announce_tracker(
     tracker_url: &str,
     info_hash: [u8; 20],
@@ -487,6 +527,7 @@ async fn announce_tracker(
     http_timeout: Duration,
     udp_timeout: Duration,
     event: TrackerEvent,
+    egress_policy: &OutboundEgressPolicy,
 ) -> Result<AnnounceResponse, TrackerError> {
     if tracker_url.starts_with("udp://") {
         announce_udp(
@@ -496,6 +537,7 @@ async fn announce_tracker(
             max_peers,
             udp_timeout,
             event,
+            egress_policy,
         )
         .await
     } else {
@@ -506,6 +548,7 @@ async fn announce_tracker(
             max_peers,
             http_timeout,
             event,
+            egress_policy,
         )
         .await
     }
@@ -518,36 +561,34 @@ async fn announce_http(
     max_peers: usize,
     http_timeout: Duration,
     event: TrackerEvent,
+    egress_policy: &OutboundEgressPolicy,
 ) -> Result<AnnounceResponse, TrackerError> {
-    if !tracker_url.starts_with("http://") && !tracker_url.starts_with("https://") {
-        return Err(TrackerError::Disabled);
-    }
+    let tracker =
+        Url::parse(tracker_url).map_err(|error| TrackerError::InvalidUrl(error.to_string()))?;
+    let client = egress_policy
+        .http_client(
+            OutboundTargetKind::Tracker,
+            &tracker,
+            http_timeout,
+            crate::peer_id::user_agent(),
+        )
+        .await
+        .map_err(|error| TrackerError::Network(error.to_string()))?;
     let req = metadata_announce_request(info_hash, listen_port, max_peers, event);
     let url = req.to_http_query(tracker_url)?;
-    let response = reqwest::Client::builder()
-        .timeout(http_timeout)
-        .user_agent(crate::peer_id::user_agent())
-        .build()
-        .map_err(|e| TrackerError::Network(e.to_string()))?
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| {
-            if e.is_timeout() {
-                TrackerError::Timeout
-            } else {
-                TrackerError::Network(e.to_string())
-            }
-        })?;
+    let response = client.get(url).send().await.map_err(|e| {
+        if e.is_timeout() {
+            TrackerError::Timeout
+        } else {
+            TrackerError::Network(e.to_string())
+        }
+    })?;
     if !response.status().is_success() {
         return Err(TrackerError::Http {
             status: response.status().as_u16(),
         });
     }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| TrackerError::Network(e.to_string()))?;
+    let bytes = bounded_response_body(response, 4 * 1024 * 1024).await?;
     AnnounceResponse::parse(&bytes)
 }
 
@@ -558,20 +599,17 @@ async fn announce_udp(
     max_peers: usize,
     udp_timeout: Duration,
     event: TrackerEvent,
+    egress_policy: &OutboundEgressPolicy,
 ) -> Result<AnnounceResponse, TrackerError> {
     let url = Url::parse(tracker_url).map_err(|e| TrackerError::InvalidUrl(e.to_string()))?;
-    let host = url
-        .host_str()
-        .ok_or_else(|| TrackerError::InvalidUrl("missing UDP tracker host".into()))?;
-    let port = url
-        .port()
-        .ok_or_else(|| TrackerError::InvalidUrl("missing UDP tracker port".into()))?;
-    let mut addrs = tokio::net::lookup_host((host, port))
+    let mut addrs = egress_policy
+        .resolve_and_validate(OutboundTargetKind::Tracker, &url, udp_timeout)
         .await
         .map_err(|e| TrackerError::Network(e.to_string()))?;
     let tracker_addr = addrs
+        .drain(..)
         .next()
-        .ok_or_else(|| TrackerError::Network(format!("no address for {host}:{port}")))?;
+        .ok_or_else(|| TrackerError::Network("no validated tracker address".to_owned()))?;
 
     let bind_addr = if tracker_addr.is_ipv4() {
         "0.0.0.0:0"
@@ -592,7 +630,7 @@ async fn announce_udp(
         .await
         .map_err(|e| TrackerError::Network(e.to_string()))?;
 
-    let mut buf = vec![0u8; 1500];
+    let mut buf = vec![0u8; 64 * 1024];
     let n = tokio::time::timeout(udp_timeout, socket.recv(&mut buf))
         .await
         .map_err(|_| TrackerError::Timeout)?
@@ -681,6 +719,7 @@ async fn fetch_from_incoming_peer(
     info_hash: [u8; 20],
     remote_hs: Handshake,
     resources: ResourceGovernor,
+    _peer_permit: OwnedSemaphorePermit,
 ) -> anyhow::Result<Vec<u8>> {
     stream.set_nodelay(true)?;
     let mut framed = Framed::new(stream, PeerCodec);
@@ -723,6 +762,7 @@ async fn fetch_from_incoming_utp_peer(
     info_hash: [u8; 20],
     remote_hs: Handshake,
     resources: ResourceGovernor,
+    _peer_permit: OwnedSemaphorePermit,
 ) -> anyhow::Result<Vec<u8>> {
     write_utp_handshake(&mut stream, info_hash).await?;
     fetch_metadata_over_io(
@@ -1238,6 +1278,7 @@ mod tests {
                 &mut attempts,
                 &engine_tx,
                 &governor,
+                &GlobalNetworkBudget::unlimited(),
             )
             .await
         );

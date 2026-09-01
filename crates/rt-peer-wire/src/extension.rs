@@ -50,13 +50,13 @@ impl ExtensionHandshake {
             .iter()
             .map(|(name, id)| (name.as_bytes(), BValue::Int(i64::from(*id))))
             .collect::<Vec<_>>();
-        extension_pairs.sort_by(|(a, _), (b, _)| a.cmp(b));
+        extension_pairs.sort_by_key(|(name, _)| *name);
 
         let mut pairs = vec![(b"m".as_slice(), BValue::Dict(extension_pairs))];
         if let Some(size) = self.metadata_size {
             pairs.push((b"metadata_size".as_slice(), BValue::Int(i64::from(size))));
         }
-        pairs.sort_by(|(a, _), (b, _)| a.cmp(b));
+        pairs.sort_by_key(|(name, _)| *name);
         encode(&BValue::Dict(pairs))
     }
 
@@ -174,7 +174,7 @@ fn metadata_header(msg_type: i64, piece: u32, total_size: Option<u32>) -> Vec<u8
     if let Some(total_size) = total_size {
         pairs.push((b"total_size".as_slice(), BValue::Int(i64::from(total_size))));
     }
-    pairs.sort_by(|(a, _), (b, _)| a.cmp(b));
+    pairs.sort_by_key(|(name, _)| *name);
     encode(&BValue::Dict(pairs))
 }
 

@@ -130,7 +130,11 @@ impl TorrentBackend for TorrentngBackend {
     }
 
     async fn list_torrents(&self) -> Result<Vec<RawTorrent>> {
-        let torrents: Vec<Value> = self.get_json("api/v1/torrents").await?;
+        let body: Value = self.get_json("api/v1/torrents").await?;
+        let torrents = body
+            .get("torrents")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("TorrentNG list response missing torrents array"))?;
         Ok(torrents.iter().map(map_summary).collect())
     }
 

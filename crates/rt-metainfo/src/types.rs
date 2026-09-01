@@ -6,7 +6,7 @@ pub enum TorrentMeta {
     V1(TorrentMetaV1),
     V2(TorrentMetaV2),
     /// Both v1 SHA-1 and v2 SHA-256 infohashes are valid; clients can use either.
-    Hybrid(TorrentMetaV1, TorrentMetaV2),
+    Hybrid(Box<TorrentMetaV1>, TorrentMetaV2),
 }
 
 impl TorrentMeta {

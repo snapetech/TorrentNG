@@ -27,7 +27,9 @@ pub enum DhtCommand {
     GetStats {
         reply: oneshot::Sender<DhtRuntimeStats>,
     },
-    Shutdown,
+    Shutdown {
+        reply: oneshot::Sender<()>,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -146,13 +148,14 @@ impl DhtTask {
             DhtCommand::GetStats { reply } => {
                 let _ = reply.send(self.runtime_stats());
             }
-            DhtCommand::Shutdown => {
+            DhtCommand::Shutdown { reply } => {
                 info!(
                     component = "dht",
                     operation = "shutdown",
                     result = "ok",
                     "DHT task shutting down"
                 );
+                let _ = reply.send(());
                 return false;
             }
         }
@@ -399,7 +402,8 @@ impl DhtTask {
             || self
                 .last_full_lookup
                 .get(&info_hash)
-                .is_none_or(|last| now.duration_since(*last) >= DHT_LOOKUP_RESTART_AFTER);
+                .map(|last| now.duration_since(*last) >= DHT_LOOKUP_RESTART_AFTER)
+                .unwrap_or(true);
         if should_restart {
             self.queried_nodes.remove(&info_hash);
             self.last_full_lookup.insert(info_hash, now);

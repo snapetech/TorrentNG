@@ -7,6 +7,7 @@ const WINDOWS_RESERVED: &[&str] = &[
     "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
     "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 ];
+const MAX_COMPONENT_BYTES: usize = 4096;
 
 /// A validated, sanitized, storage-root-relative path.
 ///
@@ -67,14 +68,26 @@ fn validate_component(s: &str, check_windows_reserved: bool) -> Result<(), PathE
     if s.is_empty() {
         return Err(PathError::EmptyComponent);
     }
+    if s.len() > MAX_COMPONENT_BYTES {
+        return Err(PathError::ComponentTooLong {
+            len: s.len(),
+            max: MAX_COMPONENT_BYTES,
+        });
+    }
     if s.contains('\0') {
         return Err(PathError::NulByte);
     }
     if s == ".." {
         return Err(PathError::ParentTraversal(s.to_owned()));
     }
-    if s.starts_with('/') || s.starts_with('\\') {
-        return Err(PathError::AbsolutePath(s.to_owned()));
+    if s == "." {
+        return Err(PathError::IllegalCharacter('.'));
+    }
+    if let Some(separator) = s
+        .chars()
+        .find(|character| *character == '/' || *character == '\\')
+    {
+        return Err(PathError::IllegalCharacter(separator));
     }
     // Reject any component that would be treated as absolute on any platform
     if s.len() >= 2 && s.as_bytes()[1] == b':' {
@@ -113,6 +126,22 @@ mod tests {
     #[test]
     fn reject_absolute_unix() {
         assert!(SafeRelPath::from_components(&["/etc/passwd"], false).is_err());
+    }
+
+    #[test]
+    fn reject_embedded_separators_and_current_directory() {
+        assert!(SafeRelPath::from_components(&["nested/file"], false).is_err());
+        assert!(SafeRelPath::from_components(&["nested\\file"], false).is_err());
+        assert!(SafeRelPath::from_components(&["."], false).is_err());
+    }
+
+    #[test]
+    fn reject_oversized_component() {
+        let component = "x".repeat(MAX_COMPONENT_BYTES + 1);
+        assert!(matches!(
+            SafeRelPath::from_components(&[component], false),
+            Err(PathError::ComponentTooLong { .. })
+        ));
     }
 
     #[test]

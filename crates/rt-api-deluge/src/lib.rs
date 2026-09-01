@@ -6,7 +6,15 @@ use std::{
     sync::Arc,
 };
 
-use axum::{extract::State, response::IntoResponse, routing::post, Json, Router};
+use axum::{
+    body::{to_bytes, Body},
+    extract::State,
+    http::{header, Request, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::post,
+    Json, Router,
+};
 use base64::{engine::general_purpose, Engine as _};
 use rt_engine::{
     EngineHandle, EnginePeerSnapshot, EngineTorrentLimits, EngineTorrentMetadata,
@@ -23,6 +31,7 @@ use tokio::sync::RwLock;
 pub struct AppState {
     pub registry: Arc<RwLock<SessionRegistry>>,
     pub engine: Option<EngineHandle>,
+    pub api_tokens: Arc<Vec<String>>,
     pub torrent_options: Arc<RwLock<HashMap<String, EngineTorrentLimits>>>,
     pub move_completed_options: Arc<RwLock<HashMap<String, DelugeMoveCompletedOptions>>>,
     pub url_downloads: Arc<RwLock<HashMap<String, String>>>,
@@ -43,6 +52,7 @@ impl AppState {
         Self {
             registry,
             engine: None,
+            api_tokens: Arc::new(Vec::new()),
             torrent_options: Arc::new(RwLock::new(HashMap::new())),
             move_completed_options: Arc::new(RwLock::new(HashMap::new())),
             url_downloads: Arc::new(RwLock::new(HashMap::new())),
@@ -54,9 +64,18 @@ impl AppState {
     }
 
     pub fn with_engine(registry: Arc<RwLock<SessionRegistry>>, engine: EngineHandle) -> Self {
+        Self::with_engine_and_tokens(registry, engine, Vec::new())
+    }
+
+    pub fn with_engine_and_tokens(
+        registry: Arc<RwLock<SessionRegistry>>,
+        engine: EngineHandle,
+        api_tokens: Vec<String>,
+    ) -> Self {
         Self {
             registry,
             engine: Some(engine),
+            api_tokens: Arc::new(api_tokens),
             torrent_options: Arc::new(RwLock::new(HashMap::new())),
             move_completed_options: Arc::new(RwLock::new(HashMap::new())),
             url_downloads: Arc::new(RwLock::new(HashMap::new())),
@@ -102,7 +121,61 @@ pub fn build_deluge_router(state: AppState) -> Router {
     Router::new()
         .route("/json", post(json_rpc))
         .route("/deluge/json", post(json_rpc))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            deluge_auth_guard,
+        ))
         .with_state(state)
+}
+
+async fn deluge_auth_guard(
+    State(state): State<AppState>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    if state.api_tokens.is_empty()
+        || request_token(&req)
+            .is_some_and(|token| state.api_tokens.iter().any(|allowed| allowed == &token))
+    {
+        return next.run(req).await;
+    }
+
+    let (parts, body) = req.into_parts();
+    let body = match to_bytes(body, 1024 * 1024).await {
+        Ok(body) => body,
+        Err(_) => {
+            return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+        }
+    };
+    let login_token = serde_json::from_slice::<JsonRpcRequest>(&body)
+        .ok()
+        .filter(|request| request.method == "auth.login")
+        .and_then(|request| {
+            request
+                .params
+                .first()
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+        });
+    let req = Request::from_parts(parts, Body::from(body));
+    if login_token.is_some_and(|token| state.api_tokens.iter().any(|allowed| allowed == &token)) {
+        return next.run(req).await;
+    }
+
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::CONTENT_TYPE, "application/json")],
+        r#"{"error":{"message":"authentication required","code":1}}"#,
+    )
+        .into_response()
+}
+
+fn request_token(req: &Request<Body>) -> Option<String> {
+    req.headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::to_owned)
 }
 
 pub async fn json_rpc(
@@ -1524,7 +1597,7 @@ fn deluge_tracker_status(tracker: &EngineTrackerSnapshot) -> String {
         "error" => "Error".to_owned(),
         "warning" => "Warning".to_owned(),
         "pending" => "Announce pending".to_owned(),
-        status if status.is_empty() => String::new(),
+        "" => String::new(),
         status => status.to_owned(),
     }
 }
@@ -2144,6 +2217,46 @@ mod tests {
     use axum::{body::Body, http::Request};
     use rt_session::TorrentEntry;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn deluge_router_enforces_configured_token_and_preserves_login_body() {
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        let mut state = AppState::new(Arc::clone(&registry));
+        state.api_tokens = Arc::new(vec!["secret".to_owned()]);
+        let app = build_deluge_router(state);
+
+        let denied = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/json")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"id":1,"method":"daemon.info","params":[]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let login = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/json")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"id":1,"method":"auth.login","params":["secret"]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(login.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["result"], true);
+    }
 
     #[tokio::test]
     async fn deluge_update_ui_projects_registry() {

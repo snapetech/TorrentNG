@@ -112,7 +112,8 @@ struct Iso {
 
 fn parse_hash(raw: &[u8]) -> [u8; 20] {
     match parse_torrent(raw).unwrap() {
-        TorrentMeta::V1(m) | TorrentMeta::Hybrid(m, _) => m.info_hash,
+        TorrentMeta::V1(m) => m.info_hash,
+        TorrentMeta::Hybrid(m, _) => m.info_hash,
         TorrentMeta::V2(_) => unreachable!(),
     }
 }

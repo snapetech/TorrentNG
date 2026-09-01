@@ -73,7 +73,7 @@ fn move_import_delete_executor_runs_on_configured_storage_root() {
         available_bytes: None,
         dry_run: false,
     });
-    execute_storage_plan_under_roots(&move_plan, &[root.clone()]).unwrap();
+    execute_storage_plan_under_roots(&move_plan, std::slice::from_ref(&root)).unwrap();
     assert!(!source.exists());
     assert_eq!(read_tree_len(&moved), expected_bytes);
 
@@ -85,7 +85,7 @@ fn move_import_delete_executor_runs_on_configured_storage_root() {
         hardlink_or_copy: true,
         dry_run: false,
     });
-    execute_storage_plan_under_roots(&import_plan, &[root.clone()]).unwrap();
+    execute_storage_plan_under_roots(&import_plan, std::slice::from_ref(&root)).unwrap();
     assert_eq!(read_tree_len(&moved), expected_bytes);
     assert_eq!(read_tree_len(&imported), expected_bytes);
 
@@ -95,7 +95,7 @@ fn move_import_delete_executor_runs_on_configured_storage_root() {
         dry_run: false,
         dry_run_approved: true,
     });
-    execute_storage_plan_under_roots(&delete_plan, &[root.clone()]).unwrap();
+    execute_storage_plan_under_roots(&delete_plan, std::slice::from_ref(&root)).unwrap();
     assert!(!imported.exists());
 
     println!(

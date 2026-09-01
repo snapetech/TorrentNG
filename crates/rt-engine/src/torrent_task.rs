@@ -15,7 +15,7 @@ use rt_bencode::{decode, BValue};
 use rusqlite::Connection;
 use tokio::net::TcpStream;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, RwLock};
 use tokio::time::{interval, sleep};
 use tokio_util::codec::Framed;
 use tracing::{debug, info, warn};
@@ -53,6 +53,8 @@ use rt_tracker::{
 };
 use rt_utp::UtpStream;
 
+use crate::egress_policy::{OutboundEgressPolicy, OutboundTargetKind};
+use crate::network_budget::{GlobalNetworkBudget, SharedRateLimiter};
 use crate::{
     EngineGlobalLimits, EnginePeerSnapshot, EngineTorrentLimits, EngineWebseedSnapshot,
     TorrentRuntimeStats,
@@ -61,6 +63,10 @@ use crate::{
 const LOCAL_UT_METADATA_ID: u8 = 1;
 const LOCAL_UT_PEX_ID: u8 = 2;
 const METADATA_PIECE_SIZE: usize = 16 * 1024;
+const MAX_TRACKER_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const PEER_UPLOAD_REQUEST_WINDOW: Duration = Duration::from_secs(10);
+const MAX_PEER_UPLOAD_REQUESTS_PER_WINDOW: u32 = 256;
 
 /// Messages from the engine to a running torrent task.
 #[derive(Debug)]
@@ -97,12 +103,14 @@ pub enum TorrentCmd {
         stream: TcpStream,
         peer_addr: SocketAddr,
         handshake: Handshake,
+        peer_permit: OwnedSemaphorePermit,
     },
     /// An inbound uTP peer whose handshake already matched this torrent.
     AcceptUtpPeer {
         stream: UtpStream,
         peer_addr: SocketAddr,
         handshake: Handshake,
+        peer_permit: OwnedSemaphorePermit,
     },
 }
 
@@ -140,6 +148,7 @@ fn memory_aware_request_pipeline(piece_assembly_bytes: usize, soft_cap_bytes: us
     }
 }
 
+#[cfg(test)]
 fn stricter_limit(torrent_limit: Option<u64>, global_limit: Option<u64>) -> Option<u64> {
     match (torrent_limit, global_limit) {
         (Some(torrent), Some(global)) => Some(torrent.min(global)),
@@ -357,12 +366,19 @@ struct PeerHandle {
     choked: bool,
     upload_choked: bool,
     interested: bool,
+    downloaded: u64,
+    uploaded: u64,
+    download_rate: f64,
     upload_rate: f64,
+    download_rate_window: u64,
+    upload_rate_window: u64,
+    rate_window_started: Instant,
     outstanding: usize,
     requested: Vec<BlockRequest>,
     ut_metadata_id: Option<u8>,
     ut_pex_id: Option<u8>,
     metadata_size: Option<u32>,
+    _peer_permit: OwnedSemaphorePermit,
 }
 
 #[derive(Debug)]
@@ -386,6 +402,7 @@ struct UploadContext {
     is_private: bool,
     pex_enabled: bool,
     upload_limit_bytes_per_sec: Option<u64>,
+    global_upload: Arc<SharedRateLimiter>,
 }
 
 struct LeasedUploadBlock {
@@ -411,6 +428,7 @@ pub struct TorrentTask {
     registry: Arc<RwLock<SessionRegistry>>,
     db: Arc<Mutex<Connection>>,
     resources: ResourceGovernor,
+    network_budget: GlobalNetworkBudget,
     cmd_rx: mpsc::Receiver<TorrentCmd>,
     peer_event_tx: mpsc::Sender<PeerEvent>,
     peer_event_rx: mpsc::Receiver<PeerEvent>,
@@ -421,7 +439,7 @@ pub struct TorrentTask {
     known_tracker_peers: HashSet<SocketAddr>,
     allowed_private_peers: HashSet<SocketAddr>,
     last_peerless_reannounce: Option<Instant>,
-    webseed_client: reqwest::Client,
+    egress_policy: OutboundEgressPolicy,
     webseed_next_index: usize,
     webseed_failures: Vec<u8>,
     webseed_last_rates: Vec<i64>,
@@ -449,11 +467,16 @@ pub struct TorrentTask {
     prepared_files: Mutex<HashSet<u32>>,
     paused: bool,
     max_peers: usize,
+    torrent_max_peers: Option<usize>,
     pex_enabled: bool,
 }
 
 impl TorrentTask {
-    pub fn new(
+    // This constructor is the current dependency-injection seam for a
+    // torrent actor. It is intentionally explicit while the actor context is
+    // being split into storage/network/persistence components.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
         meta: TorrentMetaV1,
         save_root: PathBuf,
         paused: bool,
@@ -470,6 +493,8 @@ impl TorrentTask {
         piece_assembly_cap_bytes: usize,
         storage_io: StorageIoConfig,
         pex_enabled: bool,
+        egress_policy: OutboundEgressPolicy,
+        network_budget: GlobalNetworkBudget,
     ) -> Self {
         let (peer_event_tx, peer_event_rx) = mpsc::channel(512);
         let total = meta.total_length();
@@ -527,6 +552,7 @@ impl TorrentTask {
             registry,
             db,
             resources,
+            network_budget,
             cmd_rx,
             peer_event_tx,
             peer_event_rx,
@@ -536,10 +562,7 @@ impl TorrentTask {
             known_tracker_peers: HashSet::new(),
             allowed_private_peers: HashSet::new(),
             last_peerless_reannounce: None,
-            webseed_client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(http_timeout_secs.max(1)))
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+            egress_policy,
             webseed_next_index: 0,
             webseed_failures,
             webseed_last_rates,
@@ -569,6 +592,7 @@ impl TorrentTask {
             prepared_files: Mutex::new(HashSet::new()),
             paused,
             max_peers,
+            torrent_max_peers: None,
             pex_enabled,
         };
         task.apply_file_policy_from_db();
@@ -650,18 +674,22 @@ impl TorrentTask {
                             stream,
                             peer_addr,
                             handshake,
+                            peer_permit,
                         } => {
                             if !self.paused {
-                                self.accept_peer(stream, peer_addr, handshake).await;
+                                self.accept_peer(stream, peer_addr, handshake, peer_permit)
+                                    .await;
                             }
                         }
                         TorrentCmd::AcceptUtpPeer {
                             stream,
                             peer_addr,
                             handshake,
+                            peer_permit,
                         } => {
                             if !self.paused {
-                                self.accept_utp_peer(stream, peer_addr, handshake).await;
+                                self.accept_utp_peer(stream, peer_addr, handshake, peer_permit)
+                                    .await;
                             }
                         }
                         TorrentCmd::Recheck { job_id } => {
@@ -709,10 +737,8 @@ impl TorrentTask {
                     }
                 }
 
-                _ = webseed_tick.tick() => {
-                    if !self.paused {
-                        self.download_next_webseed_block().await;
-                    }
+                _ = webseed_tick.tick(), if !self.paused && !self.meta.webseeds.is_empty() && !self.picker.is_complete() => {
+                    self.download_next_webseed_block().await;
                 }
             }
         }
@@ -720,7 +746,7 @@ impl TorrentTask {
 
     async fn connect_peers(&mut self, addrs: Vec<SocketAddr>, source: PeerSource) {
         for addr in addrs {
-            if self.active_peers.len() >= self.max_peers {
+            if self.active_peers.len() >= self.peer_capacity() {
                 break;
             }
             if !self.peer_source_allowed(addr) {
@@ -734,8 +760,16 @@ impl TorrentTask {
             if self.active_peers.contains_key(&addr) {
                 continue;
             }
+            let Ok(peer_permit) = self.network_budget.try_acquire_peer() else {
+                debug!(
+                    torrent = %self.info_hash_hex,
+                    peer = %addr,
+                    "global peer connection budget exhausted"
+                );
+                break;
+            };
             let info_hash = self.meta.info_hash;
-            let peer_cmd_rx = self.register_peer(addr);
+            let peer_cmd_rx = self.register_peer(addr, peer_permit);
             let peer_event_tx = self.peer_event_tx.clone();
             let upload = self.upload_context(addr);
             let transport_policy = outgoing_transport_policy_for_peer(
@@ -780,10 +814,10 @@ impl TorrentTask {
             if self.active_peers.contains_key(&addr) {
                 continue;
             }
-            if self.active_peers.len() >= self.max_peers {
+            if self.active_peers.len() >= self.peer_capacity() {
                 self.drop_replaceable_peer(&preferred).await;
             }
-            if self.active_peers.len() >= self.max_peers {
+            if self.active_peers.len() >= self.peer_capacity() {
                 break;
             }
             self.connect_peers(vec![addr], PeerSource::Manual).await;
@@ -937,9 +971,18 @@ impl TorrentTask {
         tracker_url: &str,
         event: TrackerEvent,
     ) -> Result<AnnounceResponse, TrackerError> {
-        if !tracker_url.starts_with("http://") && !tracker_url.starts_with("https://") {
-            return Err(TrackerError::Disabled);
-        }
+        let tracker =
+            Url::parse(tracker_url).map_err(|error| TrackerError::InvalidUrl(error.to_string()))?;
+        let client = self
+            .egress_policy
+            .http_client(
+                OutboundTargetKind::Tracker,
+                &tracker,
+                self.http_timeout,
+                crate::peer_id::user_agent(),
+            )
+            .await
+            .map_err(|error| TrackerError::Network(error.to_string()))?;
 
         let (uploaded, downloaded) = self.transfer_snapshot().await;
         let req = AnnounceRequest {
@@ -951,33 +994,22 @@ impl TorrentTask {
             left: self.picker.bytes_left(),
             event,
             compact: true,
-            numwant: Some(self.max_peers as u32),
+            numwant: Some(self.peer_capacity() as u32),
         };
         let url = req.to_http_query(tracker_url)?;
-        let response = reqwest::Client::builder()
-            .timeout(self.http_timeout)
-            .user_agent(crate::peer_id::user_agent())
-            .build()
-            .map_err(|e| TrackerError::Network(e.to_string()))?
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    TrackerError::Timeout
-                } else {
-                    TrackerError::Network(e.to_string())
-                }
-            })?;
+        let response = client.get(url).send().await.map_err(|e| {
+            if e.is_timeout() {
+                TrackerError::Timeout
+            } else {
+                TrackerError::Network(e.to_string())
+            }
+        })?;
         if !response.status().is_success() {
             return Err(TrackerError::Http {
                 status: response.status().as_u16(),
             });
         }
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| TrackerError::Network(e.to_string()))?;
+        let bytes = bounded_response_body(response, MAX_TRACKER_RESPONSE_BYTES).await?;
         AnnounceResponse::parse(&bytes)
     }
 
@@ -999,18 +1031,15 @@ impl TorrentTask {
         event: TrackerEvent,
     ) -> Result<AnnounceResponse, TrackerError> {
         let url = Url::parse(tracker_url).map_err(|e| TrackerError::InvalidUrl(e.to_string()))?;
-        let host = url
-            .host_str()
-            .ok_or_else(|| TrackerError::InvalidUrl("missing UDP tracker host".into()))?;
-        let port = url
-            .port()
-            .ok_or_else(|| TrackerError::InvalidUrl("missing UDP tracker port".into()))?;
-        let mut addrs = tokio::net::lookup_host((host, port))
+        let mut addrs = self
+            .egress_policy
+            .resolve_and_validate(OutboundTargetKind::Tracker, &url, self.udp_timeout)
             .await
-            .map_err(|e| TrackerError::Network(e.to_string()))?;
+            .map_err(|error| TrackerError::Network(error.to_string()))?;
         let tracker_addr = addrs
+            .drain(..)
             .next()
-            .ok_or_else(|| TrackerError::Network(format!("no address for {host}:{port}")))?;
+            .ok_or_else(|| TrackerError::Network("no tracker address resolved".to_owned()))?;
 
         let bind_addr = if tracker_addr.is_ipv4() {
             "0.0.0.0:0"
@@ -1031,7 +1060,7 @@ impl TorrentTask {
             .await
             .map_err(|e| TrackerError::Network(e.to_string()))?;
 
-        let mut buf = vec![0u8; 1500];
+        let mut buf = vec![0u8; 64 * 1024];
         let n = tokio::time::timeout(self.udp_timeout, socket.recv(&mut buf))
             .await
             .map_err(|_| TrackerError::Timeout)?
@@ -1051,7 +1080,7 @@ impl TorrentTask {
             left: self.picker.bytes_left(),
             event,
             compact: true,
-            numwant: Some(self.max_peers as u32),
+            numwant: Some(self.peer_capacity() as u32),
         };
         let announce = UdpAnnounceRequest::new(connect_resp.connection_id, req);
         let encoded = announce.encode()?;
@@ -1081,14 +1110,21 @@ impl TorrentTask {
     }
 
     async fn scrape_tracker(&self, tracker_url: &str) -> Result<ScrapeStats, TrackerError> {
-        if !tracker_url.starts_with("http://") && !tracker_url.starts_with("https://") {
-            return Err(TrackerError::Disabled);
-        }
+        let tracker =
+            Url::parse(tracker_url).map_err(|error| TrackerError::InvalidUrl(error.to_string()))?;
+        let client = self
+            .egress_policy
+            .http_client(
+                OutboundTargetKind::Tracker,
+                &tracker,
+                self.http_timeout,
+                crate::peer_id::user_agent(),
+            )
+            .await
+            .map_err(|error| TrackerError::Network(error.to_string()))?;
         let url = to_http_scrape_url(tracker_url, InfoHash::V1(self.meta.info_hash))?;
-        let resp = reqwest::Client::new()
+        let resp = client
             .get(url)
-            .header(reqwest::header::USER_AGENT, crate::peer_id::user_agent())
-            .timeout(self.http_timeout)
             .send()
             .await
             .map_err(|e| TrackerError::Network(e.to_string()))?;
@@ -1098,10 +1134,7 @@ impl TorrentTask {
                 status: status.as_u16(),
             });
         }
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| TrackerError::Network(e.to_string()))?;
+        let body = bounded_response_body(resp, MAX_TRACKER_RESPONSE_BYTES).await?;
         ScrapeStats::parse(&body, &self.meta.info_hash)
     }
 
@@ -1110,8 +1143,11 @@ impl TorrentTask {
         stream: TcpStream,
         peer_addr: SocketAddr,
         handshake: Handshake,
+        peer_permit: OwnedSemaphorePermit,
     ) {
-        if self.active_peers.len() >= self.max_peers || self.active_peers.contains_key(&peer_addr) {
+        if self.active_peers.len() >= self.peer_capacity()
+            || self.active_peers.contains_key(&peer_addr)
+        {
             return;
         }
         if !self.peer_source_allowed(peer_addr) {
@@ -1123,7 +1159,7 @@ impl TorrentTask {
             return;
         }
         let info_hash = self.meta.info_hash;
-        let peer_cmd_rx = self.register_peer(peer_addr);
+        let peer_cmd_rx = self.register_peer(peer_addr, peer_permit);
         let peer_event_tx = self.peer_event_tx.clone();
         let upload = self.upload_context(peer_addr);
         tokio::spawn(async move {
@@ -1162,8 +1198,11 @@ impl TorrentTask {
         stream: UtpStream,
         peer_addr: SocketAddr,
         handshake: Handshake,
+        peer_permit: OwnedSemaphorePermit,
     ) {
-        if self.active_peers.len() >= self.max_peers || self.active_peers.contains_key(&peer_addr) {
+        if self.active_peers.len() >= self.peer_capacity()
+            || self.active_peers.contains_key(&peer_addr)
+        {
             return;
         }
         if !self.peer_source_allowed(peer_addr) {
@@ -1175,7 +1214,7 @@ impl TorrentTask {
             return;
         }
         let info_hash = self.meta.info_hash;
-        let peer_cmd_rx = self.register_peer(peer_addr);
+        let peer_cmd_rx = self.register_peer(peer_addr, peer_permit);
         let peer_event_tx = self.peer_event_tx.clone();
         let upload = self.upload_context(peer_addr);
         tokio::spawn(async move {
@@ -1226,10 +1265,15 @@ impl TorrentTask {
             is_private: self.meta.private,
             pex_enabled: self.pex_enabled,
             upload_limit_bytes_per_sec: self.upload_limit_bytes_per_sec,
+            global_upload: self.network_budget.upload(),
         }
     }
 
-    fn register_peer(&mut self, addr: SocketAddr) -> mpsc::Receiver<PeerCommand> {
+    fn register_peer(
+        &mut self,
+        addr: SocketAddr,
+        peer_permit: OwnedSemaphorePermit,
+    ) -> mpsc::Receiver<PeerCommand> {
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         self.active_peers.insert(
             addr,
@@ -1240,12 +1284,19 @@ impl TorrentTask {
                 choked: true,
                 upload_choked: true,
                 interested: false,
+                downloaded: 0,
+                uploaded: 0,
+                download_rate: 0.0,
                 upload_rate: 0.0,
+                download_rate_window: 0,
+                upload_rate_window: 0,
+                rate_window_started: Instant::now(),
                 outstanding: 0,
                 requested: Vec::new(),
                 ut_metadata_id: None,
                 ut_pex_id: None,
                 metadata_size: None,
+                _peer_permit: peer_permit,
             },
         );
         cmd_rx
@@ -1271,10 +1322,10 @@ impl TorrentTask {
                     pieces,
                     pieces_total,
                     progress,
-                    download_rate: 0,
-                    upload_rate: peer.upload_rate.max(0.0).round() as i64,
-                    downloaded: 0,
-                    uploaded: 0,
+                    download_rate: peer_rate(peer.download_rate, peer.rate_window_started),
+                    upload_rate: peer_rate(peer.upload_rate, peer.rate_window_started),
+                    downloaded: peer.downloaded,
+                    uploaded: peer.uploaded,
                 }
             })
             .collect()
@@ -1378,7 +1429,7 @@ impl TorrentTask {
         if self.active_peers.is_empty() {
             self.schedule_peerless_reannounce();
         }
-        if self.active_peers.len() >= self.max_peers || self.known_tracker_peers.is_empty() {
+        if self.active_peers.len() >= self.peer_capacity() || self.known_tracker_peers.is_empty() {
             return;
         }
         info!(
@@ -1533,11 +1584,20 @@ impl TorrentTask {
         url: &Url,
         req: BlockRequest,
     ) -> anyhow::Result<bytes::Bytes> {
+        let client = self
+            .egress_policy
+            .http_client(
+                OutboundTargetKind::Webseed,
+                url,
+                self.http_timeout,
+                crate::peer_id::user_agent(),
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
         let _lease = reserve_webseed_body_bytes(&self.resources, req.length)?;
         let start = req.piece as u64 * self.meta.piece_length + req.begin as u64;
         let end = start + req.length as u64 - 1;
-        let response = self
-            .webseed_client
+        let response = client
             .get(url.clone())
             .header(RANGE, format!("bytes={start}-{end}"))
             .send()
@@ -1545,7 +1605,9 @@ impl TorrentTask {
         if !response.status().is_success() {
             anyhow::bail!("HTTP {}", response.status());
         }
-        let bytes = response.bytes().await?;
+        let bytes = bounded_response_body(response, req.length as usize)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
         if bytes.len() != req.length as usize {
             anyhow::bail!(
                 "expected {} bytes, received {} bytes",
@@ -1553,7 +1615,7 @@ impl TorrentTask {
                 bytes.len()
             );
         }
-        Ok(bytes)
+        Ok(bytes.into())
     }
 
     fn schedule_peerless_reannounce(&mut self) {
@@ -1631,13 +1693,14 @@ impl TorrentTask {
                 if let Some(handle) = self.active_peers.get_mut(&peer) {
                     handle.outstanding = handle.outstanding.saturating_sub(1);
                     remove_requested_block(&mut handle.requested, block.piece, block.offset);
+                    record_peer_transfer(handle, false, block.data.len() as u64);
                 }
                 self.handle_block(block).await;
                 self.refill_peer_requests(peer).await;
             }
             PeerEvent::Uploaded { peer, bytes } => {
                 if let Some(handle) = self.active_peers.get_mut(&peer) {
-                    handle.upload_rate = 0.3 * bytes as f64 + 0.7 * handle.upload_rate;
+                    record_peer_transfer(handle, true, bytes);
                 }
                 self.record_upload(bytes).await;
             }
@@ -1797,6 +1860,10 @@ impl TorrentTask {
 
     async fn handle_block(&mut self, block: BlockEvent) {
         let piece = block.piece;
+        self.network_budget
+            .download()
+            .acquire(block.data.len() as u64)
+            .await;
         let aggregate_piece_write = self.can_aggregate_piece_write(piece);
         if let Err(e) = self.record_piece_block(&block) {
             warn!(
@@ -2180,9 +2247,20 @@ impl TorrentTask {
             self.picker.set_sequential_from_piece(piece as usize);
         }
         self.super_seeding = limits.super_seeding;
+        self.torrent_max_peers = limits.max_connections.and_then(|value| {
+            usize::try_from(value)
+                .ok()
+                .filter(|connections| *connections > 0)
+        });
         self.set_torrent_download_limit(limits.download_limit);
         self.set_torrent_upload_limit(limits.upload_limit);
         self.apply_file_policy_from_db();
+    }
+
+    fn peer_capacity(&self) -> usize {
+        self.torrent_max_peers
+            .map(|limit| limit.min(self.max_peers))
+            .unwrap_or(self.max_peers)
     }
 
     fn apply_global_limits_from_db(&mut self) {
@@ -2218,10 +2296,10 @@ impl TorrentTask {
     }
 
     fn recompute_download_limit(&mut self) {
-        self.download_limit_bytes_per_sec = stricter_limit(
-            self.torrent_download_limit_bytes_per_sec,
-            self.global_download_limit_bytes_per_sec,
-        );
+        // The process-wide limiter is shared by every task. Including the
+        // global value here would divide the global allowance once per
+        // torrent and make the configured limit unusably strict at scale.
+        self.download_limit_bytes_per_sec = self.torrent_download_limit_bytes_per_sec;
         self.download_tokens_updated = Instant::now();
         self.download_tokens = self.download_limit_bytes_per_sec.unwrap_or(u64::MAX);
     }
@@ -2238,10 +2316,9 @@ impl TorrentTask {
     }
 
     fn recompute_upload_limit(&mut self) {
-        self.upload_limit_bytes_per_sec = stricter_limit(
-            self.torrent_upload_limit_bytes_per_sec,
-            self.global_upload_limit_bytes_per_sec,
-        );
+        // See recompute_download_limit: global traffic is enforced by the
+        // engine-owned shared bucket, while this field is per torrent.
+        self.upload_limit_bytes_per_sec = self.torrent_upload_limit_bytes_per_sec;
         let mut queue_full = 0u64;
         for handle in self.active_peers.values() {
             if handle
@@ -3011,6 +3088,41 @@ impl TorrentTask {
     }
 }
 
+pub(crate) async fn bounded_response_body(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, TrackerError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(TrackerError::ParseError(format!(
+            "response exceeds {} byte limit",
+            max_bytes
+        )));
+    }
+    let mut body = Vec::with_capacity(
+        response
+            .content_length()
+            .map(|length| length.min(max_bytes as u64) as usize)
+            .unwrap_or_default(),
+    );
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| TrackerError::Network(error.to_string()))?
+    {
+        if body.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(TrackerError::ParseError(format!(
+                "response exceeds {} byte limit",
+                max_bytes
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutgoingTransportPolicy {
     Auto,
@@ -3167,7 +3279,49 @@ fn private_peer_source_allowed(
 fn private_peer_port_fallback_allowed(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
-        IpAddr::V6(ip) => ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local(),
+        IpAddr::V6(ip) => {
+            ip.is_loopback() || is_ipv6_unique_local(ip) || is_ipv6_unicast_link_local(ip)
+        }
+    }
+}
+
+fn is_ipv6_unique_local(ip: std::net::Ipv6Addr) -> bool {
+    ip.segments()[0] & 0xfe00 == 0xfc00
+}
+
+fn is_ipv6_unicast_link_local(ip: std::net::Ipv6Addr) -> bool {
+    ip.segments()[0] & 0xffc0 == 0xfe80
+}
+
+fn record_peer_transfer(peer: &mut PeerHandle, upload: bool, bytes: u64) {
+    if upload {
+        peer.uploaded = peer.uploaded.saturating_add(bytes);
+        peer.upload_rate_window = peer.upload_rate_window.saturating_add(bytes);
+    } else {
+        peer.downloaded = peer.downloaded.saturating_add(bytes);
+        peer.download_rate_window = peer.download_rate_window.saturating_add(bytes);
+    }
+    let now = Instant::now();
+    let elapsed = now.saturating_duration_since(peer.rate_window_started);
+    if elapsed < Duration::from_secs(1) {
+        return;
+    }
+    let seconds = elapsed.as_secs_f64().max(0.001);
+    if upload {
+        peer.upload_rate = peer.upload_rate_window as f64 / seconds;
+        peer.upload_rate_window = 0;
+    } else {
+        peer.download_rate = peer.download_rate_window as f64 / seconds;
+        peer.download_rate_window = 0;
+    }
+    peer.rate_window_started = now;
+}
+
+fn peer_rate(rate: f64, last_sample: Instant) -> i64 {
+    if Instant::now().saturating_duration_since(last_sample) > Duration::from_secs(15) {
+        0
+    } else {
+        rate.max(0.0).round() as i64
     }
 }
 
@@ -3224,7 +3378,7 @@ fn parse_ut_pex_peers(payload: &[u8]) -> anyhow::Result<Vec<SocketAddr>> {
     else {
         return Ok(Vec::new());
     };
-    if !added.len().is_multiple_of(6) {
+    if added.len() % 6 != 0 {
         anyhow::bail!("ut_pex added peers length is not a multiple of 6");
     }
     Ok(added
@@ -3386,7 +3540,11 @@ async fn run_outgoing_peer(
     let remote_supports_extension = {
         use tokio::io::AsyncReadExt;
         let mut hs_buf = [0u8; 68];
-        framed.get_mut().read_exact(&mut hs_buf).await?;
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            framed.get_mut().read_exact(&mut hs_buf),
+        )
+        .await??;
         let remote_hs = Handshake::parse(&hs_buf)?;
         if remote_hs.info_hash != info_hash {
             anyhow::bail!("info_hash mismatch from {addr}");
@@ -3436,7 +3594,7 @@ async fn run_established_utp_peer(
     stream.write_all(&our_hs.encode()).await?;
 
     let mut hs_buf = [0u8; 68];
-    stream.read_exact(&mut hs_buf).await?;
+    tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut hs_buf)).await??;
     let remote_hs = Handshake::parse(&hs_buf)?;
     if remote_hs.info_hash != info_hash {
         anyhow::bail!("info_hash mismatch from {addr}");
@@ -3590,11 +3748,15 @@ async fn run_peer_loop(
     let mut upload_tokens = upload_limit_bytes_per_sec.unwrap_or(u64::MAX);
     let mut upload_tokens_updated = Instant::now();
     let mut timeout_tick = interval(Duration::from_secs(5));
+    let mut last_activity = Instant::now();
+    let mut request_window_started = Instant::now();
+    let mut upload_requests_in_window = 0u32;
 
     let result: anyhow::Result<()> = async {
         loop {
         tokio::select! {
             Some(cmd) = peer_cmd_rx.recv() => {
+                last_activity = Instant::now();
                 match cmd {
                     PeerCommand::Request(req) => {
                         peer_io.send(Message::Request {
@@ -3632,6 +3794,7 @@ async fn run_peer_loop(
                 let Some(msg) = msg_result? else {
                     break;
                 };
+                last_activity = Instant::now();
                 match msg {
                     Message::Bitfield(bits) => {
                         let pieces = match bitfield_to_pieces(&bits, upload.have_pieces.len()) {
@@ -3712,6 +3875,15 @@ async fn run_peer_loop(
                         }
                     }
                     Message::Request { piece, begin, length } => {
+                        let now = Instant::now();
+                        if now.duration_since(request_window_started) >= PEER_UPLOAD_REQUEST_WINDOW {
+                            request_window_started = now;
+                            upload_requests_in_window = 0;
+                        }
+                        upload_requests_in_window = upload_requests_in_window.saturating_add(1);
+                        if upload_requests_in_window > MAX_PEER_UPLOAD_REQUESTS_PER_WINDOW {
+                            anyhow::bail!("peer upload request rate exceeded");
+                        }
                         if !upload_choked && upload.have_pieces.get(piece as usize).copied().unwrap_or(false) {
                             match read_upload_block(&upload, piece, begin, length).await {
                                 Ok(block) => {
@@ -3723,6 +3895,7 @@ async fn run_peer_loop(
                                         bytes,
                                     )
                                     .await;
+                                    upload.global_upload.acquire(bytes).await;
                                     peer_io.send(Message::Piece {
                                         piece,
                                         begin,
@@ -3858,6 +4031,9 @@ async fn run_peer_loop(
                 }
             }
             _ = timeout_tick.tick() => {
+                if last_activity.elapsed() > PEER_IDLE_TIMEOUT {
+                    anyhow::bail!("peer idle timeout");
+                }
                 let timed_out = take_timed_out_requests(&mut outstanding, Duration::from_secs(60));
                 if !timed_out.is_empty()
                     && peer_event_tx
@@ -3963,6 +4139,9 @@ async fn read_upload_block(
     begin: u32,
     length: u32,
 ) -> anyhow::Result<LeasedUploadBlock> {
+    if length == 0 || length > MAX_BLOCK_SIZE {
+        anyhow::bail!("invalid upload block length {length}");
+    }
     let lease = reserve_peer_upload_bytes(&upload.resources, length)?;
     let regions = upload.piece_map.validate_request(piece, begin, length)?;
     let mut data = Vec::with_capacity(length as usize);
@@ -4856,6 +5035,7 @@ mod tests {
             is_private: false,
             pex_enabled: true,
             upload_limit_bytes_per_sec: None,
+            global_upload: GlobalNetworkBudget::unlimited().upload(),
         };
 
         let block = read_upload_block(&upload, 0, 0, 16 * 1024).await.unwrap();

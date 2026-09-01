@@ -2,6 +2,7 @@ use crate::error::BencodeError;
 
 const DEFAULT_MAX_DEPTH: usize = 64;
 const DEFAULT_MAX_STRING: usize = 16 * 1024 * 1024; // 16 MiB
+const DEFAULT_MAX_NODES: usize = 1_000_000;
 
 /// A borrowed bencode value. String values borrow from the input slice.
 #[derive(Debug, PartialEq, Clone)]
@@ -44,6 +45,8 @@ pub struct Decoder<'a> {
     pos: usize,
     max_depth: usize,
     max_string: usize,
+    max_nodes: usize,
+    nodes: usize,
     strict_dict_keys: bool,
 }
 
@@ -54,6 +57,8 @@ impl<'a> Decoder<'a> {
             pos: 0,
             max_depth: DEFAULT_MAX_DEPTH,
             max_string: DEFAULT_MAX_STRING,
+            max_nodes: DEFAULT_MAX_NODES,
+            nodes: 0,
             strict_dict_keys: true,
         }
     }
@@ -65,6 +70,11 @@ impl<'a> Decoder<'a> {
 
     pub fn with_max_string(mut self, max: usize) -> Self {
         self.max_string = max;
+        self
+    }
+
+    pub fn with_max_nodes(mut self, max: usize) -> Self {
+        self.max_nodes = max;
         self
     }
 
@@ -119,6 +129,19 @@ impl<'a> Decoder<'a> {
         if depth > self.max_depth {
             return Err(BencodeError::DepthExceeded(self.max_depth));
         }
+        self.nodes = self
+            .nodes
+            .checked_add(1)
+            .ok_or(BencodeError::NodeLimitExceeded {
+                nodes: usize::MAX,
+                max: self.max_nodes,
+            })?;
+        if self.nodes > self.max_nodes {
+            return Err(BencodeError::NodeLimitExceeded {
+                nodes: self.nodes,
+                max: self.max_nodes,
+            });
+        }
         match self.peek()? {
             b'i' => self.decode_int(),
             b'l' => self.decode_list(depth),
@@ -169,7 +192,10 @@ impl<'a> Decoder<'a> {
                 max: self.max_string,
             });
         }
-        let end = self.pos + len;
+        let end = self
+            .pos
+            .checked_add(len)
+            .ok_or(BencodeError::UnexpectedEof)?;
         if end > self.input.len() {
             return Err(BencodeError::UnexpectedEof);
         }
@@ -375,6 +401,19 @@ mod tests {
     fn reject_unsorted_dict_keys() {
         // "foo" < "bar" would be out of order
         assert!(decode(b"d3:fooi1e3:bari2ee").is_err());
+    }
+
+    #[test]
+    fn reject_excessive_node_count() {
+        let mut input = Vec::from(b"l".as_slice());
+        for _ in 0..4 {
+            input.extend_from_slice(b"i1e");
+        }
+        input.push(b'e');
+        assert!(matches!(
+            Decoder::new(&input).with_max_nodes(3).decode(),
+            Err(BencodeError::NodeLimitExceeded { max: 3, .. })
+        ));
     }
 
     #[test]

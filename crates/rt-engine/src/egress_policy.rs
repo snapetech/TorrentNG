@@ -1,5 +1,9 @@
 use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 
+use rt_config::TrackerConfig;
+use tokio::net::lookup_host;
+use tokio::time::timeout;
 use url::Url;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +44,21 @@ impl Default for OutboundEgressPolicy {
 }
 
 impl OutboundEgressPolicy {
+    pub fn from_config(config: &TrackerConfig) -> Self {
+        Self {
+            allow_http_trackers: config.allow_http_trackers,
+            allow_https_trackers: config.allow_https_trackers,
+            allow_udp_trackers: config.allow_udp_trackers,
+            allow_http_webseeds: config.allow_http_webseeds,
+            allow_https_webseeds: config.allow_https_webseeds,
+            allow_loopback: config.allow_loopback_egress,
+            allow_private: config.allow_private_egress,
+            allow_link_local: config.allow_link_local_egress,
+            allow_multicast: config.allow_multicast_egress,
+            allow_unspecified: config.allow_unspecified_egress,
+        }
+    }
+
     pub fn validate_url(
         &self,
         kind: OutboundTargetKind,
@@ -78,6 +97,67 @@ impl OutboundEgressPolicy {
 
     pub fn validate_socket_addr(&self, addr: SocketAddr) -> Result<(), EgressPolicyError> {
         self.validate_ip(addr.ip())
+    }
+
+    /// Resolve a hostname and validate every answer before a request is sent.
+    /// HTTP callers should use [`Self::http_client`] so the validated address
+    /// is also pinned in the transport client.
+    pub async fn resolve_and_validate(
+        &self,
+        kind: OutboundTargetKind,
+        url: &Url,
+        resolve_timeout: Duration,
+    ) -> Result<Vec<SocketAddr>, EgressPolicyError> {
+        self.validate_url(kind, url)?;
+        let host = url
+            .host_str()
+            .ok_or(EgressPolicyError::MissingHost)?
+            .to_owned();
+        let port = url
+            .port_or_known_default()
+            .ok_or(EgressPolicyError::MissingPort)?;
+        let addresses = timeout(resolve_timeout, lookup_host((host.as_str(), port)))
+            .await
+            .map_err(|_| EgressPolicyError::Resolution("DNS resolution timed out".to_owned()))?
+            .map_err(|error| EgressPolicyError::Resolution(error.to_string()))?
+            .collect::<Vec<_>>();
+        if addresses.is_empty() {
+            return Err(EgressPolicyError::Resolution(format!(
+                "no addresses returned for {host}"
+            )));
+        }
+        for address in &addresses {
+            self.validate_socket_addr(*address)?;
+        }
+        Ok(addresses)
+    }
+
+    /// Build an HTTP client pinned to the first address that passed policy
+    /// validation. Redirects stay disabled so every new URL is revalidated by
+    /// the caller. Pinning the resolver result closes the TOCTOU window between
+    /// policy DNS resolution and reqwest's connection lookup.
+    pub async fn http_client(
+        &self,
+        kind: OutboundTargetKind,
+        url: &Url,
+        request_timeout: Duration,
+        user_agent: &str,
+    ) -> Result<reqwest::Client, EgressPolicyError> {
+        let addresses = self
+            .resolve_and_validate(kind, url, request_timeout)
+            .await?;
+        let host = url.host_str().ok_or(EgressPolicyError::MissingHost)?;
+        let address = addresses
+            .first()
+            .copied()
+            .ok_or_else(|| EgressPolicyError::Resolution("no validated address".to_owned()))?;
+        reqwest::Client::builder()
+            .timeout(request_timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .user_agent(user_agent)
+            .resolve(host, address)
+            .build()
+            .map_err(|error| EgressPolicyError::Client(error.to_string()))
     }
 }
 
@@ -121,7 +201,7 @@ impl AddressClass {
                     AddressClass::Unspecified
                 } else if addr.is_loopback() {
                     AddressClass::Loopback
-                } else if addr.is_unicast_link_local() {
+                } else if is_ipv6_unicast_link_local(&addr) {
                     AddressClass::LinkLocal
                 } else if addr.is_multicast() {
                     AddressClass::Multicast
@@ -149,6 +229,10 @@ impl AddressClass {
     }
 }
 
+fn is_ipv6_unicast_link_local(addr: &std::net::Ipv6Addr) -> bool {
+    addr.segments()[0] & 0xffc0 == 0xfe80
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EgressPolicyError {
     SchemeDenied {
@@ -159,6 +243,10 @@ pub enum EgressPolicyError {
         addr: IpAddr,
         class: AddressClass,
     },
+    MissingHost,
+    MissingPort,
+    Resolution(String),
+    Client(String),
 }
 
 impl std::fmt::Display for EgressPolicyError {
@@ -169,6 +257,14 @@ impl std::fmt::Display for EgressPolicyError {
             }
             EgressPolicyError::AddressDenied { addr, class } => {
                 write!(f, "egress address denied: {addr} ({class:?})")
+            }
+            EgressPolicyError::MissingHost => write!(f, "egress URL has no host"),
+            EgressPolicyError::MissingPort => write!(f, "egress URL has no port"),
+            EgressPolicyError::Resolution(error) => {
+                write!(f, "egress DNS resolution failed: {error}")
+            }
+            EgressPolicyError::Client(error) => {
+                write!(f, "egress HTTP client creation failed: {error}")
             }
         }
     }

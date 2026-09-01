@@ -828,6 +828,10 @@ fn device_queue_key(
 }
 
 impl PeerReadElevator {
+    // This constructor wires independent resource pools owned by the storage
+    // runtime. Keeping the arguments explicit makes ownership and scheduling
+    // boundaries visible; a context object would hide those dependencies.
+    #[allow(clippy::too_many_arguments)]
     fn spawn(
         storage_root: StorageRootId,
         queue_depth: usize,
@@ -912,6 +916,7 @@ impl PeerReadElevator {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn peer_read_elevator_worker(
     _storage_root: StorageRootId,
     mut receiver: tokio_mpsc::Receiver<PeerReadRequest>,
@@ -2417,10 +2422,10 @@ fn full_preallocate(file: &File, len: u64) -> Result<(), StorageError> {
         if rc == 0 {
             return Ok(());
         }
-        return Err(StorageError::Io {
+        Err(StorageError::Io {
             path: "<preallocate>".to_owned(),
             source: std::io::Error::from_raw_os_error(rc),
-        });
+        })
     }
     #[cfg(not(target_os = "linux"))]
     {

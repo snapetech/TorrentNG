@@ -1,0 +1,808 @@
+# TorrentNG Backend Audit Burn-down
+
+Status: **active**  
+Baseline: 2026-09-01, `main`  
+Scope: native Rust engine, native daemon/API, compatibility facades, storage,
+deployment, CI, and release evidence.
+
+This is the canonical remediation ledger for the principal-engineer / investor
+audit. Older roadmap and certification documents describe intended or locally
+tested behavior; they are not proof that a feature is wired into the live
+runtime. An item is not complete until its code path, focused regression test,
+and release evidence exist together.
+
+## Executive decision
+
+TorrentNG is not currently credible as a production-grade 100k-torrent engine
+or as a universally compatible client. The low-level storage, parser, and
+protocol crates have useful foundations, but the orchestration and trust
+boundaries are not finished. The current release posture is **do not make
+unqualified scale, security, pure-v2, or universal-compatibility claims**.
+
+The burn-down order is:
+
+1. security and data integrity;
+2. runtime limits, lifecycle, and scale;
+3. API and compatibility truth;
+4. deployment, CI, and independent release evidence;
+5. architecture seams and maintainability.
+
+## Status rules
+
+- **Open** — finding reproduced or independently evidenced; no complete fix.
+- **In progress** — code or documentation work exists, but acceptance criteria
+  are not all met.
+- **Blocked** — external hardware/client/operator evidence is required and the
+  local repository cannot produce it.
+- **Resolved** — implementation, regression coverage, and required evidence are
+  present. A passing unit test alone is not enough.
+
+Severity is an engineering priority, not a statement about exploitability in a
+particular private deployment. P0 means release-blocking for any deployment
+that exposes the affected surface. P1 means material production risk. P2 means
+important correctness, evidence, or maintainability debt.
+
+## Baseline evidence
+
+The following was run against the audit baseline before this burn-down began:
+
+| Check | Result | Meaning |
+| --- | --- | --- |
+| `cargo test --workspace --all-targets --locked` | PASS | Existing native tests are green, but mostly exercise isolated behavior. |
+| `cargo test --manifest-path sidecar/Cargo.toml --locked` | PASS | Sidecar tests are green. |
+| `cargo fmt --all -- --check` | FAIL | `crates/rt-migrate/src/lib.rs:2663` was not formatted. |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | FAIL | Existing lint/MSRV/enum-layout failures remain. |
+| native CI workflow | INCOMPLETE | `.github/workflows/ci.yml` builds sidecar/WebUI but does not test native crates. |
+| native release workflow | INCOMPLETE | Release builds and smoke-checks the binary without native test, fmt, or clippy gates. |
+| certification status | NOT CLEAN | Universal compatibility is `PASS_WITH_SKIPS`; 24h soak is stale/incomplete; strict readiness fails. |
+| checked-in fuzz/OpenAPI/idempotency evidence | ABSENT | Documentation claims are not backed by checked-in targets or gates. |
+
+## Current verified evidence (2026-09-01, second session)
+
+A prior remediation pass (same date) left the tree with real progress but a
+red baseline: `cargo test --workspace --all-targets --locked` hung
+indefinitely, and two of the tests that could run were failing. This session
+resumed from that point. Everything below was re-run and passed after fixes
+recorded in the burn-down log:
+
+| Check | Result | Meaning |
+| --- | --- | --- |
+| `cargo test --workspace --all-targets --locked` | PASS | Was hanging (see log: `network_budget` livelock). All crates green. |
+| `cargo test --manifest-path sidecar/Cargo.toml --locked` | PASS | Unaffected by native-engine changes. |
+| `cargo fmt --all -- --check` | PASS | Was failing (pre-existing `rt-migrate` issue plus new unformatted test code); now clean. |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | PASS | Two findings fixed (see log below). |
+| `cargo +1.88 build/test --workspace --all-targets --locked` | PASS | See MSRV correction below. |
+| `cargo +1.97 build/test --manifest-path sidecar/Cargo.toml --locked` | PASS | See MSRV correction below. |
+| declared `rust-version` (both `Cargo.toml`s) | **CORRECTED** | Was `1.80` in both, unverified and untrue. Neither workspace's *locked* dependency graph builds below 1.88 (main: `idna_adapter` needs rustc 1.86+, plus `edition2024` needs Cargo 1.85+) or 1.97 (sidecar: `libsqlite3-sys`'s build script uses `cfg_select!`, stabilized between 1.94 and 1.97). This is a transitive-dependency floor, not first-party code needing new syntax. Corrected both `rust-version` fields to `1.88` / `1.97` to match reality; this itself is TNG-028 acceptance criteria ("document the supported toolchain"). |
+
+CI still does not run any of this (TNG-025, still Open) -- these are local,
+manually-run results, not an enforced gate yet.
+
+## P0 — security and data integrity
+
+### TNG-001 — Server-owned storage authority is bypassable
+
+**Status: In progress** · **Priority: P0** · **Confidence: high**
+
+Verified evidence -- this is further along than a first pass of the diff
+suggested; re-checked properly rather than left as Open by default. New
+`ServerStorageRoots::authorize_path()`: rejects non-absolute paths and any
+`..` component outright, then walks up to the nearest *existing* ancestor,
+canonicalizes it (resolving symlinks), and requires that canonical
+ancestor to be at or under a configured root -- closing the plain
+absolute-path-escape and symlink-at-admission cases named in the finding.
+6 unit tests cover it. `Engine::authorize_storage_path()` wraps it against
+the live configured roots and has **12 real call sites** across add,
+magnet-add, task restore/startup, save-path update, storage-plan
+execution, and move source/destination -- this is broad, not a token
+gesture. Deletion specifically was checked and is now covered:
+`delete_payload_files()` calls `authorize_storage_path` on both the
+save_path root and *every individual resolved file path* before removing
+it, directly closing the finding's explicit "deletion trusts the stored
+path" complaint.
+
+The module's own doc comment is honest about what's left: "the actual file
+operation still needs race-resistant, descriptor-relative enforcement
+before this can be treated as a complete sandbox." That is the real
+remaining gap -- this is admission-time path validation with a
+canonicalize-then-check pattern, which is inherently TOCTOU-able (the
+filesystem can change between the canonicalize check and the actual
+`std::fs::remove_file`/open call). Not done: descriptor-relative
+operations (`openat`-style, anchored to an already-opened root fd) or an
+equivalent race-closing primitive: preview-roots-are-simulation-only
+enforcement; fail-closed-with-no-writable-root behavior (exists as
+`NoConfiguredRoots` but not independently verified here); and the full
+acceptance suite (outside-root, symlink, broken-symlink, missing-ancestor,
+restart, concurrent-plan tests).
+
+Evidence: normal add/magnet paths accept caller-selected `save_path` in
+`crates/rt-engine/src/engine.rs` and construct a scheduler directly in
+`crates/rt-engine/src/torrent_task.rs`. Live file opens in
+`crates/rt-storage/src/scheduler.rs` use ordinary path-based `OpenOptions`.
+Storage-plan execution also accepts caller-provided roots even though the
+newer plan path can reload persisted roots. Deletion trusts the stored path.
+
+Required action:
+
+- make server-configured/persisted roots the only authority for all execution,
+  including add, magnet, move, delete, recheck, and task startup;
+- reject absolute paths outside an authorized root and reject unsafe relative
+  paths;
+- defend every filesystem operation against symlink and ancestor races, using
+  descriptor-relative operations or an equivalent platform-specific primitive;
+- keep preview roots explicitly simulation-only;
+- fail closed when no writable root is configured.
+
+Acceptance: outside-root, symlink, broken-symlink, missing-ancestor, restart,
+delete, and concurrent-plan tests; execution ignores caller roots; Linux
+descriptor-relative integration coverage where supported.
+
+### TNG-002 — Storage moves can race active writes
+
+**Status: Open** · **Priority: P0** · **Confidence: high**
+
+Evidence: `update_torrent_fields_inner` can start a move while the torrent task
+continues writing. Cached handles and task-local storage state remain live while
+the path changes.
+
+Required action: add a storage transition protocol: quiesce/pause writes,
+drain in-flight I/O, execute the move, atomically switch the authoritative path,
+reopen handles, and resume or roll back. The same protocol must cover API
+storage-plan execution and shutdown.
+
+Acceptance: move-under-download, move-under-upload, cancellation, crash,
+rollback, and restart tests with no writes to the old path after commit.
+
+### TNG-003 — Copy verification and rollback semantics are too weak
+
+**Status: Open** · **Priority: P0** · **Confidence: high**
+
+Evidence: `crates/rt-storage/src/plan.rs` verifies aggregate lengths rather than
+content hashes, and rollback drops failed steps instead of reporting a complete
+and independently auditable rollback result.
+
+Required action: verify copied content at the piece/file level before commit;
+record per-step state and rollback errors; make partial completion explicit and
+resumable; never report success after an unverified copy.
+
+Acceptance: bit-flip, short-read, permission failure, destination-full, partial
+rollback, resume, and idempotent retry tests.
+
+### TNG-004 — Torrent-controlled integers can wrap or overflow
+
+**Status: In progress** · **Priority: P0** · **Confidence: high**
+
+Verified evidence: `rt-metainfo` now rejects a piece-hash count that doesn't
+match `ceil(total_length / piece_length)` (caught a real bug in
+`rt-migrate/tests/scale.rs`'s own fixture generator, which had always
+generated a fixed 1-piece hash regardless of declared length -- fixed the
+fixture, not the check). Not yet verified: checked non-negative/positive
+integer helpers, checked offset arithmetic across the parser, explicit
+limits on files/path components/trackers/webseeds/total nodes, or any fuzz
+target. Acceptance criteria (`-1`, `i64::MIN`, overflow, zero, absurd
+piece length/count, fuzz coverage) are not evidenced as tests yet.
+
+Evidence: `crates/rt-metainfo/src/parse.rs` casts signed bencode integers to
+unsigned values and later accumulates offsets. Piece length is later narrowed
+to `u32`.
+
+Required action: checked non-negative and positive integer helpers; checked
+offset arithmetic; explicit limits for raw input, files, path components,
+trackers, webseeds, pieces, and total collection nodes; reject invalid or
+unrepresentable values before allocation.
+
+Acceptance: `-1`, `i64::MIN`, overflow, zero, absurd piece length/count, and
+large tracker/webseed corpus tests, plus fuzz target coverage.
+
+### TNG-005 — Outbound tracker/webseed egress policy is not wired
+
+**Status: In progress** · **Priority: P0** · **Confidence: high**
+
+Verified evidence: wiring is broader than it first looked. Every named
+unguarded call site now routes through `self.egress_policy` in
+`torrent_task.rs` -- `announce_http`, `announce_udp`, `scrape_tracker`, and
+`fetch_webseed_block` all call `egress_policy.http_client(...)` or
+`.resolve_and_validate(...)` with an `OutboundTargetKind`; the free-function
+`metadata_task::announce_tracker` (its own separate client, used during
+magnet metadata fetch) takes and uses one too. Not yet verified: that
+`OutboundEgressPolicy`'s own implementation actually rejects
+private/loopback/link-local targets and DNS-rebinding, bounds
+redirect-chains/body-size/time, and reuses clients rather than
+constructing one per call -- i.e. the wiring is real, but the policy body's
+correctness is not yet independently checked. No negative-path tests
+(loopback, RFC1918, link-local, rebinding, oversized body) found yet.
+
+Evidence: `crates/rt-engine/src/egress_policy.rs` contains a policy type but no
+live call sites. Tracker, scrape, and webseed paths in `torrent_task.rs` use
+hostname resolution or a fresh HTTP client without private-address,
+redirect-chain, response-size, or connection policy enforcement. Bodies are
+fully collected before parser limits apply.
+
+Required action: route every tracker, scrape, webseed, and metadata URL through
+one server-owned policy; resolve and validate every address and redirect;
+bound headers/body/decompression/time; reuse clients; emit rejection metrics;
+default private/local ranges and metadata endpoints to denied.
+
+Acceptance: loopback, RFC1918, link-local, IPv6-local, rebinding, redirect,
+oversized-body, compressed-body, timeout, and allowed-public-target tests.
+
+### TNG-006 — Authentication is fail-open and inconsistent across facades
+
+**Status: In progress** · **Priority: P0** · **Confidence: high**
+
+Verified evidence: Transmission and Deluge compat routers each gained a new
+`route_layer` auth-guard middleware (token-or-cookie, matching the native
+API's pattern), each with its own `AppState::with_engine_and_tokens`
+constructor threading `api_tokens` through. qBittorrent-compat's
+pre-existing guard was fixed to allowlist `/auth/login` and `/auth/logout`
+(previously would have 401'd the login request itself) and to
+percent-decode cookie values. Regression test added/fixed for Transmission
+(`transmission_router_enforces_configured_token`; was a test bug, not an
+implementation bug -- see burn-down log). **rt-api-rtorrent got no auth
+guard at all** -- the finding's claim that it "is unsafe when mounted
+without the daemon's outer guard" is still true and unaddressed. Not
+verified for any facade: the qBit static `SID=torrentng` session-cookie
+claim, CSRF/origin enforcement, cookie flag/expiry correctness, the native
+sample's public `0.0.0.0` bind with `change-me`, or a public-bind
+placeholder-token startup rejection.
+
+Evidence: empty token lists disable guards in `torrentngd`, native, and qBit
+routers; the native sample binds `0.0.0.0` with `change-me`; the qBit login
+returns a static `SID=torrentng`; Transmission/Deluge/rTorrent routers are
+unsafe when mounted without the daemon’s outer guard; CSRF claims are not
+enforced.
+
+Required action: one server-owned auth middleware with explicit local-dev
+opt-out; reject public binds with missing or placeholder credentials; make
+compatibility login/session behavior token-aware; protect every facade and
+mutating route; implement CSRF/origin policy where the API claims it; use
+secure, bounded cookies.
+
+Acceptance: auth-on/auth-off tests for every facade, public/bind matrix,
+placeholder-token startup failure, cookie flags/expiry, CSRF negative tests,
+and direct-router mounting tests.
+
+### TNG-007 — Peer ingress has no effective global unauthenticated budget
+
+**Status: In progress** · **Priority: P0** · **Confidence: high**
+
+Verified evidence: `Engine`'s accept loop now calls both
+`peer_ingress.try_begin(peer_addr, ...)` (per-IP/handshake admission) and
+`self.network_budget.try_acquire_peer()` (global slot) before spawning a
+handshake task, on the rejection path releasing cleanly (no task spawned).
+New `network_budget.rs` module (`GlobalNetworkBudget`, `SharedRateLimiter`)
+has its own unit tests, including cross-clone slot sharing. A real bug was
+found and fixed in this module this session: `SharedRateLimiter` used
+`std::time::Instant` instead of `tokio::time::Instant`, which live-locked
+its own `#[tokio::test(start_paused = true)]` test and was hanging the
+*entire workspace test suite* indefinitely -- fixed, see burn-down log. Not
+verified: uTP incoming path parity, handshake-read bounded timeouts beyond
+what TNG-018 covers, or the acceptance suite (slowloris, burst, per-IP,
+global-cap, malformed, permit-release-under-load).
+
+Evidence: `PeerIngressBudget` exists in `crates/rt-engine/src/peer_ingress.rs`
+but has no engine call site. Inbound connections are spawned from
+`crates/rt-engine/src/engine.rs`; TCP/uTP handshake reads lack bounded
+timeouts, and configured limits are not runtime enforcement.
+
+Required action: wire a shared accept semaphore and per-IP budget into TCP and
+uTP; cap the number and duration of unauthenticated handshakes; release all
+permits on every failure path; add malformed/slow-peer metrics and bounded
+penalty state.
+
+Acceptance: slowloris, burst, per-IP, global-cap, malformed, timeout, uTP, and
+permit-release tests under concurrent load.
+
+### TNG-008 — Persistence updates are not transactional with runtime state
+
+**Status: Open** · **Priority: P0** · **Confidence: high**
+
+Evidence: add and update paths mutate the registry before later DB/blob work;
+per-block transfer updates hold runtime and DB locks and perform full upserts;
+job state/events are separate operations; migrations apply DDL and update
+`user_version` separately.
+
+Required action: define transaction boundaries and an authoritative state
+machine; commit DB + event + in-memory publication atomically or recoverably;
+batch transfer deltas; make migration version advancement transactional;
+reconcile interrupted operations on startup.
+
+Acceptance: injected failure at every write boundary, crash/restart recovery,
+no phantom registry rows, no lost transitions, and bounded write amplification.
+
+## P1 — runtime, scale, and lifecycle
+
+### TNG-009 — “Global” peer and rate limits are per torrent/peer
+
+**Status: In progress** · **Priority: P1** · **Confidence: high**
+
+Verified evidence: same `GlobalNetworkBudget` as TNG-007 -- shared
+(`Arc`-cloned) into every spawned `TorrentTask`, with engine-level
+`set_download_limit`/`set_upload_limit` setters distinct from any
+per-torrent value. Both directions are actually gated on real payload
+bytes: `handle_block` calls `self.network_budget.download().acquire(...)`
+per received block, and the peer-upload loop calls
+`upload.global_upload.acquire(bytes).await` (a captured reference to
+`network_budget.upload()`) before sending each `Piece` message, layered on
+top of the existing per-peer `wait_for_upload_budget`. (First pass at this
+note incorrectly said upload wasn't gated -- missed the differently-named
+local binding on first read; corrected after checking the actual send
+path.) Not verified: protocol-overhead accounting, or the acceptance suite
+(multi-torrent/multi-peer aggregate tests, runtime mutation tests, fairness
+tests, metrics-matches-wire-bytes).
+
+Evidence: `NetworkConfig` documents total limits, but
+`Engine::spawn_torrent_task` passes the same value to every task. Download and
+upload token buckets are created per torrent or per peer. Static global limit
+fields have no production call sites; `max_connections` is projected but not
+enforced.
+
+Required action: create shared process-wide limiters/budgets owned by the
+engine, define whether limits include protocol overhead, and apply them to
+every ingress/egress path. Expose actual aggregate enforcement and current
+usage.
+
+Acceptance: multi-torrent and multi-peer aggregate rate/connection tests,
+runtime limit mutation tests, fairness tests, and metrics matching observed
+wire bytes.
+
+### TNG-010 — Tiering and 100k scale architecture are not runtime-integrated
+
+**Status: Open** · **Priority: P1** · **Confidence: high**
+
+Evidence: `TierController`, dormant snapshots, timer wheel, and compact bitmap
+are definitions/tests in `crates/rt-engine/src/tier.rs`; no engine integration
+was found. Stats marks every torrent active. All persisted rows spawn tasks;
+each scheduler creates multiple native threads by default.
+
+Required action: integrate dormant/warm/hot lifecycle into restore, event
+routing, tracker deadlines, peer promotion, stats, and shutdown; remove the
+per-torrent thread multiplier; make memory/fd/task budgets explicit. If the
+architecture cannot meet the target, delete the 100k claim and publish a lower
+supported envelope.
+
+Acceptance: 100k dormant, 1k hot, restart, promotion/demotion, fd/thread/task
+counts, RSS, API latency, and recovery benchmarks on the release binary.
+
+### TNG-011 — Storage jobs block the engine actor and lack control-plane routes
+
+**Status: Open** · **Priority: P1** · **Confidence: high**
+
+Evidence: native storage execute returns `202`, but the engine command path
+invokes synchronous storage execution. Native routing exposes only `GET
+/api/v1/jobs`; pause/resume/cancel are not complete native controls.
+
+Required action: move blocking execution behind a bounded job worker pool;
+persist and stream progress; implement authenticated get/pause/resume/cancel;
+bound concurrency and shutdown behavior.
+
+Acceptance: concurrent plan jobs do not delay health/torrent commands; restart
+resume; cancellation; durable progress; worker saturation; bounded shutdown.
+
+### TNG-012 — Shutdown and task health are not trustworthy
+
+**Status: In progress** · **Priority: P1** · **Confidence: high**
+
+Verified evidence: `torrentngd/src/main.rs` now listens for SIGTERM
+(`tokio::signal::unix::signal(SignalKind::terminate())`) alongside Ctrl-C.
+`EngineCmd::Shutdown` and `DhtCommand::Shutdown` were both changed from
+fire-and-forget to carry a `oneshot::Sender<()>` reply, and the engine
+awaits `torrent_tasks` joins with a bounded `timeout(...)` (aborting and
+logging on timeout) instead of dropping handles. Full suite passes,
+including `shutdown_torrent_tasks_sends_shutdown_and_waits_for_task_exit`.
+Not independently verified: `axum::serve`'s own graceful-shutdown hook (is
+the HTTP listener itself included in the same bounded shutdown?), whether
+health reflects task liveness (vs. just "engine handle exists"), or the
+acceptance suite (SIGTERM/Ctrl-C/worker-panic/DHT-death/storage-failure/
+shutdown-under-load tests).
+
+Evidence: `torrentngd` listens only for Ctrl-C; `axum::serve` has no graceful
+shutdown hook; `EngineHandle::shutdown` does not await; remove drops task join
+handles; engine/DHT task death can leave a non-None handle and a superficially
+healthy endpoint.
+
+Required action: handle SIGTERM and Ctrl-C; propagate a bounded cancellation
+token; await engine/DHT/task joins; make health reflect task liveness and
+readiness; define stopped-announce and DB-drain deadlines.
+
+Acceptance: SIGTERM, Ctrl-C, worker panic, DHT death, storage failure, and
+shutdown-under-load tests with bounded completion and truthful health.
+
+### TNG-013 — Stats, SSE, and list APIs scale with full scans
+
+**Status: Open** · **Priority: P1** · **Confidence: high**
+
+Evidence: stats asks every task sequentially with a 250 ms timeout; SSE
+`torrent_delta` scans and serializes all torrents for every client every second;
+native list returns an unpaginated bare vector while docs promise query/envelope
+semantics.
+
+Required action: introduce snapshot/versioned aggregation, pagination and
+bounded projections, delta subscriptions keyed by changed torrents, client
+backpressure, and documented compatibility behavior.
+
+Acceptance: 1k/15k/100k latency and allocation tests, many SSE clients, slow
+consumer behavior, stable pagination, and API contract tests.
+
+### TNG-014 — Per-peer metadata/bitmap allocations threaten scale
+
+**Status: Open** · **Priority: P1** · **Confidence: high**
+
+Evidence: `torrent_task.rs` allocates a `Vec<bool>` piece map per peer and
+clones piece bitmap/metadata into upload contexts.
+
+Required action: use shared immutable metadata and compact/shared bitmaps;
+account per-peer memory; cap peer count and metadata size; benchmark hot swarm
+RSS rather than extrapolating from row fixtures.
+
+Acceptance: memory-profiled 1k-hot/large-piece-count runs and peer churn tests.
+
+### TNG-015 — Webseed polling creates an idle tax
+
+**Status: In progress** · **Priority: P1** · **Confidence: moderate**
+
+Verified evidence: the webseed tick's `tokio::select!` arm is now guarded
+(`_ = webseed_tick.tick(), if !self.paused && !self.meta.webseeds.is_empty()
+&& !self.picker.is_complete() => ...`), so a torrent with no webseeds or
+that's already complete no longer fires this timer at all. Not verified:
+adaptive backoff or failure-deadline behavior for torrents that *do* have
+webseeds but are currently failing, or the acceptance benchmark (idle CPU/
+timer counts, webseed recovery timing).
+
+Evidence: every torrent runs a 100 ms webseed tick even when no webseed work
+exists.
+
+Required action: arm timers only when webseed work is possible; use adaptive
+backoff and failure deadlines.
+
+Acceptance: idle-torrent CPU/timer counts and webseed recovery benchmarks.
+
+## P1 — protocol and transfer correctness
+
+### TNG-016 — Pure v2 completion is a capability lie
+
+**Status: In progress (honesty fix chosen over full implementation)** · **Priority: P1** · **Confidence: high**
+
+Verified evidence: the required action offered two paths -- implement it,
+or "reject unsupported pure-v2 operations explicitly." This took the
+second path. `Engine`'s taskless-v2 peer-transfer and tracker-lifecycle
+branches now return `Err("pure v2 peer transfer is not implemented")` /
+`Err("pure v2 tracker lifecycle is not implemented")` instead of a silent
+`Ok(())`, and `native_engine_capabilities` was corrected:
+`pure_v2_metadata_completion: false`, new `pure_v2_transfer: false`,
+`storage_plan_controls: false`, `storage_throttled: false`. Three tests
+that asserted the old silent-success behavior were updated to assert the
+new explicit errors instead (all previously green tests were asserting the
+capability lie was correct behavior -- see burn-down log). Full pure-v2
+transfer/tracker implementation itself remains not done; that is now
+honestly reflected rather than claimed.
+
+Evidence: engine task startup accepts `TorrentMetaV1`; pure-v2 metadata is a
+taskless/recheck placeholder while the native capability manifest claims pure
+v2 metadata completion.
+
+Required action: implement v2 piece-layer acquisition, verification, storage,
+resume, and tracker/peer lifecycle, or remove the capability claim and reject
+unsupported pure-v2 operations explicitly.
+
+Acceptance: pure-v2 magnet, metadata completion, partial resume, payload
+verification, seeding, export, and compatibility tests.
+
+### TNG-017 — Peer rate snapshots and choker inputs are wrong
+
+**Status: In progress** · **Priority: P1** · **Confidence: high**
+
+Verified evidence: `PeerHandle` gained `downloaded`/`uploaded` monotonic
+counters and `download_rate_window`/`upload_rate_window`/
+`rate_window_started` fields; a new `record_peer_transfer()` helper updates
+both the cumulative counter and the current window on every block
+transferred, and peer snapshots now compute
+`peer_rate(peer.upload_rate, peer.rate_window_started)` for both
+directions (previously upload used raw un-rated block bytes directly).
+Full suite passes. Not verified: whether the choker's actual ranking logic
+was updated to consume these correctly (only confirmed the inputs feeding
+it changed), or the acceptance suite (controlled-transfer-rate,
+peer-ranking tests with nonzero monotonic values).
+
+Evidence: peer snapshots report zero rates/counters; `PeerEvent::Uploaded`
+uses raw block bytes where the choker expects throughput.
+
+Required action: maintain monotonic counters and interval rates at one defined
+sampling boundary; distinguish wire/payload bytes; test choker ranking.
+
+Acceptance: controlled transfer-rate and peer-ranking tests with nonzero,
+monotonic values.
+
+### TNG-018 — Peer loops lack hostile-peer I/O limits
+
+**Status: In progress** · **Priority: P1** · **Confidence: high**
+
+Verified evidence: added `PEER_IDLE_TIMEOUT` (120s, checked against
+`last_activity.elapsed()` in the peer loop -- real call site, not just a
+declared constant), a bounded 10s timeout on the initial handshake read
+(`tokio::time::timeout(Duration::from_secs(10),
+framed.get_mut().read_exact(&mut hs_buf))`, previously unbounded), and a
+per-peer upload request-rate budget (`PEER_UPLOAD_REQUEST_WINDOW` = 10s,
+`MAX_PEER_UPLOAD_REQUESTS_PER_WINDOW` = 256, bails the peer connection over
+budget). Not verified: whether request disk I/O is actually isolated off
+the peer loop (the finding's specific complaint was inline disk I/O
+blocking the loop) -- `read_upload_block` is `async` but that alone doesn't
+establish it's non-blocking under real disk load. Acceptance suite
+(slow-read, request-flood, oversized-message, scheduler saturation) not
+evidenced.
+
+Evidence: request disk I/O runs inline in the peer loop; no clear idle timeout
+or per-peer request-rate budget exists.
+
+Required action: isolate disk work behind bounded scheduling; cap outstanding
+requests, message sizes, request rates, and idle time; apply peer penalties.
+
+Acceptance: slow-read, request-flood, oversized-message, idle, and scheduler
+saturation tests.
+
+### TNG-019 — DHT resource and validation controls are incomplete
+
+**Status: Open** · **Priority: P1** · **Confidence: high**
+
+Evidence: DHT is IPv4-only in the live task; there is no effective rate limit or
+outstanding expiry; transaction IDs are two bytes; response source validation
+and global announced-peer caps are incomplete.
+
+Required action: validate transaction/source, expire outstanding queries, cap
+tables and announce state, rate-limit traffic, support or explicitly scope
+IPv6, and harden token/address binding.
+
+Acceptance: spoofed response, transaction reuse, timeout, flood, IPv6, table
+cap, private torrent, and restart tests.
+
+### TNG-020 — Tracker and PEX protocol handling is partial
+
+**Status: Open** · **Priority: P1** · **Confidence: high**
+
+Evidence: tracker response integers are cast to unsigned types; UDP announces
+use a fixed 1500-byte buffer/new socket per request and incomplete interval/id
+fidelity; PEX parses IPv4 `added` but not IPv6/dropped peers.
+
+Required action: checked response parsing, bounded adaptive UDP framing,
+connection/transaction reuse where appropriate, announce interval/id semantics,
+and complete PEX field handling.
+
+Acceptance: malformed/negative/large tracker responses, fragmentation/MTU,
+retry/interval, IPv6 PEX, dropped-peer, and private-torrent tests.
+
+## P1/P2 — API, configuration, and product truth
+
+### TNG-021 — Native list API does not match its documentation
+
+**Status: Resolved** · **Priority: P1** · **Confidence: high**
+
+`GET /api/v1/torrents` now returns `{total, torrents}` with real
+`limit`/`offset`/`filter`/`status`/`category`/`tag`/`sort`/`dir`/`reverse`
+query handling (`limit` clamped 1..=5000), and is memory-bounded via an
+`ApiSnapshot` `reserve_memory` lease sized to the actual page, not the
+whole registry. Verified by fixing/writing tests this session:
+`list_torrents_empty` and `list_torrents_with_entry` were asserting the old
+bare-array shape (updated to the envelope); added
+`list_torrents_reports_total_independent_of_page_size`, which seeds 3
+torrents and asserts `total: 3` while `limit=1` bounds the returned page to
+1 -- the specific acceptance-relevant behavior (total != page size) that
+neither old test could have caught. All three pass. `docs/API.md:135`
+already documents `Response: { total: int, torrents: TorrentRow[] }` --
+implementation now genuinely matches the documented contract.
+
+Evidence: `rt-api-native` list handler returns a bare unpaged vector, while
+`docs/API.md` promises query parameters and an envelope.
+
+Required action: choose and version the contract; implement pagination/filter
+limits/envelope or correct the docs and compatibility tests. Do not leave both
+surfaces claiming different behavior.
+
+### TNG-022 — Compatibility mutations and in-memory state are too often inert
+
+**Status: Open** · **Priority: P1** · **Confidence: high**
+
+Evidence: compatibility routes accept semantics that are not applied to the
+native engine; several operator-facing stores remain process-memory state.
+
+Required action: route supported mutations to durable engine state; for
+unsupported behavior return structured capability/no-op metadata, log it, and
+document it; classify and persist operator-created state.
+
+Acceptance: method-by-method mutation matrix with stateful round trips and
+restart tests.
+
+### TNG-023 — Capability and health manifests overclaim implementation
+
+**Status: In progress** · **Priority: P1** · **Confidence: high**
+
+Verified evidence: `native_engine_capabilities` downgraded
+`pure_v2_metadata_completion`, `storage_throttled`, `safe_move`,
+`safe_delete_after_dry_run`, `bounded_shutdown`, and `scale_certification`
+from `true` to `false`, and added `pure_v2_transfer: false` /
+`storage_plan_controls: false`. Cross-checked each against this session's
+own findings: all six downgrades correctly track ledger items that are
+still Open or only In progress with acceptance criteria unmet (storage
+authority/race/verification = TNG-001/002/003, still Open; storage job
+async pool = TNG-011, still Open; shutdown = TNG-012, In progress but not
+acceptance-complete; scale = TNG-010/026, still Open/Blocked) -- i.e. this
+wasn't a blanket "set everything false," it's consistent with the real
+state. Not yet done: the `implemented`/`enabled`/`certified`/`experimental`
+state separation the required action calls for (currently still one flat
+bool per capability), and no capability contract test exists that would
+fail if a claim regresses without evidence.
+
+Evidence: native capabilities hard-code pure-v2, durable job controls, bounded
+shutdown, DHT, and scale claims that the runtime/evidence does not establish.
+
+Required action: derive capabilities from active runtime paths/configuration or
+remove the claims. Separate `implemented`, `enabled`, `certified`, and
+`experimental` states.
+
+Acceptance: capability contract tests that fail when a claim lacks a live
+implementation and evidence reference.
+
+### TNG-024 — Deployment defaults are unsafe, inconsistent, or silently ignored
+
+**Status: In progress** · **Priority: P0/P1** · **Confidence: high**
+
+Verified evidence: `Config::validate()` (called from the real config-load
+path, `rt-config/src/lib.rs:289`) now unconditionally rejects any
+`api_tokens` entry matching a placeholder pattern (`change-me`, `changeme`,
+`replace-me`, or anything containing `REPLACE_WITH`, case-insensitive) --
+stricter than the required action asked (it's not scoped to public binds
+only), plus a separate check that a public `daemon.api_bind` requires
+non-empty tokens of at least 16 characters. Both are covered by existing
+`ConfigError::Validation` tests, part of the passing suite. Sample configs
+(`deploy/native/config.toml`, the Kubernetes `secret.yaml`) were updated
+from `change-me` to `REPLACE_WITH_RANDOM_TOKEN`, which now actually fails
+`validate()` instead of silently starting -- previously renaming alone
+would have been cosmetic; here it's backed by real enforcement. Peer-port
+inconsistency (`6881` in Docker/Kubernetes vs. the daemon's real default)
+fixed to `44444` across `Dockerfile`, `service.yaml`, and
+`statefulset.yaml`. Docker build now uses `--locked`. Not verified: Compose
+files (not seen in the diff -- may still be inconsistent), whether an
+*invalid* (not just placeholder) config load failure is visible/fails
+closed rather than silently falling back to defaults, and whether
+`trust_proxy_header` / other bind-adjacent settings were reviewed.
+
+Evidence: native sample config binds publicly with a known token; compose,
+Kubernetes, and config use inconsistent peer ports; invalid standard-path
+config can fall back to defaults; native Docker build did not explicitly use
+`--locked`.
+
+Required action: safe default bind/credentials; reject placeholders on public
+binds; make config load failures visible and fail closed; centralize port values;
+lock builds and test rendered deployment manifests.
+
+Acceptance: clean-container startup, invalid-config, public-bind, compose,
+Kubernetes, and Docker build smoke tests.
+
+## P1/P2 — release evidence and engineering system
+
+### TNG-025 — Native CI does not enforce native quality
+
+**Status: In progress** · **Priority: P1** · **Confidence: high**
+
+Verified evidence: `.github/workflows/ci.yml` gained a `native-quality` job
+(fmt check, `cargo test --workspace --all-targets --locked`, `clippy -D
+warnings`) plus `cargo test` for the sidecar (was build-only before).
+`.github/workflows/release.yml` got the identical `native-quality` job,
+and both `native-binaries` and `linux-release-assets` now declare `needs:
+native-quality` -- release cannot produce artifacts unless it passes.
+Everything this gate runs was independently re-verified locally this
+session and is green. Separately, `.gitlab-ci.yml`'s trivy container scan
+was changed from `--exit-code 0` (report-only, never fails the pipeline)
+to `--exit-code 1` (actually blocks on HIGH/CRITICAL CVEs) -- not one of
+the 29 named findings but a real release-gate fix in the same spirit. Not
+verified: MSRV is not pinned in the new CI steps (`dtolnay/rust-toolchain@
+stable` tracks whatever's current, not the declared 1.88/1.97 -- worth
+pinning explicitly so CI catches the next MSRV drift instead of only
+catching it when someone runs it locally, as happened this session).
+
+Evidence: `.github/workflows/ci.yml` does not run native workspace tests,
+formatting, clippy, or sidecar/native integration together.
+
+Required action: add a required native quality job and make release depend on
+it; pin/declare the MSRV policy; run locked tests and lint on supported targets.
+
+Acceptance: intentionally broken fmt/test/clippy changes fail CI.
+
+### TNG-026 — Release evidence is stale or weaker than its claims
+
+**Status: Open** · **Priority: P1** · **Confidence: high**
+
+Evidence: certification reports are from May 2026; universal compatibility is
+`PASS_WITH_SKIPS`, the 24h soak is stale/incomplete, security evidence covers
+sidecar config rather than native deployment, scale evidence is synthetic, and
+strict readiness fails.
+
+Required action: refresh evidence against the exact release artifact/config;
+make skipped legs explicit; block release on stale/unknown rows; separate
+synthetic proxy evidence from real deployment claims.
+
+Acceptance: one machine-readable clean release bundle or an explicit blocked
+release report with owner/action/artifact for every remaining row.
+
+### TNG-027 — Claimed fuzz/OpenAPI/idempotency coverage is not checked in
+
+**Status: Open** · **Priority: P1/P2** · **Confidence: high**
+
+Evidence: repository search found no checked-in fuzz targets, OpenAPI source,
+or idempotency test harness despite documentation references.
+
+Required action: add bounded parser/network fuzz targets, generate and validate
+an API schema, and add replay/idempotency tests for mutating endpoints.
+
+Acceptance: CI invokes each target with a bounded smoke budget and publishes
+artifacts.
+
+### TNG-028 — Formatting, clippy, and MSRV are already red
+
+**Status: In progress** · **Priority: P1** · **Confidence: high**
+
+Verified locally (see "Current verified evidence" above for full detail):
+`cargo fmt --all -- --check`, `cargo test --workspace --all-targets
+--locked`, and `cargo clippy --workspace --all-targets --locked -- -D
+warnings` all pass now, including on the actual declared MSRV toolchains
+(1.88 main workspace, 1.97 sidecar -- both `rust-version` fields were
+corrected from an untrue "1.80" to the real, verified floor). Two clippy
+findings were fixed (too-many-arguments on an egress-policy-widened
+function, a redundant `u32 -> u32` cast). Not yet done: CI does not pin
+the MSRV toolchain explicitly (see TNG-025 note) -- until it does, "passes
+the declared toolchain" is only established by this session's manual run,
+not by an enforced, repeatable gate.
+
+Evidence: baseline fmt fails in `rt-migrate`; clippy fails on sort idioms,
+MSRV-incompatible `is_multiple_of`, and a large enum variant.
+
+Required action: repair current failures, document the supported toolchain, and
+make the checks required in CI/release.
+
+Acceptance: local and CI `fmt`, locked test, and `clippy -D warnings` pass on
+the declared toolchain.
+
+## P2 — architecture and maintainability
+
+### TNG-029 — The engine has poor fault/change isolation
+
+**Status: Open** · **Priority: P2** · **Confidence: high**
+
+Evidence: `Engine` is roughly 6.9k lines, `TorrentTask` roughly 4.9k, and
+native handlers roughly 6.6k. Actor orchestration, persistence, storage,
+trackers, peers, DHT, and API projection are tightly coupled.
+
+Required action: create explicit seams for storage jobs, peer admission,
+outbound policy, persistence transactions, runtime aggregation, and capability
+projection; split modules only after contracts and tests exist.
+
+Acceptance: subsystem tests can run without the whole engine; failures are
+contained and health identifies the failed subsystem; no new cross-layer
+global state.
+
+## Claims to delete or downgrade now
+
+Until the corresponding ledger item is resolved, these claims are not release
+claims:
+
+- “100k torrents” as a production capacity guarantee;
+- “pure v2 metadata completion” as a supported native capability;
+- “global” connection/rate limits when enforcement is per torrent/peer;
+- “bounded graceful shutdown” without signal and join tests;
+- “universal compatibility PASS” when rows are skipped or stale;
+- “security PASS” when evidence was run against a different deployment mode;
+- “storage plan safe” when execution authority still accepts caller roots;
+- “fuzz/OpenAPI/idempotency covered” without checked-in targets and CI output.
+
+## Burn-down log
+
+| Date | Change | Evidence | Ledger impact |
+| --- | --- | --- | --- |
+| 2026-09-01 | Created this canonical ledger; captured remediation initiative. | Repository audit baseline above. | All findings explicitly tracked; unsupported claims downgraded. |
+| 2026-09-01 | First remediation tranche (same-day, prior session): started TNG-004/005/006/007/009/012/015/016/017/018/021/023/024/025/028 work; new `network_budget.rs`, `egress_policy` wiring, per-facade auth guards, shutdown reply channels, capability-honesty downgrades, CI native-quality job. Left uncommitted with a hung test suite and 2 known-failing tests (a partially-applied clippy fix in progress). | Session transcript; working-tree diff at handoff. | Real progress on 15 items, but unverified and non-buildable as a checkpoint. |
+| 2026-09-01 | Second session: resumed from the exact handoff point (verified via file content match + no live cargo process), found and fixed a livelock in `network_budget`'s rate limiter (`std::time::Instant` instead of `tokio::time::Instant`, invisible to production but hung the *entire* `cargo test --workspace` under `start_paused` tests), fixed 4 tests asserting old pre-honesty-fix behavior, fixed 1 test-fixture bug (piece-count mismatch, caught by real new validation), fixed 2 clippy findings, corrected both `rust-version` fields from an unverified/untrue "1.80" to the real verified floor (1.88 main, 1.97 sidecar -- transitive-dependency-driven, not first-party code). Independently spot-verified ~10 of the prior session's specific implementation claims against the actual diff rather than trusting the transcript narration (one self-correction recorded in TNG-009's note: initially misread upload rate-limiting as unwired due to an incomplete grep, corrected after checking the real send path). Updated 15 ledger items from Open to In progress or Resolved with cited evidence and explicit gaps; left 14 untouched items (TNG-001/002/003/008/010/011/013/014/019/020/022/026/027/029) as Open -- no work found on any of them. | `cargo test --workspace --all-targets --locked` (green, was hanging), `cargo fmt --all -- --check` (green), `cargo clippy --workspace --all-targets --locked -- -D warnings` (green), `cargo +1.88 test --workspace ...` (green), `cargo +1.97 test --manifest-path sidecar/Cargo.toml ...` (green), `cargo test --manifest-path sidecar/Cargo.toml --locked` (green, 75 passed). | Tree is a real, buildable, green checkpoint for the first time since remediation began. TNG-021 fully Resolved; 14 other items moved Open -> In progress with specific verified evidence and specific remaining gaps recorded per item, so a future session can resume without re-deriving what's already true. |
+
+## Release gate
+
+The native release gate must fail while any P0 item is Open or while TNG-025,
+TNG-026, or TNG-028 is Open. A production-scale claim additionally requires
+TNG-010, TNG-013, and TNG-014 to be Resolved with release-artifact evidence.

@@ -94,11 +94,18 @@ async fn main() -> anyhow::Result<()> {
     );
     let qbit_router = rt_api_qbit::router::build_qbit_router(qbit_state);
 
-    let transmission_state =
-        TransmissionState::with_engine(Arc::clone(&registry), engine_handle.clone());
+    let transmission_state = TransmissionState::with_engine_and_tokens(
+        Arc::clone(&registry),
+        engine_handle.clone(),
+        config.auth.api_tokens.clone(),
+    );
     let transmission_router = rt_api_transmission::build_transmission_router(transmission_state);
 
-    let deluge_state = DelugeState::with_engine(Arc::clone(&registry), engine_handle.clone());
+    let deluge_state = DelugeState::with_engine_and_tokens(
+        Arc::clone(&registry),
+        engine_handle.clone(),
+        config.auth.api_tokens.clone(),
+    );
     let deluge_router = rt_api_deluge::build_deluge_router(deluge_state);
 
     // Merge into a single axum app
@@ -150,28 +157,60 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("binding API to {api_addr}"))?;
 
-    // Graceful shutdown on ctrl-c
-    let engine_for_shutdown = engine_handle.clone();
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            info!(
-                component = "daemon",
-                operation = "shutdown_signal",
-                signal = "ctrl-c",
-                "received ctrl-c, shutting down"
-            );
-            engine_for_shutdown.shutdown().await;
-        }
-    });
-
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(shutdown_signal(engine_handle))
     .await
     .context("API server error")?;
 
     Ok(())
+}
+
+async fn shutdown_signal(engine: rt_engine::EngineHandle) {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate()).ok();
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                if result.is_ok() {
+                    info!(
+                        component = "daemon",
+                        operation = "shutdown_signal",
+                        signal = "ctrl-c",
+                        "received shutdown signal"
+                    );
+                }
+            }
+            _ = async {
+                if let Some(signal) = sigterm.as_mut() {
+                    signal.recv().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                info!(
+                    component = "daemon",
+                    operation = "shutdown_signal",
+                    signal = "sigterm",
+                    "received shutdown signal"
+                );
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        info!(
+            component = "daemon",
+            operation = "shutdown_signal",
+            signal = "ctrl-c",
+            "received shutdown signal"
+        );
+    }
+    engine.shutdown().await;
 }
 
 fn print_help() {
@@ -213,7 +252,13 @@ async fn daemon_auth_guard(
 fn daemon_public_path(path: &str) -> bool {
     matches!(
         path,
-        "/health" | "/api/v1/auth/login" | "/api/v1/auth/logout"
+        "/health"
+            | "/api/v1/auth/login"
+            | "/api/v1/auth/logout"
+            | "/api/qb/v2/auth/login"
+            | "/api/qb/v2/auth/logout"
+            | "/api/v2/auth/login"
+            | "/api/v2/auth/logout"
     ) || is_webui_path(path)
 }
 
@@ -239,9 +284,39 @@ fn session_cookie(headers: &HeaderMap, cookie_name: &str) -> Option<String> {
         .and_then(|cookie| {
             cookie.split(';').find_map(|part| {
                 let part = part.trim();
-                part.strip_prefix(&prefix).map(str::to_owned)
+                part.strip_prefix(&prefix).and_then(cookie_component_decode)
             })
         })
+}
+
+fn cookie_component_decode(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            output.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        if index + 2 >= bytes.len() {
+            return None;
+        }
+        let high = hex_value(bytes[index + 1])?;
+        let low = hex_value(bytes[index + 2])?;
+        output.push((high << 4) | low);
+        index += 3;
+    }
+    String::from_utf8(output).ok()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 async fn request_log(req: Request<Body>, next: Next) -> Response {
@@ -320,6 +395,14 @@ fn is_static_asset_path(path: &str) -> bool {
     )
 }
 
+fn load_config() -> anyhow::Result<Config> {
+    if let Ok(path) = std::env::var("TORRENTNGD_CONFIG") {
+        return Config::load(std::path::Path::new(&path))
+            .with_context(|| format!("loading explicit config from {path}"));
+    }
+    Config::load_default().context("loading default config")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{daemon_public_path, request_id, skip_request_log, static_dir};
@@ -391,12 +474,4 @@ mod tests {
         headers.insert("x-request-id", HeaderValue::from_static(""));
         assert!(request_id(&headers).starts_with("tng-"));
     }
-}
-
-fn load_config() -> anyhow::Result<Config> {
-    if let Ok(path) = std::env::var("TORRENTNGD_CONFIG") {
-        return Config::load(std::path::Path::new(&path))
-            .with_context(|| format!("loading explicit config from {path}"));
-    }
-    Ok(Config::load_default())
 }

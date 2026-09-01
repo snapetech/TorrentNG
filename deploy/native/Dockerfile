@@ -3,7 +3,7 @@ FROM rust:1.96-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN cargo build --release -p torrentngd
+RUN cargo build --release --locked -p torrentngd
 
 FROM node:22-bookworm-slim AS webui-build
 
@@ -32,7 +32,7 @@ ENV RUST_LOG=info
 
 USER torrentngd
 VOLUME ["/data", "/var/lib/torrentngd", "/config"]
-EXPOSE 8080 6881 6881/udp
+EXPOSE 8080 44444 44444/udp
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/torrentngd"]
 CMD []

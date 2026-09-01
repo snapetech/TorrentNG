@@ -7,9 +7,11 @@ use std::{
 };
 
 use axum::{
+    body::Body,
     extract::State,
     http::{HeaderMap, HeaderValue, StatusCode},
-    response::IntoResponse,
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::post,
     Json, Router,
 };
@@ -32,6 +34,7 @@ const MAX_TRANSMISSION_BATCH_REQUESTS: usize = 128;
 pub struct AppState {
     pub registry: Arc<RwLock<SessionRegistry>>,
     pub engine: Option<EngineHandle>,
+    pub api_tokens: Arc<Vec<String>>,
     pub session: Arc<RwLock<TransmissionSessionSettings>>,
     pub torrent_limits: Arc<RwLock<HashMap<String, EngineTorrentLimits>>>,
     pub torrent_groups: Arc<RwLock<HashMap<String, String>>>,
@@ -163,6 +166,7 @@ impl AppState {
         Self {
             registry,
             engine: None,
+            api_tokens: Arc::new(Vec::new()),
             session: Arc::new(RwLock::new(TransmissionSessionSettings::default())),
             torrent_limits: Arc::new(RwLock::new(HashMap::new())),
             torrent_groups: Arc::new(RwLock::new(HashMap::new())),
@@ -173,9 +177,18 @@ impl AppState {
     }
 
     pub fn with_engine(registry: Arc<RwLock<SessionRegistry>>, engine: EngineHandle) -> Self {
+        Self::with_engine_and_tokens(registry, engine, Vec::new())
+    }
+
+    pub fn with_engine_and_tokens(
+        registry: Arc<RwLock<SessionRegistry>>,
+        engine: EngineHandle,
+        api_tokens: Vec<String>,
+    ) -> Self {
         Self {
             registry,
             engine: Some(engine),
+            api_tokens: Arc::new(api_tokens),
             session: Arc::new(RwLock::new(TransmissionSessionSettings::default())),
             torrent_limits: Arc::new(RwLock::new(HashMap::new())),
             torrent_groups: Arc::new(RwLock::new(HashMap::new())),
@@ -208,7 +221,52 @@ pub fn build_transmission_router(state: AppState) -> Router {
     Router::new()
         .route("/transmission/rpc", post(rpc))
         .route("/api/transmission/rpc", post(rpc))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            transmission_auth_guard,
+        ))
         .with_state(state)
+}
+
+async fn transmission_auth_guard(
+    State(state): State<AppState>,
+    req: axum::http::Request<Body>,
+    next: Next,
+) -> Response {
+    if state.api_tokens.is_empty()
+        || presented_token(req.headers())
+            .is_some_and(|token| state.api_tokens.iter().any(|allowed| allowed == &token))
+    {
+        return next.run(req).await;
+    }
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "result": "authentication required"
+        })),
+    )
+        .into_response()
+}
+
+fn presented_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::to_owned)
+        .or_else(|| {
+            headers
+                .get("cookie")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|cookie| {
+                    cookie.split(';').find_map(|part| {
+                        part.trim()
+                            .strip_prefix("tng_session=")
+                            .or_else(|| part.trim().strip_prefix("SID="))
+                            .map(str::to_owned)
+                    })
+                })
+        })
 }
 
 async fn rpc(
@@ -271,12 +329,12 @@ async fn transmission_rpc_payload(state: &AppState, body: Value) -> Value {
     let tag = body.get("tag").cloned();
     let id = body.get("id").cloned().unwrap_or(Value::Null);
     let result = match method_key.as_str() {
-        "session-get" => Ok(session_get(&state, &args).await),
-        "session-stats" => Ok(session_stats(&state).await),
+        "session-get" => Ok(session_get(state, &args).await),
+        "session-stats" => Ok(session_stats(state).await),
         "session-close" => Ok(json!({})),
-        "session-set" => session_set(&state, &args).await,
-        "session-subscribe" => session_subscribe(&state, &args).await,
-        "session-unsubscribe" => session_unsubscribe(&state, &args).await,
+        "session-set" => session_set(state, &args).await,
+        "session-subscribe" => session_subscribe(state, &args).await,
+        "session-unsubscribe" => session_unsubscribe(state, &args).await,
         "session-access-control" => {
             let session = state.session.read().await;
             Ok(json!({
@@ -287,19 +345,19 @@ async fn transmission_rpc_payload(state: &AppState, body: Value) -> Value {
                 "rpc-bind-address": session.rpc_bind_address,
             }))
         }
-        "group-get" => group_get(&state, &args).await,
-        "group-set" => group_set(&state, &args).await,
-        "torrent-set" => torrent_set(&state, &args).await,
-        "torrent-set-tracker-list" => torrent_set_tracker_list(&state, &args).await,
-        "torrent-set-file-priorities" => torrent_set_file_priorities(&state, &args).await,
-        "torrent-set-file-wanted" => torrent_set_file_wanted(&state, &args, true).await,
-        "torrent-set-file-unwanted" => torrent_set_file_wanted(&state, &args, false).await,
-        "queue-move-top" => transmission_queue_move(&state, &args, QueueMove::Top).await,
-        "queue-move-up" => transmission_queue_move(&state, &args, QueueMove::Up).await,
-        "queue-move-down" => transmission_queue_move(&state, &args, QueueMove::Down).await,
-        "queue-move-bottom" => transmission_queue_move(&state, &args, QueueMove::Bottom).await,
-        "queue-stalled-enable" => queue_stalled_set(&state, true).await,
-        "queue-stalled-disable" => queue_stalled_set(&state, false).await,
+        "group-get" => group_get(state, &args).await,
+        "group-set" => group_set(state, &args).await,
+        "torrent-set" => torrent_set(state, &args).await,
+        "torrent-set-tracker-list" => torrent_set_tracker_list(state, &args).await,
+        "torrent-set-file-priorities" => torrent_set_file_priorities(state, &args).await,
+        "torrent-set-file-wanted" => torrent_set_file_wanted(state, &args, true).await,
+        "torrent-set-file-unwanted" => torrent_set_file_wanted(state, &args, false).await,
+        "queue-move-top" => transmission_queue_move(state, &args, QueueMove::Top).await,
+        "queue-move-up" => transmission_queue_move(state, &args, QueueMove::Up).await,
+        "queue-move-down" => transmission_queue_move(state, &args, QueueMove::Down).await,
+        "queue-move-bottom" => transmission_queue_move(state, &args, QueueMove::Bottom).await,
+        "queue-stalled-enable" => queue_stalled_set(state, true).await,
+        "queue-stalled-disable" => queue_stalled_set(state, false).await,
         "port-test" => Ok(json!({"port-is-open": true})),
         "blocklist-update" => Ok(json!({
             "blocklist-size": state.session.read().await.blocklist_size,
@@ -307,8 +365,8 @@ async fn transmission_rpc_payload(state: &AppState, body: Value) -> Value {
         "free-space" => Ok(
             json!({"path": args.get("path").and_then(Value::as_str).unwrap_or(""), "size-bytes": 0}),
         ),
-        "torrent-get" => torrent_get(&state, &args).await,
-        "torrent-add" => torrent_add(&state, &args).await,
+        "torrent-get" => torrent_get(state, &args).await,
+        "torrent-add" => torrent_add(state, &args).await,
         "torrent-set-location" => {
             let Some(location) = args.get("location").and_then(Value::as_str) else {
                 return transmission_response(
@@ -318,7 +376,7 @@ async fn transmission_rpc_payload(state: &AppState, body: Value) -> Value {
                     Err("missing location".to_owned()),
                 );
             };
-            for hash in ids(&state, &args).await {
+            for hash in ids(state, &args).await {
                 if let Some(engine) = &state.engine {
                     let _ = engine
                         .update_torrent_fields(hash, None, Some(std::path::PathBuf::from(location)))
@@ -332,9 +390,9 @@ async fn transmission_rpc_payload(state: &AppState, body: Value) -> Value {
             }
             Ok(json!({}))
         }
-        "torrent-rename-path" => torrent_rename_path(&state, &args).await,
+        "torrent-rename-path" => torrent_rename_path(state, &args).await,
         "torrent-start" | "torrent-start-now" => {
-            for hash in ids(&state, &args).await {
+            for hash in ids(state, &args).await {
                 if let Some(engine) = &state.engine {
                     let _ = engine.resume_torrent(hash).await;
                 }
@@ -342,7 +400,7 @@ async fn transmission_rpc_payload(state: &AppState, body: Value) -> Value {
             Ok(json!({}))
         }
         "torrent-stop" => {
-            for hash in ids(&state, &args).await {
+            for hash in ids(state, &args).await {
                 if let Some(engine) = &state.engine {
                     let _ = engine.pause_torrent(hash).await;
                 }
@@ -350,7 +408,7 @@ async fn transmission_rpc_payload(state: &AppState, body: Value) -> Value {
             Ok(json!({}))
         }
         "torrent-verify" => {
-            for hash in ids(&state, &args).await {
+            for hash in ids(state, &args).await {
                 if let Some(engine) = &state.engine {
                     let _ = engine.recheck_torrent(hash).await;
                 }
@@ -358,7 +416,7 @@ async fn transmission_rpc_payload(state: &AppState, body: Value) -> Value {
             Ok(json!({}))
         }
         "torrent-reannounce" => {
-            for hash in ids(&state, &args).await {
+            for hash in ids(state, &args).await {
                 if let Some(engine) = &state.engine {
                     let _ = engine.reannounce_torrent(hash).await;
                 }
@@ -370,7 +428,7 @@ async fn transmission_rpc_payload(state: &AppState, body: Value) -> Value {
                 .get("delete-local-data")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            for hash in ids(&state, &args).await {
+            for hash in ids(state, &args).await {
                 if let Some(engine) = &state.engine {
                     let _ = engine.remove_torrent(hash, delete_files).await;
                 }
@@ -521,7 +579,12 @@ async fn group_get(state: &AppState, args: &Value) -> Result<Value, String> {
     let groups = state.groups.read().await;
     let groups = groups
         .values()
-        .filter(|group| requested.as_ref().is_none_or(|name| &group.name == name))
+        .filter(|group| {
+            requested
+                .as_ref()
+                .map(|name| &group.name == name)
+                .unwrap_or(true)
+        })
         .map(transmission_group_json)
         .collect::<Vec<_>>();
     Ok(json!({ "groups": groups }))
@@ -2356,6 +2419,46 @@ mod tests {
     use rt_engine::{EnginePieceState, EngineTorrentFile, EngineTrackerSnapshot};
     use rt_session::TorrentEntry;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn transmission_router_enforces_configured_token() {
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        let mut state = AppState::new(Arc::clone(&registry));
+        state.api_tokens = Arc::new(vec!["secret".to_owned()]);
+        let app = build_transmission_router(state);
+
+        let denied = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .body(Body::from(r#"{"method":"session-get"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let allowed = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"method":"session-get"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // A correctly-authenticated request without the Transmission
+        // session-id header still gets the RPC layer's own 409 CSRF
+        // challenge -- auth and the Transmission session-id dance are
+        // independent checks, and auth must run first (see the 401 case
+        // above) without masking or short-circuiting the second one.
+        assert_eq!(allowed.status(), StatusCode::CONFLICT);
+    }
 
     #[tokio::test]
     async fn transmission_session_id_handshake() {

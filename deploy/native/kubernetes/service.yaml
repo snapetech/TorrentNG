@@ -13,10 +13,10 @@ spec:
       port: 8080
       targetPort: http
     - name: bittorrent-tcp
-      port: 6881
+      port: 44444
       targetPort: bittorrent-tcp
       protocol: TCP
     - name: bittorrent-udp
-      port: 6881
+      port: 44444
       targetPort: bittorrent-udp
       protocol: UDP

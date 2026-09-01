@@ -29,10 +29,10 @@ spec:
             - name: http
               containerPort: 8080
             - name: bittorrent-tcp
-              containerPort: 6881
+              containerPort: 44444
               protocol: TCP
             - name: bittorrent-udp
-              containerPort: 6881
+              containerPort: 44444
               protocol: UDP
           readinessProbe:
             httpGet:

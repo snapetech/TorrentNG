@@ -49,13 +49,13 @@ pub fn raise_nofile_limit() -> u64 {
                         component = "storage",
                         operation = "set_nofile_limit",
                         result = "error",
-                        soft = rlim.rlim_cur as u64,
-                        hard = rlim.rlim_max as u64,
+                        soft = rlim.rlim_cur,
+                        hard = rlim.rlim_max,
                         "setrlimit(RLIMIT_NOFILE) failed; keeping soft limit"
                     );
                 }
             }
-            rlim.rlim_cur as u64
+            rlim.rlim_cur
         }
     }
     #[cfg(not(unix))]

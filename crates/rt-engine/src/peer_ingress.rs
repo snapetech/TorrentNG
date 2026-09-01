@@ -80,6 +80,11 @@ impl PeerIngressBudget {
                 Ok(PeerIngressPermit { _global: permit })
             }
             Err(_) => {
+                // The per-IP reservation is a rate-window admission record,
+                // but this connection never became an admitted handshake.
+                // Roll it back so a saturated global budget cannot permanently
+                // poison an otherwise healthy source IP until the window ends.
+                self.release_ip_slot(peer_addr.ip(), now);
                 self.rejected_global_budget.fetch_add(1, Ordering::Relaxed);
                 Err(PeerIngressReject::GlobalBudget)
             }
@@ -124,6 +129,22 @@ impl PeerIngressBudget {
         }
         events.push_back(now);
         true
+    }
+
+    fn release_ip_slot(&self, ip: IpAddr, now: Instant) {
+        let mut per_ip = self
+            .per_ip
+            .lock()
+            .expect("peer ingress budget mutex poisoned");
+        let Some(events) = per_ip.get_mut(&ip) else {
+            return;
+        };
+        if events.back().copied() == Some(now) {
+            events.pop_back();
+        }
+        if events.is_empty() {
+            per_ip.remove(&ip);
+        }
     }
 }
 
@@ -194,6 +215,26 @@ mod tests {
 
         assert!(budget
             .try_begin(addr(4), now + Duration::from_secs(31))
+            .is_ok());
+    }
+
+    #[test]
+    fn global_rejection_does_not_consume_per_ip_slot() {
+        let budget = PeerIngressBudget::new(PeerIngressConfig {
+            max_global_handshakes: 1,
+            max_handshakes_per_ip: 1,
+            per_ip_window: Duration::from_secs(30),
+            handshake_timeout: Duration::from_secs(5),
+        });
+        let now = Instant::now();
+        let first = budget.try_begin(addr(1), now).unwrap();
+        assert!(matches!(
+            budget.try_begin(SocketAddr::from(([192, 0, 2, 11], 2)), now),
+            Err(PeerIngressReject::GlobalBudget)
+        ));
+        drop(first);
+        assert!(budget
+            .try_begin(SocketAddr::from(([192, 0, 2, 11], 2)), now)
             .is_ok());
     }
 }

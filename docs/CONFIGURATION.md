@@ -137,6 +137,10 @@ precedence over both.
 
 ### Native minimal example
 
+An empty token list is only valid on a loopback API bind. Use a randomly
+generated token of at least 16 characters before changing `api_bind` to a
+non-loopback address; placeholder tokens are rejected at startup.
+
 ```toml
 [daemon]
 api_bind = "127.0.0.1:8080"
@@ -146,7 +150,8 @@ session_dir = "/var/lib/torrentngd"
 download_dir = "/data"
 
 [auth]
-api_tokens = ["change-me"]
+# Loopback-only native development mode. Public binds require real tokens.
+api_tokens = []
 ```
 
 ### Native full example

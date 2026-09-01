@@ -440,12 +440,12 @@ impl UringBackend {
             let reason = format!(
                 "io_uring probe succeeded; registered_files={registered_files} fixed_buffers={fixed_buffers}"
             );
-            return Ok(UringProbe {
+            Ok(UringProbe {
                 usable: true,
                 registered_files,
                 fixed_buffers,
                 reason,
-            });
+            })
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -811,9 +811,7 @@ impl UringWorker {
                 .flags(types::FsyncFlags::DATASYNC)
                 .build()
                 .user_data(id);
-                if let Err(e) = self.push_entry(entry) {
-                    return Err(e);
-                }
+                self.push_entry(entry)?;
                 self.pending.insert(id, PendingUring::Sync { file, reply });
             }
         }
@@ -1450,8 +1448,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn uring_fixed_buffer_registration_budget_stays_below_common_memlock_limit() {
-        assert!(URING_FIXED_BUFFER_SLOTS < URING_BATCH_LIMIT);
-        assert!(URING_FIXED_BUFFER_SLOTS * URING_FIXED_BUFFER_LEN <= 4 * 1024 * 1024);
+        const {
+            assert!(URING_FIXED_BUFFER_SLOTS < URING_BATCH_LIMIT);
+            assert!(URING_FIXED_BUFFER_SLOTS * URING_FIXED_BUFFER_LEN <= 4 * 1024 * 1024);
+        }
     }
 
     #[test]

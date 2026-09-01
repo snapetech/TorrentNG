@@ -46,7 +46,7 @@ path = "/var/lib/torrentngd/state.db"
 wal_checkpoint_pages = 1000
 
 [auth]
-api_tokens = ["change-me"]
+api_tokens = ["REPLACE_WITH_RANDOM_TOKEN"]
 
 [logging]
 format = "json"

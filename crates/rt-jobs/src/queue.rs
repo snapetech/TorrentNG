@@ -80,7 +80,7 @@ impl JobQueue {
     /// All jobs, sorted by created_at descending.
     pub fn all_jobs(&self) -> Vec<&Job> {
         let mut jobs: Vec<&Job> = self.jobs.values().collect();
-        jobs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        jobs.sort_by_key(|job| std::cmp::Reverse(job.created_at));
         jobs
     }
 
