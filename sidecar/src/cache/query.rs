@@ -378,7 +378,7 @@ fn build_where(p: &ListParams) -> (String, Vec<String>) {
             "seeding" => clauses.push("t.complete=1 AND t.is_active=1".into()),
             "downloading" => clauses.push("t.complete=0 AND t.is_active=1".into()),
             "completed" => clauses.push("t.complete=1".into()),
-            "active" => clauses.push("t.is_active=1".into()),
+            "active" | "resumed" => clauses.push("t.is_active=1".into()),
             "inactive" => clauses.push("t.is_active=0".into()),
             "queued" => clauses.push("t.state=1 AND t.is_open=0".into()),
             "paused" | "stopped" => clauses.push("t.state=0 AND t.is_active=0".into()),

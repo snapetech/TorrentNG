@@ -2786,7 +2786,35 @@ mod tests {
         rtorrent::TransferRates,
     };
 
-    use super::{qb_server_state, qbit_log_entry, to_qb_torrent, LogMainQuery};
+    use super::{is_status_filter, qb_server_state, qbit_log_entry, to_qb_torrent, LogMainQuery};
+
+    #[test]
+    fn is_status_filter_recognizes_every_bucket_build_where_handles() {
+        // Every status string cache::query::build_where() actually matches
+        // on must be recognized here too, or qb-compat callers (Sonarr,
+        // Radarr, Prowlarr, autobrr) filtering on it silently get treated
+        // as a free-text name search instead.
+        for status in [
+            "downloading",
+            "seeding",
+            "completed",
+            "running",
+            "queued",
+            "paused",
+            "stopped",
+            "active",
+            "inactive",
+            "stalled",
+            "stalled_uploading",
+            "stalled_downloading",
+            "checking",
+            "moving",
+            "errored",
+        ] {
+            assert!(is_status_filter(status), "{status} should be a recognized status filter");
+        }
+        assert!(!is_status_filter("not-a-real-status"));
+    }
 
     #[test]
     fn qb_server_state_includes_current_transfer_rates() {
@@ -3115,16 +3143,24 @@ fn map_sort(s: &str) -> &str {
 }
 
 fn is_status_filter(f: &str) -> bool {
+    // Kept in sync with every status arm build_where() (cache/query.rs)
+    // actually handles -- a name missing here silently falls back to a
+    // free-text name search instead of the intended status bucket.
     matches!(
         f,
         "downloading"
             | "seeding"
             | "completed"
             | "paused"
+            | "stopped"
+            | "running"
+            | "queued"
             | "active"
             | "inactive"
             | "resumed"
             | "stalled"
+            | "stalled_uploading"
+            | "stalled_downloading"
             | "checking"
             | "moving"
             | "errored"
