@@ -1,5 +1,8 @@
 # Stage 1: Build Rust sidecar
-FROM rust:1.96-alpine AS sidecar-build
+# Must track sidecar/Cargo.toml's rust-version (verified against the
+# locked dependency graph -- see docs/BACKEND_AUDIT_BURN_DOWN.md TNG-028).
+# libsqlite3-sys's build script uses cfg_select!, requiring 1.97+.
+FROM rust:1.97-alpine AS sidecar-build
 RUN apk add --no-cache musl-dev pkgconf openssl-dev openssl-libs-static
 WORKDIR /src
 RUN printf '%s\n' \
