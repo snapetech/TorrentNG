@@ -155,18 +155,75 @@ rollback, and restart tests with no writes to the old path after commit.
 
 ### TNG-003 — Copy verification and rollback semantics are too weak
 
-**Status: Open** · **Priority: P0** · **Confidence: high**
+**Status: In progress** · **Priority: P0** · **Confidence: high**
 
-Evidence: `crates/rt-storage/src/plan.rs` verifies aggregate lengths rather than
-content hashes, and rollback drops failed steps instead of reporting a complete
-and independently auditable rollback result.
+Original evidence: `crates/rt-storage/src/plan.rs` verified aggregate lengths
+rather than content hashes, and rollback dropped failed steps instead of
+reporting a complete and independently auditable rollback result.
 
-Required action: verify copied content at the piece/file level before commit;
-record per-step state and rollback errors; make partial completion explicit and
-resumable; never report success after an unverified copy.
+Verified evidence (this session): both headline complaints are now fixed with
+real code and real tests, not just claims.
 
-Acceptance: bit-flip, short-read, permission failure, destination-full, partial
-rollback, resume, and idempotent retry tests.
+- Content verification: `copy_verify()` (`plan.rs:609`) now calls
+  `verify_content_matches()` (`plan.rs:641`) after `verify_path_len()`
+  succeeds -- a streaming SHA-1 comparison (`hash_file_sha1`, 64KB buffer,
+  never loads a whole file into memory) of every regular file, recursing
+  through directories, rejecting symlinks on either side, and erroring
+  clearly on a dir/file type mismatch. New test
+  `verify_content_matches_detects_bit_flip_despite_matching_length` proves
+  this directly: two 10-byte files, one byte different, same length --
+  `verify_path_len` alone would have accepted it, `verify_content_matches`
+  correctly rejects it with a `StagedMoveFailed { step: "verify-content" }`
+  and a "content hash mismatch" message.
+- Rollback honesty: `StoragePlanExecution` gained a
+  `rollback_failures: Vec<(StoragePlanStep, String)>` field and a
+  `rollback_fully_succeeded()` helper. `rollback_plan()` (`plan.rs:568`) was
+  rewritten to return `(Vec<StoragePlanStep>, Vec<(StoragePlanStep, String)>)`
+  -- it used to silently drop any rollback step that itself failed
+  (`if execute_step(step).is_ok() { ... }`, discarding the `Err` entirely).
+  Now every rollback step is still attempted (a failing one does not abort
+  the rest), and failures are captured with their reasons. Since the only
+  caller that currently exists (`engine.rs`'s `execute_storage_plan_job`)
+  only persists `error.to_string()` and discards the returned
+  `StoragePlanExecution`, the failure detail is folded into the returned
+  `StorageError::StagedMoveFailed` message itself
+  (`execute_storage_plan_with_checkpoints`, `plan.rs:290`), e.g. "...;
+  ADDITIONALLY 1 rollback step(s) failed and left the filesystem in a
+  partial state requiring manual attention: SafeDelete <path> -> : <reason>".
+  New test `execute_plan_reports_rollback_step_failure_in_error_message`
+  proves this: a plan whose primary step fails, with two rollback steps (one
+  that succeeds, one pointing at a nonexistent path that fails) -- asserts
+  the surfaced error names the failing path, and that the rollback step
+  which *could* succeed still ran and cleaned up its target despite the
+  other one failing.
+- Existing test `execute_copy_verify_plan_rolls_back_staged_file_on_short_copy`
+  continues to cover the short-read case (verified still passing).
+- Full workspace `cargo test --workspace --all-targets --locked`,
+  `cargo fmt --all -- --check`, and
+  `cargo clippy --workspace --all-targets --locked -- -D warnings` all green
+  after this change (111 tests now passing in `rt-storage` alone, up from
+  109).
+
+Not yet evidenced (why this stays "In progress", not "Resolved"): permission
+failure, destination-full, resume-after-partial-completion, and
+idempotent-retry tests from the original acceptance list are still missing.
+`execute_storage_plan_with_checkpoints` already has a `completed_steps`
+resume parameter (pre-existing), but nothing exercises resuming a plan that
+was interrupted mid-way, and nothing simulates `EACCES`/`ENOSPC` from the
+underlying filesystem calls. TNG-002 (storage moves racing active writes) is
+a separate, still-fully-open finding -- this item is scoped to
+copy-verify-rollback correctness only, not concurrency safety.
+
+Required action (remaining): permission-failure and destination-full
+simulation tests (likely via a restricted-permission tempdir or a mock/small
+tmpfs quota, since Rust has no portable disk-full injection); an explicit
+resume-after-interruption test using the existing `completed_steps`
+parameter; an idempotent-retry test (running the same plan twice after a
+partial failure doesn't corrupt state further).
+
+Acceptance: bit-flip (done), short-read (done, pre-existing), permission
+failure (missing), destination-full (missing), partial rollback (done),
+resume (missing), and idempotent retry (missing) tests.
 
 ### TNG-004 — Torrent-controlled integers can wrap or overflow
 
@@ -799,7 +856,8 @@ claims:
 | --- | --- | --- | --- |
 | 2026-09-01 | Created this canonical ledger; captured remediation initiative. | Repository audit baseline above. | All findings explicitly tracked; unsupported claims downgraded. |
 | 2026-09-01 | First remediation tranche (same-day, prior session): started TNG-004/005/006/007/009/012/015/016/017/018/021/023/024/025/028 work; new `network_budget.rs`, `egress_policy` wiring, per-facade auth guards, shutdown reply channels, capability-honesty downgrades, CI native-quality job. Left uncommitted with a hung test suite and 2 known-failing tests (a partially-applied clippy fix in progress). | Session transcript; working-tree diff at handoff. | Real progress on 15 items, but unverified and non-buildable as a checkpoint. |
-| 2026-09-01 | Second session: resumed from the exact handoff point (verified via file content match + no live cargo process), found and fixed a livelock in `network_budget`'s rate limiter (`std::time::Instant` instead of `tokio::time::Instant`, invisible to production but hung the *entire* `cargo test --workspace` under `start_paused` tests), fixed 4 tests asserting old pre-honesty-fix behavior, fixed 1 test-fixture bug (piece-count mismatch, caught by real new validation), fixed 2 clippy findings, corrected both `rust-version` fields from an unverified/untrue "1.80" to the real verified floor (1.88 main, 1.97 sidecar -- transitive-dependency-driven, not first-party code). Independently spot-verified ~10 of the prior session's specific implementation claims against the actual diff rather than trusting the transcript narration (one self-correction recorded in TNG-009's note: initially misread upload rate-limiting as unwired due to an incomplete grep, corrected after checking the real send path). Updated 15 ledger items from Open to In progress or Resolved with cited evidence and explicit gaps; left 14 untouched items (TNG-001/002/003/008/010/011/013/014/019/020/022/026/027/029) as Open -- no work found on any of them. | `cargo test --workspace --all-targets --locked` (green, was hanging), `cargo fmt --all -- --check` (green), `cargo clippy --workspace --all-targets --locked -- -D warnings` (green), `cargo +1.88 test --workspace ...` (green), `cargo +1.97 test --manifest-path sidecar/Cargo.toml ...` (green), `cargo test --manifest-path sidecar/Cargo.toml --locked` (green, 75 passed). | Tree is a real, buildable, green checkpoint for the first time since remediation began. TNG-021 fully Resolved; 14 other items moved Open -> In progress with specific verified evidence and specific remaining gaps recorded per item, so a future session can resume without re-deriving what's already true. |
+| 2026-09-01 | Second session: resumed from the exact handoff point (verified via file content match + no live cargo process), found and fixed a livelock in `network_budget`'s rate limiter (`std::time::Instant` instead of `tokio::time::Instant`, invisible to production but hung the *entire* `cargo test --workspace` under `start_paused` tests), fixed 4 tests asserting old pre-honesty-fix behavior, fixed 1 test-fixture bug (piece-count mismatch, caught by real new validation), fixed 2 clippy findings, corrected both `rust-version` fields from an unverified/untrue "1.80" to the real verified floor (1.88 main, 1.97 sidecar -- transitive-dependency-driven, not first-party code). Independently spot-verified ~10 of the prior session's specific implementation claims against the actual diff rather than trusting the transcript narration (one self-correction recorded in TNG-009's note: initially misread upload rate-limiting as unwired due to an incomplete grep, corrected after checking the real send path). Updated 15 ledger items from Open to In progress or Resolved with cited evidence and explicit gaps; left 14 untouched items (TNG-001/002/003/008/010/011/013/014/019/020/022/026/027/029) as Open -- no work found on any of them; a closer pass then found real TNG-001 evidence that a first look missed and corrected its status. | `cargo test --workspace --all-targets --locked` (green, was hanging), `cargo fmt --all -- --check` (green), `cargo clippy --workspace --all-targets --locked -- -D warnings` (green), `cargo +1.88 test --workspace ...` (green), `cargo +1.97 test --manifest-path sidecar/Cargo.toml ...` (green), `cargo test --manifest-path sidecar/Cargo.toml --locked` (green, 75 passed). | Tree is a real, buildable, green checkpoint for the first time since remediation began. TNG-021 fully Resolved; other items moved Open -> In progress with specific verified evidence and specific remaining gaps recorded per item, so a future session can resume without re-deriving what's already true. Committed as `a479bf0`. |
+| 2026-09-01 | Third session (same date, continuing "build it all out"): implemented TNG-003's two headline complaints for real. Added streaming SHA-1 content verification (`verify_content_matches`/`hash_file_sha1` in `crates/rt-storage/src/plan.rs`) so `copy_verify()` no longer trusts aggregate length alone. Rewrote `rollback_plan()` to return both succeeded and *failed* rollback steps (previously a failed rollback step was silently dropped via `.is_ok()`); failures are folded into the returned `StorageError` message since that is the only channel the existing caller (`engine.rs`'s `execute_storage_plan_job`) reads. Added `StoragePlanExecution::rollback_failures` + `rollback_fully_succeeded()`. Wrote two new targeted tests: a same-length bit-flip that length-only verification would have missed, and a rollback step that itself fails being surfaced in the error while the other rollback step still runs. | `cargo build -p rt-storage` (clean), `cargo test -p rt-storage --lib` (111 passed, up from 109, 0 failed), full `cargo test --workspace --all-targets --locked` (green), `cargo fmt --all -- --check` (green), `cargo clippy --workspace --all-targets --locked -- -D warnings` (green). | TNG-003 moved Open -> In progress (not Resolved: permission-failure, destination-full, resume-after-interruption, and idempotent-retry tests from its acceptance list are still missing -- see item detail). |
 
 ## Release gate
 

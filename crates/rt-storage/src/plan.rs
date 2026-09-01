@@ -264,6 +264,23 @@ pub fn ensure_plan_can_apply(plan: &StoragePlan) -> Result<(), StorageError> {
 pub struct StoragePlanExecution {
     pub applied_steps: Vec<StoragePlanStep>,
     pub rolled_back_steps: Vec<StoragePlanStep>,
+    /// Rollback steps that were *attempted* but themselves failed, with the
+    /// reason. TNG-003: a rollback step failing silently is worse than the
+    /// original failure -- it means partial state was left behind with no
+    /// record that it needs manual attention. Never populated on a fully
+    /// successful rollback.
+    pub rollback_failures: Vec<(StoragePlanStep, String)>,
+}
+
+impl StoragePlanExecution {
+    /// True if no rollback step failed -- vacuously true when execution
+    /// succeeded and no rollback was attempted at all. When execution did
+    /// fail, callers must check this (not just that `execute_storage_plan`
+    /// returned an error) before assuming the filesystem is back to its
+    /// pre-execution state.
+    pub fn rollback_fully_succeeded(&self) -> bool {
+        self.rollback_failures.is_empty()
+    }
 }
 
 pub fn execute_storage_plan(plan: &StoragePlan) -> Result<StoragePlanExecution, StorageError> {
@@ -291,10 +308,48 @@ where
             continue;
         }
         if let Err(error) = execute_step(step) {
-            execution.rolled_back_steps = rollback_plan(plan);
+            let (rolled_back, rollback_failures) = rollback_plan(plan);
+            execution.rolled_back_steps = rolled_back;
+            execution.rollback_failures = rollback_failures;
+            // TNG-003: a rollback step that itself fails is worse than the
+            // original failure -- it means files were left in a partial
+            // state with nothing recording that fact. Previously this was
+            // silently dropped (rollback_plan only returned steps that
+            // succeeded); now it's folded into the error message, since
+            // that message is the only thing every current caller actually
+            // reads (see engine.rs's execute_storage_plan_job, which
+            // persists `error.to_string()` as the job's failure reason and
+            // otherwise discards the returned StoragePlanExecution).
+            let reason = if execution.rollback_failures.is_empty() {
+                error.to_string()
+            } else {
+                let failures = execution
+                    .rollback_failures
+                    .iter()
+                    .map(|(step, reason)| {
+                        format!(
+                            "{:?} {} -> {}: {reason}",
+                            step.action,
+                            step.source
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_default(),
+                            step.destination
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_default(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                format!(
+                    "{error}; ADDITIONALLY {} rollback step(s) failed and left the filesystem in a partial state requiring manual attention: {failures}",
+                    execution.rollback_failures.len()
+                )
+            };
             return Err(StorageError::StagedMoveFailed {
                 step: "execute",
-                reason: error.to_string(),
+                reason,
             });
         }
         checkpoint_step(index, step)?;
@@ -505,14 +560,21 @@ fn resolve_confined_path(path: &Path) -> Result<PathBuf, StorageError> {
     Ok(resolved)
 }
 
-fn rollback_plan(plan: &StoragePlan) -> Vec<StoragePlanStep> {
+/// Runs every rollback step, continuing past individual failures (a failed
+/// rollback step must not prevent attempting the rest -- each one is
+/// independent staging/cleanup). Returns which steps succeeded and, just as
+/// importantly, which ones failed and why: TNG-003 explicitly calls out
+/// that dropping failed rollback steps silently is not acceptable.
+fn rollback_plan(plan: &StoragePlan) -> (Vec<StoragePlanStep>, Vec<(StoragePlanStep, String)>) {
     let mut rolled_back = Vec::new();
+    let mut failures = Vec::new();
     for step in &plan.rollback_steps {
-        if execute_step(step).is_ok() {
-            rolled_back.push(step.clone());
+        match execute_step(step) {
+            Ok(()) => rolled_back.push(step.clone()),
+            Err(error) => failures.push((step.clone(), error.to_string())),
         }
     }
-    rolled_back
+    (rolled_back, failures)
 }
 
 fn required_path<'a>(
@@ -561,7 +623,106 @@ fn copy_verify(source: &Path, destination: &Path, expected_bytes: u64) -> Result
             reason: format!("unsupported file type: {}", source.display()),
         });
     }
-    verify_path_len(destination, expected_bytes)
+    // TNG-003: length matching alone can't catch a bit-flip (same size,
+    // wrong bytes) from a bad disk, a bus error during the copy, or a
+    // torn/partial write that happens to land on the right length. Verify
+    // actual content -- source is re-read here rather than hashed
+    // incrementally during the copy above, so this also catches corruption
+    // introduced by the destination write path itself, not just a bug in
+    // the copy loop.
+    verify_path_len(destination, expected_bytes)?;
+    verify_content_matches(source, destination)
+}
+
+/// Recursively verifies that every regular file under `source` has bytes
+/// identical to its counterpart under `destination`, via a streaming SHA-1
+/// content hash (never loads a whole file into memory). Never follows
+/// symlinks on either side.
+fn verify_content_matches(source: &Path, destination: &Path) -> Result<(), StorageError> {
+    let source_meta = safe_symlink_metadata(source, "verify-content-source")?;
+    let destination_meta = safe_symlink_metadata(destination, "verify-content-destination")?;
+    let source_type = source_meta.file_type();
+    let destination_type = destination_meta.file_type();
+    if source_type.is_symlink() {
+        return Err(unsafe_symlink_error(source, "verify-content-source"));
+    }
+    if destination_type.is_symlink() {
+        return Err(unsafe_symlink_error(
+            destination,
+            "verify-content-destination",
+        ));
+    }
+
+    if source_type.is_dir() {
+        if !destination_type.is_dir() {
+            return Err(StorageError::StagedMoveFailed {
+                step: "verify-content",
+                reason: format!(
+                    "expected a directory at {} to match source directory {}",
+                    destination.display(),
+                    source.display()
+                ),
+            });
+        }
+        for entry in std::fs::read_dir(source)
+            .map_err(|e| StorageError::io(source.display().to_string(), e))?
+        {
+            let entry = entry.map_err(|e| StorageError::io(source.display().to_string(), e))?;
+            let destination_child = destination.join(entry.file_name());
+            verify_content_matches(&entry.path(), &destination_child)?;
+        }
+        Ok(())
+    } else if source_type.is_file() {
+        if !destination_type.is_file() {
+            return Err(StorageError::StagedMoveFailed {
+                step: "verify-content",
+                reason: format!(
+                    "expected a regular file at {} to match source file {}",
+                    destination.display(),
+                    source.display()
+                ),
+            });
+        }
+        let source_hash = hash_file_sha1(source)?;
+        let destination_hash = hash_file_sha1(destination)?;
+        if source_hash == destination_hash {
+            Ok(())
+        } else {
+            Err(StorageError::StagedMoveFailed {
+                step: "verify-content",
+                reason: format!(
+                    "content hash mismatch after copy: {} != {}",
+                    source.display(),
+                    destination.display()
+                ),
+            })
+        }
+    } else {
+        Err(StorageError::StagedMoveFailed {
+            step: "verify-content",
+            reason: format!("unsupported file type: {}", source.display()),
+        })
+    }
+}
+
+fn hash_file_sha1(path: &Path) -> Result<[u8; 20], StorageError> {
+    use sha1::{Digest, Sha1};
+    use std::io::Read;
+
+    let mut file =
+        std::fs::File::open(path).map_err(|e| StorageError::io(path.display().to_string(), e))?;
+    let mut hasher = Sha1::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buf)
+            .map_err(|e| StorageError::io(path.display().to_string(), e))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(hasher.finalize().into())
 }
 
 fn verify_path_len(path: &Path, expected_bytes: u64) -> Result<(), StorageError> {
@@ -1041,6 +1202,87 @@ mod tests {
             execute_storage_plan(&plan),
             Err(StorageError::StagedMoveFailed { .. })
         ));
+        assert!(!staged.exists());
+    }
+
+    #[test]
+    fn verify_content_matches_detects_bit_flip_despite_matching_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.bin");
+        let destination = dir.path().join("dest.bin");
+        // Same length as source, single byte flipped -- a length-only check
+        // (verify_path_len) would have accepted this as a successful copy.
+        std::fs::write(&source, b"AAAAAAAAAA").unwrap();
+        std::fs::write(&destination, b"AAAAAAAAAB").unwrap();
+        assert_eq!(
+            std::fs::metadata(&source).unwrap().len(),
+            std::fs::metadata(&destination).unwrap().len()
+        );
+
+        let error = verify_content_matches(&source, &destination).unwrap_err();
+        assert!(matches!(
+            error,
+            StorageError::StagedMoveFailed {
+                step: "verify-content",
+                ..
+            }
+        ));
+        assert!(error.to_string().contains("content hash mismatch"));
+    }
+
+    #[test]
+    fn execute_plan_reports_rollback_step_failure_in_error_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.bin");
+        let destination = dir.path().join("dest.bin");
+        let staged = staging_path(&destination);
+        let missing_rollback_target = dir.path().join("does-not-exist.bin");
+        std::fs::write(&source, b"data").unwrap();
+        // Simulate a staged file already present from a prior interrupted
+        // run: the primary step fails at `ensure_destination_available`
+        // before it can touch anything, which is enough to trigger rollback.
+        std::fs::write(&staged, b"data").unwrap();
+
+        let plan = StoragePlan {
+            dry_run: false,
+            can_apply: true,
+            issues: Vec::new(),
+            steps: vec![StoragePlanStep {
+                action: PlannedStorageAction::CopyVerifyRename,
+                source: Some(source),
+                destination: Some(staged.clone()),
+                bytes: 4,
+            }],
+            rollback_steps: vec![
+                StoragePlanStep {
+                    action: PlannedStorageAction::SafeDelete,
+                    source: Some(staged.clone()),
+                    destination: None,
+                    bytes: 4,
+                },
+                StoragePlanStep {
+                    action: PlannedStorageAction::SafeDelete,
+                    source: Some(missing_rollback_target),
+                    destination: None,
+                    bytes: 0,
+                },
+            ],
+        };
+
+        let error = execute_storage_plan(&plan).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("rollback step(s) failed"),
+            "expected a failed rollback step to be surfaced in the error, got: {message}"
+        );
+        assert!(
+            message.contains("does-not-exist.bin"),
+            "expected the failing rollback step's path to be named in the error, got: {message}"
+        );
+        // The rollback step that *could* succeed still ran and cleaned up its
+        // target even though a later rollback step failed -- one rollback
+        // step failing must not stop the rest of the rollback from being
+        // attempted.
         assert!(!staged.exists());
     }
 
