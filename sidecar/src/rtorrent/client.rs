@@ -74,6 +74,50 @@ impl Client {
             .await
     }
 
+    /// Execute many independent, single-argument XMLRPC calls in one round
+    /// trip via the standard `system.multicall` meta-method, instead of one
+    /// connection + request/response per call. rTorrent processes them in
+    /// array order within a single request; each entry reports its own
+    /// success/fault independently of the others. Confirmed supported by
+    /// this project's patched rTorrent 0.16.11 build (see docs/TRACKER-IDENTITY.md
+    /// for the other rTorrent patches this codebase carries).
+    ///
+    /// `calls` is `(method, single_arg)` pairs, e.g. `("d.stop", hash)`.
+    /// Returns one `Result` per input call, in the same order.
+    pub async fn call_multicall(
+        &self,
+        method: &str,
+        args: &[String],
+    ) -> Result<Vec<Result<XmlValue, String>>> {
+        if args.is_empty() {
+            return Ok(Vec::new());
+        }
+        let entries: Vec<XmlValue> = args
+            .iter()
+            .map(|arg| {
+                XmlValue::Struct(vec![
+                    ("methodName".to_owned(), XmlValue::String(method.to_owned())),
+                    (
+                        "params".to_owned(),
+                        XmlValue::Array(vec![XmlValue::String(arg.clone())]),
+                    ),
+                ])
+            })
+            .collect();
+
+        let _permit = self
+            .rpc_gate
+            .acquire()
+            .await
+            .context("rTorrent RPC gate closed")?;
+        let response = self
+            .call_xml("system.multicall", &[XmlValue::Array(entries)])
+            .await
+            .with_context(|| format!("system.multicall({method})"))?;
+
+        parse_multicall_response(response, args.len(), method)
+    }
+
     async fn call_with_priority(
         &self,
         method: &str,
@@ -432,6 +476,40 @@ fn describe_xml_value(value: &XmlValue) -> String {
 
 // --- XMLRPC parser ---
 
+/// Turn a parsed `system.multicall` response array into one Result per
+/// input call. Per the XMLRPC multicall convention: a successful entry is
+/// a one-element array wrapping the real return value; a failed entry is a
+/// `{faultCode, faultString}` struct. Confirmed against this project's
+/// patched rTorrent 0.16.11 build via a raw SCGI probe (both shapes).
+fn parse_multicall_response(
+    response: XmlValue,
+    expected_count: usize,
+    method: &str,
+) -> Result<Vec<Result<XmlValue, String>>> {
+    let items = response.into_array();
+    if items.len() != expected_count {
+        bail!(
+            "system.multicall({method}) returned {} results for {} calls",
+            items.len(),
+            expected_count
+        );
+    }
+    Ok(items
+        .into_iter()
+        .map(|item| match item {
+            // Per-call fault: {faultCode, faultString}.
+            XmlValue::Struct(fields) => Err(fields
+                .into_iter()
+                .find(|(k, _)| k == "faultString")
+                .and_then(|(_, v)| v.as_str().map(str::to_owned))
+                .unwrap_or_else(|| "unknown multicall fault".to_owned())),
+            // Per-call success: single-element array wrapping the value.
+            XmlValue::Array(mut inner) => Ok(inner.pop().unwrap_or(XmlValue::Nil)),
+            other => Ok(other),
+        })
+        .collect())
+}
+
 fn parse_xmlrpc_response(xml: &[u8]) -> Result<XmlValue> {
     let xml_str = std::str::from_utf8(xml).context("XMLRPC response not UTF-8")?;
     let mut reader = Reader::from_str(xml_str);
@@ -563,4 +641,64 @@ fn parse_struct(reader: &mut Reader<&[u8]>) -> Result<XmlValue> {
 
 fn read_text_string(reader: &mut Reader<&[u8]>, end: QName<'_>) -> Result<String> {
     Ok(reader.read_text(end)?.into_inner().into_owned())
+}
+
+#[cfg(test)]
+mod multicall_tests {
+    use super::*;
+
+    // Exact shapes observed from a real raw SCGI probe against this
+    // project's patched rTorrent 0.16.11 build:
+    //   success: <value><array><data><value><i8>0</i8></value></data></array></value>
+    //   fault:   <value><struct><member><name>faultCode</name>...
+    //                    <member><name>faultString</name>
+    //                       <value><string>invalid parameters: invalid target</string>...
+
+    #[test]
+    fn all_success_unwraps_each_single_element_array() {
+        let response = XmlValue::Array(vec![
+            XmlValue::Array(vec![XmlValue::Int(0)]),
+            XmlValue::Array(vec![XmlValue::Int(0)]),
+        ]);
+        let results = parse_multicall_response(response, 2, "d.stop").unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_ok());
+        assert!(results[1].is_ok());
+        assert_eq!(results[0].as_ref().unwrap().as_i64(), Some(0));
+    }
+
+    #[test]
+    fn per_call_fault_reports_that_hash_without_failing_the_others() {
+        let fault = XmlValue::Struct(vec![
+            ("faultCode".to_owned(), XmlValue::Int(-500)),
+            (
+                "faultString".to_owned(),
+                XmlValue::String("invalid parameters: invalid target".to_owned()),
+            ),
+        ]);
+        let response = XmlValue::Array(vec![fault, XmlValue::Array(vec![XmlValue::Int(0)])]);
+        let results = parse_multicall_response(response, 2, "d.stop").unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0].as_ref().unwrap_err(),
+            "invalid parameters: invalid target"
+        );
+        assert!(results[1].is_ok(), "one fault must not affect the other result");
+    }
+
+    #[test]
+    fn result_count_mismatch_is_an_error_not_a_panic() {
+        // Guards the zip() in stop_many()/recheck_many() against ever being
+        // fed a shorter results list than the hashes it's paired with.
+        let response = XmlValue::Array(vec![XmlValue::Array(vec![XmlValue::Int(0)])]);
+        let err = parse_multicall_response(response, 5, "d.stop").unwrap_err();
+        assert!(err.to_string().contains("returned 1 results for 5 calls"));
+    }
+
+    #[test]
+    fn empty_input_short_circuits_without_a_request() {
+        let response = XmlValue::Array(vec![]);
+        let results = parse_multicall_response(response, 0, "d.stop").unwrap();
+        assert!(results.is_empty());
+    }
 }

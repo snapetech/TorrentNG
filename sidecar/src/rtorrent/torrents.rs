@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use std::path::{Component, Path};
 
 use super::client::{Client, XmlValue};
@@ -309,6 +309,20 @@ impl Client {
         Ok(())
     }
 
+    /// Same as calling stop() once per hash, but via one system.multicall
+    /// round trip instead of one connection per hash -- seconds instead of
+    /// minutes for a few thousand torrents. Returns one result per input
+    /// hash, in the same order.
+    pub async fn stop_many(&self, hashes: &[String]) -> Result<Vec<(String, Result<()>)>> {
+        let results = self.call_multicall("d.stop", hashes).await?;
+        Ok(hashes
+            .iter()
+            .cloned()
+            .zip(results)
+            .map(|(hash, res)| (hash, res.map(|_| ()).map_err(|e| anyhow!(e))))
+            .collect())
+    }
+
     pub async fn remove(&self, hash: &str, delete_data: bool) -> Result<()> {
         if delete_data {
             self.call("d.custom5.set", &[hash.into(), "1".into()])
@@ -321,6 +335,17 @@ impl Client {
     pub async fn recheck(&self, hash: &str) -> Result<()> {
         self.call("d.check_hash", &[hash.into()]).await?;
         Ok(())
+    }
+
+    /// Bulk equivalent of recheck() -- see stop_many().
+    pub async fn recheck_many(&self, hashes: &[String]) -> Result<Vec<(String, Result<()>)>> {
+        let results = self.call_multicall("d.check_hash", hashes).await?;
+        Ok(hashes
+            .iter()
+            .cloned()
+            .zip(results)
+            .map(|(hash, res)| (hash, res.map(|_| ()).map_err(|e| anyhow!(e))))
+            .collect())
     }
 
     pub async fn reannounce(&self, hash: &str) -> Result<()> {

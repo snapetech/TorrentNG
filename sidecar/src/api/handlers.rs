@@ -2494,6 +2494,46 @@ pub async fn bulk_action(
         })
         .into_response();
     }
+
+    // Prefer a backend's bulk-optimized path (e.g. rTorrent's
+    // system.multicall, one round trip for the whole set) when it has one.
+    // None means the backend has no such path -- fall through to the
+    // per-hash concurrent loop below, which every backend supports.
+    if action == "stop" || action == "recheck" {
+        let fast = if action == "stop" {
+            s.backend.stop_many(&body.hashes).await
+        } else {
+            s.backend.recheck_many(&body.hashes).await
+        };
+        if let Some(outcome) = fast {
+            let mut applied = Vec::new();
+            let mut errors = Vec::new();
+            match outcome {
+                Ok(results) => {
+                    for (hash, res) in results {
+                        match res {
+                            Ok(()) => {
+                                update_cached_lifecycle_state(&s, &hash, &action);
+                                emit_torrent_updated(&s, &hash);
+                                applied.push(hash);
+                            }
+                            Err(e) => errors.push(format!("{hash}: {e}")),
+                        }
+                    }
+                }
+                Err(e) => {
+                    errors.extend(body.hashes.iter().map(|hash| format!("{hash}: {e}")));
+                }
+            }
+            return Json(BulkResult {
+                applied,
+                errors,
+                dry_run: false,
+            })
+            .into_response();
+        }
+    }
+
     // Each backend call is one XMLRPC round-trip over a freshly-opened
     // socket; run them concurrently (bounded) instead of one at a time --
     // a few thousand torrents took over two minutes sequentially, which

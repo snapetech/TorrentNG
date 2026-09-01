@@ -133,6 +133,23 @@ pub trait TorrentBackend: Send + Sync {
     async fn stop(&self, hash: &str) -> Result<()>;
     async fn recheck(&self, hash: &str) -> Result<()>;
     async fn reannounce(&self, hash: &str) -> Result<()>;
+
+    /// Bulk-optimized stop for backends that can process many hashes in one
+    /// round trip (e.g. rTorrent's system.multicall). `None` means this
+    /// backend has no such fast path -- the caller falls back to calling
+    /// stop() once per hash. `Some` always covers every input hash, one
+    /// result each, in the same order.
+    async fn stop_many(&self, _hashes: &[String]) -> Option<Result<Vec<(String, Result<()>)>>> {
+        None
+    }
+
+    /// Bulk-optimized recheck -- see stop_many().
+    async fn recheck_many(
+        &self,
+        _hashes: &[String],
+    ) -> Option<Result<Vec<(String, Result<()>)>>> {
+        None
+    }
     async fn list_trackers(&self, hash: &str) -> Result<Vec<RawTracker>>;
     async fn add_tracker(&self, hash: &str, url: &str) -> Result<()>;
     async fn edit_tracker(&self, hash: &str, original_url: &str, new_url: &str) -> Result<()>;

@@ -110,8 +110,19 @@ impl TorrentBackend for RtorrentBackend {
         self.client.stop(hash).await
     }
 
+    async fn stop_many(&self, hashes: &[String]) -> Option<Result<Vec<(String, Result<()>)>>> {
+        Some(self.client.stop_many(hashes).await)
+    }
+
     async fn recheck(&self, hash: &str) -> Result<()> {
         self.client.recheck(hash).await
+    }
+
+    async fn recheck_many(
+        &self,
+        hashes: &[String],
+    ) -> Option<Result<Vec<(String, Result<()>)>>> {
+        Some(self.client.recheck_many(hashes).await)
     }
 
     async fn reannounce(&self, hash: &str) -> Result<()> {
