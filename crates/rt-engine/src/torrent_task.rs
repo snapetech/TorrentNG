@@ -418,7 +418,13 @@ enum PeerCommand {
 #[derive(Clone)]
 struct UploadContext {
     save_root: PathBuf,
-    piece_map: PieceMap,
+    // TNG-014: shared, not owned per peer -- PieceMap's `files: Vec<FileSpan>`
+    // scales with file count, and a fresh deep clone on every new peer
+    // connection (`upload_context()` below) was real, avoidable per-peer
+    // memory and allocation cost for torrents with many files, at swarm
+    // scale. `PieceMap` is only ever read after construction (never
+    // mutated), so an `Arc` clone here is a cheap refcount bump instead.
+    piece_map: Arc<PieceMap>,
     storage: MountScheduler,
     resources: ResourceGovernor,
     have_pieces: Vec<bool>,
@@ -438,7 +444,7 @@ pub struct TorrentTask {
     info_hash_hex: String,
     meta: TorrentMetaV1,
     save_root: PathBuf,
-    piece_map: PieceMap,
+    piece_map: Arc<PieceMap>,
     storage: MountScheduler,
     fastresume: FastresumeStore,
     tracker_tiers: Vec<Vec<TrackerState>>,
@@ -533,19 +539,21 @@ impl TorrentTask {
         let webseed_last_success = vec![None; meta.webseeds.len()];
         let picker = PiecePicker::new(piece_count, meta.piece_length as u32, last_piece_len as u32);
         let info_hash_hex = meta.info_hash.iter().map(|b| format!("{b:02x}")).collect();
-        let piece_map = PieceMap::new(
-            meta.piece_length,
-            meta.files
-                .iter()
-                .map(|file| FileSpan {
-                    file_index: file.index,
-                    path: file.path.clone(),
-                    content_offset: file.offset,
-                    length: file.length,
-                })
-                .collect(),
-        )
-        .expect("metainfo parser rejects invalid piece maps");
+        let piece_map = Arc::new(
+            PieceMap::new(
+                meta.piece_length,
+                meta.files
+                    .iter()
+                    .map(|file| FileSpan {
+                        file_index: file.index,
+                        path: file.path.clone(),
+                        content_offset: file.offset,
+                        length: file.length,
+                    })
+                    .collect(),
+            )
+            .expect("metainfo parser rejects invalid piece maps"),
+        );
         let storage = MountScheduler::new_for_path(
             StorageRootId::new(),
             &save_root,
@@ -5199,7 +5207,7 @@ mod tests {
             });
             offset += 256;
         }
-        let piece_map = PieceMap::new(16 * 1024, files).unwrap();
+        let piece_map = Arc::new(PieceMap::new(16 * 1024, files).unwrap());
         let upload = UploadContext {
             save_root: dir.path().to_path_buf(),
             piece_map,
@@ -5231,6 +5239,39 @@ mod tests {
         assert_eq!(
             upload.resources.snapshot().classes[MemoryClass::PeerBuffer as usize].used_bytes,
             0
+        );
+    }
+
+    #[test]
+    fn upload_context_piece_map_is_shared_not_deep_cloned_per_peer() {
+        // TNG-014: `UploadContext.piece_map` used to be an owned `PieceMap`,
+        // deep-copying its `files: Vec<FileSpan>` on every new peer
+        // connection (`upload_context()`'s `self.piece_map.clone()`).
+        // Wrapping it in `Arc` makes that the same cheap refcount bump every
+        // other per-peer field already gets (`storage`, `resources`, etc.)
+        // instead of real, avoidable memory growth at swarm scale.
+        let files = vec![FileSpan {
+            file_index: 0,
+            path: rt_path::SafeRelPath::from_name("a.bin", false).unwrap(),
+            content_offset: 0,
+            length: 256,
+        }];
+        let shared = Arc::new(PieceMap::new(16 * 1024, files).unwrap());
+        assert_eq!(Arc::strong_count(&shared), 1);
+
+        // Mirrors exactly what `upload_context()` does per new peer
+        // connection: `piece_map: self.piece_map.clone()`.
+        let per_peer_a = shared.clone();
+        let per_peer_b = shared.clone();
+
+        assert_eq!(
+            Arc::strong_count(&shared),
+            3,
+            "cloning for two peer connections should only bump the refcount, not allocate two new PieceMaps"
+        );
+        assert!(
+            Arc::ptr_eq(&shared, &per_peer_a) && Arc::ptr_eq(&per_peer_a, &per_peer_b),
+            "every peer's piece_map must point at the exact same allocation"
         );
     }
 

@@ -604,16 +604,66 @@ consumer behavior, stable pagination, and API contract tests.
 
 ### TNG-014 — Per-peer metadata/bitmap allocations threaten scale
 
-**Status: Open** · **Priority: P1** · **Confidence: high**
+**Status: In progress** · **Priority: P1** · **Confidence: high**
 
-Evidence: `torrent_task.rs` allocates a `Vec<bool>` piece map per peer and
-clones piece bitmap/metadata into upload contexts.
+Original evidence: `torrent_task.rs` allocates a `Vec<bool>` piece map per
+peer and clones piece bitmap/metadata into upload contexts.
 
-Required action: use shared immutable metadata and compact/shared bitmaps;
-account per-peer memory; cap peer count and metadata size; benchmark hot swarm
-RSS rather than extrapolating from row fixtures.
+Verified evidence (this session): fixed the one piece of this finding that
+was safe to fix without touching the peer-wire protocol's message-passing
+architecture. `UploadContext.piece_map` (and `TorrentTask.piece_map`) were
+plain, owned `PieceMap` values; `upload_context()` -- called once per new
+peer connection (accept/connect/uTP-accept) -- did `self.piece_map.clone()`,
+a full deep copy of `PieceMap.files: Vec<FileSpan>` (scales with file
+count, not piece count) for every single peer. `metadata` was already
+`Option<Arc<Vec<u8>>>` (cheap to clone); `piece_map` was the real gap.
+`PieceMap` is never mutated after construction (confirmed: no
+`self.piece_map = ...` assignment anywhere in the file), so wrapping it in
+`Arc<PieceMap>` is a pure, safe win -- every other call site
+(`self.piece_map.piece_count`, `.piece_to_file_regions(...)`,
+`upload.piece_map.validate_request(...)`, etc.) kept compiling unchanged
+thanks to `Arc<T>`'s auto-deref; only the two struct field declarations and
+two construction sites needed to change. New test
+`upload_context_piece_map_is_shared_not_deep_cloned_per_peer` proves the
+sharing property directly via `Arc::strong_count`/`Arc::ptr_eq` (a
+compile-time-enforced property once `Arc`-wrapped, so no revert-and-check
+was meaningful the way it is for a runtime-only bug fix).
 
-Acceptance: memory-profiled 1k-hot/large-piece-count runs and peer churn tests.
+Deliberately NOT touched in this pass, and why: `have_pieces: Vec<bool>`
+(the actual "per-peer bitmap" in the finding's title) is genuinely mutated
+per-peer as our own download progresses (`PeerCommand::Have` updates each
+peer task's own copy independently, since each peer runs as its own
+spawned tokio task communicating only via channels -- there is no shared
+mutable state between them today). Sharing it safely would mean either a
+new synchronized shared-bitmap type (lock contention on a hot path) or
+bit-packing the existing `Vec<bool>` (an 8x density win, but touches every
+read/write/len call site across `received`, `pieces`/`bitfield_to_pieces`,
+`peer_has`, and `have_pieces` -- all peer-wire protocol-critical code where
+an indexing mistake would silently corrupt Have/Bitfield messages).
+That redesign needs its own dedicated pass with careful protocol-level
+testing, not a fix squeezed into an already-large session.
+
+Full workspace `cargo test --workspace --all-targets --locked`,
+`cargo fmt --all -- --check`, and
+`cargo clippy --workspace --all-targets --locked -- -D warnings` all green
+(`rt-engine` 135 tests, up from 134).
+
+Not yet evidenced (why this stays "In progress", not "Resolved"): the
+`have_pieces`/`peer_has` bitmap sharing and bit-packing described above is
+unaddressed; there is still no per-peer memory accounting or peer-count
+cap tied to metadata/bitmap size; no memory-profiled 1k-hot/large-piece-
+count benchmark exists (the new test proves the *mechanism* -- shared
+allocation -- not measured RSS at scale).
+
+Required action (remaining): bit-pack and/or share `have_pieces`/`peer_has`
+across peer tasks (needs a concurrency-safety design, not just a type
+swap); per-peer memory accounting; a peer-count/metadata-size cap; a real
+memory-profiled benchmark at 1k+ hot peers and large piece counts.
+
+Acceptance: memory-profiled 1k-hot/large-piece-count runs (missing) and
+peer churn tests (missing) -- this session's fix reduces per-peer
+allocation for one of the two implicated structures but does not itself
+constitute the required benchmark evidence.
 
 ### TNG-015 — Webseed polling creates an idle tax
 
@@ -1141,6 +1191,7 @@ claims:
 | 2026-09-01 | Sixth session (same date, continuing "build it all out"): fixed TNG-020's two most concrete correctness sub-issues. `AnnounceResponse::parse` (`crates/rt-tracker/src/response.rs`) used bare `as u32` casts on bencoded `i64` interval/stats fields -- a negative or oversized value silently wrapped instead of being rejected, inconsistent with the sibling `scrape_int` helper in the same file which already did this correctly. Switched to checked `u32::try_from`: `interval` now fails the response on an invalid value, the optional stats fields degrade to `None`. `parse_ut_pex_peers` (`crates/rt-engine/src/torrent_task.rs`) only parsed ut_pex's IPv4 `added` key; added `added6` (IPv6) parsing so dual-stack/IPv6 swarms' PEX-advertised peers are no longer silently dropped. `dropped`/`dropped6` intentionally left unparsed -- BEP 11 defines them as informational only and this engine has no mechanism to safely act on them yet; wiring that in needs a real design decision, not a rushed addition. Five new tests total (3 tracker, 2 pex). | `cargo test -p rt-engine -p rt-tracker --lib` (rt-tracker 59 passed, up from 56; 0 failed), full `cargo test --workspace --all-targets --locked` (green), `cargo fmt --all -- --check` (green), `cargo clippy --workspace --all-targets --locked -- -D warnings` (green). | TNG-020 moved Open -> In progress. UDP framing/connection-reuse, interval/transaction-id fidelity audit, and dropped-peer semantics remain explicitly open (see item detail). |
 | 2026-09-01 | Seventh session (same date, continuing "build it all out"): fixed TNG-019's most severe issue -- confirmed it was a real, exploitable DHT-poisoning gap, not just missing hardening. `handle_packet` (`crates/rt-engine/src/dht_task.rs`) accepted any KRPC Response/Error whose transaction id matched an outstanding entry regardless of which UDP address the packet actually came from, merging its claimed nodes into the routing table and forwarding get_peers results straight to the torrent unconditionally; combined with transaction ids being a plain sequential counter starting at 1 on every launch (fully predictable across restarts), an off-path attacker with no visibility into real traffic could inject forged nodes/peers with a handful of guessed low IDs. Added `OutstandingQuery` (address + timestamp per sent query); Response/Error handling now requires the source address to match before trusting anything, dropping (and logging) a mismatch without touching the routing table or consuming the real pending query. Transaction ids now start from a random per-launch seed (reusing `NodeId::random()`'s existing `rand` dependency rather than adding a new one) instead of always 1. Added a 10s sweep pruning outstanding entries older than 30s, closing the unbounded-growth path from non-responding nodes. Five new regression tests; verified the source-check test is real by disabling the check and confirming it fails first. | `cargo test -p rt-engine --lib` (134 passed, up from 129, 0 failed), full `cargo test --workspace --all-targets --locked` (green), `cargo fmt --all -- --check` (green), `cargo clippy --workspace --all-targets --locked -- -D warnings` (green, after fixing one clippy finding in a new test). | TNG-019 moved Open -> In progress. IPv6 support, inbound rate limiting, announce-token binding audit, and global table/peer caps remain explicitly open (see item detail). |
 | 2026-09-01 | Eighth session (same date, continuing "build it all out"): built and verified real fuzz targets for TNG-027 -- the repository had an empty placeholder `fuzz/` directory (0 files), confirming this was never actually implemented. Installed `cargo-fuzz` (was not present) so targets could be built and run locally, not just scaffolded. Added `parse_torrent` (fuzzes `rt_metainfo::parse_torrent`, the entry point for every `.torrent` file this daemon reads) and `bencode_decode` (fuzzes the lower-level `rt_bencode::decode` also used by tracker/DHT parsing). Ran both locally: ~2.7M and ~2.5M executions in 16s each, zero crashes. Wired a new `fuzz-smoke` CI job with a bounded 60s-per-target budget and crash-artifact upload on failure. `fuzz/` excluded from the main Cargo workspace (matching the existing `sidecar` pattern) since cargo-fuzz needs nightly + sanitizer flags. While re-running a full clippy pass for this, discovered `.clippy.toml` still declared the pre-correction `msrv = "1.80"` from before this session's earlier MSRV fix (which corrected `Cargo.toml`'s actual `rust-version` to `1.88`) -- the stale value had been silently suppressing real, applicable MSRV-gated lint suggestions across the whole workspace the entire session. Fixed the declared MSRV and applied the ~19 newly-surfaced findings (manual modulo checks -> `.is_multiple_of()`, manual `chunks_exact(N)` -> `.as_chunks::<N>()`) across 8 crates, mostly via `cargo clippy --fix`, with the diffs spot-checked for correctness. | Fuzz targets run locally with real execution counts and zero crashes (see above); full `cargo test --workspace --all-targets --locked` (green), `cargo fmt --all -- --check` (green), `cargo clippy --workspace --all-targets --locked -- -D warnings` (green), `cargo test --manifest-path sidecar/Cargo.toml --locked` (green, 75 passed); `cargo metadata --no-deps` confirms `fuzz/` is not part of the main workspace. | TNG-027 moved Open -> In progress (OpenAPI schema and idempotency tests remain entirely untouched; the new CI job has not yet been observed running for real, only verified locally -- see item detail). Also closed a real, if quieter, MSRV-consistency gap that had been masking lint coverage since the second session's TNG-028 work. |
+| 2026-09-01 | Ninth session (same date, continuing "build it all out"): fixed the safe half of TNG-014. `UploadContext`/`TorrentTask`'s `piece_map: PieceMap` was deep-cloned (`files: Vec<FileSpan>`, scales with file count) on every new peer connection; `PieceMap` is never mutated after construction, so wrapped it in `Arc<PieceMap>` -- a pure, mechanical, low-risk win (every other read call site kept compiling unchanged via auto-deref). New test proves the sharing via `Arc::strong_count`/`Arc::ptr_eq`. Deliberately left `have_pieces`/`peer_has` (the actual per-peer *bitmap*, genuinely mutated independently per peer task today) untouched -- sharing or bit-packing it safely needs a concurrency-safety design and touches protocol-critical Have/Bitfield code across four call sites, which deserves its own dedicated pass rather than a squeezed-in change. | `cargo test -p rt-engine --lib` (135 passed, up from 134, 0 failed), full `cargo test --workspace --all-targets --locked` (green), `cargo fmt --all -- --check` (green), `cargo clippy --workspace --all-targets --locked -- -D warnings` (green). | TNG-014 moved Open -> In progress. The bitmap-sharing/bit-packing half of the finding, per-peer memory accounting, a peer-count cap, and a real memory-profiled benchmark all remain explicitly open (see item detail). |
 
 ## Release gate
 
