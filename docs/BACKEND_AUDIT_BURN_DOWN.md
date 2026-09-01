@@ -931,17 +931,95 @@ surfaces claiming different behavior.
 
 ### TNG-022 — Compatibility mutations and in-memory state are too often inert
 
-**Status: Open** · **Priority: P1** · **Confidence: high**
+**Status: In progress** · **Priority: P1** · **Confidence: high**
 
-Evidence: compatibility routes accept semantics that are not applied to the
-native engine; several operator-facing stores remain process-memory state.
+Original evidence: compatibility routes accept semantics that are not
+applied to the native engine; several operator-facing stores remain
+process-memory state.
 
-Required action: route supported mutations to durable engine state; for
-unsupported behavior return structured capability/no-op metadata, log it, and
-document it; classify and persist operator-created state.
+Verified evidence (this session): a targeted audit (not the full
+method-by-method matrix the acceptance criteria calls for) found and fixed
+the two highest-confidence, easiest-to-fix inert mutations -- both had an
+already-working native-engine method one facade over, just never wired to
+this one.
 
-Acceptance: method-by-method mutation matrix with stateful round trips and
-restart tests.
+- rTorrent XML-RPC `d.tracker_announce` (`crates/rt-api-rtorrent/src/lib.rs`)
+  was a pure literal `Ok(RtValue::Int(0))` -- it never even read `params`
+  (which carries the target info hash), so a client asking rTorrent's
+  "force reannounce" call for a specific torrent got a convincing success
+  with nothing happening for *any* torrent. The qBittorrent-compat
+  equivalent (`torrents_reannounce`) was already correctly wired to
+  `Engine::reannounce_torrent`. Added a `tracker_announce` helper mirroring
+  the existing `lifecycle` helper's hash-extraction pattern, now calling
+  the same `Engine::reannounce_torrent`. New tests: missing/empty params
+  now correctly error (previously silently "succeeded" for anything,
+  including no hash at all); a valid hash with no engine attached still
+  degrades gracefully, matching this crate's existing testing convention
+  for engine-touching operations (no live-engine test harness exists in
+  this crate; verified the underlying `reannounce_torrent` engine method
+  itself is separately tested in `rt-engine`).
+- Transmission RPC `session-set` for `dht-enabled`/`pex-enabled`
+  (`crates/rt-api-transmission/src/lib.rs`) only mutated an in-process
+  `AppState.session` struct (no DB backing); `session-get` echoed it
+  straight back, so a client toggling DHT off and reading it back saw
+  "yes, off" even though the swarm's real DHT/PEX state never changed.
+  The qBittorrent-compat equivalent (`app_set_preferences`) was already
+  correctly wired to `Engine::network_features`/`update_network_features`.
+  Added the same read-current/apply-requested-fields/write-back pattern to
+  `session_set`, alongside (not replacing) the existing process-memory
+  mirror that `session-get` still reads from -- both stay consistent, but
+  now the engine's real state changes too. Existing test
+  `transmission_session_set_persists_broad_compat_settings_without_engine`
+  (which already exercises `dht-enabled:false`/`pex-enabled:false`)
+  continues to pass unchanged, confirming the no-engine path is
+  unaffected; the qBittorrent-compat sibling this mirrors has no
+  live-engine test of its own either (checked --
+  `app_set_preferences_persists_form_and_json_updates` also runs without
+  an engine and doesn't even exercise the dht/pex fields), so this fix's
+  verification bar matches, and slightly exceeds, existing precedent in
+  this codebase.
+
+Full workspace `cargo test --workspace --all-targets --locked`,
+`cargo fmt --all -- --check`, and
+`cargo clippy --workspace --all-targets --locked -- -D warnings` all green
+(`rt-api-rtorrent` 19 tests, up from 17).
+
+Not yet evidenced (why this stays "In progress", not "Resolved" -- this
+finding's full scope is large): the audit that produced the two fixes
+above also surfaced, but did not fix, several more inert mutations with
+no existing engine method to wire to (real feature gaps, not wiring bugs):
+qBittorrent-compat `transfer/banPeers` (written to an in-process set,
+never consulted anywhere a peer connection is accepted or dialed --
+confirmed no ban/blocklist enforcement exists anywhere in `rt-engine`);
+Deluge's `move_completed`/`move_on_completed_path` torrent options (same
+shape, no "move on completion" hook exists in the engine). Also surfaced:
+qBittorrent-compat `setForceStart`/`setAutoTMM`/`setAutoManagement` *do*
+reach the engine and *do* persist durably via
+`EngineTorrentLimits`/`rt_db::upsert_torrent_limits`, but
+`apply_torrent_limits()` in `torrent_task.rs` never actually reads those
+three fields for anything -- a durably-stored-but-behaviorally-inert
+variant of this same finding, distinct enough it may deserve its own
+line item rather than folding into this one. The qBittorrent-compat
+category store (`createCategory`/`editCategory`/`removeCategories`) is
+also still process-memory-only despite `rt-db` already having an unused
+`torrent_categories` table and `list_categories()` reader -- a real fix,
+but needs new create/rename/delete functions against that table (not a
+one-line wiring fix like the two done this session). None of the broader
+method-by-method matrix, stateful round-trip tests, or restart tests the
+acceptance criteria call for exist yet.
+
+Required action (remaining): wire the category store to the existing
+`rt-db` table; decide whether `setForceStart`/`setAutoTMM`/
+`setAutoManagement` need real engine behavior or should be downgraded to
+documented no-ops; design and implement peer banning/blocklist
+enforcement and a move-on-completion hook (both real engine features, not
+wiring fixes) before their compat surfaces can be made honest; the full
+method-by-method mutation matrix with stateful round-trip and restart
+tests.
+
+Acceptance: method-by-method mutation matrix (partial -- two items fixed
+and evidenced, several more identified but not yet fixed, full matrix not
+built) with stateful round trips (not done) and restart tests (not done).
 
 ### TNG-023 — Capability and health manifests overclaim implementation
 
@@ -1210,6 +1288,7 @@ claims:
 | 2026-09-01 | Eighth session (same date, continuing "build it all out"): built and verified real fuzz targets for TNG-027 -- the repository had an empty placeholder `fuzz/` directory (0 files), confirming this was never actually implemented. Installed `cargo-fuzz` (was not present) so targets could be built and run locally, not just scaffolded. Added `parse_torrent` (fuzzes `rt_metainfo::parse_torrent`, the entry point for every `.torrent` file this daemon reads) and `bencode_decode` (fuzzes the lower-level `rt_bencode::decode` also used by tracker/DHT parsing). Ran both locally: ~2.7M and ~2.5M executions in 16s each, zero crashes. Wired a new `fuzz-smoke` CI job with a bounded 60s-per-target budget and crash-artifact upload on failure. `fuzz/` excluded from the main Cargo workspace (matching the existing `sidecar` pattern) since cargo-fuzz needs nightly + sanitizer flags. While re-running a full clippy pass for this, discovered `.clippy.toml` still declared the pre-correction `msrv = "1.80"` from before this session's earlier MSRV fix (which corrected `Cargo.toml`'s actual `rust-version` to `1.88`) -- the stale value had been silently suppressing real, applicable MSRV-gated lint suggestions across the whole workspace the entire session. Fixed the declared MSRV and applied the ~19 newly-surfaced findings (manual modulo checks -> `.is_multiple_of()`, manual `chunks_exact(N)` -> `.as_chunks::<N>()`) across 8 crates, mostly via `cargo clippy --fix`, with the diffs spot-checked for correctness. | Fuzz targets run locally with real execution counts and zero crashes (see above); full `cargo test --workspace --all-targets --locked` (green), `cargo fmt --all -- --check` (green), `cargo clippy --workspace --all-targets --locked -- -D warnings` (green), `cargo test --manifest-path sidecar/Cargo.toml --locked` (green, 75 passed); `cargo metadata --no-deps` confirms `fuzz/` is not part of the main workspace. | TNG-027 moved Open -> In progress (OpenAPI schema and idempotency tests remain entirely untouched; the new CI job has not yet been observed running for real, only verified locally -- see item detail). Also closed a real, if quieter, MSRV-consistency gap that had been masking lint coverage since the second session's TNG-028 work. |
 | 2026-09-01 | Ninth session (same date, continuing "build it all out"): fixed the safe half of TNG-014. `UploadContext`/`TorrentTask`'s `piece_map: PieceMap` was deep-cloned (`files: Vec<FileSpan>`, scales with file count) on every new peer connection; `PieceMap` is never mutated after construction, so wrapped it in `Arc<PieceMap>` -- a pure, mechanical, low-risk win (every other read call site kept compiling unchanged via auto-deref). New test proves the sharing via `Arc::strong_count`/`Arc::ptr_eq`. Deliberately left `have_pieces`/`peer_has` (the actual per-peer *bitmap*, genuinely mutated independently per peer task today) untouched -- sharing or bit-packing it safely needs a concurrency-safety design and touches protocol-critical Have/Bitfield code across four call sites, which deserves its own dedicated pass rather than a squeezed-in change. | `cargo test -p rt-engine --lib` (135 passed, up from 134, 0 failed), full `cargo test --workspace --all-targets --locked` (green), `cargo fmt --all -- --check` (green), `cargo clippy --workspace --all-targets --locked -- -D warnings` (green). | TNG-014 moved Open -> In progress. The bitmap-sharing/bit-packing half of the finding, per-peer memory accounting, a peer-count cap, and a real memory-profiled benchmark all remain explicitly open (see item detail). |
 | 2026-09-01 | Tenth session (same date, continuing "build it all out"): closed a gap TNG-025's own entry had already flagged as a prediction -- MSRV wasn't pinned anywhere in CI (`@stable` tracks current, not the declared floor), which is exactly the class of drift that let `.clippy.toml` go stale earlier this session. Added `msrv-check`/`msrv-check-sidecar` jobs pinning `dtolnay/rust-toolchain` to the exact declared floors (1.88.0 / 1.97.0) via version tags, alongside (not replacing) the existing `@stable` jobs. Verified both jobs' exact commands locally against the already-installed pinned toolchains before committing: full workspace build+test green at 1.88, sidecar build+test green at 1.97.0 (75 passed). | `cargo +1.88 build/test --workspace --all-targets --locked` (green), `cargo +1.97.0 build/test --locked --manifest-path sidecar/Cargo.toml` (green, 75 passed), full default-toolchain `cargo test --workspace --all-targets --locked` / `cargo fmt --all -- --check` / `cargo clippy --workspace --all-targets --locked -- -D warnings` (all green). | TNG-025's evidence updated with the MSRV-pinning fix; still not verified that any of this session's CI edits have actually run in real GitHub Actions (no way to trigger that from this sandboxed session). |
+| 2026-09-01 | Eleventh session (same date, continuing "build it all out"): ran a targeted (not full-matrix) audit for TNG-022 via a research subagent, then fixed the two highest-confidence, easiest-to-wire inert compat mutations it found -- both had an already-working native-engine method one facade over, never connected to this one. rTorrent's `d.tracker_announce` (`crates/rt-api-rtorrent`) was a literal `Ok(Int(0))` that never read params at all; wired to `Engine::reannounce_torrent`, mirroring the already-correct qBittorrent-compat sibling. Transmission's `session-set` `dht-enabled`/`pex-enabled` (`crates/rt-api-transmission`) only mutated a process-memory struct that `session-get` echoed back convincingly; wired to `Engine::network_features`/`update_network_features`, alongside (not replacing) the existing mirror, mirroring `app_set_preferences`'s already-correct qBittorrent-compat pattern. The same audit surfaced several more inert mutations that were NOT fixed because they need real new engine features (peer banning/blocklist enforcement, a move-on-completion hook) rather than a wiring fix, plus a durably-stored-but-behaviorally-inert variant (`setForceStart`/`setAutoTMM`/`setAutoManagement` persist but `apply_torrent_limits()` never reads them) -- all recorded as explicit remaining gaps. | `cargo test -p rt-api-rtorrent --lib` (19 passed, up from 17), `cargo test -p rt-api-transmission --lib` (32 passed, 0 failed, no regressions), full `cargo test --workspace --all-targets --locked` (green), `cargo fmt --all -- --check` (green), `cargo clippy --workspace --all-targets --locked -- -D warnings` (green). | TNG-022 moved Open -> In progress. This remains a large finding -- category-store persistence, peer banning, move-on-completion, and the full method-by-method mutation matrix with stateful round-trip/restart tests are all still open (see item detail for the complete list). |
 
 ## Release gate
 

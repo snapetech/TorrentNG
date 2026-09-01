@@ -2297,6 +2297,27 @@ async fn session_set(state: &AppState, args: &Value) -> Result<Value, String> {
     );
     set_string_value_arg(args, "rpc-username", &mut session.rpc_username);
     set_string_value_arg(args, "rpc-bind-address", &mut session.rpc_bind_address);
+    // TNG-022: dht-enabled/pex-enabled used to only mutate `session`
+    // (process-memory, no DB backing) below -- session-get echoed it
+    // straight back, so a client toggling DHT off and reading it back saw
+    // a convincing "yes, off" even though the swarm's actual DHT/PEX state
+    // never changed. Mirrors the already-working qBittorrent-compat
+    // equivalent (`app_set_preferences`): read current engine state,
+    // apply only the fields this request actually specified, write back.
+    if let Some(engine) = &state.engine {
+        let dht_request = transmission_bool_arg(args, "dht-enabled");
+        let pex_request = transmission_bool_arg(args, "pex-enabled");
+        if dht_request.is_some() || pex_request.is_some() {
+            let mut features = engine.network_features().await.unwrap_or_default();
+            if let Some(value) = dht_request {
+                features.dht = value;
+            }
+            if let Some(value) = pex_request {
+                features.pex = value;
+            }
+            let _ = engine.update_network_features(features).await;
+        }
+    }
     set_bool_arg(args, "dht-enabled", &mut session.dht_enabled);
     set_bool_arg(args, "pex-enabled", &mut session.pex_enabled);
     set_bool_arg(args, "lpd-enabled", &mut session.lpd_enabled);

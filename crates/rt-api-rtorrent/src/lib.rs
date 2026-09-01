@@ -177,7 +177,7 @@ pub async fn execute(
         "d.erase" => lifecycle(state, params, Lifecycle::Erase).await,
         "d.pause" | "d.stop" => lifecycle(state, params, Lifecycle::Pause).await,
         "d.resume" | "d.start" => lifecycle(state, params, Lifecycle::Resume).await,
-        "d.tracker_announce" => Ok(RtValue::Int(0)),
+        "d.tracker_announce" => tracker_announce(state, params).await,
         "f.multicall" => file_multicall(state, params).await,
         "t.multicall" => tracker_multicall(state, params).await,
         "p.multicall" => peer_multicall(state, params).await,
@@ -794,6 +794,24 @@ async fn lifecycle(
     }
     if matches!(lifecycle, Lifecycle::Erase) {
         let _ = state.registry.write().await.remove(hash);
+    }
+    Ok(RtValue::Int(0))
+}
+
+/// TNG-022: `d.tracker_announce = <hash>` is rTorrent's "force reannounce"
+/// call. This used to be a pure literal `0` return that never read
+/// `params` or touched the engine at all -- a client asking for a
+/// reannounce got a convincing "success" with nothing actually happening.
+/// Mirrors `lifecycle`'s hash-extraction pattern and the already-working
+/// qBittorrent-compat equivalent (`torrents_reannounce`, which calls this
+/// same `Engine::reannounce_torrent`).
+async fn tracker_announce(state: &AppState, params: &[RtValue]) -> Result<RtValue, String> {
+    let hash = params
+        .first()
+        .and_then(RtValue::as_str)
+        .ok_or_else(|| "d.tracker_announce requires info hash".to_owned())?;
+    if let Some(engine) = &state.engine {
+        let _ = engine.reannounce_torrent(hash.to_owned()).await;
     }
     Ok(RtValue::Int(0))
 }
@@ -1505,6 +1523,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(state.registry.read().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn tracker_announce_requires_info_hash() {
+        // TNG-022: d.tracker_announce used to be a literal `Ok(Int(0))`
+        // that never even read `params` -- an empty/missing hash was
+        // silently accepted as "success". It now has to parse a real
+        // hash out of params before it can call the engine, so a missing
+        // one must be a real error, not a stub success.
+        let state = AppState::new(Arc::new(RwLock::new(SessionRegistry::new())));
+        let result = execute(&state, "d.tracker_announce", &[]).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn tracker_announce_succeeds_without_engine() {
+        // Matches this crate's established pattern for engine-touching,
+        // registry-independent operations (no live-engine test harness
+        // exists in this crate): a valid hash with no engine attached
+        // must degrade gracefully, not panic or error.
+        let state = AppState::new(Arc::new(RwLock::new(SessionRegistry::new())));
+        let result = execute(
+            &state,
+            "d.tracker_announce",
+            &[RtValue::String("b".repeat(40))],
+        )
+        .await;
+        assert_eq!(result.unwrap(), RtValue::Int(0));
     }
 
     #[test]
