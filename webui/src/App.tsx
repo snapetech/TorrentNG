@@ -469,6 +469,20 @@ export function App() {
     if (hashes.length === 0) setDetailHash(null)
   }
 
+  const [selectingAllMatching, setSelectingAllMatching] = useState(false)
+
+  async function handleSelectAllMatching() {
+    setSelectingAllMatching(true)
+    try {
+      const res = await api.torrents.list({ ...params, limit: total, offset: 0 })
+      handleSelectAll(res.torrents.map(t => t.hash))
+    } catch {
+      setActionNotice({ text: 'Failed to select all matching torrents', tone: 'error' })
+    } finally {
+      setSelectingAllMatching(false)
+    }
+  }
+
   function updateDetailAutoDisplay(enabled: boolean) {
     try {
       localStorage.setItem(DETAIL_AUTO_DISPLAY_KEY, enabled ? 'on' : 'off')
@@ -865,6 +879,8 @@ export function App() {
                   params={params}
                   onSelect={handleSelect}
                   onSelectAll={handleSelectAll}
+                  onSelectAllMatching={handleSelectAllMatching}
+                  isSelectingAllMatching={selectingAllMatching}
                   onDetail={openAutoDetail}
                   onContextMenu={(torrent, x, y) => {
                     setContextMenu({ torrent, x, y })

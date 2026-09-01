@@ -429,6 +429,19 @@ fn order_clause(sort: Option<&str>, dir: Option<&str>) -> String {
         Some("seeds") => "t.peers_complete",
         Some("peers") => "t.peers_connected",
         Some("progress") => "CAST(t.bytes_done AS REAL) / NULLIF(t.size_bytes, 0)",
+        // Mirrors the WebUI's statusLabel() precedence (TorrentTable.tsx)
+        // exactly, so sorting by status matches what the column displays.
+        Some("status") => {
+            "CASE \
+                WHEN t.message <> '' AND t.is_active = 0 THEN 0 \
+                WHEN t.state = 0 THEN 1 \
+                WHEN t.state = 2 THEN 2 \
+                WHEN t.complete = 1 AND t.is_active = 1 THEN 3 \
+                WHEN t.complete = 0 AND t.is_active = 1 THEN 4 \
+                WHEN t.is_open = 1 THEN 5 \
+                ELSE 6 \
+            END"
+        }
         _ => "t.name COLLATE NOCASE",
     };
     let d = if dir.map(|d| d.eq_ignore_ascii_case("desc")).unwrap_or(false) {
@@ -437,4 +450,32 @@ fn order_clause(sort: Option<&str>, dir: Option<&str>) -> String {
         "ASC"
     };
     format!("{col} {d}")
+}
+
+#[cfg(test)]
+mod order_clause_tests {
+    use super::order_clause;
+
+    #[test]
+    fn status_sorts_via_case_expression_not_default_name_sort() {
+        let clause = order_clause(Some("status"), None);
+        assert!(clause.contains("CASE"), "expected a CASE expression: {clause}");
+        assert!(clause.trim_end().ends_with("END ASC"), "unexpected clause: {clause}");
+        assert!(
+            !clause.contains("t.name"),
+            "status sort must not silently fall back to name sort: {clause}"
+        );
+    }
+
+    #[test]
+    fn status_desc_respects_direction() {
+        let clause = order_clause(Some("status"), Some("desc"));
+        assert!(clause.trim_end().ends_with("END DESC"), "unexpected clause: {clause}");
+    }
+
+    #[test]
+    fn unknown_sort_falls_back_to_name() {
+        let clause = order_clause(Some("not-a-real-column"), None);
+        assert_eq!(clause, "t.name COLLATE NOCASE ASC");
+    }
 }

@@ -11,6 +11,8 @@ interface Props {
   params: ListParams
   onSelect: (hash: string) => void
   onSelectAll: (hashes: string[]) => void
+  onSelectAllMatching?: () => void
+  isSelectingAllMatching?: boolean
   onDetail: (hash: string | null) => void
   onContextMenu: (torrent: TorrentSummary, x: number, y: number) => void
   onSort: (sort: string) => void
@@ -133,7 +135,7 @@ const COLS: Col[] = [
   { key: 'check',      label: '',          width: '32px', required: true },
   { key: 'kind',       label: 'Type',      width: '52px' },
   { key: 'name',       label: 'Name',      width: '260px', sortKey: 'name' },
-  { key: 'status',     label: 'Status',    width: '78px' },
+  { key: 'status',     label: 'Status',    width: '78px', sortKey: 'status' },
   { key: 'size',       label: 'Size',      width: '78px', sortKey: 'size' },
   { key: 'progress',   label: '%',         width: '72px', sortKey: 'progress' },
   { key: 'remaining',  label: 'Left',      width: '86px', sortKey: 'remaining' },
@@ -303,8 +305,8 @@ function loadWidths(): Partial<Record<ColKey, number>> {
 }
 
 export function TorrentTable({
-  torrents, total, selected, params, onSelect, onSelectAll, onDetail, onContextMenu, onSort,
-  onLoadMore, hasMore, isFetchingMore, detailHash, mediaInference,
+  torrents, total, selected, params, onSelect, onSelectAll, onSelectAllMatching, isSelectingAllMatching,
+  onDetail, onContextMenu, onSort, onLoadMore, hasMore, isFetchingMore, detailHash, mediaInference,
 }: Props) {
   const parentRef = useRef<HTMLDivElement>(null)
   const columnsRef = useRef<HTMLDivElement>(null)
@@ -606,13 +608,32 @@ export function TorrentTable({
             {selectedVisible > 0 && (
               <span style={{
                 position: 'absolute', right: 84, top: 6, height: 20,
-                display: 'inline-flex', alignItems: 'center',
-                border: '1px solid color-mix(in srgb, var(--accent) 35%, var(--border))',
-                background: 'color-mix(in srgb, var(--accent) 12%, transparent)',
-                color: 'var(--accent-text)', borderRadius: 999, padding: '0 7px',
-                fontSize: 10, fontWeight: 800, textTransform: 'none', letterSpacing: 0,
+                display: 'inline-flex', alignItems: 'center', gap: 8,
+                textTransform: 'none', letterSpacing: 0, fontWeight: 400,
               }}>
-                {selectedVisible.toLocaleString()} visible selected
+                <span style={{
+                  display: 'inline-flex', alignItems: 'center',
+                  border: '1px solid color-mix(in srgb, var(--accent) 35%, var(--border))',
+                  background: 'color-mix(in srgb, var(--accent) 12%, transparent)',
+                  color: 'var(--accent-text)', borderRadius: 999, padding: '0 7px',
+                  fontSize: 10, fontWeight: 800, height: '100%',
+                }}>
+                  {selectedVisible.toLocaleString()} visible selected
+                </span>
+                {allVisible && total > torrents.length && onSelectAllMatching && (
+                  <button
+                    onClick={onSelectAllMatching}
+                    disabled={isSelectingAllMatching}
+                    title={`Select all ${total.toLocaleString()} torrents matching the current filter, not just the ${torrents.length.toLocaleString()} loaded so far`}
+                    style={{
+                      background: 'transparent', border: 'none', color: 'var(--accent-text)',
+                      fontSize: 10, fontWeight: 700, textDecoration: 'underline', cursor: 'pointer',
+                      padding: 0, opacity: isSelectingAllMatching ? 0.6 : 1,
+                    }}
+                  >
+                    {isSelectingAllMatching ? 'Selecting…' : `Select all ${total.toLocaleString()}`}
+                  </button>
+                )}
               </span>
             )}
             {columnsOpen && (
