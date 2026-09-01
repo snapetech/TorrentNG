@@ -466,14 +466,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("cache.db")).unwrap();
         db.upsert(&torrent_row("queued", 1, false, false)).unwrap();
-        db.upsert(&torrent_row("stalled", 1, false, true)).unwrap();
+        // "stalled" means started (is_active=1) but zero throughput right
+        // now (down_rate=0, set by torrent_row) -- not is_active=0, which
+        // means stopped.
+        db.upsert(&torrent_row("stalled", 1, true, true)).unwrap();
         db.upsert(&torrent_row("stopped", 0, false, false)).unwrap();
 
         let facets = db.sidebar_facets(&ListParams::default()).unwrap();
         assert_eq!(facets.status.get("queued"), Some(&1));
         assert_eq!(facets.status.get("stopped"), Some(&1));
         assert_eq!(facets.status.get("stalled"), Some(&1));
-        assert_eq!(facets.status.get("inactive"), Some(&3));
+        assert_eq!(facets.status.get("inactive"), Some(&2));
 
         let (queued, _) = db
             .list(&ListParams {

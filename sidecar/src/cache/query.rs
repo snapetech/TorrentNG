@@ -278,14 +278,21 @@ impl Db {
             ("stopped", "t.state=0 AND t.is_active=0"),
             ("active", "t.is_active=1"),
             ("inactive", "t.is_active=0"),
-            ("stalled", "t.is_open=1 AND t.is_active=0"),
+            // "Stalled" means started but currently moving zero bytes (no
+            // willing peers right now), NOT is_active=0 -- that's rTorrent's
+            // d.is_active, which tracks started/stopped, not throughput. A
+            // stopped torrent is "stopped", never "stalled".
+            (
+                "stalled",
+                "t.is_active=1 AND ((t.complete=1 AND t.up_rate=0) OR (t.complete=0 AND t.down_rate=0))",
+            ),
             (
                 "stalled_uploading",
-                "t.complete=1 AND t.is_open=1 AND t.is_active=0",
+                "t.complete=1 AND t.is_active=1 AND t.up_rate=0",
             ),
             (
                 "stalled_downloading",
-                "t.complete=0 AND t.is_open=1 AND t.is_active=0",
+                "t.complete=0 AND t.is_active=1 AND t.down_rate=0",
             ),
             ("checking", "t.state=2"),
             ("moving", "0=1"),
@@ -375,12 +382,16 @@ fn build_where(p: &ListParams) -> (String, Vec<String>) {
             "inactive" => clauses.push("t.is_active=0".into()),
             "queued" => clauses.push("t.state=1 AND t.is_open=0".into()),
             "paused" | "stopped" => clauses.push("t.state=0 AND t.is_active=0".into()),
-            "stalled" => clauses.push("t.is_open=1 AND t.is_active=0".into()),
+            // Kept in sync with the identical bucket definitions in
+            // sidebar_facets() above -- see the comment there.
+            "stalled" => clauses.push(
+                "t.is_active=1 AND ((t.complete=1 AND t.up_rate=0) OR (t.complete=0 AND t.down_rate=0))".into(),
+            ),
             "stalled_uploading" => {
-                clauses.push("t.complete=1 AND t.is_open=1 AND t.is_active=0".into())
+                clauses.push("t.complete=1 AND t.is_active=1 AND t.up_rate=0".into())
             }
             "stalled_downloading" => {
-                clauses.push("t.complete=0 AND t.is_open=1 AND t.is_active=0".into())
+                clauses.push("t.complete=0 AND t.is_active=1 AND t.down_rate=0".into())
             }
             "checking" => clauses.push("t.state=2".into()),
             "moving" => clauses.push("0=1".into()),
@@ -450,6 +461,57 @@ fn order_clause(sort: Option<&str>, dir: Option<&str>) -> String {
         "ASC"
     };
     format!("{col} {d}")
+}
+
+#[cfg(test)]
+mod status_bucket_tests {
+    use super::{build_where, ListParams};
+
+    fn where_for(status: &str) -> String {
+        let params = ListParams {
+            status: Some(status.to_owned()),
+            ..Default::default()
+        };
+        build_where(&params).0
+    }
+
+    #[test]
+    fn seeding_excludes_incomplete_and_stopped() {
+        let w = where_for("seeding");
+        assert!(w.contains("t.complete=1"), "{w}");
+        assert!(w.contains("t.is_active=1"), "{w}");
+    }
+
+    #[test]
+    fn downloading_excludes_complete() {
+        let w = where_for("downloading");
+        assert!(w.contains("t.complete=0"), "{w}");
+        assert!(w.contains("t.is_active=1"), "{w}");
+    }
+
+    #[test]
+    fn stalled_uploading_checks_throughput_not_started_state() {
+        let w = where_for("stalled_uploading");
+        assert!(w.contains("t.up_rate=0"), "{w}");
+        assert!(w.contains("t.complete=1"), "{w}");
+        // The bug this guards against: checking is_active=0 (stopped)
+        // instead of up_rate=0 (zero throughput while still running).
+        assert!(
+            !w.contains("is_active=0"),
+            "stalled_uploading must not require is_active=0 (that means stopped, not stalled): {w}"
+        );
+    }
+
+    #[test]
+    fn stalled_downloading_checks_throughput_not_started_state() {
+        let w = where_for("stalled_downloading");
+        assert!(w.contains("t.down_rate=0"), "{w}");
+        assert!(w.contains("t.complete=0"), "{w}");
+        assert!(
+            !w.contains("is_active=0"),
+            "stalled_downloading must not require is_active=0 (that means stopped, not stalled): {w}"
+        );
+    }
 }
 
 #[cfg(test)]
