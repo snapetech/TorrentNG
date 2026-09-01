@@ -18,6 +18,12 @@ pub struct TorrentSummary {
     pub completed_at: Option<i64>,
     pub num_peers: u32,
     pub num_seeds: u32,
+    /// The active tracker's failure/warning message, if any -- a torrent
+    /// can be actively seeding or downloading fine while its tracker
+    /// rejects announces (e.g. "torrent not registered with this
+    /// tracker"), which `state` alone never reflects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracker_message: Option<String>,
 }
 
 /// Full detail returned by `GET /api/v1/torrents/{hash}`.
@@ -88,6 +94,7 @@ mod tests {
             completed_at: None,
             num_peers: 3,
             num_seeds: 10,
+            tracker_message: None,
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: TorrentSummary = serde_json::from_str(&json).unwrap();

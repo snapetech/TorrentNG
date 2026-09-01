@@ -27,14 +27,14 @@ use rt_engine::{
 };
 use rt_metainfo::{parse_magnet, parse_torrent};
 use rt_metrics::MemoryClass;
-use rt_session::{TorrentEntry, TorrentState};
+use rt_session::TorrentState;
 use rt_storage::{
     runtime::StorageRuntime, DeletePlanRequest, ImportPlanRequest, MovePlanRequest, PlanIssue,
     PlannedStorageAction, StoragePlan, StoragePlanStep, STORAGE_LATENCY_BUCKETS_NS,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::state::{AppState, JsonMap};
+use crate::state::{torrent_summary, AppState, JsonMap, TorrentSnapshotError, TorrentSnapshotItem};
 
 /// `POST /api/v1/auth/login` — native WebUI session probe.
 pub async fn auth_login(State(state): State<AppState>, body: String) -> impl IntoResponse {
@@ -106,10 +106,14 @@ pub struct TorrentListQuery {
     pub reverse: Option<bool>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+    /// Generation returned by a previous page.  Cursors expire when they
+    /// fall out of the bounded server-side snapshot cache.
+    pub snapshot: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct TorrentListResponse {
+    pub snapshot: u64,
     pub total: usize,
     pub torrents: Vec<TorrentSummary>,
 }
@@ -119,15 +123,29 @@ pub async fn list_torrents(
     State(state): State<AppState>,
     Query(query): Query<TorrentListQuery>,
 ) -> impl IntoResponse {
-    let total = {
-        let reg = state.registry.read().await;
-        reg.iter()
-            .filter(|entry| torrent_matches(entry, &query))
-            .count()
+    let snapshot = match state.torrent_snapshot(query.snapshot).await {
+        Ok(snapshot) => snapshot,
+        Err(TorrentSnapshotError::Expired { revision }) => {
+            return (
+                StatusCode::GONE,
+                Json(
+                    serde_json::to_value(ApiError::bad_request(format!(
+                        "torrent snapshot {revision} expired; restart pagination"
+                    )))
+                    .unwrap(),
+                ),
+            )
+                .into_response();
+        }
     };
+    let total = snapshot
+        .torrents
+        .iter()
+        .filter(|item| torrent_matches_summary(&item.summary, &query))
+        .count();
     let limit = query.limit.unwrap_or(200).clamp(1, 5_000);
     let offset = query.offset.unwrap_or(0);
-    let estimate = estimate_torrent_summary_snapshot_bytes(limit.min(total));
+    let estimate = estimate_torrent_summary_snapshot_bytes(snapshot.torrents.len());
 
     let lease = if let Some(engine) = &state.engine {
         match engine
@@ -148,22 +166,23 @@ pub async fn list_torrents(
         None
     };
 
-    let reg = state.registry.read().await;
-    let mut entries = reg
+    let mut entries = snapshot
+        .torrents
         .iter()
-        .filter(|entry| torrent_matches(entry, &query))
+        .filter(|item| torrent_matches_summary(&item.summary, &query))
         .collect::<Vec<_>>();
-    sort_torrent_entries(&mut entries, &query);
+    sort_torrent_summaries(&mut entries, &query);
     let summaries = entries
         .into_iter()
         .skip(offset)
         .take(limit)
-        .map(torrent_summary)
+        .map(|item| item.summary.clone())
         .collect::<Vec<_>>();
     drop(lease);
     (
         StatusCode::OK,
         Json(TorrentListResponse {
+            snapshot: snapshot.revision,
             total,
             torrents: summaries,
         }),
@@ -171,7 +190,7 @@ pub async fn list_torrents(
         .into_response()
 }
 
-fn torrent_matches(entry: &TorrentEntry, query: &TorrentListQuery) -> bool {
+fn torrent_matches_summary(entry: &TorrentSummary, query: &TorrentListQuery) -> bool {
     if let Some(filter) = query
         .filter
         .as_deref()
@@ -220,26 +239,28 @@ fn torrent_matches(entry: &TorrentEntry, query: &TorrentListQuery) -> bool {
     true
 }
 
-fn sort_torrent_entries(entries: &mut [&TorrentEntry], query: &TorrentListQuery) {
+fn sort_torrent_summaries(entries: &mut [&TorrentSnapshotItem], query: &TorrentListQuery) {
     let sort = query.sort.as_deref().unwrap_or("added");
     entries.sort_by(|left, right| {
         let ordering = match sort {
             "name" => left
+                .summary
                 .name
                 .to_ascii_lowercase()
-                .cmp(&right.name.to_ascii_lowercase()),
-            "size" | "total_length" => left.total_length.cmp(&right.total_length),
+                .cmp(&right.summary.name.to_ascii_lowercase()),
+            "size" | "total_length" => left.summary.total_length.cmp(&right.summary.total_length),
             "ratio" => left
-                .stats
-                .ratio()
-                .partial_cmp(&right.stats.ratio())
+                .summary
+                .ratio
+                .partial_cmp(&right.summary.ratio)
                 .unwrap_or(std::cmp::Ordering::Equal),
-            "progress" => left
-                .total_length
+            "progress" => (left.summary.total_length.max(0) as u64)
                 .saturating_sub(left.amount_left)
-                .cmp(&right.total_length.saturating_sub(right.amount_left)),
-            "hash" => left.info_hash.cmp(&right.info_hash),
-            _ => left.added_at.cmp(&right.added_at),
+                .cmp(
+                    &((right.summary.total_length.max(0) as u64).saturating_sub(right.amount_left)),
+                ),
+            "hash" => left.summary.info_hash.cmp(&right.summary.info_hash),
+            _ => left.summary.added_at.cmp(&right.summary.added_at),
         };
         let ordering = if query.reverse.unwrap_or(false)
             || query
@@ -251,7 +272,7 @@ fn sort_torrent_entries(entries: &mut [&TorrentEntry], query: &TorrentListQuery)
         } else {
             ordering
         };
-        ordering.then_with(|| left.info_hash.cmp(&right.info_hash))
+        ordering.then_with(|| left.summary.info_hash.cmp(&right.summary.info_hash))
     });
 }
 
@@ -3336,27 +3357,29 @@ pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
 /// `GET /api/v1/events` — server-sent torrent delta stream.
 pub async fn stream_events(
     State(state): State<AppState>,
+    Query(query): Query<EventStreamQuery>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let stream = futures::stream::unfold(
-        EventStreamState::new(state),
+        EventStreamState::new(state, query.last_known_revision),
         |mut stream_state| async move {
             loop {
                 stream_state.tick.tick().await;
-                let delta = torrent_delta(&stream_state.state, &stream_state.previous).await;
+                let delta = torrent_delta_for_stream(&mut stream_state).await;
                 if delta.torrents.is_empty() && delta.removed.is_empty() {
                     continue;
                 }
 
                 stream_state.seq = stream_state.seq.saturating_add(1);
-                stream_state.previous = delta.current;
+                let cursor = stream_state.registry_revision.unwrap_or_default();
                 let payload = serde_json::json!({
                     "seq": stream_state.seq,
+                    "cursor": cursor,
                     "torrents": delta.torrents,
                     "removed": delta.removed,
                 });
                 let event = Event::default()
                     .event("torrent_delta")
-                    .id(stream_state.seq.to_string())
+                    .id(cursor.to_string())
                     .json_data(payload)
                     .expect("torrent delta serializes");
                 return Some((Ok(event), stream_state));
@@ -3365,6 +3388,14 @@ pub async fn stream_events(
     );
 
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct EventStreamQuery {
+    /// Registry generation returned in the previous SSE payload.  The
+    /// bounded mutation journal allows reconnects without rescanning every
+    /// torrent; an expired cursor triggers a one-time snapshot resync.
+    pub last_known_revision: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3459,16 +3490,16 @@ fn level_from_kind(kind: &str) -> &'static str {
 
 struct EventStreamState {
     state: AppState,
-    previous: BTreeMap<String, String>,
+    registry_revision: Option<u64>,
     seq: u64,
     tick: tokio::time::Interval,
 }
 
 impl EventStreamState {
-    fn new(state: AppState) -> Self {
+    fn new(state: AppState, registry_revision: Option<u64>) -> Self {
         EventStreamState {
             state,
-            previous: BTreeMap::new(),
+            registry_revision,
             seq: 0,
             tick: tokio::time::interval(Duration::from_secs(1)),
         }
@@ -3476,55 +3507,69 @@ impl EventStreamState {
 }
 
 struct TorrentDelta {
-    current: BTreeMap<String, String>,
     torrents: Vec<TorrentSummary>,
     removed: Vec<String>,
 }
 
-async fn torrent_delta(state: &AppState, previous: &BTreeMap<String, String>) -> TorrentDelta {
-    let _lease = if let Some(engine) = &state.engine {
-        let torrent_count = state.registry.read().await.iter().count();
-        match engine
-            .reserve_memory(
-                MemoryClass::ApiSnapshot,
-                estimate_torrent_delta_snapshot_bytes(torrent_count),
-            )
-            .await
-        {
-            Ok(Some(lease)) => Some(lease),
-            Ok(None) | Err(_) => {
+async fn torrent_delta_for_stream(stream_state: &mut EventStreamState) -> TorrentDelta {
+    loop {
+        let Some(last_revision) = stream_state.registry_revision else {
+            let Ok(snapshot) = stream_state.state.torrent_snapshot(None).await else {
                 return TorrentDelta {
-                    current: BTreeMap::new(),
                     torrents: Vec::new(),
                     removed: Vec::new(),
                 };
+            };
+            stream_state.registry_revision = Some(snapshot.revision);
+            return TorrentDelta {
+                torrents: snapshot
+                    .torrents
+                    .iter()
+                    .map(|item| item.summary.clone())
+                    .collect(),
+                removed: Vec::new(),
+            };
+        };
+
+        let (current_revision, changes) = {
+            let registry = stream_state.state.registry.read().await;
+            let current_revision = registry.revision();
+            let Some(changes) = registry.changes_since(last_revision) else {
+                stream_state.registry_revision = None;
+                continue;
+            };
+            (current_revision, changes)
+        };
+        if changes.is_empty() {
+            return TorrentDelta {
+                torrents: Vec::new(),
+                removed: Vec::new(),
+            };
+        }
+
+        let mut changed = BTreeSet::new();
+        let mut removed = BTreeSet::new();
+        for change in changes {
+            if change.removed {
+                changed.remove(&change.info_hash);
+                removed.insert(change.info_hash);
+            } else {
+                removed.remove(&change.info_hash);
+                changed.insert(change.info_hash);
             }
         }
-    } else {
-        None
-    };
 
-    let reg = state.registry.read().await;
-    let mut current = BTreeMap::new();
-    let mut torrents = Vec::new();
-    for entry in reg.iter() {
-        let summary = torrent_summary(entry);
-        let encoded = serde_json::to_string(&summary).expect("torrent summary serializes");
-        if previous.get(&summary.info_hash) != Some(&encoded) {
-            torrents.push(summary);
-        }
-        current.insert(entry.info_hash.clone(), encoded);
-    }
-    let removed = previous
-        .keys()
-        .filter(|hash| !current.contains_key(*hash))
-        .cloned()
-        .collect();
-
-    TorrentDelta {
-        current,
-        torrents,
-        removed,
+        let registry = stream_state.state.registry.read().await;
+        let torrents = changed
+            .into_iter()
+            .filter_map(|hash| registry.get(&hash).map(torrent_summary))
+            .collect::<Vec<_>>();
+        let removed = removed
+            .into_iter()
+            .filter(|hash| registry.get(hash).is_none())
+            .collect::<Vec<_>>();
+        stream_state.registry_revision = Some(current_revision);
+        return TorrentDelta { torrents, removed };
     }
 }
 
@@ -3532,10 +3577,6 @@ fn estimate_torrent_summary_snapshot_bytes(torrent_count: usize) -> u64 {
     // Conservative enough to cover Vec growth and cloned strings for typical
     // summaries without letting a huge API snapshot bypass governor pressure.
     (torrent_count as u64).saturating_mul(1024)
-}
-
-fn estimate_torrent_delta_snapshot_bytes(torrent_count: usize) -> u64 {
-    (torrent_count as u64).saturating_mul(1536)
 }
 
 fn estimate_torrent_detail_base_snapshot_bytes() -> u64 {
@@ -3569,25 +3610,6 @@ fn estimate_torrent_detail_snapshot_bytes(
         .saturating_add(webseed_strings)
         .saturating_add(file_strings)
         .max(estimate_torrent_detail_base_snapshot_bytes() as usize) as u64
-}
-
-fn torrent_summary(e: &TorrentEntry) -> TorrentSummary {
-    TorrentSummary {
-        info_hash: e.info_hash.clone(),
-        name: e.name.clone(),
-        state: e.state.as_str().to_owned(),
-        total_length: e.total_length as i64,
-        downloaded: e.stats.downloaded as i64,
-        uploaded: e.stats.uploaded as i64,
-        ratio: e.stats.ratio(),
-        save_path: e.save_path.clone(),
-        category: e.category.clone(),
-        tags: e.tags.clone(),
-        added_at: e.added_at as i64,
-        completed_at: e.completed_at.map(|t| t as i64),
-        num_peers: 0,
-        num_seeds: 0,
-    }
 }
 
 fn render_metrics(stats: &rt_engine::EngineStats) -> String {
@@ -6147,7 +6169,10 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v, serde_json::json!({"total": 0, "torrents": []}));
+        assert_eq!(
+            v,
+            serde_json::json!({"snapshot": 0, "total": 0, "torrents": []})
+        );
     }
 
     #[tokio::test]
@@ -6804,7 +6829,8 @@ mod tests {
             .unwrap();
         }
 
-        let first = torrent_delta(&state, &BTreeMap::new()).await;
+        let mut stream_state = EventStreamState::new(state.clone(), None);
+        let first = torrent_delta_for_stream(&mut stream_state).await;
         assert_eq!(first.torrents.len(), 1);
         assert_eq!(first.torrents[0].info_hash, hash);
         assert!(first.removed.is_empty());
@@ -6813,7 +6839,7 @@ mod tests {
             let mut reg = state.registry.write().await;
             reg.remove(&hash).unwrap();
         }
-        let second = torrent_delta(&state, &first.current).await;
+        let second = torrent_delta_for_stream(&mut stream_state).await;
         assert!(second.torrents.is_empty());
         assert_eq!(second.removed, vec![hash]);
     }
@@ -6822,7 +6848,6 @@ mod tests {
     fn api_snapshot_estimates_scale_with_torrent_count() {
         assert_eq!(estimate_torrent_summary_snapshot_bytes(0), 0);
         assert_eq!(estimate_torrent_summary_snapshot_bytes(10), 10 * 1024);
-        assert_eq!(estimate_torrent_delta_snapshot_bytes(10), 10 * 1536);
         let summary = TorrentSummary {
             info_hash: "a".repeat(40),
             name: "detail.bin".to_owned(),
@@ -6838,6 +6863,7 @@ mod tests {
             completed_at: None,
             num_peers: 0,
             num_seeds: 0,
+            tracker_message: None,
         };
         let small_meta = rt_engine::EngineTorrentMetadata {
             piece_length: 16 * 1024,

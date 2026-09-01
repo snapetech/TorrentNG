@@ -7,6 +7,7 @@ pub(crate) mod network_budget;
 pub mod peer_id;
 pub mod peer_ingress;
 pub mod storage_authority;
+pub(crate) mod storage_jobs;
 pub mod tier;
 pub mod torrent_task;
 

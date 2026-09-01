@@ -7,6 +7,7 @@ use rt_metainfo::{MagnetLink, TorrentMeta};
 use rt_metrics::{MemoryClass, MemoryLease, ResourceSnapshot};
 use rt_storage::{StorageIoStats, StoragePlan, STORAGE_LATENCY_BUCKET_COUNT};
 
+use crate::torrent_task::TorrentCmd;
 use crate::TorrentActivityTier;
 
 pub type CmdResult<T> = Result<T, String>;
@@ -735,6 +736,12 @@ pub enum EngineCmd {
     },
     /// Internal completion from the magnet metadata worker.
     CompleteMagnet { info_hash: String, raw: Vec<u8> },
+    /// Route a peer whose handshake identified a currently dormant torrent.
+    /// The engine promotes the torrent before forwarding this command.
+    IncomingPeer {
+        info_hash: String,
+        command: TorrentCmd,
+    },
     /// Remove a torrent. delete_files removes content from disk.
     RemoveTorrent {
         info_hash: String,
@@ -813,6 +820,22 @@ pub enum EngineCmd {
         plan: StoragePlan,
         completed_steps: Vec<usize>,
         reply: oneshot::Sender<CmdResult<String>>,
+    },
+    /// Internal completion notification from the storage worker boundary.
+    StoragePlanFinished {
+        job_id: String,
+        affected_torrents: Vec<(String, bool)>,
+        succeeded: bool,
+    },
+    /// Internal completion notification for an asynchronous save-path move.
+    StorageMoveFinished {
+        job_id: String,
+        info_hash: String,
+        name: Option<String>,
+        old_save_path: PathBuf,
+        save_path: PathBuf,
+        quiesced: Option<bool>,
+        succeeded: bool,
     },
     /// List active durable jobs.
     ListJobs {

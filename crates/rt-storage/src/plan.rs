@@ -4,7 +4,7 @@ use std::path::{Component, Path, PathBuf};
 use crate::StorageError;
 use rt_path::SafeRelPath;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PlannedStorageAction {
     ImportExisting,
     Rename,
@@ -12,7 +12,7 @@ pub enum PlannedStorageAction {
     SafeDelete,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PlanIssue {
     SourceMissing(PathBuf),
     DestinationExists(PathBuf),
@@ -20,7 +20,7 @@ pub enum PlanIssue {
     DeleteRequiresDryRunApproval,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StoragePlanStep {
     pub action: PlannedStorageAction,
     pub source: Option<PathBuf>,
@@ -28,7 +28,7 @@ pub struct StoragePlanStep {
     pub bytes: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StoragePlan {
     pub dry_run: bool,
     pub can_apply: bool,

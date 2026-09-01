@@ -56,6 +56,7 @@ interface NativeTorrentSummary {
   completed_at: number | null
   num_peers: number
   num_seeds: number
+  tracker_message?: string | null
 }
 
 export interface ListParams {
@@ -119,7 +120,7 @@ function normalizeNativeTorrent(t: NativeTorrentSummary): TorrentSummary {
     tracker_focus: 0,
     peers_connected: Number(t.num_peers ?? 0),
     peers_complete: Number(t.num_seeds ?? 0),
-    message: '',
+    message: t.tracker_message ?? '',
     tracker_url: '',
     tags: Array.isArray(t.tags) ? t.tags.join(', ') : '',
     updated_at: Date.now(),

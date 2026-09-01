@@ -9,6 +9,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use anyhow::Context;
+use futures::{stream, StreamExt};
 use rusqlite::Connection;
 use sha1::{Digest, Sha1};
 use tokio::net::TcpListener;
@@ -46,7 +47,8 @@ use crate::metadata_task::run_metadata_task;
 use crate::network_budget::GlobalNetworkBudget;
 use crate::peer_ingress::{PeerIngressBudget, PeerIngressConfig, PeerIngressPermit};
 use crate::storage_authority::ServerStorageRoots;
-use crate::tier::{TierInput, TierPolicy};
+use crate::storage_jobs::{StorageJobAction, StorageJobCompletion, StorageJobDispatcher};
+use crate::tier::{TierController, TierEvent, TierInput, TierPolicy};
 use crate::torrent_task::{TorrentCmd, TorrentTask};
 
 const EVENT_ENGINE_STARTED: &str = "engine_started";
@@ -81,6 +83,7 @@ const SETTING_GLOBAL_SPEED_LIMITS_MODE: &str = "transfer.speed_limits_mode";
 const SETTING_NETWORK_DHT: &str = "network.dht";
 const SETTING_NETWORK_PEX: &str = "network.pex";
 const SETTING_QUEUE_PREFIX: &str = "torrent.queue.";
+const ENGINE_STATS_CACHE_TTL: Duration = Duration::from_millis(500);
 
 fn resource_config_from_config(config: &Config) -> ResourceGovernorConfig {
     let mib = 1024 * 1024;
@@ -735,6 +738,10 @@ pub struct Engine {
     dht_tx: Option<mpsc::Sender<DhtCommand>>,
     resources: ResourceGovernor,
     network_budget: GlobalNetworkBudget,
+    storage_jobs: StorageJobDispatcher,
+    tier_controller: crate::tier::TierController<String>,
+    tier_last_active: HashMap<String, Instant>,
+    stats_cache: Option<(Instant, EngineStats)>,
     shutdown_reply: Option<oneshot::Sender<()>>,
 }
 
@@ -756,8 +763,13 @@ impl Engine {
             .with_context(|| format!("opening database {:?}", config.db_path()))?;
         rt_db::migrate(&conn).context("migrating database")?;
         register_configured_storage(&conn, &config).context("registering configured storage")?;
+        let db = Arc::new(Mutex::new(conn));
+        let storage_jobs = StorageJobDispatcher::new(Arc::clone(&db));
 
-        let dht_enabled = setting_bool_with_default(&conn, SETTING_NETWORK_DHT, config.dht.enabled);
+        let dht_enabled = {
+            let conn = db.lock().expect("database mutex poisoned");
+            setting_bool_with_default(&conn, SETTING_NETWORK_DHT, config.dht.enabled)
+        };
         let dht_shutdown = if dht_enabled {
             Some(spawn_dht_task(&config))
         } else {
@@ -772,7 +784,7 @@ impl Engine {
         let mut engine = Engine {
             config: config.clone(),
             registry,
-            db: Arc::new(Mutex::new(conn)),
+            db,
             cmd_rx,
             cmd_tx: tx,
             torrent_chans: HashMap::new(),
@@ -780,6 +792,10 @@ impl Engine {
             dht_tx: dht_shutdown,
             resources: ResourceGovernor::new(resource_config_from_config(&config)),
             network_budget,
+            storage_jobs,
+            tier_controller: TierController::new(TierPolicy::default()),
+            tier_last_active: HashMap::new(),
+            stats_cache: None,
             shutdown_reply: None,
         };
         engine.apply_shared_global_limits_from_db();
@@ -794,6 +810,7 @@ impl Engine {
         );
         engine.recover_interrupted_jobs()?;
         engine.load_persisted_torrents().await?;
+        engine.resume_recovered_storage_jobs().await?;
 
         // Spawn TCP listener.
         let listen_addr: SocketAddr = format!("0.0.0.0:{}", config.network.listen_port)
@@ -837,6 +854,7 @@ impl Engine {
         utp_endpoint: Option<UtpEndpoint>,
         peer_ingress: Arc<PeerIngressBudget>,
     ) {
+        let mut tier_tick = tokio::time::interval(Duration::from_secs(5));
         loop {
             tokio::select! {
                 Some(cmd) = self.cmd_rx.recv() => {
@@ -861,12 +879,14 @@ impl Engine {
                                 continue;
                             };
                             let chans = self.torrent_chans.clone();
+                            let engine_tx = self.cmd_tx.clone();
                             let handshake_timeout = peer_ingress.config().handshake_timeout;
                             tokio::spawn(async move {
                                 if let Err(e) = handle_incoming(
                                     stream,
                                     peer_addr,
                                     chans,
+                                    engine_tx,
                                     permit,
                                     peer_permit,
                                     handshake_timeout,
@@ -914,6 +934,7 @@ impl Engine {
                                         continue;
                                     };
                                     let chans = self.torrent_chans.clone();
+                                    let engine_tx = self.cmd_tx.clone();
                                     let handshake_timeout =
                                         peer_ingress.config().handshake_timeout;
                                     tokio::spawn(async move {
@@ -921,6 +942,7 @@ impl Engine {
                                             stream,
                                             peer_addr,
                                             chans,
+                                            engine_tx,
                                             permit,
                                             peer_permit,
                                             handshake_timeout,
@@ -961,9 +983,19 @@ impl Engine {
                         }
                     }
                 }
+                _ = tier_tick.tick() => {
+                    if self.config.runtime.torrent_tiers_enabled {
+                        self.reconcile_activity_tiers().await;
+                    }
+                }
             }
         }
         self.shutdown_torrent_tasks().await;
+        self.storage_jobs
+            .shutdown(Duration::from_secs(
+                self.config.daemon.shutdown_timeout_secs.max(1),
+            ))
+            .await;
         if let Some(tx) = self.dht_tx.take() {
             shutdown_dht_task(
                 tx,
@@ -1037,6 +1069,19 @@ impl Engine {
                 }
             }
 
+            EngineCmd::IncomingPeer { info_hash, command } => {
+                if let Err(e) = self.route_incoming_peer(info_hash.clone(), command).await {
+                    warn!(
+                        component = "peer_listener",
+                        operation = "route_incoming_peer",
+                        torrent = %info_hash,
+                        result = "rejected",
+                        error = %e,
+                        "failed to promote or route inbound peer"
+                    );
+                }
+            }
+
             EngineCmd::RemoveTorrent {
                 info_hash,
                 delete_files,
@@ -1070,6 +1115,8 @@ impl Engine {
                         }
                     }
                 }
+                self.tier_controller.remove(&info_hash);
+                self.tier_last_active.remove(&info_hash);
                 let result = {
                     let entry = {
                         let mut reg = self.registry.write().await;
@@ -1133,7 +1180,10 @@ impl Engine {
                         self.set_registry_state(&info_hash, TorrentState::Paused, None)
                             .await
                     }
-                    Err(err) => Err(err),
+                    Err(_) => {
+                        self.set_registry_state(&info_hash, TorrentState::Paused, None)
+                            .await
+                    }
                 };
                 if result.is_ok() {
                     self.append_session_event(
@@ -1160,7 +1210,7 @@ impl Engine {
                         TorrentState::MetadataPending,
                     )
                 } else {
-                    let result = self.ensure_metadata_task(&info_hash).await.and_then(|_| {
+                    let result = self.ensure_torrent_task(&info_hash).await.and_then(|_| {
                         self.torrent_chans
                             .get(&info_hash)
                             .ok_or_else(|| format!("torrent {info_hash} not found"))
@@ -1192,14 +1242,28 @@ impl Engine {
 
             EngineCmd::RecheckTorrent { info_hash, reply } => {
                 let job_id = self.create_recheck_job(&info_hash);
-                let result = self
-                    .send_to_torrent(
+                let result = if self.is_pure_v2_torrent(&info_hash) {
+                    self.send_to_torrent(
                         &info_hash,
                         TorrentCmd::Recheck {
                             job_id: job_id.clone(),
                         },
                     )
-                    .await;
+                    .await
+                } else {
+                    match self.ensure_torrent_task(&info_hash).await {
+                        Ok(()) => {
+                            self.send_to_torrent(
+                                &info_hash,
+                                TorrentCmd::Recheck {
+                                    job_id: job_id.clone(),
+                                },
+                            )
+                            .await
+                        }
+                        Err(error) => Err(error),
+                    }
+                };
                 let result = if result.is_err() && self.is_pure_v2_torrent(&info_hash) {
                     self.recheck_pure_v2_torrent(&info_hash, job_id.clone())
                         .await
@@ -1258,8 +1322,17 @@ impl Engine {
                 } else if taskless_v2 {
                     Err("pure v2 tracker lifecycle is not implemented".to_owned())
                 } else {
-                    self.send_to_torrent(&info_hash, TorrentCmd::Reannounce)
-                        .await
+                    let was_taskless = !self.torrent_chans.contains_key(&info_hash);
+                    match self.ensure_torrent_task(&info_hash).await {
+                        Ok(()) => {
+                            if was_taskless {
+                                let _ = self.send_to_torrent(&info_hash, TorrentCmd::Resume).await;
+                            }
+                            self.send_to_torrent(&info_hash, TorrentCmd::Reannounce)
+                                .await
+                        }
+                        Err(error) => Err(error),
+                    }
                 };
                 if result.is_ok() {
                     self.append_session_event(
@@ -1324,26 +1397,86 @@ impl Engine {
                 completed_steps,
                 reply,
             } => {
-                // TNG-002: this generic executor operates on raw
-                // filesystem paths and never changes a torrent's
-                // persisted save_path itself (that's
-                // `move_torrent_payload_files`'s job), but it can still
-                // rename/copy/delete files a running task's peers or an
-                // in-progress recheck are actively touching. Quiesce
-                // every torrent this plan claims to affect first, and
-                // resume each one unchanged afterward regardless of
-                // outcome.
                 let quiesced = self
                     .quiesce_torrents_for_storage_plan(&affected_torrents)
                     .await;
-                let result = self.execute_storage_plan_job(
+                let (completion, completion_rx) = oneshot::channel();
+                let result = self.queue_storage_plan_job(
                     &operation,
-                    affected_torrents,
+                    affected_torrents.clone(),
                     &plan,
                     completed_steps,
+                    completion,
                 );
-                self.resume_torrents_after_storage_plan(quiesced).await;
+                if let Ok(job_id) = &result {
+                    let cmd_tx = self.cmd_tx.clone();
+                    let job_id = job_id.clone();
+                    tokio::spawn(async move {
+                        let succeeded = completion_rx
+                            .await
+                            .map(|completion: StorageJobCompletion| completion.succeeded)
+                            .unwrap_or(false);
+                        let _ = cmd_tx
+                            .send(EngineCmd::StoragePlanFinished {
+                                job_id,
+                                affected_torrents: quiesced,
+                                succeeded,
+                            })
+                            .await;
+                    });
+                } else {
+                    self.resume_torrents_after_storage_plan(quiesced).await;
+                }
                 let _ = reply.send(result);
+            }
+            EngineCmd::StoragePlanFinished {
+                job_id,
+                affected_torrents,
+                succeeded,
+            } => {
+                if !succeeded {
+                    warn!(
+                        component = "storage_jobs",
+                        operation = "complete",
+                        job_id = %job_id,
+                        result = "failed",
+                        "storage plan finished without a successful commit"
+                    );
+                }
+                self.resume_torrents_after_storage_plan(affected_torrents)
+                    .await;
+            }
+            EngineCmd::StorageMoveFinished {
+                job_id,
+                info_hash,
+                name,
+                old_save_path,
+                save_path,
+                quiesced,
+                succeeded,
+            } => {
+                if let Err(error) = self
+                    .finish_storage_move(
+                        &job_id,
+                        &info_hash,
+                        name,
+                        old_save_path,
+                        save_path,
+                        quiesced,
+                        succeeded,
+                    )
+                    .await
+                {
+                    warn!(
+                        component = "storage_jobs",
+                        operation = "finish_storage_move",
+                        job_id = %job_id,
+                        torrent = %info_hash,
+                        result = "error",
+                        error = %error,
+                        "failed to finalize asynchronous storage move"
+                    );
+                }
             }
             EngineCmd::ListJobs { reply } => {
                 let result = self.list_active_jobs();
@@ -1837,9 +1970,11 @@ impl Engine {
             self.network_budget.clone(),
         );
         let handle = tokio::spawn(task.run());
+        let tier_key = info_hash_hex.clone();
         self.torrent_chans
             .insert(info_hash_hex.clone(), cmd_tx.clone());
         self.torrent_tasks.insert(info_hash_hex, handle);
+        self.tier_last_active.insert(tier_key, Instant::now());
         cmd_tx
     }
 
@@ -1866,9 +2001,11 @@ impl Engine {
             OutboundEgressPolicy::from_config(&self.config.tracker),
             self.network_budget.clone(),
         ));
+        let tier_key = info_hash_hex.clone();
         self.torrent_chans
             .insert(info_hash_hex.clone(), cmd_tx.clone());
         self.torrent_tasks.insert(info_hash_hex, handle);
+        self.tier_last_active.insert(tier_key, Instant::now());
         cmd_tx
     }
 
@@ -1939,6 +2076,151 @@ impl Engine {
         }
     }
 
+    /// Reconcile only the currently promoted task set. Dormant torrents are
+    /// represented by the registry/SQLite/blob and do not participate in a
+    /// periodic per-torrent async loop. A seed that has been idle through the
+    /// warm window is demoted and reconstructed on the next lifecycle or peer
+    /// demand.
+    async fn reconcile_activity_tiers(&mut self) {
+        if !self.config.runtime.torrent_tiers_enabled {
+            return;
+        }
+        let task_ids = self.torrent_chans.keys().cloned().collect::<Vec<_>>();
+        let states = {
+            let registry = self.registry.read().await;
+            task_ids
+                .iter()
+                .filter_map(|info_hash| {
+                    registry
+                        .get(info_hash)
+                        .map(|entry| (info_hash.clone(), entry.state))
+                })
+                .collect::<HashMap<_, _>>()
+        };
+        let now = Instant::now();
+        let mut demote = Vec::new();
+        for info_hash in task_ids {
+            let Some(state) = states.get(&info_hash).copied() else {
+                continue;
+            };
+            let connected_peers = self.torrent_chans.get(&info_hash).and_then(|tx| {
+                let (reply, rx) = oneshot::channel();
+                tx.try_send(TorrentCmd::GetRuntimeStats { reply })
+                    .ok()
+                    .map(|_| rx)
+            });
+            let runtime = match connected_peers {
+                Some(rx) => timeout(Duration::from_millis(50), rx)
+                    .await
+                    .ok()
+                    .and_then(Result::ok),
+                None => None,
+            };
+            let connected = runtime
+                .as_ref()
+                .map(|stats| stats.connected_peers as usize)
+                .unwrap_or_default();
+            let outstanding = runtime
+                .as_ref()
+                .map(|stats| stats.outstanding_requests as usize)
+                .unwrap_or_default();
+            if connected > 0 || outstanding > 0 {
+                self.tier_last_active.insert(info_hash.clone(), now);
+            }
+            let decision = self.tier_controller.apply_input(
+                info_hash.clone(),
+                TierInput {
+                    state,
+                    connected_peers: connected,
+                    outstanding_requests: outstanding,
+                    inbound_peer: false,
+                    tracker_due: false,
+                    last_active: self.tier_last_active.get(&info_hash).copied(),
+                    now,
+                },
+            );
+            if decision.tier == crate::tier::TorrentActivityTier::Dormant
+                && state == TorrentState::Seeding
+            {
+                demote.push(info_hash);
+            }
+        }
+        for info_hash in demote {
+            self.demote_torrent_task(&info_hash).await;
+        }
+    }
+
+    async fn demote_torrent_task(&mut self, info_hash: &str) {
+        let Some(tx) = self.torrent_chans.remove(info_hash) else {
+            return;
+        };
+        self.unregister_dht_torrent(info_hash).await;
+        let _ = tx.send(TorrentCmd::Shutdown).await;
+        if let Some(mut task) = self.torrent_tasks.remove(info_hash) {
+            let timeout_budget = Duration::from_secs(10);
+            if timeout(timeout_budget, &mut task).await.is_err() {
+                task.abort();
+            }
+        }
+        self.tier_controller.remove(&info_hash.to_owned());
+        self.tier_last_active.remove(info_hash);
+        info!(
+            component = "tiering",
+            operation = "demote",
+            torrent = %info_hash,
+            result = "ok",
+            "demoted idle torrent to dormant representation"
+        );
+    }
+
+    async fn route_incoming_peer(
+        &mut self,
+        info_hash: String,
+        command: TorrentCmd,
+    ) -> CmdResult<()> {
+        let was_taskless = !self.torrent_chans.contains_key(&info_hash);
+        if was_taskless {
+            self.ensure_torrent_task(&info_hash).await?;
+        }
+        let tx = self
+            .torrent_chans
+            .get(&info_hash)
+            .cloned()
+            .ok_or_else(|| format!("torrent {info_hash} has no runtime task"))?;
+        if was_taskless {
+            tx.send(TorrentCmd::Resume)
+                .await
+                .map_err(|_| "promoted torrent task stopped before resume".to_owned())?;
+        }
+        tx.send(command)
+            .await
+            .map_err(|_| "promoted torrent task stopped before peer delivery".to_owned())?;
+
+        let now = Instant::now();
+        self.tier_last_active.insert(info_hash.clone(), now);
+        let state = self
+            .registry
+            .read()
+            .await
+            .get(&info_hash)
+            .map(|entry| entry.state)
+            .unwrap_or(TorrentState::Downloading);
+        self.tier_controller.apply_event(
+            info_hash,
+            TierInput {
+                state,
+                connected_peers: 1,
+                outstanding_requests: 0,
+                inbound_peer: true,
+                tracker_due: false,
+                last_active: Some(now),
+                now,
+            },
+            TierEvent::InboundPeer,
+        );
+        Ok(())
+    }
+
     async fn load_persisted_torrents(&mut self) -> anyhow::Result<()> {
         let rows = {
             let db = self.db.lock().expect("database mutex poisoned");
@@ -1959,7 +2241,9 @@ impl Engine {
                 continue;
             }
             if self.is_metadata_placeholder_row(&row) {
-                let paused = state_from_str(&row.state) == TorrentState::Paused;
+                let state = state_from_str(&row.state);
+                let start_task = !self.config.runtime.torrent_tiers_enabled
+                    || should_start_task_on_restore(state);
                 let entry = entry_from_row(&row);
                 {
                     let mut db = self.db.lock().expect("database mutex poisoned");
@@ -1986,15 +2270,27 @@ impl Engine {
                     );
                 }
                 drop(reg);
+                self.tier_controller.apply_input(
+                    row.info_hash.clone(),
+                    TierInput {
+                        state,
+                        connected_peers: 0,
+                        outstanding_requests: 0,
+                        inbound_peer: false,
+                        tracker_due: false,
+                        last_active: start_task.then_some(Instant::now()),
+                        now: Instant::now(),
+                    },
+                );
                 let mut restored = false;
                 if let Ok(info_hash) = parse_info_hash_hex(&row.info_hash) {
-                    let _tx = self.spawn_metadata_task(
-                        info_hash,
-                        row.info_hash.clone(),
-                        row.trackers.clone(),
-                        paused,
-                    );
-                    if !paused {
+                    if start_task {
+                        let _tx = self.spawn_metadata_task(
+                            info_hash,
+                            row.info_hash.clone(),
+                            row.trackers.clone(),
+                            matches!(state, TorrentState::Paused | TorrentState::Stopped),
+                        );
                         self.register_dht_torrent(info_hash, &row.info_hash).await;
                     }
                     self.append_session_event(
@@ -2095,19 +2391,34 @@ impl Engine {
             }
 
             let state = state_from_str(&row.state);
-            let paused = !matches!(state, TorrentState::Downloading | TorrentState::Seeding);
+            let start_task =
+                !self.config.runtime.torrent_tiers_enabled || should_start_task_on_restore(state);
+            self.tier_controller.apply_input(
+                row.info_hash.clone(),
+                TierInput {
+                    state,
+                    connected_peers: 0,
+                    outstanding_requests: 0,
+                    inbound_peer: false,
+                    tracker_due: false,
+                    last_active: start_task.then_some(Instant::now()),
+                    now: Instant::now(),
+                },
+            );
             let is_private = meta.is_private();
             let v2_only = matches!(meta, TorrentMeta::V2(_));
-            if let Some(v1) = meta_v1(meta) {
-                let info_hash = v1.info_hash;
-                let _tx = self.spawn_torrent_task(
-                    row.info_hash.clone(),
-                    v1,
-                    PathBuf::from(&row.save_path),
-                    paused,
-                );
-                if !paused && !is_private {
-                    self.register_dht_torrent(info_hash, &row.info_hash).await;
+            if start_task {
+                if let Some(v1) = meta_v1(meta) {
+                    let info_hash = v1.info_hash;
+                    let _tx = self.spawn_torrent_task(
+                        row.info_hash.clone(),
+                        v1,
+                        PathBuf::from(&row.save_path),
+                        matches!(state, TorrentState::Paused | TorrentState::Stopped),
+                    );
+                    if !is_private {
+                        self.register_dht_torrent(info_hash, &row.info_hash).await;
+                    }
                 }
             }
             self.append_session_event(
@@ -2125,7 +2436,7 @@ impl Engine {
                 operation = "restore_torrent",
                 torrent = %row.info_hash,
                 state = %row.state,
-                paused,
+                task_started = start_task,
                 result = "ok",
                 "restored persisted torrent"
             );
@@ -2140,6 +2451,9 @@ impl Engine {
         for mut job in jobs {
             let previous_state = job.state.clone();
             let recovered_state = match previous_state.as_str() {
+                JOB_STATE_RUNNING | "cancelling" if job.kind == JOB_KIND_STORAGE_PLAN => {
+                    Some(JOB_STATE_QUEUED)
+                }
                 JOB_STATE_RUNNING | "cancelling" => Some(JOB_STATE_PAUSED),
                 _ => None,
             };
@@ -2164,6 +2478,132 @@ impl Engine {
                     .to_string(),
                 },
             )?;
+        }
+        Ok(())
+    }
+
+    /// Reconstruct storage plans from their durable queue/checkpoint event and
+    /// hand them back to the bounded worker supervisor after restart. The
+    /// worker owns the filesystem transaction; the actor only restores
+    /// quiesce/resume and save-path finalization callbacks.
+    async fn resume_recovered_storage_jobs(&self) -> anyhow::Result<()> {
+        let jobs = {
+            let db = self.db.lock().expect("database mutex poisoned");
+            rt_db::list_active_jobs(&db)?
+        };
+        for job in jobs
+            .into_iter()
+            .filter(|job| job.kind == JOB_KIND_STORAGE_PLAN && job.state == JOB_STATE_QUEUED)
+        {
+            let recovery = {
+                let db = self.db.lock().expect("database mutex poisoned");
+                rt_db::list_job_events(&db, &job.job_id, 64)?
+                    .into_iter()
+                    .find_map(|event| decode_storage_plan_event(&event.payload))
+            };
+            let Some((operation, plan, event_completed_steps, context)) = recovery else {
+                self.update_job_state(
+                    &job.job_id,
+                    JOB_STATE_FAILED,
+                    Some("storage plan payload is missing or invalid".to_owned()),
+                    Some("storage plan recovery failed"),
+                );
+                continue;
+            };
+            let checkpoint_steps = if job.checkpoint > 0 {
+                (0..job.checkpoint as usize).collect()
+            } else {
+                event_completed_steps
+            };
+            let quiesced = self
+                .quiesce_torrents_for_storage_plan(&job.affected_torrents)
+                .await;
+            let roots = match self.configured_storage_roots_for_execution() {
+                Ok(roots) => roots,
+                Err(error) => {
+                    self.resume_torrents_after_storage_plan(quiesced).await;
+                    self.update_job_state(
+                        &job.job_id,
+                        JOB_STATE_FAILED,
+                        Some(error),
+                        Some("storage plan recovery could not resolve roots"),
+                    );
+                    continue;
+                }
+            };
+            let (completion, completion_rx) = oneshot::channel();
+            if let Err(error) = self.storage_jobs.submit(
+                Arc::clone(&self.db),
+                job.job_id.clone(),
+                operation.clone(),
+                plan,
+                checkpoint_steps,
+                roots,
+                completion,
+            ) {
+                self.resume_torrents_after_storage_plan(quiesced).await;
+                self.update_job_state(
+                    &job.job_id,
+                    JOB_STATE_FAILED,
+                    Some(error),
+                    Some("storage plan recovery could not be queued"),
+                );
+                continue;
+            }
+
+            let cmd_tx = self.cmd_tx.clone();
+            let job_id = job.job_id.clone();
+            let affected_torrents = quiesced;
+            let move_context = if operation == "move" {
+                (|| {
+                    let info_hash = job.affected_torrents.first()?.clone();
+                    let old_save_path = context
+                        .get("old_save_path")
+                        .and_then(serde_json::Value::as_str)?
+                        .into();
+                    let save_path = context
+                        .get("save_path")
+                        .and_then(serde_json::Value::as_str)?
+                        .into();
+                    let name = context
+                        .get("name")
+                        .and_then(|value| value.as_str().map(ToOwned::to_owned));
+                    Some((info_hash, name, old_save_path, save_path))
+                })()
+            } else {
+                None
+            };
+            tokio::spawn(async move {
+                let succeeded = completion_rx
+                    .await
+                    .map(|completion: StorageJobCompletion| completion.succeeded)
+                    .unwrap_or(false);
+                if let Some((info_hash, name, old_save_path, save_path)) = move_context {
+                    let quiesced = affected_torrents
+                        .iter()
+                        .find(|(hash, _)| hash == &info_hash)
+                        .map(|(_, paused)| *paused);
+                    let _ = cmd_tx
+                        .send(EngineCmd::StorageMoveFinished {
+                            job_id,
+                            info_hash,
+                            name,
+                            old_save_path,
+                            save_path,
+                            quiesced,
+                            succeeded,
+                        })
+                        .await;
+                } else {
+                    let _ = cmd_tx
+                        .send(EngineCmd::StoragePlanFinished {
+                            job_id,
+                            affected_torrents,
+                            succeeded,
+                        })
+                        .await;
+                }
+            });
         }
         Ok(())
     }
@@ -2507,8 +2947,57 @@ impl Engine {
         let meta = load_meta_from_blob(&self.config, info_hash).ok();
         if let (Some(target), Some(meta)) = (&target_save_path, meta.as_ref()) {
             if *target != current_save_path {
-                self.move_torrent_payload_files(info_hash, &current_save_path, target, meta)
-                    .await?;
+                if let Some(plan) =
+                    self.plan_torrent_payload_files(&current_save_path, target, meta)?
+                {
+                    // The actor only performs bounded orchestration here.
+                    // Filesystem work and checkpoints run behind the storage
+                    // worker boundary; completion comes back as a command so
+                    // health/lifecycle requests remain serviceable.
+                    let quiesced = self.quiesce_torrent_for_storage_move(info_hash).await;
+                    let (completion, completion_rx) = oneshot::channel();
+                    let result = self.queue_storage_plan_job_with_context(
+                        "move",
+                        vec![info_hash.to_owned()],
+                        &plan,
+                        Vec::new(),
+                        serde_json::json!({
+                            "old_save_path": current_save_path.display().to_string(),
+                            "save_path": target.display().to_string(),
+                            "name": normalized_name.clone(),
+                        }),
+                        completion,
+                    );
+                    if let Ok(job_id) = &result {
+                        let cmd_tx = self.cmd_tx.clone();
+                        let job_id_for_task = job_id.clone();
+                        let info_hash = info_hash.to_owned();
+                        let name = normalized_name.clone();
+                        let old_save_path = current_save_path.clone();
+                        let save_path = target.clone();
+                        tokio::spawn(async move {
+                            let succeeded = completion_rx
+                                .await
+                                .map(|completion: StorageJobCompletion| completion.succeeded)
+                                .unwrap_or(false);
+                            let _ = cmd_tx
+                                .send(EngineCmd::StorageMoveFinished {
+                                    job_id: job_id_for_task,
+                                    info_hash,
+                                    name,
+                                    old_save_path,
+                                    save_path,
+                                    quiesced,
+                                    succeeded,
+                                })
+                                .await;
+                        });
+                        return Ok(());
+                    }
+                    self.resume_torrent_after_storage_move(info_hash, quiesced, None)
+                        .await;
+                    return result.map(|_| ());
+                }
             }
         }
 
@@ -2551,13 +3040,12 @@ impl Engine {
         Ok(())
     }
 
-    async fn move_torrent_payload_files(
+    fn plan_torrent_payload_files(
         &self,
-        info_hash: &str,
         source_root: &std::path::Path,
         destination_root: &std::path::Path,
         meta: &TorrentMeta,
-    ) -> CmdResult<()> {
+    ) -> CmdResult<Option<StoragePlan>> {
         self.authorize_storage_path(source_root)?;
         self.authorize_storage_path(destination_root)?;
         let mut steps = Vec::new();
@@ -2583,7 +3071,7 @@ impl Engine {
             rollback_steps.extend(plan.rollback_steps);
         }
         if steps.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let plan = StoragePlan {
             dry_run: false,
@@ -2593,26 +3081,7 @@ impl Engine {
             rollback_steps,
         };
 
-        // TNG-002: a running task's writes (and, during a recheck, its
-        // reads) must stop before any file under `source_root` is
-        // touched -- otherwise a peer write or an in-progress recheck can
-        // race the move: writing into a half-renamed path, or reading a
-        // file that briefly doesn't exist mid-rename. Quiescing also
-        // guarantees the task isn't holding any assumption about the old
-        // path across the move; `ResumeAfterStorageMove` re-points it at
-        // the new one (or leaves it untouched on failure) once the plan
-        // has actually finished.
-        let quiesced = self.quiesce_torrent_for_storage_move(info_hash).await;
-        let result =
-            self.execute_storage_plan_job("move", vec![info_hash.to_owned()], &plan, Vec::new());
-        let new_save_root = if result.is_ok() {
-            Some(destination_root.to_path_buf())
-        } else {
-            None
-        };
-        self.resume_torrent_after_storage_move(info_hash, quiesced, new_save_root)
-            .await;
-        result.map(|_| ())
+        Ok(Some(plan))
     }
 
     /// Quiesces the running task for `info_hash` before a storage move, if
@@ -2684,6 +3153,90 @@ impl Engine {
             self.resume_torrent_after_storage_move(&info_hash, Some(was_paused), None)
                 .await;
         }
+    }
+
+    // Single call site (the storage-plan-job completion handler); each
+    // parameter is a distinct piece of state needed to finish committing
+    // or rolling back a move, not a natural grouping.
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_storage_move(
+        &mut self,
+        job_id: &str,
+        info_hash: &str,
+        name: Option<String>,
+        old_save_path: PathBuf,
+        save_path: PathBuf,
+        quiesced: Option<bool>,
+        succeeded: bool,
+    ) -> CmdResult<()> {
+        if !succeeded {
+            self.resume_torrent_after_storage_move(info_hash, quiesced, None)
+                .await;
+            self.append_session_event(
+                Some(info_hash),
+                EVENT_FIELDS_UPDATED,
+                Some("storage move failed; save path unchanged"),
+                serde_json::json!({
+                    "job_id": job_id,
+                    "save_path": old_save_path,
+                    "storage_move": "failed",
+                }),
+            );
+            return Ok(());
+        }
+
+        let meta = load_meta_from_blob(&self.config, info_hash).ok();
+        let entry = {
+            let mut registry = self.registry.write().await;
+            let entry = registry
+                .get_mut(info_hash)
+                .ok_or_else(|| format!("torrent {info_hash} disappeared during storage move"))?;
+            if let Some(name) = name {
+                entry.name = name;
+            }
+            entry.save_path = save_path.to_string_lossy().to_string();
+            entry.clone()
+        };
+        let row = match meta {
+            Some(meta) => row_from_entry(&entry, &meta),
+            None => {
+                let db = self.db.lock().expect("database mutex poisoned");
+                let mut row = rt_db::get(&db, info_hash).map_err(|e| e.to_string())?;
+                row.name = entry.name.clone();
+                row.save_path = entry.save_path.clone();
+                row
+            }
+        };
+        let persistence_error = {
+            let db = self.db.lock().expect("database mutex poisoned");
+            rt_db::upsert(&db, &row)
+                .err()
+                .map(|error| error.to_string())
+        };
+        if let Some(error) = persistence_error {
+            // Keep the in-memory projection aligned with the durable row if
+            // persistence fails. The worker's file transaction is already
+            // committed, so surface the failure loudly.
+            let mut registry = self.registry.write().await;
+            if let Some(entry) = registry.get_mut(info_hash) {
+                entry.save_path = old_save_path.to_string_lossy().to_string();
+            }
+            return Err(error);
+        }
+        self.resume_torrent_after_storage_move(info_hash, quiesced, Some(save_path.clone()))
+            .await;
+        self.append_session_event(
+            Some(info_hash),
+            EVENT_FIELDS_UPDATED,
+            Some("torrent fields updated after storage move"),
+            serde_json::json!({
+                "job_id": job_id,
+                "name": row.name,
+                "save_path": row.save_path,
+                "storage_move": "completed",
+            }),
+        );
+        Ok(())
     }
 
     async fn update_torrent_trackers_inner(
@@ -2843,7 +3396,7 @@ impl Engine {
         Ok(())
     }
 
-    async fn add_peers_inner(&self, info_hash: &str, peers: Vec<SocketAddr>) -> CmdResult<()> {
+    async fn add_peers_inner(&mut self, info_hash: &str, peers: Vec<SocketAddr>) -> CmdResult<()> {
         if peers.is_empty() {
             return Ok(());
         }
@@ -2855,6 +3408,11 @@ impl Engine {
         }
         if self.is_taskless_pure_v2_torrent(info_hash) {
             return Err("pure v2 peer transfer is not implemented".to_owned());
+        }
+        let was_taskless = !self.torrent_chans.contains_key(info_hash);
+        self.ensure_torrent_task(info_hash).await?;
+        if was_taskless {
+            self.send_to_torrent(info_hash, TorrentCmd::Resume).await?;
         }
         self.send_to_torrent(info_hash, TorrentCmd::PriorityPeers(peers))
             .await
@@ -3211,7 +3769,12 @@ impl Engine {
         }
     }
 
-    async fn engine_stats(&self) -> CmdResult<EngineStats> {
+    async fn engine_stats(&mut self) -> CmdResult<EngineStats> {
+        if let Some((generated_at, cached)) = self.stats_cache.as_ref() {
+            if generated_at.elapsed() <= ENGINE_STATS_CACHE_TTL {
+                return Ok(cached.clone());
+            }
+        }
         let mut stats = EngineStats::default();
         let mut states = HashMap::new();
         {
@@ -3235,8 +3798,7 @@ impl Engine {
                 }
             }
         }
-        let now = std::time::Instant::now();
-        let policy = TierPolicy::default();
+        let now = Instant::now();
         let trackers = {
             let db = self.db.lock().expect("database mutex poisoned");
             stats.jobs_active = rt_db::list_active_jobs(&db)
@@ -3277,62 +3839,99 @@ impl Engine {
                 }
             }
         }
-        for (info_hash, tx) in &self.torrent_chans {
-            let (reply, rx) = tokio::sync::oneshot::channel();
-            if tx
-                .send(TorrentCmd::GetRuntimeStats { reply })
-                .await
-                .is_err()
-            {
-                continue;
-            }
-            match timeout(Duration::from_millis(250), rx).await {
-                Ok(Ok(runtime)) => {
-                    if let Some(state) = states.remove(info_hash) {
-                        stats.add_activity_tier(
-                            policy
-                                .decide(TierInput {
-                                    state,
-                                    connected_peers: runtime.connected_peers as usize,
-                                    outstanding_requests: runtime.outstanding_requests as usize,
-                                    inbound_peer: false,
-                                    tracker_due: false,
-                                    last_active: Some(now),
-                                    now,
-                                })
-                                .tier,
+        // Query task actors in bounded parallelism. The old sequential loop
+        // made a single slow/dead torrent add 250 ms to every other torrent;
+        // at 100k tasks that was an outage-sized stats request.
+        let task_channels = self
+            .torrent_chans
+            .iter()
+            .map(|(info_hash, tx)| (info_hash.clone(), tx.clone()))
+            .collect::<Vec<_>>();
+        let runtime_results =
+            stream::iter(task_channels.into_iter().map(|(info_hash, tx)| async move {
+                let (reply, rx) = tokio::sync::oneshot::channel();
+                if tx
+                    .send(TorrentCmd::GetRuntimeStats { reply })
+                    .await
+                    .is_err()
+                {
+                    return (info_hash, None);
+                }
+                match timeout(Duration::from_millis(250), rx).await {
+                    Ok(Ok(runtime)) => (info_hash, Some(runtime)),
+                    Ok(Err(_)) => (info_hash, None),
+                    Err(_) => {
+                        warn!(
+                            component = "engine",
+                            operation = "collect_runtime_stats",
+                            target = "torrent",
+                            torrent = %info_hash,
+                            duration_ms = 250_u64,
+                            result = "timeout",
+                            "timed out collecting torrent runtime stats"
                         );
+                        (info_hash, None)
                     }
-                    stats.add_torrent_runtime(info_hash.clone(), runtime);
                 }
-                Ok(Err(_)) => {}
-                Err(_) => {
-                    warn!(
-                        component = "engine",
-                        operation = "collect_runtime_stats",
-                        target = "torrent",
-                        torrent = %info_hash,
-                        duration_ms = 250_u64,
-                        result = "timeout",
-                        "timed out collecting torrent runtime stats"
-                    );
-                }
+            }))
+            .buffer_unordered(64)
+            .collect::<Vec<_>>()
+            .await;
+
+        for (info_hash, runtime) in runtime_results {
+            let Some(state) = states.remove(&info_hash) else {
+                continue;
+            };
+            if let Some(runtime) = runtime {
+                let tier = self
+                    .tier_controller
+                    .apply_input(
+                        info_hash.clone(),
+                        TierInput {
+                            state,
+                            connected_peers: runtime.connected_peers as usize,
+                            outstanding_requests: runtime.outstanding_requests as usize,
+                            inbound_peer: false,
+                            tracker_due: false,
+                            last_active: self.tier_last_active.get(&info_hash).copied(),
+                            now,
+                        },
+                    )
+                    .tier;
+                stats.add_activity_tier(tier);
+                stats.add_torrent_runtime(info_hash, runtime);
+            } else {
+                let tier = self.tier_controller.tier(&info_hash).unwrap_or_else(|| {
+                    TierPolicy::default()
+                        .decide(TierInput {
+                            state,
+                            connected_peers: 0,
+                            outstanding_requests: 0,
+                            inbound_peer: false,
+                            tracker_due: false,
+                            last_active: self.tier_last_active.get(&info_hash).copied(),
+                            now,
+                        })
+                        .tier
+                });
+                stats.add_activity_tier(tier);
             }
         }
-        for (_, state) in states {
-            stats.add_activity_tier(
-                policy
+        for (info_hash, state) in states {
+            let tier = self.tier_controller.tier(&info_hash).unwrap_or_else(|| {
+                TierPolicy::default()
                     .decide(TierInput {
                         state,
                         connected_peers: 0,
                         outstanding_requests: 0,
                         inbound_peer: false,
                         tracker_due: false,
-                        last_active: None,
+                        last_active: self.tier_last_active.get(&info_hash).copied(),
                         now,
                     })
-                    .tier,
-            );
+                    .tier
+            });
+            stats.add_activity_tier(tier);
         }
         let mut resources = self.resources.snapshot();
         let storage = StorageRuntime::global();
@@ -3372,6 +3971,7 @@ impl Engine {
             self.config.memory.pressure_critical_pct,
         );
         stats.resources = Some(resources);
+        self.stats_cache = Some((Instant::now(), stats.clone()));
         Ok(stats)
     }
 
@@ -3475,6 +4075,30 @@ impl Engine {
             let db = self.db.lock().expect("database mutex poisoned");
             rt_db::get_job(&db, job_id).map_err(|e| e.to_string())?
         };
+        if job.kind == JOB_KIND_STORAGE_PLAN {
+            let action = match target_state {
+                JOB_STATE_PAUSED => StorageJobAction::Pause,
+                JOB_STATE_RUNNING => StorageJobAction::Resume,
+                JOB_STATE_CANCELLED => StorageJobAction::Cancel,
+                _ => return Err(format!("unsupported job state {target_state}")),
+            };
+            if job.finished_at.is_some()
+                || matches!(
+                    job.state.as_str(),
+                    JOB_STATE_CANCELLED | JOB_STATE_COMPLETED | JOB_STATE_FAILED
+                )
+            {
+                return Err(format!("job {job_id} is already terminal"));
+            }
+            self.storage_jobs.control(job_id, action)?;
+            self.update_job_state(
+                job_id,
+                target_state,
+                None,
+                Some("storage plan job control updated"),
+            );
+            return Ok(());
+        }
         if job.kind != JOB_KIND_RECHECK {
             return Err(format!("job {job_id} is not a recheck job"));
         }
@@ -3563,6 +4187,45 @@ impl Engine {
             row.trackers,
             state_from_str(&row.state) == TorrentState::Paused,
         );
+        Ok(())
+    }
+
+    /// Promote a persisted, taskless torrent into the hot runtime tier. A
+    /// dormant seed keeps only its registry/SQLite/blob state; promotion
+    /// reconstructs the task from the authoritative metainfo blob and then
+    /// lets the normal command path resume/recheck it.
+    async fn ensure_torrent_task(&mut self, info_hash_hex: &str) -> CmdResult<()> {
+        if self.torrent_chans.contains_key(info_hash_hex) {
+            return Ok(());
+        }
+        if self.metadata_placeholder_row(info_hash_hex).is_some() {
+            return self.ensure_metadata_task(info_hash_hex).await;
+        }
+        let row = {
+            let db = self.db.lock().expect("database mutex poisoned");
+            rt_db::get(&db, info_hash_hex).map_err(|e| e.to_string())?
+        };
+        let raw = self
+            .load_torrent_blob(info_hash_hex)
+            .map_err(|e| e.to_string())?;
+        let meta = parse_torrent(&raw).map_err(|e| e.to_string())?;
+        let Some(v1) = meta_v1(meta) else {
+            return Err("pure v2 peer transfer is not implemented".to_owned());
+        };
+        let info_hash = v1.info_hash;
+        let is_private = v1.private;
+        self.authorize_storage_path(Path::new(&row.save_path))?;
+        let _tx = self.spawn_torrent_task(
+            info_hash_hex.to_owned(),
+            v1,
+            PathBuf::from(row.save_path),
+            true,
+        );
+        self.tier_last_active
+            .insert(info_hash_hex.to_owned(), Instant::now());
+        if !is_private {
+            self.register_dht_torrent(info_hash, info_hash_hex).await;
+        }
         Ok(())
     }
 
@@ -4025,6 +4688,21 @@ impl Engine {
         affected_torrents: Vec<String>,
         plan: &StoragePlan,
     ) -> Result<String, String> {
+        self.create_storage_plan_job_with_context(
+            operation,
+            affected_torrents,
+            plan,
+            serde_json::json!({}),
+        )
+    }
+
+    fn create_storage_plan_job_with_context(
+        &self,
+        operation: &str,
+        affected_torrents: Vec<String>,
+        plan: &StoragePlan,
+        context: serde_json::Value,
+    ) -> Result<String, String> {
         let now = unix_now_i64();
         let seq = STORAGE_PLAN_JOB_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let job_id = format!("storage-plan-{operation}-{now}-{seq}");
@@ -4048,17 +4726,75 @@ impl Engine {
             updated_at: now,
             finished_at: None,
         };
+        let mut payload = storage_plan_payload(operation, plan, &[]);
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("context".to_owned(), context);
+        }
         let event = rt_db::JobEventRow {
             event_id: None,
             job_id: job_id.clone(),
             occurred_at: now,
             kind: "storage_plan_queued".to_owned(),
             message: Some(format!("{operation} storage plan queued")),
-            payload: storage_plan_payload(operation, plan, &[]).to_string(),
+            payload: payload.to_string(),
         };
         let db = self.db.lock().expect("database mutex poisoned");
         rt_db::upsert_job(&db, &job).map_err(|e| e.to_string())?;
         rt_db::append_job_event(&db, &event).map_err(|e| e.to_string())?;
+        Ok(job_id)
+    }
+
+    /// Queue a storage plan and return immediately. Filesystem work belongs
+    /// to `StorageJobDispatcher`; awaiting the plan here would stop the
+    /// engine actor from serving health, torrent, and control commands.
+    fn queue_storage_plan_job(
+        &self,
+        operation: &str,
+        affected_torrents: Vec<String>,
+        plan: &StoragePlan,
+        completed_steps: Vec<usize>,
+        completion: oneshot::Sender<StorageJobCompletion>,
+    ) -> Result<String, String> {
+        self.queue_storage_plan_job_with_context(
+            operation,
+            affected_torrents,
+            plan,
+            completed_steps,
+            serde_json::json!({}),
+            completion,
+        )
+    }
+
+    fn queue_storage_plan_job_with_context(
+        &self,
+        operation: &str,
+        affected_torrents: Vec<String>,
+        plan: &StoragePlan,
+        completed_steps: Vec<usize>,
+        context: serde_json::Value,
+        completion: oneshot::Sender<StorageJobCompletion>,
+    ) -> Result<String, String> {
+        let completed_steps = normalize_storage_plan_completed_steps(plan, completed_steps)?;
+        let server_roots = self.configured_storage_roots_for_execution()?;
+        let job_id =
+            self.create_storage_plan_job_with_context(operation, affected_torrents, plan, context)?;
+        if let Err(error) = self.storage_jobs.submit(
+            Arc::clone(&self.db),
+            job_id.clone(),
+            operation.to_owned(),
+            plan.clone(),
+            completed_steps,
+            server_roots,
+            completion,
+        ) {
+            self.update_job_state(
+                &job_id,
+                JOB_STATE_FAILED,
+                Some(error.clone()),
+                Some("storage plan could not be queued"),
+            );
+            return Err(error);
+        }
         Ok(job_id)
     }
 
@@ -4206,6 +4942,24 @@ impl Engine {
 }
 
 #[allow(dead_code)]
+fn decode_storage_plan_event(
+    payload: &str,
+) -> Option<(String, StoragePlan, Vec<usize>, serde_json::Value)> {
+    let value = serde_json::from_str::<serde_json::Value>(payload).ok()?;
+    let operation = value.get("operation")?.as_str()?.to_owned();
+    let plan = serde_json::from_value(value.get("plan")?.clone()).ok()?;
+    let completed_steps = value
+        .get("completed_steps")
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+        .unwrap_or_default();
+    let context = value
+        .get("context")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    Some((operation, plan, completed_steps, context))
+}
+
+#[allow(dead_code)]
 fn normalize_storage_plan_completed_steps(
     plan: &StoragePlan,
     mut completed_steps: Vec<usize>,
@@ -4233,6 +4987,7 @@ fn storage_plan_payload(
 ) -> serde_json::Value {
     serde_json::json!({
         "operation": operation,
+        "plan": plan,
         "dry_run": plan.dry_run,
         "can_apply": plan.can_apply,
         "completed_steps": completed_steps,
@@ -4360,6 +5115,7 @@ fn entry_from_row(row: &TorrentRow) -> TorrentEntry {
         category: row.category.clone(),
         tags: row.tags.clone(),
         error_message: None,
+        tracker_message: None,
     }
 }
 
@@ -4374,6 +5130,13 @@ fn state_from_str(state: &str) -> TorrentState {
         "error" => TorrentState::Error,
         _ => TorrentState::Stopped,
     }
+}
+
+fn should_start_task_on_restore(state: TorrentState) -> bool {
+    matches!(
+        state,
+        TorrentState::Downloading | TorrentState::Checking | TorrentState::MetadataPending
+    )
 }
 
 fn is_v2_only_placeholder_row(row: &TorrentRow) -> bool {
@@ -4700,7 +5463,7 @@ fn parse_info_hash_hex(info_hash: &str) -> Result<[u8; 20], ()> {
     Ok(out)
 }
 
-fn unix_now_i64() -> i64 {
+pub(crate) fn unix_now_i64() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -5242,6 +6005,10 @@ mod tests {
             dht_tx: None,
             resources: test_resource_governor(),
             network_budget: GlobalNetworkBudget::unlimited(),
+            storage_jobs: StorageJobDispatcher::for_tests(),
+            tier_controller: TierController::new(TierPolicy::default()),
+            tier_last_active: HashMap::new(),
+            stats_cache: None,
             shutdown_reply: None,
         };
         engine.save_torrent_blob(&info_hash, &raw).unwrap();
@@ -5324,6 +6091,10 @@ mod tests {
             dht_tx: None,
             resources: test_resource_governor(),
             network_budget: GlobalNetworkBudget::unlimited(),
+            storage_jobs: StorageJobDispatcher::for_tests(),
+            tier_controller: TierController::new(TierPolicy::default()),
+            tier_last_active: HashMap::new(),
+            stats_cache: None,
             shutdown_reply: None,
         };
         let job_id = engine.create_recheck_job(&info_hash).unwrap();
@@ -5405,6 +6176,10 @@ mod tests {
             dht_tx: None,
             resources: test_resource_governor(),
             network_budget: GlobalNetworkBudget::unlimited(),
+            storage_jobs: StorageJobDispatcher::for_tests(),
+            tier_controller: TierController::new(TierPolicy::default()),
+            tier_last_active: HashMap::new(),
+            stats_cache: None,
             shutdown_reply: None,
         };
 
@@ -5454,6 +6229,10 @@ mod tests {
             dht_tx: None,
             resources: test_resource_governor(),
             network_budget: GlobalNetworkBudget::unlimited(),
+            storage_jobs: StorageJobDispatcher::for_tests(),
+            tier_controller: TierController::new(TierPolicy::default()),
+            tier_last_active: HashMap::new(),
+            stats_cache: None,
             shutdown_reply: None,
         };
 
@@ -5499,6 +6278,10 @@ mod tests {
             dht_tx: None,
             resources: test_resource_governor(),
             network_budget: GlobalNetworkBudget::unlimited(),
+            storage_jobs: StorageJobDispatcher::for_tests(),
+            tier_controller: TierController::new(TierPolicy::default()),
+            tier_last_active: HashMap::new(),
+            stats_cache: None,
             shutdown_reply: None,
         };
         let magnet = MagnetLink {
@@ -5605,6 +6388,10 @@ mod tests {
             dht_tx: None,
             resources: test_resource_governor(),
             network_budget: GlobalNetworkBudget::unlimited(),
+            storage_jobs: StorageJobDispatcher::for_tests(),
+            tier_controller: TierController::new(TierPolicy::default()),
+            tier_last_active: HashMap::new(),
+            stats_cache: None,
             shutdown_reply: None,
         };
         std::fs::create_dir_all(torrent_blob_dir(&engine.config)).unwrap();
@@ -5854,6 +6641,10 @@ mod tests {
             dht_tx: None,
             resources: test_resource_governor(),
             network_budget: GlobalNetworkBudget::unlimited(),
+            storage_jobs: StorageJobDispatcher::for_tests(),
+            tier_controller: TierController::new(TierPolicy::default()),
+            tier_last_active: HashMap::new(),
+            stats_cache: None,
             shutdown_reply: None,
         };
 
@@ -5888,6 +6679,10 @@ mod tests {
             dht_tx: None,
             resources: test_resource_governor(),
             network_budget: GlobalNetworkBudget::unlimited(),
+            storage_jobs: StorageJobDispatcher::for_tests(),
+            tier_controller: TierController::new(TierPolicy::default()),
+            tier_last_active: HashMap::new(),
+            stats_cache: None,
             shutdown_reply: None,
         };
 
@@ -5927,6 +6722,10 @@ mod tests {
             dht_tx: None,
             resources: test_resource_governor(),
             network_budget: GlobalNetworkBudget::unlimited(),
+            storage_jobs: StorageJobDispatcher::for_tests(),
+            tier_controller: TierController::new(TierPolicy::default()),
+            tier_last_active: HashMap::new(),
+            stats_cache: None,
             shutdown_reply: None,
         };
 
@@ -5978,7 +6777,7 @@ mod tests {
             .unwrap();
         let mut torrent_chans = HashMap::new();
         torrent_chans.insert(info_hash.clone(), torrent_tx);
-        let engine = Engine {
+        let mut engine = Engine {
             config: Arc::new(Config::default()),
             registry: Arc::new(RwLock::new(registry)),
             db: Arc::new(Mutex::new(conn)),
@@ -5989,6 +6788,10 @@ mod tests {
             dht_tx: None,
             resources: test_resource_governor(),
             network_budget: GlobalNetworkBudget::unlimited(),
+            storage_jobs: StorageJobDispatcher::for_tests(),
+            tier_controller: TierController::new(TierPolicy::default()),
+            tier_last_active: HashMap::new(),
+            stats_cache: None,
             shutdown_reply: None,
         };
 
@@ -6018,6 +6821,10 @@ mod tests {
             dht_tx: None,
             resources: test_resource_governor(),
             network_budget: GlobalNetworkBudget::unlimited(),
+            storage_jobs: StorageJobDispatcher::for_tests(),
+            tier_controller: TierController::new(TierPolicy::default()),
+            tier_last_active: HashMap::new(),
+            stats_cache: None,
             shutdown_reply: None,
         };
 
@@ -6061,6 +6868,10 @@ mod tests {
             dht_tx: None,
             resources: test_resource_governor(),
             network_budget: GlobalNetworkBudget::unlimited(),
+            storage_jobs: StorageJobDispatcher::for_tests(),
+            tier_controller: TierController::new(TierPolicy::default()),
+            tier_last_active: HashMap::new(),
+            stats_cache: None,
             shutdown_reply: None,
         };
 
@@ -6110,6 +6921,10 @@ mod tests {
             dht_tx: None,
             resources: test_resource_governor(),
             network_budget: GlobalNetworkBudget::unlimited(),
+            storage_jobs: StorageJobDispatcher::for_tests(),
+            tier_controller: TierController::new(TierPolicy::default()),
+            tier_last_active: HashMap::new(),
+            stats_cache: None,
             shutdown_reply: None,
         };
 
@@ -6177,6 +6992,10 @@ mod tests {
             dht_tx: None,
             resources: test_resource_governor(),
             network_budget: GlobalNetworkBudget::unlimited(),
+            storage_jobs: StorageJobDispatcher::for_tests(),
+            tier_controller: TierController::new(TierPolicy::default()),
+            tier_last_active: HashMap::new(),
+            stats_cache: None,
             shutdown_reply: None,
         };
 
@@ -6248,6 +7067,10 @@ mod tests {
             dht_tx: None,
             resources: test_resource_governor(),
             network_budget: GlobalNetworkBudget::unlimited(),
+            storage_jobs: StorageJobDispatcher::for_tests(),
+            tier_controller: TierController::new(TierPolicy::default()),
+            tier_last_active: HashMap::new(),
+            stats_cache: None,
             shutdown_reply: None,
         };
 
@@ -6329,6 +7152,10 @@ mod tests {
             dht_tx: None,
             resources: test_resource_governor(),
             network_budget: GlobalNetworkBudget::unlimited(),
+            storage_jobs: StorageJobDispatcher::for_tests(),
+            tier_controller: TierController::new(TierPolicy::default()),
+            tier_last_active: HashMap::new(),
+            stats_cache: None,
             shutdown_reply: None,
         };
 
@@ -6387,6 +7214,10 @@ mod tests {
             dht_tx: None,
             resources: test_resource_governor(),
             network_budget: GlobalNetworkBudget::unlimited(),
+            storage_jobs: StorageJobDispatcher::for_tests(),
+            tier_controller: TierController::new(TierPolicy::default()),
+            tier_last_active: HashMap::new(),
+            stats_cache: None,
             shutdown_reply: None,
         };
 
@@ -6439,6 +7270,10 @@ mod tests {
             dht_tx: None,
             resources: test_resource_governor(),
             network_budget: GlobalNetworkBudget::unlimited(),
+            storage_jobs: StorageJobDispatcher::for_tests(),
+            tier_controller: TierController::new(TierPolicy::default()),
+            tier_last_active: HashMap::new(),
+            stats_cache: None,
             shutdown_reply: None,
         };
 
@@ -6465,6 +7300,10 @@ mod tests {
             dht_tx: None,
             resources: test_resource_governor(),
             network_budget: GlobalNetworkBudget::unlimited(),
+            storage_jobs: StorageJobDispatcher::for_tests(),
+            tier_controller: TierController::new(TierPolicy::default()),
+            tier_last_active: HashMap::new(),
+            stats_cache: None,
             shutdown_reply: None,
         };
         let mut job = rt_db::JobRow {
@@ -6532,6 +7371,10 @@ mod tests {
             dht_tx: None,
             resources: test_resource_governor(),
             network_budget: GlobalNetworkBudget::unlimited(),
+            storage_jobs: StorageJobDispatcher::for_tests(),
+            tier_controller: TierController::new(TierPolicy::default()),
+            tier_last_active: HashMap::new(),
+            stats_cache: None,
             shutdown_reply: None,
         };
         let plan = StoragePlan {
@@ -6670,6 +7513,10 @@ mod tests {
             dht_tx: None,
             resources: test_resource_governor(),
             network_budget: GlobalNetworkBudget::unlimited(),
+            storage_jobs: StorageJobDispatcher::for_tests(),
+            tier_controller: TierController::new(TierPolicy::default()),
+            tier_last_active: HashMap::new(),
+            stats_cache: None,
             shutdown_reply: None,
         };
         let plan = rt_storage::plan_move(&rt_storage::MovePlanRequest {
@@ -6704,6 +7551,10 @@ mod tests {
             dht_tx: None,
             resources: test_resource_governor(),
             network_budget: GlobalNetworkBudget::unlimited(),
+            storage_jobs: StorageJobDispatcher::for_tests(),
+            tier_controller: TierController::new(TierPolicy::default()),
+            tier_last_active: HashMap::new(),
+            stats_cache: None,
             shutdown_reply: None,
         };
 
@@ -6750,18 +7601,24 @@ mod tests {
         rt_db::upsert(&conn, &row_from_entry(&entry, &TorrentMeta::V1(meta))).unwrap();
         let registry = Arc::new(RwLock::new(SessionRegistry::new()));
         registry.write().await.add(entry).unwrap();
-        let (_tx, rx) = mpsc::channel(1);
-        let engine = Engine {
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
+        let db = Arc::new(Mutex::new(conn));
+        let storage_jobs = StorageJobDispatcher::with_limits(Arc::clone(&db), 1, 4);
+        let mut engine = Engine {
             config: Arc::new(config),
             registry: Arc::clone(&registry),
-            db: Arc::new(Mutex::new(conn)),
-            cmd_rx: rx,
-            cmd_tx: mpsc::channel(1).0,
+            db,
+            cmd_rx,
+            cmd_tx,
             torrent_chans: HashMap::new(),
             torrent_tasks: HashMap::new(),
             dht_tx: None,
             resources: test_resource_governor(),
             network_budget: GlobalNetworkBudget::unlimited(),
+            storage_jobs,
+            tier_controller: TierController::new(TierPolicy::default()),
+            tier_last_active: HashMap::new(),
+            stats_cache: None,
             shutdown_reply: None,
         };
 
@@ -6769,6 +7626,13 @@ mod tests {
             .update_torrent_fields_inner(&info_hash, None, Some(destination_root.clone()))
             .await
             .unwrap();
+
+        let completion =
+            tokio::time::timeout(std::time::Duration::from_secs(5), engine.cmd_rx.recv())
+                .await
+                .expect("storage move completion was not delivered")
+                .expect("engine command channel closed");
+        assert!(engine.handle_cmd(completion).await);
 
         assert!(!source_root.join("restore.bin").exists());
         assert_eq!(
@@ -6808,6 +7672,9 @@ mod tests {
         config.daemon.session_dir = temp.path().join("session");
         config.db.path = temp.path().join("state.db");
         config.storage.download_dir = temp.path().to_path_buf();
+        // This test targets the live-task storage-move protocol; disable
+        // dormant-tier restore so the fixture deliberately starts hot.
+        config.runtime.torrent_tiers_enabled = false;
         std::fs::create_dir_all(torrent_blob_dir(&config)).unwrap();
         std::fs::create_dir_all(fastresume_dir(&config)).unwrap();
 
@@ -6861,19 +7728,25 @@ mod tests {
         )
         .unwrap();
 
-        let (_tx, rx) = mpsc::channel(1);
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
+        let db = Arc::new(Mutex::new(conn));
+        let storage_jobs = StorageJobDispatcher::with_limits(Arc::clone(&db), 1, 4);
         let registry = Arc::new(RwLock::new(SessionRegistry::new()));
         let mut engine = Engine {
             config: Arc::new(config),
             registry: Arc::clone(&registry),
-            db: Arc::new(Mutex::new(conn)),
-            cmd_rx: rx,
-            cmd_tx: mpsc::channel(1).0,
+            db,
+            cmd_rx,
+            cmd_tx,
             torrent_chans: HashMap::new(),
             torrent_tasks: HashMap::new(),
             dht_tx: None,
             resources: test_resource_governor(),
             network_budget: GlobalNetworkBudget::unlimited(),
+            storage_jobs,
+            tier_controller: TierController::new(TierPolicy::default()),
+            tier_last_active: HashMap::new(),
+            stats_cache: None,
             shutdown_reply: None,
         };
 
@@ -6887,6 +7760,13 @@ mod tests {
             .update_torrent_fields_inner(&info_hash, None, Some(destination_root.clone()))
             .await
             .unwrap();
+
+        let completion =
+            tokio::time::timeout(std::time::Duration::from_secs(5), engine.cmd_rx.recv())
+                .await
+                .expect("storage move completion was not delivered")
+                .expect("engine command channel closed");
+        assert!(engine.handle_cmd(completion).await);
 
         assert!(!source_root.join("restore.bin").exists());
         assert_eq!(
@@ -6931,7 +7811,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_persisted_torrents_restores_registry_and_task_channels() {
+    async fn load_persisted_torrents_restores_paused_registry_as_dormant() {
         let temp = tempfile::tempdir().unwrap();
         let mut config = Config::default();
         config.storage.download_dir = temp.path().join("downloads");
@@ -6989,12 +7869,19 @@ mod tests {
             dht_tx: None,
             resources: test_resource_governor(),
             network_budget: GlobalNetworkBudget::unlimited(),
+            storage_jobs: StorageJobDispatcher::for_tests(),
+            tier_controller: TierController::new(TierPolicy::default()),
+            tier_last_active: HashMap::new(),
+            stats_cache: None,
             shutdown_reply: None,
         };
 
         engine.load_persisted_torrents().await.unwrap();
 
-        assert!(engine.torrent_chans.contains_key(&info_hash));
+        assert!(
+            !engine.torrent_chans.contains_key(&info_hash),
+            "paused restore should not allocate a torrent task"
+        );
         let reg = registry.read().await;
         let restored = reg.get(&info_hash).unwrap();
         assert_eq!(restored.state, TorrentState::Paused);
@@ -7007,13 +7894,10 @@ mod tests {
             assert_eq!(trackers.len(), 1);
             assert_eq!(trackers[0].url, "http://tracker.example.com/announce");
         }
-        if let Some(tx) = engine.torrent_chans.remove(&info_hash) {
-            let _ = tx.send(TorrentCmd::Shutdown).await;
-        }
     }
 
     #[tokio::test]
-    async fn load_persisted_torrents_resumes_seeding_rows_not_paused() {
+    async fn load_persisted_torrents_restores_seeding_rows_as_dormant() {
         let temp = tempfile::tempdir().unwrap();
         let mut config = Config::default();
         config.storage.download_dir = temp.path().join("downloads");
@@ -7047,10 +7931,8 @@ mod tests {
                 save_path: temp.path().join("downloads").to_string_lossy().to_string(),
                 category: None,
                 tags: vec![],
-                // A torrent that was seeding when the daemon last shut down
-                // must resume active (seeding/checking), never come back
-                // Paused -- an operator restart/upgrade must not silently
-                // stop every previously-healthy seed.
+                // A persisted seed is retained in the registry, but its
+                // peer/runtime task is reconstructed only on demand.
                 state: "seeding".to_owned(),
                 added_at: 10,
                 completed_at: Some(20),
@@ -7075,23 +7957,23 @@ mod tests {
             dht_tx: None,
             resources: test_resource_governor(),
             network_budget: GlobalNetworkBudget::unlimited(),
+            storage_jobs: StorageJobDispatcher::for_tests(),
+            tier_controller: TierController::new(TierPolicy::default()),
+            tier_last_active: HashMap::new(),
+            stats_cache: None,
             shutdown_reply: None,
         };
 
         engine.load_persisted_torrents().await.unwrap();
 
-        assert!(engine.torrent_chans.contains_key(&info_hash));
+        assert!(
+            !engine.torrent_chans.contains_key(&info_hash),
+            "idle seed restore should retain only the dormant representation"
+        );
         let reg = registry.read().await;
         let restored = reg.get(&info_hash).unwrap();
-        assert_ne!(
-            restored.state,
-            TorrentState::Paused,
-            "a persisted seeding torrent must not restore as paused"
-        );
+        assert_eq!(restored.state, TorrentState::Seeding);
         drop(reg);
-        if let Some(tx) = engine.torrent_chans.remove(&info_hash) {
-            let _ = tx.send(TorrentCmd::Shutdown).await;
-        }
     }
 
     #[tokio::test]
@@ -7174,6 +8056,10 @@ mod tests {
             dht_tx: None,
             resources: test_resource_governor(),
             network_budget: GlobalNetworkBudget::unlimited(),
+            storage_jobs: StorageJobDispatcher::for_tests(),
+            tier_controller: TierController::new(TierPolicy::default()),
+            tier_last_active: HashMap::new(),
+            stats_cache: None,
             shutdown_reply: None,
         };
 
@@ -7251,6 +8137,10 @@ mod tests {
             dht_tx: None,
             resources: test_resource_governor(),
             network_budget: GlobalNetworkBudget::unlimited(),
+            storage_jobs: StorageJobDispatcher::for_tests(),
+            tier_controller: TierController::new(TierPolicy::default()),
+            tier_last_active: HashMap::new(),
+            stats_cache: None,
             shutdown_reply: None,
         };
 
@@ -7326,7 +8216,7 @@ mod tests {
                 });
             }
         });
-        let engine = Engine {
+        let mut engine = Engine {
             config: Arc::new(Config::default()),
             registry,
             db: Arc::new(Mutex::new(conn)),
@@ -7337,6 +8227,10 @@ mod tests {
             dht_tx: Some(dht_tx),
             resources: test_resource_governor(),
             network_budget: GlobalNetworkBudget::unlimited(),
+            storage_jobs: StorageJobDispatcher::for_tests(),
+            tier_controller: TierController::new(TierPolicy::default()),
+            tier_last_active: HashMap::new(),
+            stats_cache: None,
             shutdown_reply: None,
         };
         let job_id = engine.create_recheck_job(&info_hash).unwrap();
@@ -7473,6 +8367,10 @@ mod tests {
             dht_tx: None,
             resources: tiny_api_snapshot_governor(),
             network_budget: GlobalNetworkBudget::unlimited(),
+            storage_jobs: StorageJobDispatcher::for_tests(),
+            tier_controller: TierController::new(TierPolicy::default()),
+            tier_last_active: HashMap::new(),
+            stats_cache: None,
             shutdown_reply: None,
         };
 
@@ -7539,6 +8437,10 @@ mod tests {
             dht_tx: None,
             resources: test_resource_governor(),
             network_budget: GlobalNetworkBudget::unlimited(),
+            storage_jobs: StorageJobDispatcher::for_tests(),
+            tier_controller: TierController::new(TierPolicy::default()),
+            tier_last_active: HashMap::new(),
+            stats_cache: None,
             shutdown_reply: None,
         };
         {
@@ -7598,6 +8500,7 @@ async fn handle_incoming(
     mut stream: tokio::net::TcpStream,
     peer_addr: SocketAddr,
     torrent_chans: HashMap<String, mpsc::Sender<TorrentCmd>>,
+    engine_tx: mpsc::Sender<EngineCmd>,
     _permit: PeerIngressPermit,
     peer_permit: OwnedSemaphorePermit,
     handshake_timeout: Duration,
@@ -7613,17 +8516,13 @@ async fn handle_incoming(
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    let tx = torrent_chans
-        .get(&info_hash_hex)
-        .ok_or_else(|| anyhow::anyhow!("no torrent for incoming info_hash {info_hash_hex}"))?;
-    tx.send(TorrentCmd::AcceptPeer {
+    let command = TorrentCmd::AcceptPeer {
         stream,
         peer_addr,
         handshake,
         peer_permit,
-    })
-    .await
-    .map_err(|_| anyhow::anyhow!("torrent task gone for incoming info_hash {info_hash_hex}"))?;
+    };
+    route_incoming_command(&info_hash_hex, torrent_chans, engine_tx, command).await?;
     Ok(())
 }
 
@@ -7643,6 +8542,7 @@ async fn handle_incoming_utp(
     mut stream: UtpStream,
     peer_addr: SocketAddr,
     torrent_chans: HashMap<String, mpsc::Sender<TorrentCmd>>,
+    engine_tx: mpsc::Sender<EngineCmd>,
     _permit: PeerIngressPermit,
     peer_permit: OwnedSemaphorePermit,
     handshake_timeout: Duration,
@@ -7657,18 +8557,41 @@ async fn handle_incoming_utp(
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    let tx = torrent_chans
-        .get(&info_hash_hex)
-        .ok_or_else(|| anyhow::anyhow!("no torrent for incoming uTP info_hash {info_hash_hex}"))?;
-    tx.send(TorrentCmd::AcceptUtpPeer {
+    let command = TorrentCmd::AcceptUtpPeer {
         stream,
         peer_addr,
         handshake,
         peer_permit,
-    })
-    .await
-    .map_err(|_| anyhow::anyhow!("torrent task gone for incoming uTP info_hash {info_hash_hex}"))?;
+    };
+    route_incoming_command(&info_hash_hex, torrent_chans, engine_tx, command).await?;
     Ok(())
+}
+
+async fn route_incoming_command(
+    info_hash_hex: &str,
+    torrent_chans: HashMap<String, mpsc::Sender<TorrentCmd>>,
+    engine_tx: mpsc::Sender<EngineCmd>,
+    command: TorrentCmd,
+) -> anyhow::Result<()> {
+    match torrent_chans.get(info_hash_hex).cloned() {
+        Some(tx) => match tx.send(command).await {
+            Ok(()) => Ok(()),
+            Err(error) => engine_tx
+                .send(EngineCmd::IncomingPeer {
+                    info_hash: info_hash_hex.to_owned(),
+                    command: error.0,
+                })
+                .await
+                .map_err(|_| anyhow::anyhow!("engine stopped while routing inbound peer")),
+        },
+        None => engine_tx
+            .send(EngineCmd::IncomingPeer {
+                info_hash: info_hash_hex.to_owned(),
+                command,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("engine stopped while routing inbound peer")),
+    }
 }
 
 fn incoming_utp_enabled() -> bool {

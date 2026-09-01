@@ -62,6 +62,13 @@ pub struct TorrentEntry {
     pub category: Option<String>,
     pub tags: Vec<String>,
     pub error_message: Option<String>,
+    /// The active tracker's failure/warning message, if any, independent
+    /// of `state`/`error_message` -- a torrent can be actively seeding or
+    /// downloading fine while its tracker rejects announces (e.g. "torrent
+    /// not registered with this tracker"). Updated whenever a tracker
+    /// announce completes; cleared on the next successful announce.
+    #[serde(default)]
+    pub tracker_message: Option<String>,
 }
 
 impl TorrentEntry {
@@ -84,6 +91,7 @@ impl TorrentEntry {
             category: None,
             tags: Vec::new(),
             error_message: None,
+            tracker_message: None,
         }
     }
 

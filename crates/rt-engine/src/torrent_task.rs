@@ -2215,8 +2215,20 @@ impl TorrentTask {
         let now = Instant::now();
         let mut rows = Vec::new();
         let mut tracker_index = 0i64;
+        // Native-engine counterpart to the sidecar's cached `t.message`
+        // column: a torrent can be actively seeding/downloading fine while
+        // its tracker rejects announces, which `state` alone never
+        // reflects. Cache the first error/warning message found across
+        // any tier on the registry entry so list/facet queries can read it
+        // directly instead of needing a per-torrent round trip through
+        // this actor.
+        let mut tracker_message: Option<String> = None;
         for (tier_idx, tier) in self.tracker_tiers.iter().enumerate() {
             for tracker in tier {
+                if tracker_message.is_none() {
+                    tracker_message = tracker_failure_reason(&tracker.status)
+                        .or_else(|| tracker_warning_message(&tracker.status));
+                }
                 rows.push(rt_db::TorrentTrackerRow {
                     info_hash: self.info_hash_hex.clone(),
                     tracker_index,
@@ -2238,16 +2250,22 @@ impl TorrentTask {
                 tracker_index += 1;
             }
         }
-        let mut db = self.db.lock().expect("database mutex poisoned");
-        if let Err(e) = rt_db::replace_torrent_trackers(&mut db, &self.info_hash_hex, &rows) {
-            warn!(
-                component = "db",
-                operation = "persist_tracker_state",
-                torrent = %self.info_hash_hex,
-                result = "error",
-                error = %e,
-                "failed to persist tracker state"
-            );
+        {
+            let mut db = self.db.lock().expect("database mutex poisoned");
+            if let Err(e) = rt_db::replace_torrent_trackers(&mut db, &self.info_hash_hex, &rows) {
+                warn!(
+                    component = "db",
+                    operation = "persist_tracker_state",
+                    torrent = %self.info_hash_hex,
+                    result = "error",
+                    error = %e,
+                    "failed to persist tracker state"
+                );
+            }
+        }
+        let mut reg = self.registry.write().await;
+        if let Some(entry) = reg.get_mut(&self.info_hash_hex) {
+            entry.tracker_message = tracker_message;
         }
     }
 

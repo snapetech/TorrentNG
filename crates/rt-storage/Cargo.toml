@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 thiserror.workspace = true
 tracing.workspace = true
+serde.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "sync", "rt"] }
 bytes.workspace = true
 sha1.workspace = true
