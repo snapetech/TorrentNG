@@ -472,7 +472,6 @@ export function TorrentTable({
   const allVisible = torrents.length > 0 && torrents.every(t => selected.has(t.hash))
   const someSelected = !allVisible && torrents.some(t => selected.has(t.hash))
   const hasFilters = Boolean(params.filter || params.status || params.category || params.tag || params.tracker || params.media_type)
-  const selectedVisible = torrents.reduce((count, torrent) => count + (selected.has(torrent.hash) ? 1 : 0), 0)
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minWidth: 0 }}>
@@ -514,15 +513,30 @@ export function TorrentTable({
             } : undefined}>
               <input
                 type="checkbox"
-                aria-label={allVisible ? 'Clear visible torrent selection' : 'Select all visible torrents'}
-                title={allVisible ? 'Clear visible selection' : 'Select all visible torrents'}
-                checked={allVisible}
-                ref={el => { if (el) el.indeterminate = someSelected }}
-                onChange={() => allVisible
-                  ? onSelectAll([])
-                  : onSelectAll(torrents.map(t => t.hash))
+                aria-label={
+                  allVisible ? 'Clear selection'
+                    : isSelectingAllMatching ? 'Selecting all matching torrents…'
+                      : `Select all ${total.toLocaleString()} torrents matching the current filter`
                 }
-                style={{ accentColor: 'var(--accent)', cursor: 'pointer' }}
+                title={
+                  allVisible ? 'Clear selection'
+                    : total > torrents.length
+                      ? `Select all ${total.toLocaleString()} torrents matching the current filter (not just the ${torrents.length.toLocaleString()} loaded so far)`
+                      : 'Select all visible torrents'
+                }
+                checked={allVisible}
+                disabled={isSelectingAllMatching}
+                ref={el => { if (el) el.indeterminate = someSelected }}
+                onChange={() => {
+                  if (allVisible) {
+                    onSelectAll([])
+                  } else if (total > torrents.length && onSelectAllMatching) {
+                    onSelectAllMatching()
+                  } else {
+                    onSelectAll(torrents.map(t => t.hash))
+                  }
+                }}
+                style={{ accentColor: 'var(--accent)', cursor: isSelectingAllMatching ? 'wait' : 'pointer' }}
               />
             </span>
             {visibleCols.slice(1, -1).map(col => {
@@ -605,35 +619,16 @@ export function TorrentTable({
             >
               Columns
             </button>
-            {selectedVisible > 0 && (
+            {selected.size > 0 && (
               <span style={{
                 position: 'absolute', right: 84, top: 6, height: 20,
-                display: 'inline-flex', alignItems: 'center', gap: 8,
-                textTransform: 'none', letterSpacing: 0, fontWeight: 400,
+                display: 'inline-flex', alignItems: 'center',
+                border: '1px solid color-mix(in srgb, var(--accent) 35%, var(--border))',
+                background: 'color-mix(in srgb, var(--accent) 12%, transparent)',
+                color: 'var(--accent-text)', borderRadius: 999, padding: '0 7px',
+                fontSize: 10, fontWeight: 800, textTransform: 'none', letterSpacing: 0,
               }}>
-                <span style={{
-                  display: 'inline-flex', alignItems: 'center',
-                  border: '1px solid color-mix(in srgb, var(--accent) 35%, var(--border))',
-                  background: 'color-mix(in srgb, var(--accent) 12%, transparent)',
-                  color: 'var(--accent-text)', borderRadius: 999, padding: '0 7px',
-                  fontSize: 10, fontWeight: 800, height: '100%',
-                }}>
-                  {selectedVisible.toLocaleString()} visible selected
-                </span>
-                {allVisible && total > torrents.length && onSelectAllMatching && (
-                  <button
-                    onClick={onSelectAllMatching}
-                    disabled={isSelectingAllMatching}
-                    title={`Select all ${total.toLocaleString()} torrents matching the current filter, not just the ${torrents.length.toLocaleString()} loaded so far`}
-                    style={{
-                      background: 'transparent', border: 'none', color: 'var(--accent-text)',
-                      fontSize: 10, fontWeight: 700, textDecoration: 'underline', cursor: 'pointer',
-                      padding: 0, opacity: isSelectingAllMatching ? 0.6 : 1,
-                    }}
-                  >
-                    {isSelectingAllMatching ? 'Selecting…' : `Select all ${total.toLocaleString()}`}
-                  </button>
-                )}
+                {isSelectingAllMatching ? 'Selecting…' : `${selected.size.toLocaleString()} selected`}
               </span>
             )}
             {columnsOpen && (
