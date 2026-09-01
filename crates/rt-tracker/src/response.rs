@@ -110,16 +110,29 @@ impl AnnounceResponse {
             return Err(TrackerError::FailureReason(msg));
         }
 
+        // TNG-020: these were bare `as u32` casts -- a tracker sending a
+        // negative or absurdly large bencoded integer (buggy or hostile)
+        // would silently wrap into a huge or unrelated u32 instead of
+        // being rejected. `interval` drives re-announce timing and hence
+        // real network/tracker load, so an invalid value fails the whole
+        // response, matching `scrape_int`'s existing checked pattern
+        // below. The optional stats fields degrade to `None` instead --
+        // failing an entire announce over a cosmetic field being garbage
+        // would be needlessly fragile against a quirky-but-usable tracker.
         let interval = val
             .get(b"interval")
             .and_then(|v| v.as_int())
-            .ok_or_else(|| TrackerError::ParseError("missing interval".into()))?
-            as u32;
+            .ok_or_else(|| TrackerError::ParseError("missing interval".into()))
+            .and_then(|value| {
+                u32::try_from(value).map_err(|_| {
+                    TrackerError::ParseError(format!("interval out of range: {value}"))
+                })
+            })?;
 
         let min_interval = val
             .get(b"min interval")
             .and_then(|v| v.as_int())
-            .map(|i| i as u32);
+            .and_then(|i| u32::try_from(i).ok());
 
         let warning_message = val
             .get(b"warning message")
@@ -136,11 +149,11 @@ impl AnnounceResponse {
         let complete = val
             .get(b"complete")
             .and_then(|v| v.as_int())
-            .map(|i| i as u32);
+            .and_then(|i| u32::try_from(i).ok());
         let incomplete = val
             .get(b"incomplete")
             .and_then(|v| v.as_int())
-            .map(|i| i as u32);
+            .and_then(|i| u32::try_from(i).ok());
 
         let peers = parse_peers_field(&val)?;
 
@@ -257,6 +270,48 @@ mod tests {
         let raw = encode(&BValue::Dict(pairs));
         let result = AnnounceResponse::parse(&raw);
         assert!(matches!(result, Err(TrackerError::ParseError(_))));
+    }
+
+    #[test]
+    fn parse_rejects_negative_interval() {
+        // A negative interval used to be cast straight to u32 with `as`,
+        // silently wrapping to a huge positive value instead of being
+        // rejected -- a hostile or buggy tracker could use this to push a
+        // client toward an absurd re-announce schedule.
+        let raw = make_response(-1, Some(&[]), None);
+        let result = AnnounceResponse::parse(&raw);
+        assert!(matches!(result, Err(TrackerError::ParseError(_))));
+    }
+
+    #[test]
+    fn parse_rejects_interval_overflowing_u32() {
+        let raw = make_response(i64::from(u32::MAX) + 1, Some(&[]), None);
+        let result = AnnounceResponse::parse(&raw);
+        assert!(matches!(result, Err(TrackerError::ParseError(_))));
+    }
+
+    #[test]
+    fn parse_treats_out_of_range_optional_stats_as_absent() {
+        // min_interval/complete/incomplete are informational-only; an
+        // invalid value in one of them should degrade to `None` rather
+        // than either wrapping (the old `as u32` behavior) or failing the
+        // whole announce response over a cosmetic field.
+        let mut pairs: Vec<(&[u8], BValue<'_>)> = vec![
+            (b"interval", BValue::Int(1800)),
+            (b"peers", BValue::Bytes(b"")),
+            (b"min interval", BValue::Int(-5)),
+            (b"complete", BValue::Int(-1)),
+            (b"incomplete", BValue::Int(i64::from(u32::MAX) + 1)),
+        ];
+        pairs.sort_by(|a, b| a.0.cmp(b.0));
+        let raw = encode(&BValue::Dict(pairs));
+
+        let resp = AnnounceResponse::parse(&raw).unwrap();
+
+        assert_eq!(resp.interval, 1800);
+        assert_eq!(resp.min_interval, None);
+        assert_eq!(resp.complete, None);
+        assert_eq!(resp.incomplete, None);
     }
 
     #[test]

@@ -4,7 +4,7 @@
 /// management, piece picker, and storage writes.
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -3472,31 +3472,55 @@ fn webseed_block_url(meta: &TorrentMetaV1, webseed: &str) -> Option<Url> {
     }
 }
 
+/// Parses a ut_pex extension payload's `added` (IPv4, BEP 11) and `added6`
+/// (IPv6) compact peer lists, returning every newly-advertised peer address
+/// from both. `dropped`/`dropped6` are intentionally not parsed here: BEP
+/// 11 defines them as informational only (a peer telling us it disconnected
+/// from an address, not a command), and there is no existing plumbing in
+/// this engine to act on that safely -- see TNG-020 in
+/// docs/BACKEND_AUDIT_BURN_DOWN.md for the remaining gap.
 fn parse_ut_pex_peers(payload: &[u8]) -> anyhow::Result<Vec<SocketAddr>> {
     let value = decode(payload)?;
     let BValue::Dict(pairs) = value else {
         anyhow::bail!("ut_pex payload must be a dict");
     };
-    let Some(added) = pairs
+    let mut peers = Vec::new();
+    if let Some(added) = pairs
         .iter()
         .find(|(key, _)| *key == b"added")
         .and_then(|(_, value)| value.as_bytes())
-    else {
-        return Ok(Vec::new());
-    };
-    if added.len() % 6 != 0 {
-        anyhow::bail!("ut_pex added peers length is not a multiple of 6");
-    }
-    Ok(added
-        .chunks_exact(6)
-        .filter_map(|chunk| {
+    {
+        if added.len() % 6 != 0 {
+            anyhow::bail!("ut_pex added peers length is not a multiple of 6");
+        }
+        peers.extend(added.chunks_exact(6).filter_map(|chunk| {
             let port = u16::from_be_bytes([chunk[4], chunk[5]]);
             (port != 0).then_some(SocketAddr::V4(SocketAddrV4::new(
                 Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]),
                 port,
             )))
-        })
-        .collect())
+        }));
+    }
+    if let Some(added6) = pairs
+        .iter()
+        .find(|(key, _)| *key == b"added6")
+        .and_then(|(_, value)| value.as_bytes())
+    {
+        if added6.len() % 18 != 0 {
+            anyhow::bail!("ut_pex added6 peers length is not a multiple of 18");
+        }
+        peers.extend(added6.chunks_exact(18).filter_map(|chunk| {
+            let port = u16::from_be_bytes([chunk[16], chunk[17]]);
+            let octets: [u8; 16] = chunk[0..16].try_into().expect("chunk is 18 bytes");
+            (port != 0).then_some(SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::from(octets),
+                port,
+                0,
+                0,
+            )))
+        }));
+    }
+    Ok(peers)
 }
 
 fn reconcile_peer_availability(availability: &mut Availability, old: &[bool], new: &[bool]) {
@@ -4606,6 +4630,58 @@ mod tests {
             vec![
                 "127.0.0.1:6881".parse::<SocketAddr>().unwrap(),
                 "10.0.0.2:5000".parse::<SocketAddr>().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_ut_pex_added6_ipv6_peers() {
+        // TNG-020: added6 (BEP 11 IPv6 compact peers, 16-byte address + 2-byte
+        // port) was previously not parsed at all -- only IPv4 `added`.
+        let mut added6 = Vec::new();
+        added6.extend_from_slice(&Ipv6Addr::LOCALHOST.octets());
+        added6.extend_from_slice(&0x1a_e1u16.to_be_bytes());
+        added6.extend_from_slice(&Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).octets());
+        added6.extend_from_slice(&0x1388u16.to_be_bytes());
+        let payload = rt_bencode::encode(&BValue::Dict(vec![(
+            b"added6".as_slice(),
+            BValue::Bytes(&added6),
+        )]));
+
+        let peers = parse_ut_pex_peers(&payload).unwrap();
+
+        assert_eq!(
+            peers,
+            vec![
+                SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 6881, 0, 0)),
+                SocketAddr::V6(SocketAddrV6::new(
+                    Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+                    5000,
+                    0,
+                    0
+                )),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_ut_pex_added_and_added6_together() {
+        let added = [10, 0, 0, 2, 0x13, 0x88];
+        let mut added6 = Vec::new();
+        added6.extend_from_slice(&Ipv6Addr::LOCALHOST.octets());
+        added6.extend_from_slice(&0x1a_e1u16.to_be_bytes());
+        let payload = rt_bencode::encode(&BValue::Dict(vec![
+            (b"added".as_slice(), BValue::Bytes(&added)),
+            (b"added6".as_slice(), BValue::Bytes(&added6)),
+        ]));
+
+        let peers = parse_ut_pex_peers(&payload).unwrap();
+
+        assert_eq!(
+            peers,
+            vec![
+                "10.0.0.2:5000".parse::<SocketAddr>().unwrap(),
+                SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 6881, 0, 0)),
             ]
         );
     }

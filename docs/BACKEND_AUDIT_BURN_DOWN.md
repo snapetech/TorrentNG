@@ -735,18 +735,66 @@ cap, private torrent, and restart tests.
 
 ### TNG-020 — Tracker and PEX protocol handling is partial
 
-**Status: Open** · **Priority: P1** · **Confidence: high**
+**Status: In progress** · **Priority: P1** · **Confidence: high**
 
-Evidence: tracker response integers are cast to unsigned types; UDP announces
-use a fixed 1500-byte buffer/new socket per request and incomplete interval/id
-fidelity; PEX parses IPv4 `added` but not IPv6/dropped peers.
+Original evidence: tracker response integers are cast to unsigned types; UDP
+announces use a fixed 1500-byte buffer/new socket per request and incomplete
+interval/id fidelity; PEX parses IPv4 `added` but not IPv6/dropped peers.
 
-Required action: checked response parsing, bounded adaptive UDP framing,
-connection/transaction reuse where appropriate, announce interval/id semantics,
-and complete PEX field handling.
+Verified evidence (this session): fixed the two most concrete,
+correctness-focused sub-issues.
 
-Acceptance: malformed/negative/large tracker responses, fragmentation/MTU,
-retry/interval, IPv6 PEX, dropped-peer, and private-torrent tests.
+- `AnnounceResponse::parse` (`crates/rt-tracker/src/response.rs`) cast
+  `interval`/`min_interval`/`complete`/`incomplete` from the bencoded `i64`
+  to `u32` with a bare `as` -- a negative or absurdly large value from a
+  buggy or hostile tracker silently wrapped into an unrelated u32 instead
+  of being rejected (the sibling `scrape_int` helper in the *same file*
+  already did this correctly with `u32::try_from`, so this was an internal
+  inconsistency as much as a bug). Now uses checked `u32::try_from`
+  throughout: `interval` (required, drives real re-announce scheduling)
+  fails the whole response on an invalid value; the three optional stats
+  fields degrade to `None` rather than failing the response over a
+  cosmetic field. New tests: `parse_rejects_negative_interval`,
+  `parse_rejects_interval_overflowing_u32`,
+  `parse_treats_out_of_range_optional_stats_as_absent`. (Checked the UDP
+  tracker parser too -- `crates/rt-tracker/src/udp.rs` already reads
+  fixed-width fields via `from_be_bytes`, not vulnerable to this same
+  cast-wraparound class.)
+- `parse_ut_pex_peers` (`crates/rt-engine/src/torrent_task.rs`) only parsed
+  the ut_pex extension's `added` (IPv4, BEP 11) key -- `added6` (IPv6) was
+  silently ignored, meaning peers on IPv6-only or dual-stack swarms
+  advertised via PEX were never discovered through this path. Now parses
+  both and returns the combined peer list. New tests:
+  `parses_ut_pex_added6_ipv6_peers`, `parses_ut_pex_added_and_added6_together`.
+  `dropped`/`dropped6` remain intentionally unparsed -- see the "not yet
+  evidenced" note below for why.
+
+Full workspace `cargo test --workspace --all-targets --locked`,
+`cargo fmt --all -- --check`, and
+`cargo clippy --workspace --all-targets --locked -- -D warnings` all green
+(`rt-tracker` 59 tests, up from 56).
+
+Not yet evidenced (why this stays "In progress", not "Resolved"): UDP's
+fixed 1500-byte buffer and new-socket-per-request pattern is untouched
+(a resource-efficiency/scale concern, not a correctness bug); UDP announce
+interval/transaction-id fidelity was not audited beyond confirming the
+basic field parsing is cast-safe. `dropped`/`dropped6` are deliberately
+NOT parsed yet: BEP 11 defines them as informational (a peer reporting it
+disconnected from an address), not a command, and this engine has no
+existing mechanism to act on that signal safely -- wiring it in requires a
+real design decision (what should "dropped" actually *do*: nothing but
+logging, deprioritize the address, or something else) that a rushed
+addition to this already-large session should not make unilaterally.
+
+Required action (remaining): decide and implement `dropped`/`dropped6`
+semantics; UDP adaptive/bounded framing and connection reuse; announce
+interval/transaction-id fidelity audit; malformed/fragmentation/MTU and
+retry/interval tests.
+
+Acceptance: malformed/negative/large tracker responses (done for HTTP
+announce; UDP not audited), fragmentation/MTU (missing), retry/interval
+(missing), IPv6 PEX (done), dropped-peer (missing -- needs a design
+decision first), and private-torrent (pre-existing, unaffected) tests.
 
 ## P1/P2 — API, configuration, and product truth
 
@@ -981,6 +1029,7 @@ claims:
 | 2026-09-01 | Third session (same date, continuing "build it all out"): implemented TNG-003's two headline complaints for real. Added streaming SHA-1 content verification (`verify_content_matches`/`hash_file_sha1` in `crates/rt-storage/src/plan.rs`) so `copy_verify()` no longer trusts aggregate length alone. Rewrote `rollback_plan()` to return both succeeded and *failed* rollback steps (previously a failed rollback step was silently dropped via `.is_ok()`); failures are folded into the returned `StorageError` message since that is the only channel the existing caller (`engine.rs`'s `execute_storage_plan_job`) reads. Added `StoragePlanExecution::rollback_failures` + `rollback_fully_succeeded()`. Wrote two new targeted tests: a same-length bit-flip that length-only verification would have missed, and a rollback step that itself fails being surfaced in the error while the other rollback step still runs. | `cargo build -p rt-storage` (clean), `cargo test -p rt-storage --lib` (111 passed, up from 109, 0 failed), full `cargo test --workspace --all-targets --locked` (green), `cargo fmt --all -- --check` (green), `cargo clippy --workspace --all-targets --locked -- -D warnings` (green). | TNG-003 moved Open -> In progress (not Resolved: permission-failure, destination-full, resume-after-interruption, and idempotent-retry tests from its acceptance list are still missing -- see item detail). |
 | 2026-09-01 | Fourth session (same date, continuing "build it all out"): implemented TNG-002's quiesce/resume storage-transition protocol. New `TorrentCmd::QuiesceForStorageMove`/`ResumeAfterStorageMove` in `crates/rt-engine/src/torrent_task.rs`, handled in the main actor loop, inside `pending_recheck_control` (an in-progress recheck reads files too), and in `metadata_task.rs` (no-op for not-yet-materialized torrents). `engine.rs`'s `move_torrent_payload_files` and the generic `EngineCmd::ExecuteStoragePlan` handler (`POST /api/v1/storage/execute`) both now quiesce affected running tasks before touching files and resume them afterward. Wrote a real regression test using a genuinely spawned `TorrentTask` (not the taskless path) proving a live task's cached save_root is correctly re-pointed after a move and a post-move recheck finds the content at the new location -- verified this actually catches the bug by temporarily reverting the fix and confirming the test fails (`Downloading` instead of `Seeding`) before restoring it. While building that test, found and fixed a real, separate, pre-existing bug: `rt-session`'s state machine had no `(Seeding, Checking)`/`(Seeding, Downloading)` transitions, so rechecking an already-seeding torrent via the *existing* `TorrentCmd::Recheck` command could never have its outcome reflected in the registry (`set_state` silently discards `transition()`'s `Result`). Fixed with a regression test. | `cargo test -p rt-engine -p rt-session --lib` (rt-engine 127 passed, up from 126; rt-session 19, up from 18; 0 failed), full `cargo test --workspace --all-targets --locked` (green), `cargo fmt --all -- --check` (green), `cargo clippy --workspace --all-targets --locked -- -D warnings` (green), `cargo test --manifest-path sidecar/Cargo.toml --locked` (green, 75 passed, unaffected). | TNG-002 moved Open -> In progress (not Resolved: live-peer move-under-transfer, cancellation, crash/restart tests still missing -- see item detail). Uncovered and fixed an independent state-machine bug along the way (recheck-of-seeding-torrent outcome was unobservable), which also directly strengthens TNG-002's and TNG-003's own recheck-after-move safety net. |
 | 2026-09-01 | Fifth session (same date, continuing "build it all out"): fixed TNG-008's first concrete "phantom registry row" case in `add_torrent` (`crates/rt-engine/src/engine.rs`) -- `reg.add(entry)` made a torrent visible before its blob was written and its DB row upserted, and neither failure path rolled the registry entry back. Now both failure points roll back the registry row; a DB-upsert failure after a successful blob write also cleans up the now-orphaned blob (best-effort, logged on cleanup failure). Two new regression tests force each failure independently (blocking the blob directory with a plain file; `PRAGMA query_only = ON` on the DB connection) and confirm no phantom row remains -- verified both are real by temporarily disabling the rollback and confirming both tests fail first. | `cargo test -p rt-engine --lib` (129 passed, up from 127, 0 failed), full `cargo test --workspace --all-targets --locked` (green), `cargo fmt --all -- --check` (green), `cargo clippy --workspace --all-targets --locked -- -D warnings` (green). | TNG-008 moved Open -> In progress. This is a deliberately narrow slice of a very broad finding -- `add_magnet` and other registry-mutating paths are not yet audited for the same pattern, and job-state/event atomicity, migration transactionality, per-block write amplification, and crash-restart reconciliation are all still open (see item detail for the explicit remaining list). |
+| 2026-09-01 | Sixth session (same date, continuing "build it all out"): fixed TNG-020's two most concrete correctness sub-issues. `AnnounceResponse::parse` (`crates/rt-tracker/src/response.rs`) used bare `as u32` casts on bencoded `i64` interval/stats fields -- a negative or oversized value silently wrapped instead of being rejected, inconsistent with the sibling `scrape_int` helper in the same file which already did this correctly. Switched to checked `u32::try_from`: `interval` now fails the response on an invalid value, the optional stats fields degrade to `None`. `parse_ut_pex_peers` (`crates/rt-engine/src/torrent_task.rs`) only parsed ut_pex's IPv4 `added` key; added `added6` (IPv6) parsing so dual-stack/IPv6 swarms' PEX-advertised peers are no longer silently dropped. `dropped`/`dropped6` intentionally left unparsed -- BEP 11 defines them as informational only and this engine has no mechanism to safely act on them yet; wiring that in needs a real design decision, not a rushed addition. Five new tests total (3 tracker, 2 pex). | `cargo test -p rt-engine -p rt-tracker --lib` (rt-tracker 59 passed, up from 56; 0 failed), full `cargo test --workspace --all-targets --locked` (green), `cargo fmt --all -- --check` (green), `cargo clippy --workspace --all-targets --locked -- -D warnings` (green). | TNG-020 moved Open -> In progress. UDP framing/connection-reuse, interval/transaction-id fidelity audit, and dropped-peer semantics remain explicitly open (see item detail). |
 
 ## Release gate
 
