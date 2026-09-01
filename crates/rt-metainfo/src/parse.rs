@@ -471,10 +471,7 @@ fn parse_piece_hashes(info: &BValue<'_>) -> Result<Vec<[u8; 20]>, MetainfoError>
             limit: MAX_PIECES,
         });
     }
-    Ok(pieces_bytes
-        .chunks_exact(20)
-        .map(|c| c.try_into().unwrap())
-        .collect())
+    Ok(pieces_bytes.as_chunks::<20>().0.to_vec())
 }
 
 fn validate_piece_count(

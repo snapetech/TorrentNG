@@ -522,7 +522,7 @@ impl TorrentTask {
     ) -> Self {
         let (peer_event_tx, peer_event_rx) = mpsc::channel(512);
         let total = meta.total_length();
-        let last_piece_len = if total % meta.piece_length == 0 {
+        let last_piece_len = if total.is_multiple_of(meta.piece_length) {
             meta.piece_length
         } else {
             total % meta.piece_length
@@ -3493,7 +3493,7 @@ fn parse_ut_pex_peers(payload: &[u8]) -> anyhow::Result<Vec<SocketAddr>> {
         if added.len() % 6 != 0 {
             anyhow::bail!("ut_pex added peers length is not a multiple of 6");
         }
-        peers.extend(added.chunks_exact(6).filter_map(|chunk| {
+        peers.extend(added.as_chunks::<6>().0.iter().filter_map(|chunk| {
             let port = u16::from_be_bytes([chunk[4], chunk[5]]);
             (port != 0).then_some(SocketAddr::V4(SocketAddrV4::new(
                 Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]),
@@ -3509,7 +3509,7 @@ fn parse_ut_pex_peers(payload: &[u8]) -> anyhow::Result<Vec<SocketAddr>> {
         if added6.len() % 18 != 0 {
             anyhow::bail!("ut_pex added6 peers length is not a multiple of 18");
         }
-        peers.extend(added6.chunks_exact(18).filter_map(|chunk| {
+        peers.extend(added6.as_chunks::<18>().0.iter().filter_map(|chunk| {
             let port = u16::from_be_bytes([chunk[16], chunk[17]]);
             let octets: [u8; 16] = chunk[0..16].try_into().expect("chunk is 18 bytes");
             (port != 0).then_some(SocketAddr::V6(SocketAddrV6::new(
@@ -4335,7 +4335,7 @@ fn bitfield_to_pieces(bits: &[u8], piece_count: usize) -> anyhow::Result<Vec<boo
             expected_len
         );
     }
-    if piece_count % 8 != 0 && !bits.is_empty() {
+    if !piece_count.is_multiple_of(8) && !bits.is_empty() {
         let used_bits = piece_count % 8;
         let spare_mask = (1u8 << (8 - used_bits)) - 1;
         if bits[bits.len() - 1] & spare_mask != 0 {

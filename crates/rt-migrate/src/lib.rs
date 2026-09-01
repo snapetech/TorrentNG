@@ -2332,11 +2332,11 @@ fn hex_lower(bytes: &[u8]) -> String {
 }
 
 fn decode_hex(value: &str) -> Option<Vec<u8>> {
-    if value.len() % 2 != 0 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if !value.len().is_multiple_of(2) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
     let mut out = Vec::with_capacity(value.len() / 2);
-    for chunk in value.as_bytes().chunks_exact(2) {
+    for chunk in value.as_bytes().as_chunks::<2>().0 {
         let text = std::str::from_utf8(chunk).ok()?;
         out.push(u8::from_str_radix(text, 16).ok()?);
     }

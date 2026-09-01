@@ -114,8 +114,7 @@ pub fn list_session_events_filtered(
     let level_placeholders = if levels.is_empty() {
         String::new()
     } else {
-        std::iter::repeat("?")
-            .take(levels.len())
+        std::iter::repeat_n("?", levels.len())
             .collect::<Vec<_>>()
             .join(",")
     };

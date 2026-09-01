@@ -169,7 +169,7 @@ impl CompactPieceBitmap {
     }
 
     fn has_unused_tail_bits_set(&self) -> bool {
-        if self.piece_count % 8 == 0 || self.bytes.is_empty() {
+        if self.piece_count.is_multiple_of(8) || self.bytes.is_empty() {
             return false;
         }
         let used_bits = self.piece_count % 8;
@@ -178,7 +178,7 @@ impl CompactPieceBitmap {
     }
 
     fn clear_unused_tail_bits(&mut self) {
-        if self.piece_count % 8 == 0 || self.bytes.is_empty() {
+        if self.piece_count.is_multiple_of(8) || self.bytes.is_empty() {
             return;
         }
         let used_bits = self.piece_count % 8;

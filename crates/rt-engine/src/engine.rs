@@ -4693,7 +4693,7 @@ fn parse_info_hash_hex(info_hash: &str) -> Result<[u8; 20], ()> {
         return Err(());
     }
     let mut out = [0u8; 20];
-    for (idx, chunk) in info_hash.as_bytes().chunks_exact(2).enumerate() {
+    for (idx, chunk) in info_hash.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let hex = std::str::from_utf8(chunk).map_err(|_| ())?;
         out[idx] = u8::from_str_radix(hex, 16).map_err(|_| ())?;
     }

@@ -61,7 +61,7 @@ pub fn memory_db() -> Result<Connection, rt_db::DbError> {
 /// Build a deterministic torrent row for scale and certification datasets.
 pub fn synthetic_torrent_row(index: usize) -> rt_db::TorrentRow {
     let total_length = 64 * 1024 * 1024 + ((index % 8192) as i64 * 4096);
-    let downloaded = if index % 5 == 0 {
+    let downloaded = if index.is_multiple_of(5) {
         total_length / 2
     } else {
         total_length
@@ -77,7 +77,7 @@ pub fn synthetic_torrent_row(index: usize) -> rt_db::TorrentRow {
         total_length,
         piece_length: 256 * 1024,
         piece_count: (total_length + (256 * 1024 - 1)) / (256 * 1024),
-        is_private: index % 3 != 0,
+        is_private: !index.is_multiple_of(3),
         save_path: format!("/certification/library/{:02}", index % 64),
         category: Some(format!("category-{:02}", index % 32)),
         tags: vec![format!("tag-{:02}", index % 128)],
@@ -113,17 +113,26 @@ pub fn torrent_row(index: usize) -> rt_db::TorrentRow {
         total_length: 1024 * 1024 * (index as i64 + 1),
         piece_length: 16 * 1024,
         piece_count: 64 * (index as i64 + 1),
-        is_private: index % 2 == 0,
+        is_private: index.is_multiple_of(2),
         save_path: format!("/data/fixture-{index:04}"),
-        category: Some(if index % 2 == 0 { "movies" } else { "tv" }.to_owned()),
+        category: Some(
+            if index.is_multiple_of(2) {
+                "movies"
+            } else {
+                "tv"
+            }
+            .to_owned(),
+        ),
         tags: vec!["fixture".to_owned(), format!("batch-{}", index % 10)],
-        state: if index % 3 == 0 {
+        state: if index.is_multiple_of(3) {
             "seeding".to_owned()
         } else {
             "downloading".to_owned()
         },
         added_at: FIXTURE_ADDED_AT + index as i64,
-        completed_at: (index % 3 == 0).then_some(FIXTURE_ADDED_AT + index as i64 + 60),
+        completed_at: index
+            .is_multiple_of(3)
+            .then_some(FIXTURE_ADDED_AT + index as i64 + 60),
         uploaded: 10_000 * index as i64,
         downloaded: 20_000 * index as i64,
         ratio: if index == 0 { 0.0 } else { 0.5 },

@@ -39,40 +39,38 @@ impl CompactPeer {
 
 /// Parse compact IPv4 peer list (BEP 23): 6-byte chunks.
 pub fn parse_compact_peers_v4(bytes: &[u8]) -> Result<Vec<Peer>, TrackerError> {
-    if bytes.len() % 6 != 0 {
+    if !bytes.len().is_multiple_of(6) {
         return Err(TrackerError::ParseError(format!(
             "compact peers v4 length {} not multiple of 6",
             bytes.len()
         )));
     }
     Ok(bytes
-        .chunks_exact(6)
-        .map(|c| {
-            let arr: &[u8; 6] = c.try_into().unwrap();
-            Peer {
-                addr: CompactPeer::from_bytes_v4(arr).addr,
-                peer_id: None,
-            }
+        .as_chunks::<6>()
+        .0
+        .iter()
+        .map(|arr| Peer {
+            addr: CompactPeer::from_bytes_v4(arr).addr,
+            peer_id: None,
         })
         .collect())
 }
 
 /// Parse compact IPv6 peer list: 18-byte chunks.
 pub fn parse_compact_peers_v6(bytes: &[u8]) -> Result<Vec<Peer>, TrackerError> {
-    if bytes.len() % 18 != 0 {
+    if !bytes.len().is_multiple_of(18) {
         return Err(TrackerError::ParseError(format!(
             "compact peers v6 length {} not multiple of 18",
             bytes.len()
         )));
     }
     Ok(bytes
-        .chunks_exact(18)
-        .map(|c| {
-            let arr: &[u8; 18] = c.try_into().unwrap();
-            Peer {
-                addr: CompactPeer::from_bytes_v6(arr).addr,
-                peer_id: None,
-            }
+        .as_chunks::<18>()
+        .0
+        .iter()
+        .map(|arr| Peer {
+            addr: CompactPeer::from_bytes_v6(arr).addr,
+            peer_id: None,
         })
         .collect())
 }
