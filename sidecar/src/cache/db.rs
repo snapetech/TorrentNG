@@ -497,6 +497,37 @@ mod tests {
         assert_eq!(stopped[0].hash, "stopped");
     }
 
+    #[test]
+    fn set_torrent_runtime_state_many_updates_every_row_in_one_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+        for i in 0..50 {
+            db.upsert(&torrent_row(&format!("h{i}"), 1, true, true))
+                .unwrap();
+        }
+
+        let updates: Vec<(String, i64, bool, bool)> = (0..50)
+            .map(|i| (format!("h{i}"), 0i64, false, false))
+            .collect();
+        db.set_torrent_runtime_state_many(&updates).unwrap();
+
+        let (stopped, total) = db
+            .list(&ListParams {
+                status: Some("stopped".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(total, 50, "every row must have been updated, not just some");
+        assert_eq!(stopped.len(), 50);
+    }
+
+    #[test]
+    fn set_torrent_runtime_state_many_empty_input_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+        db.set_torrent_runtime_state_many(&[]).unwrap();
+    }
+
     fn torrent_row(hash: &str, state: i64, is_active: bool, is_open: bool) -> TorrentRow {
         TorrentRow {
             hash: hash.to_owned(),

@@ -2510,15 +2510,34 @@ pub async fn bulk_action(
             let mut errors = Vec::new();
             match outcome {
                 Ok(results) => {
-                    for (hash, res) in results {
+                    // Batch the cache write into one transaction instead of
+                    // one autocommit per hash -- with the RPC round trips no
+                    // longer the bottleneck, thousands of individual fsyncs
+                    // here would just become the new one.
+                    let mut state_updates = Vec::new();
+                    for (hash, res) in &results {
                         match res {
                             Ok(()) => {
-                                update_cached_lifecycle_state(&s, &hash, &action);
-                                emit_torrent_updated(&s, &hash);
-                                applied.push(hash);
+                                if action == "stop" {
+                                    state_updates.push((hash.clone(), 0i64, false, false));
+                                }
+                                applied.push(hash.clone());
                             }
                             Err(e) => errors.push(format!("{hash}: {e}")),
                         }
+                    }
+                    if let Err(e) = s.db.set_torrent_runtime_state_many(&state_updates) {
+                        tracing::warn!(
+                            component = "cache",
+                            operation = "set_torrent_runtime_state_many",
+                            count = state_updates.len(),
+                            result = "error",
+                            error = %e,
+                            "bulk torrent runtime cache update failed"
+                        );
+                    }
+                    for hash in &applied {
+                        emit_torrent_updated(&s, hash);
                     }
                 }
                 Err(e) => {

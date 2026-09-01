@@ -222,6 +222,38 @@ impl Db {
         )?;
         Ok(())
     }
+
+    /// Same as calling set_torrent_runtime_state() once per row, but in one
+    /// transaction instead of one autocommit (and, under WAL, one fsync) per
+    /// row -- for a few thousand rows that's the difference between tens of
+    /// seconds and under a second. Used after a bulk-optimized backend call
+    /// (e.g. rTorrent's system.multicall) so the DB write doesn't become the
+    /// new bottleneck once the RPC round trips are no longer it.
+    pub fn set_torrent_runtime_state_many(
+        &self,
+        updates: &[(String, i64, bool, bool)],
+    ) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.0.lock().expect("db");
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE torrents SET state=?1, is_active=?2, is_open=?3, updated_at=(
+                    SELECT MAX(v) FROM (
+                        SELECT CAST(strftime('%s','now') AS INTEGER) AS v
+                        UNION ALL SELECT COALESCE(MAX(updated_at), 0) + 1 FROM torrents
+                    )
+                 ) WHERE hash=?4",
+            )?;
+            for (hash, state, is_active, is_open) in updates {
+                stmt.execute(params![state, *is_active as i64, *is_open as i64, hash])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
 }
 
 fn touch_torrent(conn: &rusqlite::Connection, hash: &str) -> Result<()> {
