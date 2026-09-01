@@ -1007,16 +1007,69 @@ release report with owner/action/artifact for every remaining row.
 
 ### TNG-027 — Claimed fuzz/OpenAPI/idempotency coverage is not checked in
 
-**Status: Open** · **Priority: P1/P2** · **Confidence: high**
+**Status: In progress** · **Priority: P1/P2** · **Confidence: high**
 
-Evidence: repository search found no checked-in fuzz targets, OpenAPI source,
-or idempotency test harness despite documentation references.
+Original evidence: repository search found no checked-in fuzz targets,
+OpenAPI source, or idempotency test harness despite documentation
+references. There was an empty placeholder `fuzz/` directory (0 files) --
+confirming this was planned but never actually built.
 
-Required action: add bounded parser/network fuzz targets, generate and validate
-an API schema, and add replay/idempotency tests for mutating endpoints.
+Verified evidence (this session): added the fuzz-target half of this
+finding, verified working, not just scaffolded.
 
-Acceptance: CI invokes each target with a bounded smoke budget and publishes
-artifacts.
+- `cargo-fuzz` was not installed on this machine; installed it (via nightly
+  Rust, already present) specifically so these targets could be built and
+  actually run locally before being claimed as working, per this session's
+  own verification discipline.
+- Two real `libFuzzer` targets in `fuzz/fuzz_targets/`:
+  `parse_torrent.rs` fuzzes `rt_metainfo::parse_torrent` -- the entry point
+  for every `.torrent` file this daemon ever reads, the single highest-value
+  target since `.torrent` files routinely come from untrusted sources.
+  `bencode_decode.rs` fuzzes `rt_bencode::decode`, the lower-level parser
+  underneath it that also parses tracker responses and DHT KRPC messages.
+  Both only assert "does not panic/crash" -- `Err` on malformed input is
+  correct and expected.
+- Actually ran both locally (`cargo +nightly fuzz run <target> --
+  -max_total_time=15`): `parse_torrent` completed ~2.71M executions in 16s,
+  `bencode_decode` ~2.46M in 16s, zero crashes on either. This is real
+  evidence the harnesses build and run against the current parser APIs,
+  not just that the scaffolding exists.
+- Wired a new `fuzz-smoke` CI job (`.github/workflows/ci.yml`): installs
+  nightly + `cargo-fuzz`, runs each target with a bounded 60s budget, and
+  uploads `fuzz/artifacts/` (crash reproducers) via `actions/upload-artifact`
+  on failure -- directly satisfies this item's acceptance criterion ("CI
+  invokes each target with a bounded smoke budget and publishes artifacts").
+  This job could not be run in this sandboxed session (no way to trigger
+  the actual GitHub Actions runner here); the manual local runs above are
+  the closest available verification that the underlying commands work.
+- `fuzz/` is deliberately excluded from the main Cargo workspace
+  (`Cargo.toml`'s `exclude`, matching the existing `sidecar` pattern) since
+  `cargo-fuzz` requires nightly + sanitizer flags incompatible with the
+  main workspace's stable build.
+
+Full workspace `cargo test --workspace --all-targets --locked`,
+`cargo fmt --all -- --check`, and
+`cargo clippy --workspace --all-targets --locked -- -D warnings` all still
+green (the main workspace does not see `fuzz/` at all,
+`cargo metadata --no-deps` confirms it).
+
+Not yet evidenced (why this stays "In progress", not "Resolved"): OpenAPI
+schema generation/validation is entirely untouched; idempotency/replay
+tests for mutating endpoints are entirely untouched; the new CI job itself
+has not been observed actually running in GitHub Actions (only verified
+locally); fuzz coverage is currently limited to two parsers -- tracker
+HTTP/UDP response parsing, DHT KRPC message parsing, and peer-wire message
+parsing are all untouched and would each be reasonable additional targets
+given they also handle attacker-reachable bytes.
+
+Required action (remaining): observe the CI job actually run and pass/fail
+correctly; add fuzz targets for tracker/DHT/peer-wire parsing; generate and
+validate an OpenAPI schema; add idempotency/replay tests for mutating
+endpoints (add/remove/move/etc.).
+
+Acceptance: CI invokes each target with a bounded smoke budget (done,
+pending an observed real CI run) and publishes artifacts (done, pending
+an observed real CI run with an actual crash to verify the upload step).
 
 ### TNG-028 — Formatting, clippy, and MSRV are already red
 
@@ -1087,6 +1140,7 @@ claims:
 | 2026-09-01 | Fifth session (same date, continuing "build it all out"): fixed TNG-008's first concrete "phantom registry row" case in `add_torrent` (`crates/rt-engine/src/engine.rs`) -- `reg.add(entry)` made a torrent visible before its blob was written and its DB row upserted, and neither failure path rolled the registry entry back. Now both failure points roll back the registry row; a DB-upsert failure after a successful blob write also cleans up the now-orphaned blob (best-effort, logged on cleanup failure). Two new regression tests force each failure independently (blocking the blob directory with a plain file; `PRAGMA query_only = ON` on the DB connection) and confirm no phantom row remains -- verified both are real by temporarily disabling the rollback and confirming both tests fail first. | `cargo test -p rt-engine --lib` (129 passed, up from 127, 0 failed), full `cargo test --workspace --all-targets --locked` (green), `cargo fmt --all -- --check` (green), `cargo clippy --workspace --all-targets --locked -- -D warnings` (green). | TNG-008 moved Open -> In progress. This is a deliberately narrow slice of a very broad finding -- `add_magnet` and other registry-mutating paths are not yet audited for the same pattern, and job-state/event atomicity, migration transactionality, per-block write amplification, and crash-restart reconciliation are all still open (see item detail for the explicit remaining list). |
 | 2026-09-01 | Sixth session (same date, continuing "build it all out"): fixed TNG-020's two most concrete correctness sub-issues. `AnnounceResponse::parse` (`crates/rt-tracker/src/response.rs`) used bare `as u32` casts on bencoded `i64` interval/stats fields -- a negative or oversized value silently wrapped instead of being rejected, inconsistent with the sibling `scrape_int` helper in the same file which already did this correctly. Switched to checked `u32::try_from`: `interval` now fails the response on an invalid value, the optional stats fields degrade to `None`. `parse_ut_pex_peers` (`crates/rt-engine/src/torrent_task.rs`) only parsed ut_pex's IPv4 `added` key; added `added6` (IPv6) parsing so dual-stack/IPv6 swarms' PEX-advertised peers are no longer silently dropped. `dropped`/`dropped6` intentionally left unparsed -- BEP 11 defines them as informational only and this engine has no mechanism to safely act on them yet; wiring that in needs a real design decision, not a rushed addition. Five new tests total (3 tracker, 2 pex). | `cargo test -p rt-engine -p rt-tracker --lib` (rt-tracker 59 passed, up from 56; 0 failed), full `cargo test --workspace --all-targets --locked` (green), `cargo fmt --all -- --check` (green), `cargo clippy --workspace --all-targets --locked -- -D warnings` (green). | TNG-020 moved Open -> In progress. UDP framing/connection-reuse, interval/transaction-id fidelity audit, and dropped-peer semantics remain explicitly open (see item detail). |
 | 2026-09-01 | Seventh session (same date, continuing "build it all out"): fixed TNG-019's most severe issue -- confirmed it was a real, exploitable DHT-poisoning gap, not just missing hardening. `handle_packet` (`crates/rt-engine/src/dht_task.rs`) accepted any KRPC Response/Error whose transaction id matched an outstanding entry regardless of which UDP address the packet actually came from, merging its claimed nodes into the routing table and forwarding get_peers results straight to the torrent unconditionally; combined with transaction ids being a plain sequential counter starting at 1 on every launch (fully predictable across restarts), an off-path attacker with no visibility into real traffic could inject forged nodes/peers with a handful of guessed low IDs. Added `OutstandingQuery` (address + timestamp per sent query); Response/Error handling now requires the source address to match before trusting anything, dropping (and logging) a mismatch without touching the routing table or consuming the real pending query. Transaction ids now start from a random per-launch seed (reusing `NodeId::random()`'s existing `rand` dependency rather than adding a new one) instead of always 1. Added a 10s sweep pruning outstanding entries older than 30s, closing the unbounded-growth path from non-responding nodes. Five new regression tests; verified the source-check test is real by disabling the check and confirming it fails first. | `cargo test -p rt-engine --lib` (134 passed, up from 129, 0 failed), full `cargo test --workspace --all-targets --locked` (green), `cargo fmt --all -- --check` (green), `cargo clippy --workspace --all-targets --locked -- -D warnings` (green, after fixing one clippy finding in a new test). | TNG-019 moved Open -> In progress. IPv6 support, inbound rate limiting, announce-token binding audit, and global table/peer caps remain explicitly open (see item detail). |
+| 2026-09-01 | Eighth session (same date, continuing "build it all out"): built and verified real fuzz targets for TNG-027 -- the repository had an empty placeholder `fuzz/` directory (0 files), confirming this was never actually implemented. Installed `cargo-fuzz` (was not present) so targets could be built and run locally, not just scaffolded. Added `parse_torrent` (fuzzes `rt_metainfo::parse_torrent`, the entry point for every `.torrent` file this daemon reads) and `bencode_decode` (fuzzes the lower-level `rt_bencode::decode` also used by tracker/DHT parsing). Ran both locally: ~2.7M and ~2.5M executions in 16s each, zero crashes. Wired a new `fuzz-smoke` CI job with a bounded 60s-per-target budget and crash-artifact upload on failure. `fuzz/` excluded from the main Cargo workspace (matching the existing `sidecar` pattern) since cargo-fuzz needs nightly + sanitizer flags. While re-running a full clippy pass for this, discovered `.clippy.toml` still declared the pre-correction `msrv = "1.80"` from before this session's earlier MSRV fix (which corrected `Cargo.toml`'s actual `rust-version` to `1.88`) -- the stale value had been silently suppressing real, applicable MSRV-gated lint suggestions across the whole workspace the entire session. Fixed the declared MSRV and applied the ~19 newly-surfaced findings (manual modulo checks -> `.is_multiple_of()`, manual `chunks_exact(N)` -> `.as_chunks::<N>()`) across 8 crates, mostly via `cargo clippy --fix`, with the diffs spot-checked for correctness. | Fuzz targets run locally with real execution counts and zero crashes (see above); full `cargo test --workspace --all-targets --locked` (green), `cargo fmt --all -- --check` (green), `cargo clippy --workspace --all-targets --locked -- -D warnings` (green), `cargo test --manifest-path sidecar/Cargo.toml --locked` (green, 75 passed); `cargo metadata --no-deps` confirms `fuzz/` is not part of the main workspace. | TNG-027 moved Open -> In progress (OpenAPI schema and idempotency tests remain entirely untouched; the new CI job has not yet been observed running for real, only verified locally -- see item detail). Also closed a real, if quieter, MSRV-consistency gap that had been masking lint coverage since the second session's TNG-028 work. |
 
 ## Release gate
 

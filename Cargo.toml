@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-exclude = ["sidecar"]
+exclude = ["sidecar", "fuzz"]
 members = [
     "crates/rt-bencode",
     "crates/rt-metainfo",

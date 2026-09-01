@@ -1,0 +1,31 @@
+[package]
+name = "torrentng-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.rt-bencode]
+path = "../crates/rt-bencode"
+
+[dependencies.rt-metainfo]
+path = "../crates/rt-metainfo"
+
+[[bin]]
+name = "parse_torrent"
+path = "fuzz_targets/parse_torrent.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bencode_decode"
+path = "fuzz_targets/bencode_decode.rs"
+test = false
+doc = false
+bench = false

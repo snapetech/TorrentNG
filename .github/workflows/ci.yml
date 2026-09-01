@@ -27,6 +27,41 @@ jobs:
       - name: Lint native workspace
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+  fuzz-smoke:
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      # TNG-027: bounded smoke run, not a real fuzzing campaign -- this
+      # exists to catch a target that's gone stale (no longer builds
+      # against the current parser API) or an immediately-reachable
+      # crash, not to find deep bugs on every PR. Each target gets a
+      # fixed, short time budget so this job stays fast and deterministic
+      # in CI; real fuzzing runs happen out-of-band with a much larger
+      # budget.
+      - name: Fuzz parse_torrent (bounded smoke run)
+        working-directory: fuzz
+        run: cargo +nightly fuzz run parse_torrent -- -max_total_time=60
+
+      - name: Fuzz bencode_decode (bounded smoke run)
+        working-directory: fuzz
+        run: cargo +nightly fuzz run bencode_decode -- -max_total_time=60
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+
   sidecar:
     runs-on: [self-hosted, Linux, X64]
     steps:
