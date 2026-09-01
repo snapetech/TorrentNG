@@ -30,6 +30,11 @@ const STATUS_OPTIONS = [
   { value: 'checking', label: 'Checking', icon: '↻' },
   { value: 'moving', label: 'Moving', icon: '⌖' },
   { value: 'error', label: 'Errored', icon: '!' },
+  // Distinct from "Errored" above: a torrent can be actively seeding or
+  // downloading fine while its tracker rejects announces (e.g. "torrent
+  // not registered with this tracker") -- "Errored" only ever matches a
+  // torrent that's also stopped, so it never surfaces this case.
+  { value: 'tracker_error', label: 'Tracker Errors', icon: '⚠' },
 ]
 
 const TYPE_OPTIONS = [

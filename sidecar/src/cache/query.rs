@@ -297,6 +297,16 @@ impl Db {
             ("checking", "t.state=2"),
             ("moving", "0=1"),
             ("error", "t.message != '' AND t.is_active=0"),
+            // Distinct from "error" above: a torrent can be actively
+            // seeding/downloading just fine while its tracker is
+            // rejecting announces (e.g. "torrent not registered with
+            // this tracker") -- rTorrent still reports it as active, so
+            // the is_active=0 restriction on "error" always misses this
+            // case. This bucket is exactly `tracker_health`'s existing
+            // error_count predicate (see tracker_health() above),
+            // finally made filterable per-torrent, not just visible as a
+            // per-tracker aggregate.
+            ("tracker_error", "t.message != ''"),
         ];
         for (key, bucket_sql) in status_queries {
             let mut clauses = shared_clauses.clone();
@@ -396,6 +406,9 @@ fn build_where(p: &ListParams) -> (String, Vec<String>) {
             "checking" => clauses.push("t.state=2".into()),
             "moving" => clauses.push("0=1".into()),
             "error" | "errored" => clauses.push("t.message != '' AND t.is_active=0".into()),
+            // Kept in sync with sidebar_facets()'s identical bucket -- see
+            // the comment there for why this is distinct from "error".
+            "tracker_error" => clauses.push("t.message != ''".into()),
             _ => {}
         }
     }
@@ -464,6 +477,78 @@ fn order_clause(sort: Option<&str>, dir: Option<&str>) -> String {
 }
 
 #[cfg(test)]
+mod tracker_error_integration_tests {
+    use super::{Db, ListParams};
+    use crate::cache::db::TorrentRow;
+
+    fn row(hash: &str, is_active: bool, message: &str) -> TorrentRow {
+        TorrentRow {
+            hash: hash.to_owned(),
+            name: format!("torrent-{hash}"),
+            size_bytes: 1_000_000,
+            bytes_done: 1_000_000,
+            down_rate: 0,
+            up_rate: 12_345,
+            up_total: 5_000_000,
+            down_total: 1_000_000,
+            ratio: 5000,
+            is_active,
+            is_open: is_active,
+            complete: true,
+            state: if is_active { 1 } else { 0 },
+            priority: 3,
+            category: String::new(),
+            base_path: "/data".to_owned(),
+            directory: "/data".to_owned(),
+            creation_date: 0,
+            timestamp_finished: 0,
+            tracker_focus: 0,
+            peers_connected: 0,
+            peers_complete: 1,
+            message: message.to_owned(),
+            tracker_url: "https://tracker.example/announce".to_owned(),
+            tags: String::new(),
+            updated_at: 0,
+        }
+    }
+
+    /// TNG-webui: a torrent can be actively seeding fine while its
+    /// tracker rejects announces (e.g. "torrent not registered with this
+    /// tracker") -- the existing "error"/"errored" bucket requires
+    /// is_active=0 and so never surfaces this. Proves the new
+    /// "tracker_error" bucket does, against a real SQLite-backed cache,
+    /// not just a generated SQL string.
+    #[test]
+    fn seeding_torrent_with_tracker_failure_is_findable_and_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+        db.upsert(&row(
+            "a".repeat(40).as_str(),
+            true,
+            "Tracker: [Failure reason \"torrent not registered with this tracker\"]",
+        ))
+        .unwrap();
+        db.upsert(&row("b".repeat(40).as_str(), true, "")).unwrap();
+
+        let facets = db.sidebar_facets(&ListParams::default()).unwrap();
+        assert_eq!(facets.status.get("tracker_error"), Some(&1));
+        // The pre-existing "error" bucket must still miss it -- that's
+        // exactly the gap this new bucket exists to close.
+        assert_eq!(facets.status.get("error"), Some(&0));
+
+        let (rows, total) = db
+            .list(&ListParams {
+                status: Some("tracker_error".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].hash, "a".repeat(40));
+    }
+}
+
+#[cfg(test)]
 mod status_bucket_tests {
     use super::{build_where, ListParams};
 
@@ -511,6 +596,29 @@ mod status_bucket_tests {
             !w.contains("is_active=0"),
             "stalled_downloading must not require is_active=0 (that means stopped, not stalled): {w}"
         );
+    }
+
+    #[test]
+    fn tracker_error_matches_regardless_of_active_state() {
+        // The bug this guards against: a torrent actively seeding fine
+        // except for a rejected tracker announce (e.g. "torrent not
+        // registered with this tracker") must still be matched -- unlike
+        // "error"/"errored", this must NOT require is_active=0.
+        let w = where_for("tracker_error");
+        assert!(w.contains("t.message != ''"), "{w}");
+        assert!(
+            !w.contains("is_active"),
+            "tracker_error must match active torrents with a tracker message too: {w}"
+        );
+    }
+
+    #[test]
+    fn error_and_tracker_error_are_distinct_buckets() {
+        // "error" stays narrow (message + actually stopped); adding
+        // tracker_error must not have widened or replaced it.
+        let error = where_for("error");
+        assert!(error.contains("t.message != ''"), "{error}");
+        assert!(error.contains("t.is_active=0"), "{error}");
     }
 }
 
