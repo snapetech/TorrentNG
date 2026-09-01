@@ -720,18 +720,74 @@ saturation tests.
 
 ### TNG-019 — DHT resource and validation controls are incomplete
 
-**Status: Open** · **Priority: P1** · **Confidence: high**
+**Status: In progress** · **Priority: P1** · **Confidence: high**
 
-Evidence: DHT is IPv4-only in the live task; there is no effective rate limit or
-outstanding expiry; transaction IDs are two bytes; response source validation
-and global announced-peer caps are incomplete.
+Original evidence: DHT is IPv4-only in the live task; there is no effective
+rate limit or outstanding expiry; transaction IDs are two bytes; response
+source validation and global announced-peer caps are incomplete.
 
-Required action: validate transaction/source, expire outstanding queries, cap
-tables and announce state, rate-limit traffic, support or explicitly scope
-IPv6, and harden token/address binding.
+Verified evidence (this session): fixed the most severe issue -- confirmed
+this was a real, exploitable gap, not just a hardening nice-to-have.
+`crates/rt-engine/src/dht_task.rs`'s `handle_packet` accepted *any* KRPC
+`Response`/`Error` whose transaction ID matched an outstanding entry,
+**regardless of which UDP address the packet actually came from** --
+merging its claimed nodes into the routing table and, for `get_peers`,
+forwarding its claimed peers straight to the torrent, unconditionally. Worse,
+transaction IDs were a plain sequential `u16` counter starting at `1` on
+every daemon launch (`next_tx.wrapping_add(1)`), not random -- fully
+predictable across restarts. Together this meant an off-path attacker
+(no need to see our real traffic) could send a handful of forged UDP
+packets with guessed low transaction IDs and inject fabricated DHT nodes
+or, more seriously, fabricated `get_peers` results that the torrent task
+would treat as real, connectable peers.
 
-Acceptance: spoofed response, transaction reuse, timeout, flood, IPv6, table
-cap, private torrent, and restart tests.
+- `OutstandingQuery` now records the address a query was actually sent to
+  and a `sent_at` timestamp. `Response`/`Error` handling looks up the
+  transaction ID and requires the packet's source address to match before
+  trusting anything in it; a mismatch (or an unrecognized transaction ID)
+  is logged and dropped without touching the routing table, without
+  consuming the real outstanding entry, and without forwarding anything to
+  the torrent.
+- Transaction IDs now start from a random `u16` seed per daemon launch
+  (reusing `NodeId::random()`, already backed by `rand` inside `rt-dht`,
+  rather than adding a new direct dependency) instead of always `1`. Still
+  sequential *within* a session (an attacker who observes one ID can still
+  predict the next), but the source-address check above is now the actual
+  security boundary -- guessing IDs alone is no longer sufficient.
+- Added `prune_stale_outstanding`, run on a new 10s tick, dropping
+  outstanding entries older than 30s -- closes the unbounded-growth path
+  from nodes (or an attacker) that never respond.
+- Five new regression tests: a spoofed-source response is rejected without
+  touching the routing table or consuming the real query; an unknown
+  transaction ID is rejected; expiry sweep removes only stale entries.
+  Verified `response_from_wrong_source_address_is_ignored` is a real
+  regression test by temporarily disabling the address check and
+  confirming it fails first.
+
+Full workspace `cargo test --workspace --all-targets --locked`,
+`cargo fmt --all -- --check`, and
+`cargo clippy --workspace --all-targets --locked -- -D warnings` all green
+(`rt-engine` 134 tests, up from 129).
+
+Not yet evidenced (why this stays "In progress", not "Resolved"): DHT is
+still IPv4-only in the live task (no IPv6 support at all, not just
+untested); there is still no rate limiting on inbound DHT traffic (a flood
+of valid-looking queries/responses is not bounded); global announced-peer
+caps beyond the existing per-info-hash cap were not audited; token/address
+binding for `announce_peer` (does the token actually bind to the
+querying address, preventing a third party from replaying an overheard
+token?) was not audited.
+
+Required action (remaining): inbound DHT rate limiting; IPv6 support or an
+explicit, documented scope decision to not support it; announce-token
+binding audit; global (not just per-info-hash) announced-peer/table caps;
+flood and restart tests.
+
+Acceptance: spoofed response (done), transaction reuse (partially --
+source-address check is now the real defense; ID predictability itself is
+unchanged), timeout (done, via the new expiry sweep), flood (missing),
+IPv6 (missing), table cap (missing), private torrent (pre-existing,
+unaffected), and restart tests (missing).
 
 ### TNG-020 — Tracker and PEX protocol handling is partial
 
@@ -1030,6 +1086,7 @@ claims:
 | 2026-09-01 | Fourth session (same date, continuing "build it all out"): implemented TNG-002's quiesce/resume storage-transition protocol. New `TorrentCmd::QuiesceForStorageMove`/`ResumeAfterStorageMove` in `crates/rt-engine/src/torrent_task.rs`, handled in the main actor loop, inside `pending_recheck_control` (an in-progress recheck reads files too), and in `metadata_task.rs` (no-op for not-yet-materialized torrents). `engine.rs`'s `move_torrent_payload_files` and the generic `EngineCmd::ExecuteStoragePlan` handler (`POST /api/v1/storage/execute`) both now quiesce affected running tasks before touching files and resume them afterward. Wrote a real regression test using a genuinely spawned `TorrentTask` (not the taskless path) proving a live task's cached save_root is correctly re-pointed after a move and a post-move recheck finds the content at the new location -- verified this actually catches the bug by temporarily reverting the fix and confirming the test fails (`Downloading` instead of `Seeding`) before restoring it. While building that test, found and fixed a real, separate, pre-existing bug: `rt-session`'s state machine had no `(Seeding, Checking)`/`(Seeding, Downloading)` transitions, so rechecking an already-seeding torrent via the *existing* `TorrentCmd::Recheck` command could never have its outcome reflected in the registry (`set_state` silently discards `transition()`'s `Result`). Fixed with a regression test. | `cargo test -p rt-engine -p rt-session --lib` (rt-engine 127 passed, up from 126; rt-session 19, up from 18; 0 failed), full `cargo test --workspace --all-targets --locked` (green), `cargo fmt --all -- --check` (green), `cargo clippy --workspace --all-targets --locked -- -D warnings` (green), `cargo test --manifest-path sidecar/Cargo.toml --locked` (green, 75 passed, unaffected). | TNG-002 moved Open -> In progress (not Resolved: live-peer move-under-transfer, cancellation, crash/restart tests still missing -- see item detail). Uncovered and fixed an independent state-machine bug along the way (recheck-of-seeding-torrent outcome was unobservable), which also directly strengthens TNG-002's and TNG-003's own recheck-after-move safety net. |
 | 2026-09-01 | Fifth session (same date, continuing "build it all out"): fixed TNG-008's first concrete "phantom registry row" case in `add_torrent` (`crates/rt-engine/src/engine.rs`) -- `reg.add(entry)` made a torrent visible before its blob was written and its DB row upserted, and neither failure path rolled the registry entry back. Now both failure points roll back the registry row; a DB-upsert failure after a successful blob write also cleans up the now-orphaned blob (best-effort, logged on cleanup failure). Two new regression tests force each failure independently (blocking the blob directory with a plain file; `PRAGMA query_only = ON` on the DB connection) and confirm no phantom row remains -- verified both are real by temporarily disabling the rollback and confirming both tests fail first. | `cargo test -p rt-engine --lib` (129 passed, up from 127, 0 failed), full `cargo test --workspace --all-targets --locked` (green), `cargo fmt --all -- --check` (green), `cargo clippy --workspace --all-targets --locked -- -D warnings` (green). | TNG-008 moved Open -> In progress. This is a deliberately narrow slice of a very broad finding -- `add_magnet` and other registry-mutating paths are not yet audited for the same pattern, and job-state/event atomicity, migration transactionality, per-block write amplification, and crash-restart reconciliation are all still open (see item detail for the explicit remaining list). |
 | 2026-09-01 | Sixth session (same date, continuing "build it all out"): fixed TNG-020's two most concrete correctness sub-issues. `AnnounceResponse::parse` (`crates/rt-tracker/src/response.rs`) used bare `as u32` casts on bencoded `i64` interval/stats fields -- a negative or oversized value silently wrapped instead of being rejected, inconsistent with the sibling `scrape_int` helper in the same file which already did this correctly. Switched to checked `u32::try_from`: `interval` now fails the response on an invalid value, the optional stats fields degrade to `None`. `parse_ut_pex_peers` (`crates/rt-engine/src/torrent_task.rs`) only parsed ut_pex's IPv4 `added` key; added `added6` (IPv6) parsing so dual-stack/IPv6 swarms' PEX-advertised peers are no longer silently dropped. `dropped`/`dropped6` intentionally left unparsed -- BEP 11 defines them as informational only and this engine has no mechanism to safely act on them yet; wiring that in needs a real design decision, not a rushed addition. Five new tests total (3 tracker, 2 pex). | `cargo test -p rt-engine -p rt-tracker --lib` (rt-tracker 59 passed, up from 56; 0 failed), full `cargo test --workspace --all-targets --locked` (green), `cargo fmt --all -- --check` (green), `cargo clippy --workspace --all-targets --locked -- -D warnings` (green). | TNG-020 moved Open -> In progress. UDP framing/connection-reuse, interval/transaction-id fidelity audit, and dropped-peer semantics remain explicitly open (see item detail). |
+| 2026-09-01 | Seventh session (same date, continuing "build it all out"): fixed TNG-019's most severe issue -- confirmed it was a real, exploitable DHT-poisoning gap, not just missing hardening. `handle_packet` (`crates/rt-engine/src/dht_task.rs`) accepted any KRPC Response/Error whose transaction id matched an outstanding entry regardless of which UDP address the packet actually came from, merging its claimed nodes into the routing table and forwarding get_peers results straight to the torrent unconditionally; combined with transaction ids being a plain sequential counter starting at 1 on every launch (fully predictable across restarts), an off-path attacker with no visibility into real traffic could inject forged nodes/peers with a handful of guessed low IDs. Added `OutstandingQuery` (address + timestamp per sent query); Response/Error handling now requires the source address to match before trusting anything, dropping (and logging) a mismatch without touching the routing table or consuming the real pending query. Transaction ids now start from a random per-launch seed (reusing `NodeId::random()`'s existing `rand` dependency rather than adding a new one) instead of always 1. Added a 10s sweep pruning outstanding entries older than 30s, closing the unbounded-growth path from non-responding nodes. Five new regression tests; verified the source-check test is real by disabling the check and confirming it fails first. | `cargo test -p rt-engine --lib` (134 passed, up from 129, 0 failed), full `cargo test --workspace --all-targets --locked` (green), `cargo fmt --all -- --check` (green), `cargo clippy --workspace --all-targets --locked -- -D warnings` (green, after fixing one clippy finding in a new test). | TNG-019 moved Open -> In progress. IPv6 support, inbound rate limiting, announce-token binding audit, and global table/peer caps remain explicitly open (see item detail). |
 
 ## Release gate
 

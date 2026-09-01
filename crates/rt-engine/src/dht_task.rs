@@ -61,13 +61,25 @@ pub async fn run_dht(
         "DHT UDP socket bound"
     );
 
+    // TNG-019: previously always started at 1 and incremented sequentially,
+    // meaning transaction ids were fully predictable across every daemon
+    // restart (not just within one running session). Combined with the
+    // response source-address check above, an attacker guessing this
+    // sequence is no longer enough on its own to inject a forged response,
+    // but starting from a random point still removes a cheap, free signal.
+    // Reuses `NodeId::random()` (already backed by `rand` inside rt-dht)
+    // instead of adding a new direct dependency just for two bytes.
+    let seed_bytes = *rt_dht::NodeId::random().as_bytes();
+    // `.max(1)` matches `transaction_id()`'s own invariant that a
+    // transaction id is never the all-zero value.
+    let random_tx_seed = u16::from_be_bytes([seed_bytes[0], seed_bytes[1]]).max(1);
     let mut task = DhtTask {
         local_id,
         table: RoutingTable::new(local_id),
         socket,
         listen_port,
         bootstrap_nodes,
-        next_tx: 1,
+        next_tx: random_tx_seed,
         outstanding: HashMap::new(),
         queried_nodes: HashMap::new(),
         torrents: HashMap::new(),
@@ -78,6 +90,7 @@ pub async fn run_dht(
 
     let mut bootstrap_tick = interval(Duration::from_secs(300));
     let mut search_tick = interval(Duration::from_secs(30));
+    let mut outstanding_sweep_tick = interval(Duration::from_secs(10));
     let mut buf = vec![0u8; 2048];
     loop {
         tokio::select! {
@@ -93,6 +106,9 @@ pub async fn run_dht(
             }
             _ = search_tick.tick() => {
                 task.search_torrents().await;
+            }
+            _ = outstanding_sweep_tick.tick() => {
+                task.prune_stale_outstanding();
             }
             recv = task.socket.recv_from(&mut buf) => {
                 match recv {
@@ -118,7 +134,7 @@ struct DhtTask {
     listen_port: u16,
     bootstrap_nodes: Vec<String>,
     next_tx: u16,
-    outstanding: HashMap<Vec<u8>, DhtRequest>,
+    outstanding: HashMap<Vec<u8>, OutstandingQuery>,
     queried_nodes: HashMap<[u8; 20], HashSet<SocketAddrV4>>,
     torrents: HashMap<[u8; 20], mpsc::Sender<TorrentCmd>>,
     announced_peers: HashMap<[u8; 20], Vec<SocketAddr>>,
@@ -131,6 +147,27 @@ enum DhtRequest {
     GetPeers([u8; 20]),
     AnnouncePeer,
 }
+
+/// TNG-019: a query we sent and are waiting on a response to. Records the
+/// address we actually sent it to (`addr`) so an incoming `Response`/`Error`
+/// claiming a matching transaction ID can be checked against it -- without
+/// this, any UDP packet from *any* source that happens to guess or replay a
+/// valid transaction ID would be accepted as if it came from the queried
+/// node, letting an off-path attacker inject forged nodes/peers into the
+/// routing table or a get_peers result. Also records `sent_at` so stale
+/// entries (queried nodes that never answered) can be pruned instead of
+/// growing `outstanding` unboundedly.
+#[derive(Debug, Clone, Copy)]
+struct OutstandingQuery {
+    addr: SocketAddr,
+    request: DhtRequest,
+    sent_at: Instant,
+}
+
+/// Outstanding queries older than this never got a response and are
+/// considered abandoned -- pruned so `outstanding` doesn't grow forever
+/// from nodes that silently drop our packets.
+const OUTSTANDING_QUERY_TTL: Duration = Duration::from_secs(30);
 
 impl DhtTask {
     async fn handle_command(&mut self, cmd: DhtCommand) -> bool {
@@ -190,7 +227,14 @@ impl DhtTask {
                         target: self.local_id,
                     },
                 };
-                self.outstanding.insert(tx, DhtRequest::Bootstrap);
+                self.outstanding.insert(
+                    tx,
+                    OutstandingQuery {
+                        addr,
+                        request: DhtRequest::Bootstrap,
+                        sent_at: Instant::now(),
+                    },
+                );
                 if let Err(e) = self.socket.send_to(&msg.encode(), addr).await {
                     warn!(
                         component = "dht",
@@ -233,12 +277,41 @@ impl DhtTask {
                 transaction_id,
                 response,
             } => {
-                let request = self.outstanding.remove(&transaction_id);
+                // TNG-019: only trust a response that matches a query we
+                // actually sent, from the exact address we sent it to.
+                // Without this, any UDP packet claiming a live/guessable
+                // transaction id -- from any source -- was merged straight
+                // into the routing table and, for get_peers, forwarded to
+                // the torrent as if it were real peer data.
+                let Some(outstanding) = self.outstanding.get(&transaction_id).copied() else {
+                    debug!(
+                        component = "dht",
+                        operation = "handle_response",
+                        peer = %addr,
+                        result = "rejected",
+                        reason = "unknown transaction id",
+                        "ignoring unsolicited DHT response"
+                    );
+                    return;
+                };
+                if outstanding.addr != addr {
+                    warn!(
+                        component = "dht",
+                        operation = "handle_response",
+                        peer = %addr,
+                        expected = %outstanding.addr,
+                        result = "rejected",
+                        reason = "source address mismatch",
+                        "ignoring DHT response whose source does not match the address its transaction id was queried at"
+                    );
+                    return;
+                }
+                self.outstanding.remove(&transaction_id);
                 self.remember_node(response.id, addr);
                 for node in response.nodes {
                     self.table.insert(node);
                 }
-                if let Some(DhtRequest::GetPeers(info_hash)) = request {
+                if let DhtRequest::GetPeers(info_hash) = outstanding.request {
                     if let Some(token) = response.token {
                         self.announce_peer_to_node(info_hash, token, addr).await;
                     }
@@ -254,7 +327,28 @@ impl DhtTask {
                 transaction_id,
                 error,
             } => {
-                self.outstanding.remove(&transaction_id);
+                // Same source check as Response: an error for a transaction
+                // id we don't recognize, or from an address that doesn't
+                // match who we sent it to, is not something we should let
+                // clear our own outstanding query.
+                match self.outstanding.get(&transaction_id) {
+                    Some(outstanding) if outstanding.addr == addr => {
+                        self.outstanding.remove(&transaction_id);
+                    }
+                    Some(outstanding) => {
+                        warn!(
+                            component = "dht",
+                            operation = "handle_error",
+                            peer = %addr,
+                            expected = %outstanding.addr,
+                            result = "rejected",
+                            reason = "source address mismatch",
+                            "ignoring DHT error whose source does not match the address its transaction id was queried at"
+                        );
+                        return;
+                    }
+                    None => {}
+                }
                 debug!(
                     peer = %addr,
                     code = error.code,
@@ -450,7 +544,14 @@ impl DhtTask {
                 info_hash,
             },
         };
-        self.outstanding.insert(tx, DhtRequest::GetPeers(info_hash));
+        self.outstanding.insert(
+            tx,
+            OutstandingQuery {
+                addr,
+                request: DhtRequest::GetPeers(info_hash),
+                sent_at: Instant::now(),
+            },
+        );
         if let Err(e) = self.socket.send_to(&msg.encode(), addr).await {
             warn!(
                 component = "dht",
@@ -470,7 +571,14 @@ impl DhtTask {
         addr: SocketAddr,
     ) {
         let (tx, msg) = self.announce_peer_query(info_hash, token);
-        self.outstanding.insert(tx, DhtRequest::AnnouncePeer);
+        self.outstanding.insert(
+            tx,
+            OutstandingQuery {
+                addr,
+                request: DhtRequest::AnnouncePeer,
+                sent_at: Instant::now(),
+            },
+        );
         if let Err(e) = self.socket.send_to(&msg.encode(), addr).await {
             warn!(
                 component = "dht",
@@ -553,6 +661,28 @@ impl DhtTask {
         let tx = self.next_tx.to_be_bytes().to_vec();
         self.next_tx = self.next_tx.wrapping_add(1).max(1);
         tx
+    }
+
+    /// TNG-019: drops outstanding queries that never got a response within
+    /// `OUTSTANDING_QUERY_TTL`. Without this, a node that silently drops our
+    /// packets (or is offline, or is deliberately ignoring us) leaves an
+    /// entry in `outstanding` forever -- an unbounded, attacker-triggerable
+    /// growth path (send queries to many never-responding addresses) as
+    /// well as ordinary leak from normal network loss.
+    fn prune_stale_outstanding(&mut self) {
+        let before = self.outstanding.len();
+        self.outstanding
+            .retain(|_, query| query.sent_at.elapsed() < OUTSTANDING_QUERY_TTL);
+        let pruned = before - self.outstanding.len();
+        if pruned > 0 {
+            debug!(
+                component = "dht",
+                operation = "prune_stale_outstanding",
+                pruned,
+                remaining = self.outstanding.len(),
+                "pruned stale outstanding DHT queries"
+            );
+        }
     }
 }
 
@@ -754,7 +884,14 @@ mod tests {
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
             next_tx: 1,
-            outstanding: HashMap::from([(b"aa".to_vec(), DhtRequest::Bootstrap)]),
+            outstanding: HashMap::from([(
+                b"aa".to_vec(),
+                OutstandingQuery {
+                    addr: SocketAddr::from(queried),
+                    request: DhtRequest::Bootstrap,
+                    sent_at: Instant::now(),
+                },
+            )]),
             queried_nodes: HashMap::from([(info_hash, HashSet::from([queried]))]),
             torrents: HashMap::from([(info_hash, cmd_tx)]),
             announced_peers: HashMap::from([(info_hash, vec![announced])]),
@@ -913,7 +1050,14 @@ mod tests {
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
             next_tx: 1,
-            outstanding: HashMap::from([(b"gp".to_vec(), DhtRequest::GetPeers(info_hash))]),
+            outstanding: HashMap::from([(
+                b"gp".to_vec(),
+                OutstandingQuery {
+                    addr: "127.0.0.1:6001".parse().unwrap(),
+                    request: DhtRequest::GetPeers(info_hash),
+                    sent_at: Instant::now(),
+                },
+            )]),
             queried_nodes: HashMap::new(),
             torrents: HashMap::from([(info_hash, cmd_tx)]),
             announced_peers: HashMap::new(),
@@ -938,5 +1082,154 @@ mod tests {
             }
             other => panic!("unexpected torrent command: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn response_from_wrong_source_address_is_ignored() {
+        // TNG-019: a response claiming a transaction id we really did send,
+        // but arriving from a different address than the one we sent it
+        // to, must not be treated as real -- otherwise any off-path
+        // attacker who guesses/observes a transaction id could inject
+        // forged peers/nodes from anywhere.
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let socket = UdpSocket::from_std(socket).unwrap();
+        let local_id = NodeId::from_bytes([1; 20]);
+        let remote_id = NodeId::from_bytes([2; 20]);
+        let info_hash = [9; 20];
+        let queried_addr: SocketAddr = "127.0.0.1:6001".parse().unwrap();
+        let spoofed_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let discovered_peer: SocketAddr = "127.0.0.1:51413".parse().unwrap();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
+        let mut task = DhtTask {
+            local_id,
+            table: RoutingTable::new(local_id),
+            socket,
+            listen_port: 6881,
+            bootstrap_nodes: Vec::new(),
+            next_tx: 1,
+            outstanding: HashMap::from([(
+                b"gp".to_vec(),
+                OutstandingQuery {
+                    addr: queried_addr,
+                    request: DhtRequest::GetPeers(info_hash),
+                    sent_at: Instant::now(),
+                },
+            )]),
+            queried_nodes: HashMap::new(),
+            torrents: HashMap::from([(info_hash, cmd_tx)]),
+            announced_peers: HashMap::new(),
+            last_full_lookup: HashMap::new(),
+        };
+        let response = KrpcMessage::Response {
+            transaction_id: b"gp".to_vec(),
+            response: DhtResponse {
+                id: remote_id,
+                nodes: Vec::new(),
+                values: vec![discovered_peer],
+                token: None,
+            },
+        };
+
+        task.handle_packet(&response.encode(), spoofed_addr).await;
+
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "a spoofed response must not be forwarded as discovered peers"
+        );
+        assert_eq!(
+            task.table.total_nodes(),
+            0,
+            "a spoofed response must not be merged into the routing table"
+        );
+        assert_eq!(
+            task.outstanding.len(),
+            1,
+            "the real outstanding query must remain pending, not be consumed by a spoofed reply"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_with_unknown_transaction_id_is_ignored() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let socket = UdpSocket::from_std(socket).unwrap();
+        let local_id = NodeId::from_bytes([1; 20]);
+        let remote_id = NodeId::from_bytes([2; 20]);
+        let mut task = DhtTask {
+            local_id,
+            table: RoutingTable::new(local_id),
+            socket,
+            listen_port: 6881,
+            bootstrap_nodes: Vec::new(),
+            next_tx: 1,
+            outstanding: HashMap::new(),
+            queried_nodes: HashMap::new(),
+            torrents: HashMap::new(),
+            announced_peers: HashMap::new(),
+            last_full_lookup: HashMap::new(),
+        };
+        let response = KrpcMessage::Response {
+            transaction_id: b"zz".to_vec(),
+            response: DhtResponse {
+                id: remote_id,
+                nodes: Vec::new(),
+                values: Vec::new(),
+                token: None,
+            },
+        };
+
+        task.handle_packet(&response.encode(), "127.0.0.1:9999".parse().unwrap())
+            .await;
+
+        assert_eq!(
+            task.table.total_nodes(),
+            0,
+            "an unsolicited response must not be merged into the routing table"
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_stale_outstanding_removes_expired_entries_only() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let socket = UdpSocket::from_std(socket).unwrap();
+        let local_id = NodeId::from_bytes([1; 20]);
+        let addr: SocketAddr = "127.0.0.1:6001".parse().unwrap();
+        let mut task = DhtTask {
+            local_id,
+            table: RoutingTable::new(local_id),
+            socket,
+            listen_port: 6881,
+            bootstrap_nodes: Vec::new(),
+            next_tx: 1,
+            outstanding: HashMap::from([
+                (
+                    b"old".to_vec(),
+                    OutstandingQuery {
+                        addr,
+                        request: DhtRequest::Bootstrap,
+                        sent_at: Instant::now() - OUTSTANDING_QUERY_TTL - Duration::from_secs(1),
+                    },
+                ),
+                (
+                    b"new".to_vec(),
+                    OutstandingQuery {
+                        addr,
+                        request: DhtRequest::Bootstrap,
+                        sent_at: Instant::now(),
+                    },
+                ),
+            ]),
+            queried_nodes: HashMap::new(),
+            torrents: HashMap::new(),
+            announced_peers: HashMap::new(),
+            last_full_lookup: HashMap::new(),
+        };
+
+        task.prune_stale_outstanding();
+
+        assert_eq!(task.outstanding.len(), 1);
+        assert!(task.outstanding.contains_key(b"new".as_slice()));
     }
 }
