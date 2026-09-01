@@ -2494,70 +2494,81 @@ pub async fn bulk_action(
         })
         .into_response();
     }
+    // Each backend call is one XMLRPC round-trip over a freshly-opened
+    // socket; run them concurrently (bounded) instead of one at a time --
+    // a few thousand torrents took over two minutes sequentially, which
+    // both feels broken and, combined with a status-sorted view reshuffling
+    // mid-operation, looks like the action silently isn't working.
+    const BULK_CONCURRENCY: usize = 32;
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(BULK_CONCURRENCY));
+    let category = category.map(str::to_owned);
+    let save_path = save_path.map(str::to_owned);
+    let mut set = tokio::task::JoinSet::new();
+    for hash in body.hashes.clone() {
+        let sem = semaphore.clone();
+        let state = s.clone();
+        let action = action.clone();
+        let category = category.clone();
+        let save_path = save_path.clone();
+        set.spawn(async move {
+            let _permit = sem.acquire_owned().await.expect("semaphore never closed");
+            let res: anyhow::Result<()> = match action.as_str() {
+                "start" => state.backend.start(&hash).await,
+                "stop" => state.backend.stop(&hash).await,
+                "recheck" => state.backend.recheck(&hash).await,
+                "reannounce" => state.backend.reannounce(&hash).await,
+                "set-category" => {
+                    let category = category.as_deref().expect("category was validated");
+                    match state.db.exists(&hash) {
+                        Ok(true) => {}
+                        Ok(false) => return (hash, Err(anyhow::anyhow!("not found"))),
+                        Err(e) => return (hash, Err(e)),
+                    }
+                    if let Err(e) = state.db.set_torrent_category(&hash, category) {
+                        return (hash, Err(e));
+                    }
+                    state.backend.set_category(&hash, category).await
+                }
+                "set-location" => {
+                    let save_path = save_path.as_deref().expect("save_path was validated");
+                    match state.db.exists(&hash) {
+                        Ok(true) => {}
+                        Ok(false) => return (hash, Err(anyhow::anyhow!("not found"))),
+                        Err(e) => return (hash, Err(e)),
+                    }
+                    match state.backend.set_location(&hash, save_path).await {
+                        Ok(()) => {
+                            if let Err(e) = state.db.set_torrent_location(&hash, save_path) {
+                                return (hash, Err(e));
+                            }
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                _ => unreachable!("bulk action was validated"),
+            };
+            match res {
+                Ok(_) => {
+                    update_cached_lifecycle_state(&state, &hash, &action);
+                    emit_torrent_updated(&state, &hash);
+                    if action == "set-category" {
+                        emit(&state, Event::CategoriesUpdated);
+                    }
+                    (hash, Ok(()))
+                }
+                Err(e) => (hash, Err(e)),
+            }
+        });
+    }
+
     let mut applied = Vec::new();
     let mut errors = Vec::new();
-    for hash in &body.hashes {
-        let res = match action.as_str() {
-            "start" => s.backend.start(hash).await,
-            "stop" => s.backend.stop(hash).await,
-            "recheck" => s.backend.recheck(hash).await,
-            "reannounce" => s.backend.reannounce(hash).await,
-            "set-category" => {
-                let category = category.expect("category was validated");
-                match s.db.exists(hash) {
-                    Ok(true) => {
-                        if let Err(e) = s.db.set_torrent_category(hash, category) {
-                            errors.push(format!("{hash}: {e}"));
-                            continue;
-                        }
-                    }
-                    Ok(false) => {
-                        errors.push(format!("{hash}: not found"));
-                        continue;
-                    }
-                    Err(e) => {
-                        errors.push(format!("{hash}: {e}"));
-                        continue;
-                    }
-                }
-                s.backend.set_category(hash, category).await
-            }
-            "set-location" => {
-                let save_path = save_path.expect("save_path was validated");
-                match s.db.exists(hash) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        errors.push(format!("{hash}: not found"));
-                        continue;
-                    }
-                    Err(e) => {
-                        errors.push(format!("{hash}: {e}"));
-                        continue;
-                    }
-                }
-                match s.backend.set_location(hash, save_path).await {
-                    Ok(()) => {
-                        if let Err(e) = s.db.set_torrent_location(hash, save_path) {
-                            errors.push(format!("{hash}: {e}"));
-                            continue;
-                        }
-                        Ok(())
-                    }
-                    Err(e) => Err(e),
-                }
-            }
-            _ => unreachable!("bulk action was validated"),
-        };
-        match res {
-            Ok(_) => {
-                update_cached_lifecycle_state(&s, hash, &action);
-                emit_torrent_updated(&s, hash);
-                if action == "set-category" {
-                    emit(&s, Event::CategoriesUpdated);
-                }
-                applied.push(hash.clone());
-            }
-            Err(e) => errors.push(format!("{hash}: {e}")),
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok((hash, Ok(()))) => applied.push(hash),
+            Ok((hash, Err(e))) => errors.push(format!("{hash}: {e}")),
+            Err(join_err) => errors.push(format!("task panicked: {join_err}")),
         }
     }
     Json(BulkResult {

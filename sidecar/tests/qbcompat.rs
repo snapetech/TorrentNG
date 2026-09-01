@@ -2091,6 +2091,39 @@ async fn bulk_dry_run() {
 }
 
 #[tokio::test]
+async fn bulk_stop_processes_every_hash_exactly_once_concurrently() {
+    // bulk_action() runs one task per hash under a bounded semaphore instead
+    // of a sequential loop -- this guards against a concurrency bug losing
+    // or duplicating results. The backend here points at a nonexistent
+    // socket, so every call fails, but every one of the 200 hashes must
+    // still show up exactly once, in applied+errors combined.
+    let (addr, client) = spawn_server().await;
+    let hashes: Vec<String> = (0..200).map(|i| format!("hash{i:04}")).collect();
+    let res = client
+        .post(url(addr, "/api/v1/bulk/stop"))
+        .json(&serde_json::json!({ "hashes": hashes, "dry_run": false }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let applied = body["applied"].as_array().unwrap();
+    let errors = body["errors"].as_array().unwrap();
+    assert_eq!(applied.len() + errors.len(), 200);
+
+    let mut seen: std::collections::HashSet<String> = applied
+        .iter()
+        .map(|v| v.as_str().unwrap().to_owned())
+        .collect();
+    for e in errors {
+        let msg = e.as_str().unwrap();
+        let hash = msg.split(':').next().unwrap().to_owned();
+        seen.insert(hash);
+    }
+    assert_eq!(seen.len(), 200, "every hash must appear exactly once");
+}
+
+#[tokio::test]
 async fn bulk_unknown_action_rejected() {
     let (addr, client) = spawn_server().await;
     let res = client
