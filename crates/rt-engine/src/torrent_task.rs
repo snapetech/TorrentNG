@@ -84,6 +84,30 @@ pub enum TorrentCmd {
     UpdateLimits(EngineTorrentLimits),
     UpdateGlobalLimits(EngineGlobalLimits),
     UpdatePeerExchange(bool),
+    /// TNG-002: stops network activity, disconnects every peer, and drains
+    /// any already-buffered peer events so no further disk write can reach
+    /// `handle_block` after the reply is sent. The caller must hold this
+    /// guarantee for the entire duration of a storage move against this
+    /// torrent's files -- without it, a peer write racing the move could
+    /// write to a path mid-rename, or resurrect a file at the old path
+    /// after the move already deleted it there. Replies with whether the
+    /// torrent was already paused before this call, so the caller can
+    /// restore that state afterward instead of unconditionally resuming.
+    QuiesceForStorageMove {
+        reply: oneshot::Sender<bool>,
+    },
+    /// TNG-002: re-points this task's cached `save_root` (and rebuilds the
+    /// `MountScheduler` bound to it, so device-topology detection and any
+    /// per-path handle-cache state is re-derived for the new location
+    /// rather than staying pinned to the pre-move mount) after a storage
+    /// move committed, then resumes activity unless the torrent was
+    /// already paused before the move began. `new_save_root` is `None`
+    /// when the move failed and rolled back -- the task simply resumes
+    /// unchanged in that case.
+    ResumeAfterStorageMove {
+        new_save_root: Option<PathBuf>,
+        resume_paused: bool,
+    },
     Shutdown,
     /// Peers discovered by DHT.
     NewPeers(Vec<SocketAddr>),
@@ -645,6 +669,57 @@ impl TorrentTask {
                             self.restart_tracker_session();
                             if matches!(self.run_recheck(None).await, RecheckOutcome::Shutdown) {
                                 break;
+                            }
+                        }
+                        TorrentCmd::QuiesceForStorageMove { reply } => {
+                            let was_paused = self.paused;
+                            self.paused = true;
+                            self.announce_stopped().await;
+                            self.shutdown_peers().await;
+                            self.save_fastresume(false).await;
+                            self.set_state(TorrentState::Paused).await;
+                            self.tracker_event = TrackerEvent::Started;
+                            // `shutdown_peers` above terminates every peer
+                            // task, so no *new* PeerEvent can arrive after
+                            // it returns -- but an event already buffered
+                            // in the channel a moment before disconnect
+                            // could still be sitting there. Drop anything
+                            // left so a leftover Block event can't reach
+                            // `handle_block` (and write to disk) after we
+                            // hand back this reply.
+                            while self.peer_event_rx.try_recv().is_ok() {}
+                            let _ = reply.send(was_paused);
+                        }
+                        TorrentCmd::ResumeAfterStorageMove {
+                            new_save_root,
+                            resume_paused,
+                        } => {
+                            if let Some(new_root) = new_save_root {
+                                self.save_root = new_root.clone();
+                                self.storage = MountScheduler::new_for_path(
+                                    StorageRootId::new(),
+                                    &new_root,
+                                    &SchedulerConfig {
+                                        profile: StorageProfile::Unknown,
+                                        resources: Some(self.resources.clone()),
+                                        storage_io: self.storage.io_config().clone(),
+                                        ..Default::default()
+                                    },
+                                );
+                                // Any file-prepared bookkeeping refers to
+                                // handles/allocations at the old path; the
+                                // files now live at a verified-identical
+                                // new path, so start clean rather than
+                                // trust stale state across the move.
+                                self.prepared_files.lock().expect("prepared_files mutex poisoned").clear();
+                            }
+                            if !resume_paused {
+                                self.paused = false;
+                                self.restart_tracker_session();
+                                if matches!(self.run_recheck(None).await, RecheckOutcome::Shutdown)
+                                {
+                                    break;
+                                }
                             }
                         }
                         TorrentCmd::NewPeers(addrs) => {
@@ -2576,6 +2651,37 @@ impl TorrentTask {
                 }
                 Ok(TorrentCmd::AcceptPeer { .. }) => {}
                 Ok(TorrentCmd::AcceptUtpPeer { .. }) => {}
+                Ok(TorrentCmd::QuiesceForStorageMove { reply }) => {
+                    let was_paused = self.paused;
+                    self.paused = true;
+                    self.shutdown_peers().await;
+                    self.announce_stopped().await;
+                    let _ = reply.send(was_paused);
+                    return Some(RecheckOutcome::Paused);
+                }
+                Ok(TorrentCmd::ResumeAfterStorageMove {
+                    new_save_root,
+                    resume_paused,
+                }) => {
+                    if let Some(new_root) = new_save_root {
+                        self.save_root = new_root.clone();
+                        self.storage = MountScheduler::new_for_path(
+                            StorageRootId::new(),
+                            &new_root,
+                            &SchedulerConfig {
+                                profile: StorageProfile::Unknown,
+                                resources: Some(self.resources.clone()),
+                                storage_io: self.storage.io_config().clone(),
+                                ..Default::default()
+                            },
+                        );
+                        self.prepared_files
+                            .lock()
+                            .expect("prepared_files mutex poisoned")
+                            .clear();
+                    }
+                    self.paused = resume_paused;
+                }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return None,
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                     return Some(RecheckOutcome::Shutdown);

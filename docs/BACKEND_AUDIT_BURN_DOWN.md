@@ -139,19 +139,98 @@ descriptor-relative integration coverage where supported.
 
 ### TNG-002 — Storage moves can race active writes
 
-**Status: Open** · **Priority: P0** · **Confidence: high**
+**Status: In progress** · **Priority: P0** · **Confidence: high**
 
-Evidence: `update_torrent_fields_inner` can start a move while the torrent task
-continues writing. Cached handles and task-local storage state remain live while
-the path changes.
+Original evidence: `update_torrent_fields_inner` could start a move while the
+torrent task continued writing. Cached handles and task-local storage state
+remained live while the path changed -- `TorrentTask` caches its `save_root`
+field at spawn time and never updated it, so a running task kept
+reading/writing the *old* path forever after any move, even though the DB's
+own `save_path` had already changed.
 
-Required action: add a storage transition protocol: quiesce/pause writes,
-drain in-flight I/O, execute the move, atomically switch the authoritative path,
-reopen handles, and resume or roll back. The same protocol must cover API
-storage-plan execution and shutdown.
+Verified evidence (this session): a real quiesce/resume protocol now exists
+and is wired into both places a move or other in-place storage operation can
+happen.
 
-Acceptance: move-under-download, move-under-upload, cancellation, crash,
-rollback, and restart tests with no writes to the old path after commit.
+- Two new `TorrentCmd` variants (`crates/rt-engine/src/torrent_task.rs`):
+  `QuiesceForStorageMove { reply: oneshot::Sender<bool> }` disconnects every
+  peer, drains any peer event already buffered in the channel before
+  replying (so a leftover `Block` event from just before disconnect can't
+  still reach `handle_block` after the reply fires), and replies with
+  whether the torrent was already paused beforehand. `ResumeAfterStorageMove
+  { new_save_root: Option<PathBuf>, resume_paused: bool }` re-points
+  `save_root` and rebuilds the `MountScheduler` bound to it (re-running
+  device-topology detection rather than staying pinned to the pre-move
+  mount's profile) when a move committed, clears `prepared_files` (stale
+  bookkeeping from the old location), and resumes activity -- including
+  re-running a recheck -- unless the torrent was paused before the move
+  began. Both commands are also handled inside `pending_recheck_control`
+  (an in-progress recheck is itself a reader that must stop before a move
+  touches its files) and in `metadata_task.rs` (a no-op reply for
+  not-yet-materialized torrents, since there are no files yet to race).
+- `engine.rs`'s `move_torrent_payload_files` (the real save_path-changing
+  path, reached from `update_torrent_fields_inner`) now quiesces the
+  torrent's running task (if any) before calling `execute_storage_plan_job`,
+  and resumes it afterward with `new_save_root: Some(destination)` on
+  success or `None` on failure -- so a failed/rolled-back move leaves the
+  task's cached path untouched.
+- The generic `EngineCmd::ExecuteStoragePlan` handler (backing
+  `POST /api/v1/storage/execute`, which operates on raw filesystem paths
+  and never itself changes a torrent's persisted `save_path`) now quiesces
+  every torrent listed in `affected_torrents` before executing the plan and
+  resumes them all afterward unchanged (`new_save_root: None`) -- this was
+  the "API storage-plan execution" gap the original finding explicitly
+  called out.
+- New test `update_save_path_reroutes_running_task_and_recheck_finds_new_root`
+  (`crates/rt-engine/src/engine.rs`) proves this against a *real* spawned
+  `TorrentTask`, not just the taskless path: a genuinely running task's
+  torrent is moved while active, and a real, correctly SHA-1-hashed payload
+  is placed only at the destination -- the post-move recheck the resume
+  protocol triggers must find it there and reach `Seeding`. Verified this
+  is a real regression test, not a tautology: temporarily reverted the
+  `save_root` reassignment (kept the `MountScheduler` rebuild) and confirmed
+  the test fails with `Downloading` (piece reported missing, read from the
+  stale path) before restoring the real fix.
+- Side finding while building that test, fixed as part of this work:
+  `rt-session`'s `TorrentEntry::transition` table (`crates/rt-session/src/torrent.rs`)
+  had no `(Seeding, Checking)` or `(Seeding, Downloading)` entries. Since
+  `set_state` discards `transition()`'s `Result` (`let _ = entry.transition(state)`),
+  rechecking an already-seeding torrent -- via the pre-existing
+  `TorrentCmd::Recheck` command, not just this session's new code -- could
+  never have its outcome reflected in the registry: the state field stayed
+  stuck on stale `Seeding` no matter what the recheck actually found. Added
+  the two transitions plus regression test `seeding_torrent_can_be_rechecked`.
+- Full workspace `cargo test --workspace --all-targets --locked`,
+  `cargo fmt --all -- --check`, and
+  `cargo clippy --workspace --all-targets --locked -- -D warnings` all green
+  (`rt-engine` 127 tests, up from 126; `rt-session` 19, up from 18).
+  `cargo test --manifest-path sidecar/Cargo.toml --locked` unaffected (75
+  passed).
+
+Not yet evidenced (why this stays "In progress", not "Resolved"): the
+acceptance list's move-under-upload/move-under-download tests with a real
+*active peer connection* transferring blocks during the move are not
+covered -- the new test proves the task's cached path is correctly
+re-pointed and a post-move recheck is correctly triggered, but doesn't
+drive it through a live peer-wire handshake concurrently with the move
+(no such loopback-peer test harness exists yet in this crate to reuse).
+Cancellation, crash-mid-move, and restart-after-interrupted-move tests are
+also still missing -- `execute_storage_plan_with_checkpoints` already
+supports resuming from a partial `completed_steps` list (pre-existing), but
+nothing exercises quiesce/resume specifically across a daemon restart.
+`TorrentCmd::Shutdown` itself is not yet integrated with this protocol (a
+shutdown racing an in-flight move is a distinct, still-open scenario).
+
+Required action (remaining): a live-peer move-under-transfer test (needs a
+loopback peer-wire harness); cancellation and crash/restart tests around an
+in-flight move; decide whether `Shutdown` should itself quiesce/wait on any
+in-flight storage-plan execution rather than racing it.
+
+Acceptance: move-under-download (missing), move-under-upload (missing),
+cancellation (missing), crash (missing), rollback (done -- see TNG-003's
+rollback-failure-surfacing work, which this protocol also benefits from),
+and restart (missing) tests with no writes to the old path after commit
+(done for the quiesce/resume window itself).
 
 ### TNG-003 — Copy verification and rollback semantics are too weak
 
@@ -858,6 +937,7 @@ claims:
 | 2026-09-01 | First remediation tranche (same-day, prior session): started TNG-004/005/006/007/009/012/015/016/017/018/021/023/024/025/028 work; new `network_budget.rs`, `egress_policy` wiring, per-facade auth guards, shutdown reply channels, capability-honesty downgrades, CI native-quality job. Left uncommitted with a hung test suite and 2 known-failing tests (a partially-applied clippy fix in progress). | Session transcript; working-tree diff at handoff. | Real progress on 15 items, but unverified and non-buildable as a checkpoint. |
 | 2026-09-01 | Second session: resumed from the exact handoff point (verified via file content match + no live cargo process), found and fixed a livelock in `network_budget`'s rate limiter (`std::time::Instant` instead of `tokio::time::Instant`, invisible to production but hung the *entire* `cargo test --workspace` under `start_paused` tests), fixed 4 tests asserting old pre-honesty-fix behavior, fixed 1 test-fixture bug (piece-count mismatch, caught by real new validation), fixed 2 clippy findings, corrected both `rust-version` fields from an unverified/untrue "1.80" to the real verified floor (1.88 main, 1.97 sidecar -- transitive-dependency-driven, not first-party code). Independently spot-verified ~10 of the prior session's specific implementation claims against the actual diff rather than trusting the transcript narration (one self-correction recorded in TNG-009's note: initially misread upload rate-limiting as unwired due to an incomplete grep, corrected after checking the real send path). Updated 15 ledger items from Open to In progress or Resolved with cited evidence and explicit gaps; left 14 untouched items (TNG-001/002/003/008/010/011/013/014/019/020/022/026/027/029) as Open -- no work found on any of them; a closer pass then found real TNG-001 evidence that a first look missed and corrected its status. | `cargo test --workspace --all-targets --locked` (green, was hanging), `cargo fmt --all -- --check` (green), `cargo clippy --workspace --all-targets --locked -- -D warnings` (green), `cargo +1.88 test --workspace ...` (green), `cargo +1.97 test --manifest-path sidecar/Cargo.toml ...` (green), `cargo test --manifest-path sidecar/Cargo.toml --locked` (green, 75 passed). | Tree is a real, buildable, green checkpoint for the first time since remediation began. TNG-021 fully Resolved; other items moved Open -> In progress with specific verified evidence and specific remaining gaps recorded per item, so a future session can resume without re-deriving what's already true. Committed as `a479bf0`. |
 | 2026-09-01 | Third session (same date, continuing "build it all out"): implemented TNG-003's two headline complaints for real. Added streaming SHA-1 content verification (`verify_content_matches`/`hash_file_sha1` in `crates/rt-storage/src/plan.rs`) so `copy_verify()` no longer trusts aggregate length alone. Rewrote `rollback_plan()` to return both succeeded and *failed* rollback steps (previously a failed rollback step was silently dropped via `.is_ok()`); failures are folded into the returned `StorageError` message since that is the only channel the existing caller (`engine.rs`'s `execute_storage_plan_job`) reads. Added `StoragePlanExecution::rollback_failures` + `rollback_fully_succeeded()`. Wrote two new targeted tests: a same-length bit-flip that length-only verification would have missed, and a rollback step that itself fails being surfaced in the error while the other rollback step still runs. | `cargo build -p rt-storage` (clean), `cargo test -p rt-storage --lib` (111 passed, up from 109, 0 failed), full `cargo test --workspace --all-targets --locked` (green), `cargo fmt --all -- --check` (green), `cargo clippy --workspace --all-targets --locked -- -D warnings` (green). | TNG-003 moved Open -> In progress (not Resolved: permission-failure, destination-full, resume-after-interruption, and idempotent-retry tests from its acceptance list are still missing -- see item detail). |
+| 2026-09-01 | Fourth session (same date, continuing "build it all out"): implemented TNG-002's quiesce/resume storage-transition protocol. New `TorrentCmd::QuiesceForStorageMove`/`ResumeAfterStorageMove` in `crates/rt-engine/src/torrent_task.rs`, handled in the main actor loop, inside `pending_recheck_control` (an in-progress recheck reads files too), and in `metadata_task.rs` (no-op for not-yet-materialized torrents). `engine.rs`'s `move_torrent_payload_files` and the generic `EngineCmd::ExecuteStoragePlan` handler (`POST /api/v1/storage/execute`) both now quiesce affected running tasks before touching files and resume them afterward. Wrote a real regression test using a genuinely spawned `TorrentTask` (not the taskless path) proving a live task's cached save_root is correctly re-pointed after a move and a post-move recheck finds the content at the new location -- verified this actually catches the bug by temporarily reverting the fix and confirming the test fails (`Downloading` instead of `Seeding`) before restoring it. While building that test, found and fixed a real, separate, pre-existing bug: `rt-session`'s state machine had no `(Seeding, Checking)`/`(Seeding, Downloading)` transitions, so rechecking an already-seeding torrent via the *existing* `TorrentCmd::Recheck` command could never have its outcome reflected in the registry (`set_state` silently discards `transition()`'s `Result`). Fixed with a regression test. | `cargo test -p rt-engine -p rt-session --lib` (rt-engine 127 passed, up from 126; rt-session 19, up from 18; 0 failed), full `cargo test --workspace --all-targets --locked` (green), `cargo fmt --all -- --check` (green), `cargo clippy --workspace --all-targets --locked -- -D warnings` (green), `cargo test --manifest-path sidecar/Cargo.toml --locked` (green, 75 passed, unaffected). | TNG-002 moved Open -> In progress (not Resolved: live-peer move-under-transfer, cancellation, crash/restart tests still missing -- see item detail). Uncovered and fixed an independent state-machine bug along the way (recheck-of-seeding-torrent outcome was unobservable), which also directly strengthens TNG-002's and TNG-003's own recheck-after-move safety net. |
 
 ## Release gate
 

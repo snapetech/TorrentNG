@@ -1324,12 +1324,25 @@ impl Engine {
                 completed_steps,
                 reply,
             } => {
+                // TNG-002: this generic executor operates on raw
+                // filesystem paths and never changes a torrent's
+                // persisted save_path itself (that's
+                // `move_torrent_payload_files`'s job), but it can still
+                // rename/copy/delete files a running task's peers or an
+                // in-progress recheck are actively touching. Quiesce
+                // every torrent this plan claims to affect first, and
+                // resume each one unchanged afterward regardless of
+                // outcome.
+                let quiesced = self
+                    .quiesce_torrents_for_storage_plan(&affected_torrents)
+                    .await;
                 let result = self.execute_storage_plan_job(
                     &operation,
                     affected_torrents,
                     &plan,
                     completed_steps,
                 );
+                self.resume_torrents_after_storage_plan(quiesced).await;
                 let _ = reply.send(result);
             }
             EngineCmd::ListJobs { reply } => {
@@ -2469,7 +2482,8 @@ impl Engine {
         let meta = load_meta_from_blob(&self.config, info_hash).ok();
         if let (Some(target), Some(meta)) = (&target_save_path, meta.as_ref()) {
             if *target != current_save_path {
-                self.move_torrent_payload_files(info_hash, &current_save_path, target, meta)?;
+                self.move_torrent_payload_files(info_hash, &current_save_path, target, meta)
+                    .await?;
             }
         }
 
@@ -2512,7 +2526,7 @@ impl Engine {
         Ok(())
     }
 
-    fn move_torrent_payload_files(
+    async fn move_torrent_payload_files(
         &self,
         info_hash: &str,
         source_root: &std::path::Path,
@@ -2553,8 +2567,98 @@ impl Engine {
             steps,
             rollback_steps,
         };
-        self.execute_storage_plan_job("move", vec![info_hash.to_owned()], &plan, Vec::new())?;
-        Ok(())
+
+        // TNG-002: a running task's writes (and, during a recheck, its
+        // reads) must stop before any file under `source_root` is
+        // touched -- otherwise a peer write or an in-progress recheck can
+        // race the move: writing into a half-renamed path, or reading a
+        // file that briefly doesn't exist mid-rename. Quiescing also
+        // guarantees the task isn't holding any assumption about the old
+        // path across the move; `ResumeAfterStorageMove` re-points it at
+        // the new one (or leaves it untouched on failure) once the plan
+        // has actually finished.
+        let quiesced = self.quiesce_torrent_for_storage_move(info_hash).await;
+        let result =
+            self.execute_storage_plan_job("move", vec![info_hash.to_owned()], &plan, Vec::new());
+        let new_save_root = if result.is_ok() {
+            Some(destination_root.to_path_buf())
+        } else {
+            None
+        };
+        self.resume_torrent_after_storage_move(info_hash, quiesced, new_save_root)
+            .await;
+        result.map(|_| ())
+    }
+
+    /// Quiesces the running task for `info_hash` before a storage move, if
+    /// one exists. Returns `Some(was_already_paused)` when a task was
+    /// quiesced (the caller must resume it afterward via
+    /// `resume_torrent_after_storage_move`), or `None` when there is no
+    /// running task -- nothing to quiesce, and correspondingly nothing to
+    /// resume.
+    async fn quiesce_torrent_for_storage_move(&self, info_hash: &str) -> Option<bool> {
+        let tx = self.torrent_chans.get(info_hash).cloned()?;
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        if tx
+            .send(TorrentCmd::QuiesceForStorageMove { reply })
+            .await
+            .is_err()
+        {
+            return None;
+        }
+        rx.await.ok()
+    }
+
+    /// Resumes a task previously quiesced by
+    /// `quiesce_torrent_for_storage_move`. `new_save_root` should be
+    /// `Some(destination)` when the move committed, `None` when it failed
+    /// or was rolled back, so the task keeps using its original path
+    /// unchanged. A no-op if `quiesced` is `None` (nothing was quiesced).
+    async fn resume_torrent_after_storage_move(
+        &self,
+        info_hash: &str,
+        quiesced: Option<bool>,
+        new_save_root: Option<std::path::PathBuf>,
+    ) {
+        let Some(was_paused) = quiesced else {
+            return;
+        };
+        if let Some(tx) = self.torrent_chans.get(info_hash).cloned() {
+            let _ = tx
+                .send(TorrentCmd::ResumeAfterStorageMove {
+                    new_save_root,
+                    resume_paused: was_paused,
+                })
+                .await;
+        }
+    }
+
+    /// Quiesces every torrent in `info_hashes` that currently has a
+    /// running task, for the duration of a generic (non-save-path-owning)
+    /// storage plan execution. Returns the `(info_hash, was_already_paused)`
+    /// pairs that actually got quiesced, for `resume_torrents_after_storage_plan`.
+    async fn quiesce_torrents_for_storage_plan(
+        &self,
+        info_hashes: &[String],
+    ) -> Vec<(String, bool)> {
+        let mut quiesced = Vec::with_capacity(info_hashes.len());
+        for info_hash in info_hashes {
+            if let Some(was_paused) = self.quiesce_torrent_for_storage_move(info_hash).await {
+                quiesced.push((info_hash.clone(), was_paused));
+            }
+        }
+        quiesced
+    }
+
+    /// Resumes every torrent previously quiesced by
+    /// `quiesce_torrents_for_storage_plan`. This generic executor never
+    /// changes a torrent's canonical save_path, so every resume carries
+    /// `new_save_root: None`.
+    async fn resume_torrents_after_storage_plan(&self, quiesced: Vec<(String, bool)>) {
+        for (info_hash, was_paused) in quiesced {
+            self.resume_torrent_after_storage_move(&info_hash, Some(was_paused), None)
+                .await;
+        }
     }
 
     async fn update_torrent_trackers_inner(
@@ -4922,6 +5026,33 @@ mod tests {
         encode(&BValue::Dict(pairs))
     }
 
+    /// Like `raw_single_file_torrent`, but with a real piece hash computed
+    /// from `content` (which must fit in one 16KiB piece) instead of a
+    /// placeholder -- lets a test prove a recheck actually reads real bytes
+    /// from a real path, rather than only checking file presence.
+    fn raw_single_file_torrent_with_content(content: &[u8]) -> Vec<u8> {
+        let mut hasher = Sha1::new();
+        hasher.update(content);
+        let piece_hash: [u8; 20] = hasher.finalize().into();
+        let mut info_pairs: Vec<(&[u8], BValue<'_>)> = vec![
+            (b"length", BValue::Int(content.len() as i64)),
+            (b"name", BValue::Bytes(b"restore.bin")),
+            (b"piece length", BValue::Int(16_384)),
+            (b"pieces", BValue::Bytes(&piece_hash)),
+        ];
+        info_pairs.sort_by(|a, b| a.0.cmp(b.0));
+        let info = BValue::Dict(info_pairs);
+        let mut pairs: Vec<(&[u8], BValue<'_>)> = vec![
+            (
+                b"announce",
+                BValue::Bytes(b"http://tracker.example.com/announce"),
+            ),
+            (b"info", info),
+        ];
+        pairs.sort_by(|a, b| a.0.cmp(b.0));
+        encode(&BValue::Dict(pairs))
+    }
+
     fn raw_v2_torrent() -> Vec<u8> {
         raw_v2_torrent_with_root([0xAB; 32], 65_536)
     }
@@ -6527,6 +6658,143 @@ mod tests {
             entry.save_path,
             destination_root.to_string_lossy().to_string()
         );
+    }
+
+    #[tokio::test]
+    async fn update_save_path_reroutes_running_task_and_recheck_finds_new_root() {
+        // TNG-002: a running TorrentTask caches its save_root at spawn time.
+        // Before this fix, moving a torrent's files while its task was
+        // still running left that cached field stale -- the task kept
+        // reading/writing the OLD path forever after a move, even though
+        // the files (and the DB's own save_path) had already moved. Prove
+        // the fix by giving a *running* task's torrent a real, correctly
+        // hashed payload only reachable via the new path after the move,
+        // and checking that a post-move recheck actually finds it there.
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.daemon.session_dir = temp.path().join("session");
+        config.db.path = temp.path().join("state.db");
+        config.storage.download_dir = temp.path().to_path_buf();
+        std::fs::create_dir_all(torrent_blob_dir(&config)).unwrap();
+        std::fs::create_dir_all(fastresume_dir(&config)).unwrap();
+
+        let content = vec![9u8; 1024];
+        let raw = raw_single_file_torrent_with_content(&content);
+        let TorrentMeta::V1(meta) = parse_torrent(&raw).unwrap() else {
+            panic!("expected v1 torrent");
+        };
+        let info_hash = meta
+            .info_hash
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        std::fs::write(torrent_blob_path(&config, &info_hash), &raw).unwrap();
+
+        let source_root = temp.path().join("old");
+        let destination_root = temp.path().join("new");
+        std::fs::create_dir_all(&source_root).unwrap();
+        std::fs::write(source_root.join("restore.bin"), &content).unwrap();
+
+        let conn = Connection::open(config.db_path()).unwrap();
+        rt_db::migrate(&conn).unwrap();
+        register_configured_storage(&conn, &config).unwrap();
+        rt_db::upsert(
+            &conn,
+            &TorrentRow {
+                info_hash: info_hash.clone(),
+                name: meta.name.clone(),
+                total_length: meta.total_length() as i64,
+                piece_length: meta.piece_length as i64,
+                piece_count: meta.pieces.len() as i64,
+                is_private: false,
+                save_path: source_root.to_string_lossy().to_string(),
+                category: None,
+                tags: vec![],
+                // Not paused: the task starts genuinely active (it will
+                // run its own startup recheck against the real content at
+                // source_root and reach Seeding before the move even
+                // starts), so quiescing it for the move exercises a real
+                // running task, not a dormant one -- and because it was
+                // not paused beforehand, `was_paused` comes back false and
+                // the post-move resume triggers its own recheck too.
+                state: "seeding".to_owned(),
+                added_at: 10,
+                completed_at: None,
+                uploaded: 0,
+                downloaded: 0,
+                ratio: 0.0,
+                trackers: meta.all_trackers(),
+            },
+        )
+        .unwrap();
+
+        let (_tx, rx) = mpsc::channel(1);
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        let mut engine = Engine {
+            config: Arc::new(config),
+            registry: Arc::clone(&registry),
+            db: Arc::new(Mutex::new(conn)),
+            cmd_rx: rx,
+            cmd_tx: mpsc::channel(1).0,
+            torrent_chans: HashMap::new(),
+            torrent_tasks: HashMap::new(),
+            dht_tx: None,
+            resources: test_resource_governor(),
+            network_budget: GlobalNetworkBudget::unlimited(),
+            shutdown_reply: None,
+        };
+
+        engine.load_persisted_torrents().await.unwrap();
+        assert!(
+            engine.torrent_chans.contains_key(&info_hash),
+            "a live task must be running for this test to exercise the quiesce/resume protocol"
+        );
+
+        engine
+            .update_torrent_fields_inner(&info_hash, None, Some(destination_root.clone()))
+            .await
+            .unwrap();
+
+        assert!(!source_root.join("restore.bin").exists());
+        assert_eq!(
+            std::fs::read(destination_root.join("restore.bin")).unwrap(),
+            content
+        );
+
+        // `ResumeAfterStorageMove` (which the move above sent as its last
+        // step) is fire-and-forget from the engine's perspective, and it
+        // triggers a recheck inside the task before that recheck's result
+        // is visible here. In this test's flow, `Paused` and `Checking`
+        // are always transient (quiescing sets Paused, the resume's own
+        // recheck sets Checking while it runs) -- the only states a
+        // successful post-move recheck can settle on are `Seeding`
+        // (complete) or `Downloading` (found something invalid/missing).
+        // Poll the shared registry, the same way a real client would,
+        // ignoring the known-transient states rather than guessing at a
+        // fixed delay.
+        let final_state = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let state = registry.read().await.get(&info_hash).unwrap().state;
+                if !matches!(state, TorrentState::Paused | TorrentState::Checking) {
+                    return state;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("recheck after the move did not settle within the timeout");
+
+        assert_eq!(
+            final_state,
+            TorrentState::Seeding,
+            "recheck after the move should find the real content at the NEW save_root and mark \
+             the torrent complete; if the running task's cached save_root had not been updated, \
+             the file would be missing at the (now-empty) old path and this would stay incomplete"
+        );
+
+        if let Some(tx) = engine.torrent_chans.remove(&info_hash) {
+            let _ = tx.send(TorrentCmd::Shutdown).await;
+        }
     }
 
     #[tokio::test]

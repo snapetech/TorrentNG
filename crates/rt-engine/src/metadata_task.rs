@@ -220,6 +220,20 @@ pub async fn run_metadata_task(
                     TorrentCmd::GetRuntimeStats { reply } => {
                         let _ = reply.send(Default::default());
                     }
+                    TorrentCmd::QuiesceForStorageMove { reply } => {
+                        // No metadata (and therefore no files) exist yet
+                        // for a torrent still in this pre-metadata state,
+                        // so there is nothing on disk a move could race --
+                        // reply immediately with the current paused state.
+                        let _ = reply.send(paused);
+                    }
+                    TorrentCmd::ResumeAfterStorageMove { resume_paused, .. } => {
+                        paused = resume_paused;
+                        if !resume_paused {
+                            tracker_event = TrackerEvent::Started;
+                            tracker_tick.reset_immediately();
+                        }
+                    }
                     TorrentCmd::Recheck { .. }
                     | TorrentCmd::CancelJob { .. }
                     | TorrentCmd::ReloadFilePolicy

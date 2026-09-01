@@ -111,6 +111,17 @@ impl TorrentEntry {
             (TorrentState::Seeding, TorrentState::Paused) => true,
             (TorrentState::Seeding, TorrentState::Stopped) => true,
             (TorrentState::Seeding, TorrentState::Error) => true,
+            // A recheck can be run against an already-seeding torrent (the
+            // existing `TorrentCmd::Recheck` command permits this
+            // regardless of current state, and TNG-002's post-storage-move
+            // recheck relies on it too): without these, `set_state`'s
+            // `entry.transition(...)` call was silently rejected the
+            // instant a recheck of a seeding torrent tried to report
+            // `Checking` or, on finding something invalid, `Downloading`
+            // -- the registry's state field stayed stuck on the stale
+            // `Seeding` value no matter what the recheck actually found.
+            (TorrentState::Seeding, TorrentState::Checking) => true,
+            (TorrentState::Seeding, TorrentState::Downloading) => true,
             (TorrentState::Queued, TorrentState::Downloading) => true,
             (TorrentState::Queued, TorrentState::Seeding) => true,
             (TorrentState::Queued, TorrentState::Paused) => true,
@@ -172,6 +183,25 @@ mod tests {
         e.transition(TorrentState::Seeding).unwrap();
         e.transition(TorrentState::Paused).unwrap();
         assert_eq!(e.state, TorrentState::Paused);
+    }
+
+    #[test]
+    fn seeding_torrent_can_be_rechecked() {
+        // A recheck must be able to move a seeding torrent back through
+        // Checking and, if it finds something wrong, to Downloading --
+        // otherwise `set_state`'s silently-discarded `transition()` result
+        // leaves the registry reporting a stale "Seeding" no matter what a
+        // later recheck actually finds (real bug, caught while writing a
+        // TNG-002 test for post-move rechecks).
+        let mut e = entry();
+        e.transition(TorrentState::Checking).unwrap();
+        e.transition(TorrentState::Seeding).unwrap();
+
+        e.transition(TorrentState::Checking).unwrap();
+        assert_eq!(e.state, TorrentState::Checking);
+
+        e.transition(TorrentState::Downloading).unwrap();
+        assert_eq!(e.state, TorrentState::Downloading);
     }
 
     #[test]
