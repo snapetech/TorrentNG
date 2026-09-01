@@ -320,6 +320,17 @@ export function TorrentTable({
 
   const colByKey = useMemo(() => new Map(COLS.map(c => [c.key, c])), [])
 
+  // Type inference off means every row would show the same "disabled"
+  // placeholder -- not a useful column, so hide it (and its toggle in the
+  // Columns menu below) rather than let the user pick a column that can
+  // never show real data. The user's own visibleKeys preference for it is
+  // left untouched, so it reappears automatically if they re-enable inference.
+  const typeColumnUsable = mediaInference !== 'off'
+  const toggleableCols = useMemo(
+    () => COLS.filter(col => !col.required && (col.key !== 'kind' || typeColumnUsable)),
+    [typeColumnUsable],
+  )
+
   const visibleCols = useMemo(() => {
     const visible = new Set(visibleKeys)
     const ordered = order.map(key => colByKey.get(key)).filter((c): c is Col => Boolean(c))
@@ -334,9 +345,9 @@ export function TorrentTable({
     const actions = colByKey.get('actions')!
     const sticky = STICKY_KEYS.slice(1)
       .map(key => colByKey.get(key))
-      .filter((c): c is Col => Boolean(c && visible.has(c.key)))
+      .filter((c): c is Col => Boolean(c && visible.has(c.key) && (c.key !== 'kind' || typeColumnUsable)))
     return [check, ...sticky, ...middle, actions]
-  }, [visibleKeys, order, colByKey])
+  }, [visibleKeys, order, colByKey, typeColumnUsable])
 
   function resolvedWidth(col: Col): string {
     const override = widths[col.key]
@@ -643,9 +654,9 @@ export function TorrentTable({
                   color: 'var(--faint)', fontSize: 11, margin: '2px 4px 7px',
                 }}>
                   <span>Visible columns</span>
-                  <span>{visibleCols.filter(col => !col.required).length}/{COLS.filter(col => !col.required).length}</span>
+                  <span>{visibleCols.filter(col => !col.required).length}/{toggleableCols.length}</span>
                 </div>
-                {COLS.filter(col => !col.required).map(col => (
+                {toggleableCols.map(col => (
                   <label key={col.key} className="tng-column-menu-item" data-active={visibleKeys.includes(col.key) ? 'true' : 'false'} style={{
                     display: 'flex', alignItems: 'center', gap: 8, color: 'var(--text)',
                     fontSize: 12, padding: '4px 3px', cursor: 'pointer',
