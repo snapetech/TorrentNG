@@ -683,7 +683,10 @@ mod multicall_tests {
             results[0].as_ref().unwrap_err(),
             "invalid parameters: invalid target"
         );
-        assert!(results[1].is_ok(), "one fault must not affect the other result");
+        assert!(
+            results[1].is_ok(),
+            "one fault must not affect the other result"
+        );
     }
 
     #[test]

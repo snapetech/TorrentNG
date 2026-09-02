@@ -3,6 +3,7 @@ pub mod auth;
 pub mod backend;
 pub mod cache;
 pub mod config;
+pub mod identity;
 pub mod media_type;
 pub mod metrics;
 pub mod qbcompat;

@@ -283,6 +283,134 @@ impl StoragePlanExecution {
     }
 }
 
+/// Reconcile a durable storage plan with the filesystem before retrying it
+/// after a crash or a database failure. The database checkpoint is an
+/// ordering hint, not proof that the last filesystem syscall was durable:
+/// filesystem state may be ahead of the checkpoint when the process dies
+/// between the syscall and its checkpoint commit.
+///
+/// The returned indexes are safe to pass back to
+/// `execute_storage_plan_under_roots_with_checkpoints`. Ambiguous states are
+/// rejected instead of silently repeating or deleting a file. A completed
+/// copy followed by a completed rename is inferred as a pair when only the
+/// latter is visible in the filesystem.
+pub fn reconcile_storage_plan_under_roots(
+    plan: &StoragePlan,
+    roots: &[PathBuf],
+    checkpointed_steps: &[usize],
+) -> Result<Vec<usize>, StorageError> {
+    ensure_plan_can_apply(plan)?;
+    let roots = canonical_roots(roots)?;
+    validate_plan_paths_under_roots(plan, &roots)?;
+
+    let mut completed = checkpointed_steps.iter().copied().collect::<HashSet<_>>();
+    if let Some(index) = completed
+        .iter()
+        .copied()
+        .find(|index| *index >= plan.steps.len())
+    {
+        return Err(StorageError::StagedMoveFailed {
+            step: "reconcile",
+            reason: format!(
+                "checkpointed storage-plan step {index} is outside plan length {}",
+                plan.steps.len()
+            ),
+        });
+    }
+
+    // First classify each step from its own source/destination state. Then
+    // repeat the inference pass because a plan can contain more than one
+    // copy/rename pair.
+    loop {
+        let mut changed = false;
+        for (index, step) in plan.steps.iter().enumerate() {
+            if completed.contains(&index) {
+                continue;
+            }
+            if storage_step_is_applied(step)? {
+                completed.insert(index);
+                changed = true;
+                continue;
+            }
+            // A later rename can prove that its immediately preceding copy
+            // already happened even when the staging path has disappeared.
+            if let Some(next) = plan.steps.get(index + 1) {
+                if completed.contains(&(index + 1))
+                    && matches!(step.action, PlannedStorageAction::CopyVerifyRename)
+                    && step.destination == next.source
+                {
+                    completed.insert(index);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut completed = completed.into_iter().collect::<Vec<_>>();
+    completed.sort_unstable();
+    Ok(completed)
+}
+
+fn storage_step_is_applied(step: &StoragePlanStep) -> Result<bool, StorageError> {
+    let source = required_path(step.source.as_ref(), "reconcile-source")?;
+    let destination = step.destination.as_deref();
+    match step.action {
+        PlannedStorageAction::Rename => {
+            let destination = destination.ok_or_else(|| StorageError::StagedMoveFailed {
+                step: "reconcile-destination",
+                reason: "missing path".to_owned(),
+            })?;
+            let source_exists = path_exists_no_follow(source);
+            let destination_exists = path_exists_no_follow(destination);
+            if source_exists && destination_exists {
+                return Err(StorageError::StagedMoveFailed {
+                    step: "reconcile",
+                    reason: format!(
+                        "rename has both source and destination present: {} -> {}",
+                        source.display(),
+                        destination.display()
+                    ),
+                });
+            }
+            Ok(!source_exists && destination_exists)
+        }
+        PlannedStorageAction::CopyVerifyRename => {
+            let destination = destination.ok_or_else(|| StorageError::StagedMoveFailed {
+                step: "reconcile-destination",
+                reason: "missing path".to_owned(),
+            })?;
+            if !path_exists_no_follow(destination) {
+                return Ok(false);
+            }
+            // A source that is still present lets us detect a torn or
+            // corrupted staging copy. If the source disappeared, the
+            // destination is still recoverable evidence and the following
+            // plan step determines whether it was a completed rename.
+            if path_exists_no_follow(source) {
+                verify_content_matches(source, destination)?;
+            }
+            Ok(true)
+        }
+        PlannedStorageAction::ImportExisting => {
+            let destination = destination.ok_or_else(|| StorageError::StagedMoveFailed {
+                step: "reconcile-destination",
+                reason: "missing path".to_owned(),
+            })?;
+            if !path_exists_no_follow(destination) {
+                return Ok(false);
+            }
+            if path_exists_no_follow(source) {
+                verify_content_matches(source, destination)?;
+            }
+            Ok(true)
+        }
+        PlannedStorageAction::SafeDelete => Ok(!path_exists_no_follow(source)),
+    }
+}
+
 pub fn execute_storage_plan(plan: &StoragePlan) -> Result<StoragePlanExecution, StorageError> {
     execute_storage_plan_with_checkpoints(plan, &[], |_, _| Ok(()))
 }
@@ -1656,6 +1784,101 @@ mod tests {
         assert!(matches!(
             execute_storage_plan_under_roots(&plan, &[root]),
             Err(StorageError::StagedMoveFailed { step: "path", .. })
+        ));
+    }
+
+    #[test]
+    fn reconcile_detects_rename_committed_before_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.bin");
+        let destination = root.join("destination.bin");
+        std::fs::write(&source, b"data").unwrap();
+        let plan = plan_move(&MovePlanRequest {
+            source,
+            destination: destination.clone(),
+            bytes: 4,
+            available_bytes: None,
+            dry_run: false,
+        });
+
+        execute_storage_plan_under_roots(&plan, std::slice::from_ref(&root)).unwrap();
+
+        assert_eq!(
+            reconcile_storage_plan_under_roots(&plan, std::slice::from_ref(&root), &[]).unwrap(),
+            vec![0]
+        );
+        assert_eq!(std::fs::read(destination).unwrap(), b"data");
+    }
+
+    #[test]
+    fn reconcile_infers_copy_when_following_rename_is_already_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.bin");
+        let staging = root.join(".destination.bin.tng-copying");
+        let destination = root.join("destination.bin");
+        std::fs::write(&source, b"data").unwrap();
+        // Simulate a process dying after the staging file was renamed but
+        // before either checkpoint event reached SQLite.
+        std::fs::write(&destination, b"data").unwrap();
+        let plan = StoragePlan {
+            dry_run: false,
+            can_apply: true,
+            issues: Vec::new(),
+            steps: vec![
+                StoragePlanStep {
+                    action: PlannedStorageAction::CopyVerifyRename,
+                    source: Some(source),
+                    destination: Some(staging.clone()),
+                    bytes: 4,
+                },
+                StoragePlanStep {
+                    action: PlannedStorageAction::Rename,
+                    source: Some(staging),
+                    destination: Some(destination),
+                    bytes: 4,
+                },
+            ],
+            rollback_steps: Vec::new(),
+        };
+
+        assert_eq!(
+            reconcile_storage_plan_under_roots(&plan, std::slice::from_ref(&root), &[]).unwrap(),
+            vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn reconcile_rejects_corrupt_staging_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.bin");
+        let staging = root.join(".destination.bin.tng-copying");
+        std::fs::write(&source, b"source").unwrap();
+        std::fs::write(&staging, b"corrupt").unwrap();
+        let plan = StoragePlan {
+            dry_run: false,
+            can_apply: true,
+            issues: Vec::new(),
+            steps: vec![StoragePlanStep {
+                action: PlannedStorageAction::CopyVerifyRename,
+                source: Some(source),
+                destination: Some(staging),
+                bytes: 6,
+            }],
+            rollback_steps: Vec::new(),
+        };
+
+        assert!(matches!(
+            reconcile_storage_plan_under_roots(&plan, std::slice::from_ref(&root), &[]),
+            Err(StorageError::StagedMoveFailed {
+                step: "verify-content",
+                ..
+            })
         ));
     }
 }

@@ -249,7 +249,10 @@ pub enum TierEvent {
 pub struct TierController<K> {
     policy: TierPolicy,
     tiers: HashMap<K, TorrentActivityTier>,
+    dormant_snapshots: HashMap<K, DormantTorrentSnapshot>,
+    dormant_heap_bytes: usize,
     idle_checks: ActivityTimerWheel<K>,
+    tracker_checks: ActivityTimerWheel<K>,
 }
 
 impl<K> TierController<K>
@@ -260,7 +263,10 @@ where
         Self {
             policy,
             tiers: HashMap::new(),
+            dormant_snapshots: HashMap::new(),
+            dormant_heap_bytes: 0,
             idle_checks: ActivityTimerWheel::default(),
+            tracker_checks: ActivityTimerWheel::default(),
         }
     }
 
@@ -272,13 +278,66 @@ where
         self.tiers.len()
     }
 
+    /// Number of bytes retained by compact dormant projections. This is
+    /// maintained incrementally so exposing scale telemetry does not itself
+    /// scan every dormant torrent.
+    pub fn dormant_heap_bytes(&self) -> usize {
+        self.dormant_heap_bytes
+    }
+
+    pub fn dormant_snapshot(&self, key: &K) -> Option<&DormantTorrentSnapshot> {
+        self.dormant_snapshots.get(key)
+    }
+
+    /// Retain only the small runtime inputs needed to classify or wake a
+    /// dormant torrent. Durable metadata remains in SQLite and is loaded on
+    /// promotion. A non-dormant tier never retains a dormant projection.
+    pub fn set_dormant_snapshot(&mut self, key: K, snapshot: DormantTorrentSnapshot) {
+        self.clear_dormant_snapshot(&key);
+        if self.tier(&key) == Some(TorrentActivityTier::Dormant) {
+            self.dormant_heap_bytes = self
+                .dormant_heap_bytes
+                .saturating_add(snapshot.estimate_heap_bytes());
+            self.dormant_snapshots.insert(key, snapshot);
+        }
+    }
+
+    pub fn clear_dormant_snapshot(&mut self, key: &K) -> Option<DormantTorrentSnapshot> {
+        let snapshot = self.dormant_snapshots.remove(key)?;
+        self.dormant_heap_bytes = self
+            .dormant_heap_bytes
+            .saturating_sub(snapshot.estimate_heap_bytes());
+        Some(snapshot)
+    }
+
     pub fn next_idle_deadline(&self) -> Option<Instant> {
         self.idle_checks.next_deadline()
     }
 
     pub fn remove(&mut self, key: &K) -> Option<TorrentActivityTier> {
         self.idle_checks.cancel(key);
+        self.tracker_checks.cancel(key);
+        self.clear_dormant_snapshot(key);
         self.tiers.remove(key)
+    }
+
+    /// Schedule a persisted tracker deadline for a dormant torrent. Tracker
+    /// deadlines use a separate wheel from activity demotion deadlines so an
+    /// idle seed can remain taskless without losing its next announce.
+    pub fn schedule_tracker_check(&mut self, key: K, deadline: Instant) {
+        self.tracker_checks.schedule(key, deadline);
+    }
+
+    pub fn cancel_tracker_check(&mut self, key: &K) -> bool {
+        self.tracker_checks.cancel(key)
+    }
+
+    pub fn next_tracker_deadline(&self) -> Option<Instant> {
+        self.tracker_checks.next_deadline()
+    }
+
+    pub fn pop_due_tracker_checks(&mut self, now: Instant) -> Vec<K> {
+        self.tracker_checks.pop_due(now)
     }
 
     pub fn apply_input(&mut self, key: K, input: TierInput) -> TierDecision {
@@ -312,6 +371,9 @@ where
 
     fn record_decision(&mut self, key: K, now: Instant, decision: TierDecision) {
         self.tiers.insert(key.clone(), decision.tier);
+        if decision.tier != TorrentActivityTier::Dormant {
+            self.clear_dormant_snapshot(&key);
+        }
         if let Some(delay) = decision.next_idle_check {
             self.idle_checks.schedule(key, now + delay);
         } else {
@@ -749,6 +811,33 @@ mod tests {
     }
 
     #[test]
+    fn dormant_snapshot_is_accounted_and_cleared_on_promotion() {
+        let now = Instant::now();
+        let mut controller = TierController::new(TierPolicy::default());
+        let key = "torrent".to_owned();
+        controller.apply_input(key.clone(), input(TorrentState::Seeding, now));
+        let snapshot = DormantTorrentSnapshot::new(
+            key.clone(),
+            TorrentState::Seeding,
+            CompactPieceBitmap::missing(8192),
+            None,
+            None,
+        );
+        let expected = snapshot.estimate_heap_bytes();
+        controller.set_dormant_snapshot(key.clone(), snapshot);
+        assert_eq!(controller.dormant_heap_bytes(), expected);
+        assert!(controller.dormant_snapshot(&key).is_some());
+
+        controller.apply_event(
+            key.clone(),
+            input(TorrentState::Seeding, now),
+            TierEvent::InboundPeer,
+        );
+        assert_eq!(controller.dormant_heap_bytes(), 0);
+        assert!(controller.dormant_snapshot(&key).is_none());
+    }
+
+    #[test]
     fn scale_snapshot_enforces_100k_two_percent_proxy_budget() {
         let dormant_template = DormantTorrentSnapshot::new(
             "a".repeat(40),
@@ -783,5 +872,52 @@ mod tests {
             ..sample
         };
         assert!(too_many_hot.validate(TierScaleBudget::default()).is_err());
+    }
+
+    #[test]
+    fn controller_tracks_100k_registry_entries_with_only_two_percent_hot() {
+        let now = Instant::now();
+        let mut controller = TierController::new(TierPolicy::default());
+        let dormant_input = input(TorrentState::Seeding, now);
+        for index in 0..100_000 {
+            let decision = controller.apply_input(format!("{index:040x}"), dormant_input);
+            assert_eq!(decision.tier, TorrentActivityTier::Dormant);
+        }
+
+        let mut hot_torrents = 0;
+        for index in 0..2_000 {
+            let key = format!("{index:040x}");
+            let decision = controller.apply_event(key, dormant_input, TierEvent::InboundPeer);
+            hot_torrents += usize::from(decision.tier == TorrentActivityTier::Hot);
+        }
+
+        assert_eq!(controller.tracked_len(), 100_000);
+        assert_eq!(hot_torrents, 2_000);
+        TierScaleSnapshot {
+            total_torrents: controller.tracked_len(),
+            hot_torrents,
+            warm_torrents: 0,
+            dormant_torrents: 98_000,
+            active_torrent_tasks: hot_torrents,
+            dormant_heap_bytes: 98_000 * 64,
+        }
+        .validate(TierScaleBudget::default())
+        .unwrap();
+    }
+
+    #[test]
+    fn tracker_deadline_wheel_wakes_only_due_torrents() {
+        let now = Instant::now();
+        let mut controller = TierController::new(TierPolicy::default());
+        controller.schedule_tracker_check("due".to_owned(), now);
+        controller.schedule_tracker_check("later".to_owned(), now + Duration::from_secs(30));
+
+        assert_eq!(controller.next_tracker_deadline(), Some(now));
+        assert_eq!(controller.pop_due_tracker_checks(now), vec!["due"]);
+        assert_eq!(controller.pop_due_tracker_checks(now), Vec::<String>::new());
+        assert_eq!(
+            controller.next_tracker_deadline(),
+            Some(now + Duration::from_secs(30))
+        );
     }
 }

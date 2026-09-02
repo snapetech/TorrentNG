@@ -212,7 +212,7 @@ test('desktop handles 15k torrents without rendering every row', async ({ page, 
 test('core workspace controls expose accessible names', async ({ page }) => {
   await expect(page.getByRole('navigation', { name: 'Primary' })).toBeVisible()
   await expect(page.getByRole('button', { name: 'Settings' })).toBeVisible()
-  await expect(page.getByLabel('Select all visible torrents')).toBeVisible()
+  await expect(page.getByLabel(/Select all .* torrents matching the current filter/)).toBeVisible()
   await expect(page.getByRole('button', { name: /Sort by Name/i })).toBeVisible()
   await expect(page.getByRole('button', { name: 'Choose visible table columns' })).toBeVisible()
 

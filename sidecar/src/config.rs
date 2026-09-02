@@ -8,11 +8,19 @@ use std::{path::PathBuf, time::Duration};
 /// "rtorrent/0.16.11"; rTorrent 0.16.11 appends libtorrent's 0.16.11 version.
 pub const DEFAULT_USER_AGENT: &str = "rtorrent/0.16.11/0.16.11";
 
-/// Default rTorrent peer ID written to rTorrent download local_id values.
+/// Historical fully-pinned peer ID, used only as a sentinel meaning "not yet
+/// resolved to a real per-install identity" (see `Config::resolve_peer_id`).
 ///
-/// This is libtorrent 0.16.11's PEER_NAME prefix with deterministic padding.
-/// Do not replace it with "rtorrent/0.16.11/000" or a guessed "-lt1011-"
-/// prefix. It must be exactly 20 ASCII bytes for BitTorrent and trackers.
+/// Never ship this as a live peer_id: its suffix is all zeros, so every
+/// install that skips resolution presents the exact same 20 bytes. A
+/// tracker's client/peer verification reads the same peer_id appearing from
+/// many different IPs as one client running multiple simultaneous
+/// instances — a bannable multi-client signature on trackers like MAM, even
+/// though each install is actually a different, unrelated user. The
+/// `-lt100B-` prefix itself is libtorrent 0.16.11's PEER_NAME and must stay
+/// fixed; only the 12-byte suffix needs to be unique per install. Do not
+/// replace the prefix with "rtorrent/0.16.11/000" or a guessed "-lt1011-"
+/// prefix. See docs/TRACKER-IDENTITY.md.
 pub const DEFAULT_PEER_ID: &str = "-lt100B-000000000000";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -359,8 +367,57 @@ impl Config {
         // Env overrides — highest priority.
         cfg.apply_env();
 
+        cfg.resolve_peer_id();
+
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Replace an unresolved peer_id (still the shared `DEFAULT_PEER_ID`
+    /// sentinel after file + env overrides) with this install's persisted,
+    /// randomly-generated identity. A `peer_id` the operator actually set to
+    /// something else — including, deliberately, back to the literal
+    /// default value — is left untouched.
+    ///
+    /// Runs after `apply_env()` (so an explicit TNG_PEER_ID override always
+    /// wins) and before `validate()`. Persistence failures are logged and
+    /// fall back to an unpersisted random id rather than silently keeping
+    /// the shared sentinel, so a read-only data dir degrades to "unique but
+    /// not stable across restarts" instead of "identical to every other
+    /// unconfigured install".
+    fn resolve_peer_id(&mut self) {
+        if self.backend.backend_type != BackendKind::Rtorrent {
+            return;
+        }
+        if self.rtorrent.peer_id != DEFAULT_PEER_ID {
+            return;
+        }
+        let dir = self.resolved_data_dir();
+        match crate::identity::load_or_generate_peer_id(&dir) {
+            Ok(peer_id) => self.rtorrent.peer_id = peer_id,
+            Err(error) => {
+                tracing::warn!(
+                    component = "config",
+                    operation = "resolve_peer_id",
+                    result = "error",
+                    data_dir = %dir.display(),
+                    %error,
+                    "could not persist per-install peer id; using an unpersisted random one for this run"
+                );
+                self.rtorrent.peer_id = format!("{}{}", crate::identity::PEER_ID_PREFIX, {
+                    use rand::distributions::{Alphanumeric, DistString};
+                    Alphanumeric.sample_string(&mut rand::thread_rng(), 12)
+                });
+            }
+        }
+    }
+
+    fn resolved_data_dir(&self) -> PathBuf {
+        self.data_dir.clone().unwrap_or_else(|| {
+            dirs_next::data_local_dir()
+                .unwrap_or_else(|| PathBuf::from("/var/lib"))
+                .join("torrentng")
+        })
     }
 
     fn apply_env(&mut self) {
@@ -563,12 +620,7 @@ impl Config {
     }
 
     pub fn cache_path(&self) -> PathBuf {
-        let dir = self.data_dir.clone().unwrap_or_else(|| {
-            dirs_next::data_local_dir()
-                .unwrap_or_else(|| PathBuf::from("/var/lib"))
-                .join("torrentng")
-        });
-        dir.join("cache.db")
+        self.resolved_data_dir().join("cache.db")
     }
 
     pub fn sync_interval(&self) -> Duration {
@@ -849,5 +901,67 @@ scgi_socket = "/tmp/rtorrent.sock"
         for (key, value) in old {
             restore_env(key, value);
         }
+    }
+
+    #[test]
+    fn load_replaces_shared_default_peer_id_with_a_persisted_unique_one() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let old_data_dir = std::env::var("TNG_DATA_DIR").ok();
+        let old_peer_id = std::env::var("TNG_PEER_ID").ok();
+        std::env::remove_var("TNG_PEER_ID");
+        std::env::remove_var("RTNG_PEER_ID");
+
+        let data_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("TNG_DATA_DIR", data_dir.path());
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[rtorrent]
+scgi_socket = "/tmp/rtorrent.sock"
+"#,
+        )
+        .unwrap();
+
+        let cfg = Config::load(Some(config_path.to_str().unwrap())).unwrap();
+
+        assert_ne!(
+            cfg.rtorrent.peer_id, DEFAULT_PEER_ID,
+            "an unconfigured install must not keep the shared sentinel peer_id"
+        );
+        assert_eq!(cfg.rtorrent.peer_id.len(), 20);
+        assert!(cfg.rtorrent.peer_id.starts_with("-lt100B-"));
+
+        // Restarting (reloading) the same install must reuse the same id.
+        let cfg2 = Config::load(Some(config_path.to_str().unwrap())).unwrap();
+        assert_eq!(cfg.rtorrent.peer_id, cfg2.rtorrent.peer_id);
+
+        restore_env("TNG_DATA_DIR", old_data_dir);
+        restore_env("TNG_PEER_ID", old_peer_id);
+    }
+
+    #[test]
+    fn load_respects_an_explicit_peer_id_override() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let old_peer_id = std::env::var("TNG_PEER_ID").ok();
+        std::env::set_var("TNG_PEER_ID", "-lt100B-aaaaaaaaaaaa");
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[rtorrent]
+scgi_socket = "/tmp/rtorrent.sock"
+"#,
+        )
+        .unwrap();
+
+        let cfg = Config::load(Some(config_path.to_str().unwrap())).unwrap();
+        assert_eq!(cfg.rtorrent.peer_id, "-lt100B-aaaaaaaaaaaa");
+
+        restore_env("TNG_PEER_ID", old_peer_id);
     }
 }

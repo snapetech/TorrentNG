@@ -71,6 +71,11 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&config.daemon.session_dir)
         .with_context(|| format!("creating session_dir {:?}", config.daemon.session_dir))?;
 
+    // Resolve (and persist, if not already done) this install's tracker
+    // peer id before any engine/tracker task can observe it. Must run
+    // before Engine::start. See docs/TRACKER-IDENTITY.md.
+    rt_engine::peer_id::init(&config.daemon.session_dir);
+
     // Shared in-memory session registry
     let registry = Arc::new(RwLock::new(SessionRegistry::new()));
 

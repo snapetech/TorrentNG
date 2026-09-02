@@ -24,6 +24,9 @@ certified status.
 - [BACKEND_AUDIT_BURN_DOWN.md](BACKEND_AUDIT_BURN_DOWN.md) - canonical,
   evidence-backed remediation ledger for the native backend audit; this is the
   release-facing source of truth for open findings and unsupported claims.
+- [BACKEND_BURNDOWN_RELEASE_20260902.md](BACKEND_BURNDOWN_RELEASE_20260902.md) -
+  exact release-artifact smoke evidence and explicit blockers from the focused
+  backend burn-down run.
 - [WEBUI_AUDIT.md](WEBUI_AUDIT.md) - torrent-table alignment, status semantics,
   field coverage, and the remaining cross-client projection gaps.
 - [RELEASE_EVIDENCE.md](RELEASE_EVIDENCE.md) - operator runbook for clearing

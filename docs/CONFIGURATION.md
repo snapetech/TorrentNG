@@ -250,11 +250,15 @@ type = "qbittorrent"
 | `scgi_addr` | - | `TNG_SCGI_ADDR` | `host:port` for TCP SCGI; mutually exclusive with `scgi_socket` |
 | `timeout_secs` | `10` | - | Timeout for individual XMLRPC calls |
 | `user_agent` | `rtorrent/0.16.11/0.16.11` | `TNG_USER_AGENT` | Tracker HTTP user-agent pushed to rTorrent on startup |
-| `peer_id` | `-lt100B-000000000000` | `TNG_PEER_ID` | 20-byte tracker peer ID pushed to loaded rTorrent downloads on startup |
+| `peer_id` | generated + persisted per install | `TNG_PEER_ID` | 20-byte tracker peer ID pushed to loaded rTorrent downloads on startup |
 
-The packaged rTorrent backend deliberately pins the upstream rTorrent/libtorrent
-0.16.11 tracker identity pair. See [TRACKER-IDENTITY.md](TRACKER-IDENTITY.md)
-before changing either value.
+The packaged rTorrent backend pins the upstream rTorrent/libtorrent 0.16.11
+`user_agent`, but **not** a fixed `peer_id`: only the 8-byte client-family
+prefix (`-lt100B-`) is fixed. The remaining 12 bytes are generated once per
+install and persisted to `<data_dir>/peer_id_suffix`; leave `peer_id` unset
+unless you specifically need to pin one install to a literal value. See
+[TRACKER-IDENTITY.md](TRACKER-IDENTITY.md) — sharing a fixed peer_id across
+installs previously caused a private-tracker multi-client ban.
 
 ### Sidecar `[qbittorrent]`
 
@@ -373,14 +377,24 @@ TNG_USER_AGENT="rtorrent/0.16.11/0.16.11" torrentng
 #### `peer_id`
 
 The `peer_id` value is pushed to existing rTorrent downloads via the packaged
-`d.local_id.set` command on startup, then each session file is saved. This keeps
-the tracker-facing peer ID paired with rTorrent's upstream HTTP user-agent. The
-value must be exactly 20 ASCII bytes.
+`d.local_id.set` command on startup, then each session file is saved. The
+value must be exactly 20 ASCII bytes: an 8-byte client-family prefix plus a
+12-byte suffix that **must be unique per install** — see
+[TRACKER-IDENTITY.md](TRACKER-IDENTITY.md) for why a shared/hardcoded suffix
+got a real user banned from a private tracker for "running multiple
+instances of the same client."
 
-For packaged rTorrent/libtorrent 0.16.11, keep this as
-`-lt100B-000000000000`. The `-lt100B-` prefix is libtorrent 0.16.11's upstream
+Leave `peer_id` unset in normal deployments. The sidecar generates a random
+12-byte suffix on first start and persists it to
+`<data_dir>/peer_id_suffix`, so it stays stable across restarts of that one
+install while still being unique to it. For packaged rTorrent/libtorrent
+0.16.11, the fixed prefix is `-lt100B-` — libtorrent 0.16.11's upstream
 peer-name encoding; it is not `-lt1011-`, and the peer ID is not the literal
 string `rtorrent/0.16.11/000`.
+
+Only set `peer_id` (or `TNG_PEER_ID`) explicitly when you need one specific
+install pinned to a reproducible value, e.g. for a test fixture — never in a
+shared config template, base image, or fleet-wide env var:
 
 ```toml
 [rtorrent]
@@ -486,7 +500,8 @@ type = "rtorrent"
 scgi_socket = "/run/rtorrent/rpc.sock"
 timeout_secs = 10
 user_agent = "rtorrent/0.16.11/0.16.11"
-peer_id = "-lt100B-000000000000"
+# peer_id intentionally omitted — generated and persisted per install.
+# See TRACKER-IDENTITY.md.
 
 [rtorrent.logs]
 enabled = false

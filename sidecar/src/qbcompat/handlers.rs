@@ -2811,7 +2811,10 @@ mod tests {
             "moving",
             "errored",
         ] {
-            assert!(is_status_filter(status), "{status} should be a recognized status filter");
+            assert!(
+                is_status_filter(status),
+                "{status} should be a recognized status filter"
+            );
         }
         assert!(!is_status_filter("not-a-real-status"));
     }

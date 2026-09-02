@@ -474,8 +474,29 @@ export function App() {
   async function handleSelectAllMatching() {
     setSelectingAllMatching(true)
     try {
-      const res = await api.torrents.list({ ...params, limit: total, offset: 0 })
-      handleSelectAll(res.torrents.map(t => t.hash))
+      const selectedHashes = new Set<string>()
+      const pageSize = 5000
+      let offset = 0
+      let snapshot: number | undefined
+      let matchingTotal = total
+
+      // The API deliberately caps each response. Walk the immutable snapshot
+      // so a mutation during a large select-all cannot skip or duplicate rows.
+      do {
+        const page = await api.torrents.list({
+          ...params,
+          limit: pageSize,
+          offset,
+          snapshot,
+        })
+        matchingTotal = page.total
+        snapshot = page.snapshot
+        page.torrents.forEach(torrent => selectedHashes.add(torrent.hash))
+        if (page.torrents.length === 0) break
+        offset += page.torrents.length
+      } while (offset < matchingTotal)
+
+      handleSelectAll([...selectedHashes])
     } catch {
       setActionNotice({ text: 'Failed to select all matching torrents', tone: 'error' })
     } finally {

@@ -6,13 +6,20 @@ const PAGE_SIZE = 200
 export function useTorrentsInfinite(params: Omit<ListParams, 'limit' | 'offset'>, enabled = true) {
   return useInfiniteQuery({
     queryKey: ['torrents', params],
-    queryFn: ({ pageParam = 0 }) =>
-      api.torrents.list({ ...params, limit: PAGE_SIZE, offset: pageParam }),
+    queryFn: ({ pageParam }) =>
+      api.torrents.list({
+        ...params,
+        limit: PAGE_SIZE,
+        offset: pageParam.offset,
+        snapshot: pageParam.snapshot,
+      }),
     enabled,
-    initialPageParam: 0,
+    initialPageParam: { offset: 0 } as { offset: number; snapshot?: number },
     getNextPageParam: (lastPage, allPages) => {
       const loaded = allPages.reduce((n, p) => n + p.torrents.length, 0)
-      return loaded < lastPage.total ? loaded : undefined
+      return loaded < lastPage.total
+        ? { offset: loaded, snapshot: lastPage.snapshot }
+        : undefined
     },
     placeholderData: (prev) => prev,
     staleTime: 1000,

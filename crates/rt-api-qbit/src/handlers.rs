@@ -13,12 +13,13 @@ use std::{
     collections::{hash_map::DefaultHasher, HashMap, HashSet},
     hash::{Hash, Hasher},
     net::{IpAddr, SocketAddr},
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use url::Url;
 
 use rt_engine::{
-    EngineGlobalLimits, EngineNetworkFeatures, EnginePeerSnapshot, EnginePieceState,
+    EngineGlobalLimits, EngineNetworkFeatures, EnginePeerSnapshot, EnginePieceState, EngineStats,
     EngineTorrentFile, EngineTorrentLimits, EngineTorrentMetadata, EngineTrackerSnapshot,
     QueueMove,
 };
@@ -29,8 +30,13 @@ use crate::{
         to_qbit_state, QbCategoryInfo, QbFileInfo, QbServerState, QbTorrentInfo,
         QbTorrentProperties, QbTrackerInfo,
     },
-    state::AppState,
+    state::{AppState, TorrentSnapshotError},
 };
+
+// Live qBittorrent compatibility fields are backed by per-torrent engine
+// commands. Keep those projections for interactive pages, but do not turn a
+// full-list response into one actor round-trip per dormant torrent.
+const QBIT_LIVE_PROJECTION_MAX_ENTRIES: usize = 200;
 
 // ---------------------------------------------------------------------------
 // Auth
@@ -553,17 +559,98 @@ pub struct TorrentsInfoQuery {
     pub limit: Option<usize>,
     pub offset: Option<usize>,
     pub hashes: Option<String>,
+    /// Optional TorrentNG snapshot generation for stable offset pagination.
+    /// qBittorrent clients ignore the response header, while native clients
+    /// can use it to pin multiple pages to one immutable registry view.
+    pub snapshot: Option<u64>,
 }
 
 pub async fn torrents_info(
     State(state): State<AppState>,
     Query(q): Query<TorrentsInfoQuery>,
 ) -> impl IntoResponse {
-    let torrent_count = state.registry.read().await.len();
+    let snapshot = match state.torrent_snapshot(q.snapshot).await {
+        Ok(snapshot) => snapshot,
+        Err(TorrentSnapshotError::Expired { revision }) => {
+            return (
+                StatusCode::GONE,
+                format!("torrent snapshot {revision} expired; restart pagination"),
+            )
+                .into_response();
+        }
+    };
+    let torrent_count = snapshot.entries.len();
+    let hashes = q
+        .hashes
+        .as_deref()
+        .map(|hashes| hashes.split('|').map(str::to_owned).collect::<HashSet<_>>());
+    let order = snapshot.ordered_indices(q.sort.as_deref(), |left, right| {
+        match q.sort.as_deref().unwrap_or_default() {
+            "size" => left.total_length.cmp(&right.total_length),
+            "progress" => torrent_progress(
+                left.total_length,
+                left.amount_left,
+                left.completed_at.is_some(),
+            )
+            .total_cmp(&torrent_progress(
+                right.total_length,
+                right.amount_left,
+                right.completed_at.is_some(),
+            )),
+            "ratio" => left.stats.ratio().total_cmp(&right.stats.ratio()),
+            "added_on" => left.added_at.cmp(&right.added_at),
+            "completion_on" => left
+                .completed_at
+                .unwrap_or(0)
+                .cmp(&right.completed_at.unwrap_or(0)),
+            "category" => left.category.cmp(&right.category),
+            "state" => to_qbit_state(left.state.as_str()).cmp(to_qbit_state(right.state.as_str())),
+            "dlspeed" | "upspeed" => left.info_hash.cmp(&right.info_hash),
+            _ => left.name.cmp(&right.name),
+        }
+    });
+    let (indexed_states, completed_only) = indexed_qbit_filter(q.filter.as_deref());
+    let candidates = snapshot.candidate_indices(
+        hashes.as_ref(),
+        &indexed_states,
+        completed_only,
+        q.category.as_deref(),
+        q.tag.as_deref(),
+    );
+    let offset = q.offset.unwrap_or(0);
+    let limit = q.limit.unwrap_or(torrent_count);
+    let descending = q.reverse.unwrap_or(false);
+    let mut skipped = 0;
+    let mut selected = Vec::with_capacity(limit.min(torrent_count));
+    let indices: Box<dyn Iterator<Item = &usize>> = if descending {
+        Box::new(order.iter().rev())
+    } else {
+        Box::new(order.iter())
+    };
+    for index in indices {
+        if candidates
+            .as_ref()
+            .is_some_and(|candidate| candidate.binary_search(index).is_err())
+        {
+            continue;
+        }
+        let entry = &snapshot.entries[*index];
+        if !qbit_entry_matches(entry, &q, hashes.as_ref()) {
+            continue;
+        }
+        if skipped < offset {
+            skipped += 1;
+            continue;
+        }
+        selected.push(*index);
+        if selected.len() == limit {
+            break;
+        }
+    }
     let _lease = if state.engine.is_some() {
         match reserve_qbit_api_snapshot(
             &state,
-            estimate_qbit_torrent_info_snapshot_bytes(torrent_count),
+            estimate_qbit_torrent_info_snapshot_bytes(selected.len()),
         )
         .await
         {
@@ -574,80 +661,73 @@ pub async fn torrents_info(
     } else {
         None
     };
-    let entries = {
-        let reg = state.registry.read().await;
-        reg.iter()
-            .filter(|e| {
-                // Filter by hashes if provided
-                if let Some(ref hashes_str) = q.hashes {
-                    let hashes: Vec<&str> = hashes_str.split('|').collect();
-                    if !hashes.contains(&e.info_hash.as_str()) {
-                        return false;
-                    }
-                }
-                // Filter by category
-                if let Some(ref cat) = q.category {
-                    if e.category.as_deref() != Some(cat.as_str()) {
-                        return false;
-                    }
-                }
-                if let Some(ref tag) = q.tag {
-                    if !tag.is_empty() && !e.tags.iter().any(|entry_tag| entry_tag == tag) {
-                        return false;
-                    }
-                }
-                // Filter by state
-                if let Some(ref filter) = q.filter {
-                    let qb_state = to_qbit_state(e.state.as_str());
-                    match filter.as_str() {
-                        "all" => {}
-                        "downloading" => {
-                            if qb_state != "downloading" {
-                                return false;
-                            }
-                        }
-                        "seeding" | "uploading" => {
-                            if qb_state != "uploading" {
-                                return false;
-                            }
-                        }
-                        "completed" => {
-                            if e.completed_at.is_none() {
-                                return false;
-                            }
-                        }
-                        "paused" if !matches!(qb_state, "pausedUP" | "pausedDL") => {
-                            return false;
-                        }
-                        _ => {}
-                    }
-                }
-                true
-            })
-            .cloned()
-            .collect::<Vec<_>>()
-    };
-    let mut entries = entries;
-    sort_torrent_entries(&mut entries, q.sort.as_deref(), q.reverse.unwrap_or(false));
-
-    let offset = q.offset.unwrap_or(0);
-    let entries = if offset < entries.len() {
-        &entries[offset..]
-    } else {
-        &[]
-    };
-    let entries: Vec<_> = if let Some(limit) = q.limit {
-        entries.iter().take(limit).cloned().collect()
-    } else {
-        entries.to_vec()
-    };
     let active_rechecks = active_recheck_hashes(&state).await;
-    let mut infos = Vec::with_capacity(entries.len());
-    for entry in &entries {
-        infos.push(qbit_torrent_info(&state, entry, &active_rechecks).await);
+    let include_live = selected.len() <= QBIT_LIVE_PROJECTION_MAX_ENTRIES;
+    let mut infos = Vec::with_capacity(selected.len());
+    for index in selected {
+        infos.push(
+            qbit_torrent_info(
+                &state,
+                &snapshot.entries[index],
+                &active_rechecks,
+                include_live,
+            )
+            .await,
+        );
     }
 
-    (StatusCode::OK, Json(infos)).into_response()
+    let mut response = (StatusCode::OK, Json(infos)).into_response();
+    if let Ok(value) = HeaderValue::from_str(&snapshot.revision.to_string()) {
+        response.headers_mut().insert(
+            header::HeaderName::from_static("x-torrentng-snapshot"),
+            value,
+        );
+    }
+    response
+}
+
+fn indexed_qbit_filter(filter: Option<&str>) -> (Vec<&'static str>, bool) {
+    match filter.map(str::trim) {
+        Some("downloading") => (vec!["downloading"], false),
+        Some("seeding" | "uploading") => (vec!["seeding"], false),
+        Some("completed") => (Vec::new(), true),
+        Some("paused") => (vec!["paused", "stopped"], false),
+        _ => (Vec::new(), false),
+    }
+}
+
+fn qbit_entry_matches(
+    entry: &rt_session::TorrentEntry,
+    query: &TorrentsInfoQuery,
+    hashes: Option<&HashSet<String>>,
+) -> bool {
+    if let Some(hashes) = hashes {
+        if !hashes.contains(&entry.info_hash) {
+            return false;
+        }
+    }
+    if let Some(category) = query.category.as_deref() {
+        if entry.category.as_deref() != Some(category) {
+            return false;
+        }
+    }
+    if let Some(tag) = query.tag.as_deref() {
+        if !tag.is_empty() && !entry.tags.iter().any(|entry_tag| entry_tag == tag) {
+            return false;
+        }
+    }
+    if let Some(filter) = query.filter.as_deref() {
+        let qb_state = to_qbit_state(entry.state.as_str());
+        match filter {
+            "all" => {}
+            "downloading" if qb_state != "downloading" => return false,
+            "seeding" | "uploading" if qb_state != "uploading" => return false,
+            "completed" if entry.completed_at.is_none() => return false,
+            "paused" if !matches!(qb_state, "pausedUP" | "pausedDL") => return false,
+            _ => {}
+        }
+    }
+    true
 }
 
 /// `POST /api/qb/v2/torrents/add`.
@@ -2123,14 +2203,13 @@ struct SyncMaindataResponse {
     rid: i64,
     full_update: bool,
     torrents: SyncTorrentMap,
-    torrents_removed: &'static [&'static str],
+    torrents_removed: Vec<String>,
     server_state: QbServerState,
 }
 
 #[derive(Debug)]
 struct SyncTorrentMap {
     infos: Vec<QbTorrentInfo>,
-    full_update: bool,
 }
 
 impl Serialize for SyncTorrentMap {
@@ -2138,16 +2217,9 @@ impl Serialize for SyncTorrentMap {
     where
         S: Serializer,
     {
-        let len = if self.full_update {
-            Some(self.infos.len())
-        } else {
-            Some(0)
-        };
-        let mut map = serializer.serialize_map(len)?;
-        if self.full_update {
-            for info in &self.infos {
-                map.serialize_entry(&info.hash, info)?;
-            }
+        let mut map = serializer.serialize_map(Some(self.infos.len()))?;
+        for info in &self.infos {
+            map.serialize_entry(&info.hash, info)?;
         }
         map.end()
     }
@@ -2157,7 +2229,75 @@ pub async fn sync_maindata(
     State(state): State<AppState>,
     Query(q): Query<SyncMaindataQuery>,
 ) -> impl IntoResponse {
-    let torrent_count = state.registry.read().await.len();
+    let (current_revision, requested_revision) = {
+        let registry = state.registry.read().await;
+        (
+            registry.revision(),
+            q.rid.filter(|rid| *rid > 0).map(|rid| rid as u64),
+        )
+    };
+    let unchanged_empty_registry = q
+        .rid
+        .is_some_and(|rid| rid > 0 && rid == qbit_registry_rid(current_revision))
+        && current_revision == 0;
+    let empty_entries = Arc::new(Vec::<rt_session::TorrentEntry>::new());
+    let (revision, full_update, entries, torrents_removed) = if requested_revision
+        .is_some_and(|requested| requested == current_revision)
+        || unchanged_empty_registry
+    {
+        (current_revision, false, empty_entries, Vec::new())
+    } else {
+        let delta = if let Some(requested_revision) =
+            requested_revision.filter(|requested| *requested <= current_revision)
+        {
+            let registry = state.registry.read().await;
+            registry.changes_since(requested_revision).map(|changes| {
+                let mut changed = HashSet::new();
+                let mut removed = HashSet::new();
+                for change in changes {
+                    if change.removed {
+                        changed.remove(&change.info_hash);
+                        removed.insert(change.info_hash);
+                    } else {
+                        removed.remove(&change.info_hash);
+                        changed.insert(change.info_hash);
+                    }
+                }
+                let entries = changed
+                    .into_iter()
+                    .filter_map(|hash| registry.get(&hash).cloned())
+                    .collect::<Vec<_>>();
+                let mut removed = removed
+                    .into_iter()
+                    .filter(|hash| registry.get(hash).is_none())
+                    .collect::<Vec<_>>();
+                removed.sort_unstable();
+                (registry.revision(), Arc::new(entries), removed)
+            })
+        } else {
+            None
+        };
+        if let Some((revision, entries, removed)) = delta {
+            (revision, false, entries, removed)
+        } else {
+            // Full updates use the shared snapshot cache. This remains
+            // O(N) when the registry changes, but repeated qBit polling
+            // no longer clones every TorrentEntry independently of the
+            // native/SSE snapshot consumers.
+            let snapshot = match state.torrent_snapshot(None).await {
+                Ok(snapshot) => snapshot,
+                Err(TorrentSnapshotError::Expired { revision }) => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("failed to build torrent snapshot at revision {revision}"),
+                    )
+                        .into_response();
+                }
+            };
+            (snapshot.revision, true, snapshot.entries, Vec::new())
+        }
+    };
+    let torrent_count = entries.len();
     let _lease = if state.engine.is_some() {
         match reserve_qbit_api_snapshot(
             &state,
@@ -2172,37 +2312,54 @@ pub async fn sync_maindata(
     } else {
         None
     };
-    let entries = {
-        let reg = state.registry.read().await;
-        reg.iter().cloned().collect::<Vec<_>>()
+    let active_rechecks = if entries.is_empty() {
+        HashSet::new()
+    } else {
+        active_recheck_hashes(&state).await
     };
-    let active_rechecks = active_recheck_hashes(&state).await;
     let mut infos = Vec::with_capacity(entries.len());
-    let mut tracker_digests = Vec::with_capacity(entries.len());
-    for entry in &entries {
-        infos.push(qbit_torrent_info(&state, entry, &active_rechecks).await);
-        tracker_digests.push(qbit_tracker_snapshot_digest(&state, &entry.info_hash).await);
+    let include_live = entries.len() <= QBIT_LIVE_PROJECTION_MAX_ENTRIES;
+    for entry in entries.iter() {
+        infos.push(qbit_torrent_info(&state, entry, &active_rechecks, include_live).await);
     }
-    let rid = sync_rid_for_infos_and_trackers(&infos, &tracker_digests);
-    let full_update = q.rid.unwrap_or(0) != rid;
-    let (alltime_dl, alltime_ul) = infos.iter().fold((0_i64, 0_i64), |(dl, ul), info| {
+    let rid = qbit_registry_rid(revision);
+    let (alltime_dl, alltime_ul, session_rates) = if let Some(engine) = &state.engine {
+        match engine.stats().await {
+            Ok(stats) => (
+                stats.bytes_downloaded.min(i64::MAX as u64) as i64,
+                stats.bytes_uploaded.min(i64::MAX as u64) as i64,
+                QbitSwarmProjection {
+                    download_rate: stats.download_rate,
+                    upload_rate: stats.upload_rate,
+                    ..Default::default()
+                },
+            ),
+            Err(_) => (0, 0, QbitSwarmProjection::default()),
+        }
+    } else {
+        let (alltime_dl, alltime_ul) = infos.iter().fold((0_i64, 0_i64), |(dl, ul), info| {
+            (
+                dl.saturating_add(info.downloaded),
+                ul.saturating_add(info.uploaded),
+            )
+        });
         (
-            dl.saturating_add(info.downloaded),
-            ul.saturating_add(info.uploaded),
+            alltime_dl,
+            alltime_ul,
+            qbit_session_rates_from_infos(&infos),
         )
-    });
+    };
     let global_ratio = if alltime_dl > 0 {
         alltime_ul as f64 / alltime_dl as f64
     } else {
         0.0
     };
-    let session_rates = qbit_session_rates_from_infos(&infos);
     let limits = global_limits(&state).await;
     let resp = SyncMaindataResponse {
         rid,
         full_update,
-        torrents: SyncTorrentMap { infos, full_update },
-        torrents_removed: &[],
+        torrents: SyncTorrentMap { infos },
+        torrents_removed,
         server_state: QbServerState {
             dl_info_speed: session_rates.download_rate,
             dl_info_data: 0,
@@ -2230,6 +2387,12 @@ pub async fn sync_maindata(
         },
     };
     (StatusCode::OK, Json(resp)).into_response()
+}
+
+fn qbit_registry_rid(revision: u64) -> i64 {
+    // qBittorrent clients use zero as "no previous response". Keep the
+    // empty registry distinguishable from that sentinel.
+    (revision.min(i64::MAX as u64) as i64).max(1)
 }
 
 pub async fn sync_torrent_peers(
@@ -2343,14 +2506,31 @@ fn qbit_peer_map(peers: &[EnginePeerSnapshot]) -> serde_json::Map<String, serde_
 
 pub async fn transfer_info(State(state): State<AppState>) -> impl IntoResponse {
     let limits = global_limits(&state).await;
-    let session_rates = qbit_session_rates(&state).await;
+    let engine_stats = qbit_engine_stats(&state).await;
+    let session_rates = engine_stats
+        .as_ref()
+        .map(|stats| QbitSwarmProjection {
+            download_rate: stats.download_rate,
+            upload_rate: stats.upload_rate,
+            ..Default::default()
+        })
+        .unwrap_or_default();
+    let (dl_info_data, up_info_data) = engine_stats
+        .as_ref()
+        .map(|stats| {
+            (
+                stats.bytes_downloaded.min(i64::MAX as u64) as i64,
+                stats.bytes_uploaded.min(i64::MAX as u64) as i64,
+            )
+        })
+        .unwrap_or_default();
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "dl_info_speed": session_rates.download_rate,
-            "dl_info_data": 0,
+            "dl_info_data": dl_info_data,
             "up_info_speed": session_rates.upload_rate,
-            "up_info_data": 0,
+            "up_info_data": up_info_data,
             "connection_status": "connected",
             "free_space_on_disk": 0,
             "dl_rate_limit": limits.download_limit,
@@ -2972,33 +3152,6 @@ fn torrent_progress(total_length: u64, amount_left: u64, complete: bool) -> f64 
     (done as f64 / total_length as f64).clamp(0.0, 1.0)
 }
 
-fn sort_torrent_entries(
-    entries: &mut [rt_session::TorrentEntry],
-    sort: Option<&str>,
-    reverse: bool,
-) {
-    match sort.unwrap_or_default() {
-        "name" => entries.sort_by(|a, b| a.name.cmp(&b.name)),
-        "size" => entries.sort_by_key(|entry| entry.total_length),
-        "progress" => entries.sort_by(|a, b| {
-            torrent_progress(a.total_length, a.amount_left, a.completed_at.is_some()).total_cmp(
-                &torrent_progress(b.total_length, b.amount_left, b.completed_at.is_some()),
-            )
-        }),
-        "ratio" => entries.sort_by(|a, b| a.stats.ratio().total_cmp(&b.stats.ratio())),
-        "added_on" => entries.sort_by_key(|entry| entry.added_at),
-        "completion_on" => entries.sort_by_key(|entry| entry.completed_at.unwrap_or(0)),
-        "category" => entries.sort_by(|a, b| a.category.cmp(&b.category)),
-        "state" => entries
-            .sort_by(|a, b| to_qbit_state(a.state.as_str()).cmp(to_qbit_state(b.state.as_str()))),
-        "dlspeed" | "upspeed" => entries.sort_by(|a, b| a.info_hash.cmp(&b.info_hash)),
-        _ => entries.sort_by(|a, b| a.name.cmp(&b.name)),
-    }
-    if reverse {
-        entries.reverse();
-    }
-}
-
 fn pieces_have(
     total_length: u64,
     amount_left: u64,
@@ -3452,16 +3605,29 @@ async fn qbit_torrent_info(
     state: &AppState,
     e: &rt_session::TorrentEntry,
     active_rechecks: &HashSet<String>,
+    include_live: bool,
 ) -> QbTorrentInfo {
     let progress = torrent_progress(e.total_length, e.amount_left, e.completed_at.is_some());
-    let (tracker, trackers_count) = if state.engine.is_some() {
+    let (tracker, trackers_count) = if include_live && state.engine.is_some() {
         qbit_tracker_projection(state, &e.info_hash).await
     } else {
         (String::new(), 0)
     };
-    let swarm = qbit_swarm_projection(state, &e.info_hash).await;
-    let priority = queue_priority(state, &e.info_hash).await;
-    let limits = get_torrent_limits(state, &e.info_hash).await;
+    let swarm = if include_live {
+        qbit_swarm_projection(state, &e.info_hash).await
+    } else {
+        QbitSwarmProjection::default()
+    };
+    let priority = if include_live {
+        queue_priority(state, &e.info_hash).await
+    } else {
+        0
+    };
+    let limits = if include_live {
+        get_torrent_limits(state, &e.info_hash).await
+    } else {
+        EngineTorrentLimits::default()
+    };
     QbTorrentInfo {
         hash: e.info_hash.clone(),
         name: e.name.clone(),
@@ -3533,20 +3699,8 @@ struct QbitSwarmProjection {
     upload_rate: i64,
 }
 
-async fn qbit_session_rates(state: &AppState) -> QbitSwarmProjection {
-    let entries = {
-        let reg = state.registry.read().await;
-        reg.iter()
-            .map(|entry| entry.info_hash.clone())
-            .collect::<Vec<_>>()
-    };
-    let mut projection = QbitSwarmProjection::default();
-    for hash in entries {
-        let swarm = qbit_swarm_projection(state, &hash).await;
-        projection.download_rate = projection.download_rate.saturating_add(swarm.download_rate);
-        projection.upload_rate = projection.upload_rate.saturating_add(swarm.upload_rate);
-    }
-    projection
+async fn qbit_engine_stats(state: &AppState) -> Option<EngineStats> {
+    state.engine.as_ref()?.stats().await.ok()
 }
 
 fn qbit_session_rates_from_infos(infos: &[QbTorrentInfo]) -> QbitSwarmProjection {
@@ -3685,6 +3839,7 @@ fn sync_rid_for_infos(infos: &[QbTorrentInfo]) -> i64 {
     sync_rid_for_infos_and_trackers(infos, &[])
 }
 
+#[cfg(test)]
 fn sync_rid_for_infos_and_trackers(
     infos: &[QbTorrentInfo],
     tracker_digests: &[(String, u64)],
@@ -3718,34 +3873,6 @@ fn sync_rid_for_infos_and_trackers(
     }
     let rid = (hasher.finish() & 0x7fff_ffff_ffff_ffff) as i64;
     rid.max(1)
-}
-
-async fn qbit_tracker_snapshot_digest(state: &AppState, hash: &str) -> (String, u64) {
-    let mut hasher = DefaultHasher::new();
-    hash.hash(&mut hasher);
-    let Some(engine) = &state.engine else {
-        return (hash.to_owned(), hasher.finish());
-    };
-    if let Ok(mut trackers) = engine.torrent_trackers(hash.to_owned()).await {
-        trackers.sort_by(|a, b| {
-            a.tier
-                .cmp(&b.tier)
-                .then_with(|| a.announce.cmp(&b.announce))
-        });
-        for tracker in trackers {
-            tracker.announce.hash(&mut hasher);
-            tracker.tier.hash(&mut hasher);
-            tracker.status.hash(&mut hasher);
-            tracker.failure_reason.hash(&mut hasher);
-            tracker.warning_message.hash(&mut hasher);
-            tracker.seeders.hash(&mut hasher);
-            tracker.leechers.hash(&mut hasher);
-            tracker.completed.hash(&mut hasher);
-            tracker.last_announce_at.hash(&mut hasher);
-            tracker.next_announce_at.hash(&mut hasher);
-        }
-    }
-    (hash.to_owned(), hasher.finish())
 }
 
 fn extract_hashes_from_str(s: &str) -> Vec<String> {
@@ -4873,6 +5000,143 @@ mod tests {
         assert_eq!(v.as_array().unwrap().len(), 2);
         assert_eq!(v[0]["name"].as_str().unwrap(), "alpha");
         assert_eq!(v[1]["name"].as_str().unwrap(), "zeta");
+    }
+
+    #[tokio::test]
+    async fn torrents_info_pages_are_pinned_by_snapshot_header() {
+        let state = AppState::new();
+        for (hash, name) in [("a", "alpha"), ("b", "bravo"), ("c", "charlie")] {
+            state
+                .registry
+                .write()
+                .await
+                .add(TorrentEntry::new(
+                    format!("{hash}{}", "0".repeat(39)),
+                    name.into(),
+                    "/data".into(),
+                ))
+                .unwrap();
+        }
+        let app = build_qbit_router(state.clone());
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/qb/v2/torrents/info?sort=name&limit=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let snapshot = first
+            .headers()
+            .get("x-torrentng-snapshot")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let body = axum::body::to_bytes(first.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body[0]["name"], "alpha");
+
+        let first_hash = "a0".to_owned() + &"0".repeat(38);
+        state
+            .registry
+            .write()
+            .await
+            .get_mut(&first_hash)
+            .unwrap()
+            .name = "zulu".into();
+
+        let second = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/qb/v2/torrents/info?sort=name&offset=1&limit=1&snapshot={snapshot}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(second.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body[0]["name"], "bravo");
+    }
+
+    #[tokio::test]
+    async fn sync_maindata_returns_registry_deltas_and_removals() {
+        let state = AppState::new();
+        let first_hash = "a0".to_owned() + &"0".repeat(38);
+        let second_hash = "b0".to_owned() + &"0".repeat(38);
+        state
+            .registry
+            .write()
+            .await
+            .add(TorrentEntry::new(
+                first_hash.clone(),
+                "alpha".into(),
+                "/data".into(),
+            ))
+            .unwrap();
+        state
+            .registry
+            .write()
+            .await
+            .add(TorrentEntry::new(
+                second_hash.clone(),
+                "bravo".into(),
+                "/data".into(),
+            ))
+            .unwrap();
+        let app = build_qbit_router(state.clone());
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/qb/v2/sync/maindata")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(first.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let first: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let rid = first["rid"].as_i64().unwrap();
+        assert_eq!(first["torrents"].as_object().unwrap().len(), 2);
+
+        state
+            .registry
+            .write()
+            .await
+            .get_mut(&first_hash)
+            .unwrap()
+            .name = "renamed".into();
+        state.registry.write().await.remove(&second_hash).unwrap();
+
+        let second = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/qb/v2/sync/maindata?rid={rid}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(second.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let second: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(second["full_update"], false);
+        assert_eq!(second["torrents"][&first_hash]["name"], "renamed");
+        assert_eq!(second["torrents_removed"], serde_json::json!([second_hash]));
     }
 
     #[tokio::test]

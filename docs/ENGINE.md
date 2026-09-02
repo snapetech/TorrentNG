@@ -117,10 +117,19 @@ info hash, lifecycle state, compact MSB-first piece bitmap, tracker deadline,
 and last activity timestamp; peer state, open files, channels, request queues,
 and piece assemblies are intentionally absent. `TierController` applies inbound
 peer, announce, peer-drain, request, state-change, and idle events to the tier
-policy and schedules shared idle checks through the timer wheel. `TierScaleSnapshot`
-records the release proxy for the 100k-torrent target: at most 2% hot torrents,
-at most one active Tokio task per hot torrent, and bounded dormant heap per
-torrent.
+policy and schedules shared idle checks through the timer wheel.
+
+The runtime integration is now behind `runtime.torrent_tiers_enabled`: restore
+retains dormant durable rows without starting a torrent actor, active lifecycle
+states start actors, inbound peers and lifecycle commands promote dormant rows,
+and a shared reconciliation tick demotes idle actors. Persisted tracker
+deadlines are bulk-loaded into a separate shared deadline wheel; when a dormant
+seed becomes due, the engine promotes it and sends a reannounce command. Stats
+and shutdown include the tiered task set. `TierScaleSnapshot` remains a proxy
+contract, not a capacity certificate: the current 100k test exercises the
+controller and registry model, while the dormant registry representation still
+retains a full `TorrentEntry` and the release binary has not yet been measured
+at 100k.
 
 ---
 

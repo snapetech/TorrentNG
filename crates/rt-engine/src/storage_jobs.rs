@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rusqlite::Connection;
-use tokio::sync::{mpsc, oneshot, Semaphore};
+use tokio::sync::{mpsc, oneshot, Notify, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
 use tracing::{debug, warn};
@@ -32,17 +32,18 @@ pub(crate) enum StorageJobAction {
     Cancel,
 }
 
-#[derive(Debug)]
 struct StorageJobControl {
     paused: AtomicBool,
     cancelled: AtomicBool,
+    notify: Notify,
 }
 
 impl StorageJobControl {
-    fn new() -> Self {
+    fn new(paused: bool) -> Self {
         Self {
-            paused: AtomicBool::new(false),
+            paused: AtomicBool::new(paused),
             cancelled: AtomicBool::new(false),
+            notify: Notify::new(),
         }
     }
 
@@ -51,6 +52,24 @@ impl StorageJobControl {
             StorageJobAction::Pause => self.paused.store(true, Ordering::Release),
             StorageJobAction::Resume => self.paused.store(false, Ordering::Release),
             StorageJobAction::Cancel => self.cancelled.store(true, Ordering::Release),
+        }
+        self.notify.notify_waiters();
+    }
+
+    fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
+    }
+
+    async fn wait_until_runnable(&self) {
+        loop {
+            if !self.is_paused() || self.cancelled.load(Ordering::Acquire) {
+                return;
+            }
+            let notified = self.notify.notified();
+            if !self.is_paused() || self.cancelled.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
         }
     }
 
@@ -83,12 +102,40 @@ pub(crate) struct StorageJobCompletion {
     pub(crate) succeeded: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StorageJobStats {
+    pub(crate) queue_depth: usize,
+    pub(crate) inflight: usize,
+    pub(crate) capacity: usize,
+    pub(crate) worker_count: usize,
+}
+
 /// Handle for the bounded storage worker supervisor.
 pub(crate) struct StorageJobDispatcher {
     tx: mpsc::Sender<StorageJobRequest>,
     controls: Arc<Mutex<HashMap<String, Arc<StorageJobControl>>>>,
+    max_inflight: usize,
+    worker_count: usize,
     shutdown_tx: Option<oneshot::Sender<()>>,
     join: Option<JoinHandle<()>>,
+}
+
+/// Removes a request's admission slot even when the request future itself
+/// panics. The supervisor normally reaps completed futures and performs this
+/// cleanup, but a panic is a separate failure path; without the guard a
+/// single worker panic would permanently consume one end-to-end capacity
+/// slot until restart.
+struct StorageJobRegistration {
+    job_id: String,
+    controls: Arc<Mutex<HashMap<String, Arc<StorageJobControl>>>>,
+}
+
+impl Drop for StorageJobRegistration {
+    fn drop(&mut self) {
+        if let Ok(mut controls) = self.controls.lock() {
+            controls.remove(&self.job_id);
+        }
+    }
 }
 
 impl StorageJobDispatcher {
@@ -102,6 +149,8 @@ impl StorageJobDispatcher {
         Self {
             tx,
             controls: Arc::new(Mutex::new(HashMap::new())),
+            max_inflight: 2,
+            worker_count: 1,
             shutdown_tx: None,
             join: None,
         }
@@ -112,10 +161,19 @@ impl StorageJobDispatcher {
         worker_count: usize,
         queue_capacity: usize,
     ) -> Self {
-        let (tx, rx) = mpsc::channel(queue_capacity.max(1));
+        let worker_count = worker_count.max(1);
+        let queue_capacity = queue_capacity.max(1);
+        let max_inflight = queue_capacity.saturating_add(worker_count);
+        // Size the channel to the full end-to-end inflight bound, not just
+        // queue_capacity: submit_inner's `controls.len() >= max_inflight`
+        // check is what's meant to reject over-capacity submissions (with a
+        // clear "dispatcher is at capacity" error). A smaller channel buffer
+        // makes `try_send` hit its own, stricter "queue is full" rejection
+        // first whenever the supervisor hasn't drained a slot yet, which is
+        // a scheduling artifact, not the intended bound.
+        let (tx, rx) = mpsc::channel(max_inflight);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let controls = Arc::new(Mutex::new(HashMap::new()));
-        let worker_count = worker_count.max(1);
         let slots = Arc::new(Semaphore::new(worker_count));
         let supervisor_controls = Arc::clone(&controls);
         let join = tokio::spawn(run_supervisor(rx, shutdown_rx, slots, supervisor_controls));
@@ -125,6 +183,8 @@ impl StorageJobDispatcher {
         Self {
             tx,
             controls,
+            max_inflight,
+            worker_count,
             shutdown_tx: Some(shutdown_tx),
             join: Some(join),
         }
@@ -144,11 +204,66 @@ impl StorageJobDispatcher {
         roots: Vec<std::path::PathBuf>,
         completion: oneshot::Sender<StorageJobCompletion>,
     ) -> Result<(), String> {
-        let control = Arc::new(StorageJobControl::new());
-        self.controls
-            .lock()
-            .expect("storage job controls mutex poisoned")
-            .insert(job_id.clone(), Arc::clone(&control));
+        self.submit_inner(
+            db,
+            job_id,
+            operation,
+            plan,
+            completed_steps,
+            roots,
+            completion,
+            false,
+        )
+    }
+
+    /// Reattach a durable paused job without briefly marking it running or
+    /// consuming a worker slot. Resume/cancel wakes the supervisor task.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn submit_paused(
+        &self,
+        db: Arc<Mutex<Connection>>,
+        job_id: String,
+        operation: String,
+        plan: StoragePlan,
+        completed_steps: Vec<usize>,
+        roots: Vec<std::path::PathBuf>,
+        completion: oneshot::Sender<StorageJobCompletion>,
+    ) -> Result<(), String> {
+        self.submit_inner(
+            db,
+            job_id,
+            operation,
+            plan,
+            completed_steps,
+            roots,
+            completion,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn submit_inner(
+        &self,
+        db: Arc<Mutex<Connection>>,
+        job_id: String,
+        operation: String,
+        plan: StoragePlan,
+        completed_steps: Vec<usize>,
+        roots: Vec<std::path::PathBuf>,
+        completion: oneshot::Sender<StorageJobCompletion>,
+        paused: bool,
+    ) -> Result<(), String> {
+        let control = Arc::new(StorageJobControl::new(paused));
+        {
+            let mut controls = self
+                .controls
+                .lock()
+                .expect("storage job controls mutex poisoned");
+            if controls.len() >= self.max_inflight {
+                return Err("storage job dispatcher is at capacity".to_owned());
+            }
+            controls.insert(job_id.clone(), Arc::clone(&control));
+        }
         let request = StorageJobRequest {
             job_id: job_id.clone(),
             operation,
@@ -184,6 +299,24 @@ impl StorageJobDispatcher {
             .ok_or_else(|| format!("storage worker has no active job {job_id}"))?;
         control.apply(action);
         Ok(())
+    }
+
+    pub(crate) fn stats(&self) -> StorageJobStats {
+        let inflight = self
+            .controls
+            .lock()
+            .expect("storage job controls mutex poisoned")
+            .len();
+        StorageJobStats {
+            queue_depth: self.max_inflight.saturating_sub(self.tx.capacity()),
+            inflight,
+            capacity: self.max_inflight,
+            worker_count: self.worker_count,
+        }
+    }
+
+    pub(crate) fn is_healthy(&self) -> bool {
+        !self.tx.is_closed() && self.join.as_ref().is_some_and(|join| !join.is_finished())
     }
 
     pub(crate) async fn shutdown(&mut self, timeout_budget: Duration) {
@@ -226,24 +359,23 @@ async fn run_supervisor(
     loop {
         tokio::select! {
             biased;
-            _ = &mut shutdown_rx => break,
+            _ = &mut shutdown_rx => {
+                let active_controls = controls
+                    .lock()
+                    .expect("storage job controls mutex poisoned")
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for control in active_controls {
+                    control.apply(StorageJobAction::Cancel);
+                }
+                break;
+            },
             Some(request) = rx.recv() => {
                 let slots = Arc::clone(&slots);
+                let request_controls = Arc::clone(&controls);
                 active.spawn(async move {
-                    let _slot = slots.acquire_owned().await.expect("storage worker semaphore closed");
-                    let job_id = request.job_id.clone();
-                    let result = tokio::task::spawn_blocking(move || execute_storage_job(request)).await;
-                    if let Err(error) = result {
-                        warn!(
-                            component = "storage_jobs",
-                            operation = "worker",
-                            job_id = %job_id,
-                            result = "panic",
-                            error = %error,
-                            "storage worker task failed"
-                        );
-                    }
-                    job_id
+                    run_storage_request(request, slots, request_controls).await
                 });
             }
             Some(result) = active.join_next(), if !active.is_empty() => {
@@ -296,6 +428,60 @@ async fn run_supervisor(
             .lock()
             .expect("storage job controls mutex poisoned")
             .remove(&request.job_id);
+    }
+}
+
+async fn run_storage_request(
+    request: StorageJobRequest,
+    slots: Arc<Semaphore>,
+    controls: Arc<Mutex<HashMap<String, Arc<StorageJobControl>>>>,
+) -> String {
+    let job_id = request.job_id.clone();
+    let _registration = StorageJobRegistration {
+        job_id: job_id.clone(),
+        controls,
+    };
+    let control = Arc::clone(&request.control);
+    loop {
+        control.wait_until_runnable().await;
+        let slot = Arc::clone(&slots)
+            .acquire_owned()
+            .await
+            .expect("storage worker semaphore closed");
+        // A pause can arrive after the wait and before the slot is acquired.
+        // Release the slot and wait again so paused jobs do not starve active
+        // work behind the fixed worker budget.
+        if control.is_paused() && !control.cancelled.load(Ordering::Acquire) {
+            drop(slot);
+            continue;
+        }
+        let recovery_db = Arc::clone(&request.db);
+        let recovery_operation = request.operation.clone();
+        let recovery_plan = request.plan.clone();
+        let recovery_completed_steps = request.completed_steps.clone();
+        let result = tokio::task::spawn_blocking(move || execute_storage_job(request)).await;
+        drop(slot);
+        if let Err(error) = result {
+            let reason = format!("storage worker panicked: {error}");
+            let _ = persist_terminal(
+                &recovery_db,
+                &job_id,
+                &recovery_operation,
+                &recovery_plan,
+                &recovery_completed_steps,
+                "failed",
+                Some(reason.clone()),
+            );
+            warn!(
+                component = "storage_jobs",
+                operation = "worker",
+                job_id = %job_id,
+                result = "panic",
+                error = %error,
+                "storage worker task failed; durable job marked failed"
+            );
+        }
+        return job_id;
     }
 }
 
@@ -508,13 +694,230 @@ mod tests {
         migrate(&connection).unwrap();
         let db = Arc::new(Mutex::new(connection));
         let mut dispatcher = StorageJobDispatcher::with_limits(Arc::clone(&db), 1, 1);
-        let control = Arc::new(StorageJobControl::new());
+        let control = Arc::new(StorageJobControl::new(false));
         control.apply(StorageJobAction::Pause);
         assert!(control.paused.load(Ordering::Acquire));
         control.apply(StorageJobAction::Resume);
         assert!(!control.paused.load(Ordering::Acquire));
         control.apply(StorageJobAction::Cancel);
         assert!(control.cancelled.load(Ordering::Acquire));
+        dispatcher.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn dispatcher_rejects_when_end_to_end_inflight_bound_is_reached() {
+        let connection = Connection::open_in_memory().unwrap();
+        migrate(&connection).unwrap();
+        let now = unix_now_i64();
+        for job_id in ["paused-one", "paused-two", "paused-three"] {
+            rt_db::upsert_job(
+                &connection,
+                &rt_db::JobRow {
+                    job_id: job_id.to_owned(),
+                    kind: "storage_plan".to_owned(),
+                    state: "paused".to_owned(),
+                    dry_run: false,
+                    affected_torrents: Vec::new(),
+                    total: 0,
+                    done: 0,
+                    checkpoint: 0,
+                    file_index: Some(0),
+                    piece_index: None,
+                    byte_offset: Some(0),
+                    verified_bytes: 0,
+                    invalid_pieces: Vec::new(),
+                    error: None,
+                    created_at: now,
+                    started_at: None,
+                    updated_at: now,
+                    finished_at: None,
+                },
+            )
+            .unwrap();
+        }
+        let db = Arc::new(Mutex::new(connection));
+        let mut dispatcher = StorageJobDispatcher::with_limits(Arc::clone(&db), 1, 2);
+        let root = tempfile::tempdir().unwrap();
+        let plan = StoragePlan {
+            dry_run: false,
+            can_apply: true,
+            issues: Vec::new(),
+            steps: Vec::new(),
+            rollback_steps: Vec::new(),
+        };
+
+        {
+            let job_id = "paused-one";
+            let (completion, _completion_rx) = oneshot::channel();
+            dispatcher
+                .submit_paused(
+                    Arc::clone(&db),
+                    job_id.to_owned(),
+                    "move".to_owned(),
+                    plan.clone(),
+                    Vec::new(),
+                    vec![root.path().to_path_buf()],
+                    completion,
+                )
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        for job_id in ["paused-two", "paused-three"] {
+            let (completion, _completion_rx) = oneshot::channel();
+            dispatcher
+                .submit_paused(
+                    Arc::clone(&db),
+                    job_id.to_owned(),
+                    "move".to_owned(),
+                    plan.clone(),
+                    Vec::new(),
+                    vec![root.path().to_path_buf()],
+                    completion,
+                )
+                .unwrap();
+        }
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let stats = dispatcher.stats();
+        assert_eq!(stats.inflight, 3);
+        assert_eq!(stats.capacity, 3);
+        assert_eq!(stats.worker_count, 1);
+
+        let (completion, _completion_rx) = oneshot::channel();
+        let error = dispatcher
+            .submit_paused(
+                Arc::clone(&db),
+                "paused-four".to_owned(),
+                "move".to_owned(),
+                plan,
+                Vec::new(),
+                vec![root.path().to_path_buf()],
+                completion,
+            )
+            .unwrap_err();
+        assert_eq!(error, "storage job dispatcher is at capacity");
+        dispatcher.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn worker_panic_releases_end_to_end_inflight_registration() {
+        let connection = Connection::open_in_memory().unwrap();
+        migrate(&connection).unwrap();
+        let db = Arc::new(Mutex::new(connection));
+        let control = Arc::new(StorageJobControl::new(false));
+        let controls = Arc::new(Mutex::new(HashMap::from([(
+            "panic-job".to_owned(),
+            Arc::clone(&control),
+        )])));
+        let (completion, _completion_rx) = oneshot::channel();
+        let request = StorageJobRequest {
+            job_id: "panic-job".to_owned(),
+            operation: "move".to_owned(),
+            plan: StoragePlan {
+                dry_run: false,
+                can_apply: true,
+                issues: Vec::new(),
+                steps: Vec::new(),
+                rollback_steps: Vec::new(),
+            },
+            completed_steps: Vec::new(),
+            roots: Vec::new(),
+            db,
+            control,
+            completion,
+        };
+        let slots = Arc::new(Semaphore::new(0));
+        slots.close();
+
+        let result = tokio::spawn(run_storage_request(request, slots, Arc::clone(&controls))).await;
+        assert!(
+            result.is_err(),
+            "closed worker semaphore should exercise panic path"
+        );
+        assert!(controls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn paused_job_waits_without_consuming_worker_slot_until_resumed() {
+        let root = tempfile::tempdir().unwrap();
+        let connection = Connection::open_in_memory().unwrap();
+        migrate(&connection).unwrap();
+        let now = unix_now_i64();
+        rt_db::upsert_job(
+            &connection,
+            &rt_db::JobRow {
+                job_id: "paused-storage".to_owned(),
+                kind: "storage_plan".to_owned(),
+                state: "paused".to_owned(),
+                dry_run: false,
+                affected_torrents: Vec::new(),
+                total: 0,
+                done: 0,
+                checkpoint: 0,
+                file_index: Some(0),
+                piece_index: None,
+                byte_offset: Some(0),
+                verified_bytes: 0,
+                invalid_pieces: Vec::new(),
+                error: None,
+                created_at: now,
+                started_at: None,
+                updated_at: now,
+                finished_at: None,
+            },
+        )
+        .unwrap();
+        let db = Arc::new(Mutex::new(connection));
+        let mut dispatcher = StorageJobDispatcher::with_limits(Arc::clone(&db), 1, 1);
+        let plan = StoragePlan {
+            dry_run: false,
+            can_apply: true,
+            issues: Vec::new(),
+            steps: Vec::new(),
+            rollback_steps: Vec::new(),
+        };
+        let (completion, mut completion_rx) = oneshot::channel();
+        dispatcher
+            .submit_paused(
+                Arc::clone(&db),
+                "paused-storage".to_owned(),
+                "move".to_owned(),
+                plan,
+                Vec::new(),
+                vec![root.path().to_path_buf()],
+                completion,
+            )
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        {
+            let conn = db.lock().unwrap();
+            assert_eq!(
+                rt_db::get_job(&conn, "paused-storage").unwrap().state,
+                "paused"
+            );
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut completion_rx)
+                .await
+                .is_err()
+        );
+
+        dispatcher
+            .control("paused-storage", StorageJobAction::Resume)
+            .unwrap();
+        let completion = tokio::time::timeout(Duration::from_secs(1), completion_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(completion.succeeded);
+        {
+            let conn = db.lock().unwrap();
+            assert_eq!(
+                rt_db::get_job(&conn, "paused-storage").unwrap().state,
+                "completed"
+            );
+        }
         dispatcher.shutdown(Duration::from_secs(1)).await;
     }
 

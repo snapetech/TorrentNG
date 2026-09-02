@@ -56,6 +56,8 @@ pub struct EngineStats {
     pub torrents_activity_hot: u64,
     pub torrents_activity_warm: u64,
     pub torrents_activity_dormant: u64,
+    /// Heap bytes retained by the compact dormant runtime projections.
+    pub dormant_runtime_heap_bytes: u64,
     pub torrent_tasks_active: u64,
     pub fastresume_dirty_pieces: u64,
     pub completed_piece_verify_from_memory: u64,
@@ -63,7 +65,22 @@ pub struct EngineStats {
     pub bytes_uploaded: u64,
     pub bytes_downloaded: u64,
     pub bytes_left: u64,
+    /// Aggregate current peer download rate in bytes per second.
+    pub download_rate: i64,
+    /// Aggregate current peer upload rate in bytes per second.
+    pub upload_rate: i64,
     pub jobs_active: u64,
+    /// Storage-plan requests currently retained by the background dispatcher,
+    /// including queued, paused, and running requests.
+    pub storage_jobs_inflight: u64,
+    /// Storage-plan requests pending in the bounded dispatcher channel. A
+    /// paused request already handed to the supervisor is counted only in
+    /// `storage_jobs_inflight`, not here.
+    pub storage_jobs_queue_depth: u64,
+    /// End-to-end storage-plan request capacity, including worker slots.
+    pub storage_jobs_capacity: u64,
+    /// Configured blocking storage worker count.
+    pub storage_workers: u64,
     pub trackers_total: u64,
     pub trackers_working: u64,
     pub trackers_warning: u64,
@@ -149,6 +166,16 @@ pub struct EngineStats {
     pub resources: Option<ResourceSnapshot>,
 }
 
+/// Liveness of the engine-owned dependency boundaries. A healthy engine
+/// actor is not sufficient if its storage supervisor or DHT task has already
+/// died; the API health endpoint exposes these states separately.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EngineSubsystemHealth {
+    pub storage_workers_healthy: bool,
+    pub dht_enabled: bool,
+    pub dht_healthy: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HotTorrentMemoryStats {
     pub info_hash: String,
@@ -231,6 +258,8 @@ impl From<rt_db::JobRow> for EngineJob {
 pub struct TorrentRuntimeStats {
     pub connected_peers: u64,
     pub outstanding_requests: u64,
+    pub download_rate: i64,
+    pub upload_rate: i64,
     pub fastresume_dirty_pieces: u64,
     pub completed_piece_verify_from_memory: u64,
     pub completed_piece_verify_from_disk: u64,
@@ -264,6 +293,8 @@ impl EngineStats {
     pub fn add_torrent_runtime(&mut self, info_hash: String, runtime: TorrentRuntimeStats) {
         self.record_hot_torrent_memory(info_hash, &runtime);
         self.torrent_tasks_active = self.torrent_tasks_active.saturating_add(1);
+        self.download_rate = self.download_rate.saturating_add(runtime.download_rate);
+        self.upload_rate = self.upload_rate.saturating_add(runtime.upload_rate);
         self.fastresume_dirty_pieces = self
             .fastresume_dirty_pieces
             .saturating_add(runtime.fastresume_dirty_pieces);
@@ -813,6 +844,14 @@ pub enum EngineCmd {
         save_path: Option<PathBuf>,
         reply: oneshot::Sender<CmdResult<()>>,
     },
+    /// Update user-visible fields and return a durable storage job id when a
+    /// save-path move was queued asynchronously.
+    UpdateTorrentFieldsWithJob {
+        info_hash: String,
+        name: Option<String>,
+        save_path: Option<PathBuf>,
+        reply: oneshot::Sender<CmdResult<Option<String>>>,
+    },
     /// Execute a durable storage plan through the engine job table.
     ExecuteStoragePlan {
         operation: String,
@@ -918,6 +957,11 @@ pub enum EngineCmd {
     GetStats {
         reply: oneshot::Sender<CmdResult<EngineStats>>,
     },
+    /// Probe engine-owned dependency seams without performing a full stats
+    /// collection.
+    GetHealth {
+        reply: oneshot::Sender<CmdResult<EngineSubsystemHealth>>,
+    },
     /// Read recent durable session events for API log projection.
     ListSessionEvents {
         info_hash: Option<String>,
@@ -1014,6 +1058,8 @@ mod tests {
             TorrentRuntimeStats {
                 connected_peers: 2,
                 outstanding_requests: 3,
+                download_rate: 30,
+                upload_rate: 40,
                 fastresume_dirty_pieces: 4,
                 completed_piece_verify_from_memory: 5,
                 completed_piece_verify_from_disk: 6,
@@ -1041,6 +1087,8 @@ mod tests {
         assert_eq!(stats.storage_file_pool_misses, 2);
         assert_eq!(stats.storage_read_ops, 51);
         assert_eq!(stats.storage_write_ops, 27);
+        assert_eq!(stats.download_rate, 30);
+        assert_eq!(stats.upload_rate, 40);
         assert_eq!(stats.storage_bytes_read, 28);
         assert_eq!(stats.storage_bytes_written, 29);
         assert_eq!(stats.storage_read_ops_by_class[0], 25);

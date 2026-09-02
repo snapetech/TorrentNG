@@ -629,8 +629,14 @@ mod order_clause_tests {
     #[test]
     fn status_sorts_via_case_expression_not_default_name_sort() {
         let clause = order_clause(Some("status"), None);
-        assert!(clause.contains("CASE"), "expected a CASE expression: {clause}");
-        assert!(clause.trim_end().ends_with("END ASC"), "unexpected clause: {clause}");
+        assert!(
+            clause.contains("CASE"),
+            "expected a CASE expression: {clause}"
+        );
+        assert!(
+            clause.trim_end().ends_with("END ASC"),
+            "unexpected clause: {clause}"
+        );
         assert!(
             !clause.contains("t.name"),
             "status sort must not silently fall back to name sort: {clause}"
@@ -640,7 +646,10 @@ mod order_clause_tests {
     #[test]
     fn status_desc_respects_direction() {
         let clause = order_clause(Some("status"), Some("desc"));
-        assert!(clause.trim_end().ends_with("END DESC"), "unexpected clause: {clause}");
+        assert!(
+            clause.trim_end().ends_with("END DESC"),
+            "unexpected clause: {clause}"
+        );
     }
 
     #[test]

@@ -44,6 +44,9 @@ async-trait = "0.1"
 # Config / env
 dotenvy = "0.15"
 
+# Per-install peer identity generation (see docs/TRACKER-IDENTITY.md)
+rand = "0.8"
+
 # Misc
 bytes = "1"
 base64 = "0.22"

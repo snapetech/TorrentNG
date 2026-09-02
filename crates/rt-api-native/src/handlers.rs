@@ -22,8 +22,8 @@ use rt_api_model::{
     AddTorrentRequest, AddTorrentResponse, ApiError, FileInfo, TorrentDetail, TorrentSummary,
 };
 use rt_engine::{
-    EngineGlobalLimits, EngineJob, EngineNetworkFeatures, EngineStorageRoot, EngineTorrentLimits,
-    QueueMove,
+    EngineGlobalLimits, EngineHandle, EngineJob, EngineNetworkFeatures, EngineStorageRoot,
+    EngineTorrentLimits, QueueMove,
 };
 use rt_metainfo::{parse_magnet, parse_torrent};
 use rt_metrics::MemoryClass;
@@ -34,7 +34,7 @@ use rt_storage::{
 };
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::state::{torrent_summary, AppState, JsonMap, TorrentSnapshotError, TorrentSnapshotItem};
+use crate::state::{torrent_summary, AppState, JsonMap, TorrentSnapshotError};
 
 /// `POST /api/v1/auth/login` — native WebUI session probe.
 pub async fn auth_login(State(state): State<AppState>, body: String) -> impl IntoResponse {
@@ -138,15 +138,60 @@ pub async fn list_torrents(
                 .into_response();
         }
     };
-    let total = snapshot
-        .torrents
-        .iter()
-        .filter(|item| torrent_matches_summary(&item.summary, &query))
-        .count();
+    let indexed_states = indexed_status_states(query.status.as_deref());
+    let candidates = snapshot.candidate_indices(
+        &indexed_states,
+        query.category.as_deref(),
+        query.tag.as_deref(),
+    );
+    let total = match candidates.as_ref() {
+        Some(indices) => indices
+            .iter()
+            .filter_map(|index| snapshot.torrents.get(*index))
+            .filter(|item| torrent_matches_summary(&item.summary, &query))
+            .count(),
+        None => snapshot
+            .torrents
+            .iter()
+            .filter(|item| torrent_matches_summary(&item.summary, &query))
+            .count(),
+    };
     let limit = query.limit.unwrap_or(200).clamp(1, 5_000);
     let offset = query.offset.unwrap_or(0);
-    let estimate = estimate_torrent_summary_snapshot_bytes(snapshot.torrents.len());
-
+    let descending = query.reverse.unwrap_or(false)
+        || query
+            .dir
+            .as_deref()
+            .is_some_and(|dir| dir.eq_ignore_ascii_case("desc"));
+    let order = snapshot.ordered_indices(query.sort.as_deref());
+    let mut skipped = 0;
+    let mut summaries = Vec::with_capacity(limit);
+    let indices: Box<dyn Iterator<Item = &usize>> = if descending {
+        Box::new(order.iter().rev())
+    } else {
+        Box::new(order.iter())
+    };
+    for index in indices {
+        if candidates
+            .as_ref()
+            .is_some_and(|candidate| candidate.binary_search(index).is_err())
+        {
+            continue;
+        }
+        let item = &snapshot.torrents[*index];
+        if !torrent_matches_summary(&item.summary, &query) {
+            continue;
+        }
+        if skipped < offset {
+            skipped += 1;
+            continue;
+        }
+        summaries.push(item.summary.clone());
+        if summaries.len() == limit {
+            break;
+        }
+    }
+    let estimate = estimate_torrent_summary_snapshot_bytes(summaries.len());
     let lease = if let Some(engine) = &state.engine {
         match engine
             .reserve_memory(MemoryClass::ApiSnapshot, estimate)
@@ -165,19 +210,6 @@ pub async fn list_torrents(
     } else {
         None
     };
-
-    let mut entries = snapshot
-        .torrents
-        .iter()
-        .filter(|item| torrent_matches_summary(&item.summary, &query))
-        .collect::<Vec<_>>();
-    sort_torrent_summaries(&mut entries, &query);
-    let summaries = entries
-        .into_iter()
-        .skip(offset)
-        .take(limit)
-        .map(|item| item.summary.clone())
-        .collect::<Vec<_>>();
     drop(lease);
     (
         StatusCode::OK,
@@ -188,6 +220,27 @@ pub async fn list_torrents(
         }),
     )
         .into_response()
+}
+
+fn indexed_status_states(status: Option<&str>) -> Vec<&'static str> {
+    match status
+        .map(str::trim)
+        .filter(|status| !status.is_empty())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("active") => vec!["downloading", "seeding", "checking"],
+        Some("completed" | "complete") => vec!["seeding"],
+        Some("stopped") => vec!["stopped", "paused"],
+        Some("checking") => vec!["checking"],
+        Some("downloading") => vec!["downloading"],
+        Some("error") => vec!["error"],
+        Some("metadata_pending") => vec!["metadata_pending"],
+        Some("paused") => vec!["paused"],
+        Some("queued") => vec!["queued"],
+        Some("seeding") => vec!["seeding"],
+        _ => Vec::new(),
+    }
 }
 
 fn torrent_matches_summary(entry: &TorrentSummary, query: &TorrentListQuery) -> bool {
@@ -237,43 +290,6 @@ fn torrent_matches_summary(entry: &TorrentSummary, query: &TorrentListQuery) -> 
         return false;
     }
     true
-}
-
-fn sort_torrent_summaries(entries: &mut [&TorrentSnapshotItem], query: &TorrentListQuery) {
-    let sort = query.sort.as_deref().unwrap_or("added");
-    entries.sort_by(|left, right| {
-        let ordering = match sort {
-            "name" => left
-                .summary
-                .name
-                .to_ascii_lowercase()
-                .cmp(&right.summary.name.to_ascii_lowercase()),
-            "size" | "total_length" => left.summary.total_length.cmp(&right.summary.total_length),
-            "ratio" => left
-                .summary
-                .ratio
-                .partial_cmp(&right.summary.ratio)
-                .unwrap_or(std::cmp::Ordering::Equal),
-            "progress" => (left.summary.total_length.max(0) as u64)
-                .saturating_sub(left.amount_left)
-                .cmp(
-                    &((right.summary.total_length.max(0) as u64).saturating_sub(right.amount_left)),
-                ),
-            "hash" => left.summary.info_hash.cmp(&right.summary.info_hash),
-            _ => left.summary.added_at.cmp(&right.summary.added_at),
-        };
-        let ordering = if query.reverse.unwrap_or(false)
-            || query
-                .dir
-                .as_deref()
-                .is_some_and(|dir| dir.eq_ignore_ascii_case("desc"))
-        {
-            ordering.reverse()
-        } else {
-            ordering
-        };
-        ordering.then_with(|| left.summary.info_hash.cmp(&right.summary.info_hash))
-    });
 }
 
 fn api_snapshot_budget_exhausted() -> axum::response::Response {
@@ -549,10 +565,15 @@ pub async fn update_torrent(
 
     if let Some(engine) = &state.engine {
         return match engine
-            .update_torrent_fields(info_hash.clone(), name, save_path)
+            .update_torrent_fields_with_job(info_hash.clone(), name, save_path)
             .await
         {
-            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Ok(Some(job_id)) => (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({ "job_id": job_id, "state": "queued" })),
+            )
+                .into_response(),
+            Ok(None) => StatusCode::NO_CONTENT.into_response(),
             Err(e) => (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::to_value(ApiError::bad_request(e)).unwrap()),
@@ -807,21 +828,38 @@ pub async fn transfer_limits(State(state): State<AppState>) -> impl IntoResponse
 
 /// `GET /api/v1/transfer/info` — qBit-compatible aggregate transfer counters.
 pub async fn transfer_info(State(state): State<AppState>) -> impl IntoResponse {
-    let hashes = {
-        let reg = state.registry.read().await;
-        reg.iter()
-            .map(|entry| entry.info_hash.clone())
-            .collect::<Vec<_>>()
-    };
-    let (dl_info_speed, up_info_speed) = native_session_peer_rates(&state, &hashes).await;
-    let reg = state.registry.read().await;
-    let mut dl_info_data = 0i64;
-    let mut up_info_data = 0i64;
-    for entry in reg.iter() {
-        dl_info_data = dl_info_data.saturating_add(entry.stats.downloaded as i64);
-        up_info_data = up_info_data.saturating_add(entry.stats.uploaded as i64);
-    }
-    drop(reg);
+    let (dl_info_speed, up_info_speed, dl_info_data, up_info_data, dht_nodes) =
+        if let Some(engine) = &state.engine {
+            match engine.stats().await {
+                Ok(stats) => (
+                    stats.download_rate,
+                    stats.upload_rate,
+                    stats.bytes_downloaded.min(i64::MAX as u64) as i64,
+                    stats.bytes_uploaded.min(i64::MAX as u64) as i64,
+                    stats.dht_routing_nodes.min(i64::MAX as u64) as i64,
+                ),
+                Err(_) => (0, 0, 0, 0, 0),
+            }
+        } else {
+            // Keep the no-engine facade mode bounded by the same shared
+            // snapshot used by list consumers. There is no live peer-rate
+            // source without an engine, so only durable byte counters apply.
+            match state.torrent_snapshot(None).await {
+                Ok(snapshot) => snapshot.torrents.iter().fold(
+                    (0_i64, 0_i64, 0_i64, 0_i64, 0_i64),
+                    |(dl_speed, up_speed, dl_data, up_data, dht), item| {
+                        (
+                            dl_speed,
+                            up_speed,
+                            dl_data.saturating_add(item.summary.downloaded.max(0)),
+                            up_data.saturating_add(item.summary.uploaded.max(0)),
+                            dht,
+                        )
+                    },
+                ),
+                Err(_) => (0, 0, 0, 0, 0),
+            }
+        };
 
     let (dl_rate_limit, up_rate_limit) = if let Some(engine) = &state.engine {
         match engine.global_limits().await {
@@ -850,7 +888,7 @@ pub async fn transfer_info(State(state): State<AppState>) -> impl IntoResponse {
         up_info_data,
         dl_rate_limit,
         up_rate_limit,
-        dht_nodes: 0,
+        dht_nodes,
         connection_status: if state.engine.is_some() {
             "connected".to_owned()
         } else {
@@ -858,23 +896,6 @@ pub async fn transfer_info(State(state): State<AppState>) -> impl IntoResponse {
         },
     })
     .into_response()
-}
-
-async fn native_session_peer_rates(state: &AppState, hashes: &[String]) -> (i64, i64) {
-    let Some(engine) = &state.engine else {
-        return (0, 0);
-    };
-    let mut download_rate = 0i64;
-    let mut upload_rate = 0i64;
-    for hash in hashes {
-        if let Ok(peers) = engine.torrent_peers(hash.clone()).await {
-            for peer in peers {
-                download_rate = download_rate.saturating_add(peer.download_rate);
-                upload_rate = upload_rate.saturating_add(peer.upload_rate);
-            }
-        }
-    }
-    (download_rate, upload_rate)
 }
 
 /// `PUT /api/v1/transfer/limits` — merge global transfer limits.
@@ -3117,8 +3138,20 @@ pub async fn diagnose_torrent(
 
 /// `GET /health` — native engine readiness probe.
 pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    let torrent_count = state.registry.read().await.iter().count();
-    let ready = state.engine.is_some();
+    let torrent_count = state.registry.read().await.len();
+    let engine_alive = state.engine.as_ref().is_some_and(EngineHandle::is_alive);
+    let subsystem_health = if engine_alive {
+        match state.engine.as_ref() {
+            Some(engine) => engine.subsystem_health().await.ok(),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let ready = engine_alive
+        && subsystem_health.is_some_and(|health| {
+            health.storage_workers_healthy && (!health.dht_enabled || health.dht_healthy)
+        });
     let status = if ready {
         StatusCode::OK
     } else {
@@ -3135,6 +3168,16 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
                 "mode": if ready { "native" } else { "unavailable" },
                 "source_of_truth": if ready { "sqlite_session_db" } else { "registry_only" },
                 "track1_sidecar_required": false,
+                "subsystems": {
+                    "engine": { "alive": engine_alive },
+                    "storage_workers": {
+                        "healthy": subsystem_health.map(|health| health.storage_workers_healthy).unwrap_or(false)
+                    },
+                    "dht": {
+                        "enabled": subsystem_health.map(|health| health.dht_enabled).unwrap_or(false),
+                        "healthy": subsystem_health.map(|health| health.dht_healthy).unwrap_or(false)
+                    }
+                },
                 "capabilities": native_engine_capabilities(),
             },
         })),
@@ -3205,7 +3248,7 @@ fn native_engine_capabilities() -> serde_json::Value {
             "durable_recheck": true,
             "pause_resume_cancel": true,
             "crash_recovery": true,
-            "storage_plan_controls": false,
+            "storage_plan_controls": true,
             "storage_throttled": false,
         },
         "storage": {
@@ -3251,7 +3294,7 @@ fn native_engine_capabilities() -> serde_json::Value {
         "operations": {
             "prometheus_metrics": true,
             "diagnostics": true,
-            "bounded_shutdown": false,
+            "bounded_shutdown": true,
             "api_token_auth": true,
             "scale_certification": false,
         },
@@ -3693,6 +3736,13 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
     );
     metric(
         &mut out,
+        "torrentng_dormant_runtime_heap_bytes",
+        "gauge",
+        "Heap bytes retained by compact dormant runtime projections",
+        stats.dormant_runtime_heap_bytes,
+    );
+    metric(
+        &mut out,
         "torrentng_torrent_tasks_active",
         "gauge",
         "Active per-torrent runtime tasks",
@@ -3735,6 +3785,20 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
     );
     metric(
         &mut out,
+        "torrentng_download_rate_bytes_per_second",
+        "gauge",
+        "Aggregate current peer download rate",
+        stats.download_rate.max(0) as u64,
+    );
+    metric(
+        &mut out,
+        "torrentng_upload_rate_bytes_per_second",
+        "gauge",
+        "Aggregate current peer upload rate",
+        stats.upload_rate.max(0) as u64,
+    );
+    metric(
+        &mut out,
         "torrentng_bytes_left",
         "gauge",
         "Bytes left across enabled torrent pieces",
@@ -3746,6 +3810,34 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
         "gauge",
         "Active durable jobs",
         stats.jobs_active,
+    );
+    metric(
+        &mut out,
+        "torrentng_storage_jobs_inflight",
+        "gauge",
+        "Storage-plan requests retained by the background dispatcher",
+        stats.storage_jobs_inflight,
+    );
+    metric(
+        &mut out,
+        "torrentng_storage_jobs_queue_depth",
+        "gauge",
+        "Storage-plan requests pending in the bounded dispatcher channel",
+        stats.storage_jobs_queue_depth,
+    );
+    metric(
+        &mut out,
+        "torrentng_storage_jobs_capacity",
+        "gauge",
+        "End-to-end storage-plan dispatcher capacity",
+        stats.storage_jobs_capacity,
+    );
+    metric(
+        &mut out,
+        "torrentng_storage_workers",
+        "gauge",
+        "Configured blocking storage worker count",
+        stats.storage_workers,
     );
     metric(
         &mut out,
@@ -5771,6 +5863,12 @@ mod tests {
         assert_eq!(body["ready"], false);
         assert_eq!(body["engine"]["mode"], "unavailable");
         assert_eq!(body["engine"]["track1_sidecar_required"], false);
+        assert_eq!(body["engine"]["subsystems"]["engine"]["alive"], false);
+        assert_eq!(
+            body["engine"]["subsystems"]["storage_workers"]["healthy"],
+            false
+        );
+        assert_eq!(body["engine"]["subsystems"]["dht"]["healthy"], false);
         assert_eq!(
             body["engine"]["capabilities"]["torrent_identity"]["hash_lengths"],
             serde_json::json!([40, 64])
@@ -5791,6 +5889,7 @@ mod tests {
         );
         assert_eq!(capabilities["session"]["crash_restore"], true);
         assert_eq!(capabilities["jobs"]["durable_recheck"], true);
+        assert_eq!(capabilities["jobs"]["storage_plan_controls"], true);
         assert_eq!(capabilities["storage"]["v2_file_root_verify"], true);
         assert_eq!(capabilities["networking"]["dht"], true);
         assert_eq!(capabilities["networking"]["utp_packet_codec"], true);
@@ -5809,7 +5908,7 @@ mod tests {
         assert_eq!(capabilities["compatibility"]["qbittorrent_v2"], true);
         assert_eq!(capabilities["migration"]["transmission"], true);
         assert_eq!(capabilities["operations"]["prometheus_metrics"], true);
-        assert_eq!(capabilities["operations"]["bounded_shutdown"], false);
+        assert_eq!(capabilities["operations"]["bounded_shutdown"], true);
         assert_eq!(capabilities["operations"]["scale_certification"], false);
     }
 
@@ -5879,11 +5978,16 @@ mod tests {
             torrents_activity_hot: 2,
             torrents_activity_warm: 3,
             torrents_activity_dormant: 4,
+            dormant_runtime_heap_bytes: 13,
             torrent_tasks_active: 5,
             fastresume_dirty_pieces: 6,
             completed_piece_verify_from_memory: 7,
             completed_piece_verify_from_disk: 8,
             jobs_active: 3,
+            storage_jobs_inflight: 9,
+            storage_jobs_queue_depth: 10,
+            storage_jobs_capacity: 11,
+            storage_workers: 12,
             trackers_error: 4,
             dht_routing_nodes: 45,
             dht_announced_peer_sets: 46,
@@ -5991,11 +6095,16 @@ mod tests {
         assert!(rendered.contains("torrentng_torrents_activity_hot 2"));
         assert!(rendered.contains("torrentng_torrents_activity_warm 3"));
         assert!(rendered.contains("torrentng_torrents_activity_dormant 4"));
+        assert!(rendered.contains("torrentng_dormant_runtime_heap_bytes 13"));
         assert!(rendered.contains("torrentng_torrent_tasks_active 5"));
         assert!(rendered.contains("torrentng_fastresume_dirty_pieces 6"));
         assert!(rendered.contains("torrentng_completed_piece_verify_from_memory_total 7"));
         assert!(rendered.contains("torrentng_completed_piece_verify_from_disk_total 8"));
         assert!(rendered.contains("torrentng_jobs_active 3"));
+        assert!(rendered.contains("torrentng_storage_jobs_inflight 9"));
+        assert!(rendered.contains("torrentng_storage_jobs_queue_depth 10"));
+        assert!(rendered.contains("torrentng_storage_jobs_capacity 11"));
+        assert!(rendered.contains("torrentng_storage_workers 12"));
         assert!(rendered.contains("torrentng_trackers_error 4"));
         assert!(rendered.contains("torrentng_dht_routing_nodes 45"));
         assert!(rendered.contains("torrentng_dht_announced_peer_sets 46"));
@@ -6290,6 +6399,64 @@ mod tests {
             1,
             "page must be bounded by limit"
         );
+    }
+
+    #[tokio::test]
+    async fn list_torrents_snapshot_pins_pages_across_mutations() {
+        let state = AppState::new();
+        for (index, name) in [("a", "alpha"), ("b", "bravo"), ("c", "charlie")] {
+            state
+                .registry
+                .write()
+                .await
+                .add(TorrentEntry::new(
+                    index.repeat(40),
+                    name.to_owned(),
+                    "/data".into(),
+                ))
+                .unwrap();
+        }
+        let app = build_router(state.clone());
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/torrents?sort=name&limit=1&offset=0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = axum::body::to_bytes(first.into_body(), 4096).await.unwrap();
+        let first_json: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+        let snapshot = first_json["snapshot"].as_u64().unwrap();
+        assert_eq!(first_json["torrents"][0]["name"], "alpha");
+
+        {
+            let mut registry = state.registry.write().await;
+            registry.get_mut(&"a".repeat(40)).unwrap().name = "zulu".to_owned();
+        }
+
+        let second = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/torrents?sort=name&limit=1&offset=1&snapshot={snapshot}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_body = axum::body::to_bytes(second.into_body(), 4096)
+            .await
+            .unwrap();
+        let second_json: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
+        assert_eq!(second_json["snapshot"], snapshot);
+        assert_eq!(second_json["total"], 3);
+        assert_eq!(second_json["torrents"][0]["name"], "bravo");
     }
 
     #[tokio::test]

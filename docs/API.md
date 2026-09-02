@@ -108,10 +108,11 @@ the rewritten engine.
 | `POST` | `/api/v1/torrents/:hash/peers` | Add explicit peers (`{ peers: ["host:port"] }`) |
 | `POST` | `/api/v1/torrents/queue` | Move torrents in queue order (`{ hashes: ["..."], move: "up" \| "down" \| "top" \| "bottom" }`) |
 | `PATCH` | `/api/v1/torrents/:hash/tags` | Add/remove tags (`{ add: ["a"], remove: ["b"] }`); native daemon routes tag changes through the engine label update path |
-| `GET` | `/api/v1/events` | Server-sent torrent delta stream |
+| `GET` | `/api/v1/events` | Server-sent torrent delta stream; accepts `last_known_revision` for incremental reconnects |
 | `GET` | `/api/v1/jobs` | List active durable engine jobs with progress, checkpoint, and last-error fields |
 | `GET` | `/api/v1/session-events` | Recent durable native session events; query: `limit`, `torrent`, `kind`, `level`, `last_known_id` |
 | `GET` | `/api/v1/logs` | Recent durable TorrentNG app/backend events plus rTorrent log-ingest events when that adapter is selected; query: `limit`, `kind`, `level`, `last_known_id` |
+| `GET` | `/api/v1/transfer/info` | Aggregate transfer rates, byte counters, DHT node count, and global limit state |
 | `GET` | `/api/v1/transfer/limits` | Read global transfer limits and speed-limits mode |
 | `PUT` | `/api/v1/transfer/limits` | Merge global transfer limits (`download_limit`, `upload_limit`, `speed_limits_mode`) |
 | `GET` | `/api/v1/session/features` | Read runtime network feature switches (`dht`, `pex`) |
@@ -130,9 +131,27 @@ the rewritten engine.
 | `sort` | string | `name` \| `size` \| `added` \| `ratio` \| `speed_down` \| `speed_up` \| `progress` |
 | `dir` | string | `asc` \| `desc` |
 | `limit` | int | Max rows (1–5000, default 200) |
-| `offset` | int | Pagination offset |
+| `offset` | int | Page offset within the immutable snapshot (default 0) |
+| `snapshot` | uint | Snapshot generation returned by a previous page; pin this on every subsequent page |
 
-Response: `{ total: int, torrents: TorrentRow[] }`
+Response: `{ snapshot: uint, total: int, torrents: TorrentRow[] }`. The server
+materializes a bounded immutable summary snapshot and lazily caches sort order;
+the page itself is bounded to `limit`. If a requested `snapshot` has expired
+from the server cache, the endpoint returns `410 Gone` and the client must
+restart pagination without that cursor. Without a cursor, a recent snapshot may
+be reused for up to 750 ms to prevent concurrent list callers from repeatedly
+scanning live actor state.
+
+`GET /api/v1/events` emits `torrent_delta` events with a `cursor` field equal to
+the registry revision. The first event is a snapshot; later events contain only
+mutated or removed torrents from the bounded mutation journal. A reconnect with
+`last_known_revision` resumes from that cursor. If the journal has expired, the
+next event is a one-time full snapshot resync.
+
+`PUT /api/v1/torrents/:hash` returns `202 Accepted` with `{ job_id, state }`
+when changing `save_path` requires a filesystem move. The move is executed by
+the bounded storage worker pool; inspect `/api/v1/jobs` using the returned id.
+Name-only updates and already-local metadata changes retain `204 No Content`.
 
 Native API list, delta-stream, and torrent-detail snapshots are charged to the
 `api_snapshot` memory class. When that budget is exhausted the API returns
@@ -140,8 +159,10 @@ Native API list, delta-stream, and torrent-detail snapshots are charged to the
 unbounded response.
 
 The qBittorrent facade applies the same budget to `/api/qb/v2/torrents/info`
-and `/api/qb/v2/sync/maindata`, because those endpoints clone the largest
-compatibility snapshots under high torrent counts.
+and `/api/qb/v2/sync/maindata`. Bounded pages charge for their selected output;
+full compatibility responses still charge for and materialize the requested
+output. Snapshot caching avoids repeated registry clones, and `sync/maindata`
+uses the registry mutation journal for retained revisions.
 
 The Deluge facade applies the same budget to `web.update_ui`,
 `core.get_torrents_status`, and `core.get_torrent_status`.
@@ -327,12 +348,20 @@ Implements the qBittorrent Web API v2. By default it advertises qBittorrent `5.0
 
 | Method | Path | Notes |
 |--------|------|-------|
-| `GET`  | `/api/qb/v2/torrents/info` | Filter params: `filter`, `category`, `tag`, `sort`, `reverse`, `limit`, `offset` |
+| `GET`  | `/api/qb/v2/torrents/info` | Filter params: `filter`, `category`, `tag`, `sort`, `reverse`, `limit`, `offset`, optional `snapshot`; returns `X-TorrentNG-Snapshot` for stable offset pagination |
 | `GET`  | `/api/qb/v2/torrents/properties` | Query: `hash`; returns cached torrent properties |
 | `POST` | `/api/qb/v2/torrents/add` | Multipart: `urls`, `savepath`, `category`, `tags`, `paused`, `stopped`, `skip_checking`, `autoTMM`, `contentLayout`, `ratioLimit`, `seedingTimeLimit`, `torrents` (file) |
 | `POST` | `/api/qb/v2/torrents/pause` / `/stop` | Form: `hashes` (pipe-separated or `all`) |
 | `POST` | `/api/qb/v2/torrents/resume` / `/start` | Form: `hashes` |
 | `POST` | `/api/qb/v2/torrents/delete` | Form: `hashes`, `deleteFiles` |
+
+For a response containing more than 200 torrents, the native qBittorrent
+facade does not issue per-torrent actor queries for transient tracker, swarm,
+queue, and limit fields. Those fields use compatibility defaults for that
+large projection; durable torrent fields and aggregate transfer statistics
+remain available. This cutoff prevents a 100k-row request from becoming
+100k sequential engine-actor round trips. Small interactive pages retain the
+live projections.
 | `POST` | `/api/qb/v2/torrents/recheck` | Form: `hashes` |
 | `POST` | `/api/qb/v2/torrents/reannounce` | Form: `hashes` |
 | `GET`  | `/api/qb/v2/torrents/trackers` | Query: `hash` |
@@ -383,7 +412,7 @@ Implements the qBittorrent Web API v2. By default it advertises qBittorrent `5.0
 
 | Method | Path |
 |--------|------|
-| `GET` | `/api/qb/v2/sync/maindata` | Full (`rid=0`) and incremental (`rid>0`) torrent updates; includes current `categories` map and `tags` list |
+| `GET` | `/api/qb/v2/sync/maindata` | Full (`rid=0`) and registry-revision incremental (`rid>0`) torrent updates; retained revisions return only changed torrents and removals, stale revisions fall back to a full update; includes current `categories` map and `tags` list |
 | `GET` | `/api/qb/v2/transfer/info` | Returns aggregate rates plus current global speed-limit state |
 | `GET` | `/api/qb/v2/transfer/speedLimitsMode` | Returns `1` when alternate/global speed-limit mode is enabled, otherwise `0` |
 | `POST` | `/api/qb/v2/transfer/toggleSpeedLimitsMode` | Toggles backend global speed-limit mode where supported |
@@ -438,10 +467,14 @@ backend adapter.
 | `torrentng_torrents_stopped` | gauge | Stopped |
 | `torrentng_torrents_errored` | gauge | In error state |
 | `torrentng_torrents_activity_{hot,warm,dormant}` | gauge | Activity-tier classification counts from the native tier policy |
+| `torrentng_dormant_runtime_heap_bytes` | gauge | Heap retained by compact dormant runtime projections; this does not certify total process RSS |
 | `torrentng_torrent_tasks_active` | gauge | Active per-torrent runtime tasks |
 | `torrentng_fastresume_dirty_pieces` | gauge | Pieces validated since the last completed durability barrier |
 | `torrentng_completed_piece_verify_from_{memory,disk}_total` | counter | Completed-piece verification source; memory verifies avoid read-after-write disk rereads |
+| `torrentng_{download,upload}_rate_bytes_per_second` | gauge | Aggregate current peer transfer rates; served from the cached native engine stats snapshot |
 | `torrentng_peers_connected` | gauge | Connected peers across all torrents |
+| `torrentng_storage_jobs_{inflight,queue_depth,capacity}` | gauge | Retained requests, pending dispatcher-channel requests, and end-to-end capacity for durable storage-plan background work |
+| `torrentng_storage_workers` | gauge | Configured blocking storage worker count |
 | `torrentng_dht_*` | gauge | Native DHT routing table, lookup, tracked torrent, and announced peer cache counts |
 | `torrentng_storage_file_pool_*` | gauge/counter | Native scheduler open-file cache capacity, open files, metadata bytes, hits, misses, evictions, and idle closes |
 | `torrentng_storage_*_queue_depth` | gauge | Native disk I/O and hashing queue depths |

@@ -338,8 +338,13 @@ feature matrix:
 2. **Phase B (standout):** topology detection, topology-derived
    preallocation, per-device queue sharing, peer-read readahead, and the HDD
    peer-read elevator are implemented.
-3. **Phase C (scale unlock):** Dormant/Warm/Hot tier logic, shared timer-wheel
-   behavior, and scale proxy tests are implemented in `rt-engine`.
+3. **Phase C (scale unlock):** Dormant/Warm/Hot tier logic is integrated into
+   restore, lifecycle/inbound promotion, idle demotion, stats, and shutdown
+   when `runtime.torrent_tiers_enabled` is enabled. Shared policy and scale
+   proxy tests are implemented in `rt-engine`; persisted tracker-deadline
+   promotion is wired through a shared deadline wheel, but the dormant
+   registry row is not yet the compact `DormantTorrentSnapshot` and
+   release-binary capacity evidence is still missing.
 4. **Phase D (efficiency):** runtime backend selection, explicit `io_uring`,
    registered frame-slot reads, sync barriers, bounded recheck, RAM-first
    completed-piece hashing, adaptive readahead/fadvise, and sparse recheck are
@@ -377,8 +382,10 @@ automatic `io_uring` defaulting requires target-hardware graduation evidence.
 
 Beyond the existing benchmark targets in `CLAUDE.md`:
 
-- 100k synthetic torrents, ≤2% with active peers: idle RSS within release
-  target; fd count ≤ handle-cache cap; ≤1 Tokio task per *Hot* torrent.
+- 100k synthetic torrents, ≤2% with active peers: release-binary idle RSS
+  within target; fd/thread/task counts recorded; ≤1 Tokio task per *Hot*
+  torrent. The current controller/registry test is only a proxy for this
+  acceptance target and must not be cited as production capacity evidence.
 - HDD seed mix (100k torrents, churned peer set): aggregate read throughput
   ≥ 5× the non-elevator baseline on the same dataset.
 - Kill -9 under write load: post-restart recheck bounded to pieces written

@@ -151,10 +151,12 @@ shippable and benchmarkable.
 ### Phase C — tiered torrents (scale unlock)
 
 - [x] Introduce Dormant/Warm/Hot tiers orthogonal to `TorrentState`.
-- [x] Shared timer-wheel reactor for Dormant torrents (no task/channel/fd per torrent).
-- [x] Promote to Hot on inbound peer/announce; demote on peer drain + idle.
-- [x] Dormant torrents hold only piece bitmap (mmap-backed/compressed) + tracker deadline.
-- [x] Bench/proxy: 100k torrents ≤2% active → ≤1 Tokio task per Hot torrent; dormant heap within target.
+- [x] Integrate restore, lifecycle/inbound promotion, idle demotion, stats, and shutdown behind `runtime.torrent_tiers_enabled`.
+- [~] Shared timer-wheel reactor for dormant runtime state; persisted tracker-deadline promotion is wired through a separate shared deadline wheel, but dormant registry rows still retain a full `TorrentEntry`.
+- [~] 100k proxy: controller/registry test covers 100,000 rows with 2,000 hot entries and the two-percent/one-task policy; release-binary RSS/fd/thread/task/restart evidence is still missing.
+
+`[~]` items are deliberate: the code path exists, but the production-scale
+acceptance claim is not earned until the release artifact is measured.
 
 ### Phase D — efficiency
 

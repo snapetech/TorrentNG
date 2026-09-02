@@ -37,6 +37,7 @@ export interface TorrentSummary {
 }
 
 export interface TorrentListResponse {
+  snapshot?: number
   total: number
   torrents: TorrentSummary[]
 }
@@ -70,6 +71,7 @@ export interface ListParams {
   dir?: 'asc' | 'desc'
   limit?: number
   offset?: number
+  snapshot?: number
 }
 
 async function get<T>(path: string, params?: Record<string, string | number | undefined>): Promise<T> {

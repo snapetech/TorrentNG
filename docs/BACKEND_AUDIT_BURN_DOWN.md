@@ -57,7 +57,7 @@ The following was run against the audit baseline before this burn-down began:
 | certification status | NOT CLEAN | Universal compatibility is `PASS_WITH_SKIPS`; 24h soak is stale/incomplete; strict readiness fails. |
 | checked-in fuzz/OpenAPI/idempotency evidence | ABSENT | Documentation claims are not backed by checked-in targets or gates. |
 
-## Current verified evidence (2026-09-01, second session)
+## Current verified evidence (2026-09-02)
 
 A prior remediation pass (same date) left the tree with real progress but a
 red baseline: `cargo test --workspace --all-targets --locked` hung
@@ -77,6 +77,15 @@ recorded in the burn-down log:
 
 CI still does not run any of this (TNG-025, still Open) -- these are local,
 manually-run results, not an enforced gate yet.
+
+Focused release evidence from 2026-09-02 is indexed in
+[`BACKEND_BURNDOWN_RELEASE_20260902.md`](BACKEND_BURNDOWN_RELEASE_20260902.md).
+The current release binary was built, launched with an isolated authenticated
+config, exercised through native REST, qBittorrent REST, health, and metrics,
+and terminated with SIGTERM. The local release gate passed its implementation
+checks with warnings; strict readiness failed because external evidence is
+stale, missing, or explicitly skipped. This is a deployment smoke result, not
+a 100k capacity result.
 
 ## P0 — security and data integrity
 
@@ -526,33 +535,74 @@ wire bytes.
 
 ### TNG-010 — Tiering and 100k scale architecture are not runtime-integrated
 
-**Status: Open** · **Priority: P1** · **Confidence: high**
+**Status: In progress** · **Priority: P1** · **Confidence: high**
 
-Evidence: `TierController`, dormant snapshots, timer wheel, and compact bitmap
-are definitions/tests in `crates/rt-engine/src/tier.rs`; no engine integration
-was found. Stats marks every torrent active. All persisted rows spawn tasks;
-each scheduler creates multiple native threads by default.
+Verified evidence (2026-09-02): `runtime.torrent_tiers_enabled` now controls
+the runtime path. Restore keeps paused/stopped/seeding/error rows in the
+registry without parsing their metainfo blobs or starting torrent actors;
+Downloading, Checking, and MetadataPending rows start actors. Lifecycle
+commands and inbound TCP/uTP peers promote dormant rows, the five-second
+reconciliation loop demotes idle actors, shutdown handles both hot actors and
+the storage worker, and engine stats reports hot/warm/dormant counts. The
+controller test tracks 100,000 registry keys with 2,000 hot entries and
+enforces the two-percent/one-task proxy budget. Restore also bulk-repairs
+missing tracker rows and authorizes configured storage roots once per restore,
+instead of repeating that work per row.
 
-Required action: integrate dormant/warm/hot lifecycle into restore, event
-routing, tracker deadlines, peer promotion, stats, and shutdown; remove the
-per-torrent thread multiplier; make memory/fd/task budgets explicit. If the
-architecture cannot meet the target, delete the 100k claim and publish a lower
-supported envelope.
+This is runtime integration, not 100k production proof. The dormant registry
+entry is still a full `TorrentEntry` projection rather than the compact
+`DormantTorrentSnapshot` described by the original design, although the tier
+controller now retains that compact projection as a separate runtime seam and
+reports its heap budget incrementally. Persisted tracker deadlines are now
+bulk-loaded into a shared deadline wheel at restore and on demotion; due
+dormant seeds are promoted and reannounced without a per-torrent timer task.
+No release-binary run has measured RSS, file descriptors, native threads,
+Tokio tasks, restart time, or promotion latency at 100k/2k.
+
+Required action: finish the compact dormant representation, then run the
+release binary with 100k dormant and 1k/2k hot fixtures. Record RSS,
+fd/thread/task counts, restart/recovery time, API latency, and promotion and
+demotion latency. Until that artifact exists, remove any production-capacity
+interpretation of the 100k claim.
 
 Acceptance: 100k dormant, 1k hot, restart, promotion/demotion, fd/thread/task
 counts, RSS, API latency, and recovery benchmarks on the release binary.
 
 ### TNG-011 — Storage jobs block the engine actor and lack control-plane routes
 
-**Status: Open** · **Priority: P1** · **Confidence: high**
+**Status: In progress** · **Priority: P1** · **Confidence: high**
 
-Evidence: native storage execute returns `202`, but the engine command path
-invokes synchronous storage execution. Native routing exposes only `GET
-/api/v1/jobs`; pause/resume/cancel are not complete native controls.
+Verified evidence (2026-09-02): filesystem plans now run behind a bounded
+dispatcher (32 queued requests, two `spawn_blocking` workers by default), not
+inside the engine actor. The dispatcher also enforces an end-to-end in-flight
+cap equal to queued capacity plus worker slots, so paused/slow requests cannot
+accumulate as unbounded supervisor waiters. Native save-path moves return
+`202` with a durable job id; authenticated get/pause/resume/cancel routes
+control the same job state. Plans, operation, affected torrents, and completed
+checkpoints are serialized into job events. Pause waits asynchronously without
+consuming a worker slot, cancellation is checked at step boundaries, and
+shutdown cancels/drains queued and active work. On restart, interrupted
+storage jobs are requeued and queued/paused plans are reattached with their
+validated checkpoint; non-storage jobs are paused.
 
-Required action: move blocking execution behind a bounded job worker pool;
-persist and stream progress; implement authenticated get/pause/resume/cancel;
-bound concurrency and shutdown behavior.
+The dispatcher now exposes retained, queued, capacity, and configured-worker
+gauges through `EngineStats`/Prometheus. A registration guard also releases an
+in-flight admission slot if the supervisor request future panics, with a
+regression test covering a closed-worker failure path.
+
+The worker test proves queue/slot behavior and durable state, but the
+acceptance boundary is not closed. There is no end-to-end crash/restart test
+that resumes a real filesystem plan through `Engine::start`. A pause arriving
+mid-step waits for that step to finish, terminal completion is reduced to a
+boolean callback rather than a rich result, there are no queue-saturation
+metrics/alerts, and a database-persist failure after a committed filesystem
+move can leave the filesystem ahead of the database (the in-memory path is
+reverted, but the file transaction cannot be undone).
+
+Required action: add crash/restart, cancellation, mid-step failure, and DB
+failure tests against real temporary roots; expose terminal error/checkpoint
+details and queue/worker saturation metrics; define reconciliation for a
+filesystem-committed/DB-failed move before calling this resolved.
 
 Acceptance: concurrent plan jobs do not delay health/torrent commands; restart
 resume; cancellation; durable progress; worker saturation; bounded shutdown.
@@ -588,16 +638,36 @@ shutdown-under-load tests with bounded completion and truthful health.
 
 ### TNG-013 — Stats, SSE, and list APIs scale with full scans
 
-**Status: Open** · **Priority: P1** · **Confidence: high**
+**Status: In progress** · **Priority: P1** · **Confidence: high**
 
-Evidence: stats asks every task sequentially with a 250 ms timeout; SSE
-`torrent_delta` scans and serializes all torrents for every client every second;
-native list returns an unpaginated bare vector while docs promise query/envelope
-semantics.
+Verified evidence (2026-09-02): the native list API returns a bounded page and
+immutable revision cursor; snapshots are cached for 750 ms, sort indexes are
+lazy and shared, refreshes are single-flight, and an expired cursor returns
+`410 Gone`. Native SSE sends one initial snapshot followed by mutation-journal
+deltas and performs a full resync only when the bounded journal expires.
+Engine stats uses a 500 ms cache, parallel task queries (up to 64), and
+per-query timeouts; native and qBittorrent transfer-info now consume its
+aggregate rate/byte snapshot instead of walking every torrent actor.
+qBittorrent `/torrents/info` has the same pinned snapshot
+and page index, returns `X-TorrentNG-Snapshot`, and `/sync/maindata` uses the
+registry journal for changed/removed torrents. Large qBit projections skip
+per-torrent live engine round-trips; durable fields and aggregate stats remain
+available.
 
-Required action: introduce snapshot/versioned aggregation, pagination and
-bounded projections, delta subscriptions keyed by changed torrents, client
-backpressure, and documented compatibility behavior.
+The redesign does not make every operation sublinear. A cache refresh still
+scans the registry, native `total` and arbitrary filters scan the snapshot,
+and the engine stats cache still aggregates runtime state on expiry. qBit full
+responses necessarily serialize their requested output and can be enormous;
+large responses intentionally omit transient per-torrent tracker/swarm/limit
+queries rather than issue 100k actor calls. There is no many-client/slow-SSE
+load test, allocation profile, cursor-expiry integration test, or 1k/15k/100k
+release-binary latency evidence.
+
+Required action: add load tests for concurrent list/stat/SSE clients, slow
+consumers, snapshot expiry, and 1k/15k/100k datasets. Add explicit metrics for
+snapshot refreshes, journal resyncs, response sizes, and dropped/lagging SSE
+clients. Decide and document the acceptable semantics for omitted live fields
+in large qBit responses.
 
 Acceptance: 1k/15k/100k latency and allocation tests, many SSE clients, slow
 consumer behavior, stable pagination, and API contract tests.
@@ -1136,16 +1206,29 @@ Acceptance: intentionally broken fmt/test/clippy changes fail CI.
 
 ### TNG-026 — Release evidence is stale or weaker than its claims
 
-**Status: Open** · **Priority: P1** · **Confidence: high**
+**Status: In progress** · **Priority: P1** · **Confidence: high**
 
-Evidence: certification reports are from May 2026; universal compatibility is
-`PASS_WITH_SKIPS`, the 24h soak is stale/incomplete, security evidence covers
-sidecar config rather than native deployment, scale evidence is synthetic, and
-strict readiness fails.
+Verified evidence (2026-09-02): rebuilt `target/release/torrentngd` with
+`cargo build --release --locked -p torrentngd`, launched that binary with an
+isolated authenticated config, exercised `/health`, native torrent listing,
+qBittorrent listing, and `/metrics`, and terminated it with SIGTERM. The
+process exited cleanly after its engine/task shutdown path. The local release
+gate, storage feature matrix, WebUI certification, API facade checks,
+migration corpus checks, native/sidecar config review, and external preflight
+were rerun against the dirty working tree; exact reports are linked from
+`docs/BACKEND_BURNDOWN_RELEASE_20260902.md`.
 
-Required action: refresh evidence against the exact release artifact/config;
-make skipped legs explicit; block release on stale/unknown rows; separate
-synthetic proxy evidence from real deployment claims.
+This is not a clean release certificate. The local and external gates retain
+warnings/skips for an unset real-device storage target, an unapproved public
+torrent leg, and no active 24-hour soak. The 100k scale evidence is still a
+unit/proxy test, not release-binary RSS/fd/thread/task evidence. The release
+readiness gate therefore remains blocked for production-scale and universal
+compatibility claims. This distinction is the result, not a paperwork gap.
+
+Required action: run the missing external legs, capture the exact artifact
+digest/config/deployment logs, run the 100k release-binary scale harness, and
+keep the release blocked until every required row is PASS or has an explicit
+owner, action, and artifact in the release bundle.
 
 Acceptance: one machine-readable clean release bundle or an explicit blocked
 release report with owner/action/artifact for every remaining row.
@@ -1245,15 +1328,32 @@ the declared toolchain.
 
 ### TNG-029 — The engine has poor fault/change isolation
 
-**Status: Open** · **Priority: P2** · **Confidence: high**
+**Status: In progress** · **Priority: P2** · **Confidence: high**
 
-Evidence: `Engine` is roughly 6.9k lines, `TorrentTask` roughly 4.9k, and
-native handlers roughly 6.6k. Actor orchestration, persistence, storage,
-trackers, peers, DHT, and API projection are tightly coupled.
+Verified evidence (2026-09-02): explicit seams now exist for storage-job
+dispatch/control/recovery, registry revisions and mutation deltas, native and
+qBit snapshot projection, peer admission, outbound egress policy, process-wide
+network budgets, storage-root authority, command replies, and capability
+projection. Those seams have focused tests that do not require a live network
+or the full daemon. Health now probes engine-owned storage-worker and DHT
+dependency seams independently of the engine actor, and the fault test proves
+a dead DHT channel and dead storage supervisor are reported as unhealthy.
+Health exposes the current capability boundary instead of claiming scale
+certification or unsupported storage behavior.
 
-Required action: create explicit seams for storage jobs, peer admission,
-outbound policy, persistence transactions, runtime aggregation, and capability
-projection; split modules only after contracts and tests exist.
+The architecture is still a large actor monolith (`Engine`, `TorrentTask`,
+and API handler modules remain oversized), and several seams are only wrappers
+around that actor. The failure matrix is still incomplete: there is no
+concurrent API-load fault-containment run, no DB/storage failure injection
+through a live daemon, no durable filesystem-ahead-of-DB reconciliation, and
+no full inversion of persistence, tracker, or peer dependencies. `TNG-029`
+therefore remains in progress; health reporting and isolated unit failures are
+useful seams, not proof that the monolith is fault-isolated.
+
+Required action: add subsystem health/metrics and failure-injection tests for
+worker panic, DHT loss, DB failure, storage failure, and slow API consumers;
+then extract the proven contracts into independently owned modules without
+adding cross-layer global state.
 
 Acceptance: subsystem tests can run without the whole engine; failures are
 contained and health identifies the failed subsystem; no new cross-layer
@@ -1289,6 +1389,7 @@ claims:
 | 2026-09-01 | Ninth session (same date, continuing "build it all out"): fixed the safe half of TNG-014. `UploadContext`/`TorrentTask`'s `piece_map: PieceMap` was deep-cloned (`files: Vec<FileSpan>`, scales with file count) on every new peer connection; `PieceMap` is never mutated after construction, so wrapped it in `Arc<PieceMap>` -- a pure, mechanical, low-risk win (every other read call site kept compiling unchanged via auto-deref). New test proves the sharing via `Arc::strong_count`/`Arc::ptr_eq`. Deliberately left `have_pieces`/`peer_has` (the actual per-peer *bitmap*, genuinely mutated independently per peer task today) untouched -- sharing or bit-packing it safely needs a concurrency-safety design and touches protocol-critical Have/Bitfield code across four call sites, which deserves its own dedicated pass rather than a squeezed-in change. | `cargo test -p rt-engine --lib` (135 passed, up from 134, 0 failed), full `cargo test --workspace --all-targets --locked` (green), `cargo fmt --all -- --check` (green), `cargo clippy --workspace --all-targets --locked -- -D warnings` (green). | TNG-014 moved Open -> In progress. The bitmap-sharing/bit-packing half of the finding, per-peer memory accounting, a peer-count cap, and a real memory-profiled benchmark all remain explicitly open (see item detail). |
 | 2026-09-01 | Tenth session (same date, continuing "build it all out"): closed a gap TNG-025's own entry had already flagged as a prediction -- MSRV wasn't pinned anywhere in CI (`@stable` tracks current, not the declared floor), which is exactly the class of drift that let `.clippy.toml` go stale earlier this session. Added `msrv-check`/`msrv-check-sidecar` jobs pinning `dtolnay/rust-toolchain` to the exact declared floors (1.88.0 / 1.97.0) via version tags, alongside (not replacing) the existing `@stable` jobs. Verified both jobs' exact commands locally against the already-installed pinned toolchains before committing: full workspace build+test green at 1.88, sidecar build+test green at 1.97.0 (75 passed). | `cargo +1.88 build/test --workspace --all-targets --locked` (green), `cargo +1.97.0 build/test --locked --manifest-path sidecar/Cargo.toml` (green, 75 passed), full default-toolchain `cargo test --workspace --all-targets --locked` / `cargo fmt --all -- --check` / `cargo clippy --workspace --all-targets --locked -- -D warnings` (all green). | TNG-025's evidence updated with the MSRV-pinning fix; still not verified that any of this session's CI edits have actually run in real GitHub Actions (no way to trigger that from this sandboxed session). |
 | 2026-09-01 | Eleventh session (same date, continuing "build it all out"): ran a targeted (not full-matrix) audit for TNG-022 via a research subagent, then fixed the two highest-confidence, easiest-to-wire inert compat mutations it found -- both had an already-working native-engine method one facade over, never connected to this one. rTorrent's `d.tracker_announce` (`crates/rt-api-rtorrent`) was a literal `Ok(Int(0))` that never read params at all; wired to `Engine::reannounce_torrent`, mirroring the already-correct qBittorrent-compat sibling. Transmission's `session-set` `dht-enabled`/`pex-enabled` (`crates/rt-api-transmission`) only mutated a process-memory struct that `session-get` echoed back convincingly; wired to `Engine::network_features`/`update_network_features`, alongside (not replacing) the existing mirror, mirroring `app_set_preferences`'s already-correct qBittorrent-compat pattern. The same audit surfaced several more inert mutations that were NOT fixed because they need real new engine features (peer banning/blocklist enforcement, a move-on-completion hook) rather than a wiring fix, plus a durably-stored-but-behaviorally-inert variant (`setForceStart`/`setAutoTMM`/`setAutoManagement` persist but `apply_torrent_limits()` never reads them) -- all recorded as explicit remaining gaps. | `cargo test -p rt-api-rtorrent --lib` (19 passed, up from 17), `cargo test -p rt-api-transmission --lib` (32 passed, 0 failed, no regressions), full `cargo test --workspace --all-targets --locked` (green), `cargo fmt --all -- --check` (green), `cargo clippy --workspace --all-targets --locked -- -D warnings` (green). | TNG-022 moved Open -> In progress. This remains a large finding -- category-store persistence, peer banning, move-on-completion, and the full method-by-method mutation matrix with stateful round-trip/restart tests are all still open (see item detail for the complete list). |
+| 2026-09-02 | Focused TNG-010/011/013/026/029 remediation: wired tier-aware restore, dormant promotion/demotion, inbound routing, tiered stats, aggregate dormant restore events, and persisted tracker-deadline promotion/reannounce through a shared deadline wheel; added a bounded two-worker storage dispatcher with async pause, cancellation, durable serialized plans/checkpoints, sparse-checkpoint-safe restart recovery, and native job controls; added registry revisions, a bounded mutation journal, single-flight immutable native/qBit snapshots, lazy shared sort indexes, bounded native pagination, SSE delta/resync cursors, qBit snapshot pagination and journal-backed `sync/maindata`, stats caching/parallel task queries, aggregate transfer-rate stats, and a large-output guard against per-torrent qBit actor round trips. Fixed WebUI select-all to walk 5,000-row pages pinned to one snapshot. | Focused native/qBit/engine tests: 46/60/144 passed; full workspace tests, format, and clippy with warnings denied passed. Rebuilt the release binary with `cargo build --release --locked -p torrentngd` in 24.73 s after fixing overdue tracker deadlines. The final release binary smoke endpoints, aggregate transfer endpoints, metrics, and SIGTERM passed; SHA-256 is `c4540162a4f75b31486bf425c1f81d038a0ed0ad813fbd7f7360bf07bb736ecc`. [`local-release-backend-burndown-final-20260902.md`](../certification/reports/local-release-backend-burndown-final-20260902.md) passed implementation gates with warnings; [`external-evidence-preflight-backend-burndown-final-20260902.md`](../certification/reports/external-evidence-preflight-backend-burndown-final-20260902.md) is `PASS_WITH_WARNINGS` (3); strict and local readiness are `FAIL`. | TNG-010/011/013/026/029 remain In progress. The release certificate remains blocked: no 100k release-binary scale run, no real storage target, no public/live compatibility run, no 24h soak, no subsystem fault-injection matrix, and the full dormant representation and storage reconciliation gaps remain. |
 
 ## Release gate
 

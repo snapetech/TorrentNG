@@ -188,7 +188,14 @@ Configurable via `[rtorrent] user_agent` in config or `TNG_USER_AGENT` env var.
 Default: `rtorrent/0.16.11/0.16.11` (used in packaged releases).
 Pushed to rTorrent via `network.http.user_agent.set` on startup.
 Runtime update: `PUT /api/v1/settings/user-agent` or Settings panel in WebUI.
-Paired peer ID: `-lt100B-000000000000` via `[rtorrent] peer_id` or `TNG_PEER_ID`.
+Peer ID family prefix: `-lt100B-`, fixed. The other 12 bytes are generated
+and persisted per install (native: `<session_dir>/peer_id_suffix`; sidecar:
+`<data_dir>/peer_id_suffix`) — NOT a shared literal. A shared/hardcoded
+peer_id suffix got a real user banned from a private tracker (MAM) for
+"running multiple instances of the same client," because every install
+without one presented the identical peer_id. Only set `[rtorrent] peer_id`
+or `TNG_PEER_ID` to pin one specific install (e.g. a test fixture) — never
+in a shared template, base image, or fleet-wide env var.
 Do not strip the user-agent to `rtorrent/0.16.11`, do not use
 `rtorrent/0.16.11/000` as a peer ID, and do not guess `-lt1011-`.
 See `docs/TRACKER-IDENTITY.md` before changing this.

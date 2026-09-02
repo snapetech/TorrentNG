@@ -144,10 +144,7 @@ pub trait TorrentBackend: Send + Sync {
     }
 
     /// Bulk-optimized recheck -- see stop_many().
-    async fn recheck_many(
-        &self,
-        _hashes: &[String],
-    ) -> Option<Result<Vec<(String, Result<()>)>>> {
+    async fn recheck_many(&self, _hashes: &[String]) -> Option<Result<Vec<(String, Result<()>)>>> {
         None
     }
     async fn list_trackers(&self, hash: &str) -> Result<Vec<RawTracker>>;

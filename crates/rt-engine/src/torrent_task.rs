@@ -1471,9 +1471,29 @@ impl TorrentTask {
             .sum::<u64>();
         let tracker_peer_cache_bytes = (self.known_tracker_peers.capacity() as u64)
             .saturating_mul(std::mem::size_of::<SocketAddr>() as u64);
+        let (download_rate, upload_rate) = self
+            .active_peers
+            .values()
+            .map(|peer| {
+                (
+                    peer_rate(peer.download_rate, peer.rate_window_started),
+                    peer_rate(peer.upload_rate, peer.rate_window_started),
+                )
+            })
+            .fold(
+                (0_i64, 0_i64),
+                |(download, upload), (peer_download, peer_upload)| {
+                    (
+                        download.saturating_add(peer_download),
+                        upload.saturating_add(peer_upload),
+                    )
+                },
+            );
         TorrentRuntimeStats {
             connected_peers: self.active_peers.len() as u64,
             outstanding_requests,
+            download_rate,
+            upload_rate,
             fastresume_dirty_pieces: self.dirty_pieces_since_barrier.len() as u64,
             completed_piece_verify_from_memory: self.completed_piece_verify_from_memory,
             completed_piece_verify_from_disk: self.completed_piece_verify_from_disk,
