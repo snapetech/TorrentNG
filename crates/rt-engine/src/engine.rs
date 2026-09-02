@@ -7982,7 +7982,7 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::channel(4);
         let db = Arc::new(Mutex::new(conn));
         let storage_jobs = StorageJobDispatcher::with_limits(Arc::clone(&db), 1, 2);
-        let mut engine = Engine {
+        let engine = Engine {
             config: Arc::new(config),
             registry: Arc::new(RwLock::new(SessionRegistry::new())),
             db,

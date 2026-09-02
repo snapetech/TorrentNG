@@ -19,7 +19,8 @@ use axum::{
 use base64::Engine as _;
 use futures::Stream;
 use rt_api_model::{
-    AddTorrentRequest, AddTorrentResponse, ApiError, FileInfo, TorrentDetail, TorrentSummary,
+    AddTorrentRequest, AddTorrentResponse, ApiError, ApiRuntimeMetricsSnapshot, ApiSseClientGuard,
+    FileInfo, TorrentDetail, TorrentSummary,
 };
 use rt_engine::{
     EngineGlobalLimits, EngineHandle, EngineJob, EngineNetworkFeatures, EngineStorageRoot,
@@ -192,6 +193,9 @@ pub async fn list_torrents(
         }
     }
     let estimate = estimate_torrent_summary_snapshot_bytes(summaries.len());
+    state
+        .api_metrics
+        .record_estimated_response_bytes(estimate.saturating_add(256));
     let lease = if let Some(engine) = &state.engine {
         match engine
             .reserve_memory(MemoryClass::ApiSnapshot, estimate)
@@ -3384,7 +3388,7 @@ pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("text/plain; version=0.0.4"),
             )],
-            render_metrics(&stats),
+            render_metrics_with_api(&stats, state.api_metrics.snapshot()),
         ),
         Err(e) => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -3420,6 +3424,11 @@ pub async fn stream_events(
                     "torrents": delta.torrents,
                     "removed": delta.removed,
                 });
+                stream_state.state.api_metrics.record_sse_event();
+                stream_state
+                    .state
+                    .api_metrics
+                    .record_estimated_response_bytes(payload.to_string().len() as u64);
                 let event = Event::default()
                     .event("torrent_delta")
                     .id(cursor.to_string())
@@ -3536,15 +3545,18 @@ struct EventStreamState {
     registry_revision: Option<u64>,
     seq: u64,
     tick: tokio::time::Interval,
+    _client_guard: ApiSseClientGuard,
 }
 
 impl EventStreamState {
     fn new(state: AppState, registry_revision: Option<u64>) -> Self {
+        let client_guard = state.api_metrics.register_sse_client();
         EventStreamState {
             state,
             registry_revision,
             seq: 0,
             tick: tokio::time::interval(Duration::from_secs(1)),
+            _client_guard: client_guard,
         }
     }
 }
@@ -3578,6 +3590,7 @@ async fn torrent_delta_for_stream(stream_state: &mut EventStreamState) -> Torren
             let registry = stream_state.state.registry.read().await;
             let current_revision = registry.revision();
             let Some(changes) = registry.changes_since(last_revision) else {
+                stream_state.state.api_metrics.record_sse_resync();
                 stream_state.registry_revision = None;
                 continue;
             };
@@ -3655,7 +3668,15 @@ fn estimate_torrent_detail_snapshot_bytes(
         .max(estimate_torrent_detail_base_snapshot_bytes() as usize) as u64
 }
 
+#[cfg(test)]
 fn render_metrics(stats: &rt_engine::EngineStats) -> String {
+    render_metrics_with_api(stats, ApiRuntimeMetricsSnapshot::default())
+}
+
+fn render_metrics_with_api(
+    stats: &rt_engine::EngineStats,
+    api_metrics: ApiRuntimeMetricsSnapshot,
+) -> String {
     let mut out = String::new();
     metric(
         &mut out,
@@ -4774,6 +4795,48 @@ fn render_metrics(stats: &rt_engine::EngineStats) -> String {
         "gauge",
         "Last observed uTP bytes in flight",
         utp.bytes_in_flight,
+    );
+    metric(
+        &mut out,
+        "torrentng_api_snapshot_refreshes_total",
+        "counter",
+        "Immutable API snapshot generations built across native and qBittorrent facades",
+        api_metrics.snapshot_refreshes_total,
+    );
+    metric(
+        &mut out,
+        "torrentng_api_snapshot_expired_total",
+        "counter",
+        "API pagination cursors rejected because their immutable snapshot expired",
+        api_metrics.snapshot_expired_total,
+    );
+    metric(
+        &mut out,
+        "torrentng_api_sse_resyncs_total",
+        "counter",
+        "SSE clients forced to resnapshot after the mutation journal expired",
+        api_metrics.sse_resyncs_total,
+    );
+    metric(
+        &mut out,
+        "torrentng_api_sse_events_total",
+        "counter",
+        "Torrent delta events emitted to SSE clients",
+        api_metrics.sse_events_total,
+    );
+    metric(
+        &mut out,
+        "torrentng_api_sse_clients",
+        "gauge",
+        "Currently active native SSE clients",
+        api_metrics.sse_clients,
+    );
+    metric(
+        &mut out,
+        "torrentng_api_response_bytes_estimated_total",
+        "counter",
+        "Estimated bytes emitted by bounded list and SSE responses",
+        api_metrics.response_bytes_estimated_total,
     );
     out
 }
@@ -6260,6 +6323,22 @@ mod tests {
         assert!(rendered.contains("torrentng_utp_congestion_base_delay_us "));
         assert!(rendered.contains("torrentng_utp_congestion_current_delay_us "));
         assert!(rendered.contains("torrentng_utp_bytes_in_flight "));
+
+        let api_metrics = rt_api_model::ApiRuntimeMetrics::new();
+        api_metrics.record_snapshot_refresh();
+        api_metrics.record_snapshot_expired();
+        api_metrics.record_sse_resync();
+        api_metrics.record_sse_event();
+        api_metrics.record_estimated_response_bytes(123);
+        let client = api_metrics.register_sse_client();
+        let api_rendered = render_metrics_with_api(&stats, api_metrics.snapshot());
+        assert!(api_rendered.contains("torrentng_api_snapshot_refreshes_total 1"));
+        assert!(api_rendered.contains("torrentng_api_snapshot_expired_total 1"));
+        assert!(api_rendered.contains("torrentng_api_sse_resyncs_total 1"));
+        assert!(api_rendered.contains("torrentng_api_sse_events_total 1"));
+        assert!(api_rendered.contains("torrentng_api_sse_clients 1"));
+        assert!(api_rendered.contains("torrentng_api_response_bytes_estimated_total 123"));
+        drop(client);
     }
 
     #[tokio::test]

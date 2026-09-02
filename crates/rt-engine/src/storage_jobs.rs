@@ -444,10 +444,29 @@ async fn run_storage_request(
     let control = Arc::clone(&request.control);
     loop {
         control.wait_until_runnable().await;
-        let slot = Arc::clone(&slots)
-            .acquire_owned()
-            .await
-            .expect("storage worker semaphore closed");
+        let recovery_db = Arc::clone(&request.db);
+        let recovery_operation = request.operation.clone();
+        let recovery_plan = request.plan.clone();
+        let recovery_completed_steps = request.completed_steps.clone();
+        let slot = match Arc::clone(&slots).acquire_owned().await {
+            Ok(slot) => slot,
+            Err(error) => {
+                let reason = format!("storage worker semaphore closed: {error}");
+                let _ = persist_terminal(
+                    &recovery_db,
+                    &job_id,
+                    &recovery_operation,
+                    &recovery_plan,
+                    &recovery_completed_steps,
+                    "failed",
+                    Some(reason),
+                );
+                let _ = request
+                    .completion
+                    .send(StorageJobCompletion { succeeded: false });
+                return job_id;
+            }
+        };
         // A pause can arrive after the wait and before the slot is acquired.
         // Release the slot and wait again so paused jobs do not starve active
         // work behind the fixed worker budget.
@@ -455,10 +474,6 @@ async fn run_storage_request(
             drop(slot);
             continue;
         }
-        let recovery_db = Arc::clone(&request.db);
-        let recovery_operation = request.operation.clone();
-        let recovery_plan = request.plan.clone();
-        let recovery_completed_steps = request.completed_steps.clone();
         let result = tokio::task::spawn_blocking(move || execute_storage_job(request)).await;
         drop(slot);
         if let Err(error) = result {
@@ -800,7 +815,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_panic_releases_end_to_end_inflight_registration() {
+    async fn closed_worker_releases_end_to_end_inflight_registration() {
         let connection = Connection::open_in_memory().unwrap();
         migrate(&connection).unwrap();
         let db = Arc::new(Mutex::new(connection));
@@ -829,11 +844,30 @@ mod tests {
         let slots = Arc::new(Semaphore::new(0));
         slots.close();
 
-        let result = tokio::spawn(run_storage_request(request, slots, Arc::clone(&controls))).await;
-        assert!(
-            result.is_err(),
-            "closed worker semaphore should exercise panic path"
-        );
+        let result = tokio::spawn(run_storage_request(request, slots, Arc::clone(&controls)))
+            .await
+            .unwrap();
+        assert_eq!(result, "panic-job");
+        assert!(controls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn worker_registration_guard_releases_on_unwind() {
+        let controls = Arc::new(Mutex::new(HashMap::from([(
+            "panic-job".to_owned(),
+            Arc::new(StorageJobControl::new(false)),
+        )])));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let controls = Arc::clone(&controls);
+            move || {
+                let _registration = StorageJobRegistration {
+                    job_id: "panic-job".to_owned(),
+                    controls,
+                };
+                panic!("test worker panic");
+            }
+        }));
+        assert!(result.is_err());
         assert!(controls.lock().unwrap().is_empty());
     }
 

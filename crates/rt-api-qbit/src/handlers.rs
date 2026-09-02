@@ -580,10 +580,18 @@ pub async fn torrents_info(
         }
     };
     let torrent_count = snapshot.entries.len();
-    let hashes = q
-        .hashes
-        .as_deref()
-        .map(|hashes| hashes.split('|').map(str::to_owned).collect::<HashSet<_>>());
+    let hashes = q.hashes.as_deref().and_then(|hashes| {
+        let hashes = hashes
+            .split('|')
+            .filter(|hash| !hash.is_empty())
+            .map(str::to_owned)
+            .collect::<HashSet<_>>();
+        if hashes.is_empty() || hashes.contains("all") {
+            None
+        } else {
+            Some(hashes)
+        }
+    });
     let order = snapshot.ordered_indices(q.sort.as_deref(), |left, right| {
         match q.sort.as_deref().unwrap_or_default() {
             "size" => left.total_length.cmp(&right.total_length),
@@ -675,6 +683,9 @@ pub async fn torrents_info(
             .await,
         );
     }
+    state
+        .api_metrics
+        .record_estimated_response_bytes(estimate_qbit_torrent_info_snapshot_bytes(infos.len()));
 
     let mut response = (StatusCode::OK, Json(infos)).into_response();
     if let Ok(value) = HeaderValue::from_str(&snapshot.revision.to_string()) {
@@ -2322,6 +2333,9 @@ pub async fn sync_maindata(
     for entry in entries.iter() {
         infos.push(qbit_torrent_info(&state, entry, &active_rechecks, include_live).await);
     }
+    state
+        .api_metrics
+        .record_estimated_response_bytes(estimate_qbit_maindata_snapshot_bytes(infos.len()));
     let rid = qbit_registry_rid(revision);
     let (alltime_dl, alltime_ul, session_rates) = if let Some(engine) = &state.engine {
         match engine.stats().await {
@@ -5000,6 +5014,39 @@ mod tests {
         assert_eq!(v.as_array().unwrap().len(), 2);
         assert_eq!(v[0]["name"].as_str().unwrap(), "alpha");
         assert_eq!(v[1]["name"].as_str().unwrap(), "zeta");
+    }
+
+    #[tokio::test]
+    async fn torrents_info_intersects_hash_filter_with_indexed_filters() {
+        let state = AppState::new();
+        let keep_hash = "a".repeat(40);
+        let skip_hash = "b".repeat(40);
+        {
+            let mut reg = state.registry.write().await;
+            let mut keep = TorrentEntry::new(keep_hash.clone(), "keep".into(), "/data".into());
+            keep.tags = vec!["wanted".into()];
+            reg.add(keep).unwrap();
+            let mut skip = TorrentEntry::new(skip_hash.clone(), "skip".into(), "/data".into());
+            skip.tags = vec!["other".into()];
+            reg.add(skip).unwrap();
+        }
+        let app = build_qbit_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/qb/v2/torrents/info?hashes={keep_hash}|{skip_hash}&tag=wanted"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body.as_array().unwrap().len(), 1);
+        assert_eq!(body[0]["hash"], keep_hash);
     }
 
     #[tokio::test]

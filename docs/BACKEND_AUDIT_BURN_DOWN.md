@@ -590,19 +590,21 @@ gauges through `EngineStats`/Prometheus. A registration guard also releases an
 in-flight admission slot if the supervisor request future panics, with a
 regression test covering a closed-worker failure path.
 
-The worker test proves queue/slot behavior and durable state, but the
-acceptance boundary is not closed. There is no end-to-end crash/restart test
-that resumes a real filesystem plan through `Engine::start`. A pause arriving
-mid-step waits for that step to finish, terminal completion is reduced to a
-boolean callback rather than a rich result, there are no queue-saturation
-metrics/alerts, and a database-persist failure after a committed filesystem
-move can leave the filesystem ahead of the database (the in-memory path is
-reverted, but the file transaction cannot be undone).
+The worker test proves queue/slot behavior and durable state, and recovery now
+reconciles real filesystem state against the persisted checkpoint before
+reattaching a plan. A pause arriving mid-step waits for that step to finish,
+terminal completion is still reduced to a boolean callback even though the
+durable job row carries the detailed error/checkpoint, and the saturation
+gauges have no alert policy yet. A database-persist failure after a committed
+filesystem move can still leave the filesystem ahead of the database; restart
+reconciliation detects and advances uncheckpointed rename/copy steps, while
+ambiguous or corrupt staging state fails closed for manual attention.
 
-Required action: add crash/restart, cancellation, mid-step failure, and DB
-failure tests against real temporary roots; expose terminal error/checkpoint
-details and queue/worker saturation metrics; define reconciliation for a
-filesystem-committed/DB-failed move before calling this resolved.
+Required action: add a full `Engine::start` crash/restart run, cancellation,
+mid-step failure, and injected DB-failure tests against real temporary roots;
+return the durable terminal error/checkpoint through the internal completion
+contract; and define alerts for queue/worker saturation before calling this
+resolved.
 
 Acceptance: concurrent plan jobs do not delay health/torrent commands; restart
 resume; cancellation; durable progress; worker saturation; bounded shutdown.
@@ -660,14 +662,16 @@ and the engine stats cache still aggregates runtime state on expiry. qBit full
 responses necessarily serialize their requested output and can be enormous;
 large responses intentionally omit transient per-torrent tracker/swarm/limit
 queries rather than issue 100k actor calls. There is no many-client/slow-SSE
-load test, allocation profile, cursor-expiry integration test, or 1k/15k/100k
-release-binary latency evidence.
+load test, allocation profile, or 1k/15k/100k release-binary latency evidence.
+Snapshot refresh/expiry, journal resync/event/client counts, and estimated
+bounded response volume are now exposed through Prometheus; cursor expiry and
+snapshot pinning have focused contract tests, but not a production-like load
+run.
 
 Required action: add load tests for concurrent list/stat/SSE clients, slow
-consumers, snapshot expiry, and 1k/15k/100k datasets. Add explicit metrics for
-snapshot refreshes, journal resyncs, response sizes, and dropped/lagging SSE
-clients. Decide and document the acceptable semantics for omitted live fields
-in large qBit responses.
+consumers, snapshot expiry, and 1k/15k/100k datasets; add dropped/lagging SSE
+client accounting and alert thresholds; and decide/document the acceptable
+semantics for omitted live fields in large qBit responses.
 
 Acceptance: 1k/15k/100k latency and allocation tests, many SSE clients, slow
 consumer behavior, stable pagination, and API contract tests.

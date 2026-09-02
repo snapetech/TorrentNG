@@ -19,6 +19,7 @@ use tower_http::services::{ServeDir, ServeFile};
 use tracing::info;
 
 use rt_api_deluge::AppState as DelugeState;
+use rt_api_model::ApiRuntimeMetrics;
 use rt_api_native::state::AppState as NativeState;
 use rt_api_qbit::state::AppState as QbitState;
 use rt_api_transmission::AppState as TransmissionState;
@@ -85,17 +86,20 @@ async fn main() -> anyhow::Result<()> {
         .context("starting engine")?;
 
     // Build the API routers
-    let native_state = NativeState::with_engine_and_tokens(
+    let api_metrics = ApiRuntimeMetrics::new();
+    let native_state = NativeState::with_engine_and_tokens_and_metrics(
         Arc::clone(&registry),
         engine_handle.clone(),
         config.auth.api_tokens.clone(),
+        Arc::clone(&api_metrics),
     );
     let native_router = rt_api_native::router::build_router(native_state);
 
-    let qbit_state = QbitState::with_engine_and_tokens(
+    let qbit_state = QbitState::with_engine_and_tokens_and_metrics(
         Arc::clone(&registry),
         engine_handle.clone(),
         config.auth.api_tokens.clone(),
+        Arc::clone(&api_metrics),
     );
     let qbit_router = rt_api_qbit::router::build_qbit_router(qbit_state);
 

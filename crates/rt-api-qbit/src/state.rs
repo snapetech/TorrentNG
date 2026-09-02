@@ -7,6 +7,7 @@ use std::{
 };
 use tokio::sync::{Mutex, RwLock};
 
+use rt_api_model::ApiRuntimeMetrics;
 use rt_engine::{EngineGlobalLimits, EngineHandle};
 use rt_session::{SessionRegistry, TorrentEntry};
 
@@ -222,6 +223,7 @@ pub struct AppState {
     pub api_key: Arc<RwLock<Option<String>>>,
     pub global_limits: Arc<RwLock<EngineGlobalLimits>>,
     pub banned_peers: Arc<RwLock<BTreeSet<SocketAddr>>>,
+    pub(crate) api_metrics: Arc<ApiRuntimeMetrics>,
     pub search_plugins: Arc<RwLock<JsonMap>>,
     pub search_jobs: Arc<RwLock<JsonMap>>,
     pub next_search_id: Arc<RwLock<i64>>,
@@ -245,6 +247,7 @@ impl AppState {
             api_key: Arc::new(RwLock::new(None)),
             global_limits: Arc::new(RwLock::new(EngineGlobalLimits::default())),
             banned_peers: Arc::new(RwLock::new(BTreeSet::new())),
+            api_metrics: ApiRuntimeMetrics::new(),
             search_plugins: Arc::new(RwLock::new(serde_json::Map::new())),
             search_jobs: Arc::new(RwLock::new(serde_json::Map::new())),
             next_search_id: Arc::new(RwLock::new(1)),
@@ -268,6 +271,7 @@ impl AppState {
             api_key: Arc::new(RwLock::new(None)),
             global_limits: Arc::new(RwLock::new(EngineGlobalLimits::default())),
             banned_peers: Arc::new(RwLock::new(BTreeSet::new())),
+            api_metrics: ApiRuntimeMetrics::new(),
             search_plugins: Arc::new(RwLock::new(serde_json::Map::new())),
             search_jobs: Arc::new(RwLock::new(serde_json::Map::new())),
             next_search_id: Arc::new(RwLock::new(1)),
@@ -299,6 +303,7 @@ impl AppState {
             api_key: Arc::new(RwLock::new(None)),
             global_limits: Arc::new(RwLock::new(EngineGlobalLimits::default())),
             banned_peers: Arc::new(RwLock::new(BTreeSet::new())),
+            api_metrics: ApiRuntimeMetrics::new(),
             search_plugins: Arc::new(RwLock::new(serde_json::Map::new())),
             search_jobs: Arc::new(RwLock::new(serde_json::Map::new())),
             next_search_id: Arc::new(RwLock::new(1)),
@@ -307,6 +312,17 @@ impl AppState {
             torrent_snapshot_cache: Arc::new(RwLock::new(VecDeque::new())),
             torrent_snapshot_refresh: Arc::new(Mutex::new(())),
         }
+    }
+
+    pub fn with_engine_and_tokens_and_metrics(
+        registry: Arc<RwLock<SessionRegistry>>,
+        engine: EngineHandle,
+        api_tokens: Vec<String>,
+        api_metrics: Arc<ApiRuntimeMetrics>,
+    ) -> Self {
+        let mut state = Self::with_engine_and_tokens(registry, engine, api_tokens);
+        state.api_metrics = api_metrics;
+        state
     }
 
     /// Return a bounded, immutable registry snapshot for qBittorrent list
@@ -326,6 +342,7 @@ impl AppState {
                 {
                     return Ok(cached.snapshot.clone());
                 }
+                self.api_metrics.record_snapshot_expired();
                 return Err(TorrentSnapshotError::Expired { revision });
             }
 
@@ -360,6 +377,7 @@ impl AppState {
             )
         };
         let filters = Arc::new(build_filter_index(&entries));
+        self.api_metrics.record_snapshot_refresh();
         let snapshot = TorrentSnapshot {
             revision,
             entries,

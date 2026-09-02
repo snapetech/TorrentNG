@@ -2195,6 +2195,7 @@ dependencies = [
  "anyhow",
  "axum",
  "rt-api-deluge",
+ "rt-api-model",
  "rt-api-native",
  "rt-api-qbit",
  "rt-api-transmission",

@@ -475,6 +475,11 @@ backend adapter.
 | `torrentng_peers_connected` | gauge | Connected peers across all torrents |
 | `torrentng_storage_jobs_{inflight,queue_depth,capacity}` | gauge | Retained requests, pending dispatcher-channel requests, and end-to-end capacity for durable storage-plan background work |
 | `torrentng_storage_workers` | gauge | Configured blocking storage worker count |
+| `torrentng_api_snapshot_refreshes_total` | counter | Immutable API snapshot generations built across native and qBittorrent facades |
+| `torrentng_api_snapshot_expired_total` | counter | Pagination cursors rejected because their immutable snapshot expired |
+| `torrentng_api_sse_{resyncs,events}_total` | counter | SSE journal-expiry resyncs and emitted torrent-delta events |
+| `torrentng_api_sse_clients` | gauge | Active native SSE clients |
+| `torrentng_api_response_bytes_estimated_total` | counter | Estimated bytes emitted by bounded list and SSE responses; an estimate, not wire accounting |
 | `torrentng_dht_*` | gauge | Native DHT routing table, lookup, tracked torrent, and announced peer cache counts |
 | `torrentng_storage_file_pool_*` | gauge/counter | Native scheduler open-file cache capacity, open files, metadata bytes, hits, misses, evictions, and idle closes |
 | `torrentng_storage_*_queue_depth` | gauge | Native disk I/O and hashing queue depths |

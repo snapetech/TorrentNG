@@ -1,4 +1,4 @@
-use rt_api_model::TorrentSummary;
+use rt_api_model::{ApiRuntimeMetrics, TorrentSummary};
 use std::sync::Mutex as StdMutex;
 use std::{
     cmp::Ordering,
@@ -64,6 +64,7 @@ pub struct AppState {
     pub workflow_runs: Arc<RwLock<Vec<serde_json::Value>>>,
     pub rss_rules: Arc<RwLock<JsonMap>>,
     pub user_agent: Arc<RwLock<String>>,
+    pub(crate) api_metrics: Arc<ApiRuntimeMetrics>,
     torrent_snapshot_cache: Arc<RwLock<VecDeque<CachedTorrentSnapshot>>>,
     torrent_snapshot_refresh: Arc<Mutex<()>>,
 }
@@ -74,6 +75,7 @@ impl AppState {
             Arc::new(RwLock::new(SessionRegistry::new())),
             None,
             Vec::new(),
+            ApiRuntimeMetrics::new(),
         )
     }
 
@@ -81,6 +83,7 @@ impl AppState {
         registry: Arc<RwLock<SessionRegistry>>,
         engine: Option<EngineHandle>,
         api_tokens: Vec<String>,
+        api_metrics: Arc<ApiRuntimeMetrics>,
     ) -> Self {
         AppState {
             registry,
@@ -94,13 +97,14 @@ impl AppState {
             workflow_runs: Arc::new(RwLock::new(Vec::new())),
             rss_rules: Arc::new(RwLock::new(BTreeMap::new())),
             user_agent: Arc::new(RwLock::new(rt_engine::peer_id::user_agent().to_owned())),
+            api_metrics,
             torrent_snapshot_cache: Arc::new(RwLock::new(VecDeque::new())),
             torrent_snapshot_refresh: Arc::new(Mutex::new(())),
         }
     }
 
     pub fn with_registry(registry: Arc<RwLock<SessionRegistry>>) -> Self {
-        Self::from_parts(registry, None, Vec::new())
+        Self::from_parts(registry, None, Vec::new(), ApiRuntimeMetrics::new())
     }
 
     pub fn with_tokens(engine: Option<EngineHandle>, api_tokens: Vec<String>) -> Self {
@@ -108,11 +112,12 @@ impl AppState {
             Arc::new(RwLock::new(SessionRegistry::new())),
             engine,
             api_tokens,
+            ApiRuntimeMetrics::new(),
         )
     }
 
     pub fn with_engine(registry: Arc<RwLock<SessionRegistry>>, engine: EngineHandle) -> Self {
-        Self::from_parts(registry, Some(engine), Vec::new())
+        Self::from_parts(registry, Some(engine), Vec::new(), ApiRuntimeMetrics::new())
     }
 
     pub fn with_engine_and_tokens(
@@ -120,7 +125,16 @@ impl AppState {
         engine: EngineHandle,
         api_tokens: Vec<String>,
     ) -> Self {
-        Self::from_parts(registry, Some(engine), api_tokens)
+        Self::from_parts(registry, Some(engine), api_tokens, ApiRuntimeMetrics::new())
+    }
+
+    pub fn with_engine_and_tokens_and_metrics(
+        registry: Arc<RwLock<SessionRegistry>>,
+        engine: EngineHandle,
+        api_tokens: Vec<String>,
+        api_metrics: Arc<ApiRuntimeMetrics>,
+    ) -> Self {
+        Self::from_parts(registry, Some(engine), api_tokens, api_metrics)
     }
 
     /// Return a bounded, immutable summary snapshot for pagination and other
@@ -139,6 +153,7 @@ impl AppState {
                 {
                     return Ok(cached.snapshot.clone());
                 }
+                self.api_metrics.record_snapshot_expired();
                 return Err(TorrentSnapshotError::Expired { revision });
             }
 
@@ -180,6 +195,7 @@ impl AppState {
             (revision, Arc::new(torrents))
         };
         let filters = Arc::new(build_filter_index(&torrents));
+        self.api_metrics.record_snapshot_refresh();
         let snapshot = TorrentSnapshot {
             revision,
             torrents,

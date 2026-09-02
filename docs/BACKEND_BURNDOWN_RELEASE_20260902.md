@@ -54,8 +54,8 @@ was configured, and no 24-hour soak was active.
 | Finding | Current result | What is still not proven |
 | --- | --- | --- |
 | TNG-010 | Runtime tier path, compact tier-controller dormant projections, and persisted tracker-deadline promotion integrated; **in progress** | Full registry projection replacement and release-binary 100k RSS/fd/thread/task/restart/promotion evidence |
-| TNG-011 | Bounded background worker, end-to-end in-flight cap, durable recovery, saturation gauges, and panic-slot cleanup implemented; **in progress** | Real filesystem crash/restart, richer terminal failure state, and filesystem-ahead-of-DB reconciliation |
-| TNG-013 | Revision snapshots, bounded pages, journal deltas, stats cache, and qBit large-output guard implemented; **in progress** | Sublinear filtering/aggregation, many-client/slow-consumer load evidence, and release-binary 1k/15k/100k latency/allocation evidence |
+| TNG-011 | Bounded background worker, end-to-end in-flight cap, durable recovery, saturation gauges, panic-slot cleanup, and filesystem-aware restart reconciliation implemented; **in progress** | Full `Engine::start` crash/restart injection, richer internal terminal result, and saturation alert policy |
+| TNG-013 | Revision snapshots, bounded pages, equality indexes, journal deltas, stats cache, API pressure telemetry, and qBit large-output guard implemented; **in progress** | Sublinear aggregation, dropped/lagging-client accounting, many-client/slow-consumer load evidence, and release-binary 1k/15k/100k latency/allocation evidence |
 | TNG-026 | Exact release artifact was built, deployed locally, smoked, and shut down; **in progress** | Fresh public/client/device/24-hour evidence and a clean strict readiness result |
 | TNG-029 | Explicit storage, policy, registry, API, budget, capability, and dependency-health seams exist; **in progress** | Concurrent fault-containment matrix and actual dependency isolation from the engine monolith |
 
