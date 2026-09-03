@@ -3,6 +3,8 @@ Description=TorrentNG native BitTorrent daemon
 Documentation=https://github.com/torrentng/torrentng
 After=network-online.target
 Wants=network-online.target
+Conflicts=rtorrentng-prod.service rtorrent.service torrentng-sidecar.service
+Before=rtorrentng-prod.service rtorrent.service torrentng-sidecar.service
 
 [Service]
 Type=simple

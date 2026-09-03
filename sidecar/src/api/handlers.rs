@@ -2461,6 +2461,14 @@ pub struct BulkResult {
     pub dry_run: bool,
 }
 
+fn deduplicate_hashes(hashes: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    hashes
+        .into_iter()
+        .filter(|hash| seen.insert(hash.clone()))
+        .collect()
+}
+
 pub async fn bulk_action(
     State(s): State<AppState>,
     Path(action): Path<String>,
@@ -2486,9 +2494,15 @@ pub async fn bulk_action(
         }
     }
 
+    // Treat a repeated hash as one mutation target. The WebUI normally
+    // supplies a Set, but qBittorrent/automation clients can submit the same
+    // hash repeatedly; forwarding that list would invoke start/reannounce
+    // multiple times for the same torrent.
+    let hashes = deduplicate_hashes(body.hashes);
+
     if body.dry_run {
         return Json(BulkResult {
-            applied: body.hashes.clone(),
+            applied: hashes.clone(),
             errors: vec![],
             dry_run: true,
         })
@@ -2501,9 +2515,9 @@ pub async fn bulk_action(
     // per-hash concurrent loop below, which every backend supports.
     if action == "stop" || action == "recheck" {
         let fast = if action == "stop" {
-            s.backend.stop_many(&body.hashes).await
+            s.backend.stop_many(&hashes).await
         } else {
-            s.backend.recheck_many(&body.hashes).await
+            s.backend.recheck_many(&hashes).await
         };
         if let Some(outcome) = fast {
             let mut applied = Vec::new();
@@ -2541,7 +2555,7 @@ pub async fn bulk_action(
                     }
                 }
                 Err(e) => {
-                    errors.extend(body.hashes.iter().map(|hash| format!("{hash}: {e}")));
+                    errors.extend(hashes.iter().map(|hash| format!("{hash}: {e}")));
                 }
             }
             return Json(BulkResult {
@@ -2563,7 +2577,7 @@ pub async fn bulk_action(
     let category = category.map(str::to_owned);
     let save_path = save_path.map(str::to_owned);
     let mut set = tokio::task::JoinSet::new();
-    for hash in body.hashes.clone() {
+    for hash in hashes {
         let sem = semaphore.clone();
         let state = s.clone();
         let action = action.clone();

@@ -315,7 +315,11 @@ impl Client {
         self.call_xmlrpc("d.resume", &[hash.into()]).await?;
         self.call_xmlrpc("d.try_start", &[hash.into()]).await?;
         self.call_xmlrpc("d.start", &[hash.into()]).await?;
-        self.announce_trackers(hash).await?;
+        // d.resume starts a stopped download and rTorrent emits its normal
+        // start announce as part of that transition. A manual announce here
+        // was a second tracker request for every explicit start. The
+        // dedicated reannounce endpoint below remains the only path that
+        // should force an additional announce.
         Ok(())
     }
 

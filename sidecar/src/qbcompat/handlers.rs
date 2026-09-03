@@ -2786,7 +2786,10 @@ mod tests {
         rtorrent::TransferRates,
     };
 
-    use super::{is_status_filter, qb_server_state, qbit_log_entry, to_qb_torrent, LogMainQuery};
+    use super::{
+        is_status_filter, qb_server_state, qbit_log_entry, split_hashes, to_qb_torrent,
+        LogMainQuery,
+    };
 
     #[test]
     fn is_status_filter_recognizes_every_bucket_build_where_handles() {
@@ -2817,6 +2820,16 @@ mod tests {
             );
         }
         assert!(!is_status_filter("not-a-real-status"));
+    }
+
+    #[test]
+    fn split_hashes_deduplicates_repeated_mutation_targets() {
+        let dir = tempfile::tempdir().expect("create cache tempdir");
+        let db = crate::cache::Db::open(&dir.path().join("cache.db")).expect("open cache");
+        assert_eq!(
+            split_hashes(&db, Some("A| A |B||A|B")),
+            vec!["A", "B"]
+        );
     }
 
     #[test]
@@ -3015,12 +3028,19 @@ fn split_hashes(db: &crate::cache::Db, s: Option<&str>) -> Vec<String> {
                 vec![]
             }
         },
-        Some(s) => s
-            .split('|')
-            .map(str::trim)
-            .filter(|h| !h.is_empty())
-            .map(str::to_owned)
-            .collect(),
+        Some(s) => {
+            let mut seen = std::collections::HashSet::new();
+            s.split('|')
+                .map(str::trim)
+                .filter_map(|hash| {
+                    if hash.is_empty() || !seen.insert(hash.to_owned()) {
+                        None
+                    } else {
+                        Some(hash.to_owned())
+                    }
+                })
+                .collect()
+        }
     }
 }
 
