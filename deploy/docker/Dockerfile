@@ -55,7 +55,12 @@ RUN git clone --depth=1 --branch "v${LIBTORRENT_VERSION}" https://github.com/rak
 COPY deploy/docker/patches/rtorrent-0.16.11-user-agent-command.patch /tmp/rtorrent-user-agent-command.patch
 COPY deploy/docker/patches/rtorrent-0.16.11-local-id-command.patch /tmp/rtorrent-local-id-command.patch
 COPY deploy/docker/patches/rtorrent-0.16.11-multicall-range.patch /tmp/rtorrent-multicall-range.patch
-RUN cd rtorrent && git apply /tmp/rtorrent-user-agent-command.patch && git apply /tmp/rtorrent-local-id-command.patch && git apply /tmp/rtorrent-multicall-range.patch
+COPY deploy/docker/patches/rtorrent-0.16.11-tracker-identity-gate.patch /tmp/rtorrent-tracker-identity-gate.patch
+RUN cd rtorrent && \
+    git apply /tmp/rtorrent-user-agent-command.patch && \
+    git apply /tmp/rtorrent-local-id-command.patch && \
+    git apply /tmp/rtorrent-multicall-range.patch && \
+    git apply /tmp/rtorrent-tracker-identity-gate.patch
 RUN cd libtorrent && autoreconf -fi && \
     ./configure --prefix=/usr/local && \
     make -j"$(nproc)" && make install
@@ -82,7 +87,7 @@ ENV TNG_STATIC_DIR=/usr/share/torrentng/webui
 ENV LD_LIBRARY_PATH=/usr/local/lib
 ENV TNG_PACKAGED_RTORRENT_VERSION=0.16.11
 ENV TNG_PACKAGED_LIBTORRENT_VERSION=0.16.11
-ENV TNG_RTORRENT_PATCHES=rtorrent-0.16.11-user-agent-command,rtorrent-0.16.11-local-id-command,rtorrent-0.16.11-multicall-range
+ENV TNG_RTORRENT_PATCHES=rtorrent-0.16.11-user-agent-command,rtorrent-0.16.11-local-id-command,rtorrent-0.16.11-multicall-range,rtorrent-0.16.11-tracker-identity-gate
 
 VOLUME ["/data", "/session", "/config"]
 EXPOSE 8080 50000 50000/udp

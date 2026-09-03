@@ -77,72 +77,44 @@ async fn main() -> Result<()> {
     let (tx, _) = broadcast::channel::<Event>(1024);
 
     if cfg.backend.backend_type == BackendKind::Rtorrent {
-        let rt_ua = rt.clone();
-        let ua = cfg.rtorrent.user_agent.clone();
-        let peer_id = cfg.rtorrent.peer_id.clone();
-        let db2 = db.clone();
-        let retention = cfg.logging.event_retention;
-        tokio::spawn(async move {
-            let mut user_agent_error = None;
-            for attempt in 1..=3 {
-                match rt_ua.set_user_agent(&ua).await {
-                    Ok(()) => {
-                        user_agent_error = None;
-                        break;
-                    }
-                    Err(e) => {
-                        user_agent_error = Some(e);
-                        if attempt < 3 {
-                            tokio::time::sleep(Duration::from_secs(5)).await;
-                        }
-                    }
-                }
-            }
-            if let Some(e) = user_agent_error {
-                warn!(
-                    component = "rtorrent",
-                    operation = "set_user_agent",
-                    result = "error",
-                    error = %e,
-                    "could not set user agent after startup"
-                );
-                append_startup_event(
-                    &db2,
-                    retention,
-                    "warn",
-                    "rtorrent_user_agent_error",
-                    "could not apply rTorrent user agent after startup",
-                    serde_json::json!({
-                        "component": "rtorrent",
-                        "operation": "set_user_agent",
-                        "result": "error",
-                        "error": e.to_string(),
-                    }),
-                );
-            }
-            if let Err(e) = rt_ua.set_all_peer_ids(&peer_id).await {
-                warn!(
-                    component = "rtorrent",
-                    operation = "set_peer_id",
-                    result = "error",
-                    error = %e,
-                    "could not set rTorrent peer id after startup"
-                );
-                append_startup_event(
-                    &db2,
-                    retention,
-                    "warn",
-                    "rtorrent_peer_id_error",
-                    "could not apply rTorrent peer id after startup",
-                    serde_json::json!({
-                        "component": "rtorrent",
-                        "operation": "set_peer_id",
-                        "result": "error",
-                        "error": e.to_string(),
-                    }),
-                );
-            }
-        });
+        if let Err(error) =
+            initialize_rtorrent_identity(&rt, &cfg.rtorrent.user_agent, &cfg.rtorrent.peer_id).await
+        {
+            warn!(
+                component = "rtorrent",
+                operation = "startup_identity",
+                result = "error",
+                error = %error,
+                "refusing to serve until rTorrent tracker identity is applied"
+            );
+            append_startup_event(
+                &db,
+                cfg.logging.event_retention,
+                "error",
+                "rtorrent_identity_error",
+                "sidecar refused startup because rTorrent tracker identity was not applied",
+                serde_json::json!({
+                    "component": "rtorrent",
+                    "operation": "startup_identity",
+                    "result": "error",
+                    "error": error.to_string(),
+                }),
+            );
+            return Err(error).context("initialize rTorrent tracker identity");
+        }
+        append_startup_event(
+            &db,
+            cfg.logging.event_retention,
+            "info",
+            "rtorrent_identity_ready",
+            "rTorrent tracker identity applied before sidecar became available",
+            serde_json::json!({
+                "component": "rtorrent",
+                "operation": "startup_identity",
+                "result": "ok",
+                "peer_id_length": cfg.rtorrent.peer_id.len(),
+            }),
+        );
     }
 
     {
@@ -231,6 +203,56 @@ async fn main() -> Result<()> {
         "shutdown complete"
     );
     Ok(())
+}
+
+/// Apply every tracker-facing rTorrent identity before starting any sidecar
+/// background task or binding the HTTP listener. The packaged rTorrent build
+/// keeps session torrents behind its identity gate until release_identity_gate
+/// succeeds, so startup cannot expose a window where a torrent announces with
+/// a stale or default local_id.
+async fn initialize_rtorrent_identity(rt: &Client, user_agent: &str, peer_id: &str) -> Result<()> {
+    let mut last_error = None;
+    for attempt in 1..=3 {
+        let result = async {
+            // Use the XML-RPC path for all mutators. The JSON adapter can
+            // acknowledge some rTorrent state-changing calls without applying
+            // the underlying transition.
+            rt.set_user_agent(user_agent).await?;
+            rt.set_all_peer_ids(peer_id).await?;
+            rt.release_identity_gate().await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                tracing::info!(
+                    component = "rtorrent",
+                    operation = "startup_identity",
+                    result = "ok",
+                    attempt,
+                    "rTorrent tracker identity is ready"
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                warn!(
+                    component = "rtorrent",
+                    operation = "startup_identity",
+                    result = "retry",
+                    attempt,
+                    error = %error,
+                    "rTorrent tracker identity setup failed"
+                );
+                last_error = Some(error);
+                if attempt < 3 {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
+        }
+    }
+
+    Err(last_error.expect("identity setup always attempts at least once"))
 }
 
 fn unix_now_i64() -> i64 {

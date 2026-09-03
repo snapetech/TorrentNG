@@ -144,10 +144,23 @@ On startup the sidecar:
    XMLRPC target argument.
 2. Calls `d.multicall2` with `d.local_id.set=<resolved peer_id>` for loaded
    downloads.
-3. Calls `d.save_full_session=` so the local IDs survive restart.
+3. Calls `d.save_full_session=` for the normal session checkpoint. This does
+   **not** serialize `local_id`; the identity rewrite is therefore required
+   on every rTorrent start.
+4. Releases the packaged rTorrent `tng.identity_ready` startup gate and runs
+   `scheduler.simple.update` over the `started` view.
 
 The leading empty XMLRPC argument is the rTorrent target slot. It is not a
 sidecar identity and must not be removed.
+
+The packaged rTorrent build starts with `tng.identity_ready=0`. Session
+torrents may enter the `started` desired-state view while the sidecar rewrites
+their identities, but `scheduler.simple.added` is held back until the gate is
+released. This prevents a startup announce with a stale or historical
+`local_id`. The same `d.local_id.set=<resolved peer_id>` command is included
+when the sidecar handles `load.start` / `load.raw_start`, and is reapplied
+before an explicit `start`, so torrents added after startup use the install
+identity too.
 
 ## Migrating an existing install
 

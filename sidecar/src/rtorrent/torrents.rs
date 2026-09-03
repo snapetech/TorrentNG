@@ -235,16 +235,23 @@ impl Client {
         let save_path = normalize_rtorrent_save_path(save_path);
         let dir_cmd = format!("d.directory.set={save_path}");
         let category_cmd = format!("d.custom1.set={category}");
-        self.call(
-            method,
-            &[
-                "".into(),
-                magnet.into(),
-                dir_cmd.as_str().into(),
-                category_cmd.as_str().into(),
-            ],
-        )
-        .await?;
+        let identity_cmd = self
+            .tracker_peer_id()
+            .map(|peer_id| format!("d.local_id.set={peer_id}"));
+        let mut args: Vec<XmlValue> = vec![
+            "".into(),
+            magnet.into(),
+            dir_cmd.as_str().into(),
+            category_cmd.as_str().into(),
+        ];
+        if let Some(identity_cmd) = identity_cmd.as_deref() {
+            args.push(identity_cmd.into());
+        }
+        // rTorrent executes load commands after inserting the download and
+        // before load.start applies the requested started state. Assigning
+        // local_id here prevents a newly-added torrent from receiving a
+        // second, per-torrent identity.
+        self.call_xmlrpc(method, &args).await?;
         Ok(())
     }
 
@@ -280,22 +287,30 @@ impl Client {
         let save_path = normalize_rtorrent_save_path(save_path);
         let dir_cmd = format!("d.directory.set={save_path}");
         let category_cmd = format!("d.custom1.set={category}");
+        let identity_cmd = self
+            .tracker_peer_id()
+            .map(|peer_id| format!("d.local_id.set={peer_id}"));
         // rTorrent's raw loader expects XMLRPC base64, not a plain string.
         let b64 = base64_encode(data);
-        self.call(
-            method,
-            &[
-                "".into(),
-                XmlValue::Base64(b64),
-                dir_cmd.as_str().into(),
-                category_cmd.as_str().into(),
-            ],
-        )
-        .await?;
+        let mut args: Vec<XmlValue> = vec![
+            "".into(),
+            XmlValue::Base64(b64),
+            dir_cmd.as_str().into(),
+            category_cmd.as_str().into(),
+        ];
+        if let Some(identity_cmd) = identity_cmd.as_deref() {
+            args.push(identity_cmd.into());
+        }
+        self.call_xmlrpc(method, &args).await?;
         Ok(())
     }
 
     pub async fn start(&self, hash: &str) -> Result<()> {
+        if let Some(peer_id) = self.tracker_peer_id() {
+            self.call_xmlrpc("d.local_id.set", &[hash.into(), peer_id.into()])
+                .await
+                .context("set rTorrent download local_id before start")?;
+        }
         self.call_xmlrpc("d.open", &[hash.into()]).await?;
         self.call_xmlrpc("d.resume", &[hash.into()]).await?;
         self.call_xmlrpc("d.try_start", &[hash.into()]).await?;
@@ -407,7 +422,7 @@ impl Client {
     /// Push user_agent to rTorrent's HTTP user agent setting.
     /// Called on startup and on config change via API.
     pub async fn set_user_agent(&self, user_agent: &str) -> Result<()> {
-        self.call(
+        self.call_xmlrpc(
             "network.http.user_agent.set",
             &["".into(), user_agent.into()],
         )
@@ -426,7 +441,7 @@ impl Client {
         }
 
         let set_cmd = format!("d.local_id.set={peer_id}");
-        self.call(
+        self.call_xmlrpc(
             "d.multicall2",
             &[
                 "".into(),
@@ -437,6 +452,27 @@ impl Client {
         )
         .await
         .context("set rTorrent download local_id values")?;
+        Ok(())
+    }
+
+    /// Release the rTorrent startup gate after all loaded downloads have the
+    /// resolved identity. The patched rTorrent profile keeps session torrents
+    /// from resuming while this flag is zero, so no tracker announce can race
+    /// the identity rewrite.
+    pub async fn release_identity_gate(&self) -> Result<()> {
+        self.call_xmlrpc("tng.identity_ready.set", &[1.into()])
+            .await
+            .context("release rTorrent tracker identity gate")?;
+        self.call_xmlrpc(
+            "d.multicall2",
+            &[
+                "".into(),
+                "started".into(),
+                "scheduler.simple.update=".into(),
+            ],
+        )
+        .await
+        .context("resume rTorrent downloads after identity gate")?;
         Ok(())
     }
 

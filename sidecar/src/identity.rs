@@ -22,7 +22,7 @@ pub fn load_or_generate_peer_id(data_dir: &Path) -> Result<String> {
     let path = data_dir.join(PEER_ID_SUFFIX_FILE);
     if let Ok(existing) = std::fs::read_to_string(&path) {
         let trimmed = existing.trim();
-        if trimmed.len() == 12 && trimmed.is_ascii() {
+        if valid_suffix(trimmed) {
             return Ok(format!("{PEER_ID_PREFIX}{trimmed}"));
         }
     }
@@ -32,6 +32,12 @@ pub fn load_or_generate_peer_id(data_dir: &Path) -> Result<String> {
     std::fs::write(&path, &suffix)
         .with_context(|| format!("persist peer id suffix to {}", path.display()))?;
     Ok(format!("{PEER_ID_PREFIX}{suffix}"))
+}
+
+fn valid_suffix(suffix: &str) -> bool {
+    suffix.len() == 12
+        && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        && suffix.bytes().any(|byte| byte != b'0')
 }
 
 fn random_suffix() -> String {
@@ -67,5 +73,34 @@ mod tests {
         let a = load_or_generate_peer_id(dir_a.path()).expect("a");
         let b = load_or_generate_peer_id(dir_b.path()).expect("b");
         assert_ne!(a, b, "two independent installs must not share a peer id");
+    }
+
+    #[test]
+    fn invalid_persisted_suffix_is_replaced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(PEER_ID_SUFFIX_FILE);
+        std::fs::write(&path, "000000000000").expect("write sentinel");
+
+        let id = load_or_generate_peer_id(dir.path()).expect("replace sentinel");
+        let suffix = id.strip_prefix(PEER_ID_PREFIX).expect("prefix");
+
+        assert!(valid_suffix(suffix));
+        assert_ne!(suffix, "000000000000");
+        assert_eq!(
+            std::fs::read_to_string(path).expect("read replacement"),
+            suffix
+        );
+    }
+
+    #[test]
+    fn punctuation_in_persisted_suffix_is_replaced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(PEER_ID_SUFFIX_FILE);
+        std::fs::write(&path, "aaaaaaaaaaa!").expect("write invalid suffix");
+
+        let id = load_or_generate_peer_id(dir.path()).expect("replace invalid suffix");
+        let suffix = id.strip_prefix(PEER_ID_PREFIX).expect("prefix");
+
+        assert!(valid_suffix(suffix));
     }
 }

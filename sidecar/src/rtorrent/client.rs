@@ -24,6 +24,7 @@ pub struct Client {
     timeout: std::time::Duration,
     rpc_gate: Arc<Semaphore>,
     low_priority_pause_until: Arc<Mutex<Option<Instant>>>,
+    tracker_peer_id: Option<String>,
 }
 
 impl Client {
@@ -38,6 +39,7 @@ impl Client {
             timeout: std::time::Duration::from_secs(cfg.timeout_secs),
             rpc_gate: Arc::new(Semaphore::new(1)),
             low_priority_pause_until: Arc::new(Mutex::new(None)),
+            tracker_peer_id: Some(cfg.peer_id.clone()),
         })
     }
 
@@ -48,7 +50,15 @@ impl Client {
             timeout: std::time::Duration::from_secs(timeout_secs),
             rpc_gate: Arc::new(Semaphore::new(1)),
             low_priority_pause_until: Arc::new(Mutex::new(None)),
+            tracker_peer_id: None,
         }
+    }
+
+    /// Return the resolved per-install tracker identity for commands that
+    /// create or resume a download. Test-only clients intentionally have no
+    /// identity because they do not own a configured rTorrent instance.
+    pub(crate) fn tracker_peer_id(&self) -> Option<&str> {
+        self.tracker_peer_id.as_deref()
     }
 
     /// Execute a single XMLRPC method and return the parsed result.

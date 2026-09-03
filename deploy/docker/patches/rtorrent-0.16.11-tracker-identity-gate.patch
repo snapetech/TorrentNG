@@ -1,0 +1,18 @@
+diff --git a/src/main.cc b/src/main.cc
+index c797f19..49778c4 100644
+--- a/src/main.cc
++++ b/src/main.cc
+@@ -187,4 +187,7 @@ main(int argc, char** argv) {
+     rpc::parse_command_multiple
+       (rpc::make_target(),
++       // Session torrents must not resume until TorrentNG has applied the
++       // per-install tracker identity to every loaded download.
++       "method.insert = tng.identity_ready, value, 0\n"
+        "method.insert = event.view.hide,multi|rlookup|static\n"
+        "method.insert = event.view.show,multi|rlookup|static\n"
+@@ -253,4 +253,4 @@ main(int argc, char** argv) {
+        "view.add = started\n"
+        "view.filter = started,((false))\n"
+-       "view.event_added   = started,{(view.set_not_visible,stopped),(d.state.set,1),(scheduler.simple.added)}\n"
++       "view.event_added   = started,{(view.set_not_visible,stopped),(d.state.set,1),(branch=tng.identity_ready=,((scheduler.simple.added)),{})}\n"
+        "view.event_removed = started,{(view.set_visible,stopped),(scheduler.simple.removed)}\n"
