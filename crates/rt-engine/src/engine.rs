@@ -12085,14 +12085,18 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if !save_root.join("restore.bin").exists() {
+                let payload_removed = !save_root.join("restore.bin").exists();
+                let job_finished = rt_db::list_active_jobs(&db.lock().unwrap())
+                    .unwrap()
+                    .is_empty();
+                if payload_removed && job_finished {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("payload cleanup worker did not finish");
+        .expect("payload cleanup worker did not finish filesystem and durable work");
 
         let jobs = rt_db::list_active_jobs(&db.lock().unwrap()).unwrap();
         assert!(jobs.is_empty());
