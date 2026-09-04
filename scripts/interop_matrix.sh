@@ -969,6 +969,11 @@ run_rust_api_facade_case() {
   append_report "## Extended Local: rust-api-facades"
   append_report ""
   log "running extended local case rust-api-facades"
+  # The preceding restart-recovery case may have returned before the daemon's
+  # readiness probe became stable. Wait for the same authenticated readiness
+  # contract that protects the rest of the matrix before treating a transient
+  # 503 as a facade failure.
+  wait_rust_ready 120 || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/health" |
     jq -e '.ready == true and .status == "ok"' >/dev/null || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/metrics" |
