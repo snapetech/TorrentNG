@@ -1,6 +1,6 @@
 # TorrentNG Project Gap Audit
 
-Status as of 2026-09-04 on the dirty working tree rooted at `e0d487f`.
+Status as of 2026-09-04 on clean `main` at `83b70ce`.
 
 This audit separates local implementation gaps from external evidence gates.
 It is based on the roadmap docs, compatibility matrices, certification status,
@@ -10,9 +10,9 @@ The dated audit narrative below is retained for traceability. The current
 repository disposition is the 2026-09-04 reconciliation in
 [`BACKEND_AUDIT_BURN_DOWN.md`](BACKEND_AUDIT_BURN_DOWN.md): all repository-
 actionable implementation, contract, security, CI, and local evidence work is
-closed for its declared scope. Remaining rows require hosted runners, public
-clients/networks, physical storage, or elapsed soak time and are not hidden
-implementation backlog.
+closed for its declared scope. Hosted CI is now green. Remaining rows require
+public clients/networks, physical storage, branch-protection settings, or
+elapsed soak time and are not hidden implementation backlog.
 
 ## Executive Summary
 
@@ -51,12 +51,13 @@ Current `scripts/certification_status.sh` highlights:
 | Area | Status |
 | --- | --- |
 | Native engine rewrite | PASS |
-| Local release gate | PASS_WITH_WARNINGS only while optional live/public/device/soak rows are skipped or stale |
-| Storage hardware matrix | PASS |
-| Storage io_uring capability/graduation | PASS |
-| Storage move/import | PASS |
-| Storage release certification | PASS |
-| Storage indexed evidence | PASS |
+| Hosted CI repository gate | PASS (`33910318860`, all 10 jobs) |
+| Local release gate | PASS_WITH_WARNINGS; target-device storage is skipped |
+| Storage hardware matrix | Historical evidence only; current target unavailable |
+| Storage io_uring capability/graduation | Historical evidence only; current target unavailable |
+| Storage move/import | Historical evidence only; current target unavailable |
+| Storage release certification | Historical evidence only; current target unavailable |
+| Storage indexed evidence | Historical index; not current target qualification |
 | Security review and scan | PASS |
 | Pre-engine release gate | PASS |
 | Post-soak release gate | PASS_WITH_WARNINGS while skipped/gap/stale rows remain |
@@ -66,7 +67,7 @@ Current `scripts/certification_status.sh` highlights:
 | Release evidence suite | Fails until strict readiness passes, while refreshing bundle/burndown |
 | Certification JSON status | Machine-readable status export for CI/release automation |
 | Universal compatibility | PASS_WITH_SKIPS unless live/public/device legs are enabled |
-| Universal live compatibility | PASS_WITH_SKIPS while public/device legs are skipped; latest local Docker interop leg passed |
+| Universal live compatibility | PASS_WITH_SKIPS while public/device legs are skipped; current local Docker interop passes |
 | Migration corpus | PASS with generated checked-in corpus; strict local gate passes |
 | External evidence preflight | Host readiness for live/corpus/soak external evidence |
 | 24h soak | STALE/INCOMPLETE |
@@ -258,12 +259,13 @@ it updates status, burndown, readiness, and bundle reports, and fails while
 strict readiness still has blockers.
 `docs/RELEASE_EVIDENCE.md` is the runbook for clearing every current warning
 row and producing the final evidence bundle.
-The full Docker interop matrix still has release evidence to run:
+The current full Docker interop matrix now has a clean local result in
+[`interop-matrix-20260904T195529Z.md`](../certification/reports/interop-matrix-20260904T195529Z.md):
+28/28 cases pass against the current image and source tree. The remaining
+interop work is external or optional:
 
-- local Docker client-to-client rows across qBittorrent, Transmission, Deluge,
-  rTorrent, and TorrentNG now have refreshed passing evidence through
-  `scripts/universal_live_certification.sh`;
 - public legal torrent matrix;
+- real-device storage matrix;
 - the Docker protocol matrix now includes `rust-trackerless-magnet`, which adds
   TorrentNG from a trackerless magnet and completes via an explicit bridged
   peer, covering trackerless BEP 9 metadata and payload transfer in the local

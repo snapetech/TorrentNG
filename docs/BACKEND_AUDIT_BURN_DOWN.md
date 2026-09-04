@@ -68,9 +68,9 @@ The following was run against the audit baseline before this burn-down began:
 
 The current source tree has been re-verified after the functional isolation,
 durability, compatibility, and contract fixes recorded in the latest
-burn-down entries. The checks below are local verification; hosted CI,
-external hardware, real client traffic, and long-soak results remain separate
-evidence gates.
+burn-down entries. The checks below combine local verification with the
+completed hosted CI run; external hardware, public-network traffic, and
+long-soak results remain separate evidence gates.
 
 | Check | Result | Meaning |
 | --- | --- | --- |
@@ -81,10 +81,13 @@ evidence gates.
 | `cargo +1.88 build/test --workspace --all-targets --locked` | PASS | Declared main-workspace MSRV build and tests green. |
 | `cargo +1.97.0 build/test --manifest-path sidecar/Cargo.toml --locked` | PASS | Declared sidecar MSRV build and tests green. |
 | declared `rust-version` (both `Cargo.toml`s) | **CORRECTED** | Was `1.80` in both, unverified and untrue. Neither workspace's *locked* dependency graph builds below 1.88 (main: `idna_adapter` needs rustc 1.86+, plus `edition2024` needs Cargo 1.85+) or 1.97 (sidecar: `libsqlite3-sys`'s build script uses `cfg_select!`, stabilized between 1.94 and 1.97). This is a transitive-dependency floor, not first-party code needing new syntax. Corrected both `rust-version` fields to `1.88` / `1.97` to match reality; this itself is TNG-028 acceptance criteria ("document the supported toolchain"). |
+| GitHub Actions CI run `33910318860` | PASS | All 10 jobs passed on `83b70ce`: native quality, both MSRV jobs, fuzz smoke, sidecar, WebUI, dependency security, backup/restore, API/SSE load, and fault containment. |
 
-The hosted workflows now define these checks, but no hosted run has been
-observed from this environment. These are local, manually-run results, not
-evidence that branch protection has made the gates required yet.
+The hosted CI workflow has now run successfully. The companion dynamic
+`Push on main` orchestration also passed (`33910318425`). This proves the
+repository gates execute on GitHub's runners; it does not prove that branch
+protection requires them, and the repository's branch-protection setting must
+still be reviewed separately.
 
 Focused release evidence from 2026-09-04 is indexed in
 [`BACKEND_BURNDOWN_RELEASE_20260902.md`](BACKEND_BURNDOWN_RELEASE_20260902.md).
@@ -96,37 +99,41 @@ stale, missing, or explicitly skipped. This is a deployment smoke result, not
 a 100k capacity result.
 
 The latest verification rebuilt `target/release/torrentngd` locally on
-2026-09-04: 22,518,096 bytes, SHA-256
-`9f2dd59ba4bff2f760c789288dc057aab22c0f957ce4e47c36d51f0ff6699288`.
+2026-09-04: 22,433,352 bytes, SHA-256
+`ff94ede075f7541ef9eecf5418b1c31324fb1b6ca2648681d975b3e9cd048e73`.
 The current release-binary smoke passed authenticated health, native list and
 transfer, qBittorrent list and transfer, Prometheus metrics, and SIGTERM
-clean exit in 470 ms. See
-[`backend-burndown-native-release-smoke-current-20260904.md`](../certification/reports/backend-burndown-native-release-smoke-current-20260904.md).
+clean exit in 462 ms. See the current local release gate and smoke report:
+[`local-release-backend-burndown-final-20260904.md`](../certification/reports/local-release-backend-burndown-final-20260904.md),
+[`backend-burndown-native-release-smoke-local-release-20260904T192950Z.md`](../certification/reports/backend-burndown-native-release-smoke-local-release-20260904T192950Z.md).
 Full workspace tests, warnings-denied clippy, formatting, OpenAPI validation,
 sidecar tests, the current security scan, and the universal-live local Docker
 matrix are green. These are current local facts, not external production
 evidence. The universal-live report is `PASS_WITH_SKIPS`: its 28 local Docker
-cases pass, while public-torrent and real-device legs remain explicit skips.
+cases pass in [`universal-live-current-20260904.md`](../certification/reports/universal-live-current-20260904.md),
+while public-torrent and real-device legs remain explicit skips.
 
 The local release process also passed the focused fault and API-load gates:
-[`backend-burndown-fault-matrix-local-20260904-final.md`](../certification/reports/backend-burndown-fault-matrix-local-20260904-final.md)
-passed deterministic worker panic/cancellation/rollback checks plus live
-SIGKILL/restart, injected SQLite failure/recovery, API cancellation, and
-filesystem failure isolation. [`backend-api-load-local-20260904-final.md`](../certification/reports/backend-api-load-local-20260904-final.md)
-passed 191,893 requests from 32 JSON clients plus 8 slow SSE consumers over
-30 seconds with zero errors (p50 4.71 ms, p95 8.67 ms, p99 10.73 ms).
+[`backend-burndown-native-fault-live-current-20260904.md`](../certification/reports/backend-burndown-native-fault-live-current-20260904.md)
+passed live SIGKILL/restart, injected SQLite failure/recovery, API
+cancellation, and filesystem failure isolation; the deterministic worker
+panic/cancellation/rollback report is
+[`backend-burndown-native-fault-current-20260904.md`](../certification/reports/backend-burndown-native-fault-current-20260904.md).
+[`backend-api-load-current-20260904-final.md`](../certification/reports/backend-api-load-current-20260904-final.md)
+passed 204,936 requests from 32 JSON clients plus 8 slow SSE consumers over
+30 seconds with zero errors (p50 4.41 ms, p95 8.05 ms, p99 10.08 ms).
 RSS was sampled as an allocation proxy; this is not an allocator profile or a
 representative public production workload.
 
-The local Docker interoperability matrix is also reconciled at 28/28 PASS:
-[`interop-matrix-backend-local-20260904-final.md`](../certification/reports/interop-matrix-backend-local-20260904-final.md).
+The current full Docker interoperability matrix is
+[`interop-matrix-20260904T195529Z.md`](../certification/reports/interop-matrix-20260904T195529Z.md).
 It covers bidirectional transfers with qBittorrent, Transmission, Deluge, and
 rTorrent, failure/recovery protocol cases, and native/qBittorrent/Transmission/
 Deluge facade mutations. The public Internet matrix remains intentionally
 unrun.
 
 The current external preflight is
-[`external-evidence-preflight-20260904T160551Z.md`](../certification/reports/external-evidence-preflight-20260904T160551Z.md):
+[`external-evidence-preflight-20260904T193524Z.md`](../certification/reports/external-evidence-preflight-20260904T193524Z.md):
 migration corpus and Docker are green; public-network opt-in, a writable
 real-device target, and an active 24-hour soak are not configured.
 
@@ -218,12 +225,13 @@ Still genuinely open after this pass:
   evidence. Arbitrary filter-index refresh remains linear by design.
 - TNG-016 remains explicitly unsupported for pure-v2 transfer; this is a
   deliberate capability boundary, not a hidden implementation claim.
-- TNG-023/025/028 need accepted certification or hosted-run evidence before
-  their certified/hosted status can change. TNG-026 has current local release,
-  fault, and API-load evidence but not hosted observation, public, device, or
-  soak evidence.
-- TNG-027 has real parser fuzz targets and local runs; broader mutation replay
-  and hosted fuzz execution remain evidence work.
+- TNG-023 still needs accepted certification evidence before its `certified`
+  state can change. TNG-025/027/028 now have hosted CI evidence in run
+  `33910318860`; branch-protection enforcement remains a repository-settings
+  question. TNG-026 has current local release, fault, API-load, and hosted
+  repository-gate evidence but not public, device, or soak evidence.
+- TNG-027 has real parser fuzz targets, local runs, and a passing hosted fuzz
+  smoke; broader mutation replay remains evidence work.
 - TNG-029's stated synchronous actor-owned persistence defect is resolved:
   production authoritative DB work crosses a bounded supervised worker and
   the live crash/cancellation/DB/storage fault matrix passes. The engine/API
@@ -273,7 +281,7 @@ and is superseded by the source reconciliation above.
 | TNG-010 | Implemented locally: runtime tiering, compact dormant state, deadline wheel | 100k/hot-set certification is explicitly deferred |
 | TNG-011 | Implemented and locally fault-tested: detached bounded storage workers, dedicated DB connection, durable restart recovery, live cancellation, DB-failure, and filesystem-failure isolation | Hosted/device deployment evidence and broader disk/permission/space matrix remain external |
 | TNG-012 | Implemented locally: actor liveness, task reaping, bounded shutdown; live dependency health and SIGTERM paths pass | Shutdown-under-load and deployment timing evidence remain external |
-| TNG-013 | Implemented and locally load-tested: immutable snapshots, indexes, pagination, journals, bounded SSE chunks; 191,893-request many-client/slow-consumer run passes | Representative production corpus, allocator profile, and public/client load evidence remain external |
+| TNG-013 | Implemented and locally load-tested: immutable snapshots, indexes, pagination, journals, bounded SSE chunks; 204,936-request many-client/slow-consumer run passes with zero errors | Representative production corpus, allocator profile, and public/client load evidence remain external |
 | TNG-014 | Implemented locally: packed bitmaps and shared immutable piece maps | Run peer-count memory profile |
 | TNG-015 | Implemented locally: guarded webseed timer and exponential retry backoff | Run idle/large-swarm benchmark |
 | TNG-016 | Explicitly unsupported: pure-v2 transfer/completion is not claimed | No implementation action until a complete v2 transfer design exists |
@@ -285,16 +293,17 @@ and is superseded by the source reconciliation above.
 | TNG-022 | Implemented locally: durable categories/tags/bans and ban eviction; unsupported mode/plugin operations now fail explicitly | Keep projection-only compatibility behavior documented; run real-client matrix |
 | TNG-023 | Implemented locally: implemented/enabled/certified/experimental assurance states are separate | Keep `certified` empty until external evidence is accepted |
 | TNG-024 | Implemented locally: fail-closed config validation, secret-file support, deployment templates | Run deployment on the target orchestrator and inspect rendered secrets |
-| TNG-025 | Implemented locally: native CI, clippy, MSRV, fuzz, and authenticated release-smoke jobs are defined | Hosted workflow execution has not been observed |
-| TNG-026 | Local release deployment, live fault matrix, and API/SSE load smoke are current and passing | Hosted CI observation, public/device/24-hour evidence, and strict readiness remain external gates |
-| TNG-027 | Implemented locally: fuzz targets, OpenAPI validator, and idempotency tests are checked in | Run hosted fuzz and broaden mutation replay corpus |
-| TNG-028 | Implemented locally: format, clippy, locked tests, and declared MSRV pass locally | Hosted MSRV job execution has not been observed |
+| TNG-025 | Resolved for the repository gate: native quality, clippy, MSRV, fuzz, release-smoke, security, backup, load, and fault jobs execute successfully | Branch-protection enforcement still needs repository-settings review |
+| TNG-026 | Current release artifact was built from clean `83b70ce`, deployed locally, authenticated, smoked, backed up/restored, and shut down cleanly; hosted CI run also passed | Public/device/24-hour evidence and strict readiness remain external gates |
+| TNG-027 | Resolved for the repository gate: fuzz targets, OpenAPI validator, idempotency tests, and hosted bounded fuzz smoke are green | Broader parser and mutation replay corpus remains optional evidence work |
+| TNG-028 | Resolved for the repository gate: format, clippy, locked tests, and declared MSRV pass locally and in hosted CI | Branch-protection enforcement still needs repository-settings review |
 | TNG-029 | Resolved for the stated persistence-isolation finding: authoritative engine DB work uses a dedicated bounded supervised worker; live crash/DB/storage fault matrix and local client matrix pass | Full actor decomposition and deployment-specific fault evidence remain non-release structural follow-up |
 
 The practical release statement is therefore: **local functional remediation,
-live fault containment, API/SSE load, and release-binary smoke pass; hosted CI
-observation, real-device, public compatibility, long-soak certification, and
-extended-scale proof are not complete.**
+live fault containment, API/SSE load, release-binary smoke, and the hosted CI
+repository gate pass; branch-protection enforcement, real-device storage,
+public compatibility, long-soak certification, and extended-scale proof are
+not complete.**
 
 ## P0 — security and data integrity
 
@@ -493,9 +502,9 @@ zero/absurd sizes, path and collection limits, and piece-count mismatch. The
 checked-in `parse_torrent` and `bencode_decode` libFuzzer targets also run in
 the bounded fuzz CI job.
 
-The implementation gate is complete. Broader corpus duration and hosted fuzz
-execution remain evidence work; malformed input must continue to fail closed
-before any large allocation.
+The implementation gate is complete, and hosted fuzz smoke is now green in CI
+run `33910318860`. Broader corpus duration remains evidence work; malformed
+input must continue to fail closed before any large allocation.
 
 ### TNG-005 — Outbound tracker/webseed egress policy is not wired
 
@@ -870,10 +879,10 @@ responses necessarily serialize their requested output and can be enormous;
 large responses intentionally omit transient per-torrent tracker/swarm/limit
 queries rather than issue 100k actor calls. SSE stream-instance drops are now
 counted. The current release process load run used 32 JSON clients and 8
-deliberately slow SSE consumers for 30 seconds: 191,893 requests, 175.4 MB of
-responses, zero errors, p50 4.71 ms, p95 8.67 ms, p99 10.73 ms, and eight
+deliberately slow SSE consumers for 30 seconds: 204,936 requests, 249.6 MB of
+responses, zero errors, p50 4.41 ms, p95 8.05 ms, p99 10.08 ms, and eight
 successful SSE streams. RSS was sampled as an allocation proxy (119 samples,
-19.5 MiB minimum, 21.8 MiB maximum, +2.28 MiB); this is not an allocator
+18.9 MiB minimum, 23.7 MiB maximum, +4.85 MiB); this is not an allocator
 profile, and the fixture had a small torrent corpus. Snapshot refresh/expiry,
 journal resync/event/lag/disconnect/client counts, and estimated bounded
 response volume are now exposed through Prometheus; checked-in alert rules
@@ -888,11 +897,11 @@ production-daemon corpus report
 adds file-backed 100k restore, pagination, aggregate stats, restart, and
 single-torrent tier-transition evidence. The current local concurrent-client
 and slow-SSE report is
-[`backend-api-load-local-20260904-final.md`](../certification/reports/backend-api-load-local-20260904-final.md).
-The local Docker client/protocol matrix is
-[`interop-matrix-backend-local-20260904-final.md`](../certification/reports/interop-matrix-backend-local-20260904-final.md);
+[`backend-api-load-current-20260904-final.md`](../certification/reports/backend-api-load-current-20260904-final.md).
+The current Docker client/protocol matrix is
+[`interop-matrix-20260904T195529Z.md`](../certification/reports/interop-matrix-20260904T195529Z.md);
 it reconciles 10 base swarm, 4 extended, and 14 protocol cases as PASS after
-the qBittorrent unsupported-mutation assertion was corrected to require the
+qBittorrent unsupported-mutation assertion was corrected to require the
 documented 501 response.
 Snapshot filters/index rebuilds remain linear in the immutable snapshot, and
 the local run does not replace representative production-corpus, allocator,
@@ -1303,7 +1312,7 @@ the operator before apply.
 
 ### TNG-025 — Native CI does not enforce native quality
 
-**Status: Implementation complete; hosted-run evidence deferred** · **Priority: P1** · **Confidence: high**
+**Status: Repository gate resolved; branch-protection review outstanding** · **Priority: P1** · **Confidence: high**
 
 Verified evidence: `.github/workflows/ci.yml` gained a `native-quality` job
 (fmt check, OpenAPI validation, `cargo test --workspace --all-targets
@@ -1334,33 +1343,31 @@ a distinct and still-valuable check). Verified both jobs' exact commands
 locally against the already-installed `1.88` and `1.97.0` rustup
 toolchains before committing: `cargo +1.88 build/test --workspace
 --all-targets --locked` green, `cargo +1.97.0 build/test --locked
---manifest-path sidecar/Cargo.toml` green (75 sidecar tests passed). Not
-verified: none of this session's CI edits (native-quality, fuzz-smoke,
-msrv-check, msrv-check-sidecar) have been observed actually running in
-GitHub Actions itself -- this sandboxed session has no way to trigger the
-real runner, so "intentionally broken fmt/test/clippy changes fail CI"
-remains evidenced only by local command runs, not a real CI execution.
+--manifest-path sidecar/Cargo.toml` green (75 sidecar tests passed).
 
-The remaining action is to observe the workflow on its hosted runner and verify
-that branch protection marks the native-quality, MSRV, and fuzz jobs required.
-The repository-side implementation and local command verification are complete;
-this environment cannot manufacture a hosted GitHub Actions result.
+Hosted evidence is now present: CI run `33910318860` passed all ten jobs on
+`83b70ce`, including native quality, both MSRV jobs, fuzz smoke, sidecar,
+WebUI, dependency security, backup/restore, API/SSE load, and fault
+containment. The dynamic `Push on main` orchestration also passed as run
+`33910318425`. The remaining repository action is settings review: GitHub
+branch protection is not evidenced as requiring these jobs.
 
 ### TNG-026 — Release evidence is stale or weaker than its claims
 
-**Status: Local release evidence current; external evidence deferred** · **Priority: P1** · **Confidence: high**
+**Status: Local and hosted repository evidence current; external evidence deferred** · **Priority: P1** · **Confidence: high**
 
 Verified evidence (2026-09-04 UTC):
-`target/release/torrentngd` was rebuilt from the dirty working tree rooted at
-commit `e0d487f` with `cargo build --release --locked -p torrentngd`, launched with an isolated
-authenticated config, exercised through health, native list/transfer,
-qBittorrent list/transfer, and Prometheus metrics, and terminated with SIGTERM.
+`target/release/torrentngd` was rebuilt from the clean `main` tree at commit
+`83b70ce` with `cargo build --release --locked -p torrentngd`, launched with
+an isolated authenticated config, exercised through health, native
+list/transfer, qBittorrent list/transfer, and Prometheus metrics, and
+terminated with SIGTERM.
 The process exited cleanly. The exact current artifact and deployment report
 are linked from `docs/BACKEND_BURNDOWN_RELEASE_20260902.md`.
 
-The current artifact is 22,518,096 bytes with SHA-256
-`9f2dd59ba4bff2f760c789288dc057aab22c0f957ce4e47c36d51f0ff6699288`; smoke
-duration was 470 ms. Compose rendering also passes. The same artifact passed
+The current artifact is 22,433,352 bytes with SHA-256
+`ff94ede075f7541ef9eecf5418b1c31324fb1b6ca2648681d975b3e9cd048e73`; smoke
+duration was 462 ms. Compose rendering also passes. The current source passed
 the strict local fault matrix, live daemon fault matrix, 32-client/8-slow-SSE
 load gate, and reconciled 28-case local Docker interoperability matrix. This
 is current local deployment evidence, not a clean public release certificate.
@@ -1373,7 +1380,7 @@ deferred as a product-priority choice.
 
 ### TNG-027 — Claimed fuzz/OpenAPI/idempotency coverage is not checked in
 
-**Status: Implementation complete; breadth/hosted evidence deferred** · **Priority: P1/P2** · **Confidence: high**
+**Status: Repository gate resolved; breadth evidence deferred** · **Priority: P1/P2** · **Confidence: high**
 
 Original evidence: repository search found no checked-in fuzz targets,
 OpenAPI source, or idempotency test harness despite documentation
@@ -1405,9 +1412,7 @@ finding, verified working, not just scaffolded.
   uploads `fuzz/artifacts/` (crash reproducers) via `actions/upload-artifact`
   on failure -- directly satisfies this item's acceptance criterion ("CI
   invokes each target with a bounded smoke budget and publishes artifacts").
-  This job could not be run in this sandboxed session (no way to trigger
-  the actual GitHub Actions runner here); the manual local runs above are
-  the closest available verification that the underlying commands work.
+  Hosted run `33910318860` passed this job.
 - `fuzz/` is deliberately excluded from the main Cargo workspace
   (`Cargo.toml`'s `exclude`, matching the existing `sidecar` pattern) since
   `cargo-fuzz` requires nightly + sanitizer flags incompatible with the
@@ -1419,17 +1424,17 @@ Full workspace `cargo test --workspace --all-targets --locked`,
 green (the main workspace does not see `fuzz/` at all,
 `cargo metadata --no-deps` confirms it).
 
-The repository-side implementation gate is now complete: the two parser fuzz
-targets run locally, the bounded fuzz-smoke job and crash-artifact upload are
-checked in, `docs/API.openapi.json` validates through
-`scripts/validate_openapi.py`, and shared idempotency claim/replay/conflict
-tests cover the native, qBittorrent, Transmission, and Deluge mutation
-routers. The remaining action is hosted fuzz execution and a broader parser
-and mutation replay corpus.
+The repository-side implementation and hosted gate are now complete: the two
+parser fuzz targets run locally, the bounded fuzz-smoke job and crash-artifact
+upload are checked in and green in run `33910318860`,
+`docs/API.openapi.json` validates through `scripts/validate_openapi.py`, and
+shared idempotency claim/replay/conflict tests cover the native, qBittorrent,
+Transmission, and Deluge mutation routers. A broader parser and mutation
+replay corpus remains optional evidence work.
 
 ### TNG-028 — Formatting, clippy, and MSRV are already red
 
-**Status: Implementation complete; hosted-run evidence deferred** · **Priority: P1** · **Confidence: high**
+**Status: Repository gate resolved; branch-protection review outstanding** · **Priority: P1** · **Confidence: high**
 
 Verified locally (see "Current verified evidence" above for full detail):
 `cargo fmt --all -- --check`, `cargo test --workspace --all-targets
@@ -1439,9 +1444,9 @@ warnings` all pass now, including on the actual declared MSRV toolchains
 corrected from an untrue "1.80" to the real, verified floor). Two clippy
 findings were fixed (too-many-arguments on an egress-policy-widened
 function, a redundant `u32 -> u32` cast). The native-quality, MSRV, and
-sidecar checks are defined in CI and pass locally. The remaining action is
-observing the hosted jobs and making them required through repository branch
-protection; this environment cannot manufacture that hosted result.
+sidecar checks are defined in CI and pass in hosted run `33910318860`.
+Repository branch-protection enforcement remains a settings review, not a
+source-code gap.
 
 ## P2 — architecture and maintainability
 
@@ -1523,16 +1528,19 @@ error/panic/cancellation, transaction rollback, storage-worker
 panic/cancellation, liveness, and restart-recovery checks. The local release
 daemon matrix passes SIGKILL/restart durability, API cancellation with source
 retention, injected SQLite failure and recovery, isolated filesystem failure
-with source retention, and health continuity. The local API/SSE load gate
-passes 191,893 requests from 32 JSON clients and 8 slow consumers over 30
+with source retention, and health continuity; the current live report is
+[`backend-burndown-native-fault-live-current-20260904.md`](../certification/reports/backend-burndown-native-fault-live-current-20260904.md).
+The local API/SSE load gate
+passes 204,936 requests from 32 JSON clients and 8 slow consumers over 30
 seconds with zero errors. These are real local process checks, not a claim
 that every dependency failure mode or public deployment has been certified.
 
 Full inversion of tracker, peer, and every API dependency is not required to
 resolve the stated TNG-029 persistence defect and remains a separate
 maintainability choice. The remaining evidence is deployment-specific:
-hosted-run observation, physical storage/device faults, public compatibility,
-and long-soak behavior.
+physical storage/device faults, public compatibility, and long-soak behavior.
+Hosted repository CI is now green; branch-protection enforcement still needs
+settings review.
 
 Acceptance for the stated implementation gate is met: worker and engine
 liveness is truthful, failed torrent tasks are reaped and projected as errors,
@@ -1588,6 +1596,7 @@ claims:
 
 | 2026-09-03 local / 2026-09-04 UTC | Rebuilt the current release artifact and reran the strict local fault matrix, live daemon fault matrix, 30-second API/SSE load, and local Docker interoperability matrix. Corrected a real peer self-connection fallback that disabled webseed recovery, corrected qBittorrent progress/piece projection after stale completion timestamps, and fixed the interop harness to assert documented 501 responses for unsupported qBittorrent mutations. | Release smoke: 22,470,824 bytes, SHA-256 `caa3c725bdd29e49677dfd0bf11a70904650d5954092f533e1684ceab7fd1f76`, 466 ms; fault matrix PASS; 191,893 requests with 32 JSON clients and 8 slow SSE consumers, zero errors; local interop [`interop-matrix-backend-local-20260904-final.md`](../certification/reports/interop-matrix-backend-local-20260904-final.md) reconciles 28/28 PASS. | TNG-011/TNG-013/TNG-026/TNG-029 local implementation and evidence gates remain closed for their declared scopes. Pure-v2 transfer/completion is explicitly unsupported and the rTorrent library boundary is documented/tested. Hosted CI observation, public Internet compatibility, real-device storage, 24-hour soak, allocator/production-corpus evidence, and extended capacity proof remain external or deferred. |
 | 2026-09-04 local / 2026-09-04 UTC | Final local burn-down refresh: rebuilt the release binary after metrics privacy and sidecar security changes; completed the live storage/DB fault matrix, many-client/slow-SSE load, storage regression suite, webseed deadline scheduler, peer-channel budget, sidecar auth/default-bind/proxy tests, security scan, policy self-tests, and universal-live local Docker interop. Default Prometheus labels hash torrent identifiers; raw IDs require explicit opt-in. | Release smoke [`backend-burndown-native-release-smoke-current-20260904.md`](../certification/reports/backend-burndown-native-release-smoke-current-20260904.md): 22,518,096 bytes, SHA-256 `9f2dd59ba4bff2f760c789288dc057aab22c0f957ce4e47c36d51f0ff6699288`, 470 ms; sidecar 125 unit/87 integration tests; rt-storage 130 tests; security scan PASS with no HIGH/CRITICAL image findings; universal-live [`universal-live-backend-local-20260904-current-pass.md`](../certification/reports/universal-live-backend-local-20260904-current-pass.md) PASS_WITH_SKIPS with 28/28 local cases PASS. | All repository-actionable TNG implementation, contract, security, CI, and local-evidence work is closed for the declared scope. Remaining gates are external-only: hosted CI observation/branch protection, public-client/network interop, target-device storage, 24-hour soak, production-corpus allocator/fairness/transport profiles, and optional 100k capacity proof. Pure-v2 transfer/completion and the unowned rTorrent HTTP-server interpretation remain explicitly unsupported. |
+| 2026-09-04 local / 2026-09-04 UTC | CI failure burn-down and evidence refresh: fixed hosted scheduling/fixture races, made recovery evidence portable, made certification archives pipefail-safe, made missing security tooling fail closed, waited for daemon readiness after restart, fenced cleanup assertions on durable DB state, and removed the interop metrics probe SIGPIPE. Rebuilt the clean release artifact and reran the current full Docker matrix. | Hosted CI run `33910318860` is green with all 10 jobs; dynamic `Push on main` run `33910318425` is green; release artifact is 22,433,352 bytes with SHA-256 `ff94ede075f7541ef9eecf5418b1c31324fb1b6ca2648681d975b3e9cd048e73` and 462 ms smoke; current local Docker matrix [`interop-matrix-20260904T195529Z.md`](../certification/reports/interop-matrix-20260904T195529Z.md) is 28/28 PASS. | TNG-025/027/028 repository gates are resolved. Branch-protection enforcement, public/client/device/24-hour evidence, production-corpus profiling, and optional extended-capacity proof remain explicit external or optional gates. |
 
 ## Release gate
 

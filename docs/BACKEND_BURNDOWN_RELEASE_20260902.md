@@ -4,23 +4,28 @@
 
 | Check | Result | Evidence |
 | --- | --- | --- |
-| Source revision | recorded | `e0d487f` plus uncommitted remediation changes; smoke report records `Worktree: dirty` |
+| Source revision | recorded | clean `main` at `83b70ce`; the current release gate and smoke report record `Worktree: clean` |
 | Release build | PASS | `cargo build --release --locked -p torrentngd` |
-| Binary | PASS | `target/release/torrentngd`; 22,518,096 bytes; SHA-256 `9f2dd59ba4bff2f760c789288dc057aab22c0f957ce4e47c36d51f0ff6699288` |
-| Authenticated deployment smoke | PASS | [`backend-burndown-native-release-smoke-current-20260904.md`](../certification/reports/backend-burndown-native-release-smoke-current-20260904.md) |
+| Binary | PASS | `target/release/torrentngd`; 22,433,352 bytes; SHA-256 `ff94ede075f7541ef9eecf5418b1c31324fb1b6ca2648681d975b3e9cd048e73` |
+| Authenticated deployment smoke | PASS | [`backend-burndown-native-release-smoke-local-release-20260904T192950Z.md`](../certification/reports/backend-burndown-native-release-smoke-local-release-20260904T192950Z.md) |
 | Startup/health | PASS | Release binary started from the isolated authenticated config and returned ready health |
 | Native list/transfer | PASS | Native list envelope and aggregate transfer-info requests returned HTTP 200 |
 | qBittorrent list/transfer | PASS | qBittorrent list and aggregate transfer-info requests returned HTTP 200 |
-| Prometheus metrics | PASS | 623 lines / 42,079 bytes returned HTTP 200 |
-| SIGTERM | PASS | Clean exit observed after 2 polls; total smoke duration 470 ms |
+| Prometheus metrics | PASS | 647 lines / 43,459 bytes returned HTTP 200 |
+| SIGTERM | PASS | Clean exit observed after 2 polls; total smoke duration 462 ms |
 | Compose render | PASS | `docker compose -f deploy/native/compose.yml config --quiet` |
-| Live fault matrix | PASS | [`backend-burndown-fault-matrix-local-20260904-final.md`](../certification/reports/backend-burndown-fault-matrix-local-20260904-final.md); deterministic worker faults plus live SIGKILL/restart, API cancellation, injected SQLite failure/recovery, and isolated filesystem failure |
-| API/SSE load | PASS | [`backend-api-load-local-20260904-final.md`](../certification/reports/backend-api-load-local-20260904-final.md); 191,893 requests over 30 seconds, 32 JSON clients, 8 slow SSE consumers, zero errors |
-| Local client/protocol interoperability | PASS | [`interop-matrix-backend-local-20260904-final.md`](../certification/reports/interop-matrix-backend-local-20260904-final.md); 28/28 reconciled local Docker cases across qBittorrent, Transmission, Deluge, and rTorrent |
-| Local universal-live interop | PASS_WITH_SKIPS | [`universal-live-backend-local-20260904-current-pass.md`](../certification/reports/universal-live-backend-local-20260904-current-pass.md); 28 local Docker cases pass; public torrent and real-device legs are explicit skips |
+| Live fault matrix | PASS | [`backend-burndown-native-fault-live-current-20260904.md`](../certification/reports/backend-burndown-native-fault-live-current-20260904.md); SIGKILL/restart, SQLite failure/recovery, storage cancellation, and filesystem failure all remain isolated |
+| API/SSE load | PASS | [`backend-api-load-current-20260904-final.md`](../certification/reports/backend-api-load-current-20260904-final.md); 204,936 requests over 30 seconds, 32 JSON clients, 8 slow SSE consumers, zero errors |
+| Local client/protocol interoperability | PASS | [`interop-matrix-20260904T195529Z.md`](../certification/reports/interop-matrix-20260904T195529Z.md); 28/28 local cases across qBittorrent, Transmission, Deluge, and rTorrent |
+| Local universal-live interop | PASS_WITH_SKIPS | [`universal-live-current-20260904.md`](../certification/reports/universal-live-current-20260904.md); current local Docker matrix passes; public torrent and real-device legs are explicit skips |
 | Security scan | PASS | [`security-scan-current-20260904.md`](../certification/reports/security-scan-current-20260904.md); npm audit, locked Cargo tree, and container scan pass with no HIGH/CRITICAL findings |
-| Local release gate | PASS_WITH_WARNINGS | [`local-release-backend-burndown-current-20260904.md`](../certification/reports/local-release-backend-burndown-current-20260904.md); all local implementation gates pass; only real-device storage certification is skipped |
-| External evidence preflight | PASS_WITH_WARNINGS | [`external-evidence-preflight-20260904T160551Z.md`](../certification/reports/external-evidence-preflight-20260904T160551Z.md); migration corpus and Docker pass; public opt-in, real-device target, and active 24-hour soak are not configured |
+| Local release gate | PASS_WITH_WARNINGS | [`local-release-backend-burndown-final-20260904.md`](../certification/reports/local-release-backend-burndown-final-20260904.md); all local implementation gates pass; only real-device storage certification is skipped |
+| External evidence preflight | PASS_WITH_WARNINGS | [`external-evidence-preflight-20260904T193524Z.md`](../certification/reports/external-evidence-preflight-20260904T193524Z.md); migration corpus and Docker pass; public opt-in, real-device target, and active 24-hour soak are not configured |
+
+Hosted repository CI is now green: run `33910318860` passed all ten jobs on
+`83b70ce`, and dynamic `Push on main` orchestration run `33910318425` also
+passed. This closes the hosted repository gate; branch-protection enforcement
+and the public/device/soak qualification gates remain separate.
 
 This is the current local release-binary record. It is not a public,
 real-device, 24-hour soak, universal-compatibility, or 100k capacity

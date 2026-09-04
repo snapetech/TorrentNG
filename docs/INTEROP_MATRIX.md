@@ -69,6 +69,11 @@ already current.
 INTEROP_SKIP_BUILD=1 scripts/interop_matrix.sh --local
 ```
 
+The current local run on clean `main` at `83b70ce` passed all 28 cases (10
+base, 4 extended, and 14 protocol rows):
+[`interop-matrix-20260904T195529Z.md`](../certification/reports/interop-matrix-20260904T195529Z.md).
+Public-network and real-device legs remain separate opt-in gates.
+
 ## Local Matrix
 
 Local mode generates legal fixture torrents under

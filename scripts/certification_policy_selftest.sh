@@ -147,6 +147,7 @@ BENCHMARK_DIR="$benchmark_dir" "$ROOT/scripts/certification_status.sh" "$report_
 grep -q '| Migration corpus | PASS_WITH_GAPS | migration-corpus-20260518T000000Z.md |' "$report_dir/status-migration-selector.md"
 write_report "$report_dir/migration-corpus-selftest.md" PASS
 
+REPORT_DIR="$report_dir" \
 TNG_LOCAL_RELEASE_SELFTEST=1 \
   TNG_LOCAL_RELEASE_SELFTEST_REPORT_STATUS=PASS_WITH_WARNINGS \
   env -u TNG_STORAGE_MATRIX_TARGETS \
