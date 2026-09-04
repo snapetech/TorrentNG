@@ -1028,8 +1028,7 @@ fn qbit_cookie_payload(body: &str) -> Option<Vec<serde_json::Value>> {
 
 fn new_qbit_api_key() -> String {
     let mut bytes = [0_u8; 32];
-    let mut rng = rand::thread_rng();
-    rand::RngCore::fill_bytes(&mut rng, &mut bytes);
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut bytes);
     format!("tng_{}", hex::encode(bytes))
 }
 

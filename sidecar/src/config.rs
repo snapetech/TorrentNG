@@ -412,8 +412,8 @@ impl Config {
                     "could not persist per-install peer id; using an unpersisted random one for this run"
                 );
                 self.rtorrent.peer_id = format!("{}{}", crate::identity::PEER_ID_PREFIX, {
-                    use rand::distributions::{Alphanumeric, DistString};
-                    Alphanumeric.sample_string(&mut rand::thread_rng(), 12)
+                    use rand::distr::{Alphanumeric, SampleString};
+                    Alphanumeric.sample_string(&mut rand::rng(), 12)
                 });
             }
         }

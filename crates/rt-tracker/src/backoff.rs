@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use rand::Rng;
+use rand::RngExt;
 
 /// Exponential backoff with jitter for tracker retry logic.
 ///
@@ -38,7 +38,7 @@ impl Backoff {
     pub fn next_delay(&mut self) -> Duration {
         let base_secs = self.base.as_secs_f64() * 2f64.powi(self.attempt as i32);
         let capped = base_secs.min(self.max.as_secs_f64());
-        let jitter = rand::thread_rng().gen_range(
+        let jitter = rand::rng().random_range(
             capped * (1.0 - self.jitter_fraction)..=capped * (1.0 + self.jitter_fraction),
         );
         self.attempt = self.attempt.saturating_add(1);
@@ -58,7 +58,7 @@ impl Backoff {
 pub fn jitter_interval(interval: Duration, fraction: f64) -> Duration {
     let secs = interval.as_secs_f64();
     let delta = secs * fraction;
-    let jittered = rand::thread_rng().gen_range((secs - delta)..=(secs + delta));
+    let jittered = rand::rng().random_range((secs - delta)..=(secs + delta));
     Duration::from_secs_f64(jittered.max(1.0))
 }
 

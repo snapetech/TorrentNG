@@ -1,5 +1,5 @@
 /// BEP 5: 160-bit DHT node ID with XOR-distance metric.
-use rand::Rng;
+use rand::RngExt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId([u8; 20]);
@@ -7,7 +7,7 @@ pub struct NodeId([u8; 20]);
 impl NodeId {
     pub fn random() -> Self {
         let mut id = [0u8; 20];
-        rand::thread_rng().fill(&mut id);
+        rand::rng().fill(&mut id);
         NodeId(id)
     }
 

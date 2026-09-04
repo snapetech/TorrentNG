@@ -8,7 +8,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use rand::Rng;
+use rand::RngExt;
 use tokio::{
     net::UdpSocket,
     sync::{mpsc, Mutex},
@@ -620,11 +620,11 @@ async fn recv_packet(
 }
 
 fn random_connection_id() -> u16 {
-    rand::thread_rng().gen()
+    rand::rng().random()
 }
 
 fn random_seq_nr() -> u16 {
-    rand::thread_rng().gen()
+    rand::rng().random()
 }
 
 fn now_us() -> u32 {

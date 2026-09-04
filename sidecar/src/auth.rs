@@ -6,7 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use hmac::{Hmac, Mac};
-use rand::RngCore;
+use rand::Rng;
 use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -105,7 +105,7 @@ pub(crate) fn session_cookie_value(secret: Option<&str>, token: &str) -> String 
 
     let expires = unix_now().saturating_add(SESSION_TTL_SECS);
     let mut nonce = [0_u8; 16];
-    rand::thread_rng().fill_bytes(&mut nonce);
+    rand::rng().fill_bytes(&mut nonce);
     let nonce = hex::encode(nonce);
     let payload = format!("{token}.{expires}.{nonce}");
     let mut mac = SessionMac::new_from_slice(secret.as_bytes())

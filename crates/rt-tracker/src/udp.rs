@@ -2,7 +2,7 @@
 ///
 /// Implements connect/announce message encoding and response parsing.
 /// The actual UDP I/O is handled by the caller via tokio UdpSocket.
-use rand::Rng;
+use rand::RngExt;
 
 use crate::{error::TrackerError, peer::parse_compact_peers_v4, request::AnnounceRequest, Peer};
 
@@ -19,7 +19,7 @@ pub struct UdpConnectRequest {
 impl UdpConnectRequest {
     pub fn new() -> Self {
         UdpConnectRequest {
-            transaction_id: rand::thread_rng().gen(),
+            transaction_id: rand::rng().random(),
         }
     }
 
@@ -82,10 +82,10 @@ impl UdpAnnounceRequest {
     pub fn new(connection_id: u64, req: AnnounceRequest) -> Self {
         UdpAnnounceRequest {
             connection_id,
-            transaction_id: rand::thread_rng().gen(),
+            transaction_id: rand::rng().random(),
             req,
             ip: 0,
-            key: rand::thread_rng().gen(),
+            key: rand::rng().random(),
         }
     }
 

@@ -61,8 +61,8 @@ fn valid_suffix(suffix: &str) -> bool {
 }
 
 fn random_suffix() -> String {
-    use rand::distributions::{Alphanumeric, DistString};
-    Alphanumeric.sample_string(&mut rand::thread_rng(), 12)
+    use rand::distr::{Alphanumeric, SampleString};
+    Alphanumeric.sample_string(&mut rand::rng(), 12)
 }
 
 #[cfg(test)]
