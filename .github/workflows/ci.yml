@@ -229,6 +229,10 @@ jobs:
         working-directory: webui
         run: npm ci
 
+      - name: Install Playwright Chromium
+        working-directory: webui
+        run: npx playwright install chromium
+
       - name: Build webui
         working-directory: webui
         run: npm run build
