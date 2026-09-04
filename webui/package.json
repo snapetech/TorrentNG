@@ -16,13 +16,13 @@
     "@tanstack/react-table": "^8.17.0",
     "@tanstack/react-virtual": "^3.14.5",
     "react": "^19.2.8",
-    "react-dom": "^19.2.7"
+    "react-dom": "^19.2.8"
   },
   "devDependencies": {
     "@axe-core/playwright": "^4.12.1",
     "@playwright/test": "^1.61.1",
     "@types/react": "^19.2.18",
-    "@types/react-dom": "^19.0.0",
+    "@types/react-dom": "^19.2.5",
     "@typescript-eslint/eslint-plugin": "^8.63.0",
     "@typescript-eslint/parser": "^8.63.0",
     "@vitejs/plugin-react": "^6.0.3",
