@@ -1671,21 +1671,20 @@ mod tests {
             )
             .unwrap();
 
-        for _ in 0..100 {
-            let state = rt_db::get_job(&db.lock().unwrap(), "pause-mid-step")
-                .unwrap()
-                .state;
-            if state == "paused" {
-                break;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if rt_db::get_job(&db.lock().unwrap(), "pause-mid-step")
+                    .unwrap()
+                    .state
+                    == "paused"
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(
-            rt_db::get_job(&db.lock().unwrap(), "pause-mid-step")
-                .unwrap()
-                .state,
-            "paused"
-        );
+        })
+        .await
+        .expect("pause-at-step-boundary job did not reach paused state");
         assert!(
             tokio::time::timeout(Duration::from_millis(20), &mut paused_rx)
                 .await

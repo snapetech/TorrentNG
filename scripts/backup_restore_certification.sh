@@ -155,7 +155,6 @@ trap cleanup EXIT
 
 write_header
 test -x "$BIN"
-test -f "$FIXTURE"
 # The native API-only drill does not require checked-in WebUI assets. Create
 # an empty temporary-compatible directory when a checkout omits generated
 # static assets; the API assertions below still exercise the daemon itself.
@@ -179,6 +178,51 @@ SOURCE_LIST="$WORK_DIR/source-list.json"
 RESTORED_LIST="$WORK_DIR/restored-list.json"
 ADD_BODY="$WORK_DIR/add.json"
 mkdir -p "$SOURCE_SESSION" "$SOURCE_DATA" "$BACKUP_ROOT/session" "$RESTORE_ROOT"
+
+# Keep the drill self-contained in a clean checkout. An operator can still
+# provide TNG_BACKUP_FIXTURE for a real checked-in or externally supplied
+# metainfo file, but the default must not depend on ignored interop output.
+if [[ ! -f "$FIXTURE" ]]; then
+  FIXTURE="$WORK_DIR/backup-restore.torrent"
+  python3 - "$FIXTURE" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+
+def bstr(value: bytes) -> bytes:
+    return str(len(value)).encode("ascii") + b":" + value
+
+
+payload = b"payload"
+piece_hash = hashlib.sha1(payload).digest()
+info = (
+    b"d"
+    + bstr(b"length")
+    + b"i7e"
+    + bstr(b"name")
+    + bstr(b"payload.bin")
+    + bstr(b"piece length")
+    + b"i16384e"
+    + bstr(b"pieces")
+    + bstr(piece_hash)
+    + b"e"
+)
+torrent = (
+    b"d"
+    + bstr(b"announce")
+    + bstr(b"http://127.0.0.1:1/announce")
+    + bstr(b"info")
+    + info
+    + b"e"
+)
+pathlib.Path(sys.argv[1]).write_bytes(torrent)
+PY
+fi
+
+# Rewrite the header after selecting the generated fallback so the evidence
+# identifies the actual fixture used by the drill.
+write_header
 
 api_port="${TNG_BACKUP_API_PORT:-$((28080 + (BASHPID % 900)))}"
 while curl -fsS --max-time 0.1 "http://127.0.0.1:$api_port/health" >/dev/null 2>&1; do
