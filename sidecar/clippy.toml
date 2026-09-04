@@ -1,0 +1,3 @@
+# The sidecar is maintained as an independently deployable crate and has a
+# newer MSRV than the native workspace.
+msrv = "1.97"

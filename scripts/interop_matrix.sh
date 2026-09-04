@@ -16,7 +16,7 @@ PUBLIC_MAX_PARALLEL="${INTEROP_PUBLIC_MAX_PARALLEL:-3}"
 PUBLIC_MIN_RUST_PEERS="${INTEROP_PUBLIC_MIN_RUST_PEERS:-2}"
 KEEP_STACK="${INTEROP_KEEP_STACK:-0}"
 KEEP_PUBLIC_DATA="${INTEROP_KEEP_PUBLIC_DATA:-0}"
-RUST_TOKEN="${INTEROP_RUST_TOKEN:-interop-token}"
+RUST_TOKEN="${INTEROP_RUST_TOKEN:-interop-backend-token-20260904}"
 CURL_MAX_TIME="${INTEROP_CURL_MAX_TIME:-10}"
 EXTENDED_LOCAL="${INTEROP_EXTENDED_LOCAL:-1}"
 
@@ -265,9 +265,30 @@ wait_http_status() {
   done
 }
 
+wait_rust_ready() {
+  local timeout="${1:-240}" start body
+  start="$(date +%s)"
+  while true; do
+    body="$(curl --max-time "$CURL_MAX_TIME" -sS \
+      -H "Authorization: Bearer $RUST_TOKEN" \
+      "$(client_url torrentngd)/health" 2>/dev/null || true)"
+    if jq -e '.ready == true' <<<"$body" >/dev/null 2>&1; then
+      return 0
+    fi
+    if (( "$(date +%s)" - start > timeout )); then
+      echo "timed out waiting for authenticated torrentngd readiness at $(client_url torrentngd)/health" >&2
+      if [[ -n "$body" ]]; then
+        echo "last health response: $body" >&2
+      fi
+      return 1
+    fi
+    sleep 2
+  done
+}
+
 wait_stack() {
   log "waiting for client APIs and ports"
-  wait_http torrentngd "$(client_url torrentngd)/health" 240
+  wait_rust_ready 240
   wait_http_status qbittorrent "$(client_url qbittorrent)" '^(200|401|403)$' 240
   wait_http transmission "$(client_url transmission)/transmission/web/" 240
   wait_http deluge "$(client_url deluge)" 240
@@ -286,7 +307,7 @@ ensure_services_running() {
   for service in "$@"; do
     case "$service" in
       torrentngd)
-        wait_http torrentngd "$(client_url torrentngd)/health" 240 || return 1
+        wait_rust_ready 240 || return 1
         ;;
       qbittorrent)
         wait_http_status qbittorrent "$(client_url qbittorrent)" '^(200|401|403)$' 240 || return 1
@@ -953,7 +974,7 @@ run_rust_api_facade_case() {
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/metrics" |
     grep -q '^# HELP' || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/v1/torrents" |
-    jq -e 'type == "array"' >/dev/null || status="FAIL"
+    jq -e 'type == "object" and (.torrents | type == "array")' >/dev/null || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/qb/v2/torrents/info" |
     jq -e 'type == "array"' >/dev/null || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/qb/v2/sync/maindata" |
@@ -1395,22 +1416,32 @@ run_qbit_mutation_facade_case() {
     "$(client_url torrentngd)/api/qb/v2/transfer/setUploadLimit" >/dev/null || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -X POST -H "Authorization: Bearer $RUST_TOKEN" \
     "$(client_url torrentngd)/api/qb/v2/transfer/toggleSpeedLimitsMode" >/dev/null || status="FAIL"
-  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
+  # These flags are intentionally not advertised as runtime operations. The
+  # compatibility contract is an explicit 501, not a false 200 that leaves a
+  # client believing its queue policy was applied.
+  local unsupported_status
+  unsupported_status="$(curl --max-time "$CURL_MAX_TIME" -sS -o /dev/null -w '%{http_code}' \
+    -H "Authorization: Bearer $RUST_TOKEN" \
     --data-urlencode "hashes=$info_hash" \
     --data-urlencode "value=true" \
-    "$(client_url torrentngd)/api/qb/v2/torrents/setForceStart" >/dev/null || status="FAIL"
+    "$(client_url torrentngd)/api/qb/v2/torrents/setForceStart" || true)"
+  [[ "$unsupported_status" == "501" ]] || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
     --data-urlencode "hashes=$info_hash" \
     --data-urlencode "value=true" \
     "$(client_url torrentngd)/api/qb/v2/torrents/setSuperSeeding" >/dev/null || status="FAIL"
-  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
+  unsupported_status="$(curl --max-time "$CURL_MAX_TIME" -sS -o /dev/null -w '%{http_code}' \
+    -H "Authorization: Bearer $RUST_TOKEN" \
     --data-urlencode "hashes=$info_hash" \
     --data-urlencode "enable=true" \
-    "$(client_url torrentngd)/api/qb/v2/torrents/setAutoTMM" >/dev/null || status="FAIL"
-  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
+    "$(client_url torrentngd)/api/qb/v2/torrents/setAutoTMM" || true)"
+  [[ "$unsupported_status" == "501" ]] || status="FAIL"
+  unsupported_status="$(curl --max-time "$CURL_MAX_TIME" -sS -o /dev/null -w '%{http_code}' \
+    -H "Authorization: Bearer $RUST_TOKEN" \
     --data-urlencode "hashes=$info_hash" \
     --data-urlencode "enable=true" \
-    "$(client_url torrentngd)/api/qb/v2/torrents/setAutoManagement" >/dev/null || status="FAIL"
+    "$(client_url torrentngd)/api/qb/v2/torrents/setAutoManagement" || true)"
+  [[ "$unsupported_status" == "501" ]] || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
     --data-urlencode "hashes=$info_hash" \
     "$(client_url torrentngd)/api/qb/v2/torrents/toggleFirstLastPiecePrio" >/dev/null || status="FAIL"
@@ -1481,7 +1512,7 @@ run_qbit_mutation_facade_case() {
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/v1/torrents/$info_hash/trackers" |
     jq -e 'type == "array"' >/dev/null || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/v1/torrents/$info_hash/limits" |
-    jq -e '.download_limit == 1048576 and .upload_limit == 524288 and .seed_ratio_limit == null and .sequential_download == true and .first_last_piece_prio == true and .force_start == true and .super_seeding == true and .auto_tmm == true and .auto_management == true' >/dev/null || status="FAIL"
+    jq -e '.download_limit == 1048576 and .upload_limit == 524288 and .seed_ratio_limit == null and .sequential_download == true and .first_last_piece_prio == true and .force_start == false and .super_seeding == true and .auto_tmm == false and .auto_management == false' >/dev/null || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/v1/transfer/limits" |
     jq -e '.download_limit == 2097152 and .upload_limit == 1048576 and .speed_limits_mode == true' >/dev/null || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/qb/v2/torrents/downloadLimit?hashes=$info_hash" |
@@ -1492,7 +1523,7 @@ run_qbit_mutation_facade_case() {
   [[ "$(curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/qb/v2/transfer/uploadLimit" || true)" == "1048576" ]] || status="FAIL"
   [[ "$(curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/qb/v2/transfer/speedLimitsMode" || true)" == "1" ]] || status="FAIL"
   append_report "- Target: torrentngd qBittorrent-compatible mutation endpoints"
-  append_report "- Checked qBit facade: filePrio, torrent setDownloadLimit/setUploadLimit, transfer setDownloadLimit/setUploadLimit/toggleSpeedLimitsMode, setForceStart, setSuperSeeding, setAutoTMM, setAutoManagement, toggleFirstLastPiecePrio, addPeers, topPrio, recheck, addTrackers, editTracker, removeTrackers, trackers, files, webseeds, pieceStates, pieceHashes, export"
+  append_report "- Checked qBit facade: filePrio, torrent setDownloadLimit/setUploadLimit, transfer setDownloadLimit/setUploadLimit/toggleSpeedLimitsMode, setSuperSeeding, toggleFirstLastPiecePrio, addPeers, topPrio, recheck, addTrackers, editTracker, removeTrackers, trackers, files, webseeds, pieceStates, pieceHashes, export; setForceStart/setAutoTMM/setAutoManagement explicitly return 501"
   append_report "- Checked native REST: start, stop, update metadata, file priorities, tags, trackers, peers, queue, torrent limits, transfer limits, files/trackers/limits projection"
   append_report "- Fixture: multi-128m"
   append_report "- Info hash: $info_hash"

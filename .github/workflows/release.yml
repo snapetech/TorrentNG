@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   native-quality:
-    name: Native quality gate
+    name: Native and sidecar quality gate
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -33,15 +33,96 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Validate native API contract
+        run: python3 scripts/validate_openapi.py
+
       - name: Test native workspace
         run: cargo test --workspace --all-targets --locked
 
       - name: Lint native workspace
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      - name: Check sidecar formatting
+        run: cargo fmt --manifest-path sidecar/Cargo.toml -- --check
+
+      - name: Test sidecar
+        run: cargo test --locked --manifest-path sidecar/Cargo.toml
+
+      - name: Lint sidecar
+        run: cargo clippy --all-targets --locked --manifest-path sidecar/Cargo.toml -- -D warnings
+
+  msrv-check:
+    name: Main workspace MSRV gate
+    needs: native-quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install Rust 1.88.0
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      - name: Build native workspace at declared MSRV
+        run: cargo build --workspace --all-targets --locked
+
+      - name: Test native workspace at declared MSRV
+        run: cargo test --workspace --all-targets --locked
+
+  msrv-check-sidecar:
+    name: Sidecar MSRV gate
+    needs: native-quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install Rust 1.97.0
+        uses: dtolnay/rust-toolchain@1.97.0
+
+      - name: Build sidecar at declared MSRV
+        run: cargo build --locked --manifest-path sidecar/Cargo.toml
+
+      - name: Test sidecar at declared MSRV
+        run: cargo test --locked --manifest-path sidecar/Cargo.toml
+
+  native-release-smoke:
+    name: Native release-binary smoke
+    needs: [native-quality, msrv-check, msrv-check-sidecar]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build native release binary
+        run: cargo build --release --locked -p torrentngd
+
+      - name: Run authenticated release-binary smoke
+        run: |
+          set -euo pipefail
+          TNG_RELEASE_CONFIG=certification/fixtures/backend-burndown-native-release-smoke.toml \
+          TNG_RELEASE_TOKEN=backend-burndown-token-20260902 \
+            scripts/backend_burndown_native_release_smoke.sh \
+            "certification/reports/backend-burndown-native-release-smoke-ci-${GITHUB_RUN_ID}.md"
+
+      - name: Upload native release smoke evidence
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-release-smoke-${{ github.run_id }}
+          path: certification/reports/backend-burndown-native-release-smoke-ci-*
+          if-no-files-found: error
+
   native-binaries:
     name: Native binary (${{ matrix.suffix }})
-    needs: native-quality
+    needs: [native-quality, msrv-check, msrv-check-sidecar, native-release-smoke]
     strategy:
       fail-fast: false
       matrix:
@@ -142,7 +223,7 @@ jobs:
 
   linux-release-assets:
     name: Linux containers and shared assets
-    needs: native-quality
+    needs: [native-quality, msrv-check, msrv-check-sidecar, native-release-smoke]
     runs-on: [self-hosted, Linux, X64]
     steps:
       - name: Checkout

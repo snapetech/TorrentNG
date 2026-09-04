@@ -160,7 +160,10 @@ row "Proton-routed TorrentNG DHT" 'proton-tng-dht-*.md'
 row "Mobile read-flow" 'mobile-compat-*.md'
 row "Phase 1 ruTorrent" 'phase1-cert-*.md'
 row "Universal compatibility" 'universal-compat-*.md'
-row "Universal live compatibility" 'universal-live-*.md'
+# This is an intermediate readiness note, not a certification result.  It can
+# remain newer than the actual universal-live run and would otherwise make the
+# gate report RUNNING/UNKNOWN indefinitely.
+row_excluding "Universal live compatibility" 'universal-live-*.md' "$REPORT_DIR" 'universal-live-soak-ready.md'
 row_excluding "Migration corpus" 'migration-corpus-*.md' "$REPORT_DIR" 'migration-corpus-local-release-*' 'migration-corpus-universal-*'
 row "External evidence preflight" 'external-evidence-preflight-*.md'
 row "Synthetic benchmark" 'report-*.md' "$BENCHMARK_DIR"
@@ -173,6 +176,9 @@ row "Security review" 'security-review-*.md'
 row "Security scan" 'security-scan-*.md'
 row "Native engine rewrite" 'native-engine-*.md'
 row "WebUI certification" 'webui-certification-*.md'
+row "Backend burn-down release smoke" 'backend-burndown-native-release-smoke-*.md'
+row "Backend fault-containment matrix" 'backend-burndown-fault-matrix-*.md'
+row "Native API/SSE load" 'backend-api-load-*.md'
 row "Local release gate" 'local-release-*.md'
 row "Storage hardware matrix" 'storage-hardware-*.md'
 row "Storage io_uring capability/graduation" 'storage-uring-graduation-*.md'

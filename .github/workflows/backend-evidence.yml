@@ -1,0 +1,244 @@
+name: Backend Evidence
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_live_fault:
+        description: "Run release-daemon crash, SQLite-failure, and storage-failure matrix"
+        required: true
+        default: false
+        type: boolean
+      run_api_load:
+        description: "Run the many-client and slow-SSE load runner against base_url"
+        required: true
+        default: false
+        type: boolean
+      base_url:
+        description: "Already-running native daemon URL for API load, e.g. http://host:28080"
+        required: false
+        default: ""
+        type: string
+      load_duration_seconds:
+        description: "API load duration"
+        required: true
+        default: "60"
+        type: string
+      load_clients:
+        description: "Concurrent JSON API clients"
+        required: true
+        default: "32"
+        type: string
+      load_sse_clients:
+        description: "Concurrent deliberately slow SSE consumers"
+        required: true
+        default: "8"
+        type: string
+      run_public_compat:
+        description: "Run opt-in public torrent/client compatibility evidence"
+        required: true
+        default: false
+        type: boolean
+      run_real_device:
+        description: "Run ignored storage tests against storage_target"
+        required: true
+        default: false
+        type: boolean
+      storage_target:
+        description: "Mounted writable real-device storage path"
+        required: false
+        default: ""
+        type: string
+      run_24h_soak:
+        description: "Run the blocking 24-hour container soak"
+        required: true
+        default: false
+        type: boolean
+      soak_url:
+        description: "Soak target URL"
+        required: false
+        default: "http://localhost:18080"
+        type: string
+      soak_container:
+        description: "Running TorrentNG container name for RSS sampling"
+        required: false
+        default: "certification-torrentng-1"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  deterministic-fault:
+    name: Deterministic fault matrix
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run deterministic matrix
+        run: |
+          TNG_FAULT_MATRIX_STRICT=0 \
+            scripts/backend_burndown_fault_matrix.sh \
+            "certification/reports/backend-burndown-fault-matrix-${GITHUB_RUN_ID}.md"
+
+      - name: Upload deterministic evidence
+        uses: actions/upload-artifact@v7
+        with:
+          name: backend-deterministic-fault-${{ github.run_id }}
+          path: certification/reports/backend-burndown-fault-matrix-*
+          if-no-files-found: error
+
+  live-fault:
+    name: Live release-daemon fault matrix
+    if: inputs.run_live_fault == true
+    runs-on: self-hosted
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release daemon
+        run: cargo build --release --locked -p torrentngd
+
+      - name: Run live fault injection
+        env:
+          TNG_FAULT_TOKEN: ${{ secrets.TNG_BACKEND_API_TOKEN }}
+        run: |
+          TNG_FAULT_MATRIX_STRICT=1 \
+            scripts/backend_burndown_native_fault_injection.sh \
+            "certification/reports/backend-burndown-native-fault-${GITHUB_RUN_ID}.md"
+
+      - name: Upload live fault evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: backend-live-fault-${{ github.run_id }}
+          path: certification/reports/backend-burndown-native-fault-*
+          if-no-files-found: warn
+
+  api-load:
+    name: Live many-client and slow-SSE load
+    if: inputs.run_api_load == true
+    runs-on: self-hosted
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Run API/SSE load
+        env:
+          TNG_BASE_URL: ${{ inputs.base_url }}
+          TNG_API_TOKEN: ${{ secrets.TNG_BACKEND_API_TOKEN }}
+          TNG_LOAD_DURATION_SECONDS: ${{ inputs.load_duration_seconds }}
+          TNG_LOAD_CLIENTS: ${{ inputs.load_clients }}
+          TNG_LOAD_SSE_CLIENTS: ${{ inputs.load_sse_clients }}
+          TNG_LOAD_SLOW_DELAY_MS: "250"
+        run: |
+          set -euo pipefail
+          if [[ -z "${TNG_BASE_URL:-}" || -z "${TNG_API_TOKEN:-}" ]]; then
+            echo "run_api_load requires base_url and the TNG_BACKEND_API_TOKEN secret" >&2
+            exit 1
+          fi
+          scripts/backend_burndown_api_load.py \
+            "certification/reports/backend-api-load-${GITHUB_RUN_ID}.md"
+
+      - name: Upload API/SSE evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: backend-api-load-${{ github.run_id }}
+          path: certification/reports/backend-api-load-*
+          if-no-files-found: warn
+
+  public-compatibility:
+    name: Public/client compatibility evidence
+    if: inputs.run_public_compat == true
+    runs-on: self-hosted
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Run explicitly opted-in public compatibility matrix
+        env:
+          UNIVERSAL_COMPAT_LIVE: "1"
+          UNIVERSAL_COMPAT_PUBLIC: "1"
+        run: |
+          scripts/universal_compatibility_certification.sh \
+            "certification/reports/universal-compat-backend-${GITHUB_RUN_ID}.md"
+
+      - name: Upload public compatibility evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: backend-public-compat-${{ github.run_id }}
+          path: certification/reports/universal-compat-backend-*
+          if-no-files-found: warn
+
+  real-device:
+    name: Real-device storage evidence
+    if: inputs.run_real_device == true
+    runs-on: self-hosted
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Run mounted-device matrix
+        env:
+          STORAGE_PHASE_B_REAL_DEVICE: "1"
+          TNG_STORAGE_BENCH_DIR: ${{ inputs.storage_target }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${TNG_STORAGE_BENCH_DIR:-}" || ! -d "$TNG_STORAGE_BENCH_DIR" || ! -w "$TNG_STORAGE_BENCH_DIR" ]]; then
+            echo "run_real_device requires a writable storage_target on the self-hosted runner" >&2
+            exit 1
+          fi
+          scripts/storage_phase_b_matrix.sh
+
+      - name: Upload storage evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: backend-real-device-${{ github.run_id }}
+          path: certification/reports/storage-*
+          if-no-files-found: warn
+
+  soak:
+    name: 24-hour production soak
+    if: inputs.run_24h_soak == true
+    runs-on: self-hosted
+    timeout-minutes: 1500
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Run blocking soak
+        env:
+          TNG_HOST_URL: ${{ inputs.soak_url }}
+          TNG_API_TOKEN: ${{ secrets.TNG_BACKEND_API_TOKEN }}
+          TNG_CONTAINER: ${{ inputs.soak_container }}
+          SOAK_DURATION_SECONDS: "86400"
+          SOAK_INTERVAL_SECONDS: "60"
+        run: |
+          set -euo pipefail
+          if [[ -z "${TNG_API_TOKEN:-}" ]]; then
+            echo "run_24h_soak requires the TNG_BACKEND_API_TOKEN secret" >&2
+            exit 1
+          fi
+          scripts/soak_certification.sh \
+            "certification/reports/soak-24h-backend-${GITHUB_RUN_ID}.md"
+
+      - name: Upload soak evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: backend-24h-soak-${{ github.run_id }}
+          path: certification/reports/soak-24h-backend-*
+          if-no-files-found: warn

@@ -44,6 +44,7 @@ fi
 
 allow_scripts="$(value_for allow_scripts | tr -d ' "')"
 allowed_dirs="$(value_for allowed_script_dirs)"
+listen_addr="$(value_for listen_addr | tr -d ' \"')"
 tokens="$(value_for api_tokens)"
 configured_secret="$(value_for secret_key)"
 secret="$(printf '%s' "$configured_secret" | tr -d ' "')"
@@ -84,7 +85,12 @@ else
 fi
 
 if [[ "$trust_proxy" == "true" ]]; then
-  emit "proxy header trust" "WARN" "requires trusted reverse proxy that strips spoofed inbound headers"
+  case "$listen_addr" in
+    127.0.0.1:*|localhost:*|\[::1\]:*)
+      emit "proxy header trust" "WARN" "loopback-only; reverse proxy must strip spoofed inbound headers" ;;
+    *)
+      emit "proxy header trust" "FAIL" "trust_proxy_header requires a loopback listen_addr" ;;
+  esac
 else
   emit "proxy header trust" "PASS" "disabled"
 fi
@@ -94,7 +100,7 @@ fi
   echo "## Manual Checks"
   echo
   echo "- Confirm script directories are owned by the service owner or root and are not world-writable."
-  echo "- Confirm metrics and health endpoints are exposed only to trusted networks."
+  echo "- Confirm metrics is exposed only to trusted networks; /health is intentionally public for probes."
   echo "- Confirm Docker/systemd deployments do not mount workflow script directories writable from untrusted paths."
   echo
   echo "Overall status: $status"

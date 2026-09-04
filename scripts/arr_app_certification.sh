@@ -245,7 +245,7 @@ grab_release() {
 
 SONARR_BASE="$(mapped_host_url "$SONARR_CONTAINER" 8989)"
 RADARR_BASE="$(mapped_host_url "$RADARR_CONTAINER" 7878)"
-TNG_API_TOKEN="${TNG_API_TOKEN:-cert-token}"
+TNG_API_TOKEN="${TNG_API_TOKEN:-local-cert-api-token-20260904}"
 TNG_HOST_URL="${TNG_HOST_URL:-http://localhost:${TNG_HOST_PORT:-18080}}"
 TNG_HOST_URL="$(mapped_host_url "$TNG_CONTAINER" 8080)"
 SONARR_KEY="${SONARR_API_KEY_OVERRIDE:-$(api_key_from_container "$SONARR_CONTAINER")}"

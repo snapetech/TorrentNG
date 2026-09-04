@@ -127,6 +127,9 @@ for pattern in \
   security-scan-selftest.md \
   native-engine-selftest.md \
   webui-certification-selftest.md \
+  backend-burndown-native-release-smoke-selftest.md \
+  backend-burndown-fault-matrix-selftest.md \
+  backend-api-load-selftest.md \
   local-release-selftest.md \
   certification-burndown-selftest.md \
   release-readiness-selftest.md \

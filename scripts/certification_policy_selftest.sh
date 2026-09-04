@@ -46,6 +46,9 @@ for report in \
   security-scan-selftest.md \
   native-engine-selftest.md \
   webui-certification-selftest.md \
+  backend-burndown-native-release-smoke-selftest.md \
+  backend-burndown-fault-matrix-selftest.md \
+  backend-api-load-selftest.md \
   local-release-selftest.md \
   pre-engine-release-selftest.md \
   pre-engine-suite-selftest.md \
@@ -97,6 +100,14 @@ write_report "$report_dir/release-readiness-selftest.md" FAIL
 write_report "$report_dir/certification-bundle-selftest.md" PASS_WITH_WARNINGS
 write_report "$report_dir/release-evidence-suite-selftest.md" FAIL
 write_report "$report_dir/certification-status-selftest.md" FAIL
+
+if BENCHMARK_DIR="$benchmark_dir" \
+  "$ROOT/scripts/certification_status_json.sh" "$report_dir/status-json-selftest.json" >/dev/null 2>&1; then
+  echo "certification status JSON selftest accepted failed gates" >&2
+  exit 1
+fi
+grep -q '"fail":' "$report_dir/status-json-selftest.json"
+grep -q 'Overall status: FAIL' "$report_dir/status-json-selftest.md"
 
 REPORT_DIR="$report_dir" BENCHMARK_DIR="$benchmark_dir" \
   "$ROOT/scripts/certification_burndown.sh" "$report_dir/certification-burndown-policy.md" >/dev/null

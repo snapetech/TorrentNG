@@ -12,7 +12,7 @@ if [[ -f "$ENV_FILE" ]]; then
   set +a
 fi
 
-TNG_API_TOKEN="${TNG_API_TOKEN:-cert-token}"
+TNG_API_TOKEN="${TNG_API_TOKEN:-local-cert-api-token-20260904}"
 TNG_HOST_URL="${TNG_HOST_URL:-http://localhost:${TNG_HOST_PORT:-18080}}"
 PROWLARR_CONTAINER="${PROWLARR_CONTAINER:-certification-prowlarr-1}"
 TNG_CONTAINER="${TNG_CONTAINER:-certification-torrentng-1}"

@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="${1:-$ROOT/certification/reports/mobile-compat-$(date -u +%Y%m%dT%H%M%SZ).md}"
 TNG_HOST_URL="${TNG_HOST_URL:-http://localhost:${TNG_HOST_PORT:-18080}}"
-TNG_API_TOKEN="${TNG_API_TOKEN:-cert-token}"
+TNG_API_TOKEN="${TNG_API_TOKEN:-local-cert-api-token-20260904}"
 TNG_CONTAINER="${TNG_CONTAINER:-certification-torrentng-1}"
 MOBILE_LIST_LIMIT="${MOBILE_LIST_LIMIT:-50000}"
 BODY="$(mktemp)"

@@ -21,11 +21,93 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Validate native API contract
+        run: python3 scripts/validate_openapi.py
+
       - name: Test native workspace
         run: cargo test --workspace --all-targets --locked
 
       - name: Lint native workspace
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  backend-fault-matrix:
+    name: Backend fault-containment matrix
+    needs: native-quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run deterministic fault matrix
+        run: |
+          TNG_FAULT_MATRIX_STRICT=0 \
+            scripts/backend_burndown_fault_matrix.sh \
+            "certification/reports/backend-burndown-fault-matrix-ci-${GITHUB_RUN_ID}.md"
+
+      - name: Upload fault matrix evidence
+        uses: actions/upload-artifact@v7
+        with:
+          name: backend-fault-matrix-${{ github.run_id }}
+          path: certification/reports/backend-burndown-fault-matrix-ci-*
+          if-no-files-found: error
+
+  backend-api-load:
+    name: Hosted native API/SSE load harness
+    needs: native-quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build native release daemon
+        run: cargo build --release --locked -p torrentngd
+
+      - name: Run concurrent API and slow-SSE load
+        shell: bash
+        run: |
+          set -euo pipefail
+          TORRENTNGD_CONFIG=certification/fixtures/backend-burndown-native-release-smoke.toml \
+          TNG_STATIC_DIR=sidecar/static \
+            target/release/torrentngd > /tmp/torrentng-api-load-${GITHUB_RUN_ID}.log 2>&1 &
+          pid=$!
+          cleanup() {
+            kill -TERM "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          for _ in $(seq 1 100); do
+            if curl -fsS \
+              -H 'Authorization: Bearer backend-burndown-token-20260902' \
+              http://127.0.0.1:28080/health >/dev/null; then
+              break
+            fi
+            sleep 0.1
+          done
+          TNG_BASE_URL=http://127.0.0.1:28080 \
+          TNG_API_TOKEN=backend-burndown-token-20260902 \
+          TNG_LOAD_PID="$pid" \
+          TNG_LOAD_DURATION_SECONDS=15 \
+          TNG_LOAD_CLIENTS=16 \
+          TNG_LOAD_SSE_CLIENTS=4 \
+          TNG_LOAD_SLOW_DELAY_MS=100 \
+            scripts/backend_burndown_api_load.py \
+            "certification/reports/backend-api-load-ci-${GITHUB_RUN_ID}.md"
+
+      - name: Upload API load evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: backend-api-load-${{ github.run_id }}
+          path: |
+            certification/reports/backend-api-load-ci-*
+            /tmp/torrentng-api-load-${{ github.run_id }}.log
+          if-no-files-found: warn
 
   # TNG-025: the empirically-verified MSRV floor for this workspace's
   # locked dependency graph (see docs/BACKEND_AUDIT_BURN_DOWN.md) is

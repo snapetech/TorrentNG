@@ -14,12 +14,6 @@ tmp_status="$(mktemp)"
 tmp_rows="$(mktemp)"
 trap 'rm -f "$tmp_status" "$tmp_rows"' EXIT
 
-{
-  echo "# TorrentNG Certification JSON Status"
-  echo
-  echo "Overall status: PASS"
-} >"$REPORT"
-
 BENCHMARK_DIR="$BENCHMARK_DIR" "$ROOT/scripts/certification_status.sh" "$REPORT_DIR" >"$tmp_status"
 
 awk -F'|' '
@@ -64,6 +58,14 @@ while IFS=$'\t' read -r _gate status _report; do
   esac
 done <"$tmp_rows"
 
+if [[ "$fail" -gt 0 || "$missing" -gt 0 || "$other" -gt 0 ]]; then
+  overall_status="FAIL"
+elif [[ "$warn" -gt 0 ]]; then
+  overall_status="PASS_WITH_WARNINGS"
+else
+  overall_status="PASS"
+fi
+
 {
   echo "{"
   printf '  "generated_utc": "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -107,7 +109,8 @@ done <"$tmp_rows"
   echo "- Failures: $fail"
   echo "- Missing: $missing"
   echo
-  echo "Overall status: PASS"
+  echo "Overall status: $overall_status"
 } >"$REPORT"
 
 echo "$OUT"
+[[ "$overall_status" != "FAIL" ]]

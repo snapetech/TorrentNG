@@ -12,7 +12,7 @@ if [[ -f "$ENV_FILE" ]]; then
   set +a
 fi
 
-TNG_API_TOKEN="${TNG_API_TOKEN:-cert-token}"
+TNG_API_TOKEN="${TNG_API_TOKEN:-local-cert-api-token-20260904}"
 AUTOBRR_CONTAINER="${AUTOBRR_CONTAINER:-certification-autobrr-1}"
 AUTOBRR_HOST_URL="${AUTOBRR_HOST_URL:-http://localhost:${AUTOBRR_HOST_PORT:-17474}}"
 AUTOBRR_CERT_USER="${AUTOBRR_CERT_USER:-cert}"
