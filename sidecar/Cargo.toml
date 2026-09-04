@@ -45,7 +45,7 @@ async-trait = "0.1"
 dotenvy = "0.15"
 
 # Per-install peer identity generation (see docs/TRACKER-IDENTITY.md)
-rand = "0.8"
+rand = "0.10"
 hex = "0.4"
 hmac = "0.12"
 sha2 = "0.10"
