@@ -8,6 +8,7 @@ IMAGE="${TNG_SCAN_IMAGE:-torrentng:certification}"
 mkdir -p "$(dirname "$OUT")"
 
 status="PASS"
+blocked=0
 
 mark() {
   local name="$1"
@@ -16,6 +17,8 @@ mark() {
   printf '| %s | %s | %s |\n' "$name" "$result" "$detail" >> "$OUT"
   if [[ "$result" == "FAIL" ]]; then
     status="FAIL"
+  elif [[ "$result" == "BLOCKED" ]]; then
+    blocked=1
   fi
 }
 
@@ -94,9 +97,16 @@ else
 fi
 
 {
+  if [[ "$blocked" == "1" ]]; then
+    if [[ "${TNG_SECURITY_SCAN_ALLOW_BLOCKED:-0}" == "1" ]]; then
+      status="PASS_WITH_WARNINGS"
+    elif [[ "$status" != "FAIL" ]]; then
+      status="FAIL"
+    fi
+  fi
   echo
   echo "Overall status: $status"
 } >> "$OUT"
 
 echo "$OUT"
-[[ "$status" != "FAIL" ]]
+[[ "$status" == "PASS" || "$status" == "PASS_WITH_WARNINGS" && "${TNG_SECURITY_SCAN_ALLOW_BLOCKED:-0}" == "1" ]]
