@@ -45,6 +45,7 @@ const QBIT_LIVE_PROJECTION_MAX_ENTRIES: usize = 200;
 /// and the TorrentNG snapshot header.
 const QBIT_DEFAULT_PAGE_SIZE: usize = 200;
 const MAX_TORRENT_LIST_OFFSET: usize = 1_000_000;
+const QBIT_LIST_INITIAL_CAPACITY: usize = 256;
 const QBIT_LIMIT_PROJECTION_CONCURRENCY: usize = 64;
 const QBIT_LIVE_PROJECTION_CONCURRENCY: usize = 64;
 
@@ -1079,7 +1080,6 @@ pub async fn torrents_info(
                 .into_response();
         }
     };
-    let torrent_count = snapshot.entries.len();
     let hashes = match q.hashes.as_deref().map(str::trim) {
         None | Some("") | Some("all") => None,
         Some(raw) => match strict_hashes_from_str(raw) {
@@ -1125,7 +1125,10 @@ pub async fn torrents_info(
     let limit = q.limit.unwrap_or(QBIT_DEFAULT_PAGE_SIZE).clamp(1, 5_000);
     let descending = q.reverse.unwrap_or(false);
     let mut skipped = 0;
-    let mut selected = Vec::with_capacity(limit.min(torrent_count));
+    // Keep the initial allocation independent of the caller's page size. The
+    // response remains bounded by `limit`, but a hostile limit must not flow
+    // directly into an allocation site.
+    let mut selected = Vec::with_capacity(QBIT_LIST_INITIAL_CAPACITY);
     let indices: Box<dyn Iterator<Item = &usize>> = if descending {
         Box::new(order.iter().rev())
     } else {

@@ -46,6 +46,7 @@ const SSE_INITIAL_BATCH_MAX: usize = 1_000;
 const SSE_DELTA_MAX_ENTRIES: usize = 1_000;
 const SSE_SLOW_CLIENT_RESYNC_AFTER: Duration = Duration::from_secs(15);
 const MAX_TORRENT_LIST_OFFSET: usize = 1_000_000;
+const TORRENT_LIST_INITIAL_CAPACITY: usize = 256;
 const SETTING_NATIVE_SAVED_VIEWS: &str = "native.saved_views";
 const SETTING_NATIVE_RATIO_GROUPS: &str = "native.ratio_groups";
 const SETTING_NATIVE_WORKFLOWS: &str = "native.workflows";
@@ -213,7 +214,10 @@ pub async fn list_torrents(
             .is_some_and(|dir| dir.eq_ignore_ascii_case("desc"));
     let order = snapshot.ordered_indices(query.sort.as_deref());
     let mut skipped = 0;
-    let mut summaries = Vec::with_capacity(limit);
+    // Keep the initial allocation independent of the caller's page size. The
+    // response remains bounded by `limit`, but a hostile limit must not flow
+    // directly into an allocation site.
+    let mut summaries = Vec::with_capacity(TORRENT_LIST_INITIAL_CAPACITY);
     let indices: Box<dyn Iterator<Item = &usize>> = if descending {
         Box::new(order.iter().rev())
     } else {
