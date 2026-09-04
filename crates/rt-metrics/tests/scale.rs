@@ -33,7 +33,7 @@ async fn native_app_with(n: usize) -> axum::Router {
     {
         let mut reg = state.registry.write().await;
         for i in 0..n {
-            let hash = format!("{:040x}", i);
+            let hash = format!("{i:040x}");
             let entry = TorrentEntry::new(hash, format!("torrent_{i}"), "/data".into());
             reg.add(entry).unwrap();
         }
@@ -47,7 +47,7 @@ async fn qbit_app_with(n: usize) -> axum::Router {
     {
         let mut reg = state.registry.write().await;
         for i in 0..n {
-            let hash = format!("{:040x}", i);
+            let hash = format!("{i:040x}");
             let entry = TorrentEntry::new(hash, format!("torrent_{i}"), "/data".into());
             reg.add(entry).unwrap();
         }
@@ -55,10 +55,13 @@ async fn qbit_app_with(n: usize) -> axum::Router {
     rt_api_qbit::build_qbit_router(state)
 }
 
-/// Debug builds are ~15x slower; multiply thresholds so CI passes without --release.
+/// Debug builds can be substantially slower on shared CI runners; these are
+/// release-envelope smoke tests, not a benchmark of an unoptimized binary.
+/// Keep the release thresholds unchanged and give debug/MSRV jobs enough
+/// scheduler headroom to avoid turning host contention into a false failure.
 fn threshold(release_ms: u128) -> u128 {
     if cfg!(debug_assertions) {
-        release_ms * 20
+        release_ms * 50
     } else {
         release_ms
     }

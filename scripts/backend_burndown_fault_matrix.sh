@@ -79,16 +79,22 @@ run_gate "production engine compile" \
 run_gate "complete engine regression suite" \
   cargo test -p rt-engine --locked
 
-if rg -U -q '#\[cfg\(test\)\][[:space:]]+db:[[:space:]]*Arc<Mutex<Connection>>' \
-  "$ROOT/crates/rt-engine/src/engine.rs"; then
+# Keep this harness dependent only on POSIX-ish tools available on the hosted
+# runner. `rg` is convenient locally but is not installed on ubuntu-latest.
+if awk '
+  /#\[cfg\(test\)\]/ { test_attr = 1; next }
+  test_attr && /db:[[:space:]]*Arc<Mutex<Connection>>/ { found = 1; exit }
+  test_attr && /^[[:space:]]*[^[:space:]]/ { test_attr = 0 }
+  END { exit found ? 0 : 1 }
+' "$ROOT/crates/rt-engine/src/engine.rs"; then
   mark "engine test-only direct database fixture" PASS "production Engine has no direct SQLite handle"
 else
   mark "engine test-only direct database fixture" FAIL "Engine database ownership marker missing"
 fi
 
-if rg -q 'db_worker: DbWorker' "$ROOT/crates/rt-engine/src/engine.rs" \
-  && rg -q 'self\.db_worker\.run' "$ROOT/crates/rt-engine/src/engine.rs" \
-  && rg -q 'pub\(crate\) fn submit_managed' "$ROOT/crates/rt-engine/src/storage_jobs.rs"; then
+if grep -Eq 'db_worker: DbWorker' "$ROOT/crates/rt-engine/src/engine.rs" \
+  && grep -Eq 'self\.db_worker\.run' "$ROOT/crates/rt-engine/src/engine.rs" \
+  && grep -Eq 'pub\(crate\) fn submit_managed' "$ROOT/crates/rt-engine/src/storage_jobs.rs"; then
   mark "supervised persistence ownership boundary" PASS "engine DB and production storage submissions use supervised workers"
 else
   mark "supervised persistence ownership boundary" FAIL "supervised persistence markers missing"
