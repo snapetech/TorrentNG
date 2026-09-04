@@ -12,18 +12,18 @@ PREFIX="${OUT%.md}"
 
 mkdir -p "$(dirname "$OUT")"
 WORK_DIR=""
-SOURCE_SESSION="$WORK_DIR/source-session"
-SOURCE_DATA="$WORK_DIR/source-data"
-BACKUP_ROOT="$WORK_DIR/backup"
-RESTORE_ROOT="$WORK_DIR/restore"
-SOURCE_CONFIG="$WORK_DIR/source-config.toml"
-RESTORE_CONFIG="$RESTORE_ROOT/restored-config.toml"
+SOURCE_SESSION=""
+SOURCE_DATA=""
+BACKUP_ROOT=""
+RESTORE_ROOT=""
+SOURCE_CONFIG=""
+RESTORE_CONFIG=""
 SOURCE_LOG="$PREFIX.source.log"
 RESTORE_LOG="$PREFIX.restore.log"
-ARCHIVE="$WORK_DIR/torrentng-session.tar.gz"
-SOURCE_LIST="$WORK_DIR/source-list.json"
-RESTORED_LIST="$WORK_DIR/restored-list.json"
-ADD_BODY="$WORK_DIR/add.json"
+ARCHIVE=""
+SOURCE_LIST=""
+RESTORED_LIST=""
+ADD_BODY=""
 daemon_pid=""
 status="PASS"
 failure_reason=""
@@ -156,6 +156,9 @@ trap cleanup EXIT
 write_header
 test -x "$BIN"
 test -f "$FIXTURE"
+# The native API-only drill does not require checked-in WebUI assets. Create
+# an empty temporary-compatible directory when a checkout omits generated
+# static assets; the API assertions below still exercise the daemon itself.
 mkdir -p "$STATIC_DIR"
 command -v curl >/dev/null
 command -v jq >/dev/null

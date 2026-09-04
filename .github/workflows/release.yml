@@ -148,6 +148,7 @@ jobs:
             "certification/reports/backup-restore-release-${GITHUB_RUN_ID}.md"
 
       - name: Upload native release smoke evidence
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: native-release-smoke-${{ github.run_id }}
