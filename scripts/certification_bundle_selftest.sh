@@ -76,7 +76,8 @@ REPORT_DIR="$report_dir" BENCHMARK_DIR="$benchmark_dir" CERTIFICATION_BUNDLE_DIR
 latest="$(ls -t "$report_dir"/certification-bundle-*.md | head -1)"
 grep -q 'Overall status: PASS_WITH_WARNINGS' "$latest"
 grep -q 'Missing referenced reports: 1' "$latest"
-tar -xOzf "$bundle_dir/warn.tar.gz" "$(tar -tzf "$bundle_dir/warn.tar.gz" | grep '/MANIFEST.md$')" \
-  | grep -q 'universal-live-selftest.md | missing at bundle time'
+manifest_path="$(tar -tzf "$bundle_dir/warn.tar.gz" | awk '/\/MANIFEST\.md$/ {path=$0} END {print path}')"
+tar -xOzf "$bundle_dir/warn.tar.gz" "$manifest_path" >"$tmpdir/warn-manifest.md"
+grep -q 'universal-live-selftest.md | missing at bundle time' "$tmpdir/warn-manifest.md"
 
 echo "certification bundle self-test: PASS"
