@@ -1,10 +1,18 @@
 # TorrentNG Project Gap Audit
 
-Status as of 2026-05-18 on `main`.
+Status as of 2026-09-04 on the dirty working tree rooted at `e0d487f`.
 
 This audit separates local implementation gaps from external evidence gates.
 It is based on the roadmap docs, compatibility matrices, certification status,
 and the local checks listed at the end.
+
+The dated audit narrative below is retained for traceability. The current
+repository disposition is the 2026-09-04 reconciliation in
+[`BACKEND_AUDIT_BURN_DOWN.md`](BACKEND_AUDIT_BURN_DOWN.md): all repository-
+actionable implementation, contract, security, CI, and local evidence work is
+closed for its declared scope. Remaining rows require hosted runners, public
+clients/networks, physical storage, or elapsed soak time and are not hidden
+implementation backlog.
 
 ## Executive Summary
 
@@ -28,8 +36,9 @@ compatibility depth:
   peer-wire, incoming peer-wire when explicitly enabled, and magnet metadata
   fetch; remaining uTP work is public/live interop evidence and operational
   tuning rather than a hidden packet-codec-only implementation gap;
-- the security release checklist is intentionally unchecked until run against
-  the exact deployment config;
+- the current native and sidecar security reviews pass their configuration,
+  token, and script-policy checks; rendered-secret, proxy, metrics-exposure,
+  dependency, and image-scan review remains deployment/operator evidence;
 - the 24h soak status row is explicitly `STALE/INCOMPLETE` when the latest
   report lacks an `Overall status` line and no matching soak process is active,
   even though short, transfer-churn, finalization, local release, and post-soak
@@ -69,18 +78,13 @@ native implementation. The remaining roadmap risk is that the high-level
 roadmap now mixes completed implementation claims with evidence boundaries from
 the compatibility matrix.
 
-Actionable gaps:
+Remaining qualification gates:
 
-- Keep `docs/CLIENT_COMPATIBILITY_MATRICES.md` as the live backlog for broad
-  ecosystem compatibility. It still has P1/P2 rows for live client matrices,
-  public transfer interop, storage resume scenarios, golden import corpora, and
-  plugin auxiliary APIs.
-- Keep `docs/INTEROP_MATRIX.md` as the live backlog for protocol and
-  client-to-client evidence. Its expansion backlog now separates implemented
-  default-gate rows from remaining Docker/live coverage.
-- Decide whether `24h soak` should be rerun to completion, superseded by
-  transfer-churn soak, or removed from release status if the stale report is no
-  longer a release target.
+- `docs/CLIENT_COMPATIBILITY_MATRICES.md` and `docs/INTEROP_MATRIX.md` retain
+  optional live-client, public-network, and broader protocol qualification rows;
+  they are not unassigned native implementation work.
+- The 24-hour soak remains an explicit release-evidence gate. It can be run by
+  the release operator, but cannot be truthfully completed by a source edit.
 
 ## Storage
 
@@ -279,11 +283,14 @@ The full Docker interop matrix still has release evidence to run:
 
 ## Security
 
-Security scripts and reports exist and the current status shows PASS, but
-`docs/SECURITY_REVIEW.md` intentionally leaves the release checklist unchecked
-because it must be run against the exact release deployment config.
+The repository security checks pass for the current native and sidecar
+configuration fixtures. Native metrics identifiers are hashed by default;
+sidecar metrics requires credentials when tokens are configured; public binds
+require strong tokens and a signing secret; and proxy-header trust is
+loopback-only. The remaining checks are deployment-specific rather than open
+source work.
 
-Release-blocking checks before shipping:
+Release-operator checks before shipping:
 
 - run `scripts/security_review.sh` against the selected config;
 - confirm scripts are disabled or constrained to explicit non-world-writable
@@ -298,13 +305,13 @@ Release-blocking checks before shipping:
 Native deployment docs and packaging artifacts exist for systemd, Docker,
 Compose, Kubernetes, Prometheus/Grafana, and Arch/AUR template coverage.
 
-Remaining operational evidence:
+Remaining external operational evidence:
 
 - rerun the release suite against the exact release config and target hardware;
 - attach security, storage, compatibility, and soak reports to release notes;
 - resolve the stale/incomplete 24h soak row.
 
-## Validation Run During This Audit
+## Historical Validation Run
 
 Commands run successfully:
 

@@ -92,6 +92,8 @@ enqueue and released on queue rejection, cancellation, or completion.
 | Key | Default | Description |
 |---|---|---|
 | `torrent_tiers_enabled` | `true` | Keep idle torrents in Dormant/Warm tiers so only active torrents own task/runtime resources |
+| `tier_hot_idle_secs` | `120` | Idle seconds before a promoted torrent moves from Hot to Warm |
+| `tier_warm_idle_secs` | `1800` | Idle seconds before a promoted torrent moves from Warm to Dormant; must exceed `tier_hot_idle_secs` |
 
 ### `[tracker]`
 
@@ -109,6 +111,10 @@ enqueue and released on queue rejection, cancellation, or completion.
 | `port` | `0` | UDP DHT port; `0` uses `network.listen_port` |
 | `bootstrap_nodes` | Public BitTorrent bootstrap routers | Bootstrap nodes as `host:port` strings |
 
+The live native DHT transport is currently IPv4-only. The metainfo and magnet
+identity model accepts v1, v2, and hybrid identities, but this does not imply
+IPv6 DHT routing or IPv6 tracker/peer coverage.
+
 ### `[db]`
 
 | Key | Default | Description |
@@ -121,6 +127,13 @@ enqueue and released on queue rejection, cancellation, or completion.
 | Key | Default | Description |
 |---|---|---|
 | `api_tokens` | `[]` | Pre-shared bearer/session tokens accepted by the native API |
+| `api_tokens_file` | unset | Optional newline-delimited token file; loaded in addition to `api_tokens` |
+| `metrics.include_torrent_ids` | `false` | Include raw infohashes in hot-torrent Prometheus labels; disabled by default because labels are high-cardinality identifiers |
+
+An empty token list is valid only when `[daemon].api_bind` is loopback. A
+non-loopback bind requires at least one real token of 16 or more characters;
+placeholder values such as `change-me` and `REPLACE_WITH_*` are rejected at
+startup. Prefer `api_tokens_file` or a deployment secret over inline tokens.
 
 ### `[logging]`
 
@@ -152,6 +165,7 @@ download_dir = "/data"
 [auth]
 # Loopback-only native development mode. Public binds require real tokens.
 api_tokens = []
+# Production alternative: api_tokens_file = "/run/secrets/torrentngd_api_token"
 ```
 
 ### Native full example
@@ -217,7 +231,7 @@ Environment variables override file values where listed.
 
 | Key | Default | Env override | Description |
 |---|---|---|---|
-| `listen_addr` | `0.0.0.0:8080` | `TNG_LISTEN_ADDR` | TCP address the sidecar listens on |
+| `listen_addr` | `127.0.0.1:8080` | `TNG_LISTEN_ADDR` | TCP address the sidecar listens on; non-loopback binds require strong API tokens and a session secret |
 | `debug` | `false` | `TNG_DEBUG=1` | Enable debug logging |
 | `sync_interval_secs` | `2` | `TNG_SYNC_INTERVAL_SECS` | Seconds between backend state polls |
 | `data_dir` | `~/.local/share/torrentng` | - | Directory for SQLite cache |
@@ -249,6 +263,11 @@ type = "qbittorrent"
 | `scgi_socket` | `/run/rtorrent/rpc.sock` | `TNG_SCGI_SOCKET` | Path to rTorrent SCGI Unix socket |
 | `scgi_addr` | - | `TNG_SCGI_ADDR` | `host:port` for TCP SCGI; mutually exclusive with `scgi_socket` |
 | `timeout_secs` | `10` | - | Timeout for individual XMLRPC calls |
+
+The sidecar's mounted HTTP/XMLRPC routes enforce the configured API token.
+The crate-level `execute_xml` helper without a token is a local embedding/test
+convenience and is not mounted by `torrentngd`; use the token-aware helper for
+an independently exposed integration.
 | `user_agent` | `rtorrent/0.16.11/0.16.11` | `TNG_USER_AGENT` | Tracker HTTP user-agent pushed to rTorrent on startup |
 | `peer_id` | generated + persisted per install | `TNG_PEER_ID` | 20-byte tracker peer ID pushed to loaded rTorrent downloads on startup |
 
@@ -286,7 +305,7 @@ timeout_secs = 10
 
 ### Sidecar `[transmission]`
 
-The Transmission backend talks to an external Transmission RPC endpoint. Categories are mapped to Transmission labels where available. File priority, tracker add/edit/remove, pause/resume, remove, add, recheck, location moves, file rename, and share limits are mapped to Transmission RPC where supported; tags, torrent rename, sequential toggles, and runtime user-agent changes are unsupported.
+The Transmission backend talks to an external Transmission RPC endpoint. Categories are mapped to Transmission labels where available. File priority, tracker add/edit/remove, pause/resume, remove, add, recheck, location moves, file rename, and share limits are mapped to Transmission RPC where supported. The native TorrentNG compatibility facade uses configured storage-root probes for free-space responses; port testing and operations without an attached engine return explicit unsupported errors rather than false success. Tags, torrent rename, sequential toggles, and runtime user-agent changes remain unsupported in this adapter.
 
 | Key | Default | Env override | Description |
 |---|---|---|---|
@@ -306,7 +325,7 @@ url = "http://127.0.0.1:9091/transmission/rpc"
 
 ### Sidecar `[deluge]`
 
-The Deluge backend talks to the Deluge Web JSON-RPC endpoint. File priority, tracker replacement, pause/resume, remove, add, recheck, storage moves, file rename, ratio share limits, and seeding-time share limits are mapped to Deluge core methods where supported; categories, tags, torrent rename, sequential toggles, and runtime user-agent changes are unsupported.
+The Deluge backend talks to the Deluge Web JSON-RPC endpoint. File priority, tracker replacement, pause/resume, remove, add, recheck, storage moves, file rename, ratio share limits, and seeding-time share limits are mapped to Deluge core methods where supported. In native compatibility mode, path-based torrent loads and daemon/plugin/configuration writes are rejected explicitly, and free-space reads use healthy configured storage roots. Categories, tags, torrent rename, sequential toggles, and runtime user-agent changes are unsupported in this adapter.
 
 | Key | Default | Env override | Description |
 |---|---|---|---|
@@ -326,7 +345,7 @@ password = "deluge"
 
 ### Sidecar `[torrentng]`
 
-The TorrentNG backend talks to a native TorrentNG daemon over its native HTTP API. This is primarily for deployments that want the sidecar WebUI/API compatibility layer in front of a separate native daemon. The adapter forwards torrent add/remove, pause/resume, recheck/reannounce, category/tag changes, location/name updates, file-priority and file-rename changes, and tracker add/edit/remove operations to the native daemon; sidecar-only catalog metadata such as saved views and RSS rules remains in the sidecar cache.
+The TorrentNG backend talks to a native TorrentNG daemon over its native HTTP API. This is primarily for deployments that want the sidecar WebUI/API compatibility layer in front of a separate native daemon. The adapter forwards torrent add/remove, pause/resume, recheck/reannounce, category/tag changes, location/name updates, file-priority and file-rename changes, and tracker add/edit/remove operations to the native daemon; sidecar-only catalog metadata such as saved views and RSS rules remains in the sidecar cache. Bounded cache synchronization pins the native list snapshot across pages and retries; external qBittorrent synchronization is bounded but eventual because qBittorrent exposes no equivalent snapshot token.
 
 | Key | Default | Env override | Description |
 |---|---|---|---|
@@ -431,9 +450,9 @@ Use these only for lab compatibility testing. Tracker-facing identity is still c
 
 | Key | Default | Env override | Description |
 |---|---|---|---|
-| `secret_key` | - | `TNG_SECRET_KEY` | Secret for signing session tokens. Set in production. |
-| `api_tokens` | `[]` | `TNG_API_TOKENS` | Comma-separated pre-shared bearer tokens for automation tools |
-| `trust_proxy_header` | `false` | - | Trust `X-Remote-User` from reverse proxy |
+| `secret_key` | - | `TNG_SECRET_KEY` | Secret for signing expiring compatibility session cookies. Required for public binds. |
+| `api_tokens` | `[]` | `TNG_API_TOKENS` | Comma-separated pre-shared bearer tokens for automation tools; public binds require tokens of at least 16 characters |
+| `trust_proxy_header` | `false` | - | Trust a non-empty `X-Remote-User` only on a loopback listener; the reverse proxy must strip inbound copies before forwarding |
 
 For compatibility with older installed `rtorrentng-prod` units, the sidecar
 also accepts the former `RTNG_*` spelling for environment overrides. When both
@@ -454,11 +473,12 @@ names are set, the canonical `TNG_*` value wins.
 
 | Key | Default | Env override | Description |
 |---|---|---|---|
-| `allow_scripts` | `false` | `TNG_ALLOW_SCRIPTS=1` | Enables workflow `script` actions |
+| `allow_scripts` | `false` | `TNG_ALLOW_SCRIPTS=1` | Enables workflow `script` actions; requires a non-empty `allowed_script_dirs` allowlist |
 | `script_timeout_secs` | `30` | - | Maximum runtime for each script action |
-| `allowed_script_dirs` | `[]` | - | Optional canonical directory allowlist for script paths |
+| `allowed_script_dirs` | `[]` | - | Canonical directory allowlist for script paths; required when scripts are enabled |
+| `allow_private_webhooks` | `false` | `TNG_ALLOW_PRIVATE_WEBHOOKS=1` | Allows workflow webhooks to resolve to private/loopback unicast addresses; redirects remain disabled |
 
-Script actions are refused unless `allow_scripts` is true. Production configs that enable scripts should set `allowed_script_dirs` to root-owned or service-owned directories and keep those directories non-world-writable. See [SECURITY_REVIEW.md](SECURITY_REVIEW.md).
+Script actions are refused unless `allow_scripts` is true and `allowed_script_dirs` is non-empty. The executable path must be absolute, is canonicalized before launch, and must remain under an allowed directory. Production configs should use root-owned or service-owned directories and keep them non-world-writable. Workflow webhooks reject private/local DNS results by default, pin one validated address, reject redirects, and cap responses; set `allow_private_webhooks` only for an explicitly trusted internal destination. See [SECURITY_REVIEW.md](SECURITY_REVIEW.md).
 
 ### Sidecar minimal example
 

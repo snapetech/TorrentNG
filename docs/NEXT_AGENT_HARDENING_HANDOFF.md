@@ -1,5 +1,28 @@
 # Next-agent hardening handoff
 
+> Historical handoff: the concrete root-authority, egress-policy, and auth
+> wiring items below were the starting checklist, not the current state. The
+> current source disposition is maintained in
+> [`docs/BACKEND_AUDIT_BURN_DOWN.md`](BACKEND_AUDIT_BURN_DOWN.md), updated
+> 2026-09-03. Check that ledger before reapplying any item.
+
+## Current disposition (2026-09-04)
+
+This handoff is retained as historical context, not as an active checklist.
+The storage-root authority, egress policy, shared HTTP transport, peer ingress,
+packed peer state, supervised persistence, snapshot/pagination, compatibility
+honesty, and metrics-privacy items described below are implemented in the
+current tree. The current verification set includes full native/sidecar tests,
+warnings-denied clippy, MSRV runs, authenticated release smoke, live fault
+containment, and API/SSE load; see
+[`BACKEND_AUDIT_BURN_DOWN.md`](BACKEND_AUDIT_BURN_DOWN.md).
+
+Do not re-implement the old patch targets. Only external qualification remains
+open: hosted workflow observation, public/client traffic, target-device
+storage, hostile-network runs, and long soak. If a new failure is found, add a
+new dated ledger entry with a reproducer rather than reopening these historical
+instructions by assumption.
+
 This branch already contains several hardening primitives and safety fixes, but some of the highest-impact integrations require editing very large files (`crates/rt-engine/src/engine.rs`, `crates/rt-engine/src/torrent_task.rs`, and sometimes native handlers). The connector write API only supports whole-file replacement for those files. I intentionally did not reconstruct those giant files blindly without a local build/test loop.
 
 Branch: `hardening/ruthless-review-fixes`
@@ -14,7 +37,7 @@ Current high-value additions already present:
 - metainfo numeric/cap hardening in `crates/rt-metainfo/src/parse.rs`
 - daemon and facade auth hardening in `crates/torrentngd/src/main.rs`, `crates/rt-api-native/src/router.rs`, and `crates/rt-api-qbit/*`
 
-## Must-do before merge
+## Historical must-do before merge
 
 Run:
 

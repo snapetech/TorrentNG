@@ -1,5 +1,15 @@
 # WebUI Live UX/Engineering Audit
 
+## Current disposition — 2026-09-04
+
+This is a historical observation of the deployed `kspls0` instance, not the
+current source ledger. The source fixes and local release-image verification
+are complete; redeploying and rechecking the real production instance remains
+an operator-owned deployment gate. The remaining field-depth items near the
+end of this document are product/projection decisions, not hidden native
+engine defects. See [`BACKEND_AUDIT_BURN_DOWN.md`](BACKEND_AUDIT_BURN_DOWN.md)
+for the canonical current status.
+
 Status as of 2026-08-29: **all findings below have been fixed in source**
 (`main`, uncommitted at the time of writing). The live instance at the time
 of the original audit (2026-08-28) was running an older deployed build than
@@ -389,7 +399,7 @@ logging). **Nothing was deployed** — the sidecar binary and WebUI bundle on
 | P2-1 Accessibility | **Fixed** | `color-contrast`: the default theme's toolbar/detail-panel action buttons blended text color toward `--text` instead of using the raw (4.39:1) accent tint. Also fixed an unrelated bug hit while in this code: `` `1px solid ${color}55` `` where `color` is a `var(--token)` reference, not a hex string — `"var(--accent)55"` is not a valid CSS color and the whole border declaration was silently dropped by the browser. `landmark-unique`/`region`/`page-has-heading-one`: added `aria-label`s to the two unlabeled `<aside>`s, wrapped the filter/toolbar controls in a `<nav>`, added an `<h1>`. Verified: 0 axe-core violations (was 1 serious + 3 moderate). |
 | P2-2 Facets vs. search | **Fixed** | `sidebar_facets` took no query params at all — it was always an unfiltered, whole-library aggregate. It now accepts the same search/category/tag/tracker filters as the main list query and applies them to both the STATE and TYPE buckets (excluding each bucket's own dimension, so filtering by a status doesn't collapse its own facet to itself). |
 | P2-3 Settings IA | **Fixed** | Moved the raw Operator Logs panel from "Support" (mixed with theme picker and Discord/GitHub links) to "Backend" (next to the sync-error diagnostics it explains). |
-| P2-4 Tracker-error findability | **Fixed** | Tracker Health rows are now clickable ("View torrents →"), jumping to the torrent list pre-filtered to that tracker. Doesn't isolate the specific erroring torrents within a tracker (would need a schema change to track per-torrent tracker error state) — noted as a follow-up, not implemented here. |
+| P2-4 Tracker-error findability | **Fixed** | Tracker Health rows are clickable ("View torrents →") and the current Torrent list exposes a `Tracker Errors` status facet backed by the durable tracker-message field, so operators can isolate affected torrents without a new schema. |
 | Polish: `linux%20iso` category | **Fixed** | Root cause: classic ruTorrent stores label/category values in `d.custom1` using PHP `rawurlencode()`; TorrentNG read it raw. Now decodes defensively (only when the value contains a `%XX` escape and round-trips to valid UTF-8, so a category with a literal `%` isn't mangled). Requires a sidecar rebuild to take effect on already-migrated data (existing rows aren't retroactively renamed — only what's read from rTorrent going forward). |
 | Polish: file shows 0% | **Fixed** | Defensive fix: a wanted file (priority ≠ 0) in a torrent the backend already reports complete can't itself be incomplete — trust `torrent.complete` over a stale/zero per-file chunk count. Root cause in the rTorrent XMLRPC layer not fully isolated (the query code looked structurally correct). |
 | Polish: "Unsaved view" always on | **Fixed** | Three compounding bugs, found by instrumenting the actual runtime values: (1) key-order-sensitive `JSON.stringify` comparison; (2) the debounced search effect in `FilterBar` fires once on mount even with empty input, adding a real `offset: 0` key to `params` that `cleanParams` wasn't stripping (`offset`/`limit` are pagination position, not filter identity); (3) the server round-trips a saved view's unset fields as JSON `null`, which `cleanParams`'s `undefined`/`''` check didn't catch. Verified: badge is off on a pristine load and on with a real filter applied. |

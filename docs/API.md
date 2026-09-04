@@ -16,6 +16,12 @@ calls onto one native model. Endpoint availability does not by itself mean full
 semantic parity; current native, partial, compatibility-only, and gap status is
 tracked in [CLIENT_COMPATIBILITY_MATRICES.md](CLIENT_COMPATIBILITY_MATRICES.md).
 
+The machine-readable contract for the native REST surface is
+[API.openapi.json](API.openapi.json). It is intentionally scoped to the
+implemented `/api/v1` surface; qBittorrent, Transmission, Deluge, and rTorrent
+compatibility method matrices remain documented separately because their wire
+contracts are client-specific.
+
 For engine selection and native-vs-rTorrent behavior, see
 [ENGINE_REWRITE.md](ENGINE_REWRITE.md).
 
@@ -30,8 +36,9 @@ Authorization: Bearer <token>
 Cookie: tng_session=<token>
 ```
 
-Public endpoints (never require auth): `/health`, `/metrics`,
-`/api/v1/auth/login`, `/api/qb/v2/auth/login`
+Public endpoints (never require auth): `/health`, the login/logout endpoints,
+and the WebUI/static paths. `/metrics` is protected when API tokens are
+configured; it is not a public exception.
 
 ## Request Correlation
 
@@ -63,10 +70,13 @@ capabilities. Adapter capability flags cover tags, categories, file priority,
 tracker edit, recheck, torrent export, webseed reads, piece state/hash reads,
 peer snapshots, explicit peer add/ban, queue ordering, per-torrent/global/share
 limits, qBittorrent-style mode flags, location updates, torrent/file renames,
-runtime user-agent changes, rTorrent config overlay, and backend restart. Where
+and runtime user-agent changes. Native mode supports the user-agent mutation;
+configuration overlays and backend restart remain supervisor-owned/unsupported.
+Where
 a flag is false, native/backend endpoints return an explicit unsupported result
 or the documented compatibility empty response instead of pretending mutation
-success.
+success. A compatibility facade may retain a projection-only setting for a
+client, but that does not mean the native engine applies it.
 
 The `engine.track1_sidecar_required` field is always `false` for native-engine
 mode; Track 1 remains a migration/facade layer, not a runtime dependency for
@@ -88,10 +98,10 @@ the rewritten engine.
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET`  | `/api/v1/torrents` | List torrents with filter/sort/page |
-| `POST` | `/api/v1/torrents` | Add torrent (multipart: `torrent` file or `magnet` URL, `save_path`, `category`, `start`) |
+| `POST` | `/api/v1/torrents` | Add torrent as JSON (`torrent_b64` or `magnet`, `save_path`, optional `category`, `tags`, `start`) |
 | `GET`  | `/api/v1/torrents/:hash` | Get single torrent by hash |
 | `PUT`  | `/api/v1/torrents/:hash` | Update torrent metadata (`{ name, save_path }`; at least one required) |
-| `DELETE` | `/api/v1/torrents/:hash` | Remove torrent (`?delete_files=true` to also delete data) |
+| `DELETE` | `/api/v1/torrents/:hash` | Remove torrent (`?delete_files=true` queues an asynchronous payload delete and returns `{ job_id, state }`; otherwise `204`) |
 | `POST` | `/api/v1/torrents/:hash/start` | Start torrent |
 | `POST` | `/api/v1/torrents/:hash/resume` | Resume torrent (alias of `start`) |
 | `POST` | `/api/v1/torrents/:hash/stop` | Stop torrent |
@@ -142,11 +152,23 @@ restart pagination without that cursor. Without a cursor, a recent snapshot may
 be reused for up to 750 ms to prevent concurrent list callers from repeatedly
 scanning live actor state.
 
+This snapshot contract applies to native-engine mode. In Track 1 sidecar mode
+the same route reads the local SQLite projection and returns the bounded
+`{ total, torrents }` envelope without a native snapshot token; it is
+eventually consistent with the selected backend. Sidecar callers must not use
+`offset` pagination as if it were an immutable multi-request snapshot.
+
 `GET /api/v1/events` emits `torrent_delta` events with a `cursor` field equal to
-the registry revision. The first event is a snapshot; later events contain only
-mutated or removed torrents from the bounded mutation journal. A reconnect with
-`last_known_revision` resumes from that cursor. If the journal has expired, the
-next event is a one-time full snapshot resync.
+the registry revision. The initial snapshot is emitted in bounded chunks
+(default 500 summaries, maximum 1,000) at one revision. Initial events set
+`snapshot: true`; the final chunk also sets `snapshot_complete: true`. Later
+events contain only mutated or removed torrents from the bounded mutation
+journal. A reconnect with `last_known_revision` resumes from that cursor. If
+the journal has expired, the next event is a one-time bounded snapshot resync.
+
+After the first generation, list snapshot refreshes use the mutation journal
+when it still covers the cached revision; the server falls back to a full
+registry projection only when the journal or base snapshot is unavailable.
 
 `PUT /api/v1/torrents/:hash` returns `202 Accepted` with `{ job_id, state }`
 when changing `save_path` requires a filesystem move. The move is executed by
@@ -164,12 +186,21 @@ full compatibility responses still charge for and materialize the requested
 output. Snapshot caching avoids repeated registry clones, and `sync/maindata`
 uses the registry mutation journal for retained revisions.
 
+The sidecar qBittorrent compatibility `sync/maindata` response is capped at
+10,000 changed torrents because that upstream method has no page or snapshot
+parameter. It returns `413 Payload Too Large` rather than claiming a complete
+but truncated full or incremental update; use the native paged API for larger
+collections.
+
 The Deluge facade applies the same budget to `web.update_ui`,
 `core.get_torrents_status`, and `core.get_torrent_status`.
 The Transmission facade applies it to `torrent-get`, scaled by torrent count
 and requested field count. The rTorrent XMLRPC facade applies it to
 `d.multicall`/`d.multicall2`, scaled by torrent count and requested command
-count.
+count. Deluge/Transmission full-list compatibility calls and rTorrent
+`d.multicall` reject responses over 10,000 torrents because those upstream
+contracts do not provide a range or snapshot cursor; use the native paged API
+for large collections.
 
 #### TorrentRow fields
 
@@ -230,11 +261,11 @@ Notes:
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/v1/storage` | List configured storage roots with total/used/free bytes, readonly status, and per-root errors |
-| `POST` | `/api/v1/storage/plan` | Preview move/import/delete storage plans (`{ operation, source, destination, target, bytes, available_bytes, hardlink_or_copy, roots, completed_steps }`); import uses staged copy unless `hardlink_or_copy` allows same-filesystem hardlinks, and completed-step resume indexes are validated against the generated plan |
-| `POST` | `/api/v1/storage/execute` | Execute a root-confined move/import/delete storage plan through durable engine storage-plan jobs; execution uses server-configured storage roots and ignores any client-supplied `roots` (delete execution also uses `dry_run_approved`; `completed_steps` resumes only validated plan steps from the matching previewed plan) |
-| `GET` | `/api/v1/tracker-health` | Aggregate cached torrents by tracker URL with torrent/active/complete/error/peer counts |
+| `POST` | `/api/v1/storage/plan` | Preview move/import/delete storage plans (`{ operation, source, destination, target, bytes, available_bytes, hardlink_or_copy, roots, affected_torrents, completed_steps }`); import uses staged copy unless `hardlink_or_copy` allows same-filesystem hardlinks, and completed-step resume indexes are validated against the generated plan |
+| `POST` | `/api/v1/storage/execute` | Execute a root-confined move/import/delete storage plan through durable engine storage-plan jobs; execution uses server-configured storage roots and ignores any client-supplied `roots` (move/delete require non-empty `affected_torrents` containing existing torrent hashes so live payload owners can be quiesced; import may omit it; `completed_steps` resumes only validated plan steps from the matching previewed plan). A save-path move is reported as `commit_pending` after filesystem completion until the engine publishes the new path to the durable torrent row; it is not terminal and is recovered after a crash. |
+| `GET` | `/api/v1/tracker-health` | Aggregate durable tracker rows by tracker URL with torrent/active/complete/error/peer counts; `peer_count` is the tracker-reported peer/leecher count, not the number of currently connected local sessions |
 | `GET` | `/api/v1/engine` | Runtime backend type/capabilities plus rTorrent provenance, XMLRPC probes, tracker-stack telemetry, and profile drift when the selected backend is rTorrent |
-| `GET` | `/api/v1/engine/commands` | Full XMLRPC command index exposed by the running rTorrent build; rTorrent-only |
+| `GET` | `/api/v1/engine/commands` | Full XMLRPC command index when the rTorrent facade is selected; native mode returns explicit `501 NOT_IMPLEMENTED` |
 | `POST` | `/api/v1/cross-seed` | Preview/apply cross-seed helper (`{ hashes, trackers, reannounce, dry_run }`) |
 
 ### Saved Views
@@ -260,7 +291,7 @@ Notes:
 |---|---|---|
 | `GET` | `/api/v1/workflows` | List workflow rules |
 | `POST` | `/api/v1/workflows` | Create/update workflow rule for `completed`, `added`, or `category_changed` events |
-| `POST` | `/api/v1/workflows/:id` | Run workflow rule (`{ dry_run }`); native actions and webhook POST actions execute, script actions require `[workflows].allow_scripts=true` and pass the configured directory allowlist |
+| `POST` | `/api/v1/workflows/:id` | Run workflow rule (`{ dry_run }`); native category/location actions execute. Native webhook and script actions are recorded as unsupported; the sidecar/rTorrent integration may execute them only when its own backend/configuration allows it |
 | `DELETE` | `/api/v1/workflows/:id` | Delete workflow rule |
 | `GET` | `/api/v1/workflow-runs` | List the most recent workflow run audit records, capped to the latest 200 |
 
@@ -271,7 +302,7 @@ Notes:
 | `GET` | `/api/v1/rss-rules` | List RSS automation rules |
 | `POST` | `/api/v1/rss-rules` | Create/update RSS rule (`{ id, name, enabled, feed_url, include, exclude, category, save_path, tags, start }`) |
 | `POST` | `/api/v1/rss-rules/test` | Test a sample `{ title, link }` against configured rules |
-| `POST` | `/api/v1/rss-rules/apply` | Preview or apply a sample `{ title, link, dry_run }`; real runs submit matched links with rule category/save path/start settings |
+| `POST` | `/api/v1/rss-rules/apply` | Preview or apply a sample `{ title, link, dry_run }`; native runs accept magnet links through the engine. HTTP torrent downloads are sidecar-only and unsupported in native mode |
 | `DELETE` | `/api/v1/rss-rules/:id` | Delete RSS rule |
 
 ### Bulk operations
@@ -296,7 +327,7 @@ Pass `dry_run: true` to preview what would be affected without making changes.
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET`  | `/api/v1/settings/user-agent` | Get current runtime user-agent string when supported by the selected backend |
-| `PUT`  | `/api/v1/settings/user-agent` | Set user-agent (`{ user_agent: "..." }`) when supported; rTorrent packaged builds apply it immediately |
+| `PUT`  | `/api/v1/settings/user-agent` | Set user-agent (`{ user_agent: "..." }`) when supported; native mode persists and applies it through the engine, while rTorrent behavior depends on its packaged build |
 
 ### Infrastructure
 
@@ -315,6 +346,12 @@ When configured with `backend.type = "torrentng"`, the sidecar forwards torrent 
 { "type": "torrent_removed", "hash": "abc123" }
 { "type": "stats", "upload_speed": 1048576, "download_speed": 524288 }
 ```
+
+If a client falls behind the bounded event buffer, the sidecar emits a
+resync_required event with reason event_stream_lagged and the number of
+dropped events. The client must refresh its bounded torrent list; event
+delivery is not a durable replay protocol. A socket that cannot accept a
+message for five seconds is closed.
 
 ---
 
@@ -336,36 +373,27 @@ Implements the qBittorrent Web API v2. By default it advertises qBittorrent `5.0
 | `GET` | `/api/qb/v2/app/version` |
 | `GET` | `/api/qb/v2/app/webapiVersion` |
 | `GET` | `/api/qb/v2/app/buildInfo` |
-| `GET` | `/api/qb/v2/app/preferences` | Includes queue defaults plus backend-derived `dht`/`pex` status when known and `network_http_user_agent` when supported |
+| `GET` | `/api/qb/v2/app/preferences` | Includes queue defaults plus backend-derived `dht`/`pex` status when known and `network_http_user_agent` when supported; native-engine preferences, cookies, and API-key state are durable |
 | `GET` | `/api/qb/v2/app/defaultSavePath` |
-| `POST` | `/api/qb/v2/app/setPreferences` | Form: `json` preference object; applies `dht`, `pex`, and `network_http_user_agent` when backend-supported; unsupported keys are accepted and ignored |
-| `GET` | `/api/qb/v2/app/getCookies` | Returns facade-stored cookie objects sorted by host/name |
-| `POST` | `/api/qb/v2/app/setCookies` | Accepts JSON array, `{ "cookies": [...] }`, or form `cookies=<json array>` |
-| `POST` | `/api/qb/v2/app/rotateAPIKey` | Stores and returns a generated facade API key as `{ "apiKey": "..." }` |
+| `POST` | `/api/qb/v2/app/setPreferences` | Form: `json` preference object; native-engine mode applies `dht`, `pex`, and the supported user-agent setting; other accepted keys are compatibility-only facade overrides and are not runtime enforcement unless the capability manifest says so |
+| `GET` | `/api/qb/v2/app/getCookies` | Returns durable facade-stored cookie objects sorted by host/name when the engine is attached; no-engine instances are process-local |
+| `POST` | `/api/qb/v2/app/setCookies` | Accepts JSON array, `{ "cookies": [...] }`, or form `cookies=<json array>`; bounded and durable when the engine is attached |
+| `POST` | `/api/qb/v2/app/rotateAPIKey` | Stores and returns a generated facade API key as `{ "apiKey": "..." }`; this is compatibility state, not an authentication credential |
 | `POST` | `/api/qb/v2/app/deleteAPIKey` | Clears the facade API key |
 
 ### Torrents
 
 | Method | Path | Notes |
 |--------|------|-------|
-| `GET`  | `/api/qb/v2/torrents/info` | Filter params: `filter`, `category`, `tag`, `sort`, `reverse`, `limit`, `offset`, optional `snapshot`; returns `X-TorrentNG-Snapshot` for stable offset pagination |
+| `GET`  | `/api/qb/v2/torrents/info` | Filter params: `filter`, `category`, `tag`, `sort`, `reverse`, `limit`, `offset`, optional `snapshot`; default `limit` is 200 and the native facade clamps it to 5,000; returns `X-TorrentNG-Snapshot` for stable offset pagination |
 | `GET`  | `/api/qb/v2/torrents/properties` | Query: `hash`; returns cached torrent properties |
 | `POST` | `/api/qb/v2/torrents/add` | Multipart: `urls`, `savepath`, `category`, `tags`, `paused`, `stopped`, `skip_checking`, `autoTMM`, `contentLayout`, `ratioLimit`, `seedingTimeLimit`, `torrents` (file) |
 | `POST` | `/api/qb/v2/torrents/pause` / `/stop` | Form: `hashes` (pipe-separated or `all`) |
 | `POST` | `/api/qb/v2/torrents/resume` / `/start` | Form: `hashes` |
 | `POST` | `/api/qb/v2/torrents/delete` | Form: `hashes`, `deleteFiles` |
-
-For a response containing more than 200 torrents, the native qBittorrent
-facade does not issue per-torrent actor queries for transient tracker, swarm,
-queue, and limit fields. Those fields use compatibility defaults for that
-large projection; durable torrent fields and aggregate transfer statistics
-remain available. This cutoff prevents a 100k-row request from becoming
-100k sequential engine-actor round trips. Small interactive pages retain the
-live projections.
 | `POST` | `/api/qb/v2/torrents/recheck` | Form: `hashes` |
 | `POST` | `/api/qb/v2/torrents/reannounce` | Form: `hashes` |
 | `GET`  | `/api/qb/v2/torrents/trackers` | Query: `hash` |
-| `GET`  | `/api/qb/v2/torrents/export` | Query: `hash`; streams the persisted `.torrent` blob where supported |
 | `GET`  | `/api/qb/v2/torrents/webseeds` | Query: `hash`; backend-backed where supported, otherwise `[]` |
 | `GET`  | `/api/qb/v2/torrents/files` | Query: `hash` |
 | `GET`  | `/api/qb/v2/torrents/pieceStates` | Query: `hash`; backend-backed where supported, otherwise `[]` |
@@ -408,11 +436,35 @@ live projections.
 | `POST` | `/api/qb/v2/torrents/setSuperSeeding` | Backend-backed where supported |
 | `POST` | `/api/qb/v2/torrents/toggleFirstLastPiecePrio` | Backend-backed where supported |
 
+For a response containing more than 200 torrents, the native qBittorrent
+facade does not issue per-torrent actor queries for transient tracker, swarm,
+queue, and limit fields. Those fields use compatibility defaults for that
+large projection; durable torrent fields and aggregate transfer statistics
+remain available. This cutoff prevents a large request from becoming one
+sequential engine-actor round trip per torrent. Small interactive pages retain
+the live projections. Explicitly requesting a large page still serializes that
+page, so callers should use bounded pages and a pinned snapshot rather than
+treating this endpoint as an unbounded export.
+
+`POST /api/qb/v2/app/shutdown` requests graceful daemon shutdown when the
+native daemon wires the facade's shutdown notifier. `sendTestEmail` is exposed
+for method compatibility but returns `501 Not Implemented`.
+
+In native-engine mode, qBittorrent mode mutations that have no equivalent
+runtime behavior (`setAutoTMM`, `setAutoManagement`, and `setForceStart`) return
+`501 Not Implemented`. Queue order, sequential/first-last selection,
+super-seeding, limits, categories, tags, and bans use the engine paths
+documented by the capability manifest.
+
+qBittorrent tag mutators reject empty or dropped comma-separated segments;
+`setTags` may use an empty value to clear all tags. Legacy compatibility
+mutators do not silently discard malformed values.
+
 ### Sync / Transfer
 
 | Method | Path |
 |--------|------|
-| `GET` | `/api/qb/v2/sync/maindata` | Full (`rid=0`) and registry-revision incremental (`rid>0`) torrent updates; retained revisions return only changed torrents and removals, stale revisions fall back to a full update; includes current `categories` map and `tags` list |
+| `GET` | `/api/qb/v2/sync/maindata` | Full (`rid=0`) and registry-revision incremental (`rid>0`) torrent updates; retained revisions return only changed torrents and removals, while native stale revisions fall back to a full update; includes current `categories` map and `tags` list. In sidecar mode `rid` is a durable SQLite revision with bounded deletion tombstones; stale or over-limit deltas return `413`, and full responses over 10,000 torrents also return `413` because qBit provides no page/cursor contract. |
 | `GET` | `/api/qb/v2/transfer/info` | Returns aggregate rates plus current global speed-limit state |
 | `GET` | `/api/qb/v2/transfer/speedLimitsMode` | Returns `1` when alternate/global speed-limit mode is enabled, otherwise `0` |
 | `POST` | `/api/qb/v2/transfer/toggleSpeedLimitsMode` | Toggles backend global speed-limit mode where supported |
@@ -422,9 +474,38 @@ live projections.
 | `POST` | `/api/qb/v2/transfer/setUploadLimit` | Form: `limit`; backend-backed where supported |
 | `POST` | `/api/qb/v2/transfer/banPeers` | Backend-backed where supported; native qB facade also persists banned peers into `app/preferences.banned_ips` |
 
+### Compatibility failure semantics
+
+The native Deluge and Transmission facades require an attached engine for
+engine-backed mutations. Empty-target lifecycle requests remain successful for
+client compatibility; non-empty requests without an engine return an explicit
+error. Deluge path-based torrent loads, plugin/configuration writes, and
+notification writes are rejected. Transmission `session-close` requests
+graceful daemon shutdown when the native daemon wires its supervisor notifier;
+port testing is unavailable;
+its free-space response probes healthy configured native storage roots. The
+native rTorrent library boundary accepts embedded raw metainfo and magnets but
+rejects unsafe path-based loads. These boundaries prevent a facade response
+from implying that a torrent mutation or filesystem operation was applied when
+it was not.
+
+### Pure-v2 boundary
+
+Pure-v2 torrents are an explicit partial-support boundary, not a hidden
+capability claim. Native parsing, storage projection, file-root recheck, and
+metadata placeholders are supported. Pure-v2 metadata completion, peer
+transfer, and tracker lifecycle are not implemented and return explicit
+unsupported errors (HTTP maps these to `501 Not Implemented` where the
+operation is exposed). The native capability manifest reports completion and
+transfer as unsupported. This remains intentional until there is a complete
+v2 piece-transfer, peer-wire, and tracker design with independent evidence.
+
+The rTorrent facade follows the same boundary and is a library-only entry
+point; see [RTORRENT_LIBRARY_API.md](RTORRENT_LIBRARY_API.md).
+
 ### Log / Search / RSS
 
-These compatibility endpoints are present so qBittorrent clients can probe them safely. Search keeps plugin and job lifecycle state while returning inert local result sets; RSS keeps in-memory folder, feed, and rule mutation state and can later project native RSS rules.
+These compatibility endpoints are present so qBittorrent clients can probe them safely. Search keeps plugin and job lifecycle state while returning inert local result sets. RSS folder, feed, and rule state is durable through the engine settings store when the native engine is attached; no-engine test/facade instances use process-local state. RSS automation is limited to the documented native magnet path; unsupported external actions fail explicitly.
 
 | Method | Path | Notes |
 |--------|------|-------|
@@ -444,10 +525,10 @@ These compatibility endpoints are present so qBittorrent clients can probe them 
 | `GET` | `/api/qb/v2/rss/items` | Returns compatibility folder/feed state |
 | `GET` | `/api/qb/v2/rss/rules` | Returns compatibility qBit-shaped rule map |
 | `GET` | `/api/qb/v2/rss/matchingArticles` | Returns known rule names |
-| `POST` | `/api/qb/v2/rss/setRule` | Creates/updates compatibility RSS rule JSON |
+| `POST` | `/api/qb/v2/rss/setRule` | Creates/updates bounded RSS rule JSON; state is durable with the native engine attached |
 | `POST` | `/api/qb/v2/rss/renameRule` | Renames compatibility RSS rule |
 | `POST` | `/api/qb/v2/rss/removeRule` | Deletes compatibility RSS rule |
-| `POST` | `/api/qb/v2/rss/addFolder`, `/addFeed`, `/removeItem`, `/moveItem`, `/markAsRead`, `/refreshItem` | Maintains qBit-shaped compatibility folder/feed item state |
+| `POST` | `/api/qb/v2/rss/addFolder`, `/addFeed`, `/removeItem`, `/moveItem`, `/markAsRead`, `/refreshItem` | Maintains bounded qBit-shaped folder/feed item state, durable with the native engine attached and process-local otherwise |
 
 ---
 
@@ -474,10 +555,12 @@ backend adapter.
 | `torrentng_{download,upload}_rate_bytes_per_second` | gauge | Aggregate current peer transfer rates; served from the cached native engine stats snapshot |
 | `torrentng_peers_connected` | gauge | Connected peers across all torrents |
 | `torrentng_storage_jobs_{inflight,queue_depth,capacity}` | gauge | Retained requests, pending dispatcher-channel requests, and end-to-end capacity for durable storage-plan background work |
+| `torrentng_storage_workers_healthy` | gauge | Storage-job supervisor health (`1` healthy, `0` unhealthy); an unhealthy value means new durable storage work cannot be trusted |
 | `torrentng_storage_workers` | gauge | Configured blocking storage worker count |
 | `torrentng_api_snapshot_refreshes_total` | counter | Immutable API snapshot generations built across native and qBittorrent facades |
+| `torrentng_api_snapshot_incremental_updates_total` | counter | Snapshot generations advanced from retained registry mutation-journal changes |
 | `torrentng_api_snapshot_expired_total` | counter | Pagination cursors rejected because their immutable snapshot expired |
-| `torrentng_api_sse_{resyncs,events}_total` | counter | SSE journal-expiry resyncs and emitted torrent-delta events |
+| `torrentng_api_sse_{resyncs,events,lagged,disconnects}_total` | counter | SSE journal-expiry resyncs, emitted torrent-delta events, delayed stream polls, and dropped stream instances |
 | `torrentng_api_sse_clients` | gauge | Active native SSE clients |
 | `torrentng_api_response_bytes_estimated_total` | counter | Estimated bytes emitted by bounded list and SSE responses; an estimate, not wire accounting |
 | `torrentng_dht_*` | gauge | Native DHT routing table, lookup, tracked torrent, and announced peer cache counts |

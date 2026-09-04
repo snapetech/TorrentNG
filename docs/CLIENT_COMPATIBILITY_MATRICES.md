@@ -34,7 +34,7 @@ Status legend:
 | Status | Meaning |
 |---|---|
 | Native | Backed by TorrentNG engine/session behavior |
-| Compat | API shape is accepted and returns a client-compatible result; may be no-op if the feature has no native equivalent |
+| Compat | API shape is accepted with a client-compatible projection; a feature with no native equivalent is either a documented read-only/projection surface or returns an explicit unsupported result |
 | Partial | Useful behavior exists, but fields, persistence, filtering, or error shape is incomplete |
 | Gap | Not implemented |
 | Test gap | Behavior exists, but matrix/certification coverage is missing or too shallow |
@@ -52,11 +52,30 @@ Universal compatibility release rule:
 - Every wire-level claim must be backed by interop evidence against at least one
   independent client.
 
+Collection-size caveat: Deluge and Transmission compatibility list calls, plus
+rTorrent `d.multicall`, are full-list upstream operations with no range or
+snapshot cursor. TorrentNG bounds those legacy responses at 10,000 entries and
+returns an explicit error above that limit; native REST/qBittorrent pagination
+is the supported large-collection path. The sidecar keeps the same distinction
+and does not label a locally sliced full-list response as bounded sync.
+
+## Current disposition (2026-09-04)
+
+All repository-actionable P0/P1 implementation rows in this matrix have a
+native or explicitly compatibility-shaped path, focused tests, and a local
+certification artifact. Rows described as `Partial` in the historical feature
+vocabulary identify projection depth or deliberately limited compatibility;
+they are not a silent claim of full upstream parity. Remaining work is
+qualification against real public clients, live plugin behavior, public swarm
+traffic, and larger corpus/load evidence. Pure-v2 transfer/completion and
+unsupported plugin or option mutations remain deliberate non-goals and must
+continue to return explicit unsupported results.
+
 ## 1. Feature Matrix
 
 | Capability | qBittorrent | Transmission | Deluge | rTorrent | TorrentNG status | Required certification rows |
 |---|---|---|---|---|---|---|
-| Add `.torrent` | Web API multipart | `torrent_add` metainfo | `core.add_torrent_file`, `web.add_torrents` | `load.*` commands | Native through qBit, Transmission, Deluge facades; rTorrent XMLRPC accepts path/raw load shapes and projects registry state | Add file via every facade; verify native list and payload |
+| Add `.torrent` | Web API multipart | `torrent_add` metainfo | `core.add_torrent_file`, `web.add_torrents` | `load.*` commands | Native through qBit, Transmission, and Deluge facades; rTorrent XMLRPC accepts embedded raw metainfo, while unsafe path-based loads are rejected at the direct library boundary | Add file via every facade; verify native list and payload |
 | Add magnet | `torrents/add urls=magnet` | `torrent_add filename=magnet` | `core.add_torrent_magnet` | `load.normal` magnet-capable builds/scripts | Native through qBit, Transmission, Deluge facades; rTorrent XMLRPC accepts magnet load | Magnet with tracker, magnet metadata fetch, DHT-only magnet |
 | Pause/resume/start/stop | pause/resume plus v5 start/stop | start/start_now/stop | pause/resume | `d.stop`, `d.start` | Native where engine attached; registry fallback for reads | Per-facade lifecycle transition assertions |
 | Remove torrent | delete with optional data | torrent_remove | core.remove_torrent | `d.erase` | Native through qBit/Transmission/Deluge | Remove torrent-only and remove-with-data rows |
@@ -74,7 +93,7 @@ Universal compatibility release rule:
 | Per-torrent speed limits | torrent limit endpoints | torrent_set limits | set_torrent_options | throttle commands | Native/Compat through qBit, Transmission, Deluge, rTorrent, and native REST `/api/v1/torrents/:hash/limits`; native request pacing applies per-torrent download ceilings and peer upload responses honor upload ceilings, including live updates to connected peers | Per-torrent limit mutation/projection row plus engine request pacing |
 | Sequential/first-last | qBit toggles | 4.1 sequential fields | options/prioritize first-last | client-specific | Mutation/projection implemented where facades expose the fields; native picker honors sequential mode for running torrents; first/last maps through priority pieces | Assert accepted plus picker behavior |
 | Super seeding | qBit setSuperSeeding | seed mode fields | super_seeding option | supported in rTorrent | Mutation/projection implemented as torrent limit state; native peer-wire behavior limits initial piece visibility for complete seeders and suppresses blanket Have broadcasts | API acceptance plus projection row and peer-wire visibility tests |
-| RSS | qBit RSS API | none core | plugin ecosystem | ruTorrent plugins | qBit stateful in-memory compatibility for folders, feeds, and rules | RSS API shape and mutation tests |
+| RSS | qBit RSS API | none core | plugin ecosystem | ruTorrent plugins | qBit-shaped folders, feeds, and rules are bounded and durable with the native engine attached; no-engine facade instances are process-local; native automation accepts the documented magnet path only | RSS API shape, persistence, and unsupported-action tests |
 | Search | qBit search API | none core | plugin ecosystem | ruTorrent plugins | qBit and sidecar stateful plugin/job compatibility with inert local result sets | Search API shape and lifecycle tests |
 | Logs | qBit log endpoints | none core | events | log files | qBit main log backed by retained app/session events and peer log projects native peer snapshots when an engine is attached; Deluge events basic | Log/event shape tests |
 | Session stats | transfer/info, sync | session_stats | session_status/stats | global commands | Native counters; qBit, Transmission, and Deluge session rates aggregate native peer snapshots where available | Cross-facade stats consistency row |
@@ -124,9 +143,9 @@ Local implementation: `crates/rt-api-qbit`.
 | Group | Upstream API points | TorrentNG points | Status | Test rows |
 |---|---|---|---|---|
 | Auth | `auth/login`, `auth/logout` | Same | Compat | Login/logout status and `SID` cookie shape |
-| App info | `app/version`, `webapiVersion`, `buildInfo`, `preferences`, `setPreferences`, `shutdown`, `sendTestEmail`, `getCookies`, `setCookies`, `rotateAPIKey`, `deleteAPIKey`, `networkInterfaceList`, `networkInterfaceAddressList`, `defaultSavePath` | Same | Native/Compat mix; preferences, cookies, and API-key lifecycle round-trip in facade state | Probe every endpoint plus preference/cookie/API-key persistence |
+| App info | `app/version`, `webapiVersion`, `buildInfo`, `preferences`, `setPreferences`, `shutdown`, `sendTestEmail`, `getCookies`, `setCookies`, `rotateAPIKey`, `deleteAPIKey`, `networkInterfaceList`, `networkInterfaceAddressList`, `defaultSavePath` | Same | Native/Compat mix; dht/pex preferences are engine-applied in native daemon mode, other broad preference keys are projection-only, shutdown is wired to daemon signal handling, and test email is explicit `501` unsupported | Probe every endpoint plus preference/cookie/API-key persistence |
 | Backend capability manifest | n/a | `/api/v1/engine` backend capabilities | Native | Capability flags enumerate every backend-dependent read/mutation surface: export, webseed/piece/peer reads, peer add/ban, queue order, limits, mode flags, location/rename, runtime user-agent, rTorrent overlay, and restart |
-| Torrent list/add | `torrents/info`, `torrents/add` | Same | Native | Add magnet/file, list filters/sort/category/tag/hash |
+| Torrent list/add | `torrents/info`, `torrents/add` | Same | Native | Add magnet/file, list filters/sort/category/tag/hash; malformed or unknown add fields fail closed, while unsupported meaningful options return `501` rather than being ignored |
 | Torrent lifecycle | `pause`, `resume`, `start`, `stop`, `delete`, `recheck`, `reannounce` | Same | Native | Lifecycle transition per endpoint; qBittorrent list state projects active recheck jobs as checking |
 | Torrent trackers/peers | `trackers`, `addTrackers`, `editTracker`, `removeTrackers`, `addPeers` | Same | Native/Compat; persisted engine tracker rows project status, message, scrape counts, and live peer rows where available | Tracker mutation and explicit peer row |
 | Torrent files/pieces | `files`, `webseeds`, `pieceStates`, `pieceHashes`, `export`, `filePrio` | Same | Native/Compat | File priority, wanted state, per-file progress, and piece state are engine-backed; `export` returns the persisted raw `.torrent` bytes for known torrents with stored metadata |
@@ -134,7 +153,7 @@ Local implementation: `crates/rt-api-qbit`.
 | Properties | `properties` | Same | Native/Compat | Full property key presence row; registry counters/lifecycle and engine metadata project the documented properties object |
 | Categories | `categories`, `createCategory`, `editCategory`, `removeCategories`, `setCategory` | Same | Native/Compat; configured category save paths apply on set | Category create/edit/remove/set row |
 | Tags | `tags`, `createTags`, `deleteTags`, `addTags`, `setTags`, `removeTags` | Same | Native/Compat; global tags persist and clean up when unused | Tags global and per-torrent row |
-| Limits/modes | `downloadLimit`, `setDownloadLimit`, `uploadLimit`, `setUploadLimit`, `setShareLimits`, `setForceStart`, `setSuperSeeding`, `setAutoTMM`, `setAutoManagement`, `toggleSequentialDownload`, `toggleFirstLastPiecePrio` | Same | Native/Compat | Limit read/write and qBit mode mutations are backend-backed where the selected backend exposes equivalent behavior; unavailable backend modes return compatible success with logged unsupported detail |
+| Limits/modes | `downloadLimit`, `setDownloadLimit`, `uploadLimit`, `setUploadLimit`, `setShareLimits`, `setForceStart`, `setSuperSeeding`, `setAutoTMM`, `setAutoManagement`, `toggleSequentialDownload`, `toggleFirstLastPiecePrio` | Same | Native/Compat | Limits and implemented picker/seed modes are engine-backed. Native-engine mode flags without an equivalent runtime behavior return explicit `501` unsupported results; they are not reported as successful no-ops. |
 | Sync | `sync/maindata`, `sync/torrentPeers` | Same | Native/Compat; maindata includes broad torrent/server-state keys, torrentPeers has qBit peer shape, live tracker digests, and stable RID deltas | Full sync, delta sync, peer sync row |
 | Transfer | `transfer/info`, download/upload limits, speed limits mode, toggle, setters, `banPeers` | Same | Native/Compat | Global limits round-trip; native qB facade persists `banPeers` into `app/preferences.banned_ips`, and sidecar routes bans to backends that support them |
 | Logs | `log/main`, `log/peers` | Same | Native/Compat | Main log projects retained native session events, sidecar app events, and optional ingested rTorrent logs with qBit severity filters; peer log projects native/qB backend peer snapshots where supported |
@@ -145,7 +164,7 @@ qBittorrent field backlog:
 
 | Surface | Fields to audit exhaustively | Current risk |
 |---|---|---|
-| `app/preferences` | Broad current/legacy WebUI preference key set across paths, queueing, BitTorrent, WebUI, RSS, proxy, and advanced settings | Implemented compatibility defaults plus in-memory `setPreferences` persistence for arbitrary qBit preference keys |
+| `app/preferences` | Broad current/legacy WebUI preference key set across paths, queueing, BitTorrent, WebUI, RSS, proxy, and advanced settings | Compatibility defaults plus facade persistence for arbitrary keys; only settings listed as engine-backed in the capability manifest are runtime enforcement |
 | `torrents/info` | Core list fields plus modern path, session counter, lifecycle, limit, mode, magnet, infohash, and native-backed live swarm counters/rates | Implemented compatibility breadth for common remote-app columns |
 | `torrents/properties` | Full properties object | Implemented key set with registry/engine-backed counters, lifecycle times, piece counts, and per-torrent limits where available |
 | `sync/maindata` / `sync/torrentPeers` | Server state, categories, tags, torrents, trackers, peers | Broad torrent/server-state key sets and peer shape/RID stability are matrix-tested; RID and torrent-row tracker/count projection include live tracker snapshot changes when native engine state is attached |
@@ -159,15 +178,15 @@ kebab/camel calls and normalizes Transmission 4.1 snake_case calls.
 |---|---|---|---|
 | JSON-RPC shape | JSON-RPC 2.0, snake_case names; old bespoke RPC deprecated but still common | Compat: JSON-RPC 2.0 single and batch requests, `params`, direct `result`, error object, snake_case names/keys; old envelope remains supported | JSON-RPC 2.0 envelope row, batch row, old envelope row, CSRF header row |
 | Torrent accessor | `torrent_get` with `objects` and `table` formats, `recently_active` removed list | Compat: objects, table rows, and empty removed list supported | All-field object row; table format row; recently-active row |
-| Torrent mutator | `torrent_set` | Compat/native mix; labels, location, speed limits, peer limits, seed limits, and sequential mode project after mutation | Per-field mutation acceptance and projection |
+| Torrent mutator | `torrent_set` | Compat/native mix; labels, location, speed limits, peer limits, seed limits, and sequential mode project after mutation; operations that have no native equivalent return an explicit error rather than a false success | Per-field mutation acceptance and projection |
 | Torrent add | `torrent_add` | Native for magnet/metainfo/download dir/paused/labels | Magnet, metainfo, duplicate, invalid metainfo rows |
 | Torrent actions | `torrent_start`, `torrent_start_now`, `torrent_stop`, `torrent_verify`, `torrent_reannounce`, `torrent_remove` | Native | Lifecycle action rows |
 | Torrent location/rename | `torrent_set_location`, `torrent_rename_path` | Native/Compat; download directory and file rename mutations update registry state and preserve parent paths | Move and rename row |
 | File controls | `torrent_set_file_priorities`, `torrent_set_file_wanted`, `torrent_set_file_unwanted` | Native | File selection row |
 | Trackers | `torrent_set_tracker_list` | Native | Tracker list row |
 | Queue | `queue_move_top`, `queue_move_up`, `queue_move_down`, `queue_move_bottom` | Native | Queue row |
-| Session | `session_get`, `session_set`, `session_stats`, `session_close`, `session_access_control`, `session_subscribe`, `session_unsubscribe` | Compat/native mix; `session_get` field projection supported and broad mutable settings plus notification subscriptions roundtrip in facade state | Session fields, mutable settings, and notification subscription row |
-| Utilities | `blocklist_update`, `port_test`, `free_space` | Compat | Utility shape row |
+| Session | `session_get`, `session_set`, `session_stats`, `session_close`, `session_access_control`, `session_subscribe`, `session_unsubscribe` | Compat/native mix; `session_get` field projection supported, broad mutable settings plus notification subscriptions roundtrip in facade state, and native-daemon `session_close` signals graceful supervisor shutdown | Session fields, mutable settings, notification subscription, and shutdown propagation rows |
+| Utilities | `blocklist_update`, `port_test`, `free_space` | Compat/native mix; free-space probes use configured native storage roots, while port testing and blocklist import are explicit unsupported operations in native compatibility mode | Utility shape row |
 | Groups | `group_get`, `group_set`, torrent group assignment | Compat plus native speed-limit effect: group state and per-torrent group projection roundtrip for remote-client parity; enabled group speed limits propagate into native per-torrent limits for assigned torrents | Group shape, mutation, torrent projection row, and native limit propagation |
 
 Transmission `torrent_get` field matrix:
@@ -198,7 +217,7 @@ Transmission `session_get` field matrix:
 | Queue | download/seed queue, queue stalled settings | Compat; mutable settings roundtrip in facade state |
 | Peer/network | peer limits, peer port, port forwarding, DHT/PEX/LPD/uTP, preferred transports | Compat; mutable settings roundtrip in facade state |
 | RPC/security | auth, whitelist, bind address, anti brute force, username | Compat state roundtrip for auth, whitelist, bind address, and username; anti brute force remains deployment/runtime policy |
-| Blocklist | enabled, size, URL | Compat; enabled/URL/size roundtrip plus update response projection |
+| Blocklist | enabled, size, URL | Read-only compatibility shape; native blocklist writes/import are explicitly unsupported, and migration preserves source artifacts |
 | Scripts | added/done/done-seeding script paths/enabled | Compat; mutable settings roundtrip in facade state |
 | Seeding | ratio and idle limits | Compat; mutable settings roundtrip in facade state |
 
@@ -210,16 +229,16 @@ Local implementation: `crates/rt-api-deluge`.
 |---|---|---|---|
 | JSON endpoint/auth | `/json`, `auth.login`, `auth.check_session` | Compat | Auth row |
 | Daemon | `daemon.login`, `daemon.info`, `daemon.get_method_list`, `daemon.shutdown` | Compat | Method-list parity row |
-| Web host management | `web.add_host`, `edit_host`, `remove_host`, `get_hosts`, `get_host_status`, `connect`, `disconnect`, `connected`, `start_daemon`, `stop_daemon` | Compat/native shape implemented | Host management shape row |
-| Web torrent helpers | `web.add_torrents`, `download_torrent_from_url`, `get_torrent_files`, `update_ui`, `get_events` | Compat/native shape implemented; `download_torrent_from_url` returns a stateful safe token without server-side fetching, and `web.add_torrents` accepts that token plus magnet, temp-file path, embedded metainfo/base64, and URL payloads; `update_ui` honors requested fields and emits filter/stat shape | Web add and update row |
-| Web config/plugins | `web.get_config`, `update_config`, `save_config`, plugins | Compat implemented | Web config row |
+| Web host management | `web.add_host`, `edit_host`, `remove_host`, `get_hosts`, `get_host_status`, `connect`, `disconnect`, `connected`, `start_daemon`, `stop_daemon` | Compat/native shape implemented; `connected` reflects native-engine availability and daemon lifecycle start/stop are explicit unsupported operations because torrentngd owns its process lifecycle | Host management shape row |
+| Web torrent helpers | `web.add_torrents`, `download_torrent_from_url`, `get_torrent_files`, `update_ui`, `get_events` | Compat/native shape implemented; `download_torrent_from_url` returns a stateful safe token without server-side fetching, `web.add_torrents` accepts that token plus magnet or embedded metainfo/base64, and path-based loads are rejected at the API boundary | Web add and update row |
+| Web config/plugins | `web.get_config`, `update_config`, `save_config`, plugins | Reads remain compatibility-shaped; native configuration/plugin writes return explicit unsupported results | Web config row |
 | Core session | `core.get_session_status`, stats/rates/connections, filter tree, cache status, config values | Native/Compat; rates aggregate native peer snapshots when available | Session/status/config rows |
 | Core torrent reads | `get_torrents_status`, `get_torrent_status`, `get_torrent_file_status`, `get_session_state` | Native/Compat; requested-key filtering, label/state/hash filters, and option projection implemented | Requested-key/filter row |
 | Core lifecycle | add file/magnet, pause/resume, force_recheck, remove | Native | Lifecycle rows |
-| Core mutation | set options, priorities, trackers, queue, move, rename, connect_peer | Native/Compat; torrent options roundtrip in facade state and apply to engine when available | Mutation rows |
+| Core mutation | set options, priorities, trackers, queue, move, rename, connect_peer | Native/Compat; engine-backed mutations require the native engine, while unsupported option/plugin operations return explicit errors | Mutation rows |
 | Label plugin | label list/add/remove/options/set_torrent | Native/Compat | Label plugin row |
 | Notifications plugin | handled events, subscriptions, config/add subscription | Compat | Notification shape row |
-| Other plugins | AutoAdd, Blocklist, Execute, Extractor, Scheduler | Migration artifact preservation implemented; facade APIs expose stateful compatibility config/command surfaces while native behavioral effects remain explicit non-goals unless TorrentNG owns that workflow | Artifact preservation and plugin API rows |
+| Other plugins | AutoAdd, Blocklist, Execute, Extractor, Scheduler | Migration artifact preservation implemented; read-only compatibility shapes are exposed, while configuration, plugin lifecycle, and command writes fail explicitly because no native behavioral owner exists | Artifact preservation and plugin API rows |
 
 Deluge torrent status field matrix:
 
@@ -248,7 +267,7 @@ when engine metadata or peer snapshots are available.
 | Command family | Upstream examples | TorrentNG status | Test rows |
 |---|---|---|---|
 | System/session | `system.*`, `session.*`, `network.*`, throttle commands | Native/Compat: version/session/network values plus native global throttle reads when an engine is attached | Method enumeration and XMLRPC fixture rows |
-| Download/torrent | `d.*`, `d.multicall*`, `load.*` | Compat/native mix: registry-backed reads, custom field roundtrip, magnet/path load, lifecycle hooks | Read projection, custom field, multicall, load/erase rows |
+| Download/torrent | `d.*`, `d.multicall*`, `load.*` | Compat/native mix: registry-backed reads, custom field roundtrip, embedded raw/magnet load, lifecycle hooks; unsafe path-based direct loads are rejected | Read projection, custom field, multicall, load/erase rows |
 | File | `f.*` | Native/compat: registry fallback row without an engine; native metadata rows expose path, size, offsets, piece ranges, priority, and completion | File multicall shape and projection rows |
 | Tracker | `t.*`, tracker announce controls | Native/Compat: tracker rows expose native announce URLs, and persisted engine tracker status/scrape counters when available; announce accepted and engine tracker work remains covered by interop matrix | Tracker multicall and announce acceptance row |
 | Peer | `p.*` | Native/compat: peer rows expose native peer address, port, client, progress, rates, choke/interested flags when an engine is attached | Peer multicall projection row |
@@ -269,7 +288,7 @@ when engine metadata or peer snapshots are available.
 | P1 | `tracker_peer_matrix` | HTTP tracker, UDP tracker, private torrent DHT/PEX policy, explicit peer, multi-tracker fallback, tracker outage after peer discovery, and multi-peer completion are covered by Docker protocol rows in `scripts/interop_matrix.sh` |
 | P1 | `native_rest_mutation_matrix` | Native REST mutation coverage for start/stop aliases, metadata update, delete-with-data semantics, category, tags, file priority/file rename, tracker add/edit/remove, explicit peer add, queue moves, per-torrent limits, global transfer limits, and files/trackers/limits projection is covered by `rt-api-native` tests plus the `rust-qbit-mutation-facade` Docker row in `scripts/interop_matrix.sh` |
 | P1 | `storage_resume_matrix` | stop mid-transfer/restart/resume, corrupt block recheck repair, and missing file recovery are covered by Docker protocol rows `resume-after-partial-download`, `force-recheck-corruption-repair`, and `missing-file-recovery`; local storage topology coverage is included in `scripts/universal_compatibility_certification.sh` |
-| P2 | `plugin_aux_matrix` | Migration artifact preservation implemented for RSS/search/scheduler/autoadd/blocklist/execute/plugin/config files; Deluge auxiliary plugin facades round-trip autoadd, blocklist, execute, extractor, scheduler, and enabled-plugin state; remaining work is native behavioral effects only where explicitly supported |
+| P2 | `plugin_aux_matrix` | Migration artifact preservation implemented for RSS/search/scheduler/autoadd/blocklist/execute/plugin/config files; Deluge auxiliary plugin reads retain compatibility shapes, while unsupported writes are asserted to fail closed; remaining work is native behavioral effects only where explicitly supported |
 | P2 | `scale_matrix` | 15k imported torrents, hundreds active, many files, hostile paths; local scale coverage is included in `scripts/universal_compatibility_certification.sh` |
 
 ## 8. Build Backlog From Matrices

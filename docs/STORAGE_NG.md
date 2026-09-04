@@ -287,8 +287,8 @@ Recheck (`PieceVerifier`) becomes a low-priority elevator producer:
 device-sequential, throttled, page-cache-polite (`DONTNEED` after each
 region), and `SEEK_HOLE`/`SEEK_DATA`-aware so sparse gaps are skipped instead
 of read as zeros. A 100k-torrent recheck is a planned linear sweep, not
-random thrash. Resumable-recheck checkpoints (already in `rt-jobs`) are
-unchanged.
+random thrash. Resumable-recheck checkpoints are persisted by the native
+engine's storage-job dispatcher and are unchanged by this scheduling design.
 
 ### Topology-aware preallocation
 
@@ -343,8 +343,10 @@ feature matrix:
    when `runtime.torrent_tiers_enabled` is enabled. Shared policy and scale
    proxy tests are implemented in `rt-engine`; persisted tracker-deadline
    promotion is wired through a shared deadline wheel, but the dormant
-   registry row is not yet the compact `DormantTorrentSnapshot` and
-   release-binary capacity evidence is still missing.
+   registry stores the compact `DormantTorrent` projection and the tier
+   controller keeps only the small `DormantTorrentSnapshot` wake inputs;
+   release-binary capacity evidence is intentionally deferred; it is an
+   external scale/target-hardware gate, not missing tier integration.
 4. **Phase D (efficiency):** runtime backend selection, explicit `io_uring`,
    registered frame-slot reads, sync barriers, bounded recheck, RAM-first
    completed-piece hashing, adaptive readahead/fadvise, and sparse recheck are

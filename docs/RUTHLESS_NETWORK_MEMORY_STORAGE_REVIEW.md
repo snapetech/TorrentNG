@@ -1,8 +1,31 @@
 # Ruthless network / memory / storage review
 
+> Historical baseline: this document preserves the original review narrative.
+> Current implementation status and remaining actions are maintained in
+> [`BACKEND_AUDIT_BURN_DOWN.md`](BACKEND_AUDIT_BURN_DOWN.md), updated 2026-09-03.
+
 This review is intentionally hostile. The target is not "does it work on a happy path". The target is: can TorrentNG survive hostile torrents, hostile peers, high-latency storage, huge libraries, bad operator config, reverse proxies, and sustained high-throughput workloads without lying to the user or corrupting data.
 
-Status: not yet. There are strong foundations, but several hot paths and trust boundaries are not yet robust enough for a best-in-class torrent daemon.
+Status: historical baseline. The concrete repository findings below were
+reconciled and actioned in the current tree; the canonical current status is
+[`BACKEND_AUDIT_BURN_DOWN.md`](BACKEND_AUDIT_BURN_DOWN.md), not the pre-fix
+narrative in this file.
+
+## Current disposition (2026-09-04)
+
+The former implementation gaps are closed locally: checked metainfo bounds,
+server-owned storage execution, policy-gated tracker/webseed egress, shared
+HTTP transport workers, bounded peer ingress, packed peer bitmaps, validated
+storage configuration, adaptive webseed scheduling, supervised DB
+persistence, and SLO/resource metrics are all wired into the native runtime
+and covered by focused tests. The latest local fault, API/SSE load, and
+release smoke reports are linked from the backend ledger.
+
+Remaining items are qualification evidence rather than unimplemented code:
+target-hardware storage/performance, hostile public-network traffic, hosted CI
+observation, representative allocator profiling, public/client compatibility,
+and a completed 24-hour soak. Pure-v2 transfer remains an explicit unsupported
+capability.
 
 ## Executive verdict
 

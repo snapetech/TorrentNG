@@ -129,8 +129,8 @@ Sidecar-managed replacement for high-value ruTorrent plugins.
 
 A ground-up Rust BitTorrent daemon optimized for 10k–100k torrents, 200+ TB
 libraries, private-tracker seeding, and operational observability. This track is
-implemented across the workspace and certified by
-`scripts/native_engine_certification_report.sh`.
+implemented across the workspace; local certification scripts exist, but
+production-scale/public certification remains deferred.
 
 See `docs/ENGINE.md` for the full design.
 
@@ -278,7 +278,10 @@ surfaces.
 Required before 1.0:
 - [x] Migration tools from rTorrent, qBittorrent, Transmission
 - [x] qBit API compatibility report
-- [x] Public benchmark report via native scale certification
+- [x] Native scale benchmark implementation and synthetic evidence
+  (100k proxy and 1k/2k hot-set policy) are checked in. A target-hardware or
+  public benchmark report remains external evidence and is not represented as
+  certified here.
 - [x] Threat model review
 - [x] Backup/restore docs
 - [x] Native deployment docs

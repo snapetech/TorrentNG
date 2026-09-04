@@ -12,6 +12,17 @@ The current storage implementation map, including the split between the live
 torrent hot path and the backend/runtime probe path, lives in
 [`STORAGE_WORK_MAP.md`](STORAGE_WORK_MAP.md).
 
+## Current Disposition — 2026-09-04
+
+The local storage implementation and recovery contracts are closed for the
+declared scope: bounded scheduling, descriptor reuse, preallocation,
+durability-aware fastresume, checkpointed plans, safe paths, and worker
+cancellation/recovery are executable and covered by tests. The remaining
+storage rows in the gap register are external qualification gates for target
+filesystems/devices, including truthful `ENOSPC`/permission behavior,
+io_uring graduation, syscall/latency profiles, and long-duration throughput.
+They must not be read as missing local implementation.
+
 ## Previous Gap
 
 The original native path used a simple per-block primitive:

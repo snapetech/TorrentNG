@@ -37,7 +37,7 @@ cargo test qb_integration_flow
 cargo test qb_extended_torrent_forms_parse
 ```
 
-These tests run against an in-memory sidecar and do not require a live rTorrent instance. Endpoints that call rTorrent are expected to fail gracefully or return qBit-compatible success for no-op compatibility surfaces.
+These tests run against an in-memory sidecar and do not require a live rTorrent instance. Endpoints that call rTorrent are expected to fail gracefully; compatibility-only surfaces may return a documented projection, but mutators with no safe backend implementation must return an explicit unsupported/error result rather than a false success.
 
 ## Native Engine Compatibility
 

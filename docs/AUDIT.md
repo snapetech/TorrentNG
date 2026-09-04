@@ -1,5 +1,12 @@
 # Integration Audit — rTorrent 0.16.x + ruTorrent 5.3.x
 
+This file is a historical integration snapshot retained for traceability. Its
+unchecked rows describe the environment and client captures that were missing
+when the snapshot was written; they are not the current implementation ledger.
+Current repository status, supported contracts, and remaining external gates
+are maintained in [`BACKEND_AUDIT_BURN_DOWN.md`](BACKEND_AUDIT_BURN_DOWN.md)
+and [`COMPATIBILITY_AUDIT.md`](COMPATIBILITY_AUDIT.md).
+
 Status legend: ✅ confirmed working | ❌ broken | ⚠️ conditional | 🔲 not yet tested
 
 ---

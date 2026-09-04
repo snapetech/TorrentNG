@@ -158,4 +158,8 @@ report is downgraded to `PASS_WITH_WARNINGS`.
 
 `scripts/certification_status_json.sh` writes a machine-readable
 `certification-status-*.json` file plus a companion Markdown report for the
-status table.
+status table. The companion report is `PASS` when every row is clean,
+`PASS_WITH_WARNINGS` when rows are warning-only, and `FAIL` when any row is
+failed, missing, or otherwise invalid; the command exits non-zero for the last
+case so CI and release automation cannot mistake a failed status table for a
+passing export.

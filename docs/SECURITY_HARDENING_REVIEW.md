@@ -1,6 +1,34 @@
 # Security hardening review
 
+> Historical baseline: this document preserves the original May 2026 red-team
+> findings. The current disposition and verification record are maintained in
+> [`BACKEND_AUDIT_BURN_DOWN.md`](BACKEND_AUDIT_BURN_DOWN.md), updated 2026-09-03.
+
 This document records the red-team and engineering-hardening issues found during the May 2026 ruthless review pass. It is intentionally blunt: if a behavior is compatibility-shaped, inert, or safe only behind localhost assumptions, that needs to be visible in code, docs, and release gates.
+
+## Current disposition (2026-09-04)
+
+The historical checklist below is not an open work queue. Its repository-
+actionable items have been implemented and regression-tested in the current
+tree. Current local security review reports are
+[`security-review-native-current-20260904.md`](../certification/reports/security-review-native-current-20260904.md)
+and
+[`security-review-sidecar-current-20260904.md`](../certification/reports/security-review-sidecar-current-20260904.md).
+
+| Finding | Current state | Honest boundary |
+|---|---|---|
+| Facade authentication | Native, qBittorrent, Transmission, Deluge, and the rTorrent library entry point enforce the configured token boundary; login/session compatibility is explicit. | Reverse-proxy header handling and deployed secret rotation require operator review. |
+| Storage authority | Execute paths use configured/persisted server roots and descriptor-relative no-follow checks; caller roots are preview-only. | Non-Linux portability and a hostile live mount race require target-host evidence. |
+| Metainfo integers and caps | Checked signed-to-unsigned conversions and parser limits reject negative, overflowing, and oversized torrent-controlled values. | Larger external corpus/fuzz runs remain qualification evidence. |
+| Outbound egress | Tracker/webseed scheme, DNS/address, redirect, response-size, and private-address policy is enforced by the live runtime. | Hostile DNS/public-network behavior still needs a deployment run. |
+| Compatibility honesty | Unsupported queue/plugin/pure-v2 behavior returns explicit unsupported results; projection-only state is documented. | Client-version breadth remains an interoperability evidence question. |
+| Durable operator state | Engine-backed compatibility state, categories, tags, bans, preferences, and job state are persisted where the native engine owns the surface; process-local no-engine facades are documented. | Plugin-specific native behavior is intentionally not claimed. |
+| Metrics privacy and ingress | `/metrics` is auth-protected when tokens exist; hot-torrent labels hash identifiers by default, raw IDs are opt-in with a startup warning; peer ingress has global/per-IP budgets and timeouts. | Actual network exposure and reverse-proxy policy require deployment review. |
+
+The remaining release gates are evidence-only: hosted CI observation, public
+client/network traffic, real-device filesystem runs, and long soak. Do not copy
+the historical requirements below into a new implementation plan without
+first reconciling them against this section and the canonical backend ledger.
 
 ## Immediate fixes included in `hardening/ruthless-review-fixes`
 
@@ -10,7 +38,7 @@ This document records the red-team and engineering-hardening issues found during
 - Native API routes now use a route-level guard when API tokens are configured. `/health`, `/api/v1/auth/login`, and `/api/v1/auth/logout` remain public; operational reads such as `/metrics`, `/api/v1/logs`, `/api/v1/session-events`, `/api/v1/events`, `/api/v1/engine`, `/api/v1/storage`, and torrent listing/detail now require a valid bearer token or session cookie when tokens exist.
 - qBittorrent compatibility routes now use a route-level guard when API tokens are configured. Bearer tokens or `SID` cookies matching a configured API token are accepted. If no API tokens are configured, legacy unauthenticated compatibility behavior remains available for localhost/dev deployments.
 
-## Remaining P0/P1 hardening backlog
+## Historical P0/P1 hardening backlog
 
 ### P0: normalize auth across every facade
 

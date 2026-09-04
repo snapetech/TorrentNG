@@ -152,11 +152,12 @@ shippable and benchmarkable.
 
 - [x] Introduce Dormant/Warm/Hot tiers orthogonal to `TorrentState`.
 - [x] Integrate restore, lifecycle/inbound promotion, idle demotion, stats, and shutdown behind `runtime.torrent_tiers_enabled`.
-- [~] Shared timer-wheel reactor for dormant runtime state; persisted tracker-deadline promotion is wired through a separate shared deadline wheel, but dormant registry rows still retain a full `TorrentEntry`.
-- [~] 100k proxy: controller/registry test covers 100,000 rows with 2,000 hot entries and the two-percent/one-task policy; release-binary RSS/fd/thread/task/restart evidence is still missing.
+- [x] Shared timer-wheel reactor for dormant runtime state; activity and persisted tracker-deadline promotion use bounded deadline wheels, and dormant registry rows retain only compact `DormantTorrent` state until promotion.
+- [x] 100k proxy implementation: controller/registry tests cover 100,000 rows with 2,000 hot entries and the two-percent/one-task policy. Release-artifact capacity measurement is tracked separately as an external evidence gate.
 
-`[~]` items are deliberate: the code path exists, but the production-scale
-acceptance claim is not earned until the release artifact is measured.
+The implementation checklist is complete. This does not turn the synthetic
+100k proxy into a production-capacity claim; release-binary RSS/fd/thread/task
+and restart measurements remain explicitly external evidence.
 
 ### Phase D — efficiency
 

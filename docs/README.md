@@ -51,6 +51,9 @@ certified status.
 
 - [API.md](API.md) - native REST, qBittorrent-compatible, Transmission, Deluge,
   health, metrics, and auth surfaces.
+- [RTORRENT_LIBRARY_API.md](RTORRENT_LIBRARY_API.md) - the explicitly
+  library-only rTorrent XML-RPC boundary, credential contract, and why it is
+  not mounted as an HTTP server.
 - [CLIENT_COMPATIBILITY_MATRICES.md](CLIENT_COMPATIBILITY_MATRICES.md) -
   universal compatibility target, current status, and certification backlog.
 - [INTEGRATION_COMPAT.md](INTEGRATION_COMPAT.md) - sidecar and native

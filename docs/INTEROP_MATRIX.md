@@ -216,6 +216,15 @@ When `INTEROP_PROTOCOL_ONLY` is set, the runner skips the base local and
 extended local cases and runs only the requested protocol row. Unknown protocol
 row names fail before the Compose stack is started.
 
+## Current disposition (2026-09-04)
+
+The current local Docker run reconciles 28/28 declared base, extended, and
+protocol cases. The expansion table below is a qualification backlog for
+optional DHT/PEX/LSD, adversity, long-running, public-network, and deeper
+client-parity evidence; it is not a list of unimplemented core paths. The
+`magnet-dht-only` row remains an external/extended discovery test, and no local
+green run is promoted to a public compatibility claim.
+
 ## Expansion Backlog
 
 These rows are not all release blockers. They separate default-gate coverage

@@ -7,12 +7,25 @@ same durable engine state.
 For the larger rewrite overview and native-vs-rTorrent comparison, see
 [ENGINE_REWRITE.md](ENGINE_REWRITE.md).
 
+## Current local release evidence
+
+On 2026-09-03 local time, `cargo build --release --locked -p torrentngd`
+produced `target/release/torrentngd` (21,993,112 bytes,
+SHA-256 `1d5fe1bee668179001dab21ac697aea01bb0f2cb11276f13208c38975cacd28e`).
+The authenticated release-binary smoke started it from an isolated config,
+checked native and qBittorrent list/transfer endpoints plus Prometheus
+metrics, sent SIGTERM, and observed a clean exit in 474 ms. The current report
+is [`backend-burndown-native-release-smoke-current-20260903.md`](../certification/reports/backend-burndown-native-release-smoke-current-20260903.md).
+This is local deployment evidence, not a capacity, public-compatibility,
+real-device, or long-soak certificate.
+
 ## Production Requirements
 
 - Put the session DB and torrent metadata on durable local storage.
 - Put payload data on mounted storage roots with stable paths.
-- Set native API tokens in `[auth].api_tokens`; public binds reject missing,
-  short, or placeholder tokens at startup.
+- Set native API tokens in `[auth].api_tokens` or a protected
+  `[auth].api_tokens_file`; public binds reject missing, short, or placeholder
+  tokens at startup.
 - Bind the native API behind TLS or a trusted reverse proxy.
 - Keep mutating endpoints token-protected.
 - Enable scripts only with a root-owned allowlist directory.
@@ -52,8 +65,17 @@ Minimum validation:
 
 ```sh
 curl -fsS http://127.0.0.1:8080/health
-curl -fsS http://127.0.0.1:8080/api/v1/torrents
-curl -fsS http://127.0.0.1:8080/api/qb/v2/torrents/info
+export TNG_API_TOKEN='the-token-from-your-protected-config'
+curl -fsS -H "Authorization: Bearer ${TNG_API_TOKEN}" http://127.0.0.1:8080/api/v1/torrents
+curl -fsS -H "Authorization: Bearer ${TNG_API_TOKEN}" http://127.0.0.1:8080/api/qb/v2/torrents/info
+```
+
+The repository smoke command can be run against a freshly built binary with
+an isolated authenticated config:
+
+```sh
+scripts/backend_burndown_native_release_smoke.sh \
+  certification/reports/backend-burndown-native-release-smoke-current-$(date -u +%Y%m%d).md
 ```
 
 ## Docker Compose
@@ -67,9 +89,19 @@ docker compose -f deploy/native/compose.yml --profile observability up --build
 ```
 
 The example config is [deploy/native/config.toml](../deploy/native/config.toml).
-Replace the token placeholder with a random value, then change storage paths and
-the public peer port before using it outside local testing. The shipped example
-intentionally refuses to start until the placeholder is replaced.
+The Compose example reads one newline-delimited token from the
+`TORRENTNG_API_TOKEN` environment variable through a Docker secret, so do not
+put a token in `prometheus.yml` or duplicate it in the TOML file:
+
+```sh
+export TORRENTNG_API_TOKEN="$(openssl rand -hex 32)"
+docker compose -f deploy/native/compose.yml --profile observability up --build
+```
+
+Change storage paths and the public peer port before using the example outside
+local testing. For systemd or a direct binary deployment, use a root-owned
+token file and set `auth.api_tokens_file` to its path, or use inline
+`auth.api_tokens` in a private config.
 
 ## systemd
 
@@ -98,7 +130,9 @@ kubectl apply -k deploy/native/kubernetes
 The StatefulSet uses persistent volume claims for session state and downloads.
 The config is mounted from a Secret because it contains API tokens. Adjust
 storage classes, sizes, ingress/load-balancer exposure, and tokens for the
-target cluster.
+target cluster. The checked-in Kubernetes secret is a template and contains a
+placeholder token; replace it before applying. The native config validator
+rejects that placeholder and rejects public binds without a real token.
 
 ## Observability
 
@@ -106,10 +140,19 @@ target cluster.
 directory includes:
 
 - [prometheus.yml](../deploy/native/prometheus.yml)
+- [torrentngd.rules.yml](../deploy/native/torrentngd.rules.yml)
 - [Grafana datasource provisioning](../deploy/native/grafana/provisioning/datasources/prometheus.yml)
 - [torrentngd overview dashboard](../deploy/native/grafana/dashboards/torrentngd.json)
 
-With Compose, start them through the `observability` profile.
+The checked-in Prometheus rules alert on sustained storage-dispatcher
+saturation, an unhealthy storage supervisor, repeated expired API snapshots,
+and SSE resynchronization storms. These are operator signals, not proof that a
+deployment has sufficient hardware capacity; validate thresholds against the
+target workload.
+
+With Compose, start them through the `observability` profile. Prometheus sends
+the same Bearer token from `/run/secrets/torrentngd_api_token`; metrics are not
+silently left unauthenticated just because the monitoring profile is enabled.
 
 ## Arch Package
 
@@ -160,6 +203,21 @@ NATIVE_ENGINE_URL=http://127.0.0.1:8080 scripts/native_engine_certification_repo
 
 The post-soak release gate also reruns native engine rewrite certification
 directly before refreshing the aggregate release report.
+
+For the exact release artifact, run the bounded deployment smoke and the
+release-optimized scale suite separately:
+
+```sh
+scripts/backend_burndown_native_release_smoke.sh \
+  certification/reports/backend-burndown-native-release-smoke-$(date -u +%Y%m%d).md
+scripts/backend_burndown_scale_release.sh \
+  certification/reports/backend-burndown-scale-release-$(date -u +%Y%m%d).md
+```
+
+The smoke binds the artifact digest to authenticated health, native and qBittorrent
+REST, metrics, and SIGTERM evidence. The scale suite is synthetic optimized-build
+evidence; it does not certify production hardware, restart recovery, or a 100k
+live daemon fixture.
 
 Live public transfer evidence is optional for offline CI but required before a
 production release:

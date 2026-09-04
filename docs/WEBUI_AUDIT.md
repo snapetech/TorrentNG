@@ -29,6 +29,14 @@ The column menu also exposes `Downloaded`, `Uploaded`, `Priority`, and `Save
 path`. The compact preset keeps the transfer/status fields while retaining the
 ETA and swarm context.
 
+## Current disposition (2026-09-04)
+
+The native summary projection and the current WebUI build are locally verified.
+The fields listed below are explicit product/projection-depth follow-up, not
+an untracked backend implementation blocker. Add them only with a defined API
+contract and tests; do not infer them in the browser or treat the current
+summary as universal client parity.
+
 ## Remaining compatibility gaps
 
 The list model does not yet carry every field exposed by the comparison clients.

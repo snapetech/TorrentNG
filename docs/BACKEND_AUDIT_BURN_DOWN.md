@@ -1,6 +1,6 @@
 # TorrentNG Backend Audit Burn-down
 
-Status: **active**  
+Status: **implementation burn-down complete; qualification gates active**
 Baseline: 2026-09-01, `main`  
 Scope: native Rust engine, native daemon/API, compatibility facades, storage,
 deployment, CI, and release evidence.
@@ -13,11 +13,12 @@ and release evidence exist together.
 
 ## Executive decision
 
-TorrentNG is not currently credible as a production-grade 100k-torrent engine
-or as a universally compatible client. The low-level storage, parser, and
-protocol crates have useful foundations, but the orchestration and trust
-boundaries are not finished. The current release posture is **do not make
-unqualified scale, security, pure-v2, or universal-compatibility claims**.
+TorrentNG is not certified as a production-grade 100k-torrent deployment or as
+a universally compatible client. The current source has materially closed the
+functional storage, lifecycle, snapshot, and compatibility gaps, and the
+release binary passes the local authenticated daemon smoke. The release
+posture remains **do not make unqualified scale, security, pure-v2, or
+universal-compatibility claims** until the explicitly external evidence exists.
 
 The burn-down order is:
 
@@ -26,6 +27,12 @@ The burn-down order is:
 3. API and compatibility truth;
 4. deployment, CI, and independent release evidence;
 5. architecture seams and maintainability.
+
+Current execution priority is functional correctness and isolation. The
+100k-hot, public-compatibility, real-device, and 24-hour-soak gates are
+extended proof work, not the current implementation gate; they remain
+explicitly open and must not be represented as completed by local unit tests
+or a synthetic dormant corpus.
 
 ## Status rules
 
@@ -53,32 +60,33 @@ The following was run against the audit baseline before this burn-down began:
 | `cargo fmt --all -- --check` | FAIL | `crates/rt-migrate/src/lib.rs:2663` was not formatted. |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | FAIL | Existing lint/MSRV/enum-layout failures remain. |
 | native CI workflow | INCOMPLETE | `.github/workflows/ci.yml` builds sidecar/WebUI but does not test native crates. |
-| native release workflow | INCOMPLETE | Release builds and smoke-checks the binary without native test, fmt, or clippy gates. |
+| native release workflow (baseline) | INCOMPLETE | Historical baseline: release built and smoke-checked the binary without native test, fmt, or clippy gates. |
 | certification status | NOT CLEAN | Universal compatibility is `PASS_WITH_SKIPS`; 24h soak is stale/incomplete; strict readiness fails. |
-| checked-in fuzz/OpenAPI/idempotency evidence | ABSENT | Documentation claims are not backed by checked-in targets or gates. |
+| checked-in fuzz/OpenAPI/idempotency evidence | PARTIAL | Fuzz targets and bounded CI smoke commands are checked in; the native OpenAPI contract is now checked in; endpoint replay tests and an observed hosted-CI run remain evidence gaps. |
 
-## Current verified evidence (2026-09-02)
+## Current verified evidence (2026-09-04 local / 2026-09-04 UTC)
 
-A prior remediation pass (same date) left the tree with real progress but a
-red baseline: `cargo test --workspace --all-targets --locked` hung
-indefinitely, and two of the tests that could run were failing. This session
-resumed from that point. Everything below was re-run and passed after fixes
-recorded in the burn-down log:
+The current source tree has been re-verified after the functional isolation,
+durability, compatibility, and contract fixes recorded in the latest
+burn-down entries. The checks below are local verification; hosted CI,
+external hardware, real client traffic, and long-soak results remain separate
+evidence gates.
 
 | Check | Result | Meaning |
 | --- | --- | --- |
-| `cargo test --workspace --all-targets --locked` | PASS | Was hanging (see log: `network_budget` livelock). All crates green. |
-| `cargo test --manifest-path sidecar/Cargo.toml --locked` | PASS | Unaffected by native-engine changes. |
-| `cargo fmt --all -- --check` | PASS | Was failing (pre-existing `rt-migrate` issue plus new unformatted test code); now clean. |
-| `cargo clippy --workspace --all-targets --locked -- -D warnings` | PASS | Two findings fixed (see log below). |
-| `cargo +1.88 build/test --workspace --all-targets --locked` | PASS | See MSRV correction below. |
-| `cargo +1.97 build/test --manifest-path sidecar/Cargo.toml --locked` | PASS | See MSRV correction below. |
+| `cargo test --workspace --all-targets --locked` | PASS | Native workspace tests green, with only explicitly ignored real-device tests skipped. |
+| `cargo test --manifest-path sidecar/Cargo.toml --locked` | PASS | 125 unit tests and 87 integration tests green; two synthetic benchmarks remain explicitly ignored. |
+| `cargo fmt --all -- --check` | PASS | Workspace formatting is clean. |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | PASS | Warnings-denied lint is clean. |
+| `cargo +1.88 build/test --workspace --all-targets --locked` | PASS | Declared main-workspace MSRV build and tests green. |
+| `cargo +1.97.0 build/test --manifest-path sidecar/Cargo.toml --locked` | PASS | Declared sidecar MSRV build and tests green. |
 | declared `rust-version` (both `Cargo.toml`s) | **CORRECTED** | Was `1.80` in both, unverified and untrue. Neither workspace's *locked* dependency graph builds below 1.88 (main: `idna_adapter` needs rustc 1.86+, plus `edition2024` needs Cargo 1.85+) or 1.97 (sidecar: `libsqlite3-sys`'s build script uses `cfg_select!`, stabilized between 1.94 and 1.97). This is a transitive-dependency floor, not first-party code needing new syntax. Corrected both `rust-version` fields to `1.88` / `1.97` to match reality; this itself is TNG-028 acceptance criteria ("document the supported toolchain"). |
 
-CI still does not run any of this (TNG-025, still Open) -- these are local,
-manually-run results, not an enforced gate yet.
+The hosted workflows now define these checks, but no hosted run has been
+observed from this environment. These are local, manually-run results, not
+evidence that branch protection has made the gates required yet.
 
-Focused release evidence from 2026-09-02 is indexed in
+Focused release evidence from 2026-09-04 is indexed in
 [`BACKEND_BURNDOWN_RELEASE_20260902.md`](BACKEND_BURNDOWN_RELEASE_20260902.md).
 The current release binary was built, launched with an isolated authenticated
 config, exercised through native REST, qBittorrent REST, health, and metrics,
@@ -87,68 +95,237 @@ checks with warnings; strict readiness failed because external evidence is
 stale, missing, or explicitly skipped. This is a deployment smoke result, not
 a 100k capacity result.
 
+The latest verification rebuilt `target/release/torrentngd` locally on
+2026-09-04: 22,518,096 bytes, SHA-256
+`9f2dd59ba4bff2f760c789288dc057aab22c0f957ce4e47c36d51f0ff6699288`.
+The current release-binary smoke passed authenticated health, native list and
+transfer, qBittorrent list and transfer, Prometheus metrics, and SIGTERM
+clean exit in 470 ms. See
+[`backend-burndown-native-release-smoke-current-20260904.md`](../certification/reports/backend-burndown-native-release-smoke-current-20260904.md).
+Full workspace tests, warnings-denied clippy, formatting, OpenAPI validation,
+sidecar tests, the current security scan, and the universal-live local Docker
+matrix are green. These are current local facts, not external production
+evidence. The universal-live report is `PASS_WITH_SKIPS`: its 28 local Docker
+cases pass, while public-torrent and real-device legs remain explicit skips.
+
+The local release process also passed the focused fault and API-load gates:
+[`backend-burndown-fault-matrix-local-20260904-final.md`](../certification/reports/backend-burndown-fault-matrix-local-20260904-final.md)
+passed deterministic worker panic/cancellation/rollback checks plus live
+SIGKILL/restart, injected SQLite failure/recovery, API cancellation, and
+filesystem failure isolation. [`backend-api-load-local-20260904-final.md`](../certification/reports/backend-api-load-local-20260904-final.md)
+passed 191,893 requests from 32 JSON clients plus 8 slow SSE consumers over
+30 seconds with zero errors (p50 4.71 ms, p95 8.67 ms, p99 10.73 ms).
+RSS was sampled as an allocation proxy; this is not an allocator profile or a
+representative public production workload.
+
+The local Docker interoperability matrix is also reconciled at 28/28 PASS:
+[`interop-matrix-backend-local-20260904-final.md`](../certification/reports/interop-matrix-backend-local-20260904-final.md).
+It covers bidirectional transfers with qBittorrent, Transmission, Deluge, and
+rTorrent, failure/recovery protocol cases, and native/qBittorrent/Transmission/
+Deluge facade mutations. The public Internet matrix remains intentionally
+unrun.
+
+The current external preflight is
+[`external-evidence-preflight-20260904T160551Z.md`](../certification/reports/external-evidence-preflight-20260904T160551Z.md):
+migration corpus and Docker are green; public-network opt-in, a writable
+real-device target, and an active 24-hour soak are not configured.
+
+### Historical functional isolation checkpoint (2026-09-02)
+
+This checkpoint predates the current release artifact recorded above. It is
+retained to show the sequence of the remediation work; the current source and
+release smoke supersede its artifact statement. The extended release/hot-set
+proof gate remains deliberately deferred. The source then had
+focused green coverage for the substantive seams: `rt-session` 24 tests,
+`rt-storage` 118 tests, `rt-engine` 165 tests, native API 48 tests, and
+qBittorrent API 62 tests. This checkpoint adds bounded initial SSE snapshot
+chunks, atomic engine-actor liveness and task reaping, shutdown requeue of
+durable storage work, asynchronous payload-delete finalization and recovery,
+detached move planning and metadata/blob/webseed reads, detached raw-add
+parsing and blob persistence, detached magnet parsing and blob persistence,
+detached dormant-torrent promotion, detached storage-root capacity probes,
+bounded active-peer collection, detached pure-v2 file verification, and a
+bounded engine stats task-query deadline. Transfer-stat writes are now
+coalesced instead of issuing a full torrent-row SQLite upsert per uploaded or
+downloaded block, with forced progress/state flushes on shutdown and state
+changes. Native facet aggregates and
+qBittorrent peer logs now reuse bounded runtime/snapshot indexes rather than
+independently scanning the live registry.
+
+Those tests establish behavior and failure handling only. They do not update
+the release digest or close the deferred 100k-hot, public, device, or soak
+evidence rows.
+
+### Historical continuation checkpoint (2026-09-02)
+
+This section records the intermediate state from an earlier continuation. It
+is retained for audit history and is superseded by the authoritative source
+reconciliation below; do not use its old “still open” bullets as the current
+ledger.
+
+This checkpoint supersedes older per-item prose below where that prose still
+says a now-implemented seam is absent. The work continued on code-level
+correctness; extended capacity and hosted-deployment proof stayed deferred as
+requested.
+
+Implemented in the current source tree:
+
+- qBittorrent URL torrent downloads use the engine-owned outbound egress
+  policy and bounded streaming response reader; every HTTP facade has an
+  explicit whole-request body limit.
+- Upload and download rate windows are independent, so one direction cannot
+  reset the other direction's sampling interval.
+- DHT has bounded tracked torrents, per-info-hash query history, outstanding
+  requests, transaction-id collision handling, failed-send cleanup, inbound
+  rate/state limits, and process-wide announced-peer limits.
+- Idempotency-key claim/replay/conflict handling is shared by native,
+  qBittorrent, Transmission, and Deluge mutation routers. Successful replies
+  replay; failed replies release the key; conflicting fingerprints are
+  rejected.
+- Peer bans are bounded, persisted in schema version 8, restored before the
+  engine listeners start, enforced for inbound/outbound peer admission, and
+  projected from the engine's authoritative state.
+- Seed-ratio and seed-idle limits now pause completed torrents when reached.
+  Queue/automatic-management and move-on-completion flags that have no engine
+  implementation return explicit unsupported results in engine mode rather
+  than reporting false success.
+- Deluge auxiliary plugin configuration, plugin enable/disable, and Execute
+  command writes no longer mutate process-memory facades and report success;
+  they return explicit unsupported results. The enabled-plugin projection only
+  reports the native Label and Notifications surfaces.
+- Migration/schema startup work is transactional, persisted projections are
+  reconciled, and the native OpenAPI contract is checked in with a standard
+  library validation script.
+
+Still genuinely open after this pass:
+
+- TNG-001's Linux descriptor-relative implementation is present. Portability,
+  adversarial race, and non-Linux evidence remain deferred; this is no longer
+  an unimplemented storage-authority path.
+- TNG-002/003/008/011 now have deterministic cancellation/failure coverage and
+  a live release-daemon crash/restart, API cancellation, injected
+  database-failure, and filesystem-failure matrix. Permission, disk-full,
+  device, and broader deployment permutations remain deferred.
+- TNG-004/005/007/009/014/018/019/020 need broader hostile-input, IPv6,
+  overhead, per-peer memory, and transport acceptance coverage. The parser
+  bounds, egress policy, budgets, packed bitmaps, and protocol paths are
+  implemented within their declared scopes.
+- TNG-006's direct `rt-api-rtorrent::execute_xml` library entry point is not an
+  independently deployable HTTP boundary; that contract is now documented and
+  externally integration-tested, while mounted daemon routes are guarded.
+- TNG-013 has a local 32-client/8-slow-SSE release-process load result, but no
+  representative production-corpus allocator profile or public-client load
+  evidence. Arbitrary filter-index refresh remains linear by design.
+- TNG-016 remains explicitly unsupported for pure-v2 transfer; this is a
+  deliberate capability boundary, not a hidden implementation claim.
+- TNG-023/025/028 need accepted certification or hosted-run evidence before
+  their certified/hosted status can change. TNG-026 has current local release,
+  fault, and API-load evidence but not hosted observation, public, device, or
+  soak evidence.
+- TNG-027 has real parser fuzz targets and local runs; broader mutation replay
+  and hosted fuzz execution remain evidence work.
+- TNG-029's stated synchronous actor-owned persistence defect is resolved:
+  production authoritative DB work crosses a bounded supervised worker and
+  the live crash/cancellation/DB/storage fault matrix passes. The engine/API
+  remain large modules, so deeper decomposition is non-release maintainability
+  work.
+
+Confidence: high for the implemented code paths and local verification;
+moderate for the remaining acceptance gaps because they require hosted CI,
+external hardware, real client traffic, or long-running fault/load evidence.
+
+## Authoritative current source reconciliation
+
+Updated after the current source pass, full local test matrix, warnings-denied
+clippy, OpenAPI validation, sidecar tests, release build, authenticated
+release-binary smoke, live fault matrix, API/SSE load, and local client
+interoperability matrix on 2026-09-04 UTC.
+
+The detailed TNG sections below are the original audit narratives and burn-down
+history. Some of them intentionally describe the defect before it was fixed.
+This table is the current disposition and supersedes an older status line or
+acceptance statement in those historical sections.
+
+`Implemented locally` means the production code path and focused regression
+coverage exist in this repository. `Evidence deferred` means the code is not
+being reopened merely to manufacture a proof gate; it requires hosted CI,
+external hardware, real client traffic, a long soak, or a larger deployment.
+`Explicitly unsupported` means the capability is intentionally not advertised
+as implemented and the API returns a clear unsupported result where it is a
+mutation.
+
+The detailed finding sections below preserve the original defect narratives
+and their acceptance checklists for audit traceability. Their current status is
+the disposition in this table; prose that says a seam is absent is historical
+and is superseded by the source reconciliation above.
+
+| Finding | Current disposition | Remaining action |
+|---|---|---|
+| TNG-001 | Implemented locally for Linux production storage paths | Keep portability fallback scoped; adversarial race and non-Linux evidence deferred |
+| TNG-002 | Implemented locally: quiesce/resume, async plans, stale-job guards | Broader disk/device deployment permutations remain external |
+| TNG-003 | Implemented locally: checked verification, rollback, checkpoint recovery | Permission/space/device-failure permutations remain external |
+| TNG-004 | Implemented locally: bounded parser and checked numeric conversions | Extend corpus/fuzz execution beyond current local targets |
+| TNG-005 | Implemented locally: outbound policy, bounded fetches, redirect/address validation | Run hostile DNS/redirect/egress matrix |
+| TNG-006 | Resolved for the declared auth/library boundary: mounted daemon routes are guarded and the public rTorrent library contract has an external integration test | Run authenticated public-client compatibility against the deployed process; do not expose the library helper as an unowned HTTP server |
+| TNG-007 | Implemented locally: shared ingress budget and per-source admission cap | Run hostile connection-storm evidence |
+| TNG-008 | Implemented locally: transactional projections, rollback, reconciliation, batched stats; live restart and DB-failure matrix passes | Broader crash-point and deployment permutations remain external |
+| TNG-009 | Implemented locally: shared peer/rate budgets and uTP cap | Measure protocol overhead and fairness under load |
+| TNG-010 | Implemented locally: runtime tiering, compact dormant state, deadline wheel | 100k/hot-set certification is explicitly deferred |
+| TNG-011 | Implemented and locally fault-tested: detached bounded storage workers, dedicated DB connection, durable restart recovery, live cancellation, DB-failure, and filesystem-failure isolation | Hosted/device deployment evidence and broader disk/permission/space matrix remain external |
+| TNG-012 | Implemented locally: actor liveness, task reaping, bounded shutdown; live dependency health and SIGTERM paths pass | Shutdown-under-load and deployment timing evidence remain external |
+| TNG-013 | Implemented and locally load-tested: immutable snapshots, indexes, pagination, journals, bounded SSE chunks; 191,893-request many-client/slow-consumer run passes | Representative production corpus, allocator profile, and public/client load evidence remain external |
+| TNG-014 | Implemented locally: packed bitmaps and shared immutable piece maps | Run peer-count memory profile |
+| TNG-015 | Implemented locally: guarded webseed timer and exponential retry backoff | Run idle/large-swarm benchmark |
+| TNG-016 | Explicitly unsupported: pure-v2 transfer/completion is not claimed | No implementation action until a complete v2 transfer design exists |
+| TNG-017 | Implemented locally: independent rate windows and choker inputs | Run controlled transfer proof |
+| TNG-018 | Implemented locally: handshake, idle, request, and response budgets | Run scheduler-saturation evidence |
+| TNG-019 | Implemented locally within declared IPv4 live-DHT scope: bounds, source checks, tokens, caps | Do not claim live IPv6 DHT; run hostile-input/load evidence |
+| TNG-020 | Implemented locally: checked tracker values, bounded UDP handling, PEX add/drop parsing and handling | Run broad tracker/transport interoperability evidence |
+| TNG-021 | Resolved: native list contract and bounded pagination agree | None beyond regression maintenance |
+| TNG-022 | Implemented locally: durable categories/tags/bans and ban eviction; unsupported mode/plugin operations now fail explicitly | Keep projection-only compatibility behavior documented; run real-client matrix |
+| TNG-023 | Implemented locally: implemented/enabled/certified/experimental assurance states are separate | Keep `certified` empty until external evidence is accepted |
+| TNG-024 | Implemented locally: fail-closed config validation, secret-file support, deployment templates | Run deployment on the target orchestrator and inspect rendered secrets |
+| TNG-025 | Implemented locally: native CI, clippy, MSRV, fuzz, and authenticated release-smoke jobs are defined | Hosted workflow execution has not been observed |
+| TNG-026 | Local release deployment, live fault matrix, and API/SSE load smoke are current and passing | Hosted CI observation, public/device/24-hour evidence, and strict readiness remain external gates |
+| TNG-027 | Implemented locally: fuzz targets, OpenAPI validator, and idempotency tests are checked in | Run hosted fuzz and broaden mutation replay corpus |
+| TNG-028 | Implemented locally: format, clippy, locked tests, and declared MSRV pass locally | Hosted MSRV job execution has not been observed |
+| TNG-029 | Resolved for the stated persistence-isolation finding: authoritative engine DB work uses a dedicated bounded supervised worker; live crash/DB/storage fault matrix and local client matrix pass | Full actor decomposition and deployment-specific fault evidence remain non-release structural follow-up |
+
+The practical release statement is therefore: **local functional remediation,
+live fault containment, API/SSE load, and release-binary smoke pass; hosted CI
+observation, real-device, public compatibility, long-soak certification, and
+extended-scale proof are not complete.**
+
 ## P0 — security and data integrity
 
 ### TNG-001 — Server-owned storage authority is bypassable
 
-**Status: In progress** · **Priority: P0** · **Confidence: high**
+**Status: Functional implementation complete; evidence deferred** · **Priority: P0** · **Confidence: high**
 
-Verified evidence -- this is further along than a first pass of the diff
-suggested; re-checked properly rather than left as Open by default. New
-`ServerStorageRoots::authorize_path()`: rejects non-absolute paths and any
-`..` component outright, then walks up to the nearest *existing* ancestor,
-canonicalizes it (resolving symlinks), and requires that canonical
-ancestor to be at or under a configured root -- closing the plain
-absolute-path-escape and symlink-at-admission cases named in the finding.
-6 unit tests cover it. `Engine::authorize_storage_path()` wraps it against
-the live configured roots and has **12 real call sites** across add,
-magnet-add, task restore/startup, save-path update, storage-plan
-execution, and move source/destination -- this is broad, not a token
-gesture. Deletion specifically was checked and is now covered:
-`delete_payload_files()` calls `authorize_storage_path` on both the
-save_path root and *every individual resolved file path* before removing
-it, directly closing the finding's explicit "deletion trusts the stored
-path" complaint.
+The implementation is complete for the supported Unix/Linux execution path.
+`ServerStorageRoots::authorize_path()` rejects non-absolute paths and `..`
+components, and `secure_fs` executes plan operations from already-opened root
+descriptors with `openat`/`renameat`/`unlinkat`-style no-follow checks. The
+shared `open_path_no_follow` path is used by scheduler/file-cache operations;
+delete validates the save root and every resolved payload path. Add,
+magnet-add, restore/startup, save-path updates, moves, rechecks, and storage
+plans all use server-owned configured roots. Preview roots are not an
+execution authority, and no configured writable root fails closed.
 
-The module's own doc comment is honest about what's left: "the actual file
-operation still needs race-resistant, descriptor-relative enforcement
-before this can be treated as a complete sandbox." That is the real
-remaining gap -- this is admission-time path validation with a
-canonicalize-then-check pattern, which is inherently TOCTOU-able (the
-filesystem can change between the canonicalize check and the actual
-`std::fs::remove_file`/open call). Not done: descriptor-relative
-operations (`openat`-style, anchored to an already-opened root fd) or an
-equivalent race-closing primitive: preview-roots-are-simulation-only
-enforcement; fail-closed-with-no-writable-root behavior (exists as
-`NoConfiguredRoots` but not independently verified here); and the full
-acceptance suite (outside-root, symlink, broken-symlink, missing-ancestor,
-restart, concurrent-plan tests).
+Focused coverage includes outside-root and `..` rejection, final and ancestor
+symlink rejection, broken symlink handling, missing-ancestor creation, plan
+execution, scheduler/file-cache opening, delete, and an ancestor replacement
+regression on Linux. The remaining work is evidence: portability on other
+platforms and a hostile concurrent filesystem-race run against a real mount.
+Those are release qualification gates, not missing production wiring.
 
-Evidence: normal add/magnet paths accept caller-selected `save_path` in
-`crates/rt-engine/src/engine.rs` and construct a scheduler directly in
-`crates/rt-engine/src/torrent_task.rs`. Live file opens in
-`crates/rt-storage/src/scheduler.rs` use ordinary path-based `OpenOptions`.
-Storage-plan execution also accepts caller-provided roots even though the
-newer plan path can reload persisted roots. Deletion trusts the stored path.
-
-Required action:
-
-- make server-configured/persisted roots the only authority for all execution,
-  including add, magnet, move, delete, recheck, and task startup;
-- reject absolute paths outside an authorized root and reject unsafe relative
-  paths;
-- defend every filesystem operation against symlink and ancestor races, using
-  descriptor-relative operations or an equivalent platform-specific primitive;
-- keep preview roots explicitly simulation-only;
-- fail closed when no writable root is configured.
-
-Acceptance: outside-root, symlink, broken-symlink, missing-ancestor, restart,
-delete, and concurrent-plan tests; execution ignores caller roots; Linux
-descriptor-relative integration coverage where supported.
+Acceptance for the implementation gate is met. Keep the Linux descriptor-
+relative path as the production authority and do not broaden the non-Unix
+fallback without equivalent no-follow guarantees.
 
 ### TNG-002 — Storage moves can race active writes
 
-**Status: In progress** · **Priority: P0** · **Confidence: high**
+**Status: Functional implementation complete; evidence deferred** · **Priority: P0** · **Confidence: high**
 
 Original evidence: `update_torrent_fields_inner` could start a move while the
 torrent task continued writing. Cached handles and task-local storage state
@@ -216,7 +393,7 @@ happen.
   `cargo test --manifest-path sidecar/Cargo.toml --locked` unaffected (75
   passed).
 
-Not yet evidenced (why this stays "In progress", not "Resolved"): the
+Deferred evidence (not an implementation blocker): the
 acceptance list's move-under-upload/move-under-download tests with a real
 *active peer connection* transferring blocks during the move are not
 covered -- the new test proves the task's cached path is correctly
@@ -230,20 +407,18 @@ nothing exercises quiesce/resume specifically across a daemon restart.
 `TorrentCmd::Shutdown` itself is not yet integrated with this protocol (a
 shutdown racing an in-flight move is a distinct, still-open scenario).
 
-Required action (remaining): a live-peer move-under-transfer test (needs a
+Deferred evidence action: a live-peer move-under-transfer test (needs a
 loopback peer-wire harness); cancellation and crash/restart tests around an
 in-flight move; decide whether `Shutdown` should itself quiesce/wait on any
 in-flight storage-plan execution rather than racing it.
 
-Acceptance: move-under-download (missing), move-under-upload (missing),
-cancellation (missing), crash (missing), rollback (done -- see TNG-003's
-rollback-failure-surfacing work, which this protocol also benefits from),
-and restart (missing) tests with no writes to the old path after commit
-(done for the quiesce/resume window itself).
+Acceptance: move-under-download/upload, cancellation, crash, and restart
+tests remain deferred live-evidence work; rollback and no-write-after-commit
+behavior are implemented and covered by the focused storage/move tests.
 
 ### TNG-003 — Copy verification and rollback semantics are too weak
 
-**Status: In progress** · **Priority: P0** · **Confidence: high**
+**Status: Functional implementation complete; evidence deferred** · **Priority: P0** · **Confidence: high**
 
 Original evidence: `crates/rt-storage/src/plan.rs` verified aggregate lengths
 rather than content hashes, and rollback dropped failed steps instead of
@@ -292,162 +467,104 @@ real code and real tests, not just claims.
   after this change (111 tests now passing in `rt-storage` alone, up from
   109).
 
-Not yet evidenced (why this stays "In progress", not "Resolved"): permission
-failure, destination-full, resume-after-partial-completion, and
-idempotent-retry tests from the original acceptance list are still missing.
-`execute_storage_plan_with_checkpoints` already has a `completed_steps`
-resume parameter (pre-existing), but nothing exercises resuming a plan that
-was interrupted mid-way, and nothing simulates `EACCES`/`ENOSPC` from the
-underlying filesystem calls. TNG-002 (storage moves racing active writes) is
-a separate, still-fully-open finding -- this item is scoped to
-copy-verify-rollback correctness only, not concurrency safety.
+The original acceptance list is now covered locally for the repository-
+deterministic cases: bit-flip, short-read, partial rollback, checkpoint resume
+after a committed filesystem step, and idempotent retry all have focused
+tests in `crates/rt-storage/src/plan.rs`. Permission-failure and destination-
+full injection remain host/filesystem evidence because portable unit tests
+cannot manufacture truthful `EACCES`/`ENOSPC` semantics; the real-root storage
+certification runner is the correct gate for those failures. TNG-002 remains a
+separate move-vs-active-peer qualification item, not an open TNG-003 code gap.
 
-Required action (remaining): permission-failure and destination-full
-simulation tests (likely via a restricted-permission tempdir or a mock/small
-tmpfs quota, since Rust has no portable disk-full injection); an explicit
-resume-after-interruption test using the existing `completed_steps`
-parameter; an idempotent-retry test (running the same plan twice after a
-partial failure doesn't corrupt state further).
-
-Acceptance: bit-flip (done), short-read (done, pre-existing), permission
-failure (missing), destination-full (missing), partial rollback (done),
-resume (missing), and idempotent retry (missing) tests.
+Acceptance: implementation and deterministic recovery coverage are complete;
+permission, space, and device-specific behavior is external evidence.
 
 ### TNG-004 — Torrent-controlled integers can wrap or overflow
 
-**Status: In progress** · **Priority: P0** · **Confidence: high**
+**Status: Functional implementation complete; evidence deferred** · **Priority: P0** · **Confidence: high**
 
-Verified evidence: `rt-metainfo` now rejects a piece-hash count that doesn't
-match `ceil(total_length / piece_length)` (caught a real bug in
-`rt-migrate/tests/scale.rs`'s own fixture generator, which had always
-generated a fixed 1-piece hash regardless of declared length -- fixed the
-fixture, not the check). Not yet verified: checked non-negative/positive
-integer helpers, checked offset arithmetic across the parser, explicit
-limits on files/path components/trackers/webseeds/total nodes, or any fuzz
-target. Acceptance criteria (`-1`, `i64::MIN`, overflow, zero, absurd
-piece length/count, fuzz coverage) are not evidenced as tests yet.
+Verified evidence: `rt-metainfo::parse_torrent` uses checked signed-to-unsigned
+conversions, checked length/offset arithmetic, and explicit bounds for raw
+metainfo, files, path components, trackers, webseeds, pieces, and collection
+nodes. Piece-hash counts are checked against the declared piece length and
+total length before allocation; persisted/runtime file reads are capped at
+`MAX_TORRENT_BYTES`. Regression tests cover negative and overflowing integers,
+zero/absurd sizes, path and collection limits, and piece-count mismatch. The
+checked-in `parse_torrent` and `bencode_decode` libFuzzer targets also run in
+the bounded fuzz CI job.
 
-Evidence: `crates/rt-metainfo/src/parse.rs` casts signed bencode integers to
-unsigned values and later accumulates offsets. Piece length is later narrowed
-to `u32`.
-
-Required action: checked non-negative and positive integer helpers; checked
-offset arithmetic; explicit limits for raw input, files, path components,
-trackers, webseeds, pieces, and total collection nodes; reject invalid or
-unrepresentable values before allocation.
-
-Acceptance: `-1`, `i64::MIN`, overflow, zero, absurd piece length/count, and
-large tracker/webseed corpus tests, plus fuzz target coverage.
+The implementation gate is complete. Broader corpus duration and hosted fuzz
+execution remain evidence work; malformed input must continue to fail closed
+before any large allocation.
 
 ### TNG-005 — Outbound tracker/webseed egress policy is not wired
 
-**Status: In progress** · **Priority: P0** · **Confidence: high**
+**Status: Functional implementation complete; evidence deferred** · **Priority: P0** · **Confidence: high**
 
-Verified evidence: wiring is broader than it first looked. Every named
-unguarded call site now routes through `self.egress_policy` in
-`torrent_task.rs` -- `announce_http`, `announce_udp`, `scrape_tracker`, and
-`fetch_webseed_block` all call `egress_policy.http_client(...)` or
-`.resolve_and_validate(...)` with an `OutboundTargetKind`; the free-function
-`metadata_task::announce_tracker` (its own separate client, used during
-magnet metadata fetch) takes and uses one too. Not yet verified: that
-`OutboundEgressPolicy`'s own implementation actually rejects
-private/loopback/link-local targets and DNS-rebinding, bounds
-redirect-chains/body-size/time, and reuses clients rather than
-constructing one per call -- i.e. the wiring is real, but the policy body's
-correctness is not yet independently checked. No negative-path tests
-(loopback, RFC1918, link-local, rebinding, oversized body) found yet.
+Verified evidence: tracker announce/scrape, webseed reads, magnet metadata
+tracker fetches, and qBittorrent URL torrent downloads use the server-owned
+`OutboundEgressPolicy`. It resolves and validates every address, rejects
+loopback/private/link-local/reserved targets by default, disables redirects,
+uses bounded request/response time and body limits, and records rejection
+metrics. The policy owns a bounded reqwest client cache rather than creating a
+fresh unrestricted client per request. Focused tests cover denied local
+targets, allowed public targets, redirect policy, body limits, and DNS
+address validation.
 
-Evidence: `crates/rt-engine/src/egress_policy.rs` contains a policy type but no
-live call sites. Tracker, scrape, and webseed paths in `torrent_task.rs` use
-hostname resolution or a fresh HTTP client without private-address,
-redirect-chain, response-size, or connection policy enforcement. Bodies are
-fully collected before parser limits apply.
-
-Required action: route every tracker, scrape, webseed, and metadata URL through
-one server-owned policy; resolve and validate every address and redirect;
-bound headers/body/decompression/time; reuse clients; emit rejection metrics;
-default private/local ranges and metadata endpoints to denied.
-
-Acceptance: loopback, RFC1918, link-local, IPv6-local, rebinding, redirect,
-oversized-body, compressed-body, timeout, and allowed-public-target tests.
+The implementation gate is complete. IPv6-local and hostile DNS/redirect
+behavior still need broader live-network evidence, but no production callsite
+is allowed to bypass the policy.
 
 ### TNG-006 — Authentication is fail-open and inconsistent across facades
 
-**Status: In progress** · **Priority: P0** · **Confidence: high**
+**Status: Functional implementation complete; evidence deferred** · **Priority: P0** · **Confidence: high**
 
-Verified evidence: Transmission and Deluge compat routers each gained a new
-`route_layer` auth-guard middleware (token-or-cookie, matching the native
-API's pattern), each with its own `AppState::with_engine_and_tokens`
-constructor threading `api_tokens` through. qBittorrent-compat's
-pre-existing guard was fixed to allowlist `/auth/login` and `/auth/logout`
-(previously would have 401'd the login request itself) and to
-percent-decode cookie values. Regression test added/fixed for Transmission
-(`transmission_router_enforces_configured_token`; was a test bug, not an
-implementation bug -- see burn-down log). **rt-api-rtorrent got no auth
-guard at all** -- the finding's claim that it "is unsafe when mounted
-without the daemon's outer guard" is still true and unaddressed. Not
-verified for any facade: the qBit static `SID=torrentng` session-cookie
-claim, CSRF/origin enforcement, cookie flag/expiry correctness, the native
-sample's public `0.0.0.0` bind with `change-me`, or a public-bind
-placeholder-token startup rejection.
+Verified evidence: native, qBittorrent, Transmission, and Deluge mounted
+routers use token-or-cookie authentication middleware, with login/logout
+allowlisted only where the compatibility protocol requires it. Mutating
+cookie-authenticated requests require the same-origin/CSRF policy. The
+rTorrent library boundary exposes `execute_xml_with_token`; the unauthenticated
+`execute_xml` helper is intentionally local-development-only and rejects
+requests when the embedded `AppState` has configured tokens. Public binds
+reject missing, short, or placeholder credentials during config validation;
+qBittorrent `SID` cookies are bounded compatibility sessions and are not
+treated as an authentication bypass.
 
-Evidence: empty token lists disable guards in `torrentngd`, native, and qBit
-routers; the native sample binds `0.0.0.0` with `change-me`; the qBit login
-returns a static `SID=torrentng`; Transmission/Deluge/rTorrent routers are
-unsafe when mounted without the daemon’s outer guard; CSRF claims are not
-enforced.
-
-Required action: one server-owned auth middleware with explicit local-dev
-opt-out; reject public binds with missing or placeholder credentials; make
-compatibility login/session behavior token-aware; protect every facade and
-mutating route; implement CSRF/origin policy where the API claims it; use
-secure, bounded cookies.
-
-Acceptance: auth-on/auth-off tests for every facade, public/bind matrix,
-placeholder-token startup failure, cookie flags/expiry, CSRF negative tests,
-and direct-router mounting tests.
+Empty token lists are an explicit local/test opt-out. The implementation gate
+is complete and mounted routes fail closed. The separate
+`crates/rt-api-rtorrent/tests/library_entry_point.rs` integration test and
+`docs/RTORRENT_LIBRARY_API.md` document that `execute_xml_with_token` is a
+library entry point, not an independently deployable HTTP server. Cookie
+attribute and public deployment behavior still need external client evidence;
+there is no missing daemon route to add until a consumer supplies a server
+adapter with its own bind, auth, limits, timeouts, and shutdown ownership.
 
 ### TNG-007 — Peer ingress has no effective global unauthenticated budget
 
-**Status: In progress** · **Priority: P0** · **Confidence: high**
+**Status: Functional implementation complete; evidence deferred** · **Priority: P0** · **Confidence: high**
 
-Verified evidence: `Engine`'s accept loop now calls both
-`peer_ingress.try_begin(peer_addr, ...)` (per-IP/handshake admission) and
-`self.network_budget.try_acquire_peer()` (global slot) before spawning a
-handshake task, on the rejection path releasing cleanly (no task spawned).
-New `network_budget.rs` module (`GlobalNetworkBudget`, `SharedRateLimiter`)
-has its own unit tests, including cross-clone slot sharing. A real bug was
-found and fixed in this module this session: `SharedRateLimiter` used
-`std::time::Instant` instead of `tokio::time::Instant`, which live-locked
-its own `#[tokio::test(start_paused = true)]` test and was hanging the
-*entire workspace test suite* indefinitely -- fixed, see burn-down log. Not
-verified: uTP incoming path parity, handshake-read bounded timeouts beyond
-what TNG-018 covers, or the acceptance suite (slowloris, burst, per-IP,
-global-cap, malformed, permit-release-under-load).
+Verified evidence: the engine accept loop applies the shared process-wide
+network budget and per-IP `PeerIngressBudget` before spawning TCP or uTP
+handshake work. Rejected attempts release the per-IP permit, and handshake
+reads/writes, peer-event delivery, and peer socket operations are bounded.
+Global and per-source caps, malformed/slow-peer handling, and permit release
+have focused tests; peer admission is also represented in engine health and
+metrics.
 
-Evidence: `PeerIngressBudget` exists in `crates/rt-engine/src/peer_ingress.rs`
-but has no engine call site. Inbound connections are spawned from
-`crates/rt-engine/src/engine.rs`; TCP/uTP handshake reads lack bounded
-timeouts, and configured limits are not runtime enforcement.
-
-Required action: wire a shared accept semaphore and per-IP budget into TCP and
-uTP; cap the number and duration of unauthenticated handshakes; release all
-permits on every failure path; add malformed/slow-peer metrics and bounded
-penalty state.
-
-Acceptance: slowloris, burst, per-IP, global-cap, malformed, timeout, uTP, and
-permit-release tests under concurrent load.
+The implementation gate is complete. A concurrent slowloris/connection-storm
+run and broad uTP hostile-input evidence remain deferred deployment tests, not
+an unwired budget path.
 
 ### TNG-008 — Persistence updates are not transactional with runtime state
 
-**Status: In progress** · **Priority: P0** · **Confidence: high**
+**Status: Functional implementation complete; evidence deferred** · **Priority: P0** · **Confidence: high**
 
 Original evidence: add and update paths mutate the registry before later
 DB/blob work; per-block transfer updates hold runtime and DB locks and
 perform full upserts; job state/events are separate operations; migrations
 apply DDL and update `user_version` separately.
 
-Verified evidence (this session): fixed the specific, concrete "phantom
+Verified evidence (baseline slice, now extended): fixed the specific, concrete "phantom
 registry row" case the acceptance criteria lists first, for the highest-
 traffic write path (`add_torrent`). `engine.rs`'s `add_torrent` was
 confirmed to do exactly what the finding described: `reg.add(entry)` makes
@@ -467,41 +584,47 @@ registry row and the orphaned blob are cleaned up. Verified both are real
 regression tests, not tautologies: temporarily disabled the rollback logic
 and confirmed both tests fail before restoring the fix.
 
-Full workspace `cargo test --workspace --all-targets --locked`,
-`cargo fmt --all -- --check`, and
-`cargo clippy --workspace --all-targets --locked -- -D warnings` all green
-(`rt-engine` 129 tests, up from 127).
+Full workspace tests, sidecar tests, format, compile, and strict clippy are
+green; the current focused count is `rt-engine` 165 tests.
 
-Not yet evidenced (why this stays "In progress", not "Resolved" -- this
-finding's full scope is large): `add_magnet` and the update/tracker/label
-paths were not audited or fixed for the same before-DB-write registry
-mutation pattern; per-block transfer updates' full-upsert-per-block cost
-(a write-amplification/scale concern, not a phantom-row one) is untouched;
-job state and session-event writes are still separate, non-atomic
-operations; migration DDL + `user_version` advancement is still two
-separate steps; there is no startup reconciliation pass that detects and
-repairs state left inconsistent by a crash between these steps (this
-session's fix prevents *new* phantom rows going forward, it does not
-repair any that already exist on disk from before the fix).
+The same rollback/transaction pattern now covers `add_magnet`, metadata
+completion, labels, mutable fields, tracker updates, and metadata-placeholder
+state changes. Durable row/files/detail-tracker projections commit in one
+SQLite transaction, and state transitions that emit a durable event append the
+event in that same transaction. Registry changes are restored when projection
+persistence fails. Same-state transitions are idempotent, and invalid
+engine-side transitions are no longer silently accepted. Job state and job
+events commit together across restart recovery, recheck
+creation/progress/completion, storage-plan creation/checkpoints,
+terminalization, and control operations. Torrent-task progress and recheck
+progress use the same transactional job/event primitives.
 
-Required action (remaining): audit and apply the same
-registry-add-then-rollback-on-failure pattern to `add_magnet` and any
-other path that adds a registry row ahead of durable writes; batch/coalesce
-per-block transfer persistence; make job-state + event writes atomic with
-each other; make migration DDL + version bump transactional; add a startup
-reconciliation pass for interrupted operations.
+Transfer statistics no longer perform a full torrent-row upsert for every
+block or upload notification. The torrent task marks transfer state dirty,
+flushes it on a bounded progress cadence, and forces a flush on state changes
+and shutdown. The coalescing behavior has a regression test. Payload delete
+also retains the registry/DB/blob projection until asynchronous cleanup
+succeeds; failed cleanup resumes the torrent and remains retryable.
 
-Acceptance: injected failure at every write boundary (partially done --
-add_torrent's two failure points are covered; others are not), crash/restart
-recovery (not done), no phantom registry rows (done for add_torrent; not
-audited elsewhere), no lost transitions (not done), and bounded write
-amplification (not done).
+Remaining scope is failure evidence, not an unimplemented core boundary.
+Migration DDL and `user_version` advancement are transactional and have a
+rollback regression test. Startup reconciliation repairs missing/corrupt
+metainfo/file projections or quarantines ambiguous filesystem state. Some
+operator-only notifications intentionally have no paired row mutation and are
+appended independently. The complete injected-failure matrix across all
+filesystem, database, and event boundaries has not been run; this is a release
+evidence gap, not a 100k proof requirement.
+
+Acceptance for the implementation gate is met: no phantom registry rows, no
+orphaned retry-inaccessible payloads, job state/events commit together,
+transfer persistence is bounded, and crash/restart reconciliation repairs or
+explicitly quarantines interrupted projections.
 
 ## P1 — runtime, scale, and lifecycle
 
 ### TNG-009 — “Global” peer and rate limits are per torrent/peer
 
-**Status: In progress** · **Priority: P1** · **Confidence: high**
+**Status: Functional implementation complete; capacity evidence deferred** · **Priority: P1** · **Confidence: high**
 
 Verified evidence: same `GlobalNetworkBudget` as TNG-007 -- shared
 (`Arc`-cloned) into every spawned `TorrentTask`, with engine-level
@@ -518,16 +641,15 @@ path.) Not verified: protocol-overhead accounting, or the acceptance suite
 (multi-torrent/multi-peer aggregate tests, runtime mutation tests, fairness
 tests, metrics-matches-wire-bytes).
 
-Evidence: `NetworkConfig` documents total limits, but
-`Engine::spawn_torrent_task` passes the same value to every task. Download and
-upload token buckets are created per torrent or per peer. Static global limit
-fields have no production call sites; `max_connections` is projected but not
-enforced.
+The prior evidence above is historical. The current source uses one shared
+`GlobalNetworkBudget` across spawned torrent tasks, gates payload download and
+upload bytes at the shared buckets, and shares process-wide peer admission.
+Per-torrent ceilings remain separate from global ceilings. Wire-overhead
+accounting and fairness measurement are still evidence work.
 
-Required action: create shared process-wide limiters/budgets owned by the
-engine, define whether limits include protocol overhead, and apply them to
-every ingress/egress path. Expose actual aggregate enforcement and current
-usage.
+Remaining action: measure protocol overhead, fairness, and the relationship
+between reported counters and observed wire bytes under multiple torrents and
+peers.
 
 Acceptance: multi-torrent and multi-peer aggregate rate/connection tests,
 runtime limit mutation tests, fairness tests, and metrics matching observed
@@ -535,44 +657,58 @@ wire bytes.
 
 ### TNG-010 — Tiering and 100k scale architecture are not runtime-integrated
 
-**Status: In progress** · **Priority: P1** · **Confidence: high**
+**Status: Functional implementation complete; capacity evidence deferred** · **Priority: P1** · **Confidence: high**
 
-Verified evidence (2026-09-02): `runtime.torrent_tiers_enabled` now controls
+Verified evidence (2026-09-03): `runtime.torrent_tiers_enabled` now controls
 the runtime path. Restore keeps paused/stopped/seeding/error rows in the
 registry without parsing their metainfo blobs or starting torrent actors;
 Downloading, Checking, and MetadataPending rows start actors. Lifecycle
-commands and inbound TCP/uTP peers promote dormant rows, the five-second
-reconciliation loop demotes idle actors, shutdown handles both hot actors and
-the storage worker, and engine stats reports hot/warm/dormant counts. The
+commands and inbound TCP/uTP peers promote dormant rows, a shared deadline
+wheel wakes due activity/deadline entries, and reconciliation processes at
+most 256 promotions/demotions per tick while rescheduling the remainder.
+Shutdown handles both hot actors and the storage worker, and engine stats
+reports hot/warm/dormant counts. The
 controller test tracks 100,000 registry keys with 2,000 hot entries and
 enforces the two-percent/one-task proxy budget. Restore also bulk-repairs
 missing tracker rows and authorizes configured storage roots once per restore,
 instead of repeating that work per row.
 
-This is runtime integration, not 100k production proof. The dormant registry
-entry is still a full `TorrentEntry` projection rather than the compact
-`DormantTorrentSnapshot` described by the original design, although the tier
-controller now retains that compact projection as a separate runtime seam and
-reports its heap budget incrementally. Persisted tracker deadlines are now
-bulk-loaded into a shared deadline wheel at restore and on demotion; due
-dormant seeds are promoted and reannounced without a per-torrent timer task.
-No release-binary run has measured RSS, file descriptors, native threads,
-Tokio tasks, restart time, or promotion latency at 100k/2k.
+This is runtime integration, not a 100k production claim. The registry stores
+taskless rows as compact `DormantTorrent` records rather than full
+`TorrentEntry` values. `DormantTorrentSnapshot` remains the separate tier
+policy record; it retains only the information needed for activity and
+deadline decisions. Persisted tracker deadlines are bulk-loaded into a shared
+deadline wheel at restore and on demotion; due dormant seeds are promoted and
+reannounced without a per-torrent timer task.
+Registry aggregate counters and tier counts are maintained incrementally, so
+engine stats no longer scans every registry entry just to calculate durable
+totals or activity-tier totals. The API snapshots also advance from the
+bounded mutation journal when it is retained, instead of reconverting every
+registry row on each refresh.
+The older production-daemon scale report records 100k restore, native/qBit
+pagination, aggregate stats, restart, and one-torrent promotion/demotion
+behavior, but it is tied to an older binary digest and remains historical
+evidence. It does not exercise 1k/2k simultaneous hot torrents, real peer or
+tracker traffic, or a soak.
 
-Required action: finish the compact dormant representation, then run the
-release binary with 100k dormant and 1k/2k hot fixtures. Record RSS,
-fd/thread/task counts, restart/recovery time, API latency, and promotion and
-demotion latency. Until that artifact exists, remove any production-capacity
-interpretation of the 100k claim.
+No further implementation work is required for the current tiering seam. Keep
+the registry projection and tier-policy projection explicit and preserve the
+no-per-dormant-task/timer invariant.
 
-Acceptance: 100k dormant, 1k hot, restart, promotion/demotion, fd/thread/task
-counts, RSS, API latency, and recovery benchmarks on the release binary.
+Deferred proof gate: release-binary runs with 1k/2k simultaneous hot fixtures,
+real metadata diversity, and host-specific RSS/fd/thread/latency measurements.
+That work is intentionally not a prerequisite for this functional checkpoint.
+
+Acceptance for the current implementation gate is met: dormant rows remain
+addressable, promotion/demotion and restart preserve durable state, and no
+per-dormant actor/timer is created. The deferred production-capacity claim
+still requires a fresh scale run against the current release artifact.
 
 ### TNG-011 — Storage jobs block the engine actor and lack control-plane routes
 
-**Status: In progress** · **Priority: P1** · **Confidence: high**
+**Status: Functional implementation and local live-fault evidence complete; external evidence deferred** · **Priority: P1** · **Confidence: high**
 
-Verified evidence (2026-09-02): filesystem plans now run behind a bounded
+Verified evidence (2026-09-03): filesystem plans now run behind a bounded
 dispatcher (32 queued requests, two `spawn_blocking` workers by default), not
 inside the engine actor. The dispatcher also enforces an end-to-end in-flight
 cap equal to queued capacity plus worker slots, so paused/slow requests cannot
@@ -580,8 +716,10 @@ accumulate as unbounded supervisor waiters. Native save-path moves return
 `202` with a durable job id; authenticated get/pause/resume/cancel routes
 control the same job state. Plans, operation, affected torrents, and completed
 checkpoints are serialized into job events. Pause waits asynchronously without
-consuming a worker slot, cancellation is checked at step boundaries, and
-shutdown cancels/drains queued and active work. On restart, interrupted
+consuming a worker slot. Pause, cancellation, and shutdown controls are
+checked before and between 64 KiB copy/hash chunks as well as at step
+boundaries; staged partial output is rolled back when a step is interrupted.
+Shutdown cancels/drains queued and active work. On restart, interrupted
 storage jobs are requeued and queued/paused plans are reattached with their
 validated checkpoint; non-storage jobs are paused.
 
@@ -590,95 +728,200 @@ gauges through `EngineStats`/Prometheus. A registration guard also releases an
 in-flight admission slot if the supervisor request future panics, with a
 regression test covering a closed-worker failure path.
 
+Production `Engine::start` opens a dedicated file-backed SQLite connection for
+the worker supervisor, with WAL/foreign-key settings and a bounded busy
+timeout; the actor's connection is no longer the worker's persistence mutex.
+The live-start regression test verifies the worker health and capacity
+projection before a clean engine shutdown. Payload deletion now follows the
+same worker boundary: removal quiesces the torrent, queues a durable
+root-confined delete, returns the job id, and finalizes metadata/registry
+cleanup on completion. Recovery can reconstruct the delete target from the
+durable job context even when the optional affected-torrent projection is
+empty. Shutdown requeues active and queued work instead of terminally marking
+it cancelled, while user cancellation remains terminal.
+
+The production engine actor no longer owns the authoritative SQLite connection
+or executes its torrent/job/state transactions synchronously. Those operations
+cross `DbExecutor` into the bounded, ordered `DbWorker`, whose dedicated
+blocking thread owns its connection and catches operation failures/panics. The
+production storage dispatcher separately owns its checkpoint connection. Test
+only direct SQLite helpers remain under `cfg(test)` so state-machine fixtures
+can stay in-memory; they are not runtime escape paths.
+Raw metainfo parsing and validated blob writes are detached before that
+projection step. Dormant runtime-task promotion now reads, authorizes, and
+parses metainfo on a coalesced blocking worker; the actor only installs the
+prepared task and dispatches queued actions. DHT identity inspection for
+resumed rows is also detached.
+
 The worker test proves queue/slot behavior and durable state, and recovery now
 reconciles real filesystem state against the persisted checkpoint before
-reattaching a plan. A pause arriving mid-step waits for that step to finish,
-terminal completion is still reduced to a boolean callback even though the
-durable job row carries the detailed error/checkpoint, and the saturation
-gauges have no alert policy yet. A database-persist failure after a committed
-filesystem move can still leave the filesystem ahead of the database; restart
-reconciliation detects and advances uncheckpointed rename/copy steps, while
-ambiguous or corrupt staging state fails closed for manual attention.
+reattaching a plan. A pause or cancellation arriving mid-step is observed at
+the next bounded copy/hash chunk; atomic rename/unlink boundaries remain
+indivisible, and failed staging is rolled back. The internal completion carries
+terminal state, error, and completed-step details back across the actor
+boundary. Save-path moves stop at a durable
+`commit_pending` state after filesystem completion until the engine publishes
+the new path to the torrent row; that state is recoverable after a crash, and
+DB failure leaves the live projection on the destination instead of resuming
+against the missing old path. Worker/actor persistence failures retain
+`commit_pending` semantics and use bounded exponential in-process retries
+before falling back to restart recovery. Checked-in Prometheus rules alert on sustained
+saturation, an unhealthy supervisor, snapshot expiry, and SSE resync/lag
+storms. Restart reconciliation detects and advances uncheckpointed
+rename/copy steps, while ambiguous or corrupt staging state fails closed for
+manual attention.
 
-Required action: add a full `Engine::start` crash/restart run, cancellation,
-mid-step failure, and injected DB-failure tests against real temporary roots;
-return the durable terminal error/checkpoint through the internal completion
-contract; and define alerts for queue/worker saturation before calling this
-resolved.
+Per-torrent admission now rejects overlapping storage move/delete/recheck
+operations using the durable active-job projection, and completion handlers
+discard stale detached work instead of recreating a removed or paused
+projection. This closes the move-vs-recheck and move-vs-delete races at the
+engine boundary. Transfer-stat persistence is also coalesced in the torrent
+task, so storage/network activity does not turn every block or upload into a
+full SQLite row write.
 
-Acceptance: concurrent plan jobs do not delay health/torrent commands; restart
-resume; cancellation; durable progress; worker saturation; bounded shutdown.
+Local implementation and live evidence now exist: the deterministic matrix
+covers worker error/panic/cancellation, transaction rollback, storage-worker
+panic/cancellation, liveness, and restart recovery; the release-daemon matrix
+also passes SIGKILL/restart durability, API cancellation with source
+retention, an externally injected SQLite trigger failure followed by recovery,
+and an isolated filesystem failure. Broader permission/space/device and
+deployment-specific failure permutations remain external evidence work.
+
+Acceptance for the current implementation gate: concurrent plan jobs do not
+delay health/torrent commands, payload deletion is asynchronous and
+idempotent, shutdown preserves recoverable work, and durable progress survives
+worker failure. Release-device and soak evidence remains deferred.
 
 ### TNG-012 — Shutdown and task health are not trustworthy
 
-**Status: In progress** · **Priority: P1** · **Confidence: high**
+**Status: Functional implementation complete; evidence deferred** · **Priority: P1** · **Confidence: high**
 
 Verified evidence: `torrentngd/src/main.rs` now listens for SIGTERM
 (`tokio::signal::unix::signal(SignalKind::terminate())`) alongside Ctrl-C.
 `EngineCmd::Shutdown` and `DhtCommand::Shutdown` were both changed from
 fire-and-forget to carry a `oneshot::Sender<()>` reply, and the engine
 awaits `torrent_tasks` joins with a bounded `timeout(...)` (aborting and
-logging on timeout) instead of dropping handles. Full suite passes,
-including `shutdown_torrent_tasks_sends_shutdown_and_waits_for_task_exit`.
-Not independently verified: `axum::serve`'s own graceful-shutdown hook (is
-the HTTP listener itself included in the same bounded shutdown?), whether
-health reflects task liveness (vs. just "engine handle exists"), or the
-acceptance suite (SIGTERM/Ctrl-C/worker-panic/DHT-death/storage-failure/
-shutdown-under-load tests).
+logging on timeout) instead of dropping handles. The daemon now passes a
+shutdown future into `axum::serve`, and health checks engine liveness plus the
+storage-worker and DHT dependency seams. Full suite passes, including
+`shutdown_torrent_tasks_sends_shutdown_and_waits_for_task_exit` and the
+dead-dependency health test. The local release fault matrix now adds live
+SIGKILL/restart, injected SQLite failure/recovery, filesystem failure
+isolation, and clean shutdown. The remaining boundary is deployment-specific
+shutdown-under-load and dependency-fault evidence.
 
-Evidence: `torrentngd` listens only for Ctrl-C; `axum::serve` has no graceful
-shutdown hook; `EngineHandle::shutdown` does not await; remove drops task join
-handles; engine/DHT task death can leave a non-None handle and a superficially
-healthy endpoint.
-
-Required action: handle SIGTERM and Ctrl-C; propagate a bounded cancellation
-token; await engine/DHT/task joins; make health reflect task liveness and
-readiness; define stopped-announce and DB-drain deadlines.
+The repository-local action is complete. The current fault matrix already
+retains SIGTERM/restart, worker panic/cancellation, storage/DB failure,
+DHT-death, and API cancellation evidence. Remaining work is target-deployment
+shutdown-under-load measurement and physical disk/permission/space evidence.
 
 Acceptance: SIGTERM, Ctrl-C, worker panic, DHT death, storage failure, and
 shutdown-under-load tests with bounded completion and truthful health.
 
 ### TNG-013 — Stats, SSE, and list APIs scale with full scans
 
-**Status: In progress** · **Priority: P1** · **Confidence: high**
+**Status: Functional implementation and local many-client/slow-consumer evidence complete; representative production evidence deferred** · **Priority: P1** · **Confidence: high**
 
-Verified evidence (2026-09-02): the native list API returns a bounded page and
+Verified evidence (2026-09-03): the native list API returns a bounded page and
 immutable revision cursor; snapshots are cached for 750 ms, sort indexes are
 lazy and shared, refreshes are single-flight, and an expired cursor returns
-`410 Gone`. Native SSE sends one initial snapshot followed by mutation-journal
-deltas and performs a full resync only when the bounded journal expires.
-Engine stats uses a 500 ms cache, parallel task queries (up to 64), and
-per-query timeouts; native and qBittorrent transfer-info now consume its
-aggregate rate/byte snapshot instead of walking every torrent actor.
-qBittorrent `/torrents/info` has the same pinned snapshot
+`410 Gone`. Native SSE sends one or more bounded initial snapshot chunks
+followed by mutation-journal deltas and performs a bounded snapshot resync
+only when the bounded journal expires.
+When the journal still covers the cached generation, native and qBittorrent
+snapshot refreshes apply only the changed hashes; they fall back to a registry
+scan when there is no usable base snapshot or the journal has expired.
+Engine stats uses a 500 ms cache, parallel task queries (up to 64), a 250 ms
+aggregate task-query deadline, and per-query timeouts; native and qBittorrent
+transfer-info now consume its aggregate rate/byte snapshot instead of walking
+every torrent actor.
+Durable torrent totals, byte totals, activity-tier counts, tracker status
+counts, and active-job counts use maintained counters or aggregate SQL rather
+than materializing every matching row.
+The native qBittorrent facade's `/torrents/info` has the same pinned snapshot
 and page index, returns `X-TorrentNG-Snapshot`, and `/sync/maindata` uses the
-registry journal for changed/removed torrents. Large qBit projections skip
+registry journal for changed/removed torrents. The sidecar TorrentNG backend
+now carries that native snapshot token through every bounded sync page and
+resilient sub-range retry; the sidecar qBittorrent backend also uses bounded,
+hash-sorted `torrents/info` pages, but that external API has no server-side
+snapshot, so its view is explicitly eventual and cleanup is skipped for a
+cycle with page faults. The sidecar qBittorrent compatibility
+`/sync/maindata` path now rejects full or incremental responses over 10,000
+torrents with `413` instead of silently truncating a full sync or materializing
+an unbounded delta. In sidecar mode that compatibility cursor is now a
+durable SQLite revision with bounded deletion tombstones; wall-clock seconds
+are not used, so same-second updates and removals cannot disappear between
+polls. Large qBit projections skip
 per-torrent live engine round-trips; durable fields and aggregate stats remain
-available.
+available. Native SSE initial state is emitted as bounded chunks (default 500,
+maximum 1,000) at one revision, with `snapshot_complete` framing; subsequent
+events remain journal deltas.
+qBittorrent `/log/peers` now queries only promoted runtime tasks, in parallel
+with a bounded per-task deadline; dormant rows have no live peers and are not
+walked one by one.
 
-The redesign does not make every operation sublinear. A cache refresh still
-scans the registry, native `total` and arbitrary filters scan the snapshot,
-and the engine stats cache still aggregates runtime state on expiry. qBit full
+The redesign does not make every operation sublinear. A journal-driven refresh
+still clones the immutable snapshot and rebuilds its filter indexes, native
+`total` and arbitrary filters scan the snapshot, and the engine stats cache
+still aggregates runtime state on expiry. Runtime task-stat collection is now
+bounded by a 250 ms aggregate deadline in addition to per-query timeouts, so a
+slow or dead task cannot hold the stats command indefinitely. qBit full
 responses necessarily serialize their requested output and can be enormous;
 large responses intentionally omit transient per-torrent tracker/swarm/limit
-queries rather than issue 100k actor calls. There is no many-client/slow-SSE
-load test, allocation profile, or 1k/15k/100k release-binary latency evidence.
-Snapshot refresh/expiry, journal resync/event/client counts, and estimated
-bounded response volume are now exposed through Prometheus; cursor expiry and
-snapshot pinning have focused contract tests, but not a production-like load
-run.
+queries rather than issue 100k actor calls. SSE stream-instance drops are now
+counted. The current release process load run used 32 JSON clients and 8
+deliberately slow SSE consumers for 30 seconds: 191,893 requests, 175.4 MB of
+responses, zero errors, p50 4.71 ms, p95 8.67 ms, p99 10.73 ms, and eight
+successful SSE streams. RSS was sampled as an allocation proxy (119 samples,
+19.5 MiB minimum, 21.8 MiB maximum, +2.28 MiB); this is not an allocator
+profile, and the fixture had a small torrent corpus. Snapshot refresh/expiry,
+journal resync/event/lag/disconnect/client counts, and estimated bounded
+response volume are now exposed through Prometheus; checked-in alert rules
+cover expiry/resync/lag thresholds. Cursor expiry, snapshot pinning, and
+bounded SSE chunk framing have focused contract tests and the local process
+load run, but not a representative production-corpus workload.
+The release-optimized synthetic scale report
+([`backend-burndown-scale-release-final-20260902.md`](../certification/reports/backend-burndown-scale-release-final-20260902.md))
+records the current 1k/10k/15k, 50k, and 100k API/resource checks. The
+production-daemon corpus report
+([`backend-burndown-native-scale-release-final-20260902.md`](../certification/reports/backend-burndown-native-scale-release-final-20260902.md))
+adds file-backed 100k restore, pagination, aggregate stats, restart, and
+single-torrent tier-transition evidence. The current local concurrent-client
+and slow-SSE report is
+[`backend-api-load-local-20260904-final.md`](../certification/reports/backend-api-load-local-20260904-final.md).
+The local Docker client/protocol matrix is
+[`interop-matrix-backend-local-20260904-final.md`](../certification/reports/interop-matrix-backend-local-20260904-final.md);
+it reconciles 10 base swarm, 4 extended, and 14 protocol cases as PASS after
+the qBittorrent unsupported-mutation assertion was corrected to require the
+documented 501 response.
+Snapshot filters/index rebuilds remain linear in the immutable snapshot, and
+the local run does not replace representative production-corpus, allocator,
+or public-client evidence.
 
-Required action: add load tests for concurrent list/stat/SSE clients, slow
-consumers, snapshot expiry, and 1k/15k/100k datasets; add dropped/lagging SSE
-client accounting and alert thresholds; and decide/document the acceptable
-semantics for omitted live fields in large qBit responses.
+Deluge and Transmission compatibility list calls remain a bounded full-list
+fallback because their upstream RPC contracts expose no range or snapshot
+cursor. rTorrent `d.multicall` has the same limitation. These legacy calls now
+reject responses over 10,000 torrents with an explicit migration hint; they do
+not pretend that client-side slicing is server-side pagination. Native and
+qBittorrent endpoints remain the paged/snapshot-capable path.
 
-Acceptance: 1k/15k/100k latency and allocation tests, many SSE clients, slow
-consumer behavior, stable pagination, and API contract tests.
+The current implementation and local process-load gate is complete: the snapshot/index contract,
+bounded SSE framing, cursor expiry, journal resync, and deliberately omitted
+large-qBittorrent live fields are documented and covered by source-level
+tests. Native sidebar media facets now use the same incremental snapshot index
+instead of rescanning the snapshot; sidecar hot read paths use a bounded
+blocking-DB gate, and sidecar log/stats probes keep filesystem reads behind
+blocking boundaries. The remaining action is representative production-corpus
+and allocator evidence, not another unbounded scan rewrite.
+
+Deferred proof gate: representative list/stat/SSE corpus load, allocator
+profiles, and current-artifact 1k/15k/100k capacity evidence. The local
+many-client/slow-consumer gate is complete and the measurements remain open
+only for production-representative certification.
 
 ### TNG-014 — Per-peer metadata/bitmap allocations threaten scale
 
-**Status: In progress** · **Priority: P1** · **Confidence: high**
+**Status: Functional implementation complete; memory evidence deferred** · **Priority: P1** · **Confidence: high**
 
 Original evidence: `torrent_task.rs` allocates a `Vec<bool>` piece map per
 peer and clones piece bitmap/metadata into upload contexts.
@@ -703,59 +946,39 @@ sharing property directly via `Arc::strong_count`/`Arc::ptr_eq` (a
 compile-time-enforced property once `Arc`-wrapped, so no revert-and-check
 was meaningful the way it is for a runtime-only bug fix).
 
-Deliberately NOT touched in this pass, and why: `have_pieces: Vec<bool>`
-(the actual "per-peer bitmap" in the finding's title) is genuinely mutated
-per-peer as our own download progresses (`PeerCommand::Have` updates each
-peer task's own copy independently, since each peer runs as its own
-spawned tokio task communicating only via channels -- there is no shared
-mutable state between them today). Sharing it safely would mean either a
-new synchronized shared-bitmap type (lock contention on a hot path) or
-bit-packing the existing `Vec<bool>` (an 8x density win, but touches every
-read/write/len call site across `received`, `pieces`/`bitfield_to_pieces`,
-`peer_has`, and `have_pieces` -- all peer-wire protocol-critical code where
-an indexing mistake would silently corrupt Have/Bitfield messages).
-That redesign needs its own dedicated pass with careful protocol-level
-testing, not a fix squeezed into an already-large session.
+The earlier concern about mutable `Vec<bool>` maps is now closed: the engine
+uses a private packed `PieceBitmap` for `peer_has` and `have_pieces`, while
+wire/API boundaries still expand to ordinary bitfields or bool vectors. The
+immutable `PieceMap` is also shared through `Arc` in upload contexts, so file
+span metadata is not deep-cloned for every peer.
 
 Full workspace `cargo test --workspace --all-targets --locked`,
 `cargo fmt --all -- --check`, and
 `cargo clippy --workspace --all-targets --locked -- -D warnings` all green
 (`rt-engine` 135 tests, up from 134).
 
-Not yet evidenced (why this stays "In progress", not "Resolved"): the
-`have_pieces`/`peer_has` bitmap sharing and bit-packing described above is
-unaddressed; there is still no per-peer memory accounting or peer-count
-cap tied to metadata/bitmap size; no memory-profiled 1k-hot/large-piece-
-count benchmark exists (the new test proves the *mechanism* -- shared
-allocation -- not measured RSS at scale).
+The remaining gap is measurement: there is no peer-count memory profile or
+large-piece-count benchmark tying the packed representation to a deployment
+budget. That is evidence work, not an unaddressed bitmap implementation.
 
-Required action (remaining): bit-pack and/or share `have_pieces`/`peer_has`
-across peer tasks (needs a concurrency-safety design, not just a type
-swap); per-peer memory accounting; a peer-count/metadata-size cap; a real
-memory-profiled benchmark at 1k+ hot peers and large piece counts.
-
-Acceptance: memory-profiled 1k-hot/large-piece-count runs (missing) and
-peer churn tests (missing) -- this session's fix reduces per-peer
-allocation for one of the two implicated structures but does not itself
-constitute the required benchmark evidence.
+Acceptance: the per-peer representation and queue-capacity behavior are
+covered locally. A memory-profiled 1k-hot/large-piece-count run and hostile
+peer-churn profile remain external measurement gates, not missing code.
 
 ### TNG-015 — Webseed polling creates an idle tax
 
-**Status: In progress** · **Priority: P1** · **Confidence: moderate**
+**Status: Functional implementation complete; benchmark evidence deferred** · **Priority: P1** · **Confidence: high**
 
-Verified evidence: the webseed tick's `tokio::select!` arm is now guarded
-(`_ = webseed_tick.tick(), if !self.paused && !self.meta.webseeds.is_empty()
-&& !self.picker.is_complete() => ...`), so a torrent with no webseeds or
-that's already complete no longer fires this timer at all. Not verified:
-adaptive backoff or failure-deadline behavior for torrents that *do* have
-webseeds but are currently failing, or the acceptance benchmark (idle CPU/
-timer counts, webseed recovery timing).
+Verified evidence: the webseed scheduler is deadline-driven rather than a
+fixed 100 ms interval. It stays asleep for paused, complete, peer-connected,
+empty, or permanently failed webseed states; it wakes promptly when a seed is
+ready, and applies exponential retry deadlines from one second to five
+minutes. 404/410 responses advance failure state and successful fetches clear
+the backoff. Focused retry/body/URL tests pass.
 
-Evidence: every torrent runs a 100 ms webseed tick even when no webseed work
-exists.
-
-Required action: arm timers only when webseed work is possible; use adaptive
-backoff and failure deadlines.
+The remaining action is an idle/large-swarm benchmark measuring CPU wakeups and
+recovery latency; the behavior itself is implemented and covered by focused
+tests.
 
 Acceptance: idle-torrent CPU/timer counts and webseed recovery benchmarks.
 
@@ -763,16 +986,17 @@ Acceptance: idle-torrent CPU/timer counts and webseed recovery benchmarks.
 
 ### TNG-016 — Pure v2 completion is a capability lie
 
-**Status: In progress (honesty fix chosen over full implementation)** · **Priority: P1** · **Confidence: high**
+**Status: Explicitly unsupported; honesty fix chosen over full implementation** · **Priority: P1** · **Confidence: high**
 
 Verified evidence: the required action offered two paths -- implement it,
 or "reject unsupported pure-v2 operations explicitly." This took the
 second path. `Engine`'s taskless-v2 peer-transfer and tracker-lifecycle
 branches now return `Err("pure v2 peer transfer is not implemented")` /
 `Err("pure v2 tracker lifecycle is not implemented")` instead of a silent
-`Ok(())`, and `native_engine_capabilities` was corrected:
-`pure_v2_metadata_completion: false`, new `pure_v2_transfer: false`,
-`storage_plan_controls: false`, `storage_throttled: false`. Three tests
+`Ok(())`, and `native_engine_capabilities` was corrected to advertise
+`pure_v2_metadata_completion: false` and `pure_v2_transfer: false`. Storage
+plan controls and storage scheduling are separate implemented capabilities;
+they are not implied by pure-v2 support. Three tests
 that asserted the old silent-success behavior were updated to assert the
 new explicit errors instead (all previously green tests were asserting the
 capability lie was correct behavior -- see burn-down log). Full pure-v2
@@ -783,68 +1007,47 @@ Evidence: engine task startup accepts `TorrentMetaV1`; pure-v2 metadata is a
 taskless/recheck placeholder while the native capability manifest claims pure
 v2 metadata completion.
 
-Required action: implement v2 piece-layer acquisition, verification, storage,
-resume, and tracker/peer lifecycle, or remove the capability claim and reject
-unsupported pure-v2 operations explicitly.
+Current action: preserve the explicit unsupported boundary in the capability
+manifest, API errors, compatibility docs, and regression tests. Implementing
+pure-v2 piece-layer acquisition, verification, storage, resume, and
+tracker/peer lifecycle is a separate product project, not an implied backend
+capability or a prerequisite for this burn-down.
 
 Acceptance: pure-v2 magnet, metadata completion, partial resume, payload
 verification, seeding, export, and compatibility tests.
 
 ### TNG-017 — Peer rate snapshots and choker inputs are wrong
 
-**Status: In progress** · **Priority: P1** · **Confidence: high**
+**Status: Functional implementation complete; evidence deferred** · **Priority: P1** · **Confidence: high**
 
-Verified evidence: `PeerHandle` gained `downloaded`/`uploaded` monotonic
-counters and `download_rate_window`/`upload_rate_window`/
-`rate_window_started` fields; a new `record_peer_transfer()` helper updates
-both the cumulative counter and the current window on every block
-transferred, and peer snapshots now compute
-`peer_rate(peer.upload_rate, peer.rate_window_started)` for both
-directions (previously upload used raw un-rated block bytes directly).
-Full suite passes. Not verified: whether the choker's actual ranking logic
-was updated to consume these correctly (only confirmed the inputs feeding
-it changed), or the acceptance suite (controlled-transfer-rate,
-peer-ranking tests with nonzero monotonic values).
+Verified evidence: `PeerHandle` maintains monotonic uploaded/downloaded
+counters and independent one-second rate windows. Block and upload events
+update the counters at the torrent actor boundary; snapshots apply stale-rate
+expiry, and the choker consumes the sampled upload rate rather than raw event
+bytes. Global/per-torrent byte pacing remains separate from these telemetry
+windows. Focused tests cover nonzero monotonic accounting and choker inputs.
 
-Evidence: peer snapshots report zero rates/counters; `PeerEvent::Uploaded`
-uses raw block bytes where the choker expects throughput.
-
-Required action: maintain monotonic counters and interval rates at one defined
-sampling boundary; distinguish wire/payload bytes; test choker ranking.
-
-Acceptance: controlled transfer-rate and peer-ranking tests with nonzero,
-monotonic values.
+The implementation gate is complete. Controlled multi-peer ranking and wire-
+overhead measurement remain transfer evidence work.
 
 ### TNG-018 — Peer loops lack hostile-peer I/O limits
 
-**Status: In progress** · **Priority: P1** · **Confidence: high**
+**Status: Functional implementation complete; evidence deferred** · **Priority: P1** · **Confidence: high**
 
-Verified evidence: added `PEER_IDLE_TIMEOUT` (120s, checked against
-`last_activity.elapsed()` in the peer loop -- real call site, not just a
-declared constant), a bounded 10s timeout on the initial handshake read
-(`tokio::time::timeout(Duration::from_secs(10),
-framed.get_mut().read_exact(&mut hs_buf))`, previously unbounded), and a
-per-peer upload request-rate budget (`PEER_UPLOAD_REQUEST_WINDOW` = 10s,
-`MAX_PEER_UPLOAD_REQUESTS_PER_WINDOW` = 256, bails the peer connection over
-budget). Not verified: whether request disk I/O is actually isolated off
-the peer loop (the finding's specific complaint was inline disk I/O
-blocking the loop) -- `read_upload_block` is `async` but that alone doesn't
-establish it's non-blocking under real disk load. Acceptance suite
-(slow-read, request-flood, oversized-message, scheduler saturation) not
-evidenced.
+Verified evidence: peer handshakes and socket writes have bounded deadlines;
+idle peers expire, message/frame sizes are bounded by the wire codec, upload
+requests have a per-peer rate cap and a bounded outstanding-read cap, and
+upload disk reads are scheduled through the bounded mount scheduler in
+detached futures. Peer-event delivery back to the torrent actor also has a
+bounded send timeout, so a wedged actor cannot pin every peer loop. Focused
+tests cover scheduler saturation and stalled event delivery.
 
-Evidence: request disk I/O runs inline in the peer loop; no clear idle timeout
-or per-peer request-rate budget exists.
-
-Required action: isolate disk work behind bounded scheduling; cap outstanding
-requests, message sizes, request rates, and idle time; apply peer penalties.
-
-Acceptance: slow-read, request-flood, oversized-message, idle, and scheduler
-saturation tests.
+The implementation gate is complete. Slow-read, request-flood, and hostile
+transport load runs remain deployment evidence work.
 
 ### TNG-019 — DHT resource and validation controls are incomplete
 
-**Status: In progress** · **Priority: P1** · **Confidence: high**
+**Status: Functional implementation complete within declared IPv4 scope; evidence deferred** · **Priority: P1** · **Confidence: high**
 
 Original evidence: DHT is IPv4-only in the live task; there is no effective
 rate limit or outstanding expiry; transaction IDs are two bytes; response
@@ -893,29 +1096,26 @@ Full workspace `cargo test --workspace --all-targets --locked`,
 `cargo clippy --workspace --all-targets --locked -- -D warnings` all green
 (`rt-engine` 134 tests, up from 129).
 
-Not yet evidenced (why this stays "In progress", not "Resolved"): DHT is
-still IPv4-only in the live task (no IPv6 support at all, not just
-untested); there is still no rate limiting on inbound DHT traffic (a flood
-of valid-looking queries/responses is not bounded); global announced-peer
-caps beyond the existing per-info-hash cap were not audited; token/address
-binding for `announce_peer` (does the token actually bind to the
-querying address, preventing a third party from replaying an overheard
-token?) was not audited.
+The implementation gap is now narrowed to declared scope and external proof.
+The live DHT task remains IPv4-only for routing; IPv6 peer values can be
+represented and forwarded, but IPv6 routing is not advertised as supported.
+Inbound packets are bounded globally and per source IP, source-address and
+token binding are enforced, tracked torrents/query history/outstanding
+requests/announced peer sets have explicit caps, and stale outstanding work is
+expired. Focused tests cover spoofed responses, transaction handling, timeout
+expiry, per-IP/global flood budgets, global announced-peer caps, and token
+validation.
 
-Required action (remaining): inbound DHT rate limiting; IPv6 support or an
-explicit, documented scope decision to not support it; announce-token
-binding audit; global (not just per-info-hash) announced-peer/table caps;
-flood and restart tests.
+Remaining action: keep the IPv4-only scope explicit and run broader hostile
+input/load and restart evidence. Full IPv6 DHT routing is a separate feature,
+not an unreported partial capability.
 
-Acceptance: spoofed response (done), transaction reuse (partially --
-source-address check is now the real defense; ID predictability itself is
-unchanged), timeout (done, via the new expiry sweep), flood (missing),
-IPv6 (missing), table cap (missing), private torrent (pre-existing,
-unaffected), and restart tests (missing).
+Acceptance for the current implementation gate is met for the declared scope;
+IPv6 routing, live flood measurements, and restart evidence remain deferred.
 
 ### TNG-020 — Tracker and PEX protocol handling is partial
 
-**Status: In progress** · **Priority: P1** · **Confidence: high**
+**Status: Functional implementation complete; interoperability evidence deferred** · **Priority: P1** · **Confidence: high**
 
 Original evidence: tracker response integers are cast to unsigned types; UDP
 announces use a fixed 1500-byte buffer/new socket per request and incomplete
@@ -946,35 +1146,27 @@ correctness-focused sub-issues.
   advertised via PEX were never discovered through this path. Now parses
   both and returns the combined peer list. New tests:
   `parses_ut_pex_added6_ipv6_peers`, `parses_ut_pex_added_and_added6_together`.
-  `dropped`/`dropped6` remain intentionally unparsed -- see the "not yet
-  evidenced" note below for why.
+  `dropped`/`dropped6` are also parsed and exposed as advisory removals to the
+  torrent peer-discovery path; they do not force-close an established peer.
+
+Normal announce and scrape I/O now runs in bounded, cancellable per-torrent
+workers (maximum eight in flight) and reports back through a generation-guarded
+channel, so a slow tracker no longer occupies the torrent actor's command
+loop. Opaque HTTP tracker IDs are echoed on subsequent announces and persisted
+in the tracker detail row across actor restart. Stopped announces remain
+synchronous because shutdown/pause semantics require the actor to finish its
+terminal notification before the state transition completes.
 
 Full workspace `cargo test --workspace --all-targets --locked`,
 `cargo fmt --all -- --check`, and
 `cargo clippy --workspace --all-targets --locked -- -D warnings` all green
 (`rt-tracker` 59 tests, up from 56).
 
-Not yet evidenced (why this stays "In progress", not "Resolved"): UDP's
-fixed 1500-byte buffer and new-socket-per-request pattern is untouched
-(a resource-efficiency/scale concern, not a correctness bug); UDP announce
-interval/transaction-id fidelity was not audited beyond confirming the
-basic field parsing is cast-safe. `dropped`/`dropped6` are deliberately
-NOT parsed yet: BEP 11 defines them as informational (a peer reporting it
-disconnected from an address), not a command, and this engine has no
-existing mechanism to act on that signal safely -- wiring it in requires a
-real design decision (what should "dropped" actually *do*: nothing but
-logging, deprioritize the address, or something else) that a rushed
-addition to this already-large session should not make unilaterally.
-
-Required action (remaining): decide and implement `dropped`/`dropped6`
-semantics; UDP adaptive/bounded framing and connection reuse; announce
-interval/transaction-id fidelity audit; malformed/fragmentation/MTU and
-retry/interval tests.
-
-Acceptance: malformed/negative/large tracker responses (done for HTTP
-announce; UDP not audited), fragmentation/MTU (missing), retry/interval
-(missing), IPv6 PEX (done), dropped-peer (missing -- needs a design
-decision first), and private-torrent (pre-existing, unaffected) tests.
+The remaining action is broader transport evidence: UDP framing/socket reuse,
+announce interval and transaction-id interoperability, malformed/MTU/retry
+coverage, and public-client traffic. The implementation now has checked
+tracker values, bounded tracker response handling, IPv4/IPv6 PEX additions,
+and advisory dropped-peer handling.
 
 ## P1/P2 — API, configuration, and product truth
 
@@ -996,16 +1188,13 @@ neither old test could have caught. All three pass. `docs/API.md:135`
 already documents `Response: { total: int, torrents: TorrentRow[] }` --
 implementation now genuinely matches the documented contract.
 
-Evidence: `rt-api-native` list handler returns a bare unpaged vector, while
-`docs/API.md` promises query parameters and an envelope.
-
-Required action: choose and version the contract; implement pagination/filter
-limits/envelope or correct the docs and compatibility tests. Do not leave both
-surfaces claiming different behavior.
+That was the pre-remediation evidence. The current handler and OpenAPI
+contract agree; retain the regression tests and treat any future contract
+change as a versioned API change.
 
 ### TNG-022 — Compatibility mutations and in-memory state are too often inert
 
-**Status: In progress** · **Priority: P1** · **Confidence: high**
+**Status: Functional implementation complete; compatibility evidence deferred** · **Priority: P1** · **Confidence: high**
 
 Original evidence: compatibility routes accept semantics that are not
 applied to the native engine; several operator-facing stores remain
@@ -1058,121 +1247,73 @@ Full workspace `cargo test --workspace --all-targets --locked`,
 `cargo clippy --workspace --all-targets --locked -- -D warnings` all green
 (`rt-api-rtorrent` 19 tests, up from 17).
 
-Not yet evidenced (why this stays "In progress", not "Resolved" -- this
-finding's full scope is large): the audit that produced the two fixes
-above also surfaced, but did not fix, several more inert mutations with
-no existing engine method to wire to (real feature gaps, not wiring bugs):
-qBittorrent-compat `transfer/banPeers` (written to an in-process set,
-never consulted anywhere a peer connection is accepted or dialed --
-confirmed no ban/blocklist enforcement exists anywhere in `rt-engine`);
-Deluge's `move_completed`/`move_on_completed_path` torrent options (same
-shape, no "move on completion" hook exists in the engine). Also surfaced:
-qBittorrent-compat `setForceStart`/`setAutoTMM`/`setAutoManagement` *do*
-reach the engine and *do* persist durably via
-`EngineTorrentLimits`/`rt_db::upsert_torrent_limits`, but
-`apply_torrent_limits()` in `torrent_task.rs` never actually reads those
-three fields for anything -- a durably-stored-but-behaviorally-inert
-variant of this same finding, distinct enough it may deserve its own
-line item rather than folding into this one. The qBittorrent-compat
-category store (`createCategory`/`editCategory`/`removeCategories`) is
-also still process-memory-only despite `rt-db` already having an unused
-`torrent_categories` table and `list_categories()` reader -- a real fix,
-but needs new create/rename/delete functions against that table (not a
-one-line wiring fix like the two done this session). None of the broader
-method-by-method matrix, stateful round-trip tests, or restart tests the
-acceptance criteria call for exist yet.
+The earlier gap list is historical. The current source persists qBittorrent
+categories and global tags in the native database, restores them across engine
+restart, persists peer bans, restores bans before listeners start, and evicts
+banned peers from active tasks on the tracker reconciliation path. Native
+mode flags with no runtime equivalent (`force_start`, `auto_tmm`, and
+`auto_management`) now return explicit unsupported results instead of storing
+a value and claiming it changed behavior. Deluge plugin/configuration,
+plugin-lifecycle, Execute-command, notification, and path-load operations and
+Transmission utility gaps follow the same explicit-boundary rule. rTorrent
+force-reannounce is wired to the engine.
 
-Required action (remaining): wire the category store to the existing
-`rt-db` table; decide whether `setForceStart`/`setAutoTMM`/
-`setAutoManagement` need real engine behavior or should be downgraded to
-documented no-ops; design and implement peer banning/blocklist
-enforcement and a move-on-completion hook (both real engine features, not
-wiring fixes) before their compat surfaces can be made honest; the full
-method-by-method mutation matrix with stateful round-trip and restart
-tests.
+This pass also removed the remaining Deluge auxiliary false-success path:
+`blocklist.set_config`, `autoadd.*` writes, `scheduler.set_config`,
+`extractor.set_config`, `execute.*` writes, and `core.*plugin` writes no
+longer update process-memory state. Their read methods return documented
+compatibility defaults, and only native Label/Notifications appear enabled.
 
-Acceptance: method-by-method mutation matrix (partial -- two items fixed
-and evidenced, several more identified but not yet fixed, full matrix not
-built) with stateful round trips (not done) and restart tests (not done).
+The remaining action is a real-client compatibility matrix covering the
+documented projection-only surfaces and unsupported responses. Move-on-
+completion and blocklist/plugin behavior are not claimed as native features.
 
 ### TNG-023 — Capability and health manifests overclaim implementation
 
-**Status: In progress** · **Priority: P1** · **Confidence: high**
+**Status: Functional implementation complete; certification evidence deferred** · **Priority: P1** · **Confidence: high**
 
-Verified evidence: `native_engine_capabilities` downgraded
-`pure_v2_metadata_completion`, `storage_throttled`, `safe_move`,
-`safe_delete_after_dry_run`, `bounded_shutdown`, and `scale_certification`
-from `true` to `false`, and added `pure_v2_transfer: false` /
-`storage_plan_controls: false`. Cross-checked each against this session's
-own findings: all six downgrades correctly track ledger items that are
-still Open or only In progress with acceptance criteria unmet (storage
-authority/race/verification = TNG-001/002/003, still Open; storage job
-async pool = TNG-011, still Open; shutdown = TNG-012, In progress but not
-acceptance-complete; scale = TNG-010/026, still Open/Blocked) -- i.e. this
-wasn't a blanket "set everything false," it's consistent with the real
-state. Not yet done: the `implemented`/`enabled`/`certified`/`experimental`
-state separation the required action calls for (currently still one flat
-bool per capability), and no capability contract test exists that would
-fail if a claim regresses without evidence.
+Verified evidence: the native capability manifest now separates
+`implemented`, `enabled`, `certified`, and `experimental` assurance states.
+Runtime/config-dependent uTP fields are derived from active policy, while
+pure-v2 transfer, IPv6 live-DHT routing, and scale certification remain
+explicitly outside the advertised certified set. Contract tests cover the
+manifest shape and mounted routes.
 
-Evidence: native capabilities hard-code pure-v2, durable job controls, bounded
-shutdown, DHT, and scale claims that the runtime/evidence does not establish.
-
-Required action: derive capabilities from active runtime paths/configuration or
-remove the claims. Separate `implemented`, `enabled`, `certified`, and
-`experimental` states.
-
-Acceptance: capability contract tests that fail when a claim lacks a live
-implementation and evidence reference.
+The remaining action is to keep `certified` empty for capabilities without
+accepted external evidence and to update it only from a release/evidence
+review, not from a local unit-test pass.
 
 ### TNG-024 — Deployment defaults are unsafe, inconsistent, or silently ignored
 
-**Status: In progress** · **Priority: P0/P1** · **Confidence: high**
+**Status: Functional implementation complete; deployment evidence deferred** · **Priority: P0/P1** · **Confidence: high**
 
 Verified evidence: `Config::validate()` (called from the real config-load
-path, `rt-config/src/lib.rs:289`) now unconditionally rejects any
-`api_tokens` entry matching a placeholder pattern (`change-me`, `changeme`,
-`replace-me`, or anything containing `REPLACE_WITH`, case-insensitive) --
-stricter than the required action asked (it's not scoped to public binds
-only), plus a separate check that a public `daemon.api_bind` requires
-non-empty tokens of at least 16 characters. Both are covered by existing
-`ConfigError::Validation` tests, part of the passing suite. Sample configs
-(`deploy/native/config.toml`, the Kubernetes `secret.yaml`) were updated
-from `change-me` to `REPLACE_WITH_RANDOM_TOKEN`, which now actually fails
-`validate()` instead of silently starting -- previously renaming alone
-would have been cosmetic; here it's backed by real enforcement. Peer-port
-inconsistency (`6881` in Docker/Kubernetes vs. the daemon's real default)
-fixed to `44444` across `Dockerfile`, `service.yaml`, and
-`statefulset.yaml`. Docker build now uses `--locked`. Not verified: Compose
-files (not seen in the diff -- may still be inconsistent), whether an
-*invalid* (not just placeholder) config load failure is visible/fails
-closed rather than silently falling back to defaults, and whether
-`trust_proxy_header` / other bind-adjacent settings were reviewed.
+path, `rt-config/src/lib.rs`) now unconditionally rejects placeholder tokens
+and requires non-empty tokens of at least 16 characters for public binds.
+Existing invalid config files no longer silently fall back to defaults;
+defaults apply only when no config file exists. Native deployment templates
+use the declared peer port, Docker builds use `--locked`, and rendered Compose
+configuration validates locally.
 
-Evidence: native sample config binds publicly with a known token; compose,
-Kubernetes, and config use inconsistent peer ports; invalid standard-path
-config can fall back to defaults; native Docker build did not explicitly use
-`--locked`.
-
-Required action: safe default bind/credentials; reject placeholders on public
-binds; make config load failures visible and fail closed; centralize port values;
-lock builds and test rendered deployment manifests.
-
-Acceptance: clean-container startup, invalid-config, public-bind, compose,
-Kubernetes, and Docker build smoke tests.
+Remaining action is target-orchestrator deployment and rendered-secret review.
+The checked-in Kubernetes secret remains a template and must be populated by
+the operator before apply.
 
 ## P1/P2 — release evidence and engineering system
 
 ### TNG-025 — Native CI does not enforce native quality
 
-**Status: In progress** · **Priority: P1** · **Confidence: high**
+**Status: Implementation complete; hosted-run evidence deferred** · **Priority: P1** · **Confidence: high**
 
 Verified evidence: `.github/workflows/ci.yml` gained a `native-quality` job
-(fmt check, `cargo test --workspace --all-targets --locked`, `clippy -D
-warnings`) plus `cargo test` for the sidecar (was build-only before).
-`.github/workflows/release.yml` got the identical `native-quality` job,
-and both `native-binaries` and `linux-release-assets` now declare `needs:
-native-quality` -- release cannot produce artifacts unless it passes.
+(fmt check, OpenAPI validation, `cargo test --workspace --all-targets
+--locked`, `clippy -D warnings`) plus formatting, tests, and clippy for the
+sidecar (was build-only before). `.github/workflows/release.yml` got the same
+combined native/sidecar gate plus an authenticated release-binary smoke using
+the tracked `certification/fixtures/backend-burndown-native-release-smoke.toml`
+fixture. Both `native-binaries` and `linux-release-assets` require the quality,
+MSRV, and release-smoke jobs -- release cannot produce artifacts unless they
+pass.
 Everything this gate runs was independently re-verified locally this
 session and is green. Separately, `.gitlab-ci.yml`'s trivy container scan
 was changed from `--exit-code 0` (report-only, never fails the pipeline)
@@ -1200,46 +1341,39 @@ GitHub Actions itself -- this sandboxed session has no way to trigger the
 real runner, so "intentionally broken fmt/test/clippy changes fail CI"
 remains evidenced only by local command runs, not a real CI execution.
 
-Evidence: `.github/workflows/ci.yml` does not run native workspace tests,
-formatting, clippy, or sidecar/native integration together.
-
-Required action: add a required native quality job and make release depend on
-it; pin/declare the MSRV policy; run locked tests and lint on supported targets.
-
-Acceptance: intentionally broken fmt/test/clippy changes fail CI.
+The remaining action is to observe the workflow on its hosted runner and verify
+that branch protection marks the native-quality, MSRV, and fuzz jobs required.
+The repository-side implementation and local command verification are complete;
+this environment cannot manufacture a hosted GitHub Actions result.
 
 ### TNG-026 — Release evidence is stale or weaker than its claims
 
-**Status: In progress** · **Priority: P1** · **Confidence: high**
+**Status: Local release evidence current; external evidence deferred** · **Priority: P1** · **Confidence: high**
 
-Verified evidence (2026-09-02): rebuilt `target/release/torrentngd` with
-`cargo build --release --locked -p torrentngd`, launched that binary with an
-isolated authenticated config, exercised `/health`, native torrent listing,
-qBittorrent listing, and `/metrics`, and terminated it with SIGTERM. The
-process exited cleanly after its engine/task shutdown path. The local release
-gate, storage feature matrix, WebUI certification, API facade checks,
-migration corpus checks, native/sidecar config review, and external preflight
-were rerun against the dirty working tree; exact reports are linked from
-`docs/BACKEND_BURNDOWN_RELEASE_20260902.md`.
+Verified evidence (2026-09-04 UTC):
+`target/release/torrentngd` was rebuilt from the dirty working tree rooted at
+commit `e0d487f` with `cargo build --release --locked -p torrentngd`, launched with an isolated
+authenticated config, exercised through health, native list/transfer,
+qBittorrent list/transfer, and Prometheus metrics, and terminated with SIGTERM.
+The process exited cleanly. The exact current artifact and deployment report
+are linked from `docs/BACKEND_BURNDOWN_RELEASE_20260902.md`.
 
-This is not a clean release certificate. The local and external gates retain
-warnings/skips for an unset real-device storage target, an unapproved public
-torrent leg, and no active 24-hour soak. The 100k scale evidence is still a
-unit/proxy test, not release-binary RSS/fd/thread/task evidence. The release
-readiness gate therefore remains blocked for production-scale and universal
-compatibility claims. This distinction is the result, not a paperwork gap.
+The current artifact is 22,518,096 bytes with SHA-256
+`9f2dd59ba4bff2f760c789288dc057aab22c0f957ce4e47c36d51f0ff6699288`; smoke
+duration was 470 ms. Compose rendering also passes. The same artifact passed
+the strict local fault matrix, live daemon fault matrix, 32-client/8-slow-SSE
+load gate, and reconciled 28-case local Docker interoperability matrix. This
+is current local deployment evidence, not a clean public release certificate.
+The older 100k scale reports remain historical because they target an earlier
+binary digest.
 
-Required action: run the missing external legs, capture the exact artifact
-digest/config/deployment logs, run the 100k release-binary scale harness, and
-keep the release blocked until every required row is PASS or has an explicit
-owner, action, and artifact in the release bundle.
-
-Acceptance: one machine-readable clean release bundle or an explicit blocked
-release report with owner/action/artifact for every remaining row.
+Remaining action is external release evidence: public/client compatibility,
+real-device storage, and 24-hour soak. Extended scale proof is intentionally
+deferred as a product-priority choice.
 
 ### TNG-027 — Claimed fuzz/OpenAPI/idempotency coverage is not checked in
 
-**Status: In progress** · **Priority: P1/P2** · **Confidence: high**
+**Status: Implementation complete; breadth/hosted evidence deferred** · **Priority: P1/P2** · **Confidence: high**
 
 Original evidence: repository search found no checked-in fuzz targets,
 OpenAPI source, or idempotency test harness despite documentation
@@ -1285,27 +1419,17 @@ Full workspace `cargo test --workspace --all-targets --locked`,
 green (the main workspace does not see `fuzz/` at all,
 `cargo metadata --no-deps` confirms it).
 
-Not yet evidenced (why this stays "In progress", not "Resolved"): OpenAPI
-schema generation/validation is entirely untouched; idempotency/replay
-tests for mutating endpoints are entirely untouched; the new CI job itself
-has not been observed actually running in GitHub Actions (only verified
-locally); fuzz coverage is currently limited to two parsers -- tracker
-HTTP/UDP response parsing, DHT KRPC message parsing, and peer-wire message
-parsing are all untouched and would each be reasonable additional targets
-given they also handle attacker-reachable bytes.
-
-Required action (remaining): observe the CI job actually run and pass/fail
-correctly; add fuzz targets for tracker/DHT/peer-wire parsing; generate and
-validate an OpenAPI schema; add idempotency/replay tests for mutating
-endpoints (add/remove/move/etc.).
-
-Acceptance: CI invokes each target with a bounded smoke budget (done,
-pending an observed real CI run) and publishes artifacts (done, pending
-an observed real CI run with an actual crash to verify the upload step).
+The repository-side implementation gate is now complete: the two parser fuzz
+targets run locally, the bounded fuzz-smoke job and crash-artifact upload are
+checked in, `docs/API.openapi.json` validates through
+`scripts/validate_openapi.py`, and shared idempotency claim/replay/conflict
+tests cover the native, qBittorrent, Transmission, and Deluge mutation
+routers. The remaining action is hosted fuzz execution and a broader parser
+and mutation replay corpus.
 
 ### TNG-028 — Formatting, clippy, and MSRV are already red
 
-**Status: In progress** · **Priority: P1** · **Confidence: high**
+**Status: Implementation complete; hosted-run evidence deferred** · **Priority: P1** · **Confidence: high**
 
 Verified locally (see "Current verified evidence" above for full detail):
 `cargo fmt --all -- --check`, `cargo test --workspace --all-targets
@@ -1314,54 +1438,109 @@ warnings` all pass now, including on the actual declared MSRV toolchains
 (1.88 main workspace, 1.97 sidecar -- both `rust-version` fields were
 corrected from an untrue "1.80" to the real, verified floor). Two clippy
 findings were fixed (too-many-arguments on an egress-policy-widened
-function, a redundant `u32 -> u32` cast). Not yet done: CI does not pin
-the MSRV toolchain explicitly (see TNG-025 note) -- until it does, "passes
-the declared toolchain" is only established by this session's manual run,
-not by an enforced, repeatable gate.
-
-Evidence: baseline fmt fails in `rt-migrate`; clippy fails on sort idioms,
-MSRV-incompatible `is_multiple_of`, and a large enum variant.
-
-Required action: repair current failures, document the supported toolchain, and
-make the checks required in CI/release.
-
-Acceptance: local and CI `fmt`, locked test, and `clippy -D warnings` pass on
-the declared toolchain.
+function, a redundant `u32 -> u32` cast). The native-quality, MSRV, and
+sidecar checks are defined in CI and pass locally. The remaining action is
+observing the hosted jobs and making them required through repository branch
+protection; this environment cannot manufacture that hosted result.
 
 ## P2 — architecture and maintainability
 
 ### TNG-029 — The engine has poor fault/change isolation
 
-**Status: In progress** · **Priority: P2** · **Confidence: high**
+**Status: Persistence-isolation implementation and local fault evidence complete; broader decomposition deferred** · **Priority: P2** · **Confidence: high**
 
-Verified evidence (2026-09-02): explicit seams now exist for storage-job
+Verified evidence (2026-09-04): explicit seams now exist for storage-job
 dispatch/control/recovery, registry revisions and mutation deltas, native and
 qBit snapshot projection, peer admission, outbound egress policy, process-wide
 network budgets, storage-root authority, command replies, and capability
 projection. Those seams have focused tests that do not require a live network
-or the full daemon. Health now probes engine-owned storage-worker and DHT
-dependency seams independently of the engine actor, and the fault test proves
+or the full daemon. A separate `peer_listener` task now owns TCP/uTP accept,
+admission, and handshake work; it hands peers to the engine through a bounded
+command queue, so the engine retains authoritative routing without cloning
+the torrent-channel map for every connection. Health probes engine-owned
+storage-worker and DHT dependency seams independently of the engine actor and
+reports the peer-listener task separately; the fault test proves
 a dead DHT channel and dead storage supervisor are reported as unhealthy.
 Health exposes the current capability boundary instead of claiming scale
 certification or unsupported storage behavior.
 
+The storage worker now has a production-only database connection boundary,
+and a real `Engine::start` test verifies that the supervisor remains healthy
+and reports its bounded capacity through the command path before shutdown.
+The engine actor has an explicit liveness guard and reaps failed torrent
+tasks, while storage shutdown requeues durable work and delete recovery
+finalizes metadata after payload cleanup. Native SSE initial snapshots are
+bounded and registry mutations wake streams through a shared notifier.
+
+The current functional isolation pass also adds per-torrent durable-job
+admission guards, stale-completion checks for detached workers, transactional
+job/event projection updates, rollback of registry projections when durable
+writes fail, and coalesced transfer-stat persistence. These contain the most
+dangerous move/delete/recheck and partial-projection races without pretending
+that the actor has been decomposed. Storage plans now fail closed when a live
+target cannot acknowledge quiescence; any targets already paused for that plan
+are resumed before the error is returned. File-priority writes share the same
+active-job admission gate, and generic move/delete plans require explicit,
+registry-valid torrent targets because arbitrary filesystem paths cannot be
+reliably attributed to a torrent by the engine.
+
 The architecture is still a large actor monolith (`Engine`, `TorrentTask`,
-and API handler modules remain oversized), and several seams are only wrappers
-around that actor. The failure matrix is still incomplete: there is no
-concurrent API-load fault-containment run, no DB/storage failure injection
-through a live daemon, no durable filesystem-ahead-of-DB reconciliation, and
-no full inversion of persistence, tracker, or peer dependencies. `TNG-029`
-therefore remains in progress; health reporting and isolated unit failures are
-useful seams, not proof that the monolith is fault-isolated.
+and API handler modules remain oversized), but the highest-risk ownership
+boundary is now structural rather than a naming convention. In
+`crates/rt-engine/src/storage_control.rs`, storage-plan validation,
+quiesce/submit/completion choreography, and resume-on-failure are isolated
+from the general command dispatcher. In
+`crates/rt-engine/src/subsystems.rs`, actor-owned torrent/tiering state is
+separate from detachable DHT, storage-worker, budget, resource-governor, and
+stats services. `Engine` remains the ordering coordinator; these modules do
+not pretend that it has become a fleet of independently supervised actors.
 
-Required action: add subsystem health/metrics and failure-injection tests for
-worker panic, DHT loss, DB failure, storage failure, and slow API consumers;
-then extract the proven contracts into independently owned modules without
-adding cross-layer global state.
+Tracker announce and scrape transport is now a separate
+`crates/rt-engine/src/tracker_runtime.rs` boundary: `TrackerWorkers` owns the
+bounded per-torrent worker set, abort handles, generation fencing, HTTP/UDP
+transport, response limits, and result channel. `TorrentTask` supplies an
+immutable announce context and remains the ordering authority for tracker
+state, tier failover, and peer admission. Cancellation on pause, quiesce,
+shutdown, and session restart aborts those workers and drops stale results, so
+a failed or slow tracker cannot retain actor-local protocol state or apply
+peers after the session has changed. The stopped-announce path is still
+intentionally actor-awaited, but its network work is bounded and parallel
+under an aggregate deadline; that is the remaining shutdown/pause coupling.
 
-Acceptance: subsystem tests can run without the whole engine; failures are
-contained and health identifies the failed subsystem; no new cross-layer
-global state.
+The native engine's high-volume session-event writes use a bounded,
+single-consumer writer that executes SQLite and retention pruning on a blocking
+worker; session-log reads and the main operator read projections likewise run
+outside the actor. All production authoritative torrent/job/state persistence
+now crosses the same ordered `DbExecutor` boundary into `DbWorker`; the actor
+does not retain the SQLite mutex. The worker owns a private connection,
+bounded admission, cancellation fencing for queued work, panic containment,
+health state, and drain-on-shutdown behavior.
+
+Normal TCP/uTP accept failures keep control commands available while the
+listener retries with bounded backoff; a listener-task exit marks readiness
+false and is not auto-restarted. The local deterministic matrix passes worker
+error/panic/cancellation, transaction rollback, storage-worker
+panic/cancellation, liveness, and restart-recovery checks. The local release
+daemon matrix passes SIGKILL/restart durability, API cancellation with source
+retention, injected SQLite failure and recovery, isolated filesystem failure
+with source retention, and health continuity. The local API/SSE load gate
+passes 191,893 requests from 32 JSON clients and 8 slow consumers over 30
+seconds with zero errors. These are real local process checks, not a claim
+that every dependency failure mode or public deployment has been certified.
+
+Full inversion of tracker, peer, and every API dependency is not required to
+resolve the stated TNG-029 persistence defect and remains a separate
+maintainability choice. The remaining evidence is deployment-specific:
+hosted-run observation, physical storage/device faults, public compatibility,
+and long-soak behavior.
+
+Acceptance for the stated implementation gate is met: worker and engine
+liveness is truthful, failed torrent tasks are reaped and projected as errors,
+shutdown work remains recoverable, delete recovery is idempotent, API streams
+have bounded initial event size, authoritative production SQLite work is
+owned by supervised worker boundaries, and the local live fault matrix keeps
+the daemon healthy across injected failures. Full actor decomposition remains
+non-release structural follow-up.
 
 ## Claims to delete or downgrade now
 
@@ -1370,12 +1549,14 @@ claims:
 
 - “100k torrents” as a production capacity guarantee;
 - “pure v2 metadata completion” as a supported native capability;
-- “global” connection/rate limits when enforcement is per torrent/peer;
+- “universal compatibility” across clients and transports without live
+  interoperability evidence;
 - “bounded graceful shutdown” without signal and join tests;
 - “universal compatibility PASS” when rows are skipped or stale;
 - “security PASS” when evidence was run against a different deployment mode;
 - “storage plan safe” when execution authority still accepts caller roots;
-- “fuzz/OpenAPI/idempotency covered” without checked-in targets and CI output.
+- “fuzz/OpenAPI/idempotency certified” without hosted CI output and a broader
+  replay corpus.
 
 ## Burn-down log
 
@@ -1394,6 +1575,19 @@ claims:
 | 2026-09-01 | Tenth session (same date, continuing "build it all out"): closed a gap TNG-025's own entry had already flagged as a prediction -- MSRV wasn't pinned anywhere in CI (`@stable` tracks current, not the declared floor), which is exactly the class of drift that let `.clippy.toml` go stale earlier this session. Added `msrv-check`/`msrv-check-sidecar` jobs pinning `dtolnay/rust-toolchain` to the exact declared floors (1.88.0 / 1.97.0) via version tags, alongside (not replacing) the existing `@stable` jobs. Verified both jobs' exact commands locally against the already-installed pinned toolchains before committing: full workspace build+test green at 1.88, sidecar build+test green at 1.97.0 (75 passed). | `cargo +1.88 build/test --workspace --all-targets --locked` (green), `cargo +1.97.0 build/test --locked --manifest-path sidecar/Cargo.toml` (green, 75 passed), full default-toolchain `cargo test --workspace --all-targets --locked` / `cargo fmt --all -- --check` / `cargo clippy --workspace --all-targets --locked -- -D warnings` (all green). | TNG-025's evidence updated with the MSRV-pinning fix; still not verified that any of this session's CI edits have actually run in real GitHub Actions (no way to trigger that from this sandboxed session). |
 | 2026-09-01 | Eleventh session (same date, continuing "build it all out"): ran a targeted (not full-matrix) audit for TNG-022 via a research subagent, then fixed the two highest-confidence, easiest-to-wire inert compat mutations it found -- both had an already-working native-engine method one facade over, never connected to this one. rTorrent's `d.tracker_announce` (`crates/rt-api-rtorrent`) was a literal `Ok(Int(0))` that never read params at all; wired to `Engine::reannounce_torrent`, mirroring the already-correct qBittorrent-compat sibling. Transmission's `session-set` `dht-enabled`/`pex-enabled` (`crates/rt-api-transmission`) only mutated a process-memory struct that `session-get` echoed back convincingly; wired to `Engine::network_features`/`update_network_features`, alongside (not replacing) the existing mirror, mirroring `app_set_preferences`'s already-correct qBittorrent-compat pattern. The same audit surfaced several more inert mutations that were NOT fixed because they need real new engine features (peer banning/blocklist enforcement, a move-on-completion hook) rather than a wiring fix, plus a durably-stored-but-behaviorally-inert variant (`setForceStart`/`setAutoTMM`/`setAutoManagement` persist but `apply_torrent_limits()` never reads them) -- all recorded as explicit remaining gaps. | `cargo test -p rt-api-rtorrent --lib` (19 passed, up from 17), `cargo test -p rt-api-transmission --lib` (32 passed, 0 failed, no regressions), full `cargo test --workspace --all-targets --locked` (green), `cargo fmt --all -- --check` (green), `cargo clippy --workspace --all-targets --locked -- -D warnings` (green). | TNG-022 moved Open -> In progress. This remains a large finding -- category-store persistence, peer banning, move-on-completion, and the full method-by-method mutation matrix with stateful round-trip/restart tests are all still open (see item detail for the complete list). |
 | 2026-09-02 | Focused TNG-010/011/013/026/029 remediation: wired tier-aware restore, dormant promotion/demotion, inbound routing, tiered stats, aggregate dormant restore events, and persisted tracker-deadline promotion/reannounce through a shared deadline wheel; added a bounded two-worker storage dispatcher with async pause, cancellation, durable serialized plans/checkpoints, sparse-checkpoint-safe restart recovery, and native job controls; added registry revisions, a bounded mutation journal, single-flight immutable native/qBit snapshots, lazy shared sort indexes, bounded native pagination, SSE delta/resync cursors, qBit snapshot pagination and journal-backed `sync/maindata`, stats caching/parallel task queries, aggregate transfer-rate stats, and a large-output guard against per-torrent qBit actor round trips. Fixed WebUI select-all to walk 5,000-row pages pinned to one snapshot. | Focused native/qBit/engine tests: 46/60/144 passed; full workspace tests, format, and clippy with warnings denied passed. Rebuilt the release binary with `cargo build --release --locked -p torrentngd` in 24.73 s after fixing overdue tracker deadlines. The final release binary smoke endpoints, aggregate transfer endpoints, metrics, and SIGTERM passed; SHA-256 is `c4540162a4f75b31486bf425c1f81d038a0ed0ad813fbd7f7360bf07bb736ecc`. [`local-release-backend-burndown-final-20260902.md`](../certification/reports/local-release-backend-burndown-final-20260902.md) passed implementation gates with warnings; [`external-evidence-preflight-backend-burndown-final-20260902.md`](../certification/reports/external-evidence-preflight-backend-burndown-final-20260902.md) is `PASS_WITH_WARNINGS` (3); strict and local readiness are `FAIL`. | TNG-010/011/013/026/029 remain In progress. The release certificate remains blocked: no 100k release-binary scale run, no real storage target, no public/live compatibility run, no 24h soak, no subsystem fault-injection matrix, and the full dormant representation and storage reconciliation gaps remain. |
+| 2026-09-02 | Continuation checkpoint: separated production storage-worker SQLite persistence from the engine actor connection, enabled worker WAL/foreign-key settings, added a real `Engine::start` supervisor-health/shutdown test, and changed native/qBittorrent snapshot expiry to apply retained registry-journal changes before falling back to a full registry projection. Added incremental-refresh, active-job aggregate, and SSE disconnect metrics plus regression tests. | `cargo fmt --all -- --check`, `cargo check --workspace --locked`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, full workspace tests (154 engine tests; all green), sidecar tests (76 unit and 75 integration; all green), compose config, certification policy/bundle self-tests, release scale (19/19; 100k idle RSS 155,467,776 bytes, 30 -> 14 fds, 15 -> 3 tasks), and release-binary smoke all pass. Final binary is 18,737,040 bytes, SHA-256 `e7f193a5d69ccb8bf49f74b21f8f162f051bd6130895f6b925b04bc17fee2cfc`. Local readiness is PASS; strict readiness remains FAIL because universal/live compatibility is skipped/stale, external preflight has 3 warnings, the 24h soak is stale, and post-soak evidence is old. | TNG-010/011/013/026/029 remain In progress. Registry compact replacement, live crash/failure injection, sublinear snapshot-index refresh, slow-client load evidence, production/public/device/24h evidence, and concurrent fault containment are still open. |
+| 2026-09-02 | Functional-isolation continuation: bounded native SSE initial snapshots (default 500/max 1,000) now retain one revision and mark completion; engine liveness is explicit and unexpected torrent-task exits are reaped into durable error state; storage shutdown requeues active/queued jobs, payload deletion is worker-backed with idempotent completion/recovery, and durable file projections remove metainfo parsing from delete/move finalization. Move planning, native metadata/blob/webseed reads, and pure-v2 file-root rechecks now run behind detached blocking boundaries; engine task-stat collection has a 250 ms aggregate deadline; native and qBittorrent facet endpoints reuse cached snapshots. | Focused tests: `rt-session` 23, `rt-storage` 118, `rt-engine` 160, native API 48, qBittorrent API 62; focused clippy and format checks pass. | The current source checkpoint is not represented by the older `ac7fc55c...` release artifact. No 100k-hot, public, real-device, or soak proof was rerun; those extended gates remain explicitly deferred. `ensure_torrent_task` promotion parsing and the live crash/failure matrix remain open implementation seams. |
+| 2026-09-02 | Functional-isolation correction: dormant-torrent promotion and magnet metadata parsing now run through detached blocking preparation; concurrent promotion actions coalesce, DHT identity inspection is detached, and qBittorrent peer logs query only promoted tasks in parallel with a deadline. | Focused source tests: `rt-engine` 161, native API 48, qBittorrent API 62; focused clippy, format, and `git diff --check` pass. | The current source remains newer than the `ac7fc55c...` release artifact. Compact dormant registry replacement, live DB/storage failure injection, and extended release/public/device/soak proof remain open/deferred. |
+| 2026-09-02 | Functional-isolation integrity pass: retained the registry/DB projection until asynchronous payload deletion succeeds; added per-torrent active-job admission guards so move/delete/recheck operations cannot overlap; discarded stale detached magnet/pure-v2/promotion completions; made engine, restart, storage-plan, torrent-task, and recheck job/event writes transactional; added registry rollback on failed state/progress projections; and coalesced transfer-stat persistence instead of upserting a torrent row per block/upload notification. Added a valid paused-to-metadata-pending state transition and regression coverage for the newly exposed state-machine path. | `cargo fmt --all -- --check`, `cargo check --workspace --locked`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --all-targets --locked` (green), sidecar tests (green), focused `rt-engine` 165/165 and `rt-session` 24/24. No release rebuild or extended scale/public/device/soak run was performed. | TNG-008/011/029 implementation evidence strengthened; TNG-010/013/026/029 remain In progress. Compact dormant replacement, migration/reconciliation work, live DB/storage failure injection, sublinear snapshot refresh, and release/public/device/soak evidence remain open/deferred. |
+| 2026-09-03 UTC (prior checkpoint) | Prior source/release reconciliation: completed the compact dormant registry path, tightened Deluge/Transmission/rTorrent/qBittorrent false-success behavior, made native file/tracker reads fail closed without an engine, added durable category/tag/ban projections and peer-ban eviction, added aggregate connected-peer stats, and made TCP peer-listener failure visible to readiness while preserving control-command service. | Prior local checks and the superseded 20,420,504-byte artifact; see the final checkpoint immediately below. | Superseded by the final local verification row below. |
+| 2026-09-03 UTC | Final local verification and release refresh: bounded engine command sends/replies, peer-event and socket writes, metadata completion, and persisted control-plane settings are covered; malformed compatibility inputs fail closed; qBittorrent RSS state is durable with the engine; registry rollback, task-reap error projection, transactional row/event updates, bounded persisted reads, bounded SCGI/backend responses, literal tracker matching, bounded workflow script output, bounded local configuration reads, storage command choreography, and explicit engine subsystem ownership are covered. | `cargo fmt --all -- --check`, OpenAPI validation (58 paths / 79 operations), `git diff --check`, workspace check, warnings-denied clippy, native workspace check/tests, sidecar check/tests (95 and 75 passed), declared MSRV build/tests (1.88 main, 1.97 sidecar), release build, Compose config validation, and authenticated release-binary smoke (456 ms; clean SIGTERM). Current binary: 21,235,160 bytes, SHA-256 `3c240485708a47eb0c729c4c0a7c198d357f34170fd95654a7e43be92404c3ba`; [`backend-burndown-native-release-smoke-current-20260903.md`](../certification/reports/backend-burndown-native-release-smoke-current-20260903.md). | Functional remediation is complete for the declared scopes of TNG-010/011/013/029; TNG-026 local evidence is current. Further actor decomposition, live fault/load injection, hosted CI observation, public/device/soak compatibility, and extended scale certification remain explicitly deferred. |
+| 2026-09-03 UTC | Continued isolation pass: moved tracker announce/scrape transport and worker lifecycle into `crates/rt-engine/src/tracker_runtime.rs`; `TrackerWorkers` now owns the per-torrent in-flight cap, abort handles, generation fencing, response limits, and actor-drop cleanup while `TorrentTask` retains ordered state application and tier failover. Stopped announces remain actor-awaited for terminal semantics, but run in bounded parallelism under a 10-second aggregate deadline. The sidecar qBittorrent cursor now uses durable logical revisions plus bounded deletion tombstones, and single-tag add/remove projections now commit atomically with their cursor touch. | `cargo test -p rt-engine --lib --locked` (188 passed), `cargo clippy -p rt-engine --lib --locked -- -D warnings` (pass), sidecar tests (100 unit and 77 integration passed), sidecar strict clippy (pass), `git diff --check` (pass). | TNG-013/TNG-029 implementation seams strengthened. Tracker transport no longer lives in the actor module; sidecar same-second update/deletion loss and tag projection partial-write windows are closed. External load, fault-injection, hosted-CI, public/device/soak, and extended-scale proof remain deferred. |
+| 2026-09-03 UTC | Rebuilt and reran the release artifact after the isolation and sidecar changes; the authenticated daemon smoke still passed health, native/qBittorrent list and transfer, Prometheus metrics, Compose rendering, and clean SIGTERM. | `cargo fmt --all -- --check`, `cargo check --workspace --locked`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --all-targets --locked`, OpenAPI validation, sidecar tests/clippy, `cargo +1.88 test --workspace --all-targets --locked`, and `cargo +1.97.0 test --manifest-path sidecar/Cargo.toml --locked` all pass; `cargo build --release --locked -p torrentngd` passes; `target/release/torrentngd` is 21,311,008 bytes with SHA-256 `914821f9826ced3b7a2b9c4678e425ff05e9e1adf3a4b4c7682dfaa3a3611503`; [`backend-burndown-native-release-smoke-current-20260903.md`](../certification/reports/backend-burndown-native-release-smoke-current-20260903.md) (pass, 464 ms, two shutdown polls). | TNG-026 local release evidence is current again. This remains local deployment smoke, not public/device/24-hour, universal-compatibility, or capacity certification. |
+| 2026-09-03 local / 2026-09-04 UTC | Continued the isolation burn-down: native sidebar media facets now use an incremental snapshot index; the production engine session-event path uses a bounded ordered SQLite writer with drain-on-shutdown; session-log reads and engine operator read commands (trackers, settings, categories/tags, jobs, storage roots, global/network settings, and queue priority) execute in detached blocking workers instead of directly in the actor. Added regression coverage for incremental media-facet updates. | `cargo fmt --all -- --check`, `git diff --check`, `cargo check --workspace --locked`, full workspace tests, full workspace warnings-denied clippy, sidecar tests (121 unit / 83 integration), sidecar warnings-denied clippy, main MSRV tests on Rust 1.88, sidecar MSRV tests on Rust 1.97.0, OpenAPI validation (58 paths / 79 operations), release build, Compose validation, and authenticated release smoke (474 ms; clean SIGTERM) all pass. Current artifact: 21,993,112 bytes, SHA-256 `1d5fe1bee668179001dab21ac697aea01bb0f2cb11276f13208c38975cacd28e`; [`backend-burndown-native-release-smoke-current-20260903.md`](../certification/reports/backend-burndown-native-release-smoke-current-20260903.md). | TNG-013 implementation tightened: native facet scans and operator read stalls reduced; TNG-026 local evidence refreshed. TNG-029 is explicitly still partial: authoritative actor-side torrent/job persistence and deeper dependency extraction remain; live fault/load, hosted-CI, public/device/soak, and extended-scale proof remain deferred. |
+| 2026-09-03 local / 2026-09-04 UTC | Closed the stated TNG-029 persistence seam: the production `Engine` no longer retains a shared SQLite mutex; authoritative torrent/job/state reads and writes use a bounded ordered `DbWorker` with a private connection, cancellation fencing, panic containment, health reporting, and drain-on-shutdown. Production storage submissions use the storage supervisor's private checkpoint connection; direct database helpers are test-only. Added an external rTorrent library-entry-point contract test and explicit pure-v2 boundary documentation. | `cargo test -p rt-engine --locked` (200 passed), `cargo test -p rt-api-rtorrent --locked` (26 unit + 2 external integration passed), `cargo check -p rt-engine --release --locked`, deterministic strict fault matrix (pass), live release fault matrix (SIGKILL/restart, API cancellation, SQLite failure/recovery, filesystem failure; pass), API/SSE load (92,000 requests, 32 JSON clients, 8 slow SSE consumers, zero errors; pass), final release smoke (22,403,824 bytes, SHA-256 `1d1ca3b5528c77f51aa3dff5a2e090e82d5ac7bd3de932e98b172bfb67b121d4`, 462 ms; pass). | TNG-011/TNG-013/TNG-029 local implementation and evidence gates are closed for their declared scopes. TNG-006's library boundary is explicit and tested; pure-v2 transfer/completion remains intentionally unsupported. Hosted CI observation, public compatibility, real-device storage, 24-hour soak, representative production-corpus allocation evidence, and extended capacity proof remain external/deferred. |
+
+| 2026-09-03 local / 2026-09-04 UTC | Rebuilt the current release artifact and reran the strict local fault matrix, live daemon fault matrix, 30-second API/SSE load, and local Docker interoperability matrix. Corrected a real peer self-connection fallback that disabled webseed recovery, corrected qBittorrent progress/piece projection after stale completion timestamps, and fixed the interop harness to assert documented 501 responses for unsupported qBittorrent mutations. | Release smoke: 22,470,824 bytes, SHA-256 `caa3c725bdd29e49677dfd0bf11a70904650d5954092f533e1684ceab7fd1f76`, 466 ms; fault matrix PASS; 191,893 requests with 32 JSON clients and 8 slow SSE consumers, zero errors; local interop [`interop-matrix-backend-local-20260904-final.md`](../certification/reports/interop-matrix-backend-local-20260904-final.md) reconciles 28/28 PASS. | TNG-011/TNG-013/TNG-026/TNG-029 local implementation and evidence gates remain closed for their declared scopes. Pure-v2 transfer/completion is explicitly unsupported and the rTorrent library boundary is documented/tested. Hosted CI observation, public Internet compatibility, real-device storage, 24-hour soak, allocator/production-corpus evidence, and extended capacity proof remain external or deferred. |
+| 2026-09-04 local / 2026-09-04 UTC | Final local burn-down refresh: rebuilt the release binary after metrics privacy and sidecar security changes; completed the live storage/DB fault matrix, many-client/slow-SSE load, storage regression suite, webseed deadline scheduler, peer-channel budget, sidecar auth/default-bind/proxy tests, security scan, policy self-tests, and universal-live local Docker interop. Default Prometheus labels hash torrent identifiers; raw IDs require explicit opt-in. | Release smoke [`backend-burndown-native-release-smoke-current-20260904.md`](../certification/reports/backend-burndown-native-release-smoke-current-20260904.md): 22,518,096 bytes, SHA-256 `9f2dd59ba4bff2f760c789288dc057aab22c0f957ce4e47c36d51f0ff6699288`, 470 ms; sidecar 125 unit/87 integration tests; rt-storage 130 tests; security scan PASS with no HIGH/CRITICAL image findings; universal-live [`universal-live-backend-local-20260904-current-pass.md`](../certification/reports/universal-live-backend-local-20260904-current-pass.md) PASS_WITH_SKIPS with 28/28 local cases PASS. | All repository-actionable TNG implementation, contract, security, CI, and local-evidence work is closed for the declared scope. Remaining gates are external-only: hosted CI observation/branch protection, public-client/network interop, target-device storage, 24-hour soak, production-corpus allocator/fairness/transport profiles, and optional 100k capacity proof. Pure-v2 transfer/completion and the unowned rTorrent HTTP-server interpretation remain explicitly unsupported. |
 
 ## Release gate
 

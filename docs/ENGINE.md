@@ -62,7 +62,8 @@ crates/
   rt-api-qbit/        — qBittorrent v2 compatibility shim
   rt-api-transmission/ — Transmission RPC compatibility facade over native state
   rt-api-deluge/      — Deluge compatibility facade over native state
-  rt-jobs/            — bulk op job queue, dry-run engine
+  rt-jobs/            — in-memory job model/queue for library users and tests;
+                       daemon persistence is in rt-engine's StorageJobDispatcher
   rt-metrics/         — Prometheus metrics definitions and scale certification tests
   rt-config/          — TOML config, env override, validation
   rt-migrate/         — import from rTorrent / qBit / Transmission / Deluge / uTorrent / BiglyBT / Tixati / generic libraries
@@ -122,14 +123,26 @@ policy and schedules shared idle checks through the timer wheel.
 The runtime integration is now behind `runtime.torrent_tiers_enabled`: restore
 retains dormant durable rows without starting a torrent actor, active lifecycle
 states start actors, inbound peers and lifecycle commands promote dormant rows,
-and a shared reconciliation tick demotes idle actors. Persisted tracker
-deadlines are bulk-loaded into a separate shared deadline wheel; when a dormant
-seed becomes due, the engine promotes it and sends a reannounce command. Stats
-and shutdown include the tiered task set. `TierScaleSnapshot` remains a proxy
-contract, not a capacity certificate: the current 100k test exercises the
-controller and registry model, while the dormant registry representation still
-retains a full `TorrentEntry` and the release binary has not yet been measured
-at 100k.
+and a shared reconciliation tick demotes idle actors. `runtime.tier_hot_idle_secs`
+and `runtime.tier_warm_idle_secs` configure the Hot-to-Warm and Warm-to-Dormant
+windows; defaults are 120 seconds and 1,800 seconds, respectively. Persisted
+tracker deadlines are bulk-loaded into a separate shared deadline wheel; when a
+dormant seed becomes due, the engine promotes it and sends a reannounce
+command. Stats and shutdown include the tiered task set. `TierScaleSnapshot`
+remains a proxy contract, not a capacity certificate. The registry now stores
+taskless torrents as compact `DormantTorrent` records; `DormantTorrentSnapshot`
+is the separate tier-policy record used for deadline and activity decisions.
+The current release-binary smoke proves startup and basic API behavior, not a
+100k capacity claim or simultaneous-hot peer/tracker workload.
+
+The engine's first structural ownership boundary is explicit in code. The
+`rt-engine::storage_control` module owns storage-plan validation,
+quiesce/submit/completion choreography, and resume-on-failure. The
+`EngineRuntimeState` in `subsystems.rs` owns torrent actors, tier admission,
+and lifecycle bookkeeping; `EngineSubsystems` owns detachable DHT,
+storage-worker, budget, resource-governor, and stats services. `Engine` remains
+the single ordering coordinator. Further decomposition is still a P2
+maintainability task and is not represented as independent supervision.
 
 ---
 
@@ -195,7 +208,11 @@ byte_offset (resumable)
 verified_bytes
 invalid_pieces
 started_at / updated_at
-state: queued | running | paused | cancelled | complete
+state: queued | running | paused | commit_pending | cancelled | completed
+
+`commit_pending` is the storage-move boundary after filesystem work has
+committed but before the engine has durably published the new save path. It is
+retriable/recovered state, not a successful terminal result.
 ```
 
 Requirements:
@@ -247,10 +264,12 @@ Moving 200+ TB is a database migration, not a file copy:
 | BEP 23 | Compact peer list | implemented |
 | BEP 27 | Private torrents | implemented |
 | BEP 29 | uTP | implemented for packet/state/UDP stream primitives plus opt-in engine peer-wire and metadata paths; public interop remains release evidence |
-| BEP 32 | IPv6 | partial: tracker compact IPv6 peers and DHT compact IPv6 peer values are parsed/forwarded; DHT routing nodes remain IPv4-only |
-| BEP 52 | BitTorrent v2 / hybrid | implemented for parsing, identity, metadata projection, storage root verification, fastresume, and compatibility projections |
+| BEP 32 | IPv6 | partial: tracker compact IPv6 peers and DHT compact IPv6 peer values are parsed/forwarded; live DHT routing nodes remain IPv4-only |
+| BEP 52 | BitTorrent v2 / hybrid | implemented for parsing, identity, metadata projection, storage root verification, fastresume, and compatibility projections; pure-v2 peer transfer/tracker lifecycle is explicitly unsupported |
 
-DHT is implemented in Phase 10. Private-tracker profiles disable DHT/PEX/LSD by default.
+DHT is implemented in Phase 10 within the current IPv4 live-routing scope.
+Private-tracker profiles disable DHT/PEX/LSD by default; do not infer IPv6
+DHT support from the parser's ability to represent IPv6 peer values.
 
 ---
 
@@ -390,7 +409,7 @@ Transmission `magnetLink` projection emits `btih` for v1 hashes and BEP 52
 - API tokens with scopes
 - Bearer token mode for automation
 - Browser cookie mode with CSRF protection
-- Reverse-proxy safe (trust X-Remote-User if configured)
+- Reverse-proxy safe when `trust_proxy_header` is explicitly enabled on a loopback listener and the proxy strips inbound `X-Remote-User`
 - Local socket option
 - Audit log for destructive operations
 
@@ -437,6 +456,8 @@ torrentng_recheck_bytes_total
 torrentng_api_request_duration_seconds{endpoint, method}
 torrentng_event_lag_seconds
 torrentng_job_queue_depth{type}
+torrentng_api_snapshot_incremental_updates_total
+torrentng_api_sse_disconnects_total
 ```
 
 ### Diagnostics API

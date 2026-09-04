@@ -49,11 +49,11 @@ Current implementation status on `main`:
 
 | Area | Local status | Notes |
 |---|---|---|
-| Native engine rewrite | Passing local certification | `torrentngd` owns torrent identity, SQLite session state, jobs, storage roots, trackers, DHT, peer-wire, uTP policy, metrics, and API projections |
+| Native engine rewrite | Local functional gates passing; external evidence pending | `torrentngd` owns torrent identity, SQLite session state, jobs, storage roots, trackers, DHT, peer-wire, uTP policy, metrics, and API projections |
 | WebUI | Passing build, lint, and browser certification | Virtualized torrent workspace, mobile-safe layout, storage planner, tracker health, logs, RSS/workflows, ratio groups, saved views, appearance, and engine panels |
 | API compatibility | Passing deterministic facade tests | Native REST plus qBittorrent, Transmission, Deluge, and rTorrent-compatible surfaces for common automation and client workflows |
 | Import/export | Passing generated corpus and apply/round-trip tests | Dry-run and apply flows cover qBittorrent, Deluge, Transmission, rTorrent, uTorrent/BitTorrent Classic, BiglyBT/Vuze, Tixati import, and generic export |
-| Storage and memory | Passing local storage, memory, and release evidence gates | Bounded positioned I/O, fd pooling, preallocation, durability, hash isolation, readahead/elevator scheduling, move/import/delete plans, and resource accounting are implemented |
+| Storage and memory | Local implementation and release smoke passing; hardware evidence pending | Bounded positioned I/O, fd pooling, preallocation, durability, hash isolation, readahead/elevator scheduling, move/import/delete plans, and resource accounting are implemented |
 | Interop and soak evidence | In progress for release | Local deterministic gates pass; live Docker/public/device legs and 24h soak are explicit release evidence runs, not hidden implementation claims |
 
 The fastest current status command is:

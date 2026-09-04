@@ -1,0 +1,152 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "TorrentNG Native API",
+    "version": "0.1.0",
+    "description": "Machine-readable contract for the implemented native /api/v1 JSON REST surface. Compatibility facades are documented by their client-specific matrices. Mutating requests accept an optional Idempotency-Key; successful responses may be replayed with Idempotency-Replayed: true. API tokens are bearer tokens or tng_session cookies."
+  },
+  "servers": [{"url": "/"}],
+  "security": [{"bearerAuth": []}, {"sessionCookie": []}],
+  "paths": {
+    "/health": {
+      "get": {"operationId": "health", "security": [], "responses": {"200": {"$ref": "#/components/responses/JsonOk"}, "503": {"$ref": "#/components/responses/JsonError"}}}
+    },
+    "/metrics": {
+      "get": {"operationId": "metrics", "responses": {"200": {"description": "Prometheus text exposition", "content": {"text/plain": {"schema": {"type": "string"}}}}, "401": {"$ref": "#/components/responses/Unauthorized"}}}
+    },
+    "/api/v1/auth/login": {
+      "post": {"operationId": "authLogin", "security": [], "requestBody": {"$ref": "#/components/requestBodies/JsonObject"}, "responses": {"200": {"$ref": "#/components/responses/JsonOk"}, "401": {"$ref": "#/components/responses/Unauthorized"}}}
+    },
+    "/api/v1/auth/logout": {
+      "post": {"operationId": "authLogout", "security": [], "responses": {"200": {"$ref": "#/components/responses/JsonOk"}}}
+    },
+    "/api/v1/torrents": {
+      "get": {"operationId": "listTorrents", "parameters": [{"$ref": "#/components/parameters/Limit"}, {"$ref": "#/components/parameters/Offset"}, {"$ref": "#/components/parameters/Snapshot"}, {"$ref": "#/components/parameters/Filter"}], "responses": {"200": {"$ref": "#/components/responses/JsonOk"}, "401": {"$ref": "#/components/responses/Unauthorized"}}},
+      "post": {"operationId": "addTorrent", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "requestBody": {"$ref": "#/components/requestBodies/AddTorrent"}, "responses": {"200": {"$ref": "#/components/responses/JsonOk"}, "400": {"$ref": "#/components/responses/JsonError"}, "413": {"$ref": "#/components/responses/PayloadTooLarge"}}}
+    },
+    "/api/v1/torrents/{hash}": {
+      "parameters": [{"$ref": "#/components/parameters/Hash"}],
+      "get": {"operationId": "getTorrent", "responses": {"200": {"$ref": "#/components/responses/JsonOk"}, "404": {"$ref": "#/components/responses/NotFound"}}},
+      "put": {"operationId": "updateTorrent", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "requestBody": {"$ref": "#/components/requestBodies/JsonObject"}, "responses": {"204": {"$ref": "#/components/responses/Empty"}, "400": {"$ref": "#/components/responses/JsonError"}, "404": {"$ref": "#/components/responses/NotFound"}}},
+      "delete": {"operationId": "deleteTorrent", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "responses": {"204": {"$ref": "#/components/responses/Empty"}, "202": {"$ref": "#/components/responses/JsonOk"}, "404": {"$ref": "#/components/responses/NotFound"}}}
+    },
+    "/api/v1/torrents/{hash}/start": {"parameters": [{"$ref": "#/components/parameters/Hash"}], "post": {"operationId": "startTorrent", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "responses": {"204": {"$ref": "#/components/responses/Empty"}, "404": {"$ref": "#/components/responses/NotFound"}}}},
+    "/api/v1/torrents/{hash}/resume": {"parameters": [{"$ref": "#/components/parameters/Hash"}], "post": {"operationId": "resumeTorrent", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "responses": {"204": {"$ref": "#/components/responses/Empty"}, "404": {"$ref": "#/components/responses/NotFound"}}}},
+    "/api/v1/torrents/{hash}/stop": {"parameters": [{"$ref": "#/components/parameters/Hash"}], "post": {"operationId": "stopTorrent", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "responses": {"204": {"$ref": "#/components/responses/Empty"}, "404": {"$ref": "#/components/responses/NotFound"}}}},
+    "/api/v1/torrents/{hash}/pause": {"parameters": [{"$ref": "#/components/parameters/Hash"}], "post": {"operationId": "pauseTorrent", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "responses": {"204": {"$ref": "#/components/responses/Empty"}, "404": {"$ref": "#/components/responses/NotFound"}}}},
+    "/api/v1/torrents/{hash}/recheck": {"parameters": [{"$ref": "#/components/parameters/Hash"}], "post": {"operationId": "recheckTorrent", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "responses": {"202": {"$ref": "#/components/responses/JsonOk"}, "404": {"$ref": "#/components/responses/NotFound"}}}},
+    "/api/v1/torrents/{hash}/reannounce": {"parameters": [{"$ref": "#/components/parameters/Hash"}], "post": {"operationId": "reannounceTorrent", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "responses": {"204": {"$ref": "#/components/responses/Empty"}, "404": {"$ref": "#/components/responses/NotFound"}}}},
+    "/api/v1/torrents/{hash}/category": {"parameters": [{"$ref": "#/components/parameters/Hash"}], "put": {"operationId": "setTorrentCategory", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "requestBody": {"$ref": "#/components/requestBodies/JsonObject"}, "responses": {"204": {"$ref": "#/components/responses/Empty"}, "404": {"$ref": "#/components/responses/NotFound"}}}},
+    "/api/v1/torrents/{hash}/limits": {
+      "parameters": [{"$ref": "#/components/parameters/Hash"}],
+      "get": {"operationId": "getTorrentLimits", "responses": {"200": {"$ref": "#/components/responses/JsonOk"}, "404": {"$ref": "#/components/responses/NotFound"}}},
+      "put": {"operationId": "updateTorrentLimits", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "requestBody": {"$ref": "#/components/requestBodies/JsonObject"}, "responses": {"204": {"$ref": "#/components/responses/Empty"}, "501": {"$ref": "#/components/responses/JsonError"}}}
+    },
+    "/api/v1/torrents/{hash}/peers": {"parameters": [{"$ref": "#/components/parameters/Hash"}], "post": {"operationId": "addTorrentPeers", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "requestBody": {"$ref": "#/components/requestBodies/JsonObject"}, "responses": {"204": {"$ref": "#/components/responses/Empty"}, "400": {"$ref": "#/components/responses/JsonError"}}}},
+    "/api/v1/torrents/queue": {"post": {"operationId": "updateTorrentQueue", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "requestBody": {"$ref": "#/components/requestBodies/JsonObject"}, "responses": {"204": {"$ref": "#/components/responses/Empty"}}}},
+    "/api/v1/torrents/{hash}/tags": {
+      "parameters": [{"$ref": "#/components/parameters/Hash"}],
+      "post": {"operationId": "addTorrentTags", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "requestBody": {"$ref": "#/components/requestBodies/JsonObject"}, "responses": {"204": {"$ref": "#/components/responses/Empty"}}},
+      "patch": {"operationId": "patchTorrentTags", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "requestBody": {"$ref": "#/components/requestBodies/JsonObject"}, "responses": {"204": {"$ref": "#/components/responses/Empty"}}},
+      "delete": {"operationId": "removeTorrentTags", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "responses": {"204": {"$ref": "#/components/responses/Empty"}}}
+    },
+    "/api/v1/torrents/{hash}/files": {
+      "parameters": [{"$ref": "#/components/parameters/Hash"}],
+      "get": {"operationId": "listTorrentFiles", "responses": {"200": {"$ref": "#/components/responses/JsonOk"}}},
+      "patch": {"operationId": "patchTorrentFiles", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "requestBody": {"$ref": "#/components/requestBodies/JsonObject"}, "responses": {"204": {"$ref": "#/components/responses/Empty"}, "400": {"$ref": "#/components/responses/JsonError"}}}
+    },
+    "/api/v1/torrents/{hash}/trackers": {
+      "parameters": [{"$ref": "#/components/parameters/Hash"}],
+      "get": {"operationId": "listTorrentTrackers", "responses": {"200": {"$ref": "#/components/responses/JsonOk"}}},
+      "patch": {"operationId": "patchTorrentTrackers", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "requestBody": {"$ref": "#/components/requestBodies/JsonObject"}, "responses": {"204": {"$ref": "#/components/responses/Empty"}, "400": {"$ref": "#/components/responses/JsonError"}}}
+    },
+    "/api/v1/torrents/{hash}/diagnostics": {"parameters": [{"$ref": "#/components/parameters/Hash"}], "get": {"operationId": "diagnoseTorrent", "responses": {"200": {"$ref": "#/components/responses/JsonOk"}}}},
+    "/api/v1/transfer/info": {"get": {"operationId": "transferInfo", "responses": {"200": {"$ref": "#/components/responses/JsonOk"}, "503": {"$ref": "#/components/responses/JsonError"}}}},
+    "/api/v1/transfer/limits": {
+      "get": {"operationId": "transferLimits", "responses": {"200": {"$ref": "#/components/responses/JsonOk"}}},
+      "put": {"operationId": "updateTransferLimits", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "requestBody": {"$ref": "#/components/requestBodies/JsonObject"}, "responses": {"204": {"$ref": "#/components/responses/Empty"}}}
+    },
+    "/api/v1/session/features": {
+      "get": {"operationId": "sessionFeatures", "responses": {"200": {"$ref": "#/components/responses/JsonOk"}}},
+      "put": {"operationId": "updateSessionFeatures", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "requestBody": {"$ref": "#/components/requestBodies/JsonObject"}, "responses": {"204": {"$ref": "#/components/responses/Empty"}}}
+    },
+    "/api/v1/categories": {
+      "get": {"operationId": "listCategories", "responses": {"200": {"$ref": "#/components/responses/JsonOk"}}},
+      "post": {"operationId": "upsertCategory", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "requestBody": {"$ref": "#/components/requestBodies/JsonObject"}, "responses": {"204": {"$ref": "#/components/responses/Empty"}}}
+    },
+    "/api/v1/categories/{name}": {"parameters": [{"$ref": "#/components/parameters/Name"}], "delete": {"operationId": "deleteCategory", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "responses": {"204": {"$ref": "#/components/responses/Empty"}}}},
+    "/api/v1/tags": {
+      "get": {"operationId": "listTags", "responses": {"200": {"$ref": "#/components/responses/JsonOk"}}},
+      "post": {"operationId": "createTag", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "requestBody": {"$ref": "#/components/requestBodies/JsonObject"}, "responses": {"204": {"$ref": "#/components/responses/Empty"}}}
+    },
+    "/api/v1/tags/{name}": {"parameters": [{"$ref": "#/components/parameters/Name"}], "delete": {"operationId": "deleteTag", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "responses": {"204": {"$ref": "#/components/responses/Empty"}}}},
+    "/api/v1/bulk/{action}": {"parameters": [{"$ref": "#/components/parameters/Action"}], "post": {"operationId": "bulkAction", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "requestBody": {"$ref": "#/components/requestBodies/JsonObject"}, "responses": {"200": {"$ref": "#/components/responses/JsonOk"}}}},
+    "/api/v1/cross-seed": {"post": {"operationId": "crossSeed", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "requestBody": {"$ref": "#/components/requestBodies/JsonObject"}, "responses": {"200": {"$ref": "#/components/responses/JsonOk"}}}},
+    "/api/v1/tracker-health": {"get": {"operationId": "trackerHealth", "responses": {"200": {"$ref": "#/components/responses/JsonOk"}}}},
+    "/api/v1/sidebar-facets": {"get": {"operationId": "sidebarFacets", "responses": {"200": {"$ref": "#/components/responses/JsonOk"}}}},
+    "/api/v1/logs": {"get": {"operationId": "logs", "parameters": [{"$ref": "#/components/parameters/Limit"}, {"$ref": "#/components/parameters/LastKnownId"}], "responses": {"200": {"$ref": "#/components/responses/JsonOk"}}}},
+    "/api/v1/saved-views": {"get": {"operationId": "listSavedViews", "responses": {"200": {"$ref": "#/components/responses/JsonOk"}}}, "post": {"operationId": "upsertSavedView", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "requestBody": {"$ref": "#/components/requestBodies/JsonObject"}, "responses": {"204": {"$ref": "#/components/responses/Empty"}}}},
+    "/api/v1/saved-views/{id}": {"parameters": [{"$ref": "#/components/parameters/Id"}], "delete": {"operationId": "deleteSavedView", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "responses": {"204": {"$ref": "#/components/responses/Empty"}}}},
+    "/api/v1/ratio-groups": {"get": {"operationId": "listRatioGroups", "responses": {"200": {"$ref": "#/components/responses/JsonOk"}}}, "post": {"operationId": "upsertRatioGroup", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "requestBody": {"$ref": "#/components/requestBodies/JsonObject"}, "responses": {"204": {"$ref": "#/components/responses/Empty"}}}},
+    "/api/v1/ratio-groups/{id}": {"parameters": [{"$ref": "#/components/parameters/Id"}], "post": {"operationId": "runRatioGroup", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "responses": {"200": {"$ref": "#/components/responses/JsonOk"}}}, "delete": {"operationId": "deleteRatioGroup", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "responses": {"204": {"$ref": "#/components/responses/Empty"}}}},
+    "/api/v1/workflows": {"get": {"operationId": "listWorkflows", "responses": {"200": {"$ref": "#/components/responses/JsonOk"}}}, "post": {"operationId": "upsertWorkflow", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "requestBody": {"$ref": "#/components/requestBodies/JsonObject"}, "responses": {"204": {"$ref": "#/components/responses/Empty"}}}},
+    "/api/v1/workflows/{id}": {"parameters": [{"$ref": "#/components/parameters/Id"}], "post": {"operationId": "runWorkflow", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "responses": {"200": {"$ref": "#/components/responses/JsonOk"}}}, "delete": {"operationId": "deleteWorkflow", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "responses": {"204": {"$ref": "#/components/responses/Empty"}}}},
+    "/api/v1/workflow-runs": {"get": {"operationId": "listWorkflowRuns", "responses": {"200": {"$ref": "#/components/responses/JsonOk"}}}},
+    "/api/v1/rss-rules": {"get": {"operationId": "listRssRules", "responses": {"200": {"$ref": "#/components/responses/JsonOk"}}}, "post": {"operationId": "upsertRssRule", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "requestBody": {"$ref": "#/components/requestBodies/JsonObject"}, "responses": {"204": {"$ref": "#/components/responses/Empty"}}}},
+    "/api/v1/rss-rules/test": {"post": {"operationId": "testRssRules", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "requestBody": {"$ref": "#/components/requestBodies/JsonObject"}, "responses": {"200": {"$ref": "#/components/responses/JsonOk"}}}},
+    "/api/v1/rss-rules/apply": {"post": {"operationId": "applyRssRules", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "requestBody": {"$ref": "#/components/requestBodies/JsonObject"}, "responses": {"200": {"$ref": "#/components/responses/JsonOk"}}}},
+    "/api/v1/rss-rules/{id}": {"parameters": [{"$ref": "#/components/parameters/Id"}], "delete": {"operationId": "deleteRssRule", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "responses": {"204": {"$ref": "#/components/responses/Empty"}}}},
+    "/api/v1/engine": {"get": {"operationId": "engineDiagnostics", "responses": {"200": {"$ref": "#/components/responses/JsonOk"}}}},
+    "/api/v1/engine/commands": {"get": {"operationId": "engineCommands", "responses": {"501": {"$ref": "#/components/responses/JsonError"}}}},
+    "/api/v1/engine/rtorrent-settings": {"get": {"operationId": "getRtorrentSettings", "responses": {"200": {"$ref": "#/components/responses/JsonOk"}}}, "put": {"operationId": "saveRtorrentSettings", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "requestBody": {"$ref": "#/components/requestBodies/JsonObject"}, "responses": {"200": {"$ref": "#/components/responses/JsonOk"}, "400": {"$ref": "#/components/responses/JsonError"}, "501": {"$ref": "#/components/responses/JsonError"}, "503": {"$ref": "#/components/responses/JsonError"}}}},
+    "/api/v1/engine/restart": {"post": {"operationId": "restartEngine", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "responses": {"501": {"$ref": "#/components/responses/JsonError"}}}},
+    "/api/v1/engine/user-agent": {"get": {"operationId": "getEngineUserAgent", "responses": {"200": {"$ref": "#/components/responses/JsonOk"}}}, "put": {"operationId": "setEngineUserAgent", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "requestBody": {"$ref": "#/components/requestBodies/JsonObject"}, "responses": {"204": {"$ref": "#/components/responses/Empty"}, "400": {"$ref": "#/components/responses/JsonError"}, "503": {"$ref": "#/components/responses/JsonError"}}}},
+    "/api/v1/settings/user-agent": {"get": {"operationId": "getUserAgent", "responses": {"200": {"$ref": "#/components/responses/JsonOk"}}}, "put": {"operationId": "setUserAgent", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "requestBody": {"$ref": "#/components/requestBodies/JsonObject"}, "responses": {"204": {"$ref": "#/components/responses/Empty"}, "400": {"$ref": "#/components/responses/JsonError"}, "503": {"$ref": "#/components/responses/JsonError"}}}},
+    "/api/v1/events": {"get": {"operationId": "streamEvents", "parameters": [{"$ref": "#/components/parameters/LastKnownRevision"}], "responses": {"200": {"description": "Bounded server-sent event stream", "content": {"text/event-stream": {"schema": {"type": "string"}}}}}}},
+    "/api/v1/session-events": {"get": {"operationId": "listSessionEvents", "parameters": [{"$ref": "#/components/parameters/Limit"}, {"$ref": "#/components/parameters/LastKnownId"}], "responses": {"200": {"$ref": "#/components/responses/JsonOk"}}}},
+    "/api/v1/jobs": {"get": {"operationId": "listJobs", "responses": {"200": {"$ref": "#/components/responses/JsonOk"}}}},
+    "/api/v1/jobs/{id}/pause": {"parameters": [{"$ref": "#/components/parameters/Id"}], "post": {"operationId": "pauseJob", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "responses": {"204": {"$ref": "#/components/responses/Empty"}}}},
+    "/api/v1/jobs/{id}/resume": {"parameters": [{"$ref": "#/components/parameters/Id"}], "post": {"operationId": "resumeJob", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "responses": {"204": {"$ref": "#/components/responses/Empty"}}}},
+    "/api/v1/jobs/{id}/cancel": {"parameters": [{"$ref": "#/components/parameters/Id"}], "post": {"operationId": "cancelJob", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "responses": {"204": {"$ref": "#/components/responses/Empty"}}}},
+    "/api/v1/storage": {"get": {"operationId": "storage", "responses": {"200": {"$ref": "#/components/responses/JsonOk"}}}},
+    "/api/v1/storage/plan": {"post": {"operationId": "previewStoragePlan", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "requestBody": {"$ref": "#/components/requestBodies/JsonObject"}, "responses": {"200": {"$ref": "#/components/responses/JsonOk"}, "400": {"$ref": "#/components/responses/JsonError"}}}},
+    "/api/v1/storage/execute": {"post": {"operationId": "executeStoragePlan", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "requestBody": {"$ref": "#/components/requestBodies/JsonObject"}, "responses": {"202": {"$ref": "#/components/responses/JsonOk"}, "400": {"$ref": "#/components/responses/JsonError"}, "409": {"$ref": "#/components/responses/JsonError"}}}}
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {"type": "http", "scheme": "bearer"},
+      "sessionCookie": {"type": "apiKey", "in": "cookie", "name": "tng_session"}
+    },
+    "parameters": {
+      "Hash": {"name": "hash", "in": "path", "required": true, "schema": {"type": "string", "minLength": 40, "maxLength": 64}},
+      "Name": {"name": "name", "in": "path", "required": true, "schema": {"type": "string", "minLength": 1}},
+      "Id": {"name": "id", "in": "path", "required": true, "schema": {"type": "string", "minLength": 1}},
+      "Action": {"name": "action", "in": "path", "required": true, "schema": {"type": "string", "minLength": 1}},
+      "Limit": {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 1, "maximum": 5000}},
+      "Offset": {"name": "offset", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 0}},
+      "Snapshot": {"name": "snapshot", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 0}},
+      "Filter": {"name": "filter", "in": "query", "required": false, "schema": {"type": "string"}},
+      "LastKnownId": {"name": "last_known_id", "in": "query", "required": false, "schema": {"type": "integer"}},
+      "LastKnownRevision": {"name": "last_known_revision", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 0}},
+      "IdempotencyKey": {"name": "Idempotency-Key", "in": "header", "required": false, "description": "Printable ASCII key, max 128 bytes. Successful responses are replayable for the retention window; reuse with a different request is rejected.", "schema": {"type": "string", "minLength": 1, "maxLength": 128}}
+    },
+    "requestBodies": {
+      "JsonObject": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/JsonObject"}}}},
+      "AddTorrent": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AddTorrentRequest"}}}}
+    },
+    "responses": {
+      "JsonOk": {"description": "JSON response", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/JsonValue"}}}},
+      "JsonError": {"description": "Structured API error", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}},
+      "Unauthorized": {"description": "Missing or invalid API token"},
+      "NotFound": {"description": "Torrent, job, or named resource was not found"},
+      "PayloadTooLarge": {"description": "Request exceeds the facade body limit"},
+      "Empty": {"description": "Mutation accepted with no response body"}
+    },
+    "schemas": {
+      "JsonValue": {},
+      "JsonObject": {"type": "object", "additionalProperties": true},
+      "AddTorrentRequest": {"type": "object", "required": ["save_path"], "properties": {"torrent_b64": {"type": ["string", "null"]}, "magnet": {"type": ["string", "null"]}, "save_path": {"type": "string", "minLength": 1}, "category": {"type": ["string", "null"]}, "tags": {"type": ["array", "null"], "items": {"type": "string"}}, "start": {"type": ["boolean", "null"]}}, "additionalProperties": false},
+      "Error": {"type": "object", "properties": {"code": {"type": "string"}, "message": {"type": "string"}}, "required": ["code", "message"], "additionalProperties": true}
+    }
+  }
+}

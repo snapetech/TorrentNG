@@ -6,6 +6,12 @@ surface; see [ENGINE_REWRITE.md](ENGINE_REWRITE.md),
 [ENGINE_REWRITE_BURNDOWN.md](ENGINE_REWRITE_BURNDOWN.md), and
 [NATIVE_DEPLOYMENT.md](NATIVE_DEPLOYMENT.md).
 
+The remaining bullets in this historical file are environment-owned release
+gates, not an unassigned repository backlog. The local source, test, security,
+and release-smoke work is reconciled in
+[BACKEND_AUDIT_BURN_DOWN.md](BACKEND_AUDIT_BURN_DOWN.md); what remains requires
+real clients, target hardware, public network access, or elapsed soak time.
+
 ## Done in sidecar scope
 
 - Native REST API for torrents, files, trackers, categories, tags, bulk operations, settings, storage, tracker health, ratio groups, workflows, RSS rules, cross-seed helper, and saved views.

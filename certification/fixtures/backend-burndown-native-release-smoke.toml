@@ -1,0 +1,23 @@
+[daemon]
+api_bind = "127.0.0.1:28080"
+session_dir = "/tmp/torrentng-backend-burndown-release-smoke-session"
+shutdown_timeout_secs = 10
+
+[network]
+listen_port = 45555
+max_peers = 32
+
+[storage]
+download_dir = "/tmp/torrentng-backend-burndown-release-smoke-data"
+
+[runtime]
+torrent_tiers_enabled = true
+
+[dht]
+enabled = false
+
+[db]
+path = "/tmp/torrentng-backend-burndown-release-smoke-session/state.db"
+
+[auth]
+api_tokens = ["backend-burndown-token-20260902"]
