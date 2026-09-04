@@ -965,7 +965,7 @@ run_restart_recovery_case() {
 }
 
 run_rust_api_facade_case() {
-  local status="PASS"
+  local status="PASS" metrics_body
   append_report "## Extended Local: rust-api-facades"
   append_report ""
   log "running extended local case rust-api-facades"
@@ -976,8 +976,8 @@ run_rust_api_facade_case() {
   wait_rust_ready 120 || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/health" |
     jq -e '.ready == true and .status == "ok"' >/dev/null || status="FAIL"
-  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/metrics" |
-    grep -q '^# HELP' || status="FAIL"
+  metrics_body="$(curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/metrics")" || status="FAIL"
+  grep -q '^# HELP' <<<"$metrics_body" || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/v1/torrents" |
     jq -e 'type == "object" and (.torrents | type == "array")' >/dev/null || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/qb/v2/torrents/info" |
