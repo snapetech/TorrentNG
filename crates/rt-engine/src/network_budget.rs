@@ -107,6 +107,7 @@ impl SharedRateLimiter {
         if bytes == 0 {
             return;
         }
+        let mut remaining = bytes;
         loop {
             let wait = {
                 let mut state = self.state.lock().expect("network budget mutex poisoned");
@@ -122,14 +123,32 @@ impl SharedRateLimiter {
                     .tokens
                     .saturating_add(refill)
                     .min(limit.max(MAX_INITIAL_BURST_BYTES));
-                if state.tokens >= bytes {
-                    state.tokens -= bytes;
-                    return;
+                // A protocol frame can be larger than the initial burst
+                // (for example, a future metadata/data path may account for
+                // a whole bounded frame). Consume it in bucket-sized chunks;
+                // asking the bucket for more than its capacity would
+                // otherwise wait forever because tokens can never reach that
+                // request size.
+                let requested = remaining.min(limit.max(MAX_INITIAL_BURST_BYTES));
+                if state.tokens >= requested {
+                    state.tokens -= requested;
+                    remaining -= requested;
+                    if remaining == 0 {
+                        return;
+                    }
+                    Duration::ZERO
+                } else {
+                    let missing = requested.saturating_sub(state.tokens);
+                    let wait_nanos = ((u128::from(missing) * 1_000_000_000) / u128::from(limit))
+                        .min(u128::from(u64::MAX)) as u64;
+                    Duration::from_nanos(wait_nanos)
                 }
-                let missing = bytes.saturating_sub(state.tokens);
-                Duration::from_secs_f64(missing as f64 / limit as f64)
             };
-            tokio::time::sleep(wait.max(Duration::from_millis(1))).await;
+            if wait.is_zero() {
+                tokio::task::yield_now().await;
+            } else {
+                tokio::time::sleep(wait.max(Duration::from_millis(1))).await;
+            }
         }
     }
 }
@@ -155,6 +174,21 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!waiter.is_finished());
         tokio::time::advance(Duration::from_secs(1)).await;
+        waiter.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn limited_budget_accepts_request_larger_than_bucket_capacity() {
+        let limiter = Arc::new(SharedRateLimiter::new(Some(1_000)));
+        let waiter_limiter = Arc::clone(&limiter);
+        let waiter = tokio::spawn(async move {
+            waiter_limiter
+                .acquire(MAX_INITIAL_BURST_BYTES.saturating_mul(2))
+                .await;
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        tokio::time::advance(Duration::from_secs(65)).await;
         waiter.await.unwrap();
     }
 

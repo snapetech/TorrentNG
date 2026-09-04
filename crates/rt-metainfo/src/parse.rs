@@ -9,7 +9,7 @@ use crate::{
     types::{TorrentFileV1, TorrentFileV2, TorrentMeta, TorrentMetaV1, TorrentMetaV2},
 };
 
-const MAX_TORRENT_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_TORRENT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_FILES: usize = 100_000;
 const MAX_PATH_COMPONENTS: usize = 256;
 const MAX_TRACKER_URLS: usize = 4096;
@@ -50,9 +50,34 @@ pub fn parse_torrent(raw: &[u8]) -> Result<TorrentMeta, MetainfoError> {
     let has_file_tree = info.get(b"file tree").is_some();
     let has_pieces = info.get(b"pieces").is_some();
 
+    // BEP 52 requires implementations to reject a newer metadata version
+    // before interpreting any of its fields. Otherwise a future torrent that
+    // happens to contain legacy-looking fields can be silently misread as a
+    // v1 torrent.
+    if let Some(version) = meta_version {
+        if version < 0 {
+            return Err(MetainfoError::InvalidIntegerValue {
+                field: "meta version",
+                value: version,
+            });
+        }
+        if version > 2 {
+            return Err(MetainfoError::UnsupportedMetaVersion(version));
+        }
+        if version == 2 && !has_file_tree {
+            return Err(MetainfoError::MissingField("file tree"));
+        }
+    }
+    if has_file_tree && meta_version != Some(2) {
+        return Err(match meta_version {
+            Some(version) => MetainfoError::UnsupportedMetaVersion(version),
+            None => MetainfoError::MissingField("meta version"),
+        });
+    }
+
     let is_v2 = meta_version == Some(2) && has_file_tree;
 
-    let announce = parse_announce(root);
+    let announce = parse_announce(root)?;
     let announce_list = parse_announce_list(root)?;
     let webseeds = parse_webseeds(root)?;
     let comment = parse_optional_string(root, b"comment");
@@ -72,6 +97,9 @@ pub fn parse_torrent(raw: &[u8]) -> Result<TorrentMeta, MetainfoError> {
 
     let piece_length = get_positive_u64(info, b"piece length", "piece length")?;
     if piece_length > u32::MAX as u64 {
+        return Err(MetainfoError::InvalidPieceLength(piece_length));
+    }
+    if is_v2 && (piece_length < 16 * 1024 || !piece_length.is_power_of_two()) {
         return Err(MetainfoError::InvalidPieceLength(piece_length));
     }
 
@@ -96,7 +124,7 @@ pub fn parse_torrent(raw: &[u8]) -> Result<TorrentMeta, MetainfoError> {
 
         let pieces = parse_piece_hashes(info)?;
         let files_v1 = parse_files_v1(info, &name)?;
-        let files_v2 = parse_file_tree(info, &name)?;
+        let files_v2 = parse_file_tree(info)?;
         validate_piece_count(&pieces, &files_v1, piece_length)?;
 
         return Ok(TorrentMeta::Hybrid(
@@ -139,7 +167,7 @@ pub fn parse_torrent(raw: &[u8]) -> Result<TorrentMeta, MetainfoError> {
             h.update(info_bytes);
             h.finalize().into()
         };
-        let files_v2 = parse_file_tree(info, &name)?;
+        let files_v2 = parse_file_tree(info)?;
         return Ok(TorrentMeta::V2(TorrentMetaV2 {
             info_hash_v2,
             announce,
@@ -193,26 +221,17 @@ pub fn torrent_info_bytes(raw: &[u8]) -> Result<Vec<u8>, MetainfoError> {
 
 /// Parse a v2 `file tree` dict into a flat list of files.
 /// BEP 52 file tree: nested dicts where leaves have `{"": {"length": N, "pieces root": <bytes>}}`.
-fn parse_file_tree(
-    info: &BValue<'_>,
-    torrent_name: &str,
-) -> Result<Vec<TorrentFileV2>, MetainfoError> {
+fn parse_file_tree(info: &BValue<'_>) -> Result<Vec<TorrentFileV2>, MetainfoError> {
     let file_tree = info
         .get(b"file tree")
         .ok_or(MetainfoError::MissingField("file tree"))?;
 
-    // Unlike v1, BEP 52 does not special-case single-file torrents: the
-    // file tree is always rooted under `name` as a container directory,
-    // even when it holds exactly one file. Real v2-capable clients
-    // (libtorrent-based: qBittorrent, rTorrent) place such a file at
-    // `save_path/name/<leaf>`, not flatly at `save_path/name` - confirmed
-    // against this crate's own cryptographically-verified fixtures in
-    // `crates/rt-engine/src/engine.rs` (`pure_v2_recheck_verifies_file_roots_without_torrent_task`).
-    // Do not "fix" this into flat placement without re-verifying against
-    // real client output first.
     let mut files = Vec::new();
     let mut offset = 0u64;
-    walk_file_tree(file_tree, &[torrent_name], &mut files, &mut offset)?;
+    // `name` is advisory in BEP 52. The tree itself is rootless and may
+    // optionally contain a directory with the same name; adding `name`
+    // unconditionally turns a standard single-file tree into a wrong path.
+    walk_file_tree(file_tree, &[], &mut files, &mut offset)?;
 
     if files.is_empty() {
         return Err(MetainfoError::MissingField("file tree (empty)"));
@@ -246,14 +265,30 @@ fn walk_file_tree<'a>(
 
     // Leaf: has empty-string key ""
     if let Some(leaf) = node.get(b"") {
-        let length = get_nonnegative_u64(leaf, b"length", "file tree length")?;
-        let pieces_root_bytes = get_bytes(leaf, b"pieces root", "pieces root")?;
-        if pieces_root_bytes.len() != 32 {
+        if path_components.is_empty() {
+            return Err(MetainfoError::InvalidFieldType("file tree root"));
+        }
+        if dict.len() != 1 {
             return Err(MetainfoError::InvalidFieldType(
-                "pieces root (must be 32 bytes)",
+                "file tree leaf with sibling entries",
             ));
         }
-        let pieces_root: [u8; 32] = pieces_root_bytes.try_into().unwrap();
+        let length = get_nonnegative_u64(leaf, b"length", "file tree length")?;
+        let pieces_root = match leaf.get(b"pieces root") {
+            Some(value) => {
+                let pieces_root_bytes = value
+                    .as_bytes()
+                    .ok_or(MetainfoError::InvalidFieldType("pieces root"))?;
+                if pieces_root_bytes.len() != 32 {
+                    return Err(MetainfoError::InvalidFieldType(
+                        "pieces root (must be 32 bytes)",
+                    ));
+                }
+                Some(pieces_root_bytes.try_into().expect("length checked"))
+            }
+            None if length == 0 => None,
+            None => return Err(MetainfoError::MissingField("pieces root")),
+        };
 
         let components: Vec<String> = path_components.iter().map(|s| s.to_string()).collect();
         let path = SafeRelPath::from_components(&components, false)?;
@@ -285,8 +320,24 @@ fn walk_file_tree<'a>(
     Ok(())
 }
 
-fn parse_announce(root: &BValue<'_>) -> Option<String> {
-    parse_optional_string(root, b"announce")
+fn parse_announce(root: &BValue<'_>) -> Result<Option<String>, MetainfoError> {
+    let Some(value) = root.get(b"announce") else {
+        return Ok(None);
+    };
+    let Some(bytes) = value.as_bytes() else {
+        return Err(MetainfoError::InvalidFieldType("announce"));
+    };
+    if bytes.len() > MAX_TRACKER_URL_BYTES {
+        return Err(MetainfoError::LimitExceeded {
+            field: "tracker url bytes",
+            limit: MAX_TRACKER_URL_BYTES,
+        });
+    }
+    Ok(std::str::from_utf8(bytes)
+        .ok()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned))
 }
 
 fn parse_optional_string(root: &BValue<'_>, key: &[u8]) -> Option<String> {
@@ -299,72 +350,76 @@ fn parse_optional_string(root: &BValue<'_>, key: &[u8]) -> Option<String> {
 }
 
 fn parse_files_v1(info: &BValue<'_>, name: &str) -> Result<Vec<TorrentFileV1>, MetainfoError> {
-    if let Some(BValue::List(file_list)) = info.get(b"files") {
-        if file_list.len() > MAX_FILES {
-            return Err(MetainfoError::LimitExceeded {
-                field: "files",
-                limit: MAX_FILES,
-            });
-        }
-        // Multi-file torrent: name is the root directory
-        let mut offset = 0u64;
-        let mut files = Vec::with_capacity(file_list.len());
-        for (idx, entry) in file_list.iter().enumerate() {
-            let length = get_nonnegative_u64(entry, b"length", "file length")?;
-            let path_list = match entry.get(b"path") {
-                Some(BValue::List(parts)) => parts,
-                _ => return Err(MetainfoError::MissingField("file path")),
-            };
-            if path_list.len().saturating_add(1) > MAX_PATH_COMPONENTS {
+    match info.get(b"files") {
+        Some(BValue::List(file_list)) => {
+            if file_list.len() > MAX_FILES {
                 return Err(MetainfoError::LimitExceeded {
-                    field: "path components",
-                    limit: MAX_PATH_COMPONENTS,
+                    field: "files",
+                    limit: MAX_FILES,
                 });
             }
-            let mut components: Vec<String> = vec![name.to_owned()];
-            for part in path_list {
-                let s = match part {
-                    BValue::Bytes(b) => std::str::from_utf8(b)
-                        .map_err(|_| MetainfoError::InvalidUtf8("path component"))?
-                        .to_owned(),
-                    _ => return Err(MetainfoError::InvalidFieldType("path component")),
+            // Multi-file torrent: name is the root directory
+            let mut offset = 0u64;
+            let mut files = Vec::with_capacity(file_list.len());
+            for (idx, entry) in file_list.iter().enumerate() {
+                let length = get_nonnegative_u64(entry, b"length", "file length")?;
+                let path_list = match entry.get(b"path") {
+                    Some(BValue::List(parts)) => parts,
+                    _ => return Err(MetainfoError::MissingField("file path")),
                 };
-                // Some (old, real-world) torrent creation tools emit a
-                // vestigial empty leading path component - e.g.
-                // `path: ["", "movie.mkv"]`. Confirmed against a real,
-                // actively-seeding rTorrent production torrent: rTorrent
-                // itself silently drops it (files land at
-                // `<name>/movie.mkv`, no empty-named subdirectory), so
-                // rejecting the whole file here would import less than a
-                // real client does. `SafeRelPath` still rejects a path
-                // that ends up with zero components after this filtering.
-                if !s.is_empty() {
-                    components.push(s);
+                if path_list.len().saturating_add(1) > MAX_PATH_COMPONENTS {
+                    return Err(MetainfoError::LimitExceeded {
+                        field: "path components",
+                        limit: MAX_PATH_COMPONENTS,
+                    });
                 }
+                let mut components: Vec<String> = vec![name.to_owned()];
+                for part in path_list {
+                    let s = match part {
+                        BValue::Bytes(b) => std::str::from_utf8(b)
+                            .map_err(|_| MetainfoError::InvalidUtf8("path component"))?
+                            .to_owned(),
+                        _ => return Err(MetainfoError::InvalidFieldType("path component")),
+                    };
+                    // Some (old, real-world) torrent creation tools emit a
+                    // vestigial empty leading path component - e.g.
+                    // `path: ["", "movie.mkv"]`. Confirmed against a real,
+                    // actively-seeding rTorrent production torrent: rTorrent
+                    // itself silently drops it (files land at
+                    // `<name>/movie.mkv`, no empty-named subdirectory), so
+                    // rejecting the whole file here would import less than a
+                    // real client does. `SafeRelPath` still rejects a path
+                    // that ends up with zero components after this filtering.
+                    if !s.is_empty() {
+                        components.push(s);
+                    }
+                }
+                let path = SafeRelPath::from_components(&components, false)?;
+                let pad = is_pad_attr(entry);
+                files.push(TorrentFileV1 {
+                    index: idx as u32,
+                    length,
+                    path,
+                    offset,
+                    pad,
+                });
+                add_offset(&mut offset, length, "file offset")?;
             }
-            let path = SafeRelPath::from_components(&components, false)?;
-            let pad = is_pad_attr(entry);
-            files.push(TorrentFileV1 {
-                index: idx as u32,
+            Ok(files)
+        }
+        Some(_) => Err(MetainfoError::InvalidFieldType("files")),
+        None => {
+            // Single-file torrent
+            let length = get_nonnegative_u64(info, b"length", "length")?;
+            let path = SafeRelPath::from_name(name, false)?;
+            Ok(vec![TorrentFileV1 {
+                index: 0,
                 length,
                 path,
-                offset,
-                pad,
-            });
-            add_offset(&mut offset, length, "file offset")?;
+                offset: 0,
+                pad: false,
+            }])
         }
-        Ok(files)
-    } else {
-        // Single-file torrent
-        let length = get_nonnegative_u64(info, b"length", "length")?;
-        let path = SafeRelPath::from_name(name, false)?;
-        Ok(vec![TorrentFileV1 {
-            index: 0,
-            length,
-            path,
-            offset: 0,
-            pad: false,
-        }])
     }
 }
 
@@ -665,6 +720,26 @@ mod tests {
         assert!(m.is_single_file());
         assert!(!m.private);
         assert_eq!(m.info_hash.len(), 20);
+    }
+
+    #[test]
+    fn reject_files_field_with_wrong_type() {
+        let pieces_data = make_pieces(1);
+        let mut info_pairs: Vec<(&[u8], BValue<'_>)> = vec![
+            (b"files", BValue::Int(1)),
+            (b"length", BValue::Int(1024)),
+            (b"name", BValue::Bytes(b"test.bin")),
+            (b"piece length", BValue::Int(512 * 1024)),
+            (b"pieces", BValue::Bytes(&pieces_data)),
+        ];
+        info_pairs.sort_by(|a, b| a.0.cmp(b.0));
+        let mut root = vec![(b"info".as_ref(), BValue::Dict(info_pairs))];
+        root.sort_by(|a, b| a.0.cmp(b.0));
+
+        assert!(matches!(
+            parse_torrent(&encode(&BValue::Dict(root))),
+            Err(MetainfoError::InvalidFieldType("files"))
+        ));
     }
 
     #[test]
@@ -1005,12 +1080,24 @@ mod tests {
     }
 
     fn v2_torrent(name: &str, file_name: &str, length: i64) -> Vec<u8> {
+        v2_torrent_with_settings(name, file_name, length, 16 * 1024, 2, true)
+    }
+
+    fn v2_torrent_with_settings(
+        name: &str,
+        file_name: &str,
+        length: i64,
+        piece_length: i64,
+        meta_version: i64,
+        include_pieces_root: bool,
+    ) -> Vec<u8> {
         let pieces_root = vec![0xABu8; 32];
+        let mut leaf_pairs: Vec<(&[u8], BValue<'_>)> = vec![(b"length", BValue::Int(length))];
+        if include_pieces_root {
+            leaf_pairs.push((b"pieces root", BValue::Bytes(&pieces_root)));
+        }
         let leaf = BValue::Dict({
-            let mut p: Vec<(&[u8], BValue<'_>)> = vec![
-                (b"length", BValue::Int(length)),
-                (b"pieces root", BValue::Bytes(&pieces_root)),
-            ];
+            let mut p = leaf_pairs;
             p.sort_by(|a, b| a.0.cmp(b.0));
             p
         });
@@ -1019,9 +1106,9 @@ mod tests {
 
         let mut info_pairs: Vec<(&[u8], BValue<'_>)> = vec![
             (b"file tree", file_tree),
-            (b"meta version", BValue::Int(2)),
+            (b"meta version", BValue::Int(meta_version)),
             (b"name", BValue::Bytes(name.as_bytes())),
-            (b"piece length", BValue::Int(16 * 1024)),
+            (b"piece length", BValue::Int(piece_length)),
         ];
         info_pairs.sort_by(|a, b| a.0.cmp(b.0));
 
@@ -1043,14 +1130,11 @@ mod tests {
         assert_eq!(m.name, "mydir");
         assert_eq!(m.files.len(), 1);
         assert_eq!(m.files[0].length, 65536);
+        assert_eq!(m.files[0].path.as_display(), "data.bin");
         assert_eq!(m.info_hash_v2.len(), 32);
     }
 
-    // Regression coverage for the v2 single-file wrapper-directory bug:
-    // real v2-capable clients (libtorrent-based qBittorrent/rTorrent,
-    // Transmission) place a true single-file v2 torrent flatly at
-    // `save_path/name`, matching v1 single-file placement. Only when the
-    // tree genuinely encodes a subdirectory should `name/` be prepended.
+    // Regression coverage for rootless BEP 52 file-tree paths.
 
     fn v2_multi_file_torrent(dir_name: &str, files: &[(&str, i64)]) -> Vec<u8> {
         let pieces_root = vec![0xCDu8; 32];
@@ -1124,20 +1208,13 @@ mod tests {
     }
 
     #[test]
-    fn v2_single_file_keeps_name_as_wrapper_directory() {
-        // Unlike v1, BEP 52 does not special-case single-file torrents:
-        // even one file lives under `name/` as a container directory. Do
-        // not "fix" this into flat `save_path/name` placement without
-        // re-verifying against real client output first - an earlier
-        // attempt at exactly that broke `crates/rt-engine/src/engine.rs`'s
-        // cryptographically-verified v2 fixtures
-        // (`pure_v2_recheck_verifies_file_roots_without_torrent_task`).
+    fn v2_single_file_uses_rootless_file_tree_path() {
         let raw = v2_torrent("mydir", "data.bin", 65536);
         let TorrentMeta::V2(m) = parse_torrent(&raw).unwrap() else {
             panic!("expected V2")
         };
         assert_eq!(m.files.len(), 1);
-        assert_eq!(m.files[0].path.as_display(), "mydir/data.bin");
+        assert_eq!(m.files[0].path.as_display(), "data.bin");
     }
 
     #[test]
@@ -1200,37 +1277,37 @@ mod tests {
         let real = m
             .files
             .iter()
-            .find(|f| f.path.as_display() == "album/01.flac")
+            .find(|f| f.path.as_display() == "01.flac")
             .unwrap();
         let pad = m
             .files
             .iter()
-            .find(|f| f.path.as_display() == "album/.pad/24")
+            .find(|f| f.path.as_display() == ".pad/24")
             .unwrap();
         assert!(!real.pad);
         assert!(pad.pad);
     }
 
     #[test]
-    fn v2_multi_file_root_keeps_name_as_wrapper_directory() {
+    fn v2_multi_file_preserves_tree_root_without_advisory_name() {
         let raw = v2_multi_file_torrent("album", &[("01.flac", 1000), ("02.flac", 2000)]);
         let TorrentMeta::V2(m) = parse_torrent(&raw).unwrap() else {
             panic!("expected V2")
         };
         assert_eq!(m.files.len(), 2);
         let paths: Vec<String> = m.files.iter().map(|f| f.path.as_display()).collect();
-        assert!(paths.contains(&"album/01.flac".to_owned()));
-        assert!(paths.contains(&"album/02.flac".to_owned()));
+        assert!(paths.contains(&"01.flac".to_owned()));
+        assert!(paths.contains(&"02.flac".to_owned()));
     }
 
     #[test]
-    fn v2_single_file_nested_in_subdirectory_keeps_name_and_subdir() {
+    fn v2_single_file_nested_in_subdirectory_preserves_tree_path() {
         let raw = v2_single_file_in_subdir_torrent("mydir", "docs", "readme.txt", 42);
         let TorrentMeta::V2(m) = parse_torrent(&raw).unwrap() else {
             panic!("expected V2")
         };
         assert_eq!(m.files.len(), 1);
-        assert_eq!(m.files[0].path.as_display(), "mydir/docs/readme.txt");
+        assert_eq!(m.files[0].path.as_display(), "docs/readme.txt");
     }
 
     #[test]
@@ -1242,6 +1319,108 @@ mod tests {
                 field: "file tree length",
                 value: -1
             })
+        ));
+    }
+
+    #[test]
+    fn v2_empty_file_may_omit_pieces_root() {
+        let raw = v2_torrent_with_settings("empty", "empty.bin", 0, 16 * 1024, 2, false);
+        let TorrentMeta::V2(meta) = parse_torrent(&raw).unwrap() else {
+            panic!("expected V2")
+        };
+
+        assert_eq!(meta.files.len(), 1);
+        assert_eq!(meta.files[0].path.as_display(), "empty.bin");
+        assert_eq!(meta.files[0].pieces_root, None);
+    }
+
+    #[test]
+    fn reject_v2_piece_length_below_protocol_minimum() {
+        let raw = v2_torrent_with_settings("dir", "data.bin", 1, 8192, 2, true);
+
+        assert!(matches!(
+            parse_torrent(&raw),
+            Err(MetainfoError::InvalidPieceLength(8192))
+        ));
+    }
+
+    #[test]
+    fn reject_future_metainfo_version_before_v1_fallback() {
+        let raw = v2_torrent_with_settings("future", "data.bin", 1, 16 * 1024, 3, true);
+
+        assert!(matches!(
+            parse_torrent(&raw),
+            Err(MetainfoError::UnsupportedMetaVersion(3))
+        ));
+    }
+
+    #[test]
+    fn reject_negative_metainfo_version() {
+        let raw = v2_torrent_with_settings("negative", "data.bin", 1, 16 * 1024, -1, false);
+
+        assert!(matches!(
+            parse_torrent(&raw),
+            Err(MetainfoError::InvalidIntegerValue {
+                field: "meta version",
+                value: -1
+            })
+        ));
+    }
+
+    #[test]
+    fn reject_oversized_top_level_tracker_url() {
+        let pieces = make_pieces(1);
+        let mut info_pairs: Vec<(&[u8], BValue<'_>)> = vec![
+            (b"length", BValue::Int(1)),
+            (b"name", BValue::Bytes(b"data.bin")),
+            (b"piece length", BValue::Int(512 * 1024)),
+            (b"pieces", BValue::Bytes(&pieces)),
+        ];
+        info_pairs.sort_by(|a, b| a.0.cmp(b.0));
+        let tracker = vec![b'x'; MAX_TRACKER_URL_BYTES + 1];
+        let raw = encode(&BValue::Dict(vec![
+            (b"announce".as_ref(), BValue::Bytes(&tracker)),
+            (b"info".as_ref(), BValue::Dict(info_pairs)),
+        ]));
+
+        assert!(matches!(
+            parse_torrent(&raw),
+            Err(MetainfoError::LimitExceeded {
+                field: "tracker url bytes",
+                limit: MAX_TRACKER_URL_BYTES
+            })
+        ));
+    }
+
+    #[test]
+    fn reject_file_tree_leaf_with_sibling_entries() {
+        let pieces_root = [0xABu8; 32];
+        let leaf = BValue::Dict(vec![
+            (
+                b"".as_ref(),
+                BValue::Dict(vec![(b"length".as_ref(), BValue::Int(1))]),
+            ),
+            (b"sibling".as_ref(), BValue::Dict(Vec::new())),
+        ]);
+        let file_tree = BValue::Dict(vec![(b"data.bin".as_ref(), leaf)]);
+        let mut info_pairs: Vec<(&[u8], BValue<'_>)> = vec![
+            (b"file tree", file_tree),
+            (b"meta version", BValue::Int(2)),
+            (b"name", BValue::Bytes(b"tree")),
+            (b"piece length", BValue::Int(16 * 1024)),
+            (b"pieces root", BValue::Bytes(&pieces_root)),
+        ];
+        info_pairs.sort_by(|a, b| a.0.cmp(b.0));
+        let raw = encode(&BValue::Dict(vec![(
+            b"info".as_ref(),
+            BValue::Dict(info_pairs),
+        )]));
+
+        assert!(matches!(
+            parse_torrent(&raw),
+            Err(MetainfoError::InvalidFieldType(
+                "file tree leaf with sibling entries"
+            ))
         ));
     }
 

@@ -9,17 +9,60 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
     collections::HashMap,
+    fmt,
     net::SocketAddr,
-    sync::atomic::Ordering,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{atomic::Ordering, Arc},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use tokio::task::JoinSet;
+
+// qBittorrent's maindata protocol has no page or snapshot parameter.  Keep
+// its compatibility response bounded and reject an over-limit sync instead
+// of returning a truncated object that claims to be a full update.
+const MAX_QBIT_SYNC_ENTRIES: usize = 10_000;
 
 use crate::{
     api::{server::AppState, ws::Event},
-    backend::{BackendPeer, BackendPieceState, QueueMove},
-    cache::{AppEventRow, ListParams, RssRule, TorrentRow},
+    backend::{ratio_milli, BackendPeer, BackendPieceState, BackendStatus, QueueMove},
+    cache::{
+        bounded_page_limit, validate_page_offset, AppEventRow, ListParams, RssRule,
+        RssRuleRenameResult, TorrentRow,
+    },
     rtorrent::TransferRates,
 };
+
+fn backend_error_status(error: &anyhow::Error) -> StatusCode {
+    if is_unsupported_error(error) {
+        StatusCode::NOT_IMPLEMENTED
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
+fn is_unsupported_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains("does not support"))
+}
+
+#[derive(Debug)]
+struct InvalidHashTarget(String);
+
+impl fmt::Display for InvalidHashTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::error::Error for InvalidHashTarget {}
+
+fn hash_resolution_status(error: &anyhow::Error) -> StatusCode {
+    if error.downcast_ref::<InvalidHashTarget>().is_some() {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
 
 pub fn build_router(_state: AppState) -> Router<AppState> {
     Router::new()
@@ -158,8 +201,13 @@ pub(crate) async fn auth_login(
         .unwrap_or("");
 
     if s.cfg.auth.api_tokens.iter().any(|token| token == candidate) {
-        let tng_cookie = format!("tng_session={candidate}; Path=/; HttpOnly; SameSite=Lax");
-        let sid_cookie = format!("SID={candidate}; Path=/; HttpOnly; SameSite=Lax");
+        // API tokens are operator-provided strings, not cookie-safe strings.
+        // Encode the value before putting it in a header; the auth middleware
+        // decodes it again before comparison.
+        let cookie_value =
+            crate::auth::session_cookie_value(s.cfg.auth.secret_key.as_deref(), candidate);
+        let tng_cookie = format!("tng_session={cookie_value}; Path=/; HttpOnly; SameSite=Lax");
+        let sid_cookie = format!("SID={cookie_value}; Path=/; HttpOnly; SameSite=Lax");
         (
             AppendHeaders([
                 (header::SET_COOKIE, tng_cookie),
@@ -212,18 +260,37 @@ async fn log_main(State(s): State<AppState>, Query(q): Query<LogMainQuery>) -> i
     let levels = q.included_levels();
     match s
         .db
-        .list_app_events_filtered(limit, None, &levels, q.last_known_id)
+        .run_blocking("qbit_log_main", move |db| {
+            db.list_app_events_filtered(limit, None, &levels, q.last_known_id)
+        })
+        .await
     {
-        Ok(events) => (
-            StatusCode::OK,
-            Json(
-                events
-                    .into_iter()
-                    .map(qbit_log_entry)
-                    .filter(|entry| q.includes_type(entry.kind))
-                    .collect::<Vec<_>>(),
-            ),
-        ),
+        Ok(events) => match events
+            .into_iter()
+            .map(qbit_log_entry)
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(events) => (
+                StatusCode::OK,
+                Json(
+                    events
+                        .into_iter()
+                        .filter(|entry| q.includes_type(entry.kind))
+                        .collect::<Vec<_>>(),
+                ),
+            )
+                .into_response(),
+            Err(e) => {
+                tracing::warn!(
+                    component = "api",
+                    operation = "log_main",
+                    result = "error",
+                    error = %e,
+                    "failed to project app event"
+                );
+                StatusCode::SERVICE_UNAVAILABLE.into_response()
+            }
+        },
         Err(e) => {
             tracing::warn!(
                 component = "api",
@@ -232,17 +299,34 @@ async fn log_main(State(s): State<AppState>, Query(q): Query<LogMainQuery>) -> i
                 error = %e,
                 "failed to read app events"
             );
-            (StatusCode::OK, Json(Vec::<QbLogEntry>::new()))
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
     }
 }
 
 async fn log_peers(State(s): State<AppState>) -> impl IntoResponse {
-    let hashes = match s.db.list(&ListParams {
-        limit: Some(50_000),
-        ..Default::default()
-    }) {
-        Ok((rows, _)) => rows.into_iter().map(|row| row.hash).collect::<Vec<_>>(),
+    const MAX_TORRENTS: i64 = 1_000;
+    const MAX_ENTRIES: usize = 10_000;
+    const BATCH_SIZE: usize = 32;
+
+    if !s.backend.capabilities().supports_peer_snapshots {
+        return StatusCode::NOT_IMPLEMENTED.into_response();
+    }
+
+    let hashes = match s
+        .db
+        .run_blocking("qbit_log_peers_torrents", |db| {
+            db.list_page(&ListParams {
+                // qBittorrent's peer log has no pagination contract. Keep this
+                // compatibility projection bounded instead of issuing one backend
+                // request for every cached torrent in a large library.
+                limit: Some(MAX_TORRENTS),
+                ..Default::default()
+            })
+        })
+        .await
+    {
+        Ok(rows) => rows.into_iter().map(|row| row.hash).collect::<Vec<_>>(),
         Err(e) => {
             tracing::warn!(
                 component = "api",
@@ -251,22 +335,56 @@ async fn log_peers(State(s): State<AppState>) -> impl IntoResponse {
                 error = %e,
                 "failed to read torrent cache for peer log"
             );
-            return (StatusCode::OK, Json(Vec::<serde_json::Value>::new()));
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
 
     let mut entries = Vec::new();
-    for hash in hashes {
-        let Ok(peers) = s.backend.list_peers(&hash).await else {
-            continue;
-        };
-        entries.extend(
-            peers
-                .into_iter()
-                .map(|peer| qbit_peer_log_entry(&hash, peer)),
-        );
+    let mut first_error: Option<anyhow::Error> = None;
+    for batch in hashes.chunks(BATCH_SIZE) {
+        let mut tasks = JoinSet::new();
+        for hash in batch {
+            let backend = Arc::clone(&s.backend);
+            let hash = hash.clone();
+            tasks.spawn(async move { (hash.clone(), backend.list_peers(&hash).await) });
+        }
+        while let Some(result) = tasks.join_next().await {
+            match result {
+                Ok((hash, Ok(peers))) => {
+                    entries.extend(
+                        peers
+                            .into_iter()
+                            .map(|peer| qbit_peer_log_entry(&hash, peer))
+                            .take(MAX_ENTRIES.saturating_sub(entries.len())),
+                    );
+                }
+                Ok((hash, Err(error))) => {
+                    first_error.get_or_insert_with(|| {
+                        anyhow::anyhow!("peer snapshot for {hash} failed: {error:#}")
+                    });
+                }
+                Err(error) => {
+                    first_error.get_or_insert_with(|| {
+                        anyhow::anyhow!("peer snapshot task failed: {error}")
+                    });
+                }
+            };
+        }
+        if entries.len() >= MAX_ENTRIES {
+            break;
+        }
     }
-    (StatusCode::OK, Json(entries))
+    if let Some(error) = first_error {
+        tracing::warn!(
+            component = "api",
+            operation = "log_peers",
+            result = "error",
+            error = %error,
+            "failed to read peer snapshots"
+        );
+        return backend_error_status(&error).into_response();
+    }
+    (StatusCode::OK, Json(entries)).into_response()
 }
 
 impl LogMainQuery {
@@ -311,9 +429,14 @@ impl LogMainQuery {
     }
 }
 
-fn qbit_log_entry(row: crate::cache::AppEventRow) -> QbLogEntry {
-    QbLogEntry {
-        id: row.event_id.unwrap_or_default(),
+fn qbit_log_entry(row: crate::cache::AppEventRow) -> Result<QbLogEntry, String> {
+    let event_id = row
+        .event_id
+        .ok_or_else(|| "app event is missing event_id".to_owned())?;
+    serde_json::from_str::<serde_json::Value>(&row.payload)
+        .map_err(|error| format!("app event payload is invalid JSON: {error}"))?;
+    Ok(QbLogEntry {
+        id: event_id,
         message: row.message,
         timestamp: row.occurred_at,
         kind: match row.level.as_str() {
@@ -321,7 +444,7 @@ fn qbit_log_entry(row: crate::cache::AppEventRow) -> QbLogEntry {
             "warn" | "warning" => 2,
             _ => 1,
         },
-    }
+    })
 }
 
 fn qbit_peer_log_entry(info_hash: &str, peer: BackendPeer) -> serde_json::Value {
@@ -395,12 +518,12 @@ async fn search_install_plugin(
     State(s): State<AppState>,
     Form(f): Form<HashMap<String, String>>,
 ) -> StatusCode {
+    let sources = match required_qbit_form_list(&f, "sources") {
+        Ok(sources) => sources,
+        Err(status) => return status,
+    };
     let mut plugins = s.qbit_search_plugins.write().await;
-    for source in f
-        .get("sources")
-        .map(|raw| split_qbit_list(raw))
-        .unwrap_or_default()
-    {
+    for source in sources {
         let name = plugin_name_from_source(&source);
         plugins.insert(name.clone(), search_plugin_value(&name, &source, true));
     }
@@ -411,12 +534,12 @@ async fn search_uninstall_plugin(
     State(s): State<AppState>,
     Form(f): Form<HashMap<String, String>>,
 ) -> StatusCode {
+    let names = match required_qbit_form_list(&f, "names") {
+        Ok(names) => names,
+        Err(status) => return status,
+    };
     let mut plugins = s.qbit_search_plugins.write().await;
-    for name in f
-        .get("names")
-        .map(|raw| split_qbit_list(raw))
-        .unwrap_or_default()
-    {
+    for name in names {
         plugins.remove(&name);
     }
     StatusCode::OK
@@ -426,13 +549,15 @@ async fn search_enable_plugin(
     State(s): State<AppState>,
     Form(f): Form<HashMap<String, String>>,
 ) -> StatusCode {
-    let enabled = parse_bool_param(f.get("enable").map(String::as_str), true);
+    let Some(enabled) = f.get("enable").and_then(|value| parse_wire_bool(value)) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let names = match required_qbit_form_list(&f, "names") {
+        Ok(names) => names,
+        Err(status) => return status,
+    };
     let mut plugins = s.qbit_search_plugins.write().await;
-    for name in f
-        .get("names")
-        .map(|raw| split_qbit_list(raw))
-        .unwrap_or_default()
-    {
+    for name in names {
         let entry = plugins
             .entry(name.clone())
             .or_insert_with(|| search_plugin_value(&name, "", enabled));
@@ -450,11 +575,19 @@ async fn search_update_plugins() -> StatusCode {
 async fn search_start(
     State(s): State<AppState>,
     Form(f): Form<HashMap<String, String>>,
-) -> Json<serde_json::Value> {
+) -> impl IntoResponse {
+    let Some(pattern) = f
+        .get("pattern")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|pattern| !pattern.is_empty())
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
     let id = s.qbit_next_search_id.fetch_add(1, Ordering::Relaxed);
     let job = json!({
         "id": id,
-        "pattern": f.get("pattern").cloned().unwrap_or_default(),
+        "pattern": pattern,
         "plugins": f.get("plugins").cloned().unwrap_or_else(|| "all".to_owned()),
         "category": f.get("category").cloned().unwrap_or_else(|| "all".to_owned()),
         "status": "Stopped",
@@ -462,19 +595,22 @@ async fn search_start(
         "results": [],
     });
     s.qbit_search_jobs.write().await.insert(id.to_string(), job);
-    Json(json!({ "id": id }))
+    Json(json!({ "id": id })).into_response()
 }
 
 async fn search_stop(
     State(s): State<AppState>,
     Form(f): Form<HashMap<String, String>>,
 ) -> StatusCode {
-    if let Some(id) = f.get("id") {
-        if let Some(job) = s.qbit_search_jobs.write().await.get_mut(id) {
-            if let Some(map) = job.as_object_mut() {
-                map.insert("status".into(), "Stopped".into());
-            }
-        }
+    let Some(id) = f.get("id").filter(|id| !id.trim().is_empty()) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let mut jobs = s.qbit_search_jobs.write().await;
+    let Some(job) = jobs.get_mut(id) else {
+        return StatusCode::NOT_FOUND;
+    };
+    if let Some(map) = job.as_object_mut() {
+        map.insert("status".into(), "Stopped".into());
     }
     StatusCode::OK
 }
@@ -482,18 +618,47 @@ async fn search_stop(
 async fn search_results(
     State(s): State<AppState>,
     Query(q): Query<HashMap<String, String>>,
-) -> Json<serde_json::Value> {
+) -> impl IntoResponse {
+    let requested_id = match q.get("id") {
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(id) => Some(id.to_string()),
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        },
+        None => None,
+    };
+    let offset = match q.get("offset") {
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(offset) => offset,
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        },
+        None => 0,
+    };
+    let requested_limit = match q.get("limit") {
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(limit) => Some(limit),
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        },
+        None => None,
+    };
+
     let jobs = s.qbit_search_jobs.read().await;
-    let job = q
-        .get("id")
-        .and_then(|id| jobs.get(id))
-        .or_else(|| jobs.iter().next_back().map(|(_, job)| job));
+    let job = match requested_id.as_deref() {
+        Some(id) => jobs.get(id),
+        None => jobs.iter().next_back().map(|(_, job)| job),
+    };
     let Some(job) = job else {
-        return Json(json!({
+        if requested_id.is_some() {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        return (
+            StatusCode::OK,
+            Json(json!({
             "status": "Stopped",
             "total": 0,
             "results": [],
-        }));
+            })),
+        )
+            .into_response();
     };
     let mut response = job.clone();
     if let Some(map) = response.as_object_mut() {
@@ -502,14 +667,7 @@ async fn search_results(
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
-        let offset = q
-            .get("offset")
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(0);
-        let limit = q
-            .get("limit")
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or_else(|| results.len().saturating_sub(offset));
+        let limit = requested_limit.unwrap_or_else(|| results.len().saturating_sub(offset));
         let sliced = results
             .into_iter()
             .skip(offset)
@@ -517,15 +675,18 @@ async fn search_results(
             .collect::<Vec<_>>();
         map.insert("results".into(), serde_json::Value::Array(sliced));
     }
-    Json(response)
+    (StatusCode::OK, Json(response)).into_response()
 }
 
 async fn search_delete(
     State(s): State<AppState>,
     Form(f): Form<HashMap<String, String>>,
 ) -> StatusCode {
-    if let Some(id) = f.get("id") {
-        s.qbit_search_jobs.write().await.remove(id);
+    let Some(id) = f.get("id").filter(|id| !id.trim().is_empty()) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    if s.qbit_search_jobs.write().await.remove(id).is_none() {
+        return StatusCode::NOT_FOUND;
     }
     StatusCode::OK
 }
@@ -588,8 +749,11 @@ async fn rss_remove_item(
     State(s): State<AppState>,
     Form(f): Form<HashMap<String, String>>,
 ) -> StatusCode {
-    if let Some(path) = f.get("path") {
-        s.qbit_rss_items.write().await.remove(path);
+    let Some(path) = f.get("path").filter(|path| !path.trim().is_empty()) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    if s.qbit_rss_items.write().await.remove(path).is_none() {
+        return StatusCode::NOT_FOUND;
     }
     StatusCode::OK
 }
@@ -604,14 +768,24 @@ async fn rss_move_item(
     let Some(dest_path) = f.get("destPath") else {
         return StatusCode::BAD_REQUEST;
     };
-    let mut items = s.qbit_rss_items.write().await;
-    if let Some(mut item) = items.remove(item_path) {
-        if let Some(map) = item.as_object_mut() {
-            map.insert("uid".into(), dest_path.clone().into());
-            map.insert("name".into(), rss_leaf_name(dest_path).into());
-        }
-        items.insert(dest_path.clone(), item);
+    if item_path.trim().is_empty() || dest_path.trim().is_empty() {
+        return StatusCode::BAD_REQUEST;
     }
+    let mut items = s.qbit_rss_items.write().await;
+    if item_path == dest_path {
+        return StatusCode::OK;
+    }
+    if items.contains_key(dest_path) {
+        return StatusCode::CONFLICT;
+    }
+    let Some(mut item) = items.remove(item_path) else {
+        return StatusCode::NOT_FOUND;
+    };
+    if let Some(map) = item.as_object_mut() {
+        map.insert("uid".into(), dest_path.clone().into());
+        map.insert("name".into(), rss_leaf_name(dest_path).into());
+    }
+    items.insert(dest_path.clone(), item);
     StatusCode::OK
 }
 
@@ -619,12 +793,17 @@ async fn rss_mark_as_read(
     State(s): State<AppState>,
     Form(f): Form<HashMap<String, String>>,
 ) -> StatusCode {
-    if let Some(item_path) = f.get("itemPath") {
-        if let Some(item) = s.qbit_rss_items.write().await.get_mut(item_path) {
-            if let Some(map) = item.as_object_mut() {
-                map.insert("read".into(), true.into());
-            }
-        }
+    let Some(item_path) = f.get("itemPath").filter(|path| !path.trim().is_empty()) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let mut items = s.qbit_rss_items.write().await;
+    let Some(item) = items.get_mut(item_path) else {
+        return StatusCode::NOT_FOUND;
+    };
+    if let Some(map) = item.as_object_mut() {
+        map.insert("read".into(), true.into());
+    } else {
+        return StatusCode::INTERNAL_SERVER_ERROR;
     }
     StatusCode::OK
 }
@@ -633,18 +812,27 @@ async fn rss_refresh_item(
     State(s): State<AppState>,
     Form(f): Form<HashMap<String, String>>,
 ) -> StatusCode {
-    if let Some(item_path) = f.get("itemPath") {
-        if let Some(item) = s.qbit_rss_items.write().await.get_mut(item_path) {
-            if let Some(map) = item.as_object_mut() {
-                map.insert("lastBuildDate".into(), now_unix_secs().into());
-            }
-        }
+    let Some(item_path) = f.get("itemPath").filter(|path| !path.trim().is_empty()) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let mut items = s.qbit_rss_items.write().await;
+    let Some(item) = items.get_mut(item_path) else {
+        return StatusCode::NOT_FOUND;
+    };
+    if let Some(map) = item.as_object_mut() {
+        map.insert("lastBuildDate".into(), now_unix_secs().into());
+    } else {
+        return StatusCode::INTERNAL_SERVER_ERROR;
     }
     StatusCode::OK
 }
 
 async fn rss_rules(State(s): State<AppState>) -> impl IntoResponse {
-    match s.db.list_rss_rules() {
+    match s
+        .db
+        .run_blocking("qbit_list_rss_rules", |db| db.list_rss_rules())
+        .await
+    {
         Ok(rules) => {
             let map: serde_json::Map<String, serde_json::Value> = rules
                 .into_iter()
@@ -698,7 +886,9 @@ async fn rss_set_rule(State(s): State<AppState>, Form(f): Form<RssSetRuleForm>) 
     else {
         return StatusCode::BAD_REQUEST;
     };
-    let raw = f.rule.as_deref().or(f.rule_def.as_deref()).unwrap_or("{}");
+    let Some(raw) = f.rule.as_deref().or(f.rule_def.as_deref()) else {
+        return StatusCode::BAD_REQUEST;
+    };
     let value: serde_json::Value = match serde_json::from_str(raw) {
         Ok(value) => value,
         Err(e) => {
@@ -712,61 +902,66 @@ async fn rss_set_rule(State(s): State<AppState>, Form(f): Form<RssSetRuleForm>) 
             return StatusCode::BAD_REQUEST;
         }
     };
-    let feed_url = value
-        .get("affectedFeeds")
-        .and_then(|v| v.as_array())
-        .and_then(|feeds| feeds.first())
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let include = value
-        .get("mustContain")
-        .or_else(|| value.get("contains"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let rule = RssRule {
-        id: String::new(),
-        name: name.to_owned(),
-        enabled: value
-            .get("enabled")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true),
-        feed_url: feed_url.to_owned(),
-        include: include.to_owned(),
-        exclude: value
-            .get("mustNotContain")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned)
-            .filter(|v| !v.trim().is_empty()),
-        category: value
-            .get("assignedCategory")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned)
-            .filter(|v| !v.trim().is_empty()),
-        save_path: value
-            .get("savePath")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned)
-            .filter(|v| !v.trim().is_empty()),
-        tags: value
-            .get("tags")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
+    if !value.is_object() {
+        return StatusCode::BAD_REQUEST;
+    }
+    let feed_url = match rss_required_feed_url(&value) {
+        Ok(feed_url) => feed_url,
+        Err(()) => return StatusCode::BAD_REQUEST,
+    };
+    let include = match rss_required_string_alias(&value, &["mustContain", "contains"]) {
+        Ok(include) => include,
+        Err(()) => return StatusCode::BAD_REQUEST,
+    };
+    let enabled = match rss_optional_bool(&value, "enabled", true) {
+        Ok(enabled) => enabled,
+        Err(()) => return StatusCode::BAD_REQUEST,
+    };
+    let exclude = match rss_optional_string(&value, "mustNotContain") {
+        Ok(exclude) => exclude.filter(|value| !value.trim().is_empty()),
+        Err(()) => return StatusCode::BAD_REQUEST,
+    };
+    let category = match rss_optional_string(&value, "assignedCategory") {
+        Ok(category) => category.filter(|value| !value.trim().is_empty()),
+        Err(()) => return StatusCode::BAD_REQUEST,
+    };
+    let save_path = match rss_optional_string(&value, "savePath") {
+        Ok(save_path) => save_path.filter(|value| !value.trim().is_empty()),
+        Err(()) => return StatusCode::BAD_REQUEST,
+    };
+    let tags = match rss_optional_string(&value, "tags") {
+        Ok(tags) => tags
+            .unwrap_or_default()
             .split(',')
             .map(str::trim)
             .filter(|tag| !tag.is_empty())
             .map(str::to_owned)
             .collect(),
-        start: !value
-            .get("addPaused")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
+        Err(()) => return StatusCode::BAD_REQUEST,
     };
-    if rule.feed_url.trim().is_empty() || rule.include.trim().is_empty() {
-        return StatusCode::BAD_REQUEST;
-    }
-    match s.db.upsert_rss_rule(rule) {
+    let add_paused = match rss_optional_bool(&value, "addPaused", false) {
+        Ok(add_paused) => add_paused,
+        Err(()) => return StatusCode::BAD_REQUEST,
+    };
+    let rule = RssRule {
+        id: String::new(),
+        name: name.to_owned(),
+        enabled,
+        feed_url,
+        include,
+        exclude,
+        category,
+        save_path,
+        tags,
+        start: !add_paused,
+    };
+    match s
+        .db
+        .run_blocking("qbit_upsert_rss_rule", move |db| db.upsert_rss_rule(rule))
+        .await
+    {
         Ok(_) => {
-            emit(&s, Event::RssRulesUpdated);
+            emit(&s, Event::RssRulesUpdated).await;
             StatusCode::OK
         }
         Err(e) => {
@@ -783,6 +978,53 @@ async fn rss_set_rule(State(s): State<AppState>, Form(f): Form<RssSetRuleForm>) 
     }
 }
 
+fn rss_required_feed_url(value: &serde_json::Value) -> Result<String, ()> {
+    let feeds = value
+        .get("affectedFeeds")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(())?;
+    if feeds.len() != 1 {
+        // The durable RSS rule model has one feed URL. Refuse to silently
+        // discard additional qBittorrent feeds until the model can represent
+        // them without changing matching semantics.
+        return Err(());
+    }
+    let feed = feeds
+        .first()
+        .and_then(serde_json::Value::as_str)
+        .ok_or(())?;
+    if feed.trim().is_empty() {
+        return Err(());
+    }
+    Ok(feed.to_owned())
+}
+
+fn rss_required_string_alias(value: &serde_json::Value, keys: &[&str]) -> Result<String, ()> {
+    let raw = keys
+        .iter()
+        .find_map(|key| value.get(*key))
+        .and_then(serde_json::Value::as_str)
+        .ok_or(())?;
+    if raw.trim().is_empty() {
+        return Err(());
+    }
+    Ok(raw.to_owned())
+}
+
+fn rss_optional_string(value: &serde_json::Value, key: &str) -> Result<Option<String>, ()> {
+    match value.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(raw) => raw.as_str().map(|value| Some(value.to_owned())).ok_or(()),
+    }
+}
+
+fn rss_optional_bool(value: &serde_json::Value, key: &str, default: bool) -> Result<bool, ()> {
+    match value.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(default),
+        Some(raw) => raw.as_bool().ok_or(()),
+    }
+}
+
 #[derive(Deserialize)]
 struct RssRenameRuleForm {
     #[serde(rename = "ruleName")]
@@ -795,7 +1037,12 @@ async fn rss_rename_rule(
     State(s): State<AppState>,
     Form(f): Form<RssRenameRuleForm>,
 ) -> StatusCode {
-    let Some(old_name) = f.rule_name.as_deref() else {
+    let Some(old_name) = f
+        .rule_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
         return StatusCode::BAD_REQUEST;
     };
     let Some(new_name) = f
@@ -806,19 +1053,21 @@ async fn rss_rename_rule(
     else {
         return StatusCode::BAD_REQUEST;
     };
-    let Some(mut rule) =
-        s.db.list_rss_rules()
-            .ok()
-            .and_then(|rules| rules.into_iter().find(|rule| rule.name == old_name))
-    else {
-        return StatusCode::NOT_FOUND;
-    };
-    rule.name = new_name.to_owned();
-    match s.db.upsert_rss_rule(rule) {
-        Ok(_) => {
-            emit(&s, Event::RssRulesUpdated);
+    let old_name_for_db = old_name.to_owned();
+    let new_name_for_db = new_name.to_owned();
+    match s
+        .db
+        .run_blocking("qbit_rename_rss_rule", move |db| {
+            db.rename_rss_rule(&old_name_for_db, &new_name_for_db)
+        })
+        .await
+    {
+        Ok(RssRuleRenameResult::Renamed) => {
+            emit(&s, Event::RssRulesUpdated).await;
             StatusCode::OK
         }
+        Ok(RssRuleRenameResult::Missing) => StatusCode::NOT_FOUND,
+        Ok(RssRuleRenameResult::Conflict) => StatusCode::CONFLICT,
         Err(e) => {
             tracing::error!(
                 component = "qbcompat",
@@ -844,22 +1093,27 @@ async fn rss_remove_rule(
     State(s): State<AppState>,
     Form(f): Form<RssRemoveRuleForm>,
 ) -> StatusCode {
-    let Some(name) = f.rule_name.as_deref() else {
+    let Some(name) = f
+        .rule_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
         return StatusCode::BAD_REQUEST;
     };
-    let Some(id) = s.db.list_rss_rules().ok().and_then(|rules| {
-        rules
-            .into_iter()
-            .find(|rule| rule.name == name)
-            .map(|rule| rule.id)
-    }) else {
-        return StatusCode::OK;
-    };
-    match s.db.delete_rss_rule(&id) {
-        Ok(_) => {
-            emit(&s, Event::RssRulesUpdated);
+    let name_for_db = name.to_owned();
+    match s
+        .db
+        .run_blocking("qbit_delete_rss_rule", move |db| {
+            db.delete_rss_rule_by_name(&name_for_db)
+        })
+        .await
+    {
+        Ok(true) => {
+            emit(&s, Event::RssRulesUpdated).await;
             StatusCode::OK
         }
+        Ok(false) => StatusCode::NOT_FOUND,
         Err(e) => {
             tracing::error!(
                 component = "qbcompat",
@@ -891,7 +1145,14 @@ async fn rss_matching_articles(
     else {
         return Json(json!([])).into_response();
     };
-    match s.db.match_rss_item(title, None) {
+    let title = title.to_owned();
+    match s
+        .db
+        .run_blocking("qbit_match_rss_item", move |db| {
+            db.match_rss_item(&title, None)
+        })
+        .await
+    {
         Ok(matches) => Json(json!(matches
             .into_iter()
             .filter(|m| m.matched)
@@ -968,30 +1229,57 @@ async fn app_set_preferences(
             return StatusCode::BAD_REQUEST;
         }
     };
+    if !prefs.is_object() {
+        return StatusCode::BAD_REQUEST;
+    }
+    // Validate every backend-backed field before applying any of them. A
+    // malformed field must not be silently ignored while a sibling setting
+    // is committed, leaving the caller with a partially understood request.
+    let dht = match qbit_preference_bool(&prefs, "dht") {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    let pex = match qbit_preference_bool(&prefs, "pex") {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    let user_agent = match prefs.get("network_http_user_agent") {
+        None => None,
+        Some(value) => match value.as_str() {
+            Some(value) => Some(value),
+            None => return StatusCode::BAD_REQUEST,
+        },
+    };
 
-    for setting in ["dht", "pex"] {
-        if let Some(enabled) = prefs.get(setting).and_then(serde_json::Value::as_bool) {
+    let mut backend_failed = false;
+    let mut unsupported = false;
+    for (setting, enabled) in [("dht", dht), ("pex", pex)] {
+        if let Some(enabled) = enabled {
             let result = match setting {
                 "dht" => s.backend.set_dht(enabled).await,
                 "pex" => s.backend.set_pex(enabled).await,
                 _ => unreachable!(),
             };
             match result {
-                Ok(_) => record_operator_event(
-                    &s,
-                    "info",
-                    "settings_changed",
-                    "qBittorrent preferences updated backend session feature",
-                    serde_json::json!({
-                        "component": "qbcompat",
-                        "backend": s.backend.backend_type().as_str(),
-                        "operation": "set_preferences",
-                        "setting": setting,
-                        "enabled": enabled,
-                        "result": "updated",
-                    }),
-                ),
+                Ok(_) => {
+                    record_operator_event(
+                        &s,
+                        "info",
+                        "settings_changed",
+                        "qBittorrent preferences updated backend session feature",
+                        serde_json::json!({
+                            "component": "qbcompat",
+                            "backend": s.backend.backend_type().as_str(),
+                            "operation": "set_preferences",
+                            "setting": setting,
+                            "enabled": enabled,
+                            "result": "updated",
+                        }),
+                    )
+                    .await
+                }
                 Err(e) => {
+                    backend_failed = true;
                     tracing::debug!(
                         component = "qbcompat",
                         backend = s.backend.backend_type().as_str(),
@@ -1007,11 +1295,9 @@ async fn app_set_preferences(
         }
     }
 
-    if let Some(ua) = prefs
-        .get("network_http_user_agent")
-        .and_then(|v| v.as_str())
-    {
+    if let Some(ua) = user_agent {
         if !s.backend.capabilities().supports_runtime_user_agent {
+            unsupported = true;
             tracing::debug!(
                 component = "qbcompat",
                 backend = s.backend.backend_type().as_str(),
@@ -1020,50 +1306,71 @@ async fn app_set_preferences(
                 result = "unsupported",
                 "qBit user-agent preference ignored because backend does not support runtime user-agent updates"
             );
-            return StatusCode::OK;
-        }
-        match s.backend.set_user_agent(ua).await {
-            Ok(_) => record_operator_event(
-                &s,
-                "info",
-                "settings_changed",
-                "qBittorrent preferences updated backend user agent",
-                serde_json::json!({
-                    "component": "qbcompat",
-                    "backend": s.backend.backend_type().as_str(),
-                    "operation": "set_preferences",
-                    "setting": "network_http_user_agent",
-                    "result": "updated",
-                    "user_agent_len": ua.len(),
-                }),
-            ),
-            Err(e) => {
-                tracing::warn!(
-                    component = "qbcompat",
-                    operation = "set_user_agent",
-                result = "error",
-                    error = %e,
-                    "qBit user-agent preference update failed"
-                );
-                record_operator_event(
-                    &s,
-                    "warn",
-                    "rtorrent_user_agent_error",
-                    "qBittorrent preference update could not apply backend user agent",
-                    serde_json::json!({
-                        "component": "qbcompat",
-                        "backend": s.backend.backend_type().as_str(),
-                        "operation": "set_preferences",
-                        "setting": "network_http_user_agent",
-                        "result": "error",
-                        "error": e.to_string(),
-                    }),
-                );
+        } else {
+            match s.backend.set_user_agent(ua).await {
+                Ok(_) => {
+                    record_operator_event(
+                        &s,
+                        "info",
+                        "settings_changed",
+                        "qBittorrent preferences updated backend user agent",
+                        serde_json::json!({
+                            "component": "qbcompat",
+                            "backend": s.backend.backend_type().as_str(),
+                            "operation": "set_preferences",
+                            "setting": "network_http_user_agent",
+                            "result": "updated",
+                            "user_agent_len": ua.len(),
+                        }),
+                    )
+                    .await
+                }
+                Err(e) => {
+                    backend_failed = true;
+                    tracing::warn!(
+                        component = "qbcompat",
+                        operation = "set_user_agent",
+                    result = "error",
+                        error = %e,
+                        "qBit user-agent preference update failed"
+                    );
+                    record_operator_event(
+                        &s,
+                        "warn",
+                        "rtorrent_user_agent_error",
+                        "qBittorrent preference update could not apply backend user agent",
+                        serde_json::json!({
+                            "component": "qbcompat",
+                            "backend": s.backend.backend_type().as_str(),
+                            "operation": "set_preferences",
+                            "setting": "network_http_user_agent",
+                            "result": "error",
+                            "error": e.to_string(),
+                        }),
+                    )
+                    .await;
+                }
             }
         }
     }
 
-    StatusCode::OK
+    if backend_failed {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else if unsupported {
+        StatusCode::NOT_IMPLEMENTED
+    } else {
+        StatusCode::OK
+    }
+}
+
+fn qbit_preference_bool(
+    preferences: &serde_json::Value,
+    key: &str,
+) -> Result<Option<bool>, StatusCode> {
+    match preferences.get(key) {
+        None => Ok(None),
+        Some(value) => value.as_bool().map(Some).ok_or(StatusCode::BAD_REQUEST),
+    }
 }
 
 fn feature_status_to_bool(status: &str) -> Option<bool> {
@@ -1082,32 +1389,52 @@ struct InfoQuery {
     category: Option<String>,
     tag: Option<String>,
     sort: Option<String>,
-    reverse: Option<String>,
-    limit: Option<i64>,
-    offset: Option<i64>,
+    reverse: Option<bool>,
+    limit: Option<usize>,
+    offset: Option<usize>,
 }
 
 async fn torrents_info(State(s): State<AppState>, Query(q): Query<InfoQuery>) -> impl IntoResponse {
-    let is_status = q.filter.as_deref().map(is_status_filter).unwrap_or(false);
+    let status = match qbit_status_filter(q.filter.as_deref()) {
+        Ok(status) => status,
+        Err(status) => return status.into_response(),
+    };
+    let limit = bounded_page_limit(q.limit.map(|limit| limit.min(5_000) as i64));
+    let offset = match q.offset {
+        Some(offset) => match i64::try_from(offset) {
+            Ok(offset) if validate_page_offset(Some(offset)).is_ok() => Some(offset),
+            Ok(_) => return StatusCode::BAD_REQUEST.into_response(),
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        },
+        None => None,
+    };
     let params = ListParams {
-        filter: if is_status { None } else { q.filter.clone() },
-        status: if is_status { q.filter } else { None },
+        // qBittorrent's `filter` is a finite status enum, not a free-text
+        // search. Passing an unknown value through as ListParams::filter
+        // makes the cache search torrent names and can return a successful
+        // but semantically unrelated response.
+        filter: None,
+        status,
         category: q.category,
         tag: q.tag,
         tracker: None,
         media_type: None,
         sort: q.sort.as_deref().map(map_sort).map(String::from),
-        dir: if q.reverse.as_deref() == Some("true") {
+        dir: if q.reverse.unwrap_or(false) {
             Some("desc".into())
         } else {
             Some("asc".into())
         },
-        limit: q.limit,
-        offset: q.offset,
+        limit,
+        offset,
     };
 
-    match s.db.list(&params) {
-        Ok((rows, _)) => Json(rows.iter().map(to_qb_torrent).collect::<Vec<_>>()).into_response(),
+    match s
+        .db
+        .run_blocking("qbit_torrents_info", move |db| db.list_page(&params))
+        .await
+    {
+        Ok(rows) => Json(rows.iter().map(to_qb_torrent).collect::<Vec<_>>()).into_response(),
         Err(e) => {
             tracing::error!(
                 component = "qbcompat",
@@ -1133,7 +1460,12 @@ async fn torrents_properties(
     let Some(hash) = q.hash else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    match s.db.get(&hash) {
+    let lookup_hash = hash.clone();
+    match s
+        .db
+        .run_blocking("qbit_torrent_properties", move |db| db.get(&lookup_hash))
+        .await
+    {
         Ok(Some(t)) => Json(json!({
             "save_path": t.directory,
             "creation_date": t.creation_date,
@@ -1197,49 +1529,309 @@ async fn torrents_add(State(s): State<AppState>, mut multipart: Multipart) -> im
     let mut paused = false;
     let mut stopped = false;
     let mut torrent_data: Option<Vec<u8>> = None;
+    let mut tags: Option<String> = None;
+    let mut skip_checking = false;
+    let mut content_layout: Option<String> = None;
+    let mut auto_tmm: Option<bool> = None;
+    let mut ratio_limit: Option<f64> = None;
+    let mut seeding_time_limit: Option<i64> = None;
 
-    while let Ok(Some(field)) = multipart.next_field().await {
+    loop {
+        let Some(field) = (match multipart.next_field().await {
+            Ok(field) => field,
+            Err(error) => {
+                tracing::warn!(
+                    component = "qbcompat",
+                    operation = "add_torrent",
+                    result = "bad_request",
+                    error = %error,
+                    "invalid qBit multipart request"
+                );
+                return (StatusCode::BAD_REQUEST, "Fails.").into_response();
+            }
+        }) else {
+            break;
+        };
         let name = field.name().map(str::to_owned);
         match name.as_deref() {
             Some("urls") => {
-                urls = Some(field.text().await.unwrap_or_default());
+                urls = Some(match field.text().await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::warn!(
+                            component = "qbcompat",
+                            operation = "add_torrent",
+                            field = "urls",
+                            result = "bad_request",
+                            error = %error,
+                            "invalid qBit multipart text field"
+                        );
+                        return (StatusCode::BAD_REQUEST, "Fails.").into_response();
+                    }
+                });
             }
             Some("savepath") => {
-                save_path = field.text().await.unwrap_or_default();
+                save_path = match field.text().await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::warn!(
+                            component = "qbcompat",
+                            operation = "add_torrent",
+                            field = "savepath",
+                            result = "bad_request",
+                            error = %error,
+                            "invalid qBit multipart text field"
+                        );
+                        return (StatusCode::BAD_REQUEST, "Fails.").into_response();
+                    }
+                };
             }
             Some("category") => {
-                category = field.text().await.unwrap_or_default();
+                category = match field.text().await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::warn!(
+                            component = "qbcompat",
+                            operation = "add_torrent",
+                            field = "category",
+                            result = "bad_request",
+                            error = %error,
+                            "invalid qBit multipart text field"
+                        );
+                        return (StatusCode::BAD_REQUEST, "Fails.").into_response();
+                    }
+                };
             }
             Some("paused") => {
-                paused = field.text().await.unwrap_or_default() == "true";
+                let value = match field.text().await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::warn!(
+                            component = "qbcompat",
+                            operation = "add_torrent",
+                            field = "paused",
+                            result = "bad_request",
+                            error = %error,
+                            "invalid qBit multipart text field"
+                        );
+                        return (StatusCode::BAD_REQUEST, "Fails.").into_response();
+                    }
+                };
+                paused = match value.as_str() {
+                    "true" => true,
+                    "false" => false,
+                    _ => return (StatusCode::BAD_REQUEST, "Fails.").into_response(),
+                };
             }
             Some("stopped") => {
-                stopped = field.text().await.unwrap_or_default() == "true";
+                let value = match field.text().await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::warn!(
+                            component = "qbcompat",
+                            operation = "add_torrent",
+                            field = "stopped",
+                            result = "bad_request",
+                            error = %error,
+                            "invalid qBit multipart text field"
+                        );
+                        return (StatusCode::BAD_REQUEST, "Fails.").into_response();
+                    }
+                };
+                stopped = match value.as_str() {
+                    "true" => true,
+                    "false" => false,
+                    _ => return (StatusCode::BAD_REQUEST, "Fails.").into_response(),
+                };
+            }
+            Some("tags") => {
+                tags = Some(match field.text().await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::warn!(
+                            component = "qbcompat",
+                            operation = "add_torrent",
+                            field = "tags",
+                            result = "bad_request",
+                            error = %error,
+                            "invalid qBit multipart text field"
+                        );
+                        return (StatusCode::BAD_REQUEST, "Fails.").into_response();
+                    }
+                });
+            }
+            Some("skip_checking") => {
+                let value = match field.text().await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::warn!(
+                            component = "qbcompat",
+                            operation = "add_torrent",
+                            field = "skip_checking",
+                            result = "bad_request",
+                            error = %error,
+                            "invalid qBit multipart text field"
+                        );
+                        return (StatusCode::BAD_REQUEST, "Fails.").into_response();
+                    }
+                };
+                skip_checking = match value.as_str() {
+                    "true" => true,
+                    "false" => false,
+                    _ => return (StatusCode::BAD_REQUEST, "Fails.").into_response(),
+                };
+            }
+            Some("contentLayout") => {
+                content_layout = Some(match field.text().await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::warn!(
+                            component = "qbcompat",
+                            operation = "add_torrent",
+                            field = "contentLayout",
+                            result = "bad_request",
+                            error = %error,
+                            "invalid qBit multipart text field"
+                        );
+                        return (StatusCode::BAD_REQUEST, "Fails.").into_response();
+                    }
+                });
+            }
+            Some("autoTMM") => {
+                let value = match field.text().await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::warn!(
+                            component = "qbcompat",
+                            operation = "add_torrent",
+                            field = "autoTMM",
+                            result = "bad_request",
+                            error = %error,
+                            "invalid qBit multipart text field"
+                        );
+                        return (StatusCode::BAD_REQUEST, "Fails.").into_response();
+                    }
+                };
+                auto_tmm = Some(match value.as_str() {
+                    "true" => true,
+                    "false" => false,
+                    _ => return (StatusCode::BAD_REQUEST, "Fails.").into_response(),
+                });
+            }
+            Some("ratioLimit") => {
+                let value = match field.text().await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::warn!(
+                            component = "qbcompat",
+                            operation = "add_torrent",
+                            field = "ratioLimit",
+                            result = "bad_request",
+                            error = %error,
+                            "invalid qBit multipart text field"
+                        );
+                        return (StatusCode::BAD_REQUEST, "Fails.").into_response();
+                    }
+                };
+                ratio_limit = match value.parse::<f64>() {
+                    Ok(value)
+                        if (value.is_finite() && value >= 0.0)
+                            || value == -1.0
+                            || value == -2.0 =>
+                    {
+                        Some(value)
+                    }
+                    _ => return (StatusCode::BAD_REQUEST, "Fails.").into_response(),
+                };
+            }
+            Some("seedingTimeLimit") => {
+                let value = match field.text().await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::warn!(
+                            component = "qbcompat",
+                            operation = "add_torrent",
+                            field = "seedingTimeLimit",
+                            result = "bad_request",
+                            error = %error,
+                            "invalid qBit multipart text field"
+                        );
+                        return (StatusCode::BAD_REQUEST, "Fails.").into_response();
+                    }
+                };
+                seeding_time_limit = match value.parse::<i64>() {
+                    Ok(value) if value >= 0 || value == -1 || value == -2 => Some(value),
+                    _ => return (StatusCode::BAD_REQUEST, "Fails.").into_response(),
+                };
             }
             Some("torrents") => {
-                torrent_data = field.bytes().await.ok().map(|b| b.to_vec());
+                torrent_data = Some(match field.bytes().await {
+                    Ok(value) => value.to_vec(),
+                    Err(error) => {
+                        tracing::warn!(
+                            component = "qbcompat",
+                            operation = "add_torrent",
+                            field = "torrents",
+                            result = "bad_request",
+                            error = %error,
+                            "invalid qBit multipart file field"
+                        );
+                        return (StatusCode::BAD_REQUEST, "Fails.").into_response();
+                    }
+                });
             }
-            _ => {
-                if let Some(name) = name {
-                    let _ = field.text().await;
-                    tracing::debug!(
-                        component = "qbcompat",
-                        operation = "add_torrent",
-                        field = %name,
-                        "ignored qBit add field"
-                    );
-                }
+            Some(name) => {
+                let _ = field.text().await;
+                tracing::info!(
+                    component = "qbcompat",
+                    operation = "add_torrent",
+                    field = %name,
+                    result = "unsupported",
+                    "qBit add option has no sidecar backend contract"
+                );
+                return (StatusCode::NOT_IMPLEMENTED, "Fails.").into_response();
+            }
+            None => {
+                let _ = field.text().await;
+                return (StatusCode::BAD_REQUEST, "multipart field is missing a name")
+                    .into_response();
             }
         }
+    }
+
+    // The generic sidecar backend has no add-time contract for these qBit
+    // options. Silently dropping them reports a successful add while creating
+    // a torrent with different scheduler/share semantics.
+    if tags.as_deref().is_some_and(|tags| !tags.trim().is_empty())
+        || skip_checking
+        || content_layout.as_deref().is_some_and(|layout| {
+            !layout.trim().is_empty() && !layout.eq_ignore_ascii_case("Original")
+        })
+        || auto_tmm == Some(true)
+        || ratio_limit.is_some_and(|limit| limit != -2.0)
+        || seeding_time_limit.is_some_and(|limit| limit != -2)
+    {
+        tracing::info!(
+            component = "qbcompat",
+            operation = "add_torrent",
+            result = "unsupported",
+            "qBit add request contains options without a sidecar backend contract"
+        );
+        return (StatusCode::NOT_IMPLEMENTED, "Fails.").into_response();
     }
 
     let start = !(paused || stopped);
 
     if let Some(url_list) = urls {
         let mut added = false;
-        for url in url_list.split('\n') {
+        let normalized = url_list.replace("\r\n", "\n").replace('\r', "");
+        let lines = normalized.split('\n').collect::<Vec<_>>();
+        for (index, url) in lines.iter().enumerate() {
             let url = url.trim();
             if url.is_empty() {
+                if index + 1 != lines.len() {
+                    return (StatusCode::BAD_REQUEST, "Fails.").into_response();
+                }
                 continue;
             }
             added = true;
@@ -1311,13 +1903,33 @@ struct AddPeersForm {
 
 async fn torrents_add_peers(State(s): State<AppState>, Form(f): Form<AddPeersForm>) -> StatusCode {
     let hashes = f.hashes.as_deref().or(f.hash.as_deref());
-    let hashes = split_hashes(&s.db, hashes);
-    let peers = f.peers.as_deref().map(parse_peer_addrs).unwrap_or_default();
-    if hashes.is_empty() || peers.is_empty() {
+    let hashes = match required_resolved_hashes_async(&s.db, hashes).await {
+        Ok(hashes) => hashes,
+        Err(e) => {
+            tracing::error!(
+                component = "qbcompat",
+                operation = "resolve_hashes",
+                result = "error",
+                error = %e,
+                "failed to resolve hashes for peer add"
+            );
+            return hash_resolution_status(&e);
+        }
+    };
+    let peers = match f.peers.as_deref().map(parse_peer_addrs) {
+        Some(Ok(peers)) => peers,
+        Some(Err(_)) | None => return StatusCode::BAD_REQUEST,
+    };
+    if peers.is_empty() {
         return StatusCode::BAD_REQUEST;
     }
+    if !s.backend.capabilities().supports_peer_add {
+        return StatusCode::NOT_IMPLEMENTED;
+    }
+    let mut failed = false;
     for hash in hashes {
         if let Err(e) = s.backend.add_peers(&hash, &peers).await {
+            failed = true;
             tracing::warn!(
                 component = "qbcompat",
                 operation = "add_peers",
@@ -1328,7 +1940,11 @@ async fn torrents_add_peers(State(s): State<AppState>, Form(f): Form<AddPeersFor
             );
         }
     }
-    StatusCode::OK
+    if failed {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    }
 }
 
 async fn torrents_increase_prio(
@@ -1358,11 +1974,28 @@ async fn torrents_update_queue_order(
     hashes: Option<String>,
     queue_move: QueueMove,
 ) -> StatusCode {
-    let hashes = split_hashes(&s.db, hashes.as_deref());
+    let hashes = match required_resolved_hashes_async(&s.db, hashes.as_deref()).await {
+        Ok(hashes) => hashes,
+        Err(e) => {
+            tracing::error!(
+                component = "qbcompat",
+                operation = "resolve_hashes",
+                result = "error",
+                error = %e,
+                "failed to resolve hashes for queue update"
+            );
+            return hash_resolution_status(&e);
+        }
+    };
     if hashes.is_empty() {
         return StatusCode::BAD_REQUEST;
     }
+    if !s.backend.capabilities().supports_queue_order {
+        return StatusCode::NOT_IMPLEMENTED;
+    }
+    let mut failed = false;
     if let Err(e) = s.backend.update_queue_order(&hashes, queue_move).await {
+        failed = true;
         tracing::warn!(
             component = "qbcompat",
             operation = "update_queue_order",
@@ -1371,19 +2004,38 @@ async fn torrents_update_queue_order(
             "qBit queue order update failed"
         );
     }
-    StatusCode::OK
+    if failed {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    }
 }
 
 async fn bulk_action(s: &AppState, hashes_str: &Option<String>, action: &str) -> StatusCode {
-    for hash in split_hashes(&s.db, hashes_str.as_deref()) {
+    let hashes = match required_resolved_hashes_async(&s.db, hashes_str.as_deref()).await {
+        Ok(hashes) => hashes,
+        Err(e) => {
+            tracing::error!(
+                component = "qbcompat",
+                operation = "resolve_hashes",
+                result = "error",
+                error = %e,
+                "failed to resolve hashes for bulk action"
+            );
+            return hash_resolution_status(&e);
+        }
+    };
+    let mut failed = false;
+    for hash in hashes {
         let res = match action {
             "start" => s.backend.start(&hash).await,
             "stop" => s.backend.stop(&hash).await,
             "recheck" => s.backend.recheck(&hash).await,
             "reannounce" => s.backend.reannounce(&hash).await,
-            _ => Ok(()),
+            _ => Err(anyhow::anyhow!("unsupported bulk action {action}")),
         };
         if let Err(e) = res {
+            failed = true;
             tracing::warn!(
                 component = "qbcompat",
                 operation = %action,
@@ -1392,11 +2044,24 @@ async fn bulk_action(s: &AppState, hashes_str: &Option<String>, action: &str) ->
                 error = %e,
                 "qBit torrent action failed"
             );
-        } else {
-            update_cached_lifecycle_state(s, &hash, action);
+        } else if let Err(error) = update_cached_lifecycle_state(s, &hash, action).await {
+            failed = true;
+            tracing::warn!(
+                component = "cache",
+                operation = "set_torrent_runtime_state",
+                torrent = %hash,
+                action,
+                result = "error",
+                error = %error,
+                "qBit action succeeded but cache projection failed"
+            );
         }
     }
-    StatusCode::OK
+    if failed {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    }
 }
 
 #[derive(Deserialize)]
@@ -1407,9 +2072,31 @@ struct DeleteForm {
 }
 
 async fn torrents_delete(State(s): State<AppState>, Form(f): Form<DeleteForm>) -> StatusCode {
-    let delete_files = f.delete_files.as_deref() == Some("true");
-    for hash in split_hashes(&s.db, f.hashes.as_deref()) {
+    let delete_files = match f.delete_files.as_deref() {
+        Some(value) => match parse_wire_bool(value) {
+            Some(value) => value,
+            None => return StatusCode::BAD_REQUEST,
+        },
+        None => false,
+    };
+    let hashes = match required_resolved_hashes_async(&s.db, f.hashes.as_deref()).await {
+        Ok(hashes) => hashes,
+        Err(e) => {
+            tracing::error!(
+                component = "qbcompat",
+                operation = "resolve_hashes",
+                result = "error",
+                error = %e,
+                "failed to resolve hashes for delete"
+            );
+            return hash_resolution_status(&e);
+        }
+    };
+    let mut backend_failed = false;
+    let mut cache_failed = false;
+    for hash in hashes {
         if let Err(e) = s.backend.remove(&hash, delete_files).await {
+            backend_failed = true;
             tracing::warn!(
                 component = "qbcompat",
                 operation = "delete_torrent",
@@ -1421,7 +2108,12 @@ async fn torrents_delete(State(s): State<AppState>, Form(f): Form<DeleteForm>) -
             );
             continue;
         }
-        if let Err(e) = s.db.delete(&hash) {
+        let cache_hash = hash.clone();
+        if let Err(e) =
+            s.db.run_blocking("qbit_delete_torrent", move |db| db.delete(&cache_hash))
+                .await
+        {
+            cache_failed = true;
             tracing::warn!(
                 component = "cache",
                 operation = "delete_torrent",
@@ -1431,20 +2123,26 @@ async fn torrents_delete(State(s): State<AppState>, Form(f): Form<DeleteForm>) -
                 "cache delete failed after qBit delete"
             );
         } else {
-            emit(&s, Event::TorrentRemoved { hash: hash.clone() });
-            emit(&s, Event::TrackerHealthUpdated);
+            emit(&s, Event::TorrentRemoved { hash: hash.clone() }).await;
+            emit(&s, Event::TrackerHealthUpdated).await;
         }
     }
-    StatusCode::OK
+    if cache_failed {
+        StatusCode::INTERNAL_SERVER_ERROR
+    } else if backend_failed {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    }
 }
 
 async fn torrents_trackers(
     State(s): State<AppState>,
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let hash = match q.get("hash") {
-        Some(h) => h.clone(),
-        None => return Json(json!([])).into_response(),
+    let hash = match required_resolved_hash_async(&s.db, q.get("hash").map(String::as_str)).await {
+        Ok(hash) => hash,
+        Err(status) => return status.into_response(),
     };
     match s.backend.list_trackers(&hash).await {
         Ok(trackers) => {
@@ -1490,12 +2188,10 @@ async fn torrents_export(
     State(s): State<AppState>,
     Query(q): Query<HashQuery>,
 ) -> impl IntoResponse {
-    let Some(hash) = q.hash else {
-        return StatusCode::BAD_REQUEST.into_response();
+    let hash = match required_resolved_hash_async(&s.db, q.hash.as_deref()).await {
+        Ok(hash) => hash,
+        Err(status) => return status.into_response(),
     };
-    if !matches!(s.db.get(&hash), Ok(Some(_))) {
-        return StatusCode::NOT_FOUND.into_response();
-    }
     match s.backend.torrent_blob(&hash).await {
         Ok(raw) => {
             let mut headers = HeaderMap::new();
@@ -1514,7 +2210,7 @@ async fn torrents_export(
                 error = %e,
                 "qBit torrent export failed"
             );
-            StatusCode::NOT_FOUND.into_response()
+            backend_error_status(&e).into_response()
         }
     }
 }
@@ -1523,9 +2219,9 @@ async fn torrents_files(
     State(s): State<AppState>,
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let hash = match q.get("hash") {
-        Some(h) => h.clone(),
-        None => return Json(json!([])).into_response(),
+    let hash = match required_resolved_hash_async(&s.db, q.get("hash").map(String::as_str)).await {
+        Ok(hash) => hash,
+        Err(status) => return status.into_response(),
     };
     match s.backend.list_files(&hash).await {
         Ok(files) => {
@@ -1575,25 +2271,30 @@ async fn torrents_webseeds(
     State(s): State<AppState>,
     Query(q): Query<HashQuery>,
 ) -> impl IntoResponse {
-    let Some(hash) = q.hash else {
-        return Json(json!([])).into_response();
+    let hash = match required_resolved_hash_async(&s.db, q.hash.as_deref()).await {
+        Ok(hash) => hash,
+        Err(status) => return status.into_response(),
     };
     match s.backend.list_webseeds(&hash).await {
         Ok(webseeds) => Json(json!(webseeds)).into_response(),
-        Err(_) => match s.db.get(&hash) {
-            Ok(Some(_)) | Ok(None) => Json(json!([])).into_response(),
-            Err(e) => {
-                tracing::error!(
-                    component = "qbcompat",
-                    operation = "list_webseeds",
-                    torrent = %hash,
-                    result = "error",
-                    error = %e,
-                    "qBit webseed listing failed"
-                );
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
-            }
-        },
+        Err(e) if is_unsupported_error(&e) => {
+            // qBittorrent represents an absent optional capability as an
+            // empty collection. Preserve that wire contract for adapters
+            // that explicitly do not expose the feature; transport and
+            // backend failures still return a non-success status below.
+            Json(json!([])).into_response()
+        }
+        Err(e) => {
+            tracing::warn!(
+                component = "qbcompat",
+                operation = "list_webseeds",
+                torrent = %hash,
+                result = "error",
+                error = %e,
+                "qBit webseed listing failed"
+            );
+            backend_error_status(&e).into_response()
+        }
     }
 }
 
@@ -1601,8 +2302,9 @@ async fn torrents_piece_states(
     State(s): State<AppState>,
     Query(q): Query<HashQuery>,
 ) -> impl IntoResponse {
-    let Some(hash) = q.hash else {
-        return Json(json!([])).into_response();
+    let hash = match required_resolved_hash_async(&s.db, q.hash.as_deref()).await {
+        Ok(hash) => hash,
+        Err(status) => return status.into_response(),
     };
     match s.backend.piece_states(&hash).await {
         Ok(states) => {
@@ -1616,20 +2318,18 @@ async fn torrents_piece_states(
                 .collect();
             Json(json!(states)).into_response()
         }
-        Err(_) => match s.db.get(&hash) {
-            Ok(Some(_)) | Ok(None) => Json(json!([])).into_response(),
-            Err(e) => {
-                tracing::error!(
-                    component = "qbcompat",
-                    operation = "piece_states",
-                    torrent = %hash,
-                    result = "error",
-                    error = %e,
-                    "qBit piece state query failed"
-                );
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
-            }
-        },
+        Err(e) if is_unsupported_error(&e) => Json(json!([])).into_response(),
+        Err(e) => {
+            tracing::warn!(
+                component = "qbcompat",
+                operation = "piece_states",
+                torrent = %hash,
+                result = "error",
+                error = %e,
+                "qBit piece state query failed"
+            );
+            backend_error_status(&e).into_response()
+        }
     }
 }
 
@@ -1637,30 +2337,33 @@ async fn torrents_piece_hashes(
     State(s): State<AppState>,
     Query(q): Query<HashQuery>,
 ) -> impl IntoResponse {
-    let Some(hash) = q.hash else {
-        return Json(json!([])).into_response();
+    let hash = match required_resolved_hash_async(&s.db, q.hash.as_deref()).await {
+        Ok(hash) => hash,
+        Err(status) => return status.into_response(),
     };
     match s.backend.piece_hashes(&hash).await {
         Ok(hashes) => Json(json!(hashes)).into_response(),
-        Err(_) => match s.db.get(&hash) {
-            Ok(Some(_)) | Ok(None) => Json(json!([])).into_response(),
-            Err(e) => {
-                tracing::error!(
-                    component = "qbcompat",
-                    operation = "piece_hashes",
-                    torrent = %hash,
-                    result = "error",
-                    error = %e,
-                    "qBit piece hash query failed"
-                );
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
-            }
-        },
+        Err(e) if is_unsupported_error(&e) => Json(json!([])).into_response(),
+        Err(e) => {
+            tracing::warn!(
+                component = "qbcompat",
+                operation = "piece_hashes",
+                torrent = %hash,
+                result = "error",
+                error = %e,
+                "qBit piece hash query failed"
+            );
+            backend_error_status(&e).into_response()
+        }
     }
 }
 
 async fn categories(State(s): State<AppState>) -> impl IntoResponse {
-    match s.db.list_categories() {
+    match s
+        .db
+        .run_blocking("qbit_list_categories", |db| db.list_categories())
+        .await
+    {
         Ok(cats) => {
             let map: serde_json::Map<String, serde_json::Value> = cats
                 .iter()
@@ -1687,7 +2390,11 @@ async fn categories(State(s): State<AppState>) -> impl IntoResponse {
 }
 
 async fn tags(State(s): State<AppState>) -> impl IntoResponse {
-    match s.db.list_tags() {
+    match s
+        .db
+        .run_blocking("qbit_list_tags", |db| db.list_tags())
+        .await
+    {
         Ok(tags) => Json(tags).into_response(),
         Err(e) => {
             tracing::error!(
@@ -1712,23 +2419,30 @@ async fn torrents_set_category(
     State(s): State<AppState>,
     Form(f): Form<SetCategoryForm>,
 ) -> StatusCode {
-    let category = f.category.as_deref().unwrap_or("");
-    for hash in split_hashes(&s.db, f.hashes.as_deref()) {
-        if let Err(e) = s.db.set_torrent_category(&hash, category) {
-            tracing::warn!(
-                component = "cache",
-                operation = "set_category",
-                torrent = %hash,
-                category = %category,
+    let Some(category) = f.category.as_deref() else {
+        return StatusCode::BAD_REQUEST;
+    };
+    if !s.backend.capabilities().supports_categories {
+        return StatusCode::NOT_IMPLEMENTED;
+    }
+    let hashes = match required_resolved_hashes_async(&s.db, f.hashes.as_deref()).await {
+        Ok(hashes) => hashes,
+        Err(e) => {
+            tracing::error!(
+                component = "qbcompat",
+                operation = "resolve_hashes",
                 result = "error",
                 error = %e,
-                "cache category update failed"
+                "failed to resolve hashes for category update"
             );
-        } else {
-            emit_torrent_updated(&s, &hash);
-            emit(&s, Event::CategoriesUpdated);
+            return hash_resolution_status(&e);
         }
+    };
+    let mut backend_failed = false;
+    let mut cache_failed = false;
+    for hash in hashes {
         if let Err(e) = s.backend.set_category(&hash, category).await {
+            backend_failed = true;
             tracing::warn!(
                 component = "backend",
                 operation = "set_category",
@@ -1738,9 +2452,38 @@ async fn torrents_set_category(
                 error = %e,
                 "backend category update failed"
             );
+            continue;
+        }
+        let cache_hash = hash.clone();
+        let cache_category = category.to_owned();
+        if let Err(e) =
+            s.db.run_blocking("qbit_set_torrent_category", move |db| {
+                db.set_torrent_category(&cache_hash, &cache_category)
+            })
+            .await
+        {
+            cache_failed = true;
+            tracing::warn!(
+                component = "cache",
+                operation = "set_category",
+                torrent = %hash,
+                category = %category,
+                result = "error",
+                error = %e,
+                "cache category update failed after backend update"
+            );
+        } else {
+            emit_torrent_updated(&s, &hash).await;
+            emit(&s, Event::CategoriesUpdated).await;
         }
     }
-    StatusCode::OK
+    if cache_failed {
+        StatusCode::INTERNAL_SERVER_ERROR
+    } else if backend_failed {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    }
 }
 
 #[derive(Deserialize)]
@@ -1750,126 +2493,216 @@ struct TagsForm {
 }
 
 async fn torrents_add_tags(State(s): State<AppState>, Form(f): Form<TagsForm>) -> StatusCode {
-    let tag_list: Vec<&str> = f
-        .tags
-        .as_deref()
-        .unwrap_or("")
-        .split(',')
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .collect();
-    for hash in split_hashes(&s.db, f.hashes.as_deref()) {
-        for tag in &tag_list {
-            if let Err(e) = s.db.add_torrent_tag(&hash, tag) {
-                tracing::warn!(
-                    component = "cache",
-                    operation = "add_tag",
-                    torrent = %hash,
-                    tag = %tag,
+    let tag_list = match strict_tag_values(f.tags.as_deref(), false) {
+        Ok(tags) => tags,
+        Err(_) => return StatusCode::BAD_REQUEST,
+    };
+    if !s.backend.capabilities().supports_tags {
+        return StatusCode::NOT_IMPLEMENTED;
+    }
+    let hashes = match required_resolved_hashes_async(&s.db, f.hashes.as_deref()).await {
+        Ok(hashes) => hashes,
+        Err(e) => {
+            tracing::error!(
+                component = "qbcompat",
+                operation = "resolve_hashes",
                 result = "error",
-                    error = %e,
-                    "cache tag add failed"
-                );
-            } else {
-                emit_torrent_updated(&s, &hash);
-                emit(&s, Event::TagsUpdated);
-            }
+                error = %e,
+                "failed to resolve hashes for tag add"
+            );
+            return hash_resolution_status(&e);
         }
-        if s.backend.capabilities().supports_tags {
-            if let Err(e) = s.backend.add_tags(&hash, &tag_list).await {
-                tracing::warn!(
-                    component = "qbcompat",
-                    operation = "add_tags",
-                    torrent = %hash,
-                    result = "error",
-                    error = %e,
-                    "backend tag add failed"
-                );
-            }
+    };
+    let mut backend_failed = false;
+    let mut cache_failed = false;
+    for hash in hashes {
+        if let Err(e) = s.backend.add_tags(&hash, &tag_list).await {
+            backend_failed = true;
+            tracing::warn!(
+                component = "qbcompat",
+                operation = "add_tags",
+                torrent = %hash,
+                result = "error",
+                error = %e,
+                "backend tag add failed"
+            );
+            continue;
+        }
+        let cache_hash = hash.clone();
+        let cache_tags = tag_list
+            .iter()
+            .map(|tag| (*tag).to_owned())
+            .collect::<Vec<_>>();
+        if let Err(e) =
+            s.db.run_blocking("qbit_add_torrent_tags", move |db| {
+                let tag_refs = cache_tags.iter().map(String::as_str).collect::<Vec<_>>();
+                db.add_torrent_tags(&cache_hash, &tag_refs)
+            })
+            .await
+        {
+            cache_failed = true;
+            tracing::warn!(
+                component = "cache",
+                operation = "add_tags",
+                torrent = %hash,
+                result = "error",
+                error = %e,
+                "cache tag add failed after backend update"
+            );
+        } else {
+            emit_torrent_updated(&s, &hash).await;
+            emit(&s, Event::TagsUpdated).await;
         }
     }
-    StatusCode::OK
+    if cache_failed {
+        StatusCode::INTERNAL_SERVER_ERROR
+    } else if backend_failed {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    }
 }
 
 async fn torrents_remove_tags(State(s): State<AppState>, Form(f): Form<TagsForm>) -> StatusCode {
-    let tag_list: Vec<&str> = f
-        .tags
-        .as_deref()
-        .unwrap_or("")
-        .split(',')
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .collect();
-    for hash in split_hashes(&s.db, f.hashes.as_deref()) {
-        for tag in &tag_list {
-            if let Err(e) = s.db.remove_torrent_tag(&hash, tag) {
-                tracing::warn!(
-                    component = "cache",
-                    operation = "remove_tag",
-                    torrent = %hash,
-                    tag = %tag,
+    let tag_list = match strict_tag_values(f.tags.as_deref(), false) {
+        Ok(tags) => tags,
+        Err(_) => return StatusCode::BAD_REQUEST,
+    };
+    if !s.backend.capabilities().supports_tags {
+        return StatusCode::NOT_IMPLEMENTED;
+    }
+    let hashes = match required_resolved_hashes_async(&s.db, f.hashes.as_deref()).await {
+        Ok(hashes) => hashes,
+        Err(e) => {
+            tracing::error!(
+                component = "qbcompat",
+                operation = "resolve_hashes",
                 result = "error",
-                    error = %e,
-                    "cache tag removal failed"
-                );
-            } else {
-                emit_torrent_updated(&s, &hash);
-                emit(&s, Event::TagsUpdated);
-            }
+                error = %e,
+                "failed to resolve hashes for tag removal"
+            );
+            return hash_resolution_status(&e);
         }
-        if s.backend.capabilities().supports_tags {
-            if let Err(e) = s.backend.remove_tags(&hash, &tag_list).await {
-                tracing::warn!(
-                    component = "qbcompat",
-                    operation = "remove_tags",
-                    torrent = %hash,
-                    result = "error",
-                    error = %e,
-                    "backend tag removal failed"
-                );
-            }
+    };
+    let mut backend_failed = false;
+    let mut cache_failed = false;
+    for hash in hashes {
+        if let Err(e) = s.backend.remove_tags(&hash, &tag_list).await {
+            backend_failed = true;
+            tracing::warn!(
+                component = "qbcompat",
+                operation = "remove_tags",
+                torrent = %hash,
+                result = "error",
+                error = %e,
+                "backend tag removal failed"
+            );
+            continue;
+        }
+        let cache_hash = hash.clone();
+        let cache_tags = tag_list
+            .iter()
+            .map(|tag| (*tag).to_owned())
+            .collect::<Vec<_>>();
+        if let Err(e) =
+            s.db.run_blocking("qbit_remove_torrent_tags", move |db| {
+                let tag_refs = cache_tags.iter().map(String::as_str).collect::<Vec<_>>();
+                db.remove_torrent_tags(&cache_hash, &tag_refs)
+            })
+            .await
+        {
+            cache_failed = true;
+            tracing::warn!(
+                component = "cache",
+                operation = "remove_tags",
+                torrent = %hash,
+                result = "error",
+                error = %e,
+                "cache tag removal failed after backend update"
+            );
+        } else {
+            emit_torrent_updated(&s, &hash).await;
+            emit(&s, Event::TagsUpdated).await;
         }
     }
-    StatusCode::OK
+    if cache_failed {
+        StatusCode::INTERNAL_SERVER_ERROR
+    } else if backend_failed {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    }
 }
 
 async fn torrents_set_tags(State(s): State<AppState>, Form(f): Form<TagsForm>) -> StatusCode {
-    let tag_list: Vec<&str> = f
-        .tags
-        .as_deref()
-        .unwrap_or("")
-        .split(',')
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .collect();
-    for hash in split_hashes(&s.db, f.hashes.as_deref()) {
-        if let Err(e) = s.db.set_torrent_tags(&hash, &tag_list) {
+    let tag_list = match strict_tag_values(f.tags.as_deref(), true) {
+        Ok(tags) => tags,
+        Err(_) => return StatusCode::BAD_REQUEST,
+    };
+    if !s.backend.capabilities().supports_tags {
+        return StatusCode::NOT_IMPLEMENTED;
+    }
+    let hashes = match required_resolved_hashes_async(&s.db, f.hashes.as_deref()).await {
+        Ok(hashes) => hashes,
+        Err(e) => {
+            tracing::error!(
+                component = "qbcompat",
+                operation = "resolve_hashes",
+                result = "error",
+                error = %e,
+                "failed to resolve hashes for tag replacement"
+            );
+            return hash_resolution_status(&e);
+        }
+    };
+    let mut backend_failed = false;
+    let mut cache_failed = false;
+    for hash in hashes {
+        if let Err(e) = s.backend.set_tags(&hash, &tag_list).await {
+            backend_failed = true;
+            tracing::warn!(
+                component = "qbcompat",
+                operation = "set_tags",
+                torrent = %hash,
+                result = "error",
+                error = %e,
+                "backend tag replace failed"
+            );
+            continue;
+        }
+        let cache_hash = hash.clone();
+        let cache_tags = tag_list
+            .iter()
+            .map(|tag| (*tag).to_owned())
+            .collect::<Vec<_>>();
+        if let Err(e) =
+            s.db.run_blocking("qbit_set_torrent_tags", move |db| {
+                let tag_refs = cache_tags.iter().map(String::as_str).collect::<Vec<_>>();
+                db.set_torrent_tags(&cache_hash, &tag_refs)
+            })
+            .await
+        {
+            cache_failed = true;
             tracing::warn!(
                 component = "cache",
                 operation = "set_tags",
                 torrent = %hash,
                 result = "error",
                 error = %e,
-                "cache tag replace failed"
+                "cache tag replace failed after backend update"
             );
         } else {
-            emit_torrent_updated(&s, &hash);
-            emit(&s, Event::TagsUpdated);
-        }
-        if s.backend.capabilities().supports_tags {
-            if let Err(e) = s.backend.set_tags(&hash, &tag_list).await {
-                tracing::warn!(
-                    component = "qbcompat",
-                    operation = "set_tags",
-                    torrent = %hash,
-                    result = "error",
-                    error = %e,
-                    "backend tag replace failed"
-                );
-            }
+            emit_torrent_updated(&s, &hash).await;
+            emit(&s, Event::TagsUpdated).await;
         }
     }
-    StatusCode::OK
+    if cache_failed {
+        StatusCode::INTERNAL_SERVER_ERROR
+    } else if backend_failed {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    }
 }
 
 // --- qBit category/tag management ---
@@ -1885,14 +2718,25 @@ async fn create_category(
     State(s): State<AppState>,
     Form(f): Form<CreateCategoryForm>,
 ) -> StatusCode {
+    if !s.backend.capabilities().supports_categories {
+        return StatusCode::NOT_IMPLEMENTED;
+    }
     let name = match f.category.as_deref().map(str::trim) {
         Some(n) if !n.is_empty() => n,
         _ => return StatusCode::BAD_REQUEST,
     };
     let save_path = f.save_path.as_deref().unwrap_or("");
-    match s.db.upsert_category(name, save_path) {
+    let category_name = name.to_owned();
+    let category_path = save_path.to_owned();
+    match s
+        .db
+        .run_blocking("qbit_create_category", move |db| {
+            db.upsert_category(&category_name, &category_path)
+        })
+        .await
+    {
         Ok(_) => {
-            emit(&s, Event::CategoriesUpdated);
+            emit(&s, Event::CategoriesUpdated).await;
             StatusCode::OK
         }
         Err(e) => {
@@ -1910,14 +2754,25 @@ async fn create_category(
 }
 
 async fn edit_category(State(s): State<AppState>, Form(f): Form<CreateCategoryForm>) -> StatusCode {
+    if !s.backend.capabilities().supports_categories {
+        return StatusCode::NOT_IMPLEMENTED;
+    }
     let name = match f.category.as_deref().map(str::trim) {
         Some(n) if !n.is_empty() => n,
         _ => return StatusCode::BAD_REQUEST,
     };
     let save_path = f.save_path.as_deref().unwrap_or("");
-    match s.db.upsert_category(name, save_path) {
+    let category_name = name.to_owned();
+    let category_path = save_path.to_owned();
+    match s
+        .db
+        .run_blocking("qbit_edit_category", move |db| {
+            db.upsert_category(&category_name, &category_path)
+        })
+        .await
+    {
         Ok(_) => {
-            emit(&s, Event::CategoriesUpdated);
+            emit(&s, Event::CategoriesUpdated).await;
             StatusCode::OK
         }
         Err(e) => {
@@ -1943,15 +2798,23 @@ async fn remove_categories(
     State(s): State<AppState>,
     Form(f): Form<RemoveCategoriesForm>,
 ) -> StatusCode {
-    for name in f
-        .categories
-        .as_deref()
-        .unwrap_or("")
-        .lines()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        if let Err(e) = s.db.delete_category(name) {
+    if !s.backend.capabilities().supports_categories {
+        return StatusCode::NOT_IMPLEMENTED;
+    }
+    let categories = match required_qbit_list(f.categories.as_deref()) {
+        Ok(categories) => categories,
+        Err(_) => return StatusCode::BAD_REQUEST,
+    };
+    let mut failed = false;
+    for name in categories {
+        let delete_name = name.clone();
+        if let Err(e) =
+            s.db.run_blocking("qbit_delete_category", move |db| {
+                db.delete_category(&delete_name)
+            })
+            .await
+        {
+            failed = true;
             tracing::warn!(
                 component = "qbcompat",
                 operation = "remove_category",
@@ -1961,11 +2824,15 @@ async fn remove_categories(
                 "qBit category removal failed"
             );
         } else {
-            emit(&s, Event::CategoriesUpdated);
-            emit(&s, Event::TrackerHealthUpdated);
+            emit(&s, Event::CategoriesUpdated).await;
+            emit(&s, Event::TrackerHealthUpdated).await;
         }
     }
-    StatusCode::OK
+    if failed {
+        StatusCode::INTERNAL_SERVER_ERROR
+    } else {
+        StatusCode::OK
+    }
 }
 
 #[derive(Deserialize)]
@@ -1974,15 +2841,21 @@ struct CreateTagsForm {
 }
 
 async fn create_tags(State(s): State<AppState>, Form(f): Form<CreateTagsForm>) -> StatusCode {
-    for tag in f
-        .tags
-        .as_deref()
-        .unwrap_or("")
-        .split(',')
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-    {
-        if let Err(e) = s.db.ensure_tag(tag) {
+    if !s.backend.capabilities().supports_tags {
+        return StatusCode::NOT_IMPLEMENTED;
+    }
+    let tags = match strict_tag_values(f.tags.as_deref(), false) {
+        Ok(tags) => tags,
+        Err(_) => return StatusCode::BAD_REQUEST,
+    };
+    let mut failed = false;
+    for tag in tags {
+        let tag_name = tag.to_owned();
+        if let Err(e) =
+            s.db.run_blocking("qbit_ensure_tag", move |db| db.ensure_tag(&tag_name))
+                .await
+        {
+            failed = true;
             tracing::warn!(
                 component = "qbcompat",
                 operation = "create_tag",
@@ -1992,22 +2865,32 @@ async fn create_tags(State(s): State<AppState>, Form(f): Form<CreateTagsForm>) -
                 "qBit tag create failed"
             );
         } else {
-            emit(&s, Event::TagsUpdated);
+            emit(&s, Event::TagsUpdated).await;
         }
     }
-    StatusCode::OK
+    if failed {
+        StatusCode::INTERNAL_SERVER_ERROR
+    } else {
+        StatusCode::OK
+    }
 }
 
 async fn delete_tags(State(s): State<AppState>, Form(f): Form<CreateTagsForm>) -> StatusCode {
-    for tag in f
-        .tags
-        .as_deref()
-        .unwrap_or("")
-        .split(',')
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-    {
-        if let Err(e) = s.db.delete_tag(tag) {
+    if !s.backend.capabilities().supports_tags {
+        return StatusCode::NOT_IMPLEMENTED;
+    }
+    let tags = match strict_tag_values(f.tags.as_deref(), false) {
+        Ok(tags) => tags,
+        Err(_) => return StatusCode::BAD_REQUEST,
+    };
+    let mut failed = false;
+    for tag in tags {
+        let tag_name = tag.to_owned();
+        if let Err(e) =
+            s.db.run_blocking("qbit_delete_tag", move |db| db.delete_tag(&tag_name))
+                .await
+        {
+            failed = true;
             tracing::warn!(
                 component = "qbcompat",
                 operation = "delete_tag",
@@ -2017,11 +2900,15 @@ async fn delete_tags(State(s): State<AppState>, Form(f): Form<CreateTagsForm>) -
                 "qBit tag delete failed"
             );
         } else {
-            emit(&s, Event::TagsUpdated);
-            emit(&s, Event::TrackerHealthUpdated);
+            emit(&s, Event::TagsUpdated).await;
+            emit(&s, Event::TrackerHealthUpdated).await;
         }
     }
-    StatusCode::OK
+    if failed {
+        StatusCode::INTERNAL_SERVER_ERROR
+    } else {
+        StatusCode::OK
+    }
 }
 
 #[derive(Deserialize)]
@@ -2032,34 +2919,52 @@ struct FilePrioForm {
 }
 
 async fn torrents_file_prio(State(s): State<AppState>, Form(f): Form<FilePrioForm>) -> StatusCode {
-    let hash = match f.hash {
-        Some(h) => h,
-        None => return StatusCode::BAD_REQUEST,
+    let hash = match required_resolved_hash_async(&s.db, f.hash.as_deref()).await {
+        Ok(hash) => hash,
+        Err(status) => return status,
     };
     let priority: i64 = match f.priority.as_deref() {
         Some("0") => 0,
         Some("6") | Some("7") => 2,
-        _ => 1,
+        Some("1") => 1,
+        _ => return StatusCode::BAD_REQUEST,
     };
-    if let Some(ids) = f.id {
-        for id_str in ids.split('|') {
-            if let Ok(idx) = id_str.parse::<usize>() {
-                if let Err(e) = s.backend.set_file_priority(&hash, idx, priority).await {
-                    tracing::warn!(
-                            component = "qbcompat",
-                            operation = "set_file_priority",
-                            torrent = %hash,
-                            file_index = idx,
-                            priority,
-                    result = "error",
-                            error = %e,
-                            "qBit file priority update failed"
-                        );
-                }
-            }
+    if !s.backend.capabilities().supports_file_priority {
+        return StatusCode::NOT_IMPLEMENTED;
+    }
+    let ids = match f.id {
+        Some(ids) if !ids.trim().is_empty() => ids,
+        None | Some(_) => return StatusCode::BAD_REQUEST,
+    };
+    let ids = match ids
+        .split('|')
+        .map(|id| id.trim().parse::<usize>().map_err(|_| ()))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(ids) if !ids.is_empty() => ids,
+        _ => return StatusCode::BAD_REQUEST,
+    };
+    let mut failed = false;
+    for idx in ids {
+        if let Err(e) = s.backend.set_file_priority(&hash, idx, priority).await {
+            failed = true;
+            tracing::warn!(
+                component = "qbcompat",
+                operation = "set_file_priority",
+                torrent = %hash,
+                file_index = idx,
+                priority,
+                result = "error",
+                error = %e,
+                "qBit file priority update failed"
+            );
         }
     }
-    StatusCode::OK
+    if failed {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    }
 }
 
 #[derive(Deserialize)]
@@ -2072,18 +2977,32 @@ async fn torrents_add_trackers(
     State(s): State<AppState>,
     Form(f): Form<AddTrackersForm>,
 ) -> StatusCode {
-    let urls: Vec<&str> = f
-        .urls
-        .as_deref()
-        .unwrap_or("")
-        .lines()
-        .map(str::trim)
-        .filter(|u| !u.is_empty())
-        .collect();
+    let urls = match required_qbit_lines(f.urls.as_deref()) {
+        Ok(urls) => urls,
+        Err(_) => return StatusCode::BAD_REQUEST,
+    };
+    if !s.backend.capabilities().supports_tracker_edit {
+        return StatusCode::NOT_IMPLEMENTED;
+    }
+    let hashes = match required_resolved_hashes_async(&s.db, f.hashes.as_deref()).await {
+        Ok(hashes) => hashes,
+        Err(e) => {
+            tracing::error!(
+                component = "qbcompat",
+                operation = "resolve_hashes",
+                result = "error",
+                error = %e,
+                "failed to resolve hashes for tracker add"
+            );
+            return hash_resolution_status(&e);
+        }
+    };
+    let mut failed = false;
 
-    for hash in split_hashes(&s.db, f.hashes.as_deref()) {
+    for hash in hashes {
         for url in &urls {
             if let Err(e) = s.backend.add_tracker(&hash, url).await {
+                failed = true;
                 tracing::warn!(
                     component = "qbcompat",
                     operation = "add_tracker",
@@ -2096,7 +3015,11 @@ async fn torrents_add_trackers(
             }
         }
     }
-    StatusCode::OK
+    if failed {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    }
 }
 
 #[derive(Deserialize)]
@@ -2109,32 +3032,38 @@ async fn torrents_remove_trackers(
     State(s): State<AppState>,
     Form(f): Form<RemoveTrackersForm>,
 ) -> StatusCode {
-    let Some(hash) = f.hash else {
-        return StatusCode::BAD_REQUEST;
+    let hash = match required_resolved_hash_async(&s.db, f.hash.as_deref()).await {
+        Ok(hash) => hash,
+        Err(status) => return status,
     };
-    let urls: Vec<&str> = f
-        .urls
-        .as_deref()
-        .unwrap_or("")
-        .split('|')
-        .map(str::trim)
-        .filter(|u| !u.is_empty())
-        .collect();
+    let urls = match required_qbit_list(f.urls.as_deref()) {
+        Ok(urls) => urls,
+        Err(_) => return StatusCode::BAD_REQUEST,
+    };
+    if !s.backend.capabilities().supports_tracker_edit {
+        return StatusCode::NOT_IMPLEMENTED;
+    }
+    let mut failed = false;
 
     for url in urls {
-        if let Err(e) = s.backend.remove_tracker(&hash, url).await {
+        if let Err(e) = s.backend.remove_tracker(&hash, &url).await {
+            failed = true;
             tracing::warn!(
                 component = "qbcompat",
                 operation = "remove_tracker",
                 torrent = %hash,
-                tracker = %redact_log_url(url),
+                tracker = %redact_log_url(&url),
                 result = "error",
                 error = %e,
                 "qb remove tracker failed"
             );
         }
     }
-    StatusCode::OK
+    if failed {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    }
 }
 
 #[derive(Deserialize)]
@@ -2150,15 +3079,19 @@ async fn torrents_edit_tracker(
     State(s): State<AppState>,
     Form(f): Form<EditTrackerForm>,
 ) -> StatusCode {
-    let Some(hash) = f.hash else {
+    let hash = match required_resolved_hash_async(&s.db, f.hash.as_deref()).await {
+        Ok(hash) => hash,
+        Err(status) => return status,
+    };
+    let Some(orig_url) = f.orig_url.filter(|url| !url.trim().is_empty()) else {
         return StatusCode::BAD_REQUEST;
     };
-    let Some(orig_url) = f.orig_url else {
+    let Some(new_url) = f.new_url.filter(|url| !url.trim().is_empty()) else {
         return StatusCode::BAD_REQUEST;
     };
-    let Some(new_url) = f.new_url else {
-        return StatusCode::BAD_REQUEST;
-    };
+    if !s.backend.capabilities().supports_tracker_edit {
+        return StatusCode::NOT_IMPLEMENTED;
+    }
     if let Err(e) = s.backend.edit_tracker(&hash, &orig_url, &new_url).await {
         tracing::warn!(
             component = "qbcompat",
@@ -2170,6 +3103,7 @@ async fn torrents_edit_tracker(
             error = %e,
             "qBit tracker edit failed"
         );
+        return StatusCode::SERVICE_UNAVAILABLE;
     }
     StatusCode::OK
 }
@@ -2181,12 +3115,16 @@ struct RenameForm {
 }
 
 async fn torrents_rename(State(s): State<AppState>, Form(f): Form<RenameForm>) -> StatusCode {
-    let Some(hash) = f.hash else {
-        return StatusCode::BAD_REQUEST;
+    let hash = match required_resolved_hash_async(&s.db, f.hash.as_deref()).await {
+        Ok(hash) => hash,
+        Err(status) => return status,
     };
     let Some(name) = f.name else {
         return StatusCode::BAD_REQUEST;
     };
+    if !s.backend.capabilities().supports_torrent_rename {
+        return StatusCode::NOT_IMPLEMENTED;
+    }
     if let Err(e) = s.backend.rename_torrent(&hash, &name).await {
         tracing::warn!(
             component = "qbcompat",
@@ -2196,6 +3134,7 @@ async fn torrents_rename(State(s): State<AppState>, Form(f): Form<RenameForm>) -
             error = %e,
             "qBit torrent rename failed"
         );
+        return StatusCode::SERVICE_UNAVAILABLE;
     }
     StatusCode::OK
 }
@@ -2211,8 +3150,9 @@ async fn torrents_rename_file(
     State(s): State<AppState>,
     Form(f): Form<RenameFileForm>,
 ) -> StatusCode {
-    let Some(hash) = f.hash else {
-        return StatusCode::BAD_REQUEST;
+    let hash = match required_resolved_hash_async(&s.db, f.hash.as_deref()).await {
+        Ok(hash) => hash,
+        Err(status) => return status,
     };
     let Some(id) = f.id else {
         return StatusCode::BAD_REQUEST;
@@ -2220,6 +3160,9 @@ async fn torrents_rename_file(
     let Some(name) = f.name else {
         return StatusCode::BAD_REQUEST;
     };
+    if !s.backend.capabilities().supports_file_rename {
+        return StatusCode::NOT_IMPLEMENTED;
+    }
     if let Err(e) = s.backend.rename_file(&hash, id, &name).await {
         tracing::warn!(
             component = "qbcompat",
@@ -2230,6 +3173,7 @@ async fn torrents_rename_file(
             error = %e,
             "qBit file rename failed"
         );
+        return StatusCode::SERVICE_UNAVAILABLE;
     }
     StatusCode::OK
 }
@@ -2273,13 +3217,48 @@ async fn torrents_limit_map(
     hashes: Option<&str>,
     download: bool,
 ) -> impl IntoResponse {
-    let hashes = split_hashes(&s.db, hashes);
+    if !s.backend.capabilities().supports_per_torrent_limits {
+        return StatusCode::NOT_IMPLEMENTED.into_response();
+    }
+    let hashes = match required_resolved_hashes_async(&s.db, hashes).await {
+        Ok(hashes) => hashes,
+        Err(e) => {
+            tracing::warn!(
+                component = "qbcompat",
+                operation = if download {
+                    "resolve_download_limit_hashes"
+                } else {
+                    "resolve_upload_limit_hashes"
+                },
+                result = "error",
+                error = %e,
+                "failed to resolve hashes for per-torrent limit read"
+            );
+            return hash_resolution_status(&e).into_response();
+        }
+    };
     let result = if download {
         s.backend.download_limits(&hashes).await
     } else {
         s.backend.upload_limits(&hashes).await
     };
-    Json(result.unwrap_or_default())
+    match result {
+        Ok(limits) => Json(limits).into_response(),
+        Err(e) => {
+            tracing::warn!(
+                component = "qbcompat",
+                operation = if download {
+                    "download_limits"
+                } else {
+                    "upload_limits"
+                },
+                result = "error",
+                error = %e,
+                "qBit per-torrent limit read failed"
+            );
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+    }
 }
 
 async fn torrents_set_download_limit(
@@ -2297,19 +3276,40 @@ async fn torrents_set_upload_limit(
 }
 
 async fn torrents_set_speed_limit(s: AppState, f: SpeedLimitForm, download: bool) -> StatusCode {
-    let limit = f.limit.filter(|value| *value > 0);
+    if !s.backend.capabilities().supports_per_torrent_limits {
+        return StatusCode::NOT_IMPLEMENTED;
+    }
+    let Some(raw_limit) = f.limit.filter(|value| *value >= 0) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let limit = (raw_limit > 0).then_some(raw_limit);
     let operation = if download {
         "set_download_limit"
     } else {
         "set_upload_limit"
     };
-    for hash in split_hashes(&s.db, f.hashes.as_deref()) {
+    let mut failed = false;
+    let hashes = match required_resolved_hashes_async(&s.db, f.hashes.as_deref()).await {
+        Ok(hashes) => hashes,
+        Err(e) => {
+            tracing::warn!(
+                component = "qbcompat",
+                operation = "resolve_hashes",
+                result = "error",
+                error = %e,
+                "failed to resolve hashes for per-torrent limit update"
+            );
+            return hash_resolution_status(&e);
+        }
+    };
+    for hash in hashes {
         let result = if download {
             s.backend.set_download_limit(&hash, limit).await
         } else {
             s.backend.set_upload_limit(&hash, limit).await
         };
         if let Err(e) = result {
+            failed = true;
             tracing::warn!(
                 component = "qbcompat",
                 operation,
@@ -2320,33 +3320,49 @@ async fn torrents_set_speed_limit(s: AppState, f: SpeedLimitForm, download: bool
             );
         }
     }
-    StatusCode::OK
+    if failed {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    }
 }
 
 async fn transfer_set_download_limit(
     State(s): State<AppState>,
     Form(f): Form<SpeedLimitForm>,
 ) -> StatusCode {
-    transfer_set_speed_limit(s, f.limit.unwrap_or(0), true).await
+    let Some(limit) = f.limit.filter(|value| *value >= 0) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    transfer_set_speed_limit(s, limit, true).await
 }
 
 async fn transfer_set_upload_limit(
     State(s): State<AppState>,
     Form(f): Form<SpeedLimitForm>,
 ) -> StatusCode {
-    transfer_set_speed_limit(s, f.limit.unwrap_or(0), false).await
+    let Some(limit) = f.limit.filter(|value| *value >= 0) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    transfer_set_speed_limit(s, limit, false).await
 }
 
 async fn transfer_ban_peers(
     State(s): State<AppState>,
     Form(f): Form<HashMap<String, String>>,
 ) -> StatusCode {
-    let peers = f
-        .get("peers")
-        .map(|raw| parse_peer_addrs(raw))
-        .unwrap_or_default();
+    let Some(raw_peers) = f.get("peers") else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let peers = match parse_peer_addrs(raw_peers) {
+        Ok(peers) => peers,
+        Err(_) => return StatusCode::BAD_REQUEST,
+    };
     if peers.is_empty() {
-        return StatusCode::OK;
+        return StatusCode::BAD_REQUEST;
+    }
+    if !s.backend.capabilities().supports_peer_ban {
+        return StatusCode::NOT_IMPLEMENTED;
     }
     if let Err(e) = s.backend.ban_peers(&peers).await {
         tracing::warn!(
@@ -2356,11 +3372,15 @@ async fn transfer_ban_peers(
             error = %e,
             "qBit peer ban not supported by backend"
         );
+        return StatusCode::SERVICE_UNAVAILABLE;
     }
     StatusCode::OK
 }
 
 async fn transfer_set_speed_limit(s: AppState, limit: i64, download: bool) -> StatusCode {
+    if !s.backend.capabilities().supports_global_limits {
+        return StatusCode::NOT_IMPLEMENTED;
+    }
     let limit = limit.max(0);
     let operation = if download {
         "set_global_download_limit"
@@ -2372,69 +3392,132 @@ async fn transfer_set_speed_limit(s: AppState, limit: i64, download: bool) -> St
     } else {
         s.backend.set_global_upload_limit(limit).await
     };
-    if let Err(e) = result {
-        tracing::warn!(
-            component = "qbcompat",
-            operation,
-            result = "error",
-            error = %e,
-            "qBit global speed limit update failed"
-        );
+    match result {
+        Ok(()) => StatusCode::OK,
+        Err(e) => {
+            tracing::warn!(
+                component = "qbcompat",
+                operation,
+                result = "error",
+                error = %e,
+                "qBit global speed limit update failed"
+            );
+            StatusCode::SERVICE_UNAVAILABLE
+        }
     }
-    StatusCode::OK
 }
 
 async fn transfer_toggle_speed_limits_mode(State(s): State<AppState>) -> StatusCode {
-    if let Err(e) = s.backend.toggle_global_speed_limits_mode().await {
-        tracing::warn!(
-            component = "qbcompat",
-            operation = "toggle_global_speed_limits_mode",
-            result = "error",
-            error = %e,
-            "qBit global speed-limit mode toggle failed"
-        );
+    if !s.backend.capabilities().supports_global_limits {
+        return StatusCode::NOT_IMPLEMENTED;
     }
-    StatusCode::OK
+    match s.backend.toggle_global_speed_limits_mode().await {
+        Ok(()) => StatusCode::OK,
+        Err(e) => {
+            tracing::warn!(
+                component = "qbcompat",
+                operation = "toggle_global_speed_limits_mode",
+                result = "error",
+                error = %e,
+                "qBit global speed-limit mode toggle failed"
+            );
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+    }
 }
 
 async fn transfer_speed_limits_mode(State(s): State<AppState>) -> impl IntoResponse {
     match s.backend.global_limits().await {
-        Ok(limits) if limits.speed_limits_mode => "1".to_owned(),
-        Ok(_) | Err(_) => "0".to_owned(),
+        Ok(limits) if limits.speed_limits_mode => "1".to_owned().into_response(),
+        Ok(_) => "0".to_owned().into_response(),
+        Err(e) => {
+            tracing::warn!(
+                component = "qbcompat",
+                operation = "speed_limits_mode",
+                result = "error",
+                error = %e,
+                "qBit speed-limit mode read failed"
+            );
+            backend_error_status(&e).into_response()
+        }
     }
 }
 
 async fn transfer_download_limit(State(s): State<AppState>) -> impl IntoResponse {
-    s.backend
-        .global_limits()
-        .await
-        .map(|limits| limits.download_limit.max(0).to_string())
-        .unwrap_or_else(|_| "0".to_owned())
+    match s.backend.global_limits().await {
+        Ok(limits) => limits.download_limit.max(0).to_string().into_response(),
+        Err(e) => {
+            tracing::warn!(
+                component = "qbcompat",
+                operation = "download_limit",
+                result = "error",
+                error = %e,
+                "qBit download-limit read failed"
+            );
+            backend_error_status(&e).into_response()
+        }
+    }
 }
 
 async fn transfer_upload_limit(State(s): State<AppState>) -> impl IntoResponse {
-    s.backend
-        .global_limits()
-        .await
-        .map(|limits| limits.upload_limit.max(0).to_string())
-        .unwrap_or_else(|_| "0".to_owned())
+    match s.backend.global_limits().await {
+        Ok(limits) => limits.upload_limit.max(0).to_string().into_response(),
+        Err(e) => {
+            tracing::warn!(
+                component = "qbcompat",
+                operation = "upload_limit",
+                result = "error",
+                error = %e,
+                "qBit upload-limit read failed"
+            );
+            backend_error_status(&e).into_response()
+        }
+    }
 }
 
 async fn torrents_set_share_limits(
     State(s): State<AppState>,
     Form(f): Form<ShareLimitsForm>,
 ) -> StatusCode {
-    let ratio_limit_milli = f
-        .ratio_limit
-        .map(|ratio| (ratio * 1000.0) as i64)
-        .unwrap_or(-2);
+    if !s.backend.capabilities().supports_share_limits {
+        return StatusCode::NOT_IMPLEMENTED;
+    }
+    if f.ratio_limit
+        .is_some_and(|ratio| !ratio.is_finite() || (ratio < 0.0 && ratio != -1.0 && ratio != -2.0))
+    {
+        return StatusCode::BAD_REQUEST;
+    }
+    if f.ratio_limit.is_none() && f.seeding_time_limit.is_none() {
+        return StatusCode::BAD_REQUEST;
+    }
+    if f.seeding_time_limit
+        .is_some_and(|limit| limit < 0 && limit != -1 && limit != -2)
+    {
+        return StatusCode::BAD_REQUEST;
+    }
+    let ratio_limit_milli = f.ratio_limit.map(qbit_ratio_limit_milli).unwrap_or(-2);
     let seeding_time_limit = f.seeding_time_limit.unwrap_or(-2);
-    for hash in split_hashes(&s.db, f.hashes.as_deref()) {
+    let mut failed = false;
+    let hashes = match required_resolved_hashes_async(&s.db, f.hashes.as_deref()).await {
+        Ok(hashes) => hashes,
+        Err(e) => {
+            tracing::warn!(
+                component = "qbcompat",
+                operation = "resolve_hashes",
+                result = "error",
+                error = %e,
+                "failed to resolve hashes for share-limit update"
+            );
+            return hash_resolution_status(&e);
+        }
+    };
+    for hash in hashes {
         if let Err(e) = s
             .backend
             .set_share_limits(&hash, ratio_limit_milli, seeding_time_limit)
             .await
         {
+            failed = true;
             tracing::warn!(
                 component = "qbcompat",
                 operation = "set_share_limits",
@@ -2445,7 +3528,22 @@ async fn torrents_set_share_limits(
             );
         }
     }
-    StatusCode::OK
+    if failed {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    }
+}
+
+fn qbit_ratio_limit_milli(ratio: f64) -> i64 {
+    // qBittorrent uses -2 as the "use global/default" sentinel. It is not a
+    // real negative ratio and must survive the fixed-point conversion
+    // unchanged. -1 means explicitly disable the ratio limit.
+    if ratio == -2.0 || ratio == -1.0 {
+        ratio as i64
+    } else {
+        ratio_milli(Some(ratio))
+    }
 }
 
 #[derive(Deserialize)]
@@ -2464,10 +3562,55 @@ async fn torrents_set_location(
     if location.is_empty() {
         return StatusCode::BAD_REQUEST;
     }
-    for hash in split_hashes(&s.db, f.hashes.as_deref()) {
-        match s.db.exists(&hash) {
+    if !s.backend.capabilities().supports_location_update {
+        return StatusCode::NOT_IMPLEMENTED;
+    }
+    let mut backend_failed = false;
+    let mut cache_failed = false;
+    let hashes = match required_resolved_hashes_async(&s.db, f.hashes.as_deref()).await {
+        Ok(hashes) => hashes,
+        Err(e) => {
+            tracing::warn!(
+                component = "qbcompat",
+                operation = "resolve_hashes",
+                result = "error",
+                error = %e,
+                "failed to resolve hashes for location update"
+            );
+            return hash_resolution_status(&e);
+        }
+    };
+    for hash in hashes {
+        if let Err(e) = s.backend.set_location(&hash, location).await {
+            backend_failed = true;
+            tracing::warn!(
+                component = "backend",
+                operation = "set_location",
+                torrent = %hash,
+                result = "error",
+                error = %e,
+                "backend location update failed"
+            );
+            continue;
+        }
+        let lookup_hash = hash.clone();
+        match s
+            .db
+            .run_blocking("qbit_set_location_exists", move |db| {
+                db.exists(&lookup_hash)
+            })
+            .await
+        {
             Ok(true) => {
-                if let Err(e) = s.db.set_torrent_location(&hash, location) {
+                let cache_hash = hash.clone();
+                let cache_location = location.to_owned();
+                if let Err(e) =
+                    s.db.run_blocking("qbit_set_location_cache", move |db| {
+                        db.set_torrent_location(&cache_hash, &cache_location)
+                    })
+                    .await
+                {
+                    cache_failed = true;
                     tracing::warn!(
                             component = "cache",
                             operation = "set_location",
@@ -2477,31 +3620,30 @@ async fn torrents_set_location(
                             "cache location update failed"
                         );
                 } else {
-                    emit_torrent_updated(&s, &hash);
+                    emit_torrent_updated(&s, &hash).await;
                 }
             }
             Ok(false) => {}
-            Err(e) => tracing::warn!(
-                component = "cache",
-                operation = "exists",
-                torrent = %hash,
-                result = "error",
-                error = %e,
-                "cache torrent existence check failed"
-            ),
-        }
-        if let Err(e) = s.backend.set_location(&hash, location).await {
-            tracing::warn!(
-                component = "backend",
-                operation = "set_location",
-                torrent = %hash,
-                result = "error",
-                error = %e,
-                "backend location update failed"
-            );
+            Err(e) => {
+                cache_failed = true;
+                tracing::warn!(
+                    component = "cache",
+                    operation = "exists",
+                    torrent = %hash,
+                    result = "error",
+                    error = %e,
+                    "cache torrent existence check failed"
+                );
+            }
         }
     }
-    StatusCode::OK
+    if cache_failed {
+        StatusCode::INTERNAL_SERVER_ERROR
+    } else if backend_failed {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    }
 }
 
 #[derive(Deserialize)]
@@ -2545,16 +3687,38 @@ async fn torrents_set_auto_management(
 }
 
 async fn torrents_set_mode_flag(s: AppState, f: TorrentModeForm, operation: &str) -> StatusCode {
-    let enabled = f.value.or(f.enable).unwrap_or(false);
-    for hash in split_hashes(&s.db, f.hashes.as_deref()) {
+    if !s.backend.capabilities().supports_mode_flags {
+        return StatusCode::NOT_IMPLEMENTED;
+    }
+    let Some(enabled) = f.value.or(f.enable) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let mut failed = false;
+    let hashes = match required_resolved_hashes_async(&s.db, f.hashes.as_deref()).await {
+        Ok(hashes) => hashes,
+        Err(e) => {
+            tracing::warn!(
+                component = "qbcompat",
+                operation = "resolve_hashes",
+                result = "error",
+                error = %e,
+                "failed to resolve hashes for mode update"
+            );
+            return hash_resolution_status(&e);
+        }
+    };
+    for hash in hashes {
         let result = match operation {
             "set_force_start" => s.backend.set_force_start(&hash, enabled).await,
             "set_super_seeding" => s.backend.set_super_seeding(&hash, enabled).await,
             "set_auto_tmm" => s.backend.set_auto_tmm(&hash, enabled).await,
             "set_auto_management" => s.backend.set_auto_management(&hash, enabled).await,
-            _ => Ok(()),
+            _ => Err(anyhow::anyhow!(
+                "unsupported torrent mode operation {operation}"
+            )),
         };
         if let Err(e) = result {
+            failed = true;
             tracing::warn!(
                 component = "qbcompat",
                 operation,
@@ -2565,15 +3729,37 @@ async fn torrents_set_mode_flag(s: AppState, f: TorrentModeForm, operation: &str
             );
         }
     }
-    StatusCode::OK
+    if failed {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    }
 }
 
 async fn torrents_toggle_sequential_download(
     State(s): State<AppState>,
     Form(f): Form<ToggleSequentialForm>,
 ) -> StatusCode {
-    for hash in split_hashes(&s.db, f.hashes.as_deref()) {
+    if !s.backend.capabilities().supports_per_torrent_limits {
+        return StatusCode::NOT_IMPLEMENTED;
+    }
+    let mut failed = false;
+    let hashes = match required_resolved_hashes_async(&s.db, f.hashes.as_deref()).await {
+        Ok(hashes) => hashes,
+        Err(e) => {
+            tracing::warn!(
+                component = "qbcompat",
+                operation = "resolve_hashes",
+                result = "error",
+                error = %e,
+                "failed to resolve hashes for sequential toggle"
+            );
+            return hash_resolution_status(&e);
+        }
+    };
+    for hash in hashes {
         if let Err(e) = s.backend.toggle_sequential_download(&hash).await {
+            failed = true;
             tracing::warn!(
                 component = "qbcompat",
                 operation = "toggle_sequential_download",
@@ -2584,15 +3770,37 @@ async fn torrents_toggle_sequential_download(
             );
         }
     }
-    StatusCode::OK
+    if failed {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    }
 }
 
 async fn torrents_toggle_first_last_piece_prio(
     State(s): State<AppState>,
     Form(f): Form<ToggleSequentialForm>,
 ) -> StatusCode {
-    for hash in split_hashes(&s.db, f.hashes.as_deref()) {
+    if !s.backend.capabilities().supports_per_torrent_limits {
+        return StatusCode::NOT_IMPLEMENTED;
+    }
+    let mut failed = false;
+    let hashes = match required_resolved_hashes_async(&s.db, f.hashes.as_deref()).await {
+        Ok(hashes) => hashes,
+        Err(e) => {
+            tracing::warn!(
+                component = "qbcompat",
+                operation = "resolve_hashes",
+                result = "error",
+                error = %e,
+                "failed to resolve hashes for first-last toggle"
+            );
+            return hash_resolution_status(&e);
+        }
+    };
+    for hash in hashes {
         if let Err(e) = s.backend.toggle_first_last_piece_priority(&hash).await {
+            failed = true;
             tracing::warn!(
                 component = "qbcompat",
                 operation = "toggle_first_last_piece_prio",
@@ -2603,7 +3811,11 @@ async fn torrents_toggle_first_last_piece_prio(
             );
         }
     }
-    StatusCode::OK
+    if failed {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    }
 }
 
 // --- Sync ---
@@ -2619,12 +3831,11 @@ async fn sync_maindata(
 ) -> impl IntoResponse {
     // rid absent or 0 → full update; rid>0 → incremental since that rid
     let rid = q.rid.unwrap_or(0);
+    if rid < 0 {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let full = rid == 0;
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    let (categories, tags) = match sync_metadata(&s) {
+    let (categories, tags) = match sync_metadata(&s).await {
         Ok(metadata) => metadata,
         Err(e) => {
             tracing::error!(
@@ -2637,22 +3848,84 @@ async fn sync_maindata(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    let server_state = qb_server_state(crate::stats::current_rates(s.backend.clone()).await);
+    let backend_status =
+        match tokio::time::timeout(Duration::from_secs(3), s.backend.health()).await {
+            Ok(status) => status,
+            Err(_) => BackendStatus::Unreachable,
+        };
+    let rates = match crate::stats::current_rates_result(s.backend.clone()).await {
+        Ok(rates) => rates,
+        Err(error) if backend_status == BackendStatus::Connected => {
+            tracing::warn!(
+                component = "qbcompat",
+                operation = "sync_maindata_transfer_stats",
+                result = "error",
+                error = %crate::sync::error_chain(&error),
+                "connected backend transfer stats are unavailable"
+            );
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "error": "transfer rates unavailable",
+                    "connection_status": "unreachable",
+                })),
+            )
+                .into_response();
+        }
+        Err(_) => TransferRates::default(),
+    };
+    let server_state = qb_server_state(rates, backend_status == BackendStatus::Connected);
 
     if full {
         let params = ListParams {
-            limit: Some(50000),
+            limit: Some((MAX_QBIT_SYNC_ENTRIES + 1) as i64),
             ..Default::default()
         };
-        match s.db.list(&params) {
-            Ok((rows, _total)) => {
-                // Use wall clock as floor so empty DB doesn't return rid=0 (which re-triggers full update)
-                let max_updated: i64 = rows
-                    .iter()
-                    .map(|t| t.updated_at)
-                    .max()
-                    .unwrap_or(now_secs)
-                    .max(now_secs - 1);
+        // Read the cursor before the list. If a concurrent mutation lands
+        // while the page is materialized, the following incremental request
+        // will replay it; reading the cursor after the list would falsely
+        // claim that mutation was already included and lose it.
+        let revision = match s
+            .db
+            .run_blocking("qbit_sync_maindata_revision", |db| db.current_revision())
+            .await
+        {
+            Ok(revision) => revision,
+            Err(e) => {
+                tracing::error!(
+                    component = "qbcompat",
+                    operation = "sync_maindata_revision",
+                    result = "error",
+                    error = %e,
+                    "qBit maindata revision load failed"
+                );
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+        match s
+            .db
+            .run_blocking("qbit_sync_maindata_full", move |db| db.list_page(&params))
+            .await
+        {
+            Ok(rows) if rows.len() > MAX_QBIT_SYNC_ENTRIES => {
+                tracing::warn!(
+                    component = "qbcompat",
+                    operation = "sync_maindata",
+                    result = "rejected",
+                    total = rows.len(),
+                    maximum = MAX_QBIT_SYNC_ENTRIES,
+                    "qBit full sync exceeds the bounded compatibility response; use paged native endpoints"
+                );
+                (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!(
+                        "qBit full sync contains more than {} torrents; use the paged native API",
+                        MAX_QBIT_SYNC_ENTRIES
+                    ),
+                )
+                    .into_response()
+            }
+            Ok(rows) => {
                 let torrents = match torrents_map(&rows) {
                     Ok(torrents) => torrents,
                     Err(e) => {
@@ -2667,7 +3940,7 @@ async fn sync_maindata(
                     }
                 };
                 Json(json!({
-                    "rid": max_updated,
+                    "rid": revision,
                     "full_update": true,
                     "torrents": torrents,
                     "torrents_removed": [],
@@ -2689,9 +3962,15 @@ async fn sync_maindata(
             }
         }
     } else {
-        match s.db.list_since(rid) {
-            Ok((rows, max_updated)) => {
-                let torrents = match torrents_map(&rows) {
+        match s
+            .db
+            .run_blocking("qbit_sync_maindata_delta", move |db| {
+                db.list_since_bounded(rid, MAX_QBIT_SYNC_ENTRIES)
+            })
+            .await
+        {
+            Ok(Some(delta)) => {
+                let torrents = match torrents_map(&delta.changed) {
                     Ok(torrents) => torrents,
                     Err(e) => {
                         tracing::error!(
@@ -2705,15 +3984,33 @@ async fn sync_maindata(
                     }
                 };
                 Json(json!({
-                    "rid": max_updated,
+                    "rid": delta.revision,
                     "full_update": false,
                     "torrents": torrents,
-                    "torrents_removed": [],
+                    "torrents_removed": delta.removed,
                     "categories": categories,
                     "tags": tags,
                     "server_state": server_state,
                 }))
                 .into_response()
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    component = "qbcompat",
+                    operation = "sync_maindata",
+                    result = "rejected",
+                    rid,
+                    maximum = MAX_QBIT_SYNC_ENTRIES,
+                    "qBit incremental sync exceeds the bounded compatibility response; request a fresh paged/native sync"
+                );
+                (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!(
+                        "qBit incremental sync exceeds the {}-torrent limit; request a fresh sync or use the paged native API",
+                        MAX_QBIT_SYNC_ENTRIES
+                    ),
+                )
+                    .into_response()
             }
             Err(e) => {
                 tracing::error!(
@@ -2739,56 +4036,124 @@ fn torrents_map(
         .collect()
 }
 
-fn sync_metadata(
+async fn sync_metadata(
     s: &AppState,
 ) -> anyhow::Result<(serde_json::Map<String, serde_json::Value>, Vec<String>)> {
-    let categories =
-        s.db.list_categories()?
-            .into_iter()
-            .map(|c| {
-                (
-                    c.name.clone(),
-                    json!({ "name": c.name, "savePath": c.save_path }),
-                )
-            })
-            .collect();
-    let tags = s.db.list_tags()?;
+    let (categories, tags) =
+        s.db.run_blocking("qbit_sync_metadata", |db| {
+            Ok((db.list_categories()?, db.list_tags()?))
+        })
+        .await?;
+    let categories = categories
+        .into_iter()
+        .map(|c| {
+            (
+                c.name.clone(),
+                json!({ "name": c.name, "savePath": c.save_path }),
+            )
+        })
+        .collect();
     Ok((categories, tags))
 }
 
-async fn transfer_info(State(s): State<AppState>) -> Json<serde_json::Value> {
-    let rates = crate::stats::current_rates(s.backend.clone()).await;
+async fn transfer_info(State(s): State<AppState>) -> impl IntoResponse {
+    let backend_status =
+        match tokio::time::timeout(Duration::from_secs(3), s.backend.health()).await {
+            Ok(status) => status,
+            Err(_) => BackendStatus::Unreachable,
+        };
+    if backend_status != BackendStatus::Connected {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "backend is unreachable",
+                "connection_status": backend_status.as_str(),
+            })),
+        )
+            .into_response();
+    }
+    let rates = match crate::stats::current_rates_result(s.backend.clone()).await {
+        Ok(rates) => rates,
+        Err(e) => {
+            tracing::warn!(
+                component = "qbcompat",
+                operation = "transfer_info",
+                result = "error",
+                error = %crate::sync::error_chain(&e),
+                "transfer rates unavailable"
+            );
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "error": "transfer rates unavailable",
+                    "connection_status": "unreachable",
+                })),
+            )
+                .into_response();
+        }
+    };
+    let limits = if s.backend.capabilities().supports_global_limits {
+        match s.backend.global_limits().await {
+            Ok(limits) => limits,
+            Err(e) => {
+                tracing::warn!(
+                    component = "qbcompat",
+                    operation = "transfer_info",
+                    result = "error",
+                    error = %e,
+                    "global transfer limits unavailable"
+                );
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({
+                        "error": "global transfer limits unavailable",
+                        "connection_status": "unreachable",
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        crate::backend::BackendTransferLimits::default()
+    };
     let totals = crate::stats::session_totals();
 
-    Json(json!({
-        "connection_status": "connected",
-        "dl_info_speed": rates.download,
-        "dl_info_data": totals.download,
-        "up_info_speed": rates.upload,
-        "up_info_data": totals.upload,
-        "dl_rate_limit": 0,
-        "up_rate_limit": 0,
-    }))
+    (
+        StatusCode::OK,
+        Json(json!({
+            "connection_status": "connected",
+            "dl_info_speed": rates.download,
+            "dl_info_data": totals.download,
+            "up_info_speed": rates.upload,
+            "up_info_data": totals.upload,
+            "dl_rate_limit": limits.download_limit,
+            "up_rate_limit": limits.upload_limit,
+        })),
+    )
+        .into_response()
 }
 
-fn qb_server_state(rates: TransferRates) -> serde_json::Value {
+fn qb_server_state(rates: TransferRates, connected: bool) -> serde_json::Value {
     json!({
-        "connection_status": "connected",
+        "connection_status": if connected { "connected" } else { "disconnected" },
         "dl_info_speed": rates.download,
         "up_info_speed": rates.upload,
     })
 }
 
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
+    use axum::http::StatusCode;
+
     use crate::{
         cache::{AppEventRow, TorrentRow},
         rtorrent::TransferRates,
     };
 
     use super::{
-        is_status_filter, qb_server_state, qbit_log_entry, split_hashes, to_qb_torrent,
-        LogMainQuery,
+        is_status_filter, qb_server_state, qbit_log_entry, qbit_ratio_limit_milli,
+        qbit_status_filter, resolve_hashes, split_hashes, to_qb_torrent, LogMainQuery,
     };
 
     #[test]
@@ -2813,6 +4178,7 @@ mod tests {
             "checking",
             "moving",
             "errored",
+            "tracker_error",
         ] {
             assert!(
                 is_status_filter(status),
@@ -2823,21 +4189,80 @@ mod tests {
     }
 
     #[test]
-    fn split_hashes_deduplicates_repeated_mutation_targets() {
-        let dir = tempfile::tempdir().expect("create cache tempdir");
-        let db = crate::cache::Db::open(&dir.path().join("cache.db")).expect("open cache");
+    fn qbit_status_filter_does_not_turn_protocol_values_into_name_searches() {
+        assert_eq!(qbit_status_filter(None).unwrap(), None);
+        assert_eq!(qbit_status_filter(Some("all")).unwrap(), None);
         assert_eq!(
-            split_hashes(&db, Some("A| A |B||A|B")),
-            vec!["A", "B"]
+            qbit_status_filter(Some("uploading")).unwrap(),
+            Some("seeding".to_owned())
+        );
+        assert_eq!(
+            qbit_status_filter(Some("missingFiles")).unwrap_err(),
+            StatusCode::NOT_IMPLEMENTED
+        );
+        assert_eq!(
+            qbit_status_filter(Some("not-a-real-status")).unwrap_err(),
+            StatusCode::BAD_REQUEST
         );
     }
 
     #[test]
+    fn split_hashes_deduplicates_repeated_mutation_targets() {
+        let dir = tempfile::tempdir().expect("create cache tempdir");
+        let db = crate::cache::Db::open(&dir.path().join("cache.db")).expect("open cache");
+        assert_eq!(split_hashes(&db, Some("A| a |B|A|B")), vec!["A", "B"]);
+        assert!(resolve_hashes(&db, Some("A||B")).is_err());
+        assert!(resolve_hashes(&db, Some("all|A")).is_err());
+    }
+
+    #[test]
+    fn required_hashes_are_existing_and_canonical_case_insensitively() {
+        let dir = tempfile::tempdir().expect("create cache tempdir");
+        let db = crate::cache::Db::open(&dir.path().join("cache.db")).expect("open cache");
+        db.upsert(&torrent_row("ABCDEF", true, true, false))
+            .expect("seed cache");
+
+        assert_eq!(
+            super::required_resolved_hashes(&db, Some("abcdef")).expect("resolve cached hash"),
+            vec!["ABCDEF"]
+        );
+        assert!(super::required_resolved_hashes(&db, Some("123456")).is_err());
+        assert_eq!(
+            super::required_resolved_hash(&db, Some("abcdef"))
+                .expect("resolve singular cached hash"),
+            "ABCDEF"
+        );
+        assert_eq!(
+            super::required_resolved_hash(&db, Some("ALL")).unwrap_err(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            super::required_resolved_hash(&db, Some("123456")).unwrap_err(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            super::resolve_hashes(&db, Some("ALL")).expect("resolve all"),
+            vec!["ABCDEF"]
+        );
+        assert!(super::resolve_hashes(&db, Some("all|ABCDEF")).is_err());
+    }
+
+    #[test]
+    fn qbit_default_ratio_sentinel_is_preserved() {
+        assert_eq!(qbit_ratio_limit_milli(-2.0), -2);
+        assert_eq!(qbit_ratio_limit_milli(-1.0), -1);
+        assert_eq!(qbit_ratio_limit_milli(1.25), 1_250);
+    }
+
+    #[test]
     fn qb_server_state_includes_current_transfer_rates() {
-        let state = qb_server_state(TransferRates {
-            download: 1_234,
-            upload: 567,
-        });
+        let state = qb_server_state(
+            TransferRates {
+                download: 1_234,
+                upload: 567,
+            },
+            true,
+        );
 
         assert_eq!(state["connection_status"], "connected");
         assert_eq!(state["dl_info_speed"], 1_234);
@@ -2853,11 +4278,38 @@ mod tests {
             kind: "rtorrent_log".to_owned(),
             message: "tracker warning".to_owned(),
             payload: "{}".to_owned(),
-        });
+        })
+        .unwrap();
         assert_eq!(entry.id, 7);
         assert_eq!(entry.message, "tracker warning");
         assert_eq!(entry.timestamp, 1_700_000_000);
         assert_eq!(entry.kind, 2);
+    }
+
+    #[test]
+    fn qbit_log_entry_rejects_missing_event_id() {
+        assert!(qbit_log_entry(AppEventRow {
+            event_id: None,
+            occurred_at: 1_700_000_000,
+            level: "info".to_owned(),
+            kind: "native_event".to_owned(),
+            message: "event".to_owned(),
+            payload: "{}".to_owned(),
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn qbit_log_entry_rejects_corrupt_payload() {
+        assert!(qbit_log_entry(AppEventRow {
+            event_id: Some(7),
+            occurred_at: 1_700_000_000,
+            level: "info".to_owned(),
+            kind: "native_event".to_owned(),
+            message: "event".to_owned(),
+            payload: "not json".to_owned(),
+        })
+        .is_err());
     }
 
     #[test]
@@ -3012,58 +4464,206 @@ fn current_row_rates(t: &TorrentRow) -> (i64, i64) {
     (t.down_rate.max(0), t.up_rate.max(0))
 }
 
-fn split_hashes(db: &crate::cache::Db, s: Option<&str>) -> Vec<String> {
+#[cfg(test)]
+fn resolve_hashes(db: &crate::cache::Db, s: Option<&str>) -> anyhow::Result<Vec<String>> {
     match s {
-        None | Some("") => vec![],
-        Some(s) if s.trim() == "all" => match db.all_hashes() {
-            Ok(hashes) => hashes.into_iter().collect(),
-            Err(e) => {
-                tracing::warn!(
-                    component = "qbcompat",
-                    operation = "resolve_hashes",
-                result = "error",
-                    error = %e,
-                    "failed to resolve hashes=all"
-                );
-                vec![]
-            }
+        None | Some("") => Ok(vec![]),
+        Some(s) if s.trim().eq_ignore_ascii_case("all") => match db.all_hashes() {
+            Ok(hashes) => Ok(hashes.into_iter().collect()),
+            Err(e) => Err(anyhow::anyhow!("failed to resolve hashes=all: {e}")),
         },
         Some(s) => {
+            let values = s.split('|').map(str::trim).collect::<Vec<_>>();
+            if values
+                .iter()
+                .any(|hash| hash.is_empty() || hash.eq_ignore_ascii_case("all"))
+            {
+                return Err(anyhow::Error::new(InvalidHashTarget(
+                    "hashes must contain non-empty torrent hashes or exactly 'all'".to_owned(),
+                )));
+            }
             let mut seen = std::collections::HashSet::new();
-            s.split('|')
-                .map(str::trim)
+            Ok(values
+                .into_iter()
                 .filter_map(|hash| {
-                    if hash.is_empty() || !seen.insert(hash.to_owned()) {
-                        None
-                    } else {
+                    if seen.insert(hash.to_ascii_lowercase()) {
                         Some(hash.to_owned())
+                    } else {
+                        None
                     }
                 })
-                .collect()
+                .collect())
         }
     }
 }
 
-fn parse_peer_addrs(values: &str) -> Vec<SocketAddr> {
-    values
-        .split('|')
-        .filter_map(|peer| peer.trim().parse::<SocketAddr>().ok())
+async fn resolve_hashes_async(
+    db: &crate::cache::Db,
+    s: Option<&str>,
+) -> anyhow::Result<Vec<String>> {
+    match s {
+        None | Some("") => Ok(vec![]),
+        Some(s) if s.trim().eq_ignore_ascii_case("all") => db
+            .run_blocking("resolve_hashes_all", |db| db.all_hashes())
+            .await
+            .map(|hashes| hashes.into_iter().collect())
+            .map_err(|e| anyhow::anyhow!("failed to resolve hashes=all: {e}")),
+        Some(s) => {
+            let values = s.split('|').map(str::trim).collect::<Vec<_>>();
+            if values
+                .iter()
+                .any(|hash| hash.is_empty() || hash.eq_ignore_ascii_case("all"))
+            {
+                return Err(anyhow::Error::new(InvalidHashTarget(
+                    "hashes must contain non-empty torrent hashes or exactly 'all'".to_owned(),
+                )));
+            }
+            let mut seen = std::collections::HashSet::new();
+            Ok(values
+                .into_iter()
+                .filter_map(|hash| {
+                    if seen.insert(hash.to_ascii_lowercase()) {
+                        Some(hash.to_owned())
+                    } else {
+                        None
+                    }
+                })
+                .collect())
+        }
+    }
+}
+
+async fn required_resolved_hashes_async(
+    db: &crate::cache::Db,
+    raw: Option<&str>,
+) -> anyhow::Result<Vec<String>> {
+    let raw = raw
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .ok_or_else(|| anyhow::Error::new(InvalidHashTarget("hashes is required".to_owned())))?;
+    let hashes = resolve_hashes_async(db, Some(raw)).await?;
+    if hashes.is_empty() {
+        return Err(anyhow::Error::new(InvalidHashTarget(
+            "hashes resolved to no torrents".to_owned(),
+        )));
+    }
+
+    db.clone()
+        .run_blocking("canonicalize_torrent_hashes", move |db| {
+            let mut resolved = Vec::with_capacity(hashes.len());
+            for hash in hashes {
+                let Some(canonical) = db.canonical_hash(&hash).map_err(|error| {
+                    anyhow::anyhow!("failed to resolve torrent hash {hash}: {error}")
+                })?
+                else {
+                    return Err(anyhow::Error::new(InvalidHashTarget(format!(
+                        "torrent hash not found: {hash}"
+                    ))));
+                };
+                resolved.push(canonical);
+            }
+            Ok(resolved)
+        })
+        .await
+}
+
+async fn required_resolved_hash_async(
+    db: &crate::cache::Db,
+    raw: Option<&str>,
+) -> Result<String, StatusCode> {
+    if raw
+        .map(str::trim)
+        .is_some_and(|value| value.eq_ignore_ascii_case("all"))
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    match required_resolved_hashes_async(db, raw).await {
+        Ok(mut hashes) if hashes.len() == 1 => Ok(hashes.remove(0)),
+        Ok(_) => Err(StatusCode::BAD_REQUEST),
+        Err(error) => Err(hash_resolution_status(&error)),
+    }
+}
+
+#[cfg(test)]
+fn required_resolved_hashes(
+    db: &crate::cache::Db,
+    raw: Option<&str>,
+) -> anyhow::Result<Vec<String>> {
+    let raw = raw
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .ok_or_else(|| anyhow::Error::new(InvalidHashTarget("hashes is required".to_owned())))?;
+    let hashes = resolve_hashes(db, Some(raw))?;
+    if hashes.is_empty() {
+        return Err(anyhow::Error::new(InvalidHashTarget(
+            "hashes resolved to no torrents".to_owned(),
+        )));
+    }
+
+    // Do not delegate existence semantics to the backend. Transmission and
+    // some other compatibility targets can acknowledge an unknown id as a
+    // successful no-op, which would turn a typo into a false-successful
+    // mutation. Resolve each target against the sidecar cache and preserve
+    // its canonical spelling for downstream cache/backend operations.
+    let mut resolved = Vec::with_capacity(hashes.len());
+    for hash in hashes {
+        let Some(canonical) = db
+            .canonical_hash(&hash)
+            .map_err(|error| anyhow::anyhow!("failed to resolve torrent hash {hash}: {error}"))?
+        else {
+            return Err(anyhow::Error::new(InvalidHashTarget(format!(
+                "torrent hash not found: {hash}"
+            ))));
+        };
+        resolved.push(canonical);
+    }
+    Ok(resolved)
+}
+
+#[cfg(test)]
+fn required_resolved_hash(db: &crate::cache::Db, raw: Option<&str>) -> Result<String, StatusCode> {
+    if raw
+        .map(str::trim)
+        .is_some_and(|value| value.eq_ignore_ascii_case("all"))
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    match required_resolved_hashes(db, raw) {
+        Ok(mut hashes) if hashes.len() == 1 => Ok(hashes.remove(0)),
+        Ok(_) => Err(StatusCode::BAD_REQUEST),
+        Err(error) => Err(hash_resolution_status(&error)),
+    }
+}
+
+#[cfg(test)]
+fn split_hashes(db: &crate::cache::Db, s: Option<&str>) -> Vec<String> {
+    resolve_hashes(db, s).expect("test hash resolution should succeed")
+}
+
+fn parse_peer_addrs(values: &str) -> Result<Vec<SocketAddr>, ()> {
+    let peers = values.split('|').collect::<Vec<_>>();
+    if peers.is_empty() || peers.iter().any(|peer| peer.trim().is_empty()) {
+        return Err(());
+    }
+    peers
+        .into_iter()
+        .map(|peer| peer.trim().parse::<SocketAddr>().map_err(|_| ()))
         .collect()
 }
 
-fn emit(s: &AppState, event: Event) {
-    record_app_event(s, &event);
+async fn emit(s: &AppState, event: Event) {
+    record_app_event(s, &event).await;
     let _ = s.events.send(event);
 }
 
-fn record_app_event(s: &AppState, event: &Event) {
+async fn record_app_event(s: &AppState, event: &Event) {
     let Some((kind, message, payload)) = app_event_projection(event) else {
         return;
     };
-    append_operator_event(s, "info", kind, message, payload);
+    append_operator_event(s, "info", kind, message, payload).await;
 }
 
-fn record_operator_event(
+async fn record_operator_event(
     s: &AppState,
     level: &str,
     kind: &str,
@@ -3076,27 +4676,32 @@ fn record_operator_event(
         kind.to_owned(),
         message.to_owned(),
         payload.to_string(),
-    );
+    )
+    .await;
 }
 
-fn append_operator_event(
+async fn append_operator_event(
     s: &AppState,
     level: &str,
     kind: String,
     message: String,
     payload: String,
 ) {
-    if let Err(e) = s.db.append_app_event(
-        &AppEventRow {
-            event_id: None,
-            occurred_at: chrono::Utc::now().timestamp(),
-            level: level.to_owned(),
-            kind,
-            message,
-            payload,
-        },
-        s.cfg.logging.event_retention,
-    ) {
+    let event = AppEventRow {
+        event_id: None,
+        occurred_at: chrono::Utc::now().timestamp(),
+        level: level.to_owned(),
+        kind,
+        message,
+        payload,
+    };
+    let retention = s.cfg.logging.event_retention;
+    if let Err(e) =
+        s.db.run_blocking("append_operator_event", move |db| {
+            db.append_app_event(&event, retention)
+        })
+        .await
+    {
         tracing::warn!(component = "app_events", operation = "append", result = "error", error = %e, "failed to append app event");
     }
 }
@@ -3123,33 +4728,35 @@ fn app_event_projection(event: &Event) -> Option<(String, String, String)> {
     ))
 }
 
-fn emit_torrent_updated(s: &AppState, hash: &str) {
+async fn emit_torrent_updated(s: &AppState, hash: &str) {
     emit(
         s,
         Event::TorrentUpdated {
             hash: hash.to_owned(),
         },
-    );
-    emit(s, Event::TrackerHealthUpdated);
+    )
+    .await;
+    emit(s, Event::TrackerHealthUpdated).await;
 }
 
-fn update_cached_lifecycle_state(s: &AppState, hash: &str, action: &str) {
-    let res = match action {
-        "start" => s.db.set_torrent_runtime_state(hash, 1, false, true),
-        "stop" => s.db.set_torrent_runtime_state(hash, 0, false, false),
-        _ => return,
+async fn update_cached_lifecycle_state(
+    s: &AppState,
+    hash: &str,
+    action: &str,
+) -> std::result::Result<(), String> {
+    let Some((state, active, open)) = (match action {
+        "start" => Some((1, false, true)),
+        "stop" => Some((0, false, false)),
+        _ => None,
+    }) else {
+        return Ok(());
     };
-    if let Err(e) = res {
-        tracing::warn!(
-            component = "cache",
-            operation = "set_torrent_runtime_state",
-            torrent = %hash,
-            action,
-            result = "error",
-            error = %e,
-            "torrent runtime cache update failed"
-        );
-    }
+    let hash = hash.to_owned();
+    s.db.run_blocking("qbit_set_torrent_runtime_state", move |db| {
+        db.set_torrent_runtime_state(&hash, state, active, open)
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 fn map_sort(s: &str) -> &str {
@@ -3187,7 +4794,24 @@ fn is_status_filter(f: &str) -> bool {
             | "checking"
             | "moving"
             | "errored"
+            | "tracker_error"
     )
+}
+
+fn qbit_status_filter(filter: Option<&str>) -> Result<Option<String>, StatusCode> {
+    let Some(filter) = filter.map(str::trim) else {
+        return Ok(None);
+    };
+    if filter.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    match filter {
+        "all" => Ok(None),
+        "uploading" => Ok(Some("seeding".to_owned())),
+        "missingFiles" => Err(StatusCode::NOT_IMPLEMENTED),
+        value if is_status_filter(value) => Ok(Some(value.to_owned())),
+        _ => Err(StatusCode::BAD_REQUEST),
+    }
 }
 
 fn search_plugin_value(name: &str, source: &str, enabled: bool) -> serde_json::Value {
@@ -3211,19 +4835,56 @@ fn plugin_name_from_source(source: &str) -> String {
         .to_owned()
 }
 
-fn split_qbit_list(raw: &str) -> Vec<String> {
-    raw.split(['|', ','])
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .collect()
+fn required_qbit_form_list(
+    params: &HashMap<String, String>,
+    key: &str,
+) -> Result<Vec<String>, StatusCode> {
+    let raw = params.get(key).ok_or(StatusCode::BAD_REQUEST)?;
+    let values = raw.split(['|', ',']).map(str::trim).collect::<Vec<_>>();
+    if values.is_empty() || values.iter().any(|value| value.is_empty()) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(values.into_iter().map(str::to_owned).collect())
 }
 
-fn parse_bool_param(value: Option<&str>, default: bool) -> bool {
-    match value.map(str::trim).map(str::to_ascii_lowercase) {
-        Some(value) if matches!(value.as_str(), "true" | "1" | "yes" | "on") => true,
-        Some(value) if matches!(value.as_str(), "false" | "0" | "no" | "off") => false,
-        _ => default,
+fn required_qbit_list(raw: Option<&str>) -> Result<Vec<String>, ()> {
+    let raw = raw.ok_or(())?;
+    let values = raw
+        .split(['|', '\n', '\r'])
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    if values.is_empty() || values.iter().any(|value| value.is_empty()) {
+        return Err(());
+    }
+    Ok(values.into_iter().map(str::to_owned).collect())
+}
+
+fn required_qbit_lines(raw: Option<&str>) -> Result<Vec<String>, ()> {
+    let raw = raw.ok_or(())?;
+    let values = raw.lines().map(str::trim).collect::<Vec<_>>();
+    if values.is_empty() || values.iter().any(|value| value.is_empty()) {
+        return Err(());
+    }
+    Ok(values.into_iter().map(str::to_owned).collect())
+}
+
+fn strict_tag_values(raw: Option<&str>, allow_empty: bool) -> Result<Vec<&str>, ()> {
+    let raw = raw.ok_or(())?;
+    if raw.trim().is_empty() {
+        return if allow_empty { Ok(Vec::new()) } else { Err(()) };
+    }
+    let values = raw.split(',').map(str::trim).collect::<Vec<_>>();
+    if values.iter().any(|value| value.is_empty()) {
+        return Err(());
+    }
+    Ok(values)
+}
+
+fn parse_wire_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
     }
 }
 

@@ -21,7 +21,7 @@ use sha1::{Digest, Sha1};
 use tokio::net::TcpStream;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, OwnedSemaphorePermit};
-use tokio::time::interval;
+use tokio::time::{interval, timeout};
 use tokio_util::codec::Framed;
 use tracing::{debug, warn};
 use url::Url;
@@ -29,7 +29,8 @@ use url::Url;
 use crate::command::EngineCmd;
 use crate::egress_policy::{OutboundEgressPolicy, OutboundTargetKind};
 use crate::network_budget::GlobalNetworkBudget;
-use crate::torrent_task::{bounded_response_body, TorrentCmd};
+use crate::torrent_task::TorrentCmd;
+use crate::tracker_runtime::bounded_response_body;
 
 const METADATA_PIECE_SIZE: usize = 16 * 1024;
 const MAX_METADATA_SIZE: u32 = 16 * 1024 * 1024;
@@ -38,6 +39,8 @@ const MAX_METADATA_FETCH_CONCURRENCY: usize = 8;
 const METADATA_PEER_RETRY_AFTER: Duration = Duration::from_secs(15);
 const METADATA_PEER_ATTEMPT_CACHE_MIN: usize = 256;
 const METADATA_PEER_ATTEMPT_CACHE_MULTIPLIER: usize = 4;
+const METADATA_ENGINE_SEND_TIMEOUT: Duration = Duration::from_millis(500);
+const METADATA_PEER_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MetadataTransportPolicy {
@@ -96,7 +99,20 @@ pub async fn run_metadata_task(
     let mut tracker_event = TrackerEvent::Started;
     loop {
         tokio::select! {
-            Some(cmd) = cmd_rx.recv() => {
+            command = cmd_rx.recv() => {
+                let Some(cmd) = command else {
+                    // The owning engine disappeared. Metadata work has no
+                    // independent lifecycle and must not remain alive on its
+                    // tracker timer after its command channel is gone.
+                    warn!(
+                        component = "metadata",
+                        operation = "run",
+                        torrent = %info_hash_hex,
+                        result = "command_channel_closed",
+                        "metadata command channel closed; shutting down"
+                    );
+                    return;
+                };
                 match cmd {
                     TorrentCmd::NewPeers(peers) | TorrentCmd::PriorityPeers(peers) => {
                         if paused {
@@ -127,8 +143,9 @@ pub async fn run_metadata_task(
                     } else {
                         match fetch_from_incoming_peer(stream, peer_addr, info_hash, handshake, resources.clone(), peer_permit).await {
                         Ok(info) => {
-                            complete_metadata(&engine_tx, &info_hash_hex, &trackers, info).await;
-                            return;
+                            if complete_metadata(&engine_tx, &info_hash_hex, &trackers, info).await {
+                                return;
+                            }
                         }
                         Err(e) => {
                             debug!(
@@ -152,8 +169,9 @@ pub async fn run_metadata_task(
                     } else {
                         match fetch_from_incoming_utp_peer(stream, peer_addr, info_hash, handshake, resources.clone(), peer_permit).await {
                             Ok(info) => {
-                                complete_metadata(&engine_tx, &info_hash_hex, &trackers, info).await;
-                                return;
+                                if complete_metadata(&engine_tx, &info_hash_hex, &trackers, info).await {
+                                    return;
+                                }
                             }
                             Err(e) => {
                                 debug!(
@@ -236,10 +254,18 @@ pub async fn run_metadata_task(
                     }
                     TorrentCmd::Recheck { .. }
                     | TorrentCmd::CancelJob { .. }
-                    | TorrentCmd::ReloadFilePolicy
-                    | TorrentCmd::UpdateLimits(_)
-                    | TorrentCmd::UpdateGlobalLimits(_)
-                    | TorrentCmd::UpdatePeerExchange(_) => {}
+                    | TorrentCmd::UpdatePeerExchange(_)
+                    | TorrentCmd::BanPeer(_) => {}
+                    TorrentCmd::ReloadFilePolicy { reply } => {
+                        if let Some(reply) = reply {
+                            let _ = reply.send(Ok(()));
+                        }
+                    }
+                    TorrentCmd::UpdateLimits { reply, .. } => {
+                        if let Some(reply) = reply {
+                            let _ = reply.send(Ok(()));
+                        }
+                    }
                 }
             }
             _ = tracker_tick.tick(), if !paused && !trackers.is_empty() => {
@@ -329,8 +355,9 @@ async fn try_fetch_from_peers(
     while let Some((peer, result)) = in_flight.next().await {
         match result {
             Ok(info) => {
-                complete_metadata(engine_tx, info_hash_hex, trackers, info).await;
-                return true;
+                if complete_metadata(engine_tx, info_hash_hex, trackers, info).await {
+                    return true;
+                }
             }
             Err(e) => {
                 debug!(
@@ -464,14 +491,29 @@ async fn complete_metadata(
     info_hash_hex: &str,
     trackers: &[String],
     info: Vec<u8>,
-) {
+) -> bool {
     let raw = build_torrent_from_info(&info, trackers);
-    let _ = engine_tx
-        .send(EngineCmd::CompleteMagnet {
+    match timeout(
+        METADATA_ENGINE_SEND_TIMEOUT,
+        engine_tx.send(EngineCmd::CompleteMagnet {
             info_hash: info_hash_hex.to_owned(),
             raw,
-        })
-        .await;
+        }),
+    )
+    .await
+    {
+        Ok(Ok(())) => true,
+        Ok(Err(_)) | Err(_) => {
+            warn!(
+                component = "metadata",
+                operation = "complete_magnet",
+                torrent = %info_hash_hex,
+                result = "engine_unavailable",
+                "metadata was fetched but the engine could not accept completion"
+            );
+            false
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -579,12 +621,13 @@ async fn announce_http(
 ) -> Result<AnnounceResponse, TrackerError> {
     let tracker =
         Url::parse(tracker_url).map_err(|error| TrackerError::InvalidUrl(error.to_string()))?;
+    let user_agent = crate::peer_id::user_agent();
     let client = egress_policy
         .http_client(
             OutboundTargetKind::Tracker,
             &tracker,
             http_timeout,
-            crate::peer_id::user_agent(),
+            &user_agent,
         )
         .await
         .map_err(|error| TrackerError::Network(error.to_string()))?;
@@ -799,7 +842,12 @@ async fn write_handshake(
         peer_id: crate::peer_id::our_peer_id(),
         reserved: ExtensionFlags::with_extension_protocol(),
     };
-    framed.get_mut().write_all(&hs.encode()).await?;
+    timeout(
+        METADATA_PEER_WRITE_TIMEOUT,
+        framed.get_mut().write_all(&hs.encode()),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("metadata peer handshake write timed out"))??;
     Ok(())
 }
 
@@ -820,7 +868,9 @@ async fn write_utp_handshake(stream: &mut UtpStream, info_hash: [u8; 20]) -> any
         peer_id: crate::peer_id::our_peer_id(),
         reserved: ExtensionFlags::with_extension_protocol(),
     };
-    stream.write_all(&hs.encode()).await?;
+    timeout(METADATA_PEER_WRITE_TIMEOUT, stream.write_all(&hs.encode()))
+        .await
+        .map_err(|_| anyhow::anyhow!("metadata peer handshake write timed out"))??;
     Ok(())
 }
 
@@ -912,13 +962,17 @@ enum MetadataPeerIo {
 
 impl MetadataPeerIo {
     async fn send(&mut self, msg: Message) -> anyhow::Result<()> {
-        match self {
-            MetadataPeerIo::Tcp(framed) => framed.send(msg).await.map_err(Into::into),
-            MetadataPeerIo::Utp(stream) => {
-                stream.write_all(&msg.encode()).await?;
-                Ok(())
+        timeout(METADATA_PEER_WRITE_TIMEOUT, async {
+            match self {
+                MetadataPeerIo::Tcp(framed) => framed.send(msg).await.map_err(Into::into),
+                MetadataPeerIo::Utp(stream) => {
+                    stream.write_all(&msg.encode()).await?;
+                    Ok(())
+                }
             }
-        }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("metadata peer socket write timed out"))?
     }
 
     async fn next(&mut self) -> anyhow::Result<Option<Message>> {
@@ -1054,11 +1108,15 @@ fn validate_metadata_piece(
             "metadata piece {piece} total_size {total_size} does not match expected {expected_total_size}"
         );
     }
-    let start = piece as usize * METADATA_PIECE_SIZE;
-    if start >= expected_total_size as usize {
+    let expected_total_size = usize::try_from(expected_total_size)
+        .map_err(|_| anyhow::anyhow!("metadata size does not fit this platform"))?;
+    let start = (piece as usize)
+        .checked_mul(METADATA_PIECE_SIZE)
+        .ok_or_else(|| anyhow::anyhow!("metadata piece offset overflow"))?;
+    if start >= expected_total_size {
         anyhow::bail!("metadata piece {piece} starts past metadata size");
     }
-    let expected_len = (expected_total_size as usize - start).min(METADATA_PIECE_SIZE);
+    let expected_len = (expected_total_size - start).min(METADATA_PIECE_SIZE);
     if data_len != expected_len {
         anyhow::bail!(
             "metadata piece {piece} length {data_len} does not match expected {expected_len}"
@@ -1112,6 +1170,7 @@ mod tests {
         assert!(validate_metadata_piece(0, 20_000, 19_999, METADATA_PIECE_SIZE).is_err());
         assert!(validate_metadata_piece(1, 20_000, 20_000, METADATA_PIECE_SIZE).is_err());
         assert!(validate_metadata_piece(2, 20_000, 20_000, 1).is_err());
+        assert!(validate_metadata_piece(u32::MAX, 20_000, 20_000, 1).is_err());
     }
 
     #[test]

@@ -316,21 +316,30 @@ impl Client {
 
     async fn probe_string(&self, method: &str) -> ProbeValue<String> {
         match self.call(method, &[]).await {
-            Ok(v) => ProbeValue::ok(v.as_str().unwrap_or("").to_owned()),
+            Ok(v) => match v.as_str() {
+                Some(value) => ProbeValue::ok(value.to_owned()),
+                None => ProbeValue::err(format!("{method} returned a non-string value")),
+            },
             Err(e) => ProbeValue::err(e.to_string()),
         }
     }
 
     async fn probe_i64(&self, method: &str) -> ProbeValue<i64> {
         match self.call(method, &[]).await {
-            Ok(v) => ProbeValue::ok(v.as_i64().unwrap_or(0)),
+            Ok(v) => match v.as_i64() {
+                Some(value) => ProbeValue::ok(value),
+                None => ProbeValue::err(format!("{method} returned a non-integer value")),
+            },
             Err(e) => ProbeValue::err(e.to_string()),
         }
     }
 
     async fn probe_bool(&self, method: &str) -> ProbeValue<bool> {
         match self.call(method, &[]).await {
-            Ok(v) => ProbeValue::ok(v.as_bool().unwrap_or(false)),
+            Ok(v) => match v.as_bool() {
+                Some(value) => ProbeValue::ok(value),
+                None => ProbeValue::err(format!("{method} returned a non-boolean value")),
+            },
             Err(e) => ProbeValue::err(e.to_string()),
         }
     }

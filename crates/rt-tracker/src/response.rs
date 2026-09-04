@@ -1,8 +1,10 @@
+use std::net::{IpAddr, SocketAddr};
+
 use rt_bencode::{decode, BValue};
 
 use crate::{
     error::TrackerError,
-    peer::{parse_compact_peers_v4, Peer},
+    peer::{parse_compact_peers_v4, parse_compact_peers_v6, Peer},
 };
 
 /// Current status of a tracker.
@@ -39,7 +41,8 @@ pub struct AnnounceResponse {
     pub min_interval: Option<u32>,
     pub peers: Vec<Peer>,
     /// Optional tracker ID (re-sent on subsequent announces).
-    pub tracker_id: Option<String>,
+    /// Opaque bytes; BEP 3 does not require tracker IDs to be UTF-8.
+    pub tracker_id: Option<Vec<u8>>,
     pub warning_message: Option<String>,
     pub complete: Option<u32>,
     pub incomplete: Option<u32>,
@@ -143,8 +146,7 @@ impl AnnounceResponse {
         let tracker_id = val
             .get(b"tracker id")
             .and_then(|v| v.as_bytes())
-            .and_then(|b| std::str::from_utf8(b).ok())
-            .map(|s| s.to_owned());
+            .map(ToOwned::to_owned);
 
         let complete = val
             .get(b"complete")
@@ -170,13 +172,13 @@ impl AnnounceResponse {
 }
 
 fn parse_peers_field(val: &BValue<'_>) -> Result<Vec<Peer>, TrackerError> {
-    match val.get(b"peers") {
+    let mut peers = match val.get(b"peers") {
         Some(BValue::Bytes(b)) => {
-            // Compact format (BEP 23)
-            parse_compact_peers_v4(b)
+            // Compact IPv4 format (BEP 23).
+            parse_compact_peers_v4(b)?
         }
         Some(BValue::List(entries)) => {
-            // Non-compact (legacy) format
+            // Non-compact (legacy) format.
             let mut peers = Vec::with_capacity(entries.len());
             for entry in entries {
                 let ip = entry
@@ -187,8 +189,12 @@ fn parse_peers_field(val: &BValue<'_>) -> Result<Vec<Peer>, TrackerError> {
                 let port = entry
                     .get(b"port")
                     .and_then(|v| v.as_int())
-                    .ok_or_else(|| TrackerError::ParseError("peer missing port".into()))?
-                    as u16;
+                    .ok_or_else(|| TrackerError::ParseError("peer missing port".into()))
+                    .and_then(|port| {
+                        u16::try_from(port).map_err(|_| {
+                            TrackerError::ParseError(format!("invalid peer port: {port}"))
+                        })
+                    })?;
                 let peer_id = entry
                     .get(b"peer id")
                     .and_then(|v| v.as_bytes())
@@ -201,18 +207,35 @@ fn parse_peers_field(val: &BValue<'_>) -> Result<Vec<Peer>, TrackerError> {
                             None
                         }
                     });
-                let addr: std::net::SocketAddr = format!("{ip}:{port}").parse().map_err(|_| {
+                let ip = ip.parse::<IpAddr>().map_err(|_| {
                     TrackerError::ParseError(format!("invalid peer address: {ip}:{port}"))
                 })?;
-                peers.push(Peer { addr, peer_id });
+                peers.push(Peer {
+                    addr: SocketAddr::new(ip, port),
+                    peer_id,
+                });
             }
-            Ok(peers)
+            peers
         }
-        None => Ok(Vec::new()),
-        Some(_) => Err(TrackerError::ParseError(
-            "unexpected peers field type".into(),
-        )),
+        None => Vec::new(),
+        Some(_) => {
+            return Err(TrackerError::ParseError(
+                "unexpected peers field type".into(),
+            ))
+        }
+    };
+
+    if let Some(peers6) = val.get(b"peers6") {
+        let BValue::Bytes(bytes) = peers6 else {
+            return Err(TrackerError::ParseError(
+                "unexpected peers6 field type".into(),
+            ));
+        };
+        // Compact IPv6 format (BEP 7).
+        peers.extend(parse_compact_peers_v6(bytes)?);
     }
+
+    Ok(peers)
 }
 
 #[cfg(test)]
@@ -264,6 +287,59 @@ mod tests {
     }
 
     #[test]
+    fn parse_compact_ipv6_peers_field() {
+        let mut peers6 = [0u8; 18];
+        peers6[..16].copy_from_slice(&std::net::Ipv6Addr::LOCALHOST.octets());
+        peers6[16..].copy_from_slice(&6881u16.to_be_bytes());
+        let raw = encode(&BValue::Dict(vec![
+            (b"interval".as_ref(), BValue::Int(1800)),
+            (b"peers".as_ref(), BValue::Bytes(b"")),
+            (b"peers6".as_ref(), BValue::Bytes(&peers6)),
+        ]));
+
+        let response = AnnounceResponse::parse(&raw).unwrap();
+
+        assert_eq!(response.peers.len(), 1);
+        assert_eq!(response.peers[0].addr, "[::1]:6881".parse().unwrap());
+    }
+
+    #[test]
+    fn parse_noncompact_ipv6_peer() {
+        let peer = BValue::Dict(vec![
+            (b"ip".as_ref(), BValue::Bytes(b"2001:db8::1")),
+            (b"port".as_ref(), BValue::Int(6881)),
+        ]);
+        let raw = encode(&BValue::Dict(vec![
+            (b"interval".as_ref(), BValue::Int(1800)),
+            (b"peers".as_ref(), BValue::List(vec![peer])),
+        ]));
+
+        let response = AnnounceResponse::parse(&raw).unwrap();
+
+        assert_eq!(
+            response.peers[0].addr,
+            "[2001:db8::1]:6881".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn reject_noncompact_peer_port_out_of_range() {
+        let peer = BValue::Dict(vec![
+            (b"ip".as_ref(), BValue::Bytes(b"127.0.0.1")),
+            (b"port".as_ref(), BValue::Int(65_536)),
+        ]);
+        let raw = encode(&BValue::Dict(vec![
+            (b"interval".as_ref(), BValue::Int(1800)),
+            (b"peers".as_ref(), BValue::List(vec![peer])),
+        ]));
+
+        assert!(matches!(
+            AnnounceResponse::parse(&raw),
+            Err(TrackerError::ParseError(message)) if message.contains("port")
+        ));
+    }
+
+    #[test]
     fn parse_missing_interval() {
         // Response with no interval field
         let pairs: Vec<(&[u8], BValue<'_>)> = vec![(b"peers", BValue::Bytes(b""))];
@@ -312,6 +388,22 @@ mod tests {
         assert_eq!(resp.min_interval, None);
         assert_eq!(resp.complete, None);
         assert_eq!(resp.incomplete, None);
+    }
+
+    #[test]
+    fn parse_preserves_opaque_tracker_id_bytes() {
+        let raw = encode(&BValue::Dict(vec![
+            (b"interval".as_ref(), BValue::Int(1800)),
+            (b"peers".as_ref(), BValue::Bytes(b"")),
+            (
+                b"tracker id".as_ref(),
+                BValue::Bytes(&[0x00, 0xff, 0x2d, 0x80]),
+            ),
+        ]));
+
+        let response = AnnounceResponse::parse(&raw).unwrap();
+
+        assert_eq!(response.tracker_id, Some(vec![0x00, 0xff, 0x2d, 0x80]));
     }
 
     #[test]

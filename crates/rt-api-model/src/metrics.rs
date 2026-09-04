@@ -8,9 +8,12 @@ use std::sync::Arc;
 #[derive(Debug, Default)]
 pub struct ApiRuntimeMetrics {
     snapshot_refreshes_total: AtomicU64,
+    snapshot_incremental_updates_total: AtomicU64,
     snapshot_expired_total: AtomicU64,
     sse_resyncs_total: AtomicU64,
     sse_events_total: AtomicU64,
+    sse_lagged_total: AtomicU64,
+    sse_disconnects_total: AtomicU64,
     sse_clients: AtomicU64,
     response_bytes_estimated_total: AtomicU64,
 }
@@ -18,9 +21,12 @@ pub struct ApiRuntimeMetrics {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ApiRuntimeMetricsSnapshot {
     pub snapshot_refreshes_total: u64,
+    pub snapshot_incremental_updates_total: u64,
     pub snapshot_expired_total: u64,
     pub sse_resyncs_total: u64,
     pub sse_events_total: u64,
+    pub sse_lagged_total: u64,
+    pub sse_disconnects_total: u64,
     pub sse_clients: u64,
     pub response_bytes_estimated_total: u64,
 }
@@ -35,6 +41,11 @@ impl ApiRuntimeMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_snapshot_incremental_update(&self) {
+        self.snapshot_incremental_updates_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn record_snapshot_expired(&self) {
         self.snapshot_expired_total.fetch_add(1, Ordering::Relaxed);
     }
@@ -45,6 +56,14 @@ impl ApiRuntimeMetrics {
 
     pub fn record_sse_event(&self) {
         self.sse_events_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_sse_lagged(&self) {
+        self.sse_lagged_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_sse_disconnect(&self) {
+        self.sse_disconnects_total.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_estimated_response_bytes(&self, bytes: u64) {
@@ -62,9 +81,14 @@ impl ApiRuntimeMetrics {
     pub fn snapshot(&self) -> ApiRuntimeMetricsSnapshot {
         ApiRuntimeMetricsSnapshot {
             snapshot_refreshes_total: self.snapshot_refreshes_total.load(Ordering::Relaxed),
+            snapshot_incremental_updates_total: self
+                .snapshot_incremental_updates_total
+                .load(Ordering::Relaxed),
             snapshot_expired_total: self.snapshot_expired_total.load(Ordering::Relaxed),
             sse_resyncs_total: self.sse_resyncs_total.load(Ordering::Relaxed),
             sse_events_total: self.sse_events_total.load(Ordering::Relaxed),
+            sse_lagged_total: self.sse_lagged_total.load(Ordering::Relaxed),
+            sse_disconnects_total: self.sse_disconnects_total.load(Ordering::Relaxed),
             sse_clients: self.sse_clients.load(Ordering::Relaxed),
             response_bytes_estimated_total: self
                 .response_bytes_estimated_total
@@ -81,6 +105,7 @@ pub struct ApiSseClientGuard {
 
 impl Drop for ApiSseClientGuard {
     fn drop(&mut self) {
+        self.metrics.record_sse_disconnect();
         let _ =
             self.metrics
                 .sse_clients
@@ -98,9 +123,11 @@ mod tests {
     fn api_metrics_track_snapshot_and_sse_lifecycle() {
         let metrics = ApiRuntimeMetrics::new();
         metrics.record_snapshot_refresh();
+        metrics.record_snapshot_incremental_update();
         metrics.record_snapshot_expired();
         metrics.record_sse_resync();
         metrics.record_sse_event();
+        metrics.record_sse_lagged();
         metrics.record_estimated_response_bytes(42);
         let client = metrics.register_sse_client();
         assert_eq!(metrics.snapshot().sse_clients, 1);
@@ -108,9 +135,12 @@ mod tests {
         drop(client);
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.snapshot_refreshes_total, 1);
+        assert_eq!(snapshot.snapshot_incremental_updates_total, 1);
         assert_eq!(snapshot.snapshot_expired_total, 1);
         assert_eq!(snapshot.sse_resyncs_total, 1);
         assert_eq!(snapshot.sse_events_total, 1);
+        assert_eq!(snapshot.sse_lagged_total, 1);
+        assert_eq!(snapshot.sse_disconnects_total, 1);
         assert_eq!(snapshot.sse_clients, 0);
     }
 }

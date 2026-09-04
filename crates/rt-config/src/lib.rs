@@ -1,8 +1,12 @@
+use std::fs::File;
+use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -28,6 +32,7 @@ pub struct Config {
     pub dht: DhtConfig,
     pub db: DbConfig,
     pub auth: AuthConfig,
+    pub metrics: MetricsConfig,
     pub logging: rt_logging::LoggingConfig,
 }
 
@@ -120,6 +125,10 @@ pub struct MemoryConfig {
 #[serde(default)]
 pub struct RuntimeConfig {
     pub torrent_tiers_enabled: bool,
+    /// Seconds a promoted torrent may remain idle before entering Warm.
+    pub tier_hot_idle_secs: u64,
+    /// Seconds a promoted torrent may remain idle before entering Dormant.
+    pub tier_warm_idle_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,6 +176,20 @@ pub struct DbConfig {
 pub struct AuthConfig {
     /// Pre-shared bearer/session tokens accepted by the native API.
     pub api_tokens: Vec<String>,
+    /// Optional newline-delimited token file. Values are appended to
+    /// `api_tokens` while loading a config file, which lets container and
+    /// systemd deployments keep secrets out of the main TOML document.
+    pub api_tokens_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MetricsConfig {
+    /// Include raw torrent infohashes in per-torrent Prometheus labels.
+    ///
+    /// This is disabled by default because labels are high-cardinality and
+    /// expose operational identifiers to every metrics reader.
+    pub include_torrent_ids: bool,
 }
 
 impl Default for DaemonConfig {
@@ -234,6 +257,8 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         RuntimeConfig {
             torrent_tiers_enabled: true,
+            tier_hot_idle_secs: 2 * 60,
+            tier_warm_idle_secs: 30 * 60,
         }
     }
 }
@@ -284,8 +309,19 @@ impl Default for DbConfig {
 impl Config {
     /// Load from a TOML file, falling back to defaults for missing fields.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        let text = std::fs::read_to_string(path)?;
-        let config: Self = toml::from_str(&text)?;
+        let text = read_bounded_text(path, MAX_CONFIG_BYTES).map_err(|error| match error {
+            BoundedTextError::Io(error) => ConfigError::Io(error),
+            BoundedTextError::TooLarge => ConfigError::Validation(format!(
+                "config {} exceeds {} bytes",
+                path.display(),
+                MAX_CONFIG_BYTES
+            )),
+            BoundedTextError::Utf8 => {
+                ConfigError::Validation(format!("config {} is not valid UTF-8", path.display()))
+            }
+        })?;
+        let mut config: Self = toml::from_str(&text)?;
+        config.load_api_tokens_file(path)?;
         config.validate()?;
         Ok(config)
     }
@@ -338,6 +374,14 @@ impl Config {
         require(
             self.network.incoming_handshake_timeout_secs > 0,
             "network.incoming_handshake_timeout_secs must be greater than zero",
+        )?;
+        require(
+            self.runtime.tier_hot_idle_secs > 0,
+            "runtime.tier_hot_idle_secs must be greater than zero",
+        )?;
+        require(
+            self.runtime.tier_warm_idle_secs > self.runtime.tier_hot_idle_secs,
+            "runtime.tier_warm_idle_secs must be greater than runtime.tier_hot_idle_secs",
         )?;
         require(
             !self.storage.download_dir.as_os_str().is_empty(),
@@ -462,6 +506,68 @@ impl Config {
             self.dht.port
         }
     }
+
+    fn load_api_tokens_file(&mut self, config_path: &Path) -> Result<(), ConfigError> {
+        let Some(token_path) = self.auth.api_tokens_file.as_ref() else {
+            return Ok(());
+        };
+        let token_path = if token_path.is_absolute() {
+            token_path.clone()
+        } else {
+            config_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(token_path)
+        };
+        let token_text = read_bounded_text(&token_path, MAX_CONFIG_BYTES).map_err(|error| {
+            ConfigError::Validation(format!(
+                "auth.api_tokens_file {}: {error}",
+                token_path.display()
+            ))
+        })?;
+        let file_tokens = token_text
+            .lines()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if file_tokens.is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "auth.api_tokens_file {} contains no tokens",
+                token_path.display()
+            )));
+        }
+        self.auth.api_tokens.extend(file_tokens);
+        Ok(())
+    }
+}
+
+enum BoundedTextError {
+    Io(std::io::Error),
+    TooLarge,
+    Utf8,
+}
+
+impl std::fmt::Display for BoundedTextError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => error.fmt(f),
+            Self::TooLarge => write!(f, "file exceeds configured size limit"),
+            Self::Utf8 => write!(f, "file is not valid UTF-8"),
+        }
+    }
+}
+
+fn read_bounded_text(path: &Path, max_bytes: u64) -> Result<String, BoundedTextError> {
+    let file = File::open(path).map_err(BoundedTextError::Io)?;
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(BoundedTextError::Io)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(BoundedTextError::TooLarge);
+    }
+    String::from_utf8(bytes).map_err(|_| BoundedTextError::Utf8)
 }
 
 fn require(condition: bool, message: impl Into<String>) -> Result<(), ConfigError> {
@@ -533,11 +639,14 @@ mod tests {
         assert!(!c.tracker.allow_private_egress);
         assert!(!c.tracker.allow_link_local_egress);
         assert!(c.auth.api_tokens.is_empty());
+        assert!(c.auth.api_tokens_file.is_none());
         assert_eq!(c.daemon.shutdown_timeout_secs, 10);
         assert_eq!(c.memory.total_cap_mb, 512);
         assert_eq!(c.memory.storage_frame_cap_mb, 128);
         assert_eq!(c.memory.queued_disk_cap_mb, 64);
         assert!(c.runtime.torrent_tiers_enabled);
+        assert_eq!(c.runtime.tier_hot_idle_secs, 120);
+        assert_eq!(c.runtime.tier_warm_idle_secs, 1_800);
         assert!(c.storage.device_elevator_enabled);
         assert_eq!(c.storage.file_pool_size, 512);
         assert_eq!(c.storage.idle_file_ttl_secs, 300);
@@ -586,6 +695,14 @@ mod tests {
 
         let mut c = Config::default();
         c.network.max_incoming_handshakes = 0;
+        assert!(matches!(c.validate(), Err(ConfigError::Validation(_))));
+
+        let mut c = Config::default();
+        c.runtime.tier_hot_idle_secs = 0;
+        assert!(matches!(c.validate(), Err(ConfigError::Validation(_))));
+
+        let mut c = Config::default();
+        c.runtime.tier_warm_idle_secs = c.runtime.tier_hot_idle_secs;
         assert!(matches!(c.validate(), Err(ConfigError::Validation(_))));
 
         let mut c = Config::default();
@@ -657,6 +774,7 @@ peer_read_elevator_budget_ms = 9
         assert!(c.tracker.allow_link_local_egress);
         assert!(c.dht.enabled);
         assert_eq!(c.auth.api_tokens, vec!["one", "two"]);
+        assert!(!c.metrics.include_torrent_ids);
         assert_eq!(c.storage.file_pool_size, 99);
         assert_eq!(c.storage.idle_file_ttl_secs, 12);
         assert_eq!(c.storage.io_worker_threads, 3);
@@ -673,6 +791,67 @@ peer_read_elevator_budget_ms = 9
         assert_eq!(c.storage.peer_read_elevator_budget_ms, 9);
         assert_eq!(c.daemon.shutdown_timeout_secs, 10);
         assert_eq!(c.logging, rt_logging::LoggingConfig::default());
+    }
+
+    #[test]
+    fn metrics_torrent_identifier_opt_in_round_trips() {
+        let c: Config = toml::from_str("[metrics]\ninclude_torrent_ids = true\n").unwrap();
+        assert!(c.metrics.include_torrent_ids);
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn load_appends_newline_delimited_tokens_from_a_relative_secret_file() {
+        let unique = format!(
+            "torrentng-config-token-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&root).unwrap();
+        let config_path = root.join("config.toml");
+        std::fs::write(
+            root.join("api-token"),
+            "file-token-123456\nfile-token-789012\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &config_path,
+            "[auth]\napi_tokens = [\"inline-token-123456\"]\napi_tokens_file = \"api-token\"\n",
+        )
+        .unwrap();
+
+        let config = Config::load(&config_path).unwrap();
+        assert_eq!(
+            config.auth.api_tokens,
+            vec![
+                "inline-token-123456",
+                "file-token-123456",
+                "file-token-789012"
+            ]
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn config_file_size_is_bounded() {
+        let root = std::env::temp_dir().join(format!(
+            "torrentng-config-size-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        std::fs::write(&path, vec![b' '; (MAX_CONFIG_BYTES + 1) as usize]).unwrap();
+        assert!(Config::load(&path).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

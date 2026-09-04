@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 
 use super::db::Db;
@@ -23,22 +23,21 @@ impl Db {
             .query_row("SELECT value FROM kv WHERE key=?1", params![KEY], |r| {
                 r.get(0)
             })
-            .ok();
+            .optional()?;
         let mut groups: Vec<RatioGroup> = match raw {
             Some(raw) => serde_json::from_str(&raw)?,
             None => Vec::new(),
         };
-        groups.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        groups.sort_by_key(|a| a.name.to_lowercase());
         Ok(groups)
     }
 
     pub fn upsert_ratio_group(&self, group: RatioGroup) -> Result<Vec<RatioGroup>> {
-        let mut groups = self.list_ratio_groups()?;
-        groups.retain(|existing| existing.name != group.name);
-        groups.push(group);
-        groups.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-        self.save_ratio_groups(&groups)?;
-        Ok(groups)
+        let name = group.name.clone();
+        self.update_ratio_groups(|groups| {
+            groups.retain(|existing| existing.name != name);
+            groups.push(group);
+        })
     }
 
     pub fn get_ratio_group(&self, name: &str) -> Result<Option<RatioGroup>> {
@@ -58,8 +57,11 @@ impl Db {
             args.push(category.clone());
         }
         if let Some(tracker) = &group.tracker {
-            clauses.push(format!("tracker_url LIKE ?{}", args.len() + 1));
-            args.push(format!("%{tracker}%"));
+            clauses.push(format!(
+                "instr(lower(tracker_url), lower(?{})) > 0",
+                args.len() + 1
+            ));
+            args.push(tracker.clone());
         }
 
         let where_sql = if clauses.is_empty() {
@@ -77,19 +79,74 @@ impl Db {
     }
 
     pub fn delete_ratio_group(&self, name: &str) -> Result<Vec<RatioGroup>> {
-        let mut groups = self.list_ratio_groups()?;
-        groups.retain(|existing| existing.name != name);
-        self.save_ratio_groups(&groups)?;
-        Ok(groups)
+        self.update_ratio_groups(|groups| {
+            groups.retain(|existing| existing.name != name);
+        })
     }
 
-    fn save_ratio_groups(&self, groups: &[RatioGroup]) -> Result<()> {
-        let raw = serde_json::to_string(groups)?;
-        self.0.lock().expect("db").execute(
-            "INSERT INTO kv(key, value) VALUES(?1,?2)
-             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            params![KEY, raw],
-        )?;
-        Ok(())
+    fn update_ratio_groups<F>(&self, update: F) -> Result<Vec<RatioGroup>>
+    where
+        F: FnOnce(&mut Vec<RatioGroup>),
+    {
+        let mut conn = self.0.lock().expect("db");
+        let tx = conn.transaction()?;
+        let raw: Option<String> = tx
+            .query_row("SELECT value FROM kv WHERE key=?1", params![KEY], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        let mut groups: Vec<RatioGroup> = match raw {
+            Some(raw) => serde_json::from_str(&raw)?,
+            None => Vec::new(),
+        };
+        update(&mut groups);
+        groups.sort_by_key(|group| group.name.to_lowercase());
+        let raw = serde_json::to_string(&groups)?;
+        write_ratio_groups(&tx, &raw)?;
+        tx.commit()?;
+        Ok(groups)
+    }
+}
+
+fn write_ratio_groups(tx: &Transaction<'_>, raw: &str) -> Result<()> {
+    tx.execute(
+        "INSERT INTO kv(key, value) VALUES(?1,?2)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![KEY, raw],
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn concurrent_ratio_group_updates_do_not_lose_groups() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Db::open(&directory.path().join("cache.sqlite")).unwrap();
+        let start = Arc::new(std::sync::Barrier::new(16));
+
+        std::thread::scope(|scope| {
+            for index in 0..16 {
+                let db = db.clone();
+                let start = Arc::clone(&start);
+                scope.spawn(move || {
+                    start.wait();
+                    db.upsert_ratio_group(RatioGroup {
+                        name: format!("Group {index}"),
+                        ratio_limit: 2.0,
+                        seeding_time_limit: -1,
+                        category: None,
+                        tracker: None,
+                        enabled: true,
+                    })
+                    .unwrap();
+                });
+            }
+        });
+
+        assert_eq!(db.list_ratio_groups().unwrap().len(), 16);
     }
 }

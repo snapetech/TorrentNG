@@ -1,6 +1,6 @@
 use axum::{
-    body::Body,
-    extract::State,
+    body::{to_bytes, Body},
+    extract::{DefaultBodyLimit, State},
     http::{header, HeaderMap, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -9,6 +9,10 @@ use axum::{
 };
 
 use crate::{handlers::*, state::AppState};
+use rt_api_model::{
+    csrf_request_allowed, has_session_cookie, request_fingerprint, valid_idempotency_key,
+    CachedResponse, IdempotencyClaim, MAX_IDEMPOTENCY_BODY_BYTES,
+};
 
 pub fn build_qbit_router(state: AppState) -> Router {
     Router::new()
@@ -18,7 +22,136 @@ pub fn build_qbit_router(state: AppState) -> Router {
 }
 
 fn protected_qbit_routes(state: AppState) -> Router<AppState> {
-    qbit_routes().route_layer(middleware::from_fn_with_state(state, qbit_auth_guard))
+    qbit_routes()
+        // Multipart add requests may contain a bounded set of torrent files;
+        // cap the whole request so repeated fields cannot create an
+        // unbounded allocation before the per-torrent 16 MiB limit applies.
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            qbit_auth_guard,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            state,
+            qbit_idempotency_guard,
+        ))
+}
+
+async fn qbit_idempotency_guard(
+    State(state): State<AppState>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    if !matches!(
+        req.method(),
+        &axum::http::Method::POST
+            | &axum::http::Method::PUT
+            | &axum::http::Method::PATCH
+            | &axum::http::Method::DELETE
+    ) || qbit_public_path(req.uri().path())
+    {
+        return next.run(req).await;
+    }
+    let Some(key) = req
+        .headers()
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+    else {
+        return next.run(req).await;
+    };
+    if !valid_idempotency_key(&key) {
+        return (StatusCode::BAD_REQUEST, "invalid Idempotency-Key").into_response();
+    }
+    let (mut parts, body) = req.into_parts();
+    let body = match to_bytes(body, MAX_IDEMPOTENCY_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    };
+    let fingerprint =
+        request_fingerprint(parts.method.as_str(), &parts.uri.to_string(), body.as_ref());
+    parts.headers.remove(header::CONTENT_LENGTH);
+    let req = Request::from_parts(parts, Body::from(body.to_vec()));
+    loop {
+        match state.idempotency.claim(&key, fingerprint) {
+            IdempotencyClaim::Execute => break,
+            IdempotencyClaim::Wait(notify) => notify.notified().await,
+            IdempotencyClaim::Replay(cached) => return replay_response(cached),
+            IdempotencyClaim::Conflict => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "Idempotency-Key was already used for a different request",
+                )
+                    .into_response();
+            }
+            IdempotencyClaim::Saturated => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "idempotency store is saturated; retry later",
+                )
+                    .into_response();
+            }
+        }
+    }
+    let mut execution = state.idempotency.execution_guard(&key, fingerprint);
+    let response = next.run(req).await;
+    let (parts, body) = response.into_parts();
+    let body = match to_bytes(body, MAX_IDEMPOTENCY_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "mutation response exceeded the idempotency response limit",
+            )
+                .into_response();
+        }
+    };
+    let response = Response::from_parts(parts.clone(), Body::from(body.clone()));
+    if parts.status.is_success() {
+        let headers = parts
+            .headers
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.as_bytes().to_vec()))
+            .collect();
+        execution.complete(CachedResponse {
+            status: parts.status.as_u16(),
+            headers,
+            body: body.to_vec(),
+        });
+    } else {
+        execution.abandon();
+    }
+    response
+}
+
+fn replay_response(cached: CachedResponse) -> Response {
+    // Keep the bound explicit at the final user-controlled allocation site as
+    // well as at request capture. This protects against corrupted/injected
+    // in-memory cache entries and makes the idempotency replay contract
+    // auditable by static analysis.
+    if cached.body.len() > MAX_IDEMPOTENCY_BODY_BYTES {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "cached idempotency response exceeded the replay limit",
+        )
+            .into_response();
+    }
+    let mut response = Response::new(Body::from(cached.body));
+    *response.status_mut() = StatusCode::from_u16(cached.status).unwrap_or(StatusCode::OK);
+    for (name, value) in cached.headers {
+        let Ok(name) = axum::http::HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        let Ok(value) = axum::http::HeaderValue::from_bytes(&value) else {
+            continue;
+        };
+        response.headers_mut().append(name, value);
+    }
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static("idempotency-replayed"),
+        axum::http::HeaderValue::from_static("true"),
+    );
+    response
 }
 
 async fn qbit_auth_guard(
@@ -26,11 +159,20 @@ async fn qbit_auth_guard(
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    if qbit_public_path(req.uri().path())
-        || state.api_tokens.is_empty()
-        || qbit_presented_token(req.headers())
-            .is_some_and(|token| qbit_token_allowed(&state, &token))
-    {
+    if qbit_public_path(req.uri().path()) || state.api_tokens.is_empty() {
+        return next.run(req).await;
+    }
+
+    if qbit_bearer_token(req.headers()).is_some_and(|token| qbit_token_allowed(&state, &token)) {
+        return next.run(req).await;
+    }
+    if qbit_presented_token(req.headers()).is_some_and(|token| qbit_token_allowed(&state, &token)) {
+        if has_session_cookie(req.headers(), &["SID"])
+            && is_mutating_request(&req)
+            && !csrf_request_allowed(req.headers())
+        {
+            return (StatusCode::FORBIDDEN, "cross-site cookie mutation rejected").into_response();
+        }
         return next.run(req).await;
     }
 
@@ -42,6 +184,16 @@ async fn qbit_auth_guard(
         .into_response()
 }
 
+fn is_mutating_request(req: &Request<Body>) -> bool {
+    matches!(
+        *req.method(),
+        axum::http::Method::POST
+            | axum::http::Method::PUT
+            | axum::http::Method::PATCH
+            | axum::http::Method::DELETE
+    )
+}
+
 fn qbit_public_path(path: &str) -> bool {
     path.ends_with("/auth/login") || path.ends_with("/auth/logout")
 }
@@ -51,17 +203,20 @@ fn qbit_token_allowed(state: &AppState, token: &str) -> bool {
 }
 
 fn qbit_presented_token(headers: &HeaderMap) -> Option<String> {
+    qbit_bearer_token(headers).or_else(|| {
+        headers
+            .get(header::COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(qbit_sid_cookie)
+    })
+}
+
+fn qbit_bearer_token(headers: &HeaderMap) -> Option<String> {
     headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .map(str::to_owned)
-        .or_else(|| {
-            headers
-                .get(header::COOKIE)
-                .and_then(|value| value.to_str().ok())
-                .and_then(qbit_sid_cookie)
-        })
 }
 
 fn qbit_sid_cookie(cookie: &str) -> Option<String> {

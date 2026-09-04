@@ -260,7 +260,7 @@ fn parse_response(value: &BValue<'_>, transaction_id: Vec<u8>) -> Result<KrpcMes
         Some(BValue::List(items)) => {
             let mut peers = Vec::new();
             for item in items {
-                peers.extend(parse_compact_peers(required_value_bytes(item)?)?);
+                peers.push(parse_compact_peer_value(required_value_bytes(item)?)?);
             }
             peers
         }
@@ -377,6 +377,31 @@ pub fn parse_compact_peers(bytes: &[u8]) -> Result<Vec<SocketAddr>, KrpcError> {
     Err(KrpcError::Invalid(
         "compact peers length is not a multiple of 6 or 18",
     ))
+}
+
+fn parse_compact_peer_value(bytes: &[u8]) -> Result<SocketAddr, KrpcError> {
+    match bytes.len() {
+        6 => {
+            let chunk: [u8; 6] = bytes.try_into().expect("length checked");
+            Ok(SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]),
+                u16::from_be_bytes([chunk[4], chunk[5]]),
+            )))
+        }
+        18 => {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&bytes[..16]);
+            Ok(SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::from(octets),
+                u16::from_be_bytes([bytes[16], bytes[17]]),
+                0,
+                0,
+            )))
+        }
+        _ => Err(KrpcError::Invalid(
+            "compact peer value must contain exactly one IPv4 or IPv6 peer",
+        )),
+    }
 }
 
 fn encode_compact_peer_values(peers: &[SocketAddr]) -> Vec<Vec<u8>> {
@@ -536,5 +561,26 @@ mod tests {
 
         assert_eq!(parse_compact_peers(&compact[0]).unwrap(), vec![peers[0]]);
         assert_eq!(parse_compact_peers(&compact[1]).unwrap(), vec![peers[1]]);
+    }
+
+    #[test]
+    fn response_rejects_multi_peer_value() {
+        let mut value = vec![0u8; 36];
+        value[..6].copy_from_slice(&[10, 0, 0, 1, 0x1a, 0xe1]);
+        value[6..12].copy_from_slice(&[10, 0, 0, 2, 0x1a, 0xe2]);
+        let response = BValue::Dict(vec![
+            (b"id".as_ref(), BValue::Bytes(&[4u8; 20])),
+            (
+                b"values".as_ref(),
+                BValue::List(vec![BValue::Bytes(&value)]),
+            ),
+        ]);
+        let packet = encode(&BValue::Dict(vec![
+            (b"r".as_ref(), response),
+            (b"t".as_ref(), BValue::Bytes(b"tx")),
+            (b"y".as_ref(), BValue::Bytes(b"r")),
+        ]));
+
+        assert!(KrpcMessage::parse(&packet).is_err());
     }
 }

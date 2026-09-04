@@ -12,12 +12,22 @@ use rt_metainfo::{parse_magnet, parse_torrent};
 use rt_metrics::{MemoryClass, MemoryLease};
 use rt_session::{SessionRegistry, TorrentEntry};
 use serde_json::Value;
-use tokio::sync::RwLock;
+use tokio::{sync::RwLock, task::JoinSet};
+
+// XMLRPC multicall has no page/cursor contract in this compatibility layer.
+// Bound the legacy all-torrent projection instead of allowing a client to
+// force an unbounded response and serial per-torrent actor queries.
+const MAX_LEGACY_FULL_LIST_ENTRIES: usize = 10_000;
+const RTORRENT_RUNTIME_PROJECTION_CONCURRENCY: usize = 64;
 
 #[derive(Clone)]
 pub struct AppState {
     pub registry: Arc<RwLock<SessionRegistry>>,
     pub engine: Option<EngineHandle>,
+    /// Optional library-boundary credentials. `execute_xml` remains useful
+    /// for explicit local-development states with no configured tokens, but a
+    /// configured state cannot be driven through the unauthenticated helper.
+    pub api_tokens: Arc<Vec<String>>,
     pub session_path: String,
     pub network_port: i64,
     global_down_limit: Arc<RwLock<i64>>,
@@ -32,6 +42,7 @@ impl AppState {
         Self {
             registry,
             engine: None,
+            api_tokens: Arc::new(Vec::new()),
             session_path: String::new(),
             network_port: 0,
             global_down_limit: Arc::new(RwLock::new(0)),
@@ -40,6 +51,11 @@ impl AppState {
             custom: Arc::new(RwLock::new(BTreeMap::new())),
             views: Arc::new(RwLock::new(default_rtorrent_views())),
         }
+    }
+
+    pub fn with_tokens(mut self, api_tokens: Vec<String>) -> Self {
+        self.api_tokens = Arc::new(api_tokens);
+        self
     }
 
     pub fn with_engine(registry: Arc<RwLock<SessionRegistry>>, engine: EngineHandle) -> Self {
@@ -144,11 +160,7 @@ pub fn supported_methods() -> &'static [&'static str] {
     ]
 }
 
-pub async fn execute(
-    state: &AppState,
-    method: &str,
-    params: &[RtValue],
-) -> Result<RtValue, String> {
+async fn execute(state: &AppState, method: &str, params: &[RtValue]) -> Result<RtValue, String> {
     match method {
         "method.list" => Ok(RtValue::Array(
             supported_methods()
@@ -163,8 +175,8 @@ pub async fn execute(
         "session.path" => Ok(RtValue::String(state.session_path.clone())),
         "network.port_open" => Ok(RtValue::Int(state.network_port)),
         "network.port_random" => Ok(RtValue::Bool(false)),
-        "throttle.global_down.max_rate" => Ok(RtValue::Int(global_down_limit(state).await)),
-        "throttle.global_up.max_rate" => Ok(RtValue::Int(global_up_limit(state).await)),
+        "throttle.global_down.max_rate" => global_down_limit(state).await.map(RtValue::Int),
+        "throttle.global_up.max_rate" => global_up_limit(state).await.map(RtValue::Int),
         "throttle.global_down.max_rate.set" => set_global_limit(state, params, true).await,
         "throttle.global_up.max_rate.set" => set_global_limit(state, params, false).await,
         "view.list" => Ok(RtValue::Array(rtorrent_views(state).await)),
@@ -187,6 +199,23 @@ pub async fn execute(
 }
 
 pub async fn execute_xml(state: &AppState, request: &str) -> String {
+    execute_xml_with_token(state, request, None).await
+}
+
+/// Execute an XML-RPC request with an explicit library-boundary credential.
+/// The daemon does not mount this facade; callers that embed it directly must
+/// use this entry point when `AppState::with_tokens` is configured.
+pub async fn execute_xml_with_token(
+    state: &AppState,
+    request: &str,
+    presented_token: Option<&str>,
+) -> String {
+    if !state.api_tokens.is_empty()
+        && !presented_token
+            .is_some_and(|token| state.api_tokens.iter().any(|allowed| allowed == token))
+    {
+        return fault_response(401, "unauthorized");
+    }
     match parse_method_call(request) {
         Ok((method, params)) => match execute(state, &method, &params).await {
             Ok(value) => method_response(&value),
@@ -205,36 +234,49 @@ async fn d_read_or_write(
         .first()
         .and_then(RtValue::as_str)
         .ok_or_else(|| format!("{method} requires info hash"))?;
+    let hash_key = canonical_hash_key(hash);
     if method == "d.custom.set" {
-        let key = params.get(1).and_then(RtValue::as_str).unwrap_or_default();
+        let key = params
+            .get(1)
+            .and_then(RtValue::as_str)
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .ok_or_else(|| "d.custom.set requires a non-empty field name".to_owned())?;
         let value = params
             .get(2)
             .cloned()
-            .unwrap_or(RtValue::String(String::new()));
+            .ok_or_else(|| "d.custom.set requires a value".to_owned())?;
+        if state.registry.read().await.get(hash).is_none() {
+            return Err(format!("torrent not found: {hash}"));
+        }
         state
             .custom
             .write()
             .await
-            .entry(hash.to_owned())
+            .entry(hash_key.clone())
             .or_default()
             .insert(key.to_owned(), value);
         return Ok(RtValue::Int(0));
     }
     if method == "d.down.max_rate.set" || method == "d.up.max_rate.set" {
-        let value = params.get(1).and_then(rt_value_i64).unwrap_or(0).max(0);
+        let value = params
+            .get(1)
+            .and_then(rt_value_i64)
+            .ok_or_else(|| format!("{method} requires a numeric rate"))?
+            .max(0);
         set_torrent_limit(state, hash, method == "d.down.max_rate.set", value).await?;
         return Ok(RtValue::Int(0));
     }
-    let limits = torrent_limits(state, hash).await;
+    let limits = torrent_limits(state, hash).await?;
     let registry = state.registry.read().await;
     let entry = registry
         .get(hash)
         .ok_or_else(|| format!("torrent not found: {hash}"))?;
     Ok(project_download_field(
-        entry,
+        &entry,
         method,
         limits.as_ref(),
-        state.custom.read().await.get(hash),
+        state.custom.read().await.get(&hash_key),
         params.get(1).and_then(RtValue::as_str),
     ))
 }
@@ -250,10 +292,10 @@ fn project_download_field(
         "d.hash" => RtValue::String(entry.info_hash.clone()),
         "d.name" => RtValue::String(entry.name.clone()),
         "d.base_path" | "d.directory" => RtValue::String(entry.save_path.clone()),
-        "d.size_bytes" => RtValue::Int(entry.total_length as i64),
-        "d.left_bytes" => RtValue::Int(entry.amount_left as i64),
+        "d.size_bytes" => RtValue::Int(rt_i64(entry.total_length)),
+        "d.left_bytes" => RtValue::Int(rt_i64(entry.amount_left)),
         "d.completed_bytes" => {
-            RtValue::Int(entry.total_length.saturating_sub(entry.amount_left) as i64)
+            RtValue::Int(rt_i64(entry.total_length.saturating_sub(entry.amount_left)))
         }
         "d.complete" => RtValue::Bool(entry.total_length > 0 && entry.amount_left == 0),
         "d.is_active" => RtValue::Bool(matches!(
@@ -261,14 +303,14 @@ fn project_download_field(
             "downloading" | "seeding" | "checking"
         )),
         "d.state" => RtValue::String(entry.state.as_str().to_owned()),
-        "d.state_changed" => RtValue::Int(entry.added_at as i64),
-        "d.up.total" => RtValue::Int(entry.stats.uploaded as i64),
-        "d.down.total" => RtValue::Int(entry.stats.downloaded as i64),
+        "d.state_changed" => RtValue::Int(rt_i64(entry.added_at)),
+        "d.up.total" => RtValue::Int(rt_i64(entry.stats.uploaded)),
+        "d.down.total" => RtValue::Int(rt_i64(entry.stats.downloaded)),
         "d.down.max_rate" => {
             RtValue::Int(limits.and_then(|limits| limits.download_limit).unwrap_or(0))
         }
         "d.up.max_rate" => RtValue::Int(limits.and_then(|limits| limits.upload_limit).unwrap_or(0)),
-        "d.ratio" => RtValue::Int((entry.stats.ratio() * 1000.0).round() as i64),
+        "d.ratio" => RtValue::Int(rt_ratio_milli(entry.stats.uploaded, entry.stats.downloaded)),
         "d.custom" => custom
             .and_then(|values| custom_key.and_then(|key| values.get(key)))
             .cloned()
@@ -278,30 +320,55 @@ fn project_download_field(
 }
 
 async fn d_multicall(state: &AppState, params: &[RtValue]) -> Result<RtValue, String> {
-    let commands = params
-        .iter()
-        .skip(1)
-        .filter_map(RtValue::as_str)
-        .map(|command| command.trim_end_matches('=').to_owned())
-        .collect::<Vec<_>>();
-    let torrent_count = state.registry.read().await.len();
+    let view = params
+        .first()
+        .and_then(RtValue::as_str)
+        .map(str::trim)
+        .filter(|view| !view.is_empty())
+        .ok_or_else(|| "d.multicall requires a non-empty view".to_owned())?;
+    let commands = d_multicall_commands(params)?;
+    let snapshot = {
+        let registry = state.registry.read().await;
+        registry
+            .snapshot()
+            .iter()
+            .filter(|entry| rtorrent_view_matches(entry, view))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    if snapshot.len() > MAX_LEGACY_FULL_LIST_ENTRIES {
+        return Err(format!(
+            "rTorrent d.multicall full-list response has {} torrents; maximum is {MAX_LEGACY_FULL_LIST_ENTRIES}; use the native paged API",
+            snapshot.len()
+        ));
+    }
     let _lease = reserve_rtorrent_api_snapshot(
         state,
-        estimate_rtorrent_multicall_snapshot_bytes(torrent_count, commands.len()),
+        estimate_rtorrent_multicall_snapshot_bytes(snapshot.len(), commands.len()),
     )
     .await?;
-    let registry = state.registry.read().await;
-    let custom = state.custom.read().await;
+    let custom = state.custom.read().await.clone();
     let local_limits = state.torrent_limits.read().await.clone();
-    let mut rows = Vec::new();
-    for entry in registry.iter() {
-        let engine_limits = if let Some(engine) = &state.engine {
-            engine.torrent_limits(entry.info_hash.clone()).await.ok()
+    let need_limits = commands.iter().any(|command| {
+        matches!(
+            command.as_str(),
+            "d.down.max_rate" | "d.up.max_rate" | "d.down.max_rate.set" | "d.up.max_rate.set"
+        )
+    });
+    let engine_limits = if need_limits {
+        if let Some(engine) = &state.engine {
+            Some(load_rtorrent_limit_projections(engine.clone(), &snapshot).await?)
         } else {
             None
-        };
+        }
+    } else {
+        None
+    };
+    let mut rows = Vec::with_capacity(snapshot.len());
+    for entry in snapshot.iter() {
         let limits = engine_limits
             .as_ref()
+            .and_then(|limits| limits.get(&entry.info_hash))
             .or_else(|| local_limits.get(&entry.info_hash));
         let row = commands
             .iter()
@@ -314,12 +381,39 @@ async fn d_multicall(state: &AppState, params: &[RtValue]) -> Result<RtValue, St
     Ok(RtValue::Array(rows))
 }
 
+async fn load_rtorrent_limit_projections(
+    engine: EngineHandle,
+    entries: &[TorrentEntry],
+) -> Result<BTreeMap<String, EngineTorrentLimits>, String> {
+    let mut limits = BTreeMap::new();
+    for batch in entries.chunks(RTORRENT_RUNTIME_PROJECTION_CONCURRENCY) {
+        let mut tasks = JoinSet::new();
+        for entry in batch {
+            let hash = entry.info_hash.clone();
+            let engine = engine.clone();
+            tasks.spawn(async move {
+                let limits = engine
+                    .torrent_limits(hash.clone())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok::<_, String>((hash, limits))
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            let (hash, projection) = result
+                .map_err(|error| format!("rTorrent runtime projection task failed: {error}"))??;
+            limits.insert(hash, projection);
+        }
+    }
+    Ok(limits)
+}
+
 async fn file_multicall(state: &AppState, params: &[RtValue]) -> Result<RtValue, String> {
-    let commands = multicall_commands(params);
+    let commands = multicall_commands(params)?;
     let Some(entry) = selected_torrent_entry(state, params).await else {
         return Ok(RtValue::Array(Vec::new()));
     };
-    let meta = torrent_metadata_snapshot(state, &entry.info_hash).await;
+    let meta = torrent_metadata_snapshot(state, &entry.info_hash).await?;
     let rows = if let Some(meta) = meta.as_ref() {
         meta.files
             .iter()
@@ -344,28 +438,30 @@ async fn file_multicall(state: &AppState, params: &[RtValue]) -> Result<RtValue,
 }
 
 async fn tracker_multicall(state: &AppState, params: &[RtValue]) -> Result<RtValue, String> {
-    let commands = multicall_commands(params);
+    let commands = multicall_commands(params)?;
     let Some(entry) = selected_torrent_entry(state, params).await else {
         return Ok(RtValue::Array(Vec::new()));
     };
     if let Some(engine) = &state.engine {
-        if let Ok(trackers) = engine.torrent_trackers(entry.info_hash.clone()).await {
-            return Ok(RtValue::Array(
-                trackers
-                    .iter()
-                    .map(|tracker| {
-                        RtValue::Array(
-                            commands
-                                .iter()
-                                .map(|command| project_tracker_snapshot_field(tracker, command))
-                                .collect(),
-                        )
-                    })
-                    .collect(),
-            ));
-        }
+        let trackers = engine
+            .torrent_trackers(entry.info_hash.clone())
+            .await
+            .map_err(|error| error.to_string())?;
+        return Ok(RtValue::Array(
+            trackers
+                .iter()
+                .map(|tracker| {
+                    RtValue::Array(
+                        commands
+                            .iter()
+                            .map(|command| project_tracker_snapshot_field(tracker, command))
+                            .collect(),
+                    )
+                })
+                .collect(),
+        ));
     }
-    let Some(meta) = torrent_metadata_snapshot(state, &entry.info_hash).await else {
+    let Some(meta) = torrent_metadata_snapshot(state, &entry.info_hash).await? else {
         return Ok(RtValue::Array(Vec::new()));
     };
     Ok(RtValue::Array(
@@ -385,7 +481,7 @@ async fn tracker_multicall(state: &AppState, params: &[RtValue]) -> Result<RtVal
 }
 
 async fn peer_multicall(state: &AppState, params: &[RtValue]) -> Result<RtValue, String> {
-    let commands = multicall_commands(params);
+    let commands = multicall_commands(params)?;
     let Some(entry) = selected_torrent_entry(state, params).await else {
         return Ok(RtValue::Array(Vec::new()));
     };
@@ -395,7 +491,7 @@ async fn peer_multicall(state: &AppState, params: &[RtValue]) -> Result<RtValue,
     let peers = engine
         .torrent_peers(entry.info_hash)
         .await
-        .unwrap_or_default()
+        .map_err(|error| error.to_string())?
         .into_iter()
         .map(|peer| {
             RtValue::Array(
@@ -411,47 +507,63 @@ async fn peer_multicall(state: &AppState, params: &[RtValue]) -> Result<RtValue,
 
 async fn selected_torrent_entry(state: &AppState, params: &[RtValue]) -> Option<TorrentEntry> {
     let registry = state.registry.read().await;
+    let snapshot = registry.snapshot();
     params
         .iter()
         .filter_map(RtValue::as_str)
-        .find_map(|value| registry.get(value).cloned())
-        .or_else(|| registry.iter().next().cloned())
+        .find_map(|value| snapshot.find(value).cloned())
+        .or_else(|| snapshot.get(0).cloned())
 }
 
-async fn torrent_metadata_snapshot(state: &AppState, hash: &str) -> Option<EngineTorrentMetadata> {
-    let engine = state.engine.as_ref()?;
-    engine.torrent_metadata(hash.to_owned()).await.ok()
+async fn torrent_metadata_snapshot(
+    state: &AppState,
+    hash: &str,
+) -> Result<Option<EngineTorrentMetadata>, String> {
+    let Some(engine) = state.engine.as_ref() else {
+        return Ok(None);
+    };
+    engine
+        .torrent_metadata(hash.to_owned())
+        .await
+        .map(Some)
+        .map_err(|error| error.to_string())
 }
 
-async fn global_down_limit(state: &AppState) -> i64 {
+async fn global_down_limit(state: &AppState) -> Result<i64, String> {
     if let Some(engine) = &state.engine {
         return engine
             .global_limits()
             .await
             .map(|limits| limits.download_limit)
-            .unwrap_or(0);
+            .map_err(|error| error.to_string());
     }
-    *state.global_down_limit.read().await
+    Ok(*state.global_down_limit.read().await)
 }
 
-async fn global_up_limit(state: &AppState) -> i64 {
+async fn global_up_limit(state: &AppState) -> Result<i64, String> {
     if let Some(engine) = &state.engine {
         return engine
             .global_limits()
             .await
             .map(|limits| limits.upload_limit)
-            .unwrap_or(0);
+            .map_err(|error| error.to_string());
     }
-    *state.global_up_limit.read().await
+    Ok(*state.global_up_limit.read().await)
 }
 
-async fn torrent_limits(state: &AppState, hash: &str) -> Option<EngineTorrentLimits> {
+async fn torrent_limits(
+    state: &AppState,
+    hash: &str,
+) -> Result<Option<EngineTorrentLimits>, String> {
     if let Some(engine) = &state.engine {
-        if let Ok(limits) = engine.torrent_limits(hash.to_owned()).await {
-            return Some(limits);
-        }
+        return engine
+            .torrent_limits(hash.to_owned())
+            .await
+            .map(Some)
+            .map_err(|error| error.to_string());
     }
-    state.torrent_limits.read().await.get(hash).cloned()
+    let hash = canonical_hash_key(hash);
+    Ok(state.torrent_limits.read().await.get(&hash).cloned())
 }
 
 async fn set_torrent_limit(
@@ -460,22 +572,22 @@ async fn set_torrent_limit(
     download: bool,
     value: i64,
 ) -> Result<(), String> {
-    let mut limits = torrent_limits(state, hash).await.unwrap_or_default();
+    if state.engine.is_none() && state.registry.read().await.get(hash).is_none() {
+        return Err(format!("torrent not found: {hash}"));
+    }
+    let mut limits = torrent_limits(state, hash).await?.unwrap_or_default();
     if download {
         limits.download_limit = (value > 0).then_some(value);
     } else {
         limits.upload_limit = (value > 0).then_some(value);
     }
-    state
-        .torrent_limits
-        .write()
-        .await
-        .insert(hash.to_owned(), limits.clone());
     if let Some(engine) = &state.engine {
         engine
-            .update_torrent_limits(hash.to_owned(), limits)
+            .update_torrent_limits(hash.to_owned(), limits.clone())
             .await?;
     }
+    let hash = canonical_hash_key(hash);
+    state.torrent_limits.write().await.insert(hash, limits);
     Ok(())
 }
 
@@ -484,10 +596,17 @@ async fn set_global_limit(
     params: &[RtValue],
     download: bool,
 ) -> Result<RtValue, String> {
-    let value = params.first().and_then(rt_value_i64).unwrap_or(0).max(0);
+    let value = params
+        .first()
+        .and_then(rt_value_i64)
+        .ok_or_else(|| "global throttle setter requires a numeric rate".to_owned())?
+        .max(0);
 
     if let Some(engine) = &state.engine {
-        let mut limits = engine.global_limits().await.unwrap_or_default();
+        let mut limits = engine
+            .global_limits()
+            .await
+            .map_err(|error| error.to_string())?;
         if download {
             limits.download_limit = value;
         } else {
@@ -566,7 +685,9 @@ async fn view_size(state: &AppState, params: &[RtValue]) -> i64 {
     registry
         .iter()
         .filter(|entry| rtorrent_view_matches(entry, view))
-        .count() as i64
+        .count()
+        .try_into()
+        .unwrap_or(i64::MAX)
 }
 
 fn rtorrent_view_matches(entry: &TorrentEntry, view: &str) -> bool {
@@ -583,26 +704,67 @@ fn rtorrent_view_matches(entry: &TorrentEntry, view: &str) -> bool {
     }
 }
 
-fn multicall_commands(params: &[RtValue]) -> Vec<String> {
-    let commands = params
-        .iter()
-        .filter_map(RtValue::as_str)
-        .filter(|value| value.ends_with('='))
-        .map(|command| command.trim_end_matches('=').to_owned())
-        .collect::<Vec<_>>();
+fn d_multicall_commands(params: &[RtValue]) -> Result<Vec<String>, String> {
+    if params.len() < 2 {
+        return Err("d.multicall requires a view and at least one command".to_owned());
+    }
+    let mut commands = Vec::with_capacity(params.len() - 1);
+    for (index, value) in params.iter().enumerate().skip(1) {
+        let command = value
+            .as_str()
+            .ok_or_else(|| format!("d.multicall command {index} must be a string"))?;
+        let command = command
+            .strip_suffix('=')
+            .ok_or_else(|| format!("d.multicall command {index} must end with '='"))?
+            .trim();
+        if command.is_empty() || command.contains('=') {
+            return Err(format!("d.multicall command {index} is invalid"));
+        }
+        commands.push(command.to_owned());
+    }
+    Ok(commands)
+}
+
+fn multicall_commands(params: &[RtValue]) -> Result<Vec<String>, String> {
+    let mut commands = Vec::new();
+    let mut command_section = false;
+    for (index, value) in params.iter().enumerate() {
+        let Some(value) = value.as_str() else {
+            if command_section {
+                return Err(format!("multicall command {index} must be a string"));
+            }
+            continue;
+        };
+        if value.is_empty() {
+            if command_section {
+                commands.push(String::new());
+            }
+            continue;
+        }
+        if let Some(command) = value.strip_suffix('=') {
+            let command = command.trim();
+            if command.is_empty() || command.contains('=') {
+                return Err(format!("multicall command {index} is invalid"));
+            }
+            command_section = true;
+            commands.push(command.to_owned());
+        } else if command_section {
+            return Err(format!("multicall command {index} must end with '='"));
+        }
+    }
     if commands.is_empty() {
-        vec!["".to_owned()]
+        Ok(vec!["".to_owned()])
     } else {
-        commands
+        Ok(commands)
     }
 }
 
 fn project_registry_file_field(entry: &TorrentEntry, command: &str) -> RtValue {
     match command {
         "" | "f.path" | "f.frozen_path" => RtValue::String(entry.name.clone()),
-        "f.size_bytes" => RtValue::Int(entry.total_length as i64),
+        "f.size_bytes" => RtValue::Int(rt_i64(entry.total_length)),
         "f.completed_bytes" => {
-            RtValue::Int(entry.total_length.saturating_sub(entry.amount_left) as i64)
+            RtValue::Int(rt_i64(entry.total_length.saturating_sub(entry.amount_left)))
         }
         "f.priority" => RtValue::Int(1),
         "f.is_created" | "f.is_open" => RtValue::Bool(true),
@@ -619,20 +781,20 @@ fn project_file_field(
 ) -> RtValue {
     match command {
         "" | "f.path" | "f.frozen_path" => RtValue::String(file.path.clone()),
-        "f.size_bytes" => RtValue::Int(file.length as i64),
+        "f.size_bytes" => RtValue::Int(rt_i64(file.length)),
         "f.priority" => RtValue::Int(file.priority),
         "f.is_created" | "f.is_open" => RtValue::Bool(true),
         "f.is_complete" => RtValue::Bool(file_is_complete(file, meta)),
         "f.completed_bytes" => {
             if file_is_complete(file, meta) {
-                RtValue::Int(file.length as i64)
+                RtValue::Int(rt_i64(file.length))
             } else {
                 RtValue::Int(0)
             }
         }
-        "f.offset" => RtValue::Int(file_start_offset(file, meta) as i64),
-        "f.range_first" => RtValue::Int(file_first_piece(file, meta) as i64),
-        "f.range_second" => RtValue::Int(file_last_piece(file, meta) as i64),
+        "f.offset" => RtValue::Int(rt_i64(file_start_offset(file, meta))),
+        "f.range_first" => RtValue::Int(rt_usize_i64(file_first_piece(file, meta))),
+        "f.range_second" => RtValue::Int(rt_usize_i64(file_last_piece(file, meta))),
         _ => RtValue::Nil,
     }
 }
@@ -642,21 +804,27 @@ fn file_start_offset(file: &EngineTorrentFile, meta: &EngineTorrentMetadata) -> 
         .iter()
         .filter(|candidate| candidate.index < file.index)
         .map(|candidate| candidate.length)
-        .sum()
+        .fold(0, u64::saturating_add)
 }
 
 fn file_first_piece(file: &EngineTorrentFile, meta: &EngineTorrentMetadata) -> usize {
     if meta.piece_length == 0 {
         return 0;
     }
-    (file_start_offset(file, meta) / meta.piece_length) as usize
+    usize::try_from(file_start_offset(file, meta) / meta.piece_length).unwrap_or(usize::MAX)
 }
 
 fn file_last_piece(file: &EngineTorrentFile, meta: &EngineTorrentMetadata) -> usize {
     if meta.piece_length == 0 || file.length == 0 {
         return file_first_piece(file, meta);
     }
-    ((file_start_offset(file, meta) + file.length - 1) / meta.piece_length) as usize
+    usize::try_from(
+        file_start_offset(file, meta)
+            .saturating_add(file.length)
+            .saturating_sub(1)
+            / meta.piece_length,
+    )
+    .unwrap_or(usize::MAX)
 }
 
 fn file_is_complete(file: &EngineTorrentFile, meta: &EngineTorrentMetadata) -> bool {
@@ -677,7 +845,7 @@ fn project_tracker_field(idx: usize, tracker: &str, command: &str) -> RtValue {
     match command {
         "" | "t.url" | "t.group" => RtValue::String(tracker.to_owned()),
         "t.is_enabled" | "t.is_open" => RtValue::Bool(true),
-        "t.type" | "t.id" => RtValue::Int(idx as i64),
+        "t.type" | "t.id" => RtValue::Int(rt_usize_i64(idx)),
         "t.latest_event"
         | "t.latest_sum_peers"
         | "t.scrape_complete"
@@ -709,12 +877,12 @@ fn project_tracker_snapshot_field(tracker: &EngineTrackerSnapshot, command: &str
 fn project_peer_field(peer: &EnginePeerSnapshot, command: &str) -> RtValue {
     match command {
         "" | "p.address" => RtValue::String(peer.addr.ip().to_string()),
-        "p.port" => RtValue::Int(peer.addr.port() as i64),
+        "p.port" => RtValue::Int(i64::from(peer.addr.port())),
         "p.client_version" => RtValue::String(peer.client.clone()),
-        "p.completed_percent" => RtValue::Int((peer.progress * 100.0).round() as i64),
+        "p.completed_percent" => RtValue::Int(rt_percent(peer.progress)),
         "p.down_rate" | "p.down_rate_total" => RtValue::Int(peer.download_rate),
         "p.up_rate" | "p.up_rate_total" => RtValue::Int(peer.upload_rate),
-        "p.completed_chunks" => RtValue::Int(peer.pieces as i64),
+        "p.completed_chunks" => RtValue::Int(rt_usize_i64(peer.pieces)),
         "p.is_encrypted" | "p.is_incoming" => RtValue::Bool(false),
         "p.is_interested" => RtValue::Bool(peer.interested),
         "p.is_choked" => RtValue::Bool(peer.choked),
@@ -727,19 +895,48 @@ async fn load(state: &AppState, method: &str, params: &[RtValue]) -> Result<RtVa
         .first()
         .and_then(RtValue::as_str)
         .ok_or_else(|| "load requires magnet URI, torrent bytes, or path".to_owned())?;
-    let mut entry = if payload.starts_with("magnet:") {
+    let start = method.ends_with("start");
+    if payload.starts_with("magnet:") {
         let magnet = parse_magnet(payload).map_err(|err| err.to_string())?;
+        if let Some(engine) = &state.engine {
+            engine
+                .add_magnet_with_labels(magnet, None, !start, None, Vec::new())
+                .await?;
+            return Ok(RtValue::Int(0));
+        }
         let hash = magnet
             .info_hash_v1
             .map(hex_lower)
             .or_else(|| magnet.info_hash_v2.map(hex_lower))
             .ok_or_else(|| "magnet missing supported info hash".to_owned())?;
-        TorrentEntry::new(
+        let mut entry = TorrentEntry::new(
             hash,
             magnet.display_name.unwrap_or_else(|| "magnet".to_owned()),
             String::new(),
-        )
-    } else if let Some(bytes) = load_torrent_bytes(method, payload) {
+        );
+        if start {
+            entry
+                .transition(rt_session::TorrentState::Downloading)
+                .map_err(|err| err.to_string())?;
+        }
+        state
+            .registry
+            .write()
+            .await
+            .add(entry)
+            .map_err(|err| err.to_string())?;
+        return Ok(RtValue::Int(0));
+    }
+
+    let bytes = load_torrent_bytes(method, payload)?;
+    if let Some(engine) = &state.engine {
+        engine
+            .add_torrent_raw_with_labels(bytes, None, !start, None, Vec::new())
+            .await?;
+        return Ok(RtValue::Int(0));
+    }
+
+    let mut entry = {
         let parsed = parse_torrent(&bytes).map_err(|err| err.to_string())?;
         let hash = parsed
             .v1_info_hash()
@@ -747,21 +944,30 @@ async fn load(state: &AppState, method: &str, params: &[RtValue]) -> Result<RtVa
             .or_else(|| parsed.v2_info_hash().map(hex_lower))
             .ok_or_else(|| "torrent missing supported info hash".to_owned())?;
         TorrentEntry::new(hash, parsed.name().to_owned(), String::new())
-    } else {
-        return Ok(RtValue::Int(0));
     };
-    if method.ends_with("start") {
-        let _ = entry.transition(rt_session::TorrentState::Downloading);
+    if start {
+        entry
+            .transition(rt_session::TorrentState::Downloading)
+            .map_err(|err| err.to_string())?;
     }
-    let _ = state.registry.write().await.add(entry);
+    state
+        .registry
+        .write()
+        .await
+        .add(entry)
+        .map_err(|err| err.to_string())?;
     Ok(RtValue::Int(0))
 }
 
-fn load_torrent_bytes(method: &str, payload: &str) -> Option<Vec<u8>> {
-    if method.contains(".raw") {
-        return general_purpose::STANDARD.decode(payload).ok();
+fn load_torrent_bytes(method: &str, payload: &str) -> Result<Vec<u8>, String> {
+    if !method.contains(".raw") {
+        return Err(
+            "path-based rTorrent loads are unsupported at this library boundary; use load.raw or load.raw_start with embedded metainfo".to_owned(),
+        );
     }
-    std::fs::read(payload).ok()
+    general_purpose::STANDARD
+        .decode(payload)
+        .map_err(|err| format!("invalid base64 torrent payload: {err}"))
 }
 
 enum Lifecycle {
@@ -782,18 +988,53 @@ async fn lifecycle(
     if let Some(engine) = &state.engine {
         match lifecycle {
             Lifecycle::Erase => {
-                let _ = engine.remove_torrent(hash.to_owned(), false).await;
+                engine.remove_torrent(hash.to_owned(), false).await?;
             }
             Lifecycle::Pause => {
-                let _ = engine.pause_torrent(hash.to_owned()).await;
+                engine.pause_torrent(hash.to_owned()).await?;
             }
             Lifecycle::Resume => {
-                let _ = engine.resume_torrent(hash.to_owned()).await;
+                engine.resume_torrent(hash.to_owned()).await?;
             }
         }
+        if matches!(lifecycle, Lifecycle::Erase) {
+            state.custom.write().await.remove(&canonical_hash_key(hash));
+            state
+                .torrent_limits
+                .write()
+                .await
+                .remove(&canonical_hash_key(hash));
+        }
+        return Ok(RtValue::Int(0));
     }
-    if matches!(lifecycle, Lifecycle::Erase) {
-        let _ = state.registry.write().await.remove(hash);
+
+    let mut registry = state.registry.write().await;
+    match lifecycle {
+        Lifecycle::Erase => {
+            registry.remove(hash).map_err(|err| err.to_string())?;
+            state.custom.write().await.remove(&canonical_hash_key(hash));
+            state
+                .torrent_limits
+                .write()
+                .await
+                .remove(&canonical_hash_key(hash));
+        }
+        Lifecycle::Pause => {
+            let mut entry = registry
+                .get_mut(hash)
+                .ok_or_else(|| format!("torrent {hash} not found"))?;
+            entry
+                .transition(rt_session::TorrentState::Paused)
+                .map_err(|err| err.to_string())?;
+        }
+        Lifecycle::Resume => {
+            let mut entry = registry
+                .get_mut(hash)
+                .ok_or_else(|| format!("torrent {hash} not found"))?;
+            entry
+                .transition(rt_session::TorrentState::Downloading)
+                .map_err(|err| err.to_string())?;
+        }
     }
     Ok(RtValue::Int(0))
 }
@@ -810,17 +1051,57 @@ async fn tracker_announce(state: &AppState, params: &[RtValue]) -> Result<RtValu
         .first()
         .and_then(RtValue::as_str)
         .ok_or_else(|| "d.tracker_announce requires info hash".to_owned())?;
-    if let Some(engine) = &state.engine {
-        let _ = engine.reannounce_torrent(hash.to_owned()).await;
-    }
+    let Some(engine) = &state.engine else {
+        return Err("rTorrent tracker announce requires a live engine".to_owned());
+    };
+    engine.reannounce_torrent(hash.to_owned()).await?;
     Ok(RtValue::Int(0))
 }
 
 fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
+    rt_i64(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    )
+}
+
+fn rt_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn rt_usize_i64(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn rt_ratio_milli(uploaded: u64, downloaded: u64) -> i64 {
+    if downloaded == 0 {
+        return 0;
+    }
+    let value = (uploaded as f64 / downloaded as f64) * 1000.0;
+    if !value.is_finite() || value >= i64::MAX as f64 {
+        i64::MAX
+    } else if value <= i64::MIN as f64 {
+        i64::MIN
+    } else {
+        value.round() as i64
+    }
+}
+
+fn rt_percent(progress: f64) -> i64 {
+    if !progress.is_finite() {
+        return 0;
+    }
+    (progress * 100.0).round().clamp(0.0, 100.0) as i64
+}
+
+fn canonical_hash_key(hash: &str) -> String {
+    if matches!(hash.len(), 40 | 64) && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        hash.to_ascii_lowercase()
+    } else {
+        hash.to_owned()
+    }
 }
 
 fn hex_lower<const N: usize>(bytes: [u8; N]) -> String {
@@ -835,7 +1116,7 @@ fn parse_method_call(xml: &str) -> Result<(String, Vec<RtValue>), String> {
     while let Some(start) = rest.find("<param>") {
         rest = &rest[start + "<param>".len()..];
         let Some(end) = rest.find("</param>") else {
-            break;
+            return Err("XMLRPC request contains an unterminated param".to_owned());
         };
         params.push(parse_value(&rest[..end]));
         rest = &rest[end + "</param>".len()..];
@@ -862,7 +1143,11 @@ fn parse_value(xml: &str) -> RtValue {
         return RtValue::String(value.trim().to_owned());
     }
     if let Some(value) = between(xml, "<i4>", "</i4>").or_else(|| between(xml, "<int>", "</int>")) {
-        return RtValue::Int(value.trim().parse().unwrap_or_default());
+        return value
+            .trim()
+            .parse()
+            .map(RtValue::Int)
+            .unwrap_or_else(|_| RtValue::String(xml_unescape(value.trim())));
     }
     if let Some(value) = between(xml, "<boolean>", "</boolean>") {
         return RtValue::Bool(value.trim() == "1" || value.trim().eq_ignore_ascii_case("true"));
@@ -1075,6 +1360,77 @@ mod tests {
         );
     }
 
+    #[test]
+    fn xml_projection_saturates_unrepresentable_unsigned_values() {
+        let mut entry = TorrentEntry::new("a".repeat(40), "large".into(), "/data".into());
+        entry.total_length = u64::MAX;
+        entry.amount_left = u64::MAX;
+        entry.added_at = u64::MAX;
+        entry.stats.uploaded = u64::MAX;
+        entry.stats.downloaded = 1;
+
+        assert_eq!(
+            project_download_field(&entry, "d.size_bytes", None, None, None),
+            RtValue::Int(i64::MAX)
+        );
+        assert_eq!(
+            project_download_field(&entry, "d.state_changed", None, None, None),
+            RtValue::Int(i64::MAX)
+        );
+        assert_eq!(
+            project_download_field(&entry, "d.ratio", None, None, None),
+            RtValue::Int(i64::MAX)
+        );
+
+        let meta = EngineTorrentMetadata {
+            piece_length: 1,
+            piece_count: 1,
+            piece_hashes: Vec::new(),
+            piece_states: Vec::new(),
+            is_private: false,
+            trackers: Vec::new(),
+            webseeds: Vec::new(),
+            comment: None,
+            created_by: None,
+            creation_date: None,
+            files: Vec::new(),
+        };
+        let file = EngineTorrentFile {
+            index: 0,
+            path: "large.bin".to_owned(),
+            length: u64::MAX,
+            priority: 1,
+            wanted: true,
+        };
+        assert_eq!(
+            project_file_field(&file, "f.size_bytes", &meta),
+            RtValue::Int(i64::MAX)
+        );
+
+        let peer = EnginePeerSnapshot {
+            addr: "127.0.0.1:6881".parse().unwrap(),
+            client: "test".to_owned(),
+            choked: false,
+            upload_choked: false,
+            interested: false,
+            pieces: usize::MAX,
+            pieces_total: usize::MAX,
+            progress: f64::NAN,
+            download_rate: 0,
+            upload_rate: 0,
+            downloaded: u64::MAX,
+            uploaded: u64::MAX,
+        };
+        assert_eq!(
+            project_peer_field(&peer, "p.completed_chunks"),
+            RtValue::Int(i64::MAX)
+        );
+        assert_eq!(
+            project_peer_field(&peer, "p.completed_percent"),
+            RtValue::Int(0)
+        );
+    }
+
     #[tokio::test]
     async fn view_size_projects_registry_backed_compat_views() {
         let state = state_with_torrent().await;
@@ -1165,6 +1521,105 @@ mod tests {
             .unwrap(),
             RtValue::String("movies".to_owned())
         );
+    }
+
+    #[tokio::test]
+    async fn torrent_local_state_is_case_insensitive_and_erased_with_torrent() {
+        let state = state_with_torrent().await;
+        let upper = RtValue::String("A".repeat(40));
+        let lower = RtValue::String("a".repeat(40));
+
+        execute(
+            &state,
+            "d.custom.set",
+            &[
+                upper.clone(),
+                RtValue::String("label".to_owned()),
+                RtValue::String("movies".to_owned()),
+            ],
+        )
+        .await
+        .unwrap();
+        execute(
+            &state,
+            "d.down.max_rate.set",
+            &[upper.clone(), RtValue::Int(333)],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            execute(
+                &state,
+                "d.custom",
+                &[lower.clone(), RtValue::String("label".to_owned())],
+            )
+            .await
+            .unwrap(),
+            RtValue::String("movies".to_owned())
+        );
+        assert_eq!(
+            execute(&state, "d.down.max_rate", std::slice::from_ref(&lower))
+                .await
+                .unwrap(),
+            RtValue::Int(333)
+        );
+
+        assert!(execute(
+            &state,
+            "d.custom.set",
+            &[
+                RtValue::String("b".repeat(40)),
+                RtValue::String("label".to_owned()),
+                RtValue::String("orphan".to_owned()),
+            ],
+        )
+        .await
+        .is_err());
+
+        execute(&state, "d.erase", std::slice::from_ref(&upper))
+            .await
+            .unwrap();
+        assert!(!state.custom.read().await.contains_key(&"a".repeat(40)));
+        assert!(!state
+            .torrent_limits
+            .read()
+            .await
+            .contains_key(&"a".repeat(40)));
+    }
+
+    #[tokio::test]
+    async fn rtorrent_mutators_reject_missing_or_malformed_values() {
+        let state = state_with_torrent().await;
+        let hash = RtValue::String("a".repeat(40));
+
+        assert!(execute(&state, "d.custom.set", std::slice::from_ref(&hash))
+            .await
+            .is_err());
+        assert!(execute(
+            &state,
+            "d.custom.set",
+            &[
+                hash.clone(),
+                RtValue::String(String::new()),
+                RtValue::Int(1)
+            ],
+        )
+        .await
+        .is_err());
+        assert!(execute(
+            &state,
+            "d.down.max_rate.set",
+            &[hash.clone(), RtValue::String("not-a-rate".to_owned())],
+        )
+        .await
+        .is_err());
+        assert!(execute(&state, "throttle.global_down.max_rate.set", &[])
+            .await
+            .is_err());
+
+        let parsed = parse_value("<value><int>not-a-number</int></value>");
+        assert_eq!(parsed, RtValue::String("not-a-number".to_owned()));
     }
 
     #[tokio::test]
@@ -1287,6 +1742,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multicall_honors_view_and_rejects_malformed_commands() {
+        let state = state_with_torrent().await;
+        let mut complete = TorrentEntry::new("b".repeat(40), "beta".into(), "/data/beta".into());
+        complete.total_length = 10;
+        complete.amount_left = 0;
+        complete.transition(TorrentState::Downloading).unwrap();
+        complete.transition(TorrentState::Seeding).unwrap();
+        state.registry.write().await.add(complete).unwrap();
+
+        let value = execute(
+            &state,
+            "d.multicall2",
+            &[
+                RtValue::String("complete".to_owned()),
+                RtValue::String("d.hash=".to_owned()),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            value,
+            RtValue::Array(vec![RtValue::Array(vec![RtValue::String("b".repeat(40))])])
+        );
+
+        let malformed = execute(
+            &state,
+            "d.multicall2",
+            &[
+                RtValue::String("main".to_owned()),
+                RtValue::String("d.hash".to_owned()),
+            ],
+        )
+        .await;
+        assert!(malformed.is_err());
+    }
+
+    #[tokio::test]
     async fn xmlrpc_fixture_roundtrips() {
         let state = state_with_torrent().await;
         let xml = format!(
@@ -1296,6 +1788,22 @@ mod tests {
         let response = execute_xml(&state, &xml).await;
         assert!(response.contains("<methodResponse>"));
         assert!(response.contains("<string>alpha</string>"));
+    }
+
+    #[tokio::test]
+    async fn configured_embedded_xmlrpc_state_rejects_missing_or_wrong_token() {
+        let state = AppState::new(Arc::new(RwLock::new(SessionRegistry::new())))
+            .with_tokens(vec!["embedded-secret".to_owned()]);
+        let request = r#"<methodCall><methodName>method.list</methodName><params/></methodCall>"#;
+
+        let unauthorized = execute_xml(&state, request).await;
+        assert!(unauthorized.contains("unauthorized"));
+
+        let wrong = execute_xml_with_token(&state, request, Some("wrong")).await;
+        assert!(wrong.contains("unauthorized"));
+
+        let authorized = execute_xml_with_token(&state, request, Some("embedded-secret")).await;
+        assert!(authorized.contains("<methodResponse>"));
     }
 
     #[tokio::test]
@@ -1526,6 +2034,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lifecycle_fallback_mutates_registry_and_rejects_missing_torrents() {
+        let state = state_with_torrent().await;
+        let hash = RtValue::String("a".repeat(40));
+
+        execute(&state, "d.pause", std::slice::from_ref(&hash))
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .registry
+                .read()
+                .await
+                .get(&"a".repeat(40))
+                .unwrap()
+                .state,
+            TorrentState::Paused
+        );
+
+        execute(&state, "d.resume", std::slice::from_ref(&hash))
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .registry
+                .read()
+                .await
+                .get(&"a".repeat(40))
+                .unwrap()
+                .state,
+            TorrentState::Downloading
+        );
+
+        let missing = execute(&state, "d.erase", &[RtValue::String("b".repeat(40))]).await;
+        assert!(missing.is_err());
+    }
+
+    #[tokio::test]
+    async fn path_load_rejects_unsupported_filesystem_boundary() {
+        let state = AppState::new(Arc::new(RwLock::new(SessionRegistry::new())));
+        let result = execute(
+            &state,
+            "load.normal",
+            &[RtValue::String("/tmp/does-not-exist.torrent".to_owned())],
+        )
+        .await;
+        assert!(result
+            .expect_err("path loads must not report a false success")
+            .contains("path-based rTorrent loads are unsupported"));
+    }
+
+    #[tokio::test]
     async fn tracker_announce_requires_info_hash() {
         // TNG-022: d.tracker_announce used to be a literal `Ok(Int(0))`
         // that never even read `params` -- an empty/missing hash was
@@ -1538,11 +2097,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tracker_announce_succeeds_without_engine() {
-        // Matches this crate's established pattern for engine-touching,
-        // registry-independent operations (no live-engine test harness
-        // exists in this crate): a valid hash with no engine attached
-        // must degrade gracefully, not panic or error.
+    async fn tracker_announce_fails_closed_without_engine() {
+        // A force-reannounce has no meaningful projection-only fallback: it
+        // must reach the engine or tell the caller that it did not happen.
         let state = AppState::new(Arc::new(RwLock::new(SessionRegistry::new())));
         let result = execute(
             &state,
@@ -1550,7 +2107,9 @@ mod tests {
             &[RtValue::String("b".repeat(40))],
         )
         .await;
-        assert_eq!(result.unwrap(), RtValue::Int(0));
+        assert!(result
+            .expect_err("announce must not report success without an engine")
+            .contains("requires a live engine"));
     }
 
     #[test]

@@ -12,6 +12,8 @@ use tokio::time::Instant;
 
 use crate::config::RtorrentConfig;
 
+const MAX_SCGI_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub enum Transport {
     Unix(String),
@@ -223,7 +225,11 @@ impl Client {
                             .with_context(|| format!("connect to SCGI socket {path}"))?;
                         stream.write_all(&packet).await?;
                         let mut buf = Vec::new();
-                        stream.read_to_end(&mut buf).await?;
+                        let mut limited = stream.take((MAX_SCGI_RESPONSE_BYTES + 1) as u64);
+                        limited.read_to_end(&mut buf).await?;
+                        if buf.len() > MAX_SCGI_RESPONSE_BYTES {
+                            bail!("SCGI response exceeds {MAX_SCGI_RESPONSE_BYTES} byte limit");
+                        }
                         Ok::<_, anyhow::Error>(buf)
                     }
                 }
@@ -233,7 +239,11 @@ impl Client {
                         .with_context(|| format!("connect to SCGI addr {addr}"))?;
                     stream.write_all(&packet).await?;
                     let mut buf = Vec::new();
-                    stream.read_to_end(&mut buf).await?;
+                    let mut limited = stream.take((MAX_SCGI_RESPONSE_BYTES + 1) as u64);
+                    limited.read_to_end(&mut buf).await?;
+                    if buf.len() > MAX_SCGI_RESPONSE_BYTES {
+                        bail!("SCGI response exceeds {MAX_SCGI_RESPONSE_BYTES} byte limit");
+                    }
                     Ok(buf)
                 }
             }
@@ -301,6 +311,13 @@ impl XmlValue {
             vec![]
         }
     }
+
+    pub fn try_into_array(self) -> Result<Vec<XmlValue>> {
+        match self {
+            XmlValue::Array(values) => Ok(values),
+            other => bail!("expected XML-RPC array, got {}", describe_xml_value(&other)),
+        }
+    }
 }
 
 impl From<&str> for XmlValue {
@@ -340,29 +357,37 @@ fn xml_to_json(value: &XmlValue) -> Value {
     }
 }
 
-fn json_to_xml(value: Value) -> XmlValue {
-    match value {
+fn json_to_xml(value: Value) -> Result<XmlValue> {
+    Ok(match value {
         Value::Null => XmlValue::Nil,
         Value::Bool(b) => XmlValue::Bool(b),
         Value::Number(n) => XmlValue::Int(
             n.as_i64()
-                .or_else(|| n.as_u64().map(|n| n as i64))
-                .unwrap_or(0),
+                .or_else(|| n.as_u64().and_then(|value| i64::try_from(value).ok()))
+                .ok_or_else(|| anyhow!("JSON-RPC number does not fit in signed 64 bits"))?,
         ),
         Value::String(s) => XmlValue::String(s),
-        Value::Array(items) => XmlValue::Array(items.into_iter().map(json_to_xml).collect()),
+        Value::Array(items) => XmlValue::Array(
+            items
+                .into_iter()
+                .map(json_to_xml)
+                .collect::<Result<Vec<_>>>()?,
+        ),
         Value::Object(map) => XmlValue::Struct(
             map.into_iter()
-                .map(|(key, value)| (key, json_to_xml(value)))
-                .collect(),
+                .map(|(key, value)| Ok((key, json_to_xml(value)?)))
+                .collect::<Result<Vec<_>>>()?,
         ),
-    }
+    })
 }
 
 fn parse_jsonrpc_response(body: &[u8]) -> Result<XmlValue> {
     let value: Value =
         serde_json::from_slice(body).context("JSON-RPC response is not valid JSON")?;
-    if let Some(error) = value.get("error") {
+    let response = value
+        .as_object()
+        .ok_or_else(|| anyhow!("JSON-RPC response is not an object"))?;
+    if let Some(error) = response.get("error").filter(|error| !error.is_null()) {
         bail!(
             "JSON-RPC error: {}",
             error
@@ -371,9 +396,11 @@ fn parse_jsonrpc_response(body: &[u8]) -> Result<XmlValue> {
                 .unwrap_or("unknown error")
         );
     }
-    Ok(json_to_xml(
-        value.get("result").cloned().unwrap_or(Value::Null),
-    ))
+    let result = response
+        .get("result")
+        .cloned()
+        .ok_or_else(|| anyhow!("JSON-RPC response has no result"))?;
+    json_to_xml(result)
 }
 
 fn is_jsonrpc_unavailable(error: &anyhow::Error) -> bool {
@@ -496,7 +523,7 @@ fn parse_multicall_response(
     expected_count: usize,
     method: &str,
 ) -> Result<Vec<Result<XmlValue, String>>> {
-    let items = response.into_array();
+    let items = response.try_into_array()?;
     if items.len() != expected_count {
         bail!(
             "system.multicall({method}) returned {} results for {} calls",
@@ -514,7 +541,10 @@ fn parse_multicall_response(
                 .and_then(|(_, v)| v.as_str().map(str::to_owned))
                 .unwrap_or_else(|| "unknown multicall fault".to_owned())),
             // Per-call success: single-element array wrapping the value.
-            XmlValue::Array(mut inner) => Ok(inner.pop().unwrap_or(XmlValue::Nil)),
+            XmlValue::Array(mut inner) if inner.len() == 1 => Ok(inner.pop().unwrap()),
+            XmlValue::Array(_) => {
+                Err("multicall success entry did not contain one value".to_owned())
+            }
             other => Ok(other),
         })
         .collect())
@@ -561,7 +591,8 @@ fn parse_value(reader: &mut Reader<&[u8]>) -> Result<XmlValue> {
     loop {
         match reader.read_event()? {
             Event::Start(e) if e.name().into_inner() == "value" => break,
-            Event::End(_) | Event::Eof => return Ok(XmlValue::Nil),
+            Event::End(_) => return Err(anyhow!("XML-RPC response missing <value>")),
+            Event::Eof => return Err(anyhow!("XML-RPC response ended before <value>")),
             _ => {}
         }
     }
@@ -579,11 +610,17 @@ fn parse_value_content(reader: &mut Reader<&[u8]>) -> Result<XmlValue> {
                     }
                     "int" | "i4" | "i8" => {
                         let text = read_text_string(reader, e.name())?;
-                        XmlValue::Int(text.trim().parse().unwrap_or(0))
+                        XmlValue::Int(text.trim().parse().with_context(|| {
+                            format!("invalid XML-RPC integer value {:?}", text.trim())
+                        })?)
                     }
                     "boolean" => {
                         let text = read_text_string(reader, e.name())?;
-                        XmlValue::Bool(text.trim() == "1")
+                        XmlValue::Bool(match text.trim() {
+                            "0" => false,
+                            "1" => true,
+                            value => bail!("invalid XML-RPC boolean value {value:?}"),
+                        })
                     }
                     "array" => parse_array(reader)?,
                     "struct" => parse_struct(reader)?,
@@ -619,7 +656,7 @@ fn parse_array(reader: &mut Reader<&[u8]>) -> Result<XmlValue> {
                 items.push(parse_value_content(reader)?);
             }
             Event::End(e) if e.name().into_inner() == "array" => break,
-            Event::Eof => break,
+            Event::Eof => return Err(anyhow!("unexpected EOF in XML-RPC array")),
             _ => {}
         }
     }
@@ -642,7 +679,7 @@ fn parse_struct(reader: &mut Reader<&[u8]>) -> Result<XmlValue> {
                 _ => {}
             },
             Event::End(e) if e.name().into_inner() == "struct" => break,
-            Event::Eof => break,
+            Event::Eof => return Err(anyhow!("unexpected EOF in XML-RPC struct")),
             _ => {}
         }
     }

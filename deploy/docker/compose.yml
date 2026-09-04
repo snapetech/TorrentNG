@@ -19,8 +19,8 @@ services:
       TORRENTNG_CONFIG: /config/config.toml
       RTORRENT_INCOMING_PORT: "50000"
       RTORRENT_SCGI_SOCKET: /run/rtorrent/rpc.sock
-      TNG_SECRET_KEY: "${TNG_SECRET_KEY:-change-me}"
-      TNG_API_TOKENS: "${TNG_API_TOKENS:-}"
+      TNG_SECRET_KEY: "${TNG_SECRET_KEY:?TNG_SECRET_KEY must be set to a random secret}"
+      TNG_API_TOKENS: "${TNG_API_TOKENS:?TNG_API_TOKENS must be set to one or more tokens}"
       TNG_USER_AGENT: "${TNG_USER_AGENT:-rtorrent/0.16.11/0.16.11}"
       # TNG_PEER_ID is deliberately not defaulted here: the sidecar generates
       # and persists a unique per-install id under data_dir on first start
@@ -53,8 +53,8 @@ services:
       TNG_QBITTORRENT_URL: http://qbittorrent:8080
       TNG_QBITTORRENT_USERNAME: "${QBITTORRENT_USERNAME:-admin}"
       TNG_QBITTORRENT_PASSWORD: "${QBITTORRENT_PASSWORD:-adminadmin}"
-      TNG_SECRET_KEY: "${TNG_SECRET_KEY:-change-me}"
-      TNG_API_TOKENS: "${TNG_API_TOKENS:-}"
+      TNG_SECRET_KEY: "${TNG_SECRET_KEY:?TNG_SECRET_KEY must be set to a random secret}"
+      TNG_API_TOKENS: "${TNG_API_TOKENS:?TNG_API_TOKENS must be set to one or more tokens}"
     depends_on:
       - qbittorrent
     healthcheck:
@@ -98,8 +98,8 @@ services:
       TNG_TRANSMISSION_URL: http://transmission:9091/transmission/rpc
       TNG_TRANSMISSION_USERNAME: "${TRANSMISSION_USERNAME:-}"
       TNG_TRANSMISSION_PASSWORD: "${TRANSMISSION_PASSWORD:-}"
-      TNG_SECRET_KEY: "${TNG_SECRET_KEY:-change-me}"
-      TNG_API_TOKENS: "${TNG_API_TOKENS:-}"
+      TNG_SECRET_KEY: "${TNG_SECRET_KEY:?TNG_SECRET_KEY must be set to a random secret}"
+      TNG_API_TOKENS: "${TNG_API_TOKENS:?TNG_API_TOKENS must be set to one or more tokens}"
     depends_on:
       - transmission
     healthcheck:
@@ -141,8 +141,8 @@ services:
       TNG_BACKEND: deluge
       TNG_DELUGE_URL: http://deluge:8112/json
       TNG_DELUGE_PASSWORD: "${DELUGE_PASSWORD:-deluge}"
-      TNG_SECRET_KEY: "${TNG_SECRET_KEY:-change-me}"
-      TNG_API_TOKENS: "${TNG_API_TOKENS:-}"
+      TNG_SECRET_KEY: "${TNG_SECRET_KEY:?TNG_SECRET_KEY must be set to a random secret}"
+      TNG_API_TOKENS: "${TNG_API_TOKENS:?TNG_API_TOKENS must be set to one or more tokens}"
     depends_on:
       - deluge
     healthcheck:

@@ -1,6 +1,6 @@
 use std::{
     io::{Read, Seek, SeekFrom},
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -13,51 +13,73 @@ use crate::{
     config::RtorrentLogConfig,
 };
 
+const MAX_LOG_BYTES_PER_POLL: u64 = 1024 * 1024;
+
 pub async fn run(db: Arc<Db>, config: RtorrentLogConfig, retention: usize) {
     if !config.enabled || config.paths.is_empty() {
         return;
     }
     let interval = Duration::from_secs(config.poll_interval_secs.max(1));
+    let paths = config.paths;
+    let read_from_start = config.read_from_start;
 
     loop {
-        for path in &config.paths {
-            match ingest_path(&db, path, retention, config.read_from_start) {
-                Ok(()) => {
-                    if let Err(e) = record_ingest_recovery(&db, path, retention) {
-                        tracing::warn!(
-                            component = "rtorrent_logs",
-                            operation = "record_recovery",
-                            source = log_source(path),
-                            result = "error",
-                            error = %e,
-                            "failed to record rtorrent log ingest recovery"
-                        );
-                    }
-                }
-                Err(e) => {
-                    let source = log_source(path);
+        let db_for_poll = Arc::clone(&db);
+        let paths_for_poll = paths.clone();
+        let poll = tokio::task::spawn_blocking(move || {
+            poll_paths(&db_for_poll, &paths_for_poll, retention, read_from_start)
+        })
+        .await;
+        if let Err(error) = poll {
+            tracing::warn!(
+                component = "rtorrent_logs",
+                operation = "poll",
+                result = "error",
+                error = %error,
+                "rTorrent log poll worker failed"
+            );
+        }
+        sleep(interval).await;
+    }
+}
+
+fn poll_paths(db: &Db, paths: &[PathBuf], retention: usize, read_from_start: bool) {
+    for path in paths {
+        match ingest_path(db, path, retention, read_from_start) {
+            Ok(()) => {
+                if let Err(e) = record_ingest_recovery(db, path, retention) {
                     tracing::warn!(
                         component = "rtorrent_logs",
-                        operation = "ingest",
-                        source,
+                        operation = "record_recovery",
+                        source = log_source(path),
                         result = "error",
                         error = %e,
-                        "failed to ingest rtorrent log"
+                        "failed to record rtorrent log ingest recovery"
                     );
-                    if let Err(event_error) = record_ingest_failure(&db, path, &e, retention) {
-                        tracing::warn!(
-                            component = "rtorrent_logs",
-                            operation = "record_failure",
-                            source,
-                            result = "error",
-                            error = %event_error,
-                            "failed to record rtorrent log ingest failure"
-                        );
-                    }
+                }
+            }
+            Err(e) => {
+                let source = log_source(path);
+                tracing::warn!(
+                    component = "rtorrent_logs",
+                    operation = "ingest",
+                    source,
+                    result = "error",
+                    error = %e,
+                    "failed to ingest rtorrent log"
+                );
+                if let Err(event_error) = record_ingest_failure(db, path, &e, retention) {
+                    tracing::warn!(
+                        component = "rtorrent_logs",
+                        operation = "record_failure",
+                        source,
+                        result = "error",
+                        error = %event_error,
+                        "failed to record rtorrent log ingest failure"
+                    );
                 }
             }
         }
-        sleep(interval).await;
     }
 }
 
@@ -82,13 +104,32 @@ fn ingest_path(db: &Db, path: &Path, retention: usize, read_from_start: bool) ->
     let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     file.seek(SeekFrom::Start(offset))?;
     let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
-    let buf = String::from_utf8_lossy(&buf);
+    file.take(MAX_LOG_BYTES_PER_POLL).read_to_end(&mut buf)?;
 
-    for line in buf.lines().map(str::trim).filter(|line| !line.is_empty()) {
+    // Advance only through complete lines. A partial trailing line is left
+    // for the next poll so rotation or an interrupted write cannot silently
+    // discard its prefix. If one line itself exceeds the per-poll cap, emit
+    // the bounded chunk and advance so a pathological log cannot pin this
+    // loop forever rereading the same bytes.
+    let complete_bytes = buf
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map(|index| index + 1)
+        .filter(|end| *end > 0 || buf.len() < MAX_LOG_BYTES_PER_POLL as usize)
+        .unwrap_or({
+            if buf.len() == MAX_LOG_BYTES_PER_POLL as usize {
+                buf.len()
+            } else {
+                0
+            }
+        });
+    let text = String::from_utf8_lossy(&buf[..complete_bytes]);
+
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
         append_log_line(db, path, line, retention)?;
     }
-    db.set_kv(&offset_key, &metadata.len().to_string())?;
+    let next_offset = offset.saturating_add(complete_bytes as u64);
+    db.set_kv(&offset_key, &next_offset.to_string())?;
     Ok(())
 }
 
@@ -265,6 +306,8 @@ fn redact_path_token(token: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use super::*;
 
     #[test]
@@ -330,6 +373,37 @@ mod tests {
         let events = db.list_app_events(10).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].message, "existing line");
+    }
+
+    #[test]
+    fn ingest_path_limits_each_poll_and_retries_partial_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("rtorrent.log");
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+        let mut body = b"first\n".to_vec();
+        body.extend(std::iter::repeat_n(b'x', MAX_LOG_BYTES_PER_POLL as usize));
+        std::fs::write(&log_path, &body).unwrap();
+
+        ingest_path(&db, &log_path, 10, true).unwrap();
+        assert_eq!(db.list_app_events(10).unwrap().len(), 1);
+        assert_eq!(
+            db.get_kv(&offset_key(&log_path)).unwrap(),
+            Some("6".to_owned())
+        );
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log_path)
+            .unwrap()
+            .write_all(b"\nsecond\n")
+            .unwrap();
+        ingest_path(&db, &log_path, 10, true).unwrap();
+        ingest_path(&db, &log_path, 10, true).unwrap();
+
+        let events = db.list_app_events(10).unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].message, "second");
+        assert_eq!(events[1].message.len(), MAX_LOG_BYTES_PER_POLL as usize);
     }
 
     #[test]

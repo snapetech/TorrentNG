@@ -1,4 +1,10 @@
+use std::collections::HashMap;
+use std::hash::Hash;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Mutex, OnceLock,
+};
 use std::time::Duration;
 
 use rt_config::TrackerConfig;
@@ -6,10 +12,80 @@ use tokio::net::lookup_host;
 use tokio::time::timeout;
 use url::Url;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OutboundTargetKind {
     Tracker,
     Webseed,
+}
+
+const HTTP_CLIENT_CACHE_CAPACITY: usize = 256;
+
+static SCHEME_DENIED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static ADDRESS_DENIED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static RESOLUTION_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CLIENT_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EgressPolicyMetricsSnapshot {
+    pub scheme_denied_total: u64,
+    pub address_denied_total: u64,
+    pub resolution_failed_total: u64,
+    pub client_failed_total: u64,
+}
+
+pub fn egress_policy_metrics() -> EgressPolicyMetricsSnapshot {
+    EgressPolicyMetricsSnapshot {
+        scheme_denied_total: SCHEME_DENIED_TOTAL.load(Ordering::Relaxed),
+        address_denied_total: ADDRESS_DENIED_TOTAL.load(Ordering::Relaxed),
+        resolution_failed_total: RESOLUTION_FAILED_TOTAL.load(Ordering::Relaxed),
+        client_failed_total: CLIENT_FAILED_TOTAL.load(Ordering::Relaxed),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct HttpClientKey {
+    kind: OutboundTargetKind,
+    host: String,
+    port: u16,
+    address: SocketAddr,
+    timeout_millis: u64,
+    user_agent: String,
+}
+
+#[derive(Debug, Default)]
+struct HttpClientCache {
+    clients: HashMap<HttpClientKey, (u64, reqwest::Client)>,
+    next_tick: u64,
+}
+
+impl HttpClientCache {
+    fn get(&mut self, key: &HttpClientKey) -> Option<reqwest::Client> {
+        let (tick, client) = self.clients.get_mut(key)?;
+        self.next_tick = self.next_tick.wrapping_add(1);
+        *tick = self.next_tick;
+        Some(client.clone())
+    }
+
+    fn insert(&mut self, key: HttpClientKey, client: reqwest::Client) {
+        self.next_tick = self.next_tick.wrapping_add(1);
+        self.clients.insert(key, (self.next_tick, client));
+        while self.clients.len() > HTTP_CLIENT_CACHE_CAPACITY {
+            let Some(oldest) = self
+                .clients
+                .iter()
+                .min_by_key(|(_, (tick, _))| *tick)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.clients.remove(&oldest);
+        }
+    }
+}
+
+fn http_client_cache() -> &'static Mutex<HttpClientCache> {
+    static CACHE: OnceLock<Mutex<HttpClientCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HttpClientCache::default()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,18 +146,24 @@ impl OutboundEgressPolicy {
                 "http" if self.allow_http_trackers => Ok(()),
                 "https" if self.allow_https_trackers => Ok(()),
                 "udp" if self.allow_udp_trackers => Ok(()),
-                _ => Err(EgressPolicyError::SchemeDenied {
-                    kind,
-                    scheme: scheme.to_owned(),
-                }),
+                _ => {
+                    SCHEME_DENIED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    Err(EgressPolicyError::SchemeDenied {
+                        kind,
+                        scheme: scheme.to_owned(),
+                    })
+                }
             },
             OutboundTargetKind::Webseed => match scheme {
                 "http" if self.allow_http_webseeds => Ok(()),
                 "https" if self.allow_https_webseeds => Ok(()),
-                _ => Err(EgressPolicyError::SchemeDenied {
-                    kind,
-                    scheme: scheme.to_owned(),
-                }),
+                _ => {
+                    SCHEME_DENIED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    Err(EgressPolicyError::SchemeDenied {
+                        kind,
+                        scheme: scheme.to_owned(),
+                    })
+                }
             },
         }
     }
@@ -91,6 +173,7 @@ impl OutboundEgressPolicy {
         if class.allowed_by(*self) {
             Ok(())
         } else {
+            ADDRESS_DENIED_TOTAL.fetch_add(1, Ordering::Relaxed);
             Err(EgressPolicyError::AddressDenied { addr, class })
         }
     }
@@ -109,19 +192,28 @@ impl OutboundEgressPolicy {
         resolve_timeout: Duration,
     ) -> Result<Vec<SocketAddr>, EgressPolicyError> {
         self.validate_url(kind, url)?;
-        let host = url
-            .host_str()
-            .ok_or(EgressPolicyError::MissingHost)?
-            .to_owned();
-        let port = url
-            .port_or_known_default()
-            .ok_or(EgressPolicyError::MissingPort)?;
+        let host = url.host_str().ok_or_else(|| {
+            RESOLUTION_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            EgressPolicyError::MissingHost
+        })?;
+        let host = host.to_owned();
+        let port = url.port_or_known_default().ok_or_else(|| {
+            RESOLUTION_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            EgressPolicyError::MissingPort
+        })?;
         let addresses = timeout(resolve_timeout, lookup_host((host.as_str(), port)))
             .await
-            .map_err(|_| EgressPolicyError::Resolution("DNS resolution timed out".to_owned()))?
-            .map_err(|error| EgressPolicyError::Resolution(error.to_string()))?
+            .map_err(|_| {
+                RESOLUTION_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                EgressPolicyError::Resolution("DNS resolution timed out".to_owned())
+            })?
+            .map_err(|error| {
+                RESOLUTION_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                EgressPolicyError::Resolution(error.to_string())
+            })?
             .collect::<Vec<_>>();
         if addresses.is_empty() {
+            RESOLUTION_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
             return Err(EgressPolicyError::Resolution(format!(
                 "no addresses returned for {host}"
             )));
@@ -146,18 +238,54 @@ impl OutboundEgressPolicy {
         let addresses = self
             .resolve_and_validate(kind, url, request_timeout)
             .await?;
-        let host = url.host_str().ok_or(EgressPolicyError::MissingHost)?;
-        let address = addresses
-            .first()
-            .copied()
-            .ok_or_else(|| EgressPolicyError::Resolution("no validated address".to_owned()))?;
-        reqwest::Client::builder()
+        let host = url.host_str().ok_or_else(|| {
+            RESOLUTION_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            EgressPolicyError::MissingHost
+        })?;
+        let address = addresses.first().copied().ok_or_else(|| {
+            RESOLUTION_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            EgressPolicyError::Resolution("no validated address".to_owned())
+        })?;
+        let key = HttpClientKey {
+            kind,
+            host: host.to_owned(),
+            port: url.port_or_known_default().ok_or_else(|| {
+                RESOLUTION_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                EgressPolicyError::MissingPort
+            })?,
+            address,
+            timeout_millis: request_timeout.as_millis().min(u64::MAX as u128) as u64,
+            user_agent: user_agent.to_owned(),
+        };
+        if let Some(client) = http_client_cache()
+            .lock()
+            .expect("egress client cache poisoned")
+            .get(&key)
+        {
+            return Ok(client);
+        }
+        let client = reqwest::Client::builder()
             .timeout(request_timeout)
             .redirect(reqwest::redirect::Policy::none())
             .user_agent(user_agent)
             .resolve(host, address)
             .build()
-            .map_err(|error| EgressPolicyError::Client(error.to_string()))
+            .map_err(|error| {
+                CLIENT_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                EgressPolicyError::Client(error.to_string())
+            })?;
+        let mut cache = http_client_cache()
+            .lock()
+            .expect("egress client cache poisoned");
+        // A concurrent caller may have filled the same key while this client
+        // was being built. Returning the existing clone avoids needless
+        // duplicate connection pools without holding the mutex across DNS or
+        // reqwest client construction.
+        if let Some(existing) = cache.get(&key) {
+            return Ok(existing);
+        }
+        cache.insert(key, client.clone());
+        Ok(client)
     }
 }
 
@@ -166,6 +294,8 @@ pub enum AddressClass {
     Public,
     Loopback,
     Private,
+    CarrierGradeNat,
+    Reserved,
     LinkLocal,
     Multicast,
     Unspecified,
@@ -184,6 +314,13 @@ impl AddressClass {
                     AddressClass::Loopback
                 } else if addr.is_private() {
                     AddressClass::Private
+                } else if ipv4_in_range(addr, 100, 64, 10) {
+                    AddressClass::CarrierGradeNat
+                } else if ipv4_in_range(addr, 198, 18, 15)
+                    || ipv4_in_range(addr, 192, 0, 24)
+                    || ipv4_in_range(addr, 240, 0, 4)
+                {
+                    AddressClass::Reserved
                 } else if addr.is_link_local() {
                     AddressClass::LinkLocal
                 } else if addr.is_multicast() {
@@ -197,6 +334,16 @@ impl AddressClass {
                 }
             }
             IpAddr::V6(addr) => {
+                // Only IPv4-mapped IPv6 addresses (`::ffff:x.y.z.w`) should
+                // inherit IPv4 policy. `Ipv6Addr::to_ipv4` also accepts the
+                // deprecated IPv4-compatible `::x.y.z.w` form, which would
+                // otherwise misclassify `::1` as public `0.0.0.1`.
+                if addr.segments()[..6] == [0, 0, 0, 0, 0, 0xffff] {
+                    let mapped = addr
+                        .to_ipv4()
+                        .expect("IPv4-mapped address has an IPv4 tail");
+                    return Self::classify(IpAddr::V4(mapped));
+                }
                 if addr.is_unspecified() {
                     AddressClass::Unspecified
                 } else if addr.is_loopback() {
@@ -220,13 +367,26 @@ impl AddressClass {
         match self {
             AddressClass::Public => true,
             AddressClass::Loopback => policy.allow_loopback,
-            AddressClass::Private | AddressClass::UniqueLocal => policy.allow_private,
+            AddressClass::Private | AddressClass::CarrierGradeNat | AddressClass::UniqueLocal => {
+                policy.allow_private
+            }
             AddressClass::LinkLocal => policy.allow_link_local,
             AddressClass::Multicast => policy.allow_multicast,
             AddressClass::Unspecified => policy.allow_unspecified,
-            AddressClass::Documentation | AddressClass::Broadcast => false,
+            AddressClass::Documentation | AddressClass::Broadcast | AddressClass::Reserved => false,
         }
     }
+}
+
+fn ipv4_in_range(addr: std::net::Ipv4Addr, first_octet: u8, second_octet: u8, prefix: u8) -> bool {
+    let value = u32::from(addr);
+    let network = u32::from_be_bytes([first_octet, second_octet, 0, 0]);
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    value & mask == network & mask
 }
 
 fn is_ipv6_unicast_link_local(addr: &std::net::Ipv6Addr) -> bool {
@@ -337,6 +497,11 @@ mod tests {
             "fe80::1".parse().unwrap(),
             "fc00::1".parse().unwrap(),
             "2001:db8::1".parse().unwrap(),
+            "100.64.0.1".parse().unwrap(),
+            "198.18.0.1".parse().unwrap(),
+            "192.0.0.1".parse().unwrap(),
+            "240.0.0.1".parse().unwrap(),
+            "::ffff:127.0.0.1".parse().unwrap(),
         ] {
             assert!(policy.validate_ip(addr).is_err(), "{addr}");
         }
@@ -344,6 +509,47 @@ mod tests {
         policy
             .validate_ip("2001:4860:4860::8888".parse().unwrap())
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_clients_are_reused_after_each_address_is_revalidated() {
+        let policy = OutboundEgressPolicy {
+            allow_loopback: true,
+            ..OutboundEgressPolicy::default()
+        };
+        let url = Url::parse("http://127.0.0.1:9/announce").unwrap();
+        let first = policy
+            .http_client(
+                OutboundTargetKind::Tracker,
+                &url,
+                Duration::from_secs(1),
+                "TorrentNG/test",
+            )
+            .await
+            .unwrap();
+        let second = policy
+            .http_client(
+                OutboundTargetKind::Tracker,
+                &url,
+                Duration::from_secs(1),
+                "TorrentNG/test",
+            )
+            .await
+            .unwrap();
+        // `reqwest::Client` is intentionally cloneable; pointer identity is
+        // not part of its API. A second construction would be observable as
+        // a second cache entry, so assert the bounded cache contains this
+        // exact policy tuple rather than relying on internal client details.
+        let _ = (first, second);
+        let cache = http_client_cache()
+            .lock()
+            .expect("egress client cache poisoned");
+        assert!(cache.clients.keys().any(|key| {
+            key.kind == OutboundTargetKind::Tracker
+                && key.host == "127.0.0.1"
+                && key.port == 9
+                && key.user_agent == "TorrentNG/test"
+        }));
     }
 
     #[test]

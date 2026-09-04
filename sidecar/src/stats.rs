@@ -1,4 +1,6 @@
 use std::{
+    fs::File,
+    io::{BufRead, BufReader, Read},
     sync::{
         atomic::{AtomicI64, Ordering},
         Arc,
@@ -18,6 +20,8 @@ use crate::{
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const LIVE_SPEEDS_MAX_AGE: Duration = Duration::from_secs(60);
+const MAX_LIVE_SPEEDS_BYTES: u64 = 64 * 1024;
+const MAX_RTORRENT_CONFIG_PROBE_BYTES: u64 = 256 * 1024;
 const DEFAULT_INCOMING_PORT: u16 = 50000;
 static SESSION_UPLOAD_TOTAL: AtomicI64 = AtomicI64::new(0);
 static SESSION_DOWNLOAD_TOTAL: AtomicI64 = AtomicI64::new(0);
@@ -47,12 +51,16 @@ pub async fn run(
         let now = tokio::time::Instant::now();
         let elapsed = now.duration_since(last_tick).as_secs_f64();
         last_tick = now;
-        let rates = match live_speeds_file().and_then(|path| read_live_speeds(&path)) {
+        let file_rates = match live_speeds_file() {
+            Some(path) => read_live_speeds_async(path).await,
+            None => None,
+        };
+        let rates = match file_rates {
             Some(rates) => rates,
             None => match probe_transfer_rates_result(backend.as_ref()).await {
                 Ok(rates) => {
                     if stats_error_active {
-                        append_app_event(
+                        append_app_event_async(
                             &db,
                             "info",
                             "rtorrent_stats_recovered",
@@ -63,36 +71,21 @@ pub async fn run(
                                 "result": "ok",
                             }),
                             event_retention,
-                        );
+                        )
+                        .await;
                         stats_error_active = false;
                     }
                     rates
                 }
                 Err(e) => {
-                    let chain = crate::sync::error_chain(&e);
-                    warn!(
-                        component = backend.backend_type().as_str(),
-                        operation = "transfer_stats",
-                        result = "error",
-                        error = %chain,
-                        "transfer stats probe failed"
-                    );
-                    if !stats_error_active {
-                        append_app_event(
-                            &db,
-                            "warn",
-                            "rtorrent_stats_error",
-                            "backend transfer stats probe failed",
-                            serde_json::json!({
-                                "component": backend.backend_type().as_str(),
-                                "operation": "transfer_stats",
-                                "result": "error",
-                                "error": chain,
-                            }),
-                            event_retention,
-                        );
-                        stats_error_active = true;
-                    }
+                    record_stats_probe_failure(
+                        backend.as_ref(),
+                        &db,
+                        &mut stats_error_active,
+                        &e,
+                        event_retention,
+                    )
+                    .await;
                     TransferRates::default()
                 }
             },
@@ -125,32 +118,81 @@ pub fn session_totals() -> SessionTotals {
     }
 }
 
-pub fn current_rates(
+pub async fn current_rates(backend: Arc<dyn TorrentBackend>) -> TransferRates {
+    current_rates_result(backend).await.unwrap_or_else(|e| {
+        warn!(
+            component = "stats",
+            operation = "current_rates",
+            result = "error",
+            error = %crate::sync::error_chain(&e),
+            "current transfer rates unavailable"
+        );
+        TransferRates::default()
+    })
+}
+
+/// Read current rates without converting a dead or unresponsive backend into
+/// a plausible-looking zero. Compatibility feeds may still use `current_rates`
+/// when they must render a cached projection, but authoritative API handlers
+/// should use this result-returning path.
+pub async fn current_rates_result(
     backend: Arc<dyn TorrentBackend>,
-) -> impl std::future::Future<Output = TransferRates> {
-    async move {
-        if let Some(path) = live_speeds_file() {
-            if let Some(rates) = read_live_speeds(&path) {
-                return rates;
-            }
+) -> anyhow::Result<TransferRates> {
+    if let Some(path) = live_speeds_file() {
+        if let Some(rates) = read_live_speeds_async(path).await {
+            return Ok(rates);
         }
-        probe_transfer_rates(backend.as_ref()).await
+    }
+    probe_transfer_rates_result(backend.as_ref()).await
+}
+
+async fn read_live_speeds_async(path: String) -> Option<TransferRates> {
+    match tokio::task::spawn_blocking(move || read_live_speeds(&path)).await {
+        Ok(rates) => rates,
+        Err(error) => {
+            warn!(
+                component = "stats",
+                operation = "read_live_speeds",
+                result = "error",
+                error = %error,
+                "live speed file worker failed"
+            );
+            None
+        }
     }
 }
 
-async fn probe_transfer_rates(backend: &dyn TorrentBackend) -> TransferRates {
-    match probe_transfer_rates_result(backend).await {
-        Ok(rates) => rates,
-        Err(e) => {
-            warn!(
-                component = backend.backend_type().as_str(),
-                operation = "transfer_stats",
-                result = "error",
-                error = %crate::sync::error_chain(&e),
-                "transfer stats probe failed"
-            );
-            TransferRates::default()
-        }
+async fn record_stats_probe_failure(
+    backend: &dyn TorrentBackend,
+    db: &Db,
+    stats_error_active: &mut bool,
+    error: &anyhow::Error,
+    event_retention: usize,
+) {
+    let chain = crate::sync::error_chain(error);
+    warn!(
+        component = backend.backend_type().as_str(),
+        operation = "transfer_stats",
+        result = "error",
+        error = %chain,
+        "transfer stats probe failed"
+    );
+    if !*stats_error_active {
+        append_app_event_async(
+            db,
+            "warn",
+            "rtorrent_stats_error",
+            "backend transfer stats probe failed",
+            serde_json::json!({
+                "component": backend.backend_type().as_str(),
+                "operation": "transfer_stats",
+                "result": "error",
+                "error": chain,
+            }),
+            event_retention,
+        )
+        .await;
+        *stats_error_active = true;
     }
 }
 
@@ -173,7 +215,7 @@ async fn probe_transfer_rates_result(
     }
 }
 
-fn append_app_event(
+async fn append_app_event_async(
     db: &Db,
     level: &str,
     kind: &str,
@@ -181,17 +223,20 @@ fn append_app_event(
     payload: serde_json::Value,
     retention: usize,
 ) {
-    if let Err(e) = db.append_app_event(
-        &AppEventRow {
-            event_id: None,
-            occurred_at: chrono::Utc::now().timestamp(),
-            level: level.to_owned(),
-            kind: kind.to_owned(),
-            message: message.to_owned(),
-            payload: payload.to_string(),
-        },
-        retention,
-    ) {
+    let event = AppEventRow {
+        event_id: None,
+        occurred_at: chrono::Utc::now().timestamp(),
+        level: level.to_owned(),
+        kind: kind.to_owned(),
+        message: message.to_owned(),
+        payload: payload.to_string(),
+    };
+    if let Err(e) = db
+        .run_blocking("stats_app_event", move |db| {
+            db.append_app_event(&event, retention)
+        })
+        .await
+    {
         warn!(
             component = "app_events",
             operation = "append",
@@ -218,7 +263,7 @@ fn read_live_speeds(path: &str) -> Option<TransferRates> {
         updated_at: Option<i64>,
     }
 
-    let raw = std::fs::read_to_string(path).ok()?;
+    let raw = read_bounded_text(path, MAX_LIVE_SPEEDS_BYTES).ok()?;
     let speeds: LiveSpeeds = serde_json::from_str(&raw).ok()?;
     let legacy_modified_at = speeds.updated_at.is_none().then(|| {
         std::fs::metadata(path)
@@ -231,6 +276,25 @@ fn read_live_speeds(path: &str) -> Option<TransferRates> {
     Some(TransferRates {
         download: speeds.download.max(0),
         upload: speeds.upload.max(0),
+    })
+}
+
+fn read_bounded_text(path: &str, max_bytes: u64) -> std::io::Result<String> {
+    let file = File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "live speed file exceeds size limit",
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "live speed file is not valid UTF-8",
+        )
     })
 }
 
@@ -258,26 +322,50 @@ struct LiveStatus {
 
 async fn live_status(backend: &dyn TorrentBackend) -> LiveStatus {
     let listen_port = incoming_port();
-    let sockets = tcp_socket_counts(listen_port);
-    let (mut dht, mut pex) = backend.feature_status().await;
-    let firewall = if sockets.listening && sockets.established > 0 {
-        "open"
-    } else if sockets.listening {
-        "listening"
-    } else {
-        "closed"
-    };
-
-    LiveStatus {
-        connections: sockets.established,
-        pending_connections: sockets.pending,
-        listen_port,
-        firewall: firewall.to_owned(),
-        dht: {
-            fill_feature_status_from_config(&mut dht, &mut pex);
-            dht
-        },
-        pex,
+    let (dht, pex) = backend.feature_status().await;
+    let probe_dht = dht.clone();
+    let probe_pex = pex.clone();
+    let local_status = tokio::task::spawn_blocking(move || {
+        let sockets = tcp_socket_counts(listen_port);
+        let firewall = if sockets.listening && sockets.established > 0 {
+            "open"
+        } else if sockets.listening {
+            "listening"
+        } else {
+            "closed"
+        };
+        let mut dht = probe_dht;
+        let mut pex = probe_pex;
+        fill_feature_status_from_config(&mut dht, &mut pex);
+        LiveStatus {
+            connections: sockets.established,
+            pending_connections: sockets.pending,
+            listen_port,
+            firewall: firewall.to_owned(),
+            dht,
+            pex,
+        }
+    })
+    .await;
+    match local_status {
+        Ok(status) => status,
+        Err(error) => {
+            warn!(
+                component = "stats",
+                operation = "local_status",
+                result = "error",
+                error = %error,
+                "local stats probe worker failed"
+            );
+            LiveStatus {
+                connections: 0,
+                pending_connections: 0,
+                listen_port,
+                firewall: "unknown".to_owned(),
+                dht,
+                pex,
+            }
+        }
     }
 }
 
@@ -303,11 +391,14 @@ fn tcp_socket_counts(port: u16) -> TcpSocketCounts {
 }
 
 fn read_tcp_table(path: &str, port: u16, counts: &mut TcpSocketCounts) {
-    let Ok(raw) = std::fs::read_to_string(path) else {
+    let Ok(file) = File::open(path) else {
         return;
     };
 
-    for line in raw.lines().skip(1) {
+    for line in BufReader::new(file).lines().skip(1) {
+        let Ok(line) = line else {
+            break;
+        };
         let fields: Vec<&str> = line.split_whitespace().collect();
         if fields.len() < 4 {
             continue;
@@ -338,7 +429,7 @@ fn fill_feature_status_from_config(dht: &mut String, pex: &mut String) {
         "/etc/rtorrent/user.rc",
         "/config/rtorrent.rc",
     ] {
-        if let Ok(raw) = std::fs::read_to_string(path) {
+        if let Ok(raw) = read_bounded_text(path, MAX_RTORRENT_CONFIG_PROBE_BYTES) {
             for line in raw.lines() {
                 let normalized = line.to_ascii_lowercase().replace(char::is_whitespace, "");
                 if let Some(value) = config_switch(
@@ -423,5 +514,13 @@ mod tests {
 
         assert_eq!(rates.download, 123);
         assert_eq!(rates.upload, 45);
+    }
+
+    #[test]
+    fn oversized_live_speeds_are_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live-speeds.json");
+        std::fs::write(&path, vec![b' '; (MAX_LIVE_SPEEDS_BYTES + 1) as usize]).unwrap();
+        assert!(read_live_speeds(path.to_str().unwrap()).is_none());
     }
 }

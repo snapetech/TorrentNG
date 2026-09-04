@@ -19,7 +19,8 @@ pub struct TrackerState {
     pub last_success: Option<Instant>,
     pub interval: Duration,
     pub min_interval: Duration,
-    pub tracker_id: Option<String>,
+    /// Opaque tracker-provided bytes, retained for subsequent announces.
+    pub tracker_id: Option<Vec<u8>>,
     pub scrape_complete: Option<u32>,
     pub scrape_incomplete: Option<u32>,
     pub scrape_downloaded: Option<u32>,
@@ -64,7 +65,11 @@ impl TrackerState {
         self.scrape_complete = resp.complete;
         self.scrape_incomplete = resp.incomplete;
 
-        let jittered = jitter_interval(self.interval, 0.1);
+        // A tracker-provided `min interval` is a lower bound, not merely
+        // informational metadata. Keep jitter for herd avoidance, but do
+        // not let it schedule an announce before that lower bound.
+        let minimum = self.interval.max(self.min_interval);
+        let jittered = jitter_interval(minimum, 0.1).max(self.min_interval);
         self.next_announce = Some(now + jittered);
 
         self.status = if let Some(ref warn) = resp.warning_message {
@@ -195,5 +200,32 @@ mod tests {
         let mut ts = TrackerState::new("http://tracker.example.com/announce");
         ts.on_success(&mock_response(3600, None));
         assert_eq!(ts.interval, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn success_retains_opaque_tracker_id() {
+        let mut ts = TrackerState::new("http://tracker.example.com/announce");
+        let mut response = mock_response(1800, None);
+        response.tracker_id = Some(vec![0x00, 0xff, 0x80]);
+
+        ts.on_success(&response);
+
+        assert_eq!(ts.tracker_id, Some(vec![0x00, 0xff, 0x80]));
+    }
+
+    #[test]
+    fn response_min_interval_is_enforced() {
+        let mut ts = TrackerState::new("http://tracker.example.com/announce");
+        ts.on_success(&AnnounceResponse {
+            interval: 1,
+            min_interval: Some(60),
+            peers: Vec::new(),
+            tracker_id: None,
+            warning_message: None,
+            complete: None,
+            incomplete: None,
+        });
+
+        assert!(ts.time_until_next() >= Duration::from_secs(59));
     }
 }

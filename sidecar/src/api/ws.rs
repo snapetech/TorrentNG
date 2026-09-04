@@ -3,8 +3,12 @@ use axum::{
     response::IntoResponse,
 };
 use serde::Serialize;
+use std::time::Duration;
+use tokio::time::timeout;
 
 use super::server::AppState;
+
+const WS_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -61,14 +65,39 @@ async fn handle_socket(
                 match event {
                     Ok(e) => {
                         let payload = serde_json::to_string(&e).unwrap_or_default();
-                        if socket.send(axum::extract::ws::Message::Text(payload.into())).await.is_err() {
+                        if !send_text(&mut socket, payload).await {
                             break;
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        // A lagged broadcast receiver cannot reconstruct the
+                        // missing events. Tell the client to reload its
+                        // bounded list projection instead of silently
+                        // presenting a permanently stale view.
+                        let payload = serde_json::json!({
+                            "type": "resync_required",
+                            "reason": "event_stream_lagged",
+                            "dropped": skipped,
+                        })
+                        .to_string();
+                        if !send_text(&mut socket, payload).await {
+                            break;
+                        }
+                    }
                 }
             }
         }
     }
+}
+
+async fn send_text(socket: &mut axum::extract::ws::WebSocket, payload: String) -> bool {
+    matches!(
+        timeout(
+            WS_SEND_TIMEOUT,
+            socket.send(axum::extract::ws::Message::Text(payload.into()))
+        )
+        .await,
+        Ok(Ok(()))
+    )
 }

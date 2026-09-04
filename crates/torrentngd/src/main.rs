@@ -14,12 +14,12 @@ use axum::{
     middleware::{self, Next},
     response::{IntoResponse, Response},
 };
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::info;
 
 use rt_api_deluge::AppState as DelugeState;
-use rt_api_model::ApiRuntimeMetrics;
+use rt_api_model::{csrf_request_allowed, session_cookie_value, ApiRuntimeMetrics};
 use rt_api_native::state::AppState as NativeState;
 use rt_api_qbit::state::AppState as QbitState;
 use rt_api_transmission::AppState as TransmissionState;
@@ -59,6 +59,13 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Arc::new(load_config()?);
     rt_logging::init(&config.logging, Some(&config.daemon.log_level));
+    if config.metrics.include_torrent_ids {
+        tracing::warn!(
+            component = "metrics",
+            operation = "startup",
+            "raw torrent identifiers are enabled in Prometheus labels; prefer the default hashed labels"
+        );
+    }
     info!(
         component = "daemon",
         operation = "startup",
@@ -69,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Ensure session directory exists
-    std::fs::create_dir_all(&config.daemon.session_dir)
+    rt_storage::create_dir_all_no_follow(&config.daemon.session_dir)
         .with_context(|| format!("creating session_dir {:?}", config.daemon.session_dir))?;
 
     // Resolve (and persist, if not already done) this install's tracker
@@ -87,34 +94,45 @@ async fn main() -> anyhow::Result<()> {
 
     // Build the API routers
     let api_metrics = ApiRuntimeMetrics::new();
-    let native_state = NativeState::with_engine_and_tokens_and_metrics(
+    let native_state = NativeState::with_engine_and_tokens_metrics_config(
         Arc::clone(&registry),
         engine_handle.clone(),
         config.auth.api_tokens.clone(),
         Arc::clone(&api_metrics),
+        config.metrics.include_torrent_ids,
     );
     let native_router = rt_api_native::router::build_router(native_state);
 
-    let qbit_state = QbitState::with_engine_and_tokens_and_metrics(
+    let shutdown_notify = Arc::new(Notify::new());
+    let mut qbit_state = QbitState::with_engine_and_tokens_and_metrics(
         Arc::clone(&registry),
         engine_handle.clone(),
         config.auth.api_tokens.clone(),
         Arc::clone(&api_metrics),
     );
+    qbit_state.egress_policy = rt_engine::OutboundEgressPolicy::from_config(&config.tracker);
+    qbit_state.shutdown = Some(Arc::clone(&shutdown_notify));
     let qbit_router = rt_api_qbit::router::build_qbit_router(qbit_state);
 
-    let transmission_state = TransmissionState::with_engine_and_tokens(
+    let mut transmission_state = TransmissionState::with_engine_and_tokens(
         Arc::clone(&registry),
         engine_handle.clone(),
         config.auth.api_tokens.clone(),
     );
+    transmission_state
+        .restore_persisted_state()
+        .await
+        .map_err(anyhow::Error::msg)
+        .context("restoring Transmission compatibility state")?;
+    transmission_state.shutdown = Some(Arc::clone(&shutdown_notify));
     let transmission_router = rt_api_transmission::build_transmission_router(transmission_state);
 
-    let deluge_state = DelugeState::with_engine_and_tokens(
+    let mut deluge_state = DelugeState::with_engine_and_tokens(
         Arc::clone(&registry),
         engine_handle.clone(),
         config.auth.api_tokens.clone(),
     );
+    deluge_state.shutdown = Some(Arc::clone(&shutdown_notify));
     let deluge_router = rt_api_deluge::build_deluge_router(deluge_state);
 
     // Merge into a single axum app
@@ -170,14 +188,14 @@ async fn main() -> anyhow::Result<()> {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal(engine_handle))
+    .with_graceful_shutdown(shutdown_signal(engine_handle, shutdown_notify))
     .await
     .context("API server error")?;
 
     Ok(())
 }
 
-async fn shutdown_signal(engine: rt_engine::EngineHandle) {
+async fn shutdown_signal(engine: rt_engine::EngineHandle, shutdown_notify: Arc<Notify>) {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
@@ -207,17 +225,36 @@ async fn shutdown_signal(engine: rt_engine::EngineHandle) {
                     "received shutdown signal"
                 );
             }
+            _ = shutdown_notify.notified() => {
+                info!(
+                    component = "daemon",
+                    operation = "shutdown_signal",
+                    signal = "qbit-app-shutdown",
+                    "received qBittorrent application shutdown request"
+                );
+            }
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = tokio::signal::ctrl_c().await;
-        info!(
-            component = "daemon",
-            operation = "shutdown_signal",
-            signal = "ctrl-c",
-            "received shutdown signal"
-        );
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!(
+                    component = "daemon",
+                    operation = "shutdown_signal",
+                    signal = "ctrl-c",
+                    "received shutdown signal"
+                );
+            }
+            _ = shutdown_notify.notified() => {
+                info!(
+                    component = "daemon",
+                    operation = "shutdown_signal",
+                    signal = "qbit-app-shutdown",
+                    "received qBittorrent application shutdown request"
+                );
+            }
+        }
     }
     engine.shutdown().await;
 }
@@ -242,11 +279,21 @@ async fn daemon_auth_guard(
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    if api_tokens.is_empty()
-        || daemon_public_path(req.uri().path())
-        || daemon_presented_token(req.headers())
-            .is_some_and(|token| api_tokens.iter().any(|allowed| allowed == &token))
+    if api_tokens.is_empty() || daemon_public_path(req.uri().path()) {
+        return next.run(req).await;
+    }
+
+    if bearer_token(req.headers())
+        .is_some_and(|token| api_tokens.iter().any(|allowed| allowed == &token))
     {
+        return next.run(req).await;
+    }
+    if session_cookie_value(req.headers(), &["tng_session", "SID"])
+        .is_some_and(|token| api_tokens.iter().any(|allowed| allowed == &token))
+    {
+        if daemon_is_mutating(&req) && !csrf_request_allowed(req.headers()) {
+            return (StatusCode::FORBIDDEN, "cross-site cookie mutation rejected").into_response();
+        }
         return next.run(req).await;
     }
 
@@ -271,12 +318,6 @@ fn daemon_public_path(path: &str) -> bool {
     ) || is_webui_path(path)
 }
 
-fn daemon_presented_token(headers: &HeaderMap) -> Option<String> {
-    bearer_token(headers)
-        .or_else(|| session_cookie(headers, "tng_session"))
-        .or_else(|| session_cookie(headers, "SID"))
-}
-
 fn bearer_token(headers: &HeaderMap) -> Option<String> {
     headers
         .get(header::AUTHORIZATION)
@@ -285,47 +326,14 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn session_cookie(headers: &HeaderMap, cookie_name: &str) -> Option<String> {
-    let prefix = format!("{cookie_name}=");
-    headers
-        .get(header::COOKIE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|cookie| {
-            cookie.split(';').find_map(|part| {
-                let part = part.trim();
-                part.strip_prefix(&prefix).and_then(cookie_component_decode)
-            })
-        })
-}
-
-fn cookie_component_decode(input: &str) -> Option<String> {
-    let bytes = input.as_bytes();
-    let mut output = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] != b'%' {
-            output.push(bytes[index]);
-            index += 1;
-            continue;
-        }
-        if index + 2 >= bytes.len() {
-            return None;
-        }
-        let high = hex_value(bytes[index + 1])?;
-        let low = hex_value(bytes[index + 2])?;
-        output.push((high << 4) | low);
-        index += 3;
-    }
-    String::from_utf8(output).ok()
-}
-
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
+fn daemon_is_mutating(req: &Request<Body>) -> bool {
+    matches!(
+        *req.method(),
+        axum::http::Method::POST
+            | axum::http::Method::PUT
+            | axum::http::Method::PATCH
+            | axum::http::Method::DELETE
+    )
 }
 
 async fn request_log(req: Request<Body>, next: Next) -> Response {

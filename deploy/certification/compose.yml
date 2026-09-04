@@ -23,8 +23,10 @@ services:
       TNG_STATIC_DIR: /usr/share/torrentng/webui
       TNG_SYNC_INTERVAL_SECS: "${TNG_SYNC_INTERVAL_SECS:-2}"
       TNG_DATA_DIR: "${TNG_DATA_DIR:-/var/lib/torrentng}"
-      TNG_SECRET_KEY: "${TNG_SECRET_KEY:-certification-only-change-me}"
-      TNG_API_TOKENS: "${TNG_API_TOKEN:-cert-token}"
+      # These deterministic values are only for the local certification stack;
+      # production deployments must override both with unique secrets.
+      TNG_SECRET_KEY: "${TNG_SECRET_KEY:-local-cert-session-secret-20260904-0123456789abcdef}"
+      TNG_API_TOKENS: "${TNG_API_TOKEN:-local-cert-api-token-20260904}"
       TNG_USER_AGENT: "${TNG_USER_AGENT:-rtorrent/0.16.11/0.16.11}"
       # TNG_PEER_ID is deliberately not defaulted here: the sidecar generates
       # and persists a unique per-install id under data_dir on first start
@@ -96,7 +98,7 @@ services:
       AUTOBRR__HOST: 0.0.0.0
       AUTOBRR__PORT: "7474"
       AUTOBRR__LOG_LEVEL: debug
-      AUTOBRR__SESSION_SECRET: certification-only-change-me
+      AUTOBRR__SESSION_SECRET: local-cert-autobrr-session-secret-20260904
     depends_on:
       - torrentng
 

@@ -14,6 +14,84 @@ use tracing::{debug, info, warn};
 use crate::torrent_task::TorrentCmd;
 
 const DHT_ANNOUNCED_PEERS_PER_INFO_HASH_CAP: usize = 512;
+const DHT_ANNOUNCED_PEER_SET_CAP: usize = 4_096;
+const DHT_ANNOUNCED_PEERS_GLOBAL_CAP: usize = 16_384;
+const DHT_TRACKED_TORRENTS_CAP: usize = 16_384;
+const DHT_QUERIED_NODES_PER_INFO_HASH_CAP: usize = 256;
+const DHT_OUTSTANDING_QUERY_CAP: usize = 8_192;
+const DHT_INGRESS_GLOBAL_PACKETS_PER_SECOND: u32 = 2_048;
+const DHT_INGRESS_PACKETS_PER_IP_PER_SECOND: u32 = 64;
+const DHT_INGRESS_IP_STATE_CAP: usize = 4_096;
+const DHT_INGRESS_WINDOW: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Clone, Copy)]
+struct DhtRateWindow {
+    started_at: Instant,
+    packets: u32,
+}
+
+/// Bounded admission control for the public UDP socket. KRPC parsing and
+/// response generation are both CPU work, so rejecting excess datagrams
+/// before bencode parsing is a correctness boundary, not merely a tuning
+/// knob. Per-IP state is capped so spoofed/rotating sources cannot turn the
+/// limiter itself into an unbounded allocation.
+#[derive(Debug)]
+struct DhtIngressBudget {
+    global: DhtRateWindow,
+    per_ip: HashMap<IpAddr, DhtRateWindow>,
+}
+
+impl DhtIngressBudget {
+    fn new(now: Instant) -> Self {
+        Self {
+            global: DhtRateWindow {
+                started_at: now,
+                packets: 0,
+            },
+            per_ip: HashMap::new(),
+        }
+    }
+
+    fn allow(&mut self, addr: SocketAddr, now: Instant) -> bool {
+        if now.duration_since(self.global.started_at) >= DHT_INGRESS_WINDOW {
+            self.global = DhtRateWindow {
+                started_at: now,
+                packets: 0,
+            };
+            self.per_ip.clear();
+        }
+        if self.global.packets >= DHT_INGRESS_GLOBAL_PACKETS_PER_SECOND {
+            return false;
+        }
+
+        let ip = addr.ip();
+        if !self.per_ip.contains_key(&ip) {
+            if self.per_ip.len() >= DHT_INGRESS_IP_STATE_CAP {
+                return false;
+            }
+            self.per_ip.insert(
+                ip,
+                DhtRateWindow {
+                    started_at: now,
+                    packets: 0,
+                },
+            );
+        }
+        let window = self.per_ip.get_mut(&ip).expect("inserted DHT IP budget");
+        if now.duration_since(window.started_at) >= DHT_INGRESS_WINDOW {
+            *window = DhtRateWindow {
+                started_at: now,
+                packets: 0,
+            };
+        }
+        if window.packets >= DHT_INGRESS_PACKETS_PER_IP_PER_SECOND {
+            return false;
+        }
+        window.packets += 1;
+        self.global.packets += 1;
+        true
+    }
+}
 
 #[derive(Clone)]
 pub struct DhtTorrent {
@@ -88,13 +166,23 @@ pub async fn run_dht(
     };
     task.bootstrap().await;
 
+    let mut ingress_budget = DhtIngressBudget::new(Instant::now());
     let mut bootstrap_tick = interval(Duration::from_secs(300));
     let mut search_tick = interval(Duration::from_secs(30));
     let mut outstanding_sweep_tick = interval(Duration::from_secs(10));
     let mut buf = vec![0u8; 2048];
     loop {
         tokio::select! {
-            Some(cmd) = cmd_rx.recv() => {
+            command = cmd_rx.recv() => {
+                let Some(cmd) = command else {
+                    warn!(
+                        component = "dht",
+                        operation = "run",
+                        result = "command_channel_closed",
+                        "DHT command channel closed; shutting down"
+                    );
+                    break;
+                };
                 if !task.handle_command(cmd).await {
                     break;
                 }
@@ -112,7 +200,16 @@ pub async fn run_dht(
             }
             recv = task.socket.recv_from(&mut buf) => {
                 match recv {
-                    Ok((n, addr)) => task.handle_packet(&buf[..n], addr).await,
+                    Ok((n, addr)) if ingress_budget.allow(addr, Instant::now()) => {
+                        task.handle_packet(&buf[..n], addr).await
+                    }
+                    Ok((_, addr)) => debug!(
+                        component = "dht",
+                        operation = "ingress_rate_limit",
+                        peer = %addr,
+                        result = "rejected",
+                        "DHT packet rate limit exceeded"
+                    ),
                     Err(e) => warn!(
                         component = "dht",
                         operation = "recv",
@@ -173,6 +270,19 @@ impl DhtTask {
     async fn handle_command(&mut self, cmd: DhtCommand) -> bool {
         match cmd {
             DhtCommand::AddTorrent(torrent) => {
+                if !self.torrents.contains_key(&torrent.info_hash)
+                    && self.torrents.len() >= DHT_TRACKED_TORRENTS_CAP
+                {
+                    warn!(
+                        component = "dht",
+                        operation = "track_torrent",
+                        result = "rejected",
+                        reason = "tracked torrent cap exceeded",
+                        cap = DHT_TRACKED_TORRENTS_CAP,
+                        "DHT tracking admission cap exceeded"
+                    );
+                    return true;
+                }
                 self.torrents.insert(torrent.info_hash, torrent.cmd_tx);
                 self.search_torrent(torrent.info_hash, true).await;
             }
@@ -201,20 +311,33 @@ impl DhtTask {
 
     async fn bootstrap(&mut self) {
         for node in self.bootstrap_nodes.clone() {
-            let addrs = match tokio::net::lookup_host(&node).await {
-                Ok(addrs) => addrs,
-                Err(e) => {
-                    warn!(
-                        component = "dht",
-                        operation = "bootstrap_resolve",
-                        node = %node,
-                        result = "error",
-                        error = %e,
-                        "DHT bootstrap resolve failed"
-                    );
-                    continue;
-                }
-            };
+            let addrs =
+                match tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host(&node))
+                    .await
+                {
+                    Ok(Ok(addrs)) => addrs,
+                    Ok(Err(e)) => {
+                        warn!(
+                            component = "dht",
+                            operation = "bootstrap_resolve",
+                                node = %node,
+                                result = "error",
+                                error = %e,
+                                "DHT bootstrap resolve failed"
+                        );
+                        continue;
+                    }
+                    Err(_) => {
+                        warn!(
+                            component = "dht",
+                            operation = "bootstrap_resolve",
+                            node = %node,
+                            result = "timeout",
+                            "DHT bootstrap resolve timed out"
+                        );
+                        continue;
+                    }
+                };
             for addr in addrs {
                 if !addr.is_ipv4() {
                     continue;
@@ -227,15 +350,18 @@ impl DhtTask {
                         target: self.local_id,
                     },
                 };
-                self.outstanding.insert(
-                    tx,
+                if !self.insert_outstanding(
+                    tx.clone(),
                     OutstandingQuery {
                         addr,
                         request: DhtRequest::Bootstrap,
                         sent_at: Instant::now(),
                     },
-                );
+                ) {
+                    break;
+                }
                 if let Err(e) = self.socket.send_to(&msg.encode(), addr).await {
+                    self.outstanding.remove(&tx);
                     warn!(
                         component = "dht",
                         operation = "bootstrap_query",
@@ -444,11 +570,7 @@ impl DhtTask {
         } else {
             socket_addr_with_port(addr, port)
         };
-        remember_announced_peer(
-            self.announced_peers.entry(info_hash).or_default(),
-            peer,
-            DHT_ANNOUNCED_PEERS_PER_INFO_HASH_CAP,
-        );
+        remember_announced_peer_in_map(&mut self.announced_peers, info_hash, peer);
         KrpcMessage::Response {
             transaction_id,
             response: DhtResponse::new(self.local_id),
@@ -456,12 +578,15 @@ impl DhtTask {
     }
 
     fn token_for_addr(&self, addr: SocketAddr) -> Vec<u8> {
-        let mut token = Vec::with_capacity(8);
+        // Bind the token to the complete source address. Using only a prefix
+        // for IPv6 made all hosts sharing that prefix interchangeable for
+        // announce_peer, which defeats the address-binding check.
+        let mut token = Vec::with_capacity(24);
         match addr.ip() {
             IpAddr::V4(ip) => token.extend_from_slice(&ip.octets()),
-            IpAddr::V6(ip) => token.extend_from_slice(&ip.octets()[..4]),
+            IpAddr::V6(ip) => token.extend_from_slice(&ip.octets()),
         }
-        token.extend_from_slice(&self.local_id.as_bytes()[..4]);
+        token.extend_from_slice(&self.local_id.as_bytes()[..8]);
         token
     }
 
@@ -532,8 +657,17 @@ impl DhtTask {
         let SocketAddr::V4(v4) = addr else {
             return;
         };
-        let queried = self.queried_nodes.entry(info_hash).or_default();
-        if !queried.insert(v4) {
+        if self.outstanding.len() >= DHT_OUTSTANDING_QUERY_CAP {
+            return;
+        }
+        if self
+            .queried_nodes
+            .get(&info_hash)
+            .is_some_and(|nodes| nodes.len() >= DHT_QUERIED_NODES_PER_INFO_HASH_CAP)
+        {
+            return;
+        }
+        if !self.queried_nodes.entry(info_hash).or_default().insert(v4) {
             return;
         }
         let tx = self.transaction_id();
@@ -544,15 +678,36 @@ impl DhtTask {
                 info_hash,
             },
         };
-        self.outstanding.insert(
-            tx,
+        if !self.insert_outstanding(
+            tx.clone(),
             OutstandingQuery {
                 addr,
                 request: DhtRequest::GetPeers(info_hash),
                 sent_at: Instant::now(),
             },
-        );
+        ) {
+            let empty = if let Some(queried) = self.queried_nodes.get_mut(&info_hash) {
+                queried.remove(&v4);
+                queried.is_empty()
+            } else {
+                false
+            };
+            if empty {
+                self.queried_nodes.remove(&info_hash);
+            }
+            return;
+        }
         if let Err(e) = self.socket.send_to(&msg.encode(), addr).await {
+            self.outstanding.remove(&tx);
+            let empty = if let Some(queried) = self.queried_nodes.get_mut(&info_hash) {
+                queried.remove(&v4);
+                queried.is_empty()
+            } else {
+                false
+            };
+            if empty {
+                self.queried_nodes.remove(&info_hash);
+            }
             warn!(
                 component = "dht",
                 operation = "send_get_peers",
@@ -571,15 +726,18 @@ impl DhtTask {
         addr: SocketAddr,
     ) {
         let (tx, msg) = self.announce_peer_query(info_hash, token);
-        self.outstanding.insert(
-            tx,
+        if !self.insert_outstanding(
+            tx.clone(),
             OutstandingQuery {
                 addr,
                 request: DhtRequest::AnnouncePeer,
                 sent_at: Instant::now(),
             },
-        );
+        ) {
+            return;
+        }
         if let Err(e) = self.socket.send_to(&msg.encode(), addr).await {
+            self.outstanding.remove(&tx);
             warn!(
                 component = "dht",
                 operation = "send_announce_peer",
@@ -617,8 +775,19 @@ impl DhtTask {
         let Some(tx) = self.torrents.get(&info_hash) else {
             return;
         };
-        if tx.send(TorrentCmd::NewPeers(peers)).await.is_err() {
-            self.torrents.remove(&info_hash);
+        match tx.try_send(TorrentCmd::NewPeers(peers)) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.torrents.remove(&info_hash);
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                debug!(
+                    component = "dht",
+                    operation = "forward_peers",
+                    result = "torrent_queue_full",
+                    "dropping DHT peers for a busy torrent task"
+                );
+            }
         }
     }
 
@@ -658,9 +827,30 @@ impl DhtTask {
     }
 
     fn transaction_id(&mut self) -> Vec<u8> {
-        let tx = self.next_tx.to_be_bytes().to_vec();
-        self.next_tx = self.next_tx.wrapping_add(1).max(1);
-        tx
+        loop {
+            let tx = self.next_tx.to_be_bytes().to_vec();
+            self.next_tx = self.next_tx.wrapping_add(1).max(1);
+            if !self.outstanding.contains_key(&tx) {
+                return tx;
+            }
+        }
+    }
+
+    fn insert_outstanding(&mut self, tx: Vec<u8>, query: OutstandingQuery) -> bool {
+        if self.outstanding.len() >= DHT_OUTSTANDING_QUERY_CAP
+            && !self.outstanding.contains_key(&tx)
+        {
+            debug!(
+                component = "dht",
+                operation = "track_outstanding_query",
+                result = "rejected",
+                cap = DHT_OUTSTANDING_QUERY_CAP,
+                "DHT outstanding-query cap exceeded"
+            );
+            return false;
+        }
+        self.outstanding.insert(tx, query);
+        true
     }
 
     /// TNG-019: drops outstanding queries that never got a response within
@@ -697,6 +887,36 @@ fn remember_announced_peer(peers: &mut Vec<SocketAddr>, peer: SocketAddr, cap: u
     true
 }
 
+fn remember_announced_peer_in_map(
+    peers_by_info_hash: &mut HashMap<[u8; 20], Vec<SocketAddr>>,
+    info_hash: [u8; 20],
+    peer: SocketAddr,
+) -> bool {
+    let total = peers_by_info_hash.values().map(Vec::len).sum::<usize>();
+    if let Some(peers) = peers_by_info_hash.get_mut(&info_hash) {
+        // A duplicate is already represented and must remain an accepted
+        // idempotent announce even when the global cache is full. New peers
+        // must satisfy both the per-swarm and process-wide limits. The old
+        // existing-swarm branch only checked the former, which let a single
+        // known info-hash bypass DHT_ANNOUNCED_PEERS_GLOBAL_CAP entirely.
+        if peers.contains(&peer) {
+            return true;
+        }
+        if total >= DHT_ANNOUNCED_PEERS_GLOBAL_CAP {
+            return false;
+        }
+        return remember_announced_peer(peers, peer, DHT_ANNOUNCED_PEERS_PER_INFO_HASH_CAP);
+    }
+    if peers_by_info_hash.len() >= DHT_ANNOUNCED_PEER_SET_CAP {
+        return false;
+    }
+    if total >= DHT_ANNOUNCED_PEERS_GLOBAL_CAP {
+        return false;
+    }
+    peers_by_info_hash.insert(info_hash, vec![peer]);
+    true
+}
+
 fn socket_addr_with_port(addr: SocketAddr, port: u16) -> SocketAddr {
     match addr {
         SocketAddr::V4(v4) => SocketAddr::V4(SocketAddrV4::new(*v4.ip(), port)),
@@ -707,6 +927,35 @@ fn socket_addr_with_port(addr: SocketAddr, port: u16) -> SocketAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dht_ingress_budget_bounds_each_ip_and_expires_windows() {
+        let now = Instant::now();
+        let mut budget = DhtIngressBudget::new(now);
+        let peer: SocketAddr = "192.0.2.1:6881".parse().unwrap();
+        for _ in 0..DHT_INGRESS_PACKETS_PER_IP_PER_SECOND {
+            assert!(budget.allow(peer, now));
+        }
+        assert!(!budget.allow(peer, now));
+        assert!(budget.allow(peer, now + DHT_INGRESS_WINDOW));
+    }
+
+    #[test]
+    fn dht_ingress_budget_has_bounded_source_state() {
+        let now = Instant::now();
+        let mut budget = DhtIngressBudget::new(now);
+        for octet in 0..DHT_INGRESS_IP_STATE_CAP {
+            let peer: SocketAddr = format!("198.{}.{}.1:6881", (octet / 256) % 256, octet % 256)
+                .parse()
+                .unwrap();
+            let _ = budget.allow(peer, now);
+        }
+        assert_eq!(
+            budget.per_ip.len(),
+            DHT_INGRESS_GLOBAL_PACKETS_PER_SECOND as usize
+        );
+        assert!(budget.per_ip.len() <= DHT_INGRESS_IP_STATE_CAP);
+    }
 
     #[tokio::test]
     async fn transaction_ids_are_nonzero_and_advance() {
@@ -865,6 +1114,62 @@ mod tests {
         assert!(!remember_announced_peer(&mut peers, third, 2));
 
         assert_eq!(peers, vec![first, second]);
+    }
+
+    #[test]
+    fn announced_peer_map_is_bounded_across_info_hashes() {
+        let mut peers = HashMap::new();
+        for index in 0..DHT_ANNOUNCED_PEER_SET_CAP {
+            let mut info_hash = [0_u8; 20];
+            info_hash[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            assert!(remember_announced_peer_in_map(
+                &mut peers,
+                info_hash,
+                "198.51.100.1:6881".parse().unwrap(),
+            ));
+        }
+        let mut next_hash = [0_u8; 20];
+        next_hash[..8].copy_from_slice(&(DHT_ANNOUNCED_PEER_SET_CAP as u64).to_be_bytes());
+        assert!(!remember_announced_peer_in_map(
+            &mut peers,
+            next_hash,
+            "198.51.100.2:6881".parse().unwrap(),
+        ));
+        assert_eq!(peers.len(), DHT_ANNOUNCED_PEER_SET_CAP);
+    }
+
+    #[test]
+    fn announced_peer_global_cap_applies_to_existing_info_hashes() {
+        let mut peers = HashMap::new();
+        for index in 0..(DHT_ANNOUNCED_PEERS_GLOBAL_CAP / DHT_ANNOUNCED_PEERS_PER_INFO_HASH_CAP) {
+            let mut info_hash = [0_u8; 20];
+            info_hash[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            for port in 0..DHT_ANNOUNCED_PEERS_PER_INFO_HASH_CAP {
+                assert!(remember_announced_peer_in_map(
+                    &mut peers,
+                    info_hash,
+                    SocketAddr::from(([198, 51, 100, 1], port as u16 + 1)),
+                ));
+            }
+        }
+
+        let mut existing_hash = [0_u8; 20];
+        existing_hash[..8].copy_from_slice(&0_u64.to_be_bytes());
+        let duplicate = SocketAddr::from(([198, 51, 100, 1], 1));
+        assert!(remember_announced_peer_in_map(
+            &mut peers,
+            existing_hash,
+            duplicate,
+        ));
+        assert!(!remember_announced_peer_in_map(
+            &mut peers,
+            existing_hash,
+            SocketAddr::from(([198, 51, 100, 2], 1)),
+        ));
+        assert_eq!(
+            peers.values().map(Vec::len).sum::<usize>(),
+            DHT_ANNOUNCED_PEERS_GLOBAL_CAP
+        );
     }
 
     #[tokio::test]

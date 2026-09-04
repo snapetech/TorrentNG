@@ -1315,6 +1315,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "base64",
+ "rt-api-model",
  "rt-engine",
  "rt-metainfo",
  "rt-metrics",
@@ -1330,9 +1331,12 @@ dependencies = [
 name = "rt-api-model"
 version = "0.1.0"
 dependencies = [
+ "http",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]
@@ -1352,6 +1356,7 @@ dependencies = [
  "rt-utp",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -1364,6 +1369,8 @@ name = "rt-api-qbit"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "hex",
+ "rand 0.8.6",
  "reqwest",
  "rt-api-model",
  "rt-config",
@@ -1372,6 +1379,7 @@ dependencies = [
  "rt-metainfo",
  "rt-metrics",
  "rt-session",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
@@ -1401,6 +1409,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "base64",
+ "rt-api-model",
  "rt-engine",
  "rt-metainfo",
  "rt-metrics",
@@ -1498,6 +1507,7 @@ name = "rt-fastresume"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "libc",
  "rt-path",
  "rt-piece-map",
  "serde",
@@ -1642,6 +1652,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
+ "tokio",
  "tracing",
  "uuid",
 ]
@@ -2206,6 +2217,7 @@ dependencies = [
  "rt-logging",
  "rt-migrate",
  "rt-session",
+ "rt-storage",
  "rusqlite",
  "serde",
  "serde_json",

@@ -24,6 +24,7 @@ rt-metrics = { path = "../rt-metrics" }
 rt-session = { path = "../rt-session" }
 rt-storage = { path = "../rt-storage" }
 rt-utp = { path = "../rt-utp" }
+sha2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

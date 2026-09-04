@@ -169,6 +169,7 @@ async fn main() -> Result<()> {
         qbit_search_jobs: Arc::new(tokio::sync::RwLock::new(serde_json::Map::new())),
         qbit_next_search_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         qbit_rss_items: Arc::new(tokio::sync::RwLock::new(serde_json::Map::new())),
+        control_plane_write: Arc::new(tokio::sync::Mutex::new(())),
     };
     let app = build_router(state);
 

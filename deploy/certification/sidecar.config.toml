@@ -12,8 +12,8 @@ timeout_secs = 10
 user_agent = "rtorrent/0.16.11/0.16.11"
 
 [auth]
-secret_key = "certification-only-change-me"
-api_tokens = ["cert-token"]
+secret_key = "local-cert-session-secret-20260904-0123456789abcdef"
+api_tokens = ["local-cert-api-token-20260904"]
 trust_proxy_header = false
 
 [workflows]

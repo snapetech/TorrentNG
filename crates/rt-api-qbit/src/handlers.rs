@@ -4,23 +4,25 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use rt_metainfo::{parse_magnet, parse_torrent};
+use rt_api_model::ChunkedVec;
+use rt_metainfo::parse_magnet;
 use serde::{
     ser::{SerializeMap, Serializer},
     Deserialize, Serialize,
 };
 use std::{
-    collections::{hash_map::DefaultHasher, HashMap, HashSet},
+    collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, HashMap, HashSet},
     hash::{Hash, Hasher},
-    net::{IpAddr, SocketAddr},
+    net::SocketAddr,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use tokio::task::JoinSet;
 use url::Url;
 
 use rt_engine::{
-    EngineGlobalLimits, EngineNetworkFeatures, EnginePeerSnapshot, EnginePieceState, EngineStats,
-    EngineTorrentFile, EngineTorrentLimits, EngineTorrentMetadata, EngineTrackerSnapshot,
+    EngineGlobalLimits, EnginePeerSnapshot, EnginePieceState, EngineTorrentFile,
+    EngineTorrentLimits, EngineTorrentMetadata, EngineTrackerSnapshot, OutboundTargetKind,
     QueueMove,
 };
 use rt_metrics::{MemoryClass, MemoryLease};
@@ -30,13 +32,50 @@ use crate::{
         to_qbit_state, QbCategoryInfo, QbFileInfo, QbServerState, QbTorrentInfo,
         QbTorrentProperties, QbTrackerInfo,
     },
-    state::{AppState, TorrentSnapshotError},
+    state::{canonical_sort_key, AppState, JsonMap, TorrentSnapshotError},
 };
 
 // Live qBittorrent compatibility fields are backed by per-torrent engine
 // commands. Keep those projections for interactive pages, but do not turn a
 // full-list response into one actor round-trip per dormant torrent.
 const QBIT_LIVE_PROJECTION_MAX_ENTRIES: usize = 200;
+/// qBittorrent leaves `limit` optional, but returning an unbounded response
+/// makes one legacy request capable of allocating and projecting the entire
+/// session.  Clients that need more data can use explicit offset/limit pages
+/// and the TorrentNG snapshot header.
+const QBIT_DEFAULT_PAGE_SIZE: usize = 200;
+const MAX_TORRENT_LIST_OFFSET: usize = 1_000_000;
+const QBIT_LIMIT_PROJECTION_CONCURRENCY: usize = 64;
+const QBIT_LIVE_PROJECTION_CONCURRENCY: usize = 64;
+
+// These compatibility settings are deliberately separate from the engine's
+// runtime settings.  They are qBittorrent WebUI state, not native transport
+// configuration, but they still need to survive a daemon restart when the
+// native engine is attached.
+const SETTING_QBIT_PREFERENCES: &str = "qbit.preferences";
+const SETTING_QBIT_COOKIES: &str = "qbit.cookies";
+const SETTING_QBIT_API_KEY: &str = "qbit.api_key";
+const SETTING_QBIT_RSS_ITEMS: &str = "qbit.rss_items";
+const SETTING_QBIT_RSS_RULES: &str = "qbit.rss_rules";
+const SETTING_QBIT_SEARCH_PLUGINS: &str = "qbit.search_plugins";
+const MAX_QBIT_PREFERENCE_BYTES: usize = 1024 * 1024;
+const MAX_QBIT_PREFERENCE_KEYS: usize = 512;
+const MAX_QBIT_COOKIE_COUNT: usize = 4096;
+const MAX_QBIT_RSS_ITEMS: usize = 4096;
+const MAX_QBIT_RSS_RULES: usize = 1024;
+const MAX_QBIT_SEARCH_PLUGINS: usize = 256;
+
+async fn category_definitions(state: &AppState) -> Result<BTreeMap<String, String>, String> {
+    if let Some(engine) = &state.engine {
+        return engine.list_categories().await.map(|categories| {
+            categories
+                .into_iter()
+                .map(|category| (category.name, category.save_path.unwrap_or_default()))
+                .collect()
+        });
+    }
+    Ok(state.categories.read().await.clone())
+}
 
 // ---------------------------------------------------------------------------
 // Auth
@@ -202,52 +241,456 @@ pub async fn app_build_info() -> impl IntoResponse {
     )
 }
 
-pub async fn app_preferences(State(state): State<AppState>) -> impl IntoResponse {
-    let save_path = default_save_path(&state).await;
+fn encode_qbit_json<T: Serialize>(value: &T, label: &str) -> Result<String, String> {
+    let bytes = serde_json::to_vec(value).map_err(|error| format!("encoding {label}: {error}"))?;
+    if bytes.len() > MAX_QBIT_PREFERENCE_BYTES {
+        return Err(format!(
+            "{label} exceeds the {} byte compatibility limit",
+            MAX_QBIT_PREFERENCE_BYTES
+        ));
+    }
+    String::from_utf8(bytes).map_err(|error| format!("encoding {label} as UTF-8: {error}"))
+}
+
+fn decode_qbit_preferences(raw: &str) -> Result<JsonMap, String> {
+    decode_qbit_map(
+        raw,
+        "durable qBittorrent preferences",
+        MAX_QBIT_PREFERENCE_KEYS,
+    )
+}
+
+fn validate_qbit_preferences(preferences: &JsonMap) -> Result<(), String> {
+    validate_qbit_map(
+        preferences,
+        "qBittorrent preferences",
+        MAX_QBIT_PREFERENCE_KEYS,
+    )
+}
+
+fn decode_qbit_map(raw: &str, label: &str, max_entries: usize) -> Result<JsonMap, String> {
+    if raw.len() > MAX_QBIT_PREFERENCE_BYTES {
+        return Err(format!(
+            "{label} exceed the {MAX_QBIT_PREFERENCE_BYTES} byte compatibility limit"
+        ));
+    }
+    let values = serde_json::from_str::<JsonMap>(raw)
+        .map_err(|error| format!("decoding {label}: {error}"))?;
+    validate_qbit_map(&values, label, max_entries)?;
+    Ok(values)
+}
+
+fn validate_qbit_map(values: &JsonMap, label: &str, max_entries: usize) -> Result<(), String> {
+    if values.len() > max_entries {
+        return Err(format!("{label} contain more than {max_entries} entries"));
+    }
+    if values.keys().any(|key| key.len() > 256) {
+        return Err(format!("{label} contain a key that is too long"));
+    }
+    // Serialize before accepting an update so deeply nested or otherwise
+    // pathological JSON cannot be retained in the settings table.
+    let _ = encode_qbit_json(values, label)?;
+    Ok(())
+}
+
+async fn load_qbit_preferences(state: &AppState) -> Result<JsonMap, String> {
+    if let Some(engine) = &state.engine {
+        match engine
+            .get_setting(SETTING_QBIT_PREFERENCES.to_owned())
+            .await?
+        {
+            Some(raw) => decode_qbit_preferences(&raw),
+            None => Ok(state.preference_overrides.read().await.clone()),
+        }
+    } else {
+        Ok(state.preference_overrides.read().await.clone())
+    }
+}
+
+async fn save_qbit_preferences(state: &AppState, preferences: JsonMap) -> Result<(), String> {
+    validate_qbit_preferences(&preferences)?;
+    if let Some(engine) = &state.engine {
+        let encoded = encode_qbit_json(&preferences, "qBittorrent preferences")?;
+        engine
+            .set_setting(SETTING_QBIT_PREFERENCES.to_owned(), encoded)
+            .await?;
+    }
+    *state.preference_overrides.write().await = preferences;
+    Ok(())
+}
+
+fn decode_qbit_cookies(raw: &str) -> Result<Vec<serde_json::Value>, String> {
+    if raw.len() > MAX_QBIT_PREFERENCE_BYTES {
+        return Err("durable qBittorrent cookies exceed the compatibility limit".to_owned());
+    }
+    let cookies = serde_json::from_str::<Vec<serde_json::Value>>(raw)
+        .map_err(|error| format!("decoding durable qBittorrent cookies: {error}"))?;
+    if cookies.len() > MAX_QBIT_COOKIE_COUNT || cookies.iter().any(|cookie| !cookie.is_object()) {
+        return Err("durable qBittorrent cookies contain an invalid entry or count".to_owned());
+    }
+    Ok(cookies)
+}
+
+async fn load_qbit_cookies(state: &AppState) -> Result<Vec<serde_json::Value>, String> {
+    if let Some(engine) = &state.engine {
+        match engine.get_setting(SETTING_QBIT_COOKIES.to_owned()).await? {
+            Some(raw) => decode_qbit_cookies(&raw),
+            None => Ok(state.app_cookies.read().await.clone()),
+        }
+    } else {
+        Ok(state.app_cookies.read().await.clone())
+    }
+}
+
+async fn save_qbit_cookies(
+    state: &AppState,
+    cookies: Vec<serde_json::Value>,
+) -> Result<(), String> {
+    if cookies.len() > MAX_QBIT_COOKIE_COUNT || cookies.iter().any(|cookie| !cookie.is_object()) {
+        return Err("qBittorrent cookies contain an invalid entry or count".to_owned());
+    }
+    let encoded = encode_qbit_json(&cookies, "qBittorrent cookies")?;
+    if let Some(engine) = &state.engine {
+        engine
+            .set_setting(SETTING_QBIT_COOKIES.to_owned(), encoded)
+            .await?;
+    }
+    *state.app_cookies.write().await = cookies;
+    Ok(())
+}
+
+async fn save_qbit_api_key(state: &AppState, key: Option<String>) -> Result<(), String> {
+    if let Some(engine) = &state.engine {
+        let encoded = serde_json::to_string(&key)
+            .map_err(|error| format!("encoding qBittorrent API key: {error}"))?;
+        engine
+            .set_setting(SETTING_QBIT_API_KEY.to_owned(), encoded)
+            .await?;
+    }
+    *state.api_key.write().await = key;
+    Ok(())
+}
+
+async fn load_qbit_rss_items(state: &AppState) -> Result<JsonMap, String> {
+    if let Some(engine) = &state.engine {
+        match engine
+            .get_setting(SETTING_QBIT_RSS_ITEMS.to_owned())
+            .await?
+        {
+            Some(raw) => decode_qbit_map(&raw, "durable qBittorrent RSS items", MAX_QBIT_RSS_ITEMS),
+            None => Ok(state.rss_items.read().await.clone()),
+        }
+    } else {
+        Ok(state.rss_items.read().await.clone())
+    }
+}
+
+async fn save_qbit_rss_items(state: &AppState, items: JsonMap) -> Result<(), String> {
+    validate_qbit_map(&items, "qBittorrent RSS items", MAX_QBIT_RSS_ITEMS)?;
+    if let Some(engine) = &state.engine {
+        let encoded = encode_qbit_json(&items, "qBittorrent RSS items")?;
+        engine
+            .set_setting(SETTING_QBIT_RSS_ITEMS.to_owned(), encoded)
+            .await?;
+    }
+    *state.rss_items.write().await = items;
+    Ok(())
+}
+
+async fn load_qbit_rss_rules(state: &AppState) -> Result<JsonMap, String> {
+    if let Some(engine) = &state.engine {
+        match engine
+            .get_setting(SETTING_QBIT_RSS_RULES.to_owned())
+            .await?
+        {
+            Some(raw) => {
+                let rules =
+                    decode_qbit_map(&raw, "durable qBittorrent RSS rules", MAX_QBIT_RSS_RULES)?;
+                validate_qbit_rss_rules(&rules)?;
+                Ok(rules)
+            }
+            None => {
+                let rules = state.rss_rules.read().await.clone();
+                validate_qbit_rss_rules(&rules)?;
+                Ok(rules)
+            }
+        }
+    } else {
+        let rules = state.rss_rules.read().await.clone();
+        validate_qbit_rss_rules(&rules)?;
+        Ok(rules)
+    }
+}
+
+async fn save_qbit_rss_rules(state: &AppState, rules: JsonMap) -> Result<(), String> {
+    validate_qbit_map(&rules, "qBittorrent RSS rules", MAX_QBIT_RSS_RULES)?;
+    validate_qbit_rss_rules(&rules)?;
+    if let Some(engine) = &state.engine {
+        let encoded = encode_qbit_json(&rules, "qBittorrent RSS rules")?;
+        engine
+            .set_setting(SETTING_QBIT_RSS_RULES.to_owned(), encoded)
+            .await?;
+    }
+    *state.rss_rules.write().await = rules;
+    Ok(())
+}
+
+fn validate_qbit_rss_rules(rules: &JsonMap) -> Result<(), String> {
+    for (name, rule) in rules {
+        if name.trim().is_empty() {
+            return Err("qBittorrent RSS rules contain an empty name".to_owned());
+        }
+        let rule = rule
+            .as_object()
+            .ok_or_else(|| format!("qBittorrent RSS rule {name:?} must be a JSON object"))?;
+        for field in [
+            "mustContain",
+            "mustNotContain",
+            "assignedCategory",
+            "savePath",
+            "tags",
+        ] {
+            if let Some(value) = rule.get(field) {
+                if !value.is_string() {
+                    return Err(format!(
+                        "qBittorrent RSS rule {name:?} field {field} must be a string"
+                    ));
+                }
+            }
+        }
+        for field in ["enabled", "addPaused"] {
+            if let Some(value) = rule.get(field) {
+                if !value.is_boolean() {
+                    return Err(format!(
+                        "qBittorrent RSS rule {name:?} field {field} must be a boolean"
+                    ));
+                }
+            }
+        }
+        if let Some(feeds) = rule.get("affectedFeeds") {
+            let feeds = feeds.as_array().ok_or_else(|| {
+                format!("qBittorrent RSS rule {name:?} field affectedFeeds must be an array")
+            })?;
+            if feeds
+                .iter()
+                .any(|feed| feed.as_str().is_none_or(|feed| feed.trim().is_empty()))
+            {
+                return Err(format!(
+                    "qBittorrent RSS rule {name:?} contains an invalid affected feed"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn load_qbit_search_plugins(state: &AppState) -> Result<JsonMap, String> {
+    if let Some(engine) = &state.engine {
+        match engine
+            .get_setting(SETTING_QBIT_SEARCH_PLUGINS.to_owned())
+            .await?
+        {
+            Some(raw) => {
+                let plugins = decode_qbit_map(
+                    &raw,
+                    "durable qBittorrent search plugins",
+                    MAX_QBIT_SEARCH_PLUGINS,
+                )?;
+                validate_qbit_search_plugins(&plugins)?;
+                Ok(plugins)
+            }
+            None => {
+                let plugins = state.search_plugins.read().await.clone();
+                validate_qbit_search_plugins(&plugins)?;
+                Ok(plugins)
+            }
+        }
+    } else {
+        let plugins = state.search_plugins.read().await.clone();
+        validate_qbit_search_plugins(&plugins)?;
+        Ok(plugins)
+    }
+}
+
+async fn save_qbit_search_plugins(state: &AppState, plugins: JsonMap) -> Result<(), String> {
+    validate_qbit_map(
+        &plugins,
+        "qBittorrent search plugins",
+        MAX_QBIT_SEARCH_PLUGINS,
+    )?;
+    validate_qbit_search_plugins(&plugins)?;
+    if let Some(engine) = &state.engine {
+        let encoded = encode_qbit_json(&plugins, "qBittorrent search plugins")?;
+        engine
+            .set_setting(SETTING_QBIT_SEARCH_PLUGINS.to_owned(), encoded)
+            .await?;
+    }
+    *state.search_plugins.write().await = plugins;
+    Ok(())
+}
+
+fn validate_qbit_search_plugins(plugins: &JsonMap) -> Result<(), String> {
+    for (name, plugin) in plugins {
+        if name.trim().is_empty() {
+            return Err("qBittorrent search plugins contain an empty name".to_owned());
+        }
+        let plugin = plugin
+            .as_object()
+            .ok_or_else(|| format!("qBittorrent search plugin {name:?} must be a JSON object"))?;
+        for field in ["name", "fullName", "version", "url"] {
+            if let Some(value) = plugin.get(field) {
+                if !value.is_string() {
+                    return Err(format!(
+                        "qBittorrent search plugin {name:?} field {field} must be a string"
+                    ));
+                }
+            }
+        }
+        if let Some(enabled) = plugin.get("enabled") {
+            if !enabled.is_boolean() {
+                return Err(format!(
+                    "qBittorrent search plugin {name:?} field enabled must be a boolean"
+                ));
+            }
+        }
+        if let Some(categories) = plugin.get("supportedCategories") {
+            let categories = categories.as_array().ok_or_else(|| {
+                format!(
+                    "qBittorrent search plugin {name:?} field supportedCategories must be an array"
+                )
+            })?;
+            if categories.iter().any(|category| {
+                category
+                    .as_str()
+                    .is_none_or(|category| category.trim().is_empty())
+            }) {
+                return Err(format!(
+                    "qBittorrent search plugin {name:?} contains an invalid supported category"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn qbit_backend_error(error: impl std::fmt::Display) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": {
+                "code": "SERVICE_UNAVAILABLE",
+                "message": error.to_string(),
+            }
+        })),
+    )
+        .into_response()
+}
+
+fn qbit_engine_error_status(error: impl std::fmt::Display) -> StatusCode {
+    let message = error.to_string();
+    if message.to_ascii_lowercase().contains("not found") {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
+pub async fn app_preferences(State(state): State<AppState>) -> Response {
+    let stored_preferences = match load_qbit_preferences(&state).await {
+        Ok(preferences) => preferences,
+        Err(error) => return qbit_backend_error(error),
+    };
+    let save_path = match default_save_path(&state, &stored_preferences).await {
+        Ok(path) => path,
+        Err(error) => return qbit_backend_error(error),
+    };
     let mut preferences = qbit_preferences(save_path);
     if let Some(map) = preferences.as_object_mut() {
         if let Some(engine) = &state.engine {
-            if let Ok(features) = engine.network_features().await {
-                map.insert("dht".to_owned(), serde_json::Value::Bool(features.dht));
-                map.insert("pex".to_owned(), serde_json::Value::Bool(features.pex));
-            }
+            let features = match engine.network_features().await {
+                Ok(features) => features,
+                Err(_) => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({
+                            "error": {
+                                "code": "SERVICE_UNAVAILABLE",
+                                "message": "native engine network features are unavailable",
+                            }
+                        })),
+                    )
+                        .into_response()
+                }
+            };
+            map.insert("dht".to_owned(), serde_json::Value::Bool(features.dht));
+            map.insert("pex".to_owned(), serde_json::Value::Bool(features.pex));
         }
-        let banned_ips = state
-            .banned_peers
-            .read()
-            .await
-            .iter()
-            .map(ToString::to_string)
+        let banned_ips = if let Some(engine) = &state.engine {
+            match engine.banned_peers().await {
+                Ok(peers) => peers,
+                Err(_) => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({
+                            "error": {
+                                "code": "SERVICE_UNAVAILABLE",
+                                "message": "native engine peer-ban state is unavailable",
+                            }
+                        })),
+                    )
+                        .into_response()
+                }
+            }
+            .into_iter()
+            .map(|peer| peer.to_string())
             .collect::<Vec<_>>()
-            .join("\n");
+            .join("\n")
+        } else {
+            state
+                .banned_peers
+                .read()
+                .await
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
         map.insert(
             "banned_ips".to_owned(),
             serde_json::Value::String(banned_ips),
         );
-        for (key, value) in state.preference_overrides.read().await.iter() {
+        for (key, value) in &stored_preferences {
+            // DHT/PEX are read from the engine above. Do not let a stale
+            // compatibility override mask the authoritative runtime value.
+            if matches!(key.as_str(), "dht" | "pex") {
+                continue;
+            }
             map.insert(key.clone(), value.clone());
         }
     }
-    (StatusCode::OK, Json(preferences))
+    (StatusCode::OK, Json(preferences)).into_response()
 }
 
-pub async fn app_set_preferences(State(state): State<AppState>, body: String) -> impl IntoResponse {
+pub async fn app_set_preferences(State(state): State<AppState>, body: String) -> Response {
     match qbit_preference_payload(&body) {
         Some(serde_json::Value::Object(updates)) => {
+            if updates
+                .iter()
+                .filter(|(key, _)| matches!(key.as_str(), "dht" | "pex"))
+                .any(|(_, value)| !value.is_boolean())
+            {
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+            let _write = state.preference_write.lock().await;
+            let mut stored_preferences = match load_qbit_preferences(&state).await {
+                Ok(preferences) => preferences,
+                Err(error) => return qbit_backend_error(error),
+            };
             if let Some(engine) = &state.engine {
                 if updates.contains_key("dht") || updates.contains_key("pex") {
                     let mut features = match engine.network_features().await {
                         Ok(features) => features,
-                        Err(_) => EngineNetworkFeatures {
-                            dht: updates
-                                .get("dht")
-                                .and_then(serde_json::Value::as_bool)
-                                .unwrap_or(true),
-                            pex: updates
-                                .get("pex")
-                                .and_then(serde_json::Value::as_bool)
-                                .unwrap_or(true),
-                        },
+                        Err(error) => return qbit_backend_error(error),
                     };
                     if let Some(value) = updates.get("dht").and_then(serde_json::Value::as_bool) {
                         features.dht = value;
@@ -255,29 +698,50 @@ pub async fn app_set_preferences(State(state): State<AppState>, body: String) ->
                     if let Some(value) = updates.get("pex").and_then(serde_json::Value::as_bool) {
                         features.pex = value;
                     }
-                    if engine.update_network_features(features).await.is_err() {
-                        return StatusCode::INTERNAL_SERVER_ERROR;
+                    if let Err(error) = engine.update_network_features(features).await {
+                        return qbit_backend_error(error);
                     }
                 }
             }
-            state.preference_overrides.write().await.extend(updates);
-            StatusCode::OK
+            let mut stored_updates = updates;
+            if state.engine.is_some() {
+                // These two keys are applied to and read back from the native
+                // engine. Keeping a second facade copy would create split
+                // brain state after a restart or another control-plane write.
+                stored_updates.remove("dht");
+                stored_updates.remove("pex");
+            }
+            stored_preferences.extend(stored_updates);
+            if let Err(error) = save_qbit_preferences(&state, stored_preferences).await {
+                return qbit_backend_error(error);
+            }
+            StatusCode::OK.into_response()
         }
-        Some(_) => StatusCode::BAD_REQUEST,
-        None => StatusCode::BAD_REQUEST,
+        Some(_) | None => StatusCode::BAD_REQUEST.into_response(),
     }
 }
 
-pub async fn app_shutdown() -> impl IntoResponse {
+pub async fn app_shutdown(State(state): State<AppState>) -> impl IntoResponse {
+    if let Some(shutdown) = state.shutdown {
+        // `notify_one` retains the permit if the daemon's graceful-shutdown
+        // future has not reached its select yet, so an early HTTP request
+        // cannot be lost in a startup race.
+        shutdown.notify_one();
+    }
     StatusCode::OK
 }
 
 pub async fn app_send_test_email() -> impl IntoResponse {
-    StatusCode::OK
+    // No SMTP subsystem is configured by TorrentNG. Returning 200 here would
+    // make qBittorrent report a successful side effect that never occurred.
+    StatusCode::NOT_IMPLEMENTED
 }
 
-pub async fn app_get_cookies(State(state): State<AppState>) -> impl IntoResponse {
-    let mut cookies = state.app_cookies.read().await.clone();
+pub async fn app_get_cookies(State(state): State<AppState>) -> Response {
+    let mut cookies = match load_qbit_cookies(&state).await {
+        Ok(cookies) => cookies,
+        Err(error) => return qbit_backend_error(error),
+    };
     cookies.sort_by(|a, b| {
         a.get("host")
             .and_then(serde_json::Value::as_str)
@@ -298,31 +762,41 @@ pub async fn app_get_cookies(State(state): State<AppState>) -> impl IntoResponse
                     )
             })
     });
-    (StatusCode::OK, Json(cookies))
+    (StatusCode::OK, Json(cookies)).into_response()
 }
 
-pub async fn app_set_cookies(State(state): State<AppState>, body: String) -> impl IntoResponse {
+pub async fn app_set_cookies(State(state): State<AppState>, body: String) -> Response {
     let Some(cookies) = qbit_cookie_payload(&body) else {
-        return StatusCode::BAD_REQUEST;
+        return StatusCode::BAD_REQUEST.into_response();
     };
-    *state.app_cookies.write().await = cookies;
-    StatusCode::OK
+    let _write = state.preference_write.lock().await;
+    match save_qbit_cookies(&state, cookies).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(error) => qbit_backend_error(error),
+    }
 }
 
-pub async fn app_rotate_api_key(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn app_rotate_api_key(State(state): State<AppState>) -> Response {
     let key = new_qbit_api_key();
-    *state.api_key.write().await = Some(key.clone());
+    let _write = state.preference_write.lock().await;
+    if let Err(error) = save_qbit_api_key(&state, Some(key.clone())).await {
+        return qbit_backend_error(error);
+    }
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "apiKey": key,
         })),
     )
+        .into_response()
 }
 
-pub async fn app_delete_api_key(State(state): State<AppState>) -> impl IntoResponse {
-    *state.api_key.write().await = None;
-    StatusCode::OK
+pub async fn app_delete_api_key(State(state): State<AppState>) -> Response {
+    let _write = state.preference_write.lock().await;
+    match save_qbit_api_key(&state, None).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(error) => qbit_backend_error(error),
+    }
 }
 
 pub async fn app_network_interface_list() -> impl IntoResponse {
@@ -346,7 +820,13 @@ pub async fn app_network_interface_address_list() -> impl IntoResponse {
 }
 
 pub async fn app_default_save_path(State(state): State<AppState>) -> impl IntoResponse {
-    (StatusCode::OK, default_save_path(&state).await)
+    match load_qbit_preferences(&state).await {
+        Ok(preferences) => match default_save_path(&state, &preferences).await {
+            Ok(path) => (StatusCode::OK, path).into_response(),
+            Err(error) => qbit_backend_error(error),
+        },
+        Err(error) => qbit_backend_error(error),
+    }
 }
 
 fn qbit_preferences(save_path: String) -> serde_json::Value {
@@ -504,6 +984,9 @@ fn qbit_preferences(save_path: String) -> serde_json::Value {
 }
 
 fn qbit_preference_payload(body: &str) -> Option<serde_json::Value> {
+    if body.len() > MAX_QBIT_PREFERENCE_BYTES {
+        return None;
+    }
     let trimmed = body.trim();
     if trimmed.starts_with('{') {
         return serde_json::from_str(trimmed).ok();
@@ -514,6 +997,9 @@ fn qbit_preference_payload(body: &str) -> Option<serde_json::Value> {
 }
 
 fn qbit_cookie_payload(body: &str) -> Option<Vec<serde_json::Value>> {
+    if body.len() > MAX_QBIT_PREFERENCE_BYTES {
+        return None;
+    }
     let trimmed = body.trim();
     let value = if trimmed.starts_with('[') {
         serde_json::from_str(trimmed).ok()?
@@ -528,21 +1014,23 @@ fn qbit_cookie_payload(body: &str) -> Option<Vec<serde_json::Value>> {
     };
     match value {
         serde_json::Value::Array(cookies) => Some(
-            cookies
-                .into_iter()
-                .filter(|cookie| cookie.is_object())
-                .collect::<Vec<_>>(),
+            if cookies.len() > MAX_QBIT_COOKIE_COUNT
+                || cookies.iter().any(|cookie| !cookie.is_object())
+            {
+                return None;
+            } else {
+                cookies
+            },
         ),
         _ => None,
     }
 }
 
 fn new_qbit_api_key() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
-    format!("tng_{nanos:032x}")
+    let mut bytes = [0_u8; 32];
+    let mut rng = rand::thread_rng();
+    rand::RngCore::fill_bytes(&mut rng, &mut bytes);
+    format!("tng_{}", hex::encode(bytes))
 }
 
 // ---------------------------------------------------------------------------
@@ -569,6 +1057,19 @@ pub async fn torrents_info(
     State(state): State<AppState>,
     Query(q): Query<TorrentsInfoQuery>,
 ) -> impl IntoResponse {
+    if let Err((status, message)) = validate_qbit_filter(q.filter.as_deref()) {
+        return (status, message).into_response();
+    }
+    if let Err((status, message)) = validate_qbit_sort(q.sort.as_deref()) {
+        return (status, message).into_response();
+    }
+    if q.offset.unwrap_or(0) > MAX_TORRENT_LIST_OFFSET {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("offset is limited to {MAX_TORRENT_LIST_OFFSET}"),
+        )
+            .into_response();
+    }
     let snapshot = match state.torrent_snapshot(q.snapshot).await {
         Ok(snapshot) => snapshot,
         Err(TorrentSnapshotError::Expired { revision }) => {
@@ -580,42 +1081,38 @@ pub async fn torrents_info(
         }
     };
     let torrent_count = snapshot.entries.len();
-    let hashes = q.hashes.as_deref().and_then(|hashes| {
-        let hashes = hashes
-            .split('|')
-            .filter(|hash| !hash.is_empty())
-            .map(str::to_owned)
-            .collect::<HashSet<_>>();
-        if hashes.is_empty() || hashes.contains("all") {
-            None
-        } else {
-            Some(hashes)
-        }
-    });
-    let order = snapshot.ordered_indices(q.sort.as_deref(), |left, right| {
-        match q.sort.as_deref().unwrap_or_default() {
-            "size" => left.total_length.cmp(&right.total_length),
-            "progress" => torrent_progress(
-                left.total_length,
-                left.amount_left,
-                left.completed_at.is_some(),
-            )
-            .total_cmp(&torrent_progress(
-                right.total_length,
-                right.amount_left,
-                right.completed_at.is_some(),
-            )),
-            "ratio" => left.stats.ratio().total_cmp(&right.stats.ratio()),
-            "added_on" => left.added_at.cmp(&right.added_at),
-            "completion_on" => left
-                .completed_at
-                .unwrap_or(0)
-                .cmp(&right.completed_at.unwrap_or(0)),
-            "category" => left.category.cmp(&right.category),
-            "state" => to_qbit_state(left.state.as_str()).cmp(to_qbit_state(right.state.as_str())),
-            "dlspeed" | "upspeed" => left.info_hash.cmp(&right.info_hash),
-            _ => left.name.cmp(&right.name),
-        }
+    let hashes = match q.hashes.as_deref().map(str::trim) {
+        None | Some("") | Some("all") => None,
+        Some(raw) => match strict_hashes_from_str(raw) {
+            Some(values) => Some(values.into_iter().collect::<HashSet<_>>()),
+            None => {
+                return (StatusCode::BAD_REQUEST, "invalid hashes filter").into_response();
+            }
+        },
+    };
+    let sort = canonical_sort_key(q.sort.as_deref());
+    let order = snapshot.ordered_indices(Some(sort), |left, right| match sort {
+        "hash" => left.info_hash.cmp(&right.info_hash),
+        "size" => left.total_length.cmp(&right.total_length),
+        "progress" => torrent_progress(
+            left.total_length,
+            left.amount_left,
+            left.completed_at.is_some(),
+        )
+        .total_cmp(&torrent_progress(
+            right.total_length,
+            right.amount_left,
+            right.completed_at.is_some(),
+        )),
+        "ratio" => left.stats.ratio().total_cmp(&right.stats.ratio()),
+        "added_on" => left.added_at.cmp(&right.added_at),
+        "completion_on" => left
+            .completed_at
+            .unwrap_or(0)
+            .cmp(&right.completed_at.unwrap_or(0)),
+        "category" => left.category.cmp(&right.category),
+        "state" => to_qbit_state(left.state.as_str()).cmp(to_qbit_state(right.state.as_str())),
+        _ => left.name.cmp(&right.name),
     });
     let (indexed_states, completed_only) = indexed_qbit_filter(q.filter.as_deref());
     let candidates = snapshot.candidate_indices(
@@ -626,7 +1123,7 @@ pub async fn torrents_info(
         q.tag.as_deref(),
     );
     let offset = q.offset.unwrap_or(0);
-    let limit = q.limit.unwrap_or(torrent_count);
+    let limit = q.limit.unwrap_or(QBIT_DEFAULT_PAGE_SIZE).clamp(1, 5_000);
     let descending = q.reverse.unwrap_or(false);
     let mut skipped = 0;
     let mut selected = Vec::with_capacity(limit.min(torrent_count));
@@ -642,7 +1139,10 @@ pub async fn torrents_info(
         {
             continue;
         }
-        let entry = &snapshot.entries[*index];
+        let entry = snapshot
+            .entries
+            .get(*index)
+            .expect("snapshot index is valid");
         if !qbit_entry_matches(entry, &q, hashes.as_ref()) {
             continue;
         }
@@ -669,20 +1169,47 @@ pub async fn torrents_info(
     } else {
         None
     };
-    let active_rechecks = active_recheck_hashes(&state).await;
+    let active_rechecks = match active_recheck_hashes(&state).await {
+        Ok(active_rechecks) => active_rechecks,
+        Err(error) => return qbit_backend_unavailable(&error),
+    };
     let include_live = selected.len() <= QBIT_LIVE_PROJECTION_MAX_ENTRIES;
-    let mut infos = Vec::with_capacity(selected.len());
-    for index in selected {
-        infos.push(
-            qbit_torrent_info(
+    let infos = if include_live {
+        let entries = selected
+            .iter()
+            .map(|index| {
+                snapshot
+                    .entries
+                    .get(*index)
+                    .expect("snapshot index is valid")
+                    .clone()
+            })
+            .collect();
+        match load_qbit_live_projections(&state, entries, active_rechecks).await {
+            Ok(infos) => infos,
+            Err(error) => return qbit_backend_unavailable(&error),
+        }
+    } else {
+        let mut infos = Vec::with_capacity(selected.len());
+        for index in selected {
+            let info = match qbit_torrent_info(
                 &state,
-                &snapshot.entries[index],
+                snapshot
+                    .entries
+                    .get(index)
+                    .expect("snapshot index is valid"),
                 &active_rechecks,
-                include_live,
+                false,
             )
-            .await,
-        );
-    }
+            .await
+            {
+                Ok(info) => info,
+                Err(error) => return qbit_backend_unavailable(&error),
+            };
+            infos.push(info);
+        }
+        infos
+    };
     state
         .api_metrics
         .record_estimated_response_bytes(estimate_qbit_torrent_info_snapshot_bytes(infos.len()));
@@ -703,8 +1230,71 @@ fn indexed_qbit_filter(filter: Option<&str>) -> (Vec<&'static str>, bool) {
         Some("seeding" | "uploading") => (vec!["seeding"], false),
         Some("completed") => (Vec::new(), true),
         Some("paused") => (vec!["paused", "stopped"], false),
+        Some("active" | "resumed") => (
+            vec![
+                "metadata_pending",
+                "checking",
+                "seeding",
+                "downloading",
+                "queued",
+            ],
+            false,
+        ),
+        Some("errored") => (vec!["error"], false),
+        Some("checking") => (vec!["checking"], false),
         _ => (Vec::new(), false),
     }
+}
+
+fn validate_qbit_filter(filter: Option<&str>) -> Result<(), (StatusCode, &'static str)> {
+    let Some(filter) = filter.map(str::trim) else {
+        return Ok(());
+    };
+    if filter.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "qBittorrent filter must not be empty",
+        ));
+    }
+    if matches!(
+        filter,
+        "stalled" | "stalled_uploading" | "stalled_downloading" | "moving" | "missingFiles"
+    ) {
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            "qBittorrent filter is not runtime-backed by the native engine",
+        ));
+    }
+    if !matches!(
+        filter,
+        "all"
+            | "downloading"
+            | "seeding"
+            | "completed"
+            | "paused"
+            | "active"
+            | "inactive"
+            | "resumed"
+            | "checking"
+            | "errored"
+            | "uploading"
+    ) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "unknown qBittorrent torrent filter",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_qbit_sort(sort: Option<&str>) -> Result<(), (StatusCode, &'static str)> {
+    if matches!(sort.map(str::trim), Some("dlspeed" | "upspeed")) {
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            "qBittorrent speed sorting is not runtime-backed by the native engine",
+        ));
+    }
+    Ok(())
 }
 
 fn qbit_entry_matches(
@@ -735,6 +1325,32 @@ fn qbit_entry_matches(
             "seeding" | "uploading" if qb_state != "uploading" => return false,
             "completed" if entry.completed_at.is_none() => return false,
             "paused" if !matches!(qb_state, "pausedUP" | "pausedDL") => return false,
+            "active" | "resumed"
+                if !matches!(
+                    entry.state,
+                    rt_session::TorrentState::MetadataPending
+                        | rt_session::TorrentState::Checking
+                        | rt_session::TorrentState::Seeding
+                        | rt_session::TorrentState::Downloading
+                        | rt_session::TorrentState::Queued
+                ) =>
+            {
+                return false
+            }
+            "inactive"
+                if matches!(
+                    entry.state,
+                    rt_session::TorrentState::MetadataPending
+                        | rt_session::TorrentState::Checking
+                        | rt_session::TorrentState::Seeding
+                        | rt_session::TorrentState::Downloading
+                        | rt_session::TorrentState::Queued
+                ) =>
+            {
+                return false
+            }
+            "checking" if entry.state != rt_session::TorrentState::Checking => return false,
+            "errored" if entry.state != rt_session::TorrentState::Error => return false,
             _ => {}
         }
     }
@@ -757,40 +1373,253 @@ pub async fn torrents_add(
     let mut urls = String::new();
     let mut category = String::new();
     let mut tags = Vec::<String>::new();
-    let mut added_url_torrent = false;
+    let mut skip_checking = false;
+    let mut content_layout: Option<String> = None;
+    let mut auto_tmm: Option<bool> = None;
+    let mut ratio_limit: Option<f64> = None;
+    let mut seeding_time_limit: Option<i64> = None;
 
-    while let Ok(Some(field)) = multipart.next_field().await {
+    loop {
+        let Some(field) = (match multipart.next_field().await {
+            Ok(field) => field,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid multipart body: {error}"),
+                )
+                    .into_response()
+            }
+        }) else {
+            break;
+        };
         let name = field.name().map(str::to_owned);
         match name.as_deref() {
             Some("savepath") => {
-                save_path = field.text().await.unwrap_or_default();
+                save_path = match field.text().await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            format!("invalid savepath field: {error}"),
+                        )
+                            .into_response()
+                    }
+                };
             }
             Some("paused") => {
-                paused = field.text().await.unwrap_or_default() == "true";
+                paused = match field.text().await {
+                    Ok(value) => match parse_qbit_bool(value.trim()) {
+                        Some(value) => value,
+                        None => return StatusCode::BAD_REQUEST.into_response(),
+                    },
+                    Err(error) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            format!("invalid paused field: {error}"),
+                        )
+                            .into_response()
+                    }
+                };
             }
             Some("stopped") => {
-                stopped = field.text().await.unwrap_or_default() == "true";
+                stopped = match field.text().await {
+                    Ok(value) => match parse_qbit_bool(value.trim()) {
+                        Some(value) => value,
+                        None => return StatusCode::BAD_REQUEST.into_response(),
+                    },
+                    Err(error) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            format!("invalid stopped field: {error}"),
+                        )
+                            .into_response()
+                    }
+                };
             }
             Some("urls") => {
-                urls = field.text().await.unwrap_or_default();
+                urls = match field.text().await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            format!("invalid urls field: {error}"),
+                        )
+                            .into_response()
+                    }
+                };
             }
             Some("category") => {
-                category = field.text().await.unwrap_or_default();
+                category = match field.text().await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            format!("invalid category field: {error}"),
+                        )
+                            .into_response()
+                    }
+                };
             }
             Some("tags") => {
-                tags = split_tags(&field.text().await.unwrap_or_default());
+                let value = match field.text().await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            format!("invalid tags field: {error}"),
+                        )
+                            .into_response()
+                    }
+                };
+                tags = match strict_tag_values(&value, true) {
+                    Ok(tags) => tags,
+                    Err(()) => return (StatusCode::BAD_REQUEST, "Fails.").into_response(),
+                };
             }
-            Some("torrents") => {
-                if let Ok(bytes) = field.bytes().await {
-                    torrent_blobs.push(bytes.to_vec());
+            Some("skip_checking") => {
+                skip_checking = match field.text().await {
+                    Ok(value) => match parse_qbit_bool(value.trim()) {
+                        Some(value) => value,
+                        None => return StatusCode::BAD_REQUEST.into_response(),
+                    },
+                    Err(error) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            format!("invalid skip_checking field: {error}"),
+                        )
+                            .into_response()
+                    }
+                };
+            }
+            Some("contentLayout") => {
+                content_layout = Some(match field.text().await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            format!("invalid contentLayout field: {error}"),
+                        )
+                            .into_response()
+                    }
+                });
+            }
+            Some("autoTMM") | Some("useAutoTMM") => {
+                auto_tmm = Some(match field.text().await {
+                    Ok(value) => match parse_qbit_bool(value.trim()) {
+                        Some(value) => value,
+                        None => return StatusCode::BAD_REQUEST.into_response(),
+                    },
+                    Err(error) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            format!("invalid autoTMM field: {error}"),
+                        )
+                            .into_response()
+                    }
+                });
+            }
+            Some("ratioLimit") => {
+                ratio_limit = Some(match field.text().await {
+                    Ok(value) => match value.parse::<f64>() {
+                        Ok(value)
+                            if value.is_finite()
+                                && (value >= 0.0 || value == -1.0 || value == -2.0) =>
+                        {
+                            value
+                        }
+                        _ => return StatusCode::BAD_REQUEST.into_response(),
+                    },
+                    Err(error) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            format!("invalid ratioLimit field: {error}"),
+                        )
+                            .into_response()
+                    }
+                });
+            }
+            Some("seedingTimeLimit") => {
+                seeding_time_limit = Some(match field.text().await {
+                    Ok(value) => match value.parse::<i64>() {
+                        Ok(value) if value >= 0 || value == -1 || value == -2 => value,
+                        _ => return StatusCode::BAD_REQUEST.into_response(),
+                    },
+                    Err(error) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            format!("invalid seedingTimeLimit field: {error}"),
+                        )
+                            .into_response()
+                    }
+                });
+            }
+            Some("torrents") => match field.bytes().await {
+                Ok(bytes) => torrent_blobs.push(bytes.to_vec()),
+                Err(error) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        format!("invalid torrent field: {error}"),
+                    )
+                        .into_response()
                 }
+            },
+            Some(name) => {
+                // Do not silently discard a qBit add option. If it has no
+                // native engine contract, accepting the request would create
+                // a torrent with policy different from the caller's request.
+                let _ = field.text().await;
+                tracing::info!(
+                    component = "api",
+                    operation = "add_torrent",
+                    field = %name,
+                    result = "unsupported",
+                    "qBit add option has no native engine contract"
+                );
+                return (StatusCode::NOT_IMPLEMENTED, "Fails.").into_response();
             }
-            _ => {}
+            None => {
+                let _ = field.text().await;
+                return (StatusCode::BAD_REQUEST, "multipart field is missing a name")
+                    .into_response();
+            }
         }
     }
 
-    for url in urls.lines().map(str::trim).filter(|url| !url.is_empty()) {
-        if url.starts_with("magnet:") {
+    if skip_checking
+        || content_layout.as_deref().is_some_and(|layout| {
+            !layout.trim().is_empty() && !layout.eq_ignore_ascii_case("Original")
+        })
+        || auto_tmm == Some(true)
+    {
+        return (StatusCode::NOT_IMPLEMENTED, "Fails.").into_response();
+    }
+
+    if save_path.trim().is_empty() {
+        let preferences = match load_qbit_preferences(&state).await {
+            Ok(preferences) => preferences,
+            Err(error) => return qbit_backend_error(error),
+        };
+        save_path = match default_save_path(&state, &preferences).await {
+            Ok(path) => path,
+            Err(error) => return qbit_backend_error(error),
+        };
+    }
+
+    let url_values = if urls.trim().is_empty() {
+        Vec::new()
+    } else {
+        let values = urls.lines().map(str::trim).collect::<Vec<_>>();
+        if values.iter().any(|url| url.is_empty()) {
+            return (StatusCode::BAD_REQUEST, "Fails.").into_response();
+        }
+        values
+    };
+    let mut added_hashes = Vec::new();
+    for url in url_values {
+        if url
+            .get(.."magnet:".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("magnet:"))
+        {
             let magnet = match parse_magnet(url) {
                 Ok(magnet) => magnet,
                 Err(e) => {
@@ -802,6 +1631,7 @@ pub async fn torrents_add(
                         error = %e,
                         "qBit magnet parse failed"
                     );
+                    rollback_qbit_added_torrents(engine, &added_hashes).await;
                     return (StatusCode::BAD_REQUEST, "Fails.").into_response();
                 }
             };
@@ -810,7 +1640,7 @@ pub async fn torrents_add(
             } else {
                 Some(std::path::PathBuf::from(save_path.clone()))
             };
-            if let Err(e) = engine
+            let hash = match engine
                 .add_magnet_with_labels(
                     magnet,
                     save_path,
@@ -820,19 +1650,46 @@ pub async fn torrents_add(
                 )
                 .await
             {
-                tracing::error!(
-                    component = "api",
-                    operation = "add_magnet",
-                    result = "error",
-                    error = %e,
-                    "qBit magnet add failed"
-                );
-                return (StatusCode::BAD_REQUEST, "Fails.").into_response();
+                Ok(hash) => hash,
+                Err(e) => {
+                    tracing::error!(
+                        component = "api",
+                        operation = "add_magnet",
+                        result = "error",
+                        error = %e,
+                        "qBit magnet add failed"
+                    );
+                    rollback_qbit_added_torrents(engine, &added_hashes).await;
+                    return (StatusCode::BAD_REQUEST, "Fails.").into_response();
+                }
+            };
+            if ratio_limit.is_some_and(|value| value >= 0.0)
+                || seeding_time_limit.is_some_and(|value| value >= 0)
+            {
+                let mut limits = match engine.torrent_limits(hash.clone()).await {
+                    Ok(limits) => limits,
+                    Err(error) => {
+                        rollback_qbit_added_torrents(engine, &added_hashes).await;
+                        let _ = engine.remove_torrent(hash, false).await;
+                        return qbit_engine_error_status(error).into_response();
+                    }
+                };
+                if let Some(value) = ratio_limit {
+                    limits.seed_ratio_limit = (value >= 0.0).then_some(value);
+                }
+                if let Some(value) = seeding_time_limit {
+                    limits.seed_idle_limit = (value >= 0).then_some(value);
+                }
+                if let Err(error) = engine.update_torrent_limits(hash.clone(), limits).await {
+                    rollback_qbit_added_torrents(engine, &added_hashes).await;
+                    let _ = engine.remove_torrent(hash, false).await;
+                    return qbit_engine_error_status(error).into_response();
+                }
             }
-            added_url_torrent = true;
+            added_hashes.push(hash);
             continue;
         }
-        match fetch_torrent_url(url).await {
+        match fetch_torrent_url(url, &state.egress_policy).await {
             Ok(raw) => torrent_blobs.push(raw),
             Err(e) => {
                 tracing::error!(
@@ -843,13 +1700,14 @@ pub async fn torrents_add(
                     error = %e,
                     "qBit torrent URL fetch failed"
                 );
+                rollback_qbit_added_torrents(engine, &added_hashes).await;
                 return (StatusCode::BAD_REQUEST, "Fails.").into_response();
             }
         }
     }
 
     if torrent_blobs.is_empty() {
-        if added_url_torrent {
+        if !added_hashes.is_empty() {
             return (StatusCode::OK, "Ok.").into_response();
         }
         return (StatusCode::BAD_REQUEST, "Fails.").into_response();
@@ -863,22 +1721,9 @@ pub async fn torrents_add(
     let start_paused = paused || stopped;
 
     for raw in torrent_blobs {
-        let meta = match parse_torrent(&raw) {
-            Ok(meta) => meta,
-            Err(e) => {
-                tracing::error!(
-                    component = "api",
-                    operation = "add_torrent",
-                    result = "error",
-                    error = %e,
-                    "qBit torrent parse failed"
-                );
-                return (StatusCode::BAD_REQUEST, "Fails.").into_response();
-            }
-        };
-        if let Err(e) = engine
-            .add_torrent_with_labels(
-                meta,
+        let hash = match engine
+            .add_torrent_raw_with_labels(
+                raw,
                 save_path.clone(),
                 start_paused,
                 Some(category.clone()),
@@ -886,33 +1731,76 @@ pub async fn torrents_add(
             )
             .await
         {
-            tracing::error!(
-                component = "api",
-                operation = "add_torrent",
-                result = "error",
-                error = %e,
-                "qBit torrent add failed"
-            );
-            return (StatusCode::BAD_REQUEST, "Fails.").into_response();
+            Ok(hash) => hash,
+            Err(e) => {
+                tracing::error!(
+                    component = "api",
+                    operation = "add_torrent",
+                    result = "error",
+                    error = %e,
+                    "qBit torrent add failed"
+                );
+                rollback_qbit_added_torrents(engine, &added_hashes).await;
+                return (StatusCode::BAD_REQUEST, "Fails.").into_response();
+            }
+        };
+        if ratio_limit.is_some_and(|value| value >= 0.0)
+            || seeding_time_limit.is_some_and(|value| value >= 0)
+        {
+            let mut limits = match engine.torrent_limits(hash.clone()).await {
+                Ok(limits) => limits,
+                Err(error) => {
+                    rollback_qbit_added_torrents(engine, &added_hashes).await;
+                    let _ = engine.remove_torrent(hash, false).await;
+                    return qbit_engine_error_status(error).into_response();
+                }
+            };
+            if let Some(value) = ratio_limit {
+                limits.seed_ratio_limit = (value >= 0.0).then_some(value);
+            }
+            if let Some(value) = seeding_time_limit {
+                limits.seed_idle_limit = (value >= 0).then_some(value);
+            }
+            if let Err(error) = engine.update_torrent_limits(hash.clone(), limits).await {
+                rollback_qbit_added_torrents(engine, &added_hashes).await;
+                let _ = engine.remove_torrent(hash, false).await;
+                return qbit_engine_error_status(error).into_response();
+            }
         }
+        added_hashes.push(hash);
     }
 
     (StatusCode::OK, "Ok.").into_response()
 }
 
+async fn rollback_qbit_added_torrents(engine: &rt_engine::EngineHandle, hashes: &[String]) {
+    for hash in hashes {
+        if let Err(error) = engine.remove_torrent(hash.clone(), false).await {
+            tracing::error!(
+                component = "api",
+                operation = "add_torrent_rollback",
+                torrent = %hash,
+                result = "error",
+                error = %error,
+                "qBit bulk add rollback failed"
+            );
+        }
+    }
+}
+
 /// `POST /api/qb/v2/torrents/pause` — pause by hashes (pipe-separated or "all").
 pub async fn torrents_pause(State(state): State<AppState>, body: String) -> impl IntoResponse {
-    let hashes = resolve_hashes(&state, extract_hashes(&body)).await;
-    if let Some(engine) = &state.engine {
-        for hash in hashes {
-            let _ = engine.pause_torrent(hash).await;
-        }
-    } else {
-        let mut reg = state.registry.write().await;
-        for hash in hashes {
-            if let Some(e) = reg.get_mut(&hash) {
-                let _ = e.transition(rt_session::TorrentState::Paused);
-            }
+    let params = parse_form_body(&body);
+    let hashes = match required_resolved_hashes(&state, &params, &["hashes"]).await {
+        Ok(hashes) => hashes,
+        Err(status) => return status,
+    };
+    let Some(engine) = &state.engine else {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    };
+    for hash in hashes {
+        if let Err(error) = engine.pause_torrent(hash).await {
+            return qbit_engine_error_status(error);
         }
     }
     StatusCode::OK
@@ -920,17 +1808,17 @@ pub async fn torrents_pause(State(state): State<AppState>, body: String) -> impl
 
 /// `POST /api/qb/v2/torrents/resume`.
 pub async fn torrents_resume(State(state): State<AppState>, body: String) -> impl IntoResponse {
-    let hashes = resolve_hashes(&state, extract_hashes(&body)).await;
-    if let Some(engine) = &state.engine {
-        for hash in hashes {
-            let _ = engine.resume_torrent(hash).await;
-        }
-    } else {
-        let mut reg = state.registry.write().await;
-        for hash in hashes {
-            if let Some(e) = reg.get_mut(&hash) {
-                let _ = e.transition(rt_session::TorrentState::Downloading);
-            }
+    let params = parse_form_body(&body);
+    let hashes = match required_resolved_hashes(&state, &params, &["hashes"]).await {
+        Ok(hashes) => hashes,
+        Err(status) => return status,
+    };
+    let Some(engine) = &state.engine else {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    };
+    for hash in hashes {
+        if let Err(error) = engine.resume_torrent(hash).await {
+            return qbit_engine_error_status(error);
         }
     }
     StatusCode::OK
@@ -949,23 +1837,23 @@ pub async fn torrents_stop(State(state): State<AppState>, body: String) -> impl 
 /// `POST /api/qb/v2/torrents/delete`.
 pub async fn torrents_delete(State(state): State<AppState>, body: String) -> impl IntoResponse {
     let params = parse_form_body(&body);
-    let hashes = params
-        .get("hashes")
-        .map(|h| extract_hashes_from_str(h))
-        .unwrap_or_default();
-    let hashes = resolve_hashes(&state, hashes).await;
-    let delete_files = params
-        .get("deleteFiles")
-        .map(|value| matches!(value.as_str(), "true" | "1"))
-        .unwrap_or(false);
-    if let Some(engine) = &state.engine {
-        for hash in hashes {
-            let _ = engine.remove_torrent(hash, delete_files).await;
-        }
-    } else {
-        let mut reg = state.registry.write().await;
-        for hash in hashes {
-            let _ = reg.remove(&hash);
+    let hashes = match required_resolved_hashes(&state, &params, &["hashes"]).await {
+        Ok(hashes) => hashes,
+        Err(status) => return status,
+    };
+    let delete_files = match params.get("deleteFiles") {
+        Some(value) => match parse_qbit_bool(value) {
+            Some(value) => value,
+            None => return StatusCode::BAD_REQUEST,
+        },
+        None => false,
+    };
+    let Some(engine) = &state.engine else {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    };
+    for hash in hashes {
+        if let Err(error) = engine.remove_torrent(hash, delete_files).await {
+            return qbit_engine_error_status(error);
         }
     }
     StatusCode::OK
@@ -973,10 +1861,17 @@ pub async fn torrents_delete(State(state): State<AppState>, body: String) -> imp
 
 /// `POST /api/qb/v2/torrents/reannounce`.
 pub async fn torrents_reannounce(State(state): State<AppState>, body: String) -> impl IntoResponse {
-    let hashes = resolve_hashes(&state, extract_hashes(&body)).await;
-    if let Some(engine) = &state.engine {
-        for hash in hashes {
-            let _ = engine.reannounce_torrent(hash).await;
+    let params = parse_form_body(&body);
+    let hashes = match required_resolved_hashes(&state, &params, &["hashes"]).await {
+        Ok(hashes) => hashes,
+        Err(status) => return status,
+    };
+    let Some(engine) = &state.engine else {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    };
+    for hash in hashes {
+        if let Err(error) = engine.reannounce_torrent(hash).await {
+            return qbit_engine_error_status(error);
         }
     }
     StatusCode::OK
@@ -984,10 +1879,17 @@ pub async fn torrents_reannounce(State(state): State<AppState>, body: String) ->
 
 /// `POST /api/qb/v2/torrents/recheck`.
 pub async fn torrents_recheck(State(state): State<AppState>, body: String) -> impl IntoResponse {
-    let hashes = resolve_hashes(&state, extract_hashes(&body)).await;
-    if let Some(engine) = &state.engine {
-        for hash in hashes {
-            let _ = engine.recheck_torrent(hash).await;
+    let params = parse_form_body(&body);
+    let hashes = match required_resolved_hashes(&state, &params, &["hashes"]).await {
+        Ok(hashes) => hashes,
+        Err(status) => return status,
+    };
+    let Some(engine) = &state.engine else {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    };
+    for hash in hashes {
+        if let Err(error) = engine.recheck_torrent(hash).await {
+            return qbit_engine_error_status(error);
         }
     }
     StatusCode::OK
@@ -996,33 +1898,34 @@ pub async fn torrents_recheck(State(state): State<AppState>, body: String) -> im
 /// `POST /api/qb/v2/torrents/filePrio`.
 pub async fn torrents_file_prio(State(state): State<AppState>, body: String) -> impl IntoResponse {
     let params = parse_form_body(&body);
-    let Some(hash) = params.get("hash").cloned() else {
+    let Some(hash) = params.get("hash").and_then(|hash| normalize_api_text(hash)) else {
         return StatusCode::BAD_REQUEST;
     };
-    let file_ids = params
-        .get("id")
-        .or_else(|| params.get("ids"))
-        .map(|ids| {
-            ids.split('|')
-                .filter_map(|id| id.trim().parse::<u32>().ok())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let Some(raw_file_ids) = params.get("id").or_else(|| params.get("ids")) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let file_ids = match strict_numeric_list(raw_file_ids) {
+        Ok(file_ids) => file_ids,
+        Err(()) => return StatusCode::BAD_REQUEST,
+    };
     let Some(priority) = params
         .get("priority")
         .and_then(|value| value.parse::<i64>().ok())
     else {
         return StatusCode::BAD_REQUEST;
     };
+    if !(0..=2).contains(&priority) {
+        return StatusCode::BAD_REQUEST;
+    }
     let Some(engine) = &state.engine else {
-        return StatusCode::OK;
+        return StatusCode::NOT_IMPLEMENTED;
     };
     match engine
         .update_file_priorities(hash, file_ids, priority)
         .await
     {
         Ok(()) => StatusCode::OK,
-        Err(_) => StatusCode::NOT_FOUND,
+        Err(error) => qbit_engine_error_status(error),
     }
 }
 
@@ -1078,7 +1981,14 @@ pub async fn torrents_trackers(
         reg.get(&hash).is_some()
     };
     let Some(engine) = &state.engine else {
-        return (StatusCode::OK, Json(Vec::<QbTrackerInfo>::new()));
+        return if exists {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(Vec::<QbTrackerInfo>::new()),
+            )
+        } else {
+            (StatusCode::NOT_FOUND, Json(Vec::<QbTrackerInfo>::new()))
+        };
     };
     match engine.torrent_trackers(hash.clone()).await {
         Ok(trackers) => {
@@ -1124,7 +2034,7 @@ pub async fn torrents_trackers(
                     .map(|(idx, url)| QbTrackerInfo {
                         url,
                         status: 0,
-                        tier: idx as i32,
+                        tier: qbit_i32(i64::try_from(idx).unwrap_or(i64::MAX)),
                         num_peers: -1,
                         num_seeds: -1,
                         num_leeches: -1,
@@ -1134,7 +2044,10 @@ pub async fn torrents_trackers(
                     .collect();
                 (StatusCode::OK, Json(trackers))
             }
-            Err(_) if exists => (StatusCode::OK, Json(Vec::<QbTrackerInfo>::new())),
+            Err(_) if exists => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(Vec::<QbTrackerInfo>::new()),
+            ),
             Err(_) => (StatusCode::NOT_FOUND, Json(Vec::<QbTrackerInfo>::new())),
         },
     }
@@ -1146,17 +2059,20 @@ pub async fn torrents_add_trackers(
     body: String,
 ) -> impl IntoResponse {
     let params = parse_form_body(&body);
-    let Some(hash) = params.get("hash").cloned() else {
+    let Some(hash) = params.get("hash").and_then(|hash| normalize_api_text(hash)) else {
         return StatusCode::BAD_REQUEST;
     };
-    let urls = params
+    let urls = match params
         .get("urls")
-        .map(|urls| split_tracker_values(urls))
-        .unwrap_or_default();
-    if urls.is_empty() {
-        return StatusCode::BAD_REQUEST;
-    }
-    let mut trackers = current_tracker_urls(&state, &hash).await;
+        .and_then(|urls| strict_tracker_values(urls).ok())
+    {
+        Some(urls) if !urls.is_empty() => urls,
+        _ => return StatusCode::BAD_REQUEST,
+    };
+    let mut trackers = match current_tracker_urls(&state, &hash).await {
+        Ok(trackers) => trackers,
+        Err(error) => return qbit_engine_error_status(error),
+    };
     for url in urls {
         if !trackers.contains(&url) {
             trackers.push(url);
@@ -1171,7 +2087,7 @@ pub async fn torrents_edit_tracker(
     body: String,
 ) -> impl IntoResponse {
     let params = parse_form_body(&body);
-    let Some(hash) = params.get("hash").cloned() else {
+    let Some(hash) = params.get("hash").and_then(|hash| normalize_api_text(hash)) else {
         return StatusCode::BAD_REQUEST;
     };
     let Some(original_url) = params
@@ -1183,7 +2099,10 @@ pub async fn torrents_edit_tracker(
     let Some(new_url) = params.get("newUrl").and_then(|url| normalize_api_text(url)) else {
         return StatusCode::BAD_REQUEST;
     };
-    let mut trackers = current_tracker_urls(&state, &hash).await;
+    let mut trackers = match current_tracker_urls(&state, &hash).await {
+        Ok(trackers) => trackers,
+        Err(error) => return qbit_engine_error_status(error),
+    };
     let Some(slot) = trackers.iter_mut().find(|url| **url == original_url) else {
         return StatusCode::NOT_FOUND;
     };
@@ -1198,50 +2117,46 @@ pub async fn torrents_remove_trackers(
     body: String,
 ) -> impl IntoResponse {
     let params = parse_form_body(&body);
-    let Some(hash) = params.get("hash").cloned() else {
+    let Some(hash) = params.get("hash").and_then(|hash| normalize_api_text(hash)) else {
         return StatusCode::BAD_REQUEST;
     };
-    let remove = params
+    let remove = match params
         .get("urls")
-        .map(|urls| split_tracker_values(urls))
-        .unwrap_or_default();
-    if remove.is_empty() {
-        return StatusCode::BAD_REQUEST;
+        .and_then(|urls| strict_tracker_values(urls).ok())
+    {
+        Some(remove) if !remove.is_empty() => remove,
+        _ => return StatusCode::BAD_REQUEST,
+    };
+    let trackers = match current_tracker_urls(&state, &hash).await {
+        Ok(trackers) => trackers,
+        Err(error) => return qbit_engine_error_status(error),
     }
-    let trackers = current_tracker_urls(&state, &hash)
-        .await
-        .into_iter()
-        .filter(|url| !remove.contains(url))
-        .collect::<Vec<_>>();
+    .into_iter()
+    .filter(|url| !remove.contains(url))
+    .collect::<Vec<_>>();
     update_torrent_trackers(&state, &hash, trackers).await
 }
 
 /// `POST /api/qb/v2/torrents/addPeers`.
 pub async fn torrents_add_peers(State(state): State<AppState>, body: String) -> impl IntoResponse {
     let params = parse_form_body(&body);
-    let hashes = params
-        .get("hashes")
-        .or_else(|| params.get("hash"))
-        .map(|hashes| {
-            hashes
-                .split('|')
-                .filter_map(normalize_api_text)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let peers = params
+    let hashes = match required_resolved_hashes(&state, &params, &["hashes", "hash"]).await {
+        Ok(hashes) => hashes,
+        Err(status) => return status,
+    };
+    let peers = match params
         .get("peers")
-        .map(|peers| parse_peer_addrs(peers))
-        .unwrap_or_default();
-    if hashes.is_empty() || peers.is_empty() {
-        return StatusCode::BAD_REQUEST;
-    }
+        .and_then(|peers| strict_peer_addrs(peers).ok())
+    {
+        Some(peers) if !peers.is_empty() => peers,
+        _ => return StatusCode::BAD_REQUEST,
+    };
     let Some(engine) = &state.engine else {
-        return StatusCode::OK;
+        return StatusCode::NOT_IMPLEMENTED;
     };
     for hash in hashes {
-        if engine.add_peers(hash, peers.clone()).await.is_err() {
-            return StatusCode::NOT_FOUND;
+        if let Err(error) = engine.add_peers(hash, peers.clone()).await {
+            return qbit_engine_error_status(error);
         }
     }
     StatusCode::OK
@@ -1260,11 +2175,18 @@ pub async fn torrents_files(
         reg.get(&hash).is_some()
     };
     let Some(engine) = &state.engine else {
-        return (StatusCode::OK, Json(Vec::<QbFileInfo>::new()));
+        return if exists {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(Vec::<QbFileInfo>::new()),
+            )
+        } else {
+            (StatusCode::NOT_FOUND, Json(Vec::<QbFileInfo>::new()))
+        };
     };
     let entry = {
         let reg = state.registry.read().await;
-        reg.get(&hash).cloned()
+        reg.get(&hash)
     };
     match engine.torrent_metadata(hash).await {
         Ok(meta) => {
@@ -1286,13 +2208,19 @@ pub async fn torrents_files(
                     )
                 }
             };
-            let files = entry
-                .as_ref()
-                .map(|entry| qbit_file_infos(entry, &meta))
-                .unwrap_or_default();
-            (StatusCode::OK, Json(files))
+            let Some(entry) = entry else {
+                // Metadata can outlive the registry entry during removal or
+                // actor teardown. Do not turn that race into a successful
+                // empty file list: the caller asked for a torrent that no
+                // longer has an authoritative projection.
+                return (StatusCode::NOT_FOUND, Json(Vec::<QbFileInfo>::new()));
+            };
+            (StatusCode::OK, Json(qbit_file_infos(&entry, &meta)))
         }
-        Err(_) if exists => (StatusCode::OK, Json(Vec::<QbFileInfo>::new())),
+        Err(_) if exists => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(Vec::<QbFileInfo>::new()),
+        ),
         Err(_) => (StatusCode::NOT_FOUND, Json(Vec::<QbFileInfo>::new())),
     }
 }
@@ -1302,15 +2230,19 @@ pub async fn torrents_webseeds(
     State(state): State<AppState>,
     Query(q): Query<HashQuery>,
 ) -> impl IntoResponse {
-    let Some(hash) = q.hash else {
-        return (StatusCode::OK, Json(Vec::<String>::new()));
+    let Some(hash) = q.hash.filter(|hash| !hash.trim().is_empty()) else {
+        return (StatusCode::BAD_REQUEST, Json(Vec::<String>::new()));
     };
     let exists = {
         let reg = state.registry.read().await;
         reg.get(&hash).is_some()
     };
     let Some(engine) = &state.engine else {
-        return (StatusCode::OK, Json(Vec::<String>::new()));
+        return if exists {
+            (StatusCode::SERVICE_UNAVAILABLE, Json(Vec::<String>::new()))
+        } else {
+            (StatusCode::NOT_FOUND, Json(Vec::<String>::new()))
+        };
     };
     match engine.torrent_metadata(hash).await {
         Ok(meta) => {
@@ -1327,7 +2259,7 @@ pub async fn torrents_webseeds(
             };
             (StatusCode::OK, Json(meta.webseeds))
         }
-        Err(_) if exists => (StatusCode::OK, Json(Vec::<String>::new())),
+        Err(_) if exists => (StatusCode::SERVICE_UNAVAILABLE, Json(Vec::<String>::new())),
         Err(_) => (StatusCode::NOT_FOUND, Json(Vec::<String>::new())),
     }
 }
@@ -1337,18 +2269,18 @@ pub async fn torrents_piece_states(
     State(state): State<AppState>,
     Query(q): Query<HashQuery>,
 ) -> impl IntoResponse {
-    let Some(hash) = q.hash else {
-        return (StatusCode::OK, Json(Vec::<i32>::new()));
+    let Some(hash) = q.hash.filter(|hash| !hash.trim().is_empty()) else {
+        return (StatusCode::BAD_REQUEST, Json(Vec::<i32>::new()));
     };
     let entry = {
         let reg = state.registry.read().await;
-        reg.get(&hash).cloned()
+        reg.get(&hash)
     };
     let Some(_) = entry else {
         return (StatusCode::NOT_FOUND, Json(Vec::<i32>::new()));
     };
     let Some(engine) = &state.engine else {
-        return (StatusCode::OK, Json(Vec::<i32>::new()));
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(Vec::<i32>::new()));
     };
     match engine.torrent_metadata(hash).await {
         Ok(meta) => {
@@ -1374,7 +2306,7 @@ pub async fn torrents_piece_states(
                 .collect();
             (StatusCode::OK, Json(states))
         }
-        Err(_) => (StatusCode::OK, Json(Vec::<i32>::new())),
+        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, Json(Vec::<i32>::new())),
     }
 }
 
@@ -1383,15 +2315,19 @@ pub async fn torrents_piece_hashes(
     State(state): State<AppState>,
     Query(q): Query<HashQuery>,
 ) -> impl IntoResponse {
-    let Some(hash) = q.hash else {
-        return (StatusCode::OK, Json(Vec::<String>::new()));
+    let Some(hash) = q.hash.filter(|hash| !hash.trim().is_empty()) else {
+        return (StatusCode::BAD_REQUEST, Json(Vec::<String>::new()));
     };
     let exists = {
         let reg = state.registry.read().await;
         reg.get(&hash).is_some()
     };
     let Some(engine) = &state.engine else {
-        return (StatusCode::OK, Json(Vec::<String>::new()));
+        return if exists {
+            (StatusCode::SERVICE_UNAVAILABLE, Json(Vec::<String>::new()))
+        } else {
+            (StatusCode::NOT_FOUND, Json(Vec::<String>::new()))
+        };
     };
     match engine.torrent_metadata(hash).await {
         Ok(meta) => {
@@ -1408,7 +2344,7 @@ pub async fn torrents_piece_hashes(
             };
             (StatusCode::OK, Json(meta.piece_hashes))
         }
-        Err(_) if exists => (StatusCode::OK, Json(Vec::<String>::new())),
+        Err(_) if exists => (StatusCode::SERVICE_UNAVAILABLE, Json(Vec::<String>::new())),
         Err(_) => (StatusCode::NOT_FOUND, Json(Vec::<String>::new())),
     }
 }
@@ -1429,7 +2365,7 @@ pub async fn torrents_export(
         return StatusCode::NOT_FOUND.into_response();
     }
     let Some(engine) = &state.engine else {
-        return StatusCode::NOT_FOUND.into_response();
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     match engine.torrent_blob(hash).await {
         Ok(raw) => (
@@ -1438,7 +2374,7 @@ pub async fn torrents_export(
             raw,
         )
             .into_response(),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => qbit_engine_error_status(error).into_response(),
     }
 }
 
@@ -1456,7 +2392,7 @@ pub async fn torrents_properties(
 
     let entry = {
         let reg = state.registry.read().await;
-        reg.get(&hash).cloned()
+        reg.get(&hash)
     };
     let Some(entry) = entry else {
         return (
@@ -1479,35 +2415,63 @@ pub async fn torrents_properties(
     };
 
     let meta = if let Some(engine) = &state.engine {
-        engine.torrent_metadata(hash.clone()).await.ok()
+        match engine.torrent_metadata(hash.clone()).await {
+            Ok(meta) => Some(meta),
+            Err(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(default_torrent_properties(String::new())),
+                )
+            }
+        }
     } else {
         None
     };
     let (piece_size, pieces_num) = meta
         .as_ref()
-        .map(|meta| (meta.piece_length as i64, meta.piece_count as i64))
+        .map(|meta| (qbit_i64(meta.piece_length), qbit_usize(meta.piece_count)))
         .unwrap_or((0, 0));
 
-    let limits = get_torrent_limits(&state, &hash).await;
+    let limits = match get_torrent_limits_result(&state, &hash).await {
+        Ok(limits) => limits,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(default_torrent_properties(String::new())),
+            )
+        }
+    };
+    let swarm = if let Some(engine) = &state.engine {
+        match engine.torrent_peers(hash.clone()).await {
+            Ok(peers) => qbit_swarm_from_peers(&peers),
+            Err(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(default_torrent_properties(String::new())),
+                )
+            }
+        }
+    } else {
+        QbitSwarmProjection::default()
+    };
     let now = unix_now();
-    let time_elapsed = now.saturating_sub(entry.added_at as i64);
+    let time_elapsed = now.saturating_sub(qbit_i64(entry.added_at));
     let seeding_time = entry
         .completed_at
-        .map(|completed| now.saturating_sub(completed as i64))
+        .map(|completed| now.saturating_sub(qbit_i64(completed)))
         .unwrap_or(0);
-    let dl_speed = 0;
-    let up_speed = 0;
+    let dl_speed = swarm.download_rate;
+    let up_speed = swarm.upload_rate;
     let eta = if entry.amount_left == 0 {
         0
     } else if dl_speed > 0 {
-        (entry.amount_left as i64 / dl_speed).max(0)
+        (qbit_i64(entry.amount_left) / dl_speed).max(0)
     } else {
         -1
     };
     let pieces_have = pieces_have(
         entry.total_length,
         entry.amount_left,
-        entry.completed_at.is_some(),
         piece_size,
         pieces_num,
     );
@@ -1516,26 +2480,26 @@ pub async fn torrents_properties(
         creation_date: meta
             .as_ref()
             .and_then(|meta| meta.creation_date)
-            .unwrap_or(entry.added_at as i64),
+            .unwrap_or(qbit_i64(entry.added_at)),
         piece_size,
         comment: meta
             .as_ref()
             .and_then(|meta| meta.comment.clone())
             .unwrap_or_default(),
         total_wasted: 0,
-        total_uploaded: entry.stats.uploaded as i64,
-        total_uploaded_session: entry.stats.uploaded as i64,
-        total_downloaded: entry.stats.downloaded as i64,
-        total_downloaded_session: entry.stats.downloaded as i64,
+        total_uploaded: qbit_i64(entry.stats.uploaded),
+        total_uploaded_session: qbit_i64(entry.stats.uploaded),
+        total_downloaded: qbit_i64(entry.stats.downloaded),
+        total_downloaded_session: qbit_i64(entry.stats.downloaded),
         up_limit: limits.upload_limit.unwrap_or(-1),
         dl_limit: limits.download_limit.unwrap_or(-1),
         time_elapsed,
         seeding_time,
-        nb_connections: 0,
+        nb_connections: qbit_i64(swarm.seeds as u64 + swarm.leechers as u64),
         nb_connections_limit: limits.max_connections.unwrap_or(-1),
         share_ratio: entry.stats.ratio(),
-        addition_date: entry.added_at as i64,
-        completion_date: entry.completed_at.map(|t| t as i64).unwrap_or(-1),
+        addition_date: qbit_i64(entry.added_at),
+        completion_date: entry.completed_at.map(qbit_i64).unwrap_or(-1),
         created_by: meta
             .as_ref()
             .and_then(|meta| meta.created_by.clone())
@@ -1544,14 +2508,14 @@ pub async fn torrents_properties(
         dl_speed,
         eta,
         last_seen: -1,
-        peers: 0,
-        peers_total: 0,
+        peers: qbit_i64(swarm.leechers as u64),
+        peers_total: qbit_i64(swarm.seeds as u64 + swarm.leechers as u64),
         pieces_have,
         pieces_num,
         reannounce: -1,
-        seeds: 0,
-        seeds_total: 0,
-        total_size: entry.total_length as i64,
+        seeds: qbit_i64(swarm.seeds as u64),
+        seeds_total: qbit_i64(swarm.seeds as u64),
+        total_size: qbit_i64(entry.total_length),
         up_speed_avg: 0,
         up_speed,
     };
@@ -1561,29 +2525,47 @@ pub async fn torrents_properties(
 /// `GET /api/qb/v2/torrents/categories`.
 pub async fn torrents_categories(State(state): State<AppState>) -> impl IntoResponse {
     let mut categories = serde_json::Map::new();
-    {
-        let stored = state.categories.read().await;
-        for (category, save_path) in stored.iter() {
-            let info = QbCategoryInfo {
-                name: category.clone(),
-                save_path: format!("{}/", save_path.trim_end_matches('/')),
-            };
-            categories.insert(category.clone(), serde_json::to_value(info).unwrap());
+    let stored = match category_definitions(&state).await {
+        Ok(stored) => stored,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::Value::Object(serde_json::Map::new())),
+            )
         }
-    }
-    let reg = state.registry.read().await;
-    for entry in reg.iter() {
-        let Some(category) = entry.category.as_deref() else {
-            continue;
+    };
+    for (category, save_path) in stored {
+        let info = QbCategoryInfo {
+            name: category.clone(),
+            save_path: format!("{}/", save_path.trim_end_matches('/')),
         };
-        if category.is_empty() || categories.contains_key(category) {
+        categories.insert(category, serde_json::to_value(info).unwrap());
+    }
+    let snapshot = match state.torrent_snapshot(None).await {
+        Ok(snapshot) => snapshot,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::Value::Object(serde_json::Map::new())),
+            )
+        }
+    };
+    for facet in snapshot.category_facets() {
+        if facet.name.is_empty() || categories.contains_key(&facet.name) {
             continue;
         }
         let info = QbCategoryInfo {
-            name: category.to_owned(),
-            save_path: format!("{}/", entry.save_path.trim_end_matches('/')),
+            name: facet.name.clone(),
+            save_path: format!(
+                "{}/",
+                facet
+                    .save_path
+                    .as_deref()
+                    .unwrap_or_default()
+                    .trim_end_matches('/')
+            ),
         };
-        categories.insert(category.to_owned(), serde_json::to_value(info).unwrap());
+        categories.insert(facet.name, serde_json::to_value(info).unwrap());
     }
     let _lease = if state.engine.is_some() {
         match reserve_qbit_api_snapshot(
@@ -1608,13 +2590,26 @@ pub async fn torrents_categories(State(state): State<AppState>) -> impl IntoResp
 
 /// `GET /api/qb/v2/torrents/tags`.
 pub async fn torrents_tags(State(state): State<AppState>) -> impl IntoResponse {
-    let mut tags = state.tags.read().await.clone();
-    {
-        let reg = state.registry.read().await;
-        for entry in reg.iter() {
-            tags.extend(entry.tags.iter().filter(|tag| !tag.is_empty()).cloned());
+    let mut tags = BTreeSet::new();
+    if let Some(engine) = &state.engine {
+        match engine.list_tags().await {
+            Ok(global_tags) => tags.extend(global_tags),
+            Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, Json(Vec::<String>::new())),
         }
+    } else {
+        tags.extend(state.tags.read().await.iter().cloned());
     }
+    let snapshot = match state.torrent_snapshot(None).await {
+        Ok(snapshot) => snapshot,
+        Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, Json(Vec::<String>::new())),
+    };
+    tags.extend(
+        snapshot
+            .tag_facets()
+            .into_iter()
+            .filter(|(tag, _)| !tag.is_empty())
+            .map(|(tag, _)| tag),
+    );
     let _lease = if state.engine.is_some() {
         match reserve_qbit_api_snapshot(&state, estimate_qbit_label_snapshot_bytes(tags.len()))
             .await
@@ -1631,10 +2626,10 @@ pub async fn torrents_tags(State(state): State<AppState>) -> impl IntoResponse {
 /// `POST /api/qb/v2/torrents/rename`.
 pub async fn torrents_rename(State(state): State<AppState>, body: String) -> impl IntoResponse {
     let params = parse_form_body(&body);
-    let Some(hash) = params.get("hash").cloned() else {
+    let Some(hash) = params.get("hash").and_then(|hash| normalize_api_text(hash)) else {
         return StatusCode::BAD_REQUEST;
     };
-    let Some(name) = params.get("name").cloned() else {
+    let Some(name) = params.get("name").and_then(|name| normalize_api_text(name)) else {
         return StatusCode::BAD_REQUEST;
     };
     update_torrent_fields(&state, &hash, Some(name), None).await
@@ -1664,11 +2659,11 @@ pub async fn torrents_rename_file(
         return StatusCode::BAD_REQUEST;
     };
     let Some(engine) = &state.engine else {
-        return StatusCode::OK;
+        return StatusCode::NOT_IMPLEMENTED;
     };
     match engine.rename_file_path(hash, file_id, name).await {
         Ok(()) => StatusCode::OK,
-        Err(_) => StatusCode::NOT_FOUND,
+        Err(error) => qbit_engine_error_status(error),
     }
 }
 
@@ -1696,11 +2691,11 @@ pub async fn torrents_rename_folder(
         return StatusCode::BAD_REQUEST;
     };
     let Some(engine) = &state.engine else {
-        return StatusCode::OK;
+        return StatusCode::NOT_IMPLEMENTED;
     };
     match engine.rename_folder_path(hash, old_path, new_path).await {
         Ok(()) => StatusCode::OK,
-        Err(_) => StatusCode::NOT_FOUND,
+        Err(error) => qbit_engine_error_status(error),
     }
 }
 
@@ -1710,12 +2705,14 @@ pub async fn torrents_set_location(
     body: String,
 ) -> impl IntoResponse {
     let params = parse_form_body(&body);
-    let hashes = params
-        .get("hashes")
-        .map(|h| extract_hashes_from_str(h))
-        .unwrap_or_default();
-    let hashes = resolve_hashes(&state, hashes).await;
-    let Some(location) = params.get("location").cloned() else {
+    let hashes = match required_resolved_hashes(&state, &params, &["hashes"]).await {
+        Ok(hashes) => hashes,
+        Err(status) => return status,
+    };
+    let Some(location) = params
+        .get("location")
+        .and_then(|location| normalize_api_text(location))
+    else {
         return StatusCode::BAD_REQUEST;
     };
     for hash in hashes {
@@ -1757,6 +2754,17 @@ pub async fn torrents_create_category(
         .get("savePath")
         .and_then(|save_path| normalize_api_text(save_path))
         .unwrap_or_default();
+    if let Some(engine) = &state.engine {
+        if let Err(error) = engine
+            .create_category(
+                category.clone(),
+                (!save_path.is_empty()).then_some(save_path.clone()),
+            )
+            .await
+        {
+            return qbit_engine_error_status(error);
+        }
+    }
     state.categories.write().await.insert(category, save_path);
     StatusCode::OK
 }
@@ -1779,19 +2787,34 @@ pub async fn torrents_edit_category(
     else {
         return StatusCode::BAD_REQUEST;
     };
-    let hashes = {
-        let reg = state.registry.read().await;
-        reg.iter()
-            .filter(|entry| entry.category.as_deref() == Some(category.as_str()))
-            .map(|entry| entry.info_hash.clone())
-            .collect::<Vec<_>>()
-    };
-    for hash in hashes {
-        update_torrent_category(&state, &hash, Some(new_category.clone())).await;
+    let save_path = params
+        .get("savePath")
+        .and_then(|save_path| normalize_api_text(save_path));
+    if let Some(engine) = &state.engine {
+        if let Err(error) = engine
+            .rename_category(category.clone(), new_category.clone(), save_path.clone())
+            .await
+        {
+            return qbit_engine_error_status(error);
+        }
+    } else {
+        let hashes = {
+            let reg = state.registry.read().await;
+            reg.iter()
+                .filter(|entry| entry.category.as_deref() == Some(category.as_str()))
+                .map(|entry| entry.info_hash.clone())
+                .collect::<Vec<_>>()
+        };
+        for hash in hashes {
+            let status = update_torrent_category(&state, &hash, Some(new_category.clone())).await;
+            if status != StatusCode::OK {
+                return status;
+            }
+        }
     }
     let mut categories = state.categories.write().await;
-    if let Some(save_path) = categories.remove(&category) {
-        categories.insert(new_category, save_path);
+    if let Some(old_save_path) = categories.remove(&category) {
+        categories.insert(new_category, save_path.unwrap_or(old_save_path));
     }
     StatusCode::OK
 }
@@ -1802,24 +2825,33 @@ pub async fn torrents_remove_categories(
     body: String,
 ) -> impl IntoResponse {
     let params = parse_form_body(&body);
-    let categories = params
-        .get("categories")
-        .map(|value| split_pipe_values(value))
-        .unwrap_or_default();
-    let hashes = {
-        let reg = state.registry.read().await;
-        reg.iter()
-            .filter(|entry| {
-                entry
-                    .category
-                    .as_ref()
-                    .is_some_and(|category| categories.contains(category))
-            })
-            .map(|entry| entry.info_hash.clone())
-            .collect::<Vec<_>>()
+    let categories = match required_text_list(&params, "categories") {
+        Ok(categories) => categories,
+        Err(status) => return status,
     };
-    for hash in hashes {
-        update_torrent_category(&state, &hash, None).await;
+    if let Some(engine) = &state.engine {
+        if let Err(error) = engine.remove_categories(categories.clone()).await {
+            return qbit_engine_error_status(error);
+        }
+    } else {
+        let hashes = {
+            let reg = state.registry.read().await;
+            reg.iter()
+                .filter(|entry| {
+                    entry
+                        .category
+                        .as_ref()
+                        .is_some_and(|category| categories.contains(category))
+                })
+                .map(|entry| entry.info_hash.clone())
+                .collect::<Vec<_>>()
+        };
+        for hash in hashes {
+            let status = update_torrent_category(&state, &hash, None).await;
+            if status != StatusCode::OK {
+                return status;
+            }
+        }
     }
     let mut stored = state.categories.write().await;
     for category in categories {
@@ -1834,14 +2866,17 @@ pub async fn torrents_create_tags(
     body: String,
 ) -> impl IntoResponse {
     let params = parse_form_body(&body);
-    let tags = params
-        .get("tags")
-        .map(|tags| split_tags(tags))
-        .unwrap_or_default();
-    if tags.is_empty() {
-        return StatusCode::BAD_REQUEST;
+    let tags = match required_strict_tag_list(&params, "tags", false) {
+        Ok(tags) => tags,
+        Err(status) => return status,
+    };
+    if let Some(engine) = &state.engine {
+        if let Err(error) = engine.create_tags(tags).await {
+            return qbit_engine_error_status(error);
+        }
+    } else {
+        state.tags.write().await.extend(tags);
     }
-    state.tags.write().await.extend(tags);
     StatusCode::OK
 }
 
@@ -1851,22 +2886,28 @@ pub async fn torrents_delete_tags(
     body: String,
 ) -> impl IntoResponse {
     let params = parse_form_body(&body);
-    let remove_tags = params
-        .get("tags")
-        .map(|tags| split_tags(tags))
-        .unwrap_or_default();
-    if remove_tags.is_empty() {
-        return StatusCode::BAD_REQUEST;
-    }
-    let hashes = {
-        let reg = state.registry.read().await;
-        reg.iter()
-            .filter(|entry| entry.tags.iter().any(|tag| remove_tags.contains(tag)))
-            .map(|entry| entry.info_hash.clone())
-            .collect::<Vec<_>>()
+    let remove_tags = match required_strict_tag_list(&params, "tags", false) {
+        Ok(tags) => tags,
+        Err(status) => return status,
     };
-    for hash in hashes {
-        update_torrent_tags(&state, &hash, Vec::new(), remove_tags.clone()).await;
+    if let Some(engine) = &state.engine {
+        if let Err(error) = engine.remove_tags(remove_tags.clone()).await {
+            return qbit_engine_error_status(error);
+        }
+    } else {
+        let hashes = {
+            let reg = state.registry.read().await;
+            reg.iter()
+                .filter(|entry| entry.tags.iter().any(|tag| remove_tags.contains(tag)))
+                .map(|entry| entry.info_hash.clone())
+                .collect::<Vec<_>>()
+        };
+        for hash in hashes {
+            let status = update_torrent_tags(&state, &hash, Vec::new(), remove_tags.clone()).await;
+            if status != StatusCode::OK {
+                return status;
+            }
+        }
     }
     let mut stored = state.tags.write().await;
     for tag in remove_tags {
@@ -1881,16 +2922,21 @@ pub async fn torrents_set_category(
     body: String,
 ) -> impl IntoResponse {
     let params = parse_form_body(&body);
-    let hashes = params
-        .get("hashes")
-        .map(|h| extract_hashes_from_str(h))
-        .unwrap_or_default();
-    let hashes = resolve_hashes(&state, hashes).await;
-    let category = params.get("category").cloned().unwrap_or_default();
+    let hashes = match required_resolved_hashes(&state, &params, &["hashes"]).await {
+        Ok(hashes) => hashes,
+        Err(status) => return status,
+    };
+    let Some(category) = params.get("category").cloned() else {
+        return StatusCode::BAD_REQUEST;
+    };
     let category_save_path = if category.trim().is_empty() {
         None
     } else {
-        state.categories.read().await.get(&category).cloned()
+        let categories = match category_definitions(&state).await {
+            Ok(categories) => categories,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE,
+        };
+        categories.get(&category).cloned()
     };
     if let Some(engine) = &state.engine {
         for hash in &hashes {
@@ -1899,31 +2945,38 @@ pub async fn torrents_set_category(
             } else {
                 Some(category.clone())
             };
-            let _ = engine
+            if let Err(error) = engine
                 .update_torrent_labels(hash.clone(), Some(category), Vec::new(), Vec::new())
-                .await;
+                .await
+            {
+                return qbit_engine_error_status(error);
+            }
             if let Some(save_path) = &category_save_path {
-                let _ = engine
+                if let Err(error) = engine
                     .update_torrent_fields(
                         hash.clone(),
                         None,
                         Some(std::path::PathBuf::from(save_path)),
                     )
-                    .await;
+                    .await
+                {
+                    return qbit_engine_error_status(error);
+                }
             }
         }
     } else {
         let mut reg = state.registry.write().await;
         for hash in &hashes {
-            if let Some(e) = reg.get_mut(hash) {
-                e.category = if category.is_empty() {
-                    None
-                } else {
-                    Some(category.clone())
-                };
-                if let Some(save_path) = &category_save_path {
-                    e.save_path = save_path.clone();
-                }
+            let Some(mut e) = reg.get_mut(hash) else {
+                return StatusCode::NOT_FOUND;
+            };
+            e.category = if category.is_empty() {
+                None
+            } else {
+                Some(category.clone())
+            };
+            if let Some(save_path) = &category_save_path {
+                e.save_path = save_path.clone();
             }
         }
     }
@@ -1933,29 +2986,32 @@ pub async fn torrents_set_category(
 /// `POST /api/qb/v2/torrents/addTags`.
 pub async fn torrents_add_tags(State(state): State<AppState>, body: String) -> impl IntoResponse {
     let params = parse_form_body(&body);
-    let hashes = params
-        .get("hashes")
-        .map(|h| extract_hashes_from_str(h))
-        .unwrap_or_default();
-    let hashes = resolve_hashes(&state, hashes).await;
-    let new_tags: Vec<String> = params
-        .get("tags")
-        .map(|t| split_tags(t))
-        .unwrap_or_default();
+    let hashes = match required_resolved_hashes(&state, &params, &["hashes"]).await {
+        Ok(hashes) => hashes,
+        Err(status) => return status,
+    };
+    let new_tags = match required_strict_tag_list(&params, "tags", false) {
+        Ok(tags) => tags,
+        Err(status) => return status,
+    };
     if let Some(engine) = &state.engine {
         for hash in &hashes {
-            let _ = engine
+            if let Err(error) = engine
                 .update_torrent_labels(hash.clone(), None, new_tags.clone(), Vec::new())
-                .await;
+                .await
+            {
+                return qbit_engine_error_status(error);
+            }
         }
     } else {
         let mut reg = state.registry.write().await;
         for hash in &hashes {
-            if let Some(e) = reg.get_mut(hash) {
-                for tag in &new_tags {
-                    if !e.tags.contains(tag) {
-                        e.tags.push(tag.clone());
-                    }
+            let Some(mut e) = reg.get_mut(hash) else {
+                return StatusCode::NOT_FOUND;
+            };
+            for tag in &new_tags {
+                if !e.tags.contains(tag) {
+                    e.tags.push(tag.clone());
                 }
             }
         }
@@ -1966,15 +3022,14 @@ pub async fn torrents_add_tags(State(state): State<AppState>, body: String) -> i
 /// `POST /api/qb/v2/torrents/setTags`.
 pub async fn torrents_set_tags(State(state): State<AppState>, body: String) -> impl IntoResponse {
     let params = parse_form_body(&body);
-    let hashes = params
-        .get("hashes")
-        .map(|h| extract_hashes_from_str(h))
-        .unwrap_or_default();
-    let hashes = resolve_hashes(&state, hashes).await;
-    let new_tags = params
-        .get("tags")
-        .map(|tags| split_tags(tags))
-        .unwrap_or_default();
+    let hashes = match required_resolved_hashes(&state, &params, &["hashes"]).await {
+        Ok(hashes) => hashes,
+        Err(status) => return status,
+    };
+    let new_tags = match required_strict_tag_list(&params, "tags", true) {
+        Ok(tags) => tags,
+        Err(status) => return status,
+    };
     for hash in hashes {
         let old_tags = {
             let reg = state.registry.read().await;
@@ -1997,27 +3052,30 @@ pub async fn torrents_remove_tags(
     body: String,
 ) -> impl IntoResponse {
     let params = parse_form_body(&body);
-    let hashes = params
-        .get("hashes")
-        .map(|h| extract_hashes_from_str(h))
-        .unwrap_or_default();
-    let hashes = resolve_hashes(&state, hashes).await;
-    let remove_tags: Vec<String> = params
-        .get("tags")
-        .map(|t| split_tags(t))
-        .unwrap_or_default();
+    let hashes = match required_resolved_hashes(&state, &params, &["hashes"]).await {
+        Ok(hashes) => hashes,
+        Err(status) => return status,
+    };
+    let remove_tags = match required_strict_tag_list(&params, "tags", false) {
+        Ok(tags) => tags,
+        Err(status) => return status,
+    };
     if let Some(engine) = &state.engine {
         for hash in &hashes {
-            let _ = engine
+            if let Err(error) = engine
                 .update_torrent_labels(hash.clone(), None, Vec::new(), remove_tags.clone())
-                .await;
+                .await
+            {
+                return qbit_engine_error_status(error);
+            }
         }
     } else {
         let mut reg = state.registry.write().await;
         for hash in &hashes {
-            if let Some(e) = reg.get_mut(hash) {
-                e.tags.retain(|tag| !remove_tags.contains(tag));
-            }
+            let Some(mut e) = reg.get_mut(hash) else {
+                return StatusCode::NOT_FOUND;
+            };
+            e.tags.retain(|tag| !remove_tags.contains(tag));
         }
     }
     let still_used = {
@@ -2078,25 +3136,40 @@ pub async fn torrents_set_share_limits(
     body: String,
 ) -> impl IntoResponse {
     let params = parse_form_body(&body);
-    let hashes = params
-        .get("hashes")
-        .map(|h| extract_hashes_from_str(h))
-        .unwrap_or_default();
-    let hashes = resolve_hashes(&state, hashes).await;
-    let ratio = params
-        .get("ratioLimit")
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| *value >= 0.0);
-    let seeding_time = params
-        .get("seedingTimeLimit")
-        .and_then(|value| value.parse::<i64>().ok())
-        .filter(|value| *value >= 0);
+    let hashes = match required_resolved_hashes(&state, &params, &["hashes"]).await {
+        Ok(hashes) => hashes,
+        Err(status) => return status,
+    };
+    let ratio = match params.get("ratioLimit") {
+        Some(value) => match value.parse::<f64>() {
+            Ok(value) if value.is_finite() && (value >= 0.0 || value == -1.0 || value == -2.0) => {
+                (value >= 0.0).then_some(value)
+            }
+            _ => return StatusCode::BAD_REQUEST,
+        },
+        None => None,
+    };
+    let seeding_time = match params.get("seedingTimeLimit") {
+        Some(value) => match value.parse::<i64>() {
+            Ok(value) if value >= 0 => Some(value),
+            Ok(-1 | -2) => None,
+            _ => return StatusCode::BAD_REQUEST,
+        },
+        None => None,
+    };
+    if !params.contains_key("ratioLimit") && !params.contains_key("seedingTimeLimit") {
+        return StatusCode::BAD_REQUEST;
+    }
     for hash in hashes {
-        let mut limits = get_torrent_limits(&state, &hash).await;
+        let mut limits = match get_torrent_limits_result(&state, &hash).await {
+            Ok(limits) => limits,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE,
+        };
         limits.seed_ratio_limit = ratio;
         limits.seed_idle_limit = seeding_time;
-        if update_torrent_limits(&state, &hash, limits).await != StatusCode::OK {
-            return StatusCode::NOT_FOUND;
+        let status = update_torrent_limits(&state, &hash, limits).await;
+        if status != StatusCode::OK {
+            return status;
         }
     }
     StatusCode::OK
@@ -2167,37 +3240,46 @@ pub async fn transfer_set_upload_limit(
 }
 
 pub async fn transfer_speed_limits_mode(State(state): State<AppState>) -> impl IntoResponse {
-    let mode = global_limits(&state).await.speed_limits_mode;
-    (StatusCode::OK, if mode { "1" } else { "0" })
+    match global_limits_result(&state).await {
+        Ok(limits) => (
+            StatusCode::OK,
+            if limits.speed_limits_mode { "1" } else { "0" },
+        )
+            .into_response(),
+        Err(error) => qbit_backend_unavailable(&error),
+    }
 }
 
 pub async fn transfer_toggle_speed_limits_mode(State(state): State<AppState>) -> impl IntoResponse {
-    let mut limits = global_limits(&state).await;
+    let mut limits = match global_limits_result(&state).await {
+        Ok(limits) => limits,
+        Err(error) => return qbit_backend_unavailable(&error),
+    };
     limits.speed_limits_mode = !limits.speed_limits_mode;
     if let Some(engine) = &state.engine {
         match engine.update_global_limits(limits.clone()).await {
             Ok(()) => {}
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+            Err(error) => return qbit_engine_error_status(error).into_response(),
         }
     }
     *state.global_limits.write().await = limits;
-    StatusCode::OK
+    StatusCode::OK.into_response()
 }
 
 /// `GET /api/qb/v2/transfer/downloadLimit`.
 pub async fn transfer_download_limit(State(state): State<AppState>) -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        global_limits(&state).await.download_limit.to_string(),
-    )
+    match global_limits_result(&state).await {
+        Ok(limits) => (StatusCode::OK, limits.download_limit.to_string()).into_response(),
+        Err(error) => qbit_backend_unavailable(&error),
+    }
 }
 
 /// `GET /api/qb/v2/transfer/uploadLimit`.
 pub async fn transfer_upload_limit(State(state): State<AppState>) -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        global_limits(&state).await.upload_limit.to_string(),
-    )
+    match global_limits_result(&state).await {
+        Ok(limits) => (StatusCode::OK, limits.upload_limit.to_string()).into_response(),
+        Err(error) => qbit_backend_unavailable(&error),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2251,7 +3333,7 @@ pub async fn sync_maindata(
         .rid
         .is_some_and(|rid| rid > 0 && rid == qbit_registry_rid(current_revision))
         && current_revision == 0;
-    let empty_entries = Arc::new(Vec::<rt_session::TorrentEntry>::new());
+    let empty_entries = Arc::new(ChunkedVec::from_vec(Vec::<rt_session::TorrentEntry>::new()));
     let (revision, full_update, entries, torrents_removed) = if requested_revision
         .is_some_and(|requested| requested == current_revision)
         || unchanged_empty_registry
@@ -2276,14 +3358,18 @@ pub async fn sync_maindata(
                 }
                 let entries = changed
                     .into_iter()
-                    .filter_map(|hash| registry.get(&hash).cloned())
+                    .filter_map(|hash| registry.get(&hash))
                     .collect::<Vec<_>>();
                 let mut removed = removed
                     .into_iter()
                     .filter(|hash| registry.get(hash).is_none())
                     .collect::<Vec<_>>();
                 removed.sort_unstable();
-                (registry.revision(), Arc::new(entries), removed)
+                (
+                    registry.revision(),
+                    Arc::new(ChunkedVec::from_vec(entries)),
+                    removed,
+                )
             })
         } else {
             None
@@ -2326,49 +3412,91 @@ pub async fn sync_maindata(
     let active_rechecks = if entries.is_empty() {
         HashSet::new()
     } else {
-        active_recheck_hashes(&state).await
+        match active_recheck_hashes(&state).await {
+            Ok(active_rechecks) => active_rechecks,
+            Err(error) => return qbit_backend_unavailable(&error),
+        }
     };
     let mut infos = Vec::with_capacity(entries.len());
     let include_live = entries.len() <= QBIT_LIVE_PROJECTION_MAX_ENTRIES;
-    for entry in entries.iter() {
-        infos.push(qbit_torrent_info(&state, entry, &active_rechecks, include_live).await);
+    if include_live {
+        let live_entries = entries.iter().cloned().collect();
+        infos = match load_qbit_live_projections(&state, live_entries, active_rechecks).await {
+            Ok(infos) => infos,
+            Err(error) => return qbit_backend_unavailable(&error),
+        };
+    } else {
+        for entry in entries.iter() {
+            let info = match qbit_torrent_info(&state, entry, &active_rechecks, false).await {
+                Ok(info) => info,
+                Err(error) => return qbit_backend_unavailable(&error),
+            };
+            infos.push(info);
+        }
     }
     state
         .api_metrics
         .record_estimated_response_bytes(estimate_qbit_maindata_snapshot_bytes(infos.len()));
     let rid = qbit_registry_rid(revision);
-    let (alltime_dl, alltime_ul, session_rates) = if let Some(engine) = &state.engine {
-        match engine.stats().await {
-            Ok(stats) => (
-                stats.bytes_downloaded.min(i64::MAX as u64) as i64,
-                stats.bytes_uploaded.min(i64::MAX as u64) as i64,
-                QbitSwarmProjection {
-                    download_rate: stats.download_rate,
-                    upload_rate: stats.upload_rate,
-                    ..Default::default()
-                },
-            ),
-            Err(_) => (0, 0, QbitSwarmProjection::default()),
-        }
-    } else {
-        let (alltime_dl, alltime_ul) = infos.iter().fold((0_i64, 0_i64), |(dl, ul), info| {
+    let (alltime_dl, alltime_ul, session_rates, connected_peers, queued_io_jobs) =
+        if let Some(engine) = &state.engine {
+            match engine.stats().await {
+                Ok(stats) => (
+                    qbit_i64(stats.bytes_downloaded),
+                    qbit_i64(stats.bytes_uploaded),
+                    QbitSwarmProjection {
+                        download_rate: stats.download_rate,
+                        upload_rate: stats.upload_rate,
+                        ..Default::default()
+                    },
+                    qbit_i64(stats.connected_peers),
+                    qbit_i64(stats.storage_jobs_queue_depth),
+                ),
+                Err(error) => return qbit_backend_unavailable(&error),
+            }
+        } else {
+            let (alltime_dl, alltime_ul) = infos.iter().fold((0_i64, 0_i64), |(dl, ul), info| {
+                (
+                    dl.saturating_add(info.downloaded),
+                    ul.saturating_add(info.uploaded),
+                )
+            });
             (
-                dl.saturating_add(info.downloaded),
-                ul.saturating_add(info.uploaded),
+                alltime_dl,
+                alltime_ul,
+                qbit_session_rates_from_infos(&infos),
+                qbit_i64(
+                    infos
+                        .iter()
+                        .map(|info| info.num_leechs as u64 + info.num_seeds as u64)
+                        .sum(),
+                ),
+                0,
             )
-        });
-        (
-            alltime_dl,
-            alltime_ul,
-            qbit_session_rates_from_infos(&infos),
-        )
-    };
+        };
     let global_ratio = if alltime_dl > 0 {
         alltime_ul as f64 / alltime_dl as f64
     } else {
         0.0
     };
-    let limits = global_limits(&state).await;
+    let limits = match global_limits_result(&state).await {
+        Ok(limits) => limits,
+        Err(error) => return qbit_backend_unavailable(&error),
+    };
+    let free_space_on_disk = if let Some(engine) = &state.engine {
+        match engine.list_storage_roots().await {
+            Ok(roots) => roots
+                .into_iter()
+                .filter(|root| root.ok)
+                .map(|root| root.available_bytes)
+                .max()
+                .map(qbit_i64)
+                .unwrap_or(0),
+            Err(error) => return qbit_backend_unavailable(&error),
+        }
+    } else {
+        0
+    };
     let resp = SyncMaindataResponse {
         rid,
         full_update,
@@ -2376,22 +3504,22 @@ pub async fn sync_maindata(
         torrents_removed,
         server_state: QbServerState {
             dl_info_speed: session_rates.download_rate,
-            dl_info_data: 0,
+            dl_info_data: alltime_dl,
             up_info_speed: session_rates.upload_rate,
-            up_info_data: 0,
+            up_info_data: alltime_ul,
             alltime_dl,
             alltime_ul,
             average_time_queue: 0,
             connection_status: "connected".into(),
-            free_space_on_disk: 0,
+            free_space_on_disk,
             global_ratio,
-            queued_io_jobs: 0,
+            queued_io_jobs,
             queueing: false,
             read_cache_hits: "0".into(),
             read_cache_overload: "0".into(),
             refresh_interval: 1500,
             total_buffers_size: 0,
-            total_peer_connections: 0,
+            total_peer_connections: connected_peers,
             total_queued_size: 0,
             total_wasted_session: 0,
             dl_rate_limit: limits.download_limit,
@@ -2413,20 +3541,41 @@ pub async fn sync_torrent_peers(
     State(state): State<AppState>,
     Query(q): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let Some(hash) = q.get("hash").cloned() else {
+    let Some(hash) = q
+        .get("hash")
+        .filter(|hash| !hash.trim().is_empty())
+        .cloned()
+    else {
         return (
-            StatusCode::OK,
+            StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "rid": 1,
-                "full_update": true,
-                "peers": {},
-                "peers_removed": [],
-                "show_flags": true,
+                "error": {
+                    "code": "BAD_REQUEST",
+                    "message": "hash is required",
+                }
             })),
         );
     };
     let peers = if let Some(engine) = &state.engine {
-        engine.torrent_peers(hash).await.unwrap_or_default()
+        match engine.torrent_peers(hash).await {
+            Ok(peers) => peers,
+            Err(error) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "rid": 1,
+                        "full_update": true,
+                        "peers": {},
+                        "peers_removed": [],
+                        "show_flags": true,
+                        "error": {
+                            "code": "SERVICE_UNAVAILABLE",
+                            "message": error,
+                        },
+                    })),
+                );
+            }
+        }
     } else {
         Vec::new()
     };
@@ -2519,51 +3668,86 @@ fn qbit_peer_map(peers: &[EnginePeerSnapshot]) -> serde_json::Map<String, serde_
 }
 
 pub async fn transfer_info(State(state): State<AppState>) -> impl IntoResponse {
-    let limits = global_limits(&state).await;
-    let engine_stats = qbit_engine_stats(&state).await;
-    let session_rates = engine_stats
-        .as_ref()
-        .map(|stats| QbitSwarmProjection {
-            download_rate: stats.download_rate,
-            upload_rate: stats.upload_rate,
-            ..Default::default()
-        })
-        .unwrap_or_default();
-    let (dl_info_data, up_info_data) = engine_stats
-        .as_ref()
-        .map(|stats| {
-            (
-                stats.bytes_downloaded.min(i64::MAX as u64) as i64,
-                stats.bytes_uploaded.min(i64::MAX as u64) as i64,
-            )
-        })
-        .unwrap_or_default();
+    let Some(engine) = &state.engine else {
+        return qbit_backend_unavailable("native engine is unavailable");
+    };
+    if !engine.is_alive() {
+        return qbit_backend_unavailable("native engine is not alive");
+    }
+    let engine_stats = match engine.stats().await {
+        Ok(stats) => stats,
+        Err(error) => {
+            return qbit_backend_unavailable(&format!("engine stats unavailable: {error}"))
+        }
+    };
+    let limits = match global_limits_result(&state).await {
+        Ok(limits) => limits,
+        Err(error) => return qbit_backend_unavailable(&error),
+    };
+    let free_space = match engine.list_storage_roots().await {
+        Ok(roots) => roots
+            .into_iter()
+            .filter(|root| root.ok)
+            .map(|root| root.available_bytes)
+            .max()
+            .and_then(|bytes| i64::try_from(bytes).ok()),
+        Err(_) => None,
+    };
+    let Some(free_space) = free_space else {
+        return qbit_backend_unavailable("no healthy storage root is available");
+    };
     (
         StatusCode::OK,
         Json(serde_json::json!({
-            "dl_info_speed": session_rates.download_rate,
-            "dl_info_data": dl_info_data,
-            "up_info_speed": session_rates.upload_rate,
-            "up_info_data": up_info_data,
+            "dl_info_speed": engine_stats.download_rate,
+            "dl_info_data": engine_stats.bytes_downloaded.min(i64::MAX as u64) as i64,
+            "up_info_speed": engine_stats.upload_rate,
+            "up_info_data": engine_stats.bytes_uploaded.min(i64::MAX as u64) as i64,
             "connection_status": "connected",
-            "free_space_on_disk": 0,
+            "free_space_on_disk": free_space,
             "dl_rate_limit": limits.download_limit,
             "up_rate_limit": limits.upload_limit,
             "use_alt_speed_limits": limits.speed_limits_mode,
         })),
     )
+        .into_response()
+}
+
+fn qbit_backend_unavailable(message: &str) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": {
+                "code": "SERVICE_UNAVAILABLE",
+                "message": message,
+            }
+        })),
+    )
+        .into_response()
 }
 
 pub async fn transfer_ban_peers(State(state): State<AppState>, body: String) -> impl IntoResponse {
     let params = parse_form_body(&body);
-    let peers = params
+    let peers = match params
         .get("peers")
-        .map(|peers| parse_peer_addrs(peers))
-        .unwrap_or_default();
-    if peers.is_empty() {
-        return StatusCode::OK;
+        .and_then(|peers| strict_peer_addrs(peers).ok())
+    {
+        Some(peers) if !peers.is_empty() => peers,
+        _ => return StatusCode::BAD_REQUEST,
+    };
+    let Some(engine) = &state.engine else {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    };
+    if let Err(error) = engine.ban_peers(peers.clone()).await {
+        return qbit_engine_error_status(error);
     }
-    state.banned_peers.write().await.extend(peers);
+    let Ok(current) = engine.banned_peers().await else {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    };
+    // The engine may reject entries once its bounded durable policy set is
+    // full. Keep the compatibility facade aligned with that authoritative
+    // admission result instead of claiming every requested peer was banned.
+    *state.banned_peers.write().await = current.into_iter().collect();
     StatusCode::OK
 }
 
@@ -2605,16 +3789,34 @@ pub async fn log_main(
         .session_events_filtered(None, None, levels, query.last_known_id, limit)
         .await
     {
-        Ok(events) => (
-            StatusCode::OK,
-            Json(
-                events
-                    .into_iter()
-                    .map(qbit_log_entry)
-                    .filter(|entry| query.includes_type(entry.kind))
-                    .collect(),
+        Ok(events) => match events
+            .into_iter()
+            .map(qbit_log_entry)
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(events) => (
+                StatusCode::OK,
+                Json(
+                    events
+                        .into_iter()
+                        .filter(|entry| query.includes_type(entry.kind))
+                        .collect(),
+                ),
             ),
-        ),
+            Err(error) => {
+                tracing::warn!(
+                    component = "api",
+                    operation = "log_main",
+                    result = "error",
+                    error = %error,
+                    "failed to project session event"
+                );
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(Vec::<QbLogEntry>::new()),
+                )
+            }
+        },
         Err(e) => {
             tracing::warn!(
                 component = "api",
@@ -2623,7 +3825,10 @@ pub async fn log_main(
                 error = %e,
                 "failed to read session events"
             );
-            (StatusCode::OK, Json(Vec::<QbLogEntry>::new()))
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(Vec::<QbLogEntry>::new()),
+            )
         }
     }
 }
@@ -2670,53 +3875,54 @@ impl LogMainQuery {
     }
 }
 
-fn qbit_log_entry(row: rt_db::SessionEventRow) -> QbLogEntry {
+fn qbit_log_entry(row: rt_db::SessionEventRow) -> Result<QbLogEntry, String> {
+    let event_id = row
+        .event_id
+        .ok_or_else(|| "session event is missing event_id".to_owned())?;
     let message = row.message.unwrap_or_else(|| row.kind.clone());
-    QbLogEntry {
-        id: row.event_id.unwrap_or_default(),
+    Ok(QbLogEntry {
+        id: event_id,
         message,
         timestamp: row.occurred_at,
-        kind: qbit_log_type(&row.kind, &row.payload),
-    }
+        kind: qbit_log_type(&row.kind, &row.payload)?,
+    })
 }
 
-fn qbit_log_type(kind: &str, payload: &str) -> i64 {
+fn qbit_log_type(kind: &str, payload: &str) -> Result<i64, String> {
+    let value = serde_json::from_str::<serde_json::Value>(payload)
+        .map_err(|error| format!("session event payload is invalid JSON: {error}"))?;
     let lower_kind = kind.to_ascii_lowercase();
     if lower_kind.contains("error") || lower_kind.contains("failed") {
-        return 4;
+        return Ok(4);
     }
     if lower_kind.contains("warn") {
-        return 2;
+        return Ok(2);
     }
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
-        return 1;
-    };
-    match value
-        .get("level")
-        .and_then(|v| v.as_str())
-        .map(str::to_ascii_lowercase)
-    {
-        Some(level) if level == "error" || level == "critical" => 4,
-        Some(level) if level == "warn" || level == "warning" => 2,
-        _ => 1,
-    }
+    Ok(
+        match value
+            .get("level")
+            .and_then(|v| v.as_str())
+            .map(str::to_ascii_lowercase)
+        {
+            Some(level) if level == "error" || level == "critical" => 4,
+            Some(level) if level == "warn" || level == "warning" => 2,
+            _ => 1,
+        },
+    )
 }
 
-pub async fn log_peers(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn log_peers(State(state): State<AppState>) -> Response {
     let Some(engine) = &state.engine else {
-        return (StatusCode::OK, Json(Vec::<serde_json::Value>::new()));
+        return (StatusCode::OK, Json(Vec::<serde_json::Value>::new())).into_response();
     };
-    let hashes = {
-        let reg = state.registry.read().await;
-        reg.iter()
-            .map(|entry| entry.info_hash.clone())
-            .collect::<Vec<_>>()
+    // The engine already owns the promoted-task index. Query that bounded
+    // runtime set in parallel; dormant registry rows cannot have peers and
+    // must not turn this compatibility endpoint into a full scan plus one
+    // sequential actor round-trip per torrent.
+    let peer_snapshots = match engine.active_torrent_peers().await {
+        Ok(peer_snapshots) => peer_snapshots,
+        Err(error) => return qbit_backend_unavailable(&error),
     };
-    let mut peer_snapshots = Vec::new();
-    for hash in hashes {
-        let peers = engine.torrent_peers(hash.clone()).await.unwrap_or_default();
-        peer_snapshots.push((hash, peers));
-    }
     let peer_count = peer_snapshots
         .iter()
         .map(|(_, peers)| peers.len())
@@ -2733,6 +3939,7 @@ pub async fn log_peers(State(state): State<AppState>) -> impl IntoResponse {
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(Vec::<serde_json::Value>::new()),
             )
+                .into_response()
         }
     };
     let mut entries = Vec::with_capacity(peer_count);
@@ -2743,7 +3950,7 @@ pub async fn log_peers(State(state): State<AppState>) -> impl IntoResponse {
                 .map(|peer| qbit_peer_log_entry(&hash, &peer)),
         );
     }
-    (StatusCode::OK, Json(entries))
+    (StatusCode::OK, Json(entries)).into_response()
 }
 
 fn qbit_peer_log_entry(info_hash: &str, peer: &EnginePeerSnapshot) -> serde_json::Value {
@@ -2761,18 +3968,16 @@ fn qbit_peer_log_entry(info_hash: &str, peer: &EnginePeerSnapshot) -> serde_json
     })
 }
 
-pub async fn search_status(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn search_status(State(state): State<AppState>) -> Response {
+    let plugins = match load_qbit_search_plugins(&state).await {
+        Ok(plugins) => plugins,
+        Err(error) => return qbit_backend_error(error),
+    };
     let jobs = state.search_jobs.read().await;
     let running = jobs
         .values()
         .any(|job| job.get("status").and_then(|v| v.as_str()) == Some("Running"));
-    let plugins = state
-        .search_plugins
-        .read()
-        .await
-        .values()
-        .cloned()
-        .collect::<Vec<_>>();
+    let plugins = plugins.values().cloned().collect::<Vec<_>>();
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -2780,68 +3985,111 @@ pub async fn search_status(State(state): State<AppState>) -> impl IntoResponse {
             "plugins": plugins,
         })),
     )
+        .into_response()
 }
 
-pub async fn search_plugins(State(state): State<AppState>) -> impl IntoResponse {
-    let plugins = state
-        .search_plugins
-        .read()
-        .await
-        .values()
-        .cloned()
-        .collect::<Vec<_>>();
-    (StatusCode::OK, Json(plugins))
+pub async fn search_plugins(State(state): State<AppState>) -> Response {
+    let plugins = match load_qbit_search_plugins(&state).await {
+        Ok(plugins) => plugins,
+        Err(error) => return qbit_backend_error(error),
+    };
+    (
+        StatusCode::OK,
+        Json(plugins.values().cloned().collect::<Vec<_>>()),
+    )
+        .into_response()
 }
 
-pub async fn search_categories() -> impl IntoResponse {
-    (StatusCode::OK, Json(Vec::<String>::new()))
+pub async fn search_categories(State(state): State<AppState>) -> Response {
+    let plugins = match load_qbit_search_plugins(&state).await {
+        Ok(plugins) => plugins,
+        Err(error) => return qbit_backend_error(error),
+    };
+    let mut categories = BTreeSet::new();
+    for plugin in plugins.values() {
+        if plugin.get("enabled").and_then(serde_json::Value::as_bool) == Some(false) {
+            continue;
+        }
+        let Some(values) = plugin
+            .get("supportedCategories")
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        for category in values.iter().filter_map(serde_json::Value::as_str) {
+            let category = category.trim();
+            if !category.is_empty() {
+                categories.insert(category.to_owned());
+            }
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(categories.into_iter().collect::<Vec<_>>()),
+    )
+        .into_response()
 }
 
-pub async fn search_install_plugin(
-    State(state): State<AppState>,
-    body: String,
-) -> impl IntoResponse {
+pub async fn search_install_plugin(State(state): State<AppState>, body: String) -> Response {
     let params = parse_form_body(&body);
-    let sources = params
-        .get("sources")
-        .map(|s| split_qbit_list(s))
-        .unwrap_or_default();
-    let mut plugins = state.search_plugins.write().await;
-    for source in sources.into_iter().filter(|s| !s.is_empty()) {
+    let sources = match required_strict_qbit_list(&params, "sources") {
+        Ok(sources) => sources,
+        Err(status) => return status.into_response(),
+    };
+    let _write = state.preference_write.lock().await;
+    let mut plugins = match load_qbit_search_plugins(&state).await {
+        Ok(plugins) => plugins,
+        Err(error) => return qbit_backend_error(error),
+    };
+    for source in sources {
         let name = plugin_name_from_source(&source);
         plugins.insert(name.clone(), search_plugin_value(&name, &source, true));
     }
-    StatusCode::OK
+    match save_qbit_search_plugins(&state, plugins).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(error) => qbit_backend_error(error),
+    }
 }
 
-pub async fn search_uninstall_plugin(
-    State(state): State<AppState>,
-    body: String,
-) -> impl IntoResponse {
+pub async fn search_uninstall_plugin(State(state): State<AppState>, body: String) -> Response {
     let params = parse_form_body(&body);
-    let names = params
-        .get("names")
-        .map(|s| split_qbit_list(s))
-        .unwrap_or_default();
-    let mut plugins = state.search_plugins.write().await;
+    let names = match required_strict_qbit_list(&params, "names") {
+        Ok(names) => names,
+        Err(status) => return status.into_response(),
+    };
+    let _write = state.preference_write.lock().await;
+    let mut plugins = match load_qbit_search_plugins(&state).await {
+        Ok(plugins) => plugins,
+        Err(error) => return qbit_backend_error(error),
+    };
     for name in names {
         plugins.remove(&name);
     }
-    StatusCode::OK
+    match save_qbit_search_plugins(&state, plugins).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(error) => qbit_backend_error(error),
+    }
 }
 
-pub async fn search_enable_plugin(
-    State(state): State<AppState>,
-    body: String,
-) -> impl IntoResponse {
+pub async fn search_enable_plugin(State(state): State<AppState>, body: String) -> Response {
     let params = parse_form_body(&body);
-    let enabled = parse_bool_param(params.get("enable").map(String::as_str), true);
-    let names = params
-        .get("names")
-        .map(|s| split_qbit_list(s))
-        .unwrap_or_default();
-    let mut plugins = state.search_plugins.write().await;
-    for name in names.into_iter().filter(|s| !s.is_empty()) {
+    let enabled = match params
+        .get("enable")
+        .and_then(|value| parse_qbit_bool(value))
+    {
+        Some(enabled) => enabled,
+        None => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let names = match required_strict_qbit_list(&params, "names") {
+        Ok(names) => names,
+        Err(status) => return status.into_response(),
+    };
+    let _write = state.preference_write.lock().await;
+    let mut plugins = match load_qbit_search_plugins(&state).await {
+        Ok(plugins) => plugins,
+        Err(error) => return qbit_backend_error(error),
+    };
+    for name in names {
         let entry = plugins
             .entry(name.clone())
             .or_insert_with(|| search_plugin_value(&name, "", enabled));
@@ -2849,7 +4097,10 @@ pub async fn search_enable_plugin(
             map.insert("enabled".into(), enabled.into());
         }
     }
-    StatusCode::OK
+    match save_qbit_search_plugins(&state, plugins).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(error) => qbit_backend_error(error),
+    }
 }
 
 pub async fn search_update_plugins() -> impl IntoResponse {
@@ -2877,12 +4128,16 @@ pub async fn search_start(State(state): State<AppState>, body: String) -> impl I
 }
 
 pub async fn search_stop(State(state): State<AppState>, body: String) -> impl IntoResponse {
-    if let Some(id) = parse_form_body(&body).get("id").cloned() {
-        if let Some(job) = state.search_jobs.write().await.get_mut(&id) {
-            if let Some(map) = job.as_object_mut() {
-                map.insert("status".into(), "Stopped".into());
-            }
-        }
+    let params = parse_form_body(&body);
+    let Some(id) = params.get("id").filter(|id| !id.is_empty()) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let mut jobs = state.search_jobs.write().await;
+    let Some(job) = jobs.get_mut(id) else {
+        return StatusCode::NOT_FOUND;
+    };
+    if let Some(map) = job.as_object_mut() {
+        map.insert("status".into(), "Stopped".into());
     }
     StatusCode::OK
 }
@@ -2897,13 +4152,16 @@ pub struct SearchResultsQuery {
 pub async fn search_results(
     State(state): State<AppState>,
     Query(query): Query<SearchResultsQuery>,
-) -> impl IntoResponse {
+) -> Response {
     let jobs = state.search_jobs.read().await;
-    let job = query
-        .id
-        .and_then(|id| jobs.get(&id.to_string()))
-        .or_else(|| jobs.iter().next_back().map(|(_, job)| job));
+    let job = match query.id {
+        Some(id) => jobs.get(&id.to_string()),
+        None => jobs.iter().next_back().map(|(_, job)| job),
+    };
     let Some(job) = job else {
+        if query.id.is_some() {
+            return StatusCode::NOT_FOUND.into_response();
+        }
         return (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -2911,7 +4169,8 @@ pub async fn search_results(
                 "total": 0,
                 "results": [],
             })),
-        );
+        )
+            .into_response();
     };
     let mut response = job.clone();
     if let Some(map) = response.as_object_mut() {
@@ -2929,44 +4188,58 @@ pub async fn search_results(
             .collect::<Vec<_>>();
         map.insert("results".into(), serde_json::Value::Array(sliced));
     }
-    (StatusCode::OK, Json(response))
+    (StatusCode::OK, Json(response)).into_response()
 }
 
 pub async fn search_delete(State(state): State<AppState>, body: String) -> impl IntoResponse {
-    if let Some(id) = parse_form_body(&body).get("id").cloned() {
-        state.search_jobs.write().await.remove(&id);
+    let params = parse_form_body(&body);
+    let Some(id) = params.get("id").filter(|id| !id.is_empty()) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    if state.search_jobs.write().await.remove(id).is_none() {
+        return StatusCode::NOT_FOUND;
     }
     StatusCode::OK
 }
 
-pub async fn rss_items(State(state): State<AppState>) -> impl IntoResponse {
-    let items = state.rss_items.read().await.clone();
-    (StatusCode::OK, Json(serde_json::Value::Object(items)))
+pub async fn rss_items(State(state): State<AppState>) -> Response {
+    match load_qbit_rss_items(&state).await {
+        Ok(items) => (StatusCode::OK, Json(serde_json::Value::Object(items))).into_response(),
+        Err(error) => qbit_backend_error(error),
+    }
 }
 
-pub async fn rss_rules(State(state): State<AppState>) -> impl IntoResponse {
-    let rules = state.rss_rules.read().await.clone();
-    (StatusCode::OK, Json(serde_json::Value::Object(rules)))
+pub async fn rss_rules(State(state): State<AppState>) -> Response {
+    match load_qbit_rss_rules(&state).await {
+        Ok(rules) => (StatusCode::OK, Json(serde_json::Value::Object(rules))).into_response(),
+        Err(error) => qbit_backend_error(error),
+    }
 }
 
-pub async fn rss_matching_articles(State(state): State<AppState>) -> impl IntoResponse {
-    let rules = state
-        .rss_rules
-        .read()
-        .await
+pub async fn rss_matching_articles(State(state): State<AppState>) -> Response {
+    let rules = match load_qbit_rss_rules(&state).await {
+        Ok(rules) => rules,
+        Err(error) => return qbit_backend_error(error),
+    };
+    let names = rules
         .keys()
         .cloned()
         .map(serde_json::Value::String)
         .collect::<Vec<_>>();
-    (StatusCode::OK, Json(rules))
+    (StatusCode::OK, Json(names)).into_response()
 }
 
-pub async fn rss_add_folder(State(state): State<AppState>, body: String) -> impl IntoResponse {
+pub async fn rss_add_folder(State(state): State<AppState>, body: String) -> Response {
     let params = parse_form_body(&body);
     let Some(path) = params.get("path").filter(|p| !p.is_empty()) else {
-        return StatusCode::BAD_REQUEST;
+        return StatusCode::BAD_REQUEST.into_response();
     };
-    state.rss_items.write().await.insert(
+    let _write = state.preference_write.lock().await;
+    let mut items = match load_qbit_rss_items(&state).await {
+        Ok(items) => items,
+        Err(error) => return qbit_backend_error(error),
+    };
+    items.insert(
         path.clone(),
         serde_json::json!({
             "uid": path,
@@ -2977,20 +4250,28 @@ pub async fn rss_add_folder(State(state): State<AppState>, body: String) -> impl
             "articles": [],
         }),
     );
-    StatusCode::OK
+    match save_qbit_rss_items(&state, items).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(error) => qbit_backend_error(error),
+    }
 }
 
-pub async fn rss_add_feed(State(state): State<AppState>, body: String) -> impl IntoResponse {
+pub async fn rss_add_feed(State(state): State<AppState>, body: String) -> Response {
     let params = parse_form_body(&body);
     let Some(url) = params.get("url").filter(|u| !u.is_empty()) else {
-        return StatusCode::BAD_REQUEST;
+        return StatusCode::BAD_REQUEST.into_response();
     };
     let path = params
         .get("path")
         .filter(|p| !p.is_empty())
         .cloned()
         .unwrap_or_else(|| url.clone());
-    state.rss_items.write().await.insert(
+    let _write = state.preference_write.lock().await;
+    let mut items = match load_qbit_rss_items(&state).await {
+        Ok(items) => items,
+        Err(error) => return qbit_backend_error(error),
+    };
+    items.insert(
         path.clone(),
         serde_json::json!({
             "uid": path,
@@ -3002,92 +4283,183 @@ pub async fn rss_add_feed(State(state): State<AppState>, body: String) -> impl I
             "articles": [],
         }),
     );
-    StatusCode::OK
-}
-
-pub async fn rss_remove_item(State(state): State<AppState>, body: String) -> impl IntoResponse {
-    if let Some(path) = parse_form_body(&body).get("path").cloned() {
-        state.rss_items.write().await.remove(&path);
+    match save_qbit_rss_items(&state, items).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(error) => qbit_backend_error(error),
     }
-    StatusCode::OK
 }
 
-pub async fn rss_move_item(State(state): State<AppState>, body: String) -> impl IntoResponse {
+pub async fn rss_remove_item(State(state): State<AppState>, body: String) -> Response {
     let params = parse_form_body(&body);
-    let Some(item_path) = params.get("itemPath") else {
-        return StatusCode::BAD_REQUEST;
+    let Some(path) = params.get("path").filter(|path| !path.is_empty()) else {
+        return StatusCode::BAD_REQUEST.into_response();
     };
-    let Some(dest_path) = params.get("destPath") else {
-        return StatusCode::BAD_REQUEST;
+    let _write = state.preference_write.lock().await;
+    let mut items = match load_qbit_rss_items(&state).await {
+        Ok(items) => items,
+        Err(error) => return qbit_backend_error(error),
     };
-    let mut items = state.rss_items.write().await;
-    if let Some(mut item) = items.remove(item_path) {
-        if let Some(map) = item.as_object_mut() {
-            map.insert("uid".into(), dest_path.clone().into());
-            map.insert("name".into(), rss_leaf_name(dest_path).into());
-        }
-        items.insert(dest_path.clone(), item);
+    items.remove(path);
+    if let Err(error) = save_qbit_rss_items(&state, items).await {
+        return qbit_backend_error(error);
     }
-    StatusCode::OK
+    StatusCode::OK.into_response()
 }
 
-pub async fn rss_mark_as_read(State(state): State<AppState>, body: String) -> impl IntoResponse {
+pub async fn rss_move_item(State(state): State<AppState>, body: String) -> Response {
     let params = parse_form_body(&body);
-    if let Some(item_path) = params.get("itemPath") {
-        if let Some(item) = state.rss_items.write().await.get_mut(item_path) {
-            if let Some(map) = item.as_object_mut() {
-                map.insert("read".into(), true.into());
-            }
-        }
-    }
-    StatusCode::OK
-}
-
-pub async fn rss_refresh_item(State(state): State<AppState>, body: String) -> impl IntoResponse {
-    let params = parse_form_body(&body);
-    if let Some(item_path) = params.get("itemPath") {
-        if let Some(item) = state.rss_items.write().await.get_mut(item_path) {
-            if let Some(map) = item.as_object_mut() {
-                map.insert("lastBuildDate".into(), now_secs().into());
-            }
-        }
-    }
-    StatusCode::OK
-}
-
-pub async fn rss_set_rule(State(state): State<AppState>, body: String) -> impl IntoResponse {
-    let params = parse_form_body(&body);
-    let Some(name) = params.get("ruleName").filter(|n| !n.is_empty()) else {
-        return StatusCode::BAD_REQUEST;
+    let Some(item_path) = params.get("itemPath").filter(|path| !path.is_empty()) else {
+        return StatusCode::BAD_REQUEST.into_response();
     };
-    let rule = params
-        .get("ruleDef")
-        .and_then(|raw| serde_json::from_str(raw).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    state.rss_rules.write().await.insert(name.clone(), rule);
-    StatusCode::OK
+    let Some(dest_path) = params.get("destPath").filter(|path| !path.is_empty()) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let _write = state.preference_write.lock().await;
+    let mut items = match load_qbit_rss_items(&state).await {
+        Ok(items) => items,
+        Err(error) => return qbit_backend_error(error),
+    };
+    let Some(mut item) = items.remove(item_path) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if item_path != dest_path && items.contains_key(dest_path) {
+        return StatusCode::CONFLICT.into_response();
+    }
+    if let Some(map) = item.as_object_mut() {
+        map.insert("uid".into(), dest_path.clone().into());
+        map.insert("name".into(), rss_leaf_name(dest_path).into());
+    }
+    items.insert(dest_path.clone(), item);
+    match save_qbit_rss_items(&state, items).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(error) => qbit_backend_error(error),
+    }
 }
 
-pub async fn rss_rename_rule(State(state): State<AppState>, body: String) -> impl IntoResponse {
+pub async fn rss_mark_as_read(State(state): State<AppState>, body: String) -> Response {
     let params = parse_form_body(&body);
-    let Some(rule_name) = params.get("ruleName") else {
-        return StatusCode::BAD_REQUEST;
+    let Some(item_path) = params.get("itemPath").filter(|path| !path.is_empty()) else {
+        return StatusCode::BAD_REQUEST.into_response();
     };
-    let Some(new_rule_name) = params.get("newRuleName") else {
-        return StatusCode::BAD_REQUEST;
+    let _write = state.preference_write.lock().await;
+    let mut items = match load_qbit_rss_items(&state).await {
+        Ok(items) => items,
+        Err(error) => return qbit_backend_error(error),
     };
-    let mut rules = state.rss_rules.write().await;
-    if let Some(rule) = rules.remove(rule_name) {
-        rules.insert(new_rule_name.clone(), rule);
+    let Some(item) = items.get_mut(item_path) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if let Some(map) = item.as_object_mut() {
+        map.insert("read".into(), true.into());
     }
-    StatusCode::OK
+    if let Err(error) = save_qbit_rss_items(&state, items).await {
+        return qbit_backend_error(error);
+    }
+    StatusCode::OK.into_response()
 }
 
-pub async fn rss_remove_rule(State(state): State<AppState>, body: String) -> impl IntoResponse {
-    if let Some(rule_name) = parse_form_body(&body).get("ruleName").cloned() {
-        state.rss_rules.write().await.remove(&rule_name);
+pub async fn rss_refresh_item(State(state): State<AppState>, body: String) -> Response {
+    let params = parse_form_body(&body);
+    let Some(item_path) = params.get("itemPath").filter(|path| !path.is_empty()) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let _write = state.preference_write.lock().await;
+    let mut items = match load_qbit_rss_items(&state).await {
+        Ok(items) => items,
+        Err(error) => return qbit_backend_error(error),
+    };
+    let Some(item) = items.get_mut(item_path) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if let Some(map) = item.as_object_mut() {
+        map.insert("lastBuildDate".into(), now_secs().into());
     }
-    StatusCode::OK
+    if let Err(error) = save_qbit_rss_items(&state, items).await {
+        return qbit_backend_error(error);
+    }
+    StatusCode::OK.into_response()
+}
+
+pub async fn rss_set_rule(State(state): State<AppState>, body: String) -> Response {
+    let params = parse_form_body(&body);
+    let Some(name) = params
+        .get("ruleName")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(raw_rule) = params.get("ruleDef") else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Ok(rule) = serde_json::from_str::<serde_json::Value>(raw_rule) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let candidate = std::iter::once((name.to_owned(), rule.clone())).collect::<JsonMap>();
+    if let Err(error) = validate_qbit_rss_rules(&candidate) {
+        tracing::warn!(
+            component = "api",
+            operation = "set_rss_rule",
+            result = "bad_request",
+            error = %error,
+            "qBittorrent RSS rule validation failed"
+        );
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let _write = state.preference_write.lock().await;
+    let mut rules = match load_qbit_rss_rules(&state).await {
+        Ok(rules) => rules,
+        Err(error) => return qbit_backend_error(error),
+    };
+    rules.insert(name.to_owned(), rule);
+    match save_qbit_rss_rules(&state, rules).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(error) => qbit_backend_error(error),
+    }
+}
+
+pub async fn rss_rename_rule(State(state): State<AppState>, body: String) -> Response {
+    let params = parse_form_body(&body);
+    let Some(rule_name) = params.get("ruleName").filter(|name| !name.is_empty()) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(new_rule_name) = params.get("newRuleName").filter(|name| !name.is_empty()) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let _write = state.preference_write.lock().await;
+    let mut rules = match load_qbit_rss_rules(&state).await {
+        Ok(rules) => rules,
+        Err(error) => return qbit_backend_error(error),
+    };
+    let Some(rule) = rules.remove(rule_name) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if rule_name != new_rule_name && rules.contains_key(new_rule_name) {
+        return StatusCode::CONFLICT.into_response();
+    }
+    rules.insert(new_rule_name.clone(), rule);
+    match save_qbit_rss_rules(&state, rules).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(error) => qbit_backend_error(error),
+    }
+}
+
+pub async fn rss_remove_rule(State(state): State<AppState>, body: String) -> Response {
+    let params = parse_form_body(&body);
+    let Some(rule_name) = params.get("ruleName").filter(|name| !name.is_empty()) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let _write = state.preference_write.lock().await;
+    let mut rules = match load_qbit_rss_rules(&state).await {
+        Ok(rules) => rules,
+        Err(error) => return qbit_backend_error(error),
+    };
+    rules.remove(rule_name);
+    if let Err(error) = save_qbit_rss_rules(&state, rules).await {
+        return qbit_backend_error(error);
+    }
+    StatusCode::OK.into_response()
 }
 
 fn search_plugin_value(name: &str, source: &str, enabled: bool) -> serde_json::Value {
@@ -3120,26 +4492,22 @@ fn rss_leaf_name(path: &str) -> String {
         .to_owned()
 }
 
-fn split_qbit_list(raw: &str) -> Vec<String> {
-    raw.split(['|', ','])
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .collect()
-}
-
-fn parse_bool_param(value: Option<&str>, default: bool) -> bool {
-    match value.map(|v| v.to_ascii_lowercase()) {
-        Some(v) if matches!(v.as_str(), "true" | "1" | "yes" | "on") => true,
-        Some(v) if matches!(v.as_str(), "false" | "0" | "no" | "off") => false,
-        _ => default,
+fn required_strict_qbit_list(
+    params: &HashMap<String, String>,
+    key: &str,
+) -> Result<Vec<String>, StatusCode> {
+    let raw = params.get(key).ok_or(StatusCode::BAD_REQUEST)?;
+    let values = raw.split(['|', ',']).map(str::trim).collect::<Vec<_>>();
+    if values.is_empty() || values.iter().any(|value| value.is_empty()) {
+        return Err(StatusCode::BAD_REQUEST);
     }
+    Ok(values.into_iter().map(str::to_owned).collect())
 }
 
 fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
+        .map(|d| qbit_i64(d.as_secs()))
         .unwrap_or_default()
 }
 
@@ -3147,16 +4515,81 @@ fn now_secs() -> i64 {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn extract_hashes(body: &str) -> Vec<String> {
-    let params = parse_form_body(body);
-    params
-        .get("hashes")
-        .map(|h| extract_hashes_from_str(h))
-        .unwrap_or_default()
+fn required_hashes(
+    params: &HashMap<String, String>,
+    keys: &[&str],
+) -> Result<Vec<String>, StatusCode> {
+    let raw = keys.iter().find_map(|key| params.get(*key));
+    raw.and_then(|raw| strict_hashes_from_str(raw))
+        .ok_or(StatusCode::BAD_REQUEST)
+}
+
+async fn required_resolved_hashes(
+    state: &AppState,
+    params: &HashMap<String, String>,
+    keys: &[&str],
+) -> Result<Vec<String>, StatusCode> {
+    let requested = required_hashes(params, keys)?;
+    Ok(resolve_hashes(state, requested).await)
+}
+
+fn strict_hashes_from_str(raw: &str) -> Option<Vec<String>> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if raw == "all" {
+        return Some(vec!["all".to_owned()]);
+    }
+    let mut hashes = Vec::new();
+    for hash in raw.split('|') {
+        let hash = hash.trim();
+        if hash.is_empty() || hash == "all" {
+            return None;
+        }
+        hashes.push(hash.to_ascii_lowercase());
+    }
+    Some(hashes)
+}
+
+fn required_text_list(
+    params: &HashMap<String, String>,
+    key: &str,
+) -> Result<Vec<String>, StatusCode> {
+    let raw = params.get(key).ok_or(StatusCode::BAD_REQUEST)?;
+    let values = raw.split('|').map(str::trim).collect::<Vec<_>>();
+    if values.is_empty() || values.iter().any(|value| value.is_empty()) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(values.into_iter().map(str::to_owned).collect())
+}
+
+fn required_strict_tag_list(
+    params: &HashMap<String, String>,
+    key: &str,
+    allow_empty: bool,
+) -> Result<Vec<String>, StatusCode> {
+    let raw = params.get(key).ok_or(StatusCode::BAD_REQUEST)?;
+    strict_tag_values(raw, allow_empty).map_err(|()| StatusCode::BAD_REQUEST)
+}
+
+fn strict_numeric_list(raw: &str) -> Result<Vec<u32>, ()> {
+    let values = raw.split('|').collect::<Vec<_>>();
+    if values.is_empty() || values.iter().any(|value| value.trim().is_empty()) {
+        return Err(());
+    }
+    values
+        .into_iter()
+        .map(|value| value.trim().parse::<u32>().map_err(|_| ()))
+        .collect()
 }
 
 fn torrent_progress(total_length: u64, amount_left: u64, complete: bool) -> f64 {
-    if complete {
+    // `completed_at` is historical metadata and can survive a recheck that
+    // discovers missing files/pieces. `amount_left` is the live transfer
+    // invariant; never report a torrent as complete while it still has bytes
+    // outstanding.
+    if complete && amount_left == 0 {
         return 1.0;
     }
     if total_length == 0 {
@@ -3166,21 +4599,17 @@ fn torrent_progress(total_length: u64, amount_left: u64, complete: bool) -> f64 
     (done as f64 / total_length as f64).clamp(0.0, 1.0)
 }
 
-fn pieces_have(
-    total_length: u64,
-    amount_left: u64,
-    complete: bool,
-    piece_size: i64,
-    pieces_num: i64,
-) -> i64 {
+fn pieces_have(total_length: u64, amount_left: u64, piece_size: i64, pieces_num: i64) -> i64 {
     if pieces_num <= 0 || piece_size <= 0 {
         return 0;
     }
-    if complete || amount_left == 0 {
+    // A stale completion timestamp must not make a partially missing torrent
+    // report every piece as present.
+    if amount_left == 0 {
         return pieces_num;
     }
     let done = total_length.saturating_sub(amount_left);
-    let have = done.div_ceil(piece_size as u64) as i64;
+    let have = i64::try_from(done.div_ceil(piece_size as u64)).unwrap_or(i64::MAX);
     have.clamp(0, pieces_num)
 }
 
@@ -3233,7 +4662,7 @@ fn qbit_file_infos(
         .map(|(file, completed)| QbFileInfo {
             index: file.index,
             name: file.path.clone(),
-            size: file.length as i64,
+            size: qbit_i64(file.length),
             priority: file.priority.clamp(0, 2) as u8,
             progress: qbit_file_progress(file, completed),
         })
@@ -3268,10 +4697,18 @@ async fn torrent_limit_map(
     hashes: Option<String>,
     field: LimitField,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let requested = hashes
-        .as_deref()
-        .map(extract_hashes_from_str)
-        .unwrap_or_default();
+    let requested = match hashes.as_deref().map(str::trim) {
+        None | Some("") => Vec::new(),
+        Some(raw) => match strict_hashes_from_str(raw) {
+            Some(values) => values,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::Value::Object(serde_json::Map::new())),
+                );
+            }
+        },
+    };
     let hashes = resolve_hashes(state, requested).await;
     let reg = state.registry.read().await;
     let entries = reg
@@ -3298,17 +4735,26 @@ async fn torrent_limit_map(
     } else {
         None
     };
+    let projected = match load_qbit_limit_projections(state, &entries).await {
+        Ok(projected) => projected,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::Value::Object(serde_json::Map::new())),
+            )
+        }
+    };
     let mut limits = serde_json::Map::new();
     for hash in entries {
+        let Some(projected) = projected.get(&hash) else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::Value::Object(serde_json::Map::new())),
+            );
+        };
         let value = match field {
-            LimitField::Download => get_torrent_limits(state, &hash)
-                .await
-                .download_limit
-                .unwrap_or(0),
-            LimitField::Upload => get_torrent_limits(state, &hash)
-                .await
-                .upload_limit
-                .unwrap_or(0),
+            LimitField::Download => projected.download_limit.unwrap_or(0),
+            LimitField::Upload => projected.upload_limit.unwrap_or(0),
         };
         limits.insert(hash, serde_json::json!(value));
     }
@@ -3337,23 +4783,29 @@ async fn update_limit_field(
     field: LimitField,
 ) -> StatusCode {
     let params = parse_form_body(&body);
-    let hashes = params
-        .get("hashes")
-        .map(|h| extract_hashes_from_str(h))
-        .unwrap_or_default();
-    let hashes = resolve_hashes(&state, hashes).await;
-    let limit = params
+    let hashes = match required_resolved_hashes(&state, &params, &["hashes"]).await {
+        Ok(hashes) => hashes,
+        Err(status) => return status,
+    };
+    let limit = match params
         .get("limit")
         .and_then(|value| value.parse::<i64>().ok())
-        .filter(|value| *value > 0);
+    {
+        Some(value) if value >= 0 => (value > 0).then_some(value),
+        _ => return StatusCode::BAD_REQUEST,
+    };
     for hash in hashes {
-        let mut limits = get_torrent_limits(&state, &hash).await;
+        let mut limits = match get_torrent_limits_result(&state, &hash).await {
+            Ok(limits) => limits,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE,
+        };
         match field {
             LimitField::Download => limits.download_limit = limit,
             LimitField::Upload => limits.upload_limit = limit,
         }
-        if update_torrent_limits(&state, &hash, limits).await != StatusCode::OK {
-            return StatusCode::NOT_FOUND;
+        let status = update_torrent_limits(&state, &hash, limits).await;
+        if status != StatusCode::OK {
+            return status;
         }
     }
     StatusCode::OK
@@ -3361,12 +4813,17 @@ async fn update_limit_field(
 
 async fn update_global_limit(state: &AppState, body: &str, field: LimitField) -> StatusCode {
     let params = parse_form_body(body);
-    let limit = params
+    let limit = match params
         .get("limit")
         .and_then(|value| value.parse::<i64>().ok())
-        .unwrap_or(0)
-        .max(0);
-    let mut limits = global_limits(state).await;
+    {
+        Some(value) if value >= 0 => value,
+        _ => return StatusCode::BAD_REQUEST,
+    };
+    let mut limits = match global_limits_result(state).await {
+        Ok(limits) => limits,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE,
+    };
     match field {
         LimitField::Download => limits.download_limit = limit,
         LimitField::Upload => limits.upload_limit = limit,
@@ -3374,7 +4831,7 @@ async fn update_global_limit(state: &AppState, body: &str, field: LimitField) ->
     if let Some(engine) = &state.engine {
         match engine.update_global_limits(limits.clone()).await {
             Ok(()) => {}
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+            Err(error) => return qbit_engine_error_status(error),
         }
     }
     *state.global_limits.write().await = limits;
@@ -3386,18 +4843,36 @@ async fn update_bool_limit_field(
     body: String,
     field: BoolLimitField,
 ) -> StatusCode {
+    if state.engine.is_some()
+        && matches!(
+            field,
+            BoolLimitField::ForceStart | BoolLimitField::AutoTmm | BoolLimitField::AutoManagement
+        )
+    {
+        // These flags are persisted for migration/inspection, but TorrentNG
+        // has no queue or automatic-save-path manager that could make them
+        // true runtime operations. Returning success here would be a
+        // compatibility lie and would leave clients believing their policy
+        // took effect.
+        return StatusCode::NOT_IMPLEMENTED;
+    }
     let params = parse_form_body(&body);
-    let hashes = params
-        .get("hashes")
-        .map(|h| extract_hashes_from_str(h))
-        .unwrap_or_default();
-    let hashes = resolve_hashes(&state, hashes).await;
-    let requested = params
-        .get("value")
-        .or_else(|| params.get("enable"))
-        .and_then(|value| parse_qbit_bool(value));
+    let hashes = match required_resolved_hashes(&state, &params, &["hashes"]).await {
+        Ok(hashes) => hashes,
+        Err(status) => return status,
+    };
+    let requested = match params.get("value").or_else(|| params.get("enable")) {
+        Some(value) => match parse_qbit_bool(value) {
+            Some(value) => Some(value),
+            None => return StatusCode::BAD_REQUEST,
+        },
+        None => None,
+    };
     for hash in hashes {
-        let mut limits = get_torrent_limits(&state, &hash).await;
+        let mut limits = match get_torrent_limits_result(&state, &hash).await {
+            Ok(limits) => limits,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE,
+        };
         let current = match field {
             BoolLimitField::Sequential => limits.sequential_download,
             BoolLimitField::FirstLast => limits.first_last_piece_prio,
@@ -3415,21 +4890,24 @@ async fn update_bool_limit_field(
             BoolLimitField::AutoTmm => limits.auto_tmm = value,
             BoolLimitField::AutoManagement => limits.auto_management = value,
         }
-        if update_torrent_limits(&state, &hash, limits).await != StatusCode::OK {
-            return StatusCode::NOT_FOUND;
+        let status = update_torrent_limits(&state, &hash, limits).await;
+        if status != StatusCode::OK {
+            return status;
         }
     }
     StatusCode::OK
 }
 
-async fn global_limits(state: &AppState) -> EngineGlobalLimits {
+async fn global_limits_result(state: &AppState) -> Result<EngineGlobalLimits, String> {
     if let Some(engine) = &state.engine {
-        if let Ok(limits) = engine.global_limits().await {
-            *state.global_limits.write().await = limits.clone();
-            return limits;
-        }
+        let limits = engine
+            .global_limits()
+            .await
+            .map_err(|error| error.to_string())?;
+        *state.global_limits.write().await = limits.clone();
+        return Ok(limits);
     }
-    state.global_limits.read().await.clone()
+    Ok(state.global_limits.read().await.clone())
 }
 
 async fn reserve_qbit_api_snapshot(
@@ -3480,14 +4958,16 @@ fn qbit_trackers_from_snapshots(trackers: &[EngineTrackerSnapshot]) -> Vec<QbTra
         .map(|tracker| QbTrackerInfo {
             url: tracker.announce.clone(),
             status: qbit_tracker_status_code(&tracker.status),
-            tier: tracker.tier as i32,
-            num_peers: tracker
-                .seeders
-                .unwrap_or(0)
-                .saturating_add(tracker.leechers.unwrap_or(0)) as i32,
-            num_seeds: tracker.seeders.unwrap_or(-1) as i32,
-            num_leeches: tracker.leechers.unwrap_or(-1) as i32,
-            num_downloaded: tracker.completed.unwrap_or(-1) as i32,
+            tier: qbit_i32(tracker.tier),
+            num_peers: qbit_i32(
+                tracker
+                    .seeders
+                    .unwrap_or(0)
+                    .saturating_add(tracker.leechers.unwrap_or(0)),
+            ),
+            num_seeds: qbit_i32(tracker.seeders.unwrap_or(-1)),
+            num_leeches: qbit_i32(tracker.leechers.unwrap_or(-1)),
+            num_downloaded: qbit_i32(tracker.completed.unwrap_or(-1)),
             msg: qbit_tracker_message(tracker),
         })
         .collect()
@@ -3533,37 +5013,94 @@ fn estimate_qbit_peer_snapshot_bytes(peer_count: usize) -> u64 {
     8 * 1024 + (peer_count as u64).saturating_mul(1024)
 }
 
-async fn queue_priority(state: &AppState, hash: &str) -> i32 {
+fn qbit_i64(value: u64) -> i64 {
+    value.min(i64::MAX as u64) as i64
+}
+
+fn qbit_i32(value: i64) -> i32 {
+    value.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+}
+
+fn qbit_usize(value: usize) -> i64 {
+    qbit_i64(value as u64)
+}
+
+async fn queue_priority(state: &AppState, hash: &str) -> Result<i32, String> {
     let Some(engine) = &state.engine else {
-        return 0;
+        return Ok(0);
     };
-    engine.queue_priority(hash.to_owned()).await.unwrap_or(0)
+    engine
+        .queue_priority(hash.to_owned())
+        .await
+        .map_err(|error| error.to_string())
 }
 
 async fn update_queue_order(state: &AppState, body: &str, queue_move: QueueMove) -> StatusCode {
     let params = parse_form_body(body);
-    let hashes = params
-        .get("hashes")
-        .map(|h| extract_hashes_from_str(h))
-        .unwrap_or_default();
-    let hashes = resolve_hashes(state, hashes).await;
+    let hashes = match required_resolved_hashes(state, &params, &["hashes"]).await {
+        Ok(hashes) => hashes,
+        Err(status) => return status,
+    };
     let Some(engine) = &state.engine else {
-        return StatusCode::OK;
+        return StatusCode::NOT_IMPLEMENTED;
     };
     match engine.update_queue_order(hashes, queue_move).await {
         Ok(()) => StatusCode::OK,
-        Err(_) => StatusCode::NOT_FOUND,
+        Err(error) => qbit_engine_error_status(error),
     }
 }
 
-async fn get_torrent_limits(state: &AppState, hash: &str) -> EngineTorrentLimits {
-    let Some(engine) = &state.engine else {
-        return EngineTorrentLimits::default();
-    };
-    engine
-        .torrent_limits(hash.to_owned())
+async fn get_torrent_limits_result(
+    state: &AppState,
+    hash: &str,
+) -> Result<EngineTorrentLimits, String> {
+    if let Some(engine) = &state.engine {
+        return engine
+            .torrent_limits(hash.to_owned())
+            .await
+            .map_err(|error| error.to_string());
+    }
+    let canonical_hash = state
+        .registry
+        .read()
         .await
-        .unwrap_or_default()
+        .get(hash)
+        .map(|entry| entry.info_hash.clone())
+        .unwrap_or_else(|| hash.to_owned());
+    Ok(state
+        .torrent_limits
+        .read()
+        .await
+        .get(&canonical_hash)
+        .cloned()
+        .unwrap_or_default())
+}
+
+/// Read-only qBittorrent limit maps are full-list compatibility endpoints.
+/// Fetch their per-torrent engine projections in bounded batches so one
+/// client request does not serialize thousands of actor round trips.
+async fn load_qbit_limit_projections(
+    state: &AppState,
+    hashes: &[String],
+) -> Result<HashMap<String, EngineTorrentLimits>, String> {
+    let mut result = HashMap::with_capacity(hashes.len());
+    for batch in hashes.chunks(QBIT_LIMIT_PROJECTION_CONCURRENCY) {
+        let mut tasks = JoinSet::new();
+        for hash in batch {
+            let state = state.clone();
+            let hash = hash.clone();
+            tasks.spawn(async move {
+                let limits = get_torrent_limits_result(&state, &hash).await?;
+                Ok::<_, String>((hash, limits))
+            });
+        }
+        while let Some(task) = tasks.join_next().await {
+            let (hash, limits) = task
+                .map_err(|error| format!("qBittorrent limit projection task failed: {error}"))??;
+            result.insert(hash, limits);
+        }
+    }
+    Ok(result)
 }
 
 async fn update_torrent_limits(
@@ -3571,13 +5108,25 @@ async fn update_torrent_limits(
     hash: &str,
     limits: EngineTorrentLimits,
 ) -> StatusCode {
-    let Some(engine) = &state.engine else {
-        return StatusCode::OK;
-    };
-    match engine.update_torrent_limits(hash.to_owned(), limits).await {
-        Ok(()) => StatusCode::OK,
-        Err(_) => StatusCode::NOT_FOUND,
+    if let Some(engine) = &state.engine {
+        return match engine.update_torrent_limits(hash.to_owned(), limits).await {
+            Ok(()) => StatusCode::OK,
+            Err(error) => qbit_engine_error_status(error),
+        };
     }
+    let canonical_hash = {
+        let reg = state.registry.read().await;
+        let Some(entry) = reg.get(hash) else {
+            return StatusCode::NOT_FOUND;
+        };
+        entry.info_hash.clone()
+    };
+    state
+        .torrent_limits
+        .write()
+        .await
+        .insert(canonical_hash, limits);
+    StatusCode::OK
 }
 
 fn parse_qbit_bool(value: &str) -> Option<bool> {
@@ -3588,14 +5137,13 @@ fn parse_qbit_bool(value: &str) -> Option<bool> {
     }
 }
 
-async fn active_recheck_hashes(state: &AppState) -> HashSet<String> {
+async fn active_recheck_hashes(state: &AppState) -> Result<HashSet<String>, String> {
     let Some(engine) = &state.engine else {
-        return HashSet::new();
+        return Ok(HashSet::new());
     };
-    let Ok(jobs) = engine.list_jobs().await else {
-        return HashSet::new();
-    };
-    jobs.into_iter()
+    let jobs = engine.list_jobs().await?;
+    let hashes = jobs
+        .into_iter()
         .filter(|job| {
             job.kind == "recheck_torrent"
                 && !matches!(
@@ -3604,7 +5152,12 @@ async fn active_recheck_hashes(state: &AppState) -> HashSet<String> {
                 )
         })
         .flat_map(|job| job.affected_torrents)
-        .collect()
+        .collect::<Vec<_>>();
+    let registry = state.registry.read().await;
+    Ok(hashes
+        .into_iter()
+        .filter_map(|hash| registry.get(&hash).map(|entry| entry.info_hash.clone()))
+        .collect())
 }
 
 fn qbit_state_with_recheck(entry_state: &str, active_recheck: bool) -> String {
@@ -3615,43 +5168,88 @@ fn qbit_state_with_recheck(entry_state: &str, active_recheck: bool) -> String {
     }
 }
 
+/// Project the small interactive qBittorrent page without serializing all
+/// per-torrent engine reads.  The result remains in registry/snapshot order,
+/// while the bounded batches prevent a slow actor from creating an unbounded
+/// task fan-out or turning one page into a convoy of round trips.
+async fn load_qbit_live_projections(
+    state: &AppState,
+    entries: Vec<rt_session::TorrentEntry>,
+    active_rechecks: HashSet<String>,
+) -> Result<Vec<QbTorrentInfo>, String> {
+    let entries = Arc::new(entries);
+    let active_rechecks = Arc::new(active_rechecks);
+    let mut infos = std::iter::repeat_with(|| None)
+        .take(entries.len())
+        .collect::<Vec<Option<QbTorrentInfo>>>();
+
+    for batch_start in (0..entries.len()).step_by(QBIT_LIVE_PROJECTION_CONCURRENCY) {
+        let batch_end = (batch_start + QBIT_LIVE_PROJECTION_CONCURRENCY).min(entries.len());
+        let mut tasks = JoinSet::new();
+        for index in batch_start..batch_end {
+            let state = state.clone();
+            let entries = Arc::clone(&entries);
+            let active_rechecks = Arc::clone(&active_rechecks);
+            tasks.spawn(async move {
+                let info =
+                    qbit_torrent_info(&state, &entries[index], active_rechecks.as_ref(), true)
+                        .await?;
+                Ok::<_, String>((index, info))
+            });
+        }
+        while let Some(task) = tasks.join_next().await {
+            let (index, info) =
+                task.map_err(|error| format!("qBittorrent live projection task failed: {error}"))??;
+            infos[index] = Some(info);
+        }
+    }
+
+    infos
+        .into_iter()
+        .enumerate()
+        .map(|(index, info)| {
+            info.ok_or_else(|| format!("qBittorrent live projection {index} was not produced"))
+        })
+        .collect()
+}
+
 async fn qbit_torrent_info(
     state: &AppState,
     e: &rt_session::TorrentEntry,
     active_rechecks: &HashSet<String>,
     include_live: bool,
-) -> QbTorrentInfo {
+) -> Result<QbTorrentInfo, String> {
     let progress = torrent_progress(e.total_length, e.amount_left, e.completed_at.is_some());
     let (tracker, trackers_count) = if include_live && state.engine.is_some() {
-        qbit_tracker_projection(state, &e.info_hash).await
+        qbit_tracker_projection(state, &e.info_hash).await?
     } else {
         (String::new(), 0)
     };
     let swarm = if include_live {
-        qbit_swarm_projection(state, &e.info_hash).await
+        qbit_swarm_projection(state, &e.info_hash).await?
     } else {
         QbitSwarmProjection::default()
     };
     let priority = if include_live {
-        queue_priority(state, &e.info_hash).await
+        queue_priority(state, &e.info_hash).await?
     } else {
         0
     };
     let limits = if include_live {
-        get_torrent_limits(state, &e.info_hash).await
+        get_torrent_limits_result(state, &e.info_hash).await?
     } else {
         EngineTorrentLimits::default()
     };
-    QbTorrentInfo {
+    Ok(QbTorrentInfo {
         hash: e.info_hash.clone(),
         name: e.name.clone(),
         state: qbit_state_with_recheck(e.state.as_str(), active_rechecks.contains(&e.info_hash)),
-        size: e.total_length as i64,
-        total_size: e.total_length as i64,
-        downloaded: e.stats.downloaded as i64,
-        downloaded_session: e.stats.downloaded as i64,
-        uploaded: e.stats.uploaded as i64,
-        uploaded_session: e.stats.uploaded as i64,
+        size: qbit_i64(e.total_length),
+        total_size: qbit_i64(e.total_length),
+        downloaded: qbit_i64(e.stats.downloaded),
+        downloaded_session: qbit_i64(e.stats.downloaded),
+        uploaded: qbit_i64(e.stats.uploaded),
+        uploaded_session: qbit_i64(e.stats.uploaded),
         ratio: e.stats.ratio(),
         save_path: format!("{}/", e.save_path.trim_end_matches('/')),
         content_path: format!(
@@ -3666,10 +5264,10 @@ async fn qbit_torrent_info(
         ),
         category: e.category.clone().unwrap_or_default(),
         tags: e.tags.join(","),
-        added_on: e.added_at as i64,
-        completion_on: e.completed_at.map(|t| t as i64).unwrap_or(-1),
-        last_activity: e.added_at as i64,
-        seen_complete: e.completed_at.map(|t| t as i64).unwrap_or(-1),
+        added_on: qbit_i64(e.added_at),
+        completion_on: e.completed_at.map(qbit_i64).unwrap_or(-1),
+        last_activity: qbit_i64(e.added_at),
+        seen_complete: e.completed_at.map(qbit_i64).unwrap_or(-1),
         time_active: 0,
         seeding_time: 0,
         num_leechs: swarm.leechers,
@@ -3681,7 +5279,7 @@ async fn qbit_torrent_info(
         eta: -1,
         progress,
         priority,
-        amount_left: e.amount_left as i64,
+        amount_left: qbit_i64(e.amount_left),
         auto_tmm: limits.auto_tmm || limits.auto_management,
         seq_dl: limits.sequential_download,
         f_l_piece_prio: limits.first_last_piece_prio,
@@ -3702,7 +5300,7 @@ async fn qbit_torrent_info(
         } else {
             String::new()
         },
-    }
+    })
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -3711,10 +5309,6 @@ struct QbitSwarmProjection {
     leechers: u32,
     download_rate: i64,
     upload_rate: i64,
-}
-
-async fn qbit_engine_stats(state: &AppState) -> Option<EngineStats> {
-    state.engine.as_ref()?.stats().await.ok()
 }
 
 fn qbit_session_rates_from_infos(infos: &[QbTorrentInfo]) -> QbitSwarmProjection {
@@ -3727,15 +5321,18 @@ fn qbit_session_rates_from_infos(infos: &[QbTorrentInfo]) -> QbitSwarmProjection
         })
 }
 
-async fn qbit_swarm_projection(state: &AppState, info_hash: &str) -> QbitSwarmProjection {
+async fn qbit_swarm_projection(
+    state: &AppState,
+    info_hash: &str,
+) -> Result<QbitSwarmProjection, String> {
     let Some(engine) = &state.engine else {
-        return QbitSwarmProjection::default();
+        return Ok(QbitSwarmProjection::default());
     };
     engine
         .torrent_peers(info_hash.to_owned())
         .await
         .map(|peers| qbit_swarm_from_peers(&peers))
-        .unwrap_or_default()
+        .map_err(|error| error.to_string())
 }
 
 fn qbit_swarm_from_peers(peers: &[EnginePeerSnapshot]) -> QbitSwarmProjection {
@@ -3799,15 +5396,33 @@ fn redact_log_url(value: &str) -> String {
     }
 }
 
-async fn qbit_tracker_projection(state: &AppState, info_hash: &str) -> (String, u32) {
+async fn qbit_tracker_projection(
+    state: &AppState,
+    info_hash: &str,
+) -> Result<(String, u32), String> {
     if let Some(engine) = &state.engine {
-        if let Ok(trackers) = engine.torrent_trackers(info_hash.to_owned()).await {
-            let projection = qbit_tracker_projection_from_snapshots(&trackers);
-            if projection.1 > 0 {
-                return projection;
-            }
+        let trackers = engine.torrent_trackers(info_hash.to_owned()).await?;
+        let projection = qbit_tracker_projection_from_snapshots(&trackers);
+        if projection.1 > 0 {
+            return Ok(projection);
         }
-    }
+        // Older durable rows may not have tracker detail rows yet. Use the
+        // metadata projection only after the authoritative detail query has
+        // succeeded; a failed metadata read must not become an empty 200.
+        let meta = engine.torrent_metadata(info_hash.to_owned()).await?;
+        let projection = (
+            meta.trackers.first().cloned().unwrap_or_default(),
+            u32::try_from(meta.trackers.len()).unwrap_or(u32::MAX),
+        );
+        if projection.1 > 0 {
+            state
+                .tracker_projection_cache
+                .write()
+                .await
+                .insert(info_hash.to_owned(), projection.clone());
+        }
+        return Ok(projection);
+    };
     if let Some(cached) = state
         .tracker_projection_cache
         .read()
@@ -3815,26 +5430,9 @@ async fn qbit_tracker_projection(state: &AppState, info_hash: &str) -> (String, 
         .get(info_hash)
         .cloned()
     {
-        return cached;
+        return Ok(cached);
     }
-    let Some(engine) = &state.engine else {
-        return (String::new(), 0);
-    };
-    let projection = match engine.torrent_metadata(info_hash.to_owned()).await {
-        Ok(meta) => (
-            meta.trackers.first().cloned().unwrap_or_default(),
-            meta.trackers.len() as u32,
-        ),
-        Err(_) => (String::new(), 0),
-    };
-    if projection.1 > 0 {
-        state
-            .tracker_projection_cache
-            .write()
-            .await
-            .insert(info_hash.to_owned(), projection.clone());
-    }
-    projection
+    Ok((String::new(), 0))
 }
 
 fn qbit_tracker_projection_from_snapshots(trackers: &[EngineTrackerSnapshot]) -> (String, u32) {
@@ -3845,7 +5443,10 @@ fn qbit_tracker_projection_from_snapshots(trackers: &[EngineTrackerSnapshot]) ->
     }) else {
         return (String::new(), 0);
     };
-    (first.announce.clone(), trackers.len() as u32)
+    (
+        first.announce.clone(),
+        u32::try_from(trackers.len()).unwrap_or(u32::MAX),
+    )
 }
 
 #[cfg(test)]
@@ -3889,16 +5490,6 @@ fn sync_rid_for_infos_and_trackers(
     rid.max(1)
 }
 
-fn extract_hashes_from_str(s: &str) -> Vec<String> {
-    if s == "all" {
-        return vec!["all".into()];
-    }
-    s.split('|')
-        .map(|h| h.trim().to_owned())
-        .filter(|h| !h.is_empty())
-        .collect()
-}
-
 fn parse_form_body(body: &str) -> HashMap<String, String> {
     url::form_urlencoded::parse(body.as_bytes())
         .into_owned()
@@ -3909,23 +5500,44 @@ fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs() as i64
+        .as_secs()
+        .min(i64::MAX as u64) as i64
 }
 
-fn split_tags(tags: &str) -> Vec<String> {
-    tags.split(',')
-        .map(|s| s.trim().to_owned())
-        .filter(|s| !s.is_empty())
-        .collect()
+fn strict_tag_values(tags: &str, allow_empty: bool) -> Result<Vec<String>, ()> {
+    if tags.trim().is_empty() {
+        return if allow_empty { Ok(Vec::new()) } else { Err(()) };
+    }
+    let values = tags.split(',').map(str::trim).collect::<Vec<_>>();
+    if values.iter().any(|value| value.is_empty()) {
+        return Err(());
+    }
+    Ok(values.into_iter().map(str::to_owned).collect())
 }
 
+#[cfg(test)]
 fn split_tracker_values(values: &str) -> Vec<String> {
+    let normalized = values.replace("\r\n", "\n").replace('\r', "\n");
     normalize_tracker_values(
-        values
-            .split(['|', '\n', '\r'])
+        normalized
+            .split(['|', '\n'])
             .map(str::to_owned)
             .collect::<Vec<_>>(),
     )
+}
+
+fn strict_tracker_values(values: &str) -> Result<Vec<String>, ()> {
+    let normalized = values.replace("\r\n", "\n").replace('\r', "\n");
+    let values = normalized
+        .split(['|', '\n'])
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    if values.is_empty() || values.iter().any(|value| value.is_empty()) {
+        return Err(());
+    }
+    Ok(normalize_tracker_values(
+        values.into_iter().map(str::to_owned).collect(),
+    ))
 }
 
 fn normalize_tracker_values(values: Vec<String>) -> Vec<String> {
@@ -3939,14 +5551,22 @@ fn normalize_tracker_values(values: Vec<String>) -> Vec<String> {
     out
 }
 
-fn split_pipe_values(values: &str) -> Vec<String> {
-    values.split('|').filter_map(normalize_api_text).collect()
-}
-
+#[cfg(test)]
 fn parse_peer_addrs(values: &str) -> Vec<SocketAddr> {
     values
         .split('|')
         .filter_map(|peer| peer.trim().parse::<SocketAddr>().ok())
+        .collect()
+}
+
+fn strict_peer_addrs(values: &str) -> Result<Vec<SocketAddr>, ()> {
+    let values = values.split('|').collect::<Vec<_>>();
+    if values.is_empty() || values.iter().any(|value| value.trim().is_empty()) {
+        return Err(());
+    }
+    values
+        .into_iter()
+        .map(|peer| peer.trim().parse::<SocketAddr>().map_err(|_| ()))
         .collect()
 }
 
@@ -3971,11 +5591,11 @@ async fn update_torrent_category(
             .await
         {
             Ok(()) => StatusCode::OK,
-            Err(_) => StatusCode::NOT_FOUND,
+            Err(error) => qbit_engine_error_status(error),
         };
     }
     let mut reg = state.registry.write().await;
-    let Some(entry) = reg.get_mut(hash) else {
+    let Some(mut entry) = reg.get_mut(hash) else {
         return StatusCode::NOT_FOUND;
     };
     entry.category = category;
@@ -3994,11 +5614,11 @@ async fn update_torrent_tags(
             .await
         {
             Ok(()) => StatusCode::OK,
-            Err(_) => StatusCode::NOT_FOUND,
+            Err(error) => qbit_engine_error_status(error),
         };
     }
     let mut reg = state.registry.write().await;
-    let Some(entry) = reg.get_mut(hash) else {
+    let Some(mut entry) = reg.get_mut(hash) else {
         return StatusCode::NOT_FOUND;
     };
     for tag in add_tags {
@@ -4024,11 +5644,11 @@ async fn update_torrent_fields(
             .await
         {
             Ok(()) => StatusCode::OK,
-            Err(_) => StatusCode::NOT_FOUND,
+            Err(error) => qbit_engine_error_status(error),
         };
     }
     let mut reg = state.registry.write().await;
-    let Some(entry) = reg.get_mut(hash) else {
+    let Some(mut entry) = reg.get_mut(hash) else {
         return StatusCode::NOT_FOUND;
     };
     if let Some(name) = name.and_then(|name| normalize_api_text(&name)) {
@@ -4040,15 +5660,15 @@ async fn update_torrent_fields(
     StatusCode::OK
 }
 
-async fn current_tracker_urls(state: &AppState, hash: &str) -> Vec<String> {
+async fn current_tracker_urls(state: &AppState, hash: &str) -> Result<Vec<String>, String> {
     let Some(engine) = &state.engine else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     engine
         .torrent_metadata(hash.to_owned())
         .await
         .map(|meta| meta.trackers)
-        .unwrap_or_default()
+        .map_err(|error| error.to_string())
 }
 
 async fn update_torrent_trackers(
@@ -4057,7 +5677,7 @@ async fn update_torrent_trackers(
     trackers: Vec<String>,
 ) -> StatusCode {
     let Some(engine) = &state.engine else {
-        return StatusCode::OK;
+        return StatusCode::NOT_IMPLEMENTED;
     };
     match engine
         .update_torrent_trackers(hash.to_owned(), trackers)
@@ -4067,85 +5687,58 @@ async fn update_torrent_trackers(
             state.tracker_projection_cache.write().await.remove(hash);
             StatusCode::OK
         }
-        Err(_) => StatusCode::NOT_FOUND,
+        Err(error) => qbit_engine_error_status(error),
     }
 }
 
-async fn fetch_torrent_url(raw_url: &str) -> Result<Vec<u8>, String> {
-    const MAX_TORRENT_BYTES: u64 = 16 * 1024 * 1024;
+async fn fetch_torrent_url(
+    raw_url: &str,
+    egress_policy: &rt_engine::OutboundEgressPolicy,
+) -> Result<Vec<u8>, String> {
+    const MAX_TORRENT_BYTES: usize = 16 * 1024 * 1024;
 
     let url = Url::parse(raw_url).map_err(|e| format!("invalid URL: {e}"))?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err("only http and https torrent URLs are supported".to_owned());
     }
-    let host = url
-        .host_str()
-        .ok_or_else(|| "torrent URL is missing a host".to_owned())?;
-    reject_private_host(host, url.port_or_known_default().unwrap_or(80)).await?;
-
-    let response = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| e.to_string())?
-        .get(url)
-        .send()
+    let client = egress_policy
+        .http_client(
+            OutboundTargetKind::Webseed,
+            &url,
+            Duration::from_secs(30),
+            "TorrentNG/qBittorrent",
+        )
         .await
         .map_err(|e| e.to_string())?;
+    let response = client.get(url).send().await.map_err(|e| e.to_string())?;
 
     if !response.status().is_success() {
         return Err(format!("HTTP {}", response.status()));
     }
-    if response.content_length().unwrap_or(0) > MAX_TORRENT_BYTES {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_TORRENT_BYTES as u64)
+    {
         return Err("torrent response is too large".to_owned());
     }
-    let bytes = response.bytes().await.map_err(|e| e.to_string())?;
-    if bytes.len() as u64 > MAX_TORRENT_BYTES {
-        return Err("torrent response is too large".to_owned());
-    }
-    Ok(bytes.to_vec())
-}
-
-async fn reject_private_host(host: &str, port: u16) -> Result<(), String> {
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return reject_private_ip(ip);
-    }
-
-    let addrs = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|e| format!("DNS lookup failed: {e}"))?;
-    for addr in addrs {
-        reject_private_ip(addr.ip())?;
-    }
-    Ok(())
-}
-
-fn reject_private_ip(ip: IpAddr) -> Result<(), String> {
-    let blocked = match ip {
-        IpAddr::V4(ip) => {
-            ip.is_private()
-                || ip.is_loopback()
-                || ip.is_link_local()
-                || ip.is_broadcast()
-                || ip.is_documentation()
-                || ip.is_unspecified()
+    let mut body = Vec::with_capacity(
+        response
+            .content_length()
+            .map(|length| length.min(MAX_TORRENT_BYTES as u64) as usize)
+            .unwrap_or_default(),
+    );
+    let mut response = response;
+    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+        if body.len().saturating_add(chunk.len()) > MAX_TORRENT_BYTES {
+            return Err("torrent response is too large".to_owned());
         }
-        IpAddr::V6(ip) => {
-            ip.is_loopback()
-                || ip.is_unspecified()
-                || ip.segments()[0] & 0xfe00 == 0xfc00
-                || ip.segments()[0] & 0xffc0 == 0xfe80
-        }
-    };
-    if blocked {
-        Err(format!("private or local address {ip} is not allowed"))
-    } else {
-        Ok(())
+        body.extend_from_slice(&chunk);
     }
+    Ok(body)
 }
 
 async fn resolve_hashes(state: &AppState, hashes: Vec<String>) -> Vec<String> {
-    if hashes.iter().any(|hash| hash == "all") {
+    if hashes.len() == 1 && hashes[0] == "all" {
         let reg = state.registry.read().await;
         reg.iter().map(|entry| entry.info_hash.clone()).collect()
     } else {
@@ -4153,14 +5746,31 @@ async fn resolve_hashes(state: &AppState, hashes: Vec<String>) -> Vec<String> {
     }
 }
 
-async fn default_save_path(state: &AppState) -> String {
+async fn default_save_path(state: &AppState, preferences: &JsonMap) -> Result<String, String> {
+    if let Some(save_path) = preferences
+        .get("save_path")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        return Ok(format!("{}/", save_path.trim_end_matches('/')));
+    }
+    if let Some(engine) = &state.engine {
+        let roots = engine.list_storage_roots().await?;
+        if let Some(root) = roots.into_iter().find(|root| root.ok) {
+            return Ok(format!(
+                "{}/",
+                root.path.to_string_lossy().trim_end_matches('/')
+            ));
+        }
+    }
     let reg = state.registry.read().await;
     let save_path = reg
         .iter()
         .next()
         .map(|entry| format!("{}/", entry.save_path.trim_end_matches('/')))
         .unwrap_or_else(|| "/downloads/".to_owned());
-    save_path
+    Ok(save_path)
 }
 
 // ---------------------------------------------------------------------------
@@ -4175,7 +5785,7 @@ mod tests {
     use rt_engine::Engine;
     use rt_session::{SessionRegistry, TorrentEntry};
     use std::sync::Arc;
-    use tokio::sync::RwLock;
+    use tokio::sync::{Notify, RwLock};
     use tower::ServiceExt;
 
     use crate::router::build_qbit_router;
@@ -4243,6 +5853,20 @@ mod tests {
     }
 
     #[test]
+    fn qbit_filters_do_not_silently_fall_back_to_all_torrents() {
+        assert!(validate_qbit_filter(Some("active")).is_ok());
+        assert!(validate_qbit_filter(Some("uploading")).is_ok());
+        assert_eq!(
+            validate_qbit_filter(Some("not-a-filter")).unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            validate_qbit_filter(Some("stalled")).unwrap_err().0,
+            StatusCode::NOT_IMPLEMENTED
+        );
+    }
+
+    #[test]
     fn qbit_log_entry_projects_session_events() {
         let row = rt_db::SessionEventRow {
             event_id: Some(42),
@@ -4253,7 +5877,7 @@ mod tests {
             payload: "{}".to_owned(),
         };
 
-        let entry = qbit_log_entry(row);
+        let entry = qbit_log_entry(row).unwrap();
         assert_eq!(entry.id, 42);
         assert_eq!(entry.message, "tracker warning");
         assert_eq!(entry.timestamp, 1_700_000_000);
@@ -4262,10 +5886,33 @@ mod tests {
 
     #[test]
     fn qbit_log_type_uses_level_payload_and_kind_fallbacks() {
-        assert_eq!(qbit_log_type("torrent_added", r#"{"level":"info"}"#), 1);
-        assert_eq!(qbit_log_type("tracker_warning", "{}"), 2);
-        assert_eq!(qbit_log_type("storage_failed", "{}"), 4);
-        assert_eq!(qbit_log_type("tracker", r#"{"level":"critical"}"#), 4);
+        assert_eq!(
+            qbit_log_type("torrent_added", r#"{"level":"info"}"#).unwrap(),
+            1
+        );
+        assert_eq!(qbit_log_type("tracker_warning", "{}").unwrap(), 2);
+        assert_eq!(qbit_log_type("storage_failed", "{}").unwrap(), 4);
+        assert_eq!(
+            qbit_log_type("tracker", r#"{"level":"critical"}"#).unwrap(),
+            4
+        );
+    }
+
+    #[test]
+    fn qbit_log_entry_rejects_corrupt_or_unidentified_session_events() {
+        let mut row = rt_db::SessionEventRow {
+            event_id: Some(42),
+            occurred_at: 1_700_000_000,
+            info_hash: None,
+            kind: "torrent_added".to_owned(),
+            message: None,
+            payload: "not json".to_owned(),
+        };
+        assert!(qbit_log_entry(row.clone()).is_err());
+
+        row.payload = "{}".to_owned();
+        row.event_id = None;
+        assert!(qbit_log_entry(row).is_err());
     }
 
     #[test]
@@ -4388,6 +6035,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn idempotency_key_replays_qbit_mutation_and_rejects_reuse() {
+        let state = AppState::new();
+        let app = build_qbit_router(state);
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/torrents/createCategory")
+                    .header("idempotency-key", "qbit-category-1")
+                    .body(Body::from("category=films&savePath=%2Fdata%2Ffilms"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let replay = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/torrents/createCategory")
+                    .header("idempotency-key", "qbit-category-1")
+                    .body(Body::from("category=films&savePath=%2Fdata%2Ffilms"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(
+            replay.headers().get("idempotency-replayed").unwrap(),
+            "true"
+        );
+
+        let conflict = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/torrents/createCategory")
+                    .header("idempotency-key", "qbit-category-1")
+                    .body(Body::from("category=tv"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(conflict.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
     async fn app_version_ok() {
         let app = build_qbit_router(AppState::new());
         let resp = app
@@ -4400,6 +6097,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn app_shutdown_notifies_daemon_and_email_is_explicitly_unsupported() {
+        let shutdown = Arc::new(Notify::new());
+        let mut state = AppState::new();
+        state.shutdown = Some(Arc::clone(&shutdown));
+        let app = build_qbit_router(state);
+        let notified = shutdown.notified();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/app/shutdown")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+            .await
+            .expect("qBittorrent shutdown request was not propagated");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/app/sendTestEmail")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
     }
 
     #[tokio::test]
@@ -4644,6 +6379,182 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn engine_backed_qbit_app_state_survives_engine_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.daemon.session_dir = temp.path().join("session");
+        config.storage.download_dir = temp.path().join("downloads");
+        config.network.listen_port = 0;
+        config.dht.enabled = false;
+
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        let engine = Engine::start(Arc::new(config.clone()), Arc::clone(&registry))
+            .await
+            .unwrap();
+        let state = AppState::with_engine(Arc::clone(&registry), engine.clone());
+        let app = build_qbit_router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/app/setPreferences")
+                    .body(Body::from(r#"{"locale":"de","save_path":"/persisted"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/app/setCookies")
+                    .body(Body::from(
+                        r#"[{"host":"tracker.example","name":"sid","value":"persisted"}]"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/app/rotateAPIKey")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let api_key: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let stored_api_key = engine
+            .get_setting(SETTING_QBIT_API_KEY.to_owned())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Option<String>>(&stored_api_key).unwrap(),
+            api_key["apiKey"].as_str().map(ToOwned::to_owned)
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/rss/addFolder")
+                    .body(Body::from("path=linux"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/search/installPlugin")
+                    .body(Body::from("sources=https%3A%2F%2Fexample.test%2Fjackett"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/rss/setRule")
+                    .body(Body::from(
+                        "ruleName=linux&ruleDef=%7B%22enabled%22%3Atrue%7D",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        engine.shutdown().await;
+
+        let restarted_registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        let restarted_engine = Engine::start(Arc::new(config), Arc::clone(&restarted_registry))
+            .await
+            .unwrap();
+        let restarted_state =
+            AppState::with_engine(Arc::clone(&restarted_registry), restarted_engine.clone());
+        assert_eq!(
+            load_qbit_preferences(&restarted_state)
+                .await
+                .unwrap()
+                .get("locale"),
+            Some(&serde_json::Value::String("de".to_owned()))
+        );
+        assert_eq!(
+            load_qbit_preferences(&restarted_state)
+                .await
+                .unwrap()
+                .get("save_path"),
+            Some(&serde_json::Value::String("/persisted".to_owned()))
+        );
+        assert_eq!(
+            load_qbit_cookies(&restarted_state).await.unwrap(),
+            vec![serde_json::json!({
+                "host": "tracker.example",
+                "name": "sid",
+                "value": "persisted",
+            })]
+        );
+        assert_eq!(
+            restarted_engine
+                .get_setting(SETTING_QBIT_API_KEY.to_owned())
+                .await
+                .unwrap(),
+            Some(stored_api_key)
+        );
+        assert_eq!(
+            load_qbit_rss_items(&restarted_state)
+                .await
+                .unwrap()
+                .get("linux")
+                .and_then(|item| item.get("type")),
+            Some(&serde_json::Value::String("folder".to_owned()))
+        );
+        assert_eq!(
+            load_qbit_rss_rules(&restarted_state)
+                .await
+                .unwrap()
+                .get("linux")
+                .and_then(|rule| rule.get("enabled")),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(
+            load_qbit_search_plugins(&restarted_state)
+                .await
+                .unwrap()
+                .get("jackett")
+                .and_then(|plugin| plugin.get("enabled")),
+            Some(&serde_json::Value::Bool(true))
+        );
+        restarted_engine.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn app_cookies_and_api_key_roundtrip() {
         let app = build_qbit_router(AppState::new());
         let resp = app
@@ -4691,7 +6602,9 @@ mod tests {
             .unwrap();
         let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let rotated: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(rotated["apiKey"].as_str().unwrap().starts_with("tng_"));
+        let rotated_key = rotated["apiKey"].as_str().unwrap();
+        assert!(rotated_key.starts_with("tng_"));
+        assert_eq!(rotated_key.len(), 68);
 
         let resp = app
             .oneshot(
@@ -4704,6 +6617,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn torrents_info_rejects_unavailable_speed_sorting() {
+        let app = build_qbit_router(AppState::new());
+        for sort in ["dlspeed", "upspeed"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/qb/v2/torrents/info?sort={sort}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        }
     }
 
     #[tokio::test]
@@ -4761,6 +6692,40 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v.as_array().unwrap().len(), 1);
         assert_eq!(v[0]["hash"].as_str().unwrap(), hash);
+    }
+
+    #[tokio::test]
+    async fn torrents_info_default_page_is_bounded() {
+        let state = AppState::new();
+        {
+            let mut registry = state.registry.write().await;
+            for index in 0..=QBIT_DEFAULT_PAGE_SIZE {
+                registry
+                    .add(TorrentEntry::new(
+                        format!("{index:040x}"),
+                        format!("torrent-{index}"),
+                        "/data".into(),
+                    ))
+                    .unwrap();
+            }
+        }
+
+        let app = build_qbit_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/qb/v2/torrents/info")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 2 * 1024 * 1024)
+            .await
+            .unwrap();
+        let torrents: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(torrents.as_array().unwrap().len(), QBIT_DEFAULT_PAGE_SIZE);
     }
 
     #[tokio::test]
@@ -5050,6 +7015,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn torrents_info_rejects_mixed_all_hash_filter() {
+        let app = build_qbit_router(AppState::new());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/qb/v2/torrents/info?hashes=all%7Cdeadbeef")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn torrents_info_pages_are_pinned_by_snapshot_header() {
         let state = AppState::new();
         for (hash, name) in [("a", "alpha"), ("b", "bravo"), ("c", "charlie")] {
@@ -5088,13 +7068,11 @@ mod tests {
         assert_eq!(body[0]["name"], "alpha");
 
         let first_hash = "a0".to_owned() + &"0".repeat(38);
-        state
-            .registry
-            .write()
-            .await
-            .get_mut(&first_hash)
-            .unwrap()
-            .name = "zulu".into();
+        {
+            let mut registry = state.registry.write().await;
+            let mut entry = registry.get_mut(&first_hash).unwrap();
+            entry.name = "zulu".into();
+        }
 
         let second = app
             .oneshot(
@@ -5158,13 +7136,11 @@ mod tests {
         let rid = first["rid"].as_i64().unwrap();
         assert_eq!(first["torrents"].as_object().unwrap().len(), 2);
 
-        state
-            .registry
-            .write()
-            .await
-            .get_mut(&first_hash)
-            .unwrap()
-            .name = "renamed".into();
+        {
+            let mut registry = state.registry.write().await;
+            let mut entry = registry.get_mut(&first_hash).unwrap();
+            entry.name = "renamed".into();
+        }
         state.registry.write().await.remove(&second_hash).unwrap();
 
         let second = app
@@ -5192,7 +7168,7 @@ mod tests {
         let state = make_state_with(&hash).await;
         {
             let mut reg = state.registry.write().await;
-            let entry = reg.get_mut(&hash).unwrap();
+            let mut entry = reg.get_mut(&hash).unwrap();
             entry.total_length = 1_000;
             entry.amount_left = 250;
             entry.added_at = 100;
@@ -5246,7 +7222,7 @@ mod tests {
         let state = make_state_with(&hash).await;
         {
             let mut reg = state.registry.write().await;
-            let entry = reg.get_mut(&hash).unwrap();
+            let mut entry = reg.get_mut(&hash).unwrap();
             entry.category = Some("movies".into());
             entry.tags = vec!["hd".into(), "archive".into(), "hd".into()];
         }
@@ -5405,7 +7381,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transfer_info_ok() {
+    async fn transfer_info_fails_closed_without_engine() {
         let app = build_qbit_router(AppState::new());
         let resp = app
             .oneshot(
@@ -5416,10 +7392,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["connection_status"].as_str().unwrap(), "connected");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
@@ -5511,7 +7484,7 @@ mod tests {
         let state = make_state_with(&hash).await;
         {
             let mut reg = state.registry.write().await;
-            let entry = reg.get_mut(&hash).unwrap();
+            let mut entry = reg.get_mut(&hash).unwrap();
             entry.category = Some("old".into());
             entry.tags = vec!["remove".into(), "keep".into()];
         }
@@ -5619,6 +7592,26 @@ mod tests {
                 .unwrap();
             assert_ne!(resp.status(), StatusCode::NOT_FOUND, "{path}");
             assert_ne!(resp.status(), StatusCode::METHOD_NOT_ALLOWED, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn qbit_file_priority_rejects_values_outside_engine_contract() {
+        let app = build_qbit_router(make_state_with(&"a".repeat(40)).await);
+        for priority in ["-1", "3", "99"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/qb/v2/torrents/filePrio")
+                        .header("content-type", "application/x-www-form-urlencoded")
+                        .body(Body::from(format!("hash=a&id=0&priority={priority}")))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{priority}");
         }
     }
 
@@ -5803,12 +7796,16 @@ mod tests {
             ("GET", "/api/qb/v2/search/status", ""),
             ("GET", "/api/qb/v2/search/categories", ""),
             ("GET", "/api/qb/v2/search/plugins", ""),
-            ("POST", "/api/qb/v2/search/installPlugin", "sources="),
-            ("POST", "/api/qb/v2/search/uninstallPlugin", "names="),
+            (
+                "POST",
+                "/api/qb/v2/search/installPlugin",
+                "sources=https%3A%2F%2Fexample.test%2Fjackett",
+            ),
+            ("POST", "/api/qb/v2/search/uninstallPlugin", "names=jackett"),
             (
                 "POST",
                 "/api/qb/v2/search/enablePlugin",
-                "names=&enable=true",
+                "names=jackett&enable=true",
             ),
             ("POST", "/api/qb/v2/search/updatePlugins", ""),
             (
@@ -5816,9 +7813,9 @@ mod tests {
                 "/api/qb/v2/search/start",
                 "pattern=test&plugins=all&category=all",
             ),
-            ("POST", "/api/qb/v2/search/stop", "id=0"),
+            ("POST", "/api/qb/v2/search/stop", "id=1"),
             ("GET", "/api/qb/v2/search/results", ""),
-            ("POST", "/api/qb/v2/search/delete", "id=0"),
+            ("POST", "/api/qb/v2/search/delete", "id=1"),
             ("GET", "/api/qb/v2/rss/items", ""),
             ("GET", "/api/qb/v2/rss/rules", ""),
             ("GET", "/api/qb/v2/rss/matchingArticles", ""),
@@ -5828,7 +7825,6 @@ mod tests {
                 "/api/qb/v2/rss/addFeed",
                 "url=http://example.com/feed&path=test",
             ),
-            ("POST", "/api/qb/v2/rss/removeItem", "path=test"),
             (
                 "POST",
                 "/api/qb/v2/rss/moveItem",
@@ -5837,9 +7833,10 @@ mod tests {
             (
                 "POST",
                 "/api/qb/v2/rss/markAsRead",
-                "itemPath=test&articleId=all",
+                "itemPath=dest&articleId=all",
             ),
-            ("POST", "/api/qb/v2/rss/refreshItem", "itemPath=test"),
+            ("POST", "/api/qb/v2/rss/refreshItem", "itemPath=dest"),
+            ("POST", "/api/qb/v2/rss/removeItem", "path=dest"),
             ("POST", "/api/qb/v2/rss/setRule", "ruleName=test&ruleDef={}"),
             (
                 "POST",
@@ -5851,7 +7848,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn qbit_detail_endpoints_are_compatible_without_engine_metadata() {
+    async fn qbit_detail_endpoints_fail_closed_without_engine_metadata() {
         let hash = "d".repeat(40);
         let app = build_qbit_router(make_state_with(&hash).await);
         for path in [
@@ -5863,10 +7860,7 @@ mod tests {
                 .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
                 .await
                 .unwrap();
-            assert_eq!(resp.status(), StatusCode::OK);
-            let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
-            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(body, serde_json::json!([]));
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         }
     }
 
@@ -5902,6 +7896,38 @@ mod tests {
         let plugins: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(plugins[0]["name"], "jackett");
         assert_eq!(plugins[0]["enabled"], true);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/qb/v2/search/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let status: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 4096).await.unwrap())
+                .unwrap();
+        assert_eq!(status["plugins"][0]["name"], "jackett");
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/qb/v2/search/categories")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let categories: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 4096).await.unwrap())
+                .unwrap();
+        assert_eq!(categories, serde_json::json!(["all"]));
 
         let resp = app
             .clone()
@@ -6071,7 +8097,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
@@ -6098,6 +8124,30 @@ mod tests {
         std::fs::create_dir_all(&blob_dir).unwrap();
         let raw = b"d4:infod4:name8:exportedee".to_vec();
         std::fs::write(blob_dir.join(format!("{hash}.torrent")), &raw).unwrap();
+        let conn = rusqlite::Connection::open(config.db_path()).unwrap();
+        rt_db::migrate(&conn).unwrap();
+        rt_db::upsert(
+            &conn,
+            &rt_db::TorrentRow {
+                info_hash: hash.clone(),
+                name: "exported".to_owned(),
+                total_length: 0,
+                piece_length: 0,
+                piece_count: 0,
+                is_private: false,
+                save_path: config.storage.download_dir.to_string_lossy().into_owned(),
+                category: None,
+                tags: Vec::new(),
+                state: "stopped".to_owned(),
+                added_at: 1,
+                completed_at: None,
+                uploaded: 0,
+                downloaded: 0,
+                ratio: 0.0,
+                trackers: Vec::new(),
+            },
+        )
+        .unwrap();
 
         let engine = Engine::start(Arc::new(config), Arc::clone(&registry))
             .await
@@ -6298,7 +8348,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transfer_ban_peers_roundtrips_through_preferences_without_engine() {
+    async fn transfer_ban_peers_fails_closed_without_engine() {
         let app = build_qbit_router(AppState::new());
         let resp = app
             .clone()
@@ -6307,28 +8357,12 @@ mod tests {
                     .method("POST")
                     .uri("/api/qb/v2/transfer/banPeers")
                     .header("content-type", "application/x-www-form-urlencoded")
-                    .body(Body::from("peers=127.0.0.1:6881|[::1]:6882|bad"))
+                    .body(Body::from("peers=127.0.0.1:6881|[::1]:6882"))
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/qb/v2/app/preferences")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
-        let prefs: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let banned = prefs["banned_ips"].as_str().unwrap();
-        assert!(banned.contains("127.0.0.1:6881"));
-        assert!(banned.contains("[::1]:6882"));
-        assert!(!banned.contains("bad"));
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
@@ -6369,7 +8403,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reannounce_accepts_all_hashes_without_engine() {
+    async fn reannounce_reports_unavailable_without_engine() {
         let hash = "c".repeat(40);
         let state = make_state_with(&hash).await;
         let app = build_qbit_router(state);
@@ -6384,20 +8418,28 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]
     fn ssrf_guard_rejects_private_and_local_ips() {
-        assert!(reject_private_ip("127.0.0.1".parse().unwrap()).is_err());
-        assert!(reject_private_ip("10.0.0.1".parse().unwrap()).is_err());
-        assert!(reject_private_ip("172.16.0.1".parse().unwrap()).is_err());
-        assert!(reject_private_ip("192.168.1.1".parse().unwrap()).is_err());
-        assert!(reject_private_ip("169.254.1.1".parse().unwrap()).is_err());
-        assert!(reject_private_ip("::1".parse().unwrap()).is_err());
-        assert!(reject_private_ip("fc00::1".parse().unwrap()).is_err());
-        assert!(reject_private_ip("fe80::1".parse().unwrap()).is_err());
-        assert!(reject_private_ip("8.8.8.8".parse().unwrap()).is_ok());
+        let policy = rt_engine::OutboundEgressPolicy::default();
+        for value in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.1.1",
+            "::1",
+            "fc00::1",
+            "fe80::1",
+        ] {
+            assert!(
+                policy.validate_ip(value.parse().unwrap()).is_err(),
+                "{value}"
+            );
+        }
+        assert!(policy.validate_ip("8.8.8.8".parse().unwrap()).is_ok());
     }
 
     #[test]
@@ -6420,10 +8462,17 @@ mod tests {
 
     #[test]
     fn pieces_have_is_bounded() {
-        assert_eq!(pieces_have(1_000, 250, false, 100, 10), 8);
-        assert_eq!(pieces_have(1_000, 0, false, 100, 10), 10);
-        assert_eq!(pieces_have(1_000, 250, false, 0, 10), 0);
-        assert_eq!(pieces_have(1_000, 250, false, 100, 0), 0);
+        assert_eq!(pieces_have(1_000, 250, 100, 10), 8);
+        assert_eq!(pieces_have(1_000, 0, 100, 10), 10);
+        assert_eq!(pieces_have(1_000, 250, 0, 10), 0);
+        assert_eq!(pieces_have(1_000, 250, 100, 0), 0);
+    }
+
+    #[test]
+    fn qbit_progress_and_piece_count_ignore_stale_completion_timestamp() {
+        assert!((torrent_progress(1_000, 250, true) - 0.75).abs() < f64::EPSILON);
+        assert_eq!(pieces_have(1_000, 250, 100, 10), 8);
+        assert_eq!(torrent_progress(1_000, 0, false), 1.0);
     }
 
     #[test]
@@ -6443,6 +8492,13 @@ mod tests {
     fn split_tracker_values_accepts_qbit_separators_and_dedupes() {
         assert_eq!(
             split_tracker_values("udp://one/announce|udp://two/announce\nudp://one/announce"),
+            vec![
+                "udp://one/announce".to_owned(),
+                "udp://two/announce".to_owned()
+            ]
+        );
+        assert_eq!(
+            split_tracker_values("udp://one/announce\r\nudp://two/announce"),
             vec![
                 "udp://one/announce".to_owned(),
                 "udp://two/announce".to_owned()
@@ -6484,6 +8540,54 @@ mod tests {
         assert_eq!(peers.len(), 2);
         assert_eq!(peers[0], "127.0.0.1:6881".parse::<SocketAddr>().unwrap());
         assert_eq!(peers[1], "[::1]:6882".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn strict_mutation_parsers_reject_dropped_values() {
+        assert!(strict_hashes_from_str("").is_none());
+        assert!(strict_hashes_from_str("a||b").is_none());
+        assert!(strict_hashes_from_str("all|a").is_none());
+        assert_eq!(
+            strict_hashes_from_str("ABCD|ef01").unwrap(),
+            vec!["abcd".to_owned(), "ef01".to_owned()]
+        );
+        assert!(strict_peer_addrs("127.0.0.1:6881|bad").is_err());
+        assert!(strict_numeric_list("0|bad").is_err());
+        assert!(strict_tracker_values("udp://one/announce||udp://two/announce").is_err());
+        assert_eq!(
+            strict_tracker_values("udp://one/announce\r\nudp://two/announce").unwrap(),
+            vec![
+                "udp://one/announce".to_owned(),
+                "udp://two/announce".to_owned()
+            ]
+        );
+        assert!(strict_tag_values("one,,two", false).is_err());
+        assert!(strict_tag_values(" one, ", false).is_err());
+        assert_eq!(
+            strict_tag_values("one, two", false).unwrap(),
+            vec!["one".to_owned(), "two".to_owned()]
+        );
+        assert!(strict_tag_values("", false).is_err());
+        assert!(strict_tag_values("", true).unwrap().is_empty());
+    }
+
+    #[test]
+    fn search_plugin_validation_rejects_silent_projection_loss() {
+        let mut plugins = serde_json::Map::new();
+        plugins.insert(
+            "jackett".to_owned(),
+            serde_json::json!({
+                "enabled": true,
+                "supportedCategories": ["all", "movies"]
+            }),
+        );
+        assert!(validate_qbit_search_plugins(&plugins).is_ok());
+
+        plugins.insert(
+            "broken".to_owned(),
+            serde_json::json!({"supportedCategories": ["movies", null]}),
+        );
+        assert!(validate_qbit_search_plugins(&plugins).is_err());
     }
 
     #[test]

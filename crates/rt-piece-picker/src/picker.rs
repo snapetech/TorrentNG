@@ -16,6 +16,31 @@ pub struct BlockRequest {
     pub length: u32,
 }
 
+/// Read-only piece availability supplied by a peer. Keeping this as a small
+/// trait lets engine-owned packed bitmaps participate in piece selection
+/// without expanding them into one `bool` per piece for every request fill.
+pub trait PieceAvailability {
+    fn has_piece(&self, piece: usize) -> bool;
+}
+
+impl PieceAvailability for [bool] {
+    fn has_piece(&self, piece: usize) -> bool {
+        self.get(piece).copied().unwrap_or(false)
+    }
+}
+
+impl PieceAvailability for Vec<bool> {
+    fn has_piece(&self, piece: usize) -> bool {
+        self.as_slice().has_piece(piece)
+    }
+}
+
+impl<const N: usize> PieceAvailability for [bool; N] {
+    fn has_piece(&self, piece: usize) -> bool {
+        self.as_slice().has_piece(piece)
+    }
+}
+
 /// Tracks the download state of a single piece.
 #[derive(Debug, Clone)]
 struct PieceState {
@@ -185,7 +210,12 @@ impl PiecePicker {
 
     /// Set priority pieces (head/tail of each file for fast preview).
     pub fn set_priority(&mut self, pieces: Vec<usize>) {
-        self.priority = pieces;
+        // Priority lists can come from API/user input. Keep the picker
+        // invariant that every later direct index is within its bitsets.
+        self.priority = pieces
+            .into_iter()
+            .filter(|piece| *piece < self.piece_count)
+            .collect();
     }
 
     /// Enable or disable sequential piece selection.
@@ -205,10 +235,10 @@ impl PiecePicker {
     /// Pick the next block to request from a peer with given bitfield.
     ///
     /// Returns `None` if nothing is available from this peer right now.
-    pub fn pick(&mut self, peer_has: &[bool]) -> Option<BlockRequest> {
+    pub fn pick<A: PieceAvailability + ?Sized>(&mut self, peer_has: &A) -> Option<BlockRequest> {
         // Priority pieces first.
         for &p in &self.priority.clone() {
-            if self.wanted[p] && self.enabled[p] && peer_has.get(p).copied().unwrap_or(false) {
+            if self.wanted[p] && self.enabled[p] && peer_has.has_piece(p) {
                 if let Some(req) = self.pick_block_from(p) {
                     return Some(req);
                 }
@@ -217,7 +247,7 @@ impl PiecePicker {
 
         if self.sequential {
             for p in self.sequential_order() {
-                if self.wanted[p] && self.enabled[p] && peer_has.get(p).copied().unwrap_or(false) {
+                if self.wanted[p] && self.enabled[p] && peer_has.has_piece(p) {
                     if let Some(req) = self.pick_block_from(p) {
                         return Some(req);
                     }
@@ -235,7 +265,7 @@ impl PiecePicker {
             .collect();
         let ordered = self.availability.rarest_first(&wanted_enabled);
         for p in ordered {
-            if peer_has.get(p).copied().unwrap_or(false) {
+            if peer_has.has_piece(p) {
                 if let Some(req) = self.pick_block_from(p) {
                     return Some(req);
                 }
@@ -279,9 +309,9 @@ impl PiecePicker {
     /// This returns `Some` only after all enabled wanted pieces have no fresh
     /// unrequested blocks left. The caller supplies blocks already outstanding
     /// with the peer so we do not duplicate the same block to one peer.
-    pub fn pick_endgame(
+    pub fn pick_endgame<A: PieceAvailability + ?Sized>(
         &mut self,
-        peer_has: &[bool],
+        peer_has: &A,
         already_requested_by_peer: &[BlockRequest],
     ) -> Option<BlockRequest> {
         if !self.endgame_active() {
@@ -289,10 +319,7 @@ impl PiecePicker {
         }
 
         for piece in self.pieces_in_pick_order() {
-            if !self.wanted[piece]
-                || !self.enabled[piece]
-                || !peer_has.get(piece).copied().unwrap_or(false)
-            {
+            if !self.wanted[piece] || !self.enabled[piece] || !peer_has.has_piece(piece) {
                 continue;
             }
 
@@ -692,6 +719,15 @@ mod tests {
         p.set_priority(vec![2]);
         let req = p.pick(&peer_has_all(4)).unwrap();
         assert_eq!(req.piece, 2);
+    }
+
+    #[test]
+    fn invalid_priority_piece_is_ignored() {
+        let mut p = picker_1piece(MAX_BLOCK_SIZE);
+        p.availability.add_have(0);
+        p.set_priority(vec![usize::MAX, 0]);
+
+        assert_eq!(p.pick(&peer_has_all(1)).unwrap().piece, 0);
     }
 
     #[test]

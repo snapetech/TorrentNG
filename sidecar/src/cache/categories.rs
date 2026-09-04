@@ -1,7 +1,7 @@
 use anyhow::Result;
 use rusqlite::params;
 
-use super::db::Db;
+use super::db::{allocate_revision, canonical_hash, prune_removed_tombstones, Db};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Category {
@@ -53,11 +53,16 @@ impl Db {
     }
 
     pub fn upsert_category(&self, name: &str, save_path: &str) -> Result<()> {
-        self.0.lock().expect("db").execute(
+        let mut conn = self.0.lock().expect("db");
+        let tx = conn.transaction()?;
+        tx.execute(
             "INSERT INTO categories(name, save_path) VALUES(?1,?2)
              ON CONFLICT(name) DO UPDATE SET save_path=excluded.save_path",
             params![name, save_path],
         )?;
+        let revision = allocate_revision(&tx)?;
+        prune_removed_tombstones(&tx, revision)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -65,15 +70,17 @@ impl Db {
         let mut conn = self.0.lock().expect("db");
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM categories WHERE name=?1", params![name])?;
+        let revision = allocate_revision(&tx)?;
         tx.execute(
-            "UPDATE torrents SET category='', updated_at=(
+            "UPDATE torrents SET category='', revision=?1, updated_at=(
                 SELECT MAX(v) FROM (
                     SELECT CAST(strftime('%s','now') AS INTEGER) AS v
                     UNION ALL SELECT COALESCE(MAX(updated_at), 0) + 1 FROM torrents
                 )
-             ) WHERE category=?1",
-            params![name],
+             ) WHERE category=?2",
+            params![revision, name],
         )?;
+        prune_removed_tombstones(&tx, revision)?;
         tx.commit()?;
         Ok(())
     }
@@ -97,27 +104,31 @@ impl Db {
     }
 
     pub fn ensure_tag(&self, name: &str) -> Result<()> {
-        self.0
-            .lock()
-            .expect("db")
-            .execute("INSERT OR IGNORE INTO tags(name) VALUES(?1)", params![name])?;
+        let mut conn = self.0.lock().expect("db");
+        let tx = conn.transaction()?;
+        tx.execute("INSERT OR IGNORE INTO tags(name) VALUES(?1)", params![name])?;
+        let revision = allocate_revision(&tx)?;
+        prune_removed_tombstones(&tx, revision)?;
+        tx.commit()?;
         Ok(())
     }
 
     pub fn delete_tag(&self, name: &str) -> Result<()> {
         let mut conn = self.0.lock().expect("db");
         let tx = conn.transaction()?;
+        let revision = allocate_revision(&tx)?;
         tx.execute(
-            "UPDATE torrents SET updated_at=(
+            "UPDATE torrents SET revision=?1, updated_at=(
                 SELECT MAX(v) FROM (
                     SELECT CAST(strftime('%s','now') AS INTEGER) AS v
                     UNION ALL SELECT COALESCE(MAX(updated_at), 0) + 1 FROM torrents
                 )
              )
-             WHERE EXISTS (SELECT 1 FROM torrent_tags tt WHERE tt.hash=torrents.hash AND tt.tag=?1)",
-            params![name],
+             WHERE EXISTS (SELECT 1 FROM torrent_tags tt WHERE tt.hash=torrents.hash AND tt.tag=?2)",
+            params![revision, name],
         )?;
         tx.execute("DELETE FROM tags WHERE name=?1", params![name])?;
+        prune_removed_tombstones(&tx, revision)?;
         tx.commit()?;
         Ok(())
     }
@@ -126,7 +137,8 @@ impl Db {
 
     pub fn get_torrent_tags(&self, hash: &str) -> Result<Vec<String>> {
         let conn = self.0.lock().expect("db");
-        let mut stmt = conn.prepare("SELECT tag FROM torrent_tags WHERE hash=?1 ORDER BY tag")?;
+        let mut stmt =
+            conn.prepare("SELECT tag FROM torrent_tags WHERE hash=?1 COLLATE NOCASE ORDER BY tag")?;
         let rows = stmt
             .query_map(params![hash], |r| r.get(0))?
             .collect::<rusqlite::Result<Vec<String>>>()?;
@@ -134,29 +146,73 @@ impl Db {
     }
 
     pub fn add_torrent_tag(&self, hash: &str, tag: &str) -> Result<()> {
-        let conn = self.0.lock().expect("db");
-        conn.execute("INSERT OR IGNORE INTO tags(name) VALUES(?1)", params![tag])?;
-        conn.execute(
+        let mut conn = self.0.lock().expect("db");
+        let tx = conn.transaction()?;
+        let hash = canonical_existing_hash(&tx, hash)?;
+        tx.execute("INSERT OR IGNORE INTO tags(name) VALUES(?1)", params![tag])?;
+        tx.execute(
             "INSERT OR IGNORE INTO torrent_tags(hash, tag) VALUES(?1,?2)",
             params![hash, tag],
         )?;
-        touch_torrent(&conn, hash)?;
+        touch_torrent(&tx, &hash)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn add_torrent_tags(&self, hash: &str, tags: &[&str]) -> Result<()> {
+        if tags.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.0.lock().expect("db");
+        let tx = conn.transaction()?;
+        let hash = canonical_existing_hash(&tx, hash)?;
+        for tag in tags {
+            tx.execute("INSERT OR IGNORE INTO tags(name) VALUES(?1)", params![tag])?;
+            tx.execute(
+                "INSERT OR IGNORE INTO torrent_tags(hash, tag) VALUES(?1,?2)",
+                params![hash, tag],
+            )?;
+        }
+        touch_torrent(&tx, &hash)?;
+        tx.commit()?;
         Ok(())
     }
 
     pub fn remove_torrent_tag(&self, hash: &str, tag: &str) -> Result<()> {
-        let conn = self.0.lock().expect("db");
-        conn.execute(
+        let mut conn = self.0.lock().expect("db");
+        let tx = conn.transaction()?;
+        let hash = canonical_existing_hash(&tx, hash)?;
+        tx.execute(
             "DELETE FROM torrent_tags WHERE hash=?1 AND tag=?2",
             params![hash, tag],
         )?;
-        touch_torrent(&conn, hash)?;
+        touch_torrent(&tx, &hash)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn remove_torrent_tags(&self, hash: &str, tags: &[&str]) -> Result<()> {
+        if tags.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.0.lock().expect("db");
+        let tx = conn.transaction()?;
+        let hash = canonical_existing_hash(&tx, hash)?;
+        for tag in tags {
+            tx.execute(
+                "DELETE FROM torrent_tags WHERE hash=?1 AND tag=?2",
+                params![hash, tag],
+            )?;
+        }
+        touch_torrent(&tx, &hash)?;
+        tx.commit()?;
         Ok(())
     }
 
     pub fn set_torrent_tags(&self, hash: &str, tags: &[&str]) -> Result<()> {
         let mut conn = self.0.lock().expect("db");
         let tx = conn.transaction()?;
+        let hash = canonical_existing_hash(&tx, hash)?;
         tx.execute("DELETE FROM torrent_tags WHERE hash=?1", params![hash])?;
         for tag in tags {
             tx.execute("INSERT OR IGNORE INTO tags(name) VALUES(?1)", params![tag])?;
@@ -165,42 +221,52 @@ impl Db {
                 params![hash, tag],
             )?;
         }
-        tx.execute(
-            "UPDATE torrents SET updated_at=(
-                SELECT MAX(v) FROM (
-                    SELECT CAST(strftime('%s','now') AS INTEGER) AS v
-                    UNION ALL SELECT COALESCE(MAX(updated_at), 0) + 1 FROM torrents
-                )
-             ) WHERE hash=?1",
-            params![hash],
-        )?;
+        touch_torrent(&tx, &hash)?;
         tx.commit()?;
         Ok(())
     }
 
     pub fn set_torrent_category(&self, hash: &str, category: &str) -> Result<()> {
-        self.0.lock().expect("db").execute(
-            "UPDATE torrents SET category=?1, updated_at=(
+        let mut conn = self.0.lock().expect("db");
+        let tx = conn.transaction()?;
+        let hash = canonical_existing_hash(&tx, hash)?;
+        let revision = allocate_revision(&tx)?;
+        let changed = tx.execute(
+            "UPDATE torrents SET category=?1, revision=?2, updated_at=(
                 SELECT MAX(v) FROM (
                     SELECT CAST(strftime('%s','now') AS INTEGER) AS v
                     UNION ALL SELECT COALESCE(MAX(updated_at), 0) + 1 FROM torrents
                 )
-             ) WHERE hash=?2",
-            params![category, hash],
+             ) WHERE hash=?3",
+            params![category, revision, hash],
         )?;
+        if changed == 0 {
+            return Err(anyhow::anyhow!("torrent {hash} not found"));
+        }
+        prune_removed_tombstones(&tx, revision)?;
+        tx.commit()?;
         Ok(())
     }
 
     pub fn set_torrent_location(&self, hash: &str, location: &str) -> Result<()> {
-        self.0.lock().expect("db").execute(
-            "UPDATE torrents SET directory=?1, updated_at=(
+        let mut conn = self.0.lock().expect("db");
+        let tx = conn.transaction()?;
+        let hash = canonical_existing_hash(&tx, hash)?;
+        let revision = allocate_revision(&tx)?;
+        let changed = tx.execute(
+            "UPDATE torrents SET directory=?1, revision=?2, updated_at=(
                 SELECT MAX(v) FROM (
                     SELECT CAST(strftime('%s','now') AS INTEGER) AS v
                     UNION ALL SELECT COALESCE(MAX(updated_at), 0) + 1 FROM torrents
                 )
-             ) WHERE hash=?2",
-            params![location, hash],
+             ) WHERE hash=?3",
+            params![location, revision, hash],
         )?;
+        if changed == 0 {
+            return Err(anyhow::anyhow!("torrent {hash} not found"));
+        }
+        prune_removed_tombstones(&tx, revision)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -211,15 +277,24 @@ impl Db {
         is_active: bool,
         is_open: bool,
     ) -> Result<()> {
-        self.0.lock().expect("db").execute(
-            "UPDATE torrents SET state=?1, is_active=?2, is_open=?3, updated_at=(
+        let mut conn = self.0.lock().expect("db");
+        let tx = conn.transaction()?;
+        let hash = canonical_existing_hash(&tx, hash)?;
+        let revision = allocate_revision(&tx)?;
+        let changed = tx.execute(
+            "UPDATE torrents SET state=?1, is_active=?2, is_open=?3, revision=?4, updated_at=(
                 SELECT MAX(v) FROM (
                     SELECT CAST(strftime('%s','now') AS INTEGER) AS v
                     UNION ALL SELECT COALESCE(MAX(updated_at), 0) + 1 FROM torrents
                 )
-             ) WHERE hash=?4",
-            params![state, is_active as i64, is_open as i64, hash],
+             ) WHERE hash=?5",
+            params![state, is_active as i64, is_open as i64, revision, hash],
         )?;
+        if changed == 0 {
+            return Err(anyhow::anyhow!("torrent {hash} not found"));
+        }
+        prune_removed_tombstones(&tx, revision)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -238,33 +313,55 @@ impl Db {
         }
         let mut conn = self.0.lock().expect("db");
         let tx = conn.transaction()?;
+        let revision = allocate_revision(&tx)?;
         {
             let mut stmt = tx.prepare(
-                "UPDATE torrents SET state=?1, is_active=?2, is_open=?3, updated_at=(
+                "UPDATE torrents SET state=?1, is_active=?2, is_open=?3, revision=?4, updated_at=(
                     SELECT MAX(v) FROM (
                         SELECT CAST(strftime('%s','now') AS INTEGER) AS v
                         UNION ALL SELECT COALESCE(MAX(updated_at), 0) + 1 FROM torrents
                     )
-                 ) WHERE hash=?4",
+                 ) WHERE hash=?5",
             )?;
             for (hash, state, is_active, is_open) in updates {
-                stmt.execute(params![state, *is_active as i64, *is_open as i64, hash])?;
+                let hash = canonical_existing_hash(&tx, hash)?;
+                let changed = stmt.execute(params![
+                    state,
+                    *is_active as i64,
+                    *is_open as i64,
+                    revision,
+                    hash
+                ])?;
+                if changed == 0 {
+                    return Err(anyhow::anyhow!("torrent {hash} not found"));
+                }
             }
         }
+        prune_removed_tombstones(&tx, revision)?;
         tx.commit()?;
         Ok(())
     }
 }
 
 fn touch_torrent(conn: &rusqlite::Connection, hash: &str) -> Result<()> {
-    conn.execute(
-        "UPDATE torrents SET updated_at=(
+    let hash = canonical_existing_hash(conn, hash)?;
+    let revision = allocate_revision(conn)?;
+    let changed = conn.execute(
+        "UPDATE torrents SET revision=?1, updated_at=(
             SELECT MAX(v) FROM (
                 SELECT CAST(strftime('%s','now') AS INTEGER) AS v
                 UNION ALL SELECT COALESCE(MAX(updated_at), 0) + 1 FROM torrents
             )
-         ) WHERE hash=?1",
-        params![hash],
+         ) WHERE hash=?2",
+        params![revision, hash],
     )?;
+    if changed == 0 {
+        return Err(anyhow::anyhow!("torrent {hash} not found"));
+    }
+    prune_removed_tombstones(conn, revision)?;
     Ok(())
+}
+
+fn canonical_existing_hash(conn: &rusqlite::Connection, hash: &str) -> Result<String> {
+    canonical_hash(conn, hash)?.ok_or_else(|| anyhow::anyhow!("torrent {hash} not found"))
 }

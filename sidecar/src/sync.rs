@@ -1,3 +1,4 @@
+use anyhow::{bail, Context};
 use std::sync::atomic::Ordering;
 use std::{
     collections::{HashMap, HashSet},
@@ -16,13 +17,27 @@ use crate::{
     torrent_meta::session_tracker_url,
 };
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct SyncCounts {
     seeding: i64,
     downloading: i64,
     stopped: i64,
     errored: i64,
     peers: i64,
+}
+
+#[derive(Debug, Default)]
+struct BoundedSyncState {
+    page_offset: i64,
+    snapshot: Option<u64>,
+    full_cycle_seen: HashSet<String>,
+    full_cycle_had_errors: bool,
+    /// Backends with bounded range reads but no snapshot token (qBittorrent
+    /// and unpatched rTorrent) are eventually consistent. Require a hash to
+    /// be absent from two clean full cycles before deleting it from the
+    /// compatibility cache; a transient short page must not become data loss.
+    missing_confirmations: HashMap<String, u8>,
+    counts: SyncCounts,
 }
 
 pub async fn run(
@@ -47,37 +62,25 @@ pub async fn run(
     info!(
         component = backend.backend_type().as_str(),
         operation = "capability_probe",
-        feature = "d.multicall.range",
+        feature = "bounded_torrent_sync",
         supported = range_supported,
         result = "ok",
         "backend capability probe complete"
     );
-    let mut page_offset = 0i64;
-    let mut full_cycle_seen = HashSet::new();
-    let mut full_cycle_had_errors = false;
-    let mut tracker_cache = HashMap::new();
+    let mut bounded = BoundedSyncState::default();
     let mut sync_error_active = false;
 
     loop {
         ticker.tick().await;
         let result = if range_supported {
-            tick_bounded(
-                backend.as_ref(),
-                &db,
-                &tx,
-                &mut page_offset,
-                &mut full_cycle_seen,
-                &mut full_cycle_had_errors,
-                &mut tracker_cache,
-            )
-            .await
+            tick_bounded(backend.as_ref(), &db, &tx, &mut bounded).await
         } else {
-            tick_full(backend.as_ref(), &db, &tx, &mut tracker_cache).await
+            tick_full(backend.as_ref(), &db, &tx).await
         };
         match result {
             Ok(counts) => {
                 if sync_error_active {
-                    append_app_event(
+                    append_app_event_async(
                         &db,
                         "info",
                         "rtorrent_sync_recovered",
@@ -88,7 +91,8 @@ pub async fn run(
                             "result": "ok",
                         }),
                         event_retention,
-                    );
+                    )
+                    .await;
                     sync_error_active = false;
                 }
                 metrics.sync_cycles_total.fetch_add(1, Ordering::Relaxed);
@@ -111,7 +115,7 @@ pub async fn run(
             Err(e) => {
                 metrics.sync_errors_total.fetch_add(1, Ordering::Relaxed);
                 // `e.to_string()`/`%e` only print the outermost `.context()`
-                // layer (e.g. "d.multicall.range main offset=200 limit=100")
+                // layer (e.g. "bounded_torrent_sync main offset=200 limit=100")
                 // and silently drop the actual XMLRPC fault underneath it,
                 // which is the one detail that would explain *why* the
                 // multicall failed. `error_chain` keeps the whole chain.
@@ -124,7 +128,7 @@ pub async fn run(
                     "backend sync failed"
                 );
                 if !sync_error_active {
-                    append_app_event(
+                    append_app_event_async(
                         &db,
                         "warn",
                         "rtorrent_sync_error",
@@ -136,7 +140,8 @@ pub async fn run(
                             "error": chain,
                         }),
                         event_retention,
-                    );
+                    )
+                    .await;
                     sync_error_active = true;
                 }
             }
@@ -147,8 +152,8 @@ pub async fn run(
 /// Renders every layer of an anyhow error chain, not just the outermost
 /// `.context()` message. `anyhow::Error::to_string()` / `%e` only show the
 /// top layer, which for these sync errors is always the same generic
-/// "d.multicall.range <view> offset=<n> limit=<n>" wrapper - the actual
-/// XMLRPC fault (the useful part for diagnosing *why* it failed) is one or
+/// "bounded_torrent_sync <view> offset=<n> limit=<n>" wrapper - the actual
+/// backend fault (the useful part for diagnosing *why* it failed) is one or
 /// more levels deeper and was previously invisible in both the tracing log
 /// and the persisted operator-log event.
 pub(crate) fn error_chain(e: &anyhow::Error) -> String {
@@ -158,7 +163,7 @@ pub(crate) fn error_chain(e: &anyhow::Error) -> String {
         .join(" -> caused by: ")
 }
 
-fn append_app_event(
+async fn append_app_event_async(
     db: &Db,
     level: &str,
     kind: &str,
@@ -166,17 +171,20 @@ fn append_app_event(
     payload: serde_json::Value,
     retention: usize,
 ) {
-    if let Err(e) = db.append_app_event(
-        &AppEventRow {
-            event_id: None,
-            occurred_at: chrono::Utc::now().timestamp(),
-            level: level.to_owned(),
-            kind: kind.to_owned(),
-            message: message.to_owned(),
-            payload: payload.to_string(),
-        },
-        retention,
-    ) {
+    let event = AppEventRow {
+        event_id: None,
+        occurred_at: chrono::Utc::now().timestamp(),
+        level: level.to_owned(),
+        kind: kind.to_owned(),
+        message: message.to_owned(),
+        payload: payload.to_string(),
+    };
+    if let Err(e) = db
+        .run_blocking("sync_app_event", move |db| {
+            db.append_app_event(&event, retention)
+        })
+        .await
+    {
         warn!(
             component = "app_events",
             operation = "append",
@@ -192,70 +200,200 @@ async fn tick_full(
     backend: &dyn TorrentBackend,
     db: &Db,
     tx: &broadcast::Sender<Event>,
-    tracker_cache: &mut HashMap<String, Option<String>>,
 ) -> anyhow::Result<SyncCounts> {
+    // The session-file fallback is only a cache for duplicate reads within a
+    // single reconciliation pass. Keeping it across passes makes tracker
+    // changes invisible and retains hashes for torrents that no longer
+    // exist. Scope it to this pass so its lifetime matches the projection it
+    // describes and its memory is bounded by the current response.
+    let mut tracker_cache = HashMap::new();
     let torrents = backend.list_torrents().await?;
+    let sync_tags = backend.capabilities().supports_tags;
+    const MAX_LEGACY_FULL_SYNC_ENTRIES: usize = 10_000;
+    if torrents.len() > MAX_LEGACY_FULL_SYNC_ENTRIES {
+        bail!(
+            "{} legacy full-list sync returned {} torrents; maximum is {}; use a backend with bounded range support",
+            backend.backend_type().as_str(),
+            torrents.len(),
+            MAX_LEGACY_FULL_SYNC_ENTRIES
+        );
+    }
     let now = chrono::Utc::now().timestamp();
 
-    let seen: HashSet<String> = torrents.iter().map(|t| t.hash.clone()).collect();
+    // Info hashes are hexadecimal identifiers and all supported clients treat
+    // them case-insensitively. Compare logical hashes, not the spelling a
+    // backend happened to return this cycle; otherwise a casing-only refresh
+    // looks like a removal and can delete a live cache row.
+    let seen: HashSet<String> = torrents.iter().map(|t| logical_hash(&t.hash)).collect();
 
     let mut counts = SyncCounts::default();
 
+    let mut sync_error = None;
     for t in &torrents {
-        upsert_torrent(db, tx, t, now, &mut counts, tracker_cache);
+        if let Err(error) =
+            upsert_torrent(db, tx, t, now, &mut counts, &mut tracker_cache, sync_tags).await
+        {
+            warn!(
+                component = backend.backend_type().as_str(),
+                operation = "upsert_torrent",
+                torrent = %t.hash,
+                result = "error",
+                error = %error,
+                "backend sync could not persist torrent projection"
+            );
+            sync_error.get_or_insert(error);
+        }
     }
 
-    let known = db.all_hashes()?;
-    for hash in known.difference(&seen) {
-        let _ = db.delete(hash);
-        let _ = tx.send(Event::TorrentRemoved { hash: hash.clone() });
+    if sync_error.is_none() {
+        let known = db
+            .run_blocking("sync_all_hashes", |db| db.all_hashes())
+            .await?;
+        for hash in known
+            .iter()
+            .filter(|hash| !seen.contains(&logical_hash(hash)))
+        {
+            match db
+                .run_blocking("sync_delete_torrent", {
+                    let hash = hash.clone();
+                    move |db| db.delete(&hash)
+                })
+                .await
+            {
+                Ok(()) => {
+                    let _ = tx.send(Event::TorrentRemoved { hash: hash.clone() });
+                }
+                Err(error) => {
+                    warn!(
+                        component = backend.backend_type().as_str(),
+                        operation = "delete_torrent",
+                        torrent = %hash,
+                        result = "error",
+                        error = %error,
+                        "backend sync could not delete a stale torrent projection"
+                    );
+                    sync_error.get_or_insert(error);
+                }
+            }
+        }
     }
 
-    Ok(counts)
+    sync_error.map_or(Ok(counts), Err)
 }
 
 async fn tick_bounded(
     backend: &dyn TorrentBackend,
     db: &Db,
     tx: &broadcast::Sender<Event>,
-    page_offset: &mut i64,
-    full_cycle_seen: &mut HashSet<String>,
-    full_cycle_had_errors: &mut bool,
-    tracker_cache: &mut HashMap<String, Option<String>>,
+    bounded: &mut BoundedSyncState,
 ) -> anyhow::Result<SyncCounts> {
+    // Only the live-summary and paged reads in this tick can duplicate a
+    // torrent. A per-tick cache avoids retaining every hash across a large
+    // multi-page reconciliation cycle.
+    let mut tracker_cache = HashMap::new();
     let now = chrono::Utc::now().timestamp();
+    let sync_tags = backend.capabilities().supports_tags;
     let mut counts = SyncCounts::default();
     let mut touched = HashSet::new();
+    let mut sync_error = None;
 
     match backend
         .live_summary("main", MULTICALL_RANGE_PAGE_SIZE)
         .await
     {
         Ok(summary) => {
-            write_live_speeds(summary.rates.download, summary.rates.upload);
+            write_live_speeds(summary.rates.download, summary.rates.upload).await;
             for t in &summary.moving {
-                if touched.insert(t.hash.clone()) {
-                    upsert_torrent(db, tx, t, now, &mut counts, tracker_cache);
+                // The live-summary view and the paged main view are separate
+                // backend reads. Protect a torrent reported by the former
+                // from end-of-list cleanup if the latter is temporarily
+                // inconsistent or omits it during a concurrent mutation.
+                let logical = logical_hash(&t.hash);
+                bounded.full_cycle_seen.insert(logical.clone());
+                if !touched.contains(&logical) {
+                    match upsert_torrent(db, tx, t, now, &mut counts, &mut tracker_cache, sync_tags)
+                        .await
+                    {
+                        Ok(()) => {
+                            touched.insert(logical);
+                        }
+                        Err(error) => {
+                            bounded.full_cycle_had_errors = true;
+                            warn!(
+                                component = backend.backend_type().as_str(),
+                                operation = "upsert_torrent",
+                                torrent = %t.hash,
+                                result = "error",
+                                error = %error,
+                                "live summary torrent projection could not be persisted"
+                            );
+                            sync_error.get_or_insert(error);
+                        }
+                    }
                 }
             }
         }
-        Err(e) => warn!(
-            component = backend.backend_type().as_str(),
-            operation = "live_summary_sync",
-            result = "error",
-            error = %error_chain(&e),
-            "live summary sync failed"
-        ),
+        Err(e) => {
+            let chain = error_chain(&e);
+            warn!(
+                component = backend.backend_type().as_str(),
+                operation = "live_summary_sync",
+                result = "error",
+                error = %chain,
+                "live summary sync failed"
+            );
+            sync_error.get_or_insert_with(|| anyhow::anyhow!("live summary sync failed: {chain}"));
+        }
     }
 
-    let fetched = fetch_range_resilient(backend, *page_offset, MULTICALL_RANGE_PAGE_SIZE).await;
+    let offset = bounded.page_offset;
+    let fetched =
+        fetch_range_resilient(backend, offset, MULTICALL_RANGE_PAGE_SIZE, bounded.snapshot).await;
     let page_len = fetched.torrents.len() as i64;
-    *full_cycle_had_errors |= fetched.had_errors;
+    bounded.full_cycle_had_errors |= fetched.had_errors;
+    if fetched.had_errors {
+        sync_error.get_or_insert_with(|| {
+            anyhow::anyhow!("bounded torrent range returned an incomplete page at offset {offset}")
+        });
+    }
+    if bounded.snapshot.is_none() {
+        bounded.snapshot = fetched.snapshot;
+    } else if fetched.snapshot != bounded.snapshot {
+        bounded.full_cycle_had_errors = true;
+        warn!(
+            component = backend.backend_type().as_str(),
+            operation = "bounded_sync_snapshot",
+            result = "error",
+            expected = ?bounded.snapshot,
+            observed = ?fetched.snapshot,
+            "backend changed or dropped the bounded-sync snapshot"
+        );
+        sync_error.get_or_insert_with(|| {
+            anyhow::anyhow!("bounded torrent range changed snapshot at offset {offset}")
+        });
+    }
 
     for t in &fetched.torrents {
-        full_cycle_seen.insert(t.hash.clone());
-        if touched.insert(t.hash.clone()) {
-            upsert_torrent(db, tx, t, now, &mut counts, tracker_cache);
+        let logical = logical_hash(&t.hash);
+        bounded.full_cycle_seen.insert(logical.clone());
+        if !touched.contains(&logical) {
+            match upsert_torrent(db, tx, t, now, &mut counts, &mut tracker_cache, sync_tags).await {
+                Ok(()) => {
+                    touched.insert(logical);
+                }
+                Err(error) => {
+                    bounded.full_cycle_had_errors = true;
+                    warn!(
+                        component = backend.backend_type().as_str(),
+                        operation = "upsert_torrent",
+                        torrent = %t.hash,
+                        result = "error",
+                        error = %error,
+                        "paged torrent projection could not be persisted"
+                    );
+                    sync_error.get_or_insert(error);
+                }
+            }
         }
     }
 
@@ -265,13 +403,58 @@ async fn tick_bounded(
     // would turn a transient XMLRPC fault into data loss. The error flag must
     // live for the whole cycle, not just this final short page.
     if page_len < MULTICALL_RANGE_PAGE_SIZE {
-        if !*full_cycle_had_errors {
-            let known = db.all_hashes()?;
-            for hash in known.difference(full_cycle_seen) {
-                let _ = db.delete(hash);
-                let _ = tx.send(Event::TorrentRemoved { hash: hash.clone() });
+        if !bounded.full_cycle_had_errors {
+            let known = db
+                .run_blocking("sync_all_hashes", |db| db.all_hashes())
+                .await?;
+            let known_by_logical = known
+                .iter()
+                .map(|hash| (logical_hash(hash), hash))
+                .collect::<HashMap<_, _>>();
+            let stable_snapshot = bounded.snapshot.is_some();
+            let missing = known_by_logical
+                .iter()
+                .filter(|(logical, _)| !bounded.full_cycle_seen.contains(*logical))
+                .map(|(logical, hash)| (logical.clone(), (*hash).clone()))
+                .collect::<Vec<_>>();
+            bounded.missing_confirmations.retain(|logical, _| {
+                !bounded.full_cycle_seen.contains(logical) && known_by_logical.contains_key(logical)
+            });
+            for (logical, hash) in missing {
+                let confirmed = stable_snapshot
+                    || bounded
+                        .missing_confirmations
+                        .insert(logical.clone(), 1)
+                        .is_some();
+                if confirmed {
+                    bounded.missing_confirmations.remove(&logical);
+                    match db
+                        .run_blocking("sync_delete_torrent", {
+                            let hash = hash.clone();
+                            move |db| db.delete(&hash)
+                        })
+                        .await
+                    {
+                        Ok(()) => {
+                            let _ = tx.send(Event::TorrentRemoved { hash });
+                        }
+                        Err(error) => {
+                            bounded.full_cycle_had_errors = true;
+                            warn!(
+                                component = backend.backend_type().as_str(),
+                                operation = "delete_torrent",
+                                torrent = %hash,
+                                result = "error",
+                                error = %error,
+                                "backend sync could not delete a stale torrent projection"
+                            );
+                            sync_error.get_or_insert(error);
+                        }
+                    }
+                }
             }
         } else {
+            bounded.missing_confirmations.clear();
             warn!(
                 component = backend.backend_type().as_str(),
                 operation = "bounded_sync_cleanup",
@@ -279,41 +462,90 @@ async fn tick_bounded(
                 "skipping removed-torrent cleanup because an earlier page in this cycle had fetch errors"
             );
         }
-        full_cycle_seen.clear();
-        *full_cycle_had_errors = false;
-        *page_offset = 0;
+        if !bounded.full_cycle_had_errors {
+            let (errored, stopped, seeding, downloading, peers) = db
+                .run_blocking("sync_counts", |db| db.sync_counts())
+                .await
+                .context("aggregate bounded sync counters")?;
+            bounded.counts = SyncCounts {
+                seeding,
+                downloading,
+                stopped,
+                errored,
+                peers,
+            };
+        }
+        for hash in &bounded.full_cycle_seen {
+            bounded.missing_confirmations.remove(hash);
+        }
+        let cycle_had_errors = bounded.full_cycle_had_errors;
+        bounded.full_cycle_seen.clear();
+        bounded.full_cycle_had_errors = false;
+        bounded.page_offset = 0;
+        bounded.snapshot = None;
+        if cycle_had_errors {
+            sync_error.get_or_insert_with(|| {
+                anyhow::anyhow!("bounded torrent sync cycle had incomplete or failed pages")
+            });
+        }
     } else {
-        *page_offset += MULTICALL_RANGE_PAGE_SIZE;
+        bounded.page_offset += MULTICALL_RANGE_PAGE_SIZE;
     }
 
-    Ok(counts)
+    sync_error.map_or(Ok(bounded.counts.clone()), Err)
 }
 
 struct ResilientFetch {
     torrents: Vec<RawTorrent>,
+    snapshot: Option<u64>,
     /// True if any sub-range in this fetch failed (and was skipped) even
     /// after bisecting down to a single torrent. The caller must not treat
     /// a short result as "end of list" when this is set.
     had_errors: bool,
 }
 
-/// Fetches `[offset, offset+limit)` via `d.multicall.range`, and on failure
+/// Fetches `[offset, offset+limit)` via the backend's bounded range API, and on failure
 /// bisects the range and retries each half so a single torrent whose fields
 /// can't be read (observed in production as intermittent
-/// `d.multicall.range` faults at varying offsets) only costs that one
+/// bounded-range faults at varying offsets) only costs that one
 /// torrent's data for this tick, rather than the entire page silently going
 /// stale until the next successful cycle.
 fn fetch_range_resilient(
     backend: &dyn TorrentBackend,
     offset: i64,
     limit: i64,
+    snapshot: Option<u64>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ResilientFetch> + Send + '_>> {
     Box::pin(async move {
-        match backend.list_torrents_range("main", offset, limit).await {
-            Ok(torrents) => ResilientFetch {
-                torrents,
-                had_errors: false,
-            },
+        match backend
+            .list_torrents_range_with_snapshot("main", offset, limit, snapshot)
+            .await
+        {
+            Ok((torrents, observed_snapshot))
+                if snapshot.is_none_or(|expected| observed_snapshot == Some(expected)) =>
+            {
+                ResilientFetch {
+                    torrents,
+                    snapshot: observed_snapshot,
+                    had_errors: false,
+                }
+            }
+            Ok((_, observed_snapshot)) => {
+                warn!(
+                    component = backend.backend_type().as_str(),
+                    operation = "list_torrents_range_snapshot",
+                    offset,
+                    limit,
+                    expected = ?snapshot,
+                    observed = ?observed_snapshot,
+                    "discarding a page returned for the wrong snapshot"
+                );
+                ResilientFetch {
+                    torrents: Vec::new(),
+                    snapshot: observed_snapshot,
+                    had_errors: true,
+                }
+            }
             Err(e) if limit > 1 => {
                 warn!(
                     component = backend.backend_type().as_str(),
@@ -325,12 +557,24 @@ fn fetch_range_resilient(
                 );
                 let left_limit = limit / 2;
                 let right_limit = limit - left_limit;
-                let mut left = fetch_range_resilient(backend, offset, left_limit).await;
-                let right = fetch_range_resilient(backend, offset + left_limit, right_limit).await;
+                let mut left = fetch_range_resilient(backend, offset, left_limit, snapshot).await;
+                let right_snapshot = left.snapshot.or(snapshot);
+                let right = fetch_range_resilient(
+                    backend,
+                    offset + left_limit,
+                    right_limit,
+                    right_snapshot,
+                )
+                .await;
                 left.torrents.extend(right.torrents);
+                let snapshot_mismatch = left
+                    .snapshot
+                    .zip(right.snapshot)
+                    .is_some_and(|(left, right)| left != right);
                 ResilientFetch {
                     torrents: left.torrents,
-                    had_errors: left.had_errors || right.had_errors,
+                    snapshot: left.snapshot.or(right.snapshot),
+                    had_errors: left.had_errors || right.had_errors || snapshot_mismatch,
                 }
             }
             Err(e) => {
@@ -343,6 +587,7 @@ fn fetch_range_resilient(
                 );
                 ResilientFetch {
                     torrents: Vec::new(),
+                    snapshot,
                     had_errors: true,
                 }
             }
@@ -350,25 +595,39 @@ fn fetch_range_resilient(
     })
 }
 
-fn upsert_torrent(
+async fn session_tracker_url_async(
+    hash: &str,
+    tracker_cache: &mut HashMap<String, Option<String>>,
+) -> String {
+    let normalized = hash.trim().to_ascii_uppercase();
+    if let Some(cached) = tracker_cache.get(&normalized) {
+        return cached.clone().unwrap_or_default();
+    }
+    let hash = hash.to_owned();
+    let tracker = tokio::task::spawn_blocking(move || {
+        let mut cache = HashMap::new();
+        session_tracker_url(&hash, &mut cache)
+    })
+    .await
+    .unwrap_or_default();
+    tracker_cache.insert(normalized, (!tracker.is_empty()).then(|| tracker.clone()));
+    tracker
+}
+
+async fn upsert_torrent(
     db: &Db,
     tx: &broadcast::Sender<Event>,
     t: &RawTorrent,
     now: i64,
     counts: &mut SyncCounts,
     tracker_cache: &mut HashMap<String, Option<String>>,
-) {
-    if !t.message.is_empty() && t.state == 3 {
-        counts.errored += 1;
-    } else if !t.is_active {
-        counts.stopped += 1;
-    } else if t.complete {
-        counts.seeding += 1;
+    sync_tags: bool,
+) -> anyhow::Result<()> {
+    let tracker_url = if t.tracker_url.is_empty() {
+        session_tracker_url_async(&t.hash, tracker_cache).await
     } else {
-        counts.downloading += 1;
-    }
-    counts.peers += t.peers_connected;
-
+        t.tracker_url.clone()
+    };
     let row = TorrentRow {
         hash: t.hash.clone(),
         name: t.name.clone(),
@@ -393,30 +652,39 @@ fn upsert_torrent(
         peers_connected: t.peers_connected,
         peers_complete: t.peers_complete,
         message: t.message.clone(),
-        tracker_url: if t.tracker_url.is_empty() {
-            session_tracker_url(&t.hash, tracker_cache)
-        } else {
-            t.tracker_url.clone()
-        },
+        tracker_url,
         tags: t.tags.clone(),
         updated_at: now,
     };
-    if let Err(e) = db.upsert(&row) {
-        warn!(
-            component = "cache",
-            operation = "upsert_torrent",
-            torrent = %t.hash,
-            result = "error",
-            error = %e,
-            "torrent cache upsert failed"
-        );
+    let changed = db
+        .run_blocking("sync_upsert_torrent", move |db| {
+            db.upsert_with_tags(&row, sync_tags)
+        })
+        .await
+        .with_context(|| format!("persist torrent cache row {}", t.hash))?;
+    if !t.message.is_empty() && t.state == 3 {
+        counts.errored += 1;
+    } else if !t.is_active {
+        counts.stopped += 1;
+    } else if t.complete {
+        counts.seeding += 1;
+    } else {
+        counts.downloading += 1;
     }
-    let _ = tx.send(Event::TorrentUpdated {
-        hash: t.hash.clone(),
-    });
+    counts.peers += t.peers_connected;
+    if changed {
+        let _ = tx.send(Event::TorrentUpdated {
+            hash: t.hash.clone(),
+        });
+    }
+    Ok(())
 }
 
-fn write_live_speeds(download: i64, upload: i64) {
+fn logical_hash(hash: &str) -> String {
+    hash.to_ascii_lowercase()
+}
+
+async fn write_live_speeds(download: i64, upload: i64) {
     let Some(path) = std::env::var("TNG_LIVE_SPEEDS_FILE")
         .or_else(|_| std::env::var("RTNG_LIVE_SPEEDS_FILE"))
         .ok()
@@ -431,12 +699,26 @@ fn write_live_speeds(download: i64, upload: i64) {
     })
     .to_string();
     let tmp_path = format!("{path}.tmp");
-    if let Err(e) = std::fs::write(&tmp_path, body).and_then(|_| std::fs::rename(&tmp_path, &path))
+    let target = std::path::Path::new(&path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("live-speeds.json")
+        .to_owned();
+    let cleanup_path = tmp_path.clone();
+    let result = match tokio::task::spawn_blocking(move || {
+        let result =
+            std::fs::write(&tmp_path, body).and_then(|_| std::fs::rename(&tmp_path, &path));
+        if result.is_err() {
+            let _ = std::fs::remove_file(cleanup_path);
+        }
+        result
+    })
+    .await
     {
-        let target = std::path::Path::new(&path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("live-speeds.json");
+        Ok(result) => result.map_err(|e| e.to_string()),
+        Err(e) => Err(format!("blocking live speed writer failed: {e}")),
+    };
+    if let Err(e) = result {
         warn!(
             component = "stats",
             operation = "write_live_speeds",
@@ -445,7 +727,6 @@ fn write_live_speeds(download: i64, upload: i64) {
             error = %e,
             "live speed cache write failed"
         );
-        let _ = std::fs::remove_file(tmp_path);
     }
 }
 
@@ -453,12 +734,12 @@ fn write_live_speeds(download: i64, upload: i64) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn append_app_event_persists_sync_failure_shape() {
+    #[tokio::test]
+    async fn append_app_event_persists_sync_failure_shape() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("cache.db")).unwrap();
 
-        append_app_event(
+        append_app_event_async(
             &db,
             "warn",
             "rtorrent_sync_error",
@@ -470,7 +751,8 @@ mod tests {
                 "error": "connection refused",
             }),
             10,
-        );
+        )
+        .await;
 
         let events = db.list_app_events(10).unwrap();
         assert_eq!(events.len(), 1);
@@ -481,5 +763,11 @@ mod tests {
         assert_eq!(payload["component"], "rtorrent");
         assert_eq!(payload["operation"], "sync");
         assert_eq!(payload["result"], "error");
+    }
+
+    #[test]
+    fn logical_hash_collapses_hex_case_for_sync_identity() {
+        assert_eq!(logical_hash("ABCdef0123"), "abcdef0123");
+        assert_eq!(logical_hash("abcdef0123"), logical_hash("ABCDEF0123"));
     }
 }

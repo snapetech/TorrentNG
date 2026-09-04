@@ -1,4 +1,7 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -22,7 +25,7 @@ impl Default for TorrentHandle {
 }
 
 /// Upload/download accounting for ratio tracking.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransferStats {
     pub uploaded: u64,
     pub downloaded: u64,
@@ -71,6 +74,89 @@ pub struct TorrentEntry {
     pub tracker_message: Option<String>,
 }
 
+/// The durable projection retained for a torrent that has no live runtime
+/// task.  A dormant torrent must remain addressable by the APIs, but it must
+/// not retain the task-only error/message allocations or a second owned copy
+/// of every immutable string.  Mutating a dormant torrent promotes it to a
+/// [`TorrentEntry`] at the registry boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DormantTorrent {
+    pub(crate) handle: TorrentHandle,
+    pub(crate) info_hash: Arc<str>,
+    pub(crate) name: Arc<str>,
+    pub(crate) save_path: Arc<str>,
+    pub(crate) total_length: u64,
+    pub(crate) amount_left: u64,
+    pub(crate) state: TorrentState,
+    pub(crate) stats: TransferStats,
+    pub(crate) added_at: u64,
+    pub(crate) completed_at: Option<u64>,
+    pub(crate) category: Option<Arc<str>>,
+    pub(crate) tags: Arc<[String]>,
+    /// Externally visible messages retained compactly while the runtime task
+    /// is dormant. Dropping these would make a projection report a different
+    /// torrent after a snapshot refresh or restart.
+    pub(crate) error_message: Option<Arc<str>>,
+    pub(crate) tracker_message: Option<Arc<str>>,
+}
+
+impl TorrentEntry {
+    /// Move an entry into the compact dormant representation.  The runtime
+    /// registry uses this when demoting a taskless torrent; no metainfo or
+    /// task-owned data is retained here.
+    pub fn into_dormant(self) -> DormantTorrent {
+        DormantTorrent {
+            handle: self.handle,
+            info_hash: Arc::<str>::from(self.info_hash),
+            name: Arc::<str>::from(self.name),
+            save_path: Arc::<str>::from(self.save_path),
+            total_length: self.total_length,
+            amount_left: self.amount_left,
+            state: self.state,
+            stats: self.stats,
+            added_at: self.added_at,
+            completed_at: self.completed_at,
+            category: self.category.map(Arc::<str>::from),
+            tags: Arc::<[String]>::from(self.tags.into_boxed_slice()),
+            error_message: self.error_message.map(Arc::<str>::from),
+            tracker_message: self.tracker_message.map(Arc::<str>::from),
+        }
+    }
+}
+
+impl DormantTorrent {
+    /// Materialize the API/runtime projection when a caller needs a normal
+    /// mutable entry or an owned list item.  This is deliberately lazy: the
+    /// idle registry itself stores `DormantTorrent`, not this expansion.
+    pub fn to_entry(&self) -> TorrentEntry {
+        TorrentEntry {
+            handle: self.handle,
+            info_hash: self.info_hash.to_string(),
+            name: self.name.to_string(),
+            save_path: self.save_path.to_string(),
+            total_length: self.total_length,
+            amount_left: self.amount_left,
+            state: self.state,
+            stats: self.stats.clone(),
+            added_at: self.added_at,
+            completed_at: self.completed_at,
+            category: self.category.as_ref().map(|value| value.to_string()),
+            tags: self.tags.as_ref().to_vec(),
+            error_message: self.error_message.as_ref().map(|value| value.to_string()),
+            tracker_message: self.tracker_message.as_ref().map(|value| value.to_string()),
+        }
+    }
+
+    pub(crate) fn contribution(&self) -> (TorrentState, u64, u64, u64) {
+        (
+            self.state,
+            self.stats.uploaded,
+            self.stats.downloaded,
+            self.amount_left,
+        )
+    }
+}
+
 impl TorrentEntry {
     pub fn new(info_hash: String, name: String, save_path: String) -> Self {
         let now = SystemTime::now()
@@ -96,6 +182,9 @@ impl TorrentEntry {
     }
 
     pub fn transition(&mut self, target: TorrentState) -> Result<(), SessionError> {
+        if self.state == target {
+            return Ok(());
+        }
         let valid = match (self.state, target) {
             (TorrentState::Stopped, TorrentState::Checking) => true,
             (TorrentState::Stopped, TorrentState::MetadataPending) => true,
@@ -106,6 +195,7 @@ impl TorrentEntry {
             (TorrentState::MetadataPending, TorrentState::Paused) => true,
             (TorrentState::MetadataPending, TorrentState::Error) => true,
             (TorrentState::Paused, TorrentState::Checking) => true,
+            (TorrentState::Paused, TorrentState::MetadataPending) => true,
             (TorrentState::Paused, TorrentState::Downloading) => true,
             (TorrentState::Paused, TorrentState::Seeding) => true,
             (TorrentState::Checking, TorrentState::Seeding) => true,
@@ -191,6 +281,13 @@ mod tests {
         e.transition(TorrentState::Seeding).unwrap();
         e.transition(TorrentState::Paused).unwrap();
         assert_eq!(e.state, TorrentState::Paused);
+    }
+
+    #[test]
+    fn same_state_transition_is_idempotent() {
+        let mut e = entry();
+        e.transition(TorrentState::Stopped).unwrap();
+        assert_eq!(e.state, TorrentState::Stopped);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 /// Upstream rTorrent/libtorrent 0.16.11 peer ID family prefix (8 bytes).
 ///
@@ -31,7 +31,7 @@ pub const DEFAULT_USER_AGENT: &str = "rtorrent/0.16.11/0.16.11";
 const PEER_ID_SUFFIX_FILE: &str = "peer_id_suffix";
 
 static PEER_ID: OnceLock<[u8; 20]> = OnceLock::new();
-static USER_AGENT: OnceLock<String> = OnceLock::new();
+static USER_AGENT: OnceLock<RwLock<String>> = OnceLock::new();
 
 /// Resolve and persist the per-install peer ID before any tracker/peer code
 /// can observe [`our_peer_id`]. Call this exactly once, early in daemon
@@ -100,15 +100,16 @@ fn build_peer_id(suffix: &str) -> [u8; 20] {
 /// upgrade from a version that had no persisted identity).
 fn load_or_generate_suffix(session_dir: &Path) -> std::io::Result<String> {
     let path = session_dir.join(PEER_ID_SUFFIX_FILE);
-    if let Ok(existing) = std::fs::read_to_string(&path) {
-        let trimmed = existing.trim();
+    if let Ok(existing) = rt_storage::read_file_no_follow_limited(&path, 4096) {
+        let trimmed = String::from_utf8_lossy(&existing);
+        let trimmed = trimmed.trim();
         if trimmed.len() == 12 && trimmed.is_ascii() {
             return Ok(trimmed.to_owned());
         }
     }
     let suffix = random_suffix();
-    std::fs::create_dir_all(session_dir)?;
-    std::fs::write(&path, &suffix)?;
+    rt_storage::create_dir_all_no_follow(session_dir)?;
+    rt_storage::write_file_no_follow(&path, suffix.as_bytes())?;
     Ok(suffix)
 }
 
@@ -117,16 +118,44 @@ fn random_suffix() -> String {
     Alphanumeric.sample_string(&mut rand::thread_rng(), 12)
 }
 
-pub fn user_agent() -> &'static str {
+pub fn user_agent() -> String {
     USER_AGENT
         .get_or_init(|| {
-            std::env::var("TORRENTNG_USER_AGENT")
-                .or_else(|_| std::env::var("TNG_USER_AGENT"))
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| DEFAULT_USER_AGENT.to_owned())
+            RwLock::new(
+                std::env::var("TORRENTNG_USER_AGENT")
+                    .or_else(|_| std::env::var("TNG_USER_AGENT"))
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| DEFAULT_USER_AGENT.to_owned()),
+            )
         })
-        .as_str()
+        .read()
+        .expect("user-agent lock poisoned")
+        .clone()
+}
+
+/// Replace the runtime user agent used by new tracker/webseed HTTP clients.
+/// Existing reqwest clients remain keyed by their old value and are naturally
+/// bypassed on the next request, so this does not require walking torrent
+/// tasks or mutating their state from the engine actor.
+pub fn set_user_agent(value: String) -> Result<(), String> {
+    let value = validate_user_agent(&value)?;
+    *USER_AGENT
+        .get_or_init(|| RwLock::new(DEFAULT_USER_AGENT.to_owned()))
+        .write()
+        .expect("user-agent lock poisoned") = value;
+    Ok(())
+}
+
+pub fn validate_user_agent(value: &str) -> Result<String, String> {
+    let value = value.trim().to_owned();
+    if value.is_empty() {
+        return Err("user agent must not be empty".to_owned());
+    }
+    if value.len() > 256 || !value.is_ascii() {
+        return Err("user agent must be printable ASCII of at most 256 bytes".to_owned());
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -157,6 +186,15 @@ mod tests {
         let first = load_or_generate_suffix(dir.path()).expect("first load");
         let second = load_or_generate_suffix(dir.path()).expect("second load");
         assert_eq!(first, second, "restarting must not change the peer id");
+    }
+
+    #[test]
+    fn runtime_user_agent_rejects_empty_or_non_ascii_values() {
+        assert!(set_user_agent("   ".to_owned()).is_err());
+        assert!(set_user_agent("ümlaut".to_owned()).is_err());
+        assert!(set_user_agent("TorrentNG/test".to_owned()).is_ok());
+        assert_eq!(user_agent(), "TorrentNG/test");
+        set_user_agent(DEFAULT_USER_AGENT.to_owned()).unwrap();
     }
 
     #[test]

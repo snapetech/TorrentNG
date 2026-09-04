@@ -15,7 +15,7 @@ use std::{
     },
     time::Instant,
 };
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, Mutex, RwLock};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::services::{ServeDir, ServeFile};
 
@@ -38,6 +38,10 @@ pub struct AppState {
     pub qbit_search_jobs: Arc<RwLock<serde_json::Map<String, serde_json::Value>>>,
     pub qbit_next_search_id: Arc<AtomicU64>,
     pub qbit_rss_items: Arc<RwLock<serde_json::Map<String, serde_json::Value>>>,
+    /// Serializes read-modify-write control-plane records stored as one JSON
+    /// value in the cache database. The Db mutex protects individual SQL
+    /// statements; this lock protects the multi-statement operation.
+    pub control_plane_write: Arc<Mutex<()>>,
 }
 
 pub fn build_router(state: AppState) -> Router {

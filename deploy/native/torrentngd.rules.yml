@@ -1,0 +1,60 @@
+groups:
+  - name: torrentngd-backend
+    rules:
+      - alert: TorrentNGStorageDispatcherSaturated
+        expr: >-
+          torrentng_storage_jobs_capacity > 0
+          and torrentng_storage_jobs_inflight >= torrentng_storage_jobs_capacity
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: TorrentNG storage-job dispatcher is saturated
+          description: >-
+            Durable storage work has occupied the complete end-to-end
+            dispatcher capacity for at least 10 minutes. New moves/rechecks
+            will be rejected until work drains or operators intervene.
+
+      - alert: TorrentNGStorageWorkersUnhealthy
+        expr: torrentng_storage_workers_healthy == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: TorrentNG storage-job supervisor is unhealthy
+          description: >-
+            The storage-job supervisor is not live. Storage plans are not
+            safe to submit until the daemon recovers or is restarted.
+
+      - alert: TorrentNGApiSnapshotExpiry
+        expr: increase(torrentng_api_snapshot_expired_total[5m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: TorrentNG API snapshot cursors are expiring frequently
+          description: >-
+            More than ten pagination cursors expired in five minutes. Clients
+            may be retrying full snapshot pagination instead of progressing.
+
+      - alert: TorrentNGApiSseResyncStorm
+        expr: increase(torrentng_api_sse_resyncs_total[5m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: TorrentNG SSE clients are resynchronizing frequently
+          description: >-
+            More than ten SSE journal resynchronizations occurred in five
+            minutes. Check mutation churn, slow consumers, and journal size.
+
+      - alert: TorrentNGApiSseSlowConsumers
+        expr: increase(torrentng_api_sse_lagged_total[5m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: TorrentNG SSE clients are falling behind
+          description: >-
+            More than ten SSE polls were delayed by over three seconds in five
+            minutes. Check downstream consumers, proxies, and API saturation.

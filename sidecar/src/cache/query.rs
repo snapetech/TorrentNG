@@ -1,8 +1,34 @@
 use anyhow::Result;
-use rusqlite::{params, params_from_iter};
+use rusqlite::{params, params_from_iter, OptionalExtension};
 use serde::Deserialize;
 
-use super::db::{Db, TorrentRow};
+use super::db::{current_revision_locked, Db, TorrentRow, CACHE_REVISION_FLOOR_KEY};
+
+/// Maximum rows materialized by a public sidecar page endpoint. Compatibility
+/// protocols without paging use a separate, stricter whole-response policy.
+pub const MAX_API_PAGE_ENTRIES: i64 = 5_000;
+/// Prevent a client from turning SQL OFFSET into an arbitrary skip scan. The
+/// native snapshot API is the path for deep, cursor-pinned exports.
+pub const MAX_API_PAGE_OFFSET: i64 = 1_000_000;
+
+#[derive(Debug)]
+pub struct TorrentDelta {
+    pub changed: Vec<TorrentRow>,
+    pub removed: Vec<String>,
+    pub revision: i64,
+}
+
+pub fn bounded_page_limit(limit: Option<i64>) -> Option<i64> {
+    limit.map(|limit| limit.clamp(1, MAX_API_PAGE_ENTRIES))
+}
+
+pub fn validate_page_offset(offset: Option<i64>) -> Result<i64> {
+    let offset = offset.unwrap_or(0);
+    if !(0..=MAX_API_PAGE_OFFSET).contains(&offset) {
+        anyhow::bail!("page offset must be between 0 and {MAX_API_PAGE_OFFSET}");
+    }
+    Ok(offset)
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TrackerHealthRow {
@@ -22,7 +48,7 @@ pub struct SidebarFacets {
     pub media_type: std::collections::BTreeMap<String, i64>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ListParams {
     pub filter: Option<String>,
     pub status: Option<String>,
@@ -45,14 +71,17 @@ impl Db {
                     t.state, t.priority, t.category, t.base_path, t.directory, t.creation_date,
                     t.timestamp_finished, t.tracker_focus, t.peers_connected, t.peers_complete,
                     t.message, t.tracker_url,
-                    COALESCE(tags.tags, '') AS tags,
+                    COALESCE((
+                        SELECT GROUP_CONCAT(ordered_tags.tag)
+                        FROM (
+                            SELECT tt.tag
+                            FROM torrent_tags tt
+                            WHERE tt.hash=t.hash
+                            ORDER BY tt.tag COLLATE NOCASE, tt.tag
+                        ) AS ordered_tags
+                    ), '') AS tags,
                     t.updated_at
              FROM torrents t
-             LEFT JOIN (
-                SELECT hash, GROUP_CONCAT(tag) AS tags
-                FROM torrent_tags
-                GROUP BY hash
-             ) tags ON tags.hash=t.hash
              WHERE t.hash=?1 COLLATE NOCASE",
         )?;
         let mut rows = stmt.query(params![hash])?;
@@ -89,107 +118,62 @@ impl Db {
         }
     }
 
-    /// Returns all torrents with `updated_at > since`, plus the current max `updated_at`.
-    pub fn list_since(&self, since: i64) -> Result<(Vec<TorrentRow>, i64)> {
+    /// Returns changed torrents and removals only when the delta fits within
+    /// `max_rows` and the cursor is still replayable.
+    ///
+    /// qBittorrent's `sync/maindata` protocol has no cursor/page parameters
+    /// for splitting a large delta. Returning `None` after reading one row
+    /// past the bound, or when the tombstone history is too old, lets that
+    /// caller reject the request rather than silently returning an incomplete
+    /// projection. The cursor is a durable logical revision; wall-clock
+    /// seconds are not used because multiple updates can happen in one second.
+    pub fn list_since_bounded(&self, since: i64, max_rows: usize) -> Result<Option<TorrentDelta>> {
+        if max_rows == 0 {
+            return Ok(None);
+        }
         let conn = self.0.lock().expect("db mutex");
-        let max_updated_at: i64 = conn
+        let revision = current_revision_locked(&conn)?;
+        if since < 0 || since > revision {
+            return Ok(None);
+        }
+        let floor: i64 = conn
             .query_row(
-                "SELECT COALESCE(MAX(updated_at), 0) FROM torrents",
-                [],
+                "SELECT value FROM kv WHERE key=?1",
+                params![CACHE_REVISION_FLOOR_KEY],
                 |r| r.get(0),
             )
+            .optional()?
+            .map(|value: String| value.parse::<i64>())
+            .transpose()
+            .map_err(|error| anyhow::anyhow!("parse cache revision floor: {error}"))?
             .unwrap_or(0);
+        if since < floor {
+            return Ok(None);
+        }
+
         let sql = "SELECT t.hash, t.name, t.size_bytes, t.bytes_done, t.down_rate, t.up_rate,
                     t.up_total, t.down_total, t.ratio, t.is_active, t.is_open, t.complete,
                     t.state, t.priority, t.category, t.base_path, t.directory, t.creation_date,
                     t.timestamp_finished, t.tracker_focus, t.peers_connected, t.peers_complete,
                     t.message, t.tracker_url,
-                    COALESCE(tags.tags, '') AS tags,
-                    t.updated_at
+                    COALESCE((
+                        SELECT GROUP_CONCAT(ordered_tags.tag)
+                        FROM (
+                            SELECT tt.tag
+                            FROM torrent_tags tt
+                            WHERE tt.hash=t.hash
+                            ORDER BY tt.tag COLLATE NOCASE, tt.tag
+                        ) AS ordered_tags
+                    ), '') AS tags,
+                    t.updated_at, t.revision
              FROM torrents t
-             LEFT JOIN (
-                SELECT hash, GROUP_CONCAT(tag) AS tags
-                FROM torrent_tags
-                GROUP BY hash
-             ) tags ON tags.hash=t.hash
-             WHERE t.updated_at > ?1";
+             WHERE t.revision > ?1
+             ORDER BY t.revision ASC, t.hash COLLATE NOCASE ASC
+             LIMIT ?2";
         let mut stmt = conn.prepare(sql)?;
         let rows = stmt
-            .query_map(params![since], |r: &rusqlite::Row<'_>| {
-                Ok(TorrentRow {
-                    hash: r.get(0)?,
-                    name: r.get(1)?,
-                    size_bytes: r.get(2)?,
-                    bytes_done: r.get(3)?,
-                    down_rate: r.get(4)?,
-                    up_rate: r.get(5)?,
-                    up_total: r.get(6)?,
-                    down_total: r.get(7)?,
-                    ratio: r.get(8)?,
-                    is_active: r.get::<_, i64>(9)? != 0,
-                    is_open: r.get::<_, i64>(10)? != 0,
-                    complete: r.get::<_, i64>(11)? != 0,
-                    state: r.get(12)?,
-                    priority: r.get(13)?,
-                    category: r.get(14)?,
-                    base_path: r.get(15)?,
-                    directory: r.get(16)?,
-                    creation_date: r.get(17)?,
-                    timestamp_finished: r.get(18)?,
-                    tracker_focus: r.get(19)?,
-                    peers_connected: r.get(20)?,
-                    peers_complete: r.get(21)?,
-                    message: r.get(22)?,
-                    tracker_url: r.get(23)?,
-                    tags: r.get(24)?,
-                    updated_at: r.get(25)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok((rows, max_updated_at.max(since)))
-    }
-
-    pub fn list(&self, p: &ListParams) -> Result<(Vec<TorrentRow>, i64)> {
-        let (where_sql, args) = build_where(p);
-        let order = order_clause(p.sort.as_deref(), p.dir.as_deref());
-        let limit = p.limit.unwrap_or(200).clamp(1, 50000);
-        let offset = p.offset.unwrap_or(0).max(0);
-
-        let conn = self.0.lock().expect("db mutex");
-
-        let total: i64 = conn.query_row(
-            &format!("SELECT COUNT(*) FROM torrents t{TAGS_JOIN}{where_sql}"),
-            params_from_iter(args.iter()),
-            |r: &rusqlite::Row<'_>| r.get(0),
-        )?;
-
-        let sql = format!(
-            "SELECT t.hash, t.name, t.size_bytes, t.bytes_done, t.down_rate, t.up_rate,
-                    t.up_total, t.down_total, t.ratio, t.is_active, t.is_open, t.complete,
-                    t.state, t.priority, t.category, t.base_path, t.directory, t.creation_date,
-                    t.timestamp_finished, t.tracker_focus, t.peers_connected, t.peers_complete,
-                    t.message, t.tracker_url,
-                    COALESCE(tags.tags, '') AS tags,
-                    t.updated_at
-             FROM torrents t
-             LEFT JOIN (
-                SELECT hash, GROUP_CONCAT(tag) AS tags
-                FROM torrent_tags
-                GROUP BY hash
-             ) tags ON tags.hash=t.hash
-             {where_sql} ORDER BY {order} LIMIT ?{n1} OFFSET ?{n2}",
-            n1 = args.len() + 1,
-            n2 = args.len() + 2,
-        );
-
-        let mut all_args: Vec<String> = args;
-        all_args.push(limit.to_string());
-        all_args.push(offset.to_string());
-
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt
             .query_map(
-                params_from_iter(all_args.iter()),
+                params![since, max_rows.saturating_add(1) as i64],
                 |r: &rusqlite::Row<'_>| {
                     Ok(TorrentRow {
                         hash: r.get(0)?,
@@ -223,7 +207,57 @@ impl Db {
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
+        let mut removed_stmt = conn.prepare(
+            "SELECT hash FROM removed_torrents
+             WHERE revision > ?1
+             ORDER BY revision ASC, hash COLLATE NOCASE ASC
+             LIMIT ?2",
+        )?;
+        let removed = removed_stmt
+            .query_map(params![since, max_rows.saturating_add(1) as i64], |row| {
+                row.get(0)
+            })?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+
+        if rows.len().saturating_add(removed.len()) > max_rows {
+            return Ok(None);
+        }
+        Ok(Some(TorrentDelta {
+            changed: rows,
+            removed,
+            revision,
+        }))
+    }
+
+    pub fn list(&self, p: &ListParams) -> Result<(Vec<TorrentRow>, i64)> {
+        let (where_sql, args) = build_where(p);
+        let order = order_clause(p.sort.as_deref(), p.dir.as_deref());
+        let limit = p.limit.unwrap_or(200).clamp(1, 50000);
+        let offset = validate_page_offset(p.offset)?;
+
+        let conn = self.0.lock().expect("db mutex");
+
+        let total: i64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM torrents t{where_sql}"),
+            params_from_iter(args.iter()),
+            |r: &rusqlite::Row<'_>| r.get(0),
+        )?;
+
+        let rows = query_torrent_rows(&conn, &where_sql, &args, &order, limit, offset)?;
         Ok((rows, total))
+    }
+
+    /// Fetch one page without calculating the result-set total. Compatibility
+    /// endpoints such as qBittorrent's `torrents/info` do not expose a total;
+    /// issuing a second filtered `COUNT(*)` query there is pure database work
+    /// with no protocol value, especially for broad status filters.
+    pub fn list_page(&self, p: &ListParams) -> Result<Vec<TorrentRow>> {
+        let (where_sql, args) = build_where(p);
+        let order = order_clause(p.sort.as_deref(), p.dir.as_deref());
+        let limit = p.limit.unwrap_or(200).clamp(1, 50000);
+        let offset = validate_page_offset(p.offset)?;
+        let conn = self.0.lock().expect("db mutex");
+        query_torrent_rows(&conn, &where_sql, &args, &order, limit, offset)
     }
 
     pub fn tracker_health(&self) -> Result<Vec<TrackerHealthRow>> {
@@ -313,7 +347,7 @@ impl Db {
             clauses.push(bucket_sql.to_owned());
             let where_sql = clauses.join(" AND ");
             let count: i64 = conn.query_row(
-                &format!("SELECT COUNT(*) FROM torrents t{TAGS_JOIN} WHERE {where_sql}"),
+                &format!("SELECT COUNT(*) FROM torrents t WHERE {where_sql}"),
                 params_from_iter(shared_args.iter()),
                 |r| r.get(0),
             )?;
@@ -327,7 +361,7 @@ impl Db {
             append_media_type_clause(key, &mut clauses, &mut args);
             let where_sql = clauses.join(" AND ");
             let count: i64 = conn.query_row(
-                &format!("SELECT COUNT(*) FROM torrents t{TAGS_JOIN} WHERE {where_sql}"),
+                &format!("SELECT COUNT(*) FROM torrents t WHERE {where_sql}"),
                 params_from_iter(args.iter()),
                 |r| r.get(0),
             )?;
@@ -348,8 +382,11 @@ fn shared_clauses(p: &ListParams) -> (Vec<String>, Vec<String>) {
 
     if let Some(f) = &p.filter {
         if !f.is_empty() {
-            clauses.push(format!("t.name LIKE ?{} COLLATE NOCASE", args.len() + 1));
-            args.push(format!("%{f}%"));
+            clauses.push(format!(
+                "t.name LIKE ?{} ESCAPE char(92) COLLATE NOCASE",
+                args.len() + 1
+            ));
+            args.push(format!("%{}%", escape_like_pattern(f)));
         }
     }
     if let Some(cat) = &p.category {
@@ -366,14 +403,93 @@ fn shared_clauses(p: &ListParams) -> (Vec<String>, Vec<String>) {
     if let Some(tracker) = &p.tracker {
         if !tracker.is_empty() {
             clauses.push(format!(
-                "t.tracker_url LIKE ?{} COLLATE NOCASE",
+                "instr(lower(t.tracker_url), lower(?{})) > 0",
                 args.len() + 1
             ));
-            args.push(format!("%{tracker}%"));
+            args.push(tracker.clone());
         }
     }
 
     (clauses, args)
+}
+
+fn query_torrent_rows(
+    conn: &rusqlite::Connection,
+    where_sql: &str,
+    args: &[String],
+    order: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<TorrentRow>> {
+    let sql = format!(
+        "SELECT t.hash, t.name, t.size_bytes, t.bytes_done, t.down_rate, t.up_rate,
+                t.up_total, t.down_total, t.ratio, t.is_active, t.is_open, t.complete,
+                t.state, t.priority, t.category, t.base_path, t.directory, t.creation_date,
+                t.timestamp_finished, t.tracker_focus, t.peers_connected, t.peers_complete,
+                t.message, t.tracker_url,
+                COALESCE((
+                    SELECT GROUP_CONCAT(ordered_tags.tag)
+                    FROM (
+                        SELECT tt.tag
+                        FROM torrent_tags tt
+                        WHERE tt.hash=t.hash
+                        ORDER BY tt.tag COLLATE NOCASE, tt.tag
+                    ) AS ordered_tags
+                ), '') AS tags,
+                t.updated_at
+         FROM torrents t
+         {where_sql} ORDER BY {order} LIMIT ?{n1} OFFSET ?{n2}",
+        n1 = args.len() + 1,
+        n2 = args.len() + 2,
+    );
+
+    let mut all_args = args.to_vec();
+    all_args.push(limit.to_string());
+    all_args.push(offset.to_string());
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params_from_iter(all_args.iter()), torrent_row_from_sql)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn torrent_row_from_sql(r: &rusqlite::Row<'_>) -> rusqlite::Result<TorrentRow> {
+    Ok(TorrentRow {
+        hash: r.get(0)?,
+        name: r.get(1)?,
+        size_bytes: r.get(2)?,
+        bytes_done: r.get(3)?,
+        down_rate: r.get(4)?,
+        up_rate: r.get(5)?,
+        up_total: r.get(6)?,
+        down_total: r.get(7)?,
+        ratio: r.get(8)?,
+        is_active: r.get::<_, i64>(9)? != 0,
+        is_open: r.get::<_, i64>(10)? != 0,
+        complete: r.get::<_, i64>(11)? != 0,
+        state: r.get(12)?,
+        priority: r.get(13)?,
+        category: r.get(14)?,
+        base_path: r.get(15)?,
+        directory: r.get(16)?,
+        creation_date: r.get(17)?,
+        timestamp_finished: r.get(18)?,
+        tracker_focus: r.get(19)?,
+        peers_connected: r.get(20)?,
+        peers_complete: r.get(21)?,
+        message: r.get(22)?,
+        tracker_url: r.get(23)?,
+        tags: r.get(24)?,
+        updated_at: r.get(25)?,
+    })
+}
+
+fn escape_like_pattern(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 fn build_where(p: &ListParams) -> (String, Vec<String>) {
@@ -426,8 +542,6 @@ fn build_where(p: &ListParams) -> (String, Vec<String>) {
 /// rather than silently matching everything.
 const KNOWN_MEDIA_TYPES: &[&str] = &["ebook", "tv", "video", "audio", "image", "game", "software"];
 
-const TAGS_JOIN: &str = " LEFT JOIN (SELECT hash, GROUP_CONCAT(tag) AS tags FROM torrent_tags GROUP BY hash) tags ON tags.hash=t.hash";
-
 fn append_media_type_clause(media_type: &str, clauses: &mut Vec<String>, args: &mut Vec<String>) {
     if !KNOWN_MEDIA_TYPES.contains(&media_type) {
         clauses.push("0".to_owned());
@@ -435,7 +549,21 @@ fn append_media_type_clause(media_type: &str, clauses: &mut Vec<String>, args: &
     }
     let idx = args.len() + 1;
     clauses.push(format!(
-        "tng_media_type_match(t.name, t.category, t.directory, COALESCE(tags.tags, ''), ?{idx}) = 1"
+        "tng_media_type_match(
+            t.name,
+            t.category,
+            t.directory,
+            COALESCE((
+                SELECT GROUP_CONCAT(ordered_tags.tag)
+                FROM (
+                    SELECT tt.tag
+                    FROM torrent_tags tt
+                    WHERE tt.hash=t.hash
+                    ORDER BY tt.tag COLLATE NOCASE, tt.tag
+                ) AS ordered_tags
+            ), ''),
+            ?{idx}
+        ) = 1"
     ));
     args.push(media_type.to_owned());
 }
@@ -473,12 +601,15 @@ fn order_clause(sort: Option<&str>, dir: Option<&str>) -> String {
     } else {
         "ASC"
     };
-    format!("{col} {d}")
+    // Offset pagination needs a total ordering.  Without a unique tie-breaker
+    // SQLite may return equal names/statuses/rates in different orders across
+    // pages, which makes rows appear twice or disappear between requests.
+    format!("{col} {d}, t.hash COLLATE NOCASE {d}")
 }
 
 #[cfg(test)]
 mod tracker_error_integration_tests {
-    use super::{Db, ListParams};
+    use super::{bounded_page_limit, Db, ListParams, MAX_API_PAGE_ENTRIES};
     use crate::cache::db::TorrentRow;
 
     fn row(hash: &str, is_active: bool, message: &str) -> TorrentRow {
@@ -545,6 +676,128 @@ mod tracker_error_integration_tests {
         assert_eq!(total, 1);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].hash, "a".repeat(40));
+    }
+
+    #[test]
+    fn tracker_filter_treats_sql_wildcards_as_literal_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+        let mut literal = row("a", true, "");
+        literal.tracker_url = "https://tracker.example/announce?token=100%".to_owned();
+        db.upsert(&literal).unwrap();
+        db.upsert(&row("b", true, "")).unwrap();
+
+        let (rows, total) = db
+            .list(&ListParams {
+                tracker: Some("100%".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].hash, "a");
+    }
+
+    #[test]
+    fn name_filter_treats_sql_wildcards_as_literal_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+        let mut literal = row("literal", true, "");
+        literal.name = "100%_literal".to_owned();
+        db.upsert(&literal).unwrap();
+        let mut wildcard = row("wildcard", true, "");
+        wildcard.name = "1000x_literal".to_owned();
+        db.upsert(&wildcard).unwrap();
+
+        let (rows, total) = db
+            .list(&ListParams {
+                filter: Some("100%_".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows[0].hash, "literal");
+    }
+
+    #[test]
+    fn bounded_incremental_listing_rejects_truncation_and_orders_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+        let since = db.current_revision().unwrap();
+        for (hash, updated_at) in [("b", 2), ("a", 1)] {
+            let mut torrent = row(hash, true, "");
+            torrent.updated_at = updated_at;
+            db.upsert(&torrent).unwrap();
+        }
+
+        assert!(db.list_since_bounded(since, 1).unwrap().is_none());
+
+        let delta = db
+            .list_since_bounded(since, 2)
+            .unwrap()
+            .expect("the complete delta fits within the bound");
+        assert_eq!(
+            delta
+                .changed
+                .iter()
+                .map(|row| row.hash.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b", "a"]
+        );
+        assert!(delta.revision > since);
+        assert!(delta.removed.is_empty());
+    }
+
+    #[test]
+    fn bounded_incremental_listing_with_zero_capacity_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+        db.upsert(&row("a", true, "")).unwrap();
+        let since = db.current_revision().unwrap();
+        assert!(db.list_since_bounded(since, 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn durable_revision_captures_same_second_updates_and_deletions() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+        let since = db.current_revision().unwrap();
+
+        let mut first = row("first", true, "");
+        first.updated_at = 1_700_000_000;
+        db.upsert(&first).unwrap();
+        let mut second = row("second", true, "");
+        second.updated_at = first.updated_at;
+        db.upsert(&second).unwrap();
+
+        let delta = db
+            .list_since_bounded(since, 10)
+            .unwrap()
+            .expect("same-second updates remain individually discoverable");
+        assert_eq!(delta.changed.len(), 2);
+        assert!(delta
+            .changed
+            .iter()
+            .all(|row| row.updated_at == 1_700_000_000));
+
+        let after_updates = delta.revision;
+        db.delete("first").unwrap();
+        let delta = db
+            .list_since_bounded(after_updates, 10)
+            .unwrap()
+            .expect("deletion tombstone is replayable");
+        assert_eq!(delta.removed, vec!["first"]);
+        assert!(delta.changed.is_empty());
+    }
+
+    #[test]
+    fn public_page_limit_is_bounded() {
+        assert_eq!(bounded_page_limit(None), None);
+        assert_eq!(bounded_page_limit(Some(0)), Some(1));
+        assert_eq!(
+            bounded_page_limit(Some(MAX_API_PAGE_ENTRIES + 1)),
+            Some(MAX_API_PAGE_ENTRIES)
+        );
     }
 }
 
@@ -634,7 +887,7 @@ mod order_clause_tests {
             "expected a CASE expression: {clause}"
         );
         assert!(
-            clause.trim_end().ends_with("END ASC"),
+            clause.contains("END ASC, t.hash COLLATE NOCASE ASC"),
             "unexpected clause: {clause}"
         );
         assert!(
@@ -647,7 +900,7 @@ mod order_clause_tests {
     fn status_desc_respects_direction() {
         let clause = order_clause(Some("status"), Some("desc"));
         assert!(
-            clause.trim_end().ends_with("END DESC"),
+            clause.contains("END DESC, t.hash COLLATE NOCASE DESC"),
             "unexpected clause: {clause}"
         );
     }
@@ -655,6 +908,25 @@ mod order_clause_tests {
     #[test]
     fn unknown_sort_falls_back_to_name() {
         let clause = order_clause(Some("not-a-real-column"), None);
-        assert_eq!(clause, "t.name COLLATE NOCASE ASC");
+        assert_eq!(
+            clause,
+            "t.name COLLATE NOCASE ASC, t.hash COLLATE NOCASE ASC"
+        );
+    }
+}
+
+#[cfg(test)]
+mod page_bound_tests {
+    use super::{validate_page_offset, MAX_API_PAGE_OFFSET};
+
+    #[test]
+    fn page_offset_is_finite_and_non_negative() {
+        assert_eq!(validate_page_offset(None).unwrap(), 0);
+        assert_eq!(
+            validate_page_offset(Some(MAX_API_PAGE_OFFSET)).unwrap(),
+            MAX_API_PAGE_OFFSET
+        );
+        assert!(validate_page_offset(Some(-1)).is_err());
+        assert!(validate_page_offset(Some(MAX_API_PAGE_OFFSET + 1)).is_err());
     }
 }

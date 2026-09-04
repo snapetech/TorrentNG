@@ -26,6 +26,10 @@ impl ApiError {
     pub fn internal(msg: impl Into<String>) -> Self {
         ApiError::new("INTERNAL_ERROR", msg)
     }
+
+    pub fn not_implemented(msg: impl Into<String>) -> Self {
+        ApiError::new("NOT_IMPLEMENTED", msg)
+    }
 }
 
 #[cfg(test)]

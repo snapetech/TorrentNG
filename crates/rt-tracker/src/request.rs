@@ -74,6 +74,19 @@ pub struct AnnounceRequest {
 impl AnnounceRequest {
     /// Build the HTTP query string for an HTTP tracker announce.
     pub fn to_http_query(&self, tracker_url: &str) -> Result<String, TrackerError> {
+        self.to_http_query_with_tracker_id(tracker_url, None)
+    }
+
+    /// Build the HTTP query string and echo a tracker-provided `tracker id`
+    /// when one was returned by an earlier announce. BEP 3 trackers may use
+    /// this value to associate subsequent announces with the original
+    /// session; dropping it produces incorrect reannounce traffic for those
+    /// trackers.
+    pub fn to_http_query_with_tracker_id(
+        &self,
+        tracker_url: &str,
+        tracker_id: Option<&[u8]>,
+    ) -> Result<String, TrackerError> {
         let mut url =
             Url::parse(tracker_url).map_err(|e| TrackerError::InvalidUrl(e.to_string()))?;
         let existing_query = url.query().map(str::to_owned);
@@ -93,6 +106,9 @@ impl AnnounceRequest {
         query_parts.push(format!("compact={}", if self.compact { 1 } else { 0 }));
         if let Some(n) = self.numwant {
             query_parts.push(format!("numwant={n}"));
+        }
+        if let Some(tracker_id) = tracker_id.filter(|value| !value.is_empty()) {
+            query_parts.push(format!("trackerid={}", url_encode_bytes(tracker_id)));
         }
         if let Some(ev) = self.event.as_str() {
             query_parts.push(format!("event={ev}"));
@@ -165,6 +181,23 @@ mod tests {
         assert!(url.contains("event=started"));
         assert!(url.contains("numwant=50"));
         assert!(url.contains("info_hash="));
+    }
+
+    #[test]
+    fn tracker_id_is_echoed_only_when_provided() {
+        let req = test_request(TrackerEvent::Empty);
+        let without_id = req
+            .to_http_query("http://tracker.example.com/announce")
+            .unwrap();
+        assert!(!without_id.contains("trackerid="));
+
+        let with_id = req
+            .to_http_query_with_tracker_id(
+                "http://tracker.example.com/announce",
+                Some(b"id-42".as_slice()),
+            )
+            .unwrap();
+        assert!(with_id.contains("trackerid=%69%64%2D%34%32"));
     }
 
     #[test]

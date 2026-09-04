@@ -16,6 +16,8 @@ services:
     environment:
       TORRENTNGD_CONFIG: /etc/torrentngd/config.toml
       RUST_LOG: "${RUST_LOG:-info}"
+    secrets:
+      - torrentngd_api_token
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
       interval: 15s
@@ -31,6 +33,9 @@ services:
       - "9090:9090"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./torrentngd.rules.yml:/etc/prometheus/torrentngd.rules.yml:ro
+    secrets:
+      - torrentngd_api_token
     depends_on:
       - torrentngd
 
@@ -53,3 +58,7 @@ volumes:
     name: certification_downloads
   torrentngd-state:
   grafana-data:
+
+secrets:
+  torrentngd_api_token:
+    environment: TORRENTNG_API_TOKEN

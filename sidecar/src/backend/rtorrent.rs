@@ -44,7 +44,11 @@ impl TorrentBackend for RtorrentBackend {
             supports_per_torrent_limits: false,
             supports_global_limits: false,
             supports_share_limits: true,
-            supports_mode_flags: true,
+            // The sidecar exposes no rTorrent-backed implementations for
+            // force-start, super-seeding, auto-TMM, or auto-management. The
+            // trait defaults reject those calls, so advertising this bit
+            // would turn a truthful 501 into a misleading backend failure.
+            supports_mode_flags: false,
             supports_location_update: true,
             supports_torrent_rename: true,
             supports_file_rename: true,
@@ -55,10 +59,15 @@ impl TorrentBackend for RtorrentBackend {
     }
 
     async fn health(&self) -> BackendStatus {
-        if self.client.call("system.client_version", &[]).await.is_ok() {
-            BackendStatus::Connected
-        } else {
-            BackendStatus::Unreachable
+        match self.client.call("system.client_version", &[]).await {
+            Ok(value)
+                if value
+                    .as_str()
+                    .is_some_and(|version| !version.trim().is_empty()) =>
+            {
+                BackendStatus::Connected
+            }
+            Ok(_) | Err(_) => BackendStatus::Unreachable,
         }
     }
 

@@ -34,4 +34,6 @@ pub enum MetainfoError {
     InvalidMagnet(String),
     #[error("unsupported magnet info hash: {0}")]
     UnsupportedMagnetHash(String),
+    #[error("unsupported metainfo version: {0}")]
+    UnsupportedMetaVersion(i64),
 }

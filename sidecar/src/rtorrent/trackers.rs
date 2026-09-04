@@ -1,8 +1,7 @@
-use anyhow::Result;
+use anyhow::{anyhow, bail, Result};
 use serde::Serialize;
 
 use super::client::{Client, XmlValue};
-use crate::torrent_meta::session_tracker_urls;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RawTracker {
@@ -50,21 +49,9 @@ impl Client {
                     "t.scrape_downloaded=".into(),
                 ],
             )
-            .await;
+            .await?;
 
-        let Ok(result) = result else {
-            tracing::warn!(
-                result = ?result,
-                "t.multicall {hash} failed, falling back to session metadata"
-            );
-            return Ok(session_trackers(hash));
-        };
-
-        let mut out = parse_tracker_rows(result.into_array());
-        if out.is_empty() {
-            out = session_trackers(hash);
-        }
-        Ok(out)
+        parse_tracker_rows(result.try_into_array()?)
     }
 
     pub async fn add_tracker(&self, hash: &str, url: &str) -> Result<()> {
@@ -89,72 +76,57 @@ impl Client {
     }
 }
 
-fn parse_tracker_rows(rows: Vec<XmlValue>) -> Vec<RawTracker> {
+fn parse_tracker_rows(rows: Vec<XmlValue>) -> Result<Vec<RawTracker>> {
     let mut out = Vec::with_capacity(rows.len());
     for (idx, row) in rows.into_iter().enumerate() {
-        let f = row.into_array();
+        let f = row.try_into_array()?;
         if f.len() < 15 {
-            continue;
+            bail!("rTorrent tracker row {idx} returned {} fields", f.len());
         }
         out.push(RawTracker {
-            url: sf(&f, 0),
-            id: nf(&f, 1),
-            group: nf(&f, 2),
+            url: required_url(&f, 0)?,
+            id: required_i64(&f, 1, "t.id")?,
+            group: required_i64(&f, 2, "t.group")?,
             group_index: idx as i64,
-            is_enabled: bf(&f, 3),
-            is_open: bf(&f, 4),
-            is_extra_tracker: bf(&f, 5),
-            activity_time_last: nf(&f, 6),
-            activity_time_next: nf(&f, 7),
-            min_interval: nf(&f, 8),
-            normal_interval: nf(&f, 9),
-            failed_counter: nf(&f, 10),
-            success_counter: nf(&f, 11),
-            scrape_incomplete: nf(&f, 12),
-            scrape_complete: nf(&f, 13),
-            scrape_downloaded: nf(&f, 14),
+            is_enabled: required_bool(&f, 3, "t.is_enabled")?,
+            is_open: required_bool(&f, 4, "t.is_open")?,
+            is_extra_tracker: required_bool(&f, 5, "t.is_extra_tracker")?,
+            activity_time_last: required_i64(&f, 6, "t.activity_time_last")?,
+            activity_time_next: required_i64(&f, 7, "t.activity_time_next")?,
+            min_interval: required_i64(&f, 8, "t.min_interval")?,
+            normal_interval: required_i64(&f, 9, "t.normal_interval")?,
+            failed_counter: required_i64(&f, 10, "t.failed_counter")?,
+            success_counter: required_i64(&f, 11, "t.success_counter")?,
+            scrape_incomplete: required_i64(&f, 12, "t.scrape_incomplete")?,
+            scrape_complete: required_i64(&f, 13, "t.scrape_complete")?,
+            scrape_downloaded: required_i64(&f, 14, "t.scrape_downloaded")?,
             message: String::new(),
         });
     }
-    out
+    Ok(out)
 }
 
-fn session_trackers(hash: &str) -> Vec<RawTracker> {
-    session_tracker_urls(hash)
-        .into_iter()
-        .enumerate()
-        .map(|(idx, url)| RawTracker {
-            url,
-            id: idx as i64,
-            group: 0,
-            group_index: idx as i64,
-            is_enabled: true,
-            is_open: false,
-            is_extra_tracker: false,
-            activity_time_last: 0,
-            activity_time_next: 0,
-            min_interval: 0,
-            normal_interval: 0,
-            failed_counter: 0,
-            success_counter: 0,
-            scrape_incomplete: 0,
-            scrape_complete: 0,
-            scrape_downloaded: 0,
-            message: String::new(),
-        })
-        .collect()
+fn required_url(fields: &[XmlValue], index: usize) -> Result<String> {
+    fields
+        .get(index)
+        .and_then(XmlValue::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("rTorrent response omitted valid t.url"))
 }
 
-fn sf(f: &[XmlValue], i: usize) -> String {
-    f.get(i).and_then(|v| v.as_str()).unwrap_or("").to_owned()
+fn required_i64(fields: &[XmlValue], index: usize, name: &str) -> Result<i64> {
+    fields
+        .get(index)
+        .and_then(XmlValue::as_i64)
+        .ok_or_else(|| anyhow!("rTorrent response omitted valid {name}"))
 }
 
-fn nf(f: &[XmlValue], i: usize) -> i64 {
-    f.get(i).and_then(|v| v.as_i64()).unwrap_or(0)
-}
-
-fn bf(f: &[XmlValue], i: usize) -> bool {
-    f.get(i).and_then(|v| v.as_bool()).unwrap_or(false)
+fn required_bool(fields: &[XmlValue], index: usize, name: &str) -> Result<bool> {
+    fields
+        .get(index)
+        .and_then(XmlValue::as_bool)
+        .ok_or_else(|| anyhow!("rTorrent response omitted valid {name}"))
 }
 
 #[cfg(test)]
@@ -181,7 +153,7 @@ mod tests {
             7_i64.into(),
         ])];
 
-        let parsed = parse_tracker_rows(rows);
+        let parsed = parse_tracker_rows(rows).unwrap();
 
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].url, "udp://tracker.example/announce");
@@ -197,11 +169,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_tracker_rows_ignores_short_rows() {
+    fn parse_tracker_rows_rejects_short_rows() {
         let parsed = parse_tracker_rows(vec![XmlValue::Array(vec![
             "udp://tracker.example/announce".into(),
         ])]);
 
-        assert!(parsed.is_empty());
+        assert!(parsed.is_err());
     }
 }

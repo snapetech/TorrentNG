@@ -6,29 +6,58 @@ use rusqlite::Connection;
 
 use crate::error::DbError;
 
+/// Current native database schema version.
+pub const CURRENT_SCHEMA_VERSION: u32 = 9;
+
 /// Apply all pending migrations to bring the database up to the current schema version.
+///
+/// Every version's DDL and its `user_version` update run in the same SQLite
+/// transaction.  SQLite rolls DDL back with the transaction, so a crash or a
+/// failed statement cannot leave a partially applied schema advertising the
+/// next version.  The journal-mode pragma is intentionally configured before
+/// the transaction because SQLite does not allow changing it while a
+/// transaction is active.
 pub fn migrate(conn: &Connection) -> Result<(), DbError> {
     let current = get_schema_version(conn)?;
-    for (version, sql) in MIGRATIONS.iter() {
-        if *version > current {
-            conn.execute_batch(sql).map_err(|e| DbError::Migration {
+    if current > CURRENT_SCHEMA_VERSION {
+        return Err(DbError::Migration {
+            version: current,
+            reason: format!(
+                "database schema is newer than this binary (maximum supported {CURRENT_SCHEMA_VERSION})"
+            ),
+        });
+    }
+
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    if current == 0 {
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    for (version, sql) in MIGRATIONS.iter().filter(|(version, _)| *version > current) {
+        tx.execute_batch(sql).map_err(|e| DbError::Migration {
+            version: *version,
+            reason: e.to_string(),
+        })?;
+        tx.pragma_update(None, "user_version", version)
+            .map_err(|e| DbError::Migration {
                 version: *version,
                 reason: e.to_string(),
             })?;
-            set_schema_version(conn, *version)?;
-        }
     }
+    tx.commit().map_err(|e| DbError::Migration {
+        version: CURRENT_SCHEMA_VERSION,
+        reason: e.to_string(),
+    })?;
     Ok(())
 }
 
 fn get_schema_version(conn: &Connection) -> Result<u32, DbError> {
     let v: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    Ok(v as u32)
-}
-
-fn set_schema_version(conn: &Connection, version: u32) -> Result<(), DbError> {
-    conn.pragma_update(None, "user_version", version)?;
-    Ok(())
+    u32::try_from(v).map_err(|_| DbError::Migration {
+        version: 0,
+        reason: format!("invalid negative schema version {v}"),
+    })
 }
 
 /// Ordered migrations. Each entry is (target_version, DDL).
@@ -36,8 +65,6 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (
         1,
         "
-        PRAGMA journal_mode = WAL;
-        PRAGMA synchronous = NORMAL;
         PRAGMA foreign_keys = ON;
 
         CREATE TABLE IF NOT EXISTS torrents (
@@ -251,6 +278,55 @@ const MIGRATIONS: &[(u32, &str)] = &[
         ALTER TABLE torrent_limits ADD COLUMN sequential_download_from_piece INTEGER;
         ",
     ),
+    (
+        6,
+        "
+        PRAGMA foreign_keys = ON;
+
+        CREATE INDEX IF NOT EXISTS idx_torrent_trackers_status
+            ON torrent_trackers(status);
+        ",
+    ),
+    (
+        7,
+        "
+        CREATE TABLE IF NOT EXISTS projection_issues (
+            issue_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            info_hash      TEXT    NOT NULL DEFAULT '',
+            artifact       TEXT    NOT NULL,
+            path           TEXT    NOT NULL DEFAULT '',
+            reason         TEXT    NOT NULL,
+            detected_at    INTEGER NOT NULL,
+            resolved_at    INTEGER
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_projection_issues_active
+            ON projection_issues(info_hash, artifact, path)
+            WHERE resolved_at IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_projection_issues_hash
+            ON projection_issues(info_hash, issue_id);
+        ",
+    ),
+    (
+        8,
+        "
+        PRAGMA foreign_keys = ON;
+
+        CREATE TABLE IF NOT EXISTS peer_bans (
+            peer        TEXT NOT NULL PRIMARY KEY,
+            created_at  INTEGER NOT NULL
+        );
+        ",
+    ),
+    (
+        9,
+        "
+        PRAGMA foreign_keys = ON;
+
+        -- BEP 3 tracker IDs are opaque bytes, not necessarily UTF-8.
+        ALTER TABLE torrent_trackers ADD COLUMN tracker_id BLOB;
+        ",
+    ),
 ];
 
 #[cfg(test)]
@@ -284,7 +360,7 @@ mod tests {
         let v: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 5);
+        assert_eq!(v, CURRENT_SCHEMA_VERSION as i64);
     }
 
     #[test]
@@ -316,6 +392,8 @@ mod tests {
             "storage_roots",
             "mounts",
             "api_tokens",
+            "projection_issues",
+            "peer_bans",
         ];
         for table in expected {
             let count: i64 = conn
@@ -349,5 +427,51 @@ mod tests {
             )
             .unwrap();
         assert_eq!(index_count, 1);
+    }
+
+    #[test]
+    fn migrate_adds_opaque_tracker_id_column() {
+        let conn = open_mem();
+        migrate(&conn).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('torrent_trackers') WHERE name = 'tracker_id'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn failed_migration_rolls_back_ddl_and_user_version() {
+        let conn = open_mem();
+        // Build a genuine version-6 database without applying version 7.
+        for (version, sql) in MIGRATIONS.iter().take(6) {
+            conn.execute_batch(sql).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+        }
+        // Make version 7 fail on its index after its CREATE TABLE IF NOT
+        // EXISTS statement has run. The transaction must roll back that
+        // table creation as well as leave user_version at 6.
+        conn.execute(
+            "CREATE TABLE projection_issues (issue_id INTEGER PRIMARY KEY)",
+            [],
+        )
+        .unwrap();
+
+        assert!(migrate(&conn).is_err());
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 6);
+        let index_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_projection_issues_active'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 0, "failed migration must not retain its index");
     }
 }

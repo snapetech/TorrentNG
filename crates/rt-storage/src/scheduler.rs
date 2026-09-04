@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -24,6 +24,7 @@ use crate::{
     error::StorageError,
     frame::{global_frame_pool, Frame},
     io_class::IoClass,
+    open::{create_dir_all_no_follow, open_path_no_follow},
 };
 
 pub const STORAGE_LATENCY_BUCKETS_NS: [u64; 8] = [
@@ -371,17 +372,8 @@ impl FilePool {
         }
 
         self.counters.misses.fetch_add(1, Ordering::Relaxed);
-        let mut opts = OpenOptions::new();
-        match mode {
-            OpenMode::Read => {
-                opts.read(true).write(false).create(false).truncate(false);
-            }
-            OpenMode::Write => {
-                opts.read(false).write(true).create(create).truncate(false);
-            }
-        }
         let file = Arc::new(
-            opts.open(&key)
+            open_path_no_follow(&key, mode == OpenMode::Write, create)
                 .map_err(|e| StorageError::io(&path_str, e))?,
         );
         entries.insert(
@@ -410,12 +402,7 @@ impl FilePool {
         match file {
             Some(file) => Ok(file),
             None => Ok(Arc::new(
-                OpenOptions::new()
-                    .read(false)
-                    .write(true)
-                    .create(false)
-                    .truncate(false)
-                    .open(&key)
+                open_path_no_follow(&key, true, false)
                     .map_err(|e| StorageError::io(&path_str, e))?,
             )),
         }
@@ -568,6 +555,7 @@ pub struct MountScheduler {
     hash_pool: Arc<BlockingPool>,
     dirty_paths: Arc<Mutex<HashSet<PathBuf>>>,
     peer_read_cache: Arc<Mutex<HashMap<PathBuf, PeerReadCacheEntry>>>,
+    peer_read_cache_epoch: Arc<AtomicU64>,
     peer_read_elevator: Arc<Mutex<Option<PeerReadElevator>>>,
     peer_read_elevator_enabled: bool,
     peer_read_elevator_queue_depth: usize,
@@ -1286,6 +1274,7 @@ impl MountScheduler {
             )),
             dirty_paths: Arc::new(Mutex::new(HashSet::new())),
             peer_read_cache: Arc::new(Mutex::new(HashMap::new())),
+            peer_read_cache_epoch: Arc::new(AtomicU64::new(0)),
             peer_read_elevator,
             peer_read_elevator_enabled,
             peer_read_elevator_queue_depth,
@@ -1564,11 +1553,15 @@ impl MountScheduler {
         let disk_backend = self.disk_backend.clone();
         let counters = self.counters.clone();
         let peer_read_cache = self.peer_read_cache.clone();
+        let peer_read_cache_epoch = self.peer_read_cache_epoch.clone();
         let peer_read_elevator = self.peer_read_elevator();
         let readahead_bytes = self.io_config.peer_read_readahead_bytes;
         let readahead_cache_entries = self.io_config.peer_read_cache_entries;
         let path = path.to_path_buf();
         let started = Instant::now();
+        let cache_generation =
+            (class == IoClass::PeerRead && readahead_bytes > len && readahead_cache_entries > 0)
+                .then(|| peer_read_cache_epoch.load(Ordering::Acquire));
         if class == IoClass::PeerRead && readahead_bytes <= len {
             if let Some(elevator) = peer_read_elevator {
                 let bytes = elevator.read(path, offset, len).await?;
@@ -1691,11 +1684,8 @@ impl MountScheduler {
                 if class == IoClass::PeerRead && read_len > len && readahead_cache_entries > 0 {
                     let bytes = frame.into_bytes();
                     let exact = bytes.slice(..len);
-                    peer_read_cache_store(
-                        &peer_read_cache,
-                        &counters,
-                        self.resources.as_ref(),
-                        readahead_cache_entries,
+                    self.peer_read_cache_store(
+                        cache_generation.expect("peer-read cache generation is set"),
                         key,
                         offset,
                         bytes,
@@ -1706,6 +1696,60 @@ impl MountScheduler {
                 }
             }
         }
+    }
+
+    fn peer_read_cache_store(
+        &self,
+        generation: u64,
+        key: PathBuf,
+        offset: u64,
+        data: bytes::Bytes,
+    ) {
+        let max_entries = self.io_config.peer_read_cache_entries;
+        if max_entries == 0 {
+            return;
+        }
+        let lease = if let Some(resources) = self.resources.as_ref() {
+            match resources.try_acquire(MemoryClass::PeerBuffer, data.len() as u64) {
+                Some(lease) => Some(lease),
+                None => {
+                    self.counters.queue_full.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let mut cache = self
+            .peer_read_cache
+            .lock()
+            .expect("peer read cache mutex poisoned");
+        if self.peer_read_cache_epoch.load(Ordering::Acquire) != generation {
+            // A write completed while this read was in flight. Do not
+            // publish the stale backend bytes into the cache.
+            return;
+        }
+        if !cache.contains_key(&key) && cache.len() >= max_entries {
+            if let Some(evict) = cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| key.clone())
+            {
+                cache.remove(&evict);
+                self.counters
+                    .peer_read_cache_evictions
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        cache.insert(
+            key,
+            PeerReadCacheEntry {
+                offset,
+                data,
+                last_used: Instant::now(),
+                _lease: lease,
+            },
+        );
     }
 
     pub async fn write_at(
@@ -1721,11 +1765,18 @@ impl MountScheduler {
         let pool = self.file_pool.clone();
         let disk_backend = self.disk_backend.clone();
         let dirty_paths = self.dirty_paths.clone();
+        let peer_read_cache = self.peer_read_cache.clone();
+        let peer_read_cache_epoch = self.peer_read_cache_epoch.clone();
         let counters = self.counters.clone();
         let path = path.to_path_buf();
         let started = Instant::now();
         let submission = self.reserve_submission(data.len() as u64)?;
         let key = normalized_key(&path);
+        // Invalidate both before and after the write. A concurrent read that
+        // started before the write may finish with old bytes after the first
+        // invalidation; the epoch check in `peer_read_cache_store` prevents it
+        // from repopulating the cache after the second one.
+        peer_read_cache_invalidate(&peer_read_cache, &peer_read_cache_epoch, &key);
         let file = match self
             .io_pool
             .run({
@@ -1756,6 +1807,7 @@ impl MountScheduler {
             }
             return Err(error);
         }
+        peer_read_cache_invalidate(&peer_read_cache, &peer_read_cache_epoch, &key);
         if strict {
             let sync_started = Instant::now();
             let result = await_backend_io(&key, disk_backend.fdatasync(file)).await;
@@ -1795,7 +1847,7 @@ impl MountScheduler {
             let key = normalized_key(&path);
             let path_str = key.display().to_string();
             if let Some(parent) = key.parent() {
-                std::fs::create_dir_all(parent)
+                create_dir_all_no_follow(parent)
                     .map_err(|e| StorageError::io(parent.display().to_string(), e))?;
             }
             let file = pool.get_or_open(&key, OpenMode::Write, true)?;
@@ -2186,51 +2238,16 @@ fn peer_read_cache_hit(
     }
 }
 
-fn peer_read_cache_store(
+fn peer_read_cache_invalidate(
     cache: &Mutex<HashMap<PathBuf, PeerReadCacheEntry>>,
-    counters: &StorageCounters,
-    resources: Option<&ResourceGovernor>,
-    max_entries: usize,
-    key: PathBuf,
-    offset: u64,
-    data: bytes::Bytes,
+    epoch: &AtomicU64,
+    key: &Path,
 ) {
-    if max_entries == 0 {
-        return;
-    }
-    let lease = if let Some(resources) = resources {
-        match resources.try_acquire(MemoryClass::PeerBuffer, data.len() as u64) {
-            Some(lease) => Some(lease),
-            None => {
-                counters.queue_full.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-        }
-    } else {
-        None
-    };
-    let mut cache = cache.lock().expect("peer read cache mutex poisoned");
-    if !cache.contains_key(&key) && cache.len() >= max_entries {
-        if let Some(evict) = cache
-            .iter()
-            .min_by_key(|(_, entry)| entry.last_used)
-            .map(|(key, _)| key.clone())
-        {
-            cache.remove(&evict);
-            counters
-                .peer_read_cache_evictions
-                .fetch_add(1, Ordering::Relaxed);
-        }
-    }
-    cache.insert(
-        key,
-        PeerReadCacheEntry {
-            offset,
-            data,
-            last_used: Instant::now(),
-            _lease: lease,
-        },
-    );
+    epoch.fetch_add(1, Ordering::AcqRel);
+    cache
+        .lock()
+        .expect("peer read cache mutex poisoned")
+        .remove(key);
 }
 
 fn advise_for_read_class(
@@ -2620,6 +2637,48 @@ mod tests {
             .unwrap();
 
         assert_eq!(read, bytes::Bytes::from_static(b"compat"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_file_pool_rejects_an_ancestor_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("payload.bin");
+        std::fs::write(&outside_file, b"outside").unwrap();
+        symlink(outside.path(), root.path().join("alias")).unwrap();
+        let path = root.path().join("alias/payload.bin");
+        let sched = MountScheduler::new(StorageRootId::new(), &SchedulerConfig::default());
+
+        let error = scheduled_read(&sched, IoClass::Foreground, &path, 0, 7)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            StorageError::Io { source, .. }
+                if matches!(source.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR))
+        ));
+        assert_eq!(std::fs::read(outside_file).unwrap(), b"outside");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepare_file_does_not_create_through_an_ancestor_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), root.path().join("alias")).unwrap();
+        let path = root.path().join("alias/new/nested/file.bin");
+        let sched = MountScheduler::new(StorageRootId::new(), &SchedulerConfig::default());
+
+        assert!(sched
+            .prepare_file(&path, 16, PreallocationMode::Sparse)
+            .await
+            .is_err());
+        assert!(!outside.path().join("new").exists());
     }
 
     #[tokio::test]
@@ -3157,6 +3216,46 @@ mod tests {
             stats.backend_bytes_read_by_class[class_index(IoClass::PeerRead)],
             16
         );
+    }
+
+    #[tokio::test]
+    async fn peer_read_readahead_cache_is_invalidated_by_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coherent.bin");
+        std::fs::write(&path, b"old-data").unwrap();
+        let sched = MountScheduler::new(
+            StorageRootId::new(),
+            &SchedulerConfig {
+                profile: StorageProfile::Hdd,
+                storage_io: StorageIoConfig {
+                    peer_read_readahead_bytes: 8,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let first = scheduled_read(&sched, IoClass::PeerRead, &path, 0, 3)
+            .await
+            .unwrap();
+        assert_eq!(&first[..], b"old");
+
+        scheduled_write(
+            &sched,
+            IoClass::PeerWrite,
+            &path,
+            0,
+            bytes::Bytes::from_static(b"new"),
+            false,
+        )
+        .await
+        .unwrap();
+
+        let after_write = scheduled_read(&sched, IoClass::PeerRead, &path, 0, 3)
+            .await
+            .unwrap();
+        assert_eq!(&after_write[..], b"new");
+        assert_eq!(sched.stats().peer_read_cache_hits, 0);
     }
 
     #[tokio::test]

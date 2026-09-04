@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
 
 use super::client::{Client, XmlValue};
@@ -35,22 +35,22 @@ impl Client {
             .await
             .with_context(|| format!("f.multicall {hash}"))?;
 
-        let rows = result.into_array();
+        let rows = result.try_into_array()?;
         let mut out = Vec::with_capacity(rows.len());
         for (i, row) in rows.into_iter().enumerate() {
-            let f = row.into_array();
+            let f = row.try_into_array()?;
             if f.len() < 7 {
-                continue;
+                bail!("rTorrent file row {i} returned {} fields", f.len());
             }
             out.push(RawFile {
                 index: i,
-                path: sf(&f, 0),
-                size_bytes: nf(&f, 1),
-                size_chunks: nf(&f, 2),
-                completed_chunks: nf(&f, 3),
-                priority: nf(&f, 4),
-                is_created: bf(&f, 5),
-                is_open: bf(&f, 6),
+                path: required_path(&f, 0)?,
+                size_bytes: required_i64(&f, 1, "f.size_bytes")?,
+                size_chunks: required_i64(&f, 2, "f.size_chunks")?,
+                completed_chunks: required_i64(&f, 3, "f.completed_chunks")?,
+                priority: required_i64(&f, 4, "f.priority")?,
+                is_created: required_bool(&f, 5, "f.is_created")?,
+                is_open: required_bool(&f, 6, "f.is_open")?,
             });
         }
         Ok(out)
@@ -63,6 +63,9 @@ impl Client {
         file_index: usize,
         priority: i64,
     ) -> Result<()> {
+        if !(0..=2).contains(&priority) {
+            bail!("rTorrent file priority must be between 0 and 2");
+        }
         // f.priority.set takes hash, index, priority
         self.call(
             "f.priority.set",
@@ -86,12 +89,25 @@ impl Client {
     }
 }
 
-fn sf(f: &[XmlValue], i: usize) -> String {
-    f.get(i).and_then(|v| v.as_str()).unwrap_or("").to_owned()
+fn required_path(fields: &[XmlValue], index: usize) -> Result<String> {
+    fields
+        .get(index)
+        .and_then(XmlValue::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("rTorrent response omitted valid f.path"))
 }
-fn nf(f: &[XmlValue], i: usize) -> i64 {
-    f.get(i).and_then(|v| v.as_i64()).unwrap_or(0)
+
+fn required_i64(fields: &[XmlValue], index: usize, name: &str) -> Result<i64> {
+    fields
+        .get(index)
+        .and_then(XmlValue::as_i64)
+        .ok_or_else(|| anyhow!("rTorrent response omitted valid {name}"))
 }
-fn bf(f: &[XmlValue], i: usize) -> bool {
-    f.get(i).and_then(|v| v.as_bool()).unwrap_or(false)
+
+fn required_bool(fields: &[XmlValue], index: usize, name: &str) -> Result<bool> {
+    fields
+        .get(index)
+        .and_then(XmlValue::as_bool)
+        .ok_or_else(|| anyhow!("rTorrent response omitted valid {name}"))
 }

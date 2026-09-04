@@ -200,8 +200,9 @@ pub struct TorrentFileV2 {
     pub length: u64,
     pub path: SafeRelPath,
     pub offset: u64,
-    /// SHA-256 merkle root of this file's 16 KiB leaf hashes.
-    pub pieces_root: [u8; 32],
+    /// SHA-256 merkle root of this file's 16 KiB leaf hashes. BEP 52 omits
+    /// this field for empty files.
+    pub pieces_root: Option<[u8; 32]>,
     /// BEP 47 padding file (`"attr"` contains `'p'`). See
     /// [`TorrentFileV1::pad`].
     pub pad: bool,

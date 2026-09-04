@@ -1,4 +1,4 @@
-use rusqlite::{params, params_from_iter, types::Value, Connection, Row};
+use rusqlite::{params, params_from_iter, types::Value, Connection, Row, Transaction};
 use serde::{Deserialize, Serialize};
 
 use crate::error::DbError;
@@ -50,6 +50,10 @@ impl JobEventRow {
 }
 
 pub fn append_session_event(conn: &Connection, event: &SessionEventRow) -> Result<i64, DbError> {
+    // Session-event payloads are projected by every API surface. Reject bad
+    // JSON at the write boundary so a later read cannot turn durable
+    // corruption into a dropped or empty-looking event.
+    serde_json::from_str::<serde_json::Value>(&event.payload)?;
     let level = session_event_level(event);
     conn.execute(
         "INSERT INTO session_events (occurred_at, info_hash, kind, message, payload, level)
@@ -66,8 +70,49 @@ pub fn append_session_event(conn: &Connection, event: &SessionEventRow) -> Resul
     Ok(conn.last_insert_rowid())
 }
 
+/// Append a session event inside the caller's transaction. Runtime state
+/// changes that are exposed through the event stream use this form so a
+/// projection and the event describing it cannot commit independently.
+pub fn append_session_event_in_tx(
+    tx: &Transaction<'_>,
+    event: &SessionEventRow,
+) -> Result<i64, DbError> {
+    serde_json::from_str::<serde_json::Value>(&event.payload)?;
+    let level = session_event_level(event);
+    tx.execute(
+        "INSERT INTO session_events (occurred_at, info_hash, kind, message, payload, level)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            event.occurred_at,
+            event.info_hash,
+            event.kind,
+            event.message,
+            event.payload,
+            level,
+        ],
+    )?;
+    Ok(tx.last_insert_rowid())
+}
+
 pub fn prune_session_events(conn: &Connection, retention: usize) -> Result<usize, DbError> {
     let deleted = conn.execute(
+        "DELETE FROM session_events
+         WHERE event_id NOT IN (
+             SELECT event_id FROM session_events ORDER BY event_id DESC LIMIT ?1
+         )",
+        params![retention.max(1) as i64],
+    )?;
+    Ok(deleted)
+}
+
+/// Prune session events inside the same transaction as a newly appended
+/// event. Retention maintenance must not create a second commit boundary for
+/// an otherwise atomic projection update.
+pub fn prune_session_events_in_tx(
+    tx: &Transaction<'_>,
+    retention: usize,
+) -> Result<usize, DbError> {
+    let deleted = tx.execute(
         "DELETE FROM session_events
          WHERE event_id NOT IN (
              SELECT event_id FROM session_events ORDER BY event_id DESC LIMIT ?1
@@ -192,6 +237,23 @@ pub fn append_job_event(conn: &Connection, event: &JobEventRow) -> Result<i64, D
     Ok(conn.last_insert_rowid())
 }
 
+/// Append a job event inside a caller-owned transaction so it can commit with
+/// the job projection it describes.
+pub fn append_job_event_in_tx(tx: &Transaction<'_>, event: &JobEventRow) -> Result<i64, DbError> {
+    tx.execute(
+        "INSERT INTO job_events (job_id, occurred_at, kind, message, payload)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            event.job_id,
+            event.occurred_at,
+            event.kind,
+            event.message,
+            event.payload,
+        ],
+    )?;
+    Ok(tx.last_insert_rowid())
+}
+
 pub fn list_job_events(
     conn: &Connection,
     job_id: &str,
@@ -208,6 +270,25 @@ pub fn list_job_events(
         .query_map(params![job_id, limit.max(1) as i64], JobEventRow::from_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+/// Returns the oldest event for a job. Recovery uses this to retrieve the
+/// original storage-plan context without loading an unbounded event history;
+/// the newest checkpoint and the oldest queued event are the only records it
+/// needs to reconstruct a plan.
+pub fn first_job_event(conn: &Connection, job_id: &str) -> Result<Option<JobEventRow>, DbError> {
+    let mut stmt = conn.prepare(
+        "SELECT event_id, job_id, occurred_at, kind, message, payload
+         FROM job_events
+         WHERE job_id = ?1
+         ORDER BY event_id ASC
+         LIMIT 1",
+    )?;
+    let mut rows = stmt.query(params![job_id])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(JobEventRow::from_row(row)?)),
+        None => Ok(None),
+    }
 }
 
 #[cfg(test)]
@@ -238,6 +319,24 @@ mod tests {
         let events = list_session_events(&conn, Some(&"a".repeat(40)), 10).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "torrent_added");
+    }
+
+    #[test]
+    fn append_session_event_rejects_invalid_json_payload() {
+        let conn = setup();
+        let error = append_session_event(
+            &conn,
+            &SessionEventRow {
+                event_id: None,
+                occurred_at: 10,
+                info_hash: None,
+                kind: "corrupt".into(),
+                message: None,
+                payload: "{not-json}".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, DbError::Json(_)));
     }
 
     #[test]
@@ -332,5 +431,9 @@ mod tests {
         let events = list_job_events(&conn, "job-1", 10).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "job_queued");
+        assert_eq!(
+            first_job_event(&conn, "job-1").unwrap(),
+            Some(events[0].clone())
+        );
     }
 }

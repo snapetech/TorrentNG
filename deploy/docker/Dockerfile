@@ -14,7 +14,7 @@ RUN printf '%s\n' \
     '[workspace.package]' \
     'version = "0.1.0"' \
     'edition = "2021"' \
-    'rust-version = "1.80"' \
+    'rust-version = "1.97"' \
     'license = "GPL-3.0-or-later"' \
     '' \
     '[workspace.dependencies]' \

@@ -1,6 +1,6 @@
 use axum::{
-    body::Body,
-    extract::State,
+    body::{to_bytes, Body},
+    extract::{DefaultBodyLimit, State},
     http::{header, HeaderMap, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -25,6 +25,10 @@ use crate::{
         upsert_category, upsert_json_map,
     },
     state::AppState,
+};
+use rt_api_model::{
+    csrf_request_allowed, has_session_cookie, request_fingerprint, valid_idempotency_key,
+    CachedResponse, IdempotencyClaim, MAX_IDEMPOTENCY_BODY_BYTES,
 };
 
 pub fn build_router(state: AppState) -> Router {
@@ -171,7 +175,142 @@ pub fn build_router(state: AppState) -> Router {
             state.clone(),
             native_auth_guard,
         ))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            native_idempotency_guard,
+        ))
+        // The metainfo parser accepts up to 64 MiB of raw torrent data. The
+        // native JSON/base64 envelope is larger, so keep the transport bound
+        // explicit instead of relying on axum's small default.
+        .layer(DefaultBodyLimit::max(96 * 1024 * 1024))
         .with_state(state)
+}
+
+/// Coalesce retries of successful native HTTP mutations. Durable engine jobs
+/// cover restart recovery; this bounded middleware covers the client timeout
+/// window and rejects accidental reuse of a key for a different request.
+async fn native_idempotency_guard(
+    State(state): State<AppState>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    if !matches!(
+        req.method(),
+        &axum::http::Method::POST
+            | &axum::http::Method::PUT
+            | &axum::http::Method::PATCH
+            | &axum::http::Method::DELETE
+    ) || req.uri().path().ends_with("/auth/login")
+        || req.uri().path().ends_with("/auth/logout")
+    {
+        return next.run(req).await;
+    }
+
+    let Some(key) = req
+        .headers()
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+    else {
+        return next.run(req).await;
+    };
+    if !valid_idempotency_key(&key) {
+        return (StatusCode::BAD_REQUEST, "invalid Idempotency-Key").into_response();
+    }
+
+    let (mut parts, body) = req.into_parts();
+    let body = match to_bytes(body, MAX_IDEMPOTENCY_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    };
+    let fingerprint =
+        request_fingerprint(parts.method.as_str(), &parts.uri.to_string(), body.as_ref());
+    parts.headers.remove(header::CONTENT_LENGTH);
+    let req = Request::from_parts(parts, Body::from(body.to_vec()));
+
+    loop {
+        match state.idempotency.claim(&key, fingerprint) {
+            IdempotencyClaim::Execute => break,
+            IdempotencyClaim::Wait(notify) => {
+                notify.notified().await;
+            }
+            IdempotencyClaim::Replay(cached) => return replay_response(cached),
+            IdempotencyClaim::Conflict => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "Idempotency-Key was already used for a different request",
+                )
+                    .into_response();
+            }
+            IdempotencyClaim::Saturated => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "idempotency store is saturated; retry later",
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let mut execution = state.idempotency.execution_guard(&key, fingerprint);
+    let response = next.run(req).await;
+    let (parts, body) = response.into_parts();
+    let body = match to_bytes(body, MAX_IDEMPOTENCY_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "mutation response exceeded the idempotency response limit",
+            )
+                .into_response();
+        }
+    };
+    let response = Response::from_parts(parts.clone(), Body::from(body.clone()));
+    if parts.status.is_success() {
+        let headers = parts
+            .headers
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.as_bytes().to_vec()))
+            .collect();
+        execution.complete(CachedResponse {
+            status: parts.status.as_u16(),
+            headers,
+            body: body.to_vec(),
+        });
+    } else {
+        execution.abandon();
+    }
+    response
+}
+
+fn replay_response(cached: CachedResponse) -> Response {
+    // Keep the bound explicit at the final user-controlled allocation site as
+    // well as at request capture. This protects against corrupted/injected
+    // in-memory cache entries and makes the idempotency replay contract
+    // auditable by static analysis.
+    if cached.body.len() > MAX_IDEMPOTENCY_BODY_BYTES {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "cached idempotency response exceeded the replay limit",
+        )
+            .into_response();
+    }
+    let mut response = Response::new(Body::from(cached.body));
+    *response.status_mut() = StatusCode::from_u16(cached.status).unwrap_or(StatusCode::OK);
+    for (name, value) in cached.headers {
+        let Ok(name) = axum::http::HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        let Ok(value) = axum::http::HeaderValue::from_bytes(&value) else {
+            continue;
+        };
+        response.headers_mut().append(name, value);
+    }
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static("idempotency-replayed"),
+        axum::http::HeaderValue::from_static("true"),
+    );
+    response
 }
 
 async fn native_auth_guard(
@@ -180,11 +319,23 @@ async fn native_auth_guard(
     next: Next,
 ) -> Response {
     let path = req.uri().path();
-    if native_public_path(path)
-        || state.api_tokens.is_empty()
-        || native_presented_token(req.headers())
-            .is_some_and(|token| native_token_allowed(&state, &token))
+    if native_public_path(path) || state.api_tokens.is_empty() {
+        return next.run(req).await;
+    }
+
+    if native_bearer_token(req.headers()).is_some_and(|token| native_token_allowed(&state, &token))
     {
+        return next.run(req).await;
+    }
+    if native_presented_token(req.headers())
+        .is_some_and(|token| native_token_allowed(&state, &token))
+    {
+        if has_session_cookie(req.headers(), &["tng_session"])
+            && is_mutating_request(&req)
+            && !csrf_request_allowed(req.headers())
+        {
+            return (StatusCode::FORBIDDEN, "cross-site cookie mutation rejected").into_response();
+        }
         return next.run(req).await;
     }
 
@@ -194,6 +345,16 @@ async fn native_auth_guard(
         r#"{"code":"UNAUTHORIZED","message":"missing or invalid API token"}"#,
     )
         .into_response()
+}
+
+fn is_mutating_request(req: &Request<Body>) -> bool {
+    matches!(
+        *req.method(),
+        axum::http::Method::POST
+            | axum::http::Method::PUT
+            | axum::http::Method::PATCH
+            | axum::http::Method::DELETE
+    )
 }
 
 fn native_public_path(path: &str) -> bool {
@@ -208,17 +369,20 @@ fn native_token_allowed(state: &AppState, token: &str) -> bool {
 }
 
 fn native_presented_token(headers: &HeaderMap) -> Option<String> {
+    native_bearer_token(headers).or_else(|| {
+        headers
+            .get(header::COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(native_session_cookie)
+    })
+}
+
+fn native_bearer_token(headers: &HeaderMap) -> Option<String> {
     headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .map(str::to_owned)
-        .or_else(|| {
-            headers
-                .get(header::COOKIE)
-                .and_then(|value| value.to_str().ok())
-                .and_then(native_session_cookie)
-        })
 }
 
 fn native_session_cookie(cookie: &str) -> Option<String> {

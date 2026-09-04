@@ -3,7 +3,7 @@ use std::{net::SocketAddr, path::PathBuf};
 
 use tokio::sync::oneshot;
 
-use rt_metainfo::{MagnetLink, TorrentMeta};
+use rt_metainfo::{MagnetLink, TorrentMeta, TorrentMetaV1};
 use rt_metrics::{MemoryClass, MemoryLease, ResourceSnapshot};
 use rt_storage::{StorageIoStats, StoragePlan, STORAGE_LATENCY_BUCKET_COUNT};
 
@@ -11,6 +11,40 @@ use crate::torrent_task::TorrentCmd;
 use crate::TorrentActivityTier;
 
 pub type CmdResult<T> = Result<T, String>;
+
+/// Work that should be applied after a dormant torrent has been reconstructed
+/// by the blocking promotion worker. Keeping the reply sender in the action
+/// lets the engine actor return to its command loop while metainfo is read and
+/// parsed, without losing the original API request.
+#[derive(Debug)]
+pub enum TorrentPromotionAction {
+    Resume {
+        reply: oneshot::Sender<CmdResult<()>>,
+    },
+    Recheck {
+        job_id: Option<String>,
+        reply: oneshot::Sender<CmdResult<()>>,
+    },
+    Reannounce {
+        reply: oneshot::Sender<CmdResult<()>>,
+    },
+    AddPeers {
+        peers: Vec<SocketAddr>,
+        reply: oneshot::Sender<CmdResult<()>>,
+    },
+    IncomingPeer {
+        command: Box<TorrentCmd>,
+    },
+    TrackerReannounce,
+}
+
+#[derive(Debug)]
+pub struct PreparedTorrentTaskData {
+    pub meta: TorrentMetaV1,
+    pub save_path: PathBuf,
+    pub info_hash: [u8; 20],
+    pub is_private: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineTorrentFile {
@@ -69,6 +103,8 @@ pub struct EngineStats {
     pub download_rate: i64,
     /// Aggregate current peer upload rate in bytes per second.
     pub upload_rate: i64,
+    /// Aggregate number of currently connected peers across active torrents.
+    pub connected_peers: u64,
     pub jobs_active: u64,
     /// Storage-plan requests currently retained by the background dispatcher,
     /// including queued, paused, and running requests.
@@ -81,6 +117,8 @@ pub struct EngineStats {
     pub storage_jobs_capacity: u64,
     /// Configured blocking storage worker count.
     pub storage_workers: u64,
+    /// Whether the storage-job supervisor is live and accepting work.
+    pub storage_workers_healthy: u64,
     pub trackers_total: u64,
     pub trackers_working: u64,
     pub trackers_warning: u64,
@@ -167,10 +205,12 @@ pub struct EngineStats {
 }
 
 /// Liveness of the engine-owned dependency boundaries. A healthy engine
-/// actor is not sufficient if its storage supervisor or DHT task has already
-/// died; the API health endpoint exposes these states separately.
+/// actor is not sufficient if its database worker, storage supervisor, or DHT
+/// task has already died; the API health endpoint exposes these states
+/// separately.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EngineSubsystemHealth {
+    pub db_worker_healthy: bool,
     pub storage_workers_healthy: bool,
     pub dht_enabled: bool,
     pub dht_healthy: bool,
@@ -295,6 +335,7 @@ impl EngineStats {
         self.torrent_tasks_active = self.torrent_tasks_active.saturating_add(1);
         self.download_rate = self.download_rate.saturating_add(runtime.download_rate);
         self.upload_rate = self.upload_rate.saturating_add(runtime.upload_rate);
+        self.connected_peers = self.connected_peers.saturating_add(runtime.connected_peers);
         self.fastresume_dirty_pieces = self
             .fastresume_dirty_pieces
             .saturating_add(runtime.fastresume_dirty_pieces);
@@ -699,6 +740,8 @@ pub struct EnginePeerSnapshot {
     pub uploaded: u64,
 }
 
+pub type ActiveTorrentPeers = Vec<(String, Vec<EnginePeerSnapshot>)>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineWebseedSnapshot {
     pub url: String,
@@ -721,6 +764,24 @@ pub struct EngineTrackerSnapshot {
     pub seeders: Option<i64>,
     pub leechers: Option<i64>,
     pub completed: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct EngineTrackerHealth {
+    pub tracker: String,
+    pub torrent_count: u64,
+    pub active_count: u64,
+    pub complete_count: u64,
+    pub error_count: u64,
+    pub seed_count: u64,
+    pub peer_count: u64,
+    pub last_updated: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineCategory {
+    pub name: String,
+    pub save_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -756,6 +817,17 @@ pub enum EngineCmd {
         tags: Vec<String>,
         reply: oneshot::Sender<CmdResult<String>>, // returns info_hash hex
     },
+    /// Add a torrent from raw metainfo. Parsing and blob persistence are
+    /// performed by a detached blocking worker before the engine actor
+    /// installs the durable/session projection.
+    AddTorrentRaw {
+        raw: Vec<u8>,
+        save_path: Option<PathBuf>,
+        paused: bool,
+        category: Option<String>,
+        tags: Vec<String>,
+        reply: oneshot::Sender<CmdResult<String>>,
+    },
     /// Add a magnet as a metadata-pending entry.
     AddMagnet {
         magnet: MagnetLink,
@@ -765,19 +837,65 @@ pub enum EngineCmd {
         tags: Vec<String>,
         reply: oneshot::Sender<CmdResult<String>>,
     },
+    /// Internal completion after raw metainfo parsing. The actor performs a
+    /// duplicate check/reservation before starting blob persistence.
+    PreparedTorrentMeta {
+        prepared: CmdResult<Box<TorrentMeta>>,
+        save_path: Option<PathBuf>,
+        paused: bool,
+        category: Option<String>,
+        tags: Vec<String>,
+        reply: oneshot::Sender<CmdResult<String>>,
+    },
+    /// Internal completion after detached torrent-blob persistence.
+    PreparedTorrentAdd {
+        meta: Box<TorrentMeta>,
+        blob: CmdResult<()>,
+        save_path: Option<PathBuf>,
+        paused: bool,
+        category: Option<String>,
+        tags: Vec<String>,
+        reply: oneshot::Sender<CmdResult<String>>,
+    },
     /// Internal completion from the magnet metadata worker.
     CompleteMagnet { info_hash: String, raw: Vec<u8> },
+    /// Internal completion after magnet metainfo parsing has finished on a
+    /// blocking worker. The validated blob is handed to a detached writer;
+    /// only the durable/session projection remains serialized by the actor.
+    PreparedMagnetMetadata {
+        info_hash: String,
+        raw: Vec<u8>,
+        meta: CmdResult<TorrentMeta>,
+    },
+    /// Internal completion after the validated magnet blob has been written
+    /// by a detached blocking worker.
+    PreparedMagnetBlob {
+        info_hash: String,
+        meta: CmdResult<TorrentMeta>,
+        blob: CmdResult<()>,
+    },
     /// Route a peer whose handshake identified a currently dormant torrent.
     /// The engine promotes the torrent before forwarding this command.
     IncomingPeer {
         info_hash: String,
         command: TorrentCmd,
     },
-    /// Remove a torrent. delete_files removes content from disk.
+    /// Add endpoints to the engine-wide peer ban set used by both active
+    /// torrent tasks and taskless promotion paths.
+    BanPeers {
+        peers: Vec<SocketAddr>,
+        reply: oneshot::Sender<CmdResult<()>>,
+    },
+    /// Read the durable engine-wide peer ban policy.
+    GetBannedPeers {
+        reply: oneshot::Sender<CmdResult<Vec<SocketAddr>>>,
+    },
+    /// Remove a torrent. delete_files removes content from disk through a
+    /// durable background job; the optional reply value is that job id.
     RemoveTorrent {
         info_hash: String,
         delete_files: bool,
-        reply: oneshot::Sender<CmdResult<()>>,
+        reply: oneshot::Sender<CmdResult<Option<String>>>,
     },
     /// Pause a running torrent.
     PauseTorrent {
@@ -829,12 +947,73 @@ pub enum EngineCmd {
         info_hash: String,
         reply: oneshot::Sender<CmdResult<Vec<EngineTrackerSnapshot>>>,
     },
+    /// Read a grouped tracker-health snapshot from the normalized database.
+    /// The potentially large query runs on a blocking worker.
+    GetTrackerHealth {
+        reply: oneshot::Sender<CmdResult<Vec<EngineTrackerHealth>>>,
+    },
+    /// Find persisted torrent hashes whose normalized tracker URL contains a
+    /// literal substring. The query runs off the actor so automation filters
+    /// do not monopolize the command loop on a large session.
+    ListTorrentHashesByTracker {
+        tracker: String,
+        reply: oneshot::Sender<CmdResult<Vec<String>>>,
+    },
+    /// Read a small durable control-plane setting. Native API auxiliary
+    /// stores use this boundary instead of keeping restart-sensitive state in
+    /// the HTTP process.
+    GetSetting {
+        key: String,
+        reply: oneshot::Sender<CmdResult<Option<String>>>,
+    },
+    /// Atomically replace a small durable control-plane setting.
+    SetSetting {
+        key: String,
+        value: String,
+        reply: oneshot::Sender<CmdResult<()>>,
+    },
     /// Update category and/or tags, then persist the session row.
     UpdateTorrentLabels {
         info_hash: String,
         category: Option<Option<String>>,
         add_tags: Vec<String>,
         remove_tags: Vec<String>,
+        reply: oneshot::Sender<CmdResult<()>>,
+    },
+    /// Read durable qBittorrent-style category definitions.
+    ListCategories {
+        reply: oneshot::Sender<CmdResult<Vec<EngineCategory>>>,
+    },
+    /// Create or update a durable category definition.
+    CreateCategory {
+        name: String,
+        save_path: Option<String>,
+        reply: oneshot::Sender<CmdResult<()>>,
+    },
+    /// Rename a durable category and all torrent labels in one transaction.
+    RenameCategory {
+        old_name: String,
+        new_name: String,
+        save_path: Option<String>,
+        reply: oneshot::Sender<CmdResult<()>>,
+    },
+    /// Remove category definitions and clear matching torrent labels.
+    RemoveCategories {
+        names: Vec<String>,
+        reply: oneshot::Sender<CmdResult<()>>,
+    },
+    /// Read durable qBittorrent-style global tag definitions.
+    ListTags {
+        reply: oneshot::Sender<CmdResult<Vec<String>>>,
+    },
+    /// Create durable qBittorrent-style global tag definitions.
+    CreateTags {
+        names: Vec<String>,
+        reply: oneshot::Sender<CmdResult<()>>,
+    },
+    /// Remove durable global tags and clear matching torrent labels.
+    RemoveTags {
+        names: Vec<String>,
         reply: oneshot::Sender<CmdResult<()>>,
     },
     /// Update user-visible torrent fields stored in the session row.
@@ -852,6 +1031,26 @@ pub enum EngineCmd {
         save_path: Option<PathBuf>,
         reply: oneshot::Sender<CmdResult<Option<String>>>,
     },
+    /// Internal completion after filesystem move planning has finished off
+    /// the engine actor. The actor only validates that the request is still
+    /// current, quiesces the torrent, and queues the already-built plan.
+    PreparedTorrentFields {
+        info_hash: String,
+        name: Option<String>,
+        current_name: String,
+        current_save_path: PathBuf,
+        save_path: PathBuf,
+        plan: CmdResult<Option<StoragePlan>>,
+        reply: oneshot::Sender<CmdResult<Option<String>>>,
+    },
+    /// Internal completion after a dormant torrent's metainfo has been read
+    /// and parsed on a blocking worker. The pending actions are retained by
+    /// the engine so concurrent lifecycle requests coalesce onto one
+    /// promotion instead of spawning duplicate torrent tasks.
+    PreparedTorrentTask {
+        info_hash: String,
+        prepared: CmdResult<PreparedTorrentTaskData>,
+    },
     /// Execute a durable storage plan through the engine job table.
     ExecuteStoragePlan {
         operation: String,
@@ -865,6 +1064,21 @@ pub enum EngineCmd {
         job_id: String,
         affected_torrents: Vec<(String, bool)>,
         succeeded: bool,
+        terminal_state: String,
+        error: Option<String>,
+        completed_steps: Vec<usize>,
+    },
+    /// Internal completion notification for asynchronous torrent payload
+    /// deletion. Unlike a generic plan, successful deletion finalizes any
+    /// metadata left behind by a crash between job admission and removal.
+    StorageDeleteFinished {
+        job_id: String,
+        info_hash: String,
+        succeeded: bool,
+        terminal_state: String,
+        error: Option<String>,
+        completed_steps: Vec<usize>,
+        quiesced: Vec<(String, bool)>,
     },
     /// Internal completion notification for an asynchronous save-path move.
     StorageMoveFinished {
@@ -875,6 +1089,22 @@ pub enum EngineCmd {
         save_path: PathBuf,
         quiesced: Option<bool>,
         succeeded: bool,
+        terminal_state: String,
+        error: Option<String>,
+        completed_steps: Vec<usize>,
+        retry_attempt: u8,
+    },
+    /// Internal completion notification for a pure-v2 recheck executed off
+    /// the engine actor. File-root verification can read a large payload and
+    /// must not occupy the command loop until it finishes.
+    PureV2RecheckFinished {
+        info_hash: String,
+        job_id: Option<String>,
+        total_length: u64,
+        total_files: i64,
+        done: i64,
+        invalid_files: Vec<i64>,
+        error: Option<String>,
     },
     /// List active durable jobs.
     ListJobs {
@@ -926,6 +1156,12 @@ pub enum EngineCmd {
         info_hash: String,
         reply: oneshot::Sender<CmdResult<Vec<EnginePeerSnapshot>>>,
     },
+    /// Read peers from currently promoted torrent tasks. Dormant torrents
+    /// have no runtime peers, so this deliberately avoids traversing the
+    /// entire session registry for compatibility log endpoints.
+    GetActiveTorrentPeers {
+        reply: oneshot::Sender<CmdResult<ActiveTorrentPeers>>,
+    },
     GetTorrentWebseeds {
         info_hash: String,
         reply: oneshot::Sender<CmdResult<Vec<EngineWebseedSnapshot>>>,
@@ -944,6 +1180,14 @@ pub enum EngineCmd {
         features: EngineNetworkFeatures,
         reply: oneshot::Sender<CmdResult<()>>,
     },
+    /// Persist and apply the HTTP user agent used by tracker and webseed
+    /// clients. This remains an engine command so the native API cannot
+    /// report a process-local setting as applied while the engine keeps using
+    /// a different value.
+    SetUserAgent {
+        user_agent: String,
+        reply: oneshot::Sender<CmdResult<()>>,
+    },
     GetQueuePriority {
         info_hash: String,
         reply: oneshot::Sender<CmdResult<i32>>,
@@ -957,6 +1201,13 @@ pub enum EngineCmd {
     GetStats {
         reply: oneshot::Sender<CmdResult<EngineStats>>,
     },
+    /// Internal completion from the detached stats collector. The collector
+    /// owns all waits on SQLite, DHT, and torrent actors; the engine actor only
+    /// installs the finished immutable snapshot.
+    StatsRefreshComplete { stats: Box<EngineStats> },
+    /// Internal failure from the detached stats collector. A stale snapshot is
+    /// still served, but the next request may schedule another refresh.
+    StatsRefreshFailed { error: String },
     /// Probe engine-owned dependency seams without performing a full stats
     /// collection.
     GetHealth {
@@ -1089,6 +1340,7 @@ mod tests {
         assert_eq!(stats.storage_write_ops, 27);
         assert_eq!(stats.download_rate, 30);
         assert_eq!(stats.upload_rate, 40);
+        assert_eq!(stats.connected_peers, 2);
         assert_eq!(stats.storage_bytes_read, 28);
         assert_eq!(stats.storage_bytes_written, 29);
         assert_eq!(stats.storage_read_ops_by_class[0], 25);

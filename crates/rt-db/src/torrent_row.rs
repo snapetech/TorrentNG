@@ -1,6 +1,6 @@
 /// Torrent record stored in the `torrents` table.
-use rusqlite::{params, Connection, Row};
-use serde::{Deserialize, Serialize};
+use rusqlite::{params, types::Type, Connection, Row};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::error::DbError;
 
@@ -30,9 +30,9 @@ pub struct TorrentRow {
 impl TorrentRow {
     fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let tags_json: String = row.get(8)?;
-        let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+        let tags: Vec<String> = decode_json_column(&tags_json, 8)?;
         let trackers_json: String = row.get(15)?;
-        let trackers: Vec<String> = serde_json::from_str(&trackers_json).unwrap_or_default();
+        let trackers: Vec<String> = decode_json_column(&trackers_json, 15)?;
         Ok(TorrentRow {
             info_hash: row.get(0)?,
             name: row.get(1)?,
@@ -52,6 +52,12 @@ impl TorrentRow {
             trackers,
         })
     }
+}
+
+fn decode_json_column<T: DeserializeOwned>(value: &str, column: usize) -> rusqlite::Result<T> {
+    serde_json::from_str(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(column, Type::Text, Box::new(error))
+    })
 }
 
 pub fn upsert(conn: &Connection, row: &TorrentRow) -> Result<(), DbError> {
@@ -204,6 +210,81 @@ pub fn list_categories(conn: &Connection) -> Result<Vec<String>, DbError> {
     Ok(categories)
 }
 
+/// Return the durable category definitions, including their optional default
+/// save paths.  Torrent labels are deliberately kept separate from these
+/// definitions: a category can exist before any torrent uses it.
+pub fn list_category_definitions(
+    conn: &Connection,
+) -> Result<Vec<(String, Option<String>)>, DbError> {
+    let mut stmt =
+        conn.prepare("SELECT name, save_path FROM torrent_categories ORDER BY name ASC")?;
+    let categories = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<(String, Option<String>)>>>()?;
+    Ok(categories)
+}
+
+pub fn create_category_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    name: &str,
+    save_path: Option<&str>,
+    created_at: i64,
+) -> Result<(), DbError> {
+    tx.execute(
+        "INSERT INTO torrent_categories (name, save_path, created_at)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(name) DO UPDATE SET save_path=excluded.save_path",
+        params![name, save_path, created_at],
+    )?;
+    Ok(())
+}
+
+/// Rename a category definition and all durable torrent labels in one
+/// transaction.  Keeping these updates together prevents a restart from
+/// exposing a category definition that disagrees with the torrent rows.
+pub fn rename_category_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    old_name: &str,
+    new_name: &str,
+    save_path: Option<&str>,
+) -> Result<(), DbError> {
+    if old_name != new_name {
+        tx.execute(
+            "UPDATE torrents SET category = ?2 WHERE category = ?1",
+            params![old_name, new_name],
+        )?;
+        tx.execute(
+            "UPDATE torrent_categories
+             SET name = ?2, save_path = ?3
+             WHERE name = ?1",
+            params![old_name, new_name, save_path],
+        )?;
+    } else {
+        tx.execute(
+            "UPDATE torrent_categories SET save_path = ?2 WHERE name = ?1",
+            params![old_name, save_path],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn remove_categories_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    names: &[String],
+) -> Result<(), DbError> {
+    for name in names {
+        tx.execute(
+            "UPDATE torrents SET category = NULL WHERE category = ?1",
+            params![name],
+        )?;
+        tx.execute(
+            "DELETE FROM torrent_categories WHERE name = ?1",
+            params![name],
+        )?;
+    }
+    Ok(())
+}
+
 pub fn get(conn: &Connection, info_hash: &str) -> Result<TorrentRow, DbError> {
     conn.query_row(
         "SELECT info_hash, name, total_length, piece_length, piece_count, is_private,
@@ -221,6 +302,14 @@ pub fn get(conn: &Connection, info_hash: &str) -> Result<TorrentRow, DbError> {
 
 pub fn delete(conn: &Connection, info_hash: &str) -> Result<bool, DbError> {
     let n = conn.execute(
+        "DELETE FROM torrents WHERE info_hash = ?1",
+        params![info_hash],
+    )?;
+    Ok(n > 0)
+}
+
+pub fn delete_in_tx(tx: &rusqlite::Transaction<'_>, info_hash: &str) -> Result<bool, DbError> {
+    let n = tx.execute(
         "DELETE FROM torrents WHERE info_hash = ?1",
         params![info_hash],
     )?;
@@ -312,6 +401,39 @@ mod tests {
     }
 
     #[test]
+    fn category_definitions_are_durable_and_rename_cascades_labels() {
+        let mut conn = setup();
+        let row = sample();
+        upsert(&conn, &row).unwrap();
+        let tx = conn.transaction().unwrap();
+        create_category_in_tx(&tx, "movies", Some("/srv/movies"), row.added_at).unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(
+            list_category_definitions(&conn).unwrap(),
+            vec![("movies".to_owned(), Some("/srv/movies".to_owned()))]
+        );
+
+        let tx = conn.transaction().unwrap();
+        rename_category_in_tx(&tx, "movies", "films", Some("/srv/films")).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            get(&conn, &row.info_hash).unwrap().category.as_deref(),
+            Some("films")
+        );
+        assert_eq!(
+            list_category_definitions(&conn).unwrap(),
+            vec![("films".to_owned(), Some("/srv/films".to_owned()))]
+        );
+
+        let tx = conn.transaction().unwrap();
+        remove_categories_in_tx(&tx, &["films".to_owned()]).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(get(&conn, &row.info_hash).unwrap().category, None);
+        assert!(list_category_definitions(&conn).unwrap().is_empty());
+    }
+
+    #[test]
     fn upsert_replaces_normalized_tags() {
         let conn = setup();
         let mut row = sample();
@@ -375,5 +497,17 @@ mod tests {
         let paused = list_by_state(&conn, "paused").unwrap();
         assert_eq!(paused.len(), 1);
         assert_eq!(paused[0].info_hash, r1.info_hash);
+    }
+
+    #[test]
+    fn corrupt_serialized_labels_fail_closed() {
+        let conn = setup();
+        let row = sample();
+        upsert(&conn, &row).unwrap();
+        conn.execute("UPDATE torrents SET tags='not-json'", [])
+            .unwrap();
+
+        assert!(get(&conn, &row.info_hash).is_err());
+        assert!(list_all(&conn).is_err());
     }
 }

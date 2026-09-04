@@ -18,10 +18,13 @@
 //!   the destination rechecks.
 
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 
 use rt_db::{DbError, TorrentFileRow, TorrentRow, TorrentTrackerRow};
 use rt_fastresume::{FastresumeStore, PieceState};
+use rt_metainfo::{parse_torrent, TorrentMeta, MAX_TORRENT_BYTES};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -35,6 +38,8 @@ pub enum ExportError {
     Sqlite(#[from] rusqlite::Error),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("invalid torrent info hash for export: {0}")]
+    InvalidInfoHash(String),
 }
 
 /// Target client format for a reverse export.
@@ -169,17 +174,39 @@ pub fn gather(
     let mut skipped = Vec::new();
 
     for row in rows {
+        if !valid_info_hash(&row.info_hash) {
+            skipped.push(SkippedExport {
+                info_hash: row.info_hash.clone(),
+                reason: "invalid info hash; refusing to use it as a filesystem name".to_owned(),
+            });
+            continue;
+        }
         let blob_path = blob_dir.join(format!("{}.torrent", row.info_hash));
-        let raw_torrent = match std::fs::read(&blob_path) {
+        let raw_torrent = match read_torrent_blob(&blob_path) {
             Ok(bytes) => bytes,
-            Err(_) => {
+            Err(error) => {
+                let reason = if error.kind() == std::io::ErrorKind::NotFound {
+                    format!("missing .torrent blob at {}", blob_path.display())
+                } else {
+                    format!(
+                        "unable to read .torrent blob at {}: {error}",
+                        blob_path.display()
+                    )
+                };
                 skipped.push(SkippedExport {
                     info_hash: row.info_hash.clone(),
-                    reason: format!("missing .torrent blob at {}", blob_path.display()),
+                    reason,
                 });
                 continue;
             }
         };
+        if let Err(reason) = validate_torrent_blob(&row.info_hash, &raw_torrent) {
+            skipped.push(SkippedExport {
+                info_hash: row.info_hash.clone(),
+                reason,
+            });
+            continue;
+        }
         let files = rt_db::list_torrent_files(&conn, &row.info_hash)?;
         let trackers = rt_db::list_torrent_trackers(&conn, &row.info_hash)?;
 
@@ -351,6 +378,9 @@ impl ExportPlan {
         aggregate: &mut Vec<(Vec<u8>, Ben)>,
     ) -> Result<usize, ExportError> {
         let hash = &t.info_hash;
+        if !valid_info_hash(hash) {
+            return Err(ExportError::InvalidInfoHash(hash.clone()));
+        }
         match self.format {
             ExportFormat::Generic => {
                 std::fs::write(out_dir.join(format!("{hash}.torrent")), &t.raw_torrent)?;
@@ -424,8 +454,11 @@ impl ExportPlan {
             (b"paused".to_vec(), Ben::I(0)),
             (b"save_path".to_vec(), Ben::s(&t.row.save_path)),
             (b"qBt-savePath".to_vec(), Ben::s(&t.row.save_path)),
-            (b"total_uploaded".to_vec(), Ben::I(t.uploaded as i64)),
-            (b"total_downloaded".to_vec(), Ben::I(t.downloaded as i64)),
+            (b"total_uploaded".to_vec(), Ben::I(bencode_i64(t.uploaded))),
+            (
+                b"total_downloaded".to_vec(),
+                Ben::I(bencode_i64(t.downloaded)),
+            ),
             (b"trackers".to_vec(), self.tracker_tiers(t)),
         ];
         if let Some(raw) = t.raw_info_hash() {
@@ -451,7 +484,7 @@ impl ExportPlan {
                             .map(|(piece, blocks)| {
                                 (
                                     piece.to_string().into_bytes(),
-                                    Ben::L(blocks.iter().map(|b| Ben::I(*b as i64)).collect()),
+                                    Ben::L(blocks.iter().map(|b| Ben::I(i64::from(*b))).collect()),
                                 )
                             })
                             .collect(),
@@ -471,8 +504,8 @@ impl ExportPlan {
             (b"corrupt".to_vec(), Ben::I(0)),
             (b"destination".to_vec(), Ben::s(&t.row.save_path)),
             (b"name".to_vec(), Ben::s(&t.row.name)),
-            (b"uploaded".to_vec(), Ben::I(t.uploaded as i64)),
-            (b"downloaded".to_vec(), Ben::I(t.downloaded as i64)),
+            (b"uploaded".to_vec(), Ben::I(bencode_i64(t.uploaded))),
+            (b"downloaded".to_vec(), Ben::I(bencode_i64(t.downloaded))),
             (b"progress".to_vec(), Ben::D(progress)),
         ])
     }
@@ -484,8 +517,8 @@ impl ExportPlan {
                 Ben::I(if t.is_complete() { 1 } else { 0 }),
             ),
             (b"directory".to_vec(), Ben::s(&t.row.save_path)),
-            (b"uploaded".to_vec(), Ben::I(t.uploaded as i64)),
-            (b"downloaded".to_vec(), Ben::I(t.downloaded as i64)),
+            (b"uploaded".to_vec(), Ben::I(bencode_i64(t.uploaded))),
+            (b"downloaded".to_vec(), Ben::I(bencode_i64(t.downloaded))),
         ];
         if let Some(cat) = &t.row.category {
             d.push((b"d.custom1".to_vec(), Ben::s(cat)));
@@ -500,8 +533,8 @@ impl ExportPlan {
         let mut d: Vec<(Vec<u8>, Ben)> = vec![
             (b"caption".to_vec(), Ben::s(&t.row.name)),
             (b"path".to_vec(), Ben::s(&t.row.save_path)),
-            (b"uploaded".to_vec(), Ben::I(t.uploaded as i64)),
-            (b"downloaded".to_vec(), Ben::I(t.downloaded as i64)),
+            (b"uploaded".to_vec(), Ben::I(bencode_i64(t.uploaded))),
+            (b"downloaded".to_vec(), Ben::I(bencode_i64(t.downloaded))),
         ];
         if let Some(cat) = &t.row.category {
             d.push((b"label".to_vec(), Ben::s(cat)));
@@ -515,8 +548,11 @@ impl ExportPlan {
     fn biglybt_entry(&self, t: &ExportTorrent) -> Ben {
         let mut d: Vec<(Vec<u8>, Ben)> = vec![
             (b"save_dir".to_vec(), Ben::s(&t.row.save_path)),
-            (b"uploadedEver".to_vec(), Ben::I(t.uploaded as i64)),
-            (b"downloadedEver".to_vec(), Ben::I(t.downloaded as i64)),
+            (b"uploadedEver".to_vec(), Ben::I(bencode_i64(t.uploaded))),
+            (
+                b"downloadedEver".to_vec(),
+                Ben::I(bencode_i64(t.downloaded)),
+            ),
         ];
         if let Some(have) = &t.have {
             d.push((
@@ -529,6 +565,10 @@ impl ExportPlan {
 }
 
 // --- minimal owned bencode encoder (sorts dict keys; canonical) ---
+
+fn bencode_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
 
 #[derive(Debug, Clone)]
 enum Ben {
@@ -601,13 +641,63 @@ fn have_to_bitfield(have: &[bool]) -> Vec<u8> {
 }
 
 fn decode_hex(text: &str) -> Option<Vec<u8>> {
-    if !text.len().is_multiple_of(2) {
+    if !valid_info_hash(text) {
         return None;
     }
     (0..text.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&text[i..i + 2], 16).ok())
         .collect()
+}
+
+fn valid_info_hash(text: &str) -> bool {
+    matches!(text.len(), 40 | 64) && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn read_torrent_blob(path: &Path) -> std::io::Result<Vec<u8>> {
+    let file = File::open(path)?;
+    let length = file.metadata()?.len();
+    if length > MAX_TORRENT_BYTES as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("torrent blob is {length} bytes, maximum is {MAX_TORRENT_BYTES}"),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(length).unwrap_or(MAX_TORRENT_BYTES));
+    let mut limited = file.take(MAX_TORRENT_BYTES as u64 + 1);
+    limited.read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_TORRENT_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("torrent blob grew beyond the {MAX_TORRENT_BYTES} byte limit"),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn validate_torrent_blob(info_hash: &str, raw: &[u8]) -> Result<(), String> {
+    let meta = parse_torrent(raw).map_err(|error| format!("invalid .torrent blob: {error}"))?;
+    let actual = match meta {
+        TorrentMeta::V1(meta) => hex_lower(&meta.info_hash),
+        TorrentMeta::Hybrid(meta, _) => hex_lower(&meta.info_hash),
+        TorrentMeta::V2(meta) => hex_lower(&meta.info_hash_v2),
+    };
+    if !actual.eq_ignore_ascii_case(info_hash) {
+        return Err(format!(
+            "torrent blob hash mismatch: database has {info_hash}, blob has {actual}"
+        ));
+    }
+    Ok(())
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -832,6 +922,42 @@ mod tests {
         assert_eq!(plan.torrent_count(), 0);
         assert_eq!(plan.skipped.len(), 1);
         assert!(plan.skipped[0].reason.contains("missing .torrent blob"));
+    }
+
+    #[test]
+    fn malformed_database_hash_is_skipped_before_path_join() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, blob, fr, hash, _s) = native_fixture(tmp.path(), true);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let mut row = rt_db::get(&conn, &hash).unwrap();
+        row.info_hash = "../escape".to_owned();
+        rt_db::upsert(&conn, &row).unwrap();
+        drop(conn);
+
+        let plan = ExportPlan::new(ExportFormat::Generic, &db, &blob, &fr).unwrap();
+
+        assert_eq!(plan.torrent_count(), 1);
+        assert!(plan.skipped.iter().any(|skipped| {
+            skipped.info_hash == "../escape"
+                && skipped
+                    .reason
+                    .contains("refusing to use it as a filesystem name")
+        }));
+    }
+
+    #[test]
+    fn oversized_blob_is_skipped_before_reading_contents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, blob, fr, hash, _s) = native_fixture(tmp.path(), true);
+        let path = blob.join(format!("{hash}.torrent"));
+        let file = std::fs::File::options().write(true).open(path).unwrap();
+        file.set_len(MAX_TORRENT_BYTES as u64 + 1).unwrap();
+
+        let plan = ExportPlan::new(ExportFormat::Generic, &db, &blob, &fr).unwrap();
+
+        assert_eq!(plan.torrent_count(), 0);
+        assert_eq!(plan.skipped.len(), 1);
+        assert!(plan.skipped[0].reason.contains("maximum"));
     }
 
     #[test]

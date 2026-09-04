@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 
 use super::db::Db;
@@ -69,12 +69,12 @@ impl Db {
             .query_row("SELECT value FROM kv WHERE key=?1", params![KEY], |r| {
                 r.get(0)
             })
-            .ok();
+            .optional()?;
         let mut rules: Vec<WorkflowRule> = match raw {
             Some(raw) => serde_json::from_str(&raw)?,
             None => Vec::new(),
         };
-        rules.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        rules.sort_by_key(|a| a.name.to_lowercase());
         Ok(rules)
     }
 
@@ -82,12 +82,11 @@ impl Db {
         if rule.id.trim().is_empty() {
             rule.id = uuid::Uuid::new_v4().to_string();
         }
-        let mut rules = self.list_workflow_rules()?;
-        rules.retain(|existing| existing.id != rule.id);
-        rules.push(rule);
-        rules.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-        self.save_workflow_rules(&rules)?;
-        Ok(rules)
+        let id = rule.id.clone();
+        self.update_workflow_rules(|rules| {
+            rules.retain(|existing| existing.id != id);
+            rules.push(rule);
+        })
     }
 
     pub fn get_workflow_rule(&self, id: &str) -> Result<Option<WorkflowRule>> {
@@ -113,8 +112,11 @@ impl Db {
             args.push(category.clone());
         }
         if let Some(tracker) = &rule.tracker {
-            clauses.push(format!("tracker_url LIKE ?{}", args.len() + 1));
-            args.push(format!("%{tracker}%"));
+            clauses.push(format!(
+                "instr(lower(tracker_url), lower(?{})) > 0",
+                args.len() + 1
+            ));
+            args.push(tracker.clone());
         }
 
         let where_sql = if clauses.is_empty() {
@@ -132,10 +134,9 @@ impl Db {
     }
 
     pub fn delete_workflow_rule(&self, id: &str) -> Result<Vec<WorkflowRule>> {
-        let mut rules = self.list_workflow_rules()?;
-        rules.retain(|existing| existing.id != id);
-        self.save_workflow_rules(&rules)?;
-        Ok(rules)
+        self.update_workflow_rules(|rules| {
+            rules.retain(|existing| existing.id != id);
+        })
     }
 
     pub fn list_workflow_runs(&self) -> Result<Vec<WorkflowRun>> {
@@ -146,30 +147,31 @@ impl Db {
                 params![RUNS_KEY],
                 |r| r.get(0),
             )
-            .ok();
+            .optional()?;
         let mut runs: Vec<WorkflowRun> = match raw {
             Some(raw) => serde_json::from_str(&raw)?,
             None => Vec::new(),
         };
-        runs.sort_by(|a, b| {
-            b.started_at
-                .cmp(&a.started_at)
-                .then_with(|| b.id.cmp(&a.id))
+        runs.sort_by_key(|run| {
+            (
+                std::cmp::Reverse(run.started_at),
+                std::cmp::Reverse(run.id.clone()),
+            )
         });
         Ok(runs)
     }
 
     pub fn record_workflow_run(&self, run: WorkflowRun) -> Result<Vec<WorkflowRun>> {
-        let mut runs = self.list_workflow_runs()?;
-        runs.push(run);
-        runs.sort_by(|a, b| {
-            b.started_at
-                .cmp(&a.started_at)
-                .then_with(|| b.id.cmp(&a.id))
-        });
-        runs.truncate(MAX_RUNS);
-        self.save_workflow_runs(&runs)?;
-        Ok(runs)
+        self.update_workflow_runs(|runs| {
+            runs.push(run);
+            runs.sort_by_key(|run| {
+                (
+                    std::cmp::Reverse(run.started_at),
+                    std::cmp::Reverse(run.id.clone()),
+                )
+            });
+            runs.truncate(MAX_RUNS);
+        })
     }
 
     pub fn list_rss_rules(&self) -> Result<Vec<RssRule>> {
@@ -178,12 +180,12 @@ impl Db {
             .query_row("SELECT value FROM kv WHERE key=?1", params![RSS_KEY], |r| {
                 r.get(0)
             })
-            .ok();
+            .optional()?;
         let mut rules: Vec<RssRule> = match raw {
             Some(raw) => serde_json::from_str(&raw)?,
             None => Vec::new(),
         };
-        rules.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        rules.sort_by_key(|a| a.name.to_lowercase());
         Ok(rules)
     }
 
@@ -191,19 +193,43 @@ impl Db {
         if rule.id.trim().is_empty() {
             rule.id = uuid::Uuid::new_v4().to_string();
         }
-        let mut rules = self.list_rss_rules()?;
-        rules.retain(|existing| existing.id != rule.id);
-        rules.push(rule);
-        rules.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-        self.save_rss_rules(&rules)?;
-        Ok(rules)
+        let id = rule.id.clone();
+        self.update_rss_rules(|rules| {
+            rules.retain(|existing| existing.id != id);
+            rules.push(rule);
+        })
     }
 
     pub fn delete_rss_rule(&self, id: &str) -> Result<Vec<RssRule>> {
-        let mut rules = self.list_rss_rules()?;
-        rules.retain(|existing| existing.id != id);
-        self.save_rss_rules(&rules)?;
-        Ok(rules)
+        self.update_rss_rules(|rules| {
+            rules.retain(|existing| existing.id != id);
+        })
+    }
+
+    pub fn rename_rss_rule(&self, old_name: &str, new_name: &str) -> Result<RssRuleRenameResult> {
+        let mut result = RssRuleRenameResult::Missing;
+        self.update_rss_rules(|rules| {
+            let Some(rule_index) = rules.iter().position(|rule| rule.name == old_name) else {
+                return;
+            };
+            if old_name != new_name && rules.iter().any(|rule| rule.name == new_name) {
+                result = RssRuleRenameResult::Conflict;
+                return;
+            }
+            rules[rule_index].name = new_name.to_owned();
+            result = RssRuleRenameResult::Renamed;
+        })?;
+        Ok(result)
+    }
+
+    pub fn delete_rss_rule_by_name(&self, name: &str) -> Result<bool> {
+        let mut removed = false;
+        self.update_rss_rules(|rules| {
+            let before = rules.len();
+            rules.retain(|rule| rule.name != name);
+            removed = rules.len() != before;
+        })?;
+        Ok(removed)
     }
 
     pub fn match_rss_item(&self, title: &str, link: Option<&str>) -> Result<Vec<RssRuleMatch>> {
@@ -246,35 +272,96 @@ impl Db {
         Ok(matches)
     }
 
-    fn save_workflow_rules(&self, rules: &[WorkflowRule]) -> Result<()> {
-        let raw = serde_json::to_string(rules)?;
-        self.0.lock().expect("db").execute(
-            "INSERT INTO kv(key, value) VALUES(?1,?2)
-             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            params![KEY, raw],
-        )?;
-        Ok(())
+    fn update_workflow_rules<F>(&self, update: F) -> Result<Vec<WorkflowRule>>
+    where
+        F: FnOnce(&mut Vec<WorkflowRule>),
+    {
+        let mut conn = self.0.lock().expect("db");
+        let tx = conn.transaction()?;
+        let raw: Option<String> = tx
+            .query_row("SELECT value FROM kv WHERE key=?1", params![KEY], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        let mut rules: Vec<WorkflowRule> = match raw {
+            Some(raw) => serde_json::from_str(&raw)?,
+            None => Vec::new(),
+        };
+        update(&mut rules);
+        rules.sort_by_key(|rule| rule.name.to_lowercase());
+        write_json_vec(&tx, KEY, &rules)?;
+        tx.commit()?;
+        Ok(rules)
     }
 
-    fn save_workflow_runs(&self, runs: &[WorkflowRun]) -> Result<()> {
-        let raw = serde_json::to_string(runs)?;
-        self.0.lock().expect("db").execute(
-            "INSERT INTO kv(key, value) VALUES(?1,?2)
-             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            params![RUNS_KEY, raw],
-        )?;
-        Ok(())
+    fn update_workflow_runs<F>(&self, update: F) -> Result<Vec<WorkflowRun>>
+    where
+        F: FnOnce(&mut Vec<WorkflowRun>),
+    {
+        let mut conn = self.0.lock().expect("db");
+        let tx = conn.transaction()?;
+        let raw: Option<String> = tx
+            .query_row(
+                "SELECT value FROM kv WHERE key=?1",
+                params![RUNS_KEY],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let mut runs: Vec<WorkflowRun> = match raw {
+            Some(raw) => serde_json::from_str(&raw)?,
+            None => Vec::new(),
+        };
+        update(&mut runs);
+        runs.sort_by_key(|run| {
+            (
+                std::cmp::Reverse(run.started_at),
+                std::cmp::Reverse(run.id.clone()),
+            )
+        });
+        runs.truncate(MAX_RUNS);
+        write_json_vec(&tx, RUNS_KEY, &runs)?;
+        tx.commit()?;
+        Ok(runs)
     }
 
-    fn save_rss_rules(&self, rules: &[RssRule]) -> Result<()> {
-        let raw = serde_json::to_string(rules)?;
-        self.0.lock().expect("db").execute(
-            "INSERT INTO kv(key, value) VALUES(?1,?2)
-             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            params![RSS_KEY, raw],
-        )?;
-        Ok(())
+    fn update_rss_rules<F>(&self, update: F) -> Result<Vec<RssRule>>
+    where
+        F: FnOnce(&mut Vec<RssRule>),
+    {
+        let mut conn = self.0.lock().expect("db");
+        let tx = conn.transaction()?;
+        let raw: Option<String> = tx
+            .query_row("SELECT value FROM kv WHERE key=?1", params![RSS_KEY], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        let mut rules: Vec<RssRule> = match raw {
+            Some(raw) => serde_json::from_str(&raw)?,
+            None => Vec::new(),
+        };
+        update(&mut rules);
+        rules.sort_by_key(|rule| rule.name.to_lowercase());
+        write_json_vec(&tx, RSS_KEY, &rules)?;
+        tx.commit()?;
+        Ok(rules)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RssRuleRenameResult {
+    Missing,
+    Conflict,
+    Renamed,
+}
+
+fn write_json_vec<T: Serialize>(tx: &Transaction<'_>, key: &str, values: &[T]) -> Result<()> {
+    let raw = serde_json::to_string(values)?;
+    tx.execute(
+        "INSERT INTO kv(key, value) VALUES(?1,?2)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![key, raw],
+    )?;
+    Ok(())
 }
 
 fn pattern_list_matches(patterns: &str, haystack: &str) -> bool {
@@ -283,4 +370,42 @@ fn pattern_list_matches(patterns: &str, haystack: &str) -> bool {
         .map(str::trim)
         .filter(|pattern| !pattern.is_empty())
         .any(|pattern| haystack.contains(&pattern.to_lowercase()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{sync::Arc, thread};
+
+    #[test]
+    fn concurrent_workflow_updates_do_not_lose_rules() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Db::open(&directory.path().join("cache.sqlite")).unwrap();
+        let start = Arc::new(std::sync::Barrier::new(16));
+
+        thread::scope(|scope| {
+            for index in 0..16 {
+                let db = db.clone();
+                let start = Arc::clone(&start);
+                scope.spawn(move || {
+                    start.wait();
+                    db.upsert_workflow_rule(WorkflowRule {
+                        id: format!("rule-{index}"),
+                        name: format!("Rule {index}"),
+                        enabled: true,
+                        event: "added".to_owned(),
+                        action: "tag".to_owned(),
+                        category: None,
+                        tracker: None,
+                        command: None,
+                        url: None,
+                        target_path: None,
+                    })
+                    .unwrap();
+                });
+            }
+        });
+
+        assert_eq!(db.list_workflow_rules().unwrap().len(), 16);
+    }
 }

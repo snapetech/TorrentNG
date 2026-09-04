@@ -1,6 +1,8 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::{path::PathBuf, time::Duration};
+use std::{fs::File, io::Read, net::SocketAddr, path::PathBuf, time::Duration};
+
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
 /// Default user-agent announced to trackers via rTorrent.
 ///
@@ -180,6 +182,7 @@ pub struct WorkflowConfig {
     pub allow_scripts: bool,
     pub script_timeout_secs: u64,
     pub allowed_script_dirs: Vec<PathBuf>,
+    pub allow_private_webhooks: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -208,6 +211,7 @@ impl Default for WorkflowConfig {
             allow_scripts: false,
             script_timeout_secs: 30,
             allowed_script_dirs: Vec::new(),
+            allow_private_webhooks: false,
         }
     }
 }
@@ -313,7 +317,10 @@ impl Config {
 // --- defaults ---
 
 fn default_listen_addr() -> String {
-    "0.0.0.0:8080".into()
+    // A missing sidecar config must not publish an unauthenticated control
+    // plane. Container/public deployments set an explicit bind address and
+    // provide credentials in their deployment environment.
+    "127.0.0.1:8080".into()
 }
 fn default_sync_interval_secs() -> u64 {
     2
@@ -350,7 +357,7 @@ impl Config {
         };
 
         let mut cfg: Config = if path.exists() {
-            let raw = std::fs::read_to_string(&path)
+            let raw = read_bounded_text(&path, MAX_CONFIG_BYTES)
                 .with_context(|| format!("read config {}", path.display()))?;
             toml::from_str(&raw).with_context(|| format!("parse config {}", path.display()))?
         } else {
@@ -552,6 +559,9 @@ impl Config {
         if let Some(v) = env_override("TNG_ALLOW_SCRIPTS", "RTNG_ALLOW_SCRIPTS") {
             self.workflows.allow_scripts = v == "1" || v.eq_ignore_ascii_case("true");
         }
+        if let Some(v) = env_override("TNG_ALLOW_PRIVATE_WEBHOOKS", "RTNG_ALLOW_PRIVATE_WEBHOOKS") {
+            self.workflows.allow_private_webhooks = v == "1" || v.eq_ignore_ascii_case("true");
+        }
         if let Some(v) = env_override("TNG_QBITTORRENT_VERSION", "RTNG_QBITTORRENT_VERSION") {
             self.identity.qbittorrent_version = v;
         }
@@ -573,6 +583,11 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
+        let listen_addr: SocketAddr = self
+            .listen_addr
+            .parse()
+            .with_context(|| format!("parse listen_addr {}", self.listen_addr))?;
+
         match self.backend.backend_type {
             BackendKind::Rtorrent => match (&self.rtorrent.scgi_socket, &self.rtorrent.scgi_addr) {
                 (None, None) => bail!("rtorrent: one of scgi_socket or scgi_addr must be set"),
@@ -606,6 +621,46 @@ impl Config {
                 }
             }
         }
+        if self.workflows.allow_scripts && self.workflows.allowed_script_dirs.is_empty() {
+            bail!("workflows: allowed_script_dirs must be non-empty when allow_scripts is enabled");
+        }
+        for token in &self.auth.api_tokens {
+            if token.trim().is_empty() {
+                bail!("auth.api_tokens must not contain empty tokens");
+            }
+            if is_placeholder_secret(token) {
+                bail!("auth.api_tokens must not contain an example token");
+            }
+        }
+        if !self.auth.api_tokens.is_empty() {
+            if let Some(secret) = self.auth.secret_key.as_deref() {
+                if is_placeholder_secret(secret) {
+                    bail!("auth.secret_key must not contain an example secret");
+                }
+            }
+        }
+        if self.auth.trust_proxy_header && !listen_addr.ip().is_loopback() {
+            bail!("auth.trust_proxy_header requires a loopback listen_addr");
+        }
+        if !listen_addr.ip().is_loopback() {
+            if self.auth.api_tokens.is_empty() {
+                bail!("public listen_addr requires at least one API token");
+            }
+            if self
+                .auth
+                .api_tokens
+                .iter()
+                .any(|token| token.trim().len() < 16)
+            {
+                bail!("public listen_addr requires API tokens of at least 16 characters");
+            }
+            let Some(secret) = self.auth.secret_key.as_deref() else {
+                bail!("public listen_addr requires auth.secret_key for signed sessions");
+            };
+            if secret.trim().len() < 32 {
+                bail!("public listen_addr requires auth.secret_key of at least 32 characters");
+            }
+        }
         Ok(())
     }
 
@@ -634,6 +689,27 @@ impl Config {
     pub fn rtorrent_log_poll_interval(&self) -> Duration {
         Duration::from_secs(self.rtorrent.logs.poll_interval_secs.max(1))
     }
+}
+
+fn is_placeholder_secret(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    normalized.is_empty()
+        || normalized.contains("change-me")
+        || normalized.contains("replace_with")
+        || normalized.contains("your-")
+        || normalized.contains("cert-token")
+        || normalized.contains("certification-only")
+}
+
+fn read_bounded_text(path: &std::path::Path, max_bytes: u64) -> Result<String> {
+    let file = File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        bail!("file exceeds {max_bytes} bytes");
+    }
+    String::from_utf8(bytes).context("file is not valid UTF-8")
 }
 
 impl Default for RtorrentLogConfig {
@@ -721,6 +797,96 @@ mod tests {
             assert_eq!(cfg.backend.backend_type, expected, "{raw}");
         }
         restore_env("TNG_BACKEND", old_backend);
+    }
+
+    #[test]
+    fn scripts_require_an_explicit_directory_allowlist() {
+        let mut cfg = Config::test_default();
+        cfg.workflows.allow_scripts = true;
+        let error = cfg.validate().unwrap_err().to_string();
+        assert!(error.contains("allowed_script_dirs"));
+
+        cfg.workflows
+            .allowed_script_dirs
+            .push(PathBuf::from("/bin"));
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn missing_config_defaults_to_loopback() {
+        assert_eq!(default_listen_addr(), "127.0.0.1:8080");
+        let cfg = Config::test_default();
+        assert!(cfg
+            .listen_addr
+            .parse::<SocketAddr>()
+            .unwrap()
+            .ip()
+            .is_loopback());
+    }
+
+    #[test]
+    fn public_bind_requires_strong_authentication_material() {
+        let mut cfg = Config::test_default();
+        cfg.listen_addr = "0.0.0.0:8080".to_owned();
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("API token"));
+
+        cfg.auth.api_tokens = vec!["short-token".to_owned()];
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("16 characters"));
+
+        cfg.auth.api_tokens = vec!["sidecar-api-token-20260904".to_owned()];
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("auth.secret_key"));
+
+        cfg.auth.secret_key = Some("sidecar-session-secret-20260904-0123456789abcdef".to_owned());
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn example_auth_material_is_rejected_when_auth_is_enabled() {
+        let mut cfg = Config::test_default();
+        cfg.auth.api_tokens = vec!["cert-token".to_owned()];
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("example token"));
+
+        cfg.auth.api_tokens = vec!["sidecar-api-token-20260904".to_owned()];
+        cfg.auth.secret_key = Some("change-me".to_owned());
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("example secret"));
+    }
+
+    #[test]
+    fn proxy_header_auth_requires_a_loopback_listener() {
+        let mut cfg = Config::test_default();
+        cfg.auth.trust_proxy_header = true;
+        cfg.validate().unwrap();
+
+        cfg.listen_addr = "0.0.0.0:8080".to_owned();
+        assert!(cfg.validate().unwrap_err().to_string().contains("loopback"));
+    }
+
+    #[test]
+    fn config_file_size_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, vec![b' '; (MAX_CONFIG_BYTES + 1) as usize]).unwrap();
+        assert!(Config::load(Some(path.to_str().unwrap())).is_err());
     }
 
     #[test]

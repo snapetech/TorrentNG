@@ -5,9 +5,12 @@ use crate::{
     job::{Job, JobId, JobKind},
 };
 
-/// In-memory job registry.
+/// In-memory job registry used by library-level job tests and embedders.
 ///
-/// Phase 2: in-memory only. Phase 5 (daemon + DB) persists jobs to SQLite.
+/// The native daemon's production queue is `rt-engine::StorageJobDispatcher`,
+/// which persists job state and checkpoints in SQLite. This small type remains
+/// intentionally process-local and must not be documented as the daemon's
+/// durable queue.
 #[derive(Debug, Default)]
 pub struct JobQueue {
     jobs: HashMap<JobId, Job>,

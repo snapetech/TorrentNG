@@ -2,10 +2,13 @@ use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use reqwest::Url;
 use std::{collections::BTreeMap, net::SocketAddr};
+use tokio::sync::Mutex;
 
 use super::{
-    BackendCapabilities, BackendPeer, BackendPieceState, BackendStatus, BackendTransferLimits,
-    BackendType, QueueMove, TorrentBackend,
+    map_qbit_piece_state, parse_qbit_peer_response, response_bytes_bounded, response_json_bounded,
+    validate_qbit_mutation_body, BackendCapabilities, BackendPeer, BackendPieceState,
+    BackendStatus, BackendTransferLimits, BackendType, QueueMove, TorrentBackend,
+    MAX_BACKEND_JSON_BYTES,
 };
 use crate::{
     config::QbittorrentConfig,
@@ -18,6 +21,7 @@ pub struct QbittorrentBackend {
     username: Option<String>,
     password: Option<String>,
     no_auth: bool,
+    tag_mutation: Mutex<()>,
 }
 
 impl QbittorrentBackend {
@@ -35,6 +39,7 @@ impl QbittorrentBackend {
             username: cfg.username.clone(),
             password: cfg.password.clone(),
             no_auth: cfg.no_auth,
+            tag_mutation: Mutex::new(()),
         })
     }
 
@@ -54,8 +59,13 @@ impl QbittorrentBackend {
             .await
             .context("qBittorrent login request")?;
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        if !status.is_success() || body.trim() != "Ok." {
+        let body = super::response_bytes_bounded(
+            response,
+            MAX_BACKEND_JSON_BYTES.min(16 * 1024),
+            "qBittorrent login",
+        )
+        .await?;
+        if !status.is_success() || std::str::from_utf8(&body).ok().map(str::trim) != Some("Ok.") {
             bail!("qBittorrent login failed with status {status}");
         }
         Ok(())
@@ -67,29 +77,30 @@ impl QbittorrentBackend {
 
     async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
         self.ensure_login().await?;
-        Ok(self
-            .client
-            .get(self.url(path)?)
-            .send()
-            .await
-            .with_context(|| format!("qBittorrent GET {path}"))?
-            .error_for_status()
-            .with_context(|| format!("qBittorrent GET {path}"))?
-            .json()
-            .await
-            .with_context(|| format!("decode qBittorrent GET {path}"))?)
+        response_json_bounded(
+            self.client
+                .get(self.url(path)?)
+                .send()
+                .await
+                .with_context(|| format!("qBittorrent GET {path}"))?,
+            MAX_BACKEND_JSON_BYTES,
+            &format!("qBittorrent GET {path}"),
+        )
+        .await
     }
 
     async fn post_form(&self, path: &str, form: &[(&str, &str)]) -> Result<()> {
         self.ensure_login().await?;
-        self.client
+        let response = self
+            .client
             .post(self.url(path)?)
             .form(form)
             .send()
             .await
-            .with_context(|| format!("qBittorrent POST {path}"))?
-            .error_for_status()
             .with_context(|| format!("qBittorrent POST {path}"))?;
+        let body = response_bytes_bounded(response, 16 * 1024, &format!("qBittorrent POST {path}"))
+            .await?;
+        validate_qbit_mutation_body(&body, path)?;
         Ok(())
     }
 
@@ -98,17 +109,47 @@ impl QbittorrentBackend {
         let hashes_param = hashes.join("|");
         let mut url = self.url(path)?;
         url.query_pairs_mut().append_pair("hashes", &hashes_param);
-        Ok(self
-            .client
-            .get(url)
-            .send()
-            .await
-            .with_context(|| format!("qBittorrent GET {path}"))?
-            .error_for_status()
-            .with_context(|| format!("qBittorrent GET {path}"))?
-            .json()
-            .await
-            .with_context(|| format!("decode qBittorrent GET {path}"))?)
+        let limits: BTreeMap<String, i64> = response_json_bounded(
+            self.client
+                .get(url)
+                .send()
+                .await
+                .with_context(|| format!("qBittorrent GET {path}"))?,
+            MAX_BACKEND_JSON_BYTES,
+            &format!("qBittorrent GET {path}"),
+        )
+        .await?;
+        let mut result = BTreeMap::new();
+        for hash in hashes {
+            let value = limits
+                .iter()
+                .find(|(returned_hash, _)| returned_hash.eq_ignore_ascii_case(hash))
+                .map(|(_, value)| *value)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("qBittorrent {path} response omitted requested torrent {hash}")
+                })?;
+            if value < 0 {
+                bail!("qBittorrent {path} returned negative limit for {hash}");
+            }
+            result.insert(hash.clone(), value);
+        }
+        Ok(result)
+    }
+
+    async fn add_tags_unlocked(&self, hash: &str, tags: &[&str]) -> Result<()> {
+        self.post_form(
+            "api/v2/torrents/addTags",
+            &[("hashes", hash), ("tags", &tags.join(","))],
+        )
+        .await
+    }
+
+    async fn remove_tags_unlocked(&self, hash: &str, tags: &[&str]) -> Result<()> {
+        self.post_form(
+            "api/v2/torrents/removeTags",
+            &[("hashes", hash), ("tags", &tags.join(","))],
+        )
+        .await
     }
 }
 
@@ -138,11 +179,11 @@ struct QbitTorrent {
 
 #[derive(Debug, serde::Deserialize)]
 struct QbitTransferInfo {
-    dl_info_speed: Option<i64>,
-    up_info_speed: Option<i64>,
-    dl_rate_limit: Option<i64>,
-    up_rate_limit: Option<i64>,
-    use_alt_speed_limits: Option<bool>,
+    dl_info_speed: i64,
+    up_info_speed: i64,
+    dl_rate_limit: i64,
+    up_rate_limit: i64,
+    use_alt_speed_limits: bool,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -198,26 +239,62 @@ impl TorrentBackend for QbittorrentBackend {
     }
 
     async fn health(&self) -> BackendStatus {
-        match self
-            .get_json::<serde_json::Value>("api/v2/app/version")
-            .await
-        {
-            Ok(_) => BackendStatus::Connected,
+        match self.get_json::<String>("api/v2/app/version").await {
+            Ok(version) if !version.trim().is_empty() => BackendStatus::Connected,
             Err(_) => BackendStatus::Unreachable,
+            Ok(_) => BackendStatus::Unreachable,
         }
     }
 
     async fn transfer_rates(&self) -> Result<TransferRates> {
         let info: QbitTransferInfo = self.get_json("api/v2/transfer/info").await?;
         Ok(TransferRates {
-            download: info.dl_info_speed.unwrap_or(0).max(0),
-            upload: info.up_info_speed.unwrap_or(0).max(0),
+            download: qbit_nonnegative_i64(Some(info.dl_info_speed), "dl_info_speed")?,
+            upload: qbit_nonnegative_i64(Some(info.up_info_speed), "up_info_speed")?,
         })
     }
 
     async fn list_torrents(&self) -> Result<Vec<RawTorrent>> {
         let torrents: Vec<QbitTorrent> = self.get_json("api/v2/torrents/info").await?;
-        Ok(torrents.into_iter().map(map_torrent).collect())
+        torrents.into_iter().map(map_torrent).collect()
+    }
+
+    async fn has_bounded_sync(&self) -> bool {
+        // qBittorrent's torrents/info endpoint has supported offset/limit
+        // pagination for the v2 API used by this facade. The sync loop still
+        // treats the result as eventually consistent because qBittorrent has
+        // no server-side snapshot token for this endpoint.
+        true
+    }
+
+    async fn list_torrents_range(
+        &self,
+        view: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<RawTorrent>> {
+        let mut url = self.url("api/v2/torrents/info")?;
+        let filter = qbit_sync_filter(view);
+        url.query_pairs_mut()
+            .append_pair("filter", filter)
+            .append_pair("sort", "hash")
+            .append_pair("offset", &offset.max(0).to_string())
+            .append_pair("limit", &limit.clamp(1, 5_000).to_string());
+        self.ensure_login().await?;
+        let torrents: Vec<QbitTorrent> = response_json_bounded(
+            self.client
+                .get(url)
+                .send()
+                .await
+                .context("qBittorrent paged torrents/info request")?,
+            MAX_BACKEND_JSON_BYTES,
+            "qBittorrent paged torrents/info",
+        )
+        .await?;
+        if torrents.len() > limit.clamp(1, 5_000) as usize {
+            bail!("qBittorrent paged torrents/info exceeded requested page size");
+        }
+        torrents.into_iter().map(map_torrent).collect()
     }
 
     async fn add_magnet(
@@ -253,34 +330,35 @@ impl TorrentBackend for QbittorrentBackend {
             .text("savepath", save_path.to_owned())
             .text("category", category.to_owned())
             .text("paused", if start { "false" } else { "true" });
-        self.client
+        let response = self
+            .client
             .post(self.url("api/v2/torrents/add")?)
             .multipart(form)
             .send()
             .await
-            .context("qBittorrent POST api/v2/torrents/add")?
-            .error_for_status()
             .context("qBittorrent POST api/v2/torrents/add")?;
+        let body =
+            response_bytes_bounded(response, 16 * 1024, "qBittorrent POST api/v2/torrents/add")
+                .await?;
+        validate_qbit_mutation_body(&body, "api/v2/torrents/add")?;
         Ok(())
     }
 
     async fn torrent_blob(&self, hash: &str) -> Result<Vec<u8>> {
         self.ensure_login().await?;
-        Ok(self
-            .client
-            .get(self.url(&format!(
-                "api/v2/torrents/export?hash={}",
-                urlencoding::encode(hash)
-            ))?)
-            .send()
-            .await
-            .context("qBittorrent GET api/v2/torrents/export")?
-            .error_for_status()
-            .context("qBittorrent GET api/v2/torrents/export")?
-            .bytes()
-            .await
-            .context("read qBittorrent torrent export body")?
-            .to_vec())
+        response_bytes_bounded(
+            self.client
+                .get(self.url(&format!(
+                    "api/v2/torrents/export?hash={}",
+                    urlencoding::encode(hash)
+                ))?)
+                .send()
+                .await
+                .context("qBittorrent GET api/v2/torrents/export")?,
+            MAX_BACKEND_JSON_BYTES,
+            "qBittorrent GET api/v2/torrents/export",
+        )
+        .await
     }
 
     async fn add_url(&self, url: &str, save_path: &str, category: &str, start: bool) -> Result<()> {
@@ -325,7 +403,7 @@ impl TorrentBackend for QbittorrentBackend {
                 urlencoding::encode(hash)
             ))
             .await?;
-        Ok(trackers.into_iter().enumerate().map(map_tracker).collect())
+        trackers.into_iter().enumerate().map(map_tracker).collect()
     }
 
     async fn add_tracker(&self, hash: &str, url: &str) -> Result<()> {
@@ -363,7 +441,7 @@ impl TorrentBackend for QbittorrentBackend {
                 urlencoding::encode(hash)
             ))
             .await?;
-        Ok(files.into_iter().enumerate().map(map_file).collect())
+        files.into_iter().enumerate().map(map_file).collect()
     }
 
     async fn list_webseeds(&self, hash: &str) -> Result<Vec<String>> {
@@ -381,14 +459,7 @@ impl TorrentBackend for QbittorrentBackend {
                 urlencoding::encode(hash)
             ))
             .await?;
-        Ok(states
-            .into_iter()
-            .map(|state| match state {
-                2 => BackendPieceState::Complete,
-                1 => BackendPieceState::Partial,
-                _ => BackendPieceState::Missing,
-            })
-            .collect())
+        states.into_iter().map(map_qbit_piece_state).collect()
     }
 
     async fn piece_hashes(&self, hash: &str) -> Result<Vec<String>> {
@@ -406,16 +477,22 @@ impl TorrentBackend for QbittorrentBackend {
                 urlencoding::encode(hash)
             ))
             .await?;
-        Ok(parse_qbit_peer_response(&response))
+        parse_qbit_peer_response(&response)
     }
 
     async fn set_file_priority(&self, hash: &str, file_index: usize, priority: i64) -> Result<()> {
+        let wire_priority = match priority {
+            0 => 0,
+            1 => 1,
+            2 => 6,
+            _ => bail!("qBittorrent file priority must be between 0 and 2"),
+        };
         self.post_form(
             "api/v2/torrents/filePrio",
             &[
                 ("hash", hash),
                 ("id", &file_index.to_string()),
-                ("priority", &priority.to_string()),
+                ("priority", &wire_priority.to_string()),
             ],
         )
         .await
@@ -514,9 +591,9 @@ impl TorrentBackend for QbittorrentBackend {
     async fn global_limits(&self) -> Result<BackendTransferLimits> {
         let info: QbitTransferInfo = self.get_json("api/v2/transfer/info").await?;
         Ok(BackendTransferLimits {
-            download_limit: info.dl_rate_limit.unwrap_or(0).max(0),
-            upload_limit: info.up_rate_limit.unwrap_or(0).max(0),
-            speed_limits_mode: info.use_alt_speed_limits.unwrap_or(false),
+            download_limit: qbit_nonnegative_i64(Some(info.dl_rate_limit), "dl_rate_limit")?,
+            upload_limit: qbit_nonnegative_i64(Some(info.up_rate_limit), "up_rate_limit")?,
+            speed_limits_mode: info.use_alt_speed_limits,
         })
     }
 
@@ -620,28 +697,39 @@ impl TorrentBackend for QbittorrentBackend {
     }
 
     async fn add_tags(&self, hash: &str, tags: &[&str]) -> Result<()> {
-        self.post_form(
-            "api/v2/torrents/addTags",
-            &[("hashes", hash), ("tags", &tags.join(","))],
-        )
-        .await
+        let _guard = self.tag_mutation.lock().await;
+        self.add_tags_unlocked(hash, tags).await
     }
 
     async fn remove_tags(&self, hash: &str, tags: &[&str]) -> Result<()> {
-        self.post_form(
-            "api/v2/torrents/removeTags",
-            &[("hashes", hash), ("tags", &tags.join(","))],
-        )
-        .await
+        let _guard = self.tag_mutation.lock().await;
+        self.remove_tags_unlocked(hash, tags).await
     }
 
     async fn set_tags(&self, hash: &str, tags: &[&str]) -> Result<()> {
-        let current = self
-            .list_torrents()
-            .await?
+        // qBittorrent has no atomic replace-tags endpoint. Serialize the
+        // read/remove/add sequence so concurrent compatibility requests do
+        // not erase one another's changes, and restore the previous set when
+        // the add step fails after removal succeeded.
+        let _guard = self.tag_mutation.lock().await;
+        let mut url = self.url("api/v2/torrents/info")?;
+        url.query_pairs_mut().append_pair("hashes", hash);
+        self.ensure_login().await?;
+        let torrents: Vec<QbitTorrent> = response_json_bounded(
+            self.client
+                .get(url)
+                .send()
+                .await
+                .context("qBittorrent torrent tag lookup")?,
+            MAX_BACKEND_JSON_BYTES,
+            "qBittorrent torrent tag lookup",
+        )
+        .await?;
+        let current = torrents
             .into_iter()
             .find(|torrent| torrent.hash.eq_ignore_ascii_case(hash))
-            .map(|torrent| torrent.tags)
+            .ok_or_else(|| anyhow::anyhow!("qBittorrent torrent not found"))?
+            .tags
             .unwrap_or_default();
         let current_tags: Vec<&str> = current
             .split(',')
@@ -649,17 +737,41 @@ impl TorrentBackend for QbittorrentBackend {
             .filter(|tag| !tag.is_empty())
             .collect();
         if !current_tags.is_empty() {
-            self.remove_tags(hash, &current_tags).await?;
+            self.remove_tags_unlocked(hash, &current_tags).await?;
         }
         if !tags.is_empty() {
-            self.add_tags(hash, tags).await?;
+            if let Err(error) = self.add_tags_unlocked(hash, tags).await {
+                if !current_tags.is_empty() {
+                    if let Err(rollback_error) = self.add_tags_unlocked(hash, &current_tags).await {
+                        bail!(
+                            "qBittorrent tag replacement failed: {error}; rollback failed: {rollback_error}"
+                        );
+                    }
+                }
+                return Err(error);
+            }
         }
         Ok(())
     }
 }
 
-fn map_torrent(t: QbitTorrent) -> RawTorrent {
-    let state_name = t.state.unwrap_or_default();
+fn qbit_sync_filter(view: &str) -> &str {
+    match view {
+        "active" | "downloading" | "completed" | "paused" | "inactive" | "errored" | "resumed"
+        | "stalled" | "seeding" | "checking" | "moving" | "missingFiles" => view,
+        _ => "all",
+    }
+}
+
+fn map_torrent(t: QbitTorrent) -> Result<RawTorrent> {
+    let hash = t.hash;
+    if hash.trim().is_empty() {
+        bail!("qBittorrent torrent omitted hash");
+    }
+    let state_name = t
+        .state
+        .filter(|state| !state.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("qBittorrent torrent omitted state"))?;
     let complete = matches!(
         state_name.as_str(),
         "uploading" | "stalledUP" | "queuedUP" | "checkingUP" | "forcedUP"
@@ -673,41 +785,80 @@ fn map_torrent(t: QbitTorrent) -> RawTorrent {
     } else {
         String::new()
     };
-    RawTorrent {
-        hash: t.hash,
-        name: t.name,
-        size_bytes: t.size.unwrap_or(0),
-        bytes_done: t.completed.unwrap_or(0),
-        down_rate: t.dlspeed.unwrap_or(0),
-        up_rate: t.upspeed.unwrap_or(0),
-        up_total: t.uploaded.unwrap_or(0),
-        down_total: t.downloaded.unwrap_or(0),
-        ratio: (t.ratio.unwrap_or(0.0) * 1000.0) as i64,
+    let size_bytes = qbit_nonnegative_i64(t.size, "size")?;
+    let bytes_done = qbit_nonnegative_i64(t.completed, "completed")?;
+    if bytes_done > size_bytes {
+        bail!(
+            "qBittorrent torrent {} reports {} completed bytes for size {}",
+            hash,
+            bytes_done,
+            size_bytes
+        );
+    }
+    let category = t.category.unwrap_or_default();
+    let save_path = t
+        .save_path
+        .filter(|path| !path.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("qBittorrent torrent {} omitted save_path", hash))?;
+    let ratio = t
+        .ratio
+        .ok_or_else(|| anyhow::anyhow!("qBittorrent torrent {} omitted ratio", hash))?;
+    if !ratio.is_finite() || ratio < 0.0 {
+        bail!("qBittorrent torrent {} returned invalid ratio", hash);
+    }
+    let num_seeds = qbit_nonnegative_i64(t.num_seeds, "num_seeds")?;
+    let num_leechs = qbit_nonnegative_i64(t.num_leechs, "num_leechs")?;
+    let num_complete = qbit_nonnegative_i64(t.num_complete, "num_complete")?;
+    Ok(RawTorrent {
+        hash: hash.clone(),
+        name: if t.name.trim().is_empty() {
+            bail!("qBittorrent torrent omitted name")
+        } else {
+            t.name
+        },
+        size_bytes,
+        bytes_done,
+        down_rate: qbit_nonnegative_i64(t.dlspeed, "dlspeed")?,
+        up_rate: qbit_nonnegative_i64(t.upspeed, "upspeed")?,
+        up_total: qbit_nonnegative_i64(t.uploaded, "uploaded")?,
+        down_total: qbit_nonnegative_i64(t.downloaded, "downloaded")?,
+        ratio: super::ratio_milli(Some(ratio)),
         is_active,
         is_open: is_active,
         complete,
         state: if message.is_empty() { 1 } else { 3 },
-        priority: t.priority.unwrap_or(0),
-        category: t.category.unwrap_or_default(),
-        base_path: t.save_path.clone().unwrap_or_default(),
-        directory: t.save_path.unwrap_or_default(),
-        creation_date: t.added_on.unwrap_or(0),
-        timestamp_finished: t.completion_on.unwrap_or(0),
+        priority: t
+            .priority
+            .ok_or_else(|| anyhow::anyhow!("qBittorrent torrent {} omitted priority", hash))?,
+        category,
+        base_path: save_path.clone(),
+        directory: save_path,
+        creation_date: t
+            .added_on
+            .ok_or_else(|| anyhow::anyhow!("qBittorrent torrent {} omitted added_on", hash))?,
+        timestamp_finished: t
+            .completion_on
+            .ok_or_else(|| anyhow::anyhow!("qBittorrent torrent {} omitted completion_on", hash))?,
         tracker_focus: 0,
-        peers_connected: t
-            .num_seeds
-            .unwrap_or(0)
-            .saturating_add(t.num_leechs.unwrap_or(0)),
-        peers_complete: t.num_complete.unwrap_or(0),
+        peers_connected: num_seeds.saturating_add(num_leechs),
+        peers_complete: num_complete,
         message,
         tracker_url: t.tracker.unwrap_or_default(),
         tags: t.tags.unwrap_or_default(),
-    }
+    })
 }
 
-fn map_tracker((idx, tracker): (usize, QbitTracker)) -> RawTracker {
-    let status = tracker.status.unwrap_or(0);
-    RawTracker {
+fn map_tracker((idx, tracker): (usize, QbitTracker)) -> Result<RawTracker> {
+    if tracker.url.trim().is_empty() {
+        bail!("qBittorrent tracker {idx} returned an empty URL");
+    }
+    let status = tracker
+        .status
+        .ok_or_else(|| anyhow::anyhow!("qBittorrent tracker {idx} omitted status"))?;
+    if !(0..=6).contains(&status) {
+        bail!("qBittorrent tracker {idx} returned invalid status {status}");
+    }
+    Ok(RawTracker {
         url: tracker.url,
         id: idx as i64,
         group: 0,
@@ -721,84 +872,72 @@ fn map_tracker((idx, tracker): (usize, QbitTracker)) -> RawTracker {
         normal_interval: 0,
         failed_counter: 0,
         success_counter: 0,
-        scrape_incomplete: tracker.num_leeches.unwrap_or(0),
-        scrape_complete: tracker.num_seeds.unwrap_or(0),
-        scrape_downloaded: tracker.num_downloaded.unwrap_or(0),
+        scrape_incomplete: qbit_optional_nonnegative_i64(tracker.num_leeches, idx, "num_leeches")?,
+        scrape_complete: qbit_optional_nonnegative_i64(tracker.num_seeds, idx, "num_seeds")?,
+        scrape_downloaded: qbit_optional_nonnegative_i64(
+            tracker.num_downloaded,
+            idx,
+            "num_downloaded",
+        )?,
         message: tracker.msg.unwrap_or_default(),
-    }
+    })
 }
 
-fn map_file((index, file): (usize, QbitFile)) -> RawFile {
-    RawFile {
+fn map_file((index, file): (usize, QbitFile)) -> Result<RawFile> {
+    if file.name.trim().is_empty() {
+        bail!("qBittorrent file {index} returned an empty name");
+    }
+    if file.size < 0 {
+        bail!("qBittorrent file {index} returned negative size");
+    }
+    if !file.progress.is_finite() || !(0.0..=1.0).contains(&file.progress) {
+        bail!("qBittorrent file {index} returned invalid progress");
+    }
+    let priority = match file.priority {
+        0 => 0,
+        1 => 1,
+        6 | 7 => 2,
+        other => bail!("qBittorrent file {index} returned invalid priority {other}"),
+    };
+    Ok(RawFile {
         index,
         path: file.name,
         size_bytes: file.size,
         size_chunks: file.size,
-        completed_chunks: (file.size as f64 * file.progress.clamp(0.0, 1.0)) as i64,
-        priority: file.priority,
+        completed_chunks: (file.size as f64 * file.progress).round() as i64,
+        priority,
         is_created: true,
         is_open: true,
-    }
-}
-
-fn parse_qbit_peer_response(response: &serde_json::Value) -> Vec<BackendPeer> {
-    response
-        .get("peers")
-        .and_then(|peers| peers.as_object())
-        .map(|peers| {
-            peers
-                .iter()
-                .filter_map(|(key, peer)| parse_qbit_peer(key, peer))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn parse_qbit_peer(key: &str, peer: &serde_json::Value) -> Option<BackendPeer> {
-    let addr = if let Some(ip) = peer.get("ip").and_then(|value| value.as_str()) {
-        let port = peer
-            .get("port")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(0);
-        format!("{ip}:{port}").parse().ok()?
-    } else {
-        key.parse().ok()?
-    };
-    Some(BackendPeer {
-        addr,
-        client: peer
-            .get("client")
-            .or_else(|| peer.get("peer_id_client"))
-            .and_then(|value| value.as_str())
-            .unwrap_or("")
-            .to_owned(),
-        progress: peer
-            .get("progress")
-            .or_else(|| peer.get("relevance"))
-            .and_then(|value| value.as_f64())
-            .unwrap_or(0.0),
-        download_rate: peer
-            .get("dl_speed")
-            .and_then(|value| value.as_i64())
-            .unwrap_or(0),
-        upload_rate: peer
-            .get("up_speed")
-            .and_then(|value| value.as_i64())
-            .unwrap_or(0),
-        downloaded: peer
-            .get("downloaded")
-            .and_then(|value| value.as_i64())
-            .unwrap_or(0),
-        uploaded: peer
-            .get("uploaded")
-            .and_then(|value| value.as_i64())
-            .unwrap_or(0),
     })
+}
+
+fn qbit_nonnegative_i64(value: Option<i64>, field: &str) -> Result<i64> {
+    let value = value.ok_or_else(|| anyhow::anyhow!("qBittorrent response omitted {field}"))?;
+    if value < 0 {
+        bail!("qBittorrent response contains negative {field}");
+    }
+    Ok(value)
+}
+
+fn qbit_optional_nonnegative_i64(value: Option<i64>, index: usize, field: &str) -> Result<i64> {
+    match value {
+        None => Ok(0),
+        Some(value) if value >= 0 => Ok(value),
+        Some(value) => bail!("qBittorrent tracker {index} returned negative {field}: {value}"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qbit_mutation_failures_in_http_200_bodies_are_rejected() {
+        assert!(validate_qbit_mutation_body(b"", "api/v2/torrents/pause").is_ok());
+        assert!(validate_qbit_mutation_body(b"Ok.\n", "api/v2/torrents/pause").is_ok());
+        assert!(validate_qbit_mutation_body(b"Fails.", "api/v2/torrents/pause").is_err());
+        assert!(validate_qbit_mutation_body(b"unexpected", "api/v2/torrents/pause").is_err());
+    }
 
     #[test]
     fn parses_qbit_peer_response() {
@@ -815,12 +954,44 @@ mod tests {
             }
         });
 
-        let peers = parse_qbit_peer_response(&response);
+        let peers = parse_qbit_peer_response(&response).unwrap();
 
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].addr, "127.0.0.1:6881".parse().unwrap());
         assert_eq!(peers[0].client, "TorrentNG");
         assert_eq!(peers[0].download_rate, 1024);
         assert_eq!(peers[0].upload_rate, 512);
+    }
+
+    #[test]
+    fn bounded_sync_uses_qbittorrent_filters_and_safe_default() {
+        assert_eq!(qbit_sync_filter("seeding"), "seeding");
+        assert_eq!(qbit_sync_filter("missingFiles"), "missingFiles");
+        assert_eq!(qbit_sync_filter("main"), "all");
+        assert_eq!(qbit_sync_filter("unexpected"), "all");
+    }
+
+    #[test]
+    fn qbit_piece_states_reject_unknown_values() {
+        assert_eq!(map_qbit_piece_state(0).unwrap(), BackendPieceState::Missing);
+        assert_eq!(map_qbit_piece_state(1).unwrap(), BackendPieceState::Partial);
+        assert_eq!(
+            map_qbit_piece_state(2).unwrap(),
+            BackendPieceState::Complete
+        );
+        assert!(map_qbit_piece_state(3).is_err());
+    }
+
+    #[test]
+    fn malformed_qbit_peer_snapshots_fail_closed() {
+        assert!(parse_qbit_peer_response(&serde_json::json!({})).is_err());
+        assert!(parse_qbit_peer_response(&serde_json::json!({
+            "peers": { "bad": {} }
+        }))
+        .is_err());
+        assert!(parse_qbit_peer_response(&serde_json::json!({
+            "peers": { "127.0.0.1:6881": { "progress": 2.0 } }
+        }))
+        .is_err());
     }
 }

@@ -12,6 +12,8 @@ webui/playwright-report/
 /config/
 .run/
 .env
+.claude/settings.local.json
+.claude/worktrees/
 benchmarks/report-*.md
 certification/reports/
 certification/bundles/

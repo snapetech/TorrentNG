@@ -20,4 +20,16 @@ pub enum PieceMapError {
     ZeroPieceLength,
     #[error("zero total length")]
     ZeroTotalLength,
+    #[error("piece length exceeds supported u32 range: {0}")]
+    PieceLengthTooLarge(u64),
+    #[error("piece count exceeds supported u32 range: {0}")]
+    PieceCountTooLarge(u64),
+    #[error("file span {file_index} starts at {actual}, expected {expected}")]
+    NonContiguousFileSpan {
+        file_index: u32,
+        expected: u64,
+        actual: u64,
+    },
+    #[error("integer overflow while building piece map: {0}")]
+    IntegerOverflow(&'static str),
 }

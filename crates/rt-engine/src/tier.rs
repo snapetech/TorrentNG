@@ -192,7 +192,6 @@ impl CompactPieceBitmap {
 pub struct DormantTorrentSnapshot {
     pub info_hash: String,
     pub state: TorrentState,
-    pub pieces: CompactPieceBitmap,
     pub tracker_deadline: Option<Instant>,
     pub last_active: Option<Instant>,
 }
@@ -201,21 +200,19 @@ impl DormantTorrentSnapshot {
     pub fn new(
         info_hash: impl Into<String>,
         state: TorrentState,
-        pieces: CompactPieceBitmap,
         tracker_deadline: Option<Instant>,
         last_active: Option<Instant>,
     ) -> Self {
         Self {
             info_hash: info_hash.into(),
             state,
-            pieces,
             tracker_deadline,
             last_active,
         }
     }
 
     pub fn estimate_heap_bytes(&self) -> usize {
-        self.info_hash.capacity() + self.pieces.estimated_heap_bytes()
+        self.info_hash.capacity()
     }
 
     pub fn tier_input(&self, now: Instant, tracker_due_slack: Duration) -> TierInput {
@@ -249,6 +246,7 @@ pub enum TierEvent {
 pub struct TierController<K> {
     policy: TierPolicy,
     tiers: HashMap<K, TorrentActivityTier>,
+    tier_counts: [usize; 3],
     dormant_snapshots: HashMap<K, DormantTorrentSnapshot>,
     dormant_heap_bytes: usize,
     idle_checks: ActivityTimerWheel<K>,
@@ -263,6 +261,7 @@ where
         Self {
             policy,
             tiers: HashMap::new(),
+            tier_counts: [0; 3],
             dormant_snapshots: HashMap::new(),
             dormant_heap_bytes: 0,
             idle_checks: ActivityTimerWheel::default(),
@@ -276,6 +275,12 @@ where
 
     pub fn tracked_len(&self) -> usize {
         self.tiers.len()
+    }
+
+    /// Return O(1) counts for each activity tier in enum order:
+    /// dormant, warm, hot.
+    pub fn tier_counts(&self) -> [usize; 3] {
+        self.tier_counts
     }
 
     /// Number of bytes retained by compact dormant projections. This is
@@ -318,7 +323,12 @@ where
         self.idle_checks.cancel(key);
         self.tracker_checks.cancel(key);
         self.clear_dormant_snapshot(key);
-        self.tiers.remove(key)
+        let tier = self.tiers.remove(key);
+        if let Some(tier) = tier {
+            self.tier_counts[tier_index(tier)] =
+                self.tier_counts[tier_index(tier)].saturating_sub(1);
+        }
+        tier
     }
 
     /// Schedule a persisted tracker deadline for a dormant torrent. Tracker
@@ -369,8 +379,20 @@ where
         self.idle_checks.pop_due(now)
     }
 
+    /// Put a due activity check back on the wheel when the engine deliberately
+    /// limits one reconciliation pass. This keeps a burst of simultaneous
+    /// deadlines from turning the actor into an unbounded serial query loop.
+    pub fn reschedule_idle_check(&mut self, key: K, deadline: Instant) {
+        self.idle_checks.schedule(key, deadline);
+    }
+
     fn record_decision(&mut self, key: K, now: Instant, decision: TierDecision) {
-        self.tiers.insert(key.clone(), decision.tier);
+        if let Some(previous) = self.tiers.insert(key.clone(), decision.tier) {
+            self.tier_counts[tier_index(previous)] =
+                self.tier_counts[tier_index(previous)].saturating_sub(1);
+        }
+        self.tier_counts[tier_index(decision.tier)] =
+            self.tier_counts[tier_index(decision.tier)].saturating_add(1);
         if decision.tier != TorrentActivityTier::Dormant {
             self.clear_dormant_snapshot(&key);
         }
@@ -379,6 +401,14 @@ where
         } else {
             self.idle_checks.cancel(&key);
         }
+    }
+}
+
+fn tier_index(tier: TorrentActivityTier) -> usize {
+    match tier {
+        TorrentActivityTier::Dormant => 0,
+        TorrentActivityTier::Warm => 1,
+        TorrentActivityTier::Hot => 2,
     }
 }
 
@@ -495,7 +525,20 @@ where
     }
 
     pub fn cancel(&mut self, key: &K) -> bool {
-        self.scheduled.remove(key).is_some()
+        let Some(deadline) = self.scheduled.remove(key) else {
+            return false;
+        };
+        if let Some(keys) = self.deadlines.get_mut(&deadline) {
+            // `schedule` is called repeatedly while an active torrent is
+            // being polled. Removing only the reverse index leaves every old
+            // deadline vector in the BTreeMap until it expires, which turns a
+            // hot-set timer wheel into a delayed allocation leak.
+            keys.retain(|candidate| candidate != key);
+            if keys.is_empty() {
+                self.deadlines.remove(&deadline);
+            }
+        }
+        true
     }
 
     pub fn next_deadline(&self) -> Option<Instant> {
@@ -755,18 +798,20 @@ mod tests {
     }
 
     #[test]
-    fn dormant_snapshot_keeps_only_bitmap_and_tracker_deadline_inputs() {
+    fn dormant_snapshot_keeps_only_small_tracker_deadline_inputs() {
         let now = Instant::now();
         let snapshot = DormantTorrentSnapshot::new(
             "a".repeat(40),
             TorrentState::Seeding,
-            CompactPieceBitmap::from_pieces(&[true; 10_000]),
             Some(now + Duration::from_secs(5)),
             Some(now - Duration::from_secs(3600)),
         );
 
-        assert_eq!(snapshot.pieces.piece_count(), 10_000);
-        assert!(snapshot.estimate_heap_bytes() < 2_000);
+        // Piece state is durable in SQLite/fastresume and is loaded on
+        // promotion. Retaining a bitmap in the tier controller would turn a
+        // dormant row into a piece-count-sized allocation for no runtime
+        // benefit.
+        assert!(snapshot.estimate_heap_bytes() <= 40);
 
         let input = snapshot.tier_input(now, Duration::from_secs(10));
         assert!(input.tracker_due);
@@ -816,13 +861,7 @@ mod tests {
         let mut controller = TierController::new(TierPolicy::default());
         let key = "torrent".to_owned();
         controller.apply_input(key.clone(), input(TorrentState::Seeding, now));
-        let snapshot = DormantTorrentSnapshot::new(
-            key.clone(),
-            TorrentState::Seeding,
-            CompactPieceBitmap::missing(8192),
-            None,
-            None,
-        );
+        let snapshot = DormantTorrentSnapshot::new(key.clone(), TorrentState::Seeding, None, None);
         let expected = snapshot.estimate_heap_bytes();
         controller.set_dormant_snapshot(key.clone(), snapshot);
         assert_eq!(controller.dormant_heap_bytes(), expected);
@@ -839,13 +878,8 @@ mod tests {
 
     #[test]
     fn scale_snapshot_enforces_100k_two_percent_proxy_budget() {
-        let dormant_template = DormantTorrentSnapshot::new(
-            "a".repeat(40),
-            TorrentState::Seeding,
-            CompactPieceBitmap::missing(8192),
-            None,
-            None,
-        );
+        let dormant_template =
+            DormantTorrentSnapshot::new("a".repeat(40), TorrentState::Seeding, None, None);
         let dormant_torrents = 98_000;
         let sample = TierScaleSnapshot {
             total_torrents: 100_000,
@@ -893,6 +927,7 @@ mod tests {
 
         assert_eq!(controller.tracked_len(), 100_000);
         assert_eq!(hot_torrents, 2_000);
+        assert_eq!(controller.tier_counts(), [98_000, 0, 2_000]);
         TierScaleSnapshot {
             total_torrents: controller.tracked_len(),
             hot_torrents,
@@ -919,5 +954,20 @@ mod tests {
             controller.next_tracker_deadline(),
             Some(now + Duration::from_secs(30))
         );
+    }
+
+    #[test]
+    fn rescheduling_and_cancelling_removes_stale_idle_deadlines() {
+        let now = Instant::now();
+        let mut wheel = ActivityTimerWheel::default();
+        let key = "torrent".to_owned();
+
+        wheel.schedule(key.clone(), now + Duration::from_secs(1));
+        wheel.schedule(key.clone(), now + Duration::from_secs(2));
+        assert_eq!(wheel.len(), 1);
+        assert_eq!(wheel.deadlines.len(), 1);
+        assert!(wheel.cancel(&key));
+        assert!(wheel.is_empty());
+        assert!(wheel.deadlines.is_empty());
     }
 }

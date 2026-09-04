@@ -1,19 +1,25 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::HashMap,
+    fs::{File, OpenOptions},
+    io::{self, Read},
+    path::{Path, PathBuf},
+};
 
 const DEFAULT_SESSION_DIR: &str = "/session";
 const MAX_BENCODE_DEPTH: usize = 64;
+const MAX_SESSION_TORRENT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_TRACKER_URL_BYTES: usize = 8 * 1024;
+const MAX_TRACKER_URLS: usize = 1024;
 
 pub fn session_tracker_url(hash: &str, cache: &mut HashMap<String, Option<String>>) -> String {
-    let normalized = hash.trim().to_ascii_uppercase();
-    if normalized.is_empty() {
+    let Ok(normalized) = normalize_hash(hash) else {
         return String::new();
-    }
+    };
     if let Some(cached) = cache.get(&normalized) {
         return cached.clone().unwrap_or_default();
     }
 
-    let path = session_dir().join(format!("{normalized}.torrent"));
-    let tracker = std::fs::read(path)
+    let tracker = read_session_torrent(&normalized)
         .ok()
         .and_then(|raw| first_tracker_url(&raw));
     cache.insert(normalized, tracker.clone());
@@ -28,15 +34,69 @@ pub fn session_tracker_urls(hash: &str) -> Vec<String> {
 }
 
 pub fn session_torrent_blob(hash: &str) -> std::io::Result<Vec<u8>> {
+    let normalized = normalize_hash(hash)?;
+    read_session_torrent(&normalized)
+}
+
+fn normalize_hash(hash: &str) -> io::Result<String> {
     let normalized = hash.trim().to_ascii_uppercase();
-    if normalized.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "empty torrent hash",
+    if normalized.is_empty()
+        || normalized.len() > 64
+        || !normalized.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "torrent hash must be a non-empty hexadecimal filename component",
         ));
     }
-    let path = session_dir().join(format!("{normalized}.torrent"));
-    std::fs::read(path)
+    Ok(normalized)
+}
+
+fn read_session_torrent(hash: &str) -> io::Result<Vec<u8>> {
+    let path = session_dir().join(format!("{hash}.torrent"));
+    let file = open_read_no_follow(&path)?;
+    let file_len = file.metadata()?.len();
+    if file_len > MAX_SESSION_TORRENT_BYTES as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "session torrent {} is {file_len} bytes, maximum is {MAX_SESSION_TORRENT_BYTES}",
+                path.display()
+            ),
+        ));
+    }
+    let mut raw = Vec::with_capacity(
+        usize::try_from(file_len)
+            .unwrap_or(MAX_SESSION_TORRENT_BYTES)
+            .min(MAX_SESSION_TORRENT_BYTES),
+    );
+    let mut limited = file.take(MAX_SESSION_TORRENT_BYTES.saturating_add(1) as u64);
+    limited.read_to_end(&mut raw)?;
+    if raw.len() > MAX_SESSION_TORRENT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "session torrent {} grew beyond the {MAX_SESSION_TORRENT_BYTES} byte limit",
+                path.display()
+            ),
+        ));
+    }
+    Ok(raw)
+}
+
+#[cfg(unix)]
+fn open_read_no_follow(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_read_no_follow(path: &Path) -> io::Result<File> {
+    File::open(path)
 }
 
 fn session_dir() -> PathBuf {
@@ -85,12 +145,18 @@ fn push_tracker(
     seen: &mut std::collections::HashSet<String>,
     out: &mut Vec<String>,
 ) {
+    if out.len() >= MAX_TRACKER_URLS {
+        return;
+    }
     if seen.insert(value.clone()) {
         out.push(value);
     }
 }
 
 fn clean_tracker_url(raw: &[u8]) -> Option<String> {
+    if raw.len() > MAX_TRACKER_URL_BYTES {
+        return None;
+    }
     let value = String::from_utf8_lossy(raw).trim().to_owned();
     if value.is_empty() {
         None
@@ -215,8 +281,9 @@ fn skip_value(raw: &[u8], pos: &mut usize, depth: usize) -> Option<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::first_tracker_url;
-    use super::tracker_urls_from_torrent;
+    use super::{
+        first_tracker_url, session_torrent_blob, tracker_urls_from_torrent, MAX_TRACKER_URL_BYTES,
+    };
 
     #[test]
     fn reads_announce_first() {
@@ -246,5 +313,21 @@ mod tests {
                 "udp://tracker:6969/announce".to_owned()
             ]
         );
+    }
+
+    #[test]
+    fn rejects_path_like_hashes() {
+        assert!(session_torrent_blob("../secret").is_err());
+        assert!(session_torrent_blob("ABC/DEF").is_err());
+    }
+
+    #[test]
+    fn ignores_oversized_tracker_urls() {
+        let raw = format!(
+            "d8:announce{}:{}e",
+            MAX_TRACKER_URL_BYTES + 1,
+            "x".repeat(MAX_TRACKER_URL_BYTES + 1)
+        );
+        assert!(first_tracker_url(raw.as_bytes()).is_none());
     }
 }

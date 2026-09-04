@@ -15,9 +15,17 @@ use tokio::{
 // Re-use internal modules via the binary crate root.
 use torrentng::{
     api::{server::AppState, ws::Event},
+    backend::{
+        BackendCapabilities, BackendStatus, BackendTransferLimits, BackendType, TorrentBackend,
+    },
     cache::{AppEventRow, Db, TorrentRow},
     config::Config,
     metrics::Metrics,
+    rtorrent::{
+        files::RawFile,
+        torrents::{RawTorrent, TransferRates},
+        trackers::RawTracker,
+    },
 };
 
 async fn spawn_server() -> (SocketAddr, Client) {
@@ -37,18 +45,23 @@ async fn spawn_server_with_config(cfg: Config) -> (SocketAddr, Client, Arc<Db>) 
 async fn spawn_server_with_config_and_events(
     cfg: Config,
 ) -> (SocketAddr, Client, Arc<Db>, broadcast::Sender<Event>) {
+    let rt = Arc::new(torrentng::rtorrent::Client::new_unix("/nonexistent", 1));
+    let backend = Arc::new(torrentng::backend::rtorrent::RtorrentBackend::new(
+        rt.clone(),
+    ));
+    spawn_server_with_backend_and_events(cfg, rt, backend).await
+}
+
+async fn spawn_server_with_backend_and_events(
+    cfg: Config,
+    rt: Arc<torrentng::rtorrent::Client>,
+    backend: Arc<dyn TorrentBackend>,
+) -> (SocketAddr, Client, Arc<Db>, broadcast::Sender<Event>) {
     let cfg = Arc::new(cfg);
     let db_path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
     let db = Arc::new(Db::open(db_path.as_ref()).unwrap());
     let (tx, _) = broadcast::channel::<Event>(16);
     let metrics = Metrics::new();
-
-    // Stub rTorrent client pointing at a non-existent socket.
-    // Tests that call rTorrent fail gracefully — we only exercise DB-backed endpoints here.
-    let rt = Arc::new(torrentng::rtorrent::Client::new_unix("/nonexistent", 1));
-    let backend = Arc::new(torrentng::backend::rtorrent::RtorrentBackend::new(
-        rt.clone(),
-    ));
 
     let state = AppState {
         cfg,
@@ -61,6 +74,7 @@ async fn spawn_server_with_config_and_events(
         qbit_search_jobs: Arc::new(tokio::sync::RwLock::new(serde_json::Map::new())),
         qbit_next_search_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         qbit_rss_items: Arc::new(tokio::sync::RwLock::new(serde_json::Map::new())),
+        control_plane_write: Arc::new(tokio::sync::Mutex::new(())),
     };
     let app: Router = torrentng::api::server::build_router(state);
 
@@ -73,6 +87,215 @@ async fn spawn_server_with_config_and_events(
     let client = Client::builder().cookie_store(true).build().unwrap();
 
     (addr, client, db, tx)
+}
+
+async fn spawn_server_with_backend(
+    cfg: Config,
+    backend: Arc<dyn TorrentBackend>,
+) -> (SocketAddr, Client, Arc<Db>) {
+    let rt = Arc::new(torrentng::rtorrent::Client::new_unix("/nonexistent", 1));
+    let (addr, client, db, _) = spawn_server_with_backend_and_events(cfg, rt, backend).await;
+    (addr, client, db)
+}
+
+/// Successful backend used by mutation-flow tests. The production handlers
+/// deliberately update the cache only after the backend accepts a mutation;
+/// using the unreachable rTorrent stub here would test the failure path, not
+/// compatibility behavior.
+struct SuccessfulBackend;
+
+#[async_trait::async_trait]
+impl TorrentBackend for SuccessfulBackend {
+    fn backend_type(&self) -> BackendType {
+        BackendType::Torrentng
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            supports_tags: true,
+            supports_categories: true,
+            supports_file_priority: true,
+            supports_tracker_edit: true,
+            supports_recheck: true,
+            supports_torrent_export: true,
+            supports_webseed_reads: true,
+            supports_piece_state_reads: true,
+            supports_piece_hash_reads: true,
+            supports_peer_snapshots: true,
+            supports_peer_add: true,
+            supports_peer_ban: true,
+            supports_queue_order: true,
+            supports_per_torrent_limits: true,
+            supports_global_limits: true,
+            supports_share_limits: true,
+            supports_mode_flags: true,
+            supports_location_update: true,
+            supports_torrent_rename: true,
+            supports_file_rename: true,
+            supports_runtime_user_agent: true,
+            supports_config_overlay: true,
+            supports_restart: true,
+        }
+    }
+
+    async fn health(&self) -> BackendStatus {
+        BackendStatus::Connected
+    }
+
+    async fn transfer_rates(&self) -> anyhow::Result<TransferRates> {
+        Ok(TransferRates::default())
+    }
+
+    async fn list_torrents(&self) -> anyhow::Result<Vec<RawTorrent>> {
+        Ok(Vec::new())
+    }
+
+    async fn add_magnet(
+        &self,
+        _magnet: &str,
+        _save_path: &str,
+        _category: &str,
+        _start: bool,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn add_torrent(
+        &self,
+        _data: &[u8],
+        _save_path: &str,
+        _category: &str,
+        _start: bool,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn remove(&self, _hash: &str, _delete_data: bool) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn start(&self, _hash: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn stop(&self, _hash: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn recheck(&self, _hash: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn reannounce(&self, _hash: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn list_trackers(&self, _hash: &str) -> anyhow::Result<Vec<RawTracker>> {
+        Ok(Vec::new())
+    }
+
+    async fn add_tracker(&self, _hash: &str, _url: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn edit_tracker(
+        &self,
+        _hash: &str,
+        _original_url: &str,
+        _new_url: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn remove_tracker(&self, _hash: &str, _url: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn list_files(&self, _hash: &str) -> anyhow::Result<Vec<RawFile>> {
+        Ok(Vec::new())
+    }
+
+    async fn set_file_priority(
+        &self,
+        _hash: &str,
+        _file_index: usize,
+        _priority: i64,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn set_category(&self, _hash: &str, _category: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn set_location(&self, _hash: &str, _location: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn set_share_limits(
+        &self,
+        _hash: &str,
+        _ratio_limit_milli: i64,
+        _seeding_time_limit: i64,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn set_force_start(&self, _hash: &str, _enabled: bool) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn set_super_seeding(&self, _hash: &str, _enabled: bool) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn set_auto_tmm(&self, _hash: &str, _enabled: bool) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn set_auto_management(&self, _hash: &str, _enabled: bool) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn set_dht(&self, _enabled: bool) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn set_pex(&self, _enabled: bool) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn get_user_agent(&self) -> anyhow::Result<String> {
+        Ok("TorrentNG-Test/1.0".to_owned())
+    }
+
+    async fn set_user_agent(&self, _user_agent: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn global_limits(&self) -> anyhow::Result<BackendTransferLimits> {
+        Ok(BackendTransferLimits::default())
+    }
+
+    async fn add_tags(&self, _hash: &str, _tags: &[&str]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn remove_tags(&self, _hash: &str, _tags: &[&str]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn set_tags(&self, _hash: &str, _tags: &[&str]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn has_bounded_sync(&self) -> bool {
+        true
+    }
+}
+
+fn successful_backend() -> Arc<dyn TorrentBackend> {
+    Arc::new(SuccessfulBackend)
 }
 
 fn url(addr: SocketAddr, path: &str) -> String {
@@ -247,6 +470,98 @@ async fn qb_sid_cookie_authorizes_requests() {
 }
 
 #[tokio::test]
+async fn metrics_requires_auth_when_tokens_are_configured() {
+    let mut cfg = Config::test_default();
+    cfg.auth.api_tokens = vec!["sidecar-api-token-20260904".to_owned()];
+    let (addr, client, _) = spawn_server_with_config(cfg).await;
+
+    let res = client.get(url(addr, "/metrics")).send().await.unwrap();
+    assert_eq!(res.status(), 401);
+
+    let res = client
+        .get(url(addr, "/metrics"))
+        .bearer_auth("sidecar-api-token-20260904")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+}
+
+#[tokio::test]
+async fn trusted_proxy_header_authorizes_only_when_explicitly_enabled() {
+    let mut cfg = Config::test_default();
+    cfg.auth.api_tokens = vec!["sidecar-api-token-20260904".to_owned()];
+    cfg.auth.trust_proxy_header = true;
+    let (addr, client, _) = spawn_server_with_config(cfg).await;
+
+    let res = client
+        .get(url(addr, "/api/qb/v2/app/preferences"))
+        .header("X-Remote-User", "alice")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    let res = client
+        .get(url(addr, "/api/qb/v2/app/preferences"))
+        .header("X-Remote-User", "   ")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 401);
+}
+
+#[tokio::test]
+async fn unknown_auth_routes_are_not_public() {
+    let mut cfg = Config::test_default();
+    cfg.auth.api_tokens = vec!["sidecar-api-token-20260904".to_owned()];
+    let (addr, client, _) = spawn_server_with_config(cfg).await;
+
+    let res = client
+        .get(url(addr, "/api/v2/auth/future-admin-operation"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 401);
+}
+
+#[tokio::test]
+async fn signed_session_cookie_does_not_contain_the_api_token() {
+    let mut cfg = Config::test_default();
+    cfg.auth.api_tokens = vec!["sidecar-api-token-20260904".to_owned()];
+    cfg.auth.secret_key = Some("sidecar-session-secret-20260904-0123456789abcdef".to_owned());
+    let (addr, client, _) = spawn_server_with_config(cfg).await;
+
+    let res = client
+        .post(url(addr, "/api/qb/v2/auth/login"))
+        .form(&[
+            ("username", "admin"),
+            ("password", "sidecar-api-token-20260904"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let cookies = res
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .map(|value| value.to_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(cookies.len(), 2);
+    assert!(cookies
+        .iter()
+        .all(|cookie| !cookie.contains("sidecar-api-token-20260904")));
+
+    let res = client
+        .get(url(addr, "/api/qb/v2/app/preferences"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+}
+
+#[tokio::test]
 async fn qb_app_read_endpoints_accept_post_for_cross_seed() {
     let mut cfg = Config::test_default();
     cfg.auth.api_tokens = vec!["secret-token".to_owned()];
@@ -376,7 +691,8 @@ async fn categories_round_trip() {
 
 #[tokio::test]
 async fn deleting_category_clears_cached_torrent_category() {
-    let (addr, client, db) = spawn_server_with_db().await;
+    let (addr, client, db) =
+        spawn_server_with_backend(Config::test_default(), successful_backend()).await;
     seed_torrent(&db, "cat-hash", "Categorized");
 
     let res = client
@@ -595,7 +911,8 @@ async fn qb_torrents_info_status_filters_match_cache_state() {
 
 #[tokio::test]
 async fn qb_integration_flow_read_only_clients() {
-    let (addr, client, db) = spawn_server_with_db().await;
+    let (addr, client, db) =
+        spawn_server_with_backend(Config::test_default(), successful_backend()).await;
     seed_torrent_with(&db, "mobile-readonly", "Mobile Readonly", |t| {
         t.complete = true;
         t.category = "Movies".into();
@@ -655,7 +972,8 @@ async fn qb_integration_flow_read_only_clients() {
 
 #[tokio::test]
 async fn qb_integration_flow_arr_category_tag_and_sync() {
-    let (addr, client, db) = spawn_server_with_db().await;
+    let (addr, client, db) =
+        spawn_server_with_backend(Config::test_default(), successful_backend()).await;
     seed_torrent_with(&db, "arr-managed", "Arr Managed", |t| {
         t.complete = true;
         t.category = "radarr".into();
@@ -715,7 +1033,8 @@ async fn qb_integration_flow_arr_category_tag_and_sync() {
 
 #[tokio::test]
 async fn qb_integration_flow_cross_seed_tracker_and_reannounce() {
-    let (addr, client, db) = spawn_server_with_db().await;
+    let (addr, client, db) =
+        spawn_server_with_backend(Config::test_default(), successful_backend()).await;
     seed_torrent_with(&db, "cross-seed", "Cross Seed", |t| {
         t.complete = true;
         t.tracker_url = "udp://old.example/announce".into();
@@ -729,7 +1048,7 @@ async fn qb_integration_flow_cross_seed_tracker_and_reannounce() {
     ] {
         let res = client
             .post(url(addr, path))
-            .form(&[("hashes", "cross-seed")])
+            .form(&[("hashes", "cross-seed"), ("value", "false")])
             .send()
             .await
             .unwrap();
@@ -764,7 +1083,10 @@ async fn qb_integration_flow_cross_seed_tracker_and_reannounce() {
 
 #[tokio::test]
 async fn websocket_events_emit_for_native_metadata_mutations() {
-    let (addr, client, db, tx) = spawn_server_with_config_and_events(Config::test_default()).await;
+    let rt = Arc::new(torrentng::rtorrent::Client::new_unix("/nonexistent", 1));
+    let (addr, client, db, tx) =
+        spawn_server_with_backend_and_events(Config::test_default(), rt, successful_backend())
+            .await;
     let mut rx = tx.subscribe();
     seed_torrent(&db, "event-native", "Event Native");
 
@@ -802,7 +1124,10 @@ async fn websocket_events_emit_for_native_metadata_mutations() {
 
 #[tokio::test]
 async fn websocket_events_emit_for_qb_metadata_mutations() {
-    let (addr, client, db, tx) = spawn_server_with_config_and_events(Config::test_default()).await;
+    let rt = Arc::new(torrentng::rtorrent::Client::new_unix("/nonexistent", 1));
+    let (addr, client, db, tx) =
+        spawn_server_with_backend_and_events(Config::test_default(), rt, successful_backend())
+            .await;
     let mut rx = tx.subscribe();
     seed_torrent(&db, "event-qb", "Event QB");
 
@@ -874,6 +1199,23 @@ async fn native_torrents_list_status_filters_match_cache_state() {
     assert_eq!(body["torrents"][0]["hash"], "active-down");
 }
 
+#[tokio::test]
+async fn native_delete_rejects_malformed_delete_files() {
+    let (addr, client, db) =
+        spawn_server_with_backend(Config::test_default(), successful_backend()).await;
+    seed_torrent(&db, "delete-parse", "Delete Parse");
+
+    let res = client
+        .delete(url(
+            addr,
+            "/api/v1/torrents/delete-parse?delete_files=not-a-boolean",
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 400);
+}
+
 // --- Single torrent not found ---
 
 #[tokio::test]
@@ -919,7 +1261,8 @@ async fn native_torrent_update_save_path_validates_and_checks_existence() {
 
 #[tokio::test]
 async fn qb_set_location_updates_cache_for_known_torrents() {
-    let (addr, client, db) = spawn_server_with_db().await;
+    let (addr, client, db) =
+        spawn_server_with_backend(Config::test_default(), successful_backend()).await;
     seed_torrent(&db, "location-hash", "Location");
 
     let res = client
@@ -1018,6 +1361,50 @@ async fn qb_torrent_properties_from_cache() {
     assert_eq!(res.status(), 400);
 }
 
+#[tokio::test]
+async fn qb_hash_mutations_are_case_insensitive() {
+    let (addr, client, db) =
+        spawn_server_with_backend(Config::test_default(), successful_backend()).await;
+    let uppercase = "ABCDEF1234567890";
+    let lowercase = uppercase.to_ascii_lowercase();
+    seed_torrent(&db, uppercase, "Case-insensitive");
+
+    let res = client
+        .post(url(addr, "/api/qb/v2/torrents/setCategory"))
+        .form(&[("hashes", lowercase.as_str()), ("category", "Movies")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    let res = client
+        .post(url(addr, "/api/qb/v2/torrents/addTags"))
+        .form(&[("hashes", lowercase.as_str()), ("tags", "tracked")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    let res = client
+        .get(url(addr, &format!("/api/v1/torrents/{uppercase}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["category"], "Movies");
+    assert_eq!(body["tags"], "tracked");
+
+    let res = client
+        .post(url(addr, "/api/qb/v2/torrents/delete"))
+        .form(&[("hashes", lowercase.as_str()), ("deleteFiles", "false")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert!(!db.exists(uppercase).unwrap());
+}
+
 // --- qBit createCategory / removeCategories ---
 
 #[tokio::test]
@@ -1070,7 +1457,8 @@ async fn qb_create_remove_category() {
 
 #[tokio::test]
 async fn qb_create_delete_tags() {
-    let (addr, client) = spawn_server().await;
+    let (addr, client, _) =
+        spawn_server_with_backend(Config::test_default(), successful_backend()).await;
 
     let res = client
         .post(url(addr, "/api/qb/v2/torrents/createTags"))
@@ -1126,6 +1514,17 @@ async fn qb_sync_maindata_empty() {
 }
 
 #[tokio::test]
+async fn qb_sync_maindata_rejects_negative_revision() {
+    let (addr, client) = spawn_server().await;
+    let res = client
+        .get(url(addr, "/api/qb/v2/sync/maindata?rid=-1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 400);
+}
+
+#[tokio::test]
 async fn qb_sync_maindata_includes_category_and_tag_metadata() {
     let (addr, client, db) = spawn_server_with_db().await;
     db.upsert_category("Movies", "/data/movies").unwrap();
@@ -1166,15 +1565,9 @@ async fn qb_transfer_info() {
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), 200);
+    assert_eq!(res.status(), 503);
     let body: serde_json::Value = res.json().await.unwrap();
-    assert_eq!(body["connection_status"], "connected");
-    assert_eq!(body["dl_info_speed"], 0);
-    assert_eq!(body["up_info_speed"], 0);
-    assert_eq!(body["dl_info_data"], 0);
-    assert_eq!(body["up_info_data"], 0);
-    assert_eq!(body["dl_rate_limit"], 0);
-    assert_eq!(body["up_rate_limit"], 0);
+    assert_eq!(body["connection_status"], "unreachable");
 }
 
 // --- Health ---
@@ -1225,9 +1618,9 @@ async fn native_storage_reports_configured_roots() {
 async fn native_jobs_returns_empty_list_for_sidecar_mode() {
     let (addr, client) = spawn_server().await;
     let res = client.get(url(addr, "/api/v1/jobs")).send().await.unwrap();
-    assert_eq!(res.status(), 200);
+    assert_eq!(res.status(), 501);
     let body: serde_json::Value = res.json().await.unwrap();
-    assert_eq!(body["jobs"].as_array().unwrap().len(), 0);
+    assert_eq!(body["error"]["code"], "NOT_IMPLEMENTED");
 }
 
 #[tokio::test]
@@ -1798,6 +2191,65 @@ async fn qb_rss_rules_use_native_rule_store() {
 }
 
 #[tokio::test]
+async fn qb_rss_rule_rejects_malformed_fields_instead_of_defaulting_them() {
+    let (addr, client) = spawn_server().await;
+    let malformed_rules = [
+        serde_json::json!({}),
+        serde_json::json!({
+            "affectedFeeds": "https://example.invalid/rss",
+            "mustContain": "ubuntu"
+        }),
+        serde_json::json!({
+            "affectedFeeds": [
+                "https://example.invalid/one",
+                "https://example.invalid/two"
+            ],
+            "mustContain": "ubuntu"
+        }),
+        serde_json::json!({
+            "affectedFeeds": ["https://example.invalid/rss"],
+            "mustContain": "ubuntu",
+            "enabled": "true"
+        }),
+        serde_json::json!({
+            "affectedFeeds": ["https://example.invalid/rss"],
+            "mustContain": 42
+        }),
+        serde_json::json!({
+            "affectedFeeds": ["https://example.invalid/rss"],
+            "mustContain": "ubuntu",
+            "tags": ["linux"]
+        }),
+        serde_json::json!({
+            "affectedFeeds": ["https://example.invalid/rss"],
+            "mustContain": "ubuntu",
+            "addPaused": "true"
+        }),
+    ];
+
+    for rule in malformed_rules {
+        let raw = rule.to_string();
+        let response = client
+            .post(url(addr, "/api/qb/v2/rss/setRule"))
+            .form(&[("ruleName", "malformed"), ("rule", raw.as_str())])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400, "rule={raw}");
+    }
+
+    let rules: serde_json::Value = client
+        .get(url(addr, "/api/qb/v2/rss/rules"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(rules, serde_json::json!({}));
+}
+
+#[tokio::test]
 async fn native_workflow_run_dry_run_matches_completed_filters() {
     let (addr, client, db) = spawn_server_with_db().await;
     seed_torrent_with(&db, "workflow-match", "Workflow Match", |t| {
@@ -1862,7 +2314,9 @@ async fn native_workflow_run_dry_run_matches_completed_filters() {
 #[tokio::test]
 async fn native_workflow_webhook_executes_and_records_history() {
     let (hook_addr, mut hook_rx) = spawn_webhook_receiver().await;
-    let (addr, client, db) = spawn_server_with_db().await;
+    let mut cfg = Config::test_default();
+    cfg.workflows.allow_private_webhooks = true;
+    let (addr, client, db) = spawn_server_with_config(cfg).await;
     seed_torrent_with(&db, "workflow-webhook", "Workflow Webhook", |t| {
         t.complete = true;
         t.category = "Movies".into();
@@ -2050,6 +2504,45 @@ async fn qb_sync_maindata_incremental() {
 }
 
 #[tokio::test]
+async fn qb_sync_maindata_incremental_includes_removed_torrents() {
+    let (addr, client, db) =
+        spawn_server_with_backend(Config::test_default(), Arc::new(SuccessfulBackend)).await;
+    seed_torrent(&db, "removed-hash", "Removed");
+
+    let res = client
+        .get(url(addr, "/api/qb/v2/sync/maindata?rid=0"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let rid = body["rid"].as_i64().unwrap();
+
+    let res = client
+        .post(url(addr, "/api/qb/v2/torrents/delete"))
+        .form(&[("hashes", "removed-hash"), ("deleteFiles", "false")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    let res = client
+        .get(url(addr, &format!("/api/qb/v2/sync/maindata?rid={rid}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["full_update"], false);
+    assert_eq!(body["torrents"].as_object().unwrap().len(), 0);
+    assert_eq!(
+        body["torrents_removed"],
+        serde_json::json!(["removed-hash"])
+    );
+    assert!(body["rid"].as_i64().unwrap() > rid);
+}
+
+#[tokio::test]
 async fn add_torrent_rejects_empty_payloads() {
     let (addr, client) = spawn_server().await;
 
@@ -2185,7 +2678,8 @@ async fn bulk_category_and_location_validate_and_preview() {
 
 #[tokio::test]
 async fn bulk_set_category_applies_to_cached_torrents() {
-    let (addr, client, db) = spawn_server_with_db().await;
+    let (addr, client, db) =
+        spawn_server_with_backend(Config::test_default(), successful_backend()).await;
     seed_torrent(&db, "bulk-cat-hash", "Bulk Category");
 
     let res = client
@@ -2237,7 +2731,7 @@ async fn qb_extended_torrent_forms_parse() {
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), 200);
+    assert_eq!(res.status(), 501);
     assert_eq!(res.text().await.unwrap(), "Fails.");
 
     let res = client
@@ -2246,7 +2740,7 @@ async fn qb_extended_torrent_forms_parse() {
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), 200);
+    assert_eq!(res.status(), 400);
 
     let res = client
         .post(url(addr, "/api/qb/v2/torrents/setShareLimits"))
@@ -2258,7 +2752,7 @@ async fn qb_extended_torrent_forms_parse() {
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), 200);
+    assert_eq!(res.status(), 400);
 
     let res = client
         .post(url(addr, "/api/qb/v2/torrents/editTracker"))
@@ -2274,7 +2768,7 @@ async fn qb_extended_torrent_forms_parse() {
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), 200);
+    assert_eq!(res.status(), 400);
 
     let res = client
         .post(url(addr, "/api/qb/v2/torrents/toggleSequentialDownload"))
@@ -2282,12 +2776,13 @@ async fn qb_extended_torrent_forms_parse() {
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), 200);
+    assert_eq!(res.status(), 501);
 }
 
 #[tokio::test]
 async fn qb_hashes_all_expands_from_cache() {
-    let (addr, client, db) = spawn_server_with_db().await;
+    let (addr, client, db) =
+        spawn_server_with_backend(Config::test_default(), successful_backend()).await;
     seed_torrent(&db, "hash-a", "Alpha");
     seed_torrent(&db, "hash-b", "Beta");
 
@@ -2313,9 +2808,19 @@ async fn qb_hashes_all_expands_from_cache() {
 
 #[tokio::test]
 async fn qb_maindata_delta_includes_metadata_changes() {
-    let (addr, client, db) = spawn_server_with_db().await;
+    let (addr, client, db) =
+        spawn_server_with_backend(Config::test_default(), successful_backend()).await;
     seed_torrent(&db, "meta-hash", "Metadata");
     seed_torrent(&db, "tag-delta-hash", "Tag Delta");
+
+    let res = client
+        .get(url(addr, "/api/qb/v2/sync/maindata?rid=0"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let initial_rid = body["rid"].as_i64().unwrap();
 
     let res = client
         .post(url(addr, "/api/qb/v2/torrents/setCategory"))
@@ -2326,7 +2831,10 @@ async fn qb_maindata_delta_includes_metadata_changes() {
     assert_eq!(res.status(), 200);
 
     let res = client
-        .get(url(addr, "/api/qb/v2/sync/maindata?rid=1"))
+        .get(url(
+            addr,
+            &format!("/api/qb/v2/sync/maindata?rid={initial_rid}"),
+        ))
         .send()
         .await
         .unwrap();
@@ -2368,7 +2876,10 @@ async fn qb_maindata_delta_includes_metadata_changes() {
     assert_eq!(res.status(), 200);
 
     let res = client
-        .get(url(addr, "/api/qb/v2/sync/maindata?rid=1"))
+        .get(url(
+            addr,
+            &format!("/api/qb/v2/sync/maindata?rid={initial_rid}"),
+        ))
         .send()
         .await
         .unwrap();
@@ -2393,7 +2904,10 @@ async fn qb_maindata_delta_includes_metadata_changes() {
     assert_eq!(res.status(), 200);
 
     let res = client
-        .get(url(addr, "/api/qb/v2/sync/maindata?rid=1"))
+        .get(url(
+            addr,
+            &format!("/api/qb/v2/sync/maindata?rid={initial_rid}"),
+        ))
         .send()
         .await
         .unwrap();
@@ -2404,7 +2918,8 @@ async fn qb_maindata_delta_includes_metadata_changes() {
 
 #[tokio::test]
 async fn qb_set_tags_replaces_cache_tags() {
-    let (addr, client, db) = spawn_server_with_db().await;
+    let (addr, client, db) =
+        spawn_server_with_backend(Config::test_default(), successful_backend()).await;
     seed_torrent(&db, "tag-hash", "Tagged");
 
     let res = client
@@ -2435,14 +2950,17 @@ async fn qb_set_tags_replaces_cache_tags() {
 
 #[tokio::test]
 async fn qb_inert_surfaces_are_compatible() {
-    let (addr, client) = spawn_server().await;
+    let (addr, client, db, _) = spawn_server_with_config_and_events(Config::test_default()).await;
+    // These are optional/projection-only surfaces, but they still require a
+    // real torrent target. Using an unknown hash would turn a compatibility
+    // test into an assertion that the API silently accepts typos.
+    seed_torrent(&db, "abc", "Compatibility fixture");
 
     for path in [
         "/api/qb/v2/torrents/webseeds?hash=abc",
         "/api/qb/v2/torrents/pieceStates?hash=abc",
         "/api/qb/v2/torrents/pieceHashes?hash=abc",
         "/api/qb/v2/log/main",
-        "/api/qb/v2/log/peers",
         "/api/qb/v2/search/categories",
         "/api/qb/v2/search/plugins",
         "/api/qb/v2/rss/matchingArticles",
@@ -2452,6 +2970,13 @@ async fn qb_inert_surfaces_are_compatible() {
         let body: serde_json::Value = res.json().await.unwrap();
         assert!(body.as_array().is_some(), "{path}");
     }
+
+    let res = client
+        .get(url(addr, "/api/qb/v2/log/peers"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 501);
 
     let res = client
         .get(url(addr, "/api/qb/v2/search/status"))
@@ -2478,9 +3003,91 @@ async fn qb_inert_surfaces_are_compatible() {
         "/api/qb/v2/transfer/uploadLimit",
     ] {
         let res = client.get(url(addr, path)).send().await.unwrap();
-        assert_eq!(res.status(), 200, "{path}");
-        assert_eq!(res.text().await.unwrap(), "0");
+        assert_eq!(res.status(), 501, "{path}");
     }
+}
+
+#[tokio::test]
+async fn qb_mutation_booleans_fail_closed_and_capabilities_do_not_overclaim() {
+    let (addr, client) = spawn_server().await;
+
+    let res = client
+        .post(url(addr, "/api/qb/v2/torrents/delete"))
+        .form(&[("hashes", "all"), ("deleteFiles", "not-a-boolean")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    // The rTorrent adapter inherits rejecting implementations for mode
+    // mutations. Its capability manifest must therefore fail closed before
+    // the request reaches the unreachable stub client.
+    let res = client
+        .post(url(addr, "/api/qb/v2/torrents/setForceStart"))
+        .form(&[("hashes", "all"), ("value", "true")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_IMPLEMENTED);
+
+    let res = client
+        .post(url(addr, "/api/qb/v2/torrents/setForceStart"))
+        .form(&[("hashes", "all")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_IMPLEMENTED);
+}
+
+#[tokio::test]
+async fn qb_limit_mutations_require_explicit_valid_values() {
+    let (addr, client, db) =
+        spawn_server_with_backend(Config::test_default(), successful_backend()).await;
+    seed_torrent(&db, "limit-parse", "Limit Parse");
+
+    for (path, form) in [
+        (
+            "/api/qb/v2/torrents/setDownloadLimit",
+            vec![("hashes", "limit-parse")],
+        ),
+        (
+            "/api/qb/v2/torrents/setUploadLimit",
+            vec![("hashes", "limit-parse"), ("limit", "-1")],
+        ),
+        ("/api/qb/v2/transfer/setDownloadLimit", vec![]),
+    ] {
+        let res = client
+            .post(url(addr, path))
+            .form(&form)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 400, "{path}");
+    }
+
+    let res = client
+        .post(url(addr, "/api/qb/v2/torrents/setShareLimits"))
+        .form(&[("hashes", "limit-parse")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 400);
+
+    let res = client
+        .post(url(addr, "/api/qb/v2/torrents/setShareLimits"))
+        .form(&[("hashes", "limit-parse"), ("ratioLimit", "-1")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    let res = client
+        .post(url(addr, "/api/qb/v2/torrents/setShareLimits"))
+        .form(&[("hashes", "limit-parse"), ("seedingTimeLimit", "-3")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 400);
 }
 
 #[tokio::test]
@@ -2592,6 +3199,39 @@ async fn qb_search_plugins_jobs_and_rss_items_are_stateful() {
     assert_eq!(results["pattern"], "debian");
     assert_eq!(results["plugins"], "linux.py");
 
+    let res = client
+        .post(url(addr, "/api/qb/v2/search/enablePlugin"))
+        .form(&[("names", "linux.py"), ("enable", "not-a-boolean")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 400);
+
+    let res = client
+        .post(url(addr, "/api/qb/v2/search/stop"))
+        .form(&[("id", "999")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 404);
+
+    let res = client
+        .get(url(addr, "/api/qb/v2/search/results?id=999"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 404);
+
+    let res = client
+        .get(url(
+            addr,
+            "/api/qb/v2/search/results?id=1&limit=not-a-number",
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 400);
+
     for (endpoint, form) in [
         ("/api/qb/v2/rss/addFolder", vec![("path", "linux")]),
         (
@@ -2655,6 +3295,63 @@ async fn qb_search_plugins_jobs_and_rss_items_are_stateful() {
     assert!(items.get("linux/example").is_none());
     assert_eq!(items["linux/moved"]["read"], true);
     assert!(items["linux/moved"]["lastBuildDate"].as_i64().unwrap() > 0);
+
+    let res = client
+        .post(url(addr, "/api/qb/v2/rss/markAsRead"))
+        .form(&[("itemPath", "linux/missing")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 404);
+
+    let res = client
+        .post(url(addr, "/api/qb/v2/rss/refreshItem"))
+        .form(&[("itemPath", "linux/missing")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 404);
+
+    let res = client
+        .post(url(addr, "/api/qb/v2/rss/addFeed"))
+        .form(&[
+            ("url", "https://example.test/occupied"),
+            ("path", "linux/occupied"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    let res = client
+        .post(url(addr, "/api/qb/v2/rss/moveItem"))
+        .form(&[("itemPath", "linux/moved"), ("destPath", "linux/occupied")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 409);
+
+    let res = client
+        .post(url(addr, "/api/qb/v2/rss/moveItem"))
+        .form(&[("itemPath", "linux/missing"), ("destPath", "linux/new")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 404);
+}
+
+#[tokio::test]
+async fn qb_torrents_info_rejects_malformed_pagination_booleans() {
+    let (addr, client) = spawn_server().await;
+
+    for path in [
+        "/api/qb/v2/torrents/info?limit=not-a-number",
+        "/api/qb/v2/torrents/info?offset=-1",
+        "/api/qb/v2/torrents/info?reverse=not-a-boolean",
+    ] {
+        let res = client.get(url(addr, path)).send().await.unwrap();
+        assert_eq!(res.status(), 400, "{path}");
+    }
 }
 
 #[tokio::test]
@@ -2852,7 +3549,7 @@ async fn qb_set_preferences_validates_json() {
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), 200);
+    assert_eq!(res.status(), 503);
 
     let res = client
         .post(url(addr, "/api/qb/v2/app/setPreferences"))
@@ -2871,7 +3568,7 @@ async fn qb_set_preferences_validates_json() {
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), 200);
+    assert_eq!(res.status(), 503);
 
     let events = db.list_app_events(10).unwrap();
     assert_eq!(events[0].kind, "rtorrent_user_agent_error");

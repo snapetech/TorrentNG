@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 
 use super::{db::Db, ListParams};
@@ -50,12 +50,12 @@ impl Db {
             .query_row("SELECT value FROM kv WHERE key=?1", params![KEY], |r| {
                 r.get(0)
             })
-            .ok();
+            .optional()?;
         let mut views: Vec<SavedView> = match raw {
             Some(raw) => serde_json::from_str(&raw)?,
             None => Vec::new(),
         };
-        views.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        views.sort_by_key(|a| a.name.to_lowercase());
         Ok(views)
     }
 
@@ -63,31 +63,80 @@ impl Db {
         if view.id.trim().is_empty() {
             view.id = uuid::Uuid::new_v4().to_string();
         }
-        let mut views = self.list_saved_views()?;
-        views.retain(|existing| existing.id != view.id && existing.name != view.name);
-        views.push(view);
-        views.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-        if views.len() > MAX_VIEWS {
-            views.truncate(MAX_VIEWS);
-        }
-        self.save_saved_views(&views)?;
-        Ok(views)
+        let id = view.id.clone();
+        self.update_saved_views(|views| {
+            views.retain(|existing| existing.id != id && existing.name != view.name);
+            views.push(view);
+        })
     }
 
     pub fn delete_saved_view(&self, id: &str) -> Result<Vec<SavedView>> {
-        let mut views = self.list_saved_views()?;
-        views.retain(|existing| existing.id != id);
-        self.save_saved_views(&views)?;
-        Ok(views)
+        self.update_saved_views(|views| {
+            views.retain(|existing| existing.id != id);
+        })
     }
 
-    fn save_saved_views(&self, views: &[SavedView]) -> Result<()> {
-        let raw = serde_json::to_string(views)?;
-        self.0.lock().expect("db").execute(
-            "INSERT INTO kv(key, value) VALUES(?1,?2)
-             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            params![KEY, raw],
-        )?;
-        Ok(())
+    fn update_saved_views<F>(&self, update: F) -> Result<Vec<SavedView>>
+    where
+        F: FnOnce(&mut Vec<SavedView>),
+    {
+        let mut conn = self.0.lock().expect("db");
+        let tx = conn.transaction()?;
+        let raw: Option<String> = tx
+            .query_row("SELECT value FROM kv WHERE key=?1", params![KEY], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        let mut views: Vec<SavedView> = match raw {
+            Some(raw) => serde_json::from_str(&raw)?,
+            None => Vec::new(),
+        };
+        update(&mut views);
+        views.sort_by_key(|view| view.name.to_lowercase());
+        views.truncate(MAX_VIEWS);
+        let raw = serde_json::to_string(&views)?;
+        write_saved_views(&tx, &raw)?;
+        tx.commit()?;
+        Ok(views)
+    }
+}
+
+fn write_saved_views(tx: &Transaction<'_>, raw: &str) -> Result<()> {
+    tx.execute(
+        "INSERT INTO kv(key, value) VALUES(?1,?2)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![KEY, raw],
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn concurrent_saved_view_updates_do_not_lose_views() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Db::open(&directory.path().join("cache.sqlite")).unwrap();
+        let start = Arc::new(std::sync::Barrier::new(16));
+
+        std::thread::scope(|scope| {
+            for index in 0..16 {
+                let db = db.clone();
+                let start = Arc::clone(&start);
+                scope.spawn(move || {
+                    start.wait();
+                    db.upsert_saved_view(SavedView {
+                        id: format!("view-{index}"),
+                        name: format!("View {index}"),
+                        params: SavedViewParams::default(),
+                    })
+                    .unwrap();
+                });
+            }
+        });
+
+        assert_eq!(db.list_saved_views().unwrap().len(), 16);
     }
 }

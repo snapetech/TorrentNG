@@ -27,7 +27,7 @@ pub struct V2FileHash {
     pub file_index: u32,
     pub path: SafeRelPath,
     pub length: u64,
-    pub pieces_root: [u8; 32],
+    pub pieces_root: Option<[u8; 32]>,
 }
 
 /// Verifies piece data against expected SHA-1 hashes by reading directly
@@ -153,7 +153,11 @@ impl<'a> PieceVerifier<'a> {
         start: u32,
         end: u32,
     ) -> Result<Vec<(u32, VerifyResult)>, StorageError> {
+        let start = start.min(self.piece_map.piece_count);
         let end = end.min(self.piece_map.piece_count);
+        if start >= end {
+            return Ok(Vec::new());
+        }
         let mut results = Vec::with_capacity((end - start) as usize);
         for piece in start..end {
             let result = self.verify_piece(piece).await;
@@ -224,7 +228,11 @@ impl<'a> V2FileVerifier<'a> {
                 };
             }
         };
-        if actual == file.pieces_root {
+        if file.pieces_root.is_none() && file.length == 0 {
+            // BEP 52 omits `pieces root` for empty files. `file_root` still
+            // read the path, so a missing file is reported as Missing above.
+            VerifyResult::Valid
+        } else if Some(actual) == file.pieces_root {
             VerifyResult::Valid
         } else {
             tracing::warn!(
@@ -569,6 +577,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verify_range_returns_empty_for_reversed_or_out_of_range_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = vec![FileSpan {
+            file_index: 0,
+            path: SafeRelPath::from_name("data.bin", false).unwrap(),
+            content_offset: 0,
+            length: 32,
+        }];
+        let pm = PieceMap::new(32, files).unwrap();
+        let sched = ssd_scheduler();
+        let hashes = [[0u8; 20]];
+        let verifier = PieceVerifier::new(dir.path(), &sched, &pm, &hashes);
+
+        assert!(verifier.verify_range(1, 0).await.unwrap().is_empty());
+        assert!(verifier
+            .verify_range(u32::MAX, u32::MAX)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
     async fn v2_file_verify_accepts_matching_file_root() {
         let dir = tempfile::tempdir().unwrap();
         let content: Vec<u8> = (0..(V2FileVerifier::LEAF_SIZE + 17))
@@ -580,7 +610,7 @@ mod tests {
             file_index: 3,
             path: SafeRelPath::from_name("data.bin", false).unwrap(),
             length: content.len() as u64,
-            pieces_root: v2_file_root(&content),
+            pieces_root: Some(v2_file_root(&content)),
         };
         let sched = ssd_scheduler();
         let verifier = V2FileVerifier::new(dir.path(), &sched, std::slice::from_ref(&file));
@@ -620,7 +650,7 @@ mod tests {
             file_index: 7,
             path: SafeRelPath::from_name(fname, false).unwrap(),
             length: file_len,
-            pieces_root: v2_file_root(&expected),
+            pieces_root: Some(v2_file_root(&expected)),
         };
         let sched = ssd_scheduler();
         let verifier = V2FileVerifier::new(dir.path(), &sched, std::slice::from_ref(&file));
@@ -636,11 +666,27 @@ mod tests {
             file_index: 0,
             path: SafeRelPath::from_name("data.bin", false).unwrap(),
             length: 7,
-            pieces_root: [0u8; 32],
+            pieces_root: Some([0u8; 32]),
         };
         let sched = ssd_scheduler();
         let verifier = V2FileVerifier::new(dir.path(), &sched, std::slice::from_ref(&file));
 
         assert_eq!(verifier.verify_file(&file).await, VerifyResult::Invalid);
+    }
+
+    #[tokio::test]
+    async fn v2_file_verify_accepts_empty_file_without_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("empty.bin"), []).unwrap();
+        let file = V2FileHash {
+            file_index: 2,
+            path: SafeRelPath::from_name("empty.bin", false).unwrap(),
+            length: 0,
+            pieces_root: None,
+        };
+        let sched = ssd_scheduler();
+        let verifier = V2FileVerifier::new(dir.path(), &sched, std::slice::from_ref(&file));
+
+        assert_eq!(verifier.verify_file(&file).await, VerifyResult::Valid);
     }
 }

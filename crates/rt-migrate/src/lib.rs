@@ -1,6 +1,8 @@
 pub mod export;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use rt_bencode::{decode, BValue, Decoder};
@@ -277,6 +279,7 @@ impl MigrationTorrent {
                     tracker_index: i64_saturating(index as u64),
                     tier: i64_saturating(index as u64),
                     url: url.clone(),
+                    tracker_id: None,
                     status: self.tracker_activity.status(),
                     last_announce_at: self.tracker_activity.last_announce_at,
                     next_announce_at: self.tracker_activity.next_announce_at,
@@ -1867,10 +1870,10 @@ fn collect_file_hints(
             save_path.join(&file.path),
             save_path.join(torrent_name).join(&file.path),
         ];
-        let Some(metadata) = candidates
-            .iter()
-            .find_map(|path| std::fs::metadata(path).ok())
-        else {
+        let Some(metadata) = candidates.iter().find_map(|path| {
+            let metadata = std::fs::symlink_metadata(path).ok()?;
+            (metadata.file_type().is_file()).then_some(metadata)
+        }) else {
             continue;
         };
         if metadata.len() != file.length {
@@ -2072,7 +2075,8 @@ fn any_aux_token(path_tokens: &[String], name_tokens: &[String], needles: &[&str
 }
 
 fn read_limited(path: &Path, max_bytes: u64) -> Result<Vec<u8>, std::io::Error> {
-    let metadata = std::fs::metadata(path)?;
+    let file = File::open(path)?;
+    let metadata = file.metadata()?;
     if metadata.len() > max_bytes {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -2084,7 +2088,21 @@ fn read_limited(path: &Path, max_bytes: u64) -> Result<Vec<u8>, std::io::Error> 
             ),
         ));
     }
-    std::fs::read(path)
+    let capacity = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+    let mut bytes = Vec::with_capacity(capacity.min(max_bytes as usize));
+    let mut limited = file.take(max_bytes.saturating_add(1));
+    limited.read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{} grew beyond the {} byte import limit",
+                path.display(),
+                max_bytes
+            ),
+        ));
+    }
+    Ok(bytes)
 }
 
 fn extension_is(path: &Path, extensions: &[&str]) -> bool {
@@ -3541,6 +3559,29 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w.contains("already contains this torrent's files directly")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_hints_do_not_trust_final_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("payload.bin");
+        std::fs::write(&outside_file, [1u8; 12]).unwrap();
+        let link = dir.path().join("payload.bin");
+        std::os::unix::fs::symlink(&outside_file, &link).unwrap();
+
+        let files = vec![MigrationFile {
+            index: 0,
+            path: "payload.bin".to_owned(),
+            length: 12,
+            offset: 0,
+            priority: 1,
+            wanted: true,
+            completed_bytes: None,
+        }];
+
+        assert!(collect_file_hints(dir.path(), &files, "torrent").is_empty());
     }
 
     #[test]

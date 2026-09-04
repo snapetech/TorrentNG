@@ -11,6 +11,8 @@ thiserror.workspace = true
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+rand.workspace = true
+hex.workspace = true
 axum = { workspace = true, features = ["multipart"] }
 reqwest.workspace = true
 tokio.workspace = true
@@ -24,6 +26,7 @@ rt-metrics = { path = "../rt-metrics" }
 rt-session = { path = "../rt-session" }
 
 [dev-dependencies]
+rusqlite.workspace = true
 rt-config = { path = "../rt-config" }
 tempfile.workspace = true
 tokio = { version = "1", features = ["full"] }

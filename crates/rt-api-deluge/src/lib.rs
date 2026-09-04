@@ -8,7 +8,7 @@ use std::{
 
 use axum::{
     body::{to_bytes, Body},
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{header, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -16,22 +16,44 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose, Engine as _};
+use rt_api_model::{
+    csrf_request_allowed, request_fingerprint, session_cookie_value, valid_idempotency_key,
+    CachedResponse, IdempotencyClaim, IdempotencyStore, MAX_IDEMPOTENCY_BODY_BYTES,
+};
 use rt_engine::{
     EngineHandle, EnginePeerSnapshot, EngineTorrentLimits, EngineTorrentMetadata,
-    EngineTrackerSnapshot,
+    EngineTrackerSnapshot, QueueMove,
 };
-use rt_metainfo::{parse_magnet, parse_torrent};
+use rt_metainfo::parse_magnet;
 use rt_metrics::{MemoryClass, MemoryLease};
 use rt_session::SessionRegistry;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::RwLock;
+use tokio::{
+    sync::{Notify, RwLock},
+    task::JoinSet,
+};
+
+// Deluge's compatibility API has no offset/cursor contract. Keep its legacy
+// full-list calls bounded rather than allowing one client request to turn
+// into an unbounded response and one live-engine query per torrent.
+const MAX_LEGACY_FULL_LIST_ENTRIES: usize = 10_000;
+const DELUGE_RUNTIME_PROJECTION_CONCURRENCY: usize = 64;
+
+struct DelugeRuntimeProjection {
+    info_hash: String,
+    metadata: Option<EngineTorrentMetadata>,
+    peers: Option<Vec<EnginePeerSnapshot>>,
+    trackers: Option<Vec<EngineTrackerSnapshot>>,
+    limits: Option<EngineTorrentLimits>,
+}
 
 #[derive(Clone)]
 pub struct AppState {
     pub registry: Arc<RwLock<SessionRegistry>>,
     pub engine: Option<EngineHandle>,
     pub api_tokens: Arc<Vec<String>>,
+    pub shutdown: Option<Arc<Notify>>,
     pub torrent_options: Arc<RwLock<HashMap<String, EngineTorrentLimits>>>,
     pub move_completed_options: Arc<RwLock<HashMap<String, DelugeMoveCompletedOptions>>>,
     pub url_downloads: Arc<RwLock<HashMap<String, String>>>,
@@ -39,6 +61,7 @@ pub struct AppState {
     pub enabled_plugins: Arc<RwLock<HashSet<String>>>,
     pub plugin_configs: Arc<RwLock<HashMap<String, Value>>>,
     pub execute_commands: Arc<RwLock<Vec<Value>>>,
+    pub(crate) idempotency: Arc<IdempotencyStore>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -53,6 +76,7 @@ impl AppState {
             registry,
             engine: None,
             api_tokens: Arc::new(Vec::new()),
+            shutdown: None,
             torrent_options: Arc::new(RwLock::new(HashMap::new())),
             move_completed_options: Arc::new(RwLock::new(HashMap::new())),
             url_downloads: Arc::new(RwLock::new(HashMap::new())),
@@ -60,6 +84,7 @@ impl AppState {
             enabled_plugins: Arc::new(RwLock::new(default_enabled_plugins())),
             plugin_configs: Arc::new(RwLock::new(HashMap::new())),
             execute_commands: Arc::new(RwLock::new(Vec::new())),
+            idempotency: IdempotencyStore::new(),
         }
     }
 
@@ -76,6 +101,7 @@ impl AppState {
             registry,
             engine: Some(engine),
             api_tokens: Arc::new(api_tokens),
+            shutdown: None,
             torrent_options: Arc::new(RwLock::new(HashMap::new())),
             move_completed_options: Arc::new(RwLock::new(HashMap::new())),
             url_downloads: Arc::new(RwLock::new(HashMap::new())),
@@ -83,6 +109,7 @@ impl AppState {
             enabled_plugins: Arc::new(RwLock::new(default_enabled_plugins())),
             plugin_configs: Arc::new(RwLock::new(HashMap::new())),
             execute_commands: Arc::new(RwLock::new(Vec::new())),
+            idempotency: IdempotencyStore::new(),
         }
     }
 }
@@ -109,6 +136,13 @@ fn estimate_deluge_torrent_detail_snapshot_bytes() -> u64 {
     64 * 1024
 }
 
+fn deluge_engine(state: &AppState) -> Result<&EngineHandle, String> {
+    state
+        .engine
+        .as_ref()
+        .ok_or_else(|| "native engine is unavailable; mutation was not applied".to_owned())
+}
+
 #[derive(Debug, Deserialize)]
 pub struct JsonRpcRequest {
     pub id: Option<Value>,
@@ -125,7 +159,111 @@ pub fn build_deluge_router(state: AppState) -> Router {
             state.clone(),
             deluge_auth_guard,
         ))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            deluge_idempotency_guard,
+        ))
+        .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
         .with_state(state)
+}
+
+async fn deluge_idempotency_guard(
+    State(state): State<AppState>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    let Some(key) = req
+        .headers()
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+    else {
+        return next.run(req).await;
+    };
+    if !valid_idempotency_key(&key) {
+        return (StatusCode::BAD_REQUEST, "invalid Idempotency-Key").into_response();
+    }
+
+    let (mut parts, body) = req.into_parts();
+    let body = match to_bytes(body, MAX_IDEMPOTENCY_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    };
+    let fingerprint =
+        request_fingerprint(parts.method.as_str(), &parts.uri.to_string(), body.as_ref());
+    parts.headers.remove(header::CONTENT_LENGTH);
+    let req = Request::from_parts(parts, Body::from(body.to_vec()));
+
+    loop {
+        match state.idempotency.claim(&key, fingerprint) {
+            IdempotencyClaim::Execute => break,
+            IdempotencyClaim::Wait(notify) => notify.notified().await,
+            IdempotencyClaim::Replay(cached) => return replay_idempotent_response(cached),
+            IdempotencyClaim::Conflict => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "Idempotency-Key was already used for a different request",
+                )
+                    .into_response();
+            }
+            IdempotencyClaim::Saturated => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "idempotency store is saturated; retry later",
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let mut execution = state.idempotency.execution_guard(&key, fingerprint);
+    let response = next.run(req).await;
+    let (parts, body) = response.into_parts();
+    let body = match to_bytes(body, MAX_IDEMPOTENCY_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "mutation response exceeded the idempotency response limit",
+            )
+                .into_response();
+        }
+    };
+    let response = Response::from_parts(parts.clone(), Body::from(body.clone()));
+    if parts.status.is_success() {
+        let headers = parts
+            .headers
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.as_bytes().to_vec()))
+            .collect();
+        execution.complete(CachedResponse {
+            status: parts.status.as_u16(),
+            headers,
+            body: body.to_vec(),
+        });
+    } else {
+        execution.abandon();
+    }
+    response
+}
+
+fn replay_idempotent_response(cached: CachedResponse) -> Response {
+    let mut response = Response::new(Body::from(cached.body));
+    *response.status_mut() = StatusCode::from_u16(cached.status).unwrap_or(StatusCode::OK);
+    for (name, value) in cached.headers {
+        let Ok(name) = axum::http::HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        let Ok(value) = axum::http::HeaderValue::from_bytes(&value) else {
+            continue;
+        };
+        response.headers_mut().append(name, value);
+    }
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static("idempotency-replayed"),
+        axum::http::HeaderValue::from_static("true"),
+    );
+    response
 }
 
 async fn deluge_auth_guard(
@@ -133,10 +271,20 @@ async fn deluge_auth_guard(
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    if state.api_tokens.is_empty()
-        || request_token(&req)
-            .is_some_and(|token| state.api_tokens.iter().any(|allowed| allowed == &token))
+    if state.api_tokens.is_empty() {
+        return next.run(req).await;
+    }
+    if request_bearer_token(&req)
+        .is_some_and(|token| state.api_tokens.iter().any(|allowed| allowed == &token))
     {
+        return next.run(req).await;
+    }
+    if session_cookie_value(req.headers(), &["tng_session", "SID"])
+        .is_some_and(|token| state.api_tokens.iter().any(|allowed| allowed == &token))
+    {
+        if deluge_is_mutating(&req) && !csrf_request_allowed(req.headers()) {
+            return (StatusCode::FORBIDDEN, "cross-site cookie mutation rejected").into_response();
+        }
         return next.run(req).await;
     }
 
@@ -170,12 +318,22 @@ async fn deluge_auth_guard(
         .into_response()
 }
 
-fn request_token(req: &Request<Body>) -> Option<String> {
+fn request_bearer_token(req: &Request<Body>) -> Option<String> {
     req.headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .map(str::to_owned)
+}
+
+fn deluge_is_mutating(req: &Request<Body>) -> bool {
+    matches!(
+        *req.method(),
+        axum::http::Method::POST
+            | axum::http::Method::PUT
+            | axum::http::Method::PATCH
+            | axum::http::Method::DELETE
+    )
 }
 
 pub async fn json_rpc(
@@ -211,22 +369,54 @@ async fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Va
             "libtorrent": "native",
         })),
         "daemon.get_method_list" => Ok(json!(supported_methods())),
-        "daemon.shutdown" => Ok(json!(true)),
-        "web.connected" => Ok(json!(true)),
-        "web.add_host" => Ok(json!("TorrentNG")),
-        "web.edit_host" | "web.remove_host" => Ok(json!(true)),
-        "web.get_config" => Ok(deluge_web_config()),
-        "web.get_host_status" => Ok(json!(["TorrentNG", "127.0.0.1", 0, "Online"])),
-        "web.get_hosts" => Ok(json!([["TorrentNG", "127.0.0.1", 0, "TorrentNG"]])),
-        "web.connect" | "web.disconnect" | "web.start_daemon" | "web.stop_daemon" => {
+        "daemon.shutdown" => {
+            if let Some(shutdown) = &state.shutdown {
+                // Retain the permit when the daemon has not reached its
+                // graceful-shutdown select yet; a client request must not be
+                // lost during startup.
+                shutdown.notify_one();
+            }
             Ok(json!(true))
         }
+        "web.connected" => Ok(json!(state
+            .engine
+            .as_ref()
+            .is_some_and(EngineHandle::is_alive))),
+        "web.add_host" => Ok(json!("TorrentNG")),
+        "web.edit_host" | "web.remove_host" => Err(
+            "unsupported Deluge method: host configuration is owned by torrentngd".to_owned(),
+        ),
+        "web.get_config" => Ok(deluge_web_config()),
+        "web.get_host_status" => Ok(json!([
+            "TorrentNG",
+            "127.0.0.1",
+            0,
+            if state
+                .engine
+                .as_ref()
+                .is_some_and(EngineHandle::is_alive)
+            {
+                "Online"
+            } else {
+                "Offline"
+            }
+        ])),
+        "web.get_hosts" => Ok(json!([["TorrentNG", "127.0.0.1", 0, "TorrentNG"]])),
+        "web.connect" | "web.disconnect" => Err(
+            "unsupported Deluge method: daemon connection state is owned by torrentngd".to_owned(),
+        ),
+        "web.start_daemon" | "web.stop_daemon" => Err(
+            "unsupported Deluge method: daemon lifecycle is owned by torrentngd".to_owned(),
+        ),
         "web.download_torrent_from_url" => web_download_torrent_from_url(state, params).await,
         "web.add_torrents" => web_add_torrents(state, params).await,
         "web.get_events" => web_events(state).await,
         "web.get_plugins" => Ok(json!(deluge_plugins())),
         "web.get_plugin_info" => Ok(plugin_info(params.first().and_then(Value::as_str))),
-        "web.upload_plugin" | "web.update_config" | "web.save_config" => Ok(json!(true)),
+        "web.upload_plugin" | "web.update_config" | "web.save_config" => Err(
+            "unsupported Deluge method: plugin and WebUI configuration writes are not implemented"
+                .to_owned(),
+        ),
         "web.get_torrent_files" => {
             let hash = params
                 .first()
@@ -237,9 +427,15 @@ async fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Va
         "web.update_ui" => update_ui(state, params).await,
         "core.get_session_status" => session_status(state).await,
         "core.get_stats" => session_status(state).await,
-        "core.get_num_connections" => Ok(json!(0)),
-        "core.get_download_rate" => Ok(json!(deluge_session_download_rate(state).await)),
-        "core.get_upload_rate" => Ok(json!(deluge_session_upload_rate(state).await)),
+        "core.get_num_connections" => deluge_session_connections(state)
+            .await
+            .map(|value| json!(value)),
+        "core.get_download_rate" => deluge_session_download_rate(state)
+            .await
+            .map(|value| json!(value)),
+        "core.get_upload_rate" => deluge_session_upload_rate(state)
+            .await
+            .map(|value| json!(value)),
         "core.get_filter_tree" => filter_tree(state).await,
         "core.get_session_state" => session_state(state).await,
         "core.get_torrents_status" => torrents_status(state, params).await,
@@ -251,36 +447,36 @@ async fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Va
             torrent_status(state, hash, params.get(1)).await
         }
         "core.pause_torrent" => {
-            for hash in string_list(params.first()) {
-                if let Some(engine) = &state.engine {
-                    let _ = engine.pause_torrent(hash).await;
-                }
+            let hashes = canonical_torrent_hashes(state, params.first(), "torrent ids").await?;
+            let engine = deluge_engine(state)?;
+            for hash in hashes {
+                engine.pause_torrent(hash).await?;
             }
             Ok(json!(true))
         }
         "core.resume_torrent" => {
-            for hash in string_list(params.first()) {
-                if let Some(engine) = &state.engine {
-                    let _ = engine.resume_torrent(hash).await;
-                }
+            let hashes = canonical_torrent_hashes(state, params.first(), "torrent ids").await?;
+            let engine = deluge_engine(state)?;
+            for hash in hashes {
+                engine.resume_torrent(hash).await?;
             }
             Ok(json!(true))
         }
         "core.force_recheck" => {
-            for hash in string_list(params.first()) {
-                if let Some(engine) = &state.engine {
-                    let _ = engine.recheck_torrent(hash).await;
-                }
+            let hashes = canonical_torrent_hashes(state, params.first(), "torrent ids").await?;
+            let engine = deluge_engine(state)?;
+            for hash in hashes {
+                engine.recheck_torrent(hash).await?;
             }
             Ok(json!(true))
         }
-        "core.queue_top"
-        | "core.queue_up"
-        | "core.queue_down"
-        | "core.queue_bottom"
-        | "core.create_torrent"
-        | "core.upload_plugin"
-        | "core.rescan_plugins" => Ok(json!(true)),
+        "core.queue_top" => deluge_queue(state, params, QueueMove::Top).await,
+        "core.queue_up" => deluge_queue(state, params, QueueMove::Up).await,
+        "core.queue_down" => deluge_queue(state, params, QueueMove::Down).await,
+        "core.queue_bottom" => deluge_queue(state, params, QueueMove::Bottom).await,
+        "core.create_torrent" | "core.upload_plugin" | "core.rescan_plugins" => Err(
+            "unsupported Deluge method: native engine does not provide this operation".to_owned(),
+        ),
         "core.set_torrent_prioritize_first_last" => set_prioritize_first_last(state, params).await,
         "core.set_torrent_file_priorities" => set_file_priorities(state, params).await,
         "core.set_torrent_trackers" => set_trackers(state, params).await,
@@ -289,21 +485,33 @@ async fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Va
         "core.rename_folder" => rename_folder(state, params).await,
         "core.move_storage" => move_storage(state, params).await,
         "core.get_torrent_file_status" => {
-            if let Some(hash) = params.first().and_then(Value::as_str) {
-                torrent_files(state, hash).await
-            } else {
-                Ok(json!([]))
-            }
+            let hash = params
+                .first()
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|hash| !hash.is_empty())
+                .ok_or_else(|| "missing torrent id".to_owned())?;
+            torrent_files(state, hash).await
         }
         "core.remove_torrent" => {
             let hash = params
                 .first()
                 .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|hash| !hash.is_empty())
                 .ok_or_else(|| "missing torrent id".to_owned())?;
-            let remove_data = params.get(1).and_then(Value::as_bool).unwrap_or(false);
-            if let Some(engine) = &state.engine {
-                let _ = engine.remove_torrent(hash.to_owned(), remove_data).await;
-            }
+            let remove_data = params
+                .get(1)
+                .map(|value| {
+                    deluge_bool(Some(value))
+                        .ok_or_else(|| "remove-data must be a boolean".to_owned())
+                })
+                .transpose()?
+                .unwrap_or(false);
+            let hash = canonical_torrent_hash(state, hash).await?;
+            deluge_engine(state)?
+                .remove_torrent(hash, remove_data)
+                .await?;
             Ok(json!(true))
         }
         "core.add_torrent_magnet" => {
@@ -322,50 +530,74 @@ async fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Va
         }
         "core.set_torrent_options" => set_torrent_options(state, params).await,
         "label.get_labels" => labels(state).await,
-        "label.add" => Ok(json!(true)),
-        "label.remove" => Ok(json!(true)),
-        "label.set_options" => Ok(json!(true)),
+        "label.add" => add_label(state, params).await,
+        "label.remove" => remove_label(state, params).await,
+        "label.set_options" => Err(
+            "unsupported Deluge method: Label options have no native engine equivalent".to_owned(),
+        ),
         "label.set_torrent" => {
             let hash = params
                 .first()
                 .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|hash| !hash.is_empty())
                 .ok_or_else(|| "missing torrent id".to_owned())?;
-            let label = params.get(1).and_then(Value::as_str).unwrap_or_default();
+            let label = params
+                .get(1)
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing label".to_owned())?;
             set_label(state, hash, label).await?;
             Ok(json!(true))
         }
-        "core.get_free_space" => Ok(json!(0)),
-        "core.set_config" => Ok(json!(true)),
-        "core.get_listen_port" => Ok(json!(0)),
-        "core.get_external_ip" => Ok(json!("")),
-        "core.get_path_size" => Ok(json!(0)),
+        "core.get_free_space" => deluge_free_space(state).await,
+        "core.set_config" => Err(
+            "unsupported Deluge method: core configuration is not writable through the native API"
+                .to_owned(),
+        ),
+        "core.get_listen_port" => {
+            Err("listen-port probing is not exposed by the native compatibility API".to_owned())
+        }
+        "core.get_external_ip" => Err(
+            "unsupported Deluge method: external IP discovery is not exposed by the native API"
+                .to_owned(),
+        ),
+        "core.get_path_size" => Err(
+            "unsupported Deluge method: arbitrary filesystem size probes are not exposed by the native API"
+                .to_owned(),
+        ),
         "core.get_cache_status" => cache_status(state).await,
-        "core.get_config" => Ok(deluge_config()),
-        "core.get_config_values" => Ok(deluge_config_values(params.first())),
-        "core.get_config_value" => Ok(deluge_config_value(params.first())),
+        "core.get_config" => deluge_config(state).await,
+        "core.get_config_values" => deluge_config_values(state, params.first()).await,
+        "core.get_config_value" => deluge_config_value(state, params.first()).await,
         "core.get_enabled_plugins" => enabled_plugins(state).await,
-        "core.enable_plugin" => set_plugin_enabled(state, params, true).await,
-        "core.disable_plugin" => set_plugin_enabled(state, params, false).await,
+        "core.enable_plugin" => set_plugin_enabled(state, params, true),
+        "core.disable_plugin" => set_plugin_enabled(state, params, false),
         "core.get_available_plugins" => Ok(json!(deluge_plugins())),
         "core.get_libtorrent_version" => Ok(json!("native")),
         "blocklist.get_config" => plugin_config(state, "blocklist", blocklist_config()).await,
-        "blocklist.set_config" => set_plugin_config(state, "blocklist", params).await,
+        "blocklist.set_config" => set_plugin_config(state, "blocklist", params),
         "blocklist.get_status" | "blocklist.check_import" => blocklist_status(state).await,
-        "blocklist.import" => Ok(json!(true)),
+        "blocklist.import" => Err(
+            "unsupported Deluge method: blocklist import is not implemented by the native engine"
+                .to_owned(),
+        ),
         "autoadd.get_config" => plugin_config(state, "autoadd", autoadd_config()).await,
-        "autoadd.set_config" => set_plugin_config(state, "autoadd", params).await,
-        "autoadd.enable" => set_autoadd_enabled(state, true).await,
-        "autoadd.disable" => set_autoadd_enabled(state, false).await,
+        "autoadd.set_config" => set_plugin_config(state, "autoadd", params),
+        "autoadd.enable" => set_plugin_config(state, "autoadd", params),
+        "autoadd.disable" => set_plugin_config(state, "autoadd", params),
         "execute.get_commands" => execute_commands(state).await,
-        "execute.save_command" => save_execute_command(state, params).await,
-        "execute.remove_command" => remove_execute_command(state, params).await,
+        "execute.save_command" => save_execute_command(state, params),
+        "execute.remove_command" => remove_execute_command(state, params),
         "scheduler.get_config" => plugin_config(state, "scheduler", scheduler_config()).await,
-        "scheduler.set_config" => set_plugin_config(state, "scheduler", params).await,
+        "scheduler.set_config" => set_plugin_config(state, "scheduler", params),
         "extractor.get_config" => plugin_config(state, "extractor", extractor_config()).await,
-        "extractor.set_config" => set_plugin_config(state, "extractor", params).await,
+        "extractor.set_config" => set_plugin_config(state, "extractor", params),
         "notifications.get_handled_events" => Ok(json!(notification_events())),
         "notifications.get_subscriptions" => Ok(notification_subscriptions()),
-        "notifications.set_config" | "notifications.add_subscription" => Ok(json!(true)),
+        "notifications.set_config" | "notifications.add_subscription" => Err(
+            "unsupported Deluge method: notifications are not configured by the native daemon"
+                .to_owned(),
+        ),
         _ => Err(format!("unsupported method {method}")),
     }
 }
@@ -472,7 +704,7 @@ fn supported_methods() -> Vec<&'static str> {
     ]
 }
 
-fn deluge_config() -> Value {
+fn default_deluge_config() -> Value {
     json!({
         "download_location": "/downloads",
         "move_completed": false,
@@ -509,26 +741,53 @@ fn deluge_config() -> Value {
     })
 }
 
-fn deluge_config_values(keys: Option<&Value>) -> Value {
-    let config = deluge_config();
-    let Some(keys) = keys.and_then(Value::as_array) else {
-        return config;
+async fn deluge_config(state: &AppState) -> Result<Value, String> {
+    let mut config = default_deluge_config();
+    let (dht, pex) = if let Some(engine) = &state.engine {
+        let features = engine.network_features().await?;
+        (features.dht, features.pex)
+    } else {
+        (false, false)
+    };
+    config["dht"] = Value::Bool(dht);
+    config["utpex"] = Value::Bool(pex);
+    Ok(config)
+}
+
+async fn deluge_config_values(state: &AppState, keys: Option<&Value>) -> Result<Value, String> {
+    let config = deluge_config(state).await?;
+    let Some(value) = keys else {
+        return Ok(config);
+    };
+    let Some(keys) = value.as_array() else {
+        return Err("Deluge config keys must be an array of strings".to_owned());
     };
     let mut out = serde_json::Map::new();
-    for key in keys.iter().filter_map(Value::as_str) {
+    for (index, value) in keys.iter().enumerate() {
+        let key = value
+            .as_str()
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .ok_or_else(|| format!("Deluge config keys[{index}] must be a non-empty string"))?;
         out.insert(
             key.to_owned(),
             config.get(key).cloned().unwrap_or(Value::Null),
         );
     }
-    Value::Object(out)
+    Ok(Value::Object(out))
 }
 
-fn deluge_config_value(key: Option<&Value>) -> Value {
-    let Some(key) = key.and_then(Value::as_str) else {
-        return Value::Null;
-    };
-    deluge_config().get(key).cloned().unwrap_or(Value::Null)
+async fn deluge_config_value(state: &AppState, key: Option<&Value>) -> Result<Value, String> {
+    let key = key
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .ok_or_else(|| "Deluge config key must be a non-empty string".to_owned())?;
+    Ok(deluge_config(state)
+        .await?
+        .get(key)
+        .cloned()
+        .unwrap_or(Value::Null))
 }
 
 fn deluge_web_config() -> Value {
@@ -549,7 +808,7 @@ fn deluge_web_config() -> Value {
 
 async fn web_add_torrents(state: &AppState, params: &[Value]) -> Result<Value, String> {
     let Some(torrents) = params.first().and_then(Value::as_array) else {
-        return Ok(json!(true));
+        return Err("missing torrent list".to_owned());
     };
     let mut results = Vec::new();
     for torrent in torrents {
@@ -591,11 +850,17 @@ async fn web_add_torrents(state: &AppState, params: &[Value]) -> Result<Value, S
         } else if !path.trim().is_empty() {
             add_torrent_path(state, path, options).await
         } else {
-            Ok(json!(true))
+            Err("torrent item requires a magnet, embedded metainfo, URL token, or path".to_owned())
         };
+        let success = result.as_ref().is_ok_and(|value| {
+            value
+                .get("downloaded")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+        });
         results.push(json!({
             "path": path,
-            "success": result.is_ok(),
+            "success": success,
             "result": result.unwrap_or(Value::Null),
         }));
     }
@@ -631,109 +896,121 @@ async fn move_storage(state: &AppState, params: &[Value]) -> Result<Value, Strin
     let location = params
         .get(1)
         .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|location| !location.is_empty())
         .ok_or_else(|| "missing storage path".to_owned())?;
-    for hash in string_list(params.first()) {
-        if let Some(engine) = &state.engine {
-            let _ = engine
-                .update_torrent_fields(hash, None, Some(std::path::PathBuf::from(location)))
-                .await;
-        } else {
-            let mut reg = state.registry.write().await;
-            if let Some(entry) = reg.get_mut(&hash) {
-                entry.save_path = location.to_owned();
-            }
-        }
+    let hashes = canonical_torrent_hashes(state, params.first(), "torrent ids").await?;
+    let engine = deluge_engine(state)?;
+    for hash in hashes {
+        engine
+            .update_torrent_fields(hash, None, Some(std::path::PathBuf::from(location)))
+            .await?;
     }
     Ok(json!(true))
 }
 
+async fn deluge_queue(
+    state: &AppState,
+    params: &[Value],
+    queue_move: QueueMove,
+) -> Result<Value, String> {
+    let hashes = canonical_torrent_hashes(state, params.first(), "torrent ids").await?;
+    deluge_engine(state)?
+        .update_queue_order(hashes, queue_move)
+        .await?;
+    Ok(json!(true))
+}
+
+async fn deluge_free_space(state: &AppState) -> Result<Value, String> {
+    let roots = deluge_engine(state)?.list_storage_roots().await?;
+    roots
+        .into_iter()
+        .filter(|root| root.ok)
+        .map(|root| root.available_bytes)
+        .max()
+        .map(Value::from)
+        .ok_or_else(|| "no healthy storage root is available for a free-space probe".to_owned())
+}
+
 async fn session_state(state: &AppState) -> Result<Value, String> {
     let reg = state.registry.read().await;
-    Ok(json!(reg
+    let snapshot = reg.snapshot();
+    Ok(json!(snapshot
         .iter()
         .map(|entry| entry.info_hash.clone())
         .collect::<Vec<_>>()))
 }
 
 async fn session_status(state: &AppState) -> Result<Value, String> {
-    let reg = state.registry.read().await;
-    let torrent_count = reg.iter().count();
-    let total_payload_download = reg.iter().fold(0_u64, |acc, entry| {
-        acc.saturating_add(entry.stats.downloaded)
-    });
-    let total_payload_upload = reg
-        .iter()
-        .fold(0_u64, |acc, entry| acc.saturating_add(entry.stats.uploaded));
-    let download_rate = deluge_session_download_rate(state).await;
-    let upload_rate = deluge_session_upload_rate(state).await;
+    let (torrent_count, total_payload_download, total_payload_upload) = {
+        let reg = state.registry.read().await;
+        let stats = reg.stats();
+        (
+            stats.torrents_total,
+            stats.bytes_downloaded,
+            stats.bytes_uploaded,
+        )
+    };
+    let (download_rate, upload_rate, paused_count, connected_peers) =
+        if let Some(engine) = &state.engine {
+            let stats = engine.stats().await?;
+            (
+                stats.download_rate,
+                stats.upload_rate,
+                stats.torrents_paused,
+                stats.connected_peers,
+            )
+        } else {
+            let reg = state.registry.read().await;
+            let stats = reg.stats();
+            (0, 0, stats.torrents_paused + stats.torrents_stopped, 0)
+        };
     Ok(json!({
         "payload_download_rate": download_rate,
         "payload_upload_rate": upload_rate,
         "download_rate": download_rate,
         "upload_rate": upload_rate,
-        "num_connections": 0,
+        "num_connections": connected_peers,
         "total_payload_download": total_payload_download,
         "total_payload_upload": total_payload_upload,
         "num_torrents": torrent_count,
+        "num_paused": paused_count,
     }))
 }
 
-async fn deluge_session_download_rate(state: &AppState) -> i64 {
+async fn deluge_session_download_rate(state: &AppState) -> Result<i64, String> {
     let Some(engine) = &state.engine else {
-        return 0;
+        return Ok(0);
     };
-    let hashes = {
-        let reg = state.registry.read().await;
-        reg.iter()
-            .map(|entry| entry.info_hash.clone())
-            .collect::<Vec<_>>()
-    };
-    let mut total = 0_i64;
-    for hash in hashes {
-        if let Ok(peers) = engine.torrent_peers(hash).await {
-            total = total.saturating_add(deluge_peer_download_rate(Some(&peers)));
-        }
-    }
-    total
+    Ok(engine.stats().await?.download_rate)
 }
 
-async fn deluge_session_upload_rate(state: &AppState) -> i64 {
+async fn deluge_session_upload_rate(state: &AppState) -> Result<i64, String> {
     let Some(engine) = &state.engine else {
-        return 0;
+        return Ok(0);
     };
-    let hashes = {
-        let reg = state.registry.read().await;
-        reg.iter()
-            .map(|entry| entry.info_hash.clone())
-            .collect::<Vec<_>>()
+    Ok(engine.stats().await?.upload_rate)
+}
+
+async fn deluge_session_connections(state: &AppState) -> Result<u64, String> {
+    let Some(engine) = &state.engine else {
+        return Ok(0);
     };
-    let mut total = 0_i64;
-    for hash in hashes {
-        if let Ok(peers) = engine.torrent_peers(hash).await {
-            total = total.saturating_add(deluge_peer_upload_rate(Some(&peers)));
-        }
-    }
-    total
+    Ok(engine.stats().await?.connected_peers)
 }
 
 async fn cache_status(state: &AppState) -> Result<Value, String> {
     let (num_torrents, total_done, total_left) = {
         let reg = state.registry.read().await;
-        reg.iter()
-            .fold((0_u64, 0_u64, 0_u64), |(count, done, left), entry| {
-                (
-                    count + 1,
-                    done.saturating_add(entry.total_length.saturating_sub(entry.amount_left)),
-                    left.saturating_add(entry.amount_left),
-                )
-            })
+        let stats = reg.stats();
+        (
+            stats.torrents_total,
+            stats.bytes_total.saturating_sub(stats.bytes_left),
+            stats.bytes_left,
+        )
     };
     let jobs_active = if let Some(engine) = &state.engine {
-        engine
-            .stats()
-            .await
-            .map(|stats| stats.jobs_active)
-            .unwrap_or(0)
+        engine.stats().await?.jobs_active
     } else {
         0
     };
@@ -751,7 +1028,8 @@ async fn cache_status(state: &AppState) -> Result<Value, String> {
 
 async fn web_events(state: &AppState) -> Result<Value, String> {
     let reg = state.registry.read().await;
-    Ok(json!(reg
+    let snapshot = reg.snapshot();
+    Ok(json!(snapshot
         .iter()
         .map(|entry| {
             json!({
@@ -775,7 +1053,7 @@ fn deluge_plugins() -> Vec<&'static str> {
 }
 
 fn default_enabled_plugins() -> HashSet<String> {
-    deluge_plugins()
+    ["Label", "Notifications"]
         .into_iter()
         .map(str::to_owned)
         .collect::<HashSet<_>>()
@@ -806,23 +1084,16 @@ async fn enabled_plugins(state: &AppState) -> Result<Value, String> {
     Ok(json!(plugins))
 }
 
-async fn set_plugin_enabled(
-    state: &AppState,
-    params: &[Value],
-    enabled: bool,
-) -> Result<Value, String> {
+fn set_plugin_enabled(_state: &AppState, params: &[Value], enabled: bool) -> Result<Value, String> {
     let name = params
         .first()
         .and_then(Value::as_str)
         .and_then(canonical_plugin_name)
         .ok_or_else(|| "missing plugin name".to_owned())?;
-    let mut plugins = state.enabled_plugins.write().await;
-    if enabled {
-        plugins.insert(name.to_owned());
-    } else {
-        plugins.remove(name);
-    }
-    Ok(json!(true))
+    let operation = if enabled { "enable" } else { "disable" };
+    Err(format!(
+        "unsupported Deluge method: cannot {operation} {name}; plugin lifecycle is not runtime-backed"
+    ))
 }
 
 fn plugin_info(name: Option<&str>) -> Value {
@@ -833,28 +1104,28 @@ fn plugin_info(name: Option<&str>) -> Value {
             "version": "TorrentNG",
             "author": "TorrentNG",
             "description": "Watch-directory compatibility configuration; server-side watch execution is disabled unless native automation owns it.",
-            "enabled": true,
+            "enabled": false,
         }),
         "Blocklist" | "blocklist" => json!({
             "name": "Blocklist",
             "version": "TorrentNG",
             "author": "TorrentNG",
             "description": "Blocklist compatibility configuration with zero-entry status until a native blocklist backend is configured.",
-            "enabled": true,
+            "enabled": false,
         }),
         "Execute" | "execute" => json!({
             "name": "Execute",
             "version": "TorrentNG",
             "author": "TorrentNG",
             "description": "Execute plugin compatibility surface; arbitrary command execution is intentionally not performed by the facade.",
-            "enabled": true,
+            "enabled": false,
         }),
         "Extractor" | "extractor" => json!({
             "name": "Extractor",
             "version": "TorrentNG",
             "author": "TorrentNG",
             "description": "Extractor plugin compatibility configuration; archive extraction is left to explicit operator workflows.",
-            "enabled": true,
+            "enabled": false,
         }),
         "Label" | "label" => json!({
             "name": "Label",
@@ -875,7 +1146,7 @@ fn plugin_info(name: Option<&str>) -> Value {
             "version": "TorrentNG",
             "author": "TorrentNG",
             "description": "Scheduler plugin compatibility configuration; native limits remain controlled by TorrentNG settings.",
-            "enabled": true,
+            "enabled": false,
         }),
         _ => json!({}),
     }
@@ -952,88 +1223,28 @@ async fn plugin_config_value(state: &AppState, key: &str, default: Value) -> Val
         .unwrap_or(default)
 }
 
-async fn set_plugin_config(state: &AppState, key: &str, params: &[Value]) -> Result<Value, String> {
-    let incoming = params.first().cloned().unwrap_or_else(|| json!({}));
-    let mut current = plugin_config_value(state, key, default_plugin_config(key)).await;
-    merge_json_object(&mut current, incoming);
-    state
-        .plugin_configs
-        .write()
-        .await
-        .insert(key.to_owned(), current);
-    Ok(json!(true))
-}
-
-async fn set_autoadd_enabled(state: &AppState, enabled: bool) -> Result<Value, String> {
-    let mut current = plugin_config_value(state, "autoadd", autoadd_config()).await;
-    if let Some(map) = current.as_object_mut() {
-        map.insert("enabled".to_owned(), enabled.into());
-    }
-    state
-        .plugin_configs
-        .write()
-        .await
-        .insert("autoadd".to_owned(), current);
-    Ok(json!(true))
-}
-
-fn default_plugin_config(key: &str) -> Value {
-    match key {
-        "blocklist" => blocklist_config(),
-        "autoadd" => autoadd_config(),
-        "scheduler" => scheduler_config(),
-        "extractor" => extractor_config(),
-        _ => json!({}),
-    }
-}
-
-fn merge_json_object(target: &mut Value, incoming: Value) {
-    let Some(target_map) = target.as_object_mut() else {
-        *target = incoming;
-        return;
-    };
-    let Some(incoming_map) = incoming.as_object() else {
-        *target = incoming;
-        return;
-    };
-    for (key, value) in incoming_map {
-        target_map.insert(key.clone(), value.clone());
-    }
-}
-
 async fn execute_commands(state: &AppState) -> Result<Value, String> {
     Ok(Value::Array(state.execute_commands.read().await.clone()))
 }
 
-async fn save_execute_command(state: &AppState, params: &[Value]) -> Result<Value, String> {
-    let event = params
-        .first()
-        .and_then(Value::as_str)
-        .unwrap_or("complete")
-        .to_owned();
-    let command = params
-        .get(1)
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let mut commands = state.execute_commands.write().await;
-    let id = commands.len() as i64 + 1;
-    commands.push(json!({
-        "id": id,
-        "event": event,
-        "command": command,
-    }));
-    Ok(json!(id))
+fn set_plugin_config(_state: &AppState, key: &str, _params: &[Value]) -> Result<Value, String> {
+    Err(format!(
+        "unsupported Deluge method: {key} plugin configuration is not runtime-backed"
+    ))
 }
 
-async fn remove_execute_command(state: &AppState, params: &[Value]) -> Result<Value, String> {
-    let id = params.first().and_then(Value::as_i64).unwrap_or_default();
-    state
-        .execute_commands
-        .write()
-        .await
-        .retain(|command| command.get("id").and_then(Value::as_i64) != Some(id));
-    Ok(json!(true))
+fn save_execute_command(_state: &AppState, _params: &[Value]) -> Result<Value, String> {
+    Err(
+        "unsupported Deluge method: Execute command registration is not runtime-backed and was not applied"
+            .to_owned(),
+    )
+}
+
+fn remove_execute_command(_state: &AppState, _params: &[Value]) -> Result<Value, String> {
+    Err(
+        "unsupported Deluge method: Execute command removal is not runtime-backed and was not applied"
+            .to_owned(),
+    )
 }
 
 fn notification_events() -> Vec<&'static str> {
@@ -1055,9 +1266,10 @@ fn notification_subscriptions() -> Value {
 
 async fn filter_tree(state: &AppState) -> Result<Value, String> {
     let reg = state.registry.read().await;
+    let snapshot = reg.snapshot();
     let mut labels = std::collections::BTreeMap::<String, usize>::new();
     let mut states = std::collections::BTreeMap::<String, usize>::new();
-    for entry in reg.iter() {
+    for entry in snapshot.iter() {
         *labels
             .entry(entry.category.clone().unwrap_or_default())
             .or_default() += 1;
@@ -1071,17 +1283,104 @@ async fn filter_tree(state: &AppState) -> Result<Value, String> {
     }))
 }
 
+/// Load the optional live fields for a legacy full-list response with a
+/// bounded number of in-flight actor requests. Deluge has no page or snapshot
+/// contract, so the response still has a hard row cap; it must not also pay
+/// one serial round trip per torrent and turn one slow actor into a full-list
+/// outage.
+async fn load_deluge_runtime_projections(
+    engine: &EngineHandle,
+    hashes: &[String],
+    need_metadata: bool,
+    need_peers: bool,
+    need_limits: bool,
+    need_trackers: bool,
+) -> Result<Vec<DelugeRuntimeProjection>, String> {
+    if !need_metadata && !need_peers && !need_limits && !need_trackers {
+        return Ok(Vec::new());
+    }
+
+    let mut projections = Vec::with_capacity(hashes.len());
+    for batch in hashes.chunks(DELUGE_RUNTIME_PROJECTION_CONCURRENCY) {
+        let mut tasks = JoinSet::new();
+        for info_hash in batch {
+            let engine = engine.clone();
+            let info_hash = info_hash.clone();
+            tasks.spawn(async move {
+                let metadata = if need_metadata {
+                    Some(engine.torrent_metadata(info_hash.clone()).await?)
+                } else {
+                    None
+                };
+                let peers = if need_peers {
+                    Some(engine.torrent_peers(info_hash.clone()).await?)
+                } else {
+                    None
+                };
+                let limits = if need_limits {
+                    Some(engine.torrent_limits(info_hash.clone()).await?)
+                } else {
+                    None
+                };
+                let trackers = if need_trackers {
+                    Some(engine.torrent_trackers(info_hash.clone()).await?)
+                } else {
+                    None
+                };
+                Ok::<_, String>(DelugeRuntimeProjection {
+                    info_hash,
+                    metadata,
+                    peers,
+                    trackers,
+                    limits,
+                })
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            let projection =
+                result.map_err(|error| format!("Deluge projection task failed: {error}"))??;
+            projections.push(projection);
+        }
+    }
+    Ok(projections)
+}
+
+fn merge_deluge_runtime_projections(
+    projections: Vec<DelugeRuntimeProjection>,
+    metadata: &mut std::collections::HashMap<String, EngineTorrentMetadata>,
+    peers: &mut std::collections::HashMap<String, Vec<EnginePeerSnapshot>>,
+    trackers: &mut std::collections::HashMap<String, Vec<EngineTrackerSnapshot>>,
+    limits: &mut std::collections::HashMap<String, EngineTorrentLimits>,
+) {
+    for projection in projections {
+        let info_hash = projection.info_hash;
+        if let Some(value) = projection.metadata {
+            metadata.insert(info_hash.clone(), value);
+        }
+        if let Some(value) = projection.peers {
+            peers.insert(info_hash.clone(), value);
+        }
+        if let Some(value) = projection.trackers {
+            trackers.insert(info_hash.clone(), value);
+        }
+        if let Some(value) = projection.limits {
+            limits.insert(info_hash, value);
+        }
+    }
+}
+
 async fn update_ui(state: &AppState, params: &[Value]) -> Result<Value, String> {
-    let wanted_fields = deluge_requested_fields(params.first());
-    let entries = {
+    let wanted_fields = deluge_requested_fields(params.first())?;
+    let snapshot = {
         let reg = state.registry.read().await;
-        reg.iter().cloned().collect::<Vec<_>>()
+        reg.snapshot()
     };
+    ensure_legacy_full_list_bound(snapshot.len(), "Deluge web.update_ui")?;
     let _lease = if state.engine.is_some() {
         Some(
             reserve_deluge_api_snapshot(
                 state,
-                estimate_deluge_update_ui_snapshot_bytes(entries.len()),
+                estimate_deluge_update_ui_snapshot_bytes(snapshot.len()),
             )
             .await?
             .ok_or_else(|| "api snapshot memory budget exhausted".to_owned())?,
@@ -1095,28 +1394,32 @@ async fn update_ui(state: &AppState, params: &[Value]) -> Result<Value, String> 
     let mut active_rechecks = HashSet::new();
     let mut limits_by_hash = state.torrent_options.read().await.clone();
     let move_completed_by_hash = state.move_completed_options.read().await.clone();
+    let need_metadata = deluge_fields_need_metadata(&wanted_fields);
+    let need_limits = deluge_fields_need_limits(&wanted_fields);
     if let Some(engine) = &state.engine {
-        active_rechecks = deluge_active_recheck_hashes(engine).await;
-        for entry in &entries {
-            if let Ok(meta) = engine.torrent_metadata(entry.info_hash.clone()).await {
-                metadata.insert(entry.info_hash.clone(), meta);
-            }
-            if deluge_fields_need_peers(&wanted_fields) {
-                if let Ok(snapshot) = engine.torrent_peers(entry.info_hash.clone()).await {
-                    peers.insert(entry.info_hash.clone(), snapshot);
-                }
-            }
-            if let Ok(limits) = engine.torrent_limits(entry.info_hash.clone()).await {
-                limits_by_hash.insert(entry.info_hash.clone(), limits);
-            }
-            if deluge_fields_need_trackers(&wanted_fields) {
-                if let Ok(snapshot) = engine.torrent_trackers(entry.info_hash.clone()).await {
-                    trackers.insert(entry.info_hash.clone(), snapshot);
-                }
-            }
-        }
+        active_rechecks = deluge_active_recheck_hashes(engine).await?;
+        let hashes = snapshot
+            .iter()
+            .map(|entry| entry.info_hash.clone())
+            .collect::<Vec<_>>();
+        let projections = load_deluge_runtime_projections(
+            engine,
+            &hashes,
+            need_metadata,
+            deluge_fields_need_peers(&wanted_fields),
+            need_limits,
+            deluge_fields_need_trackers(&wanted_fields),
+        )
+        .await?;
+        merge_deluge_runtime_projections(
+            projections,
+            &mut metadata,
+            &mut peers,
+            &mut trackers,
+            &mut limits_by_hash,
+        );
     }
-    let torrents = entries
+    let torrents = snapshot
         .iter()
         .map(|entry| {
             (
@@ -1136,35 +1439,63 @@ async fn update_ui(state: &AppState, params: &[Value]) -> Result<Value, String> 
             )
         })
         .collect::<serde_json::Map<_, _>>();
+    let runtime_stats = match &state.engine {
+        Some(engine) => Some(engine.stats().await?),
+        None => None,
+    };
+    let free_space = if let Some(engine) = &state.engine {
+        engine
+            .list_storage_roots()
+            .await?
+            .into_iter()
+            .filter(|root| root.ok)
+            .map(|root| root.available_bytes)
+            .max()
+            .map(Value::from)
+            .unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    };
+    let connected = state.engine.as_ref().is_some_and(EngineHandle::is_alive);
+    let incoming_connections = state
+        .engine
+        .as_ref()
+        .is_some_and(EngineHandle::peer_listener_healthy);
     Ok(json!({
-        "connected": true,
+        "connected": connected,
         "torrents": torrents,
-        "filters": deluge_filters_from_entries(&entries, &active_rechecks),
+        "filters": deluge_filters_from_entries(snapshot.iter(), &active_rechecks),
         "stats": {
-            "download_rate": 0.0,
-            "upload_rate": 0.0,
-            "num_connections": 0,
-            "dht_nodes": 0,
-            "has_incoming_connections": true,
-            "free_space": 0,
+            "download_rate": runtime_stats.as_ref().map(|stats| stats.download_rate).unwrap_or(0),
+            "upload_rate": runtime_stats.as_ref().map(|stats| stats.upload_rate).unwrap_or(0),
+            "num_connections": runtime_stats.as_ref().map(|stats| stats.connected_peers).unwrap_or(0),
+            "dht_nodes": runtime_stats.as_ref().map(|stats| stats.dht_routing_nodes).unwrap_or(0),
+            "has_incoming_connections": incoming_connections,
+            "free_space": free_space,
         }
     }))
 }
 
-fn deluge_filters_from_entries(
-    entries: &[rt_session::TorrentEntry],
+fn deluge_filters_from_entries<'a>(
+    entries: impl IntoIterator<Item = &'a rt_session::TorrentEntry>,
     active_rechecks: &HashSet<String>,
 ) -> Value {
     let mut states = std::collections::BTreeMap::<String, usize>::new();
+    let mut labels = std::collections::BTreeMap::<String, usize>::new();
+    let mut torrent_count = 0;
     for entry in entries {
+        torrent_count += 1;
         *states
             .entry(deluge_state_with_recheck(
                 entry.state.as_str(),
                 active_rechecks.contains(&entry.info_hash),
             ))
             .or_default() += 1;
+        if let Some(label) = &entry.category {
+            *labels.entry(label.clone()).or_default() += 1;
+        }
     }
-    let mut state_filters = vec![json!(["All", entries.len()])];
+    let mut state_filters = vec![json!(["All", torrent_count])];
     state_filters.extend(
         states
             .into_iter()
@@ -1173,13 +1504,25 @@ fn deluge_filters_from_entries(
     );
     json!({
         "state": state_filters,
-        "label": labels_from_entries(entries),
+        "label": labels
+            .into_iter()
+            .map(|(label, count)| json!([label, count]))
+            .collect::<Vec<_>>(),
     })
 }
 
 async fn labels(state: &AppState) -> Result<Value, String> {
+    if let Some(engine) = &state.engine {
+        return Ok(json!(engine
+            .list_categories()
+            .await?
+            .into_iter()
+            .map(|category| category.name)
+            .collect::<Vec<_>>()));
+    }
     let reg = state.registry.read().await;
-    Ok(json!(reg
+    let snapshot = reg.snapshot();
+    Ok(json!(snapshot
         .iter()
         .filter_map(|entry| entry.category.clone())
         .collect::<std::collections::BTreeSet<_>>()
@@ -1187,34 +1530,75 @@ async fn labels(state: &AppState) -> Result<Value, String> {
         .collect::<Vec<_>>()))
 }
 
+async fn add_label(state: &AppState, params: &[Value]) -> Result<Value, String> {
+    let name = params
+        .first()
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| "missing label name".to_owned())?;
+    if params
+        .get(1)
+        .and_then(Value::as_object)
+        .is_some_and(|options| !options.is_empty())
+    {
+        return Err(
+            "unsupported Deluge method: Label options have no native engine equivalent".to_owned(),
+        );
+    }
+    deluge_engine(state)?
+        .create_category(name.to_owned(), None)
+        .await?;
+    Ok(json!(true))
+}
+
+async fn remove_label(state: &AppState, params: &[Value]) -> Result<Value, String> {
+    let name = params
+        .first()
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| "missing label name".to_owned())?;
+    deluge_engine(state)?
+        .remove_categories(vec![name.to_owned()])
+        .await?;
+    Ok(json!(true))
+}
+
 async fn set_label(state: &AppState, hash: &str, label: &str) -> Result<(), String> {
+    let hash = canonical_torrent_hash(state, hash).await?;
     let label = label.trim();
     let category = if label.is_empty() {
         None
     } else {
         Some(label.to_owned())
     };
-    if let Some(engine) = &state.engine {
-        engine
-            .update_torrent_labels(hash.to_owned(), Some(category), Vec::new(), Vec::new())
-            .await?;
-        return Ok(());
-    }
-    let mut reg = state.registry.write().await;
-    let entry = reg
-        .get_mut(hash)
-        .ok_or_else(|| format!("torrent {hash} not found"))?;
-    entry.category = category;
+    deluge_engine(state)?
+        .update_torrent_labels(hash, Some(category), Vec::new(), Vec::new())
+        .await?;
     Ok(())
 }
 
 async fn torrents_status(state: &AppState, params: &[Value]) -> Result<Value, String> {
     let filter = params.first();
-    let wanted_fields = deluge_requested_fields(params.get(1));
-    let entries = {
+    validate_deluge_status_filter(filter)?;
+    let wanted_fields = deluge_requested_fields(params.get(1))?;
+    let snapshot = {
         let reg = state.registry.read().await;
-        reg.iter().cloned().collect::<Vec<_>>()
+        reg.snapshot()
     };
+    let active_rechecks = if let Some(engine) = &state.engine {
+        deluge_active_recheck_hashes(engine).await?
+    } else {
+        HashSet::new()
+    };
+    let entries = snapshot
+        .iter()
+        .filter(|entry| {
+            deluge_torrent_matches_filter(entry, filter, active_rechecks.contains(&entry.info_hash))
+        })
+        .collect::<Vec<_>>();
+    ensure_legacy_full_list_bound(entries.len(), "Deluge core.get_torrents_status")?;
     let _lease = if state.engine.is_some() {
         Some(
             reserve_deluge_api_snapshot(
@@ -1230,35 +1614,34 @@ async fn torrents_status(state: &AppState, params: &[Value]) -> Result<Value, St
     let mut metadata = std::collections::HashMap::new();
     let mut peers = std::collections::HashMap::new();
     let mut trackers = std::collections::HashMap::new();
-    let mut active_rechecks = HashSet::new();
     let mut limits_by_hash = state.torrent_options.read().await.clone();
     let move_completed_by_hash = state.move_completed_options.read().await.clone();
+    let need_metadata = deluge_fields_need_metadata(&wanted_fields);
+    let need_limits = deluge_fields_need_limits(&wanted_fields);
     if let Some(engine) = &state.engine {
-        active_rechecks = deluge_active_recheck_hashes(engine).await;
-        for entry in &entries {
-            if let Ok(meta) = engine.torrent_metadata(entry.info_hash.clone()).await {
-                metadata.insert(entry.info_hash.clone(), meta);
-            }
-            if deluge_fields_need_peers(&wanted_fields) {
-                if let Ok(snapshot) = engine.torrent_peers(entry.info_hash.clone()).await {
-                    peers.insert(entry.info_hash.clone(), snapshot);
-                }
-            }
-            if let Ok(limits) = engine.torrent_limits(entry.info_hash.clone()).await {
-                limits_by_hash.insert(entry.info_hash.clone(), limits);
-            }
-            if deluge_fields_need_trackers(&wanted_fields) {
-                if let Ok(snapshot) = engine.torrent_trackers(entry.info_hash.clone()).await {
-                    trackers.insert(entry.info_hash.clone(), snapshot);
-                }
-            }
-        }
+        let hashes = entries
+            .iter()
+            .map(|entry| entry.info_hash.clone())
+            .collect::<Vec<_>>();
+        let projections = load_deluge_runtime_projections(
+            engine,
+            &hashes,
+            need_metadata,
+            deluge_fields_need_peers(&wanted_fields),
+            need_limits,
+            deluge_fields_need_trackers(&wanted_fields),
+        )
+        .await?;
+        merge_deluge_runtime_projections(
+            projections,
+            &mut metadata,
+            &mut peers,
+            &mut trackers,
+            &mut limits_by_hash,
+        );
     }
     let torrents = entries
         .iter()
-        .filter(|entry| {
-            deluge_torrent_matches_filter(entry, filter, active_rechecks.contains(&entry.info_hash))
-        })
         .map(|entry| {
             (
                 entry.info_hash.clone(),
@@ -1280,6 +1663,15 @@ async fn torrents_status(state: &AppState, params: &[Value]) -> Result<Value, St
     Ok(Value::Object(torrents))
 }
 
+fn ensure_legacy_full_list_bound(count: usize, endpoint: &str) -> Result<(), String> {
+    if count > MAX_LEGACY_FULL_LIST_ENTRIES {
+        return Err(format!(
+            "{endpoint} full-list response has {count} torrents; maximum is {MAX_LEGACY_FULL_LIST_ENTRIES}; use the native paged API"
+        ));
+    }
+    Ok(())
+}
+
 fn deluge_torrent_matches_filter(
     entry: &rt_session::TorrentEntry,
     filter: Option<&Value>,
@@ -1292,7 +1684,11 @@ fn deluge_torrent_matches_filter(
         match key.as_str() {
             "id" | "ids" | "hash" | "hashes" => {
                 let values = string_list(Some(value));
-                if !values.is_empty() && !values.iter().any(|hash| hash == &entry.info_hash) {
+                if !values.is_empty()
+                    && !values
+                        .iter()
+                        .any(|hash| hash.eq_ignore_ascii_case(&entry.info_hash))
+                {
                     return false;
                 }
             }
@@ -1323,6 +1719,39 @@ fn deluge_torrent_matches_filter(
     true
 }
 
+fn validate_deluge_status_filter(value: Option<&Value>) -> Result<(), String> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let Some(filter) = value.as_object() else {
+        return Err("Deluge torrent status filter must be an object".to_owned());
+    };
+    for (key, value) in filter {
+        if !matches!(
+            key.as_str(),
+            "id" | "ids" | "hash" | "hashes" | "label" | "state"
+        ) {
+            continue;
+        }
+        let values = value
+            .as_array()
+            .ok_or_else(|| format!("Deluge status filter {key} must be an array"))?;
+        for (index, item) in values.iter().enumerate() {
+            if item
+                .as_str()
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .is_none()
+            {
+                return Err(format!(
+                    "Deluge status filter {key}[{index}] must be a non-empty string"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn torrent_status(
     state: &AppState,
     hash: &str,
@@ -1331,9 +1760,9 @@ async fn torrent_status(
     let entry = {
         let reg = state.registry.read().await;
         reg.get(hash)
-            .cloned()
             .ok_or_else(|| format!("torrent {hash} not found"))?
     };
+    let hash = entry.info_hash.clone();
     let _lease = if state.engine.is_some() {
         Some(
             reserve_deluge_api_snapshot(state, estimate_deluge_torrent_detail_snapshot_bytes())
@@ -1344,28 +1773,33 @@ async fn torrent_status(
         None
     };
     let meta = if let Some(engine) = &state.engine {
-        engine.torrent_metadata(hash.to_owned()).await.ok()
+        Some(engine.torrent_metadata(hash.clone()).await?)
     } else {
         None
     };
     let peers = if let Some(engine) = &state.engine {
-        engine.torrent_peers(hash.to_owned()).await.ok()
+        Some(engine.torrent_peers(hash.clone()).await?)
     } else {
         None
     };
     let trackers = if let Some(engine) = &state.engine {
-        engine.torrent_trackers(hash.to_owned()).await.ok()
+        Some(engine.torrent_trackers(hash.clone()).await?)
     } else {
         None
     };
     let active_recheck = if let Some(engine) = &state.engine {
-        deluge_active_recheck_hashes(engine).await.contains(hash)
+        deluge_active_recheck_hashes(engine).await?.contains(&hash)
     } else {
         false
     };
-    let limits = deluge_torrent_limits(state, hash).await;
-    let move_completed = state.move_completed_options.read().await.get(hash).cloned();
-    let wanted_fields = deluge_requested_fields(fields);
+    let limits = deluge_torrent_limits(state, &hash).await?;
+    let move_completed = state
+        .move_completed_options
+        .read()
+        .await
+        .get(&hash)
+        .cloned();
+    let wanted_fields = deluge_requested_fields(fields)?;
     Ok(filter_deluge_torrent_fields(
         deluge_torrent(
             &entry,
@@ -1380,18 +1814,28 @@ async fn torrent_status(
     ))
 }
 
-fn deluge_requested_fields(value: Option<&Value>) -> Option<std::collections::BTreeSet<String>> {
-    let fields = value?.as_array()?;
+fn deluge_requested_fields(
+    value: Option<&Value>,
+) -> Result<Option<std::collections::BTreeSet<String>>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let Some(fields) = value.as_array() else {
+        return Err("Deluge requested fields must be an array".to_owned());
+    };
     if fields.is_empty() {
-        return None;
+        return Ok(None);
     }
-    Some(
-        fields
-            .iter()
-            .filter_map(Value::as_str)
-            .map(str::to_owned)
-            .collect(),
-    )
+    let mut requested = std::collections::BTreeSet::new();
+    for field in fields {
+        let field = field
+            .as_str()
+            .map(str::trim)
+            .filter(|field| !field.is_empty())
+            .ok_or_else(|| "Deluge requested fields must contain non-empty strings".to_owned())?;
+        requested.insert(field.to_owned());
+    }
+    Ok(Some(requested))
 }
 
 fn filter_deluge_torrent_fields(
@@ -1432,6 +1876,45 @@ fn deluge_fields_need_peers(fields: &Option<std::collections::BTreeSet<String>>)
     })
 }
 
+fn deluge_fields_need_metadata(fields: &Option<std::collections::BTreeSet<String>>) -> bool {
+    let Some(fields) = fields else {
+        return true;
+    };
+    fields.iter().any(|field| {
+        matches!(
+            field.as_str(),
+            "num_files"
+                | "num_pieces"
+                | "piece_length"
+                | "private"
+                | "comment"
+                | "tracker"
+                | "tracker_host"
+                | "tracker_status"
+                | "next_announce"
+        )
+    })
+}
+
+fn deluge_fields_need_limits(fields: &Option<std::collections::BTreeSet<String>>) -> bool {
+    let Some(fields) = fields else {
+        return true;
+    };
+    fields.iter().any(|field| {
+        matches!(
+            field.as_str(),
+            "max_download_speed"
+                | "max_upload_speed"
+                | "is_auto_managed"
+                | "stop_at_ratio"
+                | "stop_ratio"
+                | "prioritize_first_last"
+                | "sequential_download"
+                | "super_seeding"
+        )
+    })
+}
+
 fn deluge_fields_need_trackers(fields: &Option<std::collections::BTreeSet<String>>) -> bool {
     let Some(fields) = fields else {
         return true;
@@ -1444,11 +1927,10 @@ fn deluge_fields_need_trackers(fields: &Option<std::collections::BTreeSet<String
     })
 }
 
-async fn deluge_active_recheck_hashes(engine: &EngineHandle) -> HashSet<String> {
-    let Ok(jobs) = engine.list_jobs().await else {
-        return HashSet::new();
-    };
-    jobs.into_iter()
+async fn deluge_active_recheck_hashes(engine: &EngineHandle) -> Result<HashSet<String>, String> {
+    let jobs = engine.list_jobs().await?;
+    Ok(jobs
+        .into_iter()
         .filter(|job| {
             job.kind == "recheck_torrent"
                 && !matches!(
@@ -1457,25 +1939,25 @@ async fn deluge_active_recheck_hashes(engine: &EngineHandle) -> HashSet<String> 
                 )
         })
         .flat_map(|job| job.affected_torrents)
-        .collect()
+        .collect())
 }
 
 async fn torrent_files(state: &AppState, hash: &str) -> Result<Value, String> {
+    let hash = canonical_torrent_hash(state, hash).await?;
     if let Some(engine) = &state.engine {
-        if let Ok(meta) = engine.torrent_metadata(hash.to_owned()).await {
-            return Ok(json!(meta
-                .files
-                .into_iter()
-                .map(|file| json!({
-                    "index": file.index,
-                    "path": file.path,
-                    "size": file.length,
-                    "offset": 0,
-                    "progress": 0.0,
-                    "priority": 1,
-                }))
-                .collect::<Vec<_>>()));
-        }
+        let meta = engine.torrent_metadata(hash).await?;
+        return Ok(json!(meta
+            .files
+            .into_iter()
+            .map(|file| json!({
+                "index": file.index,
+                "path": file.path,
+                "size": file.length,
+                "offset": 0,
+                "progress": 0.0,
+                "priority": 1,
+            }))
+            .collect::<Vec<_>>()));
     }
     Ok(json!([]))
 }
@@ -1545,8 +2027,11 @@ fn deluge_torrent(
         "move_on_completed_path": move_completed.map(|options| options.path.as_str()).unwrap_or(""),
         "time_added": entry.added_at,
         "completed_time": entry.completed_at.unwrap_or(0),
-        "active_time": now.saturating_sub(entry.added_at as i64),
-        "seeding_time": entry.completed_at.map(|completed| now.saturating_sub(completed as i64)).unwrap_or(0),
+        "active_time": now.saturating_sub(deluge_i64(entry.added_at)),
+        "seeding_time": entry
+            .completed_at
+            .map(|completed| now.saturating_sub(deluge_i64(completed)))
+            .unwrap_or(0),
         "finished_time": entry.completed_at.unwrap_or(0),
         "all_time_download": entry.stats.downloaded,
         "total_uploaded": entry.stats.uploaded,
@@ -1649,7 +2134,7 @@ fn deluge_eta(amount_left: u64, download_rate: i64) -> i64 {
     if amount_left == 0 {
         0
     } else if download_rate > 0 {
-        (amount_left / download_rate as u64) as i64
+        i64::try_from(amount_left / download_rate as u64).unwrap_or(i64::MAX)
     } else {
         -1
     }
@@ -1675,26 +2160,9 @@ fn deluge_seeds_peers_ratio(peers: Option<&[EnginePeerSnapshot]>) -> f64 {
     }
 }
 
-fn labels_from_entries<'a>(
-    entries: impl IntoIterator<Item = &'a rt_session::TorrentEntry>,
-) -> Vec<Value> {
-    let mut labels = std::collections::BTreeMap::<String, usize>::new();
-    for entry in entries {
-        if let Some(label) = &entry.category {
-            *labels.entry(label.clone()).or_default() += 1;
-        }
-    }
-    labels
-        .into_iter()
-        .map(|(label, count)| json!([label, count]))
-        .collect()
-}
-
 async fn add_magnet(state: &AppState, uri: &str, options: Option<&Value>) -> Result<Value, String> {
-    let Some(engine) = &state.engine else {
-        return Ok(json!(true));
-    };
     let magnet = parse_magnet(uri).map_err(|e| e.to_string())?;
+    let engine = deluge_engine(state)?;
     let save_path = options
         .and_then(|value| value.get("download_location"))
         .and_then(Value::as_str)
@@ -1710,32 +2178,24 @@ async fn add_torrent_file(
     data: &str,
     options: Option<&Value>,
 ) -> Result<Value, String> {
-    let Some(engine) = &state.engine else {
-        return Ok(json!(true));
-    };
     let raw = decode_deluge_torrent_data(data)?;
-    let meta = parse_torrent(&raw).map_err(|e| e.to_string())?;
+    let engine = deluge_engine(state)?;
     let save_path = options
         .and_then(|value| value.get("download_location"))
         .and_then(Value::as_str)
         .map(std::path::PathBuf::from);
     let hash = engine
-        .add_torrent_with_labels(meta, save_path, false, None, Vec::new())
+        .add_torrent_raw_with_labels(raw, save_path, false, None, Vec::new())
         .await?;
     Ok(json!(hash))
 }
 
 async fn add_torrent_path(
-    state: &AppState,
-    path: &str,
-    options: Option<&Value>,
+    _state: &AppState,
+    _path: &str,
+    _options: Option<&Value>,
 ) -> Result<Value, String> {
-    if state.engine.is_none() {
-        return Ok(json!(true));
-    }
-    let raw = std::fs::read(path).map_err(|e| e.to_string())?;
-    let data = general_purpose::STANDARD.encode(raw);
-    add_torrent_file(state, &data, options).await
+    Err("path-based torrent loads are unsupported at this API boundary; use embedded base64 metainfo or a magnet URI".to_owned())
 }
 
 fn decode_deluge_torrent_data(data: &str) -> Result<Vec<u8>, String> {
@@ -1754,15 +2214,47 @@ fn decode_deluge_torrent_data(data: &str) -> Result<Vec<u8>, String> {
 }
 
 async fn set_torrent_options(state: &AppState, params: &[Value]) -> Result<Value, String> {
-    let hashes = hashes_from_param(params.first());
+    let hashes = canonical_hashes_from_param(state, params.first()).await?;
     let Some(options) = params.get(1).and_then(Value::as_object) else {
-        return Ok(json!(true));
+        return Err("missing torrent options".to_owned());
     };
+    if !hashes.is_empty() && state.engine.is_none() && !options.is_empty() {
+        return Err("native engine is unavailable; torrent options were not applied".to_owned());
+    }
+    if state.engine.is_some()
+        && [
+            "auto_managed",
+            "move_completed",
+            "move_on_completed",
+            "move_completed_path",
+            "move_on_completed_path",
+        ]
+        .iter()
+        .any(|key| options.contains_key(*key))
+    {
+        return Err(
+            "auto_managed and move-on-completion options are not runtime-supported".to_owned(),
+        );
+    }
+    validate_deluge_options(options)?;
     for hash in hashes {
-        let mut limits = deluge_torrent_limits(state, &hash)
-            .await
-            .unwrap_or_default();
+        let mut limits = if let Some(engine) = &state.engine {
+            engine.torrent_limits(hash.clone()).await?
+        } else {
+            state
+                .torrent_options
+                .read()
+                .await
+                .get(&hash)
+                .cloned()
+                .unwrap_or_default()
+        };
         apply_deluge_options(&mut limits, options);
+        if let Some(engine) = &state.engine {
+            engine
+                .update_torrent_limits(hash.clone(), limits.clone())
+                .await?;
+        }
         if let Some(move_completed) = deluge_move_completed_options(options) {
             state
                 .move_completed_options
@@ -1775,9 +2267,6 @@ async fn set_torrent_options(state: &AppState, params: &[Value]) -> Result<Value
             .write()
             .await
             .insert(hash.clone(), limits.clone());
-        if let Some(engine) = &state.engine {
-            engine.update_torrent_limits(hash, limits).await?;
-        }
     }
     Ok(json!(true))
 }
@@ -1803,38 +2292,38 @@ fn deluge_move_completed_options(
 }
 
 async fn set_prioritize_first_last(state: &AppState, params: &[Value]) -> Result<Value, String> {
-    let hashes = hashes_from_param(params.first());
+    let hashes = canonical_hashes_from_param(state, params.first()).await?;
     let Some(enabled) = deluge_bool(params.get(1)) else {
-        return Ok(json!(true));
+        return Err("missing prioritize-first-last value".to_owned());
     };
+    if hashes.is_empty() {
+        return Ok(json!(true));
+    }
+    let engine = deluge_engine(state)?;
     for hash in hashes {
-        let mut limits = deluge_torrent_limits(state, &hash)
-            .await
-            .unwrap_or_default();
+        let mut limits = engine.torrent_limits(hash.clone()).await?;
         limits.first_last_piece_prio = enabled;
-        state
-            .torrent_options
-            .write()
-            .await
-            .insert(hash.clone(), limits.clone());
-        if let Some(engine) = &state.engine {
-            engine.update_torrent_limits(hash, limits).await?;
-        }
+        engine
+            .update_torrent_limits(hash.clone(), limits.clone())
+            .await?;
+        state.torrent_options.write().await.insert(hash, limits);
     }
     Ok(json!(true))
 }
 
 async fn set_file_priorities(state: &AppState, params: &[Value]) -> Result<Value, String> {
-    let Some(hash) = params.first().and_then(Value::as_str) else {
-        return Ok(json!(true));
-    };
-    let updates = deluge_file_priority_updates(params.get(1), params.get(2));
+    let hash = params
+        .first()
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|hash| !hash.is_empty())
+        .ok_or_else(|| "missing torrent id".to_owned())?;
+    let hash = canonical_torrent_hash(state, hash).await?;
+    let updates = deluge_file_priority_updates(params.get(1), params.get(2))?;
     if updates.is_empty() {
         return Ok(json!(true));
     }
-    let Some(engine) = &state.engine else {
-        return Ok(json!(true));
-    };
+    let engine = deluge_engine(state)?;
     for (file_ids, priority) in updates {
         engine
             .update_file_priorities(hash.to_owned(), file_ids, priority)
@@ -1844,13 +2333,15 @@ async fn set_file_priorities(state: &AppState, params: &[Value]) -> Result<Value
 }
 
 async fn set_trackers(state: &AppState, params: &[Value]) -> Result<Value, String> {
-    let Some(hash) = params.first().and_then(Value::as_str) else {
-        return Ok(json!(true));
-    };
-    let trackers = deluge_trackers_arg(params.get(1));
-    let Some(engine) = &state.engine else {
-        return Ok(json!(true));
-    };
+    let hash = params
+        .first()
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|hash| !hash.is_empty())
+        .ok_or_else(|| "missing torrent id".to_owned())?;
+    let hash = canonical_torrent_hash(state, hash).await?;
+    let trackers = deluge_trackers_arg(params.get(1))?;
+    let engine = deluge_engine(state)?;
     engine
         .update_torrent_trackers(hash.to_owned(), trackers)
         .await?;
@@ -1858,32 +2349,37 @@ async fn set_trackers(state: &AppState, params: &[Value]) -> Result<Value, Strin
 }
 
 async fn connect_peer(state: &AppState, params: &[Value]) -> Result<Value, String> {
-    let Some(hash) = params.first().and_then(Value::as_str) else {
-        return Ok(json!(true));
-    };
-    let peer = if let Some(addr) = params.get(1).and_then(deluge_peer_addr_arg) {
-        Some(addr)
+    let hash = params
+        .first()
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|hash| !hash.is_empty())
+        .ok_or_else(|| "missing torrent id".to_owned())?;
+    let hash = canonical_torrent_hash(state, hash).await?;
+    let peer = if params.len() >= 3 {
+        deluge_peer_host_port(params.get(1), params.get(2))?
     } else {
-        deluge_peer_host_port(params.get(1), params.get(2))
+        deluge_peer_addr_arg(
+            params
+                .get(1)
+                .ok_or_else(|| "missing peer address".to_owned())?,
+        )?
     };
-    let Some(peer) = peer else {
-        return Ok(json!(true));
-    };
-    let Some(engine) = &state.engine else {
-        return Ok(json!(true));
-    };
+    let engine = deluge_engine(state)?;
     engine.add_peers(hash.to_owned(), vec![peer]).await?;
     Ok(json!(true))
 }
 
 async fn rename_files(state: &AppState, params: &[Value]) -> Result<Value, String> {
-    let Some(hash) = params.first().and_then(Value::as_str) else {
-        return Ok(json!(true));
-    };
-    let renames = deluge_rename_file_args(params.get(1));
-    let Some(engine) = &state.engine else {
-        return Ok(json!(true));
-    };
+    let hash = params
+        .first()
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|hash| !hash.is_empty())
+        .ok_or_else(|| "missing torrent id".to_owned())?;
+    let hash = canonical_torrent_hash(state, hash).await?;
+    let renames = deluge_rename_file_args(params.get(1))?;
+    let engine = deluge_engine(state)?;
     for (file_id, new_path) in renames {
         engine
             .rename_file_path(hash.to_owned(), file_id, new_path)
@@ -1893,18 +2389,22 @@ async fn rename_files(state: &AppState, params: &[Value]) -> Result<Value, Strin
 }
 
 async fn rename_folder(state: &AppState, params: &[Value]) -> Result<Value, String> {
-    let Some(hash) = params.first().and_then(Value::as_str) else {
-        return Ok(json!(true));
-    };
-    let Some(old_path) = params.get(1).and_then(Value::as_str) else {
-        return Ok(json!(true));
-    };
-    let Some(new_path) = params.get(2).and_then(Value::as_str) else {
-        return Ok(json!(true));
-    };
-    let Some(engine) = &state.engine else {
-        return Ok(json!(true));
-    };
+    let hash = params
+        .first()
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|hash| !hash.is_empty())
+        .ok_or_else(|| "missing torrent id".to_owned())?;
+    let hash = canonical_torrent_hash(state, hash).await?;
+    let old_path = params
+        .get(1)
+        .and_then(Value::as_str)
+        .ok_or_else(|| "missing old folder path".to_owned())?;
+    let new_path = params
+        .get(2)
+        .and_then(Value::as_str)
+        .ok_or_else(|| "missing new folder path".to_owned())?;
+    let engine = deluge_engine(state)?;
     engine
         .rename_folder_path(hash.to_owned(), old_path.to_owned(), new_path.to_owned())
         .await?;
@@ -1924,6 +2424,25 @@ fn string_list(value: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn strict_string_list(value: Option<&Value>, field: &str) -> Result<Vec<String>, String> {
+    let values = value
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("{field} must be an array of non-empty strings"))?;
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            value
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| format!("{field}[{index}] must be a non-empty string"))
+        })
+        .collect()
+}
+
+#[cfg(test)]
 fn hashes_from_param(value: Option<&Value>) -> Vec<String> {
     match value {
         Some(Value::String(hash)) if !hash.trim().is_empty() => vec![hash.trim().to_owned()],
@@ -1936,6 +2455,77 @@ fn hashes_from_param(value: Option<&Value>) -> Vec<String> {
             .collect(),
         _ => Vec::new(),
     }
+}
+
+fn strict_hashes_from_param(value: Option<&Value>) -> Result<Vec<String>, String> {
+    match value {
+        Some(Value::String(hash)) => {
+            let hash = hash.trim();
+            if hash.is_empty() {
+                Err("torrent id must not be empty".to_owned())
+            } else {
+                Ok(vec![hash.to_owned()])
+            }
+        }
+        Some(Value::Array(values)) => values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|hash| !hash.is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| format!("torrent ids[{index}] must be a non-empty string"))
+            })
+            .collect(),
+        Some(_) => Err("torrent id must be a string or an array of strings".to_owned()),
+        None => Err("missing torrent id".to_owned()),
+    }
+}
+
+async fn canonical_torrent_hash(state: &AppState, hash: &str) -> Result<String, String> {
+    let hash = hash.trim();
+    if hash.is_empty() {
+        return Err("torrent id must not be empty".to_owned());
+    }
+    let reg = state.registry.read().await;
+    reg.get(hash)
+        .map(|entry| entry.info_hash.clone())
+        .ok_or_else(|| format!("torrent {hash} was not found"))
+}
+
+async fn canonical_torrent_hashes(
+    state: &AppState,
+    value: Option<&Value>,
+    field: &str,
+) -> Result<Vec<String>, String> {
+    let hashes = strict_string_list(value, field)?;
+    let reg = state.registry.read().await;
+    hashes
+        .into_iter()
+        .map(|hash| {
+            reg.get(&hash)
+                .map(|entry| entry.info_hash.clone())
+                .ok_or_else(|| format!("torrent {hash} was not found"))
+        })
+        .collect()
+}
+
+async fn canonical_hashes_from_param(
+    state: &AppState,
+    value: Option<&Value>,
+) -> Result<Vec<String>, String> {
+    let hashes = strict_hashes_from_param(value)?;
+    let reg = state.registry.read().await;
+    hashes
+        .into_iter()
+        .map(|hash| {
+            reg.get(&hash)
+                .map(|entry| entry.info_hash.clone())
+                .ok_or_else(|| format!("torrent {hash} was not found"))
+        })
+        .collect()
 }
 
 fn apply_deluge_options(
@@ -1961,12 +2551,6 @@ fn apply_deluge_options(
         limits.super_seeding = value;
     }
     if let Some(value) = options
-        .get("auto_managed")
-        .and_then(|value| deluge_bool(Some(value)))
-    {
-        limits.auto_management = value;
-    }
-    if let Some(value) = options
         .get("max_download_speed")
         .and_then(|value| deluge_speed_limit(Some(value)))
     {
@@ -1990,13 +2574,18 @@ fn apply_deluge_options(
     }
 }
 
-async fn deluge_torrent_limits(state: &AppState, hash: &str) -> Option<EngineTorrentLimits> {
+async fn deluge_torrent_limits(
+    state: &AppState,
+    hash: &str,
+) -> Result<Option<EngineTorrentLimits>, String> {
     if let Some(engine) = &state.engine {
-        if let Ok(limits) = engine.torrent_limits(hash.to_owned()).await {
-            return Some(limits);
-        }
+        return engine
+            .torrent_limits(hash.to_owned())
+            .await
+            .map(Some)
+            .map_err(|error| error.to_string());
     }
-    state.torrent_options.read().await.get(hash).cloned()
+    Ok(state.torrent_options.read().await.get(hash).cloned())
 }
 
 fn bytes_to_deluge_kib(value: i64) -> f64 {
@@ -2004,16 +2593,22 @@ fn bytes_to_deluge_kib(value: i64) -> f64 {
 }
 
 fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
+    deluge_i64(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    )
+}
+
+fn deluge_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 fn deluge_bool(value: Option<&Value>) -> Option<bool> {
     match value {
         Some(Value::Bool(value)) => Some(*value),
-        Some(Value::Number(value)) => Some(value.as_i64().unwrap_or_default() != 0),
+        Some(Value::Number(value)) => value.as_i64().map(|value| value != 0),
         Some(Value::String(value)) => match value.trim().to_ascii_lowercase().as_str() {
             "true" | "1" | "yes" | "on" => Some(true),
             "false" | "0" | "no" | "off" => Some(false),
@@ -2023,44 +2618,102 @@ fn deluge_bool(value: Option<&Value>) -> Option<bool> {
     }
 }
 
+fn validate_deluge_options(options: &serde_json::Map<String, Value>) -> Result<(), String> {
+    const BOOL_OPTIONS: &[&str] = &[
+        "prioritize_first_last",
+        "sequential_download",
+        "super_seeding",
+        "stop_at_ratio",
+    ];
+    const SUPPORTED_OPTIONS: &[&str] = &[
+        "prioritize_first_last",
+        "sequential_download",
+        "super_seeding",
+        "max_download_speed",
+        "max_upload_speed",
+        "stop_at_ratio",
+        "stop_ratio",
+    ];
+
+    for key in BOOL_OPTIONS {
+        if options.contains_key(*key) && deluge_bool(options.get(*key)).is_none() {
+            return Err(format!("Deluge option {key} must be a boolean"));
+        }
+    }
+    for key in ["max_download_speed", "max_upload_speed"] {
+        if options.contains_key(key) && deluge_speed_limit(options.get(key)).is_none() {
+            return Err(format!(
+                "Deluge option {key} must be a finite speed in KiB/s within the supported range"
+            ));
+        }
+    }
+    if options.contains_key("stop_ratio")
+        && options
+            .get("stop_ratio")
+            .and_then(Value::as_f64)
+            .filter(|ratio| ratio.is_finite() && *ratio >= 0.0)
+            .is_none()
+    {
+        return Err("Deluge option stop_ratio must be a finite non-negative number".to_owned());
+    }
+    if let Some(key) = options
+        .keys()
+        .find(|key| !SUPPORTED_OPTIONS.contains(&key.as_str()))
+    {
+        return Err(format!(
+            "unsupported Deluge torrent option {key}; it was not applied"
+        ));
+    }
+    Ok(())
+}
+
 fn deluge_speed_limit(value: Option<&Value>) -> Option<Option<i64>> {
     let kib = match value {
         Some(Value::Number(value)) => value.as_f64()?,
         Some(Value::String(value)) => value.trim().parse::<f64>().ok()?,
         _ => return None,
     };
+    if !kib.is_finite() {
+        return None;
+    }
     if kib <= 0.0 {
         Some(None)
+    } else if kib > i64::MAX as f64 / 1024.0 {
+        None
     } else {
-        Some(Some((kib * 1024.0) as i64))
+        Some(Some((kib * 1024.0).round() as i64))
     }
 }
 
 fn deluge_file_priority_updates(
     ids_or_priorities: Option<&Value>,
     priority: Option<&Value>,
-) -> Vec<(Vec<u32>, i64)> {
-    if let Some(priority) = priority.and_then(Value::as_i64) {
-        let ids = deluge_file_ids(ids_or_priorities);
+) -> Result<Vec<(Vec<u32>, i64)>, String> {
+    if let Some(priority) = priority {
+        let priority = priority
+            .as_i64()
+            .ok_or_else(|| "file priority must be an integer".to_owned())?;
+        let ids = deluge_file_ids(ids_or_priorities)?;
         if ids.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        return vec![(ids, deluge_file_priority(priority))];
+        return Ok(vec![(ids, deluge_file_priority(priority))]);
     }
     let Some(priorities) = ids_or_priorities.and_then(Value::as_array) else {
-        return Vec::new();
+        return Err("file priorities must be an array".to_owned());
     };
     let mut skipped = Vec::new();
     let mut normal = Vec::new();
     let mut high = Vec::new();
     for (idx, value) in priorities.iter().enumerate() {
-        let Some(priority) = value.as_i64() else {
-            continue;
-        };
+        let priority = value
+            .as_i64()
+            .ok_or_else(|| format!("file priority at index {idx} must be an integer"))?;
+        let idx = u32::try_from(idx).map_err(|_| "too many file priorities".to_owned())?;
         match deluge_file_priority(priority) {
-            0 => skipped.push(idx as u32),
-            2 => high.push(idx as u32),
-            _ => normal.push(idx as u32),
+            0 => skipped.push(idx),
+            2 => high.push(idx),
+            _ => normal.push(idx),
         }
     }
     let mut updates = Vec::new();
@@ -2073,19 +2726,24 @@ fn deluge_file_priority_updates(
     if !high.is_empty() {
         updates.push((high, 2));
     }
-    updates
+    Ok(updates)
 }
 
-fn deluge_file_ids(value: Option<&Value>) -> Vec<u32> {
-    value
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(|value| value.as_u64().map(|value| value as u32))
-                .collect()
+fn deluge_file_ids(value: Option<&Value>) -> Result<Vec<u32>, String> {
+    let Some(values) = value.and_then(Value::as_array) else {
+        return Err("file ids must be an array".to_owned());
+    };
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let value = value.as_u64().ok_or_else(|| {
+                format!("file id at index {index} must be a non-negative integer")
+            })?;
+            u32::try_from(value)
+                .map_err(|_| format!("file id at index {index} exceeds the supported range"))
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 fn deluge_file_priority(priority: i64) -> i64 {
@@ -2098,34 +2756,37 @@ fn deluge_file_priority(priority: i64) -> i64 {
     }
 }
 
-fn deluge_trackers_arg(value: Option<&Value>) -> Vec<String> {
-    let Some(value) = value else {
-        return Vec::new();
-    };
+fn deluge_trackers_arg(value: Option<&Value>) -> Result<Vec<String>, String> {
+    let value = value.ok_or_else(|| "missing tracker list".to_owned())?;
     let mut trackers = Vec::new();
-    collect_deluge_trackers(value, &mut trackers);
-    normalize_deluge_trackers(trackers)
+    collect_deluge_trackers(value, &mut trackers)?;
+    Ok(normalize_deluge_trackers(trackers))
 }
 
-fn collect_deluge_trackers(value: &Value, out: &mut Vec<String>) {
+fn collect_deluge_trackers(value: &Value, out: &mut Vec<String>) -> Result<(), String> {
     match value {
-        Value::String(value) => out.push(value.to_owned()),
+        Value::String(value) if !value.trim().is_empty() => out.push(value.to_owned()),
+        Value::String(_) => return Err("tracker URL must not be empty".to_owned()),
         Value::Array(values) => {
             for value in values {
-                collect_deluge_trackers(value, out);
+                collect_deluge_trackers(value, out)?;
             }
         }
         Value::Object(obj) => {
-            if let Some(url) = obj
+            let Some(url) = obj
                 .get("url")
                 .or_else(|| obj.get("announce"))
                 .and_then(Value::as_str)
-            {
-                out.push(url.to_owned());
-            }
+                .map(str::trim)
+                .filter(|url| !url.is_empty())
+            else {
+                return Err("tracker entry must contain a non-empty url".to_owned());
+            };
+            out.push(url.to_owned());
         }
-        _ => {}
+        _ => return Err("tracker list contains an invalid entry".to_owned()),
     }
+    Ok(())
 }
 
 fn normalize_deluge_trackers(values: Vec<String>) -> Vec<String> {
@@ -2139,56 +2800,94 @@ fn normalize_deluge_trackers(values: Vec<String>) -> Vec<String> {
     out
 }
 
-fn deluge_peer_addr_arg(value: &Value) -> Option<SocketAddr> {
+fn deluge_peer_addr_arg(value: &Value) -> Result<SocketAddr, String> {
     match value {
-        Value::String(value) => value.trim().parse().ok(),
+        Value::String(value) => value
+            .trim()
+            .parse()
+            .map_err(|_| "peer address must be a valid socket address".to_owned()),
         Value::Array(values) => deluge_peer_host_port(values.first(), values.get(1)),
         Value::Object(obj) => {
             deluge_peer_host_port(obj.get("ip").or_else(|| obj.get("host")), obj.get("port"))
         }
-        _ => None,
+        _ => Err("peer address must be a socket address, host/port array, or object".to_owned()),
     }
 }
 
-fn deluge_peer_host_port(host: Option<&Value>, port: Option<&Value>) -> Option<SocketAddr> {
-    let host = host.and_then(Value::as_str)?.trim();
+fn deluge_peer_host_port(host: Option<&Value>, port: Option<&Value>) -> Result<SocketAddr, String> {
+    let host = host
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .ok_or_else(|| "peer host is required".to_owned())?;
     let port = match port {
-        Some(Value::Number(value)) => value.as_u64()? as u16,
-        Some(Value::String(value)) => value.trim().parse().ok()?,
-        _ => return None,
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .and_then(|value| u16::try_from(value).ok())
+            .ok_or_else(|| "peer port must be between 0 and 65535".to_owned())?,
+        Some(Value::String(value)) => value
+            .trim()
+            .parse()
+            .map_err(|_| "peer port must be between 0 and 65535".to_owned())?,
+        _ => return Err("peer port is required".to_owned()),
     };
-    format!("{host}:{port}").parse().ok()
+    format!("{host}:{port}")
+        .parse()
+        .map_err(|_| "peer host and port do not form a valid socket address".to_owned())
 }
 
-fn deluge_rename_file_args(value: Option<&Value>) -> Vec<(u32, String)> {
-    value
-        .and_then(Value::as_array)
-        .map(|values| values.iter().filter_map(deluge_rename_file_arg).collect())
-        .unwrap_or_default()
+fn deluge_rename_file_args(value: Option<&Value>) -> Result<Vec<(u32, String)>, String> {
+    let Some(values) = value.and_then(Value::as_array) else {
+        return Err("file renames must be an array".to_owned());
+    };
+    values.iter().map(deluge_rename_file_arg).collect()
 }
 
-fn deluge_rename_file_arg(value: &Value) -> Option<(u32, String)> {
+fn deluge_rename_file_arg(value: &Value) -> Result<(u32, String), String> {
     match value {
         Value::Array(values) => {
-            let id = values.first()?.as_u64()? as u32;
-            let path = values.get(1)?.as_str()?.to_owned();
-            Some((id, path))
+            let id = values
+                .first()
+                .and_then(Value::as_u64)
+                .ok_or_else(|| "file rename id must be a non-negative integer".to_owned())
+                .and_then(|id| {
+                    u32::try_from(id)
+                        .map_err(|_| "file rename id exceeds the supported range".to_owned())
+                })?;
+            let path = values
+                .get(1)
+                .and_then(Value::as_str)
+                .filter(|path| !path.trim().is_empty())
+                .ok_or_else(|| "file rename path is required".to_owned())?
+                .to_owned();
+            Ok((id, path))
         }
         Value::Object(obj) => {
-            let id = obj
+            let id_value = obj
                 .get("index")
                 .or_else(|| obj.get("id"))
-                .or_else(|| obj.get("file_id"))?
-                .as_u64()? as u32;
-            let path = obj
+                .or_else(|| obj.get("file_id"))
+                .ok_or_else(|| "file rename id is required".to_owned())?;
+            let id = id_value
+                .as_u64()
+                .ok_or_else(|| "file rename id must be a non-negative integer".to_owned())
+                .and_then(|id| {
+                    u32::try_from(id)
+                        .map_err(|_| "file rename id exceeds the supported range".to_owned())
+                })?;
+            let path_value = obj
                 .get("path")
                 .or_else(|| obj.get("name"))
-                .or_else(|| obj.get("new_path"))?
-                .as_str()?
+                .or_else(|| obj.get("new_path"))
+                .ok_or_else(|| "file rename path is required".to_owned())?;
+            let path = path_value
+                .as_str()
+                .filter(|path| !path.trim().is_empty())
+                .ok_or_else(|| "file rename path is required".to_owned())?
                 .to_owned();
-            Some((id, path))
+            Ok((id, path))
         }
-        _ => None,
+        _ => Err("file rename must be an array or object".to_owned()),
     }
 }
 
@@ -2256,6 +2955,62 @@ mod tests {
         let body = axum::body::to_bytes(login.into_body(), 4096).await.unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["result"], true);
+    }
+
+    #[tokio::test]
+    async fn deluge_shutdown_notifies_daemon() {
+        let notify = Arc::new(Notify::new());
+        let mut state = AppState::new(Arc::new(RwLock::new(SessionRegistry::new())));
+        state.shutdown = Some(Arc::clone(&notify));
+        let notified = notify.notified();
+
+        assert_eq!(
+            dispatch(&state, "daemon.shutdown", &[]).await.unwrap(),
+            true
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+            .await
+            .expect("daemon shutdown notification was lost");
+    }
+
+    #[tokio::test]
+    async fn deluge_idempotency_key_replays_mutation_and_rejects_reuse() {
+        let app = build_deluge_router(AppState::new(Arc::new(RwLock::new(SessionRegistry::new()))));
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/json")
+                .header("content-type", "application/json")
+                .header("idempotency-key", "deluge-session-1")
+                .body(Body::from(
+                    r#"{"id":1,"method":"web.download_torrent_from_url","params":["magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}"#,
+                ))
+                .unwrap()
+        };
+        let first = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let replay = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(
+            replay.headers().get("idempotency-replayed").unwrap(),
+            "true"
+        );
+
+        let conflict = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/json")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "deluge-session-1")
+                    .body(Body::from(
+                        r#"{"id":2,"method":"web.download_torrent_from_url","params":["magnet:?xt=urn:btih-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(conflict.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]
@@ -2618,6 +3373,18 @@ mod tests {
         assert_eq!(body["next_announce"], 200);
     }
 
+    #[test]
+    fn deluge_projection_arguments_reject_malformed_filters_and_fields() {
+        assert!(validate_deluge_status_filter(Some(&json!("all"))).is_err());
+        assert!(validate_deluge_status_filter(Some(&json!({
+            "state": ["Paused", 1]
+        })))
+        .is_err());
+        assert!(deluge_requested_fields(Some(&json!("name"))).is_err());
+        assert!(deluge_requested_fields(Some(&json!(["name", 1]))).is_err());
+        assert!(deluge_requested_fields(Some(&json!(["name", "progress"]))).is_ok());
+    }
+
     fn assert_json_keys(value: &Value, keys: &[&str]) {
         let obj = value.as_object().expect("expected JSON object");
         for key in keys {
@@ -2888,18 +3655,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deluge_auxiliary_plugin_state_roundtrips() {
+    async fn deluge_unsupported_plugin_writes_fail_closed() {
         let app = build_deluge_router(AppState::new(Arc::new(RwLock::new(SessionRegistry::new()))));
 
-        for body in [
-            r#"{"id":1,"method":"blocklist.set_config","params":[{"enabled":true,"url":"https://example.test/blocklist","list_size":42}]}"#,
-            r#"{"id":2,"method":"autoadd.set_config","params":[{"watchdirs":{"1":{"path":"/watch","enabled":true}}}]}"#,
-            r#"{"id":3,"method":"autoadd.enable","params":[1]}"#,
-            r#"{"id":4,"method":"scheduler.set_config","params":[{"low_down":10.0,"button_state":[[1,1,1,1,1,1,1,1]]}]}"#,
-            r#"{"id":5,"method":"extractor.set_config","params":[{"enabled":true,"extract_path":"/extract"}]}"#,
-            r#"{"id":6,"method":"execute.save_command","params":["complete","echo done"]}"#,
-            r#"{"id":7,"method":"core.disable_plugin","params":["Execute"]}"#,
+        for (id, method, params) in [
+            (1, "blocklist.set_config", r#"[{"enabled":true}]"#),
+            (2, "autoadd.set_config", r#"[{"watchdirs":{}}]"#),
+            (3, "autoadd.enable", r#"[1]"#),
+            (4, "autoadd.disable", r#"[1]"#),
+            (5, "scheduler.set_config", r#"[{"low_down":10.0}]"#),
+            (6, "extractor.set_config", r#"[{"enabled":true}]"#),
+            (7, "execute.save_command", r#"["complete","echo done"]"#),
+            (8, "execute.remove_command", r#"[1]"#),
+            (9, "core.enable_plugin", r#"["Execute"]"#),
+            (10, "core.disable_plugin", r#"["Execute"]"#),
         ] {
+            let body = format!(r#"{{"id":{id},"method":"{method}","params":{params}}}"#);
             let resp = app
                 .clone()
                 .oneshot(
@@ -2913,25 +3684,22 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(resp.status(), axum::http::StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert!(body["result"].is_null(), "{method}: {body:?}");
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("not runtime-backed")),
+                "{method}: {body:?}"
+            );
         }
 
         for (method, expected) in [
-            (
-                "blocklist.get_config",
-                json!({"enabled": true, "url": "https://example.test/blocklist", "list_size": 42}),
-            ),
-            (
-                "autoadd.get_config",
-                json!({"enabled": true, "watchdirs": {"1": {"path": "/watch", "enabled": true}}}),
-            ),
-            (
-                "scheduler.get_config",
-                json!({"low_down": 10.0, "button_state": [[1,1,1,1,1,1,1,1]]}),
-            ),
-            (
-                "extractor.get_config",
-                json!({"enabled": true, "extract_path": "/extract"}),
-            ),
+            ("blocklist.get_config", blocklist_config()),
+            ("autoadd.get_config", autoadd_config()),
+            ("scheduler.get_config", scheduler_config()),
+            ("extractor.get_config", extractor_config()),
         ] {
             let resp = app
                 .clone()
@@ -2949,48 +3717,9 @@ mod tests {
                 .unwrap();
             let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
             let body: Value = serde_json::from_slice(&body).unwrap();
-            for (key, value) in expected.as_object().unwrap() {
-                assert_eq!(&body["result"][key], value, "{method} {key}");
-            }
+            assert!(body["error"].is_null(), "{method}: {body:?}");
+            assert_eq!(body["result"], expected, "{method}");
         }
-
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/json")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"id":11,"method":"blocklist.get_status","params":[]}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
-        let body: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["result"]["state"], "Idle");
-        assert_eq!(body["result"]["num_blocked"], 42);
-
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/json")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"id":12,"method":"execute.get_commands","params":[]}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
-        let body: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["result"][0]["event"], "complete");
-        assert_eq!(body["result"][0]["command"], "echo done");
 
         let resp = app
             .oneshot(
@@ -3007,14 +3736,20 @@ mod tests {
             .unwrap();
         let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
-        assert!(!body["result"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("Execute")));
+        assert_eq!(body["result"], json!(["Label", "Notifications"]));
+
+        let commands = dispatch(
+            &AppState::new(Arc::new(RwLock::new(SessionRegistry::new()))),
+            "execute.get_commands",
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(commands, json!([]));
     }
 
     #[tokio::test]
-    async fn deluge_label_methods_update_registry() {
+    async fn deluge_label_mutation_requires_native_engine() {
         let registry = Arc::new(RwLock::new(SessionRegistry::new()));
         {
             let mut reg = registry.write().await;
@@ -3042,15 +3777,16 @@ mod tests {
             .await
             .unwrap();
         assert!(resp.status().is_success());
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert!(body["result"].is_null());
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("native engine is unavailable"));
         assert_eq!(
-            registry
-                .read()
-                .await
-                .get(&"b".repeat(40))
-                .unwrap()
-                .category
-                .as_deref(),
-            Some("movies")
+            registry.read().await.get(&"b".repeat(40)).unwrap().category,
+            None
         );
 
         let resp = app
@@ -3068,7 +3804,7 @@ mod tests {
             .unwrap();
         let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["result"], json!(["movies"]));
+        assert_eq!(body["result"], json!([]));
     }
 
     #[tokio::test]
@@ -3105,7 +3841,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deluge_web_add_torrents_accepts_common_webui_payload_shapes_without_engine() {
+    async fn deluge_web_add_torrents_reports_unavailable_engine_per_item() {
         let app = build_deluge_router(AppState::new(Arc::new(RwLock::new(SessionRegistry::new()))));
         let resp = app
             .oneshot(
@@ -3131,7 +3867,10 @@ mod tests {
         assert!(body["error"].is_null(), "{:?}", body["error"]);
         let results = body["result"].as_array().unwrap();
         assert_eq!(results.len(), 4);
-        assert!(results.iter().all(|result| result["success"] == true));
+        assert_eq!(results[0]["success"], false);
+        assert_eq!(results[1]["success"], false);
+        assert_eq!(results[2]["success"], false);
+        assert_eq!(results[3]["success"], false);
         assert_eq!(
             results[0]["path"],
             "magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -3181,7 +3920,7 @@ mod tests {
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert!(body["error"].is_null(), "{:?}", body["error"]);
         let result = &body["result"][0];
-        assert_eq!(result["success"], true);
+        assert_eq!(result["success"], false);
         assert_eq!(result["path"], token);
         assert_eq!(
             result["result"]["url"],
@@ -3191,7 +3930,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deluge_url_download_tokens_are_one_shot_and_magnets_use_add_path() {
+    async fn deluge_url_download_tokens_are_one_shot_and_report_engine_failure() {
         let app = build_deluge_router(AppState::new(Arc::new(RwLock::new(SessionRegistry::new()))));
         let magnet = "magnet:?xt=urn:btih:0123456789012345678901234567890123456789&dn=TokenMagnet";
         let resp = app
@@ -3231,18 +3970,13 @@ mod tests {
             let body: Value = serde_json::from_slice(&body).unwrap();
             assert!(body["error"].is_null(), "{:?}", body["error"]);
             let result = &body["result"][0];
-            assert_eq!(result["success"], true);
-            if id == 2 {
-                assert_eq!(result["result"], true);
-            } else {
-                assert_eq!(result["result"], true);
-                assert!(result["result"]["downloaded"].is_null());
-            }
+            assert_eq!(result["success"], false);
+            assert!(result["result"].is_null());
         }
     }
 
     #[tokio::test]
-    async fn deluge_torrent_options_roundtrip_through_status_without_engine() {
+    async fn deluge_torrent_options_require_native_engine() {
         let registry = Arc::new(RwLock::new(SessionRegistry::new()));
         {
             let mut reg = registry.write().await;
@@ -3270,33 +4004,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/json")
-                    .header("content-type", "application/json")
-                    .body(Body::from(format!(
-                        r#"{{"id":2,"method":"core.get_torrent_status","params":["{hash}",["max_download_speed","max_upload_speed","is_auto_managed","stop_at_ratio","stop_ratio","sequential_download","super_seeding","prioritize_first_last","move_on_completed","move_on_completed_path"]]}}"#
-                    )))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
         let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
-        let result = &body["result"];
-        assert_eq!(result["max_download_speed"], 10.5);
-        assert_eq!(result["max_upload_speed"], 4.0);
-        assert_eq!(result["is_auto_managed"], true);
-        assert_eq!(result["stop_at_ratio"], true);
-        assert_eq!(result["stop_ratio"], 1.25);
-        assert_eq!(result["sequential_download"], true);
-        assert_eq!(result["super_seeding"], true);
-        assert_eq!(result["prioritize_first_last"], true);
-        assert_eq!(result["move_on_completed"], true);
-        assert_eq!(result["move_on_completed_path"], "/done");
+        assert!(body["result"].is_null());
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("native engine is unavailable"));
     }
 
     #[test]
@@ -3310,18 +4024,19 @@ mod tests {
         assert_eq!(deluge_file_priority(7), 2);
         assert_eq!(
             deluge_file_priority_updates(Some(&json!([0, 1, 5, 7])), None),
-            vec![(vec![0], 0), (vec![1], 1), (vec![2, 3], 2)]
+            Ok(vec![(vec![0], 0), (vec![1], 1), (vec![2, 3], 2)])
         );
         assert_eq!(
             deluge_file_priority_updates(Some(&json!([2, 4])), Some(&json!(0))),
-            vec![(vec![2, 4], 0)]
+            Ok(vec![(vec![2, 4], 0)])
         );
         assert_eq!(
             deluge_trackers_arg(Some(&json!([
                 {"url":" udp://tracker.example/announce "},
                 {"announce":"http://tracker.example/announce"},
                 "udp://tracker.example/announce"
-            ]))),
+            ])))
+            .unwrap(),
             vec![
                 "udp://tracker.example/announce".to_owned(),
                 "http://tracker.example/announce".to_owned()
@@ -3335,8 +4050,19 @@ mod tests {
             deluge_rename_file_args(Some(&json!([
                 [1, "new/a.bin"],
                 {"index": 2, "path": "new/b.bin"}
-            ]))),
+            ])))
+            .unwrap(),
             vec![(1, "new/a.bin".to_owned()), (2, "new/b.bin".to_owned())]
+        );
+        assert!(deluge_file_priority_updates(Some(&json!([u64::MAX])), Some(&json!(1))).is_err());
+        assert!(deluge_peer_addr_arg(&json!(["127.0.0.1", 70_000])).is_err());
+        assert!(deluge_rename_file_args(Some(&json!([[u64::MAX, "new"]]))).is_err());
+        assert!(
+            validate_deluge_options(json!({"max_download_speed": "NaN"}).as_object().unwrap())
+                .is_err()
+        );
+        assert!(
+            validate_deluge_options(json!({"unknown_option": true}).as_object().unwrap()).is_err()
         );
     }
 
@@ -3357,7 +4083,6 @@ mod tests {
         assert!(limits.first_last_piece_prio);
         assert!(limits.sequential_download);
         assert!(limits.super_seeding);
-        assert!(!limits.auto_management);
         assert_eq!(limits.download_limit, Some(10_752));
         assert_eq!(limits.upload_limit, None);
         assert_eq!(limits.seed_ratio_limit, Some(1.25));

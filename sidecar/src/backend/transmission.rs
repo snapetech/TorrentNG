@@ -5,7 +5,10 @@ use reqwest::Url;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
-use super::{BackendCapabilities, BackendStatus, BackendType, TorrentBackend};
+use super::{
+    response_json_bounded, BackendCapabilities, BackendStatus, BackendType, TorrentBackend,
+    MAX_BACKEND_JSON_BYTES,
+};
 use crate::{
     config::TransmissionConfig,
     rtorrent::{files::RawFile, torrents::RawTorrent, trackers::RawTracker, TransferRates},
@@ -59,12 +62,12 @@ impl TransmissionBackend {
                     continue;
                 }
             }
-            let payload: Value = response
-                .error_for_status()
-                .with_context(|| format!("Transmission RPC {method}"))?
-                .json()
-                .await
-                .with_context(|| format!("decode Transmission RPC {method}"))?;
+            let payload: Value = response_json_bounded(
+                response,
+                MAX_BACKEND_JSON_BYTES,
+                &format!("Transmission RPC {method}"),
+            )
+            .await?;
             if payload.get("result").and_then(Value::as_str) == Some("success") {
                 return Ok(payload.get("arguments").cloned().unwrap_or(Value::Null));
             }
@@ -116,8 +119,9 @@ impl TorrentBackend for TransmissionBackend {
 
     async fn health(&self) -> BackendStatus {
         match self.rpc("session-get", json!({})).await {
-            Ok(_) => BackendStatus::Connected,
+            Ok(value) if value.as_object().is_some() => BackendStatus::Connected,
             Err(_) => BackendStatus::Unreachable,
+            Ok(_) => BackendStatus::Unreachable,
         }
     }
 
@@ -127,8 +131,8 @@ impl TorrentBackend for TransmissionBackend {
             .await
             .context("Transmission session-stats")?;
         Ok(TransferRates {
-            download: int(&args, "downloadSpeed").max(0),
-            upload: int(&args, "uploadSpeed").max(0),
+            download: required_nonnegative_i64(&args, "downloadSpeed")?,
+            upload: required_nonnegative_i64(&args, "uploadSpeed")?,
         })
     }
 
@@ -146,13 +150,8 @@ impl TorrentBackend for TransmissionBackend {
                 }),
             )
             .await?;
-        Ok(args
-            .get("torrents")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .map(map_torrent)
-            .collect())
+        let torrents = required_array(&args, "torrents", "torrent-get")?;
+        torrents.iter().map(map_torrent).collect()
     }
 
     async fn add_magnet(
@@ -233,21 +232,23 @@ impl TorrentBackend for TransmissionBackend {
         let args = self
             .rpc(
                 "torrent-get",
-                json!({ "ids": [hash], "fields": ["trackerStats"] }),
+                json!({ "ids": [hash], "fields": ["hashString", "trackerStats"] }),
             )
             .await?;
-        let trackers = args
-            .get("torrents")
-            .and_then(Value::as_array)
-            .and_then(|items| items.first())
-            .and_then(|torrent| torrent.get("trackerStats"))
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .enumerate()
-            .map(map_tracker)
-            .collect();
-        Ok(trackers)
+        let torrents = required_array(&args, "torrents", "torrent-get")?;
+        let torrent = torrents
+            .iter()
+            .find(|torrent| {
+                torrent
+                    .get("hashString")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value.eq_ignore_ascii_case(hash))
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!("Transmission torrent-get returned no matching torrent")
+            })?;
+        let trackers = required_array(torrent, "trackerStats", "torrent-get")?;
+        trackers.iter().enumerate().map(map_tracker).collect()
     }
 
     async fn add_tracker(&self, hash: &str, url: &str) -> Result<()> {
@@ -280,48 +281,84 @@ impl TorrentBackend for TransmissionBackend {
         let args = self
             .rpc(
                 "torrent-get",
-                json!({ "ids": [hash], "fields": ["files", "fileStats"] }),
+                json!({ "ids": [hash], "fields": ["hashString", "files", "fileStats"] }),
             )
             .await?;
-        let Some(torrent) = args
-            .get("torrents")
-            .and_then(Value::as_array)
-            .and_then(|items| items.first())
-        else {
-            return Ok(Vec::new());
-        };
-        let files = torrent
-            .get("files")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let stats = torrent
-            .get("fileStats")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        Ok(files
+        let torrents = required_array(&args, "torrents", "torrent-get")?;
+        let torrent = torrents
             .iter()
-            .enumerate()
-            .map(|(index, file)| {
-                let stat = stats.get(index).unwrap_or(&Value::Null);
-                let size = int(file, "length");
-                let completed = int(file, "bytesCompleted");
-                RawFile {
-                    index,
-                    path: string(file, "name"),
-                    size_bytes: size,
-                    size_chunks: size,
-                    completed_chunks: completed,
-                    priority: int(stat, "priority"),
-                    is_created: true,
-                    is_open: stat.get("wanted").and_then(Value::as_bool).unwrap_or(true),
-                }
+            .find(|torrent| {
+                torrent
+                    .get("hashString")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value.eq_ignore_ascii_case(hash))
             })
-            .collect())
+            .ok_or_else(|| {
+                anyhow::anyhow!("Transmission torrent-get returned no matching torrent")
+            })?;
+        let files = required_array(torrent, "files", "torrent-get")?;
+        let stats = required_array(torrent, "fileStats", "torrent-get")?;
+        if files.len() != stats.len() {
+            bail!(
+                "Transmission torrent-get returned {} files but {} fileStats entries",
+                files.len(),
+                stats.len()
+            );
+        }
+        let mut result = Vec::with_capacity(files.len());
+        for (index, file) in files.iter().enumerate() {
+            let stat = &stats[index];
+            let size = required_nonnegative_i64(file, "length")?;
+            let completed = required_nonnegative_i64(file, "bytesCompleted")?;
+            if completed > size {
+                bail!(
+                    "Transmission file {index} reports {completed} completed bytes for size {size}"
+                );
+            }
+            let wanted = stat.get("wanted").and_then(Value::as_bool).ok_or_else(|| {
+                anyhow::anyhow!("Transmission fileStats entry {index} omitted wanted")
+            })?;
+            let transmission_priority = required_i64(stat, "priority")?;
+            if !(-1..=1).contains(&transmission_priority) {
+                bail!(
+                    "Transmission fileStats entry {index} returned invalid priority {transmission_priority}"
+                );
+            }
+            result.push(RawFile {
+                index,
+                path: required_nonempty_string(file, "name")?,
+                size_bytes: size,
+                size_chunks: size,
+                completed_chunks: completed,
+                // Transmission uses -1/0/1 for low/normal/high and a
+                // separate wanted bit. Normalize it to the facade's
+                // 0/1/2 off/normal/high representation.
+                priority: if !wanted {
+                    0
+                } else if transmission_priority > 0 {
+                    2
+                } else {
+                    1
+                },
+                is_created: true,
+                is_open: wanted,
+            });
+        }
+        Ok(result)
     }
 
     async fn set_file_priority(&self, hash: &str, file_index: usize, priority: i64) -> Result<()> {
+        if !(0..=2).contains(&priority) {
+            bail!("Transmission file priority must be between 0 and 2");
+        }
+        if !self
+            .list_files(hash)
+            .await?
+            .iter()
+            .any(|file| file.index == file_index)
+        {
+            bail!("Transmission file index not found: {file_index}");
+        }
         let key = match priority {
             0 => "files-unwanted",
             2.. => "priority-high",
@@ -462,97 +499,185 @@ fn empty_to_null(value: &str) -> Value {
 }
 
 fn bytes_to_kib_ceil(bytes: i64) -> i64 {
-    (bytes + 1023) / 1024
+    bytes.saturating_add(1023) / 1024
 }
 
-fn map_torrent(t: &Value) -> RawTorrent {
-    let percent = t.get("percentDone").and_then(Value::as_f64).unwrap_or(0.0);
-    let complete = percent >= 1.0;
-    let status = int(t, "status");
-    let tracker = t
-        .get("trackerStats")
+fn required_array<'a>(value: &'a Value, key: &str, method: &str) -> Result<&'a [Value]> {
+    value
+        .as_object()
+        .and_then(|object| object.get(key))
         .and_then(Value::as_array)
-        .and_then(|items| items.first())
-        .map(|tracker| string(tracker, "announce"))
+        .map(Vec::as_slice)
+        .ok_or_else(|| anyhow::anyhow!("Transmission {method} result has no array field {key:?}"))
+}
+
+fn map_torrent(t: &Value) -> Result<RawTorrent> {
+    let percent = required_f64(t, "percentDone")?;
+    if !percent.is_finite() || !(0.0..=1.0).contains(&percent) {
+        bail!("Transmission torrent returned invalid percentDone");
+    }
+    let complete = percent >= 1.0;
+    let status = required_nonnegative_i64(t, "status")?;
+    let trackers = required_array(t, "trackerStats", "torrent-get")?;
+    let tracker = trackers
+        .first()
+        .map(|tracker| required_nonempty_string(tracker, "announce"))
+        .transpose()?
         .unwrap_or_default();
-    RawTorrent {
-        hash: string(t, "hashString"),
-        name: string(t, "name"),
-        size_bytes: int(t, "totalSize").max(int(t, "sizeWhenDone")),
-        bytes_done: int(t, "haveValid"),
-        down_rate: int(t, "rateDownload"),
-        up_rate: int(t, "rateUpload"),
-        up_total: int(t, "uploadedEver"),
-        down_total: int(t, "downloadedEver"),
-        ratio: (t.get("uploadRatio").and_then(Value::as_f64).unwrap_or(0.0) * 1000.0) as i64,
+    let labels = match t.get("labels") {
+        None => String::new(),
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("Transmission torrent labels is not an array"))?
+            .iter()
+            .map(|label| {
+                label
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("Transmission torrent label is not a string"))
+            })
+            .collect::<Result<Vec<_>>>()?
+            .first()
+            .copied()
+            .unwrap_or("")
+            .to_owned(),
+    };
+    let category = match t.get("group") {
+        None => labels,
+        Some(value) => value
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Transmission torrent group is not a string"))?
+            .to_owned(),
+    };
+    let size_bytes =
+        required_nonnegative_i64(t, "totalSize")?.max(required_nonnegative_i64(t, "sizeWhenDone")?);
+    let bytes_done = required_nonnegative_i64(t, "haveValid")?;
+    if bytes_done > size_bytes {
+        bail!("Transmission torrent reports {bytes_done} completed bytes for size {size_bytes}");
+    }
+    Ok(RawTorrent {
+        hash: required_nonempty_string(t, "hashString")?,
+        name: required_nonempty_string(t, "name")?,
+        size_bytes,
+        bytes_done,
+        down_rate: required_nonnegative_i64(t, "rateDownload")?,
+        up_rate: required_nonnegative_i64(t, "rateUpload")?,
+        up_total: required_nonnegative_i64(t, "uploadedEver")?,
+        down_total: required_nonnegative_i64(t, "downloadedEver")?,
+        ratio: super::ratio_milli(Some(required_nonnegative_f64(t, "uploadRatio")?)),
         is_active: status != 0,
         is_open: status != 0,
         complete,
-        state: if string(t, "errorString").is_empty() {
+        state: if required_string(t, "errorString")?.is_empty() {
             1
         } else {
             3
         },
         priority: 0,
-        category: t
-            .get("labels")
-            .and_then(Value::as_array)
-            .and_then(|items| items.first())
-            .and_then(Value::as_str)
-            .or_else(|| t.get("group").and_then(Value::as_str))
-            .unwrap_or("")
-            .to_owned(),
-        base_path: string(t, "downloadDir"),
-        directory: string(t, "downloadDir"),
-        creation_date: int(t, "addedDate"),
-        timestamp_finished: int(t, "doneDate"),
+        category,
+        base_path: required_nonempty_string(t, "downloadDir")?,
+        directory: required_nonempty_string(t, "downloadDir")?,
+        creation_date: required_i64(t, "addedDate")?,
+        timestamp_finished: required_i64(t, "doneDate")?,
         tracker_focus: 0,
-        peers_connected: int(t, "peersConnected"),
+        peers_connected: required_nonnegative_i64(t, "peersConnected")?,
         peers_complete: 0,
-        message: string(t, "errorString"),
+        message: required_string(t, "errorString")?,
         tracker_url: tracker,
         tags: String::new(),
-    }
+    })
 }
 
-fn map_tracker((index, tracker): (usize, &Value)) -> RawTracker {
-    RawTracker {
-        url: string(tracker, "announce"),
-        id: int(tracker, "id"),
-        group: int(tracker, "tier"),
+fn map_tracker((index, tracker): (usize, &Value)) -> Result<RawTracker> {
+    let last_succeeded = required_bool_or_int(tracker, "lastAnnounceSucceeded")?;
+    Ok(RawTracker {
+        url: required_nonempty_string(tracker, "announce")?,
+        id: required_i64(tracker, "id")?,
+        group: required_i64(tracker, "tier")?,
         group_index: index as i64,
         is_enabled: true,
-        is_open: int(tracker, "lastAnnounceSucceeded") != 0,
+        is_open: last_succeeded,
         is_extra_tracker: false,
-        activity_time_last: int(tracker, "lastAnnounceTime"),
-        activity_time_next: int(tracker, "nextAnnounceTime"),
+        activity_time_last: required_i64(tracker, "lastAnnounceTime")?,
+        activity_time_next: required_i64(tracker, "nextAnnounceTime")?,
         min_interval: 0,
         normal_interval: 0,
         failed_counter: i64::from(
-            int(tracker, "lastAnnounceSucceeded") == 0
-                && !string(tracker, "lastAnnounceResult").is_empty(),
+            !last_succeeded && !optional_string(tracker, "lastAnnounceResult")?.is_empty(),
         ),
-        success_counter: int(tracker, "lastAnnounceSucceeded"),
-        scrape_incomplete: int(tracker, "leecherCount"),
-        scrape_complete: int(tracker, "seederCount"),
-        scrape_downloaded: int(tracker, "downloadCount"),
-        message: string(tracker, "lastAnnounceResult"),
-    }
+        success_counter: i64::from(last_succeeded),
+        scrape_incomplete: required_nonnegative_i64(tracker, "leecherCount")?,
+        scrape_complete: required_nonnegative_i64(tracker, "seederCount")?,
+        scrape_downloaded: required_nonnegative_i64(tracker, "downloadCount")?,
+        message: optional_string(tracker, "lastAnnounceResult")?,
+    })
 }
 
-fn string(value: &Value, key: &str) -> String {
+fn required_string(value: &Value, key: &str) -> Result<String> {
     value
         .get(key)
         .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_owned()
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("Transmission response omitted valid {key}"))
 }
 
-fn int(value: &Value, key: &str) -> i64 {
+fn optional_string(value: &Value, key: &str) -> Result<String> {
+    match value.get(key) {
+        None => Ok(String::new()),
+        Some(value) => value
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow::anyhow!("Transmission response has invalid {key}")),
+    }
+}
+
+fn required_nonempty_string(value: &Value, key: &str) -> Result<String> {
+    let value = required_string(value, key)?;
+    if value.trim().is_empty() {
+        bail!("Transmission response omitted non-empty {key}");
+    }
+    Ok(value)
+}
+
+fn required_i64(value: &Value, key: &str) -> Result<i64> {
     value
         .get(key)
-        .and_then(|value| value.as_i64().or_else(|| value.as_bool().map(i64::from)))
-        .unwrap_or(0)
+        .and_then(Value::as_i64)
+        .ok_or_else(|| anyhow::anyhow!("Transmission response omitted valid {key}"))
+}
+
+fn required_nonnegative_i64(value: &Value, key: &str) -> Result<i64> {
+    let value = required_i64(value, key)?;
+    if value < 0 {
+        bail!("Transmission response contains negative {key}");
+    }
+    Ok(value)
+}
+
+fn required_f64(value: &Value, key: &str) -> Result<f64> {
+    value
+        .get(key)
+        .and_then(Value::as_f64)
+        .ok_or_else(|| anyhow::anyhow!("Transmission response omitted valid {key}"))
+}
+
+fn required_nonnegative_f64(value: &Value, key: &str) -> Result<f64> {
+    let value = required_f64(value, key)?;
+    if !value.is_finite() || value < 0.0 {
+        bail!("Transmission response contains invalid {key}");
+    }
+    Ok(value)
+}
+
+fn required_bool_or_int(value: &Value, key: &str) -> Result<bool> {
+    match value.get(key) {
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(Value::Number(value)) => value
+            .as_i64()
+            .map(|value| value != 0)
+            .ok_or_else(|| anyhow::anyhow!("Transmission response has invalid {key}")),
+        None => Err(anyhow::anyhow!("Transmission response omitted valid {key}")),
+        Some(_) => Err(anyhow::anyhow!("Transmission response has invalid {key}")),
+    }
 }
 
 #[cfg(test)]
@@ -591,7 +716,7 @@ mod tests {
             "downloadCount": 5
         });
 
-        let mapped = map_tracker((0, &tracker));
+        let mapped = map_tracker((0, &tracker)).unwrap();
 
         assert_eq!(mapped.url, "https://tracker.example/announce");
         assert_eq!(mapped.id, 17);

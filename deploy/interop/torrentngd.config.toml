@@ -17,6 +17,9 @@ download_dir = "/downloads/torrentngd"
 http_timeout_secs = 30
 udp_timeout_secs = 15
 min_interval_secs = 0
+# The interop harness is an isolated Docker network. Permit its private
+# tracker/webseed addresses here; production defaults remain deny-by-default.
+allow_private_egress = true
 
 [dht]
 enabled = true
@@ -32,7 +35,7 @@ path = "/var/lib/torrentngd/state.db"
 wal_checkpoint_pages = 1000
 
 [auth]
-api_tokens = ["interop-token"]
+api_tokens = ["interop-backend-token-20260904"]
 
 [logging]
 format = "json"

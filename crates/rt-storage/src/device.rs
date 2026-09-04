@@ -1,3 +1,5 @@
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use rt_path::StorageProfile;
@@ -19,6 +21,9 @@ struct MountInfo {
     fs_type: String,
     source: String,
 }
+
+#[cfg(target_os = "linux")]
+const MAX_MOUNTINFO_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Best-effort storage profile detection for a path.
 ///
@@ -55,7 +60,7 @@ fn detect_storage_topology_from_roots(
     sys_root: &Path,
 ) -> Option<StorageTopology> {
     let target = canonical_existing_path(path)?;
-    let mountinfo = std::fs::read_to_string(mountinfo_path).ok()?;
+    let mountinfo = read_mountinfo(mountinfo_path)?;
     let mounts = parse_mountinfo(&mountinfo)?;
     let mount = find_best_mount(&target, &mounts)?;
     let fs_type = Some(mount.fs_type.clone());
@@ -77,6 +82,22 @@ fn detect_storage_topology_from_roots(
         fs_type,
         cow,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn read_mountinfo(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    if file.metadata().ok()?.len() > MAX_MOUNTINFO_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_MOUNTINFO_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_MOUNTINFO_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
 }
 
 #[cfg(target_os = "linux")]
@@ -260,6 +281,18 @@ mod tests {
         assert_eq!(remote.major_minor, "0:42");
         assert_eq!(remote.fs_type, "nfs");
         assert!(is_network_fs(&remote.fs_type));
+    }
+
+    #[test]
+    fn mountinfo_read_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mountinfo");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(MAX_MOUNTINFO_BYTES + 1)
+            .unwrap();
+
+        assert!(read_mountinfo(&path).is_none());
     }
 
     #[test]

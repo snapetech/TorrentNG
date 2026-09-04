@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+const MAX_TRACKED_PEER_INGRESS_IPS: usize = 4_096;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerIngressConfig {
     pub max_global_handshakes: usize,
@@ -36,7 +38,7 @@ pub struct PeerIngressStats {
 pub struct PeerIngressBudget {
     config: PeerIngressConfig,
     global: Arc<Semaphore>,
-    per_ip: Mutex<HashMap<IpAddr, VecDeque<Instant>>>,
+    per_ip: Arc<Mutex<HashMap<IpAddr, VecDeque<Instant>>>>,
     accepted: AtomicU64,
     rejected_global_budget: AtomicU64,
     rejected_ip_budget: AtomicU64,
@@ -45,6 +47,9 @@ pub struct PeerIngressBudget {
 #[derive(Debug)]
 pub struct PeerIngressPermit {
     _global: OwnedSemaphorePermit,
+    per_ip: Arc<Mutex<HashMap<IpAddr, VecDeque<Instant>>>>,
+    ip: IpAddr,
+    admitted_at: Instant,
 }
 
 impl PeerIngressBudget {
@@ -52,7 +57,7 @@ impl PeerIngressBudget {
         Self {
             config,
             global: Arc::new(Semaphore::new(config.max_global_handshakes.max(1))),
-            per_ip: Mutex::new(HashMap::new()),
+            per_ip: Arc::new(Mutex::new(HashMap::new())),
             accepted: AtomicU64::new(0),
             rejected_global_budget: AtomicU64::new(0),
             rejected_ip_budget: AtomicU64::new(0),
@@ -77,7 +82,12 @@ impl PeerIngressBudget {
         match self.global.clone().try_acquire_owned() {
             Ok(permit) => {
                 self.accepted.fetch_add(1, Ordering::Relaxed);
-                Ok(PeerIngressPermit { _global: permit })
+                Ok(PeerIngressPermit {
+                    _global: permit,
+                    per_ip: Arc::clone(&self.per_ip),
+                    ip: peer_addr.ip(),
+                    admitted_at: now,
+                })
             }
             Err(_) => {
                 // The per-IP reservation is a rate-window admission record,
@@ -123,6 +133,9 @@ impl PeerIngressBudget {
             .per_ip
             .lock()
             .expect("peer ingress budget mutex poisoned");
+        if !per_ip.contains_key(&ip) && per_ip.len() >= MAX_TRACKED_PEER_INGRESS_IPS {
+            return false;
+        }
         let events = per_ip.entry(ip).or_default();
         if events.len() >= self.config.max_handshakes_per_ip.max(1) {
             return false;
@@ -132,19 +145,36 @@ impl PeerIngressBudget {
     }
 
     fn release_ip_slot(&self, ip: IpAddr, now: Instant) {
-        let mut per_ip = self
-            .per_ip
-            .lock()
-            .expect("peer ingress budget mutex poisoned");
-        let Some(events) = per_ip.get_mut(&ip) else {
-            return;
-        };
-        if events.back().copied() == Some(now) {
-            events.pop_back();
-        }
-        if events.is_empty() {
-            per_ip.remove(&ip);
-        }
+        release_ip_slot(&self.per_ip, ip, now);
+    }
+}
+
+impl PeerIngressPermit {
+    /// Roll back the rate-window admission when a later, process-wide
+    /// connection budget rejects the same socket. Normally an admitted
+    /// handshake keeps its per-IP attempt record for the configured window;
+    /// this explicit cancellation is only for an attempt that never reached
+    /// the handshake task.
+    pub fn cancel(self) {
+        release_ip_slot(&self.per_ip, self.ip, self.admitted_at);
+        // Dropping self releases the global semaphore permit.
+    }
+}
+
+fn release_ip_slot(
+    per_ip: &Arc<Mutex<HashMap<IpAddr, VecDeque<Instant>>>>,
+    ip: IpAddr,
+    now: Instant,
+) {
+    let mut per_ip = per_ip.lock().expect("peer ingress budget mutex poisoned");
+    let Some(events) = per_ip.get_mut(&ip) else {
+        return;
+    };
+    if let Some(index) = events.iter().rposition(|event| *event == now) {
+        events.remove(index);
+    }
+    if events.is_empty() {
+        per_ip.remove(&ip);
     }
 }
 
@@ -236,5 +266,19 @@ mod tests {
         assert!(budget
             .try_begin(SocketAddr::from(([192, 0, 2, 11], 2)), now)
             .is_ok());
+    }
+
+    #[test]
+    fn cancelled_admission_does_not_consume_per_ip_slot() {
+        let budget = PeerIngressBudget::new(PeerIngressConfig {
+            max_global_handshakes: 1,
+            max_handshakes_per_ip: 1,
+            per_ip_window: Duration::from_secs(30),
+            handshake_timeout: Duration::from_secs(5),
+        });
+        let now = Instant::now();
+        let permit = budget.try_begin(addr(1), now).unwrap();
+        permit.cancel();
+        assert!(budget.try_begin(addr(2), now).is_ok());
     }
 }

@@ -12,11 +12,13 @@
 //! per-op `seek`, so concurrent readers/writers do not race a file cursor.
 
 use std::collections::{BTreeMap, HashMap};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use crate::open::open_path_no_follow;
 
 /// Whether the cached handle is read-only or read+write. A path may have
 /// one of each (a reader and a writer fd) live simultaneously.
@@ -96,29 +98,28 @@ impl HandleCache {
     /// syscall runs outside the lock; a concurrent opener racing the same
     /// key is resolved by keeping whichever landed first.
     pub fn get_or_open(&self, path: &Path, write: bool, create: bool) -> io::Result<Arc<OpenFile>> {
+        // Keep the public cache API usable with relative paths while making
+        // the cache key and the secured open operation agree on one spelling.
+        // Runtime callers normally already provide absolute, authorized
+        // paths; relative paths are resolved against the process directory,
+        // never canonicalized through symlinks.
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(path)
+        };
         let access = if write { Access::Write } else { Access::Read };
-        let key: Key = (path.to_path_buf(), access);
+        let key: Key = (path.clone(), access);
 
         if let Some(h) = self.touch(&key) {
             return Ok(h);
         }
 
-        // Miss: open without holding the lock.
-        let file = if write {
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(create)
-                .truncate(false)
-                .open(path)?
-        } else {
-            OpenOptions::new()
-                .read(true)
-                .write(false)
-                .create(false)
-                .truncate(false)
-                .open(path)?
-        };
+        // Miss: open without holding the lock. On Unix this walks from `/`
+        // through directory descriptors with O_NOFOLLOW, so a replaced
+        // ancestor cannot redirect peer I/O outside the already-authorized
+        // path. The final component is no-follow as well.
+        let file = open_path_no_follow(&path, write, create)?;
         let handle = Arc::new(OpenFile {
             file: Arc::new(file),
         });
@@ -231,6 +232,39 @@ mod tests {
         let res = cache.get_or_open(&dir.path().join("nope.bin"), false, false);
         assert_eq!(res.err().map(|e| e.kind()), Some(io::ErrorKind::NotFound));
         assert_eq!(cache.len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_component_symlink_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = tmp_file(dir.path(), "target.bin", b"secret");
+        let link = dir.path().join("link.bin");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let cache = HandleCache::new(16, Duration::from_secs(30));
+
+        let error = cache.get_or_open(&link, false, false).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ELOOP));
+        assert!(cache.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ancestor_symlink_is_rejected_before_opening_the_file() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(outside.path(), &alias).unwrap();
+        let path = alias.join("payload.bin");
+        std::fs::write(outside.path().join("payload.bin"), b"secret").unwrap();
+        let cache = HandleCache::new(16, Duration::from_secs(30));
+
+        let error = cache.get_or_open(&path, false, false).unwrap_err();
+        assert!(matches!(
+            error.raw_os_error(),
+            Some(libc::ELOOP | libc::ENOTDIR)
+        ));
+        assert!(cache.is_empty());
     }
 
     #[test]

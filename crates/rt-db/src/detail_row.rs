@@ -21,6 +21,10 @@ pub struct TorrentTrackerRow {
     pub tracker_index: i64,
     pub tier: i64,
     pub url: String,
+    /// Opaque BEP 3 tracker ID. It is a BLOB because trackers are not
+    /// required to return UTF-8.
+    #[serde(default)]
+    pub tracker_id: Option<Vec<u8>>,
     pub status: String,
     pub last_announce_at: Option<i64>,
     pub next_announce_at: Option<i64>,
@@ -33,6 +37,31 @@ pub struct TorrentTrackerRow {
     pub uploaded: i64,
     pub downloaded: i64,
     pub left_bytes: i64,
+}
+
+/// Compact tracker status aggregate used by engine stats. It avoids
+/// materializing every tracker row just to count a few statuses.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TorrentTrackerStatusCounts {
+    pub total: u64,
+    pub working: u64,
+    pub warning: u64,
+    pub error: u64,
+}
+
+/// One row in the native tracker-health aggregate. A torrent is counted once
+/// per tracker URL even if its metainfo contains the same URL more than once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TorrentTrackerHealthRow {
+    pub tracker: String,
+    pub torrent_count: u64,
+    pub active_count: u64,
+    pub complete_count: u64,
+    pub error_count: u64,
+    pub seed_count: u64,
+    /// Tracker-reported leechers, not currently connected sessions.
+    pub peer_count: u64,
+    pub last_updated: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -74,18 +103,19 @@ impl TorrentTrackerRow {
             tracker_index: row.get(1)?,
             tier: row.get(2)?,
             url: row.get(3)?,
-            status: row.get(4)?,
-            last_announce_at: row.get(5)?,
-            next_announce_at: row.get(6)?,
-            last_success_at: row.get(7)?,
-            failure_reason: row.get(8)?,
-            warning_message: row.get(9)?,
-            seeders: row.get(10)?,
-            leechers: row.get(11)?,
-            completed: row.get(12)?,
-            uploaded: row.get(13)?,
-            downloaded: row.get(14)?,
-            left_bytes: row.get(15)?,
+            tracker_id: row.get(4)?,
+            status: row.get(5)?,
+            last_announce_at: row.get(6)?,
+            next_announce_at: row.get(7)?,
+            last_success_at: row.get(8)?,
+            failure_reason: row.get(9)?,
+            warning_message: row.get(10)?,
+            seeders: row.get(11)?,
+            leechers: row.get(12)?,
+            completed: row.get(13)?,
+            uploaded: row.get(14)?,
+            downloaded: row.get(15)?,
+            left_bytes: row.get(16)?,
         })
     }
 }
@@ -186,6 +216,18 @@ pub fn list_torrent_files(
     Ok(rows)
 }
 
+/// Count a torrent's durable file projection without materializing every file
+/// row. Startup reconciliation uses this to identify interrupted metadata
+/// commits while keeping dormant restore bounded.
+pub fn count_torrent_files(conn: &Connection, info_hash: &str) -> Result<u64, DbError> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM torrent_files WHERE info_hash = ?1",
+        params![info_hash],
+        |row| row.get(0),
+    )?;
+    Ok(count.max(0) as u64)
+}
+
 pub fn replace_torrent_trackers(
     conn: &mut Connection,
     info_hash: &str,
@@ -199,15 +241,16 @@ pub fn replace_torrent_trackers(
     for tracker in trackers {
         tx.execute(
             "INSERT INTO torrent_trackers
-                (info_hash, tracker_index, tier, url, status, last_announce_at,
+                (info_hash, tracker_index, tier, url, tracker_id, status, last_announce_at,
                  next_announce_at, last_success_at, failure_reason, warning_message,
                  seeders, leechers, completed, uploaded, downloaded, left_bytes)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 info_hash,
                 tracker.tracker_index,
                 tracker.tier,
                 tracker.url,
+                tracker.tracker_id,
                 tracker.status,
                 tracker.last_announce_at,
                 tracker.next_announce_at,
@@ -239,15 +282,16 @@ pub fn replace_torrent_trackers_in_tx(
     for tracker in trackers {
         tx.execute(
             "INSERT INTO torrent_trackers
-                (info_hash, tracker_index, tier, url, status, last_announce_at,
+                (info_hash, tracker_index, tier, url, tracker_id, status, last_announce_at,
                  next_announce_at, last_success_at, failure_reason, warning_message,
                  seeders, leechers, completed, uploaded, downloaded, left_bytes)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 info_hash,
                 tracker.tracker_index,
                 tracker.tier,
                 tracker.url,
+                tracker.tracker_id,
                 tracker.status,
                 tracker.last_announce_at,
                 tracker.next_announce_at,
@@ -271,7 +315,7 @@ pub fn list_torrent_trackers(
     info_hash: &str,
 ) -> Result<Vec<TorrentTrackerRow>, DbError> {
     let mut stmt = conn.prepare(
-        "SELECT info_hash, tracker_index, tier, url, status, last_announce_at,
+        "SELECT info_hash, tracker_index, tier, url, tracker_id, status, last_announce_at,
                 next_announce_at, last_success_at, failure_reason, warning_message,
                 seeders, leechers, completed, uploaded, downloaded, left_bytes
          FROM torrent_trackers
@@ -286,7 +330,7 @@ pub fn list_torrent_trackers(
 
 pub fn list_all_torrent_trackers(conn: &Connection) -> Result<Vec<TorrentTrackerRow>, DbError> {
     let mut stmt = conn.prepare(
-        "SELECT info_hash, tracker_index, tier, url, status, last_announce_at,
+        "SELECT info_hash, tracker_index, tier, url, tracker_id, status, last_announce_at,
                 next_announce_at, last_success_at, failure_reason, warning_message,
                 seeders, leechers, completed, uploaded, downloaded, left_bytes
          FROM torrent_trackers
@@ -298,8 +342,155 @@ pub fn list_all_torrent_trackers(conn: &Connection) -> Result<Vec<TorrentTracker
     Ok(rows)
 }
 
+/// Return torrent hashes whose normalized tracker URL contains `needle`.
+/// `instr` is used instead of `LIKE` so tracker text cannot introduce
+/// wildcard semantics.  This is the database-side half of native automation
+/// tracker matching; callers can intersect the result with their live
+/// registry projection before applying an action.
+pub fn list_torrent_hashes_by_tracker(
+    conn: &Connection,
+    needle: &str,
+) -> Result<Vec<String>, DbError> {
+    let needle = needle.trim();
+    if needle.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT info_hash
+         FROM torrent_trackers
+         WHERE instr(url, ?1) > 0
+         ORDER BY info_hash ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![needle], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(rows)
+}
+
+pub fn torrent_tracker_status_counts(
+    conn: &Connection,
+) -> Result<TorrentTrackerStatusCounts, DbError> {
+    let mut stmt = conn.prepare(
+        "SELECT status, COUNT(*)
+         FROM torrent_trackers
+         GROUP BY status",
+    )?;
+    let mut counts = TorrentTrackerStatusCounts::default();
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    for row in rows {
+        let (status, count) = row?;
+        let count = count.max(0) as u64;
+        counts.total = counts.total.saturating_add(count);
+        match status.as_str() {
+            "working" => counts.working = counts.working.saturating_add(count),
+            "warning" => counts.warning = counts.warning.saturating_add(count),
+            "error" => counts.error = counts.error.saturating_add(count),
+            _ => {}
+        }
+    }
+    Ok(counts)
+}
+
+/// Aggregate normalized tracker state without materializing every tracker
+/// row in the API process. The inner query collapses duplicate tracker URLs
+/// within a torrent before the outer query sums peer counts.
+pub fn torrent_tracker_health(conn: &Connection) -> Result<Vec<TorrentTrackerHealthRow>, DbError> {
+    let mut stmt = conn.prepare(
+        "SELECT tracker,
+                COUNT(*) AS torrent_count,
+                COALESCE(SUM(active_count), 0) AS active_count,
+                COALESCE(SUM(complete_count), 0) AS complete_count,
+                COALESCE(SUM(error_count), 0) AS error_count,
+                COALESCE(SUM(seed_count), 0) AS seed_count,
+                COALESCE(SUM(peer_count), 0) AS peer_count,
+                MAX(last_updated) AS last_updated
+         FROM (
+             SELECT tt.url AS tracker,
+                    tt.info_hash,
+                    CASE WHEN t.state IN ('downloading', 'seeding')
+                         THEN 1 ELSE 0 END AS active_count,
+                    CASE WHEN t.completed_at IS NOT NULL OR t.state = 'seeding'
+                         THEN 1 ELSE 0 END AS complete_count,
+                    MAX(CASE WHEN tt.status = 'error' THEN 1 ELSE 0 END)
+                        AS error_count,
+                    MAX(COALESCE(tt.seeders, 0)) AS seed_count,
+                    MAX(COALESCE(tt.leechers, 0)) AS peer_count,
+                    MAX(COALESCE(tt.last_announce_at, tt.last_success_at))
+                        AS last_updated
+             FROM torrent_trackers AS tt
+             INNER JOIN torrents AS t ON t.info_hash = tt.info_hash
+             WHERE tt.url <> ''
+             GROUP BY tt.url, tt.info_hash
+         )
+         GROUP BY tracker
+         ORDER BY error_count DESC, torrent_count DESC, tracker COLLATE NOCASE",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            let to_u64 = |value: i64| u64::try_from(value.max(0)).unwrap_or(0);
+            Ok(TorrentTrackerHealthRow {
+                tracker: row.get(0)?,
+                torrent_count: to_u64(row.get(1)?),
+                active_count: to_u64(row.get(2)?),
+                complete_count: to_u64(row.get(3)?),
+                error_count: to_u64(row.get(4)?),
+                seed_count: to_u64(row.get(5)?),
+                peer_count: to_u64(row.get(6)?),
+                last_updated: row.get(7)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 pub fn upsert_torrent_limits(conn: &Connection, limits: &TorrentLimitRow) -> Result<(), DbError> {
     conn.execute(
+        "INSERT INTO torrent_limits
+            (info_hash, download_limit, upload_limit, max_connections, seed_ratio_limit,
+             seed_idle_limit, sequential_download, sequential_download_from_piece,
+             first_last_piece_prio, force_start, super_seeding, auto_tmm, auto_management)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+         ON CONFLICT(info_hash) DO UPDATE SET
+            download_limit=excluded.download_limit,
+            upload_limit=excluded.upload_limit,
+            max_connections=excluded.max_connections,
+            seed_ratio_limit=excluded.seed_ratio_limit,
+            seed_idle_limit=excluded.seed_idle_limit,
+            sequential_download=excluded.sequential_download,
+            sequential_download_from_piece=excluded.sequential_download_from_piece,
+            first_last_piece_prio=excluded.first_last_piece_prio,
+            force_start=excluded.force_start,
+            super_seeding=excluded.super_seeding,
+            auto_tmm=excluded.auto_tmm,
+            auto_management=excluded.auto_management",
+        params![
+            limits.info_hash,
+            limits.download_limit,
+            limits.upload_limit,
+            limits.max_connections,
+            limits.seed_ratio_limit,
+            limits.seed_idle_limit,
+            limits.sequential_download as i64,
+            limits.sequential_download_from_piece,
+            limits.first_last_piece_prio as i64,
+            limits.force_start as i64,
+            limits.super_seeding as i64,
+            limits.auto_tmm as i64,
+            limits.auto_management as i64,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Upsert torrent limits inside a caller-owned transaction so an event or
+/// another projection row can commit with the limit change.
+pub fn upsert_torrent_limits_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    limits: &TorrentLimitRow,
+) -> Result<(), DbError> {
+    tx.execute(
         "INSERT INTO torrent_limits
             (info_hash, download_limit, upload_limit, max_connections, seed_ratio_limit,
              seed_idle_limit, sequential_download, sequential_download_from_piece,
@@ -417,6 +608,7 @@ mod tests {
                 tracker_index: 0,
                 tier: 0,
                 url: "http://tracker/announce".into(),
+                tracker_id: Some(vec![0x00, 0xff, 0x80]),
                 status: "working".into(),
                 last_announce_at: Some(20),
                 next_announce_at: Some(200),
@@ -440,9 +632,102 @@ mod tests {
         assert_eq!(trackers[0].uploaded, 4);
         assert_eq!(trackers[0].downloaded, 5);
         assert_eq!(trackers[0].left_bytes, 6);
+        assert_eq!(trackers[0].tracker_id, Some(vec![0x00, 0xff, 0x80]));
         let all = list_all_torrent_trackers(&conn).unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].status, "working");
+        assert_eq!(
+            list_torrent_hashes_by_tracker(&conn, "tracker/announce").unwrap(),
+            vec!["a".repeat(40)]
+        );
+        assert!(list_torrent_hashes_by_tracker(&conn, "[%]")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            torrent_tracker_status_counts(&conn).unwrap(),
+            TorrentTrackerStatusCounts {
+                total: 1,
+                working: 1,
+                warning: 0,
+                error: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn tracker_health_groups_urls_and_deduplicates_per_torrent() {
+        let mut conn = setup();
+        let first_hash = "a".repeat(40);
+        let mut first = torrent_row::get(&conn, &first_hash).unwrap();
+        first.state = "seeding".into();
+        first.completed_at = Some(30);
+        torrent_row::upsert(&conn, &first).unwrap();
+
+        let second_hash = "b".repeat(40);
+        let mut second = first.clone();
+        second.info_hash = second_hash.clone();
+        second.name = "beta".into();
+        second.state = "downloading".into();
+        second.completed_at = None;
+        torrent_row::upsert(&conn, &second).unwrap();
+
+        let tracker = |info_hash: &str,
+                       tracker_index: i64,
+                       url: &str,
+                       status: &str,
+                       seeders: i64,
+                       leechers: i64,
+                       last_announce_at: i64| TorrentTrackerRow {
+            info_hash: info_hash.into(),
+            tracker_index,
+            tier: 0,
+            url: url.into(),
+            tracker_id: None,
+            status: status.into(),
+            last_announce_at: Some(last_announce_at),
+            next_announce_at: None,
+            last_success_at: None,
+            failure_reason: None,
+            warning_message: None,
+            seeders: Some(seeders),
+            leechers: Some(leechers),
+            completed: None,
+            uploaded: 0,
+            downloaded: 0,
+            left_bytes: 0,
+        };
+        let url = "https://tracker.example/announce";
+        replace_torrent_trackers(
+            &mut conn,
+            &first_hash,
+            &[
+                tracker(&first_hash, 0, url, "working", 10, 4, 20),
+                tracker(&first_hash, 1, url, "error", 12, 5, 50),
+            ],
+        )
+        .unwrap();
+        replace_torrent_trackers(
+            &mut conn,
+            &second_hash,
+            &[tracker(&second_hash, 0, url, "working", 2, 3, 40)],
+        )
+        .unwrap();
+
+        let rows = torrent_tracker_health(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0],
+            TorrentTrackerHealthRow {
+                tracker: url.into(),
+                torrent_count: 2,
+                active_count: 2,
+                complete_count: 1,
+                error_count: 1,
+                seed_count: 14,
+                peer_count: 8,
+                last_updated: Some(50),
+            }
+        );
     }
 
     #[test]

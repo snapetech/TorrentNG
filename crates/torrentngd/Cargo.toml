@@ -27,6 +27,7 @@ rt-logging    = { path = "../rt-logging" }
 rt-engine     = { path = "../rt-engine" }
 rt-session    = { path = "../rt-session" }
 rt-db         = { path = "../rt-db" }
+rt-storage    = { path = "../rt-storage" }
 rt-migrate    = { path = "../rt-migrate" }
 rt-fastresume = { path = "../rt-fastresume" }
 rt-api-native = { path = "../rt-api-native" }

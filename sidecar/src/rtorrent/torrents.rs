@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Component, Path};
 
 use super::client::{Client, XmlValue};
@@ -80,21 +80,41 @@ pub struct LiveSummary {
 
 impl Client {
     pub async fn transfer_rates(&self) -> Result<TransferRates> {
-        async fn first_available(client: &Client, methods: &[&str]) -> i64 {
+        async fn first_available(
+            client: &Client,
+            methods: &[&str],
+            direction: &str,
+        ) -> Result<i64> {
+            let mut errors = Vec::new();
             for method in methods {
-                if let Ok(value) = client.call_sync(method, &[]).await {
-                    return value.as_i64().unwrap_or(0).max(0);
+                match client.call_sync(method, &[]).await {
+                    Ok(value) => {
+                        return value.as_i64().filter(|value| *value >= 0).ok_or_else(|| {
+                            anyhow!("rTorrent {method} returned invalid {direction} rate")
+                        });
+                    }
+                    Err(error) => errors.push(format!("{method}: {error}")),
                 }
             }
-            0
+            bail!(
+                "rTorrent did not provide a usable {direction} rate: {}",
+                errors.join("; ")
+            )
         }
 
         let (download, upload) = tokio::join!(
-            first_available(self, &["throttle.global_down.rate", "get_down_rate"]),
-            first_available(self, &["throttle.global_up.rate", "get_up_rate"]),
+            first_available(
+                self,
+                &["throttle.global_down.rate", "get_down_rate"],
+                "download"
+            ),
+            first_available(self, &["throttle.global_up.rate", "get_up_rate"], "upload"),
         );
 
-        Ok(TransferRates { download, upload })
+        Ok(TransferRates {
+            download: download?,
+            upload: upload?,
+        })
     }
 
     pub async fn list_torrents(&self) -> Result<Vec<RawTorrent>> {
@@ -106,7 +126,7 @@ impl Client {
             .await
             .context("d.multicall2")?;
 
-        parse_torrent_rows(result.into_array())
+        parse_torrent_rows(result.try_into_array()?)
     }
 
     pub async fn has_multicall_range(&self) -> bool {
@@ -135,7 +155,7 @@ impl Client {
             .await
             .with_context(|| format!("d.multicall.range {view} offset={offset} limit={limit}"))?;
 
-        parse_torrent_rows(result.into_array())
+        parse_torrent_rows(result.try_into_array()?)
     }
 
     pub async fn list_torrents_nonzero_rate(
@@ -150,7 +170,7 @@ impl Client {
             .await
             .with_context(|| format!("d.multicall.nonzero_rate {view} limit={limit}"))?;
 
-        parse_torrent_rows(result.into_array())
+        parse_torrent_rows(result.try_into_array()?)
     }
 
     pub async fn live_summary(&self, view: &str, limit: i64) -> Result<LiveSummary> {
@@ -160,19 +180,23 @@ impl Client {
             .call_sync("tng.live_summary", &args)
             .await
             .with_context(|| format!("tng.live_summary {view} limit={limit}"))?;
-        let mut fields = result.into_array();
+        let mut fields = result.try_into_array()?;
         if fields.len() < 3 {
-            return Ok(LiveSummary::default());
+            bail!("tng.live_summary returned fewer than three fields");
         }
         let rows = fields
             .pop()
-            .unwrap_or(XmlValue::Array(Vec::new()))
-            .into_array();
-        let upload = fields.get(1).and_then(XmlValue::as_i64).unwrap_or(0).max(0);
+            .ok_or_else(|| anyhow!("tng.live_summary omitted torrent rows"))?
+            .try_into_array()?;
+        let upload = fields
+            .get(1)
+            .and_then(XmlValue::as_i64)
+            .ok_or_else(|| anyhow!("tng.live_summary returned invalid upload rate"))?
+            .max(0);
         let download = fields
             .first()
             .and_then(XmlValue::as_i64)
-            .unwrap_or(0)
+            .ok_or_else(|| anyhow!("tng.live_summary returned invalid download rate"))?
             .max(0);
 
         Ok(LiveSummary {
@@ -217,11 +241,16 @@ impl Client {
             Err(_) => self.call("system.listMethods", &[]).await,
         }
         .context("list rTorrent XMLRPC methods")?;
-        Ok(value
-            .into_array()
+        value
+            .try_into_array()?
             .into_iter()
-            .filter_map(|v| v.as_str().map(str::to_owned))
-            .collect())
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| anyhow!("rTorrent method list contained a non-string entry"))
+            })
+            .collect()
     }
 
     pub async fn load_magnet(
@@ -265,14 +294,7 @@ impl Client {
         if url.starts_with("magnet:") {
             return self.load_magnet(url, save_path, category, start).await;
         }
-        let data = reqwest::get(url)
-            .await
-            .with_context(|| format!("fetch torrent URL {url}"))?
-            .error_for_status()
-            .with_context(|| format!("fetch torrent URL {url}"))?
-            .bytes()
-            .await
-            .with_context(|| format!("read torrent URL {url}"))?;
+        let data = crate::backend::download_remote_torrent(url).await?;
         self.load_torrent(&data, save_path, category, start).await
     }
 
@@ -486,7 +508,9 @@ impl Client {
             .call("network.http.user_agent", &[])
             .await
             .context("get network.http.user_agent")?;
-        Ok(v.as_str().unwrap_or("").to_owned())
+        v.as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow!("rTorrent user-agent response was not a string"))
     }
 }
 
@@ -523,35 +547,41 @@ fn rtorrent_patch_manifest_enables_bounded_live(patches: &str) -> bool {
 
 fn parse_torrent_rows(rows: Vec<XmlValue>) -> Result<Vec<RawTorrent>> {
     let mut torrents = Vec::with_capacity(rows.len());
-    for row in rows {
-        let fields = row.into_array();
+    for (row_index, row) in rows.into_iter().enumerate() {
+        let fields = row
+            .try_into_array()
+            .with_context(|| format!("parse rTorrent torrent row {row_index}"))?;
         if fields.len() < TORRENT_FIELDS.len() {
-            continue;
+            bail!(
+                "rTorrent torrent row {row_index} returned {} fields, expected at least {}",
+                fields.len(),
+                TORRENT_FIELDS.len()
+            );
         }
         torrents.push(RawTorrent {
-            hash: str_field(&fields, 0),
-            name: str_field(&fields, 1),
-            size_bytes: int_field(&fields, 2),
-            bytes_done: int_field(&fields, 3),
-            down_rate: int_field(&fields, 4),
-            up_rate: int_field(&fields, 5),
-            up_total: int_field(&fields, 6),
-            down_total: int_field(&fields, 7),
-            ratio: int_field(&fields, 8),
-            is_active: bool_field(&fields, 9),
-            is_open: bool_field(&fields, 10),
-            complete: bool_field(&fields, 11),
-            state: int_field(&fields, 12),
-            priority: int_field(&fields, 13),
-            category: decode_legacy_category(str_field(&fields, 14)),
-            base_path: str_field(&fields, 15),
-            directory: str_field(&fields, 16),
-            creation_date: int_field(&fields, 17),
-            timestamp_finished: int_field(&fields, 18),
-            tracker_focus: int_field(&fields, 19),
-            peers_connected: int_field(&fields, 20),
-            peers_complete: int_field(&fields, 21),
-            message: str_field(&fields, 22),
+            hash: required_string_field(&fields, 0, "d.hash")?,
+            name: required_string_field(&fields, 1, "d.name")?,
+            size_bytes: required_i64_field(&fields, 2, "d.size_bytes")?,
+            bytes_done: required_i64_field(&fields, 3, "d.bytes_done")?,
+            down_rate: required_i64_field(&fields, 4, "d.down.rate")?,
+            up_rate: required_i64_field(&fields, 5, "d.up.rate")?,
+            up_total: required_i64_field(&fields, 6, "d.up.total")?,
+            down_total: required_i64_field(&fields, 7, "d.down.total")?,
+            ratio: required_i64_field(&fields, 8, "d.ratio")?,
+            is_active: required_bool_field(&fields, 9, "d.is_active")?,
+            is_open: required_bool_field(&fields, 10, "d.is_open")?,
+            complete: required_bool_field(&fields, 11, "d.complete")?,
+            state: required_i64_field(&fields, 12, "d.state")?,
+            priority: required_i64_field(&fields, 13, "d.priority")?,
+            category: decode_legacy_category(required_string_field(&fields, 14, "d.custom1")?),
+            base_path: required_string_field(&fields, 15, "d.base_path")?,
+            directory: required_string_field(&fields, 16, "d.directory")?,
+            creation_date: required_i64_field(&fields, 17, "d.creation_date")?,
+            timestamp_finished: required_i64_field(&fields, 18, "d.timestamp.finished")?,
+            tracker_focus: required_i64_field(&fields, 19, "d.tracker_focus")?,
+            peers_connected: required_i64_field(&fields, 20, "d.peers_connected")?,
+            peers_complete: required_i64_field(&fields, 21, "d.peers_complete")?,
+            message: required_string_field(&fields, 22, "d.message")?,
             tracker_url: String::new(),
             tags: String::new(),
         });
@@ -576,18 +606,26 @@ fn decode_legacy_category(raw: String) -> String {
     }
 }
 
-fn str_field(fields: &[XmlValue], i: usize) -> String {
+fn required_string_field(fields: &[XmlValue], i: usize, name: &str) -> Result<String> {
     fields
         .get(i)
         .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_owned()
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("rTorrent response omitted valid {name}"))
 }
-fn int_field(fields: &[XmlValue], i: usize) -> i64 {
-    fields.get(i).and_then(|v| v.as_i64()).unwrap_or(0)
+
+fn required_i64_field(fields: &[XmlValue], i: usize, name: &str) -> Result<i64> {
+    fields
+        .get(i)
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| anyhow!("rTorrent response omitted valid {name}"))
 }
-fn bool_field(fields: &[XmlValue], i: usize) -> bool {
-    fields.get(i).and_then(|v| v.as_bool()).unwrap_or(false)
+
+fn required_bool_field(fields: &[XmlValue], i: usize, name: &str) -> Result<bool> {
+    fields
+        .get(i)
+        .and_then(|v| v.as_bool())
+        .ok_or_else(|| anyhow!("rTorrent response omitted valid {name}"))
 }
 
 fn normalize_rtorrent_save_path(path: &str) -> String {

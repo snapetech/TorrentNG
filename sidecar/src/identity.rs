@@ -10,17 +10,18 @@
 //! client running many simultaneous instances.
 
 use anyhow::{Context, Result};
-use std::path::Path;
+use std::{fs::File, io::Read, path::Path};
 
 pub const PEER_ID_PREFIX: &str = "-lt100B-";
 const PEER_ID_SUFFIX_FILE: &str = "peer_id_suffix";
+const MAX_PEER_ID_SUFFIX_BYTES: u64 = 4096;
 
 /// Load this install's persisted 12-byte peer id suffix from
 /// `<data_dir>/peer_id_suffix`, generating and persisting a new random one
 /// if none exists yet, and return the full 20-byte peer id string.
 pub fn load_or_generate_peer_id(data_dir: &Path) -> Result<String> {
     let path = data_dir.join(PEER_ID_SUFFIX_FILE);
-    if let Ok(existing) = std::fs::read_to_string(&path) {
+    if let Ok(existing) = read_bounded_text(&path, MAX_PEER_ID_SUFFIX_BYTES) {
         let trimmed = existing.trim();
         if valid_suffix(trimmed) {
             return Ok(format!("{PEER_ID_PREFIX}{trimmed}"));
@@ -32,6 +33,25 @@ pub fn load_or_generate_peer_id(data_dir: &Path) -> Result<String> {
     std::fs::write(&path, &suffix)
         .with_context(|| format!("persist peer id suffix to {}", path.display()))?;
     Ok(format!("{PEER_ID_PREFIX}{suffix}"))
+}
+
+fn read_bounded_text(path: &Path, max_bytes: u64) -> std::io::Result<String> {
+    let file = File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "peer id suffix file exceeds size limit",
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "peer id suffix file is not valid UTF-8",
+        )
+    })
 }
 
 fn valid_suffix(suffix: &str) -> bool {
@@ -101,6 +121,18 @@ mod tests {
         let id = load_or_generate_peer_id(dir.path()).expect("replace invalid suffix");
         let suffix = id.strip_prefix(PEER_ID_PREFIX).expect("prefix");
 
+        assert!(valid_suffix(suffix));
+    }
+
+    #[test]
+    fn oversized_persisted_suffix_is_replaced_without_unbounded_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(PEER_ID_SUFFIX_FILE);
+        std::fs::write(&path, vec![b'a'; (MAX_PEER_ID_SUFFIX_BYTES + 1) as usize])
+            .expect("write oversized suffix");
+
+        let id = load_or_generate_peer_id(dir.path()).expect("replace oversized suffix");
+        let suffix = id.strip_prefix(PEER_ID_PREFIX).expect("prefix");
         assert!(valid_suffix(suffix));
     }
 }

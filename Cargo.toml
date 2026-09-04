@@ -49,6 +49,7 @@ futures = "0.3"
 
 # web framework
 axum = { version = "0.7", features = ["ws", "macros"] }
+http = "1"
 tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
 hyper = { version = "1", features = ["full"] }

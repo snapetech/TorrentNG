@@ -54,11 +54,31 @@ impl PieceMap {
         if piece_length == 0 {
             return Err(PieceMapError::ZeroPieceLength);
         }
-        let total_length: u64 = files.iter().map(|f| f.length).sum();
+        if piece_length > u64::from(u32::MAX) {
+            return Err(PieceMapError::PieceLengthTooLarge(piece_length));
+        }
+        let mut expected_offset = 0u64;
+        for file in &files {
+            if file.content_offset != expected_offset {
+                return Err(PieceMapError::NonContiguousFileSpan {
+                    file_index: file.file_index,
+                    expected: expected_offset,
+                    actual: file.content_offset,
+                });
+            }
+            expected_offset = expected_offset
+                .checked_add(file.length)
+                .ok_or(PieceMapError::IntegerOverflow("file span offset"))?;
+        }
+        let total_length = expected_offset;
         if total_length == 0 {
             return Err(PieceMapError::ZeroTotalLength);
         }
-        let piece_count = total_length.div_ceil(piece_length) as u32;
+        let piece_count_u64 = (total_length / piece_length)
+            .checked_add(u64::from(!total_length.is_multiple_of(piece_length)))
+            .ok_or(PieceMapError::IntegerOverflow("piece count"))?;
+        let piece_count = u32::try_from(piece_count_u64)
+            .map_err(|_| PieceMapError::PieceCountTooLarge(piece_count_u64))?;
         Ok(PieceMap {
             piece_length,
             total_length,
@@ -72,7 +92,9 @@ impl PieceMap {
         if piece >= self.piece_count {
             return Err(PieceMapError::PieceOutOfRange(piece, self.piece_count));
         }
-        let start = piece as u64 * self.piece_length;
+        let start = u64::from(piece)
+            .checked_mul(self.piece_length)
+            .ok_or(PieceMapError::IntegerOverflow("piece start"))?;
         let remaining = self.total_length - start;
         Ok(remaining.min(self.piece_length) as u32)
     }
@@ -82,8 +104,13 @@ impl PieceMap {
         if piece >= self.piece_count {
             return Err(PieceMapError::PieceOutOfRange(piece, self.piece_count));
         }
-        let start = piece as u64 * self.piece_length;
-        let end = (start + self.piece_length).min(self.total_length);
+        let start = u64::from(piece)
+            .checked_mul(self.piece_length)
+            .ok_or(PieceMapError::IntegerOverflow("piece start"))?;
+        let end = start
+            .checked_add(self.piece_length)
+            .ok_or(PieceMapError::IntegerOverflow("piece end"))?
+            .min(self.total_length);
         Ok((start, end))
     }
 
@@ -92,7 +119,10 @@ impl PieceMap {
         let (piece_start, piece_end) = self.piece_content_range(piece)?;
         let mut regions = Vec::new();
         for file in &self.files {
-            let file_end = file.content_offset + file.length;
+            let file_end = file
+                .content_offset
+                .checked_add(file.length)
+                .ok_or(PieceMapError::IntegerOverflow("file span end"))?;
             let overlap_start = piece_start.max(file.content_offset);
             let overlap_end = piece_end.min(file_end);
             if overlap_start >= overlap_end {
@@ -133,13 +163,22 @@ impl PieceMap {
             });
         }
 
-        let piece_start = piece as u64 * self.piece_length;
-        let request_start = piece_start + begin as u64;
-        let request_end = request_start + length as u64;
+        let piece_start = u64::from(piece)
+            .checked_mul(self.piece_length)
+            .ok_or(PieceMapError::IntegerOverflow("piece start"))?;
+        let request_start = piece_start
+            .checked_add(u64::from(begin))
+            .ok_or(PieceMapError::IntegerOverflow("request start"))?;
+        let request_end = request_start
+            .checked_add(u64::from(length))
+            .ok_or(PieceMapError::IntegerOverflow("request end"))?;
 
         let mut regions = Vec::new();
         for file in &self.files {
-            let file_end = file.content_offset + file.length;
+            let file_end = file
+                .content_offset
+                .checked_add(file.length)
+                .ok_or(PieceMapError::IntegerOverflow("file span end"))?;
             let overlap_start = request_start.max(file.content_offset);
             let overlap_end = request_end.min(file_end);
             if overlap_start >= overlap_end {
@@ -317,6 +356,48 @@ mod tests {
         let (start, end) = pm.piece_content_range(1).unwrap();
         assert_eq!(start, 256);
         assert_eq!(end, 300);
+    }
+
+    #[test]
+    fn rejects_piece_count_overflow() {
+        let files = vec![FileSpan {
+            file_index: 0,
+            path: SafeRelPath::from_name("huge.bin", false).unwrap(),
+            content_offset: 0,
+            length: u64::from(u32::MAX) + 1,
+        }];
+
+        assert!(matches!(
+            PieceMap::new(1, files),
+            Err(PieceMapError::PieceCountTooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_non_contiguous_file_spans() {
+        let files = vec![
+            FileSpan {
+                file_index: 0,
+                path: SafeRelPath::from_name("a.bin", false).unwrap(),
+                content_offset: 0,
+                length: 10,
+            },
+            FileSpan {
+                file_index: 1,
+                path: SafeRelPath::from_name("b.bin", false).unwrap(),
+                content_offset: 12,
+                length: 10,
+            },
+        ];
+
+        assert!(matches!(
+            PieceMap::new(10, files),
+            Err(PieceMapError::NonContiguousFileSpan {
+                file_index: 1,
+                expected: 10,
+                actual: 12,
+            })
+        ));
     }
 
     #[cfg(test)]

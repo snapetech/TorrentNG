@@ -1,10 +1,11 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet, HashMap},
     convert::Infallible,
     net::SocketAddr,
     path::PathBuf,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -26,7 +27,7 @@ use rt_engine::{
     EngineGlobalLimits, EngineHandle, EngineJob, EngineNetworkFeatures, EngineStorageRoot,
     EngineTorrentLimits, QueueMove,
 };
-use rt_metainfo::{parse_magnet, parse_torrent};
+use rt_metainfo::parse_magnet;
 use rt_metrics::MemoryClass;
 use rt_session::TorrentState;
 use rt_storage::{
@@ -34,8 +35,25 @@ use rt_storage::{
     PlannedStorageAction, StoragePlan, StoragePlanStep, STORAGE_LATENCY_BUCKETS_NS,
 };
 use serde::{Deserialize, Deserializer, Serialize};
+use sha2::{Digest, Sha256};
 
-use crate::state::{torrent_summary, AppState, JsonMap, TorrentSnapshotError};
+use crate::state::{
+    native_i64, native_usize_i64, torrent_summary, AppState, JsonMap, TorrentSnapshotError,
+};
+
+const SSE_INITIAL_BATCH_DEFAULT: usize = 500;
+const SSE_INITIAL_BATCH_MAX: usize = 1_000;
+const SSE_DELTA_MAX_ENTRIES: usize = 1_000;
+const SSE_SLOW_CLIENT_RESYNC_AFTER: Duration = Duration::from_secs(15);
+const MAX_TORRENT_LIST_OFFSET: usize = 1_000_000;
+const SETTING_NATIVE_SAVED_VIEWS: &str = "native.saved_views";
+const SETTING_NATIVE_RATIO_GROUPS: &str = "native.ratio_groups";
+const SETTING_NATIVE_WORKFLOWS: &str = "native.workflows";
+const SETTING_NATIVE_RSS_RULES: &str = "native.rss_rules";
+const SETTING_NATIVE_WORKFLOW_RUNS: &str = "native.workflow_runs";
+const MAX_NATIVE_JSON_BYTES: usize = 1024 * 1024;
+const MAX_NATIVE_JSON_ENTRIES: usize = 4096;
+const MAX_NATIVE_WORKFLOW_RUNS: usize = 200;
 
 /// `POST /api/v1/auth/login` — native WebUI session probe.
 pub async fn auth_login(State(state): State<AppState>, body: String) -> impl IntoResponse {
@@ -124,6 +142,34 @@ pub async fn list_torrents(
     State(state): State<AppState>,
     Query(query): Query<TorrentListQuery>,
 ) -> impl IntoResponse {
+    if query
+        .filter
+        .as_deref()
+        .is_some_and(|filter| filter.len() > 256)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::to_value(ApiError::bad_request(
+                    "filter is limited to 256 bytes".to_owned(),
+                ))
+                .unwrap(),
+            ),
+        )
+            .into_response();
+    }
+    if query.offset.unwrap_or(0) > MAX_TORRENT_LIST_OFFSET {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::to_value(ApiError::bad_request(format!(
+                    "offset is limited to {MAX_TORRENT_LIST_OFFSET}"
+                )))
+                .unwrap(),
+            ),
+        )
+            .into_response();
+    }
     let snapshot = match state.torrent_snapshot(query.snapshot).await {
         Ok(snapshot) => snapshot,
         Err(TorrentSnapshotError::Expired { revision }) => {
@@ -144,6 +190,7 @@ pub async fn list_torrents(
         &indexed_states,
         query.category.as_deref(),
         query.tag.as_deref(),
+        query.filter.as_deref(),
     );
     let total = match candidates.as_ref() {
         Some(indices) => indices
@@ -179,7 +226,10 @@ pub async fn list_torrents(
         {
             continue;
         }
-        let item = &snapshot.torrents[*index];
+        let item = snapshot
+            .torrents
+            .get(*index)
+            .expect("snapshot index is valid");
         if !torrent_matches_summary(&item.summary, &query) {
             continue;
         }
@@ -401,22 +451,6 @@ pub async fn add_torrent(
                 .into_response();
         }
     };
-    let meta = match parse_torrent(&raw) {
-        Ok(meta) => meta,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(
-                    serde_json::to_value(ApiError::bad_request(format!(
-                        "invalid torrent metadata: {e}"
-                    )))
-                    .unwrap(),
-                ),
-            )
-                .into_response();
-        }
-    };
-
     let save_path = if req.save_path.trim().is_empty() {
         None
     } else {
@@ -425,8 +459,8 @@ pub async fn add_torrent(
     let paused = !req.start.unwrap_or(true);
 
     match engine
-        .add_torrent_with_labels(
-            meta,
+        .add_torrent_raw_with_labels(
+            raw,
             save_path,
             paused,
             req.category,
@@ -455,7 +489,7 @@ pub async fn get_torrent(
     let summary = {
         let reg = state.registry.read().await;
         match reg.get(&info_hash) {
-            Some(e) => torrent_summary(e),
+            Some(e) => torrent_summary(&e),
             None => return not_found(info_hash),
         }
     };
@@ -503,8 +537,8 @@ pub async fn get_torrent(
             };
             let detail = TorrentDetail {
                 summary,
-                piece_length: meta.piece_length as i64,
-                piece_count: meta.piece_count as i64,
+                piece_length: native_i64(meta.piece_length),
+                piece_count: native_usize_i64(meta.piece_count),
                 is_private: meta.is_private,
                 trackers: meta.trackers,
                 files: meta
@@ -513,8 +547,8 @@ pub async fn get_torrent(
                     .map(|file| FileInfo {
                         file_index: file.index,
                         path: file.path,
-                        length: file.length as i64,
-                        priority: 1,
+                        length: native_i64(file.length),
+                        priority: file.priority.clamp(0, 2) as u8,
                     })
                     .collect(),
             };
@@ -587,8 +621,8 @@ pub async fn update_torrent(
     }
 
     let mut reg = state.registry.write().await;
-    match reg.get_mut(&info_hash) {
-        Some(entry) => {
+    let response = match reg.get_mut(&info_hash) {
+        Some(mut entry) => {
             if let Some(name) = name {
                 entry.name = name;
             }
@@ -598,7 +632,9 @@ pub async fn update_torrent(
             StatusCode::NO_CONTENT.into_response()
         }
         None => not_found(info_hash),
-    }
+    };
+    drop(reg);
+    response
 }
 
 #[derive(Debug, Deserialize)]
@@ -625,13 +661,24 @@ pub async fn delete_torrent(
             .remove_torrent(info_hash.clone(), query.delete_files)
             .await
         {
-            Ok(()) => StatusCode::NO_CONTENT.into_response(),
-            Err(_) => not_found(info_hash),
+            Ok(Some(job_id)) => (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({ "job_id": job_id, "state": "queued" })),
+            )
+                .into_response(),
+            Ok(None) => StatusCode::NO_CONTENT.into_response(),
+            Err(error) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::to_value(ApiError::bad_request(error)).unwrap()),
+            )
+                .into_response(),
         }
     } else {
         let mut reg = state.registry.write().await;
-        let _ = reg.remove(&info_hash);
-        StatusCode::NO_CONTENT.into_response()
+        match reg.remove(&info_hash) {
+            Ok(_) => StatusCode::NO_CONTENT.into_response(),
+            Err(_) => not_found(info_hash),
+        }
     }
 }
 
@@ -678,13 +725,15 @@ pub async fn set_torrent_category(
     }
 
     let mut reg = state.registry.write().await;
-    match reg.get_mut(&info_hash) {
-        Some(entry) => {
+    let response = match reg.get_mut(&info_hash) {
+        Some(mut entry) => {
             entry.category = category;
             StatusCode::NO_CONTENT.into_response()
         }
         None => not_found(info_hash),
-    }
+    };
+    drop(reg);
+    response
 }
 
 #[derive(Debug, Serialize)]
@@ -832,57 +881,94 @@ pub async fn transfer_limits(State(state): State<AppState>) -> impl IntoResponse
 
 /// `GET /api/v1/transfer/info` — qBit-compatible aggregate transfer counters.
 pub async fn transfer_info(State(state): State<AppState>) -> impl IntoResponse {
-    let (dl_info_speed, up_info_speed, dl_info_data, up_info_data, dht_nodes) =
-        if let Some(engine) = &state.engine {
-            match engine.stats().await {
-                Ok(stats) => (
-                    stats.download_rate,
-                    stats.upload_rate,
-                    stats.bytes_downloaded.min(i64::MAX as u64) as i64,
-                    stats.bytes_uploaded.min(i64::MAX as u64) as i64,
-                    stats.dht_routing_nodes.min(i64::MAX as u64) as i64,
-                ),
-                Err(_) => (0, 0, 0, 0, 0),
-            }
-        } else {
-            // Keep the no-engine facade mode bounded by the same shared
-            // snapshot used by list consumers. There is no live peer-rate
-            // source without an engine, so only durable byte counters apply.
-            match state.torrent_snapshot(None).await {
-                Ok(snapshot) => snapshot.torrents.iter().fold(
-                    (0_i64, 0_i64, 0_i64, 0_i64, 0_i64),
-                    |(dl_speed, up_speed, dl_data, up_data, dht), item| {
-                        (
-                            dl_speed,
-                            up_speed,
-                            dl_data.saturating_add(item.summary.downloaded.max(0)),
-                            up_data.saturating_add(item.summary.uploaded.max(0)),
-                            dht,
-                        )
-                    },
-                ),
-                Err(_) => (0, 0, 0, 0, 0),
+    let (
+        dl_info_speed,
+        up_info_speed,
+        dl_info_data,
+        up_info_data,
+        dht_nodes,
+        dl_rate_limit,
+        up_rate_limit,
+    ) = if let Some(engine) = &state.engine {
+        let stats = match engine.stats().await {
+            Ok(stats) => stats,
+            Err(error) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(
+                        serde_json::to_value(ApiError::internal(format!(
+                            "native engine statistics are unavailable: {error}"
+                        )))
+                        .unwrap(),
+                    ),
+                )
+                    .into_response();
             }
         };
-
-    let (dl_rate_limit, up_rate_limit) = if let Some(engine) = &state.engine {
-        match engine.global_limits().await {
-            Ok(limits) => (
-                if limits.download_limit > 0 {
-                    limits.download_limit
-                } else {
-                    -1
-                },
-                if limits.upload_limit > 0 {
-                    limits.upload_limit
-                } else {
-                    -1
-                },
-            ),
-            Err(_) => (-1, -1),
-        }
+        let limits = match engine.global_limits().await {
+            Ok(limits) => limits,
+            Err(error) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(
+                        serde_json::to_value(ApiError::internal(format!(
+                            "native engine transfer limits are unavailable: {error}"
+                        )))
+                        .unwrap(),
+                    ),
+                )
+                    .into_response();
+            }
+        };
+        (
+            stats.download_rate,
+            stats.upload_rate,
+            stats.bytes_downloaded.min(i64::MAX as u64) as i64,
+            stats.bytes_uploaded.min(i64::MAX as u64) as i64,
+            stats.dht_routing_nodes.min(i64::MAX as u64) as i64,
+            if limits.download_limit > 0 {
+                limits.download_limit
+            } else {
+                -1
+            },
+            if limits.upload_limit > 0 {
+                limits.upload_limit
+            } else {
+                -1
+            },
+        )
     } else {
-        (-1, -1)
+        // Keep the no-engine facade mode bounded by the same shared
+        // snapshot used by list consumers. There is no live peer-rate
+        // source without an engine, so only durable byte counters apply.
+        let snapshot = match state.torrent_snapshot(None).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(
+                        serde_json::to_value(ApiError::internal(format!(
+                            "native transfer snapshot is unavailable: {error:?}"
+                        )))
+                        .unwrap(),
+                    ),
+                )
+                    .into_response();
+            }
+        };
+        let (_, _, dl_info_data, up_info_data, _) = snapshot.torrents.iter().fold(
+            (0_i64, 0_i64, 0_i64, 0_i64, 0_i64),
+            |(dl_speed, up_speed, dl_data, up_data, dht), item| {
+                (
+                    dl_speed,
+                    up_speed,
+                    dl_data.saturating_add(item.summary.downloaded.max(0)),
+                    up_data.saturating_add(item.summary.uploaded.max(0)),
+                    dht,
+                )
+            },
+        );
+        (0, 0, dl_info_data, up_info_data, 0, -1, -1)
     };
 
     Json(TransferInfoResponse {
@@ -893,7 +979,7 @@ pub async fn transfer_info(State(state): State<AppState>) -> impl IntoResponse {
         dl_rate_limit,
         up_rate_limit,
         dht_nodes,
-        connection_status: if state.engine.is_some() {
+        connection_status: if state.engine.as_ref().is_some_and(EngineHandle::is_alive) {
             "connected".to_owned()
         } else {
             "firewalled".to_owned()
@@ -1067,6 +1153,19 @@ pub async fn update_torrent_limits(
         )
             .into_response();
     };
+    if req.force_start.is_some() || req.auto_tmm.is_some() || req.auto_management.is_some() {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(
+                serde_json::to_value(ApiError::bad_request(
+                    "force_start, auto_tmm, and auto_management are not runtime-supported"
+                        .to_owned(),
+                ))
+                .unwrap(),
+            ),
+        )
+            .into_response();
+    }
 
     let mut limits = match engine.torrent_limits(info_hash.clone()).await {
         Ok(limits) => limits,
@@ -1109,18 +1208,33 @@ pub async fn add_torrent_peers(
     if !torrent_exists(&state, &info_hash).await {
         return not_found(info_hash);
     }
-    let peers = req
+    let peers = match req
         .peers
         .iter()
-        .filter_map(|peer| peer.trim().parse::<SocketAddr>().ok())
-        .collect::<Vec<_>>();
-    if peers.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::to_value(ApiError::bad_request("peers is required")).unwrap()),
-        )
-            .into_response();
-    }
+        .map(|peer| peer.trim().parse::<SocketAddr>())
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(peers) if !peers.is_empty() => peers,
+        Ok(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::to_value(ApiError::bad_request("peers is required")).unwrap()),
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    serde_json::to_value(ApiError::bad_request(
+                        "peers must contain only valid socket addresses",
+                    ))
+                    .unwrap(),
+                ),
+            )
+                .into_response();
+        }
+    };
     let Some(engine) = &state.engine else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1297,8 +1411,8 @@ pub async fn patch_torrent_tags(
     }
 
     let mut reg = state.registry.write().await;
-    match reg.get_mut(&info_hash) {
-        Some(entry) => {
+    let response = match reg.get_mut(&info_hash) {
+        Some(mut entry) => {
             for tag in add_tags {
                 if !entry.tags.contains(&tag) {
                     entry.tags.push(tag);
@@ -1310,7 +1424,9 @@ pub async fn patch_torrent_tags(
             StatusCode::NO_CONTENT.into_response()
         }
         None => not_found(info_hash),
-    }
+    };
+    drop(reg);
+    response
 }
 
 /// `POST /api/v1/torrents/{hash}/tags` — add persisted torrent tags.
@@ -1373,7 +1489,7 @@ pub async fn list_torrent_files(
         return not_found(info_hash);
     }
     let Some(engine) = &state.engine else {
-        return (StatusCode::OK, Json(serde_json::json!([]))).into_response();
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     match engine.torrent_metadata(info_hash).await {
         Ok(meta) => {
@@ -1383,8 +1499,8 @@ pub async fn list_torrent_files(
                 .map(|file| FileInfo {
                     file_index: file.index,
                     path: file.path,
-                    length: file.length as i64,
-                    priority: 1,
+                    length: native_i64(file.length),
+                    priority: file.priority.clamp(0, 2) as u8,
                 })
                 .collect();
             (StatusCode::OK, Json(serde_json::to_value(files).unwrap())).into_response()
@@ -1431,7 +1547,7 @@ pub async fn patch_torrent_files(
         return not_found(info_hash);
     }
     let Some(engine) = &state.engine else {
-        return StatusCode::NO_CONTENT.into_response();
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
 
     let mut failures = Vec::new();
@@ -1490,7 +1606,7 @@ pub async fn list_torrent_trackers(
         return not_found(info_hash);
     }
     let Some(engine) = &state.engine else {
-        return (StatusCode::OK, Json(serde_json::json!([]))).into_response();
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     match engine.torrent_metadata(info_hash).await {
         Ok(meta) => (
@@ -1536,7 +1652,7 @@ pub async fn patch_torrent_trackers(
         return not_found(info_hash);
     }
     let Some(engine) = &state.engine else {
-        return StatusCode::NO_CONTENT.into_response();
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
 
     let mut trackers = match engine.torrent_metadata(info_hash.clone()).await {
@@ -1746,24 +1862,233 @@ pub struct RssSampleRequest {
 
 pub trait JsonStore: Send + Sync + 'static {
     fn store(state: &AppState) -> Arc<tokio::sync::RwLock<JsonMap>>;
+    fn setting_key() -> &'static str;
+    fn kind() -> &'static str;
+}
+
+fn validate_json_map(map: &JsonMap, label: &str, kind: &str) -> Result<(), String> {
+    if map.len() > MAX_NATIVE_JSON_ENTRIES {
+        return Err(format!(
+            "{label} contains more than {MAX_NATIVE_JSON_ENTRIES} entries"
+        ));
+    }
+    if map.keys().any(|key| key.len() > 256) {
+        return Err(format!("{label} contains a key that is too long"));
+    }
+    let encoded = serde_json::to_vec(map).map_err(|error| format!("encoding {label}: {error}"))?;
+    if encoded.len() > MAX_NATIVE_JSON_BYTES {
+        return Err(format!(
+            "{label} exceeds the {MAX_NATIVE_JSON_BYTES} byte compatibility limit"
+        ));
+    }
+    for (key, value) in map {
+        validate_json_item(value, key, kind)?;
+    }
+    Ok(())
+}
+
+fn validate_json_item(value: &serde_json::Value, key: &str, kind: &str) -> Result<(), String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("{kind} {key:?} must be a JSON object"))?;
+    if json_item_id(value).is_none() {
+        return Err(format!(
+            "{kind} {key:?} must have a non-empty string id or name"
+        ));
+    }
+    for field in ["id", "name"] {
+        if let Some(value) = object.get(field) {
+            if value.as_str().is_none() {
+                return Err(format!("{kind} {key:?} field {field:?} must be a string"));
+            }
+        }
+    }
+    for field in ["enabled", "start"] {
+        if let Some(value) = object.get(field) {
+            if !value.is_boolean() {
+                return Err(format!("{kind} {key:?} field {field:?} must be a boolean"));
+            }
+        }
+    }
+    for field in [
+        "category",
+        "tracker",
+        "save_path",
+        "target_path",
+        "feed_url",
+        "include",
+        "exclude",
+        "contains",
+        "pattern",
+        "mustContain",
+        "mustNotContain",
+        "action",
+    ] {
+        if let Some(value) = object.get(field) {
+            if !(value.is_null() || value.is_string()) {
+                return Err(format!(
+                    "{kind} {key:?} field {field:?} must be a string or null"
+                ));
+            }
+        }
+    }
+    if let Some(tags) = object.get("tags") {
+        let tags = tags
+            .as_array()
+            .ok_or_else(|| format!("{kind} {key:?} field \"tags\" must be an array"))?;
+        if tags.iter().any(|tag| tag.as_str().is_none()) {
+            return Err(format!(
+                "{kind} {key:?} field \"tags\" must contain only strings"
+            ));
+        }
+    }
+    if kind == "saved_view" {
+        if let Some(params) = object.get("params") {
+            if !params.is_object() {
+                return Err(format!("{kind} {key:?} field \"params\" must be an object"));
+            }
+        }
+    }
+    if kind == "ratio_group" {
+        ratio_group_limit(value).map_err(|error| format!("{kind} {key:?}: {error}"))?;
+        seeding_time_group_limit(value).map_err(|error| format!("{kind} {key:?}: {error}"))?;
+    }
+    Ok(())
 }
 
 macro_rules! json_store {
-    ($name:ident, $field:ident) => {
+    ($name:ident, $field:ident, $setting:expr, $kind:expr) => {
         pub struct $name;
 
         impl JsonStore for $name {
             fn store(state: &AppState) -> Arc<tokio::sync::RwLock<JsonMap>> {
                 state.$field.clone()
             }
+
+            fn setting_key() -> &'static str {
+                $setting
+            }
+
+            fn kind() -> &'static str {
+                $kind
+            }
         }
     };
 }
 
-json_store!(SavedViewsStore, saved_views);
-json_store!(RatioGroupsStore, ratio_groups);
-json_store!(WorkflowsStore, workflows);
-json_store!(RssRulesStore, rss_rules);
+json_store!(
+    SavedViewsStore,
+    saved_views,
+    SETTING_NATIVE_SAVED_VIEWS,
+    "saved_view"
+);
+json_store!(
+    RatioGroupsStore,
+    ratio_groups,
+    SETTING_NATIVE_RATIO_GROUPS,
+    "ratio_group"
+);
+json_store!(
+    WorkflowsStore,
+    workflows,
+    SETTING_NATIVE_WORKFLOWS,
+    "workflow"
+);
+json_store!(
+    RssRulesStore,
+    rss_rules,
+    SETTING_NATIVE_RSS_RULES,
+    "rss_rule"
+);
+
+async fn load_json_map<S: JsonStore>(state: &AppState) -> Result<JsonMap, String> {
+    let map = if let Some(engine) = &state.engine {
+        match engine.get_setting(S::setting_key().to_owned()).await? {
+            Some(value) => {
+                if value.len() > MAX_NATIVE_JSON_BYTES {
+                    return Err(format!(
+                        "persisted {} exceeds the {MAX_NATIVE_JSON_BYTES} byte compatibility limit",
+                        S::setting_key()
+                    ));
+                }
+                let map = serde_json::from_str(&value)
+                    .map_err(|error| format!("invalid persisted {}: {error}", S::setting_key()))?;
+                validate_json_map(&map, S::setting_key(), S::kind())?;
+                map
+            }
+            None => JsonMap::new(),
+        }
+    } else {
+        S::store(state).read().await.clone()
+    };
+    validate_json_map(&map, S::setting_key(), S::kind())?;
+    *S::store(state).write().await = map.clone();
+    Ok(map)
+}
+
+async fn save_json_map<S: JsonStore>(state: &AppState, map: &JsonMap) -> Result<(), String> {
+    validate_json_map(map, S::setting_key(), S::kind())?;
+    let encoded = serde_json::to_string(map).map_err(|error| error.to_string())?;
+    if let Some(engine) = &state.engine {
+        engine
+            .set_setting(S::setting_key().to_owned(), encoded)
+            .await?;
+    }
+    *S::store(state).write().await = map.clone();
+    Ok(())
+}
+
+async fn load_workflow_runs(state: &AppState) -> Result<Vec<serde_json::Value>, String> {
+    let runs = if let Some(engine) = &state.engine {
+        match engine
+            .get_setting(SETTING_NATIVE_WORKFLOW_RUNS.to_owned())
+            .await?
+        {
+            Some(value) => {
+                if value.len() > MAX_NATIVE_JSON_BYTES {
+                    return Err(format!(
+                        "persisted workflow runs exceed the {MAX_NATIVE_JSON_BYTES} byte compatibility limit"
+                    ));
+                }
+                serde_json::from_str(&value)
+                    .map_err(|error| format!("invalid persisted workflow runs: {error}"))?
+            }
+            None => Vec::new(),
+        }
+    } else {
+        state.workflow_runs.read().await.clone()
+    };
+    if runs.len() > MAX_NATIVE_WORKFLOW_RUNS {
+        return Err(format!(
+            "persisted workflow runs contain more than {MAX_NATIVE_WORKFLOW_RUNS} entries"
+        ));
+    }
+    *state.workflow_runs.write().await = runs.clone();
+    Ok(runs)
+}
+
+async fn save_workflow_runs(
+    state: &AppState,
+    mut runs: Vec<serde_json::Value>,
+) -> Result<(), String> {
+    if runs.len() > MAX_NATIVE_WORKFLOW_RUNS {
+        let drop_count = runs.len() - MAX_NATIVE_WORKFLOW_RUNS;
+        runs.drain(..drop_count);
+    }
+    let encoded = serde_json::to_string(&runs).map_err(|error| error.to_string())?;
+    if encoded.len() > MAX_NATIVE_JSON_BYTES {
+        return Err(format!(
+            "workflow runs exceed the {MAX_NATIVE_JSON_BYTES} byte compatibility limit"
+        ));
+    }
+    if let Some(engine) = &state.engine {
+        engine
+            .set_setting(SETTING_NATIVE_WORKFLOW_RUNS.to_owned(), encoded)
+            .await?;
+    }
+    *state.workflow_runs.write().await = runs;
+    Ok(())
+}
 
 fn json_item_id(value: &serde_json::Value) -> Option<String> {
     ["id", "name"].into_iter().find_map(|field| {
@@ -1777,13 +2102,14 @@ fn json_item_id(value: &serde_json::Value) -> Option<String> {
 }
 
 pub async fn list_json_map<S: JsonStore>(State(state): State<AppState>) -> impl IntoResponse {
-    let items = S::store(&state)
-        .read()
-        .await
-        .values()
-        .cloned()
-        .collect::<Vec<_>>();
-    Json(items)
+    match load_json_map::<S>(&state).await {
+        Ok(items) => Json(items.values().cloned().collect::<Vec<_>>()).into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::to_value(ApiError::internal(error)).unwrap()),
+        )
+            .into_response(),
+    }
 }
 
 pub async fn upsert_json_map<S: JsonStore>(
@@ -1794,6 +2120,7 @@ pub async fn upsert_json_map<S: JsonStore>(
     if let Some(response) = require_mutation_auth(&state, &headers) {
         return response;
     }
+    let _write = state.json_store_write.lock().await;
     let Some(id) = json_item_id(&value) else {
         return (
             StatusCode::BAD_REQUEST,
@@ -1824,7 +2151,25 @@ pub async fn upsert_json_map<S: JsonStore>(
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
         .unwrap_or(id);
-    S::store(&state).write().await.insert(id, value);
+    let mut items = match load_json_map::<S>(&state).await {
+        Ok(items) => items,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::to_value(ApiError::internal(error)).unwrap()),
+            )
+                .into_response()
+        }
+    };
+    items.insert(id, value);
+    if let Err(error) = save_json_map::<S>(&state, &items).await {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::to_value(ApiError::internal(error)).unwrap()),
+        )
+            .into_response();
+    }
+    drop(_write);
     list_json_map::<S>(State(state)).await.into_response()
 }
 
@@ -1836,7 +2181,26 @@ pub async fn delete_saved_json<S: JsonStore>(
     if let Some(response) = require_mutation_auth(&state, &headers) {
         return response;
     }
-    S::store(&state).write().await.remove(&id);
+    let _write = state.json_store_write.lock().await;
+    let mut items = match load_json_map::<S>(&state).await {
+        Ok(items) => items,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::to_value(ApiError::internal(error)).unwrap()),
+            )
+                .into_response()
+        }
+    };
+    items.remove(&id);
+    if let Err(error) = save_json_map::<S>(&state, &items).await {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::to_value(ApiError::internal(error)).unwrap()),
+        )
+            .into_response();
+    }
+    drop(_write);
     list_json_map::<S>(State(state)).await.into_response()
 }
 
@@ -1850,7 +2214,16 @@ pub async fn run_json_workflow<S: JsonStore>(
         return response;
     }
     let dry_run = req.dry_run.unwrap_or(false);
-    let value = S::store(&state).read().await.get(&id).cloned();
+    let value = match load_json_map::<S>(&state).await {
+        Ok(items) => items.get(&id).cloned(),
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::to_value(ApiError::internal(error)).unwrap()),
+            )
+                .into_response()
+        }
+    };
     let Some(value) = value else {
         return (
             StatusCode::NOT_FOUND,
@@ -1869,25 +2242,59 @@ pub async fn run_json_workflow<S: JsonStore>(
         )
             .into_response();
     }
-    let matched = matching_hashes_for_json_rule(&state, &value).await;
-    let applied = if dry_run {
-        matched.clone()
+    let matched = match matching_hashes_for_json_rule(&state, &value).await {
+        Ok(matched) => matched,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::to_value(ApiError::internal(error)).unwrap()),
+            )
+                .into_response()
+        }
+    };
+    let (applied, errors) = if dry_run {
+        (matched.clone(), Vec::new())
+    } else if S::kind() == "ratio_group" {
+        apply_ratio_group_action(&state, &value, &matched).await
     } else {
         apply_json_rule_action(&state, &value, &matched).await
+    };
+    let action = if S::kind() == "ratio_group" {
+        "set_share_limits"
+    } else {
+        value
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("set_category")
+    };
+    let kind = if S::kind() == "ratio_group" {
+        "native_ratio_group"
+    } else {
+        "native_json_workflow"
     };
     let run = serde_json::json!({
         "id": format!("run-{}", unix_now()),
         "rule_id": id,
         "rule_name": value.get("name").and_then(serde_json::Value::as_str).unwrap_or(""),
-        "action": value.get("action").and_then(serde_json::Value::as_str).unwrap_or("set_category"),
-        "kind": "native_json_workflow",
+        "action": action,
+        "kind": kind,
         "dry_run": dry_run,
         "matched": matched,
         "applied": applied,
-        "errors": Vec::<String>::new(),
+        "errors": errors.clone(),
         "started_at": unix_now(),
     });
-    state.workflow_runs.write().await.push(run.clone());
+    let mut response_errors = errors;
+    let _write = state.json_store_write.lock().await;
+    match load_workflow_runs(&state).await {
+        Ok(mut runs) => {
+            runs.push(run.clone());
+            if let Err(error) = save_workflow_runs(&state, runs).await {
+                response_errors.push(format!("workflow audit persistence failed: {error}"));
+            }
+        }
+        Err(error) => response_errors.push(format!("workflow audit persistence failed: {error}")),
+    }
     Json(BulkResponse {
         applied: run["applied"]
             .as_array()
@@ -1899,14 +2306,21 @@ pub async fn run_json_workflow<S: JsonStore>(
                     .collect()
             })
             .unwrap_or_default(),
-        errors: Vec::new(),
+        errors: response_errors,
         dry_run,
     })
     .into_response()
 }
 
 pub async fn list_workflow_runs(State(state): State<AppState>) -> impl IntoResponse {
-    Json(state.workflow_runs.read().await.clone())
+    match load_workflow_runs(&state).await {
+        Ok(runs) => Json(runs).into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::to_value(ApiError::internal(error)).unwrap()),
+        )
+            .into_response(),
+    }
 }
 
 pub async fn test_rss_rules(
@@ -1921,7 +2335,16 @@ pub async fn test_rss_rules(
         )
             .into_response();
     }
-    let matches = rss_rule_matches(&state, &req).await;
+    let matches = match rss_rule_matches(&state, &req).await {
+        Ok(matches) => matches,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::to_value(ApiError::internal(error)).unwrap()),
+            )
+                .into_response()
+        }
+    };
     Json(serde_json::json!({ "dry_run": req.dry_run.unwrap_or(true), "matches": matches }))
         .into_response()
 }
@@ -1935,27 +2358,58 @@ pub async fn apply_rss_rules(
         return response;
     }
     let dry_run = req.dry_run.unwrap_or(true);
-    let matches = rss_rule_matches(&state, &req).await;
-    let applied = matches
-        .iter()
-        .filter_map(|rule| {
-            rule.get("rule_name")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        })
-        .collect::<Vec<_>>();
+    let matches = match rss_rule_matches(&state, &req).await {
+        Ok(matches) => matches,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::to_value(ApiError::internal(error)).unwrap()),
+            )
+                .into_response()
+        }
+    };
+    let (applied, errors) = if dry_run {
+        (
+            matches
+                .iter()
+                .filter_map(|rule| {
+                    rule.get("rule_name")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .collect::<Vec<_>>(),
+            Vec::new(),
+        )
+    } else {
+        apply_rss_rule_matches(&state, &req, &matches).await
+    };
+    let mut response_errors = errors;
+    let _write = state.json_store_write.lock().await;
     if !dry_run {
-        state.workflow_runs.write().await.push(serde_json::json!({
+        let run = serde_json::json!({
             "id": format!("rss-{}", unix_now()),
             "kind": "rss_rules",
             "dry_run": false,
-            "applied": applied,
+            "matched": matches,
+            "applied": applied.clone(),
+            "errors": response_errors.clone(),
             "started_at": unix_now(),
-        }));
+        });
+        match load_workflow_runs(&state).await {
+            Ok(mut runs) => {
+                runs.push(run);
+                if let Err(error) = save_workflow_runs(&state, runs).await {
+                    response_errors.push(format!("workflow audit persistence failed: {error}"));
+                }
+            }
+            Err(error) => {
+                response_errors.push(format!("workflow audit persistence failed: {error}"));
+            }
+        }
     }
     Json(BulkResponse {
         applied,
-        errors: Vec::new(),
+        errors: response_errors,
         dry_run,
     })
     .into_response()
@@ -2009,22 +2463,32 @@ pub async fn storage(State(state): State<AppState>) -> impl IntoResponse {
 
 /// `GET /api/v1/categories` — list known categories.
 pub async fn categories(State(state): State<AppState>) -> impl IntoResponse {
-    let reg = state.registry.read().await;
-    let mut categories = state.categories.read().await.clone();
-    for entry in reg.iter() {
-        if let Some(category) = &entry.category {
-            categories
-                .entry(category.clone())
-                .or_insert_with(|| entry.save_path.clone());
+    let snapshot = match state.torrent_snapshot(None).await {
+        Ok(snapshot) => snapshot,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let mut categories = if let Some(engine) = &state.engine {
+        match engine.list_categories().await {
+            Ok(definitions) => definitions
+                .into_iter()
+                .map(|category| (category.name, category.save_path.unwrap_or_default()))
+                .collect::<BTreeMap<_, _>>(),
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
         }
+    } else {
+        state.categories.read().await.clone()
+    };
+    let mut torrent_counts = BTreeMap::<String, usize>::new();
+    for facet in snapshot.category_facets() {
+        categories
+            .entry(facet.name.clone())
+            .or_insert_with(|| facet.save_path.unwrap_or_default());
+        torrent_counts.insert(facet.name, facet.count);
     }
     let rows = categories
         .into_iter()
         .map(|(name, save_path)| {
-            let torrent_count = reg
-                .iter()
-                .filter(|entry| entry.category.as_deref() == Some(name.as_str()))
-                .count();
+            let torrent_count = torrent_counts.get(&name).copied().unwrap_or_default();
             CategoryView {
                 name,
                 save_path,
@@ -2052,11 +2516,28 @@ pub async fn upsert_category(
         )
             .into_response();
     }
-    state
-        .categories
-        .write()
-        .await
-        .insert(name.to_owned(), req.save_path.unwrap_or_default());
+    let save_path = req.save_path.unwrap_or_default();
+    if let Some(engine) = &state.engine {
+        if let Err(error) = engine
+            .create_category(
+                name.to_owned(),
+                (!save_path.is_empty()).then_some(save_path.clone()),
+            )
+            .await
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::to_value(ApiError::internal(error)).unwrap()),
+            )
+                .into_response();
+        }
+    } else {
+        state
+            .categories
+            .write()
+            .await
+            .insert(name.to_owned(), save_path);
+    }
     categories(State(state)).await.into_response()
 }
 
@@ -2069,18 +2550,26 @@ pub async fn delete_category(
     if let Some(response) = require_mutation_auth(&state, &headers) {
         return response;
     }
-    state.categories.write().await.remove(&name);
-    let hashes = {
-        let reg = state.registry.read().await;
-        reg.iter()
-            .filter(|entry| entry.category.as_deref() == Some(name.as_str()))
-            .map(|entry| entry.info_hash.clone())
-            .collect::<Vec<_>>()
-    };
-    {
+    if let Some(engine) = &state.engine {
+        if let Err(error) = engine.remove_categories(vec![name.clone()]).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::to_value(ApiError::internal(error)).unwrap()),
+            )
+                .into_response();
+        }
+    } else {
+        state.categories.write().await.remove(&name);
+        let hashes = {
+            let reg = state.registry.read().await;
+            reg.iter()
+                .filter(|entry| entry.category.as_deref() == Some(name.as_str()))
+                .map(|entry| entry.info_hash.clone())
+                .collect::<Vec<_>>()
+        };
         let mut reg = state.registry.write().await;
         for hash in hashes {
-            let Some(entry) = reg.get_mut(&hash) else {
+            let Some(mut entry) = reg.get_mut(&hash) else {
                 continue;
             };
             if entry.category.as_deref() == Some(name.as_str()) {
@@ -2094,11 +2583,25 @@ pub async fn delete_category(
 /// `GET /api/v1/tags` — list known tag names.
 pub async fn tags(State(state): State<AppState>) -> impl IntoResponse {
     let mut tags = BTreeSet::<String>::new();
-    tags.extend(state.tags.read().await.iter().cloned());
-    let reg = state.registry.read().await;
-    for entry in reg.iter() {
-        tags.extend(entry.tags.iter().filter(|tag| !tag.is_empty()).cloned());
+    if let Some(engine) = &state.engine {
+        match engine.list_tags().await {
+            Ok(global_tags) => tags.extend(global_tags),
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
+    } else {
+        tags.extend(state.tags.read().await.iter().cloned());
     }
+    let snapshot = match state.torrent_snapshot(None).await {
+        Ok(snapshot) => snapshot,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    tags.extend(
+        snapshot
+            .tag_facets()
+            .into_iter()
+            .filter(|(tag, _)| !tag.is_empty())
+            .map(|(tag, _)| tag),
+    );
     (StatusCode::OK, Json(tags.into_iter().collect::<Vec<_>>())).into_response()
 }
 
@@ -2119,10 +2622,20 @@ pub async fn create_tag(
         )
             .into_response();
     }
-    let mut tags = state.tags.write().await;
-    if !tags.iter().any(|tag| tag == name) {
-        tags.push(name.to_owned());
-        tags.sort();
+    if let Some(engine) = &state.engine {
+        if let Err(error) = engine.create_tags(vec![name.to_owned()]).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::to_value(ApiError::internal(error)).unwrap()),
+            )
+                .into_response();
+        }
+    } else {
+        let mut tags = state.tags.write().await;
+        if !tags.iter().any(|tag| tag == name) {
+            tags.push(name.to_owned());
+            tags.sort();
+        }
     }
     StatusCode::NO_CONTENT.into_response()
 }
@@ -2136,18 +2649,28 @@ pub async fn delete_tag(
     if let Some(response) = require_mutation_auth(&state, &headers) {
         return response;
     }
-    state.tags.write().await.retain(|tag| tag != &name);
-    let hashes = {
-        let reg = state.registry.read().await;
-        reg.iter()
-            .filter(|entry| entry.tags.contains(&name))
-            .map(|entry| entry.info_hash.clone())
-            .collect::<Vec<_>>()
-    };
-    let mut reg = state.registry.write().await;
-    for hash in hashes {
-        if let Some(entry) = reg.get_mut(&hash) {
-            entry.tags.retain(|tag| tag != &name);
+    if let Some(engine) = &state.engine {
+        if let Err(error) = engine.remove_tags(vec![name.clone()]).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::to_value(ApiError::internal(error)).unwrap()),
+            )
+                .into_response();
+        }
+    } else {
+        state.tags.write().await.retain(|tag| tag != &name);
+        let hashes = {
+            let reg = state.registry.read().await;
+            reg.iter()
+                .filter(|entry| entry.tags.contains(&name))
+                .map(|entry| entry.info_hash.clone())
+                .collect::<Vec<_>>()
+        };
+        let mut reg = state.registry.write().await;
+        for hash in hashes {
+            if let Some(mut entry) = reg.get_mut(&hash) {
+                entry.tags.retain(|tag| tag != &name);
+            }
         }
     }
     StatusCode::NO_CONTENT.into_response()
@@ -2179,14 +2702,7 @@ pub async fn bulk_action(
         )
             .into_response();
     }
-    if action == "set-category"
-        && req
-            .category
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or_default()
-            .is_empty()
-    {
+    if action == "set-category" && req.category.is_none() {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::to_value(ApiError::bad_request("category is required")).unwrap()),
@@ -2233,16 +2749,18 @@ pub async fn bulk_action(
         )
             .into_response();
     }
+    let mut applied = Vec::new();
     for hash in &hashes {
         let result = run_bulk_action(&state, hash, &action, &req).await;
-        if let Err(error) = result {
-            errors.push(format!("{hash}: {error}"));
+        match result {
+            Ok(()) => applied.push(hash.clone()),
+            Err(error) => errors.push(format!("{hash}: {error}")),
         }
     }
     (
         StatusCode::OK,
         Json(BulkResponse {
-            applied: hashes,
+            applied,
             errors,
             dry_run,
         }),
@@ -2269,24 +2787,49 @@ pub async fn cross_seed(
         errors.push("trackers is required".to_owned());
     }
     if !dry_run && errors.is_empty() {
+        let Some(engine) = &state.engine else {
+            errors.push("native engine is not available".to_owned());
+            return (
+                StatusCode::OK,
+                Json(BulkResponse {
+                    applied: Vec::new(),
+                    errors,
+                    dry_run,
+                }),
+            )
+                .into_response();
+        };
+        let mut applied = Vec::new();
         for hash in &hashes {
-            if let Some(engine) = &state.engine {
-                if let Err(e) = engine
-                    .update_torrent_trackers(hash.clone(), req.trackers.clone())
-                    .await
-                {
+            if let Err(e) = engine
+                .update_torrent_trackers(hash.clone(), req.trackers.clone())
+                .await
+            {
+                errors.push(format!("{hash}: {e}"));
+                continue;
+            }
+            if req.reannounce.unwrap_or(true) {
+                if let Err(e) = engine.reannounce_torrent(hash.clone()).await {
                     errors.push(format!("{hash}: {e}"));
-                }
-                if req.reannounce.unwrap_or(true) {
-                    let _ = engine.reannounce_torrent(hash.clone()).await;
+                    continue;
                 }
             }
+            applied.push(hash.clone());
         }
+        return (
+            StatusCode::OK,
+            Json(BulkResponse {
+                applied,
+                errors,
+                dry_run,
+            }),
+        )
+            .into_response();
     }
     (
         StatusCode::OK,
         Json(BulkResponse {
-            applied: hashes,
+            applied: if dry_run { hashes } else { Vec::new() },
             errors,
             dry_run,
         }),
@@ -2294,61 +2837,45 @@ pub async fn cross_seed(
         .into_response()
 }
 
-/// `GET /api/v1/tracker-health` — aggregate tracker health from cached torrents.
+/// `GET /api/v1/tracker-health` — aggregate normalized tracker health.
 pub async fn tracker_health(State(state): State<AppState>) -> impl IntoResponse {
-    let reg = state.registry.read().await;
-    let mut rows = BTreeMap::<String, serde_json::Value>::new();
-    for entry in reg.iter() {
-        if let Some(tracker) = entry
-            .category
-            .as_deref()
-            .filter(|value| value.contains("://"))
-        {
-            let row = rows.entry(tracker.to_owned()).or_insert_with(|| {
-                serde_json::json!({
-                    "tracker": tracker,
-                    "torrent_count": 0usize,
-                    "active_count": 0usize,
-                    "complete_count": 0usize,
-                    "error_count": 0usize,
-                    "seed_count": 0usize,
-                    "peer_count": 0usize,
-                    "last_updated": entry.added_at,
-                })
-            });
-            increment_json_usize(row, "torrent_count");
-            if matches!(
-                entry.state,
-                TorrentState::Downloading | TorrentState::Seeding
-            ) {
-                increment_json_usize(row, "active_count");
-            }
-            if entry.amount_left == 0 {
-                increment_json_usize(row, "complete_count");
-                increment_json_usize(row, "seed_count");
-            }
+    let Some(engine) = &state.engine else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let rows = match engine.tracker_health().await {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(
+                component = "api",
+                operation = "tracker_health",
+                result = "error",
+                error = %error,
+                "tracker health query failed"
+            );
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
-    }
+    };
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "trackers": rows.into_values().collect::<Vec<_>>() })),
+        Json(serde_json::json!({ "trackers": rows })),
     )
         .into_response()
 }
 
 /// `GET /api/v1/sidebar-facets` — aggregate sidebar filter counts.
 pub async fn sidebar_facets(State(state): State<AppState>) -> impl IntoResponse {
-    let reg = state.registry.read().await;
-    let mut status = BTreeMap::<String, usize>::new();
-    let mut media_type = BTreeMap::<String, usize>::new();
-    for entry in reg.iter() {
-        *status
-            .entry(format!("{:?}", entry.state).to_ascii_lowercase())
-            .or_default() += 1;
-        *media_type
-            .entry(infer_media_type(&entry.name).to_owned())
-            .or_default() += 1;
-    }
+    let snapshot = match state.torrent_snapshot(None).await {
+        Ok(snapshot) => snapshot,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let status = snapshot
+        .state_counts()
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    let media_type = snapshot
+        .media_type_counts()
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
     (
         StatusCode::OK,
         Json(serde_json::json!({ "status": status, "media_type": media_type })),
@@ -2381,25 +2908,42 @@ pub async fn logs(
         .await
     {
         Ok(events) => {
-            let logs = events
-                .into_iter()
-                .filter_map(|row| {
-                    let payload = serde_json::from_str::<serde_json::Value>(&row.payload).ok()?;
+            let logs = match events
+                .iter()
+                .map(|row| {
+                    let (_, payload) = session_event_parts(row)?;
                     let level = payload
                         .get("level")
                         .and_then(serde_json::Value::as_str)
                         .map(ToOwned::to_owned)
                         .unwrap_or_else(|| level_from_kind(&row.kind).to_owned());
-                    Some(serde_json::json!({
-                        "event_id": row.event_id.unwrap_or_default(),
+                    Ok(serde_json::json!({
+                        "event_id": row.event_id,
                         "occurred_at": row.occurred_at,
                         "level": level,
                         "kind": row.kind,
-                        "message": row.message.unwrap_or_default(),
+                        "message": row.message.clone().unwrap_or_default(),
                         "payload": payload.to_string(),
                     }))
                 })
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>, String>>()
+            {
+                Ok(logs) => logs,
+                Err(error) => {
+                    tracing::warn!(
+                        component = "api",
+                        operation = "logs_projection",
+                        result = "error",
+                        error = %error,
+                        "durable session event projection is corrupt"
+                    );
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::to_value(ApiError::internal(error)).unwrap()),
+                    )
+                        .into_response();
+                }
+            };
             (StatusCode::OK, Json(serde_json::json!({ "logs": logs }))).into_response()
         }
         Err(e) => (
@@ -2426,6 +2970,22 @@ pub async fn set_user_agent(
     if let Some(response) = require_mutation_auth(&state, &headers) {
         return response;
     }
+    let Some(engine) = &state.engine else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                serde_json::to_value(ApiError::internal("native engine is not available")).unwrap(),
+            ),
+        )
+            .into_response();
+    };
+    if let Err(error) = engine.set_user_agent(req.user_agent.clone()).await {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError::bad_request(error)).unwrap()),
+        )
+            .into_response();
+    }
     *state.user_agent.write().await = req.user_agent;
     StatusCode::NO_CONTENT.into_response()
 }
@@ -2433,6 +2993,20 @@ pub async fn set_user_agent(
 /// `GET /api/v1/engine` — native engine diagnostics for the WebUI.
 pub async fn engine_diagnostics(State(state): State<AppState>) -> impl IntoResponse {
     let user_agent = state.user_agent.read().await.clone();
+    let engine_alive = state.engine.as_ref().is_some_and(EngineHandle::is_alive);
+    let peer_listener_healthy = state
+        .engine
+        .as_ref()
+        .is_some_and(EngineHandle::peer_listener_healthy);
+    let network_features = match state.engine.as_ref() {
+        Some(engine) if engine_alive => {
+            tokio::time::timeout(Duration::from_millis(500), engine.network_features())
+                .await
+                .ok()
+                .and_then(Result::ok)
+        }
+        _ => None,
+    };
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -2440,12 +3014,14 @@ pub async fn engine_diagnostics(State(state): State<AppState>) -> impl IntoRespo
                 "type": "native",
                 "name": "TorrentNG Native",
                 "version": env!("CARGO_PKG_VERSION"),
-                "connected": state.engine.is_some(),
+                "connected": engine_alive,
+                "alive": engine_alive,
+                "peer_listener_healthy": peer_listener_healthy,
                 "capabilities": native_webui_backend_capabilities(),
             },
             "provenance": {
                 "daemon_version": env!("CARGO_PKG_VERSION"),
-                "sidecar_version": env!("CARGO_PKG_VERSION"),
+                "sidecar_version": null,
                 "rtorrent_version": null,
                 "libtorrent_version": null,
                 "xmlrpc_backend": "native",
@@ -2456,25 +3032,31 @@ pub async fn engine_diagnostics(State(state): State<AppState>) -> impl IntoRespo
             "capabilities": native_capability_rows(),
             "http": {
                 "user_agent": probe_value(Ok(serde_json::json!(user_agent))),
-                "current_open": probe_value(Ok(serde_json::json!(0))),
-                "max_total_connections": probe_value(Ok(serde_json::json!(0))),
-                "max_host_connections": probe_value(Ok(serde_json::json!(0))),
-                "max_cache_connections": probe_value(Ok(serde_json::json!(0))),
-                "dns_cache_timeout": probe_value(Ok(serde_json::json!(60))),
-                "proxy_address": probe_value(Ok(serde_json::json!(""))),
-                "ca_path": probe_value(Ok(serde_json::json!(""))),
-                "ca_cert": probe_value(Ok(serde_json::json!(""))),
-                "ssl_verify_peer": probe_value(Ok(serde_json::json!(true))),
-                "ssl_verify_host": probe_value(Ok(serde_json::json!(true))),
+                "current_open": probe_value(Err("not exposed by native backend".to_owned())),
+                "max_total_connections": probe_value(Err("not exposed by native backend".to_owned())),
+                "max_host_connections": probe_value(Err("not exposed by native backend".to_owned())),
+                "max_cache_connections": probe_value(Err("not exposed by native backend".to_owned())),
+                "dns_cache_timeout": probe_value(Err("not exposed by native backend".to_owned())),
+                "proxy_address": probe_value(Err("not exposed by native backend".to_owned())),
+                "ca_path": probe_value(Err("not exposed by native backend".to_owned())),
+                "ca_cert": probe_value(Err("not exposed by native backend".to_owned())),
+                "ssl_verify_peer": probe_value(Err("not exposed by native backend".to_owned())),
+                "ssl_verify_host": probe_value(Err("not exposed by native backend".to_owned())),
             },
             "dht": {
-                "enabled": probe_value(Ok(serde_json::json!("auto"))),
-                "port": probe_value(Ok(serde_json::json!(0))),
-                "override_port": probe_value(Ok(serde_json::json!(0))),
-                "listen_port": probe_value(Ok(serde_json::json!(0))),
-                "listen_range": probe_value(Ok(serde_json::json!("0-0"))),
-                "pex": probe_value(Ok(serde_json::json!(true))),
-                "udp_trackers": probe_value(Ok(serde_json::json!(true))),
+                "enabled": probe_value(network_features
+                    .as_ref()
+                    .map(|features| serde_json::json!(features.dht))
+                    .ok_or_else(|| "native network features are unavailable".to_owned())),
+                "port": probe_value(Err("not exposed by native backend".to_owned())),
+                "override_port": probe_value(Err("not exposed by native backend".to_owned())),
+                "listen_port": probe_value(Err("not exposed by native backend".to_owned())),
+                "listen_range": probe_value(Err("not exposed by native backend".to_owned())),
+                "pex": probe_value(network_features
+                    .as_ref()
+                    .map(|features| serde_json::json!(features.pex))
+                    .ok_or_else(|| "native network features are unavailable".to_owned())),
+                "udp_trackers": probe_value(Err("not exposed by native backend".to_owned())),
                 "statistics": probe_value(Ok(serde_json::json!("native"))),
             },
             "drift": Vec::<serde_json::Value>::new(),
@@ -2483,25 +3065,22 @@ pub async fn engine_diagnostics(State(state): State<AppState>) -> impl IntoRespo
         .into_response()
 }
 
-/// `GET /api/v1/engine/commands` — rTorrent-style command surface projection.
+/// `GET /api/v1/engine/commands` — rTorrent command index.
 pub async fn engine_commands(State(_state): State<AppState>) -> impl IntoResponse {
-    let commands = vec![
-        "torrent.start",
-        "torrent.stop",
-        "torrent.recheck",
-        "torrent.reannounce",
-        "torrent.set_category",
-        "torrent.set_location",
-        "storage.plan",
-        "storage.execute",
-    ];
+    // This endpoint describes an rTorrent XMLRPC command catalog. Native has
+    // no XMLRPC command registry, so returning a hand-written subset as
+    // `ok=true` is a compatibility lie and causes clients to probe commands
+    // that are not actually exposed by this route.
     (
-        StatusCode::OK,
+        StatusCode::NOT_IMPLEMENTED,
         Json(serde_json::json!({
-            "ok": true,
-            "count": commands.len(),
-            "commands": commands,
-            "error": null,
+            "ok": false,
+            "count": 0,
+            "commands": [],
+            "error": {
+                "code": "NOT_IMPLEMENTED",
+                "message": "native backend does not expose an rTorrent XMLRPC command index"
+            },
         })),
     )
         .into_response()
@@ -2516,46 +3095,96 @@ pub async fn rtorrent_settings(State(state): State<AppState>) -> impl IntoRespon
             "settings": {
                 "system.client_version": env!("CARGO_PKG_VERSION"),
                 "system.user_agent": state.user_agent.read().await.clone(),
-                "session.name": "TorrentNG",
-                "network.http.dns_cache_timeout": 60,
+                "session.name": "TorrentNG"
             },
+            "supported": ["system.user_agent"],
+            "unsupported": ["network.http.dns_cache_timeout"],
             "error": null,
         })),
     )
         .into_response()
 }
 
-/// `PUT /api/v1/engine/rtorrent-settings` — accept compatible settings overlays.
+/// `PUT /api/v1/engine/rtorrent-settings` — apply the native-compatible subset.
 pub async fn save_rtorrent_settings(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(mut req): Json<serde_json::Value>,
+    Json(req): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     if let Some(response) = require_mutation_auth(&state, &headers) {
         return response;
     }
-    if let Some(user_agent) = req
+    let user_agent = req
         .get("settings")
         .and_then(|settings| settings.get("system.user_agent"))
         .and_then(serde_json::Value::as_str)
         .or_else(|| {
             req.get("system.user_agent")
                 .and_then(serde_json::Value::as_str)
-        })
-    {
+        });
+    let unsupported = rtorrent_setting_keys(&req)
+        .into_iter()
+        .filter(|key| key != "system.user_agent")
+        .collect::<Vec<_>>();
+    if !unsupported.is_empty() {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "ok": false,
+                "applied": {},
+                "unsupported": unsupported,
+                "error": {
+                    "code": "NOT_IMPLEMENTED",
+                    "message": "native backend only supports runtime user-agent changes; configuration overlays are not implemented"
+                }
+            })),
+        )
+            .into_response();
+    }
+    if let Some(user_agent) = user_agent {
+        let Some(engine) = &state.engine else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(
+                    serde_json::to_value(ApiError::internal("native engine is not available"))
+                        .unwrap(),
+                ),
+            )
+                .into_response();
+        };
+        if let Err(error) = engine.set_user_agent(user_agent.to_owned()).await {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::to_value(ApiError::bad_request(error)).unwrap()),
+            )
+                .into_response();
+        }
         *state.user_agent.write().await = user_agent.to_owned();
     }
-    if !req.is_object() {
-        req = serde_json::json!({ "value": req });
-    }
+    let applied = user_agent
+        .map(|value| serde_json::json!({ "system.user_agent": value }))
+        .unwrap_or_else(|| serde_json::json!({}));
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "ok": true, "applied": req, "error": null })),
+        Json(serde_json::json!({
+            "ok": true,
+            "applied": applied,
+            "unsupported": [],
+            "error": null
+        })),
     )
         .into_response()
 }
 
-/// `POST /api/v1/engine/restart` — acknowledge native restart requests.
+fn rtorrent_setting_keys(value: &serde_json::Value) -> Vec<String> {
+    let settings = value.get("settings").unwrap_or(value);
+    settings
+        .as_object()
+        .map(|settings| settings.keys().cloned().collect())
+        .unwrap_or_else(|| vec!["value".to_owned()])
+}
+
+/// `POST /api/v1/engine/restart` — native restart is supervisor-owned.
 pub async fn restart_engine(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2564,11 +3193,14 @@ pub async fn restart_engine(
         return response;
     }
     (
-        StatusCode::ACCEPTED,
+        StatusCode::NOT_IMPLEMENTED,
         Json(serde_json::json!({
-            "ok": true,
+            "ok": false,
             "restart_required": false,
-            "message": "native engine restart is supervised by torrentngd",
+            "error": {
+                "code": "NOT_IMPLEMENTED",
+                "message": "native restart is owned by the torrentngd supervisor"
+            },
         })),
     )
         .into_response()
@@ -3061,6 +3693,8 @@ fn storage_plan_step_action_label(action: &PlannedStorageAction) -> &'static str
         PlannedStorageAction::Rename => "rename",
         PlannedStorageAction::CopyVerifyRename => "copy_verify_rename",
         PlannedStorageAction::SafeDelete => "safe_delete",
+        PlannedStorageAction::SafeDeleteIfPresent => "safe_delete_if_present",
+        PlannedStorageAction::PruneEmptyDirs => "prune_empty_dirs",
     }
 }
 
@@ -3136,7 +3770,17 @@ pub async fn diagnose_torrent(
             Json(serde_json::to_value(diagnostic).unwrap()),
         )
             .into_response(),
-        Err(_) => not_found(info_hash),
+        Err(error) => {
+            if !engine.is_alive() || torrent_exists(&state, &info_hash).await {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::to_value(ApiError::internal(error)).unwrap()),
+                )
+                    .into_response()
+            } else {
+                not_found(info_hash)
+            }
+        }
     }
 }
 
@@ -3144,6 +3788,10 @@ pub async fn diagnose_torrent(
 pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let torrent_count = state.registry.read().await.len();
     let engine_alive = state.engine.as_ref().is_some_and(EngineHandle::is_alive);
+    let peer_listener_healthy = state
+        .engine
+        .as_ref()
+        .is_some_and(EngineHandle::peer_listener_healthy);
     let subsystem_health = if engine_alive {
         match state.engine.as_ref() {
             Some(engine) => engine.subsystem_health().await.ok(),
@@ -3153,8 +3801,11 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
         None
     };
     let ready = engine_alive
+        && peer_listener_healthy
         && subsystem_health.is_some_and(|health| {
-            health.storage_workers_healthy && (!health.dht_enabled || health.dht_healthy)
+            health.db_worker_healthy
+                && health.storage_workers_healthy
+                && (!health.dht_enabled || health.dht_healthy)
         });
     let status = if ready {
         StatusCode::OK
@@ -3174,6 +3825,10 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
                 "track1_sidecar_required": false,
                 "subsystems": {
                     "engine": { "alive": engine_alive },
+                    "peer_listener": { "healthy": peer_listener_healthy },
+                    "database_worker": {
+                        "healthy": subsystem_health.map(|health| health.db_worker_healthy).unwrap_or(false)
+                    },
                     "storage_workers": {
                         "healthy": subsystem_health.map(|health| health.storage_workers_healthy).unwrap_or(false)
                     },
@@ -3268,6 +3923,7 @@ fn native_engine_capabilities() -> serde_json::Value {
             "http_trackers": true,
             "udp_trackers": true,
             "dht": true,
+            "dht_address_families": ["ipv4"],
             "utp_packet_codec": true,
             "utp_udp_stream": true,
             "utp_outgoing_opt_in": true,
@@ -3302,6 +3958,38 @@ fn native_engine_capabilities() -> serde_json::Value {
             "api_token_auth": true,
             "scale_certification": false,
         },
+        "assurance": {
+            "implemented": [
+                "native_rest",
+                "native_sse",
+                "durable_session",
+                "durable_jobs",
+                "storage_plan_controls",
+                "dht_resource_bounds",
+                "peer_ban_enforcement",
+                "seed_limit_enforcement",
+                "idempotent_http_mutations"
+            ],
+            "enabled": {
+                "utp_transport": utp_transport,
+                "utp_transport_paths": utp_transport_paths
+            },
+            "certified": [],
+            "experimental": [
+                "pure_v2_metadata_completion",
+                "pure_v2_transfer",
+                "descriptor_relative_storage_authority",
+                "storage_throttling",
+                "scale_certification"
+            ],
+            "evidence": {
+                "release_artifact_current": false,
+                "hosted_ci_observed": false,
+                "real_device_storage": false,
+                "public_compatibility": false,
+                "long_soak": false
+            }
+        },
     })
 }
 
@@ -3312,21 +4000,21 @@ fn native_webui_backend_capabilities() -> serde_json::Value {
         "supports_file_priority": true,
         "supports_tracker_edit": true,
         "supports_recheck": true,
-        "supports_torrent_export": false,
-        "supports_webseed_reads": false,
+        "supports_torrent_export": true,
+        "supports_webseed_reads": true,
         "supports_piece_state_reads": true,
         "supports_piece_hash_reads": true,
         "supports_peer_snapshots": true,
         "supports_peer_add": true,
-        "supports_peer_ban": false,
+        "supports_peer_ban": true,
         "supports_queue_order": true,
         "supports_per_torrent_limits": true,
         "supports_global_limits": true,
         "supports_share_limits": true,
-        "supports_mode_flags": true,
+        "supports_mode_flags": false,
         "supports_location_update": true,
         "supports_torrent_rename": true,
-        "supports_file_rename": false,
+        "supports_file_rename": true,
         "supports_runtime_user_agent": true,
         "supports_config_overlay": false,
         "supports_restart": false,
@@ -3388,7 +4076,11 @@ pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("text/plain; version=0.0.4"),
             )],
-            render_metrics_with_api(&stats, state.api_metrics.snapshot()),
+            render_metrics_with_options(
+                &stats,
+                state.api_metrics.snapshot(),
+                state.metrics_include_torrent_ids,
+            ),
         ),
         Err(e) => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -3406,35 +4098,70 @@ pub async fn stream_events(
     State(state): State<AppState>,
     Query(query): Query<EventStreamQuery>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    // The notifier belongs to the registry, so every engine/API mutation
+    // wakes this stream without making idle clients rescan the journal once
+    // per second.
+    let change_notify = state.registry.read().await.change_notifier();
     let stream = futures::stream::unfold(
-        EventStreamState::new(state, query.last_known_revision),
+        EventStreamState::new(
+            state,
+            query.last_known_revision,
+            query
+                .batch_size
+                .unwrap_or(SSE_INITIAL_BATCH_DEFAULT)
+                .clamp(1, SSE_INITIAL_BATCH_MAX),
+            change_notify,
+        ),
         |mut stream_state| async move {
             loop {
-                stream_state.tick.tick().await;
-                let delta = torrent_delta_for_stream(&mut stream_state).await;
-                if delta.torrents.is_empty() && delta.removed.is_empty() {
-                    continue;
+                let now = Instant::now();
+                if now.duration_since(stream_state.last_polled_at) > Duration::from_secs(3) {
+                    stream_state.state.api_metrics.record_sse_lagged();
                 }
-
-                stream_state.seq = stream_state.seq.saturating_add(1);
-                let cursor = stream_state.registry_revision.unwrap_or_default();
-                let payload = serde_json::json!({
-                    "seq": stream_state.seq,
-                    "cursor": cursor,
-                    "torrents": delta.torrents,
-                    "removed": delta.removed,
-                });
-                stream_state.state.api_metrics.record_sse_event();
-                stream_state
-                    .state
-                    .api_metrics
-                    .record_estimated_response_bytes(payload.to_string().len() as u64);
-                let event = Event::default()
-                    .event("torrent_delta")
-                    .id(cursor.to_string())
-                    .json_data(payload)
-                    .expect("torrent delta serializes");
-                return Some((Ok(event), stream_state));
+                if now.duration_since(stream_state.last_polled_at) > SSE_SLOW_CLIENT_RESYNC_AFTER {
+                    // A stalled HTTP consumer must not make this stream walk
+                    // an arbitrarily long journal when it eventually polls
+                    // again. Coalesce the missed history into bounded
+                    // snapshot chunks instead.
+                    stream_state.registry_revision = None;
+                    stream_state.initial_snapshot = None;
+                    stream_state.initial_snapshot_offset = 0;
+                    stream_state.state.api_metrics.record_sse_resync();
+                }
+                stream_state.last_polled_at = now;
+                // Register the wait before reading the journal. If a
+                // mutation races with the read, either the journal observes
+                // it or Notify retains a permit for this wait.
+                let change_notify = Arc::clone(&stream_state.change_notify);
+                let notified = change_notify.notified();
+                let delta = torrent_delta_for_stream(&mut stream_state).await;
+                if delta.snapshot || !delta.torrents.is_empty() || !delta.removed.is_empty() {
+                    stream_state.seq = stream_state.seq.saturating_add(1);
+                    let cursor = stream_state.registry_revision.unwrap_or_default();
+                    let payload = serde_json::json!({
+                        "seq": stream_state.seq,
+                        "cursor": cursor,
+                        "snapshot": delta.snapshot,
+                        "snapshot_complete": delta.snapshot_complete,
+                        "torrents": delta.torrents,
+                        "removed": delta.removed,
+                    });
+                    stream_state.state.api_metrics.record_sse_event();
+                    stream_state
+                        .state
+                        .api_metrics
+                        .record_estimated_response_bytes(payload.to_string().len() as u64);
+                    let event = Event::default()
+                        .event("torrent_delta")
+                        .id(cursor.to_string())
+                        .json_data(payload)
+                        .expect("torrent delta serializes");
+                    return Some((Ok(event), stream_state));
+                }
+                tokio::select! {
+                    _ = stream_state.tick.tick() => {}
+                    _ = notified => {}
+                }
             }
         },
     );
@@ -3448,6 +4175,10 @@ pub struct EventStreamQuery {
     /// bounded mutation journal allows reconnects without rescanning every
     /// torrent; an expired cursor triggers a one-time snapshot resync.
     pub last_known_revision: Option<u64>,
+    /// Maximum number of torrent summaries in each initial snapshot event.
+    /// Snapshot events retain one coherent registry revision and are emitted
+    /// in bounded chunks so a client cannot force one unbounded SSE payload.
+    pub batch_size: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3494,11 +4225,20 @@ pub async fn list_session_events(
         .await
     {
         Ok(events) => {
-            let events = events
+            match events
                 .into_iter()
-                .filter_map(session_event_response)
-                .collect::<Vec<_>>();
-            (StatusCode::OK, Json(events))
+                .map(session_event_response)
+                .collect::<Result<Vec<_>, String>>()
+            {
+                Ok(events) => (StatusCode::OK, Json(events)),
+                Err(error) => {
+                    tracing::warn!(component = "api", operation = "session_events_projection", result = "error", error = %error, "durable session event projection is corrupt");
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(Vec::<SessionEventResponse>::new()),
+                    )
+                }
+            }
         }
         Err(e) => {
             tracing::warn!(component = "api", operation = "session_events", result = "error", error = %e, "failed to list session events");
@@ -3510,16 +4250,25 @@ pub async fn list_session_events(
     }
 }
 
-fn session_event_response(row: rt_db::SessionEventRow) -> Option<SessionEventResponse> {
-    let payload = serde_json::from_str::<serde_json::Value>(&row.payload)
-        .unwrap_or_else(|_| serde_json::json!({}));
+fn session_event_parts(row: &rt_db::SessionEventRow) -> Result<(i64, serde_json::Value), String> {
+    let event_id = row
+        .event_id
+        .ok_or_else(|| "durable session event is missing its event id".to_owned())?;
+    let payload = serde_json::from_str::<serde_json::Value>(&row.payload).map_err(|error| {
+        format!("durable session event {event_id} has invalid JSON payload: {error}")
+    })?;
+    Ok((event_id, payload))
+}
+
+fn session_event_response(row: rt_db::SessionEventRow) -> Result<SessionEventResponse, String> {
+    let (id, payload) = session_event_parts(&row)?;
     let level = payload
         .get("level")
         .and_then(|value| value.as_str())
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| level_from_kind(&row.kind).to_owned());
-    Some(SessionEventResponse {
-        id: row.event_id.unwrap_or_default(),
+    Ok(SessionEventResponse {
+        id,
         timestamp: row.occurred_at,
         torrent: row.info_hash,
         kind: row.kind,
@@ -3545,17 +4294,32 @@ struct EventStreamState {
     registry_revision: Option<u64>,
     seq: u64,
     tick: tokio::time::Interval,
+    last_polled_at: Instant,
+    change_notify: Arc<tokio::sync::Notify>,
+    initial_snapshot: Option<crate::state::TorrentSnapshot>,
+    initial_snapshot_offset: usize,
+    initial_batch_size: usize,
     _client_guard: ApiSseClientGuard,
 }
 
 impl EventStreamState {
-    fn new(state: AppState, registry_revision: Option<u64>) -> Self {
+    fn new(
+        state: AppState,
+        registry_revision: Option<u64>,
+        initial_batch_size: usize,
+        change_notify: Arc<tokio::sync::Notify>,
+    ) -> Self {
         let client_guard = state.api_metrics.register_sse_client();
         EventStreamState {
             state,
             registry_revision,
             seq: 0,
             tick: tokio::time::interval(Duration::from_secs(1)),
+            last_polled_at: Instant::now(),
+            change_notify,
+            initial_snapshot: None,
+            initial_snapshot_offset: 0,
+            initial_batch_size: initial_batch_size.clamp(1, SSE_INITIAL_BATCH_MAX),
             _client_guard: client_guard,
         }
     }
@@ -3564,29 +4328,51 @@ impl EventStreamState {
 struct TorrentDelta {
     torrents: Vec<TorrentSummary>,
     removed: Vec<String>,
+    snapshot: bool,
+    snapshot_complete: bool,
 }
 
 async fn torrent_delta_for_stream(stream_state: &mut EventStreamState) -> TorrentDelta {
     loop {
+        if let Some(snapshot) = stream_state.initial_snapshot.as_ref() {
+            let start = stream_state.initial_snapshot_offset;
+            let end = start
+                .saturating_add(stream_state.initial_batch_size)
+                .min(snapshot.torrents.len());
+            let torrents = snapshot
+                .torrents
+                .range(start, end)
+                .map(|item| item.summary.clone())
+                .collect::<Vec<_>>();
+            let snapshot_complete = end == snapshot.torrents.len();
+            stream_state.initial_snapshot_offset = end;
+            if snapshot_complete {
+                stream_state.initial_snapshot = None;
+            }
+            return TorrentDelta {
+                torrents,
+                removed: Vec::new(),
+                snapshot: true,
+                snapshot_complete,
+            };
+        }
+
         let Some(last_revision) = stream_state.registry_revision else {
             let Ok(snapshot) = stream_state.state.torrent_snapshot(None).await else {
                 return TorrentDelta {
                     torrents: Vec::new(),
                     removed: Vec::new(),
+                    snapshot: false,
+                    snapshot_complete: false,
                 };
             };
             stream_state.registry_revision = Some(snapshot.revision);
-            return TorrentDelta {
-                torrents: snapshot
-                    .torrents
-                    .iter()
-                    .map(|item| item.summary.clone())
-                    .collect(),
-                removed: Vec::new(),
-            };
+            stream_state.initial_snapshot = Some(snapshot);
+            stream_state.initial_snapshot_offset = 0;
+            continue;
         };
 
-        let (current_revision, changes) = {
+        let (current_revision, torrents, removed) = {
             let registry = stream_state.state.registry.read().await;
             let current_revision = registry.revision();
             let Some(changes) = registry.changes_since(last_revision) else {
@@ -3594,38 +4380,53 @@ async fn torrent_delta_for_stream(stream_state: &mut EventStreamState) -> Torren
                 stream_state.registry_revision = None;
                 continue;
             };
-            (current_revision, changes)
-        };
-        if changes.is_empty() {
-            return TorrentDelta {
-                torrents: Vec::new(),
-                removed: Vec::new(),
-            };
-        }
-
-        let mut changed = BTreeSet::new();
-        let mut removed = BTreeSet::new();
-        for change in changes {
-            if change.removed {
-                changed.remove(&change.info_hash);
-                removed.insert(change.info_hash);
-            } else {
-                removed.remove(&change.info_hash);
-                changed.insert(change.info_hash);
+            if changes.len() > SSE_DELTA_MAX_ENTRIES {
+                stream_state.state.api_metrics.record_sse_resync();
+                stream_state.registry_revision = None;
+                continue;
             }
-        }
+            if changes.is_empty() {
+                return TorrentDelta {
+                    torrents: Vec::new(),
+                    removed: Vec::new(),
+                    snapshot: false,
+                    snapshot_complete: false,
+                };
+            }
 
-        let registry = stream_state.state.registry.read().await;
-        let torrents = changed
-            .into_iter()
-            .filter_map(|hash| registry.get(&hash).map(torrent_summary))
-            .collect::<Vec<_>>();
-        let removed = removed
-            .into_iter()
-            .filter(|hash| registry.get(hash).is_none())
-            .collect::<Vec<_>>();
+            // Resolve the final entry state while holding the same read lock
+            // used to obtain the journal. This keeps the payload and cursor
+            // on one coherent registry generation; a later mutation is left
+            // for the next delta instead of being mislabeled as this one.
+            let mut changed = BTreeSet::new();
+            let mut removed = BTreeSet::new();
+            for change in changes {
+                if change.removed {
+                    changed.remove(&change.info_hash);
+                    removed.insert(change.info_hash);
+                } else {
+                    removed.remove(&change.info_hash);
+                    changed.insert(change.info_hash);
+                }
+            }
+
+            let torrents = changed
+                .into_iter()
+                .filter_map(|hash| registry.get(&hash).map(|entry| torrent_summary(&entry)))
+                .collect::<Vec<_>>();
+            let removed = removed
+                .into_iter()
+                .filter(|hash| registry.get(hash).is_none())
+                .collect::<Vec<_>>();
+            (current_revision, torrents, removed)
+        };
         stream_state.registry_revision = Some(current_revision);
-        return TorrentDelta { torrents, removed };
+        return TorrentDelta {
+            torrents,
+            removed,
+            snapshot: false,
+            snapshot_complete: false,
+        };
     }
 }
 
@@ -3670,12 +4471,21 @@ fn estimate_torrent_detail_snapshot_bytes(
 
 #[cfg(test)]
 fn render_metrics(stats: &rt_engine::EngineStats) -> String {
-    render_metrics_with_api(stats, ApiRuntimeMetricsSnapshot::default())
+    render_metrics_with_options(stats, ApiRuntimeMetricsSnapshot::default(), false)
 }
 
+#[cfg(test)]
 fn render_metrics_with_api(
     stats: &rt_engine::EngineStats,
     api_metrics: ApiRuntimeMetricsSnapshot,
+) -> String {
+    render_metrics_with_options(stats, api_metrics, false)
+}
+
+fn render_metrics_with_options(
+    stats: &rt_engine::EngineStats,
+    api_metrics: ApiRuntimeMetricsSnapshot,
+    include_torrent_ids: bool,
 ) -> String {
     let mut out = String::new();
     metric(
@@ -3859,6 +4669,13 @@ fn render_metrics_with_api(
         "gauge",
         "Configured blocking storage worker count",
         stats.storage_workers,
+    );
+    metric(
+        &mut out,
+        "torrentng_storage_workers_healthy",
+        "gauge",
+        "Storage-job supervisor health (1=healthy, 0=unhealthy)",
+        stats.storage_workers_healthy,
     );
     metric(
         &mut out,
@@ -4531,13 +5348,20 @@ fn render_metrics_with_api(
         }
     }
     for (rank, torrent) in stats.hot_torrent_memory_top.iter().enumerate() {
+        let hashed_info_hash;
+        let metric_info_hash: Cow<'_, str> = if include_torrent_ids {
+            Cow::Borrowed(torrent.info_hash.as_str())
+        } else {
+            hashed_info_hash = hash_metric_id(&torrent.info_hash);
+            Cow::Owned(hashed_info_hash)
+        };
         metric_with_two_labels(
             &mut out,
             "torrentng_hot_torrent_memory_estimated_bytes",
             "gauge",
             "Estimated process-owned memory attributed to top active torrents",
             ("rank", &(rank + 1).to_string()),
-            ("info_hash", &torrent.info_hash),
+            ("info_hash", metric_info_hash.as_ref()),
             torrent.estimated_bytes,
         );
         metric_with_two_labels(
@@ -4546,7 +5370,7 @@ fn render_metrics_with_api(
             "gauge",
             "Piece assembly bytes attributed to top active torrents",
             ("rank", &(rank + 1).to_string()),
-            ("info_hash", &torrent.info_hash),
+            ("info_hash", metric_info_hash.as_ref()),
             torrent.piece_assembly_bytes,
         );
         metric_with_two_labels(
@@ -4555,7 +5379,7 @@ fn render_metrics_with_api(
             "gauge",
             "Peer rx/tx buffer bytes attributed to top active torrents",
             ("rank", &(rank + 1).to_string()),
-            ("info_hash", &torrent.info_hash),
+            ("info_hash", metric_info_hash.as_ref()),
             torrent.peer_buffer_bytes,
         );
         metric_with_two_labels(
@@ -4564,7 +5388,7 @@ fn render_metrics_with_api(
             "gauge",
             "Tracker peer-cache bytes attributed to top active torrents",
             ("rank", &(rank + 1).to_string()),
-            ("info_hash", &torrent.info_hash),
+            ("info_hash", metric_info_hash.as_ref()),
             torrent.tracker_peer_bytes,
         );
         metric_with_two_labels(
@@ -4573,7 +5397,7 @@ fn render_metrics_with_api(
             "gauge",
             "Peer command queue bytes attributed to top active torrents",
             ("rank", &(rank + 1).to_string()),
-            ("info_hash", &torrent.info_hash),
+            ("info_hash", metric_info_hash.as_ref()),
             torrent.peer_command_queue_bytes,
         );
         metric_with_two_labels(
@@ -4582,7 +5406,7 @@ fn render_metrics_with_api(
             "gauge",
             "Per-torrent storage cache bytes attributed to top active torrents",
             ("rank", &(rank + 1).to_string()),
-            ("info_hash", &torrent.info_hash),
+            ("info_hash", metric_info_hash.as_ref()),
             torrent.storage_cache_bytes,
         );
     }
@@ -4805,6 +5629,13 @@ fn render_metrics_with_api(
     );
     metric(
         &mut out,
+        "torrentng_api_snapshot_incremental_updates_total",
+        "counter",
+        "Immutable API snapshot generations advanced from the registry mutation journal",
+        api_metrics.snapshot_incremental_updates_total,
+    );
+    metric(
+        &mut out,
         "torrentng_api_snapshot_expired_total",
         "counter",
         "API pagination cursors rejected because their immutable snapshot expired",
@@ -4826,6 +5657,20 @@ fn render_metrics_with_api(
     );
     metric(
         &mut out,
+        "torrentng_api_sse_lagged_total",
+        "counter",
+        "SSE stream polls delayed by more than three seconds",
+        api_metrics.sse_lagged_total,
+    );
+    metric(
+        &mut out,
+        "torrentng_api_sse_disconnects_total",
+        "counter",
+        "SSE stream instances dropped before the client connection remained active",
+        api_metrics.sse_disconnects_total,
+    );
+    metric(
+        &mut out,
         "torrentng_api_sse_clients",
         "gauge",
         "Currently active native SSE clients",
@@ -4838,7 +5683,46 @@ fn render_metrics_with_api(
         "Estimated bytes emitted by bounded list and SSE responses",
         api_metrics.response_bytes_estimated_total,
     );
+    let egress_metrics = rt_engine::egress_policy_metrics();
+    metric(
+        &mut out,
+        "torrentng_egress_scheme_denied_total",
+        "counter",
+        "Outbound tracker/webseed URLs rejected by scheme policy",
+        egress_metrics.scheme_denied_total,
+    );
+    metric(
+        &mut out,
+        "torrentng_egress_address_denied_total",
+        "counter",
+        "Outbound tracker/webseed addresses rejected by address policy",
+        egress_metrics.address_denied_total,
+    );
+    metric(
+        &mut out,
+        "torrentng_egress_resolution_failed_total",
+        "counter",
+        "Outbound tracker/webseed DNS or address resolution failures",
+        egress_metrics.resolution_failed_total,
+    );
+    metric(
+        &mut out,
+        "torrentng_egress_client_failed_total",
+        "counter",
+        "Outbound tracker/webseed HTTP client construction failures",
+        egress_metrics.client_failed_total,
+    );
     out
+}
+
+fn hash_metric_id(info_hash: &str) -> String {
+    let digest = Sha256::digest(info_hash.as_bytes());
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
 }
 
 fn metric(out: &mut String, name: &str, kind: &str, help: &str, value: u64) {
@@ -5084,20 +5968,33 @@ fn latency_histogram_by_device(
 
 async fn resolve_hashes(state: &AppState, hashes: &[String]) -> Vec<String> {
     let reg = state.registry.read().await;
-    if hashes.iter().any(|hash| hash == "all") {
+    if hashes.len() == 1 && hashes[0].trim().eq_ignore_ascii_case("all") {
         return reg.iter().map(|entry| entry.info_hash.clone()).collect();
     }
+    let canonical = reg
+        .iter()
+        .map(|entry| {
+            (
+                entry.info_hash.to_ascii_lowercase(),
+                entry.info_hash.clone(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
     hashes
         .iter()
         .map(|hash| hash.trim())
         .filter(|hash| !hash.is_empty())
-        .filter(|hash| reg.get(hash).is_some())
-        .map(ToOwned::to_owned)
+        .map(|hash| {
+            canonical
+                .get(&hash.to_ascii_lowercase())
+                .cloned()
+                .unwrap_or_else(|| hash.to_ascii_lowercase())
+        })
         .collect()
 }
 
 async fn preview_hashes(state: &AppState, hashes: &[String]) -> Vec<String> {
-    if hashes.iter().any(|hash| hash == "all") {
+    if hashes.len() == 1 && hashes[0].trim().eq_ignore_ascii_case("all") {
         return state
             .registry
             .read()
@@ -5114,7 +6011,10 @@ async fn preview_hashes(state: &AppState, hashes: &[String]) -> Vec<String> {
         .collect()
 }
 
-async fn matching_hashes_for_json_rule(state: &AppState, rule: &serde_json::Value) -> Vec<String> {
+async fn matching_hashes_for_json_rule(
+    state: &AppState,
+    rule: &serde_json::Value,
+) -> Result<Vec<String>, String> {
     let category = rule
         .get("category")
         .and_then(serde_json::Value::as_str)
@@ -5125,38 +6025,121 @@ async fn matching_hashes_for_json_rule(state: &AppState, rule: &serde_json::Valu
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty());
+    let tracker_hashes = if let Some(tracker) = tracker {
+        let Some(engine) = &state.engine else {
+            return Err("native engine is required for tracker matching".to_owned());
+        };
+        Some(
+            engine
+                .torrent_hashes_by_tracker(tracker.to_owned())
+                .await?
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+        )
+    } else {
+        None
+    };
     let reg = state.registry.read().await;
-    reg.iter()
+    Ok(reg
+        .iter()
         .filter(|entry| {
             category
                 .map(|category| entry.category.as_deref() == Some(category))
                 .unwrap_or(true)
         })
         .filter(|entry| {
-            tracker
-                .map(|tracker| {
-                    entry
-                        .category
-                        .as_deref()
-                        .map(|value| value.contains(tracker))
-                        .unwrap_or(false)
-                })
+            tracker_hashes
+                .as_ref()
+                .map(|hashes| hashes.contains(&entry.info_hash))
                 .unwrap_or(true)
         })
         .map(|entry| entry.info_hash.clone())
-        .collect()
+        .collect())
+}
+
+fn ratio_group_limit(rule: &serde_json::Value) -> Result<Option<f64>, String> {
+    let Some(value) = rule.get("ratio_limit") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let limit = value
+        .as_f64()
+        .ok_or_else(|| "ratio_limit must be a number or null".to_owned())?;
+    if !limit.is_finite() {
+        return Err("ratio_limit must be finite".to_owned());
+    }
+    if limit < 0.0 && (limit - (-1.0)).abs() > f64::EPSILON {
+        return Err("ratio_limit must be -1 or non-negative".to_owned());
+    }
+    Ok((limit >= 0.0).then_some(limit))
+}
+
+fn seeding_time_group_limit(rule: &serde_json::Value) -> Result<Option<i64>, String> {
+    let Some(value) = rule.get("seeding_time_limit") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let limit = value
+        .as_i64()
+        .ok_or_else(|| "seeding_time_limit must be an integer or null".to_owned())?;
+    if limit < -1 {
+        return Err("seeding_time_limit must be -1 or non-negative".to_owned());
+    }
+    Ok((limit >= 0).then_some(limit))
+}
+
+async fn apply_ratio_group_action(
+    state: &AppState,
+    rule: &serde_json::Value,
+    hashes: &[String],
+) -> (Vec<String>, Vec<String>) {
+    let Some(engine) = &state.engine else {
+        return (
+            Vec::new(),
+            vec!["native engine is required to apply ratio groups".to_owned()],
+        );
+    };
+    let ratio_limit = match ratio_group_limit(rule) {
+        Ok(limit) => limit,
+        Err(error) => return (Vec::new(), vec![error]),
+    };
+    let seed_idle_limit = match seeding_time_group_limit(rule) {
+        Ok(limit) => limit,
+        Err(error) => return (Vec::new(), vec![error]),
+    };
+    let mut applied = Vec::new();
+    let mut errors = Vec::new();
+    for hash in hashes {
+        let result = async {
+            let mut limits = engine.torrent_limits(hash.clone()).await?;
+            limits.seed_ratio_limit = ratio_limit;
+            limits.seed_idle_limit = seed_idle_limit;
+            engine.update_torrent_limits(hash.clone(), limits).await
+        }
+        .await;
+        match result {
+            Ok(()) => applied.push(hash.clone()),
+            Err(error) => errors.push(format!("{hash}: {error}")),
+        }
+    }
+    (applied, errors)
 }
 
 async fn apply_json_rule_action(
     state: &AppState,
     rule: &serde_json::Value,
     hashes: &[String],
-) -> Vec<String> {
+) -> (Vec<String>, Vec<String>) {
     let action = rule
         .get("action")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("set_category");
     let mut applied = Vec::new();
+    let mut errors = Vec::new();
     for hash in hashes {
         let result = match action {
             "set_category" => {
@@ -5164,13 +6147,15 @@ async fn apply_json_rule_action(
                     .get("category")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_owned);
-                if let Some(engine) = &state.engine {
-                    engine
-                        .update_torrent_labels(hash.clone(), Some(category), Vec::new(), Vec::new())
-                        .await
-                } else {
-                    set_registry_category(state, hash, category).await
-                }
+                let Some(engine) = &state.engine else {
+                    return (
+                        Vec::new(),
+                        vec!["native engine is not available".to_owned()],
+                    );
+                };
+                engine
+                    .update_torrent_labels(hash.clone(), Some(category), Vec::new(), Vec::new())
+                    .await
             }
             "set_location" => {
                 let save_path = rule
@@ -5188,17 +6173,107 @@ async fn apply_json_rule_action(
                         None => Err("target_path is required".to_owned()),
                     }
                 } else {
-                    set_registry_location(state, hash, save_path).await
+                    Err("native engine is not available".to_owned())
                 }
             }
-            "webhook" | "script" => Ok(()),
-            _ => Ok(()),
+            "webhook" => Err(
+                "native engine workflows do not execute webhooks; use the sidecar workflow route"
+                    .to_owned(),
+            ),
+            "script" => Err(
+                "native engine workflows do not execute scripts; use the sidecar workflow route"
+                    .to_owned(),
+            ),
+            _ => Err(format!("unsupported workflow action: {action}")),
         };
-        if result.is_ok() {
-            applied.push(hash.clone());
+        match result {
+            Ok(()) => applied.push(hash.clone()),
+            Err(error) => errors.push(format!("{hash}: {error}")),
         }
     }
-    applied
+    (applied, errors)
+}
+
+async fn apply_rss_rule_matches(
+    state: &AppState,
+    req: &RssSampleRequest,
+    matches: &[serde_json::Value],
+) -> (Vec<String>, Vec<String>) {
+    let Some(link) = req
+        .link
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return (
+            Vec::new(),
+            vec!["link is required for RSS apply".to_owned()],
+        );
+    };
+    let Some(engine) = &state.engine else {
+        return (
+            Vec::new(),
+            vec!["native engine is not available".to_owned()],
+        );
+    };
+    if !link
+        .get(.."magnet:".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("magnet:"))
+    {
+        return (
+            Vec::new(),
+            vec![
+                "native RSS apply supports magnet links only; HTTP torrent downloads are a sidecar capability"
+                    .to_owned(),
+            ],
+        );
+    }
+    let magnet = match parse_magnet(link) {
+        Ok(magnet) => magnet,
+        Err(error) => return (Vec::new(), vec![format!("invalid magnet link: {error}")]),
+    };
+    let mut applied = Vec::new();
+    let mut errors = Vec::new();
+    for rule in matches {
+        let rule_name = rule
+            .get("rule_name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("rss rule")
+            .to_owned();
+        let category = rule
+            .get("category")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let save_path = rule
+            .get("save_path")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from);
+        let tags = rule
+            .get("tags")
+            .and_then(|value| {
+                value.as_array().map(|values| {
+                    values
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+            })
+            .unwrap_or_default();
+        let paused = !rule
+            .get("start")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+        match engine
+            .add_magnet_with_labels(magnet.clone(), save_path, paused, category, tags)
+            .await
+        {
+            Ok(_) => applied.push(rule_name),
+            Err(error) => errors.push(format!("{rule_name}: {error}")),
+        }
+    }
+    (applied, errors)
 }
 
 async fn run_bulk_action(
@@ -5259,8 +6334,18 @@ async fn run_bulk_action(
         "start" => transition_registry_torrent(state, hash, TorrentState::Downloading).await,
         "stop" => transition_registry_torrent(state, hash, TorrentState::Paused).await,
         "recheck" => transition_registry_torrent(state, hash, TorrentState::Checking).await,
-        "reannounce" => Ok(()),
-        "set-category" => set_registry_category(state, hash, req.category.clone()).await,
+        "reannounce" => Err("native engine is not available".to_owned()),
+        "set-category" => {
+            set_registry_category(
+                state,
+                hash,
+                req.category
+                    .clone()
+                    .map(|category| category.trim().to_owned())
+                    .filter(|category| !category.is_empty()),
+            )
+            .await
+        }
         "set-location" => set_registry_location(state, hash, req.save_path.clone()).await,
         "set-tags" => set_registry_tags(state, hash, req.tags.clone().unwrap_or_default()).await,
         _ => Err(format!("unsupported bulk action {action}")),
@@ -5273,7 +6358,7 @@ async fn transition_registry_torrent(
     target: TorrentState,
 ) -> Result<(), String> {
     let mut reg = state.registry.write().await;
-    let entry = reg
+    let mut entry = reg
         .get_mut(hash)
         .ok_or_else(|| "torrent not found".to_owned())?;
     entry.transition(target).map_err(|e| e.to_string())
@@ -5285,7 +6370,7 @@ async fn set_registry_category(
     category: Option<String>,
 ) -> Result<(), String> {
     let mut reg = state.registry.write().await;
-    let entry = reg
+    let mut entry = reg
         .get_mut(hash)
         .ok_or_else(|| "torrent not found".to_owned())?;
     entry.category = category;
@@ -5301,7 +6386,7 @@ async fn set_registry_location(
         return Err("save_path is required".to_owned());
     };
     let mut reg = state.registry.write().await;
-    let entry = reg
+    let mut entry = reg
         .get_mut(hash)
         .ok_or_else(|| "torrent not found".to_owned())?;
     entry.save_path = save_path.display().to_string();
@@ -5310,7 +6395,7 @@ async fn set_registry_location(
 
 async fn set_registry_tags(state: &AppState, hash: &str, tags: Vec<String>) -> Result<(), String> {
     let mut reg = state.registry.write().await;
-    let entry = reg
+    let mut entry = reg
         .get_mut(hash)
         .ok_or_else(|| "torrent not found".to_owned())?;
     entry.tags = normalize_tags(tags);
@@ -5324,43 +6409,14 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
-fn increment_json_usize(value: &mut serde_json::Value, field: &str) {
-    let current = value
-        .get(field)
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or_default();
-    if let Some(object) = value.as_object_mut() {
-        object.insert(field.to_owned(), serde_json::json!(current + 1));
-    }
-}
-
-fn infer_media_type(name: &str) -> &'static str {
-    let lower = name.to_ascii_lowercase();
-    if [".mkv", ".mp4", ".avi", ".mov", ".webm"]
-        .iter()
-        .any(|suffix| lower.ends_with(suffix))
-    {
-        "video"
-    } else if [".flac", ".mp3", ".ogg", ".m4a", ".wav"]
-        .iter()
-        .any(|suffix| lower.ends_with(suffix))
-    {
-        "audio"
-    } else if [".zip", ".rar", ".7z", ".tar", ".gz"]
-        .iter()
-        .any(|suffix| lower.ends_with(suffix))
-    {
-        "archive"
-    } else {
-        "other"
-    }
-}
-
-async fn rss_rule_matches(state: &AppState, req: &RssSampleRequest) -> Vec<serde_json::Value> {
-    let rules = state.rss_rules.read().await;
+async fn rss_rule_matches(
+    state: &AppState,
+    req: &RssSampleRequest,
+) -> Result<Vec<serde_json::Value>, String> {
+    let rules = load_json_map::<RssRulesStore>(state).await?;
     let haystack =
         format!("{} {}", req.title, req.link.as_deref().unwrap_or_default()).to_ascii_lowercase();
-    rules
+    Ok(rules
         .values()
         .filter_map(|rule| {
             if !rule
@@ -5419,7 +6475,7 @@ async fn rss_rule_matches(state: &AppState, req: &RssSampleRequest) -> Vec<serde
                 "start": rule.get("start").and_then(serde_json::Value::as_bool).unwrap_or(true),
             }))
         })
-        .collect()
+        .collect())
 }
 
 fn slug_id(value: &str) -> String {
@@ -5479,28 +6535,46 @@ async fn control_torrent(
         };
         return match result {
             Ok(()) => StatusCode::NO_CONTENT.into_response(),
-            Err(_) => not_found(info_hash),
+            Err(error) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::to_value(ApiError::bad_request(error)).unwrap()),
+            )
+                .into_response(),
         };
     }
 
     let mut reg = state.registry.write().await;
-    if let Some(entry) = reg.get_mut(&info_hash) {
-        match control {
-            TorrentControl::Pause => {
-                let _ = entry.transition(TorrentState::Paused);
+    let response = if let Some(mut entry) = reg.get_mut(&info_hash) {
+        let result = match control {
+            TorrentControl::Pause => entry.transition(TorrentState::Paused),
+            TorrentControl::Resume => entry.transition(TorrentState::Downloading),
+            TorrentControl::Recheck => entry.transition(TorrentState::Checking),
+            TorrentControl::Reannounce => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(
+                        serde_json::to_value(ApiError::internal(
+                            "native engine is not available".to_owned(),
+                        ))
+                        .unwrap(),
+                    ),
+                )
+                    .into_response();
             }
-            TorrentControl::Resume => {
-                let _ = entry.transition(TorrentState::Downloading);
-            }
-            TorrentControl::Recheck => {
-                let _ = entry.transition(TorrentState::Checking);
-            }
-            TorrentControl::Reannounce => {}
+        };
+        match result {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(error) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::to_value(ApiError::bad_request(error.to_string())).unwrap()),
+            )
+                .into_response(),
         }
-        StatusCode::NO_CONTENT.into_response()
     } else {
         not_found(info_hash)
-    }
+    };
+    drop(reg);
+    response
 }
 
 fn require_mutation_auth(
@@ -5704,6 +6778,21 @@ mod tests {
         assert_eq!(projected.level, "warn");
         assert_eq!(projected.kind, "tracker_warning");
         assert_eq!(projected.payload["tracker"], "udp://tracker");
+    }
+
+    #[test]
+    fn session_event_response_rejects_corrupt_durable_payload() {
+        let event = rt_db::SessionEventRow {
+            event_id: Some(13),
+            occurred_at: 1_700_000_001,
+            info_hash: Some("b".repeat(40)),
+            kind: "torrent_state_changed".to_owned(),
+            message: None,
+            payload: "{not-json}".to_owned(),
+        };
+
+        let error = session_event_response(event).unwrap_err();
+        assert!(error.contains("invalid JSON payload"));
     }
 
     #[test]
@@ -5928,6 +7017,10 @@ mod tests {
         assert_eq!(body["engine"]["track1_sidecar_required"], false);
         assert_eq!(body["engine"]["subsystems"]["engine"]["alive"], false);
         assert_eq!(
+            body["engine"]["subsystems"]["peer_listener"]["healthy"],
+            false
+        );
+        assert_eq!(
             body["engine"]["subsystems"]["storage_workers"]["healthy"],
             false
         );
@@ -5955,6 +7048,10 @@ mod tests {
         assert_eq!(capabilities["jobs"]["storage_plan_controls"], true);
         assert_eq!(capabilities["storage"]["v2_file_root_verify"], true);
         assert_eq!(capabilities["networking"]["dht"], true);
+        assert_eq!(
+            capabilities["networking"]["dht_address_families"],
+            serde_json::json!(["ipv4"])
+        );
         assert_eq!(capabilities["networking"]["utp_packet_codec"], true);
         assert_eq!(capabilities["networking"]["utp_udp_stream"], true);
         assert_eq!(capabilities["networking"]["utp_outgoing_opt_in"], true);
@@ -5973,6 +7070,41 @@ mod tests {
         assert_eq!(capabilities["operations"]["prometheus_metrics"], true);
         assert_eq!(capabilities["operations"]["bounded_shutdown"], true);
         assert_eq!(capabilities["operations"]["scale_certification"], false);
+        assert!(capabilities["assurance"]["implemented"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "idempotent_http_mutations"));
+        assert_eq!(capabilities["assurance"]["enabled"]["utp_transport"], true);
+        assert_eq!(
+            capabilities["assurance"]["certified"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            capabilities["assurance"]["evidence"]["release_artifact_current"],
+            false
+        );
+    }
+
+    #[test]
+    fn native_webui_capabilities_match_mounted_routes() {
+        let capabilities = native_webui_backend_capabilities();
+
+        // These are backed by the mounted qBittorrent/native handlers. The
+        // old manifest reported false for four routes that were already
+        // implemented, making the WebUI hide working operations.
+        for field in [
+            "supports_torrent_export",
+            "supports_webseed_reads",
+            "supports_peer_ban",
+            "supports_file_rename",
+        ] {
+            assert_eq!(capabilities[field], true, "{field} must match its route");
+        }
+        // The remaining force-start/automatic-management mutations are
+        // intentionally rejected by the native engine until they have real
+        // scheduler semantics.
+        assert_eq!(capabilities["supports_mode_flags"], false);
     }
 
     #[test]
@@ -6051,6 +7183,7 @@ mod tests {
             storage_jobs_queue_depth: 10,
             storage_jobs_capacity: 11,
             storage_workers: 12,
+            storage_workers_healthy: 13,
             trackers_error: 4,
             dht_routing_nodes: 45,
             dht_announced_peer_sets: 46,
@@ -6168,6 +7301,7 @@ mod tests {
         assert!(rendered.contains("torrentng_storage_jobs_queue_depth 10"));
         assert!(rendered.contains("torrentng_storage_jobs_capacity 11"));
         assert!(rendered.contains("torrentng_storage_workers 12"));
+        assert!(rendered.contains("torrentng_storage_workers_healthy 13"));
         assert!(rendered.contains("torrentng_trackers_error 4"));
         assert!(rendered.contains("torrentng_dht_routing_nodes 45"));
         assert!(rendered.contains("torrentng_dht_announced_peer_sets 46"));
@@ -6194,23 +7328,30 @@ mod tests {
         assert!(rendered.contains("torrentng_peer_command_queue_full_total 53"));
         assert!(rendered.contains("torrentng_tracker_peer_cache_entries 43"));
         assert!(rendered.contains("torrentng_tracker_peer_cache_drops_total 44"));
-        assert!(rendered.contains(
+        let hashed_id = hash_metric_id("abc\"def\\ghi\nj");
+        assert!(!rendered.contains("abc\\\"def\\\\ghi\\nj"));
+        assert!(rendered.contains(&format!(
+            "torrentng_hot_torrent_memory_estimated_bytes{{rank=\"1\",info_hash=\"{hashed_id}\"}} 54"
+        )));
+        assert!(rendered.contains(&format!(
+            "torrentng_hot_torrent_piece_assembly_bytes{{rank=\"1\",info_hash=\"{hashed_id}\"}} 55"
+        )));
+        assert!(rendered.contains(&format!(
+            "torrentng_hot_torrent_peer_buffer_bytes{{rank=\"1\",info_hash=\"{hashed_id}\"}} 56"
+        )));
+        assert!(rendered.contains(&format!(
+            "torrentng_hot_torrent_tracker_peer_bytes{{rank=\"1\",info_hash=\"{hashed_id}\"}} 57"
+        )));
+        assert!(rendered.contains(&format!(
+            "torrentng_hot_torrent_peer_command_queue_bytes{{rank=\"1\",info_hash=\"{hashed_id}\"}} 58"
+        )));
+        assert!(rendered.contains(&format!(
+            "torrentng_hot_torrent_storage_cache_bytes{{rank=\"1\",info_hash=\"{hashed_id}\"}} 59"
+        )));
+        let opted_in =
+            render_metrics_with_options(&stats, ApiRuntimeMetricsSnapshot::default(), true);
+        assert!(opted_in.contains(
             "torrentng_hot_torrent_memory_estimated_bytes{rank=\"1\",info_hash=\"abc\\\"def\\\\ghi\\nj\"} 54"
-        ));
-        assert!(rendered.contains(
-            "torrentng_hot_torrent_piece_assembly_bytes{rank=\"1\",info_hash=\"abc\\\"def\\\\ghi\\nj\"} 55"
-        ));
-        assert!(rendered.contains(
-            "torrentng_hot_torrent_peer_buffer_bytes{rank=\"1\",info_hash=\"abc\\\"def\\\\ghi\\nj\"} 56"
-        ));
-        assert!(rendered.contains(
-            "torrentng_hot_torrent_tracker_peer_bytes{rank=\"1\",info_hash=\"abc\\\"def\\\\ghi\\nj\"} 57"
-        ));
-        assert!(rendered.contains(
-            "torrentng_hot_torrent_peer_command_queue_bytes{rank=\"1\",info_hash=\"abc\\\"def\\\\ghi\\nj\"} 58"
-        ));
-        assert!(rendered.contains(
-            "torrentng_hot_torrent_storage_cache_bytes{rank=\"1\",info_hash=\"abc\\\"def\\\\ghi\\nj\"} 59"
         ));
         assert!(
             rendered.contains("torrentng_storage_read_ops_by_class_total{class=\"peer_read\"} 10")
@@ -6326,6 +7467,7 @@ mod tests {
 
         let api_metrics = rt_api_model::ApiRuntimeMetrics::new();
         api_metrics.record_snapshot_refresh();
+        api_metrics.record_snapshot_incremental_update();
         api_metrics.record_snapshot_expired();
         api_metrics.record_sse_resync();
         api_metrics.record_sse_event();
@@ -6333,10 +7475,12 @@ mod tests {
         let client = api_metrics.register_sse_client();
         let api_rendered = render_metrics_with_api(&stats, api_metrics.snapshot());
         assert!(api_rendered.contains("torrentng_api_snapshot_refreshes_total 1"));
+        assert!(api_rendered.contains("torrentng_api_snapshot_incremental_updates_total 1"));
         assert!(api_rendered.contains("torrentng_api_snapshot_expired_total 1"));
         assert!(api_rendered.contains("torrentng_api_sse_resyncs_total 1"));
         assert!(api_rendered.contains("torrentng_api_sse_events_total 1"));
         assert!(api_rendered.contains("torrentng_api_sse_clients 1"));
+        assert!(api_rendered.contains("torrentng_api_sse_disconnects_total 0"));
         assert!(api_rendered.contains("torrentng_api_response_bytes_estimated_total 123"));
         drop(client);
     }
@@ -6514,7 +7658,8 @@ mod tests {
 
         {
             let mut registry = state.registry.write().await;
-            registry.get_mut(&"a".repeat(40)).unwrap().name = "zulu".to_owned();
+            let mut entry = registry.get_mut(&"a".repeat(40)).unwrap();
+            entry.name = "zulu".to_owned();
         }
 
         let second = app
@@ -6654,12 +7799,12 @@ mod tests {
             (
                 "GET",
                 format!("/api/v1/torrents/{hash}/files"),
-                StatusCode::OK,
+                StatusCode::SERVICE_UNAVAILABLE,
             ),
             (
                 "GET",
                 format!("/api/v1/torrents/{hash}/trackers"),
-                StatusCode::OK,
+                StatusCode::SERVICE_UNAVAILABLE,
             ),
             (
                 "GET",
@@ -6688,6 +7833,72 @@ mod tests {
                 .unwrap();
             assert_eq!(resp.status(), expected, "{method}");
         }
+    }
+
+    #[tokio::test]
+    async fn native_rtorrent_compatibility_routes_fail_closed() {
+        let state = AppState::new();
+        let app = build_router(state);
+
+        let commands = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/engine/commands")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(commands.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = axum::body::to_bytes(commands.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "NOT_IMPLEMENTED");
+
+        let unsupported = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/engine/rtorrent-settings")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"settings":{"network.port":12345}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unsupported.status(), StatusCode::NOT_IMPLEMENTED);
+
+        let user_agent = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/engine/rtorrent-settings")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"settings":{"system.user_agent":"TorrentNG/test"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(user_agent.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let restart = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/engine/restart")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(restart.status(), StatusCode::NOT_IMPLEMENTED);
     }
 
     #[tokio::test]
@@ -6725,6 +7936,81 @@ mod tests {
             .and_then(|value| value.to_str().ok())
             .unwrap();
         assert!(cookie.starts_with("tng_session=secret%20token;"));
+    }
+
+    #[tokio::test]
+    async fn idempotency_key_replays_native_mutation_and_rejects_reuse() {
+        let state = AppState::new();
+        let hash = "c".repeat(40);
+        {
+            let mut registry = state.registry.write().await;
+            registry
+                .add(TorrentEntry::new(
+                    hash.clone(),
+                    "name".into(),
+                    "/data".into(),
+                ))
+                .unwrap();
+        }
+        let app = build_router(state.clone());
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/v1/torrents/{hash}/category"))
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "category-c")
+                    .body(Body::from(r#"{"category":"films"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::NO_CONTENT);
+
+        let replay = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/v1/torrents/{hash}/category"))
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "category-c")
+                    .body(Body::from(r#"{"category":"films"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            replay.headers().get("idempotency-replayed").unwrap(),
+            "true"
+        );
+        assert_eq!(
+            state
+                .registry
+                .read()
+                .await
+                .get(&hash)
+                .unwrap()
+                .category
+                .as_deref(),
+            Some("films")
+        );
+
+        let conflict = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/v1/torrents/{hash}/category"))
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "category-c")
+                    .body(Body::from(r#"{"category":"tv"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(conflict.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]
@@ -6875,7 +8161,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reannounce_torrent_found() {
+    async fn reannounce_torrent_without_engine_is_unavailable() {
         let (app, hash) = setup_app_with_torrent().await;
         let resp = app
             .oneshot(
@@ -6887,7 +8173,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
@@ -7045,7 +8331,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn patch_trackers_without_engine_accepts_existing_torrent() {
+    async fn patch_trackers_without_engine_reports_unavailable() {
         let (app, hash) = setup_app_with_torrent().await;
         let resp = app
             .oneshot(
@@ -7058,7 +8344,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
@@ -7075,11 +8361,14 @@ mod tests {
             .unwrap();
         }
 
-        let mut stream_state = EventStreamState::new(state.clone(), None);
+        let change_notify = state.registry.read().await.change_notifier();
+        let mut stream_state = EventStreamState::new(state.clone(), None, 500, change_notify);
         let first = torrent_delta_for_stream(&mut stream_state).await;
         assert_eq!(first.torrents.len(), 1);
         assert_eq!(first.torrents[0].info_hash, hash);
         assert!(first.removed.is_empty());
+        assert!(first.snapshot);
+        assert!(first.snapshot_complete);
 
         {
             let mut reg = state.registry.write().await;
@@ -7088,6 +8377,47 @@ mod tests {
         let second = torrent_delta_for_stream(&mut stream_state).await;
         assert!(second.torrents.is_empty());
         assert_eq!(second.removed, vec![hash]);
+        assert!(!second.snapshot);
+    }
+
+    #[tokio::test]
+    async fn torrent_delta_chunks_initial_snapshot_at_one_revision() {
+        let state = AppState::new();
+        let hashes = (0..3)
+            .map(|index| format!("{index:040x}"))
+            .collect::<Vec<_>>();
+        {
+            let mut reg = state.registry.write().await;
+            for hash in &hashes {
+                reg.add(TorrentEntry::new(
+                    hash.clone(),
+                    format!("{hash}.torrent"),
+                    "/data".into(),
+                ))
+                .unwrap();
+            }
+        }
+
+        let revision = state.registry.read().await.revision();
+        let change_notify = state.registry.read().await.change_notifier();
+        let mut stream_state = EventStreamState::new(state.clone(), None, 2, change_notify);
+
+        let first = torrent_delta_for_stream(&mut stream_state).await;
+        assert_eq!(first.torrents.len(), 2);
+        assert!(first.snapshot);
+        assert!(!first.snapshot_complete);
+        assert_eq!(stream_state.registry_revision, Some(revision));
+
+        let second = torrent_delta_for_stream(&mut stream_state).await;
+        assert_eq!(second.torrents.len(), 1);
+        assert!(second.snapshot);
+        assert!(second.snapshot_complete);
+        assert_eq!(stream_state.registry_revision, Some(revision));
+
+        let third = torrent_delta_for_stream(&mut stream_state).await;
+        assert!(third.torrents.is_empty());
+        assert!(third.removed.is_empty());
+        assert!(!third.snapshot);
     }
 
     #[test]
@@ -7166,5 +8496,80 @@ mod tests {
 
         assert!(rendered.contains("torrentng_test_metric{backend=\"pool\\\"a\\\\disk\\n1\"} 1"));
         assert!(!rendered.contains("pool\\\"a\\\\disk\\n1pool"));
+    }
+
+    #[test]
+    fn json_store_validation_rejects_malformed_executable_fields() {
+        let mut rss = JsonMap::new();
+        rss.insert(
+            "rule".to_owned(),
+            serde_json::json!({
+                "id": "rule",
+                "include": "ubuntu",
+                "tags": ["linux", 7]
+            }),
+        );
+        assert!(validate_json_map(&rss, "native.rss_rules", "rss_rule").is_err());
+
+        let mut ratio = JsonMap::new();
+        ratio.insert(
+            "group".to_owned(),
+            serde_json::json!({ "name": "group", "ratio_limit": "1.5" }),
+        );
+        assert!(validate_json_map(&ratio, "native.ratio_groups", "ratio_group").is_err());
+
+        let mut workflow = JsonMap::new();
+        workflow.insert(
+            "workflow".to_owned(),
+            serde_json::json!({ "id": "workflow", "enabled": "yes" }),
+        );
+        assert!(validate_json_map(&workflow, "native.workflows", "workflow").is_err());
+    }
+
+    #[test]
+    fn json_store_validation_accepts_documented_rule_shapes() {
+        let mut rss = JsonMap::new();
+        rss.insert(
+            "rule".to_owned(),
+            serde_json::json!({
+                "id": "rule",
+                "name": "Linux",
+                "enabled": true,
+                "feed_url": "https://example.test/feed",
+                "include": "ubuntu",
+                "exclude": "sample",
+                "category": "linux",
+                "save_path": "/downloads/linux",
+                "tags": ["linux"],
+                "start": true
+            }),
+        );
+        assert!(validate_json_map(&rss, "native.rss_rules", "rss_rule").is_ok());
+
+        let mut view = JsonMap::new();
+        view.insert(
+            "view".to_owned(),
+            serde_json::json!({ "id": "view", "name": "Active", "params": {} }),
+        );
+        assert!(validate_json_map(&view, "native.saved_views", "saved_view").is_ok());
+    }
+
+    #[tokio::test]
+    async fn native_hash_resolution_preserves_unknown_targets_for_error_reporting() {
+        let state = AppState::new();
+        let known = "a".repeat(40);
+        {
+            let mut registry = state.registry.write().await;
+            registry
+                .add(TorrentEntry::new(
+                    known.clone(),
+                    "known".to_owned(),
+                    "/data".to_owned(),
+                ))
+                .unwrap();
+        }
+
+        let resolved = resolve_hashes(&state, &[known.to_ascii_uppercase(), "b".repeat(40)]).await;
+        assert_eq!(resolved, vec![known, "b".repeat(40)]);
     }
 }

@@ -26,6 +26,8 @@ pressure_critical_pct = 90
 
 [runtime]
 torrent_tiers_enabled = true
+tier_hot_idle_secs = 120
+tier_warm_idle_secs = 1800
 
 [tracker]
 http_timeout_secs = 30
@@ -46,7 +48,10 @@ path = "/var/lib/torrentngd/state.db"
 wal_checkpoint_pages = 1000
 
 [auth]
-api_tokens = ["REPLACE_WITH_RANDOM_TOKEN"]
+# Compose mounts the one deployment token at this path. For a non-Compose
+# deployment, provide the same newline-delimited secret file or replace this
+# with api_tokens = ["..."] in a private config.
+api_tokens_file = "/run/secrets/torrentngd_api_token"
 
 [logging]
 format = "json"
