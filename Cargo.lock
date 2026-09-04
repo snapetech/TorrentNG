@@ -1341,7 +1341,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "thiserror 1.0.69",
  "tokio",
 ]
 
@@ -1455,7 +1454,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
- "tracing",
 ]
 
 [[package]]
@@ -1465,7 +1463,6 @@ dependencies = [
  "rand 0.10.2",
  "rt-bencode",
  "thiserror 1.0.69",
- "tracing",
 ]
 
 [[package]]
@@ -1559,7 +1556,6 @@ dependencies = [
  "sha1",
  "sha2",
  "thiserror 1.0.69",
- "tracing",
  "url",
 ]
 
@@ -1580,10 +1576,8 @@ dependencies = [
  "rt-testkit",
  "rt-tracker",
  "tempfile",
- "thiserror 1.0.69",
  "tokio",
  "tower 0.4.13",
- "tracing",
 ]
 
 [[package]]
@@ -1608,7 +1602,6 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
- "tracing",
  "uuid",
 ]
 
@@ -1616,9 +1609,7 @@ dependencies = [
 name = "rt-peer-manager"
 version = "0.1.0"
 dependencies = [
- "rt-peer-wire",
  "thiserror 1.0.69",
- "tracing",
  "uuid",
 ]
 
@@ -1631,7 +1622,6 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",
- "tracing",
 ]
 
 [[package]]
@@ -1641,16 +1631,11 @@ dependencies = [
  "proptest",
  "rt-path",
  "thiserror 1.0.69",
- "tracing",
 ]
 
 [[package]]
 name = "rt-piece-picker"
 version = "0.1.0"
-dependencies = [
- "thiserror 1.0.69",
- "tracing",
-]
 
 [[package]]
 name = "rt-session"
@@ -1659,7 +1644,6 @@ dependencies = [
  "serde",
  "thiserror 1.0.69",
  "tokio",
- "tracing",
  "uuid",
 ]
 
@@ -1690,20 +1674,15 @@ dependencies = [
  "rt-db",
  "rusqlite",
  "thiserror 1.0.69",
- "tracing",
 ]
 
 [[package]]
 name = "rt-tracker"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "rand 0.10.2",
  "rt-bencode",
- "serde",
  "thiserror 1.0.69",
- "tokio",
- "tracing",
  "url",
 ]
 
@@ -1714,7 +1693,6 @@ dependencies = [
  "rand 0.10.2",
  "thiserror 1.0.69",
  "tokio",
- "tracing",
 ]
 
 [[package]]

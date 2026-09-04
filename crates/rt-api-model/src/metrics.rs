@@ -106,12 +106,18 @@ pub struct ApiSseClientGuard {
 impl Drop for ApiSseClientGuard {
     fn drop(&mut self) {
         self.metrics.record_sse_disconnect();
-        let _ =
-            self.metrics
-                .sse_clients
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                    value.checked_sub(1)
-                });
+        let mut current = self.metrics.sse_clients.load(Ordering::Relaxed);
+        while current > 0 {
+            match self.metrics.sse_clients.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
     }
 }
 

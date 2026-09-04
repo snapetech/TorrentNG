@@ -1,15 +1,22 @@
 name: CI
 
 on:
+  push:
+    branches: ["main"]
   pull_request:
     branches: ["master", "main"]
   workflow_dispatch:
+
+concurrency:
+  group: torrentng-ci-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
   native-quality:
+    timeout-minutes: 60
     runs-on: [self-hosted, Linux, X64]
     steps:
       - name: Checkout
@@ -33,6 +40,7 @@ jobs:
   backend-fault-matrix:
     name: Backend fault-containment matrix
     needs: native-quality
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -57,6 +65,7 @@ jobs:
   backend-api-load:
     name: Hosted native API/SSE load harness
     needs: native-quality
+    timeout-minutes: 30
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -118,6 +127,7 @@ jobs:
   # is only caught if someone happens to run it locally, which is exactly
   # how this session found .clippy.toml's own MSRV had drifted stale.
   msrv-check:
+    timeout-minutes: 60
     runs-on: [self-hosted, Linux, X64]
     steps:
       - name: Checkout
@@ -130,9 +140,13 @@ jobs:
         run: cargo build --workspace --all-targets --locked
 
       - name: Test native workspace at declared MSRV
-        run: cargo test --workspace --all-targets --locked
+        # The scale targets contain wall-clock assertions. Run the MSRV
+        # suite serially so unrelated 15k/50k fixtures cannot steal CPU from
+        # the endpoint being measured and turn the gate into scheduler noise.
+        run: cargo test --workspace --all-targets --locked -- --test-threads=1
 
   msrv-check-sidecar:
+    timeout-minutes: 30
     runs-on: [self-hosted, Linux, X64]
     steps:
       - name: Checkout
@@ -148,6 +162,7 @@ jobs:
         run: cargo test --locked --manifest-path sidecar/Cargo.toml
 
   fuzz-smoke:
+    timeout-minutes: 20
     runs-on: [self-hosted, Linux, X64]
     steps:
       - name: Checkout
@@ -183,6 +198,7 @@ jobs:
           if-no-files-found: ignore
 
   sidecar:
+    timeout-minutes: 30
     runs-on: [self-hosted, Linux, X64]
     steps:
       - name: Checkout
@@ -198,6 +214,7 @@ jobs:
         run: cargo test --locked --manifest-path sidecar/Cargo.toml
 
   webui:
+    timeout-minutes: 20
     runs-on: [self-hosted, Linux, X64]
     steps:
       - name: Checkout
@@ -215,3 +232,69 @@ jobs:
       - name: Build webui
         working-directory: webui
         run: npm run build
+
+      - name: Lint webui
+        working-directory: webui
+        run: npm run lint
+
+      - name: Run webui browser certification
+        working-directory: webui
+        run: npm run test:e2e -- --reporter=line
+
+  backup-restore:
+    name: Backup and restore drill
+    needs: native-quality
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release daemon
+        run: cargo build --release --locked -p torrentngd
+
+      - name: Run disposable backup and restore certification
+        run: |
+          scripts/backup_restore_certification.sh \
+            "certification/reports/backup-restore-ci-${GITHUB_RUN_ID}.md"
+
+      - name: Upload backup and restore evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: backup-restore-${{ github.run_id }}
+          path: certification/reports/backup-restore-ci-*
+          if-no-files-found: error
+
+  security-audit:
+    name: Dependency security audit
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Audit Rust dependencies
+        run: cargo audit
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - name: Install webui dependencies
+        working-directory: webui
+        run: npm ci
+
+      - name: Audit webui dependencies
+        working-directory: webui
+        run: npm audit --audit-level=high

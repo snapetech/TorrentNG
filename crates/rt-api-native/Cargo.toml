@@ -14,7 +14,6 @@ serde_json.workspace = true
 axum.workspace = true
 base64.workspace = true
 tokio.workspace = true
-tower.workspace = true
 futures.workspace = true
 rt-api-model = { path = "../rt-api-model" }
 rt-engine = { path = "../rt-engine" }

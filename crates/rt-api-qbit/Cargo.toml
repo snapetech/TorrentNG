@@ -16,7 +16,6 @@ hex.workspace = true
 axum = { workspace = true, features = ["multipart"] }
 reqwest.workspace = true
 tokio.workspace = true
-tower.workspace = true
 url.workspace = true
 rt-api-model = { path = "../rt-api-model" }
 rt-engine = { path = "../rt-engine" }

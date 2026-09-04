@@ -38,8 +38,6 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
 license = "AGPL-3.0-or-later"
-authors = ["TorrentNG contributors"]
-repository = "https://github.com/snapetech/TorrentNG"
 
 [workspace.dependencies]
 # async runtime
@@ -52,7 +50,6 @@ axum = { version = "0.7", features = ["ws", "macros"] }
 http = "1"
 tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
-hyper = { version = "1", features = ["full"] }
 
 # serialization
 serde = { version = "1", features = ["derive"] }
@@ -78,8 +75,6 @@ sha2 = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 # metrics
-prometheus = "0.13"
-
 # utilities
 bytes = "1"
 uuid = { version = "1", features = ["v4", "serde"] }

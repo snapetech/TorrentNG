@@ -25,7 +25,7 @@ use rt_api_model::{
 };
 use rt_engine::{
     EngineGlobalLimits, EngineHandle, EngineJob, EngineNetworkFeatures, EngineStorageRoot,
-    EngineTorrentLimits, QueueMove,
+    EngineSubsystemHealth, EngineTorrentLimits, QueueMove,
 };
 use rt_metainfo::parse_magnet;
 use rt_metrics::MemoryClass;
@@ -55,6 +55,13 @@ const SETTING_NATIVE_WORKFLOW_RUNS: &str = "native.workflow_runs";
 const MAX_NATIVE_JSON_BYTES: usize = 1024 * 1024;
 const MAX_NATIVE_JSON_ENTRIES: usize = 4096;
 const MAX_NATIVE_WORKFLOW_RUNS: usize = 200;
+
+#[derive(Debug, Clone, Copy, Default)]
+struct MetricsHealth {
+    engine_alive: bool,
+    peer_listener_healthy: bool,
+    subsystem: Option<EngineSubsystemHealth>,
+}
 
 /// `POST /api/v1/auth/login` — native WebUI session probe.
 pub async fn auth_login(State(state): State<AppState>, body: String) -> impl IntoResponse {
@@ -3798,7 +3805,19 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
         .is_some_and(EngineHandle::peer_listener_healthy);
     let subsystem_health = if engine_alive {
         match state.engine.as_ref() {
-            Some(engine) => engine.subsystem_health().await.ok(),
+            Some(engine) => match engine.subsystem_health().await {
+                Ok(health) => Some(health),
+                Err(error) => {
+                    tracing::warn!(
+                        component = "native_api",
+                        operation = "health",
+                        result = "unavailable",
+                        error = %error,
+                        "native engine health command failed"
+                    );
+                    None
+                }
+            },
             None => None,
         }
     } else {
@@ -4074,18 +4093,26 @@ pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         );
     };
     match engine.stats().await {
-        Ok(stats) => (
-            StatusCode::OK,
-            [(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("text/plain; version=0.0.4"),
-            )],
-            render_metrics_with_options(
-                &stats,
-                state.api_metrics.snapshot(),
-                state.metrics_include_torrent_ids,
-            ),
-        ),
+        Ok(stats) => {
+            let health = MetricsHealth {
+                engine_alive: engine.is_alive(),
+                peer_listener_healthy: engine.peer_listener_healthy(),
+                subsystem: engine.subsystem_health().await.ok(),
+            };
+            (
+                StatusCode::OK,
+                [(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("text/plain; version=0.0.4"),
+                )],
+                render_metrics_with_health(
+                    &stats,
+                    state.api_metrics.snapshot(),
+                    state.metrics_include_torrent_ids,
+                    health,
+                ),
+            )
+        }
         Err(e) => (
             StatusCode::SERVICE_UNAVAILABLE,
             [(
@@ -4486,12 +4513,85 @@ fn render_metrics_with_api(
     render_metrics_with_options(stats, api_metrics, false)
 }
 
+#[cfg(test)]
 fn render_metrics_with_options(
     stats: &rt_engine::EngineStats,
     api_metrics: ApiRuntimeMetricsSnapshot,
     include_torrent_ids: bool,
 ) -> String {
+    render_metrics_with_health(
+        stats,
+        api_metrics,
+        include_torrent_ids,
+        MetricsHealth::default(),
+    )
+}
+
+fn render_metrics_with_health(
+    stats: &rt_engine::EngineStats,
+    api_metrics: ApiRuntimeMetricsSnapshot,
+    include_torrent_ids: bool,
+    health: MetricsHealth,
+) -> String {
     let mut out = String::new();
+    metric(
+        &mut out,
+        "torrentng_engine_alive",
+        "gauge",
+        "Native engine actor liveness (1=alive, 0=unavailable)",
+        u64::from(health.engine_alive),
+    );
+    metric(
+        &mut out,
+        "torrentng_peer_listener_healthy",
+        "gauge",
+        "Native peer listener health (1=healthy, 0=unhealthy)",
+        u64::from(health.peer_listener_healthy),
+    );
+    metric(
+        &mut out,
+        "torrentng_database_worker_healthy",
+        "gauge",
+        "Dedicated database worker health (1=healthy, 0=unhealthy)",
+        u64::from(
+            health
+                .subsystem
+                .is_some_and(|subsystem| subsystem.db_worker_healthy),
+        ),
+    );
+    metric(
+        &mut out,
+        "torrentng_storage_supervisor_healthy",
+        "gauge",
+        "Detached storage supervisor health (1=healthy, 0=unhealthy)",
+        u64::from(
+            health
+                .subsystem
+                .is_some_and(|subsystem| subsystem.storage_workers_healthy),
+        ),
+    );
+    metric(
+        &mut out,
+        "torrentng_dht_enabled",
+        "gauge",
+        "Whether the native DHT is enabled (1=enabled, 0=disabled)",
+        u64::from(
+            health
+                .subsystem
+                .is_some_and(|subsystem| subsystem.dht_enabled),
+        ),
+    );
+    metric(
+        &mut out,
+        "torrentng_dht_healthy",
+        "gauge",
+        "Native DHT task health (1=healthy, 0=unhealthy)",
+        u64::from(
+            health
+                .subsystem
+                .is_some_and(|subsystem| subsystem.dht_healthy),
+        ),
+    );
     metric(
         &mut out,
         "torrentng_torrents_total",
@@ -4669,6 +4769,16 @@ fn render_metrics_with_options(
     );
     metric(
         &mut out,
+        "torrentng_storage_jobs_saturated",
+        "gauge",
+        "Whether the end-to-end storage-plan dispatcher is saturated (1=saturated, 0=not saturated)",
+        u64::from(
+            stats.storage_jobs_capacity > 0
+                && stats.storage_jobs_inflight >= stats.storage_jobs_capacity,
+        ),
+    );
+    metric(
+        &mut out,
         "torrentng_storage_workers",
         "gauge",
         "Configured blocking storage worker count",
@@ -4708,6 +4818,21 @@ fn render_metrics_with_options(
         "gauge",
         "Trackers with error state",
         stats.trackers_error,
+    );
+    metric(
+        &mut out,
+        "torrentng_trackers_error_ratio_milli",
+        "gauge",
+        "Tracker error ratio multiplied by 1000 (250 means 25 percent)",
+        if stats.trackers_total == 0 {
+            0
+        } else {
+            stats
+                .trackers_error
+                .saturating_mul(1_000)
+                .checked_div(stats.trackers_total)
+                .unwrap_or(0)
+        },
     );
     metric(
         &mut out,
@@ -7188,6 +7313,7 @@ mod tests {
             storage_jobs_capacity: 11,
             storage_workers: 12,
             storage_workers_healthy: 13,
+            trackers_total: 16,
             trackers_error: 4,
             dht_routing_nodes: 45,
             dht_announced_peer_sets: 46,
@@ -7291,6 +7417,12 @@ mod tests {
         stats.resources = Some(governor.snapshot());
         let rendered = render_metrics(&stats);
         assert!(rendered.contains("torrentng_torrents_total 2"));
+        assert!(rendered.contains("torrentng_engine_alive 0"));
+        assert!(rendered.contains("torrentng_peer_listener_healthy 0"));
+        assert!(rendered.contains("torrentng_database_worker_healthy 0"));
+        assert!(rendered.contains("torrentng_storage_supervisor_healthy 0"));
+        assert!(rendered.contains("torrentng_storage_jobs_saturated 0"));
+        assert!(rendered.contains("torrentng_trackers_error_ratio_milli 250"));
         assert!(rendered.contains("torrentng_torrents_seeding 1"));
         assert!(rendered.contains("torrentng_torrents_activity_hot 2"));
         assert!(rendered.contains("torrentng_torrents_activity_warm 3"));
@@ -7487,6 +7619,40 @@ mod tests {
         assert!(api_rendered.contains("torrentng_api_sse_disconnects_total 0"));
         assert!(api_rendered.contains("torrentng_api_response_bytes_estimated_total 123"));
         drop(client);
+    }
+
+    #[test]
+    fn render_metrics_exposes_dependency_health_and_pressure() {
+        let stats = rt_engine::EngineStats {
+            storage_jobs_inflight: 4,
+            storage_jobs_capacity: 4,
+            trackers_total: 4,
+            trackers_error: 1,
+            ..Default::default()
+        };
+        let rendered = render_metrics_with_health(
+            &stats,
+            ApiRuntimeMetricsSnapshot::default(),
+            false,
+            MetricsHealth {
+                engine_alive: true,
+                peer_listener_healthy: true,
+                subsystem: Some(EngineSubsystemHealth {
+                    db_worker_healthy: true,
+                    storage_workers_healthy: true,
+                    dht_enabled: true,
+                    dht_healthy: false,
+                }),
+            },
+        );
+        assert!(rendered.contains("torrentng_engine_alive 1"));
+        assert!(rendered.contains("torrentng_peer_listener_healthy 1"));
+        assert!(rendered.contains("torrentng_database_worker_healthy 1"));
+        assert!(rendered.contains("torrentng_storage_supervisor_healthy 1"));
+        assert!(rendered.contains("torrentng_dht_enabled 1"));
+        assert!(rendered.contains("torrentng_dht_healthy 0"));
+        assert!(rendered.contains("torrentng_storage_jobs_saturated 1"));
+        assert!(rendered.contains("torrentng_trackers_error_ratio_milli 250"));
     }
 
     #[tokio::test]

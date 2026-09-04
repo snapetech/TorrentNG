@@ -8,7 +8,6 @@ license.workspace = true
 
 [dependencies]
 thiserror.workspace = true
-tracing.workspace = true
 rand.workspace = true
 rt-bencode = { path = "../rt-bencode" }
 

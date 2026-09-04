@@ -8,7 +8,6 @@ license.workspace = true
 
 [dependencies]
 thiserror.workspace = true
-tracing.workspace = true
 sha1.workspace = true
 sha2.workspace = true
 hex.workspace = true
