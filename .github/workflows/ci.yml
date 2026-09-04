@@ -114,6 +114,8 @@ jobs:
           TNG_LOAD_CLIENTS=16 \
           TNG_LOAD_SSE_CLIENTS=4 \
           TNG_LOAD_SLOW_DELAY_MS=100 \
+          TNG_LOAD_COMMIT="$GITHUB_SHA" \
+          TNG_LOAD_BINARY=target/release/torrentngd \
             scripts/backend_burndown_api_load.py \
             "certification/reports/backend-api-load-ci-${GITHUB_RUN_ID}.md"
 

@@ -12,11 +12,13 @@ from __future__ import annotations
 import json
 import os
 import statistics
+import hashlib
 import sys
 import threading
 import time
 from collections import defaultdict
 from http.client import HTTPException
+from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -32,6 +34,7 @@ ENDPOINTS = (
     "/api/qb/v2/torrents/info?limit=200",
     "/api/qb/v2/sync/maindata?rid=0",
 )
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def env_int(name: str, default: int, minimum: int = 1) -> int:
@@ -199,6 +202,22 @@ def metrics_snapshot(base: str, token: str) -> tuple[int, dict[str, str]]:
     return len(body), values
 
 
+def binary_sha256(binary: str) -> str:
+    if not binary:
+        return "unavailable"
+    path = Path(binary)
+    if not path.is_absolute():
+        path = REPO_ROOT / path
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except (OSError, ValueError):
+        return "unavailable"
+
+
 def write_report(
     report: str,
     raw: str,
@@ -213,6 +232,9 @@ def write_report(
     pid: str,
     started_at: float,
     finished_at: float,
+    commit: str,
+    binary: str,
+    binary_digest: str,
     preflight_error: str | None = None,
 ) -> bool:
     request_rows: list[dict[str, Any]] = []
@@ -249,6 +271,9 @@ def write_report(
         overall = "FAIL"
     payload = {
         "base_url": base,
+        "commit": commit,
+        "binary": binary,
+        "binary_sha256": binary_digest,
         "duration_seconds": duration,
         "clients": clients,
         "sse_clients": sse_clients,
@@ -276,6 +301,7 @@ def write_report(
     with open(report, "w", encoding="utf-8") as handle:
         handle.write("# TorrentNG Native API Load Evidence\n\n")
         handle.write(f"- Date UTC: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n")
+        handle.write(f"- Commit: {commit}\n- Binary: {binary or 'not specified'}\n- Binary SHA-256: {binary_digest}\n")
         handle.write(f"- Base URL: {base}\n- Duration: {duration:.1f}s\n- JSON clients: {clients}\n")
         handle.write(f"- Slow SSE clients: {sse_clients}\n- Slow SSE delay: {slow_delay_ms}ms per byte\n")
         handle.write(f"- Raw evidence: `{os.path.basename(raw)}`\n\n")
@@ -315,6 +341,9 @@ def main() -> int:
     sse_clients = env_int("TNG_LOAD_SSE_CLIENTS", 8, 0)
     slow_delay_ms = env_int("TNG_LOAD_SLOW_DELAY_MS", 250, 0)
     pid = os.environ.get("TNG_LOAD_PID", "")
+    commit = os.environ.get("TNG_LOAD_COMMIT", "unknown (set TNG_LOAD_COMMIT)")
+    binary = os.environ.get("TNG_LOAD_BINARY", "")
+    binary_digest = binary_sha256(binary)
 
     started = time.time()
     preflight_error: str | None = None
@@ -348,7 +377,7 @@ def main() -> int:
         except (OSError, HTTPException, HTTPError, URLError):
             metrics_size = None
     finished = time.time()
-    ok = write_report(report, raw, base, duration, clients, sse_clients, slow_delay_ms, stats, metrics_size, metrics, pid, started, finished, preflight_error)
+    ok = write_report(report, raw, base, duration, clients, sse_clients, slow_delay_ms, stats, metrics_size, metrics, pid, started, finished, commit, binary, binary_digest, preflight_error)
     print(report)
     return 0 if ok else 1
 
