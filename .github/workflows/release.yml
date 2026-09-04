@@ -12,9 +12,7 @@ on:
         type: string
 
 permissions:
-  contents: write
-  packages: write
-  actions: write
+  contents: read
 
 jobs:
   native-quality:
@@ -89,9 +87,40 @@ jobs:
       - name: Test sidecar at declared MSRV
         run: cargo test --locked --manifest-path sidecar/Cargo.toml
 
+  security-audit:
+    name: Release dependency security gate
+    needs: native-quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Audit Rust dependencies
+        run: cargo audit
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - name: Audit WebUI dependencies
+        working-directory: webui
+        run: |
+          npm ci
+          npm audit --audit-level=high
+
   native-release-smoke:
     name: Native release-binary smoke
-    needs: [native-quality, msrv-check, msrv-check-sidecar]
+    needs: [native-quality, msrv-check, msrv-check-sidecar, security-audit]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -113,16 +142,25 @@ jobs:
             scripts/backend_burndown_native_release_smoke.sh \
             "certification/reports/backend-burndown-native-release-smoke-ci-${GITHUB_RUN_ID}.md"
 
+      - name: Run backup and restore drill
+        run: |
+          scripts/backup_restore_certification.sh \
+            "certification/reports/backup-restore-release-${GITHUB_RUN_ID}.md"
+
       - name: Upload native release smoke evidence
         uses: actions/upload-artifact@v7
         with:
           name: native-release-smoke-${{ github.run_id }}
-          path: certification/reports/backend-burndown-native-release-smoke-ci-*
+          path: |
+            certification/reports/backend-burndown-native-release-smoke-ci-*
+            certification/reports/backup-restore-release-*
           if-no-files-found: error
 
   native-binaries:
     name: Native binary (${{ matrix.suffix }})
-    needs: [native-quality, msrv-check, msrv-check-sidecar, native-release-smoke]
+    needs: [native-quality, msrv-check, msrv-check-sidecar, security-audit, native-release-smoke]
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -223,7 +261,10 @@ jobs:
 
   linux-release-assets:
     name: Linux containers and shared assets
-    needs: [native-quality, msrv-check, msrv-check-sidecar, native-release-smoke]
+    needs: [native-quality, msrv-check, msrv-check-sidecar, security-audit, native-release-smoke]
+    permissions:
+      contents: read
+      packages: write
     runs-on: [self-hosted, Linux, X64]
     steps:
       - name: Checkout
@@ -335,6 +376,9 @@ jobs:
     needs:
       - native-binaries
       - linux-release-assets
+    permissions:
+      contents: write
+      actions: write
     steps:
       - name: Checkout
         uses: actions/checkout@v7

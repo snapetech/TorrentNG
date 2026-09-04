@@ -246,8 +246,7 @@ fn encode_qbit_json<T: Serialize>(value: &T, label: &str) -> Result<String, Stri
     let bytes = serde_json::to_vec(value).map_err(|error| format!("encoding {label}: {error}"))?;
     if bytes.len() > MAX_QBIT_PREFERENCE_BYTES {
         return Err(format!(
-            "{label} exceeds the {} byte compatibility limit",
-            MAX_QBIT_PREFERENCE_BYTES
+            "{label} exceeds the {MAX_QBIT_PREFERENCE_BYTES} byte compatibility limit"
         ));
     }
     String::from_utf8(bytes).map_err(|error| format!("encoding {label} as UTF-8: {error}"))

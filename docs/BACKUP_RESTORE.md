@@ -28,6 +28,22 @@ rsync -a /config/session/fastresume/ /backup/fastresume/
 cp /config/config.toml /backup/config.toml
 ```
 
+Run the disposable repository certification drill after a release build. It
+uses temporary session/data roots, performs a SQLite online backup, restores to
+a different root, starts a second daemon, and proves that restored metadata can
+be mutated. It does not copy payload bytes and never touches the configured
+TorrentNG/LVM roots:
+
+```sh
+cargo build --release --locked -p torrentngd
+scripts/backup_restore_certification.sh
+```
+
+The generated report is written under `certification/reports/`. Treat a
+passing drill as proof of session-backup choreography only; payload backup,
+filesystem snapshots, encryption, retention, and restore testing on the actual
+storage device remain deployment responsibilities.
+
 ## Restore
 
 1. Stop `torrentngd`.

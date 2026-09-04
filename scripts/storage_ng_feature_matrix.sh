@@ -13,7 +13,7 @@ run_gate() {
 
 run_gate "format" cargo fmt --check
 run_gate "owned-read adoption guard" bash -c '
-  offenders="$(rg -n "scheduled_read\\(" crates --glob "*.rs" \
+  offenders="$(grep -RIn --include='*.rs' -E "scheduled_read\\(" crates \
     | grep -v "crates/rt-storage/src/scheduler.rs" || true)"
   if [[ -n "$offenders" ]]; then
     printf "%s\n" "$offenders"

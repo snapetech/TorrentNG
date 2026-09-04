@@ -145,10 +145,13 @@ directory includes:
 - [torrentngd overview dashboard](../deploy/native/grafana/dashboards/torrentngd.json)
 
 The checked-in Prometheus rules alert on sustained storage-dispatcher
-saturation, an unhealthy storage supervisor, repeated expired API snapshots,
-and SSE resynchronization storms. These are operator signals, not proof that a
-deployment has sufficient hardware capacity; validate thresholds against the
-target workload.
+saturation, unhealthy database/storage/peer/DHT seams, high tracker error
+ratio, high storage-read p95, repeated expired API snapshots, and SSE
+resynchronization storms. `/metrics` exposes the corresponding seam-health
+gauges, `torrentng_storage_jobs_saturated`, and
+`torrentng_trackers_error_ratio_milli` (250 means 25 percent). These are
+operator signals, not proof that a deployment has sufficient hardware
+capacity; validate thresholds against the target workload.
 
 With Compose, start them through the `observability` profile. Prometheus sends
 the same Bearer token from `/run/secrets/torrentngd_api_token`; metrics are not

@@ -7893,21 +7893,19 @@ impl Engine {
                     },
                 );
                 stats.add_torrent_runtime(info_hash, runtime);
-            } else {
-                if self.runtime.tier_controller.tier(&info_hash).is_none() {
-                    self.runtime.tier_controller.apply_input(
-                        info_hash.clone(),
-                        TierInput {
-                            state,
-                            connected_peers: 0,
-                            outstanding_requests: 0,
-                            inbound_peer: false,
-                            tracker_due: false,
-                            last_active: self.runtime.tier_last_active.get(&info_hash).copied(),
-                            now,
-                        },
-                    );
-                }
+            } else if self.runtime.tier_controller.tier(&info_hash).is_none() {
+                self.runtime.tier_controller.apply_input(
+                    info_hash.clone(),
+                    TierInput {
+                        state,
+                        connected_peers: 0,
+                        outstanding_requests: 0,
+                        inbound_peer: false,
+                        tracker_due: false,
+                        last_active: self.runtime.tier_last_active.get(&info_hash).copied(),
+                        now,
+                    },
+                );
             }
         }
         for (info_hash, state) in states {
@@ -10457,8 +10455,7 @@ fn normalize_storage_plan_completed_steps(
 fn normalize_storage_plan_targets(mut targets: Vec<String>) -> Result<Vec<String>, String> {
     if targets.len() > MAX_STORAGE_PLAN_AFFECTED_TORRENTS {
         return Err(format!(
-            "storage plan affects too many torrents (maximum {})",
-            MAX_STORAGE_PLAN_AFFECTED_TORRENTS
+            "storage plan affects too many torrents (maximum {MAX_STORAGE_PLAN_AFFECTED_TORRENTS})"
         ));
     }
     for target in &mut targets {

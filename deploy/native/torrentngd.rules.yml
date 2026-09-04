@@ -16,7 +16,7 @@ groups:
             will be rejected until work drains or operators intervene.
 
       - alert: TorrentNGStorageWorkersUnhealthy
-        expr: torrentng_storage_workers_healthy == 0
+        expr: torrentng_storage_supervisor_healthy == 0
         for: 2m
         labels:
           severity: critical
@@ -25,6 +25,71 @@ groups:
           description: >-
             The storage-job supervisor is not live. Storage plans are not
             safe to submit until the daemon recovers or is restarted.
+
+      - alert: TorrentNGDatabaseWorkerUnhealthy
+        expr: torrentng_database_worker_healthy == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: TorrentNG database worker is unhealthy
+          description: >-
+            Authoritative session persistence is unavailable. Mutations may
+            be rejected or remain uncommitted; inspect the daemon logs and
+            restart only after preserving the session backup.
+
+      - alert: TorrentNGPeerListenerUnhealthy
+        expr: torrentng_peer_listener_healthy == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: TorrentNG peer listener is unhealthy
+          description: >-
+            The native peer listener is not accepting work. Existing API
+            state may still look healthy while transfers are stalled.
+
+      - alert: TorrentNGDhtUnhealthy
+        expr: torrentng_dht_enabled == 1 and torrentng_dht_healthy == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: TorrentNG DHT task is unhealthy
+          description: >-
+            DHT is enabled but its task is not healthy. Tracker-backed
+            transfers may continue; inspect DHT task logs and restart state.
+
+      - alert: TorrentNGTrackerErrorRatioHigh
+        expr: >-
+          torrentng_trackers_total > 0
+          and torrentng_trackers_error_ratio_milli > 250
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: TorrentNG tracker error ratio is above 25 percent
+          description: >-
+            More than one quarter of persisted tracker rows are in error
+            state. Check tracker reachability, egress policy, and DNS.
+
+      - alert: TorrentNGStorageReadLatencyP95High
+        expr: >-
+          histogram_quantile(
+            0.95,
+            sum by (le) (
+              rate(torrentng_storage_read_latency_nanoseconds_bucket[5m])
+            )
+          ) > 5000000000
+          and rate(torrentng_storage_read_latency_nanoseconds_count[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: TorrentNG storage read p95 exceeds five seconds
+          description: >-
+            Sustained end-to-end read latency is high. Check mount health,
+            device queue saturation, and storage-worker contention.
 
       - alert: TorrentNGApiSnapshotExpiry
         expr: increase(torrentng_api_snapshot_expired_total[5m]) > 10

@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPORT_DIR="${TNG_WEBUI_REPORT_DIR:-$ROOT/certification/reports}"
-OUT="${TNG_WEBUI_REPORT:-$REPORT_DIR/webui-certification-$(date -u +%Y%m%dT%H%M%SZ).md}"
+OUT="${1:-${TNG_WEBUI_REPORT:-$REPORT_DIR/webui-certification-$(date -u +%Y%m%dT%H%M%SZ).md}}"
 
 mkdir -p "$REPORT_DIR"
 tmpdir="$(mktemp -d)"

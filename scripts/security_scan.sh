@@ -56,6 +56,16 @@ else
   mark "cargo dependency tree" "BLOCKED" "cargo not installed"
 fi
 
+if command -v cargo-audit >/dev/null 2>&1; then
+  if (cd "$ROOT" && cargo audit) >/tmp/tng-cargo-audit.log 2>&1; then
+    mark "cargo advisory audit" "PASS" "no actionable RustSec advisories"
+  else
+    mark "cargo advisory audit" "FAIL" "RustSec audit failed; see /tmp/tng-cargo-audit.log"
+  fi
+else
+  mark "cargo advisory audit" "BLOCKED" "cargo-audit not installed; CI security-audit provides the release gate"
+fi
+
 if command -v docker >/dev/null 2>&1; then
   if docker image inspect "$IMAGE" >/dev/null 2>&1; then
     mark "container image exists" "PASS" "$IMAGE"

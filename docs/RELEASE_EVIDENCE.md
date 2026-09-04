@@ -102,6 +102,11 @@ Monitor it:
 scripts/soak_status.sh
 ```
 
+The soak runner records health and qBit sync HTTP status plus process RSS. A
+passing report is required for a strict production-readiness claim; a short
+local run is useful for smoke coverage but cannot substitute for the configured
+24-hour sample window or target-device evidence.
+
 Finalize it after completion:
 
 ```sh

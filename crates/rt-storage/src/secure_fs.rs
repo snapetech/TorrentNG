@@ -7,8 +7,6 @@
 //! directory descriptors. The descriptors remain anchored if an attacker
 //! renames or replaces a path component after the walk.
 
-#![cfg(unix)]
-
 use std::ffi::{CStr, CString, OsString};
 use std::fs::File;
 use std::io::{self, Read, Write};

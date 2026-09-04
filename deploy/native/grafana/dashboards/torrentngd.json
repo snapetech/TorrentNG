@@ -74,6 +74,65 @@
       },
       "fieldConfig": {
         "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 0
+      },
+      "id": 4,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "name"
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "expr": "min(torrentng_engine_alive, torrentng_database_worker_healthy, torrentng_storage_supervisor_healthy, torrentng_peer_listener_healthy)",
+          "legendFormat": "all critical seams",
+          "refId": "A"
+        }
+      ],
+      "title": "Critical seam health",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
           "unit": "binBps"
         },
         "overrides": []
@@ -176,6 +235,16 @@
           "expr": "torrentng_trackers_error",
           "legendFormat": "tracker errors",
           "refId": "E"
+        },
+        {
+          "expr": "torrentng_storage_jobs_saturated",
+          "legendFormat": "storage saturated",
+          "refId": "F"
+        },
+        {
+          "expr": "torrentng_trackers_error_ratio_milli",
+          "legendFormat": "tracker error ratio (milli)",
+          "refId": "G"
         }
       ],
       "title": "Runtime Pressure",

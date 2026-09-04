@@ -368,8 +368,7 @@ pub(crate) async fn bounded_response_body(
         .is_some_and(|length| length > max_bytes as u64)
     {
         return Err(TrackerError::ParseError(format!(
-            "response exceeds {} byte limit",
-            max_bytes
+            "response exceeds {max_bytes} byte limit"
         )));
     }
     let mut body = Vec::with_capacity(
@@ -385,8 +384,7 @@ pub(crate) async fn bounded_response_body(
     {
         if body.len().saturating_add(chunk.len()) > max_bytes {
             return Err(TrackerError::ParseError(format!(
-                "response exceeds {} byte limit",
-                max_bytes
+                "response exceeds {max_bytes} byte limit"
             )));
         }
         body.extend_from_slice(&chunk);

@@ -151,6 +151,13 @@ run_gate "workspace tests" cargo test --workspace
 run_gate "Storage NG feature matrix" "$ROOT/scripts/storage_ng_feature_matrix.sh"
 run_gate "WebUI certification" "$ROOT/scripts/webui_certification.sh"
 run_gate "API facade certification" "$ROOT/scripts/api_facade_certification.sh" "$REPORT_DIR/api-facades-local-release-$(date -u +%Y%m%dT%H%M%SZ).md"
+run_gate "release artifact build" cargo build --release --locked -p torrentngd
+release_smoke_report="$REPORT_DIR/backend-burndown-native-release-smoke-local-release-$(date -u +%Y%m%dT%H%M%SZ).md"
+run_report_gate "authenticated release-binary smoke" "$release_smoke_report" \
+  "$ROOT/scripts/backend_burndown_native_release_smoke.sh" "$release_smoke_report"
+backup_restore_report="$REPORT_DIR/backup-restore-local-release-$(date -u +%Y%m%dT%H%M%SZ).md"
+run_report_gate "backup and restore drill" "$backup_restore_report" \
+  "$ROOT/scripts/backup_restore_certification.sh" "$backup_restore_report"
 corpus_report="$REPORT_DIR/migration-corpus-local-release-$(date -u +%Y%m%dT%H%M%SZ).md"
 run_report_gate "migration exported corpus coverage" "$corpus_report" "$ROOT/scripts/migration_corpus_certification.sh" "$corpus_report"
 

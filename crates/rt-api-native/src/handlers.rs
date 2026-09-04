@@ -4097,7 +4097,19 @@ pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
             let health = MetricsHealth {
                 engine_alive: engine.is_alive(),
                 peer_listener_healthy: engine.peer_listener_healthy(),
-                subsystem: engine.subsystem_health().await.ok(),
+                subsystem: match engine.subsystem_health().await {
+                    Ok(health) => Some(health),
+                    Err(error) => {
+                        tracing::warn!(
+                            component = "native_api",
+                            operation = "metrics",
+                            result = "unavailable",
+                            error = %error,
+                            "native engine health command failed while rendering metrics"
+                        );
+                        None
+                    }
+                },
             };
             (
                 StatusCode::OK,
@@ -6581,7 +6593,7 @@ async fn rss_rule_matches(
                         .any(|part| haystack.contains(&part.to_ascii_lowercase()))
                 })
                 .unwrap_or(false);
-            if !(include_matches && !exclude_matches) {
+            if !include_matches || exclude_matches {
                 return None;
             }
             let rule_id = rule

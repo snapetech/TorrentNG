@@ -7,6 +7,9 @@ OUT="${2:-$ROOT/certification/reports/soak-final-$(date -u +%Y%m%dT%H%M%SZ).md}"
 MIN_SAMPLES="${SOAK_MIN_SAMPLES:-1200}"
 MIN_TORRENTS="${SOAK_MIN_TORRENTS:-15000}"
 MAX_RSS_MB="${SOAK_MAX_RSS_MB:-500}"
+MAX_FDS="${SOAK_MAX_FDS:-4096}"
+MAX_THREADS="${SOAK_MAX_THREADS:-512}"
+MIN_DISK_FREE_MB="${SOAK_MIN_DISK_FREE_MB:-100}"
 RESTORE_NORMAL="${RESTORE_NORMAL:-0}"
 ALLOW_INCOMPLETE="${SOAK_ALLOW_INCOMPLETE:-0}"
 
@@ -35,6 +38,9 @@ mark() {
   echo "- Minimum samples: $MIN_SAMPLES"
   echo "- Minimum torrents: $MIN_TORRENTS"
   echo "- Max RSS MB: $MAX_RSS_MB"
+  echo "- Max file descriptors: $MAX_FDS"
+  echo "- Max threads: $MAX_THREADS"
+  echo "- Minimum disk free MB: $MIN_DISK_FREE_MB"
   echo
   echo "## Checks"
   echo
@@ -80,6 +86,41 @@ else
     mark "sync samples" "PASS" "all HTTP 200"
   else
     mark "sync samples" "FAIL" "$bad_sync non-200 samples"
+  fi
+
+  if grep -q '^| UTC | Health | Torrents | RSS MB | sync/maindata HTTP | FDs | Threads | Disk free MB | Metrics HTTP | DB/Cache | Storage |' "$REPORT"; then
+    max_fds="$(awk -F'|' '/^\| 20[0-9][0-9]-/ {gsub(/[[:space:]]/, "", $7); if ($7 + 0 > max) max = $7 + 0} END {print max + 0}' "$REPORT")"
+    max_threads="$(awk -F'|' '/^\| 20[0-9][0-9]-/ {gsub(/[[:space:]]/, "", $8); if ($8 + 0 > max) max = $8 + 0} END {print max + 0}' "$REPORT")"
+    min_disk="$(awk -F'|' '/^\| 20[0-9][0-9]-/ {gsub(/[[:space:]]/, "", $9); if (seen == 0 || ($9 + 0) < min) min = $9 + 0; seen = 1} END {print seen ? min : 0}' "$REPORT")"
+    bad_metrics="$(awk -F'|' '/^\| 20[0-9][0-9]-/ {gsub(/[[:space:]]/, "", $10); if ($10 != "200") bad++} END {print bad + 0}' "$REPORT")"
+    bad_components="$(awk -F'|' '/^\| 20[0-9][0-9]-/ {for (i = 11; i <= 12; i++) {gsub(/[[:space:]]/, "", $i); if ($i == "unhealthy" || $i == "unknown") bad++}} END {print bad + 0}' "$REPORT")"
+    if (( max_fds <= MAX_FDS )); then
+      mark "file-descriptor ceiling" "PASS" "${max_fds} <= ${MAX_FDS}"
+    else
+      mark "file-descriptor ceiling" "FAIL" "${max_fds} > ${MAX_FDS}"
+    fi
+    if (( max_threads <= MAX_THREADS )); then
+      mark "thread ceiling" "PASS" "${max_threads} <= ${MAX_THREADS}"
+    else
+      mark "thread ceiling" "FAIL" "${max_threads} > ${MAX_THREADS}"
+    fi
+    if (( min_disk >= MIN_DISK_FREE_MB )); then
+      mark "disk-free floor" "PASS" "${min_disk}MB >= ${MIN_DISK_FREE_MB}MB"
+    else
+      mark "disk-free floor" "FAIL" "${min_disk}MB < ${MIN_DISK_FREE_MB}MB"
+    fi
+    if (( bad_metrics == 0 )); then
+      mark "metrics samples" "PASS" "all HTTP 200"
+    else
+      mark "metrics samples" "FAIL" "$bad_metrics non-200 samples"
+    fi
+    if (( bad_components == 0 )); then
+      mark "dependency health fields" "PASS" "no unhealthy or unknown fields"
+    else
+      mark "dependency health fields" "FAIL" "$bad_components unhealthy/unknown fields"
+    fi
+  else
+    mark "extended process telemetry" "INFO" "legacy report has no FD/thread/disk/metrics columns"
   fi
 
   if grep -q '^Overall status: PASS' "$REPORT"; then

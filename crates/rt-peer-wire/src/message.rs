@@ -173,8 +173,7 @@ impl Message {
 fn validate_request(length: u32) -> Result<(), WireError> {
     if length == 0 || length > MAX_BLOCK_SIZE {
         return Err(WireError::InvalidMessage(format!(
-            "request length {length} not in 1..={}",
-            MAX_BLOCK_SIZE
+            "request length {length} not in 1..={MAX_BLOCK_SIZE}"
         )));
     }
     Ok(())
