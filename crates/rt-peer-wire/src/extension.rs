@@ -185,17 +185,31 @@ fn dict_int(pairs: &[(&[u8], BValue<'_>)], key: &[u8]) -> Option<i64> {
         .and_then(|(_, value)| value.as_int())
 }
 
+/// Matches rt-bencode's DEFAULT_MAX_DEPTH. Real ut_metadata headers are a
+/// flat dict (depth 1); this only needs to be deep enough for that.
+const MAX_SCAN_DEPTH: usize = 64;
+
 fn bencode_value_len(input: &[u8]) -> Result<usize, &'static str> {
     let mut pos = 0;
-    scan_value(input, &mut pos)?;
+    scan_value(input, &mut pos, 0)?;
     Ok(pos)
 }
 
-fn scan_value(input: &[u8], pos: &mut usize) -> Result<(), &'static str> {
+fn scan_value(input: &[u8], pos: &mut usize, depth: usize) -> Result<(), &'static str> {
+    // scan_list/scan_dict recurse into scan_value once per nested list/dict
+    // byte with no other bound on how far a peer-supplied payload can drive
+    // that recursion. Without this cap, a message of a few million 'l'/'d'
+    // bytes (well within the 2 MiB wire message limit) recurses deep enough
+    // to overflow the stack, which aborts the process rather than producing
+    // a catchable error -- an unauthenticated remote DoS via one BEP10
+    // ut_metadata message.
+    if depth > MAX_SCAN_DEPTH {
+        return Err("bencode nesting too deep");
+    }
     match input.get(*pos).copied() {
         Some(b'i') => scan_int(input, pos),
-        Some(b'l') => scan_list(input, pos),
-        Some(b'd') => scan_dict(input, pos),
+        Some(b'l') => scan_list(input, pos, depth),
+        Some(b'd') => scan_dict(input, pos, depth),
         Some(b'0'..=b'9') => scan_bytes(input, pos),
         Some(_) => Err("invalid bencode value"),
         None => Err("empty bencode payload"),
@@ -213,7 +227,7 @@ fn scan_int(input: &[u8], pos: &mut usize) -> Result<(), &'static str> {
     Err("unterminated bencode int")
 }
 
-fn scan_list(input: &[u8], pos: &mut usize) -> Result<(), &'static str> {
+fn scan_list(input: &[u8], pos: &mut usize, depth: usize) -> Result<(), &'static str> {
     *pos += 1;
     loop {
         match input.get(*pos).copied() {
@@ -221,13 +235,13 @@ fn scan_list(input: &[u8], pos: &mut usize) -> Result<(), &'static str> {
                 *pos += 1;
                 return Ok(());
             }
-            Some(_) => scan_value(input, pos)?,
+            Some(_) => scan_value(input, pos, depth + 1)?,
             None => return Err("unterminated bencode list"),
         }
     }
 }
 
-fn scan_dict(input: &[u8], pos: &mut usize) -> Result<(), &'static str> {
+fn scan_dict(input: &[u8], pos: &mut usize, depth: usize) -> Result<(), &'static str> {
     *pos += 1;
     loop {
         match input.get(*pos).copied() {
@@ -237,7 +251,7 @@ fn scan_dict(input: &[u8], pos: &mut usize) -> Result<(), &'static str> {
             }
             Some(b'0'..=b'9') => {
                 scan_bytes(input, pos)?;
-                scan_value(input, pos)?;
+                scan_value(input, pos, depth + 1)?;
             }
             Some(_) => return Err("invalid bencode dict key"),
             None => return Err("unterminated bencode dict"),
@@ -305,6 +319,27 @@ mod tests {
             UtMetadataMessage::parse(&message.encode()).unwrap(),
             message
         );
+    }
+
+    #[test]
+    fn ut_metadata_rejects_deeply_nested_bencode_without_deep_recursion() {
+        // Before the depth guard, this would recurse once per 'l' byte with
+        // no bound -- a peer sending a few million of these (well under the
+        // 2 MiB wire message cap) would overflow the stack and abort the
+        // process instead of returning an error. 10k is enough to prove the
+        // guard fires long before real stack exhaustion, without relying on
+        // this test surviving an actual overflow to demonstrate the bug.
+        let payload = "l".repeat(10_000).into_bytes();
+        let result = UtMetadataMessage::parse(&payload);
+        assert!(result.is_err(), "deeply nested input must be rejected");
+    }
+
+    #[test]
+    fn extension_handshake_rejects_deeply_nested_bencode() {
+        let mut payload = b"d1:m".to_vec();
+        payload.extend(std::iter::repeat_n(b'l', 10_000));
+        let result = ExtensionHandshake::parse(&payload);
+        assert!(result.is_err(), "deeply nested handshake must be rejected");
     }
 
     #[test]
