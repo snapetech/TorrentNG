@@ -56,11 +56,14 @@ jobs:
             "certification/reports/backend-burndown-fault-matrix-ci-${GITHUB_RUN_ID}.md"
 
       - name: Upload fault matrix evidence
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: backend-fault-matrix-${{ github.run_id }}
-          path: certification/reports/backend-burndown-fault-matrix-ci-*
-          if-no-files-found: error
+          path: |
+            certification/reports/backend-burndown-fault-matrix-ci-*
+            certification/reports/backend-burndown-fault-*.log
+          if-no-files-found: warn
 
   backend-api-load:
     name: Hosted native API/SSE load harness

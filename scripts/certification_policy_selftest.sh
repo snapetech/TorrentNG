@@ -46,6 +46,7 @@ for report in \
   security-scan-selftest.md \
   native-engine-selftest.md \
   webui-certification-selftest.md \
+  backup-restore-selftest.md \
   backend-burndown-native-release-smoke-selftest.md \
   backend-burndown-fault-matrix-selftest.md \
   backend-api-load-selftest.md \
@@ -152,7 +153,9 @@ TNG_LOCAL_RELEASE_SELFTEST=1 \
   "$ROOT/scripts/local_release_gate.sh" "$report_dir/local-release-warning-selftest.md" >/dev/null
 grep -q '| migration exported corpus coverage | WARN |' "$report_dir/local-release-warning-selftest.md"
 grep -q 'Overall status: PASS_WITH_WARNINGS' "$report_dir/local-release-warning-selftest.md"
-grep -q 'Warnings: 2' "$report_dir/local-release-warning-selftest.md"
+grep -q '| authenticated release-binary smoke | WARN |' "$report_dir/local-release-warning-selftest.md"
+grep -q '| backup and restore drill | WARN |' "$report_dir/local-release-warning-selftest.md"
+grep -q 'Warnings: 4' "$report_dir/local-release-warning-selftest.md"
 
 REPORT_DIR="$report_dir" BENCHMARK_DIR="$benchmark_dir" \
   TNG_RELEASE_EVIDENCE_SELFTEST=1 \

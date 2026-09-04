@@ -11,15 +11,7 @@ OUT="${1:-$REPORT_DIR/backup-restore-certification-$(date -u +%Y%m%dT%H%M%SZ).md
 PREFIX="${OUT%.md}"
 
 mkdir -p "$(dirname "$OUT")"
-test -x "$BIN"
-test -f "$FIXTURE"
-test -d "$STATIC_DIR"
-command -v curl >/dev/null
-command -v jq >/dev/null
-command -v sqlite3 >/dev/null
-command -v tar >/dev/null
-
-WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/torrentng-backup-restore.XXXXXX")"
+WORK_DIR=""
 SOURCE_SESSION="$WORK_DIR/source-session"
 SOURCE_DATA="$WORK_DIR/source-data"
 BACKUP_ROOT="$WORK_DIR/backup"
@@ -36,6 +28,38 @@ daemon_pid=""
 status="PASS"
 failure_reason=""
 finalized=0
+source_integrity="not reached"
+restored_integrity="not reached"
+binary_sha="unavailable"
+if [[ -f "$BIN" ]]; then
+  binary_sha="$(sha256sum "$BIN" | awk '{print $1}')"
+fi
+
+sqlite_integrity() {
+  python3 - "$1" <<'PY'
+import sqlite3
+import sys
+
+with sqlite3.connect(sys.argv[1]) as connection:
+    result = connection.execute("PRAGMA integrity_check;").fetchone()[0]
+print(result)
+PY
+}
+
+sqlite_backup() {
+  python3 - "$1" "$2" <<'PY'
+import sqlite3
+import sys
+
+source = sqlite3.connect(sys.argv[1])
+destination = sqlite3.connect(sys.argv[2])
+try:
+    source.backup(destination)
+finally:
+    destination.close()
+    source.close()
+PY
+}
 
 write_header() {
   cat >"$OUT" <<EOF
@@ -45,7 +69,7 @@ write_header() {
 - Host: $(hostname)
 - Commit: $(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unavailable)
 - Binary: $BIN
-- Binary SHA-256: $(sha256sum "$BIN" | awk '{print $1}')
+- Binary SHA-256: $binary_sha
 - Fixture: $FIXTURE
 
 This is a disposable native-engine drill. It creates one paused torrent in a
@@ -75,8 +99,8 @@ finalize() {
       echo "- Source session: one paused torrent with persisted category and tag state"
       echo "- Restored session: state listed, then a category mutation committed"
       echo "- Archive bytes: $(stat -c '%s' "$ARCHIVE" 2>/dev/null || echo unavailable)"
-      echo "- Source SQLite integrity: ${source_integrity:-not reached}"
-      echo "- Restored SQLite integrity: ${restored_integrity:-not reached}"
+      echo "- Source SQLite integrity: $source_integrity"
+      echo "- Restored SQLite integrity: $restored_integrity"
       echo
       echo "Overall status: PASS"
     } >>"$OUT"
@@ -128,6 +152,27 @@ trap 'on_error "$LINENO"' ERR
 trap cleanup EXIT
 
 write_header
+test -x "$BIN"
+test -f "$FIXTURE"
+mkdir -p "$STATIC_DIR"
+command -v curl >/dev/null
+command -v jq >/dev/null
+command -v python3 >/dev/null
+command -v tar >/dev/null
+
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/torrentng-backup-restore.XXXXXX")"
+SOURCE_SESSION="$WORK_DIR/source-session"
+SOURCE_DATA="$WORK_DIR/source-data"
+BACKUP_ROOT="$WORK_DIR/backup"
+RESTORE_ROOT="$WORK_DIR/restore"
+SOURCE_CONFIG="$WORK_DIR/source-config.toml"
+RESTORE_CONFIG="$RESTORE_ROOT/restored-config.toml"
+SOURCE_LOG="$PREFIX.source.log"
+RESTORE_LOG="$PREFIX.restore.log"
+ARCHIVE="$WORK_DIR/torrentng-session.tar.gz"
+SOURCE_LIST="$WORK_DIR/source-list.json"
+RESTORED_LIST="$WORK_DIR/restored-list.json"
+ADD_BODY="$WORK_DIR/add.json"
 mkdir -p "$SOURCE_SESSION" "$SOURCE_DATA" "$BACKUP_ROOT/session" "$RESTORE_ROOT"
 
 api_port="${TNG_BACKUP_API_PORT:-$((28080 + (BASHPID % 900)))}"
@@ -206,7 +251,7 @@ jq -e --arg hash "$info_hash" '
 record "Source state projection" "PASS" "category and tag survived API read"
 
 stop_daemon
-source_integrity="$(sqlite3 "$SOURCE_SESSION/state.db" 'PRAGMA integrity_check;')"
+source_integrity="$(sqlite_integrity "$SOURCE_SESSION/state.db")"
 [[ "$source_integrity" == "ok" ]]
 record "Source SQLite integrity" "PASS" "PRAGMA integrity_check=ok"
 
@@ -218,7 +263,7 @@ while IFS= read -r -d '' item; do
   esac
   cp -a "$item" "$BACKUP_ROOT/session/"
 done < <(find "$SOURCE_SESSION" -mindepth 1 -maxdepth 1 -print0)
-sqlite3 "$SOURCE_SESSION/state.db" ".backup '$BACKUP_ROOT/session/state.db'"
+sqlite_backup "$SOURCE_SESSION/state.db" "$BACKUP_ROOT/session/state.db"
 tar -C "$BACKUP_ROOT" -czf "$ARCHIVE" config.toml session
 tar -tzf "$ARCHIVE" >/dev/null
 record "Archive creation and listing" "PASS" "SQLite online backup plus session metadata archive"
@@ -233,7 +278,7 @@ sed \
   -e "s|127.0.0.1:$api_port|127.0.0.1:$restore_port|g" \
   "$RESTORE_ROOT/config.toml" >"$RESTORE_CONFIG"
 
-restored_integrity="$(sqlite3 "$restore_session/state.db" 'PRAGMA integrity_check;')"
+restored_integrity="$(sqlite_integrity "$restore_session/state.db")"
 [[ "$restored_integrity" == "ok" ]]
 record "Restored SQLite integrity" "PASS" "PRAGMA integrity_check=ok"
 

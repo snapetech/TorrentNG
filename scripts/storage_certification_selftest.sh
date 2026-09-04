@@ -128,6 +128,7 @@ for pattern in \
   native-engine-selftest.md \
   webui-certification-selftest.md \
   backend-burndown-native-release-smoke-selftest.md \
+  backup-restore-selftest.md \
   backend-burndown-fault-matrix-selftest.md \
   backend-api-load-selftest.md \
   local-release-selftest.md \

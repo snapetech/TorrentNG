@@ -45,6 +45,7 @@ for report in \
   security-scan-selftest.md \
   native-engine-selftest.md \
   webui-certification-selftest.md \
+  backup-restore-selftest.md \
   local-release-selftest.md \
   storage-hardware-selftest.md \
   storage-uring-graduation-selftest.md \
