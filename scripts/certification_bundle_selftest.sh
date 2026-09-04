@@ -65,7 +65,8 @@ REPORT_DIR="$report_dir" BENCHMARK_DIR="$benchmark_dir" CERTIFICATION_BUNDLE_DIR
   "$ROOT/scripts/certification_bundle.sh" "$bundle_dir/pass.tar.gz" >/dev/null
 grep -q '^Overall status: PASS$' "$report_dir/certification-bundle-"*.md
 grep -q 'Missing referenced reports: 0' "$report_dir/certification-bundle-"*.md
-tar -tzf "$bundle_dir/pass.tar.gz" | grep -q 'benchmarks/report-selftest.md'
+tar -tzf "$bundle_dir/pass.tar.gz" >"$tmpdir/pass-list.txt"
+grep -q 'benchmarks/report-selftest.md' "$tmpdir/pass-list.txt"
 
 rm -f "$report_dir/universal-live-selftest.md"
 write_report "$report_dir/universal-live-selftest.md"
