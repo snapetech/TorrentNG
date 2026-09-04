@@ -138,7 +138,9 @@ cleanup() {
   fi
   finalize
   rm -f "$SOURCE_LOG" "$RESTORE_LOG"
-  rm -rf "$WORK_DIR"
+  if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then
+    rm -rf "$WORK_DIR"
+  fi
   exit "$exit_code"
 }
 

@@ -37,6 +37,12 @@ jobs:
       - name: Lint native workspace
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      - name: Run certification script self-tests
+        run: |
+          scripts/certification_policy_selftest.sh
+          scripts/certification_bundle_selftest.sh
+          scripts/storage_certification_selftest.sh
+
   backend-fault-matrix:
     name: Backend fault-containment matrix
     needs: native-quality
