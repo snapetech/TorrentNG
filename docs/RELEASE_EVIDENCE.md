@@ -4,8 +4,8 @@ This is the operator sequence for turning the current certification state into a
 strict release-ready state.
 
 The repository CI gate is currently green on `main`: GitHub Actions run
-`33910318860` passed all ten jobs on `83b70ce`, and the dynamic `Push on main`
-orchestration run `33910318425` also passed. This closes hosted repository
+`33915548520` passed all ten jobs on `f1c39fd`, and the dynamic CodeQL
+orchestration run `33915547352` also passed all four analyses. This closes hosted repository
 execution; it does not by itself configure branch protection or certify public
 network, target-device, or 24-hour-soak behavior.
 

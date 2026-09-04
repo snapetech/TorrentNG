@@ -4,7 +4,7 @@
 
 | Check | Result | Evidence |
 | --- | --- | --- |
-| Source revision | recorded | clean `main` at `83b70ce`; the current release gate and smoke report record `Worktree: clean` |
+| Source revision | recorded | release artifact built from clean code commit `83b70ce`; current `main` is `f1c39fd` with documentation/certification-harness follow-up; both trees are clean |
 | Release build | PASS | `cargo build --release --locked -p torrentngd` |
 | Binary | PASS | `target/release/torrentngd`; 22,433,352 bytes; SHA-256 `ff94ede075f7541ef9eecf5418b1c31324fb1b6ca2648681d975b3e9cd048e73` |
 | Authenticated deployment smoke | PASS | [`backend-burndown-native-release-smoke-local-release-20260904T192950Z.md`](../certification/reports/backend-burndown-native-release-smoke-local-release-20260904T192950Z.md) |
@@ -22,10 +22,10 @@
 | Local release gate | PASS_WITH_WARNINGS | [`local-release-backend-burndown-final-20260904.md`](../certification/reports/local-release-backend-burndown-final-20260904.md); all local implementation gates pass; only real-device storage certification is skipped |
 | External evidence preflight | PASS_WITH_WARNINGS | [`external-evidence-preflight-20260904T193524Z.md`](../certification/reports/external-evidence-preflight-20260904T193524Z.md); migration corpus and Docker pass; public opt-in, real-device target, and active 24-hour soak are not configured |
 
-Hosted repository CI is now green: run `33910318860` passed all ten jobs on
-`83b70ce`, and dynamic `Push on main` orchestration run `33910318425` also
-passed. This closes the hosted repository gate; branch-protection enforcement
-and the public/device/soak qualification gates remain separate.
+Hosted repository CI is now green: run `33915548520` passed all ten jobs on
+`f1c39fd`, and dynamic CodeQL orchestration run `33915547352` passed all four
+analyses. This closes the hosted repository gate; branch-protection
+enforcement and the public/device/soak qualification gates remain separate.
 
 This is the current local release-binary record. It is not a public,
 real-device, 24-hour soak, universal-compatibility, or 100k capacity
