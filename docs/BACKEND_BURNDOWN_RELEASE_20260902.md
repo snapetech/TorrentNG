@@ -22,7 +22,7 @@
 | Local universal-live interop | PASS_WITH_SKIPS | [`universal-live-current-20260904.md`](../certification/reports/universal-live-current-20260904.md); current local Docker matrix passes; public torrent and real-device legs are explicit skips |
 | Security scan | PASS | [`security-scan-current-20260904.md`](../certification/reports/security-scan-current-20260904.md); npm audit, locked Cargo tree, and container scan pass with no HIGH/CRITICAL findings |
 | Local release gate | PASS_WITH_WARNINGS | [`local-release-backend-burndown-final-20260904.md`](../certification/reports/local-release-backend-burndown-final-20260904.md); all local implementation gates pass; only real-device storage certification is skipped |
-| External evidence preflight | PASS_WITH_WARNINGS (stale snapshot) | [`external-evidence-preflight-20260904T193524Z.md`](../certification/reports/external-evidence-preflight-20260904T193524Z.md) predates the public run and active soak; real-device storage remains unconfigured |
+| External evidence preflight | PASS_WITH_WARNINGS | [`external-evidence-preflight-public-soak-20260905T193039Z.md`](../certification/reports/external-evidence-preflight-public-soak-20260905T193039Z.md); Docker, public opt-in, migration corpus, and active soak pass; real-device storage is the single warning |
 
 Hosted repository CI is now green: run `33916500668` passed all ten jobs on
 `8c46b61`, and dynamic CodeQL orchestration run `33916500079` passed all four
