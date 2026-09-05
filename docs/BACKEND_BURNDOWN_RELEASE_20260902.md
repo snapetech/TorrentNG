@@ -22,7 +22,7 @@
 | Local universal-live interop | PASS_WITH_SKIPS | [`universal-live-current-20260904.md`](../certification/reports/universal-live-current-20260904.md); current local Docker matrix passes; public torrent and real-device legs are explicit skips |
 | Security scan | PASS | [`security-scan-current-20260904.md`](../certification/reports/security-scan-current-20260904.md); npm audit, locked Cargo tree, and container scan pass with no HIGH/CRITICAL findings |
 | Local release gate | PASS_WITH_WARNINGS | [`local-release-backend-burndown-final-20260904.md`](../certification/reports/local-release-backend-burndown-final-20260904.md); all local implementation gates pass; only real-device storage certification is skipped |
-| External evidence preflight | PASS_WITH_WARNINGS | [`external-evidence-preflight-public-soak-20260905T193039Z.md`](../certification/reports/external-evidence-preflight-public-soak-20260905T193039Z.md); Docker, public opt-in, migration corpus, and active soak pass; real-device storage is the single warning |
+| External evidence preflight | PASS_WITH_WARNINGS | [`external-evidence-preflight-public-soak-20260905T193325Z.md`](../certification/reports/external-evidence-preflight-public-soak-20260905T193325Z.md); Docker, public opt-in, migration corpus, and active v3 soak pass; real-device storage is the single warning |
 
 Hosted repository CI is now green: run `33916500668` passed all ten jobs on
 `8c46b61`, and dynamic CodeQL orchestration run `33916500079` passed all four
@@ -111,7 +111,7 @@ configured, and no 24-hour soak was active.
 | --- | --- | --- |
 | Release / interoperability | Extend the passing Debian public run to the remaining approved public sources and refresh universal compatibility against this artifact | New `universal-compat-*` and `universal-live-*` reports with no unknown/stale rows |
 | Storage operator | Set `TNG_STORAGE_BENCH_DIR` to the target mount and run the real-device storage certification | New storage hardware, io_uring, move/import, and indexed reports |
-| Release operator | Finalize the active named Debian soak after 86,400 seconds | `.run/soak-24h-public-debian-20260905-v2.md` with the required sample count and a passing post-soak gate |
+| Release operator | Finalize the active named Debian soak after 86,400 seconds | `.run/soak-24h-public-debian-20260905-v3.md` with the required sample count and a passing post-soak gate |
 | Backend performance | Optional extended proof: run 1k/2k simultaneous hot fixtures with real metadata diversity, peer traffic, and tracker deadlines | The older [`backend-burndown-native-scale-release-final-20260902.md`](../certification/reports/backend-burndown-native-scale-release-final-20260902.md) is historical; this is not part of the current functional gate |
 | Storage reliability | Crash/restart a real move/import plan, including sparse checkpoint indexes, cancellation, disk/permission failure, and DB persistence failure | Durable job/event report plus reconciliation behavior |
 | API performance | Optional extended proof: load list, stats, SSE, qBit `sync/maindata`, slow consumers, cursor expiry, and concurrent snapshot refreshes | Latency/allocation/backpressure report; documented large-qBit live-field semantics are already explicit |

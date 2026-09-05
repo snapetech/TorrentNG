@@ -60,8 +60,7 @@ if [[ "$USE_SYSTEMD" == "1" ]] && command -v systemd-run >/dev/null 2>&1 &&
     fi
   done
   systemd-run --user --unit="$SYSTEMD_UNIT" --collect --no-block \
-    --property=Restart=on-failure \
-    --property=RestartSec=5s \
+    --property=Restart=no \
     --property="StandardOutput=append:$LOG" \
     --property="StandardError=append:$LOG" \
     "${systemd_env[@]}" \

@@ -27,8 +27,8 @@ interop Compose services now use overrideable explicit DNS servers
 
 ## Active 24-hour soak
 
-The soak started at `2026-09-05T19:22:10Z` under the user-systemd unit
-`torrentng-public-debian-soak-20260905.service` with:
+The counted soak started at `2026-09-05T19:32:58Z` under the user-systemd unit
+`torrentng-public-debian-soak-20260905-v3.service` with:
 
 - target: `http://127.0.0.1:28180`
 - daemon container: `torrentng-interop-torrentngd-1`
@@ -36,9 +36,9 @@ The soak started at `2026-09-05T19:22:10Z` under the user-systemd unit
 - expected torrent hash: `481b6e3617be4c88f96cb25e47c9d8272130071e`
 - duration: `86400` seconds
 - interval: `60` seconds
-- initial MainPID: `2189470` (the systemd unit owns restart behavior)
-- live report: `.run/soak-24h-public-debian-20260905-v2.md`
-- live log: `.run/soak-24h-public-debian-20260905-v2.log`
+- initial MainPID: `2230423` (the systemd unit owns process lifetime and does not auto-restart a failed soak)
+- live report: `.run/soak-24h-public-debian-20260905-v3.md`
+- live log: `.run/soak-24h-public-debian-20260905-v3.log`
 
 The first sample was healthy: `/health` 200, one torrent, 100% completed,
 RSS 1.3 MB, one thread, three file descriptors, 20,632 MB free, metrics 200,
@@ -49,12 +49,13 @@ every sample. It will not report PASS until the full duration completes.
 Inspect the supervisor and live report:
 
 ```sh
-systemctl --user status torrentng-public-debian-soak-20260905.service
-tail -n 20 .run/soak-24h-public-debian-20260905-v2.md
-SOAK_MIN_TORRENTS=1 scripts/soak_status.sh .run/soak-24h-public-debian-20260905-v2.md
+systemctl --user status torrentng-public-debian-soak-20260905-v3.service
+tail -n 20 .run/soak-24h-public-debian-20260905-v3.md
+SOAK_MIN_TORRENTS=1 scripts/soak_status.sh .run/soak-24h-public-debian-20260905-v3.md
 ```
 
 The first background-launch attempt was terminated after its first sample by
 the agent shell and is not counted as soak evidence. The launcher now prefers
 a user-systemd supervisor when available and falls back to a detached session
-when it is not; the active run uses the systemd path directly.
+when it is not; the active run uses the systemd path directly. Automatic
+restart is disabled so a process failure remains visible in the report.

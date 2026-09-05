@@ -112,7 +112,9 @@ scripts/start_24h_soak.sh
 For a public-torrent soak, set `SOAK_EXPECTED_TORRENT_NAME` and
 `SOAK_EXPECTED_TORRENT_HASH`. The runner then requires that exact completed
 torrent in every sample. When a user systemd manager is available, the launcher
-uses it with restart-on-failure; otherwise it uses a detached session.
+uses it as a supervised process with no automatic restart, so a failed soak
+cannot be silently replaced by a fresh report; otherwise it uses a detached
+session.
 
 Check launcher preconditions without starting the background job:
 

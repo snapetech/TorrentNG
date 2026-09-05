@@ -147,7 +147,7 @@ status is intentionally still open until the full 86,400 seconds and post-soak
 checks complete.
 
 The current external preflight is
-[`external-evidence-preflight-public-soak-20260905T193039Z.md`](../certification/reports/external-evidence-preflight-public-soak-20260905T193039Z.md):
+[`external-evidence-preflight-public-soak-20260905T193325Z.md`](../certification/reports/external-evidence-preflight-public-soak-20260905T193325Z.md):
 Docker, public opt-in, migration corpus, and the active soak are green. The
 real-device target remains the single warning; the current public and soak
 evidence is recorded above.
