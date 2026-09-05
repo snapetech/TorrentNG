@@ -1,7 +1,13 @@
 name: torrentng-interop
 
+x-interop-dns: &interop-dns
+  dns:
+    - "${INTEROP_DNS_PRIMARY:-1.1.1.1}"
+    - "${INTEROP_DNS_SECONDARY:-8.8.8.8}"
+
 services:
   torrentngd:
+    <<: *interop-dns
     image: torrentng/torrentngd:interop
     build:
       context: ../..
@@ -28,6 +34,7 @@ services:
     networks: [interop]
 
   qbittorrent:
+    <<: *interop-dns
     image: lscr.io/linuxserver/qbittorrent:latest
     restart: unless-stopped
     ports:
@@ -48,6 +55,7 @@ services:
     networks: [interop]
 
   transmission:
+    <<: *interop-dns
     image: lscr.io/linuxserver/transmission:latest
     restart: unless-stopped
     ports:
@@ -68,6 +76,7 @@ services:
     networks: [interop]
 
   deluge:
+    <<: *interop-dns
     image: lscr.io/linuxserver/deluge:latest
     restart: unless-stopped
     ports:
@@ -87,6 +96,7 @@ services:
     networks: [interop]
 
   rtorrent:
+    <<: *interop-dns
     image: jesec/rtorrent:latest
     restart: unless-stopped
     command: ["-o", "system.daemon.set=true", "-o", "import=/config/rtorrent.rc"]

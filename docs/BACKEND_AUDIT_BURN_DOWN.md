@@ -81,10 +81,10 @@ long-soak results remain separate evidence gates.
 | `cargo +1.88 build/test --workspace --all-targets --locked` | PASS | Declared main-workspace MSRV build and tests green. |
 | `cargo +1.97.0 build/test --manifest-path sidecar/Cargo.toml --locked` | PASS | Declared sidecar MSRV build and tests green. |
 | declared `rust-version` (both `Cargo.toml`s) | **CORRECTED** | Was `1.80` in both, unverified and untrue. Neither workspace's *locked* dependency graph builds below 1.88 (main: `idna_adapter` needs rustc 1.86+, plus `edition2024` needs Cargo 1.85+) or 1.97 (sidecar: `libsqlite3-sys`'s build script uses `cfg_select!`, stabilized between 1.94 and 1.97). This is a transitive-dependency floor, not first-party code needing new syntax. Corrected both `rust-version` fields to `1.88` / `1.97` to match reality; this itself is TNG-028 acceptance criteria ("document the supported toolchain"). |
-| GitHub Actions CI run `33915548520` | PASS | All 10 jobs passed on `f1c39fd`: native quality, both MSRV jobs, fuzz smoke, sidecar, WebUI, dependency security, backup/restore, API/SSE load, and fault containment. |
+| GitHub Actions CI run `33916500668` | PASS | All 10 jobs passed on `8c46b61`: native quality, both MSRV jobs, fuzz smoke, sidecar, WebUI, dependency security, backup/restore, API/SSE load, and fault containment. |
 
 The hosted CI workflow has now run successfully. The companion dynamic
-CodeQL orchestration also passed all four analyses (`33915547352`). This proves the
+CodeQL orchestration also passed all four analyses (`33916500079`). This proves the
 repository gates execute on GitHub's runners; it does not prove that branch
 protection requires them, and the repository's branch-protection setting must
 still be reviewed separately.
@@ -110,10 +110,11 @@ Full workspace tests, warnings-denied clippy, formatting, OpenAPI validation,
 sidecar tests, the current security scan, and the universal-live local Docker
 matrix are green. These are current local facts, not external production
 evidence. The universal-live report is `PASS_WITH_SKIPS`: its 28 local Docker
-cases pass in [`universal-live-current-20260904.md`](../certification/reports/universal-live-current-20260904.md),
-while public-torrent and real-device legs remain explicit skips.
+cases pass in [`universal-live-current-20260904.md`](../certification/reports/universal-live-current-20260904.md).
+The separate public Debian matrix now passes; real-device storage remains an
+explicit skip.
 
-The documentation and certification-harness follow-up is now `f1c39fd`; it
+The documentation and certification-harness follow-up is now `8c46b61`; it
 does not change the daemon binary. The local release process also passed the focused fault and API-load gates:
 [`backend-burndown-native-fault-live-current-20260904.md`](../certification/reports/backend-burndown-native-fault-live-current-20260904.md)
 passed live SIGKILL/restart, injected SQLite failure/recovery, API
@@ -130,13 +131,26 @@ The current full Docker interoperability matrix is
 [`interop-matrix-20260904T195529Z.md`](../certification/reports/interop-matrix-20260904T195529Z.md).
 It covers bidirectional transfers with qBittorrent, Transmission, Deluge, and
 rTorrent, failure/recovery protocol cases, and native/qBittorrent/Transmission/
-Deluge facade mutations. The public Internet matrix remains intentionally
-unrun.
+Deluge facade mutations.
+
+The first live public-torrent matrix is
+[`public-debian-interop-20260905T191253Z.md`](../certification/reports/public-debian-interop-20260905T191253Z.md).
+It resolved the official Debian 13.6 netinst torrent, supplied its verified
+metainfo to Rust and the four reference clients, transferred 791,674,880
+bytes, reached 100% in Rust, and observed three reference-client peers. The
+v1 info hash is `481b6e3617be4c88f96cb25e47c9d8272130071e`. This closes one
+public-swarm evidence row; it does not establish universal compatibility.
+
+The named public-torrent 24-hour soak is active under the launch record
+[`PUBLIC_TORRENT_SOAK_20260905.md`](PUBLIC_TORRENT_SOAK_20260905.md). Its final
+status is intentionally still open until the full 86,400 seconds and post-soak
+checks complete.
 
 The current external preflight is
 [`external-evidence-preflight-20260904T193524Z.md`](../certification/reports/external-evidence-preflight-20260904T193524Z.md):
-migration corpus and Docker are green; public-network opt-in, a writable
-real-device target, and an active 24-hour soak are not configured.
+migration corpus and Docker are green, but that report predates the public
+transfer and active soak. The real-device target remains unconfigured; the
+current public and soak evidence is recorded above.
 
 ### Historical functional isolation checkpoint (2026-09-02)
 
@@ -228,9 +242,10 @@ Still genuinely open after this pass:
   deliberate capability boundary, not a hidden implementation claim.
 - TNG-023 still needs accepted certification evidence before its `certified`
   state can change. TNG-025/027/028 now have hosted CI evidence in run
-  `33915548520`; branch-protection enforcement remains a repository-settings
-  question. TNG-026 has current local release, fault, API-load, and hosted
-  repository-gate evidence but not public, device, or soak evidence.
+  `33916500668`; branch-protection enforcement remains a repository-settings
+  question. TNG-026 has current local release, fault, API-load, hosted
+  repository-gate, and one official public-transfer result; device and soak
+  evidence remain open.
 - TNG-027 has real parser fuzz targets, local runs, and a passing hosted fuzz
   smoke; broader mutation replay remains evidence work.
 - TNG-029's stated synchronous actor-owned persistence defect is resolved:
@@ -295,7 +310,7 @@ and is superseded by the source reconciliation above.
 | TNG-023 | Implemented locally: implemented/enabled/certified/experimental assurance states are separate | Keep `certified` empty until external evidence is accepted |
 | TNG-024 | Implemented locally: fail-closed config validation, secret-file support, deployment templates | Run deployment on the target orchestrator and inspect rendered secrets |
 | TNG-025 | Resolved for the repository gate: native quality, clippy, MSRV, fuzz, release-smoke, security, backup, load, and fault jobs execute successfully | Branch-protection enforcement still needs repository-settings review |
-| TNG-026 | Current release artifact was built from clean `83b70ce`, deployed locally, authenticated, smoked, backed up/restored, and shut down cleanly; hosted CI run `33915548520` also passed on the docs/harness follow-up `f1c39fd` | Public/device/24-hour evidence and strict readiness remain external gates |
+| TNG-026 | Current release artifact was built from clean `83b70ce`, deployed locally, authenticated, smoked, backed up/restored, and shut down cleanly; hosted CI run `33916500668` also passed on `8c46b61` | One official public Debian transfer passes; real-device storage, the 24-hour soak, remaining public sources, and strict readiness remain external gates |
 | TNG-027 | Resolved for the repository gate: fuzz targets, OpenAPI validator, idempotency tests, and hosted bounded fuzz smoke are green | Broader parser and mutation replay corpus remains optional evidence work |
 | TNG-028 | Resolved for the repository gate: format, clippy, locked tests, and declared MSRV pass locally and in hosted CI | Branch-protection enforcement still needs repository-settings review |
 | TNG-029 | Resolved for the stated persistence-isolation finding: authoritative engine DB work uses a dedicated bounded supervised worker; live crash/DB/storage fault matrix and local client matrix pass | Full actor decomposition and deployment-specific fault evidence remain non-release structural follow-up |
@@ -1598,6 +1613,7 @@ claims:
 | 2026-09-03 local / 2026-09-04 UTC | Rebuilt the current release artifact and reran the strict local fault matrix, live daemon fault matrix, 30-second API/SSE load, and local Docker interoperability matrix. Corrected a real peer self-connection fallback that disabled webseed recovery, corrected qBittorrent progress/piece projection after stale completion timestamps, and fixed the interop harness to assert documented 501 responses for unsupported qBittorrent mutations. | Release smoke: 22,470,824 bytes, SHA-256 `caa3c725bdd29e49677dfd0bf11a70904650d5954092f533e1684ceab7fd1f76`, 466 ms; fault matrix PASS; 191,893 requests with 32 JSON clients and 8 slow SSE consumers, zero errors; local interop [`interop-matrix-backend-local-20260904-final.md`](../certification/reports/interop-matrix-backend-local-20260904-final.md) reconciles 28/28 PASS. | TNG-011/TNG-013/TNG-026/TNG-029 local implementation and evidence gates remain closed for their declared scopes. Pure-v2 transfer/completion is explicitly unsupported and the rTorrent library boundary is documented/tested. Hosted CI observation, public Internet compatibility, real-device storage, 24-hour soak, allocator/production-corpus evidence, and extended capacity proof remain external or deferred. |
 | 2026-09-04 local / 2026-09-04 UTC | Final local burn-down refresh: rebuilt the release binary after metrics privacy and sidecar security changes; completed the live storage/DB fault matrix, many-client/slow-SSE load, storage regression suite, webseed deadline scheduler, peer-channel budget, sidecar auth/default-bind/proxy tests, security scan, policy self-tests, and universal-live local Docker interop. Default Prometheus labels hash torrent identifiers; raw IDs require explicit opt-in. | Release smoke [`backend-burndown-native-release-smoke-current-20260904.md`](../certification/reports/backend-burndown-native-release-smoke-current-20260904.md): 22,518,096 bytes, SHA-256 `9f2dd59ba4bff2f760c789288dc057aab22c0f957ce4e47c36d51f0ff6699288`, 470 ms; sidecar 125 unit/87 integration tests; rt-storage 130 tests; security scan PASS with no HIGH/CRITICAL image findings; universal-live [`universal-live-backend-local-20260904-current-pass.md`](../certification/reports/universal-live-backend-local-20260904-current-pass.md) PASS_WITH_SKIPS with 28/28 local cases PASS. | All repository-actionable TNG implementation, contract, security, CI, and local-evidence work is closed for the declared scope. Remaining gates are external-only: hosted CI observation/branch protection, public-client/network interop, target-device storage, 24-hour soak, production-corpus allocator/fairness/transport profiles, and optional 100k capacity proof. Pure-v2 transfer/completion and the unowned rTorrent HTTP-server interpretation remain explicitly unsupported. |
 | 2026-09-04 local / 2026-09-04 UTC | CI failure burn-down and evidence refresh: fixed hosted scheduling/fixture races, made recovery evidence portable, made certification archives pipefail-safe, made missing security tooling fail closed, waited for daemon readiness after restart, fenced cleanup assertions on durable DB state, and removed the interop metrics probe SIGPIPE. Rebuilt the clean release artifact and reran the current full Docker matrix. | Hosted CI run `33915548520` is green with all 10 jobs on `f1c39fd`; dynamic CodeQL run `33915547352` is green with all four analyses; release artifact is 22,433,352 bytes with SHA-256 `ff94ede075f7541ef9eecf5418b1c31324fb1b6ca2648681d975b3e9cd048e73` and 462 ms smoke; current local Docker matrix [`interop-matrix-20260904T195529Z.md`](../certification/reports/interop-matrix-20260904T195529Z.md) is 28/28 PASS. | TNG-025/027/028 repository gates are resolved. Branch-protection enforcement, public/client/device/24-hour evidence, production-corpus profiling, and optional extended-capacity proof remain explicit external or optional gates. |
+| 2026-09-05 local / 2026-09-05 UTC | Ran the official Debian 13.6 netinst public torrent through the Docker interop stack. Corrected public-mode client setup to use the host-resolved metainfo file, made interop DNS overrideable, added exact name/hash/completed-state assertions to the soak runner, corrected thread telemetry to read Linux `Threads:`, and made the 24-hour launcher prefer a supervised user-systemd unit. | [`public-debian-interop-20260905T191253Z.md`](../certification/reports/public-debian-interop-20260905T191253Z.md) is PASS: 791,674,880 bytes, Rust complete, three reference-client peers. The named 86,400-second soak is active under `torrentng-public-debian-soak-20260905.service`; launch details are in [`PUBLIC_TORRENT_SOAK_20260905.md`](PUBLIC_TORRENT_SOAK_20260905.md). Initial post-launch samples are healthy; final soak status is not yet proven. | One public-swarm transfer is now evidenced. Remaining external gates are the completed long soak, real-device storage, remaining approved public sources/universal compatibility, and optional capacity/profiling work. |
 
 ## Release gate
 

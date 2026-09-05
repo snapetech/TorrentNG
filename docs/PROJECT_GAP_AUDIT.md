@@ -1,6 +1,6 @@
 # TorrentNG Project Gap Audit
 
-Status as of 2026-09-04 on clean `main` at `f1c39fd`; the current runtime
+Status as of 2026-09-05 on clean `main` at `8c46b61`; the current runtime
 artifact and local execution evidence were built from code commit `83b70ce`.
 
 This audit separates local implementation gaps from external evidence gates.
@@ -52,7 +52,7 @@ Current `scripts/certification_status.sh` highlights:
 | Area | Status |
 | --- | --- |
 | Native engine rewrite | PASS |
-| Hosted CI repository gate | PASS (`33915548520`, all 10 jobs; CodeQL `33915547352` also green) |
+| Hosted CI repository gate | PASS (`33916500668`, all 10 jobs; CodeQL `33916500079` also green) |
 | Local release gate | PASS_WITH_WARNINGS; target-device storage is skipped |
 | Storage hardware matrix | Historical evidence only; current target unavailable |
 | Storage io_uring capability/graduation | Historical evidence only; current target unavailable |

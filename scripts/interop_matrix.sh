@@ -1641,14 +1641,26 @@ add_public_to_client() {
   save_path="$(download_dir "$client")/public"
   case "$client" in
     torrentngd)
-      curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" -F "urls=$url" -F "savepath=$save_path" "$(client_url torrentngd)/api/qb/v2/torrents/add" >/dev/null
+      if [[ -n "$torrent_file" ]]; then
+        add_rust "$torrent_file" "$save_path"
+      else
+        add_rust_url "$url" "$save_path"
+      fi
       ;;
     qbittorrent)
-      qb_login
-      curl --max-time "$CURL_MAX_TIME" -fsS -H 'Host: localhost:8080' -b "$WORKDIR/artifacts/qbit.cookie" -F "urls=$url" -F "savepath=$save_path" "$(client_url qbittorrent)/api/v2/torrents/add" >/dev/null
+      if [[ -n "$torrent_file" ]]; then
+        add_qb "$torrent_file" "$save_path"
+      else
+        qb_login
+        curl --max-time "$CURL_MAX_TIME" -fsS -H 'Host: localhost:8080' -b "$WORKDIR/artifacts/qbit.cookie" -F "urls=$url" -F "savepath=$save_path" "$(client_url qbittorrent)/api/v2/torrents/add" >/dev/null
+      fi
       ;;
     transmission)
-      transmission_rpc "{\"method\":\"torrent-add\",\"arguments\":{\"filename\":\"$url\",\"download-dir\":\"$save_path\",\"paused\":false}}" >/dev/null
+      if [[ -n "$torrent_file" ]]; then
+        add_transmission "$torrent_file" "$save_path"
+      else
+        transmission_rpc "{\"method\":\"torrent-add\",\"arguments\":{\"filename\":\"$url\",\"download-dir\":\"$save_path\",\"paused\":false}}" >/dev/null
+      fi
       ;;
     deluge)
       if [[ -n "$torrent_file" ]]; then

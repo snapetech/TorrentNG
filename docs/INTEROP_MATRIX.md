@@ -69,10 +69,52 @@ already current.
 INTEROP_SKIP_BUILD=1 scripts/interop_matrix.sh --local
 ```
 
+Public mode resolves the official torrent URL on the host, downloads and
+parses the metainfo once, then supplies that verified `.torrent` file to every
+client. This keeps a client-container DNS outage from being misreported as a
+TorrentNG transfer failure. The interop services use explicit, overrideable DNS
+servers; set `INTEROP_DNS_PRIMARY` and `INTEROP_DNS_SECONDARY` when the test
+network requires different resolvers.
+
+For a public run that leaves the swarm available for a later soak:
+
+```sh
+INTEROP_PUBLIC_ONLY=debian \
+INTEROP_KEEP_STACK=1 \
+INTEROP_KEEP_PUBLIC_DATA=1 \
+scripts/interop_matrix.sh --public
+```
+
 The latest local run, recorded against clean `main` at `83b70ce`, passed all 28 cases (10
 base, 4 extended, and 14 protocol rows):
 [`interop-matrix-20260904T195529Z.md`](../certification/reports/interop-matrix-20260904T195529Z.md).
-Public-network and real-device legs remain separate opt-in gates.
+The public Debian leg also passed on 2026-09-05:
+[`public-debian-interop-20260905T191253Z.md`](../certification/reports/public-debian-interop-20260905T191253Z.md).
+Real-device storage remains a separate external gate.
+
+The public run resolved Debian 13.6 netinst from the official Debian source,
+transferred 791,674,880 bytes, reached 100% in Rust, and observed three
+reference-client peers. Its v1 info hash is
+`481b6e3617be4c88f96cb25e47c9d8272130071e`. This is one public torrent
+compatibility result, not universal client or production-network certification.
+
+To start a named public-torrent soak after the matrix completes, pass the
+identity invariants into the soak launcher:
+
+```sh
+SOAK_EXPECTED_TORRENT_NAME=debian-13.6.0-amd64-netinst.iso \
+SOAK_EXPECTED_TORRENT_HASH=481b6e3617be4c88f96cb25e47c9d8272130071e \
+TNG_HOST_URL=http://127.0.0.1:28180 \
+TNG_API_TOKEN=interop-backend-token-20260904 \
+TNG_CONTAINER=torrentng-interop-torrentngd-1 \
+SOAK_DATA_PATH=/downloads/torrentngd \
+scripts/start_24h_soak.sh certification/reports/soak-24h-public-debian.md
+```
+
+The soak checks the exact name, hash, completed progress, and uploading/seeding
+state on every sample in addition to health, sync, metrics, resource, and
+dependency checks. Do not treat the run as complete until its final report
+contains `Overall status: PASS` after the full 86,400-second interval.
 
 ## Local Matrix
 

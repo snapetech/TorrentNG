@@ -4,7 +4,7 @@
 
 | Check | Result | Evidence |
 | --- | --- | --- |
-| Source revision | recorded | release artifact built from clean code commit `83b70ce`; current `main` is `f1c39fd` with documentation/certification-harness follow-up; both trees are clean |
+| Source revision | recorded | release artifact built from clean code commit `83b70ce`; the current evidence baseline is `main` at `8c46b61`, with the public-harness/DNS/soak follow-up recorded below |
 | Release build | PASS | `cargo build --release --locked -p torrentngd` |
 | Binary | PASS | `target/release/torrentngd`; 22,433,352 bytes; SHA-256 `ff94ede075f7541ef9eecf5418b1c31324fb1b6ca2648681d975b3e9cd048e73` |
 | Authenticated deployment smoke | PASS | [`backend-burndown-native-release-smoke-local-release-20260904T192950Z.md`](../certification/reports/backend-burndown-native-release-smoke-local-release-20260904T192950Z.md) |
@@ -17,20 +17,22 @@
 | Live fault matrix | PASS | [`backend-burndown-native-fault-live-current-20260904.md`](../certification/reports/backend-burndown-native-fault-live-current-20260904.md); SIGKILL/restart, SQLite failure/recovery, storage cancellation, and filesystem failure all remain isolated |
 | API/SSE load | PASS | [`backend-api-load-current-20260904-final.md`](../certification/reports/backend-api-load-current-20260904-final.md); 204,936 requests over 30 seconds, 32 JSON clients, 8 slow SSE consumers, zero errors |
 | Local client/protocol interoperability | PASS | [`interop-matrix-20260904T195529Z.md`](../certification/reports/interop-matrix-20260904T195529Z.md); 28/28 local cases across qBittorrent, Transmission, Deluge, and rTorrent |
+| Public legal torrent matrix | PASS | [`public-debian-interop-20260905T191253Z.md`](../certification/reports/public-debian-interop-20260905T191253Z.md); official Debian 13.6 netinst, 791,674,880 bytes, Rust completed, three reference-client peers observed |
+| Public Debian 24-hour soak | IN_PROGRESS | [`PUBLIC_TORRENT_SOAK_20260905.md`](PUBLIC_TORRENT_SOAK_20260905.md); named soak is supervised and must finish 86,400 seconds before it can be marked PASS |
 | Local universal-live interop | PASS_WITH_SKIPS | [`universal-live-current-20260904.md`](../certification/reports/universal-live-current-20260904.md); current local Docker matrix passes; public torrent and real-device legs are explicit skips |
 | Security scan | PASS | [`security-scan-current-20260904.md`](../certification/reports/security-scan-current-20260904.md); npm audit, locked Cargo tree, and container scan pass with no HIGH/CRITICAL findings |
 | Local release gate | PASS_WITH_WARNINGS | [`local-release-backend-burndown-final-20260904.md`](../certification/reports/local-release-backend-burndown-final-20260904.md); all local implementation gates pass; only real-device storage certification is skipped |
-| External evidence preflight | PASS_WITH_WARNINGS | [`external-evidence-preflight-20260904T193524Z.md`](../certification/reports/external-evidence-preflight-20260904T193524Z.md); migration corpus and Docker pass; public opt-in, real-device target, and active 24-hour soak are not configured |
+| External evidence preflight | PASS_WITH_WARNINGS (stale snapshot) | [`external-evidence-preflight-20260904T193524Z.md`](../certification/reports/external-evidence-preflight-20260904T193524Z.md) predates the public run and active soak; real-device storage remains unconfigured |
 
-Hosted repository CI is now green: run `33915548520` passed all ten jobs on
-`f1c39fd`, and dynamic CodeQL orchestration run `33915547352` passed all four
+Hosted repository CI is now green: run `33916500668` passed all ten jobs on
+`8c46b61`, and dynamic CodeQL orchestration run `33916500079` passed all four
 analyses. This closes the hosted repository gate; branch-protection
 enforcement and the public/device/soak qualification gates remain separate.
 
-This is the current local release-binary record. It is not a public,
-real-device, 24-hour soak, universal-compatibility, or 100k capacity
-certificate. The older release bundle below is retained as historical evidence
-and is tied to an earlier binary digest.
+This is the current local release-binary record plus the first public Debian
+transfer result. It is not a universal-compatibility, real-device, completed
+24-hour-soak, or 100k-capacity certificate. The older release bundle below is
+retained as historical evidence and is tied to an earlier binary digest.
 
 Everything below is historical evidence from the 2026-09-02 bundle. Its old
 TNG-011/TNG-029 wording and artifact digest are superseded by the current
@@ -107,14 +109,14 @@ configured, and no 24-hour soak was active.
 
 | Owner | Action | Required artifact / gate |
 | --- | --- | --- |
-| Release / interoperability | Refresh universal compatibility and live compatibility against this artifact; approve the public fixture before enabling it | New `universal-compat-*` and `universal-live-*` reports with no unknown/stale rows |
+| Release / interoperability | Extend the passing Debian public run to the remaining approved public sources and refresh universal compatibility against this artifact | New `universal-compat-*` and `universal-live-*` reports with no unknown/stale rows |
 | Storage operator | Set `TNG_STORAGE_BENCH_DIR` to the target mount and run the real-device storage certification | New storage hardware, io_uring, move/import, and indexed reports |
-| Release operator | Run and finalize the 24-hour soak | `soak-24h-*` report with the required sample count and a passing post-soak gate |
+| Release operator | Finalize the active named Debian soak after 86,400 seconds | `.run/soak-24h-public-debian-20260905-v2.md` with the required sample count and a passing post-soak gate |
 | Backend performance | Optional extended proof: run 1k/2k simultaneous hot fixtures with real metadata diversity, peer traffic, and tracker deadlines | The older [`backend-burndown-native-scale-release-final-20260902.md`](../certification/reports/backend-burndown-native-scale-release-final-20260902.md) is historical; this is not part of the current functional gate |
 | Storage reliability | Crash/restart a real move/import plan, including sparse checkpoint indexes, cancellation, disk/permission failure, and DB persistence failure | Durable job/event report plus reconciliation behavior |
 | API performance | Optional extended proof: load list, stats, SSE, qBit `sync/maindata`, slow consumers, cursor expiry, and concurrent snapshot refreshes | Latency/allocation/backpressure report; documented large-qBit live-field semantics are already explicit |
 
-Until those artifacts exist, the honest product statement is: **the local
-release binary runs and the focused remediation is materially implemented;
-100k capacity, universal compatibility, and production deployment readiness are
-not certified.**
+Until the active soak and remaining external artifacts finish, the honest
+product statement is: **the local release binary and one official public
+Debian transfer pass; 24-hour, universal-compatibility, real-device, 100k
+capacity, and production deployment readiness are not certified.**

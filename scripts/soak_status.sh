@@ -70,6 +70,21 @@ if (( extended )); then
   (( bad_metrics == 0 )) || status="FAIL"
   (( bad_components == 0 )) || status="FAIL"
 fi
+expected_name="$(sed -nE 's/^- Expected torrent name: (.+)$/\1/p' "$REPORT" | head -n1)"
+expected_result=""
+if [[ -n "$expected_name" && "$expected_name" != "none" ]]; then
+  if grep -q '^| expected public torrent | FAIL |' "$REPORT"; then
+    status="FAIL"
+    expected_result="FAIL"
+  elif grep -q '^| expected public torrent | PASS |' "$REPORT"; then
+    expected_result="PASS"
+  else
+    expected_result="IN_PROGRESS"
+  fi
+fi
+if [[ "$status" == "PASS" && -n "$active" ]]; then
+  status="IN_PROGRESS"
+fi
 
 echo "# TorrentNG Soak Status"
 echo
@@ -88,6 +103,9 @@ echo "| Torrent floor | $([[ "$min_torrents" -ge "$MIN_TORRENTS" ]] && echo PASS
 echo "| Memory ceiling | $(awk -v rss="$max_rss" -v limit="$MAX_RSS_MB" 'BEGIN {print (rss <= limit) ? "PASS" : "FAIL"}') | max=${max_rss}MB target<=${MAX_RSS_MB}MB |"
 echo "| Health samples | $([[ "$bad_health" -eq 0 ]] && echo PASS || echo FAIL) | bad=$bad_health |"
 echo "| Sync samples | $([[ "$bad_sync" -eq 0 ]] && echo PASS || echo FAIL) | bad=$bad_sync |"
+if [[ -n "$expected_result" ]]; then
+  echo "| Expected public torrent | $expected_result | name=$expected_name |"
+fi
 if (( extended )); then
   echo "| File-descriptor ceiling | $([[ "$max_fds" -le "$MAX_FDS" ]] && echo PASS || echo FAIL) | max=$max_fds target<=$MAX_FDS |"
   echo "| Thread ceiling | $([[ "$max_threads" -le "$MAX_THREADS" ]] && echo PASS || echo FAIL) | max=$max_threads target<=$MAX_THREADS |"
@@ -101,4 +119,4 @@ echo "| Latest sample | INFO | ${last_line//|/\\|} |"
 echo
 echo "Overall status: $status"
 
-[[ "$status" == "PASS" ]]
+[[ "$status" != "FAIL" ]]

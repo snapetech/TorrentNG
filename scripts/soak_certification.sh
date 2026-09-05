@@ -14,10 +14,13 @@ SOAK_MAX_FDS="${SOAK_MAX_FDS:-4096}"
 SOAK_MAX_THREADS="${SOAK_MAX_THREADS:-512}"
 SOAK_MIN_DISK_FREE_MB="${SOAK_MIN_DISK_FREE_MB:-100}"
 SOAK_DATA_PATH="${SOAK_DATA_PATH:-/var/lib/torrentng}"
+SOAK_EXPECTED_TORRENT_NAME="${SOAK_EXPECTED_TORRENT_NAME:-}"
+SOAK_EXPECTED_TORRENT_HASH="${SOAK_EXPECTED_TORRENT_HASH:-}"
 COOKIE_JAR="$(mktemp)"
 BODY="$(mktemp)"
 HEALTH_BODY="$(mktemp)"
 METRICS_BODY="$(mktemp)"
+TORRENTS_BODY="$(mktemp)"
 
 mkdir -p "$(dirname "$OUT")"
 
@@ -27,7 +30,7 @@ if [[ -n "$mapped" && "$TNG_HOST_URL" == http://localhost:* ]]; then
 fi
 
 cleanup() {
-  rm -f "$COOKIE_JAR" "$BODY" "$HEALTH_BODY" "$METRICS_BODY"
+  rm -f "$COOKIE_JAR" "$BODY" "$HEALTH_BODY" "$METRICS_BODY" "$TORRENTS_BODY"
 }
 trap cleanup EXIT
 
@@ -74,6 +77,8 @@ disk_free_mb() {
   echo "- Minimum disk free MB: $SOAK_MIN_DISK_FREE_MB"
   echo "- Data path: $SOAK_DATA_PATH"
   echo "- List limit: $SOAK_LIST_LIMIT"
+  echo "- Expected torrent name: ${SOAK_EXPECTED_TORRENT_NAME:-none}"
+  echo "- Expected torrent hash: ${SOAK_EXPECTED_TORRENT_HASH:-none}"
   echo
   echo "## Checks"
   echo
@@ -102,17 +107,34 @@ samples=0
 max_rss="0"
 bad_health=0
 bad_sync=0
+bad_expected=0
 while (( SECONDS < deadline || samples == 0 )); do
   now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   health="$(curl -ksS -o "$HEALTH_BODY" -w '%{http_code}' \
     -H "Authorization: Bearer $TNG_API_TOKEN" "$TNG_HOST_URL/health" || true)"
-  torrents="$(curl -ksS -b "$COOKIE_JAR" "$TNG_HOST_URL/api/qb/v2/torrents/info?limit=$SOAK_LIST_LIMIT" | jq 'length' 2>/dev/null || echo 0)"
+  curl -ksS -o "$TORRENTS_BODY" -b "$COOKIE_JAR" \
+    "$TNG_HOST_URL/api/qb/v2/torrents/info?limit=$SOAK_LIST_LIMIT" || true
+  torrents="$(jq 'length' "$TORRENTS_BODY" 2>/dev/null || echo 0)"
+  if [[ -n "$SOAK_EXPECTED_TORRENT_NAME" ]]; then
+    if jq -e --arg name "$SOAK_EXPECTED_TORRENT_NAME" --arg hash "$SOAK_EXPECTED_TORRENT_HASH" '
+      type == "array" and any(.[];
+        (.name // "") == $name
+        and ($hash == "" or (((.hash // .infohash_v1 // "") | ascii_downcase) == ($hash | ascii_downcase)))
+        and ((.progress // 0) >= 0.999)
+        and ((.state // "") | IN("uploading", "seeding", "stalledUP"))
+      )
+    ' "$TORRENTS_BODY" >/dev/null 2>&1; then
+      :
+    else
+      bad_expected=$((bad_expected + 1))
+    fi
+  fi
   sync_code="$(curl -ksS -o "$BODY" -w '%{http_code}' -b "$COOKIE_JAR" "$TNG_HOST_URL/api/qb/v2/sync/maindata?rid=0" || true)"
   metrics_code="$(curl -ksS -o "$METRICS_BODY" -w '%{http_code}' \
     -H "Authorization: Bearer $TNG_API_TOKEN" "$TNG_HOST_URL/metrics" || true)"
   rss="$(rss_mb)"
   fds="$(fd_count)"
-  threads="$(process_field VmThreads)"
+  threads="$(process_field Threads:)"
   disk_free="$(disk_free_mb)"
   db_cache="$(jq -r '
     if .engine.subsystems.database_worker.healthy != null then
@@ -186,6 +208,13 @@ if (( bad_sync == 0 )); then
   mark "sync samples" "PASS" "all samples returned HTTP 200"
 else
   mark "sync samples" "FAIL" "${bad_sync} samples did not return HTTP 200"
+fi
+if [[ -n "$SOAK_EXPECTED_TORRENT_NAME" ]]; then
+  if (( bad_expected == 0 )); then
+    mark "expected public torrent" "PASS" "${samples} samples retained the expected completed torrent"
+  else
+    mark "expected public torrent" "FAIL" "${bad_expected} samples lost or regressed the expected torrent"
+  fi
 fi
 
 {

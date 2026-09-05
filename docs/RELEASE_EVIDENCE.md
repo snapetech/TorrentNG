@@ -4,8 +4,8 @@ This is the operator sequence for turning the current certification state into a
 strict release-ready state.
 
 The repository CI gate is currently green on `main`: GitHub Actions run
-`33915548520` passed all ten jobs on `f1c39fd`, and the dynamic CodeQL
-orchestration run `33915547352` also passed all four analyses. This closes hosted repository
+`33916500668` passed all ten jobs on `8c46b61`, and the dynamic CodeQL
+orchestration run `33916500079` also passed all four analyses. This closes hosted repository
 execution; it does not by itself configure branch protection or certify public
 network, target-device, or 24-hour-soak behavior.
 
@@ -83,6 +83,16 @@ environment:
 UNIVERSAL_LIVE_PUBLIC=1 scripts/universal_live_certification.sh
 ```
 
+For the direct Debian public matrix, preserve the completed payload for a
+named soak:
+
+```sh
+INTEROP_PUBLIC_ONLY=debian \
+INTEROP_KEEP_STACK=1 \
+INTEROP_KEEP_PUBLIC_DATA=1 \
+scripts/interop_matrix.sh --public
+```
+
 Run real-device storage evidence on target hardware:
 
 ```sh
@@ -98,6 +108,11 @@ Start the long soak:
 ```sh
 scripts/start_24h_soak.sh
 ```
+
+For a public-torrent soak, set `SOAK_EXPECTED_TORRENT_NAME` and
+`SOAK_EXPECTED_TORRENT_HASH`. The runner then requires that exact completed
+torrent in every sample. When a user systemd manager is available, the launcher
+uses it with restart-on-failure; otherwise it uses a detached session.
 
 Check launcher preconditions without starting the background job:
 
