@@ -12,7 +12,8 @@ trap 'rm -rf "$tmpdir"' EXIT
 run_gate() {
   local name="$1"
   shift
-  local log="$tmpdir/$(printf '%s' "$name" | tr -c 'A-Za-z0-9_.-' '_').log"
+  local log
+  log="$tmpdir/$(printf '%s' "$name" | tr -c 'A-Za-z0-9_.-' '_').log"
   if "$@" >"$log" 2>&1; then
     printf '| %s | PASS |\n' "$name" >>"$OUT"
   else
@@ -31,6 +32,12 @@ run_gate() {
 
 overall=0
 
+dependencies_ready() {
+  [[ -x "$ROOT/webui/node_modules/.bin/tsc" ]] &&
+    [[ -x "$ROOT/webui/node_modules/.bin/eslint" ]] &&
+    [[ -x "$ROOT/webui/node_modules/.bin/playwright" ]]
+}
+
 {
   echo "# TorrentNG WebUI Certification"
   echo
@@ -42,6 +49,9 @@ overall=0
   echo "| --- | --- |"
 } >"$OUT"
 
+if ! dependencies_ready; then
+  run_gate "webui dependency install" npm --prefix "$ROOT/webui" ci
+fi
 run_gate "webui production build" npm --prefix "$ROOT/webui" run build
 run_gate "webui lint" npm --prefix "$ROOT/webui" run lint
 run_gate "webui browser matrix" npm --prefix "$ROOT/webui" run test:e2e -- --reporter=list
