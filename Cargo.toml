@@ -70,6 +70,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # crypto
 sha1 = "0.10"
 sha2 = "0.10"
+subtle = "2"
 
 # http client (tracker announces)
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }

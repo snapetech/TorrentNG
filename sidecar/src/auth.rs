@@ -9,6 +9,7 @@ use hmac::{Hmac, Mac};
 use rand::Rng;
 use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
+use subtle::ConstantTimeEq;
 
 use crate::api::server::AppState;
 
@@ -61,7 +62,7 @@ pub async fn require_auth(
             .auth
             .api_tokens
             .iter()
-            .any(|allowed| allowed == &token)
+            .any(|allowed| tokens_match(allowed, &token))
     }) {
         return next.run(req).await;
     }
@@ -74,7 +75,7 @@ pub async fn require_auth(
             .auth
             .api_tokens
             .iter()
-            .any(|allowed| allowed == &token)
+            .any(|allowed| tokens_match(allowed, &token))
     }) {
         if is_mutating(&req) && !csrf_request_allowed(req.headers()) {
             return (StatusCode::FORBIDDEN, "cross-site cookie mutation rejected").into_response();
@@ -115,6 +116,14 @@ pub(crate) fn session_cookie_value(secret: Option<&str>, token: &str) -> String 
         "tng1.{expires}.{nonce}.{}",
         hex::encode(mac.finalize().into_bytes())
     )
+}
+
+/// Constant-time credential comparison. A configured API token is a secret;
+/// comparing it with `==` short-circuits on the first differing byte and
+/// leaks how many leading bytes a guess got right to a network attacker who
+/// can measure response timing.
+pub(crate) fn tokens_match(allowed: &str, candidate: &str) -> bool {
+    allowed.as_bytes().ct_eq(candidate.as_bytes()).into()
 }
 
 fn bearer_token(req: &Request<Body>) -> Option<String> {
@@ -203,13 +212,21 @@ fn csrf_request_allowed(headers: &axum::http::HeaderMap) -> bool {
     {
         return false;
     }
+    // Fail closed rather than open: a mutating cookie-authenticated request
+    // needs positive same-origin evidence. A missing Host header, or an
+    // Origin/Referer-free request that Sec-Fetch-Site also didn't label, is
+    // not proof of same-origin — it's simply a client that omitted the
+    // headers this check relies on.
     let Some(host) = headers.get("Host").and_then(|value| value.to_str().ok()) else {
-        return headers.get("Origin").is_none() && headers.get("Referer").is_none();
+        return false;
     };
-    for (name, required) in [("Origin", true), ("Referer", false)] {
-        let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) else {
-            continue;
-        };
+    let origin = headers.get("Origin").and_then(|value| value.to_str().ok());
+    let referer = headers.get("Referer").and_then(|value| value.to_str().ok());
+    if origin.is_none() && referer.is_none() {
+        return false;
+    }
+    for (value, required) in [(origin, true), (referer, false)] {
+        let Some(value) = value else { continue };
         if !same_origin_authority(value, host, required) {
             return false;
         }
@@ -271,4 +288,81 @@ fn is_public_auth_path(path: &str) -> bool {
             | "/api/v2/auth/login"
             | "/api/v2/auth/logout"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{HeaderMap, HeaderName, HeaderValue};
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn tokens_match_accepts_equal_secrets() {
+        assert!(tokens_match("same-token", "same-token"));
+    }
+
+    #[test]
+    fn tokens_match_rejects_different_secrets_of_equal_length() {
+        assert!(!tokens_match("token-aaaa", "token-bbbb"));
+    }
+
+    #[test]
+    fn tokens_match_rejects_different_length_secrets() {
+        assert!(!tokens_match("short", "much-longer-token"));
+    }
+
+    #[test]
+    fn csrf_allows_same_origin_request_via_origin_header() {
+        let h = headers(&[("Host", "example.com"), ("Origin", "https://example.com")]);
+        assert!(csrf_request_allowed(&h));
+    }
+
+    #[test]
+    fn csrf_allows_same_origin_request_via_referer_when_origin_absent() {
+        let h = headers(&[
+            ("Host", "example.com"),
+            ("Referer", "https://example.com/page"),
+        ]);
+        assert!(csrf_request_allowed(&h));
+    }
+
+    #[test]
+    fn csrf_rejects_cross_origin_request() {
+        let h = headers(&[("Host", "example.com"), ("Origin", "https://evil.example")]);
+        assert!(!csrf_request_allowed(&h));
+    }
+
+    #[test]
+    fn csrf_rejects_sec_fetch_site_cross_site_even_with_matching_origin() {
+        let h = headers(&[
+            ("Host", "example.com"),
+            ("Origin", "https://example.com"),
+            ("Sec-Fetch-Site", "cross-site"),
+        ]);
+        assert!(!csrf_request_allowed(&h));
+    }
+
+    #[test]
+    fn csrf_fails_closed_without_origin_or_referer() {
+        // No Origin/Referer is not proof of same-origin; some clients simply
+        // omit both. Absent evidence must not be treated as a same-origin pass.
+        let h = headers(&[("Host", "example.com")]);
+        assert!(!csrf_request_allowed(&h));
+    }
+
+    #[test]
+    fn csrf_fails_closed_without_host() {
+        let h = headers(&[("Origin", "https://example.com")]);
+        assert!(!csrf_request_allowed(&h));
+    }
 }

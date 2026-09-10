@@ -49,6 +49,7 @@ rand = "0.10"
 hex = "0.4"
 hmac = "0.12"
 sha2 = "0.10"
+subtle = "2"
 
 # Misc
 bytes = "1"

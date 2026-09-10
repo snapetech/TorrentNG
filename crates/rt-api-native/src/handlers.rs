@@ -36,6 +36,7 @@ use rt_storage::{
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use crate::state::{
     native_i64, native_usize_i64, torrent_summary, AppState, JsonMap, TorrentSnapshotError,
@@ -6743,7 +6744,13 @@ fn require_mutation_auth(
 }
 
 fn token_allowed(state: &AppState, token: &str) -> bool {
-    state.api_tokens.iter().any(|allowed| allowed == token)
+    // Constant-time comparison: `==` short-circuits on the first differing
+    // byte, which lets a network attacker recover a configured token
+    // byte-by-byte via response timing.
+    state
+        .api_tokens
+        .iter()
+        .any(|allowed| bool::from(allowed.as_bytes().ct_eq(token.as_bytes())))
 }
 
 fn auth_form_token(body: &str) -> Option<String> {

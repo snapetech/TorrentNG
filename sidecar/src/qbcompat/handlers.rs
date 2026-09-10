@@ -200,7 +200,12 @@ pub(crate) async fn auth_login(
         .map(String::as_str)
         .unwrap_or("");
 
-    if s.cfg.auth.api_tokens.iter().any(|token| token == candidate) {
+    if s.cfg
+        .auth
+        .api_tokens
+        .iter()
+        .any(|token| crate::auth::tokens_match(token, candidate))
+    {
         // API tokens are operator-provided strings, not cookie-safe strings.
         // Encode the value before putting it in a header; the auth middleware
         // decodes it again before comparison.
