@@ -40,8 +40,8 @@ trap 'rm -rf "$tmpdir"' EXIT
 
 run_case() {
   local name="$1"
-  local log="$tmpdir/$name.log"
-  local trace="$tmpdir/$name.strace"
+  local log="${2:-$tmpdir/$name.log}"
+  local trace="${log%.log}.strace"
   echo
   echo "==> $name"
   if [[ "${TNG_STORAGE_SYSCALLS:-0}" == "1" && -x "$(command -v strace 2>/dev/null || true)" ]]; then
@@ -111,19 +111,50 @@ run_backend_case uring
 run_case peer_read_readahead_reduces_backend_reads_on_adjacent_blocks
 run_case repeated_reads_reuse_one_open_file_handle
 run_case recheck_range_reports_runtime_progress
-run_case shuffled_peer_read_baseline_reports_current_scheduler_throughput
-run_case hdd_peer_read_elevator_reduces_backend_reads_on_shuffled_adjacent_blocks
-
-baseline_ms="$(elapsed_ms tng_storage_shuffled_baseline "$tmpdir/shuffled_peer_read_baseline_reports_current_scheduler_throughput.log")"
-elevator_ms="$(elapsed_ms tng_storage_elevator "$tmpdir/hdd_peer_read_elevator_reduces_backend_reads_on_shuffled_adjacent_blocks.log")"
-
-if [[ -n "$baseline_ms" && -n "$elevator_ms" && "$baseline_ms" != "0" && "$elevator_ms" != "0" ]]; then
-  ratio="$(awk -v b="$baseline_ms" -v e="$elevator_ms" 'BEGIN { printf "%.2f", b / e }')"
-  echo
-  echo "TorrentNG storage elevator wall-clock ratio: ${ratio}x baseline/elevator (${baseline_ms}ms/${elevator_ms}ms)"
+elevator_trials="${TNG_STORAGE_ELEVATOR_TRIALS:-}"
+if [[ -z "$elevator_trials" ]]; then
   if [[ "${TNG_STORAGE_REQUIRE_5X:-0}" == "1" ]]; then
-    awk -v r="$ratio" 'BEGIN { exit (r >= 5.0) ? 0 : 1 }' || {
-      echo "expected >=5x wall-clock speedup; got ${ratio}x" >&2
+    elevator_trials=3
+  else
+    elevator_trials=1
+  fi
+fi
+if ! [[ "$elevator_trials" =~ ^[1-9][0-9]*$ ]]; then
+  echo "TNG_STORAGE_ELEVATOR_TRIALS must be a positive integer" >&2
+  exit 2
+fi
+
+baseline_samples=()
+elevator_samples=()
+ratios=()
+for ((trial = 1; trial <= elevator_trials; trial++)); do
+  baseline_log="$tmpdir/shuffled_peer_read_baseline_reports_current_scheduler_throughput-$trial.log"
+  elevator_log="$tmpdir/hdd_peer_read_elevator_reduces_backend_reads_on_shuffled_adjacent_blocks-$trial.log"
+  run_case shuffled_peer_read_baseline_reports_current_scheduler_throughput "$baseline_log"
+  run_case hdd_peer_read_elevator_reduces_backend_reads_on_shuffled_adjacent_blocks "$elevator_log"
+
+  baseline_ms="$(elapsed_ms tng_storage_shuffled_baseline "$baseline_log")"
+  elevator_ms="$(elapsed_ms tng_storage_elevator "$elevator_log")"
+  if [[ -n "$baseline_ms" && -n "$elevator_ms" && "$baseline_ms" != "0" && "$elevator_ms" != "0" ]]; then
+    ratio="$(awk -v b="$baseline_ms" -v e="$elevator_ms" 'BEGIN { printf "%.2f", b / e }')"
+    baseline_samples+=("$baseline_ms")
+    elevator_samples+=("$elevator_ms")
+    ratios+=("$ratio")
+    echo "TorrentNG storage elevator trial ${trial}/${elevator_trials}: ${ratio}x baseline/elevator (${baseline_ms}ms/${elevator_ms}ms)"
+  else
+    echo "TorrentNG storage elevator trial ${trial}/${elevator_trials}: ratio unavailable" >&2
+  fi
+done
+
+if ((${#ratios[@]} > 0)); then
+  median_ratio="$(printf '%s\n' "${ratios[@]}" | sort -n | awk '{ values[NR] = $1 } END { if (NR % 2) print values[(NR + 1) / 2]; else printf "%.2f", (values[NR / 2] + values[NR / 2 + 1]) / 2 }')"
+  median_baseline="$(printf '%s\n' "${baseline_samples[@]}" | sort -n | awk '{ values[NR] = $1 } END { if (NR % 2) print values[(NR + 1) / 2]; else printf "%.0f", (values[NR / 2] + values[NR / 2 + 1]) / 2 }')"
+  median_elevator="$(printf '%s\n' "${elevator_samples[@]}" | sort -n | awk '{ values[NR] = $1 } END { if (NR % 2) print values[(NR + 1) / 2]; else printf "%.0f", (values[NR / 2] + values[NR / 2 + 1]) / 2 }')"
+  echo
+  echo "TorrentNG storage elevator wall-clock ratio: ${median_ratio}x median baseline/elevator (${median_baseline}ms/${median_elevator}ms across ${#ratios[@]} trial(s))"
+  if [[ "${TNG_STORAGE_REQUIRE_5X:-0}" == "1" ]]; then
+    awk -v r="$median_ratio" 'BEGIN { exit (r >= 5.0) ? 0 : 1 }' || {
+      echo "expected >=5x median wall-clock speedup; got ${median_ratio}x" >&2
       exit 1
     }
   fi

@@ -29,7 +29,10 @@ run_gate() {
   local log
   slug="$(printf '%s' "$name" | tr -c 'A-Za-z0-9_.-' '_')"
   log="$tmpdir/$slug.log"
-  if "$@" >"$log" 2>&1; then
+  # Operator and SSH invocations commonly start outside the checkout. Run
+  # cargo from the repository root so this wrapper tests the project rather
+  # than the caller's working directory.
+  if (cd "$ROOT" && "$@") >"$log" 2>&1; then
     echo "| $name | PASS |" >>"$OUT"
     append_gate_log "$name" "$log"
   else
