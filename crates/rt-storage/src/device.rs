@@ -1,4 +1,6 @@
+#[cfg(target_os = "linux")]
 use std::fs::File;
+#[cfg(target_os = "linux")]
 use std::io::Read;
 use std::path::{Path, PathBuf};
 

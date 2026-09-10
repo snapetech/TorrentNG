@@ -2343,6 +2343,9 @@ fn seek_data_extents(
     offset: u64,
     len: u64,
 ) -> std::io::Result<(Vec<DataExtent>, bool)> {
+    #[cfg(not(target_os = "linux"))]
+    let _ = file;
+
     #[cfg(target_os = "linux")]
     {
         use std::os::fd::AsRawFd;

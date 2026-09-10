@@ -958,21 +958,44 @@ fn entry_type(parent: &File, name: &OsString, path: &Path) -> Result<EntryType, 
 #[derive(Debug, Clone, Copy)]
 struct EntryType(u32);
 
+#[cfg(target_os = "linux")]
+const ENTRY_MODE_DIR: u32 = libc::S_IFDIR;
+#[cfg(not(target_os = "linux"))]
+const ENTRY_MODE_DIR: u32 = libc::S_IFDIR as u32;
+
+#[cfg(target_os = "linux")]
+const ENTRY_MODE_FILE: u32 = libc::S_IFREG;
+#[cfg(not(target_os = "linux"))]
+const ENTRY_MODE_FILE: u32 = libc::S_IFREG as u32;
+
+#[cfg(target_os = "linux")]
+const ENTRY_MODE_SYMLINK: u32 = libc::S_IFLNK;
+#[cfg(not(target_os = "linux"))]
+const ENTRY_MODE_SYMLINK: u32 = libc::S_IFLNK as u32;
+
 impl EntryType {
     fn from_mode(mode: libc::mode_t) -> Self {
-        Self(mode & libc::S_IFMT)
+        #[cfg(target_os = "linux")]
+        {
+            Self(mode & libc::S_IFMT)
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            Self((mode & libc::S_IFMT) as u32)
+        }
     }
 
     fn is_dir(self) -> bool {
-        self.0 == libc::S_IFDIR
+        self.0 == ENTRY_MODE_DIR
     }
 
     fn is_file(self) -> bool {
-        self.0 == libc::S_IFREG
+        self.0 == ENTRY_MODE_FILE
     }
 
     fn is_symlink(self) -> bool {
-        self.0 == libc::S_IFLNK
+        self.0 == ENTRY_MODE_SYMLINK
     }
 }
 
