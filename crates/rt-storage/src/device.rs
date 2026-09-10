@@ -16,6 +16,7 @@ pub struct StorageTopology {
     pub cow: bool,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MountInfo {
     mount_point: PathBuf,

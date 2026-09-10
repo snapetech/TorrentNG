@@ -11248,7 +11248,13 @@ fn storage_capacity(path: &std::path::Path) -> Result<(u64, u64), String> {
     }
     let stat = unsafe { stat.assume_init() };
     let block_size = stat.f_frsize.max(stat.f_bsize);
+    #[cfg(target_os = "macos")]
+    let total = u64::from(stat.f_blocks).saturating_mul(block_size);
+    #[cfg(not(target_os = "macos"))]
     let total = stat.f_blocks.saturating_mul(block_size);
+    #[cfg(target_os = "macos")]
+    let available = u64::from(stat.f_bavail).saturating_mul(block_size);
+    #[cfg(not(target_os = "macos"))]
     let available = stat.f_bavail.saturating_mul(block_size);
     Ok((total, available))
 }
