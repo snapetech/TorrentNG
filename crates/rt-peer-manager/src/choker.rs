@@ -55,7 +55,14 @@ impl Choker {
         let mut interested: Vec<&PeerSnapshot> = peers.iter().filter(|p| p.interested).collect();
 
         // Sort by upload rate descending — highest throughput earns a slot.
-        interested.sort_by(|a, b| b.upload_rate.partial_cmp(&a.upload_rate).unwrap());
+        // `upload_rate` is a public field on a struct producers outside this
+        // crate can construct; a NaN rate must not panic the choke loop, so
+        // treat it as unordered rather than unwrapping the comparison.
+        interested.sort_by(|a, b| {
+            b.upload_rate
+                .partial_cmp(&a.upload_rate)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         // Pick top N for regular slots.
         let unchoked_ids: Vec<PeerId> = interested
@@ -180,5 +187,21 @@ mod tests {
         let opt_unchoked = decisions[&ids[1]] == ChokeDecision::Unchoke
             || decisions[&ids[2]] == ChokeDecision::Unchoke;
         assert!(opt_unchoked);
+    }
+
+    #[test]
+    fn nan_upload_rate_does_not_panic() {
+        // upload_rate is a public field; a producer that ever divides 0.0/0.0
+        // (e.g. a reset EMA on a genuinely idle peer) must not crash the
+        // choke loop just because it sorts by rate.
+        let mut choker = Choker::new(2);
+        let ids: Vec<PeerId> = (0..3).map(|_| PeerId::new()).collect();
+        let peers = vec![
+            snap(ids[0], true, f64::NAN),
+            snap(ids[1], true, 10.0),
+            snap(ids[2], true, f64::NAN),
+        ];
+        let decisions = choker.run(&peers);
+        assert_eq!(decisions.len(), 3);
     }
 }
