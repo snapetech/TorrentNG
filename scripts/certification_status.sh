@@ -23,6 +23,8 @@ latest_excluding() {
         base="$(basename "$path")"
         skip=0
         for exclude in "${excludes[@]}"; do
+          # The exclusion arguments are deliberate shell glob patterns.
+          # shellcheck disable=SC2053
           if [[ "$base" == $exclude ]]; then
             skip=1
             break
@@ -80,8 +82,28 @@ row_excluding() {
 }
 
 row_24h_soak() {
-  local file status sample active
-  file="$(latest 'soak-24h-*.md')"
+  local file status sample active finalized_status final_file raw_file
+  # A completed finalization report is the authoritative result for the long
+  # soak.  The raw soak report is intentionally retained for sample-level
+  # evidence, but it can be older than the finalizer and may still look
+  # RUNNING/UNKNOWN after a successful completed run.  If a newer raw run has
+  # started since the last finalization, retain the raw run's active/stale
+  # status instead of hiding it behind an older PASS.
+  final_file="$(latest 'soak-final-*.md')"
+  raw_file="$(latest 'soak-24h-*.md')"
+  if [[ -n "$final_file" && -f "$final_file" ]] && {
+    [[ -z "$raw_file" || ! -f "$raw_file" ]] ||
+      awk -v finalized="$(find "$final_file" -maxdepth 0 -type f -printf '%T@')" \
+        -v raw="$(find "$raw_file" -maxdepth 0 -type f -printf '%T@')" \
+        'BEGIN { exit finalized >= raw ? 0 : 1 }';
+  }; then
+    file="$final_file"
+    finalized_status="$(overall "$file")"
+    printf '| %s | %s | %s |\n' "24h soak" "$finalized_status" "$(basename "$file")"
+    return
+  fi
+
+  file="$raw_file"
   status="$(overall "$file")"
   sample="-"
   if [[ -n "$file" && -f "$file" ]]; then

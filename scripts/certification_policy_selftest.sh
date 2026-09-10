@@ -145,6 +145,7 @@ write_report "$report_dir/migration-corpus-local-release-20260518T999999Z.md" PA
 write_report "$report_dir/migration-corpus-universal-20260518T999999Z.md" PASS
 BENCHMARK_DIR="$benchmark_dir" "$ROOT/scripts/certification_status.sh" "$report_dir" >"$report_dir/status-migration-selector.md"
 grep -q '| Migration corpus | PASS_WITH_GAPS | migration-corpus-20260518T000000Z.md |' "$report_dir/status-migration-selector.md"
+grep -q '| 24h soak | PASS | soak-final-selftest.md |' "$report_dir/status-migration-selector.md"
 write_report "$report_dir/migration-corpus-selftest.md" PASS
 
 REPORT_DIR="$report_dir" \
@@ -181,7 +182,7 @@ write_report "$report_dir/universal-live-selftest.md" PASS_WITH_SKIPS
 REPORT_DIR="$report_dir" BENCHMARK_DIR="$benchmark_dir" \
   "$ROOT/scripts/certification_burndown.sh" "$report_dir/certification-burndown-skips.md" >/dev/null
 grep -q 'UNIVERSAL_COMPAT_LIVE=1' "$report_dir/certification-burndown-skips.md"
-grep -q 'Latest universal-live report `universal-live-selftest.md` may already include a passing local Docker interop leg' "$report_dir/certification-burndown-skips.md"
+grep -qF "Latest universal-live report \`universal-live-selftest.md\` may already include a passing local Docker interop leg" "$report_dir/certification-burndown-skips.md"
 
 if TNG_EXTERNAL_PREFLIGHT_STRICT=1 \
   TNG_MIGRATION_CORPUS_DIR="$tmpdir/missing-corpus" \
@@ -204,5 +205,11 @@ if TNG_EXTERNAL_PREFLIGHT_STRICT=1 \
   exit 1
 fi
 grep -q 'missing evidence files' "$report_dir/external-preflight-placeholders.md"
+
+# A newly started soak must supersede an older completed finalization.  This
+# prevents a previous PASS from masking a current RUNNING or stale report.
+write_report "$report_dir/soak-24h-newer-selftest.md" RUNNING/UNKNOWN
+BENCHMARK_DIR="$benchmark_dir" "$ROOT/scripts/certification_status.sh" "$report_dir" >"$report_dir/status-newer-soak.md"
+grep -q '| 24h soak | STALE/INCOMPLETE | soak-24h-newer-selftest.md |' "$report_dir/status-newer-soak.md"
 
 echo "certification policy self-test: PASS"

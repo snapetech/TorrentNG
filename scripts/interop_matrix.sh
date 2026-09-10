@@ -472,8 +472,11 @@ add_rust_url() {
 transmission_rpc() {
   local body="$1" url sid
   url="$(client_url transmission)/transmission/rpc"
-  sid="$(curl --max-time "$CURL_MAX_TIME" -sS -D - -o /dev/null -H "Content-Type: application/json" -d "$body" "$url" | awk 'tolower($0) ~ /^x-transmission-session-id:/ {print $2}' | tr -d '\r')"
-  curl --max-time "$CURL_MAX_TIME" -fsS -H "X-Transmission-Session-Id: $sid" -H "Content-Type: application/json" -d "$body" "$url"
+  # Keep large metainfo JSON out of curl's argv.  Public torrents can exceed
+  # the host's execve argument budget once base64 encoded for Transmission's
+  # torrent-add request; stream the body over stdin instead.
+  sid="$(curl --max-time "$CURL_MAX_TIME" -sS -D - -o /dev/null -H "Content-Type: application/json" --data-binary @- "$url" <<<"$body" | awk 'tolower($0) ~ /^x-transmission-session-id:/ {print $2}' | tr -d '\r')"
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "X-Transmission-Session-Id: $sid" -H "Content-Type: application/json" --data-binary @- "$url" <<<"$body"
 }
 
 add_transmission() {
@@ -1244,6 +1247,7 @@ run_force_recheck_corruption_repair_case() {
   add_to_client torrentngd "$torrent" || status="FAIL"
   wait_fixture_hashes "$TIMEOUT_LOCAL" torrentngd "$fixture" || status="FAIL"
   corrupt_bytes="${INTEROP_RECHECK_CORRUPT_BYTES:-4096}"
+  # shellcheck disable=SC2016 # $1 and $2 expand in the inner container shell.
   compose exec -T torrentngd sh -c \
     'dd if=/dev/zero of="/downloads/torrentngd/$1/payload.bin" bs="$2" count=1 conv=notrunc status=none' \
     sh "$fixture" "$corrupt_bytes" || status="FAIL"
