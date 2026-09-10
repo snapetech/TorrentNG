@@ -4,8 +4,8 @@ This is the operator sequence for turning the current certification state into a
 strict release-ready state.
 
 The current runtime product revision is `b393eb0`; the evidence reconciliation
-is on `main` at `50e0fc3`. GitHub Actions run `34510889406` passed all ten jobs
-and dynamic CodeQL run `34510889093` passed all four analyses on `b393eb0`.
+is on `main` at `50e0fc3`. GitHub Actions run `34521941751` passed all ten jobs
+and dynamic CodeQL run `34521941269` passed all four analyses on `196c65a`.
 CI success does not configure branch protection or certify broader
 public-network, target-device, or scale behavior.
 

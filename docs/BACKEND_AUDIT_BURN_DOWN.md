@@ -87,7 +87,7 @@ b393 release soak.
 | `cargo +1.88 build/test --workspace --all-targets --locked` | PASS | Declared main-workspace MSRV build and tests green. |
 | `cargo +1.97.0 build/test --manifest-path sidecar/Cargo.toml --locked` | PASS | Declared sidecar MSRV build and tests green. |
 | declared `rust-version` (both `Cargo.toml`s) | **CORRECTED** | Was `1.80` in both, unverified and untrue. Neither workspace's *locked* dependency graph builds below 1.88 (main: `idna_adapter` needs rustc 1.86+, plus `edition2024` needs Cargo 1.85+) or 1.97 (sidecar: `libsqlite3-sys`'s build script uses `cfg_select!`, stabilized between 1.94 and 1.97). This is a transitive-dependency floor, not first-party code needing new syntax. Corrected both `rust-version` fields to `1.88` / `1.97` to match reality; this itself is TNG-028 acceptance criteria ("document the supported toolchain"). |
-| GitHub Actions CI run `34510889406` | PASS | All 10 jobs passed on `b393eb0`: native quality, both MSRV jobs, fuzz smoke, sidecar, WebUI, dependency security, backup/restore, API/SSE load, and fault containment. |
+| GitHub Actions CI run `34521941751` | PASS | All 10 jobs passed on `196c65a`: native quality, both MSRV jobs, fuzz smoke, sidecar, WebUI, dependency security, backup/restore, API/SSE load, and fault containment. |
 | rTorrent startup identity timeout isolation | PASS | Commit `4a90048` gives the multi-thousand-download identity rewrite a separate 300-second timeout while ordinary XMLRPC calls remain 10 seconds; sidecar tests and warnings-denied clippy pass. |
 | kspls0 LVM storage release certification | PASS | [`storage-release-certification-kspls0-lvm-20260910-b393eb0.md`](../certification/reports/storage-release-certification-kspls0-lvm-20260910-b393eb0.md); exact commit `b393eb0`, `/dev/mapper/datapool_lvm-media`, HDD median ratio 5.11x, io_uring graduation, and real-root move/import all pass. |
 | kspls0 real-device storage matrix | PASS_WITH_SKIPS | [`universal-live-kspls0-lvm-20260910-b393eb0.md`](../certification/reports/universal-live-kspls0-lvm-20260910-b393eb0.md); the real-device storage gate passes against the LV; local Docker/public legs were intentionally not rerun in this targeted invocation. |
@@ -98,8 +98,8 @@ b393 release soak.
 | Strict external evidence preflight | PASS | [`external-evidence-preflight-release-strict-20260910-b393eb0.md`](../certification/reports/external-evidence-preflight-release-strict-20260910-b393eb0.md); Docker, public opt-in, writable target, migration corpus, and completed soak pass. |
 
 The hosted CI workflow has now run successfully for the pushed source. Run
-`34510889406` passed all ten jobs and the companion dynamic CodeQL orchestration
-run `34510889093` passed all four analyses on `b393eb0`. This proves the
+`34521941751` passed all ten jobs and the companion dynamic CodeQL orchestration
+run `34521941269` passed all four analyses on `196c65a`. This proves the
 repository gates execute on GitHub's runners; it does not prove that branch
 protection requires them, and the repository's branch-protection setting must
 still be reviewed separately.
@@ -1482,7 +1482,7 @@ warnings` all pass now, including on the actual declared MSRV toolchains
 corrected from an untrue "1.80" to the real, verified floor). Two clippy
 findings were fixed (too-many-arguments on an egress-policy-widened
 function, a redundant `u32 -> u32` cast). The native-quality, MSRV, and
-sidecar checks are defined in CI and pass in hosted run `34510889406`.
+sidecar checks are defined in CI and pass in hosted run `34521941751`.
 Repository branch-protection enforcement remains a settings review, not a
 source-code gap.
 

@@ -28,7 +28,7 @@
 | External evidence preflight | PASS | [`external-evidence-preflight-release-strict-20260910-b393eb0.md`](../certification/reports/external-evidence-preflight-release-strict-20260910-b393eb0.md); strict preflight has no warnings |
 
 Hosted repository gates are current for the pushed product revision: run
-`34510889406` passed all ten jobs and dynamic CodeQL run `34510889093` passed
+`34521941751` passed all ten jobs and dynamic CodeQL run `34521941269` passed
 all four analyses on `b393eb0`. Branch-protection enforcement is still a
 separate repository setting.
 

@@ -54,7 +54,7 @@ Current `scripts/certification_status.sh` highlights:
 | Area | Status |
 | --- | --- |
 | Native engine rewrite | PASS |
-| Hosted CI repository gate | PASS (`34510889406`, all 10 jobs; CodeQL `34510889093` also green) |
+| Hosted CI repository gate | PASS (`34521941751`, all 10 jobs; CodeQL `34521941269` also green) |
 | Local release gate | PASS_WITH_WARNINGS at `50e0fc3`; native, WebUI, API, smoke, backup, corpus, and security gates pass, with only the unconfigured local block-device probe skipped |
 | Storage hardware matrix | PASS on kspls0 LVM (`b393eb0`) |
 | Storage io_uring capability/graduation | PASS on kspls0 LVM (`b393eb0`) |
