@@ -3,14 +3,35 @@
 This is the operator sequence for turning the current certification state into a
 strict release-ready state.
 
-The repository CI gate is currently green on `main`: GitHub Actions run
-`33916500668` passed all ten jobs on `8c46b61`, and the dynamic CodeQL
-orchestration run `33916500079` also passed all four analyses. This closes hosted repository
-execution; it does not by itself configure branch protection or certify public
-network, target-device, or 24-hour-soak behavior.
+The current pushed product revision has green hosted gates: GitHub Actions run
+`34510889406` passed all ten jobs and dynamic CodeQL run `34510889093` passed
+all four analyses on `b393eb0`. CI success does not configure branch protection
+or certify broader public-network, target-device, or scale behavior.
 
 The concrete failure history and fixes for recent hosted regressions are
 tracked in [`CI_FAILURE_BURN_DOWN.md`](CI_FAILURE_BURN_DOWN.md).
+
+## Current qualification update — 2026-09-10
+
+The following external gates are now recorded in the repository. The storage
+and current local/public live reports are tied to pushed commit `b393eb0`; the
+counted named public soak source predates the b393 source refresh and its raw
+report does not record a source commit.
+
+| Gate | Result | Evidence |
+| --- | --- | --- |
+| Public Debian transfer | PASS | [`interop-matrix-20260910T192200Z.md`](../certification/reports/interop-matrix-20260910T192200Z.md); canonical parent [`universal-compat-b393eb0-all-live.md`](../certification/reports/universal-compat-b393eb0-all-live.md), 142 peers observed |
+| Canonical all-live compatibility | PASS_WITH_SKIPS | [`universal-compat-b393eb0-all-live.md`](../certification/reports/universal-compat-b393eb0-all-live.md); local Docker, mobile, and public Debian pass; the separately certified real-device storage wrapper is skipped |
+| Public Debian 24-hour soak | PASS | [`soak-final-public-debian-20260910.md`](../certification/reports/soak-final-public-debian-20260910.md); 1,437 samples and one exact completed torrent |
+| kspls0 LVM storage release certification | PASS | [`storage-release-certification-kspls0-lvm-20260910-b393eb0.md`](../certification/reports/storage-release-certification-kspls0-lvm-20260910-b393eb0.md); HDD median 5.11x, LVM extent, io_uring, and real-root move/import checks |
+| kspls0 real-device storage matrix | PASS_WITH_SKIPS | [`universal-live-kspls0-lvm-20260910-b393eb0.md`](../certification/reports/universal-live-kspls0-lvm-20260910-b393eb0.md); targeted storage leg passes, unrelated live legs are explicit skips |
+| Strict external preflight | PASS | [`external-evidence-preflight-release-strict-20260910-b393eb0.md`](../certification/reports/external-evidence-preflight-release-strict-20260910-b393eb0.md) |
+
+The storage release report and all current child reports record commit `b393eb0`.
+These results qualify the exercised Debian torrent and kspls0 LVM target; they
+do not turn one public source into universal compatibility or one storage host
+into a fleet-wide capacity claim. The counted soak remains valid evidence for
+the named run, but its raw source predates b393 and is not a b393 release soak.
 
 ## Local Refresh
 
@@ -93,6 +114,11 @@ INTEROP_KEEP_PUBLIC_DATA=1 \
 scripts/interop_matrix.sh --public
 ```
 
+The named Debian transfer and soak are already complete. Use the reports in the
+current qualification update above as the release evidence; rerun the commands
+only when a new artifact or materially different configuration needs fresh
+qualification.
+
 Run real-device storage evidence on target hardware:
 
 ```sh
@@ -102,6 +128,14 @@ scripts/universal_live_certification.sh
 ```
 
 ## 24h Soak
+
+The named Debian run completed successfully. Its live source report is
+[`soak-24h-public-debian-20260905-v3.md`](../.run/soak-24h-public-debian-20260905-v3.md),
+and its finalization is
+[`soak-final-public-debian-20260910.md`](../certification/reports/soak-final-public-debian-20260910.md).
+The finalizer accepted 1,437 samples, one matching completed torrent, healthy
+HTTP/dependency responses, and the configured resource ceilings. The collected
+systemd unit is absent by design after completion.
 
 Start the long soak:
 

@@ -1,7 +1,8 @@
 # TorrentNG Project Gap Audit
 
-Status as of 2026-09-05 on clean `main` at `8c46b61`; the current runtime
-artifact and local execution evidence were built from code commit `83b70ce`.
+Status as of 2026-09-10 on clean `main` at `b393eb0`; the current release
+smoke, public-soak finalization, and kspls0 LVM evidence are tied to this
+source revision where stated below.
 
 This audit separates local implementation gaps from external evidence gates.
 It is based on the roadmap docs, compatibility matrices, certification status,
@@ -12,8 +13,9 @@ repository disposition is the 2026-09-04 reconciliation in
 [`BACKEND_AUDIT_BURN_DOWN.md`](BACKEND_AUDIT_BURN_DOWN.md): all repository-
 actionable implementation, contract, security, CI, and local evidence work is
 closed for its declared scope. Hosted CI is now green. Remaining rows require
-public clients/networks, physical storage, branch-protection settings, or
-elapsed soak time and are not hidden implementation backlog.
+broader public clients/networks, additional physical targets,
+branch-protection settings, or optional scale/profiling work and are not hidden
+implementation backlog.
 
 ## Executive Summary
 
@@ -22,10 +24,10 @@ local deterministic API compatibility gates are green. The remaining work is
 not concentrated in storage anymore. It is concentrated in release evidence and
 compatibility depth:
 
-- the local Docker universal-live interop leg has passing evidence, while
-  public-swarm and real-device storage legs remain opt-in external release
-  gates; universal compatibility reports surface skipped optional legs as
-  `PASS_WITH_SKIPS`;
+- the local Docker universal-live interop leg and one official public-swarm
+  transfer have passing evidence; the counted public Debian soak and the
+  kspls0 real-device storage gate now also pass. Broader public sources and
+  additional hardware remain opt-in qualification depth;
 - the migration corpus gate now has checked-in generated fixtures for every
   legacy client family and passes strict local validation; adding real exported
   corpora remains optional release-depth evidence for undocumented variants;
@@ -40,10 +42,10 @@ compatibility depth:
 - the current native and sidecar security reviews pass their configuration,
   token, and script-policy checks; rendered-secret, proxy, metrics-exposure,
   dependency, and image-scan review remains deployment/operator evidence;
-- the 24h soak status row is explicitly `STALE/INCOMPLETE` when the latest
-  report lacks an `Overall status` line and no matching soak process is active,
-  even though short, transfer-churn, finalization, local release, and post-soak
-  gates are passing.
+- the completed public Debian soak is recorded as PASS in both its finalization
+  report and the refreshed external preflight; the preflight now recognizes a
+  completed PASS report instead of treating the absence of a live process as a
+  warning.
 
 ## Certification Snapshot
 
@@ -52,26 +54,26 @@ Current `scripts/certification_status.sh` highlights:
 | Area | Status |
 | --- | --- |
 | Native engine rewrite | PASS |
-| Hosted CI repository gate | PASS (`33916500668`, all 10 jobs; CodeQL `33916500079` also green) |
-| Local release gate | PASS_WITH_WARNINGS; target-device storage is skipped |
-| Storage hardware matrix | Historical evidence only; current target unavailable |
-| Storage io_uring capability/graduation | Historical evidence only; current target unavailable |
-| Storage move/import | Historical evidence only; current target unavailable |
-| Storage release certification | Historical evidence only; current target unavailable |
-| Storage indexed evidence | Historical index; not current target qualification |
+| Hosted CI repository gate | PASS (`34510889406`, all 10 jobs; CodeQL `34510889093` also green) |
+| Local release gate | Prior local PASS_WITH_WARNINGS report; final clean b393 release smoke is being refreshed after this evidence commit |
+| Storage hardware matrix | PASS on kspls0 LVM (`b393eb0`) |
+| Storage io_uring capability/graduation | PASS on kspls0 LVM (`b393eb0`) |
+| Storage move/import | PASS on kspls0 LVM (`b393eb0`) |
+| Storage release certification | PASS on kspls0 LVM (`b393eb0`) |
+| Storage indexed evidence | PASS for current kspls0 LVM reports |
 | Security review and scan | PASS |
 | Pre-engine release gate | PASS |
-| Post-soak release gate | PASS_WITH_WARNINGS while skipped/gap/stale rows remain |
+| Post-soak release gate | PASS_WITH_WARNINGS; broader optional rows and the prior local warning remain separate |
 | Certification burndown | PASS_WITH_ACTIONS while warning rows remain |
 | Release readiness | FAIL until every status row is clean PASS/INFO |
 | Certification bundle | Generates a hashed archive of latest evidence reports |
 | Release evidence suite | Fails until strict readiness passes, while refreshing bundle/burndown |
 | Certification JSON status | Machine-readable status export for CI/release automation |
-| Universal compatibility | PASS_WITH_SKIPS unless live/public/device legs are enabled |
-| Universal live compatibility | PASS_WITH_SKIPS while public/device legs are skipped; current local Docker interop passes |
+| Universal compatibility | PASS_WITH_SKIPS; current b393 Docker, mobile, and public Debian legs pass, while target storage is certified separately |
+| Universal live compatibility | PASS_WITH_SKIPS; canonical b393 all-live report passes local Docker, mobile, and public Debian legs, with the real-device wrapper explicitly skipped |
 | Migration corpus | PASS with generated checked-in corpus; strict local gate passes |
-| External evidence preflight | Host readiness for live/corpus/soak external evidence |
-| 24h soak | STALE/INCOMPLETE |
+| External evidence preflight | PASS in strict mode for Docker, public opt-in, writable storage target, corpus, and completed soak |
+| 24h soak | PASS; 1,437 samples and exact completed public torrent |
 
 ## Roadmaps
 
@@ -85,8 +87,9 @@ Remaining qualification gates:
 - `docs/CLIENT_COMPATIBILITY_MATRICES.md` and `docs/INTEROP_MATRIX.md` retain
   optional live-client, public-network, and broader protocol qualification rows;
   they are not unassigned native implementation work.
-- The 24-hour soak remains an explicit release-evidence gate. It can be run by
-  the release operator, but cannot be truthfully completed by a source edit.
+- The 24-hour soak remains an explicit release-evidence gate. The named Debian
+  run is complete; future release artifacts still need their own operator-owned
+  soak when the runtime artifact or configuration materially changes.
 
 ## Storage
 
@@ -99,7 +102,13 @@ release certification wrappers. Native REST now also exposes
 capacity probes, so WebUI/native deployments no longer depend on sidecar-only
 storage status projection.
 
-Remaining storage work is evidence-bound:
+Current kspls0 LVM evidence is complete for the exercised target:
+
+- storage hardware, io_uring, move/import, LVM extent sampling, and the
+  real-device matrix all pass against `/dev/mapper/datapool_lvm-media` at
+  commit `b393eb0`;
+
+Remaining storage qualification depth is evidence-bound:
 
 - HDD 5x wall-clock claims require a run on an HDD target with
   `TNG_STORAGE_REQUIRE_HDD_5X=1`.
@@ -121,9 +130,8 @@ Memory/resource-governor work is locally green:
 
 Remaining memory work is evidence-bound:
 
-- production-scale soak evidence should be refreshed for the exact release
-  config;
-- the current 24h soak report is stale/incomplete in status output;
+- the completed public soak covers the native interop configuration; a future
+  materially different release config still needs its own soak;
 - fleet-size claims still depend on live deployment measurements, not just
   deterministic proxy tests.
 
@@ -179,10 +187,12 @@ Local deterministic API compatibility is passing:
 - qBittorrent, Transmission, Deluge, and rTorrent facade certification passed
   via `scripts/api_facade_certification.sh`.
 - `scripts/universal_compatibility_certification.sh` passed for local
-  deterministic coverage. When the Docker live, public torrent, or real-device
-  legs are not enabled, the report status is `PASS_WITH_SKIPS` instead of plain
-  PASS. The live mobile qBittorrent read matrix is now an explicit optional
-  universal gate through `UNIVERSAL_COMPAT_MOBILE=1`.
+  deterministic coverage. When optional live legs are not enabled, the report
+  status is `PASS_WITH_SKIPS` instead of plain PASS. The live mobile qBittorrent
+  read matrix is now an explicit optional universal gate through
+  `UNIVERSAL_COMPAT_MOBILE=1`. The current targeted kspls0 report records the
+  real-device storage leg as PASS; it intentionally skips unrelated Docker and
+  public invocations.
 
 Remaining compatibility depth:
 
@@ -258,15 +268,15 @@ notes or handoff.
 `scripts/release_evidence_suite.sh` is the one-command strict evidence refresh:
 it updates status, burndown, readiness, and bundle reports, and fails while
 strict readiness still has blockers.
-`docs/RELEASE_EVIDENCE.md` is the runbook for clearing every current warning
-row and producing the final evidence bundle.
-The current full Docker interop matrix now has a clean local result in
-[`interop-matrix-20260904T195529Z.md`](../certification/reports/interop-matrix-20260904T195529Z.md):
+`docs/RELEASE_EVIDENCE.md` is the runbook for refreshing the evidence bundle
+and for the remaining broader qualification rows.
+The current full Docker interop matrix has a clean local result in
+[`interop-matrix-20260910T190228Z.md`](../certification/reports/interop-matrix-20260910T190228Z.md):
 28/28 cases pass against the current image and source tree. The remaining
 interop work is external or optional:
 
-- public legal torrent matrix;
-- real-device storage matrix;
+- additional public legal torrent sources beyond the passing Debian matrix;
+- additional real-device storage targets beyond the passing kspls0 LVM run;
 - the Docker protocol matrix now includes `rust-trackerless-magnet`, which adds
   TorrentNG from a trackerless magnet and completes via an explicit bridged
   peer, covering trackerless BEP 9 metadata and payload transfer in the local
@@ -310,9 +320,11 @@ Compose, Kubernetes, Prometheus/Grafana, and Arch/AUR template coverage.
 
 Remaining external operational evidence:
 
-- rerun the release suite against the exact release config and target hardware;
+- rerun the release suite against the exact release config when the release
+  artifact changes materially;
 - attach security, storage, compatibility, and soak reports to release notes;
-- resolve the stale/incomplete 24h soak row.
+- review branch-protection enforcement and qualify additional public/device
+  targets if the product claim requires them.
 
 ## Historical Validation Run
 

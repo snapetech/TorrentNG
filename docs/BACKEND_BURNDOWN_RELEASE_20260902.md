@@ -1,13 +1,13 @@
 # TorrentNG Backend Audit Burn-down — Release Evidence
 
-## Current artifact and smoke (2026-09-04 local / 2026-09-04 UTC)
+## Current artifact and qualification evidence (2026-09-10 UTC)
 
 | Check | Result | Evidence |
 | --- | --- | --- |
-| Source revision | recorded | release artifact built from clean code commit `83b70ce`; the current evidence baseline is `main` at `8c46b61`, with the public-harness/DNS/soak follow-up recorded below |
+| Source revision | recorded | current pushed source is `main` at `b393eb0`; the release binary and storage reports below identify their exact source revision |
 | Release build | PASS | `cargo build --release --locked -p torrentngd` |
-| Binary | PASS | `target/release/torrentngd`; 22,433,352 bytes; SHA-256 `ff94ede075f7541ef9eecf5418b1c31324fb1b6ca2648681d975b3e9cd048e73` |
-| Authenticated deployment smoke | PASS | [`backend-burndown-native-release-smoke-local-release-20260904T192950Z.md`](../certification/reports/backend-burndown-native-release-smoke-local-release-20260904T192950Z.md) |
+| Binary | PASS | `target/release/torrentngd`; 22,448,768 bytes; SHA-256 `0a8233db7d34c17854b5ee20aa62abad33ec34b36444d68ea714d6b801836067` |
+| Authenticated deployment smoke | PENDING FINAL SMOKE | A clean release-binary smoke will be recorded after this evidence reconciliation commit |
 | Startup/health | PASS | Release binary started from the isolated authenticated config and returned ready health |
 | Native list/transfer | PASS | Native list envelope and aggregate transfer-info requests returned HTTP 200 |
 | qBittorrent list/transfer | PASS | qBittorrent list and aggregate transfer-info requests returned HTTP 200 |
@@ -16,23 +16,26 @@
 | Compose render | PASS | `docker compose -f deploy/native/compose.yml config --quiet` |
 | Live fault matrix | PASS | [`backend-burndown-native-fault-live-current-20260904.md`](../certification/reports/backend-burndown-native-fault-live-current-20260904.md); SIGKILL/restart, SQLite failure/recovery, storage cancellation, and filesystem failure all remain isolated |
 | API/SSE load | PASS | [`backend-api-load-current-20260904-final.md`](../certification/reports/backend-api-load-current-20260904-final.md); 204,936 requests over 30 seconds, 32 JSON clients, 8 slow SSE consumers, zero errors |
-| Local client/protocol interoperability | PASS | [`interop-matrix-20260904T195529Z.md`](../certification/reports/interop-matrix-20260904T195529Z.md); 28/28 local cases across qBittorrent, Transmission, Deluge, and rTorrent |
-| Public legal torrent matrix | PASS | [`public-debian-interop-20260905T191253Z.md`](../certification/reports/public-debian-interop-20260905T191253Z.md); official Debian 13.6 netinst, 791,674,880 bytes, Rust completed, three reference-client peers observed |
-| Public Debian 24-hour soak | IN_PROGRESS | [`PUBLIC_TORRENT_SOAK_20260905.md`](PUBLIC_TORRENT_SOAK_20260905.md); named soak is supervised and must finish 86,400 seconds before it can be marked PASS |
-| Local universal-live interop | PASS_WITH_SKIPS | [`universal-live-current-20260904.md`](../certification/reports/universal-live-current-20260904.md); current local Docker matrix passes; public torrent and real-device legs are explicit skips |
+| Local client/protocol interoperability | PASS | [`interop-matrix-20260910T190228Z.md`](../certification/reports/interop-matrix-20260910T190228Z.md); 28/28 local cases across qBittorrent, Transmission, Deluge, and rTorrent at `b393eb0` |
+| Public legal torrent matrix | PASS | [`interop-matrix-20260910T192200Z.md`](../certification/reports/interop-matrix-20260910T192200Z.md); official Debian 13.6 netinst, 791,674,880 bytes, Rust completed, 142 Rust peers across five clients |
+| Public Debian 24-hour soak | PASS | [`soak-final-public-debian-20260910.md`](../certification/reports/soak-final-public-debian-20260910.md); 1,437 samples, exact completed torrent, health/resource checks pass |
+| Canonical universal compatibility | PASS_WITH_SKIPS | [`universal-compat-b393eb0-all-live.md`](../certification/reports/universal-compat-b393eb0-all-live.md); static, migration, local Docker, mobile, and public Debian legs pass; real-device storage is a separate targeted report |
 | Security scan | PASS | [`security-scan-current-20260904.md`](../certification/reports/security-scan-current-20260904.md); npm audit, locked Cargo tree, and container scan pass with no HIGH/CRITICAL findings |
-| Local release gate | PASS_WITH_WARNINGS | [`local-release-backend-burndown-final-20260904.md`](../certification/reports/local-release-backend-burndown-final-20260904.md); all local implementation gates pass; only real-device storage certification is skipped |
-| External evidence preflight | PASS_WITH_WARNINGS | [`external-evidence-preflight-public-soak-20260905T193325Z.md`](../certification/reports/external-evidence-preflight-public-soak-20260905T193325Z.md); Docker, public opt-in, migration corpus, and active v3 soak pass; real-device storage is the single warning |
+| kspls0 LVM storage certification | PASS | [`storage-release-certification-kspls0-lvm-20260910-b393eb0.md`](../certification/reports/storage-release-certification-kspls0-lvm-20260910-b393eb0.md); exact `b393eb0`, HDD median ratio 5.11x, LVM extent probe, io_uring, and real-root move/import pass |
+| kspls0 real-device storage matrix | PASS_WITH_SKIPS | [`universal-live-kspls0-lvm-20260910-b393eb0.md`](../certification/reports/universal-live-kspls0-lvm-20260910-b393eb0.md); storage leg PASS; Docker/public legs were intentionally skipped in this targeted run |
+| External evidence preflight | PASS | [`external-evidence-preflight-release-strict-20260910-b393eb0.md`](../certification/reports/external-evidence-preflight-release-strict-20260910-b393eb0.md); strict preflight has no warnings |
 
-Hosted repository CI is now green: run `33916500668` passed all ten jobs on
-`8c46b61`, and dynamic CodeQL orchestration run `33916500079` passed all four
-analyses. This closes the hosted repository gate; branch-protection
-enforcement and the public/device/soak qualification gates remain separate.
+Hosted repository gates are current for the pushed product revision: run
+`34510889406` passed all ten jobs and dynamic CodeQL run `34510889093` passed
+all four analyses on `b393eb0`. Branch-protection enforcement is still a
+separate repository setting.
 
-This is the current local release-binary record plus the first public Debian
-transfer result. It is not a universal-compatibility, real-device, completed
-24-hour-soak, or 100k-capacity certificate. The older release bundle below is
-retained as historical evidence and is tied to an earlier binary digest.
+This is the current local release-binary record plus the current public Debian
+transfer, completed soak, and kspls0 LVM qualification results. It is not a
+universal-compatibility or 100k-capacity certificate. The counted soak source
+predates the b393 source refresh; the current b393 public transfer and storage
+reports are separate artifact-specific evidence. The older release bundle below
+is retained as historical evidence.
 
 Everything below is historical evidence from the 2026-09-02 bundle. Its old
 TNG-011/TNG-029 wording and artifact digest are superseded by the current

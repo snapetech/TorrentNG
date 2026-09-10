@@ -85,20 +85,27 @@ INTEROP_KEEP_PUBLIC_DATA=1 \
 scripts/interop_matrix.sh --public
 ```
 
-The latest local run, recorded against clean `main` at `83b70ce`, passed all 28 cases (10
+The latest full local run, recorded against clean `main` at `b393eb0`, passed all 28 cases (10
 base, 4 extended, and 14 protocol rows):
-[`interop-matrix-20260904T195529Z.md`](../certification/reports/interop-matrix-20260904T195529Z.md).
-The public Debian leg also passed on 2026-09-05:
-[`public-debian-interop-20260905T191253Z.md`](../certification/reports/public-debian-interop-20260905T191253Z.md).
-Real-device storage remains a separate external gate.
+[`interop-matrix-20260910T190228Z.md`](../certification/reports/interop-matrix-20260910T190228Z.md).
+The current public Debian leg also passed at `b393eb0`:
+[`interop-matrix-20260910T192200Z.md`](../certification/reports/interop-matrix-20260910T192200Z.md),
+with the canonical all-live certification record in
+[`universal-compat-b393eb0-all-live.md`](../certification/reports/universal-compat-b393eb0-all-live.md).
+It observed 142 Rust peers across torrentngd, qBittorrent, Transmission, Deluge,
+and rTorrent. The targeted corruption/recheck repair regression also passes:
+[`interop-force-recheck-corruption-repair-20260910.md`](../certification/reports/interop-force-recheck-corruption-repair-20260910.md).
+The kspls0 real-device storage leg passed against `/dev/mapper/datapool_lvm-media`
+at source commit `b393eb0`:
+[`universal-live-kspls0-lvm-20260910-b393eb0.md`](../certification/reports/universal-live-kspls0-lvm-20260910-b393eb0.md).
 
 The public run resolved Debian 13.6 netinst from the official Debian source,
-transferred 791,674,880 bytes, reached 100% in Rust, and observed three
-reference-client peers. Its v1 info hash is
+transferred 791,674,880 bytes, reached 100% in Rust, and observed 142 Rust
+peers across all five configured clients. Its v1 info hash is
 `481b6e3617be4c88f96cb25e47c9d8272130071e`. This is one public torrent
 compatibility result, not universal client or production-network certification.
 
-To start a named public-torrent soak after the matrix completes, pass the
+To start a named public-torrent soak after a future matrix completes, pass the
 identity invariants into the soak launcher:
 
 ```sh
@@ -111,10 +118,13 @@ SOAK_DATA_PATH=/downloads/torrentngd \
 scripts/start_24h_soak.sh certification/reports/soak-24h-public-debian.md
 ```
 
-The soak checks the exact name, hash, completed progress, and uploading/seeding
-state on every sample in addition to health, sync, metrics, resource, and
-dependency checks. Do not treat the run as complete until its final report
-contains `Overall status: PASS` after the full 86,400-second interval.
+The completed named Debian soak checked the exact name, hash, completed
+progress, and uploading/seeding state on every sample in addition to health,
+sync, metrics, resource, and dependency checks. Its finalization report is
+[`soak-final-public-debian-20260910.md`](../certification/reports/soak-final-public-debian-20260910.md)
+and records `Overall status: PASS` after 1,437 retained samples. Do not treat a
+future run as complete until its final report contains the same PASS marker
+after the configured 86,400-second interval.
 
 ## Local Matrix
 

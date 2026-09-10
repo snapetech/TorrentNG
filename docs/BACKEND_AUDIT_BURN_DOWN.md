@@ -1,6 +1,6 @@
 # TorrentNG Backend Audit Burn-down
 
-Status: **implementation burn-down complete; qualification gates active**
+Status: **implementation burn-down complete; current qualification evidence refreshed 2026-09-10**
 Baseline: 2026-09-01, `main`  
 Scope: native Rust engine, native daemon/API, compatibility facades, storage,
 deployment, CI, and release evidence.
@@ -16,9 +16,11 @@ and release evidence exist together.
 TorrentNG is not certified as a production-grade 100k-torrent deployment or as
 a universally compatible client. The current source has materially closed the
 functional storage, lifecycle, snapshot, and compatibility gaps, and the
-release binary passes the local authenticated daemon smoke. The release
-posture remains **do not make unqualified scale, security, pure-v2, or
-universal-compatibility claims** until the explicitly external evidence exists.
+release binary passes the local authenticated daemon smoke. One official public
+Debian transfer, its completed counted soak, and the current kspls0 LVM storage
+qualification now have passing evidence. The release posture remains **do not
+make unqualified scale, security, pure-v2, or universal-compatibility claims**
+until the remaining evidence exists.
 
 The burn-down order is:
 
@@ -29,10 +31,10 @@ The burn-down order is:
 5. architecture seams and maintainability.
 
 Current execution priority is functional correctness and isolation. The
-100k-hot, public-compatibility, real-device, and 24-hour-soak gates are
-extended proof work, not the current implementation gate; they remain
-explicitly open and must not be represented as completed by local unit tests
-or a synthetic dormant corpus.
+100k-hot, broader public-compatibility, production-corpus, and multi-device
+qualification gates are extended proof work, not the current implementation
+gate; they remain explicitly bounded and must not be represented as completed
+by local unit tests or a synthetic dormant corpus.
 
 ## Status rules
 
@@ -61,16 +63,19 @@ The following was run against the audit baseline before this burn-down began:
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | FAIL | Existing lint/MSRV/enum-layout failures remain. |
 | native CI workflow | INCOMPLETE | `.github/workflows/ci.yml` builds sidecar/WebUI but does not test native crates. |
 | native release workflow (baseline) | INCOMPLETE | Historical baseline: release built and smoke-checked the binary without native test, fmt, or clippy gates. |
-| certification status | NOT CLEAN | Universal compatibility is `PASS_WITH_SKIPS`; 24h soak is stale/incomplete; strict readiness fails. |
+| certification status | NOT CLEAN | Universal compatibility is `PASS_WITH_SKIPS` because the separate real-device wrapper leg is intentionally skipped; the completed 24h soak is PASS, while strict readiness still fails on non-clean evidence rows. |
 | checked-in fuzz/OpenAPI/idempotency evidence | PARTIAL | Fuzz targets and bounded CI smoke commands are checked in; the native OpenAPI contract is now checked in; endpoint replay tests and an observed hosted-CI run remain evidence gaps. |
 
-## Current verified evidence (2026-09-04 local / 2026-09-04 UTC)
+## Current verified evidence (2026-09-10 local / 2026-09-10 UTC)
 
 The current source tree has been re-verified after the functional isolation,
-durability, compatibility, and contract fixes recorded in the latest
-burn-down entries. The checks below combine local verification with the
-completed hosted CI run; external hardware, public-network traffic, and
-long-soak results remain separate evidence gates.
+durability, compatibility, and deployment fixes recorded in the latest
+burn-down entries. The checks below combine the prior local/hosted verification
+with fresh evidence against pushed commit `b393eb0`: the public Debian transfer
+was rerun, the kspls0 LV was exercised directly, and the external preflight was
+rerun in strict mode. The counted public soak source predates b393; its
+finalization report is explicit about the source report and does not claim a
+b393 release soak.
 
 | Check | Result | Meaning |
 | --- | --- | --- |
@@ -81,38 +86,51 @@ long-soak results remain separate evidence gates.
 | `cargo +1.88 build/test --workspace --all-targets --locked` | PASS | Declared main-workspace MSRV build and tests green. |
 | `cargo +1.97.0 build/test --manifest-path sidecar/Cargo.toml --locked` | PASS | Declared sidecar MSRV build and tests green. |
 | declared `rust-version` (both `Cargo.toml`s) | **CORRECTED** | Was `1.80` in both, unverified and untrue. Neither workspace's *locked* dependency graph builds below 1.88 (main: `idna_adapter` needs rustc 1.86+, plus `edition2024` needs Cargo 1.85+) or 1.97 (sidecar: `libsqlite3-sys`'s build script uses `cfg_select!`, stabilized between 1.94 and 1.97). This is a transitive-dependency floor, not first-party code needing new syntax. Corrected both `rust-version` fields to `1.88` / `1.97` to match reality; this itself is TNG-028 acceptance criteria ("document the supported toolchain"). |
-| GitHub Actions CI run `33916500668` | PASS | All 10 jobs passed on `8c46b61`: native quality, both MSRV jobs, fuzz smoke, sidecar, WebUI, dependency security, backup/restore, API/SSE load, and fault containment. |
+| GitHub Actions CI run `34510889406` | PASS | All 10 jobs passed on `b393eb0`: native quality, both MSRV jobs, fuzz smoke, sidecar, WebUI, dependency security, backup/restore, API/SSE load, and fault containment. |
+| rTorrent startup identity timeout isolation | PASS | Commit `4a90048` gives the multi-thousand-download identity rewrite a separate 300-second timeout while ordinary XMLRPC calls remain 10 seconds; sidecar tests and warnings-denied clippy pass. |
+| kspls0 LVM storage release certification | PASS | [`storage-release-certification-kspls0-lvm-20260910-b393eb0.md`](../certification/reports/storage-release-certification-kspls0-lvm-20260910-b393eb0.md); exact commit `b393eb0`, `/dev/mapper/datapool_lvm-media`, HDD median ratio 5.11x, io_uring graduation, and real-root move/import all pass. |
+| kspls0 real-device storage matrix | PASS_WITH_SKIPS | [`universal-live-kspls0-lvm-20260910-b393eb0.md`](../certification/reports/universal-live-kspls0-lvm-20260910-b393eb0.md); the real-device storage gate passes against the LV; local Docker/public legs were intentionally not rerun in this targeted invocation. |
+| Public Debian 24-hour soak finalization | PASS | [`soak-final-public-debian-20260910.md`](../certification/reports/soak-final-public-debian-20260910.md); 1,437 samples, one exact completed torrent, resource/health checks pass. |
+| Canonical all-live compatibility certification | PASS_WITH_SKIPS | [`universal-compat-b393eb0-all-live.md`](../certification/reports/universal-compat-b393eb0-all-live.md); static, migration, local Docker, mobile, and public Debian gates pass; only the separate real-device wrapper gate is skipped. |
+| Strict external evidence preflight | PASS | [`external-evidence-preflight-release-strict-20260910-b393eb0.md`](../certification/reports/external-evidence-preflight-release-strict-20260910-b393eb0.md); Docker, public opt-in, writable target, migration corpus, and completed soak pass. |
 
-The hosted CI workflow has now run successfully. The companion dynamic
-CodeQL orchestration also passed all four analyses (`33916500079`). This proves the
+The hosted CI workflow has now run successfully for the pushed source. Run
+`34510889406` passed all ten jobs and the companion dynamic CodeQL orchestration
+run `34510889093` passed all four analyses on `b393eb0`. This proves the
 repository gates execute on GitHub's runners; it does not prove that branch
 protection requires them, and the repository's branch-protection setting must
 still be reviewed separately.
 
 Focused release evidence from 2026-09-04 is indexed in
 [`BACKEND_BURNDOWN_RELEASE_20260902.md`](BACKEND_BURNDOWN_RELEASE_20260902.md).
-The current release binary was built, launched with an isolated authenticated
+The prior release binary was built, launched with an isolated authenticated
 config, exercised through native REST, qBittorrent REST, health, and metrics,
 and terminated with SIGTERM. The local release gate passed its implementation
-checks with warnings; strict readiness failed because external evidence is
-stale, missing, or explicitly skipped. This is a deployment smoke result, not
-a 100k capacity result.
+checks. A final clean b393 release-binary rebuild and smoke is being refreshed
+after this evidence reconciliation; strict readiness remains appropriately
+blocked by optional compatibility legs until those are exercised or removed
+from release policy. This is a deployment smoke result, not a 100k capacity
+result.
 
-The latest verification rebuilt `target/release/torrentngd` locally on
+The previous verification rebuilt `target/release/torrentngd` locally on
 2026-09-04 from clean code commit `83b70ce`: 22,433,352 bytes, SHA-256
 `ff94ede075f7541ef9eecf5418b1c31324fb1b6ca2648681d975b3e9cd048e73`.
-The current release-binary smoke passed authenticated health, native list and
+That release-binary smoke passed authenticated health, native list and
 transfer, qBittorrent list and transfer, Prometheus metrics, and SIGTERM
-clean exit in 462 ms. See the current local release gate and smoke report:
+clean exit in 462 ms. A new clean b393 smoke report will replace this prior
+artifact in the final release update:
 [`local-release-backend-burndown-final-20260904.md`](../certification/reports/local-release-backend-burndown-final-20260904.md),
 [`backend-burndown-native-release-smoke-local-release-20260904T192950Z.md`](../certification/reports/backend-burndown-native-release-smoke-local-release-20260904T192950Z.md).
 Full workspace tests, warnings-denied clippy, formatting, OpenAPI validation,
 sidecar tests, the current security scan, and the universal-live local Docker
 matrix are green. These are current local facts, not external production
-evidence. The universal-live report is `PASS_WITH_SKIPS`: its 28 local Docker
-cases pass in [`universal-live-current-20260904.md`](../certification/reports/universal-live-current-20260904.md).
-The separate public Debian matrix now passes; real-device storage remains an
-explicit skip.
+evidence. The current b393 all-live compatibility report is `PASS_WITH_SKIPS`:
+its local Docker, mobile, and public legs pass, while the real-device wrapper
+is explicitly skipped in
+[`universal-compat-b393eb0-all-live.md`](../certification/reports/universal-compat-b393eb0-all-live.md).
+The separate kspls0 LVM storage qualification also passes; its targeted
+universal-live report records the real-device storage gate as PASS and leaves
+the unrelated local/public legs explicitly skipped.
 
 The documentation and certification-harness follow-up is now `8c46b61`; it
 does not change the daemon binary. The local release process also passed the focused fault and API-load gates:
@@ -128,29 +146,31 @@ RSS was sampled as an allocation proxy; this is not an allocator profile or a
 representative public production workload.
 
 The current full Docker interoperability matrix is
-[`interop-matrix-20260904T195529Z.md`](../certification/reports/interop-matrix-20260904T195529Z.md).
+[`interop-matrix-20260910T190228Z.md`](../certification/reports/interop-matrix-20260910T190228Z.md).
 It covers bidirectional transfers with qBittorrent, Transmission, Deluge, and
 rTorrent, failure/recovery protocol cases, and native/qBittorrent/Transmission/
 Deluge facade mutations.
 
-The first live public-torrent matrix is
-[`public-debian-interop-20260905T191253Z.md`](../certification/reports/public-debian-interop-20260905T191253Z.md).
+The current live public-torrent matrix is
+[`interop-matrix-20260910T192200Z.md`](../certification/reports/interop-matrix-20260910T192200Z.md),
+with the canonical all-live evidence in
+[`universal-compat-b393eb0-all-live.md`](../certification/reports/universal-compat-b393eb0-all-live.md).
 It resolved the official Debian 13.6 netinst torrent, supplied its verified
 metainfo to Rust and the four reference clients, transferred 791,674,880
-bytes, reached 100% in Rust, and observed three reference-client peers. The
+bytes, reached 100% in Rust, and observed 142 Rust peers across all five
+configured clients. The latest all-live run also exercised the mobile
+qBittorrent-compatible read flow and passed it. The
 v1 info hash is `481b6e3617be4c88f96cb25e47c9d8272130071e`. This closes one
 public-swarm evidence row; it does not establish universal compatibility.
 
-The named public-torrent 24-hour soak is active under the launch record
-[`PUBLIC_TORRENT_SOAK_20260905.md`](PUBLIC_TORRENT_SOAK_20260905.md). Its final
-status is intentionally still open until the full 86,400 seconds and post-soak
-checks complete.
+The named public-torrent 24-hour soak is complete under the launch record
+[`PUBLIC_TORRENT_SOAK_20260905.md`](PUBLIC_TORRENT_SOAK_20260905.md). The
+counted source report retained 1,437 samples and the finalizer reports PASS.
 
-The current external preflight is
-[`external-evidence-preflight-public-soak-20260905T193325Z.md`](../certification/reports/external-evidence-preflight-public-soak-20260905T193325Z.md):
-Docker, public opt-in, migration corpus, and the active soak are green. The
-real-device target remains the single warning; the current public and soak
-evidence is recorded above.
+The current strict external preflight is
+[`external-evidence-preflight-release-strict-20260910-b393eb0.md`](../certification/reports/external-evidence-preflight-release-strict-20260910-b393eb0.md):
+Docker, public opt-in, writable target, migration corpus, and completed soak
+are green with no warnings.
 
 ### Historical functional isolation checkpoint (2026-09-02)
 
@@ -310,16 +330,16 @@ and is superseded by the source reconciliation above.
 | TNG-023 | Implemented locally: implemented/enabled/certified/experimental assurance states are separate | Keep `certified` empty until external evidence is accepted |
 | TNG-024 | Implemented locally: fail-closed config validation, secret-file support, deployment templates | Run deployment on the target orchestrator and inspect rendered secrets |
 | TNG-025 | Resolved for the repository gate: native quality, clippy, MSRV, fuzz, release-smoke, security, backup, load, and fault jobs execute successfully | Branch-protection enforcement still needs repository-settings review |
-| TNG-026 | Current release artifact was built from clean `83b70ce`, deployed locally, authenticated, smoked, backed up/restored, and shut down cleanly; hosted CI run `33916500668` also passed on `8c46b61` | One official public Debian transfer passes; real-device storage, the 24-hour soak, remaining public sources, and strict readiness remain external gates |
+| TNG-026 | Current source/release refresh is `b393eb0`; prior local deployment smoke, backup/restore, and clean shutdown pass, with a final clean b393 smoke being refreshed after this evidence commit | One official public Debian transfer, completed named soak, canonical all-live local/mobile/public compatibility, and kspls0 LVM storage now pass; remaining public sources and strict readiness remain external gates |
 | TNG-027 | Resolved for the repository gate: fuzz targets, OpenAPI validator, idempotency tests, and hosted bounded fuzz smoke are green | Broader parser and mutation replay corpus remains optional evidence work |
 | TNG-028 | Resolved for the repository gate: format, clippy, locked tests, and declared MSRV pass locally and in hosted CI | Branch-protection enforcement still needs repository-settings review |
 | TNG-029 | Resolved for the stated persistence-isolation finding: authoritative engine DB work uses a dedicated bounded supervised worker; live crash/DB/storage fault matrix and local client matrix pass | Full actor decomposition and deployment-specific fault evidence remain non-release structural follow-up |
 
 The practical release statement is therefore: **local functional remediation,
-live fault containment, API/SSE load, release-binary smoke, and the hosted CI
-repository gate pass; branch-protection enforcement, real-device storage,
-public compatibility, long-soak certification, and extended-scale proof are
-not complete.**
+live fault containment, API/SSE load, release-binary smoke, hosted CI, one
+official public transfer/soak, and the exercised kspls0 LVM storage gate pass;
+branch-protection enforcement, broader public/device coverage, and extended-
+scale proof are not complete.**
 
 ## P0 — security and data integrity
 
@@ -915,7 +935,7 @@ single-torrent tier-transition evidence. The current local concurrent-client
 and slow-SSE report is
 [`backend-api-load-current-20260904-final.md`](../certification/reports/backend-api-load-current-20260904-final.md).
 The current Docker client/protocol matrix is
-[`interop-matrix-20260904T195529Z.md`](../certification/reports/interop-matrix-20260904T195529Z.md);
+[`interop-matrix-20260910T190228Z.md`](../certification/reports/interop-matrix-20260910T190228Z.md);
 it reconciles 10 base swarm, 4 extended, and 14 protocol cases as PASS after
 qBittorrent unsupported-mutation assertion was corrected to require the
 documented 501 response.
@@ -1460,7 +1480,7 @@ warnings` all pass now, including on the actual declared MSRV toolchains
 corrected from an untrue "1.80" to the real, verified floor). Two clippy
 findings were fixed (too-many-arguments on an egress-policy-widened
 function, a redundant `u32 -> u32` cast). The native-quality, MSRV, and
-sidecar checks are defined in CI and pass in hosted run `33915548520`.
+sidecar checks are defined in CI and pass in hosted run `34510889406`.
 Repository branch-protection enforcement remains a settings review, not a
 source-code gap.
 
