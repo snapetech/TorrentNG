@@ -894,6 +894,11 @@ impl TorrentTask {
                             if matches!(self.run_recheck(None).await, RecheckOutcome::Shutdown) {
                                 break;
                             }
+                            // A recheck can invalidate pieces after the
+                            // webseed timer has backed off because the picker
+                            // was complete. Wake the scheduler immediately so
+                            // repair does not wait for the long retry deadline.
+                            reset_webseed_sleep(&mut webseed_sleep, self.webseed_wake_delay());
                         }
                         TorrentCmd::QuiesceForStorageMove { reply } => {
                             let was_paused = self.paused;
@@ -945,6 +950,7 @@ impl TorrentTask {
                                 {
                                     break;
                                 }
+                                reset_webseed_sleep(&mut webseed_sleep, self.webseed_wake_delay());
                             }
                         }
                         TorrentCmd::NewPeers(addrs) => {
@@ -999,6 +1005,9 @@ impl TorrentTask {
                             if matches!(self.run_recheck(job_id).await, RecheckOutcome::Shutdown) {
                                 break;
                             }
+                            // Recheck may transition a complete torrent back
+                            // to downloading when corruption is found.
+                            reset_webseed_sleep(&mut webseed_sleep, self.webseed_wake_delay());
                         }
                         TorrentCmd::CancelJob { .. } => {}
                         TorrentCmd::Reannounce => {
