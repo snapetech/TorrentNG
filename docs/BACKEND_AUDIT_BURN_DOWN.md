@@ -70,9 +70,10 @@ The following was run against the audit baseline before this burn-down began:
 
 The current source tree has been re-verified after the functional isolation,
 durability, compatibility, and deployment fixes recorded in the latest
-burn-down entries. The checks below combine the prior local/hosted verification
-with fresh evidence against pushed commit `b393eb0`: the public Debian transfer
-was rerun, the kspls0 LV was exercised directly, and the external preflight was
+burn-down entries. Runtime and external qualification evidence below targets
+product commit `b393eb0`; evidence reconciliation is `3cb0ba4`, and the latest
+certification-script hardening is `50e0fc3`. The public Debian transfer was
+rerun, the kspls0 LV was exercised directly, and the external preflight was
 rerun in strict mode. The counted public soak source predates b393; its
 finalization report is explicit about the source report and does not claim a
 b393 release soak.
@@ -92,6 +93,8 @@ b393 release soak.
 | kspls0 real-device storage matrix | PASS_WITH_SKIPS | [`universal-live-kspls0-lvm-20260910-b393eb0.md`](../certification/reports/universal-live-kspls0-lvm-20260910-b393eb0.md); the real-device storage gate passes against the LV; local Docker/public legs were intentionally not rerun in this targeted invocation. |
 | Public Debian 24-hour soak finalization | PASS | [`soak-final-public-debian-20260910.md`](../certification/reports/soak-final-public-debian-20260910.md); 1,437 samples, one exact completed torrent, resource/health checks pass. |
 | Canonical all-live compatibility certification | PASS_WITH_SKIPS | [`universal-compat-b393eb0-all-live.md`](../certification/reports/universal-compat-b393eb0-all-live.md); static, migration, local Docker, mobile, and public Debian gates pass; only the separate real-device wrapper gate is skipped. |
+| Clean release-binary smoke | PASS | [`backend-burndown-native-release-smoke-20260910-final.md`](../certification/reports/backend-burndown-native-release-smoke-20260910-final.md); build commit `3cb0ba4`, 22,449,216 bytes, SHA-256 `7fbac478b696316d989028c47573e4cd248f04a98a479f218017c0ec5a812b5e`, 457 ms, clean SIGTERM. |
+| Full local release gate | PASS_WITH_WARNINGS | [`local-release-20260910-50e0fc3.md`](../certification/reports/local-release-20260910-50e0fc3.md); native, storage-feature, WebUI, API, smoke, backup, corpus, and security gates pass; only local block-device certification is skipped. |
 | Strict external evidence preflight | PASS | [`external-evidence-preflight-release-strict-20260910-b393eb0.md`](../certification/reports/external-evidence-preflight-release-strict-20260910-b393eb0.md); Docker, public opt-in, writable target, migration corpus, and completed soak pass. |
 
 The hosted CI workflow has now run successfully for the pushed source. Run
@@ -103,24 +106,22 @@ still be reviewed separately.
 
 Focused release evidence from 2026-09-04 is indexed in
 [`BACKEND_BURNDOWN_RELEASE_20260902.md`](BACKEND_BURNDOWN_RELEASE_20260902.md).
-The prior release binary was built, launched with an isolated authenticated
-config, exercised through native REST, qBittorrent REST, health, and metrics,
-and terminated with SIGTERM. The local release gate passed its implementation
-checks. A final clean b393 release-binary rebuild and smoke is being refreshed
-after this evidence reconciliation; strict readiness remains appropriately
-blocked by optional compatibility legs until those are exercised or removed
-from release policy. This is a deployment smoke result, not a 100k capacity
-result.
+The current clean release binary was built at `3cb0ba4`, launched with an
+isolated authenticated config, exercised through native REST, qBittorrent REST,
+health, and metrics, and terminated with SIGTERM. The full local release gate
+was rerun at `50e0fc3` and is `PASS_WITH_WARNINGS` solely because its local
+block-device target was not configured. Strict readiness remains appropriately
+blocked by explicit compatibility/storage-scope policy rows. This is a
+deployment smoke result, not a 100k capacity result.
 
-The previous verification rebuilt `target/release/torrentngd` locally on
-2026-09-04 from clean code commit `83b70ce`: 22,433,352 bytes, SHA-256
-`ff94ede075f7541ef9eecf5418b1c31324fb1b6ca2648681d975b3e9cd048e73`.
-That release-binary smoke passed authenticated health, native list and
-transfer, qBittorrent list and transfer, Prometheus metrics, and SIGTERM
-clean exit in 462 ms. A new clean b393 smoke report will replace this prior
-artifact in the final release update:
-[`local-release-backend-burndown-final-20260904.md`](../certification/reports/local-release-backend-burndown-final-20260904.md),
-[`backend-burndown-native-release-smoke-local-release-20260904T192950Z.md`](../certification/reports/backend-burndown-native-release-smoke-local-release-20260904T192950Z.md).
+The final clean release-binary smoke report is
+[`backend-burndown-native-release-smoke-20260910-final.md`](../certification/reports/backend-burndown-native-release-smoke-20260910-final.md):
+22,449,216 bytes, SHA-256
+`7fbac478b696316d989028c47573e4cd248f04a98a479f218017c0ec5a812b5e`, 457 ms,
+all checks PASS, and clean SIGTERM. The latest WebUI report is
+[`webui-certification-20260910-50e0fc3.md`](../certification/reports/webui-certification-20260910-50e0fc3.md),
+and the latest full local release report is
+[`local-release-20260910-50e0fc3.md`](../certification/reports/local-release-20260910-50e0fc3.md).
 Full workspace tests, warnings-denied clippy, formatting, OpenAPI validation,
 sidecar tests, the current security scan, and the universal-live local Docker
 matrix are green. These are current local facts, not external production
@@ -132,8 +133,9 @@ The separate kspls0 LVM storage qualification also passes; its targeted
 universal-live report records the real-device storage gate as PASS and leaves
 the unrelated local/public legs explicitly skipped.
 
-The documentation and certification-harness follow-up is now `8c46b61`; it
-does not change the daemon binary. The local release process also passed the focused fault and API-load gates:
+The evidence reconciliation is `3cb0ba4`; certification-harness hardening is
+`50e0fc3` and does not change the daemon binary. The local release process also
+passed the focused fault and API-load gates:
 [`backend-burndown-native-fault-live-current-20260904.md`](../certification/reports/backend-burndown-native-fault-live-current-20260904.md)
 passed live SIGKILL/restart, injected SQLite failure/recovery, API
 cancellation, and filesystem failure isolation; the deterministic worker
@@ -330,7 +332,7 @@ and is superseded by the source reconciliation above.
 | TNG-023 | Implemented locally: implemented/enabled/certified/experimental assurance states are separate | Keep `certified` empty until external evidence is accepted |
 | TNG-024 | Implemented locally: fail-closed config validation, secret-file support, deployment templates | Run deployment on the target orchestrator and inspect rendered secrets |
 | TNG-025 | Resolved for the repository gate: native quality, clippy, MSRV, fuzz, release-smoke, security, backup, load, and fault jobs execute successfully | Branch-protection enforcement still needs repository-settings review |
-| TNG-026 | Current source/release refresh is `b393eb0`; prior local deployment smoke, backup/restore, and clean shutdown pass, with a final clean b393 smoke being refreshed after this evidence commit | One official public Debian transfer, completed named soak, canonical all-live local/mobile/public compatibility, and kspls0 LVM storage now pass; remaining public sources and strict readiness remain external gates |
+| TNG-026 | Runtime source is `b393eb0`; release evidence was reconciled at `3cb0ba4` and the certification harness was hardened at `50e0fc3`; clean deployment smoke, backup/restore, WebUI, and shutdown now pass | One official public Debian transfer, completed named soak, canonical all-live local/mobile/public compatibility, and kspls0 LVM storage now pass; remaining public sources and strict readiness remain external gates |
 | TNG-027 | Resolved for the repository gate: fuzz targets, OpenAPI validator, idempotency tests, and hosted bounded fuzz smoke are green | Broader parser and mutation replay corpus remains optional evidence work |
 | TNG-028 | Resolved for the repository gate: format, clippy, locked tests, and declared MSRV pass locally and in hosted CI | Branch-protection enforcement still needs repository-settings review |
 | TNG-029 | Resolved for the stated persistence-isolation finding: authoritative engine DB work uses a dedicated bounded supervised worker; live crash/DB/storage fault matrix and local client matrix pass | Full actor decomposition and deployment-specific fault evidence remain non-release structural follow-up |

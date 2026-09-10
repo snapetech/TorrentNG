@@ -4,15 +4,15 @@
 
 | Check | Result | Evidence |
 | --- | --- | --- |
-| Source revision | recorded | current pushed source is `main` at `b393eb0`; the release binary and storage reports below identify their exact source revision |
-| Release build | PASS | `cargo build --release --locked -p torrentngd` |
-| Binary | PASS | `target/release/torrentngd`; 22,448,768 bytes; SHA-256 `0a8233db7d34c17854b5ee20aa62abad33ec34b36444d68ea714d6b801836067` |
-| Authenticated deployment smoke | PENDING FINAL SMOKE | A clean release-binary smoke will be recorded after this evidence reconciliation commit |
+| Source revision | recorded | current pushed source is `main` at `50e0fc3`; runtime product code is unchanged from `b393eb0`, while the release smoke identifies its exact build commit |
+| Release build | PASS | `cargo build --release --locked -p torrentngd` at `3cb0ba4` |
+| Binary | PASS | `target/release/torrentngd`; 22,449,216 bytes; SHA-256 `7fbac478b696316d989028c47573e4cd248f04a98a479f218017c0ec5a812b5e` |
+| Authenticated deployment smoke | PASS | [`backend-burndown-native-release-smoke-20260910-final.md`](../certification/reports/backend-burndown-native-release-smoke-20260910-final.md); clean worktree at `3cb0ba4`, all endpoints and SIGTERM pass in 457 ms |
 | Startup/health | PASS | Release binary started from the isolated authenticated config and returned ready health |
 | Native list/transfer | PASS | Native list envelope and aggregate transfer-info requests returned HTTP 200 |
 | qBittorrent list/transfer | PASS | qBittorrent list and aggregate transfer-info requests returned HTTP 200 |
 | Prometheus metrics | PASS | 647 lines / 43,459 bytes returned HTTP 200 |
-| SIGTERM | PASS | Clean exit observed after 2 polls; total smoke duration 462 ms |
+| SIGTERM | PASS | Clean exit observed after 2 polls; total smoke duration 457 ms |
 | Compose render | PASS | `docker compose -f deploy/native/compose.yml config --quiet` |
 | Live fault matrix | PASS | [`backend-burndown-native-fault-live-current-20260904.md`](../certification/reports/backend-burndown-native-fault-live-current-20260904.md); SIGKILL/restart, SQLite failure/recovery, storage cancellation, and filesystem failure all remain isolated |
 | API/SSE load | PASS | [`backend-api-load-current-20260904-final.md`](../certification/reports/backend-api-load-current-20260904-final.md); 204,936 requests over 30 seconds, 32 JSON clients, 8 slow SSE consumers, zero errors |
@@ -20,6 +20,8 @@
 | Public legal torrent matrix | PASS | [`interop-matrix-20260910T192200Z.md`](../certification/reports/interop-matrix-20260910T192200Z.md); official Debian 13.6 netinst, 791,674,880 bytes, Rust completed, 142 Rust peers across five clients |
 | Public Debian 24-hour soak | PASS | [`soak-final-public-debian-20260910.md`](../certification/reports/soak-final-public-debian-20260910.md); 1,437 samples, exact completed torrent, health/resource checks pass |
 | Canonical universal compatibility | PASS_WITH_SKIPS | [`universal-compat-b393eb0-all-live.md`](../certification/reports/universal-compat-b393eb0-all-live.md); static, migration, local Docker, mobile, and public Debian legs pass; real-device storage is a separate targeted report |
+| WebUI certification | PASS | [`webui-certification-20260910-50e0fc3.md`](../certification/reports/webui-certification-20260910-50e0fc3.md); production build, lint, and browser matrix pass (15 passed, 5 intentional skips) |
+| Local release gate | PASS_WITH_WARNINGS | [`local-release-20260910-50e0fc3.md`](../certification/reports/local-release-20260910-50e0fc3.md); all configured gates pass and only the unconfigured local block-device probe is skipped |
 | Security scan | PASS | [`security-scan-current-20260904.md`](../certification/reports/security-scan-current-20260904.md); npm audit, locked Cargo tree, and container scan pass with no HIGH/CRITICAL findings |
 | kspls0 LVM storage certification | PASS | [`storage-release-certification-kspls0-lvm-20260910-b393eb0.md`](../certification/reports/storage-release-certification-kspls0-lvm-20260910-b393eb0.md); exact `b393eb0`, HDD median ratio 5.11x, LVM extent probe, io_uring, and real-root move/import pass |
 | kspls0 real-device storage matrix | PASS_WITH_SKIPS | [`universal-live-kspls0-lvm-20260910-b393eb0.md`](../certification/reports/universal-live-kspls0-lvm-20260910-b393eb0.md); storage leg PASS; Docker/public legs were intentionally skipped in this targeted run |

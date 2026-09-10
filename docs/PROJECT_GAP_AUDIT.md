@@ -1,8 +1,8 @@
 # TorrentNG Project Gap Audit
 
-Status as of 2026-09-10 on clean `main` at `b393eb0`; the current release
-smoke, public-soak finalization, and kspls0 LVM evidence are tied to this
-source revision where stated below.
+Status as of 2026-09-10 on clean `main` at `50e0fc3`; runtime product evidence
+and kspls0 LVM reports are tied to `b393eb0` where stated below, and the clean
+release smoke identifies its own build commit.
 
 This audit separates local implementation gaps from external evidence gates.
 It is based on the roadmap docs, compatibility matrices, certification status,
@@ -55,7 +55,7 @@ Current `scripts/certification_status.sh` highlights:
 | --- | --- |
 | Native engine rewrite | PASS |
 | Hosted CI repository gate | PASS (`34510889406`, all 10 jobs; CodeQL `34510889093` also green) |
-| Local release gate | Prior local PASS_WITH_WARNINGS report; final clean b393 release smoke is being refreshed after this evidence commit |
+| Local release gate | PASS_WITH_WARNINGS at `50e0fc3`; native, WebUI, API, smoke, backup, corpus, and security gates pass, with only the unconfigured local block-device probe skipped |
 | Storage hardware matrix | PASS on kspls0 LVM (`b393eb0`) |
 | Storage io_uring capability/graduation | PASS on kspls0 LVM (`b393eb0`) |
 | Storage move/import | PASS on kspls0 LVM (`b393eb0`) |
