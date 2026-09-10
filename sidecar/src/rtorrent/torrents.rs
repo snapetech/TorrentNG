@@ -448,7 +448,7 @@ impl Client {
     /// Push user_agent to rTorrent's HTTP user agent setting.
     /// Called on startup and on config change via API.
     pub async fn set_user_agent(&self, user_agent: &str) -> Result<()> {
-        self.call_xmlrpc(
+        self.call_identity_xmlrpc(
             "network.http.user_agent.set",
             &["".into(), user_agent.into()],
         )
@@ -467,17 +467,33 @@ impl Client {
         }
 
         let set_cmd = format!("d.local_id.set={peer_id}");
-        self.call_xmlrpc(
-            "d.multicall2",
-            &[
-                "".into(),
-                "main".into(),
-                set_cmd.as_str().into(),
-                "d.save_full_session=".into(),
-            ],
-        )
-        .await
-        .context("set rTorrent download local_id values")?;
+        let mut offset = 0i64;
+        loop {
+            let result = self
+                .call_identity_xmlrpc(
+                    "d.multicall.range",
+                    &[
+                        "".into(),
+                        "main".into(),
+                        offset.into(),
+                        1000.into(),
+                        set_cmd.as_str().into(),
+                        "d.save_full_session=".into(),
+                    ],
+                )
+                .await
+                .with_context(|| {
+                    format!("set rTorrent download local_id values at offset {offset}")
+                })?;
+            let count = result.try_into_array()?.len() as i64;
+            if count == 0 {
+                break;
+            }
+            offset += count;
+            if count < 1000 {
+                break;
+            }
+        }
         Ok(())
     }
 
@@ -486,19 +502,35 @@ impl Client {
     /// from resuming while this flag is zero, so no tracker announce can race
     /// the identity rewrite.
     pub async fn release_identity_gate(&self) -> Result<()> {
-        self.call_xmlrpc("tng.identity_ready.set", &[1.into()])
+        self.call_identity_xmlrpc("tng.identity_ready.set", &["".into(), 1.into()])
             .await
             .context("release rTorrent tracker identity gate")?;
-        self.call_xmlrpc(
-            "d.multicall2",
-            &[
-                "".into(),
-                "started".into(),
-                "scheduler.simple.update=".into(),
-            ],
-        )
-        .await
-        .context("resume rTorrent downloads after identity gate")?;
+        let mut offset = 0i64;
+        loop {
+            let result = self
+                .call_identity_xmlrpc(
+                    "d.multicall.range",
+                    &[
+                        "".into(),
+                        "started".into(),
+                        offset.into(),
+                        1000.into(),
+                        "scheduler.simple.update=".into(),
+                    ],
+                )
+                .await
+                .with_context(|| {
+                    format!("resume rTorrent downloads after identity gate at offset {offset}")
+                })?;
+            let count = result.try_into_array()?.len() as i64;
+            if count == 0 {
+                break;
+            }
+            offset += count;
+            if count < 1000 {
+                break;
+            }
+        }
         Ok(())
     }
 

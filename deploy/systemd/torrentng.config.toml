@@ -6,6 +6,7 @@ storage_roots = ["/var/lib/rtorrent/downloads"]
 [rtorrent]
 scgi_socket = "/run/rtorrent/rpc.sock"
 timeout_secs = 10
+identity_timeout_secs = 300
 user_agent = "rtorrent/0.16.11/0.16.11"
 # peer_id is intentionally omitted: the sidecar generates and persists a
 # unique per-install suffix on first start (see docs/TRACKER-IDENTITY.md).

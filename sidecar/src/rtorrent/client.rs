@@ -24,6 +24,7 @@ pub enum Transport {
 pub struct Client {
     transport: Transport,
     timeout: std::time::Duration,
+    identity_timeout: std::time::Duration,
     rpc_gate: Arc<Semaphore>,
     low_priority_pause_until: Arc<Mutex<Option<Instant>>>,
     tracker_peer_id: Option<String>,
@@ -39,6 +40,7 @@ impl Client {
         Ok(Self {
             transport,
             timeout: std::time::Duration::from_secs(cfg.timeout_secs),
+            identity_timeout: std::time::Duration::from_secs(cfg.identity_timeout_secs),
             rpc_gate: Arc::new(Semaphore::new(1)),
             low_priority_pause_until: Arc::new(Mutex::new(None)),
             tracker_peer_id: Some(cfg.peer_id.clone()),
@@ -50,6 +52,7 @@ impl Client {
         Self {
             transport: Transport::Unix(socket_path.to_owned()),
             timeout: std::time::Duration::from_secs(timeout_secs),
+            identity_timeout: std::time::Duration::from_secs(timeout_secs),
             rpc_gate: Arc::new(Semaphore::new(1)),
             low_priority_pause_until: Arc::new(Mutex::new(None)),
             tracker_peer_id: None,
@@ -79,6 +82,23 @@ impl Client {
             .await
             .context("rTorrent RPC gate closed")?;
         self.call_xml(method, args).await
+    }
+
+    /// Execute a startup/control XML-RPC call with an operation-specific
+    /// timeout. Large session rewrites must not force ordinary list, stats, or
+    /// user-control calls to wait for the same multi-minute budget.
+    pub(crate) async fn call_identity_xmlrpc(
+        &self,
+        method: &str,
+        args: &[XmlValue],
+    ) -> Result<XmlValue> {
+        let _permit = self
+            .rpc_gate
+            .acquire()
+            .await
+            .context("rTorrent RPC gate closed")?;
+        self.call_xml_with_timeout(method, args, self.identity_timeout)
+            .await
     }
 
     pub async fn call_sync(&self, method: &str, args: &[XmlValue]) -> Result<XmlValue> {
@@ -191,9 +211,18 @@ impl Client {
     }
 
     async fn call_xml(&self, method: &str, args: &[XmlValue]) -> Result<XmlValue> {
+        self.call_xml_with_timeout(method, args, self.timeout).await
+    }
+
+    async fn call_xml_with_timeout(
+        &self,
+        method: &str,
+        args: &[XmlValue],
+        timeout: std::time::Duration,
+    ) -> Result<XmlValue> {
         let body = build_xmlrpc_request(method, args);
         let response = self
-            .scgi_roundtrip("text/xml", body.as_bytes())
+            .scgi_roundtrip_with_timeout("text/xml", body.as_bytes(), timeout)
             .await
             .with_context(|| format!("XMLRPC call {method}"))?;
         parse_xmlrpc_response(&response)
@@ -201,6 +230,16 @@ impl Client {
 
     /// Send raw SCGI request and return the HTTP body.
     async fn scgi_roundtrip(&self, content_type: &str, body: &[u8]) -> Result<Vec<u8>> {
+        self.scgi_roundtrip_with_timeout(content_type, body, self.timeout)
+            .await
+    }
+
+    async fn scgi_roundtrip_with_timeout(
+        &self,
+        content_type: &str,
+        body: &[u8],
+        timeout: std::time::Duration,
+    ) -> Result<Vec<u8>> {
         let content_length = body.len();
         let headers = format!(
             "CONTENT_LENGTH\0{content_length}\0SCGI\01\0REQUEST_METHOD\0POST\0\
@@ -212,7 +251,7 @@ impl Client {
         packet.put(netstring.as_bytes());
         packet.put(body);
 
-        let response = tokio::time::timeout(self.timeout, async {
+        let response = tokio::time::timeout(timeout, async {
             match &self.transport {
                 Transport::Unix(path) => {
                     #[cfg(not(unix))]

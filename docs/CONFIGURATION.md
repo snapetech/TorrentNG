@@ -263,6 +263,7 @@ type = "qbittorrent"
 | `scgi_socket` | `/run/rtorrent/rpc.sock` | `TNG_SCGI_SOCKET` | Path to rTorrent SCGI Unix socket |
 | `scgi_addr` | - | `TNG_SCGI_ADDR` | `host:port` for TCP SCGI; mutually exclusive with `scgi_socket` |
 | `timeout_secs` | `10` | - | Timeout for individual XMLRPC calls |
+| `identity_timeout_secs` | `300` | - | Timeout for the startup tracker-identity rewrite; kept separate from ordinary XMLRPC calls because it can touch a large session |
 
 The sidecar's mounted HTTP/XMLRPC routes enforce the configured API token.
 The crate-level `execute_xml` helper without a token is a local embedding/test

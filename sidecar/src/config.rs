@@ -87,6 +87,11 @@ pub struct RtorrentConfig {
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
 
+    /// Timeout for the startup identity rewrite, which can touch thousands of
+    /// session downloads on a large rTorrent installation.
+    #[serde(default = "default_identity_timeout_secs")]
+    pub identity_timeout_secs: u64,
+
     /// User-agent string pushed to rTorrent's network.http.user_agent on startup.
     /// Override with TNG_USER_AGENT env var.
     /// See docs/TRACKER-IDENTITY.md before changing the default pair.
@@ -230,6 +235,7 @@ impl Default for RtorrentConfig {
             scgi_socket: Some("/run/rtorrent/rpc.sock".to_owned()),
             scgi_addr: None,
             timeout_secs: default_timeout_secs(),
+            identity_timeout_secs: default_identity_timeout_secs(),
             user_agent: default_user_agent(),
             peer_id: default_peer_id(),
             logs: RtorrentLogConfig::default(),
@@ -298,6 +304,7 @@ impl Config {
                 scgi_socket: Some("/nonexistent".into()),
                 scgi_addr: None,
                 timeout_secs: 1,
+                identity_timeout_secs: 1,
                 user_agent: DEFAULT_USER_AGENT.to_owned(),
                 peer_id: DEFAULT_PEER_ID.to_owned(),
                 logs: RtorrentLogConfig::default(),
@@ -327,6 +334,9 @@ fn default_sync_interval_secs() -> u64 {
 }
 fn default_timeout_secs() -> u64 {
     10
+}
+fn default_identity_timeout_secs() -> u64 {
+    300
 }
 fn default_user_agent() -> String {
     DEFAULT_USER_AGENT.to_owned()

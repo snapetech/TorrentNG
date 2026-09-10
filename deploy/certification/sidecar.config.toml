@@ -9,6 +9,7 @@ type = "rtorrent"
 [rtorrent]
 scgi_socket = "/run/rtorrent/rpc.sock"
 timeout_secs = 10
+identity_timeout_secs = 300
 user_agent = "rtorrent/0.16.11/0.16.11"
 
 [auth]

@@ -135,17 +135,28 @@ else
 fi
 
 SOAK_PID_FILE="${TNG_24H_SOAK_PID_FILE:-$ROOT/.run/soak-24h.pid}"
+completed_soak="$(find "$REPORT_DIR" -maxdepth 1 -type f -name 'soak-final-*.md' -printf '%T@ %p\n' 2>/dev/null \
+  | sort -nr | awk 'NR == 1 {print $2}')"
+if [[ -n "$completed_soak" && -f "$completed_soak" ]] &&
+  grep -q '^Overall status: PASS$' "$completed_soak"; then
+  mark "24h soak" "PASS" "completed report $(basename "$completed_soak")"
+  exit_status=0
+else
+  exit_status=1
+fi
 soak_process="$(pgrep -af '[s]oak_certification.sh' | grep 'soak-24h-' | head -1 || true)"
-if [[ -z "$soak_process" && -f "$SOAK_PID_FILE" ]]; then
+if [[ "$exit_status" -ne 0 && -z "$soak_process" && -f "$SOAK_PID_FILE" ]]; then
   soak_pid="$(cat "$SOAK_PID_FILE" 2>/dev/null || true)"
   if [[ "$soak_pid" =~ ^[0-9]+$ ]]; then
     soak_process="$(ps -p "$soak_pid" -o args= 2>/dev/null | grep 'soak_certification.sh' | grep 'soak-24h-' || true)"
   fi
 fi
-if [[ -n "$soak_process" ]]; then
-  mark "24h soak active" "PASS" "$soak_process"
-else
-  mark "24h soak active" "WARN" "no active soak-24h run detected; use scripts/start_24h_soak.sh"
+if [[ "$exit_status" -ne 0 ]]; then
+  if [[ -n "$soak_process" ]]; then
+    mark "24h soak" "PASS" "active: $soak_process"
+  else
+    mark "24h soak" "WARN" "no active or completed soak-24h evidence detected; use scripts/start_24h_soak.sh"
+  fi
 fi
 
 {
