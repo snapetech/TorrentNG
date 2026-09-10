@@ -21,6 +21,23 @@ directories, with exact status tracked in
 broader native rewrite overview and engine swap workflow, see
 [ENGINE_REWRITE.md](ENGINE_REWRITE.md).
 
+## Fidelity Vocabulary At A Glance
+
+Migration reports use two different vocabularies depending on direction. They
+measure different things at different times, and conflating them is the most
+common way to misread a dry-run report:
+
+| Direction | Vocabulary | What it measures |
+|---|---|---|
+| **Importing in** (`torrentngd migrate`) | `trusted` / `hints` / `metadata-only` / `none` | How much piece state could be *decoded from the source client* at scan time |
+| **Exporting out** (`torrentngd export`) | `recheck-free` / `complete-only` / `metadata-only` / `torrent-only` | How much of *TorrentNG's own native state* survives being written into the target client's format |
+
+A torrent that imports as `hints` — the normal label for anything mid-download,
+see [below](#reading-the-confidence-summary) — is not a lower grade of
+imported data. Once it's in TorrentNG's native state, it can still export
+later as `recheck-free`: `hints` only describes what the *scanner* could
+confirm about the *source* at import time, not what survived the import.
+
 ## The `torrentngd migrate` command
 
 For native-engine deployments, `torrentngd migrate` is the one-shot import

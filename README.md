@@ -4,25 +4,40 @@
 
 Support TorrentNG through [Ko-fi](https://ko-fi.com/snapetech).
 
-TorrentNG is a universal-compatibility torrent stack for headless servers. The
-goal is to be the torrent client you can move into or out of without losing
-workflow, state, automation, or client choice: import existing libraries, expose
-familiar APIs, interoperate with other clients, and run a native Rust engine when
-you are ready to replace the old core.
+TorrentNG is built around two things at once:
 
-The stack includes a native Rust BitTorrent daemon, a React WebUI,
-automation-friendly APIs, migration/import tooling, compatibility facades for
-major client ecosystems, and a harness for existing rTorrent deployments.
+- **A universal control plane.** One WebUI and one automation surface — native
+  REST plus qBittorrent-, Transmission-, and Deluge-compatible APIs — so
+  Sonarr, Radarr, Prowlarr, autobrr, cross-seed, and mobile clients keep
+  working no matter which BitTorrent engine is running underneath.
+- **A complete native backend.** `torrentngd` is not a facade in front of
+  someone else's daemon. It owns peer-wire traffic, piece storage and
+  rechecks, tracker/DHT state, and session persistence itself, in Rust, with
+  no dependency on rTorrent, libtorrent, or XMLRPC. It is built to fully
+  replace rTorrent, qBittorrent, Transmission, or Deluge as the daemon doing
+  the actual downloading and seeding, not just to imitate their APIs. It is
+  the project's primary, actively developed engine.
 
-The project currently supports two engine modes:
+Those two pieces combine into the actual pitch: import a whole library from
+any of those clients, run it on TorrentNG's own native engine, and export it
+back out again to any of them if you ever want to leave — without losing
+workflow, state, or automation along the way. See
+[Migrate In And Out](#migrate-in-and-out) below.
+
+For operators not moving engines yet, the rTorrent-backed sidecar (Track 1)
+puts the same WebUI and compatibility APIs in front of upstream rTorrent over
+a trusted local socket. It's a fully supported deployment target — for
+migration, side-by-side comparison, or simply keeping rTorrent as the core —
+but it's the bridge, not the destination; new engine capability lands in
+`torrentngd`, not here.
 
 | Mode | Process | Source of truth | Use when |
 |---|---|---|---|
-| Native engine | `torrentngd` | TorrentNG Rust engine and SQLite state | You want the primary rewrite path, native storage/recheck/jobs, and one model for WebUI plus APIs |
-| rTorrent sidecar | `rTorrent` + `torrentng` | rTorrent session state | You need an rTorrent migration bridge, compatibility comparison, or an rTorrent-backed deployment |
+| Native engine (primary) | `torrentngd` | TorrentNG Rust engine and SQLite state | You want the actively developed engine: native storage/recheck/jobs and one model behind WebUI plus every API |
+| rTorrent sidecar (bridge) | `rTorrent` + `torrentng` | rTorrent session state | You're migrating off rTorrent gradually, comparing engines, or specifically want upstream rTorrent as the core |
 
-Both modes aim to expose the same user-facing WebUI and compatibility surfaces.
-The compatibility target is intentionally broad: qBittorrent-style endpoints for
+Both modes expose the same user-facing WebUI and compatibility surfaces. The
+compatibility target is intentionally broad: qBittorrent-style endpoints for
 common automation tools, Transmission and Deluge RPC facades, rTorrent migration
 and interop support, and import paths for the client state formats operators are
 likely to have accumulated over time.
@@ -261,13 +276,11 @@ one stack before starting the other unless you intentionally change ports.
 | Path | Purpose |
 |---|---|
 | `crates/` | Native engine, API, migration, metrics, and testkit crates |
-| `crates/torrentngd/` | Native daemon binary |
-| `sidecar/` | rTorrent-backed API/WebUI sidecar |
-| `webui/` | React/Vite frontend |
-| `deploy/native/` | Native engine Compose, Docker, systemd, Kubernetes, metrics assets |
-| `deploy/docker/` | rTorrent sidecar and Phase 1 rTorrent/ruTorrent deployment assets |
-| `deploy/certification/` | Integration certification stack |
-| `engine-profile/` | rTorrent profile and operational defaults |
+| `crates/torrentngd/` | Native daemon binary ([README](crates/torrentngd/README.md)) |
+| [`sidecar/`](sidecar/README.md) | rTorrent-backed API/WebUI sidecar (Track 1) |
+| [`webui/`](webui/README.md) | React/Vite frontend, shared by both engine tracks |
+| [`deploy/`](deploy/README.md) | Compose, Docker, systemd, Kubernetes, nginx, Prometheus, and Grafana assets for both tracks |
+| [`engine-profile/`](engine-profile/README.md) | Pinned rTorrent profile and build defaults (Track 1 only) |
 | `docs/` | Architecture, API, deployment, migration, security, and roadmap docs |
 | `scripts/` | Certification, interop, health, release, and operations scripts |
 
@@ -334,7 +347,8 @@ for the full coverage table and release-gate commands.
 Start with the docs index:
 
 - [Docs index](docs/README.md)
-- [Engine rewrite guide](docs/ENGINE_REWRITE.md)
+- [Engine rewrite guide](docs/ENGINE_REWRITE.md) — start here for native vs.
+  rTorrent-sidecar mode, side by side, and how to move between them
 - [Native deployment](docs/NATIVE_DEPLOYMENT.md)
 - [Track 1 rTorrent deployment](docs/DEPLOYMENT.md)
 - [Configuration](docs/CONFIGURATION.md)
