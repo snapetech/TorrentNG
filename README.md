@@ -4,393 +4,394 @@
 
 Support TorrentNG through [Ko-fi](https://ko-fi.com/snapetech).
 
-TorrentNG is built around two things at once:
+TorrentNG is a BitTorrent service built around a native Rust daemon,
+`torrentngd`, and a shared control plane. It provides a WebUI, native REST and
+SSE APIs, compatibility adapters, migration commands, metrics, and deployment
+assets. It has two runtime modes: the native TorrentNG engine and an rTorrent
+sidecar for existing rTorrent deployments.
 
-- **A universal control plane.** One WebUI and one automation surface — native
-  REST plus qBittorrent-, Transmission-, and Deluge-compatible APIs — so
-  Sonarr, Radarr, Prowlarr, autobrr, cross-seed, and mobile clients keep
-  working no matter which BitTorrent engine is running underneath.
-- **A complete native backend.** `torrentngd` is not a facade in front of
-  someone else's daemon. It owns peer-wire traffic, piece storage and
-  rechecks, tracker/DHT state, and session persistence itself, in Rust, with
-  no dependency on rTorrent, libtorrent, or XMLRPC. It is built to fully
-  replace rTorrent, qBittorrent, Transmission, or Deluge as the daemon doing
-  the actual downloading and seeding, not just to imitate their APIs. It is
-  the project's primary, actively developed engine.
-
-Those two pieces combine into the actual pitch: import a whole library from
-any of those clients, run it on TorrentNG's own native engine, and export it
-back out again to any of them if you ever want to leave — without losing
-workflow, state, or automation along the way. See
-[Migrate In And Out](#migrate-in-and-out) below.
-
-For operators not moving engines yet, the rTorrent-backed sidecar (Track 1)
-puts the same WebUI and compatibility APIs in front of upstream rTorrent over
-a trusted local socket. It's a fully supported deployment target — for
-migration, side-by-side comparison, or simply keeping rTorrent as the core —
-but it's the bridge, not the destination; new engine capability lands in
-`torrentngd`, not here.
-
-| Mode | Process | Source of truth | Use when |
-|---|---|---|---|
-| Native engine (primary) | `torrentngd` | TorrentNG Rust engine and SQLite state | You want the actively developed engine: native storage/recheck/jobs and one model behind WebUI plus every API |
-| rTorrent sidecar (bridge) | `rTorrent` + `torrentng` | rTorrent session state | You're migrating off rTorrent gradually, comparing engines, or specifically want upstream rTorrent as the core |
-
-Both modes expose the same user-facing WebUI and compatibility surfaces. The
-compatibility target is intentionally broad: qBittorrent-style endpoints for
-common automation tools, Transmission and Deluge RPC facades, rTorrent migration
-and interop support, and import paths for the client state formats operators are
-likely to have accumulated over time.
+The two modes share the product-level control-plane goals, but they do not have
+the same engine or state model. Choosing a mode determines where torrent work
+runs, which process owns durable state, and which compatibility operations can
+be engine-backed.
 
 ![TorrentNG WebUI using the Sietch Neon theme while downloading Linux ISO test data](docs/assets/torrentng-sietch-neon-linux-isos.png)
 
-## Status
+## Runtime modes
 
-The native Rust engine is the primary development and deployment path. The
-rTorrent-backed sidecar remains supported for migration, comparison, and users
-who still want the upstream rTorrent core.
+| Mode | Engine process | Authoritative state | Main surfaces | Use it for |
+|---|---|---|---|---|
+| Native | `torrentngd` | TorrentNG SQLite state, metainfo, and fast-resume data | WebUI, native REST/SSE, qBittorrent, Transmission, and Deluge adapters | New deployments, native peer/storage work, durable jobs, and the primary development path |
+| rTorrent sidecar | `rTorrent` plus `torrentng` | rTorrent session state; sidecar cache holds projections | Sidecar WebUI/API, client adapters, and rTorrent XML-RPC/SCGI integration | Existing rTorrent sessions, staged migration, compatibility comparison, or keeping rTorrent as the engine |
 
-TorrentNG is pre-1.0 software. APIs, configuration, and deployment details can
-still change. Universal compatibility is the product goal and release bar, not a
-blanket claim that every surface is complete today. Current support, partial
-coverage, no-op compatibility shapes, and gaps are tracked in
-[docs/CLIENT_COMPATIBILITY_MATRICES.md](docs/CLIENT_COMPATIBILITY_MATRICES.md).
-Track current native-engine work in
-[docs/ENGINE_REWRITE_BURNDOWN.md](docs/ENGINE_REWRITE_BURNDOWN.md), and use
-[docs/ENGINE_REWRITE.md](docs/ENGINE_REWRITE.md) for the practical native vs.
-rTorrent guide.
+In native mode, `torrentngd` performs peer, tracker, DHT, storage, job, and
+session work. In sidecar mode, `torrentng` translates the control plane to
+rTorrent through a trusted local SCGI/XML-RPC connection and caches the
+results. The sidecar is a separate Cargo workspace and deployment path, not a
+different configuration profile of the native daemon.
 
-Current implementation status on `main`:
+Read [the engine rewrite guide](docs/ENGINE_REWRITE.md) for the architectural
+comparison and migration considerations.
 
-| Area | Local status | Notes |
-|---|---|---|
-| Native engine rewrite | Local functional gates passing; external evidence pending | `torrentngd` owns torrent identity, SQLite session state, jobs, storage roots, trackers, DHT, peer-wire, uTP policy, metrics, and API projections |
-| WebUI | Passing build, lint, and browser certification | Virtualized torrent workspace, mobile-safe layout, storage planner, tracker health, logs, RSS/workflows, ratio groups, saved views, appearance, and engine panels |
-| API compatibility | Passing deterministic facade tests | Native REST plus qBittorrent, Transmission, Deluge, and rTorrent-compatible surfaces for common automation and client workflows |
-| Import/export | Passing generated corpus and apply/round-trip tests | Dry-run and apply flows cover qBittorrent, Deluge, Transmission, rTorrent, uTorrent/BitTorrent Classic, BiglyBT/Vuze, Tixati import, and generic export |
-| Storage and memory | Local implementation and release smoke passing; hardware evidence pending | Bounded positioned I/O, fd pooling, preallocation, durability, hash isolation, readahead/elevator scheduling, move/import/delete plans, and resource accounting are implemented |
-| Interop and soak evidence | In progress for release | Local deterministic gates pass; live Docker/public/device legs and 24h soak are explicit release evidence runs, not hidden implementation claims |
+## Native engine
 
-The fastest current status command is:
+`torrentngd` is the primary native daemon. It wires the engine crates, owns
+startup and shutdown, exposes the native API, and reports its capability
+manifest through `/health`.
 
-```sh
-scripts/certification_status.sh
-```
+The native engine currently covers:
 
-For the whole-project gap audit, including what is code-complete versus what
-still needs external evidence, see
-[docs/PROJECT_GAP_AUDIT.md](docs/PROJECT_GAP_AUDIT.md).
+- BitTorrent v1, v2, and hybrid metainfo parsing, identity, and metadata
+  projection, including `btih` and `btmh` magnets.
+- Peer-wire transfer, piece picking, HTTP and UDP trackers, DHT, webseeds, and
+  policy-gated uTP transport.
+- Durable SQLite session state for torrents, files, trackers, tags,
+  categories, limits, events, and jobs.
+- Supervised database persistence, bounded storage workers, positioned I/O,
+  hashing, recheck, preallocation, move/import/delete plans, and crash
+  recovery.
+- Runtime tiering and memory accounting for engine, storage, peer, metadata,
+  tracker, DHT, and API-snapshot allocations.
+- Native Prometheus metrics and health/capability reporting.
 
-## Native Engine Scope
+Long-running work is represented as a durable job. The engine actor coordinates
+the operation and publishes state; database and storage workers perform the
+blocking persistence or filesystem work. This distinction is visible through
+`/api/v1/jobs` and the storage metrics.
 
-The native rewrite is not just an API wrapper. `torrentngd` is the intended
-primary core and includes:
+Pure-v2 transfer and tracker lifecycle are not implemented. Pure-v2 parsing,
+identity, storage-root verification, and compatibility projections exist, but
+pure-v2 metadata completion and peer transfer remain explicit unsupported
+capabilities. v1 and hybrid torrents are the supported transfer paths. See
+[ENGINE.md](docs/ENGINE.md) for the protocol boundary.
 
-- BitTorrent v1, v2, and hybrid torrent identity, including `btih` and `btmh`
-  magnets.
-- Native session persistence in SQLite for torrents, files, trackers, tags,
-  categories, limits, events, and durable jobs.
-- Peer-wire transfer, piece picking, tracker management, DHT, webseed support,
-  and policy-gated uTP transport for outbound peer-wire, incoming peer-wire,
-  and metadata fetch.
-- Durable recheck jobs with pause, resume, cancel, crash recovery, and visible
-  job state.
-- Native Prometheus metrics and `/health` capability reporting, including
-  active uTP transport paths.
+## Control plane and API surface
 
-The rTorrent sidecar remains available for migration and comparison, but the
-native engine is the path used by current storage, memory, WebUI, and release
-certification work.
+The native and sidecar deployments expose different backend implementations
+behind a familiar control-plane shape. Compatibility is defined by route,
+field, error, and state behavior where a workflow is implemented; it does not
+make every upstream plugin or option meaningful on every backend.
 
-## Compatibility Surface
+| Surface | Purpose |
+|---|---|
+| `GET /health` | Liveness, readiness, capability, and subsystem health |
+| `/api/v1` | Native REST API for torrents, session settings, storage, jobs, logs, events, and transfer state |
+| `GET /api/v1/events` | Server-sent events with bounded initial data and revision-based reconnects |
+| `/api/qb/v2` and `/api/v2` | qBittorrent-compatible automation and client routes |
+| `/transmission/rpc` and `/api/transmission/rpc` | Transmission RPC compatibility |
+| `/json` and `/deluge/json` | Deluge Web/thin-client compatibility |
+| rTorrent XML-RPC library boundary | Library-level rTorrent compatibility and migration-oriented calls; this boundary is documented separately |
+| `GET /metrics` | Prometheus metrics |
 
-TorrentNG aims to meet operators where their existing tools already are:
+For native torrent lists, use the snapshot returned by
+`GET /api/v1/torrents` while paging:
 
-- Native REST under `/api/v1`.
-- qBittorrent-compatible API v2 routes under `/api/qb/v2`, including common
-  automation flows used by Sonarr, Radarr, Prowlarr, cross-seed, autobrr, and
-  mobile read clients.
-- Transmission RPC compatibility for torrent/session methods, queue/file/tracker
-  actions, session settings, JSON-RPC-style errors, and field projection.
-- Deluge Web/thin-client style methods, including torrent status, add/remove,
-  file priorities, labels, and structured plugin compatibility surfaces.
-- rTorrent XMLRPC compatibility for common torrent, file, tracker, peer,
-  throttle, view, load, and migration-oriented flows.
+- `limit` defaults to 200 and is capped at 5,000.
+- The response contains `snapshot`, `total`, and `torrents`.
+- Send the same `snapshot` with later pages so the result set does not shift
+  underneath the client.
+- An expired snapshot returns `410`; start a new snapshot and reconcile.
 
-Compatibility does not mean every unsupported upstream plugin behavior is
-silently faked. Where TorrentNG does not own a native workflow yet, the facade
-returns compatible shapes or explicit unsupported behavior and the status is
-tracked in
-[docs/CLIENT_COMPATIBILITY_MATRICES.md](docs/CLIENT_COMPATIBILITY_MATRICES.md).
+The SSE endpoint sends bounded initial chunks and a bounded mutation journal.
+Clients should retain the last known revision and resync from a fresh snapshot
+when the journal no longer covers the gap. Compatibility endpoints that have
+legacy full-list contracts use explicit limits: qBittorrent `sync/maindata`
+rejects oversized requests rather than silently truncating, while Deluge,
+Transmission, and rTorrent multicalls have documented 10,000-item safety
+limits where no cursor exists.
 
-## Storage And Memory
+The complete route and field matrices are in
+[API.md](docs/API.md) and
+[CLIENT_COMPATIBILITY_MATRICES.md](docs/CLIENT_COMPATIBILITY_MATRICES.md).
 
-The native storage path has been hardened for large seedbox-style deployments:
+## Storage, jobs, and state
 
-- Dedicated bounded disk workers and positioned I/O rather than per-block
-  `open -> seek -> read/write -> close` on Tokio's shared blocking pool.
-- Path-keyed fd cache with capacity, idle close, hit/miss/eviction metrics, and
-  Unix fd-limit clamping.
-- Per-file preparation and preallocation policies outside the per-block hot
-  path.
-- Checkpoint/strict durability modes, dirty-path tracking, and fastresume clean
-  shutdown semantics tied to data-file sync requirements.
-- Separate hash workers and RAM-first completed-piece verification to keep
-  async workers responsive.
-- Peer-read readahead, HDD elevator scheduling, sparse recheck, `io_uring`
-  capability probes, and real-device certification scripts.
-- Memory accounting for storage frames, peer buffers, piece assembly, metadata,
-  webseed bodies, tracker peers, DHT tables, API snapshots, queued disk work,
-  hash work, and cached peer-read data.
-- Root-confined move/import/delete planning and execution, including dry-run
-  previews, checkpointed jobs, rollback cleanup, symlink rejection, and WebUI
-  integration.
+TorrentNG separates durable control-plane state from payload files.
 
-See [docs/STORAGE_IO.md](docs/STORAGE_IO.md),
-[docs/STORAGE_NG.md](docs/STORAGE_NG.md), and
-[docs/STORAGE_MEMORY_GAP_REGISTER.md](docs/STORAGE_MEMORY_GAP_REGISTER.md) for
-architecture, test matrices, and evidence boundaries.
+In native mode:
 
-## Tested Evidence
+- SQLite stores torrent identity, settings, lifecycle state, event history,
+  and durable job state.
+- Metainfo blobs and fast-resume data live under the configured session
+  directory.
+- Payload files live under configured storage roots.
+- The supervised `DbWorker` serializes authoritative database operations while
+  the storage supervisor runs bounded filesystem jobs.
+- Move, import, and delete operations are planned before execution, confined
+  to configured roots, checkpointed, resumable, and exposed as jobs.
+- File removal with `delete_files=true` is asynchronous and returns a
+  `job_id`.
 
-TorrentNG has scriptable evidence rather than informal claims. The main local
-checks include:
+This means a client should not treat a successful HTTP request as proof that a
+large filesystem operation has finished. Follow the returned job through
+`GET /api/v1/jobs`, and use `/api/v1/storage/plan` when a preview is needed.
 
-- Rust unit/integration tests across native engine, storage, uTP, API facades,
-  migration, metrics, and sidecar compatibility crates.
-- WebUI production build, lint, Playwright browser checks, accessibility checks,
-  visual-regression baselines, and 15k-row virtualized-table coverage.
-- API facade certification for qBittorrent, Transmission, Deluge, and rTorrent
-  endpoint/field matrices.
-- Migration corpus certification with checked-in generated artifacts for every
-  supported source family.
-- Storage hardware, `io_uring`, move/import, and indexed release evidence
-  scripts.
-- Docker interop matrix across TorrentNG, qBittorrent, Transmission, Deluge,
-  rTorrent, opentracker, and fixture HTTP/webseed services.
-- Short soak, transfer-churn soak, security review/scan, local release, and
-  post-soak release gates.
+The storage path includes positioned I/O, file-descriptor pooling,
+preallocation, durability modes, hash-worker isolation, readahead, device
+queues, and memory accounting. These are implementation controls; their
+performance still depends on the filesystem, device, container limits, and
+configuration. See [STORAGE_IO.md](docs/STORAGE_IO.md),
+[STORAGE_NG.md](docs/STORAGE_NG.md), and
+[STORAGE_MEMORY_GAP_REGISTER.md](docs/STORAGE_MEMORY_GAP_REGISTER.md).
 
-Release-clean status requires the external evidence rows to be current: live
-Docker/public/device compatibility, any target-hardware storage claims, and the
-24h soak. These are intentionally visible in certification output as
-`SKIP`, `PASS_WITH_SKIPS`, `PASS_WITH_WARNINGS`, `RUNNING/UNKNOWN`, or
-`STALE/INCOMPLETE` until they are actually run for the release environment.
+## Quick start: native mode
 
-## Quick Start
-
-Start the native engine stack:
+The checked-in Compose file builds the native daemon and publishes its API on
+host port `28082`. It expects an external Docker volume named
+`certification_downloads`; create that volume or edit the Compose file for a
+different payload location.
 
 ```sh
+docker volume create certification_downloads
+export TORRENTNG_API_TOKEN="$(openssl rand -hex 32)"
 docker compose -f deploy/native/compose.yml up --build
 ```
 
-Open the WebUI at:
+Open the WebUI at `http://localhost:28082`. Check the daemon and make an
+authenticated API request with:
 
-```text
-http://localhost:8080
+```sh
+curl -fsS http://localhost:28082/health
+curl -fsS \
+  -H "Authorization: Bearer ${TORRENTNG_API_TOKEN}" \
+  http://localhost:28082/api/v1/torrents
 ```
 
-Useful native endpoints:
-
-```text
-http://localhost:8080/health
-http://localhost:8080/api/v1/torrents
-http://localhost:8080/api/qb/v2/torrents/info
-http://localhost:8080/metrics
-```
-
-Add observability with Prometheus and Grafana:
+Prometheus and Grafana can be started with the observability profile:
 
 ```sh
 docker compose -f deploy/native/compose.yml --profile observability up --build
 ```
 
-## Migrate In And Out
+The native Compose config is a development and certification starting point.
+For a public deployment, configure durable volumes, a real secret, a trusted
+proxy or TLS, firewall rules for the peer port, and backups before importing or
+moving a library. See [NATIVE_DEPLOYMENT.md](docs/NATIVE_DEPLOYMENT.md) and
+[CONFIGURATION.md](docs/CONFIGURATION.md).
 
-No lock-in: `torrentngd` has first-class subcommands to move a whole library
-**into** the native engine and back **out** to another client. Both default to
-a read-only dry-run with a fidelity summary; `--apply` performs the change.
+### Run the daemon directly
+
+Build the native binary and point it at a configuration file:
 
 ```sh
-# Import an existing client's state (read-only source; --apply to write)
-torrentngd migrate --source qbittorrent --from ~/.local/share/qBittorrent/BT_backup --apply
-torrentngd migrate --source rtorrent --from ~/.rtorrent-session --remap /old=/data --apply
-
-# Leave for another client, keeping seeding state where the format allows it
-torrentngd export --format libtorrent   --to /tmp/leaving --apply   # qBittorrent/Deluge
-torrentngd export --format transmission --to /tmp/leaving --apply
-torrentngd export --format generic      --to /tmp/leaving --apply   # universal valve
+cargo build --release -p torrentngd
+TORRENTNGD_CONFIG=/etc/torrentngd/config.toml target/release/torrentngd
 ```
 
-Supported both directions: qBittorrent, Deluge, Transmission, rTorrent,
-uTorrent/BitTorrent Classic, BiglyBT/Vuze, and a generic `.torrent` + manifest
-path. Tixati imports metadata (its progress format is proprietary; `generic`
-is its exit). libtorrent/Transmission/uTorrent/BiglyBT carry the full piece
-map so completed *and* in-progress torrents resume without a full recheck;
-rTorrent is recheck-free for complete torrents. Dry-run and post-apply
-summaries bucket every torrent as recheck-free / complete-only /
-metadata-only / torrent-only. See
-[docs/MIGRATION.md](docs/MIGRATION.md) for the full guide, fidelity rules, and
-rollback.
+Configuration is resolved from `TORRENTNGD_CONFIG`, the user config path, or
+the system config path. A non-loopback API bind requires a real API token of at
+least 16 characters. The deployment examples show secret-file configuration,
+storage roots, peer ports, tiering, trackers, DHT, and systemd/Kubernetes
+layouts.
 
-## rTorrent Mode
+## Migration
 
-Start the rTorrent-backed stack when you need the historical engine path:
+`torrentngd migrate` imports existing client state into the native engine.
+`torrentngd export` writes a client-specific layout from native state. Both
+commands default to a read-only plan and report; `--apply` writes the result,
+and the source is not modified by an import.
+
+Start with a report:
 
 ```sh
+torrentngd migrate \
+  --source qbittorrent \
+  --from ~/.local/share/qBittorrent/BT_backup \
+  --report migration.md
+```
+
+Apply only after reviewing the report:
+
+```sh
+torrentngd migrate \
+  --source qbittorrent \
+  --from ~/.local/share/qBittorrent/BT_backup \
+  --apply --yes
+```
+
+Supported import sources are qBittorrent, Deluge, Transmission, rTorrent,
+uTorrent/BitTorrent Classic, BiglyBT/Vuze, Tixati metadata, and a generic
+`.torrent` directory. Path prefixes can be rewritten with repeated
+`--remap OLD=NEW` options.
+
+Export formats are `generic`, `libtorrent` (qBittorrent/Deluge),
+`transmission`, `rtorrent`, `utorrent`, and `biglybt`:
+
+```sh
+torrentngd export --format libtorrent --to /tmp/qbittorrent-export
+torrentngd export --format transmission --to /tmp/transmission-export --apply --yes
+torrentngd export --format generic --to /tmp/generic-export --apply --yes
+```
+
+Migration fidelity is reported per torrent:
+
+- `recheck-free` preserves enough resume state for the destination format to
+  resume without a full recheck when the payload and paths match.
+- `complete-only` is recheck-free for complete torrents but not for all partial
+  progress.
+- `metadata-only` carries torrent metadata but requires data verification.
+- `torrent-only` carries `.torrent` files and a manifest; the destination must
+  recheck.
+
+The exact result depends on source state, destination format, path mapping, and
+whether payload files are present. Read [MIGRATION.md](docs/MIGRATION.md)
+before applying a large import or export.
+
+## rTorrent sidecar mode
+
+The sidecar runs the WebUI and adapter layer next to an existing rTorrent
+process. It connects through SCGI/XML-RPC, translates client requests, and
+keeps a cache of rTorrent state. rTorrent remains authoritative for torrent
+lifecycle and payload operations in this mode.
+
+Start the standard sidecar stack with explicit secrets:
+
+```sh
+export TNG_SECRET_KEY="$(openssl rand -hex 32)"
+export TNG_API_TOKENS="$(openssl rand -hex 32)"
 docker compose -f deploy/docker/compose.yml up --build
 ```
 
-This runs rTorrent plus the `torrentng` sidecar. The sidecar talks to rTorrent
-over a trusted local SCGI/XMLRPC socket, maintains a cache, serves the WebUI,
-and exposes native and qBittorrent-compatible APIs.
-
-The lower-level Phase 1 rTorrent/ruTorrent bundle is still available for
-rTorrent profile testing:
+The nginx front door is at `http://localhost`; the sidecar API is also
+published directly on `http://localhost:8080`. The default rTorrent incoming
+port is `50000` TCP/UDP. The lower-level Phase 1 rTorrent/ruTorrent bundle is
+available for profile testing:
 
 ```sh
 docker compose -f deploy/docker/compose.phase1.yml up --build
 ```
 
-Do not share native session state and rTorrent session directories. If you test
-both modes against the same payload data, keep separate state volumes and stop
-one stack before starting the other unless you intentionally change ports.
+Do not share native session state and rTorrent session directories. If both
+modes use the same payload files, stop one stack before starting the other and
+keep their state volumes separate unless you have deliberately planned the
+handoff.
 
-## What Is Included
+## Status and evidence
 
-- Native Rust engine crates for bencode, metainfo, hashing, storage, trackers,
-  DHT, uTP, peer wire, piece picking, session state, jobs, migration, metrics,
-  and API projections.
-- `torrentngd`, the native daemon that owns torrent state and serves APIs.
-- `sidecar/torrentng`, the rTorrent compatibility harness for existing
-  deployments.
-- React, TypeScript, and Vite WebUI in `webui/`.
-- Docker Compose, Dockerfile, systemd, Kubernetes, nginx, Prometheus, and
-  Grafana examples under `deploy/`.
-- Certification, interoperability, security review, and soak scripts under
-  `scripts/`.
+TorrentNG is pre-1.0. APIs, configuration, and deployment details can change.
+The repository separates implementation status from evidence that requires a
+particular machine, client version, network, device, or elapsed run time.
 
-## Repository Map
-
-| Path | Purpose |
+| Area | Current interpretation |
 |---|---|
-| `crates/` | Native engine, API, migration, metrics, and testkit crates |
-| `crates/torrentngd/` | Native daemon binary ([README](crates/torrentngd/README.md)) |
-| [`sidecar/`](sidecar/README.md) | rTorrent-backed API/WebUI sidecar (Track 1) |
-| [`webui/`](webui/README.md) | React/Vite frontend, shared by both engine tracks |
-| [`deploy/`](deploy/README.md) | Compose, Docker, systemd, Kubernetes, nginx, Prometheus, and Grafana assets for both tracks |
-| [`engine-profile/`](engine-profile/README.md) | Pinned rTorrent profile and build defaults (Track 1 only) |
-| `docs/` | Architecture, API, deployment, migration, security, and roadmap docs |
-| `scripts/` | Certification, interop, health, release, and operations scripts |
+| Native engine | Native unit, integration, fault, and release gates cover the implemented engine paths; target-device and long-duration behavior are separate evidence |
+| WebUI | Build, lint, browser, accessibility, visual, and virtualized-table checks exist; browser coverage is not a substitute for every client workflow |
+| API compatibility | Deterministic route/field/error matrices exist for native, qBittorrent, Transmission, Deluge, and rTorrent library boundaries; unsupported native operations should fail explicitly |
+| Import/export | Generated corpus, apply, and round-trip tests cover the declared client formats; migration fidelity remains data- and path-dependent |
+| Storage and memory | Bounded I/O, worker, durability, move/import/delete, and accounting code has local release coverage; hardware and workload results depend on the target environment |
+| Interoperability and soak | Local Docker/public-client scripts and soak gates are explicit runs. A report is evidence only while its environment and timestamp remain relevant |
 
-## Development
+Use `scripts/certification_status.sh` for the current evidence roll-up. The
+broader audit and burndown are in
+[PROJECT_GAP_AUDIT.md](docs/PROJECT_GAP_AUDIT.md) and
+[BACKEND_AUDIT_BURN_DOWN.md](docs/BACKEND_AUDIT_BURN_DOWN.md).
 
-Build the native Rust workspace:
+Known boundaries are documented rather than hidden behind successful-looking
+compatibility responses:
+
+- Pure-v2 peer transfer, tracker lifecycle, and metadata completion are
+  unsupported.
+- Some compatibility settings are projections for client discovery; they are
+  only reported as successful when the native engine applies them.
+- The rTorrent XML-RPC library entry point is a library contract with an
+  explicit credential boundary, not an independently deployable HTTP server.
+- Compatibility matrices describe the tested contract, not blanket parity with
+  every upstream plugin, preference, or extension.
+
+## Testing and development
+
+Build and test the root Rust workspace:
 
 ```sh
-cargo build
+cargo fmt --all -- --check
+cargo test --workspace --all-targets --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
-Run Rust tests:
-
-```sh
-cargo test
-```
-
-Build the rTorrent sidecar:
+The rTorrent sidecar is a separate workspace:
 
 ```sh
 cd sidecar
-cargo build
+cargo test --locked
 ```
 
-Build the WebUI:
+Build and lint the WebUI:
 
 ```sh
 cd webui
-npm install
+npm ci
 npm run build
-```
-
-Run WebUI linting:
-
-```sh
-cd webui
 npm run lint
 ```
 
-Run native certification:
+Run the native certification and client interoperability checks from the
+repository root:
 
 ```sh
 scripts/native_engine_certification_report.sh
-```
-
-Run the cross-client interoperability matrix:
-
-```sh
 scripts/interop_matrix.sh --local
 scripts/interop_matrix.sh --public
 ```
 
-The matrix runs `torrentngd` beside qBittorrent, Transmission, Deluge,
-rTorrent, opentracker, and a fixture HTTP server. Local mode verifies
-deterministic client-to-client transfers, webseeds, explicit private peers,
-restart recovery, churn, protocol rows for UDP trackers and qBit mutation
-compatibility, experimental magnet coverage, and API facade health. Public mode
-resolves official Debian, Ubuntu, and Fedora torrents at runtime and fully
-downloads them by default. See [docs/INTEROP_MATRIX.md](docs/INTEROP_MATRIX.md)
-for the full coverage table and release-gate commands.
+The local matrix uses Docker fixtures for TorrentNG, qBittorrent,
+Transmission, Deluge, rTorrent, opentracker, and HTTP/webseed services. The
+public matrix resolves official Debian, Ubuntu, and Fedora torrents at runtime
+and downloads them by default. See [INTEROP_MATRIX.md](docs/INTEROP_MATRIX.md)
+for prerequisites, coverage, and release-gate commands.
+
+## Repository map
+
+| Path | Purpose |
+|---|---|
+| `crates/` | Native engine, API, migration, metrics, and testkit crates |
+| `crates/torrentngd/` | Native daemon binary ([package README](crates/torrentngd/README.md)) |
+| `crates/rt-*` | Engine subsystems and native API/protocol crates |
+| [`sidecar/`](sidecar/README.md) | Separate rTorrent-backed API and WebUI sidecar workspace |
+| [`webui/`](webui/README.md) | React/Vite frontend shared by the runtime tracks |
+| [`deploy/`](deploy/README.md) | Compose, Docker, systemd, Kubernetes, nginx, Prometheus, and Grafana assets |
+| `certification/` | Checked-in certification fixtures and reports |
+| [`engine-profile/`](engine-profile/README.md) | Pinned rTorrent profile and build defaults |
+| `docs/` | Architecture, API, deployment, migration, security, compatibility, and roadmap documentation |
+| `scripts/` | Certification, interoperability, health, release, and operations scripts |
 
 ## Documentation
 
-Start with the docs index:
+Start with the [documentation index](docs/README.md). The main references are:
 
-- [Docs index](docs/README.md)
-- [Engine rewrite guide](docs/ENGINE_REWRITE.md) — start here for native vs.
-  rTorrent-sidecar mode, side by side, and how to move between them
+- [Engine rewrite guide](docs/ENGINE_REWRITE.md) — native and rTorrent mode
+  architecture and when to use each
 - [Native deployment](docs/NATIVE_DEPLOYMENT.md)
-- [Track 1 rTorrent deployment](docs/DEPLOYMENT.md)
+- [rTorrent deployment](docs/DEPLOYMENT.md)
 - [Configuration](docs/CONFIGURATION.md)
-- [Tracker identity](docs/TRACKER-IDENTITY.md)
 - [API reference](docs/API.md)
-- [Interop matrix](docs/INTEROP_MATRIX.md)
+- [Client compatibility matrices](docs/CLIENT_COMPATIBILITY_MATRICES.md)
 - [Migration](docs/MIGRATION.md)
+- [Interop matrix](docs/INTEROP_MATRIX.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Threat model](docs/THREAT_MODEL.md)
+- [rTorrent library API boundary](docs/RTORRENT_LIBRARY_API.md)
 
 ## Support
 
-Project support, setup help, integration discussion, and development updates are
-available on Discord:
+Project support, setup help, integration discussion, and development updates
+are available on [Discord](https://discord.gg/5PyXBfvS6T).
 
-```text
-https://discord.gg/5PyXBfvS6T
-```
+## Legal use
 
-## Legal Use
-
-TorrentNG is intended for lawful content distribution, personal data
-management, and legitimate automation workflows. The project does not condone
-copyright infringement or unauthorized access to content. Users are responsible
-for understanding and following the laws and licenses that apply to the content
-they download, seed, or manage.
+Users are responsible for the content they download, seed, or manage and for
+complying with the laws and licenses that apply to it.
 
 ## License
 
 TorrentNG is dual-licensed under `AGPL-3.0-or-later OR Commercial`.
 
-Unless you have a separate signed commercial license, your use of this software
-is governed by the GNU Affero General Public License v3.0 or later. Commercial
-licensing is available for users who need terms outside the AGPL.
-
-See [LICENSE](LICENSE) for details.
+Unless you have a separate signed commercial license, use is governed by the
+GNU Affero General Public License v3.0 or later. See [LICENSE](LICENSE) for
+details.
 
 ## Attribution
 
 TorrentNG interoperates with rTorrent, qBittorrent-compatible clients, and
-common automation tools in the BitTorrent ecosystem. Product and project names
-mentioned in this repository are trademarks or property of their respective
-owners. This project is not affiliated with, endorsed by, or sponsored by
-rTorrent, qBittorrent, or third-party automation projects unless explicitly
-stated.
+other BitTorrent ecosystem tools. Product and project names are the property
+of their respective owners. This project is not affiliated with, endorsed by,
+or sponsored by those projects unless explicitly stated.
