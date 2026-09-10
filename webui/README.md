@@ -45,8 +45,9 @@ npm run test:e2e  # Playwright browser tests
 
 The dev server (`vite.config.ts`) proxies `/api` and `/ws` to
 `http://localhost:8080` — start whichever backend you want to develop against
-on that port first (see the root [README](../README.md#quick-start) for
-native, or [rTorrent Mode](../README.md#rtorrent-mode) for the sidecar).
+on that port first (see the root README's
+[native quick start](../README.md#quick-start-native-mode), or
+[rTorrent sidecar mode](../README.md#rtorrent-sidecar-mode) for the sidecar).
 
 `npm run build` outputs to `../sidecar/static` by default (what the Track 1
 Docker image ships). Native builds override this with

@@ -1,8 +1,10 @@
 # TorrentNG CI Failure Burn-down
 
-Status: **green on `main`** as of 2026-09-05. The final GitHub Actions CI
-run was `33916500668` on commit `8c46b61`; all ten jobs passed. The dynamic
-CodeQL orchestration run `33916500079` also passed all four analyses.
+Status: **green on `main`** as of 2026-09-10. The latest completed GitHub
+Actions CI run was `34534365605` on commit `ecd75af`; all ten jobs passed.
+CodeQL run `34534364530` on the same commit also passed. (A newer push may
+already be in flight by the time this is read — check
+`gh run list --branch main --limit 5` for the current head.)
 
 ## Failures fixed
 
