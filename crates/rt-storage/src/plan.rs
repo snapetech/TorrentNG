@@ -663,6 +663,12 @@ where
 
 #[cfg(any(not(unix), test))]
 fn execute_step(step: &StoragePlanStep) -> Result<(), StorageError> {
+    if let Some(source) = &step.source {
+        reject_symlink_ancestors(source, "source-ancestor")?;
+    }
+    if let Some(destination) = &step.destination {
+        reject_symlink_ancestors(destination, "destination-ancestor")?;
+    }
     match step.action {
         PlannedStorageAction::ImportExisting => {
             let source = required_path(step.source.as_ref(), "import-source")?;
@@ -1207,6 +1213,34 @@ fn unsafe_symlink_error(path: &Path, step: &'static str) -> StorageError {
             path.display()
         ),
     }
+}
+
+/// Re-checks that no ancestor directory of `path` is a symlink, immediately
+/// before a mutating filesystem call uses that path.
+///
+/// `validate_plan_paths_under_roots` canonicalizes and root-checks every step
+/// path once, up front, before the plan starts executing. On Unix,
+/// `secure_fs` closes the gap between that check and each step's actual
+/// syscalls by walking every ancestor through `O_NOFOLLOW`-opened, fd-anchored
+/// directory handles, so a symlink swapped in after validation cannot be
+/// followed. This fallback executor has no equivalent descriptor-anchoring
+/// primitive available portably, so it cannot close that window — but it can
+/// shrink it, by re-walking the ancestor chain and rejecting a symlink right
+/// before the syscall that would otherwise follow it, rather than trusting a
+/// validation result from earlier in a potentially long-running plan.
+#[cfg(any(not(unix), test))]
+fn reject_symlink_ancestors(path: &Path, step: &'static str) -> Result<(), StorageError> {
+    for ancestor in path.ancestors().skip(1) {
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+        if let Ok(metadata) = std::fs::symlink_metadata(ancestor) {
+            if metadata.file_type().is_symlink() {
+                return Err(unsafe_symlink_error(ancestor, step));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn common_issues(
@@ -2186,6 +2220,214 @@ mod tests {
             "unexpected secure ancestor error: {error:?}"
         );
         assert!(!outside.path().join("destination.bin").exists());
+    }
+
+    // The portable fallback executor (`execute_step`/`rollback_plan`/
+    // `prune_empty_dirs`, compiled for non-Unix targets and, via
+    // `cfg(any(not(unix), test))`, for every `cargo test` run) has weaker
+    // path authority than `secure_fs`'s descriptor-anchored Unix executor
+    // above -- see the comment on `reject_symlink_ancestors`. Before this
+    // block, none of these functions were called by any test on any
+    // platform: on Unix the runtime dispatch always takes the `secure_fs`
+    // branch, so this logic ran only under a `cfg(not(unix))` build that no
+    // CI job actually tests. These tests call the fallback functions
+    // directly so the logic itself -- not just the Unix branch -- has real
+    // coverage.
+
+    #[test]
+    fn portable_execute_step_renames_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.bin");
+        let destination = dir.path().join("dest.bin");
+        std::fs::write(&source, b"data").unwrap();
+
+        let step = StoragePlanStep {
+            action: PlannedStorageAction::Rename,
+            source: Some(source.clone()),
+            destination: Some(destination.clone()),
+            bytes: 4,
+        };
+        execute_step(&step).unwrap();
+
+        assert!(!source.exists());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"data");
+    }
+
+    #[test]
+    fn portable_execute_step_import_hardlinks_or_copies_without_removing_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.bin");
+        let destination = dir.path().join("dest.bin");
+        std::fs::write(&source, b"data").unwrap();
+
+        let step = StoragePlanStep {
+            action: PlannedStorageAction::ImportExisting,
+            source: Some(source.clone()),
+            destination: Some(destination.clone()),
+            bytes: 4,
+        };
+        execute_step(&step).unwrap();
+
+        assert!(source.exists(), "import must not remove the source");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"data");
+    }
+
+    #[test]
+    fn portable_execute_step_copy_verify_rename_copies_and_verifies_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.bin");
+        let destination = dir.path().join("dest.bin");
+        std::fs::write(&source, b"payload").unwrap();
+
+        let step = StoragePlanStep {
+            action: PlannedStorageAction::CopyVerifyRename,
+            source: Some(source.clone()),
+            destination: Some(destination.clone()),
+            bytes: 7,
+        };
+        execute_step(&step).unwrap();
+
+        assert!(source.exists());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn portable_execute_step_safe_delete_removes_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.bin");
+        std::fs::write(&target, b"data").unwrap();
+
+        let step = StoragePlanStep {
+            action: PlannedStorageAction::SafeDelete,
+            source: Some(target.clone()),
+            destination: None,
+            bytes: 4,
+        };
+        execute_step(&step).unwrap();
+
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn portable_execute_step_safe_delete_if_present_is_idempotent_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("does-not-exist.bin");
+
+        let step = StoragePlanStep {
+            action: PlannedStorageAction::SafeDeleteIfPresent,
+            source: Some(target),
+            destination: None,
+            bytes: 0,
+        };
+        execute_step(&step).unwrap();
+    }
+
+    #[test]
+    fn portable_execute_step_prune_empty_dirs_removes_up_to_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let nested = root.join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let step = StoragePlanStep {
+            action: PlannedStorageAction::PruneEmptyDirs,
+            source: Some(nested),
+            destination: Some(root.clone()),
+            bytes: 0,
+        };
+        execute_step(&step).unwrap();
+
+        assert!(root.exists(), "prune must stop at (and keep) the root");
+        assert!(!root.join("a").exists());
+    }
+
+    // Windows symlink creation normally requires Developer Mode or elevation,
+    // which a CI runner may not have -- gate this to Unix so the test
+    // exercises reject_symlink()'s logic without depending on the runner's
+    // symlink privileges. The ancestor-swap test below already covers the
+    // portable executor's Unix symlink handling in more depth.
+    #[cfg(unix)]
+    #[test]
+    fn portable_execute_step_rejects_symlink_source() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.bin");
+        let link = dir.path().join("link.bin");
+        let destination = dir.path().join("dest.bin");
+        std::fs::write(&real, b"data").unwrap();
+        symlink(&real, &link).unwrap();
+
+        let step = StoragePlanStep {
+            action: PlannedStorageAction::Rename,
+            source: Some(link),
+            destination: Some(destination.clone()),
+            bytes: 4,
+        };
+        let error = execute_step(&step).unwrap_err();
+        assert!(matches!(error, StorageError::StagedMoveFailed { .. }));
+        assert!(!destination.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn portable_execute_step_rejects_an_ancestor_symlink_swapped_after_validation() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.bin");
+        let alias = root.path().join("alias");
+        let destination = alias.join("destination.bin");
+        std::fs::write(&source, b"data").unwrap();
+        // Simulates the race the up-front `validate_plan_paths_under_roots`
+        // check cannot see: by the time this step actually runs, an ancestor
+        // directory that validated cleanly earlier has been replaced with a
+        // symlink pointing outside the confined root.
+        symlink(outside.path(), &alias).unwrap();
+
+        let step = StoragePlanStep {
+            action: PlannedStorageAction::CopyVerifyRename,
+            source: Some(source),
+            destination: Some(destination),
+            bytes: 4,
+        };
+        let error = execute_step(&step).unwrap_err();
+        assert!(matches!(
+            error,
+            StorageError::StagedMoveFailed {
+                step: "destination-ancestor",
+                ..
+            }
+        ));
+        assert!(!outside.path().join("destination.bin").exists());
+    }
+
+    #[test]
+    fn portable_rollback_plan_runs_configured_rollback_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("staged.bin");
+        let restored = dir.path().join("restored.bin");
+        std::fs::write(&staged, b"data").unwrap();
+
+        let plan = StoragePlan {
+            dry_run: false,
+            can_apply: true,
+            issues: Vec::new(),
+            steps: Vec::new(),
+            rollback_steps: vec![StoragePlanStep {
+                action: PlannedStorageAction::Rename,
+                source: Some(staged.clone()),
+                destination: Some(restored.clone()),
+                bytes: 4,
+            }],
+        };
+        let (rolled_back, failures) = rollback_plan(&plan);
+
+        assert_eq!(rolled_back.len(), 1);
+        assert!(failures.is_empty());
+        assert!(!staged.exists());
+        assert_eq!(std::fs::read(&restored).unwrap(), b"data");
     }
 
     #[test]
