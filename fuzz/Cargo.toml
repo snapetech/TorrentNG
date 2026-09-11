@@ -16,6 +16,15 @@ path = "../crates/rt-bencode"
 [dependencies.rt-metainfo]
 path = "../crates/rt-metainfo"
 
+[dependencies.rt-peer-wire]
+path = "../crates/rt-peer-wire"
+
+[dependencies.rt-tracker]
+path = "../crates/rt-tracker"
+
+[dependencies.rt-dht]
+path = "../crates/rt-dht"
+
 [[bin]]
 name = "parse_torrent"
 path = "fuzz_targets/parse_torrent.rs"
@@ -26,6 +35,69 @@ bench = false
 [[bin]]
 name = "bencode_decode"
 path = "fuzz_targets/bencode_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "peer_wire_handshake"
+path = "fuzz_targets/peer_wire_handshake.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "peer_wire_message"
+path = "fuzz_targets/peer_wire_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "peer_wire_extension_handshake"
+path = "fuzz_targets/peer_wire_extension_handshake.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "peer_wire_ut_metadata"
+path = "fuzz_targets/peer_wire_ut_metadata.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dht_krpc_message"
+path = "fuzz_targets/dht_krpc_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tracker_udp_connect_response"
+path = "fuzz_targets/tracker_udp_connect_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tracker_udp_announce_response"
+path = "fuzz_targets/tracker_udp_announce_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tracker_http_announce_response"
+path = "fuzz_targets/tracker_http_announce_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tracker_scrape_stats"
+path = "fuzz_targets/tracker_scrape_stats.rs"
 test = false
 doc = false
 bench = false

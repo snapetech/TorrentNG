@@ -173,7 +173,7 @@ jobs:
         run: cargo test --locked --manifest-path sidecar/Cargo.toml
 
   fuzz-smoke:
-    timeout-minutes: 20
+    timeout-minutes: 30
     runs-on: [self-hosted, Linux, X64]
     steps:
       - name: Checkout
@@ -199,6 +199,46 @@ jobs:
       - name: Fuzz bencode_decode (bounded smoke run)
         working-directory: fuzz
         run: cargo +nightly fuzz run bencode_decode -- -max_total_time=60
+
+      # Peer-wire, DHT, and tracker codecs decode bytes from the swarm
+      # (untrusted peers, DHT nodes, and configured trackers) before
+      # anything else validates them -- the same bounded-smoke rationale
+      # as the two targets above applies to each of these.
+      - name: Fuzz peer_wire_handshake (bounded smoke run)
+        working-directory: fuzz
+        run: cargo +nightly fuzz run peer_wire_handshake -- -max_total_time=60
+
+      - name: Fuzz peer_wire_message (bounded smoke run)
+        working-directory: fuzz
+        run: cargo +nightly fuzz run peer_wire_message -- -max_total_time=60
+
+      - name: Fuzz peer_wire_extension_handshake (bounded smoke run)
+        working-directory: fuzz
+        run: cargo +nightly fuzz run peer_wire_extension_handshake -- -max_total_time=60
+
+      - name: Fuzz peer_wire_ut_metadata (bounded smoke run)
+        working-directory: fuzz
+        run: cargo +nightly fuzz run peer_wire_ut_metadata -- -max_total_time=60
+
+      - name: Fuzz dht_krpc_message (bounded smoke run)
+        working-directory: fuzz
+        run: cargo +nightly fuzz run dht_krpc_message -- -max_total_time=60
+
+      - name: Fuzz tracker_udp_connect_response (bounded smoke run)
+        working-directory: fuzz
+        run: cargo +nightly fuzz run tracker_udp_connect_response -- -max_total_time=60
+
+      - name: Fuzz tracker_udp_announce_response (bounded smoke run)
+        working-directory: fuzz
+        run: cargo +nightly fuzz run tracker_udp_announce_response -- -max_total_time=60
+
+      - name: Fuzz tracker_http_announce_response (bounded smoke run)
+        working-directory: fuzz
+        run: cargo +nightly fuzz run tracker_http_announce_response -- -max_total_time=60
+
+      - name: Fuzz tracker_scrape_stats (bounded smoke run)
+        working-directory: fuzz
+        run: cargo +nightly fuzz run tracker_scrape_stats -- -max_total_time=60
 
       - name: Upload crash artifacts
         if: failure()
