@@ -1,6 +1,7 @@
 import { useState, useRef, useCallback } from 'react'
 import { useQueryClient, useQuery } from '@tanstack/react-query'
 import { api } from '../api/client'
+import { useDialogFocus } from '../hooks/useDialogFocus'
 
 interface Props {
   onClose: () => void
@@ -23,6 +24,7 @@ export function AddTorrentDialog({ onClose }: Props) {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
+  const dialogRef = useDialogFocus(onClose)
 
   const { data: categories = [] } = useQuery({ queryKey: ['categories'], queryFn: api.categories.list })
   const urlCount = url.split('\n').map(line => line.trim()).filter(Boolean).length
@@ -86,18 +88,20 @@ export function AddTorrentDialog({ onClose }: Props) {
       position: 'fixed', inset: 0, background: 'rgba(2,6,23,0.72)', display: 'flex',
       alignItems: 'center', justifyContent: 'center', zIndex: 100,
     }} onClick={e => { if (!busy && e.target === e.currentTarget) onClose() }}>
-      <div role="dialog" aria-modal="true" aria-label="Add torrent" className="tng-modal tng-add-dialog" style={{
+      <div ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="add-torrent-title" aria-describedby="add-torrent-description" tabIndex={-1} className="tng-modal tng-add-dialog" style={{
         background: 'var(--panel)', border: '1px solid var(--border)', borderRadius: 10,
         width: 480, maxWidth: '95vw', padding: 24, display: 'flex', flexDirection: 'column', gap: 16,
       }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
           <div>
-            <div style={{ fontWeight: 800, fontSize: 15, color: 'var(--text)' }}>Add torrent</div>
-            <div style={{ color: 'var(--faint)', fontSize: 12, marginTop: 2 }}>Stage files, magnets, or HTTP torrent URLs</div>
+              <h2 id="add-torrent-title" style={{ margin: 0, fontWeight: 800, fontSize: 15, color: 'var(--text)' }}>Add torrent</h2>
+            <div id="add-torrent-description" style={{ color: 'var(--faint)', fontSize: 12, marginTop: 2 }}>Stage files, magnets, or HTTP torrent URLs</div>
           </div>
           <button
+            type="button"
             onClick={onClose}
             disabled={busy}
+            aria-label="Close add torrent dialog"
             style={{
               background: 'none', border: 'none', color: 'var(--faint)', fontSize: 18,
               cursor: busy ? 'not-allowed' : 'pointer', opacity: busy ? 0.55 : 1,
@@ -110,15 +114,17 @@ export function AddTorrentDialog({ onClose }: Props) {
           className="tng-dropzone"
           data-active={dragOver ? 'true' : 'false'}
           data-filled={files.length > 0 ? 'true' : 'false'}
-          role="button"
-          tabIndex={0}
-          aria-label="Choose or drop torrent files"
+          role={files.length > 0 ? 'group' : 'button'}
+          tabIndex={files.length > 0 ? undefined : 0}
+          aria-label={files.length > 0 ? 'Staged torrent files' : 'Choose or drop torrent files'}
+          aria-keyshortcuts={files.length > 0 ? undefined : 'Enter Space'}
+          data-dialog-initial-focus
           onDragOver={e => { e.preventDefault(); setDragOver(true) }}
           onDragLeave={() => setDragOver(false)}
           onDrop={handleDrop}
           onClick={() => fileRef.current?.click()}
           onKeyDown={e => {
-            if (e.key === 'Enter' || e.key === ' ') {
+            if (files.length === 0 && (e.key === 'Enter' || e.key === ' ')) {
               e.preventDefault()
               fileRef.current?.click()
             }
@@ -136,6 +142,7 @@ export function AddTorrentDialog({ onClose }: Props) {
             type="file"
             accept=".torrent"
             multiple
+            aria-label="Torrent files"
             style={{ display: 'none' }}
             onChange={e => e.target.files && addFiles(e.target.files)}
           />
@@ -158,13 +165,24 @@ export function AddTorrentDialog({ onClose }: Props) {
                 }}>
                   <span style={{ fontSize: 12, color: 'var(--muted)', flex: 1, textAlign: 'left', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>📄 {f.name}</span>
                   <span style={{ color: 'var(--faint)', fontSize: 10, fontVariantNumeric: 'tabular-nums' }}>{fmtSize(f.size)}</span>
-                  <button aria-label={`Remove ${f.name}`} onClick={e => { e.stopPropagation(); setFiles(p => p.filter(x => x !== f)) }}
+                  <button type="button" aria-label={`Remove ${f.name}`} onClick={e => { e.stopPropagation(); setFiles(p => p.filter(x => x !== f)) }}
                     style={{ background: 'none', border: 'none', color: '#ef4444', cursor: 'pointer', fontSize: 14, padding: '0 2px' }}>✕</button>
                 </div>
               ))}
-              <span style={{ fontSize: 11, color: 'var(--success)', marginTop: 4 }}>
-                {files.length.toLocaleString()} file{files.length === 1 ? '' : 's'} staged · click to add more
-              </span>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, flexWrap: 'wrap', marginTop: 4 }}>
+                <span style={{ fontSize: 11, color: 'var(--success)' }}>
+                  {files.length.toLocaleString()} file{files.length === 1 ? '' : 's'} staged
+                </span>
+                <button
+                  type="button"
+                  aria-label="Add more torrent files"
+                  onClick={e => { e.stopPropagation(); fileRef.current?.click() }}
+                  style={{
+                    background: 'var(--surface-2)', border: '1px solid var(--border-strong)', borderRadius: 4,
+                    color: 'var(--accent-text)', padding: '2px 7px', fontSize: 10, cursor: 'pointer',
+                  }}
+                >Browse more</button>
+              </div>
             </div>
           )}
         </div>
@@ -174,10 +192,11 @@ export function AddTorrentDialog({ onClose }: Props) {
           border: '1px solid var(--border)', borderRadius: 7, background: 'var(--surface)',
           padding: '9px 10px',
         }}>
-          <label style={{ fontSize: 11, color: 'var(--faint)', display: 'block', marginBottom: 4 }}>
+          <label htmlFor="add-torrent-urls" style={{ fontSize: 11, color: 'var(--faint)', display: 'block', marginBottom: 4 }}>
             Magnet links or URLs (one per line)
           </label>
           <textarea
+            id="add-torrent-urls"
             value={url}
             onChange={e => setUrl(e.target.value)}
             placeholder="magnet:?xt=urn:btih:…"
@@ -196,8 +215,9 @@ export function AddTorrentDialog({ onClose }: Props) {
           border: '1px solid var(--border)', borderRadius: 7, background: 'var(--surface)',
           padding: '9px 10px',
         }}>
-          <label style={{ fontSize: 11, color: 'var(--faint)', display: 'block', marginBottom: 4 }}>Save path</label>
+          <label htmlFor="add-torrent-save-path" style={{ fontSize: 11, color: 'var(--faint)', display: 'block', marginBottom: 4 }}>Save path</label>
           <input
+            id="add-torrent-save-path"
             value={savePath}
             onChange={e => setSavePath(e.target.value)}
             placeholder="/data/downloads"
@@ -211,8 +231,9 @@ export function AddTorrentDialog({ onClose }: Props) {
             border: '1px solid var(--border)', borderRadius: 7, background: 'var(--surface)',
             padding: '9px 10px',
           }}>
-            <label style={{ fontSize: 11, color: 'var(--faint)', display: 'block', marginBottom: 4 }}>Category</label>
+            <label htmlFor="add-torrent-category" style={{ fontSize: 11, color: 'var(--faint)', display: 'block', marginBottom: 4 }}>Category</label>
             <select
+              id="add-torrent-category"
               value={category}
               onChange={e => {
                 setCategory(e.target.value)
@@ -256,15 +277,15 @@ export function AddTorrentDialog({ onClose }: Props) {
           </span>
         </div>
 
-        {error && <div style={noticeStyle}>{error}</div>}
+        {error && <div role="alert" aria-live="assertive" style={noticeStyle}>{error}</div>}
 
         <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', flexWrap: 'wrap' }}>
-          <button onClick={onClose} disabled={busy} style={{
+          <button type="button" onClick={onClose} disabled={busy} style={{
             background: 'none', border: '1px solid var(--border-strong)', borderRadius: 5,
             color: 'var(--faint)', padding: '6px 16px', fontSize: 13, cursor: 'pointer',
             opacity: busy ? 0.5 : 1,
           }}>Cancel</button>
-          <button onClick={submit} disabled={!canSubmit} style={{
+          <button type="button" onClick={submit} disabled={!canSubmit} style={{
             background: 'var(--accent-soft)', border: '1px solid var(--accent)', borderRadius: 5,
             color: 'var(--accent-text)', padding: '6px 20px', fontSize: 13,
             cursor: canSubmit ? 'pointer' : 'not-allowed', opacity: canSubmit ? 1 : 0.55,

@@ -32,7 +32,7 @@ export function FilterBar({ params, onChange }: Props) {
   }, [params.filter])
 
   return (
-    <div className="tng-filterbar" style={{
+    <div className="tng-filterbar" role="region" aria-label="Torrent filters" style={{
       display: 'flex',
       gap: 8,
       padding: '7px 12px',
@@ -47,7 +47,7 @@ export function FilterBar({ params, onChange }: Props) {
         padding: '0 9px',
         boxShadow: search ? '0 0 0 2px color-mix(in srgb, var(--accent) 14%, transparent)' : undefined,
       }}>
-        <span style={{ color: 'var(--faint)', fontSize: 12 }}>⌕</span>
+        <span aria-hidden="true" style={{ color: 'var(--faint)', fontSize: 12 }}>⌕</span>
         <input
           aria-label="Search torrents"
           type="search"
@@ -127,7 +127,7 @@ export function FilterBar({ params, onChange }: Props) {
         </button>
       )}
       {hasSidebarFilters && (
-        <span className="tng-filterbar-count" style={{
+        <span className="tng-filterbar-count" role="status" style={{
           color: 'var(--accent-text)', background: 'var(--accent-soft)', border: '1px solid var(--accent)',
           borderRadius: 999, padding: '2px 8px', fontSize: 11, fontWeight: 800, whiteSpace: 'nowrap',
         }}>
@@ -136,7 +136,7 @@ export function FilterBar({ params, onChange }: Props) {
       )}
       {(chips.length > 0 || params.sort) && (
         <div className="tng-filterbar-chips" style={{ display: 'flex', gap: 5, flexWrap: 'wrap', minWidth: 0 }}>
-          <span className="tng-filter-chip tng-filter-chip-muted" title={`Sorted by ${sortLabel}`} style={{
+          <span className="tng-filter-chip tng-filter-chip-muted" aria-label={`Sorted by ${sortLabel}`} title={`Sorted by ${sortLabel}`} style={{
             display: 'inline-flex', alignItems: 'center', gap: 4,
             maxWidth: 190, border: '1px solid var(--border)', borderRadius: 999,
             background: 'var(--surface)', color: 'var(--muted)', padding: '2px 7px',

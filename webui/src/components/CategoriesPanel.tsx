@@ -63,16 +63,16 @@ export function CategoriesPanel() {
   }
 
   return (
-    <div style={{ padding: '20px 24px' }}>
+    <section aria-labelledby="categories-title" style={{ padding: '20px 24px' }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 16 }}>
         <div>
-          <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--text)' }}>Categories</div>
+          <h2 id="categories-title" style={{ margin: 0, fontSize: 14, fontWeight: 700, color: 'var(--text)' }}>Categories</h2>
           <div style={{ fontSize: 12, color: 'var(--faint)', marginTop: 2 }}>
             {categories.length.toLocaleString()} configured
           </div>
         </div>
         {(save.isPending || del.isPending) && (
-          <span style={{
+          <span role="status" aria-live="polite" style={{
             color: 'var(--accent-text)', background: 'var(--accent-soft)', border: '1px solid var(--accent)',
             borderRadius: 999, padding: '2px 8px', fontSize: 11, fontWeight: 700,
           }}>Working</span>
@@ -81,7 +81,7 @@ export function CategoriesPanel() {
 
       {/* Category list */}
       {isLoading ? (
-        <div style={{ display: 'grid', gap: 8, marginBottom: 20, maxWidth: 720 }}>
+        <div role="status" aria-label="Loading categories" style={{ display: 'grid', gap: 8, marginBottom: 20, maxWidth: 720 }}>
           {Array.from({ length: 3 }, (_, index) => (
             <div key={index} style={{
               border: '1px solid var(--border)', borderRadius: 7, background: 'var(--surface)',
@@ -93,7 +93,7 @@ export function CategoriesPanel() {
           ))}
         </div>
       ) : categories.length === 0 ? (
-        <div style={{
+        <div role="status" style={{
           fontSize: 12, color: 'var(--faint)', marginBottom: 16,
           border: '1px dashed var(--border-strong)', borderRadius: 7,
           background: 'color-mix(in srgb, var(--surface) 72%, transparent)', padding: 14,
@@ -127,11 +127,15 @@ export function CategoriesPanel() {
                 </div>
               </div>
               <button
+                type="button"
+                aria-label={`Edit category ${cat.name}`}
                 onClick={() => startEdit(cat)}
                 disabled={save.isPending || del.isPending}
                 style={{ background: 'var(--surface-2)', border: '1px solid var(--border-strong)', borderRadius: 4, color: 'var(--text)', padding: '2px 8px', fontSize: 11, cursor: 'pointer' }}
               >Edit</button>
               <button
+                type="button"
+                aria-label={`Delete category ${cat.name}`}
                 onClick={() => del.mutate(cat.name)}
                 disabled={save.isPending || del.isPending}
                 style={{
@@ -154,12 +158,13 @@ export function CategoriesPanel() {
         border: '1px solid var(--border)', borderRadius: 8, background: 'var(--surface)', padding: 12,
         boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.03)',
       }}>
-        <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--faint)', letterSpacing: '0.05em', textTransform: 'uppercase' }}>
+        <h3 style={{ margin: 0, fontSize: 12, fontWeight: 600, color: 'var(--faint)', letterSpacing: '0.05em', textTransform: 'uppercase' }}>
           {editingName ? `Edit "${editingName}"` : 'Add category'}
-        </div>
+        </h3>
         <div>
-          <label style={{ fontSize: 11, color: 'var(--faint)', display: 'block', marginBottom: 4 }}>Name</label>
+          <label htmlFor="category-name" style={{ fontSize: 11, color: 'var(--faint)', display: 'block', marginBottom: 4 }}>Name</label>
           <input
+            id="category-name"
             value={name}
             onChange={e => setName(e.target.value)}
             placeholder="e.g. Movies"
@@ -168,8 +173,9 @@ export function CategoriesPanel() {
           />
         </div>
         <div>
-          <label style={{ fontSize: 11, color: 'var(--faint)', display: 'block', marginBottom: 4 }}>Save path</label>
+          <label htmlFor="category-save-path" style={{ fontSize: 11, color: 'var(--faint)', display: 'block', marginBottom: 4 }}>Save path</label>
           <input
+            id="category-save-path"
             value={savePath}
             onChange={e => setSavePath(e.target.value)}
             placeholder="/data/downloads/movies"
@@ -194,13 +200,13 @@ export function CategoriesPanel() {
         </div>
         {save.isError && <Notice tone="error">Failed to save.</Notice>}
       </form>
-    </div>
+    </section>
   )
 }
 
 function Notice({ tone, children }: { tone: 'error' | 'ok'; children: React.ReactNode }) {
   return (
-    <div style={{
+    <div role={tone === 'error' ? 'alert' : 'status'} aria-live={tone === 'error' ? 'assertive' : 'polite'} style={{
       fontSize: 12,
       color: tone === 'error' ? 'var(--danger)' : 'var(--success)',
       background: tone === 'error' ? 'color-mix(in srgb, var(--danger) 9%, var(--surface))' : 'color-mix(in srgb, var(--success) 8%, var(--surface))',

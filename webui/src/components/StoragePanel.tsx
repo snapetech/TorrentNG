@@ -137,12 +137,13 @@ export function StoragePanel() {
   }
 
   return (
-    <section style={{ padding: '18px 24px' }}>
+    <section aria-labelledby="storage-title" aria-busy={isLoading || isFetching || previewPlan.isPending || executePlan.isPending} style={{ padding: '18px 24px' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
-        <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--text)', flex: 1 }}>
+        <h2 id="storage-title" style={{ margin: 0, fontSize: 14, fontWeight: 600, color: 'var(--text)', flex: 1 }}>
           Storage
-        </div>
+        </h2>
         <button
+          type="button"
           onClick={() => refetch()}
           disabled={isFetching}
           style={{
@@ -155,7 +156,7 @@ export function StoragePanel() {
         </button>
       </div>
 
-      {isLoading && <SkeletonRows rows={2} />}
+      {isLoading && <div role="status" aria-label="Loading storage"><SkeletonRows rows={2} /></div>}
       {error && <Notice>Storage stats unavailable</Notice>}
 
       <div style={{ display: 'grid', gap: 10, maxWidth: 840 }}>
@@ -176,9 +177,9 @@ export function StoragePanel() {
         )}
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10, flexWrap: 'wrap' }}>
-          <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--text)', flex: 1, minWidth: 200 }}>
+          <h3 style={{ margin: 0, fontSize: 14, fontWeight: 700, color: 'var(--text)', flex: 1, minWidth: 200 }}>
             Storage Plan
-          </div>
+          </h3>
           <select value={operation} onChange={event => {
             setOperation(event.target.value as StoragePlanRequest['operation'])
             setPreview(null)
@@ -229,8 +230,8 @@ export function StoragePanel() {
             </>
           )}
           <label style={labelStyle}>
-            <span>Expected bytes</span>
-            <input value={bytes} onChange={event => { setBytes(event.target.value); setPreview(null) }} inputMode="numeric" placeholder="Optional" style={fieldStyle} />
+            <span>Expected bytes {operation === 'delete' ? '(optional)' : '(required)'}</span>
+            <input aria-label="Expected bytes" value={bytes} onChange={event => { setBytes(event.target.value); setPreview(null) }} inputMode="numeric" placeholder={operation === 'delete' ? 'Optional' : 'Required'} style={fieldStyle} />
           </label>
         </div>
 
@@ -239,6 +240,7 @@ export function StoragePanel() {
             <span>Affected torrents</span>
             <textarea
               value={affectedTorrents}
+              aria-label="Affected torrents"
               onChange={event => { setAffectedTorrents(event.target.value); setPreview(null) }}
               rows={3}
               placeholder="Info hashes, one per line"
@@ -260,17 +262,17 @@ export function StoragePanel() {
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 10 }}>
           {operation === 'import' && (
             <label style={checkStyle}>
-              <input type="checkbox" checked={hardlinkOrCopy} onChange={event => { setHardlinkOrCopy(event.target.checked); setPreview(null) }} />
+              <input type="checkbox" aria-label="Allow hardlink or copy import" checked={hardlinkOrCopy} onChange={event => { setHardlinkOrCopy(event.target.checked); setPreview(null) }} />
               <span>Allow hardlink/copy import</span>
             </label>
           )}
           {operation === 'delete' && (
             <label style={checkStyle}>
-              <input type="checkbox" checked={deleteApproved} onChange={event => { setDeleteApproved(event.target.checked); setPreview(null) }} />
+              <input type="checkbox" aria-label="Approve delete execution" checked={deleteApproved} onChange={event => { setDeleteApproved(event.target.checked); setPreview(null) }} />
               <span>Approve delete execution</span>
             </label>
           )}
-          <button onClick={() => previewPlan.mutate()} disabled={previewPlan.isPending || !selectedRoot} style={actionButtonStyle(!previewPlan.isPending && Boolean(selectedRoot))}>
+          <button type="button" onClick={() => previewPlan.mutate()} disabled={previewPlan.isPending || !selectedRoot} style={actionButtonStyle(!previewPlan.isPending && Boolean(selectedRoot))}>
             {previewPlan.isPending ? 'Previewing...' : 'Preview plan'}
           </button>
           <button onClick={() => executePlan.mutate()} disabled={executePlan.isPending || !canExecutePlan} style={actionButtonStyle(!executePlan.isPending && canExecutePlan)}>
@@ -315,7 +317,7 @@ function StorageJobs({ jobs }: { jobs: Job[] }) {
               {Math.round(job.progress * 100)}%
             </span>
           </div>
-          <div style={{ height: 7, borderRadius: 99, background: 'var(--surface-2)', overflow: 'hidden' }}>
+          <div role="progressbar" aria-label={`Storage job ${job.job_id}`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(Math.max(0, Math.min(1, job.progress)) * 100)} style={{ height: 7, borderRadius: 99, background: 'var(--surface-2)', overflow: 'hidden' }}>
             <div style={{ width: `${Math.max(0, Math.min(100, job.progress * 100))}%`, height: '100%', background: 'var(--accent)' }} />
           </div>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 7 }}>
@@ -336,7 +338,7 @@ function PathField({ label, value, onChange }: { label: string; value: string; o
   return (
     <label style={labelStyle}>
       <span>{label}</span>
-      <input value={value} onChange={event => onChange(event.target.value)} placeholder="/path/on/storage/root" style={fieldStyle} />
+            <input aria-label={`${label} path`} value={value} onChange={event => onChange(event.target.value)} placeholder="/path/on/storage/root" style={fieldStyle} />
     </label>
   )
 }
@@ -349,7 +351,7 @@ function StoragePlanResult({ response, completedIndexes }: { response: StoragePl
   const completed = completedIndexes.filter(index => index < response.plan.steps.length).length
   const remaining = Math.max(0, response.plan.steps.length - completed)
   return (
-    <div style={{ border: `1px solid color-mix(in srgb, ${tone} 38%, var(--border))`, borderRadius: 7, background: 'var(--surface)', padding: 12 }}>
+    <div role="region" aria-label={`${response.operation} storage plan`} aria-live="polite" style={{ border: `1px solid color-mix(in srgb, ${tone} 38%, var(--border))`, borderRadius: 7, background: 'var(--surface)', padding: 12 }}>
       <div style={{ display: 'flex', gap: 10, alignItems: 'center', marginBottom: 8 }}>
         <strong style={{ color: 'var(--text)', fontSize: 13, textTransform: 'capitalize' }}>{response.operation}</strong>
         <span style={{ color: tone, fontSize: 12, fontWeight: 800 }}>{response.plan.can_apply ? 'Can apply' : 'Needs attention'}</span>
@@ -479,7 +481,7 @@ function StorageRootCard({ root }: { root: NonNullable<Awaited<ReturnType<typeof
 
       {root.ok ? (
         <>
-          <div className="tng-storage-meter" style={{ height: 8, background: 'var(--surface-2)', borderRadius: 99, overflow: 'hidden', marginBottom: 9 }}>
+            <div className="tng-storage-meter" role="progressbar" aria-label={`${root.path} storage used`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.max(0, Math.min(100, root.used_percent))} style={{ height: 8, background: 'var(--surface-2)', borderRadius: 99, overflow: 'hidden', marginBottom: 9 }}>
             <div style={{ width: `${Math.min(100, root.used_percent)}%`, height: '100%', background: tone }} />
           </div>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))', gap: 8, fontSize: 12 }}>
@@ -514,7 +516,7 @@ function SkeletonRows({ rows }: { rows: number }) {
 
 function Notice({ children }: { children: React.ReactNode }) {
   return (
-    <div style={{
+    <div role="alert" aria-live="assertive" style={{
       color: 'var(--danger)', background: 'color-mix(in srgb, var(--danger) 9%, var(--surface))',
       border: '1px solid color-mix(in srgb, var(--danger) 45%, var(--border))',
       borderRadius: 6, padding: '8px 9px', fontSize: 12, marginBottom: 10,

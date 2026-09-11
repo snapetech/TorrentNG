@@ -56,7 +56,7 @@ export function BulkActionBar({ hashes, onClear }: Props) {
   }
 
   return (
-    <div style={{
+    <div role="toolbar" aria-label="Bulk torrent actions" aria-busy={Boolean(pending)} style={{
       minHeight: 44,
       background: 'var(--panel)',
       borderBottom: '1px solid var(--border)',
@@ -68,13 +68,14 @@ export function BulkActionBar({ hashes, onClear }: Props) {
       flexShrink: 0,
       fontSize: 12,
     }}>
-      <span style={{ color: 'var(--accent)', fontWeight: 600, marginRight: 4 }}>
+      <span role="status" aria-live="polite" style={{ color: 'var(--accent)', fontWeight: 600, marginRight: 4 }}>
         {hashes.length} selected
       </span>
 
       {ACTIONS.map(a => (
         <button
           key={a.key}
+          type="button"
           disabled={!!pending}
           onClick={() => runAction(a.key as 'start' | 'stop' | 'recheck' | 'reannounce', false)}
           style={{
@@ -93,6 +94,7 @@ export function BulkActionBar({ hashes, onClear }: Props) {
       ))}
 
       <select
+        aria-label="Bulk category"
         value={category}
         onChange={e => setCategory(e.target.value)}
         disabled={!!pending}
@@ -108,6 +110,7 @@ export function BulkActionBar({ hashes, onClear }: Props) {
         ))}
       </select>
       <button
+        type="button"
         disabled={!!pending}
         onClick={() => runAction('set-category', true)}
         style={{
@@ -119,6 +122,7 @@ export function BulkActionBar({ hashes, onClear }: Props) {
         Preview category
       </button>
       <button
+        type="button"
         disabled={!!pending}
         onClick={() => runAction('set-category', false)}
         style={{
@@ -131,6 +135,7 @@ export function BulkActionBar({ hashes, onClear }: Props) {
       </button>
 
       <input
+        aria-label="Bulk save path"
         value={savePath}
         onChange={e => setSavePath(e.target.value)}
         disabled={!!pending}
@@ -142,6 +147,7 @@ export function BulkActionBar({ hashes, onClear }: Props) {
         }}
       />
       <button
+        type="button"
         disabled={!!pending || !savePath.trim()}
         onClick={() => runAction('set-location', true)}
         style={{
@@ -154,6 +160,7 @@ export function BulkActionBar({ hashes, onClear }: Props) {
         Preview path
       </button>
       <button
+        type="button"
         disabled={!!pending || !savePath.trim()}
         onClick={() => runAction('set-location', false)}
         style={{
@@ -167,6 +174,7 @@ export function BulkActionBar({ hashes, onClear }: Props) {
       </button>
 
       <button
+        type="button"
         disabled={!!pending}
         onClick={() => runAction('stop', true)}
         style={{
@@ -184,15 +192,16 @@ export function BulkActionBar({ hashes, onClear }: Props) {
       </button>
 
       {preview && (
-        <span style={{ color: 'var(--muted)', fontSize: 11 }}>
+          <span role="status" aria-live="polite" style={{ color: 'var(--muted)', fontSize: 11 }}>
           Preview: {preview.applied.length} would be affected
         </span>
       )}
       {error && (
-        <span style={{ color: '#ef4444', fontSize: 11 }}>{error}</span>
+        <span role="alert" aria-live="assertive" style={{ color: '#ef4444', fontSize: 11 }}>{error}</span>
       )}
 
       <button
+        type="button"
         onClick={onClear}
         style={{
           marginLeft: 'auto',

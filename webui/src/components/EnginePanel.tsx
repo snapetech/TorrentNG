@@ -21,15 +21,16 @@ export function EnginePanel() {
   const supportsOverlay = data?.backend?.capabilities.supports_config_overlay === true
 
   return (
-    <section style={{ padding: '16px 24px' }}>
+    <section aria-labelledby="backend-title" aria-busy={isLoading || isFetching} style={{ padding: '16px 24px' }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 12 }}>
-        <h2 style={{ fontSize: 13, margin: 0, color: 'var(--text)' }}>Backend</h2>
+        <h2 id="backend-title" style={{ fontSize: 13, margin: 0, color: 'var(--text)' }}>Backend</h2>
         {data && (
           <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
             <Badge ok text={data.backend.type} />
             {isRtorrent && <Badge ok={driftProblems === 0} text={driftProblems === 0 ? 'profile clean' : `${driftProblems} drift`} />}
             {isRtorrent && <Badge ok={data.capabilities.every(c => c.available)} text={`${data.capabilities.filter(c => c.available).length}/${data.capabilities.length} XMLRPC`} />}
             <button
+              type="button"
               onClick={() => {
                 refetch()
                 refetchCommands()
@@ -47,7 +48,7 @@ export function EnginePanel() {
         )}
       </div>
 
-      {isLoading && <EngineSkeleton />}
+      {isLoading && <div role="status" aria-label="Loading backend diagnostics"><EngineSkeleton /></div>}
       {error && <Notice>Engine diagnostics unavailable</Notice>}
       {data && (
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: 16 }}>
@@ -118,7 +119,7 @@ function EngineSkeleton() {
 
 function Notice({ children }: { children: React.ReactNode }) {
   return (
-    <div style={{
+    <div role="alert" aria-live="assertive" style={{
       color: 'var(--danger)', background: 'color-mix(in srgb, var(--danger) 9%, var(--surface))',
       border: '1px solid color-mix(in srgb, var(--danger) 45%, var(--border))',
       borderRadius: 6, padding: '8px 9px', fontSize: 12,
@@ -994,6 +995,7 @@ function RtorrentSettingsPanel() {
             padding: '10px 0 0',
           }} role="toolbar" aria-label="Settings save actions">
             <button
+              type="button"
               onClick={saveNow}
               disabled={save.isPending || dirtyCount === 0 || !data.overlay_writable}
               aria-keyshortcuts="Control+S Meta+S"
@@ -1003,6 +1005,7 @@ function RtorrentSettingsPanel() {
               {save.isPending ? 'Saving...' : lastSaveFailed ? 'Retry save' : 'Save now'}
             </button>
             <button
+              type="button"
               onClick={resetAll}
               disabled={dirtyCount === 0 || save.isPending}
               aria-keyshortcuts="Control+Shift+Z Meta+Shift+Z"
@@ -1012,6 +1015,7 @@ function RtorrentSettingsPanel() {
               Reset edits
             </button>
             <button
+              type="button"
               onClick={() => {
                 if (window.confirm('Restart rTorrent/TorrentNG now? Active transfers will reconnect after the service comes back.')) restart.mutate()
               }}
@@ -1020,7 +1024,7 @@ function RtorrentSettingsPanel() {
             >
               {restart.isPending ? 'Restarting…' : 'Restart daemon'}
             </button>
-            <span style={{ color: lastSaveFailed ? 'var(--danger)' : dirtyCount > 0 ? 'var(--warning)' : 'var(--faint)', fontSize: 12, fontWeight: 800 }}>
+            <span role="status" aria-live="polite" style={{ color: lastSaveFailed ? 'var(--danger)' : dirtyCount > 0 ? 'var(--warning)' : 'var(--faint)', fontSize: 12, fontWeight: 800 }}>
               {!data.overlay_writable ? 'Readonly overlay' : save.isPending ? 'Autosaving' : lastSaveFailed ? 'Autosave failed' : dirtyCount > 0 ? `${dirtyCount} pending autosave` : 'Saved'}
             </span>
           </div>
@@ -1547,6 +1551,7 @@ function CommandIndex({ commands }: { commands?: { ok: boolean; count: number; c
             <input
               value={filter}
               onChange={e => setFilter(e.target.value)}
+              aria-label="Filter XMLRPC commands"
               placeholder="Filter commands"
               style={{
                 minWidth: 0, flex: '1 1 220px', background: 'var(--bg)', border: '1px solid var(--border-strong)',
@@ -1605,17 +1610,17 @@ function Rows({ rows }: { rows: [string, string][] }) {
 }
 
 function Subhead({ children }: { children: string }) {
-  return <div style={{
+  return <h3 style={{
     fontSize: 11, fontWeight: 800, textTransform: 'uppercase', color: 'var(--accent-text)',
-    marginBottom: 8, display: 'flex', alignItems: 'center', gap: 6,
+    margin: '0 0 8px', display: 'flex', alignItems: 'center', gap: 6,
   }}>
-    <span style={{ width: 6, height: 6, borderRadius: 999, background: 'var(--accent)', flexShrink: 0 }} />
+    <span aria-hidden="true" style={{ width: 6, height: 6, borderRadius: 999, background: 'var(--accent)', flexShrink: 0 }} />
     {children}
-  </div>
+  </h3>
 }
 
 function InlineNotice({ children }: { children: React.ReactNode }) {
-  return <div style={{
+  return <div role="alert" aria-live="assertive" style={{
     color: 'var(--danger)',
     background: 'color-mix(in srgb, var(--danger) 9%, var(--surface))',
     border: '1px solid color-mix(in srgb, var(--danger) 45%, var(--border))',

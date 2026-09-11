@@ -70,9 +70,11 @@ function Badge({
     <Element
       className="tng-status-badge"
       data-state={state ?? 'idle'}
+      type={Element === 'button' ? 'button' : undefined}
       role={onClick ? 'switch' : undefined}
       aria-checked={onClick ? state === 'on' : undefined}
       aria-disabled={disabled || undefined}
+      aria-label={onClick ? `${label}: ${value}. Activate to toggle` : undefined}
       title={title}
       onClick={handleClick}
       style={{
@@ -116,7 +118,7 @@ function Badge({
 
 function Notice({ tone, children }: { tone: 'ok' | 'error'; children: React.ReactNode }) {
   return (
-    <span style={{
+    <span role={tone === 'error' ? 'alert' : 'status'} aria-live={tone === 'error' ? 'assertive' : 'polite'} style={{
       display: 'inline-flex', alignItems: 'center', gap: 5, minHeight: 22,
       border: '1px solid ' + (tone === 'error' ? 'color-mix(in srgb, var(--danger) 45%, var(--border))' : 'color-mix(in srgb, var(--success) 38%, var(--border))'),
       background: tone === 'error' ? 'color-mix(in srgb, var(--danger) 12%, transparent)' : 'color-mix(in srgb, var(--success) 10%, transparent)',
@@ -151,6 +153,7 @@ export function StatusBar({
   return (
     <footer
       className="tng-statusbar"
+      aria-label="Application status"
       data-connected={connected ? 'true' : 'false'}
       data-selected={selected > 0 ? 'true' : 'false'}
       data-mobile-expanded={mobileExpanded ? 'true' : 'false'}

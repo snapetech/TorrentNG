@@ -33,6 +33,72 @@ const torrents = Array.from({ length: 40 }, (_, i) => {
   }
 })
 
+const engineDiagnostics = {
+  backend: {
+    type: 'native',
+    status: 'connected',
+    capabilities: {
+      supports_tags: true,
+      supports_categories: true,
+      supports_file_priority: true,
+      supports_tracker_edit: true,
+      supports_recheck: true,
+      supports_torrent_export: true,
+      supports_webseed_reads: true,
+      supports_piece_state_reads: true,
+      supports_piece_hash_reads: true,
+      supports_peer_snapshots: true,
+      supports_peer_add: false,
+      supports_peer_ban: false,
+      supports_queue_order: true,
+      supports_per_torrent_limits: true,
+      supports_global_limits: true,
+      supports_share_limits: true,
+      supports_mode_flags: true,
+      supports_location_update: true,
+      supports_torrent_rename: true,
+      supports_file_rename: true,
+      supports_runtime_user_agent: false,
+      supports_config_overlay: false,
+      supports_restart: false,
+    },
+  },
+  provenance: {
+    sidecar_version: 'e2e',
+    rtorrent_version: null,
+    libtorrent_version: null,
+    xmlrpc_backend: 'native',
+    packaged_rtorrent_version: null,
+    packaged_libtorrent_version: null,
+    patch_set: [],
+  },
+  capabilities: [],
+  http: {
+    user_agent: { ok: true, value: 'TorrentNG/e2e-a11y', error: null },
+    current_open: { ok: true, value: 0, error: null },
+    max_total_connections: { ok: true, value: 64, error: null },
+    max_host_connections: { ok: true, value: 16, error: null },
+    max_cache_connections: { ok: true, value: 32, error: null },
+    dns_cache_timeout: { ok: true, value: 60, error: null },
+    proxy_address: { ok: true, value: '', error: null },
+    ca_path: { ok: true, value: '', error: null },
+    ca_cert: { ok: true, value: '', error: null },
+    ssl_verify_peer: { ok: true, value: true, error: null },
+    ssl_verify_host: { ok: true, value: true, error: null },
+  },
+  dht: {
+    enabled: { ok: true, value: 'on', error: null },
+    port: { ok: true, value: 6881, error: null },
+    override_port: { ok: true, value: null, error: null },
+    listen_port: { ok: true, value: 6881, error: null },
+    listen_range: { ok: true, value: '6881-6889', error: null },
+    pex: { ok: true, value: true, error: null },
+    udp_trackers: { ok: true, value: true, error: null },
+    statistics: { ok: true, value: 'available', error: null },
+  },
+  drift: [],
+}
+
 async function installA11yApiMock(page: Page) {
   await page.addInitScript(() => {
     try {
@@ -106,9 +172,7 @@ async function installA11yApiMock(page: Page) {
       return json({ status: { all: torrents.length, seeding: torrents.length, downloading: 0, stopped: 0, checking: 0, error: 0 }, media_type: { video: 20, archive: 20, other: 0 } })
     }
     if (path === '/api/v1/saved-views') return json([])
-    if (path === '/api/v1/engine') {
-      return json({ mode: 'native', native_engine: true, torrent_count: torrents.length, storage: {}, runtime: {}, resources: { classes: [] }, diagnostics: [] })
-    }
+    if (path === '/api/v1/engine') return json(engineDiagnostics)
     if (path === '/api/v1/engine/commands') return json({ commands: [] })
     if (path === '/api/v1/settings/user-agent') return json({ user_agent: 'TorrentNG/e2e-a11y' })
     if (path === '/api/v1/ratio-groups' || path === '/api/v1/workflows' || path === '/api/v1/workflow-runs' || path === '/api/v1/rss-rules') return json([])
@@ -146,6 +210,24 @@ test('torrent workspace has no serious automated accessibility violations', asyn
   }))).toEqual([])
 })
 
+test('multi-selection workspace has no serious automated accessibility violations', async ({ page }) => {
+  await page.getByLabel(/Select TorrentNG a11y fixture 001/i).first().click()
+  await page.getByLabel(/Select TorrentNG a11y fixture 002/i).first().click()
+  await expect(page.getByRole('complementary', { name: 'Selection workspace' })).toBeVisible()
+
+  const results = await new AxeBuilder({ page })
+    .include('body')
+    .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'])
+    .analyze()
+  const serious = results.violations.filter(violation => violation.impact === 'serious' || violation.impact === 'critical')
+
+  expect(serious.map(violation => ({
+    id: violation.id,
+    impact: violation.impact,
+    targets: violation.nodes.flatMap(node => node.target),
+  }))).toEqual([])
+})
+
 test('settings library panel has no serious automated accessibility violations', async ({ page, isMobile }) => {
   test.skip(isMobile, 'desktop settings panel exposes the full tabbed layout')
 
@@ -163,4 +245,97 @@ test('settings library panel has no serious automated accessibility violations',
     impact: violation.impact,
     targets: violation.nodes.flatMap(node => node.target),
   }))).toEqual([])
+})
+
+test('every settings section has no serious automated accessibility violations', async ({ page, isMobile }) => {
+  test.skip(isMobile, 'desktop settings surfaces provide the complete certification viewport')
+
+  await page.getByRole('button', { name: 'Settings' }).click()
+  const settingsTab = (name: string) => page.getByRole('tab', { name: new RegExp(name, 'i') })
+  const sections = [
+    ['Library', 'Storage'],
+    ['Backend', 'Operator Logs'],
+    ['Automation', 'RSS Rules'],
+    ['Support', 'Appearance'],
+  ] as const
+
+  for (const [tabName, landmark] of sections) {
+    await settingsTab(tabName).click()
+    await expect(page.getByRole('heading', { name: landmark, level: 2 })).toBeVisible()
+
+    const results = await new AxeBuilder({ page })
+      .include('body')
+      .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'])
+      .analyze()
+    const serious = results.violations.filter(violation => violation.impact === 'serious' || violation.impact === 'critical')
+
+    expect(serious.map(violation => ({
+      section: tabName,
+      id: violation.id,
+      impact: violation.impact,
+      targets: violation.nodes.flatMap(node => node.target),
+    }))).toEqual([])
+  }
+})
+
+test('transient dialogs keep focus contained and have no serious automated accessibility violations', async ({ page, isMobile }) => {
+  test.skip(isMobile, 'desktop dialog certification uses the full workspace controls')
+
+  async function assertDialogIsAccessible() {
+    const results = await new AxeBuilder({ page })
+      .include('[role="dialog"]')
+      .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'])
+      .analyze()
+    const serious = results.violations.filter(violation => violation.impact === 'serious' || violation.impact === 'critical')
+    expect(serious.map(violation => ({
+      id: violation.id,
+      impact: violation.impact,
+      targets: violation.nodes.flatMap(node => node.target),
+    }))).toEqual([])
+  }
+
+  const addButton = page.getByRole('button', { name: 'Add torrent' }).first()
+  await addButton.click()
+  const addDialog = page.getByRole('dialog', { name: 'Add torrent' })
+  await expect(addDialog).toBeVisible()
+  await expect(addDialog.locator('[data-dialog-initial-focus]')).toBeFocused()
+  await assertDialogIsAccessible()
+  await page.keyboard.press('Tab')
+  await expect(addDialog).toContainText('Stage files, magnets, or HTTP torrent URLs')
+  await page.keyboard.press('Escape')
+  await expect(addDialog).toHaveCount(0)
+  await expect(addButton).toBeFocused()
+
+  const helpButton = page.getByRole('button', { name: 'Keyboard shortcuts and docs' }).first()
+  await helpButton.click()
+  const helpDialog = page.getByRole('dialog', { name: 'Help' })
+  await expect(helpDialog).toBeVisible()
+  await expect(helpDialog.getByRole('button', { name: 'Close' })).toBeFocused()
+  await assertDialogIsAccessible()
+  await page.keyboard.press('Escape')
+  await expect(helpDialog).toHaveCount(0)
+
+  await page.getByLabel(/Select TorrentNG a11y fixture 001/i).first().click()
+  const propertiesButton = page.getByRole('button', { name: 'Open selected torrent properties' })
+  await propertiesButton.click()
+  const propertiesDialog = page.getByRole('dialog', { name: 'Properties' })
+  await expect(propertiesDialog).toBeVisible()
+  await assertDialogIsAccessible()
+  await page.keyboard.press('Escape')
+  await expect(propertiesDialog).toHaveCount(0)
+
+  const bulkEditButton = page.getByRole('button', { name: 'Bulk edit selected torrents' })
+  await bulkEditButton.click()
+  const bulkDialog = page.getByRole('dialog', { name: 'Edit selected torrents' })
+  await expect(bulkDialog).toBeVisible()
+  await assertDialogIsAccessible()
+  await page.keyboard.press('Escape')
+  await expect(bulkDialog).toHaveCount(0)
+
+  await page.getByRole('row', { name: /TorrentNG a11y fixture 001/ }).click({ button: 'right' })
+  await page.getByRole('menu', { name: /Actions for TorrentNG a11y fixture 001/ })
+    .getByRole('menuitem', { name: 'Delete...' }).click()
+  const deleteDialog = page.getByRole('dialog', { name: 'Delete torrent' })
+  await expect(deleteDialog).toBeVisible()
+  await assertDialogIsAccessible()
 })

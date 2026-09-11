@@ -6,6 +6,8 @@ import { TorrentTable } from './components/TorrentTable'
 import { FilterBar } from './components/FilterBar'
 import { SavedViewsBar } from './components/SavedViewsBar'
 import { TorrentDetail } from './components/TorrentDetail'
+import { TorrentSelectionPanel } from './components/TorrentSelectionPanel'
+import { isDetailPosition, type DetailPosition } from './components/DetailDockControls'
 import { AddTorrentDialog } from './components/AddTorrentDialog'
 import { CategoriesPanel } from './components/CategoriesPanel'
 import { TorrentSidebar } from './components/TorrentSidebar'
@@ -17,6 +19,7 @@ import { StatusBar } from './components/StatusBar'
 import { TorrentPropertiesDialog } from './components/TorrentPropertiesDialog'
 import { AppearancePanel, type MediaInferenceMode } from './components/AppearancePanel'
 import { BulkEditDialog } from './components/BulkEditDialog'
+import { useDialogFocus } from './hooks/useDialogFocus'
 import { api, AuthError, type ListParams, type LiveStats, type TorrentSummary } from './api/client'
 import { PALETTES, applyTheme, findPalette, THEME_MODE_STORAGE_KEY, THEME_STORAGE_KEY, type ThemeMode } from './themes'
 
@@ -31,8 +34,17 @@ const LogsPanel = lazy(() => import('./components/LogsPanel').then(module => ({ 
 type View = 'torrents' | 'settings'
 type AuthState = 'checking' | 'authenticated' | 'unauthenticated'
 type SettingsSection = 'library' | 'engine' | 'automation' | 'support'
+type SelectionMode = 'toggle' | 'replace' | 'range' | 'range-add'
 const MEDIA_INFERENCE_KEY = 'tng.mediaInference'
 const DETAIL_AUTO_DISPLAY_KEY = 'tng.detailAutoDisplay'
+const DETAIL_POSITION_KEY = 'tng.detailPosition'
+
+function isEditableTarget(target: EventTarget | null): boolean {
+  if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement) {
+    return true
+  }
+  return target instanceof HTMLElement && (target.isContentEditable || target.getAttribute('role') === 'textbox')
+}
 
 function utpPathLabel(path: string): string {
   switch (path) {
@@ -147,6 +159,15 @@ function loadDetailAutoDisplay(): boolean {
   }
 }
 
+function loadDetailPosition(): DetailPosition {
+  try {
+    const value = localStorage.getItem(DETAIL_POSITION_KEY)
+    return isDetailPosition(value) ? value : 'right'
+  } catch {
+    return 'right'
+  }
+}
+
 function isSettingsSection(value: string | null): value is SettingsSection {
   return value === 'library' || value === 'engine' || value === 'automation' || value === 'support'
 }
@@ -247,6 +268,8 @@ export function App() {
     dir: 'asc',
   })
   const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [selectionAnchor, setSelectionAnchor] = useState<string | null>(null)
+  const [selectedSnapshots, setSelectedSnapshots] = useState<Map<string, TorrentSummary>>(new Map())
   const [detailHash, setDetailHash] = useState<string | null>(null)
   const [liveStats, setLiveStats] = useState<LiveStats>({ upload_speed: 0, download_speed: 0 })
   const [addOpen, setAddOpen] = useState(false)
@@ -264,6 +287,7 @@ export function App() {
   const [themeId, setThemeId] = useState(loadThemeId)
   const [themeMode, setThemeMode] = useState<ThemeMode>(loadThemeMode)
   const [detailAutoDisplay, setDetailAutoDisplay] = useState(loadDetailAutoDisplay)
+  const [detailPosition, setDetailPosition] = useState<DetailPosition>(loadDetailPosition)
   const activeTheme = findPalette(themeId)[themeMode]
 
   const updateParams = useCallback((p: Partial<typeof params>) => {
@@ -273,6 +297,20 @@ export function App() {
   const isAuthed = activeTab.isActive && authState === 'authenticated'
   const query = useTorrentsInfinite(params, isAuthed)
   const { torrents, total } = flattenPages(query.data)
+  useEffect(() => {
+    const currentByHash = new Map(torrents.map(torrent => [torrent.hash, torrent]))
+    setSelectedSnapshots(previous => {
+      const next = new Map<string, TorrentSummary>()
+      for (const hash of selected) {
+        const snapshot = currentByHash.get(hash) ?? previous.get(hash)
+        if (snapshot) next.set(hash, snapshot)
+      }
+      if (next.size === previous.size && [...next].every(([hash, torrent]) => previous.get(hash) === torrent)) {
+        return previous
+      }
+      return next
+    })
+  }, [selected, torrents])
   const { data: health } = useHealth(activeTab.isActive && authState === 'authenticated')
   const healthUtp = utpStatus(health?.engine?.capabilities)
   const backendHealth = backendHealthLabel(health)
@@ -379,7 +417,7 @@ export function App() {
   useEffect(() => {
     if (query.error instanceof AuthError) {
       setAuthState('unauthenticated')
-      setSelected(new Set())
+      clearSelection()
       setDetailHash(null)
     }
   }, [query.error])
@@ -406,26 +444,26 @@ export function App() {
         if (propertiesHash) { setPropertiesHash(null); return }
         if (addOpen) { setAddOpen(false); return }
         if (detailHash) { setDetailHash(null); return }
-        if (selected.size > 0) { setSelected(new Set()); return }
+        if (selected.size > 0) { clearSelection(); return }
       }
-      const inTextField = e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement
-      if (e.key === '?' && !inTextField) {
+      const inEditable = isEditableTarget(e.target)
+      if (e.key === '?' && !inEditable) {
         setHelpOpen(true)
         return
       }
       // 'a' key to open add dialog when not in an input
-      if (e.key === 'a' && !inTextField && !e.ctrlKey && !e.metaKey) {
+      if (e.key === 'a' && !inEditable && !e.ctrlKey && !e.metaKey) {
         setAddOpen(true)
         return
       }
-      if ((e.key === 'Delete' || e.key === 'Backspace') && !inTextField && selected.size === 1
+      if ((e.key === 'Delete' || e.key === 'Backspace') && !inEditable && selected.size === 1
         && !contextMenu && !helpOpen && !pendingDelete && !bulkEditOpen && !propertiesHash && !addOpen) {
         const hash = [...selected][0]
         const torrent = torrents.find(t => t.hash === hash)
         if (torrent) { e.preventDefault(); setPendingDelete(torrent) }
         return
       }
-      if (e.key === 'a' && (e.ctrlKey || e.metaKey) && !inTextField) {
+      if (e.key === 'a' && (e.ctrlKey || e.metaKey) && !inEditable) {
         e.preventDefault()
         handleSelectAll(torrents.map(t => t.hash))
       }
@@ -436,7 +474,7 @@ export function App() {
 
   function goToTrackerTorrents(tracker: string) {
     setParams(prev => ({ ...prev, tracker, offset: 0 }))
-    setSelected(new Set())
+    clearSelection()
     setView('torrents')
   }
 
@@ -446,27 +484,72 @@ export function App() {
       dir: 'asc',
       ...next,
     })
-    setSelected(new Set())
+    clearSelection()
   }
 
-  function handleSelect(hash: string) {
-    setSelected(prev => {
-      const next = new Set(prev)
-      if (next.has(hash)) {
+  function handleSelect(hash: string, mode: SelectionMode = 'toggle') {
+    const targetIndex = torrents.findIndex(item => item.hash === hash)
+    const anchorIndex = selectionAnchor ? torrents.findIndex(item => item.hash === selectionAnchor) : -1
+    const hasRangeAnchor = targetIndex >= 0 && anchorIndex >= 0
+    const rangeHashes = hasRangeAnchor
+      ? torrents.slice(Math.min(targetIndex, anchorIndex), Math.max(targetIndex, anchorIndex) + 1).map(item => item.hash)
+      : [hash]
+    const nextHashes = mode === 'replace'
+      ? [hash]
+      : mode === 'toggle'
+        ? selected.has(hash) ? [...selected].filter(item => item !== hash) : [...selected, hash]
+        : mode === 'range'
+          ? rangeHashes
+          : [...selected, ...rangeHashes.filter(item => !selected.has(item))]
+    const nextSelected = new Set(nextHashes)
+    const wasSelected = selected.has(hash)
+
+    setSelectedSnapshots(previous => {
+      const next = mode === 'replace' || mode === 'range' ? new Map<string, TorrentSummary>() : new Map(previous)
+      if (mode === 'toggle' && wasSelected) {
         next.delete(hash)
-        if (detailHash === hash) setDetailHash(null)
       } else {
-        next.add(hash)
-        if (detailAutoDisplay) setDetailHash(hash)
+        const hashesToAdd = mode === 'range' || mode === 'range-add' ? rangeHashes : [hash]
+        hashesToAdd.forEach(item => {
+          const record = torrents.find(torrentItem => torrentItem.hash === item)
+          if (record) next.set(item, record)
+        })
       }
       return next
     })
+    setSelected(nextSelected)
+
+    if (mode === 'range' || mode === 'range-add') {
+      if (!selectionAnchor || !hasRangeAnchor) setSelectionAnchor(hash)
+    } else {
+      setSelectionAnchor(hash)
+    }
+
+    setDetailHash(current => {
+      const shouldOpen = detailAutoDisplay || Boolean(current)
+      if (!shouldOpen || nextSelected.size === 0) return null
+      return current && nextSelected.has(current) ? current : [...nextSelected][0]
+    })
   }
 
-  function handleSelectAll(hashes: string[]) {
-    setSelected(new Set(hashes))
-    if (detailAutoDisplay && hashes.length === 1) setDetailHash(hashes[0])
-    if (hashes.length === 0) setDetailHash(null)
+  function handleSelectAll(hashes: string[], records?: Map<string, TorrentSummary>) {
+    const selectedHashes = new Set(hashes)
+    const currentByHash = new Map(torrents.map(torrent => [torrent.hash, torrent]))
+    setSelectedSnapshots(previous => {
+      const next = new Map<string, TorrentSummary>()
+      for (const hash of hashes) {
+        const snapshot = records?.get(hash) ?? currentByHash.get(hash) ?? previous.get(hash)
+        if (snapshot) next.set(hash, snapshot)
+      }
+      return next
+    })
+    setSelected(selectedHashes)
+    setSelectionAnchor(hashes[hashes.length - 1] ?? null)
+    setDetailHash(current => {
+      const shouldOpen = detailAutoDisplay || Boolean(current)
+      if (!shouldOpen || hashes.length === 0) return null
+      return current && selectedHashes.has(current) ? current : hashes[0]
+    })
   }
 
   const [selectingAllMatching, setSelectingAllMatching] = useState(false)
@@ -475,6 +558,7 @@ export function App() {
     setSelectingAllMatching(true)
     try {
       const selectedHashes = new Set<string>()
+      const selectedRecords = new Map<string, TorrentSummary>()
       const pageSize = 5000
       let offset = 0
       let snapshot: number | undefined
@@ -491,12 +575,15 @@ export function App() {
         })
         matchingTotal = page.total
         snapshot = page.snapshot
-        page.torrents.forEach(torrent => selectedHashes.add(torrent.hash))
+        page.torrents.forEach(torrent => {
+          selectedHashes.add(torrent.hash)
+          selectedRecords.set(torrent.hash, torrent)
+        })
         if (page.torrents.length === 0) break
         offset += page.torrents.length
       } while (offset < matchingTotal)
 
-      handleSelectAll([...selectedHashes])
+      handleSelectAll([...selectedHashes], selectedRecords)
     } catch {
       setActionNotice({ text: 'Failed to select all matching torrents', tone: 'error' })
     } finally {
@@ -511,6 +598,23 @@ export function App() {
       // The current tab still honors the setting.
     }
     setDetailAutoDisplay(enabled)
+  }
+
+  function updateDetailPosition(position: DetailPosition) {
+    try {
+      localStorage.setItem(DETAIL_POSITION_KEY, position)
+    } catch {
+      // The current tab still honors the setting.
+    }
+    setDetailPosition(position)
+  }
+
+  function clearSelection() {
+    const wasMultiSelect = selected.size > 1
+    setSelected(new Set())
+    setSelectionAnchor(null)
+    setSelectedSnapshots(new Map())
+    if (wasMultiSelect) setDetailHash(null)
   }
 
   function openAutoDetail(hash: string | null) {
@@ -529,6 +633,9 @@ export function App() {
     detailHash ? torrents.find(t => t.hash === detailHash) : undefined
   const propertiesTorrent: TorrentSummary | undefined =
     propertiesHash ? torrents.find(t => t.hash === propertiesHash) : undefined
+  const selectedDetailTorrents = [...selected]
+    .map(hash => selectedSnapshots.get(hash) ?? torrents.find(torrent => torrent.hash === hash))
+    .filter((torrent): torrent is TorrentSummary => Boolean(torrent))
 
   async function runBulk(action: 'start' | 'stop' | 'recheck' | 'reannounce') {
     const hashes = [...selected]
@@ -548,6 +655,7 @@ export function App() {
 
   async function toggleSequential(hashes: string[]) {
     if (hashes.length === 0) return
+    setToolbarBusy(true)
     setActionNotice(null)
     try {
       await api.torrents.toggleSequential(hashes)
@@ -555,6 +663,8 @@ export function App() {
       setActionNotice({ text: `Sequential toggled for ${hashes.length.toLocaleString()} torrent${hashes.length === 1 ? '' : 's'}`, tone: 'ok' })
     } catch {
       setActionNotice({ text: 'Failed to toggle sequential download', tone: 'error' })
+    } finally {
+      setToolbarBusy(false)
     }
   }
 
@@ -604,6 +714,12 @@ export function App() {
         next.delete(torrent.hash)
         return next
       })
+      setSelectedSnapshots(prev => {
+        const next = new Map(prev)
+        next.delete(torrent.hash)
+        return next
+      })
+      if (selectionAnchor === torrent.hash) setSelectionAnchor(null)
       if (detailHash === torrent.hash) setDetailHash(null)
       qc.invalidateQueries({ queryKey: ['torrents'], exact: false })
       setActionNotice({ text: deleteFiles ? 'Torrent and files deleted' : 'Torrent removed', tone: 'ok' })
@@ -616,7 +732,7 @@ export function App() {
     setAuthMessage('')
     await api.auth.login(username, password)
     setAuthState('authenticated')
-    setSelected(new Set())
+    clearSelection()
     setDetailHash(null)
     await qc.invalidateQueries()
   }
@@ -624,7 +740,7 @@ export function App() {
   async function handleLogout() {
     await api.auth.logout()
     setAuthState('unauthenticated')
-    setSelected(new Set())
+    clearSelection()
     setDetailHash(null)
     setLiveStats({ upload_speed: 0, download_speed: 0 })
     qc.clear()
@@ -645,7 +761,7 @@ export function App() {
 
   if (authState === 'checking') {
     return (
-      <div className="tng-card tng-standby-card" style={{
+      <div className="tng-card tng-standby-card" role="status" aria-live="polite" style={{
         minHeight: '100vh', background: 'var(--bg)', color: 'var(--faint)',
         display: 'grid', placeItems: 'center', fontSize: 13, padding: 24,
       }}>
@@ -654,7 +770,7 @@ export function App() {
           border: '1px solid var(--border)', borderRadius: 8,
           background: 'var(--panel)', padding: '18px 22px',
         }}>
-          <span style={{
+          <span aria-hidden="true" style={{
             width: 22, height: 22, borderRadius: '50%',
             border: '2px solid var(--border-strong)', borderTopColor: 'var(--accent)',
             animation: 'tng-spin 800ms linear infinite',
@@ -674,6 +790,7 @@ export function App() {
       display: 'flex', flexDirection: 'column', height: '100vh', width: '100vw',
       overflow: 'hidden', background: 'var(--bg)', color: 'var(--text)',
     }}>
+      <a className="tng-skip-link" href="#tng-main-content">Skip to main content</a>
       {/* Topbar */}
       <header className="tng-topbar" style={{
         height: 44, background: 'var(--bg)', borderBottom: '1px solid var(--border)',
@@ -695,6 +812,7 @@ export function App() {
           {(['torrents', 'settings'] as View[]).map(v => (
             <button
               key={v}
+              type="button"
               onPointerEnter={() => { if (v === 'settings') preloadSettingsSection(settingsSection) }}
               onFocus={() => { if (v === 'settings') preloadSettingsSection(settingsSection) }}
               onClick={() => {
@@ -710,14 +828,14 @@ export function App() {
               whiteSpace: 'nowrap', flex: '0 0 auto', display: 'inline-flex', alignItems: 'center', gap: 6,
               fontWeight: view === v ? 800 : 600,
             }}>
-              <span style={{ color: view === v ? 'var(--accent-text)' : 'var(--accent)' }}>{v === 'torrents' ? '▤' : '⚙'}</span>
+              <span aria-hidden="true" style={{ color: view === v ? 'var(--accent-text)' : 'var(--accent)' }}>{v === 'torrents' ? '▤' : '⚙'}</span>
               {v}
             </button>
           ))}
         </nav>
 
         {view === 'torrents' && (
-          <span className="tng-topbar-pill" data-tone="neutral" style={{
+          <span className="tng-topbar-pill" data-tone="neutral" role="status" aria-label={`${total.toLocaleString()} torrents`} style={{
             color: 'var(--muted)', background: 'var(--surface)', border: '1px solid var(--border)',
             borderRadius: 999, padding: '2px 8px', fontSize: 11, fontWeight: 700,
             whiteSpace: 'nowrap', flex: '0 0 auto',
@@ -726,7 +844,7 @@ export function App() {
           </span>
         )}
         {selected.size > 0 && view === 'torrents' && (
-          <span className="tng-topbar-pill" data-tone="accent" style={{
+          <span className="tng-topbar-pill" data-tone="accent" role="status" aria-label={`${selected.size.toLocaleString()} selected`} style={{
             color: 'var(--accent-text)', background: 'var(--accent-soft)', border: '1px solid var(--accent)',
             borderRadius: 999, padding: '2px 8px', fontSize: 11, fontWeight: 800,
             whiteSpace: 'nowrap', flex: '0 0 auto',
@@ -734,20 +852,20 @@ export function App() {
             {selected.size.toLocaleString()} selected
           </span>
         )}
-        <button onClick={() => setHelpOpen(true)} title="Help and links" style={{
+        <button type="button" onClick={() => setHelpOpen(true)} title="Help and links" style={{
           background: 'transparent', border: '1px solid var(--border-strong)', borderRadius: 5,
           color: 'var(--muted)', padding: '3px 10px', fontSize: 12, cursor: 'pointer',
           whiteSpace: 'nowrap', flex: '0 0 auto',
         }}>Help</button>
 
-        <span className="tng-topbar-pill" data-tone={backendHealth.connected ? 'ok' : 'error'} title="Selected backend connection state" style={{
+        <span className="tng-topbar-pill" data-tone={backendHealth.connected ? 'ok' : 'error'} role="status" aria-label={`Backend ${backendHealth.label}`} title="Selected backend connection state" style={{
           fontSize: 11, color: backendHealth.connected ? 'var(--success)' : 'var(--danger)',
           display: 'flex', alignItems: 'center', gap: 5, padding: '2px 7px',
           border: '1px solid ' + (backendHealth.connected ? 'color-mix(in srgb, var(--success) 42%, var(--border))' : 'color-mix(in srgb, var(--danger) 42%, var(--border))'),
           borderRadius: 999,
           background: backendHealth.connected ? 'color-mix(in srgb, var(--success) 9%, transparent)' : 'color-mix(in srgb, var(--danger) 9%, transparent)',
         }}>
-          <span style={{
+          <span aria-hidden="true" style={{
             width: 6, height: 6, borderRadius: '50%',
             background: backendHealth.connected ? 'var(--success)' : 'var(--danger)',
             display: 'inline-block',
@@ -756,7 +874,7 @@ export function App() {
         </span>
 
         {healthUtp && (
-          <span className="tng-topbar-pill" data-tone={healthUtp.enabled ? 'ok' : 'neutral'} title={healthUtp.title} style={{
+          <span className="tng-topbar-pill" data-tone={healthUtp.enabled ? 'ok' : 'neutral'} role="status" aria-label={`uTP ${healthUtp.label}`} title={healthUtp.title} style={{
             fontSize: 11,
             color: healthUtp.enabled ? 'var(--success)' : 'var(--muted)',
             display: 'flex', alignItems: 'center', gap: 5, padding: '2px 7px',
@@ -796,14 +914,17 @@ export function App() {
             ))}
           </select>
           <button
+            type="button"
             onClick={() => setThemeMode(mode => mode === 'dark' ? 'light' : 'dark')}
             title="Toggle light/dark theme"
+            aria-label={`Switch to ${themeMode === 'dark' ? 'light' : 'dark'} theme`}
+            aria-pressed={themeMode === 'dark'}
             style={themeButtonStyle}
           >
             {themeMode === 'dark' ? 'Dark' : 'Light'}
           </button>
         </div>
-        <button onClick={handleLogout} title="Log out" style={{
+        <button type="button" onClick={handleLogout} title="Log out" style={{
           background: 'transparent', border: '1px solid var(--border-strong)', borderRadius: 5,
           color: 'var(--muted)', padding: '3px 10px', fontSize: 12, cursor: 'pointer',
           whiteSpace: 'nowrap', flex: '0 0 auto',
@@ -824,14 +945,14 @@ export function App() {
             onProperties={() => setPropertiesHash([...selected][0] ?? null)}
             onEditSelected={() => setBulkEditOpen(true)}
             onSequential={() => toggleSequential([...selected])}
-            onClearSelection={() => setSelected(new Set())}
+            onClearSelection={clearSelection}
             onHelp={() => setHelpOpen(true)}
             busy={toolbarBusy}
           />
         </nav>
       )}
       {/* Main content */}
-      <main className="tng-main" style={{ flex: 1, minWidth: 0, display: 'flex', overflow: 'hidden' }}>
+      <main id="tng-main-content" className="tng-main" tabIndex={-1} style={{ flex: 1, minWidth: 0, display: 'flex', overflow: 'hidden' }}>
         {view === 'settings' && (
           <SettingsView
             section={settingsSection}
@@ -848,16 +969,17 @@ export function App() {
 
         {view === 'torrents' && (
           <>
-            <TorrentSidebar
-              params={params}
-              total={total}
-              mediaInference={mediaInference}
-              onChange={updateParams}
-              onApply={applySavedView}
-            />
-            <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+          <TorrentSidebar
+            params={params}
+            total={total}
+            mediaInference={mediaInference}
+            onChange={updateParams}
+            onApply={applySavedView}
+          />
+            <div className="tng-torrent-workspace" data-detail-position={detailPosition}>
+              <div className="tng-torrent-table-pane">
               {query.isError && (
-                <div style={{
+                <div role="alert" aria-live="assertive" style={{
                   padding: 24, color: 'var(--danger)', textAlign: 'center',
                   display: 'grid', placeItems: 'center', gap: 10,
                 }}>
@@ -869,7 +991,7 @@ export function App() {
                     <span style={{ fontWeight: 800 }}>Failed to connect to TorrentNG API.</span>
                     <span style={{ color: 'var(--faint)', fontSize: 12 }}>The table will refresh when the API responds again.</span>
                   </div>
-                  <button onClick={() => query.refetch()} style={{
+                  <button type="button" onClick={() => query.refetch()} style={{
                     background: 'var(--surface-2)', border: '1px solid var(--border-strong)',
                     borderRadius: 5, color: 'var(--muted)', padding: '5px 10px', fontSize: 12,
                     cursor: 'pointer',
@@ -877,7 +999,7 @@ export function App() {
                 </div>
               )}
               {query.isLoading && !query.data && (
-                <div style={{
+                <div role="status" aria-live="polite" aria-label="Loading torrents" style={{
                   padding: 24, color: 'var(--faint)', display: 'grid', gap: 10,
                   alignContent: 'start',
                 }}>
@@ -905,32 +1027,49 @@ export function App() {
                   onDetail={openAutoDetail}
                   onContextMenu={(torrent, x, y) => {
                     setContextMenu({ torrent, x, y })
-                    setSelected(prev => {
-                      if (prev.has(torrent.hash)) return prev
-                      const next = new Set(prev)
-                      next.add(torrent.hash)
-                      return next
-                    })
-                    if (detailAutoDisplay) setDetailHash(torrent.hash)
+                    if (selected.has(torrent.hash)) {
+                      if (detailAutoDisplay) setDetailHash(torrent.hash)
+                    } else {
+                      handleSelect(torrent.hash, 'replace')
+                    }
                   }}
                   onSort={handleSort}
                   onLoadMore={() => query.fetchNextPage()}
                   hasMore={query.hasNextPage ?? false}
                   isFetchingMore={query.isFetchingNextPage}
-                  detailHash={detailHash}
+                  detailHash={selected.size > 1 ? null : detailHash}
                   mediaInference={mediaInference}
                 />
               )}
-            </div>
+              </div>
 
-            {detailTorrent && (
+            {detailHash && selected.size > 1 ? (
+              <TorrentSelectionPanel
+                torrents={selectedDetailTorrents}
+                selectedCount={selected.size}
+                position={detailPosition}
+                onPositionChange={updateDetailPosition}
+                onClose={() => setDetailHash(null)}
+                onStart={() => runBulk('start')}
+                onStop={() => runBulk('stop')}
+                onRecheck={() => runBulk('recheck')}
+                onReannounce={() => runBulk('reannounce')}
+                onEdit={() => setBulkEditOpen(true)}
+                onSequential={() => toggleSequential([...selected])}
+                onClearSelection={clearSelection}
+                busy={toolbarBusy}
+              />
+            ) : detailTorrent && (
               <TorrentDetail
                 torrent={detailTorrent}
                 onClose={() => setDetailHash(null)}
                 autoDisplay={detailAutoDisplay}
                 onAutoDisplayChange={updateDetailAutoDisplay}
+                position={detailPosition}
+                onPositionChange={updateDetailPosition}
               />
             )}
+            </div>
           </>
         )}
       </main>
@@ -998,23 +1137,23 @@ function StandbyScreen({ onTakeOver }: { onTakeOver: () => void }) {
       minHeight: '100vh', background: 'var(--bg)', color: 'var(--text)',
       display: 'grid', placeItems: 'center', padding: 24,
     }}>
-      <div style={{
+      <div role="status" aria-live="polite" style={{
         width: 'min(460px, 100%)', border: '1px solid var(--border)', borderRadius: 8,
         background: 'var(--panel)', padding: 20, display: 'flex', flexDirection: 'column', gap: 12,
         boxShadow: '0 24px 60px var(--shadow)',
       }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-          <span style={{
+          <span aria-hidden="true" style={{
             width: 30, height: 30, borderRadius: 8, display: 'inline-grid', placeItems: 'center',
             color: 'var(--accent-text)', background: 'var(--accent-soft)', border: '1px solid var(--accent)',
             fontWeight: 900,
           }}>▣</span>
-          <div style={{ fontWeight: 800, fontSize: 18 }}>TorrentNG is open in another tab</div>
+          <h1 style={{ margin: 0, fontWeight: 800, fontSize: 18 }}>TorrentNG is open in another tab</h1>
         </div>
         <div style={{ color: 'var(--muted)', fontSize: 13, lineHeight: 1.45 }}>
           This standby tab is not connected to the API or websocket. Use one active tab for large libraries.
         </div>
-        <button onClick={onTakeOver} style={{
+        <button type="button" onClick={onTakeOver} style={{
           width: 'fit-content', background: 'var(--accent-soft)', border: '1px solid var(--accent)',
           borderRadius: 5, color: 'var(--accent-text)', padding: '7px 11px', fontSize: 13, cursor: 'pointer',
         }}>Take over this tab</button>
@@ -1049,12 +1188,12 @@ function SettingsView({ section, onSection, mediaInference, onMediaInference, th
   }
   return (
     <>
-      <aside className="tng-settings-sidebar" style={{
+      <aside className="tng-settings-sidebar" aria-label="Settings sections" style={{
         width: 220, flexShrink: 0, background: 'var(--panel)', borderRight: '1px solid var(--border)',
         padding: 12,
       }}>
         <div style={{ margin: '4px 4px 12px' }}>
-          <div style={{ fontSize: 16, fontWeight: 800, color: 'var(--text)' }}>Settings</div>
+          <h2 style={{ margin: 0, fontSize: 16, fontWeight: 800, color: 'var(--text)' }}>Settings</h2>
           <div style={{ fontSize: 11, color: 'var(--faint)', marginTop: 3 }}>Daemon, library, and browser controls</div>
         </div>
         <div role="tablist" aria-label="Settings sections" aria-orientation="vertical">
@@ -1152,11 +1291,11 @@ function SettingsView({ section, onSection, mediaInference, onMediaInference, th
           }}>
             <SupportCard icon="☊" title="Discord support" href="https://discord.gg/5PyXBfvS6T" detail="Community support and release discussion" />
             <SupportCard icon="⌘" title="GitHub project" href="https://github.com/snapetech/TorrentNG" detail="Source, issues, and deployment files" />
-            <button onClick={() => window.dispatchEvent(new KeyboardEvent('keydown', { key: '?' }))} style={{
+            <button type="button" onClick={() => window.dispatchEvent(new KeyboardEvent('keydown', { key: '?' }))} style={{
               ...supportButton, width: '100%', minHeight: 72, textAlign: 'left',
               display: 'grid', gridTemplateColumns: '32px 1fr', alignItems: 'center',
             }}>
-              <span style={{ fontSize: 18, textAlign: 'center' }}>?</span>
+              <span aria-hidden="true" style={{ fontSize: 18, textAlign: 'center' }}>?</span>
               <span>
                 <span style={{ display: 'block', fontWeight: 700 }}>Open help</span>
                 <span style={{ display: 'block', color: 'var(--faint)', fontSize: 12, marginTop: 2 }}>Shortcuts and workflow notes</span>
@@ -1198,7 +1337,7 @@ function PanelTitle({ title, subtitle }: { title: string; subtitle: string }) {
           background: 'linear-gradient(180deg, var(--accent), var(--success))',
         }} />
         <div>
-          <div style={{ fontSize: 17, fontWeight: 800, color: 'var(--text)' }}>{title}</div>
+          <h2 style={{ margin: 0, fontSize: 17, fontWeight: 800, color: 'var(--text)' }}>{title}</h2>
           <div style={{ marginTop: 3, fontSize: 12, color: 'var(--faint)' }}>{subtitle}</div>
         </div>
       </div>
@@ -1216,6 +1355,8 @@ function DeleteDialog({ torrent, onCancel, onRemove, onRemoveFiles }: {
   onRemove: () => void
   onRemoveFiles: () => void
 }) {
+  const dialogRef = useDialogFocus(onCancel)
+
   return (
     <div className="tng-modal-backdrop" role="presentation" onMouseDown={e => {
       if (e.target === e.currentTarget) onCancel()
@@ -1223,7 +1364,7 @@ function DeleteDialog({ torrent, onCancel, onRemove, onRemoveFiles }: {
       position: 'fixed', inset: 0, background: 'rgba(2,6,23,0.72)', zIndex: 1150,
       display: 'grid', placeItems: 'center', padding: 24,
     }}>
-      <div className="tng-modal tng-delete-dialog" role="dialog" aria-modal="true" aria-label={`Delete ${torrent.name}`} style={{
+      <div ref={dialogRef} className="tng-modal tng-delete-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-torrent-title" aria-describedby="delete-torrent-description" tabIndex={-1} style={{
         width: 'min(480px, 100%)', background: 'var(--panel)', border: '1px solid var(--danger)',
         borderRadius: 8, boxShadow: '0 24px 60px var(--shadow)',
       }}>
@@ -1235,10 +1376,10 @@ function DeleteDialog({ torrent, onCancel, onRemove, onRemoveFiles }: {
               border: '1px solid color-mix(in srgb, var(--danger) 45%, var(--border))',
               color: 'var(--danger)', fontWeight: 800,
             }}>!</span>
-            <div style={{ fontSize: 16, fontWeight: 800, color: 'var(--danger)' }}>Delete torrent</div>
+            <h2 id="delete-torrent-title" style={{ margin: 0, fontSize: 16, fontWeight: 800, color: 'var(--danger)' }}>Delete torrent</h2>
           </div>
           <div style={{ marginTop: 8, color: 'var(--text)', fontSize: 13, lineHeight: 1.4, wordBreak: 'break-word' }}>{torrent.name}</div>
-          <div style={{
+          <div id="delete-torrent-description" style={{
             marginTop: 10, color: 'var(--faint)', fontSize: 12, lineHeight: 1.45,
             border: '1px solid var(--border)', borderRadius: 6, background: 'var(--surface)', padding: 9,
           }}>
@@ -1246,9 +1387,9 @@ function DeleteDialog({ torrent, onCancel, onRemove, onRemoveFiles }: {
           </div>
         </div>
         <div style={{ padding: 14, display: 'flex', justifyContent: 'flex-end', gap: 8, flexWrap: 'wrap' }}>
-          <button onClick={onCancel} style={dialogButton('#64748b')}>Cancel</button>
-          <button onClick={onRemove} style={dialogButton('#f87171')}>Remove torrent</button>
-          <button onClick={onRemoveFiles} style={dialogButton('#ef4444')}>Delete files</button>
+          <button type="button" onClick={onCancel} data-dialog-initial-focus style={dialogButton('var(--muted)')}>Cancel</button>
+          <button type="button" onClick={onRemove} style={dialogButton('#f87171')}>Remove torrent</button>
+          <button type="button" onClick={onRemoveFiles} style={dialogButton('var(--danger)')}>Delete files</button>
         </div>
       </div>
     </div>
@@ -1275,7 +1416,7 @@ function SupportCard({ icon, title, href, detail }: { icon: string; title: strin
       background: 'var(--surface)',
       padding: 12,
     }} href={href} target="_blank" rel="noreferrer">
-      <span style={{ color: 'var(--accent)', fontSize: 18, textAlign: 'center' }}>{icon}</span>
+      <span aria-hidden="true" style={{ color: 'var(--accent)', fontSize: 18, textAlign: 'center' }}>{icon}</span>
       <span>
         <span style={{ display: 'block', color: 'var(--text)', fontWeight: 700 }}>{title}</span>
         <span style={{ display: 'block', color: 'var(--faint)', fontSize: 12, marginTop: 2 }}>{detail}</span>
@@ -1299,9 +1440,9 @@ const supportButton: React.CSSProperties = {
 function dialogButton(color: string): React.CSSProperties {
   return {
     background: 'var(--surface-2)',
-    border: `1px solid ${color}66`,
+    border: `1px solid color-mix(in srgb, ${color} 42%, var(--border))`,
     borderRadius: 5,
-    color,
+    color: `color-mix(in srgb, ${color} 78%, var(--text))`,
     padding: '6px 10px',
     fontSize: 12,
     cursor: 'pointer',
@@ -1344,11 +1485,11 @@ function LoginScreen({ message, onLogin }: {
       }}>
         <div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <span style={{
+            <span aria-hidden="true" style={{
               width: 10, height: 10, borderRadius: 3,
               background: 'linear-gradient(135deg, var(--accent), var(--success))',
             }} />
-            <div style={{ fontWeight: 800, fontSize: 18 }}>TorrentNG</div>
+            <h1 style={{ margin: 0, fontWeight: 800, fontSize: 18 }}>TorrentNG</h1>
           </div>
           <div style={{ color: 'var(--faint)', fontSize: 12, marginTop: 4 }}>Sign in to manage torrents</div>
         </div>
@@ -1382,13 +1523,13 @@ function LoginScreen({ message, onLogin }: {
             }}
           />
         </label>
-        {error && <div style={{
+        {error && <div role="alert" aria-live="assertive" style={{
           color: 'var(--danger)', fontSize: 12,
           background: 'color-mix(in srgb, var(--danger) 9%, var(--surface))',
           border: '1px solid color-mix(in srgb, var(--danger) 45%, var(--border))',
           borderRadius: 6, padding: '8px 9px',
         }}>{error}</div>}
-        <button disabled={busy} style={{
+        <button type="submit" disabled={busy} style={{
           marginTop: 4, background: busy ? 'var(--surface-2)' : 'var(--accent-soft)',
           border: '1px solid var(--accent)', borderRadius: 5, color: 'var(--accent-text)',
           padding: '8px 12px', fontSize: 13, cursor: busy ? 'default' : 'pointer',

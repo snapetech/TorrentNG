@@ -3,6 +3,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../api/client'
 import type { TorrentSummary } from '../api/client'
 import { TrackerUrl } from '../lib/maskUrl'
+import { DetailDockControls, type DetailPosition } from './DetailDockControls'
 
 function fmtSize(bytes: number): string {
   if (bytes >= 1e12) return (bytes / 1e12).toFixed(2) + ' TB'
@@ -26,6 +27,8 @@ interface Props {
   onClose: () => void
   autoDisplay: boolean
   onAutoDisplayChange: (enabled: boolean) => void
+  position: DetailPosition
+  onPositionChange: (position: DetailPosition) => void
 }
 
 const LABEL: React.CSSProperties = {
@@ -43,7 +46,7 @@ function ActionBtn({
   label, color, onClick, disabled,
 }: { label: string; color: string; onClick: () => void; disabled?: boolean }) {
   return (
-    <button onClick={onClick} disabled={disabled} style={{
+    <button type="button" onClick={onClick} disabled={disabled} style={{
       background: 'var(--surface-2)',
       // NOTE: color is a var(--token) reference, not a hex string - a
       // "${color}55" suffix (previously used here) is not valid CSS and the
@@ -63,7 +66,7 @@ function ActionBtn({
   )
 }
 
-export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayChange }: Props) {
+export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayChange, position, onPositionChange }: Props) {
   const qc = useQueryClient()
   const [busy, setBusy] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
@@ -156,8 +159,8 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
           : { label: 'Queued', color: 'var(--muted)' }
 
   return (
-    <aside className="torrent-detail" aria-label="Torrent details" style={{
-      width: 340, background: 'var(--bg)', borderLeft: '1px solid var(--border)',
+    <aside className="torrent-detail" data-position={position} aria-labelledby="torrent-detail-title" style={{
+      width: 340, background: 'var(--bg)',
       display: 'flex', flexDirection: 'column', flexShrink: 0, fontSize: 12,
     }}>
       {/* Header */}
@@ -166,9 +169,9 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
         display: 'flex', alignItems: 'flex-start', gap: 8,
       }}>
         <div style={{ flex: 1, minWidth: 0 }}>
-          <span style={{ display: 'block', fontWeight: 700, fontSize: 13, color: 'var(--text)', lineHeight: 1.3, overflowWrap: 'anywhere' }}>
+          <h2 id="torrent-detail-title" style={{ margin: 0, display: 'block', fontWeight: 700, fontSize: 13, color: 'var(--text)', lineHeight: 1.3, overflowWrap: 'anywhere' }}>
             {t.name}
-          </span>
+          </h2>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 7 }}>
             <Pill color={state.color}>{state.label}</Pill>
             {t.complete && <Pill color="var(--success)">Complete</Pill>}
@@ -176,7 +179,8 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
             {t.up_rate > 0 && <Pill color="var(--success)">UL {fmtSpeed(t.up_rate)}</Pill>}
           </div>
         </div>
-        <button onClick={onClose} title="Hide details" aria-label="Hide details" style={{
+        <DetailDockControls position={position} onChange={onPositionChange} />
+        <button type="button" onClick={onClose} title="Hide details" aria-label="Hide details" style={{
           background: 'var(--surface-2)', border: '1px solid var(--border-strong)', borderRadius: 5,
           cursor: 'pointer', color: 'var(--muted)', fontSize: 16, lineHeight: 1,
           width: 28, height: 28, padding: 0, flexShrink: 0,
@@ -191,6 +195,7 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
         <span>Auto-display details on selection</span>
         <input
           type="checkbox"
+          aria-label="Automatically show details when a torrent is selected"
           checked={autoDisplay}
           onChange={e => onAutoDisplayChange(e.target.checked)}
           style={{ accentColor: 'var(--accent)', cursor: 'pointer', flexShrink: 0 }}
@@ -201,7 +206,7 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
         padding: '6px 14px', borderBottom: '1px solid var(--border)',
         display: 'flex', justifyContent: 'flex-end',
       }}>
-        <button onClick={onClose} style={{
+        <button type="button" onClick={onClose} style={{
           background: 'transparent', border: '1px solid var(--border-strong)', borderRadius: 5,
           color: 'var(--muted)', padding: '3px 9px', fontSize: 11, cursor: 'pointer',
         }}>Hide panel</button>
@@ -223,7 +228,7 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
 
       {/* Delete confirmation */}
       {error && (
-        <div style={{
+        <div role="alert" aria-live="assertive" style={{
           padding: '7px 14px', borderBottom: '1px solid var(--danger)',
           background: 'color-mix(in srgb, var(--danger) 10%, var(--panel))',
           color: 'var(--danger)', fontSize: 11, overflowWrap: 'anywhere',
@@ -233,23 +238,23 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
       )}
 
       {confirmDelete && (
-        <div style={{
+        <div role="alertdialog" aria-label={`Delete ${t.name}`} aria-describedby="torrent-detail-delete-description" style={{
           padding: '10px 14px', background: 'color-mix(in srgb, var(--danger) 12%, var(--panel))', borderBottom: '1px solid var(--danger)',
           fontSize: 12,
         }}>
-          <div style={{ color: 'var(--danger)', marginBottom: 8 }}>Delete "{t.name}"?</div>
+          <div id="torrent-detail-delete-description" style={{ color: 'var(--danger)', marginBottom: 8 }}>Delete "{t.name}"?</div>
           <div style={{ display: 'flex', gap: 6 }}>
-            <button disabled={busy} onClick={() => remove(false)} style={{
+            <button type="button" disabled={busy} onClick={() => remove(false)} style={{
               background: 'color-mix(in srgb, var(--danger) 18%, var(--surface-2))', border: 'none', borderRadius: 4,
               color: 'var(--danger)', padding: '3px 10px', fontSize: 11,
               cursor: busy ? 'not-allowed' : 'pointer', opacity: busy ? 0.55 : 1,
             }}>Remove torrent</button>
-            <button disabled={busy} onClick={() => remove(true)} style={{
+            <button type="button" disabled={busy} onClick={() => remove(true)} style={{
               background: 'color-mix(in srgb, var(--danger) 28%, var(--surface-2))', border: 'none', borderRadius: 4,
               color: 'var(--danger)', padding: '3px 10px', fontSize: 11,
               cursor: busy ? 'not-allowed' : 'pointer', opacity: busy ? 0.55 : 1,
             }}>+ Delete files</button>
-            <button disabled={busy} onClick={() => setConfirmDelete(false)} style={{
+            <button type="button" disabled={busy} onClick={() => setConfirmDelete(false)} style={{
               background: 'none', border: '1px solid var(--border-strong)', borderRadius: 4,
               color: 'var(--faint)', padding: '3px 8px', fontSize: 11,
               cursor: busy ? 'not-allowed' : 'pointer', opacity: busy ? 0.55 : 1,
@@ -267,7 +272,7 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
             <span style={{ fontSize: 11, color: 'var(--faint)' }}>Progress</span>
             <span style={{ fontSize: 11, color: 'var(--muted)' }}>{progress.toFixed(1)}%</span>
           </div>
-          <div style={{ height: 4, background: 'var(--surface-2)', borderRadius: 2, overflow: 'hidden' }}>
+          <div role="progressbar" aria-label={`Download progress for ${t.name}`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.min(100, Math.max(0, progress))} style={{ height: 4, background: 'var(--surface-2)', borderRadius: 2, overflow: 'hidden' }}>
             <div style={{
               width: `${progress}%`, height: '100%',
               background: progress >= 100 ? 'var(--success)' : 'var(--accent)', borderRadius: 2,
@@ -318,6 +323,7 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
           <div style={{ ...LABEL, flex: 1 }}>Save path</div>
           {!editingPath && (
             <button
+              type="button"
               onClick={() => {
                 setSavePath(t.directory || '')
                 setEditingPath(true)
@@ -334,6 +340,7 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
         {editingPath ? (
           <div style={{ marginBottom: 12 }}>
             <input
+              aria-label="Save path"
               value={savePath}
               onChange={e => setSavePath(e.target.value)}
               disabled={busy}
@@ -345,6 +352,7 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
             />
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 6, marginTop: 6 }}>
               <button
+                type="button"
                 onClick={() => setEditingPath(false)}
                 disabled={busy}
                 style={{
@@ -355,6 +363,7 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
                 Cancel
               </button>
               <button
+                type="button"
                 onClick={saveLocation}
                 disabled={busy || !savePath.trim()}
                 style={{
@@ -395,6 +404,7 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
           <Section title="Trackers">
             <div style={{ display: 'flex', gap: 6, marginBottom: 10 }}>
               <input
+                aria-label="New tracker URL"
                 value={newTracker}
                 onChange={e => setNewTracker(e.target.value)}
                 disabled={busy}
@@ -406,6 +416,7 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
                 }}
               />
               <button
+                type="button"
                 onClick={addTracker}
                 disabled={busy || !newTracker.trim()}
                 style={{
@@ -426,7 +437,7 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
                 padding: 8, background: ok ? 'var(--surface)' : 'color-mix(in srgb, var(--warning) 8%, var(--surface))',
               }}>
                 <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-                  <span style={{
+                  <span aria-hidden="true" style={{
                     width: 7, height: 7, borderRadius: '50%', flexShrink: 0,
                     background: ok ? 'var(--success)' : 'var(--warning)',
                   }} />
@@ -434,6 +445,7 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
                     flex: 1, minWidth: 0, fontSize: 11, color: 'var(--muted)',
                   }}><TrackerUrl url={tr.url} /></div>
                   <button
+                    type="button"
                     onClick={() => removeTracker(tr.url)}
                     disabled={busy}
                     style={{
@@ -491,7 +503,7 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
                     textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                   }} title={f.path}>{f.path.split('/').pop()}</div>
                   <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 2 }}>
-                    <div style={{ flex: 1, height: 2, background: 'var(--surface-2)', borderRadius: 1, overflow: 'hidden' }}>
+                    <div role="progressbar" aria-label={`Progress for ${f.path}`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.min(100, Math.max(0, fp))} style={{ flex: 1, height: 2, background: 'var(--surface-2)', borderRadius: 1, overflow: 'hidden' }}>
                       <div style={{ width: `${fp}%`, height: '100%', background: fp >= 100 ? 'var(--success)' : 'var(--accent)' }} />
                     </div>
                     <span style={{ fontSize: 10, color: 'var(--faint)', flexShrink: 0 }}>{fmtSize(f.size_bytes)}</span>
@@ -533,10 +545,10 @@ function Pill({ color, children }: { color: string; children: React.ReactNode })
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <div style={{ marginTop: 16 }}>
-      <div style={{
+      <h3 style={{
         fontSize: 10, fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase',
-        color: 'var(--accent)', borderBottom: '1px solid var(--border)', paddingBottom: 4, marginBottom: 8,
-      }}>{title}</div>
+        color: 'var(--accent)', borderBottom: '1px solid var(--border)', paddingBottom: 4, margin: 0, marginBottom: 8,
+      }}>{title}</h3>
       {children}
     </div>
   )
@@ -566,7 +578,7 @@ function EmptyBlock({ children }: { children: React.ReactNode }) {
 
 function Notice({ children }: { children: React.ReactNode }) {
   return (
-    <div style={{
+    <div role="alert" aria-live="assertive" style={{
       border: '1px solid color-mix(in srgb, var(--danger) 45%, var(--border))',
       borderRadius: 6,
       background: 'color-mix(in srgb, var(--danger) 9%, var(--surface))',

@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../api/client'
+import { useDialogFocus } from '../hooks/useDialogFocus'
 
 interface Props {
   hashes: string[]
@@ -22,6 +23,7 @@ export function BulkEditDialog({ hashes, onClose }: Props) {
   const [busy, setBusy] = useState(false)
   const [message, setMessage] = useState('')
   const [messageTone, setMessageTone] = useState<'ok' | 'error'>('ok')
+  const dialogRef = useDialogFocus(onClose)
 
   const { data: categories = [] } = useQuery({ queryKey: ['categories'], queryFn: api.categories.list })
   const { data: allTags = [] } = useQuery({ queryKey: ['tags'], queryFn: api.tags.list })
@@ -52,43 +54,44 @@ export function BulkEditDialog({ hashes, onClose }: Props) {
       position: 'fixed', inset: 0, background: 'rgba(2,6,23,0.72)', zIndex: 1200,
       display: 'grid', placeItems: 'center', padding: 22,
     }} onClick={e => { if (!busy && e.target === e.currentTarget) onClose() }}>
-      <div role="dialog" aria-modal="true" aria-label="Edit selected torrents" aria-busy={busy} className="tng-modal" style={{
+      <div ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="bulk-edit-title" aria-describedby="bulk-edit-description" aria-busy={busy} tabIndex={-1} className="tng-modal" style={{
         width: 'min(620px, 100%)', maxHeight: '88vh', overflowY: 'auto',
         background: 'var(--panel)', border: '1px solid var(--border-strong)', borderRadius: 8,
         boxShadow: '0 24px 60px var(--shadow)',
       }} onClick={e => e.stopPropagation()}>
         <header style={{ padding: '13px 15px', borderBottom: '1px solid var(--border)', display: 'flex', gap: 12, alignItems: 'center' }}>
           <div style={{ flex: 1 }}>
-            <div style={{ color: 'var(--text)', fontWeight: 700, fontSize: 15 }}>Edit selected torrents</div>
-            <div style={{ color: 'var(--faint)', fontSize: 12 }}>{hashes.length.toLocaleString()} torrent{hashes.length === 1 ? '' : 's'} selected</div>
+            <h2 id="bulk-edit-title" style={{ margin: 0, color: 'var(--text)', fontWeight: 700, fontSize: 15 }}>Edit selected torrents</h2>
+            <div id="bulk-edit-description" style={{ color: 'var(--faint)', fontSize: 12 }}>{hashes.length.toLocaleString()} torrent{hashes.length === 1 ? '' : 's'} selected</div>
           </div>
-          {busy && <span style={{
+          {busy && <span role="status" aria-live="polite" style={{
             color: 'var(--accent-text)', background: 'var(--accent-soft)', border: '1px solid var(--accent)',
             borderRadius: 999, padding: '2px 8px', fontSize: 11, fontWeight: 700,
           }}>Applying</span>}
-          <button onClick={onClose} disabled={busy} style={smallButton('#94a3b8', busy)}>Close</button>
+          <button type="button" onClick={onClose} disabled={busy} style={smallButton('var(--muted)', busy)}>Close</button>
         </header>
 
         <div style={{ padding: 15, display: 'grid', gap: 14 }}>
           <Field label="Category">
             <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: 8 }}>
-              <select value={category} onChange={e => setCategory(e.target.value)} disabled={busy} style={INPUT}>
+              <select aria-label="Category" value={category} onChange={e => setCategory(e.target.value)} disabled={busy} style={INPUT}>
                 <option value="">Clear category</option>
                 {categories.map(cat => <option key={cat.name} value={cat.name}>{cat.name}</option>)}
               </select>
-              <button disabled={busy} onClick={() => apply('Category applied', async () => { await api.bulk('set-category', hashes, false, { category }) })} style={smallButton('#93c5fd', busy)}>Apply</button>
+              <button type="button" disabled={busy} onClick={() => apply('Category applied', async () => { await api.bulk('set-category', hashes, false, { category }) })} style={smallButton('#93c5fd', busy)}>Apply</button>
             </div>
           </Field>
 
           <Field label="Tags">
             <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: 8 }}>
-              <input value={tags} onChange={e => setTags(e.target.value)} disabled={busy} placeholder="comma,separated,tags" style={INPUT} />
-              <button disabled={busy} onClick={() => apply('Tags applied', () => api.torrents.setTags(hashes, tagList))} style={smallButton('#93c5fd', busy)}>Set tags</button>
+              <input aria-label="Tags" value={tags} onChange={e => setTags(e.target.value)} disabled={busy} placeholder="comma,separated,tags" style={INPUT} />
+              <button type="button" disabled={busy} onClick={() => apply('Tags applied', () => api.torrents.setTags(hashes, tagList))} style={smallButton('#93c5fd', busy)}>Set tags</button>
             </div>
             {allTags.length > 0 && (
               <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap', marginTop: 7 }}>
                 {allTags.map(tag => (
                   <button
+                    type="button"
                     key={tag}
                     className="tng-tag-chip"
                     data-active={tagList.includes(tag) ? 'true' : 'false'}
@@ -103,17 +106,17 @@ export function BulkEditDialog({ hashes, onClose }: Props) {
 
           <Field label="Location">
             <div style={{ display: 'grid', gridTemplateColumns: '1fr auto auto', gap: 8 }}>
-              <input value={location} onChange={e => setLocation(e.target.value)} disabled={busy} placeholder="/downloads/category" style={{ ...INPUT, fontFamily: 'monospace' }} />
-              <button disabled={busy || !location.trim()} onClick={() => apply('Location previewed', async () => { await api.bulk('set-location', hashes, true, { save_path: location.trim() }) })} style={smallButton('#94a3b8', busy || !location.trim())}>Preview</button>
-              <button disabled={busy || !location.trim()} onClick={() => apply('Location applied', () => api.torrents.setLocation(hashes, location.trim()))} style={smallButton('#93c5fd', busy || !location.trim())}>Move</button>
+              <input aria-label="Location" value={location} onChange={e => setLocation(e.target.value)} disabled={busy} placeholder="/downloads/category" style={{ ...INPUT, fontFamily: 'monospace' }} />
+              <button type="button" disabled={busy || !location.trim()} onClick={() => apply('Location previewed', async () => { await api.bulk('set-location', hashes, true, { save_path: location.trim() }) })} style={smallButton('var(--muted)', busy || !location.trim())}>Preview</button>
+              <button type="button" disabled={busy || !location.trim()} onClick={() => apply('Location applied', () => api.torrents.setLocation(hashes, location.trim()))} style={smallButton('#93c5fd', busy || !location.trim())}>Move</button>
             </div>
           </Field>
 
           <Field label="Share limits">
             <div className="tng-action-grid-3" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr auto', gap: 8 }}>
-              <input value={ratioLimit} onChange={e => setRatioLimit(e.target.value)} disabled={busy} placeholder="Ratio -2 default, -1 unlimited" style={INPUT} />
-              <input value={seedMinutes} onChange={e => setSeedMinutes(e.target.value)} disabled={busy} placeholder="Minutes -2 default, -1 unlimited" style={INPUT} />
-              <button disabled={busy} onClick={() => apply('Share limits applied', () => api.torrents.setShareLimits(
+              <input aria-label="Ratio limit" value={ratioLimit} onChange={e => setRatioLimit(e.target.value)} disabled={busy} placeholder="Ratio -2 default, -1 unlimited" style={INPUT} />
+              <input aria-label="Seed time limit" value={seedMinutes} onChange={e => setSeedMinutes(e.target.value)} disabled={busy} placeholder="Minutes -2 default, -1 unlimited" style={INPUT} />
+              <button type="button" disabled={busy} onClick={() => apply('Share limits applied', () => api.torrents.setShareLimits(
                 hashes,
                 ratioLimit.trim() ? Number(ratioLimit) : -2,
                 seedMinutes.trim() ? Number(seedMinutes) : -2,
@@ -127,12 +130,12 @@ export function BulkEditDialog({ hashes, onClose }: Props) {
           }}>
             <div>
               <div style={{ color: 'var(--text)', fontSize: 12, fontWeight: 700 }}>Playback order</div>
-              <div style={{ color: 'var(--faint)', fontSize: 11, marginTop: 2 }}>Toggle sequential mode for every selected torrent.</div>
+              <div style={{ color: 'var(--muted)', fontSize: 11, marginTop: 2 }}>Toggle sequential mode for every selected torrent.</div>
             </div>
-            <button disabled={busy} onClick={() => apply('Sequential toggled', () => api.torrents.toggleSequential(hashes))} style={smallButton('#f59e0b', busy)}>Toggle sequential</button>
+            <button type="button" disabled={busy} onClick={() => apply('Sequential toggled', () => api.torrents.toggleSequential(hashes))} style={{ ...smallButton('#f59e0b', busy), color: 'var(--text)' }}>Toggle sequential</button>
           </div>
 
-          {message && <div role={messageTone === 'error' ? 'alert' : 'status'} style={{
+          {message && <div role={messageTone === 'error' ? 'alert' : 'status'} aria-live={messageTone === 'error' ? 'assertive' : 'polite'} style={{
             color: messageTone === 'error' ? 'var(--danger)' : 'var(--success)', fontSize: 12,
             background: messageTone === 'error' ? 'color-mix(in srgb, var(--danger) 9%, var(--surface))' : 'color-mix(in srgb, var(--success) 8%, var(--surface))',
             border: '1px solid ' + (messageTone === 'error' ? 'color-mix(in srgb, var(--danger) 45%, var(--border))' : 'color-mix(in srgb, var(--success) 40%, var(--border))'),
@@ -145,21 +148,21 @@ export function BulkEditDialog({ hashes, onClose }: Props) {
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
-  return <label className="tng-form-card" style={{
-    display: 'grid', gap: 6, color: 'var(--faint)', fontSize: 11, fontWeight: 700,
+  return <div className="tng-form-card" role="group" aria-label={label} style={{
+    display: 'grid', gap: 6, color: 'var(--muted)', fontSize: 11, fontWeight: 700,
     textTransform: 'uppercase', background: 'var(--surface)', border: '1px solid var(--border)',
     borderRadius: 7, padding: 10,
     boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.025)',
   }}>
     <span>{label}</span>
     {children}
-  </label>
+  </div>
 }
 
 function smallButton(color: string, disabled = false): React.CSSProperties {
   return {
-    background: 'var(--surface-2)', border: `1px solid ${color}66`, borderRadius: 5,
-    color, padding: '6px 9px', fontSize: 12,
+    background: 'var(--surface-2)', border: `1px solid color-mix(in srgb, ${color} 42%, var(--border))`, borderRadius: 5,
+    color: `color-mix(in srgb, ${color} 78%, var(--text))`, padding: '6px 9px', fontSize: 12,
     cursor: disabled ? 'not-allowed' : 'pointer', opacity: disabled ? 0.55 : 1,
   }
 }

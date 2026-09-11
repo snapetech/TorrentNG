@@ -23,8 +23,8 @@ export function AppearancePanel({ mediaInference, onMediaInference, themes = [],
   const alternateMode: ThemeMode = themeMode === 'dark' ? 'light' : 'dark'
 
   return (
-    <section style={{ padding: 18 }}>
-      <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--text)', marginBottom: 4 }}>Appearance</div>
+    <section aria-labelledby="appearance-title" style={{ padding: 18 }}>
+      <h2 id="appearance-title" style={{ margin: '0 0 4px', fontSize: 14, fontWeight: 700, color: 'var(--text)' }}>Appearance</h2>
       <div style={{ fontSize: 12, color: 'var(--faint)', marginBottom: 14 }}>
         Configure presentation-only behavior for this browser.
       </div>
@@ -33,12 +33,14 @@ export function AppearancePanel({ mediaInference, onMediaInference, themes = [],
         <div className="tng-card tng-appearance-panel" style={{ ...panelStyle, marginBottom: 12 }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, marginBottom: 10 }}>
             <div>
-              <div style={{ fontSize: 12, color: 'var(--text)', fontWeight: 800 }}>Theme palette</div>
+              <h3 style={{ margin: 0, fontSize: 12, color: 'var(--text)', fontWeight: 800 }}>Theme palette</h3>
               <div style={{ fontSize: 11, color: 'var(--faint)', marginTop: 2 }}>Preview the full shell colors used by each theme.</div>
             </div>
             <button
               type="button"
               onClick={() => onThemeMode?.(alternateMode)}
+              aria-label={`Switch to ${alternateMode} theme`}
+              aria-pressed={themeMode === 'dark'}
               style={{
                 color: 'var(--accent-text)', background: 'var(--accent-soft)', border: '1px solid var(--accent)',
                 borderRadius: 999, padding: '3px 9px', fontSize: 11, fontWeight: 800, cursor: 'pointer',
@@ -58,6 +60,8 @@ export function AppearancePanel({ mediaInference, onMediaInference, themes = [],
                   type="button"
                   className="tng-theme-card"
                   data-active={active ? 'true' : 'false'}
+                  aria-label={`${theme.label} theme${active ? ', active' : ''}`}
+                  aria-pressed={active}
                   onClick={() => onTheme?.(theme.id)}
                   style={{
                     ['--preview-bg' as string]: tokens.bg,
@@ -72,7 +76,7 @@ export function AppearancePanel({ mediaInference, onMediaInference, themes = [],
                     ['--preview-shadow' as string]: tokens.shadow,
                   }}
                 >
-                  <span className="tng-theme-card-preview">
+                  <span className="tng-theme-card-preview" aria-hidden="true">
                     <span className="tng-theme-card-bar" />
                     <span className="tng-theme-card-row" />
                     <span className="tng-theme-card-row" />
@@ -92,7 +96,7 @@ export function AppearancePanel({ mediaInference, onMediaInference, themes = [],
       <div className="tng-card tng-appearance-panel" style={panelStyle}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, marginBottom: 10 }}>
           <div>
-            <div style={{ fontSize: 12, color: 'var(--text)', fontWeight: 800 }}>Media type inference</div>
+            <h3 style={{ margin: 0, fontSize: 12, color: 'var(--text)', fontWeight: 800 }}>Media type inference</h3>
             <div style={{ fontSize: 11, color: 'var(--faint)', marginTop: 2 }}>Controls the icon and type filters only.</div>
           </div>
           <span style={{
@@ -100,6 +104,7 @@ export function AppearancePanel({ mediaInference, onMediaInference, themes = [],
             borderRadius: 999, padding: '2px 8px', fontSize: 11, fontWeight: 800,
           }}>{MODES.find(mode => mode.value === mediaInference)?.label}</span>
         </div>
+        <div role="radiogroup" aria-label="Media type inference mode">
         {MODES.map(mode => (
           <label key={mode.value} className="tng-appearance-option" data-active={mediaInference === mode.value ? 'true' : 'false'} style={{
             display: 'grid', gridTemplateColumns: 'auto 1fr auto', gap: 10, alignItems: 'start',
@@ -110,6 +115,7 @@ export function AppearancePanel({ mediaInference, onMediaInference, themes = [],
             <input
               type="radio"
               name="mediaInference"
+              aria-label={mode.label}
               checked={mediaInference === mode.value}
               onChange={() => onMediaInference(mode.value)}
               style={{ accentColor: 'var(--accent)', marginTop: 2 }}
@@ -126,6 +132,7 @@ export function AppearancePanel({ mediaInference, onMediaInference, themes = [],
             )}
           </label>
         ))}
+        </div>
       </div>
     </section>
   )

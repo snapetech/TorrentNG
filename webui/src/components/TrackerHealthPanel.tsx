@@ -39,12 +39,13 @@ export function TrackerHealthPanel({ onSelectTracker }: Props) {
   }, { torrents: 0, active: 0, errors: 0 })
 
   return (
-    <section style={{ padding: '18px 24px' }}>
+    <section aria-labelledby="tracker-health-title" style={{ padding: '18px 24px' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
-        <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--text)', flex: 1 }}>
+        <h2 id="tracker-health-title" style={{ margin: 0, fontSize: 14, fontWeight: 600, color: 'var(--text)', flex: 1 }}>
           Tracker Health
-        </div>
+        </h2>
         <button
+          type="button"
           onClick={() => refetch()}
           disabled={isFetching}
           style={{
@@ -57,10 +58,10 @@ export function TrackerHealthPanel({ onSelectTracker }: Props) {
         </button>
       </div>
 
-      {isLoading && <TrackerSkeleton />}
+      {isLoading && <div role="status" aria-label="Loading tracker health"><TrackerSkeleton /></div>}
       {error && <Notice>Tracker health unavailable</Notice>}
       {data && data.trackers.length === 0 && (
-        <div style={{
+        <div role="status" style={{
           color: 'var(--faint)', fontSize: 12, border: '1px dashed var(--border-strong)',
           borderRadius: 7, background: 'color-mix(in srgb, var(--surface) 72%, transparent)', padding: 14,
         }}>No tracker data cached yet</div>
@@ -85,16 +86,15 @@ export function TrackerHealthPanel({ onSelectTracker }: Props) {
               key={tracker.tracker}
               className="tng-card tng-tracker-row"
               data-tone={errorRatio >= 0.5 ? 'error' : errorRatio > 0 ? 'warn' : 'ok'}
-              role={onSelectTracker ? 'group' : undefined}
-              title={onSelectTracker ? `View torrents on ${hostLabel(tracker.tracker)}` : undefined}
-              onClick={onSelectTracker ? () => onSelectTracker(tracker.tracker) : undefined}
+              role="group"
+              aria-label={`${hostLabel(tracker.tracker)} tracker health`}
               style={{
                 display: 'grid',
                 gridTemplateColumns: 'minmax(220px, 1fr) 90px 90px 90px 120px',
                 minWidth: 680,
                 gap: 12,
                 alignItems: 'center',
-                cursor: onSelectTracker ? 'pointer' : undefined,
+                cursor: undefined,
                 border: `1px solid color-mix(in srgb, ${color} 45%, var(--border))`,
                 borderRadius: 6,
                 padding: '9px 12px',
@@ -104,7 +104,7 @@ export function TrackerHealthPanel({ onSelectTracker }: Props) {
             >
               <div style={{ minWidth: 0 }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-                  <span style={{ width: 7, height: 7, borderRadius: '50%', background: color, flexShrink: 0 }} />
+                  <span aria-hidden="true" style={{ width: 7, height: 7, borderRadius: '50%', background: color, flexShrink: 0 }} />
                   <span style={{
                     color: 'var(--text)', fontWeight: 700, overflow: 'hidden',
                     textOverflow: 'ellipsis', whiteSpace: 'nowrap',
@@ -114,6 +114,7 @@ export function TrackerHealthPanel({ onSelectTracker }: Props) {
                   {onSelectTracker && (
                     <button
                       type="button"
+                      aria-label={`View torrents on ${hostLabel(tracker.tracker)}`}
                       onClick={e => { e.stopPropagation(); onSelectTracker(tracker.tracker) }}
                       style={{
                         border: 0, background: 'none', padding: 0,
@@ -125,9 +126,7 @@ export function TrackerHealthPanel({ onSelectTracker }: Props) {
                     </button>
                   )}
                 </div>
-                <div
-                  onClick={e => e.stopPropagation()}
-                  style={{
+                <div style={{
                     color: 'var(--faint)', overflow: 'hidden',
                     textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: 2,
                   }}
@@ -185,7 +184,7 @@ function TrackerSkeleton() {
 
 function Notice({ children }: { children: React.ReactNode }) {
   return (
-    <div style={{
+    <div role="alert" aria-live="assertive" style={{
       color: 'var(--danger)', background: 'color-mix(in srgb, var(--danger) 9%, var(--surface))',
       border: '1px solid color-mix(in srgb, var(--danger) 45%, var(--border))',
       borderRadius: 6, padding: '8px 9px', fontSize: 12, marginBottom: 10,

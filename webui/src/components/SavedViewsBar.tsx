@@ -98,7 +98,7 @@ export function SavedViewsBar({ params, onApply }: Props) {
   }
 
   return (
-    <div className="tng-savedviews" style={{
+    <div className="tng-savedviews" role="region" aria-label="Saved views" style={{
       display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap',
       padding: '6px 12px', background: 'var(--surface)', borderBottom: '1px solid var(--border)',
       fontSize: 12,
@@ -107,10 +107,10 @@ export function SavedViewsBar({ params, onApply }: Props) {
         color: 'var(--faint)', fontWeight: 800, textTransform: 'uppercase', fontSize: 10,
         letterSpacing: 0, display: 'inline-flex', alignItems: 'center', gap: 5,
       }}>
-        <span style={{ color: 'var(--accent)' }}>◇</span>
+        <span aria-hidden="true" style={{ color: 'var(--accent)' }}>◇</span>
         Views
       </span>
-      {error && <span style={{
+      {error && <span role="alert" aria-live="assertive" style={{
         color: 'var(--danger)',
         background: 'color-mix(in srgb, var(--danger) 9%, transparent)',
         border: '1px solid color-mix(in srgb, var(--danger) 38%, var(--border))',
@@ -129,6 +129,7 @@ export function SavedViewsBar({ params, onApply }: Props) {
             overflow: 'hidden',
           }}>
             <button
+              type="button"
               onClick={() => onApply(view.params)}
               disabled={Boolean(busy)}
               title={safeViewTitle(view.params)}
@@ -143,6 +144,8 @@ export function SavedViewsBar({ params, onApply }: Props) {
               {view.name}
             </button>
             <button
+              type="button"
+              aria-label={`Delete saved view ${view.name}`}
               onClick={() => removeView(view.id)}
               disabled={Boolean(busy)}
               style={{
@@ -161,7 +164,7 @@ export function SavedViewsBar({ params, onApply }: Props) {
         <span style={{ color: 'var(--faint)', fontSize: 11 }}>No saved views yet</span>
       )}
       {hasActiveFilters && !hasSavedCurrentView && !error && (
-        <span className="tng-unsaved-view" style={{
+        <span className="tng-unsaved-view" role="status" style={{
           color: 'var(--warning)',
           background: 'color-mix(in srgb, var(--warning) 9%, transparent)',
           border: '1px solid color-mix(in srgb, var(--warning) 38%, var(--border))',
@@ -177,6 +180,7 @@ export function SavedViewsBar({ params, onApply }: Props) {
 
       <div className="tng-savedview-save" style={{ display: 'flex', alignItems: 'center', gap: 6, marginLeft: views.length ? 4 : 0 }}>
         <input
+          aria-label="Saved view name"
           value={name}
           onChange={e => setName(e.target.value)}
           onKeyDown={e => { if (e.key === 'Enter') saveView() }}
@@ -189,6 +193,7 @@ export function SavedViewsBar({ params, onApply }: Props) {
           }}
         />
         <button
+          type="button"
           onClick={saveView}
           disabled={!name.trim() || Boolean(busy)}
           style={{

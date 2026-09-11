@@ -257,3 +257,36 @@ test('Ctrl+A selects the loaded page without opening add-torrent', async ({ page
   await expect(page.getByRole('navigation', { name: 'Torrent list filters and actions' }).getByText('200 selected', { exact: true })).toBeVisible()
   await expect(page.getByRole('dialog', { name: 'Add torrent' })).toHaveCount(0)
 })
+
+test('mouse and keyboard selection support additive and range selection', async ({ page, isMobile }) => {
+  const row = (number: number) => page.getByRole('row', {
+    name: new RegExp(`TorrentNG scale fixture ${number.toString().padStart(5, '0')}`),
+  })
+  const checkbox = (number: number) => page.getByLabel(new RegExp(`(?:Select|Deselect) TorrentNG scale fixture ${number.toString().padStart(5, '0')}`)).first()
+  const target = (number: number) => isMobile ? checkbox(number) : row(number)
+  const selectedStatus = (count: number) => page.getByRole('status', { name: `${count} selected` }).first()
+
+  await target(1).click()
+  await target(4).click({ modifiers: ['Shift'] })
+  await expect(selectedStatus(4)).toBeVisible()
+  await expect(row(1)).toHaveAttribute('aria-selected', 'true')
+  await expect(row(4)).toHaveAttribute('aria-selected', 'true')
+
+  await target(6).click({ modifiers: ['Control'] })
+  await expect(selectedStatus(5)).toBeVisible()
+  await expect(row(6)).toHaveAttribute('aria-selected', 'true')
+
+  await page.keyboard.press('Escape')
+  await page.keyboard.press('Escape')
+  await target(10).click()
+  if (isMobile) await row(10).focus()
+  await page.keyboard.press('Shift+ArrowDown')
+  await page.keyboard.press('Shift+ArrowDown')
+  await expect(selectedStatus(3)).toBeVisible()
+  await expect(row(10)).toHaveAttribute('aria-selected', 'true')
+  await expect(row(12)).toHaveAttribute('aria-selected', 'true')
+
+  await page.keyboard.press('Control+Space')
+  await expect(selectedStatus(2)).toBeVisible()
+  await expect(row(12)).toHaveAttribute('aria-selected', 'false')
+})

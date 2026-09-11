@@ -1,3 +1,5 @@
+import { useDialogFocus } from '../hooks/useDialogFocus'
+
 interface Props {
   onClose: () => void
 }
@@ -8,7 +10,13 @@ const SHORTCUTS = [
   ['Esc', 'Close dialog, details, or clear selection'],
   ['Delete', 'Delete the selected torrent (with confirmation)'],
   ['Ctrl/⌘+A', 'Select every loaded torrent'],
-  ['Click row', 'Select or deselect torrent'],
+  ['Click row', 'Replace the selection with one torrent'],
+  ['Ctrl/⌘+click', 'Add or remove a torrent from the selection'],
+  ['Shift+click', 'Select a contiguous range from the anchor'],
+  ['Ctrl/⌘+Shift+click', 'Add a contiguous range to the selection'],
+  ['Arrow keys', 'Move the focused row'],
+  ['Space', 'Select the focused row using the same modifiers'],
+  ['Enter', 'Open details for the focused row'],
   ['Double click row', 'Open details'],
   ['Right click row', 'Select and open actions'],
   ['Column header', 'Sort table'],
@@ -25,12 +33,14 @@ const LINKS = [
 ]
 
 export function HelpDialog({ onClose }: Props) {
+  const dialogRef = useDialogFocus(onClose)
+
   return (
     <div className="tng-modal-backdrop" style={{
       position: 'fixed', inset: 0, background: 'rgba(2,6,23,0.72)', zIndex: 1100,
       display: 'grid', placeItems: 'center', padding: 24,
     }} onClick={e => { if (e.target === e.currentTarget) onClose() }}>
-      <div role="dialog" aria-modal="true" aria-label="Help" className="tng-modal" style={{
+      <div ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="help-dialog-title" aria-describedby="help-dialog-description" tabIndex={-1} className="tng-modal" style={{
         width: 'min(620px, 100%)', maxHeight: '80vh', overflowY: 'auto',
         background: 'var(--panel)', border: '1px solid var(--border-strong)', borderRadius: 8,
         boxShadow: '0 24px 60px var(--shadow)',
@@ -40,15 +50,15 @@ export function HelpDialog({ onClose }: Props) {
           borderBottom: '1px solid var(--border)',
         }}>
           <div style={{ flex: 1 }}>
-            <div style={{ fontSize: 16, fontWeight: 700, color: 'var(--text)' }}>Help</div>
-            <div style={{ fontSize: 12, color: 'var(--faint)', marginTop: 2 }}>TorrentNG WebUI controls and support links</div>
+            <h2 id="help-dialog-title" style={{ margin: 0, fontSize: 16, fontWeight: 700, color: 'var(--text)' }}>Help</h2>
+            <div id="help-dialog-description" style={{ fontSize: 12, color: 'var(--faint)', marginTop: 2 }}>TorrentNG WebUI controls and support links</div>
           </div>
-          <button onClick={onClose} style={closeButton}>Close</button>
+          <button type="button" onClick={onClose} data-dialog-initial-focus style={closeButton}>Close</button>
         </div>
 
         <div style={{ padding: 16, display: 'grid', gap: 18 }}>
           <section className="tng-card" style={sectionCard}>
-            <h2 style={headingStyle}>Shortcuts</h2>
+            <h3 style={headingStyle}>Shortcuts</h3>
             <div style={{ display: 'grid', gap: 6 }}>
               {SHORTCUTS.map(([key, value]) => (
                 <div key={key} className="tng-shortcut-row" style={rowStyle}>
@@ -60,7 +70,7 @@ export function HelpDialog({ onClose }: Props) {
           </section>
 
           <section className="tng-card" style={sectionCard}>
-            <h2 style={headingStyle}>Actions</h2>
+            <h3 style={headingStyle}>Actions</h3>
             <p style={textStyle}>
               Use the toolbar for selected torrents, the left sidebar for filtering and saved views,
               and the details panel for trackers, files, save path, hash, and destructive actions.
@@ -68,7 +78,7 @@ export function HelpDialog({ onClose }: Props) {
           </section>
 
           <section className="tng-card" style={sectionCard}>
-            <h2 style={headingStyle}>Links</h2>
+            <h3 style={headingStyle}>Links</h3>
             <div style={{ display: 'grid', gap: 7 }}>
               {LINKS.map(([label, href]) => (
                 <a key={href} className="tng-card-link" href={href} target="_blank" rel="noreferrer" style={linkStyle}>
@@ -87,7 +97,7 @@ export function HelpDialog({ onClose }: Props) {
 
 const headingStyle: React.CSSProperties = {
   margin: '0 0 8px',
-  color: 'var(--accent)',
+  color: 'var(--accent-text)',
   fontSize: 12,
   textTransform: 'uppercase',
   letterSpacing: '0.06em',

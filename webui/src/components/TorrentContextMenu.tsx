@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react'
 import type { TorrentSummary } from '../api/client'
+import { useDialogFocus } from '../hooks/useDialogFocus'
 
 export interface ContextMenuState {
   x: number
@@ -27,7 +28,8 @@ export function TorrentContextMenu({
   menu, onClose, onProperties, onEditSelected, onDetail, onStart, onStop, onRecheck, onReannounce, onDelete,
   onCopyHash, onCopyName, onToggleSequential,
 }: Props) {
-  const menuRef = useRef<HTMLDivElement>(null)
+  const menuRef = useDialogFocus(onClose)
+  const itemRefs = useRef<Array<HTMLButtonElement | null>>([])
   const canStop = menu.torrent.state !== 0
   const left = Math.min(menu.x, window.innerWidth - 236)
   const top = Math.min(menu.y, window.innerHeight - 356)
@@ -63,19 +65,26 @@ export function TorrentContextMenu({
     onClose()
   }
 
+  function moveMenuFocus(event: React.KeyboardEvent<HTMLDivElement>) {
+    if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return
+    const buttons = itemRefs.current.filter((button): button is HTMLButtonElement => Boolean(button))
+    if (buttons.length === 0) return
+    const current = buttons.indexOf(document.activeElement as HTMLButtonElement)
+    const nextIndex = event.key === 'Home' ? 0
+      : event.key === 'End' ? buttons.length - 1
+        : (current + (event.key === 'ArrowDown' ? 1 : -1) + buttons.length) % buttons.length
+    event.preventDefault()
+    buttons[nextIndex]?.focus()
+  }
+
   useEffect(() => {
     function onPointerDown(e: PointerEvent) {
       if (menuRef.current?.contains(e.target as Node)) return
       onClose()
     }
-    function onKeyDown(e: KeyboardEvent) {
-      if (e.key === 'Escape') onClose()
-    }
     window.addEventListener('pointerdown', onPointerDown)
-    window.addEventListener('keydown', onKeyDown)
     return () => {
       window.removeEventListener('pointerdown', onPointerDown)
-      window.removeEventListener('keydown', onKeyDown)
     }
   }, [onClose])
 
@@ -83,9 +92,11 @@ export function TorrentContextMenu({
     <div
       ref={menuRef}
       className="tng-context-menu"
+      tabIndex={-1}
       data-status={status.label.toLowerCase()}
       role="menu"
       aria-label={`Actions for ${menu.torrent.name}`}
+      onKeyDown={moveMenuFocus}
       onContextMenu={e => e.preventDefault()}
       style={{
         position: 'fixed', left: Math.max(8, left), top: Math.max(8, top), zIndex: 1000,
@@ -99,7 +110,7 @@ export function TorrentContextMenu({
       }}>
         <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{menu.torrent.name}</span>
         <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-          <span style={{
+          <span aria-hidden="true" style={{
             width: 7, height: 7, borderRadius: 999, background: status.color,
             boxShadow: `0 0 12px color-mix(in srgb, ${status.color} 45%, transparent)`,
           }} />
@@ -107,11 +118,15 @@ export function TorrentContextMenu({
           <span style={{ marginLeft: 'auto' }}>{(menu.torrent.ratio / 1000).toFixed(2)} ratio</span>
         </span>
       </div>
-      {items.map(item => item.separator ? (
-        <div key={item.label} className="tng-context-separator" style={{ height: 1, background: 'var(--border)', margin: '4px 5px' }} />
+      {items.map((item, index) => item.separator ? (
+        <div key={item.label} className="tng-context-separator" role="separator" aria-hidden="true" style={{ height: 1, background: 'var(--border)', margin: '4px 5px' }} />
       ) : (
         <button
           key={item.label}
+          type="button"
+          ref={button => {
+            itemRefs.current[index] = button
+          }}
           className="tng-context-item"
           data-danger={item.danger ? 'true' : 'false'}
           role="menuitem"

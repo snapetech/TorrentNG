@@ -196,7 +196,7 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
         borderBottom: '1px solid var(--border)', padding: '9px 10px',
       }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
-          <span style={{ color: 'var(--text)', fontWeight: 700, fontSize: 13 }}>Library</span>
+          <h2 style={{ margin: 0, color: 'var(--text)', fontWeight: 700, fontSize: 13 }}>Library</h2>
           <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
             <span style={{
               color: activeFilterCount ? 'var(--accent-text)' : 'var(--faint)',
@@ -211,6 +211,7 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
               className="tng-sidebar-mobile-toggle"
               onClick={() => setMobileOpen(o => !o)}
               aria-expanded={mobileOpen}
+              aria-controls="torrent-sidebar-body"
               style={{
                 background: 'var(--surface)', border: '1px solid var(--border-strong)', borderRadius: 5,
                 color: 'var(--muted)', padding: '3px 8px', fontSize: 11, cursor: 'pointer',
@@ -222,7 +223,7 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
         </div>
       </div>
 
-      <div className="tng-sidebar-body" data-mobile-open={mobileOpen ? 'true' : 'false'}>
+      <div id="torrent-sidebar-body" className="tng-sidebar-body" data-mobile-open={mobileOpen ? 'true' : 'false'}>
       <Section title="State" summary={facets ? `${facets.status.all?.toLocaleString() ?? total.toLocaleString()} total` : undefined}>
         {STATUS_OPTIONS.map(option => (
           <CountRow
@@ -334,7 +335,7 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
             placeholder="Tracker contains"
             style={inputStyle}
           />
-          <button style={saveStyle(true)}>Go</button>
+          <button type="submit" style={saveStyle(true)}>Go</button>
         </form>
         {trackerHealth?.trackers.slice(0, MAX_SECTION_ROWS).map(row => (
           <CountRow
@@ -379,10 +380,11 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
             Save the current filters as a named view.
           </div>
         )}
-        {viewsError && <div style={sidebarNoticeStyle}>{viewsError}</div>}
+        {viewsError && <div role="alert" aria-live="assertive" style={sidebarNoticeStyle}>{viewsError}</div>}
         {views.map(view => (
           <div key={view.id} style={savedViewRowStyle}>
             <button
+              type="button"
               onClick={() => onApply(view.params)}
               disabled={Boolean(viewsBusy)}
               title={safeViewTitle(view.params)}
@@ -391,6 +393,7 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
               <span style={labelStyle}>{view.name}</span>
             </button>
             <button
+              type="button"
               aria-label={`Delete ${view.name}`}
               onClick={() => removeView(view.id)}
               disabled={Boolean(viewsBusy)}
@@ -411,7 +414,7 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
             placeholder="Save view"
             style={inputStyle}
           />
-          <button disabled={!viewName.trim() || Boolean(viewsBusy)} onClick={saveView} style={saveStyle(Boolean(viewName.trim()) && !viewsBusy)}>
+          <button type="button" disabled={!viewName.trim() || Boolean(viewsBusy)} onClick={saveView} style={saveStyle(Boolean(viewName.trim()) && !viewsBusy)}>
             {viewsBusy === '__save__' ? '…' : 'Save'}
           </button>
         </div>
@@ -423,7 +426,7 @@ export function TorrentSidebar({ params, total, mediaInference, onChange, onAppl
           padding: '10px 12px 14px', borderTop: '1px solid var(--border)',
           boxShadow: '0 -10px 22px var(--shadow)',
         }}>
-          <button onClick={clearFilters} style={{
+          <button type="button" onClick={clearFilters} style={{
             width: '100%', background: 'transparent', border: '1px solid var(--border-strong)', borderRadius: 5,
             color: 'var(--muted)', padding: '6px 8px', fontSize: 12, cursor: 'pointer',
           }}>
@@ -447,7 +450,7 @@ function CountRow({ icon, label, active, count, maxCount, tone, onClick }: {
 }) {
   const pct = count !== undefined && maxCount ? Math.min(100, Math.max(4, (count / maxCount) * 100)) : 0
   return (
-    <button onClick={onClick} style={rowButtonStyle(active)}>
+    <button type="button" onClick={onClick} aria-pressed={active} style={rowButtonStyle(active)}>
       {count !== undefined && maxCount !== undefined && (
         <span aria-hidden="true" style={{
           position: 'absolute', left: 4, right: 4, bottom: 3, height: 2,
@@ -460,7 +463,7 @@ function CountRow({ icon, label, active, count, maxCount, tone, onClick }: {
           }} />
         </span>
       )}
-      {icon && <span style={iconStyle(active, tone)}>{icon}</span>}
+      {icon && <span aria-hidden="true" style={iconStyle(active, tone)}>{icon}</span>}
       <span style={labelStyle}>{label}</span>
       <span style={{
         color: active ? 'var(--accent-text)' : tone === 'warn' ? 'var(--warning)' : 'var(--faint)',
@@ -477,16 +480,17 @@ function CountRow({ icon, label, active, count, maxCount, tone, onClick }: {
 }
 
 function Section({ title, summary, children }: { title: string; summary?: string; children: React.ReactNode }) {
+  const headingId = `torrent-sidebar-section-${title.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`
   return (
-    <section style={{ padding: '10px 10px 8px', borderBottom: '1px solid var(--border)' }}>
-      <div style={{
+    <section aria-labelledby={headingId} style={{ padding: '10px 10px 8px', borderBottom: '1px solid var(--border)' }}>
+      <h3 id={headingId} style={{
         display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8,
         color: 'var(--faint)', fontSize: 11, fontWeight: 700, textTransform: 'uppercase',
         margin: '0 4px 7px',
       }}>
         <span>{title}</span>
         {summary && <span style={{ color: 'var(--faint)', fontWeight: 600, textTransform: 'none' }}>{summary}</span>}
-      </div>
+      </h3>
       {children}
     </section>
   )
@@ -497,7 +501,7 @@ function ToggleButton({ active, onClick, children }: {
   onClick: () => void
   children: React.ReactNode
 }) {
-  return <button onClick={onClick} style={toggleStyle(active)}>{children}</button>
+  return <button type="button" onClick={onClick} aria-pressed={active} style={toggleStyle(active)}>{children}</button>
 }
 
 const labelStyle: React.CSSProperties = {

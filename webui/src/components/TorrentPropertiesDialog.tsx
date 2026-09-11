@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, type TorrentSummary, type TorrentFile, type Tracker } from '../api/client'
 import { TrackerUrl } from '../lib/maskUrl'
+import { useDialogFocus } from '../hooks/useDialogFocus'
 
 type Tab = 'general' | 'trackers' | 'files' | 'limits'
 
@@ -32,6 +33,7 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
   const [busy, setBusy] = useState(false)
   const [message, setMessage] = useState('')
   const [messageTone, setMessageTone] = useState<'ok' | 'error'>('ok')
+  const dialogRef = useDialogFocus(onClose)
 
   const { data: categories = [] } = useQuery({ queryKey: ['categories'], queryFn: api.categories.list })
   const { data: allTags = [] } = useQuery({ queryKey: ['tags'], queryFn: api.tags.list })
@@ -79,27 +81,51 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
       position: 'fixed', inset: 0, background: 'rgba(2,6,23,0.72)', zIndex: 1200,
       display: 'grid', placeItems: 'center', padding: 22,
     }} onClick={e => { if (!busy && e.target === e.currentTarget) onClose() }}>
-      <div role="dialog" aria-modal="true" aria-label={`Properties for ${torrent.name}`} className="tng-properties-dialog tng-modal" style={{
+      <div ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="torrent-properties-title" aria-describedby="torrent-properties-description" tabIndex={-1} className="tng-properties-dialog tng-modal" style={{
         width: 'min(820px, 100%)', height: 'min(680px, 90vh)', background: 'var(--panel)',
         border: '1px solid var(--border-strong)', borderRadius: 8, display: 'flex', flexDirection: 'column',
         boxShadow: '0 24px 60px var(--shadow)',
       }} onClick={e => e.stopPropagation()}>
         <header style={{ padding: '12px 14px', borderBottom: '1px solid var(--border)', display: 'flex', gap: 12 }}>
           <div style={{ flex: 1, minWidth: 0 }}>
-            <div style={{ color: 'var(--text)', fontWeight: 700, fontSize: 15 }}>Properties</div>
-            <div style={{ color: 'var(--faint)', fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{torrent.name}</div>
+            <h2 id="torrent-properties-title" style={{ margin: 0, color: 'var(--text)', fontWeight: 700, fontSize: 15 }}>Properties</h2>
+            <div id="torrent-properties-description" style={{ color: 'var(--faint)', fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{torrent.name}</div>
           </div>
-          {busy && <span style={{
+          {busy && <span role="status" aria-live="polite" style={{
             alignSelf: 'center', color: 'var(--accent-text)', background: 'var(--accent-soft)', border: '1px solid var(--accent)',
             borderRadius: 999, padding: '2px 8px', fontSize: 11, fontWeight: 700,
           }}>Saving</span>}
-          <button onClick={onClose} disabled={busy} style={smallButton('#94a3b8', busy)}>Close</button>
+          <button type="button" onClick={onClose} disabled={busy} style={smallButton('var(--muted)', busy)}>Close</button>
         </header>
 
         <div className="tng-properties-body" style={{ display: 'flex', minHeight: 0, flex: 1 }}>
-          <nav className="tng-properties-tabs" style={{ width: 150, borderRight: '1px solid var(--border)', padding: 10 }}>
+          <nav className="tng-properties-tabs" role="tablist" aria-label="Torrent property sections" style={{ width: 150, borderRight: '1px solid var(--border)', padding: 10 }}>
             {(['general', 'trackers', 'files', 'limits'] as Tab[]).map(item => (
-              <button key={item} onClick={() => setTab(item)} disabled={busy} style={{
+              <button
+                key={item}
+                id={`torrent-properties-tab-${item}`}
+                type="button"
+                role="tab"
+                aria-selected={tab === item}
+                aria-controls={`torrent-properties-panel-${item}`}
+                tabIndex={tab === item ? 0 : -1}
+                onKeyDown={event => {
+                  const tabs: Tab[] = ['general', 'trackers', 'files', 'limits']
+                  const currentIndex = tabs.indexOf(item)
+                  const nextIndex = event.key === 'ArrowDown' || event.key === 'ArrowRight'
+                    ? (currentIndex + 1) % tabs.length
+                    : event.key === 'ArrowUp' || event.key === 'ArrowLeft'
+                      ? (currentIndex - 1 + tabs.length) % tabs.length
+                      : event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : -1
+                  if (nextIndex < 0) return
+                  event.preventDefault()
+                  const next = tabs[nextIndex]
+                  setTab(next)
+                  window.setTimeout(() => document.getElementById(`torrent-properties-tab-${next}`)?.focus(), 0)
+                }}
+                onClick={() => setTab(item)}
+                disabled={busy}
+                style={{
                 width: '100%', textAlign: 'left', marginBottom: 5, borderRadius: 5,
                 background: tab === item ? 'var(--accent-soft)' : 'transparent',
                 border: '1px solid ' + (tab === item ? 'var(--accent)' : 'transparent'),
@@ -115,39 +141,40 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
             ))}
           </nav>
 
-          <main className="tng-properties-main" style={{ flex: 1, overflowY: 'auto', padding: 14 }}>
+          <main className="tng-properties-main" role="tabpanel" id={`torrent-properties-panel-${tab}`} aria-labelledby={`torrent-properties-tab-${tab}`} tabIndex={0} style={{ flex: 1, overflowY: 'auto', padding: 14 }}>
             {tab === 'general' && (
               <div style={{ display: 'grid', gap: 12 }}>
                 <Field label="Name">
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: 8 }}>
-                    <input value={name} onChange={e => setName(e.target.value)} disabled={busy} style={INPUT} />
-                    <button disabled={busy || !name.trim()} onClick={() => apply('Renamed', () => api.torrents.rename(torrent.hash, name.trim()))} style={smallButton('#93c5fd', busy || !name.trim())}>Rename</button>
+                    <input aria-label="Torrent name" value={name} onChange={e => setName(e.target.value)} disabled={busy} style={INPUT} />
+                    <button type="button" disabled={busy || !name.trim()} onClick={() => apply('Renamed', () => api.torrents.rename(torrent.hash, name.trim()))} style={smallButton('#93c5fd', busy || !name.trim())}>Rename</button>
                   </div>
                 </Field>
                 <Field label="Location">
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: 8 }}>
-                    <input value={location} onChange={e => setLocation(e.target.value)} disabled={busy} style={{ ...INPUT, fontFamily: 'monospace' }} />
-                    <button disabled={busy || !location.trim()} onClick={() => apply('Location updated', () => api.torrents.setLocation([torrent.hash], location.trim()))} style={smallButton('#93c5fd', busy || !location.trim())}>Move</button>
+                    <input aria-label="Save location" value={location} onChange={e => setLocation(e.target.value)} disabled={busy} style={{ ...INPUT, fontFamily: 'monospace' }} />
+                    <button type="button" disabled={busy || !location.trim()} onClick={() => apply('Location updated', () => api.torrents.setLocation([torrent.hash], location.trim()))} style={smallButton('#93c5fd', busy || !location.trim())}>Move</button>
                   </div>
                 </Field>
                 <Field label="Category">
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: 8 }}>
-                    <select value={category} onChange={e => setCategory(e.target.value)} disabled={busy} style={INPUT}>
+                    <select aria-label="Category" value={category} onChange={e => setCategory(e.target.value)} disabled={busy} style={INPUT}>
                       <option value="">None</option>
                       {categories.map(c => <option key={c.name} value={c.name}>{c.name}</option>)}
                     </select>
-                    <button disabled={busy} onClick={() => apply('Category updated', () => api.torrents.setCategory(torrent.hash, category))} style={smallButton('#93c5fd', busy)}>Apply</button>
+                    <button type="button" disabled={busy} onClick={() => apply('Category updated', () => api.torrents.setCategory(torrent.hash, category))} style={smallButton('#93c5fd', busy)}>Apply</button>
                   </div>
                 </Field>
                 <Field label="Tags">
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: 8 }}>
-                    <input value={tagsText} onChange={e => setTagsText(e.target.value)} disabled={busy} placeholder="comma,separated,tags" style={INPUT} />
-                    <button disabled={busy} onClick={() => apply('Tags updated', () => api.torrents.setTags([torrent.hash], tags))} style={smallButton('#93c5fd', busy)}>Apply</button>
+                    <input aria-label="Tags" value={tagsText} onChange={e => setTagsText(e.target.value)} disabled={busy} placeholder="comma,separated,tags" style={INPUT} />
+                    <button type="button" disabled={busy} onClick={() => apply('Tags updated', () => api.torrents.setTags([torrent.hash], tags))} style={smallButton('#93c5fd', busy)}>Apply</button>
                   </div>
                   {allTags.length > 0 && (
                     <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap', marginTop: 7 }}>
                       {allTags.map(tag => (
                         <button
+                          type="button"
                           key={tag}
                           className="tng-tag-chip"
                           data-active={tags.includes(tag) ? 'true' : 'false'}
@@ -174,8 +201,8 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
             {tab === 'trackers' && (
               <div>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: 8, marginBottom: 12 }}>
-                  <input value={newTracker} onChange={e => setNewTracker(e.target.value)} disabled={busy} placeholder="udp://tracker.example/announce" style={{ ...INPUT, fontFamily: 'monospace' }} />
-                  <button disabled={busy || !newTracker.trim()} onClick={() => apply('Tracker added', async () => {
+                  <input aria-label="New tracker URL" value={newTracker} onChange={e => setNewTracker(e.target.value)} disabled={busy} placeholder="udp://tracker.example/announce" style={{ ...INPUT, fontFamily: 'monospace' }} />
+                  <button type="button" disabled={busy || !newTracker.trim()} onClick={() => apply('Tracker added', async () => {
                     await api.torrents.patchTrackers(torrent.hash, { add: [newTracker.trim()] })
                     setNewTracker('')
                   })} style={smallButton('#93c5fd', busy || !newTracker.trim())}>Add</button>
@@ -197,12 +224,12 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
                   >
                     {editingTracker?.url === tracker.url ? (
                       <div className="tng-action-grid-3" style={{ display: 'grid', gridTemplateColumns: '1fr auto auto', gap: 7 }}>
-                        <input value={trackerUrl} onChange={e => setTrackerUrl(e.target.value)} disabled={busy} style={{ ...INPUT, fontFamily: 'monospace' }} />
-                        <button disabled={busy || !trackerUrl.trim()} onClick={() => apply('Tracker edited', async () => {
+                        <input aria-label="Tracker URL" value={trackerUrl} onChange={e => setTrackerUrl(e.target.value)} disabled={busy} style={{ ...INPUT, fontFamily: 'monospace' }} />
+                        <button type="button" disabled={busy || !trackerUrl.trim()} onClick={() => apply('Tracker edited', async () => {
                           await api.torrents.patchTrackers(torrent.hash, { edit: [{ orig_url: tracker.url, new_url: trackerUrl.trim() }] })
                           setEditingTracker(null)
                         })} style={smallButton('#93c5fd', busy || !trackerUrl.trim())}>Save</button>
-                        <button disabled={busy} onClick={() => setEditingTracker(null)} style={smallButton('#64748b', busy)}>Cancel</button>
+                        <button type="button" disabled={busy} onClick={() => setEditingTracker(null)} style={smallButton('var(--muted)', busy)}>Cancel</button>
                       </div>
                     ) : (
                       <div className="tng-action-grid-3" style={{ display: 'grid', gridTemplateColumns: '1fr auto auto', gap: 7, alignItems: 'center' }}>
@@ -210,8 +237,8 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
                           <div style={{ color: 'var(--text)', fontSize: 11, overflowWrap: 'anywhere' }}><TrackerUrl url={tracker.url} /></div>
                           <div style={{ color: 'var(--faint)', fontSize: 11 }}>{tracker.scrape_complete} seeds, {tracker.scrape_incomplete} peers {tracker.message ? `- ${tracker.message}` : ''}</div>
                         </div>
-                        <button disabled={busy} onClick={() => setEditingTracker(tracker)} style={smallButton('#94a3b8', busy)}>Edit</button>
-                        <button disabled={busy} onClick={() => apply('Tracker removed', () => api.torrents.patchTrackers(torrent.hash, { remove: [tracker.url] }))} style={smallButton('#f87171', busy)}>Remove</button>
+                        <button type="button" disabled={busy} onClick={() => setEditingTracker(tracker)} style={smallButton('var(--muted)', busy)}>Edit</button>
+                        <button type="button" disabled={busy} onClick={() => apply('Tracker removed', () => api.torrents.patchTrackers(torrent.hash, { remove: [tracker.url] }))} style={smallButton('#f87171', busy)}>Remove</button>
                       </div>
                     )}
                   </div>
@@ -251,22 +278,22 @@ export function TorrentPropertiesDialog({ torrent, onClose }: Props) {
             {tab === 'limits' && (
               <div style={{ display: 'grid', gap: 12, maxWidth: 420 }}>
                 <Field label="Ratio limit">
-                  <input value={ratioLimit} onChange={e => setRatioLimit(e.target.value)} disabled={busy} placeholder="-2 uses default, -1 unlimited" style={INPUT} />
+                  <input aria-label="Ratio limit" value={ratioLimit} onChange={e => setRatioLimit(e.target.value)} disabled={busy} placeholder="-2 uses default, -1 unlimited" style={INPUT} />
                 </Field>
                 <Field label="Seeding time limit minutes">
-                  <input value={seedMinutes} onChange={e => setSeedMinutes(e.target.value)} disabled={busy} placeholder="-2 uses default, -1 unlimited" style={INPUT} />
+                  <input aria-label="Seeding time limit minutes" value={seedMinutes} onChange={e => setSeedMinutes(e.target.value)} disabled={busy} placeholder="-2 uses default, -1 unlimited" style={INPUT} />
                 </Field>
-                <button disabled={busy} onClick={() => apply('Share limits updated', () => api.torrents.setShareLimits(
+                <button type="button" disabled={busy} onClick={() => apply('Share limits updated', () => api.torrents.setShareLimits(
                   [torrent.hash],
                   ratioLimit.trim() ? Number(ratioLimit) : -2,
                   seedMinutes.trim() ? Number(seedMinutes) : -2,
                 ))} style={{ ...smallButton('#93c5fd', busy), width: 'fit-content' }}>Apply share limits</button>
-                <button disabled={busy} onClick={() => apply('Sequential toggled', () => api.torrents.toggleSequential([torrent.hash]))} style={{ ...smallButton('#f59e0b', busy), width: 'fit-content' }}>Toggle sequential download</button>
+                <button type="button" disabled={busy} onClick={() => apply('Sequential toggled', () => api.torrents.toggleSequential([torrent.hash]))} style={{ ...smallButton('#f59e0b', busy), color: 'var(--text)', width: 'fit-content' }}>Toggle sequential download</button>
               </div>
             )}
           </main>
         </div>
-        {message && <div role={messageTone === 'error' ? 'alert' : 'status'} style={{
+        {message && <div role={messageTone === 'error' ? 'alert' : 'status'} aria-live={messageTone === 'error' ? 'assertive' : 'polite'} style={{
           borderTop: '1px solid var(--border)', padding: '8px 14px',
           color: messageTone === 'error' ? 'var(--danger)' : 'var(--success)', fontSize: 12,
           background: messageTone === 'error' ? 'color-mix(in srgb, var(--danger) 8%, transparent)' : 'color-mix(in srgb, var(--success) 7%, transparent)',
@@ -309,16 +336,16 @@ function FileRow({ file, torrentComplete, busy, renaming, name, onName, onRename
     >
       {renaming ? (
         <div className="tng-action-grid-3" style={{ display: 'grid', gridTemplateColumns: '1fr auto auto', gap: 7 }}>
-          <input value={name} onChange={e => onName(e.target.value)} style={INPUT} />
-          <button disabled={busy || !name.trim()} onClick={onRenameSave} style={smallButton('#93c5fd', busy || !name.trim())}>Save</button>
-          <button disabled={busy} onClick={onRenameCancel} style={smallButton('#64748b', busy)}>Cancel</button>
+          <input aria-label="File name" value={name} onChange={e => onName(e.target.value)} style={INPUT} />
+          <button type="button" disabled={busy || !name.trim()} onClick={onRenameSave} style={smallButton('#93c5fd', busy || !name.trim())}>Save</button>
+          <button type="button" disabled={busy} onClick={onRenameCancel} style={smallButton('var(--muted)', busy)}>Cancel</button>
         </div>
       ) : (
         <div className="tng-action-grid-3" style={{ display: 'grid', gridTemplateColumns: '1fr auto auto', gap: 7, alignItems: 'center' }}>
           <div style={{ minWidth: 0 }}>
             <div style={{ color: 'var(--text)', fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={file.path}>{file.path}</div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 4 }}>
-              <div style={{ flex: 1, height: 4, background: 'var(--surface-2)', borderRadius: 999, overflow: 'hidden' }}>
+              <div role="progressbar" aria-label={`File progress for ${file.path}`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.min(100, Math.max(0, pct))} style={{ flex: 1, height: 4, background: 'var(--surface-2)', borderRadius: 999, overflow: 'hidden' }}>
                 <div style={{
                   width: `${Math.min(100, Math.max(0, pct))}%`, height: '100%',
                   background: pct >= 100 ? 'var(--success)' : 'var(--accent)',
@@ -332,12 +359,12 @@ function FileRow({ file, torrentComplete, busy, renaming, name, onName, onRename
               }}>{priority.label}</span>
             </div>
           </div>
-          <select value={file.priority} disabled={busy} onChange={e => onPriority(Number(e.target.value))} style={{ ...INPUT, width: 112 }}>
+          <select aria-label={`Priority for ${file.path}`} value={file.priority} disabled={busy} onChange={e => onPriority(Number(e.target.value))} style={{ ...INPUT, width: 112 }}>
             <option value={0}>Do not download</option>
             <option value={1}>Normal</option>
             <option value={2}>High</option>
           </select>
-          <button disabled={busy} onClick={onRenameStart} style={smallButton('#94a3b8', busy)}>Rename</button>
+          <button type="button" disabled={busy} onClick={onRenameStart} style={smallButton('var(--muted)', busy)}>Rename</button>
         </div>
       )}
     </div>
@@ -345,11 +372,11 @@ function FileRow({ file, torrentComplete, busy, renaming, name, onName, onRename
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
-  return <label className="tng-form-card" style={{
-    display: 'grid', gap: 6, color: 'var(--faint)', fontSize: 11, fontWeight: 700,
+  return <div className="tng-form-card" role="group" aria-label={label} style={{
+    display: 'grid', gap: 6, color: 'var(--muted)', fontSize: 11, fontWeight: 700,
     textTransform: 'uppercase', background: 'var(--surface)', border: '1px solid var(--border)',
     borderRadius: 7, padding: 10,
-  }}>{label}{children}</label>
+  }}><span>{label}</span>{children}</div>
 }
 
 function LoadingRows({ count }: { count: number }) {
@@ -378,7 +405,7 @@ function EmptyState({ children }: { children: React.ReactNode }) {
 }
 
 function Notice({ children }: { children: React.ReactNode }) {
-  return <div role="alert" style={{
+  return <div role="alert" aria-live="assertive" style={{
     color: 'var(--danger)', fontSize: 12,
     background: 'color-mix(in srgb, var(--danger) 9%, var(--surface))',
     border: '1px solid color-mix(in srgb, var(--danger) 45%, var(--border))',
@@ -406,8 +433,8 @@ function Info({ label, value, mono }: { label: string; value: string; mono?: boo
 
 function smallButton(color: string, disabled = false): React.CSSProperties {
   return {
-    background: 'var(--surface-2)', border: `1px solid ${color}66`, borderRadius: 5,
-    color, padding: '5px 9px', fontSize: 12,
+    background: 'var(--surface-2)', border: `1px solid color-mix(in srgb, ${color} 42%, var(--border))`, borderRadius: 5,
+    color: `color-mix(in srgb, ${color} 78%, var(--text))`, padding: '5px 9px', fontSize: 12,
     cursor: disabled ? 'not-allowed' : 'pointer', opacity: disabled ? 0.55 : 1,
   }
 }

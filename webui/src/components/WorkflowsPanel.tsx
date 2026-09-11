@@ -91,10 +91,10 @@ export function WorkflowsPanel() {
   }
 
   return (
-    <section style={{ padding: '18px 24px' }}>
+    <section aria-labelledby="workflow-rules-title" aria-busy={Boolean(pending) || rulesLoading} style={{ padding: '18px 24px' }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 12 }}>
         <div>
-          <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--text)' }}>Workflow Rules</div>
+          <h2 id="workflow-rules-title" style={{ margin: 0, fontSize: 14, fontWeight: 700, color: 'var(--text)' }}>Workflow Rules</h2>
           <div style={{ fontSize: 12, color: 'var(--faint)', marginTop: 2 }}>
             {rules.length.toLocaleString()} rules · {runs.length.toLocaleString()} runs
           </div>
@@ -102,7 +102,7 @@ export function WorkflowsPanel() {
         {pending && <Busy label={pending === '__save__' ? 'Saving' : 'Working'} />}
       </div>
       <PanelBox>
-        <div style={{ fontSize: 12, fontWeight: 800, color: 'var(--text)', marginBottom: 10 }}>Workflow builder</div>
+        <h3 style={{ margin: '0 0 10px', fontSize: 12, fontWeight: 800, color: 'var(--text)' }}>Workflow builder</h3>
         <div style={scrollX}>
           <div style={{ display: 'grid', gridTemplateColumns: '150px 120px 120px 150px minmax(240px, 1fr) auto', gap: 8, minWidth: 860, maxWidth: 1080 }}>
             <Field label="Name"><Input value={draft.name} placeholder="notify complete" onChange={name => setDraft({ ...draft, name })} /></Field>
@@ -116,7 +116,7 @@ export function WorkflowsPanel() {
               target_path: draft.action === 'set_location' ? value : null,
               category: draft.action === 'set_category' ? value : draft.category,
             })} /></Field>
-            <button onClick={save} disabled={!draft.name.trim() || Boolean(pending)} style={primaryButton(!draft.name.trim() || Boolean(pending))}>{pending === '__save__' ? 'Saving…' : 'Save'}</button>
+            <button type="button" onClick={save} disabled={!draft.name.trim() || Boolean(pending)} style={primaryButton(!draft.name.trim() || Boolean(pending))}>{pending === '__save__' ? 'Saving…' : 'Save'}</button>
           </div>
         </div>
       </PanelBox>
@@ -127,7 +127,7 @@ export function WorkflowsPanel() {
         </Notice>
       )}
       <div style={{ ...scrollX, display: 'grid', gap: 8, maxWidth: 1080 }}>
-        {rulesLoading && <SkeletonRows count={3} />}
+        {rulesLoading && <div role="status" aria-label="Loading workflow rules"><SkeletonRows count={3} /></div>}
         {!rulesLoading && rules.length === 0 && (
           <EmptyState title="No workflow rules configured" detail="Create a workflow above, then preview it against the current torrent list before running." />
         )}
@@ -151,17 +151,17 @@ export function WorkflowsPanel() {
             <span style={{ color: 'var(--faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
               {rule.url || rule.command || rule.target_path || (rule.tracker ? maskAnnounceUrl(rule.tracker) : null) || 'configured'}
             </span>
-            <button onClick={() => run(rule, true)} disabled={Boolean(pending)} style={{
+            <button type="button" onClick={() => run(rule, true)} disabled={Boolean(pending)} style={{
               background: 'none', border: '1px solid var(--border-strong)', borderRadius: 4,
               color: 'var(--muted)', padding: '3px 8px', fontSize: 11,
               cursor: pending ? 'not-allowed' : 'pointer', opacity: pending ? 0.55 : 1,
             }}>Preview</button>
-            <button onClick={() => run(rule, false)} disabled={Boolean(pending)} style={{
+            <button type="button" onClick={() => run(rule, false)} disabled={Boolean(pending)} style={{
               background: 'var(--surface-2)', border: '1px solid var(--accent)', borderRadius: 4,
               color: 'var(--accent)', padding: '3px 8px', fontSize: 11,
               cursor: pending ? 'not-allowed' : 'pointer', opacity: pending ? 0.55 : 1,
             }}>Run</button>
-            <button onClick={() => remove(rule.id)} disabled={Boolean(pending)} style={{
+            <button type="button" onClick={() => remove(rule.id)} disabled={Boolean(pending)} style={{
               background: 'none', border: '1px solid var(--border-strong)', borderRadius: 4,
               color: 'var(--faint)', padding: '3px 8px', fontSize: 11,
               cursor: pending ? 'not-allowed' : 'pointer', opacity: pending ? 0.55 : 1,
@@ -169,9 +169,9 @@ export function WorkflowsPanel() {
           </div>
         ))}
       </div>
-      <div style={{ fontSize: 13, fontWeight: 700, marginTop: 20, marginBottom: 10, color: 'var(--text)' }}>
+      <h3 style={{ fontSize: 13, fontWeight: 700, margin: '20px 0 10px', color: 'var(--text)' }}>
         Recent Runs
-      </div>
+      </h3>
       <div style={{ ...scrollX, display: 'grid', gap: 6, maxWidth: 1080 }}>
         {runs.slice(0, 8).map(run => <WorkflowRunRow key={run.id} run={run} />)}
         {runs.length === 0 && (
@@ -191,7 +191,7 @@ function Busy({ label }: { label: string }) {
 
 function Notice({ tone, children }: { tone: 'ok' | 'error'; children: React.ReactNode }) {
   return (
-    <div style={{
+    <div role={tone === 'error' ? 'alert' : 'status'} aria-live={tone === 'error' ? 'assertive' : 'polite'} style={{
       color: tone === 'error' ? 'var(--danger)' : 'var(--success)',
       background: tone === 'error' ? 'color-mix(in srgb, var(--danger) 9%, var(--surface))' : 'color-mix(in srgb, var(--success) 8%, var(--surface))',
       border: '1px solid ' + (tone === 'error' ? 'color-mix(in srgb, var(--danger) 45%, var(--border))' : 'color-mix(in srgb, var(--success) 40%, var(--border))'),

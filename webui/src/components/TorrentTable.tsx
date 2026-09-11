@@ -9,7 +9,7 @@ interface Props {
   total: number
   selected: Set<string>
   params: ListParams
-  onSelect: (hash: string) => void
+  onSelect: (hash: string, mode?: SelectionMode) => void
   onSelectAll: (hashes: string[]) => void
   onSelectAllMatching?: () => void
   isSelectingAllMatching?: boolean
@@ -22,6 +22,8 @@ interface Props {
   detailHash: string | null
   mediaInference: MediaInferenceMode
 }
+
+export type SelectionMode = 'replace' | 'toggle' | 'range' | 'range-add'
 
 const ROW_HEIGHT = 36
 const TABLE_MIN_WIDTH = 1280
@@ -78,14 +80,14 @@ function shortPath(path: string): string {
   return `…${path.slice(-33)}`
 }
 
-function statusLabel(t: TorrentSummary): { label: string; color: string } {
-  if (t.message && !t.is_active) return { label: 'Error', color: 'var(--danger)' }
-  if (t.state === 0) return { label: 'Stopped', color: 'var(--faint)' }
-  if (t.state === 2) return { label: 'Checking', color: 'var(--warning)' }
-  if (t.complete && t.is_active) return { label: 'Seeding', color: 'var(--success)' }
-  if (!t.complete && t.is_active) return { label: 'DL', color: 'var(--accent)' }
-  if (t.is_open) return { label: 'Stalled', color: 'var(--warning)' }
-  return { label: 'Queued', color: 'var(--muted)' }
+function statusLabel(t: TorrentSummary): { label: string; accessibleLabel: string; color: string } {
+  if (t.message && !t.is_active) return { label: 'Error', accessibleLabel: 'Error', color: 'var(--danger)' }
+  if (t.state === 0) return { label: 'Stopped', accessibleLabel: 'Stopped', color: 'var(--faint)' }
+  if (t.state === 2) return { label: 'Checking', accessibleLabel: 'Checking', color: 'var(--warning)' }
+  if (t.complete && t.is_active) return { label: 'Seeding', accessibleLabel: 'Seeding', color: 'var(--success)' }
+  if (!t.complete && t.is_active) return { label: 'DL', accessibleLabel: 'Downloading', color: 'var(--accent)' }
+  if (t.is_open) return { label: 'Stalled', accessibleLabel: 'Stalled', color: 'var(--warning)' }
+  return { label: 'Queued', accessibleLabel: 'Queued', color: 'var(--muted)' }
 }
 
 function rowAccent(t: TorrentSummary): string {
@@ -316,6 +318,10 @@ export function TorrentTable({
   const [order, setOrder] = useState<ColKey[]>(loadOrder)
   const [widths, setWidths] = useState<Partial<Record<ColKey, number>>>(loadWidths)
   const [dragKey, setDragKey] = useState<ColKey | null>(null)
+  const [focusedHash, setFocusedHash] = useState<string | null>(null)
+  const rowRefs = useRef(new Map<string, HTMLDivElement>())
+  const columnsButtonRef = useRef<HTMLButtonElement>(null)
+  const columnsWereOpen = useRef(false)
   const resizeState = useRef<{ key: ColKey; startX: number; startWidth: number } | null>(null)
 
   const colByKey = useMemo(() => new Map(COLS.map(c => [c.key, c])), [])
@@ -442,6 +448,23 @@ export function TorrentTable({
     overscan: 30,
   })
 
+  useEffect(() => {
+    if (focusedHash && torrents.some(torrent => torrent.hash === focusedHash)) return
+    setFocusedHash(torrents[0]?.hash ?? null)
+  }, [focusedHash, torrents])
+
+  useEffect(() => {
+    if (columnsOpen) {
+      columnsWereOpen.current = true
+      window.requestAnimationFrame(() => {
+        columnsRef.current?.querySelector<HTMLInputElement>('input')?.focus()
+      })
+    } else if (columnsWereOpen.current) {
+      columnsWereOpen.current = false
+      columnsButtonRef.current?.focus()
+    }
+  }, [columnsOpen])
+
   // Trigger next page when within 500px of the bottom
   useEffect(() => {
     const el = parentRef.current
@@ -484,6 +507,51 @@ export function TorrentTable({
   const someSelected = !allVisible && torrents.some(t => selected.has(t.hash))
   const hasFilters = Boolean(params.filter || params.status || params.category || params.tag || params.tracker || params.media_type)
 
+  function selectionMode(event: Pick<React.MouseEvent, 'shiftKey' | 'ctrlKey' | 'metaKey'>, rowClick = true): SelectionMode {
+    const additive = event.ctrlKey || event.metaKey
+    if (event.shiftKey) return additive ? 'range-add' : 'range'
+    if (additive || !rowClick) return 'toggle'
+    return 'replace'
+  }
+
+  function focusRowAt(index: number, mode?: SelectionMode) {
+    const nextIndex = Math.min(Math.max(index, 0), torrents.length - 1)
+    const torrent = torrents[nextIndex]
+    if (!torrent) return
+    if (mode) onSelect(torrent.hash, mode)
+    setFocusedHash(torrent.hash)
+    virtualizer.scrollToIndex(nextIndex, { align: 'auto' })
+    window.requestAnimationFrame(() => rowRefs.current.get(torrent.hash)?.focus())
+  }
+
+  function onRowKeyDown(event: React.KeyboardEvent<HTMLDivElement>, torrent: TorrentSummary, index: number) {
+    if (event.target !== event.currentTarget) return
+
+    if (event.key === 'Enter') {
+      event.preventDefault()
+      onDetail(torrent.hash)
+      return
+    }
+    if (event.key === ' ' || event.key === 'Spacebar') {
+      event.preventDefault()
+      onSelect(torrent.hash, selectionMode(event, true))
+      return
+    }
+
+    let nextIndex: number | null = null
+    if (event.key === 'ArrowDown') nextIndex = index + 1
+    if (event.key === 'ArrowUp') nextIndex = index - 1
+    if (event.key === 'Home') nextIndex = 0
+    if (event.key === 'End') nextIndex = torrents.length - 1
+    if (nextIndex === null || nextIndex < 0 || nextIndex >= torrents.length) return
+
+    event.preventDefault()
+    const mode = event.shiftKey
+      ? (event.ctrlKey || event.metaKey ? 'range-add' : 'range')
+      : undefined
+    focusRowAt(nextIndex, mode)
+  }
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minWidth: 0 }}>
       {/* A single element must own both scroll axes: position:sticky for the
@@ -491,9 +559,21 @@ export function TorrentTable({
           CSS auto-promotes overflow-x:visible to 'auto' whenever overflow-y
           isn't visible - splitting the axes across two nested elements (as
           this used to do) silently breaks sticky-left positioning. */}
-      <div ref={parentRef} style={{ flex: 1, minHeight: 0, minWidth: 0, overflow: 'auto', position: 'relative' }}>
+      <span id="torrent-selection-help" className="tng-visually-hidden">
+        Click a row to select it. Hold Control or Command to add or remove rows. Hold Shift to select a range. Use Arrow keys to move and Space to select.
+      </span>
+      <div
+        ref={parentRef}
+        role="grid"
+        aria-label="Torrent list"
+        aria-multiselectable="true"
+        aria-rowcount={total + 1}
+        aria-colcount={visibleCols.length}
+        aria-describedby="torrent-selection-help"
+        style={{ flex: 1, minHeight: 0, minWidth: 0, overflow: 'auto', position: 'relative' }}
+      >
         {torrents.length === 0 && (
-          <div style={{
+          <div role="status" aria-live="polite" style={{
             position: 'absolute', inset: 0, display: 'grid', placeItems: 'center',
             color: 'var(--faint)', fontSize: 13, textAlign: 'center', padding: 24, zIndex: 6,
           }}>
@@ -507,9 +587,9 @@ export function TorrentTable({
             </div>
           </div>
         )}
-        <div style={{ minWidth: TABLE_MIN_WIDTH }}>
+        <div role="presentation" style={{ minWidth: TABLE_MIN_WIDTH }}>
           {/* Header */}
-          <div style={{
+          <div role="row" aria-rowindex={1} style={{
             display: 'grid', gridTemplateColumns: gridTemplate, gap: `0 ${TABLE_CELL_GAP}px`,
             padding: `0 ${TABLE_HORIZONTAL_PADDING}px`, height: 32, alignItems: 'center',
             background: 'var(--table-head)', borderBottom: '1px solid var(--border-strong)',
@@ -518,7 +598,7 @@ export function TorrentTable({
             flexShrink: 0, userSelect: 'none', position: 'sticky', top: 0, zIndex: 5,
           }}>
             {/* Select-all checkbox */}
-            <span style={STICKY_KEYS.includes('check') ? {
+            <span role="columnheader" aria-colindex={1} aria-label="Select all" style={STICKY_KEYS.includes('check') ? {
               position: 'sticky', left: stickyLeft.check ?? 0, zIndex: 3,
               background: 'var(--table-head)', display: 'flex', alignItems: 'center',
             } : undefined}>
@@ -536,6 +616,7 @@ export function TorrentTable({
                       : 'Select all visible torrents'
                 }
                 checked={allVisible}
+                aria-checked={someSelected ? 'mixed' : allVisible}
                 disabled={isSelectingAllMatching}
                 ref={el => { if (el) el.indeterminate = someSelected }}
                 onChange={() => {
@@ -550,7 +631,7 @@ export function TorrentTable({
                 style={{ accentColor: 'var(--accent)', cursor: isSelectingAllMatching ? 'wait' : 'pointer' }}
               />
             </span>
-            {visibleCols.slice(1, -1).map(col => {
+            {visibleCols.slice(1, -1).map((col, visibleIndex) => {
               const content = (
                 <>
                   {col.label}
@@ -569,6 +650,7 @@ export function TorrentTable({
                 </span>
               ) : (
                 <button
+                  type="button"
                   onClick={() => onSort(sortKey)}
                   title={`Sort by ${col.label}`}
                   aria-label={`Sort by ${col.label}`}
@@ -586,6 +668,10 @@ export function TorrentTable({
               return (
                 <span
                   key={col.key}
+                  role="columnheader"
+                  aria-colindex={visibleIndex + 2}
+                  aria-label={col.label || col.key}
+                  aria-sort={col.sortKey === activeSort ? activeDir === 'asc' ? 'ascending' : 'descending' : 'none'}
                   draggable={draggable}
                   onDragStart={draggable ? (e: React.DragEvent) => { setDragKey(col.key); e.dataTransfer.effectAllowed = 'move' } : undefined}
                   onDragOver={draggable ? (e: React.DragEvent) => e.preventDefault() : undefined}
@@ -606,7 +692,26 @@ export function TorrentTable({
                 >
                   {inner}
                   <span
+                    role="separator"
+                    aria-orientation="vertical"
+                    aria-label={`Resize ${col.label || col.key} column`}
+                    aria-valuemin={MIN_COL_WIDTH}
+                    aria-valuemax={2000}
+                    aria-valuenow={widths[col.key] ?? (Number.parseFloat(col.width) || MIN_COL_WIDTH)}
+                    tabIndex={0}
                     onPointerDown={e => beginResize(e, col)}
+                    onKeyDown={event => {
+                      if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return
+                      event.preventDefault()
+                      const delta = event.key === 'ArrowRight' ? 16 : -16
+                      const startWidth = widths[col.key] ?? (Number.parseFloat(col.width) || 80)
+                      const nextWidth = Math.max(MIN_COL_WIDTH, Math.round(startWidth + delta))
+                      setWidths(prev => {
+                        const next = { ...prev, [col.key]: nextWidth }
+                        localStorage.setItem(COLUMN_WIDTHS_KEY, JSON.stringify(next))
+                        return next
+                      })
+                    }}
                     title="Drag to resize column"
                     style={{
                       position: 'absolute', top: 0, right: -4, bottom: 0, width: 8,
@@ -616,7 +721,10 @@ export function TorrentTable({
                 </span>
               )
             })}
+            <span role="columnheader" aria-colindex={visibleCols.length} aria-label="Table controls" style={{ position: 'relative', minWidth: 0 }}>
             <button
+              ref={columnsButtonRef}
+              type="button"
               onClick={() => setColumnsOpen(open => !open)}
               aria-expanded={columnsOpen}
               aria-haspopup="menu"
@@ -649,7 +757,7 @@ export function TorrentTable({
                 boxShadow: '0 18px 40px var(--shadow)', padding: 8,
                 textTransform: 'none', letterSpacing: 0, fontWeight: 400,
               }}>
-                <div style={{
+          <div role="row" aria-rowindex={1} style={{
                   display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8,
                   color: 'var(--faint)', fontSize: 11, margin: '2px 4px 7px',
                 }}>
@@ -673,31 +781,31 @@ export function TorrentTable({
                     {col.label || col.key}
                   </label>
                 ))}
-                <button onClick={resetColumns} style={{
+                <button type="button" onClick={resetColumns} style={{
                   marginTop: 6, width: '100%', background: 'transparent',
                   border: '1px solid var(--border-strong)', borderRadius: 5, color: 'var(--muted)',
                   padding: '5px 8px', fontSize: 12, cursor: 'pointer',
                 }}>Reset columns</button>
-                <button onClick={useCompactColumns} style={{
+                <button type="button" onClick={useCompactColumns} style={{
                   marginTop: 6, width: '100%', background: 'transparent',
                   border: '1px solid var(--border-strong)', borderRadius: 5, color: 'var(--muted)',
                   padding: '5px 8px', fontSize: 12, cursor: 'pointer',
                 }}>Compact preset</button>
-                <button onClick={() => setColumnsOpen(false)} style={{
+                <button type="button" onClick={() => setColumnsOpen(false)} style={{
                   marginTop: 6, width: '100%', background: 'var(--surface-2)',
                   border: '1px solid var(--border-strong)', borderRadius: 5, color: 'var(--muted)',
                   padding: '5px 8px', fontSize: 12, cursor: 'pointer',
                 }}>Done</button>
               </div>
             )}
+            </span>
           </div>
 
           {/* Scrollable body (rows render into parentRef above, not a nested scroller) */}
-          <div style={{ position: 'relative' }}>
-            <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
+          <div role="rowgroup" style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
           {items.map(item => {
             const t = torrents[item.index]
-            const { label, color } = statusLabel(t)
+            const { label, accessibleLabel, color } = statusLabel(t)
             const kind = mediaKind(t, mediaInference)
             const isSelected = selected.has(t.hash)
             const isDetail = detailHash === t.hash
@@ -708,13 +816,17 @@ export function TorrentTable({
                   type="checkbox"
                   aria-label={`${isSelected ? 'Deselect' : 'Select'} ${t.name}`}
                   checked={isSelected}
-                  onClick={e => e.stopPropagation()}
-                  onChange={() => onSelect(t.hash)}
+                  tabIndex={-1}
+                  onClick={event => {
+                    event.stopPropagation()
+                    onSelect(t.hash, selectionMode(event, false))
+                  }}
+                  onChange={() => undefined}
                   style={{ accentColor: 'var(--accent)', cursor: 'pointer' }}
                 />
               ),
               kind: (
-                <span title={kind.label} style={{
+                <span role="img" aria-label={kind.label} title={kind.label} style={{
                   display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
                   width: 26, height: 22, color: kind.color, fontSize: 16,
                 }}>{kind.icon}</span>
@@ -744,7 +856,7 @@ export function TorrentTable({
                 </span>
               ),
               status: (
-                <span style={{
+                <span aria-label={accessibleLabel} style={{
                   display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
                   width: 'fit-content', maxWidth: '100%', minWidth: 42, height: 20,
                   padding: '0 7px', borderRadius: 4,
@@ -781,15 +893,26 @@ export function TorrentTable({
               <div
                 key={t.hash}
                 className="torrent-row"
+                role="row"
+                aria-rowindex={item.index + 2}
+                aria-selected={isSelected}
+                aria-label={`${t.name}, ${accessibleLabel}${t.message ? `, ${t.message}` : ''}`}
+                tabIndex={focusedHash === t.hash || (!focusedHash && item.index === 0) ? 0 : -1}
+                ref={node => {
+                  if (node) rowRefs.current.set(t.hash, node)
+                  else rowRefs.current.delete(t.hash)
+                }}
+                onFocus={() => setFocusedHash(t.hash)}
                 data-status={label.toLowerCase()}
                 data-detail={isDetail ? 'true' : 'false'}
-                title={`${isSelected ? 'Deselect' : 'Select'} ${t.name}`}
-                onClick={() => onSelect(t.hash)}
+                title={`${isSelected ? 'Deselect' : 'Select'} ${t.name}. Shift-click for a range; Control/Command-click to add or remove.`}
+                onClick={event => onSelect(t.hash, selectionMode(event))}
                 onContextMenu={e => {
                   e.preventDefault()
                   onContextMenu(t, e.clientX, e.clientY)
                 }}
                 onDoubleClick={() => onDetail(t.hash)}
+                onKeyDown={event => onRowKeyDown(event, t, item.index)}
                 style={{
                   position: 'absolute', top: item.start, left: 0, right: 0,
                   height: ROW_HEIGHT, display: 'grid', gridTemplateColumns: gridTemplate,
@@ -800,11 +923,11 @@ export function TorrentTable({
                   borderLeft: isDetail ? '3px solid var(--accent)' : isSelected ? '3px solid color-mix(in srgb, var(--accent) 62%, transparent)' : `3px solid ${accent}`,
                 }}
               >
-                {visibleCols.map(col => {
+                {visibleCols.map((col, visibleIndex) => {
                   const isSticky = STICKY_KEYS.includes(col.key)
                   const isLastSticky = col.key === lastStickyKey
                   return (
-                    <span key={col.key} style={{
+                    <span key={col.key} role="gridcell" aria-colindex={visibleIndex + 1} style={{
                       minWidth: 0, overflow: 'hidden',
                       ...(isSticky ? {
                         position: 'sticky', left: stickyLeft[col.key] ?? 0, zIndex: 2,
@@ -818,23 +941,22 @@ export function TorrentTable({
             )
           })}
             </div>
-
-            {/* Load-more sentinel */}
-            {isFetchingMore && (
-              <div style={{
-                padding: '12px 0', display: 'grid', placeItems: 'center', gap: 6,
-                fontSize: 11, color: 'var(--faint)',
-              }}>
-                <span className="tng-skeleton" style={{ width: 160, height: 8 }} />
-                <span>Loading more torrents…</span>
-              </div>
-            )}
-          </div>
         </div>
       </div>
 
+      {isFetchingMore && (
+        <div role="status" aria-live="polite" style={{
+          padding: '12px 0', display: 'grid', placeItems: 'center', gap: 6,
+          fontSize: 11, color: 'var(--faint)', flexShrink: 0,
+        }}>
+          <span className="tng-skeleton" style={{ width: 160, height: 8 }} />
+          <span>Loading more torrents…</span>
+        </div>
+      )}
+
       {hasMore && !isFetchingMore && (
         <button
+          type="button"
           onClick={onLoadMore}
           title="Load the next page of torrents"
           style={{
@@ -853,10 +975,10 @@ export function TorrentTable({
 
 function ProgressCell({ value }: { value: number | null }) {
   if (value === null) {
-    return <span style={{ color: 'var(--faint)' }}>—</span>
+    return <span aria-label="Progress unavailable" style={{ color: 'var(--faint)' }}>—</span>
   }
   return (
-    <span title={`${value.toFixed(1)}%`} style={{
+    <span role="progressbar" aria-label="Torrent progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={value} title={`${value.toFixed(1)}%`} style={{
       display: 'grid', gap: 3, width: '100%', minWidth: 0,
     }}>
       <span style={{ color: value >= 100 ? 'var(--success)' : 'var(--muted)', fontSize: 11, lineHeight: 1 }}>

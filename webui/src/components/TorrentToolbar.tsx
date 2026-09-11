@@ -33,17 +33,18 @@ export function TorrentToolbar({
   }
 
   return (
-    <div className="tng-toolbar" data-has-selection={selectedCount > 0 ? 'true' : 'false'} data-busy={busy ? 'true' : 'false'} style={{
+    <div className="tng-toolbar" role="toolbar" aria-label="Torrent actions" aria-busy={busy} data-has-selection={selectedCount > 0 ? 'true' : 'false'} data-busy={busy ? 'true' : 'false'} style={{
       minHeight: 40, flexShrink: 0, display: 'flex', alignItems: 'center', gap: 8,
       padding: '0 10px', background: 'var(--surface)', borderBottom: '1px solid var(--border)',
       minWidth: 0, overflowX: 'auto', overflowY: 'hidden', scrollbarWidth: 'thin',
     }}>
-      <button className="tng-toolbar-button" onClick={onAdd} title="Add torrent" aria-label="Add torrent" style={primaryButton}><span>+</span><span>Add</span></button>
-      <div className="tng-toolbar-divider" style={{ width: 1, height: 20, background: 'var(--border)', margin: '0 2px' }} />
+      <button type="button" className="tng-toolbar-button" onClick={onAdd} title="Add torrent" aria-label="Add torrent" style={primaryButton}><span aria-hidden="true">+</span><span>Add</span></button>
+      <div className="tng-toolbar-divider" aria-hidden="true" style={{ width: 1, height: 20, background: 'var(--border)', margin: '0 2px' }} />
       <span className="tng-toolbar-label" style={groupLabel}>Transfer</span>
-      <div className="tng-toolbar-group" style={buttonGroup}>
+      <div className="tng-toolbar-group" role="group" aria-label="Transfer actions" style={buttonGroup}>
         {ACTIONS.map(action => (
           <button
+            type="button"
             className="tng-toolbar-button"
             key={action.key}
             onClick={handlers[action.key]}
@@ -52,13 +53,14 @@ export function TorrentToolbar({
             aria-label={action.title}
             style={actionButton(action.color, disabled)}
         >
-            <span>{action.icon}</span><span>{action.label}</span>
+            <span aria-hidden="true">{action.icon}</span><span>{action.label}</span>
           </button>
         ))}
       </div>
       <span className="tng-toolbar-label" style={groupLabel}>Edit</span>
-      <div className="tng-toolbar-group" style={buttonGroup}>
+      <div className="tng-toolbar-group" role="group" aria-label="Edit actions" style={buttonGroup}>
         <button
+          type="button"
           className="tng-toolbar-button"
           onClick={onProperties}
           disabled={selectedCount !== 1 || busy}
@@ -66,9 +68,10 @@ export function TorrentToolbar({
           aria-label="Open selected torrent properties"
           style={actionButton('var(--accent)', selectedCount !== 1 || busy)}
         >
-          <span>⌘</span><span>Properties</span>
+          <span aria-hidden="true">⌘</span><span>Properties</span>
         </button>
         <button
+          type="button"
           className="tng-toolbar-button"
           onClick={onEditSelected}
           disabled={disabled}
@@ -76,9 +79,10 @@ export function TorrentToolbar({
           aria-label="Bulk edit selected torrents"
           style={actionButton('var(--accent)', disabled)}
         >
-          <span>✎</span><span>Edit selected</span>
+          <span aria-hidden="true">✎</span><span>Edit selected</span>
         </button>
         <button
+          type="button"
           className="tng-toolbar-button"
           onClick={onSequential}
           disabled={disabled}
@@ -86,10 +90,10 @@ export function TorrentToolbar({
           aria-label="Toggle sequential download for selected torrents"
           style={actionButton('var(--warning)', disabled)}
         >
-          <span>≡</span><span>Sequential</span>
+          <span aria-hidden="true">≡</span><span>Sequential</span>
         </button>
       </div>
-      <span className="tng-toolbar-selection" style={{
+      <span className="tng-toolbar-selection" role="status" aria-live="polite" style={{
         color: selectedCount > 0 ? 'var(--accent-text)' : 'var(--faint)',
         fontSize: 11, marginLeft: 2, whiteSpace: 'nowrap', flex: '0 0 auto',
         padding: '3px 7px', border: '1px solid var(--border)', borderRadius: 5,
@@ -100,6 +104,7 @@ export function TorrentToolbar({
       </span>
       {selectedCount > 0 && (
         <button
+          type="button"
           className="tng-toolbar-button"
           onClick={onClearSelection}
           disabled={busy}
@@ -107,14 +112,14 @@ export function TorrentToolbar({
           aria-label="Clear selected torrents"
           style={actionButton('var(--muted)', busy)}
         >
-          <span>×</span><span>Clear</span>
+          <span aria-hidden="true">×</span><span>Clear</span>
         </button>
       )}
-      <button className="tng-toolbar-help tng-toolbar-button" onClick={onHelp} title="Keyboard shortcuts and docs" aria-label="Keyboard shortcuts and docs" style={{
+      <button type="button" className="tng-toolbar-help tng-toolbar-button" onClick={onHelp} title="Keyboard shortcuts and docs" aria-label="Keyboard shortcuts and docs" style={{
         marginLeft: 'auto', flex: '0 0 auto', background: 'transparent', border: '1px solid var(--border-strong)',
         borderRadius: 5, color: 'var(--muted)', padding: '4px 8px', fontSize: 12, cursor: 'pointer',
       }}>
-        <span>?</span><span>Help</span>
+        <span aria-hidden="true">?</span><span>Help</span>
       </button>
     </div>
   )

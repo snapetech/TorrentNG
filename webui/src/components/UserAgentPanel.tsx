@@ -44,20 +44,20 @@ export function UserAgentPanel() {
 
   if (!supported) {
     return (
-      <div style={{ padding: '18px 20px', maxWidth: 680 }}>
-        <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--text)' }}>Client Identifier</div>
-        <div style={noticeStyle}>The selected backend does not support runtime tracker user-agent changes.</div>
-      </div>
+      <section aria-labelledby="user-agent-title" style={{ padding: '18px 20px', maxWidth: 680 }}>
+        <h2 id="user-agent-title" style={{ margin: 0, fontSize: 14, fontWeight: 700, color: 'var(--text)' }}>Client Identifier</h2>
+        <div role="status" style={noticeStyle}>The selected backend does not support runtime tracker user-agent changes.</div>
+      </section>
     )
   }
 
   return (
-    <div style={{ padding: '18px 20px', maxWidth: 680 }}>
+    <section aria-labelledby="user-agent-title" aria-busy={isLoading || mutation.isPending} style={{ padding: '18px 20px', maxWidth: 680 }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 12 }}>
         <div>
-          <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--text)' }}>
+          <h2 id="user-agent-title" style={{ margin: 0, fontSize: 14, fontWeight: 700, color: 'var(--text)' }}>
             Client Identifier
-          </div>
+          </h2>
           <div style={{ color: 'var(--faint)', fontSize: 12, marginTop: 3 }}>
             Tracker-facing user agent
           </div>
@@ -75,9 +75,11 @@ export function UserAgentPanel() {
           {PRESETS.map(p => (
             <button
               key={p.value}
+              type="button"
               className="tng-preset-button"
               data-active={draft === p.value ? 'true' : 'false'}
               onClick={() => setDraft(p.value)}
+              aria-pressed={draft === p.value}
               disabled={mutation.isPending}
               style={presetButton(draft === p.value, mutation.isPending)}
             >
@@ -89,6 +91,7 @@ export function UserAgentPanel() {
         <label style={{ display: 'grid', gap: 5 }}>
           <span style={labelStyle}>Custom user agent</span>
           <input
+            id="custom-user-agent"
             ref={inputRef}
             type="text"
             value={draft}
@@ -117,6 +120,7 @@ export function UserAgentPanel() {
             {mutation.isPending && <Pill tone="info">Applying</Pill>}
           </div>
           <button
+            type="button"
             onClick={() => mutation.mutate(draft)}
             disabled={!isDirty || mutation.isPending || !draft.trim()}
             style={applyButton(Boolean(isDirty) && !mutation.isPending && Boolean(draft.trim()))}
@@ -126,7 +130,7 @@ export function UserAgentPanel() {
         </div>
 
         {mutation.isError && (
-          <div style={noticeStyle}>
+          <div role="alert" aria-live="assertive" style={noticeStyle}>
             {mutation.error instanceof Error ? mutation.error.message : 'Failed'}
           </div>
         )}
@@ -136,7 +140,7 @@ export function UserAgentPanel() {
         <span style={{ color: 'var(--faint)', fontWeight: 800, textTransform: 'uppercase', fontSize: 10 }}>Current</span>
         <span style={{ fontFamily: 'monospace', color: 'var(--muted)', overflowWrap: 'anywhere' }}>{data?.user_agent ?? '…'}</span>
       </div>
-    </div>
+    </section>
   )
 }
 

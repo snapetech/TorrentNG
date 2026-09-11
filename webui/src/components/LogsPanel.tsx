@@ -20,11 +20,11 @@ export function LogsPanel() {
   )
 
   return (
-    <section style={{ padding: '18px 24px' }}>
+    <section aria-labelledby="operator-logs-title" aria-busy={query.isFetching} style={{ padding: '18px 24px' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12, flexWrap: 'wrap' }}>
-        <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--text)', flex: 1, minWidth: 180 }}>
+        <h2 id="operator-logs-title" style={{ margin: 0, fontSize: 14, fontWeight: 700, color: 'var(--text)', flex: 1, minWidth: 180 }}>
           Operator Logs
-        </div>
+        </h2>
         <select value={level} onChange={event => setLevel(event.target.value)} style={selectStyle} aria-label="Log level">
           <option value="">All levels</option>
           <option value="info">Info</option>
@@ -55,10 +55,11 @@ export function LogsPanel() {
           <option value="admin_restart_requested">Restart requests</option>
           <option value="sidecar_started">Startup</option>
         </select>
-        <button onClick={() => query.refetch()} disabled={query.isFetching} style={buttonStyle}>
+        <button type="button" onClick={() => query.refetch()} disabled={query.isFetching} style={buttonStyle}>
           {query.isFetching ? 'Refreshing...' : 'Refresh'}
         </button>
         <button
+          type="button"
           onClick={() => setLastKnownId(newestId || undefined)}
           disabled={!newestId || query.isFetching}
           style={buttonStyle}
@@ -66,13 +67,13 @@ export function LogsPanel() {
           Newer
         </button>
         {lastKnownId && (
-          <button onClick={() => setLastKnownId(undefined)} style={buttonStyle}>
+          <button type="button" onClick={() => setLastKnownId(undefined)} style={buttonStyle}>
             Latest page
           </button>
         )}
       </div>
 
-      {query.isLoading && <SkeletonRows />}
+      {query.isLoading && <div role="status" aria-label="Loading logs"><SkeletonRows /></div>}
       {query.error && <Notice>Logs unavailable</Notice>}
       {!query.isLoading && !query.error && logs.length === 0 && (
         <EmptyState>No log events matched the current filters.</EmptyState>
@@ -185,7 +186,7 @@ function SkeletonRows() {
 
 function EmptyState({ children }: { children: React.ReactNode }) {
   return (
-    <div style={{
+    <div role="alert" aria-live="assertive" style={{
       color: 'var(--faint)',
       fontSize: 12,
       border: '1px dashed var(--border-strong)',

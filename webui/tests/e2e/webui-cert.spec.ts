@@ -195,6 +195,63 @@ test('desktop renders torrent workspace and table rows', async ({ page }) => {
   await expect(page.getByText('1 selected').first()).toBeVisible()
 })
 
+test('single-torrent detail panel exposes the dock position selector', async ({ page }) => {
+  await page.getByLabel(/Select TorrentNG fixture 001/i).first().click()
+
+  const panel = page.getByRole('complementary', { name: 'TorrentNG fixture 001' })
+  const position = panel.getByLabel('Details panel position')
+  await expect(panel).toBeVisible()
+  await expect(position).toHaveValue('right')
+
+  for (const value of ['left', 'bottom', 'top'] as const) {
+    await position.selectOption(value)
+    await expect(page.locator('.tng-torrent-workspace')).toHaveAttribute('data-detail-position', value)
+  }
+})
+
+test('multi-select opens an aggregate workspace and repositions the detail dock', async ({ page, isMobile }) => {
+  test.skip(isMobile, 'desktop dock layout assertion')
+
+  await page.getByLabel(/Select TorrentNG fixture 001/i).first().click()
+  await page.getByLabel(/Select TorrentNG fixture 002/i).first().click()
+
+  await expect(page.getByRole('complementary', { name: 'Selection workspace' })).toBeVisible()
+  await expect(page.getByText('Selection workspace')).toBeVisible()
+  await expect(page.getByText('2 torrents selected')).toBeVisible()
+
+  const position = page.getByLabel('Details panel position')
+  await expect(position).toHaveValue('right')
+  await position.selectOption('left')
+  await expect(position).toHaveValue('left')
+  await expect(page.locator('.tng-torrent-workspace')).toHaveAttribute('data-detail-position', 'left')
+
+  await position.selectOption('top')
+  await expect(page.locator('.tng-torrent-workspace')).toHaveAttribute('data-detail-position', 'top')
+  await expect(page.evaluate(() => localStorage.getItem('tng.detailPosition'))).resolves.toBe('top')
+})
+
+test('mobile multi-select keeps the dock usable in side and bottom modes', async ({ page, isMobile }) => {
+  test.skip(!isMobile, 'mobile dock assertion')
+
+  await page.getByLabel(/Select TorrentNG fixture 001/i).first().click()
+  await page.getByLabel(/Select TorrentNG fixture 002/i).first().click()
+
+  const panel = page.getByRole('complementary', { name: 'Selection workspace' })
+  const position = page.getByLabel('Details panel position')
+  await expect(panel).toBeVisible()
+
+  await position.selectOption('bottom')
+  await expect(page.locator('.tng-torrent-workspace')).toHaveAttribute('data-detail-position', 'bottom')
+  const bottomBox = await panel.boundingBox()
+  expect(bottomBox?.width).toBe(page.viewportSize()?.width)
+
+  await position.selectOption('left')
+  await expect(page.locator('.tng-torrent-workspace')).toHaveAttribute('data-detail-position', 'left')
+  const leftBox = await panel.boundingBox()
+  expect(leftBox?.x).toBe(0)
+  expect(leftBox?.width).toBeLessThan(page.viewportSize()?.width ?? 0)
+})
+
 test('settings storage panel renders with mocked root', async ({ page, isMobile }) => {
   test.skip(isMobile, 'desktop settings navigation has the full tablist')
   await page.getByRole('button', { name: 'Settings' }).click()
