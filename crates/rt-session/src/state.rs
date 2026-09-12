@@ -83,6 +83,7 @@ mod tests {
         assert!(TorrentState::Stopped.can_start());
         assert!(TorrentState::MetadataPending.can_start());
         assert!(TorrentState::Paused.can_start());
+        assert!(TorrentState::Error.can_start());
         assert!(!TorrentState::Seeding.can_start());
         assert!(!TorrentState::Checking.can_start());
     }

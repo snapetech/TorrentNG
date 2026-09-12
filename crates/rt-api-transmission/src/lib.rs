@@ -17,8 +17,9 @@ use axum::{
 };
 use base64::{engine::general_purpose, Engine as _};
 use rt_api_model::{
-    csrf_request_allowed, request_fingerprint, session_cookie_value, valid_idempotency_key,
-    CachedResponse, IdempotencyClaim, IdempotencyStore, MAX_IDEMPOTENCY_BODY_BYTES,
+    api_token_allowed, csrf_request_allowed, request_fingerprint, session_cookie_value,
+    valid_idempotency_key, CachedResponse, IdempotencyClaim, IdempotencyStore,
+    MAX_IDEMPOTENCY_BODY_BYTES,
 };
 use rt_engine::{
     EngineGlobalLimits, EngineHandle, EngineJob, EngineNetworkFeatures, EnginePeerSnapshot,
@@ -442,11 +443,11 @@ pub fn build_transmission_router(state: AppState) -> Router {
         .route("/api/transmission/rpc", post(rpc))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
-            transmission_auth_guard,
+            transmission_idempotency_guard,
         ))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
-            transmission_idempotency_guard,
+            transmission_auth_guard,
         ))
         .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
         .with_state(state)
@@ -533,6 +534,13 @@ async fn transmission_idempotency_guard(
 }
 
 fn replay_idempotent_response(cached: CachedResponse) -> Response {
+    if cached.body.len() > MAX_IDEMPOTENCY_BODY_BYTES {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "cached idempotency response exceeded the replay limit",
+        )
+            .into_response();
+    }
     let mut response = Response::new(Body::from(cached.body));
     *response.status_mut() = StatusCode::from_u16(cached.status).unwrap_or(StatusCode::OK);
     for (name, value) in cached.headers {
@@ -560,12 +568,12 @@ async fn transmission_auth_guard(
         return next.run(req).await;
     }
     if transmission_bearer_token(req.headers())
-        .is_some_and(|token| state.api_tokens.iter().any(|allowed| allowed == &token))
+        .is_some_and(|token| api_token_allowed(&state.api_tokens, &token))
     {
         return next.run(req).await;
     }
     if session_cookie_value(req.headers(), &["tng_session", "SID"])
-        .is_some_and(|token| state.api_tokens.iter().any(|allowed| allowed == &token))
+        .is_some_and(|token| api_token_allowed(&state.api_tokens, &token))
     {
         if transmission_is_mutating(&req) && !csrf_request_allowed(req.headers()) {
             return (StatusCode::FORBIDDEN, "cross-site cookie mutation rejected").into_response();

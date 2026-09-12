@@ -45,6 +45,7 @@ const TYPE_OPTIONS = [
   { value: 'image', label: 'ISO / Images', icon: '💿' },
   { value: 'game', label: 'Games', icon: '🎮' },
   { value: 'software', label: 'Software / Archives', icon: '🧩' },
+  { value: 'other', label: 'Other', icon: '📦' },
 ]
 
 const SORT_OPTIONS = [

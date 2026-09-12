@@ -210,8 +210,10 @@ invalid_pieces
 started_at / updated_at
 state: queued | running | paused | commit_pending | cancelled | completed
 
-`commit_pending` is the storage-move boundary after filesystem work has
-committed but before the engine has durably published the new save path. It is
+`commit_pending` is normally the storage-move boundary after filesystem work
+has committed but before the engine has durably published the new save path.
+It is also the recoverable filesystem-commit marker used when a storage plan's
+terminal job write fails after all filesystem steps have completed. It is
 retriable/recovered state, not a successful terminal result.
 ```
 

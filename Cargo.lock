@@ -1341,6 +1341,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "subtle",
  "tokio",
 ]
 
@@ -1362,7 +1363,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "subtle",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -1401,6 +1401,7 @@ name = "rt-api-rtorrent"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
+ "rt-api-model",
  "rt-engine",
  "rt-metainfo",
  "rt-metrics",

@@ -5,6 +5,7 @@ use tokio::sync::oneshot;
 
 use rt_metainfo::{MagnetLink, TorrentMeta, TorrentMetaV1};
 use rt_metrics::{MemoryClass, MemoryLease, ResourceSnapshot};
+use rt_session::TorrentState;
 use rt_storage::{StorageIoStats, StoragePlan, STORAGE_LATENCY_BUCKET_COUNT};
 
 use crate::torrent_task::TorrentCmd;
@@ -202,6 +203,16 @@ pub struct EngineStats {
     pub tracker_peer_cache_bytes: u64,
     pub hot_torrent_memory_top: Vec<HotTorrentMemoryStats>,
     pub resources: Option<ResourceSnapshot>,
+}
+
+/// A bounded, per-torrent runtime sample requested by the visible-row API.
+/// This deliberately stays separate from `EngineStats`, whose collection is
+/// an aggregate observability path and may inspect every promoted task.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TorrentLiveStats {
+    pub info_hash: String,
+    pub download_rate: i64,
+    pub upload_rate: i64,
 }
 
 /// Liveness of the engine-owned dependency boundaries. A healthy engine
@@ -874,6 +885,14 @@ pub enum EngineCmd {
         meta: CmdResult<TorrentMeta>,
         blob: CmdResult<()>,
     },
+    /// Internal completion from detached DHT-registration metadata parsing.
+    /// The engine actor validates that the task and lifecycle are still
+    /// current before enqueueing the DHT command, preventing a late worker
+    /// result from re-registering a torrent after the user paused it.
+    RegisterDhtTorrent {
+        info_hash: String,
+        info_hash_bytes: [u8; 20],
+    },
     /// Route a peer whose handshake identified a currently dormant torrent.
     /// The engine promotes the torrent before forwarding this command.
     IncomingPeer {
@@ -1063,10 +1082,12 @@ pub enum EngineCmd {
     StoragePlanFinished {
         job_id: String,
         affected_torrents: Vec<(String, bool)>,
+        manual_recovery_torrents: Vec<String>,
         succeeded: bool,
         terminal_state: String,
         error: Option<String>,
         completed_steps: Vec<usize>,
+        requires_manual_recovery: bool,
     },
     /// Internal completion notification for asynchronous torrent payload
     /// deletion. Unlike a generic plan, successful deletion finalizes any
@@ -1078,6 +1099,7 @@ pub enum EngineCmd {
         terminal_state: String,
         error: Option<String>,
         completed_steps: Vec<usize>,
+        requires_manual_recovery: bool,
         quiesced: Vec<(String, bool)>,
     },
     /// Internal completion notification for an asynchronous save-path move.
@@ -1092,6 +1114,7 @@ pub enum EngineCmd {
         terminal_state: String,
         error: Option<String>,
         completed_steps: Vec<usize>,
+        requires_manual_recovery: bool,
         retry_attempt: u8,
     },
     /// Internal completion notification for a pure-v2 recheck executed off
@@ -1100,6 +1123,7 @@ pub enum EngineCmd {
     PureV2RecheckFinished {
         info_hash: String,
         job_id: Option<String>,
+        restore_state: Option<TorrentState>,
         total_length: u64,
         total_files: i64,
         done: i64,
@@ -1161,6 +1185,13 @@ pub enum EngineCmd {
     /// entire session registry for compatibility log endpoints.
     GetActiveTorrentPeers {
         reply: oneshot::Sender<CmdResult<ActiveTorrentPeers>>,
+    },
+    /// Read runtime rates only for the explicitly requested promoted tasks.
+    /// Dormant or unknown torrents are omitted instead of causing a registry
+    /// or global stats traversal.
+    GetTorrentLiveStats {
+        info_hashes: Vec<String>,
+        reply: oneshot::Sender<CmdResult<Vec<TorrentLiveStats>>>,
     },
     GetTorrentWebseeds {
         info_hash: String,

@@ -19,7 +19,9 @@ use tower_http::services::{ServeDir, ServeFile};
 use tracing::info;
 
 use rt_api_deluge::AppState as DelugeState;
-use rt_api_model::{csrf_request_allowed, session_cookie_value, ApiRuntimeMetrics};
+use rt_api_model::{
+    api_token_allowed, csrf_request_allowed, session_cookie_value, ApiRuntimeMetrics,
+};
 use rt_api_native::state::AppState as NativeState;
 use rt_api_qbit::state::AppState as QbitState;
 use rt_api_transmission::AppState as TransmissionState;
@@ -283,13 +285,11 @@ async fn daemon_auth_guard(
         return next.run(req).await;
     }
 
-    if bearer_token(req.headers())
-        .is_some_and(|token| api_tokens.iter().any(|allowed| allowed == &token))
-    {
+    if bearer_token(req.headers()).is_some_and(|token| api_token_allowed(&api_tokens, &token)) {
         return next.run(req).await;
     }
     if session_cookie_value(req.headers(), &["tng_session", "SID"])
-        .is_some_and(|token| api_tokens.iter().any(|allowed| allowed == &token))
+        .is_some_and(|token| api_token_allowed(&api_tokens, &token))
     {
         if daemon_is_mutating(&req) && !csrf_request_allowed(req.headers()) {
             return (StatusCode::FORBIDDEN, "cross-site cookie mutation rejected").into_response();

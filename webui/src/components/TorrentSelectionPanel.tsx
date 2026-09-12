@@ -32,9 +32,11 @@ function fmtSpeed(bps: number): string {
 }
 
 function statusFor(t: TorrentSummary): Status {
-  if (t.message && !t.is_active) return { label: 'Error', color: 'var(--danger)' }
+  if (t.state === 5 || (t.message && !t.is_active)) return { label: 'Error', color: 'var(--danger)' }
   if (t.state === 0) return { label: 'Stopped', color: 'var(--faint)' }
   if (t.state === 2) return { label: 'Checking', color: 'var(--warning)' }
+  if (t.state === 4) return { label: 'Metadata', color: 'var(--muted)' }
+  if (t.state === 3) return { label: 'Queued', color: 'var(--muted)' }
   if (t.complete && t.is_active) return { label: 'Seeding', color: 'var(--success)' }
   if (!t.complete && t.is_active) return { label: 'Downloading', color: 'var(--accent)' }
   if (t.is_open) return { label: 'Stalled', color: 'var(--warning)' }

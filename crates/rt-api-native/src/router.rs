@@ -15,20 +15,20 @@ use crate::{
         delete_saved_json, delete_tag, delete_torrent, diagnose_torrent, engine_commands,
         engine_diagnostics, get_torrent, get_user_agent, health, list_json_map,
         list_session_events, list_torrent_files, list_torrent_trackers, list_torrents,
-        list_workflow_runs, logs, metrics, patch_torrent_files, patch_torrent_trackers, pause_job,
-        pause_torrent, reannounce_torrent, recheck_torrent, remove_torrent_tags, restart_engine,
-        resume_job, resume_torrent, rtorrent_settings, run_json_workflow, save_rtorrent_settings,
-        session_features, set_torrent_category, set_user_agent, sidebar_facets, storage,
-        storage_execute_plan, storage_preview_plan, stream_events, tags, test_rss_rules,
-        torrent_limits, tracker_health, transfer_info, transfer_limits, update_session_features,
-        update_torrent, update_torrent_limits, update_torrent_queue, update_transfer_limits,
-        upsert_category, upsert_json_map,
+        list_workflow_runs, live_torrent_stats, logs, metrics, patch_torrent_files,
+        patch_torrent_trackers, pause_job, pause_torrent, reannounce_torrent, recheck_torrent,
+        remove_torrent_tags, restart_engine, resume_job, resume_torrent, rtorrent_settings,
+        run_json_workflow, save_rtorrent_settings, session_features, set_torrent_category,
+        set_user_agent, sidebar_facets, storage, storage_execute_plan, storage_preview_plan,
+        stream_events, tags, test_rss_rules, torrent_limits, tracker_health, transfer_info,
+        transfer_limits, update_session_features, update_torrent, update_torrent_limits,
+        update_torrent_queue, update_transfer_limits, upsert_category, upsert_json_map,
     },
     state::AppState,
 };
 use rt_api_model::{
-    csrf_request_allowed, has_session_cookie, request_fingerprint, valid_idempotency_key,
-    CachedResponse, IdempotencyClaim, MAX_IDEMPOTENCY_BODY_BYTES,
+    api_token_allowed, csrf_request_allowed, has_session_cookie, request_fingerprint,
+    valid_idempotency_key, CachedResponse, IdempotencyClaim, MAX_IDEMPOTENCY_BODY_BYTES,
 };
 
 pub fn build_router(state: AppState) -> Router {
@@ -38,6 +38,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/auth/login", post(auth_login))
         .route("/api/v1/auth/logout", post(auth_logout))
         .route("/api/v1/torrents", get(list_torrents).post(add_torrent))
+        .route("/api/v1/torrents/live", get(live_torrent_stats))
         .route(
             "/api/v1/torrents/:hash",
             get(get_torrent).put(update_torrent).delete(delete_torrent),
@@ -173,12 +174,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/storage/execute", post(storage_execute_plan))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
-            native_auth_guard,
-        ))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
             native_idempotency_guard,
         ))
+        .route_layer(middleware::from_fn_with_state(state.clone(), native_auth_guard))
         // The metainfo parser accepts up to 64 MiB of raw torrent data. The
         // native JSON/base64 envelope is larger, so keep the transport bound
         // explicit instead of relying on axum's small default.
@@ -323,12 +321,13 @@ async fn native_auth_guard(
         return next.run(req).await;
     }
 
-    if native_bearer_token(req.headers()).is_some_and(|token| native_token_allowed(&state, &token))
+    if native_bearer_token(req.headers())
+        .is_some_and(|token| api_token_allowed(&state.api_tokens, &token))
     {
         return next.run(req).await;
     }
     if native_presented_token(req.headers())
-        .is_some_and(|token| native_token_allowed(&state, &token))
+        .is_some_and(|token| api_token_allowed(&state.api_tokens, &token))
     {
         if has_session_cookie(req.headers(), &["tng_session"])
             && is_mutating_request(&req)
@@ -362,10 +361,6 @@ fn native_public_path(path: &str) -> bool {
         path,
         "/health" | "/api/v1/auth/login" | "/api/v1/auth/logout"
     )
-}
-
-fn native_token_allowed(state: &AppState, token: &str) -> bool {
-    state.api_tokens.iter().any(|allowed| allowed == token)
 }
 
 fn native_presented_token(headers: &HeaderMap) -> Option<String> {

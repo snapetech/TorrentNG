@@ -352,6 +352,7 @@ impl TorrentSnapshot {
         category: Option<&str>,
         tag: Option<&str>,
         filter: Option<&str>,
+        media_type: Option<&str>,
     ) -> Option<Vec<usize>> {
         let mut candidates = if states.is_empty() {
             None
@@ -378,6 +379,16 @@ impl TorrentSnapshot {
         }
         if let Some(tag) = tag {
             let Some(indexes) = self.filters.by_tag.get(tag) else {
+                return Some(Vec::new());
+            };
+            candidates = Some(match candidates {
+                Some(current) => intersect_sorted(&current, &indexes.indices()),
+                None => indexes.indices(),
+            });
+        }
+        if let Some(media_type) = media_type.map(str::trim).filter(|value| !value.is_empty()) {
+            let media_type = media_type.to_ascii_lowercase();
+            let Some(indexes) = self.filters.by_media_type.get(media_type.as_str()) else {
                 return Some(Vec::new());
             };
             candidates = Some(match candidates {
@@ -440,22 +451,6 @@ impl TorrentSnapshot {
             .map(|(name, indexes)| (name.clone(), indexes.count()))
             .collect()
     }
-
-    pub(crate) fn state_counts(&self) -> Vec<(String, usize)> {
-        self.filters
-            .by_state
-            .iter()
-            .map(|(name, indexes)| (name.clone(), indexes.count()))
-            .collect()
-    }
-
-    pub(crate) fn media_type_counts(&self) -> Vec<(String, usize)> {
-        self.filters
-            .by_media_type
-            .iter()
-            .map(|(name, indexes)| (name.clone(), indexes.count()))
-            .collect()
-    }
 }
 
 fn build_filter_index(torrents: &ChunkedVec<TorrentSnapshotItem>) -> TorrentFilterIndex {
@@ -488,7 +483,7 @@ fn build_filter_index(torrents: &ChunkedVec<TorrentSnapshotItem>) -> TorrentFilt
             .or_default()
             .push(index);
         by_media_type
-            .entry(infer_media_type(&item.summary.name).to_owned())
+            .entry(infer_media_type(&item.summary).to_owned())
             .or_default()
             .push(index);
         if let Some(category) = &item.summary.category {
@@ -585,8 +580,8 @@ fn update_filter_index(
     );
     update_membership(
         &mut filters.by_media_type,
-        Some(infer_media_type(&old.summary.name)),
-        Some(infer_media_type(&new.summary.name)),
+        Some(infer_media_type(&old.summary)),
+        Some(infer_media_type(&new.summary)),
         index,
         len,
     );
@@ -667,23 +662,151 @@ fn search_text_ngrams(value: &str) -> (HashSet<u8>, HashSet<[u8; 2]>, HashSet<[u
     )
 }
 
-pub(crate) fn infer_media_type(name: &str) -> &'static str {
-    let lower = name.to_ascii_lowercase();
-    if [".mkv", ".mp4", ".avi", ".mov", ".webm"]
+fn is_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+}
+
+fn contains_word(haystack: &str, needle: &str) -> bool {
+    haystack.match_indices(needle).any(|(index, _)| {
+        let before_ok = haystack.as_bytes()[..index]
+            .last()
+            .map(|byte| !is_word_byte(*byte))
+            .unwrap_or(true);
+        let end = index + needle.len();
+        let after_ok = haystack.as_bytes()[end..]
+            .first()
+            .map(|byte| !is_word_byte(*byte))
+            .unwrap_or(true);
+        before_ok && after_ok
+    })
+}
+
+fn contains_extension(haystack: &str, extension: &str) -> bool {
+    haystack.match_indices(extension).any(|(index, _)| {
+        let end = index + extension.len();
+        haystack.as_bytes()[end..]
+            .first()
+            .map(|byte| !is_word_byte(*byte))
+            .unwrap_or(true)
+    })
+}
+
+fn contains_any_word(haystack: &str, words: &[&str]) -> bool {
+    words.iter().any(|word| contains_word(haystack, word))
+}
+
+fn contains_any_extension(haystack: &str, extensions: &[&str]) -> bool {
+    extensions
         .iter()
-        .any(|suffix| lower.ends_with(suffix))
+        .any(|extension| contains_extension(haystack, extension))
+}
+
+fn is_ebook(haystack: &str) -> bool {
+    contains_any_word(haystack, &["ebook", "ebooks", "book", "books", "audiobook"])
+        || contains_any_extension(
+            haystack,
+            &[".epub", ".mobi", ".azw3", ".pdf", ".cbz", ".cbr"],
+        )
+}
+
+fn contains_season_episode(haystack: &str) -> bool {
+    let bytes = haystack.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b's' && (index == 0 || !is_word_byte(bytes[index - 1])) {
+            let season_start = index + 1;
+            let mut cursor = season_start;
+            while cursor < bytes.len()
+                && bytes[cursor].is_ascii_digit()
+                && cursor - season_start < 2
+            {
+                cursor += 1;
+            }
+            if cursor > season_start && cursor < bytes.len() && bytes[cursor] == b'e' {
+                let episode_start = cursor + 1;
+                let mut end = episode_start;
+                while end < bytes.len() && bytes[end].is_ascii_digit() && end - episode_start < 3 {
+                    end += 1;
+                }
+                if end > episode_start && (end == bytes.len() || !is_word_byte(bytes[end])) {
+                    return true;
+                }
+            }
+        }
+        index += 1;
+    }
+    false
+}
+
+pub(crate) fn infer_media_type(summary: &TorrentSummary) -> &'static str {
+    let category = summary.category.as_deref().unwrap_or_default();
+    let tags = summary.tags.join(" ");
+    let haystack = format!(
+        "{} {} {} {}",
+        summary.name, category, tags, summary.save_path
+    )
+    .to_ascii_lowercase();
+
+    if is_ebook(&haystack) {
+        "ebook"
+    } else if contains_any_word(
+        &haystack,
+        &["season", "episode", "hdtv", "web-dl", "webrip", "tv"],
+    ) || contains_season_episode(&haystack)
     {
+        "tv"
+    } else if contains_any_word(
+        &haystack,
+        &[
+            "movie", "movies", "film", "bluray", "bdrip", "dvdrip", "x264", "x265", "h.264",
+            "h.265", "2160p", "1080p", "720p",
+        ],
+    ) || contains_any_extension(
+        &haystack,
+        &[".mkv", ".mp4", ".avi", ".mov", ".wmv", ".m4v"],
+    ) {
         "video"
-    } else if [".flac", ".mp3", ".ogg", ".m4a", ".wav"]
-        .iter()
-        .any(|suffix| lower.ends_with(suffix))
+    } else if contains_any_word(&haystack, &["music", "album", "discography"])
+        || contains_any_extension(
+            &haystack,
+            &[".flac", ".mp3", ".aac", ".ogg", ".opus", ".wav", ".m4a"],
+        )
     {
         "audio"
-    } else if [".zip", ".rar", ".7z", ".tar", ".gz"]
-        .iter()
-        .any(|suffix| lower.ends_with(suffix))
+    } else if contains_any_word(
+        &haystack,
+        &[
+            "iso",
+            "installer",
+            "image",
+            "linux",
+            "ubuntu",
+            "debian",
+            "archlinux",
+            "fedora",
+        ],
+    ) || contains_any_extension(&haystack, &[".iso", ".img", ".dmg"])
     {
-        "archive"
+        "image"
+    } else if contains_any_word(
+        &haystack,
+        &[
+            "game", "games", "gog", "steam", "switch", "ps4", "ps5", "xbox",
+        ],
+    ) {
+        "game"
+    } else if contains_any_word(
+        &haystack,
+        &[
+            "app", "software", "source", "code", "github", "windows", "macos", "linux",
+        ],
+    ) || contains_any_extension(
+        &haystack,
+        &[
+            ".exe", ".msi", ".pkg", ".deb", ".rpm", ".zip", ".tar", ".gz", ".xz", ".7z", ".rar",
+        ],
+    ) {
+        "software"
     } else {
         "other"
     }
@@ -927,7 +1050,7 @@ mod tests {
             filters: Arc::new(refreshed.1),
         };
         assert_eq!(
-            refreshed_snapshot.candidate_indices(&[], None, None, Some("after")),
+            refreshed_snapshot.candidate_indices(&[], None, None, Some("after"), None),
             Some(vec![0])
         );
     }
@@ -1045,26 +1168,26 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            snapshot.candidate_indices(&[], None, None, Some("P")),
+            snapshot.candidate_indices(&[], None, None, Some("P"), None),
             Some(vec![alpha_index])
         );
         assert_eq!(
-            snapshot.candidate_indices(&[], None, None, Some("ph")),
+            snapshot.candidate_indices(&[], None, None, Some("ph"), None),
             Some(vec![alpha_index])
         );
         let release_candidates = snapshot
-            .candidate_indices(&[], None, None, Some("release"))
+            .candidate_indices(&[], None, None, Some("release"), None)
             .unwrap();
         assert_eq!(
             release_candidates,
             vec![alpha_index.min(zulu_index), alpha_index.max(zulu_index)]
         );
         assert_eq!(
-            snapshot.candidate_indices(&[], None, None, Some("qq")),
+            snapshot.candidate_indices(&[], None, None, Some("qq"), None),
             Some(Vec::new())
         );
         assert_eq!(
-            snapshot.candidate_indices(&[], None, None, Some("   ")),
+            snapshot.candidate_indices(&[], None, None, Some("   "), None),
             None
         );
     }
@@ -1122,6 +1245,6 @@ mod tests {
         };
         update_filter_index(&mut filters, 1, &old, &new, items.len());
         assert_eq!(counts(&filters).get("audio"), Some(&0));
-        assert_eq!(counts(&filters).get("archive"), Some(&1));
+        assert_eq!(counts(&filters).get("software"), Some(&1));
     }
 }

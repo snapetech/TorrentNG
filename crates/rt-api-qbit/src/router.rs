@@ -10,8 +10,8 @@ use axum::{
 
 use crate::{handlers::*, state::AppState};
 use rt_api_model::{
-    csrf_request_allowed, has_session_cookie, request_fingerprint, valid_idempotency_key,
-    CachedResponse, IdempotencyClaim, MAX_IDEMPOTENCY_BODY_BYTES,
+    api_token_allowed, csrf_request_allowed, has_session_cookie, request_fingerprint,
+    valid_idempotency_key, CachedResponse, IdempotencyClaim, MAX_IDEMPOTENCY_BODY_BYTES,
 };
 
 pub fn build_qbit_router(state: AppState) -> Router {
@@ -29,12 +29,9 @@ fn protected_qbit_routes(state: AppState) -> Router<AppState> {
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
-            qbit_auth_guard,
-        ))
-        .route_layer(middleware::from_fn_with_state(
-            state,
             qbit_idempotency_guard,
         ))
+        .route_layer(middleware::from_fn_with_state(state, qbit_auth_guard))
 }
 
 async fn qbit_idempotency_guard(
@@ -163,10 +160,14 @@ async fn qbit_auth_guard(
         return next.run(req).await;
     }
 
-    if qbit_bearer_token(req.headers()).is_some_and(|token| qbit_token_allowed(&state, &token)) {
+    if qbit_bearer_token(req.headers())
+        .is_some_and(|token| api_token_allowed(&state.api_tokens, &token))
+    {
         return next.run(req).await;
     }
-    if qbit_presented_token(req.headers()).is_some_and(|token| qbit_token_allowed(&state, &token)) {
+    if qbit_presented_token(req.headers())
+        .is_some_and(|token| api_token_allowed(&state.api_tokens, &token))
+    {
         if has_session_cookie(req.headers(), &["SID"])
             && is_mutating_request(&req)
             && !csrf_request_allowed(req.headers())
@@ -196,10 +197,6 @@ fn is_mutating_request(req: &Request<Body>) -> bool {
 
 fn qbit_public_path(path: &str) -> bool {
     path.ends_with("/auth/login") || path.ends_with("/auth/logout")
-}
-
-fn qbit_token_allowed(state: &AppState, token: &str) -> bool {
-    state.api_tokens.iter().any(|allowed| allowed == token)
 }
 
 fn qbit_presented_token(headers: &HeaderMap) -> Option<String> {

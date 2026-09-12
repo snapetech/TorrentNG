@@ -39,7 +39,6 @@ const MAX_METADATA_FETCH_CONCURRENCY: usize = 8;
 const METADATA_PEER_RETRY_AFTER: Duration = Duration::from_secs(15);
 const METADATA_PEER_ATTEMPT_CACHE_MIN: usize = 256;
 const METADATA_PEER_ATTEMPT_CACHE_MULTIPLIER: usize = 4;
-const METADATA_ENGINE_SEND_TIMEOUT: Duration = Duration::from_millis(500);
 const METADATA_PEER_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,7 +202,7 @@ pub async fn run_metadata_task(
                         }
                         return;
                     }
-                    TorrentCmd::Pause => {
+                    TorrentCmd::Pause { reply } => {
                         if !paused {
                             announce_trackers(
                                 info_hash,
@@ -219,11 +218,17 @@ pub async fn run_metadata_task(
                             .await;
                         }
                         paused = true;
+                        if let Some(reply) = reply {
+                            let _ = reply.send(Ok(()));
+                        }
                     }
-                    TorrentCmd::Resume => {
+                    TorrentCmd::Resume { reply } => {
                         paused = false;
                         tracker_event = TrackerEvent::Started;
                         tracker_tick.reset_immediately();
+                        if let Some(reply) = reply {
+                            let _ = reply.send(Ok(()));
+                        }
                     }
                     TorrentCmd::Reannounce => {
                         paused = false;
@@ -243,7 +248,7 @@ pub async fn run_metadata_task(
                         // for a torrent still in this pre-metadata state,
                         // so there is nothing on disk a move could race --
                         // reply immediately with the current paused state.
-                        let _ = reply.send(paused);
+                        let _ = reply.send(Ok(paused));
                     }
                     TorrentCmd::ResumeAfterStorageMove { resume_paused, .. } => {
                         paused = resume_paused;
@@ -493,27 +498,15 @@ async fn complete_metadata(
     info: Vec<u8>,
 ) -> bool {
     let raw = build_torrent_from_info(&info, trackers);
-    match timeout(
-        METADATA_ENGINE_SEND_TIMEOUT,
-        engine_tx.send(EngineCmd::CompleteMagnet {
+    crate::engine::send_engine_command_until_delivered(
+        engine_tx.clone(),
+        EngineCmd::CompleteMagnet {
             info_hash: info_hash_hex.to_owned(),
             raw,
-        }),
+        },
+        "metadata_completion",
     )
     .await
-    {
-        Ok(Ok(())) => true,
-        Ok(Err(_)) | Err(_) => {
-            warn!(
-                component = "metadata",
-                operation = "complete_magnet",
-                torrent = %info_hash_hex,
-                result = "engine_unavailable",
-                "metadata was fetched but the engine could not accept completion"
-            );
-            false
-        }
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1365,6 +1358,45 @@ mod tests {
             other => panic!("unexpected engine command: {other:?}"),
         }
         peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn metadata_completion_waits_for_a_full_engine_mailbox() {
+        let (engine_tx, mut engine_rx) = mpsc::channel(1);
+        let (shutdown_reply, _shutdown_result) = tokio::sync::oneshot::channel();
+        engine_tx
+            .try_send(EngineCmd::Shutdown {
+                reply: shutdown_reply,
+            })
+            .unwrap();
+
+        let engine_tx_for_task = engine_tx.clone();
+        let info_hash = "a".repeat(40);
+        let trackers = Vec::new();
+        let mut completion = tokio::spawn(async move {
+            complete_metadata(
+                &engine_tx_for_task,
+                &info_hash,
+                &trackers,
+                b"d4:name4:test6:lengthi1ee".to_vec(),
+            )
+            .await
+        });
+        assert!(timeout(Duration::from_millis(50), &mut completion)
+            .await
+            .is_err());
+        assert!(matches!(
+            engine_rx.recv().await,
+            Some(EngineCmd::Shutdown { .. })
+        ));
+        assert!(timeout(Duration::from_secs(1), &mut completion)
+            .await
+            .unwrap()
+            .unwrap());
+        assert!(matches!(
+            engine_rx.recv().await,
+            Some(EngineCmd::CompleteMagnet { .. })
+        ));
     }
 
     #[test]

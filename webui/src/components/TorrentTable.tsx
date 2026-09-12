@@ -1,6 +1,7 @@
 import { useRef, useEffect, useMemo, useState } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import type { TorrentSummary, ListParams } from '../api/client'
+import { useLiveTorrentStats, useSmoothedLiveRates, type SmoothedLiveRate } from '../hooks/useTorrents'
 import type { MediaInferenceMode } from './AppearancePanel'
 import { maskAnnounceUrl } from '../lib/maskUrl'
 
@@ -55,17 +56,66 @@ function fmtDuration(seconds: number): string {
   return `${secs}s`
 }
 
-function remainingBytes(t: TorrentSummary): number {
+function remainingBytes(t: TorrentSummary, live?: SmoothedLiveRate): number {
+  if (live?.fresh) return Math.max(0, live.amountLeft)
   return Math.max(0, t.size_bytes - t.bytes_done)
 }
 
-function fmtEta(t: TorrentSummary): string {
-  if (t.size_bytes <= 0) return '—'
-  const remaining = remainingBytes(t)
-  if (remaining === 0 || t.complete) return 'Done'
-  if (t.down_rate > 0) return fmtDuration(remaining / t.down_rate)
-  if (t.is_open && !t.message) return '∞'
-  return '—'
+interface EtaDisplay {
+  label: string
+  title: string
+  color: string
+}
+
+function fmtEta(t: TorrentSummary, live?: SmoothedLiveRate): EtaDisplay {
+  if (t.state === 5 || (t.message && !t.is_active)) {
+    return {
+      label: '—',
+      title: t.message ? `Unavailable: ${t.message}` : 'Torrent is in an error state',
+      color: 'var(--danger)',
+    }
+  }
+  if (t.state === 4) {
+    return { label: 'Meta…', title: 'Waiting for torrent metadata', color: 'var(--muted)' }
+  }
+  if (t.state === 3) {
+    return { label: 'Queued', title: 'Waiting to download', color: 'var(--muted)' }
+  }
+  if (t.state === 2) {
+    return { label: 'Check…', title: 'Checking torrent data', color: 'var(--warning)' }
+  }
+  if (t.size_bytes <= 0) {
+    return {
+      label: t.is_active ? 'Calc…' : '—',
+      title: 'Waiting for torrent metadata',
+      color: 'var(--faint)',
+    }
+  }
+  const remaining = remainingBytes(t, live)
+  if (remaining === 0 || t.complete) {
+    return { label: 'Done', title: 'Complete', color: 'var(--success)' }
+  }
+  if (t.message && !t.is_active) {
+    return { label: '—', title: `Unavailable: ${t.message}`, color: 'var(--danger)' }
+  }
+  if (t.state === 0 || !t.is_open) {
+    return { label: 'Paused', title: 'Paused or stopped', color: 'var(--faint)' }
+  }
+  if (!t.is_active) {
+    return { label: 'Queued', title: 'Waiting to download', color: 'var(--muted)' }
+  }
+  const rate = live?.fresh ? live.downloadRate : t.down_rate
+  if (rate > 0) {
+    return {
+      label: fmtDuration(remaining / rate),
+      title: `${remaining.toLocaleString()} bytes at ${fmtSpeed(rate)}`,
+      color: 'var(--accent)',
+    }
+  }
+  if (live?.fresh) {
+    return { label: 'Stalled', title: 'Downloading, but no current download rate', color: 'var(--warning)' }
+  }
+  return { label: 'Calc…', title: 'Collecting a live download rate', color: 'var(--muted)' }
 }
 
 function priorityLabel(priority: number): string {
@@ -81,9 +131,11 @@ function shortPath(path: string): string {
 }
 
 function statusLabel(t: TorrentSummary): { label: string; accessibleLabel: string; color: string } {
-  if (t.message && !t.is_active) return { label: 'Error', accessibleLabel: 'Error', color: 'var(--danger)' }
+  if (t.state === 5 || (t.message && !t.is_active)) return { label: 'Error', accessibleLabel: 'Error', color: 'var(--danger)' }
   if (t.state === 0) return { label: 'Stopped', accessibleLabel: 'Stopped', color: 'var(--faint)' }
   if (t.state === 2) return { label: 'Checking', accessibleLabel: 'Checking', color: 'var(--warning)' }
+  if (t.state === 4) return { label: 'Metadata', accessibleLabel: 'Waiting for metadata', color: 'var(--muted)' }
+  if (t.state === 3) return { label: 'Queued', accessibleLabel: 'Queued', color: 'var(--muted)' }
   if (t.complete && t.is_active) return { label: 'Seeding', accessibleLabel: 'Seeding', color: 'var(--success)' }
   if (!t.complete && t.is_active) return { label: 'DL', accessibleLabel: 'Downloading', color: 'var(--accent)' }
   if (t.is_open) return { label: 'Stalled', accessibleLabel: 'Stalled', color: 'var(--warning)' }
@@ -91,9 +143,11 @@ function statusLabel(t: TorrentSummary): { label: string; accessibleLabel: strin
 }
 
 function rowAccent(t: TorrentSummary): string {
-  if (t.message && !t.is_active) return 'var(--danger)'
+  if (t.state === 5 || (t.message && !t.is_active)) return 'var(--danger)'
   if (t.state === 0) return 'var(--faint)'
   if (t.state === 2) return 'var(--warning)'
+  if (t.state === 4) return 'var(--muted)'
+  if (t.state === 3) return 'var(--muted)'
   if (t.complete && t.is_active) return 'var(--success)'
   if (!t.complete && t.is_active) return 'var(--accent)'
   if (t.is_open) return 'var(--warning)'
@@ -500,6 +554,23 @@ export function TorrentTable({
   }, [columnsOpen])
 
   const items = virtualizer.getVirtualItems()
+  const viewportHeight = parentRef.current?.clientHeight ?? 0
+  const visibleItems = useMemo(() => {
+    if (viewportHeight <= 0) return items
+    const viewportStart = virtualizer.scrollOffset ?? 0
+    const viewportEnd = viewportStart + viewportHeight
+    return items.filter(item => item.end > viewportStart && item.start < viewportEnd)
+  }, [items, viewportHeight, virtualizer.scrollOffset])
+  const visibleLiveHashes = useMemo(
+    () => visibleItems
+      .map(item => torrents[item.index])
+      .filter((torrent): torrent is TorrentSummary => Boolean(torrent && torrent.is_active && !torrent.complete && torrent.size_bytes > 0))
+      .map(torrent => torrent.hash),
+    [visibleItems, torrents],
+  )
+  const liveDataNeeded = visibleCols.some(col => col.key === 'eta' || col.key === 'down_rate' || col.key === 'up_rate')
+  const liveStats = useLiveTorrentStats(visibleLiveHashes, liveDataNeeded)
+  const liveRates = useSmoothedLiveRates(liveStats.data)
   const activeSort = params.sort ?? 'name'
   const activeDir = params.dir ?? 'asc'
 
@@ -805,6 +876,11 @@ export function TorrentTable({
           <div role="rowgroup" style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
           {items.map(item => {
             const t = torrents[item.index]
+            const live = liveRates.get(t.hash)
+            const eta = fmtEta(t, live)
+            const remaining = remainingBytes(t, live)
+            const downRate = live?.fresh ? live.downloadRate : t.down_rate
+            const upRate = live?.fresh ? live.uploadRate : t.up_rate
             const { label, accessibleLabel, color } = statusLabel(t)
             const kind = mediaKind(t, mediaInference)
             const isSelected = selected.has(t.hash)
@@ -869,10 +945,10 @@ export function TorrentTable({
               ),
               size: <span style={{ color: 'var(--muted)' }}>{fmtSize(t.size_bytes)}</span>,
               progress: <ProgressCell value={t.size_bytes ? Math.min(100, Math.max(0, (t.bytes_done / t.size_bytes) * 100)) : null} />,
-              remaining: <span style={{ color: t.size_bytes <= 0 ? 'var(--faint)' : remainingBytes(t) ? 'var(--muted)' : 'var(--success)' }}>{t.size_bytes <= 0 ? '—' : remainingBytes(t) ? fmtSize(remainingBytes(t)) : 'Done'}</span>,
-              eta: <span title={t.down_rate > 0 ? `${remainingBytes(t).toLocaleString()} bytes at ${fmtSpeed(t.down_rate)}` : undefined} style={{ color: t.complete ? 'var(--success)' : t.is_open ? 'var(--warning)' : 'var(--faint)' }}>{fmtEta(t)}</span>,
-              down_rate: <span style={{ color: t.down_rate ? 'var(--accent)' : 'var(--faint)' }}>{fmtSpeed(t.down_rate)}</span>,
-              up_rate: <span style={{ color: t.up_rate ? 'var(--success)' : 'var(--faint)' }}>{fmtSpeed(t.up_rate)}</span>,
+              remaining: <span style={{ color: t.size_bytes <= 0 ? 'var(--faint)' : remaining ? 'var(--muted)' : 'var(--success)' }}>{t.size_bytes <= 0 ? '—' : remaining ? fmtSize(remaining) : 'Done'}</span>,
+              eta: <span title={eta.title} style={{ color: eta.color }}>{eta.label}</span>,
+              down_rate: <span style={{ color: downRate ? 'var(--accent)' : 'var(--faint)' }}>{fmtSpeed(downRate)}</span>,
+              up_rate: <span style={{ color: upRate ? 'var(--success)' : 'var(--faint)' }}>{fmtSpeed(upRate)}</span>,
               seeds: <span style={{ color: t.peers_complete ? 'var(--success)' : 'var(--faint)' }} title="Connected seeds">{t.peers_complete}</span>,
               peers: <span style={{ color: t.peers_connected ? 'var(--muted)' : 'var(--faint)' }} title="Connected peers">{t.peers_connected}</span>,
               ratio: <span style={{ color: t.ratio >= 1000 ? 'var(--success)' : 'var(--muted)' }}>{(t.ratio / 1000).toFixed(2)}</span>,

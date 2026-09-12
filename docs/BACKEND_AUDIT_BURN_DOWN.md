@@ -386,11 +386,13 @@ and is wired into both places a move or other in-place storage operation can
 happen.
 
 - Two new `TorrentCmd` variants (`crates/rt-engine/src/torrent_task.rs`):
-  `QuiesceForStorageMove { reply: oneshot::Sender<bool> }` disconnects every
-  peer, drains any peer event already buffered in the channel before
-  replying (so a leftover `Block` event from just before disconnect can't
-  still reach `handle_block` after the reply fires), and replies with
-  whether the torrent was already paused beforehand. `ResumeAfterStorageMove
+  `QuiesceForStorageMove { reply: oneshot::Sender<Result<bool, String>> }`
+  disconnects every peer, drains any peer event already buffered in the
+  channel before replying (so a leftover `Block` event from just before
+  disconnect can't still reach `handle_block` after the reply fires), and
+  replies with whether the torrent was already paused beforehand. The
+  acknowledgement fails if persisting the durable `Paused` state fails.
+  `ResumeAfterStorageMove
   { new_save_root: Option<PathBuf>, resume_paused: bool }` re-points
   `save_root` and rebuilds the `MountScheduler` bound to it (re-running
   device-topology detection rather than staying pinned to the pre-move

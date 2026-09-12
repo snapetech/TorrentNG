@@ -24,7 +24,6 @@ rt-session = { path = "../rt-session" }
 rt-storage = { path = "../rt-storage" }
 rt-utp = { path = "../rt-utp" }
 sha2.workspace = true
-subtle.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

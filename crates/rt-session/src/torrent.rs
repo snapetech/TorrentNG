@@ -203,9 +203,14 @@ impl TorrentEntry {
             (TorrentState::Checking, TorrentState::Paused) => true,
             (TorrentState::Checking, TorrentState::Stopped) => true,
             (TorrentState::Checking, TorrentState::Error) => true,
+            (TorrentState::Downloading, TorrentState::Checking) => true,
             (TorrentState::Downloading, TorrentState::Seeding) => true,
             (TorrentState::Downloading, TorrentState::Paused) => true,
             (TorrentState::Downloading, TorrentState::Error) => true,
+            // A reaped task is projected as Error so the failed runtime is
+            // isolated, but the public recovery path deliberately allows a
+            // later resume/recheck to reconstruct it.
+            (TorrentState::Error, TorrentState::Checking) => true,
             (TorrentState::Seeding, TorrentState::Paused) => true,
             (TorrentState::Seeding, TorrentState::Stopped) => true,
             (TorrentState::Seeding, TorrentState::Error) => true,
@@ -220,6 +225,10 @@ impl TorrentEntry {
             // `Seeding` value no matter what the recheck actually found.
             (TorrentState::Seeding, TorrentState::Checking) => true,
             (TorrentState::Seeding, TorrentState::Downloading) => true,
+            // A queued torrent can be explicitly resumed or rechecked.  It
+            // has no live transfer task while waiting for admission, so the
+            // first active projection is Checking rather than Downloading.
+            (TorrentState::Queued, TorrentState::Checking) => true,
             (TorrentState::Queued, TorrentState::Downloading) => true,
             (TorrentState::Queued, TorrentState::Seeding) => true,
             (TorrentState::Queued, TorrentState::Paused) => true,
@@ -233,8 +242,10 @@ impl TorrentEntry {
             });
         }
         self.state = target;
-        if target == TorrentState::Error {
-            // preserve error_message set by caller
+        if target != TorrentState::Error {
+            // A successful recovery transition clears the stale failure
+            // description retained by task-reaping/error projection.
+            self.error_message = None;
         }
         Ok(())
     }
@@ -307,6 +318,34 @@ mod tests {
 
         e.transition(TorrentState::Downloading).unwrap();
         assert_eq!(e.state, TorrentState::Downloading);
+    }
+
+    #[test]
+    fn downloading_torrent_can_be_rechecked() {
+        let mut e = entry();
+        e.transition(TorrentState::Downloading).unwrap();
+        e.transition(TorrentState::Checking).unwrap();
+        assert_eq!(e.state, TorrentState::Checking);
+    }
+
+    #[test]
+    fn queued_torrent_can_be_started_or_rechecked() {
+        let mut e = entry();
+        e.transition(TorrentState::Downloading).unwrap();
+        e.transition(TorrentState::Paused).unwrap();
+        e.state = TorrentState::Queued;
+
+        e.transition(TorrentState::Checking).unwrap();
+        assert_eq!(e.state, TorrentState::Checking);
+    }
+
+    #[test]
+    fn error_torrent_can_be_restarted_and_clears_error() {
+        let mut e = entry();
+        e.set_error("torrent task crashed");
+        e.transition(TorrentState::Checking).unwrap();
+        assert_eq!(e.state, TorrentState::Checking);
+        assert_eq!(e.error_message, None);
     }
 
     #[test]

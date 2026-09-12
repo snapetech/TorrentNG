@@ -358,7 +358,7 @@ pub fn list_torrent_hashes_by_tracker(
     let mut stmt = conn.prepare(
         "SELECT DISTINCT info_hash
          FROM torrent_trackers
-         WHERE instr(url, ?1) > 0
+         WHERE instr(lower(url), lower(?1)) > 0
          ORDER BY info_hash ASC",
     )?;
     let rows = stmt
@@ -638,6 +638,10 @@ mod tests {
         assert_eq!(all[0].status, "working");
         assert_eq!(
             list_torrent_hashes_by_tracker(&conn, "tracker/announce").unwrap(),
+            vec!["a".repeat(40)]
+        );
+        assert_eq!(
+            list_torrent_hashes_by_tracker(&conn, "TRACKER/ANNOUNCE").unwrap(),
             vec!["a".repeat(40)]
         );
         assert!(list_torrent_hashes_by_tracker(&conn, "[%]")

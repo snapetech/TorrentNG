@@ -4,6 +4,7 @@ use std::{
 };
 
 use base64::{engine::general_purpose, Engine as _};
+use rt_api_model::api_token_allowed;
 use rt_engine::{
     EngineGlobalLimits, EngineHandle, EnginePeerSnapshot, EngineTorrentFile, EngineTorrentLimits,
     EngineTorrentMetadata, EngineTrackerSnapshot,
@@ -211,8 +212,7 @@ pub async fn execute_xml_with_token(
     presented_token: Option<&str>,
 ) -> String {
     if !state.api_tokens.is_empty()
-        && !presented_token
-            .is_some_and(|token| state.api_tokens.iter().any(|allowed| allowed == token))
+        && !presented_token.is_some_and(|token| api_token_allowed(&state.api_tokens, token))
     {
         return fault_response(401, "unauthorized");
     }

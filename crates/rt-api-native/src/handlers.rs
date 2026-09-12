@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     convert::Infallible,
     net::SocketAddr,
     path::PathBuf,
@@ -20,12 +20,12 @@ use axum::{
 use base64::Engine as _;
 use futures::Stream;
 use rt_api_model::{
-    AddTorrentRequest, AddTorrentResponse, ApiError, ApiRuntimeMetricsSnapshot, ApiSseClientGuard,
-    FileInfo, TorrentDetail, TorrentSummary,
+    api_token_allowed, AddTorrentRequest, AddTorrentResponse, ApiError, ApiRuntimeMetricsSnapshot,
+    ApiSseClientGuard, FileInfo, TorrentDetail, TorrentSummary,
 };
 use rt_engine::{
     EngineGlobalLimits, EngineHandle, EngineJob, EngineNetworkFeatures, EngineStorageRoot,
-    EngineSubsystemHealth, EngineTorrentLimits, QueueMove,
+    EngineSubsystemHealth, EngineTorrentLimits, QueueMove, TorrentLiveStats,
 };
 use rt_metainfo::parse_magnet;
 use rt_metrics::MemoryClass;
@@ -36,10 +36,10 @@ use rt_storage::{
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
-use subtle::ConstantTimeEq;
 
 use crate::state::{
-    native_i64, native_usize_i64, torrent_summary, AppState, JsonMap, TorrentSnapshotError,
+    native_i64, native_usize_i64, torrent_summary, AppState, JsonMap, TorrentSnapshot,
+    TorrentSnapshotError,
 };
 
 const SSE_INITIAL_BATCH_DEFAULT: usize = 500;
@@ -47,6 +47,7 @@ const SSE_INITIAL_BATCH_MAX: usize = 1_000;
 const SSE_DELTA_MAX_ENTRIES: usize = 1_000;
 const SSE_SLOW_CLIENT_RESYNC_AFTER: Duration = Duration::from_secs(15);
 const MAX_TORRENT_LIST_OFFSET: usize = 1_000_000;
+const MAX_TORRENT_LIST_FILTER_BYTES: usize = 256;
 const TORRENT_LIST_INITIAL_CAPACITY: usize = 256;
 const SETTING_NATIVE_SAVED_VIEWS: &str = "native.saved_views";
 const SETTING_NATIVE_RATIO_GROUPS: &str = "native.ratio_groups";
@@ -129,6 +130,8 @@ pub struct TorrentListQuery {
     pub status: Option<String>,
     pub category: Option<String>,
     pub tag: Option<String>,
+    pub tracker: Option<String>,
+    pub media_type: Option<String>,
     pub sort: Option<String>,
     pub dir: Option<String>,
     pub reverse: Option<bool>,
@@ -146,24 +149,150 @@ pub struct TorrentListResponse {
     pub torrents: Vec<TorrentSummary>,
 }
 
+const MAX_TORRENT_LIVE_STATS: usize = 128;
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TorrentLiveStatsQuery {
+    pub hashes: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct TorrentLiveStatResponse {
+    hash: String,
+    amount_left: u64,
+    download_rate: i64,
+    upload_rate: i64,
+    sampled_at: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct TorrentLiveStatsResponse {
+    sampled_at: u64,
+    torrents: Vec<TorrentLiveStatResponse>,
+}
+
+fn parse_torrent_live_hashes(raw: Option<&str>) -> Result<Vec<String>, String> {
+    let raw = raw.ok_or_else(|| "hashes is required".to_owned())?;
+    let mut hashes = Vec::new();
+    let mut seen = HashSet::new();
+    for value in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if !matches!(value.len(), 40 | 64) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(
+                "hashes must contain 40- or 64-character hexadecimal info hashes".to_owned(),
+            );
+        }
+        let value = value.to_ascii_lowercase();
+        if seen.insert(value.clone()) {
+            hashes.push(value);
+        }
+    }
+    if hashes.is_empty() {
+        return Err("hashes must contain at least one info hash".to_owned());
+    }
+    if hashes.len() > MAX_TORRENT_LIVE_STATS {
+        return Err(format!(
+            "at most {MAX_TORRENT_LIVE_STATS} hashes may be requested"
+        ));
+    }
+    Ok(hashes)
+}
+
+/// `GET /api/v1/torrents/live?hashes=a,b,...` — bounded live rates for the
+/// explicitly visible torrents. This never invokes the aggregate stats path.
+pub async fn live_torrent_stats(
+    State(state): State<AppState>,
+    Query(query): Query<TorrentLiveStatsQuery>,
+) -> impl IntoResponse {
+    let hashes = match parse_torrent_live_hashes(query.hashes.as_deref()) {
+        Ok(hashes) => hashes,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::to_value(ApiError::bad_request(error)).unwrap()),
+            )
+                .into_response();
+        }
+    };
+
+    let rows = {
+        let registry = state.registry.read().await;
+        hashes
+            .iter()
+            .filter_map(|hash| {
+                registry
+                    .get(hash)
+                    .map(|entry| (hash.clone(), entry.amount_left))
+            })
+            .collect::<Vec<_>>()
+    };
+    let task_hashes = rows
+        .iter()
+        .map(|(hash, _)| hash.clone())
+        .collect::<Vec<_>>();
+    let runtime = match state.engine.as_ref() {
+        Some(engine) if !task_hashes.is_empty() => {
+            match engine.torrent_live_stats(task_hashes).await {
+                Ok(stats) => stats,
+                Err(error) => {
+                    tracing::warn!(
+                        component = "api",
+                        operation = "live_torrent_stats",
+                        result = "error",
+                        error = %error,
+                        "native live torrent stats query failed"
+                    );
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::to_value(ApiError::internal(error)).unwrap()),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        _ => Vec::new(),
+    };
+    let runtime = runtime
+        .into_iter()
+        .map(|stats| (stats.info_hash.clone(), stats))
+        .collect::<HashMap<String, TorrentLiveStats>>();
+    let sampled_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+    let torrents = rows
+        .into_iter()
+        .map(|(hash, amount_left)| {
+            let stats = runtime.get(&hash);
+            TorrentLiveStatResponse {
+                hash,
+                amount_left,
+                download_rate: stats.map_or(0, |stats| stats.download_rate.max(0)),
+                upload_rate: stats.map_or(0, |stats| stats.upload_rate.max(0)),
+                sampled_at,
+            }
+        })
+        .collect();
+    Json(TorrentLiveStatsResponse {
+        sampled_at,
+        torrents,
+    })
+    .into_response()
+}
+
 /// `GET /api/v1/torrents` — bounded, filterable, deterministic torrent list.
 pub async fn list_torrents(
     State(state): State<AppState>,
     Query(query): Query<TorrentListQuery>,
 ) -> impl IntoResponse {
-    if query
-        .filter
-        .as_deref()
-        .is_some_and(|filter| filter.len() > 256)
-    {
+    if let Some(error) = torrent_list_query_validation_error(&query) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(
-                serde_json::to_value(ApiError::bad_request(
-                    "filter is limited to 256 bytes".to_owned(),
-                ))
-                .unwrap(),
-            ),
+            Json(serde_json::to_value(ApiError::bad_request(error)).unwrap()),
         )
             .into_response();
     }
@@ -179,6 +308,16 @@ pub async fn list_torrents(
         )
             .into_response();
     }
+    let tracker_hashes = match tracker_filter_hashes(&state, query.tracker.as_deref()).await {
+        Ok(hashes) => hashes,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::to_value(ApiError::internal(error)).unwrap()),
+            )
+                .into_response();
+        }
+    };
     let snapshot = match state.torrent_snapshot(query.snapshot).await {
         Ok(snapshot) => snapshot,
         Err(TorrentSnapshotError::Expired { revision }) => {
@@ -200,7 +339,9 @@ pub async fn list_torrents(
         query.category.as_deref(),
         query.tag.as_deref(),
         query.filter.as_deref(),
+        query.media_type.as_deref(),
     );
+    let candidates = restrict_to_tracker(&snapshot, candidates, tracker_hashes.as_ref());
     let total = match candidates.as_ref() {
         Some(indices) => indices
             .iter()
@@ -288,6 +429,51 @@ pub async fn list_torrents(
         .into_response()
 }
 
+async fn tracker_filter_hashes(
+    state: &AppState,
+    tracker: Option<&str>,
+) -> Result<Option<HashSet<String>>, String> {
+    let Some(tracker) = tracker.map(str::trim).filter(|tracker| !tracker.is_empty()) else {
+        return Ok(None);
+    };
+    let Some(engine) = &state.engine else {
+        return Err("native engine is required for tracker filtering".to_owned());
+    };
+    engine
+        .torrent_hashes_by_tracker(tracker.to_owned())
+        .await
+        .map(|hashes| {
+            Some(
+                hashes
+                    .into_iter()
+                    .map(|hash| hash.to_ascii_lowercase())
+                    .collect(),
+            )
+        })
+}
+
+fn restrict_to_tracker(
+    snapshot: &TorrentSnapshot,
+    candidates: Option<Vec<usize>>,
+    tracker_hashes: Option<&HashSet<String>>,
+) -> Option<Vec<usize>> {
+    let Some(tracker_hashes) = tracker_hashes else {
+        return candidates;
+    };
+    let indices = candidates.unwrap_or_else(|| (0..snapshot.torrents.len()).collect());
+    Some(
+        indices
+            .into_iter()
+            .filter(|index| {
+                snapshot
+                    .torrents
+                    .get(*index)
+                    .is_some_and(|item| tracker_hashes.contains(&item.summary.info_hash))
+            })
+            .collect(),
+    )
+}
+
 fn indexed_status_states(status: Option<&str>) -> Vec<&'static str> {
     match status
         .map(str::trim)
@@ -295,8 +481,22 @@ fn indexed_status_states(status: Option<&str>) -> Vec<&'static str> {
         .map(str::to_ascii_lowercase)
         .as_deref()
     {
-        Some("active") => vec!["downloading", "seeding", "checking"],
-        Some("completed" | "complete") => vec!["seeding"],
+        // These buckets depend on projection flags rather than only the
+        // lifecycle enum (for example a completed torrent may be paused), so
+        // leave them unindexed and let the exact predicate below decide.
+        Some(
+            "active"
+            | "complete"
+            | "completed"
+            | "running"
+            | "inactive"
+            | "resumed"
+            | "stalled"
+            | "stalled_uploading"
+            | "stalled_downloading"
+            | "moving"
+            | "tracker_error",
+        ) => Vec::new(),
         Some("stopped") => vec!["stopped", "paused"],
         Some("checking") => vec!["checking"],
         Some("downloading") => vec!["downloading"],
@@ -331,10 +531,19 @@ fn torrent_matches_summary(entry: &TorrentSummary, query: &TorrentListQuery) -> 
     {
         let status = status.to_ascii_lowercase();
         let state = entry.state.as_str();
+        let (complete, active, open) = native_summary_flags(entry);
         let matches = match status.as_str() {
-            "active" => matches!(state, "downloading" | "seeding" | "checking"),
-            "completed" | "complete" => state == "seeding",
+            "active" | "resumed" => active,
+            "running" => open,
+            "inactive" => !active,
+            "seeding" => complete && active,
+            "downloading" => !complete && active,
+            "completed" | "complete" => complete,
             "stopped" => matches!(state, "stopped" | "paused"),
+            "tracker_error" => entry
+                .tracker_message
+                .as_deref()
+                .is_some_and(|message| !message.trim().is_empty()),
             value => state == value,
         };
         if !matches {
@@ -356,6 +565,18 @@ fn torrent_matches_summary(entry: &TorrentSummary, query: &TorrentListQuery) -> 
         return false;
     }
     true
+}
+
+fn native_summary_flags(entry: &TorrentSummary) -> (bool, bool, bool) {
+    let state = entry.state.as_str();
+    let complete =
+        state == "seeding" || (entry.total_length > 0 && entry.downloaded >= entry.total_length);
+    let active = matches!(state, "downloading" | "seeding" | "checking");
+    let open = matches!(
+        state,
+        "metadata_pending" | "checking" | "downloading" | "seeding"
+    );
+    (complete, active, open)
 }
 
 fn api_snapshot_budget_exhausted() -> axum::response::Response {
@@ -2875,24 +3096,132 @@ pub async fn tracker_health(State(state): State<AppState>) -> impl IntoResponse 
 }
 
 /// `GET /api/v1/sidebar-facets` — aggregate sidebar filter counts.
-pub async fn sidebar_facets(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn sidebar_facets(
+    State(state): State<AppState>,
+    Query(query): Query<TorrentListQuery>,
+) -> impl IntoResponse {
+    if let Some(error) = torrent_list_query_validation_error(&query) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError::bad_request(error)).unwrap()),
+        )
+            .into_response();
+    }
+    let tracker_hashes = match tracker_filter_hashes(&state, query.tracker.as_deref()).await {
+        Ok(hashes) => hashes,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::to_value(ApiError::internal(error)).unwrap()),
+            )
+                .into_response();
+        }
+    };
     let snapshot = match state.torrent_snapshot(None).await {
         Ok(snapshot) => snapshot,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let status = snapshot
-        .state_counts()
+    let shared_candidates = snapshot.candidate_indices(
+        &[],
+        query.category.as_deref(),
+        query.tag.as_deref(),
+        query.filter.as_deref(),
+        None,
+    );
+    let shared_candidates =
+        restrict_to_tracker(&snapshot, shared_candidates, tracker_hashes.as_ref())
+            .unwrap_or_else(|| (0..snapshot.torrents.len()).collect());
+    let status_keys = [
+        "all",
+        "downloading",
+        "seeding",
+        "completed",
+        "running",
+        "queued",
+        "stopped",
+        "active",
+        "inactive",
+        "stalled",
+        "stalled_uploading",
+        "stalled_downloading",
+        "checking",
+        "moving",
+        "error",
+        "tracker_error",
+    ];
+    let status = status_keys
         .into_iter()
+        .map(|key| {
+            (
+                key.to_owned(),
+                shared_candidates
+                    .iter()
+                    .filter_map(|index| snapshot.torrents.get(*index))
+                    .filter(|item| status_bucket_matches(&item.summary, key))
+                    .count(),
+            )
+        })
         .collect::<BTreeMap<_, _>>();
-    let media_type = snapshot
-        .media_type_counts()
-        .into_iter()
-        .collect::<BTreeMap<_, _>>();
+    let media_type = [
+        "ebook", "tv", "video", "audio", "image", "game", "software", "other",
+    ]
+    .into_iter()
+    .map(|key| {
+        let candidates = snapshot
+            .candidate_indices(
+                &[],
+                query.category.as_deref(),
+                query.tag.as_deref(),
+                query.filter.as_deref(),
+                Some(key),
+            )
+            .unwrap_or_default();
+        let candidates = restrict_to_tracker(&snapshot, Some(candidates), tracker_hashes.as_ref())
+            .unwrap_or_default();
+        (key.to_owned(), candidates.len())
+    })
+    .collect::<BTreeMap<_, _>>();
     (
         StatusCode::OK,
         Json(serde_json::json!({ "status": status, "media_type": media_type })),
     )
         .into_response()
+}
+
+fn torrent_list_query_validation_error(query: &TorrentListQuery) -> Option<&'static str> {
+    query
+        .filter
+        .as_deref()
+        .is_some_and(|filter| filter.len() > MAX_TORRENT_LIST_FILTER_BYTES)
+        .then_some("filter is limited to 256 bytes")
+}
+
+fn status_bucket_matches(entry: &TorrentSummary, bucket: &str) -> bool {
+    let state = entry.state.as_str();
+    let (complete, active, open) = native_summary_flags(entry);
+    match bucket {
+        "all" => true,
+        "downloading" => !complete && active,
+        "seeding" => complete && active,
+        "completed" => complete,
+        "running" => open,
+        "queued" => state == "queued",
+        "stopped" => matches!(state, "stopped" | "paused"),
+        "active" | "resumed" => active,
+        "inactive" => !active,
+        // The native summary intentionally does not include instantaneous
+        // rates; these buckets remain empty until a rate-aware list projection
+        // exists rather than claiming every active torrent is stalled.
+        "stalled" | "stalled_uploading" | "stalled_downloading" => false,
+        "checking" => state == "checking",
+        "moving" => false,
+        "error" | "errored" => state == "error",
+        "tracker_error" => entry
+            .tracker_message
+            .as_deref()
+            .is_some_and(|message| !message.trim().is_empty()),
+        _ => false,
+    }
 }
 
 /// `GET /api/v1/logs` — project durable session events as operator logs.
@@ -3227,6 +3556,13 @@ pub async fn storage_preview_plan(
     if let Some(response) = require_mutation_auth(&state, &headers) {
         return response;
     }
+    if let Err(error) = validate_client_completed_steps(req.completed_steps.as_deref()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError::bad_request(error)).unwrap()),
+        )
+            .into_response();
+    }
     let Some(engine) = &state.engine else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -3281,6 +3617,13 @@ pub async fn storage_execute_plan(
     if let Some(response) = require_mutation_auth(&state, &headers) {
         return response;
     }
+    if let Err(error) = validate_client_completed_steps(req.completed_steps.as_deref()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError::bad_request(error)).unwrap()),
+        )
+            .into_response();
+    }
     let Some(engine) = &state.engine else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -3326,7 +3669,7 @@ pub async fn storage_execute_plan(
                 .unwrap_or_else(|| req.operation.to_ascii_lowercase()),
             req.affected_torrents.unwrap_or_default(),
             plan.clone(),
-            req.completed_steps.unwrap_or_default(),
+            Vec::new(),
         )
         .await
     {
@@ -3467,7 +3810,9 @@ fn build_storage_plan(req: &StoragePlanRequest, preview: bool) -> Result<Storage
                 .destination
                 .clone()
                 .ok_or_else(|| "destination is required for move".to_owned())?,
-            bytes: req.bytes.unwrap_or(0),
+            bytes: req
+                .bytes
+                .ok_or_else(|| "bytes is required for move".to_owned())?,
             available_bytes: req.available_bytes,
             dry_run,
         })),
@@ -3480,7 +3825,9 @@ fn build_storage_plan(req: &StoragePlanRequest, preview: bool) -> Result<Storage
                 .destination
                 .clone()
                 .ok_or_else(|| "destination is required for import".to_owned())?,
-            bytes: req.bytes.unwrap_or(0),
+            bytes: req
+                .bytes
+                .ok_or_else(|| "bytes is required for import".to_owned())?,
             available_bytes: req.available_bytes,
             hardlink_or_copy: req.hardlink_or_copy.unwrap_or(false),
             dry_run,
@@ -3519,7 +3866,9 @@ fn build_storage_plan_under_roots(
                     .destination
                     .clone()
                     .ok_or_else(|| "destination is required for move".to_owned())?,
-                bytes: req.bytes.unwrap_or(0),
+                bytes: req
+                    .bytes
+                    .ok_or_else(|| "bytes is required for move".to_owned())?,
                 available_bytes: req.available_bytes,
                 dry_run,
             },
@@ -3536,7 +3885,9 @@ fn build_storage_plan_under_roots(
                     .destination
                     .clone()
                     .ok_or_else(|| "destination is required for import".to_owned())?,
-                bytes: req.bytes.unwrap_or(0),
+                bytes: req
+                    .bytes
+                    .ok_or_else(|| "bytes is required for import".to_owned())?,
                 available_bytes: req.available_bytes,
                 hardlink_or_copy: req.hardlink_or_copy.unwrap_or(false),
                 dry_run,
@@ -3577,6 +3928,16 @@ fn validate_completed_steps(
             "completed storage-plan step {index} is outside plan length {}",
             plan.steps.len()
         ));
+    }
+    Ok(())
+}
+
+fn validate_client_completed_steps(completed_steps: Option<&[usize]>) -> Result<(), String> {
+    if completed_steps.is_some_and(|steps| !steps.is_empty()) {
+        return Err(
+            "completed_steps is server-owned; resume the durable job instead of supplying indexes"
+                .to_owned(),
+        );
     }
     Ok(())
 }
@@ -6744,13 +7105,7 @@ fn require_mutation_auth(
 }
 
 fn token_allowed(state: &AppState, token: &str) -> bool {
-    // Constant-time comparison: `==` short-circuits on the first differing
-    // byte, which lets a network attacker recover a configured token
-    // byte-by-byte via response timing.
-    state
-        .api_tokens
-        .iter()
-        .any(|allowed| bool::from(allowed.as_bytes().ct_eq(token.as_bytes())))
+    api_token_allowed(&state.api_tokens, token)
 }
 
 fn auth_form_token(body: &str) -> Option<String> {
@@ -6911,6 +7266,33 @@ mod tests {
     }
 
     #[test]
+    fn live_stats_hash_parser_normalizes_and_bounds_requests() {
+        let hash = "A".repeat(40);
+        assert_eq!(
+            parse_torrent_live_hashes(Some(&format!("{hash},{hash}"))).unwrap(),
+            vec!["a".repeat(40)]
+        );
+        assert!(parse_torrent_live_hashes(Some("not-a-hash")).is_err());
+        assert!(parse_torrent_live_hashes(None).is_err());
+    }
+
+    #[tokio::test]
+    async fn live_stats_route_returns_requested_registry_rows_without_engine() {
+        let (app, hash) = setup_app_with_torrent().await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/api/v1/torrents/live?hashes={hash}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
     fn session_event_response_projects_level_and_payload() {
         let event = rt_db::SessionEventRow {
             event_id: Some(12),
@@ -7020,7 +7402,10 @@ mod tests {
             Some(destination.as_str())
         );
         assert_eq!(response.plan.rollback_steps.len(), 1);
-        assert_eq!(response.plan.rollback_steps[0].action, "safe_delete");
+        assert_eq!(
+            response.plan.rollback_steps[0].action,
+            "safe_delete_if_present"
+        );
     }
 
     #[test]
@@ -7050,7 +7435,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_plan_completed_steps_accept_sorted_unique_subset() {
+    fn storage_plan_completed_steps_are_bounded_for_internal_checkpoints() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("source.bin");
         let destination = dir.path().join("destination.bin");
@@ -7073,6 +7458,38 @@ mod tests {
         let plan = build_storage_plan(&req, false).unwrap();
 
         assert!(validate_completed_steps(&plan, req.completed_steps.as_deref()).is_ok());
+    }
+
+    #[test]
+    fn public_storage_plan_rejects_client_completed_steps() {
+        assert!(validate_client_completed_steps(Some(&[0])).is_err());
+        assert!(validate_client_completed_steps(Some(&[1, 2])).is_err());
+        assert!(validate_client_completed_steps(Some(&[])).is_ok());
+        assert!(validate_client_completed_steps(None).is_ok());
+    }
+
+    #[test]
+    fn storage_plan_move_requires_expected_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = StoragePlanRequest {
+            operation: "move".to_owned(),
+            source: Some(dir.path().join("source.bin")),
+            destination: Some(dir.path().join("destination.bin")),
+            target: None,
+            bytes: None,
+            available_bytes: None,
+            hardlink_or_copy: None,
+            dry_run: Some(true),
+            dry_run_approved: None,
+            affected_torrents: None,
+            roots: None,
+            completed_steps: None,
+        };
+
+        assert_eq!(
+            build_storage_plan(&req, true).unwrap_err(),
+            "bytes is required for move"
+        );
     }
 
     #[test]
@@ -7772,6 +8189,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_torrents_applies_native_ui_status_and_media_filters() {
+        let state = AppState::new();
+        let mut tracker_error = TorrentEntry::new(
+            "a".repeat(40),
+            "Example.Show.S01E02.1080p.mkv".to_owned(),
+            "/data".into(),
+        );
+        tracker_error.state = TorrentState::Downloading;
+        tracker_error.total_length = 100;
+        tracker_error.amount_left = 50;
+        tracker_error.tracker_message = Some("tracker rejected announce".to_owned());
+        let mut ebook = TorrentEntry::new(
+            "b".repeat(40),
+            "Example Book.epub".to_owned(),
+            "/data".into(),
+        );
+        ebook.state = TorrentState::Stopped;
+        {
+            let mut registry = state.registry.write().await;
+            registry.add(tracker_error).unwrap();
+            registry.add(ebook).unwrap();
+        }
+        let app = build_router(state);
+
+        let tracker_error_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/torrents?status=tracker_error")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let tracker_error_body = axum::body::to_bytes(tracker_error_response.into_body(), 4096)
+            .await
+            .unwrap();
+        let tracker_error_json: serde_json::Value =
+            serde_json::from_slice(&tracker_error_body).unwrap();
+        assert_eq!(tracker_error_json["total"], 1);
+        assert_eq!(
+            tracker_error_json["torrents"][0]["info_hash"],
+            "a".repeat(40)
+        );
+
+        let media_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/torrents?media_type=tv")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let media_body = axum::body::to_bytes(media_response.into_body(), 4096)
+            .await
+            .unwrap();
+        let media_json: serde_json::Value = serde_json::from_slice(&media_body).unwrap();
+        assert_eq!(media_json["total"], 1);
+        assert_eq!(
+            media_json["torrents"][0]["name"],
+            "Example.Show.S01E02.1080p.mkv"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_sidebar_facets_apply_shared_filters_and_include_tracker_errors() {
+        let state = AppState::new();
+        let mut tracker_error = TorrentEntry::new(
+            "a".repeat(40),
+            "Example.Show.S01E02.mkv".to_owned(),
+            "/data".into(),
+        );
+        tracker_error.state = TorrentState::Downloading;
+        tracker_error.tracker_message = Some("tracker rejected announce".to_owned());
+        let ebook = TorrentEntry::new(
+            "b".repeat(40),
+            "Example Book.epub".to_owned(),
+            "/data".into(),
+        );
+        {
+            let mut registry = state.registry.write().await;
+            registry.add(tracker_error).unwrap();
+            registry.add(ebook).unwrap();
+        }
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/sidebar-facets?filter=show")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"]["all"], 1);
+        assert_eq!(json["status"]["tracker_error"], 1);
+        assert_eq!(json["media_type"]["tv"], 1);
+        assert_eq!(json["media_type"]["ebook"], 0);
+    }
+
+    #[tokio::test]
+    async fn torrent_filter_limit_applies_to_sidebar_facets() {
+        let state = AppState::new();
+        let app = build_router(state);
+        let oversized_filter = "a".repeat(MAX_TORRENT_LIST_FILTER_BYTES + 1);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/sidebar-facets?filter={oversized_filter}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn list_torrents_reports_total_independent_of_page_size() {
         // TNG-021 acceptance: `total` is the full filtered count, not the
         // page size -- a caller must be able to tell "more exist" apart
@@ -8129,7 +8670,7 @@ mod tests {
 
     #[tokio::test]
     async fn idempotency_key_replays_native_mutation_and_rejects_reuse() {
-        let state = AppState::new();
+        let state = AppState::with_tokens(None, vec!["native-secret".to_owned()]);
         let hash = "c".repeat(40);
         {
             let mut registry = state.registry.write().await;
@@ -8149,6 +8690,7 @@ mod tests {
                     .method("PUT")
                     .uri(format!("/api/v1/torrents/{hash}/category"))
                     .header("content-type", "application/json")
+                    .header("authorization", "Bearer native-secret")
                     .header("idempotency-key", "category-c")
                     .body(Body::from(r#"{"category":"films"}"#))
                     .unwrap(),
@@ -8164,6 +8706,7 @@ mod tests {
                     .method("PUT")
                     .uri(format!("/api/v1/torrents/{hash}/category"))
                     .header("content-type", "application/json")
+                    .header("authorization", "Bearer native-secret")
                     .header("idempotency-key", "category-c")
                     .body(Body::from(r#"{"category":"films"}"#))
                     .unwrap(),
@@ -8187,12 +8730,28 @@ mod tests {
             Some("films")
         );
 
+        let unauthenticated_replay = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/v1/torrents/{hash}/category"))
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "category-c")
+                    .body(Body::from(r#"{"category":"films"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated_replay.status(), StatusCode::UNAUTHORIZED);
+
         let conflict = app
             .oneshot(
                 Request::builder()
                     .method("PUT")
                     .uri(format!("/api/v1/torrents/{hash}/category"))
                     .header("content-type", "application/json")
+                    .header("authorization", "Bearer native-secret")
                     .header("idempotency-key", "category-c")
                     .body(Body::from(r#"{"category":"tv"}"#))
                     .unwrap(),

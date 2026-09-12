@@ -109,66 +109,67 @@ fn contains_season_episode(haystack_lower: &str) -> bool {
 /// sidebar TYPE facet buckets. Mirrors the client-side icon heuristic in
 /// `webui/src/components/TorrentTable.tsx` but with correct word-boundary
 /// matching instead of raw substring search.
-pub fn matches(name: &str, category: &str, directory: &str, tags: &str, media_type: &str) -> bool {
+fn classify(name: &str, category: &str, directory: &str, tags: &str) -> &'static str {
     let haystack = format!("{name} {category} {tags} {directory}").to_ascii_lowercase();
-    match media_type {
-        "ebook" => is_ebook(&haystack),
-        "tv" => {
-            contains_any_word(
-                &haystack,
-                &["season", "episode", "hdtv", "web-dl", "webrip", "tv"],
-            ) || contains_season_episode(&haystack)
-        }
-        "video" => {
-            contains_any_word(
-                &haystack,
-                &[
-                    "movie", "movies", "film", "bluray", "bdrip", "dvdrip", "x264", "x265",
-                    "2160p", "1080p", "720p",
-                ],
-            ) || contains_any_ext(&haystack, &[".mkv", ".mp4", ".avi", ".mov", ".wmv", ".m4v"])
-        }
-        "audio" => {
-            contains_any_word(&haystack, &["music", "album", "discography"])
-                || contains_any_ext(
-                    &haystack,
-                    &[".flac", ".mp3", ".aac", ".ogg", ".opus", ".wav", ".m4a"],
-                )
-        }
-        "image" => {
-            contains_any_word(
-                &haystack,
-                &["installer", "image", "linux", "ubuntu", "debian", "fedora"],
-            ) || contains_any_ext(&haystack, &[".iso", ".img", ".dmg"])
-        }
-        // Match the client-side precedence: a clearly identified ebook is
-        // not also treated as a game just because its title contains the
-        // whole word "games" (e.g. "Empire Games 02.epub").
-        "game" => {
-            !is_ebook(&haystack)
-                && contains_any_word(
-                    &haystack,
-                    &[
-                        "game", "games", "gog", "steam", "switch", "ps4", "ps5", "xbox",
-                    ],
-                )
-        }
-        "software" => {
-            contains_any_word(
-                &haystack,
-                &[
-                    "app", "software", "source", "code", "github", "windows", "macos",
-                ],
-            ) || contains_any_ext(
-                &haystack,
-                &[
-                    ".exe", ".msi", ".pkg", ".deb", ".rpm", ".zip", ".tar", ".gz", ".xz", ".7z",
-                    ".rar",
-                ],
-            )
-        }
-        _ => false,
+    if is_ebook(&haystack) {
+        "ebook"
+    } else if contains_any_word(
+        &haystack,
+        &["season", "episode", "hdtv", "web-dl", "webrip", "tv"],
+    ) || contains_season_episode(&haystack)
+    {
+        "tv"
+    } else if contains_any_word(
+        &haystack,
+        &[
+            "movie", "movies", "film", "bluray", "bdrip", "dvdrip", "x264", "x265",
+            "h.264", "h.265", "2160p", "1080p", "720p",
+        ],
+    ) || contains_any_ext(&haystack, &[".mkv", ".mp4", ".avi", ".mov", ".wmv", ".m4v"])
+    {
+        "video"
+    } else if contains_any_word(&haystack, &["music", "album", "discography"])
+        || contains_any_ext(
+            &haystack,
+            &[".flac", ".mp3", ".aac", ".ogg", ".opus", ".wav", ".m4a"],
+        )
+    {
+        "audio"
+    } else if contains_any_word(
+        &haystack,
+        &[
+            "iso", "installer", "image", "linux", "ubuntu", "debian", "archlinux", "fedora",
+        ],
+    ) || contains_any_ext(&haystack, &[".iso", ".img", ".dmg"])
+    {
+        "image"
+    } else if contains_any_word(
+        &haystack,
+        &[
+            "game", "games", "gog", "steam", "switch", "ps4", "ps5", "xbox",
+        ],
+    ) {
+        "game"
+    } else if contains_any_word(
+        &haystack,
+        &[
+            "app", "software", "source", "code", "github", "windows", "macos", "linux",
+        ],
+    ) || contains_any_ext(
+        &haystack,
+        &[
+            ".exe", ".msi", ".pkg", ".deb", ".rpm", ".zip", ".tar", ".gz", ".xz", ".7z",
+            ".rar",
+        ],
+    ) {
+        "software"
+    } else {
+        "other"
     }
+}
+
+pub fn matches(name: &str, category: &str, directory: &str, tags: &str, media_type: &str) -> bool {
+    classify(name, category, directory, tags) == media_type
 }
 
 #[cfg(test)]
@@ -263,5 +264,12 @@ mod tests {
     #[test]
     fn type_hints_include_tags() {
         assert!(matches("untitled", "", "", "tv", "tv"));
+    }
+
+    #[test]
+    fn other_matches_without_a_specific_type_and_unknown_types_do_not() {
+        assert!(matches("plain document", "", "/downloads", "", "other"));
+        assert!(!matches("plain document", "", "/downloads", "", "unknown"));
+        assert!(!matches("movie.mkv", "", "/downloads", "", "other"));
     }
 }

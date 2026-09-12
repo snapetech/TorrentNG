@@ -17,6 +17,7 @@ const DHT_ANNOUNCED_PEERS_PER_INFO_HASH_CAP: usize = 512;
 const DHT_ANNOUNCED_PEER_SET_CAP: usize = 4_096;
 const DHT_ANNOUNCED_PEERS_GLOBAL_CAP: usize = 16_384;
 const DHT_TRACKED_TORRENTS_CAP: usize = 16_384;
+const DHT_COMMAND_GENERATION_CAP: usize = DHT_TRACKED_TORRENTS_CAP.saturating_mul(2);
 const DHT_QUERIED_NODES_PER_INFO_HASH_CAP: usize = 256;
 const DHT_OUTSTANDING_QUERY_CAP: usize = 8_192;
 const DHT_INGRESS_GLOBAL_PACKETS_PER_SECOND: u32 = 2_048;
@@ -97,11 +98,15 @@ impl DhtIngressBudget {
 pub struct DhtTorrent {
     pub info_hash: [u8; 20],
     pub cmd_tx: mpsc::Sender<TorrentCmd>,
+    pub generation: u64,
 }
 
 pub enum DhtCommand {
     AddTorrent(DhtTorrent),
-    RemoveTorrent([u8; 20]),
+    RemoveTorrent {
+        info_hash: [u8; 20],
+        generation: u64,
+    },
     GetStats {
         reply: oneshot::Sender<DhtRuntimeStats>,
     },
@@ -161,6 +166,7 @@ pub async fn run_dht(
         outstanding: HashMap::new(),
         queried_nodes: HashMap::new(),
         torrents: HashMap::new(),
+        generations: HashMap::new(),
         announced_peers: HashMap::new(),
         last_full_lookup: HashMap::new(),
     };
@@ -234,6 +240,10 @@ struct DhtTask {
     outstanding: HashMap<Vec<u8>, OutstandingQuery>,
     queried_nodes: HashMap<[u8; 20], HashSet<SocketAddrV4>>,
     torrents: HashMap<[u8; 20], mpsc::Sender<TorrentCmd>>,
+    /// Last accepted engine command generation, including removed torrents.
+    /// Retaining bounded tombstones prevents a delayed Add from resurrecting
+    /// a torrent after a later Remove was delivered first.
+    generations: HashMap<[u8; 20], u64>,
     announced_peers: HashMap<[u8; 20], Vec<SocketAddr>>,
     last_full_lookup: HashMap<[u8; 20], Instant>,
 }
@@ -267,9 +277,37 @@ struct OutstandingQuery {
 const OUTSTANDING_QUERY_TTL: Duration = Duration::from_secs(30);
 
 impl DhtTask {
+    fn accept_generation(&mut self, info_hash: [u8; 20], generation: u64) -> bool {
+        if self
+            .generations
+            .get(&info_hash)
+            .is_some_and(|current| *current >= generation)
+        {
+            return false;
+        }
+        if !self.generations.contains_key(&info_hash)
+            && self.generations.len() >= DHT_COMMAND_GENERATION_CAP
+        {
+            let evictable = self
+                .generations
+                .keys()
+                .find(|candidate| !self.torrents.contains_key(*candidate))
+                .copied();
+            let Some(evictable) = evictable else {
+                return false;
+            };
+            self.generations.remove(&evictable);
+        }
+        self.generations.insert(info_hash, generation);
+        true
+    }
+
     async fn handle_command(&mut self, cmd: DhtCommand) -> bool {
         match cmd {
             DhtCommand::AddTorrent(torrent) => {
+                if !self.accept_generation(torrent.info_hash, torrent.generation) {
+                    return true;
+                }
                 if !self.torrents.contains_key(&torrent.info_hash)
                     && self.torrents.len() >= DHT_TRACKED_TORRENTS_CAP
                 {
@@ -286,7 +324,13 @@ impl DhtTask {
                 self.torrents.insert(torrent.info_hash, torrent.cmd_tx);
                 self.search_torrent(torrent.info_hash, true).await;
             }
-            DhtCommand::RemoveTorrent(info_hash) => {
+            DhtCommand::RemoveTorrent {
+                info_hash,
+                generation,
+            } => {
+                if !self.accept_generation(info_hash, generation) {
+                    return true;
+                }
                 self.torrents.remove(&info_hash);
                 self.queried_nodes.remove(&info_hash);
                 self.announced_peers.remove(&info_hash);
@@ -975,6 +1019,7 @@ mod tests {
             torrents: HashMap::new(),
             announced_peers: HashMap::new(),
             last_full_lookup: HashMap::new(),
+            generations: HashMap::new(),
         };
 
         assert_eq!(task.transaction_id(), u16::MAX.to_be_bytes());
@@ -999,6 +1044,7 @@ mod tests {
             torrents: HashMap::new(),
             announced_peers: HashMap::new(),
             last_full_lookup: HashMap::new(),
+            generations: HashMap::new(),
         };
         task.table.insert(KNode {
             id: NodeId::from_bytes([2; 20]),
@@ -1029,6 +1075,7 @@ mod tests {
             torrents: HashMap::new(),
             announced_peers: HashMap::new(),
             last_full_lookup: HashMap::new(),
+            generations: HashMap::new(),
         };
         let addr: SocketAddr = "127.0.0.1:60000".parse().unwrap();
         let response =
@@ -1055,6 +1102,7 @@ mod tests {
             torrents: HashMap::new(),
             announced_peers: HashMap::new(),
             last_full_lookup: HashMap::new(),
+            generations: HashMap::new(),
         };
         let info_hash = [9; 20];
         let addr: SocketAddr = "127.0.0.1:60000".parse().unwrap();
@@ -1087,6 +1135,7 @@ mod tests {
             torrents: HashMap::new(),
             announced_peers: HashMap::new(),
             last_full_lookup: HashMap::new(),
+            generations: HashMap::new(),
         };
         let info_hash = [9; 20];
         let addr: SocketAddr = "[2001:db8::1]:60000".parse().unwrap();
@@ -1201,6 +1250,7 @@ mod tests {
             torrents: HashMap::from([(info_hash, cmd_tx)]),
             announced_peers: HashMap::from([(info_hash, vec![announced])]),
             last_full_lookup: HashMap::new(),
+            generations: HashMap::new(),
         };
         task.table.insert(KNode {
             id: NodeId::from_bytes([2; 20]),
@@ -1235,6 +1285,7 @@ mod tests {
             torrents: HashMap::new(),
             announced_peers: HashMap::new(),
             last_full_lookup: HashMap::new(),
+            generations: HashMap::new(),
         };
         let token = b"token".to_vec();
         let (tx, msg) = task.announce_peer_query([9; 20], token.clone());
@@ -1283,6 +1334,7 @@ mod tests {
             torrents: HashMap::from([(info_hash, cmd_tx)]),
             announced_peers: HashMap::new(),
             last_full_lookup: HashMap::new(),
+            generations: HashMap::new(),
         };
         let first = std::net::SocketAddrV4::new("127.0.0.1".parse().unwrap(), 6001);
         let second = std::net::SocketAddrV4::new("127.0.0.1".parse().unwrap(), 6002);
@@ -1326,6 +1378,7 @@ mod tests {
             torrents: HashMap::from([(info_hash, cmd_tx)]),
             announced_peers: HashMap::new(),
             last_full_lookup: HashMap::new(),
+            generations: HashMap::new(),
         };
         task.table.insert(KNode {
             id: NodeId::from_bytes([2; 20]),
@@ -1367,6 +1420,7 @@ mod tests {
             torrents: HashMap::from([(info_hash, cmd_tx)]),
             announced_peers: HashMap::new(),
             last_full_lookup: HashMap::new(),
+            generations: HashMap::new(),
         };
         let response = KrpcMessage::Response {
             transaction_id: b"gp".to_vec(),
@@ -1425,6 +1479,7 @@ mod tests {
             torrents: HashMap::from([(info_hash, cmd_tx)]),
             announced_peers: HashMap::new(),
             last_full_lookup: HashMap::new(),
+            generations: HashMap::new(),
         };
         let response = KrpcMessage::Response {
             transaction_id: b"gp".to_vec(),
@@ -1473,6 +1528,7 @@ mod tests {
             torrents: HashMap::new(),
             announced_peers: HashMap::new(),
             last_full_lookup: HashMap::new(),
+            generations: HashMap::new(),
         };
         let response = KrpcMessage::Response {
             transaction_id: b"zz".to_vec(),
@@ -1492,6 +1548,67 @@ mod tests {
             0,
             "an unsolicited response must not be merged into the routing table"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_dht_command_generation_cannot_resurrect_a_removed_torrent() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let socket = UdpSocket::from_std(socket).unwrap();
+        let local_id = NodeId::from_bytes([1; 20]);
+        let info_hash = [9; 20];
+        let (cmd_tx, _cmd_rx) = mpsc::channel(1);
+        let mut task = DhtTask {
+            local_id,
+            table: RoutingTable::new(local_id),
+            socket,
+            listen_port: 6881,
+            bootstrap_nodes: Vec::new(),
+            next_tx: 1,
+            outstanding: HashMap::new(),
+            queried_nodes: HashMap::new(),
+            torrents: HashMap::new(),
+            announced_peers: HashMap::new(),
+            last_full_lookup: HashMap::new(),
+            generations: HashMap::new(),
+        };
+
+        task.handle_command(DhtCommand::AddTorrent(DhtTorrent {
+            info_hash,
+            cmd_tx: cmd_tx.clone(),
+            generation: 10,
+        }))
+        .await;
+        task.handle_command(DhtCommand::RemoveTorrent {
+            info_hash,
+            generation: 12,
+        })
+        .await;
+        assert!(!task.torrents.contains_key(&info_hash));
+
+        // A retry from an older saturated-mailbox operation must not undo the
+        // newer removal, even if it reaches the DHT task after that removal.
+        task.handle_command(DhtCommand::AddTorrent(DhtTorrent {
+            info_hash,
+            cmd_tx: cmd_tx.clone(),
+            generation: 11,
+        }))
+        .await;
+        assert!(!task.torrents.contains_key(&info_hash));
+
+        task.handle_command(DhtCommand::AddTorrent(DhtTorrent {
+            info_hash,
+            cmd_tx,
+            generation: 13,
+        }))
+        .await;
+        assert!(task.torrents.contains_key(&info_hash));
+        task.handle_command(DhtCommand::RemoveTorrent {
+            info_hash,
+            generation: 12,
+        })
+        .await;
+        assert!(task.torrents.contains_key(&info_hash));
     }
 
     #[tokio::test]
@@ -1530,6 +1647,7 @@ mod tests {
             torrents: HashMap::new(),
             announced_peers: HashMap::new(),
             last_full_lookup: HashMap::new(),
+            generations: HashMap::new(),
         };
 
         task.prune_stale_outstanding();

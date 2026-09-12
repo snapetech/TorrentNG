@@ -1,4 +1,15 @@
 use http::{header, HeaderMap};
+use subtle::ConstantTimeEq;
+
+/// Compare a presented API token with every configured token without
+/// short-circuiting on the first differing byte.
+pub fn api_token_allowed(api_tokens: &[String], candidate: &str) -> bool {
+    let mut matched = 0u8;
+    for allowed in api_tokens {
+        matched |= u8::from(bool::from(allowed.as_bytes().ct_eq(candidate.as_bytes())));
+    }
+    matched != 0
+}
 
 /// Return whether a request carries one of the bearer-backed browser session
 /// cookies.  The caller should invoke this only after it has validated the
@@ -125,6 +136,17 @@ fn hex_value(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_token_comparison_requires_an_exact_match() {
+        let tokens = vec!["short-secret".to_owned(), "another-secret".to_owned()];
+
+        assert!(api_token_allowed(&tokens, "short-secret"));
+        assert!(api_token_allowed(&tokens, "another-secret"));
+        assert!(!api_token_allowed(&tokens, "short-secret-extra"));
+        assert!(!api_token_allowed(&tokens, "short-secre"));
+        assert!(!api_token_allowed(&tokens, ""));
+    }
 
     #[test]
     fn session_cookie_detection_is_name_and_value_aware() {

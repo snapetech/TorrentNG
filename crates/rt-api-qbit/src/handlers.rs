@@ -4,7 +4,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use rt_api_model::ChunkedVec;
+use rt_api_model::{api_token_allowed, ChunkedVec};
 use rt_metainfo::parse_magnet;
 use serde::{
     ser::{SerializeMap, Serializer},
@@ -111,7 +111,7 @@ pub async fn auth_login(State(state): State<AppState>, body: String) -> Response
 }
 
 fn token_allowed(state: &AppState, token: &str) -> bool {
-    state.api_tokens.iter().any(|allowed| allowed == token)
+    api_token_allowed(&state.api_tokens, token)
 }
 
 fn qbit_form_token(body: &str) -> Option<String> {

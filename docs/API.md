@@ -98,6 +98,7 @@ the rewritten engine.
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET`  | `/api/v1/torrents` | List torrents with filter/sort/page |
+| `GET`  | `/api/v1/torrents/live?hashes=...` | Read bounded live rates and bytes-left for explicitly requested visible torrents |
 | `POST` | `/api/v1/torrents` | Add torrent as JSON (`torrent_b64` or `magnet`, `save_path`, optional `category`, `tags`, `start`) |
 | `GET`  | `/api/v1/torrents/:hash` | Get single torrent by hash |
 | `PUT`  | `/api/v1/torrents/:hash` | Update torrent metadata (`{ name, save_path }`; at least one required) |
@@ -135,9 +136,11 @@ the rewritten engine.
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `filter` | string | Name substring match (case-insensitive) |
-| `status` | string | `seeding` \| `downloading` \| `stopped` \| `checking` \| `error` |
+| `status` | string | `seeding` \| `downloading` \| `stopped` \| `checking` \| `error` \| `tracker_error` plus derived `active`, `inactive`, `running`, `completed`, `queued`, and `paused` buckets |
 | `category` | string | Exact category name |
 | `tag` | string | Exact tag name |
+| `tracker` | string | Case-insensitive substring match against persisted tracker URLs; requires the native engine |
+| `media_type` | string | Inferred type: `ebook` \| `tv` \| `video` \| `audio` \| `image` \| `game` \| `software` \| `other` |
 | `sort` | string | `name` \| `size` \| `added` \| `ratio` \| `speed_down` \| `speed_up` \| `progress` |
 | `dir` | string | `asc` \| `desc` |
 | `limit` | int | Max rows (1–5000, default 200) |
@@ -157,6 +160,16 @@ the same route reads the local SQLite projection and returns the bounded
 `{ total, torrents }` envelope without a native snapshot token; it is
 eventually consistent with the selected backend. Sidecar callers must not use
 `offset` pagination as if it were an immutable multi-request snapshot.
+
+#### `GET /api/v1/torrents/live`
+
+Pass a comma-separated `hashes` query parameter containing at most 128
+40/64-character hexadecimal info hashes. The WebUI sends only incomplete,
+active rows intersecting the current viewport. The response is
+`{ sampled_at, torrents: [{ hash, amount_left, download_rate, upload_rate, sampled_at }] }`.
+Native mode queries only the requested promoted torrent tasks with bounded
+concurrency; sidecar mode reads the cached SQLite projection in one query and
+does not contact the selected backend.
 
 `GET /api/v1/events` emits `torrent_delta` events with a `cursor` field equal to
 the registry revision. The initial snapshot is emitted in bounded chunks
@@ -261,8 +274,8 @@ Notes:
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/v1/storage` | List configured storage roots with total/used/free bytes, readonly status, and per-root errors |
-| `POST` | `/api/v1/storage/plan` | Preview move/import/delete storage plans (`{ operation, source, destination, target, bytes, available_bytes, hardlink_or_copy, roots, affected_torrents, completed_steps }`); import uses staged copy unless `hardlink_or_copy` allows same-filesystem hardlinks, and completed-step resume indexes are validated against the generated plan |
-| `POST` | `/api/v1/storage/execute` | Execute a root-confined move/import/delete storage plan through durable engine storage-plan jobs; execution uses server-configured storage roots and ignores any client-supplied `roots` (move/delete require non-empty `affected_torrents` containing existing torrent hashes so live payload owners can be quiesced; import may omit it; `completed_steps` resumes only validated plan steps from the matching previewed plan). A save-path move is reported as `commit_pending` after filesystem completion until the engine publishes the new path to the durable torrent row; it is not terminal and is recovered after a crash. |
+| `POST` | `/api/v1/storage/plan` | Preview move/import/delete storage plans (`{ operation, source, destination, target, bytes, available_bytes, hardlink_or_copy, roots, affected_torrents }`); `bytes` is required for move/import so copy and rename verification cannot silently use zero, while delete bytes remain optional. Import uses staged copy unless `hardlink_or_copy` allows same-filesystem hardlinks |
+| `POST` | `/api/v1/storage/execute` | Execute a root-confined move/import/delete storage plan through durable engine storage-plan jobs; execution uses server-configured storage roots, ignores client-supplied `roots`, and rejects non-empty `completed_steps` because checkpoint indexes are server-owned (move/delete require non-empty `affected_torrents` containing existing torrent hashes so live payload owners can be quiesced; import may omit it). Resume is driven by the durable job checkpoint and live filesystem reconciliation. A save-path move is reported as `commit_pending` after filesystem completion until the engine publishes the new path to the durable torrent row; it is not terminal and is recovered after a crash. If reconciliation, rollback, or destructive-step verification cannot prove a safe filesystem state, the job fails and affected torrents remain quiesced for manual recovery. |
 | `GET` | `/api/v1/tracker-health` | Aggregate durable tracker rows by tracker URL with torrent/active/complete/error/peer counts; `peer_count` is the tracker-reported peer/leecher count, not the number of currently connected local sessions |
 | `GET` | `/api/v1/engine` | Runtime backend type/capabilities plus rTorrent provenance, XMLRPC probes, tracker-stack telemetry, and profile drift when the selected backend is rTorrent |
 | `GET` | `/api/v1/engine/commands` | Full XMLRPC command index when the rTorrent facade is selected; native mode returns explicit `501 NOT_IMPLEMENTED` |

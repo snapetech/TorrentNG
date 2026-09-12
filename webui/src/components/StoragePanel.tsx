@@ -17,13 +17,6 @@ function parseLines(value: string): string[] {
     .filter(Boolean)
 }
 
-function parseStepIndexes(value: string): number[] {
-  return Array.from(new Set(parseLines(value)
-    .map(part => Number(part))
-    .filter(index => Number.isInteger(index) && index >= 0)))
-    .sort((left, right) => left - right)
-}
-
 type StoragePlanTemplate = {
   id: string
   label: string
@@ -33,7 +26,6 @@ type StoragePlanTemplate = {
   targetSuffix?: string
   hardlinkOrCopy?: boolean
   deleteApproved?: boolean
-  completedSteps?: string
 }
 
 const storagePlanTemplates: StoragePlanTemplate[] = [
@@ -41,7 +33,6 @@ const storagePlanTemplates: StoragePlanTemplate[] = [
   { id: 'import-copy', label: 'Import copy', operation: 'import', sourceSuffix: 'staging/source', destinationSuffix: 'library/imported', hardlinkOrCopy: false },
   { id: 'import-link', label: 'Import link', operation: 'import', sourceSuffix: 'staging/source', destinationSuffix: 'library/linked', hardlinkOrCopy: true },
   { id: 'delete-approved', label: 'Delete', operation: 'delete', targetSuffix: 'library/orphaned', deleteApproved: true },
-  { id: 'resume-plan', label: 'Resume', operation: 'move', sourceSuffix: 'library/source', destinationSuffix: 'library/destination', completedSteps: '0' },
 ]
 
 function joinRootPath(root: string, suffix: string): string {
@@ -59,7 +50,6 @@ export function StoragePanel() {
   const [hardlinkOrCopy, setHardlinkOrCopy] = useState(false)
   const [deleteApproved, setDeleteApproved] = useState(false)
   const [affectedTorrents, setAffectedTorrents] = useState('')
-  const [completedSteps, setCompletedSteps] = useState('')
   const [preview, setPreview] = useState<StoragePlanResponse | null>(null)
   const { data, isLoading, isFetching, error, refetch } = useQuery({
     queryKey: ['storage'],
@@ -80,7 +70,6 @@ export function StoragePanel() {
   const request = useMemo<StoragePlanRequest>(() => {
     const parsedBytes = bytes.trim() ? Number(bytes.trim()) : undefined
     const affected = parseLines(affectedTorrents)
-    const completed = parseStepIndexes(completedSteps)
     return {
       operation,
       source: operation === 'delete' ? undefined : source.trim() || undefined,
@@ -93,9 +82,8 @@ export function StoragePanel() {
       dry_run_approved: operation === 'delete' ? deleteApproved : undefined,
       roots: selectedRoot ? [selectedRoot] : undefined,
       affected_torrents: affected.length ? affected : undefined,
-      completed_steps: completed.length ? completed : undefined,
     }
-  }, [operation, source, destination, target, bytes, selectedRoot, selectedRootInfo?.available_bytes, hardlinkOrCopy, deleteApproved, affectedTorrents, completedSteps])
+  }, [operation, source, destination, target, bytes, selectedRoot, selectedRootInfo?.available_bytes, hardlinkOrCopy, deleteApproved, affectedTorrents])
   const previewPlan = useMutation({
     mutationFn: () => api.storagePlan.preview(request),
     onSuccess: setPreview,
@@ -111,17 +99,10 @@ export function StoragePanel() {
     onSuccess: setPreview,
   })
   const canExecute = Boolean(preview?.plan.can_apply && selectedRoot && (operation !== 'delete' || deleteApproved))
-  const completedIndexes = useMemo(() => parseStepIndexes(completedSteps), [completedSteps])
-  const invalidCompletedIndexes = useMemo(() => {
-    if (!preview) return []
-    return completedIndexes.filter(index => index >= preview.plan.steps.length)
-  }, [completedIndexes, preview])
-  const canExecutePlan = canExecute && invalidCompletedIndexes.length === 0
   const applyTemplate = (template: StoragePlanTemplate) => {
     setOperation(template.operation)
     setHardlinkOrCopy(Boolean(template.hardlinkOrCopy))
     setDeleteApproved(Boolean(template.deleteApproved))
-    setCompletedSteps(template.completedSteps ?? '')
     setBytes('')
     setAffectedTorrents('')
     if (template.operation === 'delete') {
@@ -247,16 +228,6 @@ export function StoragePanel() {
               style={{ ...fieldStyle, resize: 'vertical', minHeight: 76 }}
             />
           </label>
-          <label style={labelStyle}>
-            <span>Completed steps</span>
-            <textarea
-              value={completedSteps}
-              onChange={event => { setCompletedSteps(event.target.value); setPreview(null) }}
-              rows={3}
-              placeholder="0, 1, 2"
-              style={{ ...fieldStyle, resize: 'vertical', minHeight: 76 }}
-            />
-          </label>
         </div>
 
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 10 }}>
@@ -275,17 +246,14 @@ export function StoragePanel() {
           <button type="button" onClick={() => previewPlan.mutate()} disabled={previewPlan.isPending || !selectedRoot} style={actionButtonStyle(!previewPlan.isPending && Boolean(selectedRoot))}>
             {previewPlan.isPending ? 'Previewing...' : 'Preview plan'}
           </button>
-          <button onClick={() => executePlan.mutate()} disabled={executePlan.isPending || !canExecutePlan} style={actionButtonStyle(!executePlan.isPending && canExecutePlan)}>
+          <button type="button" onClick={() => executePlan.mutate()} disabled={executePlan.isPending || !canExecute} style={actionButtonStyle(!executePlan.isPending && canExecute)}>
             {executePlan.isPending ? 'Starting...' : 'Execute plan'}
           </button>
         </div>
 
-        {invalidCompletedIndexes.length > 0 && (
-          <Notice>Completed steps outside this plan: {invalidCompletedIndexes.join(', ')}</Notice>
-        )}
         {previewPlan.error && <Notice>Plan preview failed</Notice>}
         {executePlan.error && <Notice>Plan execution failed</Notice>}
-        {preview && <StoragePlanResult response={preview} completedIndexes={completedIndexes} />}
+        {preview && <StoragePlanResult response={preview} />}
       </div>
     </section>
   )
@@ -343,13 +311,12 @@ function PathField({ label, value, onChange }: { label: string; value: string; o
   )
 }
 
-function StoragePlanResult({ response, completedIndexes }: { response: StoragePlanResponse; completedIndexes: number[] }) {
+function StoragePlanResult({ response }: { response: StoragePlanResponse }) {
   const tone = response.plan.can_apply ? 'var(--success)' : 'var(--warning)'
   const totalBytes = response.plan.steps.reduce((sum, step) => sum + step.bytes, 0)
   const rollbackBytes = response.plan.rollback_steps.reduce((sum, step) => sum + step.bytes, 0)
-  const completedSet = new Set(completedIndexes)
-  const completed = completedIndexes.filter(index => index < response.plan.steps.length).length
-  const remaining = Math.max(0, response.plan.steps.length - completed)
+  const completed = 0
+  const remaining = response.plan.steps.length
   return (
     <div role="region" aria-label={`${response.operation} storage plan`} aria-live="polite" style={{ border: `1px solid color-mix(in srgb, ${tone} 38%, var(--border))`, borderRadius: 7, background: 'var(--surface)', padding: 12 }}>
       <div style={{ display: 'flex', gap: 10, alignItems: 'center', marginBottom: 8 }}>
@@ -371,21 +338,19 @@ function StoragePlanResult({ response, completedIndexes }: { response: StoragePl
       )}
       <div style={{ display: 'grid', gap: 6 }}>
         {response.plan.steps.map((step, index) => {
-          const done = completedSet.has(index)
           return (
           <div key={`${step.action}-${index}`} style={{
             display: 'grid',
             gridTemplateColumns: '132px 1fr auto',
             gap: 8,
             alignItems: 'center',
-            border: `1px solid ${done ? 'color-mix(in srgb, var(--success) 42%, var(--border))' : 'var(--border)'}`,
+            border: '1px solid var(--border)',
             borderRadius: 6,
             padding: '7px 9px',
             color: 'var(--muted)',
             fontSize: 12,
-            background: done ? 'color-mix(in srgb, var(--success) 7%, transparent)' : undefined,
           }}>
-            <strong style={{ color: 'var(--text)' }}>{done ? 'done' : step.action}</strong>
+            <strong style={{ color: 'var(--text)' }}>{step.action}</strong>
             <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={[step.source, step.destination].filter(Boolean).join(' -> ')}>
               {[step.source, step.destination].filter(Boolean).join(' -> ') || 'storage operation'}
             </span>

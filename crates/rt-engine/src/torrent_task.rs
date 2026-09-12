@@ -188,8 +188,18 @@ impl PieceAvailability for PieceBitmap {
 /// Messages from the engine to a running torrent task.
 #[derive(Debug)]
 pub enum TorrentCmd {
-    Pause,
-    Resume,
+    /// Pause the task.  Callers that need a durable lifecycle acknowledgement
+    /// provide a reply sender; internal best-effort control paths may leave it
+    /// absent.
+    Pause {
+        reply: Option<oneshot::Sender<Result<(), String>>>,
+    },
+    /// Begin resuming the task.  The acknowledgement is sent after the
+    /// `Checking` transition is durable; the potentially long piece recheck
+    /// continues afterward.
+    Resume {
+        reply: Option<oneshot::Sender<Result<(), String>>>,
+    },
     Recheck {
         job_id: Option<String>,
     },
@@ -212,10 +222,12 @@ pub enum TorrentCmd {
     /// torrent's files -- without it, a peer write racing the move could
     /// write to a path mid-rename, or resurrect a file at the old path
     /// after the move already deleted it there. Replies with whether the
-    /// torrent was already paused before this call, so the caller can
-    /// restore that state afterward instead of unconditionally resuming.
+    /// torrent was already paused before this call, so the caller can restore
+    /// that state afterward instead of unconditionally resuming. The
+    /// acknowledgement fails if the durable `Paused` transition could not be
+    /// persisted.
     QuiesceForStorageMove {
-        reply: oneshot::Sender<bool>,
+        reply: oneshot::Sender<Result<bool, String>>,
     },
     /// TNG-002: re-points this task's cached `save_root` (and rebuilds the
     /// `MountScheduler` bound to it, so device-topology detection and any
@@ -263,18 +275,25 @@ pub enum TorrentCmd {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 enum RecheckOutcome {
     Complete,
-    Paused,
+    Paused {
+        reply: Option<oneshot::Sender<Result<(), String>>>,
+        previous_paused: bool,
+        previous_restore_state: Option<TorrentState>,
+        state_persisted: bool,
+    },
     Cancelled,
     Shutdown,
+    Failed(String),
 }
 
 const JOB_STATE_RUNNING: &str = "running";
 const JOB_STATE_PAUSED: &str = "paused";
 const JOB_STATE_CANCELLED: &str = "cancelled";
 const JOB_STATE_COMPLETED: &str = "completed";
+const JOB_STATE_FAILED: &str = "failed";
 const MAX_IN_MEMORY_PIECE_ASSEMBLIES: usize = 64;
 const MAX_IN_MEMORY_PIECE_ASSEMBLY_BYTES_PER_TORRENT: usize = 64 * 1024 * 1024;
 const PEER_REQUEST_PIPELINE_NORMAL: usize = 32;
@@ -641,6 +660,16 @@ pub struct TorrentTask {
     completed_piece_verify_from_disk: u64,
     prepared_files: Mutex<HashSet<u32>>,
     paused: bool,
+    /// The lifecycle state to restore when a recheck was requested for a
+    /// dormant/paused task. Dormant tasks are constructed with `paused = true`
+    /// even when their durable state was active, so the runtime boolean alone
+    /// cannot distinguish "paused by the user" from "temporarily quiesced
+    /// until the recheck command arrives".
+    recheck_restore_state: Option<TorrentState>,
+    /// Durable state captured when a dormant task is promoted. Most dormant
+    /// tasks stage through `Paused`, but an `Error` task must remain `Error`
+    /// until an explicit resume/recheck command can move it to `Checking`.
+    initial_state: TorrentState,
     max_peers: usize,
     torrent_max_peers: Option<usize>,
     pex_enabled: bool,
@@ -656,6 +685,7 @@ impl TorrentTask {
         meta: TorrentMetaV1,
         save_root: PathBuf,
         paused: bool,
+        initial_state: TorrentState,
         registry: Arc<RwLock<SessionRegistry>>,
         db: DbExecutor,
         resources: ResourceGovernor,
@@ -807,6 +837,12 @@ impl TorrentTask {
             completed_piece_verify_from_disk: 0,
             prepared_files: Mutex::new(HashSet::new()),
             paused,
+            recheck_restore_state: match initial_state {
+                TorrentState::Paused => Some(TorrentState::Paused),
+                TorrentState::Stopped => Some(TorrentState::Stopped),
+                _ => None,
+            },
+            initial_state,
             max_peers,
             torrent_max_peers: None,
             pex_enabled,
@@ -826,15 +862,73 @@ impl TorrentTask {
         self.persist_tracker_state().await;
         if self.paused {
             self.persist_progress().await;
-            self.set_state(TorrentState::Paused).await;
-        } else if !restored {
-            if matches!(self.run_recheck(None).await, RecheckOutcome::Shutdown) {
+            // Dormant promotion constructs the task paused so no transfer
+            // starts before the queued command is delivered. Preserve an
+            // explicitly stopped projection during that staging window;
+            // rewriting it as Paused makes a stopped torrent resume with the
+            // wrong lifecycle state if the process exits before the command.
+            let startup_state = match self.initial_state {
+                TorrentState::Error => TorrentState::Error,
+                // Promotion stages every dormant task paused. Preserve a
+                // queued lifecycle projection during that staging window;
+                // otherwise a process exit before the queued command arrives
+                // silently turns queue admission into a user pause.
+                TorrentState::Queued => TorrentState::Queued,
+                _ => self.recheck_restore_state.unwrap_or(TorrentState::Paused),
+            };
+            if let Err(error) = self.set_state_checked(startup_state).await {
+                warn!(
+                    component = "torrent",
+                    operation = "startup_state",
+                    torrent = %self.info_hash_hex,
+                    result = "error",
+                    error = %error,
+                    "failed to persist paused startup state; stopping task"
+                );
                 return;
             }
+        } else if !restored {
+            match self.run_recheck(None).await {
+                RecheckOutcome::Shutdown => return,
+                RecheckOutcome::Failed(error) => {
+                    warn!(
+                        component = "torrent",
+                        operation = "startup_recheck",
+                        torrent = %self.info_hash_hex,
+                        result = "error",
+                        error = %error,
+                        "startup recheck failed; stopping task"
+                    );
+                    return;
+                }
+                RecheckOutcome::Complete
+                | RecheckOutcome::Paused { .. }
+                | RecheckOutcome::Cancelled => {}
+            }
         } else if self.picker.is_complete() {
-            self.set_state(TorrentState::Seeding).await;
+            if let Err(error) = self.set_state_checked(TorrentState::Seeding).await {
+                warn!(
+                    component = "torrent",
+                    operation = "startup_state",
+                    torrent = %self.info_hash_hex,
+                    result = "error",
+                    error = %error,
+                    "failed to persist seeding startup state; stopping task"
+                );
+                return;
+            }
         } else {
-            self.set_state(TorrentState::Downloading).await;
+            if let Err(error) = self.set_state_checked(TorrentState::Downloading).await {
+                warn!(
+                    component = "torrent",
+                    operation = "startup_state",
+                    torrent = %self.info_hash_hex,
+                    result = "error",
+                    error = %error,
+                    "failed to persist downloading startup state; stopping task"
+                );
+                return;
+            }
         }
 
         let mut choke_tick = interval(Duration::from_secs(10));
@@ -879,20 +973,74 @@ impl TorrentTask {
                             self.shutdown_peers().await;
                             break;
                         }
-                        TorrentCmd::Pause => {
+                        TorrentCmd::Pause { reply } => {
+                            let was_paused = self.paused;
                             self.paused = true;
                             self.cancel_tracker_announces();
-                            self.announce_stopped().await;
                             self.shutdown_peers().await;
                             self.save_fastresume(false).await;
-                            self.set_state(TorrentState::Paused).await;
-                            self.tracker_event = TrackerEvent::Started;
+                            let result = self.set_state_checked(TorrentState::Paused).await;
+                            if let Err(error) = &result {
+                                // A failed state write must not turn a
+                                // rejected pause into a runtime-only pause.
+                                // Restore the prior control state and let the
+                                // caller retry once the durable store is
+                                // available again.
+                                self.paused = was_paused;
+                                if !was_paused {
+                                    self.restart_tracker_session();
+                                }
+                                warn!(
+                                    component = "torrent",
+                                    operation = "pause",
+                                    torrent = %self.info_hash_hex,
+                                    result = "error",
+                                    error = %error,
+                                    "failed to persist torrent pause"
+                                );
+                            } else {
+                                self.recheck_restore_state = Some(TorrentState::Paused);
+                                self.tracker_event = TrackerEvent::Started;
+                            }
+                            if let Some(reply) = reply {
+                                let _ = reply.send(result);
+                            }
+                            if self.paused {
+                                // Tracker shutdown is best-effort lifecycle
+                                // housekeeping. Do it after the durable pause
+                                // acknowledgement so a slow tracker cannot
+                                // make the caller time out with a task that is
+                                // already safely paused.
+                                self.announce_stopped().await;
+                            }
                         }
-                        TorrentCmd::Resume => {
-                            self.paused = false;
-                            self.restart_tracker_session();
-                            if matches!(self.run_recheck(None).await, RecheckOutcome::Shutdown) {
-                                break;
+                        TorrentCmd::Resume { reply } => {
+                            let result = self.prepare_resume().await;
+                            if let Some(reply) = reply {
+                                // Do not make API callers wait for a full
+                                // disk recheck. `Checking` is the durable
+                                // acknowledgement; the recheck continues in
+                                // this actor immediately afterward.
+                                let _ = reply.send(result.clone());
+                            }
+                            if result.is_ok() {
+                                match self.run_recheck(None).await {
+                                    RecheckOutcome::Shutdown => break,
+                                    RecheckOutcome::Failed(error) => {
+                                        warn!(
+                                            component = "torrent",
+                                            operation = "resume_recheck",
+                                            torrent = %self.info_hash_hex,
+                                            result = "error",
+                                            error = %error,
+                                            "resume recheck failed; stopping task"
+                                        );
+                                        break;
+                                    }
+                                    RecheckOutcome::Complete
+                                    | RecheckOutcome::Paused { .. }
+                                    | RecheckOutcome::Cancelled => {}
+                                }
                             }
                             // A recheck can invalidate pieces after the
                             // webseed timer has backed off because the picker
@@ -904,10 +1052,18 @@ impl TorrentTask {
                             let was_paused = self.paused;
                             self.paused = true;
                             self.cancel_tracker_announces();
-                            self.announce_stopped().await;
                             self.shutdown_peers().await;
                             self.save_fastresume(false).await;
-                            self.set_state(TorrentState::Paused).await;
+                            if let Err(error) = self.set_state_checked(TorrentState::Paused).await {
+                                self.paused = was_paused;
+                                if !was_paused {
+                                    self.restart_tracker_session();
+                                }
+                                let _ = reply.send(Err(format!(
+                                    "failed to persist torrent quiesce state: {error}"
+                                )));
+                                continue;
+                            }
                             self.tracker_event = TrackerEvent::Started;
                             // `shutdown_peers` above terminates every peer
                             // task, so no *new* PeerEvent can arrive after
@@ -918,7 +1074,8 @@ impl TorrentTask {
                             // `handle_block` (and write to disk) after we
                             // hand back this reply.
                             while self.peer_event_rx.try_recv().is_ok() {}
-                            let _ = reply.send(was_paused);
+                            let _ = reply.send(Ok(was_paused));
+                            self.announce_stopped().await;
                         }
                         TorrentCmd::ResumeAfterStorageMove {
                             new_save_root,
@@ -944,11 +1101,32 @@ impl TorrentTask {
                                 self.prepared_files.lock().expect("prepared_files mutex poisoned").clear();
                             }
                             if !resume_paused {
-                                self.paused = false;
-                                self.restart_tracker_session();
-                                if matches!(self.run_recheck(None).await, RecheckOutcome::Shutdown)
-                                {
-                                    break;
+                                match self.prepare_resume().await {
+                                    Ok(()) => match self.run_recheck(None).await {
+                                        RecheckOutcome::Shutdown => break,
+                                        RecheckOutcome::Failed(error) => {
+                                            warn!(
+                                                component = "torrent",
+                                                operation = "storage_move_resume_recheck",
+                                                torrent = %self.info_hash_hex,
+                                                result = "error",
+                                                error = %error,
+                                                "post-storage-move recheck failed; stopping task"
+                                            );
+                                            break;
+                                        }
+                                        RecheckOutcome::Complete
+                                        | RecheckOutcome::Paused { .. }
+                                        | RecheckOutcome::Cancelled => {}
+                                    },
+                                    Err(error) => warn!(
+                                        component = "torrent",
+                                        operation = "storage_move_resume",
+                                        torrent = %self.info_hash_hex,
+                                        result = "error",
+                                        error = %error,
+                                        "post-storage-move resume could not be persisted"
+                                    ),
                                 }
                                 reset_webseed_sleep(&mut webseed_sleep, self.webseed_wake_delay());
                             }
@@ -1002,8 +1180,22 @@ impl TorrentTask {
                             }
                         }
                         TorrentCmd::Recheck { job_id } => {
-                            if matches!(self.run_recheck(job_id).await, RecheckOutcome::Shutdown) {
-                                break;
+                            match self.run_recheck(job_id).await {
+                                RecheckOutcome::Shutdown => break,
+                                RecheckOutcome::Failed(error) => {
+                                    warn!(
+                                        component = "torrent",
+                                        operation = "recheck",
+                                        torrent = %self.info_hash_hex,
+                                        result = "error",
+                                        error = %error,
+                                        "recheck failed; stopping task"
+                                    );
+                                    break;
+                                }
+                                RecheckOutcome::Complete
+                                | RecheckOutcome::Paused { .. }
+                                | RecheckOutcome::Cancelled => {}
                             }
                             // Recheck may transition a complete torrent back
                             // to downloading when corruption is found.
@@ -1053,13 +1245,17 @@ impl TorrentTask {
                 }
 
                 Some(event) = self.peer_event_rx.recv() => {
-                    self.handle_peer_event(event).await;
+                    if let Some(event) = peer_event_if_active(self.paused, event) {
+                        self.handle_peer_event(event).await;
+                    }
                 }
 
                 Some(event) = self.peer_disconnect_rx.recv() => {
-                    self.handle_peer_event(event).await;
-                    if self.active_peers.is_empty() {
-                        reset_webseed_sleep(&mut webseed_sleep, self.webseed_wake_delay());
+                    if let Some(event) = peer_event_if_active(self.paused, event) {
+                        self.handle_peer_event(event).await;
+                        if self.active_peers.is_empty() {
+                            reset_webseed_sleep(&mut webseed_sleep, self.webseed_wake_delay());
+                        }
                     }
                 }
 
@@ -2181,11 +2377,16 @@ impl TorrentTask {
                 }
             }
             PeerEvent::Piece { peer, block } => {
-                if let Some(handle) = self.active_peers.get_mut(&peer) {
-                    handle.outstanding = handle.outstanding.saturating_sub(1);
-                    remove_requested_block(&mut handle.requested, block.piece, block.offset);
-                    record_peer_transfer(handle, false, block.data.len() as u64);
-                }
+                // A peer task can race shutdown and leave one final block in
+                // the bounded event channel. Once its handle is gone, that
+                // block is stale and must not be written after a recheck or a
+                // storage move has switched the torrent's filesystem state.
+                let Some(handle) = self.active_peers.get_mut(&peer) else {
+                    return;
+                };
+                handle.outstanding = handle.outstanding.saturating_sub(1);
+                remove_requested_block(&mut handle.requested, block.piece, block.offset);
+                record_peer_transfer(handle, false, block.data.len() as u64);
                 self.handle_block(block).await;
                 self.refill_peer_requests(peer).await;
             }
@@ -2464,14 +2665,36 @@ impl TorrentTask {
                         self.save_fastresume(false).await;
                         self.tracker_event = TrackerEvent::Completed;
                         self.schedule_trackers_now();
-                        self.set_state(TorrentState::Seeding).await;
-                        info!(
-                            component = "torrent",
-                            operation = "complete_download",
-                            torrent = %self.info_hash_hex,
-                            result = "ok",
-                            "download complete"
-                        );
+                        match self.set_state_checked(TorrentState::Seeding).await {
+                            Ok(()) => info!(
+                                component = "torrent",
+                                operation = "complete_download",
+                                torrent = %self.info_hash_hex,
+                                result = "ok",
+                                "download complete"
+                            ),
+                            Err(error) => {
+                                // `set_state_checked` rolled the registry
+                                // back to Downloading when its durable write
+                                // failed. Keep the runtime on that same
+                                // active state; marking only the actor as
+                                // paused would leave the public projection
+                                // claiming downloading while no task work was
+                                // possible.
+                                self.paused = false;
+                                self.recheck_restore_state = None;
+                                self.restart_tracker_session();
+                                self.shutdown_peers().await;
+                                warn!(
+                                    component = "torrent",
+                                    operation = "complete_download",
+                                    torrent = %self.info_hash_hex,
+                                    result = "error",
+                                    error = %error,
+                                    "failed to persist seeding state; retaining downloading state"
+                                );
+                            }
+                        }
                     }
                 }
                 VerifyResult::Invalid => {
@@ -2647,6 +2870,11 @@ impl TorrentTask {
             .map(|peer| (peer.cmd_tx.clone(), peer.abort.clone()))
             .collect();
 
+        for peer in self.active_peers.values() {
+            self.picker
+                .availability
+                .remove_bitfield(&peer.peer_has.to_bitfield());
+        }
         for (tx, abort) in handles {
             let _ = tx.try_send(PeerCommand::Shutdown);
             if let Some(abort) = abort {
@@ -2654,7 +2882,10 @@ impl TorrentTask {
             }
         }
         self.active_peers.clear();
+        self.picker.reset_outstanding_requests();
         self.clear_piece_assemblies();
+        while self.peer_event_rx.try_recv().is_ok() {}
+        while self.peer_disconnect_rx.try_recv().is_ok() {}
     }
 
     /// A ban update can race a full torrent command queue. Re-check the
@@ -2716,12 +2947,31 @@ impl TorrentTask {
         if !(ratio_reached || idle_reached) {
             return;
         }
+        let previous_recheck_restore_state = self.recheck_restore_state;
         self.paused = true;
+        self.recheck_restore_state = Some(TorrentState::Paused);
         self.announce_stopped().await;
         self.shutdown_peers().await;
         self.save_fastresume(false).await;
-        self.set_state(TorrentState::Paused).await;
-        self.tracker_event = TrackerEvent::Started;
+        match self.set_state_checked(TorrentState::Paused).await {
+            Ok(()) => {
+                self.tracker_event = TrackerEvent::Started;
+            }
+            Err(error) => {
+                self.paused = false;
+                self.recheck_restore_state = previous_recheck_restore_state;
+                self.restart_tracker_session();
+                warn!(
+                    component = "torrent",
+                    operation = "seed_limit",
+                    torrent = %self.info_hash_hex,
+                    result = "error",
+                    error = %error,
+                    "failed to persist seed-limit pause; retaining active state"
+                );
+                return;
+            }
+        }
         info!(
             component = "torrent",
             operation = "seed_limit",
@@ -2978,6 +3228,7 @@ impl TorrentTask {
         }
         self.picker.set_priority(Vec::new());
         self.paused = true;
+        self.recheck_restore_state = Some(TorrentState::Paused);
         warn!(
             component = "torrent",
             operation,
@@ -3081,36 +3332,138 @@ impl TorrentTask {
         );
     }
 
-    async fn run_recheck(&mut self, job_id: Option<String>) -> RecheckOutcome {
-        self.shutdown_peers().await;
-        self.set_state(TorrentState::Checking).await;
+    async fn prepare_resume(&mut self) -> Result<(), String> {
+        let was_paused = self.paused;
+        self.paused = false;
+        self.restart_tracker_session();
+        if let Err(error) = self.set_state_checked(TorrentState::Checking).await {
+            self.paused = was_paused;
+            if was_paused {
+                self.cancel_tracker_announces();
+            }
+            return Err(format!("failed to persist torrent resume state: {error}"));
+        }
+        self.recheck_restore_state = None;
+        Ok(())
+    }
 
+    async fn run_recheck(&mut self, job_id: Option<String>) -> RecheckOutcome {
         let mut valid = 0usize;
         let mut invalid = 0usize;
         let mut invalid_pieces = Vec::new();
         let mut verified_pieces = Vec::with_capacity(self.piece_map.piece_count as usize);
+        // A recheck supersedes any announce already in flight. Without a
+        // generation bump, a stale Started/Completed response can be handled
+        // after a pause or cancellation and mutate the tracker session that
+        // the recheck is supposed to have frozen.
+        self.cancel_tracker_announces();
+        self.shutdown_peers().await;
+        if let Err(error) = self.set_state_checked(TorrentState::Checking).await {
+            self.paused = true;
+            self.cancel_tracker_announces();
+            self.announce_stopped().await;
+            if let Some(job_id) = &job_id {
+                self.persist_recheck_job_progress(
+                    job_id,
+                    0,
+                    valid,
+                    &invalid_pieces,
+                    JOB_STATE_FAILED,
+                    Some("failed to persist torrent checking state"),
+                )
+                .await;
+            }
+            return RecheckOutcome::Failed(format!(
+                "failed to persist torrent checking state: {error}"
+            ));
+        }
 
         for piece in 0..self.piece_map.piece_count {
             match self.pending_recheck_control().await {
-                Some(RecheckOutcome::Paused) => {
+                Some(RecheckOutcome::Paused {
+                    reply,
+                    previous_paused,
+                    previous_restore_state,
+                    state_persisted,
+                }) => {
                     self.save_fastresume(false).await;
-                    self.set_state(TorrentState::Paused).await;
+                    let result = if state_persisted {
+                        Ok(())
+                    } else {
+                        self.set_state_checked(TorrentState::Paused)
+                            .await
+                            .map_err(|error| {
+                                format!("failed to persist torrent pause after recheck: {error}")
+                            })
+                    };
+                    if let Err(error) = &result {
+                        warn!(
+                            component = "torrent",
+                            operation = "pause_during_recheck",
+                            torrent = %self.info_hash_hex,
+                            result = "error",
+                            error = %error,
+                            "failed to persist torrent pause after recheck"
+                        );
+                    }
+                    if let Some(reply) = reply {
+                        let _ = reply.send(result.clone());
+                    }
+                    if result.is_err() {
+                        // The pause request was rejected by durable storage.
+                        // Restore the pre-request runtime intent and keep the
+                        // recheck running against its still-Checking state;
+                        // otherwise the task would remain paused while the
+                        // registry/database still claim verification is active.
+                        self.paused = previous_paused;
+                        self.recheck_restore_state = previous_restore_state;
+                        continue;
+                    }
                     if let Some(job_id) = &job_id {
                         self.persist_recheck_job_progress(
                             job_id,
                             piece,
                             valid,
                             &invalid_pieces,
-                            JOB_STATE_PAUSED,
-                            Some("recheck paused"),
+                            if result.is_ok() {
+                                JOB_STATE_PAUSED
+                            } else {
+                                JOB_STATE_FAILED
+                            },
+                            if result.is_ok() {
+                                Some("recheck paused")
+                            } else {
+                                Some("failed to persist torrent pause after recheck")
+                            },
                         )
                         .await;
                     }
-                    return RecheckOutcome::Paused;
+                    self.announce_stopped().await;
+                    return RecheckOutcome::Paused {
+                        reply: None,
+                        previous_paused,
+                        previous_restore_state,
+                        state_persisted: true,
+                    };
                 }
                 Some(RecheckOutcome::Cancelled) => {
+                    let restore_state = self.recheck_restore_state.unwrap_or(TorrentState::Paused);
+                    self.paused =
+                        matches!(restore_state, TorrentState::Paused | TorrentState::Stopped);
+                    self.recheck_restore_state = Some(restore_state);
+                    self.cancel_tracker_announces();
                     self.save_fastresume(false).await;
-                    self.set_state(TorrentState::Paused).await;
+                    self.announce_stopped().await;
+                    if let Err(error) = self.set_state_checked(restore_state).await {
+                        warn!(
+                            component = "torrent",
+                            operation = "cancel_recheck",
+                            torrent = %self.info_hash_hex,
+                            result = "error",
+                            error = %error,
+                            "failed to persist torrent lifecycle state after recheck cancellation"
+                        );
+                    }
                     if let Some(job_id) = &job_id {
                         self.persist_recheck_job_progress(
                             job_id,
@@ -3126,7 +3479,16 @@ impl TorrentTask {
                 }
                 Some(RecheckOutcome::Shutdown) => {
                     self.save_fastresume(false).await;
-                    self.set_state(TorrentState::Stopped).await;
+                    if let Err(error) = self.set_state_checked(TorrentState::Stopped).await {
+                        warn!(
+                            component = "torrent",
+                            operation = "shutdown_during_recheck",
+                            torrent = %self.info_hash_hex,
+                            result = "error",
+                            error = %error,
+                            "failed to persist stopped state after recheck shutdown"
+                        );
+                    }
                     if let Some(job_id) = &job_id {
                         self.persist_recheck_job_progress(
                             job_id,
@@ -3141,6 +3503,9 @@ impl TorrentTask {
                     return RecheckOutcome::Shutdown;
                 }
                 Some(RecheckOutcome::Complete) | None => {}
+                Some(RecheckOutcome::Failed(error)) => {
+                    return RecheckOutcome::Failed(error);
+                }
             }
 
             let result = PieceVerifier::new(
@@ -3192,6 +3557,60 @@ impl TorrentTask {
         );
         self.commit_recheck_results(&verified_pieces);
         self.save_fastresume(true).await;
+
+        let final_state = if self.paused {
+            if let Some(restore_state) = self.recheck_restore_state {
+                // A recheck requested for a paused or stopped torrent must
+                // not silently start it. Dormant tasks are also constructed
+                // paused, so this branch is gated by the explicit restore
+                // intent rather than by `self.paused` alone.
+                self.tracker_event = TrackerEvent::Started;
+                self.cancel_tracker_announces();
+                restore_state
+            } else {
+                // Promotion temporarily starts an active dormant torrent in
+                // the paused runtime mode while its recheck command is being
+                // delivered. Once verification completes, restore activity.
+                self.paused = false;
+                self.restart_tracker_session();
+                if self.picker.is_complete() {
+                    self.tracker_event = TrackerEvent::Completed;
+                    self.schedule_trackers_now();
+                    TorrentState::Seeding
+                } else {
+                    self.persist_progress().await;
+                    TorrentState::Downloading
+                }
+            }
+        } else if self.picker.is_complete() {
+            self.tracker_event = TrackerEvent::Completed;
+            self.schedule_trackers_now();
+            TorrentState::Seeding
+        } else {
+            self.persist_progress().await;
+            TorrentState::Downloading
+        };
+        if let Err(error) = self.set_state_checked(final_state).await {
+            self.paused = true;
+            self.tracker_event = TrackerEvent::Started;
+            self.cancel_tracker_announces();
+            self.announce_stopped().await;
+            self.shutdown_peers().await;
+            if let Some(job_id) = &job_id {
+                self.persist_recheck_job_progress(
+                    job_id,
+                    self.piece_map.piece_count,
+                    valid,
+                    &invalid_pieces,
+                    JOB_STATE_FAILED,
+                    Some("failed to persist torrent state after recheck"),
+                )
+                .await;
+            }
+            return RecheckOutcome::Failed(format!(
+                "failed to persist torrent state after recheck: {error}"
+            ));
+        }
         if let Some(job_id) = &job_id {
             self.persist_recheck_job_progress(
                 job_id,
@@ -3202,15 +3621,6 @@ impl TorrentTask {
                 Some("recheck completed"),
             )
             .await;
-        }
-
-        if self.picker.is_complete() {
-            self.tracker_event = TrackerEvent::Completed;
-            self.schedule_trackers_now();
-            self.set_state(TorrentState::Seeding).await;
-        } else {
-            self.persist_progress().await;
-            self.set_state(TorrentState::Downloading).await;
         }
         RecheckOutcome::Complete
     }
@@ -3228,20 +3638,41 @@ impl TorrentTask {
     async fn pending_recheck_control(&mut self) -> Option<RecheckOutcome> {
         loop {
             match self.cmd_rx.try_recv() {
-                Ok(TorrentCmd::Pause) => {
+                Ok(TorrentCmd::Pause { reply }) => {
+                    let previous_paused = self.paused;
+                    let previous_restore_state = self.recheck_restore_state;
                     self.paused = true;
+                    self.recheck_restore_state = Some(TorrentState::Paused);
+                    self.cancel_tracker_announces();
                     self.shutdown_peers().await;
-                    self.announce_stopped().await;
-                    return Some(RecheckOutcome::Paused);
+                    return Some(RecheckOutcome::Paused {
+                        reply,
+                        previous_paused,
+                        previous_restore_state,
+                        state_persisted: false,
+                    });
                 }
                 Ok(TorrentCmd::Shutdown) => {
                     self.paused = true;
+                    self.cancel_tracker_announces();
                     self.shutdown_peers().await;
                     self.announce_stopped().await;
                     return Some(RecheckOutcome::Shutdown);
                 }
-                Ok(TorrentCmd::Resume) => {
+                Ok(TorrentCmd::Resume { reply }) => {
                     self.paused = false;
+                    self.recheck_restore_state = None;
+                    // A paused torrent normally has no tracker workers left;
+                    // rechecking it keeps the actor inside this control path,
+                    // so the regular `prepare_resume` helper is not reached
+                    // when the job is resumed here.
+                    self.restart_tracker_session();
+                    if let Some(reply) = reply {
+                        // Recheck already owns the durable `Checking` state;
+                        // acknowledge the control request without waiting for
+                        // the current verification pass to finish.
+                        let _ = reply.send(Ok(()));
+                    }
                 }
                 Ok(TorrentCmd::Reannounce) => {
                     self.schedule_active_tracker_tier_now();
@@ -3309,10 +3740,26 @@ impl TorrentTask {
                 Ok(TorrentCmd::QuiesceForStorageMove { reply }) => {
                     let was_paused = self.paused;
                     self.paused = true;
+                    self.cancel_tracker_announces();
                     self.shutdown_peers().await;
+                    if let Err(error) = self.set_state_checked(TorrentState::Paused).await {
+                        self.paused = was_paused;
+                        if !was_paused {
+                            self.restart_tracker_session();
+                        }
+                        let _ = reply.send(Err(format!(
+                            "failed to persist torrent quiesce state: {error}"
+                        )));
+                        continue;
+                    }
+                    let _ = reply.send(Ok(was_paused));
                     self.announce_stopped().await;
-                    let _ = reply.send(was_paused);
-                    return Some(RecheckOutcome::Paused);
+                    return Some(RecheckOutcome::Paused {
+                        reply: None,
+                        previous_paused: was_paused,
+                        previous_restore_state: self.recheck_restore_state,
+                        state_persisted: true,
+                    });
                 }
                 Ok(TorrentCmd::ResumeAfterStorageMove {
                     new_save_root,
@@ -3336,6 +3783,10 @@ impl TorrentTask {
                             .clear();
                     }
                     self.paused = resume_paused;
+                    self.recheck_restore_state = resume_paused.then_some(TorrentState::Paused);
+                    if !resume_paused {
+                        self.restart_tracker_session();
+                    }
                 }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return None,
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
@@ -3615,11 +4066,14 @@ impl TorrentTask {
         }
     }
 
-    async fn set_state(&mut self, state: TorrentState) {
+    async fn set_state_checked(&mut self, state: TorrentState) -> Result<(), String> {
         let (previous, row, state_event) = {
             let mut reg = self.registry.write().await;
             let Some(mut entry) = reg.get_mut(&self.info_hash_hex) else {
-                return;
+                return Err(format!(
+                    "torrent {} is missing from the registry",
+                    self.info_hash_hex
+                ));
             };
             let previous = entry.clone();
             let previous_state = entry.state;
@@ -3633,7 +4087,7 @@ impl TorrentTask {
                     error = %error,
                     "rejected invalid torrent state transition"
                 );
-                return;
+                return Err(error.to_string());
             }
             entry.total_length = self.meta.total_length();
             entry.amount_left = self.picker.bytes_left();
@@ -3690,6 +4144,7 @@ impl TorrentTask {
                 error = %error,
                 "failed to persist torrent state"
             );
+            return Err(error);
         } else {
             // The timer is runtime state derived from the durable state. Do
             // not start/stop it before the transition and its database row
@@ -3702,6 +4157,7 @@ impl TorrentTask {
             }
             self.transfer_stats_dirty = false;
         }
+        Ok(())
     }
 
     async fn persist_progress(&mut self) {
@@ -3779,6 +4235,18 @@ impl TorrentTask {
             .db
             .run("persist_recheck_progress", move |db| {
                 let mut job = rt_db::get_job(db, &job_id).map_err(|error| error.to_string())?;
+                // A cancellation/failure/completion written by the engine
+                // control path wins over any progress message already in
+                // flight. Without this fence, a late actor write could
+                // resurrect a terminal recheck job on the next snapshot.
+                if job.finished_at.is_some()
+                    || matches!(
+                        job.state.as_str(),
+                        JOB_STATE_CANCELLED | JOB_STATE_COMPLETED | JOB_STATE_FAILED
+                    )
+                {
+                    return Ok(());
+                }
                 job.state = state.clone();
                 job.done = done;
                 job.checkpoint = done;
@@ -3787,7 +4255,10 @@ impl TorrentTask {
                 job.verified_bytes = verified_bytes;
                 job.invalid_pieces = invalid_pieces.clone();
                 job.updated_at = db_i64(now);
-                if matches!(state.as_str(), JOB_STATE_CANCELLED | JOB_STATE_COMPLETED) {
+                if matches!(
+                    state.as_str(),
+                    JOB_STATE_CANCELLED | JOB_STATE_COMPLETED | JOB_STATE_FAILED
+                ) {
                     job.finished_at = Some(db_i64(now));
                 }
                 let event = rt_db::JobEventRow {
@@ -3797,6 +4268,7 @@ impl TorrentTask {
                     kind: match state.as_str() {
                         JOB_STATE_CANCELLED => "check_cancelled",
                         JOB_STATE_COMPLETED => "check_completed",
+                        JOB_STATE_FAILED => "check_failed",
                         _ => "check_progress",
                     }
                     .to_owned(),
@@ -4337,6 +4809,10 @@ fn tracker_warning_message(status: &TrackerStatus) -> Option<String> {
         TrackerStatus::Warning(message) => Some(message.clone()),
         _ => None,
     }
+}
+
+fn peer_event_if_active(paused: bool, event: PeerEvent) -> Option<PeerEvent> {
+    (!paused).then_some(event)
 }
 
 async fn send_peer_event(peer_event_tx: &mpsc::Sender<PeerEvent>, event: PeerEvent) -> bool {
@@ -5470,6 +5946,7 @@ mod tests {
             meta,
             temp.path().to_path_buf(),
             false,
+            TorrentState::Downloading,
             Arc::clone(&registry),
             DbExecutor::direct(Arc::clone(&db)),
             ResourceGovernor::new(rt_metrics::ResourceGovernorConfig::default()),
@@ -5545,6 +6022,7 @@ mod tests {
             meta,
             temp.path().to_path_buf(),
             false,
+            TorrentState::Downloading,
             Arc::clone(&registry),
             DbExecutor::direct(Arc::clone(&db)),
             ResourceGovernor::new(rt_metrics::ResourceGovernorConfig::default()),
@@ -5568,7 +6046,7 @@ mod tests {
         task.seed_ratio_limit = Some(0.5);
         task.update_transfer(4, false).await;
         task.update_transfer(2, true).await;
-        task.set_state(TorrentState::Seeding).await;
+        task.set_state_checked(TorrentState::Seeding).await.unwrap();
         let events = rt_db::list_session_events(&db.lock().unwrap(), Some(&info_hash), 10).unwrap();
         assert!(events.iter().any(|event| {
             event.kind == "torrent_state_changed"
@@ -5582,6 +6060,542 @@ mod tests {
             registry.read().await.get(&info_hash).unwrap().state,
             TorrentState::Paused
         );
+    }
+
+    #[tokio::test]
+    async fn recheck_preserves_a_paused_torrent_lifecycle_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let meta = TorrentMetaV1 {
+            info_hash: [12; 20],
+            announce: None,
+            announce_list: Vec::new(),
+            webseeds: Vec::new(),
+            comment: None,
+            created_by: None,
+            creation_date: None,
+            name: "paused.bin".into(),
+            piece_length: 4,
+            pieces: vec![[0; 20]],
+            files: vec![rt_metainfo::TorrentFileV1 {
+                index: 0,
+                length: 4,
+                path: rt_path::SafeRelPath::from_name("paused.bin", false).unwrap(),
+                offset: 0,
+                pad: false,
+            }],
+            private: false,
+            raw: Vec::new(),
+        };
+        let info_hash = hex::encode(meta.info_hash);
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        let mut entry = rt_session::TorrentEntry::new(
+            info_hash.clone(),
+            meta.name.clone(),
+            temp.path().to_string_lossy().into_owned(),
+        );
+        entry.total_length = 4;
+        entry.amount_left = 4;
+        entry.transition(TorrentState::Paused).unwrap();
+        registry.write().await.add(entry).unwrap();
+        let db = Arc::new(Mutex::new(conn));
+        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
+        let mut task = TorrentTask::new(
+            meta,
+            temp.path().to_path_buf(),
+            true,
+            TorrentState::Paused,
+            Arc::clone(&registry),
+            DbExecutor::direct(Arc::clone(&db)),
+            ResourceGovernor::new(rt_metrics::ResourceGovernorConfig::default()),
+            cmd_rx,
+            temp.path().join("fastresume"),
+            8,
+            6881,
+            10,
+            10,
+            60,
+            1024 * 1024,
+            StorageIoConfig::default(),
+            false,
+            OutboundEgressPolicy::default(),
+            GlobalNetworkBudget::unlimited(),
+            10_000,
+        )
+        .await;
+
+        assert!(matches!(
+            task.run_recheck(None).await,
+            RecheckOutcome::Complete
+        ));
+        assert!(task.paused);
+        assert_eq!(
+            registry.read().await.get(&info_hash).unwrap().state,
+            TorrentState::Paused
+        );
+        assert_eq!(
+            rt_db::get(&db.lock().unwrap(), &info_hash).unwrap().state,
+            TorrentState::Paused.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn recheck_pause_persistence_failure_keeps_verification_running() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let meta = TorrentMetaV1 {
+            info_hash: [15; 20],
+            announce: None,
+            announce_list: Vec::new(),
+            webseeds: Vec::new(),
+            comment: None,
+            created_by: None,
+            creation_date: None,
+            name: "pause-failure.bin".into(),
+            piece_length: 4,
+            pieces: vec![[0; 20]],
+            files: vec![rt_metainfo::TorrentFileV1 {
+                index: 0,
+                length: 4,
+                path: rt_path::SafeRelPath::from_name("pause-failure.bin", false).unwrap(),
+                offset: 0,
+                pad: false,
+            }],
+            private: false,
+            raw: Vec::new(),
+        };
+        let info_hash = hex::encode(meta.info_hash);
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        let mut entry = rt_session::TorrentEntry::new(
+            info_hash.clone(),
+            meta.name.clone(),
+            temp.path().to_string_lossy().into_owned(),
+        );
+        entry.total_length = 4;
+        entry.amount_left = 4;
+        entry.transition(TorrentState::Downloading).unwrap();
+        rt_db::upsert(
+            &conn,
+            &crate::engine::row_from_entry(&entry, &rt_metainfo::TorrentMeta::V1(meta.clone())),
+        )
+        .unwrap();
+        registry.write().await.add(entry).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_paused_state
+             BEFORE UPDATE OF state ON torrents
+             WHEN NEW.state = 'paused'
+             BEGIN SELECT RAISE(ABORT, 'injected paused state failure'); END;",
+        )
+        .unwrap();
+        let db = Arc::new(Mutex::new(conn));
+        let (cmd_tx, cmd_rx) = mpsc::channel(1);
+        let mut task = TorrentTask::new(
+            meta,
+            temp.path().to_path_buf(),
+            false,
+            TorrentState::Downloading,
+            Arc::clone(&registry),
+            DbExecutor::direct(Arc::clone(&db)),
+            ResourceGovernor::new(rt_metrics::ResourceGovernorConfig::default()),
+            cmd_rx,
+            temp.path().join("fastresume"),
+            8,
+            6881,
+            10,
+            10,
+            60,
+            1024 * 1024,
+            StorageIoConfig::default(),
+            false,
+            OutboundEgressPolicy::default(),
+            GlobalNetworkBudget::unlimited(),
+            10_000,
+        )
+        .await;
+        let (pause_reply, pause_result) = oneshot::channel();
+        cmd_tx
+            .send(TorrentCmd::Pause {
+                reply: Some(pause_reply),
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            task.run_recheck(None).await,
+            RecheckOutcome::Complete
+        ));
+        assert!(pause_result.await.unwrap().is_err());
+        assert!(!task.paused);
+        assert_eq!(
+            registry.read().await.get(&info_hash).unwrap().state,
+            TorrentState::Downloading
+        );
+        assert_eq!(
+            rt_db::get(&db.lock().unwrap(), &info_hash).unwrap().state,
+            TorrentState::Downloading.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_recheck_preserves_a_stopped_torrent_lifecycle_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let meta = TorrentMetaV1 {
+            info_hash: [13; 20],
+            announce: None,
+            announce_list: Vec::new(),
+            webseeds: Vec::new(),
+            comment: None,
+            created_by: None,
+            creation_date: None,
+            name: "stopped.bin".into(),
+            piece_length: 4,
+            pieces: vec![[0; 20]],
+            files: vec![rt_metainfo::TorrentFileV1 {
+                index: 0,
+                length: 4,
+                path: rt_path::SafeRelPath::from_name("stopped.bin", false).unwrap(),
+                offset: 0,
+                pad: false,
+            }],
+            private: false,
+            raw: Vec::new(),
+        };
+        let info_hash = hex::encode(meta.info_hash);
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        let mut entry = rt_session::TorrentEntry::new(
+            info_hash.clone(),
+            meta.name.clone(),
+            temp.path().to_string_lossy().into_owned(),
+        );
+        entry.total_length = 4;
+        entry.amount_left = 4;
+        registry.write().await.add(entry).unwrap();
+        let db = Arc::new(Mutex::new(conn));
+        let (cmd_tx, cmd_rx) = mpsc::channel(1);
+        let mut task = TorrentTask::new(
+            meta,
+            temp.path().to_path_buf(),
+            true,
+            TorrentState::Stopped,
+            Arc::clone(&registry),
+            DbExecutor::direct(Arc::clone(&db)),
+            ResourceGovernor::new(rt_metrics::ResourceGovernorConfig::default()),
+            cmd_rx,
+            temp.path().join("fastresume"),
+            8,
+            6881,
+            10,
+            10,
+            60,
+            1024 * 1024,
+            StorageIoConfig::default(),
+            false,
+            OutboundEgressPolicy::default(),
+            GlobalNetworkBudget::unlimited(),
+            10_000,
+        )
+        .await;
+        cmd_tx
+            .send(TorrentCmd::CancelJob {
+                job_id: "stopped-recheck".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            task.run_recheck(None).await,
+            RecheckOutcome::Cancelled
+        ));
+        assert!(task.paused);
+        assert_eq!(
+            registry.read().await.get(&info_hash).unwrap().state,
+            TorrentState::Stopped
+        );
+        assert_eq!(
+            rt_db::get(&db.lock().unwrap(), &info_hash).unwrap().state,
+            TorrentState::Stopped.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn stopped_dormant_promotion_does_not_become_paused_before_command() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let meta = TorrentMetaV1 {
+            info_hash: [14; 20],
+            announce: None,
+            announce_list: Vec::new(),
+            webseeds: Vec::new(),
+            comment: None,
+            created_by: None,
+            creation_date: None,
+            name: "staged.bin".into(),
+            piece_length: 4,
+            pieces: vec![[0; 20]],
+            files: vec![rt_metainfo::TorrentFileV1 {
+                index: 0,
+                length: 4,
+                path: rt_path::SafeRelPath::from_name("staged.bin", false).unwrap(),
+                offset: 0,
+                pad: false,
+            }],
+            private: false,
+            raw: Vec::new(),
+        };
+        let info_hash = hex::encode(meta.info_hash);
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        let mut entry = rt_session::TorrentEntry::new(
+            info_hash.clone(),
+            meta.name.clone(),
+            temp.path().to_string_lossy().into_owned(),
+        );
+        entry.total_length = 4;
+        entry.amount_left = 4;
+        registry.write().await.add(entry).unwrap();
+        let db = Arc::new(Mutex::new(conn));
+        let (cmd_tx, cmd_rx) = mpsc::channel(1);
+        let task = TorrentTask::new(
+            meta,
+            temp.path().to_path_buf(),
+            true,
+            TorrentState::Stopped,
+            Arc::clone(&registry),
+            DbExecutor::direct(Arc::clone(&db)),
+            ResourceGovernor::new(rt_metrics::ResourceGovernorConfig::default()),
+            cmd_rx,
+            temp.path().join("fastresume"),
+            8,
+            6881,
+            10,
+            10,
+            60,
+            1024 * 1024,
+            StorageIoConfig::default(),
+            false,
+            OutboundEgressPolicy::default(),
+            GlobalNetworkBudget::unlimited(),
+            10_000,
+        )
+        .await;
+        let handle = tokio::spawn(task.run());
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let state = db
+                    .lock()
+                    .unwrap()
+                    .query_row(
+                        "SELECT state FROM torrents WHERE info_hash = ?1",
+                        [&info_hash],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .ok();
+                if state.as_deref() == Some(TorrentState::Stopped.as_str()) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("stopped promotion did not persist its staged state");
+        assert_eq!(
+            registry.read().await.get(&info_hash).unwrap().state,
+            TorrentState::Stopped
+        );
+
+        cmd_tx.send(TorrentCmd::Shutdown).await.unwrap();
+        timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("staged torrent task did not shut down")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_dormant_promotion_preserves_queue_before_command() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let meta = TorrentMetaV1 {
+            info_hash: [16; 20],
+            announce: None,
+            announce_list: Vec::new(),
+            webseeds: Vec::new(),
+            comment: None,
+            created_by: None,
+            creation_date: None,
+            name: "queued.bin".into(),
+            piece_length: 4,
+            pieces: vec![[0; 20]],
+            files: vec![rt_metainfo::TorrentFileV1 {
+                index: 0,
+                length: 4,
+                path: rt_path::SafeRelPath::from_name("queued.bin", false).unwrap(),
+                offset: 0,
+                pad: false,
+            }],
+            private: false,
+            raw: Vec::new(),
+        };
+        let info_hash = hex::encode(meta.info_hash);
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        let mut entry = rt_session::TorrentEntry::new(
+            info_hash.clone(),
+            meta.name.clone(),
+            temp.path().to_string_lossy().into_owned(),
+        );
+        entry.total_length = 4;
+        entry.amount_left = 4;
+        entry.transition(TorrentState::Downloading).unwrap();
+        entry.state = TorrentState::Queued;
+        registry.write().await.add(entry).unwrap();
+        let db = Arc::new(Mutex::new(conn));
+        let (cmd_tx, cmd_rx) = mpsc::channel(1);
+        let task = TorrentTask::new(
+            meta,
+            temp.path().to_path_buf(),
+            true,
+            TorrentState::Queued,
+            Arc::clone(&registry),
+            DbExecutor::direct(Arc::clone(&db)),
+            ResourceGovernor::new(rt_metrics::ResourceGovernorConfig::default()),
+            cmd_rx,
+            temp.path().join("fastresume"),
+            8,
+            6881,
+            10,
+            10,
+            60,
+            1024 * 1024,
+            StorageIoConfig::default(),
+            false,
+            OutboundEgressPolicy::default(),
+            GlobalNetworkBudget::unlimited(),
+            10_000,
+        )
+        .await;
+        let handle = tokio::spawn(task.run());
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let state = db
+                    .lock()
+                    .unwrap()
+                    .query_row(
+                        "SELECT state FROM torrents WHERE info_hash = ?1",
+                        [&info_hash],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .ok();
+                if state.as_deref() == Some(TorrentState::Queued.as_str()) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("queued promotion did not preserve its staged state");
+        assert_eq!(
+            registry.read().await.get(&info_hash).unwrap().state,
+            TorrentState::Queued
+        );
+
+        cmd_tx.send(TorrentCmd::Shutdown).await.unwrap();
+        timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("queued promotion task did not shut down")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn error_dormant_promotion_accepts_resume_before_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let meta = TorrentMetaV1 {
+            info_hash: [15; 20],
+            announce: None,
+            announce_list: Vec::new(),
+            webseeds: Vec::new(),
+            comment: None,
+            created_by: None,
+            creation_date: None,
+            name: "error-recovery.bin".into(),
+            piece_length: 4,
+            pieces: vec![[0; 20]],
+            files: vec![rt_metainfo::TorrentFileV1 {
+                index: 0,
+                length: 4,
+                path: rt_path::SafeRelPath::from_name("error-recovery.bin", false).unwrap(),
+                offset: 0,
+                pad: false,
+            }],
+            private: false,
+            raw: Vec::new(),
+        };
+        let info_hash = hex::encode(meta.info_hash);
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        let mut entry = rt_session::TorrentEntry::new(
+            info_hash.clone(),
+            meta.name.clone(),
+            temp.path().to_string_lossy().into_owned(),
+        );
+        entry.total_length = 4;
+        entry.amount_left = 4;
+        entry.set_error("previous task failure");
+        registry.write().await.add(entry).unwrap();
+        let db = Arc::new(Mutex::new(conn));
+        let (cmd_tx, cmd_rx) = mpsc::channel(2);
+        let task = TorrentTask::new(
+            meta,
+            temp.path().to_path_buf(),
+            true,
+            TorrentState::Error,
+            Arc::clone(&registry),
+            DbExecutor::direct(Arc::clone(&db)),
+            ResourceGovernor::new(rt_metrics::ResourceGovernorConfig::default()),
+            cmd_rx,
+            temp.path().join("fastresume"),
+            8,
+            6881,
+            10,
+            10,
+            60,
+            1024 * 1024,
+            StorageIoConfig::default(),
+            false,
+            OutboundEgressPolicy::default(),
+            GlobalNetworkBudget::unlimited(),
+            10_000,
+        )
+        .await;
+        let handle = tokio::spawn(task.run());
+        let (reply, response) = oneshot::channel();
+        cmd_tx
+            .send(TorrentCmd::Resume { reply: Some(reply) })
+            .await
+            .unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(2), response)
+                .await
+                .expect("error promotion did not receive a resume acknowledgement")
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(
+            registry.read().await.get(&info_hash).unwrap().state,
+            TorrentState::Checking
+        );
+
+        cmd_tx.send(TorrentCmd::Shutdown).await.unwrap();
+        timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("error recovery task did not shut down")
+            .unwrap();
     }
 
     #[test]
@@ -6513,5 +7527,120 @@ mod tests {
         assert_eq!(peer_event_channel_capacity(1), 64);
         assert_eq!(peer_event_channel_capacity(200), 200);
         assert_eq!(peer_event_channel_capacity(10_000), 512);
+    }
+
+    #[test]
+    fn paused_torrent_drops_late_peer_events() {
+        let active_event = PeerEvent::Unchoked {
+            peer: "127.0.0.1:6881".parse().unwrap(),
+        };
+        let late_piece = PeerEvent::Piece {
+            peer: "127.0.0.1:6881".parse().unwrap(),
+            block: BlockEvent {
+                piece: 0,
+                offset: 0,
+                data: bytes::Bytes::from_static(b"late"),
+            },
+        };
+
+        assert!(peer_event_if_active(false, active_event).is_some());
+        assert!(peer_event_if_active(true, late_piece).is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_peers_clears_picker_peer_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let meta = TorrentMetaV1 {
+            info_hash: [9; 20],
+            announce: None,
+            announce_list: Vec::new(),
+            webseeds: Vec::new(),
+            comment: None,
+            created_by: None,
+            creation_date: None,
+            name: "sample.bin".into(),
+            piece_length: 4,
+            pieces: vec![[8; 20]],
+            files: vec![rt_metainfo::TorrentFileV1 {
+                index: 0,
+                length: 4,
+                path: rt_path::SafeRelPath::from_name("sample.bin", false).unwrap(),
+                offset: 0,
+                pad: false,
+            }],
+            private: false,
+            raw: Vec::new(),
+        };
+        let db = Arc::new(Mutex::new(conn));
+        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
+        let mut task = TorrentTask::new(
+            meta,
+            temp.path().to_path_buf(),
+            false,
+            TorrentState::Downloading,
+            Arc::new(RwLock::new(SessionRegistry::new())),
+            DbExecutor::direct(Arc::clone(&db)),
+            ResourceGovernor::new(rt_metrics::ResourceGovernorConfig::default()),
+            cmd_rx,
+            temp.path().join("fastresume"),
+            8,
+            6881,
+            10,
+            10,
+            60,
+            1024 * 1024,
+            StorageIoConfig::default(),
+            false,
+            OutboundEgressPolicy::default(),
+            GlobalNetworkBudget::unlimited(),
+            10_000,
+        )
+        .await;
+
+        let peer_addr = "127.0.0.1:6881".parse().unwrap();
+        let (peer_cmd_tx, _peer_cmd_rx) = mpsc::channel(1);
+        let peer_permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .unwrap();
+        task.picker.availability.add_bitfield(&[0x80]);
+        task.picker.pick_from_seed().unwrap();
+        task.active_peers.insert(
+            peer_addr,
+            PeerHandle {
+                id: PeerId::new(),
+                cmd_tx: peer_cmd_tx,
+                abort: None,
+                peer_has: PieceBitmap::from_bools(&[true]),
+                choked: true,
+                upload_choked: true,
+                interested: false,
+                downloaded: 0,
+                uploaded: 0,
+                download_rate: 0.0,
+                upload_rate: 0.0,
+                download_rate_window: 0,
+                upload_rate_window: 0,
+                download_rate_window_started: Instant::now(),
+                upload_rate_window_started: Instant::now(),
+                outstanding: 0,
+                requested: Vec::new(),
+                ut_metadata_id: None,
+                ut_pex_id: None,
+                metadata_size: None,
+                _peer_permit: peer_permit,
+                pending_have: PieceBitmap::new(1),
+                pending_upload_limit: None,
+            },
+        );
+
+        assert_eq!(task.picker.availability.count(0), 1);
+        task.shutdown_peers().await;
+
+        assert!(task.active_peers.is_empty());
+        assert_eq!(task.picker.availability.count(0), 0);
+        assert!(task.picker.pick_from_seed().is_some());
     }
 }

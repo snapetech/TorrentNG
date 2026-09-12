@@ -42,6 +42,19 @@ export interface TorrentListResponse {
   torrents: TorrentSummary[]
 }
 
+export interface LiveTorrentStat {
+  hash: string
+  amount_left: number
+  download_rate: number
+  upload_rate: number
+  sampled_at: number
+}
+
+export interface LiveTorrentStatsResponse {
+  sampled_at: number
+  torrents: LiveTorrentStat[]
+}
+
 interface NativeTorrentSummary {
   info_hash: string
   name: string
@@ -58,6 +71,12 @@ interface NativeTorrentSummary {
   num_peers: number
   num_seeds: number
   tracker_message?: string | null
+}
+
+interface NativeTorrentListResponse {
+  snapshot?: number
+  total: number
+  torrents: NativeTorrentSummary[]
 }
 
 export interface ListParams {
@@ -90,6 +109,14 @@ async function get<T>(path: string, params?: Record<string, string | number | un
 function torrentStateCode(state: string): number {
   switch (state) {
     case 'checking': return 2
+    case 'downloading':
+    case 'seeding': return 1
+    // qBittorrent's compact state field has no queued/metadata/error values
+    // that map cleanly to the native lifecycle. Keep those adapter-only
+    // values distinct from stopped so the UI does not mislabel them.
+    case 'queued': return 3
+    case 'metadata_pending': return 4
+    case 'error': return 5
     default: return 0
   }
 }
@@ -97,7 +124,7 @@ function torrentStateCode(state: string): number {
 function normalizeNativeTorrent(t: NativeTorrentSummary): TorrentSummary {
   const size = Number(t.total_length ?? 0)
   const done = Number(t.downloaded ?? 0)
-  const complete = size > 0 && done >= size
+  const complete = t.state === 'seeding' || (size > 0 && done >= size)
   const active = t.state === 'seeding' || t.state === 'downloading'
   return {
     hash: t.info_hash,
@@ -129,10 +156,22 @@ function normalizeNativeTorrent(t: NativeTorrentSummary): TorrentSummary {
   }
 }
 
-function normalizeTorrentList(body: TorrentListResponse | TorrentSummary[] | NativeTorrentSummary[], params: ListParams = {}): TorrentListResponse {
-  if (!Array.isArray(body)) return body
+function isNativeTorrentSummary(item: TorrentSummary | NativeTorrentSummary): item is NativeTorrentSummary {
+  return 'info_hash' in item
+}
+
+function normalizeTorrentList(
+  body: TorrentListResponse | NativeTorrentListResponse | TorrentSummary[] | NativeTorrentSummary[],
+  params: ListParams = {},
+): TorrentListResponse {
+  if (!Array.isArray(body)) {
+    const torrents = body.torrents.map(item =>
+      isNativeTorrentSummary(item) ? normalizeNativeTorrent(item) : item,
+    )
+    return { ...body, torrents }
+  }
   const torrents = body.map(item =>
-    'info_hash' in item ? normalizeNativeTorrent(item as NativeTorrentSummary) : item as TorrentSummary,
+    isNativeTorrentSummary(item) ? normalizeNativeTorrent(item) : item,
   )
   const offset = Math.max(0, Number(params.offset ?? 0))
   const limit = params.limit === undefined ? torrents.length : Math.max(0, Number(params.limit))
@@ -293,7 +332,6 @@ export interface StoragePlanRequest {
   dry_run_approved?: boolean | null
   roots?: string[] | null
   affected_torrents?: string[] | null
-  completed_steps?: number[] | null
 }
 
 export interface StoragePlanStep {
@@ -689,15 +727,18 @@ export const api = {
     login,
     logout,
     check: async (): Promise<TorrentListResponse> =>
-      normalizeTorrentList(await get<TorrentListResponse | TorrentSummary[] | NativeTorrentSummary[]>('/torrents', { limit: 1 }), { limit: 1 }),
+      normalizeTorrentList(await get<TorrentListResponse | NativeTorrentListResponse | TorrentSummary[] | NativeTorrentSummary[]>('/torrents', { limit: 1 }), { limit: 1 }),
   },
 
   torrents: {
     list: async (p: ListParams = {}): Promise<TorrentListResponse> =>
       normalizeTorrentList(
-        await get<TorrentListResponse | TorrentSummary[] | NativeTorrentSummary[]>('/torrents', p as Record<string, string | number>),
+        await get<TorrentListResponse | NativeTorrentListResponse | TorrentSummary[] | NativeTorrentSummary[]>('/torrents', p as Record<string, string | number>),
         p,
       ),
+
+    liveStats: (hashes: string[]): Promise<LiveTorrentStatsResponse> =>
+      get('/torrents/live', { hashes: hashes.join(',') }),
 
     get: (hash: string): Promise<TorrentSummary> =>
       get(`/torrents/${hash}`),

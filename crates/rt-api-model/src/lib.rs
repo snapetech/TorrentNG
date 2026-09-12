@@ -5,7 +5,7 @@ pub mod metrics;
 pub mod snapshot;
 pub mod torrent;
 
-pub use auth::{csrf_request_allowed, has_session_cookie, session_cookie_value};
+pub use auth::{api_token_allowed, csrf_request_allowed, has_session_cookie, session_cookie_value};
 pub use error::ApiError;
 pub use idempotency::{
     request_fingerprint, valid_idempotency_key, CachedResponse, Claim as IdempotencyClaim,

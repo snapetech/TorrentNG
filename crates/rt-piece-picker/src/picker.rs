@@ -436,9 +436,12 @@ impl PiecePicker {
         }
     }
 
-    /// Drop all outstanding block request bookkeeping without marking data complete.
+    /// Drop all outstanding block request bookkeeping without discarding
+    /// blocks already received for a partial piece.
     pub fn reset_outstanding_requests(&mut self) {
-        self.in_progress.clear();
+        for state in self.in_progress.values_mut() {
+            state.requested.fill(0);
+        }
     }
 
     pub fn is_complete(&self) -> bool {
@@ -468,11 +471,20 @@ impl PiecePicker {
         // is visible before the first piece finishes hashing.
         for (&piece, state) in &self.in_progress {
             if piece < self.piece_count && self.wanted[piece] && self.enabled[piece] {
-                let received_blocks: u64 = state.received.iter().filter(|r| **r).count() as u64;
-                let max_block = MAX_BLOCK_SIZE as u64;
-                let recv = received_blocks.saturating_mul(max_block);
-                let piece_len = self.piece_length_for(piece) as u64;
-                left = left.saturating_sub(recv.min(piece_len));
+                let received_bytes = state
+                    .received
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(block_idx, received)| {
+                        received.then_some(u64::from(
+                            state
+                                .piece_length
+                                .saturating_sub(block_idx as u32 * MAX_BLOCK_SIZE)
+                                .min(MAX_BLOCK_SIZE),
+                        ))
+                    })
+                    .fold(0_u64, u64::saturating_add);
+                left = left.saturating_sub(received_bytes);
             }
         }
         left
@@ -587,6 +599,25 @@ mod tests {
     }
 
     #[test]
+    fn bytes_left_counts_a_short_final_block_exactly() {
+        let piece_length = MAX_BLOCK_SIZE * 2 + 1;
+        let mut p = picker_1piece(piece_length);
+        p.availability.add_have(0);
+        let all = peer_has_all(1);
+        let first = p.pick(&all).unwrap();
+        let second = p.pick(&all).unwrap();
+        let tail = p.pick(&all).unwrap();
+        assert_eq!(tail.length, 1);
+
+        p.block_received(0, first.begin);
+        p.block_received(0, second.begin);
+        assert_eq!(p.bytes_left(), 1);
+
+        p.block_received(0, tail.begin);
+        assert_eq!(p.bytes_left(), 0);
+    }
+
+    #[test]
     fn have_pieces_is_inverse_of_wanted() {
         let mut p = picker_4pieces(10, 4);
         p.mark_have(1);
@@ -650,6 +681,22 @@ mod tests {
         let next = p.pick(&all).unwrap();
         assert_eq!(again.begin, r1.begin);
         assert_eq!(next.begin, r2.begin);
+    }
+
+    #[test]
+    fn reset_outstanding_requests_preserves_partial_piece_progress() {
+        let mut p = picker_1piece(MAX_BLOCK_SIZE * 2);
+        p.availability.add_have(0);
+        let all = peer_has_all(1);
+        let first = p.pick(&all).unwrap();
+        let second = p.pick(&all).unwrap();
+        assert!(!p.block_received(0, first.begin));
+
+        p.reset_outstanding_requests();
+
+        let next = p.pick(&all).unwrap();
+        assert_eq!(next.begin, second.begin);
+        assert_eq!(p.partial_pieces(), vec![(0, vec![0])]);
     }
 
     #[test]
