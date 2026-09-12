@@ -146,7 +146,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install Rust 1.88.0 (declared MSRV)
-        uses: dtolnay/rust-toolchain@1.88.0
+        uses: dtolnay/rust-toolchain@1.120.0
 
       - name: Build TorrentNG client workspace at declared MSRV
         run: cargo build --workspace --all-targets --locked
@@ -166,7 +166,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install Rust 1.97.0 (compatible-client service declared MSRV)
-        uses: dtolnay/rust-toolchain@1.97.0
+        uses: dtolnay/rust-toolchain@1.120.0
 
       - name: Build compatible-client service at declared MSRV
         run: cargo build --locked --manifest-path sidecar/Cargo.toml

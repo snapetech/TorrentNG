@@ -60,7 +60,7 @@ jobs:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Install Rust 1.88.0
-        uses: dtolnay/rust-toolchain@1.88.0
+        uses: dtolnay/rust-toolchain@1.120.0
 
       - name: Build TorrentNG client workspace at declared MSRV
         run: cargo build --workspace --all-targets --locked
@@ -79,7 +79,7 @@ jobs:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Install Rust 1.97.0
-        uses: dtolnay/rust-toolchain@1.97.0
+        uses: dtolnay/rust-toolchain@1.120.0
 
       - name: Build compatible-client service at declared MSRV
         run: cargo build --locked --manifest-path sidecar/Cargo.toml
