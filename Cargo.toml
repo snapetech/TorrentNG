@@ -69,7 +69,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 
 # crypto
 sha1 = "0.10"
-sha2 = "0.10"
+sha2 = "0.11"
 subtle = "2"
 
 # http client (tracker announces)
