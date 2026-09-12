@@ -2,8 +2,9 @@
 
 Status: **implementation burn-down complete; current qualification evidence refreshed 2026-09-10**
 Baseline: 2026-09-01, `main`  
-Scope: native Rust engine, native daemon/API, compatibility facades, storage,
-deployment, CI, and release evidence.
+Scope: the TorrentNG client (`torrentngd`), the compatible-client WebUI/API
+service (`torrentng`), their API facades, storage, deployment, CI, and release
+evidence.
 
 This is the canonical remediation ledger for the principal-engineer / investor
 audit. Older roadmap and certification documents describe intended or locally
@@ -57,14 +58,14 @@ The following was run against the audit baseline before this burn-down began:
 
 | Check | Result | Meaning |
 | --- | --- | --- |
-| `cargo test --workspace --all-targets --locked` | PASS | Existing native tests are green, but mostly exercise isolated behavior. |
-| `cargo test --manifest-path sidecar/Cargo.toml --locked` | PASS | Sidecar tests are green. |
+| `cargo test --workspace --all-targets --locked` | PASS | Existing TorrentNG-client tests are green, but mostly exercise isolated behavior. |
+| `cargo test --manifest-path sidecar/Cargo.toml --locked` | PASS | Compatible-client service tests are green. |
 | `cargo fmt --all -- --check` | FAIL | `crates/rt-migrate/src/lib.rs:2663` was not formatted. |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | FAIL | Existing lint/MSRV/enum-layout failures remain. |
-| native CI workflow | INCOMPLETE | `.github/workflows/ci.yml` builds sidecar/WebUI but does not test native crates. |
-| native release workflow (baseline) | INCOMPLETE | Historical baseline: release built and smoke-checked the binary without native test, fmt, or clippy gates. |
+| TorrentNG-client CI workflow | INCOMPLETE | `.github/workflows/ci.yml` builds the compatible-client service/WebUI but does not test TorrentNG-client crates. |
+| TorrentNG-client release workflow (baseline) | INCOMPLETE | Historical baseline: release built and smoke-checked the binary without TorrentNG-client test, fmt, or clippy gates. |
 | certification status | NOT CLEAN | Universal compatibility is `PASS_WITH_SKIPS` because the separate real-device wrapper leg is intentionally skipped; the completed 24h soak is PASS, while strict readiness still fails on non-clean evidence rows. |
-| checked-in fuzz/OpenAPI/idempotency evidence | PARTIAL | Fuzz targets and bounded CI smoke commands are checked in; the native OpenAPI contract is now checked in; endpoint replay tests and an observed hosted-CI run remain evidence gaps. |
+| checked-in fuzz/OpenAPI/idempotency evidence | PARTIAL | Fuzz targets and bounded CI smoke commands are checked in; the TorrentNG API OpenAPI contract is now checked in; endpoint replay tests and an observed hosted-CI run remain evidence gaps. |
 
 ## Current verified evidence (2026-09-10 local / 2026-09-10 UTC)
 
@@ -80,21 +81,21 @@ b393 release soak.
 
 | Check | Result | Meaning |
 | --- | --- | --- |
-| `cargo test --workspace --all-targets --locked` | PASS | Native workspace tests green, with only explicitly ignored real-device tests skipped. |
-| `cargo test --manifest-path sidecar/Cargo.toml --locked` | PASS | 125 unit tests and 87 integration tests green; two synthetic benchmarks remain explicitly ignored. |
+| `cargo test --workspace --all-targets --locked` | PASS | TorrentNG-client workspace tests green, with only explicitly ignored real-device tests skipped. |
+| `cargo test --manifest-path sidecar/Cargo.toml --locked` | PASS | Compatible-client service tests green; two synthetic benchmarks remain explicitly ignored. |
 | `cargo fmt --all -- --check` | PASS | Workspace formatting is clean. |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | PASS | Warnings-denied lint is clean. |
 | `cargo +1.88 build/test --workspace --all-targets --locked` | PASS | Declared main-workspace MSRV build and tests green. |
-| `cargo +1.97.0 build/test --manifest-path sidecar/Cargo.toml --locked` | PASS | Declared sidecar MSRV build and tests green. |
+| `cargo +1.97.0 build/test --manifest-path sidecar/Cargo.toml --locked` | PASS | Declared compatible-client service MSRV build and tests green. |
 | declared `rust-version` (both `Cargo.toml`s) | **CORRECTED** | Was `1.80` in both, unverified and untrue. Neither workspace's *locked* dependency graph builds below 1.88 (main: `idna_adapter` needs rustc 1.86+, plus `edition2024` needs Cargo 1.85+) or 1.97 (sidecar: `libsqlite3-sys`'s build script uses `cfg_select!`, stabilized between 1.94 and 1.97). This is a transitive-dependency floor, not first-party code needing new syntax. Corrected both `rust-version` fields to `1.88` / `1.97` to match reality; this itself is TNG-028 acceptance criteria ("document the supported toolchain"). |
-| GitHub Actions CI run `34521941751` | PASS | All 10 jobs passed on `196c65a`: native quality, both MSRV jobs, fuzz smoke, sidecar, WebUI, dependency security, backup/restore, API/SSE load, and fault containment. |
-| rTorrent startup identity timeout isolation | PASS | Commit `4a90048` gives the multi-thousand-download identity rewrite a separate 300-second timeout while ordinary XMLRPC calls remain 10 seconds; sidecar tests and warnings-denied clippy pass. |
+| GitHub Actions CI run `34521941751` | PASS | All 10 jobs passed on `196c65a`: TorrentNG-client quality, both MSRV jobs, fuzz smoke, compatible-client service, WebUI, dependency security, backup/restore, API/SSE load, and fault containment. |
+| rTorrent startup identity timeout isolation | PASS | Commit `4a90048` gives the multi-thousand-download identity rewrite a separate 300-second timeout while ordinary XMLRPC calls remain 10 seconds; compatible-client service tests and warnings-denied clippy pass. |
 | kspls0 LVM storage release certification | PASS | [`storage-release-certification-kspls0-lvm-20260910-b393eb0.md`](../certification/reports/storage-release-certification-kspls0-lvm-20260910-b393eb0.md); exact commit `b393eb0`, `/dev/mapper/datapool_lvm-media`, HDD median ratio 5.11x, io_uring graduation, and real-root move/import all pass. |
 | kspls0 real-device storage matrix | PASS_WITH_SKIPS | [`universal-live-kspls0-lvm-20260910-b393eb0.md`](../certification/reports/universal-live-kspls0-lvm-20260910-b393eb0.md); the real-device storage gate passes against the LV; local Docker/public legs were intentionally not rerun in this targeted invocation. |
 | Public Debian 24-hour soak finalization | PASS | [`soak-final-public-debian-20260910.md`](../certification/reports/soak-final-public-debian-20260910.md); 1,437 samples, one exact completed torrent, resource/health checks pass. |
 | Canonical all-live compatibility certification | PASS_WITH_SKIPS | [`universal-compat-b393eb0-all-live.md`](../certification/reports/universal-compat-b393eb0-all-live.md); static, migration, local Docker, mobile, and public Debian gates pass; only the separate real-device wrapper gate is skipped. |
 | Clean release-binary smoke | PASS | [`backend-burndown-native-release-smoke-20260910-final.md`](../certification/reports/backend-burndown-native-release-smoke-20260910-final.md); build commit `3cb0ba4`, 22,449,216 bytes, SHA-256 `7fbac478b696316d989028c47573e4cd248f04a98a479f218017c0ec5a812b5e`, 457 ms, clean SIGTERM. |
-| Full local release gate | PASS_WITH_WARNINGS | [`local-release-20260910-50e0fc3.md`](../certification/reports/local-release-20260910-50e0fc3.md); native, storage-feature, WebUI, API, smoke, backup, corpus, and security gates pass; only local block-device certification is skipped. |
+| Full local release gate | PASS_WITH_WARNINGS | [`local-release-20260910-50e0fc3.md`](../certification/reports/local-release-20260910-50e0fc3.md); TorrentNG-client, storage-feature, WebUI, API, smoke, backup, corpus, and security gates pass; only local block-device certification is skipped. |
 | Strict external evidence preflight | PASS | [`external-evidence-preflight-release-strict-20260910-b393eb0.md`](../certification/reports/external-evidence-preflight-release-strict-20260910-b393eb0.md); Docker, public opt-in, writable target, migration corpus, and completed soak pass. |
 
 The hosted CI workflow has now run successfully for the pushed source. Run
@@ -107,7 +108,7 @@ still be reviewed separately.
 Focused release evidence from 2026-09-04 is indexed in
 [`BACKEND_BURNDOWN_RELEASE_20260902.md`](BACKEND_BURNDOWN_RELEASE_20260902.md).
 The current clean release binary was built at `3cb0ba4`, launched with an
-isolated authenticated config, exercised through native REST, qBittorrent REST,
+isolated authenticated config, exercised through TorrentNG REST, qBittorrent REST,
 health, and metrics, and terminated with SIGTERM. The full local release gate
 was rerun at `50e0fc3` and is `PASS_WITH_WARNINGS` solely because its local
 block-device target was not configured. Strict readiness remains appropriately
@@ -123,7 +124,7 @@ all checks PASS, and clean SIGTERM. The latest WebUI report is
 and the latest full local release report is
 [`local-release-20260910-50e0fc3.md`](../certification/reports/local-release-20260910-50e0fc3.md).
 Full workspace tests, warnings-denied clippy, formatting, OpenAPI validation,
-sidecar tests, the current security scan, and the universal-live local Docker
+compatible-client service tests, the current security scan, and the universal-live local Docker
 matrix are green. These are current local facts, not external production
 evidence. The current b393 all-live compatibility report is `PASS_WITH_SKIPS`:
 its local Docker, mobile, and public legs pass, while the real-device wrapper
@@ -150,7 +151,7 @@ representative public production workload.
 The current full Docker interoperability matrix is
 [`interop-matrix-20260910T190228Z.md`](../certification/reports/interop-matrix-20260910T190228Z.md).
 It covers bidirectional transfers with qBittorrent, Transmission, Deluge, and
-rTorrent, failure/recovery protocol cases, and native/qBittorrent/Transmission/
+rTorrent, failure/recovery protocol cases, and TorrentNG/qBittorrent/Transmission/
 Deluge facade mutations.
 
 The current live public-torrent matrix is
@@ -181,7 +182,7 @@ retained to show the sequence of the remediation work; the current source and
 release smoke supersede its artifact statement. The extended release/hot-set
 proof gate remains deliberately deferred. The source then had
 focused green coverage for the substantive seams: `rt-session` 24 tests,
-`rt-storage` 118 tests, `rt-engine` 165 tests, native API 48 tests, and
+`rt-storage` 118 tests, `rt-engine` 165 tests, TorrentNG API 48 tests, and
 qBittorrent API 62 tests. This checkpoint adds bounded initial SSE snapshot
 chunks, atomic engine-actor liveness and task reaping, shutdown requeue of
 durable storage work, asynchronous payload-delete finalization and recovery,
@@ -192,7 +193,7 @@ bounded active-peer collection, detached pure-v2 file verification, and a
 bounded engine stats task-query deadline. Transfer-stat writes are now
 coalesced instead of issuing a full torrent-row SQLite upsert per uploaded or
 downloaded block, with forced progress/state flushes on shutdown and state
-changes. Native facet aggregates and
+changes. TorrentNG facet aggregates and
 qBittorrent peer logs now reuse bounded runtime/snapshot indexes rather than
 independently scanning the live registry.
 
@@ -222,7 +223,7 @@ Implemented in the current source tree:
 - DHT has bounded tracked torrents, per-info-hash query history, outstanding
   requests, transaction-id collision handling, failed-send cleanup, inbound
   rate/state limits, and process-wide announced-peer limits.
-- Idempotency-key claim/replay/conflict handling is shared by native,
+- Idempotency-key claim/replay/conflict handling is shared by TorrentNG,
   qBittorrent, Transmission, and Deluge mutation routers. Successful replies
   replay; failed replies release the key; conflicting fingerprints are
   rejected.
@@ -236,9 +237,9 @@ Implemented in the current source tree:
 - Deluge auxiliary plugin configuration, plugin enable/disable, and Execute
   command writes no longer mutate process-memory facades and report success;
   they return explicit unsupported results. The enabled-plugin projection only
-  reports the native Label and Notifications surfaces.
+  reports the TorrentNG Label and Notifications surfaces.
 - Migration/schema startup work is transactional, persisted projections are
-  reconciled, and the native OpenAPI contract is checked in with a standard
+  reconciled, and the TorrentNG API OpenAPI contract is checked in with a standard
   library validation script.
 
 Still genuinely open after this pass:
@@ -283,7 +284,7 @@ external hardware, real client traffic, or long-running fault/load evidence.
 ## Authoritative current source reconciliation
 
 Updated after the current source pass, full local test matrix, warnings-denied
-clippy, OpenAPI validation, sidecar tests, release build, authenticated
+clippy, OpenAPI validation, compatible-client service tests, release build, authenticated
 release-binary smoke, live fault matrix, API/SSE load, and local client
 interoperability matrix on 2026-09-04 UTC.
 
@@ -327,11 +328,11 @@ and is superseded by the source reconciliation above.
 | TNG-018 | Implemented locally: handshake, idle, request, and response budgets | Run scheduler-saturation evidence |
 | TNG-019 | Implemented locally within declared IPv4 live-DHT scope: bounds, source checks, tokens, caps | Do not claim live IPv6 DHT; run hostile-input/load evidence |
 | TNG-020 | Implemented locally: checked tracker values, bounded UDP handling, PEX add/drop parsing and handling | Run broad tracker/transport interoperability evidence |
-| TNG-021 | Resolved: native list contract and bounded pagination agree | None beyond regression maintenance |
+| TNG-021 | Resolved: TorrentNG list contract and bounded pagination agree | None beyond regression maintenance |
 | TNG-022 | Implemented locally: durable categories/tags/bans and ban eviction; unsupported mode/plugin operations now fail explicitly | Keep projection-only compatibility behavior documented; run real-client matrix |
 | TNG-023 | Implemented locally: implemented/enabled/certified/experimental assurance states are separate | Keep `certified` empty until external evidence is accepted |
 | TNG-024 | Implemented locally: fail-closed config validation, secret-file support, deployment templates | Run deployment on the target orchestrator and inspect rendered secrets |
-| TNG-025 | Resolved for the repository gate: native quality, clippy, MSRV, fuzz, release-smoke, security, backup, load, and fault jobs execute successfully | Branch-protection enforcement still needs repository-settings review |
+| TNG-025 | Resolved for the repository gate: TorrentNG-client and compatible-client service quality, clippy, MSRV, fuzz, release-smoke, security, backup, load, and fault jobs execute successfully | Branch-protection enforcement still needs repository-settings review |
 | TNG-026 | Runtime source is `b393eb0`; release evidence was reconciled at `3cb0ba4` and the certification harness was hardened at `50e0fc3`; clean deployment smoke, backup/restore, WebUI, and shutdown now pass | One official public Debian transfer, completed named soak, canonical all-live local/mobile/public compatibility, and kspls0 LVM storage now pass; remaining public sources and strict readiness remain external gates |
 | TNG-027 | Resolved for the repository gate: fuzz targets, OpenAPI validator, idempotency tests, and hosted bounded fuzz smoke are green | Broader parser and mutation replay corpus remains optional evidence work |
 | TNG-028 | Resolved for the repository gate: format, clippy, locked tests, and declared MSRV pass locally and in hosted CI | Branch-protection enforcement still needs repository-settings review |
@@ -568,7 +569,7 @@ is allowed to bypass the policy.
 
 **Status: Functional implementation complete; evidence deferred** · **Priority: P0** · **Confidence: high**
 
-Verified evidence: native, qBittorrent, Transmission, and Deluge mounted
+Verified evidence: TorrentNG, qBittorrent, Transmission, and Deluge mounted
 routers use token-or-cookie authentication middleware, with login/logout
 allowlisted only where the compatibility protocol requires it. Mutating
 cookie-authenticated requests require the same-origin/CSRF policy. The
@@ -633,7 +634,7 @@ registry row and the orphaned blob are cleaned up. Verified both are real
 regression tests, not tautologies: temporarily disabled the rollback logic
 and confirmed both tests fail before restoring the fix.
 
-Full workspace tests, sidecar tests, format, compile, and strict clippy are
+Full TorrentNG-client workspace tests, compatible-client service tests, format, compile, and strict clippy are
 green; the current focused count is `rt-engine` 165 tests.
 
 The same rollback/transaction pattern now covers `add_magnet`, metadata
@@ -734,7 +735,7 @@ engine stats no longer scans every registry entry just to calculate durable
 totals or activity-tier totals. The API snapshots also advance from the
 bounded mutation journal when it is retained, instead of reconverting every
 registry row on each refresh.
-The older production-daemon scale report records 100k restore, native/qBit
+The older production-daemon scale report records 100k restore, TorrentNG/qBit
 pagination, aggregate stats, restart, and one-torrent promotion/demotion
 behavior, but it is tied to an older binary digest and remains historical
 evidence. It does not exercise 1k/2k simultaneous hot torrents, real peer or
@@ -761,7 +762,7 @@ Verified evidence (2026-09-03): filesystem plans now run behind a bounded
 dispatcher (32 queued requests, two `spawn_blocking` workers by default), not
 inside the engine actor. The dispatcher also enforces an end-to-end in-flight
 cap equal to queued capacity plus worker slots, so paused/slow requests cannot
-accumulate as unbounded supervisor waiters. Native save-path moves return
+accumulate as unbounded supervisor waiters. TorrentNG-client save-path moves return
 `202` with a durable job id; authenticated get/pause/resume/cancel routes
 control the same job state. Plans, operation, affected torrents, and completed
 checkpoints are serialized into job events. Pause waits asynchronously without
@@ -871,38 +872,38 @@ shutdown-under-load tests with bounded completion and truthful health.
 
 **Status: Functional implementation and local many-client/slow-consumer evidence complete; representative production evidence deferred** · **Priority: P1** · **Confidence: high**
 
-Verified evidence (2026-09-03): the native list API returns a bounded page and
+Verified evidence (2026-09-03): the TorrentNG list API returns a bounded page and
 immutable revision cursor; snapshots are cached for 750 ms, sort indexes are
 lazy and shared, refreshes are single-flight, and an expired cursor returns
-`410 Gone`. Native SSE sends one or more bounded initial snapshot chunks
+`410 Gone`. TorrentNG SSE sends one or more bounded initial snapshot chunks
 followed by mutation-journal deltas and performs a bounded snapshot resync
 only when the bounded journal expires.
-When the journal still covers the cached generation, native and qBittorrent
+When the journal still covers the cached generation, TorrentNG and qBittorrent
 snapshot refreshes apply only the changed hashes; they fall back to a registry
 scan when there is no usable base snapshot or the journal has expired.
 Engine stats uses a 500 ms cache, parallel task queries (up to 64), a 250 ms
-aggregate task-query deadline, and per-query timeouts; native and qBittorrent
+aggregate task-query deadline, and per-query timeouts; TorrentNG and qBittorrent
 transfer-info now consume its aggregate rate/byte snapshot instead of walking
 every torrent actor.
 Durable torrent totals, byte totals, activity-tier counts, tracker status
 counts, and active-job counts use maintained counters or aggregate SQL rather
 than materializing every matching row.
-The native qBittorrent facade's `/torrents/info` has the same pinned snapshot
+The TorrentNG qBittorrent facade's `/torrents/info` has the same pinned snapshot
 and page index, returns `X-TorrentNG-Snapshot`, and `/sync/maindata` uses the
-registry journal for changed/removed torrents. The sidecar TorrentNG backend
-now carries that native snapshot token through every bounded sync page and
-resilient sub-range retry; the sidecar qBittorrent backend also uses bounded,
+registry journal for changed/removed torrents. The compatible-client service's
+TorrentNG backend now carries that TorrentNG snapshot token through every bounded
+sync page and resilient sub-range retry; its qBittorrent backend also uses bounded,
 hash-sorted `torrents/info` pages, but that external API has no server-side
 snapshot, so its view is explicitly eventual and cleanup is skipped for a
-cycle with page faults. The sidecar qBittorrent compatibility
+cycle with page faults. The compatible-client service's qBittorrent compatibility
 `/sync/maindata` path now rejects full or incremental responses over 10,000
 torrents with `413` instead of silently truncating a full sync or materializing
-an unbounded delta. In sidecar mode that compatibility cursor is now a
+an unbounded delta. In compatible-client service mode that compatibility cursor is now a
 durable SQLite revision with bounded deletion tombstones; wall-clock seconds
 are not used, so same-second updates and removals cannot disappear between
 polls. Large qBit projections skip
 per-torrent live engine round-trips; durable fields and aggregate stats remain
-available. Native SSE initial state is emitted as bounded chunks (default 500,
+available. TorrentNG SSE initial state is emitted as bounded chunks (default 500,
 maximum 1,000) at one revision, with `snapshot_complete` framing; subsequent
 events remain journal deltas.
 qBittorrent `/log/peers` now queries only promoted runtime tasks, in parallel
@@ -910,7 +911,7 @@ with a bounded per-task deadline; dormant rows have no live peers and are not
 walked one by one.
 
 The redesign does not make every operation sublinear. A journal-driven refresh
-still clones the immutable snapshot and rebuilds its filter indexes, native
+still clones the immutable snapshot and rebuilds its filter indexes, TorrentNG
 `total` and arbitrary filters scan the snapshot, and the engine stats cache
 still aggregates runtime state on expiry. Runtime task-stat collection is now
 bounded by a 250 ms aggregate deadline in addition to per-query timeouts, so a
@@ -951,15 +952,15 @@ Deluge and Transmission compatibility list calls remain a bounded full-list
 fallback because their upstream RPC contracts expose no range or snapshot
 cursor. rTorrent `d.multicall` has the same limitation. These legacy calls now
 reject responses over 10,000 torrents with an explicit migration hint; they do
-not pretend that client-side slicing is server-side pagination. Native and
+not pretend that client-side slicing is server-side pagination. TorrentNG and
 qBittorrent endpoints remain the paged/snapshot-capable path.
 
 The current implementation and local process-load gate is complete: the snapshot/index contract,
 bounded SSE framing, cursor expiry, journal resync, and deliberately omitted
 large-qBittorrent live fields are documented and covered by source-level
-tests. Native sidebar media facets now use the same incremental snapshot index
-instead of rescanning the snapshot; sidecar hot read paths use a bounded
-blocking-DB gate, and sidecar log/stats probes keep filesystem reads behind
+tests. TorrentNG sidebar media facets now use the same incremental snapshot index
+instead of rescanning the snapshot; compatible-client service hot read paths use a
+bounded blocking-DB gate, and its log/stats probes keep filesystem reads behind
 blocking boundaries. The remaining action is representative production-corpus
 and allocator evidence, not another unbounded scan rewrite.
 
@@ -1042,7 +1043,7 @@ or "reject unsupported pure-v2 operations explicitly." This took the
 second path. `Engine`'s taskless-v2 peer-transfer and tracker-lifecycle
 branches now return `Err("pure v2 peer transfer is not implemented")` /
 `Err("pure v2 tracker lifecycle is not implemented")` instead of a silent
-`Ok(())`, and `native_engine_capabilities` was corrected to advertise
+`Ok(())`, and `torrentng_client_capabilities` was corrected to advertise
 `pure_v2_metadata_completion: false` and `pure_v2_transfer: false`. Storage
 plan controls and storage scheduling are separate implemented capabilities;
 they are not implied by pure-v2 support. Three tests
@@ -1053,7 +1054,7 @@ transfer/tracker implementation itself remains not done; that is now
 honestly reflected rather than claimed.
 
 Evidence: engine task startup accepts `TorrentMetaV1`; pure-v2 metadata is a
-taskless/recheck placeholder while the native capability manifest claims pure
+taskless/recheck placeholder while the TorrentNG-client capability manifest claims pure
 v2 metadata completion.
 
 Current action: preserve the explicit unsupported boundary in the capability
@@ -1219,7 +1220,7 @@ and advisory dropped-peer handling.
 
 ## P1/P2 — API, configuration, and product truth
 
-### TNG-021 — Native list API does not match its documentation
+### TNG-021 — TorrentNG list API does not match its documentation
 
 **Status: Resolved** · **Priority: P1** · **Confidence: high**
 
@@ -1246,13 +1247,13 @@ change as a versioned API change.
 **Status: Functional implementation complete; compatibility evidence deferred** · **Priority: P1** · **Confidence: high**
 
 Original evidence: compatibility routes accept semantics that are not
-applied to the native engine; several operator-facing stores remain
+applied to the TorrentNG client; several operator-facing stores remain
 process-memory state.
 
 Verified evidence (this session): a targeted audit (not the full
 method-by-method matrix the acceptance criteria calls for) found and fixed
 the two highest-confidence, easiest-to-fix inert mutations -- both had an
-already-working native-engine method one facade over, just never wired to
+already-working TorrentNG-client method one facade over, just never wired to
 this one.
 
 - rTorrent XML-RPC `d.tracker_announce` (`crates/rt-api-rtorrent/src/lib.rs`)
@@ -1297,9 +1298,9 @@ Full workspace `cargo test --workspace --all-targets --locked`,
 (`rt-api-rtorrent` 19 tests, up from 17).
 
 The earlier gap list is historical. The current source persists qBittorrent
-categories and global tags in the native database, restores them across engine
+categories and global tags in the TorrentNG-client database, restores them across client
 restart, persists peer bans, restores bans before listeners start, and evicts
-banned peers from active tasks on the tracker reconciliation path. Native
+banned peers from active tasks on the tracker reconciliation path. TorrentNG-client
 mode flags with no runtime equivalent (`force_start`, `auto_tmm`, and
 `auto_management`) now return explicit unsupported results instead of storing
 a value and claiming it changed behavior. Deluge plugin/configuration,
@@ -1311,17 +1312,17 @@ This pass also removed the remaining Deluge auxiliary false-success path:
 `blocklist.set_config`, `autoadd.*` writes, `scheduler.set_config`,
 `extractor.set_config`, `execute.*` writes, and `core.*plugin` writes no
 longer update process-memory state. Their read methods return documented
-compatibility defaults, and only native Label/Notifications appear enabled.
+compatibility defaults, and only TorrentNG-client Label/Notifications appear enabled.
 
 The remaining action is a real-client compatibility matrix covering the
 documented projection-only surfaces and unsupported responses. Move-on-
-completion and blocklist/plugin behavior are not claimed as native features.
+completion and blocklist/plugin behavior are not claimed as TorrentNG-client features.
 
 ### TNG-023 — Capability and health manifests overclaim implementation
 
 **Status: Functional implementation complete; certification evidence deferred** · **Priority: P1** · **Confidence: high**
 
-Verified evidence: the native capability manifest now separates
+Verified evidence: the TorrentNG-client capability manifest now separates
 `implemented`, `enabled`, `certified`, and `experimental` assurance states.
 Runtime/config-dependent uTP fields are derived from active policy, while
 pure-v2 transfer, IPv6 live-DHT routing, and scale certification remain
@@ -1340,7 +1341,7 @@ Verified evidence: `Config::validate()` (called from the real config-load
 path, `rt-config/src/lib.rs`) now unconditionally rejects placeholder tokens
 and requires non-empty tokens of at least 16 characters for public binds.
 Existing invalid config files no longer silently fall back to defaults;
-defaults apply only when no config file exists. Native deployment templates
+defaults apply only when no config file exists. TorrentNG-client deployment templates
 use the declared peer port, Docker builds use `--locked`, and rendered Compose
 configuration validates locally.
 
@@ -1350,17 +1351,18 @@ the operator before apply.
 
 ## P1/P2 — release evidence and engineering system
 
-### TNG-025 — Native CI does not enforce native quality
+### TNG-025 — CI does not enforce both runtime quality gates
 
 **Status: Repository gate resolved; branch-protection review outstanding** · **Priority: P1** · **Confidence: high**
 
 Verified evidence: `.github/workflows/ci.yml` gained a `native-quality` job
+(the job id is retained; it is displayed as TorrentNG client quality)
 (fmt check, OpenAPI validation, `cargo test --workspace --all-targets
 --locked`, `clippy -D warnings`) plus formatting, tests, and clippy for the
-sidecar (was build-only before). `.github/workflows/release.yml` got the same
-combined native/sidecar gate plus an authenticated release-binary smoke using
+compatible-client service (was build-only before). `.github/workflows/release.yml` got the same
+combined TorrentNG-client/compatible-client service gate plus an authenticated release-binary smoke using
 the tracked `certification/fixtures/backend-burndown-native-release-smoke.toml`
-fixture. Both `native-binaries` and `linux-release-assets` require the quality,
+fixture. Both first-party binary and Linux asset jobs require the quality,
 MSRV, and release-smoke jobs -- release cannot produce artifacts unless they
 pass.
 Everything this gate runs was independently re-verified locally this
@@ -1375,18 +1377,18 @@ already predicted would bite someone, and then did (see the `.clippy.toml`
 staleness this session found and fixed under TNG-028's log entry). Added
 two new CI jobs, `msrv-check` and `msrv-check-sidecar`
 (`.github/workflows/ci.yml`), each pinning `dtolnay/rust-toolchain` to the
-exact declared floor (`1.88.0` main, `1.97.0` sidecar) via `@1.88.0`/
+exact declared floor (`1.88.0` main, `1.97.0` compatible-client service) via `@1.88.0`/
 `@1.97.0` version tags, and running a real build + full test suite at
 that exact version -- alongside, not replacing, the existing `@stable`
-`native-quality`/`sidecar` jobs (which still track current/future stable,
+TorrentNG-client/compatible-client-service jobs (which still track current/future stable,
 a distinct and still-valuable check). Verified both jobs' exact commands
 locally against the already-installed `1.88` and `1.97.0` rustup
 toolchains before committing: `cargo +1.88 build/test --workspace
 --all-targets --locked` green, `cargo +1.97.0 build/test --locked
---manifest-path sidecar/Cargo.toml` green (75 sidecar tests passed).
+--manifest-path sidecar/Cargo.toml` green (75 compatible-client service tests passed).
 
 Hosted evidence is now present: CI run `33915548520` passed all ten jobs on
-`f1c39fd`, including native quality, both MSRV jobs, fuzz smoke, sidecar,
+`f1c39fd`, including TorrentNG-client quality, both MSRV jobs, fuzz smoke, compatible-client service,
 WebUI, dependency security, backup/restore, API/SSE load, and fault
 containment. The dynamic `Push on main` orchestration also passed as run
 `33915547352`. The remaining repository action is settings review: GitHub
@@ -1399,7 +1401,7 @@ branch protection is not evidenced as requiring these jobs.
 Verified evidence (2026-09-04 UTC):
 `target/release/torrentngd` was rebuilt from the clean `main` tree at commit
 `83b70ce` with `cargo build --release --locked -p torrentngd`, launched with
-an isolated authenticated config, exercised through health, native
+an isolated authenticated config, exercised through health, TorrentNG
 list/transfer, qBittorrent list/transfer, and Prometheus metrics, and
 terminated with SIGTERM.
 The process exited cleanly. The exact current artifact and deployment report
@@ -1468,7 +1470,7 @@ The repository-side implementation and hosted gate are now complete: the two
 parser fuzz targets run locally, the bounded fuzz-smoke job and crash-artifact
 upload are checked in and green in run `33915548520`,
 `docs/API.openapi.json` validates through `scripts/validate_openapi.py`, and
-shared idempotency claim/replay/conflict tests cover the native, qBittorrent,
+shared idempotency claim/replay/conflict tests cover the TorrentNG client, qBittorrent,
 Transmission, and Deluge mutation routers. A broader parser and mutation
 replay corpus remains optional evidence work.
 
@@ -1480,11 +1482,11 @@ Verified locally (see "Current verified evidence" above for full detail):
 `cargo fmt --all -- --check`, `cargo test --workspace --all-targets
 --locked`, and `cargo clippy --workspace --all-targets --locked -- -D
 warnings` all pass now, including on the actual declared MSRV toolchains
-(1.88 main workspace, 1.97 sidecar -- both `rust-version` fields were
+(1.88 main workspace, 1.97 compatible-client service -- both `rust-version` fields were
 corrected from an untrue "1.80" to the real, verified floor). Two clippy
 findings were fixed (too-many-arguments on an egress-policy-widened
-function, a redundant `u32 -> u32` cast). The native-quality, MSRV, and
-sidecar checks are defined in CI and pass in hosted run `34521941751`.
+function, a redundant `u32 -> u32` cast). The TorrentNG-client quality, MSRV, and
+compatible-client service checks are defined in CI and pass in hosted run `34521941751`.
 Repository branch-protection enforcement remains a settings review, not a
 source-code gap.
 
@@ -1495,7 +1497,7 @@ source-code gap.
 **Status: Persistence-isolation implementation and local fault evidence complete; broader decomposition deferred** · **Priority: P2** · **Confidence: high**
 
 Verified evidence (2026-09-04): explicit seams now exist for storage-job
-dispatch/control/recovery, registry revisions and mutation deltas, native and
+dispatch/control/recovery, registry revisions and mutation deltas, TorrentNG and
 qBit snapshot projection, peer admission, outbound egress policy, process-wide
 network budgets, storage-root authority, command replies, and capability
 projection. Those seams have focused tests that do not require a live network
@@ -1514,7 +1516,7 @@ and a real `Engine::start` test verifies that the supervisor remains healthy
 and reports its bounded capacity through the command path before shutdown.
 The engine actor has an explicit liveness guard and reaps failed torrent
 tasks, while storage shutdown requeues durable work and delete recovery
-finalizes metadata after payload cleanup. Native SSE initial snapshots are
+finalizes metadata after payload cleanup. TorrentNG SSE initial snapshots are
 bounded and registry mutations wake streams through a shared notifier.
 
 The current functional isolation pass also adds per-torrent durable-job
@@ -1552,7 +1554,7 @@ peers after the session has changed. The stopped-announce path is still
 intentionally actor-awaited, but its network work is bounded and parallel
 under an aggregate deadline; that is the remaining shutdown/pause coupling.
 
-The native engine's high-volume session-event writes use a bounded,
+The TorrentNG client's high-volume session-event writes use a bounded,
 single-consumer writer that executes SQLite and retention pruning on a blocking
 worker; session-log reads and the main operator read projections likewise run
 outside the actor. All production authoritative torrent/job/state persistence
@@ -1641,6 +1643,6 @@ claims:
 
 ## Release gate
 
-The native release gate must fail while any P0 item is Open or while TNG-025,
+The TorrentNG-client release gate must fail while any P0 item is Open or while TNG-025,
 TNG-026, or TNG-028 is Open. A production-scale claim additionally requires
 TNG-010, TNG-013, and TNG-014 to be Resolved with release-artifact evidence.

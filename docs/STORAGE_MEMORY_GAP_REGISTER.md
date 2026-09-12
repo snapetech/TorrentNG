@@ -29,14 +29,14 @@ Implemented and covered by automated tests:
 - Resource-governor classes for storage frames, piece assembly, peer buffers,
   webseed bodies, metadata, tracker peers, DHT table, API snapshots, and queued
   disk work.
-- Native metrics for hot-torrent memory attribution and queued disk bytes.
+- TorrentNG-client metrics for hot-torrent memory attribution and queued disk bytes.
 - Dirty-path tracking survives open-file cache eviction: checkpoint sync
   reopens and syncs dirty files that are no longer cached.
 - Per-device storage latency has bounded Prometheus histograms for
   read/write/sync/hash work, labeled by resolved device and profile.
 - Queued disk/hash/elevator work reserves actual queued payload bytes before
   enqueue and releases them on rejection, cancellation, or completion.
-- File-pool metadata memory is attributed through scheduler, engine, and native
+- File-pool metadata memory is attributed through scheduler, engine, and TorrentNG-client
   Prometheus stats.
 - Schedulers that resolve to the same storage device share a process-level
   device queue semaphore for all positioned disk submissions.
@@ -56,11 +56,11 @@ Implemented and covered by automated tests:
   checkpointed storage-plan executor and persist storage-plan job
   queue/running/checkpoint/completed state in SQLite before committing the new
   `save_path`.
-- Native `/api/v1/storage/plan` and `/api/v1/storage/execute` expose
+- TorrentNG `/api/v1/storage/plan` and `/api/v1/storage/execute` expose
   move/import/delete plan preview and execution through the same durable
   storage-plan job path.
 - The WebUI Library storage panel has a guided move/import/delete planner that
-  previews root-confined steps and executes accepted plans through the native
+  previews root-confined steps and executes accepted plans through the TorrentNG
   durable storage-plan API, including affected torrent metadata, operation
   templates, required move/import byte verification, byte summaries, and
   active storage-plan job progress.
@@ -86,7 +86,7 @@ Implemented and covered by automated tests:
   without copying and copies only when the backing storage is a registered slot.
 - Live upload blocks hold `PeerBuffer` leases through message send, and
   scheduler-owned peer-read cache entries hold `PeerBuffer` leases while cached.
-- Native `[storage]` TOML covers scheduler `StorageIoConfig` knobs for file
+- TorrentNG-client `[storage]` TOML covers scheduler `StorageIoConfig` knobs for file
   pool size, idle TTL, I/O/hash workers, queue depths, preallocation,
   durability, peer-read readahead/cache, and elevator budget.
 - `scripts/storage_uring_graduation.sh` records real-device `pread` vs

@@ -55,12 +55,13 @@ export interface LiveTorrentStatsResponse {
   torrents: LiveTorrentStat[]
 }
 
-interface NativeTorrentSummary {
+interface TorrentNgTorrentSummary {
   info_hash: string
   name: string
   state: string
   total_length: number
   downloaded: number
+  amount_left?: number
   uploaded: number
   ratio: number
   save_path: string
@@ -73,10 +74,10 @@ interface NativeTorrentSummary {
   tracker_message?: string | null
 }
 
-interface NativeTorrentListResponse {
+interface TorrentNgTorrentListResponse {
   snapshot?: number
   total: number
-  torrents: NativeTorrentSummary[]
+  torrents: TorrentNgTorrentSummary[]
 }
 
 export interface ListParams {
@@ -111,21 +112,30 @@ function torrentStateCode(state: string): number {
     case 'checking': return 2
     case 'downloading':
     case 'seeding': return 1
-    // qBittorrent's compact state field has no queued/metadata/error values
-    // that map cleanly to the native lifecycle. Keep those adapter-only
-    // values distinct from stopped so the UI does not mislabel them.
-    case 'queued': return 3
+    // qBittorrent's compact state field has no queued/metadata values that
+    // map cleanly to the TorrentNG client lifecycle. Keep those adapter-only values
+    // distinct from the documented error code (3) and stopped (0).
+    case 'queued': return 5
     case 'metadata_pending': return 4
-    case 'error': return 5
+    case 'error': return 3
     default: return 0
   }
 }
 
-function normalizeNativeTorrent(t: NativeTorrentSummary): TorrentSummary {
+function normalizeTorrentNgTorrent(t: TorrentNgTorrentSummary): TorrentSummary {
   const size = Number(t.total_length ?? 0)
-  const done = Number(t.downloaded ?? 0)
-  const complete = t.state === 'seeding' || (size > 0 && done >= size)
-  const active = t.state === 'seeding' || t.state === 'downloading'
+  const downloaded = Number(t.downloaded ?? 0)
+  const rawAmountLeft = Number(t.amount_left)
+  const hasLiveAmountLeft = Number.isFinite(rawAmountLeft) && rawAmountLeft >= 0
+  // Older TorrentNG API servers did not expose amount_left. Keep their payload
+  // readable while using the live picker invariant whenever it is present.
+  const amountLeft = hasLiveAmountLeft
+    ? Math.min(size, rawAmountLeft)
+    : Math.min(size, Math.max(0, downloaded))
+  const done = size > 0 ? size - amountLeft : 0
+  const complete = t.state === 'seeding' || (size > 0 && amountLeft === 0)
+  const active = t.state === 'checking' || t.state === 'seeding' || t.state === 'downloading'
+  const open = t.state === 'metadata_pending' || active
   return {
     hash: t.info_hash,
     name: t.name,
@@ -134,10 +144,10 @@ function normalizeNativeTorrent(t: NativeTorrentSummary): TorrentSummary {
     down_rate: 0,
     up_rate: 0,
     up_total: Number(t.uploaded ?? 0),
-    down_total: done,
+    down_total: downloaded,
     ratio: Math.round(Number(t.ratio ?? 0) * 1000),
     is_active: active,
-    is_open: t.state !== 'paused' && t.state !== 'stopped',
+    is_open: open,
     complete,
     state: torrentStateCode(t.state),
     priority: 0,
@@ -156,22 +166,22 @@ function normalizeNativeTorrent(t: NativeTorrentSummary): TorrentSummary {
   }
 }
 
-function isNativeTorrentSummary(item: TorrentSummary | NativeTorrentSummary): item is NativeTorrentSummary {
+function isTorrentNgTorrentSummary(item: TorrentSummary | TorrentNgTorrentSummary): item is TorrentNgTorrentSummary {
   return 'info_hash' in item
 }
 
 function normalizeTorrentList(
-  body: TorrentListResponse | NativeTorrentListResponse | TorrentSummary[] | NativeTorrentSummary[],
+  body: TorrentListResponse | TorrentNgTorrentListResponse | TorrentSummary[] | TorrentNgTorrentSummary[],
   params: ListParams = {},
 ): TorrentListResponse {
   if (!Array.isArray(body)) {
     const torrents = body.torrents.map(item =>
-      isNativeTorrentSummary(item) ? normalizeNativeTorrent(item) : item,
+      isTorrentNgTorrentSummary(item) ? normalizeTorrentNgTorrent(item) : item,
     )
     return { ...body, torrents }
   }
   const torrents = body.map(item =>
-    isNativeTorrentSummary(item) ? normalizeNativeTorrent(item) : item,
+    isTorrentNgTorrentSummary(item) ? normalizeTorrentNgTorrent(item) : item,
   )
   const offset = Math.max(0, Number(params.offset ?? 0))
   const limit = params.limit === undefined ? torrents.length : Math.max(0, Number(params.limit))
@@ -486,10 +496,10 @@ export interface EngineDiagnostics {
   backend: BackendInfo
   provenance: {
     daemon_version?: string
-    sidecar_version: string
+    sidecar_version: string | null
     rtorrent_version: string | null
     libtorrent_version: string | null
-    xmlrpc_backend: string
+    xmlrpc_backend: string | null
     packaged_rtorrent_version: string | null
     packaged_libtorrent_version: string | null
     patch_set: string[]
@@ -696,7 +706,7 @@ interface FilesResponse {
   files: TorrentFile[]
 }
 
-interface NativeTorrentFile {
+interface TorrentNgTorrentFile {
   file_index?: number
   index?: number
   path: string
@@ -705,9 +715,9 @@ interface NativeTorrentFile {
   priority: number
 }
 
-async function nativeTorrentFiles(hash: string): Promise<TorrentFile[]> {
-  const body = await get<FilesResponse | NativeTorrentFile[]>(`/torrents/${hash}/files`)
-  const files = (Array.isArray(body) ? body : body.files) as Array<TorrentFile | NativeTorrentFile>
+async function torrentNgTorrentFiles(hash: string): Promise<TorrentFile[]> {
+  const body = await get<FilesResponse | TorrentNgTorrentFile[]>(`/torrents/${hash}/files`)
+  const files = (Array.isArray(body) ? body : body.files) as Array<TorrentFile | TorrentNgTorrentFile>
   return files.map(file => {
     const size = file.size_bytes ?? ('length' in file ? file.length ?? 0 : 0)
     return {
@@ -727,13 +737,13 @@ export const api = {
     login,
     logout,
     check: async (): Promise<TorrentListResponse> =>
-      normalizeTorrentList(await get<TorrentListResponse | NativeTorrentListResponse | TorrentSummary[] | NativeTorrentSummary[]>('/torrents', { limit: 1 }), { limit: 1 }),
+      normalizeTorrentList(await get<TorrentListResponse | TorrentNgTorrentListResponse | TorrentSummary[] | TorrentNgTorrentSummary[]>('/torrents', { limit: 1 }), { limit: 1 }),
   },
 
   torrents: {
     list: async (p: ListParams = {}): Promise<TorrentListResponse> =>
       normalizeTorrentList(
-        await get<TorrentListResponse | NativeTorrentListResponse | TorrentSummary[] | NativeTorrentSummary[]>('/torrents', p as Record<string, string | number>),
+        await get<TorrentListResponse | TorrentNgTorrentListResponse | TorrentSummary[] | TorrentNgTorrentSummary[]>('/torrents', p as Record<string, string | number>),
         p,
       ),
 
@@ -774,7 +784,7 @@ export const api = {
     patchTrackers: (hash: string, body: TrackerPatch) =>
       patch(`/torrents/${hash}/trackers`, body),
 
-    files: nativeTorrentFiles,
+    files: torrentNgTorrentFiles,
 
     setCategory: (hash: string, category: string) =>
       put(`/torrents/${hash}/category`, { category }),

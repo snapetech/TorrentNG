@@ -92,7 +92,7 @@ else
 fi
 
 {
-  echo "# TorrentNG Native Release-Binary Smoke"
+  echo "# TorrentNG Client Release-Binary Smoke"
   echo
   echo "- Date UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "- Host: $(hostname)"
@@ -104,7 +104,7 @@ fi
   echo "- Worktree: $worktree"
   echo
   echo "This run exercised the optimized production daemon binary with the"
-  echo "authenticated native and qBittorrent facades, then sent SIGTERM and"
+  echo "authenticated TorrentNG and qBittorrent facades, then sent SIGTERM and"
   echo "waited for process exit. It is a deployment smoke test, not 100k-scale"
   echo "capacity evidence."
   echo
@@ -113,8 +113,8 @@ fi
   echo "| Check | Result | Evidence |"
   echo "|---|---|---|"
   echo "| Startup and health | PASS | $(basename "$HEALTH") |"
-  echo "| Native list envelope | PASS | $(basename "$TORRENTS") |"
-  echo "| Native transfer info | PASS | $(basename "$TRANSFER") |"
+  echo "| TorrentNG list envelope | PASS | $(basename "$TORRENTS") |"
+  echo "| TorrentNG transfer info | PASS | $(basename "$TRANSFER") |"
   echo "| qBittorrent list | PASS | $(basename "$QBIT") |"
   echo "| qBittorrent transfer info | PASS | $(basename "$QBIT_TRANSFER") |"
   echo "| Prometheus metrics | PASS | $(basename "$METRICS"); $metrics_lines lines / $metrics_bytes bytes |"

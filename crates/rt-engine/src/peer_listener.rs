@@ -15,7 +15,8 @@ use rt_peer_wire::handshake::{Handshake, HANDSHAKE_LEN};
 use rt_utp::{UtpEndpoint, UtpStream};
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, watch, OwnedSemaphorePermit};
+use tokio::sync::{mpsc, watch, Notify, OwnedSemaphorePermit};
+use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
 use tracing::warn;
 
@@ -24,6 +25,20 @@ use crate::engine::ENGINE_COMMAND_SEND_TIMEOUT;
 use crate::network_budget::GlobalNetworkBudget;
 use crate::peer_ingress::{PeerIngressBudget, PeerIngressPermit};
 use crate::torrent_task::TorrentCmd;
+
+pub(crate) struct ListenerCompletion {
+    pub(crate) done: AtomicBool,
+    pub(crate) notify: Notify,
+}
+
+impl ListenerCompletion {
+    pub(crate) fn new() -> Self {
+        Self {
+            done: AtomicBool::new(false),
+            notify: Notify::new(),
+        }
+    }
+}
 
 /// Run the socket acceptors independently of the engine command actor.
 pub(crate) async fn run(
@@ -34,10 +49,16 @@ pub(crate) async fn run(
     engine_tx: mpsc::Sender<EngineCmd>,
     stop: watch::Receiver<bool>,
     healthy: Arc<AtomicBool>,
+    done: Arc<ListenerCompletion>,
 ) {
-    let _health_guard = ListenerHealthGuard(Arc::clone(&healthy));
+    let _health_guard = ListenerHealthGuard {
+        healthy: Arc::clone(&healthy),
+        done,
+    };
     let mut stop = stop;
+    let mut handshakes = JoinSet::new();
     loop {
+        let has_handshakes = !handshakes.is_empty();
         tokio::select! {
             stop_result = stop.changed() => {
                 if stop_result.is_err() || *stop.borrow() {
@@ -64,7 +85,7 @@ pub(crate) async fn run(
                                 };
                                 let engine_tx = engine_tx.clone();
                                 let handshake_timeout = peer_ingress.config().handshake_timeout;
-                                tokio::spawn(async move {
+                                handshakes.spawn(async move {
                                     if let Err(error) = handle_incoming(
                                         stream,
                                         peer_addr,
@@ -132,7 +153,7 @@ pub(crate) async fn run(
                                 };
                                 let engine_tx = engine_tx.clone();
                                 let handshake_timeout = peer_ingress.config().handshake_timeout;
-                                tokio::spawn(async move {
+                                handshakes.spawn(async move {
                                     if let Err(error) = handle_incoming_utp(
                                         stream,
                                         peer_addr,
@@ -180,7 +201,40 @@ pub(crate) async fn run(
                     }
                 }
             }
+            Some(result) = handshakes.join_next(), if has_handshakes => {
+                if let Err(error) = result {
+                    warn!(
+                        component = "peer_listener",
+                        operation = "handshake_task",
+                        result = "error",
+                        error = %error,
+                        "incoming peer handshake task exited unexpectedly"
+                    );
+                }
+            }
         }
+    }
+
+    // A stop signal must release every ingress and global-peer permit held by
+    // a slow handshake immediately. Detached handshake tasks used to survive
+    // the listener and could hold those limits until their read timeout.
+    handshakes.abort_all();
+    while let Some(result) = handshakes.join_next().await {
+        if let Err(error) = result {
+            debug_handshake_join_error(error);
+        }
+    }
+}
+
+fn debug_handshake_join_error(error: tokio::task::JoinError) {
+    if !error.is_cancelled() {
+        warn!(
+            component = "peer_listener",
+            operation = "handshake_shutdown",
+            result = "error",
+            error = %error,
+            "incoming peer handshake task failed during listener shutdown"
+        );
     }
 }
 
@@ -191,11 +245,16 @@ async fn backoff_or_stop(stop: &mut watch::Receiver<bool>) -> bool {
     }
 }
 
-struct ListenerHealthGuard(Arc<AtomicBool>);
+struct ListenerHealthGuard {
+    healthy: Arc<AtomicBool>,
+    done: Arc<ListenerCompletion>,
+}
 
 impl Drop for ListenerHealthGuard {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        self.healthy.store(false, Ordering::Release);
+        self.done.done.store(true, Ordering::Release);
+        self.done.notify.notify_one();
     }
 }
 

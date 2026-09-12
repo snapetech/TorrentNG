@@ -9,7 +9,7 @@ use std::{
 use tokio::sync::Semaphore;
 
 /// qBittorrent's `sync/maindata.rid` is a logical change cursor, not a wall
-/// clock.  Keep it in the cache database so it survives sidecar restarts and
+    /// clock.  Keep it in the cache database so it survives service restarts and
 /// cannot miss two updates made in the same second.
 pub(crate) const CACHE_REVISION_KEY: &str = "cache_revision";
 pub(crate) const CACHE_REVISION_FLOOR_KEY: &str = "cache_revision_floor";
@@ -313,7 +313,7 @@ impl Db {
         let revision = allocate_revision(&tx)?;
         tx.execute("DELETE FROM torrents WHERE hash=?1", params![canonical])?;
         // Clean up any tombstone written with a different case by an older
-        // sidecar before inserting the canonical key.
+        // compatible-client service before inserting the canonical key.
         tx.execute(
             "DELETE FROM removed_torrents WHERE hash=?1 COLLATE NOCASE",
             params![canonical],
@@ -486,16 +486,16 @@ impl Db {
         Ok(self.conn().query_row(
             "SELECT
                 COALESCE(SUM(CASE
-                    WHEN message <> '' AND state = 3 THEN 1 ELSE 0 END), 0),
+                    WHEN state = 3 THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE
-                    WHEN NOT (message <> '' AND state = 3) AND is_active = 0
+                    WHEN state != 3 AND is_active = 0
                     THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE
-                    WHEN NOT (message <> '' AND state = 3) AND is_active != 0
+                    WHEN state != 3 AND is_active != 0
                          AND complete != 0
                     THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE
-                    WHEN NOT (message <> '' AND state = 3) AND is_active != 0
+                    WHEN state != 3 AND is_active != 0
                          AND complete = 0
                     THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(peers_connected), 0)
@@ -699,7 +699,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     ",
     )?;
 
-    // The sidecar cache predates the durable revision column. Keep migration
+    // The compatible-client service cache predates the durable revision column. Keep migration
     // idempotent for existing installations instead of assuming a fresh DB.
     let has_revision = conn
         .prepare("PRAGMA table_info(torrents)")?
@@ -718,7 +718,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         [],
     )?;
 
-    // A pre-fix sidecar could persist the same logical hash with different
+    // A pre-fix compatible-client service could persist the same logical hash with different
     // casing because the legacy primary key used binary collation. Collapse
     // those rows before new case-insensitive upserts start resolving them;
     // otherwise one spelling would remain invisible to reads and tombstone
@@ -1157,6 +1157,25 @@ mod tests {
             .unwrap();
         assert_eq!(total, 50, "every row must have been updated, not just some");
         assert_eq!(stopped.len(), 50);
+    }
+
+    #[test]
+    fn runtime_state_change_invalidates_previous_rate_sample() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+        let mut torrent = torrent_row("rate-reset", 1, true, true);
+        torrent.down_rate = 12_345;
+        torrent.up_rate = 678;
+        torrent.updated_at = 1;
+        db.upsert(&torrent).unwrap();
+
+        db.set_torrent_runtime_state("rate-reset", 0, false, false)
+            .unwrap();
+
+        let row = db.get("rate-reset").unwrap().unwrap();
+        assert_eq!(row.down_rate, 0);
+        assert_eq!(row.up_rate, 0);
+        assert!(!row.is_active);
     }
 
     #[test]

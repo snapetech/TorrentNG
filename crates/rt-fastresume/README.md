@@ -2,4 +2,4 @@
 
 fastresume state import from rTorrent and qBittorrent.
 
-## Status: Implemented — native engine support
+## Status: Implemented — TorrentNG client support

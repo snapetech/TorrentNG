@@ -170,7 +170,7 @@ async fn execute(state: &AppState, method: &str, params: &[RtValue]) -> Result<R
                 .collect(),
         )),
         "system.client_version" => Ok(RtValue::String("TorrentNG".to_owned())),
-        "system.library_version" => Ok(RtValue::String("native".to_owned())),
+        "system.library_version" => Ok(RtValue::String("TorrentNG client".to_owned())),
         "system.time" => Ok(RtValue::Int(unix_now())),
         "session.name" => Ok(RtValue::String("TorrentNG".to_owned())),
         "session.path" => Ok(RtValue::String(state.session_path.clone())),
@@ -338,7 +338,7 @@ async fn d_multicall(state: &AppState, params: &[RtValue]) -> Result<RtValue, St
     };
     if snapshot.len() > MAX_LEGACY_FULL_LIST_ENTRIES {
         return Err(format!(
-            "rTorrent d.multicall full-list response has {} torrents; maximum is {MAX_LEGACY_FULL_LIST_ENTRIES}; use the native paged API",
+            "rTorrent d.multicall full-list response has {} torrents; maximum is {MAX_LEGACY_FULL_LIST_ENTRIES}; use the paged TorrentNG API",
             snapshot.len()
         ));
     }

@@ -8,7 +8,7 @@ services:
     security_opt:
       - seccomp:unconfined
     ports:
-      - "8080:8080"       # sidecar API + WebUI (put nginx in front for production)
+      - "8080:8080"       # compatible-client WebUI/API (put nginx in front for production)
       - "50000:50000"     # rTorrent incoming port (adjust to match rtorrent.rc)
       - "50000:50000/udp"
     volumes:
@@ -22,7 +22,7 @@ services:
       TNG_SECRET_KEY: "${TNG_SECRET_KEY:?TNG_SECRET_KEY must be set to a random secret}"
       TNG_API_TOKENS: "${TNG_API_TOKENS:?TNG_API_TOKENS must be set to one or more tokens}"
       TNG_USER_AGENT: "${TNG_USER_AGENT:-rtorrent/0.16.11/0.16.11}"
-      # TNG_PEER_ID is deliberately not defaulted here: the sidecar generates
+      # TNG_PEER_ID is deliberately not defaulted here: the compatible-client service generates
       # and persists a unique per-install id under data_dir on first start
       # (see docs/TRACKER-IDENTITY.md). Set TNG_PEER_ID only to pin a value.
       TNG_QBITTORRENT_VERSION: "${TNG_QBITTORRENT_VERSION:-5.0.0}"

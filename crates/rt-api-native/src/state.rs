@@ -85,7 +85,7 @@ pub struct AppState {
     pub user_agent: Arc<RwLock<String>>,
     pub(crate) api_metrics: Arc<ApiRuntimeMetrics>,
     pub(crate) idempotency: Arc<IdempotencyStore>,
-    /// Serializes read-modify-write operations for the small native control
+    /// Serializes read-modify-write operations for the small TorrentNG control
     /// plane. The database command itself is serialized by the engine actor,
     /// but without this lock two HTTP writers could still lose each other's
     /// JSON map update between the read and the write.
@@ -960,15 +960,16 @@ pub(crate) fn torrent_summary(entry: &rt_session::TorrentEntry) -> TorrentSummar
         info_hash: entry.info_hash.clone(),
         name: entry.name.clone(),
         state: entry.state.as_str().to_owned(),
-        total_length: native_i64(entry.total_length),
-        downloaded: native_i64(entry.stats.downloaded),
-        uploaded: native_i64(entry.stats.uploaded),
+        total_length: torrentng_i64(entry.total_length),
+        downloaded: torrentng_i64(entry.stats.downloaded),
+        amount_left: torrentng_i64(entry.amount_left),
+        uploaded: torrentng_i64(entry.stats.uploaded),
         ratio: entry.stats.ratio(),
         save_path: entry.save_path.clone(),
         category: entry.category.clone(),
         tags: entry.tags.clone(),
-        added_at: native_i64(entry.added_at),
-        completed_at: entry.completed_at.map(native_i64),
+        added_at: torrentng_i64(entry.added_at),
+        completed_at: entry.completed_at.map(torrentng_i64),
         num_peers: 0,
         num_seeds: 0,
         tracker_message: entry.tracker_message.clone(),
@@ -978,11 +979,11 @@ pub(crate) fn torrent_summary(entry: &rt_session::TorrentEntry) -> TorrentSummar
 /// API models use signed counters for compatibility with the existing wire
 /// contract. Never let a persisted or engine-owned u64 wrap into a negative
 /// value when projecting it to that contract.
-pub(crate) fn native_i64(value: u64) -> i64 {
+pub(crate) fn torrentng_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
-pub(crate) fn native_usize_i64(value: usize) -> i64 {
+pub(crate) fn torrentng_usize_i64(value: usize) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
@@ -1116,9 +1117,9 @@ mod tests {
 
     #[test]
     fn signed_summary_projection_saturates_unsigned_counters() {
-        assert_eq!(native_i64(i64::MAX as u64), i64::MAX);
-        assert_eq!(native_i64(i64::MAX as u64 + 1), i64::MAX);
-        assert_eq!(native_usize_i64(usize::MAX), i64::MAX);
+        assert_eq!(torrentng_i64(i64::MAX as u64), i64::MAX);
+        assert_eq!(torrentng_i64(i64::MAX as u64 + 1), i64::MAX);
+        assert_eq!(torrentng_usize_i64(usize::MAX), i64::MAX);
     }
 
     #[test]
@@ -1200,6 +1201,7 @@ mod tests {
             state: "stopped".to_owned(),
             total_length: 0,
             downloaded: 0,
+            amount_left: 0,
             uploaded: 0,
             ratio: 0.0,
             save_path: "/data".to_owned(),

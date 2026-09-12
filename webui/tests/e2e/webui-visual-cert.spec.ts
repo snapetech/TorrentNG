@@ -121,7 +121,7 @@ async function installVisualApiMock(page: Page) {
     }
     if (path === '/api/v1/saved-views') return json([{ id: 'visual-linux', name: 'Linux seeders', params: { category: 'Linux', status: 'seeding' } }])
     if (path === '/api/v1/engine') {
-      return json({ mode: 'native', native_engine: true, torrent_count: torrents.length, storage: {}, runtime: {}, resources: { classes: [] }, diagnostics: [] })
+      return json({ mode: 'torrentng', native_engine: true, torrent_count: torrents.length, storage: {}, runtime: {}, resources: { classes: [] }, diagnostics: [] })
     }
     if (path === '/api/v1/engine/commands') return json({ commands: [] })
     if (path === '/api/v1/settings/user-agent') return json({ user_agent: 'TorrentNG/e2e-visual' })

@@ -1,13 +1,15 @@
 # Roadmap
 
-This project has two runtime tracks. Track 1 delivered immediate value on top
-of rTorrent and remains a compatibility/migration facade. Track 2 is the native
-Rust engine that replaces rTorrent for native deployments and is now the primary
-rewrite surface.
+This project has one WebUI/API product with two backend arrangements. The
+compatible-client integration delivered immediate value on top of rTorrent and
+remains available for existing-client deployments, migration, and comparison.
+The TorrentNG client (`torrentngd`) is the first-party Rust transfer client for
+deployments where TorrentNG owns storage, persistence, and protocol behavior.
+The Track 1/Track 2 labels below are historical development labels.
 
 ---
 
-# Track 1 — rTorrent Sidecar
+# Historical Track 1 — rTorrent Compatible-Client Integration
 
 Fix the rTorrent/ruTorrent pain surface without replacing the engine. Ship something useful now.
 
@@ -46,9 +48,10 @@ Ship a pinned, tested, known-good rTorrent + ruTorrent bundle.
 - [x] Integration test suite for *arr and autobrr add-torrent flows
 - [x] `docs/MIGRATION.md` — import existing `.rtorrent.rc`, ruTorrent settings
 
-## Phase 2 — Sidecar daemon MVP
+## Phase 2 — Compatible-client service MVP
 
-The Rust sidecar becomes the control plane. ruTorrent can still coexist.
+The Rust `torrentng` service becomes the WebUI/API control plane. ruTorrent can
+still coexist.
 
 **Minimum viable API:**
 - `GET    /api/v1/torrents` — list with pagination, filter, sort
@@ -98,7 +101,7 @@ Replace ruTorrent as the primary UI.
 
 ## Phase 5 — Workflow platform
 
-Sidecar-managed replacement for high-value ruTorrent plugins.
+Compatible-client-service-managed replacement for high-value ruTorrent plugins.
 
 **Priority workflows:**
 - [x] RSS rules + autobrr integration
@@ -120,14 +123,14 @@ Sidecar-managed replacement for high-value ruTorrent plugins.
 | 15k torrents — UI first paint | < 3s |
 | 50k synthetic — `/torrents/info` API | < 500ms |
 | `/sync/maindata` delta under normal churn | < 50ms |
-| Sidecar memory at 15k torrents after 24h | < 500MB |
+| Compatible-client service memory at 15k torrents after 24h | < 500MB |
 | Cold start + first torrent list ready | < 5s |
 
 ---
 
-# Track 2 — Native Rust Engine
+# Historical Track 2 — TorrentNG Rust Client
 
-A ground-up Rust BitTorrent daemon optimized for 10k–100k torrents, 200+ TB
+A ground-up Rust BitTorrent client daemon optimized for 10k–100k torrents, 200+ TB
 libraries, private-tracker seeding, and operational observability. This track is
 implemented across the workspace; local certification scripts exist, but
 production-scale/public certification remains deferred.
@@ -136,16 +139,17 @@ See `docs/ENGINE.md` for the full design.
 
 ## North Star
 
-> A Rust-native, headless-first BitTorrent daemon and compatibility layer that
+> A headless-first BitTorrent WebUI/API product with a first-party,
+> next-generation TorrentNG client and compatible-client integrations that
 > can move into, out of, and alongside the major torrent client ecosystems:
 > qBittorrent, Transmission, Deluge, rTorrent, uTorrent/BitTorrent Classic,
 > BiglyBT/Vuze, Tixati, common automation tools, and real BitTorrent swarms.
 
 The engine is a **massive-library seeding engine** and a **compatibility-first
 torrent control plane**. It should be able to import existing state, project the
-APIs tools expect, interoperate on the wire, and expose a native model that is
-more observable and easier to operate than the historical client-specific
-internals it replaces. Native downloading, DHT/uTP protocol crates, and BEP 52
+APIs tools expect, interoperate on the wire, and expose a TorrentNG-client model
+that is more observable and easier to operate than the historical client-specific
+internals it replaces. TorrentNG-client downloading, DHT/uTP protocol crates, and BEP 52
 metadata/storage/API support are part of the rewrite surface; streaming remains
 outside the first production target.
 
@@ -255,7 +259,9 @@ Exit criteria: 15k torrents cold start under target, API responsive, recheck doe
 
 ## Track 2 — Phase 9: Web UI
 
-Full UI replacing the Track 1 WebUI, backed by the native engine API. Same design principles: virtualized table, server-side filter/sort, delta sync, bulk dry-run previews, "why is this not seeding?" diagnostic path.
+Full UI shared with the compatible-client integration, backed by the TorrentNG
+client API. Same design principles: virtualized table, server-side filter/sort,
+delta sync, bulk dry-run previews, "why is this not seeding?" diagnostic path.
 
 ## Track 2 — Phase 10: DHT / PEX / LSD / uTP
 
@@ -278,16 +284,16 @@ surfaces.
 Required before 1.0:
 - [x] Migration tools from rTorrent, qBittorrent, Transmission
 - [x] qBit API compatibility report
-- [x] Native scale benchmark implementation and synthetic evidence
+- [x] TorrentNG-client scale benchmark implementation and synthetic evidence
   (100k proxy and 1k/2k hot-set policy) are checked in. A target-hardware or
   public benchmark report remains external evidence and is not represented as
   certified here.
 - [x] Threat model review
 - [x] Backup/restore docs
-- [x] Native deployment docs
+- [x] TorrentNG client deployment docs
 - [x] Prometheus metrics endpoint and metrics certification
 - [x] Disaster recovery guide
-- [x] Native packaging examples beyond source builds: systemd unit, Docker image, Compose, Kubernetes example
+- [x] TorrentNG-client packaging examples beyond source builds: systemd unit, Docker image, Compose, Kubernetes example
 - [x] Prometheus/Grafana dashboard artifact
 - [x] Arch/AUR package template
 
@@ -311,7 +317,7 @@ Required before 1.0:
 |---|---|
 | `/api/v2/torrents/info` — 15k torrents | < 250ms |
 | `/api/v2/sync/maindata` delta | < 50ms |
-| Native filter/sort — 15k | < 250ms |
+| TorrentNG-client filter/sort — 15k | < 250ms |
 | Bulk tag — 10k torrents | < 2s |
 
 ### UI
@@ -326,21 +332,21 @@ Required before 1.0:
 ## Track 2 — "best in class" acceptance criteria
 
 These criteria now map to concrete tests, docs, or certification gates instead
-of being tracked as loose roadmap wishes. The native rewrite is not blocked on
-the Track 1 sidecar for engine state; remaining 1.0 work is packaging and
+of being tracked as loose roadmap wishes. The TorrentNG client is not blocked on
+the compatible-client service for client state; remaining 1.0 work is packaging and
 operator-facing polish.
 
 | Criterion | Status | Evidence |
 |---|---|---|
 | 15k torrents loaded and manageable | Done | `rt-metrics` scale tests and `scripts/native_engine_certification_report.sh` |
 | 200+ TB library imported without forced global recheck | Done | `rt-migrate` dry-run/import planning and durable DB import tests |
-| qBit-compatible API works with Sonarr/Radarr/Prowlarr/autobrr | Done | Track 1 live certification plus native qBit projection tests |
+| qBit-compatible API works with Sonarr/Radarr/Prowlarr/autobrr | Done | Compatible-client live certification plus TorrentNG-client qBit projection tests |
 | Cold restart does not announce-storm trackers | Done | tracker restart storm scale test |
 | Rechecks are queued, resumable, cancellable, and visible | Done | durable job queue, recheck job, and engine recovery tests |
-| Bulk path/category/tracker edits have dry-run previews | Done | native bulk preview and storage planning tests |
+| Bulk path/category/tracker edits have dry-run previews | Done | TorrentNG-client bulk preview and storage planning tests |
 | Storage engine has per-mount queueing and backpressure | Done | `rt-storage` scheduler and starvation tests |
-| UI can filter/sort 15k torrents without browser death | Done | virtualized WebUI and native/API scale targets |
+| UI can filter/sort 15k torrents without browser death | Done | virtualized WebUI and TorrentNG API scale targets |
 | Crash during move/check/import is recoverable | Done | job recovery, move planning, and migration atomicity tests |
 | Private tracker mode disables DHT/PEX/LSD unless explicitly enabled | Done | tracker policy tests |
-| Metrics and event logs explain failures without log spelunking | Done | native metrics, diagnostics, and append-only event log |
-| Public benchmark report published | Done | native certification report output under `certification/reports/` |
+| Metrics and event logs explain failures without log spelunking | Done | TorrentNG metrics, diagnostics, and append-only event log |
+| Public benchmark report published | Done | TorrentNG-client certification report output under `certification/reports/` |

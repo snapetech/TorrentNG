@@ -17,6 +17,7 @@ use thiserror::Error;
 const MAX_TORRENT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_RESUME_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_BLOCKS_PER_PARTIAL_PIECE: usize = 16_384;
+const RESUME_BLOCK_LENGTH: u64 = 16 * 1024;
 
 #[derive(Debug, Error)]
 pub enum MigrationError {
@@ -226,13 +227,14 @@ impl MigrationTorrent {
         } else {
             uploaded as f64 / downloaded as f64
         };
-        let completed = self.completed.unwrap_or(false);
+        let completed = self.live_completion();
         let added_at = self.added_at.unwrap_or(options.added_at);
         let completed_at = if completed {
             Some(self.completed_at.unwrap_or(added_at))
         } else {
             None
         };
+        let amount_left = self.live_amount_left(completed);
         DbTorrentImport {
             torrent: TorrentRow {
                 info_hash: self.info_hash.clone(),
@@ -249,6 +251,7 @@ impl MigrationTorrent {
                 completed_at,
                 uploaded: i64_saturating(uploaded),
                 downloaded: i64_saturating(downloaded),
+                amount_left: i64_saturating(amount_left),
                 ratio,
                 trackers: self.trackers.clone(),
             },
@@ -291,19 +294,105 @@ impl MigrationTorrent {
                     completed: self.tracker_activity.completed.map(i64_saturating),
                     uploaded: i64_saturating(uploaded),
                     downloaded: i64_saturating(downloaded),
-                    left_bytes: if completed {
-                        0
-                    } else {
-                        i64_saturating(self.total_length)
-                    },
+                    left_bytes: i64_saturating(amount_left),
                 })
                 .collect(),
         }
     }
 
+    /// Calculate current payload progress from verified/received piece state.
+    /// Transfer counters are cumulative and can exceed the torrent size after
+    /// a recheck or repeated downloads, so they are only a fallback when no
+    /// piece state was imported.
+    fn live_amount_left(&self, completed: bool) -> u64 {
+        let Some(imported) = self
+            .fastresume
+            .as_ref()
+            .filter(|imported| imported.pieces.len() == self.piece_count as usize)
+        else {
+            return if completed {
+                0
+            } else if self.total_length > 0
+                && self.downloaded.unwrap_or_default() >= self.total_length
+            {
+                // A cumulative counter at or above the torrent size does not
+                // prove that the current payload is complete: the torrent
+                // may have been rechecked, partially redownloaded, or have
+                // counted duplicate transfer bytes. Keep the live invariant
+                // incomplete until piece state or an explicit completion
+                // flag provides evidence.
+                self.total_length
+            } else {
+                self.total_length
+                    .saturating_sub(self.downloaded.unwrap_or_default())
+            };
+        };
+
+        let mut done = imported
+            .pieces
+            .iter()
+            .enumerate()
+            .filter(|(_, state)| **state == PieceState::Valid)
+            .map(|(piece, _)| self.piece_length_at(piece))
+            .fold(0_u64, u64::saturating_add);
+
+        for partial in &imported.partial_pieces {
+            if imported.pieces.get(partial.piece as usize) == Some(&PieceState::Valid) {
+                continue;
+            }
+            let piece_length = self.piece_length_at(partial.piece as usize);
+            let received = partial
+                .received_blocks
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .map(|block| {
+                    piece_length
+                        .saturating_sub(u64::from(block).saturating_mul(RESUME_BLOCK_LENGTH))
+                        .min(RESUME_BLOCK_LENGTH)
+                })
+                .fold(0_u64, u64::saturating_add);
+            done = done.saturating_add(received.min(piece_length));
+        }
+
+        self.total_length
+            .saturating_sub(done.min(self.total_length))
+    }
+
+    fn live_completion(&self) -> bool {
+        self.fastresume
+            .as_ref()
+            .filter(|imported| imported.pieces.len() == self.piece_count as usize)
+            .map(|imported| {
+                if imported.pieces.is_empty() {
+                    // Zero-length torrents have no piece vector to validate;
+                    // retain the explicit completion flag in that case.
+                    self.completed.unwrap_or(false)
+                } else {
+                    imported
+                        .pieces
+                        .iter()
+                        .all(|state| *state == PieceState::Valid)
+                }
+            })
+            .unwrap_or_else(|| self.completed.unwrap_or(false))
+    }
+
+    fn piece_length_at(&self, piece: usize) -> u64 {
+        let offset = (piece as u64).saturating_mul(self.piece_length);
+        self.total_length
+            .saturating_sub(offset)
+            .min(self.piece_length)
+    }
+
     fn imported_state(&self, completed: bool) -> String {
         if completed {
-            "completed".to_owned()
+            if self.paused == Some(false) {
+                "seeding".to_owned()
+            } else {
+                "stopped".to_owned()
+            }
         } else if self.paused.unwrap_or(true) {
             "stopped".to_owned()
         } else {
@@ -2643,6 +2732,122 @@ mod tests {
     }
 
     #[test]
+    fn db_import_uses_piece_progress_not_cumulative_download_counter() {
+        let torrent = MigrationTorrent {
+            info_hash: "a".repeat(40),
+            name: "rechecked".to_owned(),
+            total_length: 32 * 1024,
+            piece_length: 16 * 1024,
+            piece_count: 2,
+            is_private: false,
+            files: Vec::new(),
+            torrent_path: PathBuf::from("rechecked.torrent"),
+            resume_path: None,
+            save_path: Some(PathBuf::from("/downloads")),
+            category: None,
+            tags: Vec::new(),
+            uploaded: Some(0),
+            // This is cumulative transfer accounting, not current payload.
+            downloaded: Some(128 * 1024),
+            // The completion flag is stale after a recheck found the second
+            // piece missing; the piece vector is the current state.
+            completed: Some(true),
+            added_at: None,
+            completed_at: None,
+            paused: Some(true),
+            tracker_activity: TrackerActivity::default(),
+            resume_confidence: ResumeConfidence::Trusted,
+            fastresume: Some(ImportedFastresume {
+                pieces: vec![PieceState::Valid, PieceState::Unknown],
+                partial_pieces: Vec::new(),
+                file_hints: Vec::new(),
+                clean_shutdown: true,
+            }),
+            trackers: vec!["https://tracker.example/announce".to_owned()],
+            warnings: Vec::new(),
+        };
+
+        let import = torrent.to_db_rows(&ImportOptions::default());
+        assert_eq!(import.torrent.state, "stopped");
+        assert_eq!(import.torrent.amount_left, 16 * 1024);
+        assert_eq!(import.torrent.completed_at, None);
+        assert_eq!(import.trackers[0].left_bytes, 16 * 1024);
+    }
+
+    #[test]
+    fn db_import_does_not_turn_an_oversized_legacy_counter_into_completion() {
+        let torrent = MigrationTorrent {
+            info_hash: "b".repeat(40),
+            name: "legacy-recheck".to_owned(),
+            total_length: 100,
+            piece_length: 0,
+            piece_count: 0,
+            is_private: false,
+            files: Vec::new(),
+            torrent_path: PathBuf::from("legacy-recheck.torrent"),
+            resume_path: None,
+            save_path: Some(PathBuf::from("/downloads")),
+            category: None,
+            tags: Vec::new(),
+            uploaded: Some(0),
+            downloaded: Some(250),
+            completed: Some(false),
+            added_at: Some(10),
+            completed_at: Some(20),
+            paused: Some(false),
+            tracker_activity: TrackerActivity::default(),
+            resume_confidence: ResumeConfidence::None,
+            fastresume: None,
+            trackers: Vec::new(),
+            warnings: Vec::new(),
+        };
+
+        let import = torrent.to_db_rows(&ImportOptions::default());
+        assert_eq!(import.torrent.state, "downloading");
+        assert_eq!(import.torrent.amount_left, 100);
+        assert_eq!(import.torrent.completed_at, None);
+    }
+
+    #[test]
+    fn db_import_preserves_completion_for_zero_length_torrents() {
+        let torrent = MigrationTorrent {
+            info_hash: "c".repeat(40),
+            name: "empty".to_owned(),
+            total_length: 0,
+            piece_length: 0,
+            piece_count: 0,
+            is_private: false,
+            files: Vec::new(),
+            torrent_path: PathBuf::from("empty.torrent"),
+            resume_path: None,
+            save_path: Some(PathBuf::from("/downloads")),
+            category: None,
+            tags: Vec::new(),
+            uploaded: Some(0),
+            downloaded: Some(0),
+            completed: Some(true),
+            added_at: Some(10),
+            completed_at: Some(20),
+            paused: Some(false),
+            tracker_activity: TrackerActivity::default(),
+            resume_confidence: ResumeConfidence::None,
+            fastresume: Some(ImportedFastresume {
+                pieces: Vec::new(),
+                partial_pieces: Vec::new(),
+                file_hints: Vec::new(),
+                clean_shutdown: true,
+            }),
+            trackers: Vec::new(),
+            warnings: Vec::new(),
+        };
+
+        let import = torrent.to_db_rows(&ImportOptions::default());
+        assert_eq!(import.torrent.state, "seeding");
+        assert_eq!(import.torrent.amount_left, 0);
+        assert_eq!(import.torrent.completed_at, Some(20));
+    }
+
+    #[test]
     fn qbit_libtorrent2_resume_unpacks_bit_packed_pieces_field() {
         // Regression test for a real bug found importing a real, complete,
         // 4513-piece movie from a real, currently-running qBittorrent
@@ -2950,7 +3155,7 @@ mod tests {
         });
         let row = &import.torrents[0].torrent;
 
-        assert_eq!(row.state, "completed");
+        assert_eq!(row.state, "seeding");
         assert_eq!(row.added_at, 111);
         assert_eq!(row.completed_at, Some(222));
     }
@@ -3219,7 +3424,7 @@ mod tests {
         assert_eq!(row.save_path, "/downloads/imported");
         assert_eq!(row.category.as_deref(), Some("linux"));
         assert_eq!(row.tags, vec!["iso".to_owned(), "archive".to_owned()]);
-        assert_eq!(row.state, "completed");
+        assert_eq!(row.state, "stopped");
         assert_eq!(row.completed_at, Some(1234));
         assert_eq!(row.uploaded, 200);
         assert_eq!(row.downloaded, 100);
@@ -4400,7 +4605,9 @@ mod tests {
                 ),
                 (b"pieces".as_slice(), BValue::Bytes(&[1])),
             ],
-            MigrationSource::RTorrent => unreachable!("rTorrent is not in the sidecar matrix"),
+            MigrationSource::RTorrent => {
+                unreachable!("rTorrent is not in this compatible-client matrix")
+            }
         };
         resume.push((b"last_announce".as_slice(), BValue::Int(1_700_000_050)));
         resume.push((b"next_announce".as_slice(), BValue::Int(1_700_000_500)));

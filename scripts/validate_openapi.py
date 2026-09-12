@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Validate the checked-in native API contract without third-party tooling.
+"""Validate the checked-in TorrentNG API contract without third-party tooling.
 
 This is deliberately a contract sanity check, not a replacement for a full
 OpenAPI validator. It catches the failures that are cheap to introduce here:
 invalid JSON, duplicate operation ids, missing path parameters, and mutating
-native endpoints that forget the retry/idempotency contract.
+TorrentNG endpoints that forget the retry/idempotency contract.
 """
 
 from __future__ import annotations

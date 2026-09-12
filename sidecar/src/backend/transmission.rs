@@ -550,10 +550,19 @@ fn map_torrent(t: &Value) -> Result<RawTorrent> {
     };
     let size_bytes =
         required_nonnegative_i64(t, "totalSize")?.max(required_nonnegative_i64(t, "sizeWhenDone")?);
-    let bytes_done = required_nonnegative_i64(t, "haveValid")?;
-    if bytes_done > size_bytes {
-        bail!("Transmission torrent reports {bytes_done} completed bytes for size {size_bytes}");
+    let reported_bytes_done = required_nonnegative_i64(t, "haveValid")?;
+    if reported_bytes_done > size_bytes {
+        bail!(
+            "Transmission torrent reports {reported_bytes_done} completed bytes for size {size_bytes}"
+        );
     }
+    let bytes_done = if complete {
+        size_bytes
+    } else {
+        reported_bytes_done
+    };
+    let error = required_string(t, "errorString")?;
+    let (state, is_active, is_open) = transmission_state_projection(status, !error.is_empty());
     Ok(RawTorrent {
         hash: required_nonempty_string(t, "hashString")?,
         name: required_nonempty_string(t, "name")?,
@@ -564,14 +573,10 @@ fn map_torrent(t: &Value) -> Result<RawTorrent> {
         up_total: required_nonnegative_i64(t, "uploadedEver")?,
         down_total: required_nonnegative_i64(t, "downloadedEver")?,
         ratio: super::ratio_milli(Some(required_nonnegative_f64(t, "uploadRatio")?)),
-        is_active: status != 0,
-        is_open: status != 0,
+        is_active,
+        is_open,
         complete,
-        state: if required_string(t, "errorString")?.is_empty() {
-            1
-        } else {
-            3
-        },
+        state,
         priority: 0,
         category,
         base_path: required_nonempty_string(t, "downloadDir")?,
@@ -581,10 +586,26 @@ fn map_torrent(t: &Value) -> Result<RawTorrent> {
         tracker_focus: 0,
         peers_connected: required_nonnegative_i64(t, "peersConnected")?,
         peers_complete: 0,
-        message: required_string(t, "errorString")?,
+        message: error,
         tracker_url: tracker,
         tags: String::new(),
     })
+}
+
+/// Project Transmission's numeric lifecycle status into the compact
+/// compatible-client service cache model. The wait states are queued, not
+/// active transfers.
+fn transmission_state_projection(status: i64, has_error: bool) -> (i64, bool, bool) {
+    if has_error {
+        return (3, false, false);
+    }
+    match status {
+        0 => (0, false, false), // stopped
+        1 | 3 | 5 => (5, false, false), // check/download/seed wait
+        2 => (2, true, true),   // checking
+        4 | 6 => (1, true, true), // downloading/seeding
+        _ => (1, true, true),
+    }
 }
 
 fn map_tracker((index, tracker): (usize, &Value)) -> Result<RawTracker> {
@@ -723,5 +744,46 @@ mod tests {
         assert_eq!(mapped.group, 2);
         assert!(mapped.is_open);
         assert_eq!(mapped.scrape_complete, 4);
+    }
+
+    #[test]
+    fn transmission_state_projection_preserves_waiting_lifecycle_states() {
+        assert_eq!(transmission_state_projection(0, false), (0, false, false));
+        assert_eq!(transmission_state_projection(1, false), (5, false, false));
+        assert_eq!(transmission_state_projection(2, false), (2, true, true));
+        assert_eq!(transmission_state_projection(3, false), (5, false, false));
+        assert_eq!(transmission_state_projection(4, false), (1, true, true));
+        assert_eq!(transmission_state_projection(5, false), (5, false, false));
+        assert_eq!(transmission_state_projection(6, false), (1, true, true));
+        assert_eq!(transmission_state_projection(6, true), (3, false, false));
+    }
+
+    #[test]
+    fn transmission_complete_rows_project_full_payload_progress() {
+        let torrent = json!({
+            "percentDone": 1.0,
+            "status": 6,
+            "trackerStats": [],
+            "totalSize": 100,
+            "sizeWhenDone": 100,
+            "haveValid": 25,
+            "errorString": "",
+            "hashString": "transmission-hash",
+            "name": "seed",
+            "rateDownload": 0,
+            "rateUpload": 0,
+            "uploadedEver": 0,
+            "downloadedEver": 25,
+            "uploadRatio": 0.0,
+            "downloadDir": "/downloads",
+            "addedDate": 10,
+            "doneDate": 20,
+            "peersConnected": 0
+        });
+
+        let mapped = map_torrent(&torrent).unwrap();
+
+        assert!(mapped.complete);
+        assert_eq!(mapped.bytes_done, 100);
     }
 }

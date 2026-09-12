@@ -19,7 +19,7 @@ implementation backlog.
 
 ## Executive Summary
 
-The native engine, storage hot path, memory/resource governor, WebUI build, and
+The TorrentNG client, storage hot path, memory/resource governor, WebUI build, and
 local deterministic API compatibility gates are green. The remaining work is
 not concentrated in storage anymore. It is concentrated in release evidence and
 compatibility depth:
@@ -31,15 +31,15 @@ compatibility depth:
 - the migration corpus gate now has checked-in generated fixtures for every
   legacy client family and passes strict local validation; adding real exported
   corpora remains optional release-depth evidence for undocumented variants;
-- facade compatibility now has native-backed qBit, Transmission, Deluge, and
+- facade compatibility now has TorrentNG-client-backed qBit, Transmission, Deluge, and
   rTorrent field projection for the local matrix; remaining compatibility depth
   is live-client behavior and plugin effects that require external clients or a
-  deliberate TorrentNG-native workflow owner;
+  deliberate TorrentNG-client workflow owner;
 - uTP is implemented at the application transport layer for outbound
   peer-wire, incoming peer-wire when explicitly enabled, and magnet metadata
   fetch; remaining uTP work is public/live interop evidence and operational
   tuning rather than a hidden packet-codec-only implementation gap;
-- the current native and sidecar security reviews pass their configuration,
+- the current TorrentNG-client and compatible-client service security reviews pass their configuration,
   token, and script-policy checks; rendered-secret, proxy, metrics-exposure,
   dependency, and image-scan review remains deployment/operator evidence;
 - the completed public Debian soak is recorded as PASS in both its finalization
@@ -53,9 +53,9 @@ Current `scripts/certification_status.sh` highlights:
 
 | Area | Status |
 | --- | --- |
-| Native engine rewrite | PASS |
+| TorrentNG client implementation | PASS |
 | Hosted CI repository gate | PASS (`34521941751`, all 10 jobs; CodeQL `34521941269` also green) |
-| Local release gate | PASS_WITH_WARNINGS at `50e0fc3`; native, WebUI, API, smoke, backup, corpus, and security gates pass, with only the unconfigured local block-device probe skipped |
+| Local release gate | PASS_WITH_WARNINGS at `50e0fc3`; TorrentNG client, WebUI, API, smoke, backup, corpus, and security gates pass, with only the unconfigured local block-device probe skipped |
 | Storage hardware matrix | PASS on kspls0 LVM (`b393eb0`) |
 | Storage io_uring capability/graduation | PASS on kspls0 LVM (`b393eb0`) |
 | Storage move/import | PASS on kspls0 LVM (`b393eb0`) |
@@ -69,8 +69,8 @@ Current `scripts/certification_status.sh` highlights:
 | Certification bundle | Generates a hashed archive of latest evidence reports |
 | Release evidence suite | Fails until strict readiness passes, while refreshing bundle/burndown |
 | Certification JSON status | Machine-readable status export for CI/release automation |
-| Universal compatibility | PASS_WITH_SKIPS; current b393 Docker, mobile, and public Debian legs pass, while target storage is certified separately |
-| Universal live compatibility | PASS_WITH_SKIPS; canonical b393 all-live report passes local Docker, mobile, and public Debian legs, with the real-device wrapper explicitly skipped |
+| Broad compatibility | PASS_WITH_SKIPS; current b393 Docker, mobile, and public Debian legs pass, while target storage is certified separately |
+| Broad live compatibility | PASS_WITH_SKIPS; canonical b393 all-live report passes local Docker, mobile, and public Debian legs, with the real-device wrapper explicitly skipped |
 | Migration corpus | PASS with generated checked-in corpus; strict local gate passes |
 | External evidence preflight | PASS in strict mode for Docker, public opt-in, writable storage target, corpus, and completed soak |
 | 24h soak | PASS; 1,437 samples and exact completed public torrent |
@@ -78,7 +78,7 @@ Current `scripts/certification_status.sh` highlights:
 ## Roadmaps
 
 `docs/ROADMAP.md` and `docs/ENGINE_REWRITE_BURNDOWN.md` are mostly closed for
-native implementation. The remaining roadmap risk is that the high-level
+TorrentNG-client implementation. The remaining roadmap risk is that the high-level
 roadmap now mixes completed implementation claims with evidence boundaries from
 the compatibility matrix.
 
@@ -86,7 +86,7 @@ Remaining qualification gates:
 
 - `docs/CLIENT_COMPATIBILITY_MATRICES.md` and `docs/INTEROP_MATRIX.md` retain
   optional live-client, public-network, and broader protocol qualification rows;
-  they are not unassigned native implementation work.
+  they are not unassigned TorrentNG-client implementation work.
 - The 24-hour soak remains an explicit release-evidence gate. The named Debian
   run is complete; future release artifacts still need their own operator-owned
   soak when the runtime artifact or configuration materially changes.
@@ -97,10 +97,10 @@ Storage implementation is closed locally. The current live path includes
 bounded positioned I/O, fd pooling, preallocation, durability barriers,
 dedicated disk/hash workers, peer-read readahead, HDD elevator, topology
 detection, sparse recheck, move/import/delete planning, storage-plan jobs, and
-release certification wrappers. Native REST now also exposes
+release certification wrappers. TorrentNG REST now also exposes
 `GET /api/v1/storage` directly from the engine storage-root registry with live
-capacity probes, so WebUI/native deployments no longer depend on sidecar-only
-storage status projection.
+capacity probes, so WebUI/TorrentNG-client deployments do not depend on the
+compatible-client service for storage status projection.
 
 Current kspls0 LVM evidence is complete for the exercised target:
 
@@ -130,7 +130,7 @@ Memory/resource-governor work is locally green:
 
 Remaining memory work is evidence-bound:
 
-- the completed public soak covers the native interop configuration; a future
+- the completed public soak covers the compatible-client interop configuration; a future
   materially different release config still needs its own soak;
 - fleet-size claims still depend on live deployment measurements, not just
   deterministic proxy tests.
@@ -177,7 +177,7 @@ Remaining WebUI gaps are now product/certification depth:
   load-more responsiveness, and a configurable first-visible threshold through
   `TNG_WEBUI_FIRST_VISIBLE_MS` in `scripts/webui_certification.sh`;
 - some plugin panels intentionally show compatibility-state surfaces until
-  TorrentNG owns native plugin workflows such as blocklist, execute, extractor,
+  TorrentNG owns first-party plugin workflows such as blocklist, execute, extractor,
   scheduler, or auto-add behavior.
 
 ## API And Compatibility
@@ -198,25 +198,25 @@ Remaining compatibility depth:
 
 - Transmission: JSON-RPC 2.0 method errors, stateful notification subscription
   probes, broad mutable session settings, group limit state roundtrips, and
-  aggregate native peer rates are covered in the facade matrix. ETA now projects
-  from native peer rates, and tracker stats project persisted engine announce
+  aggregate TorrentNG-client peer rates are covered in the facade matrix. ETA now projects
+  from TorrentNG-client peer rates, and tracker stats project persisted client announce
   state, including timestamps, status messages, and scrape counts; true push
-  notification delivery and native group scheduling effects remain future
+  notification delivery and TorrentNG-client group scheduling effects remain future
   live-client parity work.
 - Deluge: extractor, scheduler, execute, blocklist, and autoadd plugin-specific
   APIs now have structured compatibility surfaces with safe no-op mutations;
-  torrent peer/rate fields and tracker status fields project native snapshots
-  when available; remaining plugin work is native behavioral effects only where
+  torrent peer/rate fields and tracker status fields project TorrentNG-client snapshots
+  when available; remaining plugin work is first-party behavioral effects only where
   TorrentNG explicitly chooses to own those workflows.
-- rTorrent: file/tracker/peer multicalls now project native metadata, persisted
+- rTorrent: file/tracker/peer multicalls now project TorrentNG-client metadata, persisted
   tracker state, and peer snapshots when an engine is attached, with registry
   fallback file rows for in-memory compatibility probes. Global throttle reads
-  use native limits where available; common view sizes are registry-backed; and
+  use TorrentNG-client limits where available; common view sizes are registry-backed; and
   custom views round-trip through `view.add`/`view.set` with registry size
   projection. Deeper per-view filter expressions remain compatibility depth.
 - qBittorrent: common automation flows are covered, and `torrents/info`,
   `sync/maindata`, `transfer/info`, `torrents/files`, and
-  `torrents/trackers` now project native peer snapshots, per-file progress,
+  `torrents/trackers` now project TorrentNG-client peer snapshots, per-file progress,
   aggregate rates, and persisted tracker status/messages/counts where
   available. Remaining depth is live-client presentation parity for
   client-specific edge cases.
@@ -225,8 +225,8 @@ Remaining compatibility depth:
   matrix now also includes `rust-trackerless-magnet` for trackerless metadata
   and payload transfer through an explicit peer bridge. Public DHT-only swarm
   discovery remains external release evidence.
-- uTP: `rt-utp` provides the packet/state/UDP stream layer, and the native
-  engine has policy-gated outbound peer-wire, boolean-gated incoming peer-wire,
+- uTP: `rt-utp` provides the packet/state/UDP stream layer, and the TorrentNG
+  client has policy-gated outbound peer-wire, boolean-gated incoming peer-wire,
   and metadata-fetch paths. `/health` reports the active `utp_transport_paths`
   so operators can distinguish enabled runtime paths from crate capability.
   Remaining depth is public-swarm interop, dashboards, and deployment tuning.
@@ -296,9 +296,10 @@ interop work is external or optional:
 
 ## Security
 
-The repository security checks pass for the current native and sidecar
-configuration fixtures. Native metrics identifiers are hashed by default;
-sidecar metrics requires credentials when tokens are configured; public binds
+The repository security checks pass for the current TorrentNG-client and
+compatible-client service configuration fixtures. TorrentNG-client metrics
+identifiers are hashed by default; compatible-client service metrics require
+credentials when tokens are configured; public binds
 require strong tokens and a signing secret; and proxy-header trust is
 loopback-only. The remaining checks are deployment-specific rather than open
 source work.
@@ -315,7 +316,7 @@ Release-operator checks before shipping:
 
 ## Packaging And Operations
 
-Native deployment docs and packaging artifacts exist for systemd, Docker,
+TorrentNG-client deployment docs and packaging artifacts exist for systemd, Docker,
 Compose, Kubernetes, Prometheus/Grafana, and Arch/AUR template coverage.
 
 Remaining external operational evidence:

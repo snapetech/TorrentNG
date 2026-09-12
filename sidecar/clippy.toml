@@ -1,3 +1,3 @@
-# The sidecar is maintained as an independently deployable crate and has a
-# newer MSRV than the native workspace.
+# The compatible-client service is maintained as an independently deployable
+# crate and has a newer MSRV than the TorrentNG-client workspace.
 msrv = "1.97"

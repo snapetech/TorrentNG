@@ -86,7 +86,7 @@ interface RateSample {
   amountLeft: number
   downloadRate: number
   uploadRate: number
-  receivedAt: number
+  sampledAt: number
 }
 
 /** Keep a short client-side mean so ETA does not jump on every backend tick. */
@@ -109,8 +109,11 @@ export function useSmoothedLiveRates(data: LiveTorrentStatsResponse | undefined)
     const receivedAt = Date.now()
     for (const stat of data.torrents) {
       const samples = historyRef.current.get(stat.hash) ?? []
+      const sampledAt = Number.isFinite(stat.sampled_at) && stat.sampled_at > 0
+        ? stat.sampled_at
+        : receivedAt
       const previous = samples[samples.length - 1]
-      if (previous && previous.receivedAt >= receivedAt - 100 && previous.amountLeft === stat.amount_left
+      if (previous && previous.sampledAt === sampledAt && previous.amountLeft === stat.amount_left
         && previous.downloadRate === stat.download_rate && previous.uploadRate === stat.upload_rate) {
         continue
       }
@@ -118,14 +121,14 @@ export function useSmoothedLiveRates(data: LiveTorrentStatsResponse | undefined)
         amountLeft: Math.max(0, stat.amount_left),
         downloadRate: Math.max(0, stat.download_rate),
         uploadRate: Math.max(0, stat.upload_rate),
-        receivedAt,
+        sampledAt,
       })
       historyRef.current.set(stat.hash, samples.slice(-4))
     }
 
     const cutoff = receivedAt - 30_000
     for (const [hash, samples] of historyRef.current) {
-      const recent = samples.filter(sample => sample.receivedAt >= cutoff)
+      const recent = samples.filter(sample => sample.sampledAt >= cutoff)
       if (recent.length === 0) historyRef.current.delete(hash)
       else historyRef.current.set(hash, recent)
     }
@@ -148,7 +151,7 @@ export function useSmoothedLiveRates(data: LiveTorrentStatsResponse | undefined)
         amountLeft: latest.amountLeft,
         downloadRate,
         uploadRate,
-        fresh: clock === 0 || clock - latest.receivedAt <= LIVE_STATS_INTERVAL_MS * 3,
+        fresh: clock === 0 || clock - latest.sampledAt <= LIVE_STATS_INTERVAL_MS * 3,
       })
     }
     return rates

@@ -2,4 +2,4 @@
 
 Prometheus metrics definitions.
 
-## Status: Implemented — native engine support
+## Status: Implemented — TorrentNG client support

@@ -72,7 +72,7 @@ write_header() {
 - Binary SHA-256: $binary_sha
 - Fixture: $FIXTURE
 
-This is a disposable native-engine drill. It creates one paused torrent in a
+This is a disposable TorrentNG-client drill. It creates one paused torrent in a
 temporary session, performs a SQLite online backup plus session archive, tears
 down the source daemon, restores the archive into a different session/data
 root, starts a second daemon, and verifies that the restored state is usable.
@@ -155,7 +155,7 @@ trap cleanup EXIT
 
 write_header
 test -x "$BIN"
-# The native API-only drill does not require checked-in WebUI assets. Create
+# The TorrentNG API-only drill does not require checked-in WebUI assets. Create
 # an empty temporary-compatible directory when a checkout omits generated
 # static assets; the API assertions below still exercise the daemon itself.
 mkdir -p "$STATIC_DIR"
@@ -278,7 +278,7 @@ start_daemon() {
 }
 
 start_daemon "$SOURCE_CONFIG" "$SOURCE_LOG" "$api_port"
-record "Source daemon startup and health" "PASS" "authenticated native health endpoint"
+record "Source daemon startup and health" "PASS" "authenticated TorrentNG health endpoint"
 
 torrent_b64="$(base64 <"$FIXTURE" | tr -d '\n')"
 request="$(jq -nc --arg torrent "$torrent_b64" --arg path "$SOURCE_DATA" '{torrent_b64:$torrent,save_path:$path,start:false,category:"backup-cert",tags:["backup-restore"]}')"

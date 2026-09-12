@@ -2,4 +2,4 @@
 
 shared API types (serde).
 
-## Status: Implemented — native engine support
+## Status: Implemented — TorrentNG client support

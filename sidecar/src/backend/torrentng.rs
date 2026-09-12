@@ -31,7 +31,7 @@ impl TorrentngBackend {
             .timeout(std::time::Duration::from_secs(cfg.timeout_secs.max(1)))
             .danger_accept_invalid_certs(cfg.accept_invalid_certs)
             .build()
-            .context("create TorrentNG native API client")?;
+            .context("create TorrentNG API client")?;
         Ok(Self {
             client,
             base_url: Url::parse(cfg.url.trim()).context("parse torrentng.url")?,
@@ -42,7 +42,7 @@ impl TorrentngBackend {
     fn url(&self, path: &str) -> Result<Url> {
         self.base_url
             .join(path)
-            .context("build TorrentNG native URL")
+            .context("build TorrentNG client URL")
     }
 
     fn torrent_path(hash: &str, suffix: &str) -> String {
@@ -125,7 +125,7 @@ impl TorrentBackend for TorrentngBackend {
             supports_global_limits: true,
             supports_share_limits: true,
             // force_start/auto-management are deliberately rejected by the
-            // native engine until they have real scheduler semantics. Do not
+            // TorrentNG client until they have real scheduler semantics. Do not
             // advertise a mutation that only persists an inert flag.
             supports_mode_flags: false,
             supports_location_update: true,
@@ -255,7 +255,7 @@ impl TorrentBackend for TorrentngBackend {
             }
             None => format!("api/v1/torrents?limit={limit}&offset={offset}"),
         };
-        if let Some(status) = native_status_for_view(view)? {
+        if let Some(status) = torrentng_status_for_view(view)? {
             path.push_str("&status=");
             path.push_str(urlencoding::encode(&status).as_ref());
         }
@@ -878,11 +878,33 @@ impl TorrentngBackend {
 
 fn map_summary(t: &Value) -> Result<RawTorrent> {
     let state = required_string(t, "state")?;
+    let state_code = torrentng_state_code(&state)?;
     let size = required_nonnegative_i64(t, "total_length")?;
     let downloaded = required_nonnegative_i64(t, "downloaded")?;
-    if downloaded > size {
-        bail!("TorrentNG torrent reports {downloaded} downloaded bytes for size {size}");
+    // `downloaded` is cumulative transfer accounting. `amount_left` is the
+    // current payload invariant and may legitimately disagree after a
+    // recheck discovers missing pieces (or after a torrent is uploaded again).
+    let amount_left = match t.get("amount_left") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(required_nonnegative_i64_value(value, "amount_left")?),
+    };
+    if let Some(amount_left) = amount_left {
+        if amount_left > size {
+            bail!(
+                "TorrentNG torrent reports {amount_left} bytes left for size {size}"
+            );
+        }
     }
+    let bytes_done = if state == "seeding" {
+        // TorrentNG-client seeding is the upload-side lifecycle state and therefore
+        // proves the payload is complete, even on older servers that did not
+        // expose the optional live `amount_left` field.
+        size
+    } else {
+        amount_left.map_or(downloaded.min(size), |amount_left| {
+            size.saturating_sub(amount_left)
+        })
+    };
     let uploaded = required_nonnegative_i64(t, "uploaded")?;
     let ratio = t
         .get("ratio")
@@ -930,16 +952,21 @@ fn map_summary(t: &Value) -> Result<RawTorrent> {
         hash,
         name,
         size_bytes: size,
-        bytes_done: downloaded,
+        bytes_done,
         down_rate: 0,
         up_rate: 0,
         up_total: uploaded,
         down_total: downloaded,
         ratio: super::ratio_milli(Some(ratio)),
-        is_active: !matches!(state.as_str(), "paused" | "stopped" | "error"),
-        is_open: !matches!(state.as_str(), "paused" | "stopped" | "error"),
-        complete: matches!(state.as_str(), "seeding" | "complete") || downloaded >= size,
-        state: if state == "error" { 3 } else { 1 },
+        is_active: matches!(state_code, 1 | 2),
+        is_open: matches!(state_code, 1 | 2 | 4),
+        // Without `amount_left`, the legacy `downloaded` field is cumulative
+        // and cannot prove that the current payload is complete. Only the
+        // lifecycle projection can establish completion on that wire shape.
+        complete: amount_left.map_or(state == "seeding", |amount_left| {
+            state == "seeding" || (size > 0 && amount_left == 0)
+        }),
+        state: state_code,
         priority: 0,
         category,
         base_path: save_path.clone(),
@@ -953,6 +980,18 @@ fn map_summary(t: &Value) -> Result<RawTorrent> {
         tracker_url: String::new(),
         tags,
     })
+}
+
+fn torrentng_state_code(state: &str) -> Result<i64> {
+    match state {
+        "stopped" | "paused" => Ok(0),
+        "downloading" | "seeding" => Ok(1),
+        "checking" => Ok(2),
+        "error" => Ok(3),
+        "metadata_pending" => Ok(4),
+        "queued" => Ok(5),
+        other => bail!("TorrentNG response contains unsupported state {other}"),
+    }
 }
 
 fn required_string(value: &Value, field: &str) -> Result<String> {
@@ -994,7 +1033,7 @@ fn required_nonnegative_usize(value: &Value, field: &str) -> Result<usize> {
         .with_context(|| format!("TorrentNG response {field} exceeds usize"))
 }
 
-fn native_status_for_view(view: &str) -> Result<Option<String>> {
+fn torrentng_status_for_view(view: &str) -> Result<Option<String>> {
     let view = view.trim();
     if view.is_empty() || view.eq_ignore_ascii_case("main") || view.eq_ignore_ascii_case("all") {
         return Ok(None);
@@ -1021,7 +1060,7 @@ fn native_status_for_view(view: &str) -> Result<Option<String>> {
     ) {
         Ok(Some(normalized.to_owned()))
     } else {
-        bail!("TorrentNG native backend does not support torrent view {view}")
+        bail!("TorrentNG client backend does not support torrent view {view}")
     }
 }
 
@@ -1073,9 +1112,124 @@ mod tests {
         assert_eq!(mapped.up_total, 2048);
         assert_eq!(mapped.ratio, 2000);
         assert!(mapped.complete);
+        assert_eq!(mapped.state, 1);
+        assert!(mapped.is_active);
+        assert!(mapped.is_open);
         assert_eq!(mapped.category, "linux");
         assert_eq!(mapped.peers_connected, 3);
         assert_eq!(mapped.peers_complete, 4);
+    }
+
+    #[test]
+    fn native_summary_preserves_non_running_state_codes() {
+        let mut raw = json!({
+            "info_hash": "abc",
+            "name": "payload",
+            "state": "stopped",
+            "total_length": 1024,
+            "downloaded": 0,
+            "uploaded": 0,
+            "ratio": 0.0,
+            "save_path": "/data",
+            "category": null,
+            "tags": [],
+            "added_at": 10,
+            "completed_at": null,
+            "num_peers": 0,
+            "num_seeds": 0
+        });
+
+        for (state, code, active, open) in [
+            ("stopped", 0, false, false),
+            ("checking", 2, true, true),
+            ("error", 3, false, false),
+            ("metadata_pending", 4, false, true),
+            ("queued", 5, false, false),
+        ] {
+            raw["state"] = json!(state);
+            let mapped = map_summary(&raw).unwrap();
+            assert_eq!(mapped.state, code, "state {state}");
+            assert_eq!(mapped.is_active, active, "active state {state}");
+            assert_eq!(mapped.is_open, open, "open state {state}");
+            assert!(!mapped.complete, "incomplete state {state}");
+        }
+    }
+
+    #[test]
+    fn native_summary_uses_live_remaining_bytes_after_recheck() {
+        let raw = json!({
+            "info_hash": "abc",
+            "name": "rechecked",
+            "state": "downloading",
+            "total_length": 100,
+            "downloaded": 100,
+            "amount_left": 50,
+            "uploaded": 0,
+            "ratio": 0.0,
+            "save_path": "/data",
+            "category": null,
+            "tags": [],
+            "added_at": 10,
+            "completed_at": 20,
+            "num_peers": 0,
+            "num_seeds": 0
+        });
+
+        let mapped = map_summary(&raw).unwrap();
+
+        assert_eq!(mapped.bytes_done, 50);
+        assert_eq!(mapped.down_total, 100);
+        assert!(!mapped.complete);
+    }
+
+    #[test]
+    fn legacy_native_summary_does_not_infer_completion_from_cumulative_downloads() {
+        let raw = json!({
+            "info_hash": "abc",
+            "name": "rechecked-legacy",
+            "state": "downloading",
+            "total_length": 100,
+            "downloaded": 250,
+            "uploaded": 0,
+            "ratio": 0.0,
+            "save_path": "/data",
+            "category": null,
+            "tags": [],
+            "added_at": 10,
+            "completed_at": 20,
+            "num_peers": 0,
+            "num_seeds": 0
+        });
+
+        let mapped = map_summary(&raw).unwrap();
+
+        assert_eq!(mapped.bytes_done, 100);
+        assert!(!mapped.complete);
+    }
+
+    #[test]
+    fn legacy_native_seeding_summary_projects_complete_payload() {
+        let raw = json!({
+            "info_hash": "abc",
+            "name": "legacy-seeding",
+            "state": "seeding",
+            "total_length": 100,
+            "downloaded": 0,
+            "uploaded": 0,
+            "ratio": 0.0,
+            "save_path": "/data",
+            "category": null,
+            "tags": [],
+            "added_at": 10,
+            "completed_at": null,
+            "num_peers": 0,
+            "num_seeds": 0
+        });
+
+        let mapped = map_summary(&raw).unwrap();
+
+        assert_eq!(mapped.bytes_done, 100);
+        assert!(mapped.complete);
     }
 
     #[test]

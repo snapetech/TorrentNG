@@ -572,12 +572,19 @@ fn map_torrent(hash: &str, t: &Value) -> Result<RawTorrent> {
         .transpose()?
         .unwrap_or_default();
     let size_bytes = required_nonnegative_i64(t, "total_size")?;
-    let bytes_done = required_nonnegative_i64(t, "total_done")?;
-    if bytes_done > size_bytes {
-        bail!("Deluge torrent {hash} reports {bytes_done} completed bytes for size {size_bytes}");
+    let reported_bytes_done = required_nonnegative_i64(t, "total_done")?;
+    if reported_bytes_done > size_bytes {
+        bail!(
+            "Deluge torrent {hash} reports {reported_bytes_done} completed bytes for size {size_bytes}"
+        );
     }
     let complete = progress >= 100.0 || state.eq_ignore_ascii_case("seeding");
-    let stopped = state.eq_ignore_ascii_case("paused") || state.eq_ignore_ascii_case("error");
+    let bytes_done = if complete {
+        size_bytes
+    } else {
+        reported_bytes_done
+    };
+    let (state_code, is_active, is_open) = deluge_state_projection(&state);
     let message = required_string(t, "message")?;
     Ok(RawTorrent {
         hash: hash.to_owned(),
@@ -589,14 +596,10 @@ fn map_torrent(hash: &str, t: &Value) -> Result<RawTorrent> {
         up_total: required_nonnegative_i64(t, "total_uploaded")?,
         down_total: required_nonnegative_i64(t, "total_downloaded")?,
         ratio: super::ratio_milli(Some(required_nonnegative_f64(t, "ratio")?)),
-        is_active: !stopped,
-        is_open: !stopped,
+        is_active,
+        is_open,
         complete,
-        state: if state.eq_ignore_ascii_case("error") {
-            3
-        } else {
-            1
-        },
+        state: state_code,
         priority: 0,
         category: String::new(),
         base_path: required_nonempty_string(t, "save_path")?,
@@ -610,6 +613,23 @@ fn map_torrent(hash: &str, t: &Value) -> Result<RawTorrent> {
         tracker_url,
         tags: String::new(),
     })
+}
+
+/// Project Deluge's lifecycle strings into the compact compatible-client
+/// service cache model.
+/// Waiting and paused torrents must not be exposed as active transfers.
+fn deluge_state_projection(state: &str) -> (i64, bool, bool) {
+    if state.eq_ignore_ascii_case("error") {
+        (3, false, false)
+    } else if state.eq_ignore_ascii_case("paused") || state.eq_ignore_ascii_case("stopped") {
+        (0, false, false)
+    } else if state.eq_ignore_ascii_case("checking") {
+        (2, true, true)
+    } else if state.eq_ignore_ascii_case("queued") {
+        (5, false, false)
+    } else {
+        (1, true, true)
+    }
 }
 
 fn map_tracker((index, tracker): (usize, &Value)) -> Result<RawTracker> {
@@ -719,5 +739,48 @@ mod tests {
         let hash = "deadbeef";
         assert_eq!(single_torrent_params(hash), json!([hash]));
         assert_eq!(torrent_ids_params(hash), json!([[hash]]));
+    }
+
+    #[test]
+    fn deluge_state_projection_preserves_waiting_lifecycle_states() {
+        for (state, code, active, open) in [
+            ("Paused", 0, false, false),
+            ("Stopped", 0, false, false),
+            ("Queued", 5, false, false),
+            ("Checking", 2, true, true),
+            ("Downloading", 1, true, true),
+            ("Seeding", 1, true, true),
+            ("Error", 3, false, false),
+        ] {
+            assert_eq!(deluge_state_projection(state), (code, active, open));
+        }
+    }
+
+    #[test]
+    fn deluge_complete_rows_project_full_payload_progress() {
+        let torrent = json!({
+            "state": "Seeding",
+            "progress": 100.0,
+            "trackers": [],
+            "total_size": 100,
+            "total_done": 25,
+            "message": "",
+            "name": "seed",
+            "download_payload_rate": 0,
+            "upload_payload_rate": 0,
+            "total_uploaded": 0,
+            "total_downloaded": 25,
+            "ratio": 0.0,
+            "save_path": "/downloads",
+            "time_added": 10,
+            "completed_time": 20,
+            "num_peers": 0,
+            "num_seeds": 0
+        });
+
+        let mapped = map_torrent("deluge-hash", &torrent).unwrap();
+
+        assert!(mapped.complete);
+        assert_eq!(mapped.bytes_done, 100);
     }
 }

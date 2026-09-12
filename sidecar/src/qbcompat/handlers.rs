@@ -1471,46 +1471,49 @@ async fn torrents_properties(
         .run_blocking("qbit_torrent_properties", move |db| db.get(&lookup_hash))
         .await
     {
-        Ok(Some(t)) => Json(json!({
-            "save_path": t.directory,
-            "creation_date": t.creation_date,
-            "piece_size": 0,
-            "comment": "",
-            "total_wasted": 0,
-            "total_uploaded": t.up_total,
-            "total_uploaded_session": 0,
-            "total_downloaded": t.down_total,
-            "total_downloaded_session": 0,
-            "up_limit": -1,
-            "dl_limit": -1,
-            "time_elapsed": 0,
-            "seeding_time": 0,
-            "nb_connections": t.peers_connected,
-            "nb_connections_limit": -1,
-            "share_ratio": t.ratio as f64 / 1000.0,
-            "addition_date": t.creation_date,
-            "completion_date": t.timestamp_finished,
-            "created_by": "",
-            "dl_speed_avg": 0,
-            "dl_speed": t.down_rate,
-            "eta": if t.down_rate > 0 && t.size_bytes > t.bytes_done {
-                (t.size_bytes - t.bytes_done) / t.down_rate
-            } else {
-                8_640_000
-            },
-            "last_seen": t.updated_at,
-            "peers": t.peers_connected,
-            "peers_total": t.peers_connected,
-            "pieces_have": 0,
-            "pieces_num": 0,
-            "reannounce": 0,
-            "seeds": t.peers_complete,
-            "seeds_total": t.peers_complete,
-            "total_size": t.size_bytes,
-            "up_speed_avg": 0,
-            "up_speed": t.up_rate,
-        }))
-        .into_response(),
+        Ok(Some(t)) => {
+            let (down_rate, up_rate) = current_row_rates(&t);
+            Json(json!({
+                "save_path": t.directory,
+                "creation_date": t.creation_date,
+                "piece_size": 0,
+                "comment": "",
+                "total_wasted": 0,
+                "total_uploaded": t.up_total,
+                "total_uploaded_session": 0,
+                "total_downloaded": t.down_total,
+                "total_downloaded_session": 0,
+                "up_limit": -1,
+                "dl_limit": -1,
+                "time_elapsed": 0,
+                "seeding_time": 0,
+                "nb_connections": t.peers_connected,
+                "nb_connections_limit": -1,
+                "share_ratio": t.ratio as f64 / 1000.0,
+                "addition_date": t.creation_date,
+                "completion_date": t.timestamp_finished,
+                "created_by": "",
+                "dl_speed_avg": 0,
+                "dl_speed": down_rate,
+                "eta": if down_rate > 0 && t.size_bytes > t.bytes_done {
+                    (t.size_bytes - t.bytes_done) / down_rate
+                } else {
+                    8_640_000
+                },
+                "last_seen": t.updated_at,
+                "peers": t.peers_connected,
+                "peers_total": t.peers_connected,
+                "pieces_have": 0,
+                "pieces_num": 0,
+                "reannounce": 0,
+                "seeds": t.peers_complete,
+                "seeds_total": t.peers_complete,
+                "total_size": t.size_bytes,
+                "up_speed_avg": 0,
+                "up_speed": up_rate,
+            }))
+            .into_response()
+        }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
             tracing::error!(
@@ -1792,7 +1795,7 @@ async fn torrents_add(State(s): State<AppState>, mut multipart: Multipart) -> im
                     operation = "add_torrent",
                     field = %name,
                     result = "unsupported",
-                    "qBit add option has no sidecar backend contract"
+                    "qBit add option has no compatible-client backend contract"
                 );
                 return (StatusCode::NOT_IMPLEMENTED, "Fails.").into_response();
             }
@@ -1804,7 +1807,7 @@ async fn torrents_add(State(s): State<AppState>, mut multipart: Multipart) -> im
         }
     }
 
-    // The generic sidecar backend has no add-time contract for these qBit
+    // The generic compatible-client backend has no add-time contract for these qBit
     // options. Silently dropping them reports a successful add while creating
     // a torrent with different scheduler/share semantics.
     if tags.as_deref().is_some_and(|tags| !tags.trim().is_empty())
@@ -1820,7 +1823,7 @@ async fn torrents_add(State(s): State<AppState>, mut multipart: Multipart) -> im
             component = "qbcompat",
             operation = "add_torrent",
             result = "unsupported",
-            "qBit add request contains options without a sidecar backend contract"
+            "qBit add request contains options without a compatible-client backend contract"
         );
         return (StatusCode::NOT_IMPLEMENTED, "Fails.").into_response();
     }
@@ -3919,12 +3922,12 @@ async fn sync_maindata(
                     result = "rejected",
                     total = rows.len(),
                     maximum = MAX_QBIT_SYNC_ENTRIES,
-                    "qBit full sync exceeds the bounded compatibility response; use paged native endpoints"
+                    "qBit full sync exceeds the bounded compatibility response; use paged TorrentNG endpoints"
                 );
                 (
                     StatusCode::PAYLOAD_TOO_LARGE,
                     format!(
-                        "qBit full sync contains more than {} torrents; use the paged native API",
+                        "qBit full sync contains more than {} torrents; use the paged TorrentNG API",
                         MAX_QBIT_SYNC_ENTRIES
                     ),
                 )
@@ -4006,12 +4009,12 @@ async fn sync_maindata(
                     result = "rejected",
                     rid,
                     maximum = MAX_QBIT_SYNC_ENTRIES,
-                    "qBit incremental sync exceeds the bounded compatibility response; request a fresh paged/native sync"
+                    "qBit incremental sync exceeds the bounded compatibility response; request a fresh paged TorrentNG sync"
                 );
                 (
                     StatusCode::PAYLOAD_TOO_LARGE,
                     format!(
-                        "qBit incremental sync exceeds the {}-torrent limit; request a fresh sync or use the paged native API",
+                        "qBit incremental sync exceeds the {}-torrent limit; request a fresh sync or use the paged TorrentNG API",
                         MAX_QBIT_SYNC_ENTRIES
                     ),
                 )
@@ -4157,8 +4160,9 @@ mod tests {
     };
 
     use super::{
-        is_status_filter, qb_server_state, qbit_log_entry, qbit_ratio_limit_milli,
-        qbit_status_filter, resolve_hashes, split_hashes, to_qb_torrent, LogMainQuery,
+        cached_lifecycle_projection, is_status_filter, map_sort, qb_server_state, qbit_log_entry,
+        qbit_ratio_limit_milli, qbit_status_filter, resolve_hashes, split_hashes, to_qb_torrent,
+        LogMainQuery,
     };
 
     #[test]
@@ -4319,12 +4323,65 @@ mod tests {
 
     #[test]
     fn qb_torrent_maps_started_idle_rows_as_stalled() {
-        let stalled_downloading = to_qb_torrent(&torrent_row("down", false, true, false));
-        let stalled_uploading = to_qb_torrent(&torrent_row("up", false, true, true));
+        let stalled_downloading = to_qb_torrent(&torrent_row("down", true, true, false));
+        let stalled_uploading = to_qb_torrent(&torrent_row("up", true, true, true));
 
         assert_eq!(stalled_downloading["state"], "stalledDL");
         assert_eq!(stalled_uploading["state"], "stalledUP");
         assert_eq!(stalled_uploading["content_path"], "/downloads/test");
+    }
+
+    #[test]
+    fn qb_torrent_maps_native_error_queue_and_checking_states() {
+        let mut error = torrent_row("error", false, false, false);
+        error.state = 3;
+        error.message = "terminal error".to_owned();
+        assert_eq!(to_qb_torrent(&error)["state"], "error");
+
+        let mut queued = torrent_row("queued", false, false, false);
+        queued.state = 5;
+        let legacy_queued = torrent_row("legacy-queued", false, false, false);
+        let mut checking = torrent_row("checking", true, true, false);
+        checking.state = 2;
+        let mut checking_with_legacy_flags = torrent_row("checking-legacy", false, false, false);
+        checking_with_legacy_flags.state = 2;
+        assert_eq!(to_qb_torrent(&queued)["state"], "queuedDL");
+        assert_eq!(to_qb_torrent(&legacy_queued)["state"], "queuedDL");
+        assert_eq!(to_qb_torrent(&checking)["state"], "checkingDL");
+        assert_eq!(
+            to_qb_torrent(&checking_with_legacy_flags)["state"],
+            "checkingDL"
+        );
+
+        let mut paused = torrent_row("paused", false, false, false);
+        paused.state = 0;
+        assert_eq!(to_qb_torrent(&paused)["state"], "pausedDL");
+        let mut paused_complete = torrent_row("paused-complete", false, false, true);
+        paused_complete.state = 0;
+        assert_eq!(to_qb_torrent(&paused_complete)["state"], "pausedUP");
+
+        let inactive_open = torrent_row("inactive-open", false, true, false);
+        assert_eq!(to_qb_torrent(&inactive_open)["state"], "pausedDL");
+        let inactive_open_complete = torrent_row("inactive-open-complete", false, true, true);
+        assert_eq!(
+            to_qb_torrent(&inactive_open_complete)["state"],
+            "pausedUP"
+        );
+    }
+
+    #[test]
+    fn successful_start_projects_as_started_until_next_sync() {
+        assert_eq!(
+            cached_lifecycle_projection("start"),
+            Some((1, true, true))
+        );
+        assert_eq!(cached_lifecycle_projection("stop"), Some((0, false, false)));
+        assert_eq!(cached_lifecycle_projection("recheck"), None);
+    }
+
+    #[test]
+    fn qbit_completion_sort_reaches_cache_ordering() {
+        assert_eq!(map_sort("completion_on"), "completed");
     }
 
     #[test]
@@ -4411,14 +4468,24 @@ pub fn to_qb_torrent(t: &TorrentRow) -> serde_json::Value {
     } else {
         0.0
     };
-    let state = if !t.is_open {
-        "pausedUP"
+    let state = if t.state == 3 {
+        "error"
+    } else if t.state == 4 {
+        "metaDL"
     } else if t.state == 2 {
-        "checkingUP"
-    } else if t.complete && t.is_active {
+        if t.complete { "checkingUP" } else { "checkingDL" }
+    } else if t.state == 5 || (t.state == 1 && !t.is_active && !t.is_open) {
+        if t.complete { "queuedUP" } else { "queuedDL" }
+    } else if !t.is_open || !t.is_active {
+        if t.complete { "pausedUP" } else { "pausedDL" }
+    } else if t.complete && t.is_active && up_rate > 0 {
         "uploading"
-    } else if !t.complete && t.is_active {
+    } else if !t.complete && t.is_active && down_rate > 0 {
         "downloading"
+    } else if t.complete && t.is_active {
+        "stalledUP"
+    } else if !t.complete && t.is_active {
+        "stalledDL"
     } else if t.complete {
         "stalledUP"
     } else if t.state == 1 {
@@ -4608,7 +4675,7 @@ fn required_resolved_hashes(
     // Do not delegate existence semantics to the backend. Transmission and
     // some other compatibility targets can acknowledge an unknown id as a
     // successful no-op, which would turn a typo into a false-successful
-    // mutation. Resolve each target against the sidecar cache and preserve
+    // mutation. Resolve each target against the compatible-client service cache and preserve
     // its canonical spelling for downstream cache/backend operations.
     let mut resolved = Vec::with_capacity(hashes.len());
     for hash in hashes {
@@ -4749,11 +4816,7 @@ async fn update_cached_lifecycle_state(
     hash: &str,
     action: &str,
 ) -> std::result::Result<(), String> {
-    let Some((state, active, open)) = (match action {
-        "start" => Some((1, false, true)),
-        "stop" => Some((0, false, false)),
-        _ => None,
-    }) else {
+    let Some((state, active, open)) = cached_lifecycle_projection(action) else {
         return Ok(());
     };
     let hash = hash.to_owned();
@@ -4764,11 +4827,23 @@ async fn update_cached_lifecycle_state(
     .map_err(|error| error.to_string())
 }
 
+fn cached_lifecycle_projection(action: &str) -> Option<(i64, bool, bool)> {
+    match action {
+        // A successful start/resume means the torrent is started immediately;
+        // throughput may still be zero, but that is a stalled transfer, not a
+        // stopped one. The next backend sync will refine the live rates.
+        "start" => Some((1, true, true)),
+        "stop" => Some((0, false, false)),
+        _ => None,
+    }
+}
+
 fn map_sort(s: &str) -> &str {
     match s {
         "name" => "name",
         "size" => "size",
         "added_on" => "added",
+        "completion_on" => "completed",
         "ratio" => "ratio",
         "dlspeed" => "speed_down",
         "upspeed" => "speed_up",

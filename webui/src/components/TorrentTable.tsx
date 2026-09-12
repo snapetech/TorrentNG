@@ -68,7 +68,7 @@ interface EtaDisplay {
 }
 
 function fmtEta(t: TorrentSummary, live?: SmoothedLiveRate): EtaDisplay {
-  if (t.state === 5 || (t.message && !t.is_active)) {
+  if (t.state === 3) {
     return {
       label: '—',
       title: t.message ? `Unavailable: ${t.message}` : 'Torrent is in an error state',
@@ -78,7 +78,7 @@ function fmtEta(t: TorrentSummary, live?: SmoothedLiveRate): EtaDisplay {
   if (t.state === 4) {
     return { label: 'Meta…', title: 'Waiting for torrent metadata', color: 'var(--muted)' }
   }
-  if (t.state === 3) {
+  if (t.state === 5) {
     return { label: 'Queued', title: 'Waiting to download', color: 'var(--muted)' }
   }
   if (t.state === 2) {
@@ -94,9 +94,6 @@ function fmtEta(t: TorrentSummary, live?: SmoothedLiveRate): EtaDisplay {
   const remaining = remainingBytes(t, live)
   if (remaining === 0 || t.complete) {
     return { label: 'Done', title: 'Complete', color: 'var(--success)' }
-  }
-  if (t.message && !t.is_active) {
-    return { label: '—', title: `Unavailable: ${t.message}`, color: 'var(--danger)' }
   }
   if (t.state === 0 || !t.is_open) {
     return { label: 'Paused', title: 'Paused or stopped', color: 'var(--faint)' }
@@ -131,11 +128,11 @@ function shortPath(path: string): string {
 }
 
 function statusLabel(t: TorrentSummary): { label: string; accessibleLabel: string; color: string } {
-  if (t.state === 5 || (t.message && !t.is_active)) return { label: 'Error', accessibleLabel: 'Error', color: 'var(--danger)' }
+  if (t.state === 3) return { label: 'Error', accessibleLabel: 'Error', color: 'var(--danger)' }
   if (t.state === 0) return { label: 'Stopped', accessibleLabel: 'Stopped', color: 'var(--faint)' }
   if (t.state === 2) return { label: 'Checking', accessibleLabel: 'Checking', color: 'var(--warning)' }
   if (t.state === 4) return { label: 'Metadata', accessibleLabel: 'Waiting for metadata', color: 'var(--muted)' }
-  if (t.state === 3) return { label: 'Queued', accessibleLabel: 'Queued', color: 'var(--muted)' }
+  if (t.state === 5) return { label: 'Queued', accessibleLabel: 'Queued', color: 'var(--muted)' }
   if (t.complete && t.is_active) return { label: 'Seeding', accessibleLabel: 'Seeding', color: 'var(--success)' }
   if (!t.complete && t.is_active) return { label: 'DL', accessibleLabel: 'Downloading', color: 'var(--accent)' }
   if (t.is_open) return { label: 'Stalled', accessibleLabel: 'Stalled', color: 'var(--warning)' }
@@ -143,11 +140,11 @@ function statusLabel(t: TorrentSummary): { label: string; accessibleLabel: strin
 }
 
 function rowAccent(t: TorrentSummary): string {
-  if (t.state === 5 || (t.message && !t.is_active)) return 'var(--danger)'
+  if (t.state === 3) return 'var(--danger)'
   if (t.state === 0) return 'var(--faint)'
   if (t.state === 2) return 'var(--warning)'
   if (t.state === 4) return 'var(--muted)'
-  if (t.state === 3) return 'var(--muted)'
+  if (t.state === 5) return 'var(--muted)'
   if (t.complete && t.is_active) return 'var(--success)'
   if (!t.complete && t.is_active) return 'var(--accent)'
   if (t.is_open) return 'var(--warning)'

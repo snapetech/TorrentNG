@@ -174,7 +174,7 @@ pub struct DbConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct AuthConfig {
-    /// Pre-shared bearer/session tokens accepted by the native API.
+    /// Pre-shared bearer/session tokens accepted by the TorrentNG API.
     pub api_tokens: Vec<String>,
     /// Optional newline-delimited token file. Values are appended to
     /// `api_tokens` while loading a config file, which lets container and

@@ -772,29 +772,31 @@ fn map_torrent(t: QbitTorrent) -> Result<RawTorrent> {
         .state
         .filter(|state| !state.trim().is_empty())
         .ok_or_else(|| anyhow::anyhow!("qBittorrent torrent omitted state"))?;
-    let complete = matches!(
-        state_name.as_str(),
-        "uploading" | "stalledUP" | "queuedUP" | "checkingUP" | "forcedUP"
-    );
-    let is_active = !matches!(
-        state_name.as_str(),
-        "pausedUP" | "pausedDL" | "stoppedUP" | "stoppedDL" | "error" | "missingFiles"
-    );
     let message = if matches!(state_name.as_str(), "error" | "missingFiles") {
         state_name.clone()
     } else {
         String::new()
     };
     let size_bytes = qbit_nonnegative_i64(t.size, "size")?;
-    let bytes_done = qbit_nonnegative_i64(t.completed, "completed")?;
-    if bytes_done > size_bytes {
+    let reported_bytes_done = qbit_nonnegative_i64(t.completed, "completed")?;
+    if reported_bytes_done > size_bytes {
         bail!(
             "qBittorrent torrent {} reports {} completed bytes for size {}",
             hash,
-            bytes_done,
+            reported_bytes_done,
             size_bytes
         );
     }
+    let complete = matches!(
+        state_name.as_str(),
+        "uploading" | "stalledUP" | "queuedUP" | "checkingUP" | "forcedUP"
+    ) || (size_bytes > 0 && reported_bytes_done >= size_bytes);
+    let bytes_done = if complete {
+        size_bytes
+    } else {
+        reported_bytes_done
+    };
+    let (state, is_active, is_open) = qbit_state_projection(&state_name);
     let category = t.category.unwrap_or_default();
     let save_path = t
         .save_path
@@ -824,9 +826,9 @@ fn map_torrent(t: QbitTorrent) -> Result<RawTorrent> {
         down_total: qbit_nonnegative_i64(t.downloaded, "downloaded")?,
         ratio: super::ratio_milli(Some(ratio)),
         is_active,
-        is_open: is_active,
+        is_open,
         complete,
-        state: if message.is_empty() { 1 } else { 3 },
+        state,
         priority: t
             .priority
             .ok_or_else(|| anyhow::anyhow!("qBittorrent torrent {} omitted priority", hash))?,
@@ -846,6 +848,21 @@ fn map_torrent(t: QbitTorrent) -> Result<RawTorrent> {
         tracker_url: t.tracker.unwrap_or_default(),
         tags: t.tags.unwrap_or_default(),
     })
+}
+
+/// Project qBittorrent's detailed state strings into the compact cache model.
+/// Keep queued and metadata states distinct from active transfers; otherwise
+/// the compatibility cache reports paused/queued/metadata torrents as
+/// downloading or seeding.
+fn qbit_state_projection(state: &str) -> (i64, bool, bool) {
+    match state {
+        "error" | "missingFiles" => (3, false, false),
+        "pausedUP" | "pausedDL" | "stoppedUP" | "stoppedDL" => (0, false, false),
+        "queuedUP" | "queuedDL" => (5, false, false),
+        "metaDL" | "downloadingMetadata" => (4, false, true),
+        "checkingUP" | "checkingDL" | "checkingResumeData" => (2, true, true),
+        _ => (1, true, true),
+    }
 }
 
 fn map_tracker((idx, tracker): (usize, QbitTracker)) -> Result<RawTracker> {
@@ -931,6 +948,31 @@ fn qbit_optional_nonnegative_i64(value: Option<i64>, index: usize, field: &str) 
 mod tests {
     use super::*;
 
+    fn torrent_fixture(state: &str, size: i64, completed: i64) -> QbitTorrent {
+        QbitTorrent {
+            hash: format!("{state}-hash"),
+            name: state.to_owned(),
+            size: Some(size),
+            completed: Some(completed),
+            dlspeed: Some(0),
+            upspeed: Some(0),
+            uploaded: Some(0),
+            downloaded: Some(0),
+            ratio: Some(0.0),
+            state: Some(state.to_owned()),
+            priority: Some(0),
+            category: Some(String::new()),
+            save_path: Some("/downloads".to_owned()),
+            added_on: Some(0),
+            completion_on: Some(0),
+            num_complete: Some(0),
+            num_seeds: Some(0),
+            num_leechs: Some(0),
+            tracker: Some(String::new()),
+            tags: Some(String::new()),
+        }
+    }
+
     #[test]
     fn qbit_mutation_failures_in_http_200_bodies_are_rejected() {
         assert!(validate_qbit_mutation_body(b"", "api/v2/torrents/pause").is_ok());
@@ -969,6 +1011,31 @@ mod tests {
         assert_eq!(qbit_sync_filter("missingFiles"), "missingFiles");
         assert_eq!(qbit_sync_filter("main"), "all");
         assert_eq!(qbit_sync_filter("unexpected"), "all");
+    }
+
+    #[test]
+    fn qbit_torrent_projection_preserves_lifecycle_states() {
+        for (state_name, state, active, open) in [
+            ("pausedDL", 0, false, false),
+            ("queuedDL", 5, false, false),
+            ("metaDL", 4, false, true),
+            ("checkingDL", 2, true, true),
+            ("downloading", 1, true, true),
+            ("error", 3, false, false),
+        ] {
+            let mapped = map_torrent(torrent_fixture(state_name, 100, 0)).unwrap();
+            assert_eq!(mapped.state, state, "state {state_name}");
+            assert_eq!(mapped.is_active, active, "active state {state_name}");
+            assert_eq!(mapped.is_open, open, "open state {state_name}");
+        }
+
+        let paused_complete = map_torrent(torrent_fixture("pausedUP", 100, 100)).unwrap();
+        assert_eq!(paused_complete.state, 0);
+        assert!(!paused_complete.is_active);
+        assert!(paused_complete.complete);
+
+        let uploading_with_short_progress = map_torrent(torrent_fixture("uploading", 100, 25)).unwrap();
+        assert_eq!(uploading_with_short_progress.bytes_done, 100);
     }
 
     #[test]

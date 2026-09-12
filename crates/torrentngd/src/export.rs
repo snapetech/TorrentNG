@@ -1,9 +1,9 @@
-//! `torrentngd export` — reverse migration: project native state back into
+//! `torrentngd export` — reverse migration: project TorrentNG-client state back into
 //! another client so a user can leave TorrentNG without losing seeding state.
 //!
-//! Dry-run is the default and is read-only against the native DB, persisted
+//! Dry-run is the default and is read-only against the TorrentNG-client DB, persisted
 //! `.torrent` blobs, and fast-resume state. `--apply` writes the target
-//! client's layout under `--to`. The native state is never modified.
+//! client's layout under `--to`. TorrentNG-client state is never modified.
 
 use std::io;
 use std::path::PathBuf;
@@ -14,7 +14,7 @@ use rt_migrate::export::{ExportFormat, ExportPlan};
 use crate::migrate::{confirm, load_config};
 
 const USAGE: &str = "\
-torrentngd export — project native state back into another client
+torrentngd export — project TorrentNG-client state back into another client
 
 USAGE:
     torrentngd export --format <FMT> --to <DIR> [OPTIONS]
@@ -28,11 +28,11 @@ OPTIONS:
     --apply            write the export (default: dry-run report only)
     --report <FILE>    also write the markdown dry-run report to FILE
     --config <FILE>    config file (else TORRENTNGD_CONFIG / defaults);
-                       locates the native DB, .torrent blobs, and fastresume
+                       locates the TorrentNG-client DB, .torrent blobs, and fastresume
     --yes              skip the confirmation prompt with --apply
     -h, --help         show this help
 
-The native state is read-only. The dry-run report and post-apply summary
+TorrentNG-client state is read-only. The dry-run report and post-apply summary
 break torrents into recheck-free / complete-only / metadata-only /
 torrent-only so you can see how much seeding state survives the move.
 Generic always works (copies .torrent files + a manifest; destination
@@ -123,13 +123,13 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
 
     if !db_path.is_file() {
         bail!(
-            "no native database at {} (is this the right --config?)",
+            "no TorrentNG-client database at {} (is this the right --config?)",
             db_path.display()
         );
     }
 
     let plan = ExportPlan::new(args.format, &db_path, &blob_dir, &fastresume_dir)
-        .map_err(|e| anyhow!("reading native state failed: {e}"))?;
+        .map_err(|e| anyhow!("reading TorrentNG-client state failed: {e}"))?;
 
     let report = plan.to_markdown();
     println!("{report}");

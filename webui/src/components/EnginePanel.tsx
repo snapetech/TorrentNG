@@ -26,7 +26,7 @@ export function EnginePanel() {
         <h2 id="backend-title" style={{ fontSize: 13, margin: 0, color: 'var(--text)' }}>Backend</h2>
         {data && (
           <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-            <Badge ok text={data.backend.type} />
+            <Badge ok text={backendDisplayName(data.backend.type)} />
             {isRtorrent && <Badge ok={driftProblems === 0} text={driftProblems === 0 ? 'profile clean' : `${driftProblems} drift`} />}
             {isRtorrent && <Badge ok={data.capabilities.every(c => c.available)} text={`${data.capabilities.filter(c => c.available).length}/${data.capabilities.length} XMLRPC`} />}
             <button
@@ -69,7 +69,7 @@ export function EnginePanel() {
 function BackendSummary({ data }: { data: EngineDiagnostics }) {
   const caps = data.backend.capabilities
   const rows: Array<[string, string]> = [
-    ['Type', data.backend.type],
+    ['Type', backendDisplayName(data.backend.type)],
     ['Tags', yesNo(caps.supports_tags)],
     ['Categories', yesNo(caps.supports_categories)],
     ['File priority', yesNo(caps.supports_file_priority)],
@@ -133,11 +133,11 @@ function Provenance({ data }: { data: EngineDiagnostics }) {
     <Panel>
       <Subhead>Provenance</Subhead>
       <Rows rows={[
-        ['TorrentNG', p.daemon_version ?? p.sidecar_version],
+        ['TorrentNG', p.daemon_version ?? p.sidecar_version ?? 'unknown'],
         ...(data.backend.type === 'rtorrent' ? [
           ['rTorrent', p.rtorrent_version ?? 'unknown'],
           ['libtorrent', p.libtorrent_version ?? 'unknown'],
-          ['XMLRPC', p.xmlrpc_backend],
+          ['XMLRPC', p.xmlrpc_backend ?? 'not applicable'],
           ['Packaged rTorrent', p.packaged_rtorrent_version ?? 'not declared'],
           ['Packaged libtorrent', p.packaged_libtorrent_version ?? 'not declared'],
           ['Patches', p.patch_set.length ? p.patch_set.join(', ') : 'none declared'],
@@ -149,6 +149,10 @@ function Provenance({ data }: { data: EngineDiagnostics }) {
 
 function yesNo(value: boolean): string {
   return value ? 'yes' : 'no'
+}
+
+function backendDisplayName(type: string): string {
+  return type === 'torrentng' ? 'TorrentNG client' : type
 }
 
 function Capabilities({ data }: { data: EngineDiagnostics }) {

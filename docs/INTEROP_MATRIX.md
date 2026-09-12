@@ -1,8 +1,8 @@
 # Docker Interop Matrix
 
 The Docker interop matrix is the release certification harness for proving that
-`torrentngd` works with common BitTorrent clients and with real legal public
-swarms. It runs the native daemon beside qBittorrent, Transmission, Deluge,
+the TorrentNG client works with common BitTorrent clients and with real legal
+public swarms. It runs `torrentngd` beside qBittorrent, Transmission, Deluge,
 rTorrent, opentracker, and a fixture HTTP server.
 
 The runner is:
@@ -152,7 +152,7 @@ Extended local coverage is enabled by default with `INTEROP_EXTENDED_LOCAL=1`.
 | `rust-webseed-only` | Webseed-only torrent with no peer availability counts. | Rust completes from fixture HTTP and the hash matches |
 | `rust-explicit-peer-private` | Private trackerless torrent with an explicit Transmission peer. | Rust completes after explicit peer injection and the hash matches |
 | `rust-restart-recovery` | Restart during an active download from Transmission. | Rust recovers, reconnects, completes, and verifies the hash |
-| `rust-api-facades` | API health while transfers are active. | Native, qBit-compatible, Transmission facade, Deluge facade, health, and metrics endpoints return without 5xx failures |
+| `rust-api-facades` | API health while transfers are active. | TorrentNG, qBit-compatible, Transmission facade, Deluge facade, health, and metrics endpoints return without 5xx failures |
 
 Run only the extended local cases:
 
@@ -347,7 +347,7 @@ active:
 
 | Surface | Endpoints or calls |
 |---|---|
-| Native | `/health`, `/metrics`, `/api/v1/torrents` |
+| TorrentNG client | `/health`, `/metrics`, `/api/v1/torrents` |
 | qBittorrent-compatible | `/api/qb/v2/torrents/info`, `/api/qb/v2/sync/maindata`, `/api/qb/v2/transfer/info` |
 | Transmission RPC facade | `session-stats`, `torrent-get` |
 | Deluge JSON-RPC facade | `web.update_ui`, `core.get_torrents_status` |
@@ -415,7 +415,7 @@ Default host ports avoid the common Linux ephemeral range:
 
 ## Release Gate
 
-Use these gates before treating native-engine interop as release-ready:
+Use these gates before treating TorrentNG-client interop as release-ready:
 
 ```sh
 cargo test --workspace

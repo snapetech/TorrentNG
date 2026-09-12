@@ -38,8 +38,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::state::{
-    native_i64, native_usize_i64, torrent_summary, AppState, JsonMap, TorrentSnapshot,
-    TorrentSnapshotError,
+    torrent_summary, torrentng_i64, torrentng_usize_i64, AppState, JsonMap, TorrentSnapshot,
+    TorrentSnapshotError, TorrentSnapshotItem,
 };
 
 const SSE_INITIAL_BATCH_DEFAULT: usize = 500;
@@ -65,7 +65,7 @@ struct MetricsHealth {
     subsystem: Option<EngineSubsystemHealth>,
 }
 
-/// `POST /api/v1/auth/login` — native WebUI session probe.
+/// `POST /api/v1/auth/login` — TorrentNG WebUI session probe.
 pub async fn auth_login(State(state): State<AppState>, body: String) -> impl IntoResponse {
     let token = auth_form_token(&body);
     if !state.api_tokens.is_empty() {
@@ -113,7 +113,7 @@ pub async fn auth_login(State(state): State<AppState>, body: String) -> impl Int
         .into_response()
 }
 
-/// `POST /api/v1/auth/logout` — native WebUI logout probe.
+/// `POST /api/v1/auth/logout` — TorrentNG WebUI logout probe.
 pub async fn auth_logout() -> impl IntoResponse {
     (
         StatusCode::OK,
@@ -243,7 +243,7 @@ pub async fn live_torrent_stats(
                         operation = "live_torrent_stats",
                         result = "error",
                         error = %error,
-                        "native live torrent stats query failed"
+                        "TorrentNG live torrent stats query failed"
                     );
                     return (
                         StatusCode::SERVICE_UNAVAILABLE,
@@ -346,12 +346,12 @@ pub async fn list_torrents(
         Some(indices) => indices
             .iter()
             .filter_map(|index| snapshot.torrents.get(*index))
-            .filter(|item| torrent_matches_summary(&item.summary, &query))
+            .filter(|item| torrent_matches_summary(item, &query))
             .count(),
         None => snapshot
             .torrents
             .iter()
-            .filter(|item| torrent_matches_summary(&item.summary, &query))
+            .filter(|item| torrent_matches_summary(item, &query))
             .count(),
     };
     let limit = query.limit.unwrap_or(200).clamp(1, 5_000);
@@ -383,7 +383,7 @@ pub async fn list_torrents(
             .torrents
             .get(*index)
             .expect("snapshot index is valid");
-        if !torrent_matches_summary(&item.summary, &query) {
+        if !torrent_matches_summary(item, &query) {
             continue;
         }
         if skipped < offset {
@@ -437,7 +437,7 @@ async fn tracker_filter_hashes(
         return Ok(None);
     };
     let Some(engine) = &state.engine else {
-        return Err("native engine is required for tracker filtering".to_owned());
+        return Err("TorrentNG client is required for tracker filtering".to_owned());
     };
     engine
         .torrent_hashes_by_tracker(tracker.to_owned())
@@ -491,6 +491,8 @@ fn indexed_status_states(status: Option<&str>) -> Vec<&'static str> {
             | "running"
             | "inactive"
             | "resumed"
+            | "seeding"
+            | "downloading"
             | "stalled"
             | "stalled_uploading"
             | "stalled_downloading"
@@ -499,17 +501,16 @@ fn indexed_status_states(status: Option<&str>) -> Vec<&'static str> {
         ) => Vec::new(),
         Some("stopped") => vec!["stopped", "paused"],
         Some("checking") => vec!["checking"],
-        Some("downloading") => vec!["downloading"],
-        Some("error") => vec!["error"],
+        Some("error" | "errored") => vec!["error"],
         Some("metadata_pending") => vec!["metadata_pending"],
         Some("paused") => vec!["paused"],
         Some("queued") => vec!["queued"],
-        Some("seeding") => vec!["seeding"],
         _ => Vec::new(),
     }
 }
 
-fn torrent_matches_summary(entry: &TorrentSummary, query: &TorrentListQuery) -> bool {
+fn torrent_matches_summary(item: &TorrentSnapshotItem, query: &TorrentListQuery) -> bool {
+    let entry = &item.summary;
     if let Some(filter) = query
         .filter
         .as_deref()
@@ -531,7 +532,7 @@ fn torrent_matches_summary(entry: &TorrentSummary, query: &TorrentListQuery) -> 
     {
         let status = status.to_ascii_lowercase();
         let state = entry.state.as_str();
-        let (complete, active, open) = native_summary_flags(entry);
+        let (complete, active, open) = torrentng_summary_flags(entry, item.amount_left);
         let matches = match status.as_str() {
             "active" | "resumed" => active,
             "running" => open,
@@ -540,6 +541,7 @@ fn torrent_matches_summary(entry: &TorrentSummary, query: &TorrentListQuery) -> 
             "downloading" => !complete && active,
             "completed" | "complete" => complete,
             "stopped" => matches!(state, "stopped" | "paused"),
+            "error" | "errored" => state == "error",
             "tracker_error" => entry
                 .tracker_message
                 .as_deref()
@@ -567,10 +569,9 @@ fn torrent_matches_summary(entry: &TorrentSummary, query: &TorrentListQuery) -> 
     true
 }
 
-fn native_summary_flags(entry: &TorrentSummary) -> (bool, bool, bool) {
+fn torrentng_summary_flags(entry: &TorrentSummary, amount_left: u64) -> (bool, bool, bool) {
     let state = entry.state.as_str();
-    let complete =
-        state == "seeding" || (entry.total_length > 0 && entry.downloaded >= entry.total_length);
+    let complete = state == "seeding" || (entry.total_length > 0 && amount_left == 0);
     let active = matches!(state, "downloading" | "seeding" | "checking");
     let open = matches!(
         state,
@@ -606,7 +607,7 @@ pub async fn add_torrent(
             StatusCode::SERVICE_UNAVAILABLE,
             Json(
                 serde_json::to_value(ApiError::internal(
-                    "native engine is not available".to_owned(),
+                    "TorrentNG client is not available".to_owned(),
                 ))
                 .unwrap(),
             ),
@@ -770,8 +771,8 @@ pub async fn get_torrent(
             };
             let detail = TorrentDetail {
                 summary,
-                piece_length: native_i64(meta.piece_length),
-                piece_count: native_usize_i64(meta.piece_count),
+                piece_length: torrentng_i64(meta.piece_length),
+                piece_count: torrentng_usize_i64(meta.piece_count),
                 is_private: meta.is_private,
                 trackers: meta.trackers,
                 files: meta
@@ -780,7 +781,7 @@ pub async fn get_torrent(
                     .map(|file| FileInfo {
                         file_index: file.index,
                         path: file.path,
-                        length: native_i64(file.length),
+                        length: torrentng_i64(file.length),
                         priority: file.priority.clamp(0, 2) as u8,
                     })
                     .collect(),
@@ -1097,7 +1098,8 @@ pub async fn transfer_limits(State(state): State<AppState>) -> impl IntoResponse
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(
-                serde_json::to_value(ApiError::internal("native engine is not available")).unwrap(),
+                serde_json::to_value(ApiError::internal("TorrentNG client is not available"))
+                    .unwrap(),
             ),
         )
             .into_response();
@@ -1130,7 +1132,7 @@ pub async fn transfer_info(State(state): State<AppState>) -> impl IntoResponse {
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(
                         serde_json::to_value(ApiError::internal(format!(
-                            "native engine statistics are unavailable: {error}"
+                            "TorrentNG client statistics are unavailable: {error}"
                         )))
                         .unwrap(),
                     ),
@@ -1145,7 +1147,7 @@ pub async fn transfer_info(State(state): State<AppState>) -> impl IntoResponse {
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(
                         serde_json::to_value(ApiError::internal(format!(
-                            "native engine transfer limits are unavailable: {error}"
+                            "TorrentNG client transfer limits are unavailable: {error}"
                         )))
                         .unwrap(),
                     ),
@@ -1181,7 +1183,7 @@ pub async fn transfer_info(State(state): State<AppState>) -> impl IntoResponse {
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(
                         serde_json::to_value(ApiError::internal(format!(
-                            "native transfer snapshot is unavailable: {error:?}"
+                            "TorrentNG transfer snapshot is unavailable: {error:?}"
                         )))
                         .unwrap(),
                     ),
@@ -1234,7 +1236,8 @@ pub async fn update_transfer_limits(
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(
-                serde_json::to_value(ApiError::internal("native engine is not available")).unwrap(),
+                serde_json::to_value(ApiError::internal("TorrentNG client is not available"))
+                    .unwrap(),
             ),
         )
             .into_response();
@@ -1274,7 +1277,8 @@ pub async fn session_features(State(state): State<AppState>) -> impl IntoRespons
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(
-                serde_json::to_value(ApiError::internal("native engine is not available")).unwrap(),
+                serde_json::to_value(ApiError::internal("TorrentNG client is not available"))
+                    .unwrap(),
             ),
         )
             .into_response();
@@ -1306,7 +1310,8 @@ pub async fn update_session_features(
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(
-                serde_json::to_value(ApiError::internal("native engine is not available")).unwrap(),
+                serde_json::to_value(ApiError::internal("TorrentNG client is not available"))
+                    .unwrap(),
             ),
         )
             .into_response();
@@ -1349,7 +1354,8 @@ pub async fn torrent_limits(
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(
-                serde_json::to_value(ApiError::internal("native engine is not available")).unwrap(),
+                serde_json::to_value(ApiError::internal("TorrentNG client is not available"))
+                    .unwrap(),
             ),
         )
             .into_response();
@@ -1381,7 +1387,8 @@ pub async fn update_torrent_limits(
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(
-                serde_json::to_value(ApiError::internal("native engine is not available")).unwrap(),
+                serde_json::to_value(ApiError::internal("TorrentNG client is not available"))
+                    .unwrap(),
             ),
         )
             .into_response();
@@ -1472,7 +1479,8 @@ pub async fn add_torrent_peers(
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(
-                serde_json::to_value(ApiError::internal("native engine is not available")).unwrap(),
+                serde_json::to_value(ApiError::internal("TorrentNG client is not available"))
+                    .unwrap(),
             ),
         )
             .into_response();
@@ -1526,7 +1534,8 @@ pub async fn update_torrent_queue(
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(
-                serde_json::to_value(ApiError::internal("native engine is not available")).unwrap(),
+                serde_json::to_value(ApiError::internal("TorrentNG client is not available"))
+                    .unwrap(),
             ),
         )
             .into_response();
@@ -1732,7 +1741,7 @@ pub async fn list_torrent_files(
                 .map(|file| FileInfo {
                     file_index: file.index,
                     path: file.path,
-                    length: native_i64(file.length),
+                    length: torrentng_i64(file.length),
                     priority: file.priority.clamp(0, 2) as u8,
                 })
                 .collect();
@@ -2671,7 +2680,7 @@ pub async fn storage(State(state): State<AppState>) -> impl IntoResponse {
             StatusCode::SERVICE_UNAVAILABLE,
             Json(
                 serde_json::to_value(ApiError::internal(
-                    "native engine is not available".to_owned(),
+                    "TorrentNG client is not available".to_owned(),
                 ))
                 .unwrap(),
             ),
@@ -2909,7 +2918,7 @@ pub async fn delete_tag(
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// `POST /api/v1/bulk/{action}` — apply a native bulk operation.
+/// `POST /api/v1/bulk/{action}` — apply a TorrentNG bulk operation.
 pub async fn bulk_action(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3021,7 +3030,7 @@ pub async fn cross_seed(
     }
     if !dry_run && errors.is_empty() {
         let Some(engine) = &state.engine else {
-            errors.push("native engine is not available".to_owned());
+            errors.push("TorrentNG client is not available".to_owned());
             return (
                 StatusCode::OK,
                 Json(BulkResponse {
@@ -3157,7 +3166,7 @@ pub async fn sidebar_facets(
                 shared_candidates
                     .iter()
                     .filter_map(|index| snapshot.torrents.get(*index))
-                    .filter(|item| status_bucket_matches(&item.summary, key))
+                    .filter(|item| status_bucket_matches(item, key))
                     .count(),
             )
         })
@@ -3196,9 +3205,10 @@ fn torrent_list_query_validation_error(query: &TorrentListQuery) -> Option<&'sta
         .then_some("filter is limited to 256 bytes")
 }
 
-fn status_bucket_matches(entry: &TorrentSummary, bucket: &str) -> bool {
+fn status_bucket_matches(item: &TorrentSnapshotItem, bucket: &str) -> bool {
+    let entry = &item.summary;
     let state = entry.state.as_str();
-    let (complete, active, open) = native_summary_flags(entry);
+    let (complete, active, open) = torrentng_summary_flags(entry, item.amount_left);
     match bucket {
         "all" => true,
         "downloading" => !complete && active,
@@ -3209,7 +3219,7 @@ fn status_bucket_matches(entry: &TorrentSummary, bucket: &str) -> bool {
         "stopped" => matches!(state, "stopped" | "paused"),
         "active" | "resumed" => active,
         "inactive" => !active,
-        // The native summary intentionally does not include instantaneous
+        // The TorrentNG-client summary intentionally does not include instantaneous
         // rates; these buckets remain empty until a rate-aware list projection
         // exists rather than claiming every active torrent is stalled.
         "stalled" | "stalled_uploading" | "stalled_downloading" => false,
@@ -3315,7 +3325,8 @@ pub async fn set_user_agent(
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(
-                serde_json::to_value(ApiError::internal("native engine is not available")).unwrap(),
+                serde_json::to_value(ApiError::internal("TorrentNG client is not available"))
+                    .unwrap(),
             ),
         )
             .into_response();
@@ -3331,7 +3342,7 @@ pub async fn set_user_agent(
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// `GET /api/v1/engine` — native engine diagnostics for the WebUI.
+/// `GET /api/v1/engine` — TorrentNG-client diagnostics for the WebUI.
 pub async fn engine_diagnostics(State(state): State<AppState>) -> impl IntoResponse {
     let user_agent = state.user_agent.read().await.clone();
     let engine_alive = state.engine.as_ref().is_some_and(EngineHandle::is_alive);
@@ -3352,53 +3363,53 @@ pub async fn engine_diagnostics(State(state): State<AppState>) -> impl IntoRespo
         StatusCode::OK,
         Json(serde_json::json!({
             "backend": {
-                "type": "native",
-                "name": "TorrentNG Native",
+                "type": "torrentng",
+                "name": "TorrentNG client",
                 "version": env!("CARGO_PKG_VERSION"),
                 "connected": engine_alive,
                 "alive": engine_alive,
                 "peer_listener_healthy": peer_listener_healthy,
-                "capabilities": native_webui_backend_capabilities(),
+                "capabilities": torrentng_client_webui_capabilities(),
             },
             "provenance": {
                 "daemon_version": env!("CARGO_PKG_VERSION"),
                 "sidecar_version": null,
                 "rtorrent_version": null,
                 "libtorrent_version": null,
-                "xmlrpc_backend": "native",
+                "xmlrpc_backend": null,
                 "packaged_rtorrent_version": null,
                 "packaged_libtorrent_version": null,
-                "patch_set": ["torrentng-native"],
+                "patch_set": [],
             },
-            "capabilities": native_capability_rows(),
+            "capabilities": torrentng_client_capability_rows(),
             "http": {
                 "user_agent": probe_value(Ok(serde_json::json!(user_agent))),
-                "current_open": probe_value(Err("not exposed by native backend".to_owned())),
-                "max_total_connections": probe_value(Err("not exposed by native backend".to_owned())),
-                "max_host_connections": probe_value(Err("not exposed by native backend".to_owned())),
-                "max_cache_connections": probe_value(Err("not exposed by native backend".to_owned())),
-                "dns_cache_timeout": probe_value(Err("not exposed by native backend".to_owned())),
-                "proxy_address": probe_value(Err("not exposed by native backend".to_owned())),
-                "ca_path": probe_value(Err("not exposed by native backend".to_owned())),
-                "ca_cert": probe_value(Err("not exposed by native backend".to_owned())),
-                "ssl_verify_peer": probe_value(Err("not exposed by native backend".to_owned())),
-                "ssl_verify_host": probe_value(Err("not exposed by native backend".to_owned())),
+                "current_open": probe_value(Err("not exposed by the TorrentNG client runtime".to_owned())),
+                "max_total_connections": probe_value(Err("not exposed by the TorrentNG client runtime".to_owned())),
+                "max_host_connections": probe_value(Err("not exposed by the TorrentNG client runtime".to_owned())),
+                "max_cache_connections": probe_value(Err("not exposed by the TorrentNG client runtime".to_owned())),
+                "dns_cache_timeout": probe_value(Err("not exposed by the TorrentNG client runtime".to_owned())),
+                "proxy_address": probe_value(Err("not exposed by the TorrentNG client runtime".to_owned())),
+                "ca_path": probe_value(Err("not exposed by the TorrentNG client runtime".to_owned())),
+                "ca_cert": probe_value(Err("not exposed by the TorrentNG client runtime".to_owned())),
+                "ssl_verify_peer": probe_value(Err("not exposed by the TorrentNG client runtime".to_owned())),
+                "ssl_verify_host": probe_value(Err("not exposed by the TorrentNG client runtime".to_owned())),
             },
             "dht": {
                 "enabled": probe_value(network_features
                     .as_ref()
                     .map(|features| serde_json::json!(features.dht))
-                    .ok_or_else(|| "native network features are unavailable".to_owned())),
-                "port": probe_value(Err("not exposed by native backend".to_owned())),
-                "override_port": probe_value(Err("not exposed by native backend".to_owned())),
-                "listen_port": probe_value(Err("not exposed by native backend".to_owned())),
-                "listen_range": probe_value(Err("not exposed by native backend".to_owned())),
+                    .ok_or_else(|| "TorrentNG network features are unavailable".to_owned())),
+                "port": probe_value(Err("not exposed by the TorrentNG client runtime".to_owned())),
+                "override_port": probe_value(Err("not exposed by the TorrentNG client runtime".to_owned())),
+                "listen_port": probe_value(Err("not exposed by the TorrentNG client runtime".to_owned())),
+                "listen_range": probe_value(Err("not exposed by the TorrentNG client runtime".to_owned())),
                 "pex": probe_value(network_features
                     .as_ref()
                     .map(|features| serde_json::json!(features.pex))
-                    .ok_or_else(|| "native network features are unavailable".to_owned())),
-                "udp_trackers": probe_value(Err("not exposed by native backend".to_owned())),
-                "statistics": probe_value(Ok(serde_json::json!("native"))),
+                    .ok_or_else(|| "TorrentNG network features are unavailable".to_owned())),
+                "udp_trackers": probe_value(Err("not exposed by the TorrentNG client runtime".to_owned())),
+                "statistics": probe_value(Ok(serde_json::json!("TorrentNG client"))),
             },
             "drift": Vec::<serde_json::Value>::new(),
         })),
@@ -3408,7 +3419,7 @@ pub async fn engine_diagnostics(State(state): State<AppState>) -> impl IntoRespo
 
 /// `GET /api/v1/engine/commands` — rTorrent command index.
 pub async fn engine_commands(State(_state): State<AppState>) -> impl IntoResponse {
-    // This endpoint describes an rTorrent XMLRPC command catalog. Native has
+    // This endpoint describes an rTorrent XMLRPC command catalog. The TorrentNG client has
     // no XMLRPC command registry, so returning a hand-written subset as
     // `ok=true` is a compatibility lie and causes clients to probe commands
     // that are not actually exposed by this route.
@@ -3420,14 +3431,14 @@ pub async fn engine_commands(State(_state): State<AppState>) -> impl IntoRespons
             "commands": [],
             "error": {
                 "code": "NOT_IMPLEMENTED",
-                "message": "native backend does not expose an rTorrent XMLRPC command index"
+            "message": "the TorrentNG client runtime does not expose an rTorrent XMLRPC command index"
             },
         })),
     )
         .into_response()
 }
 
-/// `GET /api/v1/engine/rtorrent-settings` — native compatibility settings.
+/// `GET /api/v1/engine/rtorrent-settings` — rTorrent compatibility settings.
 pub async fn rtorrent_settings(State(state): State<AppState>) -> impl IntoResponse {
     (
         StatusCode::OK,
@@ -3446,7 +3457,7 @@ pub async fn rtorrent_settings(State(state): State<AppState>) -> impl IntoRespon
         .into_response()
 }
 
-/// `PUT /api/v1/engine/rtorrent-settings` — apply the native-compatible subset.
+/// `PUT /api/v1/engine/rtorrent-settings` — apply the TorrentNG-compatible subset.
 pub async fn save_rtorrent_settings(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3476,7 +3487,7 @@ pub async fn save_rtorrent_settings(
                 "unsupported": unsupported,
                 "error": {
                     "code": "NOT_IMPLEMENTED",
-                    "message": "native backend only supports runtime user-agent changes; configuration overlays are not implemented"
+                    "message": "the TorrentNG client only supports runtime user-agent changes; configuration overlays are not implemented"
                 }
             })),
         )
@@ -3487,7 +3498,7 @@ pub async fn save_rtorrent_settings(
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(
-                    serde_json::to_value(ApiError::internal("native engine is not available"))
+                    serde_json::to_value(ApiError::internal("TorrentNG client is not available"))
                         .unwrap(),
                 ),
             )
@@ -3525,7 +3536,7 @@ fn rtorrent_setting_keys(value: &serde_json::Value) -> Vec<String> {
         .unwrap_or_else(|| vec!["value".to_owned()])
 }
 
-/// `POST /api/v1/engine/restart` — native restart is supervisor-owned.
+/// `POST /api/v1/engine/restart` — TorrentNG client restart is supervisor-owned.
 pub async fn restart_engine(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3540,7 +3551,7 @@ pub async fn restart_engine(
             "restart_required": false,
             "error": {
                 "code": "NOT_IMPLEMENTED",
-                "message": "native restart is owned by the torrentngd supervisor"
+                "message": "TorrentNG client restart is owned by the torrentngd supervisor"
             },
         })),
     )
@@ -3568,7 +3579,7 @@ pub async fn storage_preview_plan(
             StatusCode::SERVICE_UNAVAILABLE,
             Json(
                 serde_json::to_value(ApiError::internal(
-                    "native engine is not available".to_owned(),
+                    "TorrentNG client is not available".to_owned(),
                 ))
                 .unwrap(),
             ),
@@ -3629,7 +3640,7 @@ pub async fn storage_execute_plan(
             StatusCode::SERVICE_UNAVAILABLE,
             Json(
                 serde_json::to_value(ApiError::internal(
-                    "native engine is not available".to_owned(),
+                    "TorrentNG client is not available".to_owned(),
                 ))
                 .unwrap(),
             ),
@@ -3693,7 +3704,7 @@ pub async fn list_jobs(State(state): State<AppState>) -> impl IntoResponse {
             StatusCode::SERVICE_UNAVAILABLE,
             Json(
                 serde_json::to_value(ApiError::internal(
-                    "native engine is not available".to_owned(),
+                    "TorrentNG client is not available".to_owned(),
                 ))
                 .unwrap(),
             ),
@@ -3729,7 +3740,7 @@ async fn control_job(
             StatusCode::SERVICE_UNAVAILABLE,
             Json(
                 serde_json::to_value(ApiError::internal(
-                    "native engine is not available".to_owned(),
+                    "TorrentNG client is not available".to_owned(),
                 ))
                 .unwrap(),
             ),
@@ -4130,7 +4141,7 @@ pub async fn diagnose_torrent(
             StatusCode::SERVICE_UNAVAILABLE,
             Json(
                 serde_json::to_value(ApiError::internal(
-                    "native engine is not available".to_owned(),
+                    "TorrentNG client is not available".to_owned(),
                 ))
                 .unwrap(),
             ),
@@ -4157,7 +4168,7 @@ pub async fn diagnose_torrent(
     }
 }
 
-/// `GET /health` — native engine readiness probe.
+/// `GET /health` — TorrentNG-client readiness probe.
 pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let torrent_count = state.registry.read().await.len();
     let engine_alive = state.engine.as_ref().is_some_and(EngineHandle::is_alive);
@@ -4175,7 +4186,7 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
                         operation = "health",
                         result = "unavailable",
                         error = %error,
-                        "native engine health command failed"
+                        "TorrentNG client health command failed"
                     );
                     None
                 }
@@ -4205,7 +4216,7 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
             "native_engine": ready,
             "torrent_count": torrent_count,
             "engine": {
-                "mode": if ready { "native" } else { "unavailable" },
+                "mode": if ready { "torrentng" } else { "unavailable" },
                 "source_of_truth": if ready { "sqlite_session_db" } else { "registry_only" },
                 "track1_sidecar_required": false,
                 "subsystems": {
@@ -4222,13 +4233,13 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
                         "healthy": subsystem_health.map(|health| health.dht_healthy).unwrap_or(false)
                     }
                 },
-                "capabilities": native_engine_capabilities(),
+                "capabilities": torrentng_client_capabilities(),
             },
         })),
     )
 }
 
-fn native_engine_capabilities() -> serde_json::Value {
+fn torrentng_client_capabilities() -> serde_json::Value {
     let utp_outgoing_policy = std::env::var("TNG_UTP_OUTGOING").ok().unwrap_or_else(|| {
         if std::env::var_os("TNG_ENABLE_UTP_OUTGOING").is_some() {
             "prefer".to_owned()
@@ -4323,6 +4334,10 @@ fn native_engine_capabilities() -> serde_json::Value {
             "private_torrent_dht_pex_lsd_default_off": true,
         },
         "compatibility": {
+            "torrentng_rest": true,
+            "torrentng_sse": true,
+            // Retain the former capability keys for clients that persisted
+            // the old manifest; the TorrentNG names above are canonical.
             "native_rest": true,
             "native_sse": true,
             "qbittorrent_v2": true,
@@ -4345,6 +4360,8 @@ fn native_engine_capabilities() -> serde_json::Value {
         },
         "assurance": {
             "implemented": [
+                "torrentng_rest",
+                "torrentng_sse",
                 "native_rest",
                 "native_sse",
                 "durable_session",
@@ -4378,7 +4395,7 @@ fn native_engine_capabilities() -> serde_json::Value {
     })
 }
 
-fn native_webui_backend_capabilities() -> serde_json::Value {
+fn torrentng_client_webui_capabilities() -> serde_json::Value {
     serde_json::json!({
         "supports_tags": true,
         "supports_categories": true,
@@ -4406,9 +4423,9 @@ fn native_webui_backend_capabilities() -> serde_json::Value {
     })
 }
 
-fn native_capability_rows() -> Vec<serde_json::Value> {
+fn torrentng_client_capability_rows() -> Vec<serde_json::Value> {
     [
-        ("Native torrent lifecycle", "implemented"),
+        ("TorrentNG-client torrent lifecycle", "implemented"),
         ("Storage roots and move planning", "implemented"),
         ("Categories and tags", "implemented"),
         ("Tracker edit and reannounce", "implemented"),
@@ -4442,7 +4459,7 @@ fn utp_incoming_env_enabled(value: &str) -> bool {
     )
 }
 
-/// `GET /metrics` — Prometheus text exposition for native engine state.
+/// `GET /metrics` — Prometheus text exposition for TorrentNG-client state.
 pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     let Some(engine) = &state.engine else {
         return (
@@ -4451,7 +4468,7 @@ pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("text/plain; version=0.0.4"),
             )],
-            "# native engine unavailable\n".to_owned(),
+            "# TorrentNG client unavailable\n".to_owned(),
         );
     };
     match engine.stats().await {
@@ -4467,7 +4484,7 @@ pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
                             operation = "metrics",
                             result = "unavailable",
                             error = %error,
-                            "native engine health command failed while rendering metrics"
+                            "TorrentNG client health command failed while rendering metrics"
                         );
                         None
                     }
@@ -4493,7 +4510,7 @@ pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("text/plain; version=0.0.4"),
             )],
-            format!("# failed to collect native engine metrics: {e}\n"),
+            format!("# failed to collect TorrentNG-client metrics: {e}\n"),
         ),
     }
 }
@@ -4912,14 +4929,14 @@ fn render_metrics_with_health(
         &mut out,
         "torrentng_engine_alive",
         "gauge",
-        "Native engine actor liveness (1=alive, 0=unavailable)",
+        "TorrentNG client actor liveness (1=alive, 0=unavailable)",
         u64::from(health.engine_alive),
     );
     metric(
         &mut out,
         "torrentng_peer_listener_healthy",
         "gauge",
-        "Native peer listener health (1=healthy, 0=unhealthy)",
+        "TorrentNG peer listener health (1=healthy, 0=unhealthy)",
         u64::from(health.peer_listener_healthy),
     );
     metric(
@@ -4948,7 +4965,7 @@ fn render_metrics_with_health(
         &mut out,
         "torrentng_dht_enabled",
         "gauge",
-        "Whether the native DHT is enabled (1=enabled, 0=disabled)",
+        "Whether the TorrentNG-client DHT is enabled (1=enabled, 0=disabled)",
         u64::from(
             health
                 .subsystem
@@ -4959,7 +4976,7 @@ fn render_metrics_with_health(
         &mut out,
         "torrentng_dht_healthy",
         "gauge",
-        "Native DHT task health (1=healthy, 0=unhealthy)",
+        "TorrentNG-client DHT task health (1=healthy, 0=unhealthy)",
         u64::from(
             health
                 .subsystem
@@ -5212,7 +5229,7 @@ fn render_metrics_with_health(
         &mut out,
         "torrentng_dht_routing_nodes",
         "gauge",
-        "DHT routing table nodes retained by the native DHT task",
+        "DHT routing table nodes retained by the TorrentNG-client DHT task",
         stats.dht_routing_nodes,
     );
     metric(
@@ -5233,7 +5250,7 @@ fn render_metrics_with_health(
         &mut out,
         "torrentng_dht_tracked_torrents",
         "gauge",
-        "Torrents registered with the native DHT task",
+        "Torrents registered with the TorrentNG-client DHT task",
         stats.dht_tracked_torrents,
     );
     metric(
@@ -6127,7 +6144,7 @@ fn render_metrics_with_health(
         &mut out,
         "torrentng_api_snapshot_refreshes_total",
         "counter",
-        "Immutable API snapshot generations built across native and qBittorrent facades",
+        "Immutable API snapshot generations built across TorrentNG-client and qBittorrent facades",
         api_metrics.snapshot_refreshes_total,
     );
     metric(
@@ -6176,7 +6193,7 @@ fn render_metrics_with_health(
         &mut out,
         "torrentng_api_sse_clients",
         "gauge",
-        "Currently active native SSE clients",
+        "Currently active TorrentNG SSE clients",
         api_metrics.sse_clients,
     );
     metric(
@@ -6530,7 +6547,7 @@ async fn matching_hashes_for_json_rule(
         .filter(|value| !value.is_empty());
     let tracker_hashes = if let Some(tracker) = tracker {
         let Some(engine) = &state.engine else {
-            return Err("native engine is required for tracker matching".to_owned());
+            return Err("TorrentNG client is required for tracker matching".to_owned());
         };
         Some(
             engine
@@ -6603,7 +6620,7 @@ async fn apply_ratio_group_action(
     let Some(engine) = &state.engine else {
         return (
             Vec::new(),
-            vec!["native engine is required to apply ratio groups".to_owned()],
+            vec!["TorrentNG client is required to apply ratio groups".to_owned()],
         );
     };
     let ratio_limit = match ratio_group_limit(rule) {
@@ -6653,7 +6670,7 @@ async fn apply_json_rule_action(
                 let Some(engine) = &state.engine else {
                     return (
                         Vec::new(),
-                        vec!["native engine is not available".to_owned()],
+                        vec!["TorrentNG client is not available".to_owned()],
                     );
                 };
                 engine
@@ -6676,15 +6693,15 @@ async fn apply_json_rule_action(
                         None => Err("target_path is required".to_owned()),
                     }
                 } else {
-                    Err("native engine is not available".to_owned())
+                    Err("TorrentNG client is not available".to_owned())
                 }
             }
             "webhook" => Err(
-                "native engine workflows do not execute webhooks; use the sidecar workflow route"
+                "TorrentNG-client workflows do not execute webhooks; use the compatible-client service workflow route"
                     .to_owned(),
             ),
             "script" => Err(
-                "native engine workflows do not execute scripts; use the sidecar workflow route"
+                "TorrentNG-client workflows do not execute scripts; use the compatible-client service workflow route"
                     .to_owned(),
             ),
             _ => Err(format!("unsupported workflow action: {action}")),
@@ -6716,7 +6733,7 @@ async fn apply_rss_rule_matches(
     let Some(engine) = &state.engine else {
         return (
             Vec::new(),
-            vec!["native engine is not available".to_owned()],
+            vec!["TorrentNG client is not available".to_owned()],
         );
     };
     if !link
@@ -6726,7 +6743,7 @@ async fn apply_rss_rule_matches(
         return (
             Vec::new(),
             vec![
-                "native RSS apply supports magnet links only; HTTP torrent downloads are a sidecar capability"
+                "TorrentNG-client RSS apply supports magnet links only; HTTP torrent downloads are a compatible-client service capability"
                     .to_owned(),
             ],
         );
@@ -6837,7 +6854,7 @@ async fn run_bulk_action(
         "start" => transition_registry_torrent(state, hash, TorrentState::Downloading).await,
         "stop" => transition_registry_torrent(state, hash, TorrentState::Paused).await,
         "recheck" => transition_registry_torrent(state, hash, TorrentState::Checking).await,
-        "reannounce" => Err("native engine is not available".to_owned()),
+        "reannounce" => Err("TorrentNG client is not available".to_owned()),
         "set-category" => {
             set_registry_category(
                 state,
@@ -7057,7 +7074,7 @@ async fn control_torrent(
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(
                         serde_json::to_value(ApiError::internal(
-                            "native engine is not available".to_owned(),
+                            "TorrentNG client is not available".to_owned(),
                         ))
                         .unwrap(),
                     ),
@@ -7601,8 +7618,8 @@ mod tests {
     }
 
     #[test]
-    fn native_engine_capabilities_cover_rewrite_surface() {
-        let capabilities = native_engine_capabilities();
+    fn torrentng_client_capabilities_cover_rewrite_surface() {
+        let capabilities = torrentng_client_capabilities();
         assert_eq!(capabilities["torrent_identity"]["v2"], true);
         assert_eq!(
             capabilities["metadata"]["pure_v2_metadata_completion"],
@@ -7652,10 +7669,10 @@ mod tests {
     }
 
     #[test]
-    fn native_webui_capabilities_match_mounted_routes() {
-        let capabilities = native_webui_backend_capabilities();
+    fn torrentng_client_webui_capabilities_match_mounted_routes() {
+        let capabilities = torrentng_client_webui_capabilities();
 
-        // These are backed by the mounted qBittorrent/native handlers. The
+        // These are backed by the mounted qBittorrent/TorrentNG handlers. The
         // old manifest reported false for four routes that were already
         // implemented, making the WebUI hide working operations.
         for field in [
@@ -7667,7 +7684,7 @@ mod tests {
             assert_eq!(capabilities[field], true, "{field} must match its route");
         }
         // The remaining force-start/automatic-management mutations are
-        // intentionally rejected by the native engine until they have real
+        // intentionally rejected by the TorrentNG client until they have real
         // scheduler semantics.
         assert_eq!(capabilities["supports_mode_flags"], false);
     }
@@ -8189,7 +8206,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_torrents_applies_native_ui_status_and_media_filters() {
+    async fn list_torrents_applies_torrentng_ui_status_and_media_filters() {
         let state = AppState::new();
         let mut tracker_error = TorrentEntry::new(
             "a".repeat(40),
@@ -8255,7 +8272,138 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_sidebar_facets_apply_shared_filters_and_include_tracker_errors() {
+    async fn torrentng_status_filters_use_live_amount_left_not_cumulative_downloads() {
+        let state = AppState::new();
+        let mut rechecked = TorrentEntry::new(
+            "d".repeat(40),
+            "Rechecked with missing piece".to_owned(),
+            "/data".into(),
+        );
+        rechecked.state = TorrentState::Downloading;
+        rechecked.total_length = 100;
+        rechecked.amount_left = 50;
+        // TransferStats is cumulative and can remain at the old completed
+        // total after a recheck discovers missing pieces. amount_left is the
+        // live completion invariant used by the session registry.
+        rechecked.stats.downloaded = 100;
+        {
+            let mut registry = state.registry.write().await;
+            registry.add(rechecked).unwrap();
+        }
+        let app = build_router(state);
+
+        for (status, expected_total) in [("downloading", 1), ("completed", 0)] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/v1/torrents?status={status}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{status}");
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["total"], expected_total, "{status}");
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/sidebar-facets")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"]["downloading"], 1);
+        assert_eq!(json["status"]["completed"], 0);
+    }
+
+    #[test]
+    fn derived_transfer_buckets_are_not_reduced_to_lifecycle_state() {
+        // A checking or downloading row can be complete according to the
+        // live amount_left invariant while its lifecycle string has not yet
+        // advanced to "seeding". Exact bucket predicates must still see it.
+        assert!(indexed_status_states(Some("seeding")).is_empty());
+        assert!(indexed_status_states(Some("downloading")).is_empty());
+    }
+
+    #[tokio::test]
+    async fn torrentng_seeding_filter_includes_complete_active_downloading_rows() {
+        let state = AppState::new();
+        let mut entry = TorrentEntry::new(
+            "e".repeat(40),
+            "Complete before lifecycle transition".to_owned(),
+            "/data".into(),
+        );
+        entry.state = TorrentState::Downloading;
+        entry.total_length = 100;
+        entry.amount_left = 0;
+        entry.stats.downloaded = 250;
+        {
+            let mut registry = state.registry.write().await;
+            registry.add(entry).unwrap();
+        }
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/torrents?status=seeding")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["total"], 1);
+        assert_eq!(json["torrents"][0]["info_hash"], "e".repeat(40));
+    }
+
+    #[tokio::test]
+    async fn list_torrents_accepts_errored_status_alias() {
+        let state = AppState::new();
+        let mut errored =
+            TorrentEntry::new("c".repeat(40), "Errored torrent".to_owned(), "/data".into());
+        errored.state = TorrentState::Error;
+        {
+            let mut registry = state.registry.write().await;
+            registry.add(errored).unwrap();
+        }
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/torrents?status=errored")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["total"], 1);
+        assert_eq!(json["torrents"][0]["info_hash"], "c".repeat(40));
+    }
+
+    #[tokio::test]
+    async fn torrentng_sidebar_facets_apply_shared_filters_and_include_tracker_errors() {
         let state = AppState::new();
         let mut tracker_error = TorrentEntry::new(
             "a".repeat(40),
@@ -8513,7 +8661,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_alias_and_projection_routes_are_exposed() {
+    async fn torrentng_alias_and_projection_routes_are_exposed() {
         let (app, hash) = setup_app_with_torrent().await;
         for (method, uri, expected) in [
             (
@@ -8566,7 +8714,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_rtorrent_compatibility_routes_fail_closed() {
+    async fn torrentng_rtorrent_compatibility_routes_fail_closed() {
         let state = AppState::new();
         let app = build_router(state);
 
@@ -8632,7 +8780,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_login_issues_session_cookie_and_validates_tokens() {
+    async fn torrentng_login_issues_session_cookie_and_validates_tokens() {
         let app = build_router(AppState::with_tokens(None, vec!["secret token".to_owned()]));
         let bad = app
             .clone()
@@ -8669,8 +8817,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idempotency_key_replays_native_mutation_and_rejects_reuse() {
-        let state = AppState::with_tokens(None, vec!["native-secret".to_owned()]);
+    async fn idempotency_key_replays_torrentng_mutation_and_rejects_reuse() {
+        let state = AppState::with_tokens(None, vec!["torrentng-secret".to_owned()]);
         let hash = "c".repeat(40);
         {
             let mut registry = state.registry.write().await;
@@ -8690,7 +8838,7 @@ mod tests {
                     .method("PUT")
                     .uri(format!("/api/v1/torrents/{hash}/category"))
                     .header("content-type", "application/json")
-                    .header("authorization", "Bearer native-secret")
+                    .header("authorization", "Bearer torrentng-secret")
                     .header("idempotency-key", "category-c")
                     .body(Body::from(r#"{"category":"films"}"#))
                     .unwrap(),
@@ -8706,7 +8854,7 @@ mod tests {
                     .method("PUT")
                     .uri(format!("/api/v1/torrents/{hash}/category"))
                     .header("content-type", "application/json")
-                    .header("authorization", "Bearer native-secret")
+                    .header("authorization", "Bearer torrentng-secret")
                     .header("idempotency-key", "category-c")
                     .body(Body::from(r#"{"category":"films"}"#))
                     .unwrap(),
@@ -8751,7 +8899,7 @@ mod tests {
                     .method("PUT")
                     .uri(format!("/api/v1/torrents/{hash}/category"))
                     .header("content-type", "application/json")
-                    .header("authorization", "Bearer native-secret")
+                    .header("authorization", "Bearer torrentng-secret")
                     .header("idempotency-key", "category-c")
                     .body(Body::from(r#"{"category":"tv"}"#))
                     .unwrap(),
@@ -9178,6 +9326,7 @@ mod tests {
             state: "downloading".to_owned(),
             total_length: 1024,
             downloaded: 0,
+            amount_left: 1024,
             uploaded: 0,
             ratio: 0.0,
             save_path: "/data".to_owned(),
@@ -9303,7 +9452,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_hash_resolution_preserves_unknown_targets_for_error_reporting() {
+    async fn torrentng_hash_resolution_preserves_unknown_targets_for_error_reporting() {
         let state = AppState::new();
         let known = "a".repeat(40);
         {

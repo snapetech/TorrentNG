@@ -1,11 +1,11 @@
 # rt-api-deluge
 
-Deluge JSON-RPC compatibility facade over native engine state.
+Deluge JSON-RPC compatibility facade over TorrentNG-client state.
 
 ## Status: Implemented — best-effort compatibility facade
 
 This crate exposes `/json` and `/deluge/json` for clients that expect Deluge
-method names. It is intentionally a compatibility projection over the native
+method names. It is intentionally a compatibility projection over the TorrentNG
 registry, not a Deluge-compatible internal model.
 
 Supported surfaces include auth/session probes, host status, torrent list/detail

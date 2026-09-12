@@ -5,50 +5,50 @@
 **TorrentNG** is a modern torrent management stack targeting headless
 power-user seeding at scale (10k–100k torrents, 200+ TB).
 
-It is NOT a ruTorrent cosmetic fork. It now has a native Rust BitTorrent engine
-rewrite as the primary runtime path, while the rTorrent-backed sidecar remains
-available for migration, compatibility testing, and users who still want the
-upstream rTorrent core.
+It is NOT a ruTorrent cosmetic fork. TorrentNG is the shared WebUI/API product:
+it can sit in front of an existing compatible torrent client or run its own
+first-party TorrentNG client, `torrentngd`.
 
-It has two runtime tracks:
+It has two backend arrangements:
 
-1. **Native rewrite** — `crates/torrentngd` owns torrent state, peer traffic,
-   tracker state, storage, rechecks, jobs, metrics, native REST/SSE, and
-   compatibility API projections.
-2. **Track 1 rTorrent core** — rTorrent/libtorrent remains the BitTorrent
-   engine; `sidecar/torrentng` bridges trusted local SCGI/XMLRPC into the
-   WebUI, native REST facade, qBittorrent-compatible API, cache, auth, and
-   metrics.
+1. **TorrentNG client** — `crates/torrentngd` owns torrent state, peer traffic,
+   tracker state, storage, rechecks, jobs, metrics, REST/SSE, and compatibility
+   API projections.
+2. **Compatible-client integration** — `sidecar/torrentng` hosts the shared
+   WebUI/API and connects it to rTorrent, qBittorrent, Transmission, Deluge,
+   or a separate `torrentngd`; the selected client owns transfer and session
+   state.
 
 Important layers:
 
 1. **engine-profile/** — Pinned rTorrent build config, SCGI/socket setup, tuning profiles
-2. **sidecar/** — Rust daemon for rTorrent-backed deployments
-3. **crates/** — Native engine crates and `torrentngd`
-4. **webui/** — React+Vite frontend, virtualized table, talks to native/sidecar APIs
+2. **sidecar/** — Rust compatible-client WebUI/API service (path retained for compatibility)
+3. **crates/** — TorrentNG client crates and `torrentngd`
+4. **webui/** — React+Vite frontend, virtualized table, talks to TorrentNG or compatible-client APIs
 5. **deploy/** — Docker, Compose, systemd, nginx, Kubernetes examples
 
 ## Core architectural decisions
 
 - External tools (Prowlarr, Sonarr, Radarr, autobrr, cross-seed) talk to TorrentNG through compatibility APIs, primarily the qBittorrent-compatible API.
-- The browser talks to native REST/SSE/WebSocket-facing APIs, never directly to rTorrent SCGI.
-- In native mode, `torrentngd` is the source of truth and does not require rTorrent, XMLRPC, or the sidecar.
-- In Track 1 sidecar mode, **nothing** talks to rTorrent XMLRPC/SCGI directly except the sidecar.
-- The sidecar runs beside rTorrent, communicates over a trusted local SCGI socket, and remains a migration/facade layer.
+- The browser talks to TorrentNG REST/SSE/WebSocket-facing APIs, never directly to rTorrent SCGI.
+- When `torrentngd` serves the product directly, it is the source of truth and does not require rTorrent, XMLRPC, or the integration service.
+- In a compatible-client integration, **nothing** talks to rTorrent XMLRPC/SCGI directly except the `torrentng` service.
+- The compatible-client service may run beside rTorrent or connect to a remote supported client; it remains a WebUI/API, cache, and migration/facade layer.
 - Auth, tokens, CSRF/OIDC/reverse-proxy trust policy live in the TorrentNG API layer.
 
-## Why the native rewrite exists
+## Why the TorrentNG client exists
 
-Track 1 fixed immediate rTorrent/ruTorrent pain, but could not fix engine-level
-limits:
+The compatible-client integration fixes immediate rTorrent/ruTorrent control
+plane pain, but it cannot replace the selected client's transfer engine or fix
+engine-level limits:
 
 - rTorrent owns storage behavior and has no TorrentNG userspace disk scheduler.
 - Rechecks are not durable TorrentNG jobs with pause/resume/cancel semantics.
-- Torrent lifecycle history is limited compared with native structured events.
-- The sidecar must poll and translate XMLRPC state.
+- Torrent lifecycle history is limited compared with TorrentNG structured events.
+- The `torrentng` service must poll and translate XMLRPC state.
 - Engine behavior depends on rTorrent/libtorrent build details.
 - BEP 52/v2, compatibility facades, migration, and metrics are simpler when
-  projected from one native model.
+  projected from one TorrentNG-client model.
 
 See `docs/ENGINE_REWRITE.md` for the practical guide and `docs/ENGINE.md` for
 the deeper design.
@@ -76,11 +76,11 @@ rTorrent/libTorrent remains a strong baseline for large headless seed libraries:
 state tools before the daemon starts (run via `spawn_blocking`):
 
 - `torrentngd migrate --source <client> --from <dir> [--apply]` — import other
-  clients' state into the native model. Dry-run by default; `--apply` writes
+  clients' state into the TorrentNG client model. Dry-run by default; `--apply` writes
   DB rows + `rt-fastresume` state and persists `.torrent` blobs into
   `session_dir/torrents`. `--remap OLD=NEW`, `--policy verify|trust-hints|trust-all`.
 - `torrentngd export --format <client> --to <dir> [--apply]` — reverse
-  migration (anti-lock-in). Reads native state read-only, writes the target
+  migration (anti-lock-in). Reads TorrentNG-client state read-only, writes the target
   client layout.
 
 Both reuse `crates/rt-migrate` (`rt_migrate::export` for the reverse path) and
@@ -88,24 +88,24 @@ report fidelity buckets. Source code: `crates/torrentngd/src/{migrate,export}.rs
 Certification: `crates/rt-migrate/tests/round_trip_matrix.rs` (all clients ×
 import/export/round-trip) plus `scripts/migration_corpus_certification.sh`.
 
-## sidecar — Rust daemon
+## torrentng — compatible-client WebUI/API service
 
-**Entry:** `sidecar/src/main.rs`
+**Entry:** `sidecar/src/main.rs` (the source path is retained for compatibility)
 **Crates:** axum 0.7, tokio, serde/serde_json, toml, rusqlite (bundled), tracing, anyhow, quick-xml
 **Modules:**
 - `config` — TOML config loading, env override (`TNG_*`)
 - `rtorrent::client` — async XMLRPC/SCGI client over Unix socket or TCP
 - `rtorrent::torrents` — `d.multicall2` torrent query, CRUD ops, `set_user_agent`
 - `api::server` — axum router, AppState
-- `api::handlers` — native REST handlers including `GET/PUT /api/v1/settings/user-agent`
+- `api::handlers` — TorrentNG REST handlers including `GET/PUT /api/v1/settings/user-agent`
 - `api::ws` — WebSocket event broadcast
 - `qbcompat` — qBittorrent v2 API shim
 - `cache::db` — rusqlite schema, upsert/delete, WAL mode
 - `cache::query` — server-side filter/sort/paginate
-- `sync` — background tokio task: rTorrent poll → cache upsert → WS broadcast
+- `sync` — background tokio task: selected-client poll → cache upsert → WS broadcast
 
 **API surface:**
-- `/api/v1/...` — native JSON API
+- `/api/v1/...` — TorrentNG JSON API
 - `/api/v1/settings/user-agent` — GET/PUT user-agent (live, pushes to rTorrent)
 - `/api/qb/v2/...` — qBittorrent-compatible passthrough
 - `/ws` — WebSocket event stream
@@ -116,7 +116,7 @@ import/export/round-trip) plus `scripts/migration_corpus_certification.sh`.
 **Entry:** `webui/src/main.tsx`
 **Key constraints:**
 - Virtualized torrent table (TanStack Virtual or similar) — must handle 100k rows
-- Server-side sort/filter via native or sidecar API — never load all torrents to browser
+- Server-side sort/filter via TorrentNG or compatible-client API — never load all torrents to browser
 - No right-click dependency for mobile support
 - Delta sync via WebSocket — no full-refresh polling loops
 - Settings view includes `UserAgentPanel` component for live user-agent management
@@ -151,34 +151,39 @@ Every release must pass:
 - 15k torrents: UI first paint < 3s, filter < 500ms
 - 50k synthetic: compatibility API `/torrents/info` < 500ms
 - `/sync/maindata` delta < 50ms under normal churn
-- daemon/sidecar memory within release target at 15k torrents after 24h
+- TorrentNG-client/integration-service memory within release target at 15k torrents after 24h
 
-## Two-track strategy
+## Historical development tracks
 
-**Track 1 — rTorrent sidecar**: fix rTorrent/ruTorrent pain without replacing the engine. Phases 0–5. This remains available for migration and rTorrent-core comparison.
+**Track 1 — rTorrent compatible-client integration**: fix rTorrent/ruTorrent
+control-plane pain without replacing the transfer client. Phases 0–5. The
+historical track remains available as the rTorrent integration and comparison
+path.
 
-**Track 2 — Native Rust engine**: ground-up Rust BitTorrent daemon, 10k–100k torrents, 200+ TB, seeding-first. This is now the primary runtime path. See `docs/ENGINE_REWRITE.md` and `docs/ENGINE.md`.
+**Track 2 — TorrentNG client**: ground-up Rust BitTorrent client daemon,
+10k–100k torrents, 200+ TB, seeding-first. This is the first-party owned
+transfer path. See `docs/ENGINE_REWRITE.md` and `docs/ENGINE.md`.
 
 ### Track 1 phases
 
 - **Phase 0:** Audit rTorrent 0.16.x + ruTorrent 5.3.x breakages
 - **Phase 1:** Known-good distribution bundle (pinned versions, patched httprpc trust)
-- **Phase 2:** Sidecar daemon MVP (list/add/remove/start/stop/events)
+- **Phase 2:** Compatible-client service MVP (list/add/remove/start/stop/events)
 - **Phase 3:** qBittorrent API compatibility shim
 - **Phase 4:** Modern WebUI
 - **Phase 5:** Plugin/workflow platform
 
 ### Track 2 phases (summary)
 
-0. Research/design lock → 1. Foundation crates (bencode/metainfo/hash/piece-map) → 2. Storage + recheck engine → 3. Tracker engine → 4. TCP seeding MVP → 5. Session daemon → 6. qBit API compat v1 → 7. Downloading → 8. Scale hardening (15k/200TB) → 9. Web UI → 10. DHT/PEX/uTP → 11. BEP 52/v2 → 12. Production 1.0
+0. Research/design lock → 1. Foundation crates (bencode/metainfo/hash/piece-map) → 2. Storage + recheck client → 3. Tracker client → 4. TCP seeding MVP → 5. Session daemon → 6. qBit API compat v1 → 7. Downloading → 8. Scale hardening (15k/200TB) → 9. Web UI → 10. DHT/PEX/uTP → 11. BEP 52/v2 → 12. Production 1.0
 
 ## Conventions
 
-- Rust daemon/sidecar: axum + tokio; no unsafe except in deps; anyhow for errors in binary, thiserror for library errors
+- Rust services: axum + tokio; no unsafe except in deps; anyhow for errors in binaries, thiserror for library errors
 - WebUI: TypeScript strict, TanStack Query for server state, TanStack Virtual for table
 - No ORM; raw SQL via rusqlite with bundled SQLite (no system dep)
-- Native config file: `TORRENTNGD_CONFIG`, `~/.config/torrentngd/config.toml`, or `/etc/torrentngd/config.toml`
-- Sidecar config file: `~/.config/torrentng/config.toml` or `/etc/torrentng/config.toml`; env vars `TNG_*` override many sidecar fields
+- TorrentNG-client config file: `TORRENTNGD_CONFIG`, `~/.config/torrentngd/config.toml`, or `/etc/torrentngd/config.toml`
+- Compatible-client service config file: `~/.config/torrentng/config.toml` or `/etc/torrentng/config.toml`; env vars `TNG_*` override many service fields
 - All API responses: JSON, snake_case keys
 - Logs: structured JSON via tracing + tracing-subscriber JSON layer
 
@@ -189,8 +194,9 @@ Default: `rtorrent/0.16.11/0.16.11` (used in packaged releases).
 Pushed to rTorrent via `network.http.user_agent.set` on startup.
 Runtime update: `PUT /api/v1/settings/user-agent` or Settings panel in WebUI.
 Peer ID family prefix: `-lt100B-`, fixed. The other 12 bytes are generated
-and persisted per install (native: `<session_dir>/peer_id_suffix`; sidecar:
-`<data_dir>/peer_id_suffix`) — NOT a shared literal. A shared/hardcoded
+and persisted per install (TorrentNG client: `<session_dir>/peer_id_suffix`;
+compatible-client service: `<data_dir>/peer_id_suffix`) — NOT a shared literal.
+A shared/hardcoded
 peer_id suffix got a real user banned from a private tracker (MAM) for
 "running multiple instances of the same client," because every install
 without one presented the identical peer_id. Only set `[rtorrent] peer_id`

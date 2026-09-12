@@ -12,7 +12,8 @@ This handoff is retained as historical context, not as an active checklist.
 The storage-root authority, egress policy, shared HTTP transport, peer ingress,
 packed peer state, supervised persistence, snapshot/pagination, compatibility
 honesty, and metrics-privacy items described below are implemented in the
-current tree. The current verification set includes full native/sidecar tests,
+current tree. The current verification set includes full TorrentNG-client/
+compatible-client service tests,
 warnings-denied clippy, MSRV runs, authenticated release smoke, live fault
 containment, and API/SSE load; see
 [`BACKEND_AUDIT_BURN_DOWN.md`](BACKEND_AUDIT_BURN_DOWN.md).
@@ -23,7 +24,7 @@ storage, hostile-network runs, and long soak. If a new failure is found, add a
 new dated ledger entry with a reproducer rather than reopening these historical
 instructions by assumption.
 
-This branch already contains several hardening primitives and safety fixes, but some of the highest-impact integrations require editing very large files (`crates/rt-engine/src/engine.rs`, `crates/rt-engine/src/torrent_task.rs`, and sometimes native handlers). The connector write API only supports whole-file replacement for those files. I intentionally did not reconstruct those giant files blindly without a local build/test loop.
+This branch already contains several hardening primitives and safety fixes, but some of the highest-impact integrations require editing very large files (`crates/rt-engine/src/engine.rs`, `crates/rt-engine/src/torrent_task.rs`, and sometimes TorrentNG API handlers). The connector write API only supports whole-file replacement for those files. I intentionally did not reconstruct those giant files blindly without a local build/test loop.
 
 Branch: `hardening/ruthless-review-fixes`
 
@@ -35,7 +36,7 @@ Current high-value additions already present:
 - extended `CompactPieceBitmap` in `crates/rt-engine/src/tier.rs`
 - config knobs for ingress and egress hardening in `crates/rt-config/src/lib.rs`
 - metainfo numeric/cap hardening in `crates/rt-metainfo/src/parse.rs`
-- daemon and facade auth hardening in `crates/torrentngd/src/main.rs`, `crates/rt-api-native/src/router.rs`, and `crates/rt-api-qbit/*`
+- first-party client daemon and compatible-client facade auth hardening in `crates/torrentngd/src/main.rs`, `crates/rt-api-native/src/router.rs`, and `crates/rt-api-qbit/*`
 
 ## Historical must-do before merge
 
@@ -291,7 +292,7 @@ Do same for uTP accept path.
 
 Metrics:
 
-Expose `PeerIngressStats` via engine stats or native metrics.
+Expose `PeerIngressStats` via engine stats or TorrentNG-client metrics.
 
 Optimization:
 

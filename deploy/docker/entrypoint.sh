@@ -48,7 +48,7 @@ if [ "$BACKEND" = "rtorrent" ]; then
   chmod 660 "$RTORRENT_SOCKET"
 
   # A socket existing only means that rTorrent has created its SCGI listener;
-  # it may still be replaying a large session. Do not let the sidecar submit
+  # it may still be replaying a large session. Do not let the compatible-client service submit
   # identity RPCs into that startup window. This installation currently needs
   # about 130 seconds to replay 22k session entries; keep a margin for slower
   # storage conditions and allow an operator override when the session size
@@ -65,7 +65,7 @@ if [ "$BACKEND" = "rtorrent" ]; then
     sleep "$startup_grace_secs"
   fi
 else
-  echo "Starting TorrentNG sidecar with external backend: $BACKEND"
+  echo "Starting TorrentNG compatible-client service with external backend: $BACKEND"
 fi
 
 exec torrentng "$CONFIG_FILE"

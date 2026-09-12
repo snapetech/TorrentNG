@@ -1,24 +1,26 @@
 # Integration Compatibility Harness
 
-TorrentNG has compatibility coverage for both runtime modes. The target is
-universal in/out compatibility: client imports, API facades, automation flows,
-and wire-level interop all need evidence before they are considered complete.
+TorrentNG has compatibility coverage across the TorrentNG client and its
+compatible-client integrations. The target is broad in/out compatibility:
+client imports, API facades, automation flows, and wire-level interop all need
+evidence before they are considered complete. Compatibility remains
+capability-aware; a passing route probe does not imply full upstream parity.
 
-- Track 1 sidecar qBittorrent flows in `sidecar/tests/qbcompat.rs`.
-- Native compatibility API projections through `rt-api-qbit`,
+- Compatible-client qBittorrent flows in `sidecar/tests/qbcompat.rs`.
+- TorrentNG-client compatibility API projections through `rt-api-qbit`,
   `rt-api-transmission`, `rt-api-deluge`, and `rt-api-rtorrent`, included in
   `scripts/api_facade_certification.sh`.
 - The broad local compatibility gate in
   `scripts/universal_compatibility_certification.sh`, which covers API facades,
-  migration/fastresume, Track 1 qBit flows, native API, engine hooks, scale,
-  and storage topology. Set `UNIVERSAL_COMPAT_LIVE=1` for Docker client interop,
+  migration/fastresume, compatible-client qBit flows, TorrentNG REST,
+  client hooks, scale, and storage topology. Set `UNIVERSAL_COMPAT_LIVE=1` for Docker client interop,
   `UNIVERSAL_COMPAT_MOBILE=1` for live NZB360/Transdrone-style qBit read
   flows, and `UNIVERSAL_COMPAT_PUBLIC=1` for official public torrent downloads.
 
 The build backlog and source-to-implementation comparison live in
 `docs/CLIENT_COMPATIBILITY_MATRICES.md`.
 
-## Track 1 Sidecar Flows
+## Compatible-client Integration Flows
 
 Current named flows:
 
@@ -37,11 +39,15 @@ cargo test qb_integration_flow
 cargo test qb_extended_torrent_forms_parse
 ```
 
-These tests run against an in-memory sidecar and do not require a live rTorrent instance. Endpoints that call rTorrent are expected to fail gracefully; compatibility-only surfaces may return a documented projection, but mutators with no safe backend implementation must return an explicit unsupported/error result rather than a false success.
+These tests run against an in-memory compatible-client service and do not
+require a live rTorrent client. Endpoints that call rTorrent are expected to
+fail gracefully; compatibility-only surfaces may return a documented
+projection, but mutators with no safe backend implementation must return an
+explicit unsupported/error result rather than a false success.
 
-## Native Engine Compatibility
+## TorrentNG Client Compatibility
 
-Run the native compatibility projection tests:
+Run the TorrentNG-client compatibility projection tests:
 
 ```bash
 scripts/api_facade_certification.sh
@@ -54,13 +60,13 @@ Run the broad local compatibility gate:
 scripts/universal_compatibility_certification.sh
 ```
 
-Run the full native certification gate:
+Run the full TorrentNG-client certification gate:
 
 ```bash
 scripts/native_engine_certification_report.sh
 ```
 
-When a native daemon is running, bind the report to its live capability
+When a TorrentNG client daemon is running, bind the report to its live capability
 manifest:
 
 ```bash

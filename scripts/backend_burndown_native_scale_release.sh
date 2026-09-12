@@ -390,7 +390,7 @@ cp "$LOG_RESTART" "$ARTIFACT_DIR/restart.log"
 cp "$TMP_DIR"/*.json "$TMP_DIR"/*.txt "$ARTIFACT_DIR/"
 
 {
-  echo "# TorrentNG Native Release-Binary 100k Scale Evidence"
+  echo "# TorrentNG Client Release-Binary 100k Scale Evidence"
   echo
   echo "- Date UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "- Host: $(hostname)"
@@ -425,10 +425,10 @@ filesystem contention, or a production soak."
   echo
   echo "| Request | Result |"
   echo "|---|---:|"
-  echo "| Native page 1 (limit=2, total=$TORRENT_COUNT) | ${native_page_1_latency_ms} ms |"
-  echo "| Native page 2 (same snapshot) | ${native_page_2_latency_ms} ms |"
+  echo "| TorrentNG page 1 (limit=2, total=$TORRENT_COUNT) | ${native_page_1_latency_ms} ms |"
+  echo "| TorrentNG page 2 (same snapshot) | ${native_page_2_latency_ms} ms |"
   echo "| qBittorrent page (limit=200) | ${qbit_page_latency_ms} ms |"
-  echo "| Native transfer info | ${native_transfer_latency_ms} ms |"
+  echo "| TorrentNG transfer info | ${native_transfer_latency_ms} ms |"
   echo "| qBittorrent transfer info | ${qbit_transfer_latency_ms} ms |"
   echo "| Restore metrics | ${metrics_restore_latency_ms} ms |"
   echo

@@ -1,9 +1,9 @@
 {
   "openapi": "3.1.0",
   "info": {
-    "title": "TorrentNG Native API",
+    "title": "TorrentNG API",
     "version": "0.1.0",
-    "description": "Machine-readable contract for the implemented native /api/v1 JSON REST surface. Compatibility facades are documented by their client-specific matrices. Mutating requests accept an optional Idempotency-Key; successful responses may be replayed with Idempotency-Replayed: true. API tokens are bearer tokens or tng_session cookies."
+    "description": "Machine-readable contract for the implemented TorrentNG /api/v1 JSON REST surface. Compatibility facades are documented by their client-specific matrices. Mutating requests accept an optional Idempotency-Key; successful responses may be replayed with Idempotency-Replayed: true. API tokens are bearer tokens or tng_session cookies."
   },
   "servers": [{"url": "/"}],
   "security": [{"bearerAuth": []}, {"sessionCookie": []}],

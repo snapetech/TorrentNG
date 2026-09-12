@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Diagnostic script: check selected TorrentNG sidecar backend and HTTP health.
+# Diagnostic script: check the selected compatible client and TorrentNG service health.
 
 set -euo pipefail
 
@@ -63,7 +63,7 @@ else
 fi
 
 echo
-echo "--- Sidecar API ---"
+echo "--- TorrentNG compatible-client API ---"
 if command -v curl &>/dev/null; then
   HEALTH=$(curl -s "$SIDECAR/health" 2>/dev/null || echo '{}')
   if command -v jq &>/dev/null; then
@@ -78,9 +78,9 @@ if command -v curl &>/dev/null; then
     CACHED=$(echo "$HEALTH" | grep -o '"cached_torrents"[[:space:]]*:[[:space:]]*[0-9]*' | tr -dc '0-9')
   fi
   if [ "$STATUS" = "ok" ]; then
-    ok "Sidecar health: $STATUS"
+    ok "Compatible-client service health: $STATUS"
   else
-    fail "Sidecar health: ${STATUS:-unreachable}"
+    fail "Compatible-client service health: ${STATUS:-unreachable}"
   fi
   if [ "$BACKEND_STATUS" = "connected" ]; then
     ok "Backend connection: ${BACKEND_TYPE:-unknown} $BACKEND_STATUS"
@@ -89,7 +89,7 @@ if command -v curl &>/dev/null; then
   fi
   info "Cached torrents: ${CACHED:-unknown}"
 else
-  info "curl not available - skipping sidecar test"
+  info "curl not available - skipping compatible-client service test"
 fi
 
 echo

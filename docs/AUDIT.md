@@ -68,8 +68,8 @@ rTorrent 0.16.9 introduced a trusted/untrusted XMLRPC connection model. Connecti
 | Field | Status | Notes |
 |---|---|---|
 | Runtime support | ✅ | Packaged images expose `d.multicall.range` and `tng.live_summary` from `deploy/docker/patches/rtorrent-0.16.11-multicall-range.patch` |
-| Sidecar calling convention | ✅ | These calls still use rTorrent's normal leading target argument. For global calls the sidecar must send an empty string as argument 0, followed by the view/range parameters. |
-| Regression coverage | ✅ | `sidecar/src/rtorrent/torrents.rs` has tests that assert bounded list, nonzero-rate, and live-summary calls keep the required empty target argument. Removing it makes rTorrent return `invalid target` and the sidecar reports backend disconnected. |
+| Compatible-client service calling convention | ✅ | These calls still use rTorrent's normal leading target argument. For global calls the compatible-client service must send an empty string as argument 0, followed by the view/range parameters. |
+| Regression coverage | ✅ | `sidecar/src/rtorrent/torrents.rs` has tests that assert bounded list, nonzero-rate, and live-summary calls keep the required empty target argument. Removing it makes rTorrent return `invalid target` and the compatible-client service reports backend disconnected. |
 
 ### XMLRPC parsererror on torrent list
 

@@ -189,7 +189,7 @@ cp "$COMPOSE_FILE" "$RT_BACKUP/compose.yml"
 backup_manifest "$RT_BACKUP" "$RUN_DIR/rtorrent-backup.sha256"
 sha256sum -c "$RUN_DIR/rtorrent-backup.sha256" >/dev/null
 
-log "stopping TorrentNG and backing up native session"
+log "stopping TorrentNG and backing up TorrentNG-client session"
 compose stop -t 60 "$TORRENTNGD_SERVICE" || true
 copy_dir "$TORRENTNGD_SESSION_DIR" "$TNG_BACKUP"
 

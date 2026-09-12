@@ -1,10 +1,15 @@
 # webui/
 
 React + TypeScript + Vite frontend. It is backend-agnostic by design: the
-same UI talks to either engine track over the same API shapes — native
-`torrentngd` REST/SSE, or the rTorrent-backed sidecar's REST/WS — so switching
-which backend is running underneath does not require a different frontend
-build.
+same UI talks to the TorrentNG client (`torrentngd`) directly or to the
+TorrentNG WebUI/API service connected to a compatible client such as rTorrent,
+qBittorrent, Transmission, or Deluge. Switching the transfer client does not
+require a different frontend build.
+
+TorrentNG is the user-facing WebUI and automation surface. A compatible client
+continues to own transfer and session state, while `torrentngd` is TorrentNG's
+next-generation first-party client with its own storage, persistence, job, and
+protocol implementation.
 
 ## Constraints that shape this codebase
 
@@ -23,7 +28,7 @@ build.
 
 | Path | Purpose |
 |---|---|
-| `src/api/` | Typed API client for native and compat endpoints (`client.ts`) |
+| `src/api/` | Typed API client for TorrentNG and compatible-client endpoints (`client.ts`) |
 | `src/components/` | Reusable UI components (table, panels, forms) |
 | `src/hooks/` | TanStack Query hooks and other stateful logic |
 | `src/views/` | Top-level routed views |
@@ -44,18 +49,19 @@ npm run test:e2e  # Playwright browser tests
 ```
 
 The dev server (`vite.config.ts`) proxies `/api` and `/ws` to
-`http://localhost:8080` — start whichever backend you want to develop against
-on that port first (see the root README's
-[native quick start](../README.md#quick-start-native-mode), or
-[rTorrent sidecar mode](../README.md#rtorrent-sidecar-mode) for the sidecar).
+`http://localhost:8080` — start whichever TorrentNG service you want to
+develop against on that port first (see the root README's
+[TorrentNG client quick start](../README.md#quick-start-torrentng-client), or
+[compatible-client integration](../README.md#compatible-client-integration)).
 
-`npm run build` outputs to `../sidecar/static` by default (what the Track 1
-Docker image ships). Native builds override this with
+`npm run build` outputs to `../sidecar/static` by default (the
+compatible-client Docker image ships these assets). TorrentNG-client builds
+override this with
 `TNG_WEBUI_OUT_DIR=dist npm run build` — see `deploy/native/Dockerfile`.
 
 ## Related
 
-- [docs/API.md](../docs/API.md) — native and compatibility API surfaces this
+- [docs/API.md](../docs/API.md) — TorrentNG and compatibility API surfaces this
   UI consumes
 - [docs/WEBUI_AUDIT.md](../docs/WEBUI_AUDIT.md) — table alignment, status
   semantics, and known cross-client projection gaps

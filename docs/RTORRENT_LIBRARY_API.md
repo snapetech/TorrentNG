@@ -14,12 +14,12 @@ the library-boundary credential check; configured states must use
 `execute_xml_with_token`. The no-token `execute_xml` helper is reserved for
 local embedding and states with no configured credentials.
 
-The native `torrentngd` process does not mount this facade as an XML-RPC HTTP
+The `torrentngd` TorrentNG client does not mount this facade as an XML-RPC HTTP
 route. That is intentional: exposing the library helper directly would omit a
 server-owned bind address, authentication middleware, request/body limits,
 connection limits, timeout policy, and shutdown ownership. A consumer that
 needs rTorrent XML-RPC over HTTP must supply a separate adapter that enforces
-those controls, or use the existing Track 1 sidecar deployment.
+those controls, or use the compatible-client WebUI/API service.
 
 The public library contract is tested as an external crate consumer in
 `crates/rt-api-rtorrent/tests/library_entry_point.rs`, including credential

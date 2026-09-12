@@ -141,7 +141,7 @@ fn deluge_engine(state: &AppState) -> Result<&EngineHandle, String> {
     state
         .engine
         .as_ref()
-        .ok_or_else(|| "native engine is unavailable; mutation was not applied".to_owned())
+        .ok_or_else(|| "TorrentNG client is unavailable; mutation was not applied".to_owned())
 }
 
 #[derive(Debug, Deserialize)]
@@ -373,7 +373,7 @@ async fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Va
         "daemon.login" => Ok(json!(true)),
         "daemon.info" => Ok(json!({
             "version": "TorrentNG",
-            "libtorrent": "native",
+            "libtorrent": "TorrentNG client",
         })),
         "daemon.get_method_list" => Ok(json!(supported_methods())),
         "daemon.shutdown" => {
@@ -482,7 +482,7 @@ async fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Va
         "core.queue_down" => deluge_queue(state, params, QueueMove::Down).await,
         "core.queue_bottom" => deluge_queue(state, params, QueueMove::Bottom).await,
         "core.create_torrent" | "core.upload_plugin" | "core.rescan_plugins" => Err(
-            "unsupported Deluge method: native engine does not provide this operation".to_owned(),
+            "unsupported Deluge method: TorrentNG client does not provide this operation".to_owned(),
         ),
         "core.set_torrent_prioritize_first_last" => set_prioritize_first_last(state, params).await,
         "core.set_torrent_file_priorities" => set_file_priorities(state, params).await,
@@ -540,7 +540,7 @@ async fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Va
         "label.add" => add_label(state, params).await,
         "label.remove" => remove_label(state, params).await,
         "label.set_options" => Err(
-            "unsupported Deluge method: Label options have no native engine equivalent".to_owned(),
+            "unsupported Deluge method: Label options have no TorrentNG-client equivalent".to_owned(),
         ),
         "label.set_torrent" => {
             let hash = params
@@ -558,18 +558,18 @@ async fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Va
         }
         "core.get_free_space" => deluge_free_space(state).await,
         "core.set_config" => Err(
-            "unsupported Deluge method: core configuration is not writable through the native API"
+            "unsupported Deluge method: core configuration is not writable through the TorrentNG API"
                 .to_owned(),
         ),
         "core.get_listen_port" => {
-            Err("listen-port probing is not exposed by the native compatibility API".to_owned())
+            Err("listen-port probing is not exposed by the TorrentNG compatibility API".to_owned())
         }
         "core.get_external_ip" => Err(
-            "unsupported Deluge method: external IP discovery is not exposed by the native API"
+            "unsupported Deluge method: external IP discovery is not exposed by the TorrentNG API"
                 .to_owned(),
         ),
         "core.get_path_size" => Err(
-            "unsupported Deluge method: arbitrary filesystem size probes are not exposed by the native API"
+            "unsupported Deluge method: arbitrary filesystem size probes are not exposed by the TorrentNG API"
                 .to_owned(),
         ),
         "core.get_cache_status" => cache_status(state).await,
@@ -580,12 +580,12 @@ async fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Va
         "core.enable_plugin" => set_plugin_enabled(state, params, true),
         "core.disable_plugin" => set_plugin_enabled(state, params, false),
         "core.get_available_plugins" => Ok(json!(deluge_plugins())),
-        "core.get_libtorrent_version" => Ok(json!("native")),
+        "core.get_libtorrent_version" => Ok(json!("TorrentNG client")),
         "blocklist.get_config" => plugin_config(state, "blocklist", blocklist_config()).await,
         "blocklist.set_config" => set_plugin_config(state, "blocklist", params),
         "blocklist.get_status" | "blocklist.check_import" => blocklist_status(state).await,
         "blocklist.import" => Err(
-            "unsupported Deluge method: blocklist import is not implemented by the native engine"
+            "unsupported Deluge method: blocklist import is not implemented by the TorrentNG client"
                 .to_owned(),
         ),
         "autoadd.get_config" => plugin_config(state, "autoadd", autoadd_config()).await,
@@ -602,7 +602,7 @@ async fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Va
         "notifications.get_handled_events" => Ok(json!(notification_events())),
         "notifications.get_subscriptions" => Ok(notification_subscriptions()),
         "notifications.set_config" | "notifications.add_subscription" => Err(
-            "unsupported Deluge method: notifications are not configured by the native daemon"
+            "unsupported Deluge method: notifications are not configured by the TorrentNG client daemon"
                 .to_owned(),
         ),
         _ => Err(format!("unsupported method {method}")),
@@ -1110,14 +1110,14 @@ fn plugin_info(name: Option<&str>) -> Value {
             "name": "AutoAdd",
             "version": "TorrentNG",
             "author": "TorrentNG",
-            "description": "Watch-directory compatibility configuration; server-side watch execution is disabled unless native automation owns it.",
+            "description": "Watch-directory compatibility configuration; server-side watch execution is disabled unless TorrentNG automation owns it.",
             "enabled": false,
         }),
         "Blocklist" | "blocklist" => json!({
             "name": "Blocklist",
             "version": "TorrentNG",
             "author": "TorrentNG",
-            "description": "Blocklist compatibility configuration with zero-entry status until a native blocklist backend is configured.",
+            "description": "Blocklist compatibility configuration with zero-entry status until a TorrentNG blocklist backend is configured.",
             "enabled": false,
         }),
         "Execute" | "execute" => json!({
@@ -1138,21 +1138,21 @@ fn plugin_info(name: Option<&str>) -> Value {
             "name": "Label",
             "version": "TorrentNG",
             "author": "TorrentNG",
-            "description": "Category and label compatibility backed by native torrent labels.",
+            "description": "Category and label compatibility backed by TorrentNG-client torrent labels.",
             "enabled": true,
         }),
         "Notifications" | "notifications" => json!({
             "name": "Notifications",
             "version": "TorrentNG",
             "author": "TorrentNG",
-            "description": "Native session event notification compatibility.",
+            "description": "TorrentNG session event notification compatibility.",
             "enabled": true,
         }),
         "Scheduler" | "scheduler" => json!({
             "name": "Scheduler",
             "version": "TorrentNG",
             "author": "TorrentNG",
-            "description": "Scheduler plugin compatibility configuration; native limits remain controlled by TorrentNG settings.",
+            "description": "Scheduler plugin compatibility configuration; TorrentNG-client limits remain controlled by TorrentNG settings.",
             "enabled": false,
         }),
         _ => json!({}),
@@ -1208,7 +1208,7 @@ async fn blocklist_status(state: &AppState) -> Result<Value, String> {
         .unwrap_or_default();
     Ok(json!({
         "state": if enabled { "Idle" } else { "Disabled" },
-        "message": if enabled && !url.is_empty() { "Blocklist configured" } else { "No native blocklist configured" },
+        "message": if enabled && !url.is_empty() { "Blocklist configured" } else { "No TorrentNG blocklist configured" },
         "num_blocked": config.get("list_size").and_then(Value::as_i64).unwrap_or(0).max(0),
         "file_progress": 0.0,
         "file_type": "",
@@ -1550,7 +1550,8 @@ async fn add_label(state: &AppState, params: &[Value]) -> Result<Value, String> 
         .is_some_and(|options| !options.is_empty())
     {
         return Err(
-            "unsupported Deluge method: Label options have no native engine equivalent".to_owned(),
+            "unsupported Deluge method: Label options have no TorrentNG-client equivalent"
+                .to_owned(),
         );
     }
     deluge_engine(state)?
@@ -1673,7 +1674,7 @@ async fn torrents_status(state: &AppState, params: &[Value]) -> Result<Value, St
 fn ensure_legacy_full_list_bound(count: usize, endpoint: &str) -> Result<(), String> {
     if count > MAX_LEGACY_FULL_LIST_ENTRIES {
         return Err(format!(
-            "{endpoint} full-list response has {count} torrents; maximum is {MAX_LEGACY_FULL_LIST_ENTRIES}; use the native paged API"
+            "{endpoint} full-list response has {count} torrents; maximum is {MAX_LEGACY_FULL_LIST_ENTRIES}; use the paged TorrentNG API"
         ));
     }
     Ok(())
@@ -2010,7 +2011,7 @@ fn deluge_torrent(
         "save_path": entry.save_path,
         "label": entry.category.clone().unwrap_or_default(),
         "tags": entry.tags,
-        "is_finished": entry.completed_at.is_some(),
+        "is_finished": deluge_is_finished(entry),
         "eta": deluge_eta(entry.amount_left, deluge_peer_download_rate(peers)),
         "num_peers": deluge_leecher_count(peers),
         "num_seeds": deluge_seed_count(peers),
@@ -2147,6 +2148,10 @@ fn deluge_eta(amount_left: u64, download_rate: i64) -> i64 {
     }
 }
 
+fn deluge_is_finished(entry: &rt_session::TorrentEntry) -> bool {
+    entry.state.as_str() == "seeding" || (entry.total_length > 0 && entry.amount_left == 0)
+}
+
 fn deluge_distributed_copies(peers: Option<&[EnginePeerSnapshot]>) -> f64 {
     let Some(peers) = peers else {
         return 0.0;
@@ -2226,7 +2231,7 @@ async fn set_torrent_options(state: &AppState, params: &[Value]) -> Result<Value
         return Err("missing torrent options".to_owned());
     };
     if !hashes.is_empty() && state.engine.is_none() && !options.is_empty() {
-        return Err("native engine is unavailable; torrent options were not applied".to_owned());
+        return Err("TorrentNG client is unavailable; torrent options were not applied".to_owned());
     }
     if state.engine.is_some()
         && [
@@ -3078,6 +3083,18 @@ mod tests {
         assert_eq!(deluge_state_with_recheck("seeding", false), "Seeding");
     }
 
+    #[test]
+    fn deluge_finished_flag_uses_live_amount_left() {
+        let mut rechecked = TorrentEntry::new("a".repeat(40), "rechecked".into(), "/data".into());
+        rechecked.total_length = 100;
+        rechecked.amount_left = 25;
+        rechecked.completed_at = Some(200);
+        assert!(!deluge_is_finished(&rechecked));
+
+        rechecked.amount_left = 0;
+        assert!(deluge_is_finished(&rechecked));
+    }
+
     #[tokio::test]
     async fn deluge_update_ui_honors_requested_fields() {
         let registry = Arc::new(RwLock::new(SessionRegistry::new()));
@@ -3790,7 +3807,7 @@ mod tests {
         assert!(body["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("native engine is unavailable"));
+            .contains("TorrentNG client is unavailable"));
         assert_eq!(
             registry.read().await.get(&"b".repeat(40)).unwrap().category,
             None
@@ -4017,7 +4034,7 @@ mod tests {
         assert!(body["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("native engine is unavailable"));
+            .contains("TorrentNG client is unavailable"));
     }
 
     #[test]

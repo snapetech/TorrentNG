@@ -1,7 +1,7 @@
 # rt-storage
 
 `rt-storage` owns storage planning, verification reads, and the per-mount disk
-scheduler used by the native engine.
+scheduler used by the TorrentNG client.
 
 ## Architecture
 

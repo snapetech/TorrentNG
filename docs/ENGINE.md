@@ -1,12 +1,13 @@
-# Native Rust Engine Design
+# TorrentNG Client Design
 
-This document covers the native Rust BitTorrent engine. The engine is built
-around TorrentNG's universal compatibility goal: import from existing clients,
-project the APIs existing tools already speak, interoperate with independent
-clients, and keep one durable native model underneath those surfaces.
+This document covers the first-party TorrentNG Rust BitTorrent client. It is
+built around TorrentNG's broad compatibility goal: import from existing
+clients, project the APIs existing tools already speak, interoperate with
+independent clients, and keep one durable TorrentNG-client model underneath
+those surfaces.
 
-Track 1 compatibility code remains available as a migration and facade layer,
-but native engine state is now the source of truth for torrent rows, files,
+The compatible-client integration remains available as a WebUI/API, migration,
+and facade layer, but TorrentNG-client state is the source of truth for torrent rows, files,
 trackers, jobs, metrics, and compatibility API projections.
 
 ---
@@ -17,16 +18,19 @@ trackers, jobs, metrics, and compatibility API projections.
 
 **Not the primary target:** casual desktop torrenting, search-engine plugin users, "download one magnet and watch immediately" users.
 
-The engine is seeding-first and compatibility-first, but the rewrite now
-includes native downloading, magnet metadata, DHT/uTP protocol crates, and pure
+The engine is seeding-first and compatibility-first, but the TorrentNG client
+now includes downloading, magnet metadata, DHT/uTP protocol crates, and pure
 v2/hybrid metadata support. Streaming remains outside the first production
 target.
 
 ---
 
-## Why a full rewrite after Track 1
+## Why a first-party client after the compatible-client integration
 
-Track 1 solves the immediate pain: broken RPC trust, PHP control plane, polling-based sync, integration fragility. It does not solve the deep problems:
+The compatible-client integration solves the immediate control-plane pain:
+broken RPC trust, the PHP control plane, polling-based sync, and integration
+fragility. It does not replace the selected client's transfer stack or solve
+the deeper problems:
 
 - rTorrent's storage engine has no userspace disk scheduler
 - No per-mount queue depth, HDD/SSD profiles, or storage pressure awareness
@@ -58,10 +62,10 @@ crates/
   rt-session/         — torrent lifecycle types and registry
   rt-db/              — SQLite schema, durable rows, events, jobs, labels, storage roots
   rt-api-model/       — shared API types (serde)
-  rt-api-native/      — native REST + WebSocket API (axum)
+  rt-api-native/      — TorrentNG REST + WebSocket API (axum)
   rt-api-qbit/        — qBittorrent v2 compatibility shim
-  rt-api-transmission/ — Transmission RPC compatibility facade over native state
-  rt-api-deluge/      — Deluge compatibility facade over native state
+  rt-api-transmission/ — Transmission RPC compatibility facade over TorrentNG-client state
+  rt-api-deluge/      — Deluge compatibility facade over TorrentNG-client state
   rt-jobs/            — in-memory job model/queue for library users and tests;
                        daemon persistence is in rt-engine's StorageJobDispatcher
   rt-metrics/         — Prometheus metrics definitions and scale certification tests
@@ -336,7 +340,7 @@ error_raised
 
 ## API design
 
-### Native API
+### TorrentNG API
 
 ```
 /api/v1/torrents
@@ -364,7 +368,8 @@ Principles:
 
 ### qBittorrent compatibility API
 
-Compatibility shim is a translation layer over the native model. qBit API quirks do not leak into the engine.
+The compatibility shim is a translation layer over the TorrentNG-client model.
+qBit API quirks do not leak into the transfer engine.
 
 Priority 1 (Phase 6):
 ```
@@ -527,7 +532,7 @@ Multiple tracker tiers
 
 Implemented migration support lives in `rt-migrate`. Scanners are read-only
 against source session directories and produce an auditable dry-run plan before
-anything is written to the native DB. The apply path writes native torrent rows,
+anything is written to the TorrentNG-client DB. The apply path writes TorrentNG-client torrent rows,
 file rows, tracker rows, labels, categories, counters, ratio, and completion
 state through `rt-db`.
 
@@ -577,7 +582,7 @@ No global shared mutable state. Strict actor/task boundaries. Bounded channels w
 ## Release Operations
 
 - Backup/restore: [BACKUP_RESTORE.md](BACKUP_RESTORE.md)
-- Native deployment: [NATIVE_DEPLOYMENT.md](NATIVE_DEPLOYMENT.md)
+- TorrentNG client deployment: [deployment guide](NATIVE_DEPLOYMENT.md)
 - Threat model: [THREAT_MODEL.md](THREAT_MODEL.md)
 - Certification report: `scripts/native_engine_certification_report.sh`
 - Public Linux ISO certification: `scripts/public_linux_iso_certification.sh`

@@ -167,7 +167,7 @@ run_gate "native config security review" bash -c '
     "$1/scripts/security_review.sh" "$1/deploy/native/config.toml" "$2/security-review-native-local-$(date -u +%Y%m%dT%H%M%SZ).md"
 ' _ "$ROOT" "$REPORT_DIR"
 
-run_gate "sidecar config security review" bash -c '
+run_gate "compatible-client service config security review" bash -c '
   set -euo pipefail
   TNG_API_TOKENS="${TNG_API_TOKENS:-local-release-sidecar-token}" \
   TNG_SECRET_KEY="${TNG_SECRET_KEY:-local-release-sidecar-secret-00000000000000000000}" \

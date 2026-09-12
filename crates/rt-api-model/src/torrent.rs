@@ -8,7 +8,14 @@ pub struct TorrentSummary {
     pub name: String,
     pub state: String,
     pub total_length: i64,
+    /// Cumulative transfer bytes downloaded; use `amount_left` for current
+    /// payload progress after rechecks.
     pub downloaded: i64,
+    /// Live bytes still missing from the payload. Unlike `downloaded`, this
+    /// is not cumulative transfer accounting and remains correct after a
+    /// recheck discovers missing pieces.
+    #[serde(default)]
+    pub amount_left: i64,
     pub uploaded: i64,
     pub ratio: f64,
     pub save_path: String,
@@ -85,6 +92,7 @@ mod tests {
             state: "seeding".into(),
             total_length: 1_000_000,
             downloaded: 1_000_000,
+            amount_left: 0,
             uploaded: 5_000_000,
             ratio: 5.0,
             save_path: "/data".into(),

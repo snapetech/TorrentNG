@@ -1,6 +1,6 @@
 /// Scale certification tests.
 ///
-/// These tests verify that the sidecar API meets throughput targets from
+/// These tests verify that the TorrentNG API meets throughput targets from
 /// docs/ENGINE.md at synthetic load levels.
 ///
 /// Targets (from CLAUDE.md benchmarks section):
@@ -8,7 +8,7 @@
 ///   - 10k torrents: GET /api/v1/torrents < 200ms
 ///   - 15k torrents: GET /api/v1/torrents < 500ms
 ///   - 50k torrents: GET /api/qb/v2/torrents/info < 500ms
-///   - native filter/sort over 15k torrents < 250ms
+///   - TorrentNG-client filter/sort over 15k torrents < 250ms
 ///   - sync/maindata delta < 50ms (at normal churn)
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -27,8 +27,8 @@ use rt_storage::{
 use rt_tracker::backoff::jitter_interval;
 use tower::ServiceExt;
 
-/// Build a native API app populated with `n` synthetic torrents.
-async fn native_app_with(n: usize) -> axum::Router {
+/// Build a TorrentNG API app populated with `n` synthetic torrents.
+async fn torrentng_app_with(n: usize) -> axum::Router {
     let state = AppState::new();
     {
         let mut reg = state.registry.write().await;
@@ -128,7 +128,7 @@ async fn get_ms(app: axum::Router, uri: &str) -> u128 {
 
 #[tokio::test]
 async fn list_1k_torrents_under_100ms() {
-    let app = native_app_with(1_000).await;
+    let app = torrentng_app_with(1_000).await;
     let ms = get_ms(app, "/api/v1/torrents").await;
     let limit = threshold(100);
     assert!(ms < limit, "1k list took {ms}ms, want <{limit}ms");
@@ -136,7 +136,7 @@ async fn list_1k_torrents_under_100ms() {
 
 #[tokio::test]
 async fn list_10k_torrents_under_200ms() {
-    let app = native_app_with(10_000).await;
+    let app = torrentng_app_with(10_000).await;
     let ms = get_ms(app, "/api/v1/torrents").await;
     let limit = threshold(200);
     assert!(ms < limit, "10k list took {ms}ms, want <{limit}ms");
@@ -144,7 +144,7 @@ async fn list_10k_torrents_under_200ms() {
 
 #[tokio::test]
 async fn list_15k_torrents_under_500ms() {
-    let app = native_app_with(15_000).await;
+    let app = torrentng_app_with(15_000).await;
     let ms = get_ms(app, "/api/v1/torrents").await;
     let limit = threshold(500);
     assert!(ms < limit, "15k list took {ms}ms, want <{limit}ms");
@@ -166,8 +166,8 @@ async fn cold_db_load_15k_under_120s() {
 }
 
 #[tokio::test]
-async fn native_filter_sort_15k_under_250ms() {
-    let app = native_app_with(15_000).await;
+async fn torrentng_filter_sort_15k_under_250ms() {
+    let app = torrentng_app_with(15_000).await;
     let ms = get_ms(
         app,
         "/api/v1/torrents?filter=all&sort=name&reverse=true&limit=200&offset=2000",
@@ -176,7 +176,7 @@ async fn native_filter_sort_15k_under_250ms() {
     let limit = threshold(250);
     assert!(
         ms < limit,
-        "15k native filter/sort took {ms}ms, want <{limit}ms"
+        "15k TorrentNG-client filter/sort took {ms}ms, want <{limit}ms"
     );
 }
 

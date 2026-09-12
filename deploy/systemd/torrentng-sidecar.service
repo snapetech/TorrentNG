@@ -1,5 +1,5 @@
 [Unit]
-Description=TorrentNG Sidecar API Daemon
+Description=TorrentNG Compatible-Client WebUI/API Service
 After=rtorrent.service
 Requires=rtorrent.service
 

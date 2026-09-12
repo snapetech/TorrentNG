@@ -52,7 +52,7 @@ that currently project or depend on storage behavior.
 | Area | Command |
 | --- | --- |
 | Engine | `cargo test -p rt-engine` |
-| Native metrics storage scale tests | `cargo test -p rt-metrics storage_ -- --nocapture` |
+| TorrentNG-client metrics storage scale tests | `cargo test -p rt-metrics storage_ -- --nocapture` |
 | qBittorrent facade | `cargo test -p rt-api-qbit` |
 | Deluge facade | `cargo test -p rt-api-deluge` |
 | Migration importer | `cargo test -p rt-migrate` |

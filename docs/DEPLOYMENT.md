@@ -1,8 +1,9 @@
 # Deployment
 
-This document covers the Track 1 rTorrent and sidecar deployment path. For the
-native `torrentngd` engine, use [NATIVE_DEPLOYMENT.md](NATIVE_DEPLOYMENT.md).
-For the engine rewrite overview and swap/testing workflow, use
+This document covers the compatible-client WebUI/API service deployment path,
+including the packaged rTorrent integration. For the first-party TorrentNG
+client (`torrentngd`), use the [TorrentNG client deployment guide](NATIVE_DEPLOYMENT.md). For
+the product model and client comparison workflow, use
 [ENGINE_REWRITE.md](ENGINE_REWRITE.md).
 
 ## Phase 1 bundle
@@ -53,9 +54,11 @@ From inside the Phase 1 container:
 /scripts/healthcheck.sh /run/rtorrent/rpc.sock http://localhost:8080 http://localhost/rutorrent/
 ```
 
-## Sidecar config
+## Compatible-client service config
 
-`deploy/docker/sidecar.config.toml` is a container-oriented sidecar config that points at the Phase 1 socket path and `/data` storage root.
+`deploy/docker/sidecar.config.toml` is the container-oriented compatible-client
+service config. It points at the Phase 1 rTorrent socket path and `/data`
+storage root; the filename remains historical for deployment compatibility.
 
 For a host install, copy the same shape to:
 
@@ -63,21 +66,27 @@ For a host install, copy the same shape to:
 ~/.config/torrentng/config.toml
 ```
 
-## Sidecar container
+## Compatible-client service container
 
-The main Dockerfile builds the Rust sidecar and React WebUI, starts rTorrent, and serves the WebUI from the sidecar process.
+The main Dockerfile builds the Rust compatible-client service and React WebUI,
+starts rTorrent, and serves the WebUI from the `torrentng` service process.
 
 ```sh
 docker compose -f deploy/docker/compose.yml up --build
 ```
 
-The entrypoint creates `/config/config.toml` from `deploy/docker/sidecar.config.toml` when no config file exists. Set `TNG_SECRET_KEY` and `TNG_API_TOKENS` in the compose environment for production auth; `TNG_API_TOKENS` is a comma-separated list for automation clients. Override `TNG_STATIC_DIR` only if you mount WebUI assets somewhere other than `/usr/share/torrentng/webui`.
+The entrypoint creates `/config/config.toml` from
+`deploy/docker/sidecar.config.toml` when no config file exists. Set
+`TNG_SECRET_KEY` and `TNG_API_TOKENS` in the compose environment for
+production auth; `TNG_API_TOKENS` is a comma-separated list for automation
+clients. Override `TNG_STATIC_DIR` only if you mount WebUI assets somewhere
+other than `/usr/share/torrentng/webui`.
 
 ### Home live-main updater
 
 For a home test instance that should follow GitHub `main`, run the updater from
 the host instead of trying to mutate the running container. The Docker image must
-still be rebuilt because it contains the compiled Rust sidecar, built WebUI
+still be rebuilt because it contains the compiled `torrentng` service, built WebUI
 assets, and packaged rTorrent/libtorrent binaries.
 
 Install the user timer:
@@ -141,7 +150,7 @@ CERT_START_STACK=1 ./scripts/live_certification.sh
 
 The runner writes a markdown report under `certification/reports/`. Use it as the release gate for local qBittorrent API compatibility and container-level integration readiness, then complete the first-run app configuration in each service UI for full end-to-end add-torrent jobs.
 
-The running engine can be audited through the native API:
+The running TorrentNG client can be audited through the TorrentNG API:
 
 ```sh
 curl -H "Authorization: Bearer $TNG_API_TOKEN" http://localhost:28080/api/v1/engine
@@ -154,9 +163,10 @@ The drift gate intentionally checks only settings with stable readback commands 
 The Docker image declares the packaged rTorrent patches in
 `TNG_RTORRENT_PATCHES`. Production-like deployments should verify
 `d.multicall.range` and `tng.live_summary` through `/api/v1/engine/commands`
-or startup logs before relying on large-list sidecar sync. The sidecar must keep
-rTorrent's leading XMLRPC target argument on patched calls; for global calls
-that argument is the empty string, followed by the view/range parameters.
+or startup logs before relying on large-list compatible-client synchronization.
+The service must keep rTorrent's leading XMLRPC target argument on patched
+calls; for global calls that argument is the empty string, followed by the
+view/range parameters.
 Without it, rTorrent returns `invalid target`, torrent-list sync fails, and the
 WebUI reports the backend as disconnected.
 
@@ -184,7 +194,7 @@ The Docker entrypoints pin `network.port_range`, `dht.port`, and
 `dht.override_port` to `RTORRENT_INCOMING_PORT`, so the TCP peer listener and UDP
 DHT listener use the same forwarded public port.
 
-Security checks can be run against any sidecar config:
+Security checks can be run against any compatible-client service config:
 
 ```sh
 TNG_SECRET_KEY="$(openssl rand -hex 32)" TNG_API_TOKENS="token-one,token-two" ./scripts/security_review.sh deploy/docker/sidecar.config.toml
@@ -195,7 +205,8 @@ TNG_SECRET_KEY="$(openssl rand -hex 32)" TNG_API_TOKENS="token-one,token-two" ./
 Release builds are intentionally tag-only. Pushing commits to `main` does not
 build or publish a release. To publish, create and push a `main-*` tag that
 points at a commit already on `main`; the release workflow verifies the tag
-ancestry, builds the sidecar, WebUI, Docker images, creates or updates the
+ancestry, builds the compatible-client service, WebUI, and Docker images,
+creates or updates the
 GitHub Release, and posts a Discord announcement.
 
 Configure the Discord announcement webhook as the GitHub Actions secret
@@ -203,7 +214,8 @@ Configure the Discord announcement webhook as the GitHub Actions secret
 
 ## systemd install
 
-The systemd examples run rTorrent and the sidecar as the `rtorrent` user and communicate over `/run/rtorrent/rpc.sock`.
+The systemd examples run rTorrent and the compatible-client service as the
+`rtorrent` user and communicate over `/run/rtorrent/rpc.sock`.
 
 Create the service user:
 
@@ -225,7 +237,7 @@ sudo install -D -m 0640 deploy/systemd/rtorrent.rc /etc/rtorrent/rtorrent.rc
 sudo install -D -m 0640 engine-profile/rtorrent.rc /etc/rtorrent/profile.rc
 ```
 
-Install sidecar config:
+Install compatible-client service config:
 
 ```sh
 sudo install -D -m 0640 deploy/systemd/torrentng.config.toml /etc/torrentng/config.toml
@@ -240,4 +252,6 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now rtorrent.service torrentng-sidecar.service
 ```
 
-The sidecar unit sets `TNG_STATIC_DIR=/usr/share/torrentng/webui`; install built WebUI assets there for host deployments.
+The compatible-client service unit sets
+`TNG_STATIC_DIR=/usr/share/torrentng/webui`; install built WebUI assets there
+for host deployments.

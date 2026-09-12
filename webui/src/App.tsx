@@ -74,20 +74,21 @@ function utpStatus(capabilities: NonNullable<Awaited<ReturnType<typeof api.healt
 }
 
 function backendHealthLabel(health: Awaited<ReturnType<typeof api.health>> | undefined) {
+  const displayName = (type: string) => type === 'torrentng' ? 'TorrentNG client' : type
   if (health?.backend) {
     return {
       type: health.backend.type,
       status: health.backend.status,
       connected: health.backend.status === 'connected',
-      label: `${health.backend.type}: ${health.backend.status}`,
+      label: `${displayName(health.backend.type)}: ${health.backend.status}`,
     }
   }
   if (health?.native_engine) {
     return {
-      type: 'native',
+      type: 'torrentng',
       status: health.ready === false ? 'starting' : 'connected',
       connected: health.ready !== false,
-      label: `native: ${health.ready === false ? 'starting' : 'connected'}`,
+      label: `TorrentNG client: ${health.ready === false ? 'starting' : 'connected'}`,
     }
   }
   return {

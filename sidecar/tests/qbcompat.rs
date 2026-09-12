@@ -652,7 +652,7 @@ async fn categories_round_trip() {
     let body: serde_json::Value = res.json().await.unwrap();
     assert!(body.as_object().unwrap().is_empty());
 
-    // Create via native API
+    // Create via TorrentNG REST API
     let res = client
         .post(url(addr, "/api/v1/categories"))
         .json(&serde_json::json!({ "name": "Movies", "save_path": "/data/movies" }))
@@ -671,7 +671,7 @@ async fn categories_round_trip() {
     assert!(body.get("Movies").is_some());
     assert_eq!(body["Movies"]["savePath"], "/data/movies");
 
-    // Delete via native API
+    // Delete via TorrentNG REST API
     let res = client
         .delete(url(addr, "/api/v1/categories/Movies"))
         .send()
@@ -883,6 +883,7 @@ async fn qb_torrents_info_status_filters_match_cache_state() {
         t.complete = true;
     });
     seed_torrent_with(&db, "errored-idle", "Errored Idle", |t| {
+        t.state = 3;
         t.message = "tracker error".into();
     });
 
@@ -1197,6 +1198,26 @@ async fn native_torrents_list_status_filters_match_cache_state() {
     let body: serde_json::Value = res.json().await.unwrap();
     assert_eq!(body["total"], 1);
     assert_eq!(body["torrents"][0]["hash"], "active-down");
+
+    let res = client
+        .get(url(addr, "/api/v1/torrents?status=%20COMPLETED%20"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["total"], 1);
+    assert_eq!(body["torrents"][0]["hash"], "complete-idle");
+
+    let res = client
+        .get(url(addr, "/api/v1/torrents?status=not-a-real-status"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["total"], 0);
+    assert!(body["torrents"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]

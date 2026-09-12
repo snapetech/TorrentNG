@@ -46,7 +46,7 @@ groups:
         annotations:
           summary: TorrentNG peer listener is unhealthy
           description: >-
-            The native peer listener is not accepting work. Existing API
+            The TorrentNG client peer listener is not accepting work. Existing API
             state may still look healthy while transfers are stalled.
 
       - alert: TorrentNGDhtUnhealthy

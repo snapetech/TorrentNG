@@ -35,7 +35,7 @@ const torrents = Array.from({ length: 40 }, (_, i) => {
 
 const engineDiagnostics = {
   backend: {
-    type: 'native',
+    type: 'torrentng',
     status: 'connected',
     capabilities: {
       supports_tags: true,
@@ -67,7 +67,7 @@ const engineDiagnostics = {
     sidecar_version: 'e2e',
     rtorrent_version: null,
     libtorrent_version: null,
-    xmlrpc_backend: 'native',
+    xmlrpc_backend: null,
     packaged_rtorrent_version: null,
     packaged_libtorrent_version: null,
     patch_set: [],

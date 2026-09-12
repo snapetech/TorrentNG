@@ -2,4 +2,4 @@
 
 SQLite migration management, schema, WAL mode.
 
-## Status: Implemented — native engine support
+## Status: Implemented — TorrentNG client support

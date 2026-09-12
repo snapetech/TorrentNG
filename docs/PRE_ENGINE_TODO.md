@@ -1,7 +1,7 @@
 # Pre-Engine Completion TODO
 
-Historical archive. This list covered work before the native BitTorrent engine
-rewrite. The native engine now has its own implementation and certification
+Historical archive. This list covered work before the TorrentNG client
+implementation. The TorrentNG client now has its own implementation and certification
 surface; see [ENGINE_REWRITE.md](ENGINE_REWRITE.md),
 [ENGINE_REWRITE_BURNDOWN.md](ENGINE_REWRITE_BURNDOWN.md), and
 [NATIVE_DEPLOYMENT.md](NATIVE_DEPLOYMENT.md).
@@ -12,16 +12,16 @@ and release-smoke work is reconciled in
 [BACKEND_AUDIT_BURN_DOWN.md](BACKEND_AUDIT_BURN_DOWN.md); what remains requires
 real clients, target hardware, public network access, or elapsed soak time.
 
-## Done in sidecar scope
+## Done in compatible-client service scope
 
-- Native REST API for torrents, files, trackers, categories, tags, bulk operations, settings, storage, tracker health, ratio groups, workflows, RSS rules, cross-seed helper, and saved views.
+- TorrentNG REST API for torrents, files, trackers, categories, tags, bulk operations, settings, storage, tracker health, ratio groups, workflows, RSS rules, cross-seed helper, and saved views.
 - qBittorrent compatibility shim for automation/client flows, including auth, app info, torrent CRUD/control, tracker ops, file priorities, categories, tags, RSS rules, sync/maindata, and transfer info.
-- WebUI for torrent list/detail, add dialog, categories/tags, bulk dry-run operations, storage, tracker health, ratio groups, workflows, RSS rules, and sidecar-backed saved views.
+- WebUI for torrent list/detail, add dialog, categories/tags, bulk dry-run operations, storage, tracker health, ratio groups, workflows, RSS rules, and compatible-client-service-backed saved views.
 - Workflow actions for webhook, script execution with explicit config gate, category changes, and location changes.
 - Deployment scaffolding for Docker, Phase 1 ruTorrent bundle, systemd, nginx, healthcheck, and migration docs.
 - Synthetic benchmark harness for qBit list and sync delta targets.
 - Docker Compose certification stack for Sonarr, Radarr, Prowlarr, autobrr, cross-seed, and TorrentNG with a repeatable certification runner.
-- Local live certification report passing for sidecar health, qBit auth/read APIs, Sonarr, Radarr, Prowlarr, autobrr, and cross-seed container readiness.
+- Local live certification report passing for compatible-client service health, qBit auth/read APIs, Sonarr, Radarr, Prowlarr, autobrr, and cross-seed container readiness.
 - Repeatable client-configuration runner that onboards autobrr and saves tested qBittorrent-compatible TorrentNG clients in Sonarr, Radarr, Prowlarr, and autobrr.
 - Local live transfer certification runner that creates a fixture torrent, seeds it from stock Transmission through a disposable local tracker, downloads it through TorrentNG, and smoke-tests public Linux torrent URL add.
 - App-driven Prowlarr certification runner that stands up a disposable Torznab fixture indexer, searches it through Prowlarr, grabs the release through the saved qBittorrent-compatible TorrentNG client, and verifies the completed transfer.
@@ -49,7 +49,7 @@ real clients, target hardware, public network access, or elapsed soak time.
 - Complete independent security review of script workflow policy before recommending it for production.
 - Re-run `scripts/phase1_certification.sh` immediately before release and rebuild the Phase 1 image if upstream ruTorrent/PHP base behavior changes.
 
-## Moved to native engine rewrite
+## Moved to TorrentNG client rewrite
 
-- Historical section: these items moved into the native rewrite work tracked in
+- Historical section: these items moved into the TorrentNG client rewrite tracked in
   [ENGINE_REWRITE_BURNDOWN.md](ENGINE_REWRITE_BURNDOWN.md).

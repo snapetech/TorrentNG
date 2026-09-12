@@ -14,7 +14,7 @@ on:
         default: false
         type: boolean
       base_url:
-        description: "Already-running native daemon URL for API load, e.g. http://host:28080"
+        description: "Already-running TorrentNG client daemon URL for API load, e.g. http://host:28080"
         required: false
         default: ""
         type: string

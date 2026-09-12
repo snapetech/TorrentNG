@@ -41,5 +41,6 @@ pub use storage_row::{
 pub use torrent_row::{
     create_category_in_tx, delete, delete_in_tx, get, list_all, list_by_state, list_categories,
     list_category_definitions, list_torrent_tags, remove_categories_in_tx, rename_category_in_tx,
-    upsert, upsert_in_tx, TorrentRow,
+    update_fields_in_tx, update_labels_in_tx, update_runtime_in_tx, update_state_in_tx,
+    update_trackers_in_tx, upsert, upsert_in_tx, TorrentRow,
 };

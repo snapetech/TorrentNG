@@ -22,7 +22,7 @@ use rt_api_deluge::AppState as DelugeState;
 use rt_api_model::{
     api_token_allowed, csrf_request_allowed, session_cookie_value, ApiRuntimeMetrics,
 };
-use rt_api_native::state::AppState as NativeState;
+use rt_api_native::state::AppState as TorrentNgApiState;
 use rt_api_qbit::state::AppState as QbitState;
 use rt_api_transmission::AppState as TransmissionState;
 use rt_config::Config;
@@ -96,14 +96,14 @@ async fn main() -> anyhow::Result<()> {
 
     // Build the API routers
     let api_metrics = ApiRuntimeMetrics::new();
-    let native_state = NativeState::with_engine_and_tokens_metrics_config(
+    let torrentng_api_state = TorrentNgApiState::with_engine_and_tokens_metrics_config(
         Arc::clone(&registry),
         engine_handle.clone(),
         config.auth.api_tokens.clone(),
         Arc::clone(&api_metrics),
         config.metrics.include_torrent_ids,
     );
-    let native_router = rt_api_native::router::build_router(native_state);
+    let torrentng_api_router = rt_api_native::router::build_router(torrentng_api_state);
 
     let shutdown_notify = Arc::new(Notify::new());
     let mut qbit_state = QbitState::with_engine_and_tokens_and_metrics(
@@ -121,11 +121,10 @@ async fn main() -> anyhow::Result<()> {
         engine_handle.clone(),
         config.auth.api_tokens.clone(),
     );
-    transmission_state
-        .restore_persisted_state()
-        .await
-        .map_err(anyhow::Error::msg)
-        .context("restoring Transmission compatibility state")?;
+    if let Err(error) = transmission_state.restore_persisted_state().await {
+        engine_handle.shutdown().await;
+        return Err(anyhow::Error::msg(error).context("restoring Transmission compatibility state"));
+    }
     transmission_state.shutdown = Some(Arc::clone(&shutdown_notify));
     let transmission_router = rt_api_transmission::build_transmission_router(transmission_state);
 
@@ -156,7 +155,7 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let app = native_router
+    let app = torrentng_api_router
         .merge(qbit_router)
         .merge(transmission_router)
         .merge(deluge_router)
@@ -169,11 +168,18 @@ async fn main() -> anyhow::Result<()> {
             daemon_auth_guard,
         ));
 
-    let api_addr: std::net::SocketAddr = config
+    let api_addr: std::net::SocketAddr = match config
         .daemon
         .api_bind
         .parse()
-        .context("invalid api_bind address")?;
+        .context("invalid api_bind address")
+    {
+        Ok(api_addr) => api_addr,
+        Err(error) => {
+            engine_handle.shutdown().await;
+            return Err(error);
+        }
+    };
 
     info!(
         component = "http",
@@ -182,17 +188,27 @@ async fn main() -> anyhow::Result<()> {
         "API listening"
     );
 
-    let listener = tokio::net::TcpListener::bind(api_addr)
+    let listener = match tokio::net::TcpListener::bind(api_addr)
         .await
-        .with_context(|| format!("binding API to {api_addr}"))?;
+        .with_context(|| format!("binding API to {api_addr}"))
+    {
+        Ok(listener) => listener,
+        Err(error) => {
+            engine_handle.shutdown().await;
+            return Err(error);
+        }
+    };
 
-    axum::serve(
+    let serve_result = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal(engine_handle, shutdown_notify))
-    .await
-    .context("API server error")?;
+    .with_graceful_shutdown(shutdown_signal(engine_handle.clone(), shutdown_notify))
+    .await;
+    if let Err(error) = serve_result {
+        engine_handle.shutdown().await;
+        return Err(anyhow::Error::new(error).context("API server error"));
+    }
 
     Ok(())
 }
@@ -263,7 +279,7 @@ async fn shutdown_signal(engine: rt_engine::EngineHandle, shutdown_notify: Arc<N
 
 fn print_help() {
     println!(
-        "torrentngd {}\n\nUSAGE:\n    torrentngd [migrate|export] [OPTIONS]\n\nENV:\n    TORRENTNGD_CONFIG  Path to native daemon config\n    TNG_STATIC_DIR     Built WebUI directory to serve, default /usr/share/torrentng/webui\n\nCOMMANDS:\n    migrate            Import existing client state into the native engine\n    export             Export native state for another client\n    help               Print this help\n    version            Print version",
+        "torrentngd {}\n\nUSAGE:\n    torrentngd [migrate|export] [OPTIONS]\n\nENV:\n    TORRENTNGD_CONFIG  Path to TorrentNG client config\n    TNG_STATIC_DIR     Built WebUI directory to serve, default /usr/share/torrentng/webui\n\nCOMMANDS:\n    migrate            Import existing client state into the TorrentNG client\n    export             Export TorrentNG client state for another client\n    help               Print this help\n    version            Print version",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -319,11 +335,16 @@ fn daemon_public_path(path: &str) -> bool {
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<String> {
-    headers
+    let mut parts = headers
         .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::to_owned)
+        .and_then(|value| value.to_str().ok())?
+        .split_whitespace();
+    let scheme = parts.next()?;
+    let token = parts.next()?;
+    if parts.next().is_some() || !scheme.eq_ignore_ascii_case("Bearer") {
+        return None;
+    }
+    Some(token.to_owned())
 }
 
 fn daemon_is_mutating(req: &Request<Body>) -> bool {
@@ -422,8 +443,8 @@ fn load_config() -> anyhow::Result<Config> {
 
 #[cfg(test)]
 mod tests {
-    use super::{daemon_public_path, request_id, skip_request_log, static_dir};
-    use axum::http::{HeaderMap, HeaderValue};
+    use super::{bearer_token, daemon_public_path, request_id, skip_request_log, static_dir};
+    use axum::http::{header, HeaderMap, HeaderValue};
 
     #[test]
     fn request_log_skips_health_metrics_ws_and_static_assets() {
@@ -490,5 +511,20 @@ mod tests {
 
         headers.insert("x-request-id", HeaderValue::from_static(""));
         assert!(request_id(&headers).starts_with("tng-"));
+    }
+
+    #[test]
+    fn bearer_token_accepts_case_insensitive_scheme_without_extra_parts() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "bEaReR secret".parse().unwrap());
+        assert_eq!(bearer_token(&headers).as_deref(), Some("secret"));
+
+        headers.insert(header::AUTHORIZATION, "Basic secret".parse().unwrap());
+        assert!(bearer_token(&headers).is_none());
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer secret extra".parse().unwrap(),
+        );
+        assert!(bearer_token(&headers).is_none());
     }
 }

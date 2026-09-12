@@ -8,7 +8,7 @@ Primary goal: rTorrent-class Rust torrent engine/control-plane for very large he
 
 ## 0. Executive Summary
 
-Build a Rust-native BitTorrent daemon optimized for:
+Build TorrentNG's first-party Rust BitTorrent client daemon optimized for:
 
 - 10,000 to 15,000+ torrents as a normal operating target
 - 50,000+ torrents as a tested stretch target
@@ -17,7 +17,7 @@ Build a Rust-native BitTorrent daemon optimized for:
 - safe import of pre-existing files
 - reliable long-term seeding
 - qBittorrent-compatible API for ecosystem compatibility
-- native OpenAPI/JSON API for first-class control
+- TorrentNG OpenAPI/JSON API for first-class control
 - Transmission-style RPC discipline
 - event-driven state synchronization
 - operational diagnostics
@@ -80,7 +80,7 @@ Initial product is one daemon process:
 
 ```text
 torrentngd
-├── native API server
+├── TorrentNG REST/API server
 ├── qBittorrent compatibility API
 ├── optional Transmission compatibility API
 ├── SSE/WebSocket event stream
@@ -1332,7 +1332,7 @@ Acceptance:
 - expose health/metrics
 - no global recheck on restart
 
-## Phase 6: Native API
+## Phase 6: TorrentNG API
 
 Crates:
 

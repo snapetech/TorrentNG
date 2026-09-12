@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Concurrent native API/SSE load and slow-consumer evidence runner.
+"""Concurrent TorrentNG API/SSE load and slow-consumer evidence runner.
 
 Only Python's standard library is required. The script deliberately reports
 what it measures: request latency/bytes, concurrent SSE behavior, and an
@@ -299,7 +299,7 @@ def write_report(
         json.dump(payload, handle, indent=2, sort_keys=True)
         handle.write("\n")
     with open(report, "w", encoding="utf-8") as handle:
-        handle.write("# TorrentNG Native API Load Evidence\n\n")
+        handle.write("# TorrentNG API Load Evidence\n\n")
         handle.write(f"- Date UTC: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n")
         handle.write(f"- Commit: {commit}\n- Binary: {binary or 'not specified'}\n- Binary SHA-256: {binary_digest}\n")
         handle.write(f"- Base URL: {base}\n- Duration: {duration:.1f}s\n- JSON clients: {clients}\n")

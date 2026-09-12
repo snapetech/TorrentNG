@@ -49,7 +49,7 @@ pub struct TorrentTrackerStatusCounts {
     pub error: u64,
 }
 
-/// One row in the native tracker-health aggregate. A torrent is counted once
+/// One row in the TorrentNG client tracker-health aggregate. A torrent is counted once
 /// per tracker URL even if its metainfo contains the same URL more than once.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TorrentTrackerHealthRow {
@@ -344,7 +344,7 @@ pub fn list_all_torrent_trackers(conn: &Connection) -> Result<Vec<TorrentTracker
 
 /// Return torrent hashes whose normalized tracker URL contains `needle`.
 /// `instr` is used instead of `LIKE` so tracker text cannot introduce
-/// wildcard semantics.  This is the database-side half of native automation
+/// wildcard semantics.  This is the database-side half of TorrentNG automation
 /// tracker matching; callers can intersect the result with their live
 /// registry projection before applying an action.
 pub fn list_torrent_hashes_by_tracker(
@@ -411,7 +411,11 @@ pub fn torrent_tracker_health(conn: &Connection) -> Result<Vec<TorrentTrackerHea
                     tt.info_hash,
                     CASE WHEN t.state IN ('downloading', 'seeding')
                          THEN 1 ELSE 0 END AS active_count,
-                    CASE WHEN t.completed_at IS NOT NULL OR t.state = 'seeding'
+                    -- `completed_at` is historical and can survive a
+                    -- recheck that returns a torrent to downloading. Use
+                    -- the live amount-left invariant for current progress.
+                    CASE WHEN t.state IN ('seeding', 'completed')
+                              OR (t.total_length > 0 AND t.amount_left = 0)
                          THEN 1 ELSE 0 END AS complete_count,
                     MAX(CASE WHEN tt.status = 'error' THEN 1 ELSE 0 END)
                         AS error_count,
@@ -567,6 +571,7 @@ mod tests {
             completed_at: None,
             uploaded: 0,
             downloaded: 0,
+            amount_left: 100,
             ratio: 0.0,
             trackers: Vec::new(),
         };
@@ -672,7 +677,10 @@ mod tests {
         second.info_hash = second_hash.clone();
         second.name = "beta".into();
         second.state = "downloading".into();
-        second.completed_at = None;
+        // A recheck can leave this historical timestamp populated while the
+        // live payload is incomplete. Tracker aggregates must not count it.
+        second.completed_at = Some(30);
+        second.amount_left = 50;
         torrent_row::upsert(&conn, &second).unwrap();
 
         let tracker = |info_hash: &str,

@@ -1,8 +1,8 @@
-# Stage 1: Build Rust sidecar
-# Must track sidecar/Cargo.toml's rust-version (verified against the
+# Stage 1: Build the TorrentNG compatible-client service
+# Must track the compatible-client service Cargo.toml rust-version (verified against the
 # locked dependency graph -- see docs/BACKEND_AUDIT_BURN_DOWN.md TNG-028).
 # libsqlite3-sys's build script uses cfg_select!, requiring 1.97+.
-FROM rust:1.97-alpine AS sidecar-build
+FROM rust:1.97-alpine AS torrentng-service-build
 RUN apk add --no-cache musl-dev pkgconf openssl-dev openssl-libs-static
 WORKDIR /src
 RUN printf '%s\n' \
@@ -42,7 +42,7 @@ COPY webui/ ./
 RUN npm run build
 
 # Stage 3: Build modern rTorrent/libtorrent.
-# The patches expose tracker identity controls used by the sidecar.
+# The patches expose tracker identity controls used by the compatible-client service.
 FROM alpine:3.20 AS rtorrent-build
 ARG RTORRENT_VERSION=0.16.11
 ARG LIBTORRENT_VERSION=0.16.11
@@ -72,7 +72,7 @@ RUN cd rtorrent && autoreconf -fi && \
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates curl libcurl ncurses openssl socat tinyxml2 tzdata zlib
 
-COPY --from=sidecar-build /src/sidecar/target/release/torrentng /usr/local/bin/torrentng
+COPY --from=torrentng-service-build /src/sidecar/target/release/torrentng /usr/local/bin/torrentng
 COPY --from=webui-build   /sidecar/static /usr/share/torrentng/webui
 COPY --from=rtorrent-build /usr/local/bin/rtorrent /usr/local/bin/rtorrent
 COPY --from=rtorrent-build /usr/local/lib/libtorrent* /usr/local/lib/

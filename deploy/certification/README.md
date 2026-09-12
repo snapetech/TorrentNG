@@ -1,14 +1,16 @@
 # Certification Stack
 
-This directory contains the local live-certification harness for Track 1
-rTorrent-sidecar integrations. Native-engine certification lives beside it in
-`scripts/native_engine_certification_report.sh`, and cross-client native
-interop is covered by `scripts/interop_matrix.sh`.
+This directory contains the local live-certification harness for the
+compatible-client WebUI/API service with an rTorrent client. TorrentNG-client
+certification lives beside it in
+`scripts/native_engine_certification_report.sh`, and cross-client interop is
+covered by `scripts/interop_matrix.sh`.
 
-The Track 1 stack starts TorrentNG alongside Sonarr, Radarr, Prowlarr, autobrr,
-and cross-seed. The runner verifies that the rTorrent-backed sidecar
-qBittorrent-compatible API is reachable from the same Docker network and writes
-a markdown report under `certification/reports/`.
+The compatible-client stack starts TorrentNG alongside Sonarr, Radarr,
+Prowlarr, autobrr, and cross-seed. The runner verifies that the rTorrent-backed
+TorrentNG WebUI/API service and its qBittorrent-compatible API are reachable
+from the same Docker network and writes a markdown report under
+`certification/reports/`.
 
 ## Run
 
@@ -36,7 +38,12 @@ Run a real transfer fixture through a disposable local tracker and stock Transmi
 ./scripts/live_transfer_certification.sh
 ```
 
-The transfer runner creates a small local torrent in the Docker downloads volume, starts `opentracker` and `transmission-cli` sidecars on the certification network, adds the torrent through TorrentNG's qBittorrent-compatible API, and waits for completion. It also adds a public Debian netinst torrent in stopped mode as an external torrent-file smoke test. Set `PUBLIC_TRANSFER=1` to let the public Linux torrent download.
+The transfer runner creates a small local torrent in the Docker downloads
+volume, starts `opentracker` and `transmission-cli` seeders on the certification
+network, adds the torrent through TorrentNG's qBittorrent-compatible API, and
+waits for completion. It also adds a public Debian netinst torrent in stopped
+mode as an external torrent-file smoke test. Set `PUBLIC_TRANSFER=1` to let the
+public Linux torrent download.
 
 Run a transfer churn soak when you need repeated add/download/delete pressure
 instead of only synthetic cached rows:
@@ -46,7 +53,7 @@ TRANSFER_CHURN_CYCLES=25 ./scripts/transfer_churn_soak.sh
 ```
 
 The churn runner creates a fresh legal fixture torrent per cycle, seeds it from
-a stock Transmission sidecar, adds it through TorrentNG, waits for completion,
+a stock Transmission seeder, adds it through TorrentNG, waits for completion,
 deletes the torrent and files, and samples RSS after each cycle. Set
 `TRANSFER_CHURN_PUBLIC_CYCLES=1` or higher to also cycle a public Debian
 netinst torrent from `PUBLIC_TORRENT_URL`.
@@ -76,7 +83,7 @@ LibreOffice entry when its official torrent is available. The full matrix,
 environment reference, report format, and release-gate expectations are
 documented in [docs/INTEROP_MATRIX.md](../../docs/INTEROP_MATRIX.md).
 
-Run native-engine certification directly:
+Run TorrentNG-client certification directly:
 
 ```sh
 ./scripts/api_facade_certification.sh
@@ -112,8 +119,8 @@ Inspect and finalize the long soak:
 
 `post_soak_release_gate.sh` is intended for after the 24-hour soak has completed. It finalizes the soak with `RESTORE_NORMAL=1`, reruns the short certification suite, and refreshes the consolidated release report.
 
-The readiness runner verifies container/API readiness plus the Track 1
-sidecar/qBit compatibility surface. The client-configuration script completes
+The readiness runner verifies container/API readiness plus the compatible-client
+service/qBit compatibility surface. The client-configuration script completes
 the first-run qBittorrent client setup through each app's API and records
 whether each app's own connection test accepts TorrentNG.
 
@@ -121,7 +128,7 @@ whether each app's own connection test accepts TorrentNG.
 
 | Host | Container | Service |
 |---|---:|---|
-| `18080` | `8080` | TorrentNG sidecar/WebUI |
+| `18080` | `8080` | TorrentNG compatible-client service/WebUI |
 | `18989` | `8989` | Sonarr |
 | `17878` | `7878` | Radarr |
 | `19696` | `9696` | Prowlarr |

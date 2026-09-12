@@ -17,7 +17,7 @@ The former implementation gaps are closed locally: checked metainfo bounds,
 server-owned storage execution, policy-gated tracker/webseed egress, shared
 HTTP transport workers, bounded peer ingress, packed peer bitmaps, validated
 storage configuration, adaptive webseed scheduling, supervised DB
-persistence, and SLO/resource metrics are all wired into the native runtime
+persistence, and SLO/resource metrics are all wired into the TorrentNG client
 and covered by focused tests. The latest local fault, API/SSE load, and
 release smoke reports are linked from the backend ledger.
 

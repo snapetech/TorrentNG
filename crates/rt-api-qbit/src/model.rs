@@ -172,14 +172,47 @@ pub struct QbAddTorrentForm {
 
 /// State mapping from internal TorrentState → qBit state string.
 pub fn to_qbit_state(state: &str) -> &'static str {
+    if state == "downloading" {
+        "downloading"
+    } else {
+        to_qbit_state_with_completion(state, true)
+    }
+}
+
+/// Map an internal state to qBittorrent's direction-specific state name.
+/// qBittorrent distinguishes incomplete paused/queued/checking torrents from
+/// their completed upload-side equivalents.
+pub fn to_qbit_state_with_completion(state: &str, complete: bool) -> &'static str {
     match state {
-        "seeding" => "uploading",
+        "seeding" | "downloading" => {
+            if complete {
+                "uploading"
+            } else {
+                "downloading"
+            }
+        }
         "metadata_pending" => "metaDL",
-        "downloading" => "downloading",
-        "checking" => "checkingUP",
-        "paused" => "pausedUP",
-        "stopped" => "pausedUP",
-        "queued" => "queuedUP",
+        "checking" => {
+            if complete {
+                "checkingUP"
+            } else {
+                "checkingDL"
+            }
+        }
+        "paused" | "stopped" => {
+            if complete {
+                "pausedUP"
+            } else {
+                "pausedDL"
+            }
+        }
+        "queued" => {
+            if complete {
+                "queuedUP"
+            } else {
+                "queuedDL"
+            }
+        }
         "error" => "error",
         _ => "unknown",
     }
@@ -261,6 +294,27 @@ mod tests {
     #[test]
     fn unknown_state_maps_to_unknown() {
         assert_eq!(to_qbit_state("garbage"), "unknown");
+    }
+
+    #[test]
+    fn direction_specific_states_follow_completion() {
+        for (state, downloading, seeding) in [
+            ("checking", "checkingDL", "checkingUP"),
+            ("paused", "pausedDL", "pausedUP"),
+            ("stopped", "pausedDL", "pausedUP"),
+            ("queued", "queuedDL", "queuedUP"),
+        ] {
+            assert_eq!(to_qbit_state_with_completion(state, false), downloading);
+            assert_eq!(to_qbit_state_with_completion(state, true), seeding);
+        }
+        assert_eq!(
+            to_qbit_state_with_completion("downloading", false),
+            "downloading"
+        );
+        assert_eq!(
+            to_qbit_state_with_completion("downloading", true),
+            "uploading"
+        );
     }
 
     #[test]

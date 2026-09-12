@@ -326,7 +326,7 @@ fn transmission_engine(state: &AppState) -> Result<&EngineHandle, String> {
     state
         .engine
         .as_ref()
-        .ok_or_else(|| "native engine is unavailable; mutation was not applied".to_owned())
+        .ok_or_else(|| "TorrentNG client is unavailable; mutation was not applied".to_owned())
 }
 
 /// Enrich a legacy Transmission full-list response with bounded parallelism.
@@ -702,7 +702,7 @@ async fn transmission_rpc_payload(state: &AppState, body: Value) -> Value {
         "queue-stalled-enable" => queue_stalled_set(state, true).await,
         "queue-stalled-disable" => queue_stalled_set(state, false).await,
         "port-test" => {
-            Err("port testing is not exposed by the native compatibility API".to_owned())
+            Err("port testing is not exposed by the TorrentNG compatibility API".to_owned())
         }
         "blocklist-update" => Ok(json!({
             "blocklist-size": state.session.read().await.blocklist_size,
@@ -1072,7 +1072,9 @@ async fn apply_transmission_group_limits(
         return Ok(());
     }
     let Some(engine) = &state.engine else {
-        return Err("native engine is unavailable; group speed limits were not applied".to_owned());
+        return Err(
+            "TorrentNG client is unavailable; group speed limits were not applied".to_owned(),
+        );
     };
     let mut limits = transmission_torrent_limits_result(state, hash).await?;
     if group.speed_limit_down_enabled {
@@ -1600,7 +1602,7 @@ async fn session_get(state: &AppState, args: &Value) -> Result<Value, String> {
     let session = state.session.read().await.clone();
     // DHT/PEX are real engine settings, unlike most of Transmission's broad
     // compatibility surface.  Read those two values from the authority so a
-    // native API change or a restart cannot leave session-get echoing stale
+    // TorrentNG API change or a restart cannot leave session-get echoing stale
     // facade memory.
     let network_features = match &state.engine {
         Some(engine) => Some(
@@ -1820,7 +1822,7 @@ async fn torrent_get(state: &AppState, args: &Value) -> Result<Value, String> {
         .collect::<Vec<_>>();
     if entries.len() > MAX_LEGACY_FULL_LIST_ENTRIES {
         return Err(format!(
-            "Transmission torrent-get full-list response has {} torrents; maximum is {MAX_LEGACY_FULL_LIST_ENTRIES}; use the native paged API",
+            "Transmission torrent-get full-list response has {} torrents; maximum is {MAX_LEGACY_FULL_LIST_ENTRIES}; use the paged TorrentNG API",
             entries.len()
         ));
     }
@@ -1973,7 +1975,7 @@ async fn torrent_get(state: &AppState, args: &Value) -> Result<Value, String> {
                     "isPrivate" | "is-private" => {
                         json!(meta.map(|m| m.is_private).unwrap_or(false))
                     }
-                    "isFinished" | "is-finished" => json!(entry.completed_at.is_some()),
+                    "isFinished" | "is-finished" => json!(transmission_is_finished(entry)),
                     "isStalled" | "is-stalled" => json!(false),
                     "queuePosition" | "queue-position" => {
                         json!(queue_positions
@@ -2767,7 +2769,7 @@ async fn torrent_add(state: &AppState, args: &Value) -> Result<Value, String> {
         let mut limits = match engine.torrent_limits(hash.clone()).await {
             Ok(limits) => limits,
             Err(error) => {
-                // The native add has already committed the torrent. Do not
+                // The TorrentNG-client add has already committed the torrent. Do not
                 // strand a partially configured torrent when the follow-up
                 // limit read fails; remove it before surfacing the failure.
                 let _ = engine.remove_torrent(hash.clone(), false).await;
@@ -2785,7 +2787,7 @@ async fn torrent_add(state: &AppState, args: &Value) -> Result<Value, String> {
         }
         if let Err(error) = engine.update_torrent_limits(hash.clone(), limits).await {
             // Do not report an add failure while leaving a half-configured
-            // torrent behind. The native add is already durable, so cleanup
+            // torrent behind. The TorrentNG-client add is already durable, so cleanup
             // is best effort and the original error remains authoritative.
             let _ = engine.remove_torrent(hash.clone(), false).await;
             return Err(error.to_string());
@@ -3332,7 +3334,8 @@ fn validate_transmission_session_args(args: &Value) -> Result<(), String> {
 fn validate_transmission_torrent_set_args(args: &Value) -> Result<(), String> {
     if args.get("bandwidth-priority").is_some() {
         return Err(
-            "Transmission field bandwidth-priority is unsupported by the native engine".to_owned(),
+            "Transmission field bandwidth-priority is unsupported by the TorrentNG client"
+                .to_owned(),
         );
     }
     if let Some(value) = args.get("labels") {
@@ -3618,6 +3621,10 @@ fn transmission_status(state: &str) -> i64 {
         "seeding" => 6,
         _ => 0,
     }
+}
+
+fn transmission_is_finished(entry: &rt_session::TorrentEntry) -> bool {
+    entry.state.as_str() == "seeding" || (entry.total_length > 0 && entry.amount_left == 0)
 }
 
 #[cfg(test)]
@@ -4140,6 +4147,18 @@ mod tests {
         seeding.completed_at = Some(1_075);
         assert_eq!(transmission_seconds_downloading(&seeding, 1_150), 75);
         assert_eq!(transmission_seconds_seeding(&seeding, 1_150), 75);
+    }
+
+    #[test]
+    fn transmission_finished_flag_uses_live_amount_left() {
+        let mut rechecked = TorrentEntry::new("a".repeat(40), "rechecked".into(), "/data".into());
+        rechecked.total_length = 100;
+        rechecked.amount_left = 25;
+        rechecked.completed_at = Some(200);
+        assert!(!transmission_is_finished(&rechecked));
+
+        rechecked.amount_left = 0;
+        assert!(transmission_is_finished(&rechecked));
     }
 
     #[test]

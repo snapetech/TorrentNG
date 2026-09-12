@@ -7,7 +7,7 @@ use crate::{
 
 /// In-memory job registry used by library-level job tests and embedders.
 ///
-/// The native daemon's production queue is `rt-engine::StorageJobDispatcher`,
+/// The TorrentNG client's production queue is `rt-engine::StorageJobDispatcher`,
 /// which persists job state and checkpoints in SQLite. This small type remains
 /// intentionally process-local and must not be documented as the daemon's
 /// durable queue.

@@ -4,12 +4,22 @@ use serde::Deserialize;
 
 use super::db::{current_revision_locked, Db, TorrentRow, CACHE_REVISION_FLOOR_KEY};
 
-/// Maximum rows materialized by a public sidecar page endpoint. Compatibility
+/// Maximum rows materialized by a public compatible-client service page endpoint. Compatibility
 /// protocols without paging use a separate, stricter whole-response policy.
 pub const MAX_API_PAGE_ENTRIES: i64 = 5_000;
 /// Prevent a client from turning SQL OFFSET into an arbitrary skip scan. The
-/// native snapshot API is the path for deep, cursor-pinned exports.
+    /// TorrentNG-client snapshot API is the path for deep, cursor-pinned exports.
 pub const MAX_API_PAGE_OFFSET: i64 = 1_000_000;
+
+// Keep cache filtering and ordering consistent with the qBittorrent wire
+// projection in qbcompat::handlers::current_row_rates(). A rate older than
+// this is no longer presented as live throughput.
+const EFFECTIVE_DOWN_RATE_SQL: &str = "CASE WHEN t.updated_at <= 0 OR CAST(strftime('%s', 'now') AS INTEGER) - t.updated_at > 15 THEN 0 ELSE MAX(t.down_rate, 0) END";
+const EFFECTIVE_UP_RATE_SQL: &str = "CASE WHEN t.updated_at <= 0 OR CAST(strftime('%s', 'now') AS INTEGER) - t.updated_at > 15 THEN 0 ELSE MAX(t.up_rate, 0) END";
+const STALLED_SQL: &str = "t.is_active=1 AND ((t.complete=1 AND (t.updated_at <= 0 OR CAST(strftime('%s', 'now') AS INTEGER) - t.updated_at > 15 OR t.up_rate <= 0)) OR (t.complete=0 AND (t.updated_at <= 0 OR CAST(strftime('%s', 'now') AS INTEGER) - t.updated_at > 15 OR t.down_rate <= 0)))";
+const STALLED_UPLOADING_SQL: &str = "t.complete=1 AND t.is_active=1 AND (t.updated_at <= 0 OR CAST(strftime('%s', 'now') AS INTEGER) - t.updated_at > 15 OR t.up_rate <= 0)";
+const STALLED_DOWNLOADING_SQL: &str = "t.complete=0 AND t.is_active=1 AND (t.updated_at <= 0 OR CAST(strftime('%s', 'now') AS INTEGER) - t.updated_at > 15 OR t.down_rate <= 0)";
+const TRACKER_ERROR_SQL: &str = "length(trim(t.message)) > 0";
 
 #[derive(Debug)]
 pub struct TorrentDelta {
@@ -307,7 +317,7 @@ impl Db {
                     COUNT(*) AS torrent_count,
                     SUM(CASE WHEN is_active != 0 THEN 1 ELSE 0 END) AS active_count,
                     SUM(CASE WHEN complete != 0 THEN 1 ELSE 0 END) AS complete_count,
-                    SUM(CASE WHEN message != '' THEN 1 ELSE 0 END) AS error_count,
+                    SUM(CASE WHEN length(trim(message)) > 0 THEN 1 ELSE 0 END) AS error_count,
                     SUM(peers_complete) AS seed_count,
                     SUM(peers_connected) AS peer_count,
                     MAX(updated_at) AS last_updated
@@ -348,7 +358,9 @@ impl Db {
             ("seeding", "t.complete=1 AND t.is_active=1"),
             ("completed", "t.complete=1"),
             ("running", "t.is_open=1"),
-            ("queued", "t.state=1 AND t.is_open=0"),
+            // State 5 is the current queued projection. Keep accepting the
+            // older state=1/is_open=0 shape from pre-migration cache rows.
+            ("queued", "(t.state=5 OR (t.state=1 AND t.is_open=0))"),
             ("stopped", "t.state=0 AND t.is_active=0"),
             ("active", "t.is_active=1"),
             ("inactive", "t.is_active=0"),
@@ -358,29 +370,27 @@ impl Db {
             // stopped torrent is "stopped", never "stalled".
             (
                 "stalled",
-                "t.is_active=1 AND ((t.complete=1 AND t.up_rate=0) OR (t.complete=0 AND t.down_rate=0))",
+                STALLED_SQL,
             ),
             (
                 "stalled_uploading",
-                "t.complete=1 AND t.is_active=1 AND t.up_rate=0",
+                STALLED_UPLOADING_SQL,
             ),
             (
                 "stalled_downloading",
-                "t.complete=0 AND t.is_active=1 AND t.down_rate=0",
+                STALLED_DOWNLOADING_SQL,
             ),
             ("checking", "t.state=2"),
             ("moving", "0=1"),
-            ("error", "t.message != '' AND t.is_active=0"),
-            // Distinct from "error" above: a torrent can be actively
-            // seeding/downloading just fine while its tracker is
-            // rejecting announces (e.g. "torrent not registered with
-            // this tracker") -- rTorrent still reports it as active, so
-            // the is_active=0 restriction on "error" always misses this
-            // case. This bucket is exactly `tracker_health`'s existing
-            // error_count predicate (see tracker_health() above),
-            // finally made filterable per-torrent, not just visible as a
-            // per-tracker aggregate.
-            ("tracker_error", "t.message != ''"),
+            ("error", "t.state=3"),
+            // Distinct from the terminal state=3 "error" bucket above: a
+            // torrent can be actively seeding/downloading just fine while
+            // its tracker rejects announces (e.g. "torrent not registered
+            // with this tracker"). This bucket is exactly
+            // `tracker_health`'s existing error_count predicate (see
+            // tracker_health() above), finally made filterable per-torrent,
+            // not just visible as a per-tracker aggregate.
+            ("tracker_error", TRACKER_ERROR_SQL),
         ];
         for (key, bucket_sql) in status_queries {
             let mut clauses = shared_clauses.clone();
@@ -422,9 +432,10 @@ fn shared_clauses(p: &ListParams) -> (Vec<String>, Vec<String>) {
 
     if let Some(f) = &p.filter {
         if !f.is_empty() {
+            let arg_index = args.len() + 1;
             clauses.push(format!(
-                "t.name LIKE ?{} ESCAPE char(92) COLLATE NOCASE",
-                args.len() + 1
+                "(t.name LIKE ?{arg_index} ESCAPE char(92) COLLATE NOCASE
+                  OR t.hash LIKE ?{arg_index} ESCAPE char(92) COLLATE NOCASE)"
             ));
             args.push(format!("%{}%", escape_like_pattern(f)));
         }
@@ -538,7 +549,7 @@ fn build_where(p: &ListParams) -> (String, Vec<String>) {
     if let Some(media_type) = &p.media_type {
         append_media_type_clause(media_type, &mut clauses, &mut args);
     }
-    if let Some(status) = &p.status {
+    if let Some(status) = normalized_token(p.status.as_deref()) {
         match status.as_str() {
             "running" => clauses.push("t.is_open=1".into()),
             "seeding" => clauses.push("t.complete=1 AND t.is_active=1".into()),
@@ -546,26 +557,23 @@ fn build_where(p: &ListParams) -> (String, Vec<String>) {
             "completed" => clauses.push("t.complete=1".into()),
             "active" | "resumed" => clauses.push("t.is_active=1".into()),
             "inactive" => clauses.push("t.is_active=0".into()),
-            "queued" => clauses.push("t.state=1 AND t.is_open=0".into()),
+            "queued" => clauses.push("(t.state=5 OR (t.state=1 AND t.is_open=0))".into()),
             "paused" | "stopped" => clauses.push("t.state=0 AND t.is_active=0".into()),
             // Kept in sync with the identical bucket definitions in
             // sidebar_facets() above -- see the comment there.
-            "stalled" => clauses.push(
-                "t.is_active=1 AND ((t.complete=1 AND t.up_rate=0) OR (t.complete=0 AND t.down_rate=0))".into(),
-            ),
-            "stalled_uploading" => {
-                clauses.push("t.complete=1 AND t.is_active=1 AND t.up_rate=0".into())
-            }
-            "stalled_downloading" => {
-                clauses.push("t.complete=0 AND t.is_active=1 AND t.down_rate=0".into())
-            }
+            "stalled" => clauses.push(STALLED_SQL.into()),
+            "stalled_uploading" => clauses.push(STALLED_UPLOADING_SQL.into()),
+            "stalled_downloading" => clauses.push(STALLED_DOWNLOADING_SQL.into()),
             "checking" => clauses.push("t.state=2".into()),
             "moving" => clauses.push("0=1".into()),
-            "error" | "errored" => clauses.push("t.message != '' AND t.is_active=0".into()),
+            "error" | "errored" => clauses.push("t.state=3".into()),
             // Kept in sync with sidebar_facets()'s identical bucket -- see
             // the comment there for why this is distinct from "error".
-            "tracker_error" => clauses.push("t.message != ''".into()),
-            _ => {}
+            "tracker_error" => clauses.push(TRACKER_ERROR_SQL.into()),
+            // Never turn an unsupported status into an unfiltered library
+            // query. TorrentNG API status values are case-insensitive and
+            // invalid values fail closed at the predicate layer.
+            _ => clauses.push("0".into()),
         }
     }
 
@@ -611,15 +619,16 @@ fn append_media_type_clause(media_type: &str, clauses: &mut Vec<String>, args: &
 }
 
 fn order_clause(sort: Option<&str>, dir: Option<&str>) -> String {
-    let col = match sort {
+    let sort = normalized_token(sort);
+    let col = match sort.as_deref() {
         Some("name") => "t.name COLLATE NOCASE",
         Some("size") => "t.size_bytes",
         Some("remaining") => "(t.size_bytes - t.bytes_done)",
         Some("added") => "t.creation_date",
         Some("completed") => "t.timestamp_finished",
         Some("ratio") => "t.ratio",
-        Some("speed_down") => "t.down_rate",
-        Some("speed_up") => "t.up_rate",
+        Some("speed_down") => EFFECTIVE_DOWN_RATE_SQL,
+        Some("speed_up") => EFFECTIVE_UP_RATE_SQL,
         Some("seeds") => "t.peers_complete",
         Some("peers") => "t.peers_connected",
         Some("progress") => "CAST(t.bytes_done AS REAL) / NULLIF(t.size_bytes, 0)",
@@ -627,18 +636,23 @@ fn order_clause(sort: Option<&str>, dir: Option<&str>) -> String {
         // exactly, so sorting by status matches what the column displays.
         Some("status") => {
             "CASE \
-                WHEN t.message <> '' AND t.is_active = 0 THEN 0 \
+                WHEN t.state = 3 THEN 0 \
                 WHEN t.state = 0 THEN 1 \
                 WHEN t.state = 2 THEN 2 \
-                WHEN t.complete = 1 AND t.is_active = 1 THEN 3 \
-                WHEN t.complete = 0 AND t.is_active = 1 THEN 4 \
-                WHEN t.is_open = 1 THEN 5 \
-                ELSE 6 \
+                WHEN t.state = 4 THEN 3 \
+                WHEN (t.state = 5 OR (t.state = 1 AND t.is_open = 0)) THEN 4 \
+                WHEN t.complete = 1 AND t.is_active = 1 THEN 5 \
+                WHEN t.complete = 0 AND t.is_active = 1 THEN 6 \
+                WHEN t.is_open = 1 THEN 7 \
+                ELSE 8 \
             END"
         }
         _ => "t.name COLLATE NOCASE",
     };
-    let d = if dir.map(|d| d.eq_ignore_ascii_case("desc")).unwrap_or(false) {
+    let d = if dir
+        .map(str::trim)
+        .is_some_and(|dir| dir.eq_ignore_ascii_case("desc"))
+    {
         "DESC"
     } else {
         "ASC"
@@ -647,6 +661,13 @@ fn order_clause(sort: Option<&str>, dir: Option<&str>) -> String {
     // SQLite may return equal names/statuses/rates in different orders across
     // pages, which makes rows appear twice or disappear between requests.
     format!("{col} {d}, t.hash COLLATE NOCASE {d}")
+}
+
+fn normalized_token(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
 }
 
 #[cfg(test)]
@@ -687,10 +708,9 @@ mod tracker_error_integration_tests {
 
     /// TNG-webui: a torrent can be actively seeding fine while its
     /// tracker rejects announces (e.g. "torrent not registered with this
-    /// tracker") -- the existing "error"/"errored" bucket requires
-    /// is_active=0 and so never surfaces this. Proves the new
-    /// "tracker_error" bucket does, against a real SQLite-backed cache,
-    /// not just a generated SQL string.
+    /// tracker"). Proves the separate "tracker_error" bucket surfaces
+    /// this against a real SQLite-backed cache, not just a generated SQL
+    /// string.
     #[test]
     fn seeding_torrent_with_tracker_failure_is_findable_and_counted() {
         let dir = tempfile::tempdir().unwrap();
@@ -705,8 +725,7 @@ mod tracker_error_integration_tests {
 
         let facets = db.sidebar_facets(&ListParams::default()).unwrap();
         assert_eq!(facets.status.get("tracker_error"), Some(&1));
-        // The pre-existing "error" bucket must still miss it -- that's
-        // exactly the gap this new bucket exists to close.
+        // A tracker warning is not a terminal torrent error.
         assert_eq!(facets.status.get("error"), Some(&0));
 
         let (rows, total) = db
@@ -718,6 +737,55 @@ mod tracker_error_integration_tests {
         assert_eq!(total, 1);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].hash, "a".repeat(40));
+    }
+
+    #[test]
+    fn terminal_error_without_message_is_findable_and_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+        let mut terminal = row("terminal", false, "");
+        terminal.state = 3;
+        terminal.complete = false;
+        db.upsert(&terminal).unwrap();
+
+        let facets = db.sidebar_facets(&ListParams::default()).unwrap();
+        assert_eq!(facets.status.get("error"), Some(&1));
+        assert_eq!(facets.status.get("stopped"), Some(&0));
+
+        let (rows, total) = db
+            .list(&ListParams {
+                status: Some("error".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].hash, "terminal");
+
+        let (errored, stopped, seeding, downloading, _) = db.sync_counts().unwrap();
+        assert_eq!((errored, stopped, seeding, downloading), (1, 0, 0, 0));
+    }
+
+    #[test]
+    fn whitespace_tracker_message_is_not_reported_as_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+        db.upsert(&row("whitespace", true, "   ")).unwrap();
+
+        let facets = db.sidebar_facets(&ListParams::default()).unwrap();
+        assert_eq!(facets.status.get("tracker_error"), Some(&0));
+        let (rows, total) = db
+            .list(&ListParams {
+                status: Some("tracker_error".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(total, 0);
+        assert!(rows.is_empty());
+
+        let health = db.tracker_health().unwrap();
+        assert_eq!(health.len(), 1);
+        assert_eq!(health[0].error_count, 0);
     }
 
     #[test]
@@ -738,6 +806,45 @@ mod tracker_error_integration_tests {
         assert_eq!(rows[0].size_bytes - rows[0].bytes_done, 60);
         assert_eq!(rows[0].down_rate, 12_345);
         assert_eq!(rows[0].up_rate, 678);
+    }
+
+    #[test]
+    fn stale_rates_match_stalled_filter_and_sort_as_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+
+        let mut stale = row("stale", true, "");
+        stale.up_rate = 12_345;
+        stale.updated_at = 0;
+        db.upsert(&stale).unwrap();
+
+        let mut fresh = row("fresh", true, "");
+        fresh.up_rate = 1;
+        fresh.updated_at = chrono::Utc::now().timestamp();
+        db.upsert(&fresh).unwrap();
+
+        let (stalled, total) = db
+            .list(&ListParams {
+                status: Some("stalled_uploading".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(
+            stalled.iter().map(|row| row.hash.as_str()).collect::<Vec<_>>(),
+            vec!["stale"]
+        );
+
+        let (ordered, _) = db
+            .list(&ListParams {
+                sort: Some("speed_up".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            ordered.iter().map(|row| row.hash.as_str()).collect::<Vec<_>>(),
+            vec!["stale", "fresh"]
+        );
     }
 
     #[test]
@@ -782,6 +889,28 @@ mod tracker_error_integration_tests {
     }
 
     #[test]
+    fn filter_matches_info_hash_and_facets() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+        let hash = "ABCDEF1234567890";
+        let mut torrent = row(hash, true, "");
+        torrent.name = "Unrelated name".to_owned();
+        db.upsert(&torrent).unwrap();
+
+        let params = ListParams {
+            filter: Some("abcdef1234".to_owned()),
+            ..Default::default()
+        };
+        let (rows, total) = db.list(&params).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].hash, hash);
+
+        let facets = db.sidebar_facets(&params).unwrap();
+        assert_eq!(facets.status.get("all"), Some(&1));
+    }
+
+    #[test]
     fn other_media_type_is_queryable_and_counted() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("cache.db")).unwrap();
@@ -804,6 +933,34 @@ mod tracker_error_integration_tests {
         assert_eq!(total, 1);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].hash, "other");
+    }
+
+    #[test]
+    fn native_queued_state_is_queryable_alongside_legacy_queue_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+        let mut queued = row("torrentng-queued", false, "");
+        queued.complete = false;
+        queued.state = 5;
+        queued.is_open = false;
+        db.upsert(&queued).unwrap();
+
+        let mut legacy = row("legacy-queued", false, "");
+        legacy.complete = false;
+        legacy.state = 1;
+        legacy.is_open = false;
+        db.upsert(&legacy).unwrap();
+
+        let facets = db.sidebar_facets(&ListParams::default()).unwrap();
+        assert_eq!(facets.status.get("queued"), Some(&2));
+        let (rows, total) = db
+            .list(&ListParams {
+                status: Some("queued".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(rows.len(), 2);
     }
 
     #[test]
@@ -890,7 +1047,7 @@ mod tracker_error_integration_tests {
 
 #[cfg(test)]
 mod status_bucket_tests {
-    use super::{build_where, ListParams};
+    use super::{build_where, ListParams, TRACKER_ERROR_SQL};
 
     fn where_for(status: &str) -> String {
         let params = ListParams {
@@ -917,7 +1074,7 @@ mod status_bucket_tests {
     #[test]
     fn stalled_uploading_checks_throughput_not_started_state() {
         let w = where_for("stalled_uploading");
-        assert!(w.contains("t.up_rate=0"), "{w}");
+        assert!(w.contains("t.up_rate <= 0"), "{w}");
         assert!(w.contains("t.complete=1"), "{w}");
         // The bug this guards against: checking is_active=0 (stopped)
         // instead of up_rate=0 (zero throughput while still running).
@@ -930,7 +1087,7 @@ mod status_bucket_tests {
     #[test]
     fn stalled_downloading_checks_throughput_not_started_state() {
         let w = where_for("stalled_downloading");
-        assert!(w.contains("t.down_rate=0"), "{w}");
+        assert!(w.contains("t.down_rate <= 0"), "{w}");
         assert!(w.contains("t.complete=0"), "{w}");
         assert!(
             !w.contains("is_active=0"),
@@ -945,7 +1102,7 @@ mod status_bucket_tests {
         // registered with this tracker") must still be matched -- unlike
         // "error"/"errored", this must NOT require is_active=0.
         let w = where_for("tracker_error");
-        assert!(w.contains("t.message != ''"), "{w}");
+        assert!(w.contains(TRACKER_ERROR_SQL), "{w}");
         assert!(
             !w.contains("is_active"),
             "tracker_error must match active torrents with a tracker message too: {w}"
@@ -954,11 +1111,24 @@ mod status_bucket_tests {
 
     #[test]
     fn error_and_tracker_error_are_distinct_buckets() {
-        // "error" stays narrow (message + actually stopped); adding
-        // tracker_error must not have widened or replaced it.
+        // "error" is the terminal state bucket; tracker_error remains a
+        // separate message-based tracker-health bucket.
         let error = where_for("error");
-        assert!(error.contains("t.message != ''"), "{error}");
-        assert!(error.contains("t.is_active=0"), "{error}");
+        assert!(error.contains("t.state=3"), "{error}");
+        assert!(!error.contains(TRACKER_ERROR_SQL), "{error}");
+        assert!(!error.contains("t.is_active=0"), "{error}");
+    }
+
+    #[test]
+    fn status_tokens_are_trimmed_and_case_insensitive() {
+        let where_sql = where_for("  ErRoReD  ");
+        assert!(where_sql.contains("t.state=3"), "{where_sql}");
+    }
+
+    #[test]
+    fn unknown_status_fails_closed_instead_of_matching_everything() {
+        let where_sql = where_for("not-a-real-status");
+        assert!(where_sql.contains("0"), "{where_sql}");
     }
 }
 
@@ -989,6 +1159,27 @@ mod order_clause_tests {
         assert!(
             clause.contains("END DESC, t.hash COLLATE NOCASE DESC"),
             "unexpected clause: {clause}"
+        );
+    }
+
+    #[test]
+    fn status_sort_matches_error_metadata_and_queue_labels() {
+        let clause = order_clause(Some("status"), None);
+        assert!(
+            clause.contains("WHEN t.state = 3 THEN 0"),
+            "terminal errors must sort with the displayed error bucket: {clause}"
+        );
+        assert!(
+            !clause.contains("t.message <> ''"),
+            "message-only tracker failures must remain separate from terminal errors: {clause}"
+        );
+        assert!(
+            clause.contains("WHEN t.state = 4 THEN 3"),
+            "metadata-pending rows must have their displayed status rank: {clause}"
+        );
+        assert!(
+            clause.contains("WHEN (t.state = 5 OR (t.state = 1 AND t.is_open = 0)) THEN 4"),
+            "queued rows must have their displayed status rank: {clause}"
         );
     }
 

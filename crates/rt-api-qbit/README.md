@@ -1,13 +1,13 @@
 # rt-api-qbit
 
-qBittorrent Web API v2 compatibility facade over native engine state.
+qBittorrent Web API v2 compatibility facade over TorrentNG-client state.
 
 ## Status: Implemented — compatibility facade
 
 This crate exposes both `/api/qb/v2` and `/api/v2` routes so automation tools
 can configure TorrentNG as a qBittorrent-compatible download client.
 
-The facade projects native torrent registry and engine metadata into qBit
+The facade projects TorrentNG-client registry and engine metadata into qBit
 response shapes. Compatibility structs are intentionally not the internal engine
 model.
 
@@ -21,7 +21,7 @@ Run focused tests:
 cargo test -p rt-api-qbit
 ```
 
-Run the full native compatibility gate:
+Run the full TorrentNG-client compatibility gate:
 
 ```sh
 scripts/native_engine_certification_report.sh

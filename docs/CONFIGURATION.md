@@ -2,12 +2,19 @@
 
 TorrentNG has two runtime configuration surfaces:
 
-- `torrentngd`, the native engine daemon and primary runtime.
-- `torrentng`, the sidecar WebUI/API control plane used with rTorrent, qBittorrent, Transmission, Deluge, or a separate TorrentNG native daemon.
+- **TorrentNG client** — `torrentngd`, the first-party client daemon and
+  primary owned-transfer runtime.
+- **Compatible-client WebUI/API service** — `torrentng`, the service used with
+  rTorrent, qBittorrent, Transmission, Deluge, or a separate TorrentNG client.
 
-The two config files are intentionally separate. Native config controls durable engine state, peer networking, tracker behavior, storage, DHT, and native API auth. Sidecar config controls the selected backend adapter, sidecar cache, WebUI serving, and qBittorrent-compatible facade identity.
+The two config files are intentionally separate. The TorrentNG-client config
+controls durable client state, peer networking, tracker behavior, storage, DHT,
+and direct API auth. The compatible-client service config controls the selected
+client adapter, service cache, WebUI serving, and compatibility-facade
+identity. The `sidecar/` source path and existing `TNG_*` keys remain stable
+implementation/configuration contracts.
 
-## Native daemon
+## TorrentNG client (`torrentngd`)
 
 `torrentngd` loads TOML config from the first existing path in this order:
 
@@ -111,7 +118,7 @@ enqueue and released on queue rejection, cancellation, or completion.
 | `port` | `0` | UDP DHT port; `0` uses `network.listen_port` |
 | `bootstrap_nodes` | Public BitTorrent bootstrap routers | Bootstrap nodes as `host:port` strings |
 
-The live native DHT transport is currently IPv4-only. The metainfo and magnet
+The live TorrentNG-client DHT transport is currently IPv4-only. The metainfo and magnet
 identity model accepts v1, v2, and hybrid identities, but this does not imply
 IPv6 DHT routing or IPv6 tracker/peer coverage.
 
@@ -126,7 +133,7 @@ IPv6 DHT routing or IPv6 tracker/peer coverage.
 
 | Key | Default | Description |
 |---|---|---|
-| `api_tokens` | `[]` | Pre-shared bearer/session tokens accepted by the native API |
+| `api_tokens` | `[]` | Pre-shared bearer/session tokens accepted by the TorrentNG API |
 | `api_tokens_file` | unset | Optional newline-delimited token file; loaded in addition to `api_tokens` |
 | `metrics.include_torrent_ids` | `false` | Include raw infohashes in hot-torrent Prometheus labels; disabled by default because labels are high-cardinality identifiers |
 
@@ -148,7 +155,7 @@ precedence over both.
 | `filter` | `""` | Explicit tracing filter, for example `rt_engine=debug,tower_http=info` |
 | `event_retention` | `10000` | Number of newest durable session events to retain for qBit-compatible main logs |
 
-### Native minimal example
+### TorrentNG-client minimal example
 
 An empty token list is only valid on a loopback API bind. Use a randomly
 generated token of at least 16 characters before changing `api_bind` to a
@@ -163,12 +170,12 @@ session_dir = "/var/lib/torrentngd"
 download_dir = "/data"
 
 [auth]
-# Loopback-only native development mode. Public binds require real tokens.
+# Loopback-only TorrentNG-client development mode. Public binds require real tokens.
 api_tokens = []
 # Production alternative: api_tokens_file = "/run/secrets/torrentngd_api_token"
 ```
 
-### Native full example
+### TorrentNG-client full example
 
 ```toml
 [daemon]
@@ -217,9 +224,11 @@ filter = ""
 event_retention = 10000
 ```
 
-## Track 1 sidecar
+## Compatible-client WebUI/API service (`torrentng`)
 
-The sidecar loads TOML config from `~/.config/torrentng/config.toml` by default. Override the path by passing it as the first argument:
+The compatible-client service loads TOML config from
+`~/.config/torrentng/config.toml` by default. Override the path by passing it
+as the first argument:
 
 ```sh
 torrentng /path/to/config.toml
@@ -227,24 +236,26 @@ torrentng /path/to/config.toml
 
 Environment variables override file values where listed.
 
-### Top-level sidecar options
+### Service options
 
 | Key | Default | Env override | Description |
 |---|---|---|---|
-| `listen_addr` | `127.0.0.1:8080` | `TNG_LISTEN_ADDR` | TCP address the sidecar listens on; non-loopback binds require strong API tokens and a session secret |
+| `listen_addr` | `127.0.0.1:8080` | `TNG_LISTEN_ADDR` | TCP address the service listens on; non-loopback binds require strong API tokens and a session secret |
 | `debug` | `false` | `TNG_DEBUG=1` | Enable debug logging |
 | `sync_interval_secs` | `2` | `TNG_SYNC_INTERVAL_SECS` | Seconds between backend state polls |
 | `data_dir` | `~/.local/share/torrentng` | - | Directory for SQLite cache |
 | `storage_roots` | `[]` | - | Paths shown in the storage dashboard; defaults to `/` when empty |
 | WebUI static dir | `static` | `TNG_STATIC_DIR` | Directory served for WebUI assets and SPA fallback |
 
-### Sidecar `[backend]`
+### Service `[backend]`
 
-`[backend]` selects the BitTorrent client controlled by the sidecar. Existing configs that only define `[rtorrent]` still load as rTorrent-backed deployments.
+`[backend]` selects the compatible torrent client controlled by the service.
+Existing configs that only define `[rtorrent]` still load as rTorrent-backed
+deployments.
 
 | Key | Default | Env override | Description |
 |---|---|---|---|
-| `type` | `rtorrent` | `TNG_BACKEND` | Backend adapter: `rtorrent`, `qbittorrent`, `transmission`, `deluge`, or `torrentng`. |
+| `type` | `rtorrent` | `TNG_BACKEND` | Backend adapter: `rtorrent`, `qbittorrent`, `transmission`, `deluge`, or `torrentng`. The former `native` value is accepted only as a legacy alias for `torrentng`. |
 
 ```toml
 [backend]
@@ -256,7 +267,7 @@ type = "rtorrent"
 type = "qbittorrent"
 ```
 
-### Sidecar `[rtorrent]`
+### Service `[rtorrent]`
 
 | Key | Default | Env override | Description |
 |---|---|---|---|
@@ -265,7 +276,7 @@ type = "qbittorrent"
 | `timeout_secs` | `10` | - | Timeout for individual XMLRPC calls |
 | `identity_timeout_secs` | `300` | - | Timeout for the startup tracker-identity rewrite; kept separate from ordinary XMLRPC calls because it can touch a large session |
 
-The sidecar's mounted HTTP/XMLRPC routes enforce the configured API token.
+The service's mounted HTTP/XMLRPC routes enforce the configured API token.
 The crate-level `execute_xml` helper without a token is a local embedding/test
 convenience and is not mounted by `torrentngd`; use the token-aware helper for
 an independently exposed integration.
@@ -280,9 +291,11 @@ unless you specifically need to pin one install to a literal value. See
 [TRACKER-IDENTITY.md](TRACKER-IDENTITY.md) — sharing a fixed peer_id across
 installs previously caused a private-tracker multi-client ban.
 
-### Sidecar `[qbittorrent]`
+### Service `[qbittorrent]`
 
-The qBittorrent backend talks to qBittorrent-nox through the qBittorrent Web API. The sidecar keeps the TorrentNG WebUI and compatibility API in front while qBittorrent owns torrent execution.
+The qBittorrent integration talks to qBittorrent-nox through the qBittorrent
+Web API. The service keeps the TorrentNG WebUI and compatibility API in front
+while qBittorrent owns torrent execution.
 
 | Key | Default | Env override | Description |
 |---|---|---|---|
@@ -304,9 +317,9 @@ password = "adminadmin"
 timeout_secs = 10
 ```
 
-### Sidecar `[transmission]`
+### Service `[transmission]`
 
-The Transmission backend talks to an external Transmission RPC endpoint. Categories are mapped to Transmission labels where available. File priority, tracker add/edit/remove, pause/resume, remove, add, recheck, location moves, file rename, and share limits are mapped to Transmission RPC where supported. The native TorrentNG compatibility facade uses configured storage-root probes for free-space responses; port testing and operations without an attached engine return explicit unsupported errors rather than false success. Tags, torrent rename, sequential toggles, and runtime user-agent changes remain unsupported in this adapter.
+The Transmission compatible-client integration talks to an external Transmission RPC endpoint. Categories are mapped to Transmission labels where available. File priority, tracker add/edit/remove, pause/resume, remove, add, recheck, location moves, file rename, and share limits are mapped to Transmission RPC where supported. The TorrentNG service uses configured storage-root probes for free-space responses; port testing and operations without a connected TorrentNG client return explicit unsupported errors rather than false success. Tags, torrent rename, sequential toggles, and runtime user-agent changes remain unsupported in this adapter.
 
 | Key | Default | Env override | Description |
 |---|---|---|---|
@@ -324,9 +337,9 @@ type = "transmission"
 url = "http://127.0.0.1:9091/transmission/rpc"
 ```
 
-### Sidecar `[deluge]`
+### Service `[deluge]`
 
-The Deluge backend talks to the Deluge Web JSON-RPC endpoint. File priority, tracker replacement, pause/resume, remove, add, recheck, storage moves, file rename, ratio share limits, and seeding-time share limits are mapped to Deluge core methods where supported. In native compatibility mode, path-based torrent loads and daemon/plugin/configuration writes are rejected explicitly, and free-space reads use healthy configured storage roots. Categories, tags, torrent rename, sequential toggles, and runtime user-agent changes are unsupported in this adapter.
+The Deluge compatible-client integration talks to the Deluge Web JSON-RPC endpoint. File priority, tracker replacement, pause/resume, remove, add, recheck, storage moves, file rename, ratio share limits, and seeding-time share limits are mapped to Deluge core methods where supported. In compatible-client mode, path-based torrent loads and daemon/plugin/configuration writes are rejected explicitly, and free-space reads use healthy configured storage roots. Categories, tags, torrent rename, sequential toggles, and runtime user-agent changes are unsupported in this adapter.
 
 | Key | Default | Env override | Description |
 |---|---|---|---|
@@ -344,15 +357,24 @@ url = "http://127.0.0.1:8112/json"
 password = "deluge"
 ```
 
-### Sidecar `[torrentng]`
+### Service `[torrentng]`
 
-The TorrentNG backend talks to a native TorrentNG daemon over its native HTTP API. This is primarily for deployments that want the sidecar WebUI/API compatibility layer in front of a separate native daemon. The adapter forwards torrent add/remove, pause/resume, recheck/reannounce, category/tag changes, location/name updates, file-priority and file-rename changes, and tracker add/edit/remove operations to the native daemon; sidecar-only catalog metadata such as saved views and RSS rules remains in the sidecar cache. Bounded cache synchronization pins the native list snapshot across pages and retries; external qBittorrent synchronization is bounded but eventual because qBittorrent exposes no equivalent snapshot token.
+The TorrentNG integration talks to a separate TorrentNG client over its
+HTTP API. This is for deployments that want the compatible-client WebUI/API
+service in front of a separate `torrentngd` process. The adapter forwards
+torrent add/remove, pause/resume, recheck/reannounce, category/tag changes,
+location/name updates, file-priority and file-rename changes, and tracker
+add/edit/remove operations to the TorrentNG client; service-only catalog
+metadata such as saved views and RSS rules remains in the service cache.
+Bounded cache synchronization pins the TorrentNG list snapshot across pages
+and retries; external qBittorrent synchronization is bounded but eventual
+because qBittorrent exposes no equivalent snapshot token.
 
 | Key | Default | Env override | Description |
 |---|---|---|---|
-| `url` | `http://127.0.0.1:8080` | `TNG_TORRENTNG_URL` | Base URL for the native daemon |
+| `url` | `http://127.0.0.1:8080` | `TNG_TORRENTNG_URL` | Base URL for the TorrentNG client |
 | `api_token` | - | `TNG_TORRENTNG_API_TOKEN` | Optional bearer token for mutation endpoints |
-| `timeout_secs` | `10` | - | Timeout for native API requests |
+| `timeout_secs` | `10` | - | Timeout for TorrentNG API requests |
 | `accept_invalid_certs` | `false` | - | Accept invalid TLS certificates for lab deployments |
 
 ```toml
@@ -364,11 +386,26 @@ url = "http://127.0.0.1:8080"
 api_token = "optional-token"
 ```
 
-### Sidecar `[rtorrent.logs]`
+### Service `[rtorrent.logs]`
 
-When enabled, the sidecar tails configured rTorrent log files and stores new lines as durable `rtorrent_log` app events. These entries are returned by qBittorrent-compatible `/api/v2/log/main` alongside sidecar app events. Ingestion failures and recovery are also durable operator events (`rtorrent_log_ingest_error` and `rtorrent_log_ingest_recovered`) so a broken log path is visible in the same log stream. Startup-time rTorrent connectivity failures, transfer-stat probe failures, and their recoveries are retained as operator events as well. Admin settings mutations and restart requests are retained without storing full config bodies, user-agent strings, or filesystem paths. Ingested lines and ingest errors are redacted before storage: magnet URIs, common token query parameters, cookies, and full filesystem paths are removed or shortened.
+When enabled, the service tails configured rTorrent log files and stores new
+lines as durable `rtorrent_log` app events. These entries are returned by
+qBittorrent-compatible `/api/v2/log/main` alongside service app events.
+Ingestion failures and recovery are also durable operator events
+(`rtorrent_log_ingest_error` and `rtorrent_log_ingest_recovered`) so a broken
+log path is visible in the same log stream. Startup-time rTorrent connectivity
+failures, transfer-stat probe failures, and their recoveries are retained as
+operator events as well. Admin settings mutations and restart requests are
+retained without storing full config bodies, user-agent strings, or filesystem
+paths. Ingested lines and ingest errors are redacted before storage: magnet
+URIs, common token query parameters, cookies, and full filesystem paths are
+removed or shortened.
 
-By default, first-time ingestion starts at the end of each file to avoid flooding `/log/main` with old logs. The sidecar persists per-file offsets in its cache DB, so subsequent restarts continue from the last ingested byte and capture lines written while the sidecar was down. Set `read_from_start = true` only for controlled imports.
+By default, first-time ingestion starts at the end of each file to avoid
+flooding `/log/main` with old logs. The service persists per-file offsets in
+its cache DB, so subsequent restarts continue from the last ingested byte and
+capture lines written while it was down. Set `read_from_start = true` only for
+controlled imports.
 
 | Key | Default | Env override | Description |
 |---|---|---|---|
@@ -404,7 +441,7 @@ value must be exactly 20 ASCII bytes: an 8-byte client-family prefix plus a
 got a real user banned from a private tracker for "running multiple
 instances of the same client."
 
-Leave `peer_id` unset in normal deployments. The sidecar generates a random
+Leave `peer_id` unset in normal deployments. The compatible-client service generates a random
 12-byte suffix on first start and persists it to
 `<data_dir>/peer_id_suffix`, so it stays stable across restarts of that one
 install while still being unique to it. For packaged rTorrent/libtorrent
@@ -434,9 +471,9 @@ Known user-agent presets:
 | Deluge 2.2.0 | `Deluge/2.2.0 libtorrent/2.0.10` |
 | Transmission 4.0 | `Transmission/4.0` |
 
-### Sidecar `[identity]`
+### Service `[identity]`
 
-These values control the qBittorrent-compatible API identity presented to automation clients. They do not change the tracker-facing BitTorrent engine identity.
+These values control the qBittorrent-compatible API identity presented to automation clients. They do not change the tracker-facing transfer-client identity.
 
 | Key | Default | Env override | Description |
 |---|---|---|---|
@@ -447,7 +484,7 @@ These values control the qBittorrent-compatible API identity presented to automa
 
 Use these only for lab compatibility testing. Tracker-facing identity is still controlled by the underlying rTorrent build and `TNG_USER_AGENT` support.
 
-### Sidecar `[auth]`
+### Service `[auth]`
 
 | Key | Default | Env override | Description |
 |---|---|---|---|
@@ -455,11 +492,11 @@ Use these only for lab compatibility testing. Tracker-facing identity is still c
 | `api_tokens` | `[]` | `TNG_API_TOKENS` | Comma-separated pre-shared bearer tokens for automation tools; public binds require tokens of at least 16 characters |
 | `trust_proxy_header` | `false` | - | Trust a non-empty `X-Remote-User` only on a loopback listener; the reverse proxy must strip inbound copies before forwarding |
 
-For compatibility with older installed `rtorrentng-prod` units, the sidecar
+For compatibility with older installed `rtorrentng-prod` units, the service
 also accepts the former `RTNG_*` spelling for environment overrides. When both
 names are set, the canonical `TNG_*` value wins.
 
-### Sidecar `[logging]`
+### Service `[logging]`
 
 `debug = true` and `TNG_DEBUG=1` remain supported as legacy aliases for debug-level logging. `RUST_LOG` has the highest precedence, followed by `TNG_LOG_FILTER` or `logging.filter`, then `logging.profile`, then the legacy debug setting.
 
@@ -468,9 +505,9 @@ names are set, the canonical `TNG_*` value wins.
 | `format` | `json` | `TNG_LOG_FORMAT` | Output format: `json` or `pretty` |
 | `profile` | `basic` | `TNG_LOG_PROFILE` | Preset filter profile: `basic`, `detailed`, or `verbose` |
 | `filter` | `""` | `TNG_LOG_FILTER` | Explicit tracing filter, for example `torrentng=debug,tower_http=info` |
-| `event_retention` | `10000` | `TNG_LOG_EVENT_RETENTION` | Number of newest durable sidecar app events to retain for qBit-compatible main logs |
+| `event_retention` | `10000` | `TNG_LOG_EVENT_RETENTION` | Number of newest durable service app events to retain for qBit-compatible main logs |
 
-### Sidecar `[workflows]`
+### Service `[workflows]`
 
 | Key | Default | Env override | Description |
 |---|---|---|---|
@@ -481,7 +518,7 @@ names are set, the canonical `TNG_*` value wins.
 
 Script actions are refused unless `allow_scripts` is true and `allowed_script_dirs` is non-empty. The executable path must be absolute, is canonicalized before launch, and must remain under an allowed directory. Production configs should use root-owned or service-owned directories and keep them non-world-writable. Workflow webhooks reject private/local DNS results by default, pin one validated address, reject redirects, and cap responses; set `allow_private_webhooks` only for an explicitly trusted internal destination. See [SECURITY_REVIEW.md](SECURITY_REVIEW.md).
 
-### Sidecar minimal example
+### Compatible-client service minimal example
 
 ```toml
 [backend]
@@ -491,9 +528,9 @@ type = "rtorrent"
 scgi_socket = "/run/rtorrent/rpc.sock"
 ```
 
-### Sidecar container example
+### Compatible-client service container example
 
-See [deploy/docker/sidecar.config.toml](../deploy/docker/sidecar.config.toml) for the Phase 1 container-oriented sidecar config.
+See [deploy/docker/sidecar.config.toml](../deploy/docker/sidecar.config.toml) for the Phase 1 container-oriented compatible-client service config.
 
 The Docker compose stack also includes a qBittorrent profile:
 
@@ -503,9 +540,9 @@ docker compose -f deploy/docker/compose.yml --profile transmission up torrentng-
 docker compose -f deploy/docker/compose.yml --profile deluge up torrentng-deluge deluge
 ```
 
-Those profiles expose TorrentNG on host ports `8082`, `8083`, and `8084` respectively. Native client WebUIs remain exposed on their usual profile ports for troubleshooting.
+Those profiles expose TorrentNG on host ports `8082`, `8083`, and `8084` respectively. The compatible clients' own WebUIs remain exposed on their usual profile ports for troubleshooting.
 
-### Sidecar full example
+### Compatible-client service full example
 
 ```toml
 listen_addr = "127.0.0.1:8080"

@@ -52,7 +52,7 @@ pub fn build_router(state: AppState) -> Router {
         .unwrap_or_else(|_| "static".to_owned());
 
     Router::new()
-        // Native API.
+        // TorrentNG API.
         .route("/api/v1/auth/login", post(crate::qbcompat::auth_login))
         .route("/api/v1/auth/logout", post(crate::qbcompat::auth_logout))
         .route(

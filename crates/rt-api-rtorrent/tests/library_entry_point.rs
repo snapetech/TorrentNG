@@ -15,7 +15,10 @@ async fn public_library_entry_point_executes_xmlrpc_without_http_server() {
     let state = AppState::new(Arc::new(RwLock::new(SessionRegistry::new())));
     let response = execute_xml(&state, &method_call("system.library_version")).await;
 
-    assert!(response.contains("<string>native</string>"), "{response}");
+    assert!(
+        response.contains("<string>TorrentNG client</string>"),
+        "{response}"
+    );
     assert!(supported_methods().contains(&"d.multicall"));
 }
 

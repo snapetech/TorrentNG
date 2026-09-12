@@ -11,9 +11,9 @@ already be in flight by the time this is read — check
 | Run / job | Actual failure | Fix | Evidence |
 | --- | --- | --- | --- |
 | `33906940869` / Backup and restore drill | The clean GitHub checkout did not contain the ignored recovery fixture. | `718e571` makes the drill create a valid tiny v1 fixture when the ignored local fixture is absent. | Final backup/restore job passed in `33916500668`. |
-| `33906940869` / Backend fault-containment matrix | `yield_now()` was not a durable scheduling boundary on the hosted runner; the pause test raced the worker. | `718e571` changed the test to bounded deadline polling of durable SQLite state. | Full native suite and final fault job passed in `33916500668`. |
-| `33908414275` / native-quality | `tar -xOzf ... | grep -q` caused GNU tar to receive a broken pipe under `pipefail`. | `dc4ab9a` extracts the archive before checking its contents; `b748f59` applied the same fix to archive listing. | Certification bundle self-test and final native-quality job passed in `33916500668`. |
-| `33909060233` / native-quality | Cleanup became visible on disk before the terminal job row was durably removed, so the test asserted too early. | `8a85615` waits for both filesystem cleanup and the empty durable job projection. | The regression passed repeatedly locally and in final hosted CI `33916500668`. |
+| `33906940869` / Backend fault-containment matrix | `yield_now()` was not a durable scheduling boundary on the hosted runner; the pause test raced the worker. | `718e571` changed the test to bounded deadline polling of durable SQLite state. | Full TorrentNG-client suite and final fault job passed in `33916500668`. |
+| `33908414275` / `native-quality` | `tar -xOzf ... | grep -q` caused GNU tar to receive a broken pipe under `pipefail`. | `dc4ab9a` extracts the archive before checking its contents; `b748f59` applied the same fix to archive listing. | Certification bundle self-test and final `native-quality` job passed in `33916500668`. |
+| `33909060233` / `native-quality` | Cleanup became visible on disk before the terminal job row was durably removed, so the test asserted too early. | `8a85615` waits for both filesystem cleanup and the empty durable job projection. | The regression passed repeatedly locally and in final hosted CI `33916500668`. |
 | Final interop harness path | `curl | grep -q` let `grep` exit early and surfaced curl's SIGPIPE as a false failure under `pipefail`. | `83b70ce` captures the metrics response and checks it with a here-string. | Current 28/28 Docker matrix and final CI `33916500668` are green. |
 
 ## Other CI hardening included
@@ -33,8 +33,8 @@ currently zero.
 
 ## Current boundary
 
-CI now covers native quality, both declared MSRV floors, fuzz smoke, sidecar,
-WebUI, dependency security, backup/restore, API/SSE load, and deterministic
+CI now covers TorrentNG-client quality, both declared MSRV floors, fuzz smoke,
+the compatible-client service, WebUI, dependency security, backup/restore, API/SSE load, and deterministic
 fault containment. The latest CodeQL orchestration also passed actions, Rust,
 JavaScript/TypeScript, and Python analysis. It does not certify target-device
 storage, public-swarm behavior, branch-protection enforcement, a 24-hour soak, production-corpus

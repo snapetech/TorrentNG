@@ -22,6 +22,10 @@ pub struct TorrentRow {
     pub completed_at: Option<i64>,
     pub uploaded: i64,
     pub downloaded: i64,
+    /// Live bytes still missing from the payload; unlike `downloaded`, this
+    /// is not cumulative transfer accounting.
+    #[serde(default)]
+    pub amount_left: i64,
     pub ratio: f64,
     /// JSON-serialised `Vec<String>`.
     pub trackers: Vec<String>,
@@ -31,8 +35,8 @@ impl TorrentRow {
     fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let tags_json: String = row.get(8)?;
         let tags: Vec<String> = decode_json_column(&tags_json, 8)?;
-        let trackers_json: String = row.get(15)?;
-        let trackers: Vec<String> = decode_json_column(&trackers_json, 15)?;
+        let trackers_json: String = row.get(16)?;
+        let trackers: Vec<String> = decode_json_column(&trackers_json, 16)?;
         Ok(TorrentRow {
             info_hash: row.get(0)?,
             name: row.get(1)?,
@@ -48,7 +52,8 @@ impl TorrentRow {
             completed_at: row.get(11)?,
             uploaded: row.get(12)?,
             downloaded: row.get(13)?,
-            ratio: row.get(14)?,
+            amount_left: row.get(14)?,
+            ratio: row.get(15)?,
             trackers,
         })
     }
@@ -66,9 +71,9 @@ pub fn upsert(conn: &Connection, row: &TorrentRow) -> Result<(), DbError> {
     conn.execute(
         "INSERT INTO torrents
             (info_hash, name, total_length, piece_length, piece_count, is_private,
-             save_path, category, tags, state, added_at, completed_at,
-             uploaded, downloaded, ratio, trackers)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+            save_path, category, tags, state, added_at, completed_at,
+             uploaded, downloaded, amount_left, ratio, trackers)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
          ON CONFLICT(info_hash) DO UPDATE SET
              name=excluded.name,
              total_length=excluded.total_length,
@@ -78,6 +83,7 @@ pub fn upsert(conn: &Connection, row: &TorrentRow) -> Result<(), DbError> {
              save_path=excluded.save_path,
              state=excluded.state,
              uploaded=excluded.uploaded, downloaded=excluded.downloaded,
+             amount_left=excluded.amount_left,
              ratio=excluded.ratio, completed_at=excluded.completed_at,
              category=excluded.category, tags=excluded.tags,
              trackers=excluded.trackers",
@@ -96,6 +102,7 @@ pub fn upsert(conn: &Connection, row: &TorrentRow) -> Result<(), DbError> {
             row.completed_at,
             row.uploaded,
             row.downloaded,
+            row.amount_left,
             row.ratio,
             trackers_json,
         ],
@@ -110,9 +117,9 @@ pub fn upsert_in_tx(tx: &rusqlite::Transaction<'_>, row: &TorrentRow) -> Result<
     tx.execute(
         "INSERT INTO torrents
             (info_hash, name, total_length, piece_length, piece_count, is_private,
-             save_path, category, tags, state, added_at, completed_at,
-             uploaded, downloaded, ratio, trackers)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+            save_path, category, tags, state, added_at, completed_at,
+             uploaded, downloaded, amount_left, ratio, trackers)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
          ON CONFLICT(info_hash) DO UPDATE SET
              name=excluded.name,
              total_length=excluded.total_length,
@@ -122,6 +129,7 @@ pub fn upsert_in_tx(tx: &rusqlite::Transaction<'_>, row: &TorrentRow) -> Result<
              save_path=excluded.save_path,
              state=excluded.state,
              uploaded=excluded.uploaded, downloaded=excluded.downloaded,
+             amount_left=excluded.amount_left,
              ratio=excluded.ratio, completed_at=excluded.completed_at,
              category=excluded.category, tags=excluded.tags,
              trackers=excluded.trackers",
@@ -140,12 +148,123 @@ pub fn upsert_in_tx(tx: &rusqlite::Transaction<'_>, row: &TorrentRow) -> Result<
             row.completed_at,
             row.uploaded,
             row.downloaded,
+            row.amount_left,
             row.ratio,
             trackers_json,
         ],
     )?;
     persist_normalized_labels_in_tx(tx, row)?;
     Ok(())
+}
+
+/// Update only the fields owned by a running torrent task.
+///
+/// Runtime progress is written from a snapshot that may have been taken
+/// before the engine actor persisted a concurrent label/path/tracker change.
+/// Keeping this update partial prevents that stale snapshot from overwriting
+/// actor-owned metadata. It also deliberately refuses to insert a missing
+/// row: a task finishing after removal must not resurrect the torrent.
+pub fn update_runtime_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    row: &TorrentRow,
+) -> Result<bool, DbError> {
+    let changed = tx.execute(
+        "UPDATE torrents
+         SET state = ?2,
+             completed_at = ?3,
+             uploaded = ?4,
+             downloaded = ?5,
+             amount_left = ?6,
+             ratio = ?7,
+             total_length = ?8
+         WHERE info_hash = ?1",
+        params![
+            row.info_hash,
+            row.state,
+            row.completed_at,
+            row.uploaded,
+            row.downloaded,
+            row.amount_left,
+            row.ratio,
+            row.total_length,
+        ],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Update only lifecycle-owned fields on an existing torrent row.
+pub fn update_state_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    info_hash: &str,
+    state: &str,
+    completed_at: Option<i64>,
+    total_length: i64,
+    amount_left: i64,
+) -> Result<bool, DbError> {
+    let changed = tx.execute(
+        "UPDATE torrents
+         SET state = ?2,
+             completed_at = ?3,
+             total_length = ?4,
+             amount_left = ?5
+         WHERE info_hash = ?1",
+        params![info_hash, state, completed_at, total_length, amount_left,],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Update only user-editable name and save-path fields on an existing row.
+pub fn update_fields_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    info_hash: &str,
+    name: &str,
+    save_path: &str,
+) -> Result<bool, DbError> {
+    let changed = tx.execute(
+        "UPDATE torrents
+         SET name = ?2,
+             save_path = ?3
+         WHERE info_hash = ?1",
+        params![info_hash, name, save_path],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Update labels on an existing row and keep the normalized tag projection in sync.
+pub fn update_labels_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    info_hash: &str,
+    category: &Option<String>,
+    tags: &[String],
+    added_at: i64,
+) -> Result<bool, DbError> {
+    let tags_json = serde_json::to_string(tags)?;
+    let changed = tx.execute(
+        "UPDATE torrents
+         SET category = ?2,
+             tags = ?3
+         WHERE info_hash = ?1",
+        params![info_hash, category, tags_json],
+    )?;
+    if changed == 0 {
+        return Ok(false);
+    }
+    persist_normalized_labels_values_in_tx(tx, info_hash, category, tags, added_at)?;
+    Ok(true)
+}
+
+/// Update the compact tracker JSON on an existing row.
+pub fn update_trackers_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    info_hash: &str,
+    trackers: &[String],
+) -> Result<bool, DbError> {
+    let trackers_json = serde_json::to_string(trackers)?;
+    let changed = tx.execute(
+        "UPDATE torrents SET trackers = ?2 WHERE info_hash = ?1",
+        params![info_hash, trackers_json],
+    )?;
+    Ok(changed > 0)
 }
 
 fn persist_normalized_labels(conn: &Connection, row: &TorrentRow) -> Result<(), DbError> {
@@ -173,21 +292,37 @@ fn persist_normalized_labels_in_tx(
     tx: &rusqlite::Transaction<'_>,
     row: &TorrentRow,
 ) -> Result<(), DbError> {
+    persist_normalized_labels_values_in_tx(
+        tx,
+        &row.info_hash,
+        &row.category,
+        &row.tags,
+        row.added_at,
+    )
+}
+
+fn persist_normalized_labels_values_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    info_hash: &str,
+    category: &Option<String>,
+    tags: &[String],
+    added_at: i64,
+) -> Result<(), DbError> {
     tx.execute(
         "DELETE FROM torrent_tags WHERE info_hash = ?1",
-        params![row.info_hash],
+        params![info_hash],
     )?;
-    for tag in &row.tags {
+    for tag in tags {
         tx.execute(
             "INSERT OR IGNORE INTO torrent_tags (info_hash, tag) VALUES (?1, ?2)",
-            params![row.info_hash, tag],
+            params![info_hash, tag],
         )?;
     }
-    if let Some(category) = &row.category {
+    if let Some(category) = category {
         tx.execute(
             "INSERT OR IGNORE INTO torrent_categories (name, save_path, created_at)
              VALUES (?1, NULL, ?2)",
-            params![category, row.added_at],
+            params![category, added_at],
         )?;
     }
     Ok(())
@@ -289,7 +424,7 @@ pub fn get(conn: &Connection, info_hash: &str) -> Result<TorrentRow, DbError> {
     conn.query_row(
         "SELECT info_hash, name, total_length, piece_length, piece_count, is_private,
                 save_path, category, tags, state, added_at, completed_at,
-                uploaded, downloaded, ratio, trackers
+                uploaded, downloaded, amount_left, ratio, trackers
          FROM torrents WHERE info_hash = ?1",
         params![info_hash],
         TorrentRow::from_row,
@@ -320,7 +455,7 @@ pub fn list_all(conn: &Connection) -> Result<Vec<TorrentRow>, DbError> {
     let mut stmt = conn.prepare(
         "SELECT info_hash, name, total_length, piece_length, piece_count, is_private,
                 save_path, category, tags, state, added_at, completed_at,
-                uploaded, downloaded, ratio, trackers
+                uploaded, downloaded, amount_left, ratio, trackers
          FROM torrents ORDER BY added_at DESC",
     )?;
     let rows = stmt
@@ -333,7 +468,7 @@ pub fn list_by_state(conn: &Connection, state: &str) -> Result<Vec<TorrentRow>, 
     let mut stmt = conn.prepare(
         "SELECT info_hash, name, total_length, piece_length, piece_count, is_private,
                 save_path, category, tags, state, added_at, completed_at,
-                uploaded, downloaded, ratio, trackers
+                uploaded, downloaded, amount_left, ratio, trackers
          FROM torrents WHERE state = ?1 ORDER BY added_at DESC",
     )?;
     let rows = stmt
@@ -370,6 +505,7 @@ mod tests {
             completed_at: Some(1_700_001_000),
             uploaded: 5_000_000,
             downloaded: 1_000_000,
+            amount_left: 0,
             ratio: 5.0,
             trackers: vec!["http://tracker.example.com/announce".into()],
         }
@@ -384,7 +520,66 @@ mod tests {
         assert_eq!(fetched.name, row.name);
         assert_eq!(fetched.tags, row.tags);
         assert_eq!(fetched.trackers, row.trackers);
+        assert_eq!(fetched.amount_left, row.amount_left);
         assert!(fetched.is_private);
+    }
+
+    #[test]
+    fn cumulative_downloads_do_not_replace_live_amount_left() {
+        let conn = setup();
+        let mut row = sample();
+        row.state = "downloading".into();
+        row.total_length = 100;
+        row.downloaded = 250;
+        row.amount_left = 40;
+        upsert(&conn, &row).unwrap();
+
+        let fetched = get(&conn, &row.info_hash).unwrap();
+        assert_eq!(fetched.downloaded, 250);
+        assert_eq!(fetched.amount_left, 40);
+    }
+
+    #[test]
+    fn runtime_update_preserves_metadata_and_does_not_recreate_rows() {
+        let mut conn = setup();
+        let row = sample();
+        upsert(&conn, &row).unwrap();
+
+        let mut runtime = row.clone();
+        runtime.state = "paused".into();
+        runtime.completed_at = None;
+        runtime.uploaded = 7_000_000;
+        runtime.downloaded = 2_000_000;
+        runtime.amount_left = 123;
+        runtime.ratio = 3.5;
+        runtime.total_length = 2_000_000;
+        let tx = conn.transaction().unwrap();
+        assert!(update_runtime_in_tx(&tx, &runtime).unwrap());
+        tx.commit().unwrap();
+
+        let fetched = get(&conn, &row.info_hash).unwrap();
+        assert_eq!(fetched.name, row.name);
+        assert_eq!(fetched.save_path, row.save_path);
+        assert_eq!(fetched.category, row.category);
+        assert_eq!(fetched.tags, row.tags);
+        assert_eq!(fetched.trackers, row.trackers);
+        assert_eq!(fetched.state, runtime.state);
+        assert_eq!(fetched.completed_at, runtime.completed_at);
+        assert_eq!(fetched.uploaded, runtime.uploaded);
+        assert_eq!(fetched.downloaded, runtime.downloaded);
+        assert_eq!(fetched.amount_left, runtime.amount_left);
+        assert_eq!(fetched.ratio, runtime.ratio);
+        assert_eq!(fetched.total_length, runtime.total_length);
+
+        let mut missing = runtime;
+        missing.info_hash = "b".repeat(40);
+        let tx = conn.transaction().unwrap();
+        assert!(!update_runtime_in_tx(&tx, &missing).unwrap());
+        tx.commit().unwrap();
+        assert!(matches!(
+            get(&conn, &missing.info_hash),
+            Err(DbError::NotFound(_))
+        ));
     }
 
     #[test]

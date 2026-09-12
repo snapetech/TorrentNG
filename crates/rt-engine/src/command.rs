@@ -1,11 +1,11 @@
 /// Commands sent from the API layer down to the engine or individual torrent tasks.
 use std::{net::SocketAddr, path::PathBuf};
 
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 use rt_metainfo::{MagnetLink, TorrentMeta, TorrentMetaV1};
 use rt_metrics::{MemoryClass, MemoryLease, ResourceSnapshot};
-use rt_session::TorrentState;
+use rt_session::{TorrentHandle, TorrentState};
 use rt_storage::{StorageIoStats, StoragePlan, STORAGE_LATENCY_BUCKET_COUNT};
 
 use crate::torrent_task::TorrentCmd;
@@ -858,18 +858,25 @@ pub enum EngineCmd {
         tags: Vec<String>,
         reply: oneshot::Sender<CmdResult<String>>,
     },
-    /// Internal completion after detached torrent-blob persistence.
+    /// Internal completion after detached torrent-blob staging. The actor
+    /// publishes the staged file only after it still owns the pending add.
     PreparedTorrentAdd {
         meta: Box<TorrentMeta>,
-        blob: CmdResult<()>,
+        staged_blob: CmdResult<PathBuf>,
         save_path: Option<PathBuf>,
         paused: bool,
         category: Option<String>,
         tags: Vec<String>,
         reply: oneshot::Sender<CmdResult<String>>,
     },
-    /// Internal completion from the magnet metadata worker.
-    CompleteMagnet { info_hash: String, raw: Vec<u8> },
+    /// Internal completion from the magnet metadata worker. `source` is the
+    /// originating metadata-task channel and fences the completion to one
+    /// torrent incarnation when an info-hash is removed and later re-added.
+    CompleteMagnet {
+        info_hash: String,
+        raw: Vec<u8>,
+        source: mpsc::Sender<TorrentCmd>,
+    },
     /// Internal completion after magnet metainfo parsing has finished on a
     /// blocking worker. The validated blob is handed to a detached writer;
     /// only the durable/session projection remains serialized by the actor.
@@ -877,13 +884,15 @@ pub enum EngineCmd {
         info_hash: String,
         raw: Vec<u8>,
         meta: CmdResult<TorrentMeta>,
+        source: mpsc::Sender<TorrentCmd>,
     },
     /// Internal completion after the validated magnet blob has been written
     /// by a detached blocking worker.
     PreparedMagnetBlob {
         info_hash: String,
         meta: CmdResult<TorrentMeta>,
-        blob: CmdResult<()>,
+        blob: CmdResult<Option<PathBuf>>,
+        source: mpsc::Sender<TorrentCmd>,
     },
     /// Internal completion from detached DHT-registration metadata parsing.
     /// The engine actor validates that the task and lifecycle are still
@@ -978,7 +987,7 @@ pub enum EngineCmd {
         tracker: String,
         reply: oneshot::Sender<CmdResult<Vec<String>>>,
     },
-    /// Read a small durable control-plane setting. Native API auxiliary
+    /// Read a small durable control-plane setting. TorrentNG API auxiliary
     /// stores use this boundary instead of keeping restart-sensitive state in
     /// the HTTP process.
     GetSetting {
@@ -1055,6 +1064,10 @@ pub enum EngineCmd {
     /// current, quiesces the torrent, and queues the already-built plan.
     PreparedTorrentFields {
         info_hash: String,
+        /// Session identity captured before detached filesystem planning.
+        /// The info-hash alone is insufficient because a torrent can be
+        /// removed and re-added while the planner is still running.
+        torrent_handle: TorrentHandle,
         name: Option<String>,
         current_name: String,
         current_save_path: PathBuf,
@@ -1068,6 +1081,10 @@ pub enum EngineCmd {
     /// promotion instead of spawning duplicate torrent tasks.
     PreparedTorrentTask {
         info_hash: String,
+        /// Session identity captured before detached metainfo loading. A
+        /// removed and re-added torrent may reuse the info-hash while the old
+        /// promotion worker is still finishing.
+        torrent_handle: Option<TorrentHandle>,
         prepared: CmdResult<PreparedTorrentTaskData>,
     },
     /// Execute a durable storage plan through the engine job table.
@@ -1212,7 +1229,7 @@ pub enum EngineCmd {
         reply: oneshot::Sender<CmdResult<()>>,
     },
     /// Persist and apply the HTTP user agent used by tracker and webseed
-    /// clients. This remains an engine command so the native API cannot
+    /// clients. This remains an engine command so the TorrentNG API cannot
     /// report a process-local setting as applied while the engine keeps using
     /// a different value.
     SetUserAgent {

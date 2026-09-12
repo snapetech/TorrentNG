@@ -77,7 +77,7 @@ else
 fi
 
 if [[ -z "$configured_secret" ]]; then
-  emit "session secret" "PASS" "not applicable for native API-token-only config"
+  emit "session secret" "PASS" "not applicable for TorrentNG API-token-only config"
 elif [[ -z "$secret" || "$secret" == "change-me" || "$secret" == "certification-only-change-me" ]]; then
   emit "session secret" "FAIL" "example or empty secret_key"
 else

@@ -146,7 +146,7 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
   const ratio = (t.ratio / 1000).toFixed(3)
   const tags = t.tags ? t.tags.split(',').filter(Boolean) : []
   const canStop = t.state !== 0
-  const state = t.state === 5 || (t.message && !t.is_active)
+  const state = t.state === 3
     ? { label: 'Error', color: 'var(--danger)' }
     : t.state === 0
       ? { label: 'Stopped', color: 'var(--faint)' }

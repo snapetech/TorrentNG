@@ -51,7 +51,7 @@ pub async fn health(State(s): State<AppState>) -> impl IntoResponse {
                 operation = "count",
                 result = "error",
                 error = %e,
-                "sidecar cache health probe failed"
+                "compatible-client service cache health probe failed"
             );
             (0, false)
         }
@@ -117,7 +117,7 @@ pub struct StorageRoot {
 }
 
 pub async fn storage_roots(State(s): State<AppState>) -> impl IntoResponse {
-    // A sidecar without configured roots does not own `/`; reporting it as a
+    // A compatible-client service without configured roots does not own `/`; reporting it as a
     // storage root gives callers a false answer about where writes may occur.
     let roots = s.cfg.storage_roots.clone();
     let fallback_roots = roots.clone();
@@ -157,7 +157,7 @@ pub async fn storage_roots(State(s): State<AppState>) -> impl IntoResponse {
 }
 
 pub async fn list_jobs() -> impl IntoResponse {
-    // Jobs are owned by the native engine. A sidecar has no durable local job
+    // Jobs are owned by the TorrentNG client. A compatible-client service has no durable local job
     // store and must not turn an unavailable remote control plane into an
     // empty successful result.
     (
@@ -165,7 +165,7 @@ pub async fn list_jobs() -> impl IntoResponse {
         Json(serde_json::json!({
             "error": {
                 "code": "NOT_IMPLEMENTED",
-                "message": "job control is only available in native engine mode"
+                "message": "job control is only available in the direct TorrentNG client arrangement"
             }
         })),
     )
@@ -2292,6 +2292,7 @@ fn statvfs(_path: &FsPath) -> Result<FsStat, String> {
 // --- Torrent list ---
 
 const MAX_TORRENT_LIVE_STATS: usize = 128;
+const LIVE_RATE_STALE_AFTER_SECS: i64 = 15;
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct TorrentLiveStatsQuery {
@@ -2354,11 +2355,18 @@ fn live_sampled_at() -> u64 {
 fn live_row_response(row: TorrentLiveRow, sampled_at: u64) -> TorrentLiveStatResponse {
     let size_bytes = u64::try_from(row.size_bytes.max(0)).unwrap_or(0);
     let bytes_done = u64::try_from(row.bytes_done.max(0)).unwrap_or(0);
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .min(i64::MAX as u64) as i64;
+    let fresh = row.updated_at > 0
+        && now_secs.saturating_sub(row.updated_at) <= LIVE_RATE_STALE_AFTER_SECS;
     TorrentLiveStatResponse {
         hash: row.hash,
         amount_left: size_bytes.saturating_sub(bytes_done),
-        download_rate: row.down_rate.max(0),
-        upload_rate: row.up_rate.max(0),
+        download_rate: if fresh { row.down_rate.max(0) } else { 0 },
+        upload_rate: if fresh { row.up_rate.max(0) } else { 0 },
         sampled_at: if row.updated_at > 0 {
             u64::try_from(row.updated_at)
                 .unwrap_or(sampled_at.saturating_div(1_000))
@@ -2418,10 +2426,10 @@ pub async fn list_torrents(
     if let Err(error) = validate_page_offset(params.offset) {
         return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
     }
-    // The sidecar cache is a compatibility projection, not an export API.
+    // The compatible-client service cache is a compatibility projection, not an export API.
     // Clamp the caller-controlled page before the SQL query so a client
     // cannot turn this endpoint into a large response by bypassing the
-    // native handler's limit contract.
+    // TorrentNG handler's limit contract.
     params.limit = bounded_page_limit(params.limit);
     match s
         .db
@@ -2613,7 +2621,7 @@ pub async fn add_torrent(State(s): State<AppState>, mut multipart: Multipart) ->
         match s.backend.add_magnet(m, &save_path, &category, start).await {
             Ok(_) => return StatusCode::ACCEPTED.into_response(),
             Err(e) => {
-                tracing::error!(component = "api", operation = "add_magnet", result = "error", error = %e, "native magnet add failed");
+                tracing::error!(component = "api", operation = "add_magnet", result = "error", error = %e, "TorrentNG client magnet add failed");
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         }
@@ -2629,7 +2637,7 @@ pub async fn add_torrent(State(s): State<AppState>, mut multipart: Multipart) ->
         {
             Ok(_) => return StatusCode::ACCEPTED.into_response(),
             Err(e) => {
-                tracing::error!(component = "api", operation = "add_torrent", result = "error", error = %e, "native torrent add failed");
+                tracing::error!(component = "api", operation = "add_torrent", result = "error", error = %e, "TorrentNG client torrent add failed");
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         }
@@ -2665,7 +2673,7 @@ pub async fn delete_torrent(
                     torrent = %hash,
                     result = "error",
                     error = %e,
-                    "cache delete failed after native delete"
+                    "cache delete failed after TorrentNG client delete"
                 );
                 // The backend is already mutated, but reporting success here
                 // would leave every cache consumer with a false view of the
@@ -2684,7 +2692,7 @@ pub async fn delete_torrent(
                 torrent = %hash,
                 result = "error",
                 error = %e,
-                "native delete failed"
+                "TorrentNG client delete failed"
             );
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
@@ -2707,7 +2715,7 @@ pub async fn torrent_start(
                     action = "start",
                     result = "error",
                     error = %error,
-                    "native start succeeded but cache projection failed"
+                    "TorrentNG client start succeeded but cache projection failed"
                 );
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
@@ -2715,7 +2723,7 @@ pub async fn torrent_start(
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => {
-            tracing::error!(component = "api", operation = "start", result = "error", torrent = %hash, error = %e, "native start failed");
+            tracing::error!(component = "api", operation = "start", result = "error", torrent = %hash, error = %e, "TorrentNG client start failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -2734,7 +2742,7 @@ pub async fn torrent_stop(
                     action = "stop",
                     result = "error",
                     error = %error,
-                    "native stop succeeded but cache projection failed"
+                    "TorrentNG client stop succeeded but cache projection failed"
                 );
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
@@ -2742,7 +2750,7 @@ pub async fn torrent_stop(
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => {
-            tracing::error!(component = "api", operation = "stop", result = "error", torrent = %hash, error = %e, "native stop failed");
+            tracing::error!(component = "api", operation = "stop", result = "error", torrent = %hash, error = %e, "TorrentNG client stop failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -2754,7 +2762,7 @@ pub async fn torrent_recheck(
     match s.backend.recheck(&hash).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
-            tracing::error!(component = "api", operation = "recheck", result = "error", torrent = %hash, error = %e, "native recheck failed");
+            tracing::error!(component = "api", operation = "recheck", result = "error", torrent = %hash, error = %e, "TorrentNG client recheck failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -2766,7 +2774,7 @@ pub async fn torrent_reannounce(
     match s.backend.reannounce(&hash).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
-            tracing::error!(component = "api", operation = "reannounce", result = "error", torrent = %hash, error = %e, "native reannounce failed");
+            tracing::error!(component = "api", operation = "reannounce", result = "error", torrent = %hash, error = %e, "TorrentNG client reannounce failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -2781,7 +2789,7 @@ pub async fn torrent_trackers(
     match s.backend.list_trackers(&hash).await {
         Ok(trackers) => Json(serde_json::json!({ "trackers": trackers })).into_response(),
         Err(e) => {
-            tracing::error!(component = "api", operation = "list_trackers", result = "error", torrent = %hash, error = %e, "native tracker listing failed");
+            tracing::error!(component = "api", operation = "list_trackers", result = "error", torrent = %hash, error = %e, "TorrentNG client tracker listing failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -2888,7 +2896,7 @@ pub async fn torrent_files(
     match s.backend.list_files(&hash).await {
         Ok(files) => Json(serde_json::json!({ "files": files })).into_response(),
         Err(e) => {
-            tracing::error!(component = "api", operation = "list_files", result = "error", torrent = %hash, error = %e, "native file listing failed");
+            tracing::error!(component = "api", operation = "list_files", result = "error", torrent = %hash, error = %e, "TorrentNG client file listing failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -2929,7 +2937,7 @@ pub async fn set_file_priorities(
                 priority = item.priority,
                 result = "error",
                 error = %e,
-                "native file priority update failed"
+                "TorrentNG client file priority update failed"
             );
             failures.push(format!("{}: {e}", item.index));
         }
@@ -3610,8 +3618,10 @@ fn redact_log_url(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        merge_rtorrent_overlay, read_script_output, rtorrent_settings, write_rtorrent_overlay,
+        live_row_response, merge_rtorrent_overlay, read_script_output, rtorrent_settings,
+        write_rtorrent_overlay,
     };
+    use crate::cache::TorrentLiveRow;
     use std::collections::BTreeMap;
     use tokio::io::{duplex, AsyncWriteExt};
 
@@ -3649,5 +3659,21 @@ mod tests {
         assert_eq!(merged.get("max_uploads"), Some(&"77".to_owned()));
         assert_eq!(merged.get("max_downloads"), Some(&"88".to_owned()));
         assert_eq!(custom, "custom.setting = yes");
+    }
+
+    #[test]
+    fn live_stats_zero_expired_rates() {
+        let row = TorrentLiveRow {
+            hash: "stale".to_owned(),
+            size_bytes: 100,
+            bytes_done: 25,
+            down_rate: 1_000,
+            up_rate: 2_000,
+            updated_at: 1,
+        };
+        let response = live_row_response(row, 1_700_000_000_000);
+        assert_eq!(response.download_rate, 0);
+        assert_eq!(response.upload_rate, 0);
+        assert_eq!(response.amount_left, 75);
     }
 }

@@ -81,6 +81,7 @@ pub async fn run_metadata_task(
     trackers: Vec<String>,
     mut cmd_rx: mpsc::Receiver<TorrentCmd>,
     engine_tx: mpsc::Sender<EngineCmd>,
+    task_tx: mpsc::Sender<TorrentCmd>,
     resources: ResourceGovernor,
     listen_port: u16,
     max_peers: usize,
@@ -125,6 +126,7 @@ pub async fn run_metadata_task(
                             max_peers,
                             &mut peer_attempts,
                             &engine_tx,
+                            &task_tx,
                             &resources,
                             &network_budget,
                         )
@@ -142,7 +144,15 @@ pub async fn run_metadata_task(
                     } else {
                         match fetch_from_incoming_peer(stream, peer_addr, info_hash, handshake, resources.clone(), peer_permit).await {
                         Ok(info) => {
-                            if complete_metadata(&engine_tx, &info_hash_hex, &trackers, info).await {
+                            if complete_metadata(
+                                &engine_tx,
+                                &task_tx,
+                                &info_hash_hex,
+                                &trackers,
+                                info,
+                            )
+                            .await
+                            {
                                 return;
                             }
                         }
@@ -168,7 +178,15 @@ pub async fn run_metadata_task(
                     } else {
                         match fetch_from_incoming_utp_peer(stream, peer_addr, info_hash, handshake, resources.clone(), peer_permit).await {
                             Ok(info) => {
-                                if complete_metadata(&engine_tx, &info_hash_hex, &trackers, info).await {
+                                if complete_metadata(
+                                    &engine_tx,
+                                    &task_tx,
+                                    &info_hash_hex,
+                                    &trackers,
+                                    info,
+                                )
+                                .await
+                                {
                                     return;
                                 }
                             }
@@ -250,12 +268,17 @@ pub async fn run_metadata_task(
                         // reply immediately with the current paused state.
                         let _ = reply.send(Ok(paused));
                     }
-                    TorrentCmd::ResumeAfterStorageMove { resume_paused, .. } => {
+                    TorrentCmd::ResumeAfterStorageMove {
+                        resume_paused,
+                        reply,
+                        ..
+                    } => {
                         paused = resume_paused;
                         if !resume_paused {
                             tracker_event = TrackerEvent::Started;
                             tracker_tick.reset_immediately();
                         }
+                        let _ = reply.send(Ok(()));
                     }
                     TorrentCmd::Recheck { .. }
                     | TorrentCmd::CancelJob { .. }
@@ -296,6 +319,7 @@ pub async fn run_metadata_task(
                     max_peers,
                     &mut peer_attempts,
                     &engine_tx,
+                    &task_tx,
                     &resources,
                     &network_budget,
                 )
@@ -333,6 +357,7 @@ async fn try_fetch_from_peers(
     max_peers: usize,
     peer_attempts: &mut HashMap<SocketAddr, Instant>,
     engine_tx: &mpsc::Sender<EngineCmd>,
+    task_tx: &mpsc::Sender<TorrentCmd>,
     resources: &ResourceGovernor,
     network_budget: &GlobalNetworkBudget,
 ) -> bool {
@@ -360,7 +385,7 @@ async fn try_fetch_from_peers(
     while let Some((peer, result)) = in_flight.next().await {
         match result {
             Ok(info) => {
-                if complete_metadata(engine_tx, info_hash_hex, trackers, info).await {
+                if complete_metadata(engine_tx, task_tx, info_hash_hex, trackers, info).await {
                     return true;
                 }
             }
@@ -493,6 +518,7 @@ async fn metadata_fetch_attempt(
 
 async fn complete_metadata(
     engine_tx: &mpsc::Sender<EngineCmd>,
+    task_tx: &mpsc::Sender<TorrentCmd>,
     info_hash_hex: &str,
     trackers: &[String],
     info: Vec<u8>,
@@ -503,6 +529,7 @@ async fn complete_metadata(
         EngineCmd::CompleteMagnet {
             info_hash: info_hash_hex.to_owned(),
             raw,
+            source: task_tx.clone(),
         },
         "metadata_completion",
     )
@@ -1332,6 +1359,7 @@ mod tests {
             pressure_critical_pct: 90,
         });
         let (engine_tx, mut engine_rx) = mpsc::channel(1);
+        let (task_tx, _task_rx) = mpsc::channel(1);
         let mut attempts = HashMap::new();
 
         assert!(
@@ -1343,6 +1371,7 @@ mod tests {
                 8,
                 &mut attempts,
                 &engine_tx,
+                &task_tx,
                 &governor,
                 &GlobalNetworkBudget::unlimited(),
             )
@@ -1350,7 +1379,7 @@ mod tests {
         );
         let cmd = engine_rx.recv().await.unwrap();
         match cmd {
-            EngineCmd::CompleteMagnet { info_hash, raw } => {
+            EngineCmd::CompleteMagnet { info_hash, raw, .. } => {
                 assert_eq!(info_hash, info_hash_hex);
                 let parsed = rt_metainfo::parse_torrent(&raw).unwrap();
                 assert_eq!(parsed.name(), "test");
@@ -1371,11 +1400,13 @@ mod tests {
             .unwrap();
 
         let engine_tx_for_task = engine_tx.clone();
+        let (task_tx, _task_rx) = mpsc::channel(1);
         let info_hash = "a".repeat(40);
         let trackers = Vec::new();
         let mut completion = tokio::spawn(async move {
             complete_metadata(
                 &engine_tx_for_task,
+                &task_tx,
                 &info_hash,
                 &trackers,
                 b"d4:name4:test6:lengthi1ee".to_vec(),

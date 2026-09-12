@@ -146,7 +146,7 @@ async function installScaleApiMock(page: Page) {
     }
     if (path === '/api/v1/engine') {
       return json({
-        mode: 'native',
+        mode: 'torrentng',
         native_engine: true,
         torrent_count: SCALE_TOTAL,
         storage: {},

@@ -140,7 +140,7 @@ async function installApiMock(page: Page) {
     }
     if (path === '/api/v1/engine') {
       return json({
-        mode: 'native',
+        mode: 'torrentng',
         native_engine: true,
         torrent_count: torrents.length,
         storage: {},

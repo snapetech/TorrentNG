@@ -1,7 +1,8 @@
 # Benchmarks
 
-Track 1 roadmap benchmarks that can run without a live rTorrent instance live in
-`sidecar/tests/benchmarks.rs`.
+Compatible-client service benchmarks that can run without a live rTorrent
+client live in `sidecar/tests/benchmarks.rs`. The source path is retained for
+repository compatibility.
 
 Run the synthetic API checks explicitly:
 

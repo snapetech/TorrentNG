@@ -6,8 +6,8 @@ use rusqlite::Connection;
 
 use crate::error::DbError;
 
-/// Current native database schema version.
-pub const CURRENT_SCHEMA_VERSION: u32 = 9;
+/// Current TorrentNG client database schema version.
+pub const CURRENT_SCHEMA_VERSION: u32 = 10;
 
 /// Apply all pending migrations to bring the database up to the current schema version.
 ///
@@ -327,6 +327,28 @@ const MIGRATIONS: &[(u32, &str)] = &[
         ALTER TABLE torrent_trackers ADD COLUMN tracker_id BLOB;
         ",
     ),
+    (
+        10,
+        "
+        PRAGMA foreign_keys = ON;
+
+        -- `downloaded` is cumulative transfer accounting. Keep the live
+        -- payload invariant separately so restart/recheck cannot infer
+        -- completion from an old cumulative byte count.
+        ALTER TABLE torrents ADD COLUMN amount_left INTEGER NOT NULL DEFAULT 0;
+        UPDATE torrents
+        SET amount_left = CASE
+            -- `completed_at` is historical and can survive a recheck that
+            -- moves a torrent back to `downloading`. Only use it to recover
+            -- completion for lifecycle states that cannot represent an
+            -- active payload download.
+            WHEN state IN ('seeding', 'completed')
+                 OR (completed_at IS NOT NULL
+                     AND state IN ('paused', 'stopped', 'queued', 'error')) THEN 0
+            ELSE MAX(total_length, 0)
+        END;
+        ",
+    ),
 ];
 
 #[cfg(test)]
@@ -441,6 +463,128 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn migrate_adds_and_backfills_live_amount_left() {
+        let conn = open_mem();
+        // Construct the pre-v10 schema so this exercises the actual ALTER
+        // TABLE migration instead of only checking a fresh database.
+        for (version, sql) in MIGRATIONS.iter().take(9) {
+            conn.execute_batch(sql).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO torrents
+                (info_hash, name, total_length, piece_length, piece_count,
+                 save_path, state, added_at, downloaded)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                "a".repeat(40),
+                "legacy",
+                100,
+                10,
+                10,
+                "/data",
+                "downloading",
+                1,
+                250,
+            ],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let amount_left: i64 = conn
+            .query_row(
+                "SELECT amount_left FROM torrents WHERE info_hash = ?1",
+                ["a".repeat(40)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // The legacy `downloaded` column is cumulative transfer accounting;
+        // it can exceed the payload after re-downloads. Without piece-level
+        // state, the only safe migration value for an incomplete torrent is
+        // the full payload so the first recheck can establish the real value.
+        assert_eq!(amount_left, 100);
+    }
+
+    #[test]
+    fn migrate_does_not_use_stale_completion_timestamp_for_downloading_state() {
+        let conn = open_mem();
+        for (version, sql) in MIGRATIONS.iter().take(9) {
+            conn.execute_batch(sql).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO torrents
+                (info_hash, name, total_length, piece_length, piece_count,
+                 save_path, state, added_at, completed_at, downloaded)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                "b".repeat(40),
+                "rechecked",
+                100,
+                10,
+                10,
+                "/data",
+                "downloading",
+                1,
+                2,
+                250,
+            ],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let amount_left: i64 = conn
+            .query_row(
+                "SELECT amount_left FROM torrents WHERE info_hash = ?1",
+                ["b".repeat(40)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(amount_left, 100);
+    }
+
+    #[test]
+    fn migrate_recovers_paused_completion_from_historical_timestamp() {
+        let conn = open_mem();
+        for (version, sql) in MIGRATIONS.iter().take(9) {
+            conn.execute_batch(sql).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO torrents
+                (info_hash, name, total_length, piece_length, piece_count,
+                 save_path, state, added_at, completed_at, downloaded)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                "c".repeat(40),
+                "paused-seed",
+                100,
+                10,
+                10,
+                "/data",
+                "paused",
+                1,
+                2,
+                100,
+            ],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let amount_left: i64 = conn
+            .query_row(
+                "SELECT amount_left FROM torrents WHERE info_hash = ?1",
+                ["c".repeat(40)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(amount_left, 0);
     }
 
     #[test]

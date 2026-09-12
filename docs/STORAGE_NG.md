@@ -1,7 +1,7 @@
 # Storage NG — Next-Generation Disk I/O Design
 
-This document describes the next-generation disk I/O subsystem in the native
-Rust engine. The implementation lives in `crates/rt-storage` and preserves the
+This document describes the next-generation disk I/O subsystem in the TorrentNG
+client. The implementation lives in `crates/rt-storage` and preserves the
 public surface used by `rt-engine` (`MountScheduler`, `IoClass`,
 `SchedulerConfig`, `PieceVerifier`, `scheduled_read`, `scheduled_write`) while
 adding the bounded disk layer beneath it.
@@ -287,8 +287,8 @@ Recheck (`PieceVerifier`) becomes a low-priority elevator producer:
 device-sequential, throttled, page-cache-polite (`DONTNEED` after each
 region), and `SEEK_HOLE`/`SEEK_DATA`-aware so sparse gaps are skipped instead
 of read as zeros. A 100k-torrent recheck is a planned linear sweep, not
-random thrash. Resumable-recheck checkpoints are persisted by the native
-engine's storage-job dispatcher and are unchanged by this scheduling design.
+random thrash. Resumable-recheck checkpoints are persisted by the TorrentNG
+client's storage-job dispatcher and are unchanged by this scheduling design.
 
 ### Topology-aware preallocation
 

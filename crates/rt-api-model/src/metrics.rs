@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// Cross-facade counters for the bounded snapshot and SSE paths. Native and
+/// Cross-facade counters for the bounded snapshot and SSE paths. TorrentNG and
 /// qBittorrent routers can share one instance in the daemon, so the metrics
 /// endpoint reports the combined API pressure instead of whichever facade
 /// happened to be constructed first.

@@ -1,7 +1,7 @@
 # Tracker Identity
 
 TorrentNG pins one tracker-facing rTorrent 0.16.11 identity **family** for
-both the native engine and the rTorrent sidecar:
+the TorrentNG client and the compatible rTorrent integration:
 
 ```toml
 user_agent = "rtorrent/0.16.11/0.16.11"
@@ -38,8 +38,9 @@ installs seeding the same swarm — including two of the *same* user's own
 hosts — would present the identical id, which is exactly what tracker
 multi-client detection looks for.
 
-This was not a rate-limiting, port-reuse, DHT, or dual-stack (native +
-sidecar) issue — those were checked and ruled out. It was purely the static
+This was not a rate-limiting, port-reuse, DHT, or dual-stack (TorrentNG client
+plus compatible integration) issue — those were checked and ruled out. It was
+purely the static
 peer_id suffix. Fixed by generating a random 12-byte suffix per install and
 persisting it (`crates/rt-engine/src/peer_id.rs::init`,
 `sidecar/src/identity.rs::load_or_generate_peer_id`), so every install
@@ -71,25 +72,28 @@ and HTTP User-Agent do not match the client/version pair they allow.
 
 ## Per-install peer ID generation
 
-Both engines resolve the peer_id the same way, in priority order:
+The TorrentNG client and compatible rTorrent integration resolve the peer_id
+the same way, in priority order:
 
-1. `TORRENTNG_PEER_ID` / `TNG_PEER_ID` (native) or `TNG_PEER_ID` /
-   `RTNG_PEER_ID` (sidecar) — a full, explicit 20-byte override. Always wins.
+1. `TORRENTNG_PEER_ID` / `TNG_PEER_ID` (TorrentNG client) or `TNG_PEER_ID` /
+   `RTNG_PEER_ID` (compatible integration) — a full, explicit 20-byte
+   override. Always wins.
 2. A 12-byte suffix persisted from a previous run:
-   - Native: `<session_dir>/peer_id_suffix`
+   - TorrentNG client: `<session_dir>/peer_id_suffix`
      (`crates/rt-engine/src/peer_id.rs`).
-   - Sidecar: `<data_dir>/peer_id_suffix` (`sidecar/src/identity.rs`).
+   - Compatible integration: `<data_dir>/peer_id_suffix`
+     (`sidecar/src/identity.rs`).
 3. Otherwise, a freshly generated random 12-character alphanumeric suffix,
    written to that same file so future restarts stay on the same identity.
 
-The sidecar additionally treats `rtorrent.peer_id` in `config.toml` as a
+The compatible rTorrent integration additionally treats `rtorrent.peer_id` in `config.toml` as a
 sentinel: if it is still exactly `-lt100B-000000000000` after config-file and
 env overrides are applied (i.e. nobody actually customized it), `Config::load`
 resolves and persists a real per-install id in its place before startup
 continues. This makes upgrading self-healing — an old config file or deploy
 template that still hardcodes the literal default does not defeat the fix.
 
-## Native Engine
+## TorrentNG Client
 
 `crates/rt-engine/src/peer_id.rs` exposes `peer_id::init(session_dir)`,
 called once from `torrentngd`'s `main.rs` right after the session directory
@@ -104,7 +108,7 @@ TNG_PEER_ID="-lt100B-000000000000" \
 torrentngd
 ```
 
-Legacy override names also exist for native-only compatibility:
+Legacy override names also exist for TorrentNG-client compatibility:
 
 ```sh
 TORRENTNG_USER_AGENT="rtorrent/0.16.11/0.16.11"
@@ -116,9 +120,9 @@ above for reproducible testing on a single, throwaway install. Never bake a
 literal peer_id into a shared config template, image, or fleet-wide env
 var — that recreates the incident above.
 
-## rTorrent Sidecar
+## Compatible rTorrent Integration
 
-The sidecar uses the same `user_agent` in `sidecar/src/config.rs` and the
+The compatible integration uses the same `user_agent` in `sidecar/src/config.rs` and the
 packaged deployment configs; `peer_id` is resolved per-install as described
 above (packaged configs no longer set it):
 
@@ -135,10 +139,10 @@ TNG_USER_AGENT="rtorrent/0.16.11/0.16.11"
 TNG_PEER_ID="-lt100B-000000000000"
 ```
 
-The sidecar also accepts `RTNG_USER_AGENT` and `RTNG_PEER_ID` for older host
+The compatible integration also accepts `RTNG_USER_AGENT` and `RTNG_PEER_ID` for older host
 service files. Those aliases must use the same values.
 
-On startup the sidecar:
+On startup the compatible integration:
 
 1. Calls `network.http.user_agent.set` with rTorrent's required leading empty
    XMLRPC target argument.
@@ -151,14 +155,15 @@ On startup the sidecar:
    `scheduler.simple.update` over the `started` view.
 
 The leading empty XMLRPC argument is the rTorrent target slot. It is not a
-sidecar identity and must not be removed.
+TorrentNG identity and must not be removed.
 
 The packaged rTorrent build starts with `tng.identity_ready=0`. Session
-torrents may enter the `started` desired-state view while the sidecar rewrites
+torrents may enter the `started` desired-state view while the compatible
+integration rewrites
 their identities, but `scheduler.simple.added` is held back until the gate is
 released. This prevents a startup announce with a stale or historical
 `local_id`. The same `d.local_id.set=<resolved peer_id>` command is included
-when the sidecar handles `load.start` / `load.raw_start`, and is reapplied
+when the compatible integration handles `load.start` / `load.raw_start`, and is reapplied
 before an explicit `start`, so torrents added after startup use the install
 identity too.
 
@@ -167,9 +172,9 @@ identity too.
 Existing installs self-heal on their next restart after upgrading — no
 manual file edits are required:
 
-- **Native (`torrentngd`)**: on next start, `peer_id::init` finds no
+- **TorrentNG client (`torrentngd`)**: on next start, `peer_id::init` finds no
   `<session_dir>/peer_id_suffix`, generates one, and persists it.
-- **Sidecar**: on next start, `Config::load` sees `rtorrent.peer_id` is
+- **Compatible rTorrent integration**: on next start, `Config::load` sees `rtorrent.peer_id` is
   still the sentinel `-lt100B-000000000000` (whether from an old packaged
   config file or from having never set it) and replaces it with a generated,
   persisted id — unless the config or `TNG_PEER_ID`/`RTNG_PEER_ID` was
@@ -196,7 +201,7 @@ Do not use these:
 
 ## Verification
 
-For a packaged rTorrent sidecar container, verify the live tracker identity with
+For a packaged compatible-client rTorrent container, verify the live tracker identity with
 an SCGI/XMLRPC helper when one is available:
 
 ```sh
@@ -211,7 +216,8 @@ Expected: `network.http.user_agent` is `rtorrent/0.16.11/0.16.11`, and
 sentinel and something is wrong (check `data_dir`/`session_dir` is writable).
 
 The stock production image is intentionally small and may not ship an `xmlrpc`
-CLI. The sidecar API can still verify the applied User-Agent when authenticated:
+CLI. The compatible-client service API can still verify the applied User-Agent
+when authenticated:
 
 ```sh
 curl -H "Authorization: Bearer $TNG_API_TOKEN" \
@@ -221,9 +227,9 @@ curl -H "Authorization: Bearer $TNG_API_TOKEN" \
 To confirm the persisted per-install suffix directly:
 
 ```sh
-# sidecar
+# compatible-client service
 cat "$TNG_DATA_DIR/peer_id_suffix"     # e.g. /var/lib/torrentng/peer_id_suffix
-# native
+# TorrentNG client
 cat "$TORRENTNGD_SESSION_DIR/peer_id_suffix"
 ```
 

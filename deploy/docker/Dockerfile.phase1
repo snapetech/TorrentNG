@@ -1,5 +1,5 @@
 # Phase 1: Known-good rTorrent + ruTorrent bundle
-# No Rust sidecar yet — this is the "make existing users less miserable" release.
+# No TorrentNG compatible-client service yet — this is the "make existing users less miserable" release.
 # rTorrent 0.16.11, libtorrent 0.16.11, ruTorrent 5.3.1,
 # tinyxml2 XMLRPC backend, nginx proxy.
 

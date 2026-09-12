@@ -10,8 +10,8 @@ For the broader feature, API, field, and test backlog matrices, see
 ## Current Disposition — 2026-09-04
 
 The repository-actionable compatibility work in this document is implemented
-for the declared native, qBittorrent, Transmission, Deluge, and rTorrent
-facade contracts. The remaining low-confidence rows are deliberately
+for the declared TorrentNG-client, qBittorrent, Transmission, Deluge, and
+rTorrent compatible-client contracts. The remaining low-confidence rows are deliberately
 fixture/client dependent: proprietary plugin fields, public-client behavior,
 and deeper presentation parity require external client captures or a product
 decision about which fields TorrentNG should expose. They are qualification or
@@ -54,7 +54,7 @@ Shared import features:
   such as `resume.dat`, `downloads.config`, and `torrents.config`.
 - Path remapping through `ImportOptions::path_remaps`.
 - Size limits and symlink-safe directory walking.
-- Conversion into native fastresume state through `MigrationPlan::to_fastresume_import`,
+- Conversion into TorrentNG-client fastresume state through `MigrationPlan::to_fastresume_import`,
   `apply_fastresume`, and `apply_native_import`.
 
 Known import limits:
@@ -62,9 +62,9 @@ Known import limits:
 - Tixati and some BiglyBT/Vuze private fields are intentionally verification-first
   because public, stable state schemas are limited.
 - Piece state is downgraded when resume data conflicts with torrent metadata.
-- Client-specific scheduler/RSS/search/plugin histories are not native torrent
+- Client-specific scheduler/RSS/search/plugin histories are not TorrentNG-client torrent
   progress; migration dry runs preserve them as auxiliary artifacts so users can
-  carry the files forward without mixing them into piece/progress state.
+  carry the files forward without mixing them into TorrentNG-client piece/progress state.
 
 ## qBittorrent API Facade
 
@@ -73,15 +73,15 @@ Local surface: `crates/rt-api-qbit`.
 | API group | Upstream surface | Local status |
 |---|---|---|
 | Authentication | `auth/login`, `auth/logout` | Implemented |
-| Application | version, API version, build info, shutdown, preferences, set preferences, default save path, network interface probes, test email | Implemented as native/explicit-unsupported compatibility where no native equivalent exists; bounded `setPreferences` state is durable through the engine settings store and process-local only for no-engine test facades |
-| qBittorrent 5 cookie/API key APIs | `app/getCookies`, `app/setCookies`, `app/rotateAPIKey`, `app/deleteAPIKey` | Cookie arrays and API-key rotate/delete state are bounded and durable through the engine settings store; no-engine test facades remain process-local, and the API key is not an auth credential |
-| Logs | main log, peer log | Main log projects retained app/session events; peer log projects native peer snapshots when an engine is attached |
+| Application | version, API version, build info, shutdown, preferences, set preferences, default save path, network interface probes, test email | Implemented as TorrentNG-client/explicit-unsupported compatibility where no client equivalent exists; bounded `setPreferences` state is durable through the engine settings store and process-local only for no-client test facades |
+| qBittorrent 5 cookie/API key APIs | `app/getCookies`, `app/setCookies`, `app/rotateAPIKey`, `app/deleteAPIKey` | Cookie arrays and API-key rotate/delete state are bounded and durable through the engine settings store; no-client test facades remain process-local, and the API key is not an auth credential |
+| Logs | main log, peer log | Main log projects retained app/session events; peer log projects TorrentNG-client peer snapshots when a client is attached |
 | Sync | `sync/maindata`, `sync/torrentPeers` | Implemented; maindata carries broad torrent/server-state keys and torrentPeers carries qBit peer shape with stable RID deltas |
 | Transfer | global info, speed limits, speed-limit mode, ban peers | Implemented |
 | Torrent reads | list with modern qBit path/counter/limit/mode/magnet/infohash fields, properties, trackers, web seeds, files, piece states, piece hashes, export | Implemented; properties include registry/engine-backed counters, lifecycle times, piece counts, and limits where available; export streams persisted raw `.torrent` bytes instead of a placeholder body |
-| Torrent lifecycle | add, pause/resume legacy aliases, start/stop v5 aliases, delete, recheck, reannounce | Implemented; qBittorrent add rejects malformed or unknown multipart options instead of silently dropping them, and returns explicit unsupported results for meaningful options with no native equivalent |
-| Torrent mutation | tracker add/edit/remove, peers, priority order, file priority, limits, share limits, force start, super seeding, auto management, sequential, first/last, location/save path, rename, category with configured save paths, tags with global tag cleanup | Implemented where native behavior exists; native force-start/auto-management/auto-TMM and move-on-completion operations return explicit unsupported results rather than persisting inert flags |
-| RSS | folders, feeds, items, rules, matching articles | Implemented as bounded stateful compatibility: folders, feeds, read markers, refresh timestamps, and rule JSON are durable with the native engine attached and process-local for no-engine facades |
+| Torrent lifecycle | add, pause/resume legacy aliases, start/stop v5 aliases, delete, recheck, reannounce | Implemented; qBittorrent add rejects malformed or unknown multipart options instead of silently dropping them, and returns explicit unsupported results for meaningful options with no TorrentNG-client equivalent |
+| Torrent mutation | tracker add/edit/remove, peers, priority order, file priority, limits, share limits, force start, super seeding, auto management, sequential, first/last, location/save path, rename, category with configured save paths, tags with global tag cleanup | Implemented where the TorrentNG client or selected compatible client supports it; unsupported force-start/auto-management/auto-TMM and move-on-completion operations return explicit unsupported results rather than persisting inert flags |
+| RSS | folders, feeds, items, rules, matching articles | Implemented as bounded stateful compatibility: folders, feeds, read markers, refresh timestamps, and rule JSON are durable with the TorrentNG client attached and process-local for no-client facades |
 | Search | status, categories, plugins, plugin mutation, start/stop/results/delete | Implemented as stateful compatibility: plugin metadata/enabled state and search job lifecycle round-trip, with intentionally empty local result sets |
 
 ## Transmission RPC Facade
@@ -90,17 +90,17 @@ Local surface: `crates/rt-api-transmission`.
 
 | API group | Upstream surface | Local status |
 |---|---|---|
-| Protocol shape | Transmission 4.1 JSON-RPC 2.0 uses snake_case; older RPC uses kebab/camel strings | Implemented: JSON-RPC 2.0 single and batch envelopes with `params`, direct `result`, and error objects; snake_case methods/args normalize to native handlers; old envelope remains supported |
+| Protocol shape | Transmission 4.1 JSON-RPC 2.0 uses snake_case; older RPC uses kebab/camel strings | Implemented: JSON-RPC 2.0 single and batch envelopes with `params`, direct `result`, and error objects; snake_case methods/args normalize to TorrentNG handlers; old envelope remains supported |
 | CSRF session ID | `X-Transmission-Session-Id` retry flow | Implemented |
 | Session reads | `session_get`, `session_stats`, `session_access_control` | Implemented; `session_get` supports field projection and projects facade notification subscriptions |
-| Session writes | `session_set`, `session_close`, `session_subscribe`, `session_unsubscribe`, queue-stalled enable/disable | Implemented for native limits plus broad compatibility-state roundtrip for paths, queues, scheduler, peer/network, blocklist, scripts, seeding settings, and notification subscriptions |
-| Groups | `group_get`, `group_set` | Implemented as compatibility state round-trips for honors-session-limits, group speed limits, and per-torrent group projection; enabled group speed limits propagate into native per-torrent limits for assigned torrents |
+| Session writes | `session_set`, `session_close`, `session_subscribe`, `session_unsubscribe`, queue-stalled enable/disable | Implemented for TorrentNG-client limits plus broad compatibility-state roundtrip for paths, queues, scheduler, peer/network, blocklist, scripts, seeding settings, and notification subscriptions |
+| Groups | `group_get`, `group_set` | Implemented as compatibility state round-trips for honors-session-limits, group speed limits, and per-torrent group projection; enabled group speed limits propagate into TorrentNG-client per-torrent limits for assigned torrents |
 | Torrent actions | start, start now, stop, verify, reannounce, remove | Implemented |
 | Torrent add | filename magnet, base64 metainfo, paused, download dir, labels | Implemented |
-| Torrent reads | `torrent_get` common fields: identity, status, size/progress, counters, labels, paths, files, file stats, trackers, tracker stats, peers, queue, dates, private flag, magnet link; object and table formats; recently-active removed list | Implemented with a 10,000-entry safety bound for the unpageable full-list compatibility call; use native paged list APIs for larger collections |
-| Torrent writes | `torrent_set`, tracker list, file priorities, wanted/unwanted, location, rename path | Implemented where native engine supports it; labels, location, speed limits, peer limits, seed limits, and sequential mode roundtrip in facade state when no engine is attached; native engine applies sequential mode to the running picker when attached |
-| Utility | `port_test`, `blocklist_update`, `free_space` | `free_space` uses healthy configured native storage roots; port testing and blocklist mutation return explicit unsupported/compatibility results because torrentngd owns the listener and blocklist policy |
-| Remaining field depth | client-specific live webseed presentation plus native-backed effects for script/blocklist/preferred transport settings | Compatibility depth only; qBit, Transmission, Deluge, and rTorrent project peer/file/tracker/limit counters from native snapshots or stateful facade rows where available; qBit and Transmission tracker views use persisted native tracker snapshots; sequential, first/last, and super-seeding limits have native picker/peer-wire effects |
+| Torrent reads | `torrent_get` common fields: identity, status, size/progress, counters, labels, paths, files, file stats, trackers, tracker stats, peers, queue, dates, private flag, magnet link; object and table formats; recently-active removed list | Implemented with a 10,000-entry safety bound for the unpageable full-list compatibility call; use TorrentNG paged list APIs for larger collections |
+| Torrent writes | `torrent_set`, tracker list, file priorities, wanted/unwanted, location, rename path | Implemented where the TorrentNG client supports it; labels, location, speed limits, peer limits, seed limits, and sequential mode roundtrip in facade state when no client is attached; the TorrentNG client applies sequential mode to the running picker when attached |
+| Utility | `port_test`, `blocklist_update`, `free_space` | `free_space` uses healthy configured TorrentNG storage roots; port testing and blocklist mutation return explicit unsupported/compatibility results because `torrentngd` owns the listener and blocklist policy |
+| Remaining field depth | client-specific live webseed presentation plus TorrentNG-client-backed effects for script/blocklist/preferred transport settings | Compatibility depth only; qBit, Transmission, Deluge, and rTorrent project peer/file/tracker/limit counters from TorrentNG-client snapshots or stateful facade rows where available; qBit and Transmission tracker views use persisted TorrentNG-client tracker snapshots; sequential, first/last, and super-seeding limits have TorrentNG picker/peer-wire effects |
 
 ## Deluge JSON-RPC Facade
 
@@ -110,14 +110,14 @@ Local surface: `crates/rt-api-deluge`.
 |---|---|---|
 | JSON endpoint | `/json`, `/deluge/json` | Implemented |
 | Auth/daemon | login, check session, daemon login/info/method list/shutdown | Implemented |
-| Web host management | add/edit/remove host, connected, hosts, host status, connect/disconnect/start/stop daemon | Implemented as native/no-op compatibility |
-| Web UI | add torrents, URL download token, update UI, events, torrent files, plugin list/info/upload/update/save config | Implemented; `web.download_torrent_from_url` returns a stateful safe token without server-side fetching, and `web.add_torrents` accepts that token plus common magnet, embedded metainfo, temp-file path, and URL shapes; update UI honors requested torrent fields and emits filter/stat shape. Deluge full-list status/UI responses are bounded at 10,000 entries because the upstream API has no cursor; native paged endpoints are the large-collection path |
+| Web host management | add/edit/remove host, connected, hosts, host status, connect/disconnect/start/stop daemon | Implemented as TorrentNG/no-op compatibility |
+| Web UI | add torrents, URL download token, update UI, events, torrent files, plugin list/info/upload/update/save config | Implemented; `web.download_torrent_from_url` returns a stateful safe token without server-side fetching, and `web.add_torrents` accepts that token plus common magnet, embedded metainfo, temp-file path, and URL shapes; update UI honors requested torrent fields and emits filter/stat shape. Deluge full-list status/UI responses are bounded at 10,000 entries because the upstream API has no cursor; TorrentNG paged endpoints are the large-collection path |
 | Core session reads | stats, session status/state, rates, connections, filter tree, cache status, config, config values, config value, free space, listen port, external IP, path size, libtorrent version | Implemented |
-| Core torrent reads | torrents status, torrent status, torrent file status | Implemented with requested-field projection, label/state/hash filter dictionaries, and torrent option projection; unpageable list responses are bounded at 10,000 entries and direct clients should use native pagination for larger collections |
+| Core torrent reads | torrents status, torrent status, torrent file status | Implemented with requested-field projection, label/state/hash filter dictionaries, and torrent option projection; unpageable list responses are bounded at 10,000 entries and direct clients should use TorrentNG pagination for larger collections |
 | Core torrent lifecycle | add magnet, add torrent file, pause, resume, force recheck, remove | Implemented |
-| Core torrent mutation | queue movement, set options, file priorities, trackers, prioritize first/last, connect peer, rename files/folder, move storage | Implemented where native engine supports it; torrent options roundtrip in facade state when no engine is attached |
+| Core torrent mutation | queue movement, set options, file priorities, trackers, prioritize first/last, connect peer, rename files/folder, move storage | Implemented where the TorrentNG client supports it; torrent options roundtrip in facade state when no client is attached |
 | Plugin APIs | label, notifications | Implemented for common label and notification calls |
-| Auxiliary Deluge plugins | extractor, scheduler, execute, blocklist, autoadd plugin-specific APIs | Read-only compatibility-shaped defaults; configuration, plugin lifecycle, and Execute command writes return explicit unsupported errors because no native runtime owns those behaviors. Migration dry runs preserve matching plugin/config files as auxiliary artifacts |
+| Auxiliary Deluge plugins | extractor, scheduler, execute, blocklist, autoadd plugin-specific APIs | Read-only compatibility-shaped defaults; configuration, plugin lifecycle, and Execute command writes return explicit unsupported errors because no TorrentNG-client runtime owns those behaviors. Migration dry runs preserve matching plugin/config files as auxiliary artifacts |
 
 ## rTorrent XMLRPC Facade
 
@@ -128,10 +128,10 @@ Local surface: `crates/rt-api-rtorrent`.
 | System/session/network | `method.list`, `system.*`, `session.*`, `network.*`, throttle reads/writes | Implemented as compatibility dispatcher with stable version/session/network values plus global throttle read/write projection |
 | Download reads | `d.hash`, `d.name`, `d.base_path`, `d.size_bytes`, `d.left_bytes`, `d.completed_bytes`, `d.complete`, `d.state`, counters, ratio | Implemented from `SessionRegistry` state; `d.multicall` full-list projections are bounded at 10,000 entries because XMLRPC has no page/cursor contract |
 | Custom fields | `d.custom`, `d.custom.set` | Implemented as facade-local roundtrip state for labels and migration/client metadata |
-| Multicall/views | `d.multicall`, `d.multicall2`, `view.list`, `view.size` | Implemented with rTorrent row-array shape over the native registry |
+| Multicall/views | `d.multicall`, `d.multicall2`, `view.list`, `view.size` | Implemented with rTorrent row-array shape over the TorrentNG-client registry |
 | Loading | `load.normal`, `load.start`, `load.raw`, `load.raw_start` | Implemented for magnet URIs and embedded raw metainfo; path-based loads are rejected at the direct library boundary, and URL fetching is unsupported for SSRF safety |
-| Lifecycle | `d.erase`, `d.pause`, `d.resume`, `d.stop`, `d.start`, `d.tracker_announce` | Implemented as native engine hooks when attached plus registry erase projection |
-| File/tracker/peer detail | `f.*`, `t.*`, `p.*` multicalls | Implemented as rTorrent row-array projections: files fall back to registry state and use native metadata when attached, trackers use native metadata, and peers use native peer snapshots |
+| Lifecycle | `d.erase`, `d.pause`, `d.resume`, `d.stop`, `d.start`, `d.tracker_announce` | Implemented as TorrentNG-client hooks when attached plus registry erase projection |
+| File/tracker/peer detail | `f.*`, `t.*`, `p.*` multicalls | Implemented as rTorrent row-array projections: files fall back to registry state and use TorrentNG-client metadata when attached, trackers use TorrentNG-client metadata, and peers use TorrentNG-client peer snapshots |
 
 ## Cross-Client API Backlog
 
@@ -139,7 +139,7 @@ Local surface: `crates/rt-api-rtorrent`.
 |---|---|---|
 | Done | Add tests that enumerate advertised facade methods and assert every advertised method returns a compatibility-shaped response | Prevents method-list drift |
 | Done | Add `scripts/api_facade_certification.sh` as the deterministic pass/fail gate for qBit, Transmission, Deluge, and rTorrent facade matrices | Gives the compatibility docs one local certification entry point |
-| Done | Add `scripts/universal_compatibility_certification.sh` as the broad local gate for facade, migration, native API, engine, and scale compatibility evidence | Gives release certification a wider deterministic local gate before live Docker/client runs |
+| Done | Add `scripts/universal_compatibility_certification.sh` as the broad local gate for facade, migration, TorrentNG API, client, and scale compatibility evidence | Gives release certification a wider deterministic local gate before live Docker/client runs |
 | Done | Add cross-source import/apply matrices for JSON and bencoded resume aliases | Prevents fast-resume regressions when migrating from old clients |
 | Done | Add `scripts/migration_corpus_certification.sh` and `testdata/migration-corpus/` as the exported-corpus evidence gate | Keeps synthetic import/apply coverage separate from real client export coverage and can fail strict release runs with `TNG_REQUIRE_MIGRATION_CORPUS=1` |
 | Done | Expand qBittorrent preference response breadth and API-key compatibility routes | Settings panes and modern API clients probe these before mutation |

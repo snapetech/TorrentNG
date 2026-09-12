@@ -444,7 +444,7 @@ fn capability_matrix(methods: &[String]) -> Vec<EngineCapability> {
                 } else if *key == "trusted_rpc_toggle" {
                     // This toggle accepts *all* RPC connections (including
                     // remote/network ones) as trusted - broader than what
-                    // TorrentNG needs. The sidecar always talks to rTorrent
+                    // TorrentNG needs. The compatible-client service always talks to rTorrent
                     // over the local SCGI socket (see RTORRENT_SCGI_SOCKET),
                     // which rTorrent already trusts by default per its
                     // 0.16.9+ connection-trust model, so the calls that
@@ -452,7 +452,7 @@ fn capability_matrix(methods: &[String]) -> Vec<EngineCapability> {
                     // load.raw_start) are the ones worth checking here.
                     let loads_ok = has_method("load.start") && has_method("load.raw_start");
                     Some(if loads_ok {
-                        "Optional broader accept-all toggle; not required here because the sidecar \
+                        "Optional broader accept-all toggle; not required here because the compatible-client service \
                          already connects over the trusted local SCGI socket - load.start and \
                          load.raw_start below confirm untrusted-connection rejection isn't in effect."
                             .to_owned()

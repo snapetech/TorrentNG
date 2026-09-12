@@ -6,7 +6,7 @@ This is a historical observation of the deployed `kspls0` instance, not the
 current source ledger. The source fixes and local release-image verification
 are complete; redeploying and rechecking the real production instance remains
 an operator-owned deployment gate. The remaining field-depth items near the
-end of this document are product/projection decisions, not hidden native
+end of this document are product/projection decisions, not hidden client
 engine defects. See [`BACKEND_AUDIT_BURN_DOWN.md`](BACKEND_AUDIT_BURN_DOWN.md)
 for the canonical current status.
 
@@ -16,14 +16,14 @@ of the original audit (2026-08-28) was running an older deployed build than
 `main` — several things flagged here as broken were already fixed in source
 and just hadn't been rebuilt/redeployed yet; those are called out explicitly.
 **None of these fixes have been deployed to production** — that's a separate,
-explicit step (rebuild the sidecar image, redeploy to `kspls0`) that wasn't
+explicit step (rebuild the compatible-client service image, redeploy to `kspls0`) that wasn't
 taken as part of this pass. See "Fix pass" below for what changed and how it
 was verified.
 
 ## Scope and methodology
 
 Headless, authenticated, read-only inspection of the live production
-deployment (`rtorrentng-prod`, rTorrent-backed Track 1 sidecar) via
+deployment (`rtorrentng-prod`, rTorrent-backed compatible-client service from historical Track 1) via
 Playwright/Chromium, driven programmatically against the real WebUI over
 HTTPS through the production reverse proxy. No synthetic/staging data — the
 library under test holds 6,956 real torrents (~1.2 TB downloaded, ~488 GB
@@ -125,7 +125,7 @@ windows shows:
   refetched from scratch every 2 seconds regardless of whether anything
   changed.
 - `page.on('websocket')` never fires across any tested view — **no WS
-  connection is opened at any point**, despite `sidecar::api::ws` existing
+  connection is opened at any point**, despite the compatible-client service's `sidecar::api::ws` route existing
   in the codebase per `CLAUDE.md`.
 - `GET /api/v1/events` is polled every ~7s and **returns HTTP 404 on every
   single call**, both logged-out and logged-in, spamming the browser console
@@ -383,7 +383,7 @@ headless re-test against a local dev server proxied to the production
 backend (frontend-only fixes — passkey masking, mobile layout, columns,
 accessibility, the saved-view badge) or with `cargo test`/unit tests
 (backend-only fixes — the SQL type-filter bug, category decoding, sync error
-logging). **Nothing was deployed** — the sidecar binary and WebUI bundle on
+logging). **Nothing was deployed** — the compatible-client service binary and WebUI bundle on
 `kspls0` still run the pre-fix build until it's rebuilt and redeployed.
 
 | Finding | Status | Notes |
@@ -391,16 +391,16 @@ logging). **Nothing was deployed** — the sidecar binary and WebUI bundle on
 | P0-1 Mobile layout | **Fixed** | Sidebar and status bar now collapse to a "Filters"/"More ▾" toggle on narrow viewports, defaulting closed — the table gets the vertical space by default instead of ~2 visible rows. Verified: 8 rows visible on load at 390×844 (was 0–2). |
 | P0-2 No WebSocket | **Fixed** | The frontend unconditionally preferred a nonexistent SSE endpoint (`/api/v1/events`, 404) over the working `/ws` endpoint, because `EventSource` always exists in real browsers. Now always connects over `/ws`. Verified live against the *current deployed* backend — Conn/FW/DHT/PEX went from permanently "unknown"/"0" to real live values once the frontend fix loaded, since the backend's `/ws` support already existed and was simply unreachable. Full-refresh polling intervals reduced from 2s to 15–20s safety-net-only, now that push invalidation is the primary path. |
 | P0-3 Passkey exposure | **Fixed** | New `TrackerUrl` component (`webui/src/lib/maskUrl.tsx`) masks credential query params and opaque path-segment passkeys by default, with a "Show"/"Copy" affordance, in the detail panel, Properties dialog, and Tracker Health panel. Verified live: `https://tracker.hdbits.org/announce.php?passkey=••••••••` etc. |
-| P0-4 Type inference | **Fixed** | Root cause: the SQL `LIKE` pattern for "tv" included a literal `"s%e%"` glob meant to approximate SxxExx markers — in SQL `LIKE`, that matches any string containing an 's' anywhere before an 'e' anywhere later, i.e. most English text. Replaced the whole `LIKE`-glob classifier with a word-boundary-aware Rust classifier (`sidecar/src/media_type.rs`) registered as a SQLite scalar function, with a real SxxExx digit-run detector. Unit-tested against the exact false positives found live (the Grisham ebook, the FLAC album, and the `Empire Games` ebook game-title collision). Requires a sidecar rebuild to take effect. |
+| P0-4 Type inference | **Fixed** | Root cause: the SQL `LIKE` pattern for "tv" included a literal `"s%e%"` glob meant to approximate SxxExx markers — in SQL `LIKE`, that matches any string containing an 's' anywhere before an 'e' anywhere later, i.e. most English text. Replaced the whole `LIKE`-glob classifier with a word-boundary-aware Rust classifier (`sidecar/src/media_type.rs`) registered as a SQLite scalar function, with a real SxxExx digit-run detector. Unit-tested against the exact false positives found live (the Grisham ebook, the FLAC album, and the `Empire Games` ebook game-title collision). Requires a compatible-client service rebuild to take effect. |
 | P1-1 Sync reliability | **Improved** | Two changes: (1) error logging previously called `.to_string()`/`%e` on the anyhow chain, which only prints the outermost `.context()` layer ("d.multicall.range offset=X limit=100") and silently drops the actual XMLRPC fault underneath — the one detail needed to diagnose *why*. Now logs the full chain. (2) `tick_bounded` now retries a failed 100-torrent range by bisecting it instead of losing the whole page for that cycle, isolating the fault to the specific torrent(s) involved. Root cause of the underlying XMLRPC faults is still unconfirmed — these changes make it observable and non-disruptive rather than fixing an unknown upstream cause. |
-| P1-2 RPC trust flag | **Fixed** | The backend now cross-checks `load.start`/`load.raw_start` availability when explaining why `rpc.trusted_connection_accept_all.set` is unavailable, since the sidecar's trusted local-SCGI-socket connection makes that broader toggle unnecessary when those two calls work. Separately: the frontend computed this `detail` text but never rendered it anywhere — now it does, for all capabilities, not just this one. |
+| P1-2 RPC trust flag | **Fixed** | The backend now cross-checks `load.start`/`load.raw_start` availability when explaining why `rpc.trusted_connection_accept_all.set` is unavailable, since the compatible-client service's trusted local-SCGI-socket connection makes that broader toggle unnecessary when those two calls work. Separately: the frontend computed this `detail` text but never rendered it anywhere — now it does, for all capabilities, not just this one. |
 | P1-3 Pagination | **Already fixed in `main`** | Infinite scroll (500px-from-bottom trigger) was already implemented in source; the deployed build the original audit ran against just predated it. No change needed. |
-| P1-4 Ratio 0.00 | **Reassessed, not a code bug** | The original hypothesis (migration data-loss) assumed the wrong runtime track — this deployment is the rTorrent-backed sidecar, which never goes through `rt-migrate` at all; ratio comes straight from rTorrent's own resume state. The more likely explanation is the "Conn 0 / FW unknown / DHT unknown / PEX unknown" seen throughout the audit — which turned out to be a **direct symptom of P0-2** (those fields are WS-only and were simply never arriving). With P0-2 fixed, they'll show real values, which is the right next step for diagnosing whether it's a genuine connectivity issue (port forwarding, firewall) rather than a TorrentNG bug. |
+| P1-4 Ratio 0.00 | **Reassessed, not a code bug** | The original hypothesis (migration data-loss) assumed the wrong runtime track — this deployment is the rTorrent-compatible client service, which never goes through `rt-migrate` at all; ratio comes straight from rTorrent's own resume state. The more likely explanation is the "Conn 0 / FW unknown / DHT unknown / PEX unknown" seen throughout the audit — which turned out to be a **direct symptom of P0-2** (those fields are WS-only and were simply never arriving). With P0-2 fixed, they'll show real values, which is the right next step for diagnosing whether it's a genuine connectivity issue (port forwarding, firewall) rather than a TorrentNG bug. |
 | P2-1 Accessibility | **Fixed** | `color-contrast`: the default theme's toolbar/detail-panel action buttons blended text color toward `--text` instead of using the raw (4.39:1) accent tint. Also fixed an unrelated bug hit while in this code: `` `1px solid ${color}55` `` where `color` is a `var(--token)` reference, not a hex string — `"var(--accent)55"` is not a valid CSS color and the whole border declaration was silently dropped by the browser. `landmark-unique`/`region`/`page-has-heading-one`: added `aria-label`s to the two unlabeled `<aside>`s, wrapped the filter/toolbar controls in a `<nav>`, added an `<h1>`. Verified: 0 axe-core violations (was 1 serious + 3 moderate). |
 | P2-2 Facets vs. search | **Fixed** | `sidebar_facets` took no query params at all — it was always an unfiltered, whole-library aggregate. It now accepts the same search/category/tag/tracker filters as the main list query and applies them to both the STATE and TYPE buckets (excluding each bucket's own dimension, so filtering by a status doesn't collapse its own facet to itself). |
 | P2-3 Settings IA | **Fixed** | Moved the raw Operator Logs panel from "Support" (mixed with theme picker and Discord/GitHub links) to "Backend" (next to the sync-error diagnostics it explains). |
 | P2-4 Tracker-error findability | **Fixed** | Tracker Health rows are clickable ("View torrents →") and the current Torrent list exposes a `Tracker Errors` status facet backed by the durable tracker-message field, so operators can isolate affected torrents without a new schema. |
-| Polish: `linux%20iso` category | **Fixed** | Root cause: classic ruTorrent stores label/category values in `d.custom1` using PHP `rawurlencode()`; TorrentNG read it raw. Now decodes defensively (only when the value contains a `%XX` escape and round-trips to valid UTF-8, so a category with a literal `%` isn't mangled). Requires a sidecar rebuild to take effect on already-migrated data (existing rows aren't retroactively renamed — only what's read from rTorrent going forward). |
+| Polish: `linux%20iso` category | **Fixed** | Root cause: classic ruTorrent stores label/category values in `d.custom1` using PHP `rawurlencode()`; TorrentNG read it raw. Now decodes defensively (only when the value contains a `%XX` escape and round-trips to valid UTF-8, so a category with a literal `%` isn't mangled). Requires a compatible-client service rebuild to take effect on already-migrated data (existing rows aren't retroactively renamed — only what's read from rTorrent going forward). |
 | Polish: file shows 0% | **Fixed** | Defensive fix: a wanted file (priority ≠ 0) in a torrent the backend already reports complete can't itself be incomplete — trust `torrent.complete` over a stale/zero per-file chunk count. Root cause in the rTorrent XMLRPC layer not fully isolated (the query code looked structurally correct). |
 | Polish: "Unsaved view" always on | **Fixed** | Three compounding bugs, found by instrumenting the actual runtime values: (1) key-order-sensitive `JSON.stringify` comparison; (2) the debounced search effect in `FilterBar` fires once on mount even with empty input, adding a real `offset: 0` key to `params` that `cleanParams` wasn't stripping (`offset`/`limit` are pagination position, not filter identity); (3) the server round-trips a saved view's unset fields as JSON `null`, which `cleanParams`'s `undefined`/`''` check didn't catch. Verified: badge is off on a pristine load and on with a real filter applied. |
 | Polish: login form attrs | **Fixed** | Added `id`/`name` to both inputs (the `autocomplete` attributes were already present, contrary to the original finding — only `id`/`name` were actually missing). |
@@ -471,6 +471,6 @@ Backend fixes were checked with `cargo check`, the existing 51-test suite
 (all passing) plus classifier/category/tag regression coverage, run under an
 explicit toolchain (`rustup run 1.97.0 cargo test`) since the default `stable`
 toolchain on this machine was missing its `rustc`/`cargo` components. The
-sidecar run executed 127 tests; the WebUI certification run passed its desktop
+compatible-client service run executed 127 tests; the WebUI certification run passed its desktop
 and mobile functional, accessibility, and scale checks, with workspace visual
 baselines regenerated for the intentional layout changes.

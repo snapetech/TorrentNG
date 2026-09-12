@@ -7,8 +7,8 @@ state that other clients have accumulated wherever the source format makes that
 recoverable.
 
 TorrentNG also has a reverse export library path in `rt_migrate::export` for
-anti-lock-in workflows. It projects native DB rows, persisted `.torrent` blobs,
-and native fastresume state back into qBittorrent/Deluge libtorrent,
+anti-lock-in workflows. It projects TorrentNG-client DB rows, persisted
+`.torrent` blobs, and TorrentNG-client fastresume state back into qBittorrent/Deluge libtorrent,
 Transmission, rTorrent, uTorrent/BitTorrent Classic, BiglyBT/Vuze, or generic
 `.torrent` + manifest layouts. Export plans report whether each torrent is
 recheck-free, complete-only, metadata-only, or torrent-only for the chosen
@@ -18,7 +18,7 @@ Current migration coverage includes rTorrent, qBittorrent, Transmission, Deluge,
 uTorrent/BitTorrent Classic, BiglyBT/Vuze, Tixati, and generic `.torrent`
 directories, with exact status tracked in
 [CLIENT_COMPATIBILITY_MATRICES.md](CLIENT_COMPATIBILITY_MATRICES.md). For the
-broader native rewrite overview and engine swap workflow, see
+broader TorrentNG client overview and client-swap workflow, see
 [ENGINE_REWRITE.md](ENGINE_REWRITE.md).
 
 ## Fidelity Vocabulary At A Glance
@@ -30,19 +30,19 @@ common way to misread a dry-run report:
 | Direction | Vocabulary | What it measures |
 |---|---|---|
 | **Importing in** (`torrentngd migrate`) | `trusted` / `hints` / `metadata-only` / `none` | How much piece state could be *decoded from the source client* at scan time |
-| **Exporting out** (`torrentngd export`) | `recheck-free` / `complete-only` / `metadata-only` / `torrent-only` | How much of *TorrentNG's own native state* survives being written into the target client's format |
+| **Exporting out** (`torrentngd export`) | `recheck-free` / `complete-only` / `metadata-only` / `torrent-only` | How much of *TorrentNG-client state* survives being written into the target client's format |
 
 A torrent that imports as `hints` — the normal label for anything mid-download,
 see [below](#reading-the-confidence-summary) — is not a lower grade of
-imported data. Once it's in TorrentNG's native state, it can still export
+imported data. Once it's in TorrentNG-client state, it can still export
 later as `recheck-free`: `hints` only describes what the *scanner* could
 confirm about the *source* at import time, not what survived the import.
 
 ## The `torrentngd migrate` command
 
-For native-engine deployments, `torrentngd migrate` is the one-shot import
+For TorrentNG-client deployments, `torrentngd migrate` is the one-shot import
 path. It scans a source client's state directory read-only, prints a dry-run
-report, and (with `--apply`) writes native DB rows and compatible fast-resume
+report, and (with `--apply`) writes TorrentNG-client DB rows and compatible fast-resume
 state together so complete torrents resume seeding without a full recheck.
 
 ```sh
@@ -61,14 +61,15 @@ torrentngd migrate --source <SRC> --from <DIR> [OPTIONS]
 - `--default-save-path DIR` — fallback save path when the source recorded none
 - `--report FILE` — also write the markdown dry-run report to `FILE`
 - `--config FILE` — config file (else `TORRENTNGD_CONFIG` / defaults); this
-  determines the native DB and fast-resume target locations
+  determines the TorrentNG-client DB and fast-resume target locations
 - `--yes` — skip the confirmation prompt with `--apply`
 
 The dry-run report and the post-apply summary both break torrents down into
 trusted / hints / metadata-only / none so you can see how much state will
-avoid a recheck before committing. Always run the dry-run first. The native
-DB and fast-resume directory are taken from the resolved config, so point
-`--config` at the same config the daemon uses, and back up the native DB (see
+avoid a recheck before committing. Always run the dry-run first. The
+TorrentNG-client DB and fast-resume directory are taken from the resolved
+config, so point `--config` at the same config `torrentngd` uses, and back up
+the TorrentNG-client DB (see
 [BACKUP_RESTORE.md](BACKUP_RESTORE.md)) before `--apply`.
 
 ### Reading the confidence summary
@@ -89,7 +90,7 @@ recheck decision:
 - **none** — only `.torrent` metadata was importable.
 
 A `hints` partial still skips the full recheck under the default
-`trust-hints` policy. The engine's startup guard invalidates only pieces
+`trust-hints` policy. The TorrentNG client's startup guard invalidates only pieces
 whose backing files *changed since import* — not pieces that are merely
 incomplete — so a half-finished qBittorrent/Deluge download keeps its
 completed pieces and only fetches the rest. The label is a scan-time artifact
@@ -117,9 +118,9 @@ verification.
 - ruTorrent views and saved searches
 - Plugin-stored custom metadata beyond `d.custom1–5`
 
-### Native engine import (recommended)
+### Import into the TorrentNG client (recommended)
 
-For native-engine deployments, import the rTorrent session directly with
+For TorrentNG-client deployments, import the rTorrent session directly with
 [`torrentngd migrate`](#the-torrentngd-migrate-command). Stop rTorrent (or work
 from a copy of the session directory) so resume files are not mid-write, then:
 
@@ -129,7 +130,7 @@ torrentngd migrate --source rtorrent \
   --from ~/.rtorrent-session \
   --report /tmp/rtorrent-migration.md
 
-# 2. Back up the native DB (see BACKUP_RESTORE.md), then apply
+# 2. Back up the TorrentNG-client DB (see BACKUP_RESTORE.md), then apply
 torrentngd migrate --source rtorrent \
   --from ~/.rtorrent-session \
   --remap /old/downloads=/data \
@@ -143,9 +144,10 @@ partial resume state is not decoded, so in-progress downloads will recheck.
 Use `--remap` if the download paths differ in the new deployment. The rTorrent
 session directory is read only; nothing is written to it.
 
-### Procedure (Track 1 rTorrent sidecar)
+### Procedure (compatible rTorrent integration)
 
-Use this path when keeping rTorrent as the engine (migration/comparison).
+Use this path when keeping rTorrent as the transfer client (integration or
+comparison).
 
 **Step 1: Run the diagnostic first**
 
@@ -239,7 +241,7 @@ Common locations:
 cp -r ~/.local/share/data/qBittorrent/BT_backup /tmp/qbt-migration
 ```
 
-**Step 3: Run dry-run scan and native import**
+**Step 3: Run dry-run scan and TorrentNG-client import**
 
 ```sh
 torrentngd migrate --source qbittorrent --from /tmp/qbt-migration --report /tmp/qbt.md
@@ -253,7 +255,7 @@ complete and partial torrents both import their progress and avoid a full
 recheck under the default `trust-hints` policy when the data files are present.
 
 Manual fallback remains available: load each `.torrent` through the TorrentNG
-API, pointing at the existing file path, then let the native recheck job verify
+API, pointing at the existing file path, then let the TorrentNG-client recheck job verify
 and resume without downloading.
 
 ---
@@ -281,7 +283,7 @@ avoid a full recheck when their data is present. Manual fallback remains:
 
 1. Export torrent files from Transmission (right-click → "Export .torrent")
 2. Add each via the TorrentNG API, pointing to the existing download path
-3. Run a native recheck job so verified pieces resume without re-downloading
+3. Run a TorrentNG-client recheck job so verified pieces resume without re-downloading
 
 ---
 
@@ -318,7 +320,7 @@ only. Dry-run reports include trusted, hints, metadata-only, and none counts so
 operators can see how much state will avoid a full recheck. Low-confidence or
 unsupported resume data is downgraded to normal verification rather than trusted
 as complete. Piece-state length mismatches are reported and normalized to the
-torrent piece count before native fast-resume state is written.
+torrent piece count before TorrentNG-client fast-resume state is written.
 
 ---
 
@@ -332,18 +334,19 @@ If your download directories are in different locations in the new setup, you ne
 # d.directory.set=<new_path>/<torrent_name>
 ```
 
-The native and sidecar API surfaces both support per-torrent save path updates.
-Bulk moves should use the native storage planning flow so conflicts, capacity,
+The TorrentNG client and compatible-client service both support per-torrent save
+path updates. Bulk moves should use the TorrentNG storage planning flow so conflicts, capacity,
 copy/rename mode, rollback, and destructive delete approval are visible before
 data moves.
 
 Pass remaps to `torrentngd migrate` with repeatable `--remap OLD=NEW` flags
 (e.g. `--remap /downloads=/data`). Each remap is applied both to file-hint
 validation — so trusted fast-resume state is still recognized after moving data
-into a container — and to the native DB save path written during import. The
+into a container — and to the TorrentNG-client DB save path written during
+import. The
 longest matching prefix wins when multiple remaps apply.
 
-`torrentngd migrate --apply` is the combined native import path: DB rows and
+`torrentngd migrate --apply` is the combined TorrentNG-client import path: DB rows and
 compatible fast-resume state are written together under one audited summary.
 
 ---
@@ -351,7 +354,7 @@ compatible fast-resume state are written together under one audited summary.
 ## Leaving TorrentNG (`torrentngd export`)
 
 Reverse migration is a first-class, no-lock-in path. `torrentngd export`
-reads native state **read-only** (the session DB, persisted `.torrent`
+reads TorrentNG-client state **read-only** (the session DB, persisted `.torrent`
 blobs, and fast-resume state) and writes another client's on-disk layout so
 you can resume seeding elsewhere — without a full recheck wherever the target
 format can carry piece state.
@@ -366,10 +369,10 @@ torrentngd export --format <FMT> --to <DIR> [OPTIONS]
 - `--apply` — write the export; **omit for a dry-run report** (the default)
 - `--report FILE` — also write the markdown dry-run report
 - `--config FILE` — config file (else `TORRENTNGD_CONFIG` / defaults); this
-  locates the native DB, `.torrent` blobs, and fast-resume directory
+  locates the TorrentNG-client DB, `.torrent` blobs, and fast-resume directory
 - `--yes` — skip the confirmation prompt with `--apply`
 
-The native state is never modified. The dry-run report and post-apply summary
+The TorrentNG-client state is never modified. The dry-run report and post-apply summary
 break torrents into **recheck-free / complete-only / metadata-only /
 torrent-only** so you can see how much seeding state survives the move:
 
@@ -377,7 +380,7 @@ torrent-only** so you can see how much seeding state survives the move:
 | --- | --- | --- |
 | `libtorrent` | `<hash>.torrent` + `<hash>.fastresume` (qBittorrent `BT_backup` / Deluge state dir) | Recheck-free, partials included |
 | `transmission` | `torrents/` + `resume/` | Recheck-free, partials included |
-| `rtorrent` | `<hash>.torrent` + `<hash>.rtorrent` session sidecar | Recheck-free for **complete** torrents; partials metadata-only (rTorrent's format has no decodable partial bitfield) |
+| `rtorrent` | `<hash>.torrent` + `<hash>.rtorrent` session resume file | Recheck-free for **complete** torrents; partials metadata-only (rTorrent's format has no decodable partial bitfield) |
 | `utorrent` | aggregate `resume.dat` | Recheck-free at whole-piece granularity |
 | `biglybt` | aggregate `downloads.config` | Recheck-free at whole-piece granularity |
 | `generic` | `<hash>.torrent` files + `manifest.json` | Always correct; destination rechecks |
@@ -397,7 +400,7 @@ tags, counters, and completed-piece counts.
 
 Torrents imported via `torrentngd migrate --apply` persist their `.torrent`
 blob into the session directory, so a migrate-in then export-out round trip
-works without first starting the daemon. A torrent with no native fast-resume
+works without first starting `torrentngd`. A torrent with no TorrentNG-client fast-resume
 state exports as `torrent-only` (the destination rechecks) — that is honest,
 not a failure.
 
@@ -408,10 +411,10 @@ not a failure.
 If migration causes problems:
 
 1. Stop the new container.
-2. Restore the native DB/session backup created before import.
+2. Restore the TorrentNG-client DB/session backup created before import.
 3. Keep the original source client session untouched and restart it if needed.
 4. Re-run the dry-run report after correcting path/category/tag remaps.
 
 No migration step modifies the session directory in-place. The import is read-only from the source.
-See [BACKUP_RESTORE.md](BACKUP_RESTORE.md) for native DB backup and restore
+See [BACKUP_RESTORE.md](BACKUP_RESTORE.md) for TorrentNG-client DB backup and restore
 commands.

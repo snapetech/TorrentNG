@@ -623,6 +623,7 @@ async fn upsert_torrent(
     tracker_cache: &mut HashMap<String, Option<String>>,
     sync_tags: bool,
 ) -> anyhow::Result<()> {
+    let state = normalized_cache_state(t.state, t.is_active, &t.message);
     let tracker_url = if t.tracker_url.is_empty() {
         session_tracker_url_async(&t.hash, tracker_cache).await
     } else {
@@ -641,7 +642,7 @@ async fn upsert_torrent(
         is_active: t.is_active,
         is_open: t.is_open,
         complete: t.complete,
-        state: t.state,
+        state,
         priority: t.priority,
         category: t.category.clone(),
         base_path: t.base_path.clone(),
@@ -662,7 +663,7 @@ async fn upsert_torrent(
         })
         .await
         .with_context(|| format!("persist torrent cache row {}", t.hash))?;
-    if !t.message.is_empty() && t.state == 3 {
+    if state == 3 {
         counts.errored += 1;
     } else if !t.is_active {
         counts.stopped += 1;
@@ -678,6 +679,18 @@ async fn upsert_torrent(
         });
     }
     Ok(())
+}
+
+/// Older rTorrent rows encode terminal failures in `d.message` while their
+/// lifecycle state remains the ordinary stopped/active 0/1 value. Preserve
+/// that compatibility shape, but do not reinterpret the newer queued state
+/// or an active tracker warning as a terminal torrent error.
+fn normalized_cache_state(state: i64, is_active: bool, message: &str) -> i64 {
+    if state == 3 || (matches!(state, 0 | 1) && !is_active && !message.trim().is_empty()) {
+        3
+    } else {
+        state
+    }
 }
 
 fn logical_hash(hash: &str) -> String {
@@ -769,5 +782,15 @@ mod tests {
     fn logical_hash_collapses_hex_case_for_sync_identity() {
         assert_eq!(logical_hash("ABCdef0123"), "abcdef0123");
         assert_eq!(logical_hash("abcdef0123"), logical_hash("ABCDEF0123"));
+    }
+
+    #[test]
+    fn normalized_cache_state_preserves_legacy_terminal_errors_only() {
+        assert_eq!(normalized_cache_state(0, false, "disk failure"), 3);
+        assert_eq!(normalized_cache_state(1, false, "tracker failure"), 3);
+        assert_eq!(normalized_cache_state(1, true, "tracker failure"), 1);
+        assert_eq!(normalized_cache_state(5, false, "tracker failure"), 5);
+        assert_eq!(normalized_cache_state(3, true, ""), 3);
+        assert_eq!(normalized_cache_state(0, false, ""), 0);
     }
 }

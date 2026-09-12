@@ -1,8 +1,8 @@
 # rt-config
 
-TOML config loading and validation for the native `torrentngd` daemon.
+TOML config loading and validation for the `torrentngd` TorrentNG client daemon.
 
-## Status: Implemented — native engine support
+## Status: Implemented — TorrentNG client support
 
 `torrentngd` loads the first existing config path in this order:
 
@@ -10,8 +10,8 @@ TOML config loading and validation for the native `torrentngd` daemon.
 2. `~/.config/torrentngd/config.toml`
 3. `/etc/torrentngd/config.toml`
 
-The config owns native daemon, network, storage, tracker, DHT, database, and
-auth settings. Track 1 sidecar config is separate and remains under
+The config owns TorrentNG client, network, storage, tracker, DHT, database, and
+auth settings. Compatible-client service config is separate and remains under
 `torrentng` / `TNG_*`.
 
 See [../../docs/CONFIGURATION.md](../../docs/CONFIGURATION.md) for the

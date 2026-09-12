@@ -2,4 +2,4 @@
 
 HTTP and UDP tracker announce, tiers, backoff, BEP 27 private torrents.
 
-## Status: Implemented — native engine support
+## Status: Implemented — TorrentNG client support

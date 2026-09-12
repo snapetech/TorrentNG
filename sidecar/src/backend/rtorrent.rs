@@ -44,7 +44,7 @@ impl TorrentBackend for RtorrentBackend {
             supports_per_torrent_limits: false,
             supports_global_limits: false,
             supports_share_limits: true,
-            // The sidecar exposes no rTorrent-backed implementations for
+            // The compatible-client service exposes no rTorrent-backed implementations for
             // force-start, super-seeding, auto-TMM, or auto-management. The
             // trait defaults reject those calls, so advertising this bit
             // would turn a truthful 501 into a misleading backend failure.

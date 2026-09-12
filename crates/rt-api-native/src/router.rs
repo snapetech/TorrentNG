@@ -174,20 +174,20 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/storage/execute", post(storage_execute_plan))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
-            native_idempotency_guard,
+            torrentng_idempotency_guard,
         ))
-        .route_layer(middleware::from_fn_with_state(state.clone(), native_auth_guard))
+        .route_layer(middleware::from_fn_with_state(state.clone(), torrentng_auth_guard))
         // The metainfo parser accepts up to 64 MiB of raw torrent data. The
-        // native JSON/base64 envelope is larger, so keep the transport bound
+        // TorrentNG JSON/base64 envelope is larger, so keep the transport bound
         // explicit instead of relying on axum's small default.
         .layer(DefaultBodyLimit::max(96 * 1024 * 1024))
         .with_state(state)
 }
 
-/// Coalesce retries of successful native HTTP mutations. Durable engine jobs
+/// Coalesce retries of successful TorrentNG HTTP mutations. Durable engine jobs
 /// cover restart recovery; this bounded middleware covers the client timeout
 /// window and rejects accidental reuse of a key for a different request.
-async fn native_idempotency_guard(
+async fn torrentng_idempotency_guard(
     State(state): State<AppState>,
     req: Request<Body>,
     next: Next,
@@ -311,22 +311,22 @@ fn replay_response(cached: CachedResponse) -> Response {
     response
 }
 
-async fn native_auth_guard(
+async fn torrentng_auth_guard(
     State(state): State<AppState>,
     req: Request<Body>,
     next: Next,
 ) -> Response {
     let path = req.uri().path();
-    if native_public_path(path) || state.api_tokens.is_empty() {
+    if torrentng_public_path(path) || state.api_tokens.is_empty() {
         return next.run(req).await;
     }
 
-    if native_bearer_token(req.headers())
+    if torrentng_bearer_token(req.headers())
         .is_some_and(|token| api_token_allowed(&state.api_tokens, &token))
     {
         return next.run(req).await;
     }
-    if native_presented_token(req.headers())
+    if torrentng_presented_token(req.headers())
         .is_some_and(|token| api_token_allowed(&state.api_tokens, &token))
     {
         if has_session_cookie(req.headers(), &["tng_session"])
@@ -356,23 +356,23 @@ fn is_mutating_request(req: &Request<Body>) -> bool {
     )
 }
 
-fn native_public_path(path: &str) -> bool {
+fn torrentng_public_path(path: &str) -> bool {
     matches!(
         path,
         "/health" | "/api/v1/auth/login" | "/api/v1/auth/logout"
     )
 }
 
-fn native_presented_token(headers: &HeaderMap) -> Option<String> {
-    native_bearer_token(headers).or_else(|| {
+fn torrentng_presented_token(headers: &HeaderMap) -> Option<String> {
+    torrentng_bearer_token(headers).or_else(|| {
         headers
             .get(header::COOKIE)
             .and_then(|value| value.to_str().ok())
-            .and_then(native_session_cookie)
+            .and_then(torrentng_session_cookie)
     })
 }
 
-fn native_bearer_token(headers: &HeaderMap) -> Option<String> {
+fn torrentng_bearer_token(headers: &HeaderMap) -> Option<String> {
     headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -380,7 +380,7 @@ fn native_bearer_token(headers: &HeaderMap) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn native_session_cookie(cookie: &str) -> Option<String> {
+fn torrentng_session_cookie(cookie: &str) -> Option<String> {
     cookie.split(';').find_map(|part| {
         let part = part.trim();
         part.strip_prefix("tng_session=")

@@ -2,4 +2,4 @@
 
 peer wire protocol codec: handshake, messages, extension protocol.
 
-## Status: Implemented — native engine support
+## Status: Implemented — TorrentNG client support

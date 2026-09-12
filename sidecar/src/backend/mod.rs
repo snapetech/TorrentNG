@@ -19,7 +19,8 @@ const REMOTE_TORRENT_TIMEOUT: Duration = Duration::from_secs(30);
 const WEBHOOK_RESPONSE_BYTES: usize = 64 * 1024;
 const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Download a user-supplied torrent URL without turning the sidecar into an
+/// Download a user-supplied torrent URL without turning the compatible-client
+/// service into an
 /// unrestricted SSRF or unbounded-body proxy. A single validated DNS result
 /// is pinned into the client and redirects are rejected rather than followed
 /// into a second, unvalidated address.
@@ -206,7 +207,7 @@ pub(crate) async fn response_json_bounded<T: serde::de::DeserializeOwned>(
 
 /// qBittorrent reports several mutation failures as HTTP 200 with the literal
 /// `Fails.` body. Keep all qBittorrent-shaped upstream calls on the same
-/// fail-closed contract, including the native TorrentNG compatibility route.
+/// fail-closed contract, including the TorrentNG-client compatibility route.
 pub(crate) fn validate_qbit_mutation_body(body: &[u8], context: &str) -> Result<()> {
     let text = std::str::from_utf8(body)
         .with_context(|| format!("{context} returned invalid UTF-8"))?
@@ -719,7 +720,7 @@ pub struct BackendPeer {
     pub uploaded: i64,
 }
 
-/// qBittorrent-compatible peer snapshots are used by both the native API
+/// qBittorrent-compatible peer snapshots are used by both the TorrentNG API
 /// adapter and the qBittorrent adapter. Treat a malformed snapshot as a
 /// backend error instead of silently projecting it as an empty peer list.
 pub(crate) fn parse_qbit_peer_response(response: &serde_json::Value) -> Result<Vec<BackendPeer>> {

@@ -3,7 +3,7 @@
 ## Assets
 
 - Payload files and storage roots.
-- Native session DB, torrent metadata, fastresume state, and API tokens.
+- TorrentNG-client session DB, torrent metadata, fastresume state, and API tokens.
 - Automation integrations such as Sonarr, Radarr, Prowlarr, autobrr, and
   cross-seed.
 
@@ -31,7 +31,7 @@
 - URL torrent add rejects private/local hosts.
 - Bulk import/move/delete has dry-run and explicit apply paths.
 - Tracker scheduling uses jitter and durable state.
-- Mutating native endpoints require configured API tokens.
+- Mutating TorrentNG endpoints require configured API tokens.
 - Script execution requires opt-in and explicit allowlisted directories.
 - SQLite state is backed up before migration and import.
 

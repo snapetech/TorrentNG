@@ -282,7 +282,10 @@ impl Db {
         let hash = canonical_existing_hash(&tx, hash)?;
         let revision = allocate_revision(&tx)?;
         let changed = tx.execute(
-            "UPDATE torrents SET state=?1, is_active=?2, is_open=?3, revision=?4, updated_at=(
+            // A manual lifecycle action invalidates the previous rate sample.
+            // Do not make old throughput look fresh merely because the state
+            // projection updates its timestamp.
+            "UPDATE torrents SET state=?1, is_active=?2, is_open=?3, down_rate=0, up_rate=0, revision=?4, updated_at=(
                 SELECT MAX(v) FROM (
                     SELECT CAST(strftime('%s','now') AS INTEGER) AS v
                     UNION ALL SELECT COALESCE(MAX(updated_at), 0) + 1 FROM torrents
@@ -316,7 +319,9 @@ impl Db {
         let revision = allocate_revision(&tx)?;
         {
             let mut stmt = tx.prepare(
-                "UPDATE torrents SET state=?1, is_active=?2, is_open=?3, revision=?4, updated_at=(
+                // Bulk lifecycle actions invalidate the previous rate sample
+                // for the same reason as the single-row path above.
+                "UPDATE torrents SET state=?1, is_active=?2, is_open=?3, down_rate=0, up_rate=0, revision=?4, updated_at=(
                     SELECT MAX(v) FROM (
                         SELECT CAST(strftime('%s','now') AS INTEGER) AS v
                         UNION ALL SELECT COALESCE(MAX(updated_at), 0) + 1 FROM torrents

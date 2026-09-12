@@ -33,7 +33,7 @@ run_gate() {
 }
 
 {
-  echo "# TorrentNG Native Engine Certification Report"
+  echo "# TorrentNG Client Certification Report"
   echo
   echo "- Date UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "- Host: $(hostname)"
@@ -53,7 +53,7 @@ run_gate "universal compatibility certification" "$ROOT/scripts/universal_compat
 
 if [[ -n "$LIVE_HEALTH_URL" ]]; then
   # shellcheck disable=SC2016 # The inner script expands $1 and $body at runtime.
-  run_gate "live native health capability manifest" bash -c '
+  run_gate "live TorrentNG health capability manifest" bash -c '
     set -euo pipefail
     url="$1"
     body="$(curl -fsS "$url")"
@@ -89,13 +89,13 @@ if [[ -n "$LIVE_HEALTH_URL" ]]; then
 else
   {
     echo
-    echo "## live native health capability manifest"
+    echo "## live TorrentNG health capability manifest"
     echo
     echo '```text'
     echo "SKIP: set NATIVE_ENGINE_URL or NATIVE_ENGINE_HEALTH_URL to assert a running daemon /health response."
     echo '```'
   } >> "$OUT"
-  printf '| %s | SKIP |\n' "live native health capability manifest" >> "$OUT.table"
+  printf '| %s | SKIP |\n' "live TorrentNG health capability manifest" >> "$OUT.table"
 fi
 
 sed -i "/|---|---|/r $OUT.table" "$OUT"

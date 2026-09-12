@@ -1,6 +1,6 @@
-//! Reverse migration: project native TorrentNG state back into other clients.
+//! Reverse migration: project TorrentNG-client state back into other clients.
 //!
-//! This is the exit path / anti-lock-in feature. It reads the native model
+//! This is the exit path / anti-lock-in feature. It reads the TorrentNG-client model
 //! read-only (`rt-db` rows + persisted `.torrent` blobs + `rt-fastresume`
 //! state) and writes per-client resume files so a user leaving TorrentNG can
 //! resume seeding elsewhere without a full recheck wherever the target format
@@ -105,7 +105,7 @@ pub struct SkippedExport {
     pub reason: String,
 }
 
-/// One torrent's native state, gathered read-only for export.
+/// One torrent's TorrentNG-client state, gathered read-only for export.
 #[derive(Debug, Clone)]
 pub struct ExportTorrent {
     pub info_hash: String,
@@ -160,7 +160,7 @@ pub struct ExportSummary {
     pub fidelity: ExportFidelitySummary,
 }
 
-/// Read native state read-only. `blob_dir` is `session_dir/torrents`,
+/// Read TorrentNG-client state read-only. `blob_dir` is `session_dir/torrents`,
 /// `fastresume_dir` is `session_dir/fastresume`.
 pub fn gather(
     db_path: &Path,
@@ -316,7 +316,7 @@ impl ExportPlan {
         out
     }
 
-    /// Write the export under `out_dir`. The native state is never modified.
+    /// Write the export under `out_dir`. TorrentNG-client state is never modified.
     pub fn write(&self, out_dir: &Path) -> Result<ExportSummary, ExportError> {
         std::fs::create_dir_all(out_dir)?;
         let mut files_written = 0usize;
@@ -737,7 +737,7 @@ mod tests {
         b.iter().map(|x| format!("{x:02x}")).collect()
     }
 
-    /// Build a one-torrent native state on disk: returns (session_dir, db_path,
+    /// Build a one-torrent TorrentNG-client state on disk: returns (session_dir, db_path,
     /// blob_dir, fastresume_dir, info_hash_hex, save_path).
     fn native_fixture(tmp: &Path, complete: bool) -> (PathBuf, PathBuf, PathBuf, String, PathBuf) {
         let (raw, hash) = fixture_torrent();
@@ -769,6 +769,7 @@ mod tests {
             completed_at: Some(1_700_000_500),
             uploaded: 4096,
             downloaded: 12,
+            amount_left: 0,
             ratio: 1.0,
             trackers: vec!["https://tracker.example/announce".into()],
         };

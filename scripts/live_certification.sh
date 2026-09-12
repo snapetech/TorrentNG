@@ -73,9 +73,9 @@ http_code() {
 
 code="$(http_code "$TNG_HOST_URL/health")"
 if [[ "$code" == "200" || "$code" == "503" ]]; then
-  mark "sidecar health endpoint" "PASS" "HTTP $code"
+  mark "compatible-client service health endpoint" "PASS" "HTTP $code"
 else
-  mark "sidecar health endpoint" "FAIL" "HTTP $code"
+  mark "compatible-client service health endpoint" "FAIL" "HTTP $code"
 fi
 
 code="$(http_code "$TNG_HOST_URL/api/qb/v2/auth/login" -X POST -d "username=$TNG_API_TOKEN" -d "password=$TNG_API_TOKEN" -c /tmp/tng-cert-cookies.txt)"
@@ -105,9 +105,9 @@ done
 
 code="$(http_code "$TNG_HOST_URL/api/v1/cross-seed" -H "Authorization: Bearer $TNG_API_TOKEN" -H 'Content-Type: application/json' -d '{"hashes":[],"trackers":[],"dry_run":true}')"
 if [[ "$code" == "200" || "$code" == "400" ]]; then
-  mark "native cross-seed helper" "PASS" "endpoint reachable, validation active HTTP $code"
+  mark "TorrentNG cross-seed helper" "PASS" "endpoint reachable, validation active HTTP $code"
 else
-  mark "native cross-seed helper" "FAIL" "HTTP $code"
+  mark "TorrentNG cross-seed helper" "FAIL" "HTTP $code"
 fi
 
 code="$(http_code "$TNG_HOST_URL/api/v1/settings/user-agent" -H "Authorization: Bearer $TNG_API_TOKEN")"

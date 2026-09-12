@@ -9,7 +9,7 @@ use rusqlite::Connection;
 /// Deterministic timestamp used by generated fixtures.
 pub const FIXTURE_ADDED_AT: i64 = 1_700_000_000;
 
-/// Native engine scale certification dataset sizes.
+/// TorrentNG-client scale certification dataset sizes.
 pub const SCALE_DATASET_SIZES: &[usize] = &[1_000, 5_000, 10_000, 15_000, 50_000];
 
 #[derive(Debug, Clone)]
@@ -87,6 +87,7 @@ pub fn synthetic_torrent_row(index: usize) -> rt_db::TorrentRow {
             .then_some(FIXTURE_ADDED_AT + 100_000 + index as i64),
         uploaded: downloaded.saturating_mul((index % 4) as i64),
         downloaded,
+        amount_left: total_length.saturating_sub(downloaded),
         ratio: if downloaded == 0 {
             0.0
         } else {
@@ -135,6 +136,11 @@ pub fn torrent_row(index: usize) -> rt_db::TorrentRow {
             .then_some(FIXTURE_ADDED_AT + index as i64 + 60),
         uploaded: 10_000 * index as i64,
         downloaded: 20_000 * index as i64,
+        amount_left: if index.is_multiple_of(3) {
+            0
+        } else {
+            (1024 * 1024 * (index as i64 + 1)).saturating_sub(20_000 * index as i64)
+        },
         ratio: if index == 0 { 0.0 } else { 0.5 },
         trackers: vec![format!("https://tracker.example/{index:04}/announce")],
     }

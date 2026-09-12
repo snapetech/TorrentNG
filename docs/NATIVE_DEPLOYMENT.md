@@ -1,10 +1,11 @@
-# Native Engine Deployment
+# TorrentNG Client Deployment
 
-Native mode runs `torrentngd` as the source of truth. qBittorrent,
+The TorrentNG client runs `torrentngd` as the source of truth. qBittorrent,
 Transmission, Deluge, and legacy UI compatibility surfaces are facades over the
 same durable engine state.
 
-For the larger rewrite overview and native-vs-rTorrent comparison, see
+For the larger product overview and TorrentNG-client versus compatible-client
+comparison, see
 [ENGINE_REWRITE.md](ENGINE_REWRITE.md).
 
 ## Current local release evidence
@@ -13,7 +14,7 @@ On 2026-09-03 local time, `cargo build --release --locked -p torrentngd`
 produced `target/release/torrentngd` (21,993,112 bytes,
 SHA-256 `1d5fe1bee668179001dab21ac697aea01bb0f2cb11276f13208c38975cacd28e`).
 The authenticated release-binary smoke started it from an isolated config,
-checked native and qBittorrent list/transfer endpoints plus Prometheus
+checked TorrentNG-client and qBittorrent list/transfer endpoints plus Prometheus
 metrics, sent SIGTERM, and observed a clean exit in 474 ms. The current report
 is [`backend-burndown-native-release-smoke-current-20260903.md`](../certification/reports/backend-burndown-native-release-smoke-current-20260903.md).
 This is local deployment evidence, not a capacity, public-compatibility,
@@ -23,10 +24,10 @@ real-device, or long-soak certificate.
 
 - Put the session DB and torrent metadata on durable local storage.
 - Put payload data on mounted storage roots with stable paths.
-- Set native API tokens in `[auth].api_tokens` or a protected
+- Set TorrentNG API tokens in `[auth].api_tokens` or a protected
   `[auth].api_tokens_file`; public binds reject missing, short, or placeholder
   tokens at startup.
-- Bind the native API behind TLS or a trusted reverse proxy.
+- Bind the TorrentNG API behind TLS or a trusted reverse proxy.
 - Keep mutating endpoints token-protected.
 - Enable scripts only with a root-owned allowlist directory.
 - Run backup before imports, bulk moves, or upgrades.
@@ -52,7 +53,7 @@ api_tokens = ["REPLACE_WITH_A_RANDOM_TOKEN_OF_AT_LEAST_16_CHARACTERS"]
 ```
 
 The daemon stores SQLite state at `session_dir/state.db` unless `[db].path` is
-set explicitly. See [CONFIGURATION.md](CONFIGURATION.md) for the full native
+set explicitly. See [CONFIGURATION.md](CONFIGURATION.md) for the full TorrentNG-client
 config surface.
 
 ## Start
@@ -80,7 +81,7 @@ scripts/backend_burndown_native_release_smoke.sh \
 
 ## Docker Compose
 
-The native Compose stack builds `torrentngd`, mounts durable state and payload
+The TorrentNG-client Compose stack builds `torrentngd`, mounts durable state and payload
 volumes, and can optionally start Prometheus and Grafana:
 
 ```sh
@@ -131,12 +132,12 @@ The StatefulSet uses persistent volume claims for session state and downloads.
 The config is mounted from a Secret because it contains API tokens. Adjust
 storage classes, sizes, ingress/load-balancer exposure, and tokens for the
 target cluster. The checked-in Kubernetes secret is a template and contains a
-placeholder token; replace it before applying. The native config validator
+placeholder token; replace it before applying. The TorrentNG-client config validator
 rejects that placeholder and rejects public binds without a real token.
 
 ## Observability
 
-`torrentngd` exposes Prometheus metrics at `/metrics`. The native deployment
+`torrentngd` exposes Prometheus metrics at `/metrics`. The TorrentNG-client deployment
 directory includes:
 
 - [prometheus.yml](../deploy/native/prometheus.yml)
@@ -172,12 +173,12 @@ makepkg -si
 1. Run `scripts/native_engine_certification_report.sh` on the current build.
 2. Back up session state with [BACKUP_RESTORE.md](BACKUP_RESTORE.md).
 3. Deploy the new binary/container.
-4. Verify `/health`, native list, qBit list, and metrics.
+4. Verify `/health`, the TorrentNG-client list, qBit list, and metrics.
 5. Keep the previous binary/container image until restart recovery is confirmed.
 
 ## Certification
 
-The native release gate is:
+The TorrentNG-client release gate is:
 
 ```sh
 scripts/native_engine_certification_report.sh
@@ -204,7 +205,7 @@ capability manifest as well:
 NATIVE_ENGINE_URL=http://127.0.0.1:8080 scripts/native_engine_certification_report.sh
 ```
 
-The post-soak release gate also reruns native engine rewrite certification
+The post-soak release gate also reruns TorrentNG-client certification
 directly before refreshing the aggregate release report.
 
 For the exact release artifact, run the bounded deployment smoke and the
@@ -217,7 +218,7 @@ scripts/backend_burndown_scale_release.sh \
   certification/reports/backend-burndown-scale-release-$(date -u +%Y%m%d).md
 ```
 
-The smoke binds the artifact digest to authenticated health, native and qBittorrent
+The smoke binds the artifact digest to authenticated health, TorrentNG-client and qBittorrent
 REST, metrics, and SIGTERM evidence. The scale suite is synthetic optimized-build
 evidence; it does not certify production hardware, restart recovery, or a 100k
 live daemon fixture.

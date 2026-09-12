@@ -17,12 +17,12 @@ and
 
 | Finding | Current state | Honest boundary |
 |---|---|---|
-| Facade authentication | Native, qBittorrent, Transmission, Deluge, and the rTorrent library entry point enforce the configured token boundary; login/session compatibility is explicit. | Reverse-proxy header handling and deployed secret rotation require operator review. |
+| Facade authentication | The TorrentNG client, qBittorrent, Transmission, Deluge, and the rTorrent library entry point enforce the configured token boundary; login/session compatibility is explicit. | Reverse-proxy header handling and deployed secret rotation require operator review. |
 | Storage authority | Execute paths use configured/persisted server roots and descriptor-relative no-follow checks; caller roots are preview-only. | Non-Linux portability and a hostile live mount race require target-host evidence. |
 | Metainfo integers and caps | Checked signed-to-unsigned conversions and parser limits reject negative, overflowing, and oversized torrent-controlled values. | Larger external corpus/fuzz runs remain qualification evidence. |
 | Outbound egress | Tracker/webseed scheme, DNS/address, redirect, response-size, and private-address policy is enforced by the live runtime. | Hostile DNS/public-network behavior still needs a deployment run. |
 | Compatibility honesty | Unsupported queue/plugin/pure-v2 behavior returns explicit unsupported results; projection-only state is documented. | Client-version breadth remains an interoperability evidence question. |
-| Durable operator state | Engine-backed compatibility state, categories, tags, bans, preferences, and job state are persisted where the native engine owns the surface; process-local no-engine facades are documented. | Plugin-specific native behavior is intentionally not claimed. |
+| Durable operator state | TorrentNG-client state, categories, tags, bans, preferences, and job state are persisted by the owning runtime; the compatible-client service documents projection-only and process-local surfaces. | Plugin-specific behavior is intentionally not claimed. |
 | Metrics privacy and ingress | `/metrics` is auth-protected when tokens exist; hot-torrent labels hash identifiers by default, raw IDs are opt-in with a startup warning; peer ingress has global/per-IP budgets and timeouts. | Actual network exposure and reverse-proxy policy require deployment review. |
 
 The remaining release gates are evidence-only: hosted CI observation, public
@@ -34,15 +34,15 @@ first reconciling them against this section and the canonical backend ledger.
 
 - Workspace package metadata now declares `AGPL-3.0-or-later`, matching the README licensing posture.
 - Explicit `TORRENTNGD_CONFIG` load failures now fail closed instead of silently falling back to default configuration.
-- Configured native API tokens are passed into the qBittorrent facade state.
-- Native API routes now use a route-level guard when API tokens are configured. `/health`, `/api/v1/auth/login`, and `/api/v1/auth/logout` remain public; operational reads such as `/metrics`, `/api/v1/logs`, `/api/v1/session-events`, `/api/v1/events`, `/api/v1/engine`, `/api/v1/storage`, and torrent listing/detail now require a valid bearer token or session cookie when tokens exist.
+- Configured TorrentNG API tokens are passed into the qBittorrent facade state.
+- TorrentNG API routes now use a route-level guard when API tokens are configured. `/health`, `/api/v1/auth/login`, and `/api/v1/auth/logout` remain public; operational reads such as `/metrics`, `/api/v1/logs`, `/api/v1/session-events`, `/api/v1/events`, `/api/v1/engine`, `/api/v1/storage`, and torrent listing/detail now require a valid bearer token or session cookie when tokens exist.
 - qBittorrent compatibility routes now use a route-level guard when API tokens are configured. Bearer tokens or `SID` cookies matching a configured API token are accepted. If no API tokens are configured, legacy unauthenticated compatibility behavior remains available for localhost/dev deployments.
 
 ## Historical P0/P1 hardening backlog
 
 ### P0: normalize auth across every facade
 
-Native and qBittorrent are now guarded when API tokens are configured. Transmission, Deluge, and rTorrent compatibility surfaces still need the same treatment.
+The TorrentNG client and qBittorrent surfaces are now guarded when API tokens are configured. Transmission, Deluge, and rTorrent compatibility surfaces still need the same treatment.
 
 Required behavior:
 
@@ -132,7 +132,7 @@ Required behavior:
 Do not call universal compatibility release-ready until CI produces a downloadable compatibility report containing:
 
 - exact client/container versions;
-- qBittorrent, Transmission, Deluge, rTorrent, and native REST endpoint/method probes;
+- qBittorrent, Transmission, Deluge, rTorrent, and TorrentNG REST endpoint/method probes;
 - live add/list/mutate/remove flows;
 - import/export corpus hashes;
 - private-torrent DHT/PEX suppression evidence;

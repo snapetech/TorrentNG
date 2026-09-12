@@ -29,10 +29,10 @@ use rt_metrics::{MemoryClass, MemoryLease};
 
 use crate::{
     model::{
-        to_qbit_state, QbCategoryInfo, QbFileInfo, QbServerState, QbTorrentInfo,
+        to_qbit_state_with_completion, QbCategoryInfo, QbFileInfo, QbServerState, QbTorrentInfo,
         QbTorrentProperties, QbTrackerInfo,
     },
-    state::{canonical_sort_key, AppState, JsonMap, TorrentSnapshotError},
+    state::{canonical_sort_key, torrent_is_complete, AppState, JsonMap, TorrentSnapshotError},
 };
 
 // Live qBittorrent compatibility fields are backed by per-torrent engine
@@ -50,9 +50,9 @@ const QBIT_LIMIT_PROJECTION_CONCURRENCY: usize = 64;
 const QBIT_LIVE_PROJECTION_CONCURRENCY: usize = 64;
 
 // These compatibility settings are deliberately separate from the engine's
-// runtime settings.  They are qBittorrent WebUI state, not native transport
+// runtime settings.  They are qBittorrent WebUI state, not TorrentNG-client transport
 // configuration, but they still need to survive a daemon restart when the
-// native engine is attached.
+// TorrentNG client is attached.
 const SETTING_QBIT_PREFERENCES: &str = "qbit.preferences";
 const SETTING_QBIT_COOKIES: &str = "qbit.cookies";
 const SETTING_QBIT_API_KEY: &str = "qbit.api_key";
@@ -234,7 +234,7 @@ pub async fn app_build_info() -> impl IntoResponse {
         StatusCode::OK,
         Json(serde_json::json!({
             "qt": "6.7.0",
-            "libtorrent": "TorrentNG-native",
+            "libtorrent": "TorrentNG client",
             "boost": "",
             "openssl": "",
             "bitness": 64,
@@ -615,7 +615,7 @@ pub async fn app_preferences(State(state): State<AppState>) -> Response {
                         Json(serde_json::json!({
                             "error": {
                                 "code": "SERVICE_UNAVAILABLE",
-                                "message": "native engine network features are unavailable",
+                                "message": "TorrentNG client network features are unavailable",
                             }
                         })),
                     )
@@ -634,7 +634,7 @@ pub async fn app_preferences(State(state): State<AppState>) -> Response {
                         Json(serde_json::json!({
                             "error": {
                                 "code": "SERVICE_UNAVAILABLE",
-                                "message": "native engine peer-ban state is unavailable",
+                                "message": "TorrentNG client peer-ban state is unavailable",
                             }
                         })),
                     )
@@ -705,7 +705,7 @@ pub async fn app_set_preferences(State(state): State<AppState>, body: String) ->
             }
             let mut stored_updates = updates;
             if state.engine.is_some() {
-                // These two keys are applied to and read back from the native
+                // These two keys are applied to and read back from the TorrentNG
                 // engine. Keeping a second facade copy would create split
                 // brain state after a restart or another control-plane write.
                 stored_updates.remove("dht");
@@ -1047,7 +1047,7 @@ pub struct TorrentsInfoQuery {
     pub offset: Option<usize>,
     pub hashes: Option<String>,
     /// Optional TorrentNG snapshot generation for stable offset pagination.
-    /// qBittorrent clients ignore the response header, while native clients
+    /// qBittorrent clients ignore the response header, while TorrentNG clients
     /// can use it to pin multiple pages to one immutable registry view.
     pub snapshot: Option<u64>,
 }
@@ -1088,6 +1088,14 @@ pub async fn torrents_info(
             }
         },
     };
+    // Rechecks change the qBittorrent-facing lifecycle projection even before
+    // the registry entry itself advances to `checking`. Load that projection
+    // before filtering and sorting so the response uses one state view from
+    // candidate selection through serialization.
+    let active_rechecks = match active_recheck_hashes(&state).await {
+        Ok(active_rechecks) => active_rechecks,
+        Err(error) => return qbit_backend_unavailable(&error),
+    };
     let sort = canonical_sort_key(q.sort.as_deref());
     let order = snapshot.ordered_indices(Some(sort), |left, right| match sort {
         "hash" => left.info_hash.cmp(&right.info_hash),
@@ -1095,12 +1103,12 @@ pub async fn torrents_info(
         "progress" => torrent_progress(
             left.total_length,
             left.amount_left,
-            left.completed_at.is_some(),
+            torrent_is_complete(left),
         )
         .total_cmp(&torrent_progress(
             right.total_length,
             right.amount_left,
-            right.completed_at.is_some(),
+            torrent_is_complete(right),
         )),
         "ratio" => left.stats.ratio().total_cmp(&right.stats.ratio()),
         "added_on" => left.added_at.cmp(&right.added_at),
@@ -1109,7 +1117,16 @@ pub async fn torrents_info(
             .unwrap_or(0)
             .cmp(&right.completed_at.unwrap_or(0)),
         "category" => left.category.cmp(&right.category),
-        "state" => to_qbit_state(left.state.as_str()).cmp(to_qbit_state(right.state.as_str())),
+        "state" => qbit_state_with_recheck(
+            left.state.as_str(),
+            torrent_is_complete(left),
+            active_rechecks.contains(&left.info_hash),
+        )
+        .cmp(&qbit_state_with_recheck(
+            right.state.as_str(),
+            torrent_is_complete(right),
+            active_rechecks.contains(&right.info_hash),
+        )),
         _ => left.name.cmp(&right.name),
     });
     let (indexed_states, completed_only) = indexed_qbit_filter(q.filter.as_deref());
@@ -1144,7 +1161,7 @@ pub async fn torrents_info(
             .entries
             .get(*index)
             .expect("snapshot index is valid");
-        if !qbit_entry_matches(entry, &q, hashes.as_ref()) {
+        if !qbit_entry_matches(entry, &q, hashes.as_ref(), &active_rechecks) {
             continue;
         }
         if skipped < offset {
@@ -1169,10 +1186,6 @@ pub async fn torrents_info(
         }
     } else {
         None
-    };
-    let active_rechecks = match active_recheck_hashes(&state).await {
-        Ok(active_rechecks) => active_rechecks,
-        Err(error) => return qbit_backend_unavailable(&error),
     };
     let include_live = selected.len() <= QBIT_LIVE_PROJECTION_MAX_ENTRIES;
     let infos = if include_live {
@@ -1228,21 +1241,16 @@ pub async fn torrents_info(
 fn indexed_qbit_filter(filter: Option<&str>) -> (Vec<&'static str>, bool) {
     match filter.map(str::trim) {
         Some("downloading") => (vec!["downloading"], false),
-        Some("seeding" | "uploading") => (vec!["seeding"], false),
+        // Completion is live amount_left state, while the lifecycle enum can
+        // briefly remain downloading during the transition to seeding.
+        Some("seeding" | "uploading") => (vec!["seeding", "downloading"], true),
         Some("completed") => (Vec::new(), true),
         Some("paused") => (vec!["paused", "stopped"], false),
-        Some("active" | "resumed") => (
-            vec![
-                "metadata_pending",
-                "checking",
-                "seeding",
-                "downloading",
-                "queued",
-            ],
-            false,
-        ),
+        // An active recheck can temporarily project a stopped/paused/error
+        // entry as checking, so the exact predicate must see every row for
+        // these state views rather than relying on the raw lifecycle index.
+        Some("active" | "resumed" | "checking") => (Vec::new(), false),
         Some("errored") => (vec!["error"], false),
-        Some("checking") => (vec!["checking"], false),
         _ => (Vec::new(), false),
     }
 }
@@ -1263,7 +1271,7 @@ fn validate_qbit_filter(filter: Option<&str>) -> Result<(), (StatusCode, &'stati
     ) {
         return Err((
             StatusCode::NOT_IMPLEMENTED,
-            "qBittorrent filter is not runtime-backed by the native engine",
+            "qBittorrent filter is not runtime-backed by the TorrentNG client",
         ));
     }
     if !matches!(
@@ -1292,7 +1300,7 @@ fn validate_qbit_sort(sort: Option<&str>) -> Result<(), (StatusCode, &'static st
     if matches!(sort.map(str::trim), Some("dlspeed" | "upspeed")) {
         return Err((
             StatusCode::NOT_IMPLEMENTED,
-            "qBittorrent speed sorting is not runtime-backed by the native engine",
+            "qBittorrent speed sorting is not runtime-backed by the TorrentNG client",
         ));
     }
     Ok(())
@@ -1302,6 +1310,7 @@ fn qbit_entry_matches(
     entry: &rt_session::TorrentEntry,
     query: &TorrentsInfoQuery,
     hashes: Option<&HashSet<String>>,
+    active_rechecks: &HashSet<String>,
 ) -> bool {
     if let Some(hashes) = hashes {
         if !hashes.contains(&entry.info_hash) {
@@ -1318,44 +1327,41 @@ fn qbit_entry_matches(
             return false;
         }
     }
-    if let Some(filter) = query.filter.as_deref() {
-        let qb_state = to_qbit_state(entry.state.as_str());
+    if let Some(filter) = query.filter.as_deref().map(str::trim) {
+        let qb_state = qbit_state_with_recheck(
+            entry.state.as_str(),
+            torrent_is_complete(entry),
+            active_rechecks.contains(&entry.info_hash),
+        );
         match filter {
             "all" => {}
             "downloading" if qb_state != "downloading" => return false,
             "seeding" | "uploading" if qb_state != "uploading" => return false,
-            "completed" if entry.completed_at.is_none() => return false,
-            "paused" if !matches!(qb_state, "pausedUP" | "pausedDL") => return false,
-            "active" | "resumed"
-                if !matches!(
-                    entry.state,
-                    rt_session::TorrentState::MetadataPending
-                        | rt_session::TorrentState::Checking
-                        | rt_session::TorrentState::Seeding
-                        | rt_session::TorrentState::Downloading
-                        | rt_session::TorrentState::Queued
-                ) =>
-            {
+            "completed" if !torrent_is_complete(entry) => return false,
+            "paused" if !matches!(qb_state.as_str(), "pausedUP" | "pausedDL") => return false,
+            "active" | "resumed" if !qbit_state_is_active(&qb_state) => return false,
+            "inactive" if qbit_state_is_active(&qb_state) => return false,
+            "checking" if !matches!(qb_state.as_str(), "checkingDL" | "checkingUP") => {
                 return false
             }
-            "inactive"
-                if matches!(
-                    entry.state,
-                    rt_session::TorrentState::MetadataPending
-                        | rt_session::TorrentState::Checking
-                        | rt_session::TorrentState::Seeding
-                        | rt_session::TorrentState::Downloading
-                        | rt_session::TorrentState::Queued
-                ) =>
-            {
-                return false
-            }
-            "checking" if entry.state != rt_session::TorrentState::Checking => return false,
-            "errored" if entry.state != rt_session::TorrentState::Error => return false,
+            "errored" if qb_state != "error" => return false,
             _ => {}
         }
     }
     true
+}
+
+fn qbit_state_is_active(state: &str) -> bool {
+    matches!(
+        state,
+        "metaDL"
+            | "checkingDL"
+            | "checkingUP"
+            | "downloading"
+            | "uploading"
+            | "queuedDL"
+            | "queuedUP"
+    )
 }
 
 /// `POST /api/qb/v2/torrents/add`.
@@ -1566,7 +1572,7 @@ pub async fn torrents_add(
             },
             Some(name) => {
                 // Do not silently discard a qBit add option. If it has no
-                // native engine contract, accepting the request would create
+                // TorrentNG-client contract, accepting the request would create
                 // a torrent with policy different from the caller's request.
                 let _ = field.text().await;
                 tracing::info!(
@@ -1574,7 +1580,7 @@ pub async fn torrents_add(
                     operation = "add_torrent",
                     field = %name,
                     result = "unsupported",
-                    "qBit add option has no native engine contract"
+                    "qBit add option has no TorrentNG-client contract"
                 );
                 return (StatusCode::NOT_IMPLEMENTED, "Fails.").into_response();
             }
@@ -3381,7 +3387,7 @@ pub async fn sync_maindata(
             // Full updates use the shared snapshot cache. This remains
             // O(N) when the registry changes, but repeated qBit polling
             // no longer clones every TorrentEntry independently of the
-            // native/SSE snapshot consumers.
+            // TorrentNG/SSE snapshot consumers.
             let snapshot = match state.torrent_snapshot(None).await {
                 Ok(snapshot) => snapshot,
                 Err(TorrentSnapshotError::Expired { revision }) => {
@@ -3670,10 +3676,10 @@ fn qbit_peer_map(peers: &[EnginePeerSnapshot]) -> serde_json::Map<String, serde_
 
 pub async fn transfer_info(State(state): State<AppState>) -> impl IntoResponse {
     let Some(engine) = &state.engine else {
-        return qbit_backend_unavailable("native engine is unavailable");
+        return qbit_backend_unavailable("TorrentNG client is unavailable");
     };
     if !engine.is_alive() {
-        return qbit_backend_unavailable("native engine is not alive");
+        return qbit_backend_unavailable("TorrentNG client is not alive");
     }
     let engine_stats = match engine.stats().await {
         Ok(stats) => stats,
@@ -5161,11 +5167,11 @@ async fn active_recheck_hashes(state: &AppState) -> Result<HashSet<String>, Stri
         .collect())
 }
 
-fn qbit_state_with_recheck(entry_state: &str, active_recheck: bool) -> String {
+fn qbit_state_with_recheck(entry_state: &str, complete: bool, active_recheck: bool) -> String {
     if active_recheck {
-        "checkingDL".to_owned()
+        to_qbit_state_with_completion("checking", complete).to_owned()
     } else {
-        to_qbit_state(entry_state).to_owned()
+        to_qbit_state_with_completion(entry_state, complete).to_owned()
     }
 }
 
@@ -5220,7 +5226,8 @@ async fn qbit_torrent_info(
     active_rechecks: &HashSet<String>,
     include_live: bool,
 ) -> Result<QbTorrentInfo, String> {
-    let progress = torrent_progress(e.total_length, e.amount_left, e.completed_at.is_some());
+    let complete = torrent_is_complete(e);
+    let progress = torrent_progress(e.total_length, e.amount_left, complete);
     let (tracker, trackers_count) = if include_live && state.engine.is_some() {
         qbit_tracker_projection(state, &e.info_hash).await?
     } else {
@@ -5244,7 +5251,11 @@ async fn qbit_torrent_info(
     Ok(QbTorrentInfo {
         hash: e.info_hash.clone(),
         name: e.name.clone(),
-        state: qbit_state_with_recheck(e.state.as_str(), active_rechecks.contains(&e.info_hash)),
+        state: qbit_state_with_recheck(
+            e.state.as_str(),
+            complete,
+            active_rechecks.contains(&e.info_hash),
+        ),
         size: qbit_i64(e.total_length),
         total_size: qbit_i64(e.total_length),
         downloaded: qbit_i64(e.stats.downloaded),
@@ -5865,6 +5876,31 @@ mod tests {
             validate_qbit_filter(Some("stalled")).unwrap_err().0,
             StatusCode::NOT_IMPLEMENTED
         );
+    }
+
+    #[test]
+    fn qbit_filter_matching_trims_the_validated_value() {
+        let mut entry = TorrentEntry::new("a".repeat(40), "downloading".into(), "/data".into());
+        entry.state = rt_session::TorrentState::Downloading;
+
+        let query = TorrentsInfoQuery {
+            filter: Some(" downloading ".into()),
+            category: None,
+            tag: None,
+            sort: None,
+            reverse: None,
+            limit: None,
+            offset: None,
+            hashes: None,
+            snapshot: None,
+        };
+        assert!(qbit_entry_matches(&entry, &query, None, &HashSet::new()));
+
+        let query = TorrentsInfoQuery {
+            filter: Some(" inactive ".into()),
+            ..query
+        };
+        assert!(!qbit_entry_matches(&entry, &query, None, &HashSet::new()));
     }
 
     #[test]
@@ -7203,6 +7239,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn torrents_info_completed_filter_uses_live_amount_left() {
+        let hash = "e".repeat(40);
+        let state = make_state_with(&hash).await;
+        {
+            let mut reg = state.registry.write().await;
+            let mut entry = reg.get_mut(&hash).unwrap();
+            entry.total_length = 100;
+            entry.amount_left = 0;
+        }
+        let app = build_qbit_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/qb/v2/torrents/info?filter=completed")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let torrents: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(torrents.len(), 1);
+        assert_eq!(torrents[0]["hash"], hash);
+        assert_eq!(torrents[0]["state"], "pausedUP");
+    }
+
+    #[tokio::test]
+    async fn torrents_info_seeding_filter_includes_live_complete_downloading_rows() {
+        let hash = "f".repeat(40);
+        let state = AppState::new();
+        {
+            let mut registry = state.registry.write().await;
+            let mut entry = TorrentEntry::new(
+                hash.clone(),
+                "complete before lifecycle transition".into(),
+                "/data".into(),
+            );
+            entry.state = rt_session::TorrentState::Downloading;
+            entry.total_length = 100;
+            entry.amount_left = 0;
+            entry.stats.downloaded = 250;
+            registry.add(entry).unwrap();
+        }
+        let app = build_qbit_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/qb/v2/torrents/info?filter=seeding")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let torrents: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(torrents.len(), 1);
+        assert_eq!(torrents[0]["hash"], hash);
+        assert_eq!(torrents[0]["state"], "uploading");
+    }
+
+    #[tokio::test]
     async fn torrents_properties_missing_hash_is_bad_request() {
         let app = build_qbit_router(AppState::new());
         let resp = app
@@ -8144,6 +8247,7 @@ mod tests {
                 completed_at: None,
                 uploaded: 0,
                 downloaded: 0,
+                amount_left: 0,
                 ratio: 0.0,
                 trackers: Vec::new(),
             },
@@ -8478,8 +8582,80 @@ mod tests {
 
     #[test]
     fn qbit_state_projects_active_recheck_as_checking() {
-        assert_eq!(qbit_state_with_recheck("downloading", true), "checkingDL");
-        assert_eq!(qbit_state_with_recheck("seeding", false), "uploading");
+        assert_eq!(
+            qbit_state_with_recheck("downloading", false, true),
+            "checkingDL"
+        );
+        assert_eq!(qbit_state_with_recheck("seeding", true, false), "uploading");
+        assert_eq!(qbit_state_with_recheck("seeding", true, true), "checkingUP");
+    }
+
+    #[test]
+    fn qbit_filters_follow_active_recheck_projection() {
+        let hash = "a".repeat(40);
+        let mut entry = TorrentEntry::new(hash.clone(), "rechecking".into(), "/data".into());
+        entry.state = rt_session::TorrentState::Downloading;
+        entry.total_length = 100;
+        entry.amount_left = 50;
+        let active_rechecks = HashSet::from([hash]);
+
+        let query = |filter: &str| TorrentsInfoQuery {
+            filter: Some(filter.into()),
+            category: None,
+            tag: None,
+            sort: None,
+            reverse: None,
+            limit: None,
+            offset: None,
+            hashes: None,
+            snapshot: None,
+        };
+        assert!(qbit_entry_matches(
+            &entry,
+            &query("checking"),
+            None,
+            &active_rechecks
+        ));
+        assert!(!qbit_entry_matches(
+            &entry,
+            &query("downloading"),
+            None,
+            &active_rechecks
+        ));
+        assert!(qbit_entry_matches(
+            &entry,
+            &query("active"),
+            None,
+            &active_rechecks
+        ));
+    }
+
+    #[test]
+    fn qbit_completed_filter_uses_live_amount_left() {
+        let mut entry = TorrentEntry::new(
+            "a".repeat(40),
+            "complete without timestamp".into(),
+            "/data".into(),
+        );
+        entry.total_length = 100;
+        entry.amount_left = 0;
+        let query = TorrentsInfoQuery {
+            filter: Some("completed".into()),
+            category: None,
+            tag: None,
+            sort: None,
+            reverse: None,
+            limit: None,
+            offset: None,
+            hashes: None,
+            snapshot: None,
+        };
+        assert!(torrent_is_complete(&entry));
+        assert!(qbit_entry_matches(&entry, &query, None, &HashSet::new()));
+        assert_eq!(
+            qbit_state_with_recheck("paused", torrent_is_complete(&entry), false),
+            "pausedUP"
+        );
     }
 
     #[test]

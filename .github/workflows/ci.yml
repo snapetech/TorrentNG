@@ -16,6 +16,7 @@ permissions:
 
 jobs:
   native-quality:
+    name: TorrentNG client quality
     timeout-minutes: 60
     runs-on: [self-hosted, Linux, X64]
     steps:
@@ -28,13 +29,13 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Validate native API contract
+      - name: Validate TorrentNG API contract
         run: python3 scripts/validate_openapi.py
 
-      - name: Test native workspace
+      - name: Test TorrentNG client workspace
         run: cargo test --workspace --all-targets --locked
 
-      - name: Lint native workspace
+      - name: Lint TorrentNG client workspace
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Run certification script self-tests
@@ -72,7 +73,7 @@ jobs:
           if-no-files-found: warn
 
   backend-api-load:
-    name: Hosted native API/SSE load harness
+    name: Hosted TorrentNG API/SSE load harness
     needs: native-quality
     timeout-minutes: 30
     runs-on: ubuntu-latest
@@ -83,7 +84,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build native release daemon
+      - name: Build TorrentNG client release daemon
         run: cargo build --release --locked -p torrentngd
 
       - name: Run concurrent API and slow-SSE load
@@ -147,29 +148,30 @@ jobs:
       - name: Install Rust 1.88.0 (declared MSRV)
         uses: dtolnay/rust-toolchain@1.88.0
 
-      - name: Build native workspace at declared MSRV
+      - name: Build TorrentNG client workspace at declared MSRV
         run: cargo build --workspace --all-targets --locked
 
-      - name: Test native workspace at declared MSRV
+      - name: Test TorrentNG client workspace at declared MSRV
         # The scale targets contain wall-clock assertions. Run the MSRV
         # suite serially so unrelated 15k/50k fixtures cannot steal CPU from
         # the endpoint being measured and turn the gate into scheduler noise.
         run: cargo test --workspace --all-targets --locked -- --test-threads=1
 
   msrv-check-sidecar:
+    name: Compatible-client service MSRV gate
     timeout-minutes: 30
     runs-on: [self-hosted, Linux, X64]
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Install Rust 1.97.0 (sidecar's declared MSRV)
+      - name: Install Rust 1.97.0 (compatible-client service declared MSRV)
         uses: dtolnay/rust-toolchain@1.97.0
 
-      - name: Build sidecar at declared MSRV
+      - name: Build compatible-client service at declared MSRV
         run: cargo build --locked --manifest-path sidecar/Cargo.toml
 
-      - name: Test sidecar at declared MSRV
+      - name: Test compatible-client service at declared MSRV
         run: cargo test --locked --manifest-path sidecar/Cargo.toml
 
   fuzz-smoke:
@@ -249,6 +251,7 @@ jobs:
           if-no-files-found: ignore
 
   sidecar:
+    name: Compatible-client service quality
     timeout-minutes: 30
     runs-on: [self-hosted, Linux, X64]
     steps:
@@ -258,10 +261,10 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build sidecar
+      - name: Build compatible-client service
         run: cargo build --locked --manifest-path sidecar/Cargo.toml
 
-      - name: Test sidecar
+      - name: Test compatible-client service
         run: cargo test --locked --manifest-path sidecar/Cargo.toml
 
   webui:

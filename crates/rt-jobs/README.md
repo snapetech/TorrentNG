@@ -2,4 +2,4 @@
 
 bulk operation job queue, dry-run engine.
 
-## Status: Implemented — native engine support
+## Status: Implemented — TorrentNG client support

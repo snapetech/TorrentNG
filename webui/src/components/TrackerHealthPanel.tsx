@@ -17,10 +17,10 @@ function fmtDate(ts: number): string {
 
 interface Props {
   /** Jump to the torrent list filtered to this tracker. Errored trackers are
-   * otherwise a dead end: this panel can tell you 208 torrents have tracker
-   * errors, but without this there's no way to find which ones - the
-   * per-torrent STATE "Errored" filter tracks a different thing (the
-   * torrent's own message/is_active) and stays at 0 regardless. */
+   * otherwise a dead end: this panel can tell you which trackers have
+   * announce failures, but without this there's no way to find the affected
+   * torrents. The per-torrent STATE "Tracker Errors" filter is separate from
+   * terminal torrent errors. */
   onSelectTracker?: (tracker: string) => void
 }
 

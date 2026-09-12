@@ -2,15 +2,16 @@
 
 This audit compares the TorrentNG torrent workspace with the fields operators
 expect from qBittorrent, Transmission, and ruTorrent-style tables. The live
-deployment was checked through its served HTML/JavaScript and the sidecar API
-model was checked against the source and compatibility projections.
+deployment was checked through its served HTML/JavaScript and the
+compatible-client service API model was checked against the source and
+compatibility projections.
 
 ## Findings and fixes
 
 | Area | Finding | Result |
 | --- | --- | --- |
 | Header alignment | The header reserved `96px` for its controls while rows reserved only `12px`. The flexible name track absorbed the difference, so columns after Name drifted left. | Header and rows now use the same grid tracks and padding. A required action track holds the controls without changing data-column geometry. |
-| Queue state | An open, started torrent with no current transfer rate was rendered as `Queued`. | Open-but-idle torrents render as `Stalled`; only closed, ready torrents render as `Queued`. The sidecar filters use the same distinction. |
+| Queue state | An open, started torrent with no current transfer rate was rendered as `Queued`. | Open-but-idle torrents render as `Stalled`; only closed, ready torrents render as `Queued`. Compatible-client filters use the same distinction. |
 | Progress context | The table showed size and percentage but not the amount remaining or a time estimate. | Added `Left` and `ETA`. ETA is derived from remaining bytes and current download rate; active torrents without a rate show `∞` instead of a fabricated duration. |
 | Swarm context | Seeds and connected peers were available in the model but absent from the table. | Added separate `Seeds` and `Peers` columns. |
 | Lifecycle context | Added/completed timestamps were incomplete in the default view. | Added `Completed`; `Added` remains sortable. |
@@ -31,7 +32,7 @@ ETA and swarm context.
 
 ## Current disposition (2026-09-04)
 
-The native summary projection and the current WebUI build are locally verified.
+The TorrentNG-client summary projection and the current WebUI build are locally verified.
 The fields listed below are explicit product/projection-depth follow-up, not
 an untracked backend implementation blocker. Add them only with a defined API
 contract and tests; do not infer them in the browser or treat the current

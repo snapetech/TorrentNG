@@ -348,13 +348,20 @@ impl DbWorker {
     /// budget. A timeout is observable by health checks and logs; it does not
     /// block engine shutdown indefinitely.
     pub(crate) async fn shutdown(&self, budget: Duration) {
+        let deadline = Instant::now() + budget;
         if !self.is_healthy() {
-            self.join_thread(budget).await;
+            let Some(join_budget) = deadline.checked_duration_since(Instant::now()) else {
+                return;
+            };
+            self.join_thread(join_budget).await;
             return;
         }
         let (reply, response) = oneshot::channel();
+        let Some(send_budget) = deadline.checked_duration_since(Instant::now()) else {
+            return;
+        };
         if timeout(
-            budget,
+            send_budget,
             self.enqueue(DbRequest::Shutdown { reply }, "shutdown"),
         )
         .await
@@ -368,7 +375,10 @@ impl DbWorker {
             );
             return;
         }
-        if timeout(budget, response).await.is_err() {
+        let Some(wait_budget) = deadline.checked_duration_since(Instant::now()) else {
+            return;
+        };
+        if timeout(wait_budget, response).await.is_err() {
             warn!(
                 component = "db",
                 operation = "shutdown",
@@ -378,7 +388,10 @@ impl DbWorker {
             return;
         }
         self.healthy.store(false, Ordering::Release);
-        self.join_thread(budget).await;
+        let Some(join_budget) = deadline.checked_duration_since(Instant::now()) else {
+            return;
+        };
+        self.join_thread(join_budget).await;
     }
 
     async fn join_thread(&self, budget: Duration) {

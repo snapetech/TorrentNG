@@ -26,7 +26,7 @@ run_gate "storage certification script self-test" "$ROOT/scripts/storage_certifi
 run_gate "resource governor and scale proxies" cargo test -p rt-metrics
 run_gate "configuration defaults" cargo test -p rt-config
 run_gate "engine storage/resource consumers" cargo test -p rt-engine
-run_gate "native API metrics projection" cargo test -p rt-api-native
+run_gate "TorrentNG API metrics projection" cargo test -p rt-api-native
 
 if [[ "${STORAGE_NG_REAL_DEVICE:-0}" == "1" ]]; then
   run_gate "real-device storage probes" \

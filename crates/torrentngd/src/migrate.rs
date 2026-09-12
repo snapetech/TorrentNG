@@ -1,7 +1,7 @@
-//! `torrentngd migrate` — import existing client state into the native engine.
+//! `torrentngd migrate` — import existing client state into the TorrentNG client.
 //!
 //! Dry-run is the default and is read-only against the source directory.
-//! `--apply` writes native DB rows plus compatible fast-resume state so that
+//! `--apply` writes TorrentNG-client DB rows plus compatible fast-resume state so that
 //! complete torrents resume seeding without a full recheck. The source client
 //! state is never modified.
 
@@ -22,7 +22,7 @@ use rt_migrate::{
 use serde::Serialize;
 
 const USAGE: &str = "\
-torrentngd migrate — import existing client state into the native engine
+torrentngd migrate — import existing client state into the TorrentNG client
 
 USAGE:
     torrentngd migrate --source <SRC> --from <DIR> [OPTIONS]
@@ -49,7 +49,7 @@ OPTIONS:
     --yes              skip the confirmation prompt with --apply
     -h, --help         show this help
 
-Dry-run is read-only. With --apply, native DB rows and compatible
+Dry-run is read-only. With --apply, TorrentNG-client DB rows and compatible
 fast-resume state are written together; complete torrents whose data is
 present resume without a full recheck.";
 
@@ -361,7 +361,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
     );
 
     if !args.apply {
-        println!("\nDry-run only. Re-run with --apply to write native state.");
+        println!("\nDry-run only. Re-run with --apply to write TorrentNG-client state.");
         return Ok(());
     }
 
@@ -390,7 +390,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         )
         .context("reading confirmation")?
         {
-            println!("Aborted. No native state was written.");
+            println!("Aborted. No TorrentNG-client state was written.");
             return Ok(());
         }
     }
@@ -408,9 +408,9 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
 
     let result = plan
         .apply_native_import(&mut conn, &fastresume_dir, &options, args.policy)
-        .map_err(|e| anyhow!("native import failed: {e}"))?;
+        .map_err(|e| anyhow!("TorrentNG-client import failed: {e}"))?;
 
-    // Persist the .torrent metainfo into the engine blob dir so the native
+    // Persist the .torrent metainfo into the engine blob dir so the TorrentNG
     // state is complete: the daemon can load it, and `torrentngd export` can
     // project it back out without first running the daemon.
     let blob_dir = config.daemon.session_dir.join("torrents");

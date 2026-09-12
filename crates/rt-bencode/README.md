@@ -2,7 +2,7 @@
 
 Canonical bencode parser and encoder.
 
-## Status: Implemented — native engine support
+## Status: Implemented — TorrentNG client support
 
 ## Public API
 

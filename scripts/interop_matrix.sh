@@ -995,7 +995,7 @@ run_rust_api_facade_case() {
     jq -e '.result == "success" and (.arguments.torrents | type == "array")' >/dev/null || status="FAIL"
   rust_deluge_rpc '{"method":"web.update_ui","params":[["name","progress","state"],{}],"id":30}' |
     jq -e '.error == null and (.result.torrents | type == "object")' >/dev/null || status="FAIL"
-  append_report "- Native REST: checked"
+  append_report "- TorrentNG REST: checked"
   append_report "- qBittorrent API: checked"
   append_report "- Transmission RPC facade: checked"
   append_report "- Deluge JSON-RPC facade: checked"
@@ -1496,16 +1496,16 @@ run_qbit_mutation_facade_case() {
   curl --max-time "$CURL_MAX_TIME" -fsS -X POST -H "Authorization: Bearer $RUST_TOKEN" \
     "$(client_url torrentngd)/api/v1/torrents/$info_hash/start" >/dev/null || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -X PUT -H "Authorization: Bearer $RUST_TOKEN" -H "Content-Type: application/json" \
-    -d '{"name":"native-mutation-facade","save_path":"/downloads/torrentngd"}' \
+    -d '{"name":"torrentng-mutation-facade","save_path":"/downloads/torrentngd"}' \
     "$(client_url torrentngd)/api/v1/torrents/$info_hash" >/dev/null || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -X PATCH -H "Authorization: Bearer $RUST_TOKEN" -H "Content-Type: application/json" \
     -d '{"files":[{"index":0,"priority":1}]}' \
     "$(client_url torrentngd)/api/v1/torrents/$info_hash/files" >/dev/null || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -X PATCH -H "Authorization: Bearer $RUST_TOKEN" -H "Content-Type: application/json" \
-    -d '{"add":["native-matrix"],"remove":[]}' \
+    -d '{"add":["torrentng-matrix"],"remove":[]}' \
     "$(client_url torrentngd)/api/v1/torrents/$info_hash/tags" >/dev/null || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -X PATCH -H "Authorization: Bearer $RUST_TOKEN" -H "Content-Type: application/json" \
-    -d '{"add":["http://127.0.0.1:9/native-dead-announce"],"remove":["http://127.0.0.1:9/native-dead-announce"],"edit":[]}' \
+    -d '{"add":["http://127.0.0.1:9/torrentng-dead-announce"],"remove":["http://127.0.0.1:9/torrentng-dead-announce"],"edit":[]}' \
     "$(client_url torrentngd)/api/v1/torrents/$info_hash/trackers" >/dev/null || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -X POST -H "Authorization: Bearer $RUST_TOKEN" -H "Content-Type: application/json" \
     -d '{"peers":["127.0.0.1:9"]}' \
@@ -1533,7 +1533,7 @@ run_qbit_mutation_facade_case() {
   [[ "$(curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/qb/v2/transfer/speedLimitsMode" || true)" == "1" ]] || status="FAIL"
   append_report "- Target: torrentngd qBittorrent-compatible mutation endpoints"
   append_report "- Checked qBit facade: filePrio, torrent setDownloadLimit/setUploadLimit, transfer setDownloadLimit/setUploadLimit/toggleSpeedLimitsMode, setSuperSeeding, toggleFirstLastPiecePrio, addPeers, topPrio, recheck, addTrackers, editTracker, removeTrackers, trackers, files, webseeds, pieceStates, pieceHashes, export; setForceStart/setAutoTMM/setAutoManagement explicitly return 501"
-  append_report "- Checked native REST: start, stop, update metadata, file priorities, tags, trackers, peers, queue, torrent limits, transfer limits, files/trackers/limits projection"
+  append_report "- Checked TorrentNG REST: start, stop, update metadata, file priorities, tags, trackers, peers, queue, torrent limits, transfer limits, files/trackers/limits projection"
   append_report "- Fixture: multi-128m"
   append_report "- Info hash: $info_hash"
   append_report "- Status: **$status**"

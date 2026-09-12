@@ -22,15 +22,15 @@ Required production policy:
 
 Runtime behavior:
 
-- The sidecar refuses script actions unless `allow_scripts` is true.
+- The compatible-client service refuses script actions unless `allow_scripts` is true.
 - Script commands must use an absolute executable path. The path is canonicalized before launch and must live under one of the configured allowlist directories. Workflow webhooks use address-pinned, no-redirect HTTP with bounded responses and reject private/local destinations unless `allow_private_webhooks` is explicitly enabled.
-- The sidecar passes torrent context through environment variables instead of interpolating values into the command:
+- The compatible-client service passes torrent context through environment variables instead of interpolating values into the command:
   - `TNG_WORKFLOW_ID`
   - `TNG_WORKFLOW_NAME`
   - `TNG_TORRENT_HASH`
   - `TNG_CATEGORY`
   - `TNG_TRACKER`
-- The sidecar enforces a timeout and records success/failure in workflow run history.
+- The compatible-client service enforces a timeout and records success/failure in workflow run history.
 
 ## Automated Review
 
@@ -42,28 +42,29 @@ TNG_SECRET_KEY="$(openssl rand -hex 32)" TNG_API_TOKENS="token-one,token-two" \
 scripts/security_review.sh deploy/native/config.toml
 ```
 
-Sidecar configs must provide a non-example `secret_key`. Native
-`torrentngd` configs do not use a session secret, so the same script records
+Compatible-client service configs must provide a non-example `secret_key`.
+TorrentNG-client `torrentngd` configs do not use a session secret, so the same script records
 that check as not applicable and still enforces API-token review.
 
 ## Current local review (2026-09-04)
 
-`scripts/security_review.sh` was run against the native and sidecar deployment
-configs with generated non-placeholder tokens. It passed the config, token,
+`scripts/security_review.sh` was run against the TorrentNG-client and
+compatible-client service deployment configs with generated non-placeholder
+tokens. It passed the config, token,
 and script-policy checks. Dependency resolution and image scanning are recorded
 separately by `scripts/security_scan.sh`. The exact reports are
 [`security-review-native-current-20260904.md`](../certification/reports/security-review-native-current-20260904.md)
 and
 [`security-review-sidecar-current-20260904.md`](../certification/reports/security-review-sidecar-current-20260904.md).
 
-Native Prometheus hot-torrent labels now hash infohashes by default. Raw
+TorrentNG-client Prometheus hot-torrent labels now hash infohashes by default. Raw
 identifiers require `metrics.include_torrent_ids = true`, and startup emits a
-warning when that opt-in is used. `/metrics` remains behind the native auth
-middleware when tokens are configured. The sidecar now applies the same token
-gate to `/metrics`; deployments must still keep the route on an
+warning when that opt-in is used. `/metrics` remains behind the TorrentNG-client
+auth middleware when tokens are configured. The compatible-client service now
+applies the same token gate to `/metrics`; deployments must still keep the route on an
 internal/protected network.
 
-The sidecar's `trust_proxy_header` mode is loopback-only. A reverse proxy must
+The compatible-client service's `trust_proxy_header` mode is loopback-only. A reverse proxy must
 strip inbound `X-Remote-User` values before forwarding; public binds fail
 configuration validation when this mode is enabled.
 

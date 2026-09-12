@@ -27,7 +27,7 @@ async fn main() -> Result<()> {
         operation = "startup",
         version = env!("CARGO_PKG_VERSION"),
         result = "started",
-        "TorrentNG sidecar starting"
+        "TorrentNG compatible-client service starting"
     );
     info!(
         component = "config",
@@ -57,7 +57,7 @@ async fn main() -> Result<()> {
         ),
         BackendKind::Torrentng => Arc::new(
             backend::torrentng::TorrentngBackend::new(&cfg.torrentng)
-                .context("create torrentng native backend")?,
+                .context("create TorrentNG client backend")?,
         ),
     };
 
@@ -67,7 +67,7 @@ async fn main() -> Result<()> {
         cfg.logging.event_retention,
         "info",
         "sidecar_started",
-        "TorrentNG sidecar started",
+        "TorrentNG compatible-client service started",
         serde_json::json!({
             "component": "sidecar",
             "operation": "startup",
@@ -92,7 +92,7 @@ async fn main() -> Result<()> {
                 cfg.logging.event_retention,
                 "error",
                 "rtorrent_identity_error",
-                "sidecar refused startup because rTorrent tracker identity was not applied",
+                "compatible-client service refused startup because rTorrent tracker identity was not applied",
                 serde_json::json!({
                     "component": "rtorrent",
                     "operation": "startup_identity",
@@ -107,7 +107,7 @@ async fn main() -> Result<()> {
             cfg.logging.event_retention,
             "info",
             "rtorrent_identity_ready",
-            "rTorrent tracker identity applied before sidecar became available",
+            "rTorrent tracker identity applied before compatible-client service became available",
             serde_json::json!({
                 "component": "rtorrent",
                 "operation": "startup_identity",
@@ -206,7 +206,8 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Apply every tracker-facing rTorrent identity before starting any sidecar
+/// Apply every tracker-facing rTorrent identity before starting any
+/// compatible-client service
 /// background task or binding the HTTP listener. The packaged rTorrent build
 /// keeps session torrents behind its identity gate until release_identity_gate
 /// succeeds, so startup cannot expose a window where a torrent announces with

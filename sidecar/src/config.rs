@@ -324,7 +324,7 @@ impl Config {
 // --- defaults ---
 
 fn default_listen_addr() -> String {
-    // A missing sidecar config must not publish an unauthenticated control
+    // A missing compatible-client service config must not publish an unauthenticated control
     // plane. Container/public deployments set an explicit bind address and
     // provide credentials in their deployment environment.
     "127.0.0.1:8080".into()
@@ -921,8 +921,8 @@ mod tests {
         std::env::set_var("TNG_TRANSMISSION_PASSWORD", "tr-pass");
         std::env::set_var("TNG_DELUGE_URL", "http://deluge:8112/json");
         std::env::set_var("TNG_DELUGE_PASSWORD", "deluge-pass");
-        std::env::set_var("TNG_TORRENTNG_URL", "http://native:8080");
-        std::env::set_var("TNG_TORRENTNG_API_TOKEN", "native-token");
+        std::env::set_var("TNG_TORRENTNG_URL", "http://torrentngd:8080");
+        std::env::set_var("TNG_TORRENTNG_API_TOKEN", "torrentng-token");
 
         let mut cfg = Config::test_default();
         cfg.apply_env();
@@ -935,8 +935,8 @@ mod tests {
         assert_eq!(cfg.transmission.password.as_deref(), Some("tr-pass"));
         assert_eq!(cfg.deluge.url, "http://deluge:8112/json");
         assert_eq!(cfg.deluge.password.as_deref(), Some("deluge-pass"));
-        assert_eq!(cfg.torrentng.url, "http://native:8080");
-        assert_eq!(cfg.torrentng.api_token.as_deref(), Some("native-token"));
+        assert_eq!(cfg.torrentng.url, "http://torrentngd:8080");
+        assert_eq!(cfg.torrentng.api_token.as_deref(), Some("torrentng-token"));
 
         restore_env("TNG_QBITTORRENT_URL", old_qb_url);
         restore_env("TNG_QBITTORRENT_USERNAME", old_qb_user);

@@ -33,7 +33,7 @@ export function TorrentContextMenu({
   const canStop = menu.torrent.state !== 0
   const left = Math.min(menu.x, window.innerWidth - 236)
   const top = Math.min(menu.y, window.innerHeight - 356)
-  const status = menu.torrent.state === 5 || (menu.torrent.message && !menu.torrent.is_active)
+  const status = menu.torrent.state === 3
     ? { label: 'Error', color: 'var(--danger)' }
     : menu.torrent.state === 0
       ? { label: 'Stopped', color: 'var(--faint)' }

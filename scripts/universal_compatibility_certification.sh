@@ -79,9 +79,9 @@ skip_gate() {
 run_gate "API facade endpoint and field matrices" "$ROOT/scripts/api_facade_certification.sh" "$REPORT_DIR/api-facades-universal-$(date -u +%Y%m%dT%H%M%SZ).md"
 run_gate "migration dry-run, DB import, and fastresume matrices" cargo test -p rt-migrate
 run_gate "migration exported corpus coverage" "$ROOT/scripts/migration_corpus_certification.sh" "$REPORT_DIR/migration-corpus-universal-$(date -u +%Y%m%dT%H%M%SZ).md"
-run_gate "Track 1 sidecar qBittorrent compatibility flows" bash -c 'cd sidecar && cargo test qb_'
-run_gate "native API compatibility manifest" cargo test -p rt-api-native
-run_gate "native engine state, tracker, and storage hooks" cargo test -p rt-engine
+run_gate "Track 1 compatible-client qBittorrent flows" bash -c 'cd sidecar && cargo test qb_'
+run_gate "TorrentNG API compatibility manifest" cargo test -p rt-api-native
+run_gate "TorrentNG client state, tracker, and storage hooks" cargo test -p rt-engine
 run_gate "scale and metrics compatibility evidence" cargo test -p rt-metrics
 run_gate "storage topology and peer-read matrix" "$ROOT/scripts/storage_phase_b_matrix.sh"
 

@@ -2,4 +2,4 @@
 
 piece-to-file mapping and request boundary math.
 
-## Status: Implemented — native engine support
+## Status: Implemented — TorrentNG client support

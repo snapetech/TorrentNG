@@ -6,7 +6,7 @@
 //! torrents. Each client is checked in three directions:
 //!
 //!   1. IMPORT     — an independently-built client state dir → `dry_run_*`
-//!   2. EXPORT     — native DB + blob + fastresume → `rt_migrate::export`
+//!   2. EXPORT     — TorrentNG-client DB + blob + fastresume → `rt_migrate::export`
 //!   3. ROUND-TRIP — export, then re-import through that client's importer
 //!
 //! Everything is offline and deterministic (no network, no real ISOs).
@@ -212,7 +212,7 @@ fn lay_down_data(iso: &Iso, m: &Meta) {
     }
 }
 
-// --- native state builder (export source) ----------------------------------
+// --- TorrentNG-client state builder (export source) -------------------------
 
 fn native_state(tmp: &Path, iso: &Iso, have: &[bool], m: &Meta) -> (PathBuf, PathBuf, PathBuf) {
     let db = tmp.join("state.db");
@@ -224,6 +224,15 @@ fn native_state(tmp: &Path, iso: &Iso, have: &[bool], m: &Meta) -> (PathBuf, Pat
     let conn = rusqlite::Connection::open(&db).unwrap();
     rt_db::migrate(&conn).unwrap();
     let complete = have.iter().all(|&b| b);
+    let downloaded_payload = have
+        .iter()
+        .enumerate()
+        .filter(|&(_, &present)| present)
+        .map(|(index, _)| {
+            let piece_start = index as i64 * PIECE_LEN;
+            iso.total_len.saturating_sub(piece_start).min(PIECE_LEN)
+        })
+        .sum::<i64>();
     let row = TorrentRow {
         info_hash: iso.hash_hex.clone(),
         name: iso.name.clone(),
@@ -239,6 +248,7 @@ fn native_state(tmp: &Path, iso: &Iso, have: &[bool], m: &Meta) -> (PathBuf, Pat
         completed_at: complete.then_some(1_700_000_500),
         uploaded: m.uploaded as i64,
         downloaded: m.downloaded as i64,
+        amount_left: iso.total_len.saturating_sub(downloaded_payload),
         ratio: 2.25,
         trackers: vec!["https://tracker.example/announce".into()],
     };

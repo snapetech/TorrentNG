@@ -1,9 +1,9 @@
 # BEP 29 uTP Status
 
-TorrentNG now has a real `rt-utp` protocol crate, but the native engine does
+TorrentNG now has a real `rt-utp` protocol crate, but the TorrentNG client does
 not treat the packet codec alone as full application support. The distinction
-matters: the crate can open and exchange uTP packets over UDP, while the native
-engine capability only reports full transport when torrent peer-wire or
+matters: the crate can open and exchange uTP packets over UDP, while the
+TorrentNG client capability only reports full transport when torrent peer-wire or
 metadata paths can actually use those streams.
 
 ## Implemented In `rt-utp`
@@ -30,7 +30,7 @@ metadata paths can actually use those streams.
   - demultiplexes packets by remote address and receive connection ID;
   - accepts multiple incoming uTP streams without consuming the listener socket;
   - routes DATA/FIN/STATE packets into per-stream bounded queues.
-- Process-level uTP counters and gauges exported through native Prometheus
+- Process-level uTP counters and gauges exported through TorrentNG Prometheus
   metrics: connects, accepts, sent/received bytes, send/receive timeouts,
   retransmissions, route drops, RTT, RTT variance, retransmit timeout,
   congestion window, delay samples, and bytes in flight.
@@ -101,8 +101,8 @@ and retransmission-attempt bounds.
 ## `/health` uTP Transport Capability
 
 The runtime capability is intentionally stricter than crate capability. It
-means peers can transfer torrent data or metadata through uTP in the native
-engine, not merely that the protocol crate can exchange UDP packets.
+means peers can transfer torrent data or metadata through the TorrentNG
+client, not merely that the protocol crate can exchange UDP packets.
 
 `/health` now reports `networking.utp_transport=true` whenever at least one
 runtime path can use uTP:
@@ -116,7 +116,7 @@ If operators force TCP-only mode with `TNG_UTP_OUTGOING=tcp-only`, leave
 metadata uTP off, and do not enable incoming uTP, `/health` reports
 `networking.utp_transport=false`.
 
-The native health capability surface also reports:
+The TorrentNG-client health capability surface also reports:
 
 - `networking.utp_udp_stream=true`: `rt-utp` has async UDP stream primitives.
 - `networking.utp_outgoing_opt_in=true`: the engine contains an explicit

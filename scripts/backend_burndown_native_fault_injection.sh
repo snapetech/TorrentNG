@@ -143,7 +143,7 @@ PY
 }
 
 {
-  echo "# TorrentNG Native Live Fault-Injection Matrix"
+  echo "# TorrentNG Client Live Fault-Injection Matrix"
   echo
   echo "- Date UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "- Host: $(hostname)"

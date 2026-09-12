@@ -1,6 +1,10 @@
-# Engine Rewrite Burndown
+# TorrentNG Client Rewrite Burndown
 
-This is the working checklist for finishing the native Rust engine rewrite. It is intentionally implementation-facing: every unchecked item should either become code, tests, certification output, or deleted because it no longer applies.
+This is the working checklist for finishing the TorrentNG client transfer
+implementation. It is intentionally implementation-facing: every unchecked
+item should either become code, tests, certification output, or be deleted
+because it no longer applies. The compatible-client WebUI/API service remains a
+supported backend arrangement alongside this client.
 
 ## 1. Durable Session Backbone
 
@@ -63,15 +67,15 @@ This is the working checklist for finishing the native Rust engine rewrite. It i
 - [x] Harden upload serving for large multi-file torrents.
 - [x] Add public Linux ISO download certification.
 
-## 6. Daemon Operations
+## 6. TorrentNG Client Daemon Operations
 
-- [x] Add native health endpoint backed by engine readiness.
+- [x] Add TorrentNG-client health endpoint backed by engine readiness.
 - [x] Add Prometheus metrics for torrents, peers, trackers, jobs, storage, and DB.
-- [x] Add SSE/WebSocket delta stream for native API.
+- [x] Add SSE/WebSocket delta stream for TorrentNG REST API.
 - [x] Add clean shutdown stopped-announces with bounded deadline.
-- [x] Add API token authentication for mutating native endpoints.
+- [x] Add API token authentication for mutating TorrentNG endpoints.
 - [x] Add structured "why is this not seeding?" diagnostic API.
-- [x] Remove stale sidecar assumptions from `torrentngd` docs.
+- [x] Remove stale compatible-client-service assumptions from `torrentngd` docs.
 
 ## 7. Compatibility APIs
 
@@ -107,8 +111,8 @@ This is the working checklist for finishing the native Rust engine rewrite. It i
 - [x] Update `docs/ENGINE.md` when implemented behavior diverges from design.
 - [x] Add threat model review.
 - [x] Add backup/restore docs.
-- [x] Add production deployment docs for native engine mode.
-- [x] Remove or archive Track 1-only compatibility code when native engine supersedes it.
+- [x] Add production deployment docs for the TorrentNG client.
+- [x] Keep the compatible-client WebUI/API service available alongside the TorrentNG client.
 
 ## 11. Red-Team Rectifications
 

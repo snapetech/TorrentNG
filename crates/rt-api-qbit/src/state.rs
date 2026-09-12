@@ -9,7 +9,7 @@ use tokio::sync::{Mutex, Notify, RwLock};
 
 use rt_api_model::{ApiRuntimeMetrics, ChunkedBitSet, ChunkedVec, IdempotencyStore};
 use rt_engine::{EngineGlobalLimits, EngineHandle, OutboundEgressPolicy};
-use rt_session::{RegistryChange, SessionRegistry, TorrentEntry};
+use rt_session::{RegistryChange, SessionRegistry, TorrentEntry, TorrentState};
 
 pub type JsonMap = serde_json::Map<String, serde_json::Value>;
 
@@ -198,6 +198,14 @@ pub(crate) fn canonical_sort_key(requested_sort: Option<&str>) -> &'static str {
     }
 }
 
+/// Completion is a live transfer property for qBittorrent compatibility.
+/// `completed_at` records history and can remain populated after a recheck
+/// discovers missing pieces.
+pub(crate) fn torrent_is_complete(entry: &TorrentEntry) -> bool {
+    matches!(entry.state, TorrentState::Seeding)
+        || (entry.total_length > 0 && entry.amount_left == 0)
+}
+
 fn build_filter_index(entries: &ChunkedVec<TorrentEntry>) -> TorrentFilterIndex {
     let mut by_hash = HashMap::<String, usize>::new();
     let mut by_state = HashMap::<String, Vec<usize>>::new();
@@ -219,7 +227,7 @@ fn build_filter_index(entries: &ChunkedVec<TorrentEntry>) -> TorrentFilterIndex 
                 by_tag.entry(tag.clone()).or_default().push(index);
             }
         }
-        if entry.completed_at.is_some() {
+        if torrent_is_complete(entry) {
             completed.push(index);
         }
     }
@@ -289,8 +297,8 @@ fn update_filter_index(
             len,
         );
     }
-    if old.completed_at != new.completed_at {
-        filters.completed = Arc::new(filters.completed.set(index, new.completed_at.is_some()));
+    if torrent_is_complete(old) != torrent_is_complete(new) {
+        filters.completed = Arc::new(filters.completed.set(index, torrent_is_complete(new)));
     }
 }
 
@@ -357,7 +365,7 @@ pub struct AppState {
     pub(crate) preference_write: Arc<Mutex<()>>,
     pub global_limits: Arc<RwLock<EngineGlobalLimits>>,
     /// In-memory-only limit projection used by facade tests and embedders that
-    /// intentionally do not attach the native engine. The daemon always uses
+    /// intentionally do not attach the TorrentNG client. The daemon always uses
     /// the durable engine path instead.
     pub torrent_limits: Arc<RwLock<HashMap<String, rt_engine::EngineTorrentLimits>>>,
     pub banned_peers: Arc<RwLock<BTreeSet<SocketAddr>>>,
@@ -762,5 +770,20 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn completion_filter_index_tracks_live_amount_left() {
+        let mut old = TorrentEntry::new("a".repeat(40), "alpha".to_owned(), "/data".to_owned());
+        old.total_length = 100;
+        old.amount_left = 100;
+        let entries = ChunkedVec::from_vec(vec![old.clone()]);
+        let mut filters = build_filter_index(&entries);
+        assert!(filters.completed.indices().is_empty());
+
+        let mut new = old.clone();
+        new.amount_left = 0;
+        update_filter_index(&mut filters, 0, &old, &new, entries.len());
+        assert_eq!(filters.completed.indices(), vec![0]);
     }
 }

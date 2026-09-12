@@ -1,6 +1,6 @@
 # Storage I/O
 
-This document tracks the native engine storage path for large seedboxes. The
+This document tracks the TorrentNG client storage path for large seedboxes. The
 target is explicit userspace I/O control for 10k-100k torrents and 200+ TB
 libraries without mmap as the primary data path.
 
@@ -25,7 +25,7 @@ They must not be read as missing local implementation.
 
 ## Previous Gap
 
-The original native path used a simple per-block primitive:
+The original TorrentNG-client path used a simple per-block primitive:
 
 - `open -> seek -> read/write -> close` for every block.
 - `create_dir_all` before every download write.
@@ -58,7 +58,7 @@ class semaphores:
 - `StorageIoConfig` carries file-pool size, idle TTL, I/O worker count, queue
   depth, preallocation mode, durability mode, and peer-read readahead target.
   `PreallocationMode::Auto` resolves at scheduler construction time from the
-  detected topology. Native `[storage]` TOML exposes these scheduler knobs so
+  detected topology. TorrentNG-client `[storage]` TOML exposes these scheduler knobs so
   operators can tune them without code changes.
 - `scheduled_read` and `scheduled_write` remain compatibility wrappers, but
   call positioned `read_at`/`write_at`. Callers that can process borrowed data
@@ -149,7 +149,7 @@ startup falls back to verification instead of trusting stale piece state.
 The following items were previously tracked as implementation targets and are
 now part of the release surface:
 
-- Native move/import/delete API calls use the storage-plan job helpers. The
+- TorrentNG move/import/delete API calls use the storage-plan job helpers. The
   storage executor accepts engine-owned completed step indexes, while the
   public API rejects caller-selected skips. The engine persists storage-plan
   queue/start/checkpoint/complete state in the durable jobs table so

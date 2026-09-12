@@ -177,6 +177,7 @@ pub async fn run_dht(
     let mut search_tick = interval(Duration::from_secs(30));
     let mut outstanding_sweep_tick = interval(Duration::from_secs(10));
     let mut buf = vec![0u8; 2048];
+    let mut shutdown_reply = None;
     loop {
         tokio::select! {
             command = cmd_rx.recv() => {
@@ -189,6 +190,16 @@ pub async fn run_dht(
                     );
                     break;
                 };
+                if let DhtCommand::Shutdown { reply } = cmd {
+                    info!(
+                        component = "dht",
+                        operation = "shutdown",
+                        result = "ok",
+                        "DHT task shutting down"
+                    );
+                    shutdown_reply = Some(reply);
+                    break;
+                }
                 if !task.handle_command(cmd).await {
                     break;
                 }
@@ -226,6 +237,12 @@ pub async fn run_dht(
                 }
             }
         }
+    }
+    // Drop the socket-owning task before acknowledging shutdown. Callers can
+    // then safely bind the configured DHT port for a replacement engine.
+    drop(task);
+    if let Some(reply) = shutdown_reply {
+        let _ = reply.send(());
     }
     Ok(())
 }
@@ -302,12 +319,20 @@ impl DhtTask {
         true
     }
 
+    /// Discard lookup state belonging to a previous torrent-task incarnation.
+    /// A late response for an old `get_peers` request must not be forwarded to
+    /// a task that was added later for the same info-hash.
+    fn clear_torrent_lookup_state(&mut self, info_hash: [u8; 20]) {
+        self.outstanding.retain(|_, query| {
+            !matches!(query.request, DhtRequest::GetPeers(candidate) if candidate == info_hash)
+        });
+        self.queried_nodes.remove(&info_hash);
+        self.last_full_lookup.remove(&info_hash);
+    }
+
     async fn handle_command(&mut self, cmd: DhtCommand) -> bool {
         match cmd {
             DhtCommand::AddTorrent(torrent) => {
-                if !self.accept_generation(torrent.info_hash, torrent.generation) {
-                    return true;
-                }
                 if !self.torrents.contains_key(&torrent.info_hash)
                     && self.torrents.len() >= DHT_TRACKED_TORRENTS_CAP
                 {
@@ -321,6 +346,15 @@ impl DhtTask {
                     );
                     return true;
                 }
+                // Do not consume a generation for an add rejected by the
+                // tracking-cap admission above. The same registration may be
+                // retried after another torrent is removed; recording it as
+                // accepted before admission would make that retry look stale
+                // and lose DHT tracking permanently for this generation.
+                if !self.accept_generation(torrent.info_hash, torrent.generation) {
+                    return true;
+                }
+                self.clear_torrent_lookup_state(torrent.info_hash);
                 self.torrents.insert(torrent.info_hash, torrent.cmd_tx);
                 self.search_torrent(torrent.info_hash, true).await;
             }
@@ -332,9 +366,8 @@ impl DhtTask {
                     return true;
                 }
                 self.torrents.remove(&info_hash);
-                self.queried_nodes.remove(&info_hash);
+                self.clear_torrent_lookup_state(info_hash);
                 self.announced_peers.remove(&info_hash);
-                self.last_full_lookup.remove(&info_hash);
             }
             DhtCommand::GetStats { reply } => {
                 let _ = reply.send(self.runtime_stats());
@@ -1392,6 +1425,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cap_rejected_add_can_retry_after_capacity_is_freed() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let socket = UdpSocket::from_std(socket).unwrap();
+        let local_id = NodeId::from_bytes([1; 20]);
+        let target = [255; 20];
+        let (cmd_tx, _cmd_rx) = mpsc::channel(1);
+        let mut tracked = HashMap::with_capacity(DHT_TRACKED_TORRENTS_CAP);
+        for index in 0..DHT_TRACKED_TORRENTS_CAP {
+            let mut info_hash = [0; 20];
+            info_hash[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            tracked.insert(info_hash, cmd_tx.clone());
+        }
+        let mut task = DhtTask {
+            local_id,
+            table: RoutingTable::new(local_id),
+            socket,
+            listen_port: 6881,
+            bootstrap_nodes: Vec::new(),
+            next_tx: 1,
+            outstanding: HashMap::new(),
+            queried_nodes: HashMap::new(),
+            torrents: tracked,
+            announced_peers: HashMap::new(),
+            last_full_lookup: HashMap::new(),
+            generations: HashMap::new(),
+        };
+
+        task.handle_command(DhtCommand::AddTorrent(DhtTorrent {
+            info_hash: target,
+            cmd_tx: cmd_tx.clone(),
+            generation: 1,
+        }))
+        .await;
+        assert!(!task.torrents.contains_key(&target));
+        assert!(!task.generations.contains_key(&target));
+
+        task.torrents.remove(&[0; 20]);
+        task.handle_command(DhtCommand::AddTorrent(DhtTorrent {
+            info_hash: target,
+            cmd_tx,
+            generation: 1,
+        }))
+        .await;
+
+        assert!(task.torrents.contains_key(&target));
+    }
+
+    #[tokio::test]
     async fn get_peers_response_forwards_discovered_peers_to_torrent() {
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         socket.set_nonblocking(true).unwrap();
@@ -1609,6 +1691,66 @@ mod tests {
         })
         .await;
         assert!(task.torrents.contains_key(&info_hash));
+    }
+
+    #[tokio::test]
+    async fn removed_torrent_does_not_receive_late_lookup_response_after_readd() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let socket = UdpSocket::from_std(socket).unwrap();
+        let local_id = NodeId::from_bytes([1; 20]);
+        let remote_id = NodeId::from_bytes([2; 20]);
+        let info_hash = [9; 20];
+        let queried_addr_v4: SocketAddrV4 = "127.0.0.1:6001".parse().unwrap();
+        let queried_addr = SocketAddr::V4(queried_addr_v4);
+        let discovered_peer: SocketAddr = "127.0.0.1:51413".parse().unwrap();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
+        let mut task = DhtTask {
+            local_id,
+            table: RoutingTable::new(local_id),
+            socket,
+            listen_port: 6881,
+            bootstrap_nodes: Vec::new(),
+            next_tx: 1,
+            outstanding: HashMap::from([(
+                b"old".to_vec(),
+                OutstandingQuery {
+                    addr: queried_addr,
+                    request: DhtRequest::GetPeers(info_hash),
+                    sent_at: Instant::now(),
+                },
+            )]),
+            queried_nodes: HashMap::from([(info_hash, HashSet::from([queried_addr_v4]))]),
+            torrents: HashMap::from([(info_hash, cmd_tx.clone())]),
+            announced_peers: HashMap::new(),
+            last_full_lookup: HashMap::from([(info_hash, Instant::now())]),
+            generations: HashMap::new(),
+        };
+
+        task.handle_command(DhtCommand::RemoveTorrent {
+            info_hash,
+            generation: 10,
+        })
+        .await;
+        task.handle_command(DhtCommand::AddTorrent(DhtTorrent {
+            info_hash,
+            cmd_tx,
+            generation: 11,
+        }))
+        .await;
+
+        assert!(task.outstanding.is_empty());
+        let response = KrpcMessage::Response {
+            transaction_id: b"old".to_vec(),
+            response: DhtResponse {
+                id: remote_id,
+                nodes: Vec::new(),
+                values: vec![discovered_peer],
+                token: None,
+            },
+        };
+        task.handle_packet(&response.encode(), queried_addr).await;
+        assert!(cmd_rx.try_recv().is_err());
     }
 
     #[tokio::test]
