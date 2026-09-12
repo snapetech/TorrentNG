@@ -30,6 +30,8 @@ pub enum StorageError {
     QueueFull { mount: String },
     #[error("staged move failed at step {step}: {reason}")]
     StagedMoveFailed { step: &'static str, reason: String },
+    #[error("storage filesystem state requires manual recovery at step {step}: {reason}")]
+    FilesystemStateUncertain { step: &'static str, reason: String },
     #[error("path error: {0}")]
     Path(#[from] rt_path::PathError),
     #[error(
@@ -43,6 +45,12 @@ pub enum StorageError {
 }
 
 impl StorageError {
+    /// Return whether the error means the executor cannot prove that the
+    /// filesystem is back in a state where an owning torrent may safely run.
+    pub fn requires_manual_recovery(&self) -> bool {
+        matches!(self, Self::FilesystemStateUncertain { .. })
+    }
+
     pub fn io(path: impl Into<String>, source: std::io::Error) -> Self {
         let path = path.into();
         if source.kind() == std::io::ErrorKind::PermissionDenied {

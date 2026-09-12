@@ -49,8 +49,9 @@ Implemented and covered by automated tests:
 - Move/import/delete execution has an opt-in storage-root confinement entry
   point that validates source, destination, and rollback paths before applying
   any filesystem change.
-- Move/import/delete execution can resume from caller-supplied completed step
-  indexes and reports newly completed steps through checkpoint callbacks.
+- Move/import/delete execution resumes from engine-owned completed-step
+  checkpoints and reports newly completed steps through checkpoint callbacks;
+  public callers cannot select filesystem steps to skip.
 - Engine save-path updates execute existing payload moves through the
   checkpointed storage-plan executor and persist storage-plan job
   queue/running/checkpoint/completed state in SQLite before committing the new
@@ -60,9 +61,9 @@ Implemented and covered by automated tests:
   storage-plan job path.
 - The WebUI Library storage panel has a guided move/import/delete planner that
   previews root-confined steps and executes accepted plans through the native
-  durable storage-plan API, including affected torrent metadata, completed-step
-  resume indexes, operation templates, byte summaries, and active storage-plan
-  job progress.
+  durable storage-plan API, including affected torrent metadata, operation
+  templates, required move/import byte verification, byte summaries, and
+  active storage-plan job progress.
 - Move/import/delete certification can run against a real storage root with
   configurable fixture size by setting `TNG_STORAGE_MOVE_IMPORT_ROOT`,
   `TNG_STORAGE_MOVE_IMPORT_FILES`, and `TNG_STORAGE_MOVE_IMPORT_MIB_PER_FILE`.

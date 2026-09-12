@@ -62,6 +62,16 @@ pub struct ListParams {
     pub offset: Option<i64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct TorrentLiveRow {
+    pub hash: String,
+    pub size_bytes: i64,
+    pub bytes_done: i64,
+    pub down_rate: i64,
+    pub up_rate: i64,
+    pub updated_at: i64,
+}
+
 impl Db {
     pub fn get(&self, hash: &str) -> Result<Option<TorrentRow>> {
         let conn = self.0.lock().expect("db mutex");
@@ -116,6 +126,36 @@ impl Db {
                 updated_at: r.get(25)?,
             })),
         }
+    }
+
+    /// Read only the fields needed for visible-row ETA updates in one SQL
+    /// statement instead of one query and connection lock per torrent.
+    pub fn live_stats(&self, hashes: &[String]) -> Result<Vec<TorrentLiveRow>> {
+        if hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = (1..=hashes.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT hash, size_bytes, bytes_done, down_rate, up_rate, updated_at
+             FROM torrents
+             WHERE hash COLLATE NOCASE IN ({placeholders})"
+        );
+        let conn = self.0.lock().expect("db mutex");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(hashes.iter()), |row| {
+            Ok(TorrentLiveRow {
+                hash: row.get(0)?,
+                size_bytes: row.get(1)?,
+                bytes_done: row.get(2)?,
+                down_rate: row.get(3)?,
+                up_rate: row.get(4)?,
+                updated_at: row.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     /// Returns changed torrents and removals only when the delta fits within
@@ -540,7 +580,9 @@ fn build_where(p: &ListParams) -> (String, Vec<String>) {
 
 /// Known media-type bucket keys. Anything else classifies as "no match"
 /// rather than silently matching everything.
-const KNOWN_MEDIA_TYPES: &[&str] = &["ebook", "tv", "video", "audio", "image", "game", "software"];
+const KNOWN_MEDIA_TYPES: &[&str] = &[
+    "ebook", "tv", "video", "audio", "image", "game", "software", "other",
+];
 
 fn append_media_type_clause(media_type: &str, clauses: &mut Vec<String>, args: &mut Vec<String>) {
     if !KNOWN_MEDIA_TYPES.contains(&media_type) {
@@ -679,6 +721,26 @@ mod tracker_error_integration_tests {
     }
 
     #[test]
+    fn live_stats_reads_requested_rows_in_one_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+        let hash = "a".repeat(40);
+        let mut torrent = row(&hash, true, "");
+        torrent.size_bytes = 100;
+        torrent.bytes_done = 40;
+        torrent.down_rate = 12_345;
+        torrent.up_rate = 678;
+        db.upsert(&torrent).unwrap();
+
+        let rows = db.live_stats(&[hash.to_ascii_uppercase()]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].hash, hash);
+        assert_eq!(rows[0].size_bytes - rows[0].bytes_done, 60);
+        assert_eq!(rows[0].down_rate, 12_345);
+        assert_eq!(rows[0].up_rate, 678);
+    }
+
+    #[test]
     fn tracker_filter_treats_sql_wildcards_as_literal_text() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("cache.db")).unwrap();
@@ -717,6 +779,31 @@ mod tracker_error_integration_tests {
             .unwrap();
         assert_eq!(total, 1);
         assert_eq!(rows[0].hash, "literal");
+    }
+
+    #[test]
+    fn other_media_type_is_queryable_and_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+        let mut other = row("other", true, "");
+        other.name = "Plain document".to_owned();
+        db.upsert(&other).unwrap();
+        let mut video = row("video", true, "");
+        video.name = "Movie.mkv".to_owned();
+        db.upsert(&video).unwrap();
+
+        let facets = db.sidebar_facets(&ListParams::default()).unwrap();
+        assert_eq!(facets.media_type.get("other"), Some(&1));
+
+        let (rows, total) = db
+            .list(&ListParams {
+                media_type: Some("other".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].hash, "other");
     }
 
     #[test]

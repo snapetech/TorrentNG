@@ -24,7 +24,8 @@ pub use event_row::{
     prune_session_events, prune_session_events_in_tx, JobEventRow, SessionEventRow,
 };
 pub use job_row::{
-    count_active_jobs, get_job, list_active_jobs, upsert_job, upsert_job_in_tx, JobRow,
+    count_active_jobs, get_job, list_active_jobs, list_failed_jobs_with_error_prefix, upsert_job,
+    upsert_job_in_tx, JobRow,
 };
 pub use peer_ban_row::{insert_peer_bans_in_tx, list_peer_bans};
 pub use projection_row::{

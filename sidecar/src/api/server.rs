@@ -60,6 +60,10 @@ pub fn build_router(state: AppState) -> Router {
             get(handlers::list_torrents).post(handlers::add_torrent),
         )
         .route(
+            "/api/v1/torrents/live",
+            get(handlers::live_torrent_stats),
+        )
+        .route(
             "/api/v1/torrents/{hash}",
             get(handlers::get_torrent)
                 .put(handlers::update_torrent)

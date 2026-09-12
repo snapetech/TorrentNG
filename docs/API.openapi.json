@@ -24,6 +24,9 @@
       "get": {"operationId": "listTorrents", "parameters": [{"$ref": "#/components/parameters/Limit"}, {"$ref": "#/components/parameters/Offset"}, {"$ref": "#/components/parameters/Snapshot"}, {"$ref": "#/components/parameters/Filter"}], "responses": {"200": {"$ref": "#/components/responses/JsonOk"}, "401": {"$ref": "#/components/responses/Unauthorized"}}},
       "post": {"operationId": "addTorrent", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "requestBody": {"$ref": "#/components/requestBodies/AddTorrent"}, "responses": {"200": {"$ref": "#/components/responses/JsonOk"}, "400": {"$ref": "#/components/responses/JsonError"}, "413": {"$ref": "#/components/responses/PayloadTooLarge"}}}
     },
+    "/api/v1/torrents/live": {
+      "get": {"operationId": "liveTorrentStats", "parameters": [{"name": "hashes", "in": "query", "required": true, "description": "Comma-separated list of at most 128 40/64-character hexadecimal info hashes", "schema": {"type": "string"}}], "responses": {"200": {"$ref": "#/components/responses/JsonOk"}, "400": {"$ref": "#/components/responses/JsonError"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "503": {"$ref": "#/components/responses/JsonError"}}}
+    },
     "/api/v1/torrents/{hash}": {
       "parameters": [{"$ref": "#/components/parameters/Hash"}],
       "get": {"operationId": "getTorrent", "responses": {"200": {"$ref": "#/components/responses/JsonOk"}, "404": {"$ref": "#/components/responses/NotFound"}}},

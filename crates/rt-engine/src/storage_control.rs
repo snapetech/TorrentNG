@@ -9,12 +9,11 @@
 
 use rt_storage::StoragePlan;
 use tokio::sync::oneshot;
-use tokio::time::timeout;
 use tracing::warn;
 
 use super::{
     normalize_storage_plan_targets, CmdResult, Engine, EngineCmd, PureV2RecheckCompletion,
-    StorageDeleteCompletion, StorageJobCompletion, ENGINE_COMMAND_SEND_TIMEOUT,
+    StorageDeleteCompletion, StorageJobCompletion, JOB_STATE_QUEUED,
     STORAGE_JOB_STATE_COMMIT_PENDING,
 };
 
@@ -37,6 +36,10 @@ pub(super) async fn execute_storage_plan(
         ));
         return true;
     }
+    if let Err(error) = rt_storage::ensure_plan_can_apply(&plan) {
+        let _ = reply.send(Err(format!("storage plan cannot apply: {error}")));
+        return true;
+    }
     let affected_torrents = match normalize_storage_plan_targets(affected_torrents) {
         Ok(targets) => targets,
         Err(error) => {
@@ -44,6 +47,7 @@ pub(super) async fn execute_storage_plan(
             return true;
         }
     };
+    let manual_recovery_torrents = affected_torrents.clone();
     if let Err(error) = engine
         .validate_storage_plan_targets(&operation, &affected_torrents)
         .await
@@ -80,7 +84,7 @@ pub(super) async fn execute_storage_plan(
         }
     };
     let (completion, completion_rx) = oneshot::channel();
-    let context = move_context.as_ref().map_or_else(
+    let mut context = move_context.as_ref().map_or_else(
         || serde_json::json!({}),
         |(_, name, old_save_path, save_path)| {
             serde_json::json!({
@@ -90,6 +94,7 @@ pub(super) async fn execute_storage_plan(
             })
         },
     );
+    context["quiesced"] = super::storage_quiesced_context(&quiesced);
     let result = engine
         .queue_storage_plan_job_with_context(
             &operation,
@@ -105,16 +110,19 @@ pub(super) async fn execute_storage_plan(
         let job_id = job_id.clone();
         tokio::spawn(async move {
             let completion = completion_rx.await.unwrap_or_else(|_| {
-                StorageJobCompletion::failed("storage worker completion channel closed", Vec::new())
+                StorageJobCompletion::failed_with_manual_recovery(
+                    "storage worker completion channel closed",
+                    Vec::new(),
+                )
             });
             if let Some((info_hash, name, old_save_path, save_path)) = move_context {
                 let quiesced = quiesced
                     .iter()
                     .find(|(hash, _)| hash == &info_hash)
                     .map(|(_, paused)| *paused);
-                let _ = timeout(
-                    ENGINE_COMMAND_SEND_TIMEOUT,
-                    cmd_tx.send(EngineCmd::StorageMoveFinished {
+                super::send_engine_command_until_delivered(
+                    cmd_tx,
+                    EngineCmd::StorageMoveFinished {
                         job_id,
                         info_hash,
                         name,
@@ -125,21 +133,26 @@ pub(super) async fn execute_storage_plan(
                         terminal_state: completion.state,
                         error: completion.error,
                         completed_steps: completion.completed_steps,
+                        requires_manual_recovery: completion.requires_manual_recovery,
                         retry_attempt: 0,
-                    }),
+                    },
+                    "storage_move_completion",
                 )
                 .await;
             } else {
-                let _ = timeout(
-                    ENGINE_COMMAND_SEND_TIMEOUT,
-                    cmd_tx.send(EngineCmd::StoragePlanFinished {
+                super::send_engine_command_until_delivered(
+                    cmd_tx,
+                    EngineCmd::StoragePlanFinished {
                         job_id,
                         affected_torrents: quiesced,
+                        manual_recovery_torrents,
                         succeeded: completion.succeeded,
                         terminal_state: completion.state,
                         error: completion.error,
                         completed_steps: completion.completed_steps,
-                    }),
+                        requires_manual_recovery: completion.requires_manual_recovery,
+                    },
+                    "storage_plan_completion",
                 )
                 .await;
             }
@@ -151,15 +164,75 @@ pub(super) async fn execute_storage_plan(
     true
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn finish_storage_plan(
     engine: &mut Engine,
     job_id: String,
     affected_torrents: Vec<(String, bool)>,
+    manual_recovery_torrents: Vec<String>,
     succeeded: bool,
     terminal_state: String,
     error: Option<String>,
     completed_steps: Vec<usize>,
+    requires_manual_recovery: bool,
 ) {
+    // The worker uses queued for shutdown reattachment. The engine is also
+    // shutting down, so resuming quiesced torrent tasks here would briefly
+    // reopen work that must remain frozen until restart recovery.
+    if terminal_state == JOB_STATE_QUEUED {
+        return;
+    }
+    if !succeeded && requires_manual_recovery {
+        warn!(
+            component = "storage_jobs",
+            operation = "complete",
+            job_id = %job_id,
+            result = "manual_recovery_required",
+            state = %terminal_state,
+            checkpoint = ?completed_steps,
+            error = ?error,
+            "storage plan left filesystem state that cannot be resumed safely"
+        );
+        let reason = super::manual_recovery_reason(error.unwrap_or_else(|| {
+            "storage plan left filesystem state that requires manual recovery".to_owned()
+        }));
+        if let Err(persist_error) = engine
+            .persist_storage_job_manual_recovery(
+                &job_id,
+                &manual_recovery_torrents,
+                reason.clone(),
+                "storage plan completion required manual recovery",
+            )
+            .await
+        {
+            warn!(
+                component = "storage_jobs",
+                operation = "persist_manual_recovery",
+                job_id = %job_id,
+                result = "error",
+                error = %persist_error,
+                "failed to persist storage plan manual-recovery marker at completion"
+            );
+        }
+        for info_hash in manual_recovery_torrents {
+            engine.stop_torrent_task(&info_hash).await;
+            if let Err(mark_error) = engine
+                .mark_torrent_manual_recovery(&info_hash, &reason)
+                .await
+            {
+                warn!(
+                    component = "storage_jobs",
+                    operation = "mark_manual_recovery",
+                    job_id = %job_id,
+                    torrent = %info_hash,
+                    result = "error",
+                    error = %mark_error,
+                    "failed to persist torrent manual-recovery state after stopping its task"
+                );
+            }
+        }
+        return;
+    }
     if !succeeded {
         warn!(
             component = "storage_jobs",
@@ -222,6 +295,7 @@ pub(super) struct StorageMoveCompletion {
     pub(super) terminal_state: String,
     pub(super) error: Option<String>,
     pub(super) completed_steps: Vec<usize>,
+    pub(super) requires_manual_recovery: bool,
     pub(super) retry_attempt: u8,
 }
 
@@ -237,6 +311,7 @@ pub(super) async fn finish_storage_move(engine: &mut Engine, completion: Storage
         terminal_state,
         error,
         completed_steps,
+        requires_manual_recovery,
         retry_attempt,
     } = completion;
     if let Err(error) = engine
@@ -251,6 +326,7 @@ pub(super) async fn finish_storage_move(engine: &mut Engine, completion: Storage
             terminal_state,
             error,
             completed_steps,
+            requires_manual_recovery,
             retry_attempt,
         )
         .await

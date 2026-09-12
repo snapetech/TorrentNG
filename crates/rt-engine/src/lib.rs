@@ -19,7 +19,7 @@ pub use command::{
     EnginePieceState, EngineStats, EngineStorageRoot, EngineSubsystemHealth, EngineTorrentFile,
     EngineTorrentLimits, EngineTorrentMetadata, EngineTrackerHealth, EngineTrackerSnapshot,
     EngineWebseedSnapshot, HotTorrentMemoryStats, QueueMove, StorageDeviceLatencyStats,
-    TorrentDiagnostic, TorrentRuntimeStats,
+    TorrentDiagnostic, TorrentLiveStats, TorrentRuntimeStats,
 };
 pub use egress_policy::{
     egress_policy_metrics, AddressClass, EgressPolicyError, EgressPolicyMetricsSnapshot,

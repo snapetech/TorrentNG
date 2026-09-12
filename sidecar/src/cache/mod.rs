@@ -8,7 +8,8 @@ pub mod workflows;
 pub use categories::Category;
 pub use db::{AppEventRow, Db, TorrentRow};
 pub use query::{
-    bounded_page_limit, validate_page_offset, ListParams, MAX_API_PAGE_ENTRIES, MAX_API_PAGE_OFFSET,
+    bounded_page_limit, validate_page_offset, ListParams, TorrentLiveRow, MAX_API_PAGE_ENTRIES,
+    MAX_API_PAGE_OFFSET,
 };
 pub use ratio::RatioGroup;
 pub use views::{SavedView, SavedViewParams};

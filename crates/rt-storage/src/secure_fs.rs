@@ -7,16 +7,47 @@
 //! directory descriptors. The descriptors remain anchored if an attacker
 //! renames or replaces a path component after the walk.
 
+use std::collections::hash_map::DefaultHasher;
 use std::ffi::{CStr, CString, OsString};
 use std::fs::File;
+use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use sha1::{Digest, Sha1};
 
 use crate::{PlannedStorageAction, StorageError, StoragePlan, StoragePlanStep};
+
+// Serialize the check/open/rename sequence among TorrentNG workers that
+// target the same destination. Linux's renameat2(RENAME_NOREPLACE) below
+// also closes the race against other processes; this lock only prevents two
+// in-process workers from needlessly contending on the *same* destination
+// before reaching that syscall.
+//
+// The lock is sharded by a hash of the destination path rather than global:
+// a single process-wide mutex would serialize every rename in the daemon --
+// across every torrent and every storage device -- for a race that can only
+// ever occur between two workers targeting the identical path. With many
+// shards, unrelated destinations almost always land in different shards and
+// proceed concurrently, while two workers racing the same destination still
+// reliably hash to the same shard and serialize as intended.
+const RENAME_LOCK_SHARDS: usize = 64;
+static RENAME_SERIAL: OnceLock<Vec<Mutex<()>>> = OnceLock::new();
+
+fn rename_lock_shard(destination: &Path) -> &Mutex<()> {
+    let shards = RENAME_SERIAL.get_or_init(|| {
+        std::iter::repeat_with(|| Mutex::new(()))
+            .take(RENAME_LOCK_SHARDS)
+            .collect()
+    });
+    let mut hasher = DefaultHasher::new();
+    destination.hash(&mut hasher);
+    let index = (hasher.finish() as usize) % shards.len();
+    &shards[index]
+}
 
 pub(crate) fn execute_step(step: &StoragePlanStep, roots: &[PathBuf]) -> Result<(), StorageError> {
     let no_control = || Ok(());
@@ -62,9 +93,11 @@ pub(crate) fn execute_step_with_control(
 }
 
 pub(crate) fn step_is_applied(
-    step: &StoragePlanStep,
+    plan: &StoragePlan,
+    index: usize,
     roots: &[PathBuf],
 ) -> Result<bool, StorageError> {
+    let step = &plan.steps[index];
     match step.action {
         PlannedStorageAction::Rename => {
             let source = required_path(step.source.as_ref(), "reconcile-source")?;
@@ -72,7 +105,7 @@ pub(crate) fn step_is_applied(
             let source_state = entry_state(source, roots)?;
             let destination_state = entry_state(destination, roots)?;
             if source_state.is_some() && destination_state.is_some() {
-                return Err(staged(
+                return Err(staged_uncertain(
                     "reconcile",
                     format!(
                         "rename has both source and destination present: {} -> {}",
@@ -81,7 +114,39 @@ pub(crate) fn step_is_applied(
                     ),
                 ));
             }
-            Ok(source_state.is_none() && destination_state.is_some())
+            if source_state.is_none() && destination_state.is_some() {
+                let Some(previous) = index
+                    .checked_sub(1)
+                    .and_then(|previous| plan.steps.get(previous))
+                else {
+                    return Err(staged_uncertain(
+                        "reconcile",
+                        format!(
+                            "cannot prove rename completion after source disappeared: {} -> {}",
+                            source.display(),
+                            destination.display()
+                        ),
+                    ));
+                };
+                let previous_source =
+                    required_path(previous.source.as_ref(), "reconcile-previous-source")?;
+                if !matches!(previous.action, PlannedStorageAction::CopyVerifyRename)
+                    || previous.destination.as_deref() != Some(source)
+                    || entry_state(previous_source, roots)?.is_none()
+                {
+                    return Err(staged_uncertain(
+                        "reconcile",
+                        format!(
+                            "cannot prove rename completion after source disappeared: {} -> {}",
+                            source.display(),
+                            destination.display()
+                        ),
+                    ));
+                }
+                reconcile_content(previous_source, destination, roots)?;
+                return Ok(true);
+            }
+            Ok(false)
         }
         PlannedStorageAction::CopyVerifyRename | PlannedStorageAction::ImportExisting => {
             let source = required_path(step.source.as_ref(), "reconcile-source")?;
@@ -89,13 +154,17 @@ pub(crate) fn step_is_applied(
             if entry_state(destination, roots)?.is_none() {
                 return Ok(false);
             }
-            // If the source is still available, compare it while both paths
-            // are descriptor-anchored. If the source was removed after the
-            // final rename, the destination remains valid evidence for the
-            // following plan step.
-            if entry_state(source, roots)?.is_some() {
-                verify_content(source, destination, roots)?;
+            if entry_state(source, roots)?.is_none() {
+                return Err(staged_uncertain(
+                    "reconcile",
+                    format!(
+                        "cannot prove copy or import completion after source disappeared: {} -> {}",
+                        source.display(),
+                        destination.display()
+                    ),
+                ));
             }
+            reconcile_content(source, destination, roots)?;
             Ok(true)
         }
         PlannedStorageAction::SafeDelete
@@ -106,6 +175,17 @@ pub(crate) fn step_is_applied(
         )?
         .is_none()),
     }
+}
+
+fn reconcile_content(
+    source: &Path,
+    destination: &Path,
+    roots: &[PathBuf],
+) -> Result<(), StorageError> {
+    verify_content(source, destination, roots).map_err(|error| match error {
+        StorageError::FilesystemStateUncertain { .. } => error,
+        error => staged_uncertain("reconcile", error.to_string()),
+    })
 }
 
 pub(crate) fn rollback_plan(
@@ -139,6 +219,16 @@ fn secure_import(
     if source_type.is_symlink() {
         return Err(unsafe_symlink(source, "import-source"));
     }
+    // Reject a stale expected size before creating a hard link. If the source
+    // changes between this check and linkat, the post-link check below still
+    // protects the plan and removes the link it just created.
+    verify_expected_length(
+        &source_parent,
+        &source_name,
+        expected_bytes,
+        source,
+        check_control,
+    )?;
 
     // Hard links are the cheap and atomic import path for regular files. A
     // directory cannot be linked, so it falls through to the same secure
@@ -159,17 +249,33 @@ fn secure_import(
         -1
     };
     if link_result == 0 {
-        if entry_type(&destination_parent, &destination_name, destination)?.is_symlink() {
-            let _ = unlink_at(&destination_parent, &destination_name, destination, 0);
-            return Err(unsafe_symlink(source, "import-source"));
+        let verification = (|| {
+            if entry_type(&destination_parent, &destination_name, destination)?.is_symlink() {
+                return Err(unsafe_symlink(source, "import-source"));
+            }
+            verify_expected_length(
+                &destination_parent,
+                &destination_name,
+                expected_bytes,
+                destination,
+                check_control,
+            )
+        })();
+        if let Err(error) = verification {
+            if let Err(cleanup_error) =
+                unlink_at(&destination_parent, &destination_name, destination, 0)
+            {
+                return Err(staged_uncertain(
+                    "import-cleanup",
+                    format!(
+                        "{error}; failed to remove hard-link destination {}: {cleanup_error}",
+                        destination.display()
+                    ),
+                ));
+            }
+            return Err(error);
         }
-        verify_expected_length(
-            &destination_parent,
-            &destination_name,
-            expected_bytes,
-            destination,
-            check_control,
-        )
+        Ok(())
     } else {
         secure_copy_entry(
             &source_parent,
@@ -215,6 +321,56 @@ fn secure_copy_entry(
     expected_bytes: u64,
     check_control: &dyn Fn() -> Result<(), StorageError>,
 ) -> Result<(), StorageError> {
+    let mut destination_created = false;
+    let result = secure_copy_entry_inner(
+        source_parent,
+        source_name,
+        destination_parent,
+        destination_name,
+        paths,
+        expected_bytes,
+        check_control,
+        &mut destination_created,
+    );
+    if let Err(error) = result {
+        if destination_created {
+            // Cleanup is deliberately not interruptible. The copy may have
+            // been cancelled or failed after creating a partial destination;
+            // returning without removing it would make a retry look like a
+            // conflicting operator-created destination.
+            let no_control = || Ok(());
+            if let Err(cleanup_error) = remove_entry_at(
+                destination_parent,
+                destination_name,
+                paths.1,
+                true,
+                &no_control,
+            ) {
+                return Err(staged_uncertain(
+                    "copy-cleanup",
+                    format!(
+                        "{error}; failed to remove partial destination {}: {cleanup_error}",
+                        paths.1.display()
+                    ),
+                ));
+            }
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn secure_copy_entry_inner(
+    source_parent: &File,
+    source_name: &OsString,
+    destination_parent: &File,
+    destination_name: &OsString,
+    paths: (&Path, &Path),
+    expected_bytes: u64,
+    check_control: &dyn Fn() -> Result<(), StorageError>,
+    destination_created: &mut bool,
+) -> Result<(), StorageError> {
     let (source_path, destination_path) = paths;
     check_control()?;
     let source_type = entry_type(source_parent, source_name, source_path)?;
@@ -225,6 +381,7 @@ fn secure_copy_entry(
 
     if source_type.is_dir() {
         mkdir_at(destination_parent, destination_name, destination_path)?;
+        *destination_created = true;
         let source_dir = open_dir_at(source_parent, source_name, source_path)
             .map_err(|error| StorageError::io(source_path.display().to_string(), error))?;
         let destination_dir =
@@ -246,6 +403,7 @@ fn secure_copy_entry(
             source_path,
             destination_path,
             check_control,
+            destination_created,
         )?;
     } else {
         return Err(staged(
@@ -296,6 +454,7 @@ fn copy_directory_contents(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn copy_file_at(
     source_parent: &File,
     source_name: &OsString,
@@ -304,10 +463,12 @@ fn copy_file_at(
     source_path: &Path,
     destination_path: &Path,
     check_control: &dyn Fn() -> Result<(), StorageError>,
+    destination_created: &mut bool,
 ) -> Result<(), StorageError> {
     check_control()?;
     let mut source = open_file_at(source_parent, source_name, source_path, libc::O_RDONLY)?;
     let mut destination = create_file_at(destination_parent, destination_name, destination_path)?;
+    *destination_created = true;
     let mut buffer = [0u8; 64 * 1024];
     loop {
         check_control()?;
@@ -334,6 +495,9 @@ fn secure_rename(
     check_control: &dyn Fn() -> Result<(), StorageError>,
 ) -> Result<(), StorageError> {
     check_control()?;
+    let _rename_guard = rename_lock_shard(destination)
+        .lock()
+        .map_err(|_| staged("rename", "rename serialization lock poisoned"))?;
     let (source_parent, source_name) = open_parent(source, roots, false, "rename-source")?;
     let (destination_parent, destination_name) =
         open_parent(destination, roots, true, "rename-destination")?;
@@ -341,30 +505,117 @@ fn secure_rename(
     if entry_type(&source_parent, &source_name, source)?.is_symlink() {
         return Err(unsafe_symlink(source, "rename-source"));
     }
+    // Check the source before the destructive rename. A stale expected size
+    // must fail without leaving the source stranded at the destination.
+    verify_expected_length(
+        &source_parent,
+        &source_name,
+        expected_bytes,
+        source,
+        check_control,
+    )?;
     check_control()?;
     let source_c = c_name(&source_name, source)?;
     let destination_c = c_name(&destination_name, destination)?;
-    let result = unsafe {
-        libc::renameat(
-            source_parent.as_raw_fd(),
-            source_c.as_ptr(),
-            destination_parent.as_raw_fd(),
-            destination_c.as_ptr(),
-        )
-    };
-    if result != 0 {
-        return Err(StorageError::io(
-            destination.display().to_string(),
-            io::Error::last_os_error(),
-        ));
+    if let Err(error) = rename_without_replace(
+        &source_parent,
+        &source_c,
+        &destination_parent,
+        &destination_c,
+    ) {
+        return Err(StorageError::io(destination.display().to_string(), error));
     }
-    verify_expected_length(
+    if let Err(error) = verify_expected_length(
         &destination_parent,
         &destination_name,
         expected_bytes,
         destination,
         check_control,
-    )
+    ) {
+        // The source has disappeared by this point. Restore it before
+        // returning a verification failure, using the same no-replace
+        // primitive so a concurrently-created source cannot be overwritten.
+        if rename_without_replace(
+            &destination_parent,
+            &destination_c,
+            &source_parent,
+            &source_c,
+        )
+        .is_ok()
+        {
+            return Err(error);
+        }
+        return Err(staged_uncertain(
+            "rename-verify",
+            format!(
+                "{error}; failed to restore {} after verification failure",
+                source.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn rename_without_replace(
+    source_parent: &File,
+    source_name: &CString,
+    destination_parent: &File,
+    destination_name: &CString,
+) -> io::Result<()> {
+    let result = unsafe {
+        libc::renameat2(
+            source_parent.as_raw_fd(),
+            source_name.as_ptr(),
+            destination_parent.as_raw_fd(),
+            destination_name.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn rename_without_replace(
+    source_parent: &File,
+    source_name: &CString,
+    destination_parent: &File,
+    destination_name: &CString,
+) -> io::Result<()> {
+    let result = unsafe {
+        libc::renameatx_np(
+            source_parent.as_raw_fd(),
+            source_name.as_ptr(),
+            destination_parent.as_raw_fd(),
+            destination_name.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android", target_os = "macos"))
+))]
+fn rename_without_replace(
+    _source_parent: &File,
+    _source_name: &CString,
+    _destination_parent: &File,
+    _destination_name: &CString,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic no-replace rename is unavailable on this Unix platform",
+    ))
 }
 
 fn secure_delete(
@@ -389,6 +640,27 @@ fn remove_entry_at(
     missing_ok: bool,
     check_control: &dyn Fn() -> Result<(), StorageError>,
 ) -> Result<(), StorageError> {
+    let mut removed = false;
+    match remove_entry_at_inner(parent, name, path, missing_ok, check_control, &mut removed) {
+        Err(error) if removed => Err(staged_uncertain(
+            "delete",
+            format!(
+                "{error}; deletion of {} was only partially applied",
+                path.display()
+            ),
+        )),
+        result => result,
+    }
+}
+
+fn remove_entry_at_inner(
+    parent: &File,
+    name: &OsString,
+    path: &Path,
+    missing_ok: bool,
+    check_control: &dyn Fn() -> Result<(), StorageError>,
+    removed: &mut bool,
+) -> Result<(), StorageError> {
     check_control()?;
     let kind = match entry_type(parent, name, path) {
         Ok(kind) => kind,
@@ -399,19 +671,28 @@ fn remove_entry_at(
         let child_dir = open_dir_at(parent, name, path)
             .map_err(|error| StorageError::io(path.display().to_string(), error))?;
         for child in directory_names(&child_dir, path)? {
-            remove_entry_at(
+            remove_entry_at_inner(
                 &child_dir,
                 &child,
                 &path.join(&child),
                 missing_ok,
                 check_control,
+                removed,
             )?;
         }
         check_control()?;
-        unlink_at(parent, name, path, libc::AT_REMOVEDIR)
+        let result = unlink_at(parent, name, path, libc::AT_REMOVEDIR);
+        if result.is_ok() {
+            *removed = true;
+        }
+        result
     } else if kind.is_file() || kind.is_symlink() {
         check_control()?;
-        unlink_at(parent, name, path, 0)
+        let result = unlink_at(parent, name, path, 0);
+        if result.is_ok() {
+            *removed = true;
+        }
+        result
     } else {
         Err(staged(
             "delete-source",
@@ -459,15 +740,27 @@ fn secure_prune(
         directories.push(directory);
     }
 
+    let mut removed = false;
     for index in (boundary_parts.len()..source_parts.len()).rev() {
-        check_control()?;
+        if let Err(error) = check_control() {
+            if removed {
+                return Err(staged_uncertain(
+                    "prune",
+                    format!(
+                        "{error}; directory pruning of {} was only partially applied",
+                        source.display()
+                    ),
+                ));
+            }
+            return Err(error);
+        }
         match unlink_at(
             &directories[index],
             &source_parts[index],
             source,
             libc::AT_REMOVEDIR,
         ) {
-            Ok(()) => {}
+            Ok(()) => removed = true,
             Err(error) if is_not_found(&error) => {}
             Err(StorageError::Io { source: error, .. })
                 if error.kind() == io::ErrorKind::DirectoryNotEmpty =>
@@ -479,7 +772,18 @@ fn secure_prune(
             {
                 break
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                if removed {
+                    return Err(staged_uncertain(
+                        "prune",
+                        format!(
+                            "{error}; directory pruning of {} was only partially applied",
+                            source.display()
+                        ),
+                    ));
+                }
+                return Err(error);
+            }
         }
     }
     Ok(())
@@ -1067,6 +1371,13 @@ fn c_name(name: &OsString, path: &Path) -> Result<CString, StorageError> {
 
 fn staged(step: &'static str, reason: impl Into<String>) -> StorageError {
     StorageError::StagedMoveFailed {
+        step,
+        reason: reason.into(),
+    }
+}
+
+fn staged_uncertain(step: &'static str, reason: impl Into<String>) -> StorageError {
+    StorageError::FilesystemStateUncertain {
         step,
         reason: reason.into(),
     }

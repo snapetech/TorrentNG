@@ -117,7 +117,11 @@ pub fn plan_move(req: &MovePlanRequest) -> StoragePlan {
         _ => unreachable!("move planner only emits move actions"),
     };
     let rollback_steps = vec![StoragePlanStep {
-        action: PlannedStorageAction::SafeDelete,
+        // The copy path cleans a partial staging entry before returning an
+        // error. Rollback therefore has to tolerate an already-clean staging
+        // path; otherwise a successful cleanup is falsely reported as a
+        // rollback failure and escalated to manual recovery.
+        action: PlannedStorageAction::SafeDeleteIfPresent,
         source: Some(staging_path(&req.destination)),
         destination: None,
         bytes: req.bytes,
@@ -188,7 +192,9 @@ pub fn plan_import(req: &ImportPlanRequest) -> StoragePlan {
                 },
             ],
             vec![StoragePlanStep {
-                action: PlannedStorageAction::SafeDelete,
+                // Copy cleanup is idempotent: the executor may already have
+                // removed a partial staging entry before rollback begins.
+                action: PlannedStorageAction::SafeDeleteIfPresent,
                 source: Some(staging_path(&req.destination)),
                 destination: None,
                 bytes: req.bytes,
@@ -313,8 +319,7 @@ pub fn reconcile_storage_plan_under_roots(
     let roots = canonical_roots(roots)?;
     validate_plan_paths_under_roots(plan, &roots)?;
 
-    let mut completed = checkpointed_steps.iter().copied().collect::<HashSet<_>>();
-    if let Some(index) = completed
+    if let Some(index) = checkpointed_steps
         .iter()
         .copied()
         .find(|index| *index >= plan.steps.len())
@@ -328,6 +333,18 @@ pub fn reconcile_storage_plan_under_roots(
         });
     }
 
+    // These indexes come from the engine's durable worker checkpoint, not from
+    // the public storage API. The API rejects caller-supplied indexes before a
+    // plan reaches this boundary. A checkpoint is only an ordering hint: the
+    // filesystem syscall may have been lost, overwritten, or never committed
+    // before the row was durable. Validate every checkpoint against live state
+    // and leave unapplied steps in the plan so execution can retry them.
+    let mut completed = HashSet::new();
+    for index in checkpointed_steps {
+        if storage_step_is_applied(plan, *index)? {
+            completed.insert(*index);
+        }
+    }
     // First classify each step from its own source/destination state. Then
     // repeat the inference pass because a plan can contain more than one
     // copy/rename pair.
@@ -337,7 +354,7 @@ pub fn reconcile_storage_plan_under_roots(
             if completed.contains(&index) {
                 continue;
             }
-            if storage_step_is_applied(step)? {
+            if storage_step_is_applied(plan, index)? {
                 completed.insert(index);
                 changed = true;
                 continue;
@@ -364,7 +381,8 @@ pub fn reconcile_storage_plan_under_roots(
     Ok(completed)
 }
 
-fn storage_step_is_applied(step: &StoragePlanStep) -> Result<bool, StorageError> {
+fn storage_step_is_applied(plan: &StoragePlan, index: usize) -> Result<bool, StorageError> {
+    let step = &plan.steps[index];
     let source = required_path(step.source.as_ref(), "reconcile-source")?;
     let destination = step.destination.as_deref();
     match step.action {
@@ -376,7 +394,7 @@ fn storage_step_is_applied(step: &StoragePlanStep) -> Result<bool, StorageError>
             let source_exists = path_exists_no_follow(source);
             let destination_exists = path_exists_no_follow(destination);
             if source_exists && destination_exists {
-                return Err(StorageError::StagedMoveFailed {
+                return Err(StorageError::FilesystemStateUncertain {
                     step: "reconcile",
                     reason: format!(
                         "rename has both source and destination present: {} -> {}",
@@ -385,7 +403,39 @@ fn storage_step_is_applied(step: &StoragePlanStep) -> Result<bool, StorageError>
                     ),
                 });
             }
-            Ok(!source_exists && destination_exists)
+            if !source_exists && destination_exists {
+                let Some(previous) = index
+                    .checked_sub(1)
+                    .and_then(|previous| plan.steps.get(previous))
+                else {
+                    return Err(StorageError::FilesystemStateUncertain {
+                        step: "reconcile",
+                        reason: format!(
+                            "cannot prove rename completion after source disappeared: {} -> {}",
+                            source.display(),
+                            destination.display()
+                        ),
+                    });
+                };
+                let previous_source =
+                    required_path(previous.source.as_ref(), "reconcile-previous-source")?;
+                if !matches!(previous.action, PlannedStorageAction::CopyVerifyRename)
+                    || previous.destination.as_deref() != Some(source)
+                    || !path_exists_no_follow(previous_source)
+                {
+                    return Err(StorageError::FilesystemStateUncertain {
+                        step: "reconcile",
+                        reason: format!(
+                            "cannot prove rename completion after source disappeared: {} -> {}",
+                            source.display(),
+                            destination.display()
+                        ),
+                    });
+                }
+                reconcile_content_matches(previous_source, destination)?;
+                return Ok(true);
+            }
+            Ok(false)
         }
         PlannedStorageAction::CopyVerifyRename => {
             let destination = destination.ok_or_else(|| StorageError::StagedMoveFailed {
@@ -395,13 +445,17 @@ fn storage_step_is_applied(step: &StoragePlanStep) -> Result<bool, StorageError>
             if !path_exists_no_follow(destination) {
                 return Ok(false);
             }
-            // A source that is still present lets us detect a torn or
-            // corrupted staging copy. If the source disappeared, the
-            // destination is still recoverable evidence and the following
-            // plan step determines whether it was a completed rename.
-            if path_exists_no_follow(source) {
-                verify_content_matches(source, destination)?;
+            if !path_exists_no_follow(source) {
+                return Err(StorageError::FilesystemStateUncertain {
+                    step: "reconcile",
+                    reason: format!(
+                        "cannot prove copy completion after source disappeared: {} -> {}",
+                        source.display(),
+                        destination.display()
+                    ),
+                });
             }
+            reconcile_content_matches(source, destination)?;
             Ok(true)
         }
         PlannedStorageAction::ImportExisting => {
@@ -412,9 +466,17 @@ fn storage_step_is_applied(step: &StoragePlanStep) -> Result<bool, StorageError>
             if !path_exists_no_follow(destination) {
                 return Ok(false);
             }
-            if path_exists_no_follow(source) {
-                verify_content_matches(source, destination)?;
+            if !path_exists_no_follow(source) {
+                return Err(StorageError::FilesystemStateUncertain {
+                    step: "reconcile",
+                    reason: format!(
+                        "cannot prove import completion after source disappeared: {} -> {}",
+                        source.display(),
+                        destination.display()
+                    ),
+                });
             }
+            reconcile_content_matches(source, destination)?;
             Ok(true)
         }
         PlannedStorageAction::SafeDelete | PlannedStorageAction::SafeDeleteIfPresent => {
@@ -422,6 +484,16 @@ fn storage_step_is_applied(step: &StoragePlanStep) -> Result<bool, StorageError>
         }
         PlannedStorageAction::PruneEmptyDirs => Ok(!path_exists_no_follow(source)),
     }
+}
+
+fn reconcile_content_matches(source: &Path, destination: &Path) -> Result<(), StorageError> {
+    verify_content_matches(source, destination).map_err(|error| match error {
+        StorageError::FilesystemStateUncertain { .. } => error,
+        error => StorageError::FilesystemStateUncertain {
+            step: "reconcile",
+            reason: error.to_string(),
+        },
+    })
 }
 
 #[cfg(any(not(unix), test))]
@@ -447,7 +519,7 @@ where
         checkpoint_step,
         execute_step,
         rollback_plan,
-        storage_step_is_applied,
+        |index, _step| storage_step_is_applied(plan, index),
         &no_control,
     )
 }
@@ -465,15 +537,38 @@ where
     F: FnMut(usize, &StoragePlanStep) -> Result<(), StorageError>,
     E: Fn(&StoragePlanStep) -> Result<(), StorageError>,
     R: Fn(&StoragePlan) -> (Vec<StoragePlanStep>, Vec<(StoragePlanStep, String)>),
-    A: Fn(&StoragePlanStep) -> Result<bool, StorageError>,
+    A: Fn(usize, &StoragePlanStep) -> Result<bool, StorageError>,
 {
     ensure_plan_can_apply(plan)?;
     if plan.dry_run {
         return Ok(StoragePlanExecution::default());
     }
 
-    let completed = completed_steps.iter().copied().collect::<HashSet<_>>();
-    let mut completed = completed;
+    if let Some(index) = completed_steps
+        .iter()
+        .copied()
+        .find(|index| *index >= plan.steps.len())
+    {
+        return Err(StorageError::StagedMoveFailed {
+            step: "checkpoint",
+            reason: format!(
+                "checkpointed storage-plan step {index} is outside plan length {}",
+                plan.steps.len()
+            ),
+        });
+    }
+
+    // This list is populated from the engine's durable worker checkpoint. The
+    // public API rejects caller-supplied indexes; a checkpoint is still only
+    // an ordering hint and must be validated against live filesystem state
+    // before a step is skipped.
+    let mut completed = HashSet::new();
+    for index in completed_steps {
+        check_control()?;
+        if step_is_applied_fn(*index, &plan.steps[*index])? {
+            completed.insert(*index);
+        }
+    }
     let mut inferred_completed = HashSet::new();
     // Filesystem mutations can commit before their durable checkpoint. Treat
     // an already-applied step as complete and infer a preceding copy when its
@@ -487,7 +582,7 @@ where
                 continue;
             }
             check_control()?;
-            if step_is_applied_fn(step)? {
+            if step_is_applied_fn(index, step)? {
                 completed.insert(index);
                 inferred_completed.insert(index);
                 changed = true;
@@ -559,6 +654,14 @@ where
                     execution.rollback_failures.len()
                 )
             };
+            if error.requires_manual_recovery() || !execution.rollback_failures.is_empty() {
+                let step = match &error {
+                    StorageError::FilesystemStateUncertain { step, .. } => *step,
+                    _ if !execution.rollback_failures.is_empty() => "rollback",
+                    _ => "execute",
+                };
+                return Err(StorageError::FilesystemStateUncertain { step, reason });
+            }
             // Preserve the control-plane marker when a cooperative pause or
             // cancellation interrupts a large copy. The storage worker uses
             // these markers to distinguish a resumable pause from a real
@@ -639,7 +742,7 @@ where
             checkpoint_step,
             |step| secure_fs::execute_step_with_control(step, &roots, check_control_ref),
             |plan| secure_fs::rollback_plan(plan, &roots),
-            |step| secure_fs::step_is_applied(step, &roots),
+            |index, _step| secure_fs::step_is_applied(plan, index, &roots),
             check_control_ref,
         )
     }
@@ -655,7 +758,7 @@ where
             checkpoint_step,
             execute_step,
             rollback_plan,
-            storage_step_is_applied,
+            |index, _step| storage_step_is_applied(plan, index),
             &check_control,
         )
     }
@@ -676,8 +779,26 @@ fn execute_step(step: &StoragePlanStep) -> Result<(), StorageError> {
             ensure_destination_available(destination)?;
             create_parent(destination)?;
             reject_symlink(source, "import-source")?;
+            // Check before creating a hard link so a stale expected size does
+            // not leave a destination behind after the import is rejected.
+            verify_path_len(source, step.bytes)?;
             match std::fs::hard_link(source, destination) {
-                Ok(()) => verify_path_len(destination, step.bytes),
+                Ok(()) => {
+                    let verification = verify_path_len(destination, step.bytes);
+                    if let Err(error) = verification {
+                        if let Err(cleanup_error) = std::fs::remove_file(destination) {
+                            return Err(StorageError::FilesystemStateUncertain {
+                                step: "import-cleanup",
+                                reason: format!(
+                                    "{error}; failed to remove hard-link destination {}: {cleanup_error}",
+                                    destination.display()
+                                ),
+                            });
+                        }
+                        return Err(error);
+                    }
+                    Ok(())
+                }
                 Err(_) => copy_verify(source, destination, step.bytes),
             }
         }
@@ -687,9 +808,29 @@ fn execute_step(step: &StoragePlanStep) -> Result<(), StorageError> {
             ensure_destination_available(destination)?;
             create_parent(destination)?;
             reject_symlink(source, "rename-source")?;
+            // Validate the source before the destructive rename. If the
+            // caller supplied a stale size, moving first would leave the
+            // source gone when the post-rename check failed.
+            verify_path_len(source, step.bytes)?;
             std::fs::rename(source, destination)
                 .map_err(|e| StorageError::io(destination.display().to_string(), e))?;
-            verify_path_len(destination, step.bytes)
+            if let Err(error) = verify_path_len(destination, step.bytes) {
+                // The source has disappeared by this point. Restore it
+                // before returning a verification failure; never leave a
+                // same-filesystem move stranded solely because the post-move
+                // check observed a changed file.
+                if !path_exists_no_follow(source) && std::fs::rename(destination, source).is_ok() {
+                    return Err(error);
+                }
+                return Err(StorageError::FilesystemStateUncertain {
+                    step: "rename-verify",
+                    reason: format!(
+                        "{error}; failed to restore {} after verification failure",
+                        source.display()
+                    ),
+                });
+            }
+            Ok(())
         }
         PlannedStorageAction::CopyVerifyRename => {
             let source = required_path(step.source.as_ref(), "copy-source")?;
@@ -704,7 +845,13 @@ fn execute_step(step: &StoragePlanStep) -> Result<(), StorageError> {
             let file_type = metadata.file_type();
             if file_type.is_dir() {
                 std::fs::remove_dir_all(source)
-                    .map_err(|e| StorageError::io(source.display().to_string(), e))
+                    .map_err(|error| StorageError::FilesystemStateUncertain {
+                        step: "delete",
+                        reason: format!(
+                            "failed to remove directory {} after deletion may have partially applied: {error}",
+                            source.display()
+                        ),
+                    })
             } else if file_type.is_file() || file_type.is_symlink() {
                 std::fs::remove_file(source)
                     .map_err(|e| StorageError::io(source.display().to_string(), e))
@@ -727,7 +874,13 @@ fn execute_step(step: &StoragePlanStep) -> Result<(), StorageError> {
             let file_type = metadata.file_type();
             if file_type.is_dir() {
                 std::fs::remove_dir_all(source)
-                    .map_err(|e| StorageError::io(source.display().to_string(), e))
+                    .map_err(|error| StorageError::FilesystemStateUncertain {
+                        step: "delete",
+                        reason: format!(
+                            "failed to remove directory {} after deletion may have partially applied: {error}",
+                            source.display()
+                        ),
+                    })
             } else if file_type.is_file() || file_type.is_symlink() {
                 match std::fs::remove_file(source) {
                     Ok(()) => Ok(()),
@@ -761,6 +914,7 @@ fn prune_empty_dirs(mut current: &Path, root: &Path) -> Result<(), StorageError>
             ),
         });
     }
+    let mut removed = false;
     while current != root {
         let metadata = match std::fs::symlink_metadata(current) {
             Ok(metadata) => metadata,
@@ -773,22 +927,62 @@ fn prune_empty_dirs(mut current: &Path, root: &Path) -> Result<(), StorageError>
                     })?;
                 continue;
             }
-            Err(error) => return Err(StorageError::io(current.display().to_string(), error)),
+            Err(error) => {
+                if removed {
+                    return Err(StorageError::FilesystemStateUncertain {
+                        step: "prune",
+                        reason: format!(
+                            "failed to inspect {} after directory pruning partially applied: {error}",
+                            current.display()
+                        ),
+                    });
+                }
+                return Err(StorageError::io(current.display().to_string(), error));
+            }
         };
         if metadata.file_type().is_symlink() {
+            if removed {
+                return Err(StorageError::FilesystemStateUncertain {
+                    step: "prune",
+                    reason: format!(
+                        "encountered a symlink at {} after directory pruning partially applied",
+                        current.display()
+                    ),
+                });
+            }
             return Err(unsafe_symlink_error(current, "prune-source"));
         }
         if !metadata.is_dir() {
+            if removed {
+                return Err(StorageError::FilesystemStateUncertain {
+                    step: "prune",
+                    reason: format!(
+                        "encountered a non-directory at {} after directory pruning partially applied",
+                        current.display()
+                    ),
+                });
+            }
             return Err(StorageError::StagedMoveFailed {
                 step: "prune-source",
                 reason: format!("not a directory: {}", current.display()),
             });
         }
         match std::fs::remove_dir(current) {
-            Ok(()) => {}
+            Ok(()) => removed = true,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => break,
-            Err(error) => return Err(StorageError::io(current.display().to_string(), error)),
+            Err(error) => {
+                if removed {
+                    return Err(StorageError::FilesystemStateUncertain {
+                        step: "prune",
+                        reason: format!(
+                            "failed to remove {} after directory pruning partially applied: {error}",
+                            current.display()
+                        ),
+                    });
+                }
+                return Err(StorageError::io(current.display().to_string(), error));
+            }
         }
         current = current
             .parent()
@@ -860,11 +1054,30 @@ fn validate_plan_paths_under_roots(
     roots: &[PathBuf],
 ) -> Result<(), StorageError> {
     for step in plan.steps.iter().chain(plan.rollback_steps.iter()) {
+        let allow_root_boundary = matches!(step.action, PlannedStorageAction::PruneEmptyDirs);
         if let Some(source) = &step.source {
-            ensure_path_under_roots(source, roots, "source-root")?;
+            let resolved = ensure_path_under_roots(source, roots, "source-root")?;
+            if !allow_root_boundary && roots.contains(&resolved) {
+                return Err(StorageError::StagedMoveFailed {
+                    step: "source-root",
+                    reason: format!(
+                        "refusing to operate on configured storage root: {}",
+                        source.display()
+                    ),
+                });
+            }
         }
         if let Some(destination) = &step.destination {
-            ensure_path_under_roots(destination, roots, "destination-root")?;
+            let resolved = ensure_path_under_roots(destination, roots, "destination-root")?;
+            if !allow_root_boundary && roots.contains(&resolved) {
+                return Err(StorageError::StagedMoveFailed {
+                    step: "destination-root",
+                    reason: format!(
+                        "refusing to operate on configured storage root: {}",
+                        destination.display()
+                    ),
+                });
+            }
         }
     }
     Ok(())
@@ -874,10 +1087,10 @@ fn ensure_path_under_roots(
     path: &Path,
     roots: &[PathBuf],
     step: &'static str,
-) -> Result<(), StorageError> {
+) -> Result<PathBuf, StorageError> {
     let resolved = resolve_confined_path(path)?;
     if roots.iter().any(|root| resolved.starts_with(root)) {
-        Ok(())
+        Ok(resolved)
     } else {
         Err(StorageError::StagedMoveFailed {
             step,
@@ -978,15 +1191,60 @@ fn ensure_destination_available(path: &Path) -> Result<(), StorageError> {
 
 #[cfg(any(not(unix), test))]
 fn copy_verify(source: &Path, destination: &Path, expected_bytes: u64) -> Result<(), StorageError> {
+    let mut destination_created = false;
+    let result = copy_verify_inner(
+        source,
+        destination,
+        expected_bytes,
+        &mut destination_created,
+    );
+    if let Err(error) = result {
+        if destination_created {
+            if let Err(cleanup_error) = remove_partial_destination(destination) {
+                return Err(StorageError::FilesystemStateUncertain {
+                    step: "copy-cleanup",
+                    reason: format!(
+                        "{error}; failed to remove partial destination {}: {cleanup_error}",
+                        destination.display()
+                    ),
+                });
+            }
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(any(not(unix), test))]
+fn copy_verify_inner(
+    source: &Path,
+    destination: &Path,
+    expected_bytes: u64,
+    destination_created: &mut bool,
+) -> Result<(), StorageError> {
     let metadata = safe_symlink_metadata(source, "copy-source")?;
     let file_type = metadata.file_type();
     if file_type.is_symlink() {
         return Err(unsafe_symlink_error(source, "copy-source"));
     }
     if file_type.is_dir() {
-        copy_dir_recursive(source, destination)?;
+        std::fs::create_dir(destination)
+            .map_err(|e| StorageError::io(destination.display().to_string(), e))?;
+        *destination_created = true;
+        copy_dir_contents(source, destination)?;
     } else if file_type.is_file() {
-        std::fs::copy(source, destination)
+        let mut source_file = std::fs::File::open(source)
+            .map_err(|e| StorageError::io(source.display().to_string(), e))?;
+        let mut destination_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination)
+            .map_err(|e| StorageError::io(destination.display().to_string(), e))?;
+        *destination_created = true;
+        std::io::copy(&mut source_file, &mut destination_file)
+            .map_err(|e| StorageError::io(destination.display().to_string(), e))?;
+        destination_file
+            .sync_all()
             .map_err(|e| StorageError::io(destination.display().to_string(), e))?;
     } else {
         return Err(StorageError::StagedMoveFailed {
@@ -1003,6 +1261,24 @@ fn copy_verify(source: &Path, destination: &Path, expected_bytes: u64) -> Result
     // the copy loop.
     verify_path_len(destination, expected_bytes)?;
     verify_content_matches(source, destination)
+}
+
+#[cfg(any(not(unix), test))]
+fn remove_partial_destination(destination: &Path) -> Result<(), StorageError> {
+    let metadata = match std::fs::symlink_metadata(destination) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(StorageError::io(destination.display().to_string(), error));
+        }
+    };
+    if metadata.file_type().is_dir() {
+        std::fs::remove_dir_all(destination)
+            .map_err(|e| StorageError::io(destination.display().to_string(), e))
+    } else {
+        std::fs::remove_file(destination)
+            .map_err(|e| StorageError::io(destination.display().to_string(), e))
+    }
 }
 
 /// Recursively verifies that every regular file under `source` has bytes
@@ -1041,6 +1317,21 @@ fn verify_content_matches(source: &Path, destination: &Path) -> Result<(), Stora
             let entry = entry.map_err(|e| StorageError::io(source.display().to_string(), e))?;
             let destination_child = destination.join(entry.file_name());
             verify_content_matches(&entry.path(), &destination_child)?;
+        }
+        for entry in std::fs::read_dir(destination)
+            .map_err(|e| StorageError::io(destination.display().to_string(), e))?
+        {
+            let entry =
+                entry.map_err(|e| StorageError::io(destination.display().to_string(), e))?;
+            if !source.join(entry.file_name()).exists() {
+                return Err(StorageError::StagedMoveFailed {
+                    step: "verify-content",
+                    reason: format!(
+                        "destination directory has entries absent from source: {}",
+                        destination.display()
+                    ),
+                });
+            }
         }
         Ok(())
     } else if source_type.is_file() {
@@ -1122,8 +1413,13 @@ fn verify_path_len(path: &Path, expected_bytes: u64) -> Result<(), StorageError>
 #[cfg(any(not(unix), test))]
 fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), StorageError> {
     reject_symlink(source, "copy-source")?;
-    std::fs::create_dir_all(destination)
+    std::fs::create_dir(destination)
         .map_err(|e| StorageError::io(destination.display().to_string(), e))?;
+    copy_dir_contents(source, destination)
+}
+
+#[cfg(any(not(unix), test))]
+fn copy_dir_contents(source: &Path, destination: &Path) -> Result<(), StorageError> {
     for entry in
         std::fs::read_dir(source).map_err(|e| StorageError::io(source.display().to_string(), e))?
     {
@@ -1458,7 +1754,7 @@ mod tests {
         assert_eq!(
             plan.rollback_steps,
             vec![StoragePlanStep {
-                action: PlannedStorageAction::SafeDelete,
+                action: PlannedStorageAction::SafeDeleteIfPresent,
                 source: Some(staged),
                 destination: None,
                 bytes: 4,
@@ -1546,7 +1842,7 @@ mod tests {
         };
         assert!(matches!(
             execute_storage_plan(&conflict),
-            Err(StorageError::StagedMoveFailed { .. })
+            Err(StorageError::FilesystemStateUncertain { .. })
         ));
     }
 
@@ -1603,7 +1899,7 @@ mod tests {
                 bytes: 99,
             }],
             rollback_steps: vec![StoragePlanStep {
-                action: PlannedStorageAction::SafeDelete,
+                action: PlannedStorageAction::SafeDeleteIfPresent,
                 source: Some(staged.clone()),
                 destination: None,
                 bytes: 99,
@@ -1640,6 +1936,24 @@ mod tests {
             }
         ));
         assert!(error.to_string().contains("content hash mismatch"));
+    }
+
+    #[test]
+    fn verify_content_matches_rejects_extra_destination_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let destination = dir.path().join("destination");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(source.join("payload.bin"), b"payload").unwrap();
+        std::fs::write(destination.join("payload.bin"), b"payload").unwrap();
+        std::fs::write(destination.join("unexpected.bin"), b"unexpected").unwrap();
+
+        let error = verify_content_matches(&source, &destination).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("destination directory has entries absent from source"));
     }
 
     #[test]
@@ -1704,6 +2018,7 @@ mod tests {
         let source_two = dir.path().join("source-two.bin");
         let destination_one = dir.path().join("destination-one.bin");
         let destination_two = dir.path().join("destination-two.bin");
+        let staging_one = staging_path(&destination_one);
         std::fs::write(&source_one, b"one").unwrap();
         std::fs::write(&source_two, b"two").unwrap();
         let plan = StoragePlan {
@@ -1712,8 +2027,14 @@ mod tests {
             issues: Vec::new(),
             steps: vec![
                 StoragePlanStep {
-                    action: PlannedStorageAction::Rename,
+                    action: PlannedStorageAction::CopyVerifyRename,
                     source: Some(source_one.clone()),
+                    destination: Some(staging_one),
+                    bytes: 3,
+                },
+                StoragePlanStep {
+                    action: PlannedStorageAction::Rename,
+                    source: Some(staging_path(&destination_one)),
                     destination: Some(destination_one.clone()),
                     bytes: 3,
                 },
@@ -1741,19 +2062,44 @@ mod tests {
         assert!(checkpoint_error
             .to_string()
             .contains("durable-store interruption"));
-        assert!(!source_one.exists());
-        assert!(destination_one.exists());
+        assert!(source_one.exists());
+        assert!(staging_path(&destination_one).exists());
         assert!(source_two.exists());
         assert!(!destination_two.exists());
 
         let resumed = execute_storage_plan_with_checkpoints(&plan, &[0], |_, _| Ok(())).unwrap();
-        assert_eq!(resumed.applied_steps.len(), 2);
+        assert_eq!(resumed.applied_steps.len(), 3);
+        assert!(source_one.exists());
         assert!(!source_two.exists());
+        assert!(destination_one.exists());
         assert!(destination_two.exists());
     }
 
     #[test]
-    fn retrying_a_completed_plan_is_idempotent() {
+    fn retrying_a_completed_copy_plan_validates_checkpoint_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.bin");
+        let destination = dir.path().join("destination.bin");
+        std::fs::write(&source, b"data").unwrap();
+        let plan = plan_import(&ImportPlanRequest {
+            source: source.clone(),
+            destination: destination.clone(),
+            bytes: 4,
+            available_bytes: Some(100),
+            hardlink_or_copy: false,
+            dry_run: false,
+        });
+
+        execute_storage_plan(&plan).unwrap();
+        let retry = execute_storage_plan_with_checkpoints(&plan, &[0], |_, _| Ok(())).unwrap();
+
+        assert_eq!(retry.applied_steps.len(), plan.steps.len());
+        assert!(source.exists());
+        assert_eq!(std::fs::read(destination).unwrap(), b"data");
+    }
+
+    #[test]
+    fn checkpointed_rename_without_live_proof_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("source.bin");
         let destination = dir.path().join("destination.bin");
@@ -1762,16 +2108,43 @@ mod tests {
             source: source.clone(),
             destination: destination.clone(),
             bytes: 4,
-            available_bytes: Some(100),
+            available_bytes: None,
             dry_run: false,
         });
 
         execute_storage_plan(&plan).unwrap();
-        let retry = execute_storage_plan(&plan).unwrap();
+        let error = execute_storage_plan_with_checkpoints(&plan, &[0], |_, _| Ok(())).unwrap_err();
 
-        assert_eq!(retry.applied_steps.len(), plan.steps.len());
+        assert!(matches!(
+            error,
+            StorageError::FilesystemStateUncertain {
+                step: "reconcile",
+                ..
+            }
+        ));
         assert!(!source.exists());
         assert_eq!(std::fs::read(destination).unwrap(), b"data");
+    }
+
+    #[test]
+    fn rename_rejects_a_stale_expected_size_before_moving() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.bin");
+        let destination = dir.path().join("destination.bin");
+        std::fs::write(&source, b"data").unwrap();
+        let plan = plan_move(&MovePlanRequest {
+            source: source.clone(),
+            destination: destination.clone(),
+            bytes: 99,
+            available_bytes: None,
+            dry_run: false,
+        });
+
+        let error = execute_storage_plan(&plan).unwrap_err();
+
+        assert!(error.to_string().contains("99"));
+        assert_eq!(std::fs::read(source).unwrap(), b"data");
+        assert!(!destination.exists());
     }
 
     #[test]
@@ -1818,6 +2191,79 @@ mod tests {
 
         assert_eq!(std::fs::read(&source).unwrap(), b"data");
         assert_eq!(std::fs::read(&destination).unwrap(), b"data");
+    }
+
+    #[test]
+    fn execute_import_plan_rejects_stale_expected_size_without_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.bin");
+        let destination = dir.path().join("dest.bin");
+        std::fs::write(&source, b"data").unwrap();
+        let plan = plan_import(&ImportPlanRequest {
+            source: source.clone(),
+            destination: destination.clone(),
+            bytes: 99,
+            available_bytes: Some(100),
+            hardlink_or_copy: true,
+            dry_run: false,
+        });
+
+        assert!(execute_storage_plan(&plan).is_err());
+        assert_eq!(std::fs::read(&source).unwrap(), b"data");
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn copy_directory_verification_failure_removes_partial_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("payload.bin"), b"data").unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let plan = StoragePlan {
+            dry_run: false,
+            can_apply: true,
+            issues: Vec::new(),
+            steps: vec![StoragePlanStep {
+                action: PlannedStorageAction::CopyVerifyRename,
+                source: Some(source.clone()),
+                destination: Some(destination.clone()),
+                bytes: 99,
+            }],
+            rollback_steps: Vec::new(),
+        };
+
+        assert!(execute_storage_plan_under_roots(&plan, std::slice::from_ref(&root)).is_err());
+        assert!(source.exists());
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn copy_verification_failure_removes_partial_file_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let source = root.join("source.bin");
+        let destination = root.join("destination.bin");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&source, b"data").unwrap();
+        let plan = StoragePlan {
+            dry_run: false,
+            can_apply: true,
+            issues: Vec::new(),
+            steps: vec![StoragePlanStep {
+                action: PlannedStorageAction::CopyVerifyRename,
+                source: Some(source.clone()),
+                destination: Some(destination.clone()),
+                bytes: 99,
+            }],
+            rollback_steps: Vec::new(),
+        };
+
+        assert!(execute_storage_plan_under_roots(&plan, std::slice::from_ref(&root)).is_err());
+        assert!(source.exists());
+        assert!(!destination.exists());
     }
 
     #[cfg(unix)]
@@ -1946,7 +2392,7 @@ mod tests {
                 bytes: 11,
             }],
             rollback_steps: vec![StoragePlanStep {
-                action: PlannedStorageAction::SafeDelete,
+                action: PlannedStorageAction::SafeDeleteIfPresent,
                 source: Some(destination.clone()),
                 destination: None,
                 bytes: 11,
@@ -2102,6 +2548,73 @@ mod tests {
         assert_eq!(std::fs::read(&destination).unwrap(), b"data");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_anchored_rename_never_replaces_a_new_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.bin");
+        let destination = root.join("destination.bin");
+        std::fs::write(&source, b"source").unwrap();
+        std::fs::write(&destination, b"existing").unwrap();
+        let plan = StoragePlan {
+            dry_run: false,
+            can_apply: true,
+            issues: Vec::new(),
+            steps: vec![StoragePlanStep {
+                action: PlannedStorageAction::Rename,
+                source: Some(source.clone()),
+                destination: Some(destination.clone()),
+                bytes: 6,
+            }],
+            rollback_steps: Vec::new(),
+        };
+
+        let error =
+            execute_storage_plan_under_roots(&plan, std::slice::from_ref(&root)).unwrap_err();
+
+        assert!(matches!(
+            error,
+            StorageError::FilesystemStateUncertain {
+                step: "reconcile",
+                ..
+            }
+        ));
+        assert_eq!(std::fs::read(source).unwrap(), b"source");
+        assert_eq!(std::fs::read(destination).unwrap(), b"existing");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_anchored_rename_checks_size_before_mutating() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.bin");
+        let destination = root.join("destination.bin");
+        std::fs::write(&source, b"data").unwrap();
+        let plan = StoragePlan {
+            dry_run: false,
+            can_apply: true,
+            issues: Vec::new(),
+            steps: vec![StoragePlanStep {
+                action: PlannedStorageAction::Rename,
+                source: Some(source.clone()),
+                destination: Some(destination.clone()),
+                bytes: 99,
+            }],
+            rollback_steps: Vec::new(),
+        };
+
+        let error =
+            execute_storage_plan_under_roots(&plan, std::slice::from_ref(&root)).unwrap_err();
+
+        assert!(error.to_string().contains("99"));
+        assert_eq!(std::fs::read(source).unwrap(), b"data");
+        assert!(!destination.exists());
+    }
+
     #[test]
     fn execute_plan_under_roots_rejects_destination_escape_before_copy() {
         let dir = tempfile::tempdir().unwrap();
@@ -2160,6 +2673,37 @@ mod tests {
             })
         ));
         assert_eq!(std::fs::read(&outside).unwrap(), b"data");
+    }
+
+    #[test]
+    fn execute_plan_under_roots_refuses_to_delete_the_storage_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let sentinel = root.join("keep.bin");
+        std::fs::write(&sentinel, b"keep").unwrap();
+
+        let plan = StoragePlan {
+            dry_run: false,
+            can_apply: true,
+            issues: Vec::new(),
+            steps: vec![StoragePlanStep {
+                action: PlannedStorageAction::SafeDelete,
+                source: Some(root.clone()),
+                destination: None,
+                bytes: 4,
+            }],
+            rollback_steps: Vec::new(),
+        };
+
+        assert!(matches!(
+            execute_storage_plan_under_roots(&plan, std::slice::from_ref(&root)),
+            Err(StorageError::StagedMoveFailed {
+                step: "source-root",
+                ..
+            })
+        ));
+        assert!(sentinel.exists());
     }
 
     #[test]
@@ -2431,7 +2975,7 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_detects_rename_committed_before_checkpoint() {
+    fn reconcile_rejects_unverifiable_rename_committed_before_checkpoint() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("root");
         std::fs::create_dir_all(&root).unwrap();
@@ -2448,10 +2992,9 @@ mod tests {
 
         execute_storage_plan_under_roots(&plan, std::slice::from_ref(&root)).unwrap();
 
-        assert_eq!(
-            reconcile_storage_plan_under_roots(&plan, std::slice::from_ref(&root), &[]).unwrap(),
-            vec![0]
-        );
+        let error = reconcile_storage_plan_under_roots(&plan, std::slice::from_ref(&root), &[])
+            .unwrap_err();
+        assert!(error.to_string().contains("cannot prove rename completion"));
         assert_eq!(std::fs::read(destination).unwrap(), b"data");
     }
 
@@ -2488,19 +3031,37 @@ mod tests {
         assert!(!source.exists());
         assert_eq!(std::fs::read(&destination).unwrap(), b"data");
 
-        let completed =
-            reconcile_storage_plan_under_roots(&plan, std::slice::from_ref(&root), &[]).unwrap();
-        assert_eq!(completed, vec![0]);
-
-        let resumed = execute_storage_plan_under_roots_with_checkpoints(
-            &plan,
-            std::slice::from_ref(&root),
-            &completed,
-            |_, _| panic!("a reconciled step must not be executed again"),
-        )
-        .unwrap();
-        assert_eq!(resumed.applied_steps.len(), 1);
+        let error = reconcile_storage_plan_under_roots(&plan, std::slice::from_ref(&root), &[0])
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            StorageError::FilesystemStateUncertain {
+                step: "reconcile",
+                ..
+            }
+        ));
         assert_eq!(std::fs::read(&destination).unwrap(), b"data");
+    }
+
+    #[test]
+    fn execute_rejects_an_out_of_range_checkpoint_before_mutating() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.bin");
+        let destination = dir.path().join("destination.bin");
+        std::fs::write(&source, b"data").unwrap();
+        let plan = plan_move(&MovePlanRequest {
+            source: source.clone(),
+            destination: destination.clone(),
+            bytes: 4,
+            available_bytes: None,
+            dry_run: false,
+        });
+
+        let error = execute_storage_plan_with_checkpoints(&plan, &[1], |_, _| Ok(())).unwrap_err();
+
+        assert!(error.to_string().contains("outside plan length 1"));
+        assert!(source.exists());
+        assert!(!destination.exists());
     }
 
     #[test]
@@ -2550,6 +3111,52 @@ mod tests {
         assert!(source.exists());
         assert!(!destination.exists());
         assert!(!root.join(".destination.bin.tng-copying").exists());
+    }
+
+    #[test]
+    fn controlled_delete_after_partial_removal_requires_manual_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let target = root.join("payload");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("a.bin"), b"a").unwrap();
+        std::fs::write(target.join("b.bin"), b"b").unwrap();
+        let plan = StoragePlan {
+            dry_run: false,
+            can_apply: true,
+            issues: Vec::new(),
+            steps: vec![StoragePlanStep {
+                action: PlannedStorageAction::SafeDelete,
+                source: Some(target.clone()),
+                destination: None,
+                bytes: 2,
+            }],
+            rollback_steps: Vec::new(),
+        };
+
+        let result = execute_storage_plan_under_roots_with_checkpoints_and_control(
+            &plan,
+            std::slice::from_ref(&root),
+            &[],
+            |_, _| Ok(()),
+            || {
+                if !target.join("a.bin").exists() || !target.join("b.bin").exists() {
+                    Err(StorageError::StagedMoveFailed {
+                        step: "cancel",
+                        reason: "injected cancellation".to_owned(),
+                    })
+                } else {
+                    Ok(())
+                }
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(StorageError::FilesystemStateUncertain { step: "delete", .. })
+        ));
+        assert!(target.exists());
+        assert!(target.join("a.bin").exists() ^ target.join("b.bin").exists());
     }
 
     #[test]
@@ -2640,8 +3247,39 @@ mod tests {
 
         assert!(matches!(
             reconcile_storage_plan_under_roots(&plan, std::slice::from_ref(&root), &[]),
-            Err(StorageError::StagedMoveFailed {
-                step: "verify-content",
+            Err(StorageError::FilesystemStateUncertain {
+                step: "reconcile",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn reconcile_rejects_conflicting_rename_as_manual_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.bin");
+        let destination = root.join("destination.bin");
+        std::fs::write(&source, b"source").unwrap();
+        std::fs::write(&destination, b"destination").unwrap();
+        let plan = StoragePlan {
+            dry_run: false,
+            can_apply: true,
+            issues: Vec::new(),
+            steps: vec![StoragePlanStep {
+                action: PlannedStorageAction::Rename,
+                source: Some(source),
+                destination: Some(destination),
+                bytes: 6,
+            }],
+            rollback_steps: Vec::new(),
+        };
+
+        assert!(matches!(
+            reconcile_storage_plan_under_roots(&plan, std::slice::from_ref(&root), &[]),
+            Err(StorageError::FilesystemStateUncertain {
+                step: "reconcile",
                 ..
             })
         ));

@@ -150,12 +150,13 @@ The following items were previously tracked as implementation targets and are
 now part of the release surface:
 
 - Native move/import/delete API calls use the storage-plan job helpers. The
-  storage executor accepts completed step indexes, and the engine persists
-  storage-plan queue/start/checkpoint/complete state in the durable jobs table
-  so interrupted multi-step plans can resume or be audited after process
-  restart. The WebUI planner can provide affected torrent metadata, completed
-  resume steps, operation templates, forward/rollback byte summaries, and
-  active storage-plan job progress.
+  storage executor accepts engine-owned completed step indexes, while the
+  public API rejects caller-selected skips. The engine persists storage-plan
+  queue/start/checkpoint/complete state in the durable jobs table so
+  interrupted multi-step plans can resume or be audited after process
+  restart. The WebUI planner provides affected torrent metadata, operation
+  templates, forward/rollback byte summaries, and active storage-plan job
+  progress.
 - Per-device latency observability includes bounded Prometheus histograms for
   read/write/sync/hash work labeled by resolved device/profile, plus the
   cumulative per-device totals. Aggregate fixed-bucket histograms and counters
@@ -189,3 +190,10 @@ implementation:
   valid.
 - Fastresume must not trust valid pieces after a configured durability sync
   failure.
+- If a storage plan cannot prove that a destructive or partially applied step
+  is safely rolled back, its durable job is failed with a manual-recovery
+  signal and owning torrents remain quiesced until the filesystem is resolved.
+- Storage-plan queue events persist each target's pre-quiesce paused state, so
+  restart recovery can resume active torrents after a successful or ordinary
+  failed/cancelled plan without confusing them with torrents the user had
+  already paused.

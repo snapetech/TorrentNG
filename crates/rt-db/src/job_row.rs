@@ -194,6 +194,31 @@ pub fn list_active_jobs(conn: &Connection) -> Result<Vec<JobRow>, DbError> {
     Ok(rows)
 }
 
+/// Return failed jobs whose error begins with a durable, caller-defined
+/// marker. Prefix matching avoids treating arbitrary failed jobs as recovery
+/// blockers while keeping the job state itself terminal.
+pub fn list_failed_jobs_with_error_prefix(
+    conn: &Connection,
+    kind: &str,
+    prefix: &str,
+) -> Result<Vec<JobRow>, DbError> {
+    let mut stmt = conn.prepare(
+        "SELECT job_id, kind, state, dry_run, affected_torrents, total, done,
+                checkpoint, file_index, piece_index, byte_offset, verified_bytes,
+                invalid_pieces, error, created_at, started_at, updated_at, finished_at
+         FROM jobs
+         WHERE kind = ?1
+           AND state = 'failed'
+           AND error IS NOT NULL
+           AND substr(error, 1, length(?2)) = ?2
+         ORDER BY updated_at DESC",
+    )?;
+    let rows = stmt
+        .query_map(params![kind, prefix], JobRow::from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// Count non-terminal jobs without materializing their payloads. This is the
 /// hot-path counterpart to `list_active_jobs`, used by engine statistics.
 pub fn count_active_jobs(conn: &Connection) -> Result<u64, DbError> {
@@ -290,6 +315,29 @@ mod tests {
         assert!(active.iter().any(|job| job.job_id == "job-1"));
         assert!(active.iter().any(|job| job.job_id == "job-3"));
         assert_eq!(count_active_jobs(&conn).unwrap(), 2);
+    }
+
+    #[test]
+    fn list_failed_jobs_with_error_prefix_is_narrow() {
+        let conn = setup();
+        let mut manual = sample();
+        manual.job_id = "manual".into();
+        manual.kind = "storage_plan".into();
+        manual.state = "failed".into();
+        manual.error = Some("manual recovery required: ambiguous filesystem".into());
+        manual.finished_at = Some(30);
+        upsert_job(&conn, &manual).unwrap();
+
+        let mut ordinary = manual.clone();
+        ordinary.job_id = "ordinary".into();
+        ordinary.error = Some("storage plan failed".into());
+        upsert_job(&conn, &ordinary).unwrap();
+
+        let jobs =
+            list_failed_jobs_with_error_prefix(&conn, "storage_plan", "manual recovery required: ")
+                .unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].job_id, "manual");
     }
 
     #[test]

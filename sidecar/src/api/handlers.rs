@@ -14,7 +14,7 @@ use std::{
     path::{Path as FsPath, PathBuf},
     process::Stdio,
     sync::atomic::Ordering,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
@@ -27,7 +27,7 @@ use super::ws::Event;
 use crate::backend::{post_remote_json, ratio_milli, BackendHealth, BackendStatus};
 use crate::cache::{
     bounded_page_limit, validate_page_offset, AppEventRow, Category, ListParams, RatioGroup,
-    RssRule, SavedView, WorkflowRule, WorkflowRun,
+    RssRule, SavedView, TorrentLiveRow, WorkflowRule, WorkflowRun,
 };
 use crate::rtorrent::{engine::ProbeValue, XmlValue};
 
@@ -2290,6 +2290,124 @@ fn statvfs(_path: &FsPath) -> Result<FsStat, String> {
 }
 
 // --- Torrent list ---
+
+const MAX_TORRENT_LIVE_STATS: usize = 128;
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TorrentLiveStatsQuery {
+    pub hashes: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct TorrentLiveStatResponse {
+    hash: String,
+    amount_left: u64,
+    download_rate: i64,
+    upload_rate: i64,
+    sampled_at: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct TorrentLiveStatsResponse {
+    sampled_at: u64,
+    torrents: Vec<TorrentLiveStatResponse>,
+}
+
+fn parse_torrent_live_hashes(raw: Option<&str>) -> Result<Vec<String>, String> {
+    let raw = raw.ok_or_else(|| "hashes is required".to_owned())?;
+    let mut hashes = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for value in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if !matches!(value.len(), 40 | 64) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(
+                "hashes must contain 40- or 64-character hexadecimal info hashes".to_owned(),
+            );
+        }
+        let value = value.to_ascii_lowercase();
+        if seen.insert(value.clone()) {
+            hashes.push(value);
+        }
+    }
+    if hashes.is_empty() {
+        return Err("hashes must contain at least one info hash".to_owned());
+    }
+    if hashes.len() > MAX_TORRENT_LIVE_STATS {
+        return Err(format!(
+            "at most {MAX_TORRENT_LIVE_STATS} hashes may be requested"
+        ));
+    }
+    Ok(hashes)
+}
+
+fn live_sampled_at() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+fn live_row_response(row: TorrentLiveRow, sampled_at: u64) -> TorrentLiveStatResponse {
+    let size_bytes = u64::try_from(row.size_bytes.max(0)).unwrap_or(0);
+    let bytes_done = u64::try_from(row.bytes_done.max(0)).unwrap_or(0);
+    TorrentLiveStatResponse {
+        hash: row.hash,
+        amount_left: size_bytes.saturating_sub(bytes_done),
+        download_rate: row.down_rate.max(0),
+        upload_rate: row.up_rate.max(0),
+        sampled_at: if row.updated_at > 0 {
+            u64::try_from(row.updated_at)
+                .unwrap_or(sampled_at.saturating_div(1_000))
+                .saturating_mul(1_000)
+        } else {
+            sampled_at
+        },
+    }
+}
+
+/// `GET /api/v1/torrents/live?hashes=a,b,...` — cached live rates for the
+/// explicitly visible torrents. It does not call the remote backend.
+pub async fn live_torrent_stats(
+    State(s): State<AppState>,
+    Query(query): Query<TorrentLiveStatsQuery>,
+) -> impl IntoResponse {
+    s.metrics.api_requests_total.fetch_add(1, Ordering::Relaxed);
+    let hashes = match parse_torrent_live_hashes(query.hashes.as_deref()) {
+        Ok(hashes) => hashes,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    let rows = match s
+        .db
+        .run_blocking("live_torrent_stats", move |db| db.live_stats(&hashes))
+        .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::error!(
+                component = "api",
+                operation = "live_torrent_stats",
+                result = "error",
+                error = %error,
+                "live torrent stats query failed"
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let sampled_at = live_sampled_at();
+    let torrents = rows
+        .into_iter()
+        .map(|row| live_row_response(row, sampled_at))
+        .collect();
+    Json(TorrentLiveStatsResponse {
+        sampled_at,
+        torrents,
+    })
+    .into_response()
+}
 
 pub async fn list_torrents(
     State(s): State<AppState>,
