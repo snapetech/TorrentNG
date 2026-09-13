@@ -50,6 +50,10 @@ const QBIT_LIST_INITIAL_CAPACITY: usize = 256;
 const QBIT_LIMIT_PROJECTION_CONCURRENCY: usize = 64;
 const QBIT_LIVE_PROJECTION_CONCURRENCY: usize = 64;
 const MAX_QBIT_MUTATION_ITEMS: usize = 16_384;
+// qBittorrent forms use one value per named option. Keep the compatibility
+// parser from retaining an attacker-controlled number of distinct fields even
+// when the request body is otherwise within the multipart/body byte limit.
+const MAX_QBIT_FORM_FIELDS: usize = 1_024;
 
 // These compatibility settings are deliberately separate from the engine's
 // runtime settings.  They are qBittorrent WebUI state, not TorrentNG-client transport
@@ -1562,16 +1566,21 @@ pub async fn torrents_add(
                     }
                 });
             }
-            Some("torrents") => match field.bytes().await {
-                Ok(bytes) => torrent_blobs.push(bytes.to_vec()),
-                Err(error) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        format!("invalid torrent field: {error}"),
-                    )
-                        .into_response()
+            Some("torrents") => {
+                if torrent_blobs.len() >= MAX_QBIT_MUTATION_ITEMS {
+                    return (StatusCode::BAD_REQUEST, "Fails.").into_response();
                 }
-            },
+                match field.bytes().await {
+                    Ok(bytes) => torrent_blobs.push(bytes.to_vec()),
+                    Err(error) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            format!("invalid torrent field: {error}"),
+                        )
+                            .into_response()
+                    }
+                }
+            }
             Some(name) => {
                 // Do not silently discard a qBit add option. If it has no
                 // TorrentNG-client contract, accepting the request would create
@@ -1617,9 +1626,16 @@ pub async fn torrents_add(
     let url_values = if urls.trim().is_empty() {
         Vec::new()
     } else {
-        let values = urls.lines().map(str::trim).collect::<Vec<_>>();
-        if values.iter().any(|url| url.is_empty()) {
-            return (StatusCode::BAD_REQUEST, "Fails.").into_response();
+        let mut values = Vec::new();
+        for (index, url) in urls.lines().enumerate() {
+            if index >= MAX_QBIT_MUTATION_ITEMS {
+                return (StatusCode::BAD_REQUEST, "Fails.").into_response();
+            }
+            let url = url.trim();
+            if url.is_empty() {
+                return (StatusCode::BAD_REQUEST, "Fails.").into_response();
+            }
+            values.push(url);
         }
         values
     };
@@ -1699,7 +1715,13 @@ pub async fn torrents_add(
             continue;
         }
         match fetch_torrent_url(url, &state.egress_policy).await {
-            Ok(raw) => torrent_blobs.push(raw),
+            Ok(raw) => {
+                if torrent_blobs.len() >= MAX_QBIT_MUTATION_ITEMS {
+                    rollback_qbit_added_torrents(engine, &added_hashes).await;
+                    return (StatusCode::BAD_REQUEST, "Fails.").into_response();
+                }
+                torrent_blobs.push(raw);
+            }
             Err(e) => {
                 tracing::error!(
                     component = "api",
@@ -4502,7 +4524,7 @@ fn rss_leaf_name(path: &str) -> String {
 }
 
 fn required_strict_qbit_list(
-    params: &HashMap<String, String>,
+    params: &QbitFormParams,
     key: &str,
 ) -> Result<Vec<String>, StatusCode> {
     let raw = params.get(key).ok_or(StatusCode::BAD_REQUEST)?;
@@ -4534,18 +4556,15 @@ fn now_secs() -> i64 {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn required_hashes(
-    params: &HashMap<String, String>,
-    keys: &[&str],
-) -> Result<Vec<String>, StatusCode> {
-    let raw = keys.iter().find_map(|key| params.get(*key));
+fn required_hashes(params: &QbitFormParams, keys: &[&str]) -> Result<Vec<String>, StatusCode> {
+    let raw = keys.iter().find_map(|key| params.get(key));
     raw.and_then(|raw| strict_hashes_from_str(raw))
         .ok_or(StatusCode::BAD_REQUEST)
 }
 
 async fn required_resolved_hashes(
     state: &AppState,
-    params: &HashMap<String, String>,
+    params: &QbitFormParams,
     keys: &[&str],
 ) -> Result<Vec<String>, StatusCode> {
     let requested = required_hashes(params, keys)?;
@@ -4574,10 +4593,7 @@ fn strict_hashes_from_str(raw: &str) -> Option<Vec<String>> {
     Some(hashes)
 }
 
-fn required_text_list(
-    params: &HashMap<String, String>,
-    key: &str,
-) -> Result<Vec<String>, StatusCode> {
+fn required_text_list(params: &QbitFormParams, key: &str) -> Result<Vec<String>, StatusCode> {
     let raw = params.get(key).ok_or(StatusCode::BAD_REQUEST)?;
     let mut values = Vec::new();
     for value in raw.split('|') {
@@ -4597,7 +4613,7 @@ fn required_text_list(
 }
 
 fn required_strict_tag_list(
-    params: &HashMap<String, String>,
+    params: &QbitFormParams,
     key: &str,
     allow_empty: bool,
 ) -> Result<Vec<String>, StatusCode> {
@@ -5530,10 +5546,40 @@ fn sync_rid_for_infos_and_trackers(
     rid.max(1)
 }
 
-fn parse_form_body(body: &str) -> HashMap<String, String> {
-    url::form_urlencoded::parse(body.as_bytes())
-        .into_owned()
-        .collect()
+struct QbitFormParams {
+    values: HashMap<String, String>,
+    overflowed: bool,
+}
+
+impl QbitFormParams {
+    fn get(&self, key: &str) -> Option<&String> {
+        (!self.overflowed).then(|| self.values.get(key)).flatten()
+    }
+
+    fn remove(&mut self, key: &str) -> Option<String> {
+        if self.overflowed {
+            None
+        } else {
+            self.values.remove(key)
+        }
+    }
+
+    fn contains_key(&self, key: &str) -> bool {
+        !self.overflowed && self.values.contains_key(key)
+    }
+}
+
+fn parse_form_body(body: &str) -> QbitFormParams {
+    let mut values = HashMap::with_capacity(MAX_QBIT_FORM_FIELDS.min(body.len()));
+    let mut overflowed = false;
+    for (index, (key, value)) in url::form_urlencoded::parse(body.as_bytes()).enumerate() {
+        if index >= MAX_QBIT_FORM_FIELDS {
+            overflowed = true;
+            break;
+        }
+        values.insert(key.into_owned(), value.into_owned());
+    }
+    QbitFormParams { values, overflowed }
 }
 
 fn unix_now() -> i64 {
@@ -8712,6 +8758,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_form_body_rejects_excessive_field_count() {
+        let body = (0..=MAX_QBIT_FORM_FIELDS)
+            .map(|index| format!("field{index}=value"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let params = parse_form_body(&body);
+        assert!(params.get("field0").is_none());
+        assert!(params.get("field1024").is_none());
+        assert!(!params.contains_key("field0"));
+    }
+
+    #[test]
     fn split_tracker_values_accepts_qbit_separators_and_dedupes() {
         assert_eq!(
             split_tracker_values("udp://one/announce|udp://two/announce\nudp://one/announce"),
@@ -8808,17 +8866,11 @@ mod tests {
         assert!(strict_hashes_from_str(&joined).is_none());
         assert!(strict_numeric_list(&joined).is_err());
         assert!(strict_tracker_values(&joined).is_err());
-        assert!(required_text_list(
-            &HashMap::from([(String::from("values"), joined.clone())]),
-            "values"
-        )
-        .is_err());
+        let text_params = parse_form_body(&format!("values={joined}"));
+        assert!(required_text_list(&text_params, "values").is_err());
         assert!(strict_tag_values(&joined.replace('|', ","), false).is_err());
-        assert!(required_strict_qbit_list(
-            &HashMap::from([(String::from("values"), joined)]),
-            "values"
-        )
-        .is_err());
+        let strict_params = parse_form_body(&format!("values={joined}"));
+        assert!(required_strict_qbit_list(&strict_params, "values").is_err());
     }
 
     #[test]
