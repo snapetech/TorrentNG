@@ -14,7 +14,7 @@ use axum::{
     middleware::{self, Next},
     response::{IntoResponse, Response},
 };
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::{oneshot, Notify, RwLock};
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::info;
 
@@ -199,21 +199,43 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    let (shutdown_started_tx, shutdown_started_rx) = oneshot::channel();
+    let shutdown_task = tokio::spawn(shutdown_signal(
+        engine_handle.clone(),
+        shutdown_notify,
+        shutdown_started_tx,
+    ));
     let serve_result = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal(engine_handle.clone(), shutdown_notify))
+    .with_graceful_shutdown(async move {
+        let _ = shutdown_started_rx.await;
+    })
     .await;
+    if serve_result.is_err() {
+        // A server failure can occur without a signal. Do not leave the
+        // signal waiter detached while the main task performs the fallback
+        // engine shutdown below.
+        shutdown_task.abort();
+    }
+    // The signal task starts engine shutdown before Axum drains existing
+    // connections, then this idempotent call ensures the main task joins the
+    // same bounded shutdown operation on both normal and error exits.
+    engine_handle.shutdown().await;
+    let _ = shutdown_task.await;
     if let Err(error) = serve_result {
-        engine_handle.shutdown().await;
         return Err(anyhow::Error::new(error).context("API server error"));
     }
 
     Ok(())
 }
 
-async fn shutdown_signal(engine: rt_engine::EngineHandle, shutdown_notify: Arc<Notify>) {
+async fn shutdown_signal(
+    engine: rt_engine::EngineHandle,
+    shutdown_notify: Arc<Notify>,
+    shutdown_started: oneshot::Sender<()>,
+) {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
@@ -274,6 +296,7 @@ async fn shutdown_signal(engine: rt_engine::EngineHandle, shutdown_notify: Arc<N
             }
         }
     }
+    let _ = shutdown_started.send(());
     engine.shutdown().await;
 }
 

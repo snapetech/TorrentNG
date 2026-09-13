@@ -105,6 +105,7 @@ const ENGINE_COMMAND_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 const TASK_ABORT_GRACE: Duration = Duration::from_millis(100);
 const MAGNET_METADATA_STORAGE_RETRY_DELAY: Duration = Duration::from_millis(250);
 const MAX_STORAGE_PLAN_AFFECTED_TORRENTS: usize = 256;
+const MAX_ENGINE_MUTATION_ITEMS: usize = 16_384;
 /// Bound explicit peer commands before they reach a torrent actor. The actor
 /// can only maintain `max_peers` live connections, so retaining thousands of
 /// more addresses is wasted work and lets a compatibility request monopolize
@@ -562,6 +563,15 @@ fn validate_peer_command_len(count: usize, maximum: usize, kind: &str) -> CmdRes
     Ok(())
 }
 
+fn validate_command_item_len(count: usize, maximum: usize, kind: &str) -> CmdResult<()> {
+    if count > maximum {
+        return Err(format!(
+            "{kind} contains {count} items; maximum is {maximum}"
+        ));
+    }
+    Ok(())
+}
+
 /// Handle given to the API layer. Clone freely; all sends are channel-based.
 #[derive(Clone)]
 pub struct EngineHandle {
@@ -668,6 +678,7 @@ impl EngineHandle {
         category: Option<String>,
         tags: Vec<String>,
     ) -> CmdResult<String> {
+        validate_command_item_len(tags.len(), MAX_ENGINE_MUTATION_ITEMS, "torrent tag list")?;
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.send_command(EngineCmd::AddTorrent {
             meta: Box::new(meta),
@@ -695,6 +706,13 @@ impl EngineHandle {
         category: Option<String>,
         tags: Vec<String>,
     ) -> CmdResult<String> {
+        if raw.len() > MAX_TORRENT_BYTES {
+            return Err(format!(
+                "torrent metainfo contains {} bytes; maximum is {MAX_TORRENT_BYTES}",
+                raw.len()
+            ));
+        }
+        validate_command_item_len(tags.len(), MAX_ENGINE_MUTATION_ITEMS, "torrent tag list")?;
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.send_command(EngineCmd::AddTorrentRaw {
             raw,
@@ -719,6 +737,7 @@ impl EngineHandle {
         category: Option<String>,
         tags: Vec<String>,
     ) -> CmdResult<String> {
+        validate_command_item_len(tags.len(), MAX_ENGINE_MUTATION_ITEMS, "torrent tag list")?;
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.send_command(EngineCmd::AddMagnet {
             magnet,
@@ -863,6 +882,16 @@ impl EngineHandle {
         plan: StoragePlan,
         completed_steps: Vec<usize>,
     ) -> CmdResult<String> {
+        validate_command_item_len(
+            affected_torrents.len(),
+            MAX_STORAGE_PLAN_AFFECTED_TORRENTS,
+            "storage plan torrent list",
+        )?;
+        validate_command_item_len(
+            completed_steps.len(),
+            MAX_ENGINE_MUTATION_ITEMS,
+            "storage plan checkpoint list",
+        )?;
         let affected_torrents = affected_torrents
             .into_iter()
             .map(canonical_info_hash)
@@ -936,6 +965,7 @@ impl EngineHandle {
         last_known_id: Option<i64>,
         limit: usize,
     ) -> CmdResult<Vec<rt_db::SessionEventRow>> {
+        validate_command_item_len(levels.len(), MAX_ENGINE_MUTATION_ITEMS, "event level list")?;
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.send_command(EngineCmd::ListSessionEvents {
             info_hash,
@@ -979,6 +1009,16 @@ impl EngineHandle {
         add_tags: Vec<String>,
         remove_tags: Vec<String>,
     ) -> CmdResult<()> {
+        validate_command_item_len(
+            add_tags.len(),
+            MAX_ENGINE_MUTATION_ITEMS,
+            "torrent tag list",
+        )?;
+        validate_command_item_len(
+            remove_tags.len(),
+            MAX_ENGINE_MUTATION_ITEMS,
+            "torrent tag removal list",
+        )?;
         let info_hash = canonical_info_hash(info_hash);
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.send_command(EngineCmd::UpdateTorrentLabels {
@@ -1028,6 +1068,7 @@ impl EngineHandle {
     }
 
     pub async fn remove_categories(&self, names: Vec<String>) -> CmdResult<()> {
+        validate_command_item_len(names.len(), MAX_ENGINE_MUTATION_ITEMS, "category list")?;
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.send_command(EngineCmd::RemoveCategories { names, reply })
             .await?;
@@ -1041,6 +1082,7 @@ impl EngineHandle {
     }
 
     pub async fn create_tags(&self, names: Vec<String>) -> CmdResult<()> {
+        validate_command_item_len(names.len(), MAX_ENGINE_MUTATION_ITEMS, "tag list")?;
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.send_command(EngineCmd::CreateTags { names, reply })
             .await?;
@@ -1048,6 +1090,7 @@ impl EngineHandle {
     }
 
     pub async fn remove_tags(&self, names: Vec<String>) -> CmdResult<()> {
+        validate_command_item_len(names.len(), MAX_ENGINE_MUTATION_ITEMS, "tag list")?;
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.send_command(EngineCmd::RemoveTags { names, reply })
             .await?;
@@ -1113,6 +1156,7 @@ impl EngineHandle {
         info_hash: String,
         trackers: Vec<String>,
     ) -> CmdResult<()> {
+        validate_command_item_len(trackers.len(), MAX_ENGINE_MUTATION_ITEMS, "tracker list")?;
         let info_hash = canonical_info_hash(info_hash);
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.send_command(EngineCmd::UpdateTorrentTrackers {
@@ -1154,6 +1198,7 @@ impl EngineHandle {
         file_ids: Vec<u32>,
         priority: i64,
     ) -> CmdResult<()> {
+        validate_command_item_len(file_ids.len(), MAX_ENGINE_MUTATION_ITEMS, "file ID list")?;
         let info_hash = canonical_info_hash(info_hash);
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.send_command(EngineCmd::UpdateFilePriorities {
@@ -1304,6 +1349,11 @@ impl EngineHandle {
         info_hashes: Vec<String>,
         queue_move: QueueMove,
     ) -> CmdResult<()> {
+        validate_command_item_len(
+            info_hashes.len(),
+            MAX_ENGINE_MUTATION_ITEMS,
+            "queue torrent list",
+        )?;
         let info_hashes = info_hashes.into_iter().map(canonical_info_hash).collect();
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.send_command(EngineCmd::UpdateQueueOrder {
@@ -14586,6 +14636,20 @@ mod tests {
             validate_peer_command_len(MAX_BANNED_PEERS + 1, MAX_BANNED_PEERS, "peer ban list")
                 .is_err()
         );
+
+        assert!(validate_command_item_len(
+            MAX_ENGINE_MUTATION_ITEMS,
+            MAX_ENGINE_MUTATION_ITEMS,
+            "tag list"
+        )
+        .is_ok());
+        let mutation_error = validate_command_item_len(
+            MAX_ENGINE_MUTATION_ITEMS + 1,
+            MAX_ENGINE_MUTATION_ITEMS,
+            "tag list",
+        )
+        .unwrap_err();
+        assert!(mutation_error.contains("maximum is 16384"));
     }
 
     #[tokio::test]

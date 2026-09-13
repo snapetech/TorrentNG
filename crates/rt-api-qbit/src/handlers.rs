@@ -1714,14 +1714,12 @@ pub async fn torrents_add(
             added_hashes.push(hash);
             continue;
         }
+        if torrent_blobs.len() >= MAX_QBIT_MUTATION_ITEMS {
+            rollback_qbit_added_torrents(engine, &added_hashes).await;
+            return (StatusCode::BAD_REQUEST, "Fails.").into_response();
+        }
         match fetch_torrent_url(url, &state.egress_policy).await {
-            Ok(raw) => {
-                if torrent_blobs.len() >= MAX_QBIT_MUTATION_ITEMS {
-                    rollback_qbit_added_torrents(engine, &added_hashes).await;
-                    return (StatusCode::BAD_REQUEST, "Fails.").into_response();
-                }
-                torrent_blobs.push(raw);
-            }
+            Ok(raw) => torrent_blobs.push(raw),
             Err(e) => {
                 tracing::error!(
                     component = "api",
