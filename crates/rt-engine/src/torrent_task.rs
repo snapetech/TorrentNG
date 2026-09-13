@@ -2368,12 +2368,11 @@ impl TorrentTask {
 
     fn upload_context(&self, peer_addr: SocketAddr) -> Option<UploadContext> {
         let have_pieces = self.picker.have_pieces();
-        let visible_pieces = if self.super_seeding && self.picker.is_complete() {
+        let have_pieces = if self.super_seeding && self.picker.is_complete() {
             super_seed_visible_pieces(&have_pieces, peer_addr)
         } else {
-            have_pieces
+            PieceBitmap::from_bools(&have_pieces)
         };
-        let have_pieces = PieceBitmap::from_bools(&visible_pieces);
         let bitmap_memory_lease = self
             .resources
             .try_acquire(MemoryClass::PeerBuffer, have_pieces.memory_bytes())?;
@@ -7011,21 +7010,25 @@ fn pieces_to_bitfield(pieces: &[bool]) -> Vec<u8> {
     bits
 }
 
-fn super_seed_visible_pieces(have_pieces: &[bool], peer_addr: SocketAddr) -> Vec<bool> {
-    let mut visible = vec![false; have_pieces.len()];
-    let available: Vec<usize> = have_pieces
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, have)| have.then_some(idx))
-        .collect();
-    if available.is_empty() {
+fn super_seed_visible_pieces(have_pieces: &[bool], peer_addr: SocketAddr) -> PieceBitmap {
+    let available_count = have_pieces.iter().filter(|have| **have).count();
+    let mut visible = PieceBitmap::new(have_pieces.len());
+    if available_count == 0 {
         return visible;
     }
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     peer_addr.hash(&mut hasher);
-    let selected = available[(hasher.finish() as usize) % available.len()];
-    visible[selected] = true;
+    let target = (hasher.finish() as usize) % available_count;
+    if let Some(selected) = have_pieces
+        .iter()
+        .enumerate()
+        .filter(|(_, have)| **have)
+        .nth(target)
+        .map(|(index, _)| index)
+    {
+        visible.set(selected, true);
+    }
     visible
 }
 
@@ -8536,8 +8539,8 @@ mod tests {
         let addr = "127.0.0.1:6881".parse().unwrap();
         let visible = super_seed_visible_pieces(&[true, true, false, true], addr);
 
-        assert_eq!(visible.iter().filter(|piece| **piece).count(), 1);
-        assert!(!visible[2]);
+        assert_eq!(visible.count_ones(), 1);
+        assert_eq!(visible.get(2), Some(false));
     }
 
     #[test]
@@ -8546,7 +8549,7 @@ mod tests {
 
         assert_eq!(
             super_seed_visible_pieces(&[false, false, false], addr),
-            vec![false, false, false]
+            PieceBitmap::new(3)
         );
     }
 
