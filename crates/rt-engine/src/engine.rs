@@ -1,8 +1,9 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 /// Top-level engine: manages torrent task lifecycle and incoming peer listeners.
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -106,6 +107,11 @@ const TASK_ABORT_GRACE: Duration = Duration::from_millis(100);
 const MAGNET_METADATA_STORAGE_RETRY_DELAY: Duration = Duration::from_millis(250);
 const MAX_STORAGE_PLAN_AFFECTED_TORRENTS: usize = 256;
 const MAX_ENGINE_MUTATION_ITEMS: usize = 16_384;
+// Compatibility full-list endpoints can fan out many actor queries per HTTP
+// request. Keep detached DB/filesystem query tasks bounded independently of
+// the daemon's request count so their closures cannot accumulate behind a
+// slow database or disconnected storage mount.
+const MAX_ENGINE_QUERY_TASKS: usize = 256;
 /// Bound explicit peer commands before they reach a torrent actor. The actor
 /// can only maintain `max_peers` live connections, so retaining thousands of
 /// more addresses is wasted work and lets a compatibility request monopolize
@@ -115,6 +121,7 @@ static RECHECK_JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static STORAGE_PLAN_JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static DHT_COMMAND_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static TORRENT_BLOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static ENGINE_QUERY_TASKS: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(not(test))]
 const SESSION_EVENT_QUEUE_CAPACITY: usize = 1024;
@@ -281,6 +288,51 @@ pub(super) async fn send_engine_command_until_delivered(
             }
         }
     }
+}
+
+struct EngineQueryTaskGuard;
+
+impl Drop for EngineQueryTaskGuard {
+    fn drop(&mut self) {
+        ENGINE_QUERY_TASKS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn try_acquire_engine_query_task() -> Option<EngineQueryTaskGuard> {
+    let mut current = ENGINE_QUERY_TASKS.load(Ordering::Acquire);
+    loop {
+        if current >= MAX_ENGINE_QUERY_TASKS {
+            return None;
+        }
+        match ENGINE_QUERY_TASKS.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Some(EngineQueryTaskGuard),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+/// Run one detached query only when the engine-wide query budget has room.
+/// Returning a capacity error at the actor boundary is preferable to creating
+/// another task that can sit behind a saturated database worker indefinitely.
+fn spawn_engine_query<T, F>(reply: oneshot::Sender<CmdResult<T>>, query: F)
+where
+    T: Send + 'static,
+    F: Future<Output = CmdResult<T>> + Send + 'static,
+{
+    let Some(guard) = try_acquire_engine_query_task() else {
+        let _ = reply.send(Err("engine query capacity exhausted".to_owned()));
+        return;
+    };
+    tokio::spawn(async move {
+        let _guard = guard;
+        let result = query.await;
+        let _ = reply.send(result);
+    });
 }
 
 async fn send_dht_command_until_delivered(
@@ -2797,112 +2849,99 @@ impl Engine {
                 // config/database handles and replies directly.
                 let config = Arc::clone(&self.config);
                 let db = self.db_executor();
-                tokio::spawn(async move {
-                    let result = match tokio::task::spawn_blocking(move || {
+                spawn_engine_query(reply, async move {
+                    match tokio::task::spawn_blocking(move || {
                         load_torrent_metadata_from_sources(&config, &db, &info_hash)
                     })
                     .await
                     {
                         Ok(result) => result.map_err(|error| error.to_string()),
                         Err(error) => Err(format!("metadata worker failed: {error}")),
-                    };
-                    let _ = reply.send(result);
+                    }
                 });
             }
 
             EngineCmd::GetTorrentBlob { info_hash, reply } => {
                 let config = Arc::clone(&self.config);
-                tokio::spawn(async move {
-                    let result = match tokio::task::spawn_blocking(move || {
+                spawn_engine_query(reply, async move {
+                    match tokio::task::spawn_blocking(move || {
                         load_torrent_blob_from_config(&config, &info_hash)
                     })
                     .await
                     {
                         Ok(result) => result.map_err(|error| error.to_string()),
                         Err(error) => Err(format!("torrent blob worker failed: {error}")),
-                    };
-                    let _ = reply.send(result);
+                    }
                 });
             }
 
             EngineCmd::GetTorrentTrackers { info_hash, reply } => {
                 let db = self.db_executor();
-                tokio::spawn(async move {
-                    let result = db
-                        .run("get_torrent_trackers", move |db| {
-                            let row =
-                                rt_db::get(db, &info_hash).map_err(|error| error.to_string())?;
-                            rt_db::list_torrent_trackers(db, &row.info_hash)
-                                .map(|trackers| {
-                                    trackers.into_iter().map(engine_tracker_snapshot).collect()
-                                })
-                                .map_err(|error| error.to_string())
-                        })
-                        .await
-                        .map_err(|error| format!("torrent tracker worker failed: {error}"));
-                    let _ = reply.send(result);
+                spawn_engine_query(reply, async move {
+                    db.run("get_torrent_trackers", move |db| {
+                        let row = rt_db::get(db, &info_hash).map_err(|error| error.to_string())?;
+                        rt_db::list_torrent_trackers(db, &row.info_hash)
+                            .map(|trackers| {
+                                trackers.into_iter().map(engine_tracker_snapshot).collect()
+                            })
+                            .map_err(|error| error.to_string())
+                    })
+                    .await
+                    .map_err(|error| format!("torrent tracker worker failed: {error}"))
                 });
             }
 
             EngineCmd::GetTrackerHealth { reply } => {
                 let db = self.db_executor();
-                tokio::spawn(async move {
-                    let result = db
-                        .run("get_tracker_health", move |db| {
-                            rt_db::torrent_tracker_health(db)
-                                .map(|rows| rows.into_iter().map(engine_tracker_health).collect())
-                                .map_err(|error| error.to_string())
-                        })
-                        .await
-                        .map_err(|error| format!("tracker health worker failed: {error}"));
-                    let _ = reply.send(result);
+                spawn_engine_query(reply, async move {
+                    db.run("get_tracker_health", move |db| {
+                        rt_db::torrent_tracker_health(db)
+                            .map(|rows| rows.into_iter().map(engine_tracker_health).collect())
+                            .map_err(|error| error.to_string())
+                    })
+                    .await
+                    .map_err(|error| format!("tracker health worker failed: {error}"))
                 });
             }
 
             EngineCmd::ListTorrentHashesByTracker { tracker, reply } => {
                 let db = self.db_executor();
-                tokio::spawn(async move {
-                    let result = db
-                        .run("list_torrent_hashes_by_tracker", move |db| {
-                            rt_db::list_torrent_hashes_by_tracker(db, &tracker)
-                                .map_err(|error| error.to_string())
-                        })
-                        .await
-                        .map_err(|error| format!("tracker match worker failed: {error}"));
-                    let _ = reply.send(result);
+                spawn_engine_query(reply, async move {
+                    db.run("list_torrent_hashes_by_tracker", move |db| {
+                        rt_db::list_torrent_hashes_by_tracker(db, &tracker)
+                            .map_err(|error| error.to_string())
+                    })
+                    .await
+                    .map_err(|error| format!("tracker match worker failed: {error}"))
                 });
             }
 
             EngineCmd::GetSetting { key, reply } => {
                 let db = self.db_executor();
-                tokio::spawn(async move {
-                    let result = db
-                        .run("get_setting", move |db| {
-                            match rt_db::get_setting(db, &key) {
-                                Ok(value) => Ok(Some(value)),
-                                Err(rt_db::DbError::NotFound(_)) => Ok(None),
-                                Err(error) => Err(error.to_string()),
-                            }
-                        })
-                        .await
-                        .map_err(|error| format!("setting read worker failed: {error}"));
-                    let _ = reply.send(result);
+                spawn_engine_query(reply, async move {
+                    db.run("get_setting", move |db| {
+                        match rt_db::get_setting(db, &key) {
+                            Ok(value) => Ok(Some(value)),
+                            Err(rt_db::DbError::NotFound(_)) => Ok(None),
+                            Err(error) => Err(error.to_string()),
+                        }
+                    })
+                    .await
+                    .map_err(|error| format!("setting read worker failed: {error}"))
                 });
             }
 
             EngineCmd::SetSetting { key, value, reply } => {
                 let db = self.db_executor();
-                tokio::spawn(async move {
-                    let result = db
-                        .run("set_setting", move |db| {
-                            let tx = db.transaction().map_err(|error| error.to_string())?;
-                            rt_db::set_setting_in_tx(&tx, &key, &value, unix_now_i64())
-                                .map_err(|error| error.to_string())?;
-                            tx.commit().map_err(|error| error.to_string())
-                        })
-                        .await
-                        .map_err(|error| format!("setting write worker failed: {error}"));
-                    let _ = reply.send(result);
+                spawn_engine_query(reply, async move {
+                    db.run("set_setting", move |db| {
+                        let tx = db.transaction().map_err(|error| error.to_string())?;
+                        rt_db::set_setting_in_tx(&tx, &key, &value, unix_now_i64())
+                            .map_err(|error| error.to_string())?;
+                        tx.commit().map_err(|error| error.to_string())
+                    })
+                    .await
+                    .map_err(|error| format!("setting write worker failed: {error}"))
                 });
             }
 
@@ -2920,21 +2959,19 @@ impl Engine {
             }
             EngineCmd::ListCategories { reply } => {
                 let db = self.db_executor();
-                tokio::spawn(async move {
-                    let result = db
-                        .run("list_categories", move |db| {
-                            rt_db::list_category_definitions(db)
-                                .map(|categories| {
-                                    categories
-                                        .into_iter()
-                                        .map(|(name, save_path)| EngineCategory { name, save_path })
-                                        .collect()
-                                })
-                                .map_err(|error| error.to_string())
-                        })
-                        .await
-                        .map_err(|error| format!("category read worker failed: {error}"));
-                    let _ = reply.send(result);
+                spawn_engine_query(reply, async move {
+                    db.run("list_categories", move |db| {
+                        rt_db::list_category_definitions(db)
+                            .map(|categories| {
+                                categories
+                                    .into_iter()
+                                    .map(|(name, save_path)| EngineCategory { name, save_path })
+                                    .collect()
+                            })
+                            .map_err(|error| error.to_string())
+                    })
+                    .await
+                    .map_err(|error| format!("category read worker failed: {error}"))
                 });
             }
             EngineCmd::CreateCategory {
@@ -2964,20 +3001,18 @@ impl Engine {
             }
             EngineCmd::ListTags { reply } => {
                 let db = self.db_executor();
-                tokio::spawn(async move {
-                    let result = db
-                        .run("list_tags", move |db| {
-                            let mut tags = persisted_global_tags(db)?
-                                .into_iter()
-                                .collect::<BTreeSet<_>>();
-                            for row in rt_db::list_all(db).map_err(|error| error.to_string())? {
-                                tags.extend(row.tags.into_iter().filter(|tag| !tag.is_empty()));
-                            }
-                            Ok(tags.into_iter().collect())
-                        })
-                        .await
-                        .map_err(|error| format!("tag read worker failed: {error}"));
-                    let _ = reply.send(result);
+                spawn_engine_query(reply, async move {
+                    db.run("list_tags", move |db| {
+                        let mut tags = persisted_global_tags(db)?
+                            .into_iter()
+                            .collect::<BTreeSet<_>>();
+                        for row in rt_db::list_all(db).map_err(|error| error.to_string())? {
+                            tags.extend(row.tags.into_iter().filter(|tag| !tag.is_empty()));
+                        }
+                        Ok(tags.into_iter().collect())
+                    })
+                    .await
+                    .map_err(|error| format!("tag read worker failed: {error}"))
                 });
             }
             EngineCmd::CreateTags { names, reply } => {
@@ -3186,16 +3221,14 @@ impl Engine {
             }
             EngineCmd::ListJobs { reply } => {
                 let db = self.db_executor();
-                tokio::spawn(async move {
-                    let result = db
-                        .run("list_jobs", move |db| {
-                            rt_db::list_active_jobs(db)
-                                .map(|jobs| jobs.into_iter().map(EngineJob::from).collect())
-                                .map_err(|error| error.to_string())
-                        })
-                        .await
-                        .map_err(|error| format!("job list worker failed: {error}"));
-                    let _ = reply.send(result);
+                spawn_engine_query(reply, async move {
+                    db.run("list_jobs", move |db| {
+                        rt_db::list_active_jobs(db)
+                            .map(|jobs| jobs.into_iter().map(EngineJob::from).collect())
+                            .map_err(|error| error.to_string())
+                    })
+                    .await
+                    .map_err(|error| format!("job list worker failed: {error}"))
                 });
             }
             EngineCmd::ListStorageRoots { reply } => {
@@ -3204,16 +3237,14 @@ impl Engine {
                 // filesystem half of this response slow, while SQLite can
                 // be contended by storage workers.
                 let db = self.db_executor();
-                tokio::spawn(async move {
-                    let result = db
-                        .run("list_storage_roots", move |db| {
-                            rt_db::list_storage_roots(db)
-                                .map(|rows| rows.into_iter().map(engine_storage_root).collect())
-                                .map_err(|error| error.to_string())
-                        })
-                        .await
-                        .map_err(|error| format!("storage root worker failed: {error}"));
-                    let _ = reply.send(result);
+                spawn_engine_query(reply, async move {
+                    db.run("list_storage_roots", move |db| {
+                        rt_db::list_storage_roots(db)
+                            .map(|rows| rows.into_iter().map(engine_storage_root).collect())
+                            .map_err(|error| error.to_string())
+                    })
+                    .await
+                    .map_err(|error| format!("storage root worker failed: {error}"))
                 });
             }
             EngineCmd::UpdateTorrentTrackers {
@@ -3289,7 +3320,7 @@ impl Engine {
                     .iter()
                     .map(|(info_hash, tx)| (info_hash.clone(), tx.clone()))
                     .collect::<Vec<_>>();
-                tokio::spawn(async move {
+                spawn_engine_query(reply, async move {
                     let results = stream::iter(tasks)
                         .map(|(info_hash, tx)| async move {
                             let (task_reply, task_result) = oneshot::channel();
@@ -3320,8 +3351,7 @@ impl Engine {
                         .buffer_unordered(64)
                         .collect::<Vec<_>>()
                         .await;
-                    let result = results.into_iter().collect::<CmdResult<Vec<_>>>();
-                    let _ = reply.send(result);
+                    results.into_iter().collect::<CmdResult<Vec<_>>>()
                 });
             }
             EngineCmd::GetTorrentLiveStats { info_hashes, reply } => {
@@ -3335,7 +3365,7 @@ impl Engine {
                             .map(|tx| (info_hash, tx))
                     })
                     .collect::<Vec<_>>();
-                tokio::spawn(async move {
+                spawn_engine_query(reply, async move {
                     let results = stream::iter(tasks)
                         .map(|(info_hash, tx)| async move {
                             let (task_reply, task_result) = oneshot::channel();
@@ -3362,15 +3392,14 @@ impl Engine {
                         .buffer_unordered(64)
                         .collect::<Vec<_>>()
                         .await;
-                    let result = Ok(results.into_iter().flatten().collect());
-                    let _ = reply.send(result);
+                    Ok(results.into_iter().flatten().collect())
                 });
             }
             EngineCmd::GetTorrentWebseeds { info_hash, reply } => {
                 if let Some(tx) = self.runtime.torrent_chans.get(&info_hash).cloned() {
-                    tokio::spawn(async move {
+                    spawn_engine_query(reply, async move {
                         let (task_reply, task_result) = oneshot::channel();
-                        let result = match timeout(
+                        match timeout(
                             ENGINE_COMMAND_SEND_TIMEOUT,
                             tx.send(TorrentCmd::GetWebseeds { reply: task_reply }),
                         )
@@ -3384,14 +3413,13 @@ impl Engine {
                                 }
                             }
                             Ok(Err(_)) | Err(_) => Err("torrent task gone or busy".to_owned()),
-                        };
-                        let _ = reply.send(result);
+                        }
                     });
                 } else {
                     let config = Arc::clone(&self.config);
                     let db = self.db_executor();
-                    tokio::spawn(async move {
-                        let result = match tokio::task::spawn_blocking(move || {
+                    spawn_engine_query(reply, async move {
+                        match tokio::task::spawn_blocking(move || {
                             load_torrent_metadata_from_sources(&config, &db, &info_hash)
                         })
                         .await
@@ -3411,31 +3439,25 @@ impl Engine {
                                 })
                                 .map_err(|error| error.to_string()),
                             Err(error) => Err(format!("metadata worker failed: {error}")),
-                        };
-                        let _ = reply.send(result);
+                        }
                     });
                 }
             }
             EngineCmd::GetGlobalLimits { reply } => {
                 let db = self.db_executor();
-                tokio::spawn(async move {
-                    let result = db
-                        .run("get_global_limits", move |db| {
-                            Ok(EngineGlobalLimits {
-                                download_limit: setting_i64_checked(
-                                    db,
-                                    SETTING_GLOBAL_DOWNLOAD_LIMIT,
-                                )?,
-                                upload_limit: setting_i64_checked(db, SETTING_GLOBAL_UPLOAD_LIMIT)?,
-                                speed_limits_mode: setting_bool_checked(
-                                    db,
-                                    SETTING_GLOBAL_SPEED_LIMITS_MODE,
-                                )?,
-                            })
+                spawn_engine_query(reply, async move {
+                    db.run("get_global_limits", move |db| {
+                        Ok(EngineGlobalLimits {
+                            download_limit: setting_i64_checked(db, SETTING_GLOBAL_DOWNLOAD_LIMIT)?,
+                            upload_limit: setting_i64_checked(db, SETTING_GLOBAL_UPLOAD_LIMIT)?,
+                            speed_limits_mode: setting_bool_checked(
+                                db,
+                                SETTING_GLOBAL_SPEED_LIMITS_MODE,
+                            )?,
                         })
-                        .await
-                        .map_err(|error| format!("global limits worker failed: {error}"));
-                    let _ = reply.send(result);
+                    })
+                    .await
+                    .map_err(|error| format!("global limits worker failed: {error}"))
                 });
             }
             EngineCmd::UpdateGlobalLimits { limits, reply } => {
@@ -3455,24 +3477,22 @@ impl Engine {
                     .as_ref()
                     .is_some_and(|tx| !tx.is_closed());
                 let dht_default = self.config.dht.enabled;
-                tokio::spawn(async move {
-                    let result = db
-                        .run("get_network_features", move |db| {
-                            let dht_enabled = setting_bool_with_default_checked(
-                                db,
-                                SETTING_NETWORK_DHT,
-                                dht_default,
-                            )?;
-                            let pex_enabled =
-                                setting_bool_with_default_checked(db, SETTING_NETWORK_PEX, true)?;
-                            Ok(EngineNetworkFeatures {
-                                dht: dht_runtime_enabled && dht_enabled,
-                                pex: pex_enabled,
-                            })
+                spawn_engine_query(reply, async move {
+                    db.run("get_network_features", move |db| {
+                        let dht_enabled = setting_bool_with_default_checked(
+                            db,
+                            SETTING_NETWORK_DHT,
+                            dht_default,
+                        )?;
+                        let pex_enabled =
+                            setting_bool_with_default_checked(db, SETTING_NETWORK_PEX, true)?;
+                        Ok(EngineNetworkFeatures {
+                            dht: dht_runtime_enabled && dht_enabled,
+                            pex: pex_enabled,
                         })
-                        .await
-                        .map_err(|error| format!("network feature worker failed: {error}"));
-                    let _ = reply.send(result);
+                    })
+                    .await
+                    .map_err(|error| format!("network feature worker failed: {error}"))
                 });
             }
             EngineCmd::UpdateNetworkFeatures { features, reply } => {
@@ -3485,15 +3505,13 @@ impl Engine {
             }
             EngineCmd::GetQueuePriority { info_hash, reply } => {
                 let db = self.db_executor();
-                tokio::spawn(async move {
-                    let result = db
-                        .run("get_queue_priority", move |db| {
-                            i32::try_from(setting_i64_checked(db, &queue_setting_key(&info_hash))?)
-                                .map_err(|_| format!("queue position for {info_hash} exceeds i32"))
-                        })
-                        .await
-                        .map_err(|error| format!("queue priority worker failed: {error}"));
-                    let _ = reply.send(result);
+                spawn_engine_query(reply, async move {
+                    db.run("get_queue_priority", move |db| {
+                        i32::try_from(setting_i64_checked(db, &queue_setting_key(&info_hash))?)
+                            .map_err(|_| format!("queue position for {info_hash} exceeds i32"))
+                    })
+                    .await
+                    .map_err(|error| format!("queue priority worker failed: {error}"))
                 });
             }
             EngineCmd::UpdateQueueOrder {
@@ -3551,22 +3569,20 @@ impl Engine {
                 reply,
             } => {
                 let db = self.db_executor();
-                tokio::spawn(async move {
-                    let result = db
-                        .run("list_session_events", move |db| {
-                            rt_db::list_session_events_filtered(
-                                db,
-                                info_hash.as_deref(),
-                                kind.as_deref(),
-                                &levels,
-                                last_known_id,
-                                limit.min(1_000),
-                            )
-                            .map_err(|error| error.to_string())
-                        })
-                        .await
-                        .map_err(|error| format!("session event worker failed: {error}"));
-                    let _ = reply.send(result);
+                spawn_engine_query(reply, async move {
+                    db.run("list_session_events", move |db| {
+                        rt_db::list_session_events_filtered(
+                            db,
+                            info_hash.as_deref(),
+                            kind.as_deref(),
+                            &levels,
+                            last_known_id,
+                            limit.min(1_000),
+                        )
+                        .map_err(|error| error.to_string())
+                    })
+                    .await
+                    .map_err(|error| format!("session event worker failed: {error}"))
                 });
             }
 
