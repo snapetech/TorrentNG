@@ -1055,8 +1055,8 @@ impl EngineHandle {
     }
 
     /// Ban peer endpoints in the engine-owned policy set. The set is shared
-    /// with every torrent task, so a ban applies immediately to active tasks
-    /// and to incoming connections that would otherwise trigger promotion.
+    /// with every torrent task, so a ban applies to incoming connections that
+    /// would otherwise trigger promotion and schedules active-peer eviction.
     pub async fn ban_peers(&self, peers: Vec<SocketAddr>) -> CmdResult<()> {
         validate_peer_command_len(peers.len(), MAX_BANNED_PEERS, "peer ban list")?;
         let (reply, rx) = tokio::sync::oneshot::channel();
@@ -1638,6 +1638,7 @@ impl Engine {
         config: Arc<Config>,
         registry: Arc<RwLock<SessionRegistry>>,
     ) -> anyhow::Result<EngineHandle> {
+        config.validate().context("invalid engine configuration")?;
         let (tx, cmd_rx) = mpsc::channel(64);
         let alive = Arc::new(AtomicBool::new(true));
         let storage_frame_cap_bytes = config
@@ -2319,7 +2320,7 @@ impl Engine {
                     Ok(())
                 } else {
                     let accepted_for_db = accepted.clone();
-                    let mut result = self
+                    let result = self
                         .run_db("ban_peers", move |db| {
                             let tx = db.transaction().map_err(|error| error.to_string())?;
                             rt_db::insert_peer_bans_in_tx(&tx, &accepted_for_db, unix_now_i64())
@@ -2332,34 +2333,21 @@ impl Engine {
                             .write()
                             .await
                             .ban_peers(accepted.iter().copied());
-                        // A ban is not effective if an already-connected peer
-                        // remains in a torrent task. Admission checks cover
-                        // future connections; this fan-out evicts the current
-                        // session and releases its scheduler/peer permit.
-                        let mut delivery_failures = 0usize;
-                        let mut first_delivery_error = None;
-                        for peer in accepted.iter().copied() {
-                            for tx in self.runtime.torrent_chans.values() {
-                                if let Err(error) = tx.try_send(TorrentCmd::BanPeer(peer)) {
-                                    delivery_failures = delivery_failures.saturating_add(1);
-                                    first_delivery_error.get_or_insert_with(|| error.to_string());
-                                    debug!(
-                                        component = "engine",
-                                        operation = "evict_banned_peer",
-                                        peer = %peer,
-                                        result = "not_delivered",
-                                        error = %error,
-                                        "could not deliver active-peer ban to torrent task"
-                                    );
-                                }
+                        // The registry is authoritative and each torrent task
+                        // also checks it on a timer. A full mailbox must not
+                        // turn a committed ban into an API error; enqueue one
+                        // coalesced recheck per task when possible and let the
+                        // periodic pass cover a saturated mailbox.
+                        for tx in self.runtime.torrent_chans.values() {
+                            if let Err(error) = tx.try_send(TorrentCmd::EvictBannedPeers) {
+                                debug!(
+                                    component = "engine",
+                                    operation = "evict_banned_peers",
+                                    result = "deferred",
+                                    error = %error,
+                                    "torrent task mailbox was full; ban eviction will be retried"
+                                );
                             }
-                        }
-                        if delivery_failures > 0 {
-                            result = Err(format!(
-                                "peer ban persisted but was not delivered to {delivery_failures} active torrent task command(s); first error: {}",
-                                first_delivery_error
-                                    .unwrap_or_else(|| "unknown delivery failure".to_owned())
-                            ));
                         }
                     }
                     result

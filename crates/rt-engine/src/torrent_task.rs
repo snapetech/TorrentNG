@@ -342,6 +342,10 @@ pub enum TorrentCmd {
     /// Admission checks prevent future connections; this command closes an
     /// already-connected session and releases its piece/request state too.
     BanPeer(SocketAddr),
+    /// Re-check the shared ban policy and evict every matching active peer.
+    /// The command is intentionally payload-free so one ban request does not
+    /// multiply by the number of newly banned endpoints and torrent tasks.
+    EvictBannedPeers,
     GetPeers {
         reply: oneshot::Sender<Vec<EnginePeerSnapshot>>,
     },
@@ -1550,6 +1554,9 @@ impl TorrentTask {
                         }
                         TorrentCmd::BanPeer(peer) => {
                             self.evict_peer(peer);
+                        }
+                        TorrentCmd::EvictBannedPeers => {
+                            self.evict_banned_peers().await;
                         }
                         TorrentCmd::GetPeers { reply } => {
                             let _ = reply.send(self.peer_snapshots());
@@ -3559,17 +3566,17 @@ impl TorrentTask {
     /// authoritative policy on a timer so an active connection is eventually
     /// evicted even if the best-effort control message was not enqueued.
     async fn evict_banned_peers(&mut self) {
-        let banned = self.registry.read().await.banned_peers();
-        if banned.is_empty() || self.active_peers.is_empty() {
+        if self.active_peers.is_empty() {
             return;
         }
-        let banned = banned.into_iter().collect::<HashSet<_>>();
+        let registry = self.registry.read().await;
         let victims = self
             .active_peers
             .keys()
             .copied()
-            .filter(|peer| banned.contains(peer))
+            .filter(|peer| registry.is_peer_banned(*peer))
             .collect::<Vec<_>>();
+        drop(registry);
         for peer in victims {
             self.evict_peer(peer);
         }
@@ -4511,6 +4518,9 @@ impl TorrentTask {
                 Ok(TorrentCmd::PriorityPeers(_)) => {}
                 Ok(TorrentCmd::BanPeer(peer)) => {
                     self.evict_peer(peer);
+                }
+                Ok(TorrentCmd::EvictBannedPeers) => {
+                    self.evict_banned_peers().await;
                 }
                 Ok(TorrentCmd::GetPeers { reply }) => {
                     let _ = reply.send(Vec::new());

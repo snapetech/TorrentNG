@@ -49,6 +49,7 @@ const MAX_TORRENT_LIST_OFFSET: usize = 1_000_000;
 const QBIT_LIST_INITIAL_CAPACITY: usize = 256;
 const QBIT_LIMIT_PROJECTION_CONCURRENCY: usize = 64;
 const QBIT_LIVE_PROJECTION_CONCURRENCY: usize = 64;
+const MAX_QBIT_MUTATION_ITEMS: usize = 16_384;
 
 // These compatibility settings are deliberately separate from the engine's
 // runtime settings.  They are qBittorrent WebUI state, not TorrentNG-client transport
@@ -4505,11 +4506,21 @@ fn required_strict_qbit_list(
     key: &str,
 ) -> Result<Vec<String>, StatusCode> {
     let raw = params.get(key).ok_or(StatusCode::BAD_REQUEST)?;
-    let values = raw.split(['|', ',']).map(str::trim).collect::<Vec<_>>();
-    if values.is_empty() || values.iter().any(|value| value.is_empty()) {
+    let mut values = Vec::new();
+    for value in raw.split(['|', ',']) {
+        if values.len() >= MAX_QBIT_MUTATION_ITEMS {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        values.push(value.to_owned());
+    }
+    if values.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
-    Ok(values.into_iter().map(str::to_owned).collect())
+    Ok(values)
 }
 
 fn now_secs() -> i64 {
@@ -4550,7 +4561,10 @@ fn strict_hashes_from_str(raw: &str) -> Option<Vec<String>> {
         return Some(vec!["all".to_owned()]);
     }
     let mut hashes = Vec::new();
-    for hash in raw.split('|') {
+    for (index, hash) in raw.split('|').enumerate() {
+        if index >= MAX_QBIT_MUTATION_ITEMS {
+            return None;
+        }
         let hash = hash.trim();
         if hash.is_empty() || hash == "all" {
             return None;
@@ -4565,11 +4579,21 @@ fn required_text_list(
     key: &str,
 ) -> Result<Vec<String>, StatusCode> {
     let raw = params.get(key).ok_or(StatusCode::BAD_REQUEST)?;
-    let values = raw.split('|').map(str::trim).collect::<Vec<_>>();
-    if values.is_empty() || values.iter().any(|value| value.is_empty()) {
+    let mut values = Vec::new();
+    for value in raw.split('|') {
+        if values.len() >= MAX_QBIT_MUTATION_ITEMS {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        values.push(value.to_owned());
+    }
+    if values.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
-    Ok(values.into_iter().map(str::to_owned).collect())
+    Ok(values)
 }
 
 fn required_strict_tag_list(
@@ -4582,14 +4606,17 @@ fn required_strict_tag_list(
 }
 
 fn strict_numeric_list(raw: &str) -> Result<Vec<u32>, ()> {
-    let values = raw.split('|').collect::<Vec<_>>();
-    if values.is_empty() || values.iter().any(|value| value.trim().is_empty()) {
+    let mut values = Vec::new();
+    for (index, value) in raw.split('|').enumerate() {
+        if index >= MAX_QBIT_MUTATION_ITEMS || value.trim().is_empty() {
+            return Err(());
+        }
+        values.push(value.trim().parse::<u32>().map_err(|_| ())?);
+    }
+    if values.is_empty() {
         return Err(());
     }
-    values
-        .into_iter()
-        .map(|value| value.trim().parse::<u32>().map_err(|_| ()))
-        .collect()
+    Ok(values)
 }
 
 fn torrent_progress(total_length: u64, amount_left: u64, complete: bool) -> f64 {
@@ -5521,11 +5548,18 @@ fn strict_tag_values(tags: &str, allow_empty: bool) -> Result<Vec<String>, ()> {
     if tags.trim().is_empty() {
         return if allow_empty { Ok(Vec::new()) } else { Err(()) };
     }
-    let values = tags.split(',').map(str::trim).collect::<Vec<_>>();
-    if values.iter().any(|value| value.is_empty()) {
-        return Err(());
+    let mut values = Vec::new();
+    for (index, value) in tags.split(',').enumerate() {
+        if index >= MAX_QBIT_MUTATION_ITEMS {
+            return Err(());
+        }
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(());
+        }
+        values.push(value.to_owned());
     }
-    Ok(values.into_iter().map(str::to_owned).collect())
+    Ok(values)
 }
 
 #[cfg(test)]
@@ -5541,16 +5575,23 @@ fn split_tracker_values(values: &str) -> Vec<String> {
 
 fn strict_tracker_values(values: &str) -> Result<Vec<String>, ()> {
     let normalized = values.replace("\r\n", "\n").replace('\r', "\n");
-    let values = normalized
-        .split(['|', '\n'])
-        .map(str::trim)
-        .collect::<Vec<_>>();
-    if values.is_empty() || values.iter().any(|value| value.is_empty()) {
+    let mut parsed = Vec::new();
+    for line in normalized.split('\n') {
+        for value in line.split('|') {
+            if parsed.len() >= MAX_QBIT_MUTATION_ITEMS {
+                return Err(());
+            }
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(());
+            }
+            parsed.push(value.to_owned());
+        }
+    }
+    if parsed.is_empty() {
         return Err(());
     }
-    Ok(normalize_tracker_values(
-        values.into_iter().map(str::to_owned).collect(),
-    ))
+    Ok(normalize_tracker_values(parsed))
 }
 
 fn normalize_tracker_values(values: Vec<String>) -> Vec<String> {
@@ -8758,6 +8799,26 @@ mod tests {
         );
         assert!(strict_tag_values("", false).is_err());
         assert!(strict_tag_values("", true).unwrap().is_empty());
+    }
+
+    #[test]
+    fn strict_mutation_parsers_reject_oversized_lists_before_collecting_them() {
+        let values = std::iter::repeat_n("value", MAX_QBIT_MUTATION_ITEMS + 1).collect::<Vec<_>>();
+        let joined = values.join("|");
+        assert!(strict_hashes_from_str(&joined).is_none());
+        assert!(strict_numeric_list(&joined).is_err());
+        assert!(strict_tracker_values(&joined).is_err());
+        assert!(required_text_list(
+            &HashMap::from([(String::from("values"), joined.clone())]),
+            "values"
+        )
+        .is_err());
+        assert!(strict_tag_values(&joined.replace('|', ","), false).is_err());
+        assert!(required_strict_qbit_list(
+            &HashMap::from([(String::from("values"), joined)]),
+            "values"
+        )
+        .is_err());
     }
 
     #[test]

@@ -36,6 +36,11 @@ pub struct Config {
     pub logging: rt_logging::LoggingConfig,
 }
 
+// Tokio semaphores reserve three bits for internal bookkeeping. Keep the
+// configuration boundary aligned with that runtime limit so an invalid peer
+// budget is reported as a config error instead of panicking during startup.
+const MAX_SEMAPHORE_PERMITS: usize = usize::MAX >> 3;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DaemonConfig {
@@ -360,8 +365,16 @@ impl Config {
             "network.max_peers must be greater than zero",
         )?;
         require(
+            self.network.max_peers <= MAX_SEMAPHORE_PERMITS,
+            format!("network.max_peers must be <= {MAX_SEMAPHORE_PERMITS}"),
+        )?;
+        require(
             self.network.max_incoming_handshakes > 0,
             "network.max_incoming_handshakes must be greater than zero",
+        )?;
+        require(
+            self.network.max_incoming_handshakes <= MAX_SEMAPHORE_PERMITS,
+            format!("network.max_incoming_handshakes must be <= {MAX_SEMAPHORE_PERMITS}"),
         )?;
         require(
             self.network.max_incoming_handshakes_per_ip > 0,
@@ -398,6 +411,10 @@ impl Config {
         require(
             self.storage.io_queue_depth > 0,
             "storage.io_queue_depth must be greater than zero",
+        )?;
+        require(
+            self.storage.io_queue_depth <= MAX_SEMAPHORE_PERMITS,
+            format!("storage.io_queue_depth must be <= {MAX_SEMAPHORE_PERMITS}"),
         )?;
         require(
             self.storage.hash_worker_threads > 0,
@@ -695,6 +712,18 @@ mod tests {
 
         let mut c = Config::default();
         c.network.max_incoming_handshakes = 0;
+        assert!(matches!(c.validate(), Err(ConfigError::Validation(_))));
+
+        let mut c = Config::default();
+        c.network.max_peers = usize::MAX;
+        assert!(matches!(c.validate(), Err(ConfigError::Validation(_))));
+
+        let mut c = Config::default();
+        c.network.max_incoming_handshakes = usize::MAX;
+        assert!(matches!(c.validate(), Err(ConfigError::Validation(_))));
+
+        let mut c = Config::default();
+        c.storage.io_queue_depth = usize::MAX;
         assert!(matches!(c.validate(), Err(ConfigError::Validation(_))));
 
         let mut c = Config::default();

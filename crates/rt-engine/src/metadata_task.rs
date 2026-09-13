@@ -301,7 +301,8 @@ pub async fn run_metadata_task(
                     TorrentCmd::Recheck { .. }
                     | TorrentCmd::CancelJob { .. }
                     | TorrentCmd::UpdatePeerExchange(_)
-                    | TorrentCmd::BanPeer(_) => {}
+                    | TorrentCmd::BanPeer(_)
+                    | TorrentCmd::EvictBannedPeers => {}
                     TorrentCmd::ReloadFilePolicy { reply } => {
                         if let Some(reply) = reply {
                             let _ = reply.send(Ok(()));
@@ -461,7 +462,8 @@ async fn wait_for_metadata_completion(cmd_rx: &mut mpsc::Receiver<TorrentCmd>, m
             | TorrentCmd::NewPeers(_)
             | TorrentCmd::PriorityPeers(_)
             | TorrentCmd::UpdatePeerExchange(_)
-            | TorrentCmd::BanPeer(_) => {}
+            | TorrentCmd::BanPeer(_)
+            | TorrentCmd::EvictBannedPeers => {}
         }
     }
 }

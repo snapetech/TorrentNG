@@ -2,6 +2,7 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     convert::Infallible,
+    marker::PhantomData,
     net::SocketAddr,
     path::PathBuf,
     sync::Arc,
@@ -61,6 +62,7 @@ const SETTING_NATIVE_WORKFLOW_RUNS: &str = "native.workflow_runs";
 const MAX_NATIVE_JSON_BYTES: usize = 1024 * 1024;
 const MAX_NATIVE_JSON_ENTRIES: usize = 4096;
 const MAX_NATIVE_WORKFLOW_RUNS: usize = 200;
+const MAX_NATIVE_MUTATION_ITEMS: usize = 16_384;
 
 #[derive(Debug, Clone, Copy, Default)]
 struct MetricsHealth {
@@ -1039,6 +1041,7 @@ pub struct AddTorrentPeersRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct QueueOrderRequest {
+    #[serde(deserialize_with = "deserialize_bounded_vec")]
     pub hashes: Vec<String>,
     #[serde(rename = "move")]
     pub queue_move: String,
@@ -1087,6 +1090,48 @@ where
     }
 
     deserializer.deserialize_seq(PeerListVisitor)
+}
+
+fn deserialize_bounded_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct BoundedVecVisitor<T>(PhantomData<T>);
+
+    impl<'de, T> Visitor<'de> for BoundedVecVisitor<T>
+    where
+        T: Deserialize<'de>,
+    {
+        type Value = Vec<T>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a bounded array")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut values = Vec::with_capacity(
+                sequence
+                    .size_hint()
+                    .unwrap_or_default()
+                    .min(MAX_NATIVE_MUTATION_ITEMS),
+            );
+            while let Some(value) = sequence.next_element::<T>()? {
+                if values.len() >= MAX_NATIVE_MUTATION_ITEMS {
+                    return Err(de::Error::custom(format!(
+                        "array exceeds maximum of {MAX_NATIVE_MUTATION_ITEMS} items"
+                    )));
+                }
+                values.push(value);
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedVecVisitor(PhantomData))
 }
 
 #[derive(Debug, Serialize)]
@@ -1658,9 +1703,9 @@ fn nullable_f64(value: serde_json::Value, field: &str) -> Result<Option<f64>, St
 
 #[derive(Debug, Deserialize)]
 pub struct PatchTagsRequest {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bounded_vec")]
     pub add: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bounded_vec")]
     pub remove: Vec<String>,
 }
 
@@ -1807,7 +1852,7 @@ pub struct FilePriorityPatchItem {
 
 #[derive(Debug, Deserialize)]
 pub struct PatchFilesRequest {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bounded_vec")]
     pub files: Vec<FilePriorityPatchItem>,
 }
 
@@ -1915,11 +1960,11 @@ pub struct TrackerEditPatchItem {
 
 #[derive(Debug, Deserialize)]
 pub struct PatchTrackersRequest {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bounded_vec")]
     pub add: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bounded_vec")]
     pub remove: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bounded_vec")]
     pub edit: Vec<TrackerEditPatchItem>,
 }
 
@@ -1996,9 +2041,12 @@ pub struct StoragePlanRequest {
     hardlink_or_copy: Option<bool>,
     dry_run: Option<bool>,
     dry_run_approved: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_bounded_optional_vec")]
     affected_torrents: Option<Vec<String>>,
     #[allow(dead_code)]
+    #[serde(default, deserialize_with = "deserialize_bounded_optional_vec")]
     roots: Option<Vec<PathBuf>>,
+    #[serde(default, deserialize_with = "deserialize_bounded_optional_vec")]
     completed_steps: Option<Vec<usize>>,
 }
 
@@ -2089,10 +2137,12 @@ pub struct TagRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct BulkRequest {
+    #[serde(deserialize_with = "deserialize_bounded_vec")]
     hashes: Vec<String>,
     dry_run: Option<bool>,
     category: Option<String>,
     save_path: Option<PathBuf>,
+    #[serde(default, deserialize_with = "deserialize_bounded_optional_vec")]
     tags: Option<Vec<String>>,
 }
 
@@ -2105,7 +2155,9 @@ pub struct BulkResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct CrossSeedRequest {
+    #[serde(deserialize_with = "deserialize_bounded_vec")]
     hashes: Vec<String>,
+    #[serde(deserialize_with = "deserialize_bounded_vec")]
     trackers: Vec<String>,
     reannounce: Option<bool>,
     dry_run: Option<bool>,
@@ -2118,7 +2170,43 @@ pub struct UserAgentRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct TagsRequest {
+    #[serde(deserialize_with = "deserialize_bounded_vec")]
     tags: Vec<String>,
+}
+
+fn deserialize_bounded_optional_vec<'de, D, T>(deserializer: D) -> Result<Option<Vec<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct BoundedOptionalVecVisitor<T>(PhantomData<T>);
+
+    impl<'de, T> Visitor<'de> for BoundedOptionalVecVisitor<T>
+    where
+        T: Deserialize<'de>,
+    {
+        type Value = Option<Vec<T>>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("null or a bounded array")
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_some<D2>(self, deserializer: D2) -> Result<Self::Value, D2::Error>
+        where
+            D2: Deserializer<'de>,
+        {
+            deserialize_bounded_vec(deserializer).map(Some)
+        }
+    }
+
+    deserializer.deserialize_option(BoundedOptionalVecVisitor(PhantomData))
 }
 
 #[derive(Debug, Serialize)]
