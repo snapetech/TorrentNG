@@ -1,5 +1,5 @@
-use sha1::{Digest, Sha1};
-use sha2::Sha256;
+use sha1::{Digest as Sha1Digest, Sha1};
+use sha2::{Digest as Sha2Digest, Sha256};
 
 use rt_bencode::{decode_torrent_info_span, BValue};
 use rt_path::SafeRelPath;
