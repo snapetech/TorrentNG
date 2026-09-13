@@ -629,9 +629,9 @@ sync-loop counters because it polls the selected client adapter.
 | `torrentng_storage_sparse_*` | counter | Sparse recheck data extents, skipped hole bytes, and seek fallback count |
 | `torrentng_piece_assembly_*` | gauge/counter | In-memory completed-piece assembly buffers, bytes, governor-denied allocations, and budget evictions |
 | `torrentng_peer_request_window_reductions_total` | counter | Peer request refills reduced because memory pressure limited in-flight piece data |
-| `torrentng_peer_{rx,tx}_buffer_bytes` | gauge | Process-owned peer buffer pressure from outstanding receive requests and upload buffers; upload block assembly and queued peer bitfields are also charged to the `peer_buffer` memory class while in flight |
+| `torrentng_peer_{rx,tx}_buffer_bytes` | gauge | Process-owned peer buffer pressure from outstanding receive requests and upload buffers; upload block assembly, queued peer bitfields, received blocks, and PEX address vectors are also charged to the `peer_buffer` memory class while in flight |
 | `torrentng_peer_command_queue_*` | gauge/counter | Active peer command queue capacity, depth, and full-send backpressure events |
-| `torrentng_tracker_peer_cache_*` | gauge/counter | Tracker peer addresses retained or dropped by bounded per-torrent peer caches |
+| `torrentng_tracker_peer_cache_*` | gauge/counter | Tracker peer addresses retained under the bounded `tracker_peers` memory class or dropped when the count/budget is exhausted |
 | `torrentng_hot_torrent_memory_estimated_bytes{rank,info_hash}` | gauge | Top active torrents by estimated process-owned memory, capped to the largest ten torrents |
 | `torrentng_hot_torrent_piece_assembly_bytes{rank,info_hash}` | gauge | Piece-assembly portion of each hot-torrent memory estimate |
 | `torrentng_hot_torrent_peer_buffer_bytes{rank,info_hash}` | gauge | Peer rx/tx buffer portion of each hot-torrent memory estimate |

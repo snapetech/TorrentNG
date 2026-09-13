@@ -209,6 +209,8 @@ Concerns:
 Required patch direction:
 
 - Keep packed peer bitmap storage and add coverage for cap rejection and large-piece-count profiles.
+- Cache the exact BEP 9 upload metadata once per torrent, share it across peers, and keep its backing bytes under the metadata governor class.
+- Pre-size the tracker peer cache once per torrent, remove the duplicate private-torrent allowlist storage, and retain its reservation under MemoryClass::TrackerPeers.
 - Add per-torrent configurable event channel capacity.
 - Charge any remaining variable peer request/command storage to `MemoryClass::PeerBuffer` or a new peer-state class if measurement shows the current capacity estimate is insufficient.
 - Make request pipeline adapt to total ResourceGovernor pressure, not only piece assembly bytes.

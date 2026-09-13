@@ -35,7 +35,7 @@ pub(crate) fn manual_recovery_reason(error: impl Into<String>) -> String {
     if error.starts_with(STORAGE_MANUAL_RECOVERY_PREFIX) {
         error
     } else {
-        format!("{}{}", STORAGE_MANUAL_RECOVERY_PREFIX, error)
+        format!("{STORAGE_MANUAL_RECOVERY_PREFIX}{error}")
     }
 }
 

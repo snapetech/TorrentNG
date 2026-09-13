@@ -10135,10 +10135,13 @@ impl Engine {
             .saturating_add(stats.peer_tx_buffer_bytes)
             .saturating_add(stats.peer_command_queue_bytes);
         let tracker_peers = MemoryClass::TrackerPeers as usize;
-        resources.classes[tracker_peers].used_bytes = stats.tracker_peer_cache_bytes;
-        resources.classes[tracker_peers].denied_allocations = resources.classes[tracker_peers]
-            .denied_allocations
-            .saturating_add(stats.tracker_peer_cache_drops);
+        // Live tracker caches now own governor leases. Keep the larger of
+        // that authoritative live total and the collected runtime estimate
+        // so a slow stats reply cannot hide retained cache memory without
+        // double-counting the same bytes.
+        resources.classes[tracker_peers].used_bytes = resources.classes[tracker_peers]
+            .used_bytes
+            .max(stats.tracker_peer_cache_bytes);
         let dht_table = MemoryClass::DhtTable as usize;
         resources.classes[dht_table].used_bytes = stats
             .dht_routing_nodes
@@ -12855,10 +12858,12 @@ fn finalize_engine_stats_resources(
         .saturating_add(stats.peer_tx_buffer_bytes)
         .saturating_add(stats.peer_command_queue_bytes);
     let tracker_peers = MemoryClass::TrackerPeers as usize;
-    resources.classes[tracker_peers].used_bytes = stats.tracker_peer_cache_bytes;
-    resources.classes[tracker_peers].denied_allocations = resources.classes[tracker_peers]
-        .denied_allocations
-        .saturating_add(stats.tracker_peer_cache_drops);
+    // Live tracker caches now own governor leases. Keep the larger of that
+    // authoritative live total and the collected runtime estimate so a slow
+    // stats reply cannot hide retained cache memory without double-counting.
+    resources.classes[tracker_peers].used_bytes = resources.classes[tracker_peers]
+        .used_bytes
+        .max(stats.tracker_peer_cache_bytes);
     let dht_table = MemoryClass::DhtTable as usize;
     resources.classes[dht_table].used_bytes = stats
         .dht_routing_nodes
@@ -21283,7 +21288,7 @@ mod tests {
         );
         assert_eq!(
             resources.classes[MemoryClass::TrackerPeers as usize].denied_allocations,
-            10
+            0
         );
         assert_eq!(
             resources.classes[MemoryClass::DhtTable as usize].used_bytes,

@@ -387,6 +387,11 @@ const PEER_REQUEST_PIPELINE_NORMAL: usize = 32;
 const PEER_REQUEST_PIPELINE_CONSTRAINED: usize = 8;
 const TRACKER_PEER_CACHE_MIN: usize = 256;
 const TRACKER_PEER_CACHE_MULTIPLIER: usize = 4;
+// A HashSet bucket contains the socket address plus control bytes and can
+// round capacity up during allocation. Reserve conservatively for the full
+// bounded cache before accepting any tracker peers so later inserts cannot
+// grow this state outside the governor.
+const TRACKER_PEER_CACHE_BYTES_PER_ENTRY: u64 = 128;
 
 fn effective_piece_assembly_soft_cap(configured_bytes: usize) -> usize {
     configured_bytes.min(MAX_IN_MEMORY_PIECE_ASSEMBLY_BYTES_PER_TORRENT)
@@ -460,6 +465,51 @@ fn reserve_peer_event_bytes(
         .ok_or_else(|| anyhow::anyhow!("peer event allocation of {bytes} bytes denied"))
 }
 
+fn reserve_metadata_payload_bytes(
+    resources: &ResourceGovernor,
+    bytes: usize,
+) -> anyhow::Result<MemoryLease> {
+    let bytes = u64::try_from(bytes)
+        .map_err(|_| anyhow::anyhow!("metadata payload allocation does not fit in u64"))?;
+    resources
+        .try_acquire(MemoryClass::Metadata, bytes)
+        .ok_or_else(|| anyhow::anyhow!("metadata payload allocation of {bytes} bytes denied"))
+}
+
+fn prepare_metadata_payload(
+    resources: &ResourceGovernor,
+    info_hash: &str,
+    raw: &[u8],
+) -> (Option<Arc<Vec<u8>>>, Option<MemoryLease>) {
+    match torrent_info_bytes(raw) {
+        Ok(metadata) => match reserve_metadata_payload_bytes(resources, metadata.len()) {
+            Ok(lease) => (Some(Arc::new(metadata)), Some(lease)),
+            Err(error) => {
+                warn!(
+                    component = "metadata",
+                    operation = "reserve_upload_payload",
+                    torrent = %info_hash,
+                    result = "denied",
+                    error = %error,
+                    "disabling metadata upload because the metadata memory budget is exhausted"
+                );
+                (None, None)
+            }
+        },
+        Err(error) => {
+            warn!(
+                component = "metadata",
+                operation = "extract_upload_payload",
+                torrent = %info_hash,
+                result = "unavailable",
+                error = %error,
+                "disabling metadata upload because the torrent info dictionary is unavailable"
+            );
+            (None, None)
+        }
+    }
+}
+
 fn reserve_piece_assembly_bytes(
     resources: &ResourceGovernor,
     bytes: usize,
@@ -471,19 +521,37 @@ fn reserve_piece_assembly_bytes(
         .ok_or_else(|| anyhow::anyhow!("piece assembly allocation of {bytes} bytes denied"))
 }
 
+fn prepare_tracker_peer_cache(
+    resources: &ResourceGovernor,
+    max_peers: usize,
+) -> (HashSet<SocketAddr>, Option<MemoryLease>) {
+    let capacity = tracker_peer_cache_cap(max_peers);
+    let bytes = u64::try_from(capacity)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(TRACKER_PEER_CACHE_BYTES_PER_ENTRY);
+    let Some(memory_lease) = resources.try_acquire(MemoryClass::TrackerPeers, bytes) else {
+        return (HashSet::new(), None);
+    };
+
+    let mut known = HashSet::new();
+    if known.try_reserve(capacity).is_err() {
+        // The governor lease is dropped with this return value, and the
+        // cache remains disabled rather than allowing an infallible reserve
+        // to turn allocator pressure into a process abort.
+        return (HashSet::new(), None);
+    }
+    (known, Some(memory_lease))
+}
+
+#[cfg(test)]
 fn remember_tracker_peers_bounded(
     known: &mut HashSet<SocketAddr>,
-    allowed_private: &mut HashSet<SocketAddr>,
     peers: &[SocketAddr],
-    private: bool,
     cap: usize,
 ) -> u64 {
     let mut dropped = 0u64;
     for &peer in peers {
         if known.contains(&peer) {
-            if private {
-                allowed_private.insert(peer);
-            }
             continue;
         }
         if known.len() >= cap {
@@ -491,9 +559,6 @@ fn remember_tracker_peers_bounded(
             continue;
         }
         known.insert(peer);
-        if private {
-            allowed_private.insert(peer);
-        }
     }
     dropped
 }
@@ -836,6 +901,12 @@ impl Drop for UploadReadTasks {
 pub struct TorrentTask {
     info_hash_hex: String,
     meta: TorrentMetaV1,
+    /// Exact bencoded `info` bytes used for BEP 9 upload responses. This is
+    /// shared by every peer instead of being rebuilt and copied per
+    /// connection. The allocation is retained under the metadata budget for
+    /// the lifetime of the torrent task.
+    metadata: Option<Arc<Vec<u8>>>,
+    _metadata_memory_lease: Option<MemoryLease>,
     /// The immutable paths from the metainfo. `meta.files` is the runtime
     /// projection and may carry durable client-side rename overrides; keeping
     /// the wire paths lets a policy reload recover cleanly if the file
@@ -868,7 +939,10 @@ pub struct TorrentTask {
     /// active peer addresses
     active_peers: HashMap<SocketAddr, PeerHandle>,
     known_tracker_peers: HashSet<SocketAddr>,
-    allowed_private_peers: HashSet<SocketAddr>,
+    /// The cache is pre-sized and its reservation covers the hash table's
+    /// bounded capacity for the task lifetime. This prevents tracker, DHT,
+    /// PEX, and manual peer churn from growing an ungoverned address cache.
+    _tracker_peer_cache_memory_lease: Option<MemoryLease>,
     last_peerless_reannounce: Option<Instant>,
     egress_policy: OutboundEgressPolicy,
     webseed_next_index: usize,
@@ -988,6 +1062,19 @@ impl TorrentTask {
         let picker = PiecePicker::new(piece_count, meta.piece_length as u32, last_piece_len as u32);
         let info_hash_hex: String = meta.info_hash.iter().map(|b| format!("{b:02x}")).collect();
         let metainfo_files = meta.files.clone();
+        let (metadata, metadata_memory_lease) =
+            prepare_metadata_payload(&resources, &info_hash_hex, &meta.raw);
+        let (known_tracker_peers, tracker_peer_cache_memory_lease) =
+            prepare_tracker_peer_cache(&resources, max_peers);
+        if tracker_peer_cache_memory_lease.is_none() {
+            warn!(
+                component = "memory",
+                operation = "reserve_tracker_peer_cache",
+                torrent = %info_hash_hex,
+                result = "disabled",
+                "tracker peer cache disabled because its memory budget or allocator reserve was unavailable"
+            );
+        }
         let piece_map = build_piece_map(meta.piece_length, &meta.files)
             .expect("metainfo parser rejects invalid piece maps");
         let storage = MountScheduler::new_for_path(
@@ -1046,6 +1133,8 @@ impl TorrentTask {
         let mut task = TorrentTask {
             info_hash_hex,
             meta,
+            metadata,
+            _metadata_memory_lease: metadata_memory_lease,
             metainfo_files,
             save_root,
             piece_map,
@@ -1073,8 +1162,8 @@ impl TorrentTask {
             picker,
             choker: Choker::new(DEFAULT_MAX_UNCHOKED),
             active_peers: HashMap::new(),
-            known_tracker_peers: HashSet::new(),
-            allowed_private_peers: HashSet::new(),
+            known_tracker_peers,
+            _tracker_peer_cache_memory_lease: tracker_peer_cache_memory_lease,
             last_peerless_reannounce: None,
             egress_policy,
             webseed_next_index: 0,
@@ -1196,18 +1285,16 @@ impl TorrentTask {
                 );
                 return;
             }
-        } else {
-            if let Err(error) = self.set_state_checked(TorrentState::Downloading).await {
-                warn!(
-                    component = "torrent",
-                    operation = "startup_state",
-                    torrent = %self.info_hash_hex,
-                    result = "error",
-                    error = %error,
-                    "failed to persist downloading startup state; stopping task"
-                );
-                return;
-            }
+        } else if let Err(error) = self.set_state_checked(TorrentState::Downloading).await {
+            warn!(
+                component = "torrent",
+                operation = "startup_state",
+                torrent = %self.info_hash_hex,
+                result = "error",
+                error = %error,
+                "failed to persist downloading startup state; stopping task"
+            );
+            return;
         }
 
         let mut choke_tick = interval(Duration::from_secs(10));
@@ -2292,7 +2379,7 @@ impl TorrentTask {
             resources: self.resources.clone(),
             have_pieces,
             _bitmap_memory_lease: Some(bitmap_memory_lease),
-            metadata: torrent_info_bytes(&self.meta.raw).ok().map(Arc::new),
+            metadata: self.metadata.clone(),
             is_private: self.meta.private,
             pex_enabled: self.pex_enabled,
             upload_limit_bytes_per_sec: self.upload_limit_bytes_per_sec,
@@ -2456,8 +2543,10 @@ impl TorrentTask {
                     )
             })
             .sum::<u64>();
-        let tracker_peer_cache_bytes = (self.known_tracker_peers.capacity() as u64)
-            .saturating_mul(std::mem::size_of::<SocketAddr>() as u64);
+        let tracker_peer_cache_bytes = self
+            ._tracker_peer_cache_memory_lease
+            .as_ref()
+            .map_or(0, MemoryLease::bytes);
         let (download_rate, upload_rate) = self
             .active_peers
             .values()
@@ -2502,13 +2591,23 @@ impl TorrentTask {
     }
 
     fn remember_tracker_peers(&mut self, peers: &[SocketAddr]) {
-        let dropped = remember_tracker_peers_bounded(
-            &mut self.known_tracker_peers,
-            &mut self.allowed_private_peers,
-            peers,
-            self.meta.private,
-            tracker_peer_cache_cap(self.max_peers),
-        );
+        let cap = tracker_peer_cache_cap(self.max_peers);
+        let mut dropped = 0u64;
+        for &peer in peers {
+            if self.known_tracker_peers.contains(&peer) {
+                continue;
+            }
+            if self._tracker_peer_cache_memory_lease.is_none()
+                || self.known_tracker_peers.len() >= cap
+            {
+                dropped = dropped.saturating_add(1);
+                continue;
+            }
+            // prepare_tracker_peer_cache reserved the full capacity before
+            // this task could receive peers, so this insert cannot trigger a
+            // new allocation.
+            self.known_tracker_peers.insert(peer);
+        }
         self.tracker_peer_cache_drops = self.tracker_peer_cache_drops.saturating_add(dropped);
     }
 
@@ -2754,7 +2853,7 @@ impl TorrentTask {
     }
 
     fn peer_source_allowed(&self, peer: SocketAddr) -> bool {
-        private_peer_source_allowed(self.meta.private, &self.allowed_private_peers, peer)
+        private_peer_source_allowed(self.meta.private, &self.known_tracker_peers, peer)
     }
 
     async fn handle_peer_event(&mut self, event: PeerEvent) {
@@ -2926,7 +3025,6 @@ impl TorrentTask {
                 // may still be valid from our side.
                 for dropped_peer in dropped {
                     self.known_tracker_peers.remove(&dropped_peer);
-                    self.allowed_private_peers.remove(&dropped_peer);
                 }
                 self.connect_peers(peers, PeerSource::PeerExchange).await;
                 debug!(
@@ -9173,6 +9271,33 @@ mod tests {
     }
 
     #[test]
+    fn tracker_peer_cache_reservation_is_owned_until_cache_drop() {
+        let capacity = tracker_peer_cache_cap(1);
+        let bytes = capacity as u64 * TRACKER_PEER_CACHE_BYTES_PER_ENTRY;
+        let mut caps = [0; rt_metrics::MEMORY_CLASS_COUNT];
+        caps[MemoryClass::TrackerPeers as usize] = bytes;
+        let governor = ResourceGovernor::new(rt_metrics::ResourceGovernorConfig {
+            total_cap_bytes: bytes,
+            class_caps_bytes: caps,
+            pressure_constrained_pct: 75,
+            pressure_critical_pct: 90,
+        });
+
+        let (cache, lease) = prepare_tracker_peer_cache(&governor, 1);
+        assert!(cache.capacity() >= capacity);
+        assert_eq!(
+            governor.snapshot().classes[MemoryClass::TrackerPeers as usize].used_bytes,
+            bytes
+        );
+        drop(cache);
+        drop(lease);
+        assert_eq!(
+            governor.snapshot().classes[MemoryClass::TrackerPeers as usize].used_bytes,
+            0
+        );
+    }
+
+    #[test]
     fn webseed_body_reservation_uses_webseed_governor_class() {
         let mut caps = [0; rt_metrics::MEMORY_CLASS_COUNT];
         caps[MemoryClass::WebseedBody as usize] = 16;
@@ -9208,21 +9333,16 @@ mod tests {
             SocketAddr::from(([127, 0, 0, 3], 6881)),
         ];
         let mut known = HashSet::new();
-        let mut allowed_private = HashSet::new();
 
-        let dropped =
-            remember_tracker_peers_bounded(&mut known, &mut allowed_private, &peers, true, 2);
+        let dropped = remember_tracker_peers_bounded(&mut known, &peers, 2);
 
         assert_eq!(known.len(), 2);
-        assert_eq!(allowed_private, known);
         assert_eq!(dropped, 1);
 
         let duplicate = *known.iter().next().unwrap();
-        let dropped =
-            remember_tracker_peers_bounded(&mut known, &mut allowed_private, &[duplicate], true, 2);
+        let dropped = remember_tracker_peers_bounded(&mut known, &[duplicate], 2);
 
         assert_eq!(known.len(), 2);
-        assert_eq!(allowed_private, known);
         assert_eq!(dropped, 0);
     }
 
@@ -9565,6 +9685,50 @@ mod tests {
         assert!(
             Arc::ptr_eq(&shared, &per_peer_a) && Arc::ptr_eq(&per_peer_a, &per_peer_b),
             "every peer's piece_map must point at the exact same allocation"
+        );
+    }
+
+    #[test]
+    fn metadata_upload_payload_is_shared_and_budgeted_per_torrent() {
+        let pieces = [0_u8; 20];
+        let mut info_pairs: Vec<(&[u8], BValue<'_>)> = vec![
+            (b"length", BValue::Int(4)),
+            (b"name", BValue::Bytes(b"a.bin")),
+            (b"piece length", BValue::Int(16_384)),
+            (b"pieces", BValue::Bytes(&pieces)),
+        ];
+        info_pairs.sort_by(|a, b| a.0.cmp(b.0));
+        let raw = rt_bencode::encode(&BValue::Dict(vec![(
+            b"info".as_slice(),
+            BValue::Dict(info_pairs),
+        )]));
+        let payload_len = torrent_info_bytes(&raw).unwrap().len();
+        let mut class_caps_bytes = [0; rt_metrics::MEMORY_CLASS_COUNT];
+        class_caps_bytes[MemoryClass::Metadata as usize] = payload_len as u64;
+        let governor = ResourceGovernor::new(rt_metrics::ResourceGovernorConfig {
+            total_cap_bytes: payload_len as u64,
+            class_caps_bytes,
+            pressure_constrained_pct: 75,
+            pressure_critical_pct: 90,
+        });
+
+        let (metadata, lease) = prepare_metadata_payload(&governor, "a".repeat(40).as_str(), &raw);
+        let metadata = metadata.expect("metadata payload should fit the class budget");
+        let peer_a = metadata.clone();
+        let peer_b = metadata.clone();
+        assert!(Arc::ptr_eq(&metadata, &peer_a));
+        assert!(Arc::ptr_eq(&peer_a, &peer_b));
+        assert_eq!(
+            governor.snapshot().classes[MemoryClass::Metadata as usize].used_bytes,
+            payload_len as u64
+        );
+        drop(peer_a);
+        drop(peer_b);
+        drop(metadata);
+        drop(lease);
+        assert_eq!(
+            governor.snapshot().classes[MemoryClass::Metadata as usize].used_bytes,
+            0
         );
     }
 
