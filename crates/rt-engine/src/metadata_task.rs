@@ -645,7 +645,7 @@ async fn complete_metadata(
 ) -> bool {
     let FetchedMetadata {
         bytes: info,
-        _lease,
+        _lease: metadata_memory_lease,
     } = fetched;
     let raw = build_torrent_from_info(&info, trackers);
     let delivered = crate::engine::send_engine_command_until_delivered(
@@ -653,12 +653,12 @@ async fn complete_metadata(
         EngineCmd::CompleteMagnet {
             info_hash: info_hash_hex.to_owned(),
             raw,
+            metadata_memory_lease,
             source: task_tx.clone(),
         },
         "metadata_completion",
     )
     .await;
-    drop(_lease);
     delivered
 }
 
@@ -1649,12 +1649,18 @@ mod tests {
             .unwrap());
         assert_eq!(
             governor.snapshot().classes[MemoryClass::Metadata as usize].used_bytes,
-            0
+            2 * b"d4:name4:test6:lengthi1ee".len() as u64
         );
+        let completion_command = engine_rx.recv().await;
         assert!(matches!(
-            engine_rx.recv().await,
+            completion_command,
             Some(EngineCmd::CompleteMagnet { .. })
         ));
+        drop(completion_command);
+        assert_eq!(
+            governor.snapshot().classes[MemoryClass::Metadata as usize].used_bytes,
+            0
+        );
     }
 
     #[tokio::test]

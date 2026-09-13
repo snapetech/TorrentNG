@@ -1647,6 +1647,9 @@ pub async fn torrents_add(
         Some(std::path::PathBuf::from(save_path))
     };
     let start_paused = paused || stopped;
+    if url_values.len().saturating_add(torrent_blobs.len()) > MAX_QBIT_MUTATION_ITEMS {
+        return (StatusCode::BAD_REQUEST, "Fails.").into_response();
+    }
 
     for url in url_values {
         if url
@@ -1691,38 +1694,18 @@ pub async fn torrents_add(
                     return (StatusCode::BAD_REQUEST, "Fails.").into_response();
                 }
             };
-            if ratio_limit.is_some_and(|value| value >= 0.0)
-                || seeding_time_limit.is_some_and(|value| value >= 0)
+            if let Err(error) =
+                apply_qbit_add_limits(engine, &hash, ratio_limit, seeding_time_limit).await
             {
-                let mut limits = match engine.torrent_limits(hash.clone()).await {
-                    Ok(limits) => limits,
-                    Err(error) => {
-                        rollback_qbit_added_torrents(engine, &added_hashes).await;
-                        let _ = engine.remove_torrent(hash, false).await;
-                        return qbit_engine_error_status(error).into_response();
-                    }
-                };
-                if let Some(value) = ratio_limit {
-                    limits.seed_ratio_limit = (value >= 0.0).then_some(value);
-                }
-                if let Some(value) = seeding_time_limit {
-                    limits.seed_idle_limit = (value >= 0).then_some(value);
-                }
-                if let Err(error) = engine.update_torrent_limits(hash.clone(), limits).await {
-                    rollback_qbit_added_torrents(engine, &added_hashes).await;
-                    let _ = engine.remove_torrent(hash, false).await;
-                    return qbit_engine_error_status(error).into_response();
-                }
+                rollback_qbit_added_torrents(engine, &added_hashes).await;
+                let _ = engine.remove_torrent(hash, false).await;
+                return qbit_engine_error_status(error).into_response();
             }
             added_hashes.push(hash);
             continue;
         }
-        if torrent_blobs.len() >= MAX_QBIT_MUTATION_ITEMS {
-            rollback_qbit_added_torrents(engine, &added_hashes).await;
-            return (StatusCode::BAD_REQUEST, "Fails.").into_response();
-        }
-        match fetch_torrent_url(url, &state.egress_policy).await {
-            Ok(raw) => torrent_blobs.push(raw),
+        let raw = match fetch_torrent_url(url, &state.egress_policy).await {
+            Ok(raw) => raw,
             Err(e) => {
                 tracing::error!(
                     component = "api",
@@ -1735,7 +1718,38 @@ pub async fn torrents_add(
                 rollback_qbit_added_torrents(engine, &added_hashes).await;
                 return (StatusCode::BAD_REQUEST, "Fails.").into_response();
             }
+        };
+        let hash = match engine
+            .add_torrent_raw_with_labels(
+                raw,
+                save_path.clone(),
+                start_paused,
+                Some(category.clone()),
+                tags.clone(),
+            )
+            .await
+        {
+            Ok(hash) => hash,
+            Err(e) => {
+                tracing::error!(
+                    component = "api",
+                    operation = "add_torrent_url",
+                    result = "error",
+                    error = %e,
+                    "qBit torrent URL add failed"
+                );
+                rollback_qbit_added_torrents(engine, &added_hashes).await;
+                return (StatusCode::BAD_REQUEST, "Fails.").into_response();
+            }
+        };
+        if let Err(error) =
+            apply_qbit_add_limits(engine, &hash, ratio_limit, seeding_time_limit).await
+        {
+            rollback_qbit_added_torrents(engine, &added_hashes).await;
+            let _ = engine.remove_torrent(hash, false).await;
+            return qbit_engine_error_status(error).into_response();
         }
+        added_hashes.push(hash);
     }
 
     if torrent_blobs.is_empty() {
@@ -1769,33 +1783,38 @@ pub async fn torrents_add(
                 return (StatusCode::BAD_REQUEST, "Fails.").into_response();
             }
         };
-        if ratio_limit.is_some_and(|value| value >= 0.0)
-            || seeding_time_limit.is_some_and(|value| value >= 0)
+        if let Err(error) =
+            apply_qbit_add_limits(engine, &hash, ratio_limit, seeding_time_limit).await
         {
-            let mut limits = match engine.torrent_limits(hash.clone()).await {
-                Ok(limits) => limits,
-                Err(error) => {
-                    rollback_qbit_added_torrents(engine, &added_hashes).await;
-                    let _ = engine.remove_torrent(hash, false).await;
-                    return qbit_engine_error_status(error).into_response();
-                }
-            };
-            if let Some(value) = ratio_limit {
-                limits.seed_ratio_limit = (value >= 0.0).then_some(value);
-            }
-            if let Some(value) = seeding_time_limit {
-                limits.seed_idle_limit = (value >= 0).then_some(value);
-            }
-            if let Err(error) = engine.update_torrent_limits(hash.clone(), limits).await {
-                rollback_qbit_added_torrents(engine, &added_hashes).await;
-                let _ = engine.remove_torrent(hash, false).await;
-                return qbit_engine_error_status(error).into_response();
-            }
+            rollback_qbit_added_torrents(engine, &added_hashes).await;
+            let _ = engine.remove_torrent(hash, false).await;
+            return qbit_engine_error_status(error).into_response();
         }
         added_hashes.push(hash);
     }
 
     (StatusCode::OK, "Ok.").into_response()
+}
+
+async fn apply_qbit_add_limits(
+    engine: &rt_engine::EngineHandle,
+    hash: &str,
+    ratio_limit: Option<f64>,
+    seeding_time_limit: Option<i64>,
+) -> Result<(), String> {
+    if ratio_limit.is_none_or(|value| value < 0.0)
+        && seeding_time_limit.is_none_or(|value| value < 0)
+    {
+        return Ok(());
+    }
+    let mut limits = engine.torrent_limits(hash.to_owned()).await?;
+    if let Some(value) = ratio_limit {
+        limits.seed_ratio_limit = (value >= 0.0).then_some(value);
+    }
+    if let Some(value) = seeding_time_limit {
+        limits.seed_idle_limit = (value >= 0).then_some(value);
+    }
+    engine.update_torrent_limits(hash.to_owned(), limits).await
 }
 
 async fn rollback_qbit_added_torrents(engine: &rt_engine::EngineHandle, hashes: &[String]) {

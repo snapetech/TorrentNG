@@ -915,6 +915,7 @@ pub(crate) enum EngineCmd {
     CompleteMagnet {
         info_hash: String,
         raw: Vec<u8>,
+        metadata_memory_lease: MemoryLease,
         source: mpsc::Sender<TorrentCmd>,
     },
     /// Internal completion after magnet metainfo parsing has finished on a
@@ -924,6 +925,7 @@ pub(crate) enum EngineCmd {
         info_hash: String,
         raw: Vec<u8>,
         meta: CmdResult<TorrentMeta>,
+        metadata_memory_lease: MemoryLease,
         source: mpsc::Sender<TorrentCmd>,
     },
     /// Internal completion after the validated magnet blob has been written
@@ -932,6 +934,7 @@ pub(crate) enum EngineCmd {
         info_hash: String,
         meta: CmdResult<TorrentMeta>,
         blob: CmdResult<Option<PathBuf>>,
+        metadata_memory_lease: MemoryLease,
         source: mpsc::Sender<TorrentCmd>,
     },
     /// Internal completion from detached DHT-registration metadata parsing.

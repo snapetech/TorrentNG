@@ -24,8 +24,8 @@ use rt_metainfo::{
     parse_torrent, MagnetLink, TorrentMeta, TorrentMetaV1, TorrentMetaV2, MAX_TORRENT_BYTES,
 };
 use rt_metrics::{
-    MemoryClass, MemoryPressure, ResourceGovernor, ResourceGovernorConfig, ResourceSnapshot,
-    MEMORY_CLASS_COUNT,
+    MemoryClass, MemoryLease, MemoryPressure, ResourceGovernor, ResourceGovernorConfig,
+    ResourceSnapshot, MEMORY_CLASS_COUNT,
 };
 use rt_path::{StorageProfile, StorageRootId};
 use rt_session::{
@@ -2231,6 +2231,7 @@ impl Engine {
             EngineCmd::CompleteMagnet {
                 info_hash,
                 raw,
+                metadata_memory_lease,
                 source,
             } => {
                 if !self.metadata_task_is_current(&info_hash, &source) {
@@ -2268,6 +2269,7 @@ impl Engine {
                             info_hash,
                             raw,
                             meta,
+                            metadata_memory_lease,
                             source,
                         },
                         "magnet_metadata_parse_completion",
@@ -2280,6 +2282,7 @@ impl Engine {
                 info_hash,
                 raw,
                 meta,
+                metadata_memory_lease,
                 source,
             } => {
                 if !self.metadata_task_is_current(&info_hash, &source) {
@@ -2294,9 +2297,14 @@ impl Engine {
                 }
                 match self.ensure_torrent_storage_idle(&info_hash).await {
                     Ok(()) => match self.ensure_torrent_exists(&info_hash).await {
-                        Ok(()) if self.metadata_task_is_current(&info_hash, &source) => {
-                            self.start_magnet_blob_persistence(info_hash, raw, meta, source)
-                        }
+                        Ok(()) if self.metadata_task_is_current(&info_hash, &source) => self
+                            .start_magnet_blob_persistence(
+                                info_hash,
+                                raw,
+                                meta,
+                                metadata_memory_lease,
+                                source,
+                            ),
                         Ok(()) => {
                             warn!(
                                 component = "metadata",
@@ -2320,7 +2328,13 @@ impl Engine {
                         }
                     },
                     Err(error) if is_storage_job_busy_error(&error) => {
-                        self.retry_magnet_metadata_after_storage_job(info_hash, raw, meta, source);
+                        self.retry_magnet_metadata_after_storage_job(
+                            info_hash,
+                            raw,
+                            meta,
+                            metadata_memory_lease,
+                            source,
+                        );
                     }
                     Err(error) => {
                         warn!(
@@ -2340,6 +2354,7 @@ impl Engine {
                 info_hash,
                 meta,
                 blob,
+                metadata_memory_lease,
                 source,
             } => {
                 if !self.metadata_task_is_current(&info_hash, &source) {
@@ -2385,6 +2400,7 @@ impl Engine {
                                 info_hash.clone(),
                                 meta,
                                 staged_blob,
+                                metadata_memory_lease,
                                 source.clone(),
                             );
                         }
@@ -3651,12 +3667,6 @@ impl Engine {
     }
 
     fn start_torrent_add_from_meta(&self, request: TorrentAddRequest) -> bool {
-        let Some(add_guard) = request.add_guard.or_else(try_acquire_engine_add_task) else {
-            let _ = request
-                .reply
-                .send(Err("torrent add preparation capacity exhausted".to_owned()));
-            return false;
-        };
         let TorrentAddRequest {
             meta,
             save_path,
@@ -3664,8 +3674,12 @@ impl Engine {
             category,
             tags,
             reply,
-            add_guard: _,
+            add_guard,
         } = request;
+        let Some(add_guard) = add_guard.or_else(try_acquire_engine_add_task) else {
+            let _ = reply.send(Err("torrent add preparation capacity exhausted".to_owned()));
+            return false;
+        };
         let info_hash = meta_info_hash_hex(&meta);
         let raw = meta_raw(&meta).to_vec();
         let config = Arc::clone(&self.config);
@@ -4005,6 +4019,7 @@ impl Engine {
         info_hash: String,
         raw: Vec<u8>,
         meta: CmdResult<TorrentMeta>,
+        metadata_memory_lease: MemoryLease,
         source: mpsc::Sender<TorrentCmd>,
     ) {
         let config = Arc::clone(&self.config);
@@ -4033,6 +4048,7 @@ impl Engine {
                     info_hash,
                     meta,
                     blob,
+                    metadata_memory_lease,
                     source,
                 },
                 "magnet_blob_completion",
@@ -4051,6 +4067,7 @@ impl Engine {
         info_hash: String,
         raw: Vec<u8>,
         meta: CmdResult<TorrentMeta>,
+        metadata_memory_lease: MemoryLease,
         source: mpsc::Sender<TorrentCmd>,
     ) {
         let cmd_tx = self.cmd_tx.clone();
@@ -4062,6 +4079,7 @@ impl Engine {
                     info_hash,
                     raw,
                     meta,
+                    metadata_memory_lease,
                     source,
                 },
                 "magnet_metadata_storage_retry",
@@ -4075,6 +4093,7 @@ impl Engine {
         info_hash: String,
         meta: TorrentMeta,
         staged_blob: PathBuf,
+        metadata_memory_lease: MemoryLease,
         source: mpsc::Sender<TorrentCmd>,
     ) {
         let cmd_tx = self.cmd_tx.clone();
@@ -4087,6 +4106,7 @@ impl Engine {
                     info_hash,
                     meta: Ok(meta),
                     blob: Ok(Some(staged_blob)),
+                    metadata_memory_lease,
                     source,
                 },
                 "magnet_blob_storage_retry",
@@ -14594,6 +14614,12 @@ mod tests {
         ResourceGovernor::new(ResourceGovernorConfig::default())
     }
 
+    fn test_metadata_lease(bytes: usize) -> MemoryLease {
+        test_resource_governor()
+            .try_acquire(MemoryClass::Metadata, bytes as u64)
+            .expect("test metadata lease should fit")
+    }
+
     fn persist_test_torrent(engine: &Engine, info_hash: &str) {
         let db = engine.db.lock().unwrap();
         rt_db::upsert(
@@ -17223,6 +17249,7 @@ mod tests {
                 info_hash: info_hash.clone(),
                 meta: Ok(meta),
                 blob: Ok(Some(staged_path.clone())),
+                metadata_memory_lease: test_metadata_lease(1),
                 source: old_source,
             })
             .await;
@@ -17333,6 +17360,7 @@ mod tests {
                 info_hash: info_hash.clone(),
                 raw: raw.clone(),
                 meta: Ok(meta),
+                metadata_memory_lease: test_metadata_lease(raw.len().saturating_mul(2)),
                 source,
             })
             .await;
