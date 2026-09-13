@@ -10127,8 +10127,9 @@ impl Engine {
         let piece_assembly = MemoryClass::PieceAssembly as usize;
         resources.classes[piece_assembly].used_bytes = stats.piece_assembly_bytes;
         let peer_buffer = MemoryClass::PeerBuffer as usize;
-        resources.classes[peer_buffer].used_bytes = stats
-            .peer_rx_buffer_bytes
+        let governor_peer_buffer_bytes = resources.classes[peer_buffer].used_bytes;
+        resources.classes[peer_buffer].used_bytes = governor_peer_buffer_bytes
+            .saturating_add(stats.peer_rx_buffer_bytes)
             .saturating_add(stats.peer_tx_buffer_bytes)
             .saturating_add(stats.peer_command_queue_bytes);
         let tracker_peers = MemoryClass::TrackerPeers as usize;
@@ -12840,8 +12841,9 @@ fn finalize_engine_stats_resources(
     let piece_assembly = MemoryClass::PieceAssembly as usize;
     resources.classes[piece_assembly].used_bytes = stats.piece_assembly_bytes;
     let peer_buffer = MemoryClass::PeerBuffer as usize;
-    resources.classes[peer_buffer].used_bytes = stats
-        .peer_rx_buffer_bytes
+    let governor_peer_buffer_bytes = resources.classes[peer_buffer].used_bytes;
+    resources.classes[peer_buffer].used_bytes = governor_peer_buffer_bytes
+        .saturating_add(stats.peer_rx_buffer_bytes)
         .saturating_add(stats.peer_tx_buffer_bytes)
         .saturating_add(stats.peer_command_queue_bytes);
     let tracker_peers = MemoryClass::TrackerPeers as usize;
@@ -21284,6 +21286,29 @@ mod tests {
             stats.storage_queued_disk_bytes
         );
         assert!(resources.total_used_bytes >= 4096);
+    }
+
+    #[test]
+    fn engine_stats_preserve_live_peer_buffer_leases() {
+        let governor = test_resource_governor();
+        let lease = governor
+            .try_acquire(MemoryClass::PeerBuffer, 64)
+            .expect("test peer-buffer lease should fit");
+        let mut stats = EngineStats {
+            peer_rx_buffer_bytes: 1,
+            peer_tx_buffer_bytes: 2,
+            peer_command_queue_bytes: 3,
+            ..Default::default()
+        };
+
+        finalize_engine_stats_resources(&mut stats, governor.snapshot(), 75, 90);
+
+        let resources = stats.resources.expect("resource snapshot");
+        assert_eq!(
+            resources.classes[MemoryClass::PeerBuffer as usize].used_bytes,
+            64 + 1 + 2 + 3
+        );
+        drop(lease);
     }
 
     #[tokio::test]

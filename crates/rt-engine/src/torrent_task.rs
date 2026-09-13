@@ -173,6 +173,29 @@ impl PieceBitmap {
         bitmap
     }
 
+    fn from_bitfield(bits: &[u8], piece_count: usize) -> anyhow::Result<Self> {
+        validate_bitfield_shape(bits, piece_count)?;
+        let mut bitmap = Self::new(piece_count);
+        for (byte_index, byte) in bits.iter().copied().enumerate() {
+            for bit in 0..8 {
+                let piece = byte_index * 8 + bit;
+                if piece >= piece_count {
+                    break;
+                }
+                if byte & (0x80 >> bit) != 0 {
+                    bitmap.set(piece, true);
+                }
+            }
+        }
+        Ok(bitmap)
+    }
+
+    fn memory_bytes(&self) -> u64 {
+        self.words
+            .capacity()
+            .saturating_mul(std::mem::size_of::<u64>()) as u64
+    }
+
     fn len(&self) -> usize {
         self.len
     }
@@ -416,6 +439,16 @@ fn reserve_peer_upload_bytes(
         .ok_or_else(|| anyhow::anyhow!("peer upload buffer allocation of {bytes} bytes denied"))
 }
 
+fn reserve_peer_bitfield_bytes(
+    resources: &ResourceGovernor,
+    pieces: &PieceBitmap,
+) -> anyhow::Result<MemoryLease> {
+    let bytes = pieces.memory_bytes();
+    resources
+        .try_acquire(MemoryClass::PeerBuffer, bytes)
+        .ok_or_else(|| anyhow::anyhow!("peer bitfield allocation of {bytes} bytes denied"))
+}
+
 fn remember_tracker_peers_bounded(
     known: &mut HashSet<SocketAddr>,
     allowed_private: &mut HashSet<SocketAddr>,
@@ -558,7 +591,8 @@ enum PeerEvent {
     Bitfield {
         peer: SocketAddr,
         id: PeerId,
-        pieces: Vec<bool>,
+        pieces: PieceBitmap,
+        _memory_lease: MemoryLease,
     },
     Have {
         peer: SocketAddr,
@@ -662,6 +696,10 @@ struct PeerHandle {
     ut_pex_id: Option<u8>,
     metadata_size: Option<u32>,
     _peer_permit: OwnedSemaphorePermit,
+    /// Dense per-peer availability maps are sized by the torrent's piece
+    /// count. Keep their backing allocation under the process-wide peer
+    /// memory budget for the full lifetime of the peer entry.
+    _bitmap_memory_lease: MemoryLease,
     /// HAVE messages that could not enter the bounded peer mailbox. The
     /// bitmap keeps this retry state bounded by the torrent's piece map and
     /// avoids losing a protocol update when a peer is briefly backlogged.
@@ -682,7 +720,6 @@ enum PeerCommand {
     Shutdown,
 }
 
-#[derive(Clone)]
 struct UploadContext {
     save_root: PathBuf,
     // TNG-014: shared, not owned per peer -- PieceMap's `files: Vec<FileSpan>`
@@ -695,12 +732,23 @@ struct UploadContext {
     storage: MountScheduler,
     resources: ResourceGovernor,
     have_pieces: PieceBitmap,
+    /// The upload-side availability bitmap is one more dense per-peer map.
+    /// Keep its backing allocation charged until the peer task releases it.
+    _bitmap_memory_lease: Option<MemoryLease>,
     metadata: Option<Arc<Vec<u8>>>,
     is_private: bool,
     pex_enabled: bool,
     upload_limit_bytes_per_sec: Option<u64>,
     global_download: Arc<SharedRateLimiter>,
     global_upload: Arc<SharedRateLimiter>,
+}
+
+#[derive(Clone)]
+struct UploadReadContext {
+    save_root: PathBuf,
+    piece_map: Arc<PieceMap>,
+    storage: MountScheduler,
+    resources: ResourceGovernor,
 }
 
 struct LeasedUploadBlock {
@@ -1591,10 +1639,33 @@ impl TorrentTask {
                 break;
             };
             let info_hash = self.meta.info_hash;
-            let (peer_id, peer_cmd_rx) = self.register_peer(addr, peer_permit);
+            let Some((peer_id, peer_cmd_rx)) = self.register_peer(addr, peer_permit) else {
+                debug!(
+                    component = "peer",
+                    operation = "register_outgoing",
+                    torrent = %self.info_hash_hex,
+                    peer = %addr,
+                    result = "rejected",
+                    reason = "peer_state_memory_budget",
+                    "peer state memory budget exhausted"
+                );
+                break;
+            };
             let peer_event_tx = self.peer_event_tx.clone();
             let peer_disconnect_tx = self.peer_disconnect_tx.clone();
-            let upload = self.upload_context(addr);
+            let Some(upload) = self.upload_context(addr) else {
+                self.active_peers.remove(&addr);
+                debug!(
+                    component = "peer",
+                    operation = "allocate_outgoing_state",
+                    torrent = %self.info_hash_hex,
+                    peer = %addr,
+                    result = "rejected",
+                    reason = "peer_state_memory_budget",
+                    "peer state memory budget exhausted"
+                );
+                break;
+            };
             let transport_policy = outgoing_transport_policy_for_peer(
                 outgoing_transport_policy_configured(),
                 source,
@@ -1987,10 +2058,33 @@ impl TorrentTask {
             return;
         }
         let info_hash = self.meta.info_hash;
-        let (peer_id, peer_cmd_rx) = self.register_peer(peer_addr, peer_permit);
+        let Some((peer_id, peer_cmd_rx)) = self.register_peer(peer_addr, peer_permit) else {
+            debug!(
+                component = "peer",
+                operation = "register_incoming",
+                torrent = %self.info_hash_hex,
+                peer = %peer_addr,
+                result = "rejected",
+                reason = "peer_state_memory_budget",
+                "peer state memory budget exhausted"
+            );
+            return;
+        };
         let peer_event_tx = self.peer_event_tx.clone();
         let peer_disconnect_tx = self.peer_disconnect_tx.clone();
-        let upload = self.upload_context(peer_addr);
+        let Some(upload) = self.upload_context(peer_addr) else {
+            self.active_peers.remove(&peer_addr);
+            debug!(
+                component = "peer",
+                operation = "allocate_incoming_state",
+                torrent = %self.info_hash_hex,
+                peer = %peer_addr,
+                result = "rejected",
+                reason = "peer_state_memory_budget",
+                "peer state memory budget exhausted"
+            );
+            return;
+        };
         let peer_task = tokio::spawn(async move {
             let (result, outstanding) = match run_incoming_peer(
                 stream,
@@ -2075,10 +2169,33 @@ impl TorrentTask {
             return;
         }
         let info_hash = self.meta.info_hash;
-        let (peer_id, peer_cmd_rx) = self.register_peer(peer_addr, peer_permit);
+        let Some((peer_id, peer_cmd_rx)) = self.register_peer(peer_addr, peer_permit) else {
+            debug!(
+                component = "peer",
+                operation = "register_incoming_utp",
+                torrent = %self.info_hash_hex,
+                peer = %peer_addr,
+                result = "rejected",
+                reason = "peer_state_memory_budget",
+                "peer state memory budget exhausted"
+            );
+            return;
+        };
         let peer_event_tx = self.peer_event_tx.clone();
         let peer_disconnect_tx = self.peer_disconnect_tx.clone();
-        let upload = self.upload_context(peer_addr);
+        let Some(upload) = self.upload_context(peer_addr) else {
+            self.active_peers.remove(&peer_addr);
+            debug!(
+                component = "peer",
+                operation = "allocate_incoming_utp_state",
+                torrent = %self.info_hash_hex,
+                peer = %peer_addr,
+                result = "rejected",
+                reason = "peer_state_memory_budget",
+                "peer state memory budget exhausted"
+            );
+            return;
+        };
         let peer_task = tokio::spawn(async move {
             let (result, outstanding) = match run_incoming_utp_peer(
                 stream,
@@ -2118,42 +2235,55 @@ impl TorrentTask {
         self.attach_peer_abort(peer_addr, peer_task.abort_handle());
     }
 
-    fn upload_context(&self, peer_addr: SocketAddr) -> UploadContext {
+    fn upload_context(&self, peer_addr: SocketAddr) -> Option<UploadContext> {
         let have_pieces = self.picker.have_pieces();
         let visible_pieces = if self.super_seeding && self.picker.is_complete() {
             super_seed_visible_pieces(&have_pieces, peer_addr)
         } else {
             have_pieces
         };
-        UploadContext {
+        let have_pieces = PieceBitmap::from_bools(&visible_pieces);
+        let bitmap_memory_lease = self
+            .resources
+            .try_acquire(MemoryClass::PeerBuffer, have_pieces.memory_bytes())?;
+        Some(UploadContext {
             save_root: self.save_root.clone(),
             piece_map: self.piece_map.clone(),
             storage: self.storage.clone(),
             resources: self.resources.clone(),
-            have_pieces: PieceBitmap::from_bools(&visible_pieces),
+            have_pieces,
+            _bitmap_memory_lease: Some(bitmap_memory_lease),
             metadata: torrent_info_bytes(&self.meta.raw).ok().map(Arc::new),
             is_private: self.meta.private,
             pex_enabled: self.pex_enabled,
             upload_limit_bytes_per_sec: self.upload_limit_bytes_per_sec,
             global_download: self.network_budget.download(),
             global_upload: self.network_budget.upload(),
-        }
+        })
     }
 
     fn register_peer(
         &mut self,
         addr: SocketAddr,
         peer_permit: OwnedSemaphorePermit,
-    ) -> (PeerId, mpsc::Receiver<PeerCommand>) {
+    ) -> Option<(PeerId, mpsc::Receiver<PeerCommand>)> {
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let id = PeerId::new();
+        let peer_has = PieceBitmap::new(self.meta.pieces.len());
+        let pending_have = PieceBitmap::new(self.meta.pieces.len());
+        let bitmap_bytes = peer_has
+            .memory_bytes()
+            .saturating_add(pending_have.memory_bytes());
+        let bitmap_memory_lease = self
+            .resources
+            .try_acquire(MemoryClass::PeerBuffer, bitmap_bytes)?;
         self.active_peers.insert(
             addr,
             PeerHandle {
                 id,
                 cmd_tx,
                 abort: None,
-                peer_has: PieceBitmap::new(self.meta.pieces.len()),
+                peer_has,
                 choked: true,
                 upload_choked: true,
                 interested: false,
@@ -2171,11 +2301,12 @@ impl TorrentTask {
                 ut_pex_id: None,
                 metadata_size: None,
                 _peer_permit: peer_permit,
-                pending_have: PieceBitmap::new(self.meta.pieces.len()),
+                _bitmap_memory_lease: bitmap_memory_lease,
+                pending_have,
                 pending_upload_limit: None,
             },
         );
-        (id, cmd_rx)
+        Some((id, cmd_rx))
     }
 
     fn attach_peer_abort(&mut self, addr: SocketAddr, abort: tokio::task::AbortHandle) {
@@ -2269,8 +2400,20 @@ impl TorrentTask {
             .map(|peer| {
                 (peer.cmd_tx.max_capacity() as u64)
                     .saturating_mul(std::mem::size_of::<PeerCommand>() as u64)
+                    // This gauge also includes the per-peer packed
+                    // availability/control maps. They are retained for the
+                    // lifetime of the command mailbox and are charged to
+                    // the same peer-buffer memory class at registration.
+                    .saturating_add(peer.peer_has.memory_bytes())
+                    .saturating_add(peer.pending_have.memory_bytes())
+                    // The peer task retains its upload-side map for the same
+                    // lifetime; it is charged when upload_context is built.
+                    .saturating_add(peer.peer_has.memory_bytes())
                     .saturating_add(
-                        (peer.peer_has.words.capacity() * std::mem::size_of::<u64>()) as u64,
+                        peer.requested
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<BlockRequest>())
+                            as u64,
                     )
             })
             .sum::<u64>();
@@ -2595,14 +2738,19 @@ impl TorrentTask {
             return;
         }
         match event {
-            PeerEvent::Bitfield { peer, pieces, .. } => {
+            PeerEvent::Bitfield {
+                peer,
+                pieces,
+                _memory_lease,
+                ..
+            } => {
                 if let Some(handle) = self.active_peers.get_mut(&peer) {
                     reconcile_peer_availability(
                         &mut self.picker.availability,
                         &handle.peer_has,
                         &pieces,
                     );
-                    handle.peer_has = PieceBitmap::from_bools(&pieces);
+                    handle.peer_has = pieces;
                 }
                 self.refill_peer_requests(peer).await;
             }
@@ -5329,17 +5477,14 @@ fn parse_ut_pex_peers(payload: &[u8]) -> anyhow::Result<UtPexPeers> {
     })
 }
 
-fn reconcile_peer_availability<A: PieceAvailability + ?Sized>(
+fn reconcile_peer_availability<A: PieceAvailability + ?Sized, B: PieceAvailability + ?Sized>(
     availability: &mut Availability,
     old: &A,
-    new: &[bool],
+    new: &B,
 ) {
     let piece_count = availability.piece_count();
     for piece in 0..piece_count {
-        match (
-            old.has_piece(piece),
-            new.get(piece).copied().unwrap_or(false),
-        ) {
+        match (old.has_piece(piece), new.has_piece(piece)) {
             (false, true) => availability.add_have(piece),
             (true, false) => availability.remove_have(piece),
             _ => {}
@@ -5952,7 +6097,7 @@ async fn run_peer_loop(
                 last_activity = Instant::now();
                 match msg {
                     Message::Bitfield(bits) => {
-                        let pieces = match bitfield_to_pieces(&bits, upload.have_pieces.len()) {
+                        let pieces = match PieceBitmap::from_bitfield(&bits, upload.have_pieces.len()) {
                             Ok(pieces) => pieces,
                             Err(e) => {
                                 debug!(
@@ -5966,12 +6111,32 @@ async fn run_peer_loop(
                                 continue;
                             }
                         };
+                        let memory_lease = match reserve_peer_bitfield_bytes(&upload.resources, &pieces)
+                        {
+                            Ok(lease) => lease,
+                            Err(error) => {
+                                debug!(
+                                    component = "peer",
+                                    operation = "reserve_bitfield_memory",
+                                    peer = %addr,
+                                    result = "denied",
+                                    error = %error,
+                                    "disconnecting peer because its bitfield exceeds the memory budget"
+                                );
+                                break;
+                            }
+                        };
+                        // The packed bitmap is now the event's only copy. Do
+                        // not retain the wire buffer while waiting for the
+                        // bounded actor mailbox.
+                        drop(bits);
                         if !send_peer_event(
                             &peer_event_tx,
                             PeerEvent::Bitfield {
                                 peer: addr,
                                 id: peer_id,
                                 pieces,
+                                _memory_lease: memory_lease,
                             },
                         )
                         .await
@@ -6484,7 +6649,7 @@ async fn send_have_state(peer_io: &mut PeerIo, have_pieces: &PieceBitmap) -> any
 }
 
 async fn read_upload_block(
-    upload: &UploadContext,
+    upload: &UploadReadContext,
     piece: u32,
     begin: u32,
     length: u32,
@@ -6529,6 +6694,12 @@ fn start_upload_reads(
     if upload_choked {
         return;
     }
+    let read_context = UploadReadContext {
+        save_root: upload.save_root.clone(),
+        piece_map: upload.piece_map.clone(),
+        storage: upload.storage.clone(),
+        resources: upload.resources.clone(),
+    };
     while upload_reads.len() < MAX_PENDING_UPLOAD_READS {
         let Some(request) = pending_upload_requests.pop_front() else {
             break;
@@ -6540,12 +6711,12 @@ fn start_upload_reads(
         {
             continue;
         }
-        let upload_for_read = upload.clone();
+        let read_context_for_task = read_context.clone();
         upload_reads.push(tokio::spawn(async move {
             let result = match timeout(
                 PEER_UPLOAD_READ_TIMEOUT,
                 read_upload_block(
-                    &upload_for_read,
+                    &read_context_for_task,
                     request.piece,
                     request.begin,
                     request.length,
@@ -6602,7 +6773,7 @@ async fn wait_for_upload_budget(
     }
 }
 
-fn bitfield_to_pieces(bits: &[u8], piece_count: usize) -> anyhow::Result<Vec<bool>> {
+fn validate_bitfield_shape(bits: &[u8], piece_count: usize) -> anyhow::Result<()> {
     let expected_len = piece_count.div_ceil(8);
     if bits.len() != expected_len {
         anyhow::bail!(
@@ -6618,6 +6789,12 @@ fn bitfield_to_pieces(bits: &[u8], piece_count: usize) -> anyhow::Result<Vec<boo
             anyhow::bail!("bitfield has non-zero spare bits");
         }
     }
+    Ok(())
+}
+
+#[cfg(test)]
+fn bitfield_to_pieces(bits: &[u8], piece_count: usize) -> anyhow::Result<Vec<bool>> {
+    validate_bitfield_shape(bits, piece_count)?;
 
     let mut pieces = Vec::with_capacity(piece_count);
     for byte in bits {
@@ -8021,6 +8198,36 @@ mod tests {
     }
 
     #[test]
+    fn peer_bitfield_reservation_is_bounded_by_governor() {
+        let mut bits = [0xff; 9];
+        bits[8] = 0x80;
+        let pieces = PieceBitmap::from_bitfield(&bits, 65).unwrap();
+        let bytes = pieces.memory_bytes();
+        assert_eq!(bytes, 2 * std::mem::size_of::<u64>() as u64);
+
+        let mut class_caps_bytes = [0; rt_metrics::MEMORY_CLASS_COUNT];
+        class_caps_bytes[MemoryClass::PeerBuffer as usize] = bytes;
+        let governor = ResourceGovernor::new(rt_metrics::ResourceGovernorConfig {
+            total_cap_bytes: bytes,
+            class_caps_bytes,
+            pressure_constrained_pct: 75,
+            pressure_critical_pct: 90,
+        });
+
+        let lease = reserve_peer_bitfield_bytes(&governor, &pieces).unwrap();
+        assert_eq!(
+            governor.snapshot().classes[MemoryClass::PeerBuffer as usize].used_bytes,
+            bytes
+        );
+        assert!(reserve_peer_bitfield_bytes(&governor, &pieces).is_err());
+        drop(lease);
+        assert_eq!(
+            governor.snapshot().classes[MemoryClass::PeerBuffer as usize].used_bytes,
+            0
+        );
+    }
+
+    #[test]
     fn encodes_piece_flags_to_peer_wire_bitfield_msb_first() {
         assert_eq!(
             pieces_to_bitfield(&[true, false, true, false, false, false, false, false, true]),
@@ -9184,6 +9391,7 @@ mod tests {
             ),
             resources: ResourceGovernor::new(rt_metrics::ResourceGovernorConfig::default()),
             have_pieces: PieceBitmap::from_bools(&[true]),
+            _bitmap_memory_lease: None,
             metadata: None,
             is_private: false,
             pex_enabled: true,
@@ -9192,7 +9400,15 @@ mod tests {
             global_upload: GlobalNetworkBudget::unlimited().upload(),
         };
 
-        let block = read_upload_block(&upload, 0, 0, 16 * 1024).await.unwrap();
+        let read_context = UploadReadContext {
+            save_root: upload.save_root.clone(),
+            piece_map: upload.piece_map.clone(),
+            storage: upload.storage.clone(),
+            resources: upload.resources.clone(),
+        };
+        let block = read_upload_block(&read_context, 0, 0, 16 * 1024)
+            .await
+            .unwrap();
 
         assert_eq!(block.data.as_ref(), expected.as_slice());
         assert_eq!(
@@ -9500,6 +9716,7 @@ mod tests {
             ),
             resources: ResourceGovernor::new(rt_metrics::ResourceGovernorConfig::default()),
             have_pieces: PieceBitmap::from_bools(&[false]),
+            _bitmap_memory_lease: None,
             metadata: None,
             is_private: false,
             pex_enabled: true,
@@ -9567,6 +9784,7 @@ mod tests {
             ),
             resources: ResourceGovernor::new(rt_metrics::ResourceGovernorConfig::default()),
             have_pieces: PieceBitmap::from_bools(&[false]),
+            _bitmap_memory_lease: None,
             metadata: Some(Arc::new(b"metadata".to_vec())),
             is_private: false,
             pex_enabled: true,
@@ -9682,6 +9900,7 @@ mod tests {
             ),
             resources: ResourceGovernor::new(rt_metrics::ResourceGovernorConfig::default()),
             have_pieces: PieceBitmap::from_bools(&[false]),
+            _bitmap_memory_lease: None,
             metadata: None,
             is_private: false,
             pex_enabled: true,
@@ -9805,14 +10024,17 @@ mod tests {
 
         let peer_addr = "127.0.0.1:6881".parse().unwrap();
         let permits = Arc::new(tokio::sync::Semaphore::new(2));
-        let (old_id, old_cmd_rx) = task.register_peer(
-            peer_addr,
-            Arc::clone(&permits).acquire_owned().await.unwrap(),
-        );
+        let (old_id, old_cmd_rx) = task
+            .register_peer(
+                peer_addr,
+                Arc::clone(&permits).acquire_owned().await.unwrap(),
+            )
+            .expect("old peer registration should fit the memory budget");
         task.active_peers.remove(&peer_addr);
         drop(old_cmd_rx);
-        let (new_id, _new_cmd_rx) =
-            task.register_peer(peer_addr, permits.acquire_owned().await.unwrap());
+        let (new_id, _new_cmd_rx) = task
+            .register_peer(peer_addr, permits.acquire_owned().await.unwrap())
+            .expect("new peer registration should fit the memory budget");
         assert_ne!(old_id, new_id);
 
         task.handle_peer_event(PeerEvent::Interested {
@@ -9902,13 +10124,24 @@ mod tests {
             .unwrap();
         task.picker.availability.add_bitfield(&[0x80]);
         task.picker.pick_from_seed().unwrap();
+        let peer_has = PieceBitmap::from_bools(&[true]);
+        let pending_have = PieceBitmap::new(1);
+        let bitmap_memory_lease = task
+            .resources
+            .try_acquire(
+                MemoryClass::PeerBuffer,
+                peer_has
+                    .memory_bytes()
+                    .saturating_add(pending_have.memory_bytes()),
+            )
+            .expect("test peer state should fit the memory budget");
         task.active_peers.insert(
             peer_addr,
             PeerHandle {
                 id: PeerId::new(),
                 cmd_tx: peer_cmd_tx,
                 abort: None,
-                peer_has: PieceBitmap::from_bools(&[true]),
+                peer_has,
                 choked: true,
                 upload_choked: true,
                 interested: false,
@@ -9926,7 +10159,8 @@ mod tests {
                 ut_pex_id: None,
                 metadata_size: None,
                 _peer_permit: peer_permit,
-                pending_have: PieceBitmap::new(1),
+                _bitmap_memory_lease: bitmap_memory_lease,
+                pending_have,
                 pending_upload_limit: None,
             },
         );

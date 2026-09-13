@@ -202,9 +202,9 @@ Good:
 Concerns:
 
 - `peer_event_tx` channel is hardcoded at 512 per torrent. For many active torrents, this is a hidden memory multiplier. Make it configurable or derived from peer limits.
-- `register_peer` creates `peer_has: vec![false; piece_count]` per peer. For huge torrents with many pieces, this is expensive. Prefer a compact bitmap representation.
-- `PeerHandle.requested` uses a Vec of block requests. At high peer counts and deep pipelines, the memory model should include exact request-list capacity.
-- `runtime_stats` estimates `peer_command_queue_bytes` with `peer.peer_has.capacity()` but not `size_of::<bool>()` semantics or request vector capacity. The accounting is directionally useful but not strict enough for hard resource enforcement.
+- `register_peer` retains two packed per-peer availability/control maps, and the peer task retains a third upload-side map. Their backing allocations are now charged to `MemoryClass::PeerBuffer` before the connection task starts; the peer is rejected if the shared cap cannot cover them.
+- `PeerHandle.requested` uses a Vec of block requests. Runtime accounting now includes its exact capacity, but the request vector itself remains an estimate rather than a separately held lease.
+- `runtime_stats` reports packed peer-map and request-list capacity alongside the command mailbox; the live governor lease is preserved in process-wide peer-buffer pressure.
 
 Required patch direction:
 
