@@ -4,7 +4,19 @@ use url::Url;
 
 use crate::{error::MetainfoError, types::MagnetLink};
 
+const MAX_MAGNET_BYTES: usize = 4 * 1024 * 1024;
+const MAX_MAGNET_NAME_BYTES: usize = 4096;
+const MAX_MAGNET_TRACKERS: usize = 4096;
+const MAX_MAGNET_TRACKER_BYTES: usize = 8192;
+const MAX_MAGNET_TRACKER_TOTAL_BYTES: usize = 1024 * 1024;
+
 pub fn parse_magnet(input: &str) -> Result<MagnetLink, MetainfoError> {
+    if input.len() > MAX_MAGNET_BYTES {
+        return Err(MetainfoError::LimitExceeded {
+            field: "magnet bytes",
+            limit: MAX_MAGNET_BYTES,
+        });
+    }
     let url = Url::parse(input).map_err(|e| MetainfoError::InvalidMagnet(e.to_string()))?;
     if url.scheme() != "magnet" {
         return Err(MetainfoError::InvalidMagnet(
@@ -17,19 +29,45 @@ pub fn parse_magnet(input: &str) -> Result<MagnetLink, MetainfoError> {
     let mut display_name = None;
     let mut trackers = Vec::new();
     let mut seen_trackers = HashSet::new();
+    let mut tracker_bytes: usize = 0;
 
     for (key, value) in url.query_pairs() {
         match key.as_ref() {
             "xt" => parse_exact_topic(&value, &mut info_hash_v1, &mut info_hash_v2)?,
             "dn" => {
                 let name = value.trim();
+                if name.len() > MAX_MAGNET_NAME_BYTES {
+                    return Err(MetainfoError::LimitExceeded {
+                        field: "magnet display name bytes",
+                        limit: MAX_MAGNET_NAME_BYTES,
+                    });
+                }
                 if !name.is_empty() {
                     display_name = Some(name.to_owned());
                 }
             }
             "tr" => {
                 let tracker = value.trim();
+                if tracker.len() > MAX_MAGNET_TRACKER_BYTES {
+                    return Err(MetainfoError::LimitExceeded {
+                        field: "magnet tracker url bytes",
+                        limit: MAX_MAGNET_TRACKER_BYTES,
+                    });
+                }
                 if !tracker.is_empty() && seen_trackers.insert(tracker.to_owned()) {
+                    if trackers.len() >= MAX_MAGNET_TRACKERS {
+                        return Err(MetainfoError::LimitExceeded {
+                            field: "magnet tracker urls",
+                            limit: MAX_MAGNET_TRACKERS,
+                        });
+                    }
+                    tracker_bytes = tracker_bytes.saturating_add(tracker.len());
+                    if tracker_bytes > MAX_MAGNET_TRACKER_TOTAL_BYTES {
+                        return Err(MetainfoError::LimitExceeded {
+                            field: "magnet tracker url bytes",
+                            limit: MAX_MAGNET_TRACKER_TOTAL_BYTES,
+                        });
+                    }
                     trackers.push(tracker.to_owned());
                 }
             }
@@ -181,5 +219,86 @@ mod tests {
     #[test]
     fn rejects_invalid_base32_btih() {
         assert!(parse_magnet("magnet:?xt=urn:btih:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA1").is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_magnet_input() {
+        let input = format!(
+            "magnet:?xt=urn:btih:{}&dn={}",
+            "0".repeat(40),
+            "n".repeat(MAX_MAGNET_BYTES)
+        );
+        assert!(matches!(
+            parse_magnet(&input),
+            Err(MetainfoError::LimitExceeded {
+                field: "magnet bytes",
+                limit: MAX_MAGNET_BYTES
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_oversized_magnet_display_name() {
+        let input = format!(
+            "magnet:?xt=urn:btih:{}&dn={}",
+            "0".repeat(40),
+            "n".repeat(MAX_MAGNET_NAME_BYTES + 1)
+        );
+        assert!(matches!(
+            parse_magnet(&input),
+            Err(MetainfoError::LimitExceeded {
+                field: "magnet display name bytes",
+                limit: MAX_MAGNET_NAME_BYTES
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_oversized_magnet_tracker() {
+        let input = format!(
+            "magnet:?xt=urn:btih:{}&tr={}",
+            "0".repeat(40),
+            "t".repeat(MAX_MAGNET_TRACKER_BYTES + 1)
+        );
+        assert!(matches!(
+            parse_magnet(&input),
+            Err(MetainfoError::LimitExceeded {
+                field: "magnet tracker url bytes",
+                limit: MAX_MAGNET_TRACKER_BYTES
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_too_many_magnet_trackers() {
+        let mut input = format!("magnet:?xt=urn:btih:{}", "0".repeat(40));
+        for index in 0..=MAX_MAGNET_TRACKERS {
+            input.push_str("&tr=tracker");
+            input.push_str(&index.to_string());
+        }
+        assert!(matches!(
+            parse_magnet(&input),
+            Err(MetainfoError::LimitExceeded {
+                field: "magnet tracker urls",
+                limit: MAX_MAGNET_TRACKERS
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_aggregate_magnet_tracker_bytes() {
+        let mut input = format!("magnet:?xt=urn:btih:{}", "0".repeat(40));
+        for index in 0..=MAX_MAGNET_TRACKER_TOTAL_BYTES / MAX_MAGNET_TRACKER_BYTES {
+            let tracker = format!("{}{}", "t".repeat(MAX_MAGNET_TRACKER_BYTES - 4), index);
+            input.push_str("&tr=");
+            input.push_str(&tracker);
+        }
+        assert!(matches!(
+            parse_magnet(&input),
+            Err(MetainfoError::LimitExceeded {
+                field: "magnet tracker url bytes",
+                limit: MAX_MAGNET_TRACKER_TOTAL_BYTES
+            })
+        ));
     }
 }
