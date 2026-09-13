@@ -55,6 +55,28 @@ export interface LiveTorrentStatsResponse {
   torrents: LiveTorrentStat[]
 }
 
+function normalizeLiveStats(body: unknown): LiveTorrentStatsResponse {
+  if (!body || typeof body !== 'object') {
+    return { sampled_at: 0, torrents: [] }
+  }
+  const value = body as { sampled_at?: unknown; torrents?: unknown }
+  const torrents = Array.isArray(value.torrents)
+    ? value.torrents.filter((item): item is LiveTorrentStat => {
+      if (!item || typeof item !== 'object') return false
+      const stat = item as Partial<LiveTorrentStat>
+      return typeof stat.hash === 'string'
+        && typeof stat.amount_left === 'number'
+        && typeof stat.download_rate === 'number'
+        && typeof stat.upload_rate === 'number'
+        && typeof stat.sampled_at === 'number'
+    })
+    : []
+  return {
+    sampled_at: typeof value.sampled_at === 'number' ? value.sampled_at : 0,
+    torrents,
+  }
+}
+
 interface TorrentNgTorrentSummary {
   info_hash: string
   name: string
@@ -747,8 +769,8 @@ export const api = {
         p,
       ),
 
-    liveStats: (hashes: string[]): Promise<LiveTorrentStatsResponse> =>
-      get('/torrents/live', { hashes: hashes.join(',') }),
+    liveStats: async (hashes: string[]): Promise<LiveTorrentStatsResponse> =>
+      normalizeLiveStats(await get<unknown>('/torrents/live', { hashes: hashes.join(',') })),
 
     get: (hash: string): Promise<TorrentSummary> =>
       get(`/torrents/${hash}`),

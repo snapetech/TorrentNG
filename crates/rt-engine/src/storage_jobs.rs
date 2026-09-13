@@ -26,6 +26,7 @@ use crate::engine::unix_now_i64;
 
 const DEFAULT_QUEUE_CAPACITY: usize = 32;
 const DEFAULT_WORKER_COUNT: usize = 2;
+const STORAGE_WORKER_ABORT_GRACE: Duration = Duration::from_millis(100);
 pub(crate) const STORAGE_JOB_STATE_COMMIT_PENDING: &str = "commit_pending";
 pub(crate) const STORAGE_MANUAL_RECOVERY_PREFIX: &str = "manual recovery required: ";
 
@@ -46,7 +47,7 @@ fn db_i64_usize(value: usize) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
-fn completed_byte_offset(plan: &StoragePlan, completed_steps: &[usize]) -> i64 {
+pub(crate) fn completed_byte_offset(plan: &StoragePlan, completed_steps: &[usize]) -> i64 {
     completed_steps
         .iter()
         .filter_map(|index| plan.steps.get(*index))
@@ -95,6 +96,53 @@ fn storage_plan_failure_requires_manual_recovery(
                 }
             )
     }) || storage_plan_has_destructive_progress(plan, completed_steps)
+}
+
+fn is_storage_cancellation_error(error: &StorageError) -> bool {
+    matches!(
+        error,
+        StorageError::Cancelled | StorageError::StagedMoveFailed { step: "cancel", .. }
+    )
+}
+
+fn storage_job_was_cancelled(
+    control_cancelled: bool,
+    result: &Result<rt_storage::StoragePlanExecution, StorageError>,
+    plan: &StoragePlan,
+    completed_steps: &[usize],
+) -> bool {
+    control_cancelled
+        && result.as_ref().err().is_some_and(|error| {
+            // A pause is reported by the same cooperative step-boundary
+            // error path as cancellation. If cancellation arrives after
+            // that boundary was observed but before the worker classifies
+            // its result, the terminal user request must win rather than
+            // stranding the job in `paused`.
+            is_storage_cancellation_error(error)
+                || matches!(error, StorageError::StagedMoveFailed { step: "pause", .. })
+        })
+        && !storage_plan_has_destructive_progress(plan, completed_steps)
+}
+
+fn cancellation_cleanup_failure(
+    plan: &StoragePlan,
+    roots: &[std::path::PathBuf],
+    completed_steps: &[usize],
+) -> Option<String> {
+    if completed_steps.is_empty()
+        || storage_plan_filesystem_complete(plan, completed_steps)
+        || storage_plan_has_destructive_progress(plan, completed_steps)
+    {
+        return None;
+    }
+    match rt_storage::rollback_storage_plan_under_roots(plan, roots) {
+        Ok(execution) if execution.rollback_failures.is_empty() => None,
+        Ok(execution) => Some(format!(
+            "{} storage-plan rollback step(s) failed",
+            execution.rollback_failures.len()
+        )),
+        Err(error) => Some(error.to_string()),
+    }
 }
 
 fn storage_job_terminal_state(
@@ -187,7 +235,8 @@ impl StorageJobControl {
             if !self.is_paused() || self.cancelled.load(Ordering::Acquire) || self.is_shutdown() {
                 return;
             }
-            let notified = self.notify.notified();
+            let mut notified = std::pin::pin!(self.notify.notified());
+            notified.as_mut().enable();
             if !self.is_paused() || self.cancelled.load(Ordering::Acquire) || self.is_shutdown() {
                 return;
             }
@@ -250,6 +299,10 @@ pub(crate) struct StorageJobCompletion {
     pub(crate) state: String,
     pub(crate) error: Option<String>,
     pub(crate) completed_steps: Vec<usize>,
+    /// Progress computed from the same plan instance that performed the
+    /// filesystem work. This is needed when terminal persistence fails after
+    /// the filesystem has committed and the engine has to finish the job.
+    pub(crate) completed_byte_offset: Option<i64>,
     pub(crate) requires_manual_recovery: bool,
 }
 
@@ -266,6 +319,7 @@ impl StorageJobCompletion {
             state,
             error,
             completed_steps,
+            completed_byte_offset: None,
             requires_manual_recovery: false,
         }
     }
@@ -645,6 +699,7 @@ impl StorageJobDispatcher {
                 "storage workers did not drain before shutdown deadline"
             );
             join.abort();
+            let _ = timeout(STORAGE_WORKER_ABORT_GRACE, &mut join).await;
         }
     }
 }
@@ -672,6 +727,11 @@ async fn run_supervisor(
         tokio::select! {
             biased;
             _ = &mut shutdown_rx => {
+                // Close the receiver before draining active work. A sender
+                // can otherwise enqueue a request after the final
+                // `try_recv` below and leave it permanently without a
+                // supervisor or completion channel.
+                rx.close();
                 let active_controls = controls
                     .lock()
                     .expect("storage job controls mutex poisoned")
@@ -732,6 +792,7 @@ async fn run_supervisor(
             &request.job_id,
             &request.operation,
             &request.plan,
+            &request.roots,
             &request.completed_steps,
             !request.control.cancelled.load(Ordering::Acquire),
         );
@@ -821,6 +882,7 @@ async fn run_storage_request(
                 &job_id,
                 &operation,
                 &plan,
+                &roots,
                 &completed_steps,
                 control.is_shutdown() && !control.cancelled.load(Ordering::Acquire),
             );
@@ -867,7 +929,25 @@ async fn run_storage_request(
                 )
             }
         };
-        if completion_result.state == "paused" && !control.cancelled.load(Ordering::Acquire) {
+        if completion_result.state == "paused" {
+            if control.cancelled.load(Ordering::Acquire) {
+                // Cancellation can arrive after the blocking worker has
+                // computed a paused result but before this supervisor task
+                // observes it. Re-run the terminal cancellation path so a
+                // staged checkpoint is cleaned up and the job cannot remain
+                // paused forever waiting for a resume that will never come.
+                let completion_result = interrupted_before_start_completion(
+                    &db,
+                    &job_id,
+                    &operation,
+                    &plan,
+                    &roots,
+                    &completion_result.completed_steps,
+                    false,
+                );
+                let _ = completion.send(completion_result);
+                return job_id;
+            }
             if control.is_shutdown() {
                 // The worker may have observed a user pause just before the
                 // supervisor applied shutdown. Convert that already-persisted
@@ -878,6 +958,7 @@ async fn run_storage_request(
                     &job_id,
                     &operation,
                     &plan,
+                    &roots,
                     &completion_result.completed_steps,
                     true,
                 );
@@ -901,6 +982,7 @@ fn interrupted_before_start_completion(
     job_id: &str,
     operation: &str,
     plan: &StoragePlan,
+    roots: &[std::path::PathBuf],
     completed_steps: &[usize],
     shutdown_requested: bool,
 ) -> StorageJobCompletion {
@@ -923,14 +1005,57 @@ fn interrupted_before_start_completion(
         };
     }
 
+    // A cancellation can race the final filesystem syscall before this
+    // worker reaches its normal terminal-state calculation. A complete plan
+    // is already live on disk and must still enter the actor-side commit path;
+    // otherwise a move can be marked cancelled while its old source is gone.
+    if !plan.steps.is_empty() && storage_plan_filesystem_complete(plan, completed_steps) {
+        let state = if operation == "move" {
+            STORAGE_JOB_STATE_COMMIT_PENDING
+        } else {
+            "completed"
+        };
+        let completed_offset = Some(completed_byte_offset(plan, completed_steps));
+        return match persist_terminal(db, job_id, operation, plan, completed_steps, state, None) {
+            Ok(()) => {
+                let mut completion =
+                    StorageJobCompletion::terminal(state, None, completed_steps.to_vec());
+                completion.completed_byte_offset = completed_offset;
+                completion
+            }
+            Err(error) => {
+                let mut completion = StorageJobCompletion::terminal(
+                    STORAGE_JOB_STATE_COMMIT_PENDING,
+                    Some(format!("terminal persistence failed: {error}")),
+                    completed_steps.to_vec(),
+                );
+                completion.completed_byte_offset = completed_offset;
+                completion
+            }
+        };
+    }
+
     let cancellation = cancelled_error();
-    let requires_manual_recovery =
-        storage_plan_failure_requires_manual_recovery(plan, completed_steps, Some(&cancellation));
-    let reason = cancellation.to_string();
+    let cleanup_failure = cancellation_cleanup_failure(plan, roots, completed_steps);
+    let requires_manual_recovery = cleanup_failure.is_some()
+        || storage_plan_failure_requires_manual_recovery(
+            plan,
+            completed_steps,
+            Some(&cancellation),
+        );
+    let reason = cleanup_failure.map_or_else(
+        || cancellation.to_string(),
+        |failure| format!("{cancellation}; cancelled-job cleanup failed: {failure}"),
+    );
     let durable_reason = if requires_manual_recovery {
         manual_recovery_reason(&reason)
     } else {
         reason.clone()
+    };
+    let terminal_state = if requires_manual_recovery {
+        "failed"
+    } else {
+        "cancelled"
     };
     match persist_terminal(
         db,
@@ -938,7 +1063,7 @@ fn interrupted_before_start_completion(
         operation,
         plan,
         completed_steps,
-        "cancelled",
+        terminal_state,
         Some(durable_reason.clone()),
     ) {
         Ok(()) if requires_manual_recovery => StorageJobCompletion::failed_with_manual_recovery(
@@ -983,6 +1108,7 @@ fn execute_storage_job(request: StorageJobExecution) -> StorageJobCompletion {
             &job_id,
             &operation,
             &plan,
+            &roots,
             &completed_steps,
             control.is_shutdown() && !control.cancelled.load(Ordering::Acquire),
         );
@@ -1000,6 +1126,7 @@ fn execute_storage_job(request: StorageJobExecution) -> StorageJobCompletion {
                         &job_id,
                         &operation,
                         &plan,
+                        &roots,
                         &completed_steps,
                         control.is_shutdown() && !control.cancelled.load(Ordering::Acquire),
                     );
@@ -1040,6 +1167,7 @@ fn execute_storage_job(request: StorageJobExecution) -> StorageJobCompletion {
             &job_id,
             &operation,
             &plan,
+            &roots,
             &completed,
             control.is_shutdown() && !control.cancelled.load(Ordering::Acquire),
         );
@@ -1113,7 +1241,12 @@ fn execute_storage_job(request: StorageJobExecution) -> StorageJobCompletion {
     // completed. A cancellation arriving in that tiny hand-off window must
     // not relabel committed work as cancelled; doing so would leave a job
     // claiming cancellation even though its side effects are already live.
-    let cancelled = control.cancelled.load(Ordering::Acquire) && result.is_err();
+    let cancelled = storage_job_was_cancelled(
+        control.cancelled.load(Ordering::Acquire),
+        &result,
+        &plan,
+        &completed,
+    );
     let shutdown_requested = control.is_shutdown() && !control.cancelled.load(Ordering::Acquire);
     // `checkpoint` records the step in `completed` before it writes the
     // durable row and observes control state. Therefore a cancellation or
@@ -1223,12 +1356,14 @@ fn execute_storage_job(request: StorageJobExecution) -> StorageJobCompletion {
         done = completed.len(),
         "storage plan worker finished"
     );
+    let completed_offset = completed_byte_offset(&plan, &completed);
     StorageJobCompletion {
         succeeded: matches!(completion_state.as_str(), STORAGE_JOB_STATE_COMMIT_PENDING)
             || (completion_state == "completed" && completion_error.is_none()),
         state: completion_state,
         error: completion_error,
         completed_steps: completed,
+        completed_byte_offset: Some(completed_offset),
         requires_manual_recovery,
     }
 }
@@ -1315,6 +1450,10 @@ fn persist_running(db: &Arc<Mutex<Connection>>, job_id: &str) -> Result<(), Stri
     if job.started_at.is_none() {
         job.started_at = Some(unix_now_i64());
     }
+    // A queued job can carry the previous shutdown/recovery explanation.
+    // Once execution has actually resumed, that message is no longer the
+    // current job status and must not remain visible beside `running`.
+    job.error = None;
     job.updated_at = unix_now_i64();
     rt_db::upsert_job_in_tx(&tx, &job).map_err(|error| error.to_string())?;
     let event = rt_db::JobEventRow {
@@ -1396,6 +1535,8 @@ fn persist_terminal(
     job.state = state.to_owned();
     job.done = db_i64_usize(completed_steps.len());
     job.checkpoint = job.done;
+    job.file_index = Some(job.done);
+    job.byte_offset = Some(completed_byte_offset(plan, completed_steps));
     job.error = error.clone();
     job.updated_at = unix_now_i64();
     job.finished_at = (!matches!(
@@ -1455,7 +1596,7 @@ mod tests {
     use std::sync::Barrier;
 
     use rt_db::migrate;
-    use rt_storage::{plan_move, MovePlanRequest};
+    use rt_storage::{plan_import, plan_move, ImportPlanRequest, MovePlanRequest};
 
     #[tokio::test]
     async fn queue_is_bounded_and_control_is_shared() {
@@ -1575,6 +1716,189 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_only_wins_before_destructive_progress() {
+        let copy_plan = StoragePlan {
+            dry_run: false,
+            can_apply: true,
+            issues: Vec::new(),
+            steps: vec![StoragePlanStep {
+                action: rt_storage::PlannedStorageAction::CopyVerifyRename,
+                source: None,
+                destination: None,
+                bytes: 0,
+            }],
+            rollback_steps: Vec::new(),
+        };
+        let destructive_plan = StoragePlan {
+            steps: vec![StoragePlanStep {
+                action: rt_storage::PlannedStorageAction::Rename,
+                source: None,
+                destination: None,
+                bytes: 0,
+            }],
+            ..copy_plan.clone()
+        };
+        let cancellation = StorageError::StagedMoveFailed {
+            step: "cancel",
+            reason: "injected cancellation".to_owned(),
+        };
+        let cancelled_result = || {
+            Err::<rt_storage::StoragePlanExecution, _>(StorageError::StagedMoveFailed {
+                step: "cancel",
+                reason: "injected cancellation".to_owned(),
+            })
+        };
+
+        assert!(storage_job_was_cancelled(
+            true,
+            &cancelled_result(),
+            &copy_plan,
+            &[0],
+        ));
+        assert!(!storage_job_was_cancelled(
+            true,
+            &cancelled_result(),
+            &destructive_plan,
+            &[0],
+        ));
+        assert!(!storage_job_was_cancelled(
+            true,
+            &Err(StorageError::Io {
+                path: "source".to_owned(),
+                source: std::io::Error::other("injected I/O failure"),
+            }),
+            &copy_plan,
+            &[0],
+        ));
+        assert!(!storage_plan_failure_requires_manual_recovery(
+            &copy_plan,
+            &[0],
+            Some(&cancellation),
+        ));
+        assert!(storage_plan_failure_requires_manual_recovery(
+            &destructive_plan,
+            &[0],
+            Some(&cancellation),
+        ));
+    }
+
+    #[test]
+    fn cancellation_wins_over_a_late_pause_boundary() {
+        let plan = StoragePlan {
+            dry_run: false,
+            can_apply: true,
+            issues: Vec::new(),
+            steps: vec![StoragePlanStep {
+                action: rt_storage::PlannedStorageAction::CopyVerifyRename,
+                source: None,
+                destination: None,
+                bytes: 0,
+            }],
+            rollback_steps: Vec::new(),
+        };
+        let paused_result = Err(StorageError::StagedMoveFailed {
+            step: "pause",
+            reason: "pause arrived at a step boundary".to_owned(),
+        });
+
+        assert!(storage_job_was_cancelled(true, &paused_result, &plan, &[]));
+        assert!(!storage_job_was_cancelled(
+            false,
+            &paused_result,
+            &plan,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn cancelled_checkpointed_staging_is_cleaned_before_terminal_state() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.bin");
+        let destination = root.path().join("destination.bin");
+        std::fs::write(&source, b"data").unwrap();
+        let plan = plan_import(&ImportPlanRequest {
+            source: source.clone(),
+            destination: destination.clone(),
+            bytes: 4,
+            available_bytes: None,
+            hardlink_or_copy: false,
+            dry_run: false,
+        });
+        std::fs::write(plan.steps[0].destination.clone().unwrap(), b"data").unwrap();
+        let roots = vec![root.path().to_path_buf()];
+
+        assert!(cancellation_cleanup_failure(&plan, &roots, &[0]).is_none());
+        assert!(source.exists());
+        assert!(!destination.exists());
+        assert!(!plan.steps[0].destination.as_ref().unwrap().exists());
+    }
+
+    #[test]
+    fn late_cancellation_preserves_a_complete_filesystem_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.bin");
+        let destination = root.path().join("destination.bin");
+        std::fs::write(&source, b"data").unwrap();
+        let plan = plan_move(&MovePlanRequest {
+            source: source.clone(),
+            destination: destination.clone(),
+            bytes: 4,
+            available_bytes: None,
+            dry_run: false,
+        });
+        std::fs::rename(&source, &destination).unwrap();
+        let connection = Connection::open_in_memory().unwrap();
+        migrate(&connection).unwrap();
+        let now = unix_now_i64();
+        rt_db::upsert_job(
+            &connection,
+            &rt_db::JobRow {
+                job_id: "late-cancel-complete".to_owned(),
+                kind: "storage_plan".to_owned(),
+                state: "running".to_owned(),
+                dry_run: false,
+                affected_torrents: Vec::new(),
+                total: 1,
+                done: 1,
+                checkpoint: 1,
+                file_index: Some(1),
+                piece_index: None,
+                byte_offset: Some(4),
+                verified_bytes: 0,
+                invalid_pieces: Vec::new(),
+                error: None,
+                created_at: now,
+                started_at: Some(now),
+                updated_at: now,
+                finished_at: None,
+            },
+        )
+        .unwrap();
+        let db = Arc::new(Mutex::new(connection));
+        let completion = interrupted_before_start_completion(
+            &db,
+            "late-cancel-complete",
+            "move",
+            &plan,
+            std::slice::from_ref(&root.path().to_path_buf()),
+            &[0],
+            false,
+        );
+
+        assert_eq!(completion.state, STORAGE_JOB_STATE_COMMIT_PENDING);
+        assert!(completion.succeeded);
+        assert_eq!(completion.completed_byte_offset, Some(4));
+        assert_eq!(
+            rt_db::get_job(&db.lock().unwrap(), "late-cancel-complete")
+                .unwrap()
+                .state,
+            STORAGE_JOB_STATE_COMMIT_PENDING
+        );
+        assert!(!source.exists());
+        assert_eq!(std::fs::read(destination).unwrap(), b"data");
+    }
+
+    #[test]
     fn partial_destructive_storage_progress_requires_manual_recovery() {
         let plan = StoragePlan {
             dry_run: false,
@@ -1643,6 +1967,7 @@ mod tests {
             state: "completed".to_owned(),
             error: None,
             completed_steps: Vec::new(),
+            completed_byte_offset: None,
             requires_manual_recovery: false,
         });
         let mut dispatcher = StorageJobDispatcher::with_test_executor(1, 1, executor);
@@ -2021,6 +2346,33 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.contains("recovered after restart")));
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_rejects_submissions_after_supervisor_stops() {
+        let db = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        let mut dispatcher = StorageJobDispatcher::with_limits(Arc::clone(&db), 1, 1);
+        dispatcher.shutdown(Duration::from_secs(1)).await;
+
+        let (completion, _completion_rx) = oneshot::channel();
+        let error = dispatcher
+            .submit(
+                db,
+                "after-shutdown".to_owned(),
+                "delete".to_owned(),
+                StoragePlan {
+                    dry_run: false,
+                    can_apply: true,
+                    issues: Vec::new(),
+                    steps: Vec::new(),
+                    rollback_steps: Vec::new(),
+                },
+                Vec::new(),
+                Vec::new(),
+                completion,
+            )
+            .unwrap_err();
+        assert_eq!(error, "storage job worker is shutting down");
     }
 
     #[tokio::test]
@@ -2466,6 +2818,8 @@ mod tests {
         let row = rt_db::get_job(&conn, "storage-test").unwrap();
         assert_eq!(row.state, "failed");
         assert_eq!(row.done, 1);
+        assert_eq!(row.file_index, Some(1));
+        assert_eq!(row.byte_offset, Some(1));
         assert!(row.finished_at.is_some());
     }
 
@@ -2538,6 +2892,16 @@ mod tests {
     #[test]
     fn move_persistence_failure_remains_commit_pending() {
         let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.bin");
+        let destination = root.path().join("destination.bin");
+        std::fs::write(&source, b"payload").unwrap();
+        let plan = plan_move(&MovePlanRequest {
+            source,
+            destination,
+            bytes: 7,
+            available_bytes: None,
+            dry_run: false,
+        });
         let connection = Connection::open_in_memory().unwrap();
         migrate(&connection).unwrap();
         let now = unix_now_i64();
@@ -2549,7 +2913,7 @@ mod tests {
                 state: "queued".to_owned(),
                 dry_run: false,
                 affected_torrents: Vec::new(),
-                total: 0,
+                total: i64::try_from(plan.steps.len()).unwrap(),
                 done: 0,
                 checkpoint: 0,
                 file_index: Some(0),
@@ -2578,13 +2942,7 @@ mod tests {
         let completion = execute_storage_job(StorageJobExecution {
             job_id: "move-persistence-failure".to_owned(),
             operation: "move".to_owned(),
-            plan: StoragePlan {
-                dry_run: false,
-                can_apply: true,
-                issues: Vec::new(),
-                steps: Vec::new(),
-                rollback_steps: Vec::new(),
-            },
+            plan,
             completed_steps: Vec::new(),
             roots: vec![root.path().to_path_buf()],
             db: Arc::clone(&db),
@@ -2597,12 +2955,11 @@ mod tests {
             .error
             .as_deref()
             .is_some_and(|error| error.contains("terminal persistence failed")));
+        assert_eq!(completion.completed_steps, vec![0]);
+        assert_eq!(completion.completed_byte_offset, Some(7));
         let conn = db.lock().unwrap();
-        assert_eq!(
-            rt_db::get_job(&conn, "move-persistence-failure")
-                .unwrap()
-                .state,
-            "running"
-        );
+        let job = rt_db::get_job(&conn, "move-persistence-failure").unwrap();
+        assert_eq!(job.state, "running");
+        assert_eq!(job.byte_offset, Some(7));
     }
 }

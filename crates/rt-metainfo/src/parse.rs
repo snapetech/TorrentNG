@@ -1,5 +1,5 @@
-use sha1::{Digest, Sha1};
-use sha2::Sha256;
+use sha1::{Digest as Sha1Digest, Sha1};
+use sha2::{Digest as Sha2Digest, Sha256};
 
 use rt_bencode::{decode_torrent_info_span, BValue};
 use rt_path::SafeRelPath;
@@ -539,6 +539,12 @@ fn validate_piece_count(
             .checked_add(file.length)
             .ok_or(MetainfoError::IntegerOverflow("total length"))
     })?;
+    if total_length == 0 {
+        // The engine's v1 piece map has no meaningful piece-zero state. Keep
+        // an empty file inside an otherwise non-empty torrent valid, but
+        // reject a torrent whose complete content stream has no pieces.
+        return Err(MetainfoError::ZeroTotalLength);
+    }
     let expected = if total_length == 0 {
         0
     } else {
@@ -647,7 +653,17 @@ mod tests {
         piece_length: i64,
         private: Option<i64>,
     ) -> Vec<u8> {
-        let pieces_data = make_pieces(1);
+        single_file_torrent_with_piece_count(name, length, piece_length, private, 1)
+    }
+
+    fn single_file_torrent_with_piece_count(
+        name: &str,
+        length: i64,
+        piece_length: i64,
+        private: Option<i64>,
+        piece_count: usize,
+    ) -> Vec<u8> {
+        let pieces_data = make_pieces(piece_count);
         let mut info_pairs: Vec<(&[u8], BValue<'_>)> = vec![
             (b"length", BValue::Int(length)),
             (b"name", BValue::Bytes(name.as_bytes())),
@@ -1077,6 +1093,15 @@ mod tests {
         };
         assert_eq!(m.files[0].length, 0);
         assert_eq!(m.files[1].offset, 0); // empty file doesn't advance offset
+    }
+
+    #[test]
+    fn reject_zero_total_length_torrent() {
+        let raw = single_file_torrent_with_piece_count("empty.bin", 0, 512 * 1024, None, 0);
+        assert!(matches!(
+            parse_torrent(&raw),
+            Err(MetainfoError::ZeroTotalLength)
+        ));
     }
 
     fn v2_torrent(name: &str, file_name: &str, length: i64) -> Vec<u8> {

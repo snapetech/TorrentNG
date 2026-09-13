@@ -83,6 +83,12 @@ pub(super) async fn execute_storage_plan(
             return true;
         }
     };
+    // Capture every target's session identity, including dormant torrents
+    // that had no task to quiesce. A move completion can be delivered after
+    // an info-hash was removed and re-added; the hash alone must not let that
+    // stale completion publish the old torrent's destination onto the new
+    // incarnation.
+    let affected_torrent_handles = engine.torrent_handles_for_targets(&affected_torrents).await;
     let (completion, completion_rx) = oneshot::channel();
     let mut context = move_context.as_ref().map_or_else(
         || serde_json::json!({}),
@@ -120,6 +126,10 @@ pub(super) async fn execute_storage_plan(
                     .iter()
                     .find(|(hash, _)| hash == &info_hash)
                     .map(|(_, paused)| *paused);
+                let torrent_handle = affected_torrent_handles
+                    .iter()
+                    .find(|(hash, _)| hash == &info_hash)
+                    .map(|(_, handle)| *handle);
                 super::send_engine_command_until_delivered(
                     cmd_tx,
                     EngineCmd::StorageMoveFinished {
@@ -129,10 +139,12 @@ pub(super) async fn execute_storage_plan(
                         old_save_path,
                         save_path,
                         quiesced,
+                        torrent_handle,
                         succeeded: completion.succeeded,
                         terminal_state: completion.state,
                         error: completion.error,
                         completed_steps: completion.completed_steps,
+                        completed_byte_offset: completion.completed_byte_offset,
                         requires_manual_recovery: completion.requires_manual_recovery,
                         retry_attempt: 0,
                     },
@@ -145,11 +157,13 @@ pub(super) async fn execute_storage_plan(
                     EngineCmd::StoragePlanFinished {
                         job_id,
                         affected_torrents: quiesced,
+                        affected_torrent_handles,
                         manual_recovery_torrents,
                         succeeded: completion.succeeded,
                         terminal_state: completion.state,
                         error: completion.error,
                         completed_steps: completion.completed_steps,
+                        completed_byte_offset: completion.completed_byte_offset,
                         requires_manual_recovery: completion.requires_manual_recovery,
                     },
                     "storage_plan_completion",
@@ -158,7 +172,9 @@ pub(super) async fn execute_storage_plan(
             }
         });
     } else {
-        engine.resume_torrents_after_storage_plan(quiesced).await;
+        engine
+            .resume_torrents_after_storage_plan(quiesced, Vec::new())
+            .await;
     }
     let _ = reply.send(result);
     true
@@ -169,11 +185,13 @@ pub(super) async fn finish_storage_plan(
     engine: &mut Engine,
     job_id: String,
     affected_torrents: Vec<(String, bool)>,
+    affected_torrent_handles: Vec<(String, rt_session::TorrentHandle)>,
     manual_recovery_torrents: Vec<String>,
     succeeded: bool,
     terminal_state: String,
     error: Option<String>,
     completed_steps: Vec<usize>,
+    completed_byte_offset: Option<i64>,
     requires_manual_recovery: bool,
 ) {
     // The worker uses queued for shutdown reattachment. The engine is also
@@ -215,6 +233,23 @@ pub(super) async fn finish_storage_plan(
             );
         }
         for info_hash in manual_recovery_torrents {
+            if let Some(expected_handle) = affected_torrent_handles
+                .iter()
+                .find(|(hash, _)| hash == &info_hash)
+                .map(|(_, handle)| *handle)
+            {
+                if engine.torrent_handle_for(&info_hash).await != Some(expected_handle) {
+                    warn!(
+                        component = "storage_jobs",
+                        operation = "mark_manual_recovery",
+                        job_id = %job_id,
+                        torrent = %info_hash,
+                        result = "stale",
+                        "discarding manual-recovery completion for a replaced torrent"
+                    );
+                    continue;
+                }
+            }
             engine.stop_torrent_task(&info_hash).await;
             if let Err(mark_error) = engine
                 .mark_torrent_manual_recovery(&info_hash, &reason)
@@ -247,7 +282,7 @@ pub(super) async fn finish_storage_plan(
     }
     if succeeded && terminal_state == STORAGE_JOB_STATE_COMMIT_PENDING {
         if let Err(error) = engine
-            .complete_storage_plan_job_async(&job_id, &completed_steps)
+            .complete_storage_plan_job_async(&job_id, &completed_steps, completed_byte_offset)
             .await
         {
             warn!(
@@ -261,7 +296,7 @@ pub(super) async fn finish_storage_plan(
         }
     }
     engine
-        .resume_torrents_after_storage_plan(affected_torrents)
+        .resume_torrents_after_storage_plan(affected_torrents, affected_torrent_handles)
         .await;
 }
 
@@ -291,10 +326,12 @@ pub(super) struct StorageMoveCompletion {
     pub(super) old_save_path: std::path::PathBuf,
     pub(super) save_path: std::path::PathBuf,
     pub(super) quiesced: Option<bool>,
+    pub(super) torrent_handle: Option<rt_session::TorrentHandle>,
     pub(super) succeeded: bool,
     pub(super) terminal_state: String,
     pub(super) error: Option<String>,
     pub(super) completed_steps: Vec<usize>,
+    pub(super) completed_byte_offset: Option<i64>,
     pub(super) requires_manual_recovery: bool,
     pub(super) retry_attempt: u8,
 }
@@ -307,10 +344,12 @@ pub(super) async fn finish_storage_move(engine: &mut Engine, completion: Storage
         old_save_path,
         save_path,
         quiesced,
+        torrent_handle,
         succeeded,
         terminal_state,
         error,
         completed_steps,
+        completed_byte_offset,
         requires_manual_recovery,
         retry_attempt,
     } = completion;
@@ -322,10 +361,12 @@ pub(super) async fn finish_storage_move(engine: &mut Engine, completion: Storage
             old_save_path,
             save_path,
             quiesced,
+            torrent_handle,
             succeeded,
             terminal_state,
             error,
             completed_steps,
+            completed_byte_offset,
             requires_manual_recovery,
             retry_attempt,
         )

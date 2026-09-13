@@ -564,7 +564,12 @@ where
     // before a step is skipped.
     let mut completed = HashSet::new();
     for index in completed_steps {
-        check_control()?;
+        if let Err(error) = check_control() {
+            if cancellation_can_rollback(plan, &completed, false) && is_cancellation_error(&error) {
+                return Err(rollback_cancelled_progress(error, plan, &rollback_plan_fn));
+            }
+            return Err(error);
+        }
         if step_is_applied_fn(*index, &plan.steps[*index])? {
             completed.insert(*index);
         }
@@ -581,7 +586,14 @@ where
             if completed.contains(&index) {
                 continue;
             }
-            check_control()?;
+            if let Err(error) = check_control() {
+                if cancellation_can_rollback(plan, &completed, false)
+                    && is_cancellation_error(&error)
+                {
+                    return Err(rollback_cancelled_progress(error, plan, &rollback_plan_fn));
+                }
+                return Err(error);
+            }
             if step_is_applied_fn(index, step)? {
                 completed.insert(index);
                 inferred_completed.insert(index);
@@ -608,12 +620,24 @@ where
     for (index, step) in plan.steps.iter().enumerate() {
         if completed.contains(&index) {
             if inferred_completed.contains(&index) {
-                checkpoint_step(index, step)?;
+                if let Err(error) = checkpoint_step(index, step) {
+                    if cancellation_can_rollback(plan, &completed, false)
+                        && is_cancellation_error(&error)
+                    {
+                        return Err(rollback_cancelled_progress(error, plan, &rollback_plan_fn));
+                    }
+                    return Err(error);
+                }
             }
             execution.applied_steps.push(step.clone());
             continue;
         }
-        check_control()?;
+        if let Err(error) = check_control() {
+            if cancellation_can_rollback(plan, &completed, false) && is_cancellation_error(&error) {
+                return Err(rollback_cancelled_progress(error, plan, &rollback_plan_fn));
+            }
+            return Err(error);
+        }
         if let Err(error) = execute_step_fn(step) {
             let (rolled_back, rollback_failures) = rollback_plan_fn(plan);
             execution.rolled_back_steps = rolled_back;
@@ -677,10 +701,85 @@ where
             };
             return Err(StorageError::StagedMoveFailed { step, reason });
         }
-        checkpoint_step(index, step)?;
+        // Record the filesystem mutation before invoking the checkpoint
+        // callback. The callback persists the checkpoint and then checks the
+        // control plane, so a cancellation can arrive after this step is
+        // live but before the callback returns.
+        completed.insert(index);
+        if let Err(error) = checkpoint_step(index, step) {
+            if cancellation_can_rollback(plan, &completed, false) && is_cancellation_error(&error) {
+                return Err(rollback_cancelled_progress(error, plan, &rollback_plan_fn));
+            }
+            return Err(error);
+        }
         execution.applied_steps.push(step.clone());
     }
     Ok(execution)
+}
+
+fn is_cancellation_error(error: &StorageError) -> bool {
+    matches!(
+        error,
+        StorageError::Cancelled | StorageError::StagedMoveFailed { step: "cancel", .. }
+    )
+}
+
+fn cancellation_can_rollback(
+    plan: &StoragePlan,
+    completed: &HashSet<usize>,
+    current_step_committed: bool,
+) -> bool {
+    (current_step_committed || !completed.is_empty())
+        && completed.iter().all(|index| {
+            plan.steps.get(*index).is_some_and(|step| {
+                !matches!(
+                    step.action,
+                    PlannedStorageAction::Rename
+                        | PlannedStorageAction::SafeDelete
+                        | PlannedStorageAction::SafeDeleteIfPresent
+                        | PlannedStorageAction::PruneEmptyDirs
+                )
+            })
+        })
+}
+
+fn rollback_cancelled_progress<R>(
+    error: StorageError,
+    plan: &StoragePlan,
+    rollback_plan_fn: &R,
+) -> StorageError
+where
+    R: Fn(&StoragePlan) -> (Vec<StoragePlanStep>, Vec<(StoragePlanStep, String)>),
+{
+    let (_, rollback_failures) = rollback_plan_fn(plan);
+    if rollback_failures.is_empty() {
+        return error;
+    }
+    let failures = rollback_failures
+        .iter()
+        .map(|(step, reason)| {
+            format!(
+                "{:?} {} -> {}: {reason}",
+                step.action,
+                step.source
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
+                step.destination
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    StorageError::FilesystemStateUncertain {
+        step: "rollback",
+        reason: format!(
+            "{error}; ADDITIONALLY {} rollback step(s) failed and left the filesystem in a partial state requiring manual attention: {failures}",
+            rollback_failures.len()
+        ),
+    }
 }
 
 pub fn execute_storage_plan_under_roots(
@@ -762,6 +861,30 @@ where
             &check_control,
         )
     }
+}
+
+/// Run the plan's idempotent rollback steps under the same configured roots
+/// used for execution. This is used when a queued or paused job is cancelled
+/// after it has already committed non-destructive staging work.
+pub fn rollback_storage_plan_under_roots(
+    plan: &StoragePlan,
+    roots: &[PathBuf],
+) -> Result<StoragePlanExecution, StorageError> {
+    ensure_plan_can_apply(plan)?;
+    let roots = canonical_roots(roots)?;
+    validate_plan_paths_under_roots(plan, &roots)?;
+    if plan.dry_run {
+        return Ok(StoragePlanExecution::default());
+    }
+    #[cfg(unix)]
+    let (rolled_back_steps, rollback_failures) = secure_fs::rollback_plan(plan, &roots);
+    #[cfg(not(unix))]
+    let (rolled_back_steps, rollback_failures) = rollback_plan(plan);
+    Ok(StoragePlanExecution {
+        applied_steps: Vec::new(),
+        rolled_back_steps,
+        rollback_failures,
+    })
 }
 
 #[cfg(any(not(unix), test))]
@@ -3111,6 +3234,112 @@ mod tests {
         assert!(source.exists());
         assert!(!destination.exists());
         assert!(!root.join(".destination.bin.tng-copying").exists());
+    }
+
+    #[test]
+    fn cancellation_after_checkpoint_rolls_back_committed_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.bin");
+        let destination = root.join("destination.bin");
+        std::fs::write(&source, b"data").unwrap();
+        let plan = plan_import(&ImportPlanRequest {
+            source: source.clone(),
+            destination: destination.clone(),
+            bytes: 4,
+            available_bytes: None,
+            hardlink_or_copy: false,
+            dry_run: false,
+        });
+
+        let result = execute_storage_plan_under_roots_with_checkpoints_and_control(
+            &plan,
+            std::slice::from_ref(&root),
+            &[],
+            |_, _| {
+                Err(StorageError::StagedMoveFailed {
+                    step: "cancel",
+                    reason: "injected cancellation after filesystem commit".to_owned(),
+                })
+            },
+            || Ok(()),
+        );
+
+        assert!(matches!(
+            result,
+            Err(StorageError::StagedMoveFailed { step: "cancel", .. })
+        ));
+        assert!(source.exists());
+        assert!(!destination.exists());
+        assert!(!staging_path(&destination).exists());
+    }
+
+    #[test]
+    fn cancellation_before_next_step_rolls_back_prior_staging() {
+        use std::cell::Cell;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.bin");
+        let destination = root.join("destination.bin");
+        let staging = staging_path(&destination);
+        std::fs::write(&source, b"data").unwrap();
+        let plan = StoragePlan {
+            dry_run: false,
+            can_apply: true,
+            issues: Vec::new(),
+            steps: vec![
+                StoragePlanStep {
+                    action: PlannedStorageAction::CopyVerifyRename,
+                    source: Some(source.clone()),
+                    destination: Some(staging.clone()),
+                    bytes: 4,
+                },
+                StoragePlanStep {
+                    action: PlannedStorageAction::Rename,
+                    source: Some(staging.clone()),
+                    destination: Some(destination.clone()),
+                    bytes: 4,
+                },
+            ],
+            rollback_steps: vec![StoragePlanStep {
+                action: PlannedStorageAction::SafeDeleteIfPresent,
+                source: Some(staging.clone()),
+                destination: None,
+                bytes: 4,
+            }],
+        };
+        let checkpointed = Cell::new(false);
+
+        let result = execute_storage_plan_under_roots_with_checkpoints_and_control(
+            &plan,
+            std::slice::from_ref(&root),
+            &[],
+            |_, _| {
+                checkpointed.set(true);
+                Ok(())
+            },
+            || {
+                if checkpointed.get() {
+                    Err(StorageError::StagedMoveFailed {
+                        step: "cancel",
+                        reason: "injected cancellation before rename".to_owned(),
+                    })
+                } else {
+                    Ok(())
+                }
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(StorageError::StagedMoveFailed { step: "cancel", .. })
+        ));
+        assert!(source.exists());
+        assert!(!destination.exists());
+        assert!(!staging.exists());
     }
 
     #[test]

@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 
 pub const FASTRESUME_VERSION: u32 = 1;
@@ -144,19 +146,32 @@ impl FastresumeState {
     ///
     /// Returns the count of pieces reset to Unknown.
     pub fn invalidate_file(&mut self, file_index: u32, piece_map: &rt_piece_map::PieceMap) -> u32 {
+        let affected_pieces = (0..piece_map.piece_count)
+            .filter(|piece| {
+                piece_map
+                    .piece_to_file_regions(*piece)
+                    .map(|regions| regions.iter().any(|region| region.file_index == file_index))
+                    .unwrap_or(false)
+            })
+            .collect::<HashSet<_>>();
         let mut count = 0u32;
-        for piece in 0..piece_map.piece_count {
-            let regions = match piece_map.piece_to_file_regions(piece) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            if regions.iter().any(|r| r.file_index == file_index)
-                && self.pieces[piece as usize] == PieceState::Valid
-            {
-                self.pieces[piece as usize] = PieceState::Unknown;
+        for piece in &affected_pieces {
+            if self.pieces.get_mut(*piece as usize).is_some_and(|state| {
+                if *state == PieceState::Valid {
+                    *state = PieceState::Unknown;
+                    true
+                } else {
+                    false
+                }
+            }) {
                 count += 1;
             }
         }
+        // A partial piece is also tied to the bytes in this file. Keeping its
+        // block indexes after a replacement or disappearance would make the
+        // next run trust bytes that were never verified against the new file.
+        self.partial_pieces
+            .retain(|partial| !affected_pieces.contains(&partial.piece));
         count
     }
 
@@ -167,16 +182,32 @@ impl FastresumeState {
         piece_map: &rt_piece_map::PieceMap,
     ) -> u32 {
         let mut invalidated = 0u32;
-        for new_hint in &new_hints {
-            let changed = self
+        let file_indices = self
+            .file_hints
+            .iter()
+            .map(|hint| hint.file_index)
+            .chain(new_hints.iter().map(|hint| hint.file_index))
+            .collect::<HashSet<_>>();
+        for file_index in file_indices {
+            let old = self
                 .file_hints
                 .iter()
-                .find(|h| h.file_index == new_hint.file_index)
-                .map(|old| old.size != new_hint.size || old.mtime_secs != new_hint.mtime_secs)
-                .unwrap_or(true); // treat new files as changed
+                .find(|hint| hint.file_index == file_index);
+            let new = new_hints.iter().find(|hint| hint.file_index == file_index);
+            let changed = match (old, new) {
+                (Some(old), Some(new)) => {
+                    old.size != new.size
+                        || old.mtime_secs != new.mtime_secs
+                        || old.inode != new.inode
+                }
+                // Treat both newly visible and missing files as changed. The
+                // latter matters when a previously hinted file was deleted:
+                // no current hint exists to trigger the old one-sided check.
+                _ => true,
+            };
 
             if changed {
-                invalidated += self.invalidate_file(new_hint.file_index, piece_map);
+                invalidated += self.invalidate_file(file_index, piece_map);
             }
         }
         self.file_hints = new_hints;
@@ -363,6 +394,62 @@ mod tests {
         assert_eq!(inv2, 4);
         assert!(!state.is_complete());
         assert!(state.pieces.iter().all(|&p| p == PieceState::Unknown));
+    }
+
+    #[test]
+    fn file_replacement_and_disappearance_invalidate_partial_state() {
+        let pm = make_pm(64, 256);
+        let mut state = FastresumeState::new_empty(&test_hash(), 4, ImportPolicy::TrustHints);
+        state.pieces.fill(PieceState::Valid);
+        state.pieces[1] = PieceState::Unknown;
+        state.partial_pieces = vec![PartialPieceState {
+            piece: 1,
+            received_blocks: vec![0],
+        }];
+        state.file_hints = vec![FileHint {
+            file_index: 0,
+            size: 256,
+            mtime_secs: 1000,
+            inode: 7,
+        }];
+
+        // A replacement with the same size and timestamp still has different
+        // bytes when its inode changes.
+        let invalidated = state.apply_file_hints(
+            vec![FileHint {
+                file_index: 0,
+                size: 256,
+                mtime_secs: 1000,
+                inode: 8,
+            }],
+            &pm,
+        );
+        assert_eq!(invalidated, 3);
+        assert!(state.pieces[..3]
+            .iter()
+            .all(|state| *state == PieceState::Unknown));
+        assert!(state.partial_pieces.is_empty());
+
+        state.pieces.fill(PieceState::Valid);
+        state.file_hints = vec![FileHint {
+            file_index: 0,
+            size: 256,
+            mtime_secs: 1000,
+            inode: 8,
+        }];
+        state.partial_pieces = vec![PartialPieceState {
+            piece: 2,
+            received_blocks: vec![0],
+        }];
+
+        // A missing current hint must invalidate the old file as well.
+        let invalidated = state.apply_file_hints(Vec::new(), &pm);
+        assert_eq!(invalidated, 4);
+        assert!(state
+            .pieces
+            .iter()
+            .all(|state| *state == PieceState::Unknown));
+        assert!(state.partial_pieces.is_empty());
     }
 
     #[test]

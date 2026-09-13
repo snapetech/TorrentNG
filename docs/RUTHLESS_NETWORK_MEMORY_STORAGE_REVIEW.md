@@ -253,14 +253,14 @@ Concerns:
 
 - Default worker counts and queue depths are static: 4 I/O workers, 2 hash workers, 256 queue depth. That may be too small for NVMe and too aggressive for HDD arrays depending on topology.
 - Config validates almost nothing: invalid pressure thresholds, zero/huge worker values, weird memory class budgets, huge file pool sizes, and pathological queue depths can get through.
-- File pool capacity is global per scheduler, but huge multi-file torrents and many active torrents need better aggregate FD budgeting.
+- Path-backed schedulers now share one bounded file pool per process/configuration, which removes the per-active-torrent cache multiplication. A separate explicit FD budget is still not modeled for non-cache descriptors or standalone schedulers.
 - `BlockingPool` uses a synchronous channel plus worker threads. That is acceptable, but tuning must be exposed and measured as a first-class performance surface.
 
 Required patch direction:
 
 - Add config validation and clamping with warnings.
 - Add topology-derived defaults: HDD, SSD, NVMe, network mount, CoW filesystem.
-- Add global process FD budget and per-scheduler leasing.
+- Add an explicit global process FD budget and per-scheduler leasing if non-cache descriptor pressure becomes a measured bottleneck.
 - Surface storage profile in `/api/v1/storage` and metrics.
 - Add soak tests for HDD-like seek storms, NVMe parallel reads, and mixed recheck/download/upload workloads.
 

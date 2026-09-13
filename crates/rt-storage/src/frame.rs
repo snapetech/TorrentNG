@@ -12,7 +12,7 @@ use std::sync::{
     Arc, Mutex,
 };
 
-use once_cell::sync::Lazy;
+use once_cell::sync::OnceCell;
 
 /// Default process-wide frame-pool cap when `TNG_STORAGE_FRAME_CAP_MB` is not
 /// set.
@@ -26,6 +26,8 @@ const SIZE_CLASSES: [usize; 3] = [16 * 1024, 64 * 1024, 256 * 1024];
 /// Per-class cap on retained (idle) buffers, to bound resident memory when
 /// load drops. Excess freed buffers are dropped rather than retained.
 const MAX_RETAINED_PER_CLASS: usize = 256;
+
+static GLOBAL_FRAME_POOL: OnceCell<FramePool> = OnceCell::new();
 
 #[derive(Debug)]
 struct PoolInner {
@@ -71,11 +73,17 @@ impl FramePool {
         SIZE_CLASSES.iter().position(|&c| len <= c)
     }
 
+    fn charge_for(len: usize) -> u64 {
+        Self::class_for(len)
+            .map(|class| SIZE_CLASSES[class] as u64)
+            .unwrap_or(len as u64)
+    }
+
     /// Acquire a frame of at least `len` bytes, or `None` if granting it
     /// would exceed the cap. The returned frame's usable length is exactly
     /// `len`; backing capacity may be larger (a size class).
     pub fn try_acquire(&self, len: usize) -> Option<Frame> {
-        let charge = len as u64;
+        let charge = Self::charge_for(len);
         // Reserve against the cap first (CAS loop) so concurrent callers
         // cannot collectively overshoot.
         loop {
@@ -111,13 +119,14 @@ impl FramePool {
         }
         Some(Frame {
             len,
+            charge,
             backing: FrameBacking::Vec { buf, class },
             pool: self.clone(),
         })
     }
 
-    fn release(&self, mut buf: Vec<u8>, len: usize, class: Option<usize>) {
-        self.in_use.fetch_sub(len as u64, Ordering::AcqRel);
+    fn release(&self, mut buf: Vec<u8>, charge: u64, class: Option<usize>) {
+        self.in_use.fetch_sub(charge, Ordering::AcqRel);
         if let Some(ci) = class {
             // Restore full class capacity and retain for reuse, bounded.
             buf.clear();
@@ -130,23 +139,47 @@ impl FramePool {
         // Oversize buffers are simply dropped.
     }
 
-    fn release_charge(&self, len: usize) {
-        self.in_use.fetch_sub(len as u64, Ordering::AcqRel);
+    fn release_charge(&self, charge: u64) {
+        self.in_use.fetch_sub(charge, Ordering::AcqRel);
     }
 }
 
 /// Process-wide storage frame pool shared by `StorageRuntime` and the live
 /// torrent scheduler.
 pub fn global_frame_pool() -> &'static FramePool {
-    static GLOBAL: Lazy<FramePool> = Lazy::new(|| {
+    GLOBAL_FRAME_POOL.get_or_init(|| {
         let cap_mb = std::env::var("TNG_STORAGE_FRAME_CAP_MB")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|&v| v > 0)
             .unwrap_or(DEFAULT_FRAME_CAP_MB);
         FramePool::new(cap_mb.saturating_mul(1024 * 1024))
-    });
-    &GLOBAL
+    })
+}
+
+/// Configure the process-wide frame-pool cap before the daemon starts using
+/// storage. Standalone storage users that do not call this function retain
+/// the environment-variable/default initialization in [`global_frame_pool`].
+///
+/// If another component initialized the pool first, the requested cap must
+/// match the existing cap; changing a live pool would make its in-flight
+/// reservations ambiguous.
+pub fn configure_global_frame_cap(cap_bytes: u64) -> Result<(), u64> {
+    if let Some(pool) = GLOBAL_FRAME_POOL.get() {
+        return (pool.cap_bytes() == cap_bytes)
+            .then_some(())
+            .ok_or_else(|| pool.cap_bytes());
+    }
+    match GLOBAL_FRAME_POOL.set(FramePool::new(cap_bytes)) {
+        Ok(()) => Ok(()),
+        Err(pool) => {
+            let actual = GLOBAL_FRAME_POOL
+                .get()
+                .map(FramePool::cap_bytes)
+                .unwrap_or_else(|| pool.cap_bytes());
+            (actual == cap_bytes).then_some(()).ok_or(actual)
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -161,6 +194,7 @@ enum FrameBacking {
 #[derive(Debug)]
 pub struct Frame {
     len: usize,
+    charge: u64,
     backing: FrameBacking,
     pool: FramePool,
 }
@@ -197,16 +231,18 @@ impl Frame {
     /// released before returning.
     pub fn into_bytes(mut self) -> bytes::Bytes {
         let len = self.len;
+        let charge = self.charge;
         self.len = 0;
+        self.charge = 0;
         match std::mem::replace(&mut self.backing, FrameBacking::Empty) {
             FrameBacking::Vec { mut buf, .. } => {
-                self.pool.release_charge(len);
+                self.pool.release_charge(charge);
                 buf.truncate(len);
                 bytes::Bytes::from(buf)
             }
             FrameBacking::Registered { slot } => {
                 let bytes = bytes::Bytes::copy_from_slice(slot.as_slice(len));
-                self.pool.release_charge(len);
+                self.pool.release_charge(charge);
                 drop(slot);
                 bytes
             }
@@ -217,10 +253,13 @@ impl Frame {
     /// Move this frame-pool charge onto a registered fixed-buffer slot.
     pub fn into_registered_slot(mut self, slot: RegisteredFrameSlot) -> Self {
         let len = self.len;
+        let charge = self.charge;
         self.len = 0;
+        self.charge = 0;
         self.backing = FrameBacking::Empty;
         Frame {
             len,
+            charge,
             backing: FrameBacking::Registered { slot },
             pool: self.pool.clone(),
         }
@@ -246,11 +285,12 @@ impl std::ops::DerefMut for Frame {
 
 impl Drop for Frame {
     fn drop(&mut self) {
+        let charge = self.charge;
         match std::mem::replace(&mut self.backing, FrameBacking::Empty) {
-            FrameBacking::Vec { buf, class } => self.pool.release(buf, self.len, class),
+            FrameBacking::Vec { buf, class } => self.pool.release(buf, charge, class),
             FrameBacking::Registered { slot } => {
                 drop(slot);
-                self.pool.release_charge(self.len);
+                self.pool.release_charge(charge);
             }
             FrameBacking::Empty => {}
         }
@@ -367,8 +407,18 @@ mod tests {
         assert_eq!(pool.in_use_bytes(), 0);
         let f = pool.try_acquire(4096).unwrap();
         assert_eq!(f.len(), 4096);
-        assert_eq!(pool.in_use_bytes(), 4096);
+        assert_eq!(pool.in_use_bytes(), 16 * 1024);
         drop(f);
+        assert_eq!(pool.in_use_bytes(), 0);
+    }
+
+    #[test]
+    fn cap_accounts_for_pooled_backing_capacity() {
+        let pool = FramePool::new(16 * 1024);
+        let frame = pool.try_acquire(1).unwrap();
+        assert_eq!(pool.in_use_bytes(), 16 * 1024);
+        assert!(pool.try_acquire(1).is_none());
+        drop(frame);
         assert_eq!(pool.in_use_bytes(), 0);
     }
 
@@ -413,7 +463,7 @@ mod tests {
         let pool = FramePool::new(1024 * 1024);
         let mut frame = pool.try_acquire(4096).unwrap();
         frame.as_mut_slice()[..5].copy_from_slice(b"hello");
-        assert_eq!(pool.in_use_bytes(), 4096);
+        assert_eq!(pool.in_use_bytes(), 16 * 1024);
 
         let bytes = frame.into_bytes();
 
@@ -434,7 +484,7 @@ mod tests {
 
         assert!(frame.is_registered_slot());
         assert_eq!(&frame.as_slice()[..5], b"slot!");
-        assert_eq!(pool.in_use_bytes(), 4096);
+        assert_eq!(pool.in_use_bytes(), 16 * 1024);
         assert!(slots.acquire(1).is_none());
 
         drop(frame);

@@ -4,7 +4,9 @@
 /// The actual UDP I/O is handled by the caller via tokio UdpSocket.
 use rand::RngExt;
 
-use crate::{error::TrackerError, peer::parse_compact_peers_v4, request::AnnounceRequest, Peer};
+use crate::{
+    error::TrackerError, peer::parse_compact_peers_v4_with_limit, request::AnnounceRequest, Peer,
+};
 
 pub const PROTOCOL_MAGIC: u64 = 0x41727101980;
 pub const ACTION_CONNECT: u32 = 0;
@@ -142,6 +144,11 @@ pub struct UdpAnnounceResponse {
 impl UdpAnnounceResponse {
     /// Parse a UDP announce response. Minimum 20 bytes header + compact peers.
     pub fn parse(buf: &[u8]) -> Result<Self, TrackerError> {
+        Self::parse_with_peer_limit(buf, usize::MAX)
+    }
+
+    /// Parse a UDP announce response while bounding peer output.
+    pub fn parse_with_peer_limit(buf: &[u8], max_peers: usize) -> Result<Self, TrackerError> {
         if buf.len() < 20 {
             return Err(TrackerError::Udp(format!(
                 "announce response too short: {} bytes",
@@ -158,7 +165,7 @@ impl UdpAnnounceResponse {
         let interval = u32::from_be_bytes(buf[8..12].try_into().unwrap());
         let leechers = u32::from_be_bytes(buf[12..16].try_into().unwrap());
         let seeders = u32::from_be_bytes(buf[16..20].try_into().unwrap());
-        let peers = parse_compact_peers_v4(&buf[20..])?;
+        let peers = parse_compact_peers_v4_with_limit(&buf[20..], max_peers)?;
         Ok(UdpAnnounceResponse {
             transaction_id,
             interval,
@@ -255,6 +262,21 @@ mod tests {
         assert_eq!(resp.leechers, 5);
         assert_eq!(resp.seeders, 10);
         assert_eq!(resp.peers.len(), 2);
+    }
+
+    #[test]
+    fn announce_response_peer_limit_bounds_compact_peers() {
+        let mut buf = vec![0u8; 20];
+        buf[0..4].copy_from_slice(&ACTION_ANNOUNCE.to_be_bytes());
+        buf[4..8].copy_from_slice(&0xCAFEBABEu32.to_be_bytes());
+        buf[8..12].copy_from_slice(&1800u32.to_be_bytes());
+        buf.extend_from_slice(&[10, 0, 0, 1, 0x1A, 0xE1]);
+        buf.extend_from_slice(&[10, 0, 0, 2, 0x1A, 0xE2]);
+
+        let response = UdpAnnounceResponse::parse_with_peer_limit(&buf, 1).unwrap();
+
+        assert_eq!(response.peers.len(), 1);
+        assert_eq!(response.peers[0].addr, "10.0.0.1:6881".parse().unwrap());
     }
 
     #[test]

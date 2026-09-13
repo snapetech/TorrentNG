@@ -60,6 +60,7 @@ impl Drop for CancellationGuard {
 pub(crate) struct DbWorker {
     tx: mpsc::SyncSender<DbRequest>,
     healthy: Arc<AtomicBool>,
+    force_stop: Arc<AtomicBool>,
     thread: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
@@ -133,6 +134,8 @@ impl DbWorker {
         let (tx, rx) = mpsc::sync_channel(DB_QUEUE_CAPACITY);
         let healthy = Arc::new(AtomicBool::new(true));
         let worker_healthy = Arc::clone(&healthy);
+        let force_stop = Arc::new(AtomicBool::new(false));
+        let worker_force_stop = Arc::clone(&force_stop);
         let thread = thread_builder().spawn(move || {
             let mut db = match Connection::open(&db_path) {
                 Ok(db) => db,
@@ -161,7 +164,20 @@ impl DbWorker {
                 return;
             }
 
-            while let Ok(request) = rx.recv() {
+            loop {
+                let request = match rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(request) => request,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if worker_force_stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        continue;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
+                if worker_force_stop.load(Ordering::Acquire) {
+                    break;
+                }
                 match request {
                     DbRequest::Execute {
                         operation,
@@ -198,6 +214,9 @@ impl DbWorker {
                                 let _ = reply.send(result);
                             }
                         }
+                        if worker_force_stop.load(Ordering::Acquire) {
+                            break;
+                        }
                     }
                     DbRequest::Shutdown { reply } => {
                         let _ = reply.send(());
@@ -231,12 +250,27 @@ impl DbWorker {
         Self {
             tx,
             healthy,
+            force_stop,
             thread: Arc::new(Mutex::new(thread)),
         }
     }
 
     pub(crate) fn is_healthy(&self) -> bool {
         self.healthy.load(Ordering::Acquire)
+    }
+
+    /// Request an out-of-band stop for drop/abort cleanup. A normal shutdown
+    /// still uses the queued sentinel so prior work drains; this fallback is
+    /// used only when the owning actor has already been aborted or a bounded
+    /// shutdown phase has timed out.
+    #[cfg(not(test))]
+    pub(crate) fn request_stop(&self) {
+        self.healthy.store(false, Ordering::Release);
+        self.force_stop();
+    }
+
+    fn force_stop(&self) {
+        self.force_stop.store(true, Ordering::Release);
     }
 
     async fn enqueue(&self, mut request: DbRequest, operation: &'static str) -> Result<(), String> {
@@ -253,6 +287,7 @@ impl DbWorker {
                 }
                 Err(mpsc::TrySendError::Disconnected(_)) => {
                     self.healthy.store(false, Ordering::Release);
+                    self.force_stop();
                     return Err("engine database worker stopped".to_owned());
                 }
             }
@@ -278,6 +313,7 @@ impl DbWorker {
                 }
                 Err(mpsc::TrySendError::Disconnected(_)) => {
                     self.healthy.store(false, Ordering::Release);
+                    self.force_stop();
                     return Err("engine database worker stopped".to_owned());
                 }
             }
@@ -286,6 +322,20 @@ impl DbWorker {
 
     /// Execute one operation in queue order and downcast its typed result.
     pub(crate) async fn run<T, F>(&self, operation: &'static str, job: F) -> Result<T, String>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> Result<T, String> + Send + 'static,
+    {
+        self.run_with_reply_timeout(operation, job, DB_REPLY_TIMEOUT)
+            .await
+    }
+
+    async fn run_with_reply_timeout<T, F>(
+        &self,
+        operation: &'static str,
+        job: F,
+        reply_timeout: Duration,
+    ) -> Result<T, String>
     where
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> Result<T, String> + Send + 'static,
@@ -303,10 +353,18 @@ impl DbWorker {
             reply: DbReply::Async(reply),
         };
         self.enqueue(request, operation).await?;
-        let value = timeout(DB_REPLY_TIMEOUT, response)
-            .await
-            .map_err(|_| format!("database worker operation timed out: {operation}"))?
-            .map_err(|_| "engine database worker dropped its reply".to_owned())??;
+        let value = match timeout(reply_timeout, response).await {
+            Ok(response) => response.map_err(|_| {
+                self.healthy.store(false, Ordering::Release);
+                self.force_stop();
+                "engine database worker dropped its reply".to_owned()
+            })??,
+            Err(_) => {
+                self.healthy.store(false, Ordering::Release);
+                self.force_stop();
+                return Err(format!("database worker operation timed out: {operation}"));
+            }
+        };
         value
             .downcast::<T>()
             .map(|value| *value)
@@ -326,18 +384,27 @@ impl DbWorker {
             return Err("engine database worker is unavailable".to_owned());
         }
         let (reply, response) = mpsc::sync_channel(1);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _cancellation_guard = CancellationGuard(Arc::clone(&cancelled));
         self.enqueue_blocking(
             DbRequest::Execute {
                 operation,
                 job: Box::new(move |db| job(db).map(|value| Box::new(value) as ErasedValue)),
-                cancelled: Arc::new(AtomicBool::new(false)),
+                cancelled,
                 reply: DbReply::Blocking(reply),
             },
             operation,
         )?;
-        let value = response
-            .recv_timeout(DB_REPLY_TIMEOUT)
-            .map_err(|error| format!("database worker operation {operation} failed: {error}"))??;
+        let value = match response.recv_timeout(DB_REPLY_TIMEOUT) {
+            Ok(value) => value?,
+            Err(error) => {
+                self.healthy.store(false, Ordering::Release);
+                self.force_stop();
+                return Err(format!(
+                    "database worker operation {operation} failed: {error}"
+                ));
+            }
+        };
         value
             .downcast::<T>()
             .map(|value| *value)
@@ -350,6 +417,7 @@ impl DbWorker {
     pub(crate) async fn shutdown(&self, budget: Duration) {
         let deadline = Instant::now() + budget;
         if !self.is_healthy() {
+            self.force_stop();
             let Some(join_budget) = deadline.checked_duration_since(Instant::now()) else {
                 return;
             };
@@ -358,37 +426,82 @@ impl DbWorker {
         }
         let (reply, response) = oneshot::channel();
         let Some(send_budget) = deadline.checked_duration_since(Instant::now()) else {
+            self.healthy.store(false, Ordering::Release);
+            self.force_stop();
             return;
         };
-        if timeout(
+        match timeout(
             send_budget,
             self.enqueue(DbRequest::Shutdown { reply }, "shutdown"),
         )
         .await
-        .is_err()
         {
-            warn!(
-                component = "db",
-                operation = "shutdown",
-                result = "send_timeout",
-                "database worker shutdown request timed out"
-            );
-            return;
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                self.healthy.store(false, Ordering::Release);
+                self.force_stop();
+                warn!(
+                    component = "db",
+                    operation = "shutdown",
+                    result = "send_error",
+                    error = %error,
+                    "database worker shutdown request could not be queued"
+                );
+                let Some(join_budget) = deadline.checked_duration_since(Instant::now()) else {
+                    return;
+                };
+                self.join_thread(join_budget).await;
+                return;
+            }
+            Err(_) => {
+                self.healthy.store(false, Ordering::Release);
+                self.force_stop();
+                warn!(
+                    component = "db",
+                    operation = "shutdown",
+                    result = "send_timeout",
+                    "database worker shutdown request timed out"
+                );
+                return;
+            }
         }
         let Some(wait_budget) = deadline.checked_duration_since(Instant::now()) else {
+            self.healthy.store(false, Ordering::Release);
+            self.force_stop();
             return;
         };
-        if timeout(wait_budget, response).await.is_err() {
-            warn!(
-                component = "db",
-                operation = "shutdown",
-                result = "drain_timeout",
-                "database worker did not drain before shutdown deadline"
-            );
-            return;
+        match timeout(wait_budget, response).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                self.healthy.store(false, Ordering::Release);
+                self.force_stop();
+                warn!(
+                    component = "db",
+                    operation = "shutdown",
+                    result = "ack_error",
+                    "database worker dropped its shutdown acknowledgement"
+                );
+                let Some(join_budget) = deadline.checked_duration_since(Instant::now()) else {
+                    return;
+                };
+                self.join_thread(join_budget).await;
+                return;
+            }
+            Err(_) => {
+                self.healthy.store(false, Ordering::Release);
+                self.force_stop();
+                warn!(
+                    component = "db",
+                    operation = "shutdown",
+                    result = "drain_timeout",
+                    "database worker did not drain before shutdown deadline"
+                );
+                return;
+            }
         }
         self.healthy.store(false, Ordering::Release);
         let Some(join_budget) = deadline.checked_duration_since(Instant::now()) else {
+            self.force_stop();
             return;
         };
         self.join_thread(join_budget).await;
@@ -403,6 +516,8 @@ impl DbWorker {
             .await
             .is_err()
         {
+            self.healthy.store(false, Ordering::Release);
+            self.force_stop();
             warn!(
                 component = "db",
                 operation = "join_worker_thread",
@@ -644,5 +759,150 @@ mod tests {
             .expect("pending operation");
         assert_eq!(seen.load(Ordering::SeqCst), 1);
         assert!(!worker.is_healthy());
+    }
+
+    #[tokio::test]
+    async fn shutdown_timeout_marks_worker_unhealthy() {
+        let worker = worker();
+        let (started_tx, started) = oneshot::channel();
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let release_for_job = Arc::clone(&release);
+        let pending = tokio::spawn({
+            let worker = worker.clone();
+            async move {
+                worker
+                    .run("blocking_shutdown", move |_| {
+                        let _ = started_tx.send(());
+                        release_for_job.wait();
+                        Ok::<_, String>(())
+                    })
+                    .await
+            }
+        });
+        timeout(Duration::from_secs(1), started)
+            .await
+            .expect("blocking operation started before shutdown")
+            .expect("started signal");
+
+        worker.shutdown(Duration::from_millis(25)).await;
+        assert!(!worker.is_healthy());
+
+        release.wait();
+        pending
+            .await
+            .expect("blocking operation task")
+            .expect("blocking operation");
+        worker.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn zero_budget_shutdown_forces_stop_before_enqueue() {
+        let worker = worker();
+
+        worker.shutdown(Duration::ZERO).await;
+
+        assert!(!worker.is_healthy());
+        assert!(worker.force_stop.load(Ordering::Acquire));
+        assert_eq!(
+            worker
+                .run("after_zero_budget_shutdown", |_| Ok::<_, String>(()))
+                .await
+                .expect_err("stopped worker must reject new operations"),
+            "engine database worker is unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_queue_timeout_forces_worker_to_stop() {
+        let worker = worker();
+        let (started_tx, started) = oneshot::channel();
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let release_for_job = Arc::clone(&release);
+        let pending = tokio::spawn({
+            let worker = worker.clone();
+            async move {
+                worker
+                    .run("blocking_full_queue", move |_| {
+                        let _ = started_tx.send(());
+                        release_for_job.wait();
+                        Ok::<_, String>(())
+                    })
+                    .await
+            }
+        });
+        timeout(Duration::from_secs(1), started)
+            .await
+            .expect("blocking operation started before queue fill")
+            .expect("started signal");
+
+        let executed = Arc::new(AtomicUsize::new(0));
+        let mut queued_replies = Vec::with_capacity(DB_QUEUE_CAPACITY);
+        for _ in 0..DB_QUEUE_CAPACITY {
+            let (reply, response) = oneshot::channel();
+            let executed_for_job = Arc::clone(&executed);
+            worker
+                .tx
+                .try_send(DbRequest::Execute {
+                    operation: "queued_after_shutdown_timeout",
+                    job: Box::new(move |_| {
+                        executed_for_job.fetch_add(1, Ordering::SeqCst);
+                        Ok::<ErasedValue, String>(Box::new(()))
+                    }),
+                    cancelled: Arc::new(AtomicBool::new(false)),
+                    reply: DbReply::Async(reply),
+                })
+                .expect("worker queue should accept the test workload");
+            queued_replies.push(response);
+        }
+
+        worker.shutdown(Duration::from_millis(25)).await;
+        assert!(!worker.is_healthy());
+
+        release.wait();
+        pending
+            .await
+            .expect("blocking operation task")
+            .expect("blocking operation");
+        worker.shutdown(Duration::from_secs(1)).await;
+        assert_eq!(executed.load(Ordering::SeqCst), 0);
+        drop(queued_replies);
+    }
+
+    #[tokio::test]
+    async fn operation_timeout_marks_worker_unhealthy() {
+        let worker = worker();
+        let (started_tx, started) = oneshot::channel();
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let release_for_job = Arc::clone(&release);
+        let pending = tokio::spawn({
+            let worker = worker.clone();
+            async move {
+                worker
+                    .run_with_reply_timeout(
+                        "blocking_operation_timeout",
+                        move |_| {
+                            let _ = started_tx.send(());
+                            release_for_job.wait();
+                            Ok::<_, String>(())
+                        },
+                        Duration::from_millis(25),
+                    )
+                    .await
+            }
+        });
+        timeout(Duration::from_secs(1), started)
+            .await
+            .expect("blocking operation started before timeout")
+            .expect("started signal");
+
+        let result = pending.await.expect("timed operation task");
+        assert_eq!(
+            result.expect_err("operation should time out"),
+            "database worker operation timed out: blocking_operation_timeout"
+        );
+        assert!(!worker.is_healthy());
+
+        release.wait();
+        worker.shutdown(Duration::from_secs(1)).await;
     }
 }

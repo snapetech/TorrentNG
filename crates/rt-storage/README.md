@@ -32,7 +32,11 @@ scheduler used by the TorrentNG client.
   hash, and bytes-by-class counters for metrics integration.
 - `IoClass::PeerRead` can read ahead into a small per-file cache while returning
   exactly the requested block bytes to the caller.
-- `MountScheduler` and `StorageRuntime` use a probe-selected disk backend. Set
+- `MountScheduler` and `StorageRuntime` use a probe-selected disk backend. The
+  path-backed `MountScheduler` instances share the bounded file cache, disk
+  backend, I/O workers, and hash workers for one process/configuration; their
+  mount semaphores, dirty generations, peer-read caches, and counters remain
+  isolated. Set
   `TNG_STORAGE_BACKEND=auto|pread|uring` to request a backend. `auto` currently
   selects the conservative portable worker-pool baseline, `pread` requests that
   baseline explicitly, and `uring` uses Linux `io_uring` positioned SQEs when

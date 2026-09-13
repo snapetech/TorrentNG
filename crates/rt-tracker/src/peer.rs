@@ -39,16 +39,24 @@ impl CompactPeer {
 
 /// Parse compact IPv4 peer list (BEP 23): 6-byte chunks.
 pub fn parse_compact_peers_v4(bytes: &[u8]) -> Result<Vec<Peer>, TrackerError> {
+    parse_compact_peers_v4_with_limit(bytes, usize::MAX)
+}
+
+/// Parse at most `max_peers` entries from a compact IPv4 peer list.
+pub fn parse_compact_peers_v4_with_limit(
+    bytes: &[u8],
+    max_peers: usize,
+) -> Result<Vec<Peer>, TrackerError> {
     if !bytes.len().is_multiple_of(6) {
         return Err(TrackerError::ParseError(format!(
             "compact peers v4 length {} not multiple of 6",
             bytes.len()
         )));
     }
-    Ok(bytes
-        .as_chunks::<6>()
-        .0
+    let chunks = bytes.as_chunks::<6>().0;
+    Ok(chunks
         .iter()
+        .take(max_peers)
         .map(|arr| Peer {
             addr: CompactPeer::from_bytes_v4(arr).addr,
             peer_id: None,
@@ -58,16 +66,24 @@ pub fn parse_compact_peers_v4(bytes: &[u8]) -> Result<Vec<Peer>, TrackerError> {
 
 /// Parse compact IPv6 peer list: 18-byte chunks.
 pub fn parse_compact_peers_v6(bytes: &[u8]) -> Result<Vec<Peer>, TrackerError> {
+    parse_compact_peers_v6_with_limit(bytes, usize::MAX)
+}
+
+/// Parse at most `max_peers` entries from a compact IPv6 peer list.
+pub fn parse_compact_peers_v6_with_limit(
+    bytes: &[u8],
+    max_peers: usize,
+) -> Result<Vec<Peer>, TrackerError> {
     if !bytes.len().is_multiple_of(18) {
         return Err(TrackerError::ParseError(format!(
             "compact peers v6 length {} not multiple of 18",
             bytes.len()
         )));
     }
-    Ok(bytes
-        .as_chunks::<18>()
-        .0
+    let chunks = bytes.as_chunks::<18>().0;
+    Ok(chunks
         .iter()
+        .take(max_peers)
         .map(|arr| Peer {
             addr: CompactPeer::from_bytes_v6(arr).addr,
             peer_id: None,

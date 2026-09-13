@@ -53,7 +53,7 @@ const URING_FIXED_BUFFER_SLOTS: usize = 4;
 const URING_FIXED_BUFFER_LEN: usize = 256 * 1024;
 
 /// Backend requested by configuration or environment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BackendRequest {
     /// Probe for the best supported backend.
     Auto,
@@ -585,6 +585,13 @@ struct FileIdentity {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy)]
+struct RegisteredFileSlot {
+    index: u32,
+    newly_registered: bool,
+}
+
+#[cfg(target_os = "linux")]
 fn file_identity(file: &File) -> Option<FileIdentity> {
     let metadata = file.metadata().ok()?;
     Some(FileIdentity {
@@ -689,9 +696,15 @@ impl UringWorker {
             if submitted == 0 {
                 continue;
             }
-            if let Err(e) = self.ring.submit_and_wait(submitted) {
-                self.fail_all(e);
-                continue;
+            loop {
+                match self.ring.submit_and_wait(submitted) {
+                    Ok(_) => break,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => {
+                        self.fail_all(e);
+                        break;
+                    }
+                }
             }
             self.complete_ready();
         }
@@ -730,7 +743,7 @@ impl UringWorker {
                 let fixed_slot = self.fixed.as_ref().and_then(|fixed| fixed.acquire(len));
                 let entry = if let Some(buf_slot) = fixed_slot.as_ref() {
                     let ptr = buf_slot.ptr_mut();
-                    match file_slot {
+                    match file_slot.as_ref().map(|slot| slot.index) {
                         Some(file_slot) => opcode::ReadFixed::new(
                             types::Fixed(file_slot),
                             ptr,
@@ -749,7 +762,7 @@ impl UringWorker {
                     .user_data(id)
                 } else {
                     let ptr = frame.as_mut_slice().as_mut_ptr();
-                    match file_slot {
+                    match file_slot.as_ref().map(|slot| slot.index) {
                         Some(slot) => opcode::Read::new(types::Fixed(slot), ptr, len as _),
                         None => opcode::Read::new(types::Fd(file.as_raw_fd()), ptr, len as _),
                     }
@@ -759,6 +772,7 @@ impl UringWorker {
                 };
                 if let Err(e) = self.push_entry(entry) {
                     self.release_submission_resources(file_slot, fixed_slot);
+                    let _ = reply.send(Err(io::Error::new(e.kind(), e.to_string())));
                     return Err(e);
                 }
                 self.pending.insert(
@@ -781,7 +795,7 @@ impl UringWorker {
                 let len = data.len();
                 let file_slot = self.register_file_slot(&file);
                 let ptr = data.as_ptr();
-                let entry = match file_slot {
+                let entry = match file_slot.as_ref().map(|slot| slot.index) {
                     Some(slot) => opcode::Write::new(types::Fixed(slot), ptr, len as _),
                     None => opcode::Write::new(types::Fd(file.as_raw_fd()), ptr, len as _),
                 }
@@ -790,6 +804,7 @@ impl UringWorker {
                 .user_data(id);
                 if let Err(e) = self.push_entry(entry) {
                     self.release_submission_resources(file_slot, None);
+                    let _ = reply.send(Err(io::Error::new(e.kind(), e.to_string())));
                     return Err(e);
                 }
                 self.pending.insert(
@@ -804,27 +819,34 @@ impl UringWorker {
             }
             Job::Sync { file, reply } => {
                 let file_slot = self.register_file_slot(&file);
-                let entry = match file_slot {
+                let entry = match file_slot.as_ref().map(|slot| slot.index) {
                     Some(slot) => opcode::Fsync::new(types::Fixed(slot)),
                     None => opcode::Fsync::new(types::Fd(file.as_raw_fd())),
                 }
                 .flags(types::FsyncFlags::DATASYNC)
                 .build()
                 .user_data(id);
-                self.push_entry(entry)?;
+                if let Err(e) = self.push_entry(entry) {
+                    self.release_submission_resources(file_slot, None);
+                    let _ = reply.send(Err(io::Error::new(e.kind(), e.to_string())));
+                    return Err(e);
+                }
                 self.pending.insert(id, PendingUring::Sync { file, reply });
             }
         }
         Ok(())
     }
 
-    fn register_file_slot(&mut self, file: &File) -> Option<u32> {
+    fn register_file_slot(&mut self, file: &File) -> Option<RegisteredFileSlot> {
         if !self.registered_files {
             return None;
         }
         let identity = file_identity(file)?;
         if let Some(slot) = self.file_slots.get(&identity) {
-            return Some(*slot);
+            return Some(RegisteredFileSlot {
+                index: *slot,
+                newly_registered: false,
+            });
         }
         let slot = self.slot_files.iter().position(Option::is_none)? as u32;
         match self
@@ -835,7 +857,10 @@ impl UringWorker {
             Ok(1) => {
                 self.slot_files[slot as usize] = Some(identity.clone());
                 self.file_slots.insert(identity, slot);
-                Some(slot)
+                Some(RegisteredFileSlot {
+                    index: slot,
+                    newly_registered: true,
+                })
             }
             Ok(_) => None,
             Err(e) => {
@@ -854,10 +879,35 @@ impl UringWorker {
 
     fn release_submission_resources(
         &mut self,
-        _file_slot: Option<u32>,
+        file_slot: Option<RegisteredFileSlot>,
         fixed_slot: Option<RegisteredFrameSlot>,
     ) {
         drop(fixed_slot);
+        let Some(file_slot) = file_slot.filter(|slot| slot.newly_registered) else {
+            return;
+        };
+        let index = file_slot.index as usize;
+        let Some(identity) = self.slot_files.get_mut(index).and_then(Option::take) else {
+            return;
+        };
+        self.file_slots.remove(&identity);
+        // `push_entry` failed, so no SQE can reference this slot. Clear the
+        // sparse entry as well as the worker bookkeeping so a transient full
+        // submission queue cannot consume the finite fixed-file table.
+        if let Err(error) = self
+            .ring
+            .submitter()
+            .register_files_update(file_slot.index, &[-1])
+        {
+            tracing::debug!(
+                component = "storage",
+                operation = "io_uring_release_fixed_file",
+                result = "error",
+                slot = file_slot.index,
+                error = %error,
+                "io_uring fixed-file slot could not be cleared after a rejected submission"
+            );
+        }
     }
 
     fn push_entry(&mut self, entry: io_uring::squeue::Entry) -> io::Result<()> {
@@ -1452,6 +1502,54 @@ mod tests {
             assert!(URING_FIXED_BUFFER_SLOTS < URING_BATCH_LIMIT);
             assert!(URING_FIXED_BUFFER_SLOTS * URING_FIXED_BUFFER_LEN <= 4 * 1024 * 1024);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn uring_rejected_submission_releases_new_fixed_file_slot() {
+        let probe = UringBackend::probe().unwrap();
+        if !probe.usable || !probe.registered_files {
+            return;
+        }
+        let (_tx, rx) = mpsc::sync_channel(1);
+        let registered_files_supported = Arc::new(AtomicBool::new(false));
+        let fixed_buffers_supported = Arc::new(AtomicBool::new(false));
+        let Ok(mut worker) = UringWorker::new(
+            Arc::new(Mutex::new(rx)),
+            registered_files_supported,
+            fixed_buffers_supported,
+        ) else {
+            return;
+        };
+        if !worker.registered_files {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("uring-full.bin");
+        std::fs::write(&path, vec![0u8; 16]).unwrap();
+        let file = Arc::new(File::open(&path).unwrap());
+
+        let mut pushed = 0;
+        while worker.push_entry(opcode::Nop::new().build()).is_ok() {
+            pushed += 1;
+        }
+        assert!(pushed > 0);
+
+        let (reply, response) = oneshot::channel();
+        let result = worker.submit_job(Job::Sync { file, reply });
+        assert_eq!(
+            result.unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "test setup must leave the submission queue full"
+        );
+        assert_eq!(
+            response.await.unwrap().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "a rejected io_uring submission must reach the operation caller"
+        );
+        assert!(worker.file_slots.is_empty());
+        assert!(worker.slot_files.iter().all(Option::is_none));
     }
 
     #[test]

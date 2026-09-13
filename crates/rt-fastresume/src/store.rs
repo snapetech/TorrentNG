@@ -1,6 +1,5 @@
 use std::{
-    fs::{File, OpenOptions},
-    io::{self, Read, Write},
+    io,
     path::{Path, PathBuf},
 };
 
@@ -58,12 +57,15 @@ impl FastresumeStore {
     /// Save fastresume state atomically.
     #[instrument(skip(self, state), fields(info_hash = %state.info_hash))]
     pub fn save(&self, state: &FastresumeState) -> Result<(), FastresumeError> {
-        std::fs::create_dir_all(&self.dir)?;
+        rt_storage::create_dir_all_no_follow(&self.dir)?;
         let target = self.checked_path_for(&state.info_hash)?;
         let tmp = target.with_extension("tmp");
         let data = serde_json::to_vec_pretty(state)?;
-        write_no_follow(&tmp, &data)?;
-        std::fs::rename(&tmp, &target)?;
+        rt_storage::write_file_no_follow_sync(&tmp, &data)?;
+        rt_storage::rename_no_follow(&tmp, &target)?;
+        if let Some(parent) = target.parent() {
+            rt_storage::sync_dir_no_follow(parent)?;
+        }
         tracing::debug!(
             component = "fastresume",
             operation = "save",
@@ -77,7 +79,7 @@ impl FastresumeStore {
     /// Delete fastresume state (on torrent removal).
     pub fn delete(&self, info_hash_hex: &str) -> Result<(), FastresumeError> {
         let path = self.checked_path_for(info_hash_hex)?;
-        match std::fs::remove_file(&path) {
+        match rt_storage::remove_file_no_follow(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(FastresumeError::Io(e)),
@@ -87,7 +89,7 @@ impl FastresumeStore {
     /// True if a fastresume file exists for the given infohash.
     pub fn exists(&self, info_hash_hex: &str) -> bool {
         self.checked_path_for(info_hash_hex)
-            .is_ok_and(|path| path.exists())
+            .is_ok_and(|path| rt_storage::metadata_no_follow(&path).is_ok())
     }
 
     pub fn dir(&self) -> &Path {
@@ -100,62 +102,7 @@ fn is_safe_hash_component(value: &str) -> bool {
 }
 
 fn read_bounded_no_follow(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
-    let file = open_read_no_follow(path)?;
-    let file_len = file.metadata()?.len();
-    if file_len > max_bytes as u64 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "fastresume file {} is {file_len} bytes, maximum is {max_bytes}",
-                path.display()
-            ),
-        ));
-    }
-    let mut data = Vec::with_capacity(
-        usize::try_from(file_len)
-            .unwrap_or(max_bytes)
-            .min(max_bytes),
-    );
-    let mut limited = file.take(max_bytes.saturating_add(1) as u64);
-    limited.read_to_end(&mut data)?;
-    if data.len() > max_bytes {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "fastresume file {} grew beyond the {max_bytes} byte limit",
-                path.display()
-            ),
-        ));
-    }
-    Ok(data)
-}
-
-#[cfg(unix)]
-fn open_read_no_follow(path: &Path) -> io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-}
-
-#[cfg(not(unix))]
-fn open_read_no_follow(path: &Path) -> io::Result<File> {
-    File::open(path)
-}
-
-fn write_no_follow(path: &Path, data: &[u8]) -> io::Result<()> {
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let mut file = options.open(path)?;
-    file.write_all(data)?;
-    file.sync_all()
+    rt_storage::read_file_no_follow_limited(path, max_bytes)
 }
 
 #[cfg(test)]
@@ -266,5 +213,25 @@ mod tests {
 
         let error = read_bounded_no_follow(&path, 3).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_rejects_an_ancestor_symlink_without_writing_outside() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let alias = root.path().join("fastresume");
+        symlink(outside.path(), &alias).unwrap();
+
+        let store = FastresumeStore::new(&alias);
+        let error = store.save(&make_state()).unwrap_err();
+
+        assert!(matches!(error, FastresumeError::Io(_)));
+        assert!(!outside
+            .path()
+            .join(format!("{}.fastresume.json", test_hash_hex()))
+            .exists());
     }
 }
